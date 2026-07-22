@@ -1,0 +1,19 @@
+[package]
+name = "inference-executor-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+half = { workspace = true }
+inference-runtime-core = { path = "../inference-runtime-core" }
+libc = { workspace = true }
+ordered-float = { workspace = true }
+rand = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,81 @@
+[package]
+name = "inference-backend-metal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+block2 = { workspace = true }
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-metal = { workspace = true, features = [
+  "MTL4CommandAllocator",
+  "MTL4CommandBuffer",
+  "MTL4CommandEncoder",
+  "MTL4CommandQueue",
+  "MTL4CommitFeedback",
+  "MTL4ComputeCommandEncoder",
+  "MTLResidencySet",
+  "MTLGPUAddress",
+  "block2",
+] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+half = { workspace = true }
+inference-executor-core = { path = "../inference-executor-core" }
+libc = { workspace = true }
+safetensors = { workspace = true }
+
+[[bench]]
+name = "moe"
+path = "benches/mlp/moe.rs"
+harness = false
+
+[[bench]]
+name = "dense_mlp"
+path = "benches/mlp/dense.rs"
+harness = false
+
+[[bench]]
+name = "sparse_mlp"
+path = "benches/mlp/sparse.rs"
+harness = false
+
+[[bench]]
+name = "gqa_attn"
+path = "benches/gqa/attn.rs"
+harness = false
+
+[[bench]]
+name = "gdn_attn"
+path = "benches/gdn/attn.rs"
+harness = false
+
+[[bench]]
+name = "gdn_state_io"
+path = "benches/gdn/state_io.rs"
+harness = false
+
+[[bench]]
+name = "sampling_rejection"
+path = "benches/sampling_rejection.rs"
+harness = false
+
+[[bench]]
+name = "norm"
+path = "benches/norm.rs"
+harness = false
+
+[[bench]]
+name = "embedding"
+path = "benches/head/embedding.rs"
+harness = false
+
+[[bench]]
+name = "unembedding"
+path = "benches/head/unembedding.rs"
+harness = false

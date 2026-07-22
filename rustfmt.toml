@@ -1,0 +1,36 @@
+edition = "2024"
+
+unstable_features = true
+
+# import group by std; external crate; current crate;
+group_imports = "StdExternalCrate"
+# import without merge
+imports_granularity = "Item"
+reorder_imports = true
+reorder_modules = false
+
+comment_width = 120
+max_width = 120
+
+tab_spaces = 4
+hard_tabs = false
+
+
+condense_wildcard_suffixes = true
+merge_derives = true
+trailing_comma = "Vertical"
+match_block_trailing_comma = true
+use_field_init_shorthand = true
+fn_single_line = false
+fn_params_layout = "Tall"
+force_multiline_blocks = true
+format_strings = true
+binop_separator = "Front"
+blank_lines_upper_bound = 1
+blank_lines_lower_bound = 0
+brace_style = "SameLineWhere"
+control_brace_style = "AlwaysSameLine"
+empty_item_single_line = true
+# comments
+wrap_comments = true
+normalize_comments = true

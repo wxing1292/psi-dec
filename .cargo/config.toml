@@ -1,0 +1,9 @@
+[build]
+rustflags = [
+    "-Aclippy::new_without_default",
+    "-Adead_code",
+    "-Aunused_variables",
+    "-Aunreachable_patterns",
+    "-Aclippy::len_without_is_empty",
+    "-Dunused_must_use",
+]
