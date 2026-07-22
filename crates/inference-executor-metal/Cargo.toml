@@ -1,0 +1,65 @@
+[package]
+name = "inference-executor-metal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+half = { workspace = true }
+inference-backend-metal = { workspace = true }
+inference-executor-core = { workspace = true }
+inference-runtime-core = { path = "../inference-runtime-core" }
+inference-runtime-macro = { path = "../inference-runtime-macro" }
+libc = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+
+[[bench]]
+name = "qwen35_gqa"
+path = "benches/qwen35/gqa.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_gdn"
+path = "benches/qwen35/gdn.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_dense_mlp"
+path = "benches/qwen35/dense_mlp.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_moe"
+path = "benches/qwen35/moe.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_layers"
+path = "benches/qwen35/layers.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_output"
+path = "benches/qwen35/output.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_embed"
+path = "benches/qwen35/embed.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_sampling"
+path = "benches/qwen35/sampling.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_executor"
+path = "benches/qwen35/executor.rs"
+harness = false

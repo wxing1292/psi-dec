@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package psi_dec.inference.v1;
+
+service InferenceRuntime {
+  rpc Decode(DecodeRequest) returns (stream DecodeChunkResponse);
+}
+
+message DecodeRequest {
+  uint64 request_id = 1;
+  repeated uint32 tokens = 2;
+  uint32 max_sampled_tokens = 3;
+  repeated TokenSequence stop_sequences = 4;
+  optional float temperature = 5;
+  optional uint32 top_k = 6;
+  optional float top_p = 7;
+  optional uint32 seed = 8;
+}
+
+message TokenSequence {
+  repeated uint32 tokens = 1;
+}
+
+message DecodeChunkResponse {
+  repeated uint32 tokens = 1;
+  repeated float probs = 2;
+}
+
+enum RequestStatus {
+  REQUEST_STATUS_UNSPECIFIED = 0;
+  REQUEST_STATUS_UNSCHEDULED = 1;
+  REQUEST_STATUS_SCHEDULED = 2;
+  REQUEST_STATUS_RUNNING = 3;
+  REQUEST_STATUS_SWAPPED = 4;
+  REQUEST_STATUS_CANCELLED = 5;
+  REQUEST_STATUS_TIMED_OUT = 6;
+  REQUEST_STATUS_ABORTED = 7;
+  REQUEST_STATUS_COMPLETED = 8;
+}

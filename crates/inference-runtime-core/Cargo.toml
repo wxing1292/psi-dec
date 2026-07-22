@@ -1,0 +1,48 @@
+[package]
+name = "inference-runtime-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ahash = { workspace = true }
+async-channel = { workspace = true }
+async-trait = { workspace = true }
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+cfg-if = { workspace = true }
+comfy-table = { workspace = true }
+core_affinity = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
+dashmap = { workspace = true }
+delegate = { workspace = true }
+dotenvy = { workspace = true }
+either = { workspace = true }
+event-listener = { workspace = true }
+futures-lite = { workspace = true }
+futures-util = { workspace = true }
+hdrhistogram = { workspace = true }
+inference-runtime-macro = { path = "../inference-runtime-macro" }
+intrusive-collections = { workspace = true }
+itertools = { workspace = true }
+map-macro = { workspace = true }
+mockall = { workspace = true }
+nix = { workspace = true, features = ["fs", "mman", "process", "zerocopy"] }
+offset-allocator = { workspace = true }
+ordered-float = { workspace = true }
+rand = { workspace = true, features = ["std"] }
+replace_with = { workspace = true }
+slotmap = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokenizers = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["time"] }
+uuid = { workspace = true, features = ["v4", "fast-rng"] }
+zerocopy = { workspace = true }

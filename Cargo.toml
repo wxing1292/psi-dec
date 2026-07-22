@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/inference-backend-metal",
+  "crates/inference-executor-core",
+  "crates/inference-executor-metal",
+  "crates/inference-runtime-core",
+  "crates/inference-runtime-macro",
+  "crates/inference-runtime-proto",
+  "crates/inference-runtime-service",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Wenquan Xing"]
+license = "MIT"
+repository = "https://github.com/wxing1292/psi-dec"
+
+[workspace.dependencies]
+ahash = "0.8"
+async-channel = "2.5"
+async-trait = "0.1"
+block2 = "0.6"
+bytemuck = "1.25"
+bytes = "1.11"
+cfg-if = "1.0"
+clap = "4.6"
+comfy-table = "7.2"
+core_affinity = "0.8"
+criterion = "0.8"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
+dashmap = "6.1"
+delegate = "0.13"
+dotenvy = "0.15"
+either = "1.15"
+event-listener = "5.4"
+futures-lite = "2.6"
+futures-util = "0.3"
+half = "2.7"
+hdrhistogram = "7.5"
+inference-backend-metal = { path = "crates/inference-backend-metal" }
+inference-executor-core = { path = "crates/inference-executor-core" }
+inference-executor-metal = { path = "crates/inference-executor-metal" }
+intrusive-collections = "0.10"
+itertools = "0.15"
+libc = "0.2"
+llguidance = "1.7"
+map-macro = "0.3"
+mimalloc = "0.1"
+minijinja = "2.19"
+mockall = "0.15"
+nix = "0.31"
+objc2 = "0.6.3"
+objc2-foundation = "0.3.2"
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+  "MTLAllocation",
+  "MTLBuffer",
+  "MTLCommandBuffer",
+  "MTLCommandEncoder",
+  "MTLCommandQueue",
+  "MTLComputeCommandEncoder",
+  "MTLComputePipeline",
+  "MTLDevice",
+  "MTLIndirectCommandBuffer",
+  "MTLIndirectCommandEncoder",
+  "MTLLibrary",
+  "MTLEvent",
+  "MTLResource",
+  "MTLTypes",
+] }
+offset-allocator = "0.2"
+ordered-float = "5.3"
+prost = "0.14"
+qp-trie = "0.8"
+quote = "1.0"
+rand = "0.10"
+replace_with = "0.1"
+safetensors = "0.8"
+serde = "1.0"
+serde_json = "1.0"
+slotmap = "1.1"
+smallvec = "1.15"
+syn = "3.0"
+thiserror = "2.0"
+time = "0.3"
+tokenizers = "0.23"
+tokio = "1.52"
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = "1.23"
+xxhash-rust = "0.8"
+zerocopy = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,34 @@
+[package]
+name = "inference-runtime-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-channel = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+crossbeam-channel = { workspace = true }
+delegate = { workspace = true }
+inference-executor-core = { path = "../inference-executor-core" }
+inference-executor-metal = { path = "../inference-executor-metal" }
+inference-runtime-core = { path = "../inference-runtime-core" }
+inference-runtime-proto = { path = "../inference-runtime-proto" }
+mimalloc = { workspace = true }
+minijinja = { workspace = true }
+mockall = { workspace = true }
+ordered-float = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
