@@ -68,9 +68,9 @@ is committed normally for use as a non-terminal prefix by later requests.
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ SimpleScheduler                                                            │
-│ hard request/token/per-request limits + free/used compute slots            │
-│ ordered compute-slot sequence                                              │
+│ InstrumentedScheduler<SimpleScheduler>                                     │
+│ scheduler API latency/counts + hard request/token/per-request limits       │
+│ free/used compute slots + ordered compute-slot sequence                    │
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     │ runnable work + free slot
                                     │ -> allocate ordered compute slot

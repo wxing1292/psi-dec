@@ -10,14 +10,12 @@ use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
-use crate::runtime::RawComputeSlotSeq;
-use crate::runtime::scheduler::ScheduleDecision;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
 
 pub struct InstrumentedScheduler<Sch> {
-    hist_enqueue: Histogram<u64>,
-    hist_decision: Histogram<u64>,
+    num_enqueue: u64,
+    num_swap_in: u64,
     hist_prepare: Histogram<u64>,
     hist_cancel: Histogram<u64>,
     hist_commit: Histogram<u64>,
@@ -28,8 +26,8 @@ pub struct InstrumentedScheduler<Sch> {
 impl<Sch> InstrumentedScheduler<Sch> {
     pub fn new(scheduler: Sch) -> Self {
         Self {
-            hist_enqueue: Histogram::<u64>::new(4).unwrap(),
-            hist_decision: Histogram::<u64>::new(4).unwrap(),
+            num_enqueue: 0,
+            num_swap_in: 0,
             hist_prepare: Histogram::<u64>::new(4).unwrap(),
             hist_cancel: Histogram::<u64>::new(4).unwrap(),
             hist_commit: Histogram::<u64>::new(4).unwrap(),
@@ -38,21 +36,21 @@ impl<Sch> InstrumentedScheduler<Sch> {
         }
     }
 
-    pub fn latency_table(&self) -> Table {
+    pub fn stats_table(&self) -> Table {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL);
 
-        let col_count = 2 + COLUMNS.len();
-
-        // header
         let mut header = vec![Cell::new("scheduler api"), Cell::new("count")];
         header.extend(COLUMNS.iter().map(|(name, _)| Cell::new(*name)));
         table.set_header(header);
 
-        // rows
+        for (name, count) in [("enqueue", self.num_enqueue), ("swap_in", self.num_swap_in)] {
+            let mut row = vec![Cell::new(name), Cell::new(count)];
+            row.extend(COLUMNS.iter().map(|_| Cell::new("-")));
+            table.add_row(row);
+        }
+
         for (name, histogram) in [
-            ("enqueue", &self.hist_enqueue),
-            ("decision", &self.hist_decision),
             ("prepare", &self.hist_prepare),
             ("cancel", &self.hist_cancel),
             ("commit", &self.hist_commit),
@@ -77,18 +75,17 @@ where
     Sch: Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
 {
     fn enqueue(&mut self, user_req: UserReq) {
-        let instant = Instant::now();
         self.scheduler.enqueue(user_req);
-        let latency = instant.elapsed().as_micros() as u64;
-        let _ = self.hist_enqueue.record(max(1, latency));
+        self.num_enqueue += 1;
     }
 
-    fn decision(&mut self) -> ScheduleDecision {
-        let instant = Instant::now();
-        let result = self.scheduler.decision();
-        let latency = instant.elapsed().as_micros() as u64;
-        let _ = self.hist_decision.record(max(1, latency));
-        result
+    fn swap_in(&mut self, user_req: UserReq) {
+        self.scheduler.swap_in(user_req);
+        self.num_swap_in += 1;
+    }
+
+    fn can_flush(&self) -> bool {
+        self.scheduler.can_flush()
     }
 
     fn prepare(&mut self) -> BatchDeviceReq {
@@ -111,15 +108,6 @@ where
         self.scheduler.commit(batch_dev_resp);
         let latency = instant.elapsed().as_micros() as u64;
         let _ = self.hist_commit.record(max(1, latency));
-    }
-
-    delegate::delegate! {
-        to self.scheduler {
-            fn last_compute_slot_seq(&self) -> RawComputeSlotSeq;
-            fn next_compute_slot_seq(&self) -> Option<RawComputeSlotSeq>;
-            fn run_queue_size(&self) -> usize;
-            fn new_queue_size(&self) -> usize;
-        }
     }
 }
 
@@ -182,32 +170,32 @@ mod tests {
     use crate::runtime::scheduler::MockUserRequest;
 
     #[test]
-    fn test_print_latency_table() {
-        let mut scheduler = InstrumentedScheduler::new(MockScheduler::<
-            MockUserRequest<MockDevReq, MockDevResp>,
-            MockDevReq,
-            MockDevResp,
-            MockBatchDevReq<MockDevReq>,
-            MockBatchDevResp<MockDevResp>,
-        >::new());
+    fn test_metrics() {
+        type TestUserReq = MockUserRequest<MockDevReq, MockDevResp>;
+        type TestBatchDeviceReq = MockBatchDevReq<MockDevReq>;
+        type TestBatchDeviceResp = MockBatchDevResp<MockDevResp>;
 
-        for us in [5, 6, 7, 8, 10, 12, 15, 20, 50] {
-            scheduler.hist_enqueue.record(us).unwrap();
-        }
+        let mut inner =
+            MockScheduler::<TestUserReq, MockDevReq, MockDevResp, TestBatchDeviceReq, TestBatchDeviceResp>::new();
+        inner.expect_enqueue().once().return_once(drop);
+        inner.expect_swap_in().once().return_once(drop);
+        inner.expect_can_flush().once().return_const(true);
+        inner.expect_prepare().once().return_once(TestBatchDeviceReq::new);
+        inner.expect_cancel().once().return_once(drop);
+        inner.expect_commit().once().return_once(drop);
 
-        for us in [1, 1, 2, 2, 3, 3, 4, 7, 12] {
-            scheduler.hist_decision.record(us).unwrap();
-        }
+        let mut scheduler = InstrumentedScheduler::new(inner);
+        scheduler.enqueue(TestUserReq::new());
+        scheduler.swap_in(TestUserReq::new());
+        assert!(scheduler.can_flush());
+        let batch_dev_req = scheduler.prepare();
+        scheduler.cancel(batch_dev_req);
+        scheduler.commit(TestBatchDeviceResp::new());
 
-        for us in [80, 120, 150, 180, 200, 220, 300, 1200] {
-            scheduler.hist_prepare.record(us).unwrap();
-        }
-
-        for us in [30, 50, 60, 70, 90, 120, 220, 600] {
-            scheduler.hist_commit.record(us).unwrap();
-        }
-
-        let table = scheduler.latency_table();
-        println!("{}", table);
+        assert_eq!(scheduler.num_enqueue, 1);
+        assert_eq!(scheduler.num_swap_in, 1);
+        assert_eq!(scheduler.hist_prepare.len(), 1);
+        assert_eq!(scheduler.hist_cancel.len(), 1);
+        assert_eq!(scheduler.hist_commit.len(), 1);
     }
 }

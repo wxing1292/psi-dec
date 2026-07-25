@@ -1,12 +1,9 @@
-use std::time::Instant;
-
 use futures_lite::future::Boxed;
 
 use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
-use crate::runtime::RawComputeSlotSeq;
 use crate::runtime::RawRequestID;
 
 mod compute_slot;
@@ -15,8 +12,8 @@ pub use compute_slot::ComputeSlot;
 mod event_loop;
 pub use event_loop::EventLoop;
 
-mod fifo_scheduler;
-pub use fifo_scheduler::FIFOScheduler;
+mod simple_scheduler;
+pub use simple_scheduler::SimpleScheduler;
 
 mod instrumented_scheduler;
 pub use instrumented_scheduler::InstrumentedScheduler;
@@ -26,16 +23,6 @@ pub use fifo_batcher::FIFOBatcher;
 
 mod schedule_queue;
 pub use schedule_queue::ScheduleQueue;
-
-mod simple_scheduler;
-pub use simple_scheduler::SimpleScheduler;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ScheduleDecision {
-    Noop,
-    Timeout { instant: Instant },
-    Flush,
-}
 
 #[mockall::automock]
 pub trait Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>
@@ -47,17 +34,12 @@ where
     BatchDeviceResp: BatchDevResp<DeviceResp>,
 {
     fn enqueue(&mut self, user_req: UserReq);
-    fn decision(&mut self) -> ScheduleDecision;
+    fn swap_in(&mut self, user_req: UserReq);
+    fn can_flush(&self) -> bool;
 
     fn prepare(&mut self) -> BatchDeviceReq;
     fn cancel(&mut self, batch_dev_req: BatchDeviceReq);
     fn commit(&mut self, batch_dev_resp: BatchDeviceResp);
-
-    fn last_compute_slot_seq(&self) -> RawComputeSlotSeq;
-    fn next_compute_slot_seq(&self) -> Option<RawComputeSlotSeq>;
-
-    fn run_queue_size(&self) -> usize;
-    fn new_queue_size(&self) -> usize;
 }
 
 #[mockall::automock]

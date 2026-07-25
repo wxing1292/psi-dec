@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Select;
 use crossbeam_channel::Sender;
@@ -12,38 +14,41 @@ use crate::log_err_internal;
 use crate::runtime::RequestSlot;
 use crate::runtime::RequestSlotAllocationResult;
 use crate::runtime::RequestSlotAllocator;
-use crate::runtime::scheduler::Batcher;
-use crate::runtime::scheduler::SimpleScheduler;
+use crate::runtime::scheduler::InstrumentedScheduler;
+use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
 
-pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, B> {
+pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
     user_req_rx: Receiver<QueuedReq>,
     swap_in_task_rx: Receiver<UserReq>,
     batch_dev_req_tx: Sender<BatchDeviceReq>,
     batch_dev_resp_rx: Receiver<BatchDeviceResp>,
 
-    scheduler: SimpleScheduler<UserReq, DeviceReq, DeviceResp, B>,
+    scheduler: InstrumentedScheduler<S>,
     request_slot_allocator: RequestSlotAllocator,
 
     shutdown: Shutdown,
+
+    phantom_data_device_req: PhantomData<DeviceReq>,
+    phantom_data_device_resp: PhantomData<DeviceResp>,
 }
 
-impl<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, B>
-    EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, B>
+impl<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
+    EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
 where
     UserReq: From<(QueuedReq, RequestSlot)> + UserRequest<DeviceReq, DeviceResp>,
     DeviceReq: DevReq,
     DeviceResp: DevResp,
     BatchDeviceReq: BatchDevReq<DeviceReq>,
     BatchDeviceResp: BatchDevResp<DeviceResp>,
-    B: Batcher<UserReq, DeviceReq, DeviceResp>,
+    S: Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
 {
     pub fn new(
         user_req_rx: Receiver<QueuedReq>,
         swap_in_task_rx: Receiver<UserReq>,
         batch_dev_req_tx: Sender<BatchDeviceReq>,
         batch_dev_resp_rx: Receiver<BatchDeviceResp>,
-        scheduler: SimpleScheduler<UserReq, DeviceReq, DeviceResp, B>,
+        scheduler: InstrumentedScheduler<S>,
         request_slot_allocator: RequestSlotAllocator,
         shutdown: Shutdown,
     ) -> Self {
@@ -57,6 +62,9 @@ where
             request_slot_allocator,
 
             shutdown,
+
+            phantom_data_device_req: PhantomData,
+            phantom_data_device_resp: PhantomData,
         }
     }
 
@@ -158,13 +166,14 @@ where
         }
 
         self.shutdown.shutdown();
+        tracing::info!("\n{}", self.scheduler.stats_table());
         tracing::info!("stopped");
         Ok(())
     }
 }
 
-fn do_flush<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, B>(
-    scheduler: &mut SimpleScheduler<UserReq, DeviceReq, DeviceResp, B>,
+fn do_flush<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>(
+    scheduler: &mut S,
     batch_dev_req_tx: &Sender<BatchDeviceReq>,
 ) -> Result<()>
 where
@@ -172,7 +181,8 @@ where
     DeviceReq: DevReq,
     DeviceResp: DevResp,
     BatchDeviceReq: BatchDevReq<DeviceReq>,
-    B: Batcher<UserReq, DeviceReq, DeviceResp>,
+    BatchDeviceResp: BatchDevResp<DeviceResp>,
+    S: Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
 {
     let batch_dev_req = scheduler.prepare();
     match batch_dev_req_tx.try_send(batch_dev_req) {

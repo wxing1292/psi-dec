@@ -182,6 +182,10 @@ The complete verification ladder and performance-evidence record live in
 Keep public surface minimal. Items remain private unless an external caller intentionally needs them; do not use
 `pub(crate)` or `pub(super)`.
 
+When a trait is the production interface for a concrete type, put the actual method implementation directly in that
+type's trait impl. Keep constructors and operations outside the trait in the inherent impl; do not duplicate trait
+methods as inherent methods and forward between the two impls.
+
 Do not export planning structs, kernel metadata, workaround modules, scratch internals, or backend-local tables merely
 for convenience. A benchmark needing private internals is a reason to discuss a bench helper API, not to widen the
 production API automatically. Do not reshape production `src` only to make a benchmark easier.
@@ -189,6 +193,12 @@ production API automatically. Do not reshape production `src` only to make a ben
 Keep backend details behind backend APIs. Metal components own kernels, dispatch parameters, tile scratch, and runtime
 resource bindings. Model executors own model semantics, persistent model/request buffers, and component wiring; they do
 not expose backend tiling or kernel-local tables in model-level APIs.
+
+## Commit messages
+
+Use a concise lowercase subject focused on the change's main purpose. Do not enumerate related changes in the subject.
+When a body is useful, use only a few high-level bullet points for materially related changes; do not restate the
+per-file diff or low-level implementation details.
 
 ## Test style
 

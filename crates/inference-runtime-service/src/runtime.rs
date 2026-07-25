@@ -29,6 +29,7 @@ use inference_runtime_core::runtime::decoder::trie_cache::SingleLaneTrieBlockCac
 use inference_runtime_core::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use inference_runtime_core::runtime::scheduler::EventLoop;
 use inference_runtime_core::runtime::scheduler::FIFOBatcher;
+use inference_runtime_core::runtime::scheduler::InstrumentedScheduler;
 use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
@@ -132,14 +133,14 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         {
             let schedule_queue = ScheduleQueue::new(swap_out_task_tx);
             let batcher = FIFOBatcher::new();
-            let scheduler = SimpleScheduler::new(
+            let scheduler = InstrumentedScheduler::new(SimpleScheduler::new(
                 schedule_queue,
                 batcher,
                 scheduler_config.max_requests,
                 scheduler_config.max_tokens,
                 scheduler_config.max_tokens_per_request,
                 scheduler_config.max_compute_slots,
-            );
+            ));
             let event_loop = EventLoop::new(
                 user_req_rx,
                 swap_in_task_rx,

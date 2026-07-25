@@ -87,7 +87,9 @@ rejection decisions cross the CPU boundary before the next proposal input is for
 `--logging info` emits one concise batch event: model, batch sequence, request/input counts, speculative input, accepted
 speculative tokens, committed output tokens, acceptance rate, and total latency. `--logging debug` uses the same event
 model and adds request-kind counts, rejected/next speculative tokens, sampled rows, and replay-stage submit/wait timing.
-It does not duplicate an INFO event.
+It does not duplicate an INFO event. Runtime shutdown also emits a scheduler table containing call counts and latency
+percentiles over the runtime lifetime. Enqueue and swap-in report request counts; prepare, cancel, and commit report
+both counts and latency percentiles.
 
 Set `PSI_QWEN35_STATE_TRACE=1` for opt-in executor lifecycle lines on stderr. These include replay cache hit/miss keys,
 GDN restore/publish decisions, and synchronous `prepare_sync` timing (`gqa_us`, `gdn_states_us`, dependent
