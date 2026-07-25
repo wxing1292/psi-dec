@@ -27,8 +27,6 @@ objc2-metal = { workspace = true, features = [
 criterion = { workspace = true }
 half = { workspace = true }
 inference-executor-core = { path = "../inference-executor-core" }
-libc = { workspace = true }
-safetensors = { workspace = true }
 
 [[bench]]
 name = "moe"

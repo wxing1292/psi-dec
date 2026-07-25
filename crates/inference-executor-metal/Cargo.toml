@@ -12,12 +12,7 @@ inference-backend-metal = { workspace = true }
 inference-executor-core = { workspace = true }
 inference-runtime-core = { path = "../inference-runtime-core" }
 inference-runtime-macro = { path = "../inference-runtime-macro" }
-libc = { workspace = true }
 safetensors = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-
-[dev-dependencies]
 
 [[bench]]
 name = "qwen35_gqa"
@@ -63,3 +58,6 @@ harness = false
 name = "qwen35_executor"
 path = "benches/qwen35/executor.rs"
 harness = false
+
+[dev-dependencies]
+libc = { workspace = true }
