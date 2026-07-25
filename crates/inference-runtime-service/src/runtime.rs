@@ -27,11 +27,11 @@ use inference_runtime_core::runtime::decoder::TPStateBlockAllocator;
 use inference_runtime_core::runtime::decoder::trie_cache::MultiLaneTrieBlockCache;
 use inference_runtime_core::runtime::decoder::trie_cache::SingleLaneTrieBlockCache;
 use inference_runtime_core::runtime::decoder::trie_cache::TrieDecoderBlocks;
-use inference_runtime_core::runtime::scheduler::AsyncTaskPool;
 use inference_runtime_core::runtime::scheduler::EventLoop;
 use inference_runtime_core::runtime::scheduler::FIFOBatcher;
 use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
+use inference_runtime_core::runtime::tasks::AsyncTaskPool;
 use tonic::Status;
 
 type RuntimeBlockCache<const P: usize, const L: usize> =

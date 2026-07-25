@@ -9,12 +9,6 @@ use crate::compute::DevResp;
 use crate::runtime::RawComputeSlotSeq;
 use crate::runtime::RawRequestID;
 
-mod async_task;
-pub use async_task::AsyncTask;
-pub use async_task::AsyncTaskPool;
-pub use async_task::AwaitReservation;
-pub use async_task::SwapOutTask;
-
 mod compute_slot;
 pub use compute_slot::ComputeSlot;
 

@@ -8,8 +8,8 @@ use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::ScheduleQueue;
-use crate::runtime::scheduler::SwapOutTask;
 use crate::runtime::scheduler::UserRequest;
+use crate::runtime::tasks::SwapOutTask;
 
 pub struct FIFOBatcher<UserReq, DeviceReq, DeviceResp> {
     running_reqs: Vec<UserReq>,

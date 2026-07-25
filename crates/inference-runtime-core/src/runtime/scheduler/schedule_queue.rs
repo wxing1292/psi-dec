@@ -10,8 +10,8 @@ use map_macro::hash_map;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
 use crate::runtime::RawRequestID;
-use crate::runtime::scheduler::SwapOutTask;
 use crate::runtime::scheduler::UserRequest;
+use crate::runtime::tasks::SwapOutTask;
 
 pub struct ScheduleQueue<UserReq, DeviceReq, DeviceResp> {
     id_requests: HashMap<RawRequestID, UserReq>,

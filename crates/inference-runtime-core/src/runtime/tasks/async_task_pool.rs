@@ -1,18 +1,13 @@
-use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 
 use async_channel::Receiver;
 use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TrySendError;
-use futures_lite::future::Boxed;
 use futures_util::FutureExt;
 
 use crate::Result;
 use crate::channel::Shutdown;
-use crate::compute::DevReq;
-use crate::compute::DevResp;
-use crate::runtime::scheduler::UserRequest;
 
 #[async_trait]
 pub trait AsyncTask: Send + 'static {
@@ -74,6 +69,7 @@ where
                 tracing::info!("async task runner failed during shutdown, err: {err}");
             }
         }
+        while self.task_in_rx.try_recv().is_ok() {}
         tracing::info!("stopped");
         Ok(())
     }
@@ -153,79 +149,10 @@ async fn async_task_runner_loop<T>(
     tracing::info!("stopped");
 }
 
-pub struct AwaitReservation<UserReq, DeviceReq, DeviceResp> {
-    user_req: UserReq,
-    wait: Boxed<()>,
-    phantom_data: PhantomData<fn() -> (DeviceReq, DeviceResp)>,
-}
-
-impl<UserReq, DeviceReq, DeviceResp> AwaitReservation<UserReq, DeviceReq, DeviceResp>
-where
-    UserReq: UserRequest<DeviceReq, DeviceResp>,
-    DeviceReq: DevReq,
-    DeviceResp: DevResp,
-{
-    fn new(user_req: UserReq, wait: Boxed<()>) -> Self {
-        Self {
-            user_req,
-            wait,
-            phantom_data: PhantomData,
-        }
-    }
-
-    async fn run(self) -> UserReq {
-        let Self { user_req, wait, .. } = self;
-        if !user_req.store_swapped() {
-            assert!(
-                user_req.is_terminal(),
-                "swap-out task requires a running or terminal request"
-            );
-            return user_req;
-        }
-        wait.await;
-        if !user_req.store_running() {
-            assert!(
-                user_req.is_terminal(),
-                "completed swap-out task requires a swapped or terminal request"
-            );
-        }
-        user_req
-    }
-}
-
-pub enum SwapOutTask<UserReq, DeviceReq, DeviceResp> {
-    AwaitReservation(AwaitReservation<UserReq, DeviceReq, DeviceResp>),
-}
-
-impl<UserReq, DeviceReq, DeviceResp> SwapOutTask<UserReq, DeviceReq, DeviceResp>
-where
-    UserReq: UserRequest<DeviceReq, DeviceResp>,
-    DeviceReq: DevReq,
-    DeviceResp: DevResp,
-{
-    pub fn await_reservation(user_req: UserReq, wait: Boxed<()>) -> Self {
-        Self::AwaitReservation(AwaitReservation::new(user_req, wait))
-    }
-}
-
-#[async_trait]
-impl<UserReq, DeviceReq, DeviceResp> AsyncTask for SwapOutTask<UserReq, DeviceReq, DeviceResp>
-where
-    UserReq: UserRequest<DeviceReq, DeviceResp>,
-    DeviceReq: DevReq,
-    DeviceResp: DevResp,
-{
-    type Output = UserReq;
-
-    async fn run(self) -> Self::Output {
-        match self {
-            Self::AwaitReservation(task) => task.run().await,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -235,75 +162,105 @@ mod tests {
 
     use super::*;
 
-    struct PendingTask {
-        started_tx: async_channel::Sender<()>,
+    type TaskFuture = Pin<Box<dyn Future<Output = usize> + Send>>;
+
+    mockall::mock! {
+        Task {
+            fn run(self) -> TaskFuture;
+        }
+    }
+
+    #[async_trait]
+    impl AsyncTask for MockTask {
+        type Output = usize;
+
+        async fn run(self) -> Self::Output {
+            MockTask::run(self).await
+        }
+    }
+
+    struct DropMarker {
         dropped: Arc<AtomicBool>,
     }
 
-    impl Drop for PendingTask {
+    impl Drop for DropMarker {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
         }
     }
 
-    #[async_trait]
-    impl AsyncTask for PendingTask {
-        type Output = ();
-
-        async fn run(self) {
-            let started_tx = self.started_tx.clone();
-            let task = self;
-            started_tx
-                .send(())
-                .await
-                .expect("async task cancellation test start receiver should remain open");
-            std::future::pending::<()>().await;
-            drop(task);
-        }
-    }
-
     #[tokio::test]
-    async fn test_swap_out_task_returns_running_request() {
-        let mut user_req =
-            crate::runtime::scheduler::MockUserRequest::<crate::compute::MockDevReq, crate::compute::MockDevResp>::new(
-            );
-        user_req.expect_store_swapped().once().return_const(true);
-        user_req.expect_store_running().once().return_const(true);
-        let task = SwapOutTask::await_reservation(user_req, Box::pin(async {}));
-
-        let _user_req = task.run().await;
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_running_task() {
+    async fn test_execute() {
         let (task_in_tx, task_in_rx) = async_bounded(1);
         let (task_out_tx, task_out_rx) = sync_bounded(1);
+        let shutdown = Shutdown::new();
+        let pool = AsyncTaskPool::new(task_in_rx, task_out_tx, shutdown, 1);
+        let pool_task = tokio::spawn(pool.event_loop());
+
+        let mut task = MockTask::new();
+        task.expect_run().once().return_once(|| Box::pin(async { 7 }));
+        task_in_tx.send(task).await.unwrap();
+        drop(task_in_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), pool_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_out_rx.try_recv(), Ok(7));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let (task_in_tx, task_in_rx) = async_bounded(3);
+        let (task_out_tx, task_out_rx) = sync_bounded(3);
         let (started_tx, started_rx) = async_bounded(1);
-        let dropped = Arc::new(AtomicBool::new(false));
+        let running_dropped = Arc::new(AtomicBool::new(false));
+        let queued_dropped = [Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))];
         let shutdown = Shutdown::new();
         let pool = AsyncTaskPool::new(task_in_rx, task_out_tx, shutdown.clone(), 1);
         let pool_task = tokio::spawn(pool.event_loop());
 
-        task_in_tx
-            .send(PendingTask {
-                started_tx,
-                dropped: dropped.clone(),
+        let running_marker = DropMarker {
+            dropped: running_dropped.clone(),
+        };
+        let mut running_task = MockTask::new();
+        running_task.expect_run().once().return_once(move || {
+            Box::pin(async move {
+                let _marker = running_marker;
+                started_tx.send(()).await.unwrap();
+                std::future::pending::<usize>().await
             })
-            .await
-            .expect("async task cancellation test input should remain open");
+        });
+        task_in_tx.send(running_task).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
             .await
-            .expect("async task should start before the test timeout")
-            .expect("async task start sender should remain open");
+            .unwrap()
+            .unwrap();
+        for dropped in &queued_dropped {
+            task_in_tx.send(new_task(dropped.clone())).await.unwrap();
+        }
 
         shutdown.shutdown();
         tokio::time::timeout(std::time::Duration::from_secs(1), pool_task)
             .await
-            .expect("async task pool should stop after shutdown")
-            .expect("async task pool should not panic")
-            .expect("async task pool should stop successfully");
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
-        assert!(dropped.load(Ordering::Acquire));
+        assert!(running_dropped.load(Ordering::Acquire));
+        assert!(queued_dropped.iter().all(|dropped| dropped.load(Ordering::Acquire)));
+        assert!(task_in_tx.is_empty());
         assert!(task_out_rx.try_recv().is_err());
+    }
+
+    fn new_task(dropped: Arc<AtomicBool>) -> MockTask {
+        let marker = DropMarker { dropped };
+        let mut task = MockTask::new();
+        task.expect_run().never().return_once(move || {
+            drop(marker);
+            unreachable!("queued async task should not execute")
+        });
+        task
     }
 }

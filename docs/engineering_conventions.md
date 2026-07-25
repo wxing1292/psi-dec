@@ -200,9 +200,17 @@ Exercise the production owner API and real contract boundary. A helper-only test
 setter/record/submission wiring; retain it only when the helper owns reusable semantics that cannot be covered clearly
 through production.
 
-Use `fixture_*` for test data/builders and `reference_*` for slow or CPU oracles. Reserve `test_*` for test entry points.
-Do not retain constructor-only tests already covered by stronger execution tests or tests of derived Rust behavior such
-as `PartialEq`.
+Use `fixture_*` for structured test data/builders and `reference_*` for slow or CPU oracles. Use a simple `new_<noun>`
+name, such as `new_task`, for a small test-local mock constructor. Reserve `test_*` for test entry points, list test
+entries before local helper functions, and keep those helpers at the end of the test module. Do not retain
+constructor-only tests already covered by stronger execution tests or tests of derived Rust behavior such as
+`PartialEq`.
+
+Test setup and coordination operations whose failure is not the behavior under test use `unwrap()` instead of verbose
+`expect(...)` messages. Mockall expectations use `.once()` for exactly one call, `.times(n)` for repeated calls, and
+`.never()` for forbidden calls; omit a call count only when it is intentionally unconstrained. Use `return_const` for a
+cloneable fixed result, `return_once` for a one-shot or move-capturing result, and `returning` for a repeatable computed
+result.
 
 Optimized numerical paths should have concise fixed-input and random-input tests against a CPU/slow reference.
 Reference implementations favor obvious correctness and clean clippy output: use a named input struct instead of a long

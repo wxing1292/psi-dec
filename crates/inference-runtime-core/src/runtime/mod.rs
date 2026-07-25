@@ -1,6 +1,7 @@
 pub mod pin_cache;
 pub mod decoder;
 pub mod scheduler;
+pub mod tasks;
 
 mod request;
 pub use request::AtomicRequestStatus;
