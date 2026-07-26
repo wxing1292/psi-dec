@@ -296,15 +296,24 @@ If only executor-local state must be replaced for one forward, use a specific se
 
 Runtime core owns token-id stop and EOS completion at the request commit boundary. The executor reports sampled tokens; core checks configured stop token sequences, commits decoder/cache state, truncates the user-visible output after the first matched stop sequence, and then marks the request completed. EOS is represented as a one-token stop sequence.
 
-Model executors may provide model-specific default stop sequences, such as Qwen EOS token IDs. The service merges those defaults with request-provided stop sequences and de-duplicates the token sequences before submitting the request to core.
+The successful status records `CompletionReason::StopSequence` when the stop
+matcher observed a match, `LengthLimit` when the caller-visible output limit was
+reached, or `ContextLimit` when a future context-window limit is reached. The
+current runtime produces the first two reasons; context-window enforcement is
+tracked in [`future_work.md`](future_work.md). A stop match wins when both
+current conditions occur on the same commit. Service layers map the recorded
+reason and must not infer it from emitted token count.
 
-String stop conditions belong in tokenizer/detokenizer or service output handling, not in the model executor: token-id EOS/stop is handled by scheduler/request lifecycle code, while text stop strings are applied in output/detokenization paths.
+Model executors may provide model-specific default stop sequences, such as Qwen
+EOS token IDs. The service merges caller-provided token sequences with model
+defaults and de-duplicates them before submitting the request to core.
 
 Per-request token/probability delivery must not silently drop committed output.
 The current runtime uses an unbounded internal channel between request commit
-and the asynchronous RPC forwarding task. Dropping the external request closes
-the channel and cancels the request lifecycle. Slow-consumer memory accounting
-and a bounded request-local cancellation policy remain future work.
+and the transport-neutral `DecodeResponse`. Dropping that response drops its
+external request, closes the receiver, and cancels the request lifecycle.
+Slow-consumer memory accounting and a bounded request-local cancellation policy
+remain future work.
 
 `max_sampled_tokens` is a caller-visible output limit. A speculative step may
 commit more sampled tokens to decoder/cache state than the caller's remaining
@@ -346,7 +355,7 @@ Request status tracks lifecycle ownership, not scheduler placement:
 Initialized -> queued request exists but has not entered runtime admission
 Running     -> request owns a request slot in the normal runtime path
 Swapped     -> request ownership is held by an async reservation task and may later be re-enqueued
-terminal    -> Cancelled, TimedOut, Aborted, or Completed
+terminal    -> Cancelled, TimedOut, Aborted, or Completed(CompletionReason)
 ```
 
 Scheduler-internal locations such as new queue, run queue, pending device work,

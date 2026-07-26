@@ -25,7 +25,6 @@ pub struct ModelConfig {
 
 #[derive(Clone, Debug)]
 pub struct InputConfig {
-    request_id: Option<u64>,
     prompt_str: Option<String>,
     prompt_file: Option<PathBuf>,
 }
@@ -77,7 +76,6 @@ impl DecodeConfig {
                 tokenizer_file: args.tokenizer_file,
             },
             input: InputConfig {
-                request_id: args.request_id,
                 prompt_str: args.prompt_str,
                 prompt_file: args.prompt_file,
             },
@@ -140,8 +138,15 @@ impl ModelConfig {
 }
 
 impl InputConfig {
-    pub fn request_id(&self) -> Option<u64> {
-        self.request_id
+    pub fn read_prompt(&self) -> DecodeCliResult<String> {
+        if let Some(prompt) = &self.prompt_str {
+            return Ok(prompt.clone());
+        }
+        let path = self
+            .prompt_file
+            .as_ref()
+            .expect("validated input config must contain one prompt source");
+        std::fs::read_to_string(path).map_err(|error| format!("unable to read prompt file {path:?}: {error}").into())
     }
     pub fn prompt_str(&self) -> Option<&str> {
         self.prompt_str.as_deref()

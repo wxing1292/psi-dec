@@ -18,6 +18,7 @@ license = "MIT"
 repository = "https://github.com/wxing1292/psi-dec"
 
 [workspace.dependencies]
+axum = "0.8"
 ahash = "0.8"
 async-channel = "2.5"
 async-trait = "0.1"

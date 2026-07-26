@@ -12,11 +12,10 @@ use config::DecodeConfig;
 mod error;
 use error::DecodeCliResult;
 
+mod output;
+
 mod executor;
 use executor::DecodeExecutor;
-
-mod req_resp;
-use req_resp::DecodeInput;
 
 mod stream;
 
@@ -36,8 +35,11 @@ async fn main() {
 async fn run() -> DecodeCliResult<()> {
     let config = DecodeConfig::from_args(Args::parse())?;
     let tokenizer = load_tokenizer(config.model())?;
-    let input = DecodeInput::from_config(config.input())?;
-    let _output = DecodeExecutor::connect(config, tokenizer).await?.execute(input).await?;
+    let prompt = config.input().read_prompt()?;
+    DecodeExecutor::connect(config, tokenizer)
+        .await?
+        .execute(&prompt)
+        .await?;
     Ok(())
 }
 

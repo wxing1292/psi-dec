@@ -67,8 +67,9 @@ fn run(kind: ModelKind) -> Result<()> {
     let model_config = load_model_config(config.hf_model_dir())?;
     tracing::info!(
         target: "inference-runtime-service::startup",
-        listen_addr = %config.listen_addr(),
-        "decode service listener configured"
+        grpc_listen_addr = %config.grpc_listen_addr(),
+        http_listen_addr = %config.http_listen_addr(),
+        "decode service listeners configured"
     );
     validate_checkpoint_kind(kind, &model_config)?;
     let scheduler_config = config.scheduler_config();
@@ -108,7 +109,8 @@ fn run(kind: ModelKind) -> Result<()> {
 
     startup.event("initializing runtime");
     serve_qwen35(
-        config.listen_addr(),
+        config.grpc_listen_addr(),
+        config.http_listen_addr(),
         runtime_config,
         scheduler_config,
         model,
@@ -240,7 +242,8 @@ fn build_runtime_config(
 }
 
 fn serve_qwen35(
-    listen_addr: std::net::SocketAddr,
+    grpc_listen_addr: std::net::SocketAddr,
+    http_listen_addr: std::net::SocketAddr,
     runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
     model: Qwen35Executor,
@@ -250,7 +253,8 @@ fn serve_qwen35(
     match num_mtp_modules {
         0 => {
             serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 1, _>(
-                listen_addr,
+                grpc_listen_addr,
+                http_listen_addr,
                 runtime_config,
                 scheduler_config,
                 model,
@@ -259,7 +263,8 @@ fn serve_qwen35(
         },
         1 => {
             serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 2, _>(
-                listen_addr,
+                grpc_listen_addr,
+                http_listen_addr,
                 runtime_config,
                 scheduler_config,
                 model,

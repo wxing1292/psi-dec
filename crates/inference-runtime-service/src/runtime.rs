@@ -7,6 +7,7 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TrySendError;
 use crossbeam_channel::bounded as sync_bounded;
+use inference_runtime_core::Error;
 use inference_runtime_core::Result;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
@@ -24,6 +25,7 @@ use inference_runtime_core::runtime::AtomicRequestStatus;
 use inference_runtime_core::runtime::ExternalRequest;
 use inference_runtime_core::runtime::InternalRequest;
 use inference_runtime_core::runtime::QueuedRequest;
+use inference_runtime_core::runtime::RawRequestID;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::RequestSlotAllocator;
 use inference_runtime_core::runtime::Token;
@@ -38,11 +40,11 @@ use inference_runtime_core::runtime::scheduler::InstrumentedScheduler;
 use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
-use tonic::Status;
 
+use crate::api::Inference;
 use crate::consts::NUM_TRIE_PARTITION;
 use crate::executor::ReplayableModelExecutorLoop;
-use crate::service::run_rpc_server;
+use crate::rpc::run_servers;
 
 type RuntimeBlockCache<const P: usize, const L: usize> =
     MultiLaneTrieBlockCache<P, L, TPKVBlockAllocator, TPStateBlockAllocator>;
@@ -201,26 +203,25 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
 
     pub fn initialize_req(
         &self,
-        request_id: u64,
+        request_id: RawRequestID,
         tokens: Vec<Token>,
         sampling_config: SamplingConfig,
     ) -> (RuntimeQueuedRequest<N, P, L>, ExternalRequest) {
-        let req_id = request_id as usize;
         let req_status = AtomicRequestStatus::new();
         let decoder_kv_blocks = TrieDecoderBlocks::new(self.block_cache.clone(), [], tokens, []);
         let (token_prob_tx, token_prob_rx) = async_unbounded();
         let queued_request = QueuedRequest::new(
-            req_id,
+            request_id,
             req_status.clone(),
             decoder_kv_blocks,
             token_prob_tx,
             sampling_config,
         );
-        let external_request = ExternalRequest::new(req_id, req_status, token_prob_rx);
+        let external_request = ExternalRequest::new(request_id, req_status, token_prob_rx);
         (queued_request, external_request)
     }
 
-    pub fn submit_req(&self, queued_request: RuntimeQueuedRequest<N, P, L>) -> Result<(), Status> {
+    pub fn submit_req(&self, queued_request: RuntimeQueuedRequest<N, P, L>) -> Result<()> {
         let request_id = queued_request.req_id();
         match self.user_req_tx.try_send(queued_request) {
             Ok(()) => {
@@ -239,9 +240,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                     request_id,
                     "request queue is full"
                 );
-                Err(Status::resource_exhausted(
-                    "inference runtime service: request queue is full",
-                ))
+                Err(Error::resource_exhausted("decode queue is full"))
             },
             Err(TrySendError::Disconnected(_)) => {
                 tracing::debug!(
@@ -250,7 +249,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                     request_id,
                     "runtime is stopped"
                 );
-                Err(Status::unavailable("inference runtime service: runtime is stopped"))
+                Err(Error::unavailable("runtime is stopped"))
             },
         }
     }
@@ -284,7 +283,8 @@ impl<const N: usize, const L: usize, const P: usize> Drop for InferenceRuntime<N
 }
 
 pub fn serve_replay_model<const N: usize, const L: usize, M>(
-    listen_addr: SocketAddr,
+    grpc_listen_addr: SocketAddr,
+    http_listen_addr: SocketAddr,
     model_runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
     model: M,
@@ -303,16 +303,16 @@ where
         shutdown.clone(),
         server_tokio_runtime.handle(),
     ));
-    let server_runtime = runtime.clone();
+    let inference = Arc::new(Inference::new(runtime.clone(), default_stop_sequences));
     let server_shutdown = shutdown.clone();
     let server_thread = std::thread::Builder::new()
-        .name("inference-rpc-server".to_string())
+        .name("inference-rpc-servers".to_string())
         .spawn(move || {
             let _shutdown_guard = ShutdownGuard::new(server_shutdown.clone());
-            server_tokio_runtime.block_on(run_rpc_server(
-                listen_addr,
-                server_runtime,
-                default_stop_sequences,
+            server_tokio_runtime.block_on(run_servers(
+                grpc_listen_addr,
+                http_listen_addr,
+                inference,
                 server_shutdown,
             ))
         })
@@ -333,7 +333,6 @@ where
     server_thread
         .join()
         .map_err(|_| log_err_internal!("RPC server thread panicked"))?
-        .map_err(|error| log_err_unavailable!("{error}"))
 }
 
 #[cfg(test)]

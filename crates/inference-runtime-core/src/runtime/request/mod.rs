@@ -1,5 +1,6 @@
 mod status;
 pub use status::AtomicRequestStatus;
+pub use status::CompletionReason;
 pub use status::RequestStatus;
 
 mod queued_request;

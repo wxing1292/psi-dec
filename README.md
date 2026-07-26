@@ -9,7 +9,8 @@ can evolve independently.
 
 ```text
 client
-  -> service: tokenize and validate the request
+  -> client/RPC adapter: produce model-ready tokens
+  -> inference API: validate and submit the decode request
   -> runtime core: schedule work, own request lifecycle and cache pages
   -> Qwen executor: turn runtime metadata into model execution
   -> Metal backend: replay recorded GPU commands
@@ -71,7 +72,8 @@ Start the service:
 
 ```sh
 cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
-  --listen-addr 127.0.0.1:50061 \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
   --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
   --mtp-module 1

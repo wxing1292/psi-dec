@@ -7,6 +7,7 @@ use crate::runtime::decoder::trie_cache::DecoderBlocks;
 use crate::runtime::decoder::trie_cache::InitBlockOnceResult;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::decoder::trie_cache::token_consumption;
+use crate::runtime::request::CompletionReason;
 use crate::runtime::request::InternalRequest;
 use crate::runtime::request::internal_request::StopSequenceMatch;
 use crate::runtime::scheduler::CancelResult;
@@ -126,9 +127,10 @@ where
         {
             self.send_token_probs(token_probs);
         }
-        if stop_match.matched() || self.decoder_blocks.num_sampled_tokens() >= self.sampling_config().max_sampled_tokens
-        {
-            self.store_completed();
+        if stop_match.matched() {
+            self.store_completed(CompletionReason::StopSequence);
+        } else if self.decoder_blocks.num_sampled_tokens() >= self.sampling_config().max_sampled_tokens {
+            self.store_completed(CompletionReason::LengthLimit);
         }
 
         if self.status().is_terminal() {

@@ -450,8 +450,8 @@ print("{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f}".format(
     j["input_tokens"],
     j["ttft_ms"],
     j["prompt_tokens_per_s"],
-    j["inter_token_p50_ms"],
-    j["inter_token_p95_ms"],
+    j["inter_chunk_p50_ms"],
+    j["inter_chunk_p95_ms"],
     proposed,
     accepted,
     acceptance_rate,
@@ -705,7 +705,7 @@ run_named_case() {
   case "$1" in
     27b_off)
       run_server_case 27b_off "256 384" target/release/qwen3_5_dense \
-        --listen-addr "127.0.0.1:${PORT}" \
+        --grpc-listen-addr "127.0.0.1:${PORT}" \
         --hf-model-dir "$MODEL_27B" \
         --mtp-module 0 \
         --num-cache-pages "$NUM_CACHE_PAGES" \
@@ -715,7 +715,7 @@ run_named_case() {
       ;;
     27b_on)
       run_server_case 27b_on "256 384" target/release/qwen3_5_dense \
-        --listen-addr "127.0.0.1:${PORT}" \
+        --grpc-listen-addr "127.0.0.1:${PORT}" \
         --hf-model-dir "$MODEL_27B" \
         --hf-mtp-model-dir "$MTP_27B" \
         --mtp-module 1 \
@@ -726,7 +726,7 @@ run_named_case() {
       ;;
     35b_off)
       run_server_case 35b_off "256 1024" target/release/qwen3_5_sparse \
-        --listen-addr "127.0.0.1:${PORT}" \
+        --grpc-listen-addr "127.0.0.1:${PORT}" \
         --hf-model-dir "$MODEL_35B" \
         --mtp-module 0 \
         --num-cache-pages "$NUM_CACHE_PAGES" \
@@ -736,7 +736,7 @@ run_named_case() {
       ;;
     35b_on)
       run_server_case 35b_on "256 1024" target/release/qwen3_5_sparse \
-        --listen-addr "127.0.0.1:${PORT}" \
+        --grpc-listen-addr "127.0.0.1:${PORT}" \
         --hf-model-dir "$MODEL_35B" \
         --hf-mtp-model-dir "$MTP_35B" \
         --mtp-module 1 \

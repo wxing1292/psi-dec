@@ -5,6 +5,7 @@ pub mod tasks;
 
 mod request;
 pub use request::AtomicRequestStatus;
+pub use request::CompletionReason;
 pub use request::ExternalRequest;
 pub use request::InternalRequest;
 pub use request::QueuedRequest;
@@ -12,6 +13,7 @@ pub use request::RequestSlot;
 pub use request::RequestSlotAllocationResult;
 pub use request::RequestSlotAllocator;
 pub use request::RequestStatus;
+pub use request::TokenProbs;
 
 mod token;
 pub use token::Token;

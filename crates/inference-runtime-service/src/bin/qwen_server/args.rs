@@ -8,7 +8,10 @@ use clap::ValueEnum;
 #[derive(Debug, Parser)]
 pub struct Qwen35Args {
     #[arg(long, default_value = "127.0.0.1:50051")]
-    pub listen_addr: SocketAddr,
+    pub grpc_listen_addr: SocketAddr,
+
+    #[arg(long, default_value = "127.0.0.1:8000")]
+    pub http_listen_addr: SocketAddr,
 
     #[arg(long, value_name = "DIR")]
     pub hf_model_dir: PathBuf,

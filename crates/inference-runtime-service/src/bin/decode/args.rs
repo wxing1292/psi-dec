@@ -20,9 +20,6 @@ pub struct Args {
     #[arg(long, default_value = "http://127.0.0.1:50061")]
     pub server_url: String,
 
-    #[arg(long)]
-    pub request_id: Option<u64>,
-
     #[arg(long, value_name = "DIR")]
     pub hf_model_dir: Option<PathBuf>,
 

@@ -55,7 +55,7 @@ impl SharedMem {
         let c_path = CString::new(path).map_err(|_| {
             let msg = format!("unable to convert path: {path} to cstring");
             tracing::error!(msg);
-            Error::InternalError(msg)
+            Error::Internal(msg)
         })?;
         let owned_fd = match shm_open(c_path.as_c_str(), flag, mode) {
             Ok(owned_fd) => owned_fd,
@@ -64,7 +64,7 @@ impl SharedMem {
                     "unable to create / open shared mem {path}, flag: {flag:?}, mode: {mode:?}, errno: {errno}"
                 );
                 tracing::error!(msg);
-                return Err(Error::InternalError(msg));
+                return Err(Error::Internal(msg));
             },
         };
         let cleanup_created_name = || {
@@ -77,13 +77,13 @@ impl SharedMem {
                 cleanup_created_name();
                 let msg = format!("unable to ftruncate path: {path}, errno: {errno}");
                 tracing::error!(msg);
-                Error::InternalError(msg)
+                Error::Internal(msg)
             })?;
         } else {
             let stat = fstat(owned_fd.as_fd()).map_err(|errno| {
                 let msg = format!("unable to stat shared mem {path}, errno: {errno}");
                 tracing::error!(msg);
-                Error::InternalError(msg)
+                Error::Internal(msg)
             })?;
             if stat.st_size < len as i64 {
                 let msg = format!(
@@ -91,7 +91,7 @@ impl SharedMem {
                     stat.st_size
                 );
                 tracing::error!(msg);
-                return Err(Error::InternalError(msg));
+                return Err(Error::Internal(msg));
             }
         }
         let ptr = match unsafe {
@@ -109,7 +109,7 @@ impl SharedMem {
                 cleanup_created_name();
                 let msg = format!("unable to map shared mem {path}, errno: {errno}");
                 tracing::error!(msg);
-                return Err(Error::InternalError(msg));
+                return Err(Error::Internal(msg));
             },
         }
         .cast();

@@ -8,6 +8,7 @@ use crate::runtime::RequestSlot;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use crate::runtime::request::AtomicRequestStatus;
+use crate::runtime::request::CompletionReason;
 use crate::runtime::request::RequestStatus;
 use crate::runtime::request::TokenProbs;
 
@@ -69,7 +70,7 @@ where
             pub fn store_swapped(&self) -> bool;
             pub fn store_timed_out(&self) -> bool;
             pub fn store_aborted(&self) -> bool;
-            pub fn store_completed(&self) -> bool;
+            pub fn store_completed(&self, completion: CompletionReason) -> bool;
         }
     }
 

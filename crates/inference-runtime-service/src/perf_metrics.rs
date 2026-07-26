@@ -201,7 +201,7 @@ pub struct DecodePerfMetrics {
     pub elapsed: Duration,
     pub ttft: Option<Duration>,
     pub decode_elapsed: Option<Duration>,
-    pub inter_token_latencies: Vec<Duration>,
+    pub inter_chunk_latencies: Vec<Duration>,
 }
 
 impl DecodePerfMetrics {
@@ -217,25 +217,25 @@ impl DecodePerfMetrics {
         rate(self.sampled_tokens, self.decode_elapsed?)
     }
 
-    pub fn avg_inter_token_ms(&self) -> Option<f64> {
-        if self.inter_token_latencies.is_empty() {
+    pub fn avg_inter_chunk_ms(&self) -> Option<f64> {
+        if self.inter_chunk_latencies.is_empty() {
             return None;
         }
         Some(
-            self.inter_token_latencies
+            self.inter_chunk_latencies
                 .iter()
                 .map(|duration| duration.as_secs_f64() * 1000.0)
                 .sum::<f64>()
-                / self.inter_token_latencies.len() as f64,
+                / self.inter_chunk_latencies.len() as f64,
         )
     }
 
-    pub fn p50_inter_token_ms(&self) -> Option<f64> {
-        percentile_ms(&self.inter_token_latencies, 0.50)
+    pub fn p50_inter_chunk_ms(&self) -> Option<f64> {
+        percentile_ms(&self.inter_chunk_latencies, 0.50)
     }
 
-    pub fn p95_inter_token_ms(&self) -> Option<f64> {
-        percentile_ms(&self.inter_token_latencies, 0.95)
+    pub fn p95_inter_chunk_ms(&self) -> Option<f64> {
+        percentile_ms(&self.inter_chunk_latencies, 0.95)
     }
 
     pub fn json_line(&self) -> String {
@@ -252,9 +252,9 @@ impl DecodePerfMetrics {
             "prompt_tokens_per_s": self.prompt_tokens_per_s(),
             "overall_tokens_per_s": self.overall_tokens_per_s(),
             "decode_tokens_per_s": self.decode_tokens_per_s(),
-            "inter_token_avg_ms": self.avg_inter_token_ms(),
-            "inter_token_p50_ms": self.p50_inter_token_ms(),
-            "inter_token_p95_ms": self.p95_inter_token_ms(),
+            "inter_chunk_avg_ms": self.avg_inter_chunk_ms(),
+            "inter_chunk_p50_ms": self.p50_inter_chunk_ms(),
+            "inter_chunk_p95_ms": self.p95_inter_chunk_ms(),
         })
         .to_string()
     }
@@ -326,7 +326,7 @@ mod tests {
             elapsed: Duration::from_millis(100),
             ttft: Some(Duration::from_millis(30)),
             decode_elapsed: Some(Duration::from_millis(70)),
-            inter_token_latencies: vec![Duration::from_millis(20)],
+            inter_chunk_latencies: vec![Duration::from_millis(20)],
         };
 
         let value: serde_json::Value = serde_json::from_str(&metrics.json_line()).unwrap();

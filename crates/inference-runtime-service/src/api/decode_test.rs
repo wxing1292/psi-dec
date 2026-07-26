@@ -1,0 +1,172 @@
+use inference_runtime_core::config::DEFAULT_SAMPLING_TEMPERATURE;
+use inference_runtime_core::config::DEFAULT_SAMPLING_TOP_K;
+use inference_runtime_core::config::DEFAULT_SAMPLING_TOP_P;
+use inference_runtime_core::runtime::AtomicRequestStatus;
+use ordered_float::NotNan;
+use tokio_stream::StreamExt;
+
+use super::*;
+
+#[test]
+fn test_request_validation() {
+    let mut sampling = fixture_sampling(1);
+    assert!(matches!(
+        DecodeRequest::new(Vec::new(), sampling.clone()),
+        Err(Error::InvalidArgument(_))
+    ));
+    sampling.max_sampled_tokens = 0;
+    assert!(matches!(
+        DecodeRequest::new(vec![fixture_token(1)], sampling.clone()),
+        Err(Error::InvalidArgument(_))
+    ));
+    sampling.max_sampled_tokens = 1;
+    sampling.temperature = f32::NAN;
+    assert!(matches!(
+        DecodeRequest::new(vec![fixture_token(1)], sampling.clone()),
+        Err(Error::InvalidArgument(_))
+    ));
+    sampling.temperature = 1.0;
+    sampling.top_k = 0;
+    assert!(matches!(
+        DecodeRequest::new(vec![fixture_token(1)], sampling.clone()),
+        Err(Error::InvalidArgument(_))
+    ));
+    sampling.top_k = 1;
+    sampling.top_p = 2.0;
+    assert!(matches!(
+        DecodeRequest::new(vec![fixture_token(1)], sampling.clone()),
+        Err(Error::InvalidArgument(_))
+    ));
+    sampling.top_p = 1.0;
+    sampling.stop_sequences.push(Vec::new());
+    assert!(matches!(
+        DecodeRequest::new(vec![fixture_token(1)], sampling),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn test_stop_sequences_merge_and_deduplicate() {
+    let mut input = vec![vec![fixture_token(3)], vec![fixture_token(1)]];
+    merge_stop_sequences(&mut input, &[vec![fixture_token(2)], vec![fixture_token(1)]]);
+    assert_eq!(
+        input,
+        vec![vec![fixture_token(1)], vec![fixture_token(2)], vec![fixture_token(3)]]
+    );
+}
+
+#[tokio::test]
+async fn test_response_preserves_token_chunks() {
+    let (response, sender, status) = fixture_request(RequestStatus::Completed(CompletionReason::StopSequence));
+    let mut response = Box::pin(response);
+    sender
+        .send(TokenProbs {
+            tokens: vec![fixture_token(1), fixture_token(2)],
+            probs: vec![NotNan::new(0.1).unwrap(), NotNan::new(0.2).unwrap()],
+        })
+        .await
+        .unwrap();
+    drop(sender);
+    match response.next().await.unwrap().unwrap() {
+        DecodeEvent::TokenProbs(chunk) => assert_eq!(chunk.tokens.len(), 2),
+        _ => panic!("expected token chunk"),
+    }
+    assert!(matches!(
+        response.next().await.unwrap().unwrap(),
+        DecodeEvent::Completed { .. }
+    ));
+    assert!(response.next().await.is_none());
+    assert!(status.load().is_terminal());
+}
+
+#[tokio::test]
+async fn test_response_completes_on_stop_sequence() {
+    assert_completion_reason(CompletionReason::StopSequence).await;
+}
+
+#[tokio::test]
+async fn test_response_completes_on_length_limit() {
+    assert_completion_reason(CompletionReason::LengthLimit).await;
+}
+
+#[tokio::test]
+async fn test_response_completes_on_context_limit() {
+    assert_completion_reason(CompletionReason::ContextLimit).await;
+}
+
+#[tokio::test]
+async fn test_response_maps_terminal_errors() {
+    for status in [
+        RequestStatus::Cancelled,
+        RequestStatus::TimedOut,
+        RequestStatus::Aborted,
+    ] {
+        let (response, sender, _) = fixture_request(status);
+        let mut response = Box::pin(response);
+        drop(sender);
+        let error = response.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            (status, error),
+            (RequestStatus::Cancelled, Error::Cancelled(_))
+                | (RequestStatus::TimedOut, Error::DeadlineExceeded(_))
+                | (RequestStatus::Aborted, Error::Aborted(_))
+        ));
+    }
+}
+
+#[test]
+fn test_response_drop_cancels_request() {
+    let (response, _sender, status) = fixture_request(RequestStatus::Initialized);
+    drop(response);
+    assert_eq!(status.load(), RequestStatus::Cancelled);
+}
+
+async fn assert_completion_reason(expected: CompletionReason) {
+    let (response, sender, _) = fixture_request(RequestStatus::Completed(expected));
+    let mut response = Box::pin(response);
+    drop(sender);
+    match response.next().await.unwrap().unwrap() {
+        DecodeEvent::Completed { reason, .. } => assert_eq!(reason, expected),
+        DecodeEvent::TokenProbs(_) => panic!("expected completion"),
+    }
+}
+
+fn fixture_token(value: u32) -> Token {
+    Token::new(value)
+}
+
+fn fixture_sampling(max_sampled_tokens: usize) -> SamplingConfig {
+    SamplingConfig {
+        max_sampled_tokens,
+        temperature: DEFAULT_SAMPLING_TEMPERATURE,
+        top_k: DEFAULT_SAMPLING_TOP_K,
+        top_p: DEFAULT_SAMPLING_TOP_P,
+        seed: None,
+        stop_sequences: Vec::new(),
+    }
+}
+
+fn fixture_request(status: RequestStatus) -> (DecodeResponse, async_channel::Sender<TokenProbs>, AtomicRequestStatus) {
+    let (sender, receiver) = async_channel::unbounded();
+    let request_status = AtomicRequestStatus::new();
+    match status {
+        RequestStatus::Cancelled => {
+            request_status.store_cancelled();
+        },
+        RequestStatus::TimedOut => {
+            request_status.store_timed_out();
+        },
+        RequestStatus::Aborted => {
+            request_status.store_aborted();
+        },
+        RequestStatus::Completed(completion) => {
+            request_status.store_completed(completion);
+        },
+        RequestStatus::Initialized => {},
+        RequestStatus::Running | RequestStatus::Swapped => {
+            request_status.store_running();
+        },
+    }
+    let request = ExternalRequest::new(42, request_status.clone(), receiver);
+    (DecodeResponse::new(request), sender, request_status)
+}

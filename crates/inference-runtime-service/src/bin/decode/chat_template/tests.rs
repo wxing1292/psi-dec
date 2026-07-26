@@ -108,7 +108,6 @@ fn config_with(mode: ChatTemplateMode, template: Option<String>, enable_thinking
 fn args_with(mode: ChatTemplateMode, template: Option<String>, enable_thinking: bool) -> Args {
     Args {
         server_url: "http://127.0.0.1:50051".to_string(),
-        request_id: Some(1),
         hf_model_dir: None,
         tokenizer_file: Some(PathBuf::from("tokenizer.json")),
         prompt_str: Some("hello".to_string()),

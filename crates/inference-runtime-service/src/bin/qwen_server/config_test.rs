@@ -30,9 +30,16 @@ fn test_scheduler_overrides() {
 
 #[test]
 fn test_listener_overrides() {
-    let config = Qwen35Config::from_args(parse(&["--listen-addr", "127.0.0.1:50061"])).unwrap();
+    let config = Qwen35Config::from_args(parse(&[
+        "--grpc-listen-addr",
+        "127.0.0.1:50061",
+        "--http-listen-addr",
+        "127.0.0.1:8001",
+    ]))
+    .unwrap();
 
-    assert_eq!(config.listen_addr(), "127.0.0.1:50061".parse().unwrap());
+    assert_eq!(config.grpc_listen_addr(), "127.0.0.1:50061".parse().unwrap());
+    assert_eq!(config.http_listen_addr(), "127.0.0.1:8001".parse().unwrap());
 }
 
 #[test]

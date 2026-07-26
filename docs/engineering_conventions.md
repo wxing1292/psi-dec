@@ -216,6 +216,10 @@ entries before local helper functions, and keep those helpers at the end of the 
 constructor-only tests already covered by stronger execution tests or tests of derived Rust behavior such as
 `PartialEq`.
 
+Keep a small focused test module inline. When test coverage materially lengthens
+the production owner, move it to a sibling `*_test.rs` declared by that owner
+under `cfg(test)`; do not create a separate file for only a few concise cases.
+
 Test setup and coordination operations whose failure is not the behavior under test use `unwrap()` instead of verbose
 `expect(...)` messages. Mockall expectations use `.once()` for exactly one call, `.times(n)` for repeated calls, and
 `.never()` for forbidden calls; omit a call count only when it is intentionally unconstrained. Use `return_const` for a

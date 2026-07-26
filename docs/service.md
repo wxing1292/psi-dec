@@ -44,13 +44,26 @@ converter and component tests are for future integration work.
 
 Use the MTP-enabled service path for general decoding:
 
+Dense:
+
 ```sh
-cargo run --release -p inference-runtime-service --bin <qwen3_5_dense|qwen3_5_sparse> -- \
-  --listen-addr 127.0.0.1:50061 \
-  --hf-model-dir <target-model-dir> \
-  --hf-mtp-model-dir <mtp-model-dir> \
-  --mtp-module 1 \
-  --logging info
+cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
+  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
+  --mtp-module 1
+```
+
+Sparse:
+
+```sh
+cargo run --release -p inference-runtime-service --bin qwen3_5_sparse -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
+  --hf-mtp-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
+  --mtp-module 1
 ```
 
 `--mtp-module 0` is useful for controlled target-only tests. Run one GPU service at a time. Qwen uses
@@ -67,15 +80,30 @@ requests, 128 flattened tokens, and 64 tokens per request in one batch.
 ```sh
 cargo run --release -p inference-runtime-service --bin decode -- \
   --server-url http://127.0.0.1:50061 \
-  --hf-model-dir <tokenizer-model-dir> \
+  --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
+  --top-k 64 \
+  --top-p 0.8 \
+  --seed 59 \
+  --chat-template auto \
   --prompt-str "Explain paged KV cache in one paragraph." \
-  --max-sampled-tokens 128 \
-  --show-stats
+  --max-sampled-tokens 8192 \
+  --show-stats \
+  --print-prompt
 ```
 
 The client model directory supplies tokenizer and chat-template files; the server controls the target model. Use
 `--chat-template qwen-fixed --disable-thinking` when a deterministic non-thinking Qwen prompt is required. That mode
 emits the checkpoint-canonical closed empty reasoning block before generation.
+
+## HTTP checkpoint
+
+The HTTP listener binds alongside gRPC and exposes OpenAI-compatible
+`POST /v1/chat/completions` parsing scaffolding. Omitting `stream` or setting it
+to `false` selects a collected Chat Completion response; setting it to `true`
+selects Chat Completion chunks over SSE. The handler stops at explicit
+unavailable preprocessing/postprocessing boundaries and is not operational yet.
+It does not run Qwen chat-template or tool-call logic inside RPC. The remaining
+work is tracked in [`future_work.md`](future_work.md).
 
 ## Execution and logging
 

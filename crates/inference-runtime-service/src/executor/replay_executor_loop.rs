@@ -15,7 +15,6 @@ use inference_runtime_core::compute::ReplayableModelBatchExecutor;
 use inference_runtime_core::compute::SampledTokens;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
-use tonic::Status;
 
 use crate::perf_metrics::ExecutorBatchPerfMetrics;
 use crate::perf_metrics::emit_executor_batch_perf_metrics;
@@ -61,7 +60,7 @@ where
         self
     }
 
-    pub fn event_loop(mut self) -> Result<(), Status> {
+    pub fn event_loop(mut self) {
         let span = tracing::info_span!("replayable executor loop");
         let _enter = span.enter();
         tracing::info!("started");
@@ -94,7 +93,7 @@ where
                     match op.recv(&self.batch_dev_req_rx) {
                         Ok(batch_dev_req) => {
                             self.reset_req_slots();
-                            let batch_dev_resp = self.execute(batch_dev_req)?;
+                            let batch_dev_resp = self.execute(batch_dev_req);
                             if let Err(err) = self.batch_dev_resp_tx.send(batch_dev_resp) {
                                 tracing::info!("unable to send batch device response, err: {err}, stopping");
                                 break 'event_loop;
@@ -112,7 +111,6 @@ where
 
         self.shutdown.shutdown();
         tracing::info!("stopped");
-        Ok(())
     }
 
     fn reset_req_slots(&mut self) {
@@ -124,7 +122,7 @@ where
         }
     }
 
-    fn execute(&mut self, batch_req: BatchDeviceRequest) -> Result<BatchDeviceResponse, Status> {
+    fn execute(&mut self, batch_req: BatchDeviceRequest) -> BatchDeviceResponse {
         let total_start = Instant::now();
         let batch_seq = batch_req.seq;
         let batch_summary = summarize_batch_device_request(&batch_req);
@@ -146,7 +144,7 @@ where
         let _executor_batch_span = profiling::span("executor.batch");
 
         if batch_req.dev_reqs.is_empty() {
-            return Ok(BatchDeviceResponse::new(batch_seq, Vec::new()));
+            return BatchDeviceResponse::new(batch_seq, Vec::new());
         }
 
         let prepare_batch_start = Instant::now();
@@ -265,7 +263,7 @@ where
             "executor batch response"
         );
 
-        Ok(batch_resp)
+        batch_resp
     }
 }
 
@@ -456,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_drains_request_slot_resets_without_a_device_batch() {
+    fn test_executor_drains_request_slot_resets_without_a_device_batch() {
         let (_batch_dev_req_tx, batch_dev_req_rx) = bounded(1);
         let (batch_dev_resp_tx, _batch_dev_resp_rx) = bounded(1);
         let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
@@ -480,6 +478,6 @@ mod tests {
         assert_eq!(seen_reset_rx.recv_timeout(Duration::from_secs(1)).unwrap(), vec![7]);
 
         shutdown.shutdown();
-        executor_thread.join().unwrap().unwrap();
+        executor_thread.join().unwrap();
     }
 }

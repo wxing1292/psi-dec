@@ -19,7 +19,8 @@ pub const QWEN35_MAX_RUNNING_REQUESTS: usize = 8;
 
 #[derive(Debug)]
 pub struct Qwen35Config {
-    listen_addr: SocketAddr,
+    grpc_listen_addr: SocketAddr,
+    http_listen_addr: SocketAddr,
     hf_model_dir: PathBuf,
     hf_mtp_model_dir: Option<PathBuf>,
     observability: ServiceObservabilityConfig,
@@ -72,7 +73,8 @@ impl Qwen35Config {
         }
 
         Ok(Self {
-            listen_addr: args.listen_addr,
+            grpc_listen_addr: args.grpc_listen_addr,
+            http_listen_addr: args.http_listen_addr,
             hf_model_dir: args.hf_model_dir,
             hf_mtp_model_dir: args.hf_mtp_model_dir,
             observability: ServiceObservabilityConfig {
@@ -93,8 +95,12 @@ impl Qwen35Config {
         })
     }
 
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.listen_addr
+    pub fn grpc_listen_addr(&self) -> SocketAddr {
+        self.grpc_listen_addr
+    }
+
+    pub fn http_listen_addr(&self) -> SocketAddr {
+        self.http_listen_addr
     }
 
     pub fn hf_model_dir(&self) -> &Path {
