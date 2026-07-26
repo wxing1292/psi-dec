@@ -132,7 +132,6 @@ fn args_with(mode: ChatTemplateMode, template: Option<String>, enable_thinking: 
         output_file: None,
         show_stats: false,
         print_prompt: false,
-        raw: false,
     }
 }
 

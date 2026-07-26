@@ -62,7 +62,6 @@ pub struct OutputConfig {
     output_file: Option<PathBuf>,
     show_stats: bool,
     print_prompt: bool,
-    raw: bool,
 }
 
 impl DecodeConfig {
@@ -107,7 +106,6 @@ impl DecodeConfig {
                 output_file: args.output_file,
                 show_stats: args.show_stats,
                 print_prompt: args.print_prompt,
-                raw: args.raw,
             },
         })
     }
@@ -216,9 +214,6 @@ impl OutputConfig {
     }
     pub fn print_prompt(&self) -> bool {
         self.print_prompt
-    }
-    pub fn raw(&self) -> bool {
-        self.raw
     }
 }
 

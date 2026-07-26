@@ -91,8 +91,4 @@ pub struct Args {
 
     #[arg(long, default_value_t = false)]
     pub print_prompt: bool,
-
-    /// Preserve chat-template/special-token text when printing prompt/output.
-    #[arg(long, default_value_t = false)]
-    pub raw: bool,
 }
