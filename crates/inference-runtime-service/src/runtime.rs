@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_channel::bounded as async_bounded;
@@ -6,14 +7,18 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TrySendError;
 use crossbeam_channel::bounded as sync_bounded;
+use inference_runtime_core::Result;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::channel::ShutdownGuard;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
+use inference_runtime_core::compute::ReplayableModelBatchExecutor;
 use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::config::SamplingConfig;
 use inference_runtime_core::config::SchedulerConfig;
+use inference_runtime_core::log_err_internal;
+use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::memory::U32IDAllocator;
 use inference_runtime_core::runtime::AtomicRequestStatus;
 use inference_runtime_core::runtime::ExternalRequest;
@@ -34,6 +39,10 @@ use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
 use tonic::Status;
+
+use crate::consts::NUM_TRIE_PARTITION;
+use crate::executor::ReplayableModelExecutorLoop;
+use crate::service::run_rpc_server;
 
 type RuntimeBlockCache<const P: usize, const L: usize> =
     MultiLaneTrieBlockCache<P, L, TPKVBlockAllocator, TPStateBlockAllocator>;
@@ -272,6 +281,59 @@ impl<const N: usize, const L: usize, const P: usize> Drop for InferenceRuntime<N
     fn drop(&mut self) {
         self.shutdown.shutdown();
     }
+}
+
+pub fn serve_replay_model<const N: usize, const L: usize, M>(
+    listen_addr: SocketAddr,
+    model_runtime_config: RuntimeConfig,
+    scheduler_config: SchedulerConfig,
+    model: M,
+    debug_logging: bool,
+) -> Result<()>
+where
+    M: ReplayableModelBatchExecutor,
+{
+    let shutdown = Shutdown::new();
+    let server_tokio_runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| log_err_unavailable!("unable to initialize RPC async runtime: {error}"))?;
+    let default_stop_sequences = model.default_stop_sequences();
+    let runtime = Arc::new(InferenceRuntime::<N, L, NUM_TRIE_PARTITION>::new(
+        model_runtime_config,
+        scheduler_config,
+        shutdown.clone(),
+        server_tokio_runtime.handle(),
+    ));
+    let server_runtime = runtime.clone();
+    let server_shutdown = shutdown.clone();
+    let server_thread = std::thread::Builder::new()
+        .name("inference-rpc-server".to_string())
+        .spawn(move || {
+            let _shutdown_guard = ShutdownGuard::new(server_shutdown.clone());
+            server_tokio_runtime.block_on(run_rpc_server(
+                listen_addr,
+                server_runtime,
+                default_stop_sequences,
+                server_shutdown,
+            ))
+        })
+        .map_err(|error| log_err_unavailable!("unable to start RPC server thread: {error}"))?;
+
+    let executor = ReplayableModelExecutorLoop::new(
+        runtime.batch_device_request_rx(),
+        runtime.batch_device_response_tx(),
+        runtime.request_slot_reset_notifier(),
+        runtime.request_slot_reset_rx(),
+        shutdown,
+        model,
+    )
+    .with_debug_logging(debug_logging);
+    executor.event_loop();
+    runtime.shutdown();
+
+    server_thread
+        .join()
+        .map_err(|_| log_err_internal!("RPC server thread panicked"))?
+        .map_err(|error| log_err_unavailable!("{error}"))
 }
 
 #[cfg(test)]

@@ -6,18 +6,6 @@ use clap::Parser;
 use clap::ValueEnum;
 
 #[derive(Debug, Parser)]
-pub struct Qwen3Args {
-    #[arg(long, default_value = "127.0.0.1:50051")]
-    pub listen_addr: SocketAddr,
-
-    #[arg(long, value_name = "DIR")]
-    pub hf_model_dir: PathBuf,
-
-    #[arg(long, help = "Total shared cache pages used by the KV/state cache")]
-    pub num_cache_pages: Option<usize>,
-}
-
-#[derive(Debug, Parser)]
 pub struct Qwen35Args {
     #[arg(long, default_value = "127.0.0.1:50051")]
     pub listen_addr: SocketAddr,
@@ -73,7 +61,6 @@ pub enum QwenLogLevel {
 mod tests {
     use clap::Parser;
 
-    use super::super::config::Qwen35ServerConfig;
     use super::Qwen35Args;
 
     #[test]
@@ -83,29 +70,6 @@ mod tests {
         assert_eq!(args.max_requests.get(), 4);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-    }
-
-    #[test]
-    fn test_scheduler_overrides() {
-        let config = Qwen35ServerConfig::from_args(
-            Qwen35Args::try_parse_from([
-                "qwen3.5",
-                "--hf-model-dir",
-                "model",
-                "--max-requests",
-                "8",
-                "--max-tokens",
-                "256",
-                "--max-tokens-per-request",
-                "32",
-            ])
-            .unwrap(),
-        );
-        let scheduler = config.scheduler_config();
-
-        assert_eq!(scheduler.max_requests, 8);
-        assert_eq!(scheduler.max_tokens, 256);
-        assert_eq!(scheduler.max_tokens_per_request, 32);
     }
 
     #[test]
