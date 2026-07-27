@@ -12,15 +12,7 @@ pub struct HTTPError {
 impl IntoResponse for HTTPError {
     fn into_response(self) -> Response {
         let (status, code, openai_type) = classify(&self.error);
-        let message = self.error.to_string();
-        let body = json!({
-            "error": {
-                "message": message,
-                "type": openai_type,
-                "param": null,
-                "code": code,
-            }
-        });
+        let body = body(&self.error, code, openai_type);
         (status, Json(body)).into_response()
     }
 }
@@ -31,6 +23,22 @@ pub fn map_error(error: Error) -> HTTPError {
 
 pub fn invalid_request(message: impl Into<String>) -> HTTPError {
     map_error(Error::invalid_argument(message))
+}
+
+pub fn openai_error_body(error: &Error) -> serde_json::Value {
+    let (_, code, openai_type) = classify(error);
+    body(error, code, openai_type)
+}
+
+fn body(error: &Error, code: &'static str, openai_type: &'static str) -> serde_json::Value {
+    json!({
+        "error": {
+            "message": error.to_string(),
+            "type": openai_type,
+            "param": null,
+            "code": code,
+        }
+    })
 }
 
 fn classify(error: &Error) -> (StatusCode, &'static str, &'static str) {

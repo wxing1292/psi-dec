@@ -6,13 +6,15 @@ use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::log_err_unavailable;
 
 use crate::api::Inference;
+use crate::codec::qwen::QwenCodec;
 
 mod grpc;
 mod http;
 
-pub async fn run_servers<const N: usize, const L: usize, const P: usize>(
+pub async fn run<const N: usize, const L: usize, const P: usize>(
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
+    qwen_codec: Arc<QwenCodec>,
     inference: Arc<Inference<N, L, P>>,
     shutdown: Shutdown,
 ) -> Result<()> {
@@ -27,7 +29,7 @@ pub async fn run_servers<const N: usize, const L: usize, const P: usize>(
     };
     let http_shutdown = shutdown.clone();
     let http_server = async move {
-        let result = http::run(http_listen_addr, inference, http_shutdown.clone())
+        let result = http::run(http_listen_addr, inference, qwen_codec, http_shutdown.clone())
             .await
             .map_err(|error| log_err_unavailable!("HTTP server failed: {error}"));
         http_shutdown.shutdown();

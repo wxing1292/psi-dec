@@ -42,9 +42,10 @@ use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
 
 use crate::api::Inference;
+use crate::codec::qwen::QwenCodec;
 use crate::consts::NUM_TRIE_PARTITION;
 use crate::executor::ReplayableModelExecutorLoop;
-use crate::rpc::run_servers;
+use crate::rpc;
 
 type RuntimeBlockCache<const P: usize, const L: usize> =
     MultiLaneTrieBlockCache<P, L, TPKVBlockAllocator, TPStateBlockAllocator>;
@@ -285,6 +286,7 @@ impl<const N: usize, const L: usize, const P: usize> Drop for InferenceRuntime<N
 pub fn serve_replay_model<const N: usize, const L: usize, M>(
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
+    qwen_codec: Arc<QwenCodec>,
     model_runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
     model: M,
@@ -309,9 +311,10 @@ where
         .name("inference-rpc-servers".to_string())
         .spawn(move || {
             let _shutdown_guard = ShutdownGuard::new(server_shutdown.clone());
-            server_tokio_runtime.block_on(run_servers(
+            server_tokio_runtime.block_on(rpc::run(
                 grpc_listen_addr,
                 http_listen_addr,
+                qwen_codec,
                 inference,
                 server_shutdown,
             ))

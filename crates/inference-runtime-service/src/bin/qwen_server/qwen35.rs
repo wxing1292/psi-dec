@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use clap::Parser;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
@@ -9,10 +11,10 @@ use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_w
 use inference_runtime_core::Result;
 use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
-use inference_runtime_core::config::SchedulerConfig;
 use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
+use inference_runtime_service::codec::qwen::QwenCodec;
 use inference_runtime_service::observability::CacheLaneLogSummary;
 use inference_runtime_service::observability::StartupLogger;
 use inference_runtime_service::runtime::serve_replay_model;
@@ -72,6 +74,11 @@ fn run(kind: ModelKind) -> Result<()> {
         "decode service listeners configured"
     );
     validate_checkpoint_kind(kind, &model_config)?;
+    startup.event("loading Qwen codec");
+    let qwen_codec = Arc::new(QwenCodec::load(config.hf_model_dir()).map_err(|error| {
+        log_err_unavailable!("unable to load Qwen codec from {:?}: {error}", config.hf_model_dir())
+    })?);
+    startup.event("Qwen codec loaded");
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
 
@@ -108,15 +115,31 @@ fn run(kind: ModelKind) -> Result<()> {
     let runtime_config = build_runtime_config(&startup, &model_config, num_cache_pages, &model)?;
 
     startup.event("initializing runtime");
-    serve_qwen35(
-        config.grpc_listen_addr(),
-        config.http_listen_addr(),
-        runtime_config,
-        scheduler_config,
-        model,
-        config.num_mtp_modules(),
-        observability.debug_logging,
-    )
+    match config.num_mtp_modules() {
+        0 => {
+            serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 1, _>(
+                config.grpc_listen_addr(),
+                config.http_listen_addr(),
+                qwen_codec,
+                runtime_config,
+                scheduler_config,
+                model,
+                observability.debug_logging,
+            )
+        },
+        1 => {
+            serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 2, _>(
+                config.grpc_listen_addr(),
+                config.http_listen_addr(),
+                qwen_codec,
+                runtime_config,
+                scheduler_config,
+                model,
+                observability.debug_logging,
+            )
+        },
+        _ => unreachable!("validated Qwen config supports at most one MTP module"),
+    }
 }
 
 fn validate_checkpoint_kind(kind: ModelKind, model_config: &Qwen35ModelConfig) -> Result<()> {
@@ -239,40 +262,6 @@ fn build_runtime_config(
         });
     }
     Ok(runtime_config)
-}
-
-fn serve_qwen35(
-    grpc_listen_addr: std::net::SocketAddr,
-    http_listen_addr: std::net::SocketAddr,
-    runtime_config: RuntimeConfig,
-    scheduler_config: SchedulerConfig,
-    model: Qwen35Executor,
-    num_mtp_modules: usize,
-    debug_logging: bool,
-) -> Result<()> {
-    match num_mtp_modules {
-        0 => {
-            serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 1, _>(
-                grpc_listen_addr,
-                http_listen_addr,
-                runtime_config,
-                scheduler_config,
-                model,
-                debug_logging,
-            )
-        },
-        1 => {
-            serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 2, _>(
-                grpc_listen_addr,
-                http_listen_addr,
-                runtime_config,
-                scheduler_config,
-                model,
-                debug_logging,
-            )
-        },
-        _ => unreachable!("validated Qwen config supports at most one MTP module"),
-    }
 }
 
 fn load_model_config(hf_model_dir: &std::path::Path) -> Result<Qwen35ModelConfig> {

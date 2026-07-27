@@ -5,17 +5,6 @@ investigations. Current contracts belong in the current docs. Promote resolved
 repository-wide rules into `engineering_conventions.md` and component-specific
 findings into the owning component document.
 
-## HTTP APIs
-
-- Implement the explicit HTTP request/response preprocessing placeholders.
-  Chat Completions must lower the wire request into model-ready token IDs
-  before calling `Inference::decode`, then transform the token response into
-  either the collected or streaming wire response after decode. Chat-template
-  rendering, tokenization, detokenization, and tool-call dialect handling
-  remain outside the token-level inference API and the HTTP transport adapter.
-  Evaluate an HF-compatible streaming response parser for the postprocessing
-  boundary.
-
 ## Tool APIs
 
 - Implement the Pi custom-provider session wire and persistent conversation
@@ -29,6 +18,11 @@ findings into the owning component document.
 
 ## Runtime Lifecycle
 
+- Enforce each model's context window in the shared request lifecycle. Thread
+  the model limit through admission and decode commit, reject prompts that leave
+  no output capacity, produce the reserved
+  `CompletionReason::ContextLimit`, and map it to each RPC protocol without
+  inferring the reason from emitted token counts.
 - Make trie/request cache-block extent runtime-dynamic before offering arbitrary Qwen cache-block CLI values. It is
   currently the const generic shared by runtime, request, trie block/cache, and RPC service types; enumerating many
   power-of-two monomorphizations would trade a simple option for code-size and maintenance cost.
