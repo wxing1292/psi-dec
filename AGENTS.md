@@ -21,7 +21,7 @@ When changing GQA, Gated DeltaNet, dense MLP, MoE, sampling, or MTP source layou
 ## Shared hard constraints
 
 - Use `panic!`, `assert!`, and `debug_assert!` for internal invariant or contract violations. Use release `assert!` only at init-time, one-time structural or ownership boundaries, or contracts whose enforcement is absolutely necessary in release. Repeated internal bug checks that would add release hot-path noise belong in `debug_assert!`; cover them with tests and debug builds. Classify by lifecycle and cost instead of converting checks mechanically.
-- Use recoverable `Err(Exception::custom(...))` only for user input, model loading, runtime failures, MLX failures, IO failures, or other genuinely recoverable failures.
+- Use the shared typed `Error` for recoverable failures, choosing the variant by caller-visible semantics. Internal invariant violations remain assertions or panics.
 - Do not use `pub(crate)` or `pub(super)`. Keep items private unless intentionally exported with `pub`.
 - When working with Rust, use rust-analyzer semantic operations whenever applicable: definition/reference lookup, type and diagnostic inspection, rename, and refactoring. Prefer them over textual heuristics for symbol identity and bindings; use `rg` for textual discovery, not as a substitute for semantic analysis. Rename each binding or item independently when the same spelling appears in multiple scopes. Rust-analyzer does not cover Metal, generated source strings, docs, inactive configurations, or host↔shader ABI correspondence, so audit those boundaries separately and still check for shadowing, stale references, and semantic-equivalence regressions.
 - Run Rust formatting as `cargo +nightly fmt`.

@@ -33,13 +33,28 @@ Use `panic!`, `assert!`, or `debug_assert!` for internal invariant violations an
 necessary in release. Repeated internal bug checks that would add release hot-path noise belong in `debug_assert!`; tests
 and debug builds provide their coverage. Classify each check by lifecycle and cost instead of converting them mechanically.
 
-Use recoverable `Err(Exception::custom(...))` only for user input, model loading, runtime failures, MLX failures, IO failures, or other genuinely recoverable errors.
+Use the shared typed `Error` for recoverable failures. Choose the variant by
+what the caller can observe, such as `InvalidArgument`, `Unavailable`, or
+`Internal`. Internal invariant violations remain assertions or panics.
 
 Do not use `pub(crate)` or `pub(super)`. Use private items by default; use plain `pub` only for intentional API surface.
 
 Run formatting as `cargo +nightly fmt`.
 
-Before handing off broad Rust changes, run the compile-only repository gates:
+Match verification effort to the stage of the change:
+
+```text
+development       focused unit tests at the production owner
+integration       relevant package tests plus repository compile gates
+final acceptance  the real production path through an external caller
+```
+
+Final acceptance should start a release server when the change affects a
+server or RPC path, exercise the affected protocol from outside the process,
+and verify clean shutdown. Expensive GPU checks belong here unless they are
+needed earlier to answer a correctness question.
+
+Before handing off broad Rust changes, run the repository compile gates:
 
 ```sh
 cargo +nightly fmt --all -- --check
@@ -48,8 +63,8 @@ cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-Run focused tests at the narrowest production owner. Run Metal/GPU commands one at a time with explicit cross-process
-coordination; do not use a parallel workspace test run as a GPU verification gate.
+Run Metal/GPU commands one at a time with explicit cross-process coordination;
+do not use a parallel workspace test run as a GPU verification gate.
 
 In Rust module roots, list normal `use` imports before module declarations. Prefer exposing child modules with
 `pub mod` over re-exporting child items through the parent module. A child directory can define public items, but the
@@ -157,6 +172,11 @@ inputs can violate the current data flow or the owner cannot actually guarantee 
 Prefer first-principles contracts over compatibility patches. Define the caller-visible inputs, outputs, ownership, and
 state transitions first; then choose the backend implementation that satisfies that contract. Do not preserve a known
 wrong implementation behind a feature flag, environment variable, or fallback once the correct default path is verified.
+
+Prefer an established library over reimplementing generic infrastructure when
+it materially reduces correctness or maintenance risk. Keep project-specific
+semantics local; for example, a generic tokenizer may own incremental decoding
+while a Qwen codec owns Qwen response grammar.
 
 Keep interfaces symmetric across related components. For a pair such as sampling/rejection sampling, GQA/GDN state
 tables, or dense MLP/MoE paths, use parallel names for shapes, inputs, outputs, scratch, kernels, and record methods

@@ -194,11 +194,25 @@ Keep backend details behind backend APIs. Metal components own kernels, dispatch
 resource bindings. Model executors own model semantics, persistent model/request buffers, and component wiring; they do
 not expose backend tiling or kernel-local tables in model-level APIs.
 
-## Commit messages
+## Commits
 
-Use a concise lowercase subject focused on the change's main purpose. Do not enumerate related changes in the subject.
-When a body is useful, use only a few high-level bullet points for materially related changes; do not restate the
-per-file diff or low-level implementation details.
+One commit should own one coherent architectural idea. While history is local,
+amend or rebase follow-up fixes into the commit that owns them. Once a commit is
+published or shared, preserve history and use a focused follow-up commit.
+
+Use a concise subject starting with a lowercase verb and focused on the main
+purpose. Preserve standard acronyms:
+
+```text
+add HTTP chat completions
+clean tokenizer streaming
+```
+
+Do not enumerate related changes in the subject. When a body is useful, keep it
+to a few high-level points rather than restating the per-file diff. Prefer
+reviewable and compilable boundaries when practical. An intentional local
+history split may be temporarily non-compiling, but delivered history must be
+self-consistent.
 
 ## Test style
 

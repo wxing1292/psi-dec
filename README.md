@@ -1,136 +1,106 @@
 # psi-dec
 
-`psi-dec` is a Rust inference runtime and Metal executor for Qwen decoder
-models on Apple Silicon. It separates a model-agnostic runtime from a Qwen
-model executor and a Metal backend, so request lifecycle and model execution
-can evolve independently.
+`psi-dec` runs Qwen decoder models on Apple Silicon. It combines a
+model-agnostic Rust runtime, a Qwen executor, and a Metal replay backend.
 
-## Mental model
+## Architecture
 
 ```text
-client
-  -> client/RPC adapter: produce model-ready tokens
-  -> inference API: validate and submit the decode request
-  -> runtime core: schedule work, own request lifecycle and cache pages
-  -> Qwen executor: turn runtime metadata into model execution
-  -> Metal backend: replay recorded GPU commands
-  -> runtime core: commit tokens, update cache ownership, finish requests
+HTTP Chat Completions ──► Qwen codec ──► token IDs ──┐
+                                                     ├─► Inference::decode
+gRPC Decode ────────────────────────► token IDs ─────┘          │
+                                                               ▼
+                  Runtime core ──► Qwen executor ──► Metal backend
+                       ▲                                    │
+                       └──────── tokens + lifecycle ────────┘
 ```
 
-The runtime owns *when* and *which* tokens execute. The executor owns *what*
-the Qwen model computes. Metal owns *how* those computations run on the GPU.
+The layers have separate owners:
 
-| Layer | Owns | Does not own |
-| --- | --- | --- |
-| Runtime core | scheduling, request lifecycle, logical cache blocks, physical KV/state pages | model tensor layout or Metal details |
-| Qwen executor | model layout, weights, GQA, GDN, dense MLP, MoE, sampling, MTP, replay stage ordering | scheduler policy or global page ownership |
-| Metal backend | devices, buffers, kernels, command recording, ICB replay submission | request lifecycle or model-specific scheduling |
+- **Runtime core:** scheduling, request lifecycle, and cache ownership.
+- **Qwen executor:** model layout, components, sampling, MTP, and replay order.
+- **Metal backend:** devices, buffers, kernels, recording, and ICB submission.
 
-Runtime cache blocks are logical units of reusable decoder work. Their physical
-KV and GDN-state pages have globally allocated page IDs. Runtime decides their
-lifetime; the executor interprets those IDs for the current model layer.
+HTTP accepts messages and tools. The checkpoint chat template and tokenizer
+lower them into the same token-level decode API used by gRPC. The runtime owns
+when work runs and how cache pages live; the executor owns what Qwen computes;
+Metal owns how that computation runs on the GPU.
 
-GQA (grouped-query attention) and GDN (Gated DeltaNet) are alternative
-attention families in a Qwen layer; dense MLP and MoE are alternative
-feed-forward families. They are not four consecutive stages in every layer.
-MTP is a speculative proposal path around target-model execution, while replay
-is the Metal command-execution mechanism beneath both.
+## Quick start
 
-## Current scope
+Requirements:
 
-The checked-in service path is local and synchronous: one executor processes a
-batch, returns its result, and the runtime commits it before the next batch.
-Asynchronous request tasks, KV/state SSD onload/offload, and pipeline-parallel
-hidden-state transport remain future work.
+- Apple Silicon Mac
+- Rust toolchain
+- Xcode command-line tools
+- Hugging Face CLI with access to the model
 
-## Requirements and first run
-
-You need an Apple Silicon Mac, the Rust toolchain, Xcode command-line tools,
-and a Hugging Face CLI login that can download model weights. The current
-service runners use MLX Community Qwen3.6 checkpoints.
-
-If you are setting up a machine for the first time, install Xcode command-line
-tools with `xcode-select --install`, install a current stable Rust toolchain and
-the Hugging Face CLI with `brew install hf`, then log in once:
+Download the dense checkpoint:
 
 ```sh
 hf auth login
-```
-
-Download the dense 27B target and matching MTP checkpoints. MTP is part of the supported first-run path; target-only
-full-prefix resampling still has a [known recurrent-state limitation](docs/future_work.md#runtime-lifecycle).
-
-```sh
 hf download mlx-community/Qwen3.6-27B-4bit \
   --local-dir models/Qwen3.6-27B-4bit
-
-hf download mlx-community/Qwen3.6-27B-MTP-4bit \
-  --local-dir models/Qwen3.6-27B-MTP-4bit
 ```
 
-Start the service:
+Start gRPC and HTTP listeners:
 
 ```sh
 cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
-  --mtp-module 1
+  --mtp-module 0
 ```
 
-Then send a request from another terminal:
+Stream an HTTP Chat Completions response:
 
 ```sh
-cargo run --release -p inference-runtime-service --bin decode -- \
-  --server-url http://127.0.0.1:50061 \
-  --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --prompt-str "Explain paged KV cache in one paragraph." \
-  --max-sampled-tokens 128
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "qwen3.6-27b",
+    "messages": [{"role": "user", "content": "Reply with exactly: hello"}],
+    "stream": true,
+    "stream_options": {"include_usage": true},
+    "max_completion_tokens": 16,
+    "temperature": 0,
+    "top_k": 1,
+    "top_p": 1,
+    "seed": 1,
+    "enable_thinking": false
+  }'
 ```
 
-For sparse 35B-A3B, use `qwen3_5_sparse` with the matching
-`Qwen3.6-35B-A3B-4bit` and `Qwen3.6-35B-A3B-MTP-4bit` checkpoints. The runner
-names retain their Qwen3.5 implementation name but consume the current Qwen3.6
-MLX checkpoint layout. Full service options are in the
-[service guide](docs/service.md).
-
-## Where to go next
-
-Start with the document matching your question:
-
-- Requests, blocks, pages, and cache lifecycle: [runtime core](docs/core.md).
-
-- Qwen layers and replay composition: [executor architecture](docs/executor.md), then [Qwen wiring](docs/executor_qwen.md).
-
-- Sampling and rejection: [sampling](docs/executor_sampling.md).
-
-- Metal recording, ICB replay, and a minimal kernel: [executor architecture](docs/executor.md), then the Metal backend's [Add One example](crates/inference-backend-metal/README.md#add-one).
-
-- Attention and feed-forward internals: [GQA](docs/executor_gqa.md), [GDN](docs/executor_gdn.md), [dense MLP](docs/executor_dense_mlp.md), or [MoE](docs/executor_moe.md).
-
-- Running the service or validating a release: [service and decode client](docs/service.md).
-
-- Tests, benchmarks, profiling, and performance evidence: [executor verification](docs/executor_benchmarks.md).
-
-- Development rules: [engineering boundaries](docs/high_level.md) and
-  [engineering conventions](docs/engineering_conventions.md).
-
-- Active follow-up work: [future work](docs/future_work.md).
-
-The [documentation guide](docs/README.md) gives the complete reading map.
-Detailed operational and measurement guidance belongs in the workflow
-documents; this overview keeps only the shortest working first run.
+This minimal path disables MTP. See the [service guide](docs/service.md) for
+MTP, sparse-model commands, gRPC decode, tool calls, and the supported
+OpenAI-compatible subset.
 
 ## Workspace map
 
 ```text
-crates/inference-runtime-core    model-agnostic scheduling, lifecycle, and cache ownership
-crates/inference-runtime-service server binaries, tokenizer/client handling, and service configuration
-crates/inference-executor-core   backend-neutral Qwen/component contracts and CPU references
-crates/inference-executor-metal  Qwen-on-Metal weights, components, replay, sampling, and MTP
-crates/inference-backend-metal   Metal resources, kernels, operators, and ICB replay runtime
+inference-runtime-core      scheduling, lifecycle, and cache ownership
+inference-runtime-service   inference API, RPC, codecs, and server binaries
+inference-executor-core     backend-neutral model/component contracts
+inference-executor-metal    Qwen execution, replay, sampling, and MTP
+inference-backend-metal     Metal resources, kernels, and ICB runtime
 ```
+
+All paths above live under `crates/`.
+
+## Documentation
+
+- Run or test the server: [service guide](docs/service.md).
+- Understand request and cache lifecycle: [runtime core](docs/core.md).
+- Follow Qwen execution: [executor architecture](docs/executor.md).
+- Inspect replay and kernels:
+  [Metal backend](crates/inference-backend-metal/README.md).
+- Benchmark or profile changes:
+  [executor verification](docs/executor_benchmarks.md).
+- Apply engineering rules: [high-level guidance](docs/high_level.md).
+- Review active follow-up work: [future work](docs/future_work.md).
+
+The [documentation index](docs/README.md) links every component guide.
 
 ## Acknowledgements
 
@@ -140,10 +110,10 @@ open-source work of [vLLM](https://github.com/vllm-project/vllm),
 [llama.cpp](https://github.com/ggml-org/llama.cpp),
 [mistral.rs](https://github.com/EricLBuehler/mistral.rs); credit is due to their
 authors and contributor communities. It uses [MLX](https://github.com/ml-explore/mlx)
-by Apple; its Metal kernel headers are downloaded and embedded at build time
-under the MIT License, with the required notice in [`NOTICE`](NOTICE). Supported
-Qwen models are developed by the [Qwen team](https://qwen.ai/); model weights
-are separate artifacts governed by their own terms.
+by Apple; its Metal kernel headers are downloaded and embedded at build time.
+The MIT notice is retained in [`NOTICE`](NOTICE). Supported Qwen models are
+developed by the [Qwen team](https://qwen.ai/); model weights are separate
+artifacts governed by their own terms.
 
 ## License
 
