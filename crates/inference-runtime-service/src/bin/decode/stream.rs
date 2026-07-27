@@ -13,9 +13,9 @@ use inference_runtime_service::perf_metrics::DecodePerfMetrics;
 use tonic::Request;
 use tonic::transport::Channel;
 
+use crate::client::DecodeRequest;
 use crate::config::RuntimeConfig;
 use crate::error::DecodeCliResult;
-use crate::executor::DecodeRequest;
 
 pub struct DecodeStreamExecutor<'a> {
     client: &'a mut InferenceRuntimeClient<Channel>,

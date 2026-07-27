@@ -20,6 +20,7 @@ event-listener = { workspace = true }
 futures-lite = { workspace = true }
 futures-util = { workspace = true }
 hdrhistogram = { workspace = true }
+hf-chat-template = { workspace = true }
 inference-runtime-macro = { path = "../inference-runtime-macro" }
 intrusive-collections = { workspace = true }
 itertools = { workspace = true }
@@ -29,6 +30,7 @@ nix = { workspace = true, features = ["fs", "mman", "process", "zerocopy"] }
 offset-allocator = { workspace = true }
 ordered-float = { workspace = true }
 rand = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
 slotmap = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }

@@ -1,46 +1,74 @@
+use std::sync::Arc;
+
+use hf_chat_template::ChatTemplate;
+use hf_chat_template::Message;
 use inference_runtime_core::runtime::Token;
 use inference_runtime_core::tokenizer::Tokenizer;
 use inference_runtime_core::tokenizer::huggingface::HFTokenizer;
 use inference_runtime_proto::inference_runtime_service::inference_runtime_client::InferenceRuntimeClient;
+use inference_runtime_service::codec::qwen::QwenCodec;
 use tonic::transport::Channel;
 
-use crate::chat_template::ChatTemplateRenderer;
 use crate::config::DecodeConfig;
 use crate::error::DecodeCliResult;
 use crate::stream::DecodeStreamExecutor;
 use crate::stream::DecodeStreamResult;
 
-pub struct DecodeExecutor {
+pub struct InferenceClient {
     config: DecodeConfig,
     client: InferenceRuntimeClient<Channel>,
-    tokenizer: HFTokenizer,
+    qwen_codec: Option<QwenCodec>,
+    tokenizer: Arc<HFTokenizer>,
 }
 
-impl DecodeExecutor {
-    pub async fn connect(config: DecodeConfig, tokenizer: HFTokenizer) -> DecodeCliResult<Self> {
+impl InferenceClient {
+    pub async fn connect(
+        config: DecodeConfig,
+        template: Option<ChatTemplate>,
+        tokenizer: HFTokenizer,
+    ) -> DecodeCliResult<Self> {
         let client = InferenceRuntimeClient::connect(config.runtime().server_url().to_string())
             .await
             .map_err(|err| format!("unable to connect to {}: {err}", config.runtime().server_url()))?;
+        let tokenizer = Arc::new(tokenizer);
+        let qwen_codec = template
+            .map(|template| QwenCodec::new(template, tokenizer.clone()))
+            .transpose()?;
         Ok(Self {
             config,
             client,
+            qwen_codec,
             tokenizer,
         })
     }
 
-    pub async fn execute(mut self, prompt: &str) -> DecodeCliResult<()> {
-        let renderer = ChatTemplateRenderer::new(self.config.chat_template().clone(), self.config.model().clone());
-        let rendered_prompt = renderer.render(prompt)?;
-        let request = DecodeRequest::from_input(rendered_prompt, &self.tokenizer, self.config.sampling())?;
+    pub async fn decode(mut self, prompt: &str) -> DecodeCliResult<()> {
+        let tokens = match &self.qwen_codec {
+            Some(qwen_codec) => {
+                let mut messages = Vec::new();
+                if !self.config.chat_template().system_prompt().is_empty() {
+                    messages.push(Message::system(self.config.chat_template().system_prompt()));
+                }
+                messages.push(Message::user(prompt));
+                qwen_codec.encode(
+                    messages,
+                    &[],
+                    self.config.chat_template().enable_thinking(),
+                    self.config.chat_template().preserve_thinking(),
+                )?
+            },
+            None => self.tokenizer.encode(prompt)?,
+        };
+        let request = DecodeRequest::from_input(tokens, self.config.sampling())?;
 
         if self.config.output().print_prompt() {
-            let prompt_text = render_prompt_for_output(&self.tokenizer, &request)?;
+            let prompt_text = render_prompt_for_output(self.tokenizer.as_ref(), &request)?;
             println!("input: {prompt_text}");
         }
 
         let response = DecodeStreamExecutor::new(
             &mut self.client,
-            &self.tokenizer,
+            self.tokenizer.as_ref(),
             self.config.runtime(),
             self.config.output().output_str(),
         )
@@ -53,7 +81,6 @@ impl DecodeExecutor {
 
 #[derive(Clone, Debug)]
 pub struct DecodeRequest {
-    pub prompt: crate::chat_template::RenderedPrompt,
     pub tokens: Vec<Token>,
     pub max_sampled_tokens: u32,
     pub temperature: f32,
@@ -63,17 +90,9 @@ pub struct DecodeRequest {
 }
 
 impl DecodeRequest {
-    fn from_input<T: Tokenizer>(
-        prompt: crate::chat_template::RenderedPrompt,
-        tokenizer: &T,
-        config: &crate::config::DecodeSamplingConfig,
-    ) -> DecodeCliResult<Self> {
-        let tokens = tokenizer
-            .encode(prompt.text())
-            .map_err(|err| format!("unable to tokenize prompt: {err}"))?;
+    fn from_input(tokens: Vec<Token>, config: &crate::config::DecodeSamplingConfig) -> DecodeCliResult<Self> {
         let max_sampled_tokens = resolve_max_sampled_tokens(tokens.len(), config)?;
         Ok(Self {
-            prompt,
             tokens,
             max_sampled_tokens,
             temperature: config.temperature(),

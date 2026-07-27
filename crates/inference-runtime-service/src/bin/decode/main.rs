@@ -4,8 +4,6 @@ use tracing_subscriber::EnvFilter;
 mod args;
 use args::Args;
 
-mod chat_template;
-
 mod config;
 use config::DecodeConfig;
 
@@ -14,8 +12,8 @@ use error::DecodeCliResult;
 
 mod output;
 
-mod executor;
-use executor::DecodeExecutor;
+mod client;
+use client::InferenceClient;
 
 mod stream;
 
@@ -35,10 +33,11 @@ async fn main() {
 async fn run() -> DecodeCliResult<()> {
     let config = DecodeConfig::from_args(Args::parse())?;
     let tokenizer = load_tokenizer(config.model())?;
+    let template = config.chat_template().load(config.model())?;
     let prompt = config.input().read_prompt()?;
-    DecodeExecutor::connect(config, tokenizer)
+    InferenceClient::connect(config, template, tokenizer)
         .await?
-        .execute(&prompt)
+        .decode(&prompt)
         .await?;
     Ok(())
 }

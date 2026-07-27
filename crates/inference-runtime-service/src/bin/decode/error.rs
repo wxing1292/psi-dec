@@ -34,4 +34,10 @@ impl From<&str> for DecodeCliError {
     }
 }
 
+impl From<inference_runtime_core::Error> for DecodeCliError {
+    fn from(error: inference_runtime_core::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 pub type DecodeCliResult<T> = Result<T, DecodeCliError>;

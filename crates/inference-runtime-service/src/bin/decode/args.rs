@@ -11,7 +11,6 @@ use inference_runtime_core::config::DEFAULT_SAMPLING_TOP_P;
 pub enum ChatTemplateMode {
     Auto,
     Raw,
-    QwenFixed,
     Custom,
 }
 

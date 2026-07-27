@@ -5,6 +5,16 @@ workflow. Runtime internals are in [`core.md`](core.md); Qwen executor stages ar
 [`executor_qwen.md`](executor_qwen.md); benchmark methodology is in
 [`executor_benchmarks.md`](executor_benchmarks.md).
 
+`inference-runtime-core/src/chat_template/` loads and compiles the checkpoint-authoritative
+Hugging Face chat template with `hf-chat-template`; standalone
+`chat_template.jinja` takes precedence over an inline tokenizer-config
+template. `codec/qwen.rs` contains the stateless `QwenCodec`.
+`QwenCodec::encode` renders messages and tools through that template before
+tokenization. `QwenCodec::decode` transforms a token response stream into text,
+tool calls, and its terminal event while keeping incremental detokenization and
+Qwen tool-dialect state private to that request. The codec does not own the
+template or tokenizer.
+
 ## Tool state
 
 `crates/inference-runtime-service/src/tool/` owns this transport- and
@@ -170,9 +180,11 @@ cargo run --release -p inference-runtime-service --bin decode -- \
   --print-prompt
 ```
 
-The client model directory supplies tokenizer and chat-template files; the server controls the target model. Use
-`--chat-template qwen-fixed --disable-thinking` when a deterministic non-thinking Qwen prompt is required. That mode
-emits the checkpoint-canonical closed empty reasoning block before generation.
+The client model directory supplies tokenizer and chat-template files; the
+server controls the target model. `--chat-template auto` executes the
+checkpoint template rather than a hard-coded Qwen prompt formatter. Add
+`--disable-thinking` for the checkpoint-defined non-thinking generation
+prefix. `--chat-template raw` remains an explicit diagnostic bypass.
 
 ## HTTP checkpoint
 

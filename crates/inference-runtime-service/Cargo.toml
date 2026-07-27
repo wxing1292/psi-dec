@@ -9,16 +9,17 @@ repository.workspace = true
 [dependencies]
 axum = { workspace = true }
 async-channel = { workspace = true }
+async-stream = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 crossbeam-channel = { workspace = true }
 futures-util = { workspace = true }
+hf-chat-template = { workspace = true }
 inference-executor-core = { path = "../inference-executor-core" }
 inference-executor-metal = { path = "../inference-executor-metal" }
 inference-runtime-core = { path = "../inference-runtime-core" }
 inference-runtime-proto = { path = "../inference-runtime-proto" }
 mimalloc = { workspace = true }
-minijinja = { workspace = true }
 ordered-float = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

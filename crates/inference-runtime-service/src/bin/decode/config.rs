@@ -1,13 +1,15 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use hf_chat_template::ChatTemplate;
+use inference_runtime_core::chat_template;
 use inference_runtime_core::config::MAX_SAMPLING_TOP_K;
 
 use crate::args::Args;
 use crate::args::ChatTemplateMode;
 use crate::error::DecodeCliResult;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DecodeConfig {
     model: ModelConfig,
     input: InputConfig,
@@ -17,19 +19,19 @@ pub struct DecodeConfig {
     output: OutputConfig,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ModelConfig {
     hf_model_dir: Option<PathBuf>,
     tokenizer_file: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct InputConfig {
     prompt_str: Option<String>,
     prompt_file: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ChatTemplateConfig {
     mode: ChatTemplateMode,
     template_str: Option<String>,
@@ -39,7 +41,7 @@ pub struct ChatTemplateConfig {
     preserve_thinking: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DecodeSamplingConfig {
     max_sampled_tokens: u32,
     max_total_tokens: Option<u32>,
@@ -49,13 +51,13 @@ pub struct DecodeSamplingConfig {
     seed: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RuntimeConfig {
     server_url: String,
     timeout_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct OutputConfig {
     output_str: bool,
     output_file: Option<PathBuf>,
@@ -148,24 +150,25 @@ impl InputConfig {
             .expect("validated input config must contain one prompt source");
         std::fs::read_to_string(path).map_err(|error| format!("unable to read prompt file {path:?}: {error}").into())
     }
-    pub fn prompt_str(&self) -> Option<&str> {
-        self.prompt_str.as_deref()
-    }
-    pub fn prompt_file(&self) -> Option<&Path> {
-        self.prompt_file.as_deref()
-    }
 }
 
 impl ChatTemplateConfig {
-    pub fn mode(&self) -> ChatTemplateMode {
-        self.mode
+    pub fn load(&self, model: &ModelConfig) -> DecodeCliResult<Option<ChatTemplate>> {
+        match self.mode {
+            ChatTemplateMode::Raw => Ok(None),
+            ChatTemplateMode::Auto | ChatTemplateMode::Custom => {
+                if let Some(source) = self.read_source()? {
+                    let template = chat_template::compile(&source, model.hf_model_dir())?;
+                    return Ok(Some(template));
+                }
+                let model_dir = model
+                    .hf_model_dir()
+                    .expect("validated auto template config must include a model directory");
+                chat_template::load(model_dir).map(Some).map_err(Into::into)
+            },
+        }
     }
-    pub fn template_str(&self) -> Option<&str> {
-        self.template_str.as_deref()
-    }
-    pub fn template_file(&self) -> Option<&Path> {
-        self.template_file.as_deref()
-    }
+
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
@@ -174,6 +177,18 @@ impl ChatTemplateConfig {
     }
     pub fn preserve_thinking(&self) -> bool {
         self.preserve_thinking
+    }
+
+    fn read_source(&self) -> DecodeCliResult<Option<String>> {
+        if let Some(template) = &self.template_str {
+            return Ok(Some(template.clone()));
+        }
+        let Some(template_file) = &self.template_file else {
+            return Ok(None);
+        };
+        std::fs::read_to_string(template_file)
+            .map(Some)
+            .map_err(|error| format!("unable to read chat template file {template_file:?}: {error}").into())
     }
 }
 
@@ -244,16 +259,19 @@ fn validate_chat_template(args: &Args) -> DecodeCliResult<()> {
 
     let has_explicit_template = args.chat_template_str.is_some() || args.chat_template_file.is_some();
     match args.chat_template {
-        ChatTemplateMode::Raw | ChatTemplateMode::QwenFixed if has_explicit_template => {
+        ChatTemplateMode::Raw if has_explicit_template => {
             Err(format!(
                 "--chat-template {:?} does not accept --chat-template-str or --chat-template-file",
                 args.chat_template,
             )
             .into())
         },
-        ChatTemplateMode::Raw | ChatTemplateMode::QwenFixed => Ok(()),
+        ChatTemplateMode::Raw => Ok(()),
         ChatTemplateMode::Custom if !has_explicit_template => {
             Err("--chat-template custom requires --chat-template-str or --chat-template-file".into())
+        },
+        ChatTemplateMode::Auto if !has_explicit_template && args.hf_model_dir.is_none() => {
+            Err("--chat-template auto requires --hf-model-dir or an explicit chat template".into())
         },
         ChatTemplateMode::Custom | ChatTemplateMode::Auto => Ok(()),
     }

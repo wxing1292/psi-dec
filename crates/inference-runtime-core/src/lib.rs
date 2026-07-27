@@ -7,6 +7,7 @@ impl<T> SSS for T where T: Send + Sync + 'static {}
 
 pub mod config;
 pub mod channel;
+pub mod chat_template;
 pub mod runtime;
 pub mod compute;
 pub mod memory;
