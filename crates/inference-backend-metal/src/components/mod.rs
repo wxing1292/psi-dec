@@ -172,8 +172,8 @@ pub use gqa_norm_rope::GQANormRopeKernel;
 pub use gqa_norm_rope::GQANormRopeShape;
 
 mod residual;
-pub use residual::DuplicateResidualOutput;
 pub use residual::ResidualBuffers;
+pub use residual::ResidualCaptureTarget;
 pub use residual::ResidualInvocation;
 pub use residual::ResidualKernel;
 pub use residual::ResidualShape;

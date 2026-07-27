@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use inference_backend_metal::components::ResidualCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNReplayShape;
@@ -37,6 +38,7 @@ use crate::replay::ReplayComponent;
 pub struct Qwen35Main {
     layers: Vec<Qwen35Layer>,
     final_norm: RmsNorm,
+    residual_capture: Option<Rc<dyn QwenMainResidualCapture>>,
 }
 
 pub struct Qwen35MainEmbed {
@@ -64,6 +66,20 @@ pub struct Qwen35MainArgs<'a> {
     pub gqa: &'a crate::attn::gqa::batch_metadata::GQAMetadataBuffers,
     pub gdn: &'a crate::attn::gdn::batch_metadata::GDNMetadataBuffers,
     pub pages: &'a Buffer,
+}
+
+/// Selects capture targets for Qwen Main layer residual outputs.
+///
+/// While recording each zero-based model layer, Main asks the capture owner
+/// for the target of that layer's final, post-MLP residual add. A returned
+/// target receives the same BF16 values as the layer output. The owner owns
+/// the target buffer and its column-range layout.
+///
+/// Capture selection and destinations are part of the Main component's fixed
+/// replay topology. They must remain stable for the component's lifetime and
+/// must not alias Main inputs, outputs, or shared layer scratch.
+pub trait QwenMainResidualCapture {
+    fn capture_target_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>>;
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +122,7 @@ impl Qwen35Main {
         bindings: Qwen35MainWeightBindings,
         gqa_state: &Qwen35GQAState,
         gdn_state: &Qwen35GDNState,
+        residual_capture: Option<Rc<dyn QwenMainResidualCapture>>,
         layer_scratch: Rc<Qwen35LayerScratch>,
         dense_scratch: Option<&Rc<DenseMLPScratch>>,
         moe_scratch: Option<&Rc<MoEScratch>>,
@@ -184,6 +201,7 @@ impl Qwen35Main {
                 final_norm_weight,
                 RmsNorm::kernel(device),
             ),
+            residual_capture,
         })
     }
 
@@ -194,17 +212,21 @@ impl Qwen35Main {
         let num_tokens = args.num_tokens;
         let mut hidden = args.hidden_input;
         for layer in &self.layers {
-            let output = layer.output();
+            let residual_output = layer.residual_output();
             hidden = <Qwen35Layer as ReplayLayer>::record(
                 layer,
                 recorder,
                 Qwen35LayerInput {
                     gdn: Some(args.gdn),
                     gqa: args.gqa,
-                    input: hidden,
-                    output,
                     num_tokens,
                     pages: args.pages,
+                    residual_input: hidden,
+                    residual_output,
+                    residual_capture_target: self
+                        .residual_capture
+                        .as_ref()
+                        .and_then(|capture| capture.capture_target_for_model_layer(layer.layer_index())),
                 },
             );
         }
@@ -398,5 +420,57 @@ impl ReplayComponent for Qwen35GatherUnembed {
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         Qwen35GatherUnembed::record(self, recorder, *input);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inference_backend_metal::metal::Dtype;
+
+    use super::*;
+
+    struct SelectedLayerCapture {
+        model_layer_index: usize,
+        capture_output: Buffer,
+    }
+
+    impl QwenMainResidualCapture for SelectedLayerCapture {
+        fn capture_target_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>> {
+            (model_layer_index == self.model_layer_index)
+                .then(|| ResidualCaptureTarget::columns(&self.capture_output, 16, 4..12))
+        }
+    }
+
+    fn assert_replay_component<T: ReplayComponent>() {}
+
+    #[test]
+    fn test_residual_capture_selects_only_the_configured_model_layer() {
+        let device = Device::system_default();
+        let capture = Rc::new(SelectedLayerCapture {
+            model_layer_index: 10,
+            capture_output: Buffer::new_zeroed_elements(&device, 64, Dtype::Bfloat16),
+        });
+        let erased_capture: Rc<dyn QwenMainResidualCapture> = capture.clone();
+
+        assert!(erased_capture.capture_target_for_model_layer(9).is_none());
+        assert!(erased_capture.capture_target_for_model_layer(10).is_some());
+        assert!(erased_capture.capture_target_for_model_layer(11).is_none());
+
+        assert_replay_component::<Qwen35Main>();
+    }
+
+    #[test]
+    fn test_absent_main_capture_never_captures() {
+        let capture: Option<Rc<dyn QwenMainResidualCapture>> = None;
+        for model_layer_index in [0, 1, 10, usize::MAX] {
+            assert!(
+                capture
+                    .as_ref()
+                    .and_then(|capture| capture.capture_target_for_model_layer(model_layer_index))
+                    .is_none()
+            );
+        }
+
+        assert_replay_component::<Qwen35Main>();
     }
 }

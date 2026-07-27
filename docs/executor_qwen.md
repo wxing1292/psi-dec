@@ -170,6 +170,14 @@ They are executor-owned `Rc<Buffer>` workspace slots and are passed across runti
 handles, or hidden-source enums. The final layer residual is only the local current ping-pong buffer; there is no
 `final_residual` field, accessor, or allocation.
 
+`Qwen35Main` accepts an optional `Rc<dyn QwenMainResidualCapture>`. Immediately before each model layer's final
+post-MLP residual add, Main asks the capture owner for an optional opaque `ResidualCaptureTarget`. The target selects a
+stable, capture-owned BF16 column range; `None` records the ordinary residual add. The object-safe capture contract only
+returns this descriptor and never receives a recorder; `Qwen35Main::record` remains generic over
+`Recorder<Operator = ReplayOp>`. The Qwen3.5 loader supplies no capture owner, so its output buffers, replay key, and
+recorded operator sequence are unchanged. A future shared Qwen executor can inject its model-specific capture owner
+without coupling that semantic component to `ReplayRecorder`.
+
 `Qwen35GatherUnembedArgs` is flat: it binds the final-normalized hidden source, row indices, gather destination, and
 logits destination. Gathered hidden and logits remain executor workspaces.
 
@@ -230,10 +238,11 @@ MainEmbed -> Main -> GatherUnembed -> Sampling
 
 ## DSpark scope
 
-Qwen3.5 does not wire DSpark. `Qwen35Executor` has no DSpark field, replay, load/forward path, CLI option, Main residual
-capture hook, or target-context path. Existing DSpark component source, configuration, exact bindings, low-level plan,
-weights, and focused tests remain available for a future Qwen3 integration. This milestone verifies those low-level
-contracts by compilation/tests only and makes no DSpark end-to-end claim.
+Qwen3.5 does not wire DSpark. `Qwen35Executor` has no DSpark field, replay, load/forward path, CLI option, or
+target-context path. Main exposes the narrow residual-capture owner contract described above, but Qwen3.5 supplies no
+capture owner. Existing DSpark component source, configuration, exact bindings, low-level plan, weights, and focused
+tests remain available for a future Qwen3 integration. This milestone verifies those low-level contracts by
+compilation/tests only and makes no DSpark end-to-end claim.
 
 ## Verification
 

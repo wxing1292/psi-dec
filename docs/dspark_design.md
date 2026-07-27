@@ -14,7 +14,7 @@ The current Qwen3.5 path deliberately has none of the following:
 
 - a DSpark field or replay in `Qwen35Executor`;
 - DSpark load, target-capture, or proposal methods;
-- a Main residual-duplication hook or target-context input;
+- a DSpark capture policy or target-context input;
 - `--hf-dspark-model-dir` service selection;
 - shared Main/MTP/DSpark speculation abstraction;
 - a DSpark end-to-end correctness or performance claim.
@@ -47,6 +47,12 @@ crates/inference-executor-metal/src/model/qwen/v3_5/
 These files are not referenced by the Qwen3.5 executor load or forward path. Their public low-level contracts remain
 available to focused tests and future model-specific integration.
 
+Main now has a narrow object-safe residual-capture seam: `Qwen35Main` can ask an optional
+`Rc<dyn QwenMainResidualCapture>` for a capture target at each model layer's final post-MLP residual add. The
+capture contract only returns an opaque `ResidualCaptureTarget`; it has no recorder method. The Qwen3.5 loader supplies
+no capture owner, so this adds no Qwen3.5 operator or output. Future Qwen3 DSpark wiring can inject its capture owner
+through the shared executor without binding that semantic component to `ReplayRecorder`.
+
 ## Preserved low-level contract
 
 The retained implementation continues to model:
@@ -78,4 +84,5 @@ component tests. No compatible DSpark model weights are available in the reposit
 server/decode validation and no DSpark throughput result.
 
 Future wiring must be reviewed as a new model-specific design. It must not infer compatibility from the retained
-Qwen3.5 components, silently revive the old Main capture hooks, or broaden the current Qwen3.5 milestone.
+Qwen3.5 components, attach recorder semantics to the Main capture contract, or broaden the current Qwen3.5
+milestone.

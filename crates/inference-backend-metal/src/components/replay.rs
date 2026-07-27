@@ -1,9 +1,9 @@
 use crate::components::RMSNormInvocation;
 use crate::components::ResidualInvocation;
-use crate::components::residual::DuplicateResidualOutput;
-use crate::components::residual::DuplicateResidualReplayOp;
+use crate::components::residual::ResidualCaptureReplayOp;
+use crate::components::residual::ResidualCaptureTarget;
 use crate::components::residual::ResidualReplayOp;
-use crate::components::residual_rms_norm::DuplicateResidualRMSNormReplayInvocation;
+use crate::components::residual_rms_norm::ResidualCaptureRMSNormReplayInvocation;
 use crate::components::residual_rms_norm::ResidualRMSNormReplayInvocation;
 use crate::components::rms_norm::RMSNormReplayOp;
 use crate::metal::Operator;
@@ -38,12 +38,12 @@ impl ReplayRecorder {
                 op.record_into(&mut self.inner, barrier_before);
             },
             ReplayOpKind::ResidualAdd(op) => self.push_pending(PendingReplayOp::ResidualAdd { op, barrier_before }),
-            ReplayOpKind::ResidualAddWithDuplicate(op) => {
-                self.push_pending(PendingReplayOp::ResidualAddWithDuplicate { op, barrier_before });
+            ReplayOpKind::ResidualAddWithCapture(op) => {
+                self.push_pending(PendingReplayOp::ResidualAddWithCapture { op, barrier_before });
             },
             ReplayOpKind::RMSNorm(op) => {
-                if let Some((previous, residual_barrier_before)) = self.pop_duplicate_residual_add() {
-                    self.push_pending(PendingReplayOp::DuplicateResidualAddRMSNorm {
+                if let Some((previous, residual_barrier_before)) = self.pop_residual_add_with_capture() {
+                    self.push_pending(PendingReplayOp::ResidualCaptureRMSNorm {
                         op: previous.fuse_rms_norm(op),
                         barrier_before: residual_barrier_before,
                     });
@@ -84,15 +84,15 @@ impl ReplayRecorder {
         Some((op, barrier_before))
     }
 
-    fn pop_duplicate_residual_add(&mut self) -> Option<(DuplicateResidualReplayOp, bool)> {
+    fn pop_residual_add_with_capture(&mut self) -> Option<(ResidualCaptureReplayOp, bool)> {
         if !matches!(
             self.pending.last(),
-            Some(PendingReplayOp::ResidualAddWithDuplicate { .. })
+            Some(PendingReplayOp::ResidualAddWithCapture { .. })
         ) {
             return None;
         }
-        let Some(PendingReplayOp::ResidualAddWithDuplicate { op, barrier_before }) = self.pop() else {
-            panic!("pending replay op changed after duplicate residual check");
+        let Some(PendingReplayOp::ResidualAddWithCapture { op, barrier_before }) = self.pop() else {
+            panic!("pending replay op changed after residual capture check");
         };
         Some((op, barrier_before))
     }
@@ -103,8 +103,8 @@ impl ReplayRecorder {
                 PendingReplayOp::ResidualAdd { op, barrier_before } => {
                     record_pending(&mut self.inner, op.into_replay(), barrier_before);
                 },
-                PendingReplayOp::ResidualAddWithDuplicate { .. } => {
-                    panic!("duplicate residual add must be immediately fused with RMSNorm");
+                PendingReplayOp::ResidualAddWithCapture { .. } => {
+                    panic!("residual add with capture must be immediately fused with RMSNorm");
                 },
                 PendingReplayOp::RMSNorm { op, barrier_before } => {
                     record_pending(&mut self.inner, op.into_replay(), barrier_before);
@@ -112,7 +112,7 @@ impl ReplayRecorder {
                 PendingReplayOp::ResidualAddRMSNorm { op, barrier_before } => {
                     record_pending(&mut self.inner, op, barrier_before);
                 },
-                PendingReplayOp::DuplicateResidualAddRMSNorm { op, barrier_before } => {
+                PendingReplayOp::ResidualCaptureRMSNorm { op, barrier_before } => {
                     record_pending(&mut self.inner, op, barrier_before);
                 },
             }
@@ -135,7 +135,7 @@ pub struct ReplayOp<'a> {
 enum ReplayOpKind<'a> {
     Opaque(OpaqueReplayOp<'a>),
     ResidualAdd(ResidualReplayOp),
-    ResidualAddWithDuplicate(DuplicateResidualReplayOp),
+    ResidualAddWithCapture(ResidualCaptureReplayOp),
     RMSNorm(RMSNormReplayOp),
 }
 
@@ -155,12 +155,20 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
-    pub fn residual_add_with_duplicate_output(
-        invocation: ResidualInvocation<'a>,
-        duplicate_output: DuplicateResidualOutput<'a>,
-    ) -> Self {
+    /// Records a BF16 residual add that also captures every complete output row.
+    ///
+    /// The next recorded operator must be the RMSNorm consuming this residual
+    /// output. Fusion asserts that the capture range width equals the RMSNorm
+    /// hidden dimension, that the capture buffer has sufficient capacity and
+    /// does not alias any fused residual/RMSNorm buffer. A hidden dimension
+    /// divisible by four uses the vec4 kernel and requires aligned destination
+    /// coordinates; unsupported layouts panic rather than falling back to the
+    /// scalar kernel. Shape, capacity, and alias checks are intentionally
+    /// delayed because the residual invocation and capture target do not carry
+    /// the RMSNorm shape or all fused buffers.
+    pub fn residual_add_with_capture(invocation: ResidualInvocation<'a>, capture: ResidualCaptureTarget<'a>) -> Self {
         Self {
-            kind: ReplayOpKind::ResidualAddWithDuplicate(invocation.into_duplicate_replay_op(duplicate_output)),
+            kind: ReplayOpKind::ResidualAddWithCapture(invocation.into_capture_replay_op(capture)),
         }
     }
 
@@ -176,8 +184,8 @@ enum PendingReplayOp {
         op: ResidualReplayOp,
         barrier_before: bool,
     },
-    ResidualAddWithDuplicate {
-        op: DuplicateResidualReplayOp,
+    ResidualAddWithCapture {
+        op: ResidualCaptureReplayOp,
         barrier_before: bool,
     },
     RMSNorm {
@@ -188,8 +196,8 @@ enum PendingReplayOp {
         op: ResidualRMSNormReplayInvocation,
         barrier_before: bool,
     },
-    DuplicateResidualAddRMSNorm {
-        op: DuplicateResidualRMSNormReplayInvocation,
+    ResidualCaptureRMSNorm {
+        op: ResidualCaptureRMSNormReplayInvocation,
         barrier_before: bool,
     },
 }
@@ -229,11 +237,11 @@ mod tests {
 
     use super::ReplayOp;
     use super::ReplayRecorder;
-    use crate::components::DuplicateResidualOutput;
     use crate::components::RMSNormBuffers;
     use crate::components::RMSNormKernel;
     use crate::components::RMSNormShape;
     use crate::components::ResidualBuffers;
+    use crate::components::ResidualCaptureTarget;
     use crate::components::ResidualKernel;
     use crate::components::ResidualShape;
     use crate::metal::Buffer;
@@ -349,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bucketed_duplicate_residual_fusion() {
+    fn test_bucketed_residual_capture_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let residual = ResidualKernel::new(&device);
@@ -357,10 +365,11 @@ mod tests {
         let num_active_tokens = 2_u32;
         let token_capacity = 4_u32;
         let hidden_dim = 8_u32;
-        let duplicate_row_stride = hidden_dim * 3;
-        let duplicate_column_offset = hidden_dim;
+        let capture_row_width = hidden_dim * 3;
+        let capture_column_start = hidden_dim;
+        let capture_column_end = capture_column_start + hidden_dim;
         let capacity_values = (token_capacity * hidden_dim) as usize;
-        let duplicate_values = (token_capacity * duplicate_row_stride) as usize;
+        let capture_values = (token_capacity * capture_row_width) as usize;
         let lhs_values = (0..capacity_values)
             .map(|index| bf16::from_f32(index as f32 * 0.03125 - 0.5).to_bits())
             .collect::<Vec<_>>();
@@ -372,11 +381,11 @@ mod tests {
         let weight = Buffer::from_slice(&device, &vec![bf16::from_f32(1.0).to_bits(); hidden_dim as usize]);
         let sentinel = bf16::from_f32(-321.0).to_bits();
         let residual_output = Buffer::from_slice(&device, &vec![sentinel; capacity_values]);
-        let duplicate_output = Buffer::from_slice(&device, &vec![sentinel; duplicate_values]);
+        let capture_output = Buffer::from_slice(&device, &vec![sentinel; capture_values]);
         let norm_output = Buffer::from_slice(&device, &vec![sentinel; capacity_values]);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
-        recorder.record(ReplayOp::residual_add_with_duplicate_output(
+        recorder.record(ReplayOp::residual_add_with_capture(
             residual.invoke(
                 ResidualShape::bf16(capacity_values as u32),
                 ResidualBuffers {
@@ -385,11 +394,11 @@ mod tests {
                     output: &residual_output,
                 },
             ),
-            DuplicateResidualOutput {
-                buffer: &duplicate_output,
-                row_stride: duplicate_row_stride,
-                column_offset: duplicate_column_offset,
-            },
+            ResidualCaptureTarget::columns(
+                &capture_output,
+                capture_row_width,
+                capture_column_start..capture_column_end,
+            ),
         ));
         recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke_bucketed(
             RMSNormShape::bf16(token_capacity, hidden_dim),
@@ -413,16 +422,16 @@ mod tests {
             .wait();
 
         let residual_values = residual_output.read_typed::<u16>(0, capacity_values);
-        let duplicate_values = duplicate_output.read_typed::<u16>(0, duplicate_values);
+        let capture_values = capture_output.read_typed::<u16>(0, capture_values);
         for row in 0..token_capacity as usize {
-            for column in 0..duplicate_row_stride as usize {
-                let actual = duplicate_values[row * duplicate_row_stride as usize + column];
-                let in_duplicate_slice = column >= duplicate_column_offset as usize
-                    && column < (duplicate_column_offset + hidden_dim) as usize;
-                if row < num_active_tokens as usize && in_duplicate_slice {
+            for column in 0..capture_row_width as usize {
+                let actual = capture_values[row * capture_row_width as usize + column];
+                let in_capture_columns =
+                    column >= capture_column_start as usize && column < capture_column_end as usize;
+                if row < num_active_tokens as usize && in_capture_columns {
                     assert_eq!(
                         actual,
-                        residual_values[row * hidden_dim as usize + column - duplicate_column_offset as usize]
+                        residual_values[row * hidden_dim as usize + column - capture_column_start as usize]
                     );
                 } else {
                     assert_eq!(actual, sentinel);
@@ -437,15 +446,16 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_duplicate_residual_fusion() {
+    fn test_scalar_residual_capture_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let residual = ResidualKernel::new(&device);
         let rms_norm = RMSNormKernel::new(&device);
         let tokens = 2_u32;
         let hidden_dim = 6_u32;
-        let row_stride = 13_u32;
-        let column_offset = 2_u32;
+        let capture_row_width = 13_u32;
+        let capture_column_start = 2_u32;
+        let capture_column_end = capture_column_start + hidden_dim;
         let num_values = (tokens * hidden_dim) as usize;
         let lhs = Buffer::from_slice(
             &device,
@@ -463,9 +473,9 @@ mod tests {
         let residual_output = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
         let norm_output = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
         let sentinel = bf16::from_f32(-123.0).to_bits();
-        let duplicate_output = Buffer::from_slice(&device, &vec![sentinel; (tokens * row_stride) as usize]);
+        let capture_output = Buffer::from_slice(&device, &vec![sentinel; (tokens * capture_row_width) as usize]);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
-        recorder.record(ReplayOp::residual_add_with_duplicate_output(
+        recorder.record(ReplayOp::residual_add_with_capture(
             residual.invoke(
                 ResidualShape::bf16(num_values as u32),
                 ResidualBuffers {
@@ -474,11 +484,11 @@ mod tests {
                     output: &residual_output,
                 },
             ),
-            DuplicateResidualOutput {
-                buffer: &duplicate_output,
-                row_stride,
-                column_offset,
-            },
+            ResidualCaptureTarget::columns(
+                &capture_output,
+                capture_row_width,
+                capture_column_start..capture_column_end,
+            ),
         ));
         recorder.record(ReplayOp::rms_norm(rms_norm.invoke(
             RMSNormShape::bf16(tokens, hidden_dim),
@@ -493,28 +503,36 @@ mod tests {
         stream.submit_replay(&recorder.build()).wait();
 
         let residual_values = residual_output.read_typed::<u16>(0, num_values);
-        let duplicate_values = duplicate_output.read_typed::<u16>(0, (tokens * row_stride) as usize);
+        let capture_values = capture_output.read_typed::<u16>(0, (tokens * capture_row_width) as usize);
         for row in 0..tokens as usize {
             assert_eq!(
-                &duplicate_values[row * row_stride as usize + column_offset as usize
-                    ..row * row_stride as usize + column_offset as usize + hidden_dim as usize],
+                &capture_values[row * capture_row_width as usize + capture_column_start as usize
+                    ..row * capture_row_width as usize + capture_column_end as usize],
                 &residual_values[row * hidden_dim as usize..(row + 1) * hidden_dim as usize]
             );
         }
     }
 
     #[test]
-    #[should_panic(expected = "duplicate residual add must be immediately fused with RMSNorm")]
-    fn test_duplicate_residual_requires_fusion() {
+    #[should_panic(expected = "unsupported residual capture layout")]
+    fn test_unaligned_vec4_capture_is_unsupported() {
+        let device = Device::system_default();
+        let capture_output = Buffer::new_zeroed(&device, 26 * size_of::<u16>());
+        let _ = ResidualCaptureTarget::columns(&capture_output, 13, 2..10);
+    }
+
+    #[test]
+    #[should_panic(expected = "residual add with capture must be immediately fused with RMSNorm")]
+    fn test_residual_capture_requires_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let residual = ResidualKernel::new(&device);
         let lhs = Buffer::new_zeroed(&device, 16);
         let rhs = Buffer::new_zeroed(&device, 16);
         let output = Buffer::new_zeroed(&device, 16);
-        let duplicate_output = Buffer::new_zeroed(&device, 32);
+        let capture_output = Buffer::new_zeroed(&device, 32);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
-        recorder.record(ReplayOp::residual_add_with_duplicate_output(
+        recorder.record(ReplayOp::residual_add_with_capture(
             residual.invoke(
                 ResidualShape::bf16(8),
                 ResidualBuffers {
@@ -523,11 +541,7 @@ mod tests {
                     output: &output,
                 },
             ),
-            DuplicateResidualOutput {
-                buffer: &duplicate_output,
-                row_stride: 8,
-                column_offset: 0,
-            },
+            ResidualCaptureTarget::columns(&capture_output, 8, 0..8),
         ));
 
         recorder.build();

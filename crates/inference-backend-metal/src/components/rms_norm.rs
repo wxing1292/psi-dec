@@ -4,7 +4,7 @@ use objc2_metal::MTLBuffer;
 use objc2_metal::MTLComputePipelineState;
 use objc2_metal::MTLResource;
 
-use crate::components::residual_rms_norm::DuplicateResidualRMSNormOwnedBuffers;
+use crate::components::residual_rms_norm::ResidualCaptureRMSNormOwnedBuffers;
 use crate::components::residual_rms_norm::ResidualRMSNormOwnedBuffers;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
@@ -276,7 +276,7 @@ impl RMSNormReplayOp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn into_duplicate_residual_rms_norm_buffers(
+    pub fn into_residual_capture_rms_norm_buffers(
         self,
         lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
         lhs_len_bytes: usize,
@@ -284,11 +284,11 @@ impl RMSNormReplayOp {
         rhs_len_bytes: usize,
         residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
         residual_output_len_bytes: usize,
-        duplicate_residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
-        duplicate_residual_output_len_bytes: usize,
-    ) -> (DuplicateResidualRMSNormOwnedBuffers, f32, Option<ReplayParameterKey>) {
+        capture_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+        capture_output_len_bytes: usize,
+    ) -> (ResidualCaptureRMSNormOwnedBuffers, f32, Option<ReplayParameterKey>) {
         (
-            DuplicateResidualRMSNormOwnedBuffers::new(
+            ResidualCaptureRMSNormOwnedBuffers::new(
                 lhs,
                 lhs_len_bytes,
                 rhs,
@@ -297,8 +297,8 @@ impl RMSNormReplayOp {
                 self.buffers.weight_len_bytes,
                 residual_output,
                 residual_output_len_bytes,
-                duplicate_residual_output,
-                duplicate_residual_output_len_bytes,
+                capture_output,
+                capture_output_len_bytes,
                 self.buffers.output,
                 self.buffers.output_len_bytes,
             ),

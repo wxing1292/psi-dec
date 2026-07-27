@@ -228,12 +228,11 @@ impl Qwen35DSparkSpeculator {
         self.main_page_table_layout
     }
 
-    pub fn duplicate_residual_output_for_model_layer(
+    pub fn capture_target_for_model_layer(
         &self,
         model_layer_index: usize,
-    ) -> Option<inference_backend_metal::components::DuplicateResidualOutput<'_>> {
-        self.target_projector
-            .duplicate_residual_output_for_model_layer(model_layer_index)
+    ) -> Option<inference_backend_metal::components::ResidualCaptureTarget<'_>> {
+        self.target_projector.capture_target_for_model_layer(model_layer_index)
     }
 
     pub fn record_target_context<'a, R>(

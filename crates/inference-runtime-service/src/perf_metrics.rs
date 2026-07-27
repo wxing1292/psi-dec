@@ -27,15 +27,15 @@ pub struct BatchRequestSummary {
     pub decode_reqs: usize,
     pub query_tokens: usize,
     pub max_query_tokens: usize,
-    pub mtp_decode_reqs_with_spec: usize,
-    pub mtp_input_spec_tokens: usize,
+    pub spec_decode_reqs: usize,
+    pub input_spec_tokens: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct BatchResponseSummary {
-    pub mtp_accepted_tokens: usize,
+    pub accepted_spec_tokens: usize,
     pub sampled_tokens: usize,
-    pub mtp_output_spec_tokens: usize,
+    pub output_spec_tokens: usize,
 }
 
 pub fn summarize_batch_device_request(batch: &BatchDeviceRequest) -> BatchRequestSummary {
@@ -45,8 +45,8 @@ pub fn summarize_batch_device_request(batch: &BatchDeviceRequest) -> BatchReques
         decode_reqs: 0,
         query_tokens: 0,
         max_query_tokens: 0,
-        mtp_decode_reqs_with_spec: 0,
-        mtp_input_spec_tokens: 0,
+        spec_decode_reqs: 0,
+        input_spec_tokens: 0,
     };
 
     for request in &batch.dev_reqs {
@@ -58,8 +58,8 @@ pub fn summarize_batch_device_request(batch: &BatchDeviceRequest) -> BatchReques
             QueryTokens::Decode { spec_tokens, .. } => {
                 summary.decode_reqs += 1;
                 if !spec_tokens.is_empty() {
-                    summary.mtp_decode_reqs_with_spec += 1;
-                    summary.mtp_input_spec_tokens += spec_tokens.len();
+                    summary.spec_decode_reqs += 1;
+                    summary.input_spec_tokens += spec_tokens.len();
                 }
             },
         }
@@ -70,9 +70,9 @@ pub fn summarize_batch_device_request(batch: &BatchDeviceRequest) -> BatchReques
 
 pub fn summarize_batch_device_response(batch: &BatchDeviceResponse) -> BatchResponseSummary {
     let mut summary = BatchResponseSummary {
-        mtp_accepted_tokens: 0,
+        accepted_spec_tokens: 0,
         sampled_tokens: 0,
-        mtp_output_spec_tokens: 0,
+        output_spec_tokens: 0,
     };
 
     for response in &batch.dev_resps {
@@ -82,9 +82,9 @@ pub fn summarize_batch_device_response(batch: &BatchDeviceResponse) -> BatchResp
             ..
         } = &response.sampled_tokens
         {
-            summary.mtp_accepted_tokens += validated_tokens.len();
+            summary.accepted_spec_tokens += validated_tokens.len();
             summary.sampled_tokens += validated_tokens.len() + 1;
-            summary.mtp_output_spec_tokens += spec_tokens.len();
+            summary.output_spec_tokens += spec_tokens.len();
         }
     }
 
@@ -113,10 +113,7 @@ fn emit_executor_batch_perf_info(
     response_summary: &BatchResponseSummary,
     metrics: &ExecutorBatchPerfMetrics,
 ) {
-    let acceptance_rate = ratio(
-        response_summary.mtp_accepted_tokens,
-        batch_summary.mtp_input_spec_tokens,
-    );
+    let acceptance_rate = ratio(response_summary.accepted_spec_tokens, batch_summary.input_spec_tokens);
     tracing::info!(
         target: "inference-runtime-service::perf",
         phase = "executor.batch.perf",
@@ -124,8 +121,8 @@ fn emit_executor_batch_perf_info(
         batch_seq,
         num_reqs = batch_summary.num_reqs,
         num_tokens = batch_summary.query_tokens,
-        num_spec_tokens = batch_summary.mtp_input_spec_tokens,
-        num_accepted_tokens = response_summary.mtp_accepted_tokens,
+        num_spec_tokens = batch_summary.input_spec_tokens,
+        num_accepted_tokens = response_summary.accepted_spec_tokens,
         num_sampled_tokens = response_summary.sampled_tokens,
         acceptance_rate,
         latency_ms = ms(metrics.total_elapsed),
@@ -140,14 +137,11 @@ fn emit_executor_batch_perf_debug(
     response_summary: &BatchResponseSummary,
     metrics: &ExecutorBatchPerfMetrics,
 ) {
-    let mtp_rejected_tokens = batch_summary
-        .mtp_input_spec_tokens
-        .saturating_sub(response_summary.mtp_accepted_tokens);
-    let acceptance_rate = ratio(
-        response_summary.mtp_accepted_tokens,
-        batch_summary.mtp_input_spec_tokens,
-    );
-    let rejection_rate = ratio(mtp_rejected_tokens, batch_summary.mtp_input_spec_tokens);
+    let rejected_spec_tokens = batch_summary
+        .input_spec_tokens
+        .saturating_sub(response_summary.accepted_spec_tokens);
+    let acceptance_rate = ratio(response_summary.accepted_spec_tokens, batch_summary.input_spec_tokens);
+    let rejection_rate = ratio(rejected_spec_tokens, batch_summary.input_spec_tokens);
 
     tracing::debug!(
         target: "inference-runtime-service::perf",
@@ -156,17 +150,17 @@ fn emit_executor_batch_perf_debug(
         batch_seq,
         num_reqs = batch_summary.num_reqs,
         num_tokens = batch_summary.query_tokens,
-        num_spec_tokens = batch_summary.mtp_input_spec_tokens,
-        num_accepted_tokens = response_summary.mtp_accepted_tokens,
+        num_spec_tokens = batch_summary.input_spec_tokens,
+        num_accepted_tokens = response_summary.accepted_spec_tokens,
         num_sampled_tokens = response_summary.sampled_tokens,
         acceptance_rate,
         latency_ms = ms(metrics.total_elapsed),
         num_prefill_reqs = batch_summary.prefill_reqs,
         num_decode_reqs = batch_summary.decode_reqs,
         max_num_tokens = batch_summary.max_query_tokens,
-        num_mtp_reqs = batch_summary.mtp_decode_reqs_with_spec,
-        num_rejected_tokens = mtp_rejected_tokens,
-        num_output_spec_tokens = response_summary.mtp_output_spec_tokens,
+        num_spec_reqs = batch_summary.spec_decode_reqs,
+        num_rejected_tokens = rejected_spec_tokens,
+        num_output_spec_tokens = response_summary.output_spec_tokens,
         rejection_rate,
         sampled_rows = metrics.sampled_rows,
         do_sample = metrics.do_sample,
@@ -178,10 +172,10 @@ fn emit_executor_batch_perf_debug(
             metrics.model_output_timing.map(|timing| ms(timing.rejection_build_elapsed)),
         model_output_rejection_read_ms =
             metrics.model_output_timing.map(|timing| ms(timing.rejection_read_elapsed)),
-        model_output_mtp_build_ms = metrics.model_output_timing.map(|timing| ms(timing.mtp_build_elapsed)),
-        model_output_mtp_replay_ms = metrics.model_output_timing.map(|timing| ms(timing.mtp_replay_elapsed)),
-        model_output_mtp_read_ms = metrics.model_output_timing.map(|timing| ms(timing.mtp_read_elapsed)),
-        model_output_mtp_modules = metrics.model_output_timing.map(|timing| timing.mtp_modules),
+        model_output_spec_build_ms = metrics.model_output_timing.map(|timing| ms(timing.spec_build_elapsed)),
+        model_output_spec_replay_ms = metrics.model_output_timing.map(|timing| ms(timing.spec_replay_elapsed)),
+        model_output_spec_read_ms = metrics.model_output_timing.map(|timing| ms(timing.spec_read_elapsed)),
+        model_output_spec_passes = metrics.model_output_timing.map(|timing| timing.spec_passes),
         prepare_batch_ms = ms(metrics.prepare_batch_elapsed),
         input_ms = ms(metrics.input_elapsed),
         model_ms = ms(metrics.model_elapsed),
@@ -337,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_mtp_acceptance_fields() {
+    fn summarizes_spec_acceptance_fields() {
         let request = BatchDeviceRequest::new(
             0,
             [DeviceRequest::new(
@@ -378,16 +372,13 @@ mod tests {
         let request_summary = summarize_batch_device_request(&request);
         let response_summary = summarize_batch_device_response(&response);
 
-        assert_eq!(request_summary.mtp_decode_reqs_with_spec, 1);
-        assert_eq!(request_summary.mtp_input_spec_tokens, 2);
-        assert_eq!(response_summary.mtp_accepted_tokens, 1);
+        assert_eq!(request_summary.spec_decode_reqs, 1);
+        assert_eq!(request_summary.input_spec_tokens, 2);
+        assert_eq!(response_summary.accepted_spec_tokens, 1);
         assert_eq!(response_summary.sampled_tokens, 2);
-        assert_eq!(response_summary.mtp_output_spec_tokens, 2);
+        assert_eq!(response_summary.output_spec_tokens, 2);
         assert_eq!(
-            ratio(
-                response_summary.mtp_accepted_tokens,
-                request_summary.mtp_input_spec_tokens
-            ),
+            ratio(response_summary.accepted_spec_tokens, request_summary.input_spec_tokens),
             0.5
         );
     }

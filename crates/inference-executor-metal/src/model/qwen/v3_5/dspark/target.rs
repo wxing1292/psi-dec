@@ -1,7 +1,9 @@
-use inference_backend_metal::components::DuplicateResidualOutput;
+use std::ops::Range;
+
 use inference_backend_metal::components::RMSNormBuffers;
 use inference_backend_metal::components::RMSNormKernel;
 use inference_backend_metal::components::RMSNormShape;
+use inference_backend_metal::components::ResidualCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -76,27 +78,31 @@ impl Qwen35DSparkTargetLayout {
             .expect("DSpark projected target workspace size must fit usize")
     }
 
-    fn duplicate_column_offset(self, residual_slice_index: usize) -> u32 {
+    fn capture_columns(self, residual_slice_index: usize) -> Range<u32> {
         assert!(
             residual_slice_index < self.num_selected_residuals as usize,
             "DSpark target residual slice is outside the workspace"
         );
-        residual_slice_index
+        let start: u32 = residual_slice_index
             .checked_mul(self.hidden_dim as usize)
             .and_then(|offset| offset.try_into().ok())
-            .expect("DSpark target residual column offset must fit u32")
+            .expect("DSpark target residual column start must fit u32");
+        let end = start
+            .checked_add(self.hidden_dim)
+            .expect("DSpark target residual column end must fit u32");
+        start..end
     }
 
-    fn duplicate_output<'a>(
+    fn residual_capture_target<'a>(
         self,
         target_residuals: &'a Buffer,
         residual: Qwen35DSparkTargetResidualPlan,
-    ) -> DuplicateResidualOutput<'a> {
-        DuplicateResidualOutput {
-            buffer: target_residuals,
-            row_stride: self.selected_hidden_dim,
-            column_offset: self.duplicate_column_offset(residual.residual_slice_index),
-        }
+    ) -> ResidualCaptureTarget<'a> {
+        ResidualCaptureTarget::columns(
+            target_residuals,
+            self.selected_hidden_dim,
+            self.capture_columns(residual.residual_slice_index),
+        )
     }
 }
 
@@ -199,17 +205,15 @@ impl Qwen35DSparkTargetProjector {
         })
     }
 
-    pub fn duplicate_residual_output(&self, residual: Qwen35DSparkTargetResidualPlan) -> DuplicateResidualOutput<'_> {
-        self.layout.duplicate_output(&self.workspace.target_residuals, residual)
+    pub fn residual_capture_target(&self, residual: Qwen35DSparkTargetResidualPlan) -> ResidualCaptureTarget<'_> {
+        self.layout
+            .residual_capture_target(&self.workspace.target_residuals, residual)
     }
 
-    pub fn duplicate_residual_output_for_model_layer(
-        &self,
-        model_layer_index: usize,
-    ) -> Option<DuplicateResidualOutput<'_>> {
+    pub fn capture_target_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>> {
         self.residual_bindings
             .get(model_layer_index)
-            .map(|residual| self.duplicate_residual_output(residual))
+            .map(|residual| self.residual_capture_target(residual))
     }
 
     pub fn projected_target(&self) -> &Buffer {
@@ -269,7 +273,7 @@ mod tests {
     use crate::model::qwen::v3_5::plan::Qwen35QuantizedLinearPlan;
 
     #[test]
-    fn target_layout_matches_token_major_selected_residual_slices() {
+    fn test_layout_matches_token_major_selected_residual_slices() {
         let plan = test_plan();
         let layout = Qwen35DSparkTargetLayout::new(&plan, 128);
         assert_eq!(layout.max_tokens, 128);
@@ -278,9 +282,9 @@ mod tests {
         assert_eq!(layout.selected_hidden_dim, 25_600);
         assert_eq!(layout.target_residual_elements(), 3_276_800);
         assert_eq!(layout.projected_target_elements(), 655_360);
-        assert_eq!(layout.duplicate_column_offset(0), 0);
-        assert_eq!(layout.duplicate_column_offset(1), 5120);
-        assert_eq!(layout.duplicate_column_offset(4), 20_480);
+        assert_eq!(layout.capture_columns(0), 0..5120);
+        assert_eq!(layout.capture_columns(1), 5120..10_240);
+        assert_eq!(layout.capture_columns(4), 20_480..25_600);
 
         let bindings = Qwen35DSparkTargetResidualBindings::new(&plan);
         assert_eq!(bindings.get(0), None);

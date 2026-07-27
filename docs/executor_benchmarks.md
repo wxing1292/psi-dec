@@ -86,8 +86,8 @@ Run one perf command at a time. List planned cases first; GPU contention and mem
 
 `setup_us` includes model loading and fixture construction. `cache_miss_wall_us` is the first complete execution;
 `cache_build_estimate_us` is the CPU record/finish estimate after subtracting measured replay waits. Whole-executor
-samples report wall time plus main/output/MTP replay waits. Prepare, record/finish, feedback, and commit remain distinct
-host boundaries.
+samples report wall time plus main/output/speculator replay waits. Prepare, record/finish, feedback, and commit remain
+distinct host boundaries.
 
 Force-sync/profile-summary measurements are diagnostic metrics, not normal wall-clock throughput. Never compare the two
 as if they measured the same workload.

@@ -316,10 +316,11 @@ impl BlockFixture {
                 Qwen35LayerInput {
                     gdn: Some(&self.gdn_metadata),
                     gqa: &self.gqa_metadata,
-                    input: hidden,
-                    output: layer.output(),
                     num_tokens: self.shape.num_tokens,
                     pages: self.pages.buffer(),
+                    residual_input: hidden,
+                    residual_output: layer.residual_output(),
+                    residual_capture_target: None,
                 },
             );
         }

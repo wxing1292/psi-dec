@@ -56,7 +56,7 @@ pub trait ReplayableModelBatchExecutor {
         model_batch_req: &Self::ModelBatchReq,
         model_batch_hidden: Self::ModelBatchHidden,
     ) -> Self::ModelBatchHidden;
-    fn forward_mtp(
+    fn forward_spec(
         &mut self,
         _recorder: &mut Self::ModelOpsRecorder,
         _model_batch_req: &Self::ModelBatchReq,
@@ -101,10 +101,10 @@ pub struct ModelOutputTiming {
     pub sample_read_elapsed: Duration,
     pub rejection_build_elapsed: Duration,
     pub rejection_read_elapsed: Duration,
-    pub mtp_build_elapsed: Duration,
-    pub mtp_replay_elapsed: Duration,
-    pub mtp_read_elapsed: Duration,
-    pub mtp_modules: usize,
+    pub spec_build_elapsed: Duration,
+    pub spec_replay_elapsed: Duration,
+    pub spec_read_elapsed: Duration,
+    pub spec_passes: usize,
 }
 
 impl ModelOutputTiming {
@@ -114,10 +114,10 @@ impl ModelOutputTiming {
         self.sample_read_elapsed += other.sample_read_elapsed;
         self.rejection_build_elapsed += other.rejection_build_elapsed;
         self.rejection_read_elapsed += other.rejection_read_elapsed;
-        self.mtp_build_elapsed += other.mtp_build_elapsed;
-        self.mtp_replay_elapsed += other.mtp_replay_elapsed;
-        self.mtp_read_elapsed += other.mtp_read_elapsed;
-        self.mtp_modules += other.mtp_modules;
+        self.spec_build_elapsed += other.spec_build_elapsed;
+        self.spec_replay_elapsed += other.spec_replay_elapsed;
+        self.spec_read_elapsed += other.spec_read_elapsed;
+        self.spec_passes += other.spec_passes;
     }
 
     pub fn is_zero(self) -> bool {

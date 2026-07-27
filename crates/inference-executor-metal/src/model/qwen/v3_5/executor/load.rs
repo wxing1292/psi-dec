@@ -477,6 +477,7 @@ fn init_qwen_3_5_model_inner(
         main_bindings,
         &main_gqa_state,
         &main_gdn_state,
+        None,
         std::rc::Rc::clone(&layer_scratch),
         dense_mlp_scratch.as_ref(),
         moe_scratch.as_ref(),

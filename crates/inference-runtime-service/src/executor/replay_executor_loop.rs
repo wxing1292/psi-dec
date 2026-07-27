@@ -205,7 +205,7 @@ where
                 self.model.empty_sampled_output()
             };
             if last_pp_stage {
-                self.model.forward_mtp(
+                self.model.forward_spec(
                     &mut recorder,
                     &model_batch_req,
                     &model_batch_hidden_resp,

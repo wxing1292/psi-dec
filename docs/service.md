@@ -305,6 +305,11 @@ output tokens, acceptance rate, and total latency. `--logging debug` uses the
 same event model and adds request-kind counts, rejected/next speculative
 tokens, sampled rows, and replay-stage submit/wait timing. It does not
 duplicate an INFO event.
+The model-neutral speculator timing fields are `model_output_spec_build_ms`,
+`model_output_spec_replay_ms`, `model_output_spec_read_ms`, and
+`model_output_spec_passes`. A pass is one auxiliary speculator forward that
+actually executes. For Qwen3.5, each MTP module forward is one pass, including
+prefill forwards used for cache maintenance.
 Runtime shutdown also emits a scheduler table containing call counts and
 latency percentiles over the runtime lifetime. Enqueue and swap-in report
 request counts; prepare, cancel, and commit report both counts and latency

@@ -203,7 +203,7 @@ impl ExecutorFixture {
         };
         let sampled = self
             .model
-            .forward_mtp(&mut recorder, &model_batch_req, &hidden, sampled);
+            .forward_spec(&mut recorder, &model_batch_req, &hidden, sampled);
         let record = record_start.elapsed();
         let finish_start = Instant::now();
         let sampled = self.model.finish_ops_recording(recorder, sampled);
@@ -327,7 +327,7 @@ impl ExecutionTiming {
 }
 
 fn submit_wait_elapsed(stage: &ModelOutputTiming) -> Duration {
-    stage.main_replay_elapsed + stage.main_output_replay_elapsed + stage.mtp_replay_elapsed
+    stage.main_replay_elapsed + stage.main_output_replay_elapsed + stage.spec_replay_elapsed
 }
 
 fn measure_runs(runs: usize, iters: usize, mut run: impl FnMut() -> ExecutionTiming) -> Vec<RunSample> {
@@ -378,11 +378,11 @@ fn print_result(
         .map(|sample| sample.stage.main_output_replay_elapsed.as_secs_f64() * 1.0e6 / iters as f64)
         .collect::<Vec<_>>();
     output_us.sort_by(f64::total_cmp);
-    let mut mtp_us = samples
+    let mut spec_us = samples
         .iter()
-        .map(|sample| sample.stage.mtp_replay_elapsed.as_secs_f64() * 1.0e6 / iters as f64)
+        .map(|sample| sample.stage.spec_replay_elapsed.as_secs_f64() * 1.0e6 / iters as f64)
         .collect::<Vec<_>>();
-    mtp_us.sort_by(f64::total_cmp);
+    spec_us.sort_by(f64::total_cmp);
     let mut feedback_us = samples
         .iter()
         .map(|sample| sample.feedback.as_secs_f64() * 1.0e6 / iters as f64)
@@ -423,7 +423,7 @@ fn print_result(
     println!(
         "perf component=qwen35-executor case={} setup_us={:.3} cache_miss_wall_us={:.3} cache_build_estimate_us={:.3} \
          timing=executor-wall iters={} runs={} wall_median_us={:.3} main_median_us={:.3} output_median_us={:.3} \
-         mtp_median_us={:.3} prepare_median_us={:.3} record_cpu_estimate_median_us={:.3} \
+         spec_median_us={:.3} prepare_median_us={:.3} record_cpu_estimate_median_us={:.3} \
          finish_cpu_estimate_median_us={:.3} feedback_median_us={:.3}",
         case.key(),
         setup_elapsed.as_secs_f64() * 1.0e6,
@@ -434,7 +434,7 @@ fn print_result(
         median_wall_us,
         median_of_sorted(&main_us),
         median_of_sorted(&output_us),
-        median_of_sorted(&mtp_us),
+        median_of_sorted(&spec_us),
         median_of_sorted(&prepare_us),
         median_of_sorted(&record_cpu_estimate_us),
         median_of_sorted(&finish_cpu_estimate_us),

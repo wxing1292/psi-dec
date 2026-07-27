@@ -1,5 +1,5 @@
-use inference_backend_metal::components::DuplicateResidualOutput;
 use inference_backend_metal::components::RMSNormInvocation;
+use inference_backend_metal::components::ResidualCaptureTarget;
 use inference_backend_metal::components::ResidualInvocation;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayArguments;
@@ -131,15 +131,18 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
-    pub fn residual_add_with_duplicate_output(
-        invocation: ResidualInvocation<'a>,
-        duplicate_output: DuplicateResidualOutput<'a>,
-    ) -> Self {
+    /// Records a BF16 residual add that captures every complete output row.
+    ///
+    /// The next recorded operator must be the RMSNorm consuming this residual
+    /// output. Backend replay fusion then asserts that the destination range
+    /// width equals the RMSNorm hidden dimension, has sufficient capacity and
+    /// alignment, and does not alias any fused residual/RMSNorm buffer. Those
+    /// checks are delayed until fusion because this wrapper does not own the
+    /// RMSNorm shape or fused buffers. Unsupported vec4 destination alignment
+    /// panics instead of falling back to a more generic kernel.
+    pub fn residual_add_with_capture(invocation: ResidualInvocation<'a>, capture: ResidualCaptureTarget<'a>) -> Self {
         Self {
-            inner: inference_backend_metal::components::ReplayOp::residual_add_with_duplicate_output(
-                invocation,
-                duplicate_output,
-            ),
+            inner: inference_backend_metal::components::ReplayOp::residual_add_with_capture(invocation, capture),
         }
     }
 

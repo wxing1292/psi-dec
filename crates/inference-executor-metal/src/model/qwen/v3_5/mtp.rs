@@ -368,10 +368,11 @@ impl Qwen35MTP {
             Qwen35LayerInput {
                 gdn: None,
                 gqa: args.gqa,
-                input: args.hidden_input,
-                output: self.layer.output(),
                 num_tokens,
                 pages: args.pages,
+                residual_input: args.hidden_input,
+                residual_output: self.layer.residual_output(),
+                residual_capture_target: None,
             },
         );
         let num_values = num_tokens
@@ -386,11 +387,11 @@ impl Qwen35MTP {
             num_values,
             residual.lhs,
             residual.rhs,
-            self.layer.output(),
+            self.layer.residual_output(),
             None,
         );
         self.output_norm
-            .record(recorder, num_tokens, self.layer.output(), args.hidden_output);
+            .record(recorder, num_tokens, self.layer.residual_output(), args.hidden_output);
         args.hidden_output
     }
 }

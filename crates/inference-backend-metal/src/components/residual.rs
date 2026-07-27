@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
@@ -5,7 +7,7 @@ use objc2_metal::MTLComputePipelineState;
 use objc2_metal::MTLResource;
 
 use crate::components::ResidualRMSNormShape;
-use crate::components::residual_rms_norm::DuplicateResidualRMSNormReplayInvocation;
+use crate::components::residual_rms_norm::ResidualCaptureRMSNormReplayInvocation;
 use crate::components::residual_rms_norm::ResidualRMSNormReplayInvocation;
 use crate::components::rms_norm::RMSNormReplayOp;
 use crate::metal::Buffer;
@@ -146,23 +148,43 @@ pub struct ResidualReplayOp {
     buffers: ResidualOwnedBuffers,
 }
 
-pub struct DuplicateResidualReplayOp {
+pub struct ResidualCaptureReplayOp {
     residual: ResidualReplayOp,
-    duplicate_output: DuplicateResidualOwnedOutput,
+    capture: OwnedResidualCaptureTarget,
 }
 
+/// Destination for capturing every complete row produced by a fused residual add.
+///
+/// The target is currently supported only for BF16 residual-add/RMSNorm replay
+/// fusion. Each complete residual row is written into the selected destination
+/// columns. The capture must be immediately followed by its RMSNorm fusion
+/// partner, the destination range width must equal that RMSNorm's hidden
+/// dimension, and the destination buffer must not alias any fused
+/// residual/RMSNorm buffer.
+///
+/// Capture rows whose width is a multiple of four use the vec4 kernel and
+/// therefore require four-element-aligned destination rows and column starts.
+/// Other layouts in that variant are unsupported and panic instead of falling
+/// back to a more generic kernel.
+///
+/// The target alone does not know the residual row width, replay token
+/// capacity, or fused buffers. Those remaining invariants, including
+/// destination capacity, are asserted when the replay fusion is constructed
+/// or recorded.
 #[derive(Clone, Copy)]
-pub struct DuplicateResidualOutput<'a> {
-    pub buffer: &'a Buffer,
-    pub row_stride: u32,
-    pub column_offset: u32,
+pub struct ResidualCaptureTarget<'a> {
+    buffer: &'a Buffer,
+    row_width: u32,
+    column_start: u32,
+    column_end: u32,
 }
 
-struct DuplicateResidualOwnedOutput {
+struct OwnedResidualCaptureTarget {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     buffer_len_bytes: usize,
-    row_stride: u32,
-    column_offset: u32,
+    row_width: u32,
+    column_start: u32,
+    column_end: u32,
 }
 
 #[derive(Clone)]
@@ -189,6 +211,45 @@ impl Operator for ResidualReplayInvocation {
     }
 }
 
+impl<'a> ResidualCaptureTarget<'a> {
+    /// Selects the destination columns for every complete residual row.
+    ///
+    /// `row_width` and `columns` are tensor coordinates, not byte offsets.
+    /// This constructor verifies that the range is non-empty and contained in
+    /// a destination row. When the range width is a multiple of four, the
+    /// destination row width and column start must also be multiples of four;
+    /// unsupported layouts panic rather than falling back to the scalar
+    /// variant. The range width must equal the fused BF16 RMSNorm hidden
+    /// dimension; replay fusion asserts that delayed invariant together with
+    /// the immediate-fusion, no-alias, and capacity contracts. Replay fusion
+    /// owns the dtype-specific byte and vector-width lowering.
+    pub fn columns(buffer: &'a Buffer, row_width: u32, columns: Range<u32>) -> Self {
+        assert!(row_width > 0, "residual capture row width must be positive");
+        assert!(
+            columns.start < columns.end,
+            "residual capture column range must be non-empty"
+        );
+        assert!(
+            columns.end <= row_width,
+            "residual capture columns must be within the row"
+        );
+        let column_width = columns.end - columns.start;
+        if column_width.is_multiple_of(4) {
+            assert!(
+                row_width.is_multiple_of(4) && columns.start.is_multiple_of(4),
+                "unsupported residual capture layout: a capture width divisible by four requires aligned row width \
+                 and column start"
+            );
+        }
+        Self {
+            buffer,
+            row_width,
+            column_start: columns.start,
+            column_end: columns.end,
+        }
+    }
+}
+
 impl ResidualInvocation<'_> {
     pub fn into_replay_op(self) -> ResidualReplayOp {
         ResidualReplayOp {
@@ -204,14 +265,15 @@ impl ResidualInvocation<'_> {
         }
     }
 
-    pub fn into_duplicate_replay_op(self, duplicate_output: DuplicateResidualOutput<'_>) -> DuplicateResidualReplayOp {
-        DuplicateResidualReplayOp {
+    pub fn into_capture_replay_op(self, capture: ResidualCaptureTarget<'_>) -> ResidualCaptureReplayOp {
+        ResidualCaptureReplayOp {
             residual: self.into_replay_op(),
-            duplicate_output: DuplicateResidualOwnedOutput {
-                buffer: duplicate_output.buffer.as_raw_retained(),
-                buffer_len_bytes: duplicate_output.buffer.len_bytes(),
-                row_stride: duplicate_output.row_stride,
-                column_offset: duplicate_output.column_offset,
+            capture: OwnedResidualCaptureTarget {
+                buffer: capture.buffer.as_raw_retained(),
+                buffer_len_bytes: capture.buffer.len_bytes(),
+                row_width: capture.row_width,
+                column_start: capture.column_start,
+                column_end: capture.column_end,
             },
         }
     }
@@ -282,13 +344,13 @@ impl ResidualReplayOp {
     }
 }
 
-impl DuplicateResidualReplayOp {
-    pub fn fuse_rms_norm(self, rms_norm: RMSNormReplayOp) -> DuplicateResidualRMSNormReplayInvocation {
+impl ResidualCaptureReplayOp {
+    pub fn fuse_rms_norm(self, rms_norm: RMSNormReplayOp) -> ResidualCaptureRMSNormReplayInvocation {
         let rms_shape = rms_norm.shape();
         let residual_values = rms_shape
             .num_total_tokens
             .checked_mul(rms_shape.hidden_dim)
-            .expect("duplicate residual RMSNorm value count must fit u32");
+            .expect("residual capture RMSNorm value count must fit u32");
         assert_eq!(self.residual.shape.num_values, residual_values);
         assert_eq!(self.residual.shape.lhs_dtype, Dtype::Bfloat16);
         assert_eq!(self.residual.shape.rhs_dtype, Dtype::Bfloat16);
@@ -302,17 +364,22 @@ impl DuplicateResidualReplayOp {
             "residual output must be the fused RMSNorm input"
         );
 
-        let duplicate_row_stride = self.duplicate_output.row_stride;
-        let duplicate_column_offset = self.duplicate_output.column_offset;
-        let (buffers, eps, num_active_tokens_key) = rms_norm.into_duplicate_residual_rms_norm_buffers(
+        assert_eq!(
+            self.capture.column_end - self.capture.column_start,
+            rms_shape.hidden_dim,
+            "residual capture column width must match hidden dimension"
+        );
+        let capture_row_width = self.capture.row_width;
+        let capture_column_start = self.capture.column_start;
+        let (buffers, eps, num_active_tokens_key) = rms_norm.into_residual_capture_rms_norm_buffers(
             self.residual.buffers.lhs,
             self.residual.buffers.lhs_len_bytes,
             self.residual.buffers.rhs,
             self.residual.buffers.rhs_len_bytes,
             self.residual.buffers.output,
             self.residual.buffers.output_len_bytes,
-            self.duplicate_output.buffer,
-            self.duplicate_output.buffer_len_bytes,
+            self.capture.buffer,
+            self.capture.buffer_len_bytes,
         );
         let shape = ResidualRMSNormShape {
             num_total_tokens: rms_shape.num_total_tokens,
@@ -321,21 +388,21 @@ impl DuplicateResidualReplayOp {
         };
         match num_active_tokens_key {
             Some(key) => {
-                DuplicateResidualRMSNormReplayInvocation::new_bucketed(
+                ResidualCaptureRMSNormReplayInvocation::new_bucketed(
                     shape,
                     key,
                     buffers,
-                    duplicate_row_stride,
-                    duplicate_column_offset,
+                    capture_row_width,
+                    capture_column_start,
                     eps,
                 )
             },
             None => {
-                DuplicateResidualRMSNormReplayInvocation::new(
+                ResidualCaptureRMSNormReplayInvocation::new(
                     shape,
                     buffers,
-                    duplicate_row_stride,
-                    duplicate_column_offset,
+                    capture_row_width,
+                    capture_column_start,
                     eps,
                 )
             },

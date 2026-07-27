@@ -9,6 +9,7 @@ use std::rc::Rc;
 pub use dense_mlp::Qwen35DenseMLP;
 pub use gdn::Qwen35GDN;
 pub use gqa::Qwen35GQA;
+use inference_backend_metal::components::ResidualCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::backend::recorder::Recorder;
@@ -64,10 +65,11 @@ pub enum Qwen35MLP {
 pub struct Qwen35LayerInput<'a> {
     pub gdn: Option<&'a GDNMetadataBuffers>,
     pub gqa: &'a GQAMetadataBuffers,
-    pub input: &'a Buffer,
-    pub output: &'a Buffer,
     pub num_tokens: u32,
     pub pages: &'a Buffer,
+    pub residual_input: &'a Buffer,
+    pub residual_output: &'a Buffer,
+    pub residual_capture_target: Option<ResidualCaptureTarget<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +126,7 @@ impl Qwen35Layer {
         self.layer_index
     }
 
-    pub fn output(&self) -> &Buffer {
+    pub fn residual_output(&self) -> &Buffer {
         self.scratch.residual_stream(self.layer_index)
     }
 
@@ -141,8 +143,12 @@ impl Qwen35Layer {
     {
         let num_tokens = input.num_tokens;
         let num_values = residual_values(num_tokens, self.scratch.hidden_dim());
-        self.input_norm
-            .record_with_barrier(recorder, num_tokens, input.input, &self.scratch.normalized_hidden);
+        self.input_norm.record_with_barrier(
+            recorder,
+            num_tokens,
+            input.residual_input,
+            &self.scratch.normalized_hidden,
+        );
         self.attention.record(
             recorder,
             &self.scratch.normalized_hidden,
@@ -154,7 +160,7 @@ impl Qwen35Layer {
         self.residual.record(
             recorder,
             num_values,
-            input.input,
+            input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
             None,
@@ -288,9 +294,15 @@ impl ReplayLayer for Qwen35Layer {
         let num_tokens = input.num_tokens;
         let num_values = residual_values(num_tokens, self.scratch.hidden_dim());
         let residual = self.record_body(recorder, input);
-        self.residual
-            .record(recorder, num_values, residual.lhs, residual.rhs, input.output, None);
-        input.output
+        self.residual.record(
+            recorder,
+            num_values,
+            residual.lhs,
+            residual.rhs,
+            input.residual_output,
+            input.residual_capture_target,
+        );
+        input.residual_output
     }
 }
 

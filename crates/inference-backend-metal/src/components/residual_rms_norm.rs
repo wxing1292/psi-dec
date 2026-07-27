@@ -193,12 +193,12 @@ pub struct ResidualRMSNormReplayInvocation {
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub struct DuplicateResidualRMSNormReplayInvocation {
+pub struct ResidualCaptureRMSNormReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     shape: ResidualRMSNormShape,
-    buffers: DuplicateResidualRMSNormOwnedBuffers,
-    duplicate_row_stride: u32,
-    duplicate_column_offset: u32,
+    buffers: ResidualCaptureRMSNormOwnedBuffers,
+    capture_row_width: u32,
+    capture_column_start: u32,
     eps: f32,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
@@ -217,7 +217,7 @@ pub struct ResidualRMSNormOwnedBuffers {
     norm_output_len_bytes: usize,
 }
 
-pub struct DuplicateResidualRMSNormOwnedBuffers {
+pub struct ResidualCaptureRMSNormOwnedBuffers {
     lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
     lhs_len_bytes: usize,
     rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -226,8 +226,8 @@ pub struct DuplicateResidualRMSNormOwnedBuffers {
     weight_len_bytes: usize,
     residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
     residual_output_len_bytes: usize,
-    duplicate_residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
-    duplicate_residual_output_len_bytes: usize,
+    capture_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    capture_output_len_bytes: usize,
     norm_output: Retained<ProtocolObject<dyn MTLBuffer>>,
     norm_output_len_bytes: usize,
 }
@@ -276,7 +276,7 @@ impl ResidualRMSNormOwnedBuffers {
     }
 }
 
-impl DuplicateResidualRMSNormOwnedBuffers {
+impl ResidualCaptureRMSNormOwnedBuffers {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -287,8 +287,8 @@ impl DuplicateResidualRMSNormOwnedBuffers {
         weight_len_bytes: usize,
         residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
         residual_output_len_bytes: usize,
-        duplicate_residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
-        duplicate_residual_output_len_bytes: usize,
+        capture_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+        capture_output_len_bytes: usize,
         norm_output: Retained<ProtocolObject<dyn MTLBuffer>>,
         norm_output_len_bytes: usize,
     ) -> Self {
@@ -301,8 +301,8 @@ impl DuplicateResidualRMSNormOwnedBuffers {
             weight_len_bytes,
             residual_output,
             residual_output_len_bytes,
-            duplicate_residual_output,
-            duplicate_residual_output_len_bytes,
+            capture_output,
+            capture_output_len_bytes,
             norm_output,
             norm_output_len_bytes,
         }
@@ -347,7 +347,7 @@ impl Operator for ResidualRMSNormReplayInvocation {
     }
 }
 
-impl Operator for DuplicateResidualRMSNormReplayInvocation {
+impl Operator for ResidualCaptureRMSNormReplayInvocation {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
         builder.set_retained_pipeline_state(&self.pipeline);
@@ -355,16 +355,16 @@ impl Operator for DuplicateResidualRMSNormReplayInvocation {
         builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
         builder.set_retained_buffer_read(2, &self.buffers.weight, 0);
         builder.set_retained_buffer_write(3, &self.buffers.residual_output, 0);
-        builder.set_retained_buffer_write(4, &self.buffers.duplicate_residual_output, 0);
+        builder.set_retained_buffer_write(4, &self.buffers.capture_output, 0);
         builder.set_retained_buffer_write(5, &self.buffers.norm_output, 0);
         record_num_active_tokens(builder, 6, self.shape.num_total_tokens, self.num_active_tokens_key);
         builder.set_u32(7, self.shape.hidden_dim);
         if self.shape.hidden_dim.is_multiple_of(4) {
-            builder.set_u32(8, self.duplicate_row_stride / 4);
-            builder.set_u32(9, self.duplicate_column_offset / 4);
+            builder.set_u32(8, self.capture_row_width / 4);
+            builder.set_u32(9, self.capture_column_start / 4);
         } else {
-            builder.set_u32(8, self.duplicate_row_stride);
-            builder.set_u32(9, self.duplicate_column_offset);
+            builder.set_u32(8, self.capture_row_width);
+            builder.set_u32(9, self.capture_column_start);
         }
         builder.set_f32(10, self.eps);
         builder.dispatch_1d(
@@ -435,12 +435,12 @@ impl ResidualRMSNormReplayInvocation {
     }
 }
 
-impl DuplicateResidualRMSNormReplayInvocation {
+impl ResidualCaptureRMSNormReplayInvocation {
     pub fn new(
         shape: ResidualRMSNormShape,
-        buffers: DuplicateResidualRMSNormOwnedBuffers,
-        duplicate_row_stride: u32,
-        duplicate_column_offset: u32,
+        buffers: ResidualCaptureRMSNormOwnedBuffers,
+        capture_row_width: u32,
+        capture_column_start: u32,
         eps: f32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
@@ -448,13 +448,13 @@ impl DuplicateResidualRMSNormReplayInvocation {
             pipeline: Kernel::new(
                 &device,
                 RESIDUAL_RMS_NORM_SOURCE,
-                duplicate_residual_rms_norm_function_name(shape),
+                residual_capture_rms_norm_function_name(shape),
             )
             .as_raw_retained(),
             shape,
             buffers,
-            duplicate_row_stride,
-            duplicate_column_offset,
+            capture_row_width,
+            capture_column_start,
             eps,
             num_active_tokens_key: None,
         }
@@ -463,9 +463,9 @@ impl DuplicateResidualRMSNormReplayInvocation {
     pub fn new_bucketed(
         capacity_shape: ResidualRMSNormShape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: DuplicateResidualRMSNormOwnedBuffers,
-        duplicate_row_stride: u32,
-        duplicate_column_offset: u32,
+        buffers: ResidualCaptureRMSNormOwnedBuffers,
+        capture_row_width: u32,
+        capture_column_start: u32,
         eps: f32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
@@ -473,13 +473,13 @@ impl DuplicateResidualRMSNormReplayInvocation {
             pipeline: Kernel::new(
                 &device,
                 RESIDUAL_RMS_NORM_SOURCE,
-                duplicate_residual_rms_norm_function_name(capacity_shape),
+                residual_capture_rms_norm_function_name(capacity_shape),
             )
             .as_raw_retained(),
             shape: capacity_shape,
             buffers,
-            duplicate_row_stride,
-            duplicate_column_offset,
+            capture_row_width,
+            capture_column_start,
             eps,
             num_active_tokens_key: Some(num_active_tokens_key),
         }
@@ -489,11 +489,18 @@ impl DuplicateResidualRMSNormReplayInvocation {
         self.shape.validate();
         assert_eq!(self.shape.dtype, Dtype::Bfloat16);
         assert!(self.eps > 0.0);
-        assert!(self.duplicate_row_stride >= self.shape.hidden_dim);
-        assert!(self.duplicate_column_offset <= self.duplicate_row_stride - self.shape.hidden_dim);
+        assert!(self.capture_row_width >= self.shape.hidden_dim);
+        assert!(self.capture_column_start <= self.capture_row_width - self.shape.hidden_dim);
         if self.shape.hidden_dim.is_multiple_of(4) {
-            assert!(self.duplicate_row_stride.is_multiple_of(4));
-            assert!(self.duplicate_column_offset.is_multiple_of(4));
+            assert!(
+                self.capture_row_width.is_multiple_of(4),
+                "unsupported residual capture layout: vec4 hidden dimension requires a four-element-aligned row width"
+            );
+            assert!(
+                self.capture_column_start.is_multiple_of(4),
+                "unsupported residual capture layout: vec4 hidden dimension requires a four-element-aligned column \
+                 start"
+            );
         }
         assert!(self.buffers.lhs_len_bytes >= self.shape.bytes());
         assert!(self.buffers.rhs_len_bytes >= self.shape.bytes());
@@ -501,16 +508,16 @@ impl DuplicateResidualRMSNormReplayInvocation {
         assert!(self.buffers.residual_output_len_bytes >= self.shape.bytes());
         assert!(self.buffers.norm_output_len_bytes >= self.shape.bytes());
         let last_row_start = (self.shape.num_total_tokens as usize - 1)
-            .checked_mul(self.duplicate_row_stride as usize)
-            .expect("duplicate residual last-row offset must fit usize");
+            .checked_mul(self.capture_row_width as usize)
+            .expect("residual capture last-row offset must fit usize");
         let required_values = last_row_start
-            .checked_add(self.duplicate_column_offset as usize)
+            .checked_add(self.capture_column_start as usize)
             .and_then(|value| value.checked_add(self.shape.hidden_dim as usize))
-            .expect("duplicate residual value count must fit usize");
+            .expect("residual capture value count must fit usize");
         let required_bytes = required_values
             .checked_mul(Dtype::Bfloat16.item_size())
-            .expect("duplicate residual byte count must fit usize");
-        assert!(self.buffers.duplicate_residual_output_len_bytes >= required_bytes);
+            .expect("residual capture byte count must fit usize");
+        assert!(self.buffers.capture_output_len_bytes >= required_bytes);
         for other in [
             &self.buffers.lhs,
             &self.buffers.rhs,
@@ -519,11 +526,8 @@ impl DuplicateResidualRMSNormReplayInvocation {
             &self.buffers.norm_output,
         ] {
             assert!(
-                !std::ptr::eq(
-                    Retained::as_ptr(&self.buffers.duplicate_residual_output),
-                    Retained::as_ptr(other),
-                ),
-                "duplicate residual output must not alias another fused residual/RMSNorm buffer"
+                !std::ptr::eq(Retained::as_ptr(&self.buffers.capture_output), Retained::as_ptr(other),),
+                "residual capture output must not alias another fused residual/RMSNorm buffer"
             );
         }
     }
@@ -550,11 +554,11 @@ fn residual_rms_norm_function_name(shape: ResidualRMSNormShape) -> &'static str 
     }
 }
 
-fn duplicate_residual_rms_norm_function_name(shape: ResidualRMSNormShape) -> &'static str {
+fn residual_capture_rms_norm_function_name(shape: ResidualRMSNormShape) -> &'static str {
     match shape.dtype {
-        Dtype::Bfloat16 if shape.hidden_dim.is_multiple_of(4) => "duplicate_residual_rms_norm_bf16_vec4",
-        Dtype::Bfloat16 => "duplicate_residual_rms_norm_bf16",
-        dtype => panic!("unsupported duplicate residual RMSNorm dtype {dtype:?}"),
+        Dtype::Bfloat16 if shape.hidden_dim.is_multiple_of(4) => "residual_capture_rms_norm_bf16_vec4",
+        Dtype::Bfloat16 => "residual_capture_rms_norm_bf16",
+        dtype => panic!("unsupported residual capture RMSNorm dtype {dtype:?}"),
     }
 }
 

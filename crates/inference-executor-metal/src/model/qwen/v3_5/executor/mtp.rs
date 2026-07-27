@@ -221,7 +221,7 @@ impl Qwen35Executor {
                 "qwen3.5 MTPEmbed replay input must match its key"
             );
             if !mtp_embed_cache_hit {
-                timing.mtp_build_elapsed += mtp_embed_build_start.elapsed();
+                timing.spec_build_elapsed += mtp_embed_build_start.elapsed();
             }
             let mtp_build_start = Instant::now();
             let input = Qwen35MTPArgs {
@@ -239,7 +239,7 @@ impl Qwen35Executor {
                 .record(&runtime, &input);
             assert_eq!(recorded_key, mtp_key, "qwen3.5 MTP replay input must match its key");
             if !mtp_cache_hit {
-                timing.mtp_build_elapsed += mtp_build_start.elapsed();
+                timing.spec_build_elapsed += mtp_build_start.elapsed();
             }
             let mtp_replay_start = Instant::now();
             let empty_arguments = ReplayArguments::new();
@@ -287,8 +287,8 @@ impl Qwen35Executor {
                     ])
                     .wait();
             }
-            timing.mtp_replay_elapsed += mtp_replay_start.elapsed();
-            timing.mtp_modules += 1;
+            timing.spec_replay_elapsed += mtp_replay_start.elapsed();
+            timing.spec_passes += 1;
             if num_target_hidden_states > 0 {
                 let mtp_read_start = Instant::now();
                 let draft_token_ids = self
@@ -299,7 +299,7 @@ impl Qwen35Executor {
                     .sampler_output
                     .token_probs
                     .read_typed::<f32>(0, num_target_hidden_states);
-                timing.mtp_read_elapsed += mtp_read_start.elapsed();
+                timing.spec_read_elapsed += mtp_read_start.elapsed();
                 for (sample_index, &req_index) in decode_req_indices.iter().enumerate() {
                     let request = &mut requests[req_index];
                     let decision_index = request
@@ -338,7 +338,7 @@ impl Qwen35Executor {
         timing
     }
 
-    fn forward_mtp(
+    fn forward_spec(
         &mut self,
         recorder: &mut Qwen35ModelRecorder,
         model_batch_req: &Qwen35ModelBatchRequest,

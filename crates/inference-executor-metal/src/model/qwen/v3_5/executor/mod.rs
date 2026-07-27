@@ -264,14 +264,14 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         Qwen35Executor::rejection_sample(self, recorder, model_batch_req, _model_batch_resp)
     }
 
-    fn forward_mtp(
+    fn forward_spec(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
         model_batch_req: &Self::ModelBatchReq,
         model_batch_hidden: &Self::ModelBatchHidden,
         sampled_output: Self::SampledOutput,
     ) -> Self::SampledOutput {
-        Qwen35Executor::forward_mtp(self, recorder, model_batch_req, model_batch_hidden, sampled_output)
+        Qwen35Executor::forward_spec(self, recorder, model_batch_req, model_batch_hidden, sampled_output)
     }
 
     fn empty_sampled_output(&self) -> Self::SampledOutput {
