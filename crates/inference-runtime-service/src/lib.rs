@@ -6,6 +6,7 @@ pub mod perf_metrics;
 pub mod profiling;
 pub mod runtime;
 pub mod rpc;
+pub mod tool;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

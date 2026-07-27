@@ -5,6 +5,85 @@ workflow. Runtime internals are in [`core.md`](core.md); Qwen executor stages ar
 [`executor_qwen.md`](executor_qwen.md); benchmark methodology is in
 [`executor_benchmarks.md`](executor_benchmarks.md).
 
+## Tool state
+
+`crates/inference-runtime-service/src/tool/` owns this transport- and
+model-neutral domain. It does not own conversation storage, tool handlers,
+execution scheduling, prompt rendering, or model-specific tool syntax.
+
+`ToolState` is the single lifecycle owner for the state derived from one
+conversation's ordered tool events:
+
+```text
+ToolState
+├── tools: currently callable ToolDefinition values
+└── executions: HashMap<ToolCallID, ToolCallRequest>
+```
+
+It does not retain completed calls or registration, unregistration, response,
+or cancellation events; the persistent conversation history owns those.
+`ToolState::fold` reconstructs the two derived collections by applying history
+in order.
+
+`ToolRegistration` and `ToolUnregistration` are non-empty, duplicate-free
+batches. `register_tool` and `unregister_tool` are atomic: an operation either
+updates all definitions or leaves the state unchanged. Definition order
+follows conversation-history order so a later prompt adapter can render tools
+deterministically. Removing a tool prevents new calls and permits a later
+registration of the same `ToolID`.
+
+A `ToolCallRequest` has the following transport-neutral shape:
+
+```text
+ToolCallRequest
+├── tool_id: ToolID
+├── tool_call_id: ToolCallID
+└── arguments: ToolArguments
+```
+
+`ToolState` is a correlation ledger, not a tool executor. `request_execution`
+requires that `tool_id` is currently registered and that `tool_call_id` is not
+already in flight. Multiple requests may remain in flight. `respond_execution`
+and `cancel_execution` address the execution only by `ToolCallID`; neither
+consults the currently callable definitions. Consequently, unregistration does
+not cancel an accepted call, and its response remains valid. Completed and
+cancelled entries leave the in-flight ledger immediately. Execution iteration
+has no ordering contract.
+
+A `ToolCallResponse` carries:
+
+```text
+ToolCallResponse
+├── tool_call_id: ToolCallID
+├── raw_content: Vec<ToolRawContent>
+├── structured_content: Option<ToolStructuredContent>
+└── is_error: bool
+```
+
+`ToolRawContent` is model-facing content and currently supports text.
+`ToolStructuredContent` is an arbitrary JSON value for programmatic consumers;
+both forms may coexist. A tool-level failure sets `is_error` and includes a
+safe, non-empty model-facing error message. Service/protocol failures remain
+ordinary `Err(Error)` values rather than fake tool responses.
+
+The event projection is:
+
+```text
+Registration     tools + definitions    executions unchanged
+Unregistration   tools - definitions    executions unchanged
+CallRequest      require active tool    executions + request
+CallResponse     tools ignored          executions - request
+CallCancellation tools ignored          executions - request
+```
+
+The persistent per-conversation history is the authority and its position is
+the natural version. `ToolState` is only a derived in-memory projection; it is
+not a history store or recoverable cache. Calls emitted in one model response
+are independently in flight and may be executed concurrently. Approval,
+permissions, side-effect serialization, concurrency limits, handler
+cancellation, and argument-schema validation belong to the agent/tool
+environment, not the inference server.
+
 ## Binaries and checkpoints
 
 The implementation module retains Qwen3.5 names while consuming the current Qwen3.6 MLX checkpoint layout.

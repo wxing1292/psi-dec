@@ -36,6 +36,32 @@
 //! records one selected invocation. A later `Message::Tool` returns its result
 //! by referencing `ToolCall.id`.
 //!
+//! Standard OpenAI stateless tool-call lifecycle:
+//!
+//! ```text
+//! ┌──────────┐                                  ┌──────────────────┐
+//! │ Pi agent │                                  │ Inference server │
+//! └────┬─────┘                                  └────────┬─────────┘
+//!      │ 1. Request { messages, tools }                  │
+//!      │────────────────────────────────────────────────►│
+//!      │                                                 │
+//!      │ 2. ResponseChunk { tool_calls }                 │
+//!      │◄────────────────────────────────────────────────│
+//!      │                                                 │
+//!      │ 3. Execute tool                                 │
+//!      │                                                 │
+//!      │ 4. New Request { full history + Message::Tool } │
+//!      │────────────────────────────────────────────────►│
+//!      │                                                 │
+//!      │ 5. ResponseChunk { text / next tool_calls }     │
+//!      │◄────────────────────────────────────────────────│
+//!      │                                                 │
+//! ```
+//!
+//! A future Pi custom provider may instead append typed events to persistent
+//! per-conversation history; that stateful wire contract is separate from this
+//! OpenAI-compatible request schema.
+//!
 //! Streaming response object graph:
 //!
 //! ```text

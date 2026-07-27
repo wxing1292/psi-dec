@@ -16,6 +16,17 @@ findings into the owning component document.
   Evaluate an HF-compatible streaming response parser for the postprocessing
   boundary.
 
+## Tool APIs
+
+- Implement the Pi custom-provider session wire and persistent conversation
+  store. Define the session ID, event envelope, append ordering, concurrent
+  append behavior, and storage owner; map appended events into the existing
+  `ToolEvent`/`ToolState` domain. The provider should register common tools once
+  and later append only additions, removals, calls, responses, and
+  cancellations. Do not retransmit complete tool definitions on every turn,
+  model conversation history as an evictable cache, or add a registry
+  resynchronization protocol.
+
 ## Runtime Lifecycle
 
 - Make trie/request cache-block extent runtime-dynamic before offering arbitrary Qwen cache-block CLI values. It is
