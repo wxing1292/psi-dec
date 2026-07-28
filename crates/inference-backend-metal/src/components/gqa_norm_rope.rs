@@ -83,7 +83,7 @@ impl GQANormRopeConfig {
     pub fn norm_weight_bytes(self) -> usize {
         checked_product(
             "GQA norm/RoPE weight byte length",
-            &[self.head_dim as usize, size_of::<f32>()],
+            &[self.head_dim as usize, Dtype::Bfloat16.item_size()],
         )
     }
 
@@ -120,18 +120,6 @@ impl GQANormRopeShape {
         assert!(self.num_tokens > 0);
         assert_u32_count_domain(config.num_token_heads(self), "GQA norm/RoPE token-head rows");
         assert_u32_index_domain(config.num_slots(self), "GQA norm/RoPE elements");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::GQANormRopeConfig;
-    use super::GQANormRopeShape;
-
-    #[test]
-    #[should_panic(expected = "GQA norm/RoPE elements exceeds the shader u32 element-index domain")]
-    fn test_shape_rejects_shader_index_overflow() {
-        GQANormRopeShape { num_tokens: 1 << 30 }.validate(GQANormRopeConfig::bf16(2, 4, 4, 1e-6, 1_000_000.0, 1.0));
     }
 }
 
@@ -215,5 +203,77 @@ impl GQANormRopeInvocation<'_> {
         builder.set_buffer_write(3, self.buffers.output, 0);
         builder.set_u32(4, shape.num_tokens);
         builder.dispatch_1d(self.config.num_threads(shape), NUM_THREADS_PER_THREADBLOCK as usize);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+
+    use super::GQANormRopeBuffers;
+    use super::GQANormRopeConfig;
+    use super::GQANormRopeKernel;
+    use super::GQANormRopeShape;
+    use crate::metal::Buffer;
+    use crate::metal::Device;
+    use crate::metal::Dtype;
+    use crate::metal::Stream;
+
+    #[test]
+    fn test_norm_weight_uses_bf16_storage() {
+        let config = GQANormRopeConfig::f32(2, 128, 128, 1e-6, 1_000_000.0, 1.0);
+
+        assert_eq!(config.norm_weight_bytes(), 128 * Dtype::Bfloat16.item_size());
+    }
+
+    #[test]
+    fn test_bf16_preserves_norm_rounding_order() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = GQANormRopeConfig::bf16(1, 4, 2, 1e-6, 1_000_000.0, 1.0);
+        let shape = GQANormRopeShape { num_tokens: 1 };
+        let input = [0.73046875, -1.171875, 0.439_453_13, 2.03125].map(|value| bf16::from_f32(value).to_bits());
+        let norm_weight = [1.296875, 0.8984375, 1.1015625, 0.703125].map(|value| bf16::from_f32(value).to_bits());
+        let input_buffer = Buffer::from_slice(&device, &input);
+        let norm_weight_buffer = Buffer::from_slice(&device, &norm_weight);
+        let flat_token_indices = Buffer::from_slice(&device, &[0_u32]);
+        let output = Buffer::new_zeroed_elements(&device, input.len(), Dtype::Bfloat16);
+        let kernel = GQANormRopeKernel::new(&device, config);
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke(
+            shape,
+            GQANormRopeBuffers {
+                input: &input_buffer,
+                norm_weight: &norm_weight_buffer,
+                flat_token_indices: &flat_token_indices,
+                output: &output,
+            },
+        ));
+        stream.submit_replay(&builder.build()).wait();
+
+        let square_sum = input
+            .iter()
+            .map(|bits| {
+                let value = bf16::from_bits(*bits).to_f32();
+                value * value
+            })
+            .sum::<f32>();
+        let inv_rms = (square_sum / input.len() as f32 + 1e-6).sqrt().recip();
+        let expected = input
+            .iter()
+            .zip(norm_weight)
+            .map(|(input_bits, weight_bits)| {
+                let normalized = bf16::from_f32(bf16::from_bits(*input_bits).to_f32() * inv_rms);
+                bf16::from_f32(bf16::from_bits(weight_bits).to_f32() * normalized.to_f32()).to_bits()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(output.read_typed::<u16>(0, input.len()), expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "GQA norm/RoPE elements exceeds the shader u32 element-index domain")]
+    fn test_shape_rejects_shader_index_overflow() {
+        GQANormRopeShape { num_tokens: 1 << 30 }.validate(GQANormRopeConfig::bf16(2, 4, 4, 1e-6, 1_000_000.0, 1.0));
     }
 }

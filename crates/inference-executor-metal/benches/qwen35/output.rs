@@ -315,7 +315,6 @@ impl HeadFixture {
             &mut store,
             &main.final_norm_weight,
             &[layout.hidden_dim as usize],
-            model_config.quantization.is_some(),
         )
         .unwrap_or_else(|err| panic!("unable to load qwen35 final norm: {err}"));
         let unembedder = Unembed::load(&device, &mut store, unembed_config, unembed)

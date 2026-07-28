@@ -71,17 +71,8 @@ impl Qwen3MainLayer {
         } = bindings;
         let hidden_dim = config.text_config.hidden_size;
         let eps = config.text_config.rms_norm_eps;
-        let stores_actual_scale = config.quantization.is_some();
         let (gqa_core, gqa_metal) = qwen3_gqa_core_and_metal(layer_index, config)?;
-        let attention = Qwen3MainGQA::load(
-            device,
-            store,
-            &gqa_core,
-            gqa_metal,
-            stores_actual_scale,
-            attention_bindings,
-            gqa_state,
-        )?;
+        let attention = Qwen3MainGQA::load(device, store, &gqa_core, gqa_metal, attention_bindings, gqa_state)?;
         let (mlp_core, mlp_metal) = qwen3_dense_mlp_core_and_metal(layer_index, config)?;
         let mlp = Qwen3xDenseMLP::load(device, store, &mlp_core, mlp_metal, mlp_bindings, dense_scratch)?;
         Ok(Self {
@@ -90,7 +81,7 @@ impl Qwen3MainLayer {
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim], stores_actual_scale)?,
+                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim])?,
             ),
             attention,
             residual: Residual::new(device),
@@ -98,13 +89,7 @@ impl Qwen3MainLayer {
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(
-                    device,
-                    store,
-                    &post_attention_norm_weight,
-                    &[hidden_dim],
-                    stores_actual_scale,
-                )?,
+                load_qwen3x_norm_weight(device, store, &post_attention_norm_weight, &[hidden_dim])?,
             ),
             mlp,
             scratch,

@@ -511,16 +511,6 @@ fn gqa_tensor_bytes(
     view.data().to_vec()
 }
 
-fn gqa_bf16_tensor_as_f32(tensors: &SafeTensors<'_>, name: &str, model: GQAModelProfile) -> Vec<f32> {
-    let bytes = gqa_tensor_bytes(tensors, name, safetensors::Dtype::BF16, model);
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
-        .collect()
-}
-
 fn validate_gqa_tensor_shape(name: &str, view: &TensorView<'_>, model: GQAModelProfile) {
     let shape = view.shape();
     if name.ends_with("self_attn.q_proj.weight") {
@@ -559,15 +549,6 @@ fn validate_qgkv_sizes(weight: &[u8], scales: &[u8], biases: &[u8], model: GQAMo
 }
 
 fn concat_parts(parts: &[&[u8]]) -> Vec<u8> {
-    let len = parts.iter().map(|part| part.len()).sum();
-    let mut out = Vec::with_capacity(len);
-    for part in parts {
-        out.extend_from_slice(part);
-    }
-    out
-}
-
-fn concat_f32_parts(parts: &[&[f32]]) -> Vec<f32> {
     let len = parts.iter().map(|part| part.len()).sum();
     let mut out = Vec::with_capacity(len);
     for part in parts {

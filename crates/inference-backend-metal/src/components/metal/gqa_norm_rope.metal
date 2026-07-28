@@ -7,7 +7,7 @@ constant int RMS_N_READS = 4;
 template <typename T>
 void gqa_norm_rope_impl(
     device const T* input,
-    device const float* norm_weight,
+    device const bfloat16_t* norm_weight,
     device const uint* flat_token_indices,
     device T* output,
     constant uint& num_tokens,
@@ -85,7 +85,7 @@ void gqa_norm_rope_impl(
 
 kernel void gqa_norm_rope_f32(
     device const float* input [[buffer(0)]],
-    device const float* norm_weight [[buffer(1)]],
+    device const bfloat16_t* norm_weight [[buffer(1)]],
     device const uint* flat_token_indices [[buffer(2)]],
     device float* output [[buffer(3)]],
     constant uint& num_tokens [[buffer(4)]],
@@ -104,7 +104,7 @@ kernel void gqa_norm_rope_f32(
 
 kernel void gqa_norm_rope_bf16(
     device const bfloat16_t* input [[buffer(0)]],
-    device const float* norm_weight [[buffer(1)]],
+    device const bfloat16_t* norm_weight [[buffer(1)]],
     device const uint* flat_token_indices [[buffer(2)]],
     device bfloat16_t* output [[buffer(3)]],
     constant uint& num_tokens [[buffer(4)]],

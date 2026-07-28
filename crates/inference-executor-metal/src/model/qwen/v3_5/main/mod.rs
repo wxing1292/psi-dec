@@ -110,13 +110,8 @@ impl Qwen35Main {
             store.unload_all();
         }
 
-        let final_norm_weight = load_qwen3x_norm_weight(
-            device,
-            store,
-            &final_norm_weight,
-            &[config.text_config.hidden_size],
-            config.quantization.is_some(),
-        )?;
+        let final_norm_weight =
+            load_qwen3x_norm_weight(device, store, &final_norm_weight, &[config.text_config.hidden_size])?;
         Ok(Self {
             layers,
             final_norm: RmsNorm::new(

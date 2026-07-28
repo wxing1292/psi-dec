@@ -136,13 +136,19 @@ remain explicit typed input. An artificial tensor-to-tensor API does not hide th
 Model weights are immutable after initialization.
 
 - Parse model layout and validate shapes while loading.
-- Complete required relayout, slicing, head reordering, fusion, and format normalization during initialization.
+- Complete required relayout, slicing, head reordering, and byte-level fusion during initialization.
 - Materialize backend-owned immutable buffers and views, then release checkpoint mmap and file ownership when possible.
 - Do not rewrite, relayout, or fuse model weights per request or token.
 - Do not silently dequantize a full unsupported quantized weight. Fail explicitly when no runtime kernel supports it.
 
-Dense norms or biases may be materialized as dense buffers. This operation differs from expanding quantized matrix
+Persistent model parameters must preserve the checkpoint storage dtype and quantized representation. Kernels perform
+dequantization, precision promotion, and model-defined numeric transforms during execution.
+
+Runtime numerical state and scratch may use the compute dtype required for stability. These buffers are not model
 weights.
+
+If measured execution requires a precomputed parameter transform, give the derived execution resource an explicit name
+and owner. Do not expose it as the loaded checkpoint weight. Record the supporting performance evidence.
 
 Recommendation: Do not use hot-path `contiguous` calls. If execution requires a layout, prepare it during
 initialization.

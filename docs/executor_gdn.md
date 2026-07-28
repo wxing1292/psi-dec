@@ -87,6 +87,20 @@ pre_output_hidden_states     [T, Hv, Dv]
 next_hidden_state            [T, hidden_dim]
 ```
 
+Persistent checkpoint parameters keep their checkpoint storage dtype:
+
+```text
+qkvabz/output packed weights       packed U32
+qkvabz/output scales and biases    bf16
+conv_weight                        bf16
+norm_weight                        bf16
+a_log                              bf16
+dt_bias                            bf16
+```
+
+Metal kernels promote BF16 parameters to F32 at the operation that consumes them. The loader does not create persistent
+F32 copies or derive `-exp(a_log)`. Convolution and recurrent state remain F32 runtime state.
+
 `projected_qkv` is the projection-split output and short-convolution input. `conv_qkv` is the short-convolution output
 and recurrent-core input.
 
@@ -256,19 +270,22 @@ projection split
 short convolution
   buffers 0..7: conv_qkv, next_conv_state, projected_qkv, conv_state,
                 conv_weight, src_state_slots, dst_state_slots, cu_tokens
+  parameter dtype: conv_weight bf16
   scalars 8..11: num_reqs, num_tokens, conv_state_offset_bytes,
                  next_conv_state_offset_bytes
   dispatch: max(T * Cqkv, R * Cqkv * Ks), 256 threads/threadblock
 
 ragged recurrent
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
-                a_log_decay, dt_bias, src_state_slots, dst_state_slots, cu_tokens
+                a_log, dt_bias, src_state_slots, dst_state_slots, cu_tokens
+  parameter dtype: a_log and dt_bias bf16
   scalars 10..13: q_scale, num_reqs, num_tokens, recurrent_state_offset_bytes
   grid: (Dv / Dv_tile, R * Hv, 1)
   threads: (32, Dv_tile, 1)
 
 output_norm_gate
   buffers 0..3: pre_output_hidden_states, recurrent_output, z, norm_weight
+  parameter dtype: norm_weight bf16
   scalars 4..6: eps, num_reqs, num_tokens
   dispatch: T * Hv * 128, 128 threads/threadblock
 
@@ -414,6 +431,11 @@ f32-per-page counts, recurrent/conv page counts, or a selected layer coordinate.
 Backend code then runs the recurrent state update and output projection. GDN math keeps `projected_qkv`, gates,
 `conv_qkv`, recurrent state, `recurrent_output`, and `pre_output_hidden_states` in f32.
 
+Qwen checkpoint weights and affine parameters remain packed U32 or BF16 in persistent Metal buffers. Quantized matmul
+kernels dequantize packed weights and promote BF16 affine parameters during execution. GDN core kernels promote
+`conv_weight`, `norm_weight`, `a_log`, and `dt_bias` when they read each value. The recurrent kernel computes
+`-exp(a_log)` in F32.
+
 `GDNMetalConfig::boundary_dtype()` returns bf16 at the Qwen3.6 model boundary. GDN state and pre-output math remain f32
 because bf16 can cause downstream NaN/Inf.
 
@@ -488,9 +510,9 @@ The replay order is:
 ```text
 bf16 hidden_state
   -> f32 hidden_state_f32 cast when qkvabz input dtype is f32
-  -> qkvabz quantized projection into f32
+  -> qkvabz packed-weight dequantization and BF16 affine-parameter promotion into f32
   -> qkvabz projection split
-  -> f32 GDN core: short convolution, ragged recurrent, output_norm_gate
+  -> f32 GDN core with BF16 parameter promotion: short convolution, ragged recurrent, output_norm_gate
   -> f32-to-bf16 pre-output cast when the boundary dtype is bf16
   -> output projection
   -> bf16 next_hidden_state
@@ -688,8 +710,9 @@ recurrent_states[layer, slot, v_head, v_dim, qk_dim]
 Short convolution reads the source conv-state slot and `projected_qkv`. It writes `conv_qkv` for every current row. It
 writes the next conv-state into the destination slot.
 
-The recurrent core reads `conv_qkv`, raw `a`/`b`, `a_log_decay`, and `dt_bias`. It derives normalized q/k, beta, decay,
-and output values. It then advances the recurrent state in token order for each request segment.
+The recurrent core reads `conv_qkv`, raw F32 `a`/`b`, and raw BF16 `a_log`/`dt_bias`. It promotes the BF16 parameters
+and derives normalized q/k, beta, decay, and output values in F32. It then advances the recurrent state in token order
+for each request segment.
 
 Each Q/K-dimension lane loads its strided source-state fragment once. It keeps that MSL `thread` fragment local across the
 segment. It writes the final fragment to the destination slot after the last token.
@@ -814,8 +837,9 @@ The current backend records explicit data-dependency barriers. The replay layer 
 declared buffer usage. It does not add a conservative every-command fallback.
 
 This bench loads real Qwen3.6 GDN weights. It adapts separate checkpoint qkv/a/b/z projections into the executor qkvabz
-replay layout. It measures the full replay path: qkvabz projection, projection split, the GDN core, and output projection.
-Do not compare component-only GDN core or candidate state update timings with full-forward numbers.
+replay layout without changing their checkpoint dtype. It measures the full replay path: qkvabz projection, projection
+split, the GDN core, and output projection. Do not compare component-only GDN core or candidate state update timings
+with full-forward numbers.
 
 Recommendation: GDN replay debugging separates transient scratch from persistent state. Layers execute serially.
 Thus, model-level code can reuse projection/core scratch.

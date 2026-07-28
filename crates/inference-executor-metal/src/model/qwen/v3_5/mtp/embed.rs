@@ -69,15 +69,7 @@ impl Qwen35MTPEmbed {
             .quantization
             .as_ref()
             .ok_or_else(|| ModelExecutorError::custom("qwen3.5 MTP requires quantized checkpoint weights"))?;
-        let weights = Qwen35MTPEmbedWeights::load(
-            device,
-            store,
-            &bindings,
-            hidden_dim,
-            quant.group_size,
-            quant.bits,
-            config.quantization.is_some(),
-        )?;
+        let weights = Qwen35MTPEmbedWeights::load(device, store, &bindings, hidden_dim, quant.group_size, quant.bits)?;
         let Qwen35MTPEmbedWeights {
             token_hidden_norm_weight,
             prev_hidden_norm_weight,
@@ -240,7 +232,6 @@ impl Qwen35MTPEmbedWeights {
         hidden_dim: usize,
         group_size: usize,
         bits: usize,
-        norms_store_actual_scale: bool,
     ) -> Result<Self, ModelExecutorError> {
         let fused_hidden_dim = hidden_dim
             .checked_mul(2)
@@ -275,14 +266,12 @@ impl Qwen35MTPEmbedWeights {
                 store,
                 &bindings.token_hidden_norm_weight,
                 &[hidden_dim],
-                norms_store_actual_scale,
             )?,
             prev_hidden_norm_weight: load_qwen3x_norm_weight(
                 device,
                 store,
                 &bindings.prev_hidden_norm_weight,
                 &[hidden_dim],
-                norms_store_actual_scale,
             )?,
             fc_weight: Buffer::from_slice(device, &fc_weight),
             fc_scales: Buffer::from_slice(device, &fc_scales),

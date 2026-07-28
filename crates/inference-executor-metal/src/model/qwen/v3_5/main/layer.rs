@@ -131,14 +131,13 @@ impl Qwen35MainLayer {
         )?;
         let hidden_dim = config.text_config.hidden_size;
         let eps = config.text_config.rms_norm_eps;
-        let stores_actual_scale = config.quantization.is_some();
         Ok(Self {
             layer_index: model_layer_index,
             input_norm: RmsNorm::new(
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim], stores_actual_scale)?,
+                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim])?,
             ),
             attention,
             residual: Residual::new(device),
@@ -146,13 +145,7 @@ impl Qwen35MainLayer {
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(
-                    device,
-                    store,
-                    &post_attention_norm_weight,
-                    &[hidden_dim],
-                    stores_actual_scale,
-                )?,
+                load_qwen3x_norm_weight(device, store, &post_attention_norm_weight, &[hidden_dim])?,
             ),
             mlp,
             scratch,
@@ -252,7 +245,6 @@ impl Qwen35MainAttention {
                     store,
                     &core,
                     metal,
-                    config.quantization.is_some(),
                     compact_gqa_layer_index,
                     bindings,
                     Rc::clone(gqa_state.backend()),

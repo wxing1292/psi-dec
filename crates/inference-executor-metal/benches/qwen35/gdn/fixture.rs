@@ -43,10 +43,7 @@ use crate::GDN_V_HEAD_DIM;
 use crate::GDN_V_HEADS;
 use crate::GROUP_SIZE;
 use crate::HIDDEN_DIM;
-use crate::a_log_decay;
-use crate::bf16_tensor_as_f32;
 use crate::build_single_invocation_replay;
-use crate::concat_f32_parts;
 use crate::concat_parts;
 use crate::cu_tokens;
 use crate::gdn_conv_state_fixture;
@@ -151,7 +148,7 @@ impl<'a> RealGDNFixture<'a> {
             recurrent_v_tile_size: 8,
             norm_eps: GDN_EPS,
             input_dtype: Dtype::Float32,
-            qkvabz_affine_dtype: Dtype::Float32,
+            qkvabz_affine_dtype: Dtype::Bfloat16,
             output_affine_dtype: Dtype::Bfloat16,
         };
         let backend = GDN::new(device, core, config);
@@ -337,7 +334,7 @@ impl<'a> RealGDNFixture<'a> {
                     z: &self.z,
                     conv_weight: &self.weights.conv_weight,
                     norm_weight: &self.weights.norm_weight,
-                    a_log_decay: &self.weights.a_log_decay,
+                    a_log: &self.weights.a_log,
                     dt_bias: &self.weights.dt_bias,
                     cu_tokens: self.batch_metadata.cu_tokens(),
                     src_state_slots: self.batch_metadata.src_state_slots(),
@@ -413,7 +410,7 @@ struct RealGDNWeights {
     qkvabz_biases: Buffer,
     conv_weight: Buffer,
     norm_weight: Buffer,
-    a_log_decay: Buffer,
+    a_log: Buffer,
     dt_bias: Buffer,
     output_weight: Buffer,
     output_scales: Buffer,
@@ -431,26 +428,46 @@ impl RealGDNWeights {
         let a_weight = tensor_bytes(tensors, &format!("{prefix}.in_proj_a.weight"), safetensors::Dtype::U32);
         let b_weight = tensor_bytes(tensors, &format!("{prefix}.in_proj_b.weight"), safetensors::Dtype::U32);
         let z_weight = tensor_bytes(tensors, &format!("{prefix}.in_proj_z.weight"), safetensors::Dtype::U32);
-        let qkv_scales = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_qkv.scales"));
-        let a_scales = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_a.scales"));
-        let b_scales = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_b.scales"));
-        let z_scales = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_z.scales"));
-        let qkv_biases = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_qkv.biases"));
-        let a_biases = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_a.biases"));
-        let b_biases = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_b.biases"));
-        let z_biases = bf16_tensor_as_f32(tensors, &format!("{prefix}.in_proj_z.biases"));
+        let qkv_scales = tensor_bytes(
+            tensors,
+            &format!("{prefix}.in_proj_qkv.scales"),
+            safetensors::Dtype::BF16,
+        );
+        let a_scales = tensor_bytes(tensors, &format!("{prefix}.in_proj_a.scales"), safetensors::Dtype::BF16);
+        let b_scales = tensor_bytes(tensors, &format!("{prefix}.in_proj_b.scales"), safetensors::Dtype::BF16);
+        let z_scales = tensor_bytes(tensors, &format!("{prefix}.in_proj_z.scales"), safetensors::Dtype::BF16);
+        let qkv_biases = tensor_bytes(
+            tensors,
+            &format!("{prefix}.in_proj_qkv.biases"),
+            safetensors::Dtype::BF16,
+        );
+        let a_biases = tensor_bytes(tensors, &format!("{prefix}.in_proj_a.biases"), safetensors::Dtype::BF16);
+        let b_biases = tensor_bytes(tensors, &format!("{prefix}.in_proj_b.biases"), safetensors::Dtype::BF16);
+        let z_biases = tensor_bytes(tensors, &format!("{prefix}.in_proj_z.biases"), safetensors::Dtype::BF16);
         let qkvabz_weight = concat_parts(&[&qkv_weight, &a_weight, &b_weight, &z_weight]);
-        let qkvabz_scales = concat_f32_parts(&[&qkv_scales, &a_scales, &b_scales, &z_scales]);
-        let qkvabz_biases = concat_f32_parts(&[&qkv_biases, &a_biases, &b_biases, &z_biases]);
+        let qkvabz_scales = concat_parts(&[&qkv_scales, &a_scales, &b_scales, &z_scales]);
+        let qkvabz_biases = concat_parts(&[&qkv_biases, &a_biases, &b_biases, &z_biases]);
         validate_qkvabz_sizes(&qkvabz_weight, &qkvabz_scales, &qkvabz_biases);
         Self {
             qkvabz_weight: Buffer::from_slice(device, &qkvabz_weight),
             qkvabz_scales: Buffer::from_slice(device, &qkvabz_scales),
             qkvabz_biases: Buffer::from_slice(device, &qkvabz_biases),
-            conv_weight: Buffer::from_slice(device, &bf16_tensor_as_f32(tensors, &format!("{prefix}.conv1d.weight"))),
-            norm_weight: Buffer::from_slice(device, &bf16_tensor_as_f32(tensors, &format!("{prefix}.norm.weight"))),
-            a_log_decay: Buffer::from_slice(device, &a_log_decay(tensors, &format!("{prefix}.A_log"))),
-            dt_bias: Buffer::from_slice(device, &bf16_tensor_as_f32(tensors, &format!("{prefix}.dt_bias"))),
+            conv_weight: Buffer::from_slice(
+                device,
+                &tensor_bytes(tensors, &format!("{prefix}.conv1d.weight"), safetensors::Dtype::BF16),
+            ),
+            norm_weight: Buffer::from_slice(
+                device,
+                &tensor_bytes(tensors, &format!("{prefix}.norm.weight"), safetensors::Dtype::BF16),
+            ),
+            a_log: Buffer::from_slice(
+                device,
+                &tensor_bytes(tensors, &format!("{prefix}.A_log"), safetensors::Dtype::BF16),
+            ),
+            dt_bias: Buffer::from_slice(
+                device,
+                &tensor_bytes(tensors, &format!("{prefix}.dt_bias"), safetensors::Dtype::BF16),
+            ),
             output_weight: Buffer::from_slice(
                 device,
                 &tensor_bytes(tensors, &format!("{prefix}.out_proj.weight"), safetensors::Dtype::U32),
@@ -473,7 +490,7 @@ impl RealGDNWeights {
             qkvabz_biases: &self.qkvabz_biases,
             conv_weight: &self.conv_weight,
             norm_weight: &self.norm_weight,
-            a_log_decay: &self.a_log_decay,
+            a_log: &self.a_log,
             dt_bias: &self.dt_bias,
             output_weight: &self.output_weight,
             output_scales: &self.output_scales,

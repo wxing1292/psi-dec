@@ -8,7 +8,6 @@ use safetensors::SafeTensors;
 
 use crate::GQAModelProfile;
 use crate::concat_parts;
-use crate::gqa_bf16_tensor_as_f32;
 use crate::gqa_tensor_bytes;
 use crate::validate_qgkv_sizes;
 
@@ -90,11 +89,21 @@ impl RealGQAWeights {
             qgkv_biases: Buffer::from_slice(device, &qgkv_biases),
             q_norm_weight: Buffer::from_slice(
                 device,
-                &gqa_bf16_tensor_as_f32(tensors, &format!("{prefix}.q_norm.weight"), model),
+                &gqa_tensor_bytes(
+                    tensors,
+                    &format!("{prefix}.q_norm.weight"),
+                    safetensors::Dtype::BF16,
+                    model,
+                ),
             ),
             k_norm_weight: Buffer::from_slice(
                 device,
-                &gqa_bf16_tensor_as_f32(tensors, &format!("{prefix}.k_norm.weight"), model),
+                &gqa_tensor_bytes(
+                    tensors,
+                    &format!("{prefix}.k_norm.weight"),
+                    safetensors::Dtype::BF16,
+                    model,
+                ),
             ),
             output_weight: Buffer::from_slice(
                 device,

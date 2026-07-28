@@ -1,4 +1,3 @@
-use half::bf16;
 use inference_backend_metal::components::QuantizedDenseMLPConfig;
 use inference_backend_metal::components::QuantizedDenseMLPShape;
 use inference_backend_metal::components::QuantizedDenseMLPWeights;
@@ -230,8 +229,8 @@ impl Qwen35DSparkAttentionWeights {
             qkv_weight: Buffer::from_slice(device, &qkv_weight),
             qkv_scales: Buffer::from_slice(device, &qkv_scales),
             qkv_biases: Buffer::from_slice(device, &qkv_biases),
-            q_norm_weight: actual_scale_norm_f32(device, store, &bindings.q_norm_weight, core.head_dim)?,
-            k_norm_weight: actual_scale_norm_f32(device, store, &bindings.k_norm_weight, core.head_dim)?,
+            q_norm_weight: actual_scale_norm(device, store, &bindings.q_norm_weight, core.head_dim)?,
+            k_norm_weight: actual_scale_norm(device, store, &bindings.k_norm_weight, core.head_dim)?,
             output_weight: Buffer::from_slice(device, &output.weight),
             output_scales: Buffer::from_slice(device, &output.scales),
             output_biases: Buffer::from_slice(device, &output.biases),
@@ -426,28 +425,6 @@ fn actual_scale_norm(
     Ok(Buffer::from_slice(device, norm.data()))
 }
 
-fn actual_scale_norm_f32(
-    device: &Device,
-    store: &mut SafeTensorStore,
-    name: &str,
-    dimension: usize,
-) -> Result<Buffer, ModelExecutorError> {
-    let norm = tensor(store, name, safetensors::Dtype::BF16, &[dimension])?;
-    let values = actual_scale_bf16_bytes_to_f32(norm.data());
-    assert_eq!(values.len(), dimension, "DSpark norm length must match its dimension");
-    Ok(Buffer::from_slice(device, &values))
-}
-
-fn actual_scale_bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    assert_eq!(bytes.len() % 2, 0, "DSpark BF16 norm bytes must contain full elements");
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|value| bf16::from_bits(u16::from_le_bytes([value[0], value[1]])).to_f32())
-        .collect()
-}
-
 fn concat_bytes(parts: &[&[u8]]) -> Vec<u8> {
     let len = parts.iter().map(|part| part.len()).sum();
     let mut output = Vec::with_capacity(len);
@@ -496,9 +473,6 @@ fn validate_len(name: &str, actual: usize, expected: usize) -> Result<(), ModelE
 
 #[cfg(test)]
 mod tests {
-    use half::bf16;
-
-    use super::actual_scale_bf16_bytes_to_f32;
     use super::concat_bytes;
     use super::quantized_matrix_layout;
 
@@ -524,12 +498,5 @@ mod tests {
     #[test]
     fn qkv_byte_concatenation_preserves_projection_row_order() {
         assert_eq!(concat_bytes(&[&[1, 2], &[3], &[4, 5]]), [1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn qk_norm_weights_expand_from_bf16_to_f32_without_qwen_next_offset() {
-        let values = [bf16::from_f32(0.5).to_bits(), bf16::from_f32(1.25).to_bits()];
-        let bytes = values.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
-        assert_eq!(actual_scale_bf16_bytes_to_f32(&bytes), [0.5, 1.25]);
     }
 }

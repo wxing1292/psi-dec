@@ -20,8 +20,8 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::model::qwen::v3_x::weight::affine_shape;
 use crate::model::qwen::v3_x::weight::concat_bytes;
+use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::quant_weight;
-use crate::model::qwen::v3_x::weight::qwen_next_norm_f32_buffer;
 use crate::model::qwen::v3_x::weight::typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 
@@ -40,7 +40,6 @@ impl Qwen3xGQA {
         store: &mut SafeTensorStore,
         core: &GQACore,
         metal: GQAMetalConfig,
-        norms_store_actual_scale: bool,
         compact_gqa_layer_index: usize,
         bindings: Qwen3xGQAWeightBindings,
         backend: Rc<GQA>,
@@ -49,7 +48,7 @@ impl Qwen3xGQA {
     ) -> Result<Self, ModelExecutorError> {
         Ok(Self {
             compact_gqa_layer_index,
-            weights: Qwen3xGQAWeights::load(device, store, &bindings, core, metal, norms_store_actual_scale)?,
+            weights: Qwen3xGQAWeights::load(device, store, &bindings, core, metal)?,
             backend,
             scratch,
             request_page_table,
@@ -111,7 +110,6 @@ impl Qwen3xGQAWeights {
         bindings: &Qwen3xGQAWeightBindings,
         core: &GQACore,
         metal: GQAMetalConfig,
-        norms_store_actual_scale: bool,
     ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
@@ -168,20 +166,8 @@ impl Qwen3xGQAWeights {
             qgkv_weight: Buffer::from_slice(device, &qgkv_weight),
             qgkv_scales: Buffer::from_slice(device, &qgkv_scales),
             qgkv_biases: Buffer::from_slice(device, &qgkv_biases),
-            q_norm_weight: qwen_next_norm_f32_buffer(
-                device,
-                store,
-                &bindings.q_norm_weight,
-                &[core.head_dim],
-                norms_store_actual_scale,
-            )?,
-            k_norm_weight: qwen_next_norm_f32_buffer(
-                device,
-                store,
-                &bindings.k_norm_weight,
-                &[core.head_dim],
-                norms_store_actual_scale,
-            )?,
+            q_norm_weight: load_qwen3x_norm_weight(device, store, &bindings.q_norm_weight, &[core.head_dim])?,
+            k_norm_weight: load_qwen3x_norm_weight(device, store, &bindings.k_norm_weight, &[core.head_dim])?,
             output_weight: Buffer::from_slice(device, &output_weight),
             output_scales: Buffer::from_slice(device, &output_scales),
             output_biases: Buffer::from_slice(device, &output_biases),

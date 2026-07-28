@@ -112,7 +112,7 @@ pub fn qwen35_gdn_core_and_metal(
         recurrent_v_tile_size: defaults.gdn_recurrent_v_tile_size,
         norm_eps: text.rms_norm_eps,
         input_dtype: Dtype::Float32,
-        qkvabz_affine_dtype: Dtype::Float32,
+        qkvabz_affine_dtype: Dtype::Bfloat16,
         output_affine_dtype: Dtype::Bfloat16,
     };
     metal.validate();

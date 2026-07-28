@@ -576,6 +576,9 @@ scratch                              caller-owned capacity buffers, used only up
 weights                              immutable fused projection, q/k norm, and output projection buffers
 ```
 
+Q and K norm weights keep the checkpoint BF16 storage type. The norm/RoPE kernel reads them directly. It preserves the
+configured activation-type arithmetic and rounding order. RMS reduction and RoPE trigonometry use F32.
+
 The recording marks the KV arena as both a write and read resource. KV update writes the current tokens. Paged SDPA
 reads the request-visible pages.
 

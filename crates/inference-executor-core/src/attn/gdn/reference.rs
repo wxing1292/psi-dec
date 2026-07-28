@@ -84,7 +84,7 @@ pub struct GDNRecurrentReferenceInput<'a> {
     pub conv_qkv: &'a [f32],
     pub a: &'a [f32],
     pub b: &'a [f32],
-    pub a_log_decay: &'a [f32],
+    pub a_log: &'a [f32],
     pub dt_bias: &'a [f32],
 }
 
@@ -98,7 +98,7 @@ pub fn gdn_recurrent_reference(core: &GDNCore, input: GDNRecurrentReferenceInput
     assert_eq!(input.conv_qkv.len(), num_tokens * core.qkv_dim());
     assert_eq!(input.a.len(), num_tokens * core.num_v_heads);
     assert_eq!(input.b.len(), num_tokens * core.num_v_heads);
-    assert_eq!(input.a_log_decay.len(), core.num_v_heads);
+    assert_eq!(input.a_log.len(), core.num_v_heads);
     assert_eq!(input.dt_bias.len(), core.num_v_heads);
 
     let mut recurrent_output = vec![0.0; num_tokens * core.v_dim()];
@@ -130,7 +130,8 @@ pub fn gdn_recurrent_reference(core: &GDNCore, input: GDNRecurrentReferenceInput
                 let gate_offset = flat_token_index * core.num_v_heads + v_head_index;
                 let beta_t = 1.0 / (1.0 + (-input.b[gate_offset]).exp());
                 let dt = input.a[gate_offset] + input.dt_bias[v_head_index];
-                let decay = (input.a_log_decay[v_head_index] * softplus_reference(dt)).exp();
+                let decay_rate = -input.a_log[v_head_index].exp();
+                let decay = (decay_rate * softplus_reference(dt)).exp();
                 for v_dim_index in 0..core.v_head_dim {
                     let v_t = input.conv_qkv
                         [flat_token_index * core.qkv_dim() + v_base + v_head_index * core.v_head_dim + v_dim_index];
@@ -230,7 +231,7 @@ mod tests {
                 conv_qkv: &[0.0, 1.0, 0.0, 1.0, 2.0, -1.0],
                 a: &[0.0],
                 b: &[0.0],
-                a_log_decay: &[0.0],
+                a_log: &[0.0],
                 dt_bias: &[0.0],
             },
         );

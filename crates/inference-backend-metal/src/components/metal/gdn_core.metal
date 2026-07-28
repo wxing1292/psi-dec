@@ -1,6 +1,7 @@
 
 #include <metal_stdlib>
 using namespace metal;
+typedef bfloat bfloat16_t;
 
 constant uint GDN_INVALID_STATE_SLOT_ID = 0xffffffffu;
 
@@ -15,7 +16,7 @@ kernel void gdn_core_short_conv_f32(
     device float* next_conv_state [[buffer(1)]],
     device const float* projected_qkv [[buffer(2)]],
     device const float* conv_state [[buffer(3)]],
-    device const float* conv_weight [[buffer(4)]],
+    device const bfloat16_t* conv_weight [[buffer(4)]],
     device const uint* src_state_slots [[buffer(5)]],
     device const uint* dst_state_slots [[buffer(6)]],
     device const uint* cu_tokens [[buffer(7)]],
@@ -58,7 +59,7 @@ kernel void gdn_core_short_conv_f32(
                 x = projected_qkv[input_offset];
             }
             const uint weight_offset = channel_index * conv_kernel_size + kernel_index;
-            acc += x * conv_weight[weight_offset];
+            acc += x * float(conv_weight[weight_offset]);
         }
         conv_qkv[global_linear_index] = acc / (1.0f + metal::exp(-acc));
     }
@@ -159,8 +160,8 @@ kernel void gdn_core_ragged_recurrent_f32(
     device const float* conv_qkv [[buffer(2)]],
     device const float* a [[buffer(3)]],
     device const float* b [[buffer(4)]],
-    device const float* a_log_decay [[buffer(5)]],
-    device const float* dt_bias [[buffer(6)]],
+    device const bfloat16_t* a_log [[buffer(5)]],
+    device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_state_slots [[buffer(7)]],
     device const uint* dst_state_slots [[buffer(8)]],
     device const uint* cu_tokens [[buffer(9)]],
@@ -233,12 +234,13 @@ kernel void gdn_core_ragged_recurrent_f32(
             if (qk_dim_thread_index == 0) {
                 const uint gate_index = flat_token_index * num_v_heads + v_head_index;
                 const float beta_t = 1.0f / (1.0f + metal::exp(-b[gate_index]));
-                const float dt = a[gate_index] + dt_bias[v_head_index];
+                const float dt = a[gate_index] + float(dt_bias[v_head_index]);
                 const float sp = dt > 20.0f ? dt : metal::log(1.0f + metal::exp(dt));
+                const float decay_rate = -metal::exp(float(a_log[v_head_index]));
                 q_inv_norm_shared = metal::rsqrt(q_square_sum + 1.0e-6f) * q_scale;
                 k_inv_norm_shared = metal::rsqrt(k_square_sum + 1.0e-6f);
                 beta_shared = beta_t;
-                decay_shared = metal::exp(a_log_decay[v_head_index] * sp);
+                decay_shared = metal::exp(decay_rate * sp);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -301,8 +303,8 @@ kernel void gdn_core_ragged_recurrent_forward_candidate_state_f32(
     device const float* conv_qkv [[buffer(2)]],
     device const float* a [[buffer(3)]],
     device const float* b [[buffer(4)]],
-    device const float* a_log_decay [[buffer(5)]],
-    device const float* dt_bias [[buffer(6)]],
+    device const bfloat16_t* a_log [[buffer(5)]],
+    device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_state_slots [[buffer(7)]],
     device const uint* dst_state_slots [[buffer(8)]],
     device const uint* flat_candidate_state_slots [[buffer(9)]],
@@ -376,12 +378,13 @@ kernel void gdn_core_ragged_recurrent_forward_candidate_state_f32(
             if (qk_dim_thread_index == 0) {
                 const uint gate_index = flat_token_index * num_v_heads + v_head_index;
                 const float beta_t = 1.0f / (1.0f + metal::exp(-b[gate_index]));
-                const float dt = a[gate_index] + dt_bias[v_head_index];
+                const float dt = a[gate_index] + float(dt_bias[v_head_index]);
                 const float sp = dt > 20.0f ? dt : metal::log(1.0f + metal::exp(dt));
+                const float decay_rate = -metal::exp(float(a_log[v_head_index]));
                 q_inv_norm_shared = metal::rsqrt(q_square_sum + 1.0e-6f) * q_scale;
                 k_inv_norm_shared = metal::rsqrt(k_square_sum + 1.0e-6f);
                 beta_shared = beta_t;
-                decay_shared = metal::exp(a_log_decay[v_head_index] * sp);
+                decay_shared = metal::exp(decay_rate * sp);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -453,7 +456,7 @@ kernel void gdn_core_output_norm_gate_f32(
     device float* pre_output_hidden_states [[buffer(0)]],
     device const float* recurrent_output [[buffer(1)]],
     device const float* z [[buffer(2)]],
-    device const float* norm_weight [[buffer(3)]],
+    device const bfloat16_t* norm_weight [[buffer(3)]],
     constant float& eps [[buffer(4)]],
     constant uint& num_reqs [[buffer(5)]],
     constant uint& num_tokens [[buffer(6)]],
@@ -490,7 +493,7 @@ kernel void gdn_core_output_norm_gate_f32(
         const uint output_index = token_head_base + v_dim_index;
         const float z_value = z[output_index];
         const float silu_z = z_value / (1.0f + metal::exp(-z_value));
-        const float normalized_value = recurrent_output[output_index] * inv_rms * norm_weight[v_dim_index];
+        const float normalized_value = recurrent_output[output_index] * inv_rms * float(norm_weight[v_dim_index]);
         pre_output_hidden_states[output_index] = normalized_value * silu_z;
     }
 }

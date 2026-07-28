@@ -20,9 +20,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::model::qwen::v3_x::weight::affine_shape;
-use crate::model::qwen::v3_x::weight::bf16_tensor_as_f32;
 use crate::model::qwen::v3_x::weight::concat_bytes;
-use crate::model::qwen::v3_x::weight::concat_f32;
 use crate::model::qwen::v3_x::weight::quant_weight;
 use crate::model::qwen::v3_x::weight::typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
@@ -96,7 +94,7 @@ struct Qwen3xGDNWeights {
     qkvabz_biases: Buffer,
     conv_weight: Buffer,
     norm_weight: Buffer,
-    a_log_decay: Buffer,
+    a_log: Buffer,
     dt_bias: Buffer,
     output_weight: Buffer,
     output_scales: Buffer,
@@ -117,17 +115,17 @@ impl Qwen3xGDNWeights {
         let a_weight = quant_weight(store, &bindings.a.weight)?;
         let b_weight = quant_weight(store, &bindings.b.weight)?;
         let z_weight = quant_weight(store, &bindings.z.weight)?;
-        let qkv_scales = bf16_tensor_as_f32(store, &bindings.qkv.scales)?;
-        let a_scales = bf16_tensor_as_f32(store, &bindings.a.scales)?;
-        let b_scales = bf16_tensor_as_f32(store, &bindings.b.scales)?;
-        let z_scales = bf16_tensor_as_f32(store, &bindings.z.scales)?;
-        let qkv_biases = bf16_tensor_as_f32(store, &bindings.qkv.biases)?;
-        let a_biases = bf16_tensor_as_f32(store, &bindings.a.biases)?;
-        let b_biases = bf16_tensor_as_f32(store, &bindings.b.biases)?;
-        let z_biases = bf16_tensor_as_f32(store, &bindings.z.biases)?;
+        let qkv_scales = typed_tensor(store, &bindings.qkv.scales, safetensors::Dtype::BF16)?.into_data();
+        let a_scales = typed_tensor(store, &bindings.a.scales, safetensors::Dtype::BF16)?.into_data();
+        let b_scales = typed_tensor(store, &bindings.b.scales, safetensors::Dtype::BF16)?.into_data();
+        let z_scales = typed_tensor(store, &bindings.z.scales, safetensors::Dtype::BF16)?.into_data();
+        let qkv_biases = typed_tensor(store, &bindings.qkv.biases, safetensors::Dtype::BF16)?.into_data();
+        let a_biases = typed_tensor(store, &bindings.a.biases, safetensors::Dtype::BF16)?.into_data();
+        let b_biases = typed_tensor(store, &bindings.b.biases, safetensors::Dtype::BF16)?.into_data();
+        let z_biases = typed_tensor(store, &bindings.z.biases, safetensors::Dtype::BF16)?.into_data();
         let qkvabz_weight = concat_bytes(&[&qkv_weight, &a_weight, &b_weight, &z_weight]);
-        let qkvabz_scales = concat_f32(&[&qkv_scales, &a_scales, &b_scales, &z_scales]);
-        let qkvabz_biases = concat_f32(&[&qkv_biases, &a_biases, &b_biases, &z_biases]);
+        let qkvabz_scales = concat_bytes(&[&qkv_scales, &a_scales, &b_scales, &z_scales]);
+        let qkvabz_biases = concat_bytes(&[&qkv_biases, &a_biases, &b_biases, &z_biases]);
 
         let qkvabz_shape = affine_shape(
             core.qkvabz_dim(),
@@ -141,12 +139,12 @@ impl Qwen3xGDNWeights {
         validate_len("GDN qkvabz weight", qkvabz_weight.len(), qkvabz_shape.weight_bytes())?;
         validate_len(
             "GDN qkvabz scales",
-            qkvabz_scales.len() * Dtype::Float32.item_size(),
+            qkvabz_scales.len(),
             qkvabz_shape.affine_param_bytes(),
         )?;
         validate_len(
             "GDN qkvabz biases",
-            qkvabz_biases.len() * Dtype::Float32.item_size(),
+            qkvabz_biases.len(),
             qkvabz_shape.affine_param_bytes(),
         )?;
 
@@ -174,32 +172,25 @@ impl Qwen3xGDNWeights {
             output_shape.affine_param_bytes(),
         )?;
 
-        let conv_weight = bf16_tensor_as_f32(store, &bindings.conv_weight)?;
+        let conv_weight = typed_tensor(store, &bindings.conv_weight, safetensors::Dtype::BF16)?.into_data();
         validate_len(
             "GDN conv weight",
-            conv_weight.len() * Dtype::Float32.item_size(),
-            core.qkv_dim() * core.conv_kernel_size * Dtype::Float32.item_size(),
+            conv_weight.len(),
+            core.qkv_dim() * core.conv_kernel_size * Dtype::Bfloat16.item_size(),
         )?;
-        let norm_weight = bf16_tensor_as_f32(store, &bindings.norm_weight)?;
+        let norm_weight = typed_tensor(store, &bindings.norm_weight, safetensors::Dtype::BF16)?.into_data();
         validate_len(
             "GDN norm weight",
-            norm_weight.len() * Dtype::Float32.item_size(),
-            core.v_head_dim * Dtype::Float32.item_size(),
+            norm_weight.len(),
+            core.v_head_dim * Dtype::Bfloat16.item_size(),
         )?;
-        let a_log_decay = bf16_tensor_as_f32(store, &bindings.a_log)?
-            .into_iter()
-            .map(|value| -value.exp())
-            .collect::<Vec<_>>();
-        let dt_bias = bf16_tensor_as_f32(store, &bindings.dt_bias)?;
-        validate_len(
-            "GDN A_log",
-            a_log_decay.len() * Dtype::Float32.item_size(),
-            core.num_v_heads * Dtype::Float32.item_size(),
-        )?;
+        let a_log = typed_tensor(store, &bindings.a_log, safetensors::Dtype::BF16)?.into_data();
+        let dt_bias = typed_tensor(store, &bindings.dt_bias, safetensors::Dtype::BF16)?.into_data();
+        validate_len("GDN A_log", a_log.len(), core.num_v_heads * Dtype::Bfloat16.item_size())?;
         validate_len(
             "GDN dt_bias",
-            dt_bias.len() * Dtype::Float32.item_size(),
-            core.num_v_heads * Dtype::Float32.item_size(),
+            dt_bias.len(),
+            core.num_v_heads * Dtype::Bfloat16.item_size(),
         )?;
 
         Ok(Self {
@@ -208,7 +199,7 @@ impl Qwen3xGDNWeights {
             qkvabz_biases: Buffer::from_slice(device, &qkvabz_biases),
             conv_weight: Buffer::from_slice(device, &conv_weight),
             norm_weight: Buffer::from_slice(device, &norm_weight),
-            a_log_decay: Buffer::from_slice(device, &a_log_decay),
+            a_log: Buffer::from_slice(device, &a_log),
             dt_bias: Buffer::from_slice(device, &dt_bias),
             output_weight: Buffer::from_slice(device, &output_weight),
             output_scales: Buffer::from_slice(device, &output_scales),
@@ -223,7 +214,7 @@ impl Qwen3xGDNWeights {
             qkvabz_biases: &self.qkvabz_biases,
             conv_weight: &self.conv_weight,
             norm_weight: &self.norm_weight,
-            a_log_decay: &self.a_log_decay,
+            a_log: &self.a_log,
             dt_bias: &self.dt_bias,
             output_weight: &self.output_weight,
             output_scales: &self.output_scales,

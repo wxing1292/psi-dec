@@ -136,8 +136,8 @@ impl Weights {
             qkv_weight: Buffer::from_slice(device, &qkv_weight),
             qkv_scales: Buffer::from_slice(device, &qkv_scales),
             qkv_biases: Buffer::from_slice(device, &qkv_biases),
-            q_norm_weight: Buffer::from_slice(device, &load_norm_f32(store, &bindings.q_norm_weight, head_dim)),
-            k_norm_weight: Buffer::from_slice(device, &load_norm_f32(store, &bindings.k_norm_weight, head_dim)),
+            q_norm_weight: Buffer::from_slice(device, &load_norm_bf16(store, &bindings.q_norm_weight, head_dim)),
+            k_norm_weight: Buffer::from_slice(device, &load_norm_bf16(store, &bindings.k_norm_weight, head_dim)),
             output_weight: Buffer::from_slice(device, &output_weight),
             output_scales: Buffer::from_slice(device, &output_scales),
             output_biases: Buffer::from_slice(device, &output_biases),
@@ -689,18 +689,12 @@ fn load_quantized(store: &mut SafeTensorStore, bindings: &QuantizedTensorBinding
     )
 }
 
-fn load_norm_f32(store: &mut SafeTensorStore, name: &str, head_dim: usize) -> Vec<f32> {
+fn load_norm_bf16(store: &mut SafeTensorStore, name: &str, head_dim: usize) -> Vec<u8> {
     let tensor = store
         .tensor_bytes(name, safetensors::Dtype::BF16)
         .expect("unable to load norm weight");
     assert_eq!(tensor.shape(), &[head_dim]);
-    tensor
-        .data()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|bytes| bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
-        .collect()
+    tensor.into_data()
 }
 
 fn concat(parts: &[&[u8]]) -> Vec<u8> {

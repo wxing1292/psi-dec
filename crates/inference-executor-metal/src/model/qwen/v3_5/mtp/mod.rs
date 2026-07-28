@@ -69,13 +69,7 @@ impl Qwen35MTP {
             dense_scratch,
             moe_scratch,
         )?;
-        let final_norm_weight = load_qwen3x_norm_weight(
-            device,
-            store,
-            &final_norm_weight,
-            &[hidden_dim],
-            config.quantization.is_some(),
-        )?;
+        let final_norm_weight = load_qwen3x_norm_weight(device, store, &final_norm_weight, &[hidden_dim])?;
         Ok(Self {
             layer,
             output_norm: RmsNorm::new(device, hidden_dim, config.text_config.rms_norm_eps, final_norm_weight),

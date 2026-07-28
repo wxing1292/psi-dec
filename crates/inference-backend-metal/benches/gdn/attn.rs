@@ -4,6 +4,7 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
+use half::bf16;
 use inference_backend_metal::components::GDNCoreBuffers;
 use inference_backend_metal::components::GDNCoreConfig;
 use inference_backend_metal::components::GDNCoreForwardCandidateStateUpdateBuffers;
@@ -22,6 +23,9 @@ const GDN_QK_HEAD_DIM: u32 = 128;
 const GDN_QK_HEADS: u32 = 8;
 const GDN_CONV_STATE_LEN: u32 = 3;
 const GDN_CONV_KERNEL_SIZE: u32 = 4;
+// An odd prime period keeps the fixture centered at zero and avoids row-aligned repetition.
+const FIXTURE_PATTERN_PERIOD: usize = 251;
+const FIXTURE_PATTERN_CENTER: f32 = 125.0;
 
 fn bench_gdn_attn(c: &mut Criterion) {
     let device = Device::system_default();
@@ -93,14 +97,14 @@ impl GDNFixture {
         let a = f32_pattern_buffer(device, shape.num_tokens as usize * config.num_v_heads as usize, 0.002);
         let b = f32_pattern_buffer(device, shape.num_tokens as usize * config.num_v_heads as usize, -0.001);
         let z = f32_pattern_buffer(device, config.num_recurrent_output_values(shape), 0.0015);
-        let conv_weight = f32_pattern_buffer(
+        let conv_weight = bf16_pattern_buffer(
             device,
             config.qkv_dim() as usize * config.conv_kernel_size as usize,
             0.0005,
         );
-        let norm_weight = Buffer::from_slice(device, &vec![1.0_f32; config.v_head_dim as usize]);
-        let a_log_decay = Buffer::from_slice(device, &vec![-0.01_f32; config.num_v_heads as usize]);
-        let dt_bias = Buffer::from_slice(device, &vec![0.02_f32; config.num_v_heads as usize]);
+        let norm_weight = bf16_constant_buffer(device, config.v_head_dim as usize, 1.0);
+        let a_log = bf16_constant_buffer(device, config.num_v_heads as usize, -0.01);
+        let dt_bias = bf16_constant_buffer(device, config.num_v_heads as usize, 0.02);
         let cu_tokens = Buffer::from_slice(device, &cu_token_values);
         let src_state_slots = Buffer::from_slice(device, &src_state_slot_values);
         let dst_slot_ids = Buffer::from_slice(device, &dst_slot_id_values);
@@ -126,7 +130,7 @@ impl GDNFixture {
             z: &z,
             conv_weight: &conv_weight,
             norm_weight: &norm_weight,
-            a_log_decay: &a_log_decay,
+            a_log: &a_log,
             dt_bias: &dt_bias,
             cu_tokens: &cu_tokens,
             src_state_slots: &src_state_slots,
@@ -213,11 +217,25 @@ fn build_gdn_forward_candidate_state_update_replay(
 fn f32_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {
     let values = (0..len)
         .map(|index| {
-            let value = (index % 251) as f32 - 125.0;
+            let value = (index % FIXTURE_PATTERN_PERIOD) as f32 - FIXTURE_PATTERN_CENTER;
             value * scale
         })
         .collect::<Vec<_>>();
     Buffer::from_slice(device, &values)
+}
+
+fn bf16_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {
+    let values = (0..len)
+        .map(|index| {
+            let value = (index % FIXTURE_PATTERN_PERIOD) as f32 - FIXTURE_PATTERN_CENTER;
+            bf16::from_f32(value * scale).to_bits()
+        })
+        .collect::<Vec<_>>();
+    Buffer::from_slice(device, &values)
+}
+
+fn bf16_constant_buffer(device: &Device, len: usize, value: f32) -> Buffer {
+    Buffer::from_slice(device, &vec![bf16::from_f32(value).to_bits(); len])
 }
 
 criterion_group!(benches, bench_gdn_attn);

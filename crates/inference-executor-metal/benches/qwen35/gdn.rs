@@ -248,23 +248,6 @@ fn tensor_bytes(tensors: &SafeTensors<'_>, name: &str, dtype: safetensors::Dtype
     view.data().to_vec()
 }
 
-fn bf16_tensor_as_f32(tensors: &SafeTensors<'_>, name: &str) -> Vec<f32> {
-    let bytes = tensor_bytes(tensors, name, safetensors::Dtype::BF16);
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
-        .collect()
-}
-
-fn a_log_decay(tensors: &SafeTensors<'_>, name: &str) -> Vec<f32> {
-    bf16_tensor_as_f32(tensors, name)
-        .into_iter()
-        .map(|value| -value.exp())
-        .collect()
-}
-
 fn validate_tensor_shape(name: &str, view: &TensorView<'_>) {
     let shape = view.shape();
     if name.ends_with("linear_attn.in_proj_qkv.weight") {
@@ -298,25 +281,19 @@ fn validate_tensor_shape(name: &str, view: &TensorView<'_>) {
     }
 }
 
-fn validate_qkvabz_sizes(weight: &[u8], scales: &[f32], biases: &[f32]) {
+fn validate_qkvabz_sizes(weight: &[u8], scales: &[u8], biases: &[u8]) {
     assert_eq!(
         weight.len(),
         GDN_QKVABZ_DIM * packed_k_words(HIDDEN_DIM) * size_of::<u32>()
     );
-    assert_eq!(scales.len(), GDN_QKVABZ_DIM * groups(HIDDEN_DIM));
+    assert_eq!(
+        scales.len(),
+        GDN_QKVABZ_DIM * groups(HIDDEN_DIM) * Dtype::Bfloat16.item_size()
+    );
     assert_eq!(biases.len(), scales.len());
 }
 
 fn concat_parts(parts: &[&[u8]]) -> Vec<u8> {
-    let len = parts.iter().map(|part| part.len()).sum();
-    let mut out = Vec::with_capacity(len);
-    for part in parts {
-        out.extend_from_slice(part);
-    }
-    out
-}
-
-fn concat_f32_parts(parts: &[&[f32]]) -> Vec<f32> {
     let len = parts.iter().map(|part| part.len()).sum();
     let mut out = Vec::with_capacity(len);
     for part in parts {
@@ -425,7 +402,7 @@ fn gdn_qkvabz_affine_shape(num_tokens: u32) -> AffineQuantizedMatmulShape {
         bits: BITS.try_into().expect("GDN bits must fit i32"),
         input_dtype: Dtype::Float32,
         output_dtype: Dtype::Float32,
-        affine_dtype: Dtype::Float32,
+        affine_dtype: Dtype::Bfloat16,
     }
 }
 

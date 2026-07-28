@@ -87,7 +87,6 @@ impl Qwen35MTPLayer {
                     store,
                     &core,
                     metal,
-                    config.quantization.is_some(),
                     0,
                     bindings,
                     Rc::clone(gqa_state.backend()),
@@ -102,13 +101,12 @@ impl Qwen35MTPLayer {
         let mlp = Qwen35MTPMLP::load(device, store, config, defaults, mlp, dense_scratch, moe_scratch)?;
         let hidden_dim = config.text_config.hidden_size;
         let eps = config.text_config.rms_norm_eps;
-        let stores_actual_scale = config.quantization.is_some();
         Ok(Self {
             input_norm: RmsNorm::new(
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim], stores_actual_scale)?,
+                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim])?,
             ),
             attention,
             residual: Residual::new(device),
@@ -116,13 +114,7 @@ impl Qwen35MTPLayer {
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(
-                    device,
-                    store,
-                    &post_attention_norm_weight,
-                    &[hidden_dim],
-                    stores_actual_scale,
-                )?,
+                load_qwen3x_norm_weight(device, store, &post_attention_norm_weight, &[hidden_dim])?,
             ),
             mlp,
             scratch,

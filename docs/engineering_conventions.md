@@ -339,10 +339,7 @@ Delivered history must be self-consistent.
 
 Each Rust test function starts with `test_`. It protects one behavior, correctness, ownership, or lifecycle contract.
 
-Let the module path identify the subject. Inside the module, use the shortest unambiguous case name. Examples include:
-
-- `gqa_attention::tests::test_ragged_random`
-- `stream::tests::test_submission_drop`
+Let the test target and module path identify the subject. Use the shortest unambiguous case name.
 
 Exercise the production owner API and its real contract boundary. A helper-only test does not protect owner wiring for
 setters, recording, or submission.
@@ -359,9 +356,13 @@ List test entries before local helper functions. Keep the helpers at the end of 
 Do not keep constructor-only tests when stronger execution tests cover them. Do not test derived Rust behavior such as
 `PartialEq`.
 
-Keep a small and focused test module inline. Move longer test coverage to a sibling `*_test.rs` file.
+Keep unit tests beside the production logic that they validate. Keep a small and focused test module inline. Put longer
+unit-test coverage in a sibling `*_test.rs` file and declare it under `cfg(test)`.
 
-The production owner declares this file under `cfg(test)`. Do not create a separate file for only a few concise cases.
+Put integration tests in the crate `tests/` directory. Put benchmarks and benchmark-only support in the crate
+`benches/` directory.
+
+Tests and benchmarks exercise production APIs. Do not add test-only or benchmark-only abstractions to production code.
 
 Use `unwrap()` for test setup and coordination failures that are not the tested behavior. Do not use verbose
 `expect(...)` messages for these failures.
