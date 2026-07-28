@@ -72,6 +72,9 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 - `qwen35_executor` measures the public executor contract with fixed `e2e_wo_mtp` and `e2e_w_mtp` cases.
 - The `qwen35_executor` MTP case obtains proposal and draft tokens from production execution. It does not substitute a
   static draft.
+- The `qwen35_executor` fixture obtains Main and MTP page-table widths from the loaded executor.
+- The fixture advances compute sequence, token index, and the next input token after each committed decode batch.
+  It does not reuse `token_index=0` after model state advances.
 
 Representative smoke commands:
 
@@ -101,10 +104,12 @@ comparisons.
 
 `setup_us` includes model loading and fixture construction. `cache_miss_wall_us` is the first complete execution.
 
-`cache_build_estimate_us` is the CPU record and finish estimate after subtracting measured replay waits. Whole-executor
-samples report wall time and main, output, and speculator replay waits.
+`cache_build_estimate_us` is the CPU record and execute-phase estimate after subtracting measured replay waits.
+Whole-executor samples report wall time and Main-only, Main-with-sampling, and speculator replay waits.
 
-Prepare, record and finish, feedback, and commit remain distinct host boundaries.
+Prepare, Main record, execute/read, feedback, and commit remain distinct host boundaries.
+The `finish_*` benchmark fields retain their existing output names.
+They now measure Main submit/read plus optional speculator record/submit/read.
 
 Force-sync and profile-summary measurements are diagnostic metrics. They are not normal wall-clock throughput. Never
 compare the two measurement types as equivalent workloads.

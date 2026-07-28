@@ -159,13 +159,13 @@ impl Qwen35Executor {
         }
     }
 
-    fn forward_mtp_batch(
+    fn record_mtp_embed(
         &mut self,
+        recorder: &mut Qwen35ModelOpsRecorder,
         microbatch: &Qwen35Microbatch,
         main_hidden: Rc<Buffer>,
-        decisions: &mut [Qwen35DecodeDecision],
-    ) -> ModelOutputTiming {
-        let mut timing = ModelOutputTiming::default();
+        decisions: &[Qwen35DecodeDecision],
+    ) -> Rc<Buffer> {
         let decode_req_indices = (0..microbatch.num_reqs())
             .filter(|&req_index| microbatch.is_decode_req(req_index))
             .collect::<Vec<_>>();
@@ -174,169 +174,277 @@ impl Qwen35Executor {
             decode_req_indices.len(),
             "qwen3.5 MTP proposal requires one decision per decode request"
         );
+        assert!(self.mtp.is_some(), "qwen3.5 MTP recording requires the MTP module");
         let mut requests = self.mtp_requests(microbatch, decisions);
-        if self.mtp.is_some() {
-            let module_batch = self.mtp_batch(microbatch, &mut requests);
-            let num_tokens = module_batch.microbatch.total_tokens();
-            let num_target_hidden_states = module_batch.sampler_configs.len();
-            self.write_token_ids(module_batch.microbatch.flat_token_ids());
-            let mtp_gqa_state = self.mtp_gqa_state.as_ref().expect("qwen3.5 MTP requires GQA state");
-            let mtp_gqa_shape = mtp_gqa_state.prepare_metadata(
-                module_batch.microbatch.req_slots(),
-                module_batch.microbatch.token_indices(),
-                module_batch.microbatch.cu_tokens(),
-            );
-            self.mtp_input_gather_flat_indices
-                .write_typed(0, &module_batch.input_gather_flat_indices);
-            if num_target_hidden_states > 0 {
-                self.draft_distribution_indices
-                    .write_typed(0, &module_batch.draft_distribution_indices);
-            }
-            self.mtp
+        let module_batch = self.mtp_batch(microbatch, &mut requests);
+        let num_tokens = module_batch.microbatch.total_tokens();
+        let num_sample_tokens = module_batch.sampler_configs.len();
+        self.write_token_ids(module_batch.microbatch.flat_token_ids());
+        let mtp_gqa_state = self.mtp_gqa_state.as_ref().expect("qwen3.5 MTP requires GQA state");
+        let mtp_gqa_shape = mtp_gqa_state.prepare_metadata(
+            module_batch.microbatch.req_slots(),
+            module_batch.microbatch.token_indices(),
+            module_batch.microbatch.cu_tokens(),
+        );
+        self.mtp_input_gather_flat_indices
+            .write_typed(0, &module_batch.input_gather_flat_indices);
+        if num_sample_tokens > 0 {
+            self.draft_distribution_indices
+                .write_typed(0, &module_batch.draft_distribution_indices);
+        }
+        let mtp_key = Qwen35MTPReplayKey::new(0, num_tokens, mtp_gqa_shape);
+        let mtp_embed_key = Qwen35MTPEmbedReplayKey::new(0, num_tokens);
+        let mtp_hidden_input = Rc::clone(
+            self.mtp_hidden_input
                 .as_ref()
-                .expect("qwen3.5 MTP batch requires the MTP module")
-                .component()
-                .validate_batch(&module_batch.microbatch);
-            let mtp_key = Qwen35MTPReplayKey::new(0, num_tokens, mtp_gqa_shape);
-            let mtp_embed_key = Qwen35MTPEmbedReplayKey::new(0, num_tokens);
-            let mtp_hidden_input = Rc::clone(
+                .expect("qwen3.5 MTP requires its body-input workspace"),
+        );
+        let mtp_embed_build_start = Instant::now();
+        let input = Qwen35MTPEmbedArgs {
+            num_tokens: num_tokens.try_into().expect("qwen3.5 MTP token count must fit u32"),
+            prev_hidden_source: &main_hidden,
+            prev_hidden_indices: &self.mtp_input_gather_flat_indices,
+            prev_hidden_input: &self.mtp_previous_hidden,
+            token_ids: &self.token_ids,
+            token_hidden_input: &self.token_hidden_input,
+            hidden_output: &mtp_hidden_input,
+        };
+        let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        let (recorded_key, mtp_embed_cache_hit) = self
+            .mtp_embed
+            .as_mut()
+            .expect("qwen3.5 MTPEmbed replay build requires the MTP module")
+            .record(&runtime, &input);
+        assert_eq!(
+            recorded_key, mtp_embed_key,
+            "qwen3.5 MTPEmbed replay input must match its key"
+        );
+        if !mtp_embed_cache_hit {
+            recorder.mtp_build_elapsed += mtp_embed_build_start.elapsed();
+        }
+        recorder.mtp_num_sample_tokens = num_sample_tokens;
+        recorder.mtp_draft_req_slots = decode_req_indices
+            .iter()
+            .map(|&req_index| microbatch.req_slots()[req_index])
+            .collect();
+        recorder.mtp_draft_decision_indices = decode_req_indices
+            .iter()
+            .map(|&req_index| {
+                requests[req_index]
+                    .decision_index
+                    .expect("qwen3.5 MTP decode request requires a decision")
+            })
+            .collect();
+        trace::qwen35_state(|| {
+            format!(
+                "event=mtp_embed_record mtp_module_index={} num_tokens={} num_reqs={} \
+                 num_sample_tokens={} cache_hit={} key={:?}",
+                0,
+                num_tokens,
+                requests.len(),
+                num_sample_tokens,
+                mtp_embed_cache_hit,
+                mtp_embed_key,
+            )
+        });
+        recorder.mtp_embed_key = Some(mtp_embed_key);
+        recorder.mtp_key = Some(mtp_key);
+        recorder.mtp_microbatch = Some(module_batch.microbatch);
+        recorder.mtp_sampler_configs = module_batch.sampler_configs;
+        recorder.mtp_sample_positions = module_batch.sample_positions;
+        recorder.mtp_embed_cache_hit = mtp_embed_cache_hit;
+        mtp_hidden_input
+    }
+
+    fn record_mtp(
+        &mut self,
+        recorder: &mut Qwen35ModelOpsRecorder,
+        mtp_hidden_input: Rc<Buffer>,
+    ) -> Rc<Buffer> {
+        assert!(
+            Rc::ptr_eq(
+                &mtp_hidden_input,
                 self.mtp_hidden_input
                     .as_ref()
-                    .expect("qwen3.5 MTP requires its body-input workspace"),
-            );
-            let mtp_embed_build_start = Instant::now();
-            let input = Qwen35MTPEmbedArgs {
-                num_tokens: num_tokens.try_into().expect("qwen3.5 MTP token count must fit u32"),
-                prev_hidden_source: &main_hidden,
-                prev_hidden_indices: &self.mtp_input_gather_flat_indices,
-                prev_hidden_input: &self.mtp_previous_hidden,
-                token_ids: &self.token_ids,
-                token_hidden_input: &self.token_hidden_input,
-                hidden_output: &mtp_hidden_input,
-            };
-            let runtime = MetalReplayRuntime::new(self.runtime.stream());
-            let (recorded_key, mtp_embed_cache_hit) = self
-                .mtp_embed
-                .as_mut()
-                .expect("qwen3.5 MTPEmbed replay build requires the MTP module")
-                .record(&runtime, &input);
+                    .expect("qwen3.5 MTP requires its body-input workspace")
+            ),
+            "qwen3.5 MTP must consume the MTPEmbed hidden workspace"
+        );
+        let microbatch = recorder
+            .mtp_microbatch
+            .as_ref()
+            .expect("qwen3.5 MTP recording requires the MTP microbatch");
+        self.mtp
+            .as_ref()
+            .expect("qwen3.5 MTP batch requires the MTP module")
+            .component()
+            .validate_batch(microbatch);
+        let mtp_key = recorder
+            .mtp_key
+            .as_ref()
+            .expect("qwen3.5 MTP recording requires its replay key");
+        let num_tokens = microbatch.total_tokens();
+        let mtp_gqa_state = self.mtp_gqa_state.as_ref().expect("qwen3.5 MTP requires GQA state");
+        let mtp_build_start = Instant::now();
+        let input = Qwen35MTPArgs {
+            num_tokens: num_tokens.try_into().expect("qwen3.5 MTP token count must fit u32"),
+            hidden_input: &mtp_hidden_input,
+            hidden_output: &self.hidden_output,
+            gqa: mtp_gqa_state.metadata(),
+            pages: self.pages.buffer(),
+        };
+        let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        let (recorded_key, mtp_cache_hit) = self
+            .mtp
+            .as_mut()
+            .expect("qwen3.5 MTP replay build requires the MTP module")
+            .record(&runtime, &input);
+        assert_eq!(
+            &recorded_key, mtp_key,
+            "qwen3.5 MTP replay input must match its key"
+        );
+        if !mtp_cache_hit {
+            recorder.mtp_build_elapsed += mtp_build_start.elapsed();
+        }
+        trace::qwen35_state(|| {
+            format!(
+                "event=mtp_record mtp_module_index={} num_tokens={} num_reqs={} \
+                 num_sample_tokens={} mtp_embed_cache_hit={} cache_hit={} key={:?}",
+                0,
+                num_tokens,
+                microbatch.num_reqs(),
+                recorder.mtp_num_sample_tokens,
+                recorder.mtp_embed_cache_hit,
+                mtp_cache_hit,
+                mtp_key,
+            )
+        });
+        Rc::clone(&self.hidden_output)
+    }
+
+    fn record_mtp_unembed(
+        &mut self,
+        recorder: &mut Qwen35ModelOpsRecorder,
+        mtp_hidden_output: &Rc<Buffer>,
+    ) {
+        assert!(
+            Rc::ptr_eq(mtp_hidden_output, &self.hidden_output),
+            "qwen3.5 MTP GatherUnembed must consume the MTP hidden workspace"
+        );
+        if recorder.mtp_num_sample_tokens == 0 {
+            return;
+        }
+        let gather_unembed_key = self.prepare_gather_unembed_replay(
+            recorder
+                .mtp_microbatch
+                .as_ref()
+                .expect("qwen3.5 MTP GatherUnembed requires the MTP microbatch"),
+            mtp_hidden_output,
+        );
+        recorder.mtp_gather_unembed_key = Some(gather_unembed_key);
+    }
+
+    fn record_mtp_sampling(&mut self, recorder: &mut Qwen35ModelOpsRecorder) {
+        if recorder.mtp_num_sample_tokens == 0 {
+            return;
+        }
+        let (draft_sampling_key, draft_sampling_arguments) =
+            self.prepare_draft_sample_replay(&recorder.mtp_sampler_configs, &recorder.mtp_sample_positions);
+        recorder.mtp_draft_sampling_key = Some(draft_sampling_key);
+        recorder.mtp_draft_sampling_arguments = draft_sampling_arguments;
+    }
+
+    fn submit_mtp_recording(&self, recorder: &Qwen35ModelOpsRecorder) -> MetalReplaySubmission {
+        let mtp_embed_key = recorder
+            .mtp_embed_key
+            .as_ref()
+            .expect("qwen3.5 MTP submission requires MTPEmbed replay");
+        let mtp_key = recorder
+            .mtp_key
+            .as_ref()
+            .expect("qwen3.5 MTP submission requires MTP replay");
+        let mtp_embed_replay = self
+            .mtp_embed
+            .as_ref()
+            .expect("qwen3.5 MTPEmbed replay requires the MTP module")
+            .replay(mtp_embed_key);
+        let mtp_replay = self
+            .mtp
+            .as_ref()
+            .expect("qwen3.5 MTP replay requires the MTP module")
+            .replay(mtp_key);
+        let empty_arguments = ReplayArguments::new();
+        if recorder.mtp_num_sample_tokens == 0 {
+            return self.replay_runtime().submit_replay_sequence(&[
+                ReplayExecution::new(mtp_embed_replay, &empty_arguments),
+                ReplayExecution::new(mtp_replay, &empty_arguments),
+            ]);
+        }
+        let gather_unembed_key = recorder
+            .mtp_gather_unembed_key
+            .as_ref()
+            .expect("qwen3.5 MTP sampled output requires GatherUnembed replay");
+        let draft_sampling_key = recorder
+            .mtp_draft_sampling_key
+            .as_ref()
+            .expect("qwen3.5 MTP sampled output requires DraftSampling replay");
+        self.replay_runtime().submit_replay_sequence(&[
+            ReplayExecution::new(mtp_embed_replay, &empty_arguments),
+            ReplayExecution::new(mtp_replay, &empty_arguments),
+            ReplayExecution::new(self.gather_unembed.replay(gather_unembed_key), &empty_arguments),
+            ReplayExecution::new(
+                self.draft_sampling.replay(draft_sampling_key),
+                &recorder.mtp_draft_sampling_arguments,
+            ),
+        ])
+    }
+
+    fn read_mtp_batch(
+        &mut self,
+        recorder: &Qwen35ModelOpsRecorder,
+        decisions: &mut [Qwen35DecodeDecision],
+        replay_elapsed: Duration,
+    ) -> ModelOutputTiming {
+        let mut timing = ModelOutputTiming {
+            spec_build_elapsed: recorder.mtp_build_elapsed,
+            spec_replay_elapsed: replay_elapsed,
+            spec_passes: 1,
+            ..ModelOutputTiming::default()
+        };
+        if recorder.mtp_num_sample_tokens > 0 {
             assert_eq!(
-                recorded_key, mtp_embed_key,
-                "qwen3.5 MTPEmbed replay input must match its key"
+                recorder.mtp_draft_req_slots.len(),
+                recorder.mtp_num_sample_tokens,
+                "qwen3.5 MTP request slots must match draft sampling rows"
             );
-            if !mtp_embed_cache_hit {
-                timing.spec_build_elapsed += mtp_embed_build_start.elapsed();
-            }
-            let mtp_build_start = Instant::now();
-            let input = Qwen35MTPArgs {
-                num_tokens: num_tokens.try_into().expect("qwen3.5 MTP token count must fit u32"),
-                hidden_input: &mtp_hidden_input,
-                hidden_output: &self.hidden_output,
-                gqa: mtp_gqa_state.metadata(),
-                pages: self.pages.buffer(),
-            };
-            let runtime = MetalReplayRuntime::new(self.runtime.stream());
-            let (recorded_key, mtp_cache_hit) = self
-                .mtp
-                .as_mut()
-                .expect("qwen3.5 MTP replay build requires the MTP module")
-                .record(&runtime, &input);
-            assert_eq!(recorded_key, mtp_key, "qwen3.5 MTP replay input must match its key");
-            if !mtp_cache_hit {
-                timing.spec_build_elapsed += mtp_build_start.elapsed();
-            }
-            let mtp_replay_start = Instant::now();
-            let empty_arguments = ReplayArguments::new();
-            if num_target_hidden_states > 0 {
-                let hidden_output = Rc::clone(&self.hidden_output);
-                let gather_unembed_key =
-                    self.prepare_gather_unembed_replay(&module_batch.microbatch, &hidden_output);
-                let (draft_sample_key, draft_sample_arguments) =
-                    self.prepare_draft_sample_replay(&module_batch.sampler_configs, &module_batch.sample_positions);
-                let mtp_embed_replay = self
-                    .mtp_embed
-                    .as_ref()
-                    .expect("qwen3.5 MTPEmbed replay requires the MTP module")
-                    .replay(&mtp_embed_key);
-                let mtp_replay = self
-                    .mtp
-                    .as_ref()
-                    .expect("qwen3.5 MTP replay requires the MTP module")
-                    .replay(&mtp_key);
-                let gather_unembed_replay = self.gather_unembed.replay(&gather_unembed_key);
-                let draft_sample_replay = self.draft_sampling.replay(&draft_sample_key);
-                self.replay_runtime()
-                    .submit_replay_sequence(&[
-                        ReplayExecution::new(mtp_embed_replay, &empty_arguments),
-                        ReplayExecution::new(mtp_replay, &empty_arguments),
-                        ReplayExecution::new(gather_unembed_replay, &empty_arguments),
-                        ReplayExecution::new(draft_sample_replay, &draft_sample_arguments),
-                    ])
-                    .wait();
-            } else {
-                let mtp_embed_replay = self
-                    .mtp_embed
-                    .as_ref()
-                    .expect("qwen3.5 MTPEmbed replay requires the MTP module")
-                    .replay(&mtp_embed_key);
-                let mtp_replay = self
-                    .mtp
-                    .as_ref()
-                    .expect("qwen3.5 MTP replay requires the MTP module")
-                    .replay(&mtp_key);
-                self.replay_runtime()
-                    .submit_replay_sequence(&[
-                        ReplayExecution::new(mtp_embed_replay, &empty_arguments),
-                        ReplayExecution::new(mtp_replay, &empty_arguments),
-                    ])
-                    .wait();
-            }
-            timing.spec_replay_elapsed += mtp_replay_start.elapsed();
-            timing.spec_passes += 1;
-            if num_target_hidden_states > 0 {
-                let mtp_read_start = Instant::now();
-                let draft_token_ids = self
-                    .sampler_output
-                    .token_ids
-                    .read_typed::<i32>(0, num_target_hidden_states);
-                let draft_probs = self
-                    .sampler_output
-                    .token_probs
-                    .read_typed::<f32>(0, num_target_hidden_states);
-                timing.spec_read_elapsed += mtp_read_start.elapsed();
-                for (sample_index, &req_index) in decode_req_indices.iter().enumerate() {
-                    let request = &mut requests[req_index];
-                    let decision_index = request
-                        .decision_index
-                        .expect("qwen3.5 MTP decode request requires a decision");
-                    let draft_token = draft_token_ids[sample_index]
-                        .try_into()
-                        .expect("qwen3.5 sampler returned a negative draft token ID");
-                    self.spec_probs
-                        .set_expected_draft_token(microbatch.req_slots()[req_index], 0, draft_token);
-                    decisions[decision_index].spec_tokens.push(draft_token);
-                    decisions[decision_index].spec_probs.push(draft_probs[sample_index]);
-                    request.next_token_id = Some(
-                        draft_token
-                            .try_into()
-                            .expect("qwen3.5 draft token ID must fit the model i32 token domain"),
-                    );
-                }
-            }
-            trace::qwen35_state(|| {
-                format!(
-                    "event=mtp_forward_module mtp_module_index={} num_tokens={} num_reqs={} \
-                     num_target_hidden_states={} mtp_embed_cache_hit={} cache_hit={} mtp_embed_key={:?} mtp_key={:?}",
+            assert_eq!(
+                recorder.mtp_draft_decision_indices.len(),
+                recorder.mtp_num_sample_tokens,
+                "qwen3.5 MTP decisions must match draft sampling rows"
+            );
+            let mtp_read_start = Instant::now();
+            let draft_token_ids = self
+                .sampler_output
+                .token_ids
+                .read_typed::<i32>(0, recorder.mtp_num_sample_tokens);
+            let draft_probs = self
+                .sampler_output
+                .token_probs
+                .read_typed::<f32>(0, recorder.mtp_num_sample_tokens);
+            timing.spec_read_elapsed += mtp_read_start.elapsed();
+            for sample_index in 0..recorder.mtp_num_sample_tokens {
+                let draft_token = draft_token_ids[sample_index]
+                    .try_into()
+                    .expect("qwen3.5 sampler returned a negative draft token ID");
+                self.spec_probs.set_expected_draft_token(
+                    recorder.mtp_draft_req_slots[sample_index],
                     0,
-                    num_tokens,
-                    requests.len(),
-                    num_target_hidden_states,
-                    mtp_embed_cache_hit,
-                    mtp_cache_hit,
-                    mtp_embed_key,
-                    mtp_key,
-                )
-            });
+                    draft_token,
+                );
+                let decision = &mut decisions[recorder.mtp_draft_decision_indices[sample_index]];
+                decision.spec_tokens.push(draft_token);
+                decision.spec_probs.push(draft_probs[sample_index]);
+            }
         }
         trace_decisions("mtp_propose_done", decisions);
         timing

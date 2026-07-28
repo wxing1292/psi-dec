@@ -10,7 +10,6 @@ use serde_json::json;
 #[derive(Clone, Debug)]
 pub struct ExecutorBatchPerfMetrics {
     pub sampled_rows: usize,
-    pub do_sample: bool,
     pub model_output_timing: Option<ModelOutputTiming>,
     pub total_elapsed: Duration,
     pub prepare_batch_elapsed: Duration,
@@ -163,10 +162,9 @@ fn emit_executor_batch_perf_debug(
         num_output_spec_tokens = response_summary.output_spec_tokens,
         rejection_rate,
         sampled_rows = metrics.sampled_rows,
-        do_sample = metrics.do_sample,
         model_output_main_replay_ms = metrics.model_output_timing.map(|timing| ms(timing.main_replay_elapsed)),
-        model_output_main_output_replay_ms =
-            metrics.model_output_timing.map(|timing| ms(timing.main_output_replay_elapsed)),
+        model_output_main_sample_replay_ms =
+            metrics.model_output_timing.map(|timing| ms(timing.main_sample_replay_elapsed)),
         model_output_sample_read_ms = metrics.model_output_timing.map(|timing| ms(timing.sample_read_elapsed)),
         model_output_rejection_build_ms =
             metrics.model_output_timing.map(|timing| ms(timing.rejection_build_elapsed)),

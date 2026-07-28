@@ -259,6 +259,20 @@ MTP proposal and target rejection remain separate where the accepted-token decis
 candidate preparation and cache-boundary publication retain their transaction lifecycle when their GPU work is
 replayed.
 
+The generic executor lifecycle uses role-qualified Main and Spec hooks:
+
+```text
+embed_main -> forward_main -> unembed_main -> sample_main
+submit_main -> wait -> read_main
+
+embed_spec -> forward_spec -> unembed_spec -> sample_spec
+submit_spec -> wait -> read_spec
+```
+
+Each record hook owns one semantic stage.
+`forward_spec` must not also record Spec embedding, unembedding, or sampling.
+Main and Spec may have different data contracts, but they must preserve this lifecycle shape.
+
 Detailed keys, stage order, and request lifecycle are in [`executor_qwen.md`](executor_qwen.md). Sampling and rejection RNG
 and sparse-distribution contracts are in [`executor_sampling.md`](executor_sampling.md).
 

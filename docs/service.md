@@ -499,6 +499,20 @@ cross the CPU boundary before the next proposal input.
 
 It does not duplicate an INFO event.
 
+The Main timing fields are:
+
+- `model_output_main_replay_ms`: `MainEmbed -> Main` when the batch has no sampling rows
+- `model_output_main_sample_replay_ms`: `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling`
+
+Executor profiling spans use the lifecycle hook names:
+
+```text
+embed_main -> forward_main -> unembed_main -> sample_main
+submit_main -> read_main
+embed_spec -> forward_spec -> unembed_spec -> sample_spec
+submit_spec -> read_spec
+```
+
 The model-neutral speculator timing fields are:
 
 - `model_output_spec_build_ms`

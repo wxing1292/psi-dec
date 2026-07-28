@@ -321,6 +321,87 @@ Ordinary output buffers and recorded operator sequences remain unchanged.
 It binds the final-normalized hidden source, row indices, gather destination, and logits destination.
 Gathered hidden and logits remain executor workspaces.
 
+## Batch execution lifecycle
+
+The service calls the model hooks in a fixed order.
+The service records the Main components first.
+The service then owns the Main `submit`, `wait`, and CPU read boundaries.
+When the executor has MTP, the service records the MTP components after the Main CPU read.
+The service then owns the MTP `submit`, `wait`, and CPU read boundaries.
+An empty component input omits that component from its model sequence.
+The executor does not store a separate submitted-state flag.
+
+`embed_main` materializes MainEmbed.
+`forward_main` materializes Main.
+It registers the pending model transaction.
+It does not submit backend work.
+
+`unembed_main` materializes GatherUnembed when the batch has sampled rows.
+It returns immediately when the batch has no sampled rows.
+
+`sample_main` materializes Sampling or RejectionSampling when the batch has sampled rows.
+It returns immediately when the batch has no sampled rows.
+It does not submit backend work or read backend output.
+
+`submit_main` submits one Main sequence.
+For a batch with no sampled rows, the sequence is:
+
+```text
+MainEmbed -> Main
+```
+
+For ordinary sampling, the sequence is:
+
+```text
+MainEmbed -> Main -> GatherUnembed -> Sampling
+```
+
+When Qwen3.5 MTP is enabled, `sample_main` materializes RejectionSampling for both initial and speculative input.
+RejectionSampling supports a ragged `0..N` speculative-token count per request.
+`submit_main` submits this sequence:
+
+```text
+MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+```
+
+The service waits for the Main submission.
+It then calls `read_main`.
+`read_main` reads the sampled or rejection results on the CPU.
+
+The service checks the static `has_speculator` capability.
+It does not use a per-batch submitted-state flag.
+When the executor has MTP, the service calls `embed_spec` after `read_main`.
+`embed_spec` consumes the completed Main output and sampled results.
+MTP decode consumes one sampled result per decode request.
+
+`embed_spec` materializes MTPEmbed.
+`forward_spec` materializes MTP.
+`unembed_spec` materializes GatherUnembed when sampled rows exist.
+`sample_spec` materializes DraftSampling when sampled rows exist.
+These hooks do not submit backend work or read backend output.
+
+`submit_spec` submits one MTP sequence:
+
+```text
+MTPEmbed -> MTP
+[-> GatherUnembed -> DraftSampling]
+```
+
+The service waits for the MTP submission.
+It then calls `read_spec`.
+`read_spec` reads draft tokens and probabilities on the CPU.
+
+The complete service order is:
+
+```text
+embed_main -> forward_main -> unembed_main -> sample_main
+submit_main -> wait -> read_main
+if has_speculator:
+    embed_spec -> forward_spec -> unembed_spec -> sample_spec
+    submit_spec -> wait -> read_spec
+commit
+```
+
 ## GQA/GDN lifecycle
 
 `Qwen3MainGQAState` groups the Qwen3 ungated backend, scratch, request page table, metadata buffers, and cache-lane
@@ -384,15 +465,18 @@ There is no separate input-projector type or module loop.
 The composed proposal sequence remains:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> RejectionSampling
-CPU target feedback
-MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
+Main batch submission:
+    MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+CPU sampling feedback
+MTP batch submission:
+    MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
 ```
 
 Normal non-MTP sampling remains:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> Sampling
+Main batch submission:
+    MainEmbed -> Main -> GatherUnembed -> Sampling
 ```
 
 ## DSpark scope

@@ -10,6 +10,7 @@ use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::DeviceResponse;
+use inference_runtime_core::compute::ExecutionSubmission;
 use inference_runtime_core::compute::QueryTokens;
 use inference_runtime_core::compute::ReplayableModelBatchExecutor;
 use inference_runtime_core::compute::SampledTokens;
@@ -158,9 +159,9 @@ where
 
         let input_start = Instant::now();
         let model_batch_hidden_req = {
-            let _span = profiling::span("model.input");
+            let _span = profiling::span("model.embed_main.record");
             if self.model.first_pp_stage(&model_batch_req) {
-                self.model.embed(&mut recorder, &model_batch_req)
+                self.model.embed_main(&mut recorder, &model_batch_req)
             } else {
                 todo!("pipeline stages after the first must read hidden states from the batch request")
             }
@@ -169,53 +170,81 @@ where
 
         let model_start = Instant::now();
         let model_batch_hidden_resp = {
-            let _span = profiling::span("model.forward");
+            let _span = profiling::span("model.forward_main.record");
             self.model
                 .forward_main(&mut recorder, &model_batch_req, model_batch_hidden_req)
         };
         let model_elapsed = model_start.elapsed();
 
         let last_pp_stage = self.model.last_pp_stage(&model_batch_req);
-        let do_sample = last_pp_stage
-            && batch_req
-                .dev_reqs
-                .iter()
-                .any(|dev_req| matches!(dev_req.decoder_query_tokens, QueryTokens::Decode { .. }));
-        let do_rejection_sample = batch_req.dev_reqs.iter().any(|dev_req| {
-            matches!(
-                &dev_req.decoder_query_tokens,
-                QueryTokens::Decode { spec_tokens, .. } if !spec_tokens.is_empty()
-            )
-        });
 
         let output_start = Instant::now();
-        let sampled_output = {
-            let _span = profiling::span("model.output");
-            let sampled_output = if do_sample {
-                let model_batch_resp = self
-                    .model
-                    .unembed(&mut recorder, &model_batch_req, &model_batch_hidden_resp);
-                if do_rejection_sample {
-                    self.model
-                        .rejection_sample(&mut recorder, &model_batch_req, &model_batch_resp)
-                } else {
-                    self.model.sample(&mut recorder, &model_batch_req, &model_batch_resp)
-                }
-            } else {
-                self.model.empty_sampled_output()
+        if last_pp_stage {
+            let model_batch_resp = {
+                let _span = profiling::span("model.unembed_main.record");
+                self.model
+                    .unembed_main(&mut recorder, &model_batch_req, &model_batch_hidden_resp)
             };
-            if last_pp_stage {
-                self.model.forward_spec(
+            {
+                let _span = profiling::span("model.sample_main.record");
+                self.model
+                    .sample_main(&mut recorder, &model_batch_req, &model_batch_resp);
+            }
+        }
+
+        let main_replay_start = Instant::now();
+        {
+            let _span = profiling::span("model.submit_main.wait");
+            let submission = self.model.submit_main(&recorder);
+            submission.wait();
+        }
+        let main_replay_elapsed = main_replay_start.elapsed();
+        let mut sampled_output = if last_pp_stage {
+            let _span = profiling::span("model.read_main");
+            self.model.read_main(&recorder, &model_batch_req, main_replay_elapsed)
+        } else {
+            self.model.empty_sampled_output()
+        };
+
+        if last_pp_stage && self.model.has_speculator() {
+            let spec_batch_hidden_req = {
+                let _span = profiling::span("model.embed_spec.record");
+                self.model.embed_spec(
                     &mut recorder,
                     &model_batch_req,
                     &model_batch_hidden_resp,
-                    sampled_output,
+                    &sampled_output,
                 )
-            } else {
-                sampled_output
+            };
+            let spec_batch_hidden_resp = {
+                let _span = profiling::span("model.forward_spec.record");
+                self.model
+                    .forward_spec(&mut recorder, &model_batch_req, spec_batch_hidden_req)
+            };
+            let spec_batch_resp = {
+                let _span = profiling::span("model.unembed_spec.record");
+                self.model
+                    .unembed_spec(&mut recorder, &model_batch_req, &spec_batch_hidden_resp)
+            };
+            {
+                let _span = profiling::span("model.sample_spec.record");
+                self.model
+                    .sample_spec(&mut recorder, &model_batch_req, &spec_batch_resp);
             }
-        };
-        let sampled_output = self.model.finish_ops_recording(recorder, sampled_output);
+            let spec_replay_start = Instant::now();
+            {
+                let _span = profiling::span("model.submit_spec.wait");
+                let submission = self.model.submit_spec(&recorder);
+                submission.wait();
+            }
+            let spec_replay_elapsed = spec_replay_start.elapsed();
+            sampled_output = {
+                let _span = profiling::span("model.read_spec");
+                self.model
+                    .read_spec(&recorder, &model_batch_req, sampled_output, spec_replay_elapsed)
+            };
+        }
+        drop(recorder);
         let model_output_timing = self.model.sampled_output_timing(&sampled_output);
         let sampled_rows_count = self.model.sampled_output_len(&sampled_output);
         let output_elapsed = output_start.elapsed();
@@ -238,7 +267,6 @@ where
             response_summary,
             ExecutorBatchPerfMetrics {
                 sampled_rows: sampled_rows_count,
-                do_sample,
                 model_output_timing,
                 total_elapsed: total_start.elapsed(),
                 prepare_batch_elapsed,
@@ -375,12 +403,187 @@ fn summarize_f32_slice(values: &[f32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
+    use inference_runtime_core::compute::DecoderSyncBlocks;
+    use inference_runtime_core::config::SamplingConfig;
 
     use super::*;
+
+    struct LifecycleModel {
+        events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    struct LifecycleSubmission {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        wait_event: &'static str,
+    }
+
+    impl ExecutionSubmission for LifecycleSubmission {
+        fn wait(&self) {
+            self.events.borrow_mut().push(self.wait_event);
+        }
+    }
+
+    impl LifecycleModel {
+        fn record(&self, event: &'static str) {
+            self.events.borrow_mut().push(event);
+        }
+    }
+
+    impl ReplayableModelBatchExecutor for LifecycleModel {
+        type ModelBatchRequest = ();
+        type ModelBatchHidden = ();
+        type ModelBatchResponse = ();
+        type SampledOutput = ();
+        type ModelOpsRecorder = ();
+        type Submission = LifecycleSubmission;
+
+        fn model_name(&self) -> &str {
+            "lifecycle"
+        }
+
+        fn reset_req_slots(&mut self, _request_slots: &[RawRequestSlot]) {}
+
+        fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
+            self.record("prepare");
+        }
+
+        fn commit_batch(
+            &mut self,
+            core_batch_req: BatchDeviceRequest,
+            _sampled_output: Self::SampledOutput,
+        ) -> BatchDeviceResponse {
+            self.record("commit");
+            BatchDeviceResponse::new(core_batch_req.seq, Vec::new())
+        }
+
+        fn begin_ops_recording(&mut self, _batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {
+            self.record("begin");
+        }
+
+        fn embed_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _batch_req: &Self::ModelBatchRequest,
+        ) -> Self::ModelBatchHidden {
+            self.record("embed_main");
+        }
+
+        fn unembed_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: &Self::ModelBatchHidden,
+        ) -> Self::ModelBatchResponse {
+            self.record("unembed_main");
+        }
+
+        fn forward_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: Self::ModelBatchHidden,
+        ) -> Self::ModelBatchHidden {
+            self.record("forward_main");
+        }
+
+        fn submit_main(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+            self.record("submit_main");
+            LifecycleSubmission {
+                events: Rc::clone(&self.events),
+                wait_event: "wait_main",
+            }
+        }
+
+        fn read_main(
+            &mut self,
+            _recorder: &Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _replay_elapsed: Duration,
+        ) -> Self::SampledOutput {
+            self.record("read_main");
+        }
+
+        fn has_speculator(&self) -> bool {
+            true
+        }
+
+        fn embed_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: &Self::ModelBatchHidden,
+            _sampled_output: &Self::SampledOutput,
+        ) -> Self::ModelBatchHidden {
+            self.record("embed_spec");
+        }
+
+        fn forward_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: Self::ModelBatchHidden,
+        ) -> Self::ModelBatchHidden {
+            self.record("forward_spec");
+        }
+
+        fn unembed_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: &Self::ModelBatchHidden,
+        ) -> Self::ModelBatchResponse {
+            self.record("unembed_spec");
+        }
+
+        fn sample_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_resp: &Self::ModelBatchResponse,
+        ) {
+            self.record("sample_spec");
+        }
+
+        fn submit_spec(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+            self.record("submit_spec");
+            LifecycleSubmission {
+                events: Rc::clone(&self.events),
+                wait_event: "wait_spec",
+            }
+        }
+
+        fn read_spec(
+            &mut self,
+            _recorder: &Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            sampled_output: Self::SampledOutput,
+            _replay_elapsed: Duration,
+        ) -> Self::SampledOutput {
+            self.record("read_spec");
+            sampled_output
+        }
+
+        fn sample_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_resp: &Self::ModelBatchResponse,
+        ) {
+            self.record("sample_main");
+        }
+
+        fn empty_sampled_output(&self) -> Self::SampledOutput {}
+
+        fn sampled_output_len(&self, _sampled_output: &Self::SampledOutput) -> usize {
+            0
+        }
+    }
 
     struct ResetOnlyModel {
         reset_tx: Sender<Vec<RawRequestSlot>>,
@@ -392,6 +595,7 @@ mod tests {
         type ModelBatchResponse = ();
         type SampledOutput = ();
         type ModelOpsRecorder = ();
+        type Submission = LifecycleSubmission;
 
         fn model_name(&self) -> &str {
             "reset-only"
@@ -415,14 +619,14 @@ mod tests {
 
         fn begin_ops_recording(&mut self, _batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {}
 
-        fn embed(
+        fn embed_main(
             &mut self,
             _recorder: &mut Self::ModelOpsRecorder,
             _batch_req: &Self::ModelBatchRequest,
         ) -> Self::ModelBatchHidden {
         }
 
-        fn unembed(
+        fn unembed_main(
             &mut self,
             _recorder: &mut Self::ModelOpsRecorder,
             _model_batch_req: &Self::ModelBatchRequest,
@@ -438,12 +642,24 @@ mod tests {
         ) -> Self::ModelBatchHidden {
         }
 
-        fn sample(
+        fn submit_main(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+            panic!("reset-only model must not submit a batch")
+        }
+
+        fn read_main(
+            &mut self,
+            _recorder: &Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _replay_elapsed: Duration,
+        ) -> Self::SampledOutput {
+        }
+
+        fn sample_main(
             &mut self,
             _recorder: &mut Self::ModelOpsRecorder,
             _model_batch_req: &Self::ModelBatchRequest,
             _model_batch_resp: &Self::ModelBatchResponse,
-        ) -> Self::SampledOutput {
+        ) {
         }
 
         fn empty_sampled_output(&self) -> Self::SampledOutput {}
@@ -451,6 +667,63 @@ mod tests {
         fn sampled_output_len(&self, _sampled_output: &Self::SampledOutput) -> usize {
             0
         }
+    }
+
+    #[test]
+    fn test_prefill_uses_the_fixed_model_lifecycle() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (_batch_dev_req_tx, batch_dev_req_rx) = bounded(1);
+        let (batch_dev_resp_tx, _batch_dev_resp_rx) = bounded(1);
+        let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
+        let shutdown = Shutdown::new();
+        let mut executor = ReplayableModelExecutorLoop::new(
+            batch_dev_req_rx,
+            batch_dev_resp_tx,
+            req_slot_reset_notifier,
+            req_slot_reset_rx,
+            shutdown,
+            LifecycleModel {
+                events: Rc::clone(&events),
+            },
+        );
+        let request = DeviceRequest::new(
+            7,
+            0,
+            QueryTokens::Prefill {
+                epoch: 0,
+                token_index: 0,
+                tokens: vec![Token::new(11)],
+                window: 1,
+            },
+            DecoderSyncBlocks::new(0, Vec::new(), Vec::new()),
+            SamplingConfig::default(),
+        );
+
+        let response = executor.execute(BatchDeviceRequest::new(1, [request]));
+
+        assert!(response.dev_resps.is_empty());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "prepare",
+                "begin",
+                "embed_main",
+                "forward_main",
+                "unembed_main",
+                "sample_main",
+                "submit_main",
+                "wait_main",
+                "read_main",
+                "embed_spec",
+                "forward_spec",
+                "unembed_spec",
+                "sample_spec",
+                "submit_spec",
+                "wait_spec",
+                "read_spec",
+                "commit",
+            ]
+        );
     }
 
     #[test]

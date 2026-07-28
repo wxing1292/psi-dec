@@ -53,35 +53,4 @@ impl Qwen35Executor {
         recorded_key
     }
 
-    fn submit_main_decode_stage(
-        &self,
-        recorder: &mut Qwen35ModelOpsRecorder,
-        decision_replay: &ReplayProgram,
-        decision_arguments: &ReplayArguments,
-    ) -> Duration {
-        assert!(
-            !recorder.main_stage_submitted,
-            "qwen3.5 replay main stage cannot be submitted twice"
-        );
-        let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
-        let main_replay = self.main.replay(&recorder.main_key);
-        let gather_unembed_key = recorder
-            .gather_unembed_key
-            .as_ref()
-            .expect("qwen3.5 sampled output requires GatherUnembed replay");
-        let gather_unembed_replay = self.gather_unembed.replay(gather_unembed_key);
-        let empty_arguments = ReplayArguments::new();
-        let start = Instant::now();
-        self.replay_runtime()
-            .submit_replay_sequence(&[
-                ReplayExecution::new(main_embed_replay, &empty_arguments),
-                ReplayExecution::new(main_replay, &empty_arguments),
-                ReplayExecution::new(gather_unembed_replay, &empty_arguments),
-                ReplayExecution::new(decision_replay, decision_arguments),
-            ])
-            .wait();
-        let elapsed = start.elapsed();
-        recorder.main_stage_submitted = true;
-        elapsed
-    }
 }

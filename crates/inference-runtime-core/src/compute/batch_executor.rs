@@ -6,12 +6,17 @@ use crate::compute::DeviceRequest;
 use crate::runtime::RawRequestSlot;
 use crate::runtime::Token;
 
+pub trait ExecutionSubmission {
+    fn wait(&self);
+}
+
 pub trait ReplayableModelBatchExecutor {
     type ModelBatchRequest;
     type ModelBatchHidden;
     type ModelBatchResponse;
     type SampledOutput;
     type ModelOpsRecorder;
+    type Submission: ExecutionSubmission;
 
     fn model_name(&self) -> &str;
 
@@ -29,57 +34,95 @@ pub trait ReplayableModelBatchExecutor {
     ) -> BatchDeviceResponse;
 
     fn begin_ops_recording(&mut self, batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder;
-    fn finish_ops_recording(
-        &mut self,
-        recorder: Self::ModelOpsRecorder,
-        sampled_output: Self::SampledOutput,
-    ) -> Self::SampledOutput {
-        let _recorder = recorder;
-        sampled_output
-    }
 
-    fn embed(
+    fn embed_main(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
         batch_req: &Self::ModelBatchRequest,
     ) -> Self::ModelBatchHidden;
-    fn unembed(
-        &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchRequest,
-        model_batch_hidden: &Self::ModelBatchHidden,
-    ) -> Self::ModelBatchResponse;
-
     fn forward_main(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
         model_batch_req: &Self::ModelBatchRequest,
         model_batch_hidden: Self::ModelBatchHidden,
     ) -> Self::ModelBatchHidden;
-    fn forward_spec(
+    fn unembed_main(
+        &mut self,
+        recorder: &mut Self::ModelOpsRecorder,
+        model_batch_req: &Self::ModelBatchRequest,
+        model_batch_hidden: &Self::ModelBatchHidden,
+    ) -> Self::ModelBatchResponse;
+    fn sample_main(
+        &mut self,
+        recorder: &mut Self::ModelOpsRecorder,
+        model_batch_req: &Self::ModelBatchRequest,
+        model_batch_resp: &Self::ModelBatchResponse,
+    );
+
+    fn submit_main(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission;
+
+    fn read_main(
+        &mut self,
+        recorder: &Self::ModelOpsRecorder,
+        model_batch_req: &Self::ModelBatchRequest,
+        replay_elapsed: Duration,
+    ) -> Self::SampledOutput;
+
+    fn has_speculator(&self) -> bool {
+        false
+    }
+
+    fn embed_spec(
         &mut self,
         _recorder: &mut Self::ModelOpsRecorder,
         _model_batch_req: &Self::ModelBatchRequest,
         _model_batch_hidden: &Self::ModelBatchHidden,
+        _sampled_output: &Self::SampledOutput,
+    ) -> Self::ModelBatchHidden {
+        panic!("model executor does not have a speculator")
+    }
+
+    fn forward_spec(
+        &mut self,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _model_batch_hidden: Self::ModelBatchHidden,
+    ) -> Self::ModelBatchHidden {
+        panic!("model executor does not have a speculator")
+    }
+
+    fn unembed_spec(
+        &mut self,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _model_batch_hidden: &Self::ModelBatchHidden,
+    ) -> Self::ModelBatchResponse {
+        panic!("model executor does not have a speculator")
+    }
+
+    fn sample_spec(
+        &mut self,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _model_batch_resp: &Self::ModelBatchResponse,
+    ) {
+        panic!("model executor does not have a speculator")
+    }
+
+    fn submit_spec(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+        panic!("model executor does not have a speculator")
+    }
+
+    fn read_spec(
+        &mut self,
+        _recorder: &Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
         sampled_output: Self::SampledOutput,
+        _replay_elapsed: Duration,
     ) -> Self::SampledOutput {
         sampled_output
     }
 
-    fn sample(
-        &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchRequest,
-        model_batch_resp: &Self::ModelBatchResponse,
-    ) -> Self::SampledOutput;
-    fn rejection_sample(
-        &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchRequest,
-        model_batch_resp: &Self::ModelBatchResponse,
-    ) -> Self::SampledOutput {
-        self.sample(recorder, model_batch_req, model_batch_resp)
-    }
     fn empty_sampled_output(&self) -> Self::SampledOutput;
     fn sampled_output_len(&self, sampled_output: &Self::SampledOutput) -> usize;
     fn sampled_output_timing(&self, _sampled_output: &Self::SampledOutput) -> Option<ModelOutputTiming> {
@@ -97,7 +140,7 @@ pub trait ReplayableModelBatchExecutor {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ModelOutputTiming {
     pub main_replay_elapsed: Duration,
-    pub main_output_replay_elapsed: Duration,
+    pub main_sample_replay_elapsed: Duration,
     pub sample_read_elapsed: Duration,
     pub rejection_build_elapsed: Duration,
     pub rejection_read_elapsed: Duration,
@@ -110,7 +153,7 @@ pub struct ModelOutputTiming {
 impl ModelOutputTiming {
     pub fn add_assign(&mut self, other: Self) {
         self.main_replay_elapsed += other.main_replay_elapsed;
-        self.main_output_replay_elapsed += other.main_output_replay_elapsed;
+        self.main_sample_replay_elapsed += other.main_sample_replay_elapsed;
         self.sample_read_elapsed += other.sample_read_elapsed;
         self.rejection_build_elapsed += other.rejection_build_elapsed;
         self.rejection_read_elapsed += other.rejection_read_elapsed;

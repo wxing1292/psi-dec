@@ -7,7 +7,6 @@ use inference_backend_metal::MetalRuntime;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
-use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::model::qwen::v3::Qwen3DecodeDecision;
 use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
@@ -35,6 +34,7 @@ use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
 
 use crate::def::replay_op::MetalReplayRuntime;
+use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::v3::main::Qwen3Main;
 use crate::model::qwen::v3::main::Qwen3MainArgs;
@@ -92,11 +92,12 @@ pub struct Qwen3Executor {
 }
 
 pub struct Qwen3ModelOpsRecorder {
-    compute_seq: RawComputeSlotSeq,
     main_embed_key: Qwen3MainEmbedReplayKey,
     main_key: Qwen3MainReplayKey,
     gather_unembed_key: Option<Qwen3GatherUnembedReplayKey>,
-    main_stage_submitted: bool,
+    sampling_key: Option<TopKSamplingReplayKey>,
+    sampling_arguments: ReplayArguments,
+    num_sample_tokens: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -105,7 +106,6 @@ pub struct Qwen3ModelBatchResponse;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Qwen3SampledOutput {
     decisions: Vec<Qwen3DecodeDecision>,
-    read_sampling_output: bool,
     timing: ModelOutputTiming,
 }
 
@@ -115,7 +115,6 @@ struct Qwen3PendingTransactions {
 
 struct Qwen3PendingTransaction {
     compute_seq: RawComputeSlotSeq,
-    microbatch: Qwen3Microbatch,
 }
 
 impl Qwen3PendingTransactions {
@@ -125,29 +124,14 @@ impl Qwen3PendingTransactions {
         }
     }
 
-    fn push(&mut self, compute_seq: RawComputeSlotSeq, microbatch: Qwen3Microbatch) {
+    fn push(&mut self, compute_seq: RawComputeSlotSeq) {
         if let Some(last) = self.transactions.back() {
             assert!(
                 last.compute_seq < compute_seq,
                 "qwen3 pending transaction sequences must increase"
             );
         }
-        self.transactions.push_back(Qwen3PendingTransaction {
-            compute_seq,
-            microbatch,
-        });
-    }
-
-    fn pending_microbatch(&self, compute_seq: RawComputeSlotSeq) -> &Qwen3Microbatch {
-        let transaction = self
-            .transactions
-            .front()
-            .expect("qwen3 sampling requires a pending batch");
-        assert_eq!(
-            transaction.compute_seq, compute_seq,
-            "qwen3 pending batch sequence must match the oldest transaction"
-        );
-        &transaction.microbatch
+        self.transactions.push_back(Qwen3PendingTransaction { compute_seq });
     }
 
     fn commit(&mut self, compute_seq: RawComputeSlotSeq) {
@@ -168,6 +152,7 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
     type ModelBatchResponse = Qwen3ModelBatchResponse;
     type SampledOutput = Qwen3SampledOutput;
     type ModelOpsRecorder = Qwen3ModelOpsRecorder;
+    type Submission = MetalReplaySubmission;
 
     fn model_name(&self) -> &str {
         &self.model_name
@@ -226,45 +211,16 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
         );
         let main_key = Qwen3MainReplayKey::from_shape(self.main_gqa_state.metadata().replay_shape());
         Qwen3ModelOpsRecorder {
-            compute_seq: model_batch_request.compute_seq(),
             main_embed_key,
             main_key,
             gather_unembed_key: None,
-            main_stage_submitted: false,
+            sampling_key: None,
+            sampling_arguments: ReplayArguments::new(),
+            num_sample_tokens: num_target_hidden_states(model_batch_request.microbatch()),
         }
     }
 
-    fn finish_ops_recording(
-        &mut self,
-        recorder: Self::ModelOpsRecorder,
-        mut sampled_output: Self::SampledOutput,
-    ) -> Self::SampledOutput {
-        let mut recorder = recorder;
-        if recorder.main_stage_submitted {
-            return sampled_output;
-        }
-        if sampled_output.read_sampling_output {
-            let (num_sample_tokens, sampler_configs, sample_positions) = {
-                let microbatch = self.pending_transactions.pending_microbatch(recorder.compute_seq);
-                (
-                    u32::try_from(num_target_hidden_states(microbatch))
-                        .expect("qwen3 target hidden-state count must fit u32"),
-                    sample_sampler_configs(microbatch),
-                    sample_token_positions(microbatch),
-                )
-            };
-            sampled_output.timing.main_output_replay_elapsed +=
-                self.submit_main_sample_stage(&mut recorder, &sampler_configs, &sample_positions);
-            let sample_read_start = Instant::now();
-            sampled_output.decisions = self.read_sample_decisions(num_sample_tokens as usize);
-            sampled_output.timing.sample_read_elapsed += sample_read_start.elapsed();
-        } else {
-            sampled_output.timing.main_replay_elapsed += self.submit_main_stage(&mut recorder);
-        }
-        sampled_output
-    }
-
-    fn embed(
+    fn embed_main(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
         model_batch_request: &Self::ModelBatchRequest,
@@ -314,12 +270,11 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
             recorded_key, recorder.main_key,
             "qwen3 Main replay input must match the prepared replay key"
         );
-        self.pending_transactions
-            .push(model_batch_req.compute_seq(), microbatch.clone());
+        self.pending_transactions.push(model_batch_req.compute_seq());
         Rc::clone(&self.hidden_output)
     }
 
-    fn unembed(
+    fn unembed_main(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
         model_batch_req: &Self::ModelBatchRequest,
@@ -329,22 +284,65 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
             Rc::ptr_eq(model_batch_hidden, &self.hidden_output),
             "qwen3 Output must consume the executor final-norm hidden workspace"
         );
+        if num_target_hidden_states(model_batch_req.microbatch()) == 0 {
+            return Qwen3ModelBatchResponse;
+        }
         recorder.gather_unembed_key =
             Some(self.prepare_gather_unembed_replay(model_batch_req.microbatch(), model_batch_hidden));
         Qwen3ModelBatchResponse
     }
 
-    fn sample(
+    fn sample_main(
         &mut self,
-        _recorder: &mut Self::ModelOpsRecorder,
-        _model_batch_req: &Self::ModelBatchRequest,
+        recorder: &mut Self::ModelOpsRecorder,
+        model_batch_req: &Self::ModelBatchRequest,
         _model_batch_resp: &Self::ModelBatchResponse,
-    ) -> Self::SampledOutput {
-        Qwen3SampledOutput {
-            decisions: Vec::new(),
-            read_sampling_output: true,
-            timing: ModelOutputTiming::default(),
+    ) {
+        let microbatch = model_batch_req.microbatch();
+        let num_sample_tokens = num_target_hidden_states(microbatch);
+        assert_eq!(
+            num_sample_tokens, recorder.num_sample_tokens,
+            "qwen3 sampling rows must match the recording"
+        );
+        if num_sample_tokens == 0 {
+            return;
         }
+        let (sampling_key, sampling_arguments) = self.record_sampling(microbatch);
+        recorder.sampling_key = Some(sampling_key);
+        recorder.sampling_arguments = sampling_arguments;
+    }
+
+    fn submit_main(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+        if recorder.num_sample_tokens == 0 {
+            return self.submit_main_recording(recorder);
+        }
+        self.submit_main_sampling_recording(recorder)
+    }
+
+    fn read_main(
+        &mut self,
+        recorder: &Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        replay_elapsed: Duration,
+    ) -> Self::SampledOutput {
+        if recorder.num_sample_tokens == 0 {
+            let timing = ModelOutputTiming {
+                main_replay_elapsed: replay_elapsed,
+                ..ModelOutputTiming::default()
+            };
+            return Qwen3SampledOutput {
+                decisions: Vec::new(),
+                timing,
+            };
+        }
+        let mut timing = ModelOutputTiming {
+            main_sample_replay_elapsed: replay_elapsed,
+            ..ModelOutputTiming::default()
+        };
+        let sample_read_start = Instant::now();
+        let decisions = self.read_sample_decisions(recorder.num_sample_tokens);
+        timing.sample_read_elapsed = sample_read_start.elapsed();
+        Qwen3SampledOutput { decisions, timing }
     }
 
     fn empty_sampled_output(&self) -> Self::SampledOutput {

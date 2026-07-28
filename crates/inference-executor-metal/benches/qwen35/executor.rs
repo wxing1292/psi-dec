@@ -18,8 +18,6 @@ use inference_runtime_core::runtime::Token;
 
 const NUM_TOKENS_PER_BLOCK: usize = 1024;
 const NUM_CACHE_PAGES: usize = 32 * 1024;
-const QWEN27_MAIN_GQA_PAGE_IDS_PER_BLOCK: usize = 2048;
-const QWEN35_MAIN_GQA_PAGE_IDS_PER_BLOCK: usize = 640;
 
 fn main() {
     let args = Args::parse();
@@ -122,6 +120,9 @@ struct ExecutorFixture {
     case: Case,
     main_gqa_page_ids_per_block: usize,
     mtp_gqa_page_ids_per_block: Vec<usize>,
+    next_sequence: u64,
+    next_token_index: usize,
+    next_token: Token,
 }
 
 impl ExecutorFixture {
@@ -147,10 +148,7 @@ impl ExecutorFixture {
             },
         }
         .unwrap_or_else(|err| panic!("unable to initialize {}: {err}", case.key()));
-        let main_gqa_page_ids_per_block = match case {
-            Case::E2EWithoutMTP => QWEN27_MAIN_GQA_PAGE_IDS_PER_BLOCK,
-            Case::E2EWithMTP => QWEN35_MAIN_GQA_PAGE_IDS_PER_BLOCK,
-        };
+        let main_gqa_page_ids_per_block = model.num_main_gqa_page_ids_per_block();
         let mtp_gqa_page_ids_per_block = model.num_mtp_gqa_page_ids_per_block();
         assert!(
             main_gqa_page_ids_per_block + mtp_gqa_page_ids_per_block.iter().sum::<usize>() <= NUM_CACHE_PAGES,
@@ -161,6 +159,9 @@ impl ExecutorFixture {
             case,
             main_gqa_page_ids_per_block,
             mtp_gqa_page_ids_per_block,
+            next_sequence: 0,
+            next_token_index: 0,
+            next_token: Token::new(11),
         }
     }
 
@@ -172,17 +173,49 @@ impl ExecutorFixture {
 
     fn run(&mut self) -> ExecutionTiming {
         match self.case {
-            Case::E2EWithoutMTP => self.run_batch(self.batch_request(0, 0, Token::new(11), Vec::new())),
+            Case::E2EWithoutMTP => self.run_decode_batch(Vec::new()),
             Case::E2EWithMTP => self.run_mtp_cycle(),
         }
         .0
     }
 
     fn run_mtp_cycle(&mut self) -> (ExecutionTiming, BatchDeviceResponse) {
-        let (proposal_timing, proposal_response) = self.run_batch(self.batch_request(0, 0, Token::new(11), Vec::new()));
+        let (proposal_timing, proposal_response) = self.run_decode_batch(Vec::new());
         let (target_token, draft_tokens) = mtp_target_input(&proposal_response, self.case.max_spec_tokens());
-        let (target_timing, target_response) = self.run_batch(self.batch_request(1, 1, target_token, draft_tokens));
+        assert_eq!(
+            target_token, self.next_token,
+            "MTP benchmark must verify the sampled token from the proposal batch"
+        );
+        let (target_timing, target_response) = self.run_decode_batch(draft_tokens);
         (proposal_timing.combine(target_timing), target_response)
+    }
+
+    fn run_decode_batch(&mut self, spec_tokens: Vec<Token>) -> (ExecutionTiming, BatchDeviceResponse) {
+        let request = self.batch_request(self.next_sequence, self.next_token_index, self.next_token, spec_tokens);
+        let result = self.run_batch(request);
+        self.advance_decode_input(&result.1);
+        result
+    }
+
+    fn advance_decode_input(&mut self, response: &BatchDeviceResponse) {
+        assert_eq!(response.dev_resps.len(), 1, "Qwen benchmark requires one response");
+        let SampledTokens::Decode {
+            validated_tokens,
+            sampled_token,
+            ..
+        } = &response.dev_resps[0].sampled_tokens
+        else {
+            panic!("Qwen benchmark requires decode output");
+        };
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .expect("Qwen benchmark sequence must fit u64");
+        self.next_token_index = self
+            .next_token_index
+            .checked_add(validated_tokens.len() + 1)
+            .expect("Qwen benchmark token index must fit usize");
+        self.next_token = *sampled_token;
     }
 
     fn run_batch(&mut self, core_batch_req: BatchDeviceRequest) -> (ExecutionTiming, BatchDeviceResponse) {
@@ -191,22 +224,33 @@ impl ExecutorFixture {
         let prepare = prepare_start.elapsed();
         let record_start = Instant::now();
         let mut recorder = self.model.begin_ops_recording(&model_batch_req);
-        let hidden = self.model.embed(&mut recorder, &model_batch_req);
+        let hidden = self.model.embed_main(&mut recorder, &model_batch_req);
         let hidden = self.model.forward_main(&mut recorder, &model_batch_req, hidden);
-        let output = self.model.unembed(&mut recorder, &model_batch_req, &hidden);
-        let sampled = match self.case {
-            Case::E2EWithoutMTP => self.model.sample(&mut recorder, &model_batch_req, &output),
-            Case::E2EWithMTP if model_batch_req.microbatch().has_spec_tokens() => {
-                self.model.rejection_sample(&mut recorder, &model_batch_req, &output)
-            },
-            Case::E2EWithMTP => self.model.sample(&mut recorder, &model_batch_req, &output),
-        };
-        let sampled = self
-            .model
-            .forward_spec(&mut recorder, &model_batch_req, &hidden, sampled);
+        let output = self.model.unembed_main(&mut recorder, &model_batch_req, &hidden);
+        self.model.sample_main(&mut recorder, &model_batch_req, &output);
         let record = record_start.elapsed();
         let finish_start = Instant::now();
-        let sampled = self.model.finish_ops_recording(recorder, sampled);
+        let main_replay_start = Instant::now();
+        let submission = self.model.submit_main(&recorder);
+        submission.wait();
+        let mut sampled = self
+            .model
+            .read_main(&recorder, &model_batch_req, main_replay_start.elapsed());
+        if self.model.has_speculator() {
+            let spec_hidden = self
+                .model
+                .embed_spec(&mut recorder, &model_batch_req, &hidden, &sampled);
+            let spec_hidden = self.model.forward_spec(&mut recorder, &model_batch_req, spec_hidden);
+            let spec_output = self.model.unembed_spec(&mut recorder, &model_batch_req, &spec_hidden);
+            self.model.sample_spec(&mut recorder, &model_batch_req, &spec_output);
+            let spec_replay_start = Instant::now();
+            let submission = self.model.submit_spec(&recorder);
+            submission.wait();
+            sampled = self
+                .model
+                .read_spec(&recorder, &model_batch_req, sampled, spec_replay_start.elapsed());
+        }
+        drop(recorder);
         let finish = finish_start.elapsed();
         let stage = self.model.sampled_output_timing(&sampled).unwrap_or_default();
         let feedback_start = Instant::now();
@@ -327,7 +371,7 @@ impl ExecutionTiming {
 }
 
 fn submit_wait_elapsed(stage: &ModelOutputTiming) -> Duration {
-    stage.main_replay_elapsed + stage.main_output_replay_elapsed + stage.spec_replay_elapsed
+    stage.main_replay_elapsed + stage.main_sample_replay_elapsed + stage.spec_replay_elapsed
 }
 
 fn measure_runs(runs: usize, iters: usize, mut run: impl FnMut() -> ExecutionTiming) -> Vec<RunSample> {
@@ -373,11 +417,11 @@ fn print_result(
         .map(|sample| sample.stage.main_replay_elapsed.as_secs_f64() * 1.0e6 / iters as f64)
         .collect::<Vec<_>>();
     main_us.sort_by(f64::total_cmp);
-    let mut output_us = samples
+    let mut main_sample_us = samples
         .iter()
-        .map(|sample| sample.stage.main_output_replay_elapsed.as_secs_f64() * 1.0e6 / iters as f64)
+        .map(|sample| sample.stage.main_sample_replay_elapsed.as_secs_f64() * 1.0e6 / iters as f64)
         .collect::<Vec<_>>();
-    output_us.sort_by(f64::total_cmp);
+    main_sample_us.sort_by(f64::total_cmp);
     let mut spec_us = samples
         .iter()
         .map(|sample| sample.stage.spec_replay_elapsed.as_secs_f64() * 1.0e6 / iters as f64)
@@ -395,14 +439,7 @@ fn print_result(
     prepare_us.sort_by(f64::total_cmp);
     let mut record_cpu_estimate_us = samples
         .iter()
-        .map(|sample| {
-            sample
-                .record
-                .saturating_sub(submit_wait_elapsed(&sample.stage))
-                .as_secs_f64()
-                * 1.0e6
-                / iters as f64
-        })
+        .map(|sample| sample.record.as_secs_f64() * 1.0e6 / iters as f64)
         .collect::<Vec<_>>();
     record_cpu_estimate_us.sort_by(f64::total_cmp);
     let mut finish_cpu_estimate_us = samples
@@ -422,7 +459,7 @@ fn print_result(
     let cache_build_estimate_us = cache_miss.cache_build_cpu_estimate().as_secs_f64() * 1.0e6;
     println!(
         "perf component=qwen35-executor case={} setup_us={:.3} cache_miss_wall_us={:.3} cache_build_estimate_us={:.3} \
-         timing=executor-wall iters={} runs={} wall_median_us={:.3} main_median_us={:.3} output_median_us={:.3} \
+         timing=executor-wall iters={} runs={} wall_median_us={:.3} main_median_us={:.3} main_sample_median_us={:.3} \
          spec_median_us={:.3} prepare_median_us={:.3} record_cpu_estimate_median_us={:.3} \
          finish_cpu_estimate_median_us={:.3} feedback_median_us={:.3}",
         case.key(),
@@ -433,7 +470,7 @@ fn print_result(
         samples.len(),
         median_wall_us,
         median_of_sorted(&main_us),
-        median_of_sorted(&output_us),
+        median_of_sorted(&main_sample_us),
         median_of_sorted(&spec_us),
         median_of_sorted(&prepare_us),
         median_of_sorted(&record_cpu_estimate_us),

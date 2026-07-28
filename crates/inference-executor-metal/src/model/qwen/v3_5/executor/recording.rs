@@ -16,41 +16,63 @@ impl Qwen35Executor {
         self.runtime.submit_replay_with_arguments(replay, arguments).wait();
     }
 
-    fn replay_main(&self, recorder: &Qwen35ModelOpsRecorder) -> Duration {
+    fn submit_main_recording(&self, recorder: &Qwen35ModelOpsRecorder) -> MetalReplaySubmission {
         let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
         let main_replay = self.main.replay(&recorder.main_key);
         let empty_arguments = ReplayArguments::new();
-        let main_replay_start = Instant::now();
         self.replay_runtime()
             .submit_replay_sequence(&[
                 ReplayExecution::new(main_embed_replay, &empty_arguments),
                 ReplayExecution::new(main_replay, &empty_arguments),
             ])
-            .wait();
-        main_replay_start.elapsed()
     }
 
-    fn submit_main_stage(&mut self, recorder: &mut Qwen35ModelOpsRecorder) -> Duration {
+    fn submit_main_sampling_recording(
+        &self,
+        recorder: &Qwen35ModelOpsRecorder,
+    ) -> MetalReplaySubmission {
+        trace::qwen35_state(|| {
+            format!("event=submit_main_sequence_start main_key={:?}", recorder.main_key)
+        });
+        let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
+        let main_replay = self.main.replay(&recorder.main_key);
+        let gather_unembed_key = recorder
+            .gather_unembed_key
+            .as_ref()
+            .expect("qwen3.5 sampled output requires GatherUnembed replay");
+        let gather_unembed_replay = self.gather_unembed.replay(gather_unembed_key);
+        let (sampling_replay, sampling_arguments) = if self.spec_probs.is_enabled() {
+            let rejection_key = recorder
+                .rejection_key
+                .as_ref()
+                .expect("qwen3.5 sampled output requires RejectionSampling replay");
+            (
+                self.rejection_sampling.replay(rejection_key),
+                &recorder.rejection_arguments,
+            )
+        } else {
+            let sampling_key = recorder
+                .sampling_key
+                .as_ref()
+                .expect("qwen3.5 sampled output requires Sampling replay");
+            (self.sampling.replay(sampling_key), &recorder.sampling_arguments)
+        };
+        let empty_arguments = ReplayArguments::new();
+        let submission = self
+            .replay_runtime()
+            .submit_replay_sequence(&[
+                ReplayExecution::new(main_embed_replay, &empty_arguments),
+                ReplayExecution::new(main_replay, &empty_arguments),
+                ReplayExecution::new(gather_unembed_replay, &empty_arguments),
+                ReplayExecution::new(sampling_replay, sampling_arguments),
+            ]);
         trace::qwen35_state(|| {
             format!(
-                "event=submit_main_stage_start main_key={:?} submitted={}",
-                recorder.main_key, recorder.main_stage_submitted
+                "event=submit_main_sequence_submitted main_key={:?}",
+                recorder.main_key
             )
         });
-        assert!(
-            !recorder.main_stage_submitted,
-            "qwen3.5 replay main stage cannot be submitted twice"
-        );
-        let elapsed = self.replay_main(recorder);
-        recorder.main_stage_submitted = true;
-        trace::qwen35_state(|| {
-            format!(
-                "event=submit_main_stage_done main_key={:?} elapsed_us={}",
-                recorder.main_key,
-                elapsed.as_micros()
-            )
-        });
-        elapsed
+        submission
     }
 
     fn submit_gdn_state_restore(&mut self) -> Duration {

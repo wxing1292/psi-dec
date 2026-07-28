@@ -1,5 +1,6 @@
+use inference_runtime_core::compute::ExecutionSubmission;
+
 use crate::backend::recorder::Recorder;
-use crate::backend::submission::Submission;
 
 /// Backend runtime boundary for replay creation and submission.
 ///
@@ -7,7 +8,7 @@ use crate::backend::submission::Submission;
 /// buffer abstractions remain backend-specific until a later design pass.
 pub trait Runtime {
     type Replay;
-    type Submission: Submission;
+    type Submission: ExecutionSubmission;
     type Recorder<'a>: Recorder<'a, Replay = Self::Replay>
     where
         Self: 'a;

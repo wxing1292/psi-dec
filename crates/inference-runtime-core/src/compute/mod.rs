@@ -18,6 +18,7 @@ pub use response::MockBatchDevResp;
 pub use response::MockDevResp;
 
 mod batch_executor;
+pub use batch_executor::ExecutionSubmission;
 pub use batch_executor::ModelOutputTiming;
 pub use batch_executor::ReplayableModelBatchExecutor;
 pub use batch_executor::page_ids_by_layer_for_lane;

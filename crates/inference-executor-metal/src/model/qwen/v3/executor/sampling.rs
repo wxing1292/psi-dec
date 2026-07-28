@@ -32,15 +32,10 @@ impl Qwen3Executor {
         (sample_key, replay_arguments)
     }
 
-    fn submit_main_sample_stage(
-        &mut self,
-        recorder: &mut Qwen3ModelOpsRecorder,
-        sampler_configs: &[SamplerConfig],
-        sample_positions: &[u32],
-    ) -> Duration {
-        let (sample_key, sample_arguments) = self.prepare_sample_replay(sampler_configs, sample_positions);
-        let sample_replay = self.sampling.replay(&sample_key);
-        self.submit_main_decode_stage(recorder, sample_replay, &sample_arguments)
+    fn record_sampling(&mut self, microbatch: &Qwen3Microbatch) -> (TopKSamplingReplayKey, ReplayArguments) {
+        let sampler_configs = sample_sampler_configs(microbatch);
+        let sample_positions = sample_token_positions(microbatch);
+        self.prepare_sample_replay(&sampler_configs, &sample_positions)
     }
 
     fn read_sampled_token_ids(&self, num_decode_reqs: usize) -> Qwen3SampledTokens {
@@ -54,4 +49,5 @@ impl Qwen3Executor {
     fn read_sample_decisions(&self, num_decode_reqs: usize) -> Vec<Qwen3DecodeDecision> {
         sample_decisions_from_sampled_tokens(&self.read_sampled_token_ids(num_decode_reqs))
     }
+
 }

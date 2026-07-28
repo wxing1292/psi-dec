@@ -68,24 +68,10 @@ impl Qwen35Executor {
         (sample_key, replay_arguments)
     }
 
-    fn submit_main_sample_stage(
-        &mut self,
-        recorder: &mut Qwen35ModelOpsRecorder,
-        sampler_configs: &[SamplerConfig],
-        sample_positions: &[u32],
-    ) -> Duration {
-        let (sample_key, sample_arguments) = self.prepare_sample_replay(sampler_configs, sample_positions);
-        let sample_replay = self.sampling.replay(&sample_key);
-        let elapsed = self.submit_main_decode_stage(recorder, sample_replay, &sample_arguments);
-        trace::qwen35_state(|| {
-            format!(
-                "event=submit_main_sample_stage_done main_key={:?} sample_key={:?} elapsed_us={}",
-                recorder.main_key,
-                sample_key,
-                elapsed.as_micros()
-            )
-        });
-        elapsed
+    fn record_sampling(&mut self, microbatch: &Qwen35Microbatch) -> (TopKSamplingReplayKey, ReplayArguments) {
+        let sampler_configs = sample_sampler_configs(microbatch);
+        let sample_positions = sample_token_positions(microbatch);
+        self.prepare_sample_replay(&sampler_configs, &sample_positions)
     }
 
     fn assert_expected_draft_tokens_fit(&self, num_tokens: usize) {
@@ -110,12 +96,27 @@ impl Qwen35Executor {
         sample_decisions_from_sampled_tokens(&self.read_sampled_token_ids(num_decode_reqs))
     }
 
-    fn target_rejection_sample(
+    fn read_sampling(
+        &mut self,
+        num_sample_tokens: usize,
+        replay_elapsed: Duration,
+    ) -> (Vec<Qwen35DecodeDecision>, ModelOutputTiming) {
+        let mut timing = ModelOutputTiming {
+            main_sample_replay_elapsed: replay_elapsed,
+            ..ModelOutputTiming::default()
+        };
+        let sample_read_start = Instant::now();
+        let decisions = self.read_sample_decisions(num_sample_tokens);
+        trace_decisions("sample_read", &decisions);
+        timing.sample_read_elapsed = sample_read_start.elapsed();
+        (decisions, timing)
+    }
+
+    fn record_rejection_sampling(
         &mut self,
         recorder: &mut Qwen35ModelOpsRecorder,
         microbatch: &Qwen35Microbatch,
-    ) -> (Vec<Qwen35DecodeDecision>, ModelOutputTiming) {
-        let mut timing = ModelOutputTiming::default();
+    ) {
         let sample_positions = sample_token_positions(microbatch);
         let num_target_hidden_states = num_target_hidden_states(microbatch);
         let sampler_configs = sample_sampler_configs(microbatch);
@@ -230,7 +231,7 @@ impl Qwen35Executor {
                 "qwen3.5 rejection replay input must match its key"
             );
             if !rejection_cache_hit {
-                timing.rejection_build_elapsed += rejection_build_start.elapsed();
+                recorder.rejection_build_elapsed += rejection_build_start.elapsed();
             }
         }
         self.sampler
@@ -276,9 +277,28 @@ impl Qwen35Executor {
             .component()
             .rejector()
             .add_replay_arguments(rejection_input, &mut replay_arguments);
-        let rejection_replay = self.rejection_sampling.replay(&rejection_key);
-        timing.main_output_replay_elapsed +=
-            self.submit_main_decode_stage(recorder, rejection_replay, &replay_arguments);
+        recorder.rejection_key = Some(rejection_key);
+        recorder.rejection_arguments = replay_arguments;
+        recorder.rejection_prepared = Some(prepared);
+    }
+
+    fn read_rejection_sampling(
+        &mut self,
+        recorder: &Qwen35ModelOpsRecorder,
+        microbatch: &Qwen35Microbatch,
+        replay_elapsed: Duration,
+    ) -> (Vec<Qwen35DecodeDecision>, ModelOutputTiming) {
+        let prepared = recorder
+            .rejection_prepared
+            .as_ref()
+            .expect("qwen3.5 rejection read requires recorded inputs");
+        let num_active_decode_reqs = prepared.num_active_decode_reqs();
+        let num_active_draft_distributions = prepared.num_active_draft_distributions;
+        let mut timing = ModelOutputTiming {
+            main_sample_replay_elapsed: replay_elapsed,
+            rejection_build_elapsed: recorder.rejection_build_elapsed,
+            ..ModelOutputTiming::default()
+        };
         let rejection_read_start = Instant::now();
         let results = self
             .rejection_sampling
@@ -314,7 +334,7 @@ impl Qwen35Executor {
             decisions.push(decision);
             flat_draft_index += microbatch.num_spec_tokens(req_index) as usize;
         }
-        timing.rejection_read_elapsed += rejection_read_start.elapsed();
+        timing.rejection_read_elapsed = rejection_read_start.elapsed();
         (decisions, timing)
     }
 

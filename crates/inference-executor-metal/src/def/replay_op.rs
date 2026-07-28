@@ -9,7 +9,7 @@ use inference_backend_metal::metal::ReplaySubmission;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::backend::runtime::Runtime;
-use inference_executor_core::backend::submission::Submission;
+use inference_runtime_core::compute::ExecutionSubmission;
 
 pub struct MetalReplayRuntime<'a> {
     stream: &'a Stream,
@@ -105,7 +105,7 @@ impl MetalReplaySubmission {
     }
 }
 
-impl Submission for MetalReplaySubmission {
+impl ExecutionSubmission for MetalReplaySubmission {
     fn wait(&self) {
         MetalReplaySubmission::wait(self);
     }
