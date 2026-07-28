@@ -14,6 +14,7 @@ mod http;
 pub async fn run<const N: usize, const L: usize, const P: usize>(
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
+    model_name: String,
     qwen_codec: Arc<QwenCodec>,
     inference: Arc<Inference<N, L, P>>,
     shutdown: Shutdown,
@@ -29,9 +30,15 @@ pub async fn run<const N: usize, const L: usize, const P: usize>(
     };
     let http_shutdown = shutdown.clone();
     let http_server = async move {
-        let result = http::run(http_listen_addr, inference, qwen_codec, http_shutdown.clone())
-            .await
-            .map_err(|error| log_err_unavailable!("HTTP server failed: {error}"));
+        let result = http::run(
+            http_listen_addr,
+            model_name,
+            inference,
+            qwen_codec,
+            http_shutdown.clone(),
+        )
+        .await
+        .map_err(|error| log_err_unavailable!("HTTP server failed: {error}"));
         http_shutdown.shutdown();
         result
     };

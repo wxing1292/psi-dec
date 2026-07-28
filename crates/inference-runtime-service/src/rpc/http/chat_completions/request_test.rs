@@ -60,7 +60,7 @@ fn test_schema() {
     }))
     .unwrap();
 
-    assert_eq!(request.model, "qwen");
+    assert_eq!(request.model.as_deref(), Some("qwen"));
     assert_eq!(request.messages.len(), 4);
     assert!(matches!(
         &request.messages[1],
@@ -88,11 +88,11 @@ fn test_schema() {
 #[test]
 fn test_stream_defaults_to_false() {
     let request = serde_json::from_value::<Request>(json!({
-        "model": "qwen",
         "messages": [{"role": "user", "content": "hello"}]
     }))
     .unwrap();
 
+    assert_eq!(request.model, None);
     assert!(!request.stream);
 }
 
@@ -243,6 +243,10 @@ fn test_tool_definitions() {
 fn test_unsupported_options() {
     let codec = fixture_codec();
     for request in [
+        json!({
+            "model": "",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
         json!({
             "model": "qwen",
             "messages": [{"role": "user", "content": "hello"}],

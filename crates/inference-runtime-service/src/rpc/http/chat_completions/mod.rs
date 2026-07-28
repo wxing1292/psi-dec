@@ -1,39 +1,52 @@
 //! OpenAI-compatible Chat Completions wire contract.
 //!
 //! Request object graph:
+//! `Option` marks an optional field. `Vec` marks a repeated field.
+//! The graph omits scalar and object types.
 //!
 //! ```text
 //! Request
-//! ├── model
-//! ├── messages: Vec<Message>
+//! ├── model: Option
+//! ├── messages: Vec
 //! │   ├── System
 //! │   │   └── content
 //! │   ├── Developer
 //! │   │   └── content
 //! │   ├── User
-//! │   │   └── Content
+//! │   │   └── content
 //! │   │       ├── Text
-//! │   │       └── Parts: Vec<ContentPart>
+//! │   │       └── Parts: Vec
 //! │   ├── Assistant
-//! │   │   ├── content?
-//! │   │   ├── reasoning_content?
-//! │   │   └── tool_calls: Vec<ToolCall>
+//! │   │   ├── content: Option
+//! │   │   ├── reasoning_content: Option
+//! │   │   └── tool_calls: Vec
 //! │   │       └── Function
 //! │   │           ├── id
-//! │   │           └── FunctionCall { name, arguments }
+//! │   │           └── function
+//! │   │               ├── name
+//! │   │               └── arguments
 //! │   └── Tool
 //! │       ├── tool_call_id ───────────────► ToolCall.id
 //! │       ├── content
-//! │       └── name?
-//! ├── tools: Vec<Tool>
+//! │       └── name: Option
+//! ├── store: Option
+//! ├── tools: Vec
 //! │   └── Function
-//! │       └── FunctionDefinition { name, description?, parameters }
-//! │                              ▲
-//! │                              └──── FunctionCall.name selects one
-//! ├── tool_choice
-//! ├── stream / stream_options
-//! ├── store / reasoning_effort
-//! └── generation options
+//! │       └── function
+//! │           ├── name ◄──────────── FunctionCall.name selects one
+//! │           ├── description: Option
+//! │           ├── parameters
+//! │           └── strict: Option
+//! ├── tool_choice: Option
+//! ├── stream
+//! ├── stream_options: Option
+//! ├── max_completion_tokens: Option
+//! ├── temperature: Option
+//! ├── top_k: Option
+//! ├── top_p: Option
+//! ├── seed: Option
+//! ├── reasoning_effort: Option
+//! └── enable_thinking: Option
 //! ```
 //!
 //! `Tool::Function` defines one callable function. `ToolCall::Function`
@@ -70,21 +83,26 @@
 //!
 //! ```text
 //! ResponseChunk
-//! ├── id / object / created / model
-//! ├── choices: Vec<Choice>
-//! │   └── Choice
+//! ├── id
+//! ├── object
+//! ├── created
+//! ├── model
+//! ├── choices: Vec
+//! │   └── ResponseChunkChoice
 //! │       ├── index
-//! │       ├── delta: Delta
-//! │       │   ├── role?
-//! │       │   ├── content?
-//! │       │   ├── reasoning_content?
-//! │       │   └── tool_calls: Vec<ToolCallDelta>?
+//! │       ├── delta
+//! │       │   ├── role: Option
+//! │       │   ├── content: Option
+//! │       │   ├── reasoning_content: Option
+//! │       │   └── tool_calls: Option<Vec>
 //! │       │       └── FunctionCallDelta { name, arguments }
-//! │       └── finish_reason?
-//! └── usage?
-//!     └── prompt_tokens / completion_tokens / total_tokens
+//! │       └── finish_reason: Option
+//! └── usage: Option
+//!     ├── prompt_tokens
+//!     ├── completion_tokens
+//!     └── total_tokens
 //!
-//! role chunk → content/tool-call chunks → finish chunk → usage chunk? → [DONE]
+//! role chunk → content/tool-call chunks → finish chunk → optional usage chunk → [DONE]
 //! ```
 
 use axum::Json;
@@ -115,7 +133,7 @@ pub async fn handle<const N: usize, const L: usize, const P: usize>(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
-    let model = request.model.clone();
+    let model = request.model.clone().unwrap_or_else(|| server.model_name.to_string());
     let (request, prompt_tokens, tool_ids, enable_thinking) = preprocess(request, &server.qwen_codec)?;
     let response = server.inference.decode(request).map_err(map_error)?;
     let metadata = ResponseMetadata::new(response.request_id(), model, prompt_tokens);

@@ -28,7 +28,7 @@ const DEFAULT_MAX_COMPLETION_TOKENS: usize = 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
-    pub model: String,
+    pub model: Option<String>,
     messages: Vec<Message>,
     store: Option<bool>,
     #[serde(default)]
@@ -142,7 +142,7 @@ pub fn preprocess(
     request: Request,
     qwen_codec: &QwenCodec,
 ) -> Result<(DecodeRequest, usize, Vec<ToolID>, bool), HTTPError> {
-    if request.model.is_empty() {
+    if request.model.as_ref().is_some_and(String::is_empty) {
         return Err(invalid_request("model must not be empty"));
     }
     if request.store == Some(true) {

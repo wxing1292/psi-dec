@@ -157,10 +157,10 @@ The inference server does not own these controls:
 The service provides a target-only Qwen3 binary. It also provides Qwen3.5 binaries that retain their names for current
 Qwen3.6 MLX checkpoints:
 
-| Model | Binary | Target checkpoint | Optional speculator checkpoint |
-| --- | --- | --- | --- |
-| Qwen3 dense 14B | `qwen3` | `mlx-community/Qwen3-14B-4bit` | None |
-| Qwen3.6 dense 27B | `qwen3_5_dense` | `mlx-community/Qwen3.6-27B-4bit` | `mlx-community/Qwen3.6-27B-MTP-4bit` |
+| Model                  | Binary           | Target checkpoint                    | Optional speculator checkpoint           |
+| ---------------------- | ---------------- | ------------------------------------ | ---------------------------------------- |
+| Qwen3 dense 14B        | `qwen3`          | `mlx-community/Qwen3-14B-4bit`       | None                                     |
+| Qwen3.6 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.6-27B-4bit`     | `mlx-community/Qwen3.6-27B-MTP-4bit`     |
 | Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | `mlx-community/Qwen3.6-35B-A3B-MTP-4bit` |
 
 Download with the Hugging Face CLI:
@@ -196,7 +196,7 @@ The repository retains the converter and component tests for future integration 
 Qwen3 target-only startup:
 
 ```sh
-cargo run --release -p inference-runtime-service --bin qwen3 -- \
+cargo run --release --bin qwen3 -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3-14B-4bit"
@@ -210,7 +210,7 @@ Qwen3.5 startup with MTP enabled:
 Dense:
 
 ```sh
-cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
+cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
@@ -221,7 +221,7 @@ cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
 Sparse:
 
 ```sh
-cargo run --release -p inference-runtime-service --bin qwen3_5_sparse -- \
+cargo run --release --bin qwen3_5_sparse -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
@@ -290,7 +290,7 @@ means that the stream failed.
 The external diagnostic client remains a gRPC client:
 
 ```sh
-cargo run --release -p inference-runtime-service --bin decode -- \
+cargo run --release --bin decode -- \
   --server-url http://127.0.0.1:50061 \
   --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
   --top-k 64 \
@@ -319,6 +319,82 @@ explicit diagnostic bypass.
 ## HTTP Chat Completions
 
 The HTTP listener runs with gRPC. It provides the OpenAI-compatible `POST /v1/chat/completions` route.
+
+### Matched gRPC and HTTP tests
+
+The following command pairs use the same prompt, output limit, sampling values, seed, and thinking mode.
+The HTTP `model` field is optional.
+When the request omits it, the response uses the loaded executor model name.
+When the request provides it, the value labels the response.
+It does not select a different target.
+
+Use this gRPC command for a Qwen3 server:
+
+```sh
+cargo run --release --bin decode -- \
+  --server-url http://127.0.0.1:50061 \
+  --hf-model-dir "$PWD/models/Qwen3-14B-4bit" \
+  --chat-template auto \
+  --disable-thinking \
+  --prompt-str "Reply with exactly: hello" \
+  --max-sampled-tokens 16 \
+  --temperature 0 \
+  --top-k 1 \
+  --top-p 1 \
+  --seed 1
+```
+
+Use this equivalent HTTP command:
+
+```sh
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Reply with exactly: hello"}],
+    "max_completion_tokens": 16,
+    "temperature": 0,
+    "top_k": 1,
+    "top_p": 1,
+    "seed": 1,
+    "enable_thinking": false
+  }'
+```
+
+Use this gRPC command for a Qwen3.5/Qwen3.6 dense server:
+
+```sh
+cargo run --release --bin decode -- \
+  --server-url http://127.0.0.1:50061 \
+  --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
+  --chat-template auto \
+  --disable-thinking \
+  --prompt-str "Reply with exactly: hello" \
+  --max-sampled-tokens 16 \
+  --temperature 0 \
+  --top-k 1 \
+  --top-p 1 \
+  --seed 1
+```
+
+Use this equivalent HTTP command:
+
+```sh
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Reply with exactly: hello"}],
+    "max_completion_tokens": 16,
+    "temperature": 0,
+    "top_k": 1,
+    "top_p": 1,
+    "seed": 1,
+    "enable_thinking": false
+  }'
+```
+
+For the sparse Qwen3.5/Qwen3.6 server, use `"$PWD/models/Qwen3.6-35B-A3B-4bit"`.
+
+### Response modes
 
 Omit `stream` or set it to `false` to return one collected response:
 
@@ -480,7 +556,18 @@ Investigate cold-start stalls separately from later decode stalls.
 
 ## End-to-end performance helper
 
-The checked-in helper runs controlled 27B/35B, MTP-off/on comparisons:
+The Qwen3 helper runs target-only decode measurements:
+
+```sh
+PSI_DEC_QWEN3_MODEL_DIR=<qwen3-model-dir> \
+scripts/qwen3_e2e_decode_perf.sh --runs 7
+```
+
+The helper uses the model directory for tokenization by default.
+Set `PSI_DEC_QWEN3_TOKENIZER_DIR` or use `--tokenizer` to select a different directory.
+Use `--tokens` to select the comma-separated output-token counts.
+
+The Qwen3.5/3.6 helper runs controlled 27B/35B, MTP-off/on comparisons:
 
 ```sh
 PSI_DEC_QWEN_TOKENIZER_DIR=<tokenizer-model-dir> \
@@ -491,17 +578,23 @@ PSI_DEC_QWEN_35B_MTP_DIR=<35b-mtp-model-dir> \
 scripts/qwen35_e2e_decode_perf.sh --runs 7
 ```
 
-The helper prints these facts:
+Both helpers print these facts:
 
 - Commit and dirty state
 - Model directories
 - Machine and operating system
 - Cache and runtime request capacity
 - Scheduler capacities
-- Cooldown and seed
+- Sampling configuration and seed
 - Trajectory fields
 
-The checked-in M3 Max baseline was recorded on 2026-07-21 at `132c5073`. It used these settings:
+The Qwen3.5/3.6 helper also prints cooldown and speculative-acceptance fields.
+
+The Qwen3 helper does not contain a checked-in performance baseline.
+
+The Qwen3.5/3.6 helper contains an M3 Max baseline.
+The baseline was recorded on 2026-07-21 at `132c5073`.
+It used these settings:
 
 - 384K pages
 - 2048-token cache blocks

@@ -298,6 +298,7 @@ where
     let shutdown = Shutdown::new();
     let server_tokio_runtime = tokio::runtime::Runtime::new()
         .map_err(|error| log_err_unavailable!("unable to initialize RPC async runtime: {error}"))?;
+    let model_name = model.model_name().to_string();
     let default_stop_sequences = model.default_stop_sequences();
     let runtime = Arc::new(InferenceRuntime::<N, L, NUM_TRIE_PARTITION>::new(
         model_runtime_config,
@@ -314,6 +315,7 @@ where
             server_tokio_runtime.block_on(rpc::run(
                 grpc_listen_addr,
                 http_listen_addr,
+                model_name,
                 qwen_codec,
                 inference,
                 server_shutdown,
