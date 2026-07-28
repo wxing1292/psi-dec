@@ -20,6 +20,11 @@ path = "benches/qwen35/gqa.rs"
 harness = false
 
 [[bench]]
+name = "qwen3_gqa"
+path = "benches/qwen3/gqa.rs"
+harness = false
+
+[[bench]]
 name = "qwen35_gdn"
 path = "benches/qwen35/gdn.rs"
 harness = false

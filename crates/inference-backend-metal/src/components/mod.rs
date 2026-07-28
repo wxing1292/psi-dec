@@ -132,6 +132,12 @@ pub use gqa_projection::GQAProjectionSplitConfig;
 pub use gqa_projection::GQAProjectionSplitKernel;
 pub use gqa_projection::GQAProjectionSplitShape;
 
+mod ungated_gqa_projection;
+pub use ungated_gqa_projection::UngatedGQAProjectionSplitBuffers;
+pub use ungated_gqa_projection::UngatedGQAProjectionSplitConfig;
+pub use ungated_gqa_projection::UngatedGQAProjectionSplitKernel;
+pub use ungated_gqa_projection::UngatedGQAProjectionSplitShape;
+
 mod gqa_kv_pages;
 pub use gqa_kv_pages::GQAKVPageUpdate;
 pub use gqa_kv_pages::GQAKVPageUpdateBuffers;

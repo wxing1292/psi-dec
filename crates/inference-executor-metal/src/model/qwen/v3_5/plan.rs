@@ -1,6 +1,7 @@
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GQACore;
+use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::moe::GatedMoECore;
@@ -235,7 +236,7 @@ pub struct Qwen35DSparkLayerPlan {
     pub dspark_layer_index: usize,
     pub input_layernorm_eps: f32,
     pub post_attention_layernorm_eps: f32,
-    pub attention_core: GQACore,
+    pub attention_core: UngatedGQACore,
     pub attention_metal: GQAMetalConfig,
     pub mlp_core: DenseMLPCore,
     pub mlp_metal: DenseMLPMetalConfig,
@@ -326,7 +327,7 @@ pub fn build_qwen35_dspark_plan(
 
     let mut layers = Vec::with_capacity(dspark_config.num_layers);
     for dspark_layer_index in 0..dspark_config.num_layers {
-        let attention_core = GQACore::new(
+        let attention_core = UngatedGQACore::new(
             dspark_layer_index,
             dspark_config.hidden_size,
             dspark_config.head_dim,
@@ -351,7 +352,7 @@ pub fn build_qwen35_dspark_plan(
             dtype: metal_defaults.hidden_dtype,
         };
         attention_metal.validate();
-        assert!(attention_metal.num_tokens_per_page(&attention_core) > 0);
+        assert!(attention_metal.num_ungated_tokens_per_page(&attention_core) > 0);
 
         let mlp_core = DenseMLPCore {
             model_layer_index: dspark_layer_index,

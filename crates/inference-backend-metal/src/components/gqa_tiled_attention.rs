@@ -65,17 +65,17 @@ impl GQATiledSDPAShape {
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         assert!(self.q_head_tile_size > 0);
         assert!(self.q_head_tile_size <= self.q_heads_per_kv_head());
-        assert_eq!(self.head_dim, 256, "tiled GQA specializes head_dim=256");
+        let tiled_profile = (self.head_dim, self.num_tokens_per_page());
+        assert!(
+            matches!(tiled_profile, (128, 8) | (256, 16)),
+            "tiled GQA supports only (head_dim, tokens_per_page) profiles (128, 8) and (256, 16), got \
+             {tiled_profile:?}"
+        );
         assert!(matches!(self.q_token_tile_size, 8 | 16));
         assert!(matches!(self.kv_token_tile_size, 8 | 16));
         assert!(self.num_threads_per_threadblock() <= 256);
         assert!(self.scale > 0.0);
         assert_eq!(self.dtype, Dtype::Bfloat16, "tiled GQA specializes bf16");
-        assert_eq!(
-            self.num_tokens_per_page(),
-            16,
-            "tiled GQA specializes 16 tokens per page"
-        );
         self.page_table_layout.validate();
         assert!(self.gqa_layer_index < self.page_table_layout.num_gqa_layers);
         assert_u32_count_domain(self.num_head_groups(), "GQA tiled SDPA head groups");
@@ -384,6 +384,17 @@ mod tests {
     use crate::metal::Dtype;
 
     #[test]
+    fn test_shape_accepts_qwen3_profile() {
+        tiled_shape(128, 8).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "tiled GQA supports only")]
+    fn test_shape_rejects_unsupported_profile() {
+        tiled_shape(192, 8).validate();
+    }
+
+    #[test]
     #[should_panic(expected = "GQA tiled SDPA Q-token-tile metadata exceeds the shader u32 element-index domain")]
     fn test_shape_rejects_shader_index_overflow() {
         GQATiledSDPAShape {
@@ -408,5 +419,29 @@ mod tests {
             gqa_layer_index: 0,
         }
         .validate();
+    }
+
+    fn tiled_shape(head_dim: u32, num_tokens_per_page: u32) -> GQATiledSDPAShape {
+        GQATiledSDPAShape {
+            num_tokens: 8,
+            num_q_token_tiles: 1,
+            total_sdpa_map_task_templates: 1,
+            num_q_heads: 5,
+            num_kv_heads: 1,
+            head_dim,
+            q_head_tile_size: 5,
+            q_token_tile_size: 8,
+            kv_token_tile_size: 16,
+            scale: 1.0,
+            page_bytes: 2 * num_tokens_per_page * head_dim * 2,
+            dtype: Dtype::Bfloat16,
+            page_table_layout: GQAPageTableLayout {
+                num_req_slots: 1,
+                num_gqa_layers: 1,
+                num_blocks: 1,
+                num_page_ids_per_block: 1,
+            },
+            gqa_layer_index: 0,
+        }
     }
 }

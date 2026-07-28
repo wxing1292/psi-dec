@@ -6,6 +6,40 @@ use clap::Parser;
 use clap::ValueEnum;
 
 #[derive(Debug, Parser)]
+pub struct Qwen3Args {
+    #[arg(long, default_value = "127.0.0.1:50051")]
+    pub grpc_listen_addr: SocketAddr,
+
+    #[arg(long, default_value = "127.0.0.1:8000")]
+    pub http_listen_addr: SocketAddr,
+
+    #[arg(long, value_name = "DIR")]
+    pub hf_model_dir: PathBuf,
+
+    #[arg(long, value_enum)]
+    pub profile: Option<QwenProfileMode>,
+
+    #[arg(long, value_enum, default_value_t = QwenLogLevel::Info)]
+    pub logging: QwenLogLevel,
+
+    #[arg(long, help = "Total physical pages used by the Qwen3 GQA KV cache")]
+    pub num_cache_pages: Option<NonZeroUsize>,
+
+    #[arg(long, default_value = "4", help = "Maximum requests scheduled per batch")]
+    pub max_requests: NonZeroUsize,
+
+    #[arg(long, default_value = "128", help = "Maximum flattened tokens scheduled per batch")]
+    pub max_tokens: NonZeroUsize,
+
+    #[arg(
+        long,
+        default_value = "64",
+        help = "Maximum tokens from one request in one forward transaction"
+    )]
+    pub max_tokens_per_request: NonZeroUsize,
+}
+
+#[derive(Debug, Parser)]
 pub struct Qwen35Args {
     #[arg(long, default_value = "127.0.0.1:50051")]
     pub grpc_listen_addr: SocketAddr,
@@ -64,6 +98,7 @@ pub enum QwenLogLevel {
 mod tests {
     use clap::Parser;
 
+    use super::Qwen3Args;
     use super::Qwen35Args;
 
     #[test]
@@ -73,6 +108,18 @@ mod tests {
         assert_eq!(args.max_requests.get(), 4);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
+    }
+
+    #[test]
+    fn test_qwen3_defaults() {
+        let args = Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model"]).unwrap();
+
+        assert_eq!(args.grpc_listen_addr, "127.0.0.1:50051".parse().unwrap());
+        assert_eq!(args.http_listen_addr, "127.0.0.1:8000".parse().unwrap());
+        assert_eq!(args.max_requests.get(), 4);
+        assert_eq!(args.max_tokens.get(), 128);
+        assert_eq!(args.max_tokens_per_request.get(), 64);
+        assert_eq!(args.num_cache_pages, None);
     }
 
     #[test]
@@ -86,6 +133,10 @@ mod tests {
             assert!(
                 Qwen35Args::try_parse_from(["qwen3.5", "--hf-model-dir", "model", flag, "0"]).is_err(),
                 "{flag} must reject zero"
+            );
+            assert!(
+                Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", flag, "0"]).is_err(),
+                "{flag} must reject zero for Qwen3"
             );
         }
     }

@@ -77,9 +77,6 @@ impl GQARequestPageTable {
                 self.num_page_ids_per_block(),
                 "GQA request page table",
             );
-            if !has_synced_pages(&page_ids_by_layer) {
-                continue;
-            }
             for (layer_index, page_ids_by_block) in page_ids_by_layer.iter().enumerate() {
                 for (block_offset, page_ids) in page_ids_by_block.iter().enumerate() {
                     assert!(
@@ -159,12 +156,6 @@ impl GQARequestPageTable {
             .and_then(|index| index.checked_mul(self.num_page_ids_per_block()))
             .expect("GQA request page-table flat index must fit usize")
     }
-}
-
-fn has_synced_pages(page_ids_by_layer: &[Vec<Vec<u32>>]) -> bool {
-    page_ids_by_layer
-        .iter()
-        .any(|page_ids_by_block| !page_ids_by_block.is_empty())
 }
 
 #[cfg(test)]

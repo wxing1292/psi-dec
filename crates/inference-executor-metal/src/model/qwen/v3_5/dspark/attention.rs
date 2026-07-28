@@ -1,6 +1,6 @@
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::operators::AffineQuantizedMatmulShape;
-use inference_executor_core::attn::GQACore;
+use inference_executor_core::attn::UngatedGQACore;
 
 use crate::model::qwen::v3_5::plan::Qwen35DSparkLayerPlan;
 
@@ -29,7 +29,7 @@ impl Qwen35DSparkQKVLayout {
         )
     }
 
-    pub fn new(core: &GQACore, group_size: u32, bits: u32, dtype: Dtype) -> Self {
+    pub fn new(core: &UngatedGQACore, group_size: u32, bits: u32, dtype: Dtype) -> Self {
         core.validate();
         assert_eq!(dtype, Dtype::Bfloat16, "DSpark attention requires BF16 affine storage");
         let layout = Self {
@@ -121,20 +121,18 @@ fn to_u32(name: &str, value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use inference_executor_core::attn::GQACore;
+    use inference_executor_core::attn::UngatedGQACore;
 
     use super::*;
 
     #[test]
-    fn qkv_layout_excludes_qwen35_activation_gate_and_offsets_kv_rows() {
-        let core = GQACore::new(0, 5120, 128, 40, 8, 128.0_f32.sqrt().recip());
+    fn qkv_layout_offsets_kv_rows() {
+        let core = UngatedGQACore::new(0, 5120, 128, 40, 8, 128.0_f32.sqrt().recip());
         let layout = Qwen35DSparkQKVLayout::new(&core, 64, 4, Dtype::Bfloat16);
         assert_eq!(layout.q_dim(), 5120);
         assert_eq!(layout.k_dim(), 1024);
         assert_eq!(layout.v_dim(), 1024);
         assert_eq!(layout.qkv_dim(), 7168);
-        assert_eq!(core.qgkv_dim(), 12_288);
-
         let q = layout.shape(1, layout.q_dim());
         let k = layout.k_shape(1);
         assert_eq!(layout.k_weight_offset_bytes(), q.weight_bytes());

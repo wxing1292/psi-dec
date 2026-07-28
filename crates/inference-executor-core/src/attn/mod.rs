@@ -8,3 +8,4 @@ pub mod gqa;
 pub use gqa::GQACore;
 pub use gqa::GQAPageTableLayout;
 pub use gqa::GQAReplayShape;
+pub use gqa::UngatedGQACore;

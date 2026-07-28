@@ -253,7 +253,7 @@ impl Qwen35DSparkContextAppender {
 
 #[cfg(test)]
 mod tests {
-    use inference_executor_core::attn::GQACore;
+    use inference_executor_core::attn::UngatedGQACore;
     use inference_executor_core::mlp::dense::DenseMLPCore;
 
     use super::*;
@@ -280,7 +280,7 @@ mod tests {
             dspark_layer_index,
             input_layernorm_eps: 1e-6,
             post_attention_layernorm_eps: 1e-6,
-            attention_core: GQACore::new(dspark_layer_index, 5120, 128, 40, 8, 128.0_f32.sqrt().recip()),
+            attention_core: UngatedGQACore::new(dspark_layer_index, 5120, 128, 40, 8, 128.0_f32.sqrt().recip()),
             attention_metal: GQAMetalConfig {
                 group_size: 64,
                 bits: 4,

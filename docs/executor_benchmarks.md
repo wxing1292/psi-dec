@@ -44,7 +44,7 @@ embedding  unembedding  norm
 `sampling_rejection` is the backend custom-CLI target. Model-executor targets:
 
 ```text
-qwen35_dense_mlp  qwen35_moe  qwen35_gqa  qwen35_gdn
+qwen3_gqa         qwen35_dense_mlp  qwen35_moe  qwen35_gqa  qwen35_gdn
 qwen35_embed      qwen35_layers  qwen35_output
 qwen35_sampling   qwen35_executor
 ```
@@ -56,6 +56,8 @@ All real-weight targets except `qwen35_sampling` require `--model-dir`. They sha
 
 - `qwen35_gqa` selects `--gqa-model 27b|35b`, accepts `single_q_token`/`tiled_q_tokens` paths, and can run an explicit
   untimed `--validate-tiled-q-tokens` comparison.
+- `qwen3_gqa` loads real Qwen3 ungated-GQA weights, measures full replay and SDPA-only paths, exposes the static tile
+  geometry as CLI arguments, and can validate single-Q against tiled output.
 - `qwen35_gdn` measures the current ragged recurrent GDN path with the 35B-A3B profile.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer4`, `first4`, or `main_all`.
@@ -66,6 +68,10 @@ All real-weight targets except `qwen35_sampling` require `--model-dir`. They sha
 Representative smoke commands:
 
 ```text
+cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
+  --model-dir <qwen3-model-dir> --tokens-per-req 16 --contexts 128 \
+  --iters 1 --warmup-iters 0 --runs 1 --validate
+
 cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b --tokens 1 \
   --contexts 0 --num-reqs 1 --gqa-paths single_q_token \

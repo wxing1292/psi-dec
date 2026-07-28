@@ -3,6 +3,7 @@ use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
 
+pub const QWEN3_DEFAULT_NUM_CACHE_PAGES: usize = 40 * 1024;
 pub const QWEN35_DEFAULT_NUM_CACHE_PAGES: usize = 384 * 1024;
 
 pub fn kv_dtype_bytes(dtype: Option<&str>) -> Result<usize> {
@@ -43,6 +44,7 @@ pub fn block_cache_capacity(
 mod tests {
     use inference_runtime_core::Error;
 
+    use super::QWEN3_DEFAULT_NUM_CACHE_PAGES;
     use super::block_cache_capacity;
 
     #[test]
@@ -56,5 +58,10 @@ mod tests {
     #[test]
     fn test_block_capacity_counts_complete_blocks() {
         assert_eq!(block_cache_capacity(25, 7, 5).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_qwen3_default_cache_holds_512_complete_blocks() {
+        assert_eq!(block_cache_capacity(QWEN3_DEFAULT_NUM_CACHE_PAGES, 80, 0).unwrap(), 512);
     }
 }

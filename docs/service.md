@@ -117,18 +117,20 @@ environment, not the inference server.
 
 ## Binaries and checkpoints
 
-The implementation module retains Qwen3.5 binary names while serving current
-Qwen3.6 MLX checkpoints:
+The service exposes a target-only Qwen3 binary alongside the Qwen3.5 binaries,
+which retain their names while serving current Qwen3.6 MLX checkpoints:
 
-| Model | Binary | Target checkpoint | Optional MTP checkpoint |
+| Model | Binary | Target checkpoint | Optional speculator checkpoint |
 | --- | --- | --- | --- |
-| Dense 27B | `qwen3_5_dense` | `mlx-community/Qwen3.6-27B-4bit` | `mlx-community/Qwen3.6-27B-MTP-4bit` |
-| Sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | `mlx-community/Qwen3.6-35B-A3B-MTP-4bit` |
+| Qwen3 dense 14B | `qwen3` | `mlx-community/Qwen3-14B-4bit` | None |
+| Qwen3.6 dense 27B | `qwen3_5_dense` | `mlx-community/Qwen3.6-27B-4bit` | `mlx-community/Qwen3.6-27B-MTP-4bit` |
+| Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | `mlx-community/Qwen3.6-35B-A3B-MTP-4bit` |
 
 Download with the Hugging Face CLI:
 
 ```sh
 hf auth login
+hf download mlx-community/Qwen3-14B-4bit --local-dir models/Qwen3-14B-4bit
 hf download mlx-community/Qwen3.6-27B-4bit --local-dir models/Qwen3.6-27B-4bit
 hf download mlx-community/Qwen3.6-27B-MTP-4bit --local-dir models/Qwen3.6-27B-MTP-4bit
 ```
@@ -153,7 +155,20 @@ is intentionally absent: there is no `--hf-dspark-model-dir` option and
 converted weights cannot be selected by the current Qwen3.5 server. The
 retained converter and component tests are for future integration work.
 
-Example startup (MTP enabled):
+Qwen3 target-only startup:
+
+```sh
+cargo run --release -p inference-runtime-service --bin qwen3 -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3-14B-4bit"
+```
+
+Qwen3 does not expose MTP or DSpark options yet. Its executor obtains stop
+tokens from the checkpoint configuration when a separate
+`generation_config.json` is absent.
+
+Qwen3.5 startup with MTP enabled:
 
 Dense:
 
@@ -185,12 +200,21 @@ runtime stops, a listener fails, or SIGINT/SIGTERM arrives.
 `--hf-mtp-model-dir` is present and otherwise defaults to `0`; selecting `1`
 requires that directory. Explicit `--mtp-module 0` is useful for controlled
 target-only tests and ignores an optional MTP directory. Qwen uses 32 KiB
-physical cache pages and defaults to 384K shared pages; performance comparisons
-should pass `--num-cache-pages` explicitly so memory pressure is controlled.
-The service defaults to 32 queued requests and 8 running request slots. Queued
-requests do not consume executor request-slot state. Admission assigns a slot
-before entering the scheduler; the default scheduler remains limited to 4
-requests, 128 flattened tokens, and 64 tokens per request in one batch.
+physical cache pages. Qwen3 defaults to 40,960 pages; the Qwen3-14B geometry
+stores eight tokens in one physical page. Its 16-token logical cache block
+therefore consumes 80 pages across 40 layers, so the default holds 512 blocks
+or 8,192 resident tokens in aggregate. Longer resident contexts require an
+explicit larger page budget. Qwen3.5 retains 2,048-token logical blocks to
+amortize its GDN snapshots and defaults to 384K shared pages. At startup, each service
+derives the pages required by one block from the initialized executor and
+rejects `--num-cache-pages` with that dynamic minimum when even one complete
+block would not fit. Performance comparisons should pass `--num-cache-pages`
+explicitly so memory pressure is controlled. The services default to 32 queued
+requests and 8 running request slots. Queued requests do not consume executor
+request-slot state. Admission assigns a slot before entering the scheduler;
+`--max-requests` cannot exceed the executor's eight slots. The default
+scheduler remains limited to 4 requests, 128 flattened tokens, and 64 tokens
+per request in one batch.
 
 ## gRPC decode
 

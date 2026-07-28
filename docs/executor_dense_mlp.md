@@ -18,19 +18,20 @@ crates/inference-executor-metal/src/mlp/dense/
   backend.rs   DenseMLPMetalConfig + DenseMLP
   scratch.rs   reusable dense MLP scratch allocation owner and borrowed replay bindings
 
-crates/inference-executor-metal/src/model/qwen/v3_x/layer/
-  dense_mlp.rs Qwen3xDenseMLP, private checkpoint weights, load, and record
-
-crates/inference-executor-metal/src/model/qwen/v3_5/
-  main/layer.rs Qwen3.5 Main dense-MLP/MoE layer variants
-  mtp/layer.rs  Qwen3.5 MTP dense-MLP/MoE layer variants
+crates/inference-executor-metal/src/model/qwen/
+  v3_x/layer/dense_mlp.rs  Qwen3xDenseMLP, private checkpoint weights, load, and record
+  v3/main/layer.rs         fixed Qwen3 Main GQA + dense-MLP layer composition
+  v3/main/plan.rs          Qwen3 Main dense-MLP geometry/config builder
+  v3_5/main/layer.rs       Qwen3.5 Main dense-MLP/MoE layer variants
+  v3_5/mtp/layer.rs        Qwen3.5 MTP dense-MLP/MoE layer variants
+  v3_5/plan.rs             Qwen3.5 dense-MLP geometry/config builder and DSpark plan
 
 crates/inference-executor-core/src/def/
   DenseLinearShape
   SparseLinearShape
 
 crates/inference-executor-metal/src/def/
-  ReplayLayer
+  ReplayLayer              typed semantic replay input/output and record contract
 crates/inference-executor-core/src/backend/
   Recorder
 ```
@@ -98,9 +99,10 @@ group size, bit width, and dtype.
 Qwen model replay keeps dense MLP scratch in one model-owned `DenseMLPScratch`. Its `bindings()` method exposes borrowed
 `DenseMLPScratchBindings` to replay recording. Main and MTP execution is serialized on the model stream, so `gate_up` and
 activation scratch are reusable across layers. Per-layer output buffers and immutable weights remain owned directly by
-the `Qwen3xDenseMLP` leaf inside `Qwen35MainLayer` or `Qwen35MTPLayer`; there is no separate production layer-weight
-bundle. Qwen validates scratch
-layout compatibility across every Main and optional MTP dense layer at init.
+the shared `Qwen3xDenseMLP` leaf. `Qwen3MainLayer` and the dense variants of `Qwen35MainLayer` and `Qwen35MTPLayer`
+compose that leaf inside their separate role-specific layer and scratch types. Their model-specific typed binding trees
+contain `Qwen3xDenseMLPWeightBindings` at the leaf boundary. Qwen validates scratch layout compatibility across every
+Main and optional MTP dense layer at init.
 
 ## Data flow and backend stages
 

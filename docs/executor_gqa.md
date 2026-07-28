@@ -10,7 +10,8 @@ crates/inference-executor-core/src/attn/
   mod.rs                    MLX-free attention module exports
   gqa/
     mod.rs                  GQA module root
-    core.rs                 GQACore metadata, projection shapes, and GQAReplayShape
+    core.rs                 gated QGKV GQACore metadata and projection shapes
+    ungated_core.rs         ungated QKV UngatedGQACore metadata and projection shapes
     reference.rs            CPU projected-GQA correctness oracle
 
 crates/inference-executor-metal/src/attn/
@@ -18,27 +19,36 @@ crates/inference-executor-metal/src/attn/
   gqa/
     mod.rs                  GQA Metal module root
     batch_metadata.rs       state-domain-owned, capacity-sized GPU metadata updated per microbatch
-    backend.rs              executor-owned Metal replay wiring
-    scratch.rs              reusable GQA scratch allocation owner and borrowed replay bindings
+    backend.rs              gated QGKV Metal replay wiring
+    scratch.rs              gated QGKV scratch allocation and borrowed replay bindings
+    ungated_backend.rs      ungated QKV Metal replay wiring
+    ungated_scratch.rs      ungated QKV scratch allocation and borrowed replay bindings
     request_page_table.rs   per-request, per-layer KV page table for runtime-supplied page IDs
 
-crates/inference-executor-metal/src/model/qwen/v3_x/
-  layer/gqa.rs              Qwen3xGQA, private checkpoint weights, load, and record
-  state/gqa.rs              Qwen3xGQAState page/metadata/reset lifecycle grouping
-
-crates/inference-executor-metal/src/model/qwen/v3_5/
-  main/layer.rs             Qwen3.5 Main QGKV-GQA/GDN layer variants
-  mtp/layer.rs              Qwen3.5 MTP GQA layer composition
+crates/inference-executor-metal/src/model/qwen/
+  v3_x/
+    layer/gqa.rs            Qwen3xGQA, private checkpoint weights, load, and record
+    state/gqa.rs            Qwen3xGQAState page/metadata/reset lifecycle grouping
+  v3/
+    main/gqa.rs             Qwen3 Main ungated GQA weights, state, load, and record
+    main/layer.rs           fixed QKV Qwen3MainLayer composition
+    main/plan.rs            Qwen3 Main QKV GQA geometry/config builder
+  v3_5/
+    main/layer.rs           Qwen3.5 Main QGKV-GQA/GDN layer variants
+    mtp/layer.rs            Qwen3.5 MTP GQA layer composition
+    plan.rs                 Qwen3.5 QGKV GQA geometry/config builder and dSpark plan
 
 crates/inference-backend-metal/src/components/
   gqa_attention.rs          reusable Metal paged SDPA component kernels
   gqa_local_attention.rs    reusable dense bidirectional local-SDPA partial kernel
-  gqa_projection.rs         reusable Metal projection split component kernels
+  gqa_projection.rs         gated QGKV projection split component
+  ungated_gqa_projection.rs ungated QKV projection split component
   gqa_norm_rope.rs          reusable Metal q/k fused and single-input norm/RoPE component kernels
   gqa_kv_pages.rs           reusable Metal KV page update component kernels
   gqa_tiled_attention.rs    reusable token/Q-head tiled paged SDPA component
   metal/
-    gqa_projection_split.metal  Metal q/g/k/v projection split source
+    gqa_projection_split.metal  gated QGKV projection split source
+    ungated_gqa_projection_split.metal  ungated QKV projection split source
     gqa_norm_rope.metal         Metal q/k norm and RoPE source
     gqa_kv_pages.metal          Metal KV page-update source
     gqa_paged_sdpa_map.metal     Metal paged SDPA map source
@@ -68,7 +78,10 @@ num_q_heads / num_kv_heads
 attention scale
 ```
 
-The q/g/k/v widths are derived from the head counts and `head_dim`; they are not stored as duplicate core fields.
+`GQACore` is the gated contract: its fused projection is always QGKV and its replay always applies the trained
+attention-output gate. `UngatedGQACore` is the separate ungated contract: its fused projection is always QKV and it
+has no gate resources or gate recording step. Both derive query, key, and value widths from head counts and
+`head_dim`; neither uses a layout enum or gate flag.
 
 GQA tensor and tile comments use one symbolic convention:
 
@@ -89,19 +102,21 @@ matmul-like logical description `(q_token_tile_index, kv_head_index, q_head_tile
 
 Only `model_layer_index` is per layer. Qwen validates the remaining fields once and uses them through the shared backend.
 
-`Qwen3xGQAState` owns one shared `GQA` backend and `GQAScratch` for compatible invocations plus one
+Qwen3 Main owns `Qwen3MainGQAState`, `UngatedGQA`, and `UngatedGQAScratch`. Qwen3.5 owns
+`Qwen3xGQAState`, which holds one shared gated `GQA` backend and `GQAScratch` for compatible invocations plus one
 `Rc<GQARequestPageTable>` and reusable `GQAMetadataBuffers`. Each `Qwen3xGQA` layer component retains clones of the
-backend, scratch, and page-table handles together with its own weights and compact layer coordinate.
-`Qwen35MainLayer` and `Qwen35MTPLayer` compose that leaf inside separate role-specific owners. The backend owns
-the common head dimensions, Metal tuning, and compiled replay components; it records projection split, q/k norm+RoPE,
-KV page update, paged SDPA, activation gate, and output projection into the caller's `Recorder`.
+backend, scratch, and page-table handles together with its own weights and compact layer coordinate. Qwen3 Main instead
+uses its model-owned ungated leaf. `Qwen35MainLayer` and `Qwen35MTPLayer` continue to use the gated shared leaf inside
+their separate role-specific owners.
 
-The executor translates that stable core geometry and Metal tuning into generic backend configs at `GQA`
-construction. Projection split, Q norm+RoPE, K norm+RoPE, KV page update, and activation gate compile generated Metal
-source specialized for their immutable head dimensions, dtype, page geometry, and numeric constants. Their invocation
-shapes retain only replay-varying token counts plus, for KV update, the current layer/page-table coordinates. Q and K
-norm use separate configured kernels because their stable head counts differ. Source-hash caching shares identical
-component configs across models without putting Qwen names or Qwen config types in backend source or APIs.
+The gated and ungated executors share lower-level norm/RoPE, KV update, paged SDPA, and output-projection components,
+but their projection, scratch, weights, and replay graphs are concrete and separate. This keeps the existing gated
+QGKV command sequence free of mode checks while making absence of a gate structural in the ungated QKV path.
+
+Qwen3 Main constructs `UngatedGQACore` and `UngatedGQA`; Qwen3.5 Main/MTP construct `GQACore` and gated `GQA`.
+Qwen3.5 dSpark also uses `UngatedGQACore` for its separate QKV attention graph. Head dimensions, head counts, RoPE
+constants, and page geometry flow through init-time component specialization rather than a model-specific runtime
+branch.
 
 `GQARequestPageTable` stores executor-side request-slot KV page IDs between runtime reset/update
 notifications in a fixed-stride GPU buffer:
@@ -222,11 +237,11 @@ GQAPagedSDPAConfig              GQAPagedSDPAShape
 TaskTemplate may cover several consecutive KV-token tiles; `num_sdpa_map_task_templates` is rounded up to produce the
 total replay dispatch/scratch extent.
 
-The backend configuration is model-independent. Direct helpers in `model/qwen/v3_5/plan.rs` supply checkpoint
-geometry and measured `GQAMetalConfig` defaults; the generic backend converts those values into
-`GQAProjectionSplitConfig`, separate Q/K
-`GQANormRopeConfig`s, `GQAKVPageUpdateConfig`, `GQAPagedSDPAConfig`, and `GQAActivationGateConfig`. Backend source and
-APIs contain no Qwen model names or Qwen configuration types.
+The backend configuration is model-independent. `model/qwen/v3/main/plan.rs` builds Qwen3's ungated core;
+`model/qwen/v3_5/plan.rs` builds gated Main/MTP cores and ungated dSpark cores. Each concrete backend converts its
+core and `GQAMetalConfig` into a projection split plus the shared norm/RoPE, KV-update, paged-SDPA, and
+output-projection components. Only gated `GQA` constructs the activation-gate component. Backend source and APIs
+contain no Qwen model names or Qwen configuration types.
 
 ## Replay contract
 
@@ -291,6 +306,10 @@ tokens-per-physical-page and its GQA-layer count: 27B uses 4,096 GQA pages per
 logical block (16 layers × 2048/8) and 35B-A3B uses 1,280 (10 × 2048/16).
 The runtime trie and GDN state table use this same logical boundary.
 
+Qwen3 has no GDN snapshot boundary. Its service uses a 16-token logical cache
+block; Qwen3-14B stores eight tokens per 32 KiB physical page, so one logical
+block owns two pages per GQA layer, or 80 pages across all 40 layers.
+
 For Qwen3.5 model replay, `GQARequestPageTable::prepare(...)` validates and writes the current runtime page updates into
 the bound table. `GQA::prepare(...)` selects the SDPA path and builds the batch plan once; every GQA layer reuses it.
 `SingleQToken` replay always records partial-output reduction, including batches whose tokens each have one TaskTemplate.
@@ -334,29 +353,33 @@ visible context [0, N)
 `cu_sdpa_partial_outputs` selects the consecutive partials for each Q-token tile. Padded replay TaskTemplates use
 `q_token_tile_index = u32::MAX`; their threadblocks return without writing.
 
-The selector uses `SingleQToken` unless `TiledQTokens` supports the current shape (`bf16`, `D=256`, 16 KV tokens per
-physical page, and at most 8 Q heads per KV head). For supported shapes it uses the average useful tokens per request-local
-Q tile without floating-point division:
+The selector uses `SingleQToken` unless `TiledQTokens` supports the current shape. The explicit bf16 production profiles
+are `(D=128, 8 KV tokens/page)` and `(D=256, 16 KV tokens/page)`, both with at most 8 Q heads per KV head. The gated
+backend currently reaches only the `D=256` profile. For supported shapes the selector uses the average useful tokens per
+request-local Q tile without floating-point division:
 
 ```text
 num_tokens < 2 * num_q_token_tiles       -> SingleQToken
-num_tokens < 4 * num_q_token_tiles       -> TiledQTokens, roughly half the Q/KV group
+D=128 profile                            -> TiledQTokens, full Q/KV group
+D=256 and num_tokens < 4 * tiles         -> TiledQTokens, roughly half the Q/KV group
 otherwise                                -> TiledQTokens, full Q/KV group
 ```
 
-The Q-head tile is capped at 256 threads. Main and MTP use the same selector. Current reachable model paths are:
+The Q-head tile is capped at 256 threads. Current reachable model paths are:
 
 | Model | `Hq / Hkv / D` | KV tokens/page | Production path |
 | --- | --- | ---: | --- |
+| Qwen3-14B | `40 / 8 / 128` | 8 | selector above; tiled `Hq_tile=5` |
 | Qwen3.6-27B | `24 / 4 / 256` | 8 | `SingleQToken` |
 | Qwen3.6-35B-A3B | `16 / 2 / 256` | 16 | selector above |
-| DSpark | `head_dim=128` | model-derived | `SingleQToken` |
+| dSpark | `head_dim=128` | model-derived | custom `SingleQToken` composition |
 
 For 35B, `TiledQTokens` uses `Hq_tile=4` below four useful tokens/tile and `Hq_tile=8` otherwise.
 
 #### `SingleQToken`
 
-The current Qwen configuration uses `Tq_tile=1`, `Tkv_tile=256`, and 256 threads:
+`SingleQToken` always uses `Tq_tile=1`. Qwen3-14B specializes `Tkv_tile=128`, 128 threads, and `Hq_tile=5`; the Qwen3.5
+profiles retain `Tkv_tile=256`, 256 threads, and their model-derived Q-head tile:
 
 ```text
 one block owns
@@ -369,7 +392,7 @@ Q[q_token, Hq_tile, D]                 paged K/V
           |                                |
           +-- each thread scores K token --+
                            |
-             threadgroup logits[Hq_tile, 256]
+             threadgroup logits[Hq_tile, Tkv_tile]
              + block max/sum reduction
                            |
              each thread owns output dim d
@@ -380,29 +403,31 @@ Q[q_token, Hq_tile, D]                 paged K/V
         partial output[D] + max + sum per Q head
 ```
 
-With `D=256`, one active thread initially handles one KV token and later one output dimension. K/V are streamed from
-global memory; they are not staged as threadgroup tiles. Threadgroup storage is
-`logits[Hq_tile, 256]` plus `reduce_scratch[256]`, totaling 7 KiB for 27B (`Hq_tile=6`) and 9 KiB for 35B
-(`Hq_tile=8`). Running statistics and owned output dimensions are MSL thread-local values, which the compiler normally
-keeps in registers when possible.
+With Qwen3-14B's `D=128` and 128 threads, one thread owns one output dimension and the full five-head group stays in one
+map block. Its `logits[5, 128]` plus `reduce_scratch[128]` use 3 KiB of threadgroup memory. Reducing the head tile to four
+would require separate `4+1` head blocks; reducing the thread count to 64 would double the output accumulators held by
+each thread. The Qwen3.5 `D=256` profiles use one active thread per output dimension with 7 KiB for 27B
+(`Hq_tile=6`) and 9 KiB for 35B (`Hq_tile=8`). K/V are streamed from global memory rather than staged as threadgroup
+tiles. Running statistics and owned output dimensions are MSL thread-local values.
 
 #### `TiledQTokens`
 
-The current 35B geometry is:
+The common tiled geometry is:
 
 ```text
-Q tile:          [up to 8 Q tokens, Hq_tile Q heads, D=256]
-K/V tile:        [16 KV tokens, D=256] for one KV head
+Q tile:          [up to 8 Q tokens, Hq_tile Q heads, D]
+K/V tile:        [16 KV tokens, D] for one KV head
 grid:            (Hkv * ceil((Hq/Hkv) / Hq_tile), TaskTemplates, 1)
 threads/block:   (Tq_tile / 8) * Hq_tile * 32
 
+Qwen3-14B Hq_tile=5  -> 160 threads = 5 SIMD-groups
 Hq_tile=4  -> 128 threads = 4 SIMD-groups
 Hq_tile=8  -> 256 threads = 8 SIMD-groups
 ```
 
-One 32-lane SIMD-group owns one Q head and one eight-token fragment. Across 32 dimension fragments, its lanes
-collectively hold the eight `D=256` Q rows in MSL thread-local `q_fragments`; an incomplete request tail loads only
-active rows.
+One 32-lane SIMD-group owns one Q head and one eight-token fragment. Its lanes collectively hold the Q rows in MSL
+thread-local `q_fragments`; Qwen3-14B has 16 dimension fragments per thread and the `D=256` profiles have 32. An
+incomplete request tail loads only active rows.
 
 ```text
 thread-local Q fragments stay resident for the TaskTemplate
@@ -410,8 +435,7 @@ thread-local Q fragments stay resident for the TaskTemplate
 paged K/V -- 32 lanes x 16 B per row
                               |
                               v
-threadgroup K[16, 264] + V[16, 264] bf16
-       (256 values + 8-value padding per row)
+threadgroup K[16, D+8] + V[16, D+8] bf16
                               |
                  Q x K^T, causal mask
                  online-softmax update
@@ -426,8 +450,8 @@ threadgroup K[16, 264] + V[16, 264] bf16
 partial output[up to 8 tokens, Hq_tile, D] + statistics
 ```
 
-For each K or V row, every lane performs one contiguous 16-byte load, so 32 lanes collectively move the complete
-256-element bf16 row. The two threadgroup tiles occupy `2 * 16 * 264 * sizeof(bf16) = 16.5 KiB`. Q, scores, running
+For each K or V row, lanes perform contiguous 16-byte loads. The two threadgroup tiles occupy 8.5 KiB for Qwen3-14B
+(`2 * 16 * 136 * sizeof(bf16)`) and 16.5 KiB for `D=256` (`2 * 16 * 264 * sizeof(bf16)`). Q, scores, running
 statistics, and output fragments are MSL thread-local. The current kernel has one K workspace and one V workspace; it
 does not double-buffer consecutive K/V tiles.
 
@@ -437,11 +461,15 @@ Both paths reduce context-segment partials by rescaling them to one global maxim
 `TiledQTokens` always records its tiled reduce. Focused fixed, request-tail, multi-tile, and ragged cases compare both
 paths against the CPU reference.
 
-Qwen3.5 keeps reusable GQA scratch in `Qwen3xGQAState`, not in individual GQA layers. The executor owns one Main
-`GQAScratch`; the optional MTP owns one matching scratch because its GQA configuration may differ. `GQAScratch`
-owns reusable projection, norm/RoPE, SDPA, and output-gate buffers, and `GQAScratch::bindings()` exposes its borrowed
-replay bindings. Main and MTP execution are serialized on the model stream, so these buffers are reused across
-submissions without per-layer allocation. SDPA partial scratch is bounded by
+Qwen3.5 keeps reusable gated-GQA scratch in the directly owned `Qwen3xGQAState`, not in individual GQA layers. The
+executor owns one Main `GQAScratch`; the optional MTP owns one matching scratch because its GQA configuration may differ.
+This scratch contains the QGKV projection, projected gate, gated output, norm/RoPE, and SDPA buffers required by the
+fixed gated graph.
+
+Qwen3 Main instead owns `UngatedGQAScratch`. It contains the QKV projection, norm/RoPE, and SDPA buffers required by the
+fixed ungated graph and has no gate buffers. Both scratch types expose matching borrowed replay bindings. Main and MTP
+execution are serialized on the model stream, so their buffers are reused across submissions without per-layer
+allocation. SDPA partial scratch is bounded by
 `max_tokens * tiled_q_token_tile_size * num_q_heads`, independent
 of `max_position_embeddings`.
 
@@ -460,7 +488,7 @@ cu_sdpa_partial_outputs              cumulative partial-output counts selected p
 page_ids                             fixed-stride [req_slot, gqa_layer_index, block_index, page_id_index]
 kv_pages                             shared runtime-provided KV arena backing
 scratch                              caller-owned capacity buffers, used only up to current replay shape
-weights                              immutable qgkv, q/k norm, and output projection buffers
+weights                              immutable fused projection, q/k norm, and output projection buffers
 ```
 
 The KV arena is intentionally recorded as both write and read resource: KV update writes the current tokens, and paged SDPA
@@ -475,16 +503,30 @@ identifiers; this executor check enforces the runtime/executor ownership contrac
 
 ## Data flow and bindings
 
-GQA data flow is a single hidden-state stream plus side effects into the runtime-owned KV arena:
+Both GQA data flows are a single hidden-state stream plus side effects into the runtime-owned KV arena. The gated graph
+is:
 
 ```text
 hidden_state[num_tokens, hidden_dim]
-  -> qgkv projection
+  -> QGKV projection
   -> split q / gate / k / v
   -> q norm + RoPE, k norm + RoPE
   -> write current k/v tokens to KV pages
   -> paged SDPA map reads visible KV pages through the selected block lowering
   -> activation gate
+  -> output projection
+  -> next_hidden_state[num_tokens, hidden_dim]
+```
+
+The separate ungated graph is:
+
+```text
+hidden_state[num_tokens, hidden_dim]
+  -> QKV projection
+  -> split q / k / v
+  -> q norm + RoPE, k norm + RoPE
+  -> write current k/v tokens to KV pages
+  -> paged SDPA map reads visible KV pages through the selected block lowering
   -> output projection
   -> next_hidden_state[num_tokens, hidden_dim]
 ```
@@ -532,22 +574,23 @@ reduce(flat_token, q_head)
 
 Reduce uses per-partial-output max logits to combine exp sums and weighted outputs without materializing a dense context
 window. `SingleQToken` replay records this reduce even when each token has one TaskTemplate so replay topology is stable.
-The current configuration uses `kv_token_tile_size=256`,
-`num_threads_per_threadblock=256`, `q_head_tile_size <= 8`. Q heads are grouped by KV head; each map work item
-handles one KV head and a tile of Q heads that share that KV head.
+Qwen3-14B's `SingleQToken` configuration uses `kv_token_tile_size=128`,
+`num_threads_per_threadblock=128`, and `q_head_tile_size=5`. Qwen3.5 retains `kv_token_tile_size=256`,
+`num_threads_per_threadblock=256`, and `q_head_tile_size <= 8`. Q heads are grouped by KV head; each map work item handles
+one KV head and a tile of Q heads that share that KV head.
 
-Resource dependencies are explicit:
+The common resource dependencies are explicit:
 
 ```text
-qgkv projection writes projection scratch
-projection split reads projection scratch and writes q/g/k/v scratch
 q/k norm+RoPE reads q/k scratch and flat_token_indices, writes normalized q/k scratch
 KV update reads k/v scratch + flat token metadata + page IDs, writes KV pages
 SDPA map reads q scratch + KV pages + sdpa_map_task_templates + page IDs, writes SDPA scratch
 SDPA reduce reads SDPA scratch + cu_sdpa_partial_outputs, writes attention output
-activation gate reads attention output + gate scratch, writes gated attention
-output projection reads gated attention, writes next_hidden_state
 ```
+
+Gated `GQA` prefixes these stages with QGKV projection and split into q/g/k/v scratch, then suffixes them with the
+activation gate and an output projection from gated attention. `UngatedGQA` prefixes them with QKV projection and split
+into q/k/v scratch, then sends attention output directly to the output projection.
 
 Barriers are recorded only between stages with real dependencies. The model/layer boundary should not add an implicit
 every-command barrier around GQA; explicit component barriers and backend-inferred buffer hazards provide the internal
@@ -573,13 +616,22 @@ not benchmark or expose direct-submit component or forward wiring.
 Metal backend real full-forward replay bench lives in:
 
 ```text
+cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
+  --model-dir <qwen3-model-dir> --tokens-per-req 16 --contexts 0,128,1024 \
+  --iters 1 --warmup-iters 0 --runs 1
+
 cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b --tokens 1 \
   --contexts 0 --num-reqs 1 --gqa-paths single_q_token \
   --iters 1 --warmup-iters 0 --runs 1
 ```
 
-The bench uses CLI arguments, not environment variables. `--gqa-model 27b|35b` selects the real-weight layer profile;
+Both benches use CLI arguments, not environment variables. `qwen3_gqa` loads the Qwen3 model config and first-layer
+ungated weights, accepts explicit per-request token counts and context lengths, and reports both full replay and SDPA-only
+measurements. Its single-Q and tiled tile/thread arguments are configurable; `--validate` compares full single-Q and tiled
+outputs for a workload where production selects the tiled path and prints the derived threadgroup/register shape.
+
+For `qwen35_gqa`, `--gqa-model 27b|35b` selects the real-weight layer profile;
 the matching model directory is passed with `--model-dir`. For GQA, `--tokens` is the total current flat-token count,
 `--num-reqs` is the number of request segments in that microbatch, and `--contexts` is the existing context length for
 each request before its measured tokens. The bench distributes tokens as evenly as possible across requests and builds
@@ -610,18 +662,15 @@ request slot under-validates the page-table contract even if the kernel happens 
 
 Production Qwen KV cache dtype follows model config; Qwen3.6 bf16/default config creates bf16 KV pages. The paged KV writer stores projected K/V into those page-table pages.
 
-The Metal backend keeps GQA forward wiring out of `components/`: `GQA` composes projection,
-norm/RoPE, KV page update, paged SDPA, activation gate, and output projection building blocks into Metal replay/ICB
-paths. `ReplayLayer::record(...)` appends into a caller-owned whole-layer/model replay recorder; the
-focused tests and benches build replay programs from the same recorder path. The backend owns qmv/qmm affine projection kernels. Qwen
-model replay records GQA invocations keyed by true execution shape and binds one shared model-level `GQAScratch` so
-decode-step replay reuse follows the same specialization policy without multiplying scratch by layer count.
-`GQACore.scale` is part of the attention contract and is passed through to paged SDPA kernels; kernels
-must not silently substitute `1 / sqrt(head_dim)`.
+The Metal executor keeps forward wiring out of `components/`: gated `GQA` composes QGKV projection, gate, and the
+shared attention building blocks, while `UngatedGQA` composes the fixed QKV graph without gate resources.
+`ReplayLayer::record(...)` appends into a caller-owned whole-layer/model replay recorder; focused tests and benches
+build replay programs from the same recorder path. Each model state binds one shared scratch allocation for compatible
+layers so decode replay reuse does not multiply scratch by layer count.
+The core `scale` is part of both attention contracts and is passed through to paged SDPA kernels; kernels must not
+silently substitute `1 / sqrt(head_dim)`.
 
-Q and K norm/RoPE are recorded as one fused q/k command in the Metal backend. This preserves the true dependency
-shape `projection split -> q/k norm+RoPE` without adding a false q-rope-to-k-rope dependency in the ICB command stream.
-The single-input norm/RoPE invocation remains available as a focused component/test primitive.
+Q and K norm/RoPE use separately specialized commands because their stable head counts differ.
 
 GQA replay bugs usually reduce to these contracts: typed buffer offsets use typed indices; raw Metal buffer bindings use byte offsets,
 page/stride arithmetic needs 64-bit address math in Metal when multiplying large strides, resource usage marks must
