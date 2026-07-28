@@ -1,9 +1,11 @@
 # Qwen Executor
 
-This document describes the target-only Qwen3 Metal executor and the Qwen3.5/Qwen3.6 Metal executor from checkpoint
-configuration through top-down component loading, state preparation, cached replay, and sampling. Qwen3.5 additionally
-owns its single-module MTP path and the current dSpark component implementation. The `v3_x` directories contain only
-version-neutral leaf components and utilities; each model owns its structural contracts and execution graph.
+This document describes the current Qwen3 and Qwen3.5/Qwen3.6 Metal executors.
+The Qwen3 executor is target-only.
+The document covers checkpoint configuration, top-down loading, state preparation, cached replay, and sampling.
+Qwen3.5 also owns its single-module MTP path and retained DSpark components.
+The `v3_x` directories contain only version-neutral leaf components and utilities.
+Each model owns its structural contracts and execution graph.
 
 ## Source layout
 
@@ -88,18 +90,32 @@ crates/inference-executor-metal/src/sampling/
   spec_probs.rs             SpecProbsStore sparse draft/target probability workspace
 ```
 
-Runtime core owns scheduling, request lifecycle, physical page allocation/free, and page IDs. The executor owns
-model-specific interpretation of those IDs, trained tensors, backend state, replay caches, and submission ordering.
+Runtime core owns scheduling, request lifecycle, physical page allocation/free, and page IDs.
+The executor owns model-specific interpretation of page IDs, trained tensors, backend state, replay caches, and
+submission order.
 Metal kernels remain backend components.
 
-The sharing boundary is intentionally below the model execution graph. Qwen3 and Qwen3.5 each own a real model config,
-batch and response contract, pending-transaction owner, model binding tree, layer and scratch type, plan/configuration
-builder, Main components, executor, recorder, and replay keys. Structural APIs stay in their model directories.
+The sharing boundary is below the model execution graph.
+Qwen3 and Qwen3.5 each own these model-level objects:
 
-`qwen/v3_x` is limited to true leaves: common quantization/RoPE/tensor-path values, per-component weight bindings and
-checkpoint helpers, `Qwen3xGQA`/`Qwen3xGDN`/`Qwen3xDenseMLP`/`Qwen3xMoE`, and GQA/GDN state owners. Model-local layers
-compose those leaves directly. Qwen3 therefore has no GDN transaction, state-page metadata, MTP lane, or Qwen3.5 replay
-key.
+- A model configuration.
+- Batch and response contracts.
+- A pending-transaction owner.
+- A model binding tree.
+- Layer and scratch types.
+- A plan and configuration builder.
+- Main components.
+- An executor and recorder.
+- Replay keys.
+
+Structural APIs stay in their model directories.
+
+`qwen/v3_x` contains only shared leaf components and values.
+These leaves include quantization, RoPE, tensor-path values, weight bindings, checkpoint helpers, and GQA/GDN state
+owners.
+They also include `Qwen3xGQA`, `Qwen3xGDN`, `Qwen3xDenseMLP`, and `Qwen3xMoE`.
+Model-local layers compose these leaves directly.
+Qwen3 has no GDN transaction, state-page metadata, MTP lane, or Qwen3.5 replay key.
 
 ## Semantic object tree
 
@@ -127,39 +143,48 @@ Qwen35Executor
   pages: PageArena
 ```
 
-Semantic components own weights, static configuration, and `load + record`. `Replay<T>` owns the corresponding replay
-cache. Each executor owns its dynamic workspaces, lifecycle ordering, and submissions.
+Semantic components own weights, static configuration, and `load + record`.
+`Replay<T>` owns the related replay cache.
+Each executor owns its dynamic workspaces, lifecycle order, and submissions.
 
-Embedding, unembedding, row gather, residual add/capture, and RMS normalization remain shared model components. They
-hide backend kernel and invocation details while concrete Main/MTP compositions retain ownership of graph ordering.
+Embedding, unembedding, row gather, residual add/capture, and RMS normalization remain shared model components.
+These components hide backend kernel and invocation details.
+Concrete Main and MTP compositions own graph order.
 
-`Qwen3Microbatch` is target-only: it records which requests are decode requests and gathers exactly the last hidden
-state from each. It rejects speculative input tokens while converting the shared runtime request and returns explicit
-empty validated/speculative fields through the shared runtime response type.
+`Qwen3Microbatch` is target-only.
+It records which requests are decode requests.
+It gathers the last hidden state from each request.
+It rejects speculative input tokens when it converts a shared runtime request.
+It returns explicit empty validated and speculative fields through the shared runtime response type.
 
-Model role is also a structural boundary. `Qwen3MainLayer` owns Qwen3 Main's fixed-QKV `Qwen3MainGQA` plus
-`Qwen3xDenseMLP` topology. `Qwen35MainLayer` owns Qwen3.5 Main's QGKV-GQA/GDN and dense-MLP/MoE variants, while
-`Qwen35MTPLayer` independently owns the MTP decoder-layer graph. These role-specific layers may compose the same leaf
-components, but they do not share a structural layer type. Qwen3 has no dSpark layer today; a future Qwen3 dSpark path
-would likewise own a distinct role-specific type rather than extending `Qwen3MainLayer`.
+The model role is also a structural boundary.
+`Qwen3MainLayer` owns the fixed-QKV `Qwen3MainGQA` and `Qwen3xDenseMLP` topology for Qwen3 Main.
+`Qwen35MainLayer` owns the QGKV-GQA/GDN and dense-MLP/MoE variants for Qwen3.5 Main.
+`Qwen35MTPLayer` independently owns the MTP decoder-layer graph.
+These role-specific layers can compose the same leaf components.
+They do not share a structural layer type.
+
+Qwen3 has no DSpark layer today.
+A future Qwen3 DSpark path must own a distinct role-specific type.
+It must not extend `Qwen3MainLayer`.
 
 `Qwen3xGQA` and `Qwen3xGDN` store compact per-kind layer indices, not model-layer indices, for page-table and
 state-arena addressing.
 
 ## Configuration, bindings, and load
 
-`Qwen3ModelConfig` strictly parses the flat Hugging Face Qwen3 schema and rejects unsupported GDN, MoE, MTP,
-sliding-window, and RoPE-scaling variants. Its EOS token IDs provide a Qwen3-specific fallback when
-`generation_config.json` supplies none. `Qwen35ModelConfig` independently parses and normalizes the Qwen3.5/Qwen3.6
-schema, including layer-kind, MoE, MTP, and partial-RoPE fields. Runtime capacities are likewise model-specific in
-`Qwen3ExecutorConfig` and `Qwen35ExecutorConfig`.
+`Qwen3ModelConfig` strictly parses the flat Hugging Face Qwen3 schema.
+It rejects unsupported GDN, MoE, MTP, sliding-window, and RoPE-scaling variants.
+Its EOS token IDs provide a Qwen3 fallback when `generation_config.json` supplies none.
+`Qwen35ModelConfig` independently parses and normalizes the Qwen3.5/Qwen3.6 schema.
+That schema includes layer-kind, MoE, MTP, and partial-RoPE fields.
+`Qwen3ExecutorConfig` and `Qwen35ExecutorConfig` keep runtime capacities model-specific.
 
-`Qwen35ExecutorConfig::max_requests` is the executor request-slot capacity,
-not the scheduler per-batch request budget. The service initializes it from
-`RuntimeConfig::max_running_requests`; GQA page tables, GDN request state,
-sampling state, and request-indexed workspaces share that slot domain. Runtime
-initialization separately requires `SchedulerConfig::max_requests` to be no
-larger than this capacity.
+`Qwen35ExecutorConfig::max_requests` is the executor request-slot capacity.
+It is not the scheduler per-batch request budget.
+The service initializes it from `RuntimeConfig::max_running_requests`.
+GQA page tables, GDN request state, sampling state, and request-indexed workspaces share this slot domain.
+Runtime initialization also requires `SchedulerConfig::max_requests` to be no larger than this capacity.
 
 Each model resolves its own exact typed binding tree before real tensor reads:
 
@@ -202,20 +227,29 @@ Initialization is top-down:
 7. Construct Main, GatherUnembed, optional MTPEmbed/MTP, sampling owners, workspaces, and `PageArena`.
 8. Wrap every cached stage in `Replay<T>`.
 
-Qwen3 follows the same ownership order with a smaller graph: parse its flat config, resolve its Main binding
-tree, construct one QKV GQA state domain and dense scratch, load Main/Embed/GatherUnembed, construct ordinary sampling,
-and wrap the four model stages in `Replay<T>`. It has one cache lane and allocates no GDN state domain.
+Qwen3 follows the same ownership order with a smaller graph.
+It parses its flat configuration and resolves its Main binding tree.
+It constructs one QKV GQA state domain and dense scratch.
+It loads Main, Embed, and GatherUnembed.
+It then constructs ordinary sampling.
+Finally, it wraps the four model stages in `Replay<T>`.
 
-There is no Main/MTP plan object tree or aggregate component-weight owner. Qwen3 QKV GQA and dense-MLP
-geometry/config conversion lives with its Main role in `qwen/v3/main/plan.rs`. Qwen3.5 owns its QGKV GQA, GDN,
-dense-MLP, MoE, MTP validation, and low-level DSpark planning in `qwen/v3_5/plan.rs`. Shared leaf loaders receive
-finalized core and Metal configurations rather than model configuration or default bags.
+Qwen3 has one cache lane and allocates no GDN state domain.
+
+There is no Main/MTP plan object tree or aggregate component-weight owner.
+Qwen3 Main owns QKV GQA and dense-MLP geometry conversion in `qwen/v3/main/plan.rs`.
+Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, MTP validation, and low-level DSpark planning in `qwen/v3_5/plan.rs`.
+Shared leaf loaders receive finalized core and Metal configurations.
+They do not receive model configuration or default bags.
 
 ## Replay ownership
 
-`Replay<T>::record(runtime, input)` derives the component key, returns immediately on a hit, and records/builds/inserts
-exactly once on a miss. It returns `(key, cache_hit)`. `Replay<T>::replay(key)` is a strict lookup and panics if record
-did not establish the key. `Replay<T>` exposes `component()` explicitly and does not implement `Deref`.
+`Replay<T>::record(runtime, input)` derives the component key and returns immediately on a hit.
+On a miss, it records, builds, and inserts exactly once.
+It returns `(key, cache_hit)`.
+`Replay<T>::replay(key)` is a strict lookup.
+It panics if record did not establish the key.
+`Replay<T>` exposes `component()` explicitly and does not implement `Deref`.
 
 The independent cached graphs are:
 
@@ -238,8 +272,9 @@ Replay<Rc<GDNRequestStateTable>>
 
 MainEmbed and MTPEmbed are separate replay boundaries with their own keys.
 
-Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed. Its Main key owns only the token count and
-GQA replay topology. It never aliases a Qwen3.5 key or stores an optional GDN key.
+Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed.
+Its Main key owns only the token count and GQA replay topology.
+It never aliases a Qwen3.5 key or stores an optional GDN key.
 
 ## Main data flow and workspace ownership
 
@@ -256,31 +291,45 @@ unembed_logits
   -> Sampling or RejectionSampling
 ```
 
-`token_hidden_input` is the embedding destination and layer-0 input. `hidden_output` is the final RMSNorm destination.
-They are executor-owned `Rc<Buffer>` workspace slots and are passed across runtime stages without `Option`, hidden
-handles, or hidden-source enums. The final layer residual is only the local current ping-pong buffer; there is no
-`final_residual` field, accessor, or allocation.
+`token_hidden_input` is the embedding destination and layer-0 input.
+`hidden_output` is the final RMSNorm destination.
+The executor owns both `Rc<Buffer>` workspace slots.
+Runtime stages pass them without `Option`, hidden handles, or hidden-source enums.
+The final layer residual is only the current local ping-pong buffer.
+There is no `final_residual` field, accessor, or allocation.
 
-Qwen3 Main constructs `Qwen3MainLayerScratch`; Qwen3.5 Main constructs `Qwen35MainLayerScratch`, and Qwen3.5 MTP owns
-its separate layer scratch. Similar workspace roles do not imply shared structural ownership.
+Qwen3 Main constructs `Qwen3MainLayerScratch`.
+Qwen3.5 Main constructs `Qwen35MainLayerScratch`.
+Qwen3.5 MTP owns separate layer scratch.
+Similar workspace roles do not imply shared structural ownership.
 
-`Qwen35Main` accepts an optional `Rc<dyn Qwen35MainResidualCapture>`, and `Qwen3Main` exposes the corresponding
-model-specific `Qwen3MainResidualCapture` boundary. Immediately before each model layer's final
-post-MLP residual add, Main asks the capture owner for an optional opaque `ResidualCaptureTarget`. The target selects a
-stable, capture-owned BF16 column range; `None` records the ordinary residual add. The object-safe capture contract only
-returns this descriptor and never receives a recorder; both Main record methods remain generic over
-`Recorder<Operator = ReplayOp>`. The current target-only loaders supply no capture owner, so ordinary output buffers and
-recorded operator sequences are unchanged.
+`Qwen35Main` accepts an optional `Rc<dyn Qwen35MainResidualCapture>`.
+`Qwen3Main` exposes the model-specific `Qwen3MainResidualCapture` boundary.
+Main queries the capture owner immediately before each layer's final post-MLP residual add.
+The capture owner returns an optional opaque `ResidualCaptureTarget`.
+The target selects a stable BF16 column range that the capture owner owns.
+`None` records the ordinary residual add.
 
-`Qwen35GatherUnembedArgs` is flat: it binds the final-normalized hidden source, row indices, gather destination, and
-logits destination. Gathered hidden and logits remain executor workspaces.
+The object-safe capture contract returns only this descriptor.
+It never receives a recorder.
+Both Main record methods remain generic over `Recorder<Operator = ReplayOp>`.
+
+The current target-only loaders supply no capture owner.
+Ordinary output buffers and recorded operator sequences remain unchanged.
+
+`Qwen35GatherUnembedArgs` has a flat structure.
+It binds the final-normalized hidden source, row indices, gather destination, and logits destination.
+Gathered hidden and logits remain executor workspaces.
 
 ## GQA/GDN lifecycle
 
-`Qwen3MainGQAState` groups Qwen3's ungated backend, scratch, request page table, metadata buffers, and cache-lane
-information. It resets/prepares only KV page metadata. Qwen3 has zero state pages and does not construct, restore,
-publish, commit, or reset a GDN state table. Qwen3.5 Main and MTP own distinct gated `Qwen3xGQAState` domains. Both
-state types expose the same lifecycle concepts:
+`Qwen3MainGQAState` groups the Qwen3 ungated backend, scratch, request page table, metadata buffers, and cache-lane
+information.
+It resets and prepares only KV page metadata.
+Qwen3 has zero state pages.
+It does not construct, restore, publish, commit, or reset a GDN state table.
+Qwen3.5 Main and MTP own distinct gated `Qwen3xGQAState` domains.
+Both state types expose the same lifecycle concepts:
 
 ```text
 prepare_pages(core_batch)
@@ -289,8 +338,9 @@ reset_req_slots(runtime_notification)
 ```
 
 `Qwen3xGDNState` groups a backend, scratch, request state table, metadata, cached restore replay, and one optional
-asynchronous publish submission. The current Qwen3.5 executor owns one `Qwen3xGDNState` mandatorily. Preparation is
-synchronous on the executor thread:
+asynchronous publish.
+The current Qwen3.5 executor must own one `Qwen3xGDNState`.
+The executor thread prepares it synchronously:
 
 ```text
 Main GQA prepare_pages
@@ -301,26 +351,35 @@ optional MTP GQA prepare_pages
 optional GDN restore + wait
 ```
 
-The shared GDN state leaf receives only these component inputs. Qwen3.5 extracts them from its model-owned microbatch
-before calling the leaf; `Qwen3xGDNState` does not depend on the Qwen3.5 batch type.
+The shared GDN state leaf receives only these component inputs.
+Qwen3.5 extracts them from its model-owned microbatch before it calls the leaf.
+`Qwen3xGDNState` does not depend on the Qwen3.5 batch type.
 
-No prepare worker, channel, or receiver exists. GDN restore refreshes page-I/O staging on every batch, records only on
-a replay miss, and waits before Main. Commit selects verified state versions and starts uncached publish when jobs
-exist. Publish overlaps returning the response to runtime core; the next prepare/reset waits before shared page-I/O or
-live-state resources are reused.
+No prepare worker, channel, or receiver exists.
+GDN restore refreshes page-I/O staging on every batch.
+It records only on a replay miss and waits before Main.
+Commit selects verified state versions.
+It starts an uncached publish when jobs exist.
 
-Whole-request reset enters through `Qwen35Executor::reset_req_slots` and fans out to sampling, Main GQA, optional MTP
-GQA, debug speculative-probability metadata, and Main GDN. Inner state tables do not infer reset from token indices.
+Runtime core can receive the response while publish continues.
+The next prepare or reset waits before it reuses shared page-I/O or live-state resources.
+
+Whole-request reset enters through `Qwen35Executor::reset_req_slots`.
+It fans out to sampling, Main GQA, optional MTP GQA, debug speculative-probability metadata, and Main GDN.
+Inner state tables do not infer reset from token indices.
 A state version ahead of its token index is a lifecycle invariant violation and panics.
 
 ## Supported MTP
 
-The executor supports zero or one MTP module. The current checkpoint contract requires one GQA body layer, shared Main
-token embedding, and no dedicated MTP embeddings.
+The executor supports zero or one MTP module.
+The current checkpoint contract requires one GQA body layer and shared Main token embedding.
+It does not permit dedicated MTP embeddings.
 
-`Qwen35MTPEmbed` owns previous-hidden gather, the shared `Rc<Embed>`, two checkpoint norms, concatenation, quantized
-input projection, and its private temporaries. `Qwen35MTP` owns the single `Qwen35MTPLayer`, final norm, and the MTP GQA
-page-table handle. There is no separate input-projector type or module loop.
+`Qwen35MTPEmbed` owns previous-hidden gather, the shared `Rc<Embed>`, two checkpoint norms, concatenation, and quantized
+input projection.
+It also owns its private temporary buffers.
+`Qwen35MTP` owns the single `Qwen35MTPLayer`, final norm, and MTP GQA page-table handle.
+There is no separate input-projector type or module loop.
 
 The composed proposal sequence remains:
 
@@ -338,19 +397,31 @@ MainEmbed -> Main -> GatherUnembed -> Sampling
 
 ## DSpark scope
 
-The Qwen3.5 subtree owns the current dSpark implementation: strict configuration and exact weight bindings in core,
-model-specific geometry and Metal configuration in `v3_5/plan.rs`, and target residual projection, context append,
-dSpark layers, Markov head, and speculator components under `v3_5/dspark/`.
+The Qwen3.5 subtree owns the retained DSpark implementation.
+Core owns strict configuration and exact weight bindings.
+`v3_5/plan.rs` owns model-specific geometry and Metal configuration.
+`v3_5/dspark/` owns target residual projection, context append, DSpark layers, the Markov head, and speculator
+components.
 
-Neither Qwen3 nor Qwen3.5 currently wires those components into its executor. There is no dSpark executor field, replay
-stage, load/forward path, service option, or end-to-end claim. The focused component contract is documented in
-[`dspark_design.md`](dspark_design.md).
+Neither Qwen3 nor Qwen3.5 currently wires these components into an executor.
+There is no DSpark executor field, replay stage, load/forward path, service option, or end-to-end claim.
+[`dspark_design.md`](dspark_design.md) documents the focused component contract.
 
 ## Verification
 
-Unit coverage includes the strict flat Qwen3 adapter, model-specific target batch/replay keys, normalized Qwen3.5
-config and exact bindings, GQA/GDN state, page overwrite/reset, GDN transactions and snapshot I/O, generic replay
-idempotence/strict lookup, MTP rejection, generic sampling, and dSpark component contracts. End-to-end
-verification exercises Qwen3 target-only and Qwen3.5 Main/optional MTP through server/decode and inspects generated
-text. Performance evidence follows
-[`executor_benchmarks.md`](executor_benchmarks.md) and is collected serially.
+Unit tests cover:
+
+- The strict flat Qwen3 adapter.
+- Model-specific target batch and replay keys.
+- Normalized Qwen3.5 configuration and exact bindings.
+- GQA/GDN state and page overwrite/reset.
+- GDN transactions and snapshot I/O.
+- Generic replay idempotence and strict lookup.
+- MTP rejection and generic sampling.
+- DSpark component contracts.
+
+End-to-end tests exercise target-only Qwen3 through server/decode.
+They also exercise Qwen3.5 Main and optional MTP.
+The tests inspect generated text.
+Performance evidence follows [`executor_benchmarks.md`](executor_benchmarks.md).
+Collect that evidence serially.

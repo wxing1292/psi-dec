@@ -1,11 +1,12 @@
 # inference-backend-metal
 
-`inference-backend-metal` owns reusable Metal execution primitives, operators,
-and buffer-first components consumed by model executors. It does not own
-request scheduling, request lifecycle, or model-specific orchestration.
+`inference-backend-metal` owns reusable Metal primitives, operators, and buffer-first components. Model executors use
+these items.
 
-The crate has one execution path: operators record reusable indirect command
-buffers (ICBs), and a `Stream` submits those replays through Metal 4.
+The crate does not own request scheduling, request lifecycle, or model-specific orchestration.
+
+The crate has one execution path. Operators record reusable indirect command buffers (ICBs). A `Stream` submits these
+replays through Metal 4.
 
 ## System Overview
 
@@ -114,18 +115,18 @@ buffers (ICBs), and a `Stream` submits those replays through Metal 4.
 └────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The top three resource groups differ by lifecycle, not by Metal allocation
-type. Weights are immutable after initialization. Workspace and state buffers
-keep stable identities so cached commands can retain their bindings, while
-their contents may change. Runtime input is written once per submission.
-`num_total_threads` is part of the recorded dispatch capacity;
-`num_active_threads` is the submission value that masks unused capacity.
+The top three resource groups have different lifecycles. They do not have different Metal allocation types.
+
+Weights are immutable after initialization. Workspace and state buffers keep stable identities. Thus, cached commands
+can retain their bindings while buffer contents change.
+
+The executor writes runtime input one time for each submission. `num_total_threads` is part of the recorded dispatch
+capacity. `num_active_threads` masks unused capacity for one submission.
 
 ## Add One
 
-This complete example creates every persistent object from `Device`, records a
-fixed-capacity ICB, submits it twice with different active work, and reads the
-result back:
+This example creates each persistent object from `Device`. It records a fixed-capacity ICB and submits the ICB two
+times. Each submission uses a different active workload. The example then reads the result:
 
 ```rust
 use inference_backend_metal::metal::Buffer;
@@ -228,9 +229,10 @@ num_threads_per_threadblock  = 64
 num_threadblocks             = 2
 ```
 
-Only `num_active_threads` changes. On the second submission, threads `0..116`
-perform the operation and threads `117..127` return before touching memory.
-Keep these four identities visibly separate:
+Only `num_active_threads` changes. During the second submission, threads `0..116` do the operation. Threads `117..127`
+return before they access memory.
+
+Keep these four identities separate:
 
 ```text
 binding index         1                    MSL [[buffer(1)]]
@@ -239,16 +241,18 @@ submission value      96 or 117            current active workload
 fixed ICB grid         128 total threads    recorded bucket capacity
 ```
 
-The inactive-lane guard must run before every read, write, state update, or RNG
-effect. A kernel with threadblock barriers must either submit whole active
-threadblocks or keep every lane participating in each barrier and guard only
-its memory and state effects.
+The inactive-lane guard must run before each read, write, state update, or random-number effect.
 
-Standalone RMSNorm and residual-RMSNorm expose both forms explicitly. Their
-shape stores the fixed `num_total_tokens` dispatch capacity. Exact invocation
-records that value directly; bucketed invocation binds a replay parameter key
-whose per-submission `num_active_tokens` value is asserted to be within the
-capacity. Residual-add plus RMSNorm fusion preserves the same dynamic binding.
+A kernel can contain threadblock barriers. This kernel must submit full active threadblocks or keep each lane in each
+barrier. In the second case, guard only memory and state effects.
+
+Standalone RMSNorm and residual-RMSNorm expose the exact and bucketed forms. Their shape stores the fixed
+`num_total_tokens` dispatch capacity.
+
+An exact invocation records this value directly. A bucketed invocation binds a replay parameter key.
+The per-submission `num_active_tokens` value must not exceed the capacity.
+
+Residual-add and RMSNorm fusion keeps the same dynamic binding.
 
 ## Recording Layers
 
@@ -269,13 +273,17 @@ CommandMetadata
 ReplayProgramBuilder::build -> ReplayProgram / ICB
 ```
 
-`CommandRecorder` is the low-level command-recording surface.
-`ReplayProgramBuilder` collects concrete commands, consumer-side barrier
-attributes, initial parameter bytes, and the replay parameter table for one ICB.
-`ReplayProgramBuilder::new(&stream)` binds the builder to that stream's device,
-queue, and residency set; `Stream::create_replay_program()` is the equivalent
-convenience entry point. The builder constructs each `CommandRecorder`;
-operators receive a recorder borrow but cannot create or finish a recorder
+`CommandRecorder` is the low-level recording surface. `ReplayProgramBuilder` collects these items for one ICB:
+
+- Concrete commands
+- Consumer-side barrier attributes
+- Initial parameter bytes
+- The replay parameter table
+
+`ReplayProgramBuilder::new(&stream)` binds the builder to the stream device, queue, and residency set.
+`Stream::create_replay_program()` is the equivalent convenience entry point.
+
+The builder constructs each `CommandRecorder`. Operators borrow a recorder. They cannot create or finish a recorder
 independently.
 
 Model components may add the optional `ReplayRecorder` above those layers:
@@ -293,8 +301,7 @@ ReplayRecorder
 ReplayProgramBuilder -> CommandRecorder -> CommandMetadata -> ICB
 ```
 
-`ReplayRecorder` belongs to model composition and is deliberately absent from
-the basic add-one example.
+`ReplayRecorder` belongs to model composition. Thus, the basic add-one example does not use it.
 
 ## Component, Operator, and Command Order
 
@@ -306,18 +313,20 @@ These layers describe different units and are not one-to-one:
 | Operator | residual add, RMSNorm, fused residual + RMSNorm, quantized matmul | One backend tensor operation: kernel selection, backend shape, resource usage, parameters, and lowering into commands |
 | Backend command | on Metal, one compute dispatch in one ICB slot | Exactly one backend pipeline, its resource/parameter bindings, execution geometry, and consumer-side barrier attribute |
 
-A component emits one or more operators. An operator records one or more
-backend commands. The command representation is backend-specific; Metal lowers
-it to an ICB compute command, while another backend may use a different launch
-or graph-node representation. Components and their semantic contracts remain
-above that backend boundary. `ReplayRecorder` is an operator-stream rewrite
-layer: it may fuse adjacent compatible operators, but it is not another model
+A component emits one or more operators. An operator records one or more backend commands. The command representation
+depends on the backend.
+
+Metal lowers a command to an ICB compute command. A different backend can use a launch or graph-node representation.
+Components and their semantic contracts stay above this backend boundary.
+
+`ReplayRecorder` rewrites an operator stream. It can fuse adjacent compatible operators. It is not another model
 computation level.
 
-This architectural classification is not inferred from the Rust directory
-name. The backend `components` module contains reusable Metal building blocks;
-for example, `ResidualInvocation` is architecturally an operator, while the
-executor's GQA implementation is a component that composes operators.
+Rust directory names do not define this architectural classification. The backend `components` module contains reusable
+Metal building blocks.
+
+For example, `ResidualInvocation` is an operator. The executor GQA implementation is a component that composes
+operators.
 
 ```text
 Model / Layer
@@ -341,17 +350,19 @@ ReplayProgramBuilder
 ICB slots [C0, C1, C2, ...]
 ```
 
-The model or layer owns semantic order. A component lowers that algorithm into
-backend operators. `ReplayRecorder` may replace adjacent compatible operators
-with one fused operator, but preserves the same dependency. An `Operator` is a
-recording unit, not necessarily one kernel or one ICB slot; each completed
-kernel dispatch becomes one concrete backend command. On Metal that command has
-one compute pipeline, resource/parameter bindings, dispatch geometry, and one
-ICB slot.
+The model or layer owns semantic order. A component lowers its algorithm into backend operators.
 
-ICB slot order identifies commands but does not by itself serialize their
-resource accesses. Replays use concurrent compute dispatches, so commands
-without a dependency may overlap.
+`ReplayRecorder` can replace adjacent compatible operators with one fused operator. The fused operator preserves the
+same dependency.
+
+An `Operator` is a recording unit. It does not always equal one kernel or one ICB slot. Each complete kernel dispatch
+becomes one backend command.
+
+On Metal, the command has one compute pipeline and one ICB slot. It also has resource bindings, parameter bindings, and
+dispatch geometry.
+
+ICB slot order identifies commands. It does not serialize their resource access. Replays use concurrent compute
+dispatches. Thus, commands without a dependency can overlap.
 
 ## Barrier Ownership
 
@@ -369,30 +380,32 @@ phase 1:  C2 consumer C     C3 independent D
 phase 2:  C4 consumer E
 ```
 
-Apple's `MTLIndirectComputeCommand::setBarrier()` is attached to the consumer
-command: commands before it complete before it executes. The project therefore
-records `barrier_before` on `C2`, not a barrier-after property on a producer.
+Apple attaches `MTLIndirectComputeCommand::setBarrier()` to the consumer command. All earlier commands complete before
+the consumer runs.
+
+Thus, the project records `barrier_before` on `C2`. It does not record a barrier-after property on the producer.
 
 At a component boundary, the consumer records its first command with
-`record_with_barrier_before(...)`. At the low-level command API, an operator
-that has already selected the consumer kernel calls `set_barrier_before()`.
-The enclosing program builder turns a barrier request on the first program command
-into a no-op because no producer precedes it.
+`record_with_barrier_before(...)`. At the low-level API, the operator calls
+`set_barrier_before()` after it selects the consumer kernel.
 
-The replay builder also infers RAW, WAR, and WAW hazards when commands bind the
-same `MTLBuffer` handle with declared read/write usage. Explicit component
-barriers remain necessary for dependencies that buffer identity cannot express,
-such as aliased views or semantic phase boundaries.
+The program builder ignores a barrier request on the first command. No producer occurs before this command.
 
-There is no pending or trailing barrier state. `build()` freezes the recorded
-commands and parameter table; it does not append a final ICB barrier. The
-commit feedback proves that the entire submitted workload finished before
-allocator reset and in-flight resource release.
+The replay builder also infers RAW, WAR, and WAW hazards. It detects commands that bind the same `MTLBuffer` handle with
+declared read or write use.
+
+Explicit component barriers remain necessary when buffer identity cannot express a dependency. Aliased views and
+semantic-phase boundaries are examples.
+
+The builder has no pending or trailing barrier state. `build()` freezes the recorded commands and parameter table.
+It does not append a final ICB barrier.
+
+Commit feedback proves that the submitted workload finished. The stream gets this proof before allocator reset and
+in-flight resource release.
 
 ## Execution Resources
 
-An ICB command records how to execute work; it does not copy tensor data into
-the ICB:
+An ICB command records how to execute work. It does not copy tensor data into the ICB:
 
 ```text
 one indirect compute command
@@ -404,7 +417,7 @@ one indirect compute command
   `-- barrier-before state
 ```
 
-These GPU objects must remain alive and resident while a replay may execute:
+These GPU objects must remain alive and resident while a replay can execute:
 
 ```text
 Buffer data                       // MTLBuffer
@@ -457,18 +470,19 @@ ReplaySubmission --+-- Vec<Rc<ReplayResources>>
   `-- wait/drop: receive commit feedback, then reset allocator
 ```
 
-Dropping a cached `ReplayProgram` cannot release its resources while an in-flight
-`ReplaySubmission` retains the same `Rc<ReplayResources>`. There is no second
-internal submission owner or parallel resource list. A replay is tied to the
-`Stream` whose residency set registered its allocations and must be submitted through
-that Stream's queue.
+An in-flight `ReplaySubmission` retains the same `Rc<ReplayResources>` as its cached `ReplayProgram`. Thus, dropping the
+cached program cannot release active resources.
 
-One `Residency` covers many allocations. Leases may overlap on weights and
-pipelines; `ResidencySet` deduplicates them with per-allocation reference
-counts, so the queue-attached residency set contains the union of all live
-replay allocations. When new allocations first enter the set, the wrapper
-commits the membership update and requests residency before their first replay
-submission.
+There is no second internal submission owner or parallel resource list. A replay belongs to the `Stream` that registered
+its allocations.
+
+Submit the replay through the queue of that Stream.
+
+One `Residency` covers many allocations. Leases can overlap on weights and pipelines. `ResidencySet` uses
+per-allocation reference counts to remove duplicates.
+
+Thus, the queue residency set contains the union of all live replay allocations. When a new allocation enters the set,
+the wrapper commits the update. It requests residency before the first replay submission.
 
 ## End-To-End Lifecycle
 
@@ -555,10 +569,16 @@ allocator.reset()
 wait returns; dropping ReplaySubmission releases command state and ReplayResources
 ```
 
-The allocator backs transient submission commands. It does not own the ICB,
-model buffers, pipelines, parameter buffer, or residency lease. `wait()` proves
-completion and resets the allocator but leaves the submission's retained fields
-intact; those fields are released when the `ReplaySubmission` itself is dropped.
+The allocator backs transient submission commands. It does not own these persistent resources:
+
+- The ICB
+- Model buffers
+- Pipelines
+- The parameter buffer
+- The residency lease
+
+`wait()` proves completion and resets the allocator. It leaves the retained submission fields intact. Dropping the
+`ReplaySubmission` releases those fields.
 
 ## Current Stream Contract
 
@@ -571,21 +591,20 @@ One `Stream` currently owns:
 1 ResidencySet                 wraps one queue-attached MTLResidencySet
 ```
 
-Because one allocator is reused, a Stream currently allows one in-flight
-submission. Completion resets the allocator before another submission can be
-encoded. Supporting multiple in-flight submissions requires an allocator
-pool or ring; it does not require duplicating persistent ICBs.
+One Stream reuses one allocator. Thus, a Stream currently permits one in-flight submission. Completion resets the
+allocator before the stream encodes another submission.
 
-A submission may execute a sequence of distinct `ReplayProgram` values in one
-Metal 4 command buffer. The stream inserts an execution barrier between ICBs
-and retains every program's resources through completion. If one program
-appears multiple times in a sequence, every occurrence must use identical arguments
-because its parameter buffer is replay-owned.
+Multiple in-flight submissions require an allocator pool or ring. They do not require duplicate persistent ICBs.
+
+One submission can run a sequence of different `ReplayProgram` values in one Metal 4 command buffer. The stream inserts
+an execution barrier between ICBs.
+
+The stream retains all program resources through completion. A program can occur more than one time in a sequence.
+Each occurrence must use identical arguments because the replay owns its parameter buffer.
 
 ## Why Replay
 
-Conceptually, a direct path would bind pipelines, buffers, constants, and the
-current dispatch grid into a transient compute encoder on every submission:
+A conceptual direct path binds pipelines, buffers, constants, and the current grid for each submission:
 
 ```text
 conceptual direct submission
@@ -603,11 +622,10 @@ implemented replay path
   submit many: validate/write ReplayArguments -> execute ICB
 ```
 
-The crate intentionally does not expose `DirectBatch` or direct operator
-variants. Production, benches, and Metal correctness tests all exercise the
-same replay/ICB path; CPU implementations remain the correctness oracles.
-Keeping this conceptual comparison is useful for understanding what replay
-removes, but it is not a second execution API.
+The crate does not expose `DirectBatch` or direct operator variants. Production, benchmarks, and Metal correctness
+tests use the same replay and ICB path.
 
-Executable add-one coverage lives in
-[`src/metal/stream/mod.rs`](src/metal/stream/mod.rs).
+CPU implementations remain the correctness oracles. This conceptual comparison shows the work that replay removes.
+It is not a second execution API.
+
+[`src/metal/stream/mod.rs`](src/metal/stream/mod.rs) contains executable add-one coverage.

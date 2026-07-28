@@ -1,23 +1,25 @@
 # DSpark Components
 
-Status: retained low-level Qwen3.5-era component contract; not wired into the current Qwen3.5 executor or service.
-Detailed DSpark integration is deferred to a separate Qwen3 milestone using the official DeepSeek contract and
-compatible weights.
+Current status: The repository retains the low-level Qwen3.5-era component contract.
+The current Qwen3.5 executor and service do not use it.
+Future status: A separate Qwen3 milestone owns detailed DSpark integration.
+That milestone must use the official DeepSeek contract and compatible weights.
 
 ## Current scope
 
-The repository keeps the already-implemented DSpark configuration, exact tensor binding, checkpoint conversion, Metal
-components, component-level plans, weights, and focused tests. This preserves useful low-level work without committing
-the Qwen3.5 runtime to unsupported behavior.
+The repository retains the implemented DSpark configuration, exact tensor bindings, checkpoint conversion, Metal
+components, plans, weights, and focused tests.
+This scope preserves useful low-level work.
+It does not commit the Qwen3.5 runtime to unsupported behavior.
 
 The current Qwen3.5 path deliberately has none of the following:
 
-- a DSpark field or replay in `Qwen35Executor`;
-- DSpark load, target-capture, or proposal methods;
-- a DSpark capture policy or target-context input;
-- `--hf-dspark-model-dir` service selection;
-- shared Main/MTP/DSpark speculation abstraction;
-- a DSpark end-to-end correctness or performance claim.
+- A DSpark field or replay in `Qwen35Executor`.
+- DSpark load, target-capture, or proposal methods.
+- A DSpark capture policy or target-context input.
+- `--hf-dspark-model-dir` service selection.
+- A shared Main/MTP/DSpark speculation abstraction.
+- A DSpark end-to-end correctness or performance claim.
 
 MTP is the only optional speculator wired into Qwen3.5.
 
@@ -44,26 +46,32 @@ crates/inference-executor-metal/src/model/qwen/v3_5/
     weights.rs              DSpark-owned checkpoint reads and conversion
 ```
 
-These files are not referenced by the Qwen3.5 executor load or forward path. Their public low-level contracts remain
-available to focused tests and future model-specific integration.
+The Qwen3.5 executor load and forward paths do not reference these files.
+Their public low-level contracts remain available to focused tests and future model-specific integration.
 
-Main now has a narrow object-safe residual-capture seam: `Qwen35Main` can ask an optional
-`Rc<dyn Qwen35MainResidualCapture>` for a capture target at each model layer's final post-MLP residual add. The
-capture contract only returns an opaque `ResidualCaptureTarget`; it has no recorder method. The Qwen3.5 loader supplies
-no capture owner, so this adds no Qwen3.5 operator or output. Future Qwen3.5 DSpark wiring can inject its capture owner
-without binding that semantic component to `ReplayRecorder`.
+`Qwen35Main` retains the narrow, object-safe Qwen3.5-era residual-capture seam.
+It can ask an optional `Rc<dyn Qwen35MainResidualCapture>` for a capture target.
+It makes this request at each model layer's final post-MLP residual add.
+The capture contract returns only an opaque `ResidualCaptureTarget`.
+It has no recorder method.
+
+The Qwen3.5 loader passes `None` for the capture owner.
+Thus, the seam adds no Qwen3.5 operator or output.
+
+The separate Qwen3 milestone uses `Qwen3MainResidualCapture`.
+That milestone must not bind a semantic component to `ReplayRecorder`.
 
 ## Preserved low-level contract
 
-The retained implementation continues to model:
+The retained implementation models:
 
-- exact Hikari/DSpark tensor names and affine quantization layouts;
-- selected target residual geometry;
-- request-local block metadata and bounded context task coverage;
-- GQA context append using the existing target cache lane layout;
-- dense DSpark layer and scratch geometry;
-- Markov proposal positions, sampling capacities, and output correction;
-- component-owned weights and backend buffer contracts.
+- Exact Hikari/DSpark tensor names and affine quantization layouts.
+- Selected target residual geometry.
+- Request-local block metadata and bounded context task coverage.
+- GQA context append with the existing target cache lane layout.
+- Dense DSpark layer and scratch geometry.
+- Markov proposal positions, sampling capacities, and output correction.
+- Component-owned weights and backend buffer contracts.
 
 The standalone quantizer remains available:
 
@@ -74,15 +82,17 @@ cargo run -p inference-executor-core --bin qwen35_dspark_quantize -- \
   --group-size 64 --bits 4 --markov-w2-bits 8
 ```
 
-The output directory must not already exist. Producing converted weights does not make them selectable by the current
-Qwen3.5 server.
+The output directory must not already exist.
+Converted weights are not selectable by the current Qwen3.5 server.
 
 ## Verification boundary
 
-Current verification is compilation plus the existing low-level configuration, binding, geometry, quantization, and
-component tests. No compatible DSpark model weights are available in the repository environment, so there is no DSpark
-server/decode validation and no DSpark throughput result.
+Current verification includes compilation and existing low-level tests.
+These tests cover configuration, bindings, geometry, quantization, and components.
+The repository environment has no compatible DSpark model weights.
+Thus, there is no DSpark server/decode validation or DSpark throughput result.
 
-Future wiring must be reviewed as a new model-specific design. It must not infer compatibility from the retained
-Qwen3.5 components, attach recorder semantics to the Main capture contract, or broaden the current Qwen3.5
-milestone.
+Review future wiring as a new model-specific design.
+It must not infer compatibility from the retained Qwen3.5 components.
+It must not add recorder semantics to the Main capture contract.
+It must not broaden the current Qwen3.5 milestone.

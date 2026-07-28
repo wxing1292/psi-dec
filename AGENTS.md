@@ -4,6 +4,7 @@ Start with `docs/high_level.md`. It defines shared repo rules and the runtime co
 
 Focused docs:
 
+- `docs/technical_english.md`: ASD-STE100-informed writing rules for repository documentation.
 - `docs/engineering_conventions.md`: repository-wide naming, layouts, replay/resource safety, optimization, API, and test rules.
 - `docs/core.md`: runtime scheduling, lifecycle, page/cache ownership, executor notifications.
 - `docs/executor.md`: model executor architecture, symmetry, weights, and replay composition.
@@ -17,6 +18,12 @@ Focused docs:
 - `docs/future_work.md`: active TODOs and future investigations.
 
 When changing GQA, Gated DeltaNet, dense MLP, MoE, sampling, or MTP source layout/default paths, update the matching `docs/executor_*.md` in the same change. When changing service commands or logging, update `docs/service.md`. Current-component docs should describe current `src`, not planned cleanup.
+
+## Documentation style
+
+- Use the ASD-STE100-informed style in `docs/technical_english.md` for new and revised documentation.
+- Preserve technical meaning, requirement strength, code, commands, paths, identifiers, API names, equations, and numeric values.
+- Do not claim certified or full ASD-STE100 compliance without an authorized review.
 
 ## Shared hard constraints
 

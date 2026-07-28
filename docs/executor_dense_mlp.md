@@ -1,12 +1,13 @@
 # Dense MLP Executor
 
-This document maps the current dense gated-MLP implementation from semantic shapes and scratch ownership through Metal
-replay and production benchmarks.
+This document describes the current dense gated-MLP implementation.
+It covers semantic shapes, scratch ownership, Metal replay, tests, and production benchmarks.
 
 ## Source layout
 
-`crates/inference-executor-core` intentionally has no MLX or Metal dependency. It keeps backend-neutral dense MLP layer
-metadata; `crates/inference-executor-metal` owns the current Metal replay backend:
+`crates/inference-executor-core` intentionally has no MLX or Metal dependency.
+It owns backend-neutral dense MLP layer metadata.
+`crates/inference-executor-metal` owns the current Metal replay backend:
 
 ```text
 crates/inference-executor-core/src/mlp/dense/
@@ -63,22 +64,23 @@ gate_up_shape
 down_shape
 ```
 
-`DenseMLP` wires model-level dense MLP metadata to `inference-backend-metal` dense MLP kernels. It owns
-the full dense MLP backend path `gate_up -> activation -> down`; it does not own tensor storage, runtime scheduling,
-or page allocation.
+`DenseMLP` connects model-level dense MLP metadata to `inference-backend-metal` kernels.
+It owns the full `gate_up -> activation -> down` backend path.
+It does not own tensor storage, runtime scheduling, or page allocation.
 
-The backend implements `ReplayLayer` so Qwen model/layer code can append dense MLP work into a larger whole-layer or
-whole-model replay through `Recorder`. Focused tests and benches build replay programs from that same recorder path.
-Dense MLP internal replay order is
-`gate_up -> activation [barrier before] -> down [barrier before]`; model/layer wiring owns barriers on the component's
-first consumer command and on downstream residual consumers.
+The backend implements `ReplayLayer`.
+Qwen model and layer code use `Recorder` to append dense MLP work to a larger whole-layer or whole-model replay.
+Focused tests and benches build replay programs from the same recorder path.
+The internal order is `gate_up -> activation [barrier before] -> down [barrier before]`.
+Model and layer wiring own barriers on the first consumer command and downstream residual consumers.
 
 ## Replay contract
 
-`DenseMLP` records one dense gated MLP forward into a caller-owned `Recorder`. It does not submit
-commands and it does not own tensor storage or request lifecycle. The semantic layer input is
-`DenseMLPReplayInput { shape, hidden_state, next_hidden_state, scratch, weights }`. Replay returns the caller-owned
-`next_hidden_state` buffer directly.
+`DenseMLP` records one dense gated MLP forward into a caller-owned `Recorder`.
+It does not submit commands.
+It does not own tensor storage or request lifecycle.
+The semantic layer input is `DenseMLPReplayInput { shape, hidden_state, next_hidden_state, scratch, weights }`.
+Replay returns the caller-owned `next_hidden_state` buffer directly.
 
 The replay order is:
 
@@ -90,19 +92,23 @@ hidden_state
   -> next_hidden_state
 ```
 
-`DenseMLPReplayShape.num_tokens` is the backend-neutral current microbatch row count. The Metal lowering path maps it
-to `QuantizedDenseMLPShape` only inside `crates/inference-executor-metal`. Production callers allocate scratch for model
-capacity, but each replay invocation validates and uses only the current token count. The hidden input, hidden output,
-gate/up scratch, activation scratch, and immutable weights must all match the configured hidden/intermediate dimensions,
-group size, bit width, and dtype.
+`DenseMLPReplayShape.num_tokens` is the current backend-neutral microbatch row count.
+Only `crates/inference-executor-metal` maps it to `QuantizedDenseMLPShape`.
+Production callers allocate scratch for model capacity.
+Each replay invocation validates and uses only the current token count.
+All buffers and weights must match the configured dimensions, group size, bit width, and dtype.
+This requirement covers hidden buffers, gate/up scratch, activation scratch, and immutable weights.
 
-Qwen model replay keeps dense MLP scratch in one model-owned `DenseMLPScratch`. Its `bindings()` method exposes borrowed
-`DenseMLPScratchBindings` to replay recording. Main and MTP execution is serialized on the model stream, so `gate_up` and
-activation scratch are reusable across layers. Per-layer output buffers and immutable weights remain owned directly by
-the shared `Qwen3xDenseMLP` leaf. `Qwen3MainLayer` and the dense variants of `Qwen35MainLayer` and `Qwen35MTPLayer`
-compose that leaf inside their separate role-specific layer and scratch types. Their model-specific typed binding trees
-contain `Qwen3xDenseMLPWeightBindings` at the leaf boundary. Qwen validates scratch layout compatibility across every
-Main and optional MTP dense layer at init.
+Qwen model replay keeps dense MLP scratch in one model-owned `DenseMLPScratch`.
+Its `bindings()` method exposes borrowed `DenseMLPScratchBindings` during replay recording.
+The model stream serializes Main and MTP execution.
+Thus, layers can reuse `gate_up` and activation scratch.
+
+The shared `Qwen3xDenseMLP` leaf directly owns immutable weights and per-layer output buffers.
+`Qwen3MainLayer` and the dense variants of `Qwen35MainLayer` and `Qwen35MTPLayer` compose that leaf.
+Each composition uses a separate role-specific layer and scratch type.
+Their model-specific binding trees contain `Qwen3xDenseMLPWeightBindings` at the leaf boundary.
+At initialization, Qwen validates scratch layout compatibility across every Main and optional MTP dense layer.
 
 ## Data flow and backend stages
 
@@ -123,10 +129,14 @@ gate_up[row, 0..intermediate_dim)                  gate projection
 gate_up[row, intermediate_dim..2*intermediate_dim) up projection
 ```
 
-The activation kernel reads both halves and writes one `activation[num_tokens, intermediate_dim]` scratch buffer. The
-down projection reads that activation scratch and immutable down weights, then writes the component output. The hidden
-input and output are model-boundary bf16 buffers; quantized affine kernels apply the stored per-group scale/bias while
-accumulating into the kernel's internal accumulator type.
+The activation kernel reads both halves.
+It writes one `activation[num_tokens, intermediate_dim]` scratch buffer.
+The down projection reads that scratch and immutable down weights.
+It then writes the component output.
+
+The hidden input and output are model-boundary bf16 buffers.
+Quantized affine kernels apply the stored per-group scale/bias during accumulation.
+Each kernel accumulates into its internal accumulator type.
 
 Resource flow is:
 
@@ -144,18 +154,25 @@ down affine
   writes next_hidden_state
 ```
 
-The component records barriers between these stages because each stage consumes the previous stage's scratch. Model
-replay records any additional layer-level barriers around residual/norm consumers, not inside the dense MLP component.
+The component records barriers between these stages.
+Each stage consumes scratch from the previous stage.
+Model replay records additional layer-level barriers around residual and norm consumers.
+It does not put these barriers inside the dense MLP component.
 
-Dense MLP has no token-major versus expert-major policy: every active token row runs the same dense expert. The only
-shape input is `num_tokens`; capacity buffers may be larger, but each replay invocation uses the current active prefix.
-Benchmark-only qmv/qmm probes choose affine kernel policy for measurement, but the semantic dataflow stays the same.
+Dense MLP has no token-major or expert-major policy.
+Every active token row runs the same dense expert.
+The only shape input is `num_tokens`.
+Capacity buffers can be larger.
+Each replay invocation uses the current active prefix.
+
+Benchmark-only qmv/qmm probes select an affine kernel policy for measurement.
+The semantic data flow stays the same.
 
 ## Tests and benchmarks
 
-Focused backend tests compare the current quantized bf16 replay path against the CPU quantized dense-MLP reference for
-both fixed and random inputs. They cover gate/up projection, `SiLU(gate) * up`, and down projection as one numerical
-contract.
+Focused backend tests compare the current quantized bf16 replay path with the CPU quantized dense-MLP reference.
+The tests use fixed and random inputs.
+They cover gate/up projection, `SiLU(gate) * up`, and down projection as one numerical contract.
 
 Current Metal component bench:
 
@@ -171,8 +188,9 @@ cargo bench -p inference-executor-metal --bench qwen35_dense_mlp -- \
   --iters 1 --warmup-iters 0 --runs 1
 ```
 
-The bench covers the 27B dense profile and uses CLI args for model path, token list, case list, iteration count, warmup
-count, and run count. It can run the automatic full dense MLP path or focused shape-policy probes:
+The bench covers the 27B dense profile.
+CLI arguments select the model path, token list, case list, iteration count, warmup count, and run count.
+The bench can run the automatic full dense MLP path or focused shape-policy probes:
 
 ```text
 full_auto
@@ -193,13 +211,18 @@ The default forward path is the real-weight replay path:
 gate_up -> activation -> down
 ```
 
-The activation stage computes `SiLU(gate) * up` from the stacked gate/up projection. Public replay APIs use
-`activation` for this stage because it is the dense MLP activation contract, not a standalone SiLU transform.
+The activation stage computes `SiLU(gate) * up` from the stacked gate/up projection.
+Public replay APIs call this stage `activation`.
+It is the dense MLP activation contract, not a standalone SiLU transform.
 
-The real-weight `*_auto` cases use `DenseMLP` and its normal shape-dependent policy. `qmv` means the quantized
-matrix-vector kernel; `qmm` means the quantized matrix-matrix kernel. Forced qmv/qmm cases are benchmark-only
-operator-policy probes used to choose the correct production threshold; they are not separate production paths. Dense
-MLP no longer keeps direct-submit or fused gate/up activation forward probes as production paths.
+The real-weight `*_auto` cases use `DenseMLP` and its normal shape-dependent policy.
+`qmv` means the quantized matrix-vector kernel.
+`qmm` means the quantized matrix-matrix kernel.
+Forced qmv/qmm cases are benchmark-only operator-policy probes.
+
+They help select the correct production threshold.
+They are not separate production paths.
+Dense MLP no longer keeps direct-submit or fused gate/up activation forward probes as production paths.
 
 The real-weight bench prints replay metadata with each perf row:
 
@@ -211,11 +234,13 @@ retained_pipelines
 constant_bytes
 ```
 
-`backend` is reported by the Metal stream backend name and should print `backend=metal`.
+The Metal stream backend name supplies `backend`.
+The expected value is `backend=metal`.
 
-Perf and correctness checks should first compare the backend component bench, then the real-weight dense MLP wrapper,
-then the layer/layer-ladder bench. Dense MLP scratch is reusable at model scope, but the caller must preserve the
-layer-boundary hidden buffer until downstream residual consumers have finished.
+Recommendation: Compare the backend component bench first.
+Then compare the real-weight dense MLP wrapper and the layer/layer-ladder bench.
+Dense MLP scratch is reusable at model scope.
+The caller must preserve the layer-boundary hidden buffer until downstream residual consumers finish.
 
-Shared GPU serialization, benchmark metrics, and performance-evidence rules are in
-[`executor_benchmarks.md`](executor_benchmarks.md).
+[`executor_benchmarks.md`](executor_benchmarks.md) defines shared GPU serialization, benchmark metrics, and
+performance-evidence rules.

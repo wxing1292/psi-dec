@@ -1,20 +1,24 @@
 # Runtime Core Guidance
 
-Runtime core owns scheduling, request lifecycle, and page/cache ownership. It should stay model-agnostic and separate
-from the model executor.
+Runtime core owns scheduling, request lifecycle, and page and cache ownership.
+
+Recommendation: Keep runtime core model-agnostic and separate from the model executor.
 
 ## Scope
 
-Core may know requests, batches, token/block indices, page IDs, lifecycle state, and allocation ownership.
+Core may know requests, batches, token and block indices, page IDs, lifecycle state, and allocation ownership.
 
-Core should not parse model-specific tensor layout, checkpoint/Metal buffer shapes, or GQA/gated-delta-net/MLP
-internals.
+Recommendation: Keep these details out of runtime core:
 
-`RuntimeConfig::num_tokens_per_cache_block` is model-neutral cache metadata:
-the token extent of one trie block and its attached opaque KV/state-page
-vectors. It is distinct from the number of tokens that a single physical KV
-page holds. The executor interprets each vector according to its model layout;
-the core only allocates, shares, and reports the vector as one logical block.
+- Model-specific tensor layouts
+- Checkpoint and Metal buffer shapes
+- GQA, Gated DeltaNet, and MLP internals
+
+`RuntimeConfig::num_tokens_per_cache_block` is model-neutral cache metadata. It gives the token extent of one trie
+block and its attached opaque KV and state-page vectors.
+
+This extent differs from the token capacity of one physical KV page. The executor interprets each vector according to
+its model layout. Core only allocates, shares, and reports the vector as one logical block.
 
 ## Core-owned responsibilities
 
@@ -32,7 +36,7 @@ cache/state lifecycle notifications to executor
 executor input metadata construction
 ```
 
-Prefer explicit contracts:
+Recommendation: Use explicit contracts:
 
 ```text
 request slot -> active request metadata
@@ -43,15 +47,15 @@ batch row -> token_index / block_index / page IDs
 
 ## Scheduler and trie cache object model
 
-The scheduler owns request placement, budgets and compute-slot ordering. A
-request owns its decoder-block view; preparing that view may reserve or reuse
-trie-cache blocks and physical pages before producing executor metadata:
+The scheduler owns request placement, budgets, and compute-slot ordering. A request owns its decoder-block view.
+Preparation can reserve or reuse trie-cache blocks and physical pages before preparation produces executor metadata.
 
-A full block is eligible for trie lookup only when at least one request token
-remains after it. This keeps a real forward suffix for logits and recurrent
-state instead of introducing a model-specific full-prefix replay operation.
-Earlier blocks still reuse trie entries, and a completed terminal mutable block
-is committed normally for use as a non-terminal prefix by later requests.
+A full block is eligible for trie lookup only when at least one request token remains after the block. This rule keeps
+a real forward suffix for logits and recurrent state. This design does not need a model-specific full-prefix replay
+operation.
+
+Earlier blocks still reuse trie entries. Core commits a completed terminal mutable block normally. Later requests can
+then use that block as a non-terminal prefix.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -113,53 +117,64 @@ is committed normally for use as a non-terminal prefix by later requests.
                                                         └──────────────┘
 ```
 
-`PrepareResult::Pending` deliberately leaves the request in the ID map without
-putting it on `run_queue`: previously submitted work owns its next transition,
-and the executor response returns the request through `commit`.
+`PrepareResult::Pending` deliberately leaves the request in the ID map. It does not put the request on `run_queue`.
+Previously submitted work owns the next transition. The executor response returns the request through `commit`.
 
-Runtime admission and scheduler batching have separate limits.
-`RuntimeConfig::max_queued_requests` bounds the user-request channel, while
-`RuntimeConfig::max_running_requests` bounds the request-slot domain and both
-reservation-task channels. `SchedulerConfig::max_requests`,
-`max_tokens`, and `max_tokens_per_request` remain per-batch limits, and
-`SchedulerConfig::max_compute_slots` bounds outstanding batches and therefore
-the batch-request and batch-response channels. Runtime initialization requires
-the per-batch request limit to be no larger than the running-request limit.
+Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_queued_requests` bounds the
+user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and both reservation-task
+channels.
 
-A queued request owns no request slot. The synchronous event loop registers the
-user-request receiver only while the request-slot allocator reports free
-capacity, allocates one slot after receiving the request, and then constructs
-the `InternalRequest` consumed by the scheduler. The same slot follows that
-request through run queues, device-pending work, reservation-task queues and
-async runners until request drop. Request-slot allocator usage is therefore the
-single admission count; no separate running-request counter exists.
+`SchedulerConfig::max_requests`, `max_tokens`, and `max_tokens_per_request` remain per-batch limits.
+`SchedulerConfig::max_compute_slots` bounds outstanding batches. It therefore also bounds the batch-request and
+batch-response channels.
 
-`PrepareResult::Await` transfers the request into a bounded asynchronous task
-queue without producing a device request for that request. Once preparation is
-invoked, the scheduler still allocates a compute slot and submits the resulting
-batch even when it contains zero device requests. Empty batches preserve
-executor participation for backends such as distributed expert parallelism;
-the empty response releases the compute slot in normal sequence order.
+Runtime initialization requires the per-batch request limit to be no larger than the running-request limit.
 
-A task runner transitions `Running -> Swapped` immediately before awaiting the
-reservation, then `Swapped -> Running` after completion. It publishes the
-request through a bounded synchronous completion channel; the synchronous event
-loop owns that receiver and appends the request to the run queue. A request
-that becomes terminal before or during the wait stays terminal and is logged
-and released by the event loop instead of being re-enqueued. Shutdown cancels
-the wait by dropping task/request ownership. The task pool runs on the service's
-Tokio runtime; the scheduler event loop remains a synchronous thread.
+A queued request owns no request slot. The synchronous event loop registers the user-request receiver only when the
+request-slot allocator reports free capacity.
 
-This is the complete lifecycle for asynchronous cache-reservation waits. It is
-not KV/state offload: backing storage remains where it was, and future
-onload/offload requires an additional explicit ownership design.
+After the event loop receives a request, it allocates one slot. It then constructs the `InternalRequest` that the
+scheduler consumes.
 
-The event loop submits immediately after receiving a user request, receiving a
-completed reservation wait, or committing a device response when the scheduler
-has runnable token work and a free compute slot. Request and token budgets
-remain hard per-batch limits in
-`FIFOBatcher::prepare`; they are not mutable aggregation thresholds, and the
-current path has no scheduler flush timer.
+The same slot follows the request until request drop. It passes through run queues, device-pending work,
+reservation-task queues, and asynchronous runners.
+
+Request-slot allocator usage is therefore the single admission count. No separate running-request counter exists.
+
+`PrepareResult::Await` transfers the request into a bounded asynchronous task queue. It does not produce a device
+request for that request.
+
+After preparation starts, the scheduler still allocates a compute slot and submits the resulting batch. It does this
+even when the batch contains zero device requests.
+
+Empty batches preserve executor participation for backends such as distributed expert parallelism. The empty response
+releases the compute slot in normal sequence order.
+
+A task runner transitions `Running -> Swapped` immediately before it awaits the reservation. After completion, it
+transitions `Swapped -> Running`.
+
+The task runner publishes the request through a bounded synchronous completion channel. The synchronous event loop owns
+the receiver and appends the request to the run queue.
+
+A request can become terminal before or during the wait. The request then stays terminal. The event loop logs and
+releases it instead of re-enqueuing it.
+
+Shutdown cancels the wait by dropping task and request ownership. The task pool runs on the service's Tokio runtime.
+The scheduler event loop remains a synchronous thread.
+
+This is the complete lifecycle for asynchronous cache-reservation waits. This lifecycle is not KV and state offload.
+Backing storage remains unchanged. Future onload and offload require an additional explicit ownership design.
+
+The event loop can submit after three events:
+
+- It receives a user request.
+- It receives a completed reservation wait.
+- It commits a device response.
+
+The event loop submits immediately when the scheduler has runnable token work and a free compute slot.
+
+Request and token budgets remain hard per-batch limits in `FIFOBatcher::prepare`. They are not mutable aggregation
+thresholds. The current path has no scheduler flush timer.
 
 The trie cache is the storage and reuse subsystem reached through each
 request's `TrieDecoderBlocks`:
@@ -215,11 +230,10 @@ TrieDecoderBlocks::prepare_blocks()
   -> model executor page/state tables
 ```
 
-Mutable and semi-immutable blocks are request-local lifecycle objects;
-immutable identity is represented by trie nodes. Pin counts protect reusable
-nodes from eviction, while S3FIFO tracks eligible unpinned leaves. The trie
-stores logical identity and ownership links; physical allocators own page IDs
-and backing storage.
+Mutable and semi-immutable blocks are request-local lifecycle objects. Trie nodes represent immutable identity. Pin
+counts protect reusable nodes from eviction. S3FIFO tracks eligible unpinned leaves.
+
+The trie stores logical identity and ownership links. Physical allocators own page IDs and backing storage.
 
 ## Page and cache model
 
@@ -239,16 +253,19 @@ page_id -> page buffer
 
 `page_id` is globally allocated. It is not scoped by lane, block, or layer.
 
-Runtime core does not define a GPU KV page tensor layout. It allocates opaque
-physical pages and reports their IDs in logical cache-block metadata. The
-executor interprets each page according to the active model; the current Qwen
-GQA layout is documented in [`executor_gqa.md`](executor_gqa.md).
+Runtime core does not define a GPU KV page tensor layout. It allocates opaque physical pages. It reports their IDs in
+logical cache-block metadata.
 
-CPU/onload/offload should consume the same logical metadata and physical page IDs. Do not invent a separate cache object hierarchy unless scheduling or placement policy needs it.
+The executor interprets each page according to the active model. [`executor_gqa.md`](executor_gqa.md) documents the
+current Qwen GQA layout.
+
+Recommendation: Use the same logical metadata and physical page IDs for CPU, onload, and offload paths.
+
+Do not create a separate cache object hierarchy unless scheduling or placement policy needs it.
 
 ## Managed objects
 
-Likely core-managed objects:
+Core-owned concepts include:
 
 ```text
 request
@@ -263,7 +280,7 @@ request lifecycle table
 accepted token/state metadata
 ```
 
-Each object should expose a small lifecycle surface:
+Recommendation: Give each object a small lifecycle surface:
 
 ```text
 get / get_ref / get_mut
@@ -273,11 +290,12 @@ push / pop
 reset
 ```
 
-Avoid near-synonyms such as `clear`, `zero`, `reset`, `load`, `insert`, and `publish` on the same object unless they operate on clearly different objects.
+Recommendation: Do not use near-synonyms such as `clear`, `zero`, `reset`, `load`, `insert`, and `publish` on the same
+object. Use them together only when they operate on clearly different objects.
 
 ## Executor notification contract
 
-Core should notify the executor when core-owned lifecycle state changes:
+Recommendation: Send core-owned lifecycle changes from core to the executor:
 
 ```text
 request slot initialized
@@ -288,47 +306,65 @@ accepted/rejected tokens finalized
 KV/state pages allocated or freed
 ```
 
-The executor should not infer global lifecycle state from a forward call. If a request slot must be globally reset, that should come from core lifecycle.
+Recommendation: Do not infer global lifecycle state from a forward call. Initiate a required global request-slot reset
+from core lifecycle.
 
-If only executor-local state must be replaced for one forward, use a specific set/update operation instead of resetting the whole slot.
+If one forward must replace only executor-local state, use a specific set or update operation. Do not reset the whole
+slot.
 
 ## Stop and EOS handling
 
-Runtime core owns token-id stop and EOS completion at the request commit boundary. The executor reports sampled tokens; core checks configured stop token sequences, commits decoder/cache state, truncates the user-visible output after the first matched stop sequence, and then marks the request completed. EOS is represented as a one-token stop sequence.
+Runtime core owns token-ID stop and EOS completion at the request commit boundary. The executor reports sampled tokens.
 
-The successful status records `CompletionReason::StopSequence` when the stop
-matcher observed a match, `LengthLimit` when the caller-visible output limit was
-reached, or `ContextLimit` when a future context-window limit is reached. The
-current runtime produces the first two reasons; context-window enforcement is
-tracked in [`future_work.md`](future_work.md). A stop match wins when both
-current conditions occur on the same commit. Service layers map the recorded
-reason and must not infer it from emitted token count.
+Core checks the configured stop token sequences. It commits decoder and cache state. It truncates user-visible output
+after the first matched stop sequence. Core then marks the request completed.
+
+A one-token stop sequence represents EOS.
+
+The successful status records one of these completion reasons:
+
+- `CompletionReason::StopSequence` when the stop matcher observed a match
+- `LengthLimit` when caller-visible output reaches its limit
+- `ContextLimit` when a future context window reaches its limit
+
+The current runtime produces the first two reasons. [`future_work.md`](future_work.md) tracks context-window
+enforcement.
+
+A stop match wins when both current conditions occur on the same commit. Service layers map the recorded reason. They
+must not infer it from the emitted token count.
 
 Model executors may provide model-specific default stop sequences, such as Qwen
 EOS token IDs. The service merges caller-provided token sequences with model
 defaults and de-duplicates them before submitting the request to core.
 
-Per-request token/probability delivery must not silently drop committed output.
-The current runtime uses an unbounded internal channel between request commit
-and the transport-neutral `DecodeResponse`. Dropping that response drops its
-external request, closes the receiver, and cancels the request lifecycle.
-Slow-consumer memory accounting and a bounded request-local cancellation policy
-remain future work.
+Per-request token and probability delivery must not silently drop committed output. The current runtime uses an
+unbounded internal channel between request commit and the transport-neutral `DecodeResponse`.
 
-`max_sampled_tokens` is a caller-visible output limit. A speculative step may
-commit more sampled tokens to decoder/cache state than the caller's remaining
-budget. Core truncates only the `TokenProbs` sent to the caller, leaves the
-sampled-token commit unchanged, marks the request completed, and lets request
-drop release its decoder/cache ownership.
+Dropping that response causes three actions:
 
-Request-slot drop adds its slot to a deduplicated reset set before returning the
-slot to the allocator. A capacity-one channel only wakes the executor; it
-never carries slot IDs, and a full wake channel means a wake is already pending.
-The executor event loop selects over wake notifications and device batches, so
-slots dropped before any device batch are reset while the executor is otherwise
-idle. When a batch arrives, the executor also drains the reset set before
-preparing that batch; a newly reused slot therefore cannot execute ahead of its
-prior reset notification.
+- It drops the external request.
+- It closes the receiver.
+- It cancels the request lifecycle.
+
+Slow-consumer memory accounting and a bounded request-local cancellation policy remain future work.
+
+`max_sampled_tokens` is a caller-visible output limit. A speculative step can
+commit more sampled tokens to decoder and cache state than the caller's remaining
+budget.
+
+Core truncates only the `TokenProbs` sent to the caller. It leaves the sampled-token commit unchanged and marks the
+request completed. Request drop then releases its decoder and cache ownership.
+
+Request-slot drop adds its slot to a deduplicated reset set. It does this before it returns the slot to the allocator.
+
+A capacity-one channel only wakes the executor. It never carries slot IDs. A full wake channel means that a wake is
+already pending.
+
+The executor event loop selects over wake notifications and device batches. It can therefore reset dropped slots while
+the executor is otherwise idle.
+
+When a batch arrives, the executor drains the reset set before it prepares the batch. A reused slot cannot execute
+before its prior reset notification.
 
 ## Scheduler contracts and invariants
 
@@ -343,11 +379,17 @@ accepted/rejected token metadata is internally consistent
 request slot lifecycle notifications are ordered
 ```
 
-The scheduler forms FIFO ragged batches from runtime readiness and token-budget
-constraints. It does not group requests by model-executor sampling parameters
-such as top-k, top-p, temperature, seed, or speculative stage. A model executor
-must accept the resulting mixed batch and compact, partition, or select replay
-geometry internally without changing scheduler policy.
+The scheduler forms FIFO ragged batches from runtime readiness and token-budget constraints. It does not group requests
+by these model-executor sampling parameters:
+
+- Top-k
+- Top-p
+- Temperature
+- Seed
+- Speculative stage
+
+A model executor must accept the resulting mixed batch. It must compact or partition the batch, or select replay
+geometry internally. It must not change scheduler policy.
 
 Request status tracks lifecycle ownership, not scheduler placement:
 
@@ -361,38 +403,50 @@ terminal    -> Cancelled, TimedOut, Aborted, or Completed(CompletionReason)
 Scheduler-internal locations such as new queue, run queue, pending device work,
 and response commit do not create additional request statuses.
 
-Runtime-critical background threads hold a `ShutdownGuard` for their full
-lifetime. Normal return and panic unwind both drop the guard and notify the
-other runtime loops to stop; a failed worker must not leave a partially live
-service waiting forever.
+Runtime-critical background threads hold a `ShutdownGuard` for their full lifetime. Normal return and panic unwind both
+drop the guard. Both paths notify the other runtime loops to stop.
+
+A failed worker must not leave a partially live service waiting indefinitely.
 
 `PrepareResult::Pending` means a request has no additional runnable query while
 previous scheduled work is still in flight. The batcher keeps it in the
-request-ID map but does not put it back on the run queue; the model executor's
-response returns it through `commit`. Do not requeue `Pending` requests. Device
-batch responses currently commit in submission order because decoder scheduled
-token ranges are FIFO-owned. Pipeline stages may overlap, but their final
-responses must preserve that order until core owns an explicit epoch/reorder
-buffer. An out-of-order response is an internal contract violation and should
-fail fast until a real transport reorder contract is introduced.
+request-ID map. It does not put the request back on the run queue. The model executor response returns it through
+`commit`.
+
+Do not requeue `Pending` requests. Device batch responses currently commit in submission order because decoder
+scheduled token ranges are FIFO-owned.
+
+Pipeline stages can overlap. Their final responses must preserve submission order until core owns an explicit epoch or
+reorder buffer.
+
+An out-of-order response is an internal contract violation.
+
+Recommendation: Fail fast on this response until a real transport reorder contract exists.
 
 Reservation waits use bounded swap-out and swap-in channels. Their capacities
 equal `RuntimeConfig::max_running_requests`, which is also the hard
 request-slot limit and the executor request-state domain. Every admitted
-request owns exactly one slot and can occupy either channel once, so a full
-channel is an ownership/accounting bug and fails fast.
+request owns exactly one slot and can occupy either channel once.
 
-Queue priority is run queue before new queue: a continued request goes to the
-front, a completed reservation wait goes to the back, and a new request enters
-the new queue. Crossbeam selection can still receive a new request just before
-an already-ready swap-in completion; draining both ready input channels before
-flushing remains future work. Actual KV/state onload and offload also remains
-future work and must not reuse the reservation-wait name as if data movement
-already existed.
+The runtime fails fast when either channel is full. A full channel indicates an ownership or accounting bug.
+
+The run queue has priority over the new queue:
+
+- A continued request goes to the front.
+- A completed reservation wait goes to the back.
+- A new request enters the new queue.
+
+Crossbeam selection can still receive a new request immediately before an already-ready swap-in completion. Draining
+both ready input channels before flushing remains future work.
+
+Actual KV and state onload and offload also remain future work. This work must not use the reservation-wait name as if
+data movement already existed.
 
 Do not add executor-side recovery for impossible scheduler states unless there is a real runtime recovery path.
 
-## Core should avoid
+## Core exclusions
+
+Recommendation: Keep these details out of core:
 
 ```text
 model-specific layer parsing

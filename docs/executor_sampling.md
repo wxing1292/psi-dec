@@ -1,8 +1,8 @@
 # Sampling Executor
 
-This document owns the current top-k/top-p sampling and sparse rejection-sampling contracts. Qwen stage ordering and
-MTP proposal ownership remain in [`executor_qwen.md`](executor_qwen.md); generic executor composition remains in
-[`executor.md`](executor.md).
+This document owns the current top-k/top-p sampling and sparse rejection-sampling contracts.
+[`executor_qwen.md`](executor_qwen.md) owns Qwen stage order and MTP proposal ownership.
+[`executor.md`](executor.md) owns generic executor composition.
 
 ## Source layout
 
@@ -30,15 +30,17 @@ crates/inference-executor-metal/src/model/qwen/v3_5/
   rejection_sampling.rs   Qwen microbatch preparation and RejectionSampling composition
 ```
 
-Runtime core transports sampler configuration and sampled decisions. It does not own RNG state, sparse distributions,
-or replay geometry. The executor resolves one root seed per live request slot and keeps it stable until that slot is
-reset.
+Runtime core transports sampler configuration and sampled decisions.
+It does not own RNG state, sparse distributions, or replay geometry.
+The executor resolves one root seed for each live request slot.
+It keeps that seed stable until the slot resets.
 
 ## Normal sampling
 
-Each compact sampled row carries its own temperature, top-k, top-p, resolved seed, logical output-token position, and
-`SamplingDomain`. The current default decode policy is temperature 0.7, top-p 0.8, and top-k 20. Greedy decoding is the
-same contract with top-k 1 and temperature 0.
+Each compact sampled row has its own sampling parameters.
+They include temperature, top-k, top-p, resolved seed, logical output-token position, and `SamplingDomain`.
+The current default decode policy uses temperature 0.7, top-p 0.8, and top-k 20.
+Greedy decoding uses the same contract with top-k 1 and temperature 0.
 
 ```text
 logits [num_rows, vocab_size]
@@ -52,20 +54,23 @@ logits [num_rows, vocab_size]
   -> sampled token IDs + probabilities
 ```
 
-The small-k path uses repeated maximum reduction for normal top-k <= 32. Larger top-k and bf16 sparse-distribution
-generation use the bitonic tile path. They remain separate pipeline entry points because unused static threadblock
-storage can still reduce occupancy.
+The small-k path uses repeated maximum reduction for normal top-k <= 32.
+Larger top-k and bf16 sparse-distribution generation use the bitonic tile path.
+These operations remain separate pipeline entry points.
+Unused static threadblock storage can reduce occupancy.
 
-Sampling returns only token IDs and probabilities. Tile candidates and merged rows are private scratch, not model-level
-API state. Repetition, frequency, and presence penalties are not part of the current input contract.
-`TopKSamplingOutputBuffers` is the concrete sampled token/probability buffer owner; `OutputBuffers` denotes GPU buffers,
-not a model lifecycle state machine.
+Sampling returns only token IDs and probabilities.
+Tile candidates and merged rows are private scratch, not model-level API state.
+The current input contract does not include repetition, frequency, or presence penalties.
+`TopKSamplingOutputBuffers` owns the concrete sampled token and probability buffers.
+`OutputBuffers` denotes GPU buffers, not a model lifecycle state machine.
 
 ## Sparse distributions and rejection
 
 Qwen MTP proposals and target verification use the same post-temperature/top-k/top-p distribution family as ordinary
-sampling. The production path stores sparse token/probability rows; it does not scatter them into dense full-vocabulary
-buffers.
+sampling.
+The production path stores sparse token and probability rows.
+It does not scatter them into dense full-vocabulary buffers.
 
 ```text
 proposal logits
@@ -83,42 +88,55 @@ target distributions + draft distributions + flat draft tokens
   -> accepted draft prefix + one fallback/continuation token
 ```
 
-The target table contains one distribution per draft token plus one final continuation distribution per request. The
-draft table contains one distribution per draft token. `cu_target_distributions` and `cu_draft_distributions` select the
-ragged per-request ranges. Requests are independent; drafts within one request are ordered because the first rejection
-ends that request's acceptance walk.
+The target table contains one distribution for each draft token.
+It also contains one final continuation distribution for each request.
+The draft table contains one distribution for each draft token.
+`cu_target_distributions` and `cu_draft_distributions` select the ragged per-request ranges.
+Requests are independent.
+Drafts within one request are ordered because the first rejection ends that request's acceptance walk.
 
-`SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`. `max_k` is the maximum
-sparse Top-K row width, not vocabulary size. Debug builds additionally retain `expected_draft_token_ids` for lifecycle
-validation; release builds do not allocate, reset, or compare that CPU-only metadata.
+`SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
+`max_k` is the maximum sparse Top-K row width, not the vocabulary size.
+Debug builds also retain `expected_draft_token_ids` for lifecycle validation.
+Release builds do not allocate, reset, or compare this CPU-only metadata.
 
 ## Replay ownership
 
-Sampling and rejection use capacity replay keys. Power-of-two row/request capacities are capped by executor config;
-exact active thread counts are submission-scoped `ReplayArguments`. Every padded kernel returns inactive lanes before
-reading input, changing RNG state, or writing output. A 0/1 capacity uses an immediate constant to preserve the common
-single-request decode path.
+Sampling and rejection use capacity replay keys.
+Executor configuration caps power-of-two row and request capacities.
+Submission-scoped `ReplayArguments` contain exact active thread counts.
+Every padded kernel returns inactive lanes before it reads input, changes RNG state, or writes output.
+A 0/1 capacity uses an immediate constant to preserve the common single-request decode path.
 
-Active top-k remains in the replay shape because it changes candidate and scratch geometry. Temperature, top-p, seed,
-logical position, and RNG domain are dynamic request data and never enter replay keys.
+Active top-k remains in the replay shape because it changes candidate and scratch geometry.
+Temperature, top-p, seed, logical position, and RNG domain are dynamic request data.
+They never enter replay keys.
 
-Writing runtime sampling/rejection parameters arms exactly one replay-argument preparation. That preparation consumes
-the matching active row/request count and clears the armed state; replay without a fresh write is an invariant violation,
-not permission to reuse stale parameter rows.
+Writing runtime sampling or rejection parameters arms exactly one replay-argument preparation.
+That preparation consumes the matching active row or request count.
+It then clears the armed state.
+Replay without a fresh write is an invariant violation.
+It does not permit reuse of stale parameter rows.
 
-The Qwen executor owns three distinct graph/cache stages: `Replay<Sampling>` for ordinary Main output,
-`Replay<DraftSampling>` for MTP draft sampling plus sparse draft-distribution storage, and
-`Replay<RejectionSampling>` for target sparse-distribution generation plus sparse rejection. They share one
-`Rc<TopKSampling>` implementation and its parameter/scratch buffers, but retain separate replay keys and programs.
+The Qwen executor owns three distinct graph and cache stages:
 
-Main and MTP forward token counts remain exact because the complete upstream model slice does not yet share an
-inactive-lane ABI. MTP draft sampling is a distinct replay composed after MTP GatherUnembed; sparse target distribution plus
-rejection is a separate target-stage replay.
+- `Replay<Sampling>` handles ordinary Main output.
+- `Replay<DraftSampling>` handles MTP draft sampling and sparse draft-distribution storage.
+- `Replay<RejectionSampling>` handles target sparse-distribution generation and sparse rejection.
+
+These stages share one `Rc<TopKSampling>` implementation and its parameter and scratch buffers.
+They retain separate replay keys and programs.
+
+Main and MTP forward token counts remain exact.
+The complete upstream model slice does not yet share an inactive-lane ABI.
+MTP draft sampling is a distinct replay after MTP GatherUnembed.
+Sparse target distribution and rejection form a separate target-stage replay.
 
 ## Correctness and benchmarks
 
-CPU references define sampling and rejection math. Focused Metal tests compare fixed and random distributions, mixed
-per-row sampling parameters, deterministic seed/domain behavior, and accepted/rejected MTP paths against those oracles.
+CPU references define sampling and rejection math.
+Focused Metal tests compare fixed and random distributions with these references.
+They also compare mixed per-row parameters, deterministic seed/domain behavior, and accepted/rejected MTP paths.
 GPU tests run serially under the repository Metal reservation/lock rules.
 
 Synthetic backend modes:
@@ -129,6 +147,7 @@ cargo bench -p inference-backend-metal --bench sampling_rejection -- \
   --iters 1 --warmup-iters 0 --runs 1
 ```
 
-Supported modes are `top-k-sample`, `top-k-sparse-distribution`,
-`top-k-sample-and-sparse-distribution`, and `rejection-sparse`. The model-executor target is
-`qwen35_sampling`. See [`executor_benchmarks.md`](executor_benchmarks.md) for shared measurement and provenance rules.
+Supported modes are `top-k-sample`, `top-k-sparse-distribution`, `top-k-sample-and-sparse-distribution`, and
+`rejection-sparse`.
+The model-executor target is `qwen35_sampling`.
+[`executor_benchmarks.md`](executor_benchmarks.md) defines shared measurement and provenance rules.

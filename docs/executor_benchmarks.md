@@ -1,25 +1,30 @@
 # Executor Tests, Benchmarks, and Profiling
 
 This document owns the executor verification ladder, benchmark surfaces, metrics, profiling conventions, and performance
-evidence requirements. Component math and source layouts remain in the matching `executor_*.md`; service lifecycle and
-end-to-end commands remain in [`service.md`](service.md).
+evidence requirements. Component math and source layouts remain in the matching `executor_*.md`.
+[`service.md`](service.md) contains the service lifecycle and end-to-end commands.
 
 ## Verification ladder
 
 Use the smallest production owner that can prove the changed contract, then compose upward:
 
-1. Compare each optimized backend component with a slow/CPU reference.
-2. Exercise the real production component API and its metadata/buffer owner.
+1. Compare each optimized backend component with a slow or CPU reference.
+2. Exercise the real production component API and the owner of its metadata and buffer.
 3. Verify one real-weight layer path.
 4. Scale Qwen layers through `layer0`, `layer4`, `first4`, and `main_all`.
 5. Add embedding, final norm, unembedding, and ordinary sampling.
 6. Add MTP proposal, sparse distributions, rejection, and commit last.
 
-Component wins do not prove end-to-end performance; e2e regressions should be bisected down the same ladder. Correctness
-and workload identity come before timing.
+Component gains do not prove end-to-end performance.
 
-Run Metal/GPU commands strictly serially across tests, benches, services, and worktrees; use `--test-threads=1` for a
-Metal test command. Keep expected-panic contract tests host-only so one deliberate panic cannot obscure later GPU
+Recommendation: Use the same ladder to isolate end-to-end regressions.
+
+Establish correctness and workload identity before timing.
+
+Run Metal and GPU commands strictly serially across tests, benchmarks, services, and worktrees. Use `--test-threads=1`
+for a Metal test command.
+
+Keep expected-panic contract tests on the host. This placement prevents one deliberate panic from obscuring later GPU
 results.
 
 ## Benchmark layers
@@ -49,21 +54,24 @@ qwen35_embed      qwen35_layers  qwen35_output
 qwen35_sampling   qwen35_executor
 ```
 
-All real-weight targets except `qwen35_sampling` require `--model-dir`. They share `--iters`, `--warmup-iters`, and
-`--runs`. Production `src` must not gain benchmark-only state, feature paths, or environment knobs.
+All real-weight targets except `qwen35_sampling` require `--model-dir`. These targets share `--iters`,
+`--warmup-iters`, and `--runs`.
+
+Production `src` must not gain benchmark-only state, feature paths, or environment controls.
 
 ## Target meanings
 
-- `qwen35_gqa` selects `--gqa-model 27b|35b`, accepts `single_q_token`/`tiled_q_tokens` paths, and can run an explicit
+- `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts `single_q_token` or `tiled_q_tokens`. It can run an explicit
   untimed `--validate-tiled-q-tokens` comparison.
-- `qwen3_gqa` loads real Qwen3 ungated-GQA weights, measures full replay and SDPA-only paths, exposes the static tile
-  geometry as CLI arguments, and can validate single-Q against tiled output.
+- `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay and SDPA-only paths.
+- `qwen3_gqa` exposes static tile geometry as CLI arguments. It can validate single-Q output against tiled output.
 - `qwen35_gdn` measures the current ragged recurrent GDN path with the 35B-A3B profile.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer4`, `first4`, or `main_all`.
-- `qwen35_output` begins at final norm/gather/unembedding and can isolate sampling/readback.
-- `qwen35_executor` measures the public executor contract with fixed `e2e_wo_mtp` and `e2e_w_mtp` cases. Its MTP case
-  obtains proposal/draft tokens from production execution rather than substituting a static draft.
+- `qwen35_output` begins at final norm, gather, and unembedding. It can isolate sampling and readback.
+- `qwen35_executor` measures the public executor contract with fixed `e2e_wo_mtp` and `e2e_w_mtp` cases.
+- The `qwen35_executor` MTP case obtains proposal and draft tokens from production execution. It does not substitute a
+  static draft.
 
 Representative smoke commands:
 
@@ -86,21 +94,34 @@ cargo bench -p inference-executor-metal --bench qwen35_executor -- \
   --cases e2e_w_mtp --iters 1 --warmup-iters 0 --runs 1
 ```
 
-Run one perf command at a time. List planned cases first; GPU contention and memory pressure invalidate comparisons.
+Run one performance command at a time. List the planned cases first. GPU contention and memory pressure invalidate
+comparisons.
 
 ## Metrics
 
-`setup_us` includes model loading and fixture construction. `cache_miss_wall_us` is the first complete execution;
-`cache_build_estimate_us` is the CPU record/finish estimate after subtracting measured replay waits. Whole-executor
-samples report wall time plus main/output/speculator replay waits. Prepare, record/finish, feedback, and commit remain
-distinct host boundaries.
+`setup_us` includes model loading and fixture construction. `cache_miss_wall_us` is the first complete execution.
 
-Force-sync/profile-summary measurements are diagnostic metrics, not normal wall-clock throughput. Never compare the two
-as if they measured the same workload.
+`cache_build_estimate_us` is the CPU record and finish estimate after subtracting measured replay waits. Whole-executor
+samples report wall time and main, output, and speculator replay waits.
 
-Benchmark keys contain only comparison dimensions. Model, storage/backend, operation, batch/tokens, and a meaningful
-context/state coordinate are useful; default layer 0, generic `detail`/`sub-op`, and metadata already printed elsewhere
-are not.
+Prepare, record and finish, feedback, and commit remain distinct host boundaries.
+
+Force-sync and profile-summary measurements are diagnostic metrics. They are not normal wall-clock throughput. Never
+compare the two measurement types as equivalent workloads.
+
+Benchmark keys contain only comparison dimensions. Useful dimensions include:
+
+- Model
+- Storage and backend
+- Operation
+- Batch and tokens
+- A meaningful context or state coordinate
+
+Do not include these values:
+
+- Default layer 0
+- Generic `detail` or `sub-op`
+- Metadata that output already shows elsewhere
 
 ```text
 gqa/qwen36-27b/metal/full-forward/b1t64-c1024
@@ -110,20 +131,11 @@ moe/qwen36-35b-a3b/metal/token-major/b1t64
 
 ## Profiling and logging
 
-Profile paths are stable, hyphenated, static tree segments owned by local `tree_span_keys.rs` files. Dynamic request,
-shape, page, layer, or state values belong in structured logs, not profile keys.
+The service uses static `profiling::span(...)` names for its coarse CPU tree. Put dynamic request and shape values in
+structured logs.
 
-Production executor callsites remain module-qualified:
-
-```text
-profile::span(...)        tracing::debug!(...)
-profile::eval_component  tracing::info!(...)
-profile::eval_operation  tracing::warn!(...)
-```
-
-The service's `--profile component|operation` modes currently produce the same coarse CPU tree. They do not provide GPU
-kernel timestamps. Use replay-stage debug timing for submission/wait boundaries and Metal capture/counters for kernel
-attribution. Service logging fields and commands are documented in [`service.md`](service.md).
+The `--profile component|operation` modes currently produce the same tree. They do not provide GPU kernel timestamps.
+[`service.md`](service.md) documents service logging fields and commands.
 
 ## Performance evidence
 
@@ -139,5 +151,11 @@ baseline and current samples
 verdict
 ```
 
-For speculative decoding also record proposals, sampled tokens, accepted tokens/chunks, and acceptance efficiency. A
-throughput change with a different deterministic acceptance trajectory is not a pure executor/kernel comparison.
+For speculative decoding, also record these values:
+
+- Proposals
+- Sampled tokens
+- Accepted tokens and chunks
+- Acceptance efficiency
+
+A throughput change with a different deterministic acceptance trajectory is not a pure executor or kernel comparison.

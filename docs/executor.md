@@ -5,8 +5,8 @@ weights, component state, replay composition, and sampling. It does not schedule
 cache pages.
 
 Read this document after the top-level [README](../README.md) and [`core.md`](core.md). It explains the stable executor
-mental model; component documents describe current source and algorithms, while workflow documents carry shared
-commands and cross-component measurement rules.
+mental model. Component documents describe current source and algorithms. Workflow documents contain shared commands
+and cross-component measurement rules.
 
 ## Boundary and ownership
 
@@ -21,15 +21,17 @@ model executor
   bind model weights and component state
   interpret page IDs for GQA/GDN
   compose model stages and replay programs
-  return sampled decisions and lifecycle notifications
+  return sampled decisions and component results
           |
           v
 Metal backend
   own device, buffers, kernels, command recording, and replay submission
 ```
 
-The executor consumes runtime decisions; it must not recreate scheduler policy. The runtime transports model inputs and
-outputs; it must not parse model tensor layouts or component-local page contents.
+The executor consumes runtime decisions. It must not recreate scheduler policy.
+
+The runtime transports model inputs and outputs. It must not parse model tensor layouts or component-local page
+contents.
 
 ## Shared component model
 
@@ -43,18 +45,25 @@ backend-neutral core/config and shape contract
   -> CPU/reference oracle and focused production-owner tests
 ```
 
-Component-specific complexity stays behind that boundary. Backend APIs remain model-independent; Qwen adapters supply
+Component-specific complexity stays behind that boundary. Backend APIs remain model-independent. Qwen adapters supply
 model dimensions, weights, and measured defaults.
 
-Validation follows the same ownership. Config loading returns errors when checkpoint data cannot be parsed or normalized;
-component `Core`/backend constructors assert their static geometry once; replay recording checks only current-batch shape,
-capacity, and binding contracts. Do not restate component geometry in model normalization or revalidate immutable
-core/config state on every record.
+Validation follows the same ownership:
 
-Do not add wrappers merely to make names line up. A type is useful when it owns a semantic boundary, invariant,
-resource, or lifecycle. For example, `GQAMetadataBuffers` and `GDNMetadataBuffers` own reusable GPU metadata buffers for one
-batch, while `GQAInput`/`GDNInput` borrow the actual record-time tensors and component metadata. `GQAOutput` and
-`GDNOutput` name the corresponding component outputs without introducing another allocation owner.
+- Config loading returns errors when it cannot parse or normalize checkpoint data.
+- Component `Core` and backend constructors assert their static geometry once.
+- Replay recording checks only current-batch shape, capacity, and binding contracts.
+
+Do not restate component geometry during model normalization. Do not revalidate immutable core and config state on each
+record.
+
+Do not add wrappers only to align names. A type is useful when it owns a semantic boundary, invariant, resource, or
+lifecycle.
+
+`GQAMetadataBuffers` and `GDNMetadataBuffers` own reusable GPU metadata buffers for one batch. `GQAInput` and `GDNInput`
+borrow the record-time tensors and component metadata.
+
+`GQAOutput` and `GDNOutput` name the corresponding component outputs. They do not introduce another allocation owner.
 
 ## Current source areas
 
@@ -82,7 +91,7 @@ crates/inference-backend-metal/src/
 For exact files and current paths, use the component documents:
 
 - [`executor_qwen.md`](executor_qwen.md): Qwen semantic model loading, request state, replay stages, and MTP.
-- [`executor_gqa.md`](executor_gqa.md): GQA projection, KV pages, attention map/reduce, and outputs.
+- [`executor_gqa.md`](executor_gqa.md): GQA projection, KV pages, attention map and reduce, and outputs.
 - [`executor_gdn.md`](executor_gdn.md): GDN projection, short convolution, recurrence, and state pages.
 - [`executor_dense_mlp.md`](executor_dense_mlp.md): dense gated MLP.
 - [`executor_moe.md`](executor_moe.md): routing and sparse expert execution.
@@ -90,8 +99,8 @@ For exact files and current paths, use the component documents:
 
 ## Model composition
 
-Model-specific code wires reusable components together; it does not absorb their implementations. A Qwen main forward
-is conceptually:
+Model-specific code connects reusable components. It does not absorb their implementations. A Qwen main forward has
+this conceptual flow:
 
 ```text
 token IDs
@@ -108,28 +117,35 @@ token IDs
   -> optional MTP proposal and rejection flow
 ```
 
-Normalized model configuration selects each layer variant, and exact typed binding subtrees identify its weights.
-Semantic layer/component `load` functions consume those inputs directly; there is no parallel Main/MTP plan tree. The
-layer owns stage ordering and scratch handoff. The component owns reusable math, backend dispatch, and component-local
-state interpretation.
+Normalized model configuration selects each layer variant. Exact typed binding subtrees identify the weights.
+
+Semantic layer and component `load` functions consume those inputs directly. There is no parallel Main or MTP plan
+tree.
+
+The layer owns stage ordering and scratch handoff. The component owns reusable math, backend dispatch, and
+component-local state interpretation.
 
 Backend-neutral core types name component geometry and runtime replay shapes. Metal `ReplayLayer` names the typed
-record input/output and the record operation. It is intentionally lightweight: page tables, routing keys, state
-transactions, and other real component metadata remain explicit typed input rather than being hidden behind an
-artificial tensor-to-tensor API.
+record input and output and the record operation.
+
+`ReplayLayer` is intentionally lightweight. Page tables, routing keys, state transactions, and other component metadata
+remain explicit typed input. An artificial tensor-to-tensor API does not hide this metadata.
 
 ## Weight contract
 
 Model weights are immutable after initialization.
 
 - Parse model layout and validate shapes while loading.
-- Perform required relayout, slicing, head reordering, fusion, and format normalization once at init.
-- Materialize backend-owned immutable buffers/views, then release checkpoint mmap/file ownership when possible.
+- Complete required relayout, slicing, head reordering, fusion, and format normalization during initialization.
+- Materialize backend-owned immutable buffers and views, then release checkpoint mmap and file ownership when possible.
 - Do not rewrite, relayout, or fuse model weights per request or token.
 - Do not silently dequantize a full unsupported quantized weight. Fail explicitly when no runtime kernel supports it.
 
-Dense norms or biases may be materialized as dense buffers; that is different from expanding quantized matrix weights.
-Avoid hot-path `contiguous` calls. If a layout is required for execution, prepare it at init.
+Dense norms or biases may be materialized as dense buffers. This operation differs from expanding quantized matrix
+weights.
+
+Recommendation: Do not use hot-path `contiguous` calls. If execution requires a layout, prepare it during
+initialization.
 
 ## Metal lowering boundary
 
@@ -145,9 +161,16 @@ ReplayLayer::record(typed input)
 ```
 
 The executor owns semantic stage order and the buffers exchanged between stages. Backend operators own kernel binding,
-resource usage, dispatch, and internal phase barriers. The complete Metal object model, residency rules, stream
-lifecycle, and minimal Add One example live in the backend
-[`README`](../crates/inference-backend-metal/README.md); they are not duplicated here.
+resource usage, dispatch, and internal phase barriers.
+
+The backend [`README`](../crates/inference-backend-metal/README.md) contains these details:
+
+- The complete Metal object model
+- Residency rules
+- The stream lifecycle
+- The minimal Add One example
+
+This document does not duplicate those details.
 
 ### Buffer and scratch ownership
 
@@ -155,27 +178,31 @@ Keep these domains distinct:
 
 | Object | Owner | Meaning |
 | --- | --- | --- |
-| Immutable weight buffer | model/component | initialized once and shared across replays |
-| Runtime page buffer | runtime allocation; component interpretation | persistent KV or GDN state addressed by runtime page IDs |
+| Immutable weight buffer | model or component | initialized once and shared across replays |
+| Runtime page buffer | runtime allocates and component interprets | persistent KV or GDN state addressed by runtime page IDs |
 | Batch metadata buffer | component batch-metadata owner | current batch's offsets, page IDs, or state slots |
-| Scratch buffer | component/layer/model scratch owner | temporary partials and intermediates with explicit reuse boundaries |
+| Scratch buffer | component, layer, or model scratch owner | temporary partials and intermediates with explicit reuse boundaries |
 | Replay parameter buffer | backend replay program | submission-time scalar values for one recorded program |
 
-A `Buffer` is raw storage. A tensor/weight view adds dtype, shape, layout, and byte offset. Different views may alias one
-buffer intentionally; scratch reuse is correct only when the next writer cannot destroy data still consumed by a later
-stage.
+A `Buffer` is raw storage. A tensor or weight view adds dtype, shape, layout, and byte offset.
+
+Different views may intentionally alias one buffer. Scratch reuse is correct only when the next writer cannot destroy
+data that a later stage still consumes.
 
 ### Barriers
 
-A barrier belongs to the consumer command that must wait. Layer entry barriers protect cross-component dependencies;
-backend components retain their internal phase barriers. Do not infer barriers from method order, duplicate them at
-both layers, or add them to independent reads.
+A barrier belongs to the consumer command that must wait. Layer entry barriers protect cross-component dependencies.
+Backend components retain their internal phase barriers.
+
+Do not infer barriers from method order. Do not duplicate them at both layers. Do not add barriers to independent
+reads.
 
 ## Replay composition
 
-Recording is expensive relative to replay, so stable command topology is cached. A replay key contains only values that
-change recorded commands, dispatch topology, static geometry, or scratch layout. Dynamic values that fit an existing
-recording are written into metadata buffers or `ReplayArguments`.
+Recording is expensive relative to replay. The executor therefore caches stable command topology.
+
+A replay key contains only values that change recorded commands, dispatch topology, static geometry, or scratch layout.
+Metadata buffers or `ReplayArguments` contain dynamic values that fit an existing recording.
 
 ```text
 static / replay-defining
@@ -189,58 +216,83 @@ dynamic / submission-scoped
   other values consumed through current batch metadata
 ```
 
-Power-of-two capacity replay is safe only when every participating kernel returns inactive lanes before reading input,
-mutating state, advancing RNG, or writing output. Otherwise the replay key keeps the exact count. Padding is a dispatch
-property, not permission to change valid work or semantic descriptor counts.
+Power-of-two capacity replay is safe only when each participating kernel causes inactive lanes to return before these
+actions:
 
-`ReplayArguments` are keyed submission values declared while recording. Submission validates that every declared value
-is provided exactly once and within its recorded bounds. They avoid rebuilding a program for scalar activity changes;
-they do not replace component batch metadata.
+- Reading input
+- Mutating state
+- Advancing RNG
+- Writing output
+
+Otherwise, the replay key keeps the exact count. Padding is a dispatch property. It does not permit changes to valid
+work or semantic descriptor counts.
+
+`ReplayArguments` contain keyed submission values that recording declares. Submission validates that the caller
+provides each declared value exactly once and within its recorded bounds.
+
+These arguments prevent a program rebuild for scalar activity changes. They do not replace component batch metadata.
 
 ### Qwen replay stages
 
-Qwen keeps separate replay caches for semantically separate stages such as main forward, target output, GDN state
-restore, ordinary sampling, MTP proposal, draft sampling, and target rejection. A cache boundary exists when command
-topology, lifecycle, or CPU dependency differs—not merely because a component has its own name.
+Qwen keeps separate replay caches for these semantically separate stages:
 
-Normal forward/output/sampling commands that share one dependency chain can be submitted in one ordered command buffer.
-MTP proposal and target rejection remain separated where the accepted-token decision crosses the CPU boundary. GDN
-state candidate preparation and cache-boundary publication preserve their own transaction lifecycle even when their
-GPU work is replayed.
+- Main forward
+- Target output
+- GDN state restore
+- Ordinary sampling
+- MTP proposal
+- Draft sampling
+- Target rejection
 
-Detailed keys, stage order, and request lifecycle are in [`executor_qwen.md`](executor_qwen.md). Sampling/rejection RNG
+A cache boundary exists when command topology, lifecycle, or CPU dependency differs. A component name alone does not
+create a cache boundary.
+
+Normal forward, output, and sampling commands can share one ordered command buffer when they share one dependency chain.
+
+MTP proposal and target rejection remain separate where the accepted-token decision crosses the CPU boundary. GDN state
+candidate preparation and cache-boundary publication retain their transaction lifecycle when their GPU work is
+replayed.
+
+Detailed keys, stage order, and request lifecycle are in [`executor_qwen.md`](executor_qwen.md). Sampling and rejection RNG
 and sparse-distribution contracts are in [`executor_sampling.md`](executor_sampling.md).
 
 ## Concurrency and lifecycle
 
-The current service path uses one executor synchronously: prepare a batch, execute it, obtain the result, and commit
-before the next batch. Replay caches, scratch owners, request-slot state, and pending GDN transactions therefore remain
-executor-owned and single-thread confined unless an API explicitly states otherwise.
+The current service path uses one executor synchronously. The executor prepares a batch, executes it, obtains the
+result, and commits before the next batch.
 
-Runtime core still owns the durable request/cache lifecycle. The executor reports decisions and component lifecycle
-events; it does not free globally owned pages or commit scheduler state on its own.
+Replay caches, scratch owners, request-slot state, and pending GDN transactions therefore remain executor-owned. They
+remain confined to one thread unless an API explicitly states otherwise.
+
+Runtime core still owns the durable request and cache lifecycle. The executor reports sampled decisions and component
+results. It does not free globally owned pages or commit scheduler state independently.
 
 ## Verification boundary
 
-Tests should prove the narrowest production owner that can express the invariant:
+Recommendation: Use the narrowest production owner that can express the invariant:
 
 - CPU references prove math.
 - Backend tests prove shader build, dispatch, ABI, and parity.
-- Executor component tests prove real metadata/state/scratch ownership.
+- Executor component tests prove real metadata, state, and scratch ownership.
 - Layer and end-to-end tests prove composition and lifecycle.
 
-Do not reshape production source for test construction or add naming-only tests. Run Metal tests serially. The full
-verification ladder, benchmark targets, profiling vocabulary, and performance-evidence rules live in
-[`executor_benchmarks.md`](executor_benchmarks.md).
+Do not reshape production source for test construction. Do not add naming-only tests. Run Metal tests serially.
+
+[`executor_benchmarks.md`](executor_benchmarks.md) defines these shared topics:
+
+- The full verification ladder
+- Benchmark targets
+- Profiling vocabulary
+- Performance-evidence rules
 
 ## Operational workflows
 
-- Model download, server/client commands, logging, cold-start separation, and end-to-end helpers:
+- Model download, server and client commands, logging, cold-start separation, and end-to-end helpers:
   [`service.md`](service.md).
 - Tests, benchmarks, profiling, and performance claims: [`executor_benchmarks.md`](executor_benchmarks.md).
 - Shared naming, API, ownership, and definition-of-done rules: [`engineering_conventions.md`](engineering_conventions.md)
   and [`high_level.md`](high_level.md).
 - Active investigations: [`future_work.md`](future_work.md).
 
-The Metal backend embeds MLX-derived headers at build time through `build.rs`; their MIT attribution is retained in the
-repository [`NOTICE`](../NOTICE).
+The Metal backend embeds MLX-derived headers at build time through `build.rs`. The repository
+[`NOTICE`](../NOTICE) retains their MIT attribution.

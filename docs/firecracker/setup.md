@@ -1,19 +1,26 @@
-macos setup
+# Legacy Firecracker Setup Notes
 
-1. install lima & host OS: ubuntu
+Warning: This runbook is not verified or part of the supported `psi-dec` service workflow. The commands change host
+networking and delete files. Review each command before you use it.
+
+The repository keeps these notes as a historical reference. The code blocks remain unchanged.
+
+## 1. Install Lima and the Ubuntu host
 
 ```
 brew install lima
 limactl start --set '.nestedVirtualization=true' --name=mvm template://default
 ```
 
-2. ssh into above linux shell
+## 2. Open the Linux shell
 
 ```
 limactl shell mvm
 ```
 
-3. install firecracker, ref: https://github.com/firecracker-microvm/firecracker/releases
+## 3. Install Firecracker
+
+Refer to the [Firecracker releases](https://github.com/firecracker-microvm/firecracker/releases).
 
 ```
 cd /tmp
@@ -26,7 +33,7 @@ sudo mv release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH} /usr/loc
 sudo chmod +x /usr/local/bin/firecracker
 ```
 
-4. install guest OS: ubuntu
+## 4. Download the Ubuntu guest
 
 ```
 FC_VERSION="v1.14" # not v1.14.1
@@ -42,7 +49,7 @@ ubuntu_version=$(basename $latest_ubuntu_key .squashfs | grep -oE '[0-9]+\.[0-9]
 wget -O ubuntu-$ubuntu_version.squashfs.upstream "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"
 ```
 
-5. convert squashfs to ext4 with ssh keys
+## 5. Convert SquashFS to ext4
 
 ```convert-squashfs-to-ext4.sh
 #!/usr/bin/env bash
@@ -100,14 +107,14 @@ echo "  ssh key: $KEY_BASENAME (and .pub)"
 echo "Next: restart firecracker, then run ./start-vm.sh"
 ```
 
-6. start firecracker
+## 6. Start Firecracker
 
 ```
 sudo rm -f /tmp/firecracker.socket
 sudo firecracker --api-sock /tmp/firecracker.socket --enable-pci
 ```
 
-7. start guest OS
+## 7. Start the guest
 
 ```start-vm.sh
 #!/bin/bash
@@ -241,12 +248,15 @@ echo "Use 'root' for both the login and password."
 echo "Run 'reboot' to exit."
 ```
 
--3. uninstall firecracker
+## 8. Remove Firecracker
+
+Warning: This command deletes the Firecracker binary from `/usr/local/bin`.
 
 ```
 rm /usr/local/bin/firecracker
 ```
 
-ref:
-https://u3n.medium.com/the-future-of-development-is-here-running-firecracker-microvms-on-your-macbook-pro-m3-ad6fd3e5092c
-https://github.com/yashdiq/firecracker-lima-vm/tree/main
+## References
+
+- [Running Firecracker microVMs on a MacBook Pro](https://u3n.medium.com/the-future-of-development-is-here-running-firecracker-microvms-on-your-macbook-pro-m3-ad6fd3e5092c)
+- [Firecracker Lima VM](https://github.com/yashdiq/firecracker-lima-vm/tree/main)

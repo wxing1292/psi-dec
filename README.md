@@ -1,7 +1,7 @@
 # psi-dec
 
-`psi-dec` runs Qwen decoder models on Apple Silicon. It combines a
-model-agnostic Rust runtime, a Qwen executor, and a Metal replay backend.
+`psi-dec` runs Qwen decoder models on Apple Silicon.
+It combines a model-agnostic Rust runtime, a Qwen executor, and a Metal replay backend.
 
 ## Architecture
 
@@ -9,48 +9,54 @@ model-agnostic Rust runtime, a Qwen executor, and a Metal replay backend.
 HTTP Chat Completions ──► Qwen codec ──► token IDs ──┐
                                                      ├─► Inference::decode
 gRPC Decode ────────────────────────► token IDs ─────┘          │
-                                                               ▼
-                  Runtime core ──► Qwen executor ──► Metal backend
-                       ▲                                    │
-                       └──────── tokens + lifecycle ────────┘
+                                                                ▼
+                   Runtime core ──► Qwen executor ──► Metal backend
+                        ▲                                    │
+                        └──────── tokens + lifecycle ────────┘
 ```
 
-The layers have separate owners:
+Each layer has a separate owner:
 
-- **Runtime core:** scheduling, request lifecycle, and cache ownership.
-- **Qwen executor:** model layout, components, sampling, MTP, and replay order.
-- **Metal backend:** devices, buffers, kernels, recording, and ICB submission.
+- **Runtime core:** Owns scheduling, request lifecycle, and cache ownership.
+- **Qwen executor:** Owns model layout, components, sampling, MTP, and replay order.
+- **Metal backend:** Owns devices, buffers, kernels, recording, and ICB submission.
 
-HTTP accepts messages and tools. The checkpoint chat template and tokenizer
-lower them into the same token-level decode API used by gRPC. The runtime owns
-when work runs and how cache pages live; the executor owns what Qwen computes;
-Metal owns how that computation runs on the GPU.
+HTTP accepts messages and tools.
+The checkpoint chat template and tokenizer convert them to token IDs.
+The HTTP and gRPC paths use the same token-level decode API.
+The runtime owns scheduling and cache page lifecycles.
+The executor owns Qwen model computation.
+The Metal backend owns GPU execution.
 
 ## Quick start
 
-Requirements:
+You need these items:
 
 - Apple Silicon Mac
 - Rust toolchain
 - Xcode command-line tools
 - Hugging Face CLI with access to the model
 
-Download the dense checkpoint:
+Download the matching target and MTP checkpoints:
 
 ```sh
 hf auth login
 hf download mlx-community/Qwen3.6-27B-4bit \
   --local-dir models/Qwen3.6-27B-4bit
+
+hf download mlx-community/Qwen3.6-27B-MTP-4bit \
+  --local-dir models/Qwen3.6-27B-MTP-4bit
 ```
 
-Start gRPC and HTTP listeners:
+Start gRPC and HTTP listeners with MTP enabled:
 
 ```sh
 cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --mtp-module 0
+  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
+  --mtp-module 1
 ```
 
 Stream an HTTP Chat Completions response:
@@ -72,9 +78,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-This minimal path disables MTP. See the [service guide](docs/service.md) for
-MTP, sparse-model commands, gRPC decode, tool calls, and the supported
-OpenAI-compatible subset.
+The [service guide](docs/service.md) includes the sparse 35B-A3B command, target-only startup, gRPC decode, tool calls, and the supported OpenAI-compatible subset.
 
 ## Workspace map
 
@@ -90,32 +94,35 @@ All paths above live under `crates/`.
 
 ## Documentation
 
-- Run or test the server: [service guide](docs/service.md).
-- Understand request and cache lifecycle: [runtime core](docs/core.md).
-- Follow Qwen execution: [executor architecture](docs/executor.md).
-- Inspect replay and kernels:
-  [Metal backend](crates/inference-backend-metal/README.md).
-- Benchmark or profile changes:
-  [executor verification](docs/executor_benchmarks.md).
-- Apply engineering rules: [high-level guidance](docs/high_level.md).
-- Review active follow-up work: [future work](docs/future_work.md).
+- Use the [service guide](docs/service.md) to run or test the server.
+- Use the [runtime core guide](docs/core.md) to understand request and cache lifecycles.
+- Use the [executor architecture](docs/executor.md) to follow Qwen execution.
+- Use the [Metal backend guide](crates/inference-backend-metal/README.md) to inspect replay and kernels.
+- Use [executor verification](docs/executor_benchmarks.md) to benchmark or profile changes.
+- Apply the rules in [high-level guidance](docs/high_level.md).
+- Apply the [technical English guide](docs/technical_english.md) when you write documentation.
+- Review active work in [future work](docs/future_work.md).
 
-The [documentation index](docs/README.md) links every component guide.
+The [documentation index](docs/README.md) links all current component guides.
 
 ## Acknowledgements
 
-`psi-dec` is an independent Rust and Metal implementation inspired by the
-open-source work of [vLLM](https://github.com/vllm-project/vllm),
-[SGLang](https://github.com/sgl-project/sglang),
-[llama.cpp](https://github.com/ggml-org/llama.cpp),
-[mistral.rs](https://github.com/EricLBuehler/mistral.rs); credit is due to their
-authors and contributor communities. It uses [MLX](https://github.com/ml-explore/mlx)
-by Apple; its Metal kernel headers are downloaded and embedded at build time.
-The MIT notice is retained in [`NOTICE`](NOTICE). Supported Qwen models are
-developed by the [Qwen team](https://qwen.ai/); model weights are separate
-artifacts governed by their own terms.
+`psi-dec` is an independent Rust and Metal implementation.
+These open-source projects inspired its design:
+
+- [vLLM](https://github.com/vllm-project/vllm)
+- [SGLang](https://github.com/sgl-project/sglang)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
+
+Credit goes to their authors and contributor communities.
+The project uses [MLX](https://github.com/ml-explore/mlx) by Apple.
+The build process downloads and embeds the MLX Metal kernel headers.
+The project retains the MIT notice in [`NOTICE`](NOTICE).
+The [Qwen team](https://qwen.ai/) develops the supported Qwen models.
+Model weights are separate artifacts, and their own terms apply.
 
 ## License
 
-`psi-dec` is distributed under the [MIT License](LICENSE). See
-[NOTICE](NOTICE) for the MLX header attribution retained with this project.
+`psi-dec` is distributed under the [MIT License](LICENSE).
+See [NOTICE](NOTICE) for the retained MLX header attribution.
