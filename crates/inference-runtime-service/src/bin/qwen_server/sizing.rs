@@ -3,8 +3,8 @@ use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
 
-pub const QWEN3_DEFAULT_NUM_CACHE_PAGES: usize = 40 * 1024;
 pub const QWEN35_DEFAULT_NUM_CACHE_PAGES: usize = 384 * 1024;
+pub const QWEN3_DEFAULT_NUM_CACHE_PAGES: usize = QWEN35_DEFAULT_NUM_CACHE_PAGES;
 
 pub fn kv_dtype_bytes(dtype: Option<&str>) -> Result<usize> {
     match dtype {
@@ -45,6 +45,7 @@ mod tests {
     use inference_runtime_core::Error;
 
     use super::QWEN3_DEFAULT_NUM_CACHE_PAGES;
+    use super::QWEN35_DEFAULT_NUM_CACHE_PAGES;
     use super::block_cache_capacity;
 
     #[test]
@@ -61,7 +62,11 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen3_default_cache_holds_512_complete_blocks() {
-        assert_eq!(block_cache_capacity(QWEN3_DEFAULT_NUM_CACHE_PAGES, 80, 0).unwrap(), 512);
+    fn test_qwen_defaults_use_the_same_page_budget() {
+        assert_eq!(QWEN3_DEFAULT_NUM_CACHE_PAGES, QWEN35_DEFAULT_NUM_CACHE_PAGES);
+        assert_eq!(
+            block_cache_capacity(QWEN3_DEFAULT_NUM_CACHE_PAGES, 80, 0).unwrap(),
+            4_915
+        );
     }
 }

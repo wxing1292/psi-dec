@@ -14,7 +14,7 @@ SEED=42
 TEMPERATURE=0.7
 TOP_K=20
 TOP_P=0.8
-NUM_CACHE_PAGES=40960
+NUM_CACHE_PAGES=393216
 MAX_RUNNING_REQUESTS=8
 MAX_REQUESTS=4
 MAX_TOKENS=128
@@ -51,7 +51,7 @@ Options:
   --temperature N       Sampling temperature. Default: 0.7
   --top-k N             Sampling top-k. Default: 20
   --top-p N             Sampling top-p. Default: 0.8
-  --num-cache-pages N   Qwen3 GQA KV-cache pages. Default: 40960
+  --num-cache-pages N   Qwen3 GQA KV-cache pages. Default: 393216
   --max-requests N      Scheduler request capacity. Default: 4
   --max-tokens N        Scheduler flattened-token capacity. Default: 128
   --max-tokens-per-request N

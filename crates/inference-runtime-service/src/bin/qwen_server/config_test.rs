@@ -107,7 +107,7 @@ fn test_qwen3_scheduler_and_listener_overrides() {
 fn test_qwen3_default_cache_pages() {
     assert_eq!(
         Qwen3Config::from_args(parse_qwen3(&[])).unwrap().num_cache_pages(),
-        40 * 1024
+        384 * 1024
     );
 }
 

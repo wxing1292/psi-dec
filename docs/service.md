@@ -243,13 +243,11 @@ One lifecycle owner stops both listeners in these conditions:
 Value `1` requires that directory. Explicit `--mtp-module 0` ignores an optional MTP directory. Use this value for
 controlled target-only tests.
 
-Qwen uses 32 KiB physical cache pages. Qwen3 defaults to 40,960 pages. The Qwen3-14B geometry stores eight tokens in one
-physical page.
+Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 384K pages. The Qwen3-14B geometry stores eight
+tokens in one physical page.
 
-Its 16-token logical cache block uses 80 pages across 40 layers. Thus, the default holds 512 blocks. These blocks contain
-8,192 resident tokens in aggregate.
-
-Use a larger explicit page budget for longer resident contexts.
+Its 16-token logical cache block uses 80 pages across 40 layers. Thus, the default holds 4,915 complete blocks. These
+blocks contain 78,640 resident tokens in aggregate.
 
 Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 384K shared pages.
 
