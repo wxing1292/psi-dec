@@ -4,9 +4,9 @@ use std::path::Path;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::QuantizationConfig;
-use super::TextConfig;
 use crate::def::ModelExecutorError;
+use crate::model::qwen::v3_5::Qwen35TextConfig;
+use crate::model::qwen::v3_x::QuantizationConfig;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DSparkConfig {
@@ -144,7 +144,7 @@ impl DSparkConfig {
         Ok(())
     }
 
-    pub fn validate_target(&self, target: &TextConfig) -> Result<(), ModelExecutorError> {
+    pub fn validate_target(&self, target: &Qwen35TextConfig) -> Result<(), ModelExecutorError> {
         let target_kv_elements = target
             .num_key_value_heads
             .checked_mul(target.head_dim)

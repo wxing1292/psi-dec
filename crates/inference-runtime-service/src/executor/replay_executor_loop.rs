@@ -387,9 +387,9 @@ mod tests {
     }
 
     impl ReplayableModelBatchExecutor for ResetOnlyModel {
-        type ModelBatchReq = ();
+        type ModelBatchRequest = ();
         type ModelBatchHidden = ();
-        type ModelBatchResp = ();
+        type ModelBatchResponse = ();
         type SampledOutput = ();
         type ModelOpsRecorder = ();
 
@@ -401,7 +401,7 @@ mod tests {
             self.reset_tx.send(request_slots.to_vec()).unwrap();
         }
 
-        fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchReq {
+        fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
             panic!("reset-only model must not execute a batch")
         }
 
@@ -413,27 +413,27 @@ mod tests {
             panic!("reset-only model must not commit a batch")
         }
 
-        fn begin_ops_recording(&mut self, _batch_req: &Self::ModelBatchReq) -> Self::ModelOpsRecorder {}
+        fn begin_ops_recording(&mut self, _batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {}
 
         fn embed(
             &mut self,
             _recorder: &mut Self::ModelOpsRecorder,
-            _batch_req: &Self::ModelBatchReq,
+            _batch_req: &Self::ModelBatchRequest,
         ) -> Self::ModelBatchHidden {
         }
 
         fn unembed(
             &mut self,
             _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchReq,
+            _model_batch_req: &Self::ModelBatchRequest,
             _model_batch_hidden: &Self::ModelBatchHidden,
-        ) -> Self::ModelBatchResp {
+        ) -> Self::ModelBatchResponse {
         }
 
         fn forward_main(
             &mut self,
             _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchReq,
+            _model_batch_req: &Self::ModelBatchRequest,
             _model_batch_hidden: Self::ModelBatchHidden,
         ) -> Self::ModelBatchHidden {
         }
@@ -441,8 +441,8 @@ mod tests {
         fn sample(
             &mut self,
             _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchReq,
-            _model_batch_resp: &Self::ModelBatchResp,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_resp: &Self::ModelBatchResponse,
         ) -> Self::SampledOutput {
         }
 

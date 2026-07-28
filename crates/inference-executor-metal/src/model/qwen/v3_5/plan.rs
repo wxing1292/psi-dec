@@ -8,14 +8,15 @@ use inference_executor_core::mlp::moe::MoEExecutionPolicyConfig;
 use inference_executor_core::model::qwen::v3_5::DSparkConfig;
 use inference_executor_core::model::qwen::v3_5::LayerType;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
-use inference_executor_core::model::qwen::v3_5::QuantizationConfig;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::TextConfig;
+use inference_executor_core::model::qwen::v3_5::Qwen35TextConfig;
+use inference_executor_core::model::qwen::v3_x::QuantizationConfig;
 
 use crate::attn::gdn::backend::GDNMetalConfig;
 use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::moe::backend::GatedMoEMetalConfig;
+use crate::model::qwen::v3_x::weight::to_u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen35MetalDefaults {
@@ -41,9 +42,6 @@ impl Default for Qwen35MetalDefaults {
             single_q_token_kv_token_tile_size: 256,
             single_q_token_num_threads_per_threadblock: 256,
             single_q_token_max_q_head_tile_size: 8,
-            // Tiled GQA uses Tq_tile=8 and Tkv_tile=16. Hq_tile is selected
-            // dynamically from Q-token-tile utilization: 27B uses 3/6 and 35B
-            // uses 4/8 Q heads per fixed KV head.
             tiled_q_token_tile_size: 8,
             tiled_kv_token_tile_size: 16,
             moe_execution_policy: MoEExecutionPolicyConfig::default(),
@@ -55,11 +53,162 @@ impl Qwen35MetalDefaults {
     pub fn from_quantization(quantization: Option<&QuantizationConfig>) -> Result<Self, ModelExecutorError> {
         let mut defaults = Self::default();
         if let Some(quantization) = quantization {
-            defaults.group_size = to_u32("qwen3.5 quantization group_size", quantization.group_size)?;
-            defaults.bits = to_u32("qwen3.5 quantization bits", quantization.bits)?;
+            defaults.group_size = to_u32("Qwen3.5 quantization group_size", quantization.group_size)?;
+            defaults.bits = to_u32("Qwen3.5 quantization bits", quantization.bits)?;
         }
         Ok(defaults)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen35LayerCounts {
+    pub gqa: usize,
+    pub gdn: usize,
+    pub has_dense_mlp: bool,
+    pub has_moe: bool,
+}
+
+pub fn qwen35_layer_counts(config: &Qwen35ModelConfig) -> Result<Qwen35LayerCounts, ModelExecutorError> {
+    let mut counts = Qwen35LayerCounts {
+        gqa: 0,
+        gdn: 0,
+        has_dense_mlp: false,
+        has_moe: false,
+    };
+    for model_layer_index in 0..config.text_config.num_hidden_layers {
+        match config.layer_type_at(model_layer_index)? {
+            LayerType::GDN => counts.gdn += 1,
+            LayerType::FullAttention => counts.gqa += 1,
+        }
+        if config.layer_uses_moe(model_layer_index) {
+            counts.has_moe = true;
+        } else {
+            counts.has_dense_mlp = true;
+        }
+    }
+    Ok(counts)
+}
+
+pub fn qwen35_gdn_core_and_metal(
+    model_layer_index: usize,
+    text: &Qwen35TextConfig,
+    defaults: Qwen35MetalDefaults,
+) -> Result<(GDNCore, GDNMetalConfig), ModelExecutorError> {
+    let core = GDNCore {
+        model_layer_index,
+        hidden_dim: text.hidden_size,
+        num_qk_heads: text.linear_num_key_heads,
+        qk_head_dim: text.linear_key_head_dim,
+        num_v_heads: text.linear_num_value_heads,
+        v_head_dim: text.linear_value_head_dim,
+        conv_kernel_size: text.linear_conv_kernel_dim,
+        q_scale: (text.linear_key_head_dim as f32).sqrt().recip(),
+    };
+    core.validate();
+    let metal = GDNMetalConfig {
+        group_size: defaults.group_size,
+        bits: defaults.bits,
+        recurrent_v_tile_size: defaults.gdn_recurrent_v_tile_size,
+        norm_eps: text.rms_norm_eps,
+        input_dtype: Dtype::Float32,
+        qkvabz_affine_dtype: Dtype::Float32,
+        output_affine_dtype: Dtype::Bfloat16,
+    };
+    metal.validate();
+    Ok((core, metal))
+}
+
+pub fn qwen35_gqa_core_and_metal(
+    model_layer_index: usize,
+    text: &Qwen35TextConfig,
+    defaults: Qwen35MetalDefaults,
+) -> Result<(GQACore, GQAMetalConfig), ModelExecutorError> {
+    let core = GQACore::new(
+        model_layer_index,
+        text.hidden_size,
+        text.head_dim,
+        text.num_attention_heads,
+        text.num_key_value_heads,
+        text.scale,
+    );
+    core.validate();
+    let metal = GQAMetalConfig {
+        group_size: defaults.group_size,
+        bits: defaults.bits,
+        page_bytes: to_u32("Qwen3.5 GQA page_bytes", QWEN35_PAGE_SIZE_BYTES)?,
+        single_q_token_kv_token_tile_size: defaults.single_q_token_kv_token_tile_size,
+        single_q_token_num_threads_per_threadblock: defaults.single_q_token_num_threads_per_threadblock,
+        single_q_token_max_q_head_tile_size: defaults.single_q_token_max_q_head_tile_size,
+        tiled_q_token_tile_size: defaults.tiled_q_token_tile_size,
+        tiled_kv_token_tile_size: defaults.tiled_kv_token_tile_size,
+        rope_dim: to_u32("Qwen3.5 GQA rope_dim", text.rope_dim)?,
+        norm_eps: text.rms_norm_eps,
+        rope_theta: text.rope_theta,
+        rope_scale: 1.0,
+        dtype: defaults.hidden_dtype,
+    };
+    metal.validate();
+    assert!(metal.num_tokens_per_page(&core) > 0);
+    Ok((core, metal))
+}
+
+pub fn qwen35_dense_mlp_core_and_metal(
+    model_layer_index: usize,
+    text: &Qwen35TextConfig,
+    defaults: Qwen35MetalDefaults,
+) -> Result<(DenseMLPCore, DenseMLPMetalConfig), ModelExecutorError> {
+    if text.intermediate_size == 0 {
+        return Err(ModelExecutorError::custom(format!(
+            "Qwen3.5 layer {model_layer_index} uses dense MLP but intermediate_size is zero"
+        )));
+    }
+    let core = DenseMLPCore {
+        model_layer_index,
+        hidden_dim: text.hidden_size,
+        intermediate_dim: text.intermediate_size,
+    };
+    core.validate();
+    let metal = DenseMLPMetalConfig {
+        group_size: defaults.group_size,
+        bits: defaults.bits,
+        dtype: defaults.hidden_dtype,
+    };
+    metal.validate();
+    Ok((core, metal))
+}
+
+pub fn qwen35_moe_core_and_metal(
+    layer_prefix: &str,
+    model_layer_index: usize,
+    config: &Qwen35ModelConfig,
+    defaults: Qwen35MetalDefaults,
+) -> Result<(GatedMoECore, GatedMoEMetalConfig), ModelExecutorError> {
+    let text = &config.text_config;
+    let core = GatedMoECore {
+        model_layer_index,
+        hidden_dim: text.hidden_size,
+        intermediate_dim: text.moe_intermediate_size,
+        common_expert_intermediate_dim: (text.shared_expert_intermediate_size > 0)
+            .then_some(text.shared_expert_intermediate_size),
+        num_experts: text.num_experts,
+        num_experts_per_token: text.num_experts_per_tok,
+        norm_topk_prob: text.norm_topk_prob,
+    };
+    core.validate();
+    let metal = GatedMoEMetalConfig {
+        group_size: defaults.group_size,
+        bits: defaults.bits,
+        router_bits: quant_bits_for(config, &format!("{layer_prefix}.mlp.gate.weight"), defaults.bits)?,
+        common_gate_bits: quant_bits_for(
+            config,
+            &format!("{layer_prefix}.mlp.shared_expert_gate.weight"),
+            defaults.bits,
+        )?,
+        dtype: defaults.hidden_dtype,
+        execution_policy: defaults.moe_execution_policy,
+    };
+    metal.validate();
+    Ok((core, metal))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,33 +257,45 @@ pub struct Qwen35QuantizedEmbeddingPlan {
     pub bits: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Qwen35LayerCounts {
-    pub gqa: usize,
-    pub gdn: usize,
-    pub has_dense_mlp: bool,
-    pub has_moe: bool,
-}
-
-pub fn qwen35_layer_counts(config: &Qwen35ModelConfig) -> Result<Qwen35LayerCounts, ModelExecutorError> {
-    let mut counts = Qwen35LayerCounts {
-        gqa: 0,
-        gdn: 0,
-        has_dense_mlp: false,
-        has_moe: false,
-    };
-    for layer_index in 0..config.text_config.num_hidden_layers {
-        match config.layer_type_at(layer_index)? {
-            LayerType::GDN => counts.gdn += 1,
-            LayerType::FullAttention => counts.gqa += 1,
-        }
-        if config.layer_uses_moe(layer_index) {
-            counts.has_moe = true;
-        } else {
-            counts.has_dense_mlp = true;
-        }
+pub fn validate_qwen35_mtp_config(
+    main_model_config: &Qwen35ModelConfig,
+    mtp_model_config: &Qwen35ModelConfig,
+) -> Result<(), ModelExecutorError> {
+    let main = &main_model_config.text_config;
+    let mtp = &mtp_model_config.text_config;
+    if main.hidden_size != mtp.hidden_size
+        || main.num_attention_heads != mtp.num_attention_heads
+        || main.num_key_value_heads != mtp.num_key_value_heads
+        || main.head_dim != mtp.head_dim
+        || main.num_experts != mtp.num_experts
+    {
+        return Err(ModelExecutorError::custom(format!(
+            "qwen3.5 MTP config must match main model dimensions: main hidden={} q_heads={} kv_heads={} head_dim={} \
+             experts={} mtp hidden={} q_heads={} kv_heads={} head_dim={} experts={}",
+            main.hidden_size,
+            main.num_attention_heads,
+            main.num_key_value_heads,
+            main.head_dim,
+            main.num_experts,
+            mtp.hidden_size,
+            mtp.num_attention_heads,
+            mtp.num_key_value_heads,
+            mtp.head_dim,
+            mtp.num_experts
+        )));
     }
-    Ok(counts)
+    if mtp.mtp_num_hidden_layers != 1 {
+        return Err(ModelExecutorError::custom(format!(
+            "qwen3.5 MTP checkpoint must contain exactly one body layer, got {}",
+            mtp.mtp_num_hidden_layers
+        )));
+    }
+    if mtp.mtp_use_dedicated_embeddings {
+        return Err(ModelExecutorError::custom(
+            "qwen3.5 MTP checkpoint must share the Main token embedding",
+        ));
+    }
+    Ok(())
 }
 
 pub fn build_qwen35_dspark_plan(
@@ -267,188 +428,11 @@ fn dspark_quantization_for(
     ))
 }
 
-pub fn validate_qwen35_mtp_config(
-    main_model_config: &Qwen35ModelConfig,
-    mtp_model_config: &Qwen35ModelConfig,
-) -> Result<(), ModelExecutorError> {
-    let main = &main_model_config.text_config;
-    let mtp = &mtp_model_config.text_config;
-    if main.hidden_size != mtp.hidden_size
-        || main.num_attention_heads != mtp.num_attention_heads
-        || main.num_key_value_heads != mtp.num_key_value_heads
-        || main.head_dim != mtp.head_dim
-        || main.num_experts != mtp.num_experts
-    {
-        return Err(ModelExecutorError::custom(format!(
-            "qwen3.5 MTP config must match main model dimensions: main hidden={} q_heads={} kv_heads={} head_dim={} \
-             experts={} mtp hidden={} q_heads={} kv_heads={} head_dim={} experts={}",
-            main.hidden_size,
-            main.num_attention_heads,
-            main.num_key_value_heads,
-            main.head_dim,
-            main.num_experts,
-            mtp.hidden_size,
-            mtp.num_attention_heads,
-            mtp.num_key_value_heads,
-            mtp.head_dim,
-            mtp.num_experts
-        )));
-    }
-    if mtp.mtp_num_hidden_layers != 1 {
-        return Err(ModelExecutorError::custom(format!(
-            "qwen3.5 MTP checkpoint must contain exactly one body layer, got {}",
-            mtp.mtp_num_hidden_layers
-        )));
-    }
-    if mtp.mtp_use_dedicated_embeddings {
-        return Err(ModelExecutorError::custom(
-            "qwen3.5 MTP checkpoint must share the Main token embedding",
-        ));
-    }
-    Ok(())
-}
-
-pub fn qwen35_gdn_core_and_metal(
-    model_layer_index: usize,
-    text: &TextConfig,
-    metal_defaults: Qwen35MetalDefaults,
-) -> Result<(GDNCore, GDNMetalConfig), ModelExecutorError> {
-    let core = GDNCore {
-        model_layer_index,
-        hidden_dim: text.hidden_size,
-        num_qk_heads: text.linear_num_key_heads,
-        qk_head_dim: text.linear_key_head_dim,
-        num_v_heads: text.linear_num_value_heads,
-        v_head_dim: text.linear_value_head_dim,
-        conv_kernel_size: text.linear_conv_kernel_dim,
-        q_scale: (text.linear_key_head_dim as f32).sqrt().recip(),
-    };
-    core.validate();
-    let metal = GDNMetalConfig {
-        group_size: metal_defaults.group_size,
-        bits: metal_defaults.bits,
-        recurrent_v_tile_size: metal_defaults.gdn_recurrent_v_tile_size,
-        norm_eps: text.rms_norm_eps,
-        input_dtype: Dtype::Float32,
-        qkvabz_affine_dtype: Dtype::Float32,
-        output_affine_dtype: Dtype::Bfloat16,
-    };
-    metal.validate();
-    Ok((core, metal))
-}
-
-pub fn qwen35_gqa_core_and_metal(
-    model_layer_index: usize,
-    text: &TextConfig,
-    metal_defaults: Qwen35MetalDefaults,
-) -> Result<(GQACore, GQAMetalConfig), ModelExecutorError> {
-    let core = GQACore::new(
-        model_layer_index,
-        text.hidden_size,
-        text.head_dim,
-        text.num_attention_heads,
-        text.num_key_value_heads,
-        text.scale,
-    );
-    core.validate();
-    let metal = GQAMetalConfig {
-        group_size: metal_defaults.group_size,
-        bits: metal_defaults.bits,
-        page_bytes: to_u32("qwen3.5 GQA page_bytes", QWEN35_PAGE_SIZE_BYTES)?,
-        single_q_token_kv_token_tile_size: metal_defaults.single_q_token_kv_token_tile_size,
-        single_q_token_num_threads_per_threadblock: metal_defaults.single_q_token_num_threads_per_threadblock,
-        single_q_token_max_q_head_tile_size: metal_defaults.single_q_token_max_q_head_tile_size,
-        tiled_q_token_tile_size: metal_defaults.tiled_q_token_tile_size,
-        tiled_kv_token_tile_size: metal_defaults.tiled_kv_token_tile_size,
-        rope_dim: to_u32("qwen3.5 GQA rope_dim", text.rope_dim)?,
-        norm_eps: text.rms_norm_eps,
-        rope_theta: text.rope_theta,
-        rope_scale: 1.0,
-        dtype: metal_defaults.hidden_dtype,
-    };
-    metal.validate();
-    assert!(metal.num_tokens_per_page(&core) > 0);
-    Ok((core, metal))
-}
-
-pub fn qwen35_dense_mlp_core_and_metal(
-    model_layer_index: usize,
-    text: &TextConfig,
-    metal_defaults: Qwen35MetalDefaults,
-) -> Result<(DenseMLPCore, DenseMLPMetalConfig), ModelExecutorError> {
-    if text.intermediate_size == 0 {
-        return Err(ModelExecutorError::custom(format!(
-            "qwen3.5 layer {model_layer_index} uses dense MLP but intermediate_size is zero"
-        )));
-    }
-    let core = DenseMLPCore {
-        model_layer_index,
-        hidden_dim: text.hidden_size,
-        intermediate_dim: text.intermediate_size,
-    };
-    core.validate();
-    let metal = DenseMLPMetalConfig {
-        group_size: metal_defaults.group_size,
-        bits: metal_defaults.bits,
-        dtype: metal_defaults.hidden_dtype,
-    };
-    metal.validate();
-    Ok((core, metal))
-}
-
-pub fn qwen35_moe_core_and_metal(
-    layer_prefix: &str,
-    model_layer_index: usize,
-    model_config: &Qwen35ModelConfig,
-    metal_defaults: Qwen35MetalDefaults,
-) -> Result<(GatedMoECore, GatedMoEMetalConfig), ModelExecutorError> {
-    let text = &model_config.text_config;
-    let core = GatedMoECore {
-        model_layer_index,
-        hidden_dim: text.hidden_size,
-        intermediate_dim: text.moe_intermediate_size,
-        common_expert_intermediate_dim: (text.shared_expert_intermediate_size > 0)
-            .then_some(text.shared_expert_intermediate_size),
-        num_experts: text.num_experts,
-        num_experts_per_token: text.num_experts_per_tok,
-        norm_topk_prob: text.norm_topk_prob,
-    };
-    core.validate();
-    let metal = GatedMoEMetalConfig {
-        group_size: metal_defaults.group_size,
-        bits: metal_defaults.bits,
-        router_bits: quant_bits_for(
-            model_config,
-            &format!("{layer_prefix}.mlp.gate.weight"),
-            metal_defaults.bits,
-        )?,
-        common_gate_bits: quant_bits_for(
-            model_config,
-            &format!("{layer_prefix}.mlp.shared_expert_gate.weight"),
-            metal_defaults.bits,
-        )?,
-        dtype: metal_defaults.hidden_dtype,
-        execution_policy: metal_defaults.moe_execution_policy,
-    };
-    metal.validate();
-    Ok((core, metal))
-}
-
-fn quant_bits_for(
-    model_config: &Qwen35ModelConfig,
-    tensor_name: &str,
-    default_bits: u32,
-) -> Result<u32, ModelExecutorError> {
-    let bits = model_config
+fn quant_bits_for(config: &Qwen35ModelConfig, tensor_name: &str, default_bits: u32) -> Result<u32, ModelExecutorError> {
+    let bits = config
         .quantization
         .as_ref()
         .map(|quantization| quantization.resolve_for_tensor(tensor_name).bits)
         .unwrap_or(default_bits as usize);
-    to_u32("qwen3.5 quantization bits", bits)
-}
-
-fn to_u32(name: &str, value: usize) -> Result<u32, ModelExecutorError> {
-    value
-        .try_into()
-        .map_err(|_| ModelExecutorError::custom(format!("{name}={value} must fit u32")))
+    to_u32("Qwen3.5 quantization bits", bits)
 }

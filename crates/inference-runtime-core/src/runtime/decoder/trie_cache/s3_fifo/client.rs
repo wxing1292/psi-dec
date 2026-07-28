@@ -10,10 +10,10 @@ use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use dashmap::Entry as DashEntry;
 
-use super::control::Control;
-use super::eviction::Eviction;
-use super::server::S3FIFOServer;
 use crate::channel::Shutdown;
+use crate::runtime::decoder::trie_cache::s3_fifo::control::Control;
+use crate::runtime::decoder::trie_cache::s3_fifo::eviction::Eviction;
+use crate::runtime::decoder::trie_cache::s3_fifo::server::S3FIFOServer;
 
 #[derive(Debug)]
 pub struct S3FIFOClient<K>

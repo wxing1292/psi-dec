@@ -18,13 +18,16 @@ crates/inference-executor-metal/src/mlp/dense/
   backend.rs   DenseMLPMetalConfig + DenseMLP
   scratch.rs   reusable dense MLP scratch allocation owner and borrowed replay bindings
 
-crates/inference-executor-metal/src/model/qwen/v3_5/layer/
-  dense_mlp.rs Qwen35DenseMLP, private checkpoint weights, load, and record
+crates/inference-executor-metal/src/model/qwen/v3_x/layer/
+  dense_mlp.rs Qwen3xDenseMLP, private checkpoint weights, load, and record
+
+crates/inference-executor-metal/src/model/qwen/v3_5/
+  main/layer.rs Qwen3.5 Main dense-MLP/MoE layer variants
+  mtp/layer.rs  Qwen3.5 MTP dense-MLP/MoE layer variants
 
 crates/inference-executor-core/src/def/
   DenseLinearShape
   SparseLinearShape
-  Layer
 
 crates/inference-executor-metal/src/def/
   ReplayLayer
@@ -63,9 +66,9 @@ down_shape
 the full dense MLP backend path `gate_up -> activation -> down`; it does not own tensor storage, runtime scheduling,
 or page allocation.
 
-The backend implements `Layer + ReplayLayer` so Qwen model/layer code can append dense MLP work into a larger
-whole-layer or whole-model replay through `Recorder`. Focused tests and benches build replay programs from that
-same recorder path. Dense MLP internal replay order is
+The backend implements `ReplayLayer` so Qwen model/layer code can append dense MLP work into a larger whole-layer or
+whole-model replay through `Recorder`. Focused tests and benches build replay programs from that same recorder path.
+Dense MLP internal replay order is
 `gate_up -> activation [barrier before] -> down [barrier before]`; model/layer wiring owns barriers on the component's
 first consumer command and on downstream residual consumers.
 
@@ -95,7 +98,8 @@ group size, bit width, and dtype.
 Qwen model replay keeps dense MLP scratch in one model-owned `DenseMLPScratch`. Its `bindings()` method exposes borrowed
 `DenseMLPScratchBindings` to replay recording. Main and MTP execution is serialized on the model stream, so `gate_up` and
 activation scratch are reusable across layers. Per-layer output buffers and immutable weights remain owned directly by
-the dense variant inside `Qwen35Layer`; there is no separate production layer-weight bundle. Qwen validates scratch
+the `Qwen3xDenseMLP` leaf inside `Qwen35MainLayer` or `Qwen35MTPLayer`; there is no separate production layer-weight
+bundle. Qwen validates scratch
 layout compatibility across every Main and optional MTP dense layer at init.
 
 ## Data flow and backend stages

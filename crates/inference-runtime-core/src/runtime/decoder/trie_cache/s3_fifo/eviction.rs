@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 
 use crossbeam_channel::Sender;
 
-use super::control::Control;
 use crate::channel::Shutdown;
+use crate::runtime::decoder::trie_cache::s3_fifo::control::Control;
 
 const MAX_COUNT: u8 = 3;
 

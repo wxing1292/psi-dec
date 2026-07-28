@@ -20,13 +20,15 @@ crates/inference-executor-metal/src/mlp/moe/
   backend.rs   GatedMoEMetalConfig + GatedMoE
   scratch.rs   routing, top-k-expert, and optional common-expert scratch ownership and bindings
 
-crates/inference-executor-metal/src/model/qwen/v3_5/layer/
-  moe.rs       Qwen35MoE, private checkpoint weights, load, and record
+crates/inference-executor-metal/src/model/qwen/
+  v3_x/layer/moe.rs  Qwen3xMoE, private checkpoint weights, load, and record
+  v3_5/main/layer.rs Qwen3.5 Main dense-MLP/MoE layer variants
+  v3_5/mtp/layer.rs  Qwen3.5 MTP dense-MLP/MoE layer variants
+  v3_5/plan.rs       Qwen3.5 MoE geometry/config builder and DSpark plan
 
 crates/inference-executor-core/src/def/
   DenseLinearShape
   SparseLinearShape
-  Layer
 ```
 
 The current runtime path is the Metal replay path in
@@ -72,7 +74,7 @@ router projection -> route top-k -> dispatch -> sparse expert MLP -> combine/sca
 ```
 
 It keeps token-major, compact expert-major, and auto execution policies explicit. The backend implements the executor
-`Layer + ReplayLayer` contract so Qwen model/layer code can append MoE work into a larger e2e replay through one semantic
+`ReplayLayer` contract so Qwen model/layer code can append MoE work into a larger e2e replay through one semantic
 input/output and caller-owned recorder. The semantic replay input optionally carries a common/shared expert branch:
 
 ```text
@@ -102,6 +104,8 @@ not assume one global bit width for every projection in a MoE layer.
 `GatedMoECore::common_expert_intermediate_dim` is the single semantic source for common-expert presence and shape. It
 must not be inferred from `intermediate_dim`: routed and common experts may legally use different intermediate widths.
 Weight loading, common-expert MLP construction, and optional common-expert scratch allocation all derive from this value.
+The Qwen weight owner groups the common gate and dense expert under the same optional owner, so a partially populated
+common-expert branch is not representable.
 
 `QuantizedSparseMLP` remains a lower-level expert compute component; it exposes token-major and expert-major sparse
 expert MLP compute but does not own router, dispatch, combine, common expert, or policy selection. Its token-major shape
@@ -175,7 +179,10 @@ Qwen model replay keeps MoE scratch in one model-owned `MoEScratch`. It owns thr
 `common_expert_bindings()` exposes the optional common-expert branch. Main and MTP execution is serialized on the model stream,
 so router logits/probs, route metadata, sparse activation, expert-major packing, and optional common-expert scratch are
 reusable across MoE layers. Qwen asserts across every main and MTP MoE layer that the scratch layout determinants are
-uniform; per-layer router/top-k/common expert weights and layer output buffers remain layer-owned.
+uniform; per-layer router/top-k/common expert weights remain owned by the shared `Qwen3xMoE` leaf, while layer output
+buffers and composition belong to the role-specific `Qwen35MainLayer`/`Qwen35MainLayerScratch` or
+`Qwen35MTPLayer`/`Qwen35MTPLayerScratch`.
+
 Token-major `token_indices` and identity `route_indices` are capacity metadata, not request metadata; Qwen initializes
 them once in `MoEScratch` and each replay consumes the prefix implied by the current route count.
 

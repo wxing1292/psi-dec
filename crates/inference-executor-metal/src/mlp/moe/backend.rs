@@ -35,7 +35,6 @@ use inference_backend_metal::operators::AffineQuantizedMatmulShape;
 use inference_backend_metal::operators::SoftmaxKernel;
 use inference_backend_metal::operators::SoftmaxShape;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::Layer;
 use inference_executor_core::mlp::moe::GatedMoECore;
 use inference_executor_core::mlp::moe::GatedMoEReplayShape;
 use inference_executor_core::mlp::moe::MoEExecutionPolicy;
@@ -571,23 +570,10 @@ impl GatedMoE {
     }
 }
 
-impl Layer for GatedMoE {
+impl ReplayLayer for GatedMoE {
     type Input<'a> = GatedMoEReplayInput<'a>;
     type Output<'a> = &'a Buffer;
 
-    type InputShape = GatedMoECore;
-    type OutputShape = GatedMoECore;
-
-    fn input_shape(&self) -> Self::InputShape {
-        self.core.clone()
-    }
-
-    fn output_shape(&self) -> Self::OutputShape {
-        self.core.clone()
-    }
-}
-
-impl ReplayLayer for GatedMoE {
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,

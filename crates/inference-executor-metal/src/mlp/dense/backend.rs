@@ -8,7 +8,6 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::Layer;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::dense::DenseMLPReplayShape;
 
@@ -55,23 +54,10 @@ impl DenseMLP {
     }
 }
 
-impl Layer for DenseMLP {
+impl ReplayLayer for DenseMLP {
     type Input<'a> = DenseMLPReplayInput<'a>;
     type Output<'a> = &'a Buffer;
 
-    type InputShape = DenseMLPCore;
-    type OutputShape = DenseMLPCore;
-
-    fn input_shape(&self) -> Self::InputShape {
-        self.core.clone()
-    }
-
-    fn output_shape(&self) -> Self::OutputShape {
-        self.core.clone()
-    }
-}
-
-impl ReplayLayer for DenseMLP {
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,

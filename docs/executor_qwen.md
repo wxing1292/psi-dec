@@ -14,14 +14,19 @@ crates/inference-executor-core/src/model/qwen/v3_5/
   pending_transactions.rs   sequence-ordered pending executor transactions
   weight_layout.rs          exact typed Main/unembed/MTP binding trees
 
+crates/inference-executor-core/src/model/qwen/v3_x/
+  config.rs                 shared quantization, RoPE, and tensor-path types
+  weight_layout.rs          shared GQA/GDN/dense-MLP/MoE leaf bindings
+
 crates/inference-executor-metal/src/
   replay.rs                 generic Replay<T> component/cache owner
   model/
-    embed_unembed.rs        generic Embed and Unembed Metal owners
+    embedding.rs            generic Embed Metal owner
     gather.rs               generic row gather owner
     page_arena.rs           shared physical page buffer
     residual.rs             generic residual owner
     rms_norm.rs             generic RMS-normalization owner
+    unembedding.rs          generic Unembed Metal owner
     qwen/v3_5/
       executor/
         mod.rs              Qwen35Executor fields and ReplayableModelBatchExecutor integration
@@ -31,21 +36,27 @@ crates/inference-executor-metal/src/
         main.rs             MainEmbed, Main, and GatherUnembed orchestration
         sampling.rs         normal/draft/target/rejection orchestration and readback
         mtp.rs              MTP request, proposal-batch, and proposal flow
-      layer/
-        mod.rs              Qwen35Layer composition and variant selection
-        scratch.rs          shared layer workspace
-        gqa.rs              Qwen35GQA, private weights, load, and record
-        gdn.rs              Qwen35GDN, private weights, load, and record
-        dense_mlp.rs        Qwen35DenseMLP, private weights, load, and record
-        moe.rs              Qwen35MoE, private weights, load, and record
-      state/
-        gqa.rs              Qwen35GQAState page/metadata/reset lifecycle
-        gdn.rs              Qwen35GDNState prepare/restore/commit/publish/reset lifecycle
-      model.rs              Qwen35MainEmbed, Qwen35Main, and Qwen35GatherUnembed
-      mtp.rs                Qwen35MTPEmbed and the supported one-layer Qwen35MTP
+      main/
+        mod.rs              Qwen35Main owner, capture contract, and replay key
+        embed.rs            Qwen35MainEmbed and replay key
+        layer.rs            Qwen35MainLayer variants and Main scratch
+        output.rs           Qwen35GatherUnembed and replay key
+      mtp/
+        mod.rs              Qwen35MTP owner and replay key
+        embed.rs            Qwen35MTPEmbed and replay key
+        layer.rs            Qwen35MTPLayer and role-specific MTP scratch
       rejection_sampling.rs Qwen-specific rejection composition and result preparation
       plan.rs               direct geometry helpers and retained low-level DSpark plan
-      weight.rs             shared Qwen checkpoint decoding/validation helpers only
+    qwen/v3_x/
+      layer/
+        gqa.rs              Qwen3xGQA leaf weights, load, and record
+        gdn.rs              Qwen3xGDN leaf weights, load, and record
+        dense_mlp.rs        Qwen3xDenseMLP leaf weights, load, and record
+        moe.rs              Qwen3xMoE leaf weights, load, and record
+      state/
+        gqa.rs              Qwen3xGQAState page/metadata/reset lifecycle
+        gdn.rs              Qwen3xGDNState prepare/restore/commit/publish/reset lifecycle
+      weight.rs             shared Qwen checkpoint decoding/validation helpers
 
 crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs         TopKSampling and TopKSamplingOutputBuffers
@@ -62,9 +73,9 @@ Metal kernels remain backend components.
 
 ```text
 Qwen35Executor
-  main_gqa_state: Qwen35GQAState
-  main_gdn_state: Qwen35GDNState
-  mtp_gqa_state: Option<Qwen35GQAState>
+  main_gqa_state: Qwen3xGQAState
+  main_gdn_state: Qwen3xGDNState
+  mtp_gqa_state: Option<Qwen3xGQAState>
   main_embed: Replay<Qwen35MainEmbed>
   main: Replay<Qwen35Main>
   gather_unembed: Replay<Qwen35GatherUnembed>
@@ -78,10 +89,13 @@ Qwen35Executor
 
 Semantic components own weights, static configuration, and `load + record`. `Replay<T>` owns the corresponding replay
 cache. `Qwen35Executor` owns dynamic workspaces, lifecycle ordering, and submissions.
+`Embed`, `Unembed`, and `RmsNorm` each own their backend kernels; model-role code only composes their semantic
+`load`/`record` interfaces.
 
-`Qwen35Layer` owns two generic norms, residual composition, one selected attention owner, one selected MLP owner, and a
-shared `Rc<Qwen35LayerScratch>`. `Qwen35GQA` and `Qwen35GDN` store compact per-kind layer indices, not model-layer
-indices, for page-table and state-arena addressing.
+`Qwen35MainLayer` owns Qwen3.5 Main's QGKV-GQA/GDN and dense-MLP/MoE variants.
+`Qwen35MTPLayer` independently owns the MTP decoder-layer graph. Both compose shared `Qwen3x*` leaves, but they do not
+share a structural layer facade. `Qwen3xGQA` and `Qwen3xGDN` store compact per-kind layer indices, not model-layer
+indices, for page-table and state-arena addressing. Batch, config, plan, and replay keys remain Qwen3.5-owned.
 
 ## Configuration, bindings, and load
 
@@ -156,7 +170,7 @@ arguments, and composed submission order are preserved.
 token_ids
   -> MainEmbed
 token_hidden_input
-  -> Main layers using Qwen35LayerScratch::residual_stream[2] ping-pong
+  -> Main layers using Qwen35MainLayerScratch::residual_stream[2] ping-pong
 hidden_output
   -> GatherUnembed(row_indices)
 unembed_hidden
@@ -183,7 +197,7 @@ logits destination. Gathered hidden and logits remain executor workspaces.
 
 ## GQA/GDN lifecycle
 
-`Qwen35GQAState` groups a backend, scratch, request page table, metadata buffers, and cache-lane information. Main and
+`Qwen3xGQAState` groups a backend, scratch, request page table, metadata buffers, and cache-lane information. Main and
 MTP own distinct GQA state domains. Its lifecycle calls are:
 
 ```text
@@ -192,7 +206,7 @@ prepare_metadata(stage_microbatch)
 reset_req_slots(runtime_notification)
 ```
 
-`Qwen35GDNState` groups a backend, scratch, request state table, metadata, cached restore replay, and one optional
+`Qwen3xGDNState` groups a backend, scratch, request state table, metadata, cached restore replay, and one optional
 asynchronous publish submission. Preparation is synchronous on the executor thread:
 
 ```text
@@ -219,7 +233,7 @@ The executor supports zero or one MTP module. The current checkpoint contract re
 token embedding, and no dedicated MTP embeddings.
 
 `Qwen35MTPEmbed` owns previous-hidden gather, the shared `Rc<Embed>`, two checkpoint norms, concatenation, quantized
-input projection, and its private temporaries. `Qwen35MTP` owns the single body `Qwen35Layer`, final residual
+input projection, and its private temporaries. `Qwen35MTP` owns the single body `Qwen35MTPLayer`, final residual
 composition, final norm, and the MTP GQA page-table handle. There is no separate input-projector type or module loop.
 
 The composed proposal sequence remains:

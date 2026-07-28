@@ -113,9 +113,10 @@ Semantic layer/component `load` functions consume those inputs directly; there i
 layer owns stage ordering and scratch handoff. The component owns reusable math, backend dispatch, and component-local
 state interpretation.
 
-The backend-neutral `Layer` trait names typed input/output and input/output shapes. Metal `ReplayLayer` extends it with a
-record operation. It is intentionally lightweight: page tables, routing keys, state transactions, and other real
-component metadata remain explicit typed input rather than being hidden behind an artificial tensor-to-tensor API.
+Backend-neutral core types name component geometry and runtime replay shapes. Metal `ReplayLayer` names the typed
+record input/output and the record operation. It is intentionally lightweight: page tables, routing keys, state
+transactions, and other real component metadata remain explicit typed input rather than being hidden behind an
+artificial tensor-to-tensor API.
 
 ## Weight contract
 

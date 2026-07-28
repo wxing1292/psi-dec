@@ -22,7 +22,6 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::Layer;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::TopKSamplingBounds;
@@ -480,23 +479,10 @@ pub struct TopKSamplingInput<'a> {
     pub output: TopKSamplingOutput<'a>,
 }
 
-impl Layer for TopKSampling {
+impl ReplayLayer for TopKSampling {
     type Input<'a> = TopKSamplingInput<'a>;
     type Output<'a> = TopKSamplingOutput<'a>;
 
-    type InputShape = TopKSamplingShape;
-    type OutputShape = TopKSamplingShape;
-
-    fn input_shape(&self) -> Self::InputShape {
-        self.bounds.max_shape()
-    }
-
-    fn output_shape(&self) -> Self::OutputShape {
-        self.bounds.max_shape()
-    }
-}
-
-impl ReplayLayer for TopKSampling {
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,

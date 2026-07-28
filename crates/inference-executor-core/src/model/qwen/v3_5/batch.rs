@@ -566,12 +566,6 @@ pub fn to_core_batch_resp(
     BatchDeviceResponse::new(seq, core_resps)
 }
 
-pub fn has_synced_pages(page_ids_by_layer: &[Vec<Vec<u32>>]) -> bool {
-    page_ids_by_layer
-        .iter()
-        .any(|page_ids_by_block| !page_ids_by_block.is_empty())
-}
-
 fn finite_probability(probability: f32) -> NotNan<f32> {
     NotNan::new(probability).expect("qwen3.5 probability should be finite and non-NaN")
 }

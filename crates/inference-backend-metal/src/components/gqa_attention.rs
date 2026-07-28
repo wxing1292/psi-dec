@@ -1,6 +1,6 @@
-use super::assert_u32_count_domain;
-use super::assert_u32_index_domain;
-use super::checked_product;
+use crate::components::assert_u32_count_domain;
+use crate::components::assert_u32_index_domain;
+use crate::components::checked_product;
 use crate::components::gqa_kv_pages::GQAPageTableLayout;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;

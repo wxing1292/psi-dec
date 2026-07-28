@@ -11,7 +11,7 @@ use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::Qwen35PendingTransactions;
-use inference_executor_core::model::qwen::v3_5::init_model_config;
+use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MTPWeightBindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_model_weight_bindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_mtp_weight_bindings;
@@ -21,21 +21,21 @@ use inference_executor_core::sampling::RequestSamplingState;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_runtime_core::runtime::Token;
 
-use super::Qwen35Executor;
-use super::num_page_ids_per_block;
 use crate::checkpoint::SafeTensorStore;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
-use crate::model::embed_unembed::Embed;
-use crate::model::embed_unembed::EmbedConfig;
-use crate::model::embed_unembed::UnembedConfig;
+use crate::model::embedding::Embed;
+use crate::model::embedding::EmbedConfig;
 use crate::model::page_arena::PageArena;
-use crate::model::qwen::v3_5::layer::scratch::Qwen35LayerScratch;
-use crate::model::qwen::v3_5::model::Qwen35GatherUnembed;
-use crate::model::qwen::v3_5::model::Qwen35Main;
-use crate::model::qwen::v3_5::model::Qwen35MainEmbed;
+use crate::model::qwen::v3_5::executor::Qwen35Executor;
+use crate::model::qwen::v3_5::executor::num_page_ids_per_block;
+use crate::model::qwen::v3_5::main::Qwen35Main;
+use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbed;
+use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerScratch;
+use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembed;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
-use crate::model::qwen::v3_5::mtp::Qwen35MTPEmbed;
+use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
+use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
 use crate::model::qwen::v3_5::plan::qwen35_gdn_core_and_metal;
@@ -45,8 +45,9 @@ use crate::model::qwen::v3_5::plan::qwen35_moe_core_and_metal;
 use crate::model::qwen::v3_5::plan::validate_qwen35_mtp_config;
 use crate::model::qwen::v3_5::rejection_sampling::Qwen35RejectionSampler;
 use crate::model::qwen::v3_5::rejection_sampling::RejectionSampling;
-use crate::model::qwen::v3_5::state::Qwen35GDNState;
-use crate::model::qwen::v3_5::state::Qwen35GQAState;
+use crate::model::qwen::v3_x::state::Qwen3xGDNState;
+use crate::model::qwen::v3_x::state::Qwen3xGQAState;
+use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_replay::DraftSampling;
@@ -242,7 +243,7 @@ fn init_qwen_3_5_model_inner(
     config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
     config.validate();
-    let model_config = init_model_config(model_dir)?;
+    let model_config = init_qwen35_model_config(model_dir)?;
     if config.num_mtp_modules > 0 {
         assert!(
             mtp_model_dir.is_some(),
@@ -319,7 +320,7 @@ fn init_qwen_3_5_model_inner(
     let gqa_page_table_layout = target_gqa_page_table_layout;
     let mut mtp_load = if config.num_mtp_modules == 1 {
         let mtp_model_dir = mtp_model_dir.expect("qwen3.5 replay model checked MTP model dir");
-        let mtp_model_config = init_model_config(mtp_model_dir)?;
+        let mtp_model_config = init_qwen35_model_config(mtp_model_dir)?;
         validate_qwen35_mtp_config(&model_config, &mtp_model_config)?;
         let mtp_store = SafeTensorStore::from_model_dir(mtp_model_dir)?;
         let mtp_weight_bindings =
@@ -360,7 +361,7 @@ fn init_qwen_3_5_model_inner(
             .expect("qwen3.5 MTP GQA pages per block must fit u32"),
         }
     });
-    let main_gqa_state = Qwen35GQAState::load(
+    let main_gqa_state = Qwen3xGQAState::load(
         &device,
         main_gqa_core,
         main_gqa_metal,
@@ -372,7 +373,7 @@ fn init_qwen_3_5_model_inner(
     let mtp_gqa_state = mtp_gqa_geometry
         .zip(mtp_gqa_page_table_layout)
         .map(|((core, metal), page_table_layout)| {
-            Qwen35GQAState::load(
+            Qwen3xGQAState::load(
                 &device,
                 core,
                 metal,
@@ -395,7 +396,7 @@ fn init_qwen_3_5_model_inner(
         .collect::<Result<Vec<_>, _>>()?;
     let (_, gdn_metal) = qwen35_gdn_core_and_metal(gdn_layers[0], &model_config.text_config, metal_defaults)?;
     let max_spec_tokens = config.num_mtp_modules;
-    let main_gdn_state = Qwen35GDNState::load(
+    let main_gdn_state = Qwen3xGDNState::load(
         &device,
         &gdn_cores,
         gdn_metal,
@@ -406,7 +407,7 @@ fn init_qwen_3_5_model_inner(
         config.num_tokens_per_block,
         QWEN35_PAGE_SIZE_BYTES,
     );
-    let layer_scratch = std::rc::Rc::new(Qwen35LayerScratch::new(
+    let main_layer_scratch = std::rc::Rc::new(Qwen35MainLayerScratch::new(
         &device,
         config.max_tokens,
         layout.hidden_dim as usize,
@@ -421,7 +422,8 @@ fn init_qwen_3_5_model_inner(
             .map(|index| (&model_config, index))
             .or_else(|| mtp_load.as_ref().map(|(mtp_config, ..)| (mtp_config, 0)))
             .expect("qwen3.5 dense scratch requires a dense layer");
-        let (core, metal) = qwen35_dense_mlp_core_and_metal(source.1, &source.0.text_config, metal_defaults)?;
+        let defaults = Qwen35MetalDefaults::from_quantization(source.0.quantization.as_ref())?;
+        let (core, metal) = qwen35_dense_mlp_core_and_metal(source.1, &source.0.text_config, defaults)?;
         Some(std::rc::Rc::new(DenseMLPScratch::new(
             &device,
             &core,
@@ -478,11 +480,16 @@ fn init_qwen_3_5_model_inner(
         &main_gqa_state,
         &main_gdn_state,
         None,
-        std::rc::Rc::clone(&layer_scratch),
+        std::rc::Rc::clone(&main_layer_scratch),
         dense_mlp_scratch.as_ref(),
         moe_scratch.as_ref(),
     )?;
     let mtp = if let Some((mtp_model_config, mut mtp_store, mtp_bindings)) = mtp_load.take() {
+        let mtp_layer_scratch = std::rc::Rc::new(Qwen35MTPLayerScratch::new(
+            &device,
+            config.max_tokens,
+            layout.hidden_dim as usize,
+        ));
         let Qwen35MTPWeightBindings {
             embed: mtp_embed_bindings,
             body,
@@ -507,7 +514,7 @@ fn init_qwen_3_5_model_inner(
             mtp_gqa_state
                 .as_ref()
                 .expect("qwen3.5 enabled MTP requires a distinct GQA state"),
-            Rc::clone(&layer_scratch),
+            mtp_layer_scratch,
             dense_mlp_scratch.as_ref(),
             moe_scratch.as_ref(),
         )?;

@@ -20,10 +20,10 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
-use super::GRPCServer;
-use super::map_error;
 use crate::api::decode::DecodeEvent;
 use crate::api::decode::DecodeRequest;
+use crate::rpc::grpc::GRPCServer;
+use crate::rpc::grpc::map_error;
 
 #[async_trait::async_trait]
 impl<const N: usize, const L: usize, const P: usize> InferenceRuntime for GRPCServer<N, L, P> {

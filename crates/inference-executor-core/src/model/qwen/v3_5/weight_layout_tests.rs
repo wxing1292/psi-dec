@@ -7,7 +7,7 @@ use super::Qwen35WeightLayout;
 use super::resolve_qwen35_model_weight_bindings;
 use super::resolve_qwen35_mtp_weight_bindings;
 use crate::model::qwen::v3_5::Qwen35ModelConfig;
-use crate::model::qwen::v3_5::TensorPathLayout;
+use crate::model::qwen::v3_x::TensorPathLayout;
 
 fn model_config(num_experts: usize) -> Qwen35ModelConfig {
     let intermediate_size = if num_experts == 0 { 16 } else { 0 };

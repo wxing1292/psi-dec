@@ -72,6 +72,12 @@ throughput evidence instead of treating a removed or hypothetical component path
 
 ## Replay Evolution
 
+- Revisit the backend-neutral replay boundary before adding another backend. The
+  current neutral `Runtime`/`Recorder` contracts coexist with Metal-only replay
+  programs and fusion plus executor-side adapters. Keep shared execution
+  lifecycle genuinely backend-agnostic, keep Metal replay/fusion in the Metal
+  backend, and avoid mirrored replay operator/recorder APIs across the backend
+  and executor.
 - Evaluate capacity-bucketed main and MTP forward replays only after every
   participating kernel has a guarded inactive-lane ABI and parity coverage.
   Main/MTP counts remain exact until then.

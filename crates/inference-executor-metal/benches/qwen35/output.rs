@@ -13,7 +13,7 @@ use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::SafeTensorStore;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::gather_flat_indices;
-use inference_executor_core::model::qwen::v3_5::init_model_config;
+use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_core::model::qwen::v3_5::num_target_hidden_states;
 use inference_executor_core::model::qwen::v3_5::sample_sampler_configs;
 use inference_executor_core::model::qwen::v3_5::sample_token_positions;
@@ -26,15 +26,15 @@ use inference_executor_core::sampling::TopKSamplingLogitsDtype;
 use inference_executor_metal::def::layer::ReplayLayer;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
-use inference_executor_metal::model::embed_unembed::Embed;
-use inference_executor_metal::model::embed_unembed::EmbedConfig;
-use inference_executor_metal::model::embed_unembed::EmbedInput;
-use inference_executor_metal::model::embed_unembed::Unembed;
-use inference_executor_metal::model::embed_unembed::UnembedConfig;
-use inference_executor_metal::model::embed_unembed::UnembedInput;
+use inference_executor_metal::model::embedding::Embed;
+use inference_executor_metal::model::embedding::EmbedConfig;
+use inference_executor_metal::model::embedding::EmbedInput;
 use inference_executor_metal::model::gather::Gather;
-use inference_executor_metal::model::qwen::v3_5::weight::load_qwen35_norm_weight;
+use inference_executor_metal::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
 use inference_executor_metal::model::rms_norm::RmsNorm;
+use inference_executor_metal::model::unembedding::Unembed;
+use inference_executor_metal::model::unembedding::UnembedConfig;
+use inference_executor_metal::model::unembedding::UnembedInput;
 use inference_executor_metal::sampling::top_k_sampling::TopKSampling;
 use inference_executor_metal::sampling::top_k_sampling::TopKSamplingInput;
 use inference_executor_metal::sampling::top_k_sampling::TopKSamplingInputs;
@@ -290,7 +290,7 @@ struct HeadReplay {
 impl HeadFixture {
     fn new(model_dir: &std::path::Path, max_tokens: usize) -> Self {
         let device = Device::system_default();
-        let model_config = init_model_config(model_dir)
+        let model_config = init_qwen35_model_config(model_dir)
             .unwrap_or_else(|err| panic!("unable to init Qwen3.5 config from {}: {err}", model_dir.display()));
         let sampler_config = SamplerConfig::load(model_dir)
             .unwrap_or_else(|err| panic!("unable to init sampler config from {}: {err}", model_dir.display()));
@@ -310,7 +310,7 @@ impl HeadFixture {
         let Qwen35ModelWeightBindings { embed, main, unembed } = weight_bindings;
         let embedding = Embed::load(&device, &mut store, layout.embedding_config(), embed)
             .unwrap_or_else(|err| panic!("unable to load qwen35 embedding: {err}"));
-        let final_norm_weight = load_qwen35_norm_weight(
+        let final_norm_weight = load_qwen3x_norm_weight(
             &device,
             &mut store,
             &main.final_norm_weight,
@@ -332,10 +332,10 @@ impl HeadFixture {
             unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
             embedding,
             final_norm: RmsNorm::new(
+                &device,
                 layout.hidden_dim as usize,
                 layout.rms_norm_eps,
                 final_norm_weight,
-                RmsNorm::kernel(&device),
             ),
             gather: Gather::new(&device),
             unembedder,

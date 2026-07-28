@@ -4,6 +4,15 @@ fn config_json() -> Value {
     serde_json::json!({
         "model_type": "qwen3_5",
         "tie_word_embeddings": false,
+        "quantization": {
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            "model.layers.0.mlp.gate.weight": {
+                "group_size": 128,
+                "bits": 3
+            }
+        },
         "quantization_config": {
             "group_size": 64,
             "bits": 4,
@@ -45,12 +54,7 @@ fn config_json() -> Value {
 
 #[test]
 fn test_parses_and_normalizes_nested_text_config() {
-    let envelope = config_json();
-    let mut model_config = serde_json::from_value::<Qwen35ModelConfig>(envelope.clone()).unwrap();
-    model_config.quantization = model_config
-        .quantization
-        .or_else(|| parse_nested_quantization_config(&envelope));
-    model_config.normalize().unwrap();
+    let model_config = parse_qwen35_config(config_json()).unwrap();
 
     assert_eq!(model_config.text_config.hidden_act, "silu");
     assert_eq!(model_config.text_config.rms_norm_eps, 1e-6);
@@ -72,55 +76,38 @@ fn test_resolves_layer_types_and_moe_schedule() {
 }
 
 #[test]
-fn test_resolves_tensor_path_layout() {
-    let layout = resolve_tensor_path_layout_from_names([
-        "language_model.model.embed_tokens.weight",
-        "language_model.model.layers.0.gated_delta_net.in_proj_qkv.weight",
-    ]);
+fn test_rejects_malformed_nested_quantization() {
+    let mut envelope = config_json();
+    envelope["quantization"] = serde_json::json!({
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine"
+    });
+    envelope["quantization_config"]["bits"] = serde_json::json!("four");
 
-    assert_eq!(
-        layout,
-        TensorPathLayout {
-            container_prefix: "language_model.",
-            model_prefix: "model.",
-        }
-    );
-    assert_eq!(
-        layout.model_path("layers.0.self_attn.q_proj.weight"),
-        "language_model.model.layers.0.self_attn.q_proj.weight"
+    let error = parse_qwen35_config(envelope).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("unable to parse qwen3.5 quantization_config")
     );
 }
 
 #[test]
-fn test_resolves_quantization_override_aliases() {
-    let mut model_config = serde_json::from_value::<Qwen35ModelConfig>(config_json()).unwrap();
-    model_config.quantization = parse_nested_quantization_config(&config_json());
-    model_config.normalize().unwrap();
-    let quantization = model_config.quantization.unwrap();
+fn test_rejects_conflicting_quantization_fields() {
+    let mut envelope = config_json();
+    envelope["quantization"] = serde_json::json!({
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine"
+    });
 
-    let direct = quantization.resolve_for_tensor("model.layers.0.mlp.gate.weight");
-    let normalized = quantization.resolve_for_tensor("layers.0.mlp.gate.weight");
-    let fallback = quantization.resolve_for_tensor("model.layers.0.mlp.up_proj.weight");
+    let error = parse_qwen35_config(envelope).unwrap_err();
 
-    assert_eq!(direct.group_size, 128);
-    assert_eq!(normalized.bits, 3);
-    assert_eq!(fallback.group_size, 64);
-    assert_eq!(fallback.bits, 4);
-}
-
-#[test]
-fn test_normalizes_common_qwen_container_prefixes() {
-    assert_eq!(
-        normalize_qwen_name("model.layers.0.mlp.gate_proj.weight"),
-        "layers.0.mlp.gate_proj.weight"
+    assert!(
+        error
+            .to_string()
+            .contains("quantization and quantization_config must describe the same layout")
     );
-    assert_eq!(
-        normalize_qwen_name("language_model.model.layers.1.self_attn.q_proj.weight"),
-        "layers.1.self_attn.q_proj.weight"
-    );
-    assert_eq!(
-        normalize_qwen_name("model.language_model.layers.2.mlp.up_proj.weight"),
-        "layers.2.mlp.up_proj.weight"
-    );
-    assert_eq!(normalize_qwen_name("lm_head.weight"), "unembed.weight");
 }

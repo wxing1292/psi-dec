@@ -1,5 +1,5 @@
-use super::assert_u32_count_domain;
-use super::checked_product;
+use crate::components::assert_u32_count_domain;
+use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use clap::Parser;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::init_model_config;
+use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35ExecutorConfig;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model;
@@ -19,11 +19,11 @@ use inference_runtime_service::observability::CacheLaneLogSummary;
 use inference_runtime_service::observability::StartupLogger;
 use inference_runtime_service::runtime::serve_replay_model;
 
-use super::args::Qwen35Args;
-use super::config::QWEN35_MAX_RUNNING_REQUESTS;
-use super::config::Qwen35Config;
-use super::sizing::block_cache_capacity;
-use super::sizing::kv_dtype_bytes;
+use crate::qwen_server::args::Qwen35Args;
+use crate::qwen_server::config::QWEN35_MAX_RUNNING_REQUESTS;
+use crate::qwen_server::config::Qwen35Config;
+use crate::qwen_server::sizing::block_cache_capacity;
+use crate::qwen_server::sizing::kv_dtype_bytes;
 
 const TOKENS_PER_CACHE_BLOCK: usize = 2048;
 const MAX_QUEUED_REQUESTS: usize = 32;
@@ -265,7 +265,7 @@ fn build_runtime_config(
 }
 
 fn load_model_config(hf_model_dir: &std::path::Path) -> Result<Qwen35ModelConfig> {
-    init_model_config(hf_model_dir)
+    init_qwen35_model_config(hf_model_dir)
         .map_err(|error| log_err_unavailable!("unable to read qwen3.5 model config from {hf_model_dir:?}: {error}"))
 }
 

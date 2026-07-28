@@ -248,8 +248,7 @@ semantics into backend buffers.
 Traits should enforce this boundary where drift is likely:
 
 ```text
-Layer                       model-executor semantic component contract
-ReplayLayer                 replay contract over the same Layer input/output
+ReplayLayer                 model-executor semantic replay contract with typed input/output
 Recorder                    backend replay recording contract
 Operator                    backend recordable execution contract
 ```

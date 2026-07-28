@@ -1,49 +1,4 @@
 impl Qwen35Executor {
-    fn record_main(
-        &mut self,
-        recorder: &mut Qwen35ModelRecorder,
-        model_batch_req: &Qwen35ModelBatchRequest,
-        model_batch_hidden: Rc<Buffer>,
-    ) -> Rc<Buffer> {
-        let microbatch = model_batch_req.microbatch();
-        assert!(
-            Rc::ptr_eq(&model_batch_hidden, &self.token_hidden_input),
-            "qwen3.5 Main must consume the MainEmbed hidden workspace"
-        );
-        let input = Qwen35MainArgs {
-            num_tokens: microbatch
-                .total_tokens()
-                .try_into()
-                .expect("qwen3.5 Main token count must fit u32"),
-            hidden_input: &model_batch_hidden,
-            hidden_output: &self.hidden_output,
-            gqa: self.main_gqa_state.metadata(),
-            gdn: self.main_gdn_state.metadata(),
-            pages: self.pages.buffer(),
-        };
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (recorded_key, cache_hit) = self.main.record(&runtime, &input);
-        assert_eq!(
-            recorded_key, recorder.main_key,
-            "qwen3.5 Main replay input must match the prepared replay key"
-        );
-        recorder.main_cache_hit = cache_hit;
-        trace::qwen35_state(|| {
-            format!(
-                "event=main_replays main_embed_key={:?} main_key={:?} \
-                 main_embed_cache_hit={} main_cache_hit={} cache_hit={}",
-                recorder.main_embed_key,
-                recorder.main_key,
-                recorder.main_embed_cache_hit,
-                recorder.main_cache_hit,
-                recorder.main_replay_cache_hit(),
-            )
-        });
-        self.pending_transactions
-            .push(model_batch_req.compute_seq(), microbatch.clone());
-        Rc::clone(&self.hidden_output)
-    }
-
     fn write_gather_flat_indices(&self, microbatch: &Qwen35Microbatch) -> Vec<u32> {
         // The mask selects source hidden states. Its compact indices are a
         // dynamic gather input, not batch state: [F, F, F, T, T, T] -> [3, 4, 5].
@@ -100,7 +55,7 @@ impl Qwen35Executor {
 
     fn submit_main_decode_stage(
         &self,
-        recorder: &mut Qwen35ModelRecorder,
+        recorder: &mut Qwen35ModelOpsRecorder,
         decision_replay: &ReplayProgram,
         decision_arguments: &ReplayArguments,
     ) -> Duration {
@@ -128,53 +83,5 @@ impl Qwen35Executor {
         let elapsed = start.elapsed();
         recorder.main_stage_submitted = true;
         elapsed
-    }
-
-    fn embed(
-        &mut self,
-        recorder: &mut Qwen35ModelRecorder,
-        model_batch_request: &Qwen35ModelBatchRequest,
-    ) -> Rc<Buffer> {
-        let input = Qwen35MainEmbedArgs {
-            num_tokens: model_batch_request
-                .microbatch()
-                .total_tokens()
-                .try_into()
-                .expect("qwen3.5 MainEmbed token count must fit u32"),
-            token_ids: &self.token_ids,
-            hidden_output: &self.token_hidden_input,
-        };
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (recorded_key, cache_hit) = self.main_embed.record(&runtime, &input);
-        assert_eq!(
-            recorded_key, recorder.main_embed_key,
-            "qwen3.5 MainEmbed replay input must match the prepared replay key"
-        );
-        recorder.main_embed_cache_hit = cache_hit;
-        Rc::clone(&self.token_hidden_input)
-    }
-
-    fn forward_main(
-        &mut self,
-        recorder: &mut Qwen35ModelRecorder,
-        model_batch_req: &Qwen35ModelBatchRequest,
-        model_batch_hidden: Rc<Buffer>,
-    ) -> Rc<Buffer> {
-        self.record_main(recorder, model_batch_req, model_batch_hidden)
-    }
-
-    fn unembed(
-        &mut self,
-        recorder: &mut Qwen35ModelRecorder,
-        model_batch_req: &Qwen35ModelBatchRequest,
-        model_batch_hidden: &Rc<Buffer>,
-    ) -> Qwen35ForwardOutput {
-        assert!(
-            Rc::ptr_eq(model_batch_hidden, &self.hidden_output),
-            "qwen3.5 Output must consume the executor final-norm hidden workspace"
-        );
-        recorder.gather_unembed_key =
-            Some(self.prepare_gather_unembed_replay(model_batch_req.microbatch(), model_batch_hidden));
-        Qwen35ForwardOutput
     }
 }

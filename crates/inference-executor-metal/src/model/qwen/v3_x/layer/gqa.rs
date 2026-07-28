@@ -5,12 +5,12 @@ use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35GQAWeightBindings;
+use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
 
 use crate::attn::gqa::backend::GQA;
 use crate::attn::gqa::backend::GQAInput;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
+use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::attn::gqa::backend::GQAWeights;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
@@ -18,45 +18,38 @@ use crate::attn::gqa::scratch::GQAScratch;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use crate::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
-use crate::model::qwen::v3_5::weight::affine_shape;
-use crate::model::qwen::v3_5::weight::concat_bytes;
-use crate::model::qwen::v3_5::weight::quant_weight;
-use crate::model::qwen::v3_5::weight::qwen_next_norm_f32_buffer;
-use crate::model::qwen::v3_5::weight::typed_tensor;
-use crate::model::qwen::v3_5::weight::validate_len;
+use crate::model::qwen::v3_x::weight::affine_shape;
+use crate::model::qwen::v3_x::weight::concat_bytes;
+use crate::model::qwen::v3_x::weight::quant_weight;
+use crate::model::qwen::v3_x::weight::qwen_next_norm_f32_buffer;
+use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::qwen::v3_x::weight::validate_len;
 
-pub struct Qwen35GQA {
-    layer_index: usize,
-    weights: Qwen35GQAWeights,
+pub struct Qwen3xGQA {
+    compact_gqa_layer_index: usize,
+    weights: Qwen3xGQAWeights,
     backend: Rc<GQA>,
     scratch: Rc<GQAScratch>,
     request_page_table: Rc<GQARequestPageTable>,
 }
 
-impl Qwen35GQA {
-    pub fn num_tokens_per_page(&self) -> usize {
-        self.backend.num_tokens_per_page() as usize
-    }
-
+impl Qwen3xGQA {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        config: &Qwen35ModelConfig,
-        defaults: Qwen35MetalDefaults,
-        model_layer_index: usize,
-        layer_index: usize,
-        bindings: Qwen35GQAWeightBindings,
+        core: &GQACore,
+        metal: GQAMetalConfig,
+        norms_store_actual_scale: bool,
+        compact_gqa_layer_index: usize,
+        bindings: Qwen3xGQAWeightBindings,
         backend: Rc<GQA>,
         scratch: Rc<GQAScratch>,
         request_page_table: Rc<GQARequestPageTable>,
     ) -> Result<Self, ModelExecutorError> {
-        let (core, metal) = qwen35_gqa_core_and_metal(model_layer_index, &config.text_config, defaults)?;
         Ok(Self {
-            layer_index,
-            weights: Qwen35GQAWeights::load(device, store, &bindings, &core, metal, config.quantization.is_some())?,
+            compact_gqa_layer_index,
+            weights: Qwen3xGQAWeights::load(device, store, &bindings, core, metal, norms_store_actual_scale)?,
             backend,
             scratch,
             request_page_table,
@@ -79,9 +72,9 @@ impl Qwen35GQA {
             GQAInput {
                 page_table_layout: self.request_page_table.layout(),
                 gqa_layer_index: self
-                    .layer_index
+                    .compact_gqa_layer_index
                     .try_into()
-                    .expect("qwen3.5 compact GQA layer index must fit u32"),
+                    .expect("qwen3.x compact GQA layer index must fit u32"),
                 batch_metadata: metadata,
                 hidden_state: input,
                 next_hidden_state: output,
@@ -94,9 +87,13 @@ impl Qwen35GQA {
             },
         );
     }
+
+    pub fn num_tokens_per_page(&self) -> usize {
+        self.backend.num_tokens_per_page() as usize
+    }
 }
 
-struct Qwen35GQAWeights {
+struct Qwen3xGQAWeights {
     qgkv_weight: Buffer,
     qgkv_scales: Buffer,
     qgkv_biases: Buffer,
@@ -107,13 +104,13 @@ struct Qwen35GQAWeights {
     output_biases: Buffer,
 }
 
-impl Qwen35GQAWeights {
+impl Qwen3xGQAWeights {
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        bindings: &Qwen35GQAWeightBindings,
+        bindings: &Qwen3xGQAWeightBindings,
         core: &GQACore,
-        metal: crate::attn::gqa::backend::GQAMetalConfig,
+        metal: GQAMetalConfig,
         norms_store_actual_scale: bool,
     ) -> Result<Self, ModelExecutorError> {
         core.validate();

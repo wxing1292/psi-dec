@@ -182,6 +182,13 @@ The complete verification ladder and performance-evidence record live in
 Keep public surface minimal. Items remain private unless an external caller intentionally needs them; do not use
 `pub(crate)` or `pub(super)`.
 
+Treat a model role as a structural ownership boundary. Main, MTP, and dSpark use distinct concrete layer types even
+when they compose some of the same operators. Share true leaf components and utilities across roles; do not share a
+structural layer facade that mixes their execution graphs.
+
+Production source and benches use crate-absolute paths for sibling and ancestor imports. Reserve `use super::...` for
+tests.
+
 When a trait is the production interface for a concrete type, put the actual method implementation directly in that
 type's trait impl. Keep constructors and operations outside the trait in the inherent impl; do not duplicate trait
 methods as inherent methods and forward between the two impls.

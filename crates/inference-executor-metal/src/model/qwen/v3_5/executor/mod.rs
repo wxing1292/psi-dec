@@ -39,27 +39,27 @@ use inference_runtime_core::runtime::Token;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::page_arena::PageArena;
-use crate::model::qwen::v3_5::model::Qwen35GatherUnembed;
-use crate::model::qwen::v3_5::model::Qwen35GatherUnembedArgs;
-use crate::model::qwen::v3_5::model::Qwen35GatherUnembedReplayKey;
-use crate::model::qwen::v3_5::model::Qwen35Main;
-use crate::model::qwen::v3_5::model::Qwen35MainArgs;
-use crate::model::qwen::v3_5::model::Qwen35MainEmbed;
-use crate::model::qwen::v3_5::model::Qwen35MainEmbedArgs;
-use crate::model::qwen::v3_5::model::Qwen35MainEmbedReplayKey;
-use crate::model::qwen::v3_5::model::Qwen35MainReplayKey;
+use crate::model::qwen::v3_5::main::Qwen35Main;
+use crate::model::qwen::v3_5::main::Qwen35MainArgs;
+use crate::model::qwen::v3_5::main::Qwen35MainReplayKey;
+use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbed;
+use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbedArgs;
+use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbedReplayKey;
+use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembed;
+use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembedArgs;
+use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembedReplayKey;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::Qwen35MTPArgs;
-use crate::model::qwen::v3_5::mtp::Qwen35MTPEmbed;
-use crate::model::qwen::v3_5::mtp::Qwen35MTPEmbedArgs;
-use crate::model::qwen::v3_5::mtp::Qwen35MTPEmbedReplayKey;
 use crate::model::qwen::v3_5::mtp::Qwen35MTPReplayKey;
+use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
+use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedArgs;
+use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedReplayKey;
 use crate::model::qwen::v3_5::rejection_sampling::Qwen35RejectionSamplingInput;
 use crate::model::qwen::v3_5::rejection_sampling::Qwen35TargetRejectionReplayKey;
 use crate::model::qwen::v3_5::rejection_sampling::RejectionSampling;
 use crate::model::qwen::v3_5::rejection_sampling::RejectionSamplingInput;
-use crate::model::qwen::v3_5::state::Qwen35GDNState;
-use crate::model::qwen::v3_5::state::Qwen35GQAState;
+use crate::model::qwen::v3_x::state::Qwen3xGDNState;
+use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::replay::Replay;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_replay::DraftSampling;
@@ -114,16 +114,16 @@ pub struct Qwen35Executor {
     sampler_bounds: TopKSamplingBounds,
     sampler_output: TopKSamplingOutputBuffers,
     request_sampling: RequestSamplingState,
-    main_gqa_state: Qwen35GQAState,
-    main_gdn_state: Qwen35GDNState,
-    mtp_gqa_state: Option<Qwen35GQAState>,
+    main_gqa_state: Qwen3xGQAState,
+    main_gdn_state: Qwen3xGDNState,
+    mtp_gqa_state: Option<Qwen3xGQAState>,
     spec_probs: SpecProbsStore,
     pages: PageArena,
     pending_transactions: Qwen35PendingTransactions,
     gqa_page_table_layout: GQAPageTableLayout,
 }
 
-pub struct Qwen35ModelRecorder {
+pub struct Qwen35ModelOpsRecorder {
     compute_seq: RawComputeSlotSeq,
     main_embed_key: Qwen35MainEmbedReplayKey,
     main_key: Qwen35MainReplayKey,
@@ -133,7 +133,7 @@ pub struct Qwen35ModelRecorder {
     main_stage_submitted: bool,
 }
 
-impl Qwen35ModelRecorder {
+impl Qwen35ModelOpsRecorder {
     fn main_replay_cache_hit(&self) -> bool {
         self.main_embed_cache_hit && self.main_cache_hit
     }
@@ -168,21 +168,21 @@ fn mtp_proposal_sample_position(token_index: u32, num_tokens: usize) -> u32 {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen35ForwardOutput;
+pub struct Qwen35ModelBatchResponse;
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Qwen35DecodeOutput {
+pub struct Qwen35SampledOutput {
     decisions: Vec<Qwen35DecodeDecision>,
     read_sampling_output: bool,
     timing: ModelOutputTiming,
 }
 
 impl ReplayableModelBatchExecutor for Qwen35Executor {
-    type ModelBatchReq = Qwen35ModelBatchRequest;
+    type ModelBatchRequest = Qwen35ModelBatchRequest;
     type ModelBatchHidden = Rc<Buffer>;
-    type ModelBatchResp = Qwen35ForwardOutput;
-    type SampledOutput = Qwen35DecodeOutput;
-    type ModelOpsRecorder = Qwen35ModelRecorder;
+    type ModelBatchResponse = Qwen35ModelBatchResponse;
+    type SampledOutput = Qwen35SampledOutput;
+    type ModelOpsRecorder = Qwen35ModelOpsRecorder;
 
     fn model_name(&self) -> &str {
         &self.model_name
@@ -193,11 +193,105 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
     }
 
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]) {
-        Qwen35Executor::reset_req_slots(self, request_slots)
+        self.finish_cache_publish();
+        self.request_sampling.reset(request_slots);
+        self.main_gqa_state.reset_req_slots(request_slots);
+        if let Some(mtp_gqa_state) = &self.mtp_gqa_state {
+            mtp_gqa_state.reset_req_slots(request_slots);
+        }
+        self.spec_probs.reset_req_slots(request_slots);
+        self.main_gdn_state.reset_req_slots(request_slots);
     }
 
-    fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchReq {
-        Qwen35Executor::prepare_batch(self, core_batch_req)
+    fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
+        self.finish_cache_publish();
+        let batch_seq = core_batch_req.seq;
+        self.validate_input(core_batch_req);
+        let sampler_configs = core_batch_req
+            .dev_reqs
+            .iter()
+            .map(|request| {
+                let seed = self
+                    .request_sampling
+                    .resolve(request.req_slot, request.sampling_config.seed);
+                SamplerConfig::from_runtime(&request.sampling_config, seed)
+            })
+            .collect();
+        let model_batch_request =
+            Qwen35ModelBatchRequest::from_core_batch(core_batch_req, usize::from(self.mtp.is_some()), sampler_configs);
+        let microbatch = model_batch_request.microbatch();
+        trace::qwen35_state(|| {
+            format!(
+                "event=batch_from_core seq={} req_slots={:?} token_indices={:?} num_spec_tokens={:?} seeds={:?} \
+                 total_tokens={} num_reqs={}",
+                batch_seq,
+                microbatch.req_slots(),
+                microbatch.token_indices(),
+                microbatch
+                    .gdn_state_txns()
+                    .iter()
+                    .map(|txn| txn.num_spec_tokens)
+                    .collect::<Vec<_>>(),
+                microbatch
+                    .sampler_configs()
+                    .iter()
+                    .map(SamplerConfig::seed)
+                    .collect::<Vec<_>>(),
+                microbatch.total_tokens(),
+                microbatch.num_reqs()
+            )
+        });
+        self.write_token_ids(microbatch.flat_token_ids());
+        let prepare_start = Instant::now();
+        let gqa_start = Instant::now();
+        self.main_gqa_state.prepare_pages(core_batch_req);
+        let gqa_shape = self.main_gqa_state.prepare_metadata(
+            microbatch.req_slots(),
+            microbatch.token_indices(),
+            microbatch.cu_tokens(),
+        );
+        let gqa_elapsed = gqa_start.elapsed();
+        debug_assert_eq!(gqa_shape.num_tokens as usize, microbatch.total_tokens());
+        let gdn_states_start = Instant::now();
+        let gdn_prepared = self.main_gdn_state.prepare_states(
+            microbatch.req_slots(),
+            microbatch.block_indices(),
+            microbatch.token_indices(),
+            microbatch.cu_tokens(),
+            microbatch.gdn_state_txns(),
+            microbatch.gdn_state_page_ids_by_req(),
+        );
+        let gdn_states_elapsed = gdn_states_start.elapsed();
+        let gdn_metadata_start = Instant::now();
+        let gdn_shape = self
+            .main_gdn_state
+            .prepare_metadata(microbatch.cu_tokens(), &gdn_prepared);
+        let gdn_metadata_elapsed = gdn_metadata_start.elapsed();
+        debug_assert_eq!(gdn_shape.num_tokens as usize, microbatch.total_tokens());
+        debug_assert_eq!(gdn_shape.num_reqs as usize, microbatch.num_reqs());
+        if let Some(mtp_gqa_state) = &self.mtp_gqa_state {
+            mtp_gqa_state.prepare_pages(core_batch_req);
+        }
+        let prepare_elapsed = prepare_start.elapsed();
+        trace::qwen35_state(|| {
+            format!(
+                "event=prepare_sync seq={} gqa_us={} gdn_states_us={} gdn_metadata_us={} wall_us={}",
+                batch_seq,
+                gqa_elapsed.as_micros(),
+                gdn_states_elapsed.as_micros(),
+                gdn_metadata_elapsed.as_micros(),
+                prepare_elapsed.as_micros()
+            )
+        });
+        let restore_elapsed = self.submit_gdn_state_restore();
+        trace::qwen35_state(|| {
+            format!(
+                "event=prepare_batch_done seq={} gdn_restore_us={}",
+                batch_seq,
+                restore_elapsed.as_micros()
+            )
+        });
+        model_batch_request
     }
 
     fn commit_batch(
@@ -205,77 +299,238 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         core_batch_req: BatchDeviceRequest,
         sampled_output: Self::SampledOutput,
     ) -> BatchDeviceResponse {
-        Qwen35Executor::commit_batch(self, core_batch_req, sampled_output)
+        self.commit(core_batch_req.seq, &sampled_output.decisions);
+        to_core_batch_resp(core_batch_req, sampled_output.decisions)
     }
 
-    fn begin_ops_recording(&mut self, model_batch_request: &Self::ModelBatchReq) -> Self::ModelOpsRecorder {
-        Qwen35Executor::begin_ops_recording(self, model_batch_request)
+    fn begin_ops_recording(&mut self, model_batch_request: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {
+        let main_embed_key = Qwen35MainEmbedReplayKey::new(
+            model_batch_request
+                .microbatch()
+                .total_tokens()
+                .try_into()
+                .expect("qwen3.5 MainEmbed token count must fit u32"),
+        );
+        let main_key = Qwen35MainReplayKey::from_shapes(
+            self.main_gqa_state.metadata().replay_shape(),
+            self.main_gdn_state.metadata().replay_shape(),
+        );
+        trace::qwen35_state(|| {
+            format!(
+                "event=begin_ops_recording main_embed_key={:?} main_key={:?}",
+                main_embed_key, main_key
+            )
+        });
+        Qwen35ModelOpsRecorder {
+            compute_seq: model_batch_request.compute_seq(),
+            main_embed_key,
+            main_key,
+            main_embed_cache_hit: false,
+            main_cache_hit: false,
+            gather_unembed_key: None,
+            main_stage_submitted: false,
+        }
     }
 
     fn finish_ops_recording(
         &mut self,
         recorder: Self::ModelOpsRecorder,
-        sampled_output: Self::SampledOutput,
+        mut sampled_output: Self::SampledOutput,
     ) -> Self::SampledOutput {
-        Qwen35Executor::finish_ops_recording(self, recorder, sampled_output)
+        let mut recorder = recorder;
+        if recorder.main_stage_submitted {
+            return sampled_output;
+        }
+        if sampled_output.read_sampling_output {
+            let (num_sample_tokens, sampler_configs, sample_positions) = {
+                let microbatch = self.pending_transactions.pending_microbatch(recorder.compute_seq);
+                debug_assert!(
+                    !microbatch.has_spec_tokens(),
+                    "qwen3.5 deferred sampling requires non-spec inputs"
+                );
+                (
+                    u32::try_from(num_target_hidden_states(microbatch))
+                        .expect("qwen3.5 target hidden-state count must fit u32"),
+                    sample_sampler_configs(microbatch),
+                    sample_token_positions(microbatch),
+                )
+            };
+            sampled_output.timing.main_output_replay_elapsed +=
+                self.submit_main_sample_stage(&mut recorder, &sampler_configs, &sample_positions);
+            let sample_read_start = Instant::now();
+            sampled_output.decisions = self.read_sample_decisions(num_sample_tokens as usize);
+            trace_decisions("finish_sample_read", &sampled_output.decisions);
+            sampled_output.timing.sample_read_elapsed += sample_read_start.elapsed();
+        } else {
+            sampled_output.timing.main_replay_elapsed += self.submit_main_stage(&mut recorder);
+        }
+        sampled_output
     }
 
     fn embed(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_request: &Self::ModelBatchReq,
+        model_batch_request: &Self::ModelBatchRequest,
     ) -> Self::ModelBatchHidden {
-        Qwen35Executor::embed(self, recorder, model_batch_request)
+        let input = Qwen35MainEmbedArgs {
+            num_tokens: model_batch_request
+                .microbatch()
+                .total_tokens()
+                .try_into()
+                .expect("qwen3.5 MainEmbed token count must fit u32"),
+            token_ids: &self.token_ids,
+            hidden_output: &self.token_hidden_input,
+        };
+        let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        let (recorded_key, cache_hit) = self.main_embed.record(&runtime, &input);
+        assert_eq!(
+            recorded_key, recorder.main_embed_key,
+            "qwen3.5 MainEmbed replay input must match the prepared replay key"
+        );
+        recorder.main_embed_cache_hit = cache_hit;
+        Rc::clone(&self.token_hidden_input)
     }
 
     fn forward_main(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
+        model_batch_req: &Self::ModelBatchRequest,
         model_batch_hidden: Self::ModelBatchHidden,
     ) -> Self::ModelBatchHidden {
-        Qwen35Executor::forward_main(self, recorder, model_batch_req, model_batch_hidden)
+        let microbatch = model_batch_req.microbatch();
+        assert!(
+            Rc::ptr_eq(&model_batch_hidden, &self.token_hidden_input),
+            "qwen3.5 Main must consume the MainEmbed hidden workspace"
+        );
+        let input = Qwen35MainArgs {
+            num_tokens: microbatch
+                .total_tokens()
+                .try_into()
+                .expect("qwen3.5 Main token count must fit u32"),
+            hidden_input: &model_batch_hidden,
+            hidden_output: &self.hidden_output,
+            gqa: self.main_gqa_state.metadata(),
+            gdn: self.main_gdn_state.metadata(),
+            pages: self.pages.buffer(),
+        };
+        let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        let (recorded_key, cache_hit) = self.main.record(&runtime, &input);
+        assert_eq!(
+            recorded_key, recorder.main_key,
+            "qwen3.5 Main replay input must match the prepared replay key"
+        );
+        recorder.main_cache_hit = cache_hit;
+        trace::qwen35_state(|| {
+            format!(
+                "event=main_replays main_embed_key={:?} main_key={:?} main_embed_cache_hit={} main_cache_hit={} \
+                 cache_hit={}",
+                recorder.main_embed_key,
+                recorder.main_key,
+                recorder.main_embed_cache_hit,
+                recorder.main_cache_hit,
+                recorder.main_replay_cache_hit(),
+            )
+        });
+        self.pending_transactions
+            .push(model_batch_req.compute_seq(), microbatch.clone());
+        Rc::clone(&self.hidden_output)
     }
 
     fn unembed(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
+        model_batch_req: &Self::ModelBatchRequest,
         model_batch_hidden: &Self::ModelBatchHidden,
-    ) -> Self::ModelBatchResp {
-        Qwen35Executor::unembed(self, recorder, model_batch_req, model_batch_hidden)
+    ) -> Self::ModelBatchResponse {
+        assert!(
+            Rc::ptr_eq(model_batch_hidden, &self.hidden_output),
+            "qwen3.5 Output must consume the executor final-norm hidden workspace"
+        );
+        recorder.gather_unembed_key =
+            Some(self.prepare_gather_unembed_replay(model_batch_req.microbatch(), model_batch_hidden));
+        Qwen35ModelBatchResponse
     }
 
     fn sample(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
-        _model_batch_resp: &Self::ModelBatchResp,
+        model_batch_req: &Self::ModelBatchRequest,
+        _model_batch_resp: &Self::ModelBatchResponse,
     ) -> Self::SampledOutput {
-        Qwen35Executor::sample(self, recorder, model_batch_req, _model_batch_resp)
+        assert!(
+            !model_batch_req.microbatch().has_spec_tokens(),
+            "qwen3.5 replay sample requires rejection_sample for speculative inputs"
+        );
+        if self.spec_probs.is_enabled() {
+            let (decisions, timing) = self.target_rejection_sample(recorder, model_batch_req.microbatch());
+            return Qwen35SampledOutput {
+                decisions,
+                read_sampling_output: false,
+                timing,
+            };
+        }
+        Qwen35SampledOutput {
+            decisions: Vec::new(),
+            read_sampling_output: true,
+            timing: ModelOutputTiming::default(),
+        }
     }
 
     fn rejection_sample(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
-        _model_batch_resp: &Self::ModelBatchResp,
+        model_batch_req: &Self::ModelBatchRequest,
+        _model_batch_resp: &Self::ModelBatchResponse,
     ) -> Self::SampledOutput {
-        Qwen35Executor::rejection_sample(self, recorder, model_batch_req, _model_batch_resp)
+        assert!(
+            model_batch_req.microbatch().has_spec_tokens(),
+            "qwen3.5 replay rejection_sample requires speculative inputs"
+        );
+        assert!(
+            self.spec_probs.is_enabled(),
+            "qwen3.5 replay rejection_sample requires a speculator"
+        );
+        let (decisions, timing) = self.target_rejection_sample(recorder, model_batch_req.microbatch());
+        Qwen35SampledOutput {
+            decisions,
+            read_sampling_output: false,
+            timing,
+        }
     }
 
     fn forward_spec(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
+        model_batch_req: &Self::ModelBatchRequest,
         model_batch_hidden: &Self::ModelBatchHidden,
-        sampled_output: Self::SampledOutput,
+        mut sampled_output: Self::SampledOutput,
     ) -> Self::SampledOutput {
-        Qwen35Executor::forward_spec(self, recorder, model_batch_req, model_batch_hidden, sampled_output)
+        if self.mtp.is_none() {
+            return sampled_output;
+        }
+        assert!(
+            Rc::ptr_eq(model_batch_hidden, &self.hidden_output),
+            "qwen3.5 speculator must consume the executor final-norm hidden workspace"
+        );
+        let microbatch = model_batch_req.microbatch();
+        let num_decode_reqs = (0..microbatch.num_reqs())
+            .filter(|&req_index| microbatch.is_decode_req(req_index))
+            .count();
+        assert_eq!(
+            sampled_output.decisions.len(),
+            num_decode_reqs,
+            "qwen3.5 speculator requires one decision per decode request"
+        );
+        if !recorder.main_stage_submitted {
+            sampled_output.timing.main_replay_elapsed += self.submit_main_stage(recorder);
+        }
+        let timing = self.forward_mtp_batch(microbatch, Rc::clone(model_batch_hidden), &mut sampled_output.decisions);
+        sampled_output.timing.add_assign(timing);
+        sampled_output
     }
 
     fn empty_sampled_output(&self) -> Self::SampledOutput {
-        Qwen35DecodeOutput::default()
+        Qwen35SampledOutput::default()
     }
 
     fn sampled_output_len(&self, sampled_output: &Self::SampledOutput) -> usize {

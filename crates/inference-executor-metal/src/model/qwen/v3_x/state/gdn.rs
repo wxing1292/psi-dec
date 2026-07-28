@@ -4,7 +4,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
-use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
+use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::backend::GDN;
@@ -20,7 +20,7 @@ use crate::replay::Replay;
 use crate::replay::ReplayComponent;
 use crate::trace;
 
-pub struct Qwen35GDNState {
+pub struct Qwen3xGDNState {
     backend: Rc<GDN>,
     scratch: Rc<GDNScratch>,
     request_state_table: Rc<GDNRequestStateTable>,
@@ -54,7 +54,7 @@ impl ReplayComponent for Rc<GDNRequestStateTable> {
     }
 }
 
-impl Qwen35GDNState {
+impl Qwen3xGDNState {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
@@ -69,7 +69,7 @@ impl Qwen35GDNState {
     ) -> Self {
         let representative = cores
             .first()
-            .expect("qwen3.5 GDN state requires at least one GDN layer");
+            .expect("qwen3.x GDN state requires at least one GDN layer");
         let request_state_table = Rc::new(GDNRequestStateTable::new(
             device,
             cores,
@@ -84,7 +84,7 @@ impl Qwen35GDNState {
             scratch: Rc::new(GDNScratch::new(device, representative, metal, max_tokens)),
             request_state_table: Rc::clone(&request_state_table),
             metadata: GDNMetadataBuffers::new(device, num_req_slots, max_tokens),
-            state_restore: Replay::new("qwen3.5 GDN state restore", Rc::clone(&request_state_table)),
+            state_restore: Replay::new("qwen3.x GDN state restore", Rc::clone(&request_state_table)),
             pending_publish: None,
         }
     }
@@ -105,33 +105,38 @@ impl Qwen35GDNState {
         &self.metadata
     }
 
-    pub fn prepare_states(&self, microbatch: &Qwen35Microbatch) -> GDNPreparedRequestState {
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_states(
+        &self,
+        req_slots: &[u32],
+        block_indices: &[usize],
+        token_indices: &[u32],
+        cu_tokens: &[u32],
+        state_txns: &[GDNStateTxn],
+        state_page_ids_by_req: &[Vec<Vec<u32>>],
+    ) -> GDNPreparedRequestState {
         self.request_state_table.prepare(
-            microbatch.req_slots(),
-            microbatch.block_indices(),
-            microbatch.token_indices(),
-            microbatch.cu_tokens(),
-            microbatch.gdn_state_txns(),
-            microbatch.gdn_state_page_ids_by_req(),
+            req_slots,
+            block_indices,
+            token_indices,
+            cu_tokens,
+            state_txns,
+            state_page_ids_by_req,
         )
     }
 
-    pub fn prepare_metadata(
-        &self,
-        microbatch: &Qwen35Microbatch,
-        prepared: &GDNPreparedRequestState,
-    ) -> GDNReplayShape {
-        self.backend.prepare(&self.metadata, microbatch.cu_tokens(), prepared)
+    pub fn prepare_metadata(&self, cu_tokens: &[u32], prepared: &GDNPreparedRequestState) -> GDNReplayShape {
+        self.backend.prepare(&self.metadata, cu_tokens, prepared)
     }
 
     pub fn restore(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer) {
         if !self.request_state_table.prepare_restore() {
-            trace::qwen35_state(|| "event=gdn_restore skipped=true".to_string());
+            trace::gdn_state(|| "event=gdn_restore skipped=true".to_string());
             return;
         }
         let input = GDNStateRestoreInput { pages };
         let (key, cache_hit) = self.state_restore.record(runtime, &input);
-        trace::qwen35_state(|| format!("event=gdn_restore key={key:?} cache_hit={cache_hit}"));
+        trace::gdn_state(|| format!("event=gdn_restore key={key:?} cache_hit={cache_hit}"));
         runtime.submit_replay(self.state_restore.replay(&key)).wait();
     }
 

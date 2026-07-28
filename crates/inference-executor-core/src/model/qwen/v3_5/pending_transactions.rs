@@ -25,10 +25,6 @@ impl Qwen35PendingTransactions {
         }
     }
 
-    pub fn has_pending_transactions(&self) -> bool {
-        !self.transactions.is_empty()
-    }
-
     pub fn pending_microbatch(&self, compute_seq: RawComputeSlotSeq) -> &Qwen35Microbatch {
         let transaction = self
             .transactions
@@ -93,8 +89,7 @@ mod tests {
         let request = request_with_tokens(vec![11], vec![12]);
 
         transactions.push(1, request);
-
-        assert!(transactions.has_pending_transactions());
+        assert!(!transactions.transactions.is_empty());
         let decisions = vec![Qwen35DecodeDecision {
             validated_tokens: vec![12],
             sampled_token: 99,
@@ -102,7 +97,7 @@ mod tests {
             ..Qwen35DecodeDecision::default()
         }];
         assert_eq!(transactions.commit(1, &decisions), vec![6]);
-        assert!(!transactions.has_pending_transactions());
+        assert!(transactions.transactions.is_empty());
     }
 
     #[test]
@@ -134,7 +129,7 @@ mod tests {
         assert_eq!(transactions.commit(1, &[]), vec![5]);
         assert_eq!(transactions.pending_microbatch(2).flat_token_ids(), &[12]);
         assert_eq!(transactions.commit(2, &[]), vec![5]);
-        assert!(!transactions.has_pending_transactions());
+        assert!(transactions.transactions.is_empty());
     }
 
     fn request_with_tokens(tokens: Vec<u32>, spec_tokens: Vec<u32>) -> Qwen35Microbatch {

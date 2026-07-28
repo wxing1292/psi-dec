@@ -24,9 +24,13 @@ crates/inference-executor-metal/src/attn/
     request_state_table.rs  private CPU request-slot/version/candidate mapping
     state_table.rs          public GDNRequestStateTable, live arenas, GDNStatePageIO, and lifecycle
 
-crates/inference-executor-metal/src/model/qwen/v3_5/
-  layer/gdn.rs              Qwen35GDN, private checkpoint weights, load, and record
-  state/gdn.rs              Qwen35GDNState prepare/restore/commit/publish/reset lifecycle
+crates/inference-executor-metal/src/model/qwen/
+  v3_x/
+    layer/gdn.rs            Qwen3xGDN, private checkpoint weights, load, and record
+    state/gdn.rs            Qwen3xGDNState prepare/restore/commit/publish/reset lifecycle
+  v3_5/
+    main/layer.rs           Qwen3.5 QGKV-GQA/GDN layer variants
+    plan.rs                 Qwen3.5 GDN geometry/config builder and dSpark plan
 
 crates/inference-backend-metal/src/components/
   gdn_attention.rs      reusable Metal GDN core component kernels
@@ -280,12 +284,18 @@ At backend construction, the executor translates immutable `GDNCore` geometry pl
 shares compiled pipelines for identical component configs across layers and models without putting model names or model
 config types in the backend API. Batch metadata objects and scratch bindings do not carry copies of static geometry or tuning.
 
-`Qwen35GDNState` owns one shared `GDN` backend and one shared `GDNScratch` for compatible Main GDN layers, plus the
+`Qwen3xGDNState` owns one shared `GDN` backend and one shared `GDNScratch` for compatible Main GDN layers, plus the
 shared `Rc<GDNRequestStateTable>`, reusable `GDNMetadataBuffers`, cached restore replay, and optional pending publish.
-Each `Qwen35GDN` layer retains immutable weights, a compact `gdn_layer_index`, and clones of the backend, scratch, and
-state-table handles. The backend records qkvabz projection,
-projection split, recurrent core/state update, optional candidate state materialization, and output projection into the
-caller’s `Recorder`.
+Each `Qwen3xGDN` layer retains immutable weights, a compact `gdn_layer_index`, and clones of the backend, scratch, and
+state-table handles. The current Qwen3.5 executor imports and owns `Qwen3xGDNState` directly and its model layers own
+`Qwen3xGDN` directly; sharing the implementation does not move GDN lifecycle into another executor. The backend records
+qkvabz projection, projection split, recurrent core/state update, optional candidate state materialization, and output
+projection into the caller’s `Recorder`.
+
+State preparation likewise keeps the leaf boundary model-neutral. `Qwen3xGDNState::prepare_states` receives the
+request-slot, block-index, token-index, cumulative-token, state-transaction, and state-page slices consumed by
+`GDNRequestStateTable`; `prepare_metadata` receives cumulative tokens plus the prepared state. The Qwen3.5 executor
+extracts those slices from its own microbatch before calling the shared leaf.
 
 `GDNRequestStateTable` is the model-level owner for all GDN layers. It owns two contiguous aggregate arenas, one recurrent and
 one convolution:

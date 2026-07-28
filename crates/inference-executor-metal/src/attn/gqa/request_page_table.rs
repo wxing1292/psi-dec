@@ -1,11 +1,8 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GQAPageTableLayout;
-use inference_executor_core::model::qwen::v3_5::has_synced_pages;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::page_ids_by_layer_for_lane;
-
-use crate::trace;
 
 #[derive(Debug)]
 pub struct GQARequestPageTable {
@@ -78,26 +75,16 @@ impl GQARequestPageTable {
                 cache_lane,
                 self.num_layers(),
                 self.num_page_ids_per_block(),
-                "qwen3.5 GQA request page table",
+                "GQA request page table",
             );
             if !has_synced_pages(&page_ids_by_layer) {
                 continue;
             }
-            trace::qwen35_state(|| {
-                format!(
-                    "event=gqa_prepare req_slot={} cache_lane={} block_index={} num_layers={} page_ids_per_block={:?}",
-                    request.req_slot,
-                    cache_lane,
-                    request.decoder_sync_blocks.block_index(),
-                    self.num_layers(),
-                    page_ids_by_layer.iter().map(Vec::len).collect::<Vec<_>>()
-                )
-            });
             for (layer_index, page_ids_by_block) in page_ids_by_layer.iter().enumerate() {
                 for (block_offset, page_ids) in page_ids_by_block.iter().enumerate() {
                     assert!(
                         page_ids.iter().all(|&page_id| (page_id as usize) < num_cache_pages),
-                        "qwen3.5 runtime supplied a GQA page ID outside the cache-page buffer"
+                        "runtime supplied a GQA page ID outside the cache-page buffer"
                     );
                     self.write_page_ids(
                         request.req_slot,
@@ -106,7 +93,7 @@ impl GQARequestPageTable {
                             .decoder_sync_blocks
                             .block_index()
                             .checked_add(block_offset)
-                            .expect("qwen3.5 GQA cache-block index must fit usize"),
+                            .expect("GQA cache-block index must fit usize"),
                         page_ids,
                     );
                 }
@@ -172,6 +159,12 @@ impl GQARequestPageTable {
             .and_then(|index| index.checked_mul(self.num_page_ids_per_block()))
             .expect("GQA request page-table flat index must fit usize")
     }
+}
+
+fn has_synced_pages(page_ids_by_layer: &[Vec<Vec<u32>>]) -> bool {
+    page_ids_by_layer
+        .iter()
+        .any(|page_ids_by_block| !page_ids_by_block.is_empty())
 }
 
 #[cfg(test)]

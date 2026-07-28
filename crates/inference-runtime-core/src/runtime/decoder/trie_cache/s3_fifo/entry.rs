@@ -5,8 +5,8 @@ use std::sync::Arc;
 use intrusive_collections::LinkedListLink;
 use intrusive_collections::intrusive_adapter;
 
-use super::eviction::Eviction;
-use super::queue::Queue;
+use crate::runtime::decoder::trie_cache::s3_fifo::eviction::Eviction;
+use crate::runtime::decoder::trie_cache::s3_fifo::queue::Queue;
 
 pub struct Entry<K>
 where

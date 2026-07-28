@@ -10,44 +10,22 @@ use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
 use inference_backend_metal::operators::AffineQuantizedMatmulShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35AttentionWeightBindings;
-use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35LayerWeightBindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MTPEmbedWeightBindings;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
-use crate::mlp::dense::scratch::DenseMLPScratch;
-use crate::mlp::moe::scratch::MoEScratch;
-use crate::model::embed_unembed::Embed;
-use crate::model::embed_unembed::EmbedInput;
+use crate::model::embedding::Embed;
+use crate::model::embedding::EmbedInput;
 use crate::model::gather::Gather;
-use crate::model::qwen::v3_5::layer::Qwen35Attention;
-use crate::model::qwen::v3_5::layer::Qwen35GQA;
-use crate::model::qwen::v3_5::layer::Qwen35Layer;
-use crate::model::qwen::v3_5::layer::Qwen35LayerInput;
-use crate::model::qwen::v3_5::layer::scratch::Qwen35LayerScratch;
-use crate::model::qwen::v3_5::model::Qwen35GQAReplayKey;
-use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use crate::model::qwen::v3_5::state::Qwen35GQAState;
-use crate::model::qwen::v3_5::weight::load_qwen35_norm_weight;
-use crate::model::qwen::v3_5::weight::quant_weight;
-use crate::model::qwen::v3_5::weight::typed_tensor;
-use crate::model::qwen::v3_5::weight::validate_len;
-use crate::model::residual::Residual;
+use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
+use crate::model::qwen::v3_x::weight::quant_weight;
+use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::qwen::v3_x::weight::validate_len;
 use crate::model::rms_norm::RmsNorm;
 use crate::replay::ReplayComponent;
-
-pub struct Qwen35MTP {
-    hidden_dim: usize,
-    layer: Qwen35Layer,
-    output_residual: Residual,
-    output_norm: RmsNorm,
-    request_page_table: Rc<crate::attn::gqa::request_page_table::GQARequestPageTable>,
-}
 
 pub struct Qwen35MTPEmbed {
     embed: Rc<Embed>,
@@ -75,15 +53,6 @@ pub struct Qwen35MTPEmbedArgs<'a> {
     pub token_ids: &'a Buffer,
     pub token_hidden_input: &'a Buffer,
     pub hidden_output: &'a Buffer,
-}
-
-#[derive(Clone, Copy)]
-pub struct Qwen35MTPArgs<'a> {
-    pub num_tokens: u32,
-    pub hidden_input: &'a Buffer,
-    pub hidden_output: &'a Buffer,
-    pub gqa: &'a crate::attn::gqa::batch_metadata::GQAMetadataBuffers,
-    pub pages: &'a Buffer,
 }
 
 impl Qwen35MTPEmbed {
@@ -144,22 +113,21 @@ impl Qwen35MTPEmbed {
             .checked_mul(2)
             .expect("qwen3.5 MTP fused input capacity must fit usize");
         u32::try_from(fused_elements).expect("qwen3.5 MTP fused capacity must fit shader u32 count");
-        let norm_op = RmsNorm::kernel(device);
         Ok(Self {
             embed,
             input_gather: Gather::new(device),
             hidden_dim,
             hidden_norm: RmsNorm::new(
+                device,
                 hidden_dim,
                 config.text_config.rms_norm_eps,
                 prev_hidden_norm_weight,
-                Rc::clone(&norm_op),
             ),
             embedding_norm: RmsNorm::new(
+                device,
                 hidden_dim,
                 config.text_config.rms_norm_eps,
                 token_hidden_norm_weight,
-                norm_op,
             ),
             concat: Bf16ConcatRowsKernel::new(device),
             fc_kernel: AffineQuantizedMatmulKernel::new(device, fc_shape),
@@ -172,108 +140,7 @@ impl Qwen35MTPEmbed {
             fused_input: Buffer::new_zeroed_elements(device, fused_elements, Dtype::Bfloat16),
         })
     }
-}
 
-impl Qwen35MTP {
-    #[allow(clippy::too_many_arguments)]
-    pub fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        main_config: &Qwen35ModelConfig,
-        config: &Qwen35ModelConfig,
-        defaults: Qwen35MetalDefaults,
-        bindings: Qwen35LayerWeightBindings,
-        final_norm_weight: String,
-        gqa_state: &Qwen35GQAState,
-        layer_scratch: Rc<Qwen35LayerScratch>,
-        dense_scratch: Option<&Rc<DenseMLPScratch>>,
-        moe_scratch: Option<&Rc<MoEScratch>>,
-    ) -> Result<Self, ModelExecutorError> {
-        let hidden_dim = config.text_config.hidden_size;
-        let Qwen35LayerWeightBindings {
-            input_norm_weight,
-            post_attention_norm_weight,
-            attention,
-            mlp,
-        } = bindings;
-        let attention = match attention {
-            Qwen35AttentionWeightBindings::GQA(bindings) => {
-                Qwen35Attention::GQA(Qwen35GQA::load(
-                    device,
-                    store,
-                    config,
-                    defaults,
-                    main_config.text_config.num_hidden_layers,
-                    0,
-                    bindings,
-                    Rc::clone(gqa_state.backend()),
-                    Rc::clone(gqa_state.scratch()),
-                    Rc::clone(gqa_state.request_page_table()),
-                )?)
-            },
-            Qwen35AttentionWeightBindings::GDN(_) => {
-                panic!("qwen3.5 MTP body must use full attention")
-            },
-        };
-        let mlp = Qwen35Layer::load_mlp(device, store, config, defaults, 0, mlp, dense_scratch, moe_scratch)?;
-        let layer = Qwen35Layer::load(
-            device,
-            store,
-            config,
-            0,
-            input_norm_weight,
-            post_attention_norm_weight,
-            attention,
-            mlp,
-            Rc::clone(&layer_scratch),
-        )?;
-        let final_norm_weight = load_qwen35_norm_weight(
-            device,
-            store,
-            &final_norm_weight,
-            &[hidden_dim],
-            config.quantization.is_some(),
-        )?;
-        Ok(Self {
-            hidden_dim,
-            layer,
-            output_residual: Residual::new(device),
-            output_norm: RmsNorm::new(
-                hidden_dim,
-                config.text_config.rms_norm_eps,
-                final_norm_weight,
-                RmsNorm::kernel(device),
-            ),
-            request_page_table: Rc::clone(gqa_state.request_page_table()),
-        })
-    }
-
-    pub fn validate_batch(&self, microbatch: &Qwen35Microbatch) {
-        let max_context_tokens = (0..microbatch.num_reqs())
-            .map(|req_index| {
-                microbatch.token_indices()[req_index]
-                    .checked_add(microbatch.q_len(req_index))
-                    .expect("qwen3.5 MTP GQA request context length overflow")
-            })
-            .max()
-            .expect("qwen3.5 MTP batch requires requests") as usize;
-        let page_capacity = self
-            .request_page_table
-            .num_blocks()
-            .checked_mul(self.request_page_table.num_page_ids_per_block())
-            .expect("qwen3.5 MTP GQA page capacity must fit usize");
-        let tokens_per_page = self
-            .layer
-            .gqa_tokens_per_page()
-            .expect("qwen3.5 MTP body must contain GQA");
-        assert!(
-            max_context_tokens.div_ceil(tokens_per_page.max(1)) <= page_capacity,
-            "qwen3.5 MTP GQA request context exceeds page-table capacity"
-        );
-    }
-}
-
-impl Qwen35MTPEmbed {
     fn record_projection<'a, R>(
         &'a self,
         recorder: &mut R,
@@ -286,9 +153,9 @@ impl Qwen35MTPEmbed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.hidden_norm
-            .record_opaque(recorder, num_tokens, previous_hidden, &self.normed_hidden, true);
+            .record_opaque_with_barrier(recorder, num_tokens, previous_hidden, &self.normed_hidden);
         self.embedding_norm
-            .record_opaque(recorder, num_tokens, shifted_embeddings, &self.normed_embedding, false);
+            .record_opaque(recorder, num_tokens, shifted_embeddings, &self.normed_embedding);
         let hidden_dim = self
             .hidden_dim
             .try_into()
@@ -357,45 +224,6 @@ impl Qwen35MTPEmbed {
     }
 }
 
-impl Qwen35MTP {
-    pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen35MTPArgs<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        let num_tokens = args.num_tokens;
-        let residual = self.layer.record_body(
-            recorder,
-            Qwen35LayerInput {
-                gdn: None,
-                gqa: args.gqa,
-                num_tokens,
-                pages: args.pages,
-                residual_input: args.hidden_input,
-                residual_output: self.layer.residual_output(),
-                residual_capture_target: None,
-            },
-        );
-        let num_values = num_tokens
-            .checked_mul(
-                self.hidden_dim
-                    .try_into()
-                    .expect("qwen3.5 MTP hidden dimension must fit u32"),
-            )
-            .expect("qwen3.5 MTP residual element count must fit u32");
-        self.output_residual.record(
-            recorder,
-            num_values,
-            residual.lhs,
-            residual.rhs,
-            self.layer.residual_output(),
-            None,
-        );
-        self.output_norm
-            .record(recorder, num_tokens, self.layer.residual_output(), args.hidden_output);
-        args.hidden_output
-    }
-}
-
 struct Qwen35MTPEmbedWeights {
     token_hidden_norm_weight: Buffer,
     prev_hidden_norm_weight: Buffer,
@@ -442,14 +270,14 @@ impl Qwen35MTPEmbedWeights {
         validate_len("MTP fc scales", fc_scales.len(), fc_shape.affine_param_bytes())?;
         validate_len("MTP fc biases", fc_biases.len(), fc_shape.affine_param_bytes())?;
         Ok(Self {
-            token_hidden_norm_weight: load_qwen35_norm_weight(
+            token_hidden_norm_weight: load_qwen3x_norm_weight(
                 device,
                 store,
                 &bindings.token_hidden_norm_weight,
                 &[hidden_dim],
                 norms_store_actual_scale,
             )?,
-            prev_hidden_norm_weight: load_qwen35_norm_weight(
+            prev_hidden_norm_weight: load_qwen3x_norm_weight(
                 device,
                 store,
                 &bindings.prev_hidden_norm_weight,
@@ -460,27 +288,6 @@ impl Qwen35MTPEmbedWeights {
             fc_scales: Buffer::from_slice(device, &fc_scales),
             fc_biases: Buffer::from_slice(device, &fc_biases),
         })
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen35MTPReplayKey {
-    mtp_module_index: usize,
-    num_tokens: usize,
-    gqa: Qwen35GQAReplayKey,
-}
-
-impl Qwen35MTPReplayKey {
-    pub fn new(
-        mtp_module_index: usize,
-        num_tokens: usize,
-        gqa_shape: inference_executor_core::attn::GQAReplayShape,
-    ) -> Self {
-        Self {
-            mtp_module_index,
-            num_tokens,
-            gqa: Qwen35GQAReplayKey::from_shape(gqa_shape),
-        }
     }
 }
 
@@ -512,22 +319,5 @@ impl ReplayComponent for Qwen35MTPEmbed {
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         Qwen35MTPEmbed::record(self, recorder, *input);
-    }
-}
-
-impl ReplayComponent for Qwen35MTP {
-    type Key = Qwen35MTPReplayKey;
-    type Input<'a> = Qwen35MTPArgs<'a>;
-
-    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Self::Key {
-            mtp_module_index: 0,
-            num_tokens: input.num_tokens as usize,
-            gqa: Qwen35GQAReplayKey::from_shape(input.gqa.replay_shape()),
-        }
-    }
-
-    fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        Qwen35MTP::record(self, recorder, *input);
     }
 }

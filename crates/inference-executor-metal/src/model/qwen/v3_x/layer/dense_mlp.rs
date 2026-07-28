@@ -8,43 +8,39 @@ use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::dense::DenseMLPReplayShape;
-use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35DenseMLPWeightBindings;
+use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xDenseMLPWeightBindings;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLP;
+use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::dense::backend::DenseMLPReplayInput;
 use crate::mlp::dense::scratch::DenseMLPScratch;
-use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use crate::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
-use crate::model::qwen::v3_5::weight::concat_bytes;
-use crate::model::qwen::v3_5::weight::quant_weight;
-use crate::model::qwen::v3_5::weight::to_u32;
-use crate::model::qwen::v3_5::weight::typed_tensor;
-use crate::model::qwen::v3_5::weight::validate_len;
+use crate::model::qwen::v3_x::weight::concat_bytes;
+use crate::model::qwen::v3_x::weight::quant_weight;
+use crate::model::qwen::v3_x::weight::to_u32;
+use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::qwen::v3_x::weight::validate_len;
 
-pub struct Qwen35DenseMLP {
+pub struct Qwen3xDenseMLP {
     backend: DenseMLP,
     weights: DenseMLPWeightBuffers,
     scratch: Rc<DenseMLPScratch>,
 }
 
-impl Qwen35DenseMLP {
+impl Qwen3xDenseMLP {
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        config: &Qwen35ModelConfig,
-        defaults: Qwen35MetalDefaults,
-        layer_index: usize,
-        bindings: Qwen35DenseMLPWeightBindings,
+        core: &DenseMLPCore,
+        metal: DenseMLPMetalConfig,
+        bindings: Qwen3xDenseMLPWeightBindings,
         scratch: Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
-        let (core, metal) = qwen35_dense_mlp_core_and_metal(layer_index, &config.text_config, defaults)?;
         Ok(Self {
             backend: DenseMLP::new(device, core.clone(), metal),
-            weights: DenseMLPWeightBuffers::load(device, store, &bindings, &core, metal)?,
+            weights: DenseMLPWeightBuffers::load(device, store, &bindings, core, metal)?,
             scratch,
         })
     }
@@ -82,23 +78,12 @@ impl DenseMLPWeightBuffers {
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        bindings: &Qwen35DenseMLPWeightBindings,
+        bindings: &Qwen3xDenseMLPWeightBindings,
         core: &DenseMLPCore,
-        metal: crate::mlp::dense::backend::DenseMLPMetalConfig,
+        metal: DenseMLPMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
-        Self::load_with_intermediate(device, store, bindings, core.hidden_dim, core.intermediate_dim, metal)
-    }
-
-    pub fn load_with_intermediate(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        bindings: &Qwen35DenseMLPWeightBindings,
-        hidden_dim: usize,
-        intermediate_dim: usize,
-        metal: crate::mlp::dense::backend::DenseMLPMetalConfig,
-    ) -> Result<Self, ModelExecutorError> {
         let gate_weight = quant_weight(store, &bindings.gate.weight)?;
         let up_weight = quant_weight(store, &bindings.up.weight)?;
         let gate_scales = typed_tensor(store, &bindings.gate.scales, safetensors::Dtype::BF16)?.into_data();
@@ -111,8 +96,8 @@ impl DenseMLPWeightBuffers {
 
         let shape = QuantizedDenseMLPShape { num_tokens: 1 };
         let config = inference_backend_metal::components::QuantizedDenseMLPConfig {
-            hidden_dim: to_u32("dense hidden_dim", hidden_dim)?,
-            intermediate_dim: to_u32("dense intermediate_dim", intermediate_dim)?,
+            hidden_dim: to_u32("dense hidden_dim", core.hidden_dim)?,
+            intermediate_dim: to_u32("dense intermediate_dim", core.intermediate_dim)?,
             group_size: metal.group_size,
             bits: metal.bits,
             dtype: metal.dtype,

@@ -4,15 +4,15 @@ use std::collections::hash_map::Entry;
 use inference_runtime_core::Error;
 use inference_runtime_core::Result;
 
-use super::ToolCallCancellation;
-use super::ToolCallID;
-use super::ToolCallRequest;
-use super::ToolCallResponse;
-use super::ToolDefinition;
-use super::ToolEvent;
-use super::ToolID;
-use super::ToolRegistration;
-use super::ToolUnregistration;
+use crate::tool::ToolCallCancellation;
+use crate::tool::ToolCallID;
+use crate::tool::ToolCallRequest;
+use crate::tool::ToolCallResponse;
+use crate::tool::ToolDefinition;
+use crate::tool::ToolEvent;
+use crate::tool::ToolID;
+use crate::tool::ToolRegistration;
+use crate::tool::ToolUnregistration;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolState {

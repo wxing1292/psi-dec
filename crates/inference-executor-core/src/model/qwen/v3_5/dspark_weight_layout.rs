@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use super::DSparkConfig;
 use crate::checkpoint::QuantizedTensorBindings;
 use crate::def::ModelExecutorError;
+use crate::model::qwen::v3_5::DSparkConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen35DSparkWeightBindings {

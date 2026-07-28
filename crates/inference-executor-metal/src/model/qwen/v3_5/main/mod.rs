@@ -5,12 +5,9 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
+use inference_executor_core::model::qwen::v3_5::LayerType;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::num_target_hidden_states;
-use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35LayerWeightBindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MainWeightBindings;
 
 use crate::checkpoint::SafeTensorStore;
@@ -19,43 +16,24 @@ use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
-use crate::model::embed_unembed::Embed;
-use crate::model::embed_unembed::EmbedInput;
-use crate::model::embed_unembed::Unembed;
-use crate::model::embed_unembed::UnembedConfig;
-use crate::model::embed_unembed::UnembedInput;
-use crate::model::gather::Gather;
-use crate::model::qwen::v3_5::layer::Qwen35Layer;
-use crate::model::qwen::v3_5::layer::Qwen35LayerInput;
-use crate::model::qwen::v3_5::layer::scratch::Qwen35LayerScratch;
+use crate::model::qwen::v3_5::main::layer::Qwen35MainLayer;
+use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerInput;
+use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerScratch;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use crate::model::qwen::v3_5::state::Qwen35GDNState;
-use crate::model::qwen::v3_5::state::Qwen35GQAState;
-use crate::model::qwen::v3_5::weight::load_qwen35_norm_weight;
+use crate::model::qwen::v3_x::state::Qwen3xGDNState;
+use crate::model::qwen::v3_x::state::Qwen3xGQAState;
+use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
 use crate::model::rms_norm::RmsNorm;
 use crate::replay::ReplayComponent;
 
+pub mod embed;
+pub mod layer;
+pub mod output;
+
 pub struct Qwen35Main {
-    layers: Vec<Qwen35Layer>,
+    layers: Vec<Qwen35MainLayer>,
     final_norm: RmsNorm,
-    residual_capture: Option<Rc<dyn QwenMainResidualCapture>>,
-}
-
-pub struct Qwen35MainEmbed {
-    embed: Rc<Embed>,
-}
-
-pub struct Qwen35GatherUnembed {
-    gather: Gather,
-    unembed: Rc<Unembed>,
-    hidden_dim: u32,
-}
-
-#[derive(Clone, Copy)]
-pub struct Qwen35MainEmbedArgs<'a> {
-    pub num_tokens: u32,
-    pub token_ids: &'a Buffer,
-    pub hidden_output: &'a Buffer,
+    residual_capture: Option<Rc<dyn Qwen35MainResidualCapture>>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +46,7 @@ pub struct Qwen35MainArgs<'a> {
     pub pages: &'a Buffer,
 }
 
-/// Selects capture targets for Qwen Main layer residual outputs.
+/// Selects capture targets for Qwen3.5 Main layer residual outputs.
 ///
 /// While recording each zero-based model layer, Main asks the capture owner
 /// for the target of that layer's final, post-MLP residual add. A returned
@@ -78,38 +56,8 @@ pub struct Qwen35MainArgs<'a> {
 /// Capture selection and destinations are part of the Main component's fixed
 /// replay topology. They must remain stable for the component's lifetime and
 /// must not alias Main inputs, outputs, or shared layer scratch.
-pub trait QwenMainResidualCapture {
+pub trait Qwen35MainResidualCapture {
     fn capture_target_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>>;
-}
-
-#[derive(Clone, Copy)]
-pub struct Qwen35GatherUnembedArgs<'a> {
-    pub num_rows: u32,
-    pub hidden_input: &'a Buffer,
-    pub row_indices: &'a Buffer,
-    pub hidden_output: &'a Buffer,
-    pub logits: &'a Buffer,
-}
-
-impl Qwen35MainEmbed {
-    pub fn new(embed: Rc<Embed>) -> Self {
-        Self { embed }
-    }
-
-    pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen35MainEmbedArgs<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        <Embed as ReplayLayer>::record(
-            &self.embed,
-            recorder,
-            EmbedInput {
-                num_tokens: args.num_tokens,
-                token_ids: args.token_ids,
-                output_hidden: args.hidden_output,
-            },
-        )
-    }
 }
 
 impl Qwen35Main {
@@ -120,10 +68,10 @@ impl Qwen35Main {
         config: &Qwen35ModelConfig,
         defaults: Qwen35MetalDefaults,
         bindings: Qwen35MainWeightBindings,
-        gqa_state: &Qwen35GQAState,
-        gdn_state: &Qwen35GDNState,
-        residual_capture: Option<Rc<dyn QwenMainResidualCapture>>,
-        layer_scratch: Rc<Qwen35LayerScratch>,
+        gqa_state: &Qwen3xGQAState,
+        gdn_state: &Qwen3xGDNState,
+        residual_capture: Option<Rc<dyn Qwen35MainResidualCapture>>,
+        layer_scratch: Rc<Qwen35MainLayerScratch>,
         dense_scratch: Option<&Rc<DenseMLPScratch>>,
         moe_scratch: Option<&Rc<MoEScratch>>,
     ) -> Result<Self, ModelExecutorError> {
@@ -140,53 +88,29 @@ impl Qwen35Main {
         let mut compact_gdn_layer_index = 0;
         let mut layers = Vec::with_capacity(layer_bindings.len());
         for (layer_index, bindings) in layer_bindings.into_iter().enumerate() {
-            let Qwen35LayerWeightBindings {
-                input_norm_weight,
-                post_attention_norm_weight,
-                attention,
-                mlp,
-            } = bindings;
-            let attention = Qwen35Layer::load_attention(
+            layers.push(Qwen35MainLayer::load(
                 device,
                 store,
                 config,
                 defaults,
                 layer_index,
-                &mut compact_gqa_layer_index,
-                &mut compact_gdn_layer_index,
-                attention,
-                gqa_state.backend(),
-                gqa_state.scratch(),
-                gqa_state.request_page_table(),
-                gdn_state.backend(),
-                gdn_state.scratch(),
-                gdn_state.request_state_table(),
-            )?;
-            let mlp = Qwen35Layer::load_mlp(
-                device,
-                store,
-                config,
-                defaults,
-                layer_index,
-                mlp,
+                compact_gqa_layer_index,
+                compact_gdn_layer_index,
+                bindings,
+                gqa_state,
+                gdn_state,
+                Rc::clone(&layer_scratch),
                 dense_scratch,
                 moe_scratch,
-            )?;
-            layers.push(Qwen35Layer::load(
-                device,
-                store,
-                config,
-                layer_index,
-                input_norm_weight,
-                post_attention_norm_weight,
-                attention,
-                mlp,
-                Rc::clone(&layer_scratch),
             )?);
+            match config.layer_type_at(layer_index)? {
+                LayerType::FullAttention => compact_gqa_layer_index += 1,
+                LayerType::GDN => compact_gdn_layer_index += 1,
+            }
             store.unload_all();
         }
 
-        let final_norm_weight = load_qwen35_norm_weight(
+        let final_norm_weight = load_qwen3x_norm_weight(
             device,
             store,
             &final_norm_weight,
@@ -196,10 +120,10 @@ impl Qwen35Main {
         Ok(Self {
             layers,
             final_norm: RmsNorm::new(
+                device,
                 config.text_config.hidden_size,
                 config.text_config.rms_norm_eps,
                 final_norm_weight,
-                RmsNorm::kernel(device),
             ),
             residual_capture,
         })
@@ -213,11 +137,11 @@ impl Qwen35Main {
         let mut hidden = args.hidden_input;
         for layer in &self.layers {
             let residual_output = layer.residual_output();
-            hidden = <Qwen35Layer as ReplayLayer>::record(
+            hidden = <Qwen35MainLayer as ReplayLayer>::record(
                 layer,
                 recorder,
-                Qwen35LayerInput {
-                    gdn: Some(args.gdn),
+                Qwen35MainLayerInput {
+                    gdn: args.gdn,
                     gqa: args.gqa,
                     num_tokens,
                     pages: args.pages,
@@ -235,68 +159,14 @@ impl Qwen35Main {
     }
 }
 
-impl Qwen35GatherUnembed {
-    pub fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        config: UnembedConfig,
-        bindings: QuantizedTensorBindings,
-    ) -> Result<Self, ModelExecutorError> {
-        let unembed = Rc::new(Unembed::load(device, store, config, bindings)?);
-        Ok(Self {
-            gather: Gather::new(device),
-            unembed,
-            hidden_dim: config.hidden_dim,
-        })
-    }
-
-    pub fn unembed(&self) -> &Rc<Unembed> {
-        &self.unembed
-    }
-
-    pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen35GatherUnembedArgs<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.gather.record(
-            recorder,
-            args.num_rows,
-            self.hidden_dim,
-            args.hidden_input,
-            args.row_indices,
-            args.hidden_output,
-        );
-        <Unembed as ReplayLayer>::record(
-            &self.unembed,
-            recorder,
-            UnembedInput {
-                num_rows: args.num_rows,
-                hidden: args.hidden_output,
-                logits: args.logits,
-            },
-        )
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen35MainEmbedReplayKey {
-    num_tokens: u32,
-}
-
-impl Qwen35MainEmbedReplayKey {
-    pub fn new(num_tokens: u32) -> Self {
-        Self { num_tokens }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen35GQAReplayKey {
+struct Qwen35MainGQAReplayKey {
     num_q_token_tiles: u32,
     total_sdpa_map_task_templates: u32,
 }
 
-impl Qwen35GQAReplayKey {
-    pub fn from_shape(gqa_shape: inference_executor_core::attn::GQAReplayShape) -> Self {
+impl Qwen35MainGQAReplayKey {
+    fn from_shape(gqa_shape: inference_executor_core::attn::GQAReplayShape) -> Self {
         gqa_shape.validate();
         Self {
             num_q_token_tiles: gqa_shape.num_q_token_tiles,
@@ -308,8 +178,8 @@ impl Qwen35GQAReplayKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35MainReplayKey {
     num_tokens: u32,
-    gqa: Qwen35GQAReplayKey,
-    gdn: Qwen35GDNReplayKey,
+    gqa: Qwen35MainGQAReplayKey,
+    gdn: Qwen35MainGDNReplayKey,
 }
 
 impl Qwen35MainReplayKey {
@@ -322,8 +192,8 @@ impl Qwen35MainReplayKey {
         );
         Self {
             num_tokens: gqa_shape.num_tokens,
-            gqa: Qwen35GQAReplayKey::from_shape(gqa_shape),
-            gdn: Qwen35GDNReplayKey::from_shape(gdn_shape),
+            gqa: Qwen35MainGQAReplayKey::from_shape(gqa_shape),
+            gdn: Qwen35MainGDNReplayKey::from_shape(gdn_shape),
         }
     }
 
@@ -339,55 +209,16 @@ impl Qwen35MainReplayKey {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct Qwen35GDNReplayKey {
+struct Qwen35MainGDNReplayKey {
     num_reqs: u32,
 }
 
-impl Qwen35GDNReplayKey {
+impl Qwen35MainGDNReplayKey {
     fn from_shape(gdn_shape: GDNReplayShape) -> Self {
         gdn_shape.validate();
         Self {
             num_reqs: gdn_shape.num_reqs,
         }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen35GatherUnembedReplayKey {
-    num_target_hidden_states: u32,
-}
-
-impl Qwen35GatherUnembedReplayKey {
-    pub fn from_microbatch(microbatch: &Qwen35Microbatch) -> Self {
-        let num_target_hidden_states = num_target_hidden_states(microbatch)
-            .try_into()
-            .expect("qwen3.5 target hidden-state count must fit u32");
-        assert!(
-            num_target_hidden_states > 0,
-            "qwen3.5 GatherUnembed replay requires target hidden states"
-        );
-        Self {
-            num_target_hidden_states,
-        }
-    }
-
-    pub fn num_target_hidden_states(&self) -> u32 {
-        self.num_target_hidden_states
-    }
-}
-
-impl ReplayComponent for Qwen35MainEmbed {
-    type Key = Qwen35MainEmbedReplayKey;
-    type Input<'a> = Qwen35MainEmbedArgs<'a>;
-
-    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Self::Key {
-            num_tokens: input.num_tokens,
-        }
-    }
-
-    fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        Qwen35MainEmbed::record(self, recorder, *input);
     }
 }
 
@@ -404,25 +235,6 @@ impl ReplayComponent for Qwen35Main {
     }
 }
 
-impl ReplayComponent for Qwen35GatherUnembed {
-    type Key = Qwen35GatherUnembedReplayKey;
-    type Input<'a> = Qwen35GatherUnembedArgs<'a>;
-
-    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        assert!(
-            input.num_rows > 0,
-            "qwen3.5 GatherUnembed requires target hidden states"
-        );
-        Qwen35GatherUnembedReplayKey {
-            num_target_hidden_states: input.num_rows,
-        }
-    }
-
-    fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        Qwen35GatherUnembed::record(self, recorder, *input);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use inference_backend_metal::metal::Dtype;
@@ -434,7 +246,7 @@ mod tests {
         capture_output: Buffer,
     }
 
-    impl QwenMainResidualCapture for SelectedLayerCapture {
+    impl Qwen35MainResidualCapture for SelectedLayerCapture {
         fn capture_target_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>> {
             (model_layer_index == self.model_layer_index)
                 .then(|| ResidualCaptureTarget::columns(&self.capture_output, 16, 4..12))
@@ -450,7 +262,7 @@ mod tests {
             model_layer_index: 10,
             capture_output: Buffer::new_zeroed_elements(&device, 64, Dtype::Bfloat16),
         });
-        let erased_capture: Rc<dyn QwenMainResidualCapture> = capture.clone();
+        let erased_capture: Rc<dyn Qwen35MainResidualCapture> = capture.clone();
 
         assert!(erased_capture.capture_target_for_model_layer(9).is_none());
         assert!(erased_capture.capture_target_for_model_layer(10).is_some());
@@ -461,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_absent_main_capture_never_captures() {
-        let capture: Option<Rc<dyn QwenMainResidualCapture>> = None;
+        let capture: Option<Rc<dyn Qwen35MainResidualCapture>> = None;
         for model_layer_index in [0, 1, 10, usize::MAX] {
             assert!(
                 capture

@@ -13,32 +13,26 @@ use inference_executor_core::checkpoint::SafeTensorStore;
 use inference_executor_core::model::qwen::v3_5::LayerType;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::init_model_config;
+use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35LayerWeightBindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35ModelWeightBindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_model_weight_bindings;
-use inference_executor_metal::attn::gdn::backend::GDN;
-use inference_executor_metal::attn::gdn::batch_metadata::GDNMetadataBuffers;
-use inference_executor_metal::attn::gdn::scratch::GDNScratch;
-use inference_executor_metal::attn::gdn::state_table::GDNRequestStateTable;
-use inference_executor_metal::attn::gqa::backend::GQA;
-use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
-use inference_executor_metal::attn::gqa::request_page_table::GQARequestPageTable;
-use inference_executor_metal::attn::gqa::scratch::GQAScratch;
 use inference_executor_metal::def::layer::ReplayLayer;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::mlp::dense::scratch::DenseMLPScratch;
 use inference_executor_metal::mlp::moe::scratch::MoEScratch;
 use inference_executor_metal::model::page_arena::PageArena;
-use inference_executor_metal::model::qwen::v3_5::layer::Qwen35Layer;
-use inference_executor_metal::model::qwen::v3_5::layer::Qwen35LayerInput;
-use inference_executor_metal::model::qwen::v3_5::layer::scratch::Qwen35LayerScratch;
+use inference_executor_metal::model::qwen::v3_5::main::layer::Qwen35MainLayer;
+use inference_executor_metal::model::qwen::v3_5::main::layer::Qwen35MainLayerInput;
+use inference_executor_metal::model::qwen::v3_5::main::layer::Qwen35MainLayerScratch;
 use inference_executor_metal::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use inference_executor_metal::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
 use inference_executor_metal::model::qwen::v3_5::plan::qwen35_gdn_core_and_metal;
 use inference_executor_metal::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
 use inference_executor_metal::model::qwen::v3_5::plan::qwen35_layer_counts;
 use inference_executor_metal::model::qwen::v3_5::plan::qwen35_moe_core_and_metal;
+use inference_executor_metal::model::qwen::v3_x::state::Qwen3xGDNState;
+use inference_executor_metal::model::qwen::v3_x::state::Qwen3xGQAState;
 
 const DEFAULT_TOKENS: u32 = 1;
 const DEFAULT_CONTEXT: u32 = 32;
@@ -133,9 +127,9 @@ impl BenchArgs {
 struct BlockFixture {
     stream: Stream,
     input: Buffer,
-    layers: Vec<Qwen35Layer>,
-    gqa_metadata: GQAMetadataBuffers,
-    gdn_metadata: GDNMetadataBuffers,
+    layers: Vec<Qwen35MainLayer>,
+    gqa_state: Qwen3xGQAState,
+    gdn_state: Qwen3xGDNState,
     pages: PageArena,
     shape: BenchShape,
 }
@@ -175,10 +169,10 @@ impl BlockFixture {
             .checked_mul(num_blocks)
             .and_then(|value| value.checked_mul(num_page_ids_per_block))
             .expect("qwen3.5 layer bench cache page count must fit usize");
-        let gqa_backend = Rc::new(GQA::new(device, gqa_core.clone(), gqa_metal));
-        let gqa_scratch = Rc::new(GQAScratch::new(device, &gqa_core, gqa_metal, max_tokens));
-        let gqa_page_table = Rc::new(GQARequestPageTable::new(
+        let gqa_state = Qwen3xGQAState::load(
             device,
+            gqa_core,
+            gqa_metal,
             GQAPageTableLayout {
                 num_req_slots: 1,
                 num_blocks: num_blocks
@@ -192,7 +186,10 @@ impl BlockFixture {
                     .try_into()
                     .expect("qwen3.5 layer bench page count must fit u32"),
             },
-        ));
+            max_tokens,
+            num_cache_pages,
+            0,
+        );
         let mut next_page_id = 0u32;
         for layer_index in 0..counts.gqa {
             for block_index in 0..num_blocks {
@@ -205,15 +202,16 @@ impl BlockFixture {
                         page_id
                     })
                     .collect::<Vec<_>>();
-                gqa_page_table.write_page_ids(0, layer_index, block_index, &page_ids);
+                gqa_state
+                    .request_page_table()
+                    .write_page_ids(0, layer_index, block_index, &page_ids);
             }
         }
         assert_eq!(
             next_page_id as usize, num_cache_pages,
             "qwen3.5 layer bench must initialize every cache page ID"
         );
-        let gqa_metadata = GQAMetadataBuffers::new(device, max_tokens);
-        gqa_backend.prepare(&gqa_metadata, &[0], &[shape.context], &[0, shape.num_tokens]);
+        gqa_state.prepare_metadata(&[0], &[shape.context], &[0, shape.num_tokens]);
 
         let gdn_layers = (0..config.text_config.num_hidden_layers)
             .filter(|&index| config.layer_type_at(index).is_ok_and(|kind| kind == LayerType::GDN))
@@ -229,21 +227,22 @@ impl BlockFixture {
         let gdn_metal = qwen35_gdn_core_and_metal(gdn_layers[0], &config.text_config, defaults)
             .expect("qwen3.5 layer bench requires valid GDN geometry")
             .1;
-        let gdn_backend = Rc::new(GDN::new(device, gdn_cores[0].clone(), gdn_metal));
-        let gdn_scratch = Rc::new(GDNScratch::new(device, &gdn_cores[0], gdn_metal, max_tokens));
-        let gdn_state_table = Rc::new(GDNRequestStateTable::new(
+        let gdn_state = Qwen3xGDNState::load(
             device,
             &gdn_cores,
+            gdn_metal,
             1,
             0,
             max_tokens,
+            max_tokens,
             CACHE_BLOCK_TOKENS,
             QWEN35_PAGE_SIZE_BYTES,
-        ));
-        let gdn_metadata = GDNMetadataBuffers::new(device, 1, max_tokens);
-        gdn_metadata.update(&[0, shape.num_tokens], &[0], &[0], &vec![0; max_tokens]);
+        );
+        gdn_state
+            .metadata()
+            .update(&[0, shape.num_tokens], &[0], &[0], &vec![0; max_tokens]);
 
-        let layer_scratch = Rc::new(Qwen35LayerScratch::new(
+        let layer_scratch = Rc::new(Qwen35MainLayerScratch::new(
             device,
             max_tokens,
             config.text_config.hidden_size,
@@ -282,12 +281,8 @@ impl BlockFixture {
                 defaults,
                 model_layer_index,
                 bindings,
-                &gqa_backend,
-                &gqa_scratch,
-                &gqa_page_table,
-                &gdn_backend,
-                &gdn_scratch,
-                &gdn_state_table,
+                &gqa_state,
+                &gdn_state,
                 Rc::clone(&layer_scratch),
                 dense_scratch.as_ref(),
                 moe_scratch.as_ref(),
@@ -299,8 +294,8 @@ impl BlockFixture {
             stream: Stream::new(device),
             input: Buffer::from_slice(device, &hidden_fixture(max_tokens, config.text_config.hidden_size)),
             layers,
-            gqa_metadata,
-            gdn_metadata,
+            gqa_state,
+            gdn_state,
             pages: PageArena::new(device, num_cache_pages, QWEN35_PAGE_SIZE_BYTES),
             shape,
         }
@@ -310,12 +305,12 @@ impl BlockFixture {
         let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
         let mut hidden = &self.input;
         for layer in &self.layers {
-            hidden = <Qwen35Layer as ReplayLayer>::record(
+            hidden = <Qwen35MainLayer as ReplayLayer>::record(
                 layer,
                 &mut recorder,
-                Qwen35LayerInput {
-                    gdn: Some(&self.gdn_metadata),
-                    gqa: &self.gqa_metadata,
+                Qwen35MainLayerInput {
+                    gdn: self.gdn_state.metadata(),
+                    gqa: self.gqa_state.metadata(),
                     num_tokens: self.shape.num_tokens,
                     pages: self.pages.buffer(),
                     residual_input: hidden,
@@ -340,68 +335,34 @@ fn load_layer(
     defaults: Qwen35MetalDefaults,
     model_layer_index: usize,
     bindings: Qwen35LayerWeightBindings,
-    gqa_backend: &Rc<GQA>,
-    gqa_scratch: &Rc<GQAScratch>,
-    gqa_page_table: &Rc<GQARequestPageTable>,
-    gdn_backend: &Rc<GDN>,
-    gdn_scratch: &Rc<GDNScratch>,
-    gdn_state_table: &Rc<GDNRequestStateTable>,
-    layer_scratch: Rc<Qwen35LayerScratch>,
+    gqa_state: &Qwen3xGQAState,
+    gdn_state: &Qwen3xGDNState,
+    layer_scratch: Rc<Qwen35MainLayerScratch>,
     dense_scratch: Option<&Rc<DenseMLPScratch>>,
     moe_scratch: Option<&Rc<MoEScratch>>,
-) -> Qwen35Layer {
-    let Qwen35LayerWeightBindings {
-        input_norm_weight,
-        post_attention_norm_weight,
-        attention,
-        mlp,
-    } = bindings;
-    let mut compact_gqa_layer_index = (0..model_layer_index)
+) -> Qwen35MainLayer {
+    let compact_gqa_layer_index = (0..model_layer_index)
         .filter(|&index| {
             config
                 .layer_type_at(index)
                 .is_ok_and(|kind| kind == LayerType::FullAttention)
         })
         .count();
-    let mut compact_gdn_layer_index = model_layer_index - compact_gqa_layer_index;
-    let attention = Qwen35Layer::load_attention(
+    let compact_gdn_layer_index = model_layer_index - compact_gqa_layer_index;
+    Qwen35MainLayer::load(
         device,
         store,
         config,
         defaults,
         model_layer_index,
-        &mut compact_gqa_layer_index,
-        &mut compact_gdn_layer_index,
-        attention,
-        gqa_backend,
-        gqa_scratch,
-        gqa_page_table,
-        gdn_backend,
-        gdn_scratch,
-        gdn_state_table,
-    )
-    .unwrap_or_else(|err| panic!("unable to load attention for layer {model_layer_index}: {err}"));
-    let mlp = Qwen35Layer::load_mlp(
-        device,
-        store,
-        config,
-        defaults,
-        model_layer_index,
-        mlp,
+        compact_gqa_layer_index,
+        compact_gdn_layer_index,
+        bindings,
+        gqa_state,
+        gdn_state,
+        layer_scratch,
         dense_scratch,
         moe_scratch,
-    )
-    .unwrap_or_else(|err| panic!("unable to load MLP for layer {model_layer_index}: {err}"));
-    Qwen35Layer::load(
-        device,
-        store,
-        config,
-        model_layer_index,
-        input_norm_weight,
-        post_attention_norm_weight,
-        attention,
-        mlp,
-        layer_scratch,
     )
     .unwrap_or_else(|err| panic!("unable to load layer {model_layer_index}: {err}"))
 }
@@ -411,7 +372,7 @@ fn main() {
     assert!(args.iters > 0, "--iters must be positive");
     assert!(args.runs > 0, "--runs must be positive");
     let device = Device::system_default();
-    let model_config = init_model_config(&args.model_dir)
+    let model_config = init_qwen35_model_config(&args.model_dir)
         .unwrap_or_else(|err| panic!("unable to init Qwen3.5 config from {}: {err}", args.model_dir.display()));
     let mut store = SafeTensorStore::from_model_dir(&args.model_dir).unwrap_or_else(|err| {
         panic!(

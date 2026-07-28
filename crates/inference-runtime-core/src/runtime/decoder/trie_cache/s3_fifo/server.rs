@@ -6,11 +6,11 @@ use ahash::RandomState as AHashRandomState;
 use dashmap::DashMap;
 use intrusive_collections::LinkedList;
 
-use super::entry::Entry;
-use super::entry::EntryLink;
-use super::eviction::Eviction;
-use super::queue::Queue;
 use crate::channel::Shutdown;
+use crate::runtime::decoder::trie_cache::s3_fifo::entry::Entry;
+use crate::runtime::decoder::trie_cache::s3_fifo::entry::EntryLink;
+use crate::runtime::decoder::trie_cache::s3_fifo::eviction::Eviction;
+use crate::runtime::decoder::trie_cache::s3_fifo::queue::Queue;
 
 pub struct S3FIFOServer<K>
 where

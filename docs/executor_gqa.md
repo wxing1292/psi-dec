@@ -22,9 +22,13 @@ crates/inference-executor-metal/src/attn/
     scratch.rs              reusable GQA scratch allocation owner and borrowed replay bindings
     request_page_table.rs   per-request, per-layer KV page table for runtime-supplied page IDs
 
+crates/inference-executor-metal/src/model/qwen/v3_x/
+  layer/gqa.rs              Qwen3xGQA, private checkpoint weights, load, and record
+  state/gqa.rs              Qwen3xGQAState page/metadata/reset lifecycle grouping
+
 crates/inference-executor-metal/src/model/qwen/v3_5/
-  layer/gqa.rs              Qwen35GQA, private checkpoint weights, load, and record
-  state/gqa.rs              Qwen35GQAState page/metadata/reset lifecycle grouping
+  main/layer.rs             Qwen3.5 Main QGKV-GQA/GDN layer variants
+  mtp/layer.rs              Qwen3.5 MTP GQA layer composition
 
 crates/inference-backend-metal/src/components/
   gqa_attention.rs          reusable Metal paged SDPA component kernels
@@ -47,10 +51,10 @@ crates/inference-backend-metal/src/components/
 `crates/inference-executor-core` is the backend-neutral home for GQA semantic metadata and replay shape. `crates/inference-executor-metal`
 owns the current Metal replay wiring and request page table.
 
-The Metal GQA executor backend implements the executor `Layer + ReplayLayer` contract so Qwen model/layer code can append GQA
-work into a larger e2e replay through a semantic layer input/output and caller-owned `Recorder`. `request_page_table.rs` owns the executor-side request-slot KV page
-table used to accumulate runtime-supplied page IDs between reset notifications; runtime core still owns physical page
-allocation/free.
+The Metal GQA executor backend implements the executor `ReplayLayer` contract so Qwen model/layer code can append GQA
+work into a larger e2e replay through a semantic layer input/output and caller-owned `Recorder`.
+`request_page_table.rs` owns the executor-side request-slot KV page table used to accumulate runtime-supplied page IDs
+between reset notifications; runtime core still owns physical page allocation/free.
 
 ## Ownership
 
@@ -85,9 +89,10 @@ matmul-like logical description `(q_token_tile_index, kv_head_index, q_head_tile
 
 Only `model_layer_index` is per layer. Qwen validates the remaining fields once and uses them through the shared backend.
 
-`Qwen35GQAState` owns one shared `GQA` backend and `GQAScratch` for compatible invocations plus one
-`Rc<GQARequestPageTable>` and reusable `GQAMetadataBuffers`. Each `Qwen35GQA` layer component retains clones of the
-backend, scratch, and page-table handles together with its own weights and compact layer coordinate. The backend owns
+`Qwen3xGQAState` owns one shared `GQA` backend and `GQAScratch` for compatible invocations plus one
+`Rc<GQARequestPageTable>` and reusable `GQAMetadataBuffers`. Each `Qwen3xGQA` layer component retains clones of the
+backend, scratch, and page-table handles together with its own weights and compact layer coordinate.
+`Qwen35MainLayer` and `Qwen35MTPLayer` compose that leaf inside separate role-specific owners. The backend owns
 the common head dimensions, Metal tuning, and compiled replay components; it records projection split, q/k norm+RoPE,
 KV page update, paged SDPA, activation gate, and output projection into the caller's `Recorder`.
 
@@ -432,7 +437,7 @@ Both paths reduce context-segment partials by rescaling them to one global maxim
 `TiledQTokens` always records its tiled reduce. Focused fixed, request-tail, multi-tile, and ragged cases compare both
 paths against the CPU reference.
 
-Qwen3.5 keeps reusable GQA scratch in `Qwen35GQAState`, not in individual GQA layers. The executor owns one Main
+Qwen3.5 keeps reusable GQA scratch in `Qwen3xGQAState`, not in individual GQA layers. The executor owns one Main
 `GQAScratch`; the optional MTP owns one matching scratch because its GQA configuration may differ. `GQAScratch`
 owns reusable projection, norm/RoPE, SDPA, and output-gate buffers, and `GQAScratch::bindings()` exposes its borrowed
 replay bindings. Main and MTP execution are serialized on the model stream, so these buffers are reused across

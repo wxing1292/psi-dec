@@ -7,9 +7,9 @@ use crate::runtime::RawRequestSlot;
 use crate::runtime::Token;
 
 pub trait ReplayableModelBatchExecutor {
-    type ModelBatchReq;
+    type ModelBatchRequest;
     type ModelBatchHidden;
-    type ModelBatchResp;
+    type ModelBatchResponse;
     type SampledOutput;
     type ModelOpsRecorder;
 
@@ -21,14 +21,14 @@ pub trait ReplayableModelBatchExecutor {
 
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]);
 
-    fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchReq;
+    fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest;
     fn commit_batch(
         &mut self,
         core_batch_req: BatchDeviceRequest,
         sampled_output: Self::SampledOutput,
     ) -> BatchDeviceResponse;
 
-    fn begin_ops_recording(&mut self, batch_req: &Self::ModelBatchReq) -> Self::ModelOpsRecorder;
+    fn begin_ops_recording(&mut self, batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder;
     fn finish_ops_recording(
         &mut self,
         recorder: Self::ModelOpsRecorder,
@@ -41,25 +41,25 @@ pub trait ReplayableModelBatchExecutor {
     fn embed(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        batch_req: &Self::ModelBatchReq,
+        batch_req: &Self::ModelBatchRequest,
     ) -> Self::ModelBatchHidden;
     fn unembed(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
+        model_batch_req: &Self::ModelBatchRequest,
         model_batch_hidden: &Self::ModelBatchHidden,
-    ) -> Self::ModelBatchResp;
+    ) -> Self::ModelBatchResponse;
 
     fn forward_main(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
+        model_batch_req: &Self::ModelBatchRequest,
         model_batch_hidden: Self::ModelBatchHidden,
     ) -> Self::ModelBatchHidden;
     fn forward_spec(
         &mut self,
         _recorder: &mut Self::ModelOpsRecorder,
-        _model_batch_req: &Self::ModelBatchReq,
+        _model_batch_req: &Self::ModelBatchRequest,
         _model_batch_hidden: &Self::ModelBatchHidden,
         sampled_output: Self::SampledOutput,
     ) -> Self::SampledOutput {
@@ -69,14 +69,14 @@ pub trait ReplayableModelBatchExecutor {
     fn sample(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
-        model_batch_resp: &Self::ModelBatchResp,
+        model_batch_req: &Self::ModelBatchRequest,
+        model_batch_resp: &Self::ModelBatchResponse,
     ) -> Self::SampledOutput;
     fn rejection_sample(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchReq,
-        model_batch_resp: &Self::ModelBatchResp,
+        model_batch_req: &Self::ModelBatchRequest,
+        model_batch_resp: &Self::ModelBatchResponse,
     ) -> Self::SampledOutput {
         self.sample(recorder, model_batch_req, model_batch_resp)
     }
@@ -86,10 +86,10 @@ pub trait ReplayableModelBatchExecutor {
         None
     }
 
-    fn first_pp_stage(&self, _batch_req: &Self::ModelBatchReq) -> bool {
+    fn first_pp_stage(&self, _batch_req: &Self::ModelBatchRequest) -> bool {
         true
     }
-    fn last_pp_stage(&self, _batch_req: &Self::ModelBatchReq) -> bool {
+    fn last_pp_stage(&self, _batch_req: &Self::ModelBatchRequest) -> bool {
         true
     }
 }

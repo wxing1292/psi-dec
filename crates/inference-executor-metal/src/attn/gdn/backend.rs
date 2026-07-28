@@ -17,7 +17,6 @@ use inference_backend_metal::operators::AffineQuantizedMatmulShape;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::Layer;
 
 use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
 use crate::attn::gdn::scratch::GDNScratchBindings;
@@ -187,23 +186,10 @@ impl GDN {
     }
 }
 
-impl Layer for GDN {
+impl ReplayLayer for GDN {
     type Input<'a> = GDNInput<'a>;
     type Output<'a> = GDNOutput<'a>;
 
-    type InputShape = GDNCore;
-    type OutputShape = GDNCore;
-
-    fn input_shape(&self) -> Self::InputShape {
-        self.core.clone()
-    }
-
-    fn output_shape(&self) -> Self::OutputShape {
-        self.core.clone()
-    }
-}
-
-impl ReplayLayer for GDN {
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,

@@ -10,10 +10,10 @@ use inference_runtime_service::observability::ProfileMode;
 use inference_runtime_service::observability::ProfilingConfig;
 use inference_runtime_service::observability::ServiceObservabilityConfig;
 
-use super::args::Qwen35Args;
-use super::args::QwenLogLevel;
-use super::args::QwenProfileMode;
-use super::sizing::QWEN35_DEFAULT_NUM_CACHE_PAGES;
+use crate::qwen_server::args::Qwen35Args;
+use crate::qwen_server::args::QwenLogLevel;
+use crate::qwen_server::args::QwenProfileMode;
+use crate::qwen_server::sizing::QWEN35_DEFAULT_NUM_CACHE_PAGES;
 
 pub const QWEN35_MAX_RUNNING_REQUESTS: usize = 8;
 

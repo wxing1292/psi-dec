@@ -48,10 +48,10 @@ These files are not referenced by the Qwen3.5 executor load or forward path. The
 available to focused tests and future model-specific integration.
 
 Main now has a narrow object-safe residual-capture seam: `Qwen35Main` can ask an optional
-`Rc<dyn QwenMainResidualCapture>` for a capture target at each model layer's final post-MLP residual add. The
+`Rc<dyn Qwen35MainResidualCapture>` for a capture target at each model layer's final post-MLP residual add. The
 capture contract only returns an opaque `ResidualCaptureTarget`; it has no recorder method. The Qwen3.5 loader supplies
-no capture owner, so this adds no Qwen3.5 operator or output. Future Qwen3 DSpark wiring can inject its capture owner
-through the shared executor without binding that semantic component to `ReplayRecorder`.
+no capture owner, so this adds no Qwen3.5 operator or output. Future Qwen3.5 DSpark wiring can inject its capture owner
+without binding that semantic component to `ReplayRecorder`.
 
 ## Preserved low-level contract
 

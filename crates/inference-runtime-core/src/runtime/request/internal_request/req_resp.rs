@@ -1,4 +1,3 @@
-use super::stop_sequence::StopSequences;
 use crate::compute::DeviceRequest;
 use crate::compute::DeviceResponse;
 use crate::compute::SampledTokens;
@@ -10,6 +9,7 @@ use crate::runtime::decoder::trie_cache::token_consumption;
 use crate::runtime::request::CompletionReason;
 use crate::runtime::request::InternalRequest;
 use crate::runtime::request::internal_request::StopSequenceMatch;
+use crate::runtime::request::internal_request::stop_sequence::StopSequences;
 use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
 use crate::runtime::scheduler::PrepareResult;

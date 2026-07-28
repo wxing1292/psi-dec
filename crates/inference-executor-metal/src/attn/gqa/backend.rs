@@ -33,7 +33,6 @@ use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::Layer;
 
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::scratch::GQAScratchBindings;
@@ -272,23 +271,10 @@ impl GQA {
     }
 }
 
-impl Layer for GQA {
+impl ReplayLayer for GQA {
     type Input<'a> = GQAInput<'a>;
     type Output<'a> = GQAOutput<'a>;
 
-    type InputShape = GQACore;
-    type OutputShape = GQACore;
-
-    fn input_shape(&self) -> Self::InputShape {
-        self.core.clone()
-    }
-
-    fn output_shape(&self) -> Self::OutputShape {
-        self.core.clone()
-    }
-}
-
-impl ReplayLayer for GQA {
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,

@@ -6,12 +6,12 @@ use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
-use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35GDNWeightBindings;
+use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGDNWeightBindings;
 
 use crate::attn::gdn::backend::GDN;
 use crate::attn::gdn::backend::GDNInput;
 use crate::attn::gdn::backend::GDNLayerStateBindings;
+use crate::attn::gdn::backend::GDNMetalConfig;
 use crate::attn::gdn::backend::GDNWeights;
 use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
 use crate::attn::gdn::scratch::GDNScratch;
@@ -19,42 +19,38 @@ use crate::attn::gdn::state_table::GDNRequestStateTable;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use crate::model::qwen::v3_5::plan::qwen35_gdn_core_and_metal;
-use crate::model::qwen::v3_5::weight::affine_shape;
-use crate::model::qwen::v3_5::weight::bf16_tensor_as_f32;
-use crate::model::qwen::v3_5::weight::concat_bytes;
-use crate::model::qwen::v3_5::weight::concat_f32;
-use crate::model::qwen::v3_5::weight::quant_weight;
-use crate::model::qwen::v3_5::weight::typed_tensor;
-use crate::model::qwen::v3_5::weight::validate_len;
+use crate::model::qwen::v3_x::weight::affine_shape;
+use crate::model::qwen::v3_x::weight::bf16_tensor_as_f32;
+use crate::model::qwen::v3_x::weight::concat_bytes;
+use crate::model::qwen::v3_x::weight::concat_f32;
+use crate::model::qwen::v3_x::weight::quant_weight;
+use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::qwen::v3_x::weight::validate_len;
 
-pub struct Qwen35GDN {
-    layer_index: usize,
-    weights: Qwen35GDNWeights,
+pub struct Qwen3xGDN {
+    compact_gdn_layer_index: usize,
+    weights: Qwen3xGDNWeights,
     backend: Rc<GDN>,
     scratch: Rc<GDNScratch>,
     request_state_table: Rc<GDNRequestStateTable>,
 }
 
-impl Qwen35GDN {
+impl Qwen3xGDN {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        config: &Qwen35ModelConfig,
-        defaults: Qwen35MetalDefaults,
-        model_layer_index: usize,
-        layer_index: usize,
-        bindings: Qwen35GDNWeightBindings,
+        core: &GDNCore,
+        metal: GDNMetalConfig,
+        compact_gdn_layer_index: usize,
+        bindings: Qwen3xGDNWeightBindings,
         backend: Rc<GDN>,
         scratch: Rc<GDNScratch>,
         request_state_table: Rc<GDNRequestStateTable>,
     ) -> Result<Self, ModelExecutorError> {
-        let (core, metal) = qwen35_gdn_core_and_metal(model_layer_index, &config.text_config, defaults)?;
         Ok(Self {
-            layer_index,
-            weights: Qwen35GDNWeights::load(device, store, &bindings, &core, metal)?,
+            compact_gdn_layer_index,
+            weights: Qwen3xGDNWeights::load(device, store, &bindings, core, metal)?,
             backend,
             scratch,
             request_state_table,
@@ -70,7 +66,7 @@ impl Qwen35GDN {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let state = self.request_state_table.layer_bindings(self.layer_index);
+        let state = self.request_state_table.layer_bindings(self.compact_gdn_layer_index);
         let _ = <GDN as ReplayLayer>::record(
             &self.backend,
             recorder,
@@ -94,7 +90,7 @@ impl Qwen35GDN {
     }
 }
 
-struct Qwen35GDNWeights {
+struct Qwen3xGDNWeights {
     qkvabz_weight: Buffer,
     qkvabz_scales: Buffer,
     qkvabz_biases: Buffer,
@@ -107,11 +103,11 @@ struct Qwen35GDNWeights {
     output_biases: Buffer,
 }
 
-impl Qwen35GDNWeights {
+impl Qwen3xGDNWeights {
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        bindings: &Qwen35GDNWeightBindings,
+        bindings: &Qwen3xGDNWeightBindings,
         core: &GDNCore,
         metal: crate::attn::gdn::backend::GDNMetalConfig,
     ) -> Result<Self, ModelExecutorError> {

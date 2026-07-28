@@ -4,9 +4,17 @@ use crate::checkpoint::QuantizedTensorBindings;
 use crate::def::ModelExecutorError;
 use crate::model::qwen::v3_5::LayerType;
 use crate::model::qwen::v3_5::Qwen35ModelConfig;
-use crate::model::qwen::v3_5::TensorPathLayout;
-use crate::model::qwen::v3_5::default_tensor_path_layout;
-use crate::model::qwen::v3_5::tensor_path_layout_candidates;
+use crate::model::qwen::v3_x::TensorPathLayout;
+use crate::model::qwen::v3_x::tensor_path_layout_candidates;
+use crate::model::qwen::v3_x::weight_layout::Qwen3xDenseMLPWeightBindings;
+use crate::model::qwen::v3_x::weight_layout::Qwen3xGDNWeightBindings;
+use crate::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
+use crate::model::qwen::v3_x::weight_layout::Qwen3xMoEWeightBindings;
+use crate::model::qwen::v3_x::weight_layout::Qwen3xSparseExpertWeightBindings;
+use crate::model::qwen::v3_x::weight_layout::dense_mlp_bindings;
+use crate::model::qwen::v3_x::weight_layout::push_quantized_tensor_names;
+use crate::model::qwen::v3_x::weight_layout::quantized;
+use crate::model::qwen::v3_x::weight_layout::quantized_path;
 
 const QWEN35_GDN_COMPONENT_NAMES: [&str; 2] = ["gated_delta_net", "linear_attn"];
 
@@ -47,59 +55,14 @@ pub struct Qwen35LayerWeightBindings {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Qwen35AttentionWeightBindings {
-    GDN(Qwen35GDNWeightBindings),
-    GQA(Qwen35GQAWeightBindings),
+    GDN(Qwen3xGDNWeightBindings),
+    GQA(Qwen3xGQAWeightBindings),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Qwen35MLPWeightBindings {
-    Dense(Box<Qwen35DenseMLPWeightBindings>),
-    MoE(Box<Qwen35MoEWeightBindings>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Qwen35GDNWeightBindings {
-    pub qkv: QuantizedTensorBindings,
-    pub a: QuantizedTensorBindings,
-    pub b: QuantizedTensorBindings,
-    pub z: QuantizedTensorBindings,
-    pub conv_weight: String,
-    pub norm_weight: String,
-    pub a_log: String,
-    pub dt_bias: String,
-    pub output: QuantizedTensorBindings,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Qwen35GQAWeightBindings {
-    pub q: QuantizedTensorBindings,
-    pub k: QuantizedTensorBindings,
-    pub v: QuantizedTensorBindings,
-    pub q_norm_weight: String,
-    pub k_norm_weight: String,
-    pub output: QuantizedTensorBindings,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Qwen35DenseMLPWeightBindings {
-    pub gate: QuantizedTensorBindings,
-    pub up: QuantizedTensorBindings,
-    pub down: QuantizedTensorBindings,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Qwen35MoEWeightBindings {
-    pub router: QuantizedTensorBindings,
-    pub experts: Qwen35SparseExpertWeightBindings,
-    pub shared_expert_gate: Option<QuantizedTensorBindings>,
-    pub shared_expert: Option<Qwen35DenseMLPWeightBindings>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Qwen35SparseExpertWeightBindings {
-    pub gate: QuantizedTensorBindings,
-    pub up: QuantizedTensorBindings,
-    pub down: QuantizedTensorBindings,
+    Dense(Box<Qwen3xDenseMLPWeightBindings>),
+    MoE(Box<Qwen3xMoEWeightBindings>),
 }
 
 #[derive(Clone, Copy)]
@@ -108,26 +71,12 @@ struct Qwen35WeightLayout {
     gdn_component_name: &'static str,
 }
 
-impl QuantizedTensorBindings {
-    fn from_prefix(prefix: String) -> Self {
-        Self {
-            weight: format!("{prefix}.weight"),
-            scales: format!("{prefix}.scales"),
-            biases: format!("{prefix}.biases"),
-        }
-    }
-
-    fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
-        names.extend([self.weight.as_str(), self.scales.as_str(), self.biases.as_str()]);
-    }
-}
-
 impl Qwen35ModelWeightBindings {
-    pub fn tensor_names(&self) -> Vec<&str> {
+    fn tensor_names(&self) -> Vec<&str> {
         let mut names = Vec::new();
-        self.embed.push_tensor_names(&mut names);
+        push_quantized_tensor_names(&self.embed, &mut names);
         names.push(&self.main.final_norm_weight);
-        self.unembed.push_tensor_names(&mut names);
+        push_quantized_tensor_names(&self.unembed, &mut names);
         for layer in &self.main.layers {
             layer.push_tensor_names(&mut names);
         }
@@ -136,7 +85,7 @@ impl Qwen35ModelWeightBindings {
 }
 
 impl Qwen35MTPWeightBindings {
-    pub fn from_config(model_config: &Qwen35ModelConfig, num_modules: usize) -> Result<Self, ModelExecutorError> {
+    fn from_config(model_config: &Qwen35ModelConfig, num_modules: usize) -> Result<Self, ModelExecutorError> {
         assert_eq!(num_modules, 1, "qwen3.5 supports exactly one MTP module");
         assert!(
             num_modules <= model_config.text_config.num_hidden_layers,
@@ -155,13 +104,13 @@ impl Qwen35MTPWeightBindings {
         })
     }
 
-    pub fn tensor_names(&self) -> Vec<&str> {
+    fn tensor_names(&self) -> Vec<&str> {
         let mut names = Vec::new();
         names.extend([
             self.embed.prev_hidden_norm_weight.as_str(),
             self.embed.token_hidden_norm_weight.as_str(),
         ]);
-        self.embed.projection.push_tensor_names(&mut names);
+        push_quantized_tensor_names(&self.embed.projection, &mut names);
         names.push(&self.final_norm_weight);
         self.body.push_tensor_names(&mut names);
         names
@@ -195,61 +144,6 @@ impl Qwen35MLPWeightBindings {
     }
 }
 
-impl Qwen35GDNWeightBindings {
-    fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
-        self.qkv.push_tensor_names(names);
-        self.a.push_tensor_names(names);
-        self.b.push_tensor_names(names);
-        self.z.push_tensor_names(names);
-        names.extend([
-            self.conv_weight.as_str(),
-            self.norm_weight.as_str(),
-            self.a_log.as_str(),
-            self.dt_bias.as_str(),
-        ]);
-        self.output.push_tensor_names(names);
-    }
-}
-
-impl Qwen35GQAWeightBindings {
-    fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
-        self.q.push_tensor_names(names);
-        self.k.push_tensor_names(names);
-        self.v.push_tensor_names(names);
-        names.extend([self.q_norm_weight.as_str(), self.k_norm_weight.as_str()]);
-        self.output.push_tensor_names(names);
-    }
-}
-
-impl Qwen35DenseMLPWeightBindings {
-    fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
-        self.gate.push_tensor_names(names);
-        self.up.push_tensor_names(names);
-        self.down.push_tensor_names(names);
-    }
-}
-
-impl Qwen35MoEWeightBindings {
-    fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
-        self.router.push_tensor_names(names);
-        self.experts.push_tensor_names(names);
-        if let Some(bindings) = &self.shared_expert_gate {
-            bindings.push_tensor_names(names);
-        }
-        if let Some(bindings) = &self.shared_expert {
-            bindings.push_tensor_names(names);
-        }
-    }
-}
-
-impl Qwen35SparseExpertWeightBindings {
-    fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
-        self.gate.push_tensor_names(names);
-        self.up.push_tensor_names(names);
-        self.down.push_tensor_names(names);
-    }
-}
-
 impl Qwen35WeightLayout {
     fn bind(self, model_config: &Qwen35ModelConfig) -> Result<Qwen35ModelWeightBindings, ModelExecutorError> {
         let text = &model_config.text_config;
@@ -259,7 +153,7 @@ impl Qwen35WeightLayout {
             let attention = match model_config.layer_type_at(model_layer_index)? {
                 LayerType::GDN => {
                     let prefix = format!("{prefix}.{}", self.gdn_component_name);
-                    Qwen35AttentionWeightBindings::GDN(Qwen35GDNWeightBindings {
+                    Qwen35AttentionWeightBindings::GDN(Qwen3xGDNWeightBindings {
                         qkv: quantized(&prefix, "in_proj_qkv"),
                         a: quantized(&prefix, "in_proj_a"),
                         b: quantized(&prefix, "in_proj_b"),
@@ -273,7 +167,7 @@ impl Qwen35WeightLayout {
                 },
                 LayerType::FullAttention => {
                     let prefix = format!("{prefix}.self_attn");
-                    Qwen35AttentionWeightBindings::GQA(Qwen35GQAWeightBindings {
+                    Qwen35AttentionWeightBindings::GQA(Qwen3xGQAWeightBindings {
                         q: quantized(&prefix, "q_proj"),
                         k: quantized(&prefix, "k_proj"),
                         v: quantized(&prefix, "v_proj"),
@@ -286,9 +180,9 @@ impl Qwen35WeightLayout {
             let mlp_prefix = format!("{prefix}.mlp");
             let mlp = if model_config.layer_uses_moe(model_layer_index) {
                 let has_shared_expert = text.shared_expert_intermediate_size > 0;
-                Qwen35MLPWeightBindings::MoE(Box::new(Qwen35MoEWeightBindings {
+                Qwen35MLPWeightBindings::MoE(Box::new(Qwen3xMoEWeightBindings {
                     router: quantized_path(format!("{mlp_prefix}.gate")),
-                    experts: Qwen35SparseExpertWeightBindings {
+                    experts: Qwen3xSparseExpertWeightBindings {
                         gate: quantized(&mlp_prefix, "switch_mlp.gate_proj"),
                         up: quantized(&mlp_prefix, "switch_mlp.up_proj"),
                         down: quantized(&mlp_prefix, "switch_mlp.down_proj"),
@@ -326,17 +220,7 @@ impl Qwen35WeightLayout {
     }
 }
 
-pub fn default_qwen35_model_weight_bindings(
-    model_config: &Qwen35ModelConfig,
-) -> Result<Qwen35ModelWeightBindings, ModelExecutorError> {
-    Qwen35WeightLayout {
-        tensor: default_tensor_path_layout(),
-        gdn_component_name: QWEN35_GDN_COMPONENT_NAMES[0],
-    }
-    .bind(model_config)
-}
-
-pub fn qwen35_gqa_layer_weight_bindings(
+fn qwen35_gqa_layer_weight_bindings(
     layer_prefix: &str,
     uses_moe: bool,
     has_shared_expert: bool,
@@ -344,9 +228,9 @@ pub fn qwen35_gqa_layer_weight_bindings(
     let attention_prefix = format!("{layer_prefix}.self_attn");
     let mlp_prefix = format!("{layer_prefix}.mlp");
     let mlp = if uses_moe {
-        Qwen35MLPWeightBindings::MoE(Box::new(Qwen35MoEWeightBindings {
+        Qwen35MLPWeightBindings::MoE(Box::new(Qwen3xMoEWeightBindings {
             router: quantized_path(format!("{mlp_prefix}.gate")),
-            experts: Qwen35SparseExpertWeightBindings {
+            experts: Qwen3xSparseExpertWeightBindings {
                 gate: quantized(&mlp_prefix, "switch_mlp.gate_proj"),
                 up: quantized(&mlp_prefix, "switch_mlp.up_proj"),
                 down: quantized(&mlp_prefix, "switch_mlp.down_proj"),
@@ -360,7 +244,7 @@ pub fn qwen35_gqa_layer_weight_bindings(
     Qwen35LayerWeightBindings {
         input_norm_weight: format!("{layer_prefix}.input_layernorm.weight"),
         post_attention_norm_weight: format!("{layer_prefix}.post_attention_layernorm.weight"),
-        attention: Qwen35AttentionWeightBindings::GQA(Qwen35GQAWeightBindings {
+        attention: Qwen35AttentionWeightBindings::GQA(Qwen3xGQAWeightBindings {
             q: quantized(&attention_prefix, "q_proj"),
             k: quantized(&attention_prefix, "k_proj"),
             v: quantized(&attention_prefix, "v_proj"),
@@ -457,22 +341,6 @@ pub fn resolve_qwen35_mtp_weight_bindings<'a>(
         )));
     }
     Ok(bindings)
-}
-
-fn quantized(prefix: &str, relative_name: &str) -> QuantizedTensorBindings {
-    quantized_path(format!("{prefix}.{relative_name}"))
-}
-
-fn quantized_path(prefix: String) -> QuantizedTensorBindings {
-    QuantizedTensorBindings::from_prefix(prefix)
-}
-
-fn dense_mlp_bindings(prefix: &str) -> Qwen35DenseMLPWeightBindings {
-    Qwen35DenseMLPWeightBindings {
-        gate: quantized(prefix, "gate_proj"),
-        up: quantized(prefix, "up_proj"),
-        down: quantized(prefix, "down_proj"),
-    }
 }
 
 #[cfg(test)]

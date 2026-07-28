@@ -181,7 +181,11 @@ impl Qwen35Executor {
             let num_target_hidden_states = module_batch.sampler_configs.len();
             self.write_token_ids(module_batch.microbatch.flat_token_ids());
             let mtp_gqa_state = self.mtp_gqa_state.as_ref().expect("qwen3.5 MTP requires GQA state");
-            let mtp_gqa_shape = mtp_gqa_state.prepare_metadata(&module_batch.microbatch);
+            let mtp_gqa_shape = mtp_gqa_state.prepare_metadata(
+                module_batch.microbatch.req_slots(),
+                module_batch.microbatch.token_indices(),
+                module_batch.microbatch.cu_tokens(),
+            );
             self.mtp_input_gather_flat_indices
                 .write_typed(0, &module_batch.input_gather_flat_indices);
             if num_target_hidden_states > 0 {
@@ -336,37 +340,5 @@ impl Qwen35Executor {
         }
         trace_decisions("mtp_propose_done", decisions);
         timing
-    }
-
-    fn forward_spec(
-        &mut self,
-        recorder: &mut Qwen35ModelRecorder,
-        model_batch_req: &Qwen35ModelBatchRequest,
-        model_batch_hidden: &Rc<Buffer>,
-        mut sampled_output: Qwen35DecodeOutput,
-    ) -> Qwen35DecodeOutput {
-        if self.mtp.is_none() {
-            return sampled_output;
-        }
-        assert!(
-            Rc::ptr_eq(model_batch_hidden, &self.hidden_output),
-            "qwen3.5 speculator must consume the executor final-norm hidden workspace"
-        );
-        let microbatch = model_batch_req.microbatch();
-        let num_decode_reqs = (0..microbatch.num_reqs())
-            .filter(|&req_index| microbatch.is_decode_req(req_index))
-            .count();
-        assert_eq!(
-            sampled_output.decisions.len(),
-            num_decode_reqs,
-            "qwen3.5 speculator requires one decision per decode request"
-        );
-        if !recorder.main_stage_submitted {
-            sampled_output.timing.main_replay_elapsed += self.submit_main_stage(recorder);
-        }
-        let timing =
-            self.forward_mtp_batch(microbatch, Rc::clone(model_batch_hidden), &mut sampled_output.decisions);
-        sampled_output.timing.add_assign(timing);
-        sampled_output
     }
 }

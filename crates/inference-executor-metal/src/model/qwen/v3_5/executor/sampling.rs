@@ -70,7 +70,7 @@ impl Qwen35Executor {
 
     fn submit_main_sample_stage(
         &mut self,
-        recorder: &mut Qwen35ModelRecorder,
+        recorder: &mut Qwen35ModelOpsRecorder,
         sampler_configs: &[SamplerConfig],
         sample_positions: &[u32],
     ) -> Duration {
@@ -112,7 +112,7 @@ impl Qwen35Executor {
 
     fn target_rejection_sample(
         &mut self,
-        recorder: &mut Qwen35ModelRecorder,
+        recorder: &mut Qwen35ModelOpsRecorder,
         microbatch: &Qwen35Microbatch,
     ) -> (Vec<Qwen35DecodeDecision>, ModelOutputTiming) {
         let mut timing = ModelOutputTiming::default();
@@ -320,52 +320,5 @@ impl Qwen35Executor {
 
     fn num_speculative_tokens(&self) -> usize {
         usize::from(self.mtp.is_some())
-    }
-
-    fn sample(
-        &mut self,
-        recorder: &mut Qwen35ModelRecorder,
-        model_batch_req: &Qwen35ModelBatchRequest,
-        _model_batch_resp: &Qwen35ForwardOutput,
-    ) -> Qwen35DecodeOutput {
-        assert!(
-            !model_batch_req.microbatch().has_spec_tokens(),
-            "qwen3.5 replay sample requires rejection_sample for speculative inputs"
-        );
-        if self.spec_probs.is_enabled() {
-            let (decisions, timing) = self.target_rejection_sample(recorder, model_batch_req.microbatch());
-            return Qwen35DecodeOutput {
-                decisions,
-                read_sampling_output: false,
-                timing,
-            };
-        }
-        Qwen35DecodeOutput {
-            decisions: Vec::new(),
-            read_sampling_output: true,
-            timing: ModelOutputTiming::default(),
-        }
-    }
-
-    fn rejection_sample(
-        &mut self,
-        recorder: &mut Qwen35ModelRecorder,
-        model_batch_req: &Qwen35ModelBatchRequest,
-        _model_batch_resp: &Qwen35ForwardOutput,
-    ) -> Qwen35DecodeOutput {
-        assert!(
-            model_batch_req.microbatch().has_spec_tokens(),
-            "qwen3.5 replay rejection_sample requires speculative inputs"
-        );
-        assert!(
-            self.spec_probs.is_enabled(),
-            "qwen3.5 replay rejection_sample requires a speculator"
-        );
-        let (decisions, timing) = self.target_rejection_sample(recorder, model_batch_req.microbatch());
-        Qwen35DecodeOutput {
-            decisions,
-            read_sampling_output: false,
-            timing,
-        }
     }
 }

@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use crate::compute::DecoderSyncBlocks;
 use crate::runtime::Token;
+#[cfg(debug_assertions)]
+use crate::runtime::decoder::trie_cache::DecoderBlock;
 use crate::runtime::decoder::trie_cache::ImmutableBlock;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::decoder::trie_cache::MutableBlock;
@@ -219,7 +221,7 @@ fn sanity_check_materialized_block_vec<B, const L: usize>(
     ready_tokens: &mut Vec<Token>,
     cache_lane_total_tokens: &mut [Vec<Token>; L],
 ) where
-    B: crate::runtime::decoder::trie_cache::DecoderBlock,
+    B: DecoderBlock,
 {
     let main_block = &block_vec[0];
     match (

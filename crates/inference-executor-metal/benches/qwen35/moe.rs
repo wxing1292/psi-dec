@@ -323,10 +323,20 @@ impl<'a> RealMoEFixture<'a> {
                         packed_input: &packed_input,
                     },
                 },
-                weights: weights.as_moe_weights(),
+                weights: GatedMoEWeights {
+                    router_weight: &weights.router_weight,
+                    router_scales: &weights.router_scales,
+                    router_biases: &weights.router_biases,
+                    topk_experts: weights.sparse.as_borrowed(),
+                },
                 common_expert: Some(GatedMoECommonExpertReplayInput {
                     scratch: common_scratch.as_common_scratch(&common_hidden, &common_gate_logits),
-                    weights: weights.as_common_expert_weights(),
+                    weights: GatedMoECommonExpertWeights {
+                        common_gate_weight: &weights.common_gate_weight,
+                        common_gate_scales: &weights.common_gate_scales,
+                        common_gate_biases: &weights.common_gate_biases,
+                        common_expert: weights.common.as_borrowed(),
+                    },
                 }),
             },
         );
@@ -581,24 +591,6 @@ impl RealMoEWeights {
             common_gate_biases: Buffer::from_slice(device, &common_gate_biases),
             sparse,
             common,
-        }
-    }
-
-    fn as_moe_weights(&self) -> GatedMoEWeights<'_> {
-        GatedMoEWeights {
-            router_weight: &self.router_weight,
-            router_scales: &self.router_scales,
-            router_biases: &self.router_biases,
-            topk_experts: self.sparse.as_borrowed(),
-        }
-    }
-
-    fn as_common_expert_weights(&self) -> GatedMoECommonExpertWeights<'_> {
-        GatedMoECommonExpertWeights {
-            common_gate_weight: &self.common_gate_weight,
-            common_gate_scales: &self.common_gate_scales,
-            common_gate_biases: &self.common_gate_biases,
-            common_expert: self.common.as_borrowed(),
         }
     }
 }

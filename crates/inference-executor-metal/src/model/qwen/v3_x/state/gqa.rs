@@ -4,7 +4,6 @@ use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
-use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
 
@@ -14,7 +13,7 @@ use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::attn::gqa::scratch::GQAScratch;
 
-pub struct Qwen35GQAState {
+pub struct Qwen3xGQAState {
     backend: Rc<GQA>,
     scratch: Rc<GQAScratch>,
     request_page_table: Rc<GQARequestPageTable>,
@@ -23,7 +22,7 @@ pub struct Qwen35GQAState {
     cache_lane: usize,
 }
 
-impl Qwen35GQAState {
+impl Qwen3xGQAState {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
@@ -34,10 +33,10 @@ impl Qwen35GQAState {
         num_cache_pages: usize,
         cache_lane: usize,
     ) -> Self {
-        assert!(num_cache_pages > 0, "qwen3.5 GQA state requires cache pages");
+        assert!(num_cache_pages > 0, "qwen3.x GQA state requires cache pages");
         assert!(
             u32::try_from(num_cache_pages - 1).is_ok(),
-            "qwen3.5 cache page IDs must fit u32"
+            "qwen3.x cache page IDs must fit u32"
         );
         page_table_layout.validate();
         Self {
@@ -71,13 +70,9 @@ impl Qwen35GQAState {
             .prepare(core_batch, self.cache_lane, self.num_cache_pages);
     }
 
-    pub fn prepare_metadata(&self, microbatch: &Qwen35Microbatch) -> GQAReplayShape {
-        self.backend.prepare(
-            &self.metadata,
-            microbatch.req_slots(),
-            microbatch.token_indices(),
-            microbatch.cu_tokens(),
-        )
+    pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
+        self.backend
+            .prepare(&self.metadata, req_slots, token_indices, cu_tokens)
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {

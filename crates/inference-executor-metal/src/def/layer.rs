@@ -1,5 +1,4 @@
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::Layer;
 
 use crate::def::replay_op::ReplayOp;
 
@@ -10,7 +9,14 @@ use crate::def::replay_op::ReplayOp;
 /// consumer command may carry the component-entry barrier; backend kernels,
 /// resource usage markers, and internal phase barriers stay behind the
 /// lower-level Metal operator invocations that the implementation records.
-pub trait ReplayLayer: Layer {
+pub trait ReplayLayer {
+    type Input<'a>
+    where
+        Self: 'a;
+    type Output<'a>
+    where
+        Self: 'a;
+
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>;

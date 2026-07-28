@@ -7,6 +7,7 @@ use inference_executor_core::def::ModelExecutorError;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::checkpoint::TensorBytes;
+use crate::mlp::moe::backend::GatedMoEMetalConfig;
 pub fn typed_tensor(
     store: &mut SafeTensorStore,
     name: &str,
@@ -19,7 +20,7 @@ pub fn quant_weight(store: &mut SafeTensorStore, name: &str) -> Result<Vec<u8>, 
     Ok(typed_tensor(store, name, safetensors::Dtype::U32)?.into_data())
 }
 
-pub fn load_qwen35_norm_weight(
+pub fn load_qwen3x_norm_weight(
     device: &Device,
     store: &mut SafeTensorStore,
     name: &str,
@@ -123,7 +124,7 @@ pub fn sparse_affine_layout(
     experts: usize,
     output_dim: usize,
     input_dim: usize,
-    metal: crate::mlp::moe::backend::GatedMoEMetalConfig,
+    metal: GatedMoEMetalConfig,
 ) -> SparseAffineLayout {
     SparseAffineLayout {
         experts,
