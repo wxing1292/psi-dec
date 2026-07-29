@@ -38,8 +38,11 @@ impl DenseMLPScratch {
                 .try_into()
                 .expect("dense MLP scratch token capacity must fit u32"),
         };
+        let max_tokens_i32 = max_tokens
+            .try_into()
+            .expect("dense MLP scratch token capacity must fit i32");
         Self {
-            gate_up_proj: Buffer::new_zeroed(device, backend_config.gate_up_shape(shape).output_bytes()),
+            gate_up_proj: Buffer::new_zeroed(device, backend_config.gate_up_config().output_bytes(max_tokens_i32)),
             activation: Buffer::new_zeroed(device, backend_config.activation_shape(shape).bytes()),
         }
     }

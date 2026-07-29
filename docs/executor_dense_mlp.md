@@ -165,7 +165,37 @@ The only shape input is `num_tokens`.
 Capacity buffers can be larger.
 Each replay invocation uses the current active prefix.
 
-Benchmark-only qmv/qmm probes select an affine kernel policy for measurement.
+## Backend selection
+
+`QuantizedDenseMLPKernels` owns one adaptive `AffineQuantizedMatmul` for gate/up and one for down.
+Each `AffineQuantizedMatmul` owns the QMV/QMM candidates and selects its kernel.
+The model and executor provide the complete dense-MLP dimensions and active row count.
+They do not select a kernel or tile.
+
+Large dense MLPs use this policy when `hidden_dim > 4096` or `intermediate_dim > 4096`:
+
+| Active rows | Backend path |
+| ---: | --- |
+| 1–5 | QMV |
+| 6–8 | QMM BM8/BN32 |
+| 9–16 | QMM BM16/BN32 |
+| 17 or more | QMM BM32/BN32 |
+
+Smaller dense MLPs keep QMV for a longer range.
+The QMV limit is 18 rows when both dimensions are at most 2048.
+The QMV limit is 12 rows for the remaining smaller shapes.
+The backend uses BM16/BN32 through 16 rows after that limit.
+It uses BM32/BN32 for larger row counts.
+
+Gate/up and down apply the same backend selector independently.
+They can share a family when their dimensions select the same candidate.
+The 8-row BF16 BM8/BN32 kernel uses 64 threads and 3200 bytes of static threadblock memory.
+The memory contains the `8 × 40` input tile and the `32 × 40` weight tile.
+The `40` stride is `BK=32` plus eight BF16 padding values.
+Kernel initialization checks the SIMD width, pipeline thread limit, calculated threadblock memory, reported static
+threadblock memory, and device threadblock-memory limit.
+
+Benchmark-only QMV/QMM probes select an affine kernel policy for measurement.
 The semantic data flow stays the same.
 
 ## Tests and benchmarks
@@ -194,15 +224,21 @@ The bench can run the automatic full dense MLP path or focused shape-policy prob
 
 ```text
 full_auto
-full_qmv
-full_qmm
+full_qmv_bn8_bk32
+full_qmm_bm8_bn32
+full_qmm_bm16_bn32
+full_qmm_bm32_bn32
 gate_up_auto
-gate_up_qmv
-gate_up_qmm
+gate_up_qmv_bn8_bk32
+gate_up_qmm_bm8_bn32
+gate_up_qmm_bm16_bn32
+gate_up_qmm_bm32_bn32
 activation
 down_auto
-down_qmv
-down_qmm
+down_qmv_bn8_bk32
+down_qmm_bm8_bn32
+down_qmm_bm16_bn32
+down_qmm_bm32_bn32
 ```
 
 The default forward path is the real-weight replay path:
@@ -216,8 +252,8 @@ Public replay APIs call this stage `activation`.
 It is the dense MLP activation contract, not a standalone SiLU transform.
 
 The real-weight `*_auto` cases use `DenseMLP` and its normal shape-dependent policy.
-`qmv` means the quantized matrix-vector kernel.
-`qmm` means the quantized matrix-matrix kernel.
+`qmv_bn8_bk32` means the forced QMV BN8/BK32 kernel.
+Each `qmm` case includes its complete BM/BN tile.
 Forced qmv/qmm cases are benchmark-only operator-policy probes.
 
 They help select the correct production threshold.

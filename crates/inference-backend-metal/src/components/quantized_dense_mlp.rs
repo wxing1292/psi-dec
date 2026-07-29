@@ -4,8 +4,8 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
-use crate::operators::AffineQuantizedMatmulKernel;
-use crate::operators::AffineQuantizedMatmulShape;
+use crate::operators::AffineQuantizedMatmul;
+use crate::operators::AffineQuantizedMatmulConfig;
 
 const DENSE_MLP_ACTIVATION_SOURCE: &str = include_str!("metal/quantized_dense_mlp_activation.metal");
 
@@ -35,20 +35,14 @@ impl QuantizedDenseMLPConfig {
         i32::try_from(self.bits).expect("dense MLP bits must fit i32");
     }
 
-    pub fn gate_up_shape(self, shape: QuantizedDenseMLPShape) -> AffineQuantizedMatmulShape {
+    pub fn gate_up_config(self) -> AffineQuantizedMatmulConfig {
         self.validate();
-        shape.validate();
-        self.gate_up_affine_shape_unchecked(shape)
+        self.affine_config_unchecked(self.stacked_intermediate_dim(), self.hidden_dim)
     }
 
-    pub fn down_shape(self, shape: QuantizedDenseMLPShape) -> AffineQuantizedMatmulShape {
+    pub fn down_config(self) -> AffineQuantizedMatmulConfig {
         self.validate();
-        shape.validate();
-        self.down_shape_unchecked(shape)
-    }
-
-    fn down_shape_unchecked(self, shape: QuantizedDenseMLPShape) -> AffineQuantizedMatmulShape {
-        self.affine_shape_unchecked(shape, self.hidden_dim, self.intermediate_dim)
+        self.affine_config_unchecked(self.hidden_dim, self.intermediate_dim)
     }
 
     pub fn activation_shape(self, shape: QuantizedDenseMLPShape) -> QuantizedDenseMLPActivationShape {
@@ -83,41 +77,24 @@ impl QuantizedDenseMLPConfig {
     }
 
     fn gate_up_output_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
-        self.gate_up_affine_shape_unchecked(shape).output_bytes()
+        self.gate_up_config()
+            .output_bytes(shape.num_tokens.try_into().expect("dense MLP token count must fit i32"))
     }
 
     fn output_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
-        self.down_shape_unchecked(shape).output_bytes()
+        self.down_config()
+            .output_bytes(shape.num_tokens.try_into().expect("dense MLP token count must fit i32"))
     }
 
-    fn gate_up_affine_shape_unchecked(self, shape: QuantizedDenseMLPShape) -> AffineQuantizedMatmulShape {
-        self.affine_shape_unchecked(shape, self.stacked_intermediate_dim(), self.hidden_dim)
-    }
-
-    fn affine_shape_unchecked(self, shape: QuantizedDenseMLPShape, n: u32, k: u32) -> AffineQuantizedMatmulShape {
-        AffineQuantizedMatmulShape {
-            m: shape.num_tokens.try_into().expect("dense MLP token count must fit i32"),
+    fn affine_config_unchecked(self, n: u32, k: u32) -> AffineQuantizedMatmulConfig {
+        AffineQuantizedMatmulConfig {
             n: n.try_into().expect("dense MLP output dimension must fit i32"),
             k: k.try_into().expect("dense MLP input dimension must fit i32"),
             group_size: self.group_size.try_into().expect("dense MLP group_size must fit i32"),
             bits: self.bits.try_into().expect("dense MLP bits must fit i32"),
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
-        }
-    }
-
-    fn compile_shape(self, m: u32, n: u32, k: u32) -> AffineQuantizedMatmulShape {
-        self.validate();
-        AffineQuantizedMatmulShape {
-            m: m.try_into().expect("dense MLP compile rows must fit i32"),
-            n: n.try_into().expect("dense MLP compile output dimension must fit i32"),
-            k: k.try_into().expect("dense MLP compile input dimension must fit i32"),
-            group_size: self.group_size.try_into().expect("dense MLP group_size must fit i32"),
-            bits: self.bits.try_into().expect("dense MLP bits must fit i32"),
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
     }
 
@@ -197,37 +174,18 @@ pub struct QuantizedDenseMLPScratch<'a> {
 
 pub struct QuantizedDenseMLPKernels {
     config: QuantizedDenseMLPConfig,
-    gate_up_proj_qmv: AffineQuantizedMatmulKernel,
-    gate_up_proj_qmm: AffineQuantizedMatmulKernel,
-    down_proj_qmv: AffineQuantizedMatmulKernel,
-    down_proj_qmm: AffineQuantizedMatmulKernel,
+    gate_up_proj: AffineQuantizedMatmul,
+    down_proj: AffineQuantizedMatmul,
     activation: QuantizedDenseMLPActivationKernel,
 }
 
 impl QuantizedDenseMLPKernels {
     pub fn new(device: &Device, config: QuantizedDenseMLPConfig) -> Self {
         config.validate();
-        let gate_up_n = config.stacked_intermediate_dim();
-        let gate_up_qmm_m = qmv_batch_limit(config.hidden_dim, gate_up_n);
-        let down_qmm_m = qmv_batch_limit(config.intermediate_dim, config.hidden_dim);
         Self {
             config,
-            gate_up_proj_qmv: AffineQuantizedMatmulKernel::new(
-                device,
-                config.compile_shape(1, gate_up_n, config.hidden_dim),
-            ),
-            gate_up_proj_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                config.compile_shape(gate_up_qmm_m, gate_up_n, config.hidden_dim),
-            ),
-            down_proj_qmv: AffineQuantizedMatmulKernel::new(
-                device,
-                config.compile_shape(1, config.hidden_dim, config.intermediate_dim),
-            ),
-            down_proj_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                config.compile_shape(down_qmm_m, config.hidden_dim, config.intermediate_dim),
-            ),
+            gate_up_proj: AffineQuantizedMatmul::new(device, config.gate_up_config()),
+            down_proj: AffineQuantizedMatmul::new(device, config.down_config()),
             activation: QuantizedDenseMLPActivationKernel::new(device),
         }
     }
@@ -293,24 +251,6 @@ impl QuantizedDenseMLPKernels {
             weights,
         }
     }
-
-    fn gate_up_proj(&self, shape: QuantizedDenseMLPShape) -> &AffineQuantizedMatmulKernel {
-        let threshold = qmv_batch_limit(self.config.hidden_dim, self.config.stacked_intermediate_dim());
-        if shape.num_tokens >= threshold {
-            &self.gate_up_proj_qmm
-        } else {
-            &self.gate_up_proj_qmv
-        }
-    }
-
-    fn down_proj(&self, shape: QuantizedDenseMLPShape) -> &AffineQuantizedMatmulKernel {
-        let threshold = qmv_batch_limit(self.config.intermediate_dim, self.config.hidden_dim);
-        if shape.num_tokens >= threshold {
-            &self.down_proj_qmm
-        } else {
-            &self.down_proj_qmv
-        }
-    }
 }
 
 pub struct QuantizedDenseMLPInvocation<'a> {
@@ -356,9 +296,12 @@ pub struct QuantizedDenseMLPGateUpInvocation<'a> {
 impl Operator for QuantizedDenseMLPGateUpInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.kernels
-            .gate_up_proj(self.shape)
-            .invoke_with_shape(
-                self.kernels.config.gate_up_affine_shape_unchecked(self.shape),
+            .gate_up_proj
+            .invoke(
+                self.shape
+                    .num_tokens
+                    .try_into()
+                    .expect("dense MLP token count must fit i32"),
                 self.gate_up_proj,
                 0,
                 self.hidden_state,
@@ -401,9 +344,12 @@ pub struct QuantizedDenseMLPDownInvocation<'a> {
 impl Operator for QuantizedDenseMLPDownInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.kernels
-            .down_proj(self.shape)
-            .invoke_with_shape(
-                self.kernels.config.down_shape_unchecked(self.shape),
+            .down_proj
+            .invoke(
+                self.shape
+                    .num_tokens
+                    .try_into()
+                    .expect("dense MLP token count must fit i32"),
                 self.next_hidden_state,
                 0,
                 self.activation,
@@ -498,16 +444,6 @@ impl QuantizedDenseMLPActivationRowMajorInvocation<'_> {
     }
 }
 
-fn qmv_batch_limit(input_dim: u32, output_dim: u32) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
@@ -533,21 +469,21 @@ mod tests {
         let shape = QuantizedDenseMLPShape { num_tokens: 4 };
         let (device, kernels) = create_dense_mlp_kernels(config);
         let stream = Stream::new(&device);
-        let gate_up_shape = config.gate_up_shape(shape);
-        let down_shape = config.down_shape(shape);
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
         let hidden_values = hidden_fixture(shape.num_tokens as usize, config.hidden_dim as usize);
         let hidden_state = bf16_buffer(&device, &hidden_values);
-        let gate_up_weight_values = quantized_weight_values(gate_up_shape.weight_bytes());
+        let gate_up_weight_values = quantized_weight_values(gate_up_config.weight_bytes());
         let gate_up_weight = Buffer::from_slice(&device, &gate_up_weight_values);
-        let gate_up_scale_values = affine_param_fixture(gate_up_shape.affine_param_bytes() / size_of::<u16>());
+        let gate_up_scale_values = affine_param_fixture(gate_up_config.scale_or_bias_bytes() / size_of::<u16>());
         let gate_up_scales = bf16_buffer(&device, &gate_up_scale_values);
-        let gate_up_bias_values = zero_fixture(gate_up_shape.affine_param_bytes() / size_of::<u16>());
+        let gate_up_bias_values = zero_fixture(gate_up_config.scale_or_bias_bytes() / size_of::<u16>());
         let gate_up_biases = bf16_buffer(&device, &gate_up_bias_values);
-        let down_weight_values = quantized_weight_values(down_shape.weight_bytes());
+        let down_weight_values = quantized_weight_values(down_config.weight_bytes());
         let down_weight = Buffer::from_slice(&device, &down_weight_values);
-        let down_scale_values = affine_param_fixture(down_shape.affine_param_bytes() / size_of::<u16>());
+        let down_scale_values = affine_param_fixture(down_config.scale_or_bias_bytes() / size_of::<u16>());
         let down_scales = bf16_buffer(&device, &down_scale_values);
-        let down_bias_values = zero_fixture(down_shape.affine_param_bytes() / size_of::<u16>());
+        let down_bias_values = zero_fixture(down_config.scale_or_bias_bytes() / size_of::<u16>());
         let down_biases = bf16_buffer(&device, &down_bias_values);
         let weights = QuantizedDenseMLPWeights {
             gate_up_weight: &gate_up_weight,
@@ -616,39 +552,39 @@ mod tests {
         let random_seed = 0x5D2A_91C7;
         let config = QuantizedDenseMLPConfig {
             hidden_dim: 64,
-            intermediate_dim: 64,
+            intermediate_dim: 4160,
             group_size: 32,
             bits: 4,
             dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedDenseMLPShape { num_tokens: 5 };
+        let shape = QuantizedDenseMLPShape { num_tokens: 7 };
         let (device, kernels) = create_dense_mlp_kernels(config);
         let stream = Stream::new(&device);
-        let gate_up_shape = config.gate_up_shape(shape);
-        let down_shape = config.down_shape(shape);
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
         let hidden_values = generated_values(shape.num_tokens as usize * config.hidden_dim as usize, random_seed);
         let hidden_state = bf16_buffer(&device, &hidden_values);
-        let gate_up_weight_values = generated_bytes(gate_up_shape.weight_bytes(), random_seed.wrapping_add(1));
+        let gate_up_weight_values = generated_bytes(gate_up_config.weight_bytes(), random_seed.wrapping_add(1));
         let gate_up_weight = Buffer::from_slice(&device, &gate_up_weight_values);
         let gate_up_scale_values = generated_scales(
-            gate_up_shape.affine_param_bytes() / size_of::<u16>(),
+            gate_up_config.scale_or_bias_bytes() / size_of::<u16>(),
             random_seed.wrapping_add(2),
         );
         let gate_up_scales = bf16_buffer(&device, &gate_up_scale_values);
         let gate_up_bias_values = generated_biases(
-            gate_up_shape.affine_param_bytes() / size_of::<u16>(),
+            gate_up_config.scale_or_bias_bytes() / size_of::<u16>(),
             random_seed.wrapping_add(3),
         );
         let gate_up_biases = bf16_buffer(&device, &gate_up_bias_values);
-        let down_weight_values = generated_bytes(down_shape.weight_bytes(), random_seed.wrapping_add(4));
+        let down_weight_values = generated_bytes(down_config.weight_bytes(), random_seed.wrapping_add(4));
         let down_weight = Buffer::from_slice(&device, &down_weight_values);
         let down_scale_values = generated_scales(
-            down_shape.affine_param_bytes() / size_of::<u16>(),
+            down_config.scale_or_bias_bytes() / size_of::<u16>(),
             random_seed.wrapping_add(5),
         );
         let down_scales = bf16_buffer(&device, &down_scale_values);
         let down_bias_values = generated_biases(
-            down_shape.affine_param_bytes() / size_of::<u16>(),
+            down_config.scale_or_bias_bytes() / size_of::<u16>(),
             random_seed.wrapping_add(6),
         );
         let down_biases = bf16_buffer(&device, &down_bias_values);

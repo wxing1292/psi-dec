@@ -111,37 +111,38 @@ impl QuantizedDenseMLPFixture {
             dtype: Dtype::Bfloat16,
         };
         let shape = QuantizedDenseMLPShape { num_tokens: tokens };
-        let gate_up_shape = config.gate_up_shape(shape);
-        let down_shape = config.down_shape(shape);
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
+        let tokens_i32 = tokens.try_into().expect("dense MLP token count must fit i32");
         let stream = Stream::new(device);
         let kernels = QuantizedDenseMLPKernels::new(device, config);
         let buffers = QuantizedDenseMLPOwnedBuffers {
             hidden_state: bf16_buffer(device, &hidden_fixture(tokens as usize, profile.hidden_dim as usize)),
-            replay_next_hidden_state: Buffer::new_zeroed(device, down_shape.output_bytes()),
+            replay_next_hidden_state: Buffer::new_zeroed(device, down_config.output_bytes(tokens_i32)),
         };
         let scratch = QuantizedDenseMLPOwnedScratch {
-            gate_up_proj: Buffer::new_zeroed(device, gate_up_shape.output_bytes()),
+            gate_up_proj: Buffer::new_zeroed(device, gate_up_config.output_bytes(tokens_i32)),
             activation: Buffer::new_zeroed(device, config.activation_shape(shape).bytes()),
             replay_activation: Buffer::new_zeroed(device, config.activation_shape(shape).bytes()),
         };
         let weights = QuantizedDenseMLPOwnedWeights {
-            gate_up_weight: quantized_weight(device, gate_up_shape.weight_bytes()),
+            gate_up_weight: quantized_weight(device, gate_up_config.weight_bytes()),
             gate_up_scales: bf16_buffer(
                 device,
-                &affine_param_fixture(gate_up_shape.affine_param_bytes() / size_of::<u16>()),
+                &affine_param_fixture(gate_up_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
             gate_up_biases: bf16_buffer(
                 device,
-                &zero_fixture(gate_up_shape.affine_param_bytes() / size_of::<u16>()),
+                &zero_fixture(gate_up_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
-            down_weight: quantized_weight(device, down_shape.weight_bytes()),
+            down_weight: quantized_weight(device, down_config.weight_bytes()),
             down_scales: bf16_buffer(
                 device,
-                &affine_param_fixture(down_shape.affine_param_bytes() / size_of::<u16>()),
+                &affine_param_fixture(down_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
             down_biases: bf16_buffer(
                 device,
-                &zero_fixture(down_shape.affine_param_bytes() / size_of::<u16>()),
+                &zero_fixture(down_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
         };
         let gate_up_activation_replay =

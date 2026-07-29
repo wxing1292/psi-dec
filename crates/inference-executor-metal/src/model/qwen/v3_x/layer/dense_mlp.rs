@@ -1,6 +1,5 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::QuantizedDenseMLPShape;
 use inference_backend_metal::components::QuantizedDenseMLPWeights;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -94,7 +93,6 @@ impl DenseMLPWeightBuffers {
         let down_scales = typed_tensor(store, &bindings.down.scales, safetensors::Dtype::BF16)?.into_data();
         let down_biases = typed_tensor(store, &bindings.down.biases, safetensors::Dtype::BF16)?.into_data();
 
-        let shape = QuantizedDenseMLPShape { num_tokens: 1 };
         let config = inference_backend_metal::components::QuantizedDenseMLPConfig {
             hidden_dim: to_u32("dense hidden_dim", core.hidden_dim)?,
             intermediate_dim: to_u32("dense intermediate_dim", core.intermediate_dim)?,
@@ -102,29 +100,37 @@ impl DenseMLPWeightBuffers {
             bits: metal.bits,
             dtype: metal.dtype,
         };
-        let gate_up_shape = config.gate_up_shape(shape);
-        let down_shape = config.down_shape(shape);
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
         let gate_up_weight = concat_bytes(&[&gate_weight, &up_weight]);
         let gate_up_scales = concat_bytes(&[&gate_scales, &up_scales]);
         let gate_up_biases = concat_bytes(&[&gate_biases, &up_biases]);
         validate_len(
             "dense gate_up weight",
             gate_up_weight.len(),
-            gate_up_shape.weight_bytes(),
+            gate_up_config.weight_bytes(),
         )?;
         validate_len(
             "dense gate_up scales",
             gate_up_scales.len(),
-            gate_up_shape.affine_param_bytes(),
+            gate_up_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "dense gate_up biases",
             gate_up_biases.len(),
-            gate_up_shape.affine_param_bytes(),
+            gate_up_config.scale_or_bias_bytes(),
         )?;
-        validate_len("dense down weight", down_weight.len(), down_shape.weight_bytes())?;
-        validate_len("dense down scales", down_scales.len(), down_shape.affine_param_bytes())?;
-        validate_len("dense down biases", down_biases.len(), down_shape.affine_param_bytes())?;
+        validate_len("dense down weight", down_weight.len(), down_config.weight_bytes())?;
+        validate_len(
+            "dense down scales",
+            down_scales.len(),
+            down_config.scale_or_bias_bytes(),
+        )?;
+        validate_len(
+            "dense down biases",
+            down_biases.len(),
+            down_config.scale_or_bias_bytes(),
+        )?;
         Ok(Self {
             gate_up_weight: Buffer::from_slice(device, &gate_up_weight),
             gate_up_scales: Buffer::from_slice(device, &gate_up_scales),
