@@ -55,14 +55,14 @@ use crate::model::qwen::v3_5::mtp::Qwen35MTPReplayKey;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedArgs;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedReplayKey;
-use crate::model::qwen::v3_5::rejection_sampling::Qwen35PreparedRejection;
-use crate::model::qwen::v3_5::rejection_sampling::Qwen35RejectionSamplingInput;
-use crate::model::qwen::v3_5::rejection_sampling::Qwen35TargetRejectionReplayKey;
-use crate::model::qwen::v3_5::rejection_sampling::RejectionSampling;
-use crate::model::qwen::v3_5::rejection_sampling::RejectionSamplingInput;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::replay::Replay;
+use crate::sampling::rejection_replay::PreparedRejection;
+use crate::sampling::rejection_replay::RejectionReplayKey;
+use crate::sampling::rejection_replay::RejectionSamplerInput;
+use crate::sampling::rejection_replay::RejectionSampling;
+use crate::sampling::rejection_replay::RejectionSamplingInput;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_replay::DraftSampling;
 use crate::sampling::top_k_replay::DraftSamplingInput;
@@ -133,9 +133,9 @@ pub struct Qwen35ModelOpsRecorder {
     gather_unembed_key: Option<Qwen35GatherUnembedReplayKey>,
     sampling_key: Option<TopKSamplingReplayKey>,
     sampling_arguments: ReplayArguments,
-    rejection_key: Option<Qwen35TargetRejectionReplayKey>,
+    rejection_key: Option<RejectionReplayKey>,
     rejection_arguments: ReplayArguments,
-    rejection_prepared: Option<Qwen35PreparedRejection>,
+    rejection_prepared: Option<PreparedRejection>,
     rejection_build_elapsed: Duration,
     num_sample_tokens: usize,
     mtp_embed_key: Option<Qwen35MTPEmbedReplayKey>,

@@ -59,8 +59,8 @@ path = "benches/gdn/state_io.rs"
 harness = false
 
 [[bench]]
-name = "sampling_rejection"
-path = "benches/sampling_rejection.rs"
+name = "rejection_sampling"
+path = "benches/rejection_sampling.rs"
 harness = false
 
 [[bench]]

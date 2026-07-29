@@ -20,7 +20,7 @@ use crate::sampling::top_k_sampling::TopKSampling;
 use crate::sampling::top_k_sampling::TopKSamplingInputs;
 use crate::sampling::top_k_sampling::TopKSamplingSparseDistributionOutput;
 
-pub struct Qwen35RejectionSampler {
+pub struct RejectionSampler {
     sparse_sampler: SparseRejectionSampling,
     max_requests: usize,
     max_num_spec_tokens: usize,
@@ -37,7 +37,7 @@ pub struct Qwen35RejectionSampler {
 }
 
 #[derive(Clone, Copy)]
-pub struct Qwen35RejectionSamplingInput<'a> {
+pub struct RejectionSamplerInput<'a> {
     pub num_active_decode_reqs: usize,
     pub num_decode_req_capacity: usize,
     pub num_target_distribution_capacity: usize,
@@ -51,12 +51,12 @@ pub struct Qwen35RejectionSamplingInput<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct Qwen35PreparedRejection {
+pub struct PreparedRejection {
     pub decode_req_indices: Vec<usize>,
     pub num_active_draft_distributions: usize,
 }
 
-impl Qwen35RejectionSamplingInput<'_> {
+impl RejectionSamplerInput<'_> {
     fn num_active_target_distributions(self) -> usize {
         self.num_active_draft_distributions
             .checked_add(self.num_active_decode_reqs)
@@ -64,7 +64,7 @@ impl Qwen35RejectionSamplingInput<'_> {
     }
 }
 
-pub struct Qwen35RejectionResults {
+pub struct RejectionResults {
     flat_accepted_token_ids: Vec<i32>,
     flat_accepted_probs: Vec<f32>,
     num_accepted_tokens: Vec<u32>,
@@ -72,7 +72,7 @@ pub struct Qwen35RejectionResults {
     sampled_token_probs: Vec<f32>,
 }
 
-impl Qwen35RejectionResults {
+impl RejectionResults {
     pub fn num_accepted_tokens(&self, decode_req_index: usize) -> usize {
         self.num_accepted_tokens[decode_req_index]
             .try_into()
@@ -96,7 +96,7 @@ impl Qwen35RejectionResults {
     }
 }
 
-impl Qwen35PreparedRejection {
+impl PreparedRejection {
     pub fn num_active_decode_reqs(&self) -> usize {
         self.decode_req_indices.len()
     }
@@ -108,8 +108,8 @@ impl Qwen35PreparedRejection {
     }
 }
 
-impl Qwen35RejectionSampler {
-    fn validate_input(&self, input: Qwen35RejectionSamplingInput<'_>) {
+impl RejectionSampler {
+    fn validate_input(&self, input: RejectionSamplerInput<'_>) {
         assert!(input.top_k > 0, "qwen3.5 rejection top_k is empty");
         assert!(
             input.num_active_target_distributions() <= input.num_target_distribution_capacity,
@@ -182,7 +182,7 @@ impl Qwen35RejectionSampler {
         &self,
         microbatch: &Qwen35Microbatch,
         flat_draft_distribution_indices: &[u32],
-    ) -> Qwen35PreparedRejection {
+    ) -> PreparedRejection {
         let decode_req_indices = (0..microbatch.num_reqs())
             .filter(|&req_index| microbatch.is_decode_req(req_index))
             .collect::<Vec<_>>();
@@ -246,13 +246,13 @@ impl Qwen35RejectionSampler {
         self.flat_draft_token_ids.write_typed(0, &flat_draft_tokens);
         self.flat_draft_distribution_indices
             .write_typed(0, flat_draft_distribution_indices);
-        Qwen35PreparedRejection {
+        PreparedRejection {
             decode_req_indices,
             num_active_draft_distributions: num_draft_distributions,
         }
     }
 
-    pub fn record<'a, R>(&'a self, recorder: &mut R, input: Qwen35RejectionSamplingInput<'a>)
+    pub fn record<'a, R>(&'a self, recorder: &mut R, input: RejectionSamplerInput<'a>)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -280,13 +280,13 @@ impl Qwen35RejectionSampler {
         );
     }
 
-    pub fn add_replay_arguments(&self, input: Qwen35RejectionSamplingInput<'_>, arguments: &mut ReplayArguments) {
+    pub fn add_replay_arguments(&self, input: RejectionSamplerInput<'_>, arguments: &mut ReplayArguments) {
         self.validate_input(input);
         self.sparse_sampler
             .add_replay_arguments(self.sampling_shape(input), arguments);
     }
 
-    fn sampling_shape(&self, input: Qwen35RejectionSamplingInput<'_>) -> SparseRejectionSamplingShape {
+    fn sampling_shape(&self, input: RejectionSamplerInput<'_>) -> SparseRejectionSamplingShape {
         SparseRejectionSamplingShape {
             num_active_reqs: input
                 .num_active_decode_reqs
@@ -322,10 +322,10 @@ impl Qwen35RejectionSampler {
         self.sparse_sampler.set_runtime_params(params);
     }
 
-    pub fn read_results(&self, num_decode_reqs: usize, num_draft_distributions: usize) -> Qwen35RejectionResults {
+    pub fn read_results(&self, num_decode_reqs: usize, num_draft_distributions: usize) -> RejectionResults {
         debug_assert!(num_decode_reqs <= self.max_requests);
         debug_assert!(num_draft_distributions <= self.max_requests * self.max_num_spec_tokens);
-        Qwen35RejectionResults {
+        RejectionResults {
             flat_accepted_token_ids: self
                 .flat_accepted_token_ids
                 .read_typed::<i32>(0, num_draft_distributions),
@@ -344,12 +344,12 @@ mod tests {
     use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
     use inference_executor_core::sampling::SamplerConfig;
 
-    use super::Qwen35RejectionSampler;
+    use super::RejectionSampler;
 
     #[test]
     fn test_ragged_inputs() {
         let device = Device::system_default();
-        let sampler = Qwen35RejectionSampler::new(&device, 3, 4, 4);
+        let sampler = RejectionSampler::new(&device, 3, 4, 4);
         let batch = Qwen35Microbatch::new(
             vec![0, 2],
             vec![0, 0],
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn test_mixed_inputs() {
         let device = Device::system_default();
-        let sampler = Qwen35RejectionSampler::new(&device, 2, 4, 4);
+        let sampler = RejectionSampler::new(&device, 2, 4, 4);
         let batch = Qwen35Microbatch::new(
             vec![0, 1, 2],
             vec![0, 0, 0],
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn test_zero_drafts() {
         let device = Device::system_default();
-        let sampler = Qwen35RejectionSampler::new(&device, 2, 4, 4);
+        let sampler = RejectionSampler::new(&device, 2, 4, 4);
         let batch = Qwen35Microbatch::new(
             vec![0, 1],
             vec![0, 0],
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn test_result_prefixes() {
         let device = Device::system_default();
-        let sampler = Qwen35RejectionSampler::new(&device, 2, 4, 4);
+        let sampler = RejectionSampler::new(&device, 2, 4, 4);
         sampler.flat_accepted_token_ids.write_typed(0, &[11_i32, 12, 21]);
         sampler.flat_accepted_probs.write_typed(0, &[0.1_f32, 0.2, 0.3]);
         sampler.num_accepted_tokens.write_typed(0, &[2_u32, 1]);
@@ -456,15 +456,15 @@ mod tests {
 
 pub struct RejectionSampling {
     sampler: Rc<TopKSampling>,
-    rejector: Rc<Qwen35RejectionSampler>,
+    rejector: Rc<RejectionSampler>,
 }
 
 impl RejectionSampling {
-    pub fn new(sampler: Rc<TopKSampling>, rejector: Rc<Qwen35RejectionSampler>) -> Self {
+    pub fn new(sampler: Rc<TopKSampling>, rejector: Rc<RejectionSampler>) -> Self {
         Self { sampler, rejector }
     }
 
-    pub fn rejector(&self) -> &Rc<Qwen35RejectionSampler> {
+    pub fn rejector(&self) -> &Rc<RejectionSampler> {
         &self.rejector
     }
 }
@@ -474,15 +474,15 @@ pub struct RejectionSamplingInput<'a> {
     pub target_shape: TopKSamplingShape,
     pub logits: &'a Buffer,
     pub target_sparse: TopKSamplingSparseDistributionOutput<'a>,
-    pub rejection: Qwen35RejectionSamplingInput<'a>,
+    pub rejection: RejectionSamplerInput<'a>,
 }
 
 impl ReplayComponent for RejectionSampling {
-    type Key = Qwen35TargetRejectionReplayKey;
+    type Key = RejectionReplayKey;
     type Input<'a> = RejectionSamplingInput<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Qwen35TargetRejectionReplayKey {
+        RejectionReplayKey {
             num_decode_req_capacity: input.rejection.num_decode_req_capacity,
             num_target_distribution_capacity: input.rejection.num_target_distribution_capacity,
             num_draft_distribution_capacity: input.rejection.num_draft_distribution_capacity,
@@ -505,14 +505,14 @@ impl ReplayComponent for RejectionSampling {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen35TargetRejectionReplayKey {
+pub struct RejectionReplayKey {
     num_decode_req_capacity: usize,
     num_target_distribution_capacity: usize,
     num_draft_distribution_capacity: usize,
     top_k: u32,
 }
 
-impl Qwen35TargetRejectionReplayKey {
+impl RejectionReplayKey {
     pub fn new(
         num_decode_req_capacity: usize,
         num_target_distribution_capacity: usize,

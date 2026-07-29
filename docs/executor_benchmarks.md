@@ -46,7 +46,7 @@ dense_mlp  sparse_mlp  moe  gqa_attn  gdn_attn  gdn_state_io
 embedding  unembedding  norm
 ```
 
-`sampling_rejection` is the backend custom-CLI target. Model-executor targets:
+`rejection_sampling` is the backend custom-CLI target. Model-executor targets:
 
 ```text
 qwen3_gqa         qwen35_dense_mlp  qwen35_moe  qwen35_gqa  qwen35_gdn

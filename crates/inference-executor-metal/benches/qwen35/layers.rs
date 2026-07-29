@@ -315,7 +315,7 @@ impl BlockFixture {
                     pages: self.pages.buffer(),
                     residual_input: hidden,
                     residual_output: layer.residual_output(),
-                    residual_capture_target: None,
+                    residual_capture_dest: None,
                 },
             );
         }

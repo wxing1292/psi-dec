@@ -71,7 +71,7 @@ pub struct Qwen35MainLayerInput<'a> {
     pub pages: &'a Buffer,
     pub residual_input: &'a Buffer,
     pub residual_output: &'a Buffer,
-    pub residual_capture_target: Option<ResidualCaptureTarget<'a>>,
+    pub residual_capture_dest: Option<ResidualCaptureTarget<'a>>,
 }
 
 enum Qwen35MainAttentionInput<'a> {
@@ -217,7 +217,7 @@ impl ReplayLayer for Qwen35MainLayer {
             &self.scratch.post_attention_hidden,
             &self.scratch.branch_output,
             input.residual_output,
-            input.residual_capture_target,
+            input.residual_capture_dest,
         );
         input.residual_output
     }

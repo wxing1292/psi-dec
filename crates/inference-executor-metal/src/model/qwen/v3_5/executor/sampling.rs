@@ -188,13 +188,13 @@ impl Qwen35Executor {
                     .expect("qwen3.5 target-distribution capacity must fit u32"),
             );
         let top_k = target_distribution_shape.top_k;
-        let rejection_key = Qwen35TargetRejectionReplayKey::new(
+        let rejection_key = RejectionReplayKey::new(
             num_decode_req_capacity,
             num_target_distribution_capacity,
             num_draft_distribution_capacity,
             top_k,
         );
-        let rejection_input = Qwen35RejectionSamplingInput {
+        let rejection_input = RejectionSamplerInput {
             num_active_decode_reqs,
             num_decode_req_capacity,
             num_target_distribution_capacity,

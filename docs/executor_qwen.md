@@ -71,7 +71,6 @@ crates/inference-executor-metal/src/
         mod.rs              supported one-layer Qwen35MTP owner and replay key
         embed.rs            Qwen35MTPEmbed and its replay key
         layer.rs            Qwen35MTPLayer and role-specific scratch
-      rejection_sampling.rs Qwen35 rejection composition and result preparation
       plan.rs               Qwen35 component configuration, MTP validation, and dSpark plan
       dspark/                Qwen35 target/context/layer/Markov/speculator components
       executor/
@@ -87,6 +86,7 @@ crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs         TopKSampling and TopKSamplingOutputBuffers
   top_k_replay.rs           Sampling/DraftSampling replay components
   rejection_sampling.rs     generic sparse rejection Metal owner
+  rejection_replay.rs       shared Qwen rejection composition and result preparation
   spec_probs.rs             SpecProbsStore sparse draft/target probability workspace
 ```
 

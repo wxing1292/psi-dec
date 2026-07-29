@@ -43,12 +43,12 @@ use crate::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
 use crate::model::qwen::v3_5::plan::qwen35_layer_counts;
 use crate::model::qwen::v3_5::plan::qwen35_moe_core_and_metal;
 use crate::model::qwen::v3_5::plan::validate_qwen35_mtp_config;
-use crate::model::qwen::v3_5::rejection_sampling::Qwen35RejectionSampler;
-use crate::model::qwen::v3_5::rejection_sampling::RejectionSampling;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
+use crate::sampling::rejection_replay::RejectionSampler;
+use crate::sampling::rejection_replay::RejectionSampling;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_replay::DraftSampling;
 use crate::sampling::top_k_replay::Sampling;
@@ -526,7 +526,7 @@ fn init_qwen_3_5_model_inner(
     let pages = PageArena::new(&device, config.num_cache_pages, QWEN35_PAGE_SIZE_BYTES);
     let target_distribution_indices = Buffer::from_slice(&device, &(0..layout.max_tokens).collect::<Vec<_>>());
     let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));
-    let rejection_sampler = Rc::new(Qwen35RejectionSampler::new(
+    let rejection_sampler = Rc::new(RejectionSampler::new(
         &device,
         max_spec_tokens,
         config.max_requests,

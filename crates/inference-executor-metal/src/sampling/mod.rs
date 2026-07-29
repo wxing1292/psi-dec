@@ -1,6 +1,7 @@
 use std::cell::Cell;
 
 pub mod rejection_sampling;
+pub mod rejection_replay;
 pub mod spec_probs;
 pub mod top_k_replay;
 pub mod top_k_sampling;

@@ -42,13 +42,13 @@ pub struct Qwen3MainArgs<'a> {
     pub pages: &'a Buffer,
 }
 
-/// Selects capture targets for Qwen3 Main layer residual outputs.
+/// Selects capture destinations for Qwen3 Main layer residual outputs.
 ///
 /// Capture selection and destinations are fixed replay topology. The owner
 /// must keep returned buffers and their column ranges stable for the lifetime
-/// of Main, and targets must not alias Main workspaces.
+/// of Main, and destinations must not alias Main workspaces.
 pub trait Qwen3MainResidualCapture {
-    fn capture_target_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>>;
+    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>>;
 }
 
 impl Qwen3Main {
@@ -112,10 +112,10 @@ impl Qwen3Main {
                     pages: args.pages,
                     residual_input: hidden,
                     residual_output,
-                    residual_capture_target: self
+                    residual_capture_dest: self
                         .residual_capture
                         .as_ref()
-                        .and_then(|capture| capture.capture_target_for_model_layer(layer.layer_index())),
+                        .and_then(|capture| capture.capture_for_model_layer(layer.layer_index())),
                 },
             );
         }

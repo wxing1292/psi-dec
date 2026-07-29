@@ -1,3 +1,5 @@
+//! Benchmarks top-k sampling and sparse rejection components.
+
 use std::mem::size_of;
 use std::time::Duration;
 use std::time::Instant;

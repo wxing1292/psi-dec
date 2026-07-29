@@ -24,10 +24,8 @@ crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs       TopKSampling, parameter/scratch, and TopKSamplingOutputBuffers
   top_k_replay.rs         Sampling and DraftSampling replay components
   rejection_sampling.rs   generic sparse rejection Metal owner and bindings
+  rejection_replay.rs     shared Qwen microbatch preparation and RejectionSampling composition
   spec_probs.rs           SpecProbsStore sparse draft/target probability workspace
-
-crates/inference-executor-metal/src/model/qwen/v3_5/
-  rejection_sampling.rs   Qwen microbatch preparation and RejectionSampling composition
 ```
 
 Runtime core transports sampler configuration and sampled decisions.
@@ -142,7 +140,7 @@ GPU tests run serially under the repository Metal reservation/lock rules.
 Synthetic backend modes:
 
 ```text
-cargo bench -p inference-backend-metal --bench sampling_rejection -- \
+cargo bench -p inference-backend-metal --bench rejection_sampling -- \
   --mode top-k-sample --rows 1 --num-reqs 1 --spec-tokens 1 \
   --iters 1 --warmup-iters 0 --runs 1
 ```
