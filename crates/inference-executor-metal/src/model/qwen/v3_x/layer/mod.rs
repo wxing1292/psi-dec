@@ -9,3 +9,6 @@ pub use gqa::Qwen3xGQA;
 
 mod moe;
 pub use moe::Qwen3xMoE;
+
+mod ungated_gqa_weights;
+pub use ungated_gqa_weights::Qwen3xUngatedGQAWeightBuffers;

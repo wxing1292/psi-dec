@@ -17,6 +17,12 @@ crates/inference-executor-core/src/attn/
 
 crates/inference-executor-metal/src/attn/
   mod.rs                    Metal attention module exports
+  dspark/
+    backend.rs              DSpark history/block partial composition
+    context.rs              persistent DSpark context buffers
+    metadata.rs             fixed-block attention metadata
+    scratch.rs              proposal-local Q/K/V and SDPA scratch
+    state.rs                DSpark page-table and context state owner
   gqa/
     mod.rs                  GQA Metal module root
     batch_metadata.rs       state-domain-owned, capacity-sized GPU metadata updated per microbatch
@@ -28,6 +34,7 @@ crates/inference-executor-metal/src/attn/
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
+    dspark/                 independent Qwen3x DSpark model components
     layer/gqa.rs            Qwen3xGQA, private checkpoint weights, load, and record
     state/gqa.rs            Qwen3xGQAState page/metadata/reset lifecycle grouping
   v3/
@@ -136,7 +143,22 @@ the ungated QKV path.
 
 Qwen3 Main constructs `UngatedGQACore` and `UngatedGQA`.
 Qwen3.5 Main and MTP construct `GQACore` and gated `GQA`.
-Qwen3x DSpark foundations define a separate `UngatedDSparkGQACore`.
+Qwen3x DSpark defines a separate `UngatedDSparkGQACore` and `UngatedDSparkGQA`.
+The DSpark state owns a separate logical page table.
+Runtime page IDs remain in one allocation domain.
+The model executor splits each request block span into Main and DSpark spans.
+
+DSpark attention records two map sources:
+
+```text
+history_causal_sdpa_map = paged history map
+block_bidi_sdpa_map     = dense proposal-block map
+sdpa_reduce             = existing GQA partial reducer
+```
+
+The dense block K/V is temporary.
+`DSparkBlockScratch` owns it.
+The paged DSpark context K/V follows the runtime request-page lifecycle.
 
 Init-time component specialization supplies the head dimensions, head counts, RoPE constants, and page geometry. A
 model-specific runtime branch does not supply these values.

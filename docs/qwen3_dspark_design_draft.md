@@ -9,19 +9,19 @@ Current-component documents continue to describe current `src`.
 
 Current status:
 
-- Qwen3 is target-only.
+- Qwen3 is Main-only.
 - Qwen3.5 supports zero or one MTP module.
-- Qwen3.5 retains low-level DSpark-era components, configuration, bindings, conversion, and tests.
+- The Qwen3x subtree owns the new DSpark configuration, bindings, model components, attention state, and Markov
+  sampling.
 - No executor or service wires DSpark.
 - No end-to-end DSpark correctness or performance claim exists.
 
-The retained Qwen3.5 implementation is reference input.
-It is not the target Qwen3 design.
+The repository no longer contains the unwired Qwen3.5-era DSpark implementation.
 
 ## Confirmed scope
 
 The first Qwen3 DSpark milestone must use the official DeepSeek Qwen3 DSpark model contract.
-It must not directly wire the retained Qwen3.5-era low-level graph into `Qwen3Executor`.
+It must not reintroduce the removed Qwen3.5-era low-level graph into `Qwen3Executor`.
 
 The milestone must preserve these boundaries:
 
@@ -43,9 +43,9 @@ The design does not permit overlapping batch preparation or execution.
 GPU execution failures are terminal internal failures.
 The design does not provide recoverable GPU rollback.
 
-## Current foundation source
+## Current component source
 
-The repository currently contains these Qwen3x foundation files:
+The repository currently contains these Qwen3x component files:
 
 ```text
 crates/inference-executor-core/src/model/qwen/v3_x/dspark/
@@ -58,13 +58,18 @@ crates/inference-executor-core/src/bin/
 crates/inference-backend-metal/src/components/
   gqa_block_attention.rs
   metal/gqa_block_sdpa.metal
+
+crates/inference-executor-metal/src/
+  attn/dspark/
+  model/qwen/v3_x/dspark/
+  sampling/dspark_markov.rs
 ```
 
 The Qwen3.5 executor does not reference these components from its load or forward path.
 The Qwen3.5 loader supplies no DSpark capture owner.
 MTP remains the only speculator that Qwen3.5 executes.
 
-The retained components provide implementation evidence for:
+The current components implement:
 
 - Tensor names and affine layouts
 - Target-feature geometry
@@ -74,13 +79,13 @@ The retained components provide implementation evidence for:
 - Markov correction
 - Metal buffer and kernel contracts
 
-They do not define the new Qwen3 config, layer, batch, transaction, or executor contract.
+They do not define the Qwen3 batch, transaction, or executor contract.
 
 ## Official configuration contract
 
 The Qwen3 DSpark checkpoint uses a flat Hugging Face configuration.
-The new core type must be `Qwen3DSparkConfig`.
-It must parse the official field names directly.
+The core type is `Qwen3xDSparkConfig`.
+It parses the official field names directly.
 It must not contain `dflash_config` or `DSparkDFlashConfig`.
 
 The initial contract includes these fields when the checkpoint provides them:
@@ -106,12 +111,11 @@ confidence_head_with_markov
 vocab_size
 ```
 
-The implementation must follow the official Qwen3 DSpark checkpoint schema.
-It must remove the retained nested DFlash-era parser, validation, plan wiring, and tests when the new Qwen3 contract
-replaces them.
-It must not keep a compatibility alias for `dflash_config`.
+The implementation follows the official Qwen3 DSpark checkpoint schema.
+It removes the nested DFlash-era parser, validation, plan wiring, and tests.
+It does not keep a compatibility alias for `dflash_config`.
 
-`target_layer_ids` selects target decoder-layer outputs.
+The official `target_layer_ids` field selects Main decoder-layer outputs.
 The first milestone applies these requirements:
 
 - The list must not be empty.
@@ -120,7 +124,7 @@ The first milestone applies these requirements:
 - The value `-1` is unsupported.
 - Embedding outputs and final-norm sentinels are unsupported.
 
-If the current residual-capture location does not represent the official decoder-layer output, the Qwen3 capture owner
+If the current residual-capture location does not represent the official decoder-layer output, the Qwen3 Main capture owner
 must change.
 The implementation must not redefine the checkpoint field to match a retained seam.
 
@@ -469,15 +473,20 @@ Reason: Model semantics and CPU/GPU lifecycle must be stable before a replay abs
 
 ## Implementation order
 
-1. Add the official `Qwen3DSparkConfig`, validation, and exact weight-binding contract to
+Completed:
+
+1. Add the official `Qwen3xDSparkConfig`, validation, and exact weight-binding contract to
    `inference-executor-core`.
-2. Remove the retained nested DFlash-era configuration and its compatibility tests.
-3. Define `Qwen3DSparkLayer` and its Qwen3-specific Metal components.
-4. Define the DSpark block batch, target-feature context, and proposal transaction.
-5. Review the exact `Qwen3Executor` fields, target-capture owner, and draft unembedding owner before wiring them.
-6. Wire target capture and DSpark proposal through the generic Qwen executor lifecycle.
-7. Add checkpoint loading, deterministic component parity, and end-to-end target-rejection validation.
-8. Measure performance only after correctness and replay-cache behavior are stable.
+2. Remove the nested DFlash-era configuration and its compatibility tests.
+3. Define `Qwen3xDSparkLayer` and its Qwen3x Metal components.
+
+Remaining:
+
+1. Define the DSpark block batch, Main-feature context, and proposal transaction.
+2. Review the exact `Qwen3Executor` fields, Main-capture owner, and proposal unembedding owner before wiring them.
+3. Wire Main capture and DSpark proposal through the generic Qwen executor lifecycle.
+4. Add checkpoint loading, deterministic component parity, and end-to-end rejection validation.
+5. Measure performance only after correctness and replay-cache behavior are stable.
 
 The implementation must not start with a backend-neutral replay redesign.
 

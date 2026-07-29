@@ -6,7 +6,7 @@ use crate::sampling::SamplerConfig;
 const VOCAB_TILE_SIZE: u32 = 256;
 pub const MAX_TOP_K: usize = MAX_SAMPLING_TOP_K;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TopKSamplingShape {
     pub num_active_sampling_inputs: u32,
     pub num_total_sampling_inputs: u32,

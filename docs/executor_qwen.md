@@ -18,16 +18,15 @@ crates/inference-executor-core/src/model/qwen/v3/
 crates/inference-executor-core/src/model/qwen/v3_x/
   config.rs                 shared quantization, RoPE, and tensor-path value utilities
   weight_layout.rs          shared GQA/GDN/dense-MLP/MoE leaf binding types and helpers
+  dspark/
+    config.rs               Qwen3x DSpark configuration contract
+    weight_layout.rs        exact Qwen3x DSpark tensor binding tree
 
 crates/inference-executor-core/src/model/qwen/v3_5/
   config.rs                 Qwen35ModelConfig/Qwen35TextConfig parsing and normalization
   batch.rs                  Qwen35Microbatch, request, response, and sampled-decision contracts
   pending_transactions.rs   Qwen35 sequence-ordered pending transactions
   weight_layout.rs          exact Qwen35 Main/unembed/MTP binding trees
-  v3_x/dspark/
-    config.rs               Qwen3x DSpark configuration contract
-    weight_layout.rs        exact Qwen3x DSpark tensor binding tree
-
 crates/inference-executor-metal/src/
   replay.rs                 generic Replay<T> component/cache owner
   model/
@@ -38,6 +37,14 @@ crates/inference-executor-metal/src/
     residual.rs             shared residual-add/capture model component
     rms_norm.rs             shared weight-bearing RMS-normalization component
     qwen/v3_x/
+      dspark/
+        attention.rs       Qwen3x DSpark attention component
+        embed.rs           anchor and MASK embedding component
+        layer.rs           independent Qwen3xDSparkLayer role
+        main_feature.rs    selected Main-output projection
+        model.rs           DSpark context and proposal-body components
+        output.rs          DSpark gather/unembed component
+        plan.rs            validated Metal execution plan
       layer/
         gqa.rs              shared Qwen3xGQA leaf load and record
         gdn.rs              shared Qwen3xGDN leaf load and record
@@ -166,9 +173,9 @@ Each MTP owner removes its tensors before it creates Metal buffers.
 These role-specific layers can compose the same leaf components.
 They do not share a structural layer type.
 
-Qwen3 has no DSpark layer today.
-A future Qwen3 DSpark path must own a distinct role-specific type.
-It must not extend `Qwen3MainLayer`.
+Qwen3x owns an independent `Qwen3xDSparkLayer` role.
+It does not extend `Qwen3MainLayer` or `Qwen35MTPLayer`.
+The Qwen3 executor does not yet load or execute the DSpark components at this commit.
 
 `Qwen3xGQA` and `Qwen3xGDN` store compact per-kind layer indices, not model-layer indices, for page-table and
 state-arena addressing.
@@ -485,8 +492,9 @@ Main batch submission:
 
 The Qwen3x core subtree owns the DSpark configuration, exact weight bindings, and fixed-block geometry.
 The backend owns the dense block-SDPA component.
-Neither Qwen3 nor Qwen3.5 wires these foundations into an executor at this commit.
-[`dspark_design.md`](dspark_design.md) documents the current foundation boundary.
+The Qwen3x Metal subtree owns independent DSpark model, attention, output, and Markov-sampling components.
+Neither Qwen3 nor Qwen3.5 wires these components into an executor at this commit.
+[`dspark_design.md`](dspark_design.md) documents the current component boundary.
 
 ## Verification
 

@@ -23,6 +23,7 @@ crates/inference-backend-metal/src/components/
 crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs       TopKSampling, parameter/scratch, and TopKSamplingOutputBuffers
   top_k_replay.rs         Sampling and DraftSampling replay components
+  dspark_markov.rs        sequential DSpark Markov correction and sampling
   rejection_sampling.rs   generic sparse rejection Metal owner and bindings
   rejection_replay.rs     shared Qwen microbatch preparation and RejectionSampling composition
   spec_probs.rs           SpecProbsStore sparse draft/target probability workspace
@@ -124,6 +125,11 @@ The Qwen executor owns three distinct graph and cache stages:
 
 These stages share one `Rc<TopKSampling>` implementation and its parameter and scratch buffers.
 They retain separate replay keys and programs.
+
+`DSparkMarkovSampling` is an independent proposal component.
+It applies the Markov correction and samples the fixed block sequentially.
+It stores sparse draft distributions in `SpecProbsStore`.
+The Qwen3 executor does not record this component yet at this commit.
 
 Main and MTP forward token counts remain exact.
 The complete upstream model slice does not yet share an inactive-lane ABI.

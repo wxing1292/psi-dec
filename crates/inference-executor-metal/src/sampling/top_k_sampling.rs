@@ -438,7 +438,7 @@ impl TopKSampling {
                 .expect("top-k tile total thread count must fit u32");
             assert!(tile_num_active_threads <= tile_num_total_threads);
             assert_eq!(tile_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
-            arguments.set_u32(TOP_K_TILE_NUM_ACTIVE_THREADS_KEY, tile_num_active_threads);
+            arguments.set_shared_u32(TOP_K_TILE_NUM_ACTIVE_THREADS_KEY, tile_num_active_threads);
 
             let merge_num_active_threads = shape
                 .num_active_sampling_inputs
@@ -450,7 +450,7 @@ impl TopKSampling {
                 .expect("top-k merge total thread count must fit u32");
             assert!(merge_num_active_threads <= merge_num_total_threads);
             assert_eq!(merge_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
-            arguments.set_u32(TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY, merge_num_active_threads);
+            arguments.set_shared_u32(TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY, merge_num_active_threads);
         }
     }
 
