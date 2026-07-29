@@ -71,7 +71,7 @@ impl EmbeddingFixture {
             hidden_dim: profile.hidden_dim(),
             group_size: 64,
             bits: 4,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         };
         let shape = QuantizedEmbeddingShape { num_tokens: tokens };

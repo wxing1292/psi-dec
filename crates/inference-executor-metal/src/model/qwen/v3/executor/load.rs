@@ -95,7 +95,7 @@ pub struct Qwen3ModelLayout {
     pub hidden_dim: u32,
     pub group_size: u32,
     pub bits: u32,
-    pub affine_dtype: Dtype,
+    pub scale_bias_dtype: Dtype,
     pub hidden_dtype: Dtype,
     pub rms_norm_eps: f32,
 }
@@ -127,7 +127,7 @@ impl Qwen3ModelLayout {
                 .bits
                 .try_into()
                 .map_err(|_| ModelExecutorError::custom("qwen3 quantization bits must fit u32"))?,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
             hidden_dtype: Dtype::Bfloat16,
             rms_norm_eps: text.rms_norm_eps,
         })
@@ -140,7 +140,7 @@ impl Qwen3ModelLayout {
         assert!(matches!(self.group_size, 32 | 64 | 128));
         assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
         assert_eq!(self.hidden_dim % self.group_size, 0);
-        assert!(matches!(self.affine_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(matches!(self.scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
         assert_eq!(self.hidden_dtype, Dtype::Bfloat16);
         assert!(self.rms_norm_eps.is_finite() && self.rms_norm_eps > 0.0);
         i32::try_from(self.vocab_size).expect("qwen3 vocab index must fit i32");
@@ -157,7 +157,7 @@ impl Qwen3ModelLayout {
             hidden_dim: self.hidden_dim,
             group_size: self.group_size,
             bits: self.bits,
-            affine_dtype: self.affine_dtype,
+            scale_bias_dtype: self.scale_bias_dtype,
             output_dtype: self.hidden_dtype,
         }
     }
@@ -171,7 +171,7 @@ impl Qwen3ModelLayout {
             bits: self.bits,
             input_dtype: self.hidden_dtype,
             output_dtype: self.hidden_dtype,
-            affine_dtype: self.affine_dtype,
+            scale_bias_dtype: self.scale_bias_dtype,
         }
     }
 

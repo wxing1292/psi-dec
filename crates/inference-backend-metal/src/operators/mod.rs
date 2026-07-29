@@ -5,8 +5,10 @@ pub mod elementwise;
 mod mlx_headers;
 pub mod softmax;
 
+pub use affine_quantized::AffineQuantizedMatmul;
+pub use affine_quantized::AffineQuantizedMatmulConfig;
 pub use affine_quantized::AffineQuantizedMatmulKernel;
-pub use affine_quantized::AffineQuantizedMatmulShape;
+pub use affine_quantized::AffineQuantizedMatmulKernelKind;
 pub use affine_quantized::GatherAffineQuantizedMatmulKernel;
 pub use affine_quantized::GatherAffineQuantizedMatmulShape;
 pub use affine_quantized::RaggedExpertMajorAffineQuantizedGateUpSiluKernel;

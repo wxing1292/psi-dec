@@ -73,6 +73,18 @@ impl Kernel {
     pub fn as_raw_retained(&self) -> Retained<ProtocolObject<dyn MTLComputePipelineState>> {
         self.pipeline.clone()
     }
+
+    pub fn max_total_threads_per_threadblock(&self) -> usize {
+        self.pipeline.maxTotalThreadsPerThreadgroup()
+    }
+
+    pub fn thread_execution_width(&self) -> usize {
+        self.pipeline.threadExecutionWidth()
+    }
+
+    pub fn static_threadblock_memory_length(&self) -> usize {
+        self.pipeline.staticThreadgroupMemoryLength()
+    }
 }
 
 fn stable_hash(value: &str) -> u64 {

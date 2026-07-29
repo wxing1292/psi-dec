@@ -26,33 +26,30 @@ fn checked_bytes(name: &str, dimensions: &[usize], dtype: Dtype) -> usize {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct AffineQuantizedMatmulShape {
-    pub m: i32,
+pub struct AffineQuantizedMatmulConfig {
     pub n: i32,
     pub k: i32,
     pub group_size: i32,
     pub bits: i32,
     pub input_dtype: Dtype,
     pub output_dtype: Dtype,
-    pub affine_dtype: Dtype,
+    pub scale_bias_dtype: Dtype,
 }
 
-impl AffineQuantizedMatmulShape {
-    pub fn same_dtype(m: i32, n: i32, k: i32, group_size: i32, bits: i32, dtype: Dtype) -> Self {
+impl AffineQuantizedMatmulConfig {
+    pub fn same_dtype(n: i32, k: i32, group_size: i32, bits: i32, dtype: Dtype) -> Self {
         Self {
-            m,
             n,
             k,
             group_size,
             bits,
             input_dtype: dtype,
             output_dtype: dtype,
-            affine_dtype: dtype,
+            scale_bias_dtype: dtype,
         }
     }
 
     pub fn validate(self) {
-        assert!(self.m > 0);
         assert!(self.n > 0);
         assert!(self.k > 0);
         assert!(matches!(self.group_size, 32 | 64 | 128));
@@ -67,27 +64,25 @@ impl AffineQuantizedMatmulShape {
             Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
         ));
         assert!(matches!(
-            self.affine_dtype,
+            self.scale_bias_dtype,
             Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
         ));
     }
 
-    pub fn output_bytes(self) -> usize {
+    pub fn output_bytes(self, m: i32) -> usize {
         self.validate();
+        assert!(m > 0);
         checked_bytes(
             "affine matmul output",
-            &[self.m as usize, self.n as usize],
+            &[m as usize, self.n as usize],
             self.output_dtype,
         )
     }
 
-    pub fn input_bytes(self) -> usize {
+    pub fn input_bytes(self, m: i32) -> usize {
         self.validate();
-        checked_bytes(
-            "affine matmul input",
-            &[self.m as usize, self.k as usize],
-            self.input_dtype,
-        )
+        assert!(m > 0);
+        checked_bytes("affine matmul input", &[m as usize, self.k as usize], self.input_dtype)
     }
 
     pub fn weight_bytes(self) -> usize {
@@ -106,24 +101,32 @@ impl AffineQuantizedMatmulShape {
         ) / pack_factor as usize
     }
 
-    pub fn affine_param_bytes(self) -> usize {
+    pub fn scale_or_bias_bytes(self) -> usize {
         self.validate();
         checked_bytes(
-            "affine matmul parameter",
+            "affine matmul scale or bias",
             &[self.n as usize, (self.k / self.group_size) as usize],
-            self.affine_dtype,
+            self.scale_bias_dtype,
         )
     }
 
     fn uses_same_dtype(self) -> bool {
-        self.input_dtype == self.output_dtype && self.input_dtype == self.affine_dtype
+        self.input_dtype == self.output_dtype && self.input_dtype == self.scale_bias_dtype
     }
 }
 
 pub struct AffineQuantizedMatmulKernel {
-    shape: AffineQuantizedMatmulShape,
+    config: AffineQuantizedMatmulConfig,
+    kind: AffineQuantizedMatmulKernelKind,
     kernel: Kernel,
-    dispatch: AffineQuantizedDispatch,
+}
+
+pub struct AffineQuantizedMatmul {
+    config: AffineQuantizedMatmulConfig,
+    qmv_kernel: AffineQuantizedMatmulKernel,
+    qmm_bm8_bn32_kernel: AffineQuantizedMatmulKernel,
+    qmm_bm16_bn32_kernel: AffineQuantizedMatmulKernel,
+    qmm_bm32_bn32_kernel: AffineQuantizedMatmulKernel,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,8 +165,7 @@ impl AffineQuantizedGateUpSiluShape {
     }
 
     pub fn gate_up_weight_bytes(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: self.m,
+        AffineQuantizedMatmulConfig {
             n: self
                 .intermediate_dim
                 .checked_mul(2)
@@ -173,14 +175,13 @@ impl AffineQuantizedGateUpSiluShape {
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
         .weight_bytes()
     }
 
     pub fn gate_up_affine_param_bytes(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: self.m,
+        AffineQuantizedMatmulConfig {
             n: self
                 .intermediate_dim
                 .checked_mul(2)
@@ -190,22 +191,21 @@ impl AffineQuantizedGateUpSiluShape {
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
-        .affine_param_bytes()
+        .scale_or_bias_bytes()
     }
 
-    fn single_projection_shape(self) -> AffineQuantizedMatmulShape {
+    fn single_projection_config(self) -> AffineQuantizedMatmulConfig {
         self.validate();
-        AffineQuantizedMatmulShape {
-            m: self.m,
+        AffineQuantizedMatmulConfig {
             n: self.intermediate_dim,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
     }
 }
@@ -255,8 +255,8 @@ impl AffineQuantizedSplitGateUpSiluShape {
         self.gate_up_shape().gate_up_affine_param_bytes()
     }
 
-    fn single_projection_shape(self) -> AffineQuantizedMatmulShape {
-        self.gate_up_shape().single_projection_shape()
+    fn single_projection_config(self) -> AffineQuantizedMatmulConfig {
+        self.gate_up_shape().single_projection_config()
     }
 
     fn gate_up_shape(self) -> AffineQuantizedGateUpSiluShape {
@@ -319,31 +319,29 @@ impl GatherAffineQuantizedMatmulShape {
     }
 
     pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.n,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
         .weight_bytes()
     }
 
     pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.n,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
-        .affine_param_bytes()
+        .scale_or_bias_bytes()
     }
 }
 
@@ -395,31 +393,29 @@ impl GatherAffineQuantizedGateUpSiluShape {
     }
 
     pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.intermediate_dim,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
         .weight_bytes()
     }
 
     pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.intermediate_dim,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
-        .affine_param_bytes()
+        .scale_or_bias_bytes()
     }
 }
 
@@ -470,31 +466,29 @@ impl RaggedExpertMajorAffineQuantizedGateUpSiluShape {
     }
 
     pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.intermediate_dim,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
         .weight_bytes()
     }
 
     pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.intermediate_dim,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
-        .affine_param_bytes()
+        .scale_or_bias_bytes()
     }
 }
 
@@ -540,31 +534,29 @@ impl RaggedExpertMajorAffineQuantizedMatmulShape {
     }
 
     pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.n,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
         .weight_bytes()
     }
 
     pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulShape {
-            m: 1,
+        AffineQuantizedMatmulConfig {
             n: self.n,
             k: self.k,
             group_size: self.group_size,
             bits: self.bits,
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            affine_dtype: self.dtype,
+            scale_bias_dtype: self.dtype,
         }
-        .affine_param_bytes()
+        .scale_or_bias_bytes()
     }
 }
 
@@ -1357,11 +1349,13 @@ fn packed_dim(k: i32, bits: i32) -> i32 {
     total_bits / 32
 }
 
-#[derive(Clone, Copy, Debug)]
-enum AffineQuantizedDispatch {
-    QmmT { bm: usize, bn: usize, wm: usize, wn: usize },
-    QmvQuad { bn: usize },
-    Qmv { bn: usize, bk: usize },
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AffineQuantizedMatmulKernelKind {
+    QmvBn8Bk32,
+    QmvQuadBn64,
+    QmmBm8Bn32,
+    QmmBm16Bn32,
+    QmmBm32Bn32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1371,20 +1365,28 @@ enum AffineQuantizedGateUpSiluDispatch {
 }
 
 impl AffineQuantizedMatmulKernel {
-    pub fn new(device: &Device, shape: AffineQuantizedMatmulShape) -> Self {
-        shape.validate();
-        let (kernel_name, source, dispatch) = affine_kernel_source(shape);
+    pub fn new(device: &Device, config: AffineQuantizedMatmulConfig, kind: AffineQuantizedMatmulKernelKind) -> Self {
+        config.validate();
+        validate_kernel_kind(config, kind);
+        let (kernel_name, source) = affine_kernel_source(config, kind);
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self {
-            shape,
-            kernel,
-            dispatch,
+        if matches!(
+            kind,
+            AffineQuantizedMatmulKernelKind::QmmBm8Bn32 | AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        ) {
+            validate_qmm_bm8_bm16_bn32_pipeline(device, config, kind, &kernel);
         }
+        Self { config, kind, kernel }
+    }
+
+    pub fn kind(&self) -> AffineQuantizedMatmulKernelKind {
+        self.kind
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
+        m: i32,
         output: &'a Buffer,
         output_offset_bytes: usize,
         input: &'a Buffer,
@@ -1396,8 +1398,70 @@ impl AffineQuantizedMatmulKernel {
         biases: &'a Buffer,
         biases_offset_bytes: usize,
     ) -> AffineQuantizedMatmulInvocation<'a> {
-        self.invoke_with_shape(
-            self.shape,
+        assert!(m > 0);
+        AffineQuantizedMatmulInvocation {
+            kernel: self,
+            m,
+            output,
+            output_offset_bytes,
+            input,
+            input_offset_bytes,
+            weight,
+            weight_offset_bytes,
+            scales,
+            scales_offset_bytes,
+            biases,
+            biases_offset_bytes,
+        }
+    }
+}
+
+impl AffineQuantizedMatmul {
+    pub fn new(device: &Device, config: AffineQuantizedMatmulConfig) -> Self {
+        config.validate();
+        assert!(
+            config.uses_same_dtype(),
+            "adaptive affine quantized matmul requires one dtype"
+        );
+        let qmv_kind = select_qmv_kernel_kind(config);
+        Self {
+            config,
+            qmv_kernel: AffineQuantizedMatmulKernel::new(device, config, qmv_kind),
+            qmm_bm8_bn32_kernel: AffineQuantizedMatmulKernel::new(
+                device,
+                config,
+                AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+            ),
+            qmm_bm16_bn32_kernel: AffineQuantizedMatmulKernel::new(
+                device,
+                config,
+                AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
+            ),
+            qmm_bm32_bn32_kernel: AffineQuantizedMatmulKernel::new(
+                device,
+                config,
+                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke<'a>(
+        &'a self,
+        m: i32,
+        output: &'a Buffer,
+        output_offset_bytes: usize,
+        input: &'a Buffer,
+        input_offset_bytes: usize,
+        weight: &'a Buffer,
+        weight_offset_bytes: usize,
+        scales: &'a Buffer,
+        scales_offset_bytes: usize,
+        biases: &'a Buffer,
+        biases_offset_bytes: usize,
+    ) -> AffineQuantizedMatmulInvocation<'a> {
+        self.selected_kernel(m).invoke(
+            m,
             output,
             output_offset_bytes,
             input,
@@ -1411,34 +1475,14 @@ impl AffineQuantizedMatmulKernel {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn invoke_with_shape<'a>(
-        &'a self,
-        shape: AffineQuantizedMatmulShape,
-        output: &'a Buffer,
-        output_offset_bytes: usize,
-        input: &'a Buffer,
-        input_offset_bytes: usize,
-        weight: &'a Buffer,
-        weight_offset_bytes: usize,
-        scales: &'a Buffer,
-        scales_offset_bytes: usize,
-        biases: &'a Buffer,
-        biases_offset_bytes: usize,
-    ) -> AffineQuantizedMatmulInvocation<'a> {
-        AffineQuantizedMatmulInvocation {
-            kernel: self,
-            shape,
-            output,
-            output_offset_bytes,
-            input,
-            input_offset_bytes,
-            weight,
-            weight_offset_bytes,
-            scales,
-            scales_offset_bytes,
-            biases,
-            biases_offset_bytes,
+    pub fn selected_kernel(&self, m: i32) -> &AffineQuantizedMatmulKernel {
+        match select_kernel_kind(self.config, m) {
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32 | AffineQuantizedMatmulKernelKind::QmvQuadBn64 => {
+                &self.qmv_kernel
+            },
+            AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => &self.qmm_bm8_bn32_kernel,
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => &self.qmm_bm16_bn32_kernel,
+            AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => &self.qmm_bm32_bn32_kernel,
         }
     }
 }
@@ -1676,9 +1720,10 @@ impl AffineQuantizedSplitGateUpSiluInvocation<'_> {
     fn record_compute(self, builder: &CommandRecorder) {
         let shape = self.shape;
         validate_gate_up_silu_kernel_shape(self.kernel.shape.gate_up_shape(), shape.gate_up_shape());
-        let projection_shape = shape.single_projection_shape();
+        let projection_config = shape.single_projection_config();
         validate_buffer_ranges(
-            projection_shape,
+            projection_config,
+            shape.m,
             self.output,
             self.output_offset_bytes,
             self.input,
@@ -1691,7 +1736,8 @@ impl AffineQuantizedSplitGateUpSiluInvocation<'_> {
             self.gate_biases_offset_bytes,
         );
         validate_buffer_ranges(
-            projection_shape,
+            projection_config,
+            shape.m,
             self.output,
             self.output_offset_bytes,
             self.input,
@@ -1778,15 +1824,15 @@ impl AffineQuantizedGateUpSiluInvocation<'_> {
         builder.set_kernel(&self.kernel.kernel);
         match self.kernel.dispatch {
             AffineQuantizedGateUpSiluDispatch::QmmT { bm, bn, wm, wn } => {
-                let projection_shape = shape.single_projection_shape();
-                let weight_offset = projection_shape.weight_bytes();
-                let affine_offset = projection_shape.affine_param_bytes();
+                let projection_config = shape.single_projection_config();
+                let weight_offset = projection_config.weight_bytes();
+                let scale_bias_offset = projection_config.scale_or_bias_bytes();
                 builder.set_buffer_read(0, self.weight, self.weight_offset_bytes);
                 builder.set_buffer_read(1, self.scales, self.scales_offset_bytes);
                 builder.set_buffer_read(2, self.biases, self.biases_offset_bytes);
                 builder.set_buffer_read(3, self.weight, self.weight_offset_bytes + weight_offset);
-                builder.set_buffer_read(4, self.scales, self.scales_offset_bytes + affine_offset);
-                builder.set_buffer_read(5, self.biases, self.biases_offset_bytes + affine_offset);
+                builder.set_buffer_read(4, self.scales, self.scales_offset_bytes + scale_bias_offset);
+                builder.set_buffer_read(5, self.biases, self.biases_offset_bytes + scale_bias_offset);
                 builder.set_buffer_read(6, self.input, self.input_offset_bytes);
                 builder.set_buffer_write(7, self.output, self.output_offset_bytes);
                 builder.set_i32(8, shape.k);
@@ -1824,7 +1870,7 @@ impl AffineQuantizedGateUpSiluInvocation<'_> {
 
 pub struct AffineQuantizedMatmulInvocation<'a> {
     kernel: &'a AffineQuantizedMatmulKernel,
-    shape: AffineQuantizedMatmulShape,
+    m: i32,
     output: &'a Buffer,
     output_offset_bytes: usize,
     input: &'a Buffer,
@@ -1856,10 +1902,11 @@ impl AffineQuantizedMatmulInvocation<'_> {
         let scales_offset_bytes = self.scales_offset_bytes;
         let biases = self.biases;
         let biases_offset_bytes = self.biases_offset_bytes;
-        let shape = self.shape;
-        validate_matmul_kernel_shape(kernel.shape, shape);
+        let config = kernel.config;
+        let m = self.m;
         validate_buffer_ranges(
-            shape,
+            config,
+            m,
             output,
             output_offset_bytes,
             input,
@@ -1878,35 +1925,41 @@ impl AffineQuantizedMatmulInvocation<'_> {
         builder.set_buffer_read(2, biases, biases_offset_bytes);
         builder.set_buffer_read(3, input, input_offset_bytes);
         builder.set_buffer_write(4, output, output_offset_bytes);
-        builder.set_i32(5, shape.k);
-        builder.set_i32(6, shape.n);
+        builder.set_i32(5, config.k);
+        builder.set_i32(6, config.n);
 
-        match kernel.dispatch {
-            AffineQuantizedDispatch::QmmT { bm, bn, wm, wn } => {
-                builder.set_i32(7, shape.m);
+        match kernel.kind {
+            AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => {
+                builder.set_i32(7, m);
                 set_non_batched_qmm_metadata(builder);
                 builder.dispatch_threadblocks(
-                    (
-                        ceil_div_i32(shape.n, bn as i32) as usize,
-                        ceil_div_i32(shape.m, bm as i32) as usize,
-                        1,
-                    ),
-                    (32, wn, wm),
+                    (ceil_div_i32(config.n, 32) as usize, ceil_div_i32(m, 8) as usize, 1),
+                    (32, 2, 1),
                 );
             },
-            AffineQuantizedDispatch::QmvQuad { bn } => {
-                set_non_batched_qmv_metadata(builder);
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => {
+                builder.set_i32(7, m);
+                set_non_batched_qmm_metadata(builder);
                 builder.dispatch_threadblocks(
-                    (shape.m as usize, ceil_div_i32(shape.n, bn as i32) as usize, 1),
-                    (32, 1, 1),
+                    (ceil_div_i32(config.n, 32) as usize, ceil_div_i32(m, 16) as usize, 1),
+                    (32, 2, 1),
                 );
             },
-            AffineQuantizedDispatch::Qmv { bn, bk } => {
-                set_non_batched_qmv_metadata(builder);
+            AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => {
+                builder.set_i32(7, m);
+                set_non_batched_qmm_metadata(builder);
                 builder.dispatch_threadblocks(
-                    (shape.m as usize, ceil_div_i32(shape.n, bn as i32) as usize, 1),
-                    (bk, 2, 1),
+                    (ceil_div_i32(config.n, 32) as usize, ceil_div_i32(m, 32) as usize, 1),
+                    (32, 2, 2),
                 );
+            },
+            AffineQuantizedMatmulKernelKind::QmvQuadBn64 => {
+                set_non_batched_qmv_metadata(builder);
+                builder.dispatch_threadblocks((m as usize, ceil_div_i32(config.n, 64) as usize, 1), (32, 1, 1));
+            },
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32 => {
+                set_non_batched_qmv_metadata(builder);
+                builder.dispatch_threadblocks((m as usize, ceil_div_i32(config.n, 8) as usize, 1), (32, 2, 1));
             },
         }
     }
@@ -1940,7 +1993,8 @@ fn set_non_batched_qmm_metadata(builder: &CommandRecorder) {
 
 #[allow(clippy::too_many_arguments)]
 fn validate_buffer_ranges(
-    shape: AffineQuantizedMatmulShape,
+    config: AffineQuantizedMatmulConfig,
+    m: i32,
     output: &Buffer,
     output_offset_bytes: usize,
     input: &Buffer,
@@ -1952,55 +2006,42 @@ fn validate_buffer_ranges(
     biases: &Buffer,
     biases_offset_bytes: usize,
 ) {
-    shape.validate();
-    let output_bytes = shape.output_bytes();
-    let input_bytes = shape.input_bytes();
-    let weight_bytes = shape.weight_bytes();
-    let affine_param_bytes = shape.affine_param_bytes();
+    config.validate();
+    assert!(m > 0);
+    let output_bytes = config.output_bytes(m);
+    let input_bytes = config.input_bytes(m);
+    let weight_bytes = config.weight_bytes();
+    let scale_or_bias_bytes = config.scale_or_bias_bytes();
     assert!(
         output_offset_bytes + output_bytes <= output.len_bytes(),
-        "affine quantized matmul output range out of bounds: shape={shape:?} offset_bytes={output_offset_bytes} \
-         required_bytes={output_bytes} buffer_bytes={}",
+        "affine quantized matmul output range out of bounds: config={config:?} m={m} \
+         offset_bytes={output_offset_bytes} required_bytes={output_bytes} buffer_bytes={}",
         output.len_bytes()
     );
     assert!(
         input_offset_bytes + input_bytes <= input.len_bytes(),
-        "affine quantized matmul input range out of bounds: shape={shape:?} offset_bytes={input_offset_bytes} \
+        "affine quantized matmul input range out of bounds: config={config:?} m={m} offset_bytes={input_offset_bytes} \
          required_bytes={input_bytes} buffer_bytes={}",
         input.len_bytes()
     );
     assert!(
         weight_offset_bytes + weight_bytes <= weight.len_bytes(),
-        "affine quantized matmul weight range out of bounds: shape={shape:?} offset_bytes={weight_offset_bytes} \
+        "affine quantized matmul weight range out of bounds: config={config:?} offset_bytes={weight_offset_bytes} \
          required_bytes={weight_bytes} buffer_bytes={}",
         weight.len_bytes()
     );
     assert!(
-        scales_offset_bytes + affine_param_bytes <= scales.len_bytes(),
-        "affine quantized matmul scales range out of bounds: shape={shape:?} offset_bytes={scales_offset_bytes} \
-         required_bytes={affine_param_bytes} buffer_bytes={}",
+        scales_offset_bytes + scale_or_bias_bytes <= scales.len_bytes(),
+        "affine quantized matmul scales range out of bounds: config={config:?} offset_bytes={scales_offset_bytes} \
+         required_bytes={scale_or_bias_bytes} buffer_bytes={}",
         scales.len_bytes()
     );
     assert!(
-        biases_offset_bytes + affine_param_bytes <= biases.len_bytes(),
-        "affine quantized matmul biases range out of bounds: shape={shape:?} offset_bytes={biases_offset_bytes} \
-         required_bytes={affine_param_bytes} buffer_bytes={}",
+        biases_offset_bytes + scale_or_bias_bytes <= biases.len_bytes(),
+        "affine quantized matmul biases range out of bounds: config={config:?} offset_bytes={biases_offset_bytes} \
+         required_bytes={scale_or_bias_bytes} buffer_bytes={}",
         biases.len_bytes()
     );
-}
-
-fn validate_matmul_kernel_shape(
-    kernel_shape: AffineQuantizedMatmulShape,
-    invocation_shape: AffineQuantizedMatmulShape,
-) {
-    invocation_shape.validate();
-    debug_assert_eq!(kernel_shape.n, invocation_shape.n);
-    debug_assert_eq!(kernel_shape.k, invocation_shape.k);
-    debug_assert_eq!(kernel_shape.group_size, invocation_shape.group_size);
-    debug_assert_eq!(kernel_shape.bits, invocation_shape.bits);
-    debug_assert_eq!(kernel_shape.input_dtype, invocation_shape.input_dtype);
-    debug_assert_eq!(kernel_shape.output_dtype, invocation_shape.output_dtype);
-    debug_assert_eq!(kernel_shape.affine_dtype, invocation_shape.affine_dtype);
 }
 
 fn validate_gate_up_silu_kernel_shape(
@@ -2114,146 +2155,156 @@ fn validate_gate_up_silu_buffer_ranges(
     );
 }
 
-fn affine_kernel_source(shape: AffineQuantizedMatmulShape) -> (String, String, AffineQuantizedDispatch) {
-    if shape.uses_same_dtype() {
-        let type_string = metal_type_string(shape.input_dtype);
-        let (kernel_name, template_definition, dispatch) = affine_kernel_metadata_same_dtype(shape, type_string);
-        return (kernel_name, affine_quantized_source(&template_definition), dispatch);
+fn affine_kernel_source(
+    config: AffineQuantizedMatmulConfig,
+    kind: AffineQuantizedMatmulKernelKind,
+) -> (String, String) {
+    match kind {
+        AffineQuantizedMatmulKernelKind::QmvBn8Bk32 => affine_qmv_bn8_bk32_source(config),
+        AffineQuantizedMatmulKernelKind::QmvQuadBn64 => affine_qmv_quad_bn64_source(config),
+        AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => affine_qmm_bm8_bm16_bn32_source(config, 8),
+        AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => affine_qmm_bm8_bm16_bn32_source(config, 16),
+        AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => affine_qmm_bm32_bn32_source(config),
     }
+}
 
-    let input_type = metal_type_string(shape.input_dtype);
-    let output_type = metal_type_string(shape.output_dtype);
-    let affine_type = metal_type_string(shape.affine_dtype);
-    if shape.m >= qmv_batch_limit(shape.k, shape.n) {
-        let wm = 2;
-        let wn = 2;
-        let bm = 32;
-        let bn = 32;
-        let aligned = shape.n % 32 == 0;
+fn affine_qmm_bm8_bm16_bn32_source(config: AffineQuantizedMatmulConfig, bm: usize) -> (String, String) {
+    let type_string = metal_type_string(config.input_dtype);
+    let aligned = config.n % 32 == 0;
+    let kernel_name = format!(
+        "qmm_t_bm{bm}_bn32_{type_string}_gs_{}_b_{}_alN_{}",
+        config.group_size, config.bits, aligned,
+    );
+    let template_definition = template_definition(
+        &kernel_name,
+        "qmm_t_bm8_bm16_bn32",
+        &[
+            type_string.to_string(),
+            config.group_size.to_string(),
+            config.bits.to_string(),
+            aligned.to_string(),
+            bm.to_string(),
+        ],
+    );
+    (
+        kernel_name,
+        affine_quantized_source(&format!("{QMM_BM8_BM16_BN32_SOURCE}\n{template_definition}")),
+    )
+}
+
+fn affine_qmm_bm32_bn32_source(config: AffineQuantizedMatmulConfig) -> (String, String) {
+    let aligned = config.n % 32 == 0;
+    if !config.uses_same_dtype() {
+        let input_type = metal_type_string(config.input_dtype);
+        let output_type = metal_type_string(config.output_dtype);
+        let scale_bias_type = metal_type_string(config.scale_bias_dtype);
         let kernel_name = format!(
-            "mixed_qmm_t_{input_type}_{affine_type}_{output_type}_gs_{}_b_{}_alN_{}",
-            shape.group_size, shape.bits, aligned
+            "mixed_qmm_t_{input_type}_{scale_bias_type}_{output_type}_gs_{}_b_{}_alN_{}",
+            config.group_size, config.bits, aligned
         );
         let template_definition = template_definition(
             &kernel_name,
             "mixed_qmm_t",
             &[
                 input_type.to_string(),
-                affine_type.to_string(),
+                scale_bias_type.to_string(),
                 output_type.to_string(),
-                shape.group_size.to_string(),
-                shape.bits.to_string(),
+                config.group_size.to_string(),
+                config.bits.to_string(),
                 aligned.to_string(),
             ],
         );
         return (
             kernel_name,
             affine_quantized_source(&format!("{MIXED_AFFINE_SOURCE}\n{template_definition}")),
-            AffineQuantizedDispatch::QmmT { bm, bn, wm, wn },
         );
     }
 
-    let fast = shape.n % 8 == 0 && shape.k % 512 == 0;
-    let func = if fast { "mixed_qmv_fast" } else { "mixed_qmv" };
+    let type_string = metal_type_string(config.input_dtype);
     let kernel_name = format!(
-        "{func}_{input_type}_{affine_type}_{output_type}_gs_{}_b_{}",
-        shape.group_size, shape.bits
+        "qmm_t_{type_string}_gs_{}_b_{}_alN_{}_batch_0",
+        config.group_size, config.bits, aligned
     );
     let template_definition = template_definition(
         &kernel_name,
-        func,
-        &[
-            input_type.to_string(),
-            affine_type.to_string(),
-            output_type.to_string(),
-            shape.group_size.to_string(),
-            shape.bits.to_string(),
-        ],
-    );
-    (
-        kernel_name,
-        affine_quantized_source(&format!("{MIXED_AFFINE_SOURCE}\n{template_definition}")),
-        AffineQuantizedDispatch::Qmv { bn: 8, bk: 32 },
-    )
-}
-
-fn affine_kernel_metadata_same_dtype(
-    shape: AffineQuantizedMatmulShape,
-    type_string: &str,
-) -> (String, String, AffineQuantizedDispatch) {
-    if shape.m >= qmv_batch_limit(shape.k, shape.n) {
-        let wm = 2;
-        let wn = 2;
-        let bm = 32;
-        let bn = 32;
-        let aligned = shape.n % 32 == 0;
-        let kernel_name = format!(
-            "qmm_t_{type_string}_gs_{}_b_{}_alN_{}_batch_0",
-            shape.group_size, shape.bits, aligned
-        );
-        let template_definition = template_definition(
-            &kernel_name,
-            "qmm_t",
-            &[
-                type_string.to_string(),
-                shape.group_size.to_string(),
-                shape.bits.to_string(),
-                aligned.to_string(),
-                "false".to_string(),
-            ],
-        );
-        return (
-            kernel_name,
-            template_definition,
-            AffineQuantizedDispatch::QmmT { bm, bn, wm, wn },
-        );
-    }
-
-    if matches!(shape.k, 64 | 128) && is_power_of_two(shape.bits) {
-        let bn = 64;
-        let kernel_name = format!(
-            "qmv_quad_{type_string}_gs_{}_b_{}_d_{}_batch_0",
-            shape.group_size, shape.bits, shape.k
-        );
-        let template_definition = template_definition(
-            &kernel_name,
-            "qmv_quad",
-            &[
-                type_string.to_string(),
-                shape.group_size.to_string(),
-                shape.bits.to_string(),
-                shape.k.to_string(),
-                "false".to_string(),
-            ],
-        );
-        return (
-            kernel_name,
-            template_definition,
-            AffineQuantizedDispatch::QmvQuad { bn },
-        );
-    }
-
-    let bn = 8;
-    let bk = 32;
-    let fast = shape.n % bn as i32 == 0 && shape.k % 512 == 0;
-    let func = if fast { "qmv_fast" } else { "qmv" };
-    let kernel_name = format!("{func}_{type_string}_gs_{}_b_{}_batch_0", shape.group_size, shape.bits);
-    let template_func = if fast { "qmv_fast" } else { "qmv" };
-    let template_definition = template_definition(
-        &kernel_name,
-        template_func,
+        "qmm_t",
         &[
             type_string.to_string(),
-            shape.group_size.to_string(),
-            shape.bits.to_string(),
+            config.group_size.to_string(),
+            config.bits.to_string(),
+            aligned.to_string(),
             "false".to_string(),
         ],
     );
-    (
-        kernel_name,
-        template_definition,
-        AffineQuantizedDispatch::Qmv { bn, bk },
-    )
+    (kernel_name, affine_quantized_source(&template_definition))
+}
+
+fn affine_qmv_bn8_bk32_source(config: AffineQuantizedMatmulConfig) -> (String, String) {
+    if !config.uses_same_dtype() {
+        let input_type = metal_type_string(config.input_dtype);
+        let output_type = metal_type_string(config.output_dtype);
+        let scale_bias_type = metal_type_string(config.scale_bias_dtype);
+        let fast = config.n % 8 == 0 && config.k % 512 == 0;
+        let function_name = if fast { "mixed_qmv_fast" } else { "mixed_qmv" };
+        let kernel_name = format!(
+            "{function_name}_{input_type}_{scale_bias_type}_{output_type}_gs_{}_b_{}",
+            config.group_size, config.bits
+        );
+        let template_definition = template_definition(
+            &kernel_name,
+            function_name,
+            &[
+                input_type.to_string(),
+                scale_bias_type.to_string(),
+                output_type.to_string(),
+                config.group_size.to_string(),
+                config.bits.to_string(),
+            ],
+        );
+        return (
+            kernel_name,
+            affine_quantized_source(&format!("{MIXED_AFFINE_SOURCE}\n{template_definition}")),
+        );
+    }
+
+    let type_string = metal_type_string(config.input_dtype);
+    let fast = config.n % 8 == 0 && config.k % 512 == 0;
+    let function_name = if fast { "qmv_fast" } else { "qmv" };
+    let kernel_name = format!(
+        "{function_name}_{type_string}_gs_{}_b_{}_batch_0",
+        config.group_size, config.bits
+    );
+    let template_definition = template_definition(
+        &kernel_name,
+        function_name,
+        &[
+            type_string.to_string(),
+            config.group_size.to_string(),
+            config.bits.to_string(),
+            "false".to_string(),
+        ],
+    );
+    (kernel_name, affine_quantized_source(&template_definition))
+}
+
+fn affine_qmv_quad_bn64_source(config: AffineQuantizedMatmulConfig) -> (String, String) {
+    let type_string = metal_type_string(config.input_dtype);
+    let kernel_name = format!(
+        "qmv_quad_{type_string}_gs_{}_b_{}_d_{}_batch_0",
+        config.group_size, config.bits, config.k
+    );
+    let template_definition = template_definition(
+        &kernel_name,
+        "qmv_quad",
+        &[
+            type_string.to_string(),
+            config.group_size.to_string(),
+            config.bits.to_string(),
+            config.k.to_string(),
+            "false".to_string(),
+        ],
+    );
+    (kernel_name, affine_quantized_source(&template_definition))
 }
 
 fn affine_gate_up_silu_kernel_metadata(
@@ -2390,6 +2441,101 @@ fn qmv_batch_limit(input_dim: i32, output_dim: i32) -> i32 {
     }
 }
 
+fn adaptive_qmv_batch_limit(config: AffineQuantizedMatmulConfig) -> i32 {
+    if config.input_dtype == Dtype::Bfloat16 && config.n >= 65_536 {
+        if config.k <= 2048 { 5 } else { 6 }
+    } else if config.n > 4096 || config.k > 4096 {
+        6
+    } else {
+        qmv_batch_limit(config.k, config.n)
+    }
+}
+
+fn select_kernel_kind(config: AffineQuantizedMatmulConfig, m: i32) -> AffineQuantizedMatmulKernelKind {
+    config.validate();
+    assert!(m > 0);
+    if m < adaptive_qmv_batch_limit(config) {
+        select_qmv_kernel_kind(config)
+    } else if config.n < 65_536 && (config.n > 4096 || config.k > 4096) && m <= 8 {
+        AffineQuantizedMatmulKernelKind::QmmBm8Bn32
+    } else if m <= 16 {
+        AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+    } else {
+        AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+    }
+}
+
+fn select_qmv_kernel_kind(config: AffineQuantizedMatmulConfig) -> AffineQuantizedMatmulKernelKind {
+    if config.uses_same_dtype() && matches!(config.k, 64 | 128) && is_power_of_two(config.bits) {
+        AffineQuantizedMatmulKernelKind::QmvQuadBn64
+    } else {
+        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+    }
+}
+
+fn validate_kernel_kind(config: AffineQuantizedMatmulConfig, kind: AffineQuantizedMatmulKernelKind) {
+    match kind {
+        AffineQuantizedMatmulKernelKind::QmvBn8Bk32 | AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => {},
+        AffineQuantizedMatmulKernelKind::QmvQuadBn64 => {
+            assert!(
+                config.uses_same_dtype(),
+                "QMV quad BN=64 affine matmul requires one dtype"
+            );
+            assert!(
+                matches!(config.k, 64 | 128) && is_power_of_two(config.bits),
+                "QMV quad BN=64 affine matmul requires K=64 or K=128 and power-of-two weight bits"
+            );
+        },
+        AffineQuantizedMatmulKernelKind::QmmBm8Bn32 | AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => {
+            assert!(
+                config.uses_same_dtype(),
+                "QMM BM=8/16 BN=32 affine matmul requires one dtype"
+            );
+        },
+    }
+}
+
+fn validate_qmm_bm8_bm16_bn32_pipeline(
+    device: &Device,
+    config: AffineQuantizedMatmulConfig,
+    kind: AffineQuantizedMatmulKernelKind,
+    kernel: &Kernel,
+) {
+    let bm: usize = match kind {
+        AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => 8,
+        AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => 16,
+        _ => panic!("QMM BM=8/16 BN=32 pipeline validation requires a matching kernel kind"),
+    };
+    let num_threads = 2 * kernel.thread_execution_width();
+    assert_eq!(
+        kernel.thread_execution_width(),
+        32,
+        "QMM BM=8/16 BN=32 requires a 32-thread SIMDgroup"
+    );
+    assert!(
+        num_threads <= kernel.max_total_threads_per_threadblock(),
+        "QMM BM={bm} BN=32 requires {num_threads} threads, pipeline supports {}",
+        kernel.max_total_threads_per_threadblock()
+    );
+    let item_size = config.input_dtype.item_size();
+    let bk_padded = 32 + 16 / item_size;
+    let expected_threadblock_memory = (bm + 32)
+        .checked_mul(bk_padded)
+        .and_then(|elements| elements.checked_mul(item_size))
+        .expect("QMM BM=8/16 BN=32 threadblock memory must fit usize");
+    assert!(
+        expected_threadblock_memory <= device.max_threadblock_memory_length(),
+        "QMM BM={bm} BN=32 requires {expected_threadblock_memory} bytes of threadblock memory, device supports {}",
+        device.max_threadblock_memory_length()
+    );
+    assert!(
+        kernel.static_threadblock_memory_length() <= device.max_threadblock_memory_length(),
+        "QMM BM={bm} BN=32 pipeline uses {} bytes of threadblock memory, device supports {}",
+        kernel.static_threadblock_memory_length(),
+        device.max_threadblock_memory_length()
+    );
+}
+
 fn metal_type_string(dtype: Dtype) -> &'static str {
     match dtype {
         Dtype::Float32 => "float",
@@ -2427,1086 +2573,11 @@ fn affine_quantized_source(template_definition: &str) -> String {
     source
 }
 
-const MIXED_AFFINE_SOURCE: &str = r#"
-template <typename InT, typename ParamT, typename OutT, int group_size, int bits>
-[[kernel]] void mixed_qmv_fast(
-    const device uint32_t* w [[buffer(0)]],
-    const device ParamT* scales [[buffer(1)]],
-    const device ParamT* biases [[buffer(2)]],
-    const device InT* x [[buffer(3)]],
-    device OutT* y [[buffer(4)]],
-    const constant int& in_vec_size [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  (void)b_strides;
+const QMM_BM8_BM16_BN32_SOURCE: &str = include_str!("metal/affine_quantized_qmm_bm8_bm16_bn32.metal");
 
-  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
-  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
-  constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
-  constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits;
-  constexpr int bytes_per_pack = power_of_2_bits ? 4 : 3;
-  constexpr int values_per_thread = pack_factor * packs_per_thread;
-  constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int scale_step_per_thread = group_size / values_per_thread;
+const MIXED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_mixed_qmv_qmm.metal");
 
-  const device uint8_t* ws = (const device uint8_t*)w;
-  typedef float U;
-
-  thread U x_thread[values_per_thread];
-  thread U result[results_per_simdgroup] = {0};
-
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
-
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += tid.x * static_cast<int64_t>(in_vec_size) + simd_lid * values_per_thread;
-  y += tid.x * static_cast<int64_t>(out_vec_size) + out_row;
-
-  for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<InT, U, values_per_thread, bits>(x, x_thread);
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device ParamT* sl = scales + row * in_vec_size_g;
-      const device ParamT* bl = biases + row * in_vec_size_g;
-
-      U s = static_cast<U>(sl[0]);
-      U b = static_cast<U>(bl[0]);
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-    }
-
-    ws += block_size * bytes_per_pack / pack_factor;
-    scales += block_size / group_size;
-    biases += block_size / group_size;
-    x += block_size;
-  }
-
-  for (int row = 0; row < results_per_simdgroup; row++) {
-    result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
-      y[row] = static_cast<OutT>(result[row]);
-    }
-  }
-}
-
-template <typename InT, typename ParamT, typename OutT, int group_size, int bits>
-[[kernel]] void mixed_qmv(
-    const device uint32_t* w [[buffer(0)]],
-    const device ParamT* scales [[buffer(1)]],
-    const device ParamT* biases [[buffer(2)]],
-    const device InT* x [[buffer(3)]],
-    device OutT* y [[buffer(4)]],
-    const constant int& in_vec_size [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  (void)b_strides;
-
-  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
-  constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
-  constexpr int packs_per_thread = 2;
-  constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits;
-  constexpr int bytes_per_pack = power_of_2_bits ? 4 : 3;
-  constexpr int values_per_thread = pack_factor * packs_per_thread;
-  constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int scale_step_per_thread = group_size / values_per_thread;
-
-  const device uint8_t* ws = (const device uint8_t*)w;
-  typedef float U;
-
-  thread U x_thread[values_per_thread];
-  thread U result[results_per_simdgroup] = {0};
-
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
-
-  if (out_row >= out_vec_size) {
-    return;
-  }
-
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += tid.x * static_cast<int64_t>(in_vec_size) + simd_lid * values_per_thread;
-  y += tid.x * static_cast<int64_t>(out_vec_size) + out_row;
-
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
-    U sum = load_vector<InT, U, values_per_thread, bits>(x, x_thread);
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      if (out_row + row < out_vec_size) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        const device ParamT* sl = scales + row * in_vec_size_g;
-        const device ParamT* bl = biases + row * in_vec_size_g;
-        result[row] += qdot<U, values_per_thread, bits>(
-            wl, x_thread, static_cast<U>(sl[0]), static_cast<U>(bl[0]), sum);
-      }
-    }
-
-    ws += block_size * bytes_per_pack / pack_factor;
-    scales += block_size / group_size;
-    biases += block_size / group_size;
-    x += block_size;
-  }
-
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    U sum = load_vector_safe<InT, U, values_per_thread, bits>(x, x_thread, remaining);
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      if (out_row + row < out_vec_size) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        const device ParamT* sl = scales + row * in_vec_size_g;
-        const device ParamT* bl = biases + row * in_vec_size_g;
-        result[row] += qdot_safe<U, values_per_thread, bits>(
-            wl, x_thread, static_cast<U>(sl[0]), static_cast<U>(bl[0]), sum, remaining);
-      }
-    }
-  }
-
-  for (int row = 0; row < results_per_simdgroup; row++) {
-    if (out_row + row < out_vec_size) {
-      U value = simd_sum(result[row]);
-      if (simd_lid == 0) {
-        y[row] = static_cast<OutT>(value);
-      }
-    }
-  }
-}
-
-template <
-    typename InT,
-    typename OutT,
-    short BROWS,
-    short BCOLS,
-    short dst_ld,
-    short reduction_dim,
-    short tgp_size,
-    short alignment = 1,
-    short n_reads = (BCOLS * BROWS) / (tgp_size),
-    short TCOLS = BCOLS / n_reads,
-    short TROWS = tgp_size / TCOLS>
-struct PsiDecMixedBlockLoader {
-  STEEL_CONST short vec_size = n_reads;
-
-  const int src_ld;
-  const int tile_stride;
-  const short thread_idx;
-  const short bi;
-  const short bj;
-
-  threadgroup OutT* dst;
-  const device InT* src;
-
-  PsiDecMixedBlockLoader(
-      const device InT* src_,
-      const int src_ld_,
-      threadgroup OutT* dst_,
-      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
-      : src_ld(src_ld_),
-        tile_stride(reduction_dim ? BCOLS : BROWS * src_ld),
-        thread_idx(simd_group_id * 32 + simd_lane_id),
-        bi(thread_idx / TCOLS),
-        bj(vec_size * (thread_idx % TCOLS)),
-        dst(dst_ + bi * dst_ld + bj),
-        src(src_ + bi * src_ld + bj) {}
-
-  METAL_FUNC void load_unsafe() const {
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < BROWS; i += TROWS) {
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < vec_size; j++) {
-        dst[i * dst_ld + j] = static_cast<OutT>(src[i * src_ld + j]);
-      }
-    }
-  }
-
-  METAL_FUNC void load_safe(short2 src_tile_dim) const {
-    src_tile_dim = src_tile_dim - short2(bj, bi);
-
-    if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < BROWS; i += TROWS) {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < vec_size; j++) {
-          dst[i * dst_ld + j] = OutT(0);
-        }
-      }
-      return;
-    }
-
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < BROWS; i += TROWS) {
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < vec_size; j++) {
-        const bool valid = (i < src_tile_dim.y) && (j < src_tile_dim.x);
-        dst[i * dst_ld + j] = valid ? static_cast<OutT>(src[i * src_ld + j]) : OutT(0);
-      }
-    }
-  }
-
-  METAL_FUNC void next() {
-    src += tile_stride;
-  }
-};
-
-template <
-    typename ParamT,
-    typename OutT,
-    short BROWS,
-    short BCOLS,
-    short dst_ld,
-    short reduction_dim,
-    short tgp_size,
-    short group_size,
-    short bits>
-struct PsiDecMixedQuantizedBlockLoader {
-  static_assert(
-      BCOLS <= group_size,
-      "The group size should be larger than the columns");
-  static_assert(
-      group_size % BCOLS == 0,
-      "The group size should be divisible by the columns");
-  static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 6 || bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 6, 8}");
-
-  MLX_MTL_CONST short pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 8 / bits;
-  MLX_MTL_CONST short bytes_per_pack = (bits == 3 || bits == 6) ? 3 : 1;
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
-      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short group_steps = group_size / BCOLS;
-
-  const int src_ld;
-  const int tile_stride;
-  short group_step_cnt;
-  const int group_stride;
-
-  const short thread_idx;
-  const short bi;
-  const short bj;
-
-  threadgroup OutT* dst;
-  const device uint8_t* src;
-  const device ParamT* scales;
-  const device ParamT* biases;
-
-  PsiDecMixedQuantizedBlockLoader(
-      const device uint8_t* src_,
-      const device ParamT* scales_,
-      const device ParamT* biases_,
-      const int src_ld_,
-      threadgroup OutT* dst_,
-      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
-      : src_ld(src_ld_),
-        tile_stride(
-            reduction_dim ? BCOLS_PACKED * bytes_per_pack
-                          : BROWS * src_ld * bytes_per_pack / pack_factor),
-        group_step_cnt(0),
-        group_stride(BROWS * src_ld / group_size),
-        thread_idx(simd_group_id * 32 + simd_lane_id),
-        bi(n_reads * thread_idx / BCOLS_PACKED),
-        bj((n_reads * thread_idx) % BCOLS_PACKED),
-        dst(dst_ + bi * dst_ld + bj * pack_factor),
-        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
-            bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
-
-  METAL_FUNC void load_unsafe() const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-
-    OutT scale = static_cast<OutT>(*scales);
-    OutT bias = static_cast<OutT>(*biases);
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<OutT, pack_factor, bits>(
-          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
-    }
-  }
-
-  METAL_FUNC void load_safe(short2 src_tile_dim) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-
-    if (reduction_dim == 1 && bi >= src_tile_dim.y) {
-      for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = OutT(0);
-      }
-      return;
-    }
-
-    if (reduction_dim == 0 && bi >= src_tile_dim.x) {
-      for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = OutT(0);
-      }
-      return;
-    }
-
-    OutT scale = static_cast<OutT>(*scales);
-    OutT bias = static_cast<OutT>(*biases);
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<OutT, pack_factor, bits>(
-          (device uint8_t*)(src + i * bytes_per_pack),
-          scale,
-          bias,
-          dst + i * pack_factor);
-    }
-  }
-
-  METAL_FUNC void next() {
-    src += tile_stride;
-    if (reduction_dim == 1) {
-      if (group_steps > 1) {
-        group_step_cnt++;
-        if (group_step_cnt == group_steps) {
-          group_step_cnt = 0;
-          scales++;
-          biases++;
-        }
-      } else {
-        scales++;
-        biases++;
-      }
-    } else {
-      scales += group_stride;
-      biases += group_stride;
-    }
-  }
-};
-
-template <
-    typename InT,
-    typename ParamT,
-    typename OutT,
-    const int group_size,
-    const int bits,
-    const bool aligned_N,
-    const int BM = 32,
-    const int BK = 32,
-    const int BN = 32>
-METAL_FUNC void mixed_qmm_t_impl(
-    const device uint32_t* w,
-    const device ParamT* scales,
-    const device ParamT* biases,
-    const device InT* x,
-    device OutT* y,
-    threadgroup float* Xs,
-    threadgroup float* Ws,
-    const constant int& K,
-    const constant int& N,
-    const constant int& M,
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
-  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
-
-  (void)lid;
-
-  constexpr int WM = 2;
-  constexpr int WN = 2;
-  constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 8 / bits;
-  constexpr int BK_padded = (BK + 16 / sizeof(float));
-  constexpr int bytes_per_pack = (bits == 3 || bits == 6) ? 3 : 1;
-
-  using mma_t = mlx::steel::
-      BlockMMA<float, OutT, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-  using loader_x_t =
-      PsiDecMixedBlockLoader<InT, float, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  using loader_w_t = PsiDecMixedQuantizedBlockLoader<
-      ParamT,
-      float,
-      BN,
-      BK,
-      BK_padded,
-      1,
-      WM * WN * SIMD_SIZE,
-      group_size,
-      bits>;
-
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
-
-  auto wl = (const device uint8_t*)w;
-
-  x += y_row * K;
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
-  y += y_row * N + y_col;
-
-  const short num_els = min(BM, M - y_row);
-  const short num_outs = min(BN, N - y_col);
-  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  mma_t mma_op(simd_gid, simd_lid);
-
-  if (num_els < BM) {
-    if (!aligned_N && num_outs < BN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_safe(short2(BK, num_els));
-        loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
-    } else {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_safe(short2(BK, num_els));
-        loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
-    }
-  } else {
-    if (!aligned_N && num_outs < BN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_unsafe();
-        loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
-    } else {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_unsafe();
-        loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
-    }
-  }
-
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (num_els < BM || num_outs < BN) {
-    mma_op.store_result_safe(y, N, short2(num_outs, num_els));
-  } else {
-    mma_op.store_result(y, N);
-  }
-}
-
-template <
-    typename InT,
-    typename ParamT,
-    typename OutT,
-    const int group_size,
-    const int bits,
-    const bool aligned_N,
-    const int BM = 32,
-    const int BK = 32,
-    const int BN = 32>
-[[kernel]] void mixed_qmm_t(
-    const device uint32_t* w [[buffer(0)]],
-    const device ParamT* scales [[buffer(1)]],
-    const device ParamT* biases [[buffer(2)]],
-    const device InT* x [[buffer(3)]],
-    device OutT* y [[buffer(4)]],
-    const constant int& K [[buffer(5)]],
-    const constant int& N [[buffer(6)]],
-    const constant int& M [[buffer(7)]],
-    const constant int& x_batch_ndims [[buffer(8)]],
-    const constant int* x_shape [[buffer(9)]],
-    const constant int64_t* x_strides [[buffer(10)]],
-    const constant int& w_batch_ndims [[buffer(11)]],
-    const constant int* w_shape [[buffer(12)]],
-    const constant int64_t* w_strides [[buffer(13)]],
-    const constant int64_t* s_strides [[buffer(14)]],
-    const constant int64_t* b_strides [[buffer(15)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  (void)b_strides;
-
-  constexpr int BK_padded = (BK + 16 / sizeof(float));
-
-  threadgroup float Xs[BM * BK_padded];
-  threadgroup float Ws[BN * BK_padded];
-
-  mixed_qmm_t_impl<InT, ParamT, OutT, group_size, bits, aligned_N, BM, BK, BN>(
-      w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
-}
-"#;
-
-const FUSED_GATE_UP_SILU_SOURCE: &str = r#"
-template <typename T, const int group_size, const int bits, const bool aligned_N, const int BM = 32, const int BK = 32, const int BN = 32>
-[[kernel]] void qmm_t_fused_gate_up_silu(
-    const device uint32_t* w_gate [[buffer(0)]],
-    const device T* scales_gate [[buffer(1)]],
-    const device T* biases_gate [[buffer(2)]],
-    const device uint32_t* w_up [[buffer(3)]],
-    const device T* scales_up [[buffer(4)]],
-    const device T* biases_up [[buffer(5)]],
-    const device T* x [[buffer(6)]],
-    device T* y [[buffer(7)]],
-    const constant int& K [[buffer(8)]],
-    const constant int& N [[buffer(9)]],
-    const constant int& M [[buffer(10)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)lid;
-  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
-  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
-
-  constexpr int WM = 2;
-  constexpr int WN = 2;
-  constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 8 / bits;
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  constexpr int bytes_per_pack = (bits == 3 || bits == 6) ? 3 : 1;
-
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
-
-  using mma_t = mlx::steel::BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-  using loader_x_t = mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  using loader_w_t = QuantizedBlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
-
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
-
-  const device uint8_t* gate_wl = (const device uint8_t*)w_gate + y_col * K_w;
-  const device uint8_t* up_wl = (const device uint8_t*)w_up + y_col * K_w;
-  scales_gate += y_col * K_g;
-  biases_gate += y_col * K_g;
-  scales_up += y_col * K_g;
-  biases_up += y_col * K_g;
-  x += y_row * static_cast<int64_t>(K);
-  y += y_row * static_cast<int64_t>(N) + y_col;
-
-  const short num_els = min(BM, M - y_row);
-  const short num_outs = min(BN, N - y_col);
-  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-  loader_w_t loader_gate(gate_wl, scales_gate, biases_gate, K, Ws, simd_gid, simd_lid);
-  loader_w_t loader_up(up_wl, scales_up, biases_up, K, Ws, simd_gid, simd_lid);
-  mma_t mma_gate(simd_gid, simd_lid);
-  mma_t mma_up(simd_gid, simd_lid);
-
-  const bool x_safe = num_els < BM;
-  const bool w_safe = !aligned_N && num_outs < BN;
-
-  for (int k = 0; k < K; k += BK) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (x_safe) {
-      loader_x.load_safe(short2(BK, num_els));
-    } else {
-      loader_x.load_unsafe();
-    }
-    if (w_safe) {
-      loader_gate.load_safe(short2(BK, num_outs));
-    } else {
-      loader_gate.load_unsafe();
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_gate.mma(Xs, Ws);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (w_safe) {
-      loader_up.load_safe(short2(BK, num_outs));
-    } else {
-      loader_up.load_unsafe();
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_up.mma(Xs, Ws);
-
-    loader_x.next();
-    loader_gate.next();
-    loader_up.next();
-  }
-
-  for (short i = 0; i < decltype(mma_gate.Ctile)::kElemsPerTile; ++i) {
-    T gate = static_cast<T>(mma_gate.Ctile.elems()[i]);
-    T up = static_cast<T>(mma_up.Ctile.elems()[i]);
-    T sigmoid = static_cast<T>(1.0f / (1.0f + exp(-static_cast<float>(gate))));
-    T silu = static_cast<T>(static_cast<float>(gate) * static_cast<float>(sigmoid));
-    mma_gate.Ctile.elems()[i] = static_cast<T>(static_cast<float>(silu) * static_cast<float>(up));
-  }
-
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (num_els < BM || num_outs < BN) {
-    mma_gate.store_result_safe(y, N, short2(num_outs, num_els));
-  } else {
-    mma_gate.store_result(y, N);
-  }
-}
-
-template <typename T, int group_size, int bits>
-METAL_FUNC void qmv_impl(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
-    uint column_group,
-    uint simd_gid,
-    uint simd_lid) {
-  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
-  constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
-  constexpr int packs_per_thread = 2;
-  constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits;
-  constexpr int bytes_per_pack = power_of_2_bits ? 4 : 3;
-  constexpr int values_per_thread = pack_factor * packs_per_thread;
-  constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int scale_step_per_thread = group_size / values_per_thread;
-
-  const device uint8_t* ws = (const device uint8_t*)w;
-  typedef float U;
-
-  thread U x_thread[values_per_thread];
-  thread U result[results_per_simdgroup] = {0};
-
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
-  const int out_row = column_group * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
-
-  if (out_row >= out_vec_size) {
-    return;
-  }
-
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += simd_lid * values_per_thread;
-  y += out_row;
-
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      if (out_row + row < out_vec_size) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
-        result[row] += qdot<U, values_per_thread, bits>(
-            wl, x_thread, sl[0], bl[0], sum);
-      }
-    }
-
-    ws += block_size * bytes_per_pack / pack_factor;
-    scales += block_size / group_size;
-    biases += block_size / group_size;
-    x += block_size;
-  }
-
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      if (out_row + row < out_vec_size) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
-        result[row] += qdot_safe<U, values_per_thread, bits>(
-            wl, x_thread, sl[0], bl[0], sum, remaining);
-      }
-    }
-  }
-
-  for (int row = 0; row < results_per_simdgroup; row++) {
-    if (out_row + row < out_vec_size) {
-      U value = simd_sum(result[row]);
-      if (simd_lid == 0) {
-        y[row] = static_cast<T>(value);
-      }
-    }
-  }
-}
-
-template <typename T, int group_size, int bits>
-METAL_FUNC void qmv_gate_up_silu(
-    const device uint32_t* gate_w,
-    const device T* gate_scales,
-    const device T* gate_biases,
-    const device uint32_t* up_w,
-    const device T* up_scales,
-    const device T* up_biases,
-    const device T* x,
-    device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
-    uint column_group,
-    uint simd_gid,
-    uint simd_lid) {
-  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
-  constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
-  constexpr int packs_per_thread = 2;
-  constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits;
-  constexpr int bytes_per_pack = power_of_2_bits ? 4 : 3;
-  constexpr int values_per_thread = pack_factor * packs_per_thread;
-  constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int scale_step_per_thread = group_size / values_per_thread;
-
-  const device uint8_t* gate_ws = (const device uint8_t*)gate_w;
-  const device uint8_t* up_ws = (const device uint8_t*)up_w;
-  typedef float U;
-
-  thread U x_thread[values_per_thread];
-  thread U gate_result[results_per_simdgroup] = {0};
-  thread U up_result[results_per_simdgroup] = {0};
-
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
-  const int out_row = column_group * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
-
-  if (out_row >= out_vec_size) {
-    return;
-  }
-
-  gate_ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  up_ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  gate_scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  gate_biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  up_scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  up_biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += simd_lid * values_per_thread;
-  y += out_row;
-
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      if (out_row + row < out_vec_size) {
-        const device uint8_t* gate_wl = gate_ws + row * in_vec_size_w;
-        const device T* gate_sl = gate_scales + row * in_vec_size_g;
-        const device T* gate_bl = gate_biases + row * in_vec_size_g;
-        const device uint8_t* up_wl = up_ws + row * in_vec_size_w;
-        const device T* up_sl = up_scales + row * in_vec_size_g;
-        const device T* up_bl = up_biases + row * in_vec_size_g;
-        gate_result[row] += qdot<U, values_per_thread, bits>(
-            gate_wl, x_thread, gate_sl[0], gate_bl[0], sum);
-        up_result[row] += qdot<U, values_per_thread, bits>(
-            up_wl, x_thread, up_sl[0], up_bl[0], sum);
-      }
-    }
-
-    gate_ws += block_size * bytes_per_pack / pack_factor;
-    up_ws += block_size * bytes_per_pack / pack_factor;
-    gate_scales += block_size / group_size;
-    gate_biases += block_size / group_size;
-    up_scales += block_size / group_size;
-    up_biases += block_size / group_size;
-    x += block_size;
-  }
-
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
-
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      if (out_row + row < out_vec_size) {
-        const device uint8_t* gate_wl = gate_ws + row * in_vec_size_w;
-        const device T* gate_sl = gate_scales + row * in_vec_size_g;
-        const device T* gate_bl = gate_biases + row * in_vec_size_g;
-        const device uint8_t* up_wl = up_ws + row * in_vec_size_w;
-        const device T* up_sl = up_scales + row * in_vec_size_g;
-        const device T* up_bl = up_biases + row * in_vec_size_g;
-        gate_result[row] += qdot_safe<U, values_per_thread, bits>(
-            gate_wl, x_thread, gate_sl[0], gate_bl[0], sum, remaining);
-        up_result[row] += qdot_safe<U, values_per_thread, bits>(
-            up_wl, x_thread, up_sl[0], up_bl[0], sum, remaining);
-      }
-    }
-  }
-
-  for (int row = 0; row < results_per_simdgroup; row++) {
-    if (out_row + row < out_vec_size) {
-      U gate = simd_sum(gate_result[row]);
-      U up = simd_sum(up_result[row]);
-      if (simd_lid == 0) {
-        T gate_t = static_cast<T>(gate);
-        T up_t = static_cast<T>(up);
-        T sigmoid = static_cast<T>(1.0f / (1.0f + exp(-static_cast<float>(gate_t))));
-        T silu = static_cast<T>(static_cast<float>(gate_t) * static_cast<float>(sigmoid));
-        y[row] = static_cast<T>(static_cast<float>(silu) * static_cast<float>(up_t));
-      }
-    }
-  }
-}
-
-template <typename T, const int group_size, const int bits>
-[[kernel]] void dense_fused_gate_up_silu(
-    const device uint32_t* w [[buffer(0)]],
-    const device T* scales [[buffer(1)]],
-    const device T* biases [[buffer(2)]],
-    const device T* x [[buffer(3)]],
-    device T* y [[buffer(4)]],
-    const constant int& in_vec_size [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
-      (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
-  const int in_vec_size_g = in_vec_size / group_size;
-  const device uint32_t* gate_w = w;
-  const device uint32_t* up_w = (const device uint32_t*)((const device uint8_t*)w + out_vec_size * in_vec_size_w);
-  const device T* gate_scales = scales;
-  const device T* gate_biases = biases;
-  const device T* up_scales = scales + out_vec_size * in_vec_size_g;
-  const device T* up_biases = biases + out_vec_size * in_vec_size_g;
-  qmv_gate_up_silu<T, group_size, bits>(
-      gate_w,
-      gate_scales,
-      gate_biases,
-      up_w,
-      up_scales,
-      up_biases,
-      x + tid.x * in_vec_size,
-      y + tid.x * out_vec_size,
-      in_vec_size,
-      out_vec_size,
-      tid.y,
-      simd_gid,
-      simd_lid);
-}
-
-template <typename T, const int group_size, const int bits>
-[[kernel]] void split_fused_gate_up_silu(
-    const device uint32_t* gate_w [[buffer(0)]],
-    const device T* gate_scales [[buffer(1)]],
-    const device T* gate_biases [[buffer(2)]],
-    const device uint32_t* up_w [[buffer(3)]],
-    const device T* up_scales [[buffer(4)]],
-    const device T* up_biases [[buffer(5)]],
-    const device T* x [[buffer(6)]],
-    device T* y [[buffer(7)]],
-    const constant int& in_vec_size [[buffer(8)]],
-    const constant int& out_vec_size [[buffer(9)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  qmv_gate_up_silu<T, group_size, bits>(
-      gate_w,
-      gate_scales,
-      gate_biases,
-      up_w,
-      up_scales,
-      up_biases,
-      x + tid.x * in_vec_size,
-      y + tid.x * out_vec_size,
-      in_vec_size,
-      out_vec_size,
-      tid.y,
-      simd_gid,
-      simd_lid);
-}
-
-template <typename T, const int group_size, const int bits>
-[[kernel]] void token_major_fused_gate_up_silu(
-    const device uint32_t* gate_w [[buffer(0)]],
-    const device T* gate_scales [[buffer(1)]],
-    const device T* gate_biases [[buffer(2)]],
-    const device uint32_t* up_w [[buffer(3)]],
-    const device T* up_scales [[buffer(4)]],
-    const device T* up_biases [[buffer(5)]],
-    const device T* x [[buffer(6)]],
-    const device uint32_t* lhs_indices [[buffer(7)]],
-    const device uint32_t* rhs_indices [[buffer(8)]],
-    device T* y [[buffer(9)]],
-    const constant int& in_vec_size [[buffer(10)]],
-    const constant int& out_vec_size [[buffer(11)]],
-    const constant int& num_experts [[buffer(12)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  const uint route = tid.z;
-  const uint input_row = lhs_indices[route];
-  const uint expert = rhs_indices[route];
-  if (expert >= uint(num_experts)) {
-    return;
-  }
-  const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
-      (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
-  const int in_vec_size_g = in_vec_size / group_size;
-  const int expert_weight_stride = out_vec_size * in_vec_size_w;
-  const int expert_affine_stride = out_vec_size * in_vec_size_g;
-  qmv_gate_up_silu<T, group_size, bits>(
-      (const device uint32_t*)((const device uint8_t*)gate_w + expert * expert_weight_stride),
-      gate_scales + expert * expert_affine_stride,
-      gate_biases + expert * expert_affine_stride,
-      (const device uint32_t*)((const device uint8_t*)up_w + expert * expert_weight_stride),
-      up_scales + expert * expert_affine_stride,
-      up_biases + expert * expert_affine_stride,
-      x + input_row * in_vec_size,
-      y + route * out_vec_size,
-      in_vec_size,
-      out_vec_size,
-      tid.y,
-      simd_gid,
-      simd_lid);
-}
-
-template <typename T, const int group_size, const int bits>
-[[kernel]] void expert_major_down_matmul(
-    const device uint32_t* w [[buffer(0)]],
-    const device T* scales [[buffer(1)]],
-    const device T* biases [[buffer(2)]],
-    const device T* x [[buffer(3)]],
-    const device uint32_t* experts_by_route [[buffer(4)]],
-    device T* y [[buffer(5)]],
-    const constant int& in_vec_size [[buffer(6)]],
-    const constant int& out_vec_size [[buffer(7)]],
-    const constant int& num_experts [[buffer(8)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  const uint route = tid.x;
-  const uint expert = experts_by_route[route];
-  if (expert >= uint(num_experts)) {
-    return;
-  }
-  const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
-      (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
-  const int in_vec_size_g = in_vec_size / group_size;
-  const int expert_weight_stride = out_vec_size * in_vec_size_w;
-  const int expert_affine_stride = out_vec_size * in_vec_size_g;
-
-  qmv_impl<T, group_size, bits>(
-      (const device uint32_t*)((const device uint8_t*)w + expert * expert_weight_stride),
-      scales + expert * expert_affine_stride,
-      biases + expert * expert_affine_stride,
-      x + route * in_vec_size,
-      y + route * out_vec_size,
-      in_vec_size,
-      out_vec_size,
-      tid.y,
-      simd_gid,
-      simd_lid);
-}
-
-template <typename T, const int group_size, const int bits>
-[[kernel]] void expert_major_fused_gate_up_silu(
-    const device uint32_t* gate_w [[buffer(0)]],
-    const device T* gate_scales [[buffer(1)]],
-    const device T* gate_biases [[buffer(2)]],
-    const device uint32_t* up_w [[buffer(3)]],
-    const device T* up_scales [[buffer(4)]],
-    const device T* up_biases [[buffer(5)]],
-    const device T* x [[buffer(6)]],
-    const device uint32_t* experts_by_route [[buffer(7)]],
-    device T* y [[buffer(8)]],
-    const constant int& in_vec_size [[buffer(9)]],
-    const constant int& out_vec_size [[buffer(10)]],
-    const constant int& num_experts [[buffer(11)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  const uint route = tid.x;
-  const uint expert = experts_by_route[route];
-  if (expert >= uint(num_experts)) {
-    return;
-  }
-  const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
-      (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
-  const int in_vec_size_g = in_vec_size / group_size;
-  const int expert_weight_stride = out_vec_size * in_vec_size_w;
-  const int expert_affine_stride = out_vec_size * in_vec_size_g;
-
-  qmv_gate_up_silu<T, group_size, bits>(
-      (const device uint32_t*)((const device uint8_t*)gate_w + expert * expert_weight_stride),
-      gate_scales + expert * expert_affine_stride,
-      gate_biases + expert * expert_affine_stride,
-      (const device uint32_t*)((const device uint8_t*)up_w + expert * expert_weight_stride),
-      up_scales + expert * expert_affine_stride,
-      up_biases + expert * expert_affine_stride,
-      x + route * in_vec_size,
-      y + route * out_vec_size,
-      in_vec_size,
-      out_vec_size,
-      tid.y,
-      simd_gid,
-      simd_lid);
-}
-"#;
+const FUSED_GATE_UP_SILU_SOURCE: &str = include_str!("metal/affine_quantized_gate_up_silu_qmv_qmm.metal");
 
 fn mlx_metal_header_root() -> PathBuf {
     find_mlx_metal_header_root(
@@ -3531,17 +2602,76 @@ mod tests {
     use super::*;
     use crate::metal::Stream;
 
-    fn execute_matmul(
-        stream: &Stream,
-        kernel: &AffineQuantizedMatmulKernel,
-        output: &Buffer,
-        input: &Buffer,
-        weight: &Buffer,
-        scales: &Buffer,
-        biases: &Buffer,
-    ) {
+    fn adaptive_config(n: i32, k: i32, dtype: Dtype) -> AffineQuantizedMatmulConfig {
+        AffineQuantizedMatmulConfig::same_dtype(n, k, 64, 4, dtype)
+    }
+
+    #[test]
+    fn test_adaptive_large_vocabulary_qmm_crossover() {
+        assert_eq!(
+            select_kernel_kind(adaptive_config(151_936, 2048, Dtype::Bfloat16), 4),
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+        );
+        assert_eq!(
+            select_kernel_kind(adaptive_config(151_936, 2048, Dtype::Bfloat16), 5),
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        );
+        assert_eq!(
+            select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 5),
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+        );
+        assert_eq!(
+            select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 6),
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        );
+    }
+
+    #[test]
+    fn test_adaptive_qmm_tile_crossover() {
+        assert_eq!(
+            select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 16),
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        );
+        assert_eq!(
+            select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 17),
+            AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+        );
+    }
+
+    #[test]
+    fn test_adaptive_dense_projection_crossover() {
+        let large_projection = adaptive_config(34_816, 5120, Dtype::Bfloat16);
+        assert_eq!(
+            select_kernel_kind(large_projection, 5),
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+        );
+        assert_eq!(
+            select_kernel_kind(large_projection, 6),
+            AffineQuantizedMatmulKernelKind::QmmBm8Bn32
+        );
+        assert_eq!(
+            select_kernel_kind(large_projection, 8),
+            AffineQuantizedMatmulKernelKind::QmmBm8Bn32
+        );
+        assert_eq!(
+            select_kernel_kind(large_projection, 9),
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        );
+
+        let common_projection = adaptive_config(1024, 2048, Dtype::Bfloat16);
+        assert_eq!(
+            select_kernel_kind(common_projection, 8),
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+        );
+        assert_eq!(
+            select_kernel_kind(common_projection, 18),
+            AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+        );
+    }
+
+    fn execute_matmul(stream: &Stream, invocation: AffineQuantizedMatmulInvocation<'_>) {
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(output, 0, input, 0, weight, 0, scales, 0, biases, 0));
+        builder.record(invocation);
         let replay = builder.build();
         stream.submit_replay(&replay).wait();
     }
@@ -3550,43 +2680,51 @@ mod tests {
     fn test_qmv_reference() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = AffineQuantizedMatmulShape {
-            m: 2,
+        let m = 2;
+        let config = AffineQuantizedMatmulConfig {
             n: 4,
             k: 32,
             group_size: 32,
             bits: 8,
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Float32,
-            affine_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Float32,
         };
-        let input_f32 = fixture_values(shape.m as usize * shape.k as usize, 0.03125);
+        let input_f32 = fixture_values(m as usize * config.k as usize, 0.03125);
         let input_bf16 = input_f32
             .iter()
             .map(|value| bf16::from_f32(*value).to_bits())
             .collect::<Vec<_>>();
-        let weight = fixture_weight_bytes(shape.n as usize * shape.k as usize);
-        let scales = fixture_values(shape.n as usize, 0.015625);
-        let biases = fixture_values(shape.n as usize, -0.0078125);
+        let weight = fixture_weight_bytes(config.n as usize * config.k as usize);
+        let scales = fixture_values(config.n as usize, 0.015625);
+        let biases = fixture_values(config.n as usize, -0.0078125);
         let input = Buffer::from_slice(&device, &input_bf16);
-        let output = Buffer::new_zeroed(&device, shape.output_bytes());
+        let output = Buffer::new_zeroed(&device, config.output_bytes(m));
         let weight_buffer = Buffer::from_slice(&device, &weight);
         let scales_buffer = Buffer::from_slice(&device, &scales);
         let biases_buffer = Buffer::from_slice(&device, &biases);
 
         execute_matmul(
             &stream,
-            &AffineQuantizedMatmulKernel::new(&device, shape),
-            &output,
-            &input,
-            &weight_buffer,
-            &scales_buffer,
-            &biases_buffer,
+            AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+                m,
+                &output,
+                0,
+                &input,
+                0,
+                &weight_buffer,
+                0,
+                &scales_buffer,
+                0,
+                &biases_buffer,
+                0,
+            ),
         );
 
-        let actual = output.read_typed::<f32>(0, shape.m as usize * shape.n as usize);
-        let expected = cpu_affine_q8(
-            shape,
+        let actual = output.read_typed::<f32>(0, m as usize * config.n as usize);
+        let expected = cpu_affine_reference(
+            config,
+            m,
             &input_bf16
                 .iter()
                 .map(|bits| bf16::from_bits(*bits).to_f32())
@@ -3602,43 +2740,54 @@ mod tests {
     fn test_qmv_fast_reference() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = AffineQuantizedMatmulShape {
-            m: 2,
+        let m = 2;
+        let config = AffineQuantizedMatmulConfig {
             n: 8,
             k: 512,
             group_size: 64,
             bits: 8,
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Float32,
-            affine_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Float32,
         };
-        let input_f32 = fixture_values(shape.m as usize * shape.k as usize, 0.00390625);
+        let input_f32 = fixture_values(m as usize * config.k as usize, 0.00390625);
         let input_bf16 = input_f32
             .iter()
             .map(|value| bf16::from_f32(*value).to_bits())
             .collect::<Vec<_>>();
-        let weight = fixture_weight_bytes(shape.n as usize * shape.k as usize);
-        let scales = fixture_values(shape.n as usize * (shape.k / shape.group_size) as usize, 0.001953125);
-        let biases = fixture_values(shape.n as usize * (shape.k / shape.group_size) as usize, -0.0009765625);
+        let weight = fixture_weight_bytes(config.n as usize * config.k as usize);
+        let scales = fixture_values(config.n as usize * (config.k / config.group_size) as usize, 0.001953125);
+        let biases = fixture_values(
+            config.n as usize * (config.k / config.group_size) as usize,
+            -0.0009765625,
+        );
         let input = Buffer::from_slice(&device, &input_bf16);
-        let output = Buffer::new_zeroed(&device, shape.output_bytes());
+        let output = Buffer::new_zeroed(&device, config.output_bytes(m));
         let weight_buffer = Buffer::from_slice(&device, &weight);
         let scales_buffer = Buffer::from_slice(&device, &scales);
         let biases_buffer = Buffer::from_slice(&device, &biases);
 
         execute_matmul(
             &stream,
-            &AffineQuantizedMatmulKernel::new(&device, shape),
-            &output,
-            &input,
-            &weight_buffer,
-            &scales_buffer,
-            &biases_buffer,
+            AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+                m,
+                &output,
+                0,
+                &input,
+                0,
+                &weight_buffer,
+                0,
+                &scales_buffer,
+                0,
+                &biases_buffer,
+                0,
+            ),
         );
 
-        let actual = output.read_typed::<f32>(0, shape.m as usize * shape.n as usize);
-        let expected = cpu_affine_q8(
-            shape,
+        let actual = output.read_typed::<f32>(0, m as usize * config.n as usize);
+        let expected = cpu_affine_reference(
+            config,
+            m,
             &input_bf16
                 .iter()
                 .map(|bits| bf16::from_bits(*bits).to_f32())
@@ -3654,43 +2803,51 @@ mod tests {
     fn test_qmm_reference() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = AffineQuantizedMatmulShape {
-            m: 18,
+        let m = 18;
+        let config = AffineQuantizedMatmulConfig {
             n: 4,
             k: 32,
             group_size: 32,
             bits: 8,
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Float32,
-            affine_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Float32,
         };
-        let input_f32 = fixture_values(shape.m as usize * shape.k as usize, 0.03125);
+        let input_f32 = fixture_values(m as usize * config.k as usize, 0.03125);
         let input_bf16 = input_f32
             .iter()
             .map(|value| bf16::from_f32(*value).to_bits())
             .collect::<Vec<_>>();
-        let weight = fixture_weight_bytes(shape.n as usize * shape.k as usize);
-        let scales = fixture_values(shape.n as usize, 0.015625);
-        let biases = fixture_values(shape.n as usize, -0.0078125);
+        let weight = fixture_weight_bytes(config.n as usize * config.k as usize);
+        let scales = fixture_values(config.n as usize, 0.015625);
+        let biases = fixture_values(config.n as usize, -0.0078125);
         let input = Buffer::from_slice(&device, &input_bf16);
-        let output = Buffer::new_zeroed(&device, shape.output_bytes());
+        let output = Buffer::new_zeroed(&device, config.output_bytes(m));
         let weight_buffer = Buffer::from_slice(&device, &weight);
         let scales_buffer = Buffer::from_slice(&device, &scales);
         let biases_buffer = Buffer::from_slice(&device, &biases);
 
         execute_matmul(
             &stream,
-            &AffineQuantizedMatmulKernel::new(&device, shape),
-            &output,
-            &input,
-            &weight_buffer,
-            &scales_buffer,
-            &biases_buffer,
+            AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+                m,
+                &output,
+                0,
+                &input,
+                0,
+                &weight_buffer,
+                0,
+                &scales_buffer,
+                0,
+                &biases_buffer,
+                0,
+            ),
         );
 
-        let actual = output.read_typed::<f32>(0, shape.m as usize * shape.n as usize);
-        let expected = cpu_affine_q8(
-            shape,
+        let actual = output.read_typed::<f32>(0, m as usize * config.n as usize);
+        let expected = cpu_affine_reference(
+            config,
+            m,
             &input_bf16
                 .iter()
                 .map(|bits| bf16::from_bits(*bits).to_f32())
@@ -3703,23 +2860,119 @@ mod tests {
     }
 
     #[test]
+    fn test_qmm_bm8_bn32_q4_bf16_reference() {
+        assert_qmm_bm8_bm16_bn32_q4_bf16_reference(8);
+    }
+
+    #[test]
+    fn test_qmm_bm16_bn32_q4_bf16_reference() {
+        assert_qmm_bm8_bm16_bn32_q4_bf16_reference(16);
+    }
+
+    fn assert_qmm_bm8_bm16_bn32_q4_bf16_reference(bm: usize) {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let m = 7;
+        let config = AffineQuantizedMatmulConfig {
+            n: 32,
+            k: 64,
+            group_size: 64,
+            bits: 4,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+        };
+        let input_f32 = fixture_values(m as usize * config.k as usize, 0.03125);
+        let input_bf16 = input_f32
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect::<Vec<_>>();
+        let weight_values = fixture_q4_values(config.n as usize * config.k as usize);
+        let weight = pack_q4(&weight_values);
+        let scales_f32 = fixture_values(config.n as usize, 0.015625);
+        let biases_f32 = fixture_values(config.n as usize, -0.0078125);
+        let scales_bf16 = scales_f32
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect::<Vec<_>>();
+        let biases_bf16 = biases_f32
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect::<Vec<_>>();
+        let input = Buffer::from_slice(&device, &input_bf16);
+        let output = Buffer::new_zeroed(&device, config.output_bytes(m));
+        let weight_buffer = Buffer::from_slice(&device, &weight);
+        let scales_buffer = Buffer::from_slice(&device, &scales_bf16);
+        let biases_buffer = Buffer::from_slice(&device, &biases_bf16);
+
+        let kernel = match bm {
+            8 => AffineQuantizedMatmulKernel::new(&device, config, AffineQuantizedMatmulKernelKind::QmmBm8Bn32),
+            16 => AffineQuantizedMatmulKernel::new(&device, config, AffineQuantizedMatmulKernelKind::QmmBm16Bn32),
+            _ => panic!("QMM BM=8/16 BN=32 reference requires BM=8 or BM=16"),
+        };
+        execute_matmul(
+            &stream,
+            kernel.invoke(
+                m,
+                &output,
+                0,
+                &input,
+                0,
+                &weight_buffer,
+                0,
+                &scales_buffer,
+                0,
+                &biases_buffer,
+                0,
+            ),
+        );
+
+        let actual = output
+            .read_typed::<u16>(0, m as usize * config.n as usize)
+            .into_iter()
+            .map(|bits| bf16::from_bits(bits).to_f32())
+            .collect::<Vec<_>>();
+        let expected = cpu_affine_reference(
+            config,
+            m,
+            &input_bf16
+                .iter()
+                .map(|bits| bf16::from_bits(*bits).to_f32())
+                .collect::<Vec<_>>(),
+            &weight_values,
+            &scales_bf16
+                .iter()
+                .map(|bits| bf16::from_bits(*bits).to_f32())
+                .collect::<Vec<_>>(),
+            &biases_bf16
+                .iter()
+                .map(|bits| bf16::from_bits(*bits).to_f32())
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|value| bf16::from_f32(value).to_f32())
+        .collect::<Vec<_>>();
+        assert_close(&actual, &expected, 0.125);
+    }
+
+    #[test]
     fn test_qmv_bf16() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = AffineQuantizedMatmulShape {
-            m: 1,
+        let m = 1;
+        let config = AffineQuantizedMatmulConfig {
             n: 4,
             k: 32,
             group_size: 32,
             bits: 8,
             input_dtype: Dtype::Float32,
             output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
         };
-        let input = fixture_values(shape.m as usize * shape.k as usize, 0.03125);
-        let weight = fixture_weight_bytes(shape.n as usize * shape.k as usize);
-        let scales_f32 = fixture_values(shape.n as usize, 0.015625);
-        let biases_f32 = fixture_values(shape.n as usize, -0.0078125);
+        let input = fixture_values(m as usize * config.k as usize, 0.03125);
+        let weight = fixture_weight_bytes(config.n as usize * config.k as usize);
+        let scales_f32 = fixture_values(config.n as usize, 0.015625);
+        let biases_f32 = fixture_values(config.n as usize, -0.0078125);
         let scales_bf16 = scales_f32
             .iter()
             .map(|value| bf16::from_f32(*value).to_bits())
@@ -3729,28 +2982,36 @@ mod tests {
             .map(|value| bf16::from_f32(*value).to_bits())
             .collect::<Vec<_>>();
         let input_buffer = Buffer::from_slice(&device, &input);
-        let output = Buffer::new_zeroed(&device, shape.output_bytes());
+        let output = Buffer::new_zeroed(&device, config.output_bytes(m));
         let weight_buffer = Buffer::from_slice(&device, &weight);
         let scales_buffer = Buffer::from_slice(&device, &scales_bf16);
         let biases_buffer = Buffer::from_slice(&device, &biases_bf16);
 
         execute_matmul(
             &stream,
-            &AffineQuantizedMatmulKernel::new(&device, shape),
-            &output,
-            &input_buffer,
-            &weight_buffer,
-            &scales_buffer,
-            &biases_buffer,
+            AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+                m,
+                &output,
+                0,
+                &input_buffer,
+                0,
+                &weight_buffer,
+                0,
+                &scales_buffer,
+                0,
+                &biases_buffer,
+                0,
+            ),
         );
 
         let actual = output
-            .read_typed::<u16>(0, shape.m as usize * shape.n as usize)
+            .read_typed::<u16>(0, m as usize * config.n as usize)
             .into_iter()
             .map(|bits| bf16::from_bits(bits).to_f32())
             .collect::<Vec<_>>();
-        let expected = cpu_affine_q8(
-            shape,
+        let expected = cpu_affine_reference(
+            config,
+            m,
             &input,
             &weight,
             &scales_bf16
@@ -3772,20 +3033,23 @@ mod tests {
     fn test_qmv_fast_bf16() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = AffineQuantizedMatmulShape {
-            m: 2,
+        let m = 2;
+        let config = AffineQuantizedMatmulConfig {
             n: 8,
             k: 512,
             group_size: 64,
             bits: 8,
             input_dtype: Dtype::Float32,
             output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
         };
-        let input = fixture_values(shape.m as usize * shape.k as usize, 0.00390625);
-        let weight = fixture_weight_bytes(shape.n as usize * shape.k as usize);
-        let scales_f32 = fixture_values(shape.n as usize * (shape.k / shape.group_size) as usize, 0.001953125);
-        let biases_f32 = fixture_values(shape.n as usize * (shape.k / shape.group_size) as usize, -0.0009765625);
+        let input = fixture_values(m as usize * config.k as usize, 0.00390625);
+        let weight = fixture_weight_bytes(config.n as usize * config.k as usize);
+        let scales_f32 = fixture_values(config.n as usize * (config.k / config.group_size) as usize, 0.001953125);
+        let biases_f32 = fixture_values(
+            config.n as usize * (config.k / config.group_size) as usize,
+            -0.0009765625,
+        );
         let scales_bf16 = scales_f32
             .iter()
             .map(|value| bf16::from_f32(*value).to_bits())
@@ -3795,28 +3059,36 @@ mod tests {
             .map(|value| bf16::from_f32(*value).to_bits())
             .collect::<Vec<_>>();
         let input_buffer = Buffer::from_slice(&device, &input);
-        let output = Buffer::new_zeroed(&device, shape.output_bytes());
+        let output = Buffer::new_zeroed(&device, config.output_bytes(m));
         let weight_buffer = Buffer::from_slice(&device, &weight);
         let scales_buffer = Buffer::from_slice(&device, &scales_bf16);
         let biases_buffer = Buffer::from_slice(&device, &biases_bf16);
 
         execute_matmul(
             &stream,
-            &AffineQuantizedMatmulKernel::new(&device, shape),
-            &output,
-            &input_buffer,
-            &weight_buffer,
-            &scales_buffer,
-            &biases_buffer,
+            AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+                m,
+                &output,
+                0,
+                &input_buffer,
+                0,
+                &weight_buffer,
+                0,
+                &scales_buffer,
+                0,
+                &biases_buffer,
+                0,
+            ),
         );
 
         let actual = output
-            .read_typed::<u16>(0, shape.m as usize * shape.n as usize)
+            .read_typed::<u16>(0, m as usize * config.n as usize)
             .into_iter()
             .map(|bits| bf16::from_bits(bits).to_f32())
             .collect::<Vec<_>>();
-        let expected = cpu_affine_q8(
-            shape,
+        let expected = cpu_affine_reference(
+            config,
+            m,
             &input,
             &weight,
             &scales_bf16
@@ -3838,20 +3110,20 @@ mod tests {
     fn test_qmm_bf16() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = AffineQuantizedMatmulShape {
-            m: 18,
+        let m = 18;
+        let config = AffineQuantizedMatmulConfig {
             n: 4,
             k: 32,
             group_size: 32,
             bits: 8,
             input_dtype: Dtype::Float32,
             output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
         };
-        let input = fixture_values(shape.m as usize * shape.k as usize, 0.03125);
-        let weight = fixture_weight_bytes(shape.n as usize * shape.k as usize);
-        let scales_f32 = fixture_values(shape.n as usize, 0.015625);
-        let biases_f32 = fixture_values(shape.n as usize, -0.0078125);
+        let input = fixture_values(m as usize * config.k as usize, 0.03125);
+        let weight = fixture_weight_bytes(config.n as usize * config.k as usize);
+        let scales_f32 = fixture_values(config.n as usize, 0.015625);
+        let biases_f32 = fixture_values(config.n as usize, -0.0078125);
         let scales_bf16 = scales_f32
             .iter()
             .map(|value| bf16::from_f32(*value).to_bits())
@@ -3861,28 +3133,36 @@ mod tests {
             .map(|value| bf16::from_f32(*value).to_bits())
             .collect::<Vec<_>>();
         let input_buffer = Buffer::from_slice(&device, &input);
-        let output = Buffer::new_zeroed(&device, shape.output_bytes());
+        let output = Buffer::new_zeroed(&device, config.output_bytes(m));
         let weight_buffer = Buffer::from_slice(&device, &weight);
         let scales_buffer = Buffer::from_slice(&device, &scales_bf16);
         let biases_buffer = Buffer::from_slice(&device, &biases_bf16);
 
         execute_matmul(
             &stream,
-            &AffineQuantizedMatmulKernel::new(&device, shape),
-            &output,
-            &input_buffer,
-            &weight_buffer,
-            &scales_buffer,
-            &biases_buffer,
+            AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+                m,
+                &output,
+                0,
+                &input_buffer,
+                0,
+                &weight_buffer,
+                0,
+                &scales_buffer,
+                0,
+                &biases_buffer,
+                0,
+            ),
         );
 
         let actual = output
-            .read_typed::<u16>(0, shape.m as usize * shape.n as usize)
+            .read_typed::<u16>(0, m as usize * config.n as usize)
             .into_iter()
             .map(|bits| bf16::from_bits(bits).to_f32())
             .collect::<Vec<_>>();
-        let expected = cpu_affine_q8(
-            shape,
+        let expected = cpu_affine_reference(
+            config,
+            m,
             &input,
             &weight,
             &scales_bf16
@@ -3900,25 +3180,26 @@ mod tests {
         assert_close(&actual, &expected, 1.0e-4);
     }
 
-    fn cpu_affine_q8(
-        shape: AffineQuantizedMatmulShape,
+    fn cpu_affine_reference(
+        config: AffineQuantizedMatmulConfig,
+        m: i32,
         input: &[f32],
         weight: &[u8],
         scales: &[f32],
         biases: &[f32],
     ) -> Vec<f32> {
-        let m = shape.m as usize;
-        let n = shape.n as usize;
-        let k = shape.k as usize;
+        let m = m as usize;
+        let n = config.n as usize;
+        let k = config.k as usize;
         let mut output = vec![0.0_f32; m * n];
         for row in 0..m {
             let input_row = &input[row * k..(row + 1) * k];
             for col in 0..n {
                 let weight_row = &weight[col * k..(col + 1) * k];
                 let mut value = 0.0_f32;
-                for group in 0..(k / shape.group_size as usize) {
-                    let group_start = group * shape.group_size as usize;
-                    let group_end = group_start + shape.group_size as usize;
+                for group in 0..(k / config.group_size as usize) {
+                    let group_start = group * config.group_size as usize;
+                    let group_end = group_start + config.group_size as usize;
                     let input_group = &input_row[group_start..group_end];
                     let weight_group = &weight_row[group_start..group_end];
                     let input_sum = input_group.iter().copied().sum::<f32>();
@@ -3927,7 +3208,7 @@ mod tests {
                         .zip(weight_group)
                         .map(|(x, w)| *x * f32::from(*w))
                         .sum::<f32>();
-                    let affine_index = col * (k / shape.group_size as usize) + group;
+                    let affine_index = col * (k / config.group_size as usize) + group;
                     value += scales[affine_index] * dot + input_sum * biases[affine_index];
                 }
                 output[row * n + col] = value;
@@ -3942,6 +3223,25 @@ mod tests {
 
     fn fixture_weight_bytes(len: usize) -> Vec<u8> {
         (0..len).map(|index| ((index * 7 + 3) % 251) as u8).collect()
+    }
+
+    fn fixture_q4_values(len: usize) -> Vec<u8> {
+        (0..len).map(|index| ((index * 7 + 3) % 16) as u8).collect()
+    }
+
+    fn pack_q4(values: &[u8]) -> Vec<u32> {
+        assert!(values.len().is_multiple_of(8));
+        values
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |word, (index, &value)| word | u32::from(value) << (index * 4))
+            })
+            .collect()
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

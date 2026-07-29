@@ -93,7 +93,7 @@ impl Qwen35DSparkMarkov {
             hidden_dim: rank,
             group_size: plan.markov_w1.group_size,
             bits: plan.markov_w1.bits,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         };
         w1_config.validate();

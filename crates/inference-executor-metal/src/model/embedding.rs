@@ -20,7 +20,7 @@ pub struct EmbedConfig {
     pub hidden_dim: u32,
     pub group_size: u32,
     pub bits: u32,
-    pub affine_dtype: Dtype,
+    pub scale_bias_dtype: Dtype,
     pub output_dtype: Dtype,
 }
 
@@ -42,7 +42,7 @@ impl EmbedConfig {
             hidden_dim: self.hidden_dim,
             group_size: self.group_size,
             bits: self.bits,
-            affine_dtype: self.affine_dtype,
+            scale_bias_dtype: self.scale_bias_dtype,
             output_dtype: self.output_dtype,
         }
     }
@@ -100,7 +100,7 @@ impl Embed {
         assert_eq!(self.weights.weight.len_bytes(), config.weight_bytes());
         assert_eq!(
             self.weights.scales.len_bytes(),
-            config.num_affine_params() * self.config.affine_dtype.item_size()
+            config.num_affine_params() * self.config.scale_bias_dtype.item_size()
         );
         assert_eq!(self.weights.biases.len_bytes(), self.weights.scales.len_bytes());
     }
@@ -151,7 +151,7 @@ impl EmbedWeights {
         validate_len(
             "embed scales",
             scales.len(),
-            config.num_affine_params() * config.affine_dtype.item_size(),
+            config.num_affine_params() * config.scale_bias_dtype.item_size(),
         )?;
         validate_len("embed biases", biases.len(), scales.len())?;
         Ok(Self {

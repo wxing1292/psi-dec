@@ -194,7 +194,7 @@ struct HeadLayout {
     hidden_dim: u32,
     group_size: u32,
     bits: u32,
-    affine_dtype: Dtype,
+    scale_bias_dtype: Dtype,
     hidden_dtype: Dtype,
     rms_norm_eps: f32,
 }
@@ -212,7 +212,7 @@ impl HeadLayout {
             hidden_dim: text.hidden_size as u32,
             group_size: quant.group_size as u32,
             bits: quant.bits as u32,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
             hidden_dtype: Dtype::Bfloat16,
             rms_norm_eps: text.rms_norm_eps,
         };
@@ -238,7 +238,7 @@ impl HeadLayout {
             hidden_dim: self.hidden_dim,
             group_size: self.group_size,
             bits: self.bits,
-            affine_dtype: self.affine_dtype,
+            scale_bias_dtype: self.scale_bias_dtype,
             output_dtype: self.hidden_dtype,
         }
     }
@@ -252,7 +252,7 @@ impl HeadLayout {
             bits: self.bits,
             input_dtype: self.hidden_dtype,
             output_dtype: self.hidden_dtype,
-            affine_dtype: self.affine_dtype,
+            scale_bias_dtype: self.scale_bias_dtype,
         }
     }
 

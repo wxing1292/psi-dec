@@ -15,7 +15,7 @@ pub struct QuantizedEmbeddingConfig {
     pub hidden_dim: u32,
     pub group_size: u32,
     pub bits: u32,
-    pub affine_dtype: Dtype,
+    pub scale_bias_dtype: Dtype,
     pub output_dtype: Dtype,
 }
 
@@ -26,7 +26,7 @@ impl QuantizedEmbeddingConfig {
             hidden_dim,
             group_size,
             bits,
-            affine_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Float32,
             output_dtype: Dtype::Bfloat16,
         }
     }
@@ -37,7 +37,7 @@ impl QuantizedEmbeddingConfig {
             hidden_dim,
             group_size,
             bits,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         }
     }
@@ -48,7 +48,7 @@ impl QuantizedEmbeddingConfig {
         assert!(matches!(self.group_size, 32 | 64 | 128));
         assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
         assert_eq!(self.hidden_dim % self.group_size, 0);
-        assert!(matches!(self.affine_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(matches!(self.scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
         assert_eq!(self.output_dtype, Dtype::Bfloat16);
         let _ = self.weight_bytes_unchecked();
         let _ = self.num_affine_params_unchecked();
@@ -157,7 +157,7 @@ impl Operator for QuantizedEmbeddingInvocation<'_> {
         self.shape.validate();
         validate_buffers(self.kernel.config, self.shape, &self.buffers);
         let config = self.kernel.config;
-        let kernel = match config.affine_dtype {
+        let kernel = match config.scale_bias_dtype {
             Dtype::Float32 => &self.kernel.f32_kernel,
             Dtype::Bfloat16 => &self.kernel.bf16_kernel,
             other => panic!("unsupported quantized embedding affine dtype: {other:?}"),
@@ -185,7 +185,7 @@ fn validate_buffers(
     shape.validate();
     let affine_param_bytes = config
         .num_affine_params_unchecked()
-        .checked_mul(config.affine_dtype.item_size())
+        .checked_mul(config.scale_bias_dtype.item_size())
         .expect("quantized embedding affine parameter bytes must fit usize");
     let output_bytes = shape
         .num_output_values(config)

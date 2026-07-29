@@ -125,9 +125,21 @@ Keep mathematical decomposition separate from launch topology:
 - A `*Task` is the full logical work for one threadblock. A Task and a threadblock have a 1:1 relationship.
 - A `*TaskTemplate` is an optional stored subset of Task fields. Regular grid coordinates reuse this subset.
 - A threadblock is one cooperating group of GPU threads. Metal calls it a threadgroup.
+- A warp is a hardware execution subgroup within one threadblock. Metal calls it a SIMDgroup.
 - A grid is all threadblocks launched by one kernel dispatch.
 
 `Task` and `TaskTemplate` identify logical work. They are not CUDA or Metal launch primitives.
+
+Use the CUDA execution terms in backend-independent documentation and source:
+
+| Project term    | CUDA term      | Metal term         |
+| --------------- | -------------- | ------------------ |
+| `threadblock`   | thread block   | threadgroup        |
+| `warp`          | warp           | SIMDgroup          |
+| `shared memory` | shared memory  | threadgroup memory |
+
+Keep the exact backend term in a backend API, shader attribute, intrinsic, identifier, or quotation. Examples include
+`threadgroup_barrier`, `simdgroup_index_in_threadgroup`, and `thread_index_in_simdgroup`.
 
 A Task can run one or more Tile steps. It can move one tensor tile repeatedly along an ordered axis.
 
@@ -312,6 +324,27 @@ resource bindings.
 
 Model executors own model semantics, persistent model or request buffers, and component wiring. They do not expose
 backend tiling or kernel-local tables in model APIs.
+
+Model and executor components must provide the complete semantic workload facts that a backend operator needs. These
+facts include tensor shapes, data types, storage layouts, quantization parameters, and buffers.
+
+The backend operator must select its algorithm, kernel family, dispatch geometry, and tile configuration. Model and
+executor components must not select or name backend kernels or tile configurations.
+
+A backend benchmark may force an exact backend path to measure a crossover. This benchmark control must remain at the
+backend boundary. It must not enter a model configuration or executor API.
+
+An adaptive affine quantized matmul uses these ownership boundaries:
+
+- `AffineQuantizedMatmulConfig` contains fixed workload facts. These facts are `N`, `K`, quantization parameters, and
+  data types. It does not contain `M`.
+- `AffineQuantizedMatmul` owns the candidate kernels. It selects one kernel from the runtime `M` and the fixed config.
+- `AffineQuantizedMatmulKernel` owns one compiled specialization. Its `AffineQuantizedMatmulKernelKind` fixes the
+  QMV or QMM family and its tile dimensions.
+- `AffineQuantizedMatmulInvocation` contains the runtime `M`, buffers, and byte offsets.
+
+Production model and executor components must use `AffineQuantizedMatmul`. They must not select an
+`AffineQuantizedMatmulKernelKind`.
 
 ## Commits
 

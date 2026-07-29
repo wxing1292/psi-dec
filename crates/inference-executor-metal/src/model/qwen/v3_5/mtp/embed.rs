@@ -95,7 +95,7 @@ impl Qwen35MTPEmbed {
             bits: quant.bits.try_into().expect("qwen3.5 MTP bits must fit i32"),
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
         };
         let hidden_elements = max_tokens
             .checked_mul(hidden_dim)
@@ -252,7 +252,7 @@ impl Qwen35MTPEmbedWeights {
                 .map_err(|_| ModelExecutorError::custom("qwen3.5 MTP bits must fit i32"))?,
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
         };
         let fc_weight = quant_weight(store, &bindings.projection.weight)?;
         let fc_scales = typed_tensor(store, &bindings.projection.scales, safetensors::Dtype::BF16)?.into_data();
