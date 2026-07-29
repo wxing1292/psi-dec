@@ -7,14 +7,30 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
+use inference_backend_metal::components::MoECombineKernel;
+use inference_backend_metal::components::MoECombineWithCommonBuffers;
 use inference_backend_metal::components::MoECombineWithCommonShape;
+use inference_backend_metal::components::MoEExpertMajorKernels;
+use inference_backend_metal::components::MoEExpertMajorLayoutBuffers;
+use inference_backend_metal::components::MoEExpertMajorPackInputBuffers;
+use inference_backend_metal::components::MoEExpertMajorScatterWithCommonBuffers;
 use inference_backend_metal::components::MoEExpertMajorShape;
+use inference_backend_metal::components::MoERoutingBuffers;
+use inference_backend_metal::components::MoERoutingKernel;
 use inference_backend_metal::components::MoERoutingShape;
+use inference_backend_metal::components::QuantizedDenseMLPBuffers;
 use inference_backend_metal::components::QuantizedDenseMLPConfig;
+use inference_backend_metal::components::QuantizedDenseMLPKernels;
 use inference_backend_metal::components::QuantizedDenseMLPScratch;
 use inference_backend_metal::components::QuantizedDenseMLPShape;
 use inference_backend_metal::components::QuantizedDenseMLPWeights;
+use inference_backend_metal::components::QuantizedSparseMLP;
 use inference_backend_metal::components::QuantizedSparseMLPConfig;
+use inference_backend_metal::components::QuantizedSparseMLPExpertMajorBuffers;
+use inference_backend_metal::components::QuantizedSparseMLPExpertMajorScratch;
+use inference_backend_metal::components::QuantizedSparseMLPExpertMajorShape;
+use inference_backend_metal::components::QuantizedSparseMLPTokenMajorBuffers;
+use inference_backend_metal::components::QuantizedSparseMLPTokenMajorScratch;
 use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
 use inference_backend_metal::components::QuantizedSparseMLPWeights;
 use inference_backend_metal::metal::Buffer;
@@ -22,20 +38,14 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_executor_core::mlp::moe::GatedMoECore;
-use inference_executor_core::mlp::moe::GatedMoEReplayShape;
-use inference_executor_core::mlp::moe::MoEExecutionPolicy;
-use inference_executor_core::mlp::moe::MoEExecutionPolicyConfig;
-use inference_executor_metal::def::layer::ReplayLayer;
+use inference_backend_metal::operators::SoftmaxKernel;
+use inference_backend_metal::operators::SoftmaxShape;
+use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
+use inference_executor_metal::def::replay_op::ReplayOp;
 use inference_executor_metal::mlp::dense::scratch::DenseMLPScratchBindings;
-use inference_executor_metal::mlp::moe::backend::GatedMoE;
-use inference_executor_metal::mlp::moe::backend::GatedMoECommonExpertReplayInput;
-use inference_executor_metal::mlp::moe::backend::GatedMoECommonExpertWeights;
-use inference_executor_metal::mlp::moe::backend::GatedMoEMetalConfig;
-use inference_executor_metal::mlp::moe::backend::GatedMoEReplayInput;
-use inference_executor_metal::mlp::moe::backend::GatedMoEWeights;
 use inference_executor_metal::mlp::moe::scratch::CommonExpertScratchBindings;
 use inference_executor_metal::mlp::moe::scratch::MoERoutingScratchBindings;
 use inference_executor_metal::mlp::moe::scratch::MoEScratchBindings;
@@ -59,20 +69,8 @@ fn main() {
     let weights = RealMoEWeights::load(&device, &args.model_dir, args.model_layer_index);
     for num_tokens in args.num_tokens {
         if args.check_parity {
-            let token_fixture = RealMoEFixture::new(
-                &device,
-                args.model_layer_index,
-                num_tokens,
-                &weights,
-                MoERealImpl::TokenMajor,
-            );
-            let expert_fixture = RealMoEFixture::new(
-                &device,
-                args.model_layer_index,
-                num_tokens,
-                &weights,
-                MoERealImpl::ExpertMajor,
-            );
+            let token_fixture = RealMoEFixture::new(&device, num_tokens, &weights, MoERealImpl::TokenMajor);
+            let expert_fixture = RealMoEFixture::new(&device, num_tokens, &weights, MoERealImpl::ExpertMajor);
             token_fixture.run_replay();
             expert_fixture.run_replay();
             let token_bits = token_fixture.output_bits();
@@ -87,7 +85,7 @@ fn main() {
         }
 
         for implementation in &args.implementations {
-            let fixture = RealMoEFixture::new(&device, args.model_layer_index, num_tokens, &weights, *implementation);
+            let fixture = RealMoEFixture::new(&device, num_tokens, &weights, *implementation);
             let samples = fixture.measure(*implementation, args.warmup_iters, args.iters, args.runs);
             print_perf(
                 args.model_layer_index,
@@ -167,12 +165,219 @@ impl MoERealImpl {
             Self::ExpertMajor => "expert_major",
         }
     }
+}
 
-    fn policy(self) -> MoEExecutionPolicy {
-        match self {
-            Self::TokenMajor => MoEExecutionPolicy::TokenMajor,
-            Self::ExpertMajor => MoEExecutionPolicy::ExpertMajor,
+struct ForcedMoEKernels {
+    router_projection: AffineQuantizedMatmul,
+    router_softmax: SoftmaxKernel,
+    routing: MoERoutingKernel,
+    expert_major: MoEExpertMajorKernels,
+    experts: QuantizedSparseMLP,
+    common_expert: QuantizedDenseMLPKernels,
+    common_gate_projection: AffineQuantizedMatmul,
+    combine: MoECombineKernel,
+}
+
+#[derive(Clone, Copy)]
+struct ForcedMoEWeights<'a> {
+    router_weight: &'a Buffer,
+    router_scales: &'a Buffer,
+    router_biases: &'a Buffer,
+    experts: QuantizedSparseMLPWeights<'a>,
+    common_expert: QuantizedDenseMLPWeights<'a>,
+    common_gate_weight: &'a Buffer,
+    common_gate_scales: &'a Buffer,
+    common_gate_biases: &'a Buffer,
+}
+
+impl ForcedMoEKernels {
+    fn new(device: &Device, max_tokens: u32) -> Self {
+        assert!(max_tokens > 0, "forced MoE bench requires token capacity");
+        Self {
+            router_projection: AffineQuantizedMatmul::new(device, affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS)),
+            router_softmax: SoftmaxKernel::new(
+                device,
+                SoftmaxShape {
+                    num_rows: max_tokens,
+                    num_values_per_row: NUM_EXPERTS,
+                    dtype: Dtype::Bfloat16,
+                },
+            ),
+            routing: MoERoutingKernel::new(device),
+            expert_major: MoEExpertMajorKernels::new(device),
+            experts: QuantizedSparseMLP::new(device, sparse_config()),
+            common_expert: QuantizedDenseMLPKernels::new(device, dense_config()),
+            common_gate_projection: AffineQuantizedMatmul::new(device, affine_config(1, HIDDEN_DIM, ROUTER_BITS)),
+            combine: MoECombineKernel::new(device),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        implementation: MoERealImpl,
+        num_tokens: u32,
+        input: &'a Buffer,
+        output: &'a Buffer,
+        scratch: MoEScratchBindings<'a>,
+        common_scratch: CommonExpertScratchBindings<'a>,
+        weights: ForcedMoEWeights<'a>,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        let routing_shape = routing_shape(num_tokens);
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_projection.invoke(
+            num_tokens.try_into().expect("forced MoE token count must fit i32"),
+            scratch.routing.router_logits,
+            0,
+            input,
+            0,
+            weights.router_weight,
+            0,
+            weights.router_scales,
+            0,
+            weights.router_biases,
+            0,
+        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke_with_shape(
+            SoftmaxShape {
+                num_rows: num_tokens,
+                num_values_per_row: NUM_EXPERTS,
+                dtype: Dtype::Bfloat16,
+            },
+            scratch.routing.router_probs,
+            scratch.routing.router_logits,
+        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke(
+            routing_shape,
+            MoERoutingBuffers {
+                router_probs: scratch.routing.router_probs,
+                expert_indices: scratch.routing.expert_indices,
+                expert_probs: scratch.routing.expert_probs,
+            },
+        )));
+
+        match implementation {
+            MoERealImpl::TokenMajor => {
+                recorder.record_with_barrier_before(ReplayOp::opaque(self.experts.invoke_token_major(
+                    sparse_token_major_shape(num_tokens),
+                    QuantizedSparseMLPTokenMajorBuffers {
+                        input,
+                        token_indices: scratch.topk_experts.token_indices,
+                        expert_indices: scratch.routing.expert_indices,
+                        route_indices: scratch.topk_experts.route_indices,
+                        output: scratch.topk_experts.routed_hidden,
+                    },
+                    QuantizedSparseMLPTokenMajorScratch {
+                        activation: scratch.topk_experts.sparse_activation,
+                    },
+                    weights.experts,
+                )));
+                self.record_common(recorder, num_tokens, input, common_scratch, weights);
+                recorder.record_with_barrier_before(ReplayOp::opaque(self.combine.invoke_with_common(
+                    MoECombineWithCommonShape::bf16(num_tokens, TOPK_EXPERTS, HIDDEN_DIM),
+                    MoECombineWithCommonBuffers {
+                        routed_hidden: scratch.topk_experts.routed_hidden,
+                        routed_probs: scratch.routing.expert_probs,
+                        common_hidden: common_scratch.hidden,
+                        common_gate_logits: common_scratch.gate_logits,
+                        output,
+                    },
+                )));
+            },
+            MoERealImpl::ExpertMajor => {
+                let shape = MoEExpertMajorShape::bf16(num_tokens, NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM);
+                self.record_common(recorder, num_tokens, input, common_scratch, weights);
+                recorder.record(ReplayOp::opaque(self.expert_major.invoke_layout(
+                    shape,
+                    MoEExpertMajorLayoutBuffers {
+                        expert_indices: scratch.routing.expert_indices,
+                        expert_counts: scratch.topk_experts.expert_counts,
+                        expert_offsets: scratch.topk_experts.expert_offsets,
+                        expert_cursors: scratch.topk_experts.expert_cursors,
+                        routes_by_expert: scratch.topk_experts.routes_by_expert,
+                        routes_by_token: scratch.topk_experts.routes_by_token,
+                        experts_by_route: scratch.topk_experts.experts_by_route,
+                    },
+                )));
+                recorder.record_with_barrier_before(ReplayOp::opaque(self.expert_major.invoke_pack_input(
+                    shape,
+                    MoEExpertMajorPackInputBuffers {
+                        input,
+                        routes_by_expert: scratch.topk_experts.routes_by_expert,
+                        packed_input: scratch.topk_experts.packed_input,
+                    },
+                )));
+                recorder.record_with_barrier_before(ReplayOp::opaque(
+                    self.experts.invoke_expert_major(
+                        QuantizedSparseMLPExpertMajorShape {
+                            num_experts: NUM_EXPERTS,
+                            num_routes: num_tokens
+                                .checked_mul(TOPK_EXPERTS)
+                                .expect("forced MoE route count must fit u32"),
+                        },
+                        QuantizedSparseMLPExpertMajorBuffers {
+                            packed_input: scratch.topk_experts.packed_input,
+                            experts_by_route: scratch.topk_experts.experts_by_route,
+                            route_output: scratch.topk_experts.routed_hidden,
+                        },
+                        QuantizedSparseMLPExpertMajorScratch {
+                            activation: scratch.topk_experts.sparse_activation,
+                        },
+                        weights.experts,
+                    ),
+                ));
+                recorder.record_with_barrier_before(ReplayOp::opaque(self.expert_major.invoke_scatter_with_common(
+                    shape,
+                    MoEExpertMajorScatterWithCommonBuffers {
+                        route_output: scratch.topk_experts.routed_hidden,
+                        routes_by_token: scratch.topk_experts.routes_by_token,
+                        routed_probs: scratch.routing.expert_probs,
+                        common_hidden: common_scratch.hidden,
+                        common_gate_logits: common_scratch.gate_logits,
+                        output,
+                    },
+                )));
+            },
+        }
+    }
+
+    fn record_common<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_tokens: u32,
+        input: &'a Buffer,
+        scratch: CommonExpertScratchBindings<'a>,
+        weights: ForcedMoEWeights<'a>,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        recorder.record(ReplayOp::opaque(self.common_expert.invoke(
+            QuantizedDenseMLPShape { num_tokens },
+            QuantizedDenseMLPBuffers {
+                hidden_state: input,
+                next_hidden_state: scratch.hidden,
+            },
+            QuantizedDenseMLPScratch {
+                gate_up_proj: scratch.dense_mlp.gate_up_proj,
+                activation: scratch.dense_mlp.activation,
+            },
+            weights.common_expert,
+        )));
+        recorder.record(ReplayOp::opaque(self.common_gate_projection.invoke(
+            num_tokens.try_into().expect("forced MoE token count must fit i32"),
+            scratch.gate_logits,
+            0,
+            input,
+            0,
+            weights.common_gate_weight,
+            0,
+            weights.common_gate_scales,
+            0,
+            weights.common_gate_biases,
+            0,
+        )));
     }
 }
 
@@ -203,29 +408,15 @@ struct RealMoEFixture<'a> {
 }
 
 impl<'a> RealMoEFixture<'a> {
-    fn new(
-        device: &Device,
-        model_layer_index: usize,
-        num_tokens: u32,
-        weights: &'a RealMoEWeights,
-        implementation: MoERealImpl,
-    ) -> Self {
+    fn new(device: &Device, num_tokens: u32, weights: &'a RealMoEWeights, implementation: MoERealImpl) -> Self {
         let stream = Stream::new(device);
         let router_projection_config = affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS);
         let common_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
         let num_tokens_i32 = num_tokens.try_into().expect("MoE token count must fit i32");
-        let routing_shape = MoERoutingShape {
-            num_tokens,
-            num_experts: NUM_EXPERTS,
-            num_experts_per_token: TOPK_EXPERTS,
-            norm_topk_prob: true,
-        };
+        let routing_shape = routing_shape(num_tokens);
         let sparse_config = sparse_config();
         let dense_config = dense_config();
-        let sparse_shape = QuantizedSparseMLPTokenMajorShape {
-            num_routes: num_tokens * TOPK_EXPERTS,
-            num_tokens,
-        };
+        let sparse_shape = sparse_token_major_shape(num_tokens);
         let expert_major_shape = MoEExpertMajorShape::bf16(num_tokens, NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM);
         let expert_major_sparse_shape = QuantizedSparseMLPTokenMajorShape {
             num_routes: expert_major_shape.num_routes(),
@@ -266,61 +457,45 @@ impl<'a> RealMoEFixture<'a> {
             ),
             activation: Buffer::new_zeroed(device, dense_config.activation_shape(dense_shape).bytes()),
         };
-        let core = GatedMoECore {
-            model_layer_index,
-            hidden_dim: HIDDEN_DIM as usize,
-            intermediate_dim: INTERMEDIATE_DIM as usize,
-            common_expert_intermediate_dim: Some(INTERMEDIATE_DIM as usize),
-            num_experts: NUM_EXPERTS as usize,
-            num_experts_per_token: TOPK_EXPERTS as usize,
-            norm_topk_prob: true,
-        };
-        let backend = GatedMoE::new(device, core, moe_backend_config(implementation.policy()));
-        let replay_shape = GatedMoEReplayShape { num_tokens };
+        let kernels = ForcedMoEKernels::new(device, num_tokens);
         let mut builder = MetalReplayRuntime::new(&stream).create_recorder();
-        let _ = <GatedMoE as ReplayLayer>::record(
-            &backend,
+        kernels.record(
             &mut builder,
-            GatedMoEReplayInput {
-                shape: replay_shape,
-                hidden_state: &input,
-                next_hidden_state: &output,
-                scratch: MoEScratchBindings {
-                    routing: MoERoutingScratchBindings {
-                        router_logits: &router_logits,
-                        router_probs: &router_probs,
-                        expert_indices: &expert_indices,
-                        expert_probs: &expert_probs,
-                    },
-                    topk_experts: TopKExpertsScratchBindings {
-                        token_indices: &token_indices,
-                        route_indices: &route_indices,
-                        routed_hidden: &routed_hidden,
-                        sparse_activation: &sparse_activation,
-                        expert_counts: &expert_counts,
-                        expert_offsets: &expert_offsets,
-                        expert_cursors: &expert_cursors,
-                        routes_by_expert: &routes_by_expert,
-                        routes_by_token: &routes_by_token,
-                        experts_by_route: &experts_by_route,
-                        packed_input: &packed_input,
-                    },
+            implementation,
+            num_tokens,
+            &input,
+            &output,
+            MoEScratchBindings {
+                routing: MoERoutingScratchBindings {
+                    router_logits: &router_logits,
+                    router_probs: &router_probs,
+                    expert_indices: &expert_indices,
+                    expert_probs: &expert_probs,
                 },
-                weights: GatedMoEWeights {
-                    router_weight: &weights.router_weight,
-                    router_scales: &weights.router_scales,
-                    router_biases: &weights.router_biases,
-                    topk_experts: weights.sparse.as_borrowed(),
+                topk_experts: TopKExpertsScratchBindings {
+                    token_indices: &token_indices,
+                    route_indices: &route_indices,
+                    routed_hidden: &routed_hidden,
+                    sparse_activation: &sparse_activation,
+                    expert_counts: &expert_counts,
+                    expert_offsets: &expert_offsets,
+                    expert_cursors: &expert_cursors,
+                    routes_by_expert: &routes_by_expert,
+                    routes_by_token: &routes_by_token,
+                    experts_by_route: &experts_by_route,
+                    packed_input: &packed_input,
                 },
-                common_expert: Some(GatedMoECommonExpertReplayInput {
-                    scratch: common_scratch.as_common_scratch(&common_hidden, &common_gate_logits),
-                    weights: GatedMoECommonExpertWeights {
-                        common_gate_weight: &weights.common_gate_weight,
-                        common_gate_scales: &weights.common_gate_scales,
-                        common_gate_biases: &weights.common_gate_biases,
-                        common_expert: weights.common.as_borrowed(),
-                    },
-                }),
+            },
+            common_scratch.as_common_scratch(&common_hidden, &common_gate_logits),
+            ForcedMoEWeights {
+                router_weight: &weights.router_weight,
+                router_scales: &weights.router_scales,
+                router_biases: &weights.router_biases,
+                experts: weights.sparse.as_borrowed(),
+                common_expert: weights.common.as_borrowed(),
+                common_gate_weight: &weights.common_gate_weight,
+                common_gate_scales: &weights.common_gate_scales,
+                common_gate_biases: &weights.common_gate_biases,
             },
         );
         let replay = builder.build();
@@ -882,14 +1057,21 @@ fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
     }
 }
 
-fn moe_backend_config(policy: MoEExecutionPolicy) -> GatedMoEMetalConfig {
-    GatedMoEMetalConfig {
-        group_size: GROUP_SIZE,
-        bits: EXPERT_BITS,
-        router_bits: ROUTER_BITS,
-        common_gate_bits: ROUTER_BITS,
-        dtype: Dtype::Bfloat16,
-        execution_policy: MoEExecutionPolicyConfig::new(policy),
+fn routing_shape(num_tokens: u32) -> MoERoutingShape {
+    MoERoutingShape {
+        num_tokens,
+        num_experts: NUM_EXPERTS,
+        num_experts_per_token: TOPK_EXPERTS,
+        norm_topk_prob: true,
+    }
+}
+
+fn sparse_token_major_shape(num_tokens: u32) -> QuantizedSparseMLPTokenMajorShape {
+    QuantizedSparseMLPTokenMajorShape {
+        num_routes: num_tokens
+            .checked_mul(TOPK_EXPERTS)
+            .expect("forced MoE route count must fit u32"),
+        num_tokens,
     }
 }
 

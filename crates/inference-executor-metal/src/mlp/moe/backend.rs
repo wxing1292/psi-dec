@@ -37,13 +37,13 @@ use inference_backend_metal::operators::SoftmaxShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::mlp::moe::GatedMoECore;
 use inference_executor_core::mlp::moe::GatedMoEReplayShape;
-use inference_executor_core::mlp::moe::MoEExecutionPolicy;
-use inference_executor_core::mlp::moe::MoEExecutionPolicyConfig;
 
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::moe::scratch::CommonExpertScratchBindings;
 use crate::mlp::moe::scratch::MoEScratchBindings;
+
+const TOKEN_MAJOR_MAX_TOKENS: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatedMoEMetalConfig {
@@ -52,7 +52,6 @@ pub struct GatedMoEMetalConfig {
     pub router_bits: u32,
     pub common_gate_bits: u32,
     pub dtype: Dtype,
-    pub execution_policy: MoEExecutionPolicyConfig,
 }
 
 impl GatedMoEMetalConfig {
@@ -112,6 +111,12 @@ pub struct GatedMoE {
     topk_experts_mlp: QuantizedSparseMLP,
     common_expert_mlp: Option<QuantizedDenseMLPKernels>,
     combine: MoECombineKernel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatedMoEPath {
+    TokenMajor,
+    ExpertMajor,
 }
 
 impl GatedMoE {
@@ -528,20 +533,14 @@ impl ReplayLayer for GatedMoE {
         let next_hidden_state = input.next_hidden_state;
         let scratch = input.scratch;
         let weights = input.weights;
-        match (
-            self.config.execution_policy.resolve(shape.num_tokens),
-            input.common_expert,
-        ) {
-            (MoEExecutionPolicy::Auto, _) => {
-                unreachable!("auto policy must resolve to a concrete MoE policy")
-            },
-            (MoEExecutionPolicy::TokenMajor, None) => {
+        match (gated_moe_path(shape), input.common_expert) {
+            (GatedMoEPath::TokenMajor, None) => {
                 self.record_token_major_replay(recorder, shape, hidden_state, next_hidden_state, scratch, weights);
             },
-            (MoEExecutionPolicy::ExpertMajor, None) => {
+            (GatedMoEPath::ExpertMajor, None) => {
                 self.record_expert_major_replay(recorder, shape, hidden_state, next_hidden_state, scratch, weights);
             },
-            (MoEExecutionPolicy::TokenMajor, Some(common_expert)) => {
+            (GatedMoEPath::TokenMajor, Some(common_expert)) => {
                 self.record_token_major_with_common_replay(
                     recorder,
                     shape,
@@ -553,7 +552,7 @@ impl ReplayLayer for GatedMoE {
                     common_expert.weights,
                 );
             },
-            (MoEExecutionPolicy::ExpertMajor, Some(common_expert)) => {
+            (GatedMoEPath::ExpertMajor, Some(common_expert)) => {
                 self.record_expert_major_with_common_replay(
                     recorder,
                     shape,
@@ -567,6 +566,15 @@ impl ReplayLayer for GatedMoE {
             },
         }
         next_hidden_state
+    }
+}
+
+fn gated_moe_path(shape: GatedMoEReplayShape) -> GatedMoEPath {
+    shape.validate();
+    if shape.num_tokens <= TOKEN_MAJOR_MAX_TOKENS {
+        GatedMoEPath::TokenMajor
+    } else {
+        GatedMoEPath::ExpertMajor
     }
 }
 
@@ -642,13 +650,28 @@ mod tests {
             router_bits: 8,
             common_gate_bits: 8,
             dtype: Dtype::Bfloat16,
-            execution_policy: MoEExecutionPolicyConfig::default(),
         };
 
         let common = common_expert_config(&core, core.common_expert_intermediate_dim.unwrap(), metal);
 
         assert_eq!(common.hidden_dim, 2048);
         assert_eq!(common.intermediate_dim, 1024);
+    }
+
+    #[test]
+    fn test_backend_path_selection_boundary() {
+        assert_eq!(
+            gated_moe_path(GatedMoEReplayShape { num_tokens: 1 }),
+            GatedMoEPath::TokenMajor
+        );
+        assert_eq!(
+            gated_moe_path(GatedMoEReplayShape { num_tokens: 4 }),
+            GatedMoEPath::TokenMajor
+        );
+        assert_eq!(
+            gated_moe_path(GatedMoEReplayShape { num_tokens: 5 }),
+            GatedMoEPath::ExpertMajor
+        );
     }
 
     #[test]

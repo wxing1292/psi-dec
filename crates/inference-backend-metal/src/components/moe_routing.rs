@@ -26,10 +26,13 @@ impl MoERoutingShape {
     pub fn validate(self) {
         assert!(self.num_tokens > 0);
         assert!(self.num_experts > 0);
-        assert!(self.num_experts <= 256);
+        assert!(self.num_experts <= 256, "MoE routing supports at most 256 experts");
         assert!(self.num_experts_per_token > 0);
         assert!(self.num_experts_per_token <= self.num_experts);
-        assert!(self.num_experts_per_token <= 16);
+        assert!(
+            self.num_experts_per_token <= 16,
+            "MoE routing supports at most 16 experts per token"
+        );
         assert_u32_index_domain(self.num_router_prob_elements(), "MoE routing probability elements");
         assert_u32_index_domain(self.num_routes(), "MoE routing routes");
     }
@@ -158,6 +161,30 @@ mod tests {
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Stream;
+
+    #[test]
+    #[should_panic(expected = "MoE routing supports at most 256 experts")]
+    fn test_shape_rejects_more_than_256_experts() {
+        MoERoutingShape {
+            num_tokens: 1,
+            num_experts: 257,
+            num_experts_per_token: 1,
+            norm_topk_prob: false,
+        }
+        .validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "MoE routing supports at most 16 experts per token")]
+    fn test_shape_rejects_more_than_16_experts_per_token() {
+        MoERoutingShape {
+            num_tokens: 1,
+            num_experts: 256,
+            num_experts_per_token: 17,
+            norm_topk_prob: false,
+        }
+        .validate();
+    }
 
     #[test]
     #[should_panic(expected = "MoE routing probability elements exceeds the shader u32 element-index domain")]

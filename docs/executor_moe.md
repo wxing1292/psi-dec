@@ -1,12 +1,13 @@
 # MoE Executor
 
 This document describes the current MoE implementation.
-It covers routing, policy selection, expert execution, common-expert composition, tests, and production benchmarks.
+It covers routing, backend path selection, expert execution, common-expert composition, tests, and production
+benchmarks.
 
 ## Source layout
 
 `crates/inference-executor-core` intentionally has no MLX or Metal dependency.
-It owns backend-neutral MoE layer metadata and policy contracts.
+It owns backend-neutral MoE layer metadata.
 `crates/inference-executor-metal` owns the current Metal replay backend.
 MoE is the public semantic boundary.
 The low-level sparse expert MLP remains an inner component of the MoE path.
@@ -15,7 +16,6 @@ The low-level sparse expert MLP remains an inner component of the MoE path.
 crates/inference-executor-core/src/mlp/moe/
   mod.rs      semantic MoE component boundary exports
   core.rs      GatedMoECore + GatedMoEReplayShape
-  policy.rs    MoEExecutionPolicy + MoEExecutionPolicyConfig
 
 crates/inference-executor-metal/src/mlp/moe/
   mod.rs      Metal MoE module root
@@ -75,7 +75,8 @@ down_shape
 router projection -> route top-k -> dispatch -> sparse expert MLP -> combine/scatter
 ```
 
-`GatedMoE` keeps token-major, compact expert-major, and auto execution policies explicit.
+`GatedMoE` owns the token-major and compact expert-major implementations.
+It selects one implementation from the active replay shape.
 The backend implements the executor `ReplayLayer` contract.
 Qwen model and layer code use this contract to append MoE work to a larger e2e replay.
 The contract has one semantic input, one output, and a caller-owned recorder.
@@ -87,7 +88,7 @@ common expert + common gate
 combine/scatter with common contribution
 ```
 
-Current MoE replay records dispatch/layout as part of the selected token-major or expert-major policy.
+Current MoE replay records dispatch/layout as part of the selected token-major or expert-major path.
 The scheduler does not own a separate dispatch phase.
 Model and layer wiring treat the full MoE MLP as one component boundary in a larger layer/model ICB.
 The MoE backend records internal barriers where commands have RAW dependencies.
@@ -124,7 +125,7 @@ Thus, a partially populated common-expert branch is not representable.
 
 `QuantizedSparseMLP` remains a lower-level expert compute component.
 It exposes token-major and expert-major sparse expert MLP compute.
-It does not own routing, dispatch, combine, common-expert work, or policy selection.
+It does not own routing, dispatch, combine, common-expert work, or path selection.
 
 Its token-major shape is `{ num_routes, num_tokens }`.
 Its expert-major shape is `{ num_experts, num_routes }`.
@@ -152,7 +153,9 @@ GatedMoEReplayInput
 Replay returns `next_hidden_state` directly.
 It does not wrap the caller-owned buffer in a one-field output object.
 
-Focused tests and benches use the same `ReplayLayer::record(...)` entrypoint as model replay.
+Focused production-path tests use the same `ReplayLayer::record(...)` entrypoint as model replay.
+The full-forward MoE benchmark composes the lower-level backend components directly.
+This benchmark-only composition can force each implementation without adding a force option to the production API.
 
 The no-common-expert replay order is:
 
@@ -191,11 +194,14 @@ The shape contract is exact for the current microbatch:
 ```text
 num_tokens              current microbatch token count
 num_routes              num_tokens * num_experts_per_token
-policy                  token-major, expert-major, or auto resolved from num_tokens
+backend path            selected from num_tokens
 ```
 
+The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
+`MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
+
 Production callers may allocate scratch with the executor's maximum token capacity.
-Each replay invocation resolves the execution policy from the current `tokens`.
+Each replay invocation selects the backend path from the current `num_tokens`.
 It validates that capacity buffers cover the current route, input, and output shapes.
 The token-major path consumes `token_indices` and `route_indices` directly.
 
@@ -255,9 +261,9 @@ Expert-major sparse compute uses ragged rows with shape `{ num_experts, num_rout
 For each `expert_route` in `0..num_routes`, `experts_by_route[expert_route]` selects the expert.
 It does not allocate `num_experts * routes_per_expert` rows.
 
-Token-major and expert-major replay paths remain explicit probes.
-The model-executor default auto policy uses token-major for `tokens <= 4`.
-It uses expert-major above that threshold.
+Token-major and expert-major replay paths remain explicit benchmark probes.
+The production Metal backend uses token-major for `num_tokens <= 4`.
+It uses expert-major for larger microbatches.
 
 ## Data flow and backend stages
 
@@ -270,7 +276,7 @@ hidden_state[tokens, hidden_dim]
   -> routing top-k
        expert_indices[routes]
        expert_probs[routes]
-  -> sparse expert MLP policy
+  -> selected sparse expert MLP path
   -> combine/scatter
   -> next_hidden_state[tokens, hidden_dim]
 ```
@@ -392,19 +398,22 @@ Recommendation: Add replay barriers only at these actual dependencies:
 - Routing/layout before sparse expert compute.
 - Expert output and common branch before final combine or scatter.
 
-### Policy boundary
+### Backend selection boundary
 
-`GatedMoE` owns policy selection.
+`GatedMoE` owns backend path selection.
 `QuantizedSparseMLP` owns only expert inner compute.
-The current auto policy is:
+The current production selector is:
 
 ```text
 tokens <= 4  -> token-major
 tokens > 4   -> ragged expert-major
 ```
 
-Token-major and expert-major are correctness paths and explicit bench probes.
-Changing the auto threshold is a performance policy change.
+The runtime core and Qwen model config do not contain this threshold.
+They also do not expose a forced implementation.
+The full-forward benchmark directly composes the same lower-level backend components to force token-major or
+expert-major execution.
+Changing the selector is a Metal backend performance change.
 Recommendation: Justify that change with full MoE wrapper numbers, not only isolated sparse MLP kernel timings.
 
 Focused tests compare routing, token-major sparse MLP, and combine with CPU references.
@@ -427,7 +436,7 @@ They include token-major sparse expert forward paths.
 Synthetic forward cases record router projection, routing, sparse expert MLP, common expert MLP, common gate, and
 scatter/combine.
 They record these operations in one batch.
-Token-major and expert-major policies remain explicit replay cases.
+Token-major and expert-major implementations remain explicit replay cases.
 They use the 35B-A3B MoE profile:
 
 ```text
@@ -447,8 +456,8 @@ cargo bench -p inference-executor-metal --bench qwen35_moe -- \
 ```
 
 `qwen35_moe` loads a Qwen3.6-35B-A3B 4-bit checkpoint.
-It uses the MoE replay backend for one sparse layer.
-It runs explicit token-major and compact expert-major MoE replay.
+It composes one sparse layer from the production backend components.
+It runs explicit token-major and compact expert-major replay without a production force flag.
 CLI arguments select the model path, layer, token list, iteration counts, implementation, and parity checking:
 
 ```text
@@ -484,7 +493,7 @@ Route probability semantics must identify logits or already-softmaxed probabilit
 They must also identify whether routing renormalizes selected top-k probabilities.
 
 The expected parity result is bitwise-equal token-major and expert-major output.
-The current auto policy uses token-major for `tokens <= 4`.
+The current production backend uses token-major for `num_tokens <= 4`.
 It uses expert-major for larger microbatches.
 
 [`executor_benchmarks.md`](executor_benchmarks.md) defines shared GPU serialization, benchmark metrics, and

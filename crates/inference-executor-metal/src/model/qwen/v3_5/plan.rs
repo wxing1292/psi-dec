@@ -5,7 +5,6 @@ use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::moe::GatedMoECore;
-use inference_executor_core::mlp::moe::MoEExecutionPolicyConfig;
 use inference_executor_core::model::qwen::v3_5::DSparkConfig;
 use inference_executor_core::model::qwen::v3_5::LayerType;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
@@ -30,7 +29,6 @@ pub struct Qwen35MetalDefaults {
     pub single_q_token_max_q_head_tile_size: u32,
     pub tiled_q_token_tile_size: u32,
     pub tiled_kv_token_tile_size: u32,
-    pub moe_execution_policy: MoEExecutionPolicyConfig,
 }
 
 impl Default for Qwen35MetalDefaults {
@@ -45,7 +43,6 @@ impl Default for Qwen35MetalDefaults {
             single_q_token_max_q_head_tile_size: 8,
             tiled_q_token_tile_size: 8,
             tiled_kv_token_tile_size: 16,
-            moe_execution_policy: MoEExecutionPolicyConfig::default(),
         }
     }
 }
@@ -206,7 +203,6 @@ pub fn qwen35_moe_core_and_metal(
             defaults.bits,
         )?,
         dtype: defaults.hidden_dtype,
-        execution_policy: defaults.moe_execution_policy,
     };
     metal.validate();
     Ok((core, metal))
