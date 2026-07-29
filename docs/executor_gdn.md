@@ -322,7 +322,11 @@ The independent dimensions derive `qk_dim`, `v_dim`, `qkv_dim = Cqkv`, and the c
 Configurable fields do not define them.
 
 `GDNMetalConfig` owns shared execution tuning and numeric configuration. It includes the recurrent `Dv_tile` size, norm
-epsilon, input dtype, and affine dtypes.
+epsilon, input dtype, `qkvabz_scale_bias_dtype`, and `output_scale_bias_dtype`.
+
+The current mixed-dtype affine path owns one QMV BN8/BK32 kernel and one QMM BM32/BN32 kernel per projection.
+`GDN` selects between them from the active row count.
+The same-dtype adaptive `AffineQuantizedMatmul` does not own this mixed-dtype selection yet.
 
 The Qwen adapter supplies its measured default `Dv_tile` value of 8. The reusable backend remains model-agnostic.
 

@@ -8,7 +8,8 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
@@ -393,29 +394,45 @@ where
     builder.build()
 }
 
-fn gdn_qkvabz_affine_shape(num_tokens: u32) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: num_tokens.try_into().expect("GDN qkvabz m must fit i32"),
+fn gdn_qkvabz_affine_config() -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: GDN_QKVABZ_DIM.try_into().expect("GDN qkvabz n must fit i32"),
         k: HIDDEN_DIM.try_into().expect("GDN qkvabz k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GDN group size must fit i32"),
         bits: BITS.try_into().expect("GDN bits must fit i32"),
         input_dtype: Dtype::Float32,
         output_dtype: Dtype::Float32,
-        affine_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
     }
 }
 
-fn gdn_output_affine_shape(num_tokens: u32) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: num_tokens.try_into().expect("GDN output m must fit i32"),
+fn gdn_output_affine_config() -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: HIDDEN_DIM.try_into().expect("GDN output n must fit i32"),
         k: GDN_V_DIM.try_into().expect("GDN output k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GDN group size must fit i32"),
         bits: BITS.try_into().expect("GDN bits must fit i32"),
         input_dtype: Dtype::Float32,
         output_dtype: Dtype::Bfloat16,
-        affine_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
+    }
+}
+
+fn gdn_affine_kernel_kind(num_tokens: u32, config: AffineQuantizedMatmulConfig) -> AffineQuantizedMatmulKernelKind {
+    if num_tokens < qmv_batch_limit(config.k, config.n) {
+        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+    } else {
+        AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+    }
+}
+
+fn qmv_batch_limit(k: i32, n: i32) -> u32 {
+    if k <= 2048 && n <= 2048 {
+        18
+    } else if k <= 4096 && n <= 4096 {
+        12
+    } else {
+        10
     }
 }
 

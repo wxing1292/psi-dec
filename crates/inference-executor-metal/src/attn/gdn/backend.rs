@@ -12,8 +12,9 @@ use inference_backend_metal::components::GDNProjectionSplitShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
@@ -31,8 +32,8 @@ pub struct GDNMetalConfig {
     pub recurrent_v_tile_size: u32,
     pub norm_eps: f32,
     pub input_dtype: Dtype,
-    pub qkvabz_affine_dtype: Dtype,
-    pub output_affine_dtype: Dtype,
+    pub qkvabz_scale_bias_dtype: Dtype,
+    pub output_scale_bias_dtype: Dtype,
 }
 
 impl GDNMetalConfig {
@@ -42,8 +43,8 @@ impl GDNMetalConfig {
         assert!(self.recurrent_v_tile_size > 0);
         assert!(self.norm_eps > 0.0);
         assert!(matches!(self.input_dtype, Dtype::Bfloat16 | Dtype::Float32));
-        assert!(matches!(self.qkvabz_affine_dtype, Dtype::Float32 | Dtype::Bfloat16));
-        assert!(matches!(self.output_affine_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(matches!(self.qkvabz_scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(matches!(self.output_scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
     pub fn internal_dtype(self) -> Dtype {
@@ -112,61 +113,59 @@ impl GDN {
         core.validate();
         config.validate();
         let qkvabz_dim = core.qkvabz_dim();
-        let qkvabz_qmm_m = qmv_batch_limit(core.hidden_dim, qkvabz_dim);
-        let output_qmm_m = qmv_batch_limit(core.v_dim(), core.hidden_dim);
         Self {
             core: core.clone(),
             config,
             qkvabz_projection_qmv: AffineQuantizedMatmulKernel::new(
                 device,
-                affine_shape(
-                    1,
+                affine_config(
                     qkvabz_dim,
                     core.hidden_dim,
                     config.input_dtype,
                     config.internal_dtype(),
-                    config.qkvabz_affine_dtype,
+                    config.qkvabz_scale_bias_dtype,
                     config,
                 ),
+                AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
             ),
             qkvabz_projection_qmm: AffineQuantizedMatmulKernel::new(
                 device,
-                affine_shape(
-                    qkvabz_qmm_m,
+                affine_config(
                     qkvabz_dim,
                     core.hidden_dim,
                     config.input_dtype,
                     config.internal_dtype(),
-                    config.qkvabz_affine_dtype,
+                    config.qkvabz_scale_bias_dtype,
                     config,
                 ),
+                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
             ),
             projection_split: GDNProjectionSplitKernel::new(device),
             core_backend: GDNCoreBackend::new(device, core.clone(), config.recurrent_v_tile_size),
             cast_pre_output_hidden_states: BufferCastKernel::new(device),
             output_projection_qmv: AffineQuantizedMatmulKernel::new(
                 device,
-                affine_shape(
-                    1,
+                affine_config(
                     core.hidden_dim,
                     core.v_dim(),
                     config.boundary_dtype(),
                     config.boundary_dtype(),
-                    config.output_affine_dtype,
+                    config.output_scale_bias_dtype,
                     config,
                 ),
+                AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
             ),
             output_projection_qmm: AffineQuantizedMatmulKernel::new(
                 device,
-                affine_shape(
-                    output_qmm_m,
+                affine_config(
                     core.hidden_dim,
                     core.v_dim(),
                     config.boundary_dtype(),
                     config.boundary_dtype(),
-                    config.output_affine_dtype,
+                    config.output_scale_bias_dtype,
                     config,
                 ),
+                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
             ),
         }
     }
@@ -223,8 +222,8 @@ impl ReplayLayer for GDN {
             },
             dtype => panic!("unsupported GDN input dtype {dtype:?}"),
         };
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkvabz_projection(shape).invoke_with_shape(
-            self.qkvabz_shape(shape),
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkvabz_projection(shape).invoke(
+            shape.num_tokens.try_into().expect("GDN token count must fit i32"),
             scratch.qkvabz,
             0,
             qkvabz_projection_input,
@@ -309,8 +308,8 @@ impl ReplayLayer for GDN {
             Dtype::Float32 => scratch.pre_output_hidden_states,
             dtype => panic!("unsupported GDN boundary dtype {dtype:?}"),
         };
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.output_projection(shape).invoke_with_shape(
-            self.output_shape(shape),
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.output_projection(shape).invoke(
+            shape.num_tokens.try_into().expect("GDN token count must fit i32"),
             next_hidden_state,
             0,
             output_projection_input,
@@ -341,30 +340,6 @@ impl GDN {
         } else {
             &self.output_projection_qmv
         }
-    }
-
-    fn qkvabz_shape(&self, shape: GDNReplayShape) -> AffineQuantizedMatmulShape {
-        affine_shape(
-            shape.num_tokens,
-            self.core.qkvabz_dim(),
-            self.core.hidden_dim,
-            self.config.input_dtype,
-            self.config.internal_dtype(),
-            self.config.qkvabz_affine_dtype,
-            self.config,
-        )
-    }
-
-    fn output_shape(&self, shape: GDNReplayShape) -> AffineQuantizedMatmulShape {
-        affine_shape(
-            shape.num_tokens,
-            self.core.hidden_dim,
-            self.core.v_dim(),
-            self.config.boundary_dtype(),
-            self.config.boundary_dtype(),
-            self.config.output_affine_dtype,
-            self.config,
-        )
     }
 
     fn projection_split_shape(&self, shape: GDNReplayShape) -> GDNProjectionSplitShape {
@@ -423,24 +398,22 @@ impl GDNCoreBackend {
     }
 }
 
-fn affine_shape(
-    m: u32,
+fn affine_config(
     n: usize,
     k: usize,
     input_dtype: Dtype,
     output_dtype: Dtype,
-    affine_dtype: Dtype,
+    scale_bias_dtype: Dtype,
     config: GDNMetalConfig,
-) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: m.try_into().expect("GDN affine m must fit i32"),
+) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: n.try_into().expect("GDN affine n must fit i32"),
         k: k.try_into().expect("GDN affine k must fit i32"),
         group_size: config.group_size.try_into().expect("GDN group size must fit i32"),
         bits: config.bits.try_into().expect("GDN bits must fit i32"),
         input_dtype,
         output_dtype,
-        affine_dtype,
+        scale_bias_dtype,
     }
 }
 

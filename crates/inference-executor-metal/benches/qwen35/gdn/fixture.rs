@@ -46,9 +46,10 @@ use crate::HIDDEN_DIM;
 use crate::build_single_invocation_replay;
 use crate::concat_parts;
 use crate::cu_tokens;
+use crate::gdn_affine_kernel_kind;
 use crate::gdn_conv_state_fixture;
-use crate::gdn_output_affine_shape;
-use crate::gdn_qkvabz_affine_shape;
+use crate::gdn_output_affine_config;
+use crate::gdn_qkvabz_affine_config;
 use crate::gdn_recurrent_state_fixture;
 use crate::hidden_fixture;
 use crate::measure_runs;
@@ -148,8 +149,8 @@ impl<'a> RealGDNFixture<'a> {
             recurrent_v_tile_size: 8,
             norm_eps: GDN_EPS,
             input_dtype: Dtype::Float32,
-            qkvabz_affine_dtype: Dtype::Bfloat16,
-            output_affine_dtype: Dtype::Bfloat16,
+            qkvabz_scale_bias_dtype: Dtype::Bfloat16,
+            output_scale_bias_dtype: Dtype::Bfloat16,
         };
         let backend = GDN::new(device, core, config);
         let hidden_state = Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, HIDDEN_DIM));
@@ -281,15 +282,25 @@ impl<'a> RealGDNFixture<'a> {
 
     fn measure_subcomponents(&self, warmup_iters: usize, iters: usize, runs: usize) {
         let device = &self.device;
-        let qkvabz_projection = AffineQuantizedMatmulKernel::new(device, gdn_qkvabz_affine_shape(self.num_tokens));
+        let qkvabz_config = gdn_qkvabz_affine_config();
+        let qkvabz_projection = AffineQuantizedMatmulKernel::new(
+            device,
+            qkvabz_config,
+            gdn_affine_kernel_kind(self.num_tokens, qkvabz_config),
+        );
         let projection_split = GDNProjectionSplitKernel::new(device);
         let core = GDNCoreKernels::new(device, gdn_core_config());
-        let output_projection = AffineQuantizedMatmulKernel::new(device, gdn_output_affine_shape(self.num_tokens));
+        let output_config = gdn_output_affine_config();
+        let output_projection = AffineQuantizedMatmulKernel::new(
+            device,
+            output_config,
+            gdn_affine_kernel_kind(self.num_tokens, output_config),
+        );
 
         let qkvabz_replay = build_single_invocation_replay(
             &self.stream,
-            qkvabz_projection.invoke_with_shape(
-                gdn_qkvabz_affine_shape(self.num_tokens),
+            qkvabz_projection.invoke(
+                self.num_tokens.try_into().expect("GDN token count must fit i32"),
                 &self.qkvabz,
                 0,
                 &self.hidden_state_f32,
@@ -355,8 +366,8 @@ impl<'a> RealGDNFixture<'a> {
         );
         let output_projection_replay = build_single_invocation_replay(
             &self.stream,
-            output_projection.invoke_with_shape(
-                gdn_output_affine_shape(self.num_tokens),
+            output_projection.invoke(
+                self.num_tokens.try_into().expect("GDN token count must fit i32"),
                 &self.next_hidden_state,
                 0,
                 &self.pre_output_hidden_states,

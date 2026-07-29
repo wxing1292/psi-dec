@@ -19,7 +19,7 @@ use crate::attn::gdn::state_table::GDNRequestStateTable;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3_x::weight::affine_shape;
+use crate::model::qwen::v3_x::weight::affine_config;
 use crate::model::qwen::v3_x::weight::concat_bytes;
 use crate::model::qwen::v3_x::weight::quant_weight;
 use crate::model::qwen::v3_x::weight::typed_tensor;
@@ -127,49 +127,49 @@ impl Qwen3xGDNWeights {
         let qkvabz_scales = concat_bytes(&[&qkv_scales, &a_scales, &b_scales, &z_scales]);
         let qkvabz_biases = concat_bytes(&[&qkv_biases, &a_biases, &b_biases, &z_biases]);
 
-        let qkvabz_shape = affine_shape(
+        let qkvabz_config = affine_config(
             core.qkvabz_dim(),
             core.hidden_dim,
             metal.group_size,
             metal.bits,
             metal.input_dtype,
             metal.internal_dtype(),
-            metal.qkvabz_affine_dtype,
+            metal.qkvabz_scale_bias_dtype,
         );
-        validate_len("GDN qkvabz weight", qkvabz_weight.len(), qkvabz_shape.weight_bytes())?;
+        validate_len("GDN qkvabz weight", qkvabz_weight.len(), qkvabz_config.weight_bytes())?;
         validate_len(
             "GDN qkvabz scales",
             qkvabz_scales.len(),
-            qkvabz_shape.affine_param_bytes(),
+            qkvabz_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "GDN qkvabz biases",
             qkvabz_biases.len(),
-            qkvabz_shape.affine_param_bytes(),
+            qkvabz_config.scale_or_bias_bytes(),
         )?;
 
-        let output_shape = affine_shape(
+        let output_config = affine_config(
             core.hidden_dim,
             core.v_dim(),
             metal.group_size,
             metal.bits,
             metal.internal_dtype(),
             metal.boundary_dtype(),
-            metal.output_affine_dtype,
+            metal.output_scale_bias_dtype,
         );
         let output_weight = quant_weight(store, &bindings.output.weight)?;
         let output_scales = typed_tensor(store, &bindings.output.scales, safetensors::Dtype::BF16)?.into_data();
         let output_biases = typed_tensor(store, &bindings.output.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("GDN output weight", output_weight.len(), output_shape.weight_bytes())?;
+        validate_len("GDN output weight", output_weight.len(), output_config.weight_bytes())?;
         validate_len(
             "GDN output scales",
             output_scales.len(),
-            output_shape.affine_param_bytes(),
+            output_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "GDN output biases",
             output_biases.len(),
-            output_shape.affine_param_bytes(),
+            output_config.scale_or_bias_bytes(),
         )?;
 
         let conv_weight = typed_tensor(store, &bindings.conv_weight, safetensors::Dtype::BF16)?.into_data();
