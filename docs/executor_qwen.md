@@ -3,7 +3,7 @@
 This document describes the current Qwen3 and Qwen3.5/Qwen3.6 Metal executors.
 The Qwen3 executor is Main-only.
 The document covers checkpoint configuration, top-down loading, state preparation, cached replay, and sampling.
-Qwen3.5 also owns its single-module MTP path and retained DSpark components.
+Qwen3.5 also owns its single-module MTP path.
 The `v3_x` directories contain only version-neutral leaf components and utilities.
 Each model owns its structural contracts and execution graph.
 
@@ -24,8 +24,9 @@ crates/inference-executor-core/src/model/qwen/v3_5/
   batch.rs                  Qwen35Microbatch, request, response, and sampled-decision contracts
   pending_transactions.rs   Qwen35 sequence-ordered pending transactions
   weight_layout.rs          exact Qwen35 Main/unembed/MTP binding trees
-  dspark_config.rs          Qwen35 dSpark configuration contract
-  dspark_weight_layout.rs   exact Qwen35 dSpark tensor binding tree
+  v3_x/dspark/
+    config.rs               Qwen3x DSpark configuration contract
+    weight_layout.rs        exact Qwen3x DSpark tensor binding tree
 
 crates/inference-executor-metal/src/
   replay.rs                 generic Replay<T> component/cache owner
@@ -71,8 +72,7 @@ crates/inference-executor-metal/src/
         mod.rs              supported one-layer Qwen35MTP owner and replay key
         embed.rs            Qwen35MTPEmbed and its replay key
         layer.rs            Qwen35MTPLayer and role-specific scratch
-      plan.rs               Qwen35 component configuration, MTP validation, and dSpark plan
-      dspark/                Qwen35 target/context/layer/Markov/speculator components
+      plan.rs               Qwen35 component configuration and MTP validation
       executor/
         mod.rs              Qwen35Executor fields and ReplayableModelBatchExecutor integration
         load.rs             layer count pass and top-down load
@@ -240,7 +240,7 @@ Qwen3 has one cache lane and allocates no GDN state domain.
 
 There is no Main/MTP plan object tree or aggregate component-weight owner.
 Qwen3 Main owns QKV GQA and dense-MLP geometry conversion in `qwen/v3/main/plan.rs`.
-Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, MTP validation, and low-level DSpark planning in `qwen/v3_5/plan.rs`.
+Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, and MTP validation in `qwen/v3_5/plan.rs`.
 Shared leaf loaders receive finalized core and Metal configurations.
 They do not receive model configuration or default bags.
 
@@ -483,15 +483,10 @@ Main batch submission:
 
 ## DSpark scope
 
-The Qwen3.5 subtree owns the retained DSpark implementation.
-Core owns strict configuration and exact weight bindings.
-`v3_5/plan.rs` owns model-specific geometry and Metal configuration.
-`v3_5/dspark/` owns target residual projection, context append, DSpark layers, the Markov head, and speculator
-components.
-
-Neither Qwen3 nor Qwen3.5 currently wires these components into an executor.
-There is no DSpark executor field, replay stage, load/forward path, service option, or end-to-end claim.
-[`dspark_design.md`](dspark_design.md) documents the focused component contract.
+The Qwen3x core subtree owns the DSpark configuration, exact weight bindings, and fixed-block geometry.
+The backend owns the dense block-SDPA component.
+Neither Qwen3 nor Qwen3.5 wires these foundations into an executor at this commit.
+[`dspark_design.md`](dspark_design.md) documents the current foundation boundary.
 
 ## Verification
 
@@ -504,7 +499,7 @@ Unit tests cover:
 - GDN transactions and snapshot I/O.
 - Generic replay idempotence and strict lookup.
 - MTP rejection and generic sampling.
-- DSpark component contracts.
+- DSpark foundation contracts.
 
 End-to-end tests exercise Main-only Qwen3 through server/decode.
 They also exercise Qwen3.5 Main and optional MTP.

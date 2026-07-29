@@ -12,6 +12,7 @@ crates/inference-executor-core/src/attn/
     mod.rs                  GQA module root
     core.rs                 gated QGKV GQACore metadata and projection shapes
     ungated_core.rs         ungated QKV UngatedGQACore metadata and projection shapes
+    dspark_core.rs          DSpark fixed-block geometry and metadata
     reference.rs            CPU projected-GQA correctness oracle
 
 crates/inference-executor-metal/src/attn/
@@ -36,11 +37,11 @@ crates/inference-executor-metal/src/model/qwen/
   v3_5/
     main/layer.rs           Qwen3.5 Main QGKV-GQA/GDN layer variants
     mtp/layer.rs            Qwen3.5 MTP GQA layer composition
-    plan.rs                 Qwen3.5 QGKV GQA geometry/config builder and dSpark plan
+    plan.rs                 Qwen3.5 QGKV GQA geometry/config builder
 
 crates/inference-backend-metal/src/components/
   gqa_attention.rs          reusable Metal paged SDPA component kernels
-  gqa_local_attention.rs    reusable dense bidirectional local-SDPA partial kernel
+  gqa_block_attention.rs    reusable dense bidirectional block-SDPA partial kernel
   gqa_projection.rs         gated QGKV projection split component
   ungated_gqa_projection.rs ungated QKV projection split component
   gqa_norm_rope.rs          reusable Metal q/k fused and single-input norm/RoPE component kernels
@@ -53,7 +54,7 @@ crates/inference-backend-metal/src/components/
     gqa_kv_pages.metal          Metal KV page-update source
     gqa_paged_sdpa_map.metal     Metal paged SDPA map source
     gqa_paged_sdpa_reduce.metal  Metal paged SDPA partial-output reduce source
-    gqa_local_sdpa.metal         Metal dense local-SDPA partial-output source
+    gqa_block_sdpa.metal         Metal dense block-SDPA partial-output source
     gqa_tiled_attention.metal    Metal tiled paged SDPA map/reduce source
     gqa_activation_gate.metal    Metal attention-output gate source
 ```
@@ -133,8 +134,9 @@ components. Their projection, scratch, weights, and replay graphs remain concret
 This structure removes mode checks from the gated QGKV command sequence. It also makes the missing gate structural in
 the ungated QKV path.
 
-Qwen3 Main constructs `UngatedGQACore` and `UngatedGQA`. Qwen3.5 Main and MTP construct `GQACore` and gated `GQA`.
-Qwen3.5 DSpark also uses `UngatedGQACore` for its separate QKV attention graph.
+Qwen3 Main constructs `UngatedGQACore` and `UngatedGQA`.
+Qwen3.5 Main and MTP construct `GQACore` and gated `GQA`.
+Qwen3x DSpark foundations define a separate `UngatedDSparkGQACore`.
 
 Init-time component specialization supplies the head dimensions, head counts, RoPE constants, and page geometry. A
 model-specific runtime branch does not supply these values.
@@ -181,7 +183,7 @@ The `SingleQToken` paged map also permits an invalid-Q-token-tile `SDPAMapTaskTe
 range. This template does not write a paged partial output for that slot.
 
 A caller may populate the reserved max-logit, exp-sum, and normalized `SDPAPartialOutput` through
-`GQALocalSDPAKernel`. It does this before it invokes the unchanged partial-output reducer.
+`GQABlockSDPAKernel`. It does this before it invokes the unchanged partial-output reducer.
 
 This generic composition supports an attention connection that combines paged history with a dense bidirectional
 local block. The backend component does not own model-specific proposal or cache semantics.
@@ -285,7 +287,7 @@ One TaskTemplate can cover several consecutive KV-token tiles. The planner round
 `num_sdpa_map_task_templates` to produce the total replay dispatch and scratch extent.
 
 The backend configuration is model-independent. `model/qwen/v3/main/plan.rs` builds the Qwen3 ungated core.
-`model/qwen/v3_5/plan.rs` builds gated Main/MTP cores and ungated DSpark cores.
+`model/qwen/v3_5/plan.rs` builds gated Main/MTP cores.
 
 Each concrete backend converts its core and `GQAMetalConfig` into a projection split. It also constructs the shared
 norm/RoPE, KV-update, paged-SDPA, and output-projection components.

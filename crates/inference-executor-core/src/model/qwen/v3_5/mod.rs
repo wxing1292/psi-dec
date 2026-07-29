@@ -23,11 +23,4 @@ pub use pending_transactions::Qwen35PendingTransactions;
 
 pub mod weight_layout;
 
-mod dspark_config;
-pub use dspark_config::DSparkConfig;
-pub use dspark_config::DSparkDFlashConfig;
-pub use dspark_config::init_dspark_config;
-
-pub mod dspark_weight_layout;
-
 pub const QWEN35_PAGE_SIZE_BYTES: usize = 32 * 1024;

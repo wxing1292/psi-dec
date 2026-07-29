@@ -1,98 +1,77 @@
-# DSpark Components
+# Qwen3x DSpark Foundations
 
-Current status: The repository retains the low-level Qwen3.5-era component contract.
-The current Qwen3.5 executor and service do not use it.
-Future status: A separate Qwen3 milestone owns detailed DSpark integration.
-That milestone must use the official DeepSeek contract and compatible weights.
+This document describes the current backend-neutral and Metal-backend DSpark foundations.
+The Qwen3 executor does not yet load or execute these components at this commit.
+The Qwen3.5 executor continues to use MTP.
 
 ## Current scope
 
-The repository retains the implemented DSpark configuration, exact tensor bindings, checkpoint conversion, Metal
-components, plans, weights, and focused tests.
-This scope preserves useful low-level work.
-It does not commit the Qwen3.5 runtime to unsupported behavior.
+The repository contains these foundations:
 
-The current Qwen3.5 path deliberately has none of the following:
+- The official flat Qwen3 DSpark configuration contract.
+- Exact source and affine checkpoint binding trees.
+- The `qwen3_dspark_quantize` BF16-to-affine converter.
+- Backend-neutral fixed-block attention geometry.
+- A reusable Metal dense bidirectional block-SDPA component.
 
-- A DSpark field or replay in `Qwen35Executor`.
-- DSpark load, target-capture, or proposal methods.
-- A DSpark capture policy or target-context input.
-- `--hf-dspark-model-dir` service selection.
-- A shared Main/MTP/DSpark speculation abstraction.
-- A DSpark end-to-end correctness or performance claim.
+The repository no longer contains the unwired Qwen3.5-era DSpark model implementation.
 
-MTP is the only optional speculator wired into Qwen3.5.
-
-## Retained source
+## Source layout
 
 ```text
-crates/inference-executor-core/src/model/qwen/v3_5/
-  dspark_config.rs          upstream configuration normalization and target checks
-  dspark_weight_layout.rs   exact source/runtime tensor manifests
+crates/inference-executor-core/src/
+  attn/gqa/
+    dspark_core.rs               fixed-block attention geometry and metadata
+  model/qwen/v3_x/dspark/
+    config.rs                    official flat configuration contract
+    weight_layout.rs             exact source and affine binding trees
+  bin/
+    qwen3_dspark_quantize.rs     official BF16-to-affine converter
 
-crates/inference-executor-core/src/bin/
-  qwen35_dspark_quantize.rs retained BF16 -> affine checkpoint converter
-
-crates/inference-executor-metal/src/model/qwen/v3_5/
-  plan.rs                   retained Qwen35DSparkPlan and direct geometry conversion
-  dspark/
-    attention.rs            DSpark attention composition
-    block_request.rs        request-local block metadata
-    context.rs              target-context append path
-    layer.rs                DSpark layer owner
-    markov.rs               Markov proposal head
-    speculator.rs           low-level DSpark speculator composition
-    target.rs               selected target-residual handling
-    weights.rs              DSpark-owned checkpoint reads and conversion
+crates/inference-backend-metal/src/components/
+  gqa_block_attention.rs         dense bidirectional block-SDPA component
+  gqa_block_attention_test.rs    component correctness tests
+  metal/gqa_block_sdpa.metal     dense bidirectional block-SDPA kernel
 ```
 
-The Qwen3.5 executor load and forward paths do not reference these files.
-Their public low-level contracts remain available to focused tests and future model-specific integration.
+`inference-executor-core` owns model semantics, configuration, weight names, and replay-independent geometry.
+`inference-backend-metal` owns kernel resources, buffer bindings, and dispatch.
 
-`Qwen35Main` retains the narrow, object-safe Qwen3.5-era residual-capture seam.
-It can ask an optional `Rc<dyn Qwen35MainResidualCapture>` for a capture target.
-It makes this request at each model layer's final post-MLP residual add.
-The capture contract returns only an opaque `ResidualCaptureTarget`.
-It has no recorder method.
+The Qwen3x model composition and Qwen3 executor integration are separate later commits.
 
-The Qwen3.5 loader passes `None` for the capture owner.
-Thus, the seam adds no Qwen3.5 operator or output.
+## Configuration and weights
 
-The separate Qwen3 milestone uses `Qwen3MainResidualCapture`.
-That milestone must not bind a semantic component to `ReplayRecorder`.
+`Qwen3xDSparkConfig` parses the official checkpoint fields.
+It validates fixed-block geometry, selected Main layers, RoPE, ungated GQA, and the `vanilla` Markov head.
 
-## Preserved low-level contract
+`Qwen3xDSparkWeightBindings` defines the exact checkpoint tree.
+It supports official BF16 source weights and the affine runtime checkpoint.
 
-The retained implementation models:
-
-- Exact Hikari/DSpark tensor names and affine quantization layouts.
-- Selected target residual geometry.
-- Request-local block metadata and bounded context task coverage.
-- GQA context append with the existing target cache lane layout.
-- Dense DSpark layer and scratch geometry.
-- Markov proposal positions, sampling capacities, and output correction.
-- Component-owned weights and backend buffer contracts.
-
-The standalone quantizer remains available:
+The converter command is:
 
 ```sh
-cargo run -p inference-executor-core --bin qwen35_dspark_quantize -- \
+cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
   --input-dir /path/to/source \
   --output-dir /path/to/output \
   --group-size 64 --bits 4 --markov-w2-bits 8
 ```
 
 The output directory must not already exist.
-Converted weights are not selectable by the current Qwen3.5 server.
 
-## Verification boundary
+## Block attention
 
-Current verification includes compilation and existing low-level tests.
-These tests cover configuration, bindings, geometry, quantization, and components.
-The repository environment has no compatible DSpark model weights.
-Thus, there is no DSpark server/decode validation or DSpark throughput result.
+`UngatedDSparkGQACore` defines proposal-block geometry.
+The block contains one anchor row and the configured MASK rows.
+Every row can attend to the complete local block.
 
-Review future wiring as a new model-specific design.
-It must not infer compatibility from the retained Qwen3.5 components.
-It must not add recorder semantics to the Main capture contract.
-It must not broaden the current Qwen3.5 milestone.
+`GQABlockSDPAKernel` computes one dense bidirectional local-block partial.
+It writes the existing `SDPAPartialOutput` ABI.
+The existing GQA reduce component can combine this partial with paged-history partials.
+
+This component does not own model layers, persistent context pages, proposal lifecycle, or sampling.
+
+## Verification
+
+Core tests cover configuration, bindings, geometry, and converter round trips.
+Metal tests compare block attention with CPU reference results.
+Executor integration and production-path performance evidence belong to later commits.

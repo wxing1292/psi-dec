@@ -145,11 +145,11 @@ pub use gqa_kv_pages::GQAKVPageUpdateConfig;
 pub use gqa_kv_pages::GQAKVPageUpdateShape;
 pub use gqa_kv_pages::GQAPageTableLayout;
 
-mod gqa_local_attention;
-pub use gqa_local_attention::GQALocalSDPABuffers;
-pub use gqa_local_attention::GQALocalSDPAConfig;
-pub use gqa_local_attention::GQALocalSDPAKernel;
-pub use gqa_local_attention::GQALocalSDPAShape;
+mod gqa_block_attention;
+pub use gqa_block_attention::GQABlockSDPABuffers;
+pub use gqa_block_attention::GQABlockSDPAConfig;
+pub use gqa_block_attention::GQABlockSDPAKernel;
+pub use gqa_block_attention::GQABlockSDPAShape;
 
 mod moe_combine;
 pub use moe_combine::MoECombineKernel;

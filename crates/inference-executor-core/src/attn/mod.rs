@@ -5,7 +5,10 @@ pub use gdn::GDNCore;
 pub use gdn::GDNReplayShape;
 
 pub mod gqa;
+pub use gqa::DSparkBlockCapacity;
+pub use gqa::DSparkBlockMetadata;
 pub use gqa::GQACore;
 pub use gqa::GQAPageTableLayout;
 pub use gqa::GQAReplayShape;
+pub use gqa::UngatedDSparkGQACore;
 pub use gqa::UngatedGQACore;

@@ -14,8 +14,10 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use half::bf16;
-use inference_executor_core::model::qwen::v3_5::DSparkConfig;
-use inference_executor_core::model::qwen::v3_5::dspark_weight_layout::Qwen35DSparkWeightBindings;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
+use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
+use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_source_weight_bindings;
 use safetensors::Dtype;
 use safetensors::tensor::Metadata;
 use safetensors::tensor::TensorInfo;
@@ -132,7 +134,7 @@ fn parse_usize(name: &str, value: &std::ffi::OsStr) -> Result<usize> {
 }
 
 fn usage() -> &'static str {
-    "usage: qwen35_dspark_quantize --input-dir DIR --output-dir DIR [--group-size 64] [--bits 4] [--markov-w2-bits 8]"
+    "usage: qwen3_dspark_quantize --input-dir DIR --output-dir DIR [--group-size 64] [--bits 4] [--markov-w2-bits 8]"
 }
 
 fn quantize_checkpoint(input_dir: &Path, output_dir: &Path, options: QuantizeOptions) -> Result<()> {
@@ -143,11 +145,8 @@ fn quantize_checkpoint(input_dir: &Path, output_dir: &Path, options: QuantizeOpt
     let input_config_path = input_dir.join("config.json");
     let input_config_bytes = std::fs::read(&input_config_path)
         .map_err(|err| error(format!("unable to read DSpark config {input_config_path:?}: {err}")))?;
-    let mut config = serde_json::from_slice::<DSparkConfig>(&input_config_bytes)
-        .map_err(|err| error(format!("unable to parse DSpark config {input_config_path:?}: {err}")))?;
-    config
-        .normalize_and_validate()
-        .map_err(|err| error(format!("invalid DSpark config {input_config_path:?}: {err}")))?;
+    let config = init_qwen3x_dspark_config(input_dir)
+        .map_err(|err| error(format!("invalid Qwen3 DSpark config {input_config_path:?}: {err}")))?;
     let mut config_value = serde_json::from_slice::<serde_json::Value>(&input_config_bytes)
         .map_err(|err| error(format!("unable to preserve DSpark config {input_config_path:?}: {err}")))?;
 
@@ -168,7 +167,9 @@ fn quantize_checkpoint(input_dir: &Path, output_dir: &Path, options: QuantizeOpt
         committed: false,
     };
 
-    quantize_safetensors(&input_checkpoint, &temp_dir.join("model.safetensors"), &config, options)?;
+    let output_checkpoint = temp_dir.join("model.safetensors");
+    quantize_safetensors(&input_checkpoint, &output_checkpoint, &config, options)?;
+    write_safetensors_index(&output_checkpoint, &temp_dir.join("model.safetensors.index.json"))?;
     write_output_config(&mut config_value, &temp_dir.join("config.json"), options)?;
     std::fs::rename(&temp_dir, output_dir).map_err(|err| {
         error(format!(
@@ -229,15 +230,22 @@ fn validate_options(options: QuantizeOptions) -> Result<()> {
 fn quantize_safetensors(
     input_path: &Path,
     output_path: &Path,
-    config: &DSparkConfig,
+    config: &Qwen3xDSparkConfig,
     options: QuantizeOptions,
 ) -> Result<()> {
     let mut input = File::open(input_path)
         .map_err(|err| error(format!("unable to open BF16 DSpark checkpoint {input_path:?}: {err}")))?;
     let header = read_header(&mut input, input_path)?;
-    validate_source_tensors(&header, config, input_path)?;
+    let mut bindings = validate_source_tensors(&header, config, input_path)?;
+    if bindings.confidence.is_some() {
+        eprintln!(
+            "warning: omitting Qwen3 DSpark confidence-head weights; this executor checkpoint uses fixed-block \
+             proposals"
+        );
+    }
+    bindings.confidence = None;
     let output_tensors = build_output_tensors(&header, options)?;
-    validate_output_tensor_names(&output_tensors, config)?;
+    validate_output_tensor_names(&output_tensors, &bindings)?;
     let output_by_name = output_tensors
         .iter()
         .map(|tensor| (tensor.name.as_str(), tensor))
@@ -295,6 +303,9 @@ fn quantize_safetensors(
         })?;
 
     for (name, info) in &header.tensors {
+        if is_deferred_tensor(name) {
+            continue;
+        }
         let source = read_tensor(&mut input, &header, name, info, input_path)?;
         if info.shape.len() == 2 {
             let bits = bits_for_tensor(name, options);
@@ -401,20 +412,18 @@ fn read_header(file: &mut File, path: &Path) -> Result<SafetensorsHeader> {
         })
 }
 
-fn validate_source_tensors(header: &SafetensorsHeader, config: &DSparkConfig, path: &Path) -> Result<()> {
-    let expected = expected_source_tensor_names(config);
+fn validate_source_tensors(
+    header: &SafetensorsHeader,
+    config: &Qwen3xDSparkConfig,
+    path: &Path,
+) -> Result<Qwen3xDSparkWeightBindings> {
     let actual = header
         .tensors
         .keys()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    if actual != expected {
-        let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
-        let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>();
-        return Err(error(format!(
-            "DSpark checkpoint {path:?} tensor set mismatch: missing={missing:?} unexpected={unexpected:?}"
-        )));
-    }
+    let bindings = resolve_qwen3x_dspark_source_weight_bindings(config, actual.iter().map(String::as_str))
+        .map_err(|err| error(format!("Qwen3 DSpark checkpoint {path:?} tensor set mismatch: {err}")))?;
     for (name, info) in &header.tensors {
         if info.dtype != Dtype::BF16 {
             return Err(error(format!(
@@ -429,19 +438,11 @@ fn validate_source_tensors(header: &SafetensorsHeader, config: &DSparkConfig, pa
             )));
         }
     }
-    Ok(())
+    Ok(bindings)
 }
 
-fn expected_source_tensor_names(config: &DSparkConfig) -> std::collections::BTreeSet<String> {
-    Qwen35DSparkWeightBindings::from_config(config)
-        .source_tensor_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-fn validate_output_tensor_names(output_tensors: &[OutputTensor], config: &DSparkConfig) -> Result<()> {
-    let expected = Qwen35DSparkWeightBindings::from_config(config)
+fn validate_output_tensor_names(output_tensors: &[OutputTensor], bindings: &Qwen3xDSparkWeightBindings) -> Result<()> {
+    let expected = bindings
         .tensor_names()
         .into_iter()
         .map(str::to_string)
@@ -463,6 +464,9 @@ fn validate_output_tensor_names(output_tensors: &[OutputTensor], config: &DSpark
 fn build_output_tensors(header: &SafetensorsHeader, options: QuantizeOptions) -> Result<Vec<OutputTensor>> {
     let mut tensors = Vec::new();
     for (name, info) in &header.tensors {
+        if is_deferred_tensor(name) {
+            continue;
+        }
         if info.shape.len() == 2 {
             let bits = bits_for_tensor(name, options);
             let input_dim = info.shape[1];
@@ -505,6 +509,10 @@ fn build_output_tensors(header: &SafetensorsHeader, options: QuantizeOptions) ->
             .ok_or_else(|| error("quantized safetensors data length must fit usize"))?;
     }
     Ok(tensors)
+}
+
+fn is_deferred_tensor(name: &str) -> bool {
+    name.starts_with("confidence_head.")
 }
 
 fn output_tensor(name: String, dtype: Dtype, shape: Vec<usize>) -> Result<OutputTensor> {
@@ -740,6 +748,40 @@ fn write_output_config(config: &mut serde_json::Value, path: &Path, options: Qua
     Ok(())
 }
 
+fn write_safetensors_index(checkpoint_path: &Path, index_path: &Path) -> Result<()> {
+    let mut checkpoint = File::open(checkpoint_path).map_err(|err| {
+        error(format!(
+            "unable to open affine DSpark checkpoint {checkpoint_path:?}: {err}"
+        ))
+    })?;
+    let header = read_header(&mut checkpoint, checkpoint_path)?;
+    let total_size = header
+        .tensors
+        .values()
+        .map(|tensor| tensor.data_offsets.1)
+        .max()
+        .unwrap_or(0);
+    let weight_map = header
+        .tensors
+        .keys()
+        .map(|name| (name, "model.safetensors"))
+        .collect::<BTreeMap<_, _>>();
+    let index = serde_json::json!({
+        "metadata": {
+            "total_size": total_size,
+        },
+        "weight_map": weight_map,
+    });
+    let bytes = serde_json::to_vec_pretty(&index)
+        .map_err(|err| error(format!("unable to encode affine DSpark safetensors index: {err}")))?;
+    std::fs::write(index_path, bytes).map_err(|err| {
+        error(format!(
+            "unable to write affine DSpark safetensors index {index_path:?}: {err}"
+        ))
+    })?;
+    Ok(())
+}
+
 fn checked_product(name: &str, factors: &[usize]) -> Result<usize> {
     factors
         .iter()
@@ -848,7 +890,7 @@ mod tests {
             serde_json::to_vec_pretty(&config).unwrap(),
         )
         .unwrap();
-        let parsed = serde_json::from_value::<DSparkConfig>(config).unwrap();
+        let parsed = init_qwen3x_dspark_config(&input_dir).unwrap();
         let tensors = tiny_tensors(&parsed);
         serialize_to_file(
             tensors.iter().map(|(name, tensor)| (name.as_str(), tensor)),
@@ -870,6 +912,18 @@ mod tests {
 
         let bytes = std::fs::read(output_dir.join("model.safetensors")).unwrap();
         let checkpoint = SafeTensors::deserialize(&bytes).unwrap();
+        let index = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(output_dir.join("model.safetensors.index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index["weight_map"].as_object().unwrap().len(), checkpoint.names().len());
+        assert!(
+            index["weight_map"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|file_name| file_name == "model.safetensors")
+        );
         assert_eq!(checkpoint.tensor("fc.weight").unwrap().dtype(), Dtype::U32);
         assert_eq!(checkpoint.tensor("fc.weight").unwrap().shape(), [64, 16]);
         assert_eq!(checkpoint.tensor("fc.scales").unwrap().shape(), [64, 4]);
@@ -878,6 +932,8 @@ mod tests {
             [128, 16]
         );
         assert_eq!(checkpoint.tensor("norm.weight").unwrap().dtype(), Dtype::BF16);
+        assert!(checkpoint.tensor("confidence_head.proj.weight").is_err());
+        assert!(checkpoint.tensor("confidence_head.proj.bias").is_err());
         let output_config =
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(output_dir.join("config.json")).unwrap())
                 .unwrap();
@@ -888,22 +944,22 @@ mod tests {
 
     fn tiny_config() -> serde_json::Value {
         serde_json::json!({
-            "architectures": ["DFlashDraftModel"],
+            "architectures": ["Qwen3DSparkModel"],
             "model_type": "qwen3",
             "block_size": 5,
-            "dflash_config": {
-                "causal_head": false,
-                "causal": false,
-                "mask_token_id": 127,
-                "target_layer_ids": [0, 1]
-            },
+            "mask_token_id": 127,
+            "target_layer_ids": [0, 1],
             "dtype": "bfloat16",
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "hidden_act": "silu",
             "hidden_size": 64,
             "intermediate_size": 128,
             "num_hidden_layers": 2,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
-            "num_target_layers": 2,
+            "num_target_layers": 3,
+            "num_anchors": 16,
             "head_dim": 16,
             "rms_norm_eps": 1e-6,
             "rope_theta": 10000000.0,
@@ -911,11 +967,20 @@ mod tests {
             "vocab_size": 128,
             "markov_rank": 64,
             "markov_head_type": "vanilla",
-            "layer_types": ["full_attention", "full_attention"]
+            "layer_types": ["full_attention", "full_attention"],
+            "enable_confidence_head": true,
+            "confidence_head_with_markov": true,
+            "use_cache": true,
+            "use_sliding_window": false,
+            "sliding_window": null,
+            "rope_parameters": {
+                "rope_theta": 10000000.0,
+                "rope_type": "default"
+            }
         })
     }
 
-    fn tiny_tensors(config: &DSparkConfig) -> BTreeMap<String, OwnedTensor> {
+    fn tiny_tensors(config: &Qwen3xDSparkConfig) -> BTreeMap<String, OwnedTensor> {
         let mut tensors = BTreeMap::new();
         insert_matrix(&mut tensors, "fc.weight", config.hidden_size, config.hidden_size * 2);
         insert_norm(&mut tensors, "hidden_norm.weight", config.hidden_size);
@@ -932,7 +997,14 @@ mod tests {
             config.vocab_size,
             config.markov_rank,
         );
-        for layer in 0..config.num_layers {
+        insert_matrix(
+            &mut tensors,
+            "confidence_head.proj.weight",
+            1,
+            config.hidden_size + config.markov_rank,
+        );
+        insert_norm(&mut tensors, "confidence_head.proj.bias", 1);
+        for layer in 0..config.num_hidden_layers {
             let prefix = format!("layers.{layer}");
             insert_norm(
                 &mut tensors,

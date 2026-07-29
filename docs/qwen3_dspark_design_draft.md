@@ -43,29 +43,21 @@ The design does not permit overlapping batch preparation or execution.
 GPU execution failures are terminal internal failures.
 The design does not provide recoverable GPU rollback.
 
-## Current retained source
+## Current foundation source
 
-The repository currently retains these Qwen3.5-era files:
+The repository currently contains these Qwen3x foundation files:
 
 ```text
-crates/inference-executor-core/src/model/qwen/v3_5/
-  dspark_config.rs          retained nested DFlash-era configuration
-  dspark_weight_layout.rs   retained tensor binding tree
+crates/inference-executor-core/src/model/qwen/v3_x/dspark/
+  config.rs                 official flat configuration contract
+  weight_layout.rs          exact source and affine binding trees
 
 crates/inference-executor-core/src/bin/
-  qwen35_dspark_quantize.rs retained checkpoint converter
+  qwen3_dspark_quantize.rs  checkpoint converter
 
-crates/inference-executor-metal/src/model/qwen/v3_5/
-  plan.rs                   retained Qwen35DSparkPlan
-  dspark/
-    attention.rs
-    block_request.rs
-    context.rs
-    layer.rs
-    markov.rs
-    speculator.rs
-    target.rs
-    weights.rs
+crates/inference-backend-metal/src/components/
+  gqa_block_attention.rs
+  metal/gqa_block_sdpa.metal
 ```
 
 The Qwen3.5 executor does not reference these components from its load or forward path.

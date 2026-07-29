@@ -175,12 +175,12 @@ hf download mlx-community/Qwen3.6-27B-MTP-4bit --local-dir models/Qwen3.6-27B-MT
 Use the corresponding 35B-A3B names for the sparse model. MTP checkpoints contain drafter weights. They must match the
 target family.
 
-### Retained DSpark conversion tool
+### DSpark conversion tool
 
 The repository retains the low-level DSpark checkpoint converter and component contracts:
 
 ```sh
-cargo run -p inference-executor-core --bin qwen35_dspark_quantize -- \
+cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
   --input-dir /path/to/DSpark-Qwen3.6-27B-AEON-draft \
   --output-dir /path/to/DSpark-Qwen3.6-27B-AEON-draft-psi-dec \
   --group-size 64 --bits 4 --markov-w2-bits 8
@@ -188,10 +188,10 @@ cargo run -p inference-executor-core --bin qwen35_dspark_quantize -- \
 
 The output directory must not exist before you run the converter.
 
-The Qwen3.5 service does not connect DSpark. It has no `--hf-dspark-model-dir` option. The current Qwen3.5 server cannot
+The service does not connect DSpark at this commit. It has no `--hf-dspark-model-dir` option. The current server cannot
 select converted weights.
 
-The repository retains the converter and component tests for future integration work.
+The repository provides the converter and foundation tests for later executor integration.
 
 Qwen3 target-only startup:
 
