@@ -154,14 +154,14 @@ The inference server does not own these controls:
 
 ## Binaries and checkpoints
 
-The service provides a target-only Qwen3 binary. It also provides Qwen3.5 binaries that retain their names for current
-Qwen3.6 MLX checkpoints:
+The service provides a Qwen3 binary with optional DSpark.
+It also provides Qwen3.5 binaries that retain their names for current Qwen3.6 MLX checkpoints:
 
-| Model                  | Binary           | Target checkpoint                    | Optional speculator checkpoint           |
-| ---------------------- | ---------------- | ------------------------------------ | ---------------------------------------- |
-| Qwen3 dense 14B        | `qwen3`          | `mlx-community/Qwen3-14B-4bit`       | None                                     |
-| Qwen3.6 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.6-27B-4bit`     | `mlx-community/Qwen3.6-27B-MTP-4bit`     |
-| Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | `mlx-community/Qwen3.6-35B-A3B-MTP-4bit` |
+| Model                  | Binary           | Main checkpoint                      | Optional Spec checkpoint                  |
+| ---------------------- | ---------------- | ------------------------------------ | ----------------------------------------- |
+| Qwen3 dense 14B        | `qwen3`          | `mlx-community/Qwen3-14B-4bit`       | optional official Qwen3 DSpark checkpoint |
+| Qwen3.6 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.6-27B-4bit`     | `mlx-community/Qwen3.6-27B-MTP-4bit`      |
+| Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | `mlx-community/Qwen3.6-35B-A3B-MTP-4bit`  |
 
 Download with the Hugging Face CLI:
 
@@ -172,28 +172,25 @@ hf download mlx-community/Qwen3.6-27B-4bit --local-dir models/Qwen3.6-27B-4bit
 hf download mlx-community/Qwen3.6-27B-MTP-4bit --local-dir models/Qwen3.6-27B-MTP-4bit
 ```
 
-Use the corresponding 35B-A3B names for the sparse model. MTP checkpoints contain drafter weights. They must match the
-target family.
+Use the corresponding 35B-A3B names for the sparse model. MTP checkpoints contain Spec weights. They must match the
+Main model family.
 
-### DSpark conversion tool
+### Qwen3 DSpark conversion
 
-The repository retains the low-level DSpark checkpoint converter and component contracts:
+Convert an official BF16 Qwen3 DSpark checkpoint to the affine executor format:
 
 ```sh
 cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
-  --input-dir /path/to/DSpark-Qwen3.6-27B-AEON-draft \
-  --output-dir /path/to/DSpark-Qwen3.6-27B-AEON-draft-psi-dec \
+  --input-dir /path/to/Qwen3-DSpark \
+  --output-dir /path/to/Qwen3-DSpark-affine \
   --group-size 64 --bits 4 --markov-w2-bits 8
 ```
 
 The output directory must not exist before you run the converter.
+The converter writes `model.safetensors` and `model.safetensors.index.json`.
+It omits confidence-head weights because the first milestone uses fixed-length proposals.
 
-The service does not connect DSpark at this commit. It has no `--hf-dspark-model-dir` option. The current server cannot
-select converted weights.
-
-The repository provides the converter and foundation tests for later executor integration.
-
-Qwen3 target-only startup:
+Qwen3 Main-only startup:
 
 ```sh
 cargo run --release --bin qwen3 -- \
@@ -202,8 +199,18 @@ cargo run --release --bin qwen3 -- \
   --hf-model-dir "$PWD/models/Qwen3-14B-4bit"
 ```
 
-Qwen3 does not provide MTP or DSpark options. Its executor gets stop tokens from the checkpoint configuration when
-`generation_config.json` is absent.
+Qwen3 startup with DSpark:
+
+```sh
+cargo run --release --bin qwen3 -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3-14B-4bit" \
+  --hf-dspark-model-dir "$PWD/models/Qwen3-DSpark-affine"
+```
+
+The Qwen3 executor gets stop tokens from the checkpoint configuration when `generation_config.json` is absent.
+The Qwen3.5 services do not accept `--hf-dspark-model-dir`.
 
 Qwen3.5 startup with MTP enabled:
 
@@ -241,13 +248,16 @@ One lifecycle owner stops both listeners in these conditions:
 `0`.
 
 Value `1` requires that directory. Explicit `--mtp-module 0` ignores an optional MTP directory. Use this value for
-controlled target-only tests.
+controlled Main-only tests.
 
 Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 384K pages. The Qwen3-14B geometry stores eight
 tokens in one physical page.
 
 Its 16-token logical cache block uses 80 pages across 40 layers. Thus, the default holds 4,915 complete blocks. These
 blocks contain 78,640 resident tokens in aggregate.
+
+When DSpark is enabled, the executor adds persistent DSpark context pages to the same logical block.
+The page count depends on the DSpark layer and KV geometry.
 
 Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 384K shared pages.
 
@@ -307,7 +317,7 @@ incremental text.
 The client compares the incremental text with one final full decode. It reports inter-chunk metrics, not inter-token
 metrics.
 
-The client model directory supplies tokenizer and chat-template files. The server controls the target model.
+The client model directory supplies tokenizer and chat-template files. The server controls the Main model.
 
 `--chat-template auto` runs the checkpoint template. It does not use a hard-coded Qwen prompt formatter.
 
@@ -324,7 +334,7 @@ The following command pairs use the same prompt, output limit, sampling values, 
 The HTTP `model` field is optional.
 When the request omits it, the response uses the loaded executor model name.
 When the request provides it, the value labels the response.
-It does not select a different target.
+It does not select a different loaded model.
 
 Use this gRPC command for a Qwen3 server:
 
@@ -475,10 +485,14 @@ Normal sampling submits these replay programs in one ordered Metal command buffe
 - GatherUnembed
 - Sampling
 
-Speculative target verification replaces Sampling with RejectionSampling.
+Speculative Main verification replaces Sampling with RejectionSampling.
 
 An MTP proposal uses a separate submission with MTPEmbed, MTP, GatherUnembed, and DraftSampling. Rejection decisions
 cross the CPU boundary before the next proposal input.
+
+A DSpark proposal uses a separate submission with DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
+The Main submission records DSparkContext before GatherUnembed.
+Main decisions cross the CPU boundary before DSpark constructs the anchor block.
 
 `--logging info` emits one batch event with these fields:
 
@@ -520,8 +534,10 @@ The model-neutral speculator timing fields are:
 - `model_output_spec_read_ms`
 - `model_output_spec_passes`
 
-A pass is one auxiliary speculator forward that runs. For Qwen3.5, each MTP module forward is one pass. This includes
-prefill forwards for cache maintenance.
+A pass is one auxiliary speculator forward that runs.
+For Qwen3.5, each MTP module forward is one pass.
+For Qwen3, each DSpark block forward is one pass.
+Qwen3 does not run DSpark Spec for a prefill-only batch because no sampled anchor exists.
 
 Runtime shutdown emits a scheduler table. The table contains call counts and latency percentiles for the runtime
 lifetime.
@@ -555,7 +571,7 @@ For a release correctness check, first use deterministic sampling:
 
 Use a prompt with an objective oracle. Then, run a long 8K-token generation.
 
-Validate the dense and sparse targets. If MTP paths changed, validate MTP off and on.
+Validate the dense and sparse models. If MTP paths changed, validate MTP off and on.
 
 Record these facts:
 
@@ -568,7 +584,7 @@ Investigate cold-start stalls separately from later decode stalls.
 
 ## End-to-end performance helper
 
-The Qwen3 helper runs target-only decode measurements:
+The Qwen3 helper runs Main-only decode measurements:
 
 ```sh
 PSI_DEC_QWEN3_MODEL_DIR=<qwen3-model-dir> \
@@ -637,7 +653,7 @@ Summaries report these metrics:
 - Tokens for each chunk
 - Exact accepted/proposed speculative-token rate for the matching server-log interval
 
-For target-only decoding, a chunk contains one token. Thus, inter-chunk time is inter-token latency.
+For Main-only decoding, a chunk contains one token. Thus, inter-chunk time is inter-token latency.
 
 With MTP, inter-chunk time measures burst cadence. Interpret it with tokens for each chunk and the acceptance rate.
 

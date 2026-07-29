@@ -16,6 +16,9 @@ pub struct Qwen3Args {
     #[arg(long, value_name = "DIR")]
     pub hf_model_dir: PathBuf,
 
+    #[arg(long, value_name = "DIR", help = "Optional official Qwen3 DSpark model directory")]
+    pub hf_dspark_model_dir: Option<PathBuf>,
+
     #[arg(long, value_enum)]
     pub profile: Option<QwenProfileMode>,
 
@@ -120,6 +123,15 @@ mod tests {
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages, None);
+        assert_eq!(args.hf_dspark_model_dir, None);
+    }
+
+    #[test]
+    fn test_qwen3_accepts_dspark_checkpoint() {
+        let args =
+            Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", "--hf-dspark-model-dir", "dspark"]).unwrap();
+
+        assert_eq!(args.hf_dspark_model_dir, Some("dspark".into()));
     }
 
     #[test]

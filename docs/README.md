@@ -11,7 +11,7 @@ This guide identifies the document that owns each type of information.
 | Project orientation | What is `psi-dec`, and how do I run or read it? | [README](../README.md) |
 | Architecture | Who owns lifecycle, data, and execution order? | [`core.md`](core.md), [`executor.md`](executor.md), Metal backend [README](../crates/inference-backend-metal/README.md) |
 | Current components | What source implements this model component today? | [`executor_qwen.md`](executor_qwen.md), [`executor_gqa.md`](executor_gqa.md), [`executor_gdn.md`](executor_gdn.md), [`executor_dense_mlp.md`](executor_dense_mlp.md), [`executor_moe.md`](executor_moe.md), [`executor_sampling.md`](executor_sampling.md) |
-| Retained components | Which inactive low-level contracts remain in the repository? | [`dspark_design.md`](dspark_design.md) |
+| Qwen3 DSpark | How does the current fixed-block Qwen3 DSpark path work? | [`dspark_design.md`](dspark_design.md) |
 | Workflows | How do I run, verify, benchmark, or profile it? | [`service.md`](service.md), [`executor_benchmarks.md`](executor_benchmarks.md) |
 | Engineering rules | Which rules apply to code, APIs, and technical English? | [`high_level.md`](high_level.md), [`engineering_conventions.md`](engineering_conventions.md), [`technical_english.md`](technical_english.md) |
 | Follow-up work | What remains unresolved or under investigation? | [`future_work.md`](future_work.md) |

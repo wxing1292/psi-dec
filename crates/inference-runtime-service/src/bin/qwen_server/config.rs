@@ -25,6 +25,7 @@ pub struct Qwen3Config {
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
     hf_model_dir: PathBuf,
+    hf_dspark_model_dir: Option<PathBuf>,
     observability: ServiceObservabilityConfig,
     num_cache_pages: usize,
     scheduler_config: SchedulerConfig,
@@ -57,6 +58,7 @@ impl Qwen3Config {
             grpc_listen_addr: args.grpc_listen_addr,
             http_listen_addr: args.http_listen_addr,
             hf_model_dir: args.hf_model_dir,
+            hf_dspark_model_dir: args.hf_dspark_model_dir,
             observability: ServiceObservabilityConfig {
                 profiling: ProfilingConfig {
                     mode: args.profile.map(ProfileMode::from),
@@ -84,6 +86,10 @@ impl Qwen3Config {
 
     pub fn hf_model_dir(&self) -> &Path {
         self.hf_model_dir.as_path()
+    }
+
+    pub fn hf_dspark_model_dir(&self) -> Option<&Path> {
+        self.hf_dspark_model_dir.as_deref()
     }
 
     pub fn observability_config(&self) -> ServiceObservabilityConfig {

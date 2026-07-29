@@ -37,7 +37,7 @@ You need these items:
 - Xcode command-line tools
 - Hugging Face CLI with access to the model
 
-Download the matching target and MTP checkpoints:
+Download the matching Main and MTP checkpoints:
 
 ```sh
 hf auth login
@@ -78,7 +78,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-The [service guide](docs/service.md) includes the sparse 35B-A3B command, target-only startup, gRPC decode, tool calls, and the supported OpenAI-compatible subset.
+The [service guide](docs/service.md) includes the sparse 35B-A3B command, Main-only startup, gRPC decode, tool calls, and the supported OpenAI-compatible subset.
 
 ## Workspace map
 

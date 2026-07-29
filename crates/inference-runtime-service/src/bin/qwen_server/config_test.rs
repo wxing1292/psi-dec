@@ -53,8 +53,8 @@ fn test_listener_overrides() {
 
 #[test]
 fn test_mtp_defaults_from_checkpoint_presence() {
-    let target_only = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
-    assert_eq!(target_only.num_mtp_modules(), 0);
+    let main_only = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
+    assert_eq!(main_only.num_mtp_modules(), 0);
 
     let mtp = Qwen35Config::from_args(parse_qwen35(&["--hf-mtp-model-dir", "mtp-model"])).unwrap();
     assert_eq!(mtp.num_mtp_modules(), 1);

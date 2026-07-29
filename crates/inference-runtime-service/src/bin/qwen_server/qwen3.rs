@@ -5,6 +5,7 @@ use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model;
+use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model_with_dspark;
 use inference_runtime_core::Result;
 use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
@@ -54,16 +55,19 @@ fn run_inner() -> Result<()> {
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
     startup.event("initializing model executor");
-    let model = init_qwen_3_model(
-        config.hf_model_dir(),
-        Qwen3ExecutorConfig {
-            max_requests: QWEN3_MAX_RUNNING_REQUESTS,
-            max_tokens: scheduler_config.max_tokens,
-            max_tokens_per_request: scheduler_config.max_tokens_per_request,
-            num_cache_pages,
-            num_tokens_per_block: TOKENS_PER_CACHE_BLOCK,
+    let executor_config = Qwen3ExecutorConfig {
+        max_requests: QWEN3_MAX_RUNNING_REQUESTS,
+        max_tokens: scheduler_config.max_tokens,
+        max_tokens_per_request: scheduler_config.max_tokens_per_request,
+        num_cache_pages,
+        num_tokens_per_block: TOKENS_PER_CACHE_BLOCK,
+    };
+    let model = match config.hf_dspark_model_dir() {
+        Some(dspark_model_dir) => {
+            init_qwen_3_model_with_dspark(config.hf_model_dir(), dspark_model_dir, executor_config)
         },
-    )
+        None => init_qwen_3_model(config.hf_model_dir(), executor_config),
+    }
     .map_err(|error| {
         log_err_unavailable!(
             "unable to initialize qwen3 model from {:?}: {error}",
@@ -71,6 +75,16 @@ fn run_inner() -> Result<()> {
         )
     })?;
     startup.event("model executor initialized");
+    if let Some(dspark_model_dir) = config.hf_dspark_model_dir() {
+        tracing::info!(
+            target: "inference-runtime-service::startup",
+            component = "qwen3",
+            dspark_model_dir = ?dspark_model_dir,
+            proposal_mode = "fixed-block",
+            confidence_head_execution = false,
+            "qwen3 DSpark configured"
+        );
+    }
 
     let runtime_config = build_runtime_config(&startup, num_cache_pages, &model)?;
 
@@ -84,7 +98,7 @@ fn run_inner() -> Result<()> {
         max_batch_requests = scheduler_config.max_requests,
         max_tokens = scheduler_config.max_tokens,
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
-        "qwen3 target/cache configuration"
+        "qwen3 Main/cache configuration"
     );
 
     startup.event("initializing runtime");
@@ -106,8 +120,8 @@ fn build_runtime_config(
 ) -> Result<RuntimeConfig> {
     let model_config = model.model_config();
     let text = &model_config.text_config;
-    let num_pages_per_kv_block = model.num_main_gqa_page_ids_per_block();
-    let cache_lane = target_cache_lane(num_cache_pages, num_pages_per_kv_block)?;
+    let num_pages_per_kv_block = model.num_kv_page_ids_per_block();
+    let cache_lane = main_cache_lane(num_cache_pages, num_pages_per_kv_block)?;
     startup.cache_lane_config(CacheLaneLogSummary {
         cache_lane: 0,
         mtp: false,
@@ -128,7 +142,7 @@ fn build_runtime_config(
     })
 }
 
-fn target_cache_lane(num_cache_pages: usize, num_pages_per_kv_block: usize) -> Result<CacheLaneRuntimeConfig> {
+fn main_cache_lane(num_cache_pages: usize, num_pages_per_kv_block: usize) -> Result<CacheLaneRuntimeConfig> {
     Ok(CacheLaneRuntimeConfig {
         num_pages_per_kv_block,
         num_pages_per_state_block: 0,
@@ -141,7 +155,7 @@ mod tests {
     use inference_runtime_core::Error;
 
     use super::TOKENS_PER_CACHE_BLOCK;
-    use super::target_cache_lane;
+    use super::main_cache_lane;
 
     #[test]
     fn test_qwen3_uses_small_gqa_logical_blocks() {
@@ -149,8 +163,8 @@ mod tests {
     }
 
     #[test]
-    fn test_target_cache_lane_uses_no_state_pages() {
-        let lane = target_cache_lane(40 * 1024, 80).unwrap();
+    fn test_main_cache_lane_uses_no_state_pages() {
+        let lane = main_cache_lane(40 * 1024, 80).unwrap();
 
         assert_eq!(lane.num_pages_per_kv_block, 80);
         assert_eq!(lane.num_pages_per_state_block, 0);
@@ -158,9 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn test_target_cache_lane_reports_dynamic_minimum_pages() {
+    fn test_main_cache_lane_reports_dynamic_minimum_pages() {
         assert!(matches!(
-            target_cache_lane(79, 80),
+            main_cache_lane(79, 80),
             Err(Error::InvalidArgument(message))
                 if message.contains("--num-cache-pages=79")
                     && message.contains("requiring 80 pages")
