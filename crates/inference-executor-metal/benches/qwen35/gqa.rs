@@ -24,7 +24,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
@@ -648,29 +648,27 @@ where
     builder.build()
 }
 
-fn gqa_qgkv_affine_shape(num_tokens: u32, model: GQAModelProfile) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: num_tokens.try_into().expect("GQA qgkv m must fit i32"),
+fn gqa_qgkv_affine_config(model: GQAModelProfile) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: model.qgkv_dim().try_into().expect("GQA qgkv n must fit i32"),
         k: model.hidden_dim.try_into().expect("GQA qgkv k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GQA group size must fit i32"),
         bits: BITS.try_into().expect("GQA bits must fit i32"),
         input_dtype: Dtype::Bfloat16,
         output_dtype: Dtype::Bfloat16,
-        affine_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
     }
 }
 
-fn gqa_output_affine_shape(num_tokens: u32, model: GQAModelProfile) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: num_tokens.try_into().expect("GQA output m must fit i32"),
+fn gqa_output_affine_config(model: GQAModelProfile) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: model.hidden_dim.try_into().expect("GQA output n must fit i32"),
         k: model.q_dim().try_into().expect("GQA output k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GQA group size must fit i32"),
         bits: BITS.try_into().expect("GQA bits must fit i32"),
         input_dtype: Dtype::Bfloat16,
         output_dtype: Dtype::Bfloat16,
-        affine_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
     }
 }
 

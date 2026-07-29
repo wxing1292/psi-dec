@@ -18,7 +18,7 @@ use crate::attn::gqa::scratch::GQAScratch;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3_x::weight::affine_shape;
+use crate::model::qwen::v3_x::weight::affine_config;
 use crate::model::qwen::v3_x::weight::concat_bytes;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::quant_weight;
@@ -126,7 +126,7 @@ impl Qwen3xGQAWeights {
         let qgkv_scales = concat_bytes(&[&q_scales, &k_scales, &v_scales]);
         let qgkv_biases = concat_bytes(&[&q_biases, &k_biases, &v_biases]);
 
-        let qgkv_shape = affine_shape(
+        let qgkv_config = affine_config(
             core.qgkv_dim(),
             core.hidden_dim,
             metal.group_size,
@@ -135,10 +135,10 @@ impl Qwen3xGQAWeights {
             metal.dtype,
             metal.dtype,
         );
-        validate_len("GQA qgkv weight", qgkv_weight.len(), qgkv_shape.weight_bytes())?;
-        validate_len("GQA qgkv scales", qgkv_scales.len(), qgkv_shape.affine_param_bytes())?;
-        validate_len("GQA qgkv biases", qgkv_biases.len(), qgkv_shape.affine_param_bytes())?;
-        let output_shape = affine_shape(
+        validate_len("GQA qgkv weight", qgkv_weight.len(), qgkv_config.weight_bytes())?;
+        validate_len("GQA qgkv scales", qgkv_scales.len(), qgkv_config.scale_or_bias_bytes())?;
+        validate_len("GQA qgkv biases", qgkv_biases.len(), qgkv_config.scale_or_bias_bytes())?;
+        let output_config = affine_config(
             core.hidden_dim,
             core.q_dim(),
             metal.group_size,
@@ -150,16 +150,16 @@ impl Qwen3xGQAWeights {
         let output_weight = quant_weight(store, &bindings.output.weight)?;
         let output_scales = typed_tensor(store, &bindings.output.scales, safetensors::Dtype::BF16)?.into_data();
         let output_biases = typed_tensor(store, &bindings.output.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("GQA output weight", output_weight.len(), output_shape.weight_bytes())?;
+        validate_len("GQA output weight", output_weight.len(), output_config.weight_bytes())?;
         validate_len(
             "GQA output scales",
             output_scales.len(),
-            output_shape.affine_param_bytes(),
+            output_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "GQA output biases",
             output_biases.len(),
-            output_shape.affine_param_bytes(),
+            output_config.scale_or_bias_bytes(),
         )?;
 
         Ok(Self {

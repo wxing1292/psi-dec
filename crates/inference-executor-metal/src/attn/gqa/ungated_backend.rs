@@ -23,8 +23,8 @@ use inference_backend_metal::components::UngatedGQAProjectionSplitShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedGQACore;
@@ -70,16 +70,14 @@ pub type UngatedGQAOutput<'a> = &'a Buffer;
 pub struct UngatedGQA {
     core: UngatedGQACore,
     config: GQAMetalConfig,
-    qkv_projection_qmv: AffineQuantizedMatmulKernel,
-    qkv_projection_qmm: AffineQuantizedMatmulKernel,
+    qkv_projection: AffineQuantizedMatmul,
     projection_split: UngatedGQAProjectionSplitKernel,
     q_norm_rope: GQANormRopeKernel,
     k_norm_rope: GQANormRopeKernel,
     kv_update: GQAKVPageUpdate,
     paged_sdpa: GQAPagedSDPAKernels,
     tiled_sdpa: GQATiledSDPAKernels,
-    output_projection_qmv: AffineQuantizedMatmulKernel,
-    output_projection_qmm: AffineQuantizedMatmulKernel,
+    output_projection: AffineQuantizedMatmul,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,33 +148,17 @@ impl UngatedGQA {
         validate_config_for_core(&core, config);
         let qkv = core.qkv_shape();
         let output = core.output_shape();
-        let qkv_qmm_m = qmv_batch_limit(qkv.in_dim, qkv.out_dim);
-        let output_qmm_m = qmv_batch_limit(output.in_dim, output.out_dim);
         Self {
             core: core.clone(),
             config,
-            qkv_projection_qmv: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(1, qkv.out_dim, qkv.in_dim, config),
-            ),
-            qkv_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(qkv_qmm_m, qkv.out_dim, qkv.in_dim, config),
-            ),
+            qkv_projection: AffineQuantizedMatmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, config)),
             projection_split: UngatedGQAProjectionSplitKernel::new(device, projection_split_config(&core, config)),
             q_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(&core, config, core.num_q_heads)),
             k_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
             kv_update: GQAKVPageUpdate::new(device, kv_update_config(&core, config)),
             paged_sdpa: GQAPagedSDPAKernels::new(device),
             tiled_sdpa: GQATiledSDPAKernels::new(device),
-            output_projection_qmv: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(1, output.out_dim, output.in_dim, config),
-            ),
-            output_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(output_qmm_m, output.out_dim, output.in_dim, config),
-            ),
+            output_projection: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
         }
     }
 
@@ -239,19 +221,24 @@ impl ReplayLayer for UngatedGQA {
         let weights = input.weights;
         let batch_metadata = input.batch_metadata;
         let scratch = input.scratch;
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv_projection(shape).invoke_with_shape(
-            self.qkv_affine_shape(shape),
-            scratch.qkv_proj,
-            0,
-            hidden_state,
-            0,
-            weights.qkv_weight,
-            0,
-            weights.qkv_scales,
-            0,
-            weights.qkv_biases,
-            0,
-        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(
+            self.qkv_projection.invoke(
+                shape
+                    .num_tokens
+                    .try_into()
+                    .expect("ungated GQA token count must fit i32"),
+                scratch.qkv_proj,
+                0,
+                hidden_state,
+                0,
+                weights.qkv_weight,
+                0,
+                weights.qkv_scales,
+                0,
+                weights.qkv_biases,
+                0,
+            ),
+        ));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.projection_split.invoke(
             self.projection_split_shape(shape),
             UngatedGQAProjectionSplitBuffers {
@@ -352,52 +339,29 @@ impl ReplayLayer for UngatedGQA {
                 scratch.attention_output
             },
         };
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.output_projection(shape).invoke_with_shape(
-            self.output_affine_shape(shape),
-            next_hidden_state,
-            0,
-            attention_output,
-            0,
-            weights.output_weight,
-            0,
-            weights.output_scales,
-            0,
-            weights.output_biases,
-            0,
-        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(
+            self.output_projection.invoke(
+                shape
+                    .num_tokens
+                    .try_into()
+                    .expect("ungated GQA token count must fit i32"),
+                next_hidden_state,
+                0,
+                attention_output,
+                0,
+                weights.output_weight,
+                0,
+                weights.output_scales,
+                0,
+                weights.output_biases,
+                0,
+            ),
+        ));
         next_hidden_state
     }
 }
 
 impl UngatedGQA {
-    fn qkv_projection(&self, shape: GQAReplayShape) -> &AffineQuantizedMatmulKernel {
-        let qkv = self.core.qkv_shape();
-        if shape.num_tokens >= qmv_batch_limit(qkv.in_dim, qkv.out_dim) {
-            &self.qkv_projection_qmm
-        } else {
-            &self.qkv_projection_qmv
-        }
-    }
-
-    fn output_projection(&self, shape: GQAReplayShape) -> &AffineQuantizedMatmulKernel {
-        let output = self.core.output_shape();
-        if shape.num_tokens >= qmv_batch_limit(output.in_dim, output.out_dim) {
-            &self.output_projection_qmm
-        } else {
-            &self.output_projection_qmv
-        }
-    }
-
-    fn qkv_affine_shape(&self, shape: GQAReplayShape) -> AffineQuantizedMatmulShape {
-        let qkv = self.core.qkv_shape();
-        affine_shape(shape.num_tokens, qkv.out_dim, qkv.in_dim, self.config)
-    }
-
-    fn output_affine_shape(&self, shape: GQAReplayShape) -> AffineQuantizedMatmulShape {
-        let output = self.core.output_shape();
-        affine_shape(shape.num_tokens, output.out_dim, output.in_dim, self.config)
-    }
-
     fn projection_split_shape(&self, shape: GQAReplayShape) -> UngatedGQAProjectionSplitShape {
         UngatedGQAProjectionSplitShape {
             num_tokens: shape.num_tokens,
@@ -567,9 +531,8 @@ fn tiled_max_q_head_tile_size(config: GQAMetalConfig) -> usize {
     (256 / (config.tiled_q_token_tile_size / 8 * 32)) as usize
 }
 
-fn affine_shape(m: u32, n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: m.try_into().expect("ungated GQA affine m must fit i32"),
+fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: n.try_into().expect("ungated GQA affine n must fit i32"),
         k: k.try_into().expect("ungated GQA affine k must fit i32"),
         group_size: config
@@ -579,16 +542,6 @@ fn affine_shape(m: u32, n: usize, k: usize, config: GQAMetalConfig) -> AffineQua
         bits: config.bits.try_into().expect("ungated GQA bits must fit i32"),
         input_dtype: config.dtype,
         output_dtype: config.dtype,
-        affine_dtype: config.dtype,
-    }
-}
-
-fn qmv_batch_limit(input_dim: usize, output_dim: usize) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
+        scale_bias_dtype: config.dtype,
     }
 }

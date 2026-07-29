@@ -23,7 +23,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::backend::recorder::Recorder;
@@ -58,10 +58,10 @@ use crate::gqa_attention_reference_at;
 use crate::gqa_kv_update_config;
 use crate::gqa_norm_rope_config;
 use crate::gqa_norm_rope_shape;
-use crate::gqa_output_affine_shape;
+use crate::gqa_output_affine_config;
 use crate::gqa_page_table_layout;
 use crate::gqa_projection_split_config;
-use crate::gqa_qgkv_affine_shape;
+use crate::gqa_qgkv_affine_config;
 use crate::gqa_sdpa_config;
 use crate::gqa_sdpa_shape;
 use crate::hidden_fixture;
@@ -410,13 +410,13 @@ impl<'a> RealGQAFixture<'a> {
             },
         );
         let replay = builder.build();
-        let qgkv_projection = AffineQuantizedMatmulKernel::new(device, gqa_qgkv_affine_shape(num_tokens, model));
+        let qgkv_projection = AffineQuantizedMatmul::new(device, gqa_qgkv_affine_config(model));
         let projection_split = GQAProjectionSplitKernel::new(device, gqa_projection_split_config(model));
         let q_norm_rope_kernel = GQANormRopeKernel::new(device, gqa_norm_rope_config(model.num_q_heads, model));
         let k_norm_rope_kernel = GQANormRopeKernel::new(device, gqa_norm_rope_config(model.num_kv_heads, model));
         let kv_update = GQAKVPageUpdate::new(device, gqa_kv_update_config(model, config.page_bytes));
         let activation_gate = GQAActivationGateKernel::new(device, gqa_activation_gate_config(model));
-        let output_projection = AffineQuantizedMatmulKernel::new(device, gqa_output_affine_shape(num_tokens, model));
+        let output_projection = AffineQuantizedMatmul::new(device, gqa_output_affine_config(model));
         let metal_page_table_layout = gqa_page_table_layout(num_reqs, end_context_len);
         let tiled_shape = GQATiledSDPAShape {
             num_tokens,
@@ -436,8 +436,8 @@ impl<'a> RealGQAFixture<'a> {
         };
         let tiled_kernel = GQATiledSDPAKernels::new(device);
         let mut tiled_builder = MetalReplayRuntime::new(&stream).create_recorder();
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(qgkv_projection.invoke_with_shape(
-            gqa_qgkv_affine_shape(num_tokens, model),
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(qgkv_projection.invoke(
+            num_tokens.try_into().expect("GQA token count must fit i32"),
             &qgkv_proj,
             0,
             &hidden_state,
@@ -526,8 +526,8 @@ impl<'a> RealGQAFixture<'a> {
                 output: &gated_attention_output,
             },
         )));
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(output_projection.invoke_with_shape(
-            gqa_output_affine_shape(num_tokens, model),
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(output_projection.invoke(
+            num_tokens.try_into().expect("GQA token count must fit i32"),
             &tiled_next_hidden_state,
             0,
             &gated_attention_output,
@@ -736,8 +736,7 @@ impl<'a> RealGQAFixture<'a> {
     }
 
     fn measure_subcomponents(&self, selected_subcomponents: &[String], warmup_iters: usize, iters: usize, runs: usize) {
-        let qgkv_projection =
-            AffineQuantizedMatmulKernel::new(&self.device, gqa_qgkv_affine_shape(self.num_tokens, self.model));
+        let qgkv_projection = AffineQuantizedMatmul::new(&self.device, gqa_qgkv_affine_config(self.model));
         let projection_split = GQAProjectionSplitKernel::new(&self.device, gqa_projection_split_config(self.model));
         let q_norm_rope =
             GQANormRopeKernel::new(&self.device, gqa_norm_rope_config(self.model.num_q_heads, self.model));
@@ -746,15 +745,14 @@ impl<'a> RealGQAFixture<'a> {
         let kv_update = GQAKVPageUpdate::new(&self.device, gqa_kv_update_config(self.model, self.model.page_bytes()));
         let sdpa = GQAPagedSDPAKernels::new(&self.device);
         let activation_gate = GQAActivationGateKernel::new(&self.device, gqa_activation_gate_config(self.model));
-        let output_projection =
-            AffineQuantizedMatmulKernel::new(&self.device, gqa_output_affine_shape(self.num_tokens, self.model));
+        let output_projection = AffineQuantizedMatmul::new(&self.device, gqa_output_affine_config(self.model));
         let sdpa_config = gqa_sdpa_config(self.num_reqs, self.end_context_len, self.params, self.model);
         let sdpa_shape = gqa_sdpa_shape(self.batch_metadata.replay_shape());
 
         let qgkv_replay = build_single_invocation_replay(
             &self.stream,
-            qgkv_projection.invoke_with_shape(
-                gqa_qgkv_affine_shape(self.num_tokens, self.model),
+            qgkv_projection.invoke(
+                self.num_tokens.try_into().expect("GQA token count must fit i32"),
                 &self._qgkv_proj,
                 0,
                 &self._hidden_state,
@@ -926,8 +924,8 @@ impl<'a> RealGQAFixture<'a> {
         );
         let output_projection_replay = build_single_invocation_replay(
             &self.stream,
-            output_projection.invoke_with_shape(
-                gqa_output_affine_shape(self.num_tokens, self.model),
+            output_projection.invoke(
+                self.num_tokens.try_into().expect("GQA token count must fit i32"),
                 &self.next_hidden_state,
                 0,
                 &self._gated_attention_output,
