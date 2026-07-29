@@ -23,7 +23,7 @@ use crate::mlp::moe::backend::GatedMoEReplayInput;
 use crate::mlp::moe::backend::GatedMoEWeights;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::qwen::v3_x::layer::dense_mlp::DenseMLPWeightBuffers;
-use crate::model::qwen::v3_x::weight::affine_shape;
+use crate::model::qwen::v3_x::weight::affine_config;
 use crate::model::qwen::v3_x::weight::quant_weight;
 use crate::model::qwen::v3_x::weight::sparse_affine_layout;
 use crate::model::qwen::v3_x::weight::typed_tensor;
@@ -126,7 +126,7 @@ impl Qwen3xMoEWeights {
     ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
-        let router_shape = affine_shape(
+        let router_config = affine_config(
             core.num_experts,
             core.hidden_dim,
             metal.group_size,
@@ -138,16 +138,20 @@ impl Qwen3xMoEWeights {
         let router_weight = quant_weight(store, &bindings.router.weight)?;
         let router_scales = typed_tensor(store, &bindings.router.scales, safetensors::Dtype::BF16)?.into_data();
         let router_biases = typed_tensor(store, &bindings.router.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("sparse router weight", router_weight.len(), router_shape.weight_bytes())?;
+        validate_len(
+            "sparse router weight",
+            router_weight.len(),
+            router_config.weight_bytes(),
+        )?;
         validate_len(
             "sparse router scales",
             router_scales.len(),
-            router_shape.affine_param_bytes(),
+            router_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "sparse router biases",
             router_biases.len(),
-            router_shape.affine_param_bytes(),
+            router_config.scale_or_bias_bytes(),
         )?;
 
         let experts = Qwen3xSparseExpertWeights::load(device, store, &bindings.experts, core, metal)?;
@@ -160,7 +164,7 @@ impl Qwen3xMoEWeights {
                 .shared_expert
                 .as_ref()
                 .expect("qwen3.x common expert geometry requires shared expert bindings");
-            let gate_shape = affine_shape(
+            let gate_config = affine_config(
                 1,
                 core.hidden_dim,
                 metal.group_size,
@@ -175,17 +179,17 @@ impl Qwen3xMoEWeights {
             validate_len(
                 "sparse shared gate weight",
                 gate_weight.len(),
-                gate_shape.weight_bytes(),
+                gate_config.weight_bytes(),
             )?;
             validate_len(
                 "sparse shared gate scales",
                 gate_scales.len(),
-                gate_shape.affine_param_bytes(),
+                gate_config.scale_or_bias_bytes(),
             )?;
             validate_len(
                 "sparse shared gate biases",
                 gate_biases.len(),
-                gate_shape.affine_param_bytes(),
+                gate_config.scale_or_bias_bytes(),
             )?;
             let common_core = DenseMLPCore {
                 model_layer_index: core.model_layer_index,
@@ -247,12 +251,12 @@ impl Qwen3xSparseExpertWeights {
         validate_len(
             "sparse expert gate scales",
             gate_scales.len(),
-            expert_gate_layout.affine_param_bytes(),
+            expert_gate_layout.scale_or_bias_bytes(),
         )?;
         validate_len(
             "sparse expert gate biases",
             gate_biases.len(),
-            expert_gate_layout.affine_param_bytes(),
+            expert_gate_layout.scale_or_bias_bytes(),
         )?;
         validate_len(
             "sparse expert up weight",
@@ -262,12 +266,12 @@ impl Qwen3xSparseExpertWeights {
         validate_len(
             "sparse expert up scales",
             up_scales.len(),
-            expert_gate_layout.affine_param_bytes(),
+            expert_gate_layout.scale_or_bias_bytes(),
         )?;
         validate_len(
             "sparse expert up biases",
             up_biases.len(),
-            expert_gate_layout.affine_param_bytes(),
+            expert_gate_layout.scale_or_bias_bytes(),
         )?;
         validate_len(
             "sparse expert down weight",
@@ -277,12 +281,12 @@ impl Qwen3xSparseExpertWeights {
         validate_len(
             "sparse expert down scales",
             down_scales.len(),
-            expert_down_layout.affine_param_bytes(),
+            expert_down_layout.scale_or_bias_bytes(),
         )?;
         validate_len(
             "sparse expert down biases",
             down_biases.len(),
-            expert_down_layout.affine_param_bytes(),
+            expert_down_layout.scale_or_bias_bytes(),
         )?;
         Ok(Self {
             gate_weight: Buffer::from_slice(device, &gate_weight),

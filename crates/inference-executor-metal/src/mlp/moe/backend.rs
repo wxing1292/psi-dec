@@ -30,8 +30,8 @@ use inference_backend_metal::components::QuantizedSparseMLPWeights;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_backend_metal::operators::SoftmaxKernel;
 use inference_backend_metal::operators::SoftmaxShape;
 use inference_executor_core::backend::recorder::Recorder;
@@ -104,11 +104,9 @@ pub struct GatedMoEReplayInput<'a> {
 pub struct GatedMoE {
     core: GatedMoECore,
     config: GatedMoEMetalConfig,
-    router_projection_qmv: AffineQuantizedMatmulKernel,
-    router_projection_qmm: AffineQuantizedMatmulKernel,
+    router_projection: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
-    common_gate_projection_qmv: AffineQuantizedMatmulKernel,
-    common_gate_projection_qmm: AffineQuantizedMatmulKernel,
+    common_gate_projection: AffineQuantizedMatmul,
     routing: MoERoutingKernel,
     expert_major: MoEExpertMajorKernels,
     topk_experts_mlp: QuantizedSparseMLP,
@@ -129,22 +127,10 @@ impl GatedMoE {
         core.validate();
         config.validate();
         let router_shape = core.router_shape();
-        let router_qmm_m = qmv_batch_limit(router_shape.in_dim, router_shape.out_dim);
-        let common_gate_qmm_m = qmv_batch_limit(core.hidden_dim, 1);
         Self {
-            router_projection_qmv: AffineQuantizedMatmulKernel::new(
+            router_projection: AffineQuantizedMatmul::new(
                 device,
-                affine_shape_with_bits(1, router_shape.out_dim, router_shape.in_dim, config.router_bits, config),
-            ),
-            router_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape_with_bits(
-                    router_qmm_m,
-                    router_shape.out_dim,
-                    router_shape.in_dim,
-                    config.router_bits,
-                    config,
-                ),
+                affine_config_with_bits(router_shape.out_dim, router_shape.in_dim, config.router_bits, config),
             ),
             router_softmax: SoftmaxKernel::new(
                 device,
@@ -154,13 +140,9 @@ impl GatedMoE {
                     dtype: config.dtype,
                 },
             ),
-            common_gate_projection_qmv: AffineQuantizedMatmulKernel::new(
+            common_gate_projection: AffineQuantizedMatmul::new(
                 device,
-                affine_shape_with_bits(1, 1, core.hidden_dim, config.common_gate_bits, config),
-            ),
-            common_gate_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape_with_bits(common_gate_qmm_m, 1, core.hidden_dim, config.common_gate_bits, config),
+                affine_config_with_bits(1, core.hidden_dim, config.common_gate_bits, config),
             ),
             routing: MoERoutingKernel::new(device),
             expert_major: MoEExpertMajorKernels::new(device),
@@ -378,8 +360,8 @@ impl GatedMoE {
     ) where
         I: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        builder.record_with_barrier_before(ReplayOp::opaque(self.router_projection(shape).invoke_with_shape(
-            self.router_projection_shape(shape),
+        builder.record_with_barrier_before(ReplayOp::opaque(self.router_projection.invoke(
+            shape.num_tokens.try_into().expect("MoE token count must fit i32"),
             scratch.routing.router_logits,
             0,
             input,
@@ -432,8 +414,8 @@ impl GatedMoE {
             },
             weights.common_expert,
         )));
-        builder.record(ReplayOp::opaque(self.common_gate_projection(shape).invoke_with_shape(
-            self.common_gate_shape(shape),
+        builder.record(ReplayOp::opaque(self.common_gate_projection.invoke(
+            shape.num_tokens.try_into().expect("MoE token count must fit i32"),
             scratch.gate_logits,
             0,
             input,
@@ -445,44 +427,6 @@ impl GatedMoE {
             weights.common_gate_biases,
             0,
         )));
-    }
-
-    fn router_projection(&self, shape: GatedMoEReplayShape) -> &AffineQuantizedMatmulKernel {
-        let router = self.core.router_shape();
-        if shape.num_tokens >= qmv_batch_limit(router.in_dim, router.out_dim) {
-            &self.router_projection_qmm
-        } else {
-            &self.router_projection_qmv
-        }
-    }
-
-    fn router_projection_shape(&self, shape: GatedMoEReplayShape) -> AffineQuantizedMatmulShape {
-        let router = self.core.router_shape();
-        affine_shape_with_bits(
-            shape.num_tokens,
-            router.out_dim,
-            router.in_dim,
-            self.config.router_bits,
-            self.config,
-        )
-    }
-
-    fn common_gate_projection(&self, shape: GatedMoEReplayShape) -> &AffineQuantizedMatmulKernel {
-        if shape.num_tokens >= qmv_batch_limit(self.core.hidden_dim, 1) {
-            &self.common_gate_projection_qmm
-        } else {
-            &self.common_gate_projection_qmv
-        }
-    }
-
-    fn common_gate_shape(&self, shape: GatedMoEReplayShape) -> AffineQuantizedMatmulShape {
-        affine_shape_with_bits(
-            shape.num_tokens,
-            1,
-            self.core.hidden_dim,
-            self.config.common_gate_bits,
-            self.config,
-        )
     }
 
     fn common_expert_dense_shape(&self, shape: GatedMoEReplayShape) -> QuantizedDenseMLPShape {
@@ -661,36 +605,15 @@ fn common_expert_config(
     }
 }
 
-fn affine_shape(m: u32, n: usize, k: usize, config: GatedMoEMetalConfig) -> AffineQuantizedMatmulShape {
-    affine_shape_with_bits(m, n, k, config.bits, config)
-}
-
-fn affine_shape_with_bits(
-    m: u32,
-    n: usize,
-    k: usize,
-    bits: u32,
-    config: GatedMoEMetalConfig,
-) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: m.try_into().expect("MoE affine m must fit i32"),
+fn affine_config_with_bits(n: usize, k: usize, bits: u32, config: GatedMoEMetalConfig) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: n.try_into().expect("MoE affine n must fit i32"),
         k: k.try_into().expect("MoE affine k must fit i32"),
         group_size: config.group_size.try_into().expect("MoE group size must fit i32"),
         bits: bits.try_into().expect("MoE bits must fit i32"),
         input_dtype: config.dtype,
         output_dtype: config.dtype,
-        affine_dtype: config.dtype,
-    }
-}
-
-fn qmv_batch_limit(input_dim: usize, output_dim: usize) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
+        scale_bias_dtype: config.dtype,
     }
 }
 

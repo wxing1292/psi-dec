@@ -107,6 +107,12 @@ Qwen3.6-35B-A3B uses 4-bit expert MLPs and 8-bit router/common-gate tensors thro
 The Qwen component geometry helper resolves these overrides during semantic load.
 Benches must not assume one global bit width for all projections in a MoE layer.
 
+The router and common-gate projections each use one adaptive affine operator.
+`GatedMoE` provides the fixed projection geometry and quantization layout when it creates each operator.
+It provides the current active token count when it records each projection.
+The affine operator selects QMV or a QMM tile.
+`GatedMoE` does not store separate QMV/QMM kernels or a projection threshold.
+
 `GatedMoECore::common_expert_intermediate_dim` is the only semantic source for common-expert presence and shape.
 Code must not infer this information from `intermediate_dim`.
 Routed and common experts can use different intermediate widths.

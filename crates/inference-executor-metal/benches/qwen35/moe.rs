@@ -22,7 +22,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::mlp::moe::GatedMoECore;
 use inference_executor_core::mlp::moe::GatedMoEReplayShape;
 use inference_executor_core::mlp::moe::MoEExecutionPolicy;
@@ -211,26 +211,9 @@ impl<'a> RealMoEFixture<'a> {
         implementation: MoERealImpl,
     ) -> Self {
         let stream = Stream::new(device);
-        let router_projection_shape = AffineQuantizedMatmulShape {
-            m: num_tokens as i32,
-            n: NUM_EXPERTS as i32,
-            k: HIDDEN_DIM as i32,
-            group_size: GROUP_SIZE as i32,
-            bits: ROUTER_BITS as i32,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
-        };
-        let common_gate_shape = AffineQuantizedMatmulShape {
-            m: num_tokens as i32,
-            n: 1,
-            k: HIDDEN_DIM as i32,
-            group_size: GROUP_SIZE as i32,
-            bits: ROUTER_BITS as i32,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
-        };
+        let router_projection_config = affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS);
+        let common_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
+        let num_tokens_i32 = num_tokens.try_into().expect("MoE token count must fit i32");
         let routing_shape = MoERoutingShape {
             num_tokens,
             num_experts: NUM_EXPERTS,
@@ -256,8 +239,8 @@ impl<'a> RealMoEFixture<'a> {
         let combine_shape = MoECombineWithCommonShape::bf16(num_tokens, TOPK_EXPERTS, HIDDEN_DIM);
         let num_routes = num_tokens as usize * TOPK_EXPERTS as usize;
         let input = Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, HIDDEN_DIM as usize));
-        let router_logits = Buffer::new_zeroed(device, router_projection_shape.output_bytes());
-        let router_probs = Buffer::new_zeroed(device, router_projection_shape.output_bytes());
+        let router_logits = Buffer::new_zeroed(device, router_projection_config.output_bytes(num_tokens_i32));
+        let router_probs = Buffer::new_zeroed(device, router_projection_config.output_bytes(num_tokens_i32));
         let expert_indices = Buffer::new_zeroed(device, routing_shape.expert_indices_bytes());
         let expert_probs = Buffer::new_zeroed(device, routing_shape.expert_probs_bytes());
         let token_indices =
@@ -273,8 +256,8 @@ impl<'a> RealMoEFixture<'a> {
         let routed_hidden = Buffer::new_zeroed(device, sparse_config.token_major_output_bytes(selected_sparse_shape));
         let sparse_activation =
             Buffer::new_zeroed(device, sparse_config.activation_bytes(selected_sparse_shape.num_routes));
-        let common_hidden = Buffer::new_zeroed(device, dense_config.down_shape(dense_shape).output_bytes());
-        let common_gate_logits = Buffer::new_zeroed(device, common_gate_shape.output_bytes());
+        let common_hidden = Buffer::new_zeroed(device, dense_config.down_config().output_bytes(num_tokens_i32));
+        let common_gate_logits = Buffer::new_zeroed(device, common_gate_config.output_bytes(num_tokens_i32));
         let output = Buffer::new_zeroed(device, combine_shape.output_bytes());
         let common_scratch = DenseMLPScratch {
             gate_up_proj: Buffer::new_zeroed(
@@ -808,32 +791,14 @@ fn validate_weight_sizes(
     sparse: &SparseMLPWeights,
     common: &DenseMLPWeights,
 ) {
-    let router_shape = AffineQuantizedMatmulShape {
-        m: 1,
-        n: NUM_EXPERTS as i32,
-        k: HIDDEN_DIM as i32,
-        group_size: GROUP_SIZE as i32,
-        bits: ROUTER_BITS as i32,
-        input_dtype: Dtype::Bfloat16,
-        output_dtype: Dtype::Bfloat16,
-        affine_dtype: Dtype::Bfloat16,
-    };
-    let common_gate_shape = AffineQuantizedMatmulShape {
-        m: 1,
-        n: 1,
-        k: HIDDEN_DIM as i32,
-        group_size: GROUP_SIZE as i32,
-        bits: ROUTER_BITS as i32,
-        input_dtype: Dtype::Bfloat16,
-        output_dtype: Dtype::Bfloat16,
-        affine_dtype: Dtype::Bfloat16,
-    };
-    assert_eq!(router_weight.len(), router_shape.weight_bytes());
-    assert_eq!(router_scales.len(), router_shape.affine_param_bytes());
-    assert_eq!(router_biases.len(), router_shape.affine_param_bytes());
-    assert_eq!(common_gate_weight.len(), common_gate_shape.weight_bytes());
-    assert_eq!(common_gate_scales.len(), common_gate_shape.affine_param_bytes());
-    assert_eq!(common_gate_biases.len(), common_gate_shape.affine_param_bytes());
+    let router_config = affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS);
+    let common_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
+    assert_eq!(router_weight.len(), router_config.weight_bytes());
+    assert_eq!(router_scales.len(), router_config.scale_or_bias_bytes());
+    assert_eq!(router_biases.len(), router_config.scale_or_bias_bytes());
+    assert_eq!(common_gate_weight.len(), common_gate_config.weight_bytes());
+    assert_eq!(common_gate_scales.len(), common_gate_config.scale_or_bias_bytes());
+    assert_eq!(common_gate_biases.len(), common_gate_config.scale_or_bias_bytes());
     let sparse_config = sparse_config();
     let sparse_shape = QuantizedSparseMLPTokenMajorShape {
         num_routes: TOPK_EXPERTS,
@@ -869,21 +834,20 @@ fn validate_weight_sizes(
         NUM_EXPERTS as usize * down_shape.affine_param_bytes_per_expert()
     );
     let dense_config = dense_config();
-    let dense_shape = QuantizedDenseMLPShape { num_tokens: 1 };
-    let dense_gate_up_shape = dense_config.gate_up_shape(dense_shape);
-    let dense_down_shape = dense_config.down_shape(dense_shape);
-    assert_eq!(common.gate_up_weight.len_bytes(), dense_gate_up_shape.weight_bytes());
+    let dense_gate_up_config = dense_config.gate_up_config();
+    let dense_down_config = dense_config.down_config();
+    assert_eq!(common.gate_up_weight.len_bytes(), dense_gate_up_config.weight_bytes());
     assert_eq!(
         common.gate_up_scales.len_bytes(),
-        dense_gate_up_shape.affine_param_bytes()
+        dense_gate_up_config.scale_or_bias_bytes()
     );
     assert_eq!(
         common.gate_up_biases.len_bytes(),
-        dense_gate_up_shape.affine_param_bytes()
+        dense_gate_up_config.scale_or_bias_bytes()
     );
-    assert_eq!(common.down_weight.len_bytes(), dense_down_shape.weight_bytes());
-    assert_eq!(common.down_scales.len_bytes(), dense_down_shape.affine_param_bytes());
-    assert_eq!(common.down_biases.len_bytes(), dense_down_shape.affine_param_bytes());
+    assert_eq!(common.down_weight.len_bytes(), dense_down_config.weight_bytes());
+    assert_eq!(common.down_scales.len_bytes(), dense_down_config.scale_or_bias_bytes());
+    assert_eq!(common.down_biases.len_bytes(), dense_down_config.scale_or_bias_bytes());
 }
 
 fn sparse_config() -> QuantizedSparseMLPConfig {
@@ -903,6 +867,18 @@ fn dense_config() -> QuantizedDenseMLPConfig {
         group_size: GROUP_SIZE,
         bits: EXPERT_BITS,
         dtype: Dtype::Bfloat16,
+    }
+}
+
+fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
+        n: n.try_into().expect("MoE affine output dimension must fit i32"),
+        k: k.try_into().expect("MoE affine input dimension must fit i32"),
+        group_size: GROUP_SIZE.try_into().expect("MoE affine group size must fit i32"),
+        bits: bits.try_into().expect("MoE affine bits must fit i32"),
+        input_dtype: Dtype::Bfloat16,
+        output_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
     }
 }
 

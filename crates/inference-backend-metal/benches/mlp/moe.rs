@@ -39,8 +39,8 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::ReplayProgramBuilder;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_backend_metal::operators::SoftmaxKernel;
 use inference_backend_metal::operators::SoftmaxShape;
 
@@ -67,6 +67,16 @@ const ROUTER_BITS: u32 = 8;
 const MOE_PROFILE: &str = "qwen36-35b-a3b";
 const BENCH_TOKENS: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
 const AUTO_EXPERT_MAJOR_MIN_TOKENS: u32 = 32;
+
+fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig::same_dtype(
+        n.try_into().expect("MoE affine output dimension must fit i32"),
+        k.try_into().expect("MoE affine input dimension must fit i32"),
+        GROUP_SIZE.try_into().expect("MoE affine group size must fit i32"),
+        bits.try_into().expect("MoE affine bits must fit i32"),
+        Dtype::Bfloat16,
+    )
+}
 
 fn bench_moe(c: &mut Criterion) {
     let device = Device::system_default();
@@ -323,16 +333,14 @@ fn build_combine_with_common_replay(
 
 struct MoEForwardFixture {
     stream: Stream,
-    router_projection_shape: AffineQuantizedMatmulShape,
-    common_gate_shape: AffineQuantizedMatmulShape,
     routing_shape: MoERoutingShape,
     sparse_shape: QuantizedSparseMLPTokenMajorShape,
     expert_major_shape: MoEExpertMajorShape,
     dense_shape: QuantizedDenseMLPShape,
     combine_shape: MoECombineWithCommonShape,
-    router_projection: AffineQuantizedMatmulKernel,
+    router_projection: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
-    common_gate_projection: AffineQuantizedMatmulKernel,
+    common_gate_projection: AffineQuantizedMatmul,
     routing: MoERoutingKernel,
     expert_major: MoEExpertMajorKernels,
     sparse_mlp: QuantizedSparseMLP,
@@ -376,26 +384,9 @@ struct MoEForwardFixture {
 impl MoEForwardFixture {
     fn new(device: &Device, num_tokens: u32) -> Self {
         let stream = Stream::new(device);
-        let router_projection_shape = AffineQuantizedMatmulShape {
-            m: num_tokens as i32,
-            n: NUM_EXPERTS as i32,
-            k: HIDDEN_DIM as i32,
-            group_size: GROUP_SIZE as i32,
-            bits: ROUTER_BITS as i32,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
-        };
-        let common_gate_shape = AffineQuantizedMatmulShape {
-            m: num_tokens as i32,
-            n: 1,
-            k: HIDDEN_DIM as i32,
-            group_size: GROUP_SIZE as i32,
-            bits: ROUTER_BITS as i32,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-            affine_dtype: Dtype::Bfloat16,
-        };
+        let router_projection_config = affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS);
+        let common_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
+        let num_tokens_i32 = num_tokens.try_into().expect("MoE token count must fit i32");
         let routing_shape = MoERoutingShape {
             num_tokens,
             num_experts: NUM_EXPERTS,
@@ -429,12 +420,12 @@ impl MoEForwardFixture {
         let combine_shape = MoECombineWithCommonShape::bf16(num_tokens, TOPK_EXPERTS, HIDDEN_DIM);
         let sparse_gate_up_shape = sparse_config.token_major_fused_gate_up_silu_shape(sparse_shape);
         let sparse_down_shape = sparse_config.token_major_down_shape(sparse_shape);
-        let dense_gate_up_shape = dense_config.gate_up_shape(dense_shape);
-        let dense_down_shape = dense_config.down_shape(dense_shape);
+        let dense_gate_up_config = dense_config.gate_up_config();
+        let dense_down_config = dense_config.down_config();
         let num_routes = num_tokens as usize * TOPK_EXPERTS as usize;
         let input = bf16_buffer(device, &hidden_fixture(num_tokens as usize, HIDDEN_DIM as usize));
-        let router_logits = Buffer::new_zeroed(device, router_projection_shape.output_bytes());
-        let router_probs = Buffer::new_zeroed(device, router_projection_shape.output_bytes());
+        let router_logits = Buffer::new_zeroed(device, router_projection_config.output_bytes(num_tokens_i32));
+        let router_probs = Buffer::new_zeroed(device, router_projection_config.output_bytes(num_tokens_i32));
         let expert_indices = Buffer::new_zeroed(device, routing_shape.expert_indices_bytes());
         let expert_probs = Buffer::new_zeroed(device, routing_shape.expert_probs_bytes());
         let token_indices =
@@ -457,11 +448,11 @@ impl MoEForwardFixture {
             device,
             sparse_config.activation_bytes(expert_major_sparse_shape.num_routes),
         );
-        let common_hidden = Buffer::new_zeroed(device, dense_down_shape.output_bytes());
-        let common_gate_logits = Buffer::new_zeroed(device, common_gate_shape.output_bytes());
+        let common_hidden = Buffer::new_zeroed(device, dense_down_config.output_bytes(num_tokens_i32));
+        let common_gate_logits = Buffer::new_zeroed(device, common_gate_config.output_bytes(num_tokens_i32));
         let replay_output = Buffer::new_zeroed(device, combine_shape.output_bytes());
         let expert_major_output = Buffer::new_zeroed(device, combine_shape.output_bytes());
-        let router_projection = AffineQuantizedMatmulKernel::new(device, router_projection_shape);
+        let router_projection = AffineQuantizedMatmul::new(device, router_projection_config);
         let router_softmax = SoftmaxKernel::new(
             device,
             SoftmaxShape {
@@ -470,29 +461,29 @@ impl MoEForwardFixture {
                 dtype: Dtype::Bfloat16,
             },
         );
-        let common_gate_projection = AffineQuantizedMatmulKernel::new(device, common_gate_shape);
+        let common_gate_projection = AffineQuantizedMatmul::new(device, common_gate_config);
         let routing = MoERoutingKernel::new(device);
         let expert_major = MoEExpertMajorKernels::new(device);
         let sparse_mlp = QuantizedSparseMLP::new(device, sparse_config);
         let common_mlp = QuantizedDenseMLPKernels::new(device, dense_config);
         let combine = MoECombineKernel::new(device);
-        let router_weight = quantized_weight(device, router_projection_shape.weight_bytes());
+        let router_weight = quantized_weight(device, router_projection_config.weight_bytes());
         let router_scales = bf16_buffer(
             device,
-            &affine_param_fixture(router_projection_shape.affine_param_bytes() / size_of::<u16>()),
+            &affine_param_fixture(router_projection_config.scale_or_bias_bytes() / size_of::<u16>()),
         );
         let router_biases = bf16_buffer(
             device,
-            &zero_fixture(router_projection_shape.affine_param_bytes() / size_of::<u16>()),
+            &zero_fixture(router_projection_config.scale_or_bias_bytes() / size_of::<u16>()),
         );
-        let common_gate_weight = quantized_weight(device, common_gate_shape.weight_bytes());
+        let common_gate_weight = quantized_weight(device, common_gate_config.weight_bytes());
         let common_gate_scales = bf16_buffer(
             device,
-            &affine_param_fixture(common_gate_shape.affine_param_bytes() / size_of::<u16>()),
+            &affine_param_fixture(common_gate_config.scale_or_bias_bytes() / size_of::<u16>()),
         );
         let common_gate_biases = bf16_buffer(
             device,
-            &zero_fixture(common_gate_shape.affine_param_bytes() / size_of::<u16>()),
+            &zero_fixture(common_gate_config.scale_or_bias_bytes() / size_of::<u16>()),
         );
         let sparse_weights = SparseMLPWeights {
             gate_weight: quantized_weight_stack_for_experts(
@@ -548,23 +539,23 @@ impl MoEForwardFixture {
             ),
         };
         let common_weights = DenseMLPWeights {
-            gate_up_weight: quantized_weight(device, dense_gate_up_shape.weight_bytes()),
+            gate_up_weight: quantized_weight(device, dense_gate_up_config.weight_bytes()),
             gate_up_scales: bf16_buffer(
                 device,
-                &affine_param_fixture(dense_gate_up_shape.affine_param_bytes() / size_of::<u16>()),
+                &affine_param_fixture(dense_gate_up_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
             gate_up_biases: bf16_buffer(
                 device,
-                &zero_fixture(dense_gate_up_shape.affine_param_bytes() / size_of::<u16>()),
+                &zero_fixture(dense_gate_up_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
-            down_weight: quantized_weight(device, dense_down_shape.weight_bytes()),
+            down_weight: quantized_weight(device, dense_down_config.weight_bytes()),
             down_scales: bf16_buffer(
                 device,
-                &affine_param_fixture(dense_down_shape.affine_param_bytes() / size_of::<u16>()),
+                &affine_param_fixture(dense_down_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
             down_biases: bf16_buffer(
                 device,
-                &zero_fixture(dense_down_shape.affine_param_bytes() / size_of::<u16>()),
+                &zero_fixture(dense_down_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
         };
         let common_scratch = DenseMLPScratch {
@@ -577,8 +568,6 @@ impl MoEForwardFixture {
         let replay = build_moe_forward_replay(
             &stream,
             MoEForwardRecord {
-                router_projection_shape,
-                common_gate_shape,
                 routing_shape,
                 sparse_shape,
                 dense_shape,
@@ -616,8 +605,6 @@ impl MoEForwardFixture {
         let expert_major_replay = build_moe_expert_major_forward_replay(
             &stream,
             MoEExpertMajorForwardRecord {
-                router_projection_shape,
-                common_gate_shape,
                 routing_shape,
                 sparse_shape: expert_major_sparse_shape,
                 expert_major_shape,
@@ -660,8 +647,6 @@ impl MoEForwardFixture {
         );
         let fixture = Self {
             stream,
-            router_projection_shape,
-            common_gate_shape,
             routing_shape,
             sparse_shape,
             expert_major_shape,
@@ -739,8 +724,6 @@ impl MoEForwardFixture {
 
     fn record<'a>(&'a self, output: &'a Buffer) -> MoEForwardRecord<'a> {
         MoEForwardRecord {
-            router_projection_shape: self.router_projection_shape,
-            common_gate_shape: self.common_gate_shape,
             routing_shape: self.routing_shape,
             sparse_shape: self.sparse_shape,
             dense_shape: self.dense_shape,
@@ -778,8 +761,6 @@ impl MoEForwardFixture {
 
     fn expert_major_record<'a>(&'a self, output: &'a Buffer) -> MoEExpertMajorForwardRecord<'a> {
         MoEExpertMajorForwardRecord {
-            router_projection_shape: self.router_projection_shape,
-            common_gate_shape: self.common_gate_shape,
             routing_shape: self.routing_shape,
             sparse_shape: QuantizedSparseMLPTokenMajorShape {
                 num_routes: self.expert_major_shape.num_routes(),
@@ -841,15 +822,13 @@ impl MoEForwardFixture {
 }
 
 struct MoEForwardRecord<'a> {
-    router_projection_shape: AffineQuantizedMatmulShape,
-    common_gate_shape: AffineQuantizedMatmulShape,
     routing_shape: MoERoutingShape,
     sparse_shape: QuantizedSparseMLPTokenMajorShape,
     dense_shape: QuantizedDenseMLPShape,
     combine_shape: MoECombineWithCommonShape,
-    router_projection: &'a AffineQuantizedMatmulKernel,
+    router_projection: &'a AffineQuantizedMatmul,
     router_softmax: &'a SoftmaxKernel,
-    common_gate_projection: &'a AffineQuantizedMatmulKernel,
+    common_gate_projection: &'a AffineQuantizedMatmul,
     routing: &'a MoERoutingKernel,
     sparse_mlp: &'a QuantizedSparseMLP,
     common_mlp: &'a QuantizedDenseMLPKernels,
@@ -884,15 +863,13 @@ fn build_moe_forward_replay(stream: &Stream, record: MoEForwardRecord<'_>) -> Re
 }
 
 struct MoEExpertMajorForwardRecord<'a> {
-    router_projection_shape: AffineQuantizedMatmulShape,
-    common_gate_shape: AffineQuantizedMatmulShape,
     routing_shape: MoERoutingShape,
     sparse_shape: QuantizedSparseMLPTokenMajorShape,
     expert_major_shape: MoEExpertMajorShape,
     dense_shape: QuantizedDenseMLPShape,
-    router_projection: &'a AffineQuantizedMatmulKernel,
+    router_projection: &'a AffineQuantizedMatmul,
     router_softmax: &'a SoftmaxKernel,
-    common_gate_projection: &'a AffineQuantizedMatmulKernel,
+    common_gate_projection: &'a AffineQuantizedMatmul,
     routing: &'a MoERoutingKernel,
     expert_major: &'a MoEExpertMajorKernels,
     sparse_mlp: &'a QuantizedSparseMLP,
@@ -936,19 +913,25 @@ fn record_moe_forward<I>(builder: &mut I, record: MoEForwardRecord<'_>)
 where
     I: MoEForwardBuilder,
 {
-    builder.record(record.router_projection.invoke_with_shape(
-        record.router_projection_shape,
-        record.router_logits,
-        0,
-        record.input,
-        0,
-        record.router_weight,
-        0,
-        record.router_scales,
-        0,
-        record.router_biases,
-        0,
-    ));
+    builder.record(
+        record.router_projection.invoke(
+            record
+                .routing_shape
+                .num_tokens
+                .try_into()
+                .expect("MoE token count must fit i32"),
+            record.router_logits,
+            0,
+            record.input,
+            0,
+            record.router_weight,
+            0,
+            record.router_scales,
+            0,
+            record.router_biases,
+            0,
+        ),
+    );
     builder.record_with_barrier_before(record.router_softmax.invoke_with_shape(
         SoftmaxShape {
             num_rows: record.routing_shape.num_tokens,
@@ -989,19 +972,25 @@ where
         record.common_scratch,
         record.common_weights,
     ));
-    builder.record(record.common_gate_projection.invoke_with_shape(
-        record.common_gate_shape,
-        record.common_gate_logits,
-        0,
-        record.input,
-        0,
-        record.common_gate_weight,
-        0,
-        record.common_gate_scales,
-        0,
-        record.common_gate_biases,
-        0,
-    ));
+    builder.record(
+        record.common_gate_projection.invoke(
+            record
+                .routing_shape
+                .num_tokens
+                .try_into()
+                .expect("MoE token count must fit i32"),
+            record.common_gate_logits,
+            0,
+            record.input,
+            0,
+            record.common_gate_weight,
+            0,
+            record.common_gate_scales,
+            0,
+            record.common_gate_biases,
+            0,
+        ),
+    );
     builder.record_with_barrier_before(record.combine.invoke_with_common(
         record.combine_shape,
         MoECombineWithCommonBuffers {
@@ -1018,19 +1007,25 @@ fn record_moe_expert_major_forward<I>(builder: &mut I, record: MoEExpertMajorFor
 where
     I: MoEForwardBuilder,
 {
-    builder.record(record.router_projection.invoke_with_shape(
-        record.router_projection_shape,
-        record.router_logits,
-        0,
-        record.input,
-        0,
-        record.router_weight,
-        0,
-        record.router_scales,
-        0,
-        record.router_biases,
-        0,
-    ));
+    builder.record(
+        record.router_projection.invoke(
+            record
+                .routing_shape
+                .num_tokens
+                .try_into()
+                .expect("MoE token count must fit i32"),
+            record.router_logits,
+            0,
+            record.input,
+            0,
+            record.router_weight,
+            0,
+            record.router_scales,
+            0,
+            record.router_biases,
+            0,
+        ),
+    );
     builder.record_with_barrier_before(record.router_softmax.invoke_with_shape(
         SoftmaxShape {
             num_rows: record.routing_shape.num_tokens,
@@ -1092,19 +1087,25 @@ where
         record.common_scratch,
         record.common_weights,
     ));
-    builder.record(record.common_gate_projection.invoke_with_shape(
-        record.common_gate_shape,
-        record.common_gate_logits,
-        0,
-        record.input,
-        0,
-        record.common_gate_weight,
-        0,
-        record.common_gate_scales,
-        0,
-        record.common_gate_biases,
-        0,
-    ));
+    builder.record(
+        record.common_gate_projection.invoke(
+            record
+                .routing_shape
+                .num_tokens
+                .try_into()
+                .expect("MoE token count must fit i32"),
+            record.common_gate_logits,
+            0,
+            record.input,
+            0,
+            record.common_gate_weight,
+            0,
+            record.common_gate_scales,
+            0,
+            record.common_gate_biases,
+            0,
+        ),
+    );
     builder.record_with_barrier_before(record.expert_major.invoke_scatter_with_common(
         record.expert_major_shape,
         MoEExpertMajorScatterWithCommonBuffers {
