@@ -4,8 +4,8 @@ use inference_backend_metal::components::ResidualCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainFeatureWeightBindings;
@@ -137,9 +137,7 @@ struct Qwen3xDSparkMainFeatureWeights {
 pub struct Qwen3xDSparkMainFeatureProjector {
     layout: Qwen3xDSparkMainFeatureLayout,
     residual_bindings: Qwen3xDSparkMainResidualBindings,
-    fc_shape: AffineQuantizedMatmulShape,
-    single_token_fc: AffineQuantizedMatmulKernel,
-    multi_token_fc: AffineQuantizedMatmulKernel,
+    fc: AffineQuantizedMatmul,
     hidden_norm: RmsNorm,
     weights: Qwen3xDSparkMainFeatureWeights,
     main_residuals: Buffer,
@@ -161,11 +159,7 @@ impl Qwen3xDSparkMainFeatureProjector {
         max_tokens: usize,
     ) -> Result<Self, ModelExecutorError> {
         let layout = Qwen3xDSparkMainFeatureLayout::new(plan, max_tokens);
-        let fc_shape = AffineQuantizedMatmulShape::same_dtype(
-            layout
-                .max_tokens
-                .try_into()
-                .expect("Qwen3 DSpark Main-feature max_tokens must fit i32"),
+        let fc_config = AffineQuantizedMatmulConfig::same_dtype(
             layout
                 .hidden_dim
                 .try_into()
@@ -181,20 +175,19 @@ impl Qwen3xDSparkMainFeatureProjector {
             plan.fc.bits.try_into().expect("Qwen3 DSpark Main FC bits must fit i32"),
             Dtype::Bfloat16,
         );
-        fc_shape.validate();
         let weight = quant_weight(store, &bindings.fc.weight)?;
         let scales = typed_tensor(store, &bindings.fc.scales, safetensors::Dtype::BF16)?.into_data();
         let biases = typed_tensor(store, &bindings.fc.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("Qwen3 DSpark Main FC weight", weight.len(), fc_shape.weight_bytes())?;
+        validate_len("Qwen3 DSpark Main FC weight", weight.len(), fc_config.weight_bytes())?;
         validate_len(
             "Qwen3 DSpark Main FC scales",
             scales.len(),
-            fc_shape.affine_param_bytes(),
+            fc_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "Qwen3 DSpark Main FC biases",
             biases.len(),
-            fc_shape.affine_param_bytes(),
+            fc_config.scale_or_bias_bytes(),
         )?;
         let norm_weight = load_qwen3x_norm_weight(
             device,
@@ -205,9 +198,7 @@ impl Qwen3xDSparkMainFeatureProjector {
         Ok(Self {
             layout,
             residual_bindings: Qwen3xDSparkMainResidualBindings::new(plan),
-            fc_shape,
-            single_token_fc: AffineQuantizedMatmulKernel::new(device, AffineQuantizedMatmulShape { m: 1, ..fc_shape }),
-            multi_token_fc: AffineQuantizedMatmulKernel::new(device, fc_shape),
+            fc: AffineQuantizedMatmul::new(device, fc_config),
             hidden_norm: RmsNorm::new(device, layout.hidden_dim as usize, plan.hidden_norm_eps, norm_weight),
             weights: Qwen3xDSparkMainFeatureWeights {
                 fc_weight: Buffer::from_slice(device, &weight),
@@ -242,30 +233,23 @@ impl Qwen3xDSparkMainFeatureProjector {
             num_tokens <= self.layout.max_tokens,
             "Qwen3 DSpark Main projection exceeds capacity"
         );
-        let active_shape = AffineQuantizedMatmulShape {
-            m: num_tokens
-                .try_into()
-                .expect("Qwen3 DSpark Main token count must fit i32"),
-            ..self.fc_shape
-        };
-        let fc = if num_tokens == 1 {
-            &self.single_token_fc
-        } else {
-            &self.multi_token_fc
-        };
-        recorder.record_with_barrier_before(ReplayOp::opaque(fc.invoke_with_shape(
-            active_shape,
-            &self.main_feature,
-            0,
-            &self.main_residuals,
-            0,
-            &self.weights.fc_weight,
-            0,
-            &self.weights.fc_scales,
-            0,
-            &self.weights.fc_biases,
-            0,
-        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(
+            self.fc.invoke(
+                num_tokens
+                    .try_into()
+                    .expect("Qwen3 DSpark Main token count must fit i32"),
+                &self.main_feature,
+                0,
+                &self.main_residuals,
+                0,
+                &self.weights.fc_weight,
+                0,
+                &self.weights.fc_scales,
+                0,
+                &self.weights.fc_biases,
+                0,
+            ),
+        ));
         self.hidden_norm
             .record_with_barrier(recorder, num_tokens, &self.main_feature, &self.main_feature);
         &self.main_feature
