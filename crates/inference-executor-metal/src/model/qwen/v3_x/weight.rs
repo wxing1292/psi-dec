@@ -1,7 +1,7 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::def::ModelExecutorError;
 
 use crate::checkpoint::SafeTensorStore;
@@ -39,24 +39,23 @@ pub fn concat_bytes(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-pub fn affine_shape(
+pub fn affine_config(
     n: usize,
     k: usize,
     group_size: u32,
     bits: u32,
     input_dtype: Dtype,
     output_dtype: Dtype,
-    affine_dtype: Dtype,
-) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: 1,
+    scale_bias_dtype: Dtype,
+) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: n.try_into().expect("affine n must fit i32"),
         k: k.try_into().expect("affine k must fit i32"),
         group_size: group_size.try_into().expect("affine group_size must fit i32"),
         bits: bits.try_into().expect("affine bits must fit i32"),
         input_dtype,
         output_dtype,
-        affine_dtype,
+        scale_bias_dtype,
     }
 }
 
@@ -72,7 +71,7 @@ pub fn sparse_affine_layout(
         input_dim,
         group_size: metal.group_size as usize,
         bits: metal.bits as usize,
-        affine_dtype: metal.dtype,
+        scale_bias_dtype: metal.dtype,
     }
 }
 
@@ -82,7 +81,7 @@ pub struct SparseAffineLayout {
     input_dim: usize,
     group_size: usize,
     bits: usize,
-    affine_dtype: Dtype,
+    scale_bias_dtype: Dtype,
 }
 
 impl SparseAffineLayout {
@@ -90,8 +89,8 @@ impl SparseAffineLayout {
         self.experts * self.output_dim * (self.input_dim * self.bits / 32) * std::mem::size_of::<u32>()
     }
 
-    pub fn affine_param_bytes(&self) -> usize {
-        self.experts * self.output_dim * (self.input_dim / self.group_size) * self.affine_dtype.item_size()
+    pub fn scale_or_bias_bytes(&self) -> usize {
+        self.experts * self.output_dim * (self.input_dim / self.group_size) * self.scale_bias_dtype.item_size()
     }
 }
 
