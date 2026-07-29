@@ -6,8 +6,8 @@ use inference_backend_metal::components::Bf16ConcatRowsShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
@@ -20,9 +20,9 @@ use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedInput;
 use crate::model::gather::Gather;
-use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::qwen::v3_x::weight::quant_weight;
-use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::qwen::v3_x::weight::remove_quant_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 use crate::model::rms_norm::RmsNorm;
 use crate::replay::ReplayComponent;
@@ -34,8 +34,7 @@ pub struct Qwen35MTPEmbed {
     hidden_norm: RmsNorm,
     embedding_norm: RmsNorm,
     concat: Bf16ConcatRowsKernel,
-    fc_kernel: AffineQuantizedMatmulKernel,
-    fc_shape: AffineQuantizedMatmulShape,
+    fc: AffineQuantizedMatmul,
     fc_weight: Buffer,
     fc_scales: Buffer,
     fc_biases: Buffer,
@@ -80,8 +79,7 @@ impl Qwen35MTPEmbed {
         let fused_hidden_dim = hidden_dim
             .checked_mul(2)
             .expect("qwen3.5 MTP fused hidden dimension must fit usize");
-        let fc_shape = AffineQuantizedMatmulShape {
-            m: max_tokens.try_into().expect("qwen3.5 MTP max_tokens must fit i32"),
+        let fc_config = AffineQuantizedMatmulConfig {
             n: hidden_dim
                 .try_into()
                 .expect("qwen3.5 MTP hidden dimension must fit i32"),
@@ -122,8 +120,7 @@ impl Qwen35MTPEmbed {
                 token_hidden_norm_weight,
             ),
             concat: Bf16ConcatRowsKernel::new(device),
-            fc_kernel: AffineQuantizedMatmulKernel::new(device, fc_shape),
-            fc_shape,
+            fc: AffineQuantizedMatmul::new(device, fc_config),
             fc_weight,
             fc_scales,
             fc_biases,
@@ -163,11 +160,8 @@ impl Qwen35MTPEmbed {
                 output: &self.fused_input,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.fc_kernel.invoke_with_shape(
-            AffineQuantizedMatmulShape {
-                m: num_tokens.try_into().expect("qwen3.5 MTP token count must fit i32"),
-                ..self.fc_shape
-            },
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke(
+            num_tokens.try_into().expect("qwen3.5 MTP token count must fit i32"),
             output,
             0,
             &self.fused_input,
@@ -233,11 +227,13 @@ impl Qwen35MTPEmbedWeights {
         group_size: usize,
         bits: usize,
     ) -> Result<Self, ModelExecutorError> {
+        let mut tensor_names = Vec::new();
+        bindings.push_tensor_names(&mut tensor_names);
+        let mut tensors = store.load_tensors(tensor_names)?;
         let fused_hidden_dim = hidden_dim
             .checked_mul(2)
             .ok_or_else(|| ModelExecutorError::custom("qwen3.5 MTP fused hidden dimension overflow"))?;
-        let fc_shape = AffineQuantizedMatmulShape {
-            m: 1,
+        let fc_config = AffineQuantizedMatmulConfig {
             n: hidden_dim
                 .try_into()
                 .map_err(|_| ModelExecutorError::custom("qwen3.5 MTP hidden_dim must fit i32"))?,
@@ -254,29 +250,33 @@ impl Qwen35MTPEmbedWeights {
             output_dtype: Dtype::Bfloat16,
             scale_bias_dtype: Dtype::Bfloat16,
         };
-        let fc_weight = quant_weight(store, &bindings.projection.weight)?;
-        let fc_scales = typed_tensor(store, &bindings.projection.scales, safetensors::Dtype::BF16)?.into_data();
-        let fc_biases = typed_tensor(store, &bindings.projection.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("MTP fc weight", fc_weight.len(), fc_shape.weight_bytes())?;
-        validate_len("MTP fc scales", fc_scales.len(), fc_shape.affine_param_bytes())?;
-        validate_len("MTP fc biases", fc_biases.len(), fc_shape.affine_param_bytes())?;
-        Ok(Self {
-            token_hidden_norm_weight: load_qwen3x_norm_weight(
+        let fc_weight = remove_quant_weight(&mut tensors, &bindings.projection.weight)?;
+        let fc_scales =
+            remove_typed_tensor(&mut tensors, &bindings.projection.scales, safetensors::Dtype::BF16)?.into_data();
+        let fc_biases =
+            remove_typed_tensor(&mut tensors, &bindings.projection.biases, safetensors::Dtype::BF16)?.into_data();
+        validate_len("MTP fc weight", fc_weight.len(), fc_config.weight_bytes())?;
+        validate_len("MTP fc scales", fc_scales.len(), fc_config.scale_or_bias_bytes())?;
+        validate_len("MTP fc biases", fc_biases.len(), fc_config.scale_or_bias_bytes())?;
+        let weights = Self {
+            token_hidden_norm_weight: remove_qwen3x_norm_weight(
                 device,
-                store,
+                &mut tensors,
                 &bindings.token_hidden_norm_weight,
                 &[hidden_dim],
             )?,
-            prev_hidden_norm_weight: load_qwen3x_norm_weight(
+            prev_hidden_norm_weight: remove_qwen3x_norm_weight(
                 device,
-                store,
+                &mut tensors,
                 &bindings.prev_hidden_norm_weight,
                 &[hidden_dim],
             )?,
             fc_weight: Buffer::from_slice(device, &fc_weight),
             fc_scales: Buffer::from_slice(device, &fc_scales),
             fc_biases: Buffer::from_slice(device, &fc_biases),
-        })
+        };
+        assert!(tensors.is_empty(), "qwen3.5 MTP embed must consume its tensor map");
+        Ok(weights)
     }
 }
 

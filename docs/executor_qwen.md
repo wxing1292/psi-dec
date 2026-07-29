@@ -161,6 +161,8 @@ The model role is also a structural boundary.
 `Qwen3MainLayer` owns the fixed-QKV `Qwen3MainGQA` and `Qwen3xDenseMLP` topology for Qwen3 Main.
 `Qwen35MainLayer` owns the QGKV-GQA/GDN and dense-MLP/MoE variants for Qwen3.5 Main.
 `Qwen35MTPLayer` independently owns the MTP decoder-layer graph.
+The MTP embed, layer norms, and final norm load bounded tensor maps for their exact binding subtrees.
+Each MTP owner removes its tensors before it creates Metal buffers.
 These role-specific layers can compose the same leaf components.
 They do not share a structural layer type.
 

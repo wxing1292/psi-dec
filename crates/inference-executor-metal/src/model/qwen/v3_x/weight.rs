@@ -2,6 +2,8 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_executor_core::checkpoint::TensorMap;
+use inference_executor_core::checkpoint::remove_tensor;
 use inference_executor_core::def::ModelExecutorError;
 
 use crate::checkpoint::SafeTensorStore;
@@ -19,6 +21,18 @@ pub fn quant_weight(store: &mut SafeTensorStore, name: &str) -> Result<Vec<u8>, 
     Ok(typed_tensor(store, name, safetensors::Dtype::U32)?.into_data())
 }
 
+pub fn remove_typed_tensor(
+    tensors: &mut TensorMap,
+    name: &str,
+    dtype: safetensors::Dtype,
+) -> Result<TensorBytes, ModelExecutorError> {
+    remove_tensor(tensors, name, dtype)
+}
+
+pub fn remove_quant_weight(tensors: &mut TensorMap, name: &str) -> Result<Vec<u8>, ModelExecutorError> {
+    Ok(remove_typed_tensor(tensors, name, safetensors::Dtype::U32)?.into_data())
+}
+
 pub fn load_qwen3x_norm_weight(
     device: &Device,
     store: &mut SafeTensorStore,
@@ -26,6 +40,17 @@ pub fn load_qwen3x_norm_weight(
     expected_shape: &[usize],
 ) -> Result<Buffer, ModelExecutorError> {
     let data = typed_tensor(store, name, safetensors::Dtype::BF16)?;
+    validate_shape(name, data.shape(), expected_shape)?;
+    Ok(Buffer::from_slice(device, data.data()))
+}
+
+pub fn remove_qwen3x_norm_weight(
+    device: &Device,
+    tensors: &mut TensorMap,
+    name: &str,
+    expected_shape: &[usize],
+) -> Result<Buffer, ModelExecutorError> {
+    let data = remove_typed_tensor(tensors, name, safetensors::Dtype::BF16)?;
     validate_shape(name, data.shape(), expected_shape)?;
     Ok(Buffer::from_slice(device, data.data()))
 }

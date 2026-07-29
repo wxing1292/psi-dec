@@ -117,6 +117,14 @@ impl Qwen35MTPWeightBindings {
     }
 }
 
+impl Qwen35MTPEmbedWeightBindings {
+    pub fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+        names.push(&self.prev_hidden_norm_weight);
+        names.push(&self.token_hidden_norm_weight);
+        push_quantized_tensor_names(&self.projection, names);
+    }
+}
+
 impl Qwen35LayerWeightBindings {
     fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
         names.push(&self.input_norm_weight);

@@ -24,7 +24,7 @@ use crate::model::qwen::v3_x::layer::Qwen3xDenseMLP;
 use crate::model::qwen::v3_x::layer::Qwen3xGQA;
 use crate::model::qwen::v3_x::layer::Qwen3xMoE;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
-use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::residual::Residual;
 use crate::model::rms_norm::RmsNorm;
 
@@ -101,12 +101,13 @@ impl Qwen35MTPLayer {
         let mlp = Qwen35MTPMLP::load(device, store, config, defaults, mlp, dense_scratch, moe_scratch)?;
         let hidden_dim = config.text_config.hidden_size;
         let eps = config.text_config.rms_norm_eps;
-        Ok(Self {
+        let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
+        let layer = Self {
             input_norm: RmsNorm::new(
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim])?,
+                remove_qwen3x_norm_weight(device, &mut tensors, &input_norm_weight, &[hidden_dim])?,
             ),
             attention,
             residual: Residual::new(device),
@@ -114,11 +115,13 @@ impl Qwen35MTPLayer {
                 device,
                 hidden_dim,
                 eps,
-                load_qwen3x_norm_weight(device, store, &post_attention_norm_weight, &[hidden_dim])?,
+                remove_qwen3x_norm_weight(device, &mut tensors, &post_attention_norm_weight, &[hidden_dim])?,
             ),
             mlp,
             scratch,
-        })
+        };
+        assert!(tensors.is_empty(), "qwen3.5 MTP layer must consume its norm tensor map");
+        Ok(layer)
     }
 
     pub fn gqa_tokens_per_page(&self) -> usize {

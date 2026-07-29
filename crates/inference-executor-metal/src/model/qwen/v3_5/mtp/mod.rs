@@ -19,7 +19,7 @@ use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerInput;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
-use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::rms_norm::RmsNorm;
 use crate::replay::ReplayComponent;
 
@@ -69,7 +69,9 @@ impl Qwen35MTP {
             dense_scratch,
             moe_scratch,
         )?;
-        let final_norm_weight = load_qwen3x_norm_weight(device, store, &final_norm_weight, &[hidden_dim])?;
+        let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
+        let final_norm_weight = remove_qwen3x_norm_weight(device, &mut tensors, &final_norm_weight, &[hidden_dim])?;
+        assert!(tensors.is_empty(), "qwen3.5 MTP must consume its final norm tensor map");
         Ok(Self {
             layer,
             output_norm: RmsNorm::new(device, hidden_dim, config.text_config.rms_norm_eps, final_norm_weight),
