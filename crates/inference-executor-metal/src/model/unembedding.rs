@@ -1,8 +1,8 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::def::ModelExecutorError;
@@ -20,7 +20,7 @@ pub struct UnembedConfig {
     pub bits: u32,
     pub input_dtype: Dtype,
     pub output_dtype: Dtype,
-    pub affine_dtype: Dtype,
+    pub scale_bias_dtype: Dtype,
 }
 
 impl UnembedConfig {
@@ -34,34 +34,35 @@ impl UnembedConfig {
         );
         assert_eq!(self.input_dtype, Dtype::Bfloat16);
         assert_eq!(self.output_dtype, Dtype::Bfloat16);
-        assert!(matches!(self.affine_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert_eq!(
+            self.scale_bias_dtype,
+            Dtype::Bfloat16,
+            "unembed requires BF16 affine parameters"
+        );
     }
 
     pub fn logits_bytes(self) -> usize {
         self.validate();
-        self.affine_shape(self.max_tokens).output_bytes()
+        self.affine_config()
+            .output_bytes(self.max_tokens.try_into().expect("unembed max_tokens must fit i32"))
     }
 
-    fn affine_shape(self, num_rows: u32) -> AffineQuantizedMatmulShape {
-        assert!(num_rows > 0);
-        assert!(num_rows <= self.max_tokens);
-        AffineQuantizedMatmulShape {
-            m: num_rows.try_into().expect("unembed row count must fit i32"),
+    fn affine_config(self) -> AffineQuantizedMatmulConfig {
+        AffineQuantizedMatmulConfig {
             n: self.vocab_size.try_into().expect("unembed vocab_size must fit i32"),
             k: self.hidden_dim.try_into().expect("unembed hidden_dim must fit i32"),
             group_size: self.group_size.try_into().expect("unembed group_size must fit i32"),
             bits: self.bits.try_into().expect("unembed bits must fit i32"),
             input_dtype: self.input_dtype,
             output_dtype: self.output_dtype,
-            affine_dtype: self.affine_dtype,
+            scale_bias_dtype: self.scale_bias_dtype,
         }
     }
 }
 
 pub struct Unembed {
     config: UnembedConfig,
-    qmv_kernel: AffineQuantizedMatmulKernel,
-    qmm_kernel: AffineQuantizedMatmulKernel,
+    matmul: AffineQuantizedMatmul,
     weights: UnembedWeights,
 }
 
@@ -86,14 +87,11 @@ impl Unembed {
         bindings: QuantizedTensorBindings,
     ) -> Result<Self, ModelExecutorError> {
         config.validate();
-        let weights = UnembedWeights::load(device, store, config.affine_shape(config.max_tokens), bindings)?;
-        let qmv_shape = config.affine_shape(1);
-        let qmm_rows = unembed_qmv_batch_limit(config.hidden_dim, config.vocab_size).min(config.max_tokens);
-        let qmm_shape = config.affine_shape(qmm_rows);
+        let affine_config = config.affine_config();
+        let weights = UnembedWeights::load(device, store, affine_config, bindings)?;
         let unembed = Self {
             config,
-            qmv_kernel: AffineQuantizedMatmulKernel::new(device, qmv_shape),
-            qmm_kernel: AffineQuantizedMatmulKernel::new(device, qmm_shape),
+            matmul: AffineQuantizedMatmul::new(device, affine_config),
             weights,
         };
         unembed.validate_weights();
@@ -101,9 +99,9 @@ impl Unembed {
     }
 
     fn validate_weights(&self) {
-        let shape = self.config.affine_shape(self.config.max_tokens);
-        assert_eq!(self.weights.weight.len_bytes(), shape.weight_bytes());
-        assert_eq!(self.weights.scales.len_bytes(), shape.affine_param_bytes());
+        let config = self.config.affine_config();
+        assert_eq!(self.weights.weight.len_bytes(), config.weight_bytes());
+        assert_eq!(self.weights.scales.len_bytes(), config.scale_or_bias_bytes());
         assert_eq!(self.weights.biases.len_bytes(), self.weights.scales.len_bytes());
     }
 }
@@ -123,14 +121,8 @@ impl ReplayLayer for Unembed {
             input.num_rows,
             self.config.max_tokens
         );
-        let shape = self.config.affine_shape(input.num_rows);
-        let kernel = if input.num_rows < unembed_qmv_batch_limit(self.config.hidden_dim, self.config.vocab_size) {
-            &self.qmv_kernel
-        } else {
-            &self.qmm_kernel
-        };
-        recorder.record_with_barrier_before(ReplayOp::opaque(kernel.invoke_with_shape(
-            shape,
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.matmul.invoke(
+            input.num_rows.try_into().expect("unembed row count must fit i32"),
             input.logits,
             0,
             input.hidden,
@@ -150,7 +142,7 @@ impl UnembedWeights {
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        shape: AffineQuantizedMatmulShape,
+        config: AffineQuantizedMatmulConfig,
         bindings: QuantizedTensorBindings,
     ) -> Result<Self, ModelExecutorError> {
         let weight = store
@@ -162,9 +154,9 @@ impl UnembedWeights {
         let biases = store
             .tensor_bytes(&bindings.biases, safetensors::Dtype::BF16)?
             .into_data();
-        validate_len("unembed weight", weight.len(), shape.weight_bytes())?;
-        validate_len("unembed scales", scales.len(), shape.affine_param_bytes())?;
-        validate_len("unembed biases", biases.len(), shape.affine_param_bytes())?;
+        validate_len("unembed weight", weight.len(), config.weight_bytes())?;
+        validate_len("unembed scales", scales.len(), config.scale_or_bias_bytes())?;
+        validate_len("unembed biases", biases.len(), config.scale_or_bias_bytes())?;
         Ok(Self {
             weight: Buffer::from_slice(device, &weight),
             scales: Buffer::from_slice(device, &scales),
@@ -191,12 +183,24 @@ fn validate_quantized_unembedding(max_tokens: u32, vocab_size: u32, hidden_dim: 
     assert_eq!(hidden_dim % group_size, 0);
 }
 
-fn unembed_qmv_batch_limit(input_dim: u32, output_dim: u32) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
+#[cfg(test)]
+mod tests {
+    use super::Dtype;
+    use super::UnembedConfig;
+
+    #[test]
+    #[should_panic(expected = "unembed requires BF16 affine parameters")]
+    fn test_rejects_mixed_scale_bias_dtype() {
+        let config = UnembedConfig {
+            max_tokens: 16,
+            vocab_size: 151_936,
+            hidden_dim: 5120,
+            group_size: 64,
+            bits: 4,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Float32,
+        };
+        config.validate();
     }
 }
