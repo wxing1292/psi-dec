@@ -5,7 +5,7 @@ impl Qwen35Executor {
         let flat_indices = gather_flat_indices(microbatch);
         assert!(
             !flat_indices.is_empty(),
-            "qwen3.5 replay unembed requires target hidden states"
+            "qwen3.5 replay unembed requires Main output rows"
         );
         assert!(
             flat_indices.iter().all(|&flat_index| {
@@ -27,18 +27,18 @@ impl Qwen35Executor {
         hidden_input: &Buffer,
     ) -> Qwen35GatherUnembedReplayKey {
         let gather_unembed_key = Qwen35GatherUnembedReplayKey::from_microbatch(microbatch);
-        let num_target_hidden_states = self
+        let num_main_output_rows = self
             .write_gather_flat_indices(microbatch)
             .len()
             .try_into()
-            .expect("qwen3.5 target hidden-state count must fit u32");
+            .expect("qwen3.5 Main output row count must fit u32");
         assert_eq!(
-            num_target_hidden_states,
-            gather_unembed_key.num_target_hidden_states(),
+            num_main_output_rows,
+            gather_unembed_key.num_main_output_rows(),
             "qwen3.5 GatherUnembed replay key must match gathered hidden states"
         );
         let input = Qwen35GatherUnembedArgs {
-            num_rows: num_target_hidden_states,
+            num_rows: num_main_output_rows,
             hidden_input,
             row_indices: &self.gather_flat_indices,
             hidden_output: &self.unembed_hidden,

@@ -16,7 +16,7 @@ use inference_executor_core::model::qwen::v3_5::Qwen35ModelBatchRequest;
 use inference_executor_core::model::qwen::v3_5::Qwen35PendingTransactions;
 use inference_executor_core::model::qwen::v3_5::Qwen35SampledTokens;
 use inference_executor_core::model::qwen::v3_5::gather_flat_indices;
-use inference_executor_core::model::qwen::v3_5::num_target_hidden_states;
+use inference_executor_core::model::qwen::v3_5::num_main_output_rows;
 use inference_executor_core::model::qwen::v3_5::sample_decisions_from_sampled_tokens;
 use inference_executor_core::model::qwen::v3_5::sample_sampler_configs;
 use inference_executor_core::model::qwen::v3_5::sample_token_positions;
@@ -110,7 +110,7 @@ pub struct Qwen35Executor {
     sampling: Replay<Sampling>,
     mtp_embed: Option<Replay<Qwen35MTPEmbed>>,
     mtp: Option<Replay<Qwen35MTP>>,
-    draft_sampling: Replay<DraftSampling>,
+    mtp_sampling: Replay<DraftSampling>,
     rejection_sampling: Replay<RejectionSampling>,
     sampler: Rc<TopKSampling>,
     sampler_bounds: TopKSamplingBounds,
@@ -137,7 +137,7 @@ pub struct Qwen35ModelOpsRecorder {
     rejection_arguments: ReplayArguments,
     rejection_prepared: Option<PreparedRejection>,
     rejection_build_elapsed: Duration,
-    num_sample_tokens: usize,
+    num_main_sample_rows: usize,
     mtp_embed_key: Option<Qwen35MTPEmbedReplayKey>,
     mtp_key: Option<Qwen35MTPReplayKey>,
     mtp_microbatch: Option<Qwen35Microbatch>,
@@ -145,17 +145,24 @@ pub struct Qwen35ModelOpsRecorder {
     mtp_sample_positions: Vec<u32>,
     mtp_embed_cache_hit: bool,
     mtp_gather_unembed_key: Option<Qwen35GatherUnembedReplayKey>,
-    mtp_draft_sampling_key: Option<TopKSamplingReplayKey>,
-    mtp_draft_sampling_arguments: ReplayArguments,
-    mtp_draft_req_slots: Vec<u32>,
-    mtp_draft_decision_indices: Vec<usize>,
-    mtp_num_sample_tokens: usize,
+    mtp_sampling_key: Option<TopKSamplingReplayKey>,
+    mtp_sampling_arguments: ReplayArguments,
+    mtp_sample_req_slots: Vec<u32>,
+    mtp_sample_decision_indices: Vec<usize>,
     mtp_build_elapsed: Duration,
 }
 
 impl Qwen35ModelOpsRecorder {
     fn main_replay_cache_hit(&self) -> bool {
         self.main_embed_cache_hit && self.main_cache_hit
+    }
+
+    fn num_mtp_sample_rows(&self) -> usize {
+        let num_rows = self.mtp_sample_req_slots.len();
+        debug_assert_eq!(self.mtp_sample_decision_indices.len(), num_rows);
+        debug_assert_eq!(self.mtp_sampler_configs.len(), num_rows);
+        debug_assert_eq!(self.mtp_sample_positions.len(), num_rows);
+        num_rows
     }
 }
 
@@ -168,7 +175,7 @@ struct Qwen35MTPRequest {
     decision_index: Option<usize>,
 }
 
-struct Qwen35MTPModuleBatch {
+struct Qwen35MTPBatch {
     microbatch: Qwen35Microbatch,
     input_gather_flat_indices: Vec<u32>,
     draft_distribution_indices: Vec<u32>,
@@ -353,7 +360,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             rejection_arguments: ReplayArguments::new(),
             rejection_prepared: None,
             rejection_build_elapsed: Duration::ZERO,
-            num_sample_tokens: num_target_hidden_states(model_batch_request.microbatch()),
+            num_main_sample_rows: num_main_output_rows(model_batch_request.microbatch()),
             mtp_embed_key: None,
             mtp_key: None,
             mtp_microbatch: None,
@@ -361,11 +368,10 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             mtp_sample_positions: Vec::new(),
             mtp_embed_cache_hit: false,
             mtp_gather_unembed_key: None,
-            mtp_draft_sampling_key: None,
-            mtp_draft_sampling_arguments: ReplayArguments::new(),
-            mtp_draft_req_slots: Vec::new(),
-            mtp_draft_decision_indices: Vec::new(),
-            mtp_num_sample_tokens: 0,
+            mtp_sampling_key: None,
+            mtp_sampling_arguments: ReplayArguments::new(),
+            mtp_sample_req_slots: Vec::new(),
+            mtp_sample_decision_indices: Vec::new(),
             mtp_build_elapsed: Duration::ZERO,
         }
     }
@@ -449,7 +455,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             Rc::ptr_eq(model_batch_hidden, &self.hidden_output),
             "qwen3.5 Output must consume the executor final-norm hidden workspace"
         );
-        if num_target_hidden_states(model_batch_req.microbatch()) == 0 {
+        if num_main_output_rows(model_batch_req.microbatch()) == 0 {
             return Qwen35ModelBatchResponse;
         }
         recorder.gather_unembed_key =
@@ -464,12 +470,12 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         _model_batch_resp: &Self::ModelBatchResponse,
     ) {
         let microbatch = model_batch_req.microbatch();
-        let num_sample_tokens = num_target_hidden_states(microbatch);
+        let num_main_sample_rows = num_main_output_rows(microbatch);
         assert_eq!(
-            num_sample_tokens, recorder.num_sample_tokens,
+            num_main_sample_rows, recorder.num_main_sample_rows,
             "qwen3.5 sampling rows must match the recording"
         );
-        if num_sample_tokens == 0 {
+        if num_main_sample_rows == 0 {
             return;
         }
         if self.spec_probs.is_enabled() {
@@ -482,10 +488,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
     }
 
     fn submit_main(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission {
-        if recorder.num_sample_tokens == 0 {
-            return self.submit_main_recording(recorder);
-        }
-        self.submit_main_sampling_recording(recorder)
+        self.submit_main_recording(recorder)
     }
 
     fn read_main(
@@ -494,7 +497,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         model_batch_req: &Self::ModelBatchRequest,
         replay_elapsed: Duration,
     ) -> Self::SampledOutput {
-        if recorder.num_sample_tokens == 0 {
+        if recorder.num_main_sample_rows == 0 {
             let timing = ModelOutputTiming {
                 main_replay_elapsed: replay_elapsed,
                 ..ModelOutputTiming::default()
@@ -507,13 +510,13 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         let (decisions, timing) = if self.spec_probs.is_enabled() {
             self.read_rejection_sampling(recorder, model_batch_req.microbatch(), replay_elapsed)
         } else {
-            self.read_sampling(recorder.num_sample_tokens, replay_elapsed)
+            self.read_sampling(recorder.num_main_sample_rows, replay_elapsed)
         };
         Qwen35SampledOutput { decisions, timing }
     }
 
-    fn has_speculator(&self) -> bool {
-        self.mtp.is_some()
+    fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, sampled_output: &Self::SampledOutput) -> bool {
+        self.mtp.is_some() && !sampled_output.decisions.is_empty()
     }
 
     fn embed_spec(
@@ -559,7 +562,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         _model_batch_req: &Self::ModelBatchRequest,
         model_batch_hidden: &Self::ModelBatchHidden,
     ) -> Self::ModelBatchResponse {
-        self.record_mtp_unembed(recorder, model_batch_hidden);
+        self.record_mtp_gather_unembed(recorder, model_batch_hidden);
         Qwen35ModelBatchResponse
     }
 
@@ -583,7 +586,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         mut sampled_output: Self::SampledOutput,
         replay_elapsed: Duration,
     ) -> Self::SampledOutput {
-        let timing = self.read_mtp_batch(recorder, &mut sampled_output.decisions, replay_elapsed);
+        let timing = self.read_mtp_proposal(recorder, &mut sampled_output.decisions, replay_elapsed);
         sampled_output.timing.add_assign(timing);
         sampled_output
     }
@@ -741,13 +744,13 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_unembed_key_separates_target_hidden_states() {
-        let one_target = one_req_batch(4, 0);
-        let three_targets = one_req_batch(4, 2);
+    fn test_gather_unembed_key_separates_main_output_rows() {
+        let one_main_output = one_req_batch(4, 0);
+        let three_main_outputs = one_req_batch(4, 2);
 
         assert_ne!(
-            Qwen35GatherUnembedReplayKey::from_microbatch(&one_target),
-            Qwen35GatherUnembedReplayKey::from_microbatch(&three_targets)
+            Qwen35GatherUnembedReplayKey::from_microbatch(&one_main_output),
+            Qwen35GatherUnembedReplayKey::from_microbatch(&three_main_outputs)
         );
     }
 
@@ -762,7 +765,7 @@ mod tests {
     }
 
     fn one_req_batch(num_tokens: u32, num_spec_tokens: u32) -> Qwen35Microbatch {
-        let num_sample_tokens = num_spec_tokens + 1;
+        let num_sample_rows = num_spec_tokens + 1;
         Qwen35Microbatch::new(
             vec![0],
             vec![0],
@@ -773,7 +776,7 @@ mod tests {
             vec![Vec::new()],
             vec![SamplerConfig::default()],
             (0..num_tokens)
-                .map(|token_offset| token_offset + num_sample_tokens >= num_tokens)
+                .map(|token_offset| token_offset + num_sample_rows >= num_tokens)
                 .collect(),
         )
     }

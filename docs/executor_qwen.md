@@ -1,7 +1,7 @@
 # Qwen Executor
 
 This document describes the current Qwen3 and Qwen3.5/Qwen3.6 Metal executors.
-The Qwen3 executor is target-only.
+The Qwen3 executor is Main-only.
 The document covers checkpoint configuration, top-down loading, state preparation, cached replay, and sampling.
 Qwen3.5 also owns its single-module MTP path and retained DSpark components.
 The `v3_x` directories contain only version-neutral leaf components and utilities.
@@ -56,11 +56,11 @@ crates/inference-executor-metal/src/
         plan.rs             Qwen3 QKV GQA and dense-MLP core/Metal configuration
       executor/
         mod.rs              Qwen3Executor, private pending transactions, and runtime integration
-        load.rs             target-only top-down load
+        load.rs             Main-only top-down load
         batch.rs            validation, prepare, reset, and commit lifecycle
         recording.rs        recorder lifecycle and Main replay submission
         main.rs             MainEmbed, Main, and GatherUnembed orchestration
-        sampling.rs         ordinary target sampling and readback
+        sampling.rs         ordinary Main sampling and readback
     qwen/v3_5/
       main/
         mod.rs              Qwen35 Main owner, capture contract, and replay key
@@ -138,7 +138,7 @@ Qwen35Executor
   sampling: Replay<Sampling>
   mtp_embed: Option<Replay<Qwen35MTPEmbed>>
   mtp: Option<Replay<Qwen35MTP>>
-  draft_sampling: Replay<DraftSampling>
+  mtp_sampling: Replay<DraftSampling>
   rejection_sampling: Replay<RejectionSampling>
   pages: PageArena
 ```
@@ -151,7 +151,7 @@ Embedding, unembedding, row gather, residual add/capture, and RMS normalization 
 These components hide backend kernel and invocation details.
 Concrete Main and MTP compositions own graph order.
 
-`Qwen3Microbatch` is target-only.
+`Qwen3Microbatch` is Main-only.
 It records which requests are decode requests.
 It gathers the last hidden state from each request.
 It rejects speculative input tokens when it converts a shared runtime request.
@@ -261,7 +261,7 @@ Replay<Qwen3GatherUnembed>   Qwen3 gather -> unembed
 Replay<Qwen35MainEmbed>      token embedding
 Replay<Qwen35Main>           all Main layers -> final norm
 Replay<Qwen35GatherUnembed>  gather -> unembed
-Replay<Sampling>             ordinary target sampling
+Replay<Sampling>             ordinary Main sampling
 Replay<Qwen35MTPEmbed>       previous-hidden gather + token embed + input projection
 Replay<Qwen35MTP>            one GQA body layer -> final norm
 Replay<DraftSampling>        draft sampling + sparse draft distribution
@@ -314,7 +314,7 @@ The object-safe capture contract returns only this descriptor.
 It never receives a recorder.
 Both Main record methods remain generic over `Recorder<Operator = ReplayOp>`.
 
-The current target-only loaders supply no capture owner.
+The current Main-only loaders supply no capture owner.
 Ordinary output buffers and recorded operator sequences remain unchanged.
 
 `Qwen35GatherUnembedArgs` has a flat structure.
@@ -368,7 +368,7 @@ The service waits for the Main submission.
 It then calls `read_main`.
 `read_main` reads the sampled or rejection results on the CPU.
 
-The service checks the static `has_speculator` capability.
+The service calls `run_spec` with the prepared model batch and completed Main output.
 It does not use a per-batch submitted-state flag.
 When the executor has MTP, the service calls `embed_spec` after `read_main`.
 `embed_spec` consumes the completed Main output and sampled results.
@@ -396,7 +396,7 @@ The complete service order is:
 ```text
 embed_main -> forward_main -> unembed_main -> sample_main
 submit_main -> wait -> read_main
-if has_speculator:
+if run_spec(model_batch_req, sampled_output):
     embed_spec -> forward_spec -> unembed_spec -> sample_spec
     submit_spec -> wait -> read_spec
 commit
@@ -504,7 +504,7 @@ Unit tests cover:
 - MTP rejection and generic sampling.
 - DSpark component contracts.
 
-End-to-end tests exercise target-only Qwen3 through server/decode.
+End-to-end tests exercise Main-only Qwen3 through server/decode.
 They also exercise Qwen3.5 Main and optional MTP.
 The tests inspect generated text.
 Performance evidence follows [`executor_benchmarks.md`](executor_benchmarks.md).

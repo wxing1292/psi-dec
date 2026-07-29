@@ -4,7 +4,7 @@ use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
-use inference_executor_core::model::qwen::v3_5::num_target_hidden_states;
+use inference_executor_core::model::qwen::v3_5::num_main_output_rows;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
@@ -72,25 +72,23 @@ impl Qwen35GatherUnembed {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35GatherUnembedReplayKey {
-    num_target_hidden_states: u32,
+    num_main_output_rows: u32,
 }
 
 impl Qwen35GatherUnembedReplayKey {
     pub fn from_microbatch(microbatch: &Qwen35Microbatch) -> Self {
-        let num_target_hidden_states = num_target_hidden_states(microbatch)
+        let num_main_output_rows = num_main_output_rows(microbatch)
             .try_into()
-            .expect("qwen3.5 target hidden-state count must fit u32");
+            .expect("qwen3.5 Main output row count must fit u32");
         assert!(
-            num_target_hidden_states > 0,
-            "qwen3.5 GatherUnembed replay requires target hidden states"
+            num_main_output_rows > 0,
+            "qwen3.5 GatherUnembed replay requires Main output rows"
         );
-        Self {
-            num_target_hidden_states,
-        }
+        Self { num_main_output_rows }
     }
 
-    pub fn num_target_hidden_states(&self) -> u32 {
-        self.num_target_hidden_states
+    pub fn num_main_output_rows(&self) -> u32 {
+        self.num_main_output_rows
     }
 }
 
@@ -99,12 +97,9 @@ impl ReplayComponent for Qwen35GatherUnembed {
     type Input<'a> = Qwen35GatherUnembedArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        assert!(
-            input.num_rows > 0,
-            "qwen3.5 GatherUnembed requires target hidden states"
-        );
+        assert!(input.num_rows > 0, "qwen3.5 GatherUnembed requires Main output rows");
         Qwen35GatherUnembedReplayKey {
-            num_target_hidden_states: input.num_rows,
+            num_main_output_rows: input.num_rows,
         }
     }
 

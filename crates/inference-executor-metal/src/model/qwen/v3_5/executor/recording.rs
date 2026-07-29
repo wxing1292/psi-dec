@@ -20,52 +20,52 @@ impl Qwen35Executor {
         let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
         let main_replay = self.main.replay(&recorder.main_key);
         let empty_arguments = ReplayArguments::new();
-        self.replay_runtime()
-            .submit_replay_sequence(&[
-                ReplayExecution::new(main_embed_replay, &empty_arguments),
-                ReplayExecution::new(main_replay, &empty_arguments),
-            ])
-    }
-
-    fn submit_main_sampling_recording(
-        &self,
-        recorder: &Qwen35ModelOpsRecorder,
-    ) -> MetalReplaySubmission {
+        let mut sequence = vec![
+            ReplayExecution::new(main_embed_replay, &empty_arguments),
+            ReplayExecution::new(main_replay, &empty_arguments),
+        ];
+        if let Some(gather_unembed_key) = &recorder.gather_unembed_key {
+            assert!(
+                recorder.num_main_sample_rows > 0,
+                "qwen3.5 GatherUnembed replay requires Main sampling rows"
+            );
+            sequence.push(ReplayExecution::new(
+                self.gather_unembed.replay(gather_unembed_key),
+                &empty_arguments,
+            ));
+            if let Some(rejection_key) = &recorder.rejection_key {
+                assert!(
+                    recorder.sampling_key.is_none(),
+                    "qwen3.5 Main recording must select one sampling path"
+                );
+                sequence.push(ReplayExecution::new(
+                    self.rejection_sampling.replay(rejection_key),
+                    &recorder.rejection_arguments,
+                ));
+            } else {
+                let sampling_key = recorder
+                    .sampling_key
+                    .as_ref()
+                    .expect("qwen3.5 sampled output requires Sampling replay");
+                sequence.push(ReplayExecution::new(
+                    self.sampling.replay(sampling_key),
+                    &recorder.sampling_arguments,
+                ));
+            }
+        } else {
+            assert_eq!(
+                recorder.num_main_sample_rows, 0,
+                "qwen3.5 Main sampling rows require GatherUnembed replay"
+            );
+            assert!(
+                recorder.sampling_key.is_none() && recorder.rejection_key.is_none(),
+                "qwen3.5 Main recording without output rows must not contain sampling"
+            );
+        }
         trace::qwen35_state(|| {
             format!("event=submit_main_sequence_start main_key={:?}", recorder.main_key)
         });
-        let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
-        let main_replay = self.main.replay(&recorder.main_key);
-        let gather_unembed_key = recorder
-            .gather_unembed_key
-            .as_ref()
-            .expect("qwen3.5 sampled output requires GatherUnembed replay");
-        let gather_unembed_replay = self.gather_unembed.replay(gather_unembed_key);
-        let (sampling_replay, sampling_arguments) = if self.spec_probs.is_enabled() {
-            let rejection_key = recorder
-                .rejection_key
-                .as_ref()
-                .expect("qwen3.5 sampled output requires RejectionSampling replay");
-            (
-                self.rejection_sampling.replay(rejection_key),
-                &recorder.rejection_arguments,
-            )
-        } else {
-            let sampling_key = recorder
-                .sampling_key
-                .as_ref()
-                .expect("qwen3.5 sampled output requires Sampling replay");
-            (self.sampling.replay(sampling_key), &recorder.sampling_arguments)
-        };
-        let empty_arguments = ReplayArguments::new();
-        let submission = self
-            .replay_runtime()
-            .submit_replay_sequence(&[
-                ReplayExecution::new(main_embed_replay, &empty_arguments),
-                ReplayExecution::new(main_replay, &empty_arguments),
-                ReplayExecution::new(gather_unembed_replay, &empty_arguments),
-                ReplayExecution::new(sampling_replay, sampling_arguments),
-            ]);
+        let submission = self.replay_runtime().submit_replay_sequence(&sequence);
         trace::qwen35_state(|| {
             format!(
                 "event=submit_main_sequence_submitted main_key={:?}",

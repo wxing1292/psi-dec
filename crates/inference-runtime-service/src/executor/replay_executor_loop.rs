@@ -206,7 +206,7 @@ where
             self.model.empty_sampled_output()
         };
 
-        if last_pp_stage && self.model.has_speculator() {
+        if last_pp_stage && self.model.run_spec(&model_batch_req, &sampled_output) {
             let spec_batch_hidden_req = {
                 let _span = profiling::span("model.embed_spec.record");
                 self.model.embed_spec(
@@ -509,7 +509,7 @@ mod tests {
             self.record("read_main");
         }
 
-        fn has_speculator(&self) -> bool {
+        fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, _sampled_output: &Self::SampledOutput) -> bool {
             true
         }
 

@@ -4,7 +4,7 @@ pub use batch::Qwen35Microbatch;
 pub use batch::Qwen35ModelBatchRequest;
 pub use batch::Qwen35SampledTokens;
 pub use batch::gather_flat_indices;
-pub use batch::num_target_hidden_states;
+pub use batch::num_main_output_rows;
 pub use batch::sample_decisions_from_sampled_tokens;
 pub use batch::sample_sampler_configs;
 pub use batch::sample_token_positions;

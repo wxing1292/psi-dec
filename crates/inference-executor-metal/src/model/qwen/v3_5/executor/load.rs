@@ -297,7 +297,7 @@ fn init_qwen_3_5_model_inner(
         qwen35_gqa_core_and_metal(first_gqa_layer, &model_config.text_config, metal_defaults)?;
     let gqa_tokens_per_page = main_gqa_metal.num_tokens_per_page(&main_gqa_core) as usize;
     let main_page_ids_per_block = num_page_ids_per_block(config.num_tokens_per_block, gqa_tokens_per_page);
-    let target_gqa_page_table_layout = GQAPageTableLayout {
+    let main_gqa_page_table_layout = GQAPageTableLayout {
         num_req_slots: config
             .max_requests
             .try_into()
@@ -317,7 +317,7 @@ fn init_qwen_3_5_model_inner(
             .try_into()
             .expect("qwen3.5 GQA pages per block must fit u32"),
     };
-    let gqa_page_table_layout = target_gqa_page_table_layout;
+    let gqa_page_table_layout = main_gqa_page_table_layout;
     let mut mtp_load = if config.num_mtp_modules == 1 {
         let mtp_model_dir = mtp_model_dir.expect("qwen3.5 replay model checked MTP model dir");
         let mtp_model_config = init_qwen35_model_config(mtp_model_dir)?;
@@ -564,7 +564,7 @@ fn init_qwen_3_5_model_inner(
         ),
         mtp_embed: mtp_embed.map(|mtp_embed| Replay::new("qwen3.5 MTPEmbed", mtp_embed)),
         mtp: mtp.map(|mtp| Replay::new("qwen3.5 MTP", mtp)),
-        draft_sampling: Replay::new(
+        mtp_sampling: Replay::new(
             "qwen3.5 draft sampling",
             DraftSampling {
                 sampler: Rc::clone(&sampler),

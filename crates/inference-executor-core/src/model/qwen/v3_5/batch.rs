@@ -125,12 +125,12 @@ impl Qwen35Microbatch {
                 .num_spec_tokens()
                 .try_into()
                 .expect("qwen3.5 request speculative-token count must fit u32");
-            let num_req_target_hidden_states = match request.decoder_query_tokens {
+            let num_req_main_output_rows = match request.decoder_query_tokens {
                 QueryTokens::Prefill { .. } => 0,
                 QueryTokens::Decode { .. } => {
                     num_req_spec_tokens
                         .checked_add(1)
-                        .expect("qwen3.5 target hidden-state count must fit u32")
+                        .expect("qwen3.5 Main output row count must fit u32")
                 },
             };
             let gdn_state_page_ids = request
@@ -142,13 +142,13 @@ impl Qwen35Microbatch {
 
             assert!(q_len > 0, "qwen3.5 batch requires positive q_len");
             assert!(
-                num_req_target_hidden_states <= q_len,
+                num_req_main_output_rows <= q_len,
                 "qwen3.5 sample tokens exceed request query tokens"
             );
-            let first_target_offset = q_len
-                .checked_sub(num_req_target_hidden_states)
-                .expect("qwen3.5 target hidden-state suffix must fit q_len");
-            flat_sample_mask.extend((0..q_len).map(|token_offset| token_offset >= first_target_offset));
+            let first_main_output_offset = q_len
+                .checked_sub(num_req_main_output_rows)
+                .expect("qwen3.5 Main output suffix must fit q_len");
+            flat_sample_mask.extend((0..q_len).map(|token_offset| token_offset >= first_main_output_offset));
 
             for lane in 0..=num_mtp_modules {
                 let needs_runtime_lane =
@@ -273,7 +273,7 @@ impl Qwen35Microbatch {
         &self.flat_sample_mask
     }
 
-    pub fn num_target_hidden_states_for_req(&self, req_index: usize) -> usize {
+    pub fn num_main_output_rows_for_req(&self, req_index: usize) -> usize {
         let token_start = self.cu_tokens()[req_index] as usize;
         let token_end = self.cu_tokens()[req_index + 1] as usize;
         self.flat_sample_mask[token_start..token_end]
@@ -381,17 +381,17 @@ pub fn gather_flat_indices(microbatch: &Qwen35Microbatch) -> Vec<u32> {
         .collect()
 }
 
-pub fn num_target_hidden_states(microbatch: &Qwen35Microbatch) -> usize {
+pub fn num_main_output_rows(microbatch: &Qwen35Microbatch) -> usize {
     microbatch.flat_sample_mask().iter().filter(|&&sample| sample).count()
 }
 
-/// Returns the logical output-token position for each target hidden state.
+/// Returns the logical output-token position for each Main output row.
 ///
 /// The sampler combines these positions with request seeds rather than the
 /// transient compact flat index, keeping fixed-seed decoding stable when a
 /// replay is reused for a differently packed batch.
 pub fn sample_token_positions(microbatch: &Qwen35Microbatch) -> Vec<u32> {
-    let mut positions = Vec::with_capacity(num_target_hidden_states(microbatch));
+    let mut positions = Vec::with_capacity(num_main_output_rows(microbatch));
     for req_index in 0..microbatch.num_reqs() {
         let token_start = microbatch.cu_tokens()[req_index] as usize;
         let token_end = microbatch.cu_tokens()[req_index + 1] as usize;
@@ -415,23 +415,20 @@ pub fn sample_token_positions(microbatch: &Qwen35Microbatch) -> Vec<u32> {
     positions
 }
 
-/// Returns the request-level sampling configuration expanded over target hidden states.
+/// Returns the request-level sampling configuration expanded over Main output rows.
 ///
 /// A request with `num_spec_tokens` speculative input tokens owns `num_spec_tokens + 1`
-/// contiguous target hidden states: one validation distribution per draft token and
+/// contiguous Main output rows: one validation distribution per draft token and
 /// one final sample distribution.
 pub fn sample_sampler_configs(microbatch: &Qwen35Microbatch) -> Vec<SamplerConfig> {
-    let mut configs = Vec::with_capacity(num_target_hidden_states(microbatch));
+    let mut configs = Vec::with_capacity(num_main_output_rows(microbatch));
     for req_index in 0..microbatch.num_reqs() {
         configs.extend(std::iter::repeat_n(
             microbatch.sampler_configs[req_index],
-            microbatch.num_target_hidden_states_for_req(req_index),
+            microbatch.num_main_output_rows_for_req(req_index),
         ));
     }
-    assert!(
-        !configs.is_empty(),
-        "qwen3.5 sampler configs require target hidden states"
-    );
+    assert!(!configs.is_empty(), "qwen3.5 sampler configs require Main output rows");
     configs
 }
 
@@ -641,23 +638,23 @@ fn validate_flat_sample_mask(cu_tokens: &[u32], gdn_state_txns: &[GDNStateTxn], 
         let token_start = cu_tokens[req_index] as usize;
         let token_end = cu_tokens[req_index + 1] as usize;
         let req_flat_sample_mask = &flat_sample_mask[token_start..token_end];
-        let num_req_target_hidden_states = req_flat_sample_mask.iter().filter(|&&sample| sample).count();
-        if num_req_target_hidden_states == 0 {
+        let num_req_main_output_rows = req_flat_sample_mask.iter().filter(|&&sample| sample).count();
+        if num_req_main_output_rows == 0 {
             continue;
         }
         assert_eq!(
-            num_req_target_hidden_states,
+            num_req_main_output_rows,
             usize::try_from(gdn_state_txns[req_index].num_spec_tokens)
                 .expect("qwen3.5 speculative-token count must fit host usize")
                 .checked_add(1)
-                .expect("qwen3.5 target hidden-state count must fit usize"),
+                .expect("qwen3.5 Main output row count must fit usize"),
             "qwen3.5 decode request requires one sample token per speculative token plus one"
         );
         assert!(
-            req_flat_sample_mask[..req_flat_sample_mask.len() - num_req_target_hidden_states]
+            req_flat_sample_mask[..req_flat_sample_mask.len() - num_req_main_output_rows]
                 .iter()
                 .all(|&sample| !sample)
-                && req_flat_sample_mask[req_flat_sample_mask.len() - num_req_target_hidden_states..]
+                && req_flat_sample_mask[req_flat_sample_mask.len() - num_req_main_output_rows..]
                     .iter()
                     .all(|&sample| sample),
             "qwen3.5 flat_sample_mask requires a contiguous request suffix"
@@ -778,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_target_hidden_states_speculative() {
+    fn test_main_output_rows_speculative() {
         let batch = Qwen35Microbatch::new(
             vec![0],
             vec![0],
@@ -792,7 +789,7 @@ mod tests {
         );
 
         assert_eq!(gather_flat_indices(&batch), vec![2, 3, 4]);
-        assert_eq!(num_target_hidden_states(&batch), 3);
+        assert_eq!(num_main_output_rows(&batch), 3);
     }
 
     #[test]
@@ -844,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn test_target_hidden_states_decode() {
+    fn test_main_output_rows_decode() {
         let request = Qwen35Microbatch::from_requests(
             &[
                 device_request(
@@ -884,7 +881,7 @@ mod tests {
             vec![SamplerConfig::default(); 3],
         );
 
-        assert_eq!(num_target_hidden_states(&request), 4);
+        assert_eq!(num_main_output_rows(&request), 4);
         assert_eq!(gather_flat_indices(&request), vec![3, 4, 5, 6]);
         assert_eq!(sample_token_positions(&request), vec![4, 5, 6, 7]);
     }

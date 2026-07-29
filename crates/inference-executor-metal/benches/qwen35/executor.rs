@@ -236,7 +236,7 @@ impl ExecutorFixture {
         let mut sampled = self
             .model
             .read_main(&recorder, &model_batch_req, main_replay_start.elapsed());
-        if self.model.has_speculator() {
+        if self.model.run_spec(&model_batch_req, &sampled) {
             let spec_hidden = self
                 .model
                 .embed_spec(&mut recorder, &model_batch_req, &hidden, &sampled);

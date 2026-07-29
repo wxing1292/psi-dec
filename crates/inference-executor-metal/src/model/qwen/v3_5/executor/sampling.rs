@@ -32,7 +32,7 @@ impl Qwen35Executor {
         (sample_key, replay_arguments)
     }
 
-    fn prepare_draft_sample_replay(
+    fn prepare_mtp_sampling_replay(
         &mut self,
         sampler_configs: &[SamplerConfig],
         sample_positions: &[u32],
@@ -40,7 +40,7 @@ impl Qwen35Executor {
         assert_eq!(
             sampler_configs.len(),
             sample_positions.len(),
-            "qwen3.5 draft sample runtime configs and positions must have equal lengths"
+            "qwen3.5 MTP sample runtime configs and positions must have equal lengths"
         );
         let sample_shape = self.sample_replay_shape(sampler_configs);
         let input = DraftSamplingInput {
@@ -60,7 +60,7 @@ impl Qwen35Executor {
             },
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (sample_key, _) = self.draft_sampling.record(&runtime, &input);
+        let (sample_key, _) = self.mtp_sampling.record(&runtime, &input);
         self.sampler
             .set_configs(sampler_configs, sample_positions, SamplingDomain::Draft);
         let mut replay_arguments = ReplayArguments::new();
@@ -98,7 +98,7 @@ impl Qwen35Executor {
 
     fn read_sampling(
         &mut self,
-        num_sample_tokens: usize,
+        num_sample_rows: usize,
         replay_elapsed: Duration,
     ) -> (Vec<Qwen35DecodeDecision>, ModelOutputTiming) {
         let mut timing = ModelOutputTiming {
@@ -106,7 +106,7 @@ impl Qwen35Executor {
             ..ModelOutputTiming::default()
         };
         let sample_read_start = Instant::now();
-        let decisions = self.read_sample_decisions(num_sample_tokens);
+        let decisions = self.read_sample_decisions(num_sample_rows);
         trace_decisions("sample_read", &decisions);
         timing.sample_read_elapsed = sample_read_start.elapsed();
         (decisions, timing)
@@ -118,7 +118,7 @@ impl Qwen35Executor {
         microbatch: &Qwen35Microbatch,
     ) {
         let sample_positions = sample_token_positions(microbatch);
-        let num_target_hidden_states = num_target_hidden_states(microbatch);
+        let num_main_output_rows = num_main_output_rows(microbatch);
         let sampler_configs = sample_sampler_configs(microbatch);
         let mut flat_draft_distribution_indices = Vec::new();
         let max_spec_tokens = self.num_speculative_tokens();
@@ -176,8 +176,8 @@ impl Qwen35Executor {
         let num_target_distribution_capacity =
             replay_bucket_capacity_usize(num_active_target_distributions, max_target_distributions);
         debug_assert_eq!(
-            num_target_hidden_states, num_active_target_distributions,
-            "qwen3.5 target hidden states must match target distributions"
+            num_main_output_rows, num_active_target_distributions,
+            "qwen3.5 Main output rows must match target distributions"
         );
         let target_distribution_shape = self
             .sampler

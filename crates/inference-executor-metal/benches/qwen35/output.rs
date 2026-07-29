@@ -14,7 +14,7 @@ use inference_executor_core::checkpoint::SafeTensorStore;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::gather_flat_indices;
 use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
-use inference_executor_core::model::qwen::v3_5::num_target_hidden_states;
+use inference_executor_core::model::qwen::v3_5::num_main_output_rows;
 use inference_executor_core::model::qwen::v3_5::sample_sampler_configs;
 use inference_executor_core::model::qwen::v3_5::sample_token_positions;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35ModelWeightBindings;
@@ -361,11 +361,11 @@ impl HeadFixture {
                 self.record_final_norm_gather(&mut builder, microbatch);
             },
             Case::Unembed => {
-                self.record_unembed(&mut builder, num_target_hidden_states(microbatch) as u32);
+                self.record_unembed(&mut builder, num_main_output_rows(microbatch) as u32);
             },
             Case::UnembedPath => {
                 self.record_final_norm_gather(&mut builder, microbatch);
-                self.record_unembed(&mut builder, num_target_hidden_states(microbatch) as u32);
+                self.record_unembed(&mut builder, num_main_output_rows(microbatch) as u32);
             },
             Case::Sample | Case::SampleReadback => {
                 self.record_sampling(&mut builder, microbatch, &mut arguments);
@@ -382,7 +382,7 @@ impl HeadFixture {
             .submit_replay_with_arguments(&replay.program, &replay.arguments)
             .wait();
         if case == Case::SampleReadback {
-            self.read_sample_output(num_target_hidden_states(microbatch));
+            self.read_sample_output(num_main_output_rows(microbatch));
         }
     }
 
@@ -405,7 +405,7 @@ impl HeadFixture {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_rows = num_target_hidden_states(microbatch) as u32;
+        let num_rows = num_main_output_rows(microbatch) as u32;
         self.final_norm.record(
             recorder,
             microbatch.total_tokens() as u32,

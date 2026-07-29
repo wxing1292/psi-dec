@@ -68,7 +68,7 @@ pub trait ReplayableModelBatchExecutor {
         replay_elapsed: Duration,
     ) -> Self::SampledOutput;
 
-    fn has_speculator(&self) -> bool {
+    fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, _sampled_output: &Self::SampledOutput) -> bool {
         false
     }
 
