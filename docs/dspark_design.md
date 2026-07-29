@@ -300,7 +300,7 @@ Unit and Metal parity tests cover:
 - Ragged sparse rejection
 - Non-contiguous request slots
 
-The source and test boundaries are:
+The source, test, and benchmark boundaries are:
 
 ```text
 src/
@@ -308,9 +308,53 @@ src/
 
 src/*_test.rs
   unit and Metal parity tests for one production module
+
+benches/gqa/block_attn.rs
+  model-independent block-bidirectional SDPA map timing
+
+benches/qwen3/dspark.rs
+benches/qwen3/dspark/fixture.rs
+  real-checkpoint Main and DSpark executor lifecycle timing
 ```
 
-Service wiring, end-to-end verification, benchmarks, and performance evidence belong to later commits.
+The benchmark fixture uses only the public executor contract.
+Production `src` has no benchmark-only control path or state.
+
+Run the component benchmark with:
+
+```sh
+cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
+  --block-sizes 7 --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+```
+
+Run the executor benchmark with:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
+  --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
+  --cases dspark --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+```
+
+The release Qwen3 service passed deterministic and probabilistic DSpark decode.
+The deterministic 64-token decoded text matched the Main-only decoded text.
+
+The first end-to-end performance comparison found a regression.
+The steady deterministic median was `41.180 tok/s` for Main-only and `33.611 tok/s` for DSpark.
+The DSpark result was `18.4%` slower.
+The steady executor breakdown attributes approximately `85.9%` of one DSpark cycle to the eight-token Main
+verification submission.
+It attributes approximately `14.3%` to the DSpark proposal submission.
+Steady record, read, and commit work is negligible.
+The sparse-rejection kernel measures `0.351 ms` for the matching one-request, seven-proposal geometry.
+The measured `27.7%` proposal-token acceptance rate is below the approximately `38.6%` break-even rate.
+Proposal-only optimization cannot recover the regression at this acceptance rate.
+The performance verification is complete.
+The fixed-block setup is not suitable for this Qwen3-14B workload on the tested Apple M3 Max.
+This result does not invalidate the functional fixed-block milestone.
+It prevents a performance-benefit claim for this setup.
+The full evidence is in [`qwen3_dspark_design_draft.md`](qwen3_dspark_design_draft.md).
 
 ## Deferred work
 

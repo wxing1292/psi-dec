@@ -134,6 +134,36 @@ component path as the design.
 
 ## Model and Backend Investigations
 
+- Recover Qwen3 DSpark end-to-end performance in this order:
+  1. Profile and optimize the complete DSpark proposal submission.
+     Preserve the Markov dependency and the single DSpark submission.
+     Measure the DSpark embed, body, GatherUnembed, and Markov sampling sub-operations before changing production code.
+  2. Continue the separate Main multi-row verification optimization.
+     Preserve one Main submission for each batch.
+  3. Execute the official confidence head and add dynamic proposal lengths.
+     Keep confidence generation in the model executor.
+     Keep global proposal ranking and verification-budget allocation in runtime scheduling.
+     Do not add variable proposal lengths until the scheduler owns this cross-request policy.
+
+  The first deterministic Qwen3-14B comparison measured `41.180 tok/s` for Main-only and `33.611 tok/s` for
+  fixed-block DSpark.
+  Stable DSpark batches spent approximately 75.3 ms in 8-row Main verification and rejection.
+  They spent approximately 12.7 ms in the complete DSpark proposal submission.
+  The proposal acceptance rate was `27.7%`.
+  An eight-row dense-MLP diagnostic measured `1684.868 µs` for QMV and `2039.609 µs` for QMM.
+  An eight-row Qwen3 GQA diagnostic measured `0.695479 ms` for the production tiled path and `0.725750 ms` for the
+  single-Q path.
+  Do not change the current QMV/QMM or tiled-attention thresholds for this workload.
+  Compare confidence-guided verification lengths with bounded Main multi-row verification work.
+- Add a separate gated DSpark GQA implementation when a supported checkpoint requires it.
+  Do not add a runtime gate flag to `UngatedDSparkGQA`.
+  Keep the history map, block map, reducer, page layout, and scratch contracts gate-neutral.
+- Add Qwen3 DSpark checkpoint variants only from real checkpoint contracts.
+  This work can include a final-layer entry in the official `target_layer_ids` field, additional Markov heads, or a
+  different proposal layout.
+  Do not add speculative compatibility fields without a supported checkpoint.
+- Permit overlapping Qwen3 DSpark batches only after all proposal scratch, outputs, replay arguments, and probability
+  stores have bounded in-flight ownership.
 - Design backend-agnostic immutable `Weight` / `Tensor` / `Storage` ownership.
   Recommendation: Assign file and mapped-storage lifetime to checkpoint readers.
   Assign tensor identity and semantic layout to model planning.

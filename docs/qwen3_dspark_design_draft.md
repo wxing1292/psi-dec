@@ -1,322 +1,1066 @@
-# Qwen3 DSpark Integration Design (Temporary Draft)
+# Qwen3 DSpark Integration Record
 
-Temporary status: This document records the current design discussion.
-It is not a current-source contract.
+Temporary status: This document records the active Qwen3 DSpark implementation and its design audit.
+It is not a stable current-source contract.
+Current-component documents must describe the checked-in `src`.
 
-This document is the single draft record for planned Qwen3 DSpark integration.
-It also owns the related deferred executor-ownership, confidence-scheduling, and backend-neutral replay work.
-Current-component documents continue to describe current `src`.
+Model roles use `Main`, `MTP`, and `DSpark` or `Spec`.
+They do not use `Target` or `Draft`.
+The official checkpoint keys `target_layer_ids` and `num_target_layers` keep their upstream names.
+The generic rejection-sampling API keeps `target_*` and `draft_*`.
+In that API, these names identify probability distributions.
+The backend-neutral `ResidualCaptureTarget` uses `Target` to mean a write destination.
+The tracing `target:` field identifies a log category.
+None of these names identify model roles.
 
-Current status:
+## Milestone status
 
-- Qwen3 can load an optional fixed-block DSpark speculator.
-- Qwen3.5 supports zero or one MTP module.
-- The Qwen3x subtree owns the new DSpark configuration, bindings, model components, attention state, and Markov
-  sampling.
-- The Qwen3 executor wires DSpark through the generic Main and Spec lifecycle.
-- The service does not yet expose a DSpark checkpoint option.
-- No end-to-end DSpark correctness or performance claim exists.
+The active `dev` worktree implements the first fixed-block Qwen3 DSpark milestone.
+The semantic, correctness, and performance verification is complete.
+The fixed-block path is functionally valid.
+It does not improve throughput for the measured Qwen3-14B workload on the tested Apple M3 Max.
+This result prevents a performance-benefit claim.
+It does not block the fixed-block functional milestone.
 
-The repository no longer contains the unwired Qwen3.5-era DSpark implementation.
-
-## Confirmed scope
-
-The first Qwen3 DSpark milestone must use the official DeepSeek Qwen3 DSpark model contract.
-It must not reintroduce the removed Qwen3.5-era low-level graph into `Qwen3Executor`.
-
-The milestone must preserve these boundaries:
-
-- `Qwen3MainLayer`, `Qwen35MTPLayer`, and `Qwen3DSparkLayer` are separate role types.
-- DSpark must not extend or add variants to `Qwen3MainLayer`.
-- DSpark must not add fields or behavior to `Qwen35MTPLayer`.
-- `Qwen3DSparkLayer` may compose shared GQA, norm, dense-MLP, and other leaf components.
-- `Qwen3DSparkLayer` may own DSpark-specific operations and components when the model requires them.
-- The service must continue to use the generic Main and Spec lifecycle hooks.
-- Main and Spec must expose the same `embed -> forward -> unembed -> sample -> submit -> wait -> read` lifecycle shape.
-- `forward_spec` must not also record Spec embedding, unembedding, or sampling.
-- The service must not add DSpark-specific prepare, sample, commit, or replay hooks.
-
-The first milestone uses one in-flight batch per executor.
-`prepare_batch` and batch execution form one exclusive interval.
-Shared scratch and output buffers may be reused only after that interval ends.
-The design does not permit overlapping batch preparation or execution.
-
-GPU execution failures are terminal internal failures.
-The design does not provide recoverable GPU rollback.
-
-## Current component source
-
-The repository currently contains these Qwen3x component files:
+The current worktree contains these new areas:
 
 ```text
-crates/inference-executor-core/src/model/qwen/v3_x/dspark/
-  config.rs                 official flat configuration contract
-  weight_layout.rs          exact source and affine binding trees
-
-crates/inference-executor-core/src/bin/
-  qwen3_dspark_quantize.rs  checkpoint converter
+crates/inference-executor-core/src/
+  attn/gqa/dspark_core.rs
+  model/qwen/v3_x/dspark/
+  bin/qwen3_dspark_quantize.rs
 
 crates/inference-backend-metal/src/components/
   gqa_block_attention.rs
   metal/gqa_block_sdpa.metal
 
 crates/inference-executor-metal/src/
-  attn/dspark/
+  attn/dspark/*.rs
   model/qwen/v3_x/dspark/
-  model/qwen/v3/executor/dspark.rs
   sampling/dspark_markov.rs
   sampling/rejection_replay.rs
+  model/qwen/v3/executor/dspark.rs
 ```
 
-The Qwen3.5 executor does not reference these components from its load or forward path.
-The Qwen3.5 loader supplies no DSpark capture owner.
-MTP remains the only speculator that Qwen3.5 executes.
+The Qwen3 executor can load an optional affine DSpark checkpoint.
+The Qwen3 service exposes `--hf-dspark-model-dir`.
+The service keeps the common Main and Spec lifecycle.
 
-The current implementation includes:
+The first milestone has these limits:
 
-- Tensor names and affine layouts
-- Target-feature geometry
-- Local block metadata
-- GQA context append
-- Dense layer and scratch geometry
-- Markov correction
-- Metal buffer and kernel contracts
+- It supports the official anchor-first fixed-block proposal layout.
+- It supports ungated Qwen3 GQA.
+- It supports the `vanilla` Markov head.
+- It does not execute the confidence head.
+- It does not schedule variable proposal lengths.
+- It permits one in-flight batch for each executor.
+- It treats GPU execution failures as terminal internal failures.
 
-The Qwen3 batch accepts an optional speculative suffix.
-The executor owns Main verification, sparse rejection, DSpark context append, and proposal submission.
+The end-to-end Qwen3 path passed greedy and probabilistic decode.
+The repository no longer contains the earlier Qwen3.5-era DSpark source.
+The current implementation does not keep a compatibility path to that source.
+
+## Confirmed structure
+
+The model roles are independent:
+
+```text
+Qwen3MainLayer
+Qwen35MTPLayer
+Qwen3xDSparkLayer
+```
+
+`Qwen3xDSparkLayer` composes generic GQA, RMSNorm, dense MLP, residual, and Metal leaf components.
+It does not extend `Qwen3MainLayer`.
+It does not add a variant to `Qwen35MTPLayer`.
+
+The Qwen3 executor owns flat semantic stage roles:
+
+```text
+Qwen3Executor
+  Main
+    main_embed
+    main
+    dspark_context
+    gather_unembed
+    sampling
+    rejection_sampling
+
+  DSpark Spec
+    dspark_embed
+    dspark
+    dspark_gather_unembed
+    dspark_sampling
+
+  shared execution data
+    Main GQA state
+    DSpark GQA state
+    request sampling state
+    sparse probability store
+    Main and DSpark page-table layouts
+    DSparkBlockScratch
+    PageArena
+    pending Main transactions
+```
+
+`dspark_context` is a normal `Replay<Qwen3xDSparkContext>` component.
+It runs in the Main submission.
+This component projects selected Main residuals and appends persistent DSpark context K/V.
+This boundary keeps `Qwen3Main` independent from concrete DSpark types.
+
+`dspark` means the DSpark model body.
+It does not include embedding, unembedding, Markov correction, or sampling.
 
 ## Official configuration contract
 
-The Qwen3 DSpark checkpoint uses a flat Hugging Face configuration.
-The core type is `Qwen3xDSparkConfig`.
-It parses the official field names directly.
-It must not contain `dflash_config` or `DSparkDFlashConfig`.
+`Qwen3xDSparkConfig` parses the official flat Hugging Face schema.
+It does not parse `dflash_config`.
+It does not define `DSparkDFlashConfig`.
 
-The initial contract includes these fields when the checkpoint provides them:
+The first milestone parses these official fields:
 
 ```text
 architectures
+attention_bias
+attention_dropout
 block_size
-mask_token_id
-target_layer_ids
-num_target_layers
+confidence_head_with_markov
+dtype
+enable_confidence_head
+head_dim
+hidden_act
 hidden_size
 intermediate_size
-num_hidden_layers
-num_attention_heads
-num_key_value_heads
-head_dim
-rms_norm_eps
-rope_parameters
+layer_types
 markov_head_type
 markov_rank
-enable_confidence_head
-confidence_head_with_markov
+mask_token_id
+max_position_embeddings
+model_type
+num_anchors
+num_attention_heads
+num_hidden_layers
+num_key_value_heads
+num_target_layers
+quantization
+rms_norm_eps
+rope_parameters
+sliding_window
+target_layer_ids
+tie_word_embeddings
+torch_dtype
+use_cache
+use_sliding_window
 vocab_size
 ```
 
-The implementation follows the official Qwen3 DSpark checkpoint schema.
-It removes the nested DFlash-era parser, validation, plan wiring, and tests.
-It does not keep a compatibility alias for `dflash_config`.
+The first milestone requires these values:
 
-The official `target_layer_ids` field selects Main decoder-layer outputs.
-The first milestone applies these requirements:
+- `model_type = "qwen3"`
+- `architectures` is empty or contains only `Qwen3DSparkModel`
+- `attention_bias = false`
+- `attention_dropout = 0`
+- `hidden_act = "silu"`
+- `layer_types` is empty or contains only `full_attention`
+- `markov_head_type = "vanilla"`
+- `tie_word_embeddings = false`
+- `use_cache = true`
+- Sliding-window attention is disabled.
+- RoPE uses the unscaled `default` form.
+- The execution dtype is BF16.
+
+`target_layer_ids` selects raw decoder-layer outputs.
+The first milestone requires these properties:
 
 - The list must not be empty.
 - The values must be strictly increasing.
-- Each value must satisfy `0 <= layer_id < num_target_layers`.
+- Each value must satisfy `0 <= layer_id < num_target_layers - 1`.
 - The value `-1` is unsupported.
-- Embedding outputs and final-norm sentinels are unsupported.
+- The final Main decoder layer is unsupported in this milestone.
 
-If the current residual-capture location does not represent the official decoder-layer output, the Qwen3 Main capture owner
-must change.
-The implementation must not redefine the checkpoint field to match a retained seam.
+The loader compares the DSpark config with the Main config.
+It validates these shared dimensions:
+
+```text
+hidden_size
+num_target_layers == Main num_hidden_layers
+vocab_size
+max_position_embeddings
+rope_theta
+```
 
 ## Weight contract
 
-The Qwen3 DSpark binding tree must identify these semantic groups:
+The Qwen3 DSpark binding tree contains these semantic groups:
 
-- Optional DSpark token embedding
-- Target-feature projection and combination
-- DSpark decoder layers
-- DSpark final norm
-- Optional DSpark language-model head
-- Markov embedding and projection weights
-- Optional draft-to-target vocabulary mapping
-- Confidence-head weights when present
+```text
+optional embed_tokens
+Main-feature projection
+  fc
+  hidden_norm
+DSpark decoder layers
+  input norm
+  ungated GQA
+  post-attention norm
+  dense MLP
+final norm
+optional lm_head
+Markov head
+  markov_w1
+  markov_w2
+optional confidence head
+```
 
-The checkpoint decides embedding and language-model-head ownership.
-When the checkpoint includes a DSpark-owned weight, DSpark must load and use it.
-When the checkpoint omits that weight, initialization may alias the compatible target weight.
-The loader must validate shape, dtype, vocabulary, and sharing requirements before it creates the alias.
-It must not select ownership per batch.
+The official source resolver requires an exact BF16 tensor manifest.
+It recognizes `confidence_head.proj.weight` and `confidence_head.proj.bias`.
 
-The first milestone must recognize confidence fields and weights.
-It must not materialize or execute confidence-head weights.
-The loader must report this limitation clearly.
+The affine converter creates an exact executor checkpoint.
+It preserves DSpark-owned `embed_tokens` and `lm_head` when the source provides them.
+It omits confidence-head tensors for the first milestone.
+
+The executor uses a DSpark-owned embedding or language-model head when the affine checkpoint provides it.
+The executor aliases the compatible Main component when the DSpark checkpoint omits that complete group.
+The loader selects ownership once during initialization.
+
+The loader must reject a partial optional affine group.
+It must reject extra affine tensors.
 
 ## Model semantics
 
-### Target features
+### Main features
 
-Qwen3 Main produces the selected decoder-layer outputs.
-DSpark consumes only committed target history before the proposal anchor.
-Target-feature capture belongs to the Qwen3 model graph.
-It must not expose `ReplayRecorder` through the semantic capture contract.
+Qwen3 Main captures the raw output of each selected decoder layer.
+The capture owner preserves `target_layer_ids` order.
+It concatenates the selected outputs on the hidden dimension.
 
-Persistent target context may contain only data produced by target Main.
-DSpark proposal-local attention data must never become persistent target context.
+The DSpark Main-feature stage applies this computation:
+
+```text
+selected Main residuals
+  -> concatenate
+  -> fc
+  -> hidden_norm
+  -> projected Main feature
+```
+
+Each DSpark layer projects the same normalized Main feature through its K and V weights.
+It applies K RMSNorm and RoPE.
+It appends the result to that DSpark layer's persistent context pages.
+
+The Main submission contains this order:
+
+```text
+MainEmbed
+  -> Main
+       selected residual capture
+  -> DSparkContext
+       Main-feature projection
+       per-layer context K/V append
+```
+
+The capture interface returns only an opaque `ResidualCaptureTarget`.
+It does not expose `ReplayRecorder`.
+`Qwen3Main` does not reference `Qwen3xDSparkModel`.
+
+The context append runs for prefill, decode, and verification rows.
+Candidate verification rows can reach persistent pages before CPU rejection completes.
+The accepted request extent controls later visibility.
+The next Main batch overwrites rejected positions.
+The design does not require a GPU rollback copy.
 
 ### Proposal block
 
 Let `N = block_size`.
-The official anchor-as-first-prediction layout has exactly `N` local query rows:
+One request has exactly `N` local query rows:
 
 ```text
 row 0       anchor token
 row 1..N-1  MASK tokens
 ```
 
-Every local query row produces one draft distribution.
-The proposal therefore contains exactly `N` draft tokens:
+These rows produce exactly `N` proposal distributions:
 
 ```text
-anchor@P
-MASK@P+1
+anchor@P       -> draft@P+1
+MASK@P+1      -> draft@P+2
 ...
-MASK@P+N-1
-
-produces:
-
-draft@P+1
-draft@P+2
-...
-draft@P+N
+MASK@P+N-1    -> draft@P+N
 ```
 
 For `block_size = 7`, the local block contains one anchor and six MASK rows.
-It produces seven draft tokens.
-It does not contain seven MASK rows.
+It produces seven proposal tokens.
 
-The first milestone supports only this anchor-as-first-prediction layout.
-It does not support a DFlash-compatible `1 + N` query layout.
+The first milestone does not support a `1 + N` local-query layout.
 
 ### Attention
 
-Attention inside the local proposal block is bidirectional.
-Each local query can attend to:
+The official Qwen3 DSpark checkpoint uses ungated GQA.
+It does not use MLA.
+It does not use an attention-output gate.
 
-- All committed target history before the anchor
-- The anchor row
-- Every MASK row in the same local block
+The known Qwen3-14B checkpoint has this geometry:
 
-No local query can attend to unverified target context after the anchor.
+```text
+hidden_size          = 5120
+num_attention_heads  = 40
+num_key_value_heads  = 8
+head_dim             = 128
+Q heads per KV head  = 5
+```
 
-The proposal pass computes local K/V for the anchor and all MASK rows.
-This K/V is temporary scratch.
-It serves only the current bidirectional block.
-It must not be committed, retained, or reused by the next proposal.
+The executor derives all values from the checkpoint.
 
-The newly sampled target token has no target Main K/V in the batch that sampled it.
+`UngatedDSparkGQA` owns two K/V domains:
+
+```text
+persistent history K/V  runtime pages
+proposal-local K/V      DSparkBlockScratch
+```
+
+The attention component records this sequence:
+
+```text
+history_causal_sdpa_map = paged_sdpa.invoke_map(...)
+block_bidi_sdpa_map = block_sdpa.invoke(...)
+sdpa_reduce = paged_sdpa.invoke_reduce(...)
+```
+
+The paged map processes accepted history in `[0, anchor_position)`.
+CPU metadata defines this causal extent for every local query.
+
+`GQABlockSDPAKernel` processes one request-local block.
+Every local query sees the anchor and all MASK positions in the same block.
+It cannot see another request's block.
+
+Each history task and block task writes one online-softmax partial:
+
+```text
+partial maximum
+partial exponential sum
+normalized partial output
+```
+
+The existing `GQAPagedSDPAReduce` combines all partials.
+The block kernel does not accept a configurable mask.
+
+The proposal pass computes local Q/K/V for the current block.
+These tensors are temporary.
+The executor must not commit, retain, or reuse them.
+
+The newly sampled Main token has no Main K/V in the batch that sampled it.
 It becomes the next proposal anchor.
-The next DSpark proposal computes that anchor's local K/V as part of the new block.
+The DSpark block computes that anchor's local K/V.
 
-### Markov correction and sampling
+### Markov correction
 
-The DSpark body produces one draft logit row for each proposal position.
-The Markov head corrects later draft logits from previously sampled draft tokens.
-Draft sampling therefore proceeds from left to right across the block.
-
-The first milestone produces these request-major outputs:
+The DSpark body produces one base logit row for each proposal position.
+The vanilla Markov head applies this correction:
 
 ```text
-draft_tokens[request][position]
-draft_probs[request][position]
+bias(previous_token) = markov_w2(markov_w1(previous_token))
+corrected_logits = base_logits + bias(previous_token)
 ```
 
-`draft_probs` must contain the sparse distributions required by target rejection.
-Confidence output is deferred.
-
-### Target verification
-
-The next target batch validates the proposal with the ordinary target Main and rejection path.
-The target input contains the anchor followed by the selected draft prefix.
-The rejection result can accept a different number of draft tokens for each request.
-The target then samples one new token.
-That sampled token becomes the next proposal anchor.
-
-Only target Main can publish persistent target K/V and target features.
-Proposal-local K/V is not part of target verification or commit.
-
-## Batch and transaction contract
-
-The first milestone uses a fixed proposal capacity of `block_size` for every active decode request.
-The DSpark module batch must preserve request identity, request slot, target-history extent, anchor token, local-block
-offsets, sampler configuration, and sample positions.
-It must preserve ragged target histories.
-
-The executor must store draft tokens and sparse draft probabilities by request slot.
-The next target-rejection batch consumes those values.
-The existing generic `SpecProbsStore` contract may be reused when its shape and lifecycle fit the official DSpark
-contract.
-
-The Main transaction follows the existing Qwen batch lifecycle:
+Sampling proceeds from left to right:
 
 ```text
-prepare Main metadata and state
-embed_main
-forward_main
-unembed_main
-sample_main
-outer submit_main
-outer wait
-read_main
-if the executor has DSpark:
-    embed_spec
-    forward_spec
-    unembed_spec
-    sample_spec
-    outer submit_spec
-    outer wait
-    read_spec
-commit Main request and model state
-publish runtime response
+step 0 uses the Main sampled anchor
+step i uses the proposal token sampled at step i - 1
 ```
 
-The service uses one fixed hook order for prefill, decode, and mixed batches.
-The executor omits unembed and sampling components when their input row count is zero.
-Empty component input does not change the executor lifecycle.
-The static DSpark capability check selects whether the proposal sequence exists.
-It is not a per-batch execution-state flag.
-The lifecycle does not use `main_stage_submitted` or `read_sampling_output`.
+Markov correction and sampling form one `Qwen3xDSparkSampling` component.
+The implementation does not introduce a CPU loop or a submit boundary between steps.
 
-For a prefill-only batch:
+### Main verification
+
+The next Main batch validates the proposal through ordinary Main and sparse rejection.
+Each request can accept a different proposal prefix.
+Rejection then samples one continuation token.
+That token becomes the next DSpark anchor.
+
+Only Main publishes persistent Main K/V and Main features.
+The DSpark local block never becomes persistent history.
+
+## Distribution ownership
+
+Draft and Main verification distributions have intentionally different identities.
+They must not use one symmetric indexing rule.
+
+Draft distributions cross a batch boundary:
 
 ```text
-MainEmbed -> Main + selected target-feature capture
-empty GatherUnembed and sampling input
-the DSpark capability branch records no proposal rows
+Spec batch writes proposal distributions
+next Main batch reads proposal distributions
 ```
 
-For a decode batch with DSpark:
+The store indexes draft distributions by:
 
 ```text
-Main batch submission:
-    MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling
-CPU sampling result
-DSpark batch submission:
-    DSparkEmbed -> DSpark -> GatherUnembed -> DSparkDraftSampling
-CPU draft proposal
+request_slot * block_size + proposal_position
 ```
 
-Main, MTP, and DSpark must each use one batch submission.
-Each sequence contains its model body and its optional unembed and sampling suffix.
-The service owns each `submit` and `wait`.
-Model hooks only record a sequence or read completed CPU-visible output.
-DSpark must use the same empty-component behavior as Main and MTP.
-This rule does not require a new sequence wrapper or replay-owner type.
+This identity remains stable when a later batch contains different request order or non-contiguous request slots.
 
-### Main and MTP submission evidence
+Main verification distributions are temporary within one Main submission:
+
+```text
+GatherUnembed compact rows
+  -> sparse Main distributions
+  -> sparse rejection
+```
+
+The store writes these rows with compact identity indices:
+
+```text
+0, 1, 2, ..., num_active_target_distributions - 1
+```
+
+`cu_target_distributions` uses the same compact row domain.
+It must not use request-slot indices.
+
+This asymmetry follows data lifetime.
+It is not an optimization exception.
+
+## Page ownership
+
+Main K/V and persistent DSpark context K/V share one runtime cache lane.
+The runtime core allocates one flat page-ID list for each logical cache block:
+
+```text
+block_page_ids:
+  [0 .. main_page_count)           Main K/V
+  [main_page_count .. total_count) DSpark context K/V
+```
+
+The Qwen3 batch adapter splits this list.
+It updates separate Main and DSpark page tables.
+The runtime core does not parse either table.
+
+The service calculates:
+
+```text
+num_pages_per_kv_block =
+    main_pages_per_block
+  + dspark_pages_per_block
+```
+
+The runtime core allocates, caches, restores, evicts, and releases both spans together.
+DSpark-disabled Qwen3 retains its Main-only page count.
+
+## Scratch ownership
+
+`DSparkBlockScratch` is an executor-owned fixed-capacity resource.
+It contains:
+
+```text
+local Q/K/V
+Q/K norm and RoPE outputs
+history and block attention partials
+reduced attention output
+```
+
+The runtime page arena does not own this scratch.
+The scheduler does not allocate it for each request.
+
+Define:
+
+```text
+T_capacity = max_requests * block_size
+P_capacity = next_power_of_two(2 * T_capacity)
+```
+
+The first milestone uses single-Q history map tasks.
+Each local query requires at least one history partial and one block partial.
+The metadata builder can divide long history across spare history tasks.
+It cannot exceed `P_capacity`.
+
+The scratch allocates:
+
+```text
+partial_max_logits[P_capacity, num_q_heads]       f32
+partial_exp_sums[P_capacity, num_q_heads]         f32
+partial_output[P_capacity, num_q_heads, head_dim] model dtype
+```
+
+Context length does not set this capacity.
+One history task can process many K/V tiles with online softmax.
+
+## Execution lifecycle
+
+The service owns `submit` and `wait`.
+Model components only record work or read completed output.
+
+The common outer flow is:
+
+```text
+model_batch_req = prepare_batch(batch)
+recorder = begin_ops_recording(model_batch_req)
+
+main_hidden = embed_main(recorder, model_batch_req)
+main_hidden = forward_main(recorder, model_batch_req, main_hidden)
+main_response = unembed_main(recorder, model_batch_req, main_hidden)
+sample_main(recorder, model_batch_req, main_response)
+
+main_submission = submit_main(recorder)
+main_submission.wait()
+sampled_output = read_main(recorder, model_batch_req)
+
+if run_spec(model_batch_req, sampled_output):
+    spec_hidden = embed_spec(recorder, model_batch_req, main_hidden, sampled_output)
+    spec_hidden = forward_spec(recorder, model_batch_req, spec_hidden)
+    spec_response = unembed_spec(recorder, model_batch_req, spec_hidden)
+    sample_spec(recorder, model_batch_req, spec_response)
+
+    spec_submission = submit_spec(recorder)
+    spec_submission.wait()
+    sampled_output = read_spec(recorder, model_batch_req, sampled_output)
+
+response = commit_batch(batch, sampled_output)
+```
+
+The Main submission is:
+
+```text
+MainEmbed
+  -> Main
+  -> DSparkContext                         when DSpark is enabled
+  -> GatherUnembed                         when sample rows exist
+  -> Sampling or RejectionSampling         when sample rows exist
+```
+
+The DSpark Spec submission is:
+
+```text
+DSparkEmbed
+  -> DSpark
+  -> DSparkGatherUnembed
+  -> DSparkSampling
+```
+
+The CPU must read Main output before it can construct the DSpark anchor block.
+This dependency requires two submissions.
+There is no submit boundary inside Main or inside DSpark Spec.
+
+Prefill, decode, and mixed batches use the same Main hook order.
+An empty unembed or sampling stage records no component.
+
+`run_spec` is true only when both conditions are true:
+
+```text
+the executor has DSpark
+Main produced at least one decode result
+```
+
+A prefill-only batch produces no anchor token.
+It therefore records no Spec proposal.
+This condition is a semantic data-availability gate.
+It is not an execution-state flag.
+
+The lifecycle does not use `main_stage_submitted`.
+It does not use `read_sampling_output`.
+It does not return a dummy completed submission.
+
+The executor pushes one pending Main transaction after Main recording.
+It commits that transaction after the optional Spec submission completes.
+The current synchronous terminal-failure model does not require a second rollback transaction.
+
+## Core and Metal boundary
+
+`inference-executor-core` owns backend-neutral contracts:
+
+- Official config parsing and validation
+- Exact semantic weight bindings
+- GQA geometry and block capacity
+- Proposal metadata
+- Speculative microbatch access
+- Proposal token and probability contracts
+- Backend-neutral lifecycle invariants
+
+`inference-backend-metal` owns reusable Metal kernels:
+
+- Paged GQA map and reduce
+- `GQABlockSDPAKernel`
+- Kernel validation
+- Metal resource binding
+- Dispatch
+
+`inference-executor-metal` owns the model realization:
+
+- Weight buffers and tensor views
+- `UngatedDSparkGQA`
+- Persistent DSpark page interpretation
+- `DSparkBlockScratch`
+- `Qwen3xDSparkLayer`
+- Main-feature projection and context append
+- Markov sampling
+- Replay keys and replay caches
+- Replay sequence composition
+- Metal profiling and benchmarks
+
+The runtime core owns:
+
+- Scheduling
+- Request lifecycle
+- Token and block metadata
+- Page allocation and ownership
+- Cache lifecycle notifications
+
+The runtime core must not parse DSpark tensor layout.
+The executor must not implement global scheduling policy.
+
+## Design audit
+
+The first-principles audit used these questions:
+
+| Question | Result |
+| --- | --- |
+| Does each persistent value follow accepted Main history? | Yes. Main K/V and DSpark context K/V share one cache-block lifecycle. |
+| Can proposal-local state escape its batch? | No. Local Q/K/V and attention partials live in `DSparkBlockScratch`. |
+| Does every CPU dependency create one clear wait boundary? | Yes. Main output is read before Spec block construction. |
+| Does any component submit or wait internally? | No. The service owns both boundaries. |
+| Does Main depend on a concrete DSpark model? | No. Main exposes only the residual-capture seam. |
+| Does Spec use the official anchor-first layout? | Yes. `N` rows produce `N` proposal tokens. |
+| Can ragged requests keep identity across batches? | Yes. Draft distributions use request-slot identity. |
+| Can sparse rejection read compact Main rows correctly? | Yes. Main verification distributions use compact identity indices. |
+| Does context length increase static attention scratch? | No. Metadata divides history across a fixed task capacity. |
+| Does replay caching include all command-topology inputs? | Yes. Keys include active row counts and SDPA task capacity. |
+| Does a prefill-only batch need a dummy Spec submission? | No. It has no sampled anchor and records no Spec work. |
+| Does the design require a backend-neutral replay redesign? | No. Existing lifecycle and Metal replay composition are sufficient. |
+
+No unresolved design item blocks the fixed-block milestone.
+The remaining items are implementation verification or explicitly deferred features.
+
+## Confirmed tradeoffs
+
+### Independent DSpark role
+
+Decision: Use `Qwen3xDSparkLayer` and DSpark-specific stage owners.
+
+Rejected direction: Extend `Qwen3MainLayer` or reuse `Qwen35MTPLayer`.
+
+Reason: Main, MTP, and DSpark have different attention, input, state, and sampling semantics.
+
+### Shared cache-block lifecycle
+
+Decision: Allocate Main K/V and DSpark context K/V in one logical cache block.
+
+Rejected direction: Add a second DSpark cache lane.
+
+Reason: Both persistent values follow accepted Main history.
+
+### Dedicated block attention
+
+Decision: Use the paged map for history and `GQABlockSDPAKernel` for local bidirectional attention.
+
+Rejected direction: Add a configurable mask to the paged kernel.
+
+Reason: History pages and local dense scratch have different storage and visibility contracts.
+
+### Fixed block before confidence scheduling
+
+Decision: Implement `block_size` proposal tokens for every active decode request.
+
+Deferred direction: Use confidence to select variable proposal lengths.
+
+Reason: Confidence scheduling is not required to validate the DSpark backbone, Markov correction, rejection, or
+lifecycle.
+
+### Existing replay boundary
+
+Decision: Use the common submission lifecycle and executor-side `Replay<T>` composition.
+
+Deferred direction: Redesign backend-neutral recorder and operator APIs before DSpark.
+
+Reason: The current boundary expresses all required CPU and GPU dependencies.
+
+## Deferred work
+
+### Confidence and global scheduling
+
+Future work: Materialize and execute the official confidence head.
+
+The DSpark executor will produce:
+
+```text
+confidence[request][proposal_position]
+```
+
+Runtime scheduling owns the global verification budget.
+It can rank proposals across active requests.
+It returns the selected proposal length for each request.
+
+The executor must not become the global scheduler.
+
+### Gated DSpark GQA
+
+Future work: Add a separate `GatedDSparkGQA` when a supported checkpoint requires it.
+
+The implementation must not add a `gated` runtime flag to `UngatedDSparkGQA`.
+The history map, block map, reducer, page layout, and scratch contracts must remain gate-neutral.
+
+### Backend-neutral replay boundary
+
+Future work: Review the backend-neutral `Runtime` and `Recorder` boundary after the DSpark lifecycle is stable.
+
+The review may move common execution lifecycle contracts.
+It must keep these items in the Metal backend:
+
+- Metal replay programs
+- Fusion
+- Kernel resource binding
+- Metal scratch and residency
+- Metal submission arguments
+
+The review must not mirror two recorder/operator APIs for formal symmetry.
+
+### Additional checkpoint variants
+
+Future work: Support `-1`, the final Main layer, non-anchor layouts, or other Markov heads only when a supported
+checkpoint requires them.
+
+### Overlap and recovery
+
+Future work: Permit overlapping batches only after every scratch, output, replay-argument, probability, and state owner
+has a bounded in-flight domain.
+
+Recoverable GPU failure remains out of scope.
+
+## Verification gates
+
+The fixed-block milestone requires:
+
+- Official config parsing tests
+- Strict `target_layer_ids` tests
+- Exact source and affine binding tests
+- Real official-to-affine conversion
+- DSpark-owned embedding and unembedding load
+- Anchor plus `N - 1` MASK tests
+- Bidirectional block-attention Metal parity
+- Combined history and block reduction parity
+- Flat Main and DSpark page split tests
+- Static partial-scratch capacity tests
+- Markov sequential-sampling parity
+- Ragged sparse-rejection tests
+- Non-contiguous request-slot rejection coverage
+- Main-only Qwen3 regression tests
+- Qwen3.5 Main and MTP regression tests
+- End-to-end greedy DSpark decode
+- End-to-end probabilistic DSpark decode
+- Replay cache and replay-key coverage
+- Standalone `gqa_block_attn` block-bidirectional component benchmark
+- Real-checkpoint `qwen3_dspark` Main/DSpark executor benchmark
+- End-to-end performance evidence
+
+Performance evidence must follow `docs/executor_benchmarks.md`.
+It must separate replay build, normal replay, forced synchronization, and end-to-end wall-clock throughput.
+
+## Qwen3 DSpark end-to-end evidence
+
+The 2026-07-29 comparison used base commit `91b65fbc8f98cb75ee29a6c1765ef17ce6a10192`.
+The final verification worktree had 92 changed or untracked paths.
+The implementation was not committed.
+The machine was an Apple M3 Max with 40 GPU cores and 48 GB of memory.
+It used macOS 27.0 build `26A5388g` on `arm64`.
+
+The comparison used these checkpoints:
+
+- Main: `/Users/wenquanxing/Workspace/models/Qwen3-14B-4bit`
+- DSpark affine: `/tmp/qwen3-dspark-affine-e2e`
+
+The affine checkpoint came from the official Qwen3 DSpark source checkpoint.
+It contains 142 tensors.
+It owns its embedding and unembedding weights.
+It omits the deferred confidence head.
+
+Each service used these arguments:
+
+```text
+--num-cache-pages 4096
+--max-requests 4
+--max-tokens 128
+--max-tokens-per-request 64
+```
+
+The Main-only service used 80 K/V pages for each cache block.
+It had 51 cache blocks.
+The DSpark service used 80 Main pages and 10 DSpark pages for each cache block.
+It had 45 cache blocks.
+Only one GPU service ran at a time.
+
+The decode command was:
+
+```sh
+target/release/decode \
+  --server-url http://127.0.0.1:50151 \
+  --hf-model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --prompt-str 'Explain in concise technical terms why the sky appears blue during the day.' \
+  --disable-thinking \
+  --max-sampled-tokens 256 \
+  --temperature 0 \
+  --top-k 1 \
+  --top-p 1 \
+  --seed 42 \
+  --no-output-str \
+  --show-stats
+```
+
+Both paths generated the same 98-token deterministic trajectory and then reached EOS.
+The first sample warmed the replay and device state.
+The median uses the last three samples.
+
+| Path | Stable samples | Median | Output chunks |
+| --- | --- | ---: | ---: |
+| Main-only | 41.180, 41.187, 41.152 tok/s | 41.180 tok/s | 98 |
+| DSpark | 33.611, 33.581, 33.655 tok/s | 33.611 tok/s | 34 |
+
+The DSpark path was `18.4%` slower than Main-only.
+It submitted 33 Spec verification batches after the initial Main token.
+It proposed 231 tokens and accepted 64 proposal tokens.
+The proposal acceptance rate was `27.7%`.
+Each output chunk contained an average of `2.88` tokens.
+
+The public executor benchmark reproduced the same cost direction.
+It used base commit `91b65fbc8f98cb75ee29a6c1765ef17ce6a10192` with 100 changed or untracked paths.
+It ran on the same Apple M3 Max.
+No other GPU command ran concurrently.
+The Main checkpoint was `/Users/wenquanxing/Workspace/models/Qwen3-14B-4bit`.
+The DSpark checkpoint was
+`/Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine`.
+
+The command was:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --cases main,dspark \
+  --num-requests 1 \
+  --warmup-iters 2 \
+  --iters 10 \
+  --runs 3
+```
+
+The median phase times were:
+
+| Case and phase | Median |
+| --- | ---: |
+| Main-only, one-token full Main submission | 27.345 ms |
+| DSpark, eight-token Main verification submission | 86.922 ms |
+| DSpark proposal submission | 14.436 ms |
+| DSpark complete cycle | 101.193 ms |
+
+Steady record, read, and commit work contributed less than `0.04 ms` to one DSpark cycle.
+The Main verification submission contributed approximately `85.9%` of the cycle.
+The DSpark proposal submission contributed approximately `14.3%`.
+
+A matching synthetic sparse-rejection benchmark used one request, seven proposal tokens, `top_k=1`, and
+`vocab=151936`.
+Its median was `0.351 ms`.
+Therefore, the sparse-rejection kernel is not the source of the `86.922 ms` Main verification time.
+
+The end-to-end run accepted an average of `64 / 33 = 1.94` proposal tokens for each verification batch.
+Including the continuation token, one verification cycle committed an average of `2.94` tokens.
+At the executor benchmark phase times, DSpark needs approximately `2.70` accepted proposal tokens per cycle to match
+the Main-only rate.
+This value is a `38.6%` proposal-token acceptance rate.
+The measured `27.7%` rate is below that break-even point.
+
+Even a zero-cost DSpark proposal would leave the measured Main verification submission at `86.922 ms`.
+At the measured acceptance rate, that limit is approximately `33.8 tok/s`.
+The corresponding Main-only executor benchmark rate is approximately `36.5 tok/s`.
+Thus, proposal-only optimization cannot recover the regression.
+The implementation needs higher acceptance and lower multi-row Main verification cost.
+
+An 8-bit DSpark affine checkpoint tested whether 4-bit quantization caused the low acceptance rate.
+The 8-bit checkpoint was 3.4 GB.
+It produced the same 98 tokens, 34 output chunks, and proposal acceptance trajectory.
+Its stable samples were 31.900, 31.917, and 31.964 tok/s.
+Its median was `31.917 tok/s`.
+The 8-bit setup was `5.0%` slower than the 4-bit DSpark setup and did not improve acceptance.
+
+A separate 64-token greedy check produced the same decoded text for Main-only and DSpark.
+Probabilistic DSpark decode also completed successfully.
+The probabilistic Main-only and DSpark trajectories differed after seeded sampling.
+Therefore, that result is not used as a pure throughput comparison.
+
+Verdict: The end-to-end semantic path passes.
+The performance verification is complete, and this setup has a negative deployment verdict.
+Profiling attributes approximately 75.3 ms of each stable 8-row batch to Main verification and rejection.
+It attributes approximately 12.7 ms to the complete DSpark proposal submission.
+The low acceptance rate makes Main verification the dominant cost.
+
+### Proposal stage breakdown
+
+The proposal execution order is fixed:
+
+```text
+DSparkEmbed
+  -> five-layer DSpark forward
+  -> final norm
+  -> GatherUnembed
+  -> sequential Markov correction and sampling
+```
+
+The forward stage does not include `GatherUnembed`.
+The `GatherUnembed` stage does not include Markov correction or sampling.
+
+The 2026-07-29 stage comparison used base commit `a3ba1bfc01e1b5aaf6ae7355cd52b66e1dc188f5`.
+The worktree was dirty.
+It contained 11 changed or untracked paths before this evidence section changed.
+The machine was an Apple M3 Max with 40 GPU cores and 48 GB of memory.
+It used macOS 27.0 build `26A5388g` on `arm64`.
+No other GPU command ran concurrently.
+
+The forward command was:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark_forward -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-requests 1 \
+  --context 128 \
+  --warmup-iters 5 \
+  --iters 20 \
+  --runs 3
+```
+
+The Main case recorded `MainEmbed`, all 40 Main layers, and final norm for seven prefill rows.
+Its empty `GatherUnembed` and sampling stages recorded no replay.
+The DSpark case recorded `DSparkEmbed`, all five DSpark layers, and final norm for seven proposal rows.
+Both cases measured submit and wait only.
+
+| Forward case | Total | Per layer |
+| --- | ---: | ---: |
+| Main | 73.547 ms | 1.839 ms |
+| DSpark | 9.809 ms | 1.962 ms |
+
+The DSpark forward took `13.3%` of the complete Main forward time.
+The DSpark per-layer time was `6.7%` higher.
+Thus, the DSpark backbone cost follows its five-layer depth.
+It is not the abnormal part of the proposal cost.
+
+The production `GatherUnembed` command was:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark_unembedding -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-requests 1 \
+  --warmup-iters 20 \
+  --iters 100 \
+  --runs 7
+```
+
+This DSpark checkpoint does not contain `lm_head`.
+The fixture therefore used the Main unembed weights, as the production executor does.
+The shape was `7 x 5120 -> 7 x 151936`.
+The fixture recorded the production `Qwen3xDSparkGatherUnembed` component.
+It included row gather and unembed.
+It did not include DSpark forward, Markov correction, or sampling.
+
+An exact production-path A/B comparison changed only the QMV-to-QMM crossover during the baseline run.
+The retained policy selects the new small-M QMM for this seven-row shape.
+
+| `GatherUnembed` policy | Median |
+| --- | ---: |
+| QMV baseline | 4.166 ms |
+| Small-M QMM | 3.056 ms |
+
+The small-M QMM reduced this stage by `26.6%`.
+The backend kernel has a CPU-reference correctness test for Q4 BF16 input.
+The production unembed owner requires BF16 input, affine parameters, and output.
+The selector uses the small-M QMM for large-vocabulary shapes.
+It uses the small-M QMM through 16 rows.
+It uses the general BM32 QMM above 16 rows.
+It retains the general policy for smaller-output shapes.
+
+The row-count policy used representative DSpark batch shapes:
+
+| Rows | Small-M BM16 | General BM32 | Selected |
+| ---: | ---: | ---: | --- |
+| 14 | 2.938 ms | 5.443 ms | Small-M BM16 |
+| 16 | 3.431 ms | 5.674 ms | Small-M BM16 |
+| 21 | 5.741 ms | 5.275 ms | General BM32 |
+| 28 | 6.101 ms | 5.761 ms | General BM32 |
+
+The Markov and sampling command was:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-requests 1 \
+  --top-k 1 \
+  --warmup-iters 10 \
+  --iters 50 \
+  --runs 5
+```
+
+The production component used `block_size=7`, `vocab_size=151936`, and `markov_rank=256`.
+It measured the complete sequential Markov correction, sampling, and sparse-distribution replay.
+Its median was `1.398 ms`.
+
+Do not add the three isolated stage times and compare the sum with one complete proposal submission.
+Each isolated target has its own submit-and-wait boundary.
+The measurements also ran under different device-frequency states.
+The complete executor submits the three stages as one replay sequence.
+
+A compiled full-proposal A/B normalized proposal time against the Main time from the same process:
+
+| Full executor build | Main | Proposal | Proposal/Main |
+| --- | ---: | ---: | ---: |
+| Small-M QMM A | 86.368 ms | 13.607 ms | 0.15755 |
+| QMV baseline | 85.686 ms | 14.383 ms | 0.16786 |
+| Small-M QMM B | 79.222 ms | 12.520 ms | 0.15804 |
+
+The absolute times changed with device frequency.
+The normalized proposal ratio improved by `5.8%` to `6.1%`.
+This result confirms a complete-proposal gain.
+It does not change the earlier deployment verdict because Main multi-row verification remains the dominant cost.
+
+A real-weight dense-MLP diagnostic used the same `5120 -> 17408 -> 5120` geometry and 4-bit affine format as
+Qwen3-14B.
+At eight rows, the production QMV path measured `1684.868 µs` for one layer.
+The forced QMM path measured `2039.609 µs`.
+Thus, the production QMV/QMM threshold is correct for this shape.
+
+The dense-MLP diagnostic command was:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen35_dense_mlp -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit \
+  --tokens 8 \
+  --cases full_auto,full_qmv,full_qmm \
+  --iters 50 \
+  --warmup-iters 20 \
+  --runs 5
+```
+
+The diagnostic checkpoint has the same dense-MLP matrix geometry and affine format as the Qwen3-14B checkpoint.
+The weight values do not change the selected Metal kernel geometry.
+
+A Qwen3-14B real-weight GQA diagnostic used eight rows and 128 history tokens.
+The production tiled full replay measured `0.695479 ms` for one layer.
+The single-Q full replay measured `0.725750 ms`.
+Thus, the production tiled-attention selection is also correct for this shape.
+
+The GQA diagnostic command was:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --tokens-per-req 8 \
+  --contexts 128 \
+  --iters 50 \
+  --warmup-iters 20 \
+  --runs 5 \
+  --validate
+```
+
+The measured Main cost is real multi-row transformer work.
+It is not evidence of an incorrect submission boundary or replay-state flag.
+Future performance work must evaluate confidence-guided verification lengths or a new Main multi-row kernel.
+
+## Main and MTP submission evidence
 
 The 2026-07-28 comparison used base commit `3be69962c392d6ae75f33b2bef65e9403b680b30`.
 The split source was clean.
@@ -329,258 +1073,17 @@ The service used `max_running_requests=8`, seed `42`, and these checkpoints:
 
 The command used `scripts/qwen35_e2e_decode_perf.sh`.
 It ran one GPU service at a time.
-The split results came from the supplied three-run output.
-The one-sequence non-MTP result used a seven-run warm repeat.
-The one-sequence MTP result used three runs.
 
 | Case | Tokens | Split median | One-sequence median | Change |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | `35b_off` | 256 | 93.414 tok/s | 96.395 tok/s | +3.2% |
 | `35b_off` | 1024 | 90.801 tok/s | 93.658 tok/s | +3.1% |
 | `35b_on` | 256 | 138.262 tok/s | 145.307 tok/s | +5.1% |
 | `35b_on` | 1024 | 122.080 tok/s | 127.684 tok/s | +4.6% |
 
 The MTP trajectories were unchanged.
-The 256-token case proposed 135 tokens and accepted 121 tokens.
-The 1024-token case proposed 591 tokens and accepted 432 tokens.
-The checked-in historical baseline used `max_running_requests=4`.
-It is not a strict comparison for these results.
-
-Verdict: Main and MTP must not add a submit-and-wait boundary between the model body and the unembed/sampling suffix.
-Each model entity keeps one batch submission.
-
-Pushing an executor pending transaction after Main recording is valid under the current synchronous and terminal-failure
-model.
-Commit remains the publication boundary.
-The design does not add a second rollback transaction for replay submission.
-
-## Executor roles
-
-The following list identifies semantic roles.
-It is not the final Rust field layout:
-
-```text
-Qwen3Executor
-  target roles
-    main_embed
-    main
-    gather_unembed
-    sampling
-    rejection_sampling
-
-  DSpark roles
-    dspark_embed
-    dspark
-    draft_unembed
-    draft_sampling
-
-  shared execution state
-    request sampling state
-    target and draft sparse probability store
-    Qwen3 GQA state
-    DSpark target-context state
-    page arena
-    pending target transactions
-```
-
-`dspark` means the DSpark model body.
-It does not include embedding, unembedding, Markov correction, or sampling.
-
-`Qwen3DSparkEmbed` is a distinct semantic stage even when it aliases the target embedding weight.
-It constructs the anchor-and-MASK input block.
-
-The draft-unembed stage may reuse a common unembedding leaf.
-Its replay owner may be shared with target GatherUnembed only if the weight and replay contracts fit.
-The design must not force this sharing for structural symmetry.
-
-`Qwen3DSparkDraftSampling` owns the DSpark proposal-sampling lifecycle.
-It composes Markov correction, sequential sampling, and sparse draft-probability output.
-It may reuse generic sampling leaves.
-It is not identical to the current MTP `DraftSampling` graph.
-
-Each stage must use the same `Replay<T>` cache pattern as Main, GatherUnembed, MTP, and sampling.
-The executor must not add separate “context replay owner” or “proposal replay owner” abstractions.
-DSpark context still requires a buffer and state owner.
-That data owner is not a second replay framework.
-
-## Executor-core and executor-metal boundary
-
-`inference-executor-core` owns the backend-neutral model contract:
-
-- `Qwen3DSparkConfig`
-- Official config parsing and validation
-- Exact semantic weight bindings
-- Model and proposal dimensions
-- Target-layer selection
-- DSpark batch and transaction metadata
-- Proposal token and sparse-probability contracts
-- CPU reference logic
-- Backend-neutral shape and lifecycle invariants
-
-`inference-executor-metal` owns the Metal realization:
-
-- Metal buffers and tensor views
-- Immutable Metal weight materialization
-- DSpark kernels and component adapters
-- Scratch and local proposal K/V
-- Replay keys, replay caches, and replay materialization
-- Replay programs and submission arguments
-- Fusion and command ordering
-- Kernel resource binding
-- Metal profiling and benchmarks
-
-Runtime core continues to own scheduling, request lifecycle, page allocation and ownership, and cache/state
-notifications.
-It supplies batch metadata and page IDs.
-It must not parse DSpark tensor layouts.
-
-## Confirmed tradeoffs
-
-### Independent DSpark model role
-
-Decision: Use `Qwen3DSparkLayer` and DSpark-specific stage owners.
-
-Rejected direction: Extend `Qwen3MainLayer` or reuse `Qwen35MTPLayer`.
-
-Reason: Main, MTP, and DSpark have different attention, input, state, and sampling semantics.
-
-### Fixed block before confidence scheduling
-
-Decision: Implement fixed `block_size` proposals first.
-
-Deferred direction: Variable per-request proposal lengths selected from confidence.
-
-Reason: Confidence scheduling is not required to validate the official DSpark backbone, Markov correction, target
-rejection, or executor lifecycle.
-
-### Existing service lifecycle
-
-Decision: Reuse the generic Main and Spec lifecycle hooks.
-
-Rejected direction: Add DSpark-specific service hooks.
-
-Reason: The service lifecycle already provides the target-decision-to-proposal dependency.
-
-### Replay abstraction
-
-Decision: Use the backend-neutral submission lifecycle and the existing executor-side `Replay<T>` composition for the
-first milestone.
-
-The common lifecycle exposes submission and wait boundaries.
-The service owns stage ordering.
-Executor-side adapters materialize and submit backend programs.
-
-Deferred direction: Redesign backend-neutral recorder, operator, replay-program, or fusion APIs before DSpark
-integration.
-
-Reason: Model semantics and CPU/GPU lifecycle must be stable before a replay abstraction review.
-
-## Implementation order
-
-Completed:
-
-1. Add the official `Qwen3xDSparkConfig`, validation, and exact weight-binding contract to
-   `inference-executor-core`.
-2. Remove the nested DFlash-era configuration and its compatibility tests.
-3. Define `Qwen3xDSparkLayer` and its Qwen3x Metal components.
-4. Define the DSpark block batch, Main-feature context, and proposal transaction.
-5. Review the exact `Qwen3Executor` fields, Main-capture owner, and proposal unembedding owner.
-6. Wire Main capture and DSpark proposal through the generic Qwen executor lifecycle.
-
-Remaining:
-
-1. Wire service checkpoint loading.
-2. Add deterministic end-to-end rejection validation.
-3. Measure performance only after correctness and replay-cache behavior are stable.
-
-The implementation must not start with a backend-neutral replay redesign.
-
-## Deferred work
-
-### Executor ownership and access points
-
-Future work: Review the exact `Qwen3Executor` field layout before implementation step 6.
-Resolve these items:
-
-- The target-feature capture and persistent-context owner
-- The own-or-shared DSpark embedding owner
-- The own-or-shared draft-unembedding owner
-- The final `Qwen3DSparkDraftSampling` composition
-- The request-slot probability-store layout
-- The target-context commit and reset entry points
-
-The review must use the current Qwen3.5 MTP layout as evidence.
-It must not make DSpark an MTP variant.
-
-### Confidence head and global scheduling
-
-Future work: Materialize and execute the confidence head after fixed-block DSpark is correct.
-
-The DSpark executor computes confidence per request and proposal position:
-
-```text
-confidence[request][position]
-```
-
-Runtime scheduling owns the global verification budget and cross-request selection policy.
-It may rank proposal positions across all active requests and return a selected proposal length per request.
-The executor must not become the global scheduler.
-
-The first milestone must parse and recognize `enable_confidence_head` and related official fields.
-It must document that confidence execution and variable-length scheduling are unavailable.
-
-### Backend-neutral replay boundary
-
-Current decision: Runtime core owns only the common execution lifecycle.
-`ExecutionSubmission` provides the backend-neutral `wait` operation.
-The service calls executor-side `submit_main` and `submit_spec`.
-It waits before each CPU read.
-
-Future work: Review the backend-neutral `Runtime` and `Recorder` boundary only after the Qwen3 DSpark lifecycle and
-executor ownership are stable.
-
-The review may move common execution lifecycle contracts.
-It must keep these items in the Metal backend:
-
-- Metal replay programs
-- Command fusion
-- Kernel and resource binding
-- Metal scratch and residency
-- Metal submission arguments
-
-The review must not mirror two recorder/operator APIs only for formal symmetry.
-It must not move model semantics into runtime core.
-It must not redesign replay before DSpark integration.
-
-### Additional checkpoint variants
-
-Future work: Evaluate non-anchor DSpark or DFlash-compatible `1 + N` layouts only when an official supported checkpoint
-requires them.
-The first milestone rejects those layouts.
-
-### Overlap and asynchronous recovery
-
-Future work: Revisit overlapping prepared batches only after every shared scratch, output, replay-argument, probability,
-and state owner has a bounded in-flight domain.
-
-Recoverable GPU failure remains out of scope unless the runtime adopts a recoverable device-execution contract.
-
-## Verification gates
-
-The first integrated implementation must provide:
-
-- Official config parsing tests
-- Strict `target_layer_ids` validation tests
-- Exact weight-binding and own-or-shared weight tests
-- Anchor-plus-`N-1`-MASK block tests
-- Bidirectional local-attention reference parity
-- Temporary local-K/V lifecycle tests
-- Markov correction and sequential-sampling parity
-- Ragged target-rejection tests
-- Target-only Qwen3 parity when DSpark is disabled
-- Qwen3.5 target and MTP parity
-- End-to-end greedy and probabilistic DSpark decoding
-- Replay cache hit and replay-key coverage
-
-Performance evidence must follow `docs/executor_benchmarks.md`.
-It must separate replay build, normal replay, forced synchronization, and end-to-end wall-clock throughput.
+The 256-token MTP case proposed 135 tokens and accepted 121 tokens.
+The 1024-token MTP case proposed 591 tokens and accepted 432 tokens.
+
+Verdict: Main, MTP, and DSpark must keep one submission for each model entity.
+They must not add a submit-and-wait boundary between a model body and its unembed/sampling suffix.

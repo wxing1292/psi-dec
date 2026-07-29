@@ -42,20 +42,24 @@ inference-executor-metal
 Backend Criterion targets:
 
 ```text
-dense_mlp  sparse_mlp  moe  gqa_attn  gdn_attn  gdn_state_io
+dense_mlp  sparse_mlp  moe  gqa_attn  gqa_block_attn  gdn_attn  gdn_state_io
 embedding  unembedding  norm
 ```
 
 `rejection_sampling` is the backend custom-CLI target. Model-executor targets:
 
 ```text
-qwen3_gqa         qwen35_dense_mlp  qwen35_moe  qwen35_gqa  qwen35_gdn
-qwen35_embed      qwen35_layers  qwen35_output
-qwen35_sampling   qwen35_executor
+qwen3_gqa              qwen3_dspark           qwen3_dspark_forward
+qwen3_dspark_unembedding                       qwen3_dspark_sampling
+qwen35_dense_mlp       qwen35_moe             qwen35_gqa
+qwen35_gdn             qwen35_embed           qwen35_layers
+qwen35_output          qwen35_sampling        qwen35_executor
 ```
 
-All real-weight targets except `qwen35_sampling` require `--model-dir`. These targets share `--iters`,
-`--warmup-iters`, and `--runs`.
+Real-weight targets accept the model paths that their production owner needs.
+`qwen3_dspark_sampling` needs only `--dspark-model-dir`.
+`qwen35_sampling` does not load model weights.
+These targets share `--iters`, `--warmup-iters`, and `--runs`.
 
 Production `src` must not gain benchmark-only state, feature paths, or environment controls.
 
@@ -65,6 +69,32 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   untimed `--validate-tiled-q-tokens` comparison.
 - `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay and SDPA-only paths.
 - `qwen3_gqa` exposes static tile geometry as CLI arguments. It can validate single-Q output against tiled output.
+- `gqa_block_attn` measures the model-independent dense block-bidirectional SDPA map component.
+  It accepts block size, request count, head geometry, dtype, and thread count as CLI arguments.
+- `qwen3_dspark` loads real Main and DSpark checkpoints.
+  It runs the public executor lifecycle for `main` or `dspark`.
+  It reports each record, submit/wait, read, and commit boundary.
+  It also reports proposed tokens, accepted tokens, generated proposals, and acceptance.
+- `qwen3_dspark_forward` loads real Main and DSpark weights.
+  It compares the complete `MainEmbed` and Main forward with `DSparkEmbed` plus the complete DSpark backbone and final
+  norm.
+  Both cases use the same request count, seven rows per request, and history length.
+  The result reports total and per-layer time.
+  Use the per-layer value to compare the 40-layer Main stack with the five-layer DSpark stack.
+- `qwen3_dspark_unembedding` loads the production `Qwen3xDSparkGatherUnembed` component.
+  It uses DSpark-owned unembed weights when they exist.
+  Otherwise, it uses the Main unembed weights, as the production executor does.
+  It measures gather and unembed together for `block_size` rows per request.
+- `qwen3_dspark_sampling` loads real DSpark Markov weights.
+  It measures the complete sequential Markov correction, sampling, and sparse-distribution replay.
+  `qwen3_dspark_forward`, `qwen3_dspark_unembedding`, and `qwen3_dspark_sampling` isolate the three ordered proposal
+  segments:
+
+  ```text
+  DSparkEmbed + DSpark forward + final norm
+    -> GatherUnembed
+    -> Markov correction + sampling
+  ```
 - `qwen35_gdn` measures the current ragged recurrent GDN path with the 35B-A3B profile.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer4`, `first4`, or `main_all`.
@@ -79,9 +109,32 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 Representative smoke commands:
 
 ```text
+cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
+  --block-sizes 7 --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+
 cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
   --model-dir <qwen3-model-dir> --tokens-per-req 16 --contexts 128 \
   --iters 1 --warmup-iters 0 --runs 1 --validate
+
+cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
+  --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
+  --cases dspark --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-executor-metal --bench qwen3_dspark_forward -- \
+  --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
+  --num-requests 1 --context 128 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-executor-metal --bench qwen3_dspark_unembedding -- \
+  --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
+  --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
+  --dspark-model-dir <dspark-model-dir> --num-requests 1 --top-k 1 \
+  --iters 1 --warmup-iters 0 --runs 1
 
 cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b --tokens 1 \
