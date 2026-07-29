@@ -1,7 +1,7 @@
 # Sampling Executor
 
 This document owns the current top-k/top-p sampling and sparse rejection-sampling contracts.
-[`executor_qwen.md`](executor_qwen.md) owns Qwen stage order and MTP proposal ownership.
+[`executor_qwen.md`](executor_qwen.md) owns Qwen stage order and Spec proposal ownership.
 [`executor.md`](executor.md) owns generic executor composition.
 
 ## Source layout
@@ -9,7 +9,7 @@ This document owns the current top-k/top-p sampling and sparse rejection-samplin
 ```text
 crates/inference-executor-core/src/sampling/
   config.rs          sampler validation and optional request seed
-  domain.rs          independent target, draft, accept, and resample RNG domains
+  domain.rs          independent Main, Spec, accept, and resample RNG domains
   reference.rs       CPU top-k/top-p and rejection correctness oracle
   rejection_sampling.rs
                      backend-neutral sparse rejection shape/request contracts
@@ -23,9 +23,8 @@ crates/inference-backend-metal/src/components/
 crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs       TopKSampling, parameter/scratch, and TopKSamplingOutputBuffers
   top_k_replay.rs         Sampling and DraftSampling replay components
+  rejection_replay.rs     sparse rejection replay owner, microbatch contract/adapters, and bindings
   dspark_markov.rs        sequential DSpark Markov correction and sampling
-  rejection_sampling.rs   generic sparse rejection Metal owner and bindings
-  rejection_replay.rs     shared Qwen microbatch preparation and RejectionSampling composition
   spec_probs.rs           SpecProbsStore sparse draft/target probability workspace
 ```
 
@@ -66,8 +65,7 @@ The current input contract does not include repetition, frequency, or presence p
 
 ## Sparse distributions and rejection
 
-Qwen MTP proposals and target verification use the same post-temperature/top-k/top-p distribution family as ordinary
-sampling.
+Qwen MTP and DSpark proposals use the same post-temperature/top-k/top-p distribution family as Main verification.
 The production path stores sparse token and probability rows.
 It does not scatter them into dense full-vocabulary buffers.
 
@@ -99,6 +97,12 @@ Drafts within one request are ordered because the first rejection ends that requ
 Debug builds also retain `expected_draft_token_ids` for lifecycle validation.
 Release builds do not allocate, reset, or compare this CPU-only metadata.
 
+Draft distributions cross a batch boundary.
+Their row identity is `req_slot * max_num_spec_tokens + proposal_position`.
+Main verification distributions exist only in the current submission.
+They use compact active-row indices from zero.
+`cu_target_distributions` uses this compact row domain.
+
 ## Replay ownership
 
 Sampling and rejection use capacity replay keys.
@@ -121,26 +125,24 @@ The Qwen executor owns three distinct graph and cache stages:
 
 - `Replay<Sampling>` handles ordinary Main output.
 - `Replay<DraftSampling>` handles MTP draft sampling and sparse draft-distribution storage.
+- `Replay<Qwen3xDSparkSampling>` handles DSpark Markov correction, sampling, and sparse draft storage.
 - `Replay<RejectionSampling>` handles target sparse-distribution generation and sparse rejection.
 
 These stages share one `Rc<TopKSampling>` implementation and its parameter and scratch buffers.
 They retain separate replay keys and programs.
 
-`DSparkMarkovSampling` is an independent proposal component.
-It applies the Markov correction and samples the fixed block sequentially.
-It stores sparse draft distributions in `SpecProbsStore`.
-The Qwen3 executor does not record this component yet at this commit.
-
-Main and MTP forward token counts remain exact.
+Main, MTP, and DSpark body token counts remain exact.
 The complete upstream model slice does not yet share an inactive-lane ABI.
 MTP draft sampling is a distinct replay after MTP GatherUnembed.
-Sparse target distribution and rejection form a separate target-stage replay.
+DSpark Markov sampling is a distinct replay after `Qwen3xDSparkGatherUnembed`.
+Sparse Main distributions and rejection form one Main-stage replay.
 
 ## Correctness and benchmarks
 
 CPU references define sampling and rejection math.
 Focused Metal tests compare fixed and random distributions with these references.
-They also compare mixed per-row parameters, deterministic seed/domain behavior, and accepted/rejected MTP paths.
+They also compare mixed per-row parameters and deterministic seed/domain behavior.
+Sparse rejection tests cover accepted and rejected MTP and DSpark paths.
 GPU tests run serially under the repository Metal reservation/lock rules.
 
 Synthetic backend modes:

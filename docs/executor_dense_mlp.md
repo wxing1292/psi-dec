@@ -25,7 +25,7 @@ crates/inference-executor-metal/src/model/qwen/
   v3/main/plan.rs          Qwen3 Main dense-MLP geometry/config builder
   v3_5/main/layer.rs       Qwen3.5 Main dense-MLP/MoE layer variants
   v3_5/mtp/layer.rs        Qwen3.5 MTP dense-MLP/MoE layer variants
-  v3_5/plan.rs             Qwen3.5 dense-MLP geometry/config builder and DSpark plan
+  v3_5/plan.rs             Qwen3.5 dense-MLP geometry/config builder
 
 crates/inference-executor-core/src/def/
   DenseLinearShape

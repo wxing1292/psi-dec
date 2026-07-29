@@ -79,8 +79,8 @@ crates/inference-executor-core/src/
 crates/inference-executor-metal/src/
   attn           GQA/GDN adapters, batch metadata, page/state tables, scratch
   mlp            dense-MLP and MoE adapters
-  model/qwen     semantic model/layer components, weights, replay stages, MTP
-  sampling       top-k/top-p and sparse rejection replay owners
+  model/qwen     semantic model/layer components, weights, replay stages, MTP, DSpark
+  sampling       top-k/top-p, DSpark Markov, and sparse rejection replay owners
 
 crates/inference-backend-metal/src/
   metal          reusable Metal device/buffer/kernel/stream/replay runtime
@@ -90,7 +90,7 @@ crates/inference-backend-metal/src/
 
 For exact files and current paths, use the component documents:
 
-- [`executor_qwen.md`](executor_qwen.md): Qwen semantic model loading, request state, replay stages, and MTP.
+- [`executor_qwen.md`](executor_qwen.md): Qwen semantic model loading, request state, replay stages, MTP, and DSpark.
 - [`executor_gqa.md`](executor_gqa.md): GQA projection, KV pages, attention map and reduce, and outputs.
 - [`executor_gdn.md`](executor_gdn.md): GDN projection, short convolution, recurrence, and state pages.
 - [`executor_dense_mlp.md`](executor_dense_mlp.md): dense gated MLP.
@@ -113,14 +113,14 @@ token IDs
        residual
   -> final norm
   -> unembedding
-  -> ordinary sampling or target distributions
-  -> optional MTP proposal and rejection flow
+  -> ordinary sampling or Main verification distributions
+  -> optional MTP or DSpark proposal and rejection flow
 ```
 
 Normalized model configuration selects each layer variant. Exact typed binding subtrees identify the weights.
 
-Semantic layer and component `load` functions consume those inputs directly. There is no parallel Main or MTP plan
-tree.
+Semantic layer and component `load` functions consume those inputs directly.
+Each model role owns only the plan needed to convert its configuration to reusable components.
 
 The layer owns stage ordering and scratch handoff. The component owns reusable math, backend dispatch, and
 component-local state interpretation.
@@ -253,21 +253,23 @@ These arguments prevent a program rebuild for scalar activity changes. They do n
 Qwen keeps separate replay caches for these semantically separate stages:
 
 - Main forward
-- Target output
+- Main output
 - GDN state restore
 - Ordinary sampling
 - MTP proposal
-- Draft sampling
-- Target rejection
+- DSpark context append
+- DSpark proposal
+- Spec sampling
+- Rejection sampling
 
 A cache boundary exists when command topology, lifecycle, or CPU dependency differs. A component name alone does not
 create a cache boundary.
 
 Normal forward, output, and sampling commands can share one ordered command buffer when they share one dependency chain.
 
-MTP proposal and target rejection remain separate where the accepted-token decision crosses the CPU boundary. GDN state
-candidate preparation and cache-boundary publication retain their transaction lifecycle when their GPU work is
-replayed.
+MTP and DSpark proposal work remains separate from Main where the sampled result crosses the CPU boundary.
+GDN state candidate preparation and cache-boundary publication retain their transaction lifecycle when their GPU work
+is replayed.
 
 The generic executor lifecycle uses role-qualified Main and Spec hooks:
 

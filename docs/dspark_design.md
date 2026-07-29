@@ -1,117 +1,323 @@
-# Qwen3x DSpark Components
+# Qwen3 DSpark
 
-This document describes the current backend-neutral and Metal-backend DSpark components.
-The Qwen3 executor does not yet load or execute these components at this commit.
-The Qwen3.5 executor continues to use MTP.
+This document describes the current fixed-block Qwen3 DSpark implementation.
+[`executor_qwen.md`](executor_qwen.md) owns the Qwen executor lifecycle.
+[`executor_sampling.md`](executor_sampling.md) owns sparse sampling and rejection.
+[`executor_gqa.md`](executor_gqa.md) owns GQA page and attention-kernel details.
+
+## Role terminology
+
+Model roles use `Main`, `MTP`, and `DSpark` or `Spec`.
+They do not use `Target` or `Draft`.
+
+The official checkpoint fields keep their upstream names.
+These fields include `target_layer_ids` and `num_target_layers`.
+The generic rejection-sampling API also keeps `target_*` and `draft_*`.
+In that API, the terms identify two probability distributions.
+The backend-neutral `ResidualCaptureTarget` uses `Target` to mean a write destination.
+The tracing `target:` field identifies a log category.
+None of these names identify model roles.
 
 ## Current scope
 
-The repository contains these foundations:
+The Qwen3 executor can load one optional DSpark checkpoint.
+The implementation follows the official flat `Qwen3xDSparkConfig` schema.
+It supports an ungated GQA backbone and a `vanilla` Markov head.
 
-- The official flat Qwen3 DSpark configuration contract.
-- Exact source and affine checkpoint binding trees.
-- The `qwen3_dspark_quantize` BF16-to-affine converter.
-- Backend-neutral fixed-block attention geometry.
-- A reusable Metal dense bidirectional block-SDPA component.
-- Metal DSpark context, block-attention, layer, embedding, output, and Markov-sampling components.
+The first milestone has these limits:
 
-The repository no longer contains the unwired Qwen3.5-era DSpark model implementation.
+- It produces exactly `block_size` proposals for each active decode request.
+- It recognizes confidence-head fields and weights.
+- It does not materialize or execute the confidence head.
+- It does not schedule variable proposal lengths.
+- It does not support a gated DSpark GQA checkpoint.
+- It permits one in-flight batch for each executor.
+
+The Qwen3.5 executor continues to use MTP.
+It does not own a DSpark implementation.
 
 ## Source layout
 
 ```text
 crates/inference-executor-core/src/
   attn/gqa/
-    dspark_core.rs               fixed-block attention geometry and metadata
+    dspark_core.rs               block geometry and metadata
   model/qwen/v3_x/dspark/
-    config.rs                    official flat configuration contract
+    config.rs                    official configuration contract
     weight_layout.rs             exact source and affine binding trees
   bin/
-    qwen3_dspark_quantize.rs     official BF16-to-affine converter
+    qwen3_dspark_quantize.rs     official BF16 -> affine converter
 
 crates/inference-backend-metal/src/components/
-  gqa_block_attention.rs         dense bidirectional block-SDPA component
-  gqa_block_attention_test.rs    component correctness tests
-  metal/gqa_block_sdpa.metal     dense bidirectional block-SDPA kernel
+  gqa_block_attention.rs         dense block-SDPA component
+  metal/gqa_block_sdpa.metal     dense bidirectional block kernel
 
 crates/inference-executor-metal/src/
   attn/dspark/
-    backend.rs                   history and block-attention replay composition
-    context.rs                   persistent DSpark context owner
-    metadata.rs                  proposal-block attention metadata
-    scratch.rs                   proposal-local K/V and SDPA scratch
-    state.rs                     DSpark GQA state and page-table owner
+    backend.rs                   ungated DSpark GQA replay graph
+    context.rs                   persistent Main-context append
+    metadata.rs                  history and block attention metadata
+    scratch.rs                   fixed-capacity proposal scratch
+    state.rs                     page-table and metadata lifecycle
   model/qwen/v3_x/dspark/
-    attention.rs                 Qwen3x DSpark attention weights and record path
-    embed.rs                     anchor and MASK embedding component
-    layer.rs                     independent Qwen3xDSparkLayer role
-    main_feature.rs              selected Main-output projection
-    model.rs                     context and proposal-body components
-    output.rs                    proposal gather and unembedding component
-    plan.rs                      validated Metal execution plan
+    attention.rs                 DSpark attention composition
+    embed.rs                     DSpark token embedding replay
+    layer.rs                     independent Qwen3xDSparkLayer
+    model.rs                     context and body replay owners
+    output.rs                    gather, unembed, and Markov sampling
+    plan.rs                      configuration-to-backend conversion
+    main_feature.rs              selected Main residual projection
+  model/qwen/v3/executor/
+    dspark.rs                    Qwen3 proposal orchestration
   sampling/
     dspark_markov.rs             sequential Markov correction and sampling
+    rejection_replay.rs          shared sparse rejection replay and microbatch contract
 ```
 
-`inference-executor-core` owns model semantics, configuration, weight names, and replay-independent geometry.
-`inference-backend-metal` owns kernel resources, buffer bindings, and dispatch.
-`inference-executor-metal` owns DSpark tensor objects, page interpretation, replay composition, scratch, and sampling.
+The source does not retain the earlier `qwen/v3_5/dspark/` implementation.
+The current Qwen3 path does not wire that implementation through a compatibility layer.
 
-The Qwen3 executor integration is a separate later commit.
+## Model semantics
 
-## Configuration and weights
+DSpark uses one fixed transformer forward.
+It is not an iterative diffusion process.
+The input block for proposal length `N` is:
 
-`Qwen3xDSparkConfig` parses the official checkpoint fields.
-It validates fixed-block geometry, selected Main layers, RoPE, ungated GQA, and the `vanilla` Markov head.
+```text
+input rows:
+  anchor
+  MASK
+  ...
+  MASK                 N rows total
 
-`Qwen3xDSparkWeightBindings` defines the exact checkpoint tree.
-It supports official BF16 source weights and the affine runtime checkpoint.
+proposal rows:
+  token[0]
+  token[1]
+  ...
+  token[N - 1]         N proposal distributions
+```
 
-The converter command is:
+Each block row can attend to all `N` local block rows.
+Each block row can also attend to persistent history before the anchor position.
+The block therefore uses bidirectional local attention and causal history attention.
+
+The local block produces temporary Q/K/V.
+The executor discards these values after proposal generation.
+The next Main batch verifies the proposed token sequence.
+
+The Markov head corrects proposal logits in position order.
+Position `i` depends on the token sampled at position `i - 1`.
+`DSparkMarkovSampling` owns this sequential correction and sampling loop.
+It stores one sparse draft distribution for each proposed token.
+
+## Main context
+
+`Qwen3Main` exposes the narrow `Qwen3MainResidualCapture` contract.
+It does not depend on a DSpark model or a Metal recorder.
+
+`Qwen3xDSparkMainFeatureProjector` selects the configured Main residual outputs.
+It projects those outputs into one Main feature for each Main token.
+Each DSpark layer projects that feature to its persistent context K/V.
+
+`Qwen3xDSparkContext` records this work after `Qwen3Main` in the same Main submission:
+
+```text
+MainEmbed
+  -> Main
+  -> DSparkContext
+```
+
+Persistent DSpark context follows accepted Main history.
+Proposal-local K/V never enters this context.
+
+## Attention composition
+
+The official Qwen3 checkpoint uses ungated GQA.
+`UngatedDSparkGQA` owns a model-neutral QKV attention graph.
+It does not add a mode to `UngatedGQA`.
+
+One DSpark attention call records this composition:
+
+```text
+QKV projection
+  -> Q/K norm and RoPE
+  -> history paged-SDPA map
+  -> block bidirectional-SDPA map
+  -> existing GQA partial-output reduce
+  -> output projection
+```
+
+The history path reads persistent paged K/V.
+The block path reads dense local K/V from `DSparkBlockScratch`.
+Both map paths write `SDPAPartialOutput` records with the existing ABI.
+The existing `GQASDPAReduceKernel` combines both sets.
+
+The history metadata supplies a half-open visible range.
+For an anchor at position `p`, that range is `[0, p)`.
+The block kernel supplies the complete local block.
+
+## Page ownership
+
+The runtime core allocates one flat page-ID span for each logical cache block.
+The executor splits that span:
+
+```text
+[0 .. main_page_count)             Main K/V
+[main_page_count .. total_count)   persistent DSpark context K/V
+```
+
+The executor updates separate Main and DSpark page tables.
+The runtime core allocates and releases both spans as one cache block.
+The runtime core does not parse the model-specific split.
+
+The service derives:
+
+```text
+num_pages_per_kv_block =
+    main_pages_per_block
+  + dspark_pages_per_block
+```
+
+A DSpark-disabled Qwen3 executor uses only the Main span.
+
+## Scratch capacity
+
+`DSparkBlockScratch` is an executor-owned resource.
+It contains local Q/K/V, normalized Q/K, attention partials, and reduced output.
+
+Define:
+
+```text
+T_capacity = max_requests * block_size
+P_capacity = next_power_of_two(2 * T_capacity)
+```
+
+Each local query needs at least one history partial and one block partial.
+The metadata builder can divide long history across available history tasks.
+It cannot exceed `P_capacity`.
+
+The partial buffers use this capacity:
+
+```text
+partial_max_logits[P_capacity, num_q_heads]       f32
+partial_exp_sums[P_capacity, num_q_heads]         f32
+partial_output[P_capacity, num_q_heads, head_dim] model dtype
+```
+
+Context length does not set this capacity.
+One history task can process many K/V tiles with online softmax.
+
+## Sparse distribution identity
+
+Draft distributions persist until the next Main batch.
+Their identity is request-slot based:
+
+```text
+draft_distribution_index =
+    req_slot * block_size
+  + proposal_position
+```
+
+Main verification distributions exist only in one submission.
+They use compact active-row indices:
+
+```text
+0, 1, ..., num_active_target_distributions - 1
+```
+
+This difference follows the two data lifetimes.
+It is not an optimization exception.
+
+## Execution lifecycle
+
+The service owns all `submit` and `wait` boundaries.
+Components only prepare, record, or read completed output.
+
+The Main submission is:
+
+```text
+MainEmbed
+  -> Main
+  -> DSparkContext                         when DSpark is enabled
+  -> GatherUnembed                         when sample rows exist
+  -> Sampling or RejectionSampling         when sample rows exist
+```
+
+The Spec submission is:
+
+```text
+DSparkEmbed
+  -> DSpark
+  -> DSparkGatherUnembed
+  -> DSparkSampling
+```
+
+The CPU reads Main results before it creates the anchor block.
+This dependency requires two submissions.
+No component submits or waits internally.
+
+Prefill, decode, and mixed batches use the same Main hook order.
+An empty unembed or sampling input records no component.
+The service runs Spec only when Main returns at least one decode result.
+
+The lifecycle does not use `main_stage_submitted`.
+It does not use `read_sampling_output`.
+It does not create a dummy completed submission.
+
+## Configuration and conversion
+
+The loader validates the DSpark configuration against the Qwen3 Main configuration.
+It rejects unsupported attention, dtype, RoPE, `target_layer_ids`, and Markov variants.
+The affine loader requires exact semantic bindings.
+
+Convert an official checkpoint with this command:
 
 ```sh
 cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
-  --input-dir /path/to/source \
-  --output-dir /path/to/output \
+  --input-dir /path/to/Qwen3-DSpark \
+  --output-dir /path/to/Qwen3-DSpark-affine \
   --group-size 64 --bits 4 --markov-w2-bits 8
 ```
 
-The output directory must not already exist.
-
-## Block attention
-
-`UngatedDSparkGQACore` defines proposal-block geometry.
-The block contains one anchor row and the configured MASK rows.
-Every row can attend to the complete local block.
-
-`GQABlockSDPAKernel` computes one dense bidirectional local-block partial.
-It writes the existing `SDPAPartialOutput` ABI.
-The existing GQA reduce component can combine this partial with paged-history partials.
-
-`UngatedDSparkGQA` combines paged-history partials and the dense bidirectional block partial.
-`UngatedDSparkGQAState` owns the DSpark request page table and persistent context.
-`DSparkBlockScratch` owns proposal-local Q/K/V and SDPA scratch.
-Proposal-local K/V does not enter persistent context.
-
-## Model and sampling components
-
-`Qwen3xDSparkLayer` is an independent role type.
-It composes ungated DSpark GQA, normalization, residual, and dense MLP components.
-It does not extend `Qwen3MainLayer` or `Qwen35MTPLayer`.
-
-`Qwen3xDSparkContext` records selected Main features into persistent DSpark context pages.
-`Qwen3xDSparkBody` records one fixed proposal block.
-`Qwen3xDSparkEmbed` produces the anchor and MASK rows.
-`Qwen3xDSparkGatherUnembed` produces one logit row for each proposal position.
-
-`DSparkMarkovSampling` applies the trained Markov correction and samples each fixed-block position in sequence.
-Each sampled token is the Markov input for the next position.
-The component writes sparse proposal distributions to `SpecProbsStore`.
-
-These components do not own the Qwen3 batch transaction or executor submission lifecycle.
+The output directory must not exist.
+The converter writes `model.safetensors` and `model.safetensors.index.json`.
+It preserves DSpark-owned embedding and unembedding when the source provides them.
+It omits confidence weights and reports that limit.
 
 ## Verification
 
-Core tests cover configuration, bindings, geometry, and converter round trips.
-Metal tests cover DSpark planning, selected Main-output projection, sequential Markov behavior, and block attention.
-Executor integration and production-path performance evidence belong to later commits.
+Unit and Metal parity tests cover:
+
+- Official `target_layer_ids` validation
+- Exact source and affine bindings
+- Converter round-trip and safetensors index generation
+- Anchor plus `N - 1` MASK construction
+- Flat Main and DSpark page splitting
+- Bidirectional block attention
+- Combined history and block reduction
+- Static partial-scratch capacity
+- Sequential Markov sampling
+- Ragged sparse rejection
+- Non-contiguous request slots
+
+The source and test boundaries are:
+
+```text
+src/
+  production semantics, components, replay wiring, and model execution
+
+src/*_test.rs
+  unit and Metal parity tests for one production module
+```
+
+Service wiring, end-to-end verification, benchmarks, and performance evidence belong to later commits.
+
+## Deferred work
+
+[`future_work.md`](future_work.md) owns these items:
+
+- Confidence-head execution and global proposal scheduling
+- Gated DSpark GQA
+- Backend-neutral replay-boundary review
+- Additional checkpoint variants
+- Overlapping batches

@@ -30,7 +30,7 @@ crates/inference-executor-metal/src/model/qwen/
     state/gdn.rs            Qwen3xGDNState prepare/restore/commit/publish/reset lifecycle
   v3_5/
     main/layer.rs           Qwen3.5 QGKV-GQA/GDN layer variants
-    plan.rs                 Qwen3.5 GDN geometry/config builder and dSpark plan
+    plan.rs                 Qwen3.5 GDN geometry/config builder
 
 crates/inference-backend-metal/src/components/
   gdn_attention.rs      reusable Metal GDN core component kernels
@@ -645,7 +645,7 @@ GDN metadata. Commit selects the candidate whose `state_version` matches the ver
 
 A commit to the current version leaves the current slot unchanged. It clears uncommitted txn state slots.
 
-Speculative target verification must not promote a candidate written after rejected rows. If a forward contains
+Speculative Main verification must not promote a candidate written after rejected rows. If a forward contains
 `base + draft` rows and rejection accepts only a shorter verified prefix, Qwen replay records prefix candidate states.
 It uses additional per-request slots.
 
@@ -744,7 +744,7 @@ has one row. One threadblock selects a request, V head, and V-dimension tile. It
 source-state fragments. They then scan the request segment in order.
 
 For `num_tokens=1,num_reqs=1`, this operation is still a one-step state update. For
-`num_tokens=spec+1,num_reqs=1`, it verifies the full target segment. It materializes any requested prefix candidate
+`num_tokens=spec+1,num_reqs=1`, it verifies the full Main segment. It materializes any requested prefix candidate
 versions while it scans.
 
 Restore and publish page I/O are outside the core math:

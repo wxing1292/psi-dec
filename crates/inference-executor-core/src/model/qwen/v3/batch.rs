@@ -11,7 +11,7 @@ use ordered_float::NotNan;
 
 use crate::sampling::SamplerConfig;
 
-/// Qwen3 target payload for one executor request, independent of its compute sequence.
+/// Qwen3 Main payload for one executor request, independent of its compute sequence.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen3Microbatch {
     // One batch with prefill request 0 and decode request 1 can look like:
@@ -20,7 +20,7 @@ pub struct Qwen3Microbatch {
     // flat index:         0    1    2 | 3  (a coordinate, not stored)
     // flat_token_ids:   101  102  103 | 201
     // token_indices:     10             | 20  (one request-absolute start per request)
-    // decode_req_indices:                1
+    // flat_sample_mask:  F    F    F   |  T
     //
     // GQA expands the request starts into flat_token_indices:
     // [10, 11, 12, 20].
@@ -29,7 +29,8 @@ pub struct Qwen3Microbatch {
     flat_token_ids: Vec<i32>,
     cu_tokens: Vec<u32>,
     sampler_configs: Vec<SamplerConfig>,
-    decode_req_indices: Vec<usize>,
+    num_spec_tokens: Vec<u32>,
+    flat_sample_mask: Vec<bool>,
 }
 
 impl Qwen3Microbatch {
@@ -39,7 +40,8 @@ impl Qwen3Microbatch {
         flat_token_ids: Vec<i32>,
         cu_tokens: Vec<u32>,
         sampler_configs: Vec<SamplerConfig>,
-        decode_req_indices: Vec<usize>,
+        num_spec_tokens: Vec<u32>,
+        flat_sample_mask: Vec<bool>,
     ) -> Self {
         validate_batch_fields(&req_slots, &token_indices, &flat_token_ids, &cu_tokens);
         assert_eq!(
@@ -47,14 +49,20 @@ impl Qwen3Microbatch {
             req_slots.len(),
             "Qwen3 request requires one sampler_config entry per request"
         );
-        validate_decode_req_indices(req_slots.len(), &decode_req_indices);
+        assert_eq!(
+            num_spec_tokens.len(),
+            req_slots.len(),
+            "Qwen3 request requires one speculative-token count per request"
+        );
+        validate_flat_sample_mask(&cu_tokens, &num_spec_tokens, &flat_sample_mask);
         Self {
             req_slots,
             token_indices,
             flat_token_ids,
             cu_tokens,
             sampler_configs,
-            decode_req_indices,
+            num_spec_tokens,
+            flat_sample_mask,
         }
     }
 
@@ -74,10 +82,11 @@ impl Qwen3Microbatch {
                 .checked_add(1)
                 .expect("Qwen3 cumulative-token capacity must fit usize"),
         );
-        let mut decode_req_indices = Vec::new();
+        let mut num_spec_tokens = Vec::with_capacity(requests.len());
+        let mut flat_sample_mask = Vec::new();
         cu_tokens.push(0);
 
-        for (req_index, request) in requests.iter().enumerate() {
+        for request in requests {
             let token_index: u32 = request
                 .decoder_query_tokens
                 .token_index()
@@ -87,15 +96,32 @@ impl Qwen3Microbatch {
                 .token_cost()
                 .try_into()
                 .expect("Qwen3 request q_len must fit u32");
-            match &request.decoder_query_tokens {
-                QueryTokens::Prefill { .. } => {},
-                QueryTokens::Decode { spec_tokens, .. } => {
-                    assert!(
-                        spec_tokens.is_empty(),
-                        "Qwen3 target-only batch does not accept speculative input tokens"
-                    );
-                    decode_req_indices.push(req_index);
+            let num_req_spec_tokens: u32 = request
+                .decoder_query_tokens
+                .num_spec_tokens()
+                .try_into()
+                .expect("Qwen3 request speculative-token count must fit u32");
+            let num_sample_rows = match request.decoder_query_tokens {
+                QueryTokens::Prefill { .. } => 0,
+                QueryTokens::Decode { .. } => {
+                    num_req_spec_tokens
+                        .checked_add(1)
+                        .expect("Qwen3 Main sample-row count must fit u32")
                 },
+            };
+            assert!(
+                num_sample_rows <= q_len,
+                "Qwen3 Main sample rows must fit the request query width"
+            );
+            let first_sample_offset = q_len
+                .checked_sub(num_sample_rows)
+                .expect("Qwen3 Main sample suffix must fit q_len");
+            flat_sample_mask.extend((0..q_len).map(|token_offset| token_offset >= first_sample_offset));
+            if matches!(request.decoder_query_tokens, QueryTokens::Prefill { .. }) {
+                assert_eq!(
+                    num_req_spec_tokens, 0,
+                    "Qwen3 prefill request must not contain speculative tokens"
+                );
             }
             assert!(q_len > 0, "Qwen3 batch requires positive q_len");
 
@@ -122,6 +148,7 @@ impl Qwen3Microbatch {
             );
             req_slots.push(request.req_slot);
             token_indices.push(token_index);
+            num_spec_tokens.push(num_req_spec_tokens);
         }
 
         Self::new(
@@ -130,7 +157,8 @@ impl Qwen3Microbatch {
             flat_token_ids,
             cu_tokens,
             sampler_configs,
-            decode_req_indices,
+            num_spec_tokens,
+            flat_sample_mask,
         )
     }
 
@@ -150,12 +178,50 @@ impl Qwen3Microbatch {
         &self.cu_tokens
     }
 
+    pub fn num_reqs(&self) -> usize {
+        self.req_slots.len()
+    }
+
+    pub fn q_len(&self, req_index: usize) -> u32 {
+        self.cu_tokens[req_index + 1] - self.cu_tokens[req_index]
+    }
+
+    pub fn sampler_configs(&self) -> &[SamplerConfig] {
+        &self.sampler_configs
+    }
+
+    pub fn num_spec_tokens(&self, req_index: usize) -> u32 {
+        self.num_spec_tokens[req_index]
+    }
+
+    pub fn flat_sample_mask(&self) -> &[bool] {
+        &self.flat_sample_mask
+    }
+
+    pub fn num_main_hidden_states_for_req(&self, req_index: usize) -> usize {
+        let token_start = self.cu_tokens[req_index] as usize;
+        let token_end = self.cu_tokens[req_index + 1] as usize;
+        self.flat_sample_mask[token_start..token_end]
+            .iter()
+            .filter(|&&sample| sample)
+            .count()
+    }
+
+    pub fn is_decode_req(&self, req_index: usize) -> bool {
+        let token_end = self.cu_tokens[req_index + 1] as usize;
+        self.flat_sample_mask[token_end - 1]
+    }
+
+    pub fn has_spec_tokens(&self) -> bool {
+        self.num_spec_tokens.iter().any(|&count| count > 0)
+    }
+
     pub fn total_tokens(&self) -> usize {
         self.flat_token_ids.len()
     }
 }
 
-/// One runtime-scheduled Qwen3 target batch.
+/// One runtime-scheduled Qwen3 Main batch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen3ModelBatchRequest {
     compute_seq: RawComputeSlotSeq,
@@ -196,52 +262,65 @@ impl Qwen3SampledTokens {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Qwen3DecodeDecision {
+    pub validated_tokens: Vec<u32>,
+    pub validated_probs: Vec<f32>,
     pub sampled_token: u32,
     pub sampled_prob: f32,
+    pub spec_tokens: Vec<u32>,
+    pub spec_probs: Vec<f32>,
 }
 
 pub fn gather_flat_indices(microbatch: &Qwen3Microbatch) -> Vec<u32> {
     microbatch
-        .decode_req_indices
+        .flat_sample_mask
         .iter()
-        .map(|&req_index| {
-            microbatch.cu_tokens[req_index + 1]
-                .checked_sub(1)
-                .expect("Qwen3 decode request must contain a token")
+        .enumerate()
+        .filter(|&(_, &sample)| sample)
+        .map(|(flat_index, _)| {
+            flat_index
+                .try_into()
+                .expect("Qwen3 gathered flat token index must fit u32")
         })
         .collect()
 }
 
-pub fn num_target_hidden_states(microbatch: &Qwen3Microbatch) -> usize {
-    microbatch.decode_req_indices.len()
+pub fn num_main_output_rows(microbatch: &Qwen3Microbatch) -> usize {
+    microbatch.flat_sample_mask.iter().filter(|&&sample| sample).count()
 }
 
-/// Returns the logical output-token position for each target hidden state.
+/// Returns the logical output-token position for each Main output row.
 pub fn sample_token_positions(microbatch: &Qwen3Microbatch) -> Vec<u32> {
-    microbatch
-        .decode_req_indices
-        .iter()
-        .map(|&req_index| {
-            let q_len = microbatch.cu_tokens[req_index + 1] - microbatch.cu_tokens[req_index];
-            microbatch.token_indices[req_index]
-                .checked_add(q_len)
-                .expect("Qwen3 sample position overflow")
-        })
-        .collect()
+    let mut positions = Vec::with_capacity(num_main_output_rows(microbatch));
+    for req_index in 0..microbatch.num_reqs() {
+        let token_start = microbatch.cu_tokens[req_index] as usize;
+        let token_end = microbatch.cu_tokens[req_index + 1] as usize;
+        positions.extend(
+            microbatch.flat_sample_mask[token_start..token_end]
+                .iter()
+                .enumerate()
+                .filter(|&(_, &sample)| sample)
+                .map(|(token_offset, _)| {
+                    microbatch.token_indices[req_index]
+                        .checked_add(token_offset.try_into().expect("Qwen3 sample token offset must fit u32"))
+                        .and_then(|position| position.checked_add(1))
+                        .expect("Qwen3 sample position overflow")
+                }),
+        );
+    }
+    positions
 }
 
 pub fn sample_sampler_configs(microbatch: &Qwen3Microbatch) -> Vec<SamplerConfig> {
-    let configs = microbatch
-        .decode_req_indices
-        .iter()
-        .map(|&req_index| microbatch.sampler_configs[req_index])
-        .collect::<Vec<_>>();
-    assert!(
-        !configs.is_empty(),
-        "Qwen3 sampler configs require target hidden states"
-    );
+    let mut configs = Vec::with_capacity(num_main_output_rows(microbatch));
+    for req_index in 0..microbatch.num_reqs() {
+        configs.extend(std::iter::repeat_n(
+            microbatch.sampler_configs[req_index],
+            microbatch.num_main_hidden_states_for_req(req_index),
+        ));
+    }
+    assert!(!configs.is_empty(), "Qwen3 sampler configs require Main output rows");
     configs
 }
 
@@ -256,6 +335,7 @@ pub fn sample_decisions_from_sampled_tokens(sampled_tokens: &Qwen3SampledTokens)
                     .try_into()
                     .expect("Qwen3 sampled token ID must be non-negative and fit u32"),
                 sampled_prob: token_prob,
+                ..Qwen3DecodeDecision::default()
             }
         })
         .collect()
@@ -283,12 +363,12 @@ pub fn to_core_batch_resp(
                         .expect("Qwen3 service requires one decision per sampled request");
                     SampledTokens::Decode {
                         epoch: core_req.decoder_query_tokens.epoch(),
-                        validated_tokens: Vec::new(),
-                        validated_probs: Vec::new(),
+                        validated_tokens: decision.validated_tokens.into_iter().map(Token::new).collect(),
+                        validated_probs: decision.validated_probs.into_iter().map(finite_probability).collect(),
                         sampled_token: Token::new(decision.sampled_token),
                         sampled_prob: finite_probability(decision.sampled_prob),
-                        spec_tokens: Vec::new(),
-                        spec_probs: Vec::new(),
+                        spec_tokens: decision.spec_tokens.into_iter().map(Token::new).collect(),
+                        spec_probs: decision.spec_probs.into_iter().map(finite_probability).collect(),
                     }
                 },
             };
@@ -338,20 +418,29 @@ fn validate_batch_fields(req_slots: &[u32], token_indices: &[u32], flat_token_id
     }
 }
 
-fn validate_decode_req_indices(num_reqs: usize, decode_req_indices: &[usize]) {
-    let mut previous_req_index = None;
-    for &req_index in decode_req_indices {
+fn validate_flat_sample_mask(cu_tokens: &[u32], num_spec_tokens: &[u32], flat_sample_mask: &[bool]) {
+    assert_eq!(
+        flat_sample_mask.len(),
+        *cu_tokens.last().expect("Qwen3 request requires cu_tokens") as usize,
+        "Qwen3 sample mask must match flattened tokens"
+    );
+    for req_index in 0..num_spec_tokens.len() {
+        let token_start = cu_tokens[req_index] as usize;
+        let token_end = cu_tokens[req_index + 1] as usize;
+        let sample_count = flat_sample_mask[token_start..token_end]
+            .iter()
+            .filter(|&&sample| sample)
+            .count();
         assert!(
-            req_index < num_reqs,
-            "Qwen3 decode request index {req_index} exceeds batch request count {num_reqs}"
+            sample_count == 0 || sample_count == num_spec_tokens[req_index] as usize + 1,
+            "Qwen3 decode request requires one Main sample row per speculative token plus one final row"
         );
-        if let Some(previous_req_index) = previous_req_index {
-            assert!(
-                previous_req_index < req_index,
-                "Qwen3 decode request indices must be strictly increasing"
-            );
-        }
-        previous_req_index = Some(req_index);
+        assert!(
+            flat_sample_mask[token_start..token_end]
+                .windows(2)
+                .all(|pair| !pair[0] || pair[1]),
+            "Qwen3 sample mask must be a request-local suffix"
+        );
     }
 }
 

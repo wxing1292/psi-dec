@@ -12,17 +12,11 @@ crates/inference-executor-core/src/attn/
     mod.rs                  GQA module root
     core.rs                 gated QGKV GQACore metadata and projection shapes
     ungated_core.rs         ungated QKV UngatedGQACore metadata and projection shapes
-    dspark_core.rs          DSpark fixed-block geometry and metadata
+    dspark_core.rs          DSpark block geometry and metadata
     reference.rs            CPU projected-GQA correctness oracle
 
 crates/inference-executor-metal/src/attn/
   mod.rs                    Metal attention module exports
-  dspark/
-    backend.rs              DSpark history/block partial composition
-    context.rs              persistent DSpark context buffers
-    metadata.rs             fixed-block attention metadata
-    scratch.rs              proposal-local Q/K/V and SDPA scratch
-    state.rs                DSpark page-table and context state owner
   gqa/
     mod.rs                  GQA Metal module root
     batch_metadata.rs       state-domain-owned, capacity-sized GPU metadata updated per microbatch
@@ -31,10 +25,17 @@ crates/inference-executor-metal/src/attn/
     ungated_backend.rs      ungated QKV Metal replay wiring
     ungated_scratch.rs      ungated QKV scratch allocation and borrowed replay bindings
     request_page_table.rs   per-request, per-layer KV page table for runtime-supplied page IDs
+  dspark/
+    mod.rs                  DSpark attention module root
+    backend.rs              ungated paged-history plus block-bidirectional replay graph
+    context.rs              persistent DSpark context K/V append
+    metadata.rs             proposal history and block metadata
+    scratch.rs              fixed-capacity local Q/K/V and attention partials
+    state.rs                DSpark page-table and proposal metadata lifecycle
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
-    dspark/                 independent Qwen3x DSpark model components
+    dspark/                 Qwen3x DSpark attention, layer, model, and plan
     layer/gqa.rs            Qwen3xGQA, private checkpoint weights, load, and record
     state/gqa.rs            Qwen3xGQAState page/metadata/reset lifecycle grouping
   v3/
@@ -144,22 +145,8 @@ the ungated QKV path.
 
 Qwen3 Main constructs `UngatedGQACore` and `UngatedGQA`.
 Qwen3.5 Main and MTP construct `GQACore` and gated `GQA`.
-Qwen3x DSpark defines a separate `UngatedDSparkGQACore` and `UngatedDSparkGQA`.
-The DSpark state owns a separate logical page table.
-Runtime page IDs remain in one allocation domain.
-The model executor splits each request block span into Main and DSpark spans.
-
-DSpark attention records two map sources:
-
-```text
-history_causal_sdpa_map = paged history map
-block_bidi_sdpa_map     = dense proposal-block map
-sdpa_reduce             = existing GQA partial reducer
-```
-
-The dense block K/V is temporary.
-`DSparkBlockScratch` owns it.
-The paged DSpark context K/V follows the runtime request-page lifecycle.
+Qwen3x DSpark constructs `UngatedDSparkGQACore` and `UngatedDSparkGQA`.
+Its QKV attention graph is independent from Main and MTP.
 
 Init-time component specialization supplies the head dimensions, head counts, RoPE constants, and page geometry. A
 model-specific runtime branch does not supply these values.
@@ -223,6 +210,7 @@ pages[num_cache_pages][page_bytes]
 
 main_page_ids[num_req_slots][num_gqa_layers][num_blocks][num_page_ids_per_block]
 optional_mtp_page_ids[num_req_slots][1][num_blocks][num_page_ids_per_block]
+optional_dspark_page_ids[num_req_slots][num_dspark_layers][num_blocks][num_page_ids_per_block]
 
 one KV page, viewed with the model KV dtype:
   [K/V][num_kv_heads][num_tokens_per_page][head_dim]
@@ -240,10 +228,16 @@ req_slot -> gqa_layer_index -> block_index -> page_id_index -> page_id -> KV pag
 The main page-ID table uses compact main `gqa_layer_index`. The supported optional MTP has an independent table. Its
 single full-attention body uses `gqa_layer_index = 0`.
 
+Qwen3 DSpark has a separate page table.
+The Qwen3 executor splits one runtime cache-block page span into Main and DSpark page spans.
+Both page tables keep their own layer and page-stride geometry.
+
 The layout type uses generic `num_gqa_layers` for both tables. Each table instance owns its capacity and can use a
 different GQA configuration.
 
-The Qwen executor updates Main state once for each Main batch. It updates optional MTP metadata once for the MTP stage.
+The Qwen executor updates Main state once for each Main batch.
+It updates optional MTP metadata once for the MTP stage.
+It updates DSpark proposal metadata once for the DSpark Spec stage.
 
 Main GQA layers borrow the Main state domain. The optional MTP owns its backend, scratch, and compact page-ID table.
 
@@ -309,8 +303,10 @@ tiles.
 One TaskTemplate can cover several consecutive KV-token tiles. The planner rounds up
 `num_sdpa_map_task_templates` to produce the total replay dispatch and scratch extent.
 
-The backend configuration is model-independent. `model/qwen/v3/main/plan.rs` builds the Qwen3 ungated core.
-`model/qwen/v3_5/plan.rs` builds gated Main/MTP cores.
+The backend configuration is model-independent.
+`model/qwen/v3/main/plan.rs` builds the Qwen3 Main ungated core.
+`model/qwen/v3_x/dspark/plan.rs` builds the Qwen3x DSpark ungated core.
+`model/qwen/v3_5/plan.rs` builds gated Main and MTP cores.
 
 Each concrete backend converts its core and `GQAMetalConfig` into a projection split. It also constructs the shared
 norm/RoPE, KV-update, paged-SDPA, and output-projection components.
@@ -466,7 +462,7 @@ The Q-head tile is capped at 256 threads. Current reachable model paths are:
 | Qwen3-14B | `40 / 8 / 128` | 8 | selector above, tiled `Hq_tile=5` |
 | Qwen3.6-27B | `24 / 4 / 256` | 8 | `SingleQToken` |
 | Qwen3.6-35B-A3B | `16 / 2 / 256` | 16 | selector above |
-| DSpark | `head_dim=128` | model-derived | custom `SingleQToken` composition |
+| Qwen3 DSpark | checkpoint-derived | model-derived | paged history + block bidirectional |
 
 For 35B, `TiledQTokens` uses `Hq_tile=4` below four useful tokens/tile and `Hq_tile=8` otherwise.
 
@@ -586,6 +582,11 @@ graph. It has no gate buffers.
 
 Both scratch types expose matching borrowed replay bindings. The model stream serializes Main and MTP execution.
 Therefore, submissions reuse their buffers without per-layer allocation.
+
+Qwen3 DSpark owns `DSparkBlockScratch`.
+This scratch contains proposal-local Q/K/V and both attention paths' partial outputs.
+Its partial capacity is `next_power_of_two(2 * max_requests * block_size)`.
+It does not depend on `max_position_embeddings`.
 
 The bound for SDPA partial scratch is `max_tokens * tiled_q_token_tile_size * num_q_heads`. It is independent of
 `max_position_embeddings`.
@@ -751,10 +752,18 @@ Metal backend component replay sanity lives in:
 
 ```text
 cargo bench -p inference-backend-metal --bench gqa_attn -- --profile-time 1 --noplot
+
+cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
+  --block-sizes 7 --num-requests 1,4 \
+  --iters 1 --warmup-iters 0 --runs 1
 ```
 
 The GQA backend bench records paged-SDPA building blocks only in Metal replay/ICB paths. GQA Metal code does not
 benchmark or expose direct-submit component or forward wiring.
+
+`gqa_block_attn` records only `GQABlockSDPAKernel`.
+It measures the dense block-bidirectional map contribution used by DSpark.
+It does not measure history attention, partial reduction, projections, or a DSpark layer.
 
 Metal backend real full-forward replay bench lives in:
 
@@ -763,13 +772,23 @@ cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
   --model-dir <qwen3-model-dir> --tokens-per-req 16 --contexts 0,128,1024 \
   --iters 1 --warmup-iters 0 --runs 1
 
+cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
+  --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
+  --cases dspark --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+
 cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b --tokens 1 \
   --contexts 0 --num-reqs 1 --gqa-paths single_q_token \
   --iters 1 --warmup-iters 0 --runs 1
 ```
 
-Both benches use CLI arguments instead of environment variables.
+These benches use CLI arguments instead of environment variables.
+
+`qwen3_dspark` runs the public Main and Spec executor hooks.
+It measures the complete DSpark graph.
+Use it for DSpark composition and lifecycle costs.
+Do not compare its timing directly with `gqa_block_attn`.
 
 `qwen3_gqa` loads the Qwen3 model config and first-layer ungated weights. It accepts explicit per-request token counts
 and context lengths. It reports full-replay and SDPA-only measurements.

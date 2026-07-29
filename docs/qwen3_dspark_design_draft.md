@@ -9,11 +9,12 @@ Current-component documents continue to describe current `src`.
 
 Current status:
 
-- Qwen3 is Main-only.
+- Qwen3 can load an optional fixed-block DSpark speculator.
 - Qwen3.5 supports zero or one MTP module.
 - The Qwen3x subtree owns the new DSpark configuration, bindings, model components, attention state, and Markov
   sampling.
-- No executor or service wires DSpark.
+- The Qwen3 executor wires DSpark through the generic Main and Spec lifecycle.
+- The service does not yet expose a DSpark checkpoint option.
 - No end-to-end DSpark correctness or performance claim exists.
 
 The repository no longer contains the unwired Qwen3.5-era DSpark implementation.
@@ -62,14 +63,16 @@ crates/inference-backend-metal/src/components/
 crates/inference-executor-metal/src/
   attn/dspark/
   model/qwen/v3_x/dspark/
+  model/qwen/v3/executor/dspark.rs
   sampling/dspark_markov.rs
+  sampling/rejection_replay.rs
 ```
 
 The Qwen3.5 executor does not reference these components from its load or forward path.
 The Qwen3.5 loader supplies no DSpark capture owner.
 MTP remains the only speculator that Qwen3.5 executes.
 
-The current components implement:
+The current implementation includes:
 
 - Tensor names and affine layouts
 - Target-feature geometry
@@ -79,7 +82,8 @@ The current components implement:
 - Markov correction
 - Metal buffer and kernel contracts
 
-They do not define the Qwen3 batch, transaction, or executor contract.
+The Qwen3 batch accepts an optional speculative suffix.
+The executor owns Main verification, sparse rejection, DSpark context append, and proposal submission.
 
 ## Official configuration contract
 
@@ -479,14 +483,15 @@ Completed:
    `inference-executor-core`.
 2. Remove the nested DFlash-era configuration and its compatibility tests.
 3. Define `Qwen3xDSparkLayer` and its Qwen3x Metal components.
+4. Define the DSpark block batch, Main-feature context, and proposal transaction.
+5. Review the exact `Qwen3Executor` fields, Main-capture owner, and proposal unembedding owner.
+6. Wire Main capture and DSpark proposal through the generic Qwen executor lifecycle.
 
 Remaining:
 
-1. Define the DSpark block batch, Main-feature context, and proposal transaction.
-2. Review the exact `Qwen3Executor` fields, Main-capture owner, and proposal unembedding owner before wiring them.
-3. Wire Main capture and DSpark proposal through the generic Qwen executor lifecycle.
-4. Add checkpoint loading, deterministic component parity, and end-to-end rejection validation.
-5. Measure performance only after correctness and replay-cache behavior are stable.
+1. Wire service checkpoint loading.
+2. Add deterministic end-to-end rejection validation.
+3. Measure performance only after correctness and replay-cache behavior are stable.
 
 The implementation must not start with a backend-neutral replay redesign.
 

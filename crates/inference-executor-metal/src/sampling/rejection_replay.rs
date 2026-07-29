@@ -5,6 +5,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::SparseRejectionSamplingShape;
@@ -19,6 +20,58 @@ use crate::sampling::rejection_sampling::SparseRejectionSamplingOutput;
 use crate::sampling::top_k_sampling::TopKSampling;
 use crate::sampling::top_k_sampling::TopKSamplingInputs;
 use crate::sampling::top_k_sampling::TopKSamplingSparseDistributionOutput;
+
+pub trait SpecMicrobatch {
+    fn num_reqs(&self) -> usize;
+    fn is_decode_req(&self, req_index: usize) -> bool;
+    fn num_spec_tokens(&self, req_index: usize) -> u32;
+    fn cu_tokens(&self) -> &[u32];
+    fn flat_token_ids(&self) -> &[i32];
+}
+
+impl SpecMicrobatch for Qwen3Microbatch {
+    fn num_reqs(&self) -> usize {
+        Qwen3Microbatch::num_reqs(self)
+    }
+
+    fn is_decode_req(&self, req_index: usize) -> bool {
+        Qwen3Microbatch::is_decode_req(self, req_index)
+    }
+
+    fn num_spec_tokens(&self, req_index: usize) -> u32 {
+        Qwen3Microbatch::num_spec_tokens(self, req_index)
+    }
+
+    fn cu_tokens(&self) -> &[u32] {
+        Qwen3Microbatch::cu_tokens(self)
+    }
+
+    fn flat_token_ids(&self) -> &[i32] {
+        Qwen3Microbatch::flat_token_ids(self)
+    }
+}
+
+impl SpecMicrobatch for Qwen35Microbatch {
+    fn num_reqs(&self) -> usize {
+        Qwen35Microbatch::num_reqs(self)
+    }
+
+    fn is_decode_req(&self, req_index: usize) -> bool {
+        Qwen35Microbatch::is_decode_req(self, req_index)
+    }
+
+    fn num_spec_tokens(&self, req_index: usize) -> u32 {
+        Qwen35Microbatch::num_spec_tokens(self, req_index)
+    }
+
+    fn cu_tokens(&self) -> &[u32] {
+        Qwen35Microbatch::cu_tokens(self)
+    }
+
+    fn flat_token_ids(&self) -> &[i32] {
+        Qwen35Microbatch::flat_token_ids(self)
+    }
+}
 
 pub struct RejectionSampler {
     sparse_sampler: SparseRejectionSampling,
@@ -178,11 +231,10 @@ impl RejectionSampler {
         }
     }
 
-    pub fn prepare_inputs(
-        &self,
-        microbatch: &Qwen35Microbatch,
-        flat_draft_distribution_indices: &[u32],
-    ) -> PreparedRejection {
+    pub fn prepare_inputs<B>(&self, microbatch: &B, flat_draft_distribution_indices: &[u32]) -> PreparedRejection
+    where
+        B: SpecMicrobatch,
+    {
         let decode_req_indices = (0..microbatch.num_reqs())
             .filter(|&req_index| microbatch.is_decode_req(req_index))
             .collect::<Vec<_>>();
@@ -345,11 +397,13 @@ mod tests {
     use inference_executor_core::sampling::SamplerConfig;
 
     use super::RejectionSampler;
+    use crate::sampling::spec_probs::SpecProbsStore;
 
     #[test]
-    fn test_ragged_inputs() {
+    fn test_ragged_non_contiguous_request_slots() {
         let device = Device::system_default();
         let sampler = RejectionSampler::new(&device, 3, 4, 4);
+        let distributions = SpecProbsStore::new(&device, 3, 4, 4);
         let batch = Qwen35Microbatch::new(
             vec![0, 2],
             vec![0, 0],
@@ -361,8 +415,13 @@ mod tests {
             vec![SamplerConfig::default(), SamplerConfig::default()],
             vec![true; 5],
         );
+        let draft_distribution_indices = [
+            distributions.draft_distribution_index(0, 0),
+            distributions.draft_distribution_index(0, 1),
+            distributions.draft_distribution_index(2, 0),
+        ];
 
-        let prepared = sampler.prepare_inputs(&batch, &[7, 8, 1]);
+        let prepared = sampler.prepare_inputs(&batch, &draft_distribution_indices);
         assert_eq!(prepared.decode_req_indices, vec![0, 1]);
         assert_eq!(prepared.num_active_draft_distributions, 3);
         assert_eq!(prepared.num_active_target_distributions(), 5);
@@ -371,7 +430,7 @@ mod tests {
         assert_eq!(sampler.flat_draft_token_ids.read_typed::<i32>(0, 3), vec![11, 12, 21]);
         assert_eq!(
             sampler.flat_draft_distribution_indices.read_typed::<u32>(0, 3),
-            vec![7, 8, 1]
+            vec![0, 1, 6]
         );
     }
 

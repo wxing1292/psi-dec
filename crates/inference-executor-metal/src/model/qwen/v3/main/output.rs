@@ -4,7 +4,7 @@ use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
-use inference_executor_core::model::qwen::v3::num_target_hidden_states;
+use inference_executor_core::model::qwen::v3::num_main_output_rows;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
@@ -18,7 +18,7 @@ use crate::replay::ReplayComponent;
 
 pub struct Qwen3GatherUnembed {
     gather: Gather,
-    unembed: Unembed,
+    unembed: Rc<Unembed>,
     hidden_dim: u32,
 }
 
@@ -38,12 +38,20 @@ impl Qwen3GatherUnembed {
         config: UnembedConfig,
         bindings: QuantizedTensorBindings,
     ) -> Result<Self, ModelExecutorError> {
-        let unembed = Unembed::load(device, store, config, bindings)?;
-        Ok(Self {
+        let unembed = Rc::new(Unembed::load(device, store, config, bindings)?);
+        Ok(Self::new(device, config.hidden_dim, unembed))
+    }
+
+    pub fn new(device: &Device, hidden_dim: u32, unembed: Rc<Unembed>) -> Self {
+        Self {
             gather: Gather::new(device),
             unembed,
-            hidden_dim: config.hidden_dim,
-        })
+            hidden_dim,
+        }
+    }
+
+    pub fn unembed(&self) -> Rc<Unembed> {
+        Rc::clone(&self.unembed)
     }
 
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen3GatherUnembedArgs<'a>) -> &'a Buffer
@@ -72,25 +80,23 @@ impl Qwen3GatherUnembed {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3GatherUnembedReplayKey {
-    num_target_hidden_states: u32,
+    num_main_output_rows: u32,
 }
 
 impl Qwen3GatherUnembedReplayKey {
     pub fn from_microbatch(microbatch: &Qwen3Microbatch) -> Self {
-        let num_target_hidden_states = num_target_hidden_states(microbatch)
+        let num_main_output_rows = num_main_output_rows(microbatch)
             .try_into()
-            .expect("qwen3 target hidden-state count must fit u32");
+            .expect("qwen3 Main output row count must fit u32");
         assert!(
-            num_target_hidden_states > 0,
-            "qwen3 GatherUnembed replay requires target hidden states"
+            num_main_output_rows > 0,
+            "qwen3 GatherUnembed replay requires Main output rows"
         );
-        Self {
-            num_target_hidden_states,
-        }
+        Self { num_main_output_rows }
     }
 
-    pub fn num_target_hidden_states(&self) -> u32 {
-        self.num_target_hidden_states
+    pub fn num_main_output_rows(&self) -> u32 {
+        self.num_main_output_rows
     }
 }
 
@@ -99,9 +105,9 @@ impl ReplayComponent for Qwen3GatherUnembed {
     type Input<'a> = Qwen3GatherUnembedArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        assert!(input.num_rows > 0, "qwen3 GatherUnembed requires target hidden states");
+        assert!(input.num_rows > 0, "qwen3 GatherUnembed requires Main output rows");
         Qwen3GatherUnembedReplayKey {
-            num_target_hidden_states: input.num_rows,
+            num_main_output_rows: input.num_rows,
         }
     }
 
@@ -109,3 +115,4 @@ impl ReplayComponent for Qwen3GatherUnembed {
         Qwen3GatherUnembed::record(self, recorder, *input);
     }
 }
+use std::rc::Rc;

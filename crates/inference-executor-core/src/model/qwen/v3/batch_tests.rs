@@ -5,7 +5,7 @@ use inference_runtime_core::runtime::RawRequestSlot;
 use super::*;
 
 #[test]
-fn test_builds_target_microbatch() {
+fn test_builds_main_microbatch() {
     let requests = vec![
         device_request(
             10,
@@ -38,7 +38,7 @@ fn test_builds_target_microbatch() {
     assert_eq!(batch.flat_token_ids(), &[101, 102, 103, 201, 202, 203]);
     assert_eq!(batch.cu_tokens(), &[0, 3, 6]);
     assert_eq!(gather_flat_indices(&batch), vec![5]);
-    assert_eq!(num_target_hidden_states(&batch), 1);
+    assert_eq!(num_main_output_rows(&batch), 1);
     assert_eq!(sample_token_positions(&batch), vec![10]);
 }
 
@@ -66,8 +66,7 @@ fn test_batch_request_preserves_compute_sequence() {
 }
 
 #[test]
-#[should_panic(expected = "target-only batch does not accept speculative input tokens")]
-fn test_target_batch_rejects_speculative_input() {
+fn test_main_batch_accepts_speculative_input_suffix() {
     let requests = [device_request(
         10,
         0,
@@ -80,20 +79,13 @@ fn test_target_batch_rejects_speculative_input() {
         3,
     )];
 
-    let _ = Qwen3Microbatch::from_requests(&requests, vec![SamplerConfig::default()]);
-}
+    let batch = Qwen3Microbatch::from_requests(&requests, vec![SamplerConfig::default()]);
 
-#[test]
-#[should_panic(expected = "decode request indices must be strictly increasing")]
-fn test_decode_request_indices_must_be_strictly_increasing() {
-    let _ = Qwen3Microbatch::new(
-        vec![0, 1],
-        vec![8, 9],
-        vec![10, 11],
-        vec![0, 1, 2],
-        vec![SamplerConfig::default(); 2],
-        vec![1, 0],
-    );
+    assert_eq!(batch.flat_token_ids(), &[201, 202]);
+    assert_eq!(batch.num_spec_tokens(0), 1);
+    assert_eq!(batch.flat_sample_mask(), &[true, true]);
+    assert_eq!(gather_flat_indices(&batch), vec![0, 1]);
+    assert_eq!(sample_token_positions(&batch), vec![8, 9]);
 }
 
 #[test]
@@ -122,11 +114,12 @@ fn test_sampling_helpers_follow_decode_requests() {
         vec![11, 12, 13, 21, 22, 31],
         vec![0, 3, 5, 6],
         vec![first, second, third],
-        vec![0, 2],
+        vec![0, 0, 0],
+        vec![false, false, true, false, false, true],
     );
 
     assert_eq!(gather_flat_indices(&batch), vec![2, 5]);
-    assert_eq!(num_target_hidden_states(&batch), 2);
+    assert_eq!(num_main_output_rows(&batch), 2);
     assert_eq!(sample_token_positions(&batch), vec![7, 21]);
     assert_eq!(sample_sampler_configs(&batch), vec![first, third]);
 }
@@ -143,17 +136,19 @@ fn test_sampled_tokens_become_decode_decisions() {
             Qwen3DecodeDecision {
                 sampled_token: 31,
                 sampled_prob: 0.5,
+                ..Qwen3DecodeDecision::default()
             },
             Qwen3DecodeDecision {
                 sampled_token: 32,
                 sampled_prob: 0.25,
+                ..Qwen3DecodeDecision::default()
             },
         ]
     );
 }
 
 #[test]
-fn test_converts_target_decisions_to_core_response() {
+fn test_converts_main_decisions_to_core_response() {
     let core = BatchDeviceRequest::new(
         7,
         vec![
@@ -184,6 +179,7 @@ fn test_converts_target_decisions_to_core_response() {
     let decision = Qwen3DecodeDecision {
         sampled_token: 5,
         sampled_prob: 0.3,
+        ..Qwen3DecodeDecision::default()
     };
 
     let response = to_core_batch_resp(core, vec![decision]);

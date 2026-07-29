@@ -19,6 +19,18 @@ impl Qwen3Executor {
                 request.decoder_query_tokens.token_consumption(),
                 self.config.max_tokens_per_request
             );
+            let num_spec_tokens = request.decoder_query_tokens.num_spec_tokens();
+            if self.dspark_block_size == 0 {
+                assert_eq!(
+                    num_spec_tokens, 0,
+                    "qwen3 executor without DSpark does not accept speculative input tokens"
+                );
+            } else {
+                assert!(
+                    num_spec_tokens <= self.dspark_block_size,
+                    "qwen3 speculative-token count exceeds DSpark block size"
+                );
+            }
         }
         let max_context_tokens = core_batch_req
             .dev_reqs
@@ -40,6 +52,16 @@ impl Qwen3Executor {
             num_physical_pages,
             page_capacity
         );
+        if let (Some(state), Some(layout)) = (&self.dspark_gqa_state, self.dspark_page_table_layout) {
+            let num_dspark_pages = max_context_tokens.div_ceil(state.num_tokens_per_page());
+            let dspark_page_capacity = layout.num_physical_pages_per_request();
+            assert!(
+                num_dspark_pages <= dspark_page_capacity,
+                "qwen3 DSpark request context needs {} physical pages but capacity is {}",
+                num_dspark_pages,
+                dspark_page_capacity
+            );
+        }
     }
 
     pub fn model_config(&self) -> &Qwen3ModelConfig {
@@ -52,6 +74,10 @@ impl Qwen3Executor {
             .checked_mul(u64::from(layout.num_page_ids_per_block))
             .expect("qwen3 main GQA page IDs per block overflow");
         usize::try_from(num_page_ids).expect("qwen3 main GQA page IDs per block must fit usize")
+    }
+
+    pub fn num_kv_page_ids_per_block(&self) -> usize {
+        self.num_runtime_page_ids_per_block
     }
 
     fn write_token_ids(&self, token_ids: &[i32]) {
