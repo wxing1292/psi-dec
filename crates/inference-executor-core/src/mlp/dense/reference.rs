@@ -109,6 +109,29 @@ pub fn quantized_affine_reference(
     output
 }
 
+pub fn quantized_affine_weight_row_reference(
+    shape: QuantizedAffineReferenceShape,
+    output_col: usize,
+    weight: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+) -> Vec<f32> {
+    shape.validate();
+    assert!(output_col < shape.output_dim);
+    assert_eq!(weight.len(), shape.weight_bytes());
+    assert_eq!(scales.len(), shape.affine_param_len());
+    assert_eq!(biases.len(), shape.affine_param_len());
+
+    let groups = shape.input_dim / shape.group_size;
+    (0..shape.input_dim)
+        .map(|input_col| {
+            let affine_index = output_col * groups + input_col / shape.group_size;
+            quantized_weight_value(shape, weight, output_col, input_col) as f32 * scales[affine_index]
+                + biases[affine_index]
+        })
+        .collect()
+}
+
 pub fn quantized_dense_mlp_reference(
     core: &DenseMLPCore,
     input: &[f32],

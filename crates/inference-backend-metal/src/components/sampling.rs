@@ -175,8 +175,9 @@ fn assert_merge_inputs_fit(
     tile_token_ids: &Buffer,
     tile_logits: &Buffer,
     runtime_params: &Buffer,
+    vocab_tile_size: u32,
 ) {
-    let candidates = tile_count(shape, vocab_tile_size());
+    let candidates = tile_count(shape, vocab_tile_size);
     assert!(
         tile_token_ids.len_bytes() >= checked_bytes("Metal top-k merge token", candidates, size_of::<i32>()),
         "top-k tile token buffer is too short"
@@ -481,6 +482,7 @@ impl Operator for TopKSampleInvocation<'_> {
             self.buffers.tile_token_ids,
             self.buffers.tile_logits,
             self.buffers.runtime_params,
+            vocab_tile_size(),
         );
         assert!(
             self.buffers.token_ids.len_bytes()
@@ -570,6 +572,7 @@ impl Operator for TopKSparseDistributionInvocation<'_> {
             self.buffers.tile_token_ids,
             self.buffers.tile_logits,
             self.buffers.runtime_params,
+            vocab_tile_size(),
         );
         assert!(
             self.buffers.max_k >= self.shape.top_k,
@@ -660,10 +663,21 @@ impl TopKSampleAndSparseDistributionKernel {
         shape: TopKSampleShape,
         buffers: TopKSampleAndSparseDistributionBuffers<'a>,
     ) -> TopKSampleAndSparseDistributionInvocation<'a> {
+        self.invoke_replay_with_vocab_tile_size(shape, buffers, vocab_tile_size())
+    }
+
+    pub fn invoke_replay_with_vocab_tile_size<'a>(
+        &'a self,
+        shape: TopKSampleShape,
+        buffers: TopKSampleAndSparseDistributionBuffers<'a>,
+        vocab_tile_size: u32,
+    ) -> TopKSampleAndSparseDistributionInvocation<'a> {
+        assert!(vocab_tile_size > 0);
         TopKSampleAndSparseDistributionInvocation {
             kernel: self,
             shape,
             buffers,
+            vocab_tile_size,
         }
     }
 }
@@ -672,6 +686,7 @@ pub struct TopKSampleAndSparseDistributionInvocation<'a> {
     kernel: &'a TopKSampleAndSparseDistributionKernel,
     shape: TopKSampleShape,
     buffers: TopKSampleAndSparseDistributionBuffers<'a>,
+    vocab_tile_size: u32,
 }
 
 impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
@@ -682,6 +697,7 @@ impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
             self.buffers.tile_token_ids,
             self.buffers.tile_logits,
             self.buffers.runtime_params,
+            self.vocab_tile_size,
         );
         assert!(
             self.buffers.sampled_token_ids.len_bytes()
@@ -739,7 +755,7 @@ impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
                     .expect("Metal top-k sample-and-sparse-distribution probability bytes must fit usize"),
             "top-k sample-and-sparse-distribution probability buffer too short"
         );
-        let vocab_tile_size = vocab_tile_size();
+        let vocab_tile_size = self.vocab_tile_size;
         let num_tiles = num_tiles(self.shape, vocab_tile_size);
         let tile_top_k = tile_top_k(self.shape);
         builder.set_kernel(&self.kernel.kernel);

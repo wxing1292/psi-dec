@@ -4,6 +4,10 @@ use std::mem::size_of;
 use std::time::Duration;
 use std::time::Instant;
 
+use inference_backend_metal::components::DSparkMarkovTopKMapBuffers;
+use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
+use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
+use inference_backend_metal::components::DSparkMarkovTopKMapShape;
 use inference_backend_metal::components::REJECTION_NUM_ACTIVE_THREADS_KEY;
 use inference_backend_metal::components::REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY;
 use inference_backend_metal::components::REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY;
@@ -25,6 +29,7 @@ use inference_backend_metal::components::TopKTileBuffers;
 use inference_backend_metal::components::TopKTileKernel;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
@@ -69,6 +74,21 @@ fn main() {
                 }
             }
         },
+        BenchMode::DSparkMarkovTopKMap => {
+            let config = DSparkMarkovTopKMapConfig {
+                vocab_size: args.vocab,
+                rank: args.markov_rank,
+                w1_group_size: args.markov_w1_group_size,
+                w1_bits: args.markov_w1_bits,
+                w2_group_size: args.markov_w2_group_size,
+                w2_bits: args.markov_w2_bits,
+            };
+            for rows in args.rows {
+                let fixture = DSparkMarkovFixture::new(&device, rows, args.top_k, config);
+                let samples = measure_runs(args.runs, args.warmup_iters, args.iters, || fixture.run());
+                print_dspark_markov_perf(rows, args.top_k, config, fixture.vocab_tile_size, args.iters, &samples);
+            }
+        },
     }
 }
 
@@ -78,6 +98,7 @@ enum BenchMode {
     TopKSparseDistribution,
     TopKSampleAndSparseDistribution,
     RejectionSparse,
+    DSparkMarkovTopKMap,
 }
 
 impl BenchMode {
@@ -87,6 +108,7 @@ impl BenchMode {
             "top-k-sparse-distribution" => Self::TopKSparseDistribution,
             "top-k-sample-and-sparse-distribution" => Self::TopKSampleAndSparseDistribution,
             "rejection-sparse" => Self::RejectionSparse,
+            "dspark-markov-top-k-map" => Self::DSparkMarkovTopKMap,
             other => panic!("unknown --mode {other:?}; pass --help for usage"),
         }
     }
@@ -97,6 +119,7 @@ impl BenchMode {
             Self::TopKSparseDistribution => "top-k-sparse-distribution",
             Self::TopKSampleAndSparseDistribution => "top-k-sample-and-sparse-distribution",
             Self::RejectionSparse => "rejection-sparse",
+            Self::DSparkMarkovTopKMap => "dspark-markov-top-k-map",
         }
     }
 }
@@ -108,6 +131,11 @@ struct Args {
     spec_tokens: Vec<u32>,
     top_k: u32,
     vocab: u32,
+    markov_rank: u32,
+    markov_w1_group_size: u32,
+    markov_w1_bits: u32,
+    markov_w2_group_size: u32,
+    markov_w2_bits: u32,
     iters: usize,
     warmup_iters: usize,
     runs: usize,
@@ -122,6 +150,11 @@ impl Args {
             spec_tokens: vec![1, 4],
             top_k: 32,
             vocab: 32_768,
+            markov_rank: 256,
+            markov_w1_group_size: 64,
+            markov_w1_bits: 4,
+            markov_w2_group_size: 64,
+            markov_w2_bits: 8,
             iters: 200,
             warmup_iters: 50,
             runs: 7,
@@ -136,6 +169,11 @@ impl Args {
                 "--spec-tokens" => args.spec_tokens = parse_u32_list(&next_arg(&mut iter, &arg), &arg),
                 "--top-k" => args.top_k = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
                 "--vocab" => args.vocab = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
+                "--markov-rank" => args.markov_rank = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
+                "--markov-w1-group-size" => args.markov_w1_group_size = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
+                "--markov-w1-bits" => args.markov_w1_bits = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
+                "--markov-w2-group-size" => args.markov_w2_group_size = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
+                "--markov-w2-bits" => args.markov_w2_bits = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
                 "--iters" => args.iters = parse_usize_arg(&next_arg(&mut iter, &arg), &arg),
                 "--warmup-iters" => args.warmup_iters = parse_usize_arg(&next_arg(&mut iter, &arg), &arg),
                 "--runs" => args.runs = parse_usize_arg(&next_arg(&mut iter, &arg), &arg),
@@ -152,6 +190,7 @@ impl Args {
         assert!(args.top_k > 0, "--top-k must be positive");
         assert!(args.vocab > 0, "--vocab must be positive");
         assert!(args.top_k <= args.vocab, "--top-k must be <= --vocab");
+        assert!(args.markov_rank > 0, "--markov-rank must be positive");
         assert!(args.iters > 0, "--iters must be positive");
         assert!(args.runs > 0, "--runs must be positive");
         args
@@ -177,6 +216,79 @@ impl RejectionFixture {
     }
 }
 
+struct DSparkMarkovFixture {
+    replay: ReplayFixture,
+    vocab_tile_size: u32,
+}
+
+impl DSparkMarkovFixture {
+    fn new(device: &Device, rows: u32, top_k: u32, config: DSparkMarkovTopKMapConfig) -> Self {
+        assert!(rows > 0);
+        config.validate();
+        let shape = TopKSampleShape {
+            num_total_sampling_inputs: rows,
+            vocab_size: config.vocab_size,
+            top_k,
+        };
+        let previous_token_ids = Buffer::new_zeroed_elements(device, rows as usize, Dtype::Int32);
+        let base_logits =
+            Buffer::new_zeroed_elements(device, rows as usize * config.vocab_size as usize, Dtype::Bfloat16);
+        let w1_weight = Buffer::new_zeroed(
+            device,
+            affine_weight_bytes(config.vocab_size, config.rank, config.w1_bits),
+        );
+        let w1_scales = affine_param_buffer(device, config.vocab_size, config.rank, config.w1_group_size, 1.0);
+        let w1_biases = affine_param_buffer(device, config.vocab_size, config.rank, config.w1_group_size, 0.0);
+        let w2_weight = Buffer::new_zeroed(
+            device,
+            affine_weight_bytes(config.vocab_size, config.rank, config.w2_bits),
+        );
+        let w2_scales = affine_param_buffer(device, config.vocab_size, config.rank, config.w2_group_size, 1.0);
+        let w2_biases = affine_param_buffer(device, config.vocab_size, config.rank, config.w2_group_size, 0.0);
+        let kernel = DSparkMarkovTopKMapKernel::new(device, config);
+        let candidate_count = kernel.candidate_count(shape);
+        let tile_token_ids = Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32);
+        let tile_logits = Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32);
+        let stream = Stream::new(device);
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_replay(
+            DSparkMarkovTopKMapShape {
+                sampling: shape,
+                base_logits_row_offset: 0,
+            },
+            DSparkMarkovTopKMapBuffers {
+                previous_token_ids: &previous_token_ids,
+                base_logits: &base_logits,
+                w1_weight: &w1_weight,
+                w1_scales: &w1_scales,
+                w1_biases: &w1_biases,
+                w2_weight: &w2_weight,
+                w2_scales: &w2_scales,
+                w2_biases: &w2_biases,
+                tile_token_ids: &tile_token_ids,
+                tile_logits: &tile_logits,
+            },
+        ));
+        let replay = builder.build();
+        let mut arguments = ReplayArguments::new();
+        kernel.add_replay_arguments(shape, rows, &mut arguments);
+        let replay = ReplayFixture {
+            stream,
+            replay,
+            arguments,
+        };
+        replay.run();
+        Self {
+            replay,
+            vocab_tile_size: kernel.vocab_tile_size(),
+        }
+    }
+
+    fn run(&self) {
+        self.replay.run();
+    }
+}
+
 enum TopKFixture {
     Sample(ReplayFixture),
     SparseDistribution(ReplayFixture),
@@ -197,6 +309,9 @@ impl TopKFixture {
             },
             BenchMode::RejectionSparse => {
                 panic!("rejection bench mode cannot build top-k fixture")
+            },
+            BenchMode::DSparkMarkovTopKMap => {
+                panic!("DSpark Markov bench mode cannot build generic top-k fixture")
             },
         }
     }
@@ -502,6 +617,16 @@ fn tile_count(shape: TopKSampleShape) -> usize {
     shape.num_total_sampling_inputs as usize * shape.vocab_size.div_ceil(256) as usize * shape.top_k as usize
 }
 
+fn affine_weight_bytes(vocab_size: u32, rank: u32, bits: u32) -> usize {
+    vocab_size as usize * rank as usize * bits as usize / 8
+}
+
+fn affine_param_buffer(device: &Device, vocab_size: u32, rank: u32, group_size: u32, value: f32) -> Buffer {
+    let len = vocab_size as usize * (rank / group_size) as usize;
+    let bits = half::bf16::from_f32(value).to_bits();
+    Buffer::from_slice(device, &vec![bits; len])
+}
+
 fn logits(rows: u32, vocab: u32) -> Vec<f32> {
     let mut values = Vec::with_capacity(rows as usize * vocab as usize);
     for row in 0..rows {
@@ -631,6 +756,36 @@ fn print_rejection_perf(
     );
 }
 
+fn print_dspark_markov_perf(
+    rows: u32,
+    top_k: u32,
+    config: DSparkMarkovTopKMapConfig,
+    vocab_tile_size: u32,
+    iters: usize,
+    samples: &[Duration],
+) {
+    let per_iter_us = sorted_per_iter_us(iters, samples);
+    println!(
+        "perf component=sampling case=dspark-markov-top-k-map rows={} top_k={} vocab={} markov_rank={} \
+         markov_w1_group_size={} markov_w1_bits={} markov_w2_group_size={} markov_w2_bits={} vocab_tile={} iters={} \
+         runs={} median_us={:.3} min_us={:.3} max_us={:.3}",
+        rows,
+        top_k,
+        config.vocab_size,
+        config.rank,
+        config.w1_group_size,
+        config.w1_bits,
+        config.w2_group_size,
+        config.w2_bits,
+        vocab_tile_size,
+        iters,
+        samples.len(),
+        median_of_sorted(&per_iter_us),
+        per_iter_us[0],
+        per_iter_us[per_iter_us.len() - 1]
+    );
+}
+
 fn sorted_per_iter_us(iters: usize, samples: &[Duration]) -> Vec<f64> {
     let mut per_iter_us = samples
         .iter()
@@ -676,8 +831,10 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, name: &str) -> String {
 fn print_help_and_exit() -> ! {
     println!(
         "sampling bench\n--mode \
-         top-k-sample|top-k-sparse-distribution|top-k-sample-and-sparse-distribution|rejection-sparse\n--rows \
-         1,4\n--num-reqs 1,4\n--spec-tokens 1,4\n--top-k 32\n--vocab 32768\n--iters 200 --warmup-iters 50 --runs 7"
+         top-k-sample|top-k-sparse-distribution|top-k-sample-and-sparse-distribution|rejection-sparse|\
+         dspark-markov-top-k-map\n--rows 1,4\n--num-reqs 1,4\n--spec-tokens 1,4\n--top-k 32\n--vocab \
+         32768\n--markov-rank 256\n--markov-w1-group-size 64\n--markov-w1-bits 4\n--markov-w2-group-size \
+         64\n--markov-w2-bits 8\n--iters 200 --warmup-iters 50 --runs 7"
     );
     std::process::exit(0);
 }

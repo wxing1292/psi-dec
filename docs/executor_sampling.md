@@ -16,9 +16,14 @@ crates/inference-executor-core/src/sampling/
   request_state.rs   executor-owned request-slot seed lifecycle
   top_k_sampling.rs  backend-neutral sampling shape and request parameters
 
+crates/inference-executor-core/src/model/qwen/v3_x/dspark/
+  reference.rs       CPU reference for sequential Markov correction and sampling
+
 crates/inference-backend-metal/src/components/
-  sampling.rs        Metal component shapes, buffers, kernels, and dispatch
+  sampling.rs                 generic Metal sampling and rejection components
+  dspark_markov_sampling.rs   fused DSpark Markov and tile-Top-K map component
   metal/sampling.metal
+  metal/dspark_markov_sampling.metal
 
 crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs       TopKSampling, parameter/scratch, and TopKSamplingOutputBuffers
@@ -128,8 +133,10 @@ The Qwen executor owns three distinct graph and cache stages:
 - `Replay<Qwen3xDSparkSampling>` handles DSpark Markov correction, sampling, and sparse draft storage.
 - `Replay<RejectionSampling>` handles target sparse-distribution generation and sparse rejection.
 
-These stages share one `Rc<TopKSampling>` implementation and its parameter and scratch buffers.
-They retain separate replay keys and programs.
+Main and MTP share one `Rc<TopKSampling>` implementation.
+DSpark owns its Markov runtime parameters, tile candidates, and per-step outputs.
+It reuses the generic sample-and-sparse-distribution reducer.
+The stages retain separate replay keys and programs.
 
 Main, MTP, and DSpark body token counts remain exact.
 The complete upstream model slice does not yet share an inactive-lane ABI.
@@ -137,12 +144,40 @@ MTP draft sampling is a distinct replay after MTP GatherUnembed.
 DSpark Markov sampling is a distinct replay after `Qwen3xDSparkGatherUnembed`.
 Sparse Main distributions and rejection form one Main-stage replay.
 
+One DSpark Markov step records two commands:
+
+```text
+DSparkMarkovTopKMap
+  previous sampled token
+  -> affine W1 row
+  -> affine W2 projection
+  -> add one base-logit row
+  -> 64-token tile-local Top-K
+
+TopKSampleAndSparseDistribution
+  -> global Top-K merge
+  -> top-p sampling
+  -> sampled token and sparse draft distribution
+```
+
+The sampled token from one reducer is the Markov input for the next map.
+The replay places a barrier at this dependency.
+A seven-token block records 14 commands in one submission.
+It does not materialize full-vocabulary Markov bias or corrected-logit buffers.
+
+The current fused map preserves the earlier BF16 storage boundaries.
+It dequantizes W1 to F32 and stores the latent row as BF16.
+It accumulates W2 in F32.
+It rounds the correction and corrected logit to BF16 before tile Top-K.
+Sampling probabilities use F32.
+
 ## Correctness and benchmarks
 
-CPU references define sampling and rejection math.
+CPU references define sampling, rejection, and sequential DSpark Markov math.
 Focused Metal tests compare fixed and random distributions with these references.
 They also compare mixed per-row parameters and deterministic seed/domain behavior.
 Sparse rejection tests cover accepted and rejected MTP and DSpark paths.
+The DSpark Markov parity test covers a padded replay bucket and non-contiguous request slots.
 GPU tests run serially under the repository Metal reservation/lock rules.
 
 Synthetic backend modes:
@@ -151,9 +186,15 @@ Synthetic backend modes:
 cargo bench -p inference-backend-metal --bench rejection_sampling -- \
   --mode top-k-sample --rows 1 --num-reqs 1 --spec-tokens 1 \
   --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-backend-metal --bench rejection_sampling -- \
+  --mode dspark-markov-top-k-map --rows 1 --top-k 20 --vocab 151936 \
+  --markov-rank 256 --markov-w1-group-size 64 --markov-w1-bits 4 \
+  --markov-w2-group-size 64 --markov-w2-bits 8 \
+  --iters 1 --warmup-iters 0 --runs 1
 ```
 
-Supported modes are `top-k-sample`, `top-k-sparse-distribution`, `top-k-sample-and-sparse-distribution`, and
-`rejection-sparse`.
-The model-executor target is `qwen35_sampling`.
+Supported modes are `top-k-sample`, `top-k-sparse-distribution`, `top-k-sample-and-sparse-distribution`,
+`rejection-sparse`, and `dspark-markov-top-k-map`.
+The model-executor targets are `qwen35_sampling` and `qwen3_dspark_sampling`.
 [`executor_benchmarks.md`](executor_benchmarks.md) defines shared measurement and provenance rules.

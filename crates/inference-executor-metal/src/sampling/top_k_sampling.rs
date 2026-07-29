@@ -208,7 +208,7 @@ struct TopKSampleForwardBuffers<'a> {
 struct TopKSamplingScratch {
     tile_token_ids: Buffer,
     tile_logits: Buffer,
-    runtime_params: Buffer,
+    runtime_params: TopKSamplingRuntimeParams,
 }
 
 impl TopKSamplingScratch {
@@ -217,47 +217,74 @@ impl TopKSamplingScratch {
         Self {
             tile_token_ids: Buffer::new_zeroed_elements(device, max_shape.tile_count(), Dtype::Int32),
             tile_logits: Buffer::new_zeroed_elements(device, max_shape.tile_count(), Dtype::Float32),
-            runtime_params: Buffer::new_zeroed_elements(
+            runtime_params: TopKSamplingRuntimeParams::new(device, bounds),
+        }
+    }
+}
+
+pub struct TopKSamplingRuntimeParams {
+    bounds: TopKSamplingBounds,
+    buffer: Buffer,
+    rows: RuntimeParamRows,
+}
+
+impl TopKSamplingRuntimeParams {
+    pub fn new(device: &Device, bounds: TopKSamplingBounds) -> Self {
+        bounds.validate();
+        Self {
+            bounds,
+            buffer: Buffer::new_zeroed_elements(
                 device,
-                (max_shape.num_total_sampling_inputs as usize)
+                (bounds.max_sampling_inputs as usize)
                     .checked_mul(6)
                     .expect("top-k sampling runtime parameter capacity must fit usize"),
                 Dtype::Uint32,
             ),
+            rows: RuntimeParamRows::default(),
         }
     }
 
-    fn set_configs(
-        &self,
-        bounds: TopKSamplingBounds,
-        configs: &[SamplerConfig],
-        sample_positions: &[u32],
-        domain: SamplingDomain,
-    ) {
+    pub fn set_configs(&self, configs: &[SamplerConfig], sample_positions: &[u32], domain: SamplingDomain) {
         assert_eq!(
             configs.len(),
             sample_positions.len(),
             "top-k sampling runtime configs must have one logical position per input"
         );
         assert!(
-            configs.len() <= self.runtime_params.len_bytes() / (6 * size_of::<u32>()),
+            configs.len() <= self.buffer.len_bytes() / (6 * size_of::<u32>()),
             "top-k sampling runtime inputs exceed capacity"
         );
         for (row, (config, &sample_position)) in configs.iter().zip(sample_positions).enumerate() {
-            self.runtime_params.write_typed(
+            self.buffer.write_typed(
                 row * 6,
                 &[
                     config.temperature.to_bits(),
                     config.top_p.to_bits(),
                     config.seed(),
                     sample_position,
-                    bounds
+                    self.bounds
                         .active_top_k(config)
                         .expect("top-k sampling config should fit sampler bounds"),
                     u32::from(domain),
                 ],
             );
         }
+        self.rows.set(configs.len(), "top-k sampling");
+    }
+
+    pub fn active_shape(&self, configs: &[SamplerConfig]) -> TopKSamplingShape {
+        self.bounds
+            .active_shape(configs)
+            .expect("top-k sampling config should fit sampler bounds")
+    }
+
+    pub fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
+    pub fn consume(&self, shape: TopKSamplingShape) {
+        validate_shape(self.bounds, shape);
+        self.rows.consume(shape.num_active_sampling_inputs, "top-k sampling");
     }
 }
 
@@ -300,7 +327,6 @@ pub struct TopKSampling {
     kernels: TopKSamplingKernels,
     bounds: TopKSamplingBounds,
     scratch: TopKSamplingScratch,
-    runtime_param_rows: RuntimeParamRows,
 }
 
 impl TopKSampling {
@@ -310,13 +336,13 @@ impl TopKSampling {
             kernels: TopKSamplingKernels::new(device),
             bounds,
             scratch: TopKSamplingScratch::new(device, bounds),
-            runtime_param_rows: RuntimeParamRows::default(),
         }
     }
 
     pub fn set_configs(&self, configs: &[SamplerConfig], sample_positions: &[u32], domain: SamplingDomain) {
-        self.scratch.set_configs(self.bounds, configs, sample_positions, domain);
-        self.runtime_param_rows.set(configs.len(), "top-k sampling");
+        self.scratch
+            .runtime_params
+            .set_configs(configs, sample_positions, domain);
     }
 
     pub fn record<'a>(
@@ -337,7 +363,7 @@ impl TopKSampling {
                 tile_logits: &self.scratch.tile_logits,
                 token_ids: output.sampled_token_ids,
                 token_probs: output.sampled_token_probs,
-                runtime_params: &self.scratch.runtime_params,
+                runtime_params: self.scratch.runtime_params.buffer(),
             },
         );
     }
@@ -360,7 +386,7 @@ impl TopKSampling {
                 tile_logits: &self.scratch.tile_logits,
                 token_ids: output.sampled_token_ids,
                 token_probs: output.sampled_token_probs,
-                runtime_params: &self.scratch.runtime_params,
+                runtime_params: self.scratch.runtime_params.buffer(),
             },
         );
     }
@@ -383,7 +409,7 @@ impl TopKSampling {
                 tile_logits: &self.scratch.tile_logits,
                 token_ids: &self.scratch.tile_token_ids,
                 token_probs: &self.scratch.tile_logits,
-                runtime_params: &self.scratch.runtime_params,
+                runtime_params: self.scratch.runtime_params.buffer(),
             },
             output,
         );
@@ -408,67 +434,67 @@ impl TopKSampling {
                 tile_logits: &self.scratch.tile_logits,
                 token_ids: sample_output.sampled_token_ids,
                 token_probs: sample_output.sampled_token_probs,
-                runtime_params: &self.scratch.runtime_params,
+                runtime_params: self.scratch.runtime_params.buffer(),
             },
             sparse_distribution_output,
         );
     }
 
     pub fn active_shape(&self, configs: &[SamplerConfig]) -> TopKSamplingShape {
-        self.bounds
-            .active_shape(configs)
-            .expect("top-k sampling config should fit sampler bounds")
+        self.scratch.runtime_params.active_shape(configs)
     }
 
     pub fn add_replay_arguments(&self, shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
         self.validate_input(shape);
-        self.runtime_param_rows
-            .consume(shape.num_active_sampling_inputs, "top-k sampling");
-        if shape.num_total_sampling_inputs > 1 {
-            let num_tiles = shape.vocab_size.div_ceil(TOP_K_VOCAB_TILE_SIZE);
-            let tile_num_active_threads = shape
-                .num_active_sampling_inputs
-                .checked_mul(num_tiles)
-                .and_then(|threads| threads.checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK))
-                .expect("top-k tile active thread count must fit u32");
-            let tile_num_total_threads = shape
-                .num_total_sampling_inputs
-                .checked_mul(num_tiles)
-                .and_then(|threads| threads.checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK))
-                .expect("top-k tile total thread count must fit u32");
-            assert!(tile_num_active_threads <= tile_num_total_threads);
-            assert_eq!(tile_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
-            arguments.set_shared_u32(TOP_K_TILE_NUM_ACTIVE_THREADS_KEY, tile_num_active_threads);
-
-            let merge_num_active_threads = shape
-                .num_active_sampling_inputs
-                .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
-                .expect("top-k merge active thread count must fit u32");
-            let merge_num_total_threads = shape
-                .num_total_sampling_inputs
-                .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
-                .expect("top-k merge total thread count must fit u32");
-            assert!(merge_num_active_threads <= merge_num_total_threads);
-            assert_eq!(merge_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
-            arguments.set_shared_u32(TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY, merge_num_active_threads);
-        }
+        self.scratch.runtime_params.consume(shape);
+        add_top_k_sampling_replay_arguments(shape, arguments);
     }
 
     fn validate_input(&self, shape: TopKSamplingShape) {
-        assert!(
-            shape.num_total_sampling_inputs <= self.bounds.max_sampling_inputs,
-            "top-k sampling total inputs exceed capacity"
-        );
-        assert!(shape.num_active_sampling_inputs <= shape.num_total_sampling_inputs);
-        assert_eq!(
-            shape.vocab_size, self.bounds.vocab_size,
-            "top-k sampling vocab must match capacity"
-        );
-        assert!(
-            shape.top_k > 0 && shape.top_k <= self.bounds.top_k,
-            "top-k sampling width exceeds capacity"
-        );
+        validate_shape(self.bounds, shape);
     }
+}
+
+fn add_top_k_sampling_replay_arguments(shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
+    add_top_k_sampling_tile_replay_argument(shape, arguments);
+    add_top_k_sampling_merge_replay_argument(shape, arguments);
+}
+
+fn add_top_k_sampling_tile_replay_argument(shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
+    if shape.num_total_sampling_inputs <= 1 {
+        return;
+    }
+    let num_tiles = shape.vocab_size.div_ceil(TOP_K_VOCAB_TILE_SIZE);
+    let tile_num_active_threads = shape
+        .num_active_sampling_inputs
+        .checked_mul(num_tiles)
+        .and_then(|threads| threads.checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK))
+        .expect("top-k tile active thread count must fit u32");
+    let tile_num_total_threads = shape
+        .num_total_sampling_inputs
+        .checked_mul(num_tiles)
+        .and_then(|threads| threads.checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK))
+        .expect("top-k tile total thread count must fit u32");
+    assert!(tile_num_active_threads <= tile_num_total_threads);
+    assert_eq!(tile_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
+    arguments.set_u32(TOP_K_TILE_NUM_ACTIVE_THREADS_KEY, tile_num_active_threads);
+}
+
+pub fn add_top_k_sampling_merge_replay_argument(shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
+    if shape.num_total_sampling_inputs <= 1 {
+        return;
+    }
+    let merge_num_active_threads = shape
+        .num_active_sampling_inputs
+        .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
+        .expect("top-k merge active thread count must fit u32");
+    let merge_num_total_threads = shape
+        .num_total_sampling_inputs
+        .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
+        .expect("top-k merge total thread count must fit u32");
+    assert!(merge_num_active_threads <= merge_num_total_threads);
+    assert_eq!(merge_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
+    arguments.set_u32(TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY, merge_num_active_threads);
 }
 
 #[derive(Clone, Copy)]
@@ -517,6 +543,22 @@ fn component_shape(shape: TopKSamplingShape) -> TopKSampleShape {
         vocab_size: shape.vocab_size,
         top_k: shape.top_k,
     }
+}
+
+fn validate_shape(bounds: TopKSamplingBounds, shape: TopKSamplingShape) {
+    assert!(
+        shape.num_total_sampling_inputs <= bounds.max_sampling_inputs,
+        "top-k sampling total inputs exceed capacity"
+    );
+    assert!(shape.num_active_sampling_inputs <= shape.num_total_sampling_inputs);
+    assert_eq!(
+        shape.vocab_size, bounds.vocab_size,
+        "top-k sampling vocab must match capacity"
+    );
+    assert!(
+        shape.top_k > 0 && shape.top_k <= bounds.top_k,
+        "top-k sampling width exceeds capacity"
+    );
 }
 
 fn uses_reduction_tile_pipeline(top_k: u32) -> bool {

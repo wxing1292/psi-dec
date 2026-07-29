@@ -41,16 +41,6 @@ impl ReplayArguments {
         );
     }
 
-    pub fn set_shared_u32(&mut self, key: ReplayParameterKey, value: u32) {
-        if let Some(previous) = self.values.insert(key, value) {
-            assert_eq!(
-                previous, value,
-                "Metal shared replay argument {:?} has conflicting values",
-                key
-            );
-        }
-    }
-
     pub fn with_u32(mut self, key: ReplayParameterKey, value: u32) -> Self {
         self.set_u32(key, value);
         self
@@ -214,7 +204,6 @@ fn align_up(value: usize, alignment: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::CommandParameterLayoutBuilder;
-    use super::ReplayArguments;
     use super::ReplayParameterKey;
 
     const NUM_ACTIVE_THREADS: ReplayParameterKey = ReplayParameterKey::new("test.num_active_threads");
@@ -227,22 +216,5 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(builder.build().replay_parameter_table.len(), 1);
-    }
-
-    #[test]
-    fn test_shared_argument_accepts_the_same_value() {
-        let mut arguments = ReplayArguments::new();
-
-        arguments.set_shared_u32(NUM_ACTIVE_THREADS, 64);
-        arguments.set_shared_u32(NUM_ACTIVE_THREADS, 64);
-    }
-
-    #[test]
-    #[should_panic(expected = "has conflicting values")]
-    fn test_shared_argument_rejects_a_different_value() {
-        let mut arguments = ReplayArguments::new();
-
-        arguments.set_shared_u32(NUM_ACTIVE_THREADS, 64);
-        arguments.set_shared_u32(NUM_ACTIVE_THREADS, 128);
     }
 }

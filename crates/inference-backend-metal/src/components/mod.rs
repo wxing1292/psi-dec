@@ -231,6 +231,12 @@ pub use sampling::TopKTileBitonicKernel;
 pub use sampling::TopKTileBuffers;
 pub use sampling::TopKTileKernel;
 
+mod dspark_markov_sampling;
+pub use dspark_markov_sampling::DSparkMarkovTopKMapBuffers;
+pub use dspark_markov_sampling::DSparkMarkovTopKMapConfig;
+pub use dspark_markov_sampling::DSparkMarkovTopKMapKernel;
+pub use dspark_markov_sampling::DSparkMarkovTopKMapShape;
+
 mod silu;
 pub use silu::SiluBufferOffsets;
 pub use silu::SiluBuffers;
