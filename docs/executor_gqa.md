@@ -765,6 +765,20 @@ benchmark or expose direct-submit component or forward wiring.
 It measures the dense block-bidirectional map contribution used by DSpark.
 It does not measure history attention, partial reduction, projections, or a DSpark layer.
 
+One block-SDPA Task owns one Q token and one Q head.
+The backend uses one 32-thread SIMDgroup for the Task.
+For `head_dim=128`, each thread keeps four F32 Q values and one dot-product accumulator.
+The logical Q register payload is 16 bytes per thread.
+The SIMDgroup computes each Q/K dot product across the head dimension.
+It then computes four output dimensions per thread.
+
+For the seven-token DSpark block, the kernel uses 28 bytes of static shared memory for seven F32 logits.
+It does not allocate a shared reduction array.
+Kernel construction checks the pipeline SIMD width, the pipeline thread limit, and the device shared-memory limit.
+Metal does not expose the compiler register allocation.
+The backend therefore uses the source-level live-value count and the production-shape benchmark to validate register
+pressure.
+
 Metal backend real full-forward replay bench lives in:
 
 ```text

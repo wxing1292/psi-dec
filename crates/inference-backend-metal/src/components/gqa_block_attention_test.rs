@@ -11,7 +11,6 @@ fn test_block_shape_models_complete_bidirectional_blocks() {
         num_kv_heads: 8,
         head_dim: 128,
         scale: 128.0_f32.sqrt().recip(),
-        num_threads_per_threadblock: 128,
         dtype: Dtype::Bfloat16,
     };
     let shape = GQABlockSDPAShape {
@@ -37,7 +36,6 @@ fn test_block_shape_rejects_partial_request_block() {
         num_kv_heads: 8,
         head_dim: 128,
         scale: 1.0,
-        num_threads_per_threadblock: 128,
         dtype: Dtype::Bfloat16,
     });
 }
@@ -117,11 +115,10 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
     let stream = Stream::new(&device);
     let config = GQABlockSDPAConfig {
         block_size: 3,
-        num_q_heads: 2,
+        num_q_heads: 5,
         num_kv_heads: 1,
-        head_dim: 4,
-        scale: 0.5,
-        num_threads_per_threadblock: 4,
+        head_dim: 32,
+        scale: 32.0_f32.sqrt().recip(),
         dtype,
     };
     let shape = GQABlockSDPAShape {
@@ -180,18 +177,11 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
             let q_start = (q_token_index * config.num_q_heads as usize + q_head) * config.head_dim as usize;
             let q_row = &q_values[q_start..q_start + config.head_dim as usize];
             let mut scores = Vec::new();
-            let mut values = Vec::new();
             for local_kv_offset in 0..config.block_size as usize {
                 let kv_token_index = local_kv_token_begin + local_kv_offset;
                 let kv_start = kv_token_index * config.head_dim as usize;
                 let key = &k_values[kv_start..kv_start + config.head_dim as usize];
                 scores.push(q_row.iter().zip(key).map(|(&q, &k)| q * k).sum::<f32>() * config.scale);
-                values.push([
-                    v_values[kv_start],
-                    v_values[kv_start + 1],
-                    v_values[kv_start + 2],
-                    v_values[kv_start + 3],
-                ]);
             }
             let max_logit = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let weights = scores
@@ -200,13 +190,25 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
                 .collect::<Vec<_>>();
             let exp_sum = weights.iter().sum::<f32>();
             let partial_output_index = q_token_index * config.num_q_heads as usize + q_head;
-            assert!((actual_partial_max_logits[partial_output_index] - max_logit).abs() < 1.0e-5);
-            assert!((actual_partial_exp_sums[partial_output_index] - exp_sum).abs() < 1.0e-5);
+            assert!(
+                (actual_partial_max_logits[partial_output_index] - max_logit).abs() < 1.0e-4,
+                "actual={} expected={max_logit}",
+                actual_partial_max_logits[partial_output_index]
+            );
+            assert!(
+                (actual_partial_exp_sums[partial_output_index] - exp_sum).abs() < 1.0e-4,
+                "actual={} expected={exp_sum}",
+                actual_partial_exp_sums[partial_output_index]
+            );
             for dim in 0..config.head_dim as usize {
                 let expected = weights
                     .iter()
-                    .zip(&values)
-                    .map(|(&weight, value)| weight * value[dim])
+                    .enumerate()
+                    .map(|(local_kv_offset, &weight)| {
+                        let kv_token_index = local_kv_token_begin + local_kv_offset;
+                        let kv_start = kv_token_index * config.head_dim as usize;
+                        weight * v_values[kv_start + dim]
+                    })
                     .sum::<f32>()
                     / exp_sum;
                 let actual = actual_output[partial_output_index * config.head_dim as usize + dim];

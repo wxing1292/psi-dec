@@ -9,6 +9,8 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 
 const GQA_BLOCK_SDPA_SOURCE: &str = include_str!("metal/gqa_block_sdpa.metal");
+const SIMD_WIDTH: u32 = 32;
+const NUM_THREADS_PER_THREADBLOCK: u32 = SIMD_WIDTH;
 
 /// Dense request-block SDPA that writes one `SDPAPartialOutput` into the
 /// `SDPAMapTaskTemplate` slot selected for each Q token. One threadblock owns
@@ -21,7 +23,6 @@ pub struct GQABlockSDPAConfig {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub scale: f32,
-    pub num_threads_per_threadblock: u32,
     pub dtype: Dtype,
 }
 
@@ -33,7 +34,11 @@ impl GQABlockSDPAConfig {
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         assert!(self.head_dim > 0);
         assert!(self.scale.is_finite() && self.scale > 0.0);
-        assert!(self.num_threads_per_threadblock.is_power_of_two() && self.num_threads_per_threadblock <= 256);
+        assert_eq!(
+            self.head_dim % SIMD_WIDTH,
+            0,
+            "GQA block SDPA head_dim must be divisible by the SIMD width"
+        );
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
@@ -78,13 +83,13 @@ impl GQABlockSDPAConfig {
             &[
                 shape.num_tokens as usize,
                 self.num_q_heads as usize,
-                self.num_threads_per_threadblock as usize,
+                NUM_THREADS_PER_THREADBLOCK as usize,
             ],
         )
     }
 
     fn threadblock_memory_bytes(self) -> usize {
-        (self.block_size as usize + self.num_threads_per_threadblock as usize)
+        (self.block_size as usize)
             .checked_mul(size_of::<f32>())
             .expect("GQA block SDPA threadblock memory must fit usize")
     }
@@ -131,7 +136,6 @@ pub struct GQABlockSDPABuffers<'a> {
 pub struct GQABlockSDPAKernel {
     config: GQABlockSDPAConfig,
     kernel: Kernel,
-    max_threadblock_memory_length: usize,
 }
 
 impl GQABlockSDPAKernel {
@@ -142,11 +146,32 @@ impl GQABlockSDPAKernel {
             Dtype::Bfloat16 => "gqa_block_sdpa_bf16",
             dtype => panic!("unsupported GQA block SDPA dtype {dtype:?}"),
         };
-        Self {
-            config,
-            kernel: Kernel::new(device, &block_sdpa_source(config), function_name),
-            max_threadblock_memory_length: device.max_threadblock_memory_length(),
-        }
+        let kernel = Kernel::new(device, &block_sdpa_source(config), function_name);
+        assert_eq!(
+            kernel.thread_execution_width(),
+            SIMD_WIDTH as usize,
+            "GQA block SDPA requires a 32-thread SIMDgroup"
+        );
+        assert!(
+            NUM_THREADS_PER_THREADBLOCK as usize <= kernel.max_total_threads_per_threadblock(),
+            "GQA block SDPA requires {} threads per threadblock but the pipeline supports {}",
+            NUM_THREADS_PER_THREADBLOCK,
+            kernel.max_total_threads_per_threadblock()
+        );
+        let max_threadblock_memory_length = device.max_threadblock_memory_length();
+        assert!(
+            config.threadblock_memory_bytes() <= max_threadblock_memory_length,
+            "GQA block SDPA requires {} bytes of threadblock memory but the device supports {}",
+            config.threadblock_memory_bytes(),
+            max_threadblock_memory_length
+        );
+        assert!(
+            kernel.static_threadblock_memory_length() <= max_threadblock_memory_length,
+            "GQA block SDPA pipeline uses {} bytes of static threadblock memory but the device supports {}",
+            kernel.static_threadblock_memory_length(),
+            max_threadblock_memory_length
+        );
+        Self { config, kernel }
     }
 
     pub fn invoke<'a>(
@@ -157,7 +182,6 @@ impl GQABlockSDPAKernel {
         GQABlockSDPAInvocation {
             config: self.config,
             kernel: &self.kernel,
-            max_threadblock_memory_length: self.max_threadblock_memory_length,
             shape,
             buffers,
         }
@@ -168,13 +192,15 @@ fn block_sdpa_source(config: GQABlockSDPAConfig) -> String {
     let constants = format!(
         "using namespace metal;\n\nconstant uint block_size = {}u;\nconstant uint num_q_heads = {}u;\nconstant uint \
          num_kv_heads = {}u;\nconstant uint head_dim = {}u;\nconstant float attention_scale = {:.9e}f;\nconstant uint \
-         num_threads_per_threadblock = {}u;",
+         num_threads_per_threadblock = {}u;\nconstant uint simd_width = {}u;\nconstant uint q_values_per_thread = \
+         head_dim / simd_width;",
         config.block_size,
         config.num_q_heads,
         config.num_kv_heads,
         config.head_dim,
         config.scale,
-        config.num_threads_per_threadblock,
+        NUM_THREADS_PER_THREADBLOCK,
+        SIMD_WIDTH,
     );
     GQA_BLOCK_SDPA_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
@@ -182,7 +208,6 @@ fn block_sdpa_source(config: GQABlockSDPAConfig) -> String {
 pub struct GQABlockSDPAInvocation<'a> {
     config: GQABlockSDPAConfig,
     kernel: &'a Kernel,
-    max_threadblock_memory_length: usize,
     shape: GQABlockSDPAShape,
     buffers: GQABlockSDPABuffers<'a>,
 }
@@ -201,7 +226,7 @@ impl Operator for GQABlockSDPAInvocation<'_> {
         builder.set_u32(7, self.shape.num_tokens);
         builder.dispatch_1d(
             self.config.dispatch_threads(self.shape),
-            self.config.num_threads_per_threadblock as usize,
+            NUM_THREADS_PER_THREADBLOCK as usize,
         );
     }
 }
@@ -228,12 +253,6 @@ impl GQABlockSDPAInvocation<'_> {
         assert!(
             self.buffers.partial_output.len_bytes()
                 >= bytes(self.config.partial_output_values(self.shape), self.config.dtype,)
-        );
-        assert!(
-            self.config.threadblock_memory_bytes() <= self.max_threadblock_memory_length,
-            "GQA block SDPA requires {} bytes of threadblock memory but device only supports {}",
-            self.config.threadblock_memory_bytes(),
-            self.max_threadblock_memory_length
         );
     }
 }

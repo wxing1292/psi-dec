@@ -28,7 +28,6 @@ fn main() {
                     args.num_q_heads,
                     args.num_kv_heads,
                     args.head_dim,
-                    args.num_threads_per_threadblock,
                     dtype,
                 );
                 let setup_elapsed = setup_start.elapsed();
@@ -49,7 +48,6 @@ struct Args {
     num_q_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
-    num_threads_per_threadblock: u32,
     dtypes: Vec<Dtype>,
     warmup_iters: usize,
     iters: usize,
@@ -64,7 +62,6 @@ impl Args {
             num_q_heads: 40,
             num_kv_heads: 8,
             head_dim: 128,
-            num_threads_per_threadblock: 128,
             dtypes: vec![Dtype::Bfloat16],
             warmup_iters: 20,
             iters: 100,
@@ -79,9 +76,6 @@ impl Args {
                 "--num-q-heads" => args.num_q_heads = parse_u32(&next_arg(&mut values, &arg), &arg),
                 "--num-kv-heads" => args.num_kv_heads = parse_u32(&next_arg(&mut values, &arg), &arg),
                 "--head-dim" => args.head_dim = parse_u32(&next_arg(&mut values, &arg), &arg),
-                "--threads" => {
-                    args.num_threads_per_threadblock = parse_u32(&next_arg(&mut values, &arg), &arg);
-                },
                 "--dtypes" => args.dtypes = parse_dtypes(&next_arg(&mut values, &arg)),
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--iters" => args.iters = parse_usize(&next_arg(&mut values, &arg), &arg),
@@ -117,7 +111,6 @@ struct Fixture {
     num_q_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
-    num_threads_per_threadblock: u32,
     dtype: Dtype,
 }
 
@@ -130,7 +123,6 @@ impl Fixture {
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
-        num_threads_per_threadblock: u32,
         dtype: Dtype,
     ) -> Self {
         let num_tokens = num_requests
@@ -146,7 +138,6 @@ impl Fixture {
             num_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            num_threads_per_threadblock,
             dtype,
         };
         let shape = GQABlockSDPAShape {
@@ -210,7 +201,6 @@ impl Fixture {
             num_q_heads,
             num_kv_heads,
             head_dim,
-            num_threads_per_threadblock,
             dtype,
         }
     }
@@ -253,8 +243,8 @@ fn print_result(
     per_iteration_us.sort_by(f64::total_cmp);
     println!(
         "perf component=gqa-block-sdpa backend=metal operation=block-bidi-map dtype={} num_requests={} block_size={} \
-         num_tokens={} num_q_heads={} num_kv_heads={} head_dim={} threads={} setup_us={:.3} cache_miss_us={:.3} \
-         iters={} runs={} median_us={:.3} samples_us={:?}",
+         num_tokens={} num_q_heads={} num_kv_heads={} head_dim={} setup_us={:.3} cache_miss_us={:.3} iters={} runs={} \
+         median_us={:.3} samples_us={:?}",
         dtype_name(fixture.dtype),
         fixture.num_requests,
         fixture.block_size,
@@ -262,7 +252,6 @@ fn print_result(
         fixture.num_q_heads,
         fixture.num_kv_heads,
         fixture.head_dim,
-        fixture.num_threads_per_threadblock,
         setup_elapsed.as_secs_f64() * 1.0e6,
         cache_miss_elapsed.as_secs_f64() * 1.0e6,
         iters,
@@ -347,8 +336,8 @@ fn next_arg(values: &mut impl Iterator<Item = String>, flag: &str) -> String {
 fn print_help_and_exit() -> ! {
     let executable = PathBuf::from(std::env::args().next().unwrap_or_else(|| "gqa_block_attn".to_string()));
     println!(
-        "{}\n--block-sizes 7\n--num-requests 1,4\n--num-q-heads 40\n--num-kv-heads 8\n--head-dim 128\n--threads \
-         128\n--dtypes bf16,f32\n--warmup-iters N\n--iters N\n--runs N",
+        "{}\n--block-sizes 7\n--num-requests 1,4\n--num-q-heads 40\n--num-kv-heads 8\n--head-dim 128\n--dtypes \
+         bf16,f32\n--warmup-iters N\n--iters N\n--runs N",
         executable.display()
     );
     std::process::exit(0);

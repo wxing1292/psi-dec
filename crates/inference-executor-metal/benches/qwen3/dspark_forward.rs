@@ -60,27 +60,54 @@ fn main() {
         main.num_tokens, dspark.num_tokens,
         "Main and DSpark comparison rows must match"
     );
+    let measurement = Measurement {
+        warmup_iters: args.warmup_iters,
+        iters: args.iters,
+        runs: args.runs,
+    };
 
     measure_and_print(
-        "main",
-        main.num_tokens,
-        args.num_requests,
-        args.context,
+        ForwardCase {
+            name: "main",
+            num_tokens: main.num_tokens,
+            num_requests: args.num_requests,
+            context: args.context,
+        },
         main.num_layers,
-        args.warmup_iters,
-        args.iters,
-        args.runs,
+        measurement,
         || main.run(),
     );
+    measure_segment_and_print(
+        ForwardCase {
+            name: "dspark",
+            num_tokens: dspark.num_tokens,
+            num_requests: args.num_requests,
+            context: args.context,
+        },
+        "embed",
+        measurement,
+        || dspark.run_embed(),
+    );
+    measure_segment_and_print(
+        ForwardCase {
+            name: "dspark",
+            num_tokens: dspark.num_tokens,
+            num_requests: args.num_requests,
+            context: args.context,
+        },
+        "forward",
+        measurement,
+        || dspark.run_forward(),
+    );
     measure_and_print(
-        "dspark",
-        dspark.num_tokens,
-        args.num_requests,
-        args.context,
+        ForwardCase {
+            name: "dspark",
+            num_tokens: dspark.num_tokens,
+            num_requests: args.num_requests,
+            context: args.context,
+        },
         dspark.num_layers,
-        args.warmup_iters,
-        args.iters,
-        args.runs,
+        measurement,
         || dspark.run(),
     );
 }
@@ -268,7 +295,7 @@ struct DSparkFixture {
     _model: Rc<Qwen3xDSparkModel>,
     _gqa_state: UngatedDSparkGQAState,
     _token_ids: Buffer,
-    _hidden_input: Buffer,
+    hidden_input: Buffer,
     _pages: PageArena,
 }
 
@@ -427,9 +454,23 @@ impl DSparkFixture {
             _model: model,
             _gqa_state: gqa_state,
             _token_ids: token_ids,
-            _hidden_input: hidden_input,
+            hidden_input,
             _pages: pages,
         }
+    }
+
+    fn run_embed(&self) -> Duration {
+        let replay_start = Instant::now();
+        self.runtime.stream().submit_replay(&self.embed_replay).wait();
+        black_box(&self.hidden_input);
+        replay_start.elapsed()
+    }
+
+    fn run_forward(&self) -> Duration {
+        let replay_start = Instant::now();
+        self.runtime.stream().submit_replay(&self.forward_replay).wait();
+        black_box(&self.output);
+        replay_start.elapsed()
     }
 
     fn run(&self) -> Duration {
@@ -565,35 +606,80 @@ fn request_slots(num_requests: usize) -> Vec<u32> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn measure_and_print(
-    case: &str,
+#[derive(Clone, Copy)]
+struct ForwardCase {
+    name: &'static str,
     num_tokens: usize,
     num_requests: usize,
     context: u32,
-    num_layers: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Measurement {
     warmup_iters: usize,
     iters: usize,
     runs: usize,
+}
+
+fn measure_and_print(
+    case: ForwardCase,
+    num_layers: usize,
+    measurement: Measurement,
     mut run: impl FnMut() -> Duration,
 ) {
     let cache_miss = run();
-    for _ in 0..warmup_iters {
+    for _ in 0..measurement.warmup_iters {
         let _ = run();
     }
-    let samples = (0..runs).map(|_| (0..iters).map(|_| run()).sum()).collect::<Vec<_>>();
+    let samples = (0..measurement.runs)
+        .map(|_| (0..measurement.iters).map(|_| run()).sum())
+        .collect::<Vec<_>>();
     let median = median_duration(samples);
     println!(
-        "perf component=qwen3-dspark-forward case={case} num_requests={num_requests} num_tokens={num_tokens} \
-         context={context} num_layers={num_layers} operation=embed-forward cache_miss_us={:.3} warmup_iters={} \
-         iters={} runs={} median_us={:.3} per_iter_us={:.3} per_layer_us={:.3}",
+        "perf component=qwen3-dspark-forward case={} num_requests={} num_tokens={} context={} num_layers={num_layers} \
+         operation=embed-forward cache_miss_us={:.3} warmup_iters={} iters={} runs={} median_us={:.3} \
+         per_iter_us={:.3} per_layer_us={:.3}",
+        case.name,
+        case.num_requests,
+        case.num_tokens,
+        case.context,
         cache_miss.as_secs_f64() * 1.0e6,
-        warmup_iters,
-        iters,
-        runs,
+        measurement.warmup_iters,
+        measurement.iters,
+        measurement.runs,
         median.as_secs_f64() * 1.0e6,
-        median.as_secs_f64() * 1.0e6 / iters as f64,
-        median.as_secs_f64() * 1.0e6 / iters as f64 / num_layers as f64,
+        median.as_secs_f64() * 1.0e6 / measurement.iters as f64,
+        median.as_secs_f64() * 1.0e6 / measurement.iters as f64 / num_layers as f64,
+    );
+}
+
+fn measure_segment_and_print(
+    case: ForwardCase,
+    operation: &str,
+    measurement: Measurement,
+    mut run: impl FnMut() -> Duration,
+) {
+    let cache_miss = run();
+    for _ in 0..measurement.warmup_iters {
+        let _ = run();
+    }
+    let samples = (0..measurement.runs)
+        .map(|_| (0..measurement.iters).map(|_| run()).sum())
+        .collect::<Vec<_>>();
+    let median = median_duration(samples);
+    println!(
+        "perf component=qwen3-dspark-forward case={} num_requests={} num_tokens={} context={} operation={operation} \
+         cache_miss_us={:.3} warmup_iters={} iters={} runs={} median_us={:.3} per_iter_us={:.3}",
+        case.name,
+        case.num_requests,
+        case.num_tokens,
+        case.context,
+        cache_miss.as_secs_f64() * 1.0e6,
+        measurement.warmup_iters,
+        measurement.iters,
+        measurement.runs,
+        median.as_secs_f64() * 1.0e6,
+        median.as_secs_f64() * 1.0e6 / measurement.iters as f64,
     );
 }
 

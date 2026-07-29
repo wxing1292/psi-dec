@@ -88,7 +88,6 @@ impl UngatedDSparkGQA {
                         .expect("DSpark GQA KV-head count must fit u32"),
                     head_dim: attention.head_dim.try_into().expect("DSpark GQA head_dim must fit u32"),
                     scale: attention.scale,
-                    num_threads_per_threadblock: metal.single_q_token_num_threads_per_threadblock,
                     dtype: metal.dtype,
                 },
             ),
