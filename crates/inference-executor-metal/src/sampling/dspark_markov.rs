@@ -10,8 +10,8 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMarkovWeightBindings;
@@ -56,15 +56,10 @@ struct DSparkMarkovWeights {
 pub struct DSparkMarkovSampling {
     block_size: usize,
     max_requests: usize,
-    rank: u32,
-    vocab_size: u32,
     w1_config: QuantizedEmbeddingConfig,
-    w2_group_size: u32,
-    w2_bits: u32,
     weights: DSparkMarkovWeights,
     w1: QuantizedEmbeddingKernel,
-    w2_qmv: AffineQuantizedMatmulKernel,
-    w2_qmm: AffineQuantizedMatmulKernel,
+    w2: AffineQuantizedMatmul,
     add_bias: RowwiseAddKernel,
     anchor_token_ids: Buffer,
     latent: Buffer,
@@ -110,12 +105,12 @@ impl DSparkMarkovSampling {
             hidden_dim: rank,
             group_size: plan.markov_w1.group_size,
             bits: plan.markov_w1.bits,
-            affine_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         };
         w1_config.validate();
         let weights = DSparkMarkovWeights::load(device, store, plan, bindings, w1_config)?;
-        let qmm_rows = qmv_batch_limit(rank, vocab_size);
+        let w2_config = w2_config(plan);
         let mut step_samplers = Vec::with_capacity(plan.block_size);
         let mut step_outputs = Vec::with_capacity(plan.block_size);
         let mut step_distribution_indices = Vec::with_capacity(plan.block_size);
@@ -133,15 +128,10 @@ impl DSparkMarkovSampling {
         Ok(Self {
             block_size: plan.block_size,
             max_requests,
-            rank,
-            vocab_size,
             w1_config,
-            w2_group_size: plan.markov_w2.group_size,
-            w2_bits: plan.markov_w2.bits,
             weights,
             w1: QuantizedEmbeddingKernel::new(device, w1_config),
-            w2_qmv: AffineQuantizedMatmulKernel::new(device, w2_shape(plan, 1)),
-            w2_qmm: AffineQuantizedMatmulKernel::new(device, w2_shape(plan, qmm_rows)),
+            w2: AffineQuantizedMatmul::new(device, w2_config),
             add_bias: RowwiseAddKernel::new(
                 device,
                 RowwiseAddConfig {
@@ -234,11 +224,6 @@ impl DSparkMarkovSampling {
     {
         assert!(shape.num_requests > 0 && shape.num_requests as usize <= self.max_requests);
         assert_eq!(shape.sampling.num_active_sampling_inputs, shape.num_requests);
-        let w2 = if shape.num_requests >= qmv_batch_limit(self.rank, self.vocab_size) {
-            &self.w2_qmm
-        } else {
-            &self.w2_qmv
-        };
         for step_index in 0..self.block_size {
             let previous_token_ids = if step_index == 0 {
                 &self.anchor_token_ids
@@ -257,19 +242,24 @@ impl DSparkMarkovSampling {
                     output: &self.latent,
                 },
             )));
-            recorder.record_with_barrier_before(ReplayOp::opaque(w2.invoke_with_shape(
-                self.w2_shape(shape.num_requests),
-                &self.bias_logits,
-                0,
-                &self.latent,
-                0,
-                &self.weights.w2_weight,
-                0,
-                &self.weights.w2_scales,
-                0,
-                &self.weights.w2_biases,
-                0,
-            )));
+            recorder.record_with_barrier_before(ReplayOp::opaque(
+                self.w2.invoke(
+                    shape
+                        .num_requests
+                        .try_into()
+                        .expect("DSpark Markov request count must fit i32"),
+                    &self.bias_logits,
+                    0,
+                    &self.latent,
+                    0,
+                    &self.weights.w2_weight,
+                    0,
+                    &self.weights.w2_scales,
+                    0,
+                    &self.weights.w2_biases,
+                    0,
+                ),
+            ));
             recorder.record_with_barrier_before(ReplayOp::opaque(
                 self.add_bias.invoke(
                     RowwiseAddShape {
@@ -340,19 +330,6 @@ impl DSparkMarkovSampling {
         }
         DSparkProposal { token_ids, token_probs }
     }
-
-    fn w2_shape(&self, num_requests: u32) -> AffineQuantizedMatmulShape {
-        AffineQuantizedMatmulShape::same_dtype(
-            num_requests.try_into().expect("DSpark Markov rows must fit i32"),
-            self.vocab_size.try_into().expect("DSpark vocabulary must fit i32"),
-            self.rank.try_into().expect("DSpark Markov rank must fit i32"),
-            self.w2_group_size
-                .try_into()
-                .expect("DSpark Markov group size must fit i32"),
-            self.w2_bits.try_into().expect("DSpark Markov bits must fit i32"),
-            Dtype::Bfloat16,
-        )
-    }
 }
 
 impl DSparkMarkovWeights {
@@ -374,20 +351,20 @@ impl DSparkMarkovWeights {
         validate_len("DSpark Markov W1 scales", w1_scales.len(), w1_affine_bytes)?;
         validate_len("DSpark Markov W1 biases", w1_biases.len(), w1_affine_bytes)?;
 
-        let w2_shape = w2_shape(plan, 1);
+        let w2_config = w2_config(plan);
         let w2_weight = quant_weight(store, &bindings.w2.weight)?;
         let w2_scales = typed_tensor(store, &bindings.w2.scales, safetensors::Dtype::BF16)?.into_data();
         let w2_biases = typed_tensor(store, &bindings.w2.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("DSpark Markov W2 weight", w2_weight.len(), w2_shape.weight_bytes())?;
+        validate_len("DSpark Markov W2 weight", w2_weight.len(), w2_config.weight_bytes())?;
         validate_len(
             "DSpark Markov W2 scales",
             w2_scales.len(),
-            w2_shape.affine_param_bytes(),
+            w2_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "DSpark Markov W2 biases",
             w2_biases.len(),
-            w2_shape.affine_param_bytes(),
+            w2_config.scale_or_bias_bytes(),
         )?;
         Ok(Self {
             w1_weight: Buffer::from_slice(device, &w1_weight),
@@ -400,9 +377,8 @@ impl DSparkMarkovWeights {
     }
 }
 
-fn w2_shape(plan: &Qwen3xDSparkPlan, num_requests: u32) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape::same_dtype(
-        num_requests.try_into().expect("DSpark Markov rows must fit i32"),
+fn w2_config(plan: &Qwen3xDSparkPlan) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig::same_dtype(
         plan.markov_w2
             .output_dim
             .try_into()
@@ -425,16 +401,6 @@ fn replay_bucket_capacity(num_active: u32, max_capacity: u32) -> u32 {
     num_active
         .checked_next_power_of_two()
         .map_or(max_capacity, |bucket| bucket.min(max_capacity))
-}
-
-fn qmv_batch_limit(input_dim: u32, output_dim: u32) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
-    }
 }
 
 fn to_u32(name: &str, value: usize) -> u32 {

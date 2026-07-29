@@ -6,11 +6,11 @@ use inference_backend_metal::components::RowwiseAddKernel;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::TopKSamplingBounds;
 
-use super::AffineQuantizedMatmulShape;
+use super::AffineQuantizedMatmul;
+use super::AffineQuantizedMatmulConfig;
 use super::DSparkMarkovSampling;
 use super::DSparkMarkovWeights;
 use super::QuantizedEmbeddingConfig;
@@ -45,11 +45,11 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         hidden_dim: RANK as u32,
         group_size: RANK as u32,
         bits: 8,
-        affine_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
         output_dtype: Dtype::Bfloat16,
     };
-    let w2_shape =
-        AffineQuantizedMatmulShape::same_dtype(1, VOCAB_SIZE as i32, RANK as i32, RANK as i32, 8, Dtype::Bfloat16);
+    let w2_config =
+        AffineQuantizedMatmulConfig::same_dtype(VOCAB_SIZE as i32, RANK as i32, RANK as i32, 8, Dtype::Bfloat16);
 
     let mut w1_weight = vec![0u8; VOCAB_SIZE * RANK];
     let mut w2_weight = vec![0u8; VOCAB_SIZE * RANK];
@@ -70,15 +70,10 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
     let markov = DSparkMarkovSampling {
         block_size: BLOCK_SIZE,
         max_requests: NUM_REQUESTS,
-        rank: RANK as u32,
-        vocab_size: VOCAB_SIZE as u32,
         w1_config,
-        w2_group_size: RANK as u32,
-        w2_bits: 8,
         weights,
         w1: QuantizedEmbeddingKernel::new(device, w1_config),
-        w2_qmv: AffineQuantizedMatmulKernel::new(device, w2_shape),
-        w2_qmm: AffineQuantizedMatmulKernel::new(device, AffineQuantizedMatmulShape { m: 10, ..w2_shape }),
+        w2: AffineQuantizedMatmul::new(device, w2_config),
         add_bias: RowwiseAddKernel::new(
             device,
             RowwiseAddConfig {
