@@ -76,11 +76,12 @@ contract to append GQA work to a larger replay. A semantic layer input and outpu
 `request_page_table.rs` owns the executor request-slot KV page table. This table accumulates runtime-supplied page IDs
 between reset notifications. The runtime core owns physical page allocation and release.
 
-The gated and ungated GQA backends give each quantized projection to one adaptive affine operator.
-The caller provides the projection dimensions, quantization layout, dtype, and current active token count.
+The gated, ungated, and DSpark GQA backends give each quantized projection to one adaptive affine operator.
+The caller provides the fixed projection dimensions, quantization layout, and dtype when it creates the operator.
+It provides the current active token count when it records the projection.
 The affine operator selects QMV or a QMM tile.
 GQA code does not store separate QMV/QMM kernels or a projection threshold.
-This contract applies to fused QGKV/QKV projections and output projections.
+This contract applies to fused QGKV/QKV projections, output projections, and DSpark context K/V projections.
 The SDPA single-Q-token/tiled-Q-token selection remains a separate attention-plan decision.
 
 ## Ownership

@@ -10,8 +10,8 @@ use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTable
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::UngatedDSparkGQACore;
 use inference_executor_core::backend::recorder::Recorder;
@@ -52,10 +52,8 @@ pub struct UngatedDSparkGQAContextInput<'a> {
 pub struct UngatedDSparkGQAContextAppender {
     core: UngatedDSparkGQACore,
     metal: GQAMetalConfig,
-    k_projection_qmv: AffineQuantizedMatmulKernel,
-    k_projection_qmm: AffineQuantizedMatmulKernel,
-    v_projection_qmv: AffineQuantizedMatmulKernel,
-    v_projection_qmm: AffineQuantizedMatmulKernel,
+    k_projection: AffineQuantizedMatmul,
+    v_projection: AffineQuantizedMatmul,
     k_norm_rope: GQANormRopeKernel,
     kv_update: GQAKVPageUpdate,
 }
@@ -92,13 +90,10 @@ impl UngatedDSparkGQAContextAppender {
         metal.validate();
         let attention = &core.attention;
         assert!(metal.rope_dim as usize <= attention.head_dim);
-        let kv_shape = attention_kv_shape(attention, metal, 1);
-        let qmm_rows = qmv_batch_limit(attention.hidden_dim, attention.k_dim());
+        let kv_config = attention_kv_config(attention, metal);
         Self {
-            k_projection_qmv: AffineQuantizedMatmulKernel::new(device, kv_shape),
-            k_projection_qmm: AffineQuantizedMatmulKernel::new(device, attention_kv_shape(attention, metal, qmm_rows)),
-            v_projection_qmv: AffineQuantizedMatmulKernel::new(device, kv_shape),
-            v_projection_qmm: AffineQuantizedMatmulKernel::new(device, attention_kv_shape(attention, metal, qmm_rows)),
+            k_projection: AffineQuantizedMatmul::new(device, kv_config),
+            v_projection: AffineQuantizedMatmul::new(device, kv_config),
             k_norm_rope: GQANormRopeKernel::new(device, k_norm_rope_config(attention, metal)),
             kv_update: GQAKVPageUpdate::new(
                 device,
@@ -135,11 +130,13 @@ impl UngatedDSparkGQAContextAppender {
             "DSpark context layer index exceeds the page table"
         );
         let attention = &self.core.attention;
-        let shape = attention_kv_shape(attention, self.metal, input.num_tokens);
         let offsets = QKVOffsets::new(attention, self.metal);
-        let projection = self.kv_projection(input.num_tokens);
-        recorder.record_with_barrier_before(ReplayOp::opaque(projection.0.invoke_with_shape(
-            shape,
+        let num_tokens = input
+            .num_tokens
+            .try_into()
+            .expect("DSpark context token count must fit i32");
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.k_projection.invoke(
+            num_tokens,
             input.scratch.k,
             0,
             input.main_feature,
@@ -151,8 +148,8 @@ impl UngatedDSparkGQAContextAppender {
             input.weights.qkv_biases,
             offsets.k_affine,
         )));
-        recorder.record(ReplayOp::opaque(projection.1.invoke_with_shape(
-            shape,
+        recorder.record(ReplayOp::opaque(self.v_projection.invoke(
+            num_tokens,
             input.scratch.v,
             0,
             input.main_feature,
@@ -196,15 +193,6 @@ impl UngatedDSparkGQAContextAppender {
             },
         )));
     }
-
-    fn kv_projection(&self, num_tokens: u32) -> (&AffineQuantizedMatmulKernel, &AffineQuantizedMatmulKernel) {
-        let attention = &self.core.attention;
-        if num_tokens >= qmv_batch_limit(attention.hidden_dim, attention.k_dim()) {
-            (&self.k_projection_qmm, &self.v_projection_qmm)
-        } else {
-            (&self.k_projection_qmv, &self.v_projection_qmv)
-        }
-    }
 }
 
 struct QKVOffsets {
@@ -216,8 +204,7 @@ struct QKVOffsets {
 
 impl QKVOffsets {
     fn new(core: &inference_executor_core::attn::UngatedGQACore, metal: GQAMetalConfig) -> Self {
-        let q_shape = AffineQuantizedMatmulShape {
-            m: 1,
+        let q_config = AffineQuantizedMatmulConfig {
             n: core.q_dim().try_into().expect("DSpark Q dimension must fit i32"),
             k: core
                 .hidden_dim
@@ -230,34 +217,32 @@ impl QKVOffsets {
             bits: metal.bits.try_into().expect("DSpark quantization bits must fit i32"),
             input_dtype: metal.dtype,
             output_dtype: metal.dtype,
-            affine_dtype: metal.dtype,
+            scale_bias_dtype: metal.dtype,
         };
-        let k_shape = AffineQuantizedMatmulShape {
+        let k_config = AffineQuantizedMatmulConfig {
             n: core.k_dim().try_into().expect("DSpark K dimension must fit i32"),
-            ..q_shape
+            ..q_config
         };
         Self {
-            k_weight: q_shape.weight_bytes(),
-            k_affine: q_shape.affine_param_bytes(),
-            v_weight: q_shape
+            k_weight: q_config.weight_bytes(),
+            k_affine: q_config.scale_or_bias_bytes(),
+            v_weight: q_config
                 .weight_bytes()
-                .checked_add(k_shape.weight_bytes())
+                .checked_add(k_config.weight_bytes())
                 .expect("DSpark V weight offset must fit usize"),
-            v_affine: q_shape
-                .affine_param_bytes()
-                .checked_add(k_shape.affine_param_bytes())
+            v_affine: q_config
+                .scale_or_bias_bytes()
+                .checked_add(k_config.scale_or_bias_bytes())
                 .expect("DSpark V affine offset must fit usize"),
         }
     }
 }
 
-fn attention_kv_shape(
+fn attention_kv_config(
     core: &inference_executor_core::attn::UngatedGQACore,
     metal: GQAMetalConfig,
-    num_tokens: u32,
-) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: num_tokens.try_into().expect("DSpark context token count must fit i32"),
+) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: core
             .k_dim()
             .try_into()
@@ -273,7 +258,7 @@ fn attention_kv_shape(
         bits: metal.bits.try_into().expect("DSpark context bits must fit i32"),
         input_dtype: metal.dtype,
         output_dtype: metal.dtype,
-        affine_dtype: metal.dtype,
+        scale_bias_dtype: metal.dtype,
     }
 }
 
@@ -308,16 +293,6 @@ fn k_norm_rope_config(
             )
         },
         dtype => panic!("unsupported DSpark context dtype {dtype:?}"),
-    }
-}
-
-fn qmv_batch_limit(input_dim: usize, output_dim: usize) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
     }
 }
 

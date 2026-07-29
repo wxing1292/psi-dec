@@ -19,8 +19,8 @@ use inference_backend_metal::components::UngatedGQAProjectionSplitShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulShape;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
@@ -50,15 +50,13 @@ pub struct UngatedDSparkGQAInput<'a> {
 pub struct UngatedDSparkGQA {
     core: UngatedDSparkGQACore,
     metal: GQAMetalConfig,
-    qkv_projection_qmv: AffineQuantizedMatmulKernel,
-    qkv_projection_qmm: AffineQuantizedMatmulKernel,
+    qkv_projection: AffineQuantizedMatmul,
     projection_split: UngatedGQAProjectionSplitKernel,
     q_norm_rope: GQANormRopeKernel,
     k_norm_rope: GQANormRopeKernel,
     paged_sdpa: GQAPagedSDPAKernels,
     block_sdpa: GQABlockSDPAKernel,
-    output_projection_qmv: AffineQuantizedMatmulKernel,
-    output_projection_qmm: AffineQuantizedMatmulKernel,
+    output_projection: AffineQuantizedMatmul,
 }
 
 impl UngatedDSparkGQA {
@@ -71,14 +69,7 @@ impl UngatedDSparkGQA {
         let qkv = attention.qkv_shape();
         let output = attention.output_shape();
         Self {
-            qkv_projection_qmv: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(1, qkv.out_dim, qkv.in_dim, metal),
-            ),
-            qkv_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(qmv_batch_limit(qkv.in_dim, qkv.out_dim), qkv.out_dim, qkv.in_dim, metal),
-            ),
+            qkv_projection: AffineQuantizedMatmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, metal)),
             projection_split: UngatedGQAProjectionSplitKernel::new(device, projection_split_config(attention, metal)),
             q_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(attention, metal, attention.num_q_heads)),
             k_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(attention, metal, attention.num_kv_heads)),
@@ -101,19 +92,7 @@ impl UngatedDSparkGQA {
                     dtype: metal.dtype,
                 },
             ),
-            output_projection_qmv: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(1, output.out_dim, output.in_dim, metal),
-            ),
-            output_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_shape(
-                    qmv_batch_limit(output.in_dim, output.out_dim),
-                    output.out_dim,
-                    output.in_dim,
-                    metal,
-                ),
-            ),
+            output_projection: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, metal)),
             core,
             metal,
         }
@@ -194,19 +173,24 @@ impl ReplayLayer for UngatedDSparkGQA {
         let shape = self.validate_input(&input);
         let attention = &self.core.attention;
         let scratch = input.scratch;
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv_projection(shape).invoke_with_shape(
-            affine_shape(shape.num_tokens, attention.qkv_dim(), attention.hidden_dim, self.metal),
-            scratch.qkv_proj,
-            0,
-            input.hidden_state,
-            0,
-            input.weights.qkv_weight,
-            0,
-            input.weights.qkv_scales,
-            0,
-            input.weights.qkv_biases,
-            0,
-        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(
+            self.qkv_projection.invoke(
+                shape
+                    .num_tokens
+                    .try_into()
+                    .expect("DSpark GQA token count must fit i32"),
+                scratch.qkv_proj,
+                0,
+                input.hidden_state,
+                0,
+                input.weights.qkv_weight,
+                0,
+                input.weights.qkv_scales,
+                0,
+                input.weights.qkv_biases,
+                0,
+            ),
+        ));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.projection_split.invoke(
             UngatedGQAProjectionSplitShape {
                 num_tokens: shape.num_tokens,
@@ -286,40 +270,25 @@ impl ReplayLayer for UngatedDSparkGQA {
                 output: scratch.attention_output,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.output_projection(shape).invoke_with_shape(
-            affine_shape(shape.num_tokens, attention.hidden_dim, attention.q_dim(), self.metal),
-            input.next_hidden_state,
-            0,
-            scratch.attention_output,
-            0,
-            input.weights.output_weight,
-            0,
-            input.weights.output_scales,
-            0,
-            input.weights.output_biases,
-            0,
-        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(
+            self.output_projection.invoke(
+                shape
+                    .num_tokens
+                    .try_into()
+                    .expect("DSpark GQA token count must fit i32"),
+                input.next_hidden_state,
+                0,
+                scratch.attention_output,
+                0,
+                input.weights.output_weight,
+                0,
+                input.weights.output_scales,
+                0,
+                input.weights.output_biases,
+                0,
+            ),
+        ));
         input.next_hidden_state
-    }
-}
-
-impl UngatedDSparkGQA {
-    fn qkv_projection(&self, shape: GQAReplayShape) -> &AffineQuantizedMatmulKernel {
-        let qkv = self.core.attention.qkv_shape();
-        if shape.num_tokens >= qmv_batch_limit(qkv.in_dim, qkv.out_dim) {
-            &self.qkv_projection_qmm
-        } else {
-            &self.qkv_projection_qmv
-        }
-    }
-
-    fn output_projection(&self, shape: GQAReplayShape) -> &AffineQuantizedMatmulKernel {
-        let output = self.core.attention.output_shape();
-        if shape.num_tokens >= qmv_batch_limit(output.in_dim, output.out_dim) {
-            &self.output_projection_qmm
-        } else {
-            &self.output_projection_qmv
-        }
     }
 }
 
@@ -384,25 +353,14 @@ fn norm_rope_config(
     }
 }
 
-fn affine_shape(m: u32, n: usize, k: usize, metal: GQAMetalConfig) -> AffineQuantizedMatmulShape {
-    AffineQuantizedMatmulShape {
-        m: m.try_into().expect("DSpark GQA affine m must fit i32"),
+fn affine_config(n: usize, k: usize, metal: GQAMetalConfig) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
         n: n.try_into().expect("DSpark GQA affine n must fit i32"),
         k: k.try_into().expect("DSpark GQA affine k must fit i32"),
         group_size: metal.group_size.try_into().expect("DSpark GQA group_size must fit i32"),
         bits: metal.bits.try_into().expect("DSpark GQA bits must fit i32"),
         input_dtype: metal.dtype,
         output_dtype: metal.dtype,
-        affine_dtype: metal.dtype,
-    }
-}
-
-fn qmv_batch_limit(input_dim: usize, output_dim: usize) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
+        scale_bias_dtype: metal.dtype,
     }
 }
