@@ -534,7 +534,7 @@ kernel void top_k_sample_tiles(
     }
 }
 
-kernel void top_k_sparse_distribution_tiles(
+kernel void top_k_write_distribution_tiles(
     device const int* tile_token_ids [[buffer(0)]],
     device const float* tile_logits [[buffer(1)]],
     device int* token_ids [[buffer(2)]],
@@ -584,7 +584,7 @@ kernel void top_k_sparse_distribution_tiles(
     }
 }
 
-kernel void top_k_sample_and_sparse_distribution_tiles(
+kernel void top_k_sample_and_write_distribution_tiles(
     device const int* tile_token_ids [[buffer(0)]],
     device const float* tile_logits [[buffer(1)]],
     device int* sampled_token_ids [[buffer(2)]],
@@ -640,7 +640,7 @@ kernel void top_k_sample_and_sparse_distribution_tiles(
     }
 }
 
-static inline float sparse_distribution_prob(
+static inline float write_distribution_prob(
     device const int* token_ids,
     device const float* token_probs,
     uint distribution_index,
@@ -688,7 +688,7 @@ static inline void sparse_sample_residual(
             continue;
         }
         float q = metal::max(target_probs[target_base + slot], 0.0f);
-        float p = sparse_distribution_prob(
+        float p = write_distribution_prob(
             flat_draft_token_ids, draft_probs, draft_distribution_index, has_draft_distribution,
             max_draft_k, top_k, token);
         total += metal::max(q - p, 0.0f);
@@ -707,7 +707,7 @@ static inline void sparse_sample_residual(
             continue;
         }
         float q = metal::max(target_probs[target_base + slot], 0.0f);
-        float p = sparse_distribution_prob(
+        float p = write_distribution_prob(
             flat_draft_token_ids, draft_probs, draft_distribution_index, has_draft_distribution,
             max_draft_k, top_k, token);
         float mass = metal::max(q - p, 0.0f);
@@ -786,10 +786,10 @@ kernel void rejection_sparse_sample(
             return;
         }
 
-        float q = sparse_distribution_prob(
+        float q = write_distribution_prob(
             target_distribution_token_ids, target_distribution_probs, target_distribution_index, true,
             max_target_k_u, top_k, draft_token);
-        float p = sparse_distribution_prob(
+        float p = write_distribution_prob(
             draft_distribution_token_ids, draft_distribution_probs, draft_distribution_index, true,
             max_draft_k_u, top_k, draft_token);
         float accept_prob = p > 0.0f ? metal::min(q / p, 1.0f) : 0.0f;

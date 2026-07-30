@@ -123,7 +123,7 @@ DSparkMarkovTopKMap
   -> add base logits
   -> tile-local Top-K
 
-generic TopKSampleAndSparseDistribution
+generic TopKSampleAndWriteDistribution
   -> global Top-K and top-p
   -> sample
   -> sparse draft distribution
@@ -422,13 +422,13 @@ It used `Qwen3-14B-4bit` and `dspark_qwen3_14b_block7-affine`.
 All GPU runs were serial.
 Each request used `temperature=0`, `top_k=1`, `top_p=1`, and `seed=1`.
 
-| Workload | Verification rounds | Proposed tokens | Accepted tokens | Proposal acceptance | Accepted length |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Sky explanation | 34 | 238 | 65 | 27.31% | 2.91 |
-| Algebra | 20 | 140 | 113 | 80.71% | 6.65 |
-| Python code | 20 | 140 | 109 | 77.86% | 6.45 |
-| Database engineering | 40 | 280 | 93 | 33.21% | 3.33 |
-| Aggregate | 114 | 798 | 380 | 47.62% | 4.33 |
+| Workload             | Verification rounds | Proposed tokens | Accepted tokens | Proposal acceptance | Accepted length |
+| -------------------- | ------------------: | --------------: | --------------: | ------------------: | --------------: |
+| Sky explanation      |                  34 |             238 |              65 |              27.31% |            2.91 |
+| Algebra              |                  20 |             140 |             113 |              80.71% |            6.65 |
+| Python code          |                  20 |             140 |             109 |              77.86% |            6.45 |
+| Database engineering |                  40 |             280 |              93 |              33.21% |            3.33 |
+| Aggregate            |                 114 |             798 |             380 |              47.62% |            4.33 |
 
 `Accepted length` includes the one Main continuation token from each verification round.
 This is the `tau` convention in the

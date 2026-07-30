@@ -192,13 +192,13 @@ This document does not duplicate those details.
 
 Keep these domains distinct:
 
-| Object | Owner | Meaning |
-| --- | --- | --- |
-| Immutable weight buffer | model or component | initialized once and shared across replays |
-| Runtime page buffer | runtime allocates and component interprets | persistent KV or GDN state addressed by runtime page IDs |
-| Batch metadata buffer | component batch-metadata owner | current batch's offsets, page IDs, or state slots |
-| Scratch buffer | component, layer, or model scratch owner | temporary partials and intermediates with explicit reuse boundaries |
-| Replay parameter buffer | backend replay program | submission-time scalar values for one recorded program |
+| Object                  | Owner                                      | Meaning                                                             |
+| ----------------------- | ------------------------------------------ | ------------------------------------------------------------------- |
+| Immutable weight buffer | model or component                         | initialized once and shared across replays                          |
+| Runtime page buffer     | runtime allocates and component interprets | persistent KV or GDN state addressed by runtime page IDs            |
+| Batch metadata buffer   | component batch-metadata owner             | current batch's offsets, page IDs, or state slots                   |
+| Scratch buffer          | component, layer, or model scratch owner   | temporary partials and intermediates with explicit reuse boundaries |
+| Replay parameter buffer | backend replay program                     | submission-time scalar values for one recorded program              |
 
 A `Buffer` is raw storage. A tensor or weight view adds dtype, shape, layout, and byte offset.
 
@@ -286,7 +286,7 @@ Each record hook owns one semantic stage.
 Main and Spec may have different data contracts, but they must preserve this lifecycle shape.
 
 Detailed keys, stage order, and request lifecycle are in [`executor_qwen.md`](executor_qwen.md). Sampling and rejection RNG
-and sparse-distribution contracts are in [`executor_sampling.md`](executor_sampling.md).
+and write-distribution contracts are in [`executor_sampling.md`](executor_sampling.md).
 
 ## Concurrency and lifecycle
 

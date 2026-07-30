@@ -47,7 +47,7 @@ impl Qwen35Executor {
             shape: sample_shape,
             logits: &self.unembed_logits,
             output: self.sampler_output.as_output(),
-            sparse: TopKSamplingSparseDistributionOutput {
+            sparse: TopKSamplingWriteDistributionOutput {
                 token_ids: self.spec_probs.draft_token_ids(),
                 probs: self.spec_probs.draft_probs(),
                 output_distribution_indices: &self.draft_distribution_indices,
@@ -112,11 +112,7 @@ impl Qwen35Executor {
         (decisions, timing)
     }
 
-    fn record_rejection_sampling(
-        &mut self,
-        recorder: &mut Qwen35ModelOpsRecorder,
-        microbatch: &Qwen35Microbatch,
-    ) {
+    fn record_rejection_sampling(&mut self, recorder: &mut Qwen35ModelOpsRecorder, microbatch: &Qwen35Microbatch) {
         let sample_positions = sample_token_positions(microbatch);
         let num_main_output_rows = num_main_output_rows(microbatch);
         let sampler_configs = sample_sampler_configs(microbatch);
@@ -148,10 +144,8 @@ impl Qwen35Executor {
                         .try_into()
                         .expect("qwen3.5 request contained a negative draft token ID"),
                 );
-                flat_draft_distribution_indices.push(
-                    self.spec_probs
-                        .draft_distribution_index(req_slot, spec_token_index),
-                );
+                flat_draft_distribution_indices
+                    .push(self.spec_probs.draft_distribution_index(req_slot, spec_token_index));
             }
         }
         let prepared = self
@@ -209,7 +203,7 @@ impl Qwen35Executor {
         let component_input = RejectionSamplingInput {
             target_shape: target_distribution_shape,
             logits: &self.unembed_logits,
-            target_sparse: TopKSamplingSparseDistributionOutput {
+            target_sparse: TopKSamplingWriteDistributionOutput {
                 token_ids: self.spec_probs.target_token_ids(),
                 probs: self.spec_probs.target_probs(),
                 output_distribution_indices: &self.target_distribution_indices,

@@ -1,0 +1,80 @@
+//! Sampling compute building blocks.
+//!
+//! The backend owns kernel selection and dispatch geometry. Executor components
+//! provide shapes, runtime parameters, buffers, and output requirements.
+//!
+//! ```text
+//! logits
+//!   |
+//!   v
+//! TopKTileKernels
+//!   |
+//!   +--> tile token IDs
+//!   +--> tile logits
+//!            |
+//!            v
+//!      TopKMergeKernels
+//!            |
+//!            +--> sampled token and probability
+//!            +--> sparse distribution
+//!
+//! target sparse distributions + draft sparse distributions
+//!            |
+//!            v
+//! SparseRejectionSampleKernel
+//!            |
+//!            +--> accepted draft tokens
+//!            +--> sampled bonus token
+//!
+//! base logits + previous token
+//!            |
+//!            v
+//! DSparkMarkovTopKMapKernel
+//!            |
+//!            v
+//!      TopKMergeKernels
+//! ```
+
+const SAMPLING_SOURCE: &str = include_str!("../metal/sampling.metal");
+const SAMPLING_NUM_THREADS_PER_THREADBLOCK: u32 = 256;
+const MAX_TOP_K: u32 = 256;
+
+fn checked_num_threads(num_work_items: u32, num_threads_per_work_item: u32) -> u32 {
+    num_work_items
+        .checked_mul(num_threads_per_work_item)
+        .expect("Metal sampling thread count must fit u32")
+}
+
+fn checked_product(name: &str, factors: &[usize]) -> usize {
+    factors
+        .iter()
+        .try_fold(1usize, |product, &factor| product.checked_mul(factor))
+        .unwrap_or_else(|| panic!("{name} must fit usize"))
+}
+
+fn checked_bytes(name: &str, num_elements: usize, item_size: usize) -> usize {
+    num_elements
+        .checked_mul(item_size)
+        .unwrap_or_else(|| panic!("{name} byte length must fit usize"))
+}
+
+mod dspark_markov;
+pub use dspark_markov::DSparkMarkovTopKMapBuffers;
+pub use dspark_markov::DSparkMarkovTopKMapConfig;
+pub use dspark_markov::DSparkMarkovTopKMapKernel;
+pub use dspark_markov::DSparkMarkovTopKMapShape;
+
+mod rejection;
+pub use rejection::SparseRejectionSampleBuffers;
+pub use rejection::SparseRejectionSampleKernel;
+pub use rejection::SparseRejectionSampleShape;
+
+mod top_k;
+pub use top_k::TopKMergeKernels;
+pub use top_k::TopKSampleAndWriteDistributionBuffers;
+pub use top_k::TopKSampleBuffers;
+pub use top_k::TopKSampleShape;
+pub use top_k::TopKSamplingOperation;
+pub use top_k::TopKTileBuffers;
+pub use top_k::TopKTileKernels;
+pub use top_k::TopKWriteDistributionBuffers;

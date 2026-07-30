@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
+use inference_executor_core::sampling::TopKSamplingLogitsDtype;
 use inference_executor_core::sampling::TopKSamplingShape;
 
 use crate::def::replay_op::ReplayRecorder;
@@ -8,7 +9,7 @@ use crate::replay::ReplayComponent;
 use crate::sampling::top_k_sampling::TopKSampling;
 use crate::sampling::top_k_sampling::TopKSamplingInputs;
 use crate::sampling::top_k_sampling::TopKSamplingOutput;
-use crate::sampling::top_k_sampling::TopKSamplingSparseDistributionOutput;
+use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TopKSamplingReplayKey {
@@ -36,7 +37,7 @@ pub struct DraftSamplingInput<'a> {
     pub shape: TopKSamplingShape,
     pub logits: &'a Buffer,
     pub output: TopKSamplingOutput<'a>,
-    pub sparse: TopKSamplingSparseDistributionOutput<'a>,
+    pub sparse: TopKSamplingWriteDistributionOutput<'a>,
 }
 
 fn sampling_key(shape: TopKSamplingShape) -> TopKSamplingReplayKey {
@@ -55,9 +56,10 @@ impl ReplayComponent for Sampling {
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.sampler.record_bf16(
+        self.sampler.record(
             recorder,
             input.shape,
+            TopKSamplingLogitsDtype::Bfloat16,
             TopKSamplingInputs {
                 logits: input.logits,
                 logits_offset_bytes: 0,
@@ -76,9 +78,10 @@ impl ReplayComponent for DraftSampling {
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.sampler.record_bf16_with_sparse_distribution(
+        self.sampler.record_with_write_distribution(
             recorder,
             input.shape,
+            TopKSamplingLogitsDtype::Bfloat16,
             TopKSamplingInputs {
                 logits: input.logits,
                 logits_offset_bytes: 0,

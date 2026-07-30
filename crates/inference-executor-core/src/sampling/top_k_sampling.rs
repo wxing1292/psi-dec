@@ -3,7 +3,6 @@ use inference_runtime_core::config::MAX_SAMPLING_TOP_K;
 use crate::def::ModelExecutorError;
 use crate::sampling::SamplerConfig;
 
-const VOCAB_TILE_SIZE: u32 = 256;
 pub const MAX_TOP_K: usize = MAX_SAMPLING_TOP_K;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -15,13 +14,6 @@ pub struct TopKSamplingShape {
 }
 
 impl TopKSamplingShape {
-    pub fn tile_count(self) -> usize {
-        (self.num_total_sampling_inputs as usize)
-            .checked_mul(self.vocab_size.div_ceil(VOCAB_TILE_SIZE) as usize)
-            .and_then(|count| count.checked_mul(self.top_k as usize))
-            .expect("top-k sampling tile element count must fit usize")
-    }
-
     pub fn top_k_count(self) -> usize {
         (self.num_total_sampling_inputs as usize)
             .checked_mul(self.top_k as usize)

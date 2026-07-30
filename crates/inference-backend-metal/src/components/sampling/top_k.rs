@@ -1,31 +1,36 @@
+use super::MAX_TOP_K;
+use super::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
+use super::SAMPLING_SOURCE;
+use super::checked_bytes;
+use super::checked_num_threads;
+use super::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 
-const SAMPLING_SOURCE: &str = include_str!("metal/sampling.metal");
-
-pub const SAMPLING_NUM_THREADS_PER_THREADBLOCK: u32 = 256;
-pub const MAX_TOP_K: u32 = 256;
-pub const TOP_K_REDUCTION_LIMIT: u32 = 32;
-pub const TOP_K_VOCAB_TILE_SIZE: u32 = 256;
-pub const TOP_K_TILE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
+const TOP_K_REDUCTION_LIMIT: u32 = 32;
+const TOP_K_VOCAB_TILE_SIZE: u32 = 256;
+pub(super) const TOP_K_TILE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("top_k_sampling.tile_num_active_threads");
-pub const TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
+const TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("top_k_sampling.merge_num_active_threads");
-pub const REJECTION_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
-    ReplayParameterKey::new("rejection_sampling.num_active_threads");
-pub const REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY: ReplayParameterKey =
-    ReplayParameterKey::new("rejection_sampling.num_active_target_distributions");
-pub const REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY: ReplayParameterKey =
-    ReplayParameterKey::new("rejection_sampling.num_active_draft_distributions");
 
 #[derive(Clone, Copy, Debug)]
 pub struct TopKSampleShape {
     pub num_total_sampling_inputs: u32,
     pub vocab_size: u32,
     pub top_k: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopKSamplingOperation {
+    Sample,
+    WriteDistribution,
+    SampleAndWriteDistribution,
 }
 
 impl TopKSampleShape {
@@ -58,12 +63,6 @@ fn vocab_tile_size() -> u32 {
     TOP_K_VOCAB_TILE_SIZE
 }
 
-fn checked_num_threads(num_work_items: u32, num_threads_per_work_item: u32) -> u32 {
-    num_work_items
-        .checked_mul(num_threads_per_work_item)
-        .expect("Metal sampling thread count must fit u32")
-}
-
 fn num_tiles(shape: TopKSampleShape, vocab_tile_size: u32) -> u32 {
     shape.validate();
     assert!(vocab_tile_size > 0);
@@ -86,19 +85,6 @@ fn tile_count(shape: TopKSampleShape, vocab_tile_size: u32) -> usize {
     )
 }
 
-fn checked_product(name: &str, factors: &[usize]) -> usize {
-    factors
-        .iter()
-        .try_fold(1usize, |product, &factor| product.checked_mul(factor))
-        .unwrap_or_else(|| panic!("{name} must fit usize"))
-}
-
-fn checked_bytes(name: &str, num_elements: usize, item_size: usize) -> usize {
-    num_elements
-        .checked_mul(item_size)
-        .unwrap_or_else(|| panic!("{name} byte length must fit usize"))
-}
-
 #[derive(Clone, Copy)]
 pub struct TopKTileBuffers<'a> {
     pub logits: &'a Buffer,
@@ -117,7 +103,7 @@ pub struct TopKSampleBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct TopKSparseDistributionBuffers<'a> {
+pub struct TopKWriteDistributionBuffers<'a> {
     pub tile_token_ids: &'a Buffer,
     pub tile_logits: &'a Buffer,
     pub distribution_token_ids: &'a Buffer,
@@ -129,7 +115,7 @@ pub struct TopKSparseDistributionBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct TopKSampleAndSparseDistributionBuffers<'a> {
+pub struct TopKSampleAndWriteDistributionBuffers<'a> {
     pub tile_token_ids: &'a Buffer,
     pub tile_logits: &'a Buffer,
     pub sampled_token_ids: &'a Buffer,
@@ -196,28 +182,93 @@ fn assert_merge_inputs_fit(
     );
 }
 
-pub struct TopKTileKernel {
-    kernel: Kernel,
+pub struct TopKTileKernels {
+    f32_reduction: Kernel,
+    f32_bitonic: Kernel,
+    bf16_reduction: Kernel,
+    bf16_bitonic: Kernel,
 }
 
-impl TopKTileKernel {
+impl TopKTileKernels {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles"),
+            f32_reduction: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles"),
+            f32_bitonic: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bitonic"),
+            bf16_reduction: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16"),
+            bf16_bitonic: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16_bitonic"),
         }
     }
 
-    pub fn invoke_replay<'a>(&'a self, shape: TopKSampleShape, buffers: TopKTileBuffers<'a>) -> TopKTileInvocation<'a> {
+    pub fn invoke_replay<'a>(
+        &'a self,
+        shape: TopKSampleShape,
+        logits_dtype: Dtype,
+        operation: TopKSamplingOperation,
+        buffers: TopKTileBuffers<'a>,
+    ) -> TopKTileInvocation<'a> {
+        shape.validate();
+        let kind = selected_top_k_tile_kernel(shape, operation);
+        let (kernel, logits_item_size) = match (logits_dtype, kind) {
+            (Dtype::Float32, TopKTileKernelKind::Reduction) => (&self.f32_reduction, size_of::<f32>()),
+            (Dtype::Float32, TopKTileKernelKind::Bitonic) => (&self.f32_bitonic, size_of::<f32>()),
+            (Dtype::Bfloat16, TopKTileKernelKind::Reduction) => (&self.bf16_reduction, size_of::<u16>()),
+            (Dtype::Bfloat16, TopKTileKernelKind::Bitonic) => (&self.bf16_bitonic, size_of::<u16>()),
+            (dtype, _) => panic!("unsupported top-k logits dtype {dtype:?}"),
+        };
         TopKTileInvocation {
-            kernel: self,
+            kernel,
+            logits_item_size,
             shape,
             buffers,
         }
     }
+
+    pub fn candidate_count(&self, shape: TopKSampleShape) -> usize {
+        tile_count(shape, vocab_tile_size())
+    }
+
+    pub fn add_replay_arguments(
+        &self,
+        shape: TopKSampleShape,
+        num_active_sampling_inputs: u32,
+        arguments: &mut ReplayArguments,
+    ) {
+        shape.validate();
+        assert!(
+            num_active_sampling_inputs > 0 && num_active_sampling_inputs <= shape.num_total_sampling_inputs,
+            "top-k active sampling inputs must fit the recorded capacity"
+        );
+        if shape.num_total_sampling_inputs <= 1 {
+            return;
+        }
+        let num_tiles = num_tiles(shape, vocab_tile_size());
+        let num_threads_per_row = checked_num_threads(num_tiles, SAMPLING_NUM_THREADS_PER_THREADBLOCK);
+        let num_active_threads = checked_num_threads(num_active_sampling_inputs, num_threads_per_row);
+        let num_total_threads = checked_num_threads(shape.num_total_sampling_inputs, num_threads_per_row);
+        assert!(num_active_threads <= num_total_threads);
+        arguments.set_u32(TOP_K_TILE_NUM_ACTIVE_THREADS_KEY, num_active_threads);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopKTileKernelKind {
+    Reduction,
+    Bitonic,
+}
+
+fn selected_top_k_tile_kernel(shape: TopKSampleShape, operation: TopKSamplingOperation) -> TopKTileKernelKind {
+    shape.validate();
+    match operation {
+        TopKSamplingOperation::Sample if shape.top_k <= TOP_K_REDUCTION_LIMIT => TopKTileKernelKind::Reduction,
+        TopKSamplingOperation::Sample
+        | TopKSamplingOperation::WriteDistribution
+        | TopKSamplingOperation::SampleAndWriteDistribution => TopKTileKernelKind::Bitonic,
+    }
 }
 
 pub struct TopKTileInvocation<'a> {
-    kernel: &'a TopKTileKernel,
+    kernel: &'a Kernel,
+    logits_item_size: usize,
     shape: TopKSampleShape,
     buffers: TopKTileBuffers<'a>,
 }
@@ -225,10 +276,10 @@ pub struct TopKTileInvocation<'a> {
 impl Operator for TopKTileInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.shape.validate();
-        assert_tile_buffers_fit(self.shape, self.buffers, size_of::<f32>());
+        assert_tile_buffers_fit(self.shape, self.buffers, self.logits_item_size);
         let vocab_tile_size = vocab_tile_size();
         let num_tiles = num_tiles(self.shape, vocab_tile_size);
-        builder.set_kernel(&self.kernel.kernel);
+        builder.set_kernel(self.kernel);
         builder.set_buffer_read(0, self.buffers.logits, self.buffers.logits_offset_bytes);
         builder.set_buffer_write(1, self.buffers.tile_token_ids, 0);
         builder.set_buffer_write(2, self.buffers.tile_logits, 0);
@@ -255,221 +306,84 @@ impl Operator for TopKTileInvocation<'_> {
     }
 }
 
-pub struct TopKTileBitonicKernel {
-    kernel: Kernel,
+pub struct TopKMergeKernels {
+    sample: Kernel,
+    write_distribution: Kernel,
+    sample_and_write_distribution: Kernel,
 }
 
-impl TopKTileBitonicKernel {
+impl TopKMergeKernels {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bitonic"),
+            sample: Kernel::new(device, SAMPLING_SOURCE, "top_k_sample_tiles"),
+            write_distribution: Kernel::new(device, SAMPLING_SOURCE, "top_k_write_distribution_tiles"),
+            sample_and_write_distribution: Kernel::new(
+                device,
+                SAMPLING_SOURCE,
+                "top_k_sample_and_write_distribution_tiles",
+            ),
         }
     }
 
-    pub fn invoke_replay<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKTileBuffers<'a>,
-    ) -> TopKTileBitonicInvocation<'a> {
-        TopKTileBitonicInvocation {
-            kernel: self,
-            shape,
-            buffers,
-        }
-    }
-}
-
-pub struct TopKTileBitonicInvocation<'a> {
-    kernel: &'a TopKTileBitonicKernel,
-    shape: TopKSampleShape,
-    buffers: TopKTileBuffers<'a>,
-}
-
-impl Operator for TopKTileBitonicInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
-        self.shape.validate();
-        assert_tile_buffers_fit(self.shape, self.buffers, size_of::<f32>());
-        let vocab_tile_size = vocab_tile_size();
-        let num_tiles = num_tiles(self.shape, vocab_tile_size);
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.logits, self.buffers.logits_offset_bytes);
-        builder.set_buffer_write(1, self.buffers.tile_token_ids, 0);
-        builder.set_buffer_write(2, self.buffers.tile_logits, 0);
-        builder.set_u32(4, self.shape.vocab_size);
-        builder.set_u32(5, self.shape.top_k);
-        builder.set_u32(6, vocab_tile_size);
-        builder.set_u32(7, num_tiles);
-        let num_threads_per_row = checked_num_threads(num_tiles, SAMPLING_NUM_THREADS_PER_THREADBLOCK);
-        let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        if num_threads_per_row == num_total_threads {
-            builder.set_u32(3, num_total_threads);
-        } else {
-            builder.bind_u32(
-                3,
-                TOP_K_TILE_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
-        }
-        builder.dispatch_1d(
-            num_total_threads as usize,
-            SAMPLING_NUM_THREADS_PER_THREADBLOCK as usize,
-        );
-    }
-}
-
-pub struct TopKTileBf16Kernel {
-    kernel: Kernel,
-}
-
-impl TopKTileBf16Kernel {
-    pub fn new(device: &crate::metal::Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16"),
-        }
-    }
-
-    pub fn invoke_replay<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKTileBuffers<'a>,
-    ) -> TopKTileBf16Invocation<'a> {
-        TopKTileBf16Invocation {
-            kernel: self,
-            shape,
-            buffers,
-        }
-    }
-}
-
-pub struct TopKTileBf16Invocation<'a> {
-    kernel: &'a TopKTileBf16Kernel,
-    shape: TopKSampleShape,
-    buffers: TopKTileBuffers<'a>,
-}
-
-impl Operator for TopKTileBf16Invocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
-        self.shape.validate();
-        assert_tile_buffers_fit(self.shape, self.buffers, size_of::<u16>());
-        let vocab_tile_size = vocab_tile_size();
-        let num_tiles = num_tiles(self.shape, vocab_tile_size);
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.logits, self.buffers.logits_offset_bytes);
-        builder.set_buffer_write(1, self.buffers.tile_token_ids, 0);
-        builder.set_buffer_write(2, self.buffers.tile_logits, 0);
-        builder.set_u32(4, self.shape.vocab_size);
-        builder.set_u32(5, self.shape.top_k);
-        builder.set_u32(6, vocab_tile_size);
-        builder.set_u32(7, num_tiles);
-        let num_threads_per_row = checked_num_threads(num_tiles, SAMPLING_NUM_THREADS_PER_THREADBLOCK);
-        let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        if num_threads_per_row == num_total_threads {
-            builder.set_u32(3, num_total_threads);
-        } else {
-            builder.bind_u32(
-                3,
-                TOP_K_TILE_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
-        }
-        builder.dispatch_1d(
-            num_total_threads as usize,
-            SAMPLING_NUM_THREADS_PER_THREADBLOCK as usize,
-        );
-    }
-}
-
-pub struct TopKTileBf16BitonicKernel {
-    kernel: Kernel,
-}
-
-impl TopKTileBf16BitonicKernel {
-    pub fn new(device: &crate::metal::Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16_bitonic"),
-        }
-    }
-
-    pub fn invoke_replay<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKTileBuffers<'a>,
-    ) -> TopKTileBf16BitonicInvocation<'a> {
-        TopKTileBf16BitonicInvocation {
-            kernel: self,
-            shape,
-            buffers,
-        }
-    }
-}
-
-pub struct TopKTileBf16BitonicInvocation<'a> {
-    kernel: &'a TopKTileBf16BitonicKernel,
-    shape: TopKSampleShape,
-    buffers: TopKTileBuffers<'a>,
-}
-
-impl Operator for TopKTileBf16BitonicInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
-        self.shape.validate();
-        assert_tile_buffers_fit(self.shape, self.buffers, size_of::<u16>());
-        let vocab_tile_size = vocab_tile_size();
-        let num_tiles = num_tiles(self.shape, vocab_tile_size);
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.logits, self.buffers.logits_offset_bytes);
-        builder.set_buffer_write(1, self.buffers.tile_token_ids, 0);
-        builder.set_buffer_write(2, self.buffers.tile_logits, 0);
-        builder.set_u32(4, self.shape.vocab_size);
-        builder.set_u32(5, self.shape.top_k);
-        builder.set_u32(6, vocab_tile_size);
-        builder.set_u32(7, num_tiles);
-        let num_threads_per_row = checked_num_threads(num_tiles, SAMPLING_NUM_THREADS_PER_THREADBLOCK);
-        let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        if num_threads_per_row == num_total_threads {
-            builder.set_u32(3, num_total_threads);
-        } else {
-            builder.bind_u32(
-                3,
-                TOP_K_TILE_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
-        }
-        builder.dispatch_1d(
-            num_total_threads as usize,
-            SAMPLING_NUM_THREADS_PER_THREADBLOCK as usize,
-        );
-    }
-}
-
-pub struct TopKSampleKernel {
-    kernel: Kernel,
-}
-
-impl TopKSampleKernel {
-    pub fn new(device: &crate::metal::Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_sample_tiles"),
-        }
-    }
-
-    pub fn invoke_replay<'a>(
+    pub fn invoke_sample<'a>(
         &'a self,
         shape: TopKSampleShape,
         buffers: TopKSampleBuffers<'a>,
     ) -> TopKSampleInvocation<'a> {
         TopKSampleInvocation {
-            kernel: self,
+            kernel: &self.sample,
             shape,
             buffers,
         }
     }
+
+    pub fn invoke_write_distribution<'a>(
+        &'a self,
+        shape: TopKSampleShape,
+        buffers: TopKWriteDistributionBuffers<'a>,
+    ) -> TopKWriteDistributionInvocation<'a> {
+        TopKWriteDistributionInvocation {
+            kernel: &self.write_distribution,
+            shape,
+            buffers,
+        }
+    }
+
+    pub fn invoke_sample_and_write_distribution<'a>(
+        &'a self,
+        shape: TopKSampleShape,
+        buffers: TopKSampleAndWriteDistributionBuffers<'a>,
+    ) -> TopKSampleAndWriteDistributionInvocation<'a> {
+        self.invoke_sample_and_write_distribution_with_vocab_tile_size(shape, buffers, vocab_tile_size())
+    }
+
+    pub fn invoke_sample_and_write_distribution_with_vocab_tile_size<'a>(
+        &'a self,
+        shape: TopKSampleShape,
+        buffers: TopKSampleAndWriteDistributionBuffers<'a>,
+        vocab_tile_size: u32,
+    ) -> TopKSampleAndWriteDistributionInvocation<'a> {
+        assert!(vocab_tile_size > 0);
+        TopKSampleAndWriteDistributionInvocation {
+            kernel: &self.sample_and_write_distribution,
+            shape,
+            buffers,
+            vocab_tile_size,
+        }
+    }
+
+    pub fn add_replay_arguments(
+        &self,
+        shape: TopKSampleShape,
+        num_active_sampling_inputs: u32,
+        arguments: &mut ReplayArguments,
+    ) {
+        add_top_k_merge_replay_argument(shape, num_active_sampling_inputs, arguments);
+    }
 }
 
 pub struct TopKSampleInvocation<'a> {
-    kernel: &'a TopKSampleKernel,
+    kernel: &'a Kernel,
     shape: TopKSampleShape,
     buffers: TopKSampleBuffers<'a>,
 }
@@ -505,7 +419,7 @@ impl Operator for TopKSampleInvocation<'_> {
         let vocab_tile_size = vocab_tile_size();
         let num_tiles = num_tiles(self.shape, vocab_tile_size);
         let tile_top_k = tile_top_k(self.shape);
-        builder.set_kernel(&self.kernel.kernel);
+        builder.set_kernel(self.kernel);
         builder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
         builder.set_buffer_read(1, self.buffers.tile_logits, 0);
         builder.set_buffer_write(2, self.buffers.token_ids, 0);
@@ -534,37 +448,13 @@ impl Operator for TopKSampleInvocation<'_> {
     }
 }
 
-pub struct TopKSparseDistributionKernel {
-    kernel: Kernel,
-}
-
-impl TopKSparseDistributionKernel {
-    pub fn new(device: &crate::metal::Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_sparse_distribution_tiles"),
-        }
-    }
-
-    pub fn invoke_replay<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSparseDistributionBuffers<'a>,
-    ) -> TopKSparseDistributionInvocation<'a> {
-        TopKSparseDistributionInvocation {
-            kernel: self,
-            shape,
-            buffers,
-        }
-    }
-}
-
-pub struct TopKSparseDistributionInvocation<'a> {
-    kernel: &'a TopKSparseDistributionKernel,
+pub struct TopKWriteDistributionInvocation<'a> {
+    kernel: &'a Kernel,
     shape: TopKSampleShape,
-    buffers: TopKSparseDistributionBuffers<'a>,
+    buffers: TopKWriteDistributionBuffers<'a>,
 }
 
-impl Operator for TopKSparseDistributionInvocation<'_> {
+impl Operator for TopKWriteDistributionInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.shape.validate();
         assert_merge_inputs_fit(
@@ -576,14 +466,14 @@ impl Operator for TopKSparseDistributionInvocation<'_> {
         );
         assert!(
             self.buffers.max_k >= self.shape.top_k,
-            "top-k sparse-distribution slots must cover active top_k"
+            "top-k write-distribution slots must cover active top_k"
         );
         assert!(
             self.buffers.num_output_distributions > 0,
-            "top-k sparse-distribution output requires distributions"
+            "top-k write-distribution output requires distributions"
         );
         let output_elements = checked_product(
-            "Metal top-k sparse-distribution output element count",
+            "Metal top-k write-distribution output element count",
             &[
                 self.buffers.num_output_distributions as usize,
                 self.buffers.max_k as usize,
@@ -595,27 +485,27 @@ impl Operator for TopKSparseDistributionInvocation<'_> {
         assert!(
             self.buffers.output_distribution_indices.len_bytes()
                 >= checked_bytes(
-                    "Metal sparse-distribution output index",
+                    "Metal write-distribution output index",
                     self.shape.num_total_sampling_inputs as usize,
                     size_of::<u32>(),
                 ),
-            "top-k sparse-distribution output-index buffer too short"
+            "top-k write-distribution output-index buffer too short"
         );
         assert!(
             self.buffers.distribution_token_ids.len_bytes()
                 >= output_elements
                     .checked_mul(size_of::<i32>())
-                    .expect("Metal top-k sparse-distribution token bytes must fit usize"),
-            "top-k sparse-distribution token buffer too short for declared outputs"
+                    .expect("Metal top-k write-distribution token bytes must fit usize"),
+            "top-k write-distribution token buffer too short for declared outputs"
         );
         assert!(
             self.buffers.distribution_probs.len_bytes()
                 >= output_elements
                     .checked_mul(size_of::<f32>())
-                    .expect("Metal top-k sparse-distribution probability bytes must fit usize"),
-            "top-k sparse-distribution prob buffer too short for declared outputs"
+                    .expect("Metal top-k write-distribution probability bytes must fit usize"),
+            "top-k write-distribution prob buffer too short for declared outputs"
         );
-        builder.set_kernel(&self.kernel.kernel);
+        builder.set_kernel(self.kernel);
         builder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
         builder.set_buffer_read(1, self.buffers.tile_logits, 0);
         builder.set_buffer_write(2, self.buffers.distribution_token_ids, 0);
@@ -647,49 +537,14 @@ impl Operator for TopKSparseDistributionInvocation<'_> {
     }
 }
 
-pub struct TopKSampleAndSparseDistributionKernel {
-    kernel: Kernel,
-}
-
-impl TopKSampleAndSparseDistributionKernel {
-    pub fn new(device: &crate::metal::Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_sample_and_sparse_distribution_tiles"),
-        }
-    }
-
-    pub fn invoke_replay<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSampleAndSparseDistributionBuffers<'a>,
-    ) -> TopKSampleAndSparseDistributionInvocation<'a> {
-        self.invoke_replay_with_vocab_tile_size(shape, buffers, vocab_tile_size())
-    }
-
-    pub fn invoke_replay_with_vocab_tile_size<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSampleAndSparseDistributionBuffers<'a>,
-        vocab_tile_size: u32,
-    ) -> TopKSampleAndSparseDistributionInvocation<'a> {
-        assert!(vocab_tile_size > 0);
-        TopKSampleAndSparseDistributionInvocation {
-            kernel: self,
-            shape,
-            buffers,
-            vocab_tile_size,
-        }
-    }
-}
-
-pub struct TopKSampleAndSparseDistributionInvocation<'a> {
-    kernel: &'a TopKSampleAndSparseDistributionKernel,
+pub struct TopKSampleAndWriteDistributionInvocation<'a> {
+    kernel: &'a Kernel,
     shape: TopKSampleShape,
-    buffers: TopKSampleAndSparseDistributionBuffers<'a>,
+    buffers: TopKSampleAndWriteDistributionBuffers<'a>,
     vocab_tile_size: u32,
 }
 
-impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
+impl Operator for TopKSampleAndWriteDistributionInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.shape.validate();
         assert_merge_inputs_fit(
@@ -706,7 +561,7 @@ impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
                     self.shape.num_total_sampling_inputs as usize,
                     size_of::<i32>(),
                 ),
-            "top-k sample-and-sparse-distribution sampled-token buffer is too short"
+            "top-k sample-and-write-distribution sampled-token buffer is too short"
         );
         assert!(
             self.buffers.sampled_token_probs.len_bytes()
@@ -715,18 +570,18 @@ impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
                     self.shape.num_total_sampling_inputs as usize,
                     size_of::<f32>(),
                 ),
-            "top-k sample-and-sparse-distribution sampled-probability buffer is too short"
+            "top-k sample-and-write-distribution sampled-probability buffer is too short"
         );
         assert!(
             self.buffers.max_k >= self.shape.top_k,
-            "top-k sample-and-sparse-distribution slots must cover batch top_k"
+            "top-k sample-and-write-distribution slots must cover batch top_k"
         );
         assert!(
             self.buffers.num_output_distributions > 0,
-            "top-k sample-and-sparse-distribution output requires distributions"
+            "top-k sample-and-write-distribution output requires distributions"
         );
         let output_elements = checked_product(
-            "Metal top-k sample-and-sparse-distribution output element count",
+            "Metal top-k sample-and-write-distribution output element count",
             &[
                 self.buffers.num_output_distributions as usize,
                 self.buffers.max_k as usize,
@@ -735,30 +590,30 @@ impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
         assert!(
             self.buffers.output_distribution_indices.len_bytes()
                 >= checked_bytes(
-                    "Metal sparse-distribution output index",
+                    "Metal write-distribution output index",
                     self.shape.num_total_sampling_inputs as usize,
                     size_of::<u32>(),
                 ),
-            "top-k sample-and-sparse-distribution output-index buffer too short"
+            "top-k sample-and-write-distribution output-index buffer too short"
         );
         assert!(
             self.buffers.distribution_token_ids.len_bytes()
                 >= output_elements
                     .checked_mul(size_of::<i32>())
-                    .expect("Metal top-k sample-and-sparse-distribution token bytes must fit usize"),
-            "top-k sample-and-sparse-distribution token buffer too short"
+                    .expect("Metal top-k sample-and-write-distribution token bytes must fit usize"),
+            "top-k sample-and-write-distribution token buffer too short"
         );
         assert!(
             self.buffers.distribution_probs.len_bytes()
                 >= output_elements
                     .checked_mul(size_of::<f32>())
-                    .expect("Metal top-k sample-and-sparse-distribution probability bytes must fit usize"),
-            "top-k sample-and-sparse-distribution probability buffer too short"
+                    .expect("Metal top-k sample-and-write-distribution probability bytes must fit usize"),
+            "top-k sample-and-write-distribution probability buffer too short"
         );
         let vocab_tile_size = self.vocab_tile_size;
         let num_tiles = num_tiles(self.shape, vocab_tile_size);
         let tile_top_k = tile_top_k(self.shape);
-        builder.set_kernel(&self.kernel.kernel);
+        builder.set_kernel(self.kernel);
         builder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
         builder.set_buffer_read(1, self.buffers.tile_logits, 0);
         builder.set_buffer_write(2, self.buffers.sampled_token_ids, 0);
@@ -792,275 +647,23 @@ impl Operator for TopKSampleAndSparseDistributionInvocation<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct SparseRejectionSampleShape {
-    pub num_total_reqs: u32,
-    pub num_total_draft_distributions: u32,
-    pub num_total_target_distributions: u32,
-    pub top_k: u32,
-    pub max_target_k: u32,
-    pub max_draft_k: u32,
-}
-
-impl SparseRejectionSampleShape {
-    pub fn validate(self) {
-        assert!(self.num_total_reqs > 0);
-        assert!(self.num_total_target_distributions > 0);
-        assert!(self.top_k > 0);
-        assert!(self.top_k <= MAX_TOP_K);
-        assert!(self.max_target_k >= self.top_k);
-        assert!(self.max_draft_k >= self.top_k);
+fn add_top_k_merge_replay_argument(
+    shape: TopKSampleShape,
+    num_active_sampling_inputs: u32,
+    arguments: &mut ReplayArguments,
+) {
+    shape.validate();
+    assert!(
+        num_active_sampling_inputs > 0 && num_active_sampling_inputs <= shape.num_total_sampling_inputs,
+        "top-k active sampling inputs must fit the recorded capacity"
+    );
+    if shape.num_total_sampling_inputs <= 1 {
+        return;
     }
-
-    pub fn num_accepted_token_slots(self) -> usize {
-        self.num_total_draft_distributions.max(1) as usize
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct SparseRejectionSampleBuffers<'a> {
-    pub target_distribution_token_ids: &'a Buffer,
-    pub target_distribution_probs: &'a Buffer,
-    pub draft_distribution_token_ids: &'a Buffer,
-    pub draft_distribution_probs: &'a Buffer,
-    pub flat_draft_token_ids: &'a Buffer,
-    pub cu_target_distributions: &'a Buffer,
-    pub cu_draft_distributions: &'a Buffer,
-    pub flat_draft_distribution_indices: &'a Buffer,
-    pub flat_accepted_token_ids: &'a Buffer,
-    pub flat_accepted_probs: &'a Buffer,
-    pub num_accepted_tokens: &'a Buffer,
-    pub sampled_token_ids: &'a Buffer,
-    pub sampled_token_probs: &'a Buffer,
-    pub runtime_params: &'a Buffer,
-}
-
-pub struct SparseRejectionSampleKernel {
-    kernel: Kernel,
-}
-
-impl SparseRejectionSampleKernel {
-    pub fn new(device: &crate::metal::Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "rejection_sparse_sample"),
-        }
-    }
-
-    pub fn invoke_replay<'a>(
-        &'a self,
-        shape: SparseRejectionSampleShape,
-        buffers: SparseRejectionSampleBuffers<'a>,
-    ) -> SparseRejectionSampleInvocation<'a> {
-        SparseRejectionSampleInvocation {
-            kernel: self,
-            shape,
-            buffers,
-        }
-    }
-}
-
-pub struct SparseRejectionSampleInvocation<'a> {
-    kernel: &'a SparseRejectionSampleKernel,
-    shape: SparseRejectionSampleShape,
-    buffers: SparseRejectionSampleBuffers<'a>,
-}
-
-impl Operator for SparseRejectionSampleInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
-        self.shape.validate();
-        let num_target_slots = checked_product(
-            "sparse rejection target-distribution slot count",
-            &[
-                self.shape.num_total_target_distributions as usize,
-                self.shape.max_target_k as usize,
-            ],
-        );
-        let num_draft_slots = checked_product(
-            "sparse rejection draft-distribution slot count",
-            &[
-                self.shape.num_total_draft_distributions as usize,
-                self.shape.max_draft_k as usize,
-            ],
-        );
-        assert!(
-            self.buffers.target_distribution_token_ids.len_bytes()
-                >= checked_bytes("sparse rejection target token", num_target_slots, size_of::<i32>()),
-            "sparse rejection target-distribution token buffer too short"
-        );
-        assert!(
-            self.buffers.target_distribution_probs.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection target probability",
-                    num_target_slots,
-                    size_of::<f32>()
-                ),
-            "sparse rejection target-distribution probability buffer too short"
-        );
-        assert_eq!(
-            self.buffers.draft_distribution_token_ids.len_bytes() / size_of::<i32>(),
-            self.buffers.draft_distribution_probs.len_bytes() / size_of::<f32>(),
-            "sparse rejection draft-distribution token/probability buffers must have equal element counts"
-        );
-        if self.shape.num_total_draft_distributions > 0 {
-            assert!(
-                self.buffers.draft_distribution_token_ids.len_bytes()
-                    >= checked_bytes("sparse rejection draft token", num_draft_slots, size_of::<i32>()),
-                "sparse rejection draft-distribution token buffer too short"
-            );
-            assert!(
-                self.buffers.draft_distribution_probs.len_bytes()
-                    >= checked_bytes("sparse rejection draft probability", num_draft_slots, size_of::<f32>()),
-                "sparse rejection draft-distribution probability buffer too short"
-            );
-        }
-        assert!(
-            self.buffers.flat_draft_token_ids.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection flat draft token",
-                    self.shape.num_total_draft_distributions as usize,
-                    size_of::<i32>(),
-                ),
-            "sparse rejection draft-token buffer is too short"
-        );
-        assert!(
-            self.buffers.cu_target_distributions.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection cumulative target distribution",
-                    (self.shape.num_total_reqs as usize)
-                        .checked_add(1)
-                        .expect("sparse rejection request count must fit usize"),
-                    size_of::<u32>(),
-                ),
-            "sparse rejection target CU-distribution buffer is too short"
-        );
-        assert!(
-            self.buffers.cu_draft_distributions.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection cumulative draft distribution",
-                    (self.shape.num_total_reqs as usize)
-                        .checked_add(1)
-                        .expect("sparse rejection request count must fit usize"),
-                    size_of::<u32>(),
-                ),
-            "sparse rejection draft CU-distribution buffer is too short"
-        );
-        assert!(
-            self.buffers.flat_draft_distribution_indices.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection flat draft-distribution index",
-                    self.shape.num_total_draft_distributions as usize,
-                    size_of::<u32>(),
-                ),
-            "sparse rejection flat draft-distribution index buffer too short"
-        );
-        assert!(
-            self.buffers.flat_accepted_token_ids.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection accepted token",
-                    self.shape.num_accepted_token_slots(),
-                    size_of::<i32>(),
-                ),
-            "sparse rejection accepted-token buffer is too short"
-        );
-        assert!(
-            self.buffers.flat_accepted_probs.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection accepted probability",
-                    self.shape.num_accepted_token_slots(),
-                    size_of::<f32>(),
-                ),
-            "sparse rejection accepted-probability buffer is too short"
-        );
-        assert!(
-            self.buffers.num_accepted_tokens.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection accepted-token count",
-                    self.shape.num_total_reqs as usize,
-                    size_of::<u32>(),
-                ),
-            "sparse rejection accepted-token-count buffer is too short"
-        );
-        assert!(
-            self.buffers.sampled_token_ids.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection sampled token",
-                    self.shape.num_total_reqs as usize,
-                    size_of::<i32>(),
-                ),
-            "sparse rejection sampled-token buffer is too short"
-        );
-        assert!(
-            self.buffers.sampled_token_probs.len_bytes()
-                >= checked_bytes(
-                    "sparse rejection sampled probability",
-                    self.shape.num_total_reqs as usize,
-                    size_of::<f32>(),
-                ),
-            "sparse rejection sampled-probability buffer is too short"
-        );
-        assert!(
-            self.buffers.runtime_params.len_bytes()
-                >= checked_product(
-                    "sparse rejection runtime parameter byte length",
-                    &[self.shape.num_total_reqs as usize, 4, size_of::<u32>()],
-                ),
-            "sparse rejection runtime parameter buffer is too short"
-        );
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.target_distribution_token_ids, 0);
-        builder.set_buffer_read(1, self.buffers.target_distribution_probs, 0);
-        builder.set_buffer_read(2, self.buffers.draft_distribution_token_ids, 0);
-        builder.set_buffer_read(3, self.buffers.draft_distribution_probs, 0);
-        builder.set_buffer_read(4, self.buffers.flat_draft_token_ids, 0);
-        builder.set_buffer_read(5, self.buffers.cu_target_distributions, 0);
-        builder.set_buffer_read(6, self.buffers.cu_draft_distributions, 0);
-        builder.set_buffer_write(7, self.buffers.flat_accepted_token_ids, 0);
-        builder.set_buffer_write(8, self.buffers.flat_accepted_probs, 0);
-        builder.set_buffer_write(9, self.buffers.num_accepted_tokens, 0);
-        builder.set_buffer_write(10, self.buffers.sampled_token_ids, 0);
-        builder.set_buffer_write(11, self.buffers.sampled_token_probs, 0);
-        builder.set_buffer_read(12, self.buffers.runtime_params, 0);
-        builder.set_buffer_read(13, self.buffers.flat_draft_distribution_indices, 0);
-        builder.set_u32(17, self.shape.top_k);
-        builder.set_u32(18, self.shape.max_target_k);
-        builder.set_u32(19, self.shape.max_draft_k);
-        let num_threads_per_req = SAMPLING_NUM_THREADS_PER_THREADBLOCK;
-        let num_total_threads = checked_num_threads(self.shape.num_total_reqs, num_threads_per_req);
-        if num_threads_per_req == num_total_threads {
-            builder.set_u32(14, num_total_threads);
-        } else {
-            builder.bind_u32(
-                14,
-                REJECTION_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_req,
-                num_total_threads,
-            );
-        }
-        if self.shape.num_total_target_distributions == 1 {
-            builder.set_u32(15, 1);
-        } else {
-            builder.bind_u32(
-                15,
-                REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY,
-                1,
-                self.shape.num_total_target_distributions,
-            );
-        }
-        if self.shape.num_total_draft_distributions == 0 {
-            builder.set_u32(16, 0);
-        } else {
-            builder.bind_u32(
-                16,
-                REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY,
-                0,
-                self.shape.num_total_draft_distributions,
-            );
-        }
-        builder.dispatch_1d(
-            num_total_threads as usize,
-            SAMPLING_NUM_THREADS_PER_THREADBLOCK as usize,
-        );
-    }
+    let num_active_threads = checked_num_threads(num_active_sampling_inputs, SAMPLING_NUM_THREADS_PER_THREADBLOCK);
+    let num_total_threads = checked_num_threads(shape.num_total_sampling_inputs, SAMPLING_NUM_THREADS_PER_THREADBLOCK);
+    assert!(num_active_threads <= num_total_threads);
+    arguments.set_u32(TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY, num_active_threads);
 }
 
 #[cfg(test)]
@@ -1072,29 +675,25 @@ mod tests {
     use inference_executor_core::sampling::reference::sparse_sample_row_reference;
     use inference_executor_core::sampling::reference::sparse_sample_row_with_domain_reference;
 
-    use super::checked_num_threads;
-    use crate::components::REJECTION_NUM_ACTIVE_THREADS_KEY;
-    use crate::components::REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY;
-    use crate::components::REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY;
-    use crate::components::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
+    use super::super::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
+    use super::super::checked_num_threads;
+    use super::super::rejection::REJECTION_NUM_ACTIVE_THREADS_KEY;
+    use super::super::rejection::REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY;
+    use super::super::rejection::REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY;
+    use super::TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY;
+    use super::TOP_K_TILE_NUM_ACTIVE_THREADS_KEY;
+    use super::TOP_K_VOCAB_TILE_SIZE;
     use crate::components::SparseRejectionSampleBuffers;
     use crate::components::SparseRejectionSampleKernel;
     use crate::components::SparseRejectionSampleShape;
-    use crate::components::TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY;
-    use crate::components::TOP_K_TILE_NUM_ACTIVE_THREADS_KEY;
-    use crate::components::TOP_K_VOCAB_TILE_SIZE;
-    use crate::components::TopKSampleAndSparseDistributionBuffers;
-    use crate::components::TopKSampleAndSparseDistributionKernel;
+    use crate::components::TopKMergeKernels;
+    use crate::components::TopKSampleAndWriteDistributionBuffers;
     use crate::components::TopKSampleBuffers;
-    use crate::components::TopKSampleKernel;
     use crate::components::TopKSampleShape;
-    use crate::components::TopKSparseDistributionBuffers;
-    use crate::components::TopKSparseDistributionKernel;
-    use crate::components::TopKTileBf16BitonicKernel;
-    use crate::components::TopKTileBf16Kernel;
-    use crate::components::TopKTileBitonicKernel;
+    use crate::components::TopKSamplingOperation;
     use crate::components::TopKTileBuffers;
-    use crate::components::TopKTileKernel;
+    use crate::components::TopKTileKernels;
+    use crate::components::TopKWriteDistributionBuffers;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::ReplayArguments;
@@ -1197,6 +796,35 @@ mod tests {
     }
 
     #[test]
+    fn test_tile_kernel_selection() {
+        let reduction_shape = TopKSampleShape {
+            num_total_sampling_inputs: 1,
+            vocab_size: 256,
+            top_k: 20,
+        };
+        let bitonic_shape = TopKSampleShape {
+            top_k: 64,
+            ..reduction_shape
+        };
+        assert_eq!(
+            super::selected_top_k_tile_kernel(reduction_shape, TopKSamplingOperation::Sample),
+            super::TopKTileKernelKind::Reduction
+        );
+        assert_eq!(
+            super::selected_top_k_tile_kernel(bitonic_shape, TopKSamplingOperation::Sample),
+            super::TopKTileKernelKind::Bitonic
+        );
+        assert_eq!(
+            super::selected_top_k_tile_kernel(reduction_shape, TopKSamplingOperation::WriteDistribution),
+            super::TopKTileKernelKind::Bitonic
+        );
+        assert_eq!(
+            super::selected_top_k_tile_kernel(reduction_shape, TopKSamplingOperation::SampleAndWriteDistribution,),
+            super::TopKTileKernelKind::Bitonic
+        );
+    }
+
+    #[test]
     fn test_greedy() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
@@ -1222,14 +850,17 @@ mod tests {
         );
         let token_ids = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<i32>());
         let token_probs = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<f32>());
-        let topk = TopKTileKernel::new(&device);
-        let sample = TopKSampleKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
+        let sample = TopKMergeKernels::new(&device);
         let runtime_params =
             sampling_runtime_params(&device, shape.num_total_sampling_inputs, 0.0, 1.0, 1, shape.top_k);
 
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1237,7 +868,7 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sample.invoke_replay(
+        builder.record_with_barrier_before(sample.invoke_sample(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -1281,12 +912,15 @@ mod tests {
         let token_ids = Buffer::from_slice(&device, &[-99_i32; 4]);
         let token_probs = Buffer::from_slice(&device, &[-99.0_f32; 4]);
         let runtime_params = sampling_runtime_params(&device, 4, 0.0, 1.0, 7, 1);
-        let topk = TopKTileKernel::new(&device);
-        let sample = TopKSampleKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
+        let sample = TopKMergeKernels::new(&device);
 
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1294,7 +928,7 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sample.invoke_replay(
+        builder.record_with_barrier_before(sample.invoke_sample(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -1336,10 +970,13 @@ mod tests {
             &device,
             super::tile_count(shape, super::vocab_tile_size()) * size_of::<f32>(),
         );
-        let topk = TopKTileKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: shape.vocab_size as usize * size_of::<f32>(),
@@ -1380,8 +1017,9 @@ mod tests {
         );
         let token_ids = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<i32>());
         let token_probs = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<f32>());
-        let topk = TopKTileKernel::new(&device);
-        let sample = TopKSampleKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
+        let sample = TopKMergeKernels::new(&device);
         let temperature = 0.9;
         let top_p = 0.82;
         let runtime_params = sampling_runtime_params(
@@ -1396,6 +1034,8 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1403,7 +1043,7 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sample.invoke_replay(
+        builder.record_with_barrier_before(sample.invoke_sample(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -1488,11 +1128,14 @@ mod tests {
         write_sampling_runtime_params(&runtime_params, 0, &first, 11, SamplingDomain::Target);
         write_sampling_runtime_params(&runtime_params, 1, &second, 29, SamplingDomain::Target);
 
-        let topk = TopKTileKernel::new(&device);
-        let sample = TopKSampleKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
+        let sample = TopKMergeKernels::new(&device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1500,7 +1143,7 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sample.invoke_replay(
+        builder.record_with_barrier_before(sample.invoke_sample(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -1585,11 +1228,14 @@ mod tests {
         write_sampling_runtime_params(&runtime_params, 0, &configs[0], 11, SamplingDomain::Target);
         write_sampling_runtime_params(&runtime_params, 1, &configs[1], 29, SamplingDomain::Draft);
 
-        let topk = TopKTileKernel::new(&device);
-        let sample_sparse_distribution = TopKSampleAndSparseDistributionKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
+        let sample_and_write_distribution = TopKMergeKernels::new(&device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::SampleAndWriteDistribution,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1597,9 +1243,9 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sample_sparse_distribution.invoke_replay(
+        builder.record_with_barrier_before(sample_and_write_distribution.invoke_sample_and_write_distribution(
             shape,
-            TopKSampleAndSparseDistributionBuffers {
+            TopKSampleAndWriteDistributionBuffers {
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
                 sampled_token_ids: &sampled_token_ids,
@@ -1686,8 +1332,9 @@ mod tests {
             &device,
             num_output_distributions as usize * max_k as usize * size_of::<f32>(),
         );
-        let topk = TopKTileKernel::new(&device);
-        let sparse_distribution = TopKSparseDistributionKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
+        let write_distribution = TopKMergeKernels::new(&device);
         let temperature = 0.9;
         let top_p = 0.82;
         let runtime_params = sampling_runtime_params(
@@ -1702,6 +1349,8 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::WriteDistribution,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1709,9 +1358,9 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sparse_distribution.invoke_replay(
+        builder.record_with_barrier_before(write_distribution.invoke_write_distribution(
             shape,
-            TopKSparseDistributionBuffers {
+            TopKWriteDistributionBuffers {
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
                 distribution_token_ids: &distribution_token_ids,
@@ -1781,8 +1430,9 @@ mod tests {
         );
         let token_ids = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<i32>());
         let token_probs = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<f32>());
-        let topk = TopKTileBf16Kernel::new(&device);
-        let sample = TopKSampleKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Bfloat16;
+        let sample = TopKMergeKernels::new(&device);
         let temperature = 0.7;
         let top_p = 0.8;
         let runtime_params = sampling_runtime_params(
@@ -1797,6 +1447,8 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1804,7 +1456,7 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sample.invoke_replay(
+        builder.record_with_barrier_before(sample.invoke_sample(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -1858,8 +1510,9 @@ mod tests {
         );
         let token_ids = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<i32>());
         let token_probs = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<f32>());
-        let topk = TopKTileBitonicKernel::new(&device);
-        let sample = TopKSampleKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Float32;
+        let sample = TopKMergeKernels::new(&device);
         let temperature = 0.7;
         let top_p = 0.8;
         let runtime_params = sampling_runtime_params(
@@ -1874,6 +1527,8 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1881,7 +1536,7 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sample.invoke_replay(
+        builder.record_with_barrier_before(sample.invoke_sample(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -1953,8 +1608,9 @@ mod tests {
         );
         let output_distribution_indices =
             Buffer::from_slice(&device, &(0..shape.num_total_sampling_inputs).collect::<Vec<_>>());
-        let topk = TopKTileBf16BitonicKernel::new(&device);
-        let sparse_distribution = TopKSparseDistributionKernel::new(&device);
+        let topk = TopKTileKernels::new(&device);
+        let logits_dtype = crate::metal::Dtype::Bfloat16;
+        let write_distribution = TopKMergeKernels::new(&device);
         let temperature = 0.7;
         let top_p = 0.8;
         let runtime_params = sampling_runtime_params(
@@ -1969,6 +1625,8 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::WriteDistribution,
             TopKTileBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
@@ -1976,9 +1634,9 @@ mod tests {
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(sparse_distribution.invoke_replay(
+        builder.record_with_barrier_before(write_distribution.invoke_write_distribution(
             shape,
-            TopKSparseDistributionBuffers {
+            TopKWriteDistributionBuffers {
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
                 distribution_token_ids: &distribution_token_ids,
@@ -2048,8 +1706,8 @@ mod tests {
             vec![0.0, 0.10, 0.20, 0.70, 0.0, 0.0],
         ];
         let draft_tokens = vec![2_u32, 3];
-        let target_distribution = sparse_distributions_from_dense(&target_rows, shape.max_target_k as usize);
-        let draft_distribution = sparse_distributions_from_dense(&draft_rows, shape.max_draft_k as usize);
+        let target_distribution = write_distributions_from_dense(&target_rows, shape.max_target_k as usize);
+        let draft_distribution = write_distributions_from_dense(&draft_rows, shape.max_draft_k as usize);
         let flat_draft_distribution_indices = vec![2_u32, 0];
         let mut mapped_draft_distribution_token_ids = vec![-1_i32; 3 * shape.max_draft_k as usize];
         let mut mapped_draft_distribution_probs = vec![0.0_f32; 3 * shape.max_draft_k as usize];
@@ -2328,22 +1986,22 @@ mod tests {
         values.chunks(vocab_size).map(|row| row.to_vec()).collect()
     }
 
-    fn sparse_distributions_from_dense(rows: &[Vec<f32>], row_stride: usize) -> (Vec<i32>, Vec<f32>) {
+    fn write_distributions_from_dense(rows: &[Vec<f32>], row_stride: usize) -> (Vec<i32>, Vec<f32>) {
         let mut token_ids = vec![-1; rows.len() * row_stride];
         let mut probs = vec![0.0; rows.len() * row_stride];
         for (row_index, row) in rows.iter().enumerate() {
-            let mut sparse_distribution = row
+            let mut write_distribution = row
                 .iter()
                 .copied()
                 .enumerate()
                 .filter(|(_, prob)| *prob > 0.0)
                 .map(|(token, prob)| (token as i32, prob))
                 .collect::<Vec<_>>();
-            sparse_distribution
+            write_distribution
                 .sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap().then_with(|| left.0.cmp(&right.0)));
-            assert!(sparse_distribution.len() <= row_stride);
+            assert!(write_distribution.len() <= row_stride);
             let base = row_index * row_stride;
-            for (slot, (token, prob)) in sparse_distribution.into_iter().enumerate() {
+            for (slot, (token, prob)) in write_distribution.into_iter().enumerate() {
                 token_ids[base + slot] = token;
                 probs[base + slot] = prob;
             }

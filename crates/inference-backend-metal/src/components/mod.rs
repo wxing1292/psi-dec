@@ -73,12 +73,6 @@ pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorKernels;
 pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorShape;
 pub use quantized_sparse_mlp::QuantizedSparseMLPWeights;
 
-mod rowwise_add;
-pub use rowwise_add::RowwiseAddBuffers;
-pub use rowwise_add::RowwiseAddConfig;
-pub use rowwise_add::RowwiseAddKernel;
-pub use rowwise_add::RowwiseAddShape;
-
 mod quantized_embedding;
 pub use quantized_embedding::QuantizedEmbeddingBuffers;
 pub use quantized_embedding::QuantizedEmbeddingConfig;
@@ -216,36 +210,21 @@ pub use rms_norm::RMSNormKernel;
 pub use rms_norm::RMSNormShape;
 
 mod sampling;
-pub use sampling::MAX_TOP_K;
-pub use sampling::REJECTION_NUM_ACTIVE_THREADS_KEY;
-pub use sampling::REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY;
-pub use sampling::REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY;
-pub use sampling::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
+pub use sampling::DSparkMarkovTopKMapBuffers;
+pub use sampling::DSparkMarkovTopKMapConfig;
+pub use sampling::DSparkMarkovTopKMapKernel;
+pub use sampling::DSparkMarkovTopKMapShape;
 pub use sampling::SparseRejectionSampleBuffers;
 pub use sampling::SparseRejectionSampleKernel;
 pub use sampling::SparseRejectionSampleShape;
-pub use sampling::TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY;
-pub use sampling::TOP_K_REDUCTION_LIMIT;
-pub use sampling::TOP_K_TILE_NUM_ACTIVE_THREADS_KEY;
-pub use sampling::TOP_K_VOCAB_TILE_SIZE;
-pub use sampling::TopKSampleAndSparseDistributionBuffers;
-pub use sampling::TopKSampleAndSparseDistributionKernel;
+pub use sampling::TopKMergeKernels;
+pub use sampling::TopKSampleAndWriteDistributionBuffers;
 pub use sampling::TopKSampleBuffers;
-pub use sampling::TopKSampleKernel;
 pub use sampling::TopKSampleShape;
-pub use sampling::TopKSparseDistributionBuffers;
-pub use sampling::TopKSparseDistributionKernel;
-pub use sampling::TopKTileBf16BitonicKernel;
-pub use sampling::TopKTileBf16Kernel;
-pub use sampling::TopKTileBitonicKernel;
+pub use sampling::TopKSamplingOperation;
 pub use sampling::TopKTileBuffers;
-pub use sampling::TopKTileKernel;
-
-mod dspark_markov_sampling;
-pub use dspark_markov_sampling::DSparkMarkovTopKMapBuffers;
-pub use dspark_markov_sampling::DSparkMarkovTopKMapConfig;
-pub use dspark_markov_sampling::DSparkMarkovTopKMapKernel;
-pub use dspark_markov_sampling::DSparkMarkovTopKMapShape;
+pub use sampling::TopKTileKernels;
+pub use sampling::TopKWriteDistributionBuffers;
 
 mod silu;
 pub use silu::SiluBufferOffsets;

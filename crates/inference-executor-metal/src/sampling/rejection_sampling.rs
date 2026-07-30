@@ -1,7 +1,3 @@
-use inference_backend_metal::components::REJECTION_NUM_ACTIVE_THREADS_KEY;
-use inference_backend_metal::components::REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY;
-use inference_backend_metal::components::REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY;
-use inference_backend_metal::components::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
 use inference_backend_metal::components::SparseRejectionSampleBuffers;
 use inference_backend_metal::components::SparseRejectionSampleKernel;
 use inference_backend_metal::components::SparseRejectionSampleShape;
@@ -105,33 +101,13 @@ impl SparseRejectionSampling {
         self.validate_input(shape);
         self.runtime_param_rows
             .consume(shape.num_active_reqs, "sparse rejection sampling");
-        if shape.num_total_reqs > 1 {
-            let num_active_threads = shape
-                .num_active_reqs
-                .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
-                .expect("sparse rejection active thread count must fit u32");
-            let num_total_threads = shape
-                .num_total_reqs
-                .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
-                .expect("sparse rejection total thread count must fit u32");
-            assert!(num_active_threads <= num_total_threads);
-            assert_eq!(num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
-            arguments.set_u32(REJECTION_NUM_ACTIVE_THREADS_KEY, num_active_threads);
-        }
-        if shape.num_total_target_distributions > 1 {
-            assert!(shape.num_active_target_distributions <= shape.num_total_target_distributions);
-            arguments.set_u32(
-                REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY,
-                shape.num_active_target_distributions,
-            );
-        }
-        if shape.num_total_draft_distributions > 0 {
-            assert!(shape.num_active_draft_distributions <= shape.num_total_draft_distributions);
-            arguments.set_u32(
-                REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY,
-                shape.num_active_draft_distributions,
-            );
-        }
+        self.kernel.add_replay_arguments(
+            component_shape(shape),
+            shape.num_active_reqs,
+            shape.num_active_target_distributions,
+            shape.num_active_draft_distributions,
+            arguments,
+        );
     }
 
     fn validate_input(&self, shape: SparseRejectionSamplingShape) {

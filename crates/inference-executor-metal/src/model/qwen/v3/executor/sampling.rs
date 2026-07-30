@@ -50,11 +50,7 @@ impl Qwen3Executor {
         sample_decisions_from_sampled_tokens(&self.read_sampled_token_ids(num_decode_reqs))
     }
 
-    fn record_rejection_sampling(
-        &mut self,
-        recorder: &mut Qwen3ModelOpsRecorder,
-        microbatch: &Qwen3Microbatch,
-    ) {
+    fn record_rejection_sampling(&mut self, recorder: &mut Qwen3ModelOpsRecorder, microbatch: &Qwen3Microbatch) {
         assert!(self.dspark_block_size > 0, "Qwen3 rejection sampling requires DSpark");
         let sample_positions = sample_token_positions(microbatch);
         let sampler_configs = sample_sampler_configs(microbatch);
@@ -70,8 +66,7 @@ impl Qwen3Executor {
                 "Qwen3 speculative suffix exceeds DSpark capacity"
             );
             let q_end = microbatch.cu_tokens()[req_index + 1] as usize;
-            for (spec_token_index, &draft_token) in microbatch.flat_token_ids()
-                [q_end - num_spec_tokens..q_end]
+            for (spec_token_index, &draft_token) in microbatch.flat_token_ids()[q_end - num_spec_tokens..q_end]
                 .iter()
                 .enumerate()
             {
@@ -97,8 +92,7 @@ impl Qwen3Executor {
         let num_active_decode_reqs = prepared.num_active_decode_reqs();
         let num_active_draft_distributions = prepared.num_active_draft_distributions;
         let num_active_target_distributions = prepared.num_active_target_distributions();
-        let num_decode_req_capacity =
-            replay_bucket_capacity_usize(num_active_decode_reqs, self.config.max_requests);
+        let num_decode_req_capacity = replay_bucket_capacity_usize(num_active_decode_reqs, self.config.max_requests);
         let max_draft_distributions = self
             .config
             .max_requests
@@ -141,7 +135,7 @@ impl Qwen3Executor {
         let input = RejectionSamplingInput {
             target_shape,
             logits: &self.unembed_logits,
-            target_sparse: TopKSamplingSparseDistributionOutput {
+            target_sparse: TopKSamplingWriteDistributionOutput {
                 token_ids: self.spec_probs.target_token_ids(),
                 probs: self.spec_probs.target_probs(),
                 output_distribution_indices: &self.target_distribution_indices,
@@ -225,9 +219,7 @@ impl Qwen3Executor {
                             .expect("Qwen3 rejection returned a negative accepted token")
                     })
                     .collect(),
-                validated_probs: results
-                    .accepted_probs(flat_draft_index, num_accepted)
-                    .to_vec(),
+                validated_probs: results.accepted_probs(flat_draft_index, num_accepted).to_vec(),
                 sampled_token: results
                     .sampled_token_id(decode_req_index)
                     .try_into()

@@ -57,8 +57,9 @@ logits [num_rows, vocab_size]
   -> sampled token IDs + probabilities
 ```
 
-The small-k path uses repeated maximum reduction for normal top-k <= 32.
-Larger top-k and bf16 sparse-distribution generation use the bitonic tile path.
+The backend selects the tile kernel from the logits dtype, top-k, and required output.
+The small-k path uses repeated maximum reduction for sample-only top-k <= 32.
+Larger top-k and write-distribution generation use the bitonic tile path.
 These operations remain separate pipeline entry points.
 Unused static threadblock storage can reduce occupancy.
 
@@ -131,11 +132,11 @@ The Qwen executor owns three distinct graph and cache stages:
 - `Replay<Sampling>` handles ordinary Main output.
 - `Replay<DraftSampling>` handles MTP draft sampling and sparse draft-distribution storage.
 - `Replay<Qwen3xDSparkSampling>` handles DSpark Markov correction, sampling, and sparse draft storage.
-- `Replay<RejectionSampling>` handles target sparse-distribution generation and sparse rejection.
+- `Replay<RejectionSampling>` handles target write-distribution generation and sparse rejection.
 
 Main and MTP share one `Rc<TopKSampling>` implementation.
 DSpark owns its Markov runtime parameters, tile candidates, and per-step outputs.
-It reuses the generic sample-and-sparse-distribution reducer.
+It reuses the generic sample-and-write-distribution reducer.
 The stages retain separate replay keys and programs.
 
 Main, MTP, and DSpark body token counts remain exact.
@@ -154,7 +155,7 @@ DSparkMarkovTopKMap
   -> add one base-logit row
   -> 64-token tile-local Top-K
 
-TopKSampleAndSparseDistribution
+TopKSampleAndWriteDistribution
   -> global Top-K merge
   -> top-p sampling
   -> sampled token and sparse draft distribution
@@ -233,7 +234,7 @@ The current BF16 path measured 4.158 ms for the complete seven-step replay.
 The F32 candidate measured 4.162 ms.
 The candidate did not produce a measurable performance gain.
 Both contracts sampled `[5310, 5390, 979, 14550, 448, 5091, 369]` in this isolated case.
-The BF16 sparse-distribution fingerprint was `31642210e096a9d7`.
+The BF16 write-distribution fingerprint was `31642210e096a9d7`.
 The F32 fingerprint was `9dacaff10a8cc01d`.
 The proposal probability bits also differed.
 
@@ -297,7 +298,7 @@ cargo bench -p inference-backend-metal --bench rejection_sampling -- \
   --iters 1 --warmup-iters 0 --runs 1
 ```
 
-Supported modes are `top-k-sample`, `top-k-sparse-distribution`, `top-k-sample-and-sparse-distribution`,
+Supported modes are `top-k-sample`, `top-k-write-distribution`, `top-k-sample-and-write-distribution`,
 `rejection-sparse`, and `dspark-markov-top-k-map`.
 The model-executor targets are `qwen35_sampling` and `qwen3_dspark_sampling`.
 [`executor_benchmarks.md`](executor_benchmarks.md) defines shared measurement and provenance rules.

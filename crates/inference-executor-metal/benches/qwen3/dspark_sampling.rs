@@ -259,7 +259,7 @@ impl Fixture {
             .collect::<Vec<_>>();
         println!(
             "output proposal_token_ids={:?} proposal_prob_bits={proposal_prob_bits:?} \
-             sparse_distribution_fingerprint={:016x}",
+             write_distribution_fingerprint={:016x}",
             proposal.token_ids,
             distribution_fingerprint(&distribution_token_ids, &distribution_probs),
         );

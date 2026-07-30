@@ -1,22 +1,13 @@
 use std::mem::size_of;
 
-use inference_backend_metal::components::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
-use inference_backend_metal::components::TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY;
-use inference_backend_metal::components::TOP_K_REDUCTION_LIMIT;
-use inference_backend_metal::components::TOP_K_TILE_NUM_ACTIVE_THREADS_KEY;
-use inference_backend_metal::components::TOP_K_VOCAB_TILE_SIZE;
-use inference_backend_metal::components::TopKSampleAndSparseDistributionBuffers;
-use inference_backend_metal::components::TopKSampleAndSparseDistributionKernel;
+use inference_backend_metal::components::TopKMergeKernels;
+use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
 use inference_backend_metal::components::TopKSampleBuffers;
-use inference_backend_metal::components::TopKSampleKernel;
 use inference_backend_metal::components::TopKSampleShape;
-use inference_backend_metal::components::TopKSparseDistributionBuffers;
-use inference_backend_metal::components::TopKSparseDistributionKernel;
-use inference_backend_metal::components::TopKTileBf16BitonicKernel;
-use inference_backend_metal::components::TopKTileBf16Kernel;
-use inference_backend_metal::components::TopKTileBitonicKernel;
+use inference_backend_metal::components::TopKSamplingOperation;
 use inference_backend_metal::components::TopKTileBuffers;
-use inference_backend_metal::components::TopKTileKernel;
+use inference_backend_metal::components::TopKTileKernels;
+use inference_backend_metal::components::TopKWriteDistributionBuffers;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -32,26 +23,16 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::sampling::RuntimeParamRows;
 
-struct TopKSamplingKernels {
-    topk: TopKTileKernel,
-    topk_bitonic: TopKTileBitonicKernel,
-    topk_bf16: TopKTileBf16Kernel,
-    topk_bf16_bitonic: TopKTileBf16BitonicKernel,
-    sample: TopKSampleKernel,
-    sample_sparse_distribution: TopKSampleAndSparseDistributionKernel,
-    sparse_distribution: TopKSparseDistributionKernel,
+struct TopKSamplingCompute {
+    tile: TopKTileKernels,
+    merge: TopKMergeKernels,
 }
 
-impl TopKSamplingKernels {
-    pub fn new(device: &Device) -> Self {
+impl TopKSamplingCompute {
+    fn new(device: &Device) -> Self {
         Self {
-            topk: TopKTileKernel::new(device),
-            topk_bitonic: TopKTileBitonicKernel::new(device),
-            topk_bf16: TopKTileBf16Kernel::new(device),
-            topk_bf16_bitonic: TopKTileBf16BitonicKernel::new(device),
-            sample: TopKSampleKernel::new(device),
-            sample_sparse_distribution: TopKSampleAndSparseDistributionKernel::new(device),
-            sparse_distribution: TopKSparseDistributionKernel::new(device),
+            tile: TopKTileKernels::new(device),
+            merge: TopKMergeKernels::new(device),
         }
     }
 
@@ -59,7 +40,9 @@ impl TopKSamplingKernels {
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSamplingShape,
-        buffers: TopKSampleForwardBuffers<'a>,
+        logits_dtype: Dtype,
+        buffers: TopKSamplingComputeBuffers<'a>,
+        output: TopKSamplingOutput<'a>,
     ) {
         let shape = component_shape(shape);
         let tile_buffers = TopKTileBuffers {
@@ -68,24 +51,28 @@ impl TopKSamplingKernels {
             tile_token_ids: buffers.tile_token_ids,
             tile_logits: buffers.tile_logits,
         };
-        if uses_reduction_tile_pipeline(shape.top_k) {
-            recorder.record_with_barrier_before(ReplayOp::opaque(self.topk.invoke_replay(shape, tile_buffers)));
-        } else {
-            recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_bitonic.invoke_replay(shape, tile_buffers)));
-        }
-        self.record_sample_from_topk(recorder, shape, buffers);
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.tile.invoke_replay(
+            shape,
+            logits_dtype,
+            TopKSamplingOperation::Sample,
+            tile_buffers,
+        )));
+        self.record_sample_from_topk(recorder, shape, buffers, output);
     }
 
-    fn record_sparse_distribution_bf16<'a>(
+    fn record_write_distribution<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSamplingShape,
-        buffers: TopKSampleForwardBuffers<'a>,
-        sparse_distribution_output: TopKSamplingSparseDistributionOutput<'a>,
+        logits_dtype: Dtype,
+        buffers: TopKSamplingComputeBuffers<'a>,
+        output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
         let shape = component_shape(shape);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_bf16_bitonic.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.tile.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::WriteDistribution,
             TopKTileBuffers {
                 logits: buffers.logits,
                 logits_offset_bytes: buffers.logits_offset_bytes,
@@ -93,19 +80,23 @@ impl TopKSamplingKernels {
                 tile_logits: buffers.tile_logits,
             },
         )));
-        self.record_sparse_distribution_from_topk(recorder, shape, buffers, sparse_distribution_output);
+        self.record_write_distribution_from_topk(recorder, shape, buffers, output);
     }
 
-    fn record_sample_and_sparse_distribution_bf16<'a>(
+    fn record_sample_and_write_distribution<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSamplingShape,
-        buffers: TopKSampleForwardBuffers<'a>,
-        sparse_distribution_output: TopKSamplingSparseDistributionOutput<'a>,
+        logits_dtype: Dtype,
+        buffers: TopKSamplingComputeBuffers<'a>,
+        sample_output: TopKSamplingOutput<'a>,
+        sparse_output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
         let shape = component_shape(shape);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_bf16_bitonic.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.tile.invoke_replay(
             shape,
+            logits_dtype,
+            TopKSamplingOperation::SampleAndWriteDistribution,
             TopKTileBuffers {
                 logits: buffers.logits,
                 logits_offset_bytes: buffers.logits_offset_bytes,
@@ -113,111 +104,86 @@ impl TopKSamplingKernels {
                 tile_logits: buffers.tile_logits,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.sample_sparse_distribution.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.merge.invoke_sample_and_write_distribution(
             shape,
-            TopKSampleAndSparseDistributionBuffers {
+            TopKSampleAndWriteDistributionBuffers {
                 tile_token_ids: buffers.tile_token_ids,
                 tile_logits: buffers.tile_logits,
-                sampled_token_ids: buffers.token_ids,
-                sampled_token_probs: buffers.token_probs,
-                distribution_token_ids: sparse_distribution_output.token_ids,
-                distribution_probs: sparse_distribution_output.probs,
+                sampled_token_ids: sample_output.sampled_token_ids,
+                sampled_token_probs: sample_output.sampled_token_probs,
+                distribution_token_ids: sparse_output.token_ids,
+                distribution_probs: sparse_output.probs,
                 runtime_params: buffers.runtime_params,
-                output_distribution_indices: sparse_distribution_output.output_distribution_indices,
-                max_k: sparse_distribution_output.max_k,
-                num_output_distributions: sparse_distribution_output.num_output_distributions,
+                output_distribution_indices: sparse_output.output_distribution_indices,
+                max_k: sparse_output.max_k,
+                num_output_distributions: sparse_output.num_output_distributions,
             },
         )));
-    }
-
-    fn record_sample_bf16<'a>(
-        &'a self,
-        recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        shape: TopKSamplingShape,
-        buffers: TopKSampleForwardBuffers<'a>,
-    ) {
-        let shape = component_shape(shape);
-        let tile_buffers = TopKTileBuffers {
-            logits: buffers.logits,
-            logits_offset_bytes: buffers.logits_offset_bytes,
-            tile_token_ids: buffers.tile_token_ids,
-            tile_logits: buffers.tile_logits,
-        };
-        if uses_reduction_tile_pipeline(shape.top_k) {
-            recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_bf16.invoke_replay(shape, tile_buffers)));
-        } else {
-            recorder.record_with_barrier_before(ReplayOp::opaque(
-                self.topk_bf16_bitonic.invoke_replay(shape, tile_buffers),
-            ));
-        }
-        self.record_sample_from_topk(recorder, shape, buffers);
     }
 
     fn record_sample_from_topk<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSampleShape,
-        buffers: TopKSampleForwardBuffers<'a>,
+        buffers: TopKSamplingComputeBuffers<'a>,
+        output: TopKSamplingOutput<'a>,
     ) {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.sample.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.merge.invoke_sample(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: buffers.tile_token_ids,
                 tile_logits: buffers.tile_logits,
-                token_ids: buffers.token_ids,
-                token_probs: buffers.token_probs,
+                token_ids: output.sampled_token_ids,
+                token_probs: output.sampled_token_probs,
                 runtime_params: buffers.runtime_params,
             },
         )));
     }
 
-    fn record_sparse_distribution_from_topk<'a>(
+    fn record_write_distribution_from_topk<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSampleShape,
-        buffers: TopKSampleForwardBuffers<'a>,
-        sparse_distribution_output: TopKSamplingSparseDistributionOutput<'a>,
+        buffers: TopKSamplingComputeBuffers<'a>,
+        output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.sparse_distribution.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.merge.invoke_write_distribution(
             shape,
-            TopKSparseDistributionBuffers {
+            TopKWriteDistributionBuffers {
                 tile_token_ids: buffers.tile_token_ids,
                 tile_logits: buffers.tile_logits,
-                distribution_token_ids: sparse_distribution_output.token_ids,
-                distribution_probs: sparse_distribution_output.probs,
+                distribution_token_ids: output.token_ids,
+                distribution_probs: output.probs,
                 runtime_params: buffers.runtime_params,
-                output_distribution_indices: sparse_distribution_output.output_distribution_indices,
-                max_k: sparse_distribution_output.max_k,
-                num_output_distributions: sparse_distribution_output.num_output_distributions,
+                output_distribution_indices: output.output_distribution_indices,
+                max_k: output.max_k,
+                num_output_distributions: output.num_output_distributions,
             },
         )));
     }
 }
 
 #[derive(Clone, Copy)]
-struct TopKSampleForwardBuffers<'a> {
+struct TopKSamplingComputeBuffers<'a> {
     logits: &'a Buffer,
     logits_offset_bytes: usize,
     tile_token_ids: &'a Buffer,
     tile_logits: &'a Buffer,
-    token_ids: &'a Buffer,
-    token_probs: &'a Buffer,
     runtime_params: &'a Buffer,
 }
 
 struct TopKSamplingScratch {
     tile_token_ids: Buffer,
     tile_logits: Buffer,
-    runtime_params: TopKSamplingRuntimeParams,
 }
 
 impl TopKSamplingScratch {
-    fn new(device: &Device, bounds: TopKSamplingBounds) -> Self {
+    fn new(device: &Device, bounds: TopKSamplingBounds, tile: &TopKTileKernels) -> Self {
         let max_shape = bounds.max_shape();
+        let candidate_count = tile.candidate_count(component_shape(max_shape));
         Self {
-            tile_token_ids: Buffer::new_zeroed_elements(device, max_shape.tile_count(), Dtype::Int32),
-            tile_logits: Buffer::new_zeroed_elements(device, max_shape.tile_count(), Dtype::Float32),
-            runtime_params: TopKSamplingRuntimeParams::new(device, bounds),
+            tile_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
+            tile_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
         }
     }
 }
@@ -283,8 +249,12 @@ impl TopKSamplingRuntimeParams {
     }
 
     pub fn consume(&self, shape: TopKSamplingShape) {
-        validate_shape(self.bounds, shape);
+        self.validate(shape);
         self.rows.consume(shape.num_active_sampling_inputs, "top-k sampling");
+    }
+
+    fn validate(&self, shape: TopKSamplingShape) {
+        validate_shape(self.bounds, shape);
     }
 }
 
@@ -315,7 +285,7 @@ impl TopKSamplingOutputBuffers {
 }
 
 #[derive(Clone, Copy)]
-pub struct TopKSamplingSparseDistributionOutput<'a> {
+pub struct TopKSamplingWriteDistributionOutput<'a> {
     pub token_ids: &'a Buffer,
     pub probs: &'a Buffer,
     pub output_distribution_indices: &'a Buffer,
@@ -324,177 +294,120 @@ pub struct TopKSamplingSparseDistributionOutput<'a> {
 }
 
 pub struct TopKSampling {
-    kernels: TopKSamplingKernels,
-    bounds: TopKSamplingBounds,
+    compute: TopKSamplingCompute,
+    runtime_params: TopKSamplingRuntimeParams,
     scratch: TopKSamplingScratch,
 }
 
 impl TopKSampling {
     pub fn new(device: &Device, bounds: TopKSamplingBounds) -> Self {
         bounds.validate();
+        let compute = TopKSamplingCompute::new(device);
+        let scratch = TopKSamplingScratch::new(device, bounds, &compute.tile);
         Self {
-            kernels: TopKSamplingKernels::new(device),
-            bounds,
-            scratch: TopKSamplingScratch::new(device, bounds),
+            compute,
+            runtime_params: TopKSamplingRuntimeParams::new(device, bounds),
+            scratch,
         }
     }
 
     pub fn set_configs(&self, configs: &[SamplerConfig], sample_positions: &[u32], domain: SamplingDomain) {
-        self.scratch
-            .runtime_params
-            .set_configs(configs, sample_positions, domain);
+        self.runtime_params.set_configs(configs, sample_positions, domain);
     }
 
     pub fn record<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSamplingShape,
+        logits_dtype: TopKSamplingLogitsDtype,
         inputs: TopKSamplingInputs<'a>,
         output: TopKSamplingOutput<'a>,
     ) {
-        self.validate_input(shape);
-        self.kernels.record_sample(
+        self.validate(shape);
+        self.compute.record_sample(
             recorder,
             shape,
-            TopKSampleForwardBuffers {
+            component_logits_dtype(logits_dtype),
+            TopKSamplingComputeBuffers {
                 logits: inputs.logits,
                 logits_offset_bytes: inputs.logits_offset_bytes,
                 tile_token_ids: &self.scratch.tile_token_ids,
                 tile_logits: &self.scratch.tile_logits,
-                token_ids: output.sampled_token_ids,
-                token_probs: output.sampled_token_probs,
-                runtime_params: self.scratch.runtime_params.buffer(),
-            },
-        );
-    }
-
-    pub fn record_bf16<'a>(
-        &'a self,
-        recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        shape: TopKSamplingShape,
-        inputs: TopKSamplingInputs<'a>,
-        output: TopKSamplingOutput<'a>,
-    ) {
-        self.validate_input(shape);
-        self.kernels.record_sample_bf16(
-            recorder,
-            shape,
-            TopKSampleForwardBuffers {
-                logits: inputs.logits,
-                logits_offset_bytes: inputs.logits_offset_bytes,
-                tile_token_ids: &self.scratch.tile_token_ids,
-                tile_logits: &self.scratch.tile_logits,
-                token_ids: output.sampled_token_ids,
-                token_probs: output.sampled_token_probs,
-                runtime_params: self.scratch.runtime_params.buffer(),
-            },
-        );
-    }
-
-    pub fn record_sparse_distribution_bf16<'a>(
-        &'a self,
-        recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        shape: TopKSamplingShape,
-        inputs: TopKSamplingInputs<'a>,
-        output: TopKSamplingSparseDistributionOutput<'a>,
-    ) {
-        self.validate_input(shape);
-        self.kernels.record_sparse_distribution_bf16(
-            recorder,
-            shape,
-            TopKSampleForwardBuffers {
-                logits: inputs.logits,
-                logits_offset_bytes: inputs.logits_offset_bytes,
-                tile_token_ids: &self.scratch.tile_token_ids,
-                tile_logits: &self.scratch.tile_logits,
-                token_ids: &self.scratch.tile_token_ids,
-                token_probs: &self.scratch.tile_logits,
-                runtime_params: self.scratch.runtime_params.buffer(),
+                runtime_params: self.runtime_params.buffer(),
             },
             output,
         );
     }
 
-    pub fn record_bf16_with_sparse_distribution<'a>(
+    pub fn record_write_distribution<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSamplingShape,
+        logits_dtype: TopKSamplingLogitsDtype,
         inputs: TopKSamplingInputs<'a>,
-        sample_output: TopKSamplingOutput<'a>,
-        sparse_distribution_output: TopKSamplingSparseDistributionOutput<'a>,
+        output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
-        self.validate_input(shape);
-        self.kernels.record_sample_and_sparse_distribution_bf16(
+        self.validate(shape);
+        self.compute.record_write_distribution(
             recorder,
             shape,
-            TopKSampleForwardBuffers {
+            component_logits_dtype(logits_dtype),
+            TopKSamplingComputeBuffers {
                 logits: inputs.logits,
                 logits_offset_bytes: inputs.logits_offset_bytes,
                 tile_token_ids: &self.scratch.tile_token_ids,
                 tile_logits: &self.scratch.tile_logits,
-                token_ids: sample_output.sampled_token_ids,
-                token_probs: sample_output.sampled_token_probs,
-                runtime_params: self.scratch.runtime_params.buffer(),
+                runtime_params: self.runtime_params.buffer(),
             },
-            sparse_distribution_output,
+            output,
+        );
+    }
+
+    pub fn record_with_write_distribution<'a>(
+        &'a self,
+        recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
+        shape: TopKSamplingShape,
+        logits_dtype: TopKSamplingLogitsDtype,
+        inputs: TopKSamplingInputs<'a>,
+        sample_output: TopKSamplingOutput<'a>,
+        write_distribution_output: TopKSamplingWriteDistributionOutput<'a>,
+    ) {
+        self.validate(shape);
+        self.compute.record_sample_and_write_distribution(
+            recorder,
+            shape,
+            component_logits_dtype(logits_dtype),
+            TopKSamplingComputeBuffers {
+                logits: inputs.logits,
+                logits_offset_bytes: inputs.logits_offset_bytes,
+                tile_token_ids: &self.scratch.tile_token_ids,
+                tile_logits: &self.scratch.tile_logits,
+                runtime_params: self.runtime_params.buffer(),
+            },
+            sample_output,
+            write_distribution_output,
         );
     }
 
     pub fn active_shape(&self, configs: &[SamplerConfig]) -> TopKSamplingShape {
-        self.scratch.runtime_params.active_shape(configs)
+        self.runtime_params.active_shape(configs)
     }
 
     pub fn add_replay_arguments(&self, shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
-        self.validate_input(shape);
-        self.scratch.runtime_params.consume(shape);
-        add_top_k_sampling_replay_arguments(shape, arguments);
+        self.validate(shape);
+        self.runtime_params.consume(shape);
+        let component_shape = component_shape(shape);
+        self.compute
+            .tile
+            .add_replay_arguments(component_shape, shape.num_active_sampling_inputs, arguments);
+        self.compute
+            .merge
+            .add_replay_arguments(component_shape, shape.num_active_sampling_inputs, arguments);
     }
 
-    fn validate_input(&self, shape: TopKSamplingShape) {
-        validate_shape(self.bounds, shape);
+    fn validate(&self, shape: TopKSamplingShape) {
+        self.runtime_params.validate(shape);
     }
-}
-
-fn add_top_k_sampling_replay_arguments(shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
-    add_top_k_sampling_tile_replay_argument(shape, arguments);
-    add_top_k_sampling_merge_replay_argument(shape, arguments);
-}
-
-fn add_top_k_sampling_tile_replay_argument(shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
-    if shape.num_total_sampling_inputs <= 1 {
-        return;
-    }
-    let num_tiles = shape.vocab_size.div_ceil(TOP_K_VOCAB_TILE_SIZE);
-    let tile_num_active_threads = shape
-        .num_active_sampling_inputs
-        .checked_mul(num_tiles)
-        .and_then(|threads| threads.checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK))
-        .expect("top-k tile active thread count must fit u32");
-    let tile_num_total_threads = shape
-        .num_total_sampling_inputs
-        .checked_mul(num_tiles)
-        .and_then(|threads| threads.checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK))
-        .expect("top-k tile total thread count must fit u32");
-    assert!(tile_num_active_threads <= tile_num_total_threads);
-    assert_eq!(tile_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
-    arguments.set_u32(TOP_K_TILE_NUM_ACTIVE_THREADS_KEY, tile_num_active_threads);
-}
-
-pub fn add_top_k_sampling_merge_replay_argument(shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
-    if shape.num_total_sampling_inputs <= 1 {
-        return;
-    }
-    let merge_num_active_threads = shape
-        .num_active_sampling_inputs
-        .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
-        .expect("top-k merge active thread count must fit u32");
-    let merge_num_total_threads = shape
-        .num_total_sampling_inputs
-        .checked_mul(SAMPLING_NUM_THREADS_PER_THREADBLOCK)
-        .expect("top-k merge total thread count must fit u32");
-    assert!(merge_num_active_threads <= merge_num_total_threads);
-    assert_eq!(merge_num_active_threads % SAMPLING_NUM_THREADS_PER_THREADBLOCK, 0);
-    arguments.set_u32(TOP_K_MERGE_NUM_ACTIVE_THREADS_KEY, merge_num_active_threads);
 }
 
 #[derive(Clone, Copy)]
@@ -513,14 +426,14 @@ impl ReplayLayer for TopKSampling {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        match input.logits_dtype {
-            TopKSamplingLogitsDtype::Float32 => {
-                Self::record(self, recorder, input.shape, input.inputs, input.output);
-            },
-            TopKSamplingLogitsDtype::Bfloat16 => {
-                Self::record_bf16(self, recorder, input.shape, input.inputs, input.output);
-            },
-        }
+        Self::record(
+            self,
+            recorder,
+            input.shape,
+            input.logits_dtype,
+            input.inputs,
+            input.output,
+        );
         input.output
     }
 }
@@ -545,6 +458,13 @@ fn component_shape(shape: TopKSamplingShape) -> TopKSampleShape {
     }
 }
 
+fn component_logits_dtype(dtype: TopKSamplingLogitsDtype) -> Dtype {
+    match dtype {
+        TopKSamplingLogitsDtype::Float32 => Dtype::Float32,
+        TopKSamplingLogitsDtype::Bfloat16 => Dtype::Bfloat16,
+    }
+}
+
 fn validate_shape(bounds: TopKSamplingBounds, shape: TopKSamplingShape) {
     assert!(
         shape.num_total_sampling_inputs <= bounds.max_sampling_inputs,
@@ -559,21 +479,4 @@ fn validate_shape(bounds: TopKSamplingBounds, shape: TopKSamplingShape) {
         shape.top_k > 0 && shape.top_k <= bounds.top_k,
         "top-k sampling width exceeds capacity"
     );
-}
-
-fn uses_reduction_tile_pipeline(top_k: u32) -> bool {
-    top_k <= TOP_K_REDUCTION_LIMIT
-}
-
-#[cfg(test)]
-mod tests {
-    use super::uses_reduction_tile_pipeline;
-
-    #[test]
-    fn test_pipeline_boundary() {
-        assert!(uses_reduction_tile_pipeline(1));
-        assert!(uses_reduction_tile_pipeline(32));
-        assert!(!uses_reduction_tile_pipeline(33));
-        assert!(!uses_reduction_tile_pipeline(256));
-    }
 }

@@ -92,9 +92,9 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   Otherwise, it uses the Main unembed weights, as the production executor does.
   It measures gather and unembed together for `block_size` rows per request.
 - `qwen3_dspark_sampling` loads real DSpark Markov weights.
-  It measures the complete sequential fused Markov-map, sampling, and sparse-distribution replay.
+  It measures the complete sequential fused Markov-map, sampling, and write-distribution replay.
   Each proposal step uses one fused W1, W2, base-logit-add, and tile-Top-K map.
-  It then uses the generic sample-and-sparse-distribution reducer.
+  It then uses the generic sample-and-write-distribution reducer.
   It accepts `--temperature`, `--top-k`, `--top-p`, and `--seed`.
   It prints proposal token IDs, exact proposal probability bits, and a stable fingerprint of the complete sparse draft
   distribution.
@@ -106,6 +106,7 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
     -> GatherUnembed
     -> Markov correction + sampling
   ```
+
 - `qwen35_gdn` measures the current ragged recurrent GDN path with the 35B-A3B profile.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer4`, `first4`, or `main_all`.

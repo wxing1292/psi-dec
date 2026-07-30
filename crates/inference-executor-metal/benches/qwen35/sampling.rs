@@ -11,11 +11,12 @@ use inference_backend_metal::metal::Stream;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::TopKSamplingBounds;
+use inference_executor_core::sampling::TopKSamplingLogitsDtype;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::sampling::top_k_sampling::TopKSampling;
 use inference_executor_metal::sampling::top_k_sampling::TopKSamplingInputs;
 use inference_executor_metal::sampling::top_k_sampling::TopKSamplingOutputBuffers;
-use inference_executor_metal::sampling::top_k_sampling::TopKSamplingSparseDistributionOutput;
+use inference_executor_metal::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
 fn main() {
     let args = Args::parse();
@@ -40,22 +41,22 @@ fn main() {
 #[derive(Clone, Copy)]
 enum BenchMode {
     Sample,
-    SampleAndSparseDistribution,
+    SampleAndWriteDistribution,
 }
 
 impl BenchMode {
     fn parse(value: &str) -> Self {
         match value {
             "top-k-sample" => Self::Sample,
-            "top-k-sample-and-sparse-distribution" => Self::SampleAndSparseDistribution,
-            other => panic!("unknown --mode {other:?}; expected top-k-sample or top-k-sample-and-sparse-distribution"),
+            "top-k-sample-and-write-distribution" => Self::SampleAndWriteDistribution,
+            other => panic!("unknown --mode {other:?}; expected top-k-sample or top-k-sample-and-write-distribution"),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Sample => "top-k-sample",
-            Self::SampleAndSparseDistribution => "top-k-sample-and-sparse-distribution",
+            Self::SampleAndWriteDistribution => "top-k-sample-and-write-distribution",
         }
     }
 }
@@ -113,7 +114,7 @@ impl Args {
 fn print_help_and_exit() -> ! {
     println!(
         r#"qwen35_sampling bench
---mode top-k-sample|top-k-sample-and-sparse-distribution
+--mode top-k-sample|top-k-sample-and-write-distribution
 --rows 1,4
 --vocab 32768
 --top-k 32
@@ -161,9 +162,10 @@ impl SamplingFixture {
         let mut recorder = runtime.create_recorder();
         match mode {
             BenchMode::Sample => {
-                sampler.record_bf16(
+                sampler.record(
                     &mut recorder,
                     shape,
+                    TopKSamplingLogitsDtype::Bfloat16,
                     TopKSamplingInputs {
                         logits: &logits,
                         logits_offset_bytes: 0,
@@ -171,20 +173,21 @@ impl SamplingFixture {
                     output.as_output(),
                 );
             },
-            BenchMode::SampleAndSparseDistribution => {
+            BenchMode::SampleAndWriteDistribution => {
                 let distribution_token_ids =
                     Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<i32>());
                 let distribution_probs = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<f32>());
                 let output_distribution_indices = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
-                sampler.record_bf16_with_sparse_distribution(
+                sampler.record_with_write_distribution(
                     &mut recorder,
                     shape,
+                    TopKSamplingLogitsDtype::Bfloat16,
                     TopKSamplingInputs {
                         logits: &logits,
                         logits_offset_bytes: 0,
                     },
                     output.as_output(),
-                    TopKSamplingSparseDistributionOutput {
+                    TopKSamplingWriteDistributionOutput {
                         token_ids: &distribution_token_ids,
                         probs: &distribution_probs,
                         output_distribution_indices: &output_distribution_indices,

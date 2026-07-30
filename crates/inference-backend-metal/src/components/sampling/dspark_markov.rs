@@ -1,7 +1,7 @@
 use std::mem::size_of;
 
-use crate::components::TOP_K_TILE_NUM_ACTIVE_THREADS_KEY;
-use crate::components::TopKSampleShape;
+use super::top_k::TOP_K_TILE_NUM_ACTIVE_THREADS_KEY;
+use super::top_k::TopKSampleShape;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -9,7 +9,7 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 
-const DSPARK_MARKOV_SAMPLING_SOURCE: &str = include_str!("metal/dspark_markov_sampling.metal");
+const DSPARK_MARKOV_SAMPLING_SOURCE: &str = include_str!("../metal/dspark_markov_sampling.metal");
 const DSPARK_MARKOV_SIMD_WIDTH: u32 = 32;
 const DSPARK_MARKOV_RESULTS_PER_SIMDGROUP: u32 = 4;
 const DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK: u32 = 128;

@@ -2,7 +2,7 @@ use half::bf16;
 use inference_backend_metal::MetalRuntime;
 use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
-use inference_backend_metal::components::TopKSampleAndSparseDistributionKernel;
+use inference_backend_metal::components::TopKMergeKernels;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
@@ -108,7 +108,7 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         max_requests: MAX_REQUESTS,
         weights,
         top_k_map,
-        sample_reduce: TopKSampleAndSparseDistributionKernel::new(device),
+        sample_reduce: TopKMergeKernels::new(device),
         anchor_token_ids: Buffer::new_zeroed_elements(device, MAX_REQUESTS, Dtype::Int32),
         tile_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
         tile_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),

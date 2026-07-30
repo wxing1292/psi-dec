@@ -614,20 +614,20 @@ The executor must not implement global scheduling policy.
 
 The first-principles audit used these questions:
 
-| Question | Result |
-| --- | --- |
-| Does each persistent value follow accepted Main history? | Yes. Main K/V and DSpark context K/V share one cache-block lifecycle. |
-| Can proposal-local state escape its batch? | No. Local Q/K/V and attention partials live in `DSparkBlockScratch`. |
-| Does every CPU dependency create one clear wait boundary? | Yes. Main output is read before Spec block construction. |
-| Does any component submit or wait internally? | No. The service owns both boundaries. |
-| Does Main depend on a concrete DSpark model? | No. Main exposes only the residual-capture seam. |
-| Does Spec use the official anchor-first layout? | Yes. `N` rows produce `N` proposal tokens. |
-| Can ragged requests keep identity across batches? | Yes. Draft distributions use request-slot identity. |
-| Can sparse rejection read compact Main rows correctly? | Yes. Main verification distributions use compact identity indices. |
-| Does context length increase static attention scratch? | No. Metadata divides history across a fixed task capacity. |
-| Does replay caching include all command-topology inputs? | Yes. Keys include active row counts and SDPA task capacity. |
-| Does a prefill-only batch need a dummy Spec submission? | No. It has no sampled anchor and records no Spec work. |
-| Does the design require a backend-neutral replay redesign? | No. Existing lifecycle and Metal replay composition are sufficient. |
+| Question                                                   | Result                                                                |
+| ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| Does each persistent value follow accepted Main history?   | Yes. Main K/V and DSpark context K/V share one cache-block lifecycle. |
+| Can proposal-local state escape its batch?                 | No. Local Q/K/V and attention partials live in `DSparkBlockScratch`.  |
+| Does every CPU dependency create one clear wait boundary?  | Yes. Main output is read before Spec block construction.              |
+| Does any component submit or wait internally?              | No. The service owns both boundaries.                                 |
+| Does Main depend on a concrete DSpark model?               | No. Main exposes only the residual-capture seam.                      |
+| Does Spec use the official anchor-first layout?            | Yes. `N` rows produce `N` proposal tokens.                            |
+| Can ragged requests keep identity across batches?          | Yes. Draft distributions use request-slot identity.                   |
+| Can sparse rejection read compact Main rows correctly?     | Yes. Main verification distributions use compact identity indices.    |
+| Does context length increase static attention scratch?     | No. Metadata divides history across a fixed task capacity.            |
+| Does replay caching include all command-topology inputs?   | Yes. Keys include active row counts and SDPA task capacity.           |
+| Does a prefill-only batch need a dummy Spec submission?    | No. It has no sampled anchor and records no Spec work.                |
+| Does the design require a backend-neutral replay redesign? | No. Existing lifecycle and Metal replay composition are sufficient.   |
 
 No unresolved design item blocks the fixed-block milestone.
 The remaining items are implementation verification or explicitly deferred features.
@@ -681,13 +681,13 @@ Reason: The current boundary expresses all required CPU and GPU dependencies.
 
 Use this order for the marked follow-up work:
 
-| Order | Work | Completion condition |
-| ---: | --- | --- |
-| 1 | Main multi-row verification investigation | Separate Main body, GatherUnembed, and sparse rejection evidence without adding a submission boundary. |
-| 2 | Deterministic DSpark end-to-end validation | Re-run throughput, proposal count, accepted-token count, acceptance efficiency, and stage timing after the retained proposal and Main changes. |
-| 3 | Confidence and global scheduling | Execute the confidence head first. Add variable proposal lengths only when runtime scheduling owns the cross-request budget. |
-| 4 | Checkpoint-triggered DSpark variants | Add gated attention or other layout/head variants only for a real supported checkpoint. |
-| 5 | Replay and overlap evolution | Review these boundaries only after the fixed-block lifecycle and all in-flight owners are stable. |
+| Order | Work                                       | Completion condition                                                                                                                           |
+| ----: | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+|     1 | Main multi-row verification investigation  | Separate Main body, GatherUnembed, and sparse rejection evidence without adding a submission boundary.                                         |
+|     2 | Deterministic DSpark end-to-end validation | Re-run throughput, proposal count, accepted-token count, acceptance efficiency, and stage timing after the retained proposal and Main changes. |
+|     3 | Confidence and global scheduling           | Execute the confidence head first. Add variable proposal lengths only when runtime scheduling owns the cross-request budget.                   |
+|     4 | Checkpoint-triggered DSpark variants       | Add gated attention or other layout/head variants only for a real supported checkpoint.                                                        |
+|     5 | Replay and overlap evolution               | Review these boundaries only after the fixed-block lifecycle and all in-flight owners are stable.                                              |
 
 Items in a later row must not block an earlier row unless new correctness evidence identifies a dependency.
 
@@ -759,16 +759,16 @@ Do not add an executor-visible mixed-dtype mode.
 An alternating full-replay benchmark compared the retained manual QMV/BM32 policy with adaptive selection.
 Both runs used one request, context length 0, 30 warmup iterations, 100 measured iterations, and five runs.
 
-| Rows | Manual QMV/BM32 | Adaptive | Change |
-| ---: | ---: | ---: | ---: |
-| 1 | 324.055 us | 323.548 us | -0.2% |
-| 6 | 463.776 us | 426.542 us | -8.0% |
-| 8 | 520.372 us | 443.192 us | -14.8% |
-| 10 | 576.680 us | 515.592 us | -10.6% |
-| 12 | 660.710 us | 575.605 us | -12.9% |
-| 16 | 707.483 us | 575.712 us | -18.6% |
-| 18 | 733.124 us | 716.686 us | -2.2% |
-| 32 | 809.142 us | 813.413 us | +0.5% |
+| Rows | Manual QMV/BM32 |   Adaptive | Change |
+| ---: | --------------: | ---------: | -----: |
+|    1 |      324.055 us | 323.548 us |  -0.2% |
+|    6 |      463.776 us | 426.542 us |  -8.0% |
+|    8 |      520.372 us | 443.192 us | -14.8% |
+|   10 |      576.680 us | 515.592 us | -10.6% |
+|   12 |      660.710 us | 575.605 us | -12.9% |
+|   16 |      707.483 us | 575.712 us | -18.6% |
+|   18 |      733.124 us | 716.686 us |  -2.2% |
+|   32 |      809.142 us | 813.413 us |  +0.5% |
 
 Rows 1, 18, and 32 use the same kernel family in both policies and remain within run-to-run variance.
 Rows 6 through 16 benefit from the BM8/BN32 and BM16/BN32 candidates.
@@ -937,10 +937,10 @@ Both paths generated the same 98-token deterministic trajectory and then reached
 The first sample warmed the replay and device state.
 The median uses the last three samples.
 
-| Path | Stable samples | Median | Output chunks |
-| --- | --- | ---: | ---: |
-| Main-only | 41.180, 41.187, 41.152 tok/s | 41.180 tok/s | 98 |
-| DSpark | 33.611, 33.581, 33.655 tok/s | 33.611 tok/s | 34 |
+| Path      | Stable samples               |       Median | Output chunks |
+| --------- | ---------------------------- | -----------: | ------------: |
+| Main-only | 41.180, 41.187, 41.152 tok/s | 41.180 tok/s |            98 |
+| DSpark    | 33.611, 33.581, 33.655 tok/s | 33.611 tok/s |            34 |
 
 The DSpark path was `18.4%` slower than Main-only.
 It submitted 33 Spec verification batches after the initial Main token.
@@ -971,12 +971,12 @@ cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
 
 The median phase times were:
 
-| Case and phase | Median |
-| --- | ---: |
-| Main-only, one-token full Main submission | 27.345 ms |
-| DSpark, eight-token Main verification submission | 86.922 ms |
-| DSpark proposal submission | 14.436 ms |
-| DSpark complete cycle | 101.193 ms |
+| Case and phase                                   |     Median |
+| ------------------------------------------------ | ---------: |
+| Main-only, one-token full Main submission        |  27.345 ms |
+| DSpark, eight-token Main verification submission |  86.922 ms |
+| DSpark proposal submission                       |  14.436 ms |
+| DSpark complete cycle                            | 101.193 ms |
 
 Steady record, read, and commit work contributed less than `0.04 ms` to one DSpark cycle.
 The Main verification submission contributed approximately `85.9%` of the cycle.
@@ -1058,10 +1058,10 @@ Its empty `GatherUnembed` and sampling stages recorded no replay.
 The DSpark case recorded `DSparkEmbed`, all five DSpark layers, and final norm for seven proposal rows.
 Both cases measured submit and wait only.
 
-| Forward case | Total | Per layer |
-| --- | ---: | ---: |
-| Main | 73.547 ms | 1.839 ms |
-| DSpark | 9.809 ms | 1.962 ms |
+| Forward case |     Total | Per layer |
+| ------------ | --------: | --------: |
+| Main         | 73.547 ms |  1.839 ms |
+| DSpark       |  9.809 ms |  1.962 ms |
 
 The DSpark forward took `13.3%` of the complete Main forward time.
 The DSpark per-layer time was `6.7%` higher.
@@ -1083,12 +1083,12 @@ The remaining threads waited for the reduction and then produced the output dime
 
 The thread-count sweep for that original kernel was:
 
-| Threads | Shared memory | Median |
-| ---: | ---: | ---: |
-| 32 | 156 bytes | 290.676 µs |
-| 64 | 284 bytes | 287.702 µs |
-| 128 | 540 bytes | 283.614 µs |
-| 256 | 1,052 bytes | 288.918 µs |
+| Threads | Shared memory |     Median |
+| ------: | ------------: | ---------: |
+|      32 |     156 bytes | 290.676 µs |
+|      64 |     284 bytes | 287.702 µs |
+|     128 |     540 bytes | 283.614 µs |
+|     256 |   1,052 bytes | 288.918 µs |
 
 The 128-thread case was the best original configuration.
 It gave one thread to each output dimension.
@@ -1155,10 +1155,10 @@ It did not include DSpark forward, Markov correction, or sampling.
 An exact production-path A/B comparison changed only the QMV-to-QMM crossover during the baseline run.
 The retained policy selects QMM BM16/BN32 for this seven-row shape.
 
-| `GatherUnembed` policy | Median |
-| --- | ---: |
-| QMV baseline | 4.166 ms |
-| QMM BM16/BN32 | 3.056 ms |
+| `GatherUnembed` policy |   Median |
+| ---------------------- | -------: |
+| QMV baseline           | 4.166 ms |
+| QMM BM16/BN32          | 3.056 ms |
 
 QMM BM16/BN32 reduced this stage by `26.6%`.
 The backend kernel has a CPU-reference correctness test for Q4 BF16 input.
@@ -1169,12 +1169,12 @@ It retains the general policy for smaller-output shapes.
 
 The row-count policy used representative DSpark batch shapes:
 
-| Rows | QMM BM16/BN32 | QMM BM32/BN32 | Selected |
-| ---: | ---: | ---: | --- |
-| 14 | 2.938 ms | 5.443 ms | QMM BM16/BN32 |
-| 16 | 3.431 ms | 5.674 ms | QMM BM16/BN32 |
-| 21 | 5.741 ms | 5.275 ms | QMM BM32/BN32 |
-| 28 | 6.101 ms | 5.761 ms | QMM BM32/BN32 |
+| Rows | QMM BM16/BN32 | QMM BM32/BN32 | Selected      |
+| ---: | ------------: | ------------: | ------------- |
+|   14 |      2.938 ms |      5.443 ms | QMM BM16/BN32 |
+|   16 |      3.431 ms |      5.674 ms | QMM BM16/BN32 |
+|   21 |      5.741 ms |      5.275 ms | QMM BM32/BN32 |
+|   28 |      6.101 ms |      5.761 ms | QMM BM32/BN32 |
 
 The Markov and sampling command was:
 
@@ -1189,14 +1189,14 @@ cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
 ```
 
 The production component used `block_size=7`, `vocab_size=151936`, and `markov_rank=256`.
-It measured the complete sequential Markov correction, sampling, and sparse-distribution replay.
+It measured the complete sequential Markov correction, sampling, and write-distribution replay.
 The earlier top-k 1 measurement had a `1.398 ms` median.
 
 The optimized Markov path records two commands for each proposal position:
 
 ```text
 fused W1 -> W2 -> base-logit add -> 64-token tile Top-K
-  -> generic global Top-K/top-p/sample/sparse-distribution reducer
+  -> generic global Top-K/top-p/sample/write-distribution reducer
 ```
 
 The seven-position block uses 14 commands in one Spec submission.
@@ -1215,18 +1215,18 @@ The tile choice therefore used both the source-level live-value count and real-w
 
 The real-weight tile sweep used the same Qwen3-14B DSpark checkpoint and one request:
 
-| Map tile, threads, and implementation | Complete Markov sampling median |
-| --- | ---: |
-| Original five-command step | 1.729050 ms |
-| 256-token tile, 256 threads, before affine reuse | 2.499804 ms |
-| 64-token tile, 256 threads, before affine reuse | 2.081029 ms |
-| 32-token tile, 256 threads, before affine reuse | 2.399168 ms |
-| 64-token tile, 256 threads, with per-lane affine reuse, tuning run | 1.419841 ms |
-| 64-token tile, 256 threads, with per-lane affine reuse, later run | 1.478628 ms |
-| 64-token tile, 64 threads, with per-lane affine reuse | 1.397572 ms |
-| 64-token tile, 128 threads, geometry sweep | 1.393562 ms |
-| 64-token tile, 128 threads, final current run A | 1.461522 ms |
-| 64-token tile, 128 threads, final current run B | 1.389819 ms |
+| Map tile, threads, and implementation                              | Complete Markov sampling median |
+| ------------------------------------------------------------------ | ------------------------------: |
+| Original five-command step                                         |                     1.729050 ms |
+| 256-token tile, 256 threads, before affine reuse                   |                     2.499804 ms |
+| 64-token tile, 256 threads, before affine reuse                    |                     2.081029 ms |
+| 32-token tile, 256 threads, before affine reuse                    |                     2.399168 ms |
+| 64-token tile, 256 threads, with per-lane affine reuse, tuning run |                     1.419841 ms |
+| 64-token tile, 256 threads, with per-lane affine reuse, later run  |                     1.478628 ms |
+| 64-token tile, 64 threads, with per-lane affine reuse              |                     1.397572 ms |
+| 64-token tile, 128 threads, geometry sweep                         |                     1.393562 ms |
+| 64-token tile, 128 threads, final current run A                    |                     1.461522 ms |
+| 64-token tile, 128 threads, final current run B                    |                     1.389819 ms |
 
 The 32-token tile doubled the threadblock count and repeated W1 and latent setup.
 The smaller tile did not recover enough occupancy to offset that work.
@@ -1259,11 +1259,11 @@ The complete executor submits the three stages as one replay sequence.
 
 A compiled full-proposal A/B normalized proposal time against the Main time from the same process:
 
-| Full executor build | Main | Proposal | Proposal/Main |
-| --- | ---: | ---: | ---: |
-| QMM BM16/BN32 A | 86.368 ms | 13.607 ms | 0.15755 |
-| QMV baseline | 85.686 ms | 14.383 ms | 0.16786 |
-| QMM BM16/BN32 B | 79.222 ms | 12.520 ms | 0.15804 |
+| Full executor build |      Main |  Proposal | Proposal/Main |
+| ------------------- | --------: | --------: | ------------: |
+| QMM BM16/BN32 A     | 86.368 ms | 13.607 ms |       0.15755 |
+| QMV baseline        | 85.686 ms | 14.383 ms |       0.16786 |
+| QMM BM16/BN32 B     | 79.222 ms | 12.520 ms |       0.15804 |
 
 The absolute times changed with device frequency.
 The normalized proposal ratio improved by `5.8%` to `6.1%`.
@@ -1281,14 +1281,14 @@ It has the same `5120 -> 17408 -> 5120` dense-MLP geometry and 4-bit affine form
 
 The same-process eight-row comparison measured:
 
-| Dense-MLP case | Median |
-| --- | ---: |
-| Previous production QMV | 2075.433 µs |
-| QMM BM8/BN32 | 1406.506 µs |
+| Dense-MLP case                  |      Median |
+| ------------------------------- | ----------: |
+| Previous production QMV         | 2075.433 µs |
+| QMM BM8/BN32                    | 1406.506 µs |
 | Previous production gate/up QMV | 1421.795 µs |
-| Gate/up QMM BM8/BN32 | 934.661 µs |
-| Previous production down QMV | 900.451 µs |
-| Down QMM BM8/BN32 | 930.766 µs |
+| Gate/up QMM BM8/BN32            |  934.661 µs |
+| Previous production down QMV    |  900.451 µs |
+| Down QMM BM8/BN32               |  930.766 µs |
 
 The complete BM8/BN32 replay was `32.2%` faster.
 The gate/up projection supplied the primary gain.
@@ -1298,11 +1298,11 @@ A mixed BM8/QMV composition retained one more pipeline and did not improve the e
 The row sweep selected these production ranges for large dense MLPs:
 
 | Active rows | Selected path |
-| ---: | --- |
-| 1–5 | QMV |
-| 6–8 | QMM BM8/BN32 |
-| 9–16 | QMM BM16/BN32 |
-| 17 or more | QMM BM32/BN32 |
+| ----------: | ------------- |
+|         1–5 | QMV           |
+|         6–8 | QMM BM8/BN32  |
+|        9–16 | QMM BM16/BN32 |
+|  17 or more | QMM BM32/BN32 |
 
 The backend owns this selection.
 Main, MTP, and DSpark pass only the active row count and complete matrix shape.
@@ -1384,12 +1384,12 @@ cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
 
 The full executor medians were:
 
-| Stage | Median |
-| --- | ---: |
-| One-row Main submission | 30.949 ms |
+| Stage                                  |    Median |
+| -------------------------------------- | --------: |
+| One-row Main submission                | 30.949 ms |
 | Eight-row Main verification submission | 58.760 ms |
-| Seven-row DSpark proposal submission | 11.184 ms |
-| Complete DSpark cycle | 70.048 ms |
+| Seven-row DSpark proposal submission   | 11.184 ms |
+| Complete DSpark cycle                  | 70.048 ms |
 
 The synthetic executor trajectory proposed 700 tokens and accepted zero tokens.
 Thus, it fixed the Main and DSpark execution shapes but did not measure deployment acceptance.
@@ -1413,8 +1413,7 @@ cargo bench -p inference-executor-metal --bench qwen3_dspark_forward -- \
 
 The production DSpark `GatherUnembed` proxy used seven rows and the Main unembed weights.
 Its median was `2.930 ms`.
-The matching sparse-rejection benchmark used one request, seven proposal tokens, `top_k=1`, and vocabulary size
-151936.
+The matching sparse-rejection benchmark used one request, seven proposal tokens, `top_k=1`, and vocabulary size 151936.
 Its median was `0.283 ms`.
 
 ```sh
@@ -1452,15 +1451,15 @@ The values show attribution only.
 
 The eight-row Qwen3 GQA benchmark measured:
 
-| GQA operation | Median |
-| --- | ---: |
-| Full tiled GQA | 0.649 ms |
-| Tiled SDPA only | 0.319 ms |
-| QKV QMV BN8/BK32 | 0.498 ms |
-| QKV QMM BM8/BN32 | 0.436 ms |
-| QKV QMM BM16/BN32 | 0.485 ms |
-| Output QMV BN8/BK32 | 0.433 ms |
-| Output QMM BM8/BN32 | 0.416 ms |
+| GQA operation        |   Median |
+| -------------------- | -------: |
+| Full tiled GQA       | 0.649 ms |
+| Tiled SDPA only      | 0.319 ms |
+| QKV QMV BN8/BK32     | 0.498 ms |
+| QKV QMM BM8/BN32     | 0.436 ms |
+| QKV QMM BM16/BN32    | 0.485 ms |
+| Output QMV BN8/BK32  | 0.433 ms |
+| Output QMM BM8/BN32  | 0.416 ms |
 | Output QMM BM16/BN32 | 0.445 ms |
 
 The existing QMM BM8/BN32 selection is correct for both eight-row GQA projections.
@@ -1558,10 +1557,10 @@ Both paths produced the same final text.
 
 The last three warmed samples were:
 
-| Path | Samples | Median | Output chunks |
-| --- | --- | ---: | ---: |
-| Main-only | 37.154, 36.565, 36.272 tok/s | 36.565 tok/s | 98 |
-| DSpark | 42.788, 43.023, 42.786 tok/s | 42.788 tok/s | 35 |
+| Path      | Samples                      |       Median | Output chunks |
+| --------- | ---------------------------- | -----------: | ------------: |
+| Main-only | 37.154, 36.565, 36.272 tok/s | 36.565 tok/s |            98 |
+| DSpark    | 42.788, 43.023, 42.786 tok/s | 42.788 tok/s |            35 |
 
 DSpark was `17.0%` faster than Main-only.
 The deterministic DSpark request used 34 verification batches.
@@ -1590,13 +1589,13 @@ seed=1
 
 The four-prompt result was:
 
-| Workload | Output tokens | Verification rounds | Proposed | Accepted | Proposal acceptance | Accepted length |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Sky explanation | 98 | 34 | 238 | 65 | 27.31% | 2.91 |
-| Algebra | 128 | 20 | 140 | 113 | 80.71% | 6.65 |
-| Python code | 128 | 20 | 140 | 109 | 77.86% | 6.45 |
-| Database engineering | 128 | 40 | 280 | 93 | 33.21% | 3.33 |
-| Aggregate | 482 | 114 | 798 | 380 | 47.62% | 4.33 |
+| Workload             | Output tokens | Verification rounds | Proposed | Accepted | Proposal acceptance | Accepted length |
+| -------------------- | ------------: | ------------------: | -------: | -------: | ------------------: | --------------: |
+| Sky explanation      |            98 |                  34 |      238 |       65 |              27.31% |            2.91 |
+| Algebra              |           128 |                  20 |      140 |      113 |              80.71% |            6.65 |
+| Python code          |           128 |                  20 |      140 |      109 |              77.86% |            6.45 |
+| Database engineering |           128 |                  40 |      280 |       93 |              33.21% |            3.33 |
+| Aggregate            |           482 |                 114 |      798 |      380 |              47.62% |            4.33 |
 
 `Accepted length` includes the Main continuation token from each verification round.
 Proposal acceptance uses only the seven draft slots.
@@ -1639,12 +1638,12 @@ The service used `max_running_requests=8`, seed `42`, and these checkpoints:
 The command used `scripts/qwen35_e2e_decode_perf.sh`.
 It ran one GPU service at a time.
 
-| Case | Tokens | Split median | One-sequence median | Change |
-| --- | ---: | ---: | ---: | ---: |
-| `35b_off` | 256 | 93.414 tok/s | 96.395 tok/s | +3.2% |
-| `35b_off` | 1024 | 90.801 tok/s | 93.658 tok/s | +3.1% |
-| `35b_on` | 256 | 138.262 tok/s | 145.307 tok/s | +5.1% |
-| `35b_on` | 1024 | 122.080 tok/s | 127.684 tok/s | +4.6% |
+| Case      | Tokens |  Split median | One-sequence median | Change |
+| --------- | -----: | ------------: | ------------------: | -----: |
+| `35b_off` |    256 |  93.414 tok/s |        96.395 tok/s |  +3.2% |
+| `35b_off` |   1024 |  90.801 tok/s |        93.658 tok/s |  +3.1% |
+| `35b_on`  |    256 | 138.262 tok/s |       145.307 tok/s |  +5.1% |
+| `35b_on`  |   1024 | 122.080 tok/s |       127.684 tok/s |  +4.6% |
 
 The MTP trajectories were unchanged.
 The 256-token MTP case proposed 135 tokens and accepted 121 tokens.
