@@ -171,6 +171,106 @@ It accumulates W2 in F32.
 It rounds the correction and corrected logit to BF16 before tile Top-K.
 Sampling probabilities use F32.
 
+### DSpark Markov numerical contract
+
+Decision: Retain the current BF16 materialization boundaries.
+
+The Qwen3 implementations in
+[vLLM at `bb3b61f2fd2333ab165ebaba13f133db4210b9f2`](https://github.com/vllm-project/vllm/blob/bb3b61f2fd2333ab165ebaba13f133db4210b9f2/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py)
+and
+[SGLang at `85618cc798ce9b5fdbfdd5c535576515d498acc2`](https://github.com/sgl-project/sglang/blob/85618cc798ce9b5fdbfdd5c535576515d498acc2/python/sglang/srt/models/dspark.py)
+add the Markov correction in the model-logit dtype.
+They do not explicitly promote the Qwen3 corrected-logit tensor to F32.
+[SGLang sampling](https://github.com/sgl-project/sglang/blob/85618cc798ce9b5fdbfdd5c535576515d498acc2/python/sglang/kernels/ops/speculative/dspark/dspark_draft_model.py)
+promotes the corrected logits when it computes sampling probabilities.
+
+The Metal map uses F32 where reduction requires it:
+
+```text
+BF16 W1 latent in shared memory
+  -> F32 W2 partials and SIMDgroup reduction in thread-local values
+  -> BF16 correction
+  -> BF16 corrected logit
+  -> F32 tile Top-K and sampling probabilities
+```
+
+For the official rank-256 checkpoint, the map uses 1024 bytes of static shared memory.
+The BF16 latent uses 512 bytes.
+The 64 F32 tile logits and 64 I32 token IDs use the other 512 bytes.
+An F32 corrected-logit candidate does not require more shared memory.
+It keeps the correction and corrected logit in thread-local scalar values.
+The Metal compiler can keep these values in registers or spill them.
+Changing the W1 latent to F32 would increase the static shared-memory requirement to 1536 bytes, but that is a
+different numerical contract.
+
+The F32 corrected-logit candidate used this sequence:
+
+```text
+BF16 W1 latent
+  -> F32 W2 accumulation
+  -> F32 base-logit add
+  -> F32 tile Top-K and sampling probabilities
+```
+
+The A/B investigation used base commit `2804bdece3c03235e9b2b18f9655a933ed7a3220` on macOS 27.0 and an Apple M3 Max
+with a 40-core GPU and 48 GB of memory.
+The candidate changed only the corrected-logit rounding contract and its CPU reference.
+The worktree also contained only the benchmark output controls from this change.
+Focused CPU/GPU parity passed for both contracts.
+
+The real-weight Markov benchmark used
+`dspark_qwen3_14b_block7-affine`, one request, `temperature=0.7`, `top_k=20`, `top_p=0.8`, and `seed=42`.
+It used the production Markov weights and deterministic zero base logits to isolate Markov correction and sampling.
+
+```text
+cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-requests 1 --temperature 0.7 --top-k 20 --top-p 0.8 --seed 42 \
+  --warmup-iters 10 --iters 50 --runs 5
+```
+
+The current BF16 path measured 4.158 ms for the complete seven-step replay.
+The F32 candidate measured 4.162 ms.
+The candidate did not produce a measurable performance gain.
+Both contracts sampled `[5310, 5390, 979, 14550, 448, 5091, 369]` in this isolated case.
+The BF16 sparse-distribution fingerprint was `31642210e096a9d7`.
+The F32 fingerprint was `9dacaff10a8cc01d`.
+The proposal probability bits also differed.
+
+The deterministic service comparison used Qwen3-14B-4bit, the same DSpark checkpoint, `temperature=0`, `top_k=1`,
+`top_p=1`, and `seed=42`.
+
+```text
+target/release/qwen3 \
+  --grpc-listen-addr 127.0.0.1:50151 \
+  --http-listen-addr 127.0.0.1:8011 \
+  --hf-model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --hf-dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-cache-pages 4096 --max-requests 4 --max-tokens 128 \
+  --max-tokens-per-request 64 --logging info
+
+target/release/decode \
+  --server-url http://127.0.0.1:50151 \
+  --hf-model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --prompt-str 'Explain in concise technical terms why the sky appears blue during the day.' \
+  --disable-thinking --max-sampled-tokens 256 \
+  --temperature 0 --top-k 1 --top-p 1 --seed 42 --show-stats
+```
+
+Three runs for each contract produced the same final 98-token text.
+The current BF16 contract used 34 verification batches, generated 238 proposals, and accepted 65 proposals.
+Its acceptance rate was 27.31%.
+Its three decode rates were 42.095, 42.253, and 42.852 tok/s.
+The F32 candidate used 33 verification batches, generated 231 proposals, and accepted 66 proposals.
+Its acceptance rate was 28.57%.
+Its three decode rates were 43.021, 43.320, and 43.169 tok/s.
+The throughput values are not a corrected-logit kernel comparison because the contracts used different verification
+trajectories.
+
+The changed distributions and replay trajectory make F32 a model numerical-contract change.
+One deterministic prompt does not justify that change.
+The production path must keep the BF16 contract unless broader checkpoint evidence establishes a different contract.
+
 ## Correctness and benchmarks
 
 CPU references define sampling, rejection, and sequential DSpark Markov math.
@@ -179,6 +279,9 @@ They also compare mixed per-row parameters and deterministic seed/domain behavio
 Sparse rejection tests cover accepted and rejected MTP and DSpark paths.
 The DSpark Markov parity test covers a padded replay bucket and non-contiguous request slots.
 GPU tests run serially under the repository Metal reservation/lock rules.
+The `qwen3_dspark_sampling` benchmark prints proposal token IDs, exact proposal probability bits, and a stable
+fingerprint of the complete sparse draft distribution.
+Use `--temperature`, `--top-k`, `--top-p`, and `--seed` to reproduce a sampling contract.
 
 Synthetic backend modes:
 

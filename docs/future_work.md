@@ -159,30 +159,6 @@ component path as the design.
   An eight-row Qwen3 GQA diagnostic measured `0.695479 ms` for the production tiled path and `0.725750 ms` for the
   single-Q path.
   Compare confidence-guided verification lengths with bounded Main multi-row verification work.
-- Evaluate an F32 corrected-logit contract for Qwen3x DSpark Markov sampling.
-  Keep the current BF16 materialization boundaries until this work has separate correctness and acceptance evidence.
-  The current path rounds the W1 latent, W2 correction, and corrected logits to BF16.
-  Local vLLM Qwen3 DSpark source at `bb3b61f2fd2333ab165ebaba13f133db4210b9f2` adds the base logits and Markov bias
-  without an explicit cast.
-  Its default result dtype follows its language-model and Markov heads.
-  Local SGLang source at `85618cc798ce9b5fdbfdd5c535576515d498acc2` converts ordinary logits to F32.
-  Its DeepSeek V4 DSpark optimized path can compute Markov W2 with BF16 weights, but it converts the bias to F32 before
-  the add.
-  Compare these candidates:
-
-  ```text
-  current:
-    BF16 latent -> F32 W2 accumulation -> BF16 correction
-    -> F32 add -> BF16 corrected logit -> F32 Top-K
-
-  candidate:
-    BF16 latent -> F32 W2 accumulation
-    -> F32 add -> F32 Top-K
-  ```
-
-  Use the CPU reference to validate both contracts.
-  Record sampled-token parity, sparse-distribution deltas, DSpark acceptance, and end-to-end output.
-  Treat a changed token or distribution as a numerical-contract change, not as a kernel-only optimization.
 - Add a separate gated DSpark GQA implementation when a supported checkpoint requires it.
   Do not add a runtime gate flag to `UngatedDSparkGQA`.
   Keep the history map, block map, reducer, page layout, and scratch contracts gate-neutral.

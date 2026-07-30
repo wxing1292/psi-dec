@@ -95,6 +95,9 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   It measures the complete sequential fused Markov-map, sampling, and sparse-distribution replay.
   Each proposal step uses one fused W1, W2, base-logit-add, and tile-Top-K map.
   It then uses the generic sample-and-sparse-distribution reducer.
+  It accepts `--temperature`, `--top-k`, `--top-p`, and `--seed`.
+  It prints proposal token IDs, exact proposal probability bits, and a stable fingerprint of the complete sparse draft
+  distribution.
   `qwen3_dspark_forward`, `qwen3_dspark_unembedding`, and `qwen3_dspark_sampling` isolate the three ordered proposal
   segments:
 

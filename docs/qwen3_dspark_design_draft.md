@@ -686,10 +686,9 @@ Use this order for the marked follow-up work:
 | 1 | Main multi-row verification investigation | Separate Main body, GatherUnembed, and sparse rejection evidence without adding a submission boundary. |
 | 2 | Deterministic DSpark end-to-end validation | Re-run throughput, proposal count, accepted-token count, acceptance efficiency, and stage timing after the retained proposal and Main changes. |
 | 3 | Deferred mixed-dtype affine ownership | Move GDN projections to backend-owned selection without adding QMV/QMM or tile controls to model APIs. |
-| 4 | DSpark Markov numerical contract | Compare the current BF16 boundaries with an F32 corrected-logit path by CPU-reference, acceptance, and end-to-end evidence. |
-| 5 | Confidence and global scheduling | Execute the confidence head first. Add variable proposal lengths only when runtime scheduling owns the cross-request budget. |
-| 6 | Checkpoint-triggered DSpark variants | Add gated attention or other layout/head variants only for a real supported checkpoint. |
-| 7 | Replay and overlap evolution | Review these boundaries only after the fixed-block lifecycle and all in-flight owners are stable. |
+| 4 | Confidence and global scheduling | Execute the confidence head first. Add variable proposal lengths only when runtime scheduling owns the cross-request budget. |
+| 5 | Checkpoint-triggered DSpark variants | Add gated attention or other layout/head variants only for a real supported checkpoint. |
+| 6 | Replay and overlap evolution | Review these boundaries only after the fixed-block lifecycle and all in-flight owners are stable. |
 
 Items in a later row must not block an earlier row unless new correctness evidence identifies a dependency.
 
@@ -764,25 +763,27 @@ Production model and executor APIs must not expose that force control.
 
 ### DSpark Markov numerical contract
 
-Future work: Evaluate an F32 corrected-logit contract.
+Decision: Retain the current BF16 corrected-logit contract.
 
-Keep the current BF16 materialization boundaries until this investigation is complete:
+The retained path is:
 
 ```text
-current:
-  BF16 latent -> F32 W2 accumulation -> BF16 correction
+BF16 latent -> F32 W2 accumulation -> BF16 correction
   -> F32 add -> BF16 corrected logit -> F32 Top-K
+```
 
-candidate:
-  BF16 latent -> F32 W2 accumulation
+The rejected candidate was:
+
+```text
+BF16 latent -> F32 W2 accumulation
   -> F32 add -> F32 Top-K
 ```
 
-Use the CPU reference for both contracts.
-Compare sampled tokens and sparse draft distributions.
-Then compare DSpark acceptance and deterministic end-to-end output.
-Treat any token or distribution change as a numerical-contract change.
-Do not include this change in a kernel-only optimization commit.
+The candidate had no isolated Markov replay performance gain.
+It changed sparse draft probabilities and the deterministic end-to-end acceptance trajectory.
+The current contract also matches the Qwen3 tensor-dtype behavior in vLLM and SGLang.
+[`executor_sampling.md`](executor_sampling.md) records the upstream, resource, correctness, performance, and
+end-to-end evidence.
 
 ### Confidence and global scheduling
 
