@@ -376,6 +376,11 @@ An adaptive affine quantized matmul uses these ownership boundaries:
   QMV or QMM family and its tile dimensions.
 - `AffineQuantizedMatmulInvocation` contains the runtime `M`, buffers, and byte offsets.
 
+`AffineQuantizedMatmul` must support each combination of F32, F16, and BF16 input, scale/bias, and output data types.
+QMV BN8/BK32 and QMM BM8/BN32, BM16/BN32, and BM32/BN32 provide this complete capability set.
+QMV Quad BN64 is an optional specialization for its supported same-dtype shapes.
+The adaptive owner must select QMV BN8/BK32 when QMV Quad BN64 does not support the workload.
+
 Production model and executor components must use `AffineQuantizedMatmul`. They must not select an
 `AffineQuantizedMatmulKernelKind`.
 

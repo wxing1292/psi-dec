@@ -82,3 +82,8 @@ harness = false
 name = "unembedding"
 path = "benches/head/unembedding.rs"
 harness = false
+
+[[bench]]
+name = "affine_quantized_matmul"
+path = "benches/operators/affine_quantized_matmul.rs"
+harness = false

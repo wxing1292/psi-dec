@@ -425,7 +425,9 @@ METAL_FUNC void mixed_qmm_t_impl(
 
   (void)lid;
 
-  constexpr int WM = 2;
+  static_assert(BM == 8 || BM == 16 || BM == 32, "mixed QMM supports BM=8, BM=16, or BM=32");
+
+  constexpr int WM = BM == 32 ? 2 : 1;
   constexpr int WN = 2;
   constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 8 / bits;
   constexpr int BK_padded = (BK + 16 / sizeof(float));
