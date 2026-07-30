@@ -5,11 +5,16 @@ RUNS=7
 PORT=50061
 BUILD=1
 PROMPT="你好，北京有什么好玩的景点？香山如何？早上去晚上去？单纯爬山么？还有什么可以在香山玩的？"
-TOKENIZER="${PSI_DEC_QWEN_TOKENIZER_DIR:-}"
-MODEL_27B="${PSI_DEC_QWEN_27B_MODEL_DIR:-}"
-MTP_27B="${PSI_DEC_QWEN_27B_MTP_DIR:-}"
-MODEL_35B="${PSI_DEC_QWEN_35B_MODEL_DIR:-}"
-MTP_35B="${PSI_DEC_QWEN_35B_MTP_DIR:-}"
+MODEL_ROOT="$HOME/Workspace/models"
+TOKENIZER=""
+MODEL_27B=""
+MTP_27B=""
+MODEL_35B=""
+MTP_35B=""
+MODEL_27B_REPO="mlx-community/Qwen3.6-27B-4bit"
+MTP_27B_REPO="mlx-community/Qwen3.6-27B-MTP-4bit"
+MODEL_35B_REPO="mlx-community/Qwen3.6-35B-A3B-4bit"
+MTP_35B_REPO="mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
 CASES="27b_off,27b_on,35b_off,35b_on"
 BASELINE=1
 CASE_COOLDOWN_SECS=30
@@ -75,11 +80,16 @@ Options:
   --max-tokens N        Scheduler flattened-token capacity. Default: 128
   --max-tokens-per-request N
                         Scheduler per-request token capacity. Default: 64
-  --tokenizer DIR       Tokenizer/chat-template model dir. Required unless PSI_DEC_QWEN_TOKENIZER_DIR is set.
-  --model-27b DIR       27B target model dir. Required for 27B cases unless PSI_DEC_QWEN_27B_MODEL_DIR is set.
-  --mtp-27b DIR         27B MTP model dir. Required for 27b_on unless PSI_DEC_QWEN_27B_MTP_DIR is set.
-  --model-35b DIR       35B target model dir. Required for 35B cases unless PSI_DEC_QWEN_35B_MODEL_DIR is set.
-  --mtp-35b DIR         35B MTP model dir. Required for 35b_on unless PSI_DEC_QWEN_35B_MTP_DIR is set.
+  --model-root DIR      Default checkpoint root. Default: $HOME/Workspace/models
+  --tokenizer DIR       Tokenizer/chat-template directory. Default: selected target model.
+  --model-27b DIR       27B target directory. Default: MODEL_ROOT/Qwen3.6-27B-4bit
+  --mtp-27b DIR         27B MTP directory. Default: MODEL_ROOT/Qwen3.6-27B-MTP-4bit
+  --model-35b DIR       35B target directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-4bit
+  --mtp-35b DIR         35B MTP directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit
+  --model-27b-repo REPO Hugging Face repo used if the 27B target is missing.
+  --mtp-27b-repo REPO   Hugging Face repo used if the 27B MTP model is missing.
+  --model-35b-repo REPO Hugging Face repo used if the 35B target is missing.
+  --mtp-35b-repo REPO   Hugging Face repo used if the 35B MTP model is missing.
   --no-build            Skip release build.
   --no-baseline         Do not compare summary rows with the checked-in M3 Max baseline.
   --case-cooldown-secs N
@@ -90,8 +100,14 @@ Options:
   -h, --help            Show this help.
 
 Examples:
-  scripts/qwen35_e2e_decode_perf.sh --runs 7
-  scripts/qwen35_e2e_decode_perf.sh --no-build --cases 35b_on --runs 3
+  scripts/qwen35_e2e_decode_perf.sh \
+    --model-root "$HOME/Workspace/models" \
+    --cases 27b_off,35b_off,27b_on,35b_on --runs 3
+
+  scripts/qwen35_e2e_decode_perf.sh \
+    --model-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-4bit" \
+    --mtp-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-MTP-4bit" \
+    --cases 35b_on --runs 3
 EOF
 }
 
@@ -169,6 +185,14 @@ while [[ $# -gt 0 ]]; do
         MAX_TOKENS_PER_REQUEST="$2"
         shift 2
         ;;
+    --model-root)
+        [[ $# -ge 2 ]] || {
+            echo "--model-root requires a value" >&2
+            exit 2
+        }
+        MODEL_ROOT="$2"
+        shift 2
+        ;;
     --tokenizer)
         [[ $# -ge 2 ]] || {
             echo "--tokenizer requires a value" >&2
@@ -207,6 +231,38 @@ while [[ $# -gt 0 ]]; do
             exit 2
         }
         MTP_35B="$2"
+        shift 2
+        ;;
+    --model-27b-repo)
+        [[ $# -ge 2 ]] || {
+            echo "--model-27b-repo requires a value" >&2
+            exit 2
+        }
+        MODEL_27B_REPO="$2"
+        shift 2
+        ;;
+    --mtp-27b-repo)
+        [[ $# -ge 2 ]] || {
+            echo "--mtp-27b-repo requires a value" >&2
+            exit 2
+        }
+        MTP_27B_REPO="$2"
+        shift 2
+        ;;
+    --model-35b-repo)
+        [[ $# -ge 2 ]] || {
+            echo "--model-35b-repo requires a value" >&2
+            exit 2
+        }
+        MODEL_35B_REPO="$2"
+        shift 2
+        ;;
+    --mtp-35b-repo)
+        [[ $# -ge 2 ]] || {
+            echo "--mtp-35b-repo requires a value" >&2
+            exit 2
+        }
+        MTP_35B_REPO="$2"
         shift 2
         ;;
     --no-build)
@@ -289,6 +345,11 @@ if ((PORT > 65535)); then
     exit 2
 fi
 
+[[ -n "$MODEL_27B" ]] || MODEL_27B="$MODEL_ROOT/Qwen3.6-27B-4bit"
+[[ -n "$MTP_27B" ]] || MTP_27B="$MODEL_ROOT/Qwen3.6-27B-MTP-4bit"
+[[ -n "$MODEL_35B" ]] || MODEL_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-4bit"
+[[ -n "$MTP_35B" ]] || MTP_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit"
+
 IFS=, read -r -a selected_cases <<<"$CASES"
 need_27b=0
 need_27b_mtp=0
@@ -326,6 +387,65 @@ require_dir() {
         exit 2
     fi
 }
+
+model_present() {
+    local dir="$1"
+    [[ -f "$dir/config.json" ]] || return 1
+    find "$dir" -type f \
+        \( -name '*.safetensors' -o -name '*.npz' \) \
+        -print -quit 2>/dev/null | grep -q .
+}
+
+ensure_model() {
+    local repo="$1"
+    local dir="$2"
+    local -a download_command
+
+    if model_present "$dir"; then
+        echo "==> Found checkpoint: $dir"
+        return
+    fi
+
+    if command -v hf >/dev/null 2>&1; then
+        download_command=(hf download)
+    elif command -v huggingface-cli >/dev/null 2>&1; then
+        download_command=(huggingface-cli download)
+    else
+        echo "checkpoint is missing: $dir" >&2
+        echo 'Install the Hugging Face CLI with: python3 -m pip install -U "huggingface_hub[hf_xet]"' >&2
+        exit 1
+    fi
+
+    echo "==> Downloading $repo -> $dir"
+    mkdir -p "$dir"
+    "${download_command[@]}" "$repo" --local-dir "$dir"
+
+    if ! model_present "$dir"; then
+        echo "download completed, but checkpoint is incomplete: $dir" >&2
+        exit 1
+    fi
+}
+
+if [[ -z "$TOKENIZER" ]]; then
+    if ((need_35b)); then
+        TOKENIZER="$MODEL_35B"
+    else
+        TOKENIZER="$MODEL_27B"
+    fi
+fi
+
+if ((need_27b)); then
+    ensure_model "$MODEL_27B_REPO" "$MODEL_27B"
+fi
+if ((need_27b_mtp)); then
+    ensure_model "$MTP_27B_REPO" "$MTP_27B"
+fi
+if ((need_35b)); then
+    ensure_model "$MODEL_35B_REPO" "$MODEL_35B"
+fi
+if ((need_35b_mtp)); then
+    ensure_model "$MTP_35B_REPO" "$MTP_35B"
+fi
 
 require_dir "--tokenizer" "$TOKENIZER"
 if ((need_27b)); then
