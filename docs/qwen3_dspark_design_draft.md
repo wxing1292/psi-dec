@@ -31,7 +31,9 @@ crates/inference-executor-core/src/
   bin/qwen3_dspark_quantize.rs
 
 crates/inference-backend-metal/src/components/
+  dspark_markov_sampling.rs
   gqa_block_attention.rs
+  metal/dspark_markov_sampling.metal
   metal/gqa_block_sdpa.metal
 
 crates/inference-executor-metal/src/
@@ -675,6 +677,113 @@ Reason: The current boundary expresses all required CPU and GPU dependencies.
 
 ## Deferred work
 
+### Follow-up order
+
+Use this order for the marked follow-up work:
+
+| Order | Work | Completion condition |
+| ---: | --- | --- |
+| 1 | Main multi-row verification investigation | Separate Main body, GatherUnembed, and sparse rejection evidence without adding a submission boundary. |
+| 2 | Deterministic DSpark end-to-end validation | Re-run throughput, proposal count, accepted-token count, acceptance efficiency, and stage timing after the retained proposal and Main changes. |
+| 3 | Deferred mixed-dtype affine ownership | Move GDN projections to backend-owned selection without adding QMV/QMM or tile controls to model APIs. |
+| 4 | DSpark Markov numerical contract | Compare the current BF16 boundaries with an F32 corrected-logit path by CPU-reference, acceptance, and end-to-end evidence. |
+| 5 | Confidence and global scheduling | Execute the confidence head first. Add variable proposal lengths only when runtime scheduling owns the cross-request budget. |
+| 6 | Checkpoint-triggered DSpark variants | Add gated attention or other layout/head variants only for a real supported checkpoint. |
+| 7 | Replay and overlap evolution | Review these boundaries only after the fixed-block lifecycle and all in-flight owners are stable. |
+
+Items in a later row must not block an earlier row unless new correctness evidence identifies a dependency.
+
+### Main multi-row verification and end-to-end validation
+
+Future work: Continue the Main multi-row verification investigation.
+
+Keep one Main submission for each batch.
+Do not add a submit-and-wait boundary between the Main body and its GatherUnembed/rejection suffix.
+Measure these regions separately:
+
+```text
+Main body
+GatherUnembed
+sparse rejection
+```
+
+The investigation must compare the same batch shape and deterministic token trajectory.
+It must report proposal count, accepted-token count, acceptance efficiency, and stage timing.
+After a retained change, re-run the deterministic service comparison.
+Do not replace the current deployment verdict with isolated component timing.
+
+### Deferred mixed-dtype affine ownership
+
+Future work: Extend adaptive affine selection for GDN mixed-dtype projections.
+
+`Qwen35MTPEmbed` and `Qwen3xDSparkMainFeatureProjector` already use the adaptive affine owner.
+GDN remains the unsupported dtype case.
+
+The GDN `qkvabz` projection uses F32 input, BF16 affine parameters, and F32 output.
+The GDN layer casts its BF16 model-boundary input to F32 before this projection.
+The GDN output projection uses BF16 input, affine parameters, and output.
+
+`AffineQuantizedMatmulConfig` must provide these fixed workload facts:
+
+```text
+n
+k
+group_size
+bits
+input_dtype
+scale_bias_dtype
+output_dtype
+```
+
+`AffineQuantizedMatmulInvocation` must provide `m`, buffers, and byte offsets.
+Metal buffers do not carry a tensor dtype.
+The model executor must provide each dtype.
+It must not provide a QMV/QMM family or tile selection.
+The backend must derive the supported kernel set from the dtype signature.
+It must select the kernel family and tile from the complete workload facts.
+
+The shared adaptive affine owner currently accepts only one common dtype.
+Extend it before migrating GDN.
+Use a private backend representation for the actual kernel capability sets.
+The same-dtype set can contain the tuned QMV and QMM BM8/BN32, BM16/BN32, and BM32/BN32 kernels.
+The first mixed-dtype set can contain the existing mixed QMV and QMM BM32/BN32 kernels.
+Add mixed QMM BM8/BN32 or BM16/BN32 kernels only after correctness coverage and crossover evidence exist.
+Do not add an executor-visible mixed-dtype mode.
+Do not weaken GDN precision to fit the current same-dtype adaptive API.
+
+Keep the backend extension and the GDN migration as separate reviewable changes.
+The backend change must include mixed-dtype reference coverage and exact-path benchmark controls.
+The GDN change must remove its manual QMV/QMM selection.
+
+The fused DSpark Markov map combines W1 lookup, W2 projection, corrected-logit addition, and vocabulary-tile Top-K.
+Do not replace its W2 stage mechanically with a standalone affine dispatch.
+Treat this fused map as a separate backend operator.
+Compare alternative map geometry and W2 implementations inside the complete Markov replay.
+Benchmark-only code may force an exact implementation for comparison.
+Production model and executor APIs must not expose that force control.
+
+### DSpark Markov numerical contract
+
+Future work: Evaluate an F32 corrected-logit contract.
+
+Keep the current BF16 materialization boundaries until this investigation is complete:
+
+```text
+current:
+  BF16 latent -> F32 W2 accumulation -> BF16 correction
+  -> F32 add -> BF16 corrected logit -> F32 Top-K
+
+candidate:
+  BF16 latent -> F32 W2 accumulation
+  -> F32 add -> F32 Top-K
+```
+
+Use the CPU reference for both contracts.
+Compare sampled tokens and sparse draft distributions.
+Then compare DSpark acceptance and deterministic end-to-end output.
+Treat any token or distribution change as a numerical-contract change.
+Do not include this change in a kernel-only optimization commit.
+
 ### Confidence and global scheduling
 
 Future work: Materialize and execute the official confidence head.
@@ -939,6 +1048,71 @@ The DSpark per-layer time was `6.7%` higher.
 Thus, the DSpark backbone cost follows its five-layer depth.
 It is not the abnormal part of the proposal cost.
 
+### Block-bidirectional attention geometry
+
+A 2026-07-29 follow-up used base commit `9fc8a875d65c7d909735d78c433a7d976e4ea015`.
+The worktree was dirty with the DSpark sampling optimization and this forward investigation.
+The machine was an Apple M3 Max with 40 GPU cores and 48 GB of memory.
+It used macOS 27.0 build `26A5388g` on `arm64`.
+No other GPU command ran concurrently.
+
+The original block kernel used one threadblock for each Q token and Q head.
+It used 128 threads.
+Seven threads computed the seven Q/K dot products serially across `head_dim = 128`.
+The remaining threads waited for the reduction and then produced the output dimensions.
+
+The thread-count sweep for that original kernel was:
+
+| Threads | Shared memory | Median |
+| ---: | ---: | ---: |
+| 32 | 156 bytes | 290.676 µs |
+| 64 | 284 bytes | 287.702 µs |
+| 128 | 540 bytes | 283.614 µs |
+| 256 | 1,052 bytes | 288.918 µs |
+
+The 128-thread case was the best original configuration.
+It gave one thread to each output dimension.
+The 256-thread case left half of the threads idle during output generation.
+The 32-thread and 64-thread cases required four and two output iterations per thread.
+
+A rejected alternative grouped all five Q heads for one KV head into one threadblock.
+It reduced the grid from 280 threadblocks to 56 threadblocks.
+Its 32/64/128/256-thread medians were `318.279`, `314.051`, `305.660`, and `298.941 µs`.
+The smaller grid reduced device-level parallelism.
+This alternative is not retained.
+
+The retained kernel keeps one Q-token/Q-head Task per threadblock.
+It uses one 32-thread SIMDgroup.
+Each thread keeps four F32 Q values, for 16 bytes of logical Q register payload.
+The threadblock keeps seven F32 logits in 28 bytes of shared memory.
+The SIMDgroup computes each Q/K dot product across 32 lanes.
+Each lane computes four output dimensions.
+
+The retained component median was `277.502 µs`.
+The original component median was `283.614 µs`.
+The component improved by `2.2%`.
+
+Commit `d99ca7913eb483083a8e265a29f1054ba1e56a9f` was clean.
+A later operability run used this command:
+
+```sh
+cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
+  --block-sizes 7 --num-requests 1 \
+  --num-q-heads 40 --num-kv-heads 8 --head-dim 128 --dtypes bf16 \
+  --warmup-iters 20 --iters 100 --runs 7
+```
+
+It used the same machine and measured `296.311 µs`.
+That run did not include a same-process baseline.
+Device-frequency state differed from the earlier paired comparison.
+Therefore, the later run does not replace the paired `2.2%` verdict.
+
+The forward benchmark now reports DSpark embed, forward body, and combined embed-forward separately.
+For one request, seven rows, and context 128, the retained forward-body median was `9.268 ms`.
+The immediately preceding forward-body median was `9.301 ms`.
+This is a `0.35%` stage improvement.
+The change does not establish an end-to-end throughput gain.
+
 The production `GatherUnembed` command was:
 
 ```sh
@@ -959,29 +1133,28 @@ It included row gather and unembed.
 It did not include DSpark forward, Markov correction, or sampling.
 
 An exact production-path A/B comparison changed only the QMV-to-QMM crossover during the baseline run.
-The retained policy selects the new small-M QMM for this seven-row shape.
+The retained policy selects QMM BM16/BN32 for this seven-row shape.
 
 | `GatherUnembed` policy | Median |
 | --- | ---: |
 | QMV baseline | 4.166 ms |
-| Small-M QMM | 3.056 ms |
+| QMM BM16/BN32 | 3.056 ms |
 
-The small-M QMM reduced this stage by `26.6%`.
+QMM BM16/BN32 reduced this stage by `26.6%`.
 The backend kernel has a CPU-reference correctness test for Q4 BF16 input.
 The production unembed owner requires BF16 input, affine parameters, and output.
-The selector uses the small-M QMM for large-vocabulary shapes.
-It uses the small-M QMM through 16 rows.
-It uses the general BM32 QMM above 16 rows.
+The selector uses QMM BM16/BN32 for this large-vocabulary shape through 16 rows.
+It uses QMM BM32/BN32 above 16 rows.
 It retains the general policy for smaller-output shapes.
 
 The row-count policy used representative DSpark batch shapes:
 
-| Rows | Small-M BM16 | General BM32 | Selected |
+| Rows | QMM BM16/BN32 | QMM BM32/BN32 | Selected |
 | ---: | ---: | ---: | --- |
-| 14 | 2.938 ms | 5.443 ms | Small-M BM16 |
-| 16 | 3.431 ms | 5.674 ms | Small-M BM16 |
-| 21 | 5.741 ms | 5.275 ms | General BM32 |
-| 28 | 6.101 ms | 5.761 ms | General BM32 |
+| 14 | 2.938 ms | 5.443 ms | QMM BM16/BN32 |
+| 16 | 3.431 ms | 5.674 ms | QMM BM16/BN32 |
+| 21 | 5.741 ms | 5.275 ms | QMM BM32/BN32 |
+| 28 | 6.101 ms | 5.761 ms | QMM BM32/BN32 |
 
 The Markov and sampling command was:
 
@@ -997,7 +1170,67 @@ cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
 
 The production component used `block_size=7`, `vocab_size=151936`, and `markov_rank=256`.
 It measured the complete sequential Markov correction, sampling, and sparse-distribution replay.
-Its median was `1.398 ms`.
+The earlier top-k 1 measurement had a `1.398 ms` median.
+
+The optimized Markov path records two commands for each proposal position:
+
+```text
+fused W1 -> W2 -> base-logit add -> 64-token tile Top-K
+  -> generic global Top-K/top-p/sample/sparse-distribution reducer
+```
+
+The seven-position block uses 14 commands in one Spec submission.
+It does not materialize full-vocabulary bias or corrected-logit tensors.
+The CPU reference preserves the earlier BF16 rounding points.
+The Metal parity test covers `3` active requests in a replay bucket of `4`, a maximum capacity of `6`, and
+non-contiguous request slots.
+
+For the official `markov_rank = 256` shape, the retained fused map uses 128 threads and 1,024 bytes of shared memory per
+threadblock.
+Each thread holds eight F32 latent values.
+It uses one sequential W2 dot accumulator.
+The 128-thread threadblock contains four SIMDgroups.
+Metal does not expose register allocation through `MTLComputePipelineState`.
+The tile choice therefore used both the source-level live-value count and real-weight measurements.
+
+The real-weight tile sweep used the same Qwen3-14B DSpark checkpoint and one request:
+
+| Map tile, threads, and implementation | Complete Markov sampling median |
+| --- | ---: |
+| Original five-command step | 1.729050 ms |
+| 256-token tile, 256 threads, before affine reuse | 2.499804 ms |
+| 64-token tile, 256 threads, before affine reuse | 2.081029 ms |
+| 32-token tile, 256 threads, before affine reuse | 2.399168 ms |
+| 64-token tile, 256 threads, with per-lane affine reuse, tuning run | 1.419841 ms |
+| 64-token tile, 256 threads, with per-lane affine reuse, later run | 1.478628 ms |
+| 64-token tile, 64 threads, with per-lane affine reuse | 1.397572 ms |
+| 64-token tile, 128 threads, geometry sweep | 1.393562 ms |
+| 64-token tile, 128 threads, final current run A | 1.461522 ms |
+| 64-token tile, 128 threads, final current run B | 1.389819 ms |
+
+The 32-token tile doubled the threadblock count and repeated W1 and latent setup.
+The smaller tile did not recover enough occupancy to offset that work.
+The 64-thread and 128-thread cases are within `0.3%`.
+The retained 128-thread case uses four SIMDgroups and four W2 waves for each tile.
+The two final current runs reduced the complete Markov replay median by `15.5%` and `19.6%` from the original path.
+This range reflects the observed device-frequency variation.
+This result is a proposal-stage improvement.
+It does not change the earlier end-to-end acceptance verdict.
+
+The final comparison used commit `9fc8a875d65c7d909735d78c433a7d976e4ea015`.
+The baseline was clean.
+The current worktree was dirty with only this Markov optimization.
+Both cases used macOS 27.0 on an Apple M3 Max and this command:
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-requests 1 --top-k 20 \
+  --warmup-iters 20 --iters 100 --runs 7
+```
+
+The baseline median was `1.729050 ms` per complete seven-step replay.
+The two final current medians were `1.461522 ms` and `1.389819 ms`.
 
 Do not add the three isolated stage times and compare the sum with one complete proposal submission.
 Each isolated target has its own submit-and-wait boundary.
@@ -1008,35 +1241,79 @@ A compiled full-proposal A/B normalized proposal time against the Main time from
 
 | Full executor build | Main | Proposal | Proposal/Main |
 | --- | ---: | ---: | ---: |
-| Small-M QMM A | 86.368 ms | 13.607 ms | 0.15755 |
+| QMM BM16/BN32 A | 86.368 ms | 13.607 ms | 0.15755 |
 | QMV baseline | 85.686 ms | 14.383 ms | 0.16786 |
-| Small-M QMM B | 79.222 ms | 12.520 ms | 0.15804 |
+| QMM BM16/BN32 B | 79.222 ms | 12.520 ms | 0.15804 |
 
 The absolute times changed with device frequency.
 The normalized proposal ratio improved by `5.8%` to `6.1%`.
 This result confirms a complete-proposal gain.
 It does not change the earlier deployment verdict because Main multi-row verification remains the dominant cost.
 
-A real-weight dense-MLP diagnostic used the same `5120 -> 17408 -> 5120` geometry and 4-bit affine format as
-Qwen3-14B.
-At eight rows, the production QMV path measured `1684.868 µs` for one layer.
-The forced QMM path measured `2039.609 µs`.
-Thus, the production QMV/QMM threshold is correct for this shape.
+The earlier dense-MLP diagnostic compared QMV with BM32/BN32 QMM.
+It did not test a QMM row tile that matched the eight-row verification shape.
+Therefore, its conclusion that QMV was optimal was incomplete.
 
-The dense-MLP diagnostic command was:
+A 2026-07-29 follow-up used base commit `9fc8a875d65c7d909735d78c433a7d976e4ea015`.
+The worktree was dirty with the DSpark Markov and block-attention changes.
+The real-weight checkpoint was `/Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit`.
+It has the same `5120 -> 17408 -> 5120` dense-MLP geometry and 4-bit affine format as Qwen3-14B.
+
+The same-process eight-row comparison measured:
+
+| Dense-MLP case | Median |
+| --- | ---: |
+| Previous production QMV | 2075.433 µs |
+| QMM BM8/BN32 | 1406.506 µs |
+| Previous production gate/up QMV | 1421.795 µs |
+| Gate/up QMM BM8/BN32 | 934.661 µs |
+| Previous production down QMV | 900.451 µs |
+| Down QMM BM8/BN32 | 930.766 µs |
+
+The complete BM8/BN32 replay was `32.2%` faster.
+The gate/up projection supplied the primary gain.
+The complete replay still selected BM8/BN32 for both projections because that composition retained one QMM pipeline.
+A mixed BM8/QMV composition retained one more pipeline and did not improve the eight-row full replay.
+
+The row sweep selected these production ranges for large dense MLPs:
+
+| Active rows | Selected path |
+| ---: | --- |
+| 1–5 | QMV |
+| 6–8 | QMM BM8/BN32 |
+| 9–16 | QMM BM16/BN32 |
+| 17 or more | QMM BM32/BN32 |
+
+The backend owns this selection.
+Main, MTP, and DSpark pass only the active row count and complete matrix shape.
+The production model API does not contain QMV/QMM or tile controls.
+
+The eight-row command was:
 
 ```sh
 cargo bench -p inference-executor-metal --bench qwen35_dense_mlp -- \
   --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit \
   --tokens 8 \
-  --cases full_auto,full_qmv,full_qmm \
+  --cases full_auto,full_qmm_bm8_bn32 \
   --iters 50 \
   --warmup-iters 20 \
-  --runs 5
+  --runs 7
 ```
 
-The diagnostic checkpoint has the same dense-MLP matrix geometry and affine format as the Qwen3-14B checkpoint.
-The weight values do not change the selected Metal kernel geometry.
+The BM8/BN32 kernel uses 64 threads and 3200 bytes of static threadblock memory for BF16.
+Initialization checks the SIMD width, pipeline thread limit, calculated threadblock memory, reported static
+threadblock memory, and device threadblock-memory limit.
+The backend reference test covers BM8/BN32 affine output.
+The complete dense-MLP CPU/GPU test covers the seven-row production selection.
+
+A full executor control compared the retained BM8/BN32 selector with a temporary QMV selector.
+Both cases proposed 210 tokens, accepted zero tokens, and sampled 30 continuation tokens.
+Thus, the fixed synthetic trajectory was identical.
+The BM8/BN32 run measured `53.321 ms` for Main verification, `9.655 ms` for proposal, and `63.001 ms` for the
+complete cycle.
+The QMV control measured `73.640 ms`, `11.373 ms`, and `85.042 ms`.
+The separate processes had different device-frequency states, so these absolute values are directional evidence.
+The identical trajectory removes acceptance as the source of the measured difference.
 
 A Qwen3-14B real-weight GQA diagnostic used eight rows and 128 history tokens.
 The production tiled full replay measured `0.695479 ms` for one layer.
@@ -1058,7 +1335,8 @@ cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
 
 The measured Main cost is real multi-row transformer work.
 It is not evidence of an incorrect submission boundary or replay-state flag.
-Future performance work must evaluate confidence-guided verification lengths or a new Main multi-row kernel.
+The BM8/BN32 dense-MLP path reduces this cost without changing executor orchestration.
+Confidence-guided verification lengths remain deferred.
 
 ## Main and MTP submission evidence
 

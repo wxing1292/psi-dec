@@ -135,11 +135,12 @@ component path as the design.
 ## Model and Backend Investigations
 
 - Recover Qwen3 DSpark end-to-end performance in this order:
-  1. Profile and optimize the complete DSpark proposal submission.
-     Preserve the Markov dependency and the single DSpark submission.
-     Measure the DSpark embed, body, GatherUnembed, and Markov sampling sub-operations before changing production code.
-  2. Continue the separate Main multi-row verification optimization.
+  1. Continue the Main multi-row verification investigation after the retained dense-MLP QMM BM8/BN32 change.
      Preserve one Main submission for each batch.
+     Separate Main body, GatherUnembed, and sparse rejection evidence.
+  2. Re-run deterministic service throughput and acceptance with the retained DSpark proposal and Main-verification
+     optimizations.
+     Do not replace the earlier deployment verdict until this run is complete.
   3. Execute the official confidence head and add dynamic proposal lengths.
      Keep confidence generation in the model executor.
      Keep global proposal ranking and verification-budget allocation in runtime scheduling.
@@ -150,11 +151,38 @@ component path as the design.
   Stable DSpark batches spent approximately 75.3 ms in 8-row Main verification and rejection.
   They spent approximately 12.7 ms in the complete DSpark proposal submission.
   The proposal acceptance rate was `27.7%`.
-  An eight-row dense-MLP diagnostic measured `1684.868 µs` for QMV and `2039.609 µs` for QMM.
+  The earlier dense-MLP diagnostic compared QMV with BM32/BN32 QMM.
+  A later same-process comparison measured `2075.433 µs` for the previous QMV path and `1406.506 µs` for
+  BM8/BN32 QMM at eight rows.
+  Production now uses QMV for 1–5 rows, BM8/BN32 for 6–8 rows, BM16/BN32 for 9–16 rows, and BM32/BN32 above 16
+  rows for large dense MLPs.
   An eight-row Qwen3 GQA diagnostic measured `0.695479 ms` for the production tiled path and `0.725750 ms` for the
   single-Q path.
-  Do not change the current QMV/QMM or tiled-attention thresholds for this workload.
   Compare confidence-guided verification lengths with bounded Main multi-row verification work.
+- Evaluate an F32 corrected-logit contract for Qwen3x DSpark Markov sampling.
+  Keep the current BF16 materialization boundaries until this work has separate correctness and acceptance evidence.
+  The current path rounds the W1 latent, W2 correction, and corrected logits to BF16.
+  Local vLLM Qwen3 DSpark source at `bb3b61f2fd2333ab165ebaba13f133db4210b9f2` adds the base logits and Markov bias
+  without an explicit cast.
+  Its default result dtype follows its language-model and Markov heads.
+  Local SGLang source at `85618cc798ce9b5fdbfdd5c535576515d498acc2` converts ordinary logits to F32.
+  Its DeepSeek V4 DSpark optimized path can compute Markov W2 with BF16 weights, but it converts the bias to F32 before
+  the add.
+  Compare these candidates:
+
+  ```text
+  current:
+    BF16 latent -> F32 W2 accumulation -> BF16 correction
+    -> F32 add -> BF16 corrected logit -> F32 Top-K
+
+  candidate:
+    BF16 latent -> F32 W2 accumulation
+    -> F32 add -> F32 Top-K
+  ```
+
+  Use the CPU reference to validate both contracts.
+  Record sampled-token parity, sparse-distribution deltas, DSpark acceptance, and end-to-end output.
+  Treat a changed token or distribution as a numerical-contract change, not as a kernel-only optimization.
 - Add a separate gated DSpark GQA implementation when a supported checkpoint requires it.
   Do not add a runtime gate flag to `UngatedDSparkGQA`.
   Keep the history map, block map, reducer, page layout, and scratch contracts gate-neutral.

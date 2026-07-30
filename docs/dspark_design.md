@@ -44,12 +44,15 @@ crates/inference-executor-core/src/
     dspark_core.rs               block geometry and metadata
   model/qwen/v3_x/dspark/
     config.rs                    official configuration contract
+    reference.rs                 CPU Markov and sampling reference
     weight_layout.rs             exact source and affine binding trees
   bin/
     qwen3_dspark_quantize.rs     official BF16 -> affine converter
 
 crates/inference-backend-metal/src/components/
+  dspark_markov_sampling.rs      fused Markov and tile-Top-K map component
   gqa_block_attention.rs         dense block-SDPA component
+  metal/dspark_markov_sampling.metal
   metal/gqa_block_sdpa.metal     dense bidirectional block kernel
 
 crates/inference-executor-metal/src/
@@ -110,6 +113,48 @@ Position `i` depends on the token sampled at position `i - 1`.
 `DSparkMarkovSampling` owns this sequential correction and sampling loop.
 It stores one sparse draft distribution for each proposed token.
 
+Each position records this pair:
+
+```text
+DSparkMarkovTopKMap
+  previous token
+  -> quantized W1 row
+  -> quantized W2
+  -> add base logits
+  -> tile-local Top-K
+
+generic TopKSampleAndSparseDistribution
+  -> global Top-K and top-p
+  -> sample
+  -> sparse draft distribution
+```
+
+The implementation records all pairs before one Spec submission.
+The sampled token creates a GPU dependency between adjacent pairs.
+A seven-position block uses 14 commands.
+The implementation does not allocate full Markov latent, bias-logit, or corrected-logit buffers.
+
+The official Qwen3 checkpoint uses `markov_rank = 256`.
+The current fused map uses 128 threads per threadblock and a 64-token vocabulary tile.
+Each thread holds eight F32 latent values.
+It uses one sequential W2 dot accumulator.
+It does not retain one accumulator for each output token.
+Each threadblock uses 1,024 bytes of shared memory:
+
+```text
+latent       256 * sizeof(bf16) = 512 bytes
+tile logits   64 * sizeof(f32)  = 256 bytes
+tile IDs      64 * sizeof(i32)  = 256 bytes
+```
+
+Kernel construction checks the pipeline thread limit, the pipeline SIMD execution width, and the device shared-memory
+limit.
+The static geometry requires complete SIMDgroups.
+It also requires enough threads for the 64-entry bitonic network.
+The number of results per wave must divide the vocabulary tile.
+Metal does not expose register allocation through `MTLComputePipelineState`.
+The tile decision therefore also uses the source-level live-value count and a real-weight tile sweep.
+
 ## Main context
 
 `Qwen3Main` exposes the narrow `Qwen3MainResidualCapture` contract.
@@ -155,6 +200,23 @@ The existing `GQASDPAReduceKernel` combines both sets.
 The history metadata supplies a half-open visible range.
 For an anchor at position `p`, that range is `[0, p)`.
 The block kernel supplies the complete local block.
+
+One block-bidirectional map Task owns one Q token and one Q head.
+The backend fixes this Task to one 32-thread SIMDgroup.
+For the official `head_dim = 128`, each thread keeps four F32 Q values.
+The logical Q register payload is 16 bytes per thread.
+The threadblock keeps seven F32 logits in 28 bytes of shared memory.
+It does not keep a shared reduction array.
+
+This geometry preserves `block_size * num_q_heads` independent threadblocks for one request.
+The 32 lanes cooperate on each 128-value Q/K dot product.
+Each lane then computes four output dimensions.
+Larger threadblocks add SIMDgroups without independent work at this Task boundary.
+The backend does not expose this thread choice to the executor.
+
+Kernel construction checks the pipeline SIMD width, the pipeline thread limit, and the device shared-memory limit.
+Metal does not expose the compiler register allocation.
+The implementation therefore validates the logical live-value count and measures the production shape.
 
 ## Page ownership
 
@@ -297,8 +359,8 @@ Unit and Metal parity tests cover:
 - Combined history and block reduction
 - Static partial-scratch capacity
 - Sequential Markov sampling
+- Padded Markov replay buckets and non-contiguous request slots
 - Ragged sparse rejection
-- Non-contiguous request slots
 
 The source, test, and benchmark boundaries are:
 
@@ -311,6 +373,9 @@ src/*_test.rs
 
 benches/gqa/block_attn.rs
   model-independent block-bidirectional SDPA map timing
+
+benches/rejection_sampling.rs
+  model-independent fused DSpark Markov map timing
 
 benches/qwen3/dspark.rs
 benches/qwen3/dspark/fixture.rs
@@ -325,6 +390,12 @@ Run the component benchmark with:
 ```sh
 cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-backend-metal --bench rejection_sampling -- \
+  --mode dspark-markov-top-k-map --rows 1 --top-k 20 --vocab 151936 \
+  --markov-rank 256 --markov-w1-group-size 64 --markov-w1-bits 4 \
+  --markov-w2-group-size 64 --markov-w2-bits 8 \
   --iters 1 --warmup-iters 0 --runs 1
 ```
 
@@ -348,6 +419,9 @@ verification submission.
 It attributes approximately `14.3%` to the DSpark proposal submission.
 Steady record, read, and commit work is negligible.
 The sparse-rejection kernel measures `0.351 ms` for the matching one-request, seven-proposal geometry.
+Two final fused 14-command Markov replay runs measure `1.461522 ms` and `1.389819 ms`.
+The earlier five-command-per-step replay measured `1.729050 ms`.
+The fused path reduces this isolated stage by `15.5%` to `19.6%`.
 The measured `27.7%` proposal-token acceptance rate is below the approximately `38.6%` break-even rate.
 Proposal-only optimization cannot recover the regression at this acceptance rate.
 The performance verification is complete.

@@ -70,7 +70,8 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 - `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay and SDPA-only paths.
 - `qwen3_gqa` exposes static tile geometry as CLI arguments. It can validate single-Q output against tiled output.
 - `gqa_block_attn` measures the model-independent dense block-bidirectional SDPA map component.
-  It accepts block size, request count, head geometry, dtype, and thread count as CLI arguments.
+  It accepts block size, request count, head geometry, and dtype as CLI arguments.
+  The backend owns its one-SIMDgroup threadblock geometry.
 - `qwen3_dspark` loads real Main and DSpark checkpoints.
   It runs the public executor lifecycle for `main` or `dspark`.
   It reports each record, submit/wait, read, and commit boundary.
@@ -86,7 +87,9 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   Otherwise, it uses the Main unembed weights, as the production executor does.
   It measures gather and unembed together for `block_size` rows per request.
 - `qwen3_dspark_sampling` loads real DSpark Markov weights.
-  It measures the complete sequential Markov correction, sampling, and sparse-distribution replay.
+  It measures the complete sequential fused Markov-map, sampling, and sparse-distribution replay.
+  Each proposal step uses one fused W1, W2, base-logit-add, and tile-Top-K map.
+  It then uses the generic sample-and-sparse-distribution reducer.
   `qwen3_dspark_forward`, `qwen3_dspark_unembedding`, and `qwen3_dspark_sampling` isolate the three ordered proposal
   segments:
 
@@ -111,6 +114,12 @@ Representative smoke commands:
 ```text
 cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-backend-metal --bench rejection_sampling -- \
+  --mode dspark-markov-top-k-map --rows 1 --top-k 20 --vocab 151936 \
+  --markov-rank 256 --markov-w1-group-size 64 --markov-w1-bits 4 \
+  --markov-w2-group-size 64 --markov-w2-bits 8 \
   --iters 1 --warmup-iters 0 --runs 1
 
 cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
