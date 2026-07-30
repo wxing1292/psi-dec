@@ -135,7 +135,7 @@ pub fn build_qwen3x_dspark_plan(
         let mlp_metal = DenseMLPMetalConfig {
             group_size: to_u32("Qwen3 DSpark MLP group_size", mlp_quantization.group_size)?,
             bits: to_u32("Qwen3 DSpark MLP bits", mlp_quantization.bits)?,
-            dtype: Dtype::Bfloat16,
+            io_dtype: Dtype::Bfloat16,
         };
         mlp_metal.validate();
         layers.push(Qwen3xDSparkLayerPlan {

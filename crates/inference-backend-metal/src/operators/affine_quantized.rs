@@ -136,347 +136,129 @@ pub struct AffineQuantizedMatmul {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct GatherAffineQuantizedMatmulShape {
-    pub num_routes: i32,
-    pub num_input_vectors: i32,
-    pub n: i32,
-    pub k: i32,
-    pub group_size: i32,
-    pub bits: i32,
-    pub dtype: Dtype,
+pub struct ExpertAffineQuantizedConfig {
+    pub num_experts: i32,
+    pub matmul: AffineQuantizedMatmulConfig,
 }
 
-impl GatherAffineQuantizedMatmulShape {
+impl ExpertAffineQuantizedConfig {
     pub fn validate(self) {
-        assert!(self.num_routes > 0);
-        assert!(self.num_input_vectors > 0);
-        assert!(self.n > 0);
-        assert!(self.k > 0);
-        assert!(matches!(self.group_size, 32 | 64 | 128));
-        assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
-        assert_eq!(self.k % self.group_size, 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16));
+        assert!(self.num_experts > 0);
+        self.matmul.validate();
+        // TODO: Generalize the gather and ragged expert templates to separate
+        // input, output, and scale/bias element types.
+        assert!(
+            self.matmul.uses_same_dtype(),
+            "expert affine quantized kernels do not yet support mixed dtypes"
+        );
     }
 
-    pub fn output_bytes(self) -> usize {
+    pub fn output_bytes(self, num_vectors: i32) -> usize {
         self.validate();
-        checked_bytes(
-            "gather affine output",
-            &[self.num_routes as usize, self.n as usize],
-            self.dtype,
-        )
+        self.matmul.output_bytes(num_vectors)
     }
 
-    pub fn input_bytes(self) -> usize {
+    pub fn input_bytes(self, num_vectors: i32) -> usize {
         self.validate();
-        checked_bytes(
-            "gather affine input",
-            &[self.num_input_vectors as usize, self.k as usize],
-            self.dtype,
-        )
+        self.matmul.input_bytes(num_vectors)
     }
 
     pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.n,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .weight_bytes()
+        self.validate();
+        self.matmul.weight_bytes()
     }
 
     pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.n,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .scale_or_bias_bytes()
+        self.validate();
+        self.matmul.scale_or_bias_bytes()
+    }
+
+    fn weight_bytes(self) -> usize {
+        checked_product(
+            "expert affine weight byte length",
+            &[self.num_experts as usize, self.weight_bytes_per_expert()],
+        )
+    }
+
+    fn affine_param_bytes(self) -> usize {
+        checked_product(
+            "expert affine parameter byte length",
+            &[self.num_experts as usize, self.affine_param_bytes_per_expert()],
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GatherAffineQuantizedShape {
+    pub num_routes: i32,
+    pub num_input_vectors: i32,
+}
+
+impl GatherAffineQuantizedShape {
+    pub fn validate(self) {
+        assert!(self.num_routes > 0);
+        assert!(self.num_input_vectors > 0);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RaggedExpertMajorAffineQuantizedShape {
+    pub num_routes: i32,
+}
+
+impl RaggedExpertMajorAffineQuantizedShape {
+    pub fn validate(self) {
+        assert!(self.num_routes > 0);
     }
 }
 
 pub struct GatherAffineQuantizedMatmulKernel {
-    shape: GatherAffineQuantizedMatmulShape,
-    kernel: Kernel,
-    fast: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GatherAffineQuantizedGateUpSiluShape {
-    pub num_routes: i32,
-    pub num_input_vectors: i32,
-    pub intermediate_dim: i32,
-    pub k: i32,
-    pub group_size: i32,
-    pub bits: i32,
-    pub dtype: Dtype,
-}
-
-impl GatherAffineQuantizedGateUpSiluShape {
-    pub fn validate(self) {
-        assert!(self.num_routes > 0);
-        assert!(self.num_input_vectors > 0);
-        assert!(self.intermediate_dim > 0);
-        assert!(self.k > 0);
-        assert!(matches!(self.group_size, 32 | 64 | 128));
-        assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
-        assert_eq!(self.k % self.group_size, 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16));
-    }
-
-    pub fn output_bytes(self) -> usize {
-        self.validate();
-        checked_bytes(
-            "gather fused MLP output",
-            &[self.num_routes as usize, self.intermediate_dim as usize],
-            self.dtype,
-        )
-    }
-
-    pub fn input_bytes(self) -> usize {
-        self.validate();
-        checked_bytes(
-            "gather fused MLP input",
-            &[self.num_input_vectors as usize, self.k as usize],
-            self.dtype,
-        )
-    }
-
-    pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.intermediate_dim,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .weight_bytes()
-    }
-
-    pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.intermediate_dim,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .scale_or_bias_bytes()
-    }
-}
-
-pub struct GatherAffineQuantizedGateUpSiluKernel {
-    shape: GatherAffineQuantizedGateUpSiluShape,
+    config: ExpertAffineQuantizedConfig,
     kernel: Kernel,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct RaggedExpertMajorAffineQuantizedGateUpSiluShape {
-    pub num_experts: i32,
-    pub num_routes: i32,
-    pub intermediate_dim: i32,
-    pub k: i32,
-    pub group_size: i32,
-    pub bits: i32,
-    pub dtype: Dtype,
+pub struct GatherAffineQuantizedGateUpSwiGLUKernel {
+    config: ExpertAffineQuantizedConfig,
+    kernel: Kernel,
 }
 
-impl RaggedExpertMajorAffineQuantizedGateUpSiluShape {
-    pub fn validate(self) {
-        assert!(self.num_experts > 0);
-        assert!(self.num_routes > 0);
-        assert!(self.intermediate_dim > 0);
-        assert!(self.k > 0);
-        assert!(matches!(self.group_size, 32 | 64 | 128));
-        assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
-        assert_eq!(self.k % self.group_size, 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16));
-    }
-
-    pub fn output_bytes(self) -> usize {
-        self.validate();
-        checked_bytes(
-            "expert-major fused MLP output",
-            &[self.num_routes as usize, self.intermediate_dim as usize],
-            self.dtype,
-        )
-    }
-
-    pub fn input_bytes(self) -> usize {
-        self.validate();
-        checked_bytes(
-            "expert-major fused MLP input",
-            &[self.num_routes as usize, self.k as usize],
-            self.dtype,
-        )
-    }
-
-    pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.intermediate_dim,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .weight_bytes()
-    }
-
-    pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.intermediate_dim,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .scale_or_bias_bytes()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct RaggedExpertMajorAffineQuantizedMatmulShape {
-    pub num_experts: i32,
-    pub num_routes: i32,
-    pub n: i32,
-    pub k: i32,
-    pub group_size: i32,
-    pub bits: i32,
-    pub dtype: Dtype,
-}
-
-impl RaggedExpertMajorAffineQuantizedMatmulShape {
-    pub fn validate(self) {
-        assert!(self.num_experts > 0);
-        assert!(self.num_routes > 0);
-        assert!(self.n > 0);
-        assert!(self.k > 0);
-        assert!(matches!(self.group_size, 32 | 64 | 128));
-        assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
-        assert_eq!(self.k % self.group_size, 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16));
-    }
-
-    pub fn output_bytes(self) -> usize {
-        self.validate();
-        checked_bytes(
-            "expert-major affine output",
-            &[self.num_routes as usize, self.n as usize],
-            self.dtype,
-        )
-    }
-
-    pub fn input_bytes(self) -> usize {
-        self.validate();
-        checked_bytes(
-            "expert-major affine input",
-            &[self.num_routes as usize, self.k as usize],
-            self.dtype,
-        )
-    }
-
-    pub fn weight_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.n,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .weight_bytes()
-    }
-
-    pub fn affine_param_bytes_per_expert(self) -> usize {
-        AffineQuantizedMatmulConfig {
-            n: self.n,
-            k: self.k,
-            group_size: self.group_size,
-            bits: self.bits,
-            input_dtype: self.dtype,
-            output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
-        }
-        .scale_or_bias_bytes()
-    }
-}
-
-pub struct RaggedExpertMajorAffineQuantizedGateUpSiluKernel {
-    shape: RaggedExpertMajorAffineQuantizedGateUpSiluShape,
+pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
+    config: ExpertAffineQuantizedConfig,
     kernel: Kernel,
 }
 
 pub struct RaggedExpertMajorAffineQuantizedMatmulKernel {
-    shape: RaggedExpertMajorAffineQuantizedMatmulShape,
+    config: ExpertAffineQuantizedConfig,
     kernel: Kernel,
 }
 
 impl GatherAffineQuantizedMatmulKernel {
-    pub fn new(device: &Device, shape: GatherAffineQuantizedMatmulShape) -> Self {
-        shape.validate();
-        let type_string = metal_type_string(shape.dtype);
+    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+        config.validate();
+        let matmul = config.matmul;
+        let type_string = metal_type_string(matmul.input_dtype);
         let bn = 8;
-        let fast = shape.n % bn == 0 && shape.k % 512 == 0;
+        let fast = matmul.n % bn == 0 && matmul.k % 512 == 0;
         let func = if fast { "gather_qmv_fast" } else { "gather_qmv" };
-        let kernel_name = format!("{func}_{type_string}_gs_{}_b_{}", shape.group_size, shape.bits);
+        let kernel_name = format!("{func}_{type_string}_gs_{}_b_{}", matmul.group_size, matmul.bits);
         let template_definition = template_definition(
             &kernel_name,
             func,
             &[
                 type_string.to_string(),
-                shape.group_size.to_string(),
-                shape.bits.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
             ],
         );
         let source = affine_quantized_source(&template_definition);
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { shape, kernel, fast }
+        Self { config, kernel }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
-        output: &'a Buffer,
-        input: &'a Buffer,
-        weight: &'a Buffer,
-        scales: &'a Buffer,
-        biases: &'a Buffer,
-        lhs_indices: &'a Buffer,
-        rhs_indices: &'a Buffer,
-    ) -> GatherAffineQuantizedMatmulInvocation<'a> {
-        self.invoke_with_shape(
-            self.shape,
-            output,
-            input,
-            weight,
-            scales,
-            biases,
-            lhs_indices,
-            rhs_indices,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn invoke_with_shape<'a>(
-        &'a self,
-        shape: GatherAffineQuantizedMatmulShape,
+        shape: GatherAffineQuantizedShape,
         output: &'a Buffer,
         input: &'a Buffer,
         weight: &'a Buffer,
@@ -499,31 +281,33 @@ impl GatherAffineQuantizedMatmulKernel {
     }
 }
 
-impl GatherAffineQuantizedGateUpSiluKernel {
-    pub fn new(device: &Device, shape: GatherAffineQuantizedGateUpSiluShape) -> Self {
-        shape.validate();
-        let type_string = metal_type_string(shape.dtype);
+impl GatherAffineQuantizedGateUpSwiGLUKernel {
+    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+        config.validate();
+        let matmul = config.matmul;
+        let type_string = metal_type_string(matmul.input_dtype);
         let kernel_name = format!(
-            "token_major_fused_gate_up_silu_{type_string}_gs_{}_b_{}",
-            shape.group_size, shape.bits
+            "token_major_gate_up_swiglu_{type_string}_gs_{}_b_{}",
+            matmul.group_size, matmul.bits
         );
         let template_definition = template_definition(
             &kernel_name,
-            "token_major_fused_gate_up_silu",
+            "token_major_gate_up_swiglu",
             &[
                 type_string.to_string(),
-                shape.group_size.to_string(),
-                shape.bits.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
             ],
         );
-        let source = affine_quantized_source(&format!("{FUSED_GATE_UP_SILU_SOURCE}\n{template_definition}"));
+        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{template_definition}"));
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { shape, kernel }
+        Self { config, kernel }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
+        shape: GatherAffineQuantizedShape,
         output: &'a Buffer,
         input: &'a Buffer,
         gate_weight: &'a Buffer,
@@ -534,38 +318,8 @@ impl GatherAffineQuantizedGateUpSiluKernel {
         up_biases: &'a Buffer,
         lhs_indices: &'a Buffer,
         rhs_indices: &'a Buffer,
-    ) -> GatherAffineQuantizedGateUpSiluInvocation<'a> {
-        self.invoke_with_shape(
-            self.shape,
-            output,
-            input,
-            gate_weight,
-            gate_scales,
-            gate_biases,
-            up_weight,
-            up_scales,
-            up_biases,
-            lhs_indices,
-            rhs_indices,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn invoke_with_shape<'a>(
-        &'a self,
-        shape: GatherAffineQuantizedGateUpSiluShape,
-        output: &'a Buffer,
-        input: &'a Buffer,
-        gate_weight: &'a Buffer,
-        gate_scales: &'a Buffer,
-        gate_biases: &'a Buffer,
-        up_weight: &'a Buffer,
-        up_scales: &'a Buffer,
-        up_biases: &'a Buffer,
-        lhs_indices: &'a Buffer,
-        rhs_indices: &'a Buffer,
-    ) -> GatherAffineQuantizedGateUpSiluInvocation<'a> {
-        GatherAffineQuantizedGateUpSiluInvocation {
+    ) -> GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
+        GatherAffineQuantizedGateUpSwiGLUInvocation {
             kernel: self,
             shape,
             output,
@@ -582,31 +336,33 @@ impl GatherAffineQuantizedGateUpSiluKernel {
     }
 }
 
-impl RaggedExpertMajorAffineQuantizedGateUpSiluKernel {
-    pub fn new(device: &Device, shape: RaggedExpertMajorAffineQuantizedGateUpSiluShape) -> Self {
-        shape.validate();
-        let type_string = metal_type_string(shape.dtype);
+impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
+    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+        config.validate();
+        let matmul = config.matmul;
+        let type_string = metal_type_string(matmul.input_dtype);
         let kernel_name = format!(
-            "expert_major_fused_gate_up_silu_{type_string}_gs_{}_b_{}",
-            shape.group_size, shape.bits
+            "expert_major_gate_up_swiglu_{type_string}_gs_{}_b_{}",
+            matmul.group_size, matmul.bits
         );
         let template_definition = template_definition(
             &kernel_name,
-            "expert_major_fused_gate_up_silu",
+            "expert_major_gate_up_swiglu",
             &[
                 type_string.to_string(),
-                shape.group_size.to_string(),
-                shape.bits.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
             ],
         );
-        let source = affine_quantized_source(&format!("{FUSED_GATE_UP_SILU_SOURCE}\n{template_definition}"));
+        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{template_definition}"));
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { shape, kernel }
+        Self { config, kernel }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
+        shape: RaggedExpertMajorAffineQuantizedShape,
         output: &'a Buffer,
         input: &'a Buffer,
         gate_weight: &'a Buffer,
@@ -616,36 +372,8 @@ impl RaggedExpertMajorAffineQuantizedGateUpSiluKernel {
         up_scales: &'a Buffer,
         up_biases: &'a Buffer,
         experts_by_route: &'a Buffer,
-    ) -> RaggedExpertMajorAffineQuantizedGateUpSiluInvocation<'a> {
-        self.invoke_with_shape(
-            self.shape,
-            output,
-            input,
-            gate_weight,
-            gate_scales,
-            gate_biases,
-            up_weight,
-            up_scales,
-            up_biases,
-            experts_by_route,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn invoke_with_shape<'a>(
-        &'a self,
-        shape: RaggedExpertMajorAffineQuantizedGateUpSiluShape,
-        output: &'a Buffer,
-        input: &'a Buffer,
-        gate_weight: &'a Buffer,
-        gate_scales: &'a Buffer,
-        gate_biases: &'a Buffer,
-        up_weight: &'a Buffer,
-        up_scales: &'a Buffer,
-        up_biases: &'a Buffer,
-        experts_by_route: &'a Buffer,
-    ) -> RaggedExpertMajorAffineQuantizedGateUpSiluInvocation<'a> {
-        RaggedExpertMajorAffineQuantizedGateUpSiluInvocation {
+    ) -> RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
+        RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation {
             kernel: self,
             shape,
             output,
@@ -662,44 +390,32 @@ impl RaggedExpertMajorAffineQuantizedGateUpSiluKernel {
 }
 
 impl RaggedExpertMajorAffineQuantizedMatmulKernel {
-    pub fn new(device: &Device, shape: RaggedExpertMajorAffineQuantizedMatmulShape) -> Self {
-        shape.validate();
-        let type_string = metal_type_string(shape.dtype);
+    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+        config.validate();
+        let matmul = config.matmul;
+        let type_string = metal_type_string(matmul.input_dtype);
         let kernel_name = format!(
             "expert_major_down_matmul_{type_string}_gs_{}_b_{}",
-            shape.group_size, shape.bits
+            matmul.group_size, matmul.bits
         );
         let template_definition = template_definition(
             &kernel_name,
             "expert_major_down_matmul",
             &[
                 type_string.to_string(),
-                shape.group_size.to_string(),
-                shape.bits.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
             ],
         );
-        let source = affine_quantized_source(&format!("{FUSED_GATE_UP_SILU_SOURCE}\n{template_definition}"));
+        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{template_definition}"));
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { shape, kernel }
+        Self { config, kernel }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
-        output: &'a Buffer,
-        input: &'a Buffer,
-        weight: &'a Buffer,
-        scales: &'a Buffer,
-        biases: &'a Buffer,
-        experts_by_route: &'a Buffer,
-    ) -> RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
-        self.invoke_with_shape(self.shape, output, input, weight, scales, biases, experts_by_route)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn invoke_with_shape<'a>(
-        &'a self,
-        shape: RaggedExpertMajorAffineQuantizedMatmulShape,
+        shape: RaggedExpertMajorAffineQuantizedShape,
         output: &'a Buffer,
         input: &'a Buffer,
         weight: &'a Buffer,
@@ -722,7 +438,7 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
 
 pub struct GatherAffineQuantizedMatmulInvocation<'a> {
     kernel: &'a GatherAffineQuantizedMatmulKernel,
-    shape: GatherAffineQuantizedMatmulShape,
+    shape: GatherAffineQuantizedShape,
     output: &'a Buffer,
     input: &'a Buffer,
     weight: &'a Buffer,
@@ -732,9 +448,9 @@ pub struct GatherAffineQuantizedMatmulInvocation<'a> {
     rhs_indices: &'a Buffer,
 }
 
-pub struct GatherAffineQuantizedGateUpSiluInvocation<'a> {
-    kernel: &'a GatherAffineQuantizedGateUpSiluKernel,
-    shape: GatherAffineQuantizedGateUpSiluShape,
+pub struct GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
+    kernel: &'a GatherAffineQuantizedGateUpSwiGLUKernel,
+    shape: GatherAffineQuantizedShape,
     output: &'a Buffer,
     input: &'a Buffer,
     gate_weight: &'a Buffer,
@@ -747,9 +463,9 @@ pub struct GatherAffineQuantizedGateUpSiluInvocation<'a> {
     rhs_indices: &'a Buffer,
 }
 
-pub struct RaggedExpertMajorAffineQuantizedGateUpSiluInvocation<'a> {
-    kernel: &'a RaggedExpertMajorAffineQuantizedGateUpSiluKernel,
-    shape: RaggedExpertMajorAffineQuantizedGateUpSiluShape,
+pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
+    kernel: &'a RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel,
+    shape: RaggedExpertMajorAffineQuantizedShape,
     output: &'a Buffer,
     input: &'a Buffer,
     gate_weight: &'a Buffer,
@@ -763,7 +479,7 @@ pub struct RaggedExpertMajorAffineQuantizedGateUpSiluInvocation<'a> {
 
 pub struct RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
     kernel: &'a RaggedExpertMajorAffineQuantizedMatmulKernel,
-    shape: RaggedExpertMajorAffineQuantizedMatmulShape,
+    shape: RaggedExpertMajorAffineQuantizedShape,
     output: &'a Buffer,
     input: &'a Buffer,
     weight: &'a Buffer,
@@ -774,9 +490,11 @@ pub struct RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
 
 impl Operator for RaggedExpertMajorAffineQuantizedMatmulInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
+        let config = self.kernel.config;
+        let matmul = config.matmul;
         let shape = self.shape;
-        validate_ragged_expert_major_down_matmul_kernel_shape(self.kernel.shape, shape);
         validate_ragged_expert_major_down_matmul_buffer_ranges(
+            config,
             shape,
             self.output,
             self.input,
@@ -793,21 +511,23 @@ impl Operator for RaggedExpertMajorAffineQuantizedMatmulInvocation<'_> {
         builder.set_buffer_read(3, self.input, 0);
         builder.set_buffer_read(4, self.experts_by_route, 0);
         builder.set_buffer_write(5, self.output, 0);
-        builder.set_i32(6, shape.k);
-        builder.set_i32(7, shape.n);
-        builder.set_i32(8, shape.num_experts);
+        builder.set_i32(6, matmul.k);
+        builder.set_i32(7, matmul.n);
+        builder.set_i32(8, config.num_experts);
         builder.dispatch_threadblocks(
-            (shape.num_routes as usize, ceil_div_i32(shape.n, 8) as usize, 1),
+            (shape.num_routes as usize, ceil_div_i32(matmul.n, 8) as usize, 1),
             (32, 2, 1),
         );
     }
 }
 
-impl Operator for RaggedExpertMajorAffineQuantizedGateUpSiluInvocation<'_> {
+impl Operator for RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
+        let config = self.kernel.config;
+        let matmul = config.matmul;
         let shape = self.shape;
-        validate_ragged_expert_major_gate_up_silu_kernel_shape(self.kernel.shape, shape);
-        validate_ragged_expert_major_gate_up_silu_buffer_ranges(
+        validate_ragged_expert_major_gate_up_swiglu_buffer_ranges(
+            config,
             shape,
             self.output,
             self.input,
@@ -830,25 +550,23 @@ impl Operator for RaggedExpertMajorAffineQuantizedGateUpSiluInvocation<'_> {
         builder.set_buffer_read(6, self.input, 0);
         builder.set_buffer_read(7, self.experts_by_route, 0);
         builder.set_buffer_write(8, self.output, 0);
-        builder.set_i32(9, shape.k);
-        builder.set_i32(10, shape.intermediate_dim);
-        builder.set_i32(11, shape.num_experts);
+        builder.set_i32(9, matmul.k);
+        builder.set_i32(10, matmul.n);
+        builder.set_i32(11, config.num_experts);
         builder.dispatch_threadblocks(
-            (
-                shape.num_routes as usize,
-                ceil_div_i32(shape.intermediate_dim, 8) as usize,
-                1,
-            ),
+            (shape.num_routes as usize, ceil_div_i32(matmul.n, 8) as usize, 1),
             (32, 2, 1),
         );
     }
 }
 
-impl Operator for GatherAffineQuantizedGateUpSiluInvocation<'_> {
+impl Operator for GatherAffineQuantizedGateUpSwiGLUInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
+        let config = self.kernel.config;
+        let matmul = config.matmul;
         let shape = self.shape;
-        validate_gather_gate_up_silu_kernel_shape(self.kernel.shape, shape);
-        validate_gather_gate_up_silu_buffer_ranges(
+        validate_gather_gate_up_swiglu_buffer_ranges(
+            config,
             shape,
             self.output,
             self.input,
@@ -861,9 +579,6 @@ impl Operator for GatherAffineQuantizedGateUpSiluInvocation<'_> {
             self.lhs_indices,
             self.rhs_indices,
         );
-        let expert_weight_bytes = shape.weight_bytes_per_expert();
-        let num_experts = self.gate_weight.len_bytes() / expert_weight_bytes;
-
         builder.set_kernel(&self.kernel.kernel);
         builder.set_buffer_read(0, self.gate_weight, 0);
         builder.set_buffer_read(1, self.gate_scales, 0);
@@ -875,20 +590,11 @@ impl Operator for GatherAffineQuantizedGateUpSiluInvocation<'_> {
         builder.set_buffer_read(7, self.lhs_indices, 0);
         builder.set_buffer_read(8, self.rhs_indices, 0);
         builder.set_buffer_write(9, self.output, 0);
-        builder.set_i32(10, shape.k);
-        builder.set_i32(11, shape.intermediate_dim);
-        builder.set_i32(
-            12,
-            num_experts
-                .try_into()
-                .expect("gather fused MLP expert count must fit shader i32"),
-        );
+        builder.set_i32(10, matmul.k);
+        builder.set_i32(11, matmul.n);
+        builder.set_i32(12, config.num_experts);
         builder.dispatch_threadblocks(
-            (
-                1,
-                ceil_div_i32(shape.intermediate_dim, 8) as usize,
-                shape.num_routes as usize,
-            ),
+            (1, ceil_div_i32(matmul.n, 8) as usize, shape.num_routes as usize),
             (32, 2, 1),
         );
     }
@@ -896,9 +602,11 @@ impl Operator for GatherAffineQuantizedGateUpSiluInvocation<'_> {
 
 impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
+        let config = self.kernel.config;
+        let matmul = config.matmul;
         let shape = self.shape;
-        validate_gather_matmul_kernel_shape(self.kernel.shape, shape);
         validate_gather_buffer_ranges(
+            config,
             shape,
             self.output,
             self.input,
@@ -908,8 +616,8 @@ impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
             self.lhs_indices,
             self.rhs_indices,
         );
-        let packed_k = packed_dim(shape.k, shape.bits);
-        let groups = shape.k / shape.group_size;
+        let packed_k = packed_dim(matmul.k, matmul.bits);
+        let groups = matmul.k / matmul.group_size;
         builder.set_kernel(&self.kernel.kernel);
         builder.set_buffer_read(0, self.weight, 0);
         builder.set_buffer_read(1, self.scales, 0);
@@ -918,23 +626,17 @@ impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
         builder.set_buffer_read(4, self.lhs_indices, 0);
         builder.set_buffer_read(5, self.rhs_indices, 0);
         builder.set_buffer_write(6, self.output, 0);
-        builder.set_i32(7, shape.k);
-        builder.set_i32(8, shape.n);
+        builder.set_i32(7, matmul.k);
+        builder.set_i32(8, matmul.n);
 
-        let x_shape = [shape.num_input_vectors, 1, 1, shape.k];
-        let k_stride = i64::from(shape.k);
+        let x_shape = [shape.num_input_vectors, 1, 1, matmul.k];
+        let k_stride = i64::from(matmul.k);
         let x_strides = [k_stride, k_stride, k_stride, 1_i64];
-        let w_shape = [
-            num_experts_from_buffer(shape, self.weight)
-                .try_into()
-                .expect("gather affine expert count must fit shader i32"),
-            shape.n,
-            packed_k,
-        ];
-        let w_expert_stride = i64::from(shape.n)
+        let w_shape = [config.num_experts, matmul.n, packed_k];
+        let w_expert_stride = i64::from(matmul.n)
             .checked_mul(i64::from(packed_k))
             .expect("gather affine weight stride must fit i64");
-        let affine_expert_stride = i64::from(shape.n)
+        let affine_expert_stride = i64::from(matmul.n)
             .checked_mul(i64::from(groups))
             .expect("gather affine scale/bias stride must fit i64");
         let w_strides = [w_expert_stride, i64::from(packed_k), 1_i64];
@@ -957,9 +659,8 @@ impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
 
         let bn = 8;
         let bk = 32;
-        let _ = self.kernel.fast;
         builder.dispatch_threadblocks(
-            (1, ceil_div_i32(shape.n, bn) as usize, shape.num_routes as usize),
+            (1, ceil_div_i32(matmul.n, bn) as usize, shape.num_routes as usize),
             (bk as usize, 2, 1),
         );
     }
@@ -967,7 +668,8 @@ impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn validate_gather_buffer_ranges(
-    shape: GatherAffineQuantizedMatmulShape,
+    config: ExpertAffineQuantizedConfig,
+    shape: GatherAffineQuantizedShape,
     output: &Buffer,
     input: &Buffer,
     weight: &Buffer,
@@ -976,11 +678,12 @@ fn validate_gather_buffer_ranges(
     lhs_indices: &Buffer,
     rhs_indices: &Buffer,
 ) {
+    config.validate();
     shape.validate();
-    let output_bytes = shape.output_bytes();
-    let input_bytes = shape.input_bytes();
-    let expert_weight_bytes = shape.weight_bytes_per_expert();
-    let expert_affine_bytes = shape.affine_param_bytes_per_expert();
+    let output_bytes = config.output_bytes(shape.num_routes);
+    let input_bytes = config.input_bytes(shape.num_input_vectors);
+    let weight_bytes = config.weight_bytes();
+    let affine_param_bytes = config.affine_param_bytes();
     assert!(
         output_bytes <= output.len_bytes(),
         "gather affine quantized matmul output range out of bounds: shape={shape:?} required_bytes={output_bytes} \
@@ -994,25 +697,21 @@ fn validate_gather_buffer_ranges(
         input.len_bytes()
     );
     assert!(
-        weight.len_bytes() >= expert_weight_bytes && weight.len_bytes().is_multiple_of(expert_weight_bytes),
-        "gather affine quantized matmul weight stack mismatch: shape={shape:?} per_expert_bytes={expert_weight_bytes} \
-         buffer_bytes={}",
+        weight.len_bytes() >= weight_bytes,
+        "gather affine quantized matmul weight stack too short: config={config:?} shape={shape:?} \
+         required_bytes={weight_bytes} buffer_bytes={}",
         weight.len_bytes()
     );
-    let num_experts = num_experts_from_buffer(shape, weight);
-    let required_affine_bytes = num_experts
-        .checked_mul(expert_affine_bytes)
-        .expect("gather affine quantized matmul affine byte count must fit usize");
     assert!(
-        required_affine_bytes <= scales.len_bytes(),
-        "gather affine quantized matmul scales stack too short: shape={shape:?} \
-         required_bytes={required_affine_bytes} buffer_bytes={}",
+        affine_param_bytes <= scales.len_bytes(),
+        "gather affine quantized matmul scales stack too short: config={config:?} shape={shape:?} \
+         required_bytes={affine_param_bytes} buffer_bytes={}",
         scales.len_bytes()
     );
     assert!(
-        required_affine_bytes <= biases.len_bytes(),
-        "gather affine quantized matmul biases stack too short: shape={shape:?} \
-         required_bytes={required_affine_bytes} buffer_bytes={}",
+        affine_param_bytes <= biases.len_bytes(),
+        "gather affine quantized matmul biases stack too short: config={config:?} shape={shape:?} \
+         required_bytes={affine_param_bytes} buffer_bytes={}",
         biases.len_bytes()
     );
     let index_bytes = shape.num_routes as usize * size_of::<u32>();
@@ -1031,8 +730,9 @@ fn validate_gather_buffer_ranges(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_gather_gate_up_silu_buffer_ranges(
-    shape: GatherAffineQuantizedGateUpSiluShape,
+fn validate_gather_gate_up_swiglu_buffer_ranges(
+    config: ExpertAffineQuantizedConfig,
+    shape: GatherAffineQuantizedShape,
     output: &Buffer,
     input: &Buffer,
     gate_weight: &Buffer,
@@ -1044,50 +744,44 @@ fn validate_gather_gate_up_silu_buffer_ranges(
     lhs_indices: &Buffer,
     rhs_indices: &Buffer,
 ) {
+    config.validate();
     shape.validate();
-    let output_bytes = shape.output_bytes();
-    let input_bytes = shape.input_bytes();
-    let expert_weight_bytes = shape.weight_bytes_per_expert();
-    let expert_affine_bytes = shape.affine_param_bytes_per_expert();
+    let output_bytes = config.output_bytes(shape.num_routes);
+    let input_bytes = config.input_bytes(shape.num_input_vectors);
+    let weight_bytes = config.weight_bytes();
+    let affine_param_bytes = config.affine_param_bytes();
     assert!(
         output_bytes <= output.len_bytes(),
-        "gather affine quantized gate/up/silu output range out of bounds: shape={shape:?} \
+        "gather affine quantized gate/up/swiglu output range out of bounds: shape={shape:?} \
          required_bytes={output_bytes} buffer_bytes={}",
         output.len_bytes()
     );
     assert!(
         input_bytes <= input.len_bytes(),
-        "gather affine quantized gate/up/silu input range out of bounds: shape={shape:?} required_bytes={input_bytes} \
-         buffer_bytes={}",
+        "gather affine quantized gate/up/swiglu input range out of bounds: shape={shape:?} \
+         required_bytes={input_bytes} buffer_bytes={}",
         input.len_bytes()
     );
     assert!(
-        gate_weight.len_bytes() >= expert_weight_bytes && gate_weight.len_bytes().is_multiple_of(expert_weight_bytes),
-        "gather affine quantized gate weight stack mismatch: shape={shape:?} per_expert_bytes={expert_weight_bytes} \
-         buffer_bytes={}",
+        gate_weight.len_bytes() >= weight_bytes,
+        "gather affine quantized gate weight stack too short: config={config:?} shape={shape:?} \
+         required_bytes={weight_bytes} buffer_bytes={}",
         gate_weight.len_bytes()
     );
-    assert_eq!(
-        gate_weight.len_bytes(),
-        up_weight.len_bytes(),
-        "gather affine quantized fused gate/up weight stacks must have matching expert count"
-    );
-    let num_experts = gate_weight.len_bytes() / expert_weight_bytes;
-    let required_affine_bytes = num_experts
-        .checked_mul(expert_affine_bytes)
-        .expect("gather affine quantized gate/up/silu affine byte count must fit usize");
-    assert!(required_affine_bytes <= gate_scales.len_bytes());
-    assert!(required_affine_bytes <= gate_biases.len_bytes());
-    assert!(required_affine_bytes <= up_scales.len_bytes());
-    assert!(required_affine_bytes <= up_biases.len_bytes());
+    assert!(weight_bytes <= up_weight.len_bytes());
+    assert!(affine_param_bytes <= gate_scales.len_bytes());
+    assert!(affine_param_bytes <= gate_biases.len_bytes());
+    assert!(affine_param_bytes <= up_scales.len_bytes());
+    assert!(affine_param_bytes <= up_biases.len_bytes());
     let index_bytes = shape.num_routes as usize * size_of::<u32>();
     assert!(index_bytes <= lhs_indices.len_bytes());
     assert!(index_bytes <= rhs_indices.len_bytes());
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_ragged_expert_major_gate_up_silu_buffer_ranges(
-    shape: RaggedExpertMajorAffineQuantizedGateUpSiluShape,
+fn validate_ragged_expert_major_gate_up_swiglu_buffer_ranges(
+    config: ExpertAffineQuantizedConfig,
+    shape: RaggedExpertMajorAffineQuantizedShape,
     output: &Buffer,
     input: &Buffer,
     gate_weight: &Buffer,
@@ -1098,30 +792,25 @@ fn validate_ragged_expert_major_gate_up_silu_buffer_ranges(
     up_biases: &Buffer,
     experts_by_route: &Buffer,
 ) {
+    config.validate();
     shape.validate();
-    let output_bytes = shape.output_bytes();
-    let input_bytes = shape.input_bytes();
-    let weight_bytes = checked_product(
-        "ragged expert-major gate/up weight byte length",
-        &[shape.num_experts as usize, shape.weight_bytes_per_expert()],
-    );
-    let affine_param_bytes = checked_product(
-        "ragged expert-major gate/up affine byte length",
-        &[shape.num_experts as usize, shape.affine_param_bytes_per_expert()],
-    );
+    let output_bytes = config.output_bytes(shape.num_routes);
+    let input_bytes = config.input_bytes(shape.num_routes);
+    let weight_bytes = config.weight_bytes();
+    let affine_param_bytes = config.affine_param_bytes();
     let route_index_bytes = checked_product(
         "ragged expert-major gate/up route-index byte length",
         &[shape.num_routes as usize, size_of::<u32>()],
     );
     assert!(
         output_bytes <= output.len_bytes(),
-        "ragged expert-major gate/up/silu output range out of bounds: shape={shape:?} required_bytes={output_bytes} \
+        "ragged expert-major gate/up/swiglu output range out of bounds: shape={shape:?} required_bytes={output_bytes} \
          buffer_bytes={}",
         output.len_bytes()
     );
     assert!(
         input_bytes <= input.len_bytes(),
-        "ragged expert-major gate/up/silu input range out of bounds: shape={shape:?} required_bytes={input_bytes} \
+        "ragged expert-major gate/up/swiglu input range out of bounds: shape={shape:?} required_bytes={input_bytes} \
          buffer_bytes={}",
         input.len_bytes()
     );
@@ -1134,8 +823,10 @@ fn validate_ragged_expert_major_gate_up_silu_buffer_ranges(
     assert!(route_index_bytes <= experts_by_route.len_bytes());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_ragged_expert_major_down_matmul_buffer_ranges(
-    shape: RaggedExpertMajorAffineQuantizedMatmulShape,
+    config: ExpertAffineQuantizedConfig,
+    shape: RaggedExpertMajorAffineQuantizedShape,
     output: &Buffer,
     input: &Buffer,
     weight: &Buffer,
@@ -1143,17 +834,12 @@ fn validate_ragged_expert_major_down_matmul_buffer_ranges(
     biases: &Buffer,
     experts_by_route: &Buffer,
 ) {
+    config.validate();
     shape.validate();
-    let output_bytes = shape.output_bytes();
-    let input_bytes = shape.input_bytes();
-    let weight_bytes = checked_product(
-        "ragged expert-major down weight byte length",
-        &[shape.num_experts as usize, shape.weight_bytes_per_expert()],
-    );
-    let affine_param_bytes = checked_product(
-        "ragged expert-major down affine byte length",
-        &[shape.num_experts as usize, shape.affine_param_bytes_per_expert()],
-    );
+    let output_bytes = config.output_bytes(shape.num_routes);
+    let input_bytes = config.input_bytes(shape.num_routes);
+    let weight_bytes = config.weight_bytes();
+    let affine_param_bytes = config.affine_param_bytes();
     let route_index_bytes = checked_product(
         "ragged expert-major down route-index byte length",
         &[shape.num_routes as usize, size_of::<u32>()],
@@ -1174,17 +860,6 @@ fn validate_ragged_expert_major_down_matmul_buffer_ranges(
     assert!(affine_param_bytes <= scales.len_bytes());
     assert!(affine_param_bytes <= biases.len_bytes());
     assert!(route_index_bytes <= experts_by_route.len_bytes());
-}
-
-fn num_experts_from_buffer(shape: GatherAffineQuantizedMatmulShape, weight: &Buffer) -> usize {
-    let expert_bytes = shape.weight_bytes_per_expert();
-    assert!(expert_bytes > 0);
-    assert_eq!(
-        weight.len_bytes() % expert_bytes,
-        0,
-        "gather affine quantized matmul weight stack must contain whole experts"
-    );
-    weight.len_bytes() / expert_bytes
 }
 
 fn packed_dim(k: i32, bits: i32) -> i32 {
@@ -1495,54 +1170,6 @@ fn validate_buffer_ranges(
          required_bytes={scale_or_bias_bytes} buffer_bytes={}",
         biases.len_bytes()
     );
-}
-
-fn validate_gather_matmul_kernel_shape(
-    kernel_shape: GatherAffineQuantizedMatmulShape,
-    invocation_shape: GatherAffineQuantizedMatmulShape,
-) {
-    invocation_shape.validate();
-    debug_assert_eq!(kernel_shape.n, invocation_shape.n);
-    debug_assert_eq!(kernel_shape.k, invocation_shape.k);
-    debug_assert_eq!(kernel_shape.group_size, invocation_shape.group_size);
-    debug_assert_eq!(kernel_shape.bits, invocation_shape.bits);
-    debug_assert_eq!(kernel_shape.dtype, invocation_shape.dtype);
-}
-
-fn validate_gather_gate_up_silu_kernel_shape(
-    kernel_shape: GatherAffineQuantizedGateUpSiluShape,
-    invocation_shape: GatherAffineQuantizedGateUpSiluShape,
-) {
-    invocation_shape.validate();
-    debug_assert_eq!(kernel_shape.intermediate_dim, invocation_shape.intermediate_dim);
-    debug_assert_eq!(kernel_shape.k, invocation_shape.k);
-    debug_assert_eq!(kernel_shape.group_size, invocation_shape.group_size);
-    debug_assert_eq!(kernel_shape.bits, invocation_shape.bits);
-    debug_assert_eq!(kernel_shape.dtype, invocation_shape.dtype);
-}
-
-fn validate_ragged_expert_major_gate_up_silu_kernel_shape(
-    kernel_shape: RaggedExpertMajorAffineQuantizedGateUpSiluShape,
-    invocation_shape: RaggedExpertMajorAffineQuantizedGateUpSiluShape,
-) {
-    invocation_shape.validate();
-    debug_assert_eq!(kernel_shape.intermediate_dim, invocation_shape.intermediate_dim);
-    debug_assert_eq!(kernel_shape.k, invocation_shape.k);
-    debug_assert_eq!(kernel_shape.group_size, invocation_shape.group_size);
-    debug_assert_eq!(kernel_shape.bits, invocation_shape.bits);
-    debug_assert_eq!(kernel_shape.dtype, invocation_shape.dtype);
-}
-
-fn validate_ragged_expert_major_down_matmul_kernel_shape(
-    kernel_shape: RaggedExpertMajorAffineQuantizedMatmulShape,
-    invocation_shape: RaggedExpertMajorAffineQuantizedMatmulShape,
-) {
-    invocation_shape.validate();
-    debug_assert_eq!(kernel_shape.n, invocation_shape.n);
-    debug_assert_eq!(kernel_shape.k, invocation_shape.k);
-    debug_assert_eq!(kernel_shape.group_size, invocation_shape.group_size);
-    debug_assert_eq!(kernel_shape.bits, invocation_shape.bits);
-    debug_assert_eq!(kernel_shape.dtype, invocation_shape.dtype);
 }
 
 fn affine_kernel_source(
@@ -1863,7 +1490,7 @@ const QMM_BM8_BM16_BN32_SOURCE: &str = include_str!("metal/affine_quantized_qmm_
 
 const MIXED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_mixed_qmv_qmm.metal");
 
-const FUSED_GATE_UP_SILU_SOURCE: &str = include_str!("metal/affine_quantized_gate_up_silu_qmv_qmm.metal");
+const GATE_UP_SWIGLU_SOURCE: &str = include_str!("metal/affine_quantized_gate_up_swiglu_qmv_qmm.metal");
 
 fn mlx_metal_header_root() -> PathBuf {
     find_mlx_metal_header_root(
@@ -1891,6 +1518,24 @@ mod tests {
 
     fn adaptive_config(n: i32, k: i32, dtype: Dtype) -> AffineQuantizedMatmulConfig {
         AffineQuantizedMatmulConfig::same_dtype(n, k, 64, 4, dtype)
+    }
+
+    #[test]
+    #[should_panic(expected = "expert affine quantized kernels do not yet support mixed dtypes")]
+    fn test_expert_config_rejects_unimplemented_mixed_dtype_template() {
+        ExpertAffineQuantizedConfig {
+            num_experts: 2,
+            matmul: AffineQuantizedMatmulConfig {
+                n: 32,
+                k: 32,
+                group_size: 32,
+                bits: 4,
+                input_dtype: Dtype::Bfloat16,
+                output_dtype: Dtype::Float32,
+                scale_bias_dtype: Dtype::Bfloat16,
+            },
+        }
+        .validate();
     }
 
     #[test]

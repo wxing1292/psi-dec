@@ -57,13 +57,13 @@ pub fn dense_mlp_reference(
         core.hidden_dim,
         core.intermediate_dim,
     );
-    let activation = gate
+    let swiglu = gate
         .iter()
         .zip(up.iter())
         .map(|(&gate, &up)| silu_reference(gate) * up)
         .collect::<Vec<_>>();
     dense_linear_reference(
-        &activation,
+        &swiglu,
         weights.down_weight,
         weights.down_bias,
         num_tokens,
@@ -156,13 +156,13 @@ pub fn quantized_dense_mlp_reference(
         weights.gate_up_scales,
         weights.gate_up_biases,
     );
-    let mut activation = vec![0.0_f32; num_tokens * core.intermediate_dim];
+    let mut swiglu = vec![0.0_f32; num_tokens * core.intermediate_dim];
     for row in 0..num_tokens {
         let gate_up_row = &gate_up[row * core.intermediate_dim * 2..(row + 1) * core.intermediate_dim * 2];
         for col in 0..core.intermediate_dim {
             let gate = gate_up_row[col];
             let up = gate_up_row[core.intermediate_dim + col];
-            activation[row * core.intermediate_dim + col] = silu_reference(gate) * up;
+            swiglu[row * core.intermediate_dim + col] = silu_reference(gate) * up;
         }
     }
     quantized_affine_reference(
@@ -173,7 +173,7 @@ pub fn quantized_dense_mlp_reference(
             group_size,
             bits,
         },
-        &activation,
+        &swiglu,
         weights.down_weight,
         weights.down_scales,
         weights.down_biases,

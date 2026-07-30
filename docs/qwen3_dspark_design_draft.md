@@ -750,6 +750,12 @@ The backend extension and the GDN migration remain separate reviewable changes.
 The backend extension includes exhaustive dtype-combination reference coverage and exact-path benchmark controls.
 The GDN migration removes its manual QMV/QMM selection.
 
+The gather and ragged expert-affine templates currently require the input, scale/bias, and output data types to match.
+Their config still provides the complete dtype facts.
+The backend must reject unsupported mixed-dtype expert configurations during initialization.
+Future work: Generalize these templates only when a supported model requires a mixed-dtype expert projection.
+Do not add an executor-visible mixed-dtype mode.
+
 An alternating full-replay benchmark compared the retained manual QMV/BM32 policy with adaptive selection.
 Both runs used one request, context length 0, 30 warmup iterations, 100 measured iterations, and five runs.
 

@@ -11,64 +11,63 @@ use crate::operators::mlx_headers::find_mlx_metal_header_root;
 use crate::operators::mlx_headers::read_mlx_metal_header;
 
 #[derive(Clone, Copy, Debug)]
-pub struct SoftmaxShape {
-    pub num_rows: u32,
+pub struct SoftmaxConfig {
     pub num_values_per_row: u32,
     pub dtype: Dtype,
+}
+
+impl SoftmaxConfig {
+    pub fn validate(self) {
+        assert!(self.num_values_per_row > 0);
+        assert!(self.num_values_per_row <= 4096);
+        assert_eq!(self.dtype, Dtype::Bfloat16);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SoftmaxShape {
+    pub num_rows: u32,
 }
 
 impl SoftmaxShape {
     pub fn validate(self) {
         assert!(self.num_rows > 0);
-        assert!(self.num_values_per_row > 0);
-        assert!(self.num_values_per_row <= 4096);
-        assert_eq!(self.dtype, Dtype::Bfloat16);
     }
 
-    pub fn bytes(self) -> usize {
+    pub fn bytes(self, config: SoftmaxConfig) -> usize {
         self.validate();
+        config.validate();
         (self.num_rows as usize)
-            .checked_mul(self.num_values_per_row as usize)
-            .and_then(|num_values| num_values.checked_mul(self.dtype.item_size()))
+            .checked_mul(config.num_values_per_row as usize)
+            .and_then(|num_values| num_values.checked_mul(config.dtype.item_size()))
             .expect("softmax byte length must fit usize")
     }
 }
 
 pub struct SoftmaxKernel {
-    shape: SoftmaxShape,
+    config: SoftmaxConfig,
     kernel: Kernel,
 }
 
+#[derive(Clone, Copy)]
+pub struct SoftmaxBuffers<'a> {
+    pub input: &'a Buffer,
+    pub output: &'a Buffer,
+}
+
 impl SoftmaxKernel {
-    pub fn new(device: &Device, shape: SoftmaxShape) -> Self {
-        shape.validate();
+    pub fn new(device: &Device, config: SoftmaxConfig) -> Self {
+        config.validate();
         let kernel = Kernel::new(device, &softmax_source(), "block_softmax_bfloat16");
-        Self { shape, kernel }
+        Self { config, kernel }
     }
 
-    pub fn invoke<'a>(&'a self, output: &'a Buffer, input: &'a Buffer) -> SoftmaxInvocation<'a> {
-        SoftmaxInvocation {
-            kernel: self,
-            shape: self.shape,
-            output,
-            input,
-        }
-    }
-
-    pub fn invoke_with_shape<'a>(
-        &'a self,
-        shape: SoftmaxShape,
-        output: &'a Buffer,
-        input: &'a Buffer,
-    ) -> SoftmaxInvocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: SoftmaxShape, buffers: SoftmaxBuffers<'a>) -> SoftmaxInvocation<'a> {
         shape.validate();
-        assert_eq!(shape.num_values_per_row, self.shape.num_values_per_row);
-        assert_eq!(shape.dtype, self.shape.dtype);
         SoftmaxInvocation {
             kernel: self,
             shape,
-            output,
-            input,
+            buffers,
         }
     }
 }
@@ -76,26 +75,26 @@ impl SoftmaxKernel {
 pub struct SoftmaxInvocation<'a> {
     kernel: &'a SoftmaxKernel,
     shape: SoftmaxShape,
-    output: &'a Buffer,
-    input: &'a Buffer,
+    buffers: SoftmaxBuffers<'a>,
 }
 
 impl Operator for SoftmaxInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         let shape = self.shape;
         shape.validate();
-        let bytes = shape.bytes();
-        assert!(bytes <= self.input.len_bytes());
-        assert!(bytes <= self.output.len_bytes());
+        let config = self.kernel.config;
+        let bytes = shape.bytes(config);
+        assert!(bytes <= self.buffers.input.len_bytes());
+        assert!(bytes <= self.buffers.output.len_bytes());
 
         builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.input, 0);
-        builder.set_buffer_write(1, self.output, 0);
-        builder.set_i32(2, shape.num_values_per_row as i32);
+        builder.set_buffer_read(0, self.buffers.input, 0);
+        builder.set_buffer_write(1, self.buffers.output, 0);
+        builder.set_i32(2, config.num_values_per_row as i32);
 
         let n_reads = 4usize;
         let simd_size = 32usize;
-        let num_threads_needed = (shape.num_values_per_row as usize).div_ceil(n_reads);
+        let num_threads_needed = (config.num_values_per_row as usize).div_ceil(n_reads);
         let num_simdgroups = num_threads_needed.div_ceil(simd_size);
         let num_threads_per_threadblock = simd_size * num_simdgroups;
         builder.dispatch_1d(
@@ -142,6 +141,8 @@ fn mlx_metal_header_root() -> PathBuf {
 mod tests {
     use half::bf16;
 
+    use super::SoftmaxBuffers;
+    use super::SoftmaxConfig;
     use super::SoftmaxKernel;
     use super::SoftmaxShape;
     use crate::metal::Buffer;
@@ -151,19 +152,25 @@ mod tests {
 
     #[test]
     fn test_reference() {
-        let shape = SoftmaxShape {
-            num_rows: 2,
+        let config = SoftmaxConfig {
             num_values_per_row: 4,
             dtype: Dtype::Bfloat16,
         };
-        let (device, kernel) = create_softmax_kernel(shape);
+        let shape = SoftmaxShape { num_rows: 2 };
+        let (device, kernel) = create_softmax_kernel(config);
         let stream = Stream::new(&device);
         let input_values = [-2.0, -1.0, 0.0, 1.0, 4.0, 2.0, 0.0, -2.0];
         let input = bf16_buffer(&device, &input_values);
-        let output = Buffer::new_zeroed(&device, shape.bytes());
+        let output = Buffer::new_zeroed(&device, shape.bytes(config));
 
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(&output, &input));
+        builder.record(kernel.invoke(
+            shape,
+            SoftmaxBuffers {
+                input: &input,
+                output: &output,
+            },
+        ));
         let replay = builder.build();
         stream.submit_replay(&replay).wait();
 
@@ -171,14 +178,14 @@ mod tests {
         let expected = cpu_softmax_bf16_rows(
             &input_values,
             shape.num_rows as usize,
-            shape.num_values_per_row as usize,
+            config.num_values_per_row as usize,
         );
         assert_close(&actual, &expected, 0.01);
     }
 
-    fn create_softmax_kernel(shape: SoftmaxShape) -> (Device, SoftmaxKernel) {
+    fn create_softmax_kernel(config: SoftmaxConfig) -> (Device, SoftmaxKernel) {
         let device = Device::system_default();
-        let kernel = SoftmaxKernel::new(&device, shape);
+        let kernel = SoftmaxKernel::new(&device, config);
         (device, kernel)
     }
 

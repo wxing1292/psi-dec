@@ -5,9 +5,9 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
+use inference_backend_metal::components::QuantizedDenseMLP;
 use inference_backend_metal::components::QuantizedDenseMLPBuffers;
 use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPKernels;
 use inference_backend_metal::components::QuantizedDenseMLPScratch;
 use inference_backend_metal::components::QuantizedDenseMLPShape;
 use inference_backend_metal::components::QuantizedDenseMLPWeights;
@@ -62,13 +62,13 @@ fn bench_dense_mlp(c: &mut Criterion) {
             group.throughput(Throughput::Elements(tokens as u64 * profile.hidden_dim as u64));
             group.bench_function(
                 format!(
-                    "{}/gate_up_activation/tokens{tokens}/hidden{}/intermediate{}",
+                    "{}/gate_up_swiglu/tokens{tokens}/hidden{}/intermediate{}",
                     profile.name, profile.hidden_dim, profile.intermediate_dim
                 ),
                 |b| {
                     b.iter(|| {
-                        dense_mlp.replay_gate_up_activation();
-                        black_box(&dense_mlp.scratch.activation);
+                        dense_mlp.replay_gate_up_swiglu();
+                        black_box(&dense_mlp.scratch.swiglu);
                     });
                 },
             );
@@ -93,11 +93,11 @@ fn bench_dense_mlp(c: &mut Criterion) {
 struct QuantizedDenseMLPFixture {
     stream: Stream,
     shape: QuantizedDenseMLPShape,
-    kernels: QuantizedDenseMLPKernels,
+    compute: QuantizedDenseMLP,
     buffers: QuantizedDenseMLPOwnedBuffers,
     scratch: QuantizedDenseMLPOwnedScratch,
     weights: QuantizedDenseMLPOwnedWeights,
-    gate_up_activation_replay: ReplayProgram,
+    gate_up_swiglu_replay: ReplayProgram,
     forward_replay: ReplayProgram,
 }
 
@@ -115,15 +115,15 @@ impl QuantizedDenseMLPFixture {
         let down_config = config.down_config();
         let tokens_i32 = tokens.try_into().expect("dense MLP token count must fit i32");
         let stream = Stream::new(device);
-        let kernels = QuantizedDenseMLPKernels::new(device, config);
+        let compute = QuantizedDenseMLP::new(device, config);
         let buffers = QuantizedDenseMLPOwnedBuffers {
             hidden_state: bf16_buffer(device, &hidden_fixture(tokens as usize, profile.hidden_dim as usize)),
             replay_next_hidden_state: Buffer::new_zeroed(device, down_config.output_bytes(tokens_i32)),
         };
         let scratch = QuantizedDenseMLPOwnedScratch {
-            gate_up_proj: Buffer::new_zeroed(device, gate_up_config.output_bytes(tokens_i32)),
-            activation: Buffer::new_zeroed(device, config.activation_shape(shape).bytes()),
-            replay_activation: Buffer::new_zeroed(device, config.activation_shape(shape).bytes()),
+            gate_up: Buffer::new_zeroed(device, gate_up_config.output_bytes(tokens_i32)),
+            swiglu: Buffer::new_zeroed(device, config.swiglu_bytes(shape)),
+            replay_swiglu: Buffer::new_zeroed(device, config.swiglu_bytes(shape)),
         };
         let weights = QuantizedDenseMLPOwnedWeights {
             gate_up_weight: quantized_weight(device, gate_up_config.weight_bytes()),
@@ -145,25 +145,24 @@ impl QuantizedDenseMLPFixture {
                 &zero_fixture(down_config.scale_or_bias_bytes() / size_of::<u16>()),
             ),
         };
-        let gate_up_activation_replay =
-            build_gate_up_activation_replay(&stream, &kernels, shape, &buffers, &scratch, &weights);
-        let forward_replay = build_forward_replay(&stream, &kernels, shape, &buffers, &scratch, &weights);
+        let gate_up_swiglu_replay = build_gate_up_swiglu_replay(&stream, &compute, shape, &buffers, &scratch, &weights);
+        let forward_replay = build_forward_replay(&stream, &compute, shape, &buffers, &scratch, &weights);
         let fixture = Self {
             stream,
             shape,
-            kernels,
+            compute,
             buffers,
             scratch,
             weights,
-            gate_up_activation_replay,
+            gate_up_swiglu_replay,
             forward_replay,
         };
         fixture.replay_forward();
         fixture
     }
 
-    fn replay_gate_up_activation(&self) {
-        self.stream.submit_replay(&self.gate_up_activation_replay).wait();
+    fn replay_gate_up_swiglu(&self) {
+        self.stream.submit_replay(&self.gate_up_swiglu_replay).wait();
     }
 
     fn replay_forward(&self) {
@@ -182,19 +181,19 @@ impl QuantizedDenseMLPFixture {
     }
 }
 
-fn build_gate_up_activation_replay(
+fn build_gate_up_swiglu_replay(
     stream: &Stream,
-    kernels: &QuantizedDenseMLPKernels,
+    compute: &QuantizedDenseMLP,
     shape: QuantizedDenseMLPShape,
     buffers: &QuantizedDenseMLPOwnedBuffers,
     scratch: &QuantizedDenseMLPOwnedScratch,
     weights: &QuantizedDenseMLPOwnedWeights,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_gate_up(
+    builder.record(compute.invoke_gate_up(
         shape,
         &buffers.hidden_state,
-        &scratch.gate_up_proj,
+        &scratch.gate_up,
         QuantizedDenseMLPWeights {
             gate_up_weight: &weights.gate_up_weight,
             gate_up_scales: &weights.gate_up_scales,
@@ -204,28 +203,28 @@ fn build_gate_up_activation_replay(
             down_biases: &weights.down_biases,
         },
     ));
-    builder.record_with_barrier_before(kernels.invoke_activation(shape, &scratch.gate_up_proj, &scratch.activation));
+    builder.record_with_barrier_before(compute.invoke_swiglu(shape, &scratch.gate_up, &scratch.swiglu));
     builder.build()
 }
 
 fn build_forward_replay(
     stream: &Stream,
-    kernels: &QuantizedDenseMLPKernels,
+    compute: &QuantizedDenseMLP,
     shape: QuantizedDenseMLPShape,
     buffers: &QuantizedDenseMLPOwnedBuffers,
     scratch: &QuantizedDenseMLPOwnedScratch,
     weights: &QuantizedDenseMLPOwnedWeights,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke(
+    builder.record(compute.invoke(
         shape,
         QuantizedDenseMLPBuffers {
             hidden_state: &buffers.hidden_state,
             next_hidden_state: &buffers.replay_next_hidden_state,
         },
         QuantizedDenseMLPScratch {
-            gate_up_proj: &scratch.gate_up_proj,
-            activation: &scratch.replay_activation,
+            gate_up: &scratch.gate_up,
+            swiglu: &scratch.replay_swiglu,
         },
         QuantizedDenseMLPWeights {
             gate_up_weight: &weights.gate_up_weight,
@@ -245,9 +244,9 @@ struct QuantizedDenseMLPOwnedBuffers {
 }
 
 struct QuantizedDenseMLPOwnedScratch {
-    gate_up_proj: Buffer,
-    activation: Buffer,
-    replay_activation: Buffer,
+    gate_up: Buffer,
+    swiglu: Buffer,
+    replay_swiglu: Buffer,
 }
 
 struct QuantizedDenseMLPOwnedWeights {

@@ -125,6 +125,14 @@ operation only `activation` or `silu`.
 Use `shared_experts` and `topk_experts` for MoE branches. Use `shared_expert_gate` for the one gate that controls the
 aggregate shared-expert branch.
 
+Model and executor component configs must state their hidden-state boundary dtype. Use `io_dtype` when input and output
+must use one dtype. Use `input_dtype` and `output_dtype` when the two boundaries are independent. These fields describe
+workload facts. They do not select a kernel dtype specialization.
+
+Current Metal model components accept BF16 hidden-state boundaries. A recognized F32 boundary must fail with an explicit
+future-work `todo!` until the complete component path supports it. Low-level operators may support additional dtype
+combinations.
+
 Use one symbolic convention for attention tensor and tile comments:
 
 ```text

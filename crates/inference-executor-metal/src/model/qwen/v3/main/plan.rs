@@ -54,7 +54,7 @@ pub fn qwen3_dense_mlp_core_and_metal(
     let metal = DenseMLPMetalConfig {
         group_size,
         bits,
-        dtype: Dtype::Bfloat16,
+        io_dtype: Dtype::Bfloat16,
     };
     metal.validate();
     Ok((core, metal))

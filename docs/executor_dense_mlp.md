@@ -44,6 +44,7 @@ Reusable Metal dense MLP kernels live in:
 
 ```text
 crates/inference-backend-metal/src/components/quantized_dense_mlp.rs
+crates/inference-backend-metal/src/components/metal/quantized_dense_mlp_swiglu.metal
 ```
 
 ## Shape model
@@ -65,13 +66,13 @@ down_shape
 ```
 
 `DenseMLP` connects model-level dense MLP metadata to `inference-backend-metal` kernels.
-It owns the full `gate_up -> activation -> down` backend path.
+It owns the full `gate_up -> swiglu -> down` backend path.
 It does not own tensor storage, runtime scheduling, or page allocation.
 
 The backend implements `ReplayLayer`.
 Qwen model and layer code use `Recorder` to append dense MLP work to a larger whole-layer or whole-model replay.
 Focused tests and benches build replay programs from the same recorder path.
-The internal order is `gate_up -> activation [barrier before] -> down [barrier before]`.
+The internal order is `gate_up -> swiglu [barrier before] -> down [barrier before]`.
 Model and layer wiring own barriers on the first consumer command and downstream residual consumers.
 
 ## Replay contract
@@ -87,7 +88,7 @@ The replay order is:
 ```text
 hidden_state
   -> fused gate/up quantized projection
-  -> SiLU(gate) * up activation
+  -> SwiGLU: SiLU(gate) * up
   -> down quantized projection
   -> next_hidden_state
 ```
@@ -97,17 +98,22 @@ Only `crates/inference-executor-metal` maps it to `QuantizedDenseMLPShape`.
 Production callers allocate scratch for model capacity.
 Each replay invocation validates and uses only the current token count.
 All buffers and weights must match the configured dimensions, group size, bit width, and dtype.
-This requirement covers hidden buffers, gate/up scratch, activation scratch, and immutable weights.
+This requirement covers hidden buffers, gate/up scratch, swiglu scratch, and immutable weights.
 
 Qwen model replay keeps dense MLP scratch in one model-owned `DenseMLPScratch`.
 Its `bindings()` method exposes borrowed `DenseMLPScratchBindings` during replay recording.
+Scratch allocation accepts only model geometry, capacity, and `io_dtype`.
+It does not accept quantization group size or bit width because those weight facts do not affect scratch layout.
 The model stream serializes Main and MTP execution.
-Thus, layers can reuse `gate_up` and activation scratch.
+Thus, layers can reuse `gate_up` and swiglu scratch.
 
 The shared `Qwen3xDenseMLP` leaf directly owns immutable weights and per-layer output buffers.
 `Qwen3MainLayer` and the dense variants of `Qwen35MainLayer` and `Qwen35MTPLayer` compose that leaf.
 Each composition uses a separate role-specific layer and scratch type.
 Their model-specific binding trees contain `Qwen3xDenseMLPWeightBindings` at the leaf boundary.
+The weight owner loads one bounded `TensorMap` from that exact gate/up/down binding subtree.
+It removes every tensor and materializes fused gate-up buffers while it keeps the down projection separate.
+The map must be empty after construction.
 At initialization, Qwen validates scratch layout compatibility across every Main and optional MTP dense layer.
 
 ## Data flow and backend stages
@@ -117,7 +123,7 @@ Dense MLP is a pure hidden-state transform with no request page/state side effec
 ```text
 hidden_state[num_tokens, hidden_dim]
   -> fused gate/up quantized affine
-  -> activation[row, intermediate] = SiLU(gate[row, col]) * up[row, col]
+  -> swiglu[row, intermediate] = SiLU(gate[row, col]) * up[row, col]
   -> down quantized affine
   -> next_hidden_state[num_tokens, hidden_dim]
 ```
@@ -129,8 +135,8 @@ gate_up[row, 0..intermediate_dim)                  gate projection
 gate_up[row, intermediate_dim..2*intermediate_dim) up projection
 ```
 
-The activation kernel reads both halves.
-It writes one `activation[num_tokens, intermediate_dim]` scratch buffer.
+The `QuantizedDenseMLPSwiGLUKernel` reads both halves.
+It writes one `swiglu[num_tokens, intermediate_dim]` scratch buffer.
 The down projection reads that scratch and immutable down weights.
 It then writes the component output.
 
@@ -145,12 +151,12 @@ gate_up affine
   reads hidden_state + gate/up weights/scales/biases
   writes gate_up scratch
 
-activation
+swiglu
   reads gate_up scratch
-  writes activation scratch
+  writes swiglu scratch
 
 down affine
-  reads activation scratch + down weights/scales/biases
+  reads swiglu scratch + down weights/scales/biases
   writes next_hidden_state
 ```
 
@@ -167,7 +173,7 @@ Each replay invocation uses the current active prefix.
 
 ## Backend selection
 
-`QuantizedDenseMLPKernels` owns one adaptive `AffineQuantizedMatmul` for gate/up and one for down.
+`QuantizedDenseMLP` owns one adaptive `AffineQuantizedMatmul` for gate/up and one for down.
 Each `AffineQuantizedMatmul` owns the QMV/QMM candidates and selects its kernel.
 The model and executor provide the complete dense-MLP dimensions and active row count.
 They do not select a kernel or tile.
@@ -233,7 +239,7 @@ gate_up_qmv_bn8_bk32
 gate_up_qmm_bm8_bn32
 gate_up_qmm_bm16_bn32
 gate_up_qmm_bm32_bn32
-activation
+swiglu
 down_auto
 down_qmv_bn8_bk32
 down_qmm_bm8_bn32
@@ -244,12 +250,12 @@ down_qmm_bm32_bn32
 The default forward path is the real-weight replay path:
 
 ```text
-gate_up -> activation -> down
+gate_up -> swiglu -> down
 ```
 
-The activation stage computes `SiLU(gate) * up` from the stacked gate/up projection.
-Public replay APIs call this stage `activation`.
-It is the dense MLP activation contract, not a standalone SiLU transform.
+The `swiglu` stage computes `SiLU(gate) * up` from the stacked gate/up projection.
+Public replay APIs call this stage `swiglu`.
+It is the dense MLP SwiGLU contract, not a standalone SiLU transform.
 
 The real-weight `*_auto` cases use `DenseMLP` and its normal shape-dependent policy.
 `qmv_bn8_bk32` means the forced QMV BN8/BK32 kernel.
@@ -258,7 +264,7 @@ Forced qmv/qmm cases are benchmark-only operator-policy probes.
 
 They help select the correct production threshold.
 They are not separate production paths.
-Dense MLP no longer keeps direct-submit or fused gate/up activation forward probes as production paths.
+Dense MLP no longer keeps direct-submit or fused gate/up swiglu forward probes as production paths.
 
 The real-weight bench prints replay metadata with each perf row:
 

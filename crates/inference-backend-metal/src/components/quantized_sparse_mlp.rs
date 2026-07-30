@@ -5,14 +5,14 @@ use crate::metal::CommandRecorder;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
+use crate::operators::AffineQuantizedMatmulConfig;
+use crate::operators::ExpertAffineQuantizedConfig;
 use crate::operators::GatherAffineQuantizedMatmulKernel;
-use crate::operators::GatherAffineQuantizedMatmulShape;
-use crate::operators::RaggedExpertMajorAffineQuantizedGateUpSiluKernel;
-use crate::operators::RaggedExpertMajorAffineQuantizedGateUpSiluShape;
+use crate::operators::GatherAffineQuantizedShape;
+use crate::operators::RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel;
 use crate::operators::RaggedExpertMajorAffineQuantizedMatmulKernel;
-use crate::operators::RaggedExpertMajorAffineQuantizedMatmulShape;
-use crate::operators::affine_quantized::GatherAffineQuantizedGateUpSiluKernel;
-use crate::operators::affine_quantized::GatherAffineQuantizedGateUpSiluShape;
+use crate::operators::RaggedExpertMajorAffineQuantizedShape;
+use crate::operators::affine_quantized::GatherAffineQuantizedGateUpSwiGLUKernel;
 
 fn to_i32(value: u32, name: &str) -> i32 {
     value.try_into().unwrap_or_else(|_| panic!("{name} must fit i32"))
@@ -28,6 +28,7 @@ fn checked_bytes(name: &str, dimensions: &[usize], dtype: Dtype) -> usize {
 
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedSparseMLPConfig {
+    pub num_experts: u32,
     pub hidden_dim: u32,
     pub intermediate_dim: u32,
     pub group_size: u32,
@@ -37,6 +38,7 @@ pub struct QuantizedSparseMLPConfig {
 
 impl QuantizedSparseMLPConfig {
     pub fn validate(self) {
+        assert!(self.num_experts > 0);
         assert!(self.hidden_dim > 0);
         assert!(self.intermediate_dim > 0);
         self.stacked_intermediate_dim();
@@ -54,47 +56,59 @@ impl QuantizedSparseMLPConfig {
         );
         assert_eq!(self.dtype, Dtype::Bfloat16, "sparse MLP currently supports bf16 only");
         i32::try_from(self.hidden_dim).expect("sparse MLP hidden_dim must fit i32");
+        i32::try_from(self.num_experts).expect("sparse MLP expert count must fit i32");
         i32::try_from(self.intermediate_dim).expect("sparse MLP intermediate_dim must fit i32");
         i32::try_from(self.stacked_intermediate_dim()).expect("sparse MLP stacked intermediate_dim must fit i32");
         i32::try_from(self.group_size).expect("sparse MLP group_size must fit i32");
         i32::try_from(self.bits).expect("sparse MLP bits must fit i32");
     }
 
-    pub fn token_major_fused_gate_up_silu_shape(
-        self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-    ) -> GatherAffineQuantizedGateUpSiluShape {
-        self.validate();
-        shape.validate();
-        self.token_major_fused_gate_up_silu_shape_unchecked(shape)
+    pub fn gate_up_config(self) -> ExpertAffineQuantizedConfig {
+        self.expert_affine_config(self.intermediate_dim, self.hidden_dim)
     }
 
-    fn token_major_fused_gate_up_silu_shape_unchecked(
-        self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-    ) -> GatherAffineQuantizedGateUpSiluShape {
-        GatherAffineQuantizedGateUpSiluShape {
-            num_routes: to_i32(shape.num_routes, "sparse MLP route count"),
-            num_input_vectors: to_i32(shape.num_tokens, "sparse MLP token count"),
-            intermediate_dim: to_i32(self.intermediate_dim, "sparse MLP intermediate_dim"),
-            k: to_i32(self.hidden_dim, "sparse MLP hidden_dim"),
-            group_size: to_i32(self.group_size, "sparse MLP group_size"),
-            bits: to_i32(self.bits, "sparse MLP bits"),
-            dtype: self.dtype,
+    pub fn down_config(self) -> ExpertAffineQuantizedConfig {
+        self.expert_affine_config(self.hidden_dim, self.intermediate_dim)
+    }
+
+    fn expert_affine_config(self, n: u32, k: u32) -> ExpertAffineQuantizedConfig {
+        self.validate();
+        ExpertAffineQuantizedConfig {
+            num_experts: to_i32(self.num_experts, "sparse MLP expert count"),
+            matmul: AffineQuantizedMatmulConfig::same_dtype(
+                to_i32(n, "sparse MLP output dimension"),
+                to_i32(k, "sparse MLP input dimension"),
+                to_i32(self.group_size, "sparse MLP group size"),
+                to_i32(self.bits, "sparse MLP bits"),
+                self.dtype,
+            ),
         }
     }
 
-    pub fn token_major_down_shape(self, shape: QuantizedSparseMLPTokenMajorShape) -> GatherAffineQuantizedMatmulShape {
-        self.validate();
+    fn token_major_gate_up_shape(self, shape: QuantizedSparseMLPTokenMajorShape) -> GatherAffineQuantizedShape {
         shape.validate();
-        self.token_major_down_shape_unchecked(shape)
+        GatherAffineQuantizedShape {
+            num_routes: to_i32(shape.num_routes, "sparse MLP route count"),
+            num_input_vectors: to_i32(shape.num_tokens, "sparse MLP token count"),
+        }
     }
 
-    fn token_major_down_shape_unchecked(
+    fn token_major_down_shape(self, shape: QuantizedSparseMLPTokenMajorShape) -> GatherAffineQuantizedShape {
+        shape.validate();
+        GatherAffineQuantizedShape {
+            num_routes: to_i32(shape.num_routes, "sparse MLP route count"),
+            num_input_vectors: to_i32(shape.num_routes, "sparse MLP route count"),
+        }
+    }
+
+    fn expert_major_affine_shape(
         self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-    ) -> GatherAffineQuantizedMatmulShape {
-        self.gather_shape_unchecked(shape, shape.num_routes, self.hidden_dim, self.intermediate_dim)
+        shape: QuantizedSparseMLPExpertMajorShape,
+    ) -> RaggedExpertMajorAffineQuantizedShape {
+        shape.validate();
+        RaggedExpertMajorAffineQuantizedShape {
+            num_routes: to_i32(shape.num_routes, "sparse MLP route count"),
+        }
     }
 
     pub fn token_major_input_bytes(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
@@ -122,15 +136,15 @@ impl QuantizedSparseMLPConfig {
             .expect("sparse MLP route-index byte length must fit usize")
     }
 
-    pub fn activation_bytes(self, num_routes: u32) -> usize {
+    pub fn swiglu_bytes(self, num_routes: u32) -> usize {
         self.validate();
         assert!(num_routes > 0);
-        self.activation_bytes_unchecked(num_routes)
+        self.swiglu_bytes_unchecked(num_routes)
     }
 
-    fn activation_bytes_unchecked(self, num_routes: u32) -> usize {
+    fn swiglu_bytes_unchecked(self, num_routes: u32) -> usize {
         checked_bytes(
-            "sparse MLP activation",
+            "sparse MLP swiglu",
             &[num_routes as usize, self.intermediate_dim as usize],
             self.dtype,
         )
@@ -169,86 +183,12 @@ impl QuantizedSparseMLPConfig {
             .expect("sparse MLP expert-major route-index byte length must fit usize")
     }
 
-    fn expert_major_fused_gate_up_silu_shape(
-        self,
-        shape: QuantizedSparseMLPExpertMajorShape,
-    ) -> RaggedExpertMajorAffineQuantizedGateUpSiluShape {
-        self.validate();
-        shape.validate();
-        RaggedExpertMajorAffineQuantizedGateUpSiluShape {
-            num_experts: to_i32(shape.num_experts, "sparse MLP expert count"),
-            num_routes: to_i32(shape.num_routes, "sparse MLP route count"),
-            intermediate_dim: to_i32(self.intermediate_dim, "sparse MLP intermediate_dim"),
-            k: to_i32(self.hidden_dim, "sparse MLP hidden_dim"),
-            group_size: to_i32(self.group_size, "sparse MLP group_size"),
-            bits: to_i32(self.bits, "sparse MLP bits"),
-            dtype: self.dtype,
-        }
-    }
-
-    fn expert_major_down_shape(
-        self,
-        shape: QuantizedSparseMLPExpertMajorShape,
-    ) -> RaggedExpertMajorAffineQuantizedMatmulShape {
-        self.validate();
-        shape.validate();
-        RaggedExpertMajorAffineQuantizedMatmulShape {
-            num_experts: to_i32(shape.num_experts, "sparse MLP expert count"),
-            num_routes: to_i32(shape.num_routes, "sparse MLP route count"),
-            n: to_i32(self.hidden_dim, "sparse MLP hidden_dim"),
-            k: to_i32(self.intermediate_dim, "sparse MLP intermediate_dim"),
-            group_size: to_i32(self.group_size, "sparse MLP group_size"),
-            bits: to_i32(self.bits, "sparse MLP bits"),
-            dtype: self.dtype,
-        }
-    }
-
     fn token_major_output_bytes_unchecked(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
-        self.token_major_down_shape_unchecked(shape).output_bytes()
-    }
-
-    fn gather_shape_unchecked(
-        self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-        num_input_vectors: u32,
-        n: u32,
-        k: u32,
-    ) -> GatherAffineQuantizedMatmulShape {
-        GatherAffineQuantizedMatmulShape {
-            num_routes: to_i32(shape.num_routes, "sparse MLP route count"),
-            num_input_vectors: to_i32(num_input_vectors, "sparse MLP input-vector count"),
-            n: to_i32(n, "sparse MLP output dimension"),
-            k: to_i32(k, "sparse MLP input dimension"),
-            group_size: to_i32(self.group_size, "sparse MLP group_size"),
-            bits: to_i32(self.bits, "sparse MLP bits"),
-            dtype: self.dtype,
-        }
-    }
-
-    fn token_major_compile_shape(self, n: u32, k: u32) -> GatherAffineQuantizedMatmulShape {
-        self.validate();
-        GatherAffineQuantizedMatmulShape {
-            num_routes: 1,
-            num_input_vectors: 1,
-            n: to_i32(n, "sparse MLP compile output dimension"),
-            k: to_i32(k, "sparse MLP compile input dimension"),
-            group_size: to_i32(self.group_size, "sparse MLP group_size"),
-            bits: to_i32(self.bits, "sparse MLP bits"),
-            dtype: self.dtype,
-        }
-    }
-
-    fn token_major_compile_fused_gate_up_silu_shape(self) -> GatherAffineQuantizedGateUpSiluShape {
-        self.validate();
-        GatherAffineQuantizedGateUpSiluShape {
-            num_routes: 1,
-            num_input_vectors: 1,
-            intermediate_dim: to_i32(self.intermediate_dim, "sparse MLP intermediate_dim"),
-            k: to_i32(self.hidden_dim, "sparse MLP hidden_dim"),
-            group_size: to_i32(self.group_size, "sparse MLP group_size"),
-            bits: to_i32(self.bits, "sparse MLP bits"),
-            dtype: self.dtype,
-        }
+        checked_bytes(
+            "sparse MLP token-major output",
+            &[shape.num_routes as usize, self.hidden_dim as usize],
+            self.dtype,
+        )
     }
 
     fn stacked_intermediate_dim(self) -> u32 {
@@ -275,14 +215,11 @@ impl QuantizedSparseMLPTokenMajorShape {
 
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedSparseMLPExpertMajorShape {
-    pub num_experts: u32,
     pub num_routes: u32,
 }
 
 impl QuantizedSparseMLPExpertMajorShape {
     pub fn validate(self) {
-        assert!(self.num_experts > 0);
-        to_i32(self.num_experts, "sparse MLP expert count");
         to_i32(self.num_routes, "sparse MLP route count");
         assert!(self.num_routes > 0);
     }
@@ -294,14 +231,14 @@ pub struct QuantizedSparseMLPTokenMajorBuffers<'a> {
     pub token_indices: &'a Buffer,
     pub expert_indices: &'a Buffer,
     pub route_indices: &'a Buffer,
-    pub output: &'a Buffer,
+    pub routed_hidden: &'a Buffer,
 }
 
 #[derive(Clone, Copy)]
 pub struct QuantizedSparseMLPExpertMajorBuffers<'a> {
     pub packed_input: &'a Buffer,
     pub experts_by_route: &'a Buffer,
-    pub route_output: &'a Buffer,
+    pub packed_output: &'a Buffer,
 }
 
 #[derive(Clone, Copy)]
@@ -318,23 +255,43 @@ pub struct QuantizedSparseMLPWeights<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedSparseMLPTokenMajorScratch<'a> {
-    pub activation: &'a Buffer,
+pub struct QuantizedSparseMLPScratch<'a> {
+    pub swiglu: &'a Buffer,
 }
 
-#[derive(Clone, Copy)]
-pub struct QuantizedSparseMLPExpertMajorScratch<'a> {
-    pub activation: &'a Buffer,
-}
-
+/// Records one quantized sparse MLP through either supported route layout:
+///
+/// ```text
+/// TokenMajor
+///
+/// input [T, H] --(token_indices, expert_indices)--> gate_up_swiglu
+///                                                       |
+///                                                       v
+///                                                swiglu [R, I]
+///                                                       |
+///                              (route_indices, expert_indices)
+///                                                       |
+///                                                       v
+///                                             routed_hidden [R, H]
+///
+/// ExpertMajor
+///
+/// packed_input [R, H] --(experts_by_route)--> gate_up_swiglu
+///                                                   |
+///                                                   v
+///                                            swiglu [R, I]
+///                                                   |
+///                                           experts_by_route
+///                                                   |
+///                                                   v
+///                                         packed_output [R, H]
+/// ```
 pub struct QuantizedSparseMLP {
     token_major: QuantizedSparseMLPTokenMajorKernels,
     expert_major: QuantizedSparseMLPExpertMajorKernels,
 }
 
 impl QuantizedSparseMLP {
-    fn validate_input(&self) {}
-
     pub fn new(device: &Device, config: QuantizedSparseMLPConfig) -> Self {
         Self {
             token_major: QuantizedSparseMLPTokenMajorKernels::new(device, config),
@@ -342,65 +299,36 @@ impl QuantizedSparseMLP {
         }
     }
 
-    pub fn token_major(&self) -> &QuantizedSparseMLPTokenMajorKernels {
-        &self.token_major
-    }
-
     pub fn invoke_token_major<'a>(
         &'a self,
         shape: QuantizedSparseMLPTokenMajorShape,
         buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
+        scratch: QuantizedSparseMLPScratch<'a>,
         weights: QuantizedSparseMLPWeights<'a>,
     ) -> QuantizedSparseMLPTokenMajorInvocation<'a> {
-        self.validate_input();
         self.token_major.invoke(shape, buffers, scratch, weights)
-    }
-
-    pub fn invoke_token_major_fused_gate_up_silu<'a>(
-        &'a self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorFusedGateUpSiluInvocation<'a> {
-        self.validate_input();
-        self.token_major
-            .invoke_fused_gate_up_silu(shape, buffers, scratch, weights)
-    }
-
-    pub fn invoke_token_major_down<'a>(
-        &'a self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorDownInvocation<'a> {
-        self.validate_input();
-        self.token_major.invoke_down(shape, buffers, scratch, weights)
     }
 
     pub fn invoke_expert_major<'a>(
         &'a self,
         shape: QuantizedSparseMLPExpertMajorShape,
         buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPExpertMajorScratch<'a>,
+        scratch: QuantizedSparseMLPScratch<'a>,
         weights: QuantizedSparseMLPWeights<'a>,
     ) -> QuantizedSparseMLPExpertMajorInvocation<'a> {
-        self.validate_input();
         self.expert_major.invoke(shape, buffers, scratch, weights)
     }
 }
 
 pub struct QuantizedSparseMLPTokenMajorKernels {
     config: QuantizedSparseMLPConfig,
-    fused_gate_up_silu: GatherAffineQuantizedGateUpSiluKernel,
+    gate_up_swiglu: GatherAffineQuantizedGateUpSwiGLUKernel,
     down: GatherAffineQuantizedMatmulKernel,
 }
 
 pub struct QuantizedSparseMLPExpertMajorKernels {
     config: QuantizedSparseMLPConfig,
-    fused_gate_up_silu: RaggedExpertMajorAffineQuantizedGateUpSiluKernel,
+    gate_up_swiglu: RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel,
     down: RaggedExpertMajorAffineQuantizedMatmulKernel,
 }
 
@@ -409,14 +337,8 @@ impl QuantizedSparseMLPTokenMajorKernels {
         config.validate();
         Self {
             config,
-            fused_gate_up_silu: GatherAffineQuantizedGateUpSiluKernel::new(
-                device,
-                config.token_major_compile_fused_gate_up_silu_shape(),
-            ),
-            down: GatherAffineQuantizedMatmulKernel::new(
-                device,
-                config.token_major_compile_shape(config.hidden_dim, config.intermediate_dim),
-            ),
+            gate_up_swiglu: GatherAffineQuantizedGateUpSwiGLUKernel::new(device, config.gate_up_config()),
+            down: GatherAffineQuantizedMatmulKernel::new(device, config.down_config()),
         }
     }
 
@@ -424,7 +346,7 @@ impl QuantizedSparseMLPTokenMajorKernels {
         &'a self,
         shape: QuantizedSparseMLPTokenMajorShape,
         buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
+        scratch: QuantizedSparseMLPScratch<'a>,
         weights: QuantizedSparseMLPWeights<'a>,
     ) -> QuantizedSparseMLPTokenMajorInvocation<'a> {
         QuantizedSparseMLPTokenMajorInvocation {
@@ -436,14 +358,14 @@ impl QuantizedSparseMLPTokenMajorKernels {
         }
     }
 
-    pub fn invoke_fused_gate_up_silu<'a>(
+    pub fn invoke_gate_up_swiglu<'a>(
         &'a self,
         shape: QuantizedSparseMLPTokenMajorShape,
         buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
+        scratch: QuantizedSparseMLPScratch<'a>,
         weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorFusedGateUpSiluInvocation<'a> {
-        QuantizedSparseMLPTokenMajorFusedGateUpSiluInvocation {
+    ) -> QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation<'a> {
+        QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation {
             kernels: self,
             shape,
             buffers,
@@ -456,7 +378,7 @@ impl QuantizedSparseMLPTokenMajorKernels {
         &'a self,
         shape: QuantizedSparseMLPTokenMajorShape,
         buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
+        scratch: QuantizedSparseMLPScratch<'a>,
         weights: QuantizedSparseMLPWeights<'a>,
     ) -> QuantizedSparseMLPTokenMajorDownInvocation<'a> {
         QuantizedSparseMLPTokenMajorDownInvocation {
@@ -472,20 +394,10 @@ impl QuantizedSparseMLPTokenMajorKernels {
 impl QuantizedSparseMLPExpertMajorKernels {
     pub fn new(device: &Device, config: QuantizedSparseMLPConfig) -> Self {
         config.validate();
-        let compile_shape = QuantizedSparseMLPExpertMajorShape {
-            num_experts: 1,
-            num_routes: 1,
-        };
         Self {
             config,
-            fused_gate_up_silu: RaggedExpertMajorAffineQuantizedGateUpSiluKernel::new(
-                device,
-                config.expert_major_fused_gate_up_silu_shape(compile_shape),
-            ),
-            down: RaggedExpertMajorAffineQuantizedMatmulKernel::new(
-                device,
-                config.expert_major_down_shape(compile_shape),
-            ),
+            gate_up_swiglu: RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel::new(device, config.gate_up_config()),
+            down: RaggedExpertMajorAffineQuantizedMatmulKernel::new(device, config.down_config()),
         }
     }
 
@@ -493,7 +405,7 @@ impl QuantizedSparseMLPExpertMajorKernels {
         &'a self,
         shape: QuantizedSparseMLPExpertMajorShape,
         buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPExpertMajorScratch<'a>,
+        scratch: QuantizedSparseMLPScratch<'a>,
         weights: QuantizedSparseMLPWeights<'a>,
     ) -> QuantizedSparseMLPExpertMajorInvocation<'a> {
         QuantizedSparseMLPExpertMajorInvocation {
@@ -510,14 +422,14 @@ pub struct QuantizedSparseMLPTokenMajorInvocation<'a> {
     kernels: &'a QuantizedSparseMLPTokenMajorKernels,
     shape: QuantizedSparseMLPTokenMajorShape,
     buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
+    scratch: QuantizedSparseMLPScratch<'a>,
     weights: QuantizedSparseMLPWeights<'a>,
 }
 
 impl Operator for QuantizedSparseMLPTokenMajorInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.kernels
-            .invoke_fused_gate_up_silu(self.shape, self.buffers, self.scratch, self.weights)
+            .invoke_gate_up_swiglu(self.shape, self.buffers, self.scratch, self.weights)
             .record(builder);
         builder.record_with_barrier_before(self.kernels.invoke_down(
             self.shape,
@@ -528,24 +440,22 @@ impl Operator for QuantizedSparseMLPTokenMajorInvocation<'_> {
     }
 }
 
-pub struct QuantizedSparseMLPTokenMajorFusedGateUpSiluInvocation<'a> {
+pub struct QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation<'a> {
     kernels: &'a QuantizedSparseMLPTokenMajorKernels,
     shape: QuantizedSparseMLPTokenMajorShape,
     buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
+    scratch: QuantizedSparseMLPScratch<'a>,
     weights: QuantizedSparseMLPWeights<'a>,
 }
 
-impl Operator for QuantizedSparseMLPTokenMajorFusedGateUpSiluInvocation<'_> {
+impl Operator for QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         debug_validate_token_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
         self.kernels
-            .fused_gate_up_silu
-            .invoke_with_shape(
-                self.kernels
-                    .config
-                    .token_major_fused_gate_up_silu_shape_unchecked(self.shape),
-                self.scratch.activation,
+            .gate_up_swiglu
+            .invoke(
+                self.kernels.config.token_major_gate_up_shape(self.shape),
+                self.scratch.swiglu,
                 self.buffers.input,
                 self.weights.gate_weight,
                 self.weights.gate_scales,
@@ -564,7 +474,7 @@ pub struct QuantizedSparseMLPTokenMajorDownInvocation<'a> {
     kernels: &'a QuantizedSparseMLPTokenMajorKernels,
     shape: QuantizedSparseMLPTokenMajorShape,
     buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPTokenMajorScratch<'a>,
+    scratch: QuantizedSparseMLPScratch<'a>,
     weights: QuantizedSparseMLPWeights<'a>,
 }
 
@@ -573,10 +483,10 @@ impl Operator for QuantizedSparseMLPTokenMajorDownInvocation<'_> {
         debug_validate_token_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
         self.kernels
             .down
-            .invoke_with_shape(
-                self.kernels.config.token_major_down_shape_unchecked(self.shape),
-                self.buffers.output,
-                self.scratch.activation,
+            .invoke(
+                self.kernels.config.token_major_down_shape(self.shape),
+                self.buffers.routed_hidden,
+                self.scratch.swiglu,
                 self.weights.down_weight,
                 self.weights.down_scales,
                 self.weights.down_biases,
@@ -591,7 +501,7 @@ pub struct QuantizedSparseMLPExpertMajorInvocation<'a> {
     kernels: &'a QuantizedSparseMLPExpertMajorKernels,
     shape: QuantizedSparseMLPExpertMajorShape,
     buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPExpertMajorScratch<'a>,
+    scratch: QuantizedSparseMLPScratch<'a>,
     weights: QuantizedSparseMLPWeights<'a>,
 }
 
@@ -599,10 +509,10 @@ impl Operator for QuantizedSparseMLPExpertMajorInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         debug_validate_expert_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
         self.kernels
-            .fused_gate_up_silu
-            .invoke_with_shape(
-                self.kernels.config.expert_major_fused_gate_up_silu_shape(self.shape),
-                self.scratch.activation,
+            .gate_up_swiglu
+            .invoke(
+                self.kernels.config.expert_major_affine_shape(self.shape),
+                self.scratch.swiglu,
                 self.buffers.packed_input,
                 self.weights.gate_weight,
                 self.weights.gate_scales,
@@ -613,10 +523,10 @@ impl Operator for QuantizedSparseMLPExpertMajorInvocation<'_> {
                 self.buffers.experts_by_route,
             )
             .record(builder);
-        builder.record_with_barrier_before(self.kernels.down.invoke_with_shape(
-            self.kernels.config.expert_major_down_shape(self.shape),
-            self.buffers.route_output,
-            self.scratch.activation,
+        builder.record_with_barrier_before(self.kernels.down.invoke(
+            self.kernels.config.expert_major_affine_shape(self.shape),
+            self.buffers.packed_output,
+            self.scratch.swiglu,
             self.weights.down_weight,
             self.weights.down_scales,
             self.weights.down_biases,
@@ -629,7 +539,7 @@ fn debug_validate_expert_major_buffers(
     config: QuantizedSparseMLPConfig,
     shape: QuantizedSparseMLPExpertMajorShape,
     buffers: &QuantizedSparseMLPExpertMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPExpertMajorScratch<'_>,
+    scratch: &QuantizedSparseMLPScratch<'_>,
 ) {
     #[cfg(debug_assertions)]
     validate_expert_major_buffers(config, shape, buffers, scratch);
@@ -639,7 +549,7 @@ fn debug_validate_token_major_buffers(
     config: QuantizedSparseMLPConfig,
     shape: QuantizedSparseMLPTokenMajorShape,
     buffers: &QuantizedSparseMLPTokenMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPTokenMajorScratch<'_>,
+    scratch: &QuantizedSparseMLPScratch<'_>,
 ) {
     #[cfg(debug_assertions)]
     validate_token_major_buffers(config, shape, buffers, scratch);
@@ -649,13 +559,13 @@ fn validate_expert_major_buffers(
     config: QuantizedSparseMLPConfig,
     shape: QuantizedSparseMLPExpertMajorShape,
     buffers: &QuantizedSparseMLPExpertMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPExpertMajorScratch<'_>,
+    scratch: &QuantizedSparseMLPScratch<'_>,
 ) {
     shape.validate();
     let input_bytes = config.expert_major_input_bytes(shape);
     let route_indices_bytes = config.expert_major_route_indices_bytes(shape);
     let output_bytes = config.expert_major_output_bytes(shape);
-    let activation_bytes = config.activation_bytes(shape.num_routes);
+    let swiglu_bytes = config.swiglu_bytes(shape.num_routes);
     assert!(
         buffers.packed_input.len_bytes() >= input_bytes,
         "sparse MLP expert-major packed input buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
@@ -669,16 +579,16 @@ fn validate_expert_major_buffers(
         buffers.experts_by_route.len_bytes()
     );
     assert!(
-        buffers.route_output.len_bytes() >= output_bytes,
+        buffers.packed_output.len_bytes() >= output_bytes,
         "sparse MLP expert-major output buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
         output_bytes,
-        buffers.route_output.len_bytes()
+        buffers.packed_output.len_bytes()
     );
     assert!(
-        scratch.activation.len_bytes() >= activation_bytes,
-        "sparse MLP expert-major activation buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
-        activation_bytes,
-        scratch.activation.len_bytes()
+        scratch.swiglu.len_bytes() >= swiglu_bytes,
+        "sparse MLP expert-major swiglu buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
+        swiglu_bytes,
+        scratch.swiglu.len_bytes()
     );
 }
 
@@ -686,7 +596,7 @@ fn validate_token_major_buffers(
     config: QuantizedSparseMLPConfig,
     shape: QuantizedSparseMLPTokenMajorShape,
     buffers: &QuantizedSparseMLPTokenMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPTokenMajorScratch<'_>,
+    scratch: &QuantizedSparseMLPScratch<'_>,
 ) {
     shape.validate();
     let input_bytes = config.token_major_input_bytes_unchecked(shape);
@@ -717,10 +627,10 @@ fn validate_token_major_buffers(
         buffers.route_indices.len_bytes()
     );
     assert!(
-        buffers.output.len_bytes() >= output_bytes,
+        buffers.routed_hidden.len_bytes() >= output_bytes,
         "sparse MLP output buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
         output_bytes,
-        buffers.output.len_bytes()
+        buffers.routed_hidden.len_bytes()
     );
     validate_token_major_scratch(config, shape, scratch);
 }
@@ -728,14 +638,14 @@ fn validate_token_major_buffers(
 fn validate_token_major_scratch(
     config: QuantizedSparseMLPConfig,
     shape: QuantizedSparseMLPTokenMajorShape,
-    scratch: &QuantizedSparseMLPTokenMajorScratch<'_>,
+    scratch: &QuantizedSparseMLPScratch<'_>,
 ) {
-    let activation_bytes = config.activation_bytes_unchecked(shape.num_routes);
+    let swiglu_bytes = config.swiglu_bytes_unchecked(shape.num_routes);
     assert!(
-        scratch.activation.len_bytes() >= activation_bytes,
-        "sparse MLP activation scratch buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
-        activation_bytes,
-        scratch.activation.len_bytes()
+        scratch.swiglu.len_bytes() >= swiglu_bytes,
+        "sparse MLP swiglu scratch buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
+        swiglu_bytes,
+        scratch.swiglu.len_bytes()
     );
 }
 
@@ -744,14 +654,15 @@ mod tests {
     use half::bf16;
     use inference_executor_core::mlp::moe::reference::QuantizedSparseMLPReferenceWeights;
     use inference_executor_core::mlp::moe::reference::QuantizedSparseMLPTokenMajorReferenceInput;
-    use inference_executor_core::mlp::moe::reference::moe_combine_without_common_bf16_reference;
+    use inference_executor_core::mlp::moe::reference::moe_combine_without_shared_experts_bf16_reference;
     use inference_executor_core::mlp::moe::reference::quantized_sparse_mlp_token_major_reference;
 
     use super::*;
+    use crate::components::MoEExpertMajorConfig;
     use crate::components::MoEExpertMajorKernels;
     use crate::components::MoEExpertMajorLayoutBuffers;
     use crate::components::MoEExpertMajorPackInputBuffers;
-    use crate::components::MoEExpertMajorScatterWithoutCommonBuffers;
+    use crate::components::MoEExpertMajorScatterWithoutSharedExpertsBuffers;
     use crate::components::MoEExpertMajorShape;
     use crate::metal::Buffer;
     use crate::metal::Stream;
@@ -761,6 +672,7 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = QuantizedSparseMLPConfig {
+            num_experts: 4,
             hidden_dim: 64,
             intermediate_dim: 64,
             group_size: 32,
@@ -771,9 +683,9 @@ mod tests {
             num_routes: 4,
             num_tokens: 2,
         };
-        let fused_gate_up_silu_shape = config.token_major_fused_gate_up_silu_shape(shape);
-        let down_shape = config.token_major_down_shape(shape);
-        let num_experts = 4;
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
+        let num_experts = config.num_experts as usize;
         let input_values = hidden_fixture(shape.num_tokens as usize, config.hidden_dim as usize);
         let input = bf16_buffer(&device, &input_values);
         let token_index_values = vec![0_u32, 0, 1, 1];
@@ -782,37 +694,33 @@ mod tests {
         let token_indices = Buffer::from_slice(&device, &token_index_values);
         let expert_indices = Buffer::from_slice(&device, &expert_index_values);
         let route_indices = Buffer::from_slice(&device, &route_index_values);
-        let gate_weight_values =
-            quantized_weight_stack_values(num_experts, fused_gate_up_silu_shape.weight_bytes_per_expert());
+        let gate_weight_values = quantized_weight_stack_values(num_experts, gate_up_config.weight_bytes_per_expert());
         let gate_weight = Buffer::from_slice(&device, &gate_weight_values);
-        let gate_scale_values = affine_param_fixture(
-            num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
-        );
+        let gate_scale_values =
+            affine_param_fixture(num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>());
         let gate_scales = bf16_buffer(&device, &gate_scale_values);
         let gate_bias_values =
-            zero_fixture(num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>());
+            zero_fixture(num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>());
         let gate_biases = bf16_buffer(&device, &gate_bias_values);
-        let up_weight_values =
-            quantized_weight_stack_values(num_experts, fused_gate_up_silu_shape.weight_bytes_per_expert());
+        let up_weight_values = quantized_weight_stack_values(num_experts, gate_up_config.weight_bytes_per_expert());
         let up_weight = Buffer::from_slice(&device, &up_weight_values);
-        let up_scale_values = affine_param_fixture(
-            num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
-        );
+        let up_scale_values =
+            affine_param_fixture(num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>());
         let up_scales = bf16_buffer(&device, &up_scale_values);
         let up_bias_values =
-            zero_fixture(num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>());
+            zero_fixture(num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>());
         let up_biases = bf16_buffer(&device, &up_bias_values);
-        let down_weight_values = quantized_weight_stack_values(num_experts, down_shape.weight_bytes_per_expert());
+        let down_weight_values = quantized_weight_stack_values(num_experts, down_config.weight_bytes_per_expert());
         let down_weight = Buffer::from_slice(&device, &down_weight_values);
         let down_scale_values =
-            affine_param_fixture(num_experts * down_shape.affine_param_bytes_per_expert() / size_of::<u16>());
+            affine_param_fixture(num_experts * down_config.affine_param_bytes_per_expert() / size_of::<u16>());
         let down_scales = bf16_buffer(&device, &down_scale_values);
         let down_bias_values =
-            zero_fixture(num_experts * down_shape.affine_param_bytes_per_expert() / size_of::<u16>());
+            zero_fixture(num_experts * down_config.affine_param_bytes_per_expert() / size_of::<u16>());
         let down_biases = bf16_buffer(&device, &down_bias_values);
 
         let actual_output = Buffer::new_zeroed(&device, config.token_major_output_bytes(shape));
-        let actual_activation = Buffer::new_zeroed(&device, config.activation_bytes(shape.num_routes));
+        let actual_swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(shape.num_routes));
         let sparse_mlp = QuantizedSparseMLPTokenMajorKernels::new(&device, config);
         let mut builder = stream.create_replay_program();
         builder.record(sparse_mlp.invoke(
@@ -822,11 +730,9 @@ mod tests {
                 token_indices: &token_indices,
                 expert_indices: &expert_indices,
                 route_indices: &route_indices,
-                output: &actual_output,
+                routed_hidden: &actual_output,
             },
-            QuantizedSparseMLPTokenMajorScratch {
-                activation: &actual_activation,
-            },
+            QuantizedSparseMLPScratch { swiglu: &actual_swiglu },
             QuantizedSparseMLPWeights {
                 gate_weight: &gate_weight,
                 gate_scales: &gate_scales,
@@ -882,6 +788,7 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = QuantizedSparseMLPConfig {
+            num_experts: 5,
             hidden_dim: 64,
             intermediate_dim: 64,
             group_size: 32,
@@ -892,9 +799,9 @@ mod tests {
             num_routes: 6,
             num_tokens: 3,
         };
-        let num_experts = 5;
-        let fused_gate_up_silu_shape = config.token_major_fused_gate_up_silu_shape(shape);
-        let down_shape = config.token_major_down_shape(shape);
+        let num_experts = config.num_experts as usize;
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
         let input_values = generated_values(shape.num_tokens as usize * config.hidden_dim as usize, random_seed);
         let input = bf16_buffer(&device, &input_values);
         let token_index_values = generated_indices(
@@ -909,53 +816,53 @@ mod tests {
         let expert_indices = Buffer::from_slice(&device, &expert_index_values);
         let route_indices = Buffer::from_slice(&device, &route_index_values);
         let gate_weight_values = generated_bytes(
-            num_experts * fused_gate_up_silu_shape.weight_bytes_per_expert(),
+            num_experts * gate_up_config.weight_bytes_per_expert(),
             random_seed.wrapping_add(3),
         );
         let gate_weight = Buffer::from_slice(&device, &gate_weight_values);
         let gate_scale_values = generated_scales(
-            num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(4),
         );
         let gate_scales = bf16_buffer(&device, &gate_scale_values);
         let gate_bias_values = generated_biases(
-            num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(5),
         );
         let gate_biases = bf16_buffer(&device, &gate_bias_values);
         let up_weight_values = generated_bytes(
-            num_experts * fused_gate_up_silu_shape.weight_bytes_per_expert(),
+            num_experts * gate_up_config.weight_bytes_per_expert(),
             random_seed.wrapping_add(6),
         );
         let up_weight = Buffer::from_slice(&device, &up_weight_values);
         let up_scale_values = generated_scales(
-            num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(7),
         );
         let up_scales = bf16_buffer(&device, &up_scale_values);
         let up_bias_values = generated_biases(
-            num_experts * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(8),
         );
         let up_biases = bf16_buffer(&device, &up_bias_values);
         let down_weight_values = generated_bytes(
-            num_experts * down_shape.weight_bytes_per_expert(),
+            num_experts * down_config.weight_bytes_per_expert(),
             random_seed.wrapping_add(9),
         );
         let down_weight = Buffer::from_slice(&device, &down_weight_values);
         let down_scale_values = generated_scales(
-            num_experts * down_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts * down_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(10),
         );
         let down_scales = bf16_buffer(&device, &down_scale_values);
         let down_bias_values = generated_biases(
-            num_experts * down_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts * down_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(11),
         );
         let down_biases = bf16_buffer(&device, &down_bias_values);
 
         let actual_output = Buffer::new_zeroed(&device, config.token_major_output_bytes(shape));
-        let actual_activation = Buffer::new_zeroed(&device, config.activation_bytes(shape.num_routes));
+        let actual_swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(shape.num_routes));
         let sparse_mlp = QuantizedSparseMLPTokenMajorKernels::new(&device, config);
         let mut builder = stream.create_replay_program();
         builder.record(sparse_mlp.invoke(
@@ -965,11 +872,9 @@ mod tests {
                 token_indices: &token_indices,
                 expert_indices: &expert_indices,
                 route_indices: &route_indices,
-                output: &actual_output,
+                routed_hidden: &actual_output,
             },
-            QuantizedSparseMLPTokenMajorScratch {
-                activation: &actual_activation,
-            },
+            QuantizedSparseMLPScratch { swiglu: &actual_swiglu },
             QuantizedSparseMLPWeights {
                 gate_weight: &gate_weight,
                 gate_scales: &gate_scales,
@@ -1033,6 +938,7 @@ mod tests {
     #[test]
     fn test_shapes() {
         let config = QuantizedSparseMLPConfig {
+            num_experts: 5,
             hidden_dim: 64,
             intermediate_dim: 128,
             group_size: 32,
@@ -1046,32 +952,38 @@ mod tests {
 
         assert_eq!(config.token_major_input_bytes(shape), 3 * 64 * 2);
         assert_eq!(config.token_major_route_indices_bytes(shape), 6 * size_of::<u32>());
-        assert_eq!(config.activation_bytes(shape.num_routes), 6 * 128 * 2);
+        assert_eq!(config.swiglu_bytes(shape.num_routes), 6 * 128 * 2);
         assert_eq!(config.token_major_output_bytes(shape), 6 * 64 * 2);
 
-        let fused_gate_up_silu = config.token_major_fused_gate_up_silu_shape(shape);
-        assert_eq!(fused_gate_up_silu.num_routes, 6);
-        assert_eq!(fused_gate_up_silu.num_input_vectors, 3);
-        assert_eq!(fused_gate_up_silu.intermediate_dim, 128);
-        assert_eq!(fused_gate_up_silu.k, 64);
-        assert_eq!(fused_gate_up_silu.group_size, 32);
-        assert_eq!(fused_gate_up_silu.bits, 4);
-        assert_eq!(fused_gate_up_silu.dtype, Dtype::Bfloat16);
+        let gate_up_shape = config.token_major_gate_up_shape(shape);
+        assert_eq!(gate_up_shape.num_routes, 6);
+        assert_eq!(gate_up_shape.num_input_vectors, 3);
+        let down_shape = config.token_major_down_shape(shape);
+        assert_eq!(down_shape.num_routes, 6);
+        assert_eq!(down_shape.num_input_vectors, 6);
 
-        let down = config.token_major_down_shape(shape);
-        assert_eq!(down.num_routes, 6);
-        assert_eq!(down.num_input_vectors, 6);
-        assert_eq!(down.n, 64);
-        assert_eq!(down.k, 128);
-        assert_eq!(down.group_size, 32);
-        assert_eq!(down.bits, 4);
-        assert_eq!(down.dtype, Dtype::Bfloat16);
+        let gate_up = config.gate_up_config();
+        assert_eq!(gate_up.num_experts, 5);
+        assert_eq!(gate_up.matmul.n, 128);
+        assert_eq!(gate_up.matmul.k, 64);
+        assert_eq!(gate_up.matmul.group_size, 32);
+        assert_eq!(gate_up.matmul.bits, 4);
+        assert_eq!(gate_up.matmul.input_dtype, Dtype::Bfloat16);
+        assert_eq!(gate_up.matmul.output_dtype, Dtype::Bfloat16);
+        assert_eq!(gate_up.matmul.scale_bias_dtype, Dtype::Bfloat16);
+
+        let down = config.down_config();
+        assert_eq!(down.num_experts, 5);
+        assert_eq!(down.matmul.n, 64);
+        assert_eq!(down.matmul.k, 128);
     }
 
     fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
         let device = Device::system_default();
         let stream = Stream::new(&device);
+        let num_experts = 5_u32;
         let config = QuantizedSparseMLPConfig {
+            num_experts,
             hidden_dim: 64,
             intermediate_dim: 64,
             group_size: 32,
@@ -1080,15 +992,12 @@ mod tests {
         };
         let num_tokens = 3_u32;
         let num_experts_per_token = 2_u32;
-        let num_experts = 5_u32;
         let num_routes = num_tokens * num_experts_per_token;
-        let layout_shape = MoEExpertMajorShape::bf16(num_tokens, num_experts, num_experts_per_token, config.hidden_dim);
-        let sparse_shape = QuantizedSparseMLPExpertMajorShape {
-            num_experts,
-            num_routes,
-        };
-        let fused_gate_up_silu_shape = config.expert_major_fused_gate_up_silu_shape(sparse_shape);
-        let down_shape = config.expert_major_down_shape(sparse_shape);
+        let layout_config = MoEExpertMajorConfig::bf16(num_experts, num_experts_per_token, config.hidden_dim);
+        let layout_shape = MoEExpertMajorShape { num_tokens };
+        let sparse_shape = QuantizedSparseMLPExpertMajorShape { num_routes };
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
 
         let input_values = generated_values(num_tokens as usize * config.hidden_dim as usize, random_seed);
         let expert_index_values =
@@ -1103,55 +1012,55 @@ mod tests {
             .collect::<Vec<_>>();
         let route_index_values = identity_indices(num_routes as usize);
         let gate_weight_values = generated_bytes(
-            num_experts as usize * fused_gate_up_silu_shape.weight_bytes_per_expert(),
+            num_experts as usize * gate_up_config.weight_bytes_per_expert(),
             random_seed.wrapping_add(3),
         );
         let gate_scale_values = generated_scales(
-            num_experts as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(4),
         );
         let gate_bias_values = generated_biases(
-            num_experts as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(5),
         );
         let up_weight_values = generated_bytes(
-            num_experts as usize * fused_gate_up_silu_shape.weight_bytes_per_expert(),
+            num_experts as usize * gate_up_config.weight_bytes_per_expert(),
             random_seed.wrapping_add(6),
         );
         let up_scale_values = generated_scales(
-            num_experts as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(7),
         );
         let up_bias_values = generated_biases(
-            num_experts as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(8),
         );
         let down_weight_values = generated_bytes(
-            num_experts as usize * down_shape.weight_bytes_per_expert(),
+            num_experts as usize * down_config.weight_bytes_per_expert(),
             random_seed.wrapping_add(9),
         );
         let down_scale_values = generated_scales(
-            num_experts as usize * down_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts as usize * down_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(10),
         );
         let down_bias_values = generated_biases(
-            num_experts as usize * down_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+            num_experts as usize * down_config.affine_param_bytes_per_expert() / size_of::<u16>(),
             random_seed.wrapping_add(11),
         );
 
         let input = bf16_buffer(&device, &input_values);
         let expert_indices = Buffer::from_slice(&device, &expert_index_values);
         let routed_probs = Buffer::from_slice(&device, &routed_prob_values);
-        let expert_counts = Buffer::new_zeroed(&device, layout_shape.expert_counts_bytes());
-        let expert_offsets = Buffer::new_zeroed(&device, layout_shape.expert_offsets_bytes());
-        let expert_cursors = Buffer::new_zeroed(&device, layout_shape.expert_counts_bytes());
-        let routes_by_expert = Buffer::new_zeroed(&device, layout_shape.route_indices_bytes());
-        let routes_by_token = Buffer::new_zeroed(&device, layout_shape.route_indices_bytes());
-        let experts_by_route = Buffer::new_zeroed(&device, layout_shape.route_indices_bytes());
-        let packed_input = Buffer::new_zeroed(&device, layout_shape.route_hidden_bytes());
-        let route_output = Buffer::new_zeroed(&device, config.expert_major_output_bytes(sparse_shape));
-        let activation = Buffer::new_zeroed(&device, config.activation_bytes(num_routes));
-        let output = Buffer::new_zeroed(&device, layout_shape.token_hidden_bytes());
+        let expert_counts = Buffer::new_zeroed(&device, layout_config.expert_counts_bytes());
+        let expert_offsets = Buffer::new_zeroed(&device, layout_config.expert_offsets_bytes());
+        let expert_cursors = Buffer::new_zeroed(&device, layout_config.expert_counts_bytes());
+        let routes_by_expert = Buffer::new_zeroed(&device, layout_config.route_indices_bytes(layout_shape));
+        let routes_by_token = Buffer::new_zeroed(&device, layout_config.route_indices_bytes(layout_shape));
+        let experts_by_route = Buffer::new_zeroed(&device, layout_config.route_indices_bytes(layout_shape));
+        let packed_input = Buffer::new_zeroed(&device, layout_config.route_hidden_bytes(layout_shape));
+        let packed_output = Buffer::new_zeroed(&device, config.expert_major_output_bytes(sparse_shape));
+        let swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(num_routes));
+        let output = Buffer::new_zeroed(&device, layout_config.token_hidden_bytes(layout_shape));
         let gate_weight = Buffer::from_slice(&device, &gate_weight_values);
         let gate_scales = bf16_buffer(&device, &gate_scale_values);
         let gate_biases = bf16_buffer(&device, &gate_bias_values);
@@ -1162,7 +1071,7 @@ mod tests {
         let down_scales = bf16_buffer(&device, &down_scale_values);
         let down_biases = bf16_buffer(&device, &down_bias_values);
 
-        let layout = MoEExpertMajorKernels::new(&device);
+        let layout = MoEExpertMajorKernels::new(&device, layout_config);
         let sparse_mlp = QuantizedSparseMLP::new(&device, config);
         let weights = QuantizedSparseMLPWeights {
             gate_weight: &gate_weight,
@@ -1201,17 +1110,15 @@ mod tests {
             QuantizedSparseMLPExpertMajorBuffers {
                 packed_input: &packed_input,
                 experts_by_route: &experts_by_route,
-                route_output: &route_output,
+                packed_output: &packed_output,
             },
-            QuantizedSparseMLPExpertMajorScratch {
-                activation: &activation,
-            },
+            QuantizedSparseMLPScratch { swiglu: &swiglu },
             weights,
         ));
-        builder.record_with_barrier_before(layout.invoke_scatter_without_common(
+        builder.record_with_barrier_before(layout.invoke_scatter_without_shared_experts(
             layout_shape,
-            MoEExpertMajorScatterWithoutCommonBuffers {
-                route_output: &route_output,
+            MoEExpertMajorScatterWithoutSharedExpertsBuffers {
+                packed_output: &packed_output,
                 routes_by_token: &routes_by_token,
                 routed_probs: &routed_probs,
                 output: &output,
@@ -1245,7 +1152,7 @@ mod tests {
         .into_iter()
         .map(|value| bf16::from_f32(value).to_f32())
         .collect::<Vec<_>>();
-        let expected_bits = moe_combine_without_common_bf16_reference(
+        let expected_bits = moe_combine_without_shared_experts_bf16_reference(
             &routed_hidden,
             &routed_prob_values,
             num_tokens as usize,
@@ -1256,7 +1163,13 @@ mod tests {
             .into_iter()
             .map(|bits| bf16::from_bits(bits).to_f32())
             .collect::<Vec<_>>();
-        assert_bf16_close_rel_values(&expected, &output, layout_shape.token_hidden_bytes(), 2.0e-5, 8.0e-3);
+        assert_bf16_close_rel_values(
+            &expected,
+            &output,
+            layout_config.token_hidden_bytes(layout_shape),
+            2.0e-5,
+            8.0e-3,
+        );
     }
 
     fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {

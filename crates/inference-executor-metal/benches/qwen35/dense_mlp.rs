@@ -6,8 +6,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
+use inference_backend_metal::components::QuantizedDenseMLP;
 use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPKernels;
 use inference_backend_metal::components::QuantizedDenseMLPShape;
 use inference_backend_metal::components::QuantizedDenseMLPWeights;
 use inference_backend_metal::metal::Buffer;
@@ -120,7 +120,7 @@ enum DenseMLPBenchCase {
     GateUpQmmBm16Bn32,
     GateUpQmvBn8Bk32,
     GateUpQmmBm32Bn32,
-    Activation,
+    SwiGLU,
     DownAuto,
     DownQmmBm8Bn32,
     DownQmmBm16Bn32,
@@ -141,7 +141,7 @@ impl DenseMLPBenchCase {
             "gate_up_qmm_bm16_bn32" => Self::GateUpQmmBm16Bn32,
             "gate_up_qmv_bn8_bk32" => Self::GateUpQmvBn8Bk32,
             "gate_up_qmm_bm32_bn32" => Self::GateUpQmmBm32Bn32,
-            "activation" => Self::Activation,
+            "swiglu" => Self::SwiGLU,
             "down_auto" => Self::DownAuto,
             "down_qmm_bm8_bn32" => Self::DownQmmBm8Bn32,
             "down_qmm_bm16_bn32" => Self::DownQmmBm16Bn32,
@@ -163,7 +163,7 @@ impl DenseMLPBenchCase {
             Self::GateUpQmmBm16Bn32 => "gate_up_qmm_bm16_bn32",
             Self::GateUpQmvBn8Bk32 => "gate_up_qmv_bn8_bk32",
             Self::GateUpQmmBm32Bn32 => "gate_up_qmm_bm32_bn32",
-            Self::Activation => "activation",
+            Self::SwiGLU => "swiglu",
             Self::DownAuto => "down_auto",
             Self::DownQmmBm8Bn32 => "down_qmm_bm8_bn32",
             Self::DownQmmBm16Bn32 => "down_qmm_bm16_bn32",
@@ -177,11 +177,11 @@ struct RealDenseMLPFixture<'a> {
     stream: Stream,
     shape: QuantizedDenseMLPShape,
     backend: DenseMLP,
-    kernels: QuantizedDenseMLPKernels,
+    compute: QuantizedDenseMLP,
     hidden_state: Buffer,
     output: Buffer,
-    gate_up_proj: Buffer,
-    activation: Buffer,
+    gate_up: Buffer,
+    swiglu: Buffer,
     gate_up_qmv_bn8_bk32: AffineQuantizedMatmulKernel,
     gate_up_qmm_bm8_bn32: AffineQuantizedMatmulKernel,
     gate_up_qmm_bm16_bn32: AffineQuantizedMatmulKernel,
@@ -206,7 +206,7 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseMLPMetalConfig {
                 group_size: GROUP_SIZE,
                 bits: BITS,
-                dtype: Dtype::Bfloat16,
+                io_dtype: Dtype::Bfloat16,
             },
         );
         let shape = QuantizedDenseMLPShape { num_tokens };
@@ -218,14 +218,14 @@ impl<'a> RealDenseMLPFixture<'a> {
             stream: Stream::new(device),
             shape,
             backend,
-            kernels: QuantizedDenseMLPKernels::new(device, config),
+            compute: QuantizedDenseMLP::new(device, config),
             hidden_state,
             output: Buffer::new_zeroed(device, down_config.output_bytes(m)),
-            gate_up_proj: Buffer::from_slice(
+            gate_up: Buffer::from_slice(
                 device,
                 &hidden_fixture(num_tokens as usize, (INTERMEDIATE_DIM * 2) as usize),
             ),
-            activation: Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, INTERMEDIATE_DIM as usize)),
+            swiglu: Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, INTERMEDIATE_DIM as usize)),
             gate_up_qmv_bn8_bk32: AffineQuantizedMatmulKernel::new(
                 device,
                 gate_up_config,
@@ -280,10 +280,10 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseMLPBenchCase::GateUpAuto => {
                 build_single_invocation_replay(
                     &self.stream,
-                    self.kernels.invoke_gate_up(
+                    self.compute.invoke_gate_up(
                         self.shape,
                         &self.hidden_state,
-                        &self.gate_up_proj,
+                        &self.gate_up,
                         self.weights.as_borrowed(),
                     ),
                 )
@@ -292,18 +292,17 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseMLPBenchCase::GateUpQmmBm16Bn32 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm16Bn32),
             DenseMLPBenchCase::GateUpQmvBn8Bk32 => self.forced_gate_up_replay(DenseAffinePolicy::QmvBn8Bk32),
             DenseMLPBenchCase::GateUpQmmBm32Bn32 => self.forced_gate_up_replay(DenseAffinePolicy::QmmBm32Bn32),
-            DenseMLPBenchCase::Activation => {
+            DenseMLPBenchCase::SwiGLU => {
                 build_single_invocation_replay(
                     &self.stream,
-                    self.kernels
-                        .invoke_activation(self.shape, &self.gate_up_proj, &self.activation),
+                    self.compute.invoke_swiglu(self.shape, &self.gate_up, &self.swiglu),
                 )
             },
             DenseMLPBenchCase::DownAuto => {
                 build_single_invocation_replay(
                     &self.stream,
-                    self.kernels
-                        .invoke_down(self.shape, &self.activation, &self.output, self.weights.as_borrowed()),
+                    self.compute
+                        .invoke_down(self.shape, &self.swiglu, &self.output, self.weights.as_borrowed()),
                 )
             },
             DenseMLPBenchCase::DownQmmBm8Bn32 => self.forced_down_replay(DenseAffinePolicy::QmmBm8Bn32),
@@ -325,8 +324,8 @@ impl<'a> RealDenseMLPFixture<'a> {
                 hidden_state: &self.hidden_state,
                 next_hidden_state: &self.output,
                 scratch: DenseMLPScratchBindings {
-                    gate_up_proj: &self.gate_up_proj,
-                    activation: &self.activation,
+                    gate_up: &self.gate_up,
+                    swiglu: &self.swiglu,
                 },
                 weights: self.weights.as_borrowed(),
             },
@@ -341,10 +340,10 @@ impl<'a> RealDenseMLPFixture<'a> {
     fn forced_full_replay(&self, policy: DenseAffinePolicy) -> ReplayProgram {
         let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
         self.record_forced_gate_up(&mut builder, policy);
-        builder.record_with_barrier_before(ReplayOp::opaque(self.kernels.invoke_activation(
+        builder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_swiglu(
             self.shape,
-            &self.gate_up_proj,
-            &self.activation,
+            &self.gate_up,
+            &self.swiglu,
         )));
         self.record_forced_down(&mut builder, policy);
         builder.build()
@@ -380,7 +379,7 @@ impl<'a> RealDenseMLPFixture<'a> {
                     .num_tokens
                     .try_into()
                     .expect("dense MLP token count must fit i32"),
-                &self.gate_up_proj,
+                &self.gate_up,
                 0,
                 &self.hidden_state,
                 0,
@@ -414,7 +413,7 @@ impl<'a> RealDenseMLPFixture<'a> {
                     .expect("dense MLP token count must fit i32"),
                 &self.output,
                 0,
-                &self.activation,
+                &self.swiglu,
                 0,
                 weights.down_weight,
                 0,
@@ -680,7 +679,7 @@ Options:
   --model-dir PATH
   --tokens 1,2,4,8,10,16,32,64
   --cases full_auto,full_qmv_bn8_bk32,full_qmm_bm8_bn32,full_qmm_bm16_bn32,full_qmm_bm32_bn32,gate_up_auto,\
-         gate_up_qmv_bn8_bk32,gate_up_qmm_bm8_bn32,gate_up_qmm_bm16_bn32,gate_up_qmm_bm32_bn32,activation,down_auto,\
+         gate_up_qmv_bn8_bk32,gate_up_qmm_bm8_bn32,gate_up_qmm_bm16_bn32,gate_up_qmm_bm32_bn32,swiglu,down_auto,\
          down_qmv_bn8_bk32,down_qmm_bm8_bn32,down_qmm_bm16_bn32,down_qmm_bm32_bn32
   --iters N
   --warmup-iters N

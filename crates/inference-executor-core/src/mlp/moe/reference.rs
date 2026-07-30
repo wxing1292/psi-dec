@@ -212,7 +212,7 @@ pub fn quantized_sparse_mlp_token_major_reference(
     assert_eq!(weights.down_scales.len(), num_experts * down_affine_len);
     assert_eq!(weights.down_biases.len(), num_experts * down_affine_len);
 
-    let mut activation_by_route = vec![0.0_f32; num_routes * intermediate_dim];
+    let mut swiglu_by_route = vec![0.0_f32; num_routes * intermediate_dim];
     for route in 0..num_routes {
         let token = reference_input.token_indices[route] as usize;
         let expert = reference_input.expert_indices[route] as usize;
@@ -246,19 +246,19 @@ pub fn quantized_sparse_mlp_token_major_reference(
             expert_slice(weights.up_scales, expert, gate_up_affine_len),
             expert_slice(weights.up_biases, expert, gate_up_affine_len),
         );
-        let activation = gate
+        let swiglu = gate
             .iter()
             .zip(up.iter())
             .map(|(&gate, &up)| silu_reference(gate) * up)
             .collect::<Vec<_>>();
-        activation_by_route[route * intermediate_dim..(route + 1) * intermediate_dim].copy_from_slice(&activation);
+        swiglu_by_route[route * intermediate_dim..(route + 1) * intermediate_dim].copy_from_slice(&swiglu);
     }
 
     let mut output = vec![0.0_f32; num_routes * hidden_dim];
     for route in 0..num_routes {
-        let activation_route = reference_input.route_indices[route] as usize;
+        let swiglu_route = reference_input.route_indices[route] as usize;
         let expert = reference_input.expert_indices[route] as usize;
-        assert!(activation_route < num_routes);
+        assert!(swiglu_route < num_routes);
         assert!(expert < num_experts);
         let route_output = quantized_affine_reference(
             QuantizedAffineReferenceShape {
@@ -268,7 +268,7 @@ pub fn quantized_sparse_mlp_token_major_reference(
                 group_size,
                 bits,
             },
-            &activation_by_route[activation_route * intermediate_dim..(activation_route + 1) * intermediate_dim],
+            &swiglu_by_route[swiglu_route * intermediate_dim..(swiglu_route + 1) * intermediate_dim],
             expert_slice(weights.down_weight, expert, down_weight_bytes),
             expert_slice(weights.down_scales, expert, down_affine_len),
             expert_slice(weights.down_biases, expert, down_affine_len),
@@ -282,7 +282,7 @@ fn expert_slice<T>(values: &[T], expert: usize, stride: usize) -> &[T] {
     &values[expert * stride..(expert + 1) * stride]
 }
 
-pub fn moe_combine_without_common_reference(
+pub fn moe_combine_without_shared_experts_reference(
     routed_hidden: &[f32],
     routed_probs: &[f32],
     num_tokens: usize,
@@ -304,27 +304,27 @@ pub fn moe_combine_without_common_reference(
     output
 }
 
-pub fn moe_combine_with_common_reference(
+pub fn moe_combine_with_shared_experts_reference(
     routed_output: &[f32],
-    common_hidden: &[f32],
-    common_gate_logits: &[f32],
+    shared_hidden: &[f32],
+    shared_expert_gate_logits: &[f32],
     num_tokens: usize,
     hidden_dim: usize,
 ) -> Vec<f32> {
     assert_eq!(routed_output.len(), num_tokens * hidden_dim);
-    assert_eq!(common_hidden.len(), num_tokens * hidden_dim);
-    assert_eq!(common_gate_logits.len(), num_tokens);
+    assert_eq!(shared_hidden.len(), num_tokens * hidden_dim);
+    assert_eq!(shared_expert_gate_logits.len(), num_tokens);
     let mut output = routed_output.to_vec();
     for token in 0..num_tokens {
-        let gate = sigmoid_reference(common_gate_logits[token]);
+        let gate = sigmoid_reference(shared_expert_gate_logits[token]);
         for dim in 0..hidden_dim {
-            output[token * hidden_dim + dim] += gate * common_hidden[token * hidden_dim + dim];
+            output[token * hidden_dim + dim] += gate * shared_hidden[token * hidden_dim + dim];
         }
     }
     output
 }
 
-pub fn moe_combine_without_common_bf16_reference(
+pub fn moe_combine_without_shared_experts_bf16_reference(
     routed_hidden: &[f32],
     routed_probs: &[f32],
     num_tokens: usize,
@@ -350,25 +350,25 @@ pub fn moe_combine_without_common_bf16_reference(
     output
 }
 
-pub fn moe_combine_with_common_bf16_reference(
+pub fn moe_combine_with_shared_experts_bf16_reference(
     routed_output: &[u16],
-    common_hidden: &[f32],
-    common_gate_logits: &[f32],
+    shared_hidden: &[f32],
+    shared_expert_gate_logits: &[f32],
     num_tokens: usize,
     hidden_dim: usize,
 ) -> Vec<u16> {
     assert_eq!(routed_output.len(), num_tokens * hidden_dim);
-    assert_eq!(common_hidden.len(), num_tokens * hidden_dim);
-    assert_eq!(common_gate_logits.len(), num_tokens);
+    assert_eq!(shared_hidden.len(), num_tokens * hidden_dim);
+    assert_eq!(shared_expert_gate_logits.len(), num_tokens);
     let mut output = Vec::with_capacity(num_tokens * hidden_dim);
-    for (token, &common_gate_logit) in common_gate_logits.iter().enumerate().take(num_tokens) {
-        let gate_logit = bf16::from_f32(common_gate_logit).to_f32();
+    for (token, &shared_expert_gate_logit) in shared_expert_gate_logits.iter().enumerate().take(num_tokens) {
+        let gate_logit = bf16::from_f32(shared_expert_gate_logit).to_f32();
         let gate = sigmoid_reference(gate_logit);
         for dim in 0..hidden_dim {
             let gid = token * hidden_dim + dim;
             let routed = bf16::from_bits(routed_output[gid]).to_f32();
-            let common = bf16::from_f32(common_hidden[gid]).to_f32();
-            output.push(bf16::from_f32(routed + gate * common).to_bits());
+            let shared = bf16::from_f32(shared_hidden[gid]).to_f32();
+            output.push(bf16::from_f32(routed + gate * shared).to_bits());
         }
     }
     output
@@ -389,10 +389,10 @@ mod tests {
 
     #[test]
     fn test_combine() {
-        let routed = moe_combine_without_common_reference(&[1.0, 2.0, 3.0, 4.0], &[0.25, 0.75], 1, 2, 2);
+        let routed = moe_combine_without_shared_experts_reference(&[1.0, 2.0, 3.0, 4.0], &[0.25, 0.75], 1, 2, 2);
         assert_eq!(routed, vec![2.5, 3.5]);
 
-        let output = moe_combine_with_common_reference(&routed, &[10.0, -2.0], &[0.0], 1, 2);
+        let output = moe_combine_with_shared_experts_reference(&routed, &[10.0, -2.0], &[0.0], 1, 2);
         assert_eq!(output, vec![7.5, 2.5]);
     }
 }

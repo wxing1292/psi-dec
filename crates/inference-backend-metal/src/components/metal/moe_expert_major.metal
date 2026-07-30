@@ -91,7 +91,7 @@ kernel void moe_expert_major_pack_input(
 }
 
 static inline float scatter_topk(
-    device const bfloat16_t* route_output,
+    device const bfloat16_t* packed_output,
     device const uint* routes_by_token,
     device const float* routed_probs,
     uint token,
@@ -104,14 +104,14 @@ static inline float scatter_topk(
         const uint original_route = token * num_experts_per_token + slot;
         const uint packed_route = routes_by_token[original_route];
         const float route_weight = float(bfloat16_t(routed_probs[original_route]));
-        const float weighted = float(bfloat16_t(route_weight * read_bf16(route_output, packed_route * hidden_dim + dim)));
+        const float weighted = float(bfloat16_t(route_weight * read_bf16(packed_output, packed_route * hidden_dim + dim)));
         acc = float(bfloat16_t(acc + weighted));
     }
     return acc;
 }
 
-kernel void moe_expert_major_scatter_without_common(
-    device const bfloat16_t* route_output [[buffer(0)]],
+kernel void moe_expert_major_scatter_without_shared_experts(
+    device const bfloat16_t* packed_output [[buffer(0)]],
     device const uint* routes_by_token [[buffer(1)]],
     device const float* routed_probs [[buffer(2)]],
     device bfloat16_t* output [[buffer(3)]],
@@ -124,15 +124,15 @@ kernel void moe_expert_major_scatter_without_common(
     if (gid >= total) return;
     const uint token = gid / hidden_dim;
     const uint dim = gid - token * hidden_dim;
-    write_bf16(output, gid, scatter_topk(route_output, routes_by_token, routed_probs, token, dim, num_experts_per_token, hidden_dim));
+    write_bf16(output, gid, scatter_topk(packed_output, routes_by_token, routed_probs, token, dim, num_experts_per_token, hidden_dim));
 }
 
-kernel void moe_expert_major_scatter_with_common(
-    device const bfloat16_t* route_output [[buffer(0)]],
+kernel void moe_expert_major_scatter_with_shared_experts(
+    device const bfloat16_t* packed_output [[buffer(0)]],
     device const uint* routes_by_token [[buffer(1)]],
     device const float* routed_probs [[buffer(2)]],
-    device const bfloat16_t* common_hidden [[buffer(3)]],
-    device const bfloat16_t* common_gate_logits [[buffer(4)]],
+    device const bfloat16_t* shared_hidden [[buffer(3)]],
+    device const bfloat16_t* shared_expert_gate_logits [[buffer(4)]],
     device bfloat16_t* output [[buffer(5)]],
     constant uint& num_tokens [[buffer(6)]],
     constant uint& num_experts_per_token [[buffer(7)]],
@@ -144,7 +144,7 @@ kernel void moe_expert_major_scatter_with_common(
     const uint token = gid / hidden_dim;
     const uint dim = gid - token * hidden_dim;
     const float routed_output = float(bfloat16_t(scatter_topk(
-        route_output,
+        packed_output,
         routes_by_token,
         routed_probs,
         token,
@@ -152,6 +152,6 @@ kernel void moe_expert_major_scatter_with_common(
         num_experts_per_token,
         hidden_dim
     )));
-    const float common_gate = 1.0f / (1.0f + metal::exp(-read_bf16(common_gate_logits, token)));
-    write_bf16(output, gid, routed_output + common_gate * read_bf16(common_hidden, gid));
+    const float shared_expert_gate = 1.0f / (1.0f + metal::exp(-read_bf16(shared_expert_gate_logits, token)));
+    write_bf16(output, gid, routed_output + shared_expert_gate * read_bf16(shared_hidden, gid));
 }

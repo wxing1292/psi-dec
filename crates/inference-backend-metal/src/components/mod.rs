@@ -55,9 +55,9 @@ pub use bf16_concat_rows::Bf16ConcatRowsKernel;
 pub use bf16_concat_rows::Bf16ConcatRowsShape;
 
 mod quantized_dense_mlp;
+pub use quantized_dense_mlp::QuantizedDenseMLP;
 pub use quantized_dense_mlp::QuantizedDenseMLPBuffers;
 pub use quantized_dense_mlp::QuantizedDenseMLPConfig;
-pub use quantized_dense_mlp::QuantizedDenseMLPKernels;
 pub use quantized_dense_mlp::QuantizedDenseMLPScratch;
 pub use quantized_dense_mlp::QuantizedDenseMLPShape;
 pub use quantized_dense_mlp::QuantizedDenseMLPWeights;
@@ -66,11 +66,10 @@ mod quantized_sparse_mlp;
 pub use quantized_sparse_mlp::QuantizedSparseMLP;
 pub use quantized_sparse_mlp::QuantizedSparseMLPConfig;
 pub use quantized_sparse_mlp::QuantizedSparseMLPExpertMajorBuffers;
-pub use quantized_sparse_mlp::QuantizedSparseMLPExpertMajorScratch;
 pub use quantized_sparse_mlp::QuantizedSparseMLPExpertMajorShape;
+pub use quantized_sparse_mlp::QuantizedSparseMLPScratch;
 pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorBuffers;
 pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorKernels;
-pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorScratch;
 pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorShape;
 pub use quantized_sparse_mlp::QuantizedSparseMLPWeights;
 
@@ -157,22 +156,24 @@ pub use gqa_block_attention::GQABlockSDPAKernel;
 pub use gqa_block_attention::GQABlockSDPAShape;
 
 mod moe_combine;
-pub use moe_combine::MoECombineKernel;
-pub use moe_combine::MoECombineWithCommonBuffers;
-pub use moe_combine::MoECombineWithCommonShape;
-pub use moe_combine::MoECombineWithoutCommonBuffers;
-pub use moe_combine::MoECombineWithoutCommonShape;
+pub use moe_combine::MoECombineConfig;
+pub use moe_combine::MoECombineKernels;
+pub use moe_combine::MoECombineShape;
+pub use moe_combine::MoECombineWithSharedExpertsBuffers;
+pub use moe_combine::MoECombineWithoutSharedExpertsBuffers;
 
 mod moe_expert_major;
+pub use moe_expert_major::MoEExpertMajorConfig;
 pub use moe_expert_major::MoEExpertMajorKernels;
 pub use moe_expert_major::MoEExpertMajorLayoutBuffers;
 pub use moe_expert_major::MoEExpertMajorPackInputBuffers;
-pub use moe_expert_major::MoEExpertMajorScatterWithCommonBuffers;
-pub use moe_expert_major::MoEExpertMajorScatterWithoutCommonBuffers;
+pub use moe_expert_major::MoEExpertMajorScatterWithSharedExpertsBuffers;
+pub use moe_expert_major::MoEExpertMajorScatterWithoutSharedExpertsBuffers;
 pub use moe_expert_major::MoEExpertMajorShape;
 
 mod moe_routing;
 pub use moe_routing::MoERoutingBuffers;
+pub use moe_routing::MoERoutingConfig;
 pub use moe_routing::MoERoutingKernel;
 pub use moe_routing::MoERoutingShape;
 

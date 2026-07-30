@@ -15,16 +15,14 @@ const MOE_ROUTING_SOURCE: &str = include_str!("metal/moe_routing.metal");
 /// experts by the bf16 softmax probabilities and optionally renormalizes the
 /// selected probabilities across the top-k set.
 #[derive(Clone, Copy, Debug)]
-pub struct MoERoutingShape {
-    pub num_tokens: u32,
+pub struct MoERoutingConfig {
     pub num_experts: u32,
     pub num_experts_per_token: u32,
     pub norm_topk_prob: bool,
 }
 
-impl MoERoutingShape {
+impl MoERoutingConfig {
     pub fn validate(self) {
-        assert!(self.num_tokens > 0);
         assert!(self.num_experts > 0);
         assert!(self.num_experts <= 256, "MoE routing supports at most 256 experts");
         assert!(self.num_experts_per_token > 0);
@@ -33,43 +31,63 @@ impl MoERoutingShape {
             self.num_experts_per_token <= 16,
             "MoE routing supports at most 16 experts per token"
         );
-        assert_u32_index_domain(self.num_router_prob_elements(), "MoE routing probability elements");
-        assert_u32_index_domain(self.num_routes(), "MoE routing routes");
     }
 
-    pub fn num_routes(self) -> usize {
+    pub fn num_routes(self, shape: MoERoutingShape) -> usize {
+        self.validate();
+        shape.validate();
         checked_product(
             "MoE routing route count",
-            &[self.num_tokens as usize, self.num_experts_per_token as usize],
+            &[shape.num_tokens as usize, self.num_experts_per_token as usize],
         )
     }
 
-    fn num_router_prob_elements(self) -> usize {
+    fn num_router_prob_elements(self, shape: MoERoutingShape) -> usize {
+        self.validate();
+        shape.validate();
         checked_product(
             "MoE routing probability element count",
-            &[self.num_tokens as usize, self.num_experts as usize],
+            &[shape.num_tokens as usize, self.num_experts as usize],
         )
     }
 
-    pub fn router_probs_bytes(self) -> usize {
+    pub fn validate_shape(self, shape: MoERoutingShape) {
+        self.validate();
+        shape.validate();
+        assert_u32_index_domain(self.num_router_prob_elements(shape), "MoE routing probability elements");
+        assert_u32_index_domain(self.num_routes(shape), "MoE routing routes");
+    }
+
+    pub fn router_probs_bytes(self, shape: MoERoutingShape) -> usize {
         checked_product(
             "MoE routing probability byte length",
-            &[self.num_router_prob_elements(), size_of::<u16>()],
+            &[self.num_router_prob_elements(shape), size_of::<u16>()],
         )
     }
 
-    pub fn expert_indices_bytes(self) -> usize {
+    pub fn expert_indices_bytes(self, shape: MoERoutingShape) -> usize {
         checked_product(
             "MoE routing expert-index byte length",
-            &[self.num_routes(), size_of::<u32>()],
+            &[self.num_routes(shape), size_of::<u32>()],
         )
     }
 
-    pub fn expert_probs_bytes(self) -> usize {
+    pub fn expert_probs_bytes(self, shape: MoERoutingShape) -> usize {
         checked_product(
             "MoE routing expert-probability byte length",
-            &[self.num_routes(), size_of::<f32>()],
+            &[self.num_routes(shape), size_of::<f32>()],
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MoERoutingShape {
+    pub num_tokens: u32,
+}
+
+impl MoERoutingShape {
+    pub fn validate(self) {
+        assert!(self.num_tokens > 0);
     }
 }
 
@@ -80,12 +98,15 @@ pub struct MoERoutingBuffers<'a> {
 }
 
 pub struct MoERoutingKernel {
+    config: MoERoutingConfig,
     kernel: Kernel,
 }
 
 impl MoERoutingKernel {
-    pub fn new(device: &crate::metal::Device) -> Self {
+    pub fn new(device: &crate::metal::Device, config: MoERoutingConfig) -> Self {
+        config.validate();
         Self {
+            config,
             kernel: Kernel::new(device, MOE_ROUTING_SOURCE, "moe_route_topk"),
         }
     }
@@ -107,29 +128,29 @@ pub struct MoERoutingInvocation<'a> {
 
 impl Operator for MoERoutingInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.shape.validate();
-        debug_validate_buffers(self.shape, &self.buffers);
+        self.kernel.config.validate_shape(self.shape);
+        debug_validate_buffers(self.kernel.config, self.shape, &self.buffers);
         builder.set_kernel(&self.kernel.kernel);
         builder.set_buffer_read(0, self.buffers.router_probs, 0);
         builder.set_buffer_write(1, self.buffers.expert_indices, 0);
         builder.set_buffer_write(2, self.buffers.expert_probs, 0);
         builder.set_u32(3, self.shape.num_tokens);
-        builder.set_u32(4, self.shape.num_experts);
-        builder.set_u32(5, self.shape.num_experts_per_token);
-        builder.set_u32(6, u32::from(self.shape.norm_topk_prob));
+        builder.set_u32(4, self.kernel.config.num_experts);
+        builder.set_u32(5, self.kernel.config.num_experts_per_token);
+        builder.set_u32(6, u32::from(self.kernel.config.norm_topk_prob));
         builder.dispatch_threadblocks((self.shape.num_tokens as usize, 1, 1), (256, 1, 1));
     }
 }
 
-fn debug_validate_buffers(shape: MoERoutingShape, buffers: &MoERoutingBuffers<'_>) {
+fn debug_validate_buffers(config: MoERoutingConfig, shape: MoERoutingShape, buffers: &MoERoutingBuffers<'_>) {
     #[cfg(debug_assertions)]
-    validate_buffers(shape, buffers);
+    validate_buffers(config, shape, buffers);
 }
 
-fn validate_buffers(shape: MoERoutingShape, buffers: &MoERoutingBuffers<'_>) {
-    let router_probs_bytes = shape.router_probs_bytes();
-    let expert_indices_bytes = shape.expert_indices_bytes();
-    let expert_probs_bytes = shape.expert_probs_bytes();
+fn validate_buffers(config: MoERoutingConfig, shape: MoERoutingShape, buffers: &MoERoutingBuffers<'_>) {
+    let router_probs_bytes = config.router_probs_bytes(shape);
+    let expert_indices_bytes = config.expert_indices_bytes(shape);
+    let expert_probs_bytes = config.expert_probs_bytes(shape);
     assert!(
         buffers.router_probs.len_bytes() >= router_probs_bytes,
         "MoE routing router_probs buffer too short: shape={shape:?} required_bytes={} buffer_bytes={}",
@@ -152,8 +173,6 @@ fn validate_buffers(shape: MoERoutingShape, buffers: &MoERoutingBuffers<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
-
     use half::bf16;
     use inference_executor_core::mlp::moe::reference::moe_routing_from_bf16_probs_reference;
 
@@ -164,9 +183,8 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "MoE routing supports at most 256 experts")]
-    fn test_shape_rejects_more_than_256_experts() {
-        MoERoutingShape {
-            num_tokens: 1,
+    fn test_config_rejects_more_than_256_experts() {
+        MoERoutingConfig {
             num_experts: 257,
             num_experts_per_token: 1,
             norm_topk_prob: false,
@@ -176,9 +194,8 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "MoE routing supports at most 16 experts per token")]
-    fn test_shape_rejects_more_than_16_experts_per_token() {
-        MoERoutingShape {
-            num_tokens: 1,
+    fn test_config_rejects_more_than_16_experts_per_token() {
+        MoERoutingConfig {
             num_experts: 256,
             num_experts_per_token: 17,
             norm_topk_prob: false,
@@ -189,25 +206,26 @@ mod tests {
     #[test]
     #[should_panic(expected = "MoE routing probability elements exceeds the shader u32 element-index domain")]
     fn test_shape_rejects_shader_index_overflow() {
-        MoERoutingShape {
-            num_tokens: (u32::MAX / 256) + 2,
+        let config = MoERoutingConfig {
             num_experts: 256,
             num_experts_per_token: 1,
             norm_topk_prob: false,
-        }
-        .validate();
+        };
+        config.validate_shape(MoERoutingShape {
+            num_tokens: (u32::MAX / 256) + 2,
+        });
     }
 
     #[test]
     fn test_topk_renorm() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = MoERoutingShape {
-            num_tokens: 2,
+        let config = MoERoutingConfig {
             num_experts: 4,
             num_experts_per_token: 2,
             norm_topk_prob: true,
         };
+        let shape = MoERoutingShape { num_tokens: 2 };
         let router_probs_values = [
             softmax_prob(0.25, &[0.25, 2.0, -1.0, 1.0]),
             softmax_prob(2.0, &[0.25, 2.0, -1.0, 1.0]),
@@ -219,9 +237,9 @@ mod tests {
             softmax_prob(-2.0, &[3.0, 3.0, 0.5, -2.0]),
         ];
         let router_probs = bf16_buffer(&device, &router_probs_values);
-        let expert_indices = Buffer::new_zeroed(&device, shape.num_routes() * size_of::<u32>());
-        let expert_probs = Buffer::new_zeroed(&device, shape.num_routes() * size_of::<f32>());
-        let kernel = MoERoutingKernel::new(&device);
+        let expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(shape));
+        let expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(shape));
+        let kernel = MoERoutingKernel::new(&device, config);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
@@ -246,12 +264,12 @@ mod tests {
     fn test_no_topk_renorm() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = MoERoutingShape {
-            num_tokens: 1,
+        let config = MoERoutingConfig {
             num_experts: 4,
             num_experts_per_token: 2,
             norm_topk_prob: false,
         };
+        let shape = MoERoutingShape { num_tokens: 1 };
         let router_probs_values = [
             softmax_prob(0.25, &[0.25, 2.0, -1.0, 1.0]),
             softmax_prob(2.0, &[0.25, 2.0, -1.0, 1.0]),
@@ -259,9 +277,9 @@ mod tests {
             softmax_prob(1.0, &[0.25, 2.0, -1.0, 1.0]),
         ];
         let router_probs = bf16_buffer(&device, &router_probs_values);
-        let expert_indices = Buffer::new_zeroed(&device, shape.num_routes() * size_of::<u32>());
-        let expert_probs = Buffer::new_zeroed(&device, shape.num_routes() * size_of::<f32>());
-        let kernel = MoERoutingKernel::new(&device);
+        let expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(shape));
+        let expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(shape));
+        let kernel = MoERoutingKernel::new(&device, config);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
@@ -286,18 +304,18 @@ mod tests {
     fn test_random() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let shape = MoERoutingShape {
-            num_tokens: 5,
+        let config = MoERoutingConfig {
             num_experts: 8,
             num_experts_per_token: 3,
             norm_topk_prob: true,
         };
+        let shape = MoERoutingShape { num_tokens: 5 };
         let random_seed = 0x91E4_63BA;
-        let router_probs_values = generated_probs(shape.num_tokens as usize, shape.num_experts as usize, random_seed);
+        let router_probs_values = generated_probs(shape.num_tokens as usize, config.num_experts as usize, random_seed);
         let router_probs = bf16_buffer(&device, &router_probs_values);
-        let expert_indices = Buffer::new_zeroed(&device, shape.num_routes() * size_of::<u32>());
-        let expert_probs = Buffer::new_zeroed(&device, shape.num_routes() * size_of::<f32>());
-        let kernel = MoERoutingKernel::new(&device);
+        let expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(shape));
+        let expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(shape));
+        let kernel = MoERoutingKernel::new(&device, config);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
@@ -314,13 +332,13 @@ mod tests {
         let expected = moe_routing_from_bf16_probs_reference(
             &router_probs_values,
             shape.num_tokens as usize,
-            shape.num_experts as usize,
-            shape.num_experts_per_token as usize,
-            shape.norm_topk_prob,
+            config.num_experts as usize,
+            config.num_experts_per_token as usize,
+            config.norm_topk_prob,
         );
-        let actual_probs = expert_probs.read_typed::<f32>(0, shape.num_routes());
+        let actual_probs = expert_probs.read_typed::<f32>(0, config.num_routes(shape));
         assert_eq!(
-            expert_indices.read_typed::<u32>(0, shape.num_routes()),
+            expert_indices.read_typed::<u32>(0, config.num_routes(shape)),
             expected.expert_indices
         );
         assert_close(&actual_probs, &expected.expert_probs, 1.0e-3);

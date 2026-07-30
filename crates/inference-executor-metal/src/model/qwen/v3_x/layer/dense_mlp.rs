@@ -4,6 +4,7 @@ use inference_backend_metal::components::QuantizedDenseMLPWeights;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::dense::DenseMLPReplayShape;
@@ -17,9 +18,9 @@ use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::dense::backend::DenseMLPReplayInput;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::model::qwen::v3_x::weight::concat_bytes;
-use crate::model::qwen::v3_x::weight::quant_weight;
+use crate::model::qwen::v3_x::weight::remove_quant_weight;
+use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::to_u32;
-use crate::model::qwen::v3_x::weight::typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xDenseMLP {
@@ -63,7 +64,7 @@ impl Qwen3xDenseMLP {
 }
 
 // Public only inside the private `dense_mlp` module path so the sibling MoE
-// owner can reuse the identical common-expert tensor layout.
+// owner can reuse the identical shared-expert tensor layout.
 pub struct DenseMLPWeightBuffers {
     gate_up_weight: Buffer,
     gate_up_scales: Buffer,
@@ -81,24 +82,39 @@ impl DenseMLPWeightBuffers {
         core: &DenseMLPCore,
         metal: DenseMLPMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
+        let mut tensor_names = Vec::new();
+        bindings.push_tensor_names(&mut tensor_names);
+        let mut tensors = store.load_tensors(tensor_names)?;
+        let weights = Self::from_tensors(device, &mut tensors, bindings, core, metal)?;
+        assert!(tensors.is_empty(), "dense MLP must consume its tensor map");
+        Ok(weights)
+    }
+
+    pub fn from_tensors(
+        device: &Device,
+        tensors: &mut TensorMap,
+        bindings: &Qwen3xDenseMLPWeightBindings,
+        core: &DenseMLPCore,
+        metal: DenseMLPMetalConfig,
+    ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
-        let gate_weight = quant_weight(store, &bindings.gate.weight)?;
-        let up_weight = quant_weight(store, &bindings.up.weight)?;
-        let gate_scales = typed_tensor(store, &bindings.gate.scales, safetensors::Dtype::BF16)?.into_data();
-        let up_scales = typed_tensor(store, &bindings.up.scales, safetensors::Dtype::BF16)?.into_data();
-        let gate_biases = typed_tensor(store, &bindings.gate.biases, safetensors::Dtype::BF16)?.into_data();
-        let up_biases = typed_tensor(store, &bindings.up.biases, safetensors::Dtype::BF16)?.into_data();
-        let down_weight = quant_weight(store, &bindings.down.weight)?;
-        let down_scales = typed_tensor(store, &bindings.down.scales, safetensors::Dtype::BF16)?.into_data();
-        let down_biases = typed_tensor(store, &bindings.down.biases, safetensors::Dtype::BF16)?.into_data();
+        let gate_weight = remove_quant_weight(tensors, &bindings.gate.weight)?;
+        let up_weight = remove_quant_weight(tensors, &bindings.up.weight)?;
+        let gate_scales = remove_typed_tensor(tensors, &bindings.gate.scales, safetensors::Dtype::BF16)?.into_data();
+        let up_scales = remove_typed_tensor(tensors, &bindings.up.scales, safetensors::Dtype::BF16)?.into_data();
+        let gate_biases = remove_typed_tensor(tensors, &bindings.gate.biases, safetensors::Dtype::BF16)?.into_data();
+        let up_biases = remove_typed_tensor(tensors, &bindings.up.biases, safetensors::Dtype::BF16)?.into_data();
+        let down_weight = remove_quant_weight(tensors, &bindings.down.weight)?;
+        let down_scales = remove_typed_tensor(tensors, &bindings.down.scales, safetensors::Dtype::BF16)?.into_data();
+        let down_biases = remove_typed_tensor(tensors, &bindings.down.biases, safetensors::Dtype::BF16)?.into_data();
 
         let config = inference_backend_metal::components::QuantizedDenseMLPConfig {
             hidden_dim: to_u32("dense hidden_dim", core.hidden_dim)?,
             intermediate_dim: to_u32("dense intermediate_dim", core.intermediate_dim)?,
             group_size: metal.group_size,
             bits: metal.bits,
-            dtype: metal.dtype,
+            dtype: metal.io_dtype,
         };
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();

@@ -427,7 +427,7 @@ fn init_qwen_3_5_model_inner(
         Some(std::rc::Rc::new(DenseMLPScratch::new(
             &device,
             &core,
-            metal,
+            metal.io_dtype,
             config.max_tokens,
         )))
     } else {

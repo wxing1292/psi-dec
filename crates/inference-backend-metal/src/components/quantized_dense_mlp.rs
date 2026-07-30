@@ -7,7 +7,7 @@ use crate::metal::Operator;
 use crate::operators::AffineQuantizedMatmul;
 use crate::operators::AffineQuantizedMatmulConfig;
 
-const DENSE_MLP_ACTIVATION_SOURCE: &str = include_str!("metal/quantized_dense_mlp_activation.metal");
+const DENSE_MLP_SWIGLU_SOURCE: &str = include_str!("metal/quantized_dense_mlp_swiglu.metal");
 
 const ELEMENTWISE_NUM_THREADS_PER_THREADBLOCK: usize = 256;
 
@@ -45,22 +45,18 @@ impl QuantizedDenseMLPConfig {
         self.affine_config_unchecked(self.hidden_dim, self.intermediate_dim)
     }
 
-    pub fn activation_shape(self, shape: QuantizedDenseMLPShape) -> QuantizedDenseMLPActivationShape {
+    pub fn swiglu_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
         self.validate();
         shape.validate();
-        self.activation_shape_unchecked(shape)
+        (self.swiglu_num_values_unchecked(shape) as usize)
+            .checked_mul(self.dtype.item_size())
+            .expect("dense MLP swiglu byte length must fit usize")
     }
 
-    fn activation_shape_unchecked(self, shape: QuantizedDenseMLPShape) -> QuantizedDenseMLPActivationShape {
-        let num_values = self
-            .intermediate_dim
+    fn swiglu_num_values_unchecked(self, shape: QuantizedDenseMLPShape) -> u32 {
+        self.intermediate_dim
             .checked_mul(shape.num_tokens)
-            .expect("dense MLP activation num_values must fit u32");
-        match self.dtype {
-            Dtype::Float32 => QuantizedDenseMLPActivationShape::f32(num_values),
-            Dtype::Bfloat16 => QuantizedDenseMLPActivationShape::bf16(num_values),
-            dtype => panic!("unsupported dense MLP activation dtype {dtype:?}"),
-        }
+            .expect("dense MLP swiglu num_values must fit u32")
     }
 
     pub fn input_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
@@ -117,39 +113,6 @@ impl QuantizedDenseMLPShape {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QuantizedDenseMLPActivationShape {
-    pub num_values: u32,
-    pub dtype: Dtype,
-}
-
-impl QuantizedDenseMLPActivationShape {
-    pub fn f32(num_values: u32) -> Self {
-        Self {
-            num_values,
-            dtype: Dtype::Float32,
-        }
-    }
-
-    pub fn bf16(num_values: u32) -> Self {
-        Self {
-            num_values,
-            dtype: Dtype::Bfloat16,
-        }
-    }
-
-    pub fn validate(self) {
-        assert!(self.num_values > 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
-    }
-
-    pub fn bytes(self) -> usize {
-        (self.num_values as usize)
-            .checked_mul(self.dtype.item_size())
-            .expect("dense MLP activation byte length must fit usize")
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct QuantizedDenseMLPBuffers<'a> {
     pub hidden_state: &'a Buffer,
@@ -168,25 +131,48 @@ pub struct QuantizedDenseMLPWeights<'a> {
 
 #[derive(Clone, Copy)]
 pub struct QuantizedDenseMLPScratch<'a> {
-    pub gate_up_proj: &'a Buffer,
-    pub activation: &'a Buffer,
+    pub gate_up: &'a Buffer,
+    pub swiglu: &'a Buffer,
 }
 
-pub struct QuantizedDenseMLPKernels {
+/// Records one quantized dense MLP:
+///
+/// ```text
+/// hidden_state [T, H]
+///        |
+///        v
+///     gate_up
+///        |
+///        v
+/// scratch.gate_up [T, 2I]
+///        |
+///        v
+///      swiglu
+///        |
+///        v
+/// scratch.swiglu [T, I]
+///        |
+///        v
+///       down
+///        |
+///        v
+/// next_hidden_state [T, H]
+/// ```
+pub struct QuantizedDenseMLP {
     config: QuantizedDenseMLPConfig,
-    gate_up_proj: AffineQuantizedMatmul,
-    down_proj: AffineQuantizedMatmul,
-    activation: QuantizedDenseMLPActivationKernel,
+    gate_up: AffineQuantizedMatmul,
+    down: AffineQuantizedMatmul,
+    swiglu: QuantizedDenseMLPSwiGLUKernel,
 }
 
-impl QuantizedDenseMLPKernels {
+impl QuantizedDenseMLP {
     pub fn new(device: &Device, config: QuantizedDenseMLPConfig) -> Self {
         config.validate();
         Self {
             config,
-            gate_up_proj: AffineQuantizedMatmul::new(device, config.gate_up_config()),
-            down_proj: AffineQuantizedMatmul::new(device, config.down_config()),
-            activation: QuantizedDenseMLPActivationKernel::new(device),
+            gate_up: AffineQuantizedMatmul::new(device, config.gate_up_config()),
+            down: AffineQuantizedMatmul::new(device, config.down_config()),
+            swiglu: QuantizedDenseMLPSwiGLUKernel::new(device, config.dtype),
         }
     }
 
@@ -198,7 +184,7 @@ impl QuantizedDenseMLPKernels {
         weights: QuantizedDenseMLPWeights<'a>,
     ) -> QuantizedDenseMLPInvocation<'a> {
         QuantizedDenseMLPInvocation {
-            kernels: self,
+            compute: self,
             shape,
             buffers,
             scratch,
@@ -210,43 +196,43 @@ impl QuantizedDenseMLPKernels {
         &'a self,
         shape: QuantizedDenseMLPShape,
         hidden_state: &'a Buffer,
-        gate_up_proj: &'a Buffer,
+        gate_up: &'a Buffer,
         weights: QuantizedDenseMLPWeights<'a>,
     ) -> QuantizedDenseMLPGateUpInvocation<'a> {
         QuantizedDenseMLPGateUpInvocation {
-            kernels: self,
+            compute: self,
             shape,
             hidden_state,
-            gate_up_proj,
+            gate_up,
             weights,
         }
     }
 
-    pub fn invoke_activation<'a>(
+    pub fn invoke_swiglu<'a>(
         &'a self,
         shape: QuantizedDenseMLPShape,
-        gate_up_proj: &'a Buffer,
-        activation: &'a Buffer,
-    ) -> QuantizedDenseMLPActivationInvocation<'a> {
-        QuantizedDenseMLPActivationInvocation {
-            kernels: self,
+        gate_up: &'a Buffer,
+        swiglu: &'a Buffer,
+    ) -> QuantizedDenseMLPSwiGLUInvocation<'a> {
+        QuantizedDenseMLPSwiGLUInvocation {
+            compute: self,
             shape,
-            gate_up_proj,
-            activation,
+            gate_up,
+            swiglu,
         }
     }
 
     pub fn invoke_down<'a>(
         &'a self,
         shape: QuantizedDenseMLPShape,
-        activation: &'a Buffer,
+        swiglu: &'a Buffer,
         next_hidden_state: &'a Buffer,
         weights: QuantizedDenseMLPWeights<'a>,
     ) -> QuantizedDenseMLPDownInvocation<'a> {
         QuantizedDenseMLPDownInvocation {
-            kernels: self,
+            compute: self,
             shape,
-            activation,
+            swiglu,
             next_hidden_state,
             weights,
         }
@@ -254,7 +240,7 @@ impl QuantizedDenseMLPKernels {
 }
 
 pub struct QuantizedDenseMLPInvocation<'a> {
-    kernels: &'a QuantizedDenseMLPKernels,
+    compute: &'a QuantizedDenseMLP,
     shape: QuantizedDenseMLPShape,
     buffers: QuantizedDenseMLPBuffers<'a>,
     scratch: QuantizedDenseMLPScratch<'a>,
@@ -263,22 +249,22 @@ pub struct QuantizedDenseMLPInvocation<'a> {
 
 impl Operator for QuantizedDenseMLPInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.kernels
+        self.compute
             .invoke_gate_up(
                 self.shape,
                 self.buffers.hidden_state,
-                self.scratch.gate_up_proj,
+                self.scratch.gate_up,
                 self.weights,
             )
             .record(builder);
-        builder.record_with_barrier_before(self.kernels.invoke_activation(
+        builder.record_with_barrier_before(self.compute.invoke_swiglu(
             self.shape,
-            self.scratch.gate_up_proj,
-            self.scratch.activation,
+            self.scratch.gate_up,
+            self.scratch.swiglu,
         ));
-        builder.record_with_barrier_before(self.kernels.invoke_down(
+        builder.record_with_barrier_before(self.compute.invoke_down(
             self.shape,
-            self.scratch.activation,
+            self.scratch.swiglu,
             self.buffers.next_hidden_state,
             self.weights,
         ));
@@ -286,23 +272,23 @@ impl Operator for QuantizedDenseMLPInvocation<'_> {
 }
 
 pub struct QuantizedDenseMLPGateUpInvocation<'a> {
-    kernels: &'a QuantizedDenseMLPKernels,
+    compute: &'a QuantizedDenseMLP,
     shape: QuantizedDenseMLPShape,
     hidden_state: &'a Buffer,
-    gate_up_proj: &'a Buffer,
+    gate_up: &'a Buffer,
     weights: QuantizedDenseMLPWeights<'a>,
 }
 
 impl Operator for QuantizedDenseMLPGateUpInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.kernels
-            .gate_up_proj
+        self.compute
+            .gate_up
             .invoke(
                 self.shape
                     .num_tokens
                     .try_into()
                     .expect("dense MLP token count must fit i32"),
-                self.gate_up_proj,
+                self.gate_up,
                 0,
                 self.hidden_state,
                 0,
@@ -317,34 +303,34 @@ impl Operator for QuantizedDenseMLPGateUpInvocation<'_> {
     }
 }
 
-pub struct QuantizedDenseMLPActivationInvocation<'a> {
-    kernels: &'a QuantizedDenseMLPKernels,
+pub struct QuantizedDenseMLPSwiGLUInvocation<'a> {
+    compute: &'a QuantizedDenseMLP,
     shape: QuantizedDenseMLPShape,
-    gate_up_proj: &'a Buffer,
-    activation: &'a Buffer,
+    gate_up: &'a Buffer,
+    swiglu: &'a Buffer,
 }
 
-impl Operator for QuantizedDenseMLPActivationInvocation<'_> {
+impl Operator for QuantizedDenseMLPSwiGLUInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.kernels
-            .activation
-            .invoke(self.kernels.config, self.shape, self.gate_up_proj, self.activation)
+        self.compute
+            .swiglu
+            .invoke(self.compute.config, self.shape, self.gate_up, self.swiglu)
             .record(builder);
     }
 }
 
 pub struct QuantizedDenseMLPDownInvocation<'a> {
-    kernels: &'a QuantizedDenseMLPKernels,
+    compute: &'a QuantizedDenseMLP,
     shape: QuantizedDenseMLPShape,
-    activation: &'a Buffer,
+    swiglu: &'a Buffer,
     next_hidden_state: &'a Buffer,
     weights: QuantizedDenseMLPWeights<'a>,
 }
 
 impl Operator for QuantizedDenseMLPDownInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.kernels
-            .down_proj
+        self.compute
+            .down
             .invoke(
                 self.shape
                     .num_tokens
@@ -352,7 +338,7 @@ impl Operator for QuantizedDenseMLPDownInvocation<'_> {
                     .expect("dense MLP token count must fit i32"),
                 self.next_hidden_state,
                 0,
-                self.activation,
+                self.swiglu,
                 0,
                 self.weights.down_weight,
                 0,
@@ -365,16 +351,19 @@ impl Operator for QuantizedDenseMLPDownInvocation<'_> {
     }
 }
 
-struct QuantizedDenseMLPActivationKernel {
-    f32_kernel: Kernel,
-    bf16_kernel: Kernel,
+struct QuantizedDenseMLPSwiGLUKernel {
+    kernel: Kernel,
 }
 
-impl QuantizedDenseMLPActivationKernel {
-    fn new(device: &Device) -> Self {
+impl QuantizedDenseMLPSwiGLUKernel {
+    fn new(device: &Device, dtype: Dtype) -> Self {
+        let function_name = match dtype {
+            Dtype::Float32 => "dense_mlp_swiglu_f32",
+            Dtype::Bfloat16 => "dense_mlp_swiglu_bf16",
+            dtype => panic!("unsupported dense MLP swiglu dtype {dtype:?}"),
+        };
         Self {
-            f32_kernel: Kernel::new(device, DENSE_MLP_ACTIVATION_SOURCE, "dense_mlp_activation_f32"),
-            bf16_kernel: Kernel::new(device, DENSE_MLP_ACTIVATION_SOURCE, "dense_mlp_activation_bf16"),
+            kernel: Kernel::new(device, DENSE_MLP_SWIGLU_SOURCE, function_name),
         }
     }
 
@@ -382,60 +371,52 @@ impl QuantizedDenseMLPActivationKernel {
         &'a self,
         config: QuantizedDenseMLPConfig,
         shape: QuantizedDenseMLPShape,
-        gate_up_proj: &'a Buffer,
-        activation: &'a Buffer,
-    ) -> QuantizedDenseMLPActivationRowMajorInvocation<'a> {
-        QuantizedDenseMLPActivationRowMajorInvocation {
-            kernel: self.kernel(config),
+        gate_up: &'a Buffer,
+        swiglu: &'a Buffer,
+    ) -> QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
+        QuantizedDenseMLPSwiGLURowMajorInvocation {
+            kernel: &self.kernel,
             config,
             shape,
-            gate_up_proj,
-            activation,
-        }
-    }
-
-    fn kernel(&self, config: QuantizedDenseMLPConfig) -> &Kernel {
-        match config.dtype {
-            Dtype::Float32 => &self.f32_kernel,
-            Dtype::Bfloat16 => &self.bf16_kernel,
-            dtype => panic!("unsupported dense MLP activation dtype {dtype:?}"),
+            gate_up,
+            swiglu,
         }
     }
 }
 
-struct QuantizedDenseMLPActivationRowMajorInvocation<'a> {
+struct QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
     kernel: &'a Kernel,
     config: QuantizedDenseMLPConfig,
     shape: QuantizedDenseMLPShape,
-    gate_up_proj: &'a Buffer,
-    activation: &'a Buffer,
+    gate_up: &'a Buffer,
+    swiglu: &'a Buffer,
 }
 
-impl Operator for QuantizedDenseMLPActivationRowMajorInvocation<'_> {
+impl Operator for QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
         builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.gate_up_proj, 0);
-        builder.set_buffer_write(1, self.activation, 0);
+        builder.set_buffer_read(0, self.gate_up, 0);
+        builder.set_buffer_write(1, self.swiglu, 0);
         builder.set_u32(2, self.shape.num_tokens);
         builder.set_u32(3, self.config.intermediate_dim);
-        let num_values = self.config.activation_shape_unchecked(self.shape).num_values as usize;
+        let num_values = self.config.swiglu_num_values_unchecked(self.shape) as usize;
         builder.dispatch_1d(num_values, ELEMENTWISE_NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
-impl QuantizedDenseMLPActivationRowMajorInvocation<'_> {
+impl QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
     fn validate(&self) {
         self.shape.validate();
         let gate_up_output_bytes = self.config.gate_up_output_bytes(self.shape);
-        let activation_bytes = self.config.activation_shape_unchecked(self.shape).bytes();
+        let swiglu_bytes = self.config.swiglu_bytes(self.shape);
         assert!(
-            self.gate_up_proj.len_bytes() >= gate_up_output_bytes,
+            self.gate_up.len_bytes() >= gate_up_output_bytes,
             "dense MLP gate/up projection buffer is too small"
         );
         assert!(
-            self.activation.len_bytes() >= activation_bytes,
-            "dense MLP activation buffer is too small"
+            self.swiglu.len_bytes() >= swiglu_bytes,
+            "dense MLP swiglu buffer is too small"
         );
     }
 }
@@ -463,7 +444,7 @@ mod tests {
             dtype: Dtype::Bfloat16,
         };
         let shape = QuantizedDenseMLPShape { num_tokens: 4 };
-        let (device, kernels) = create_dense_mlp_kernels(config);
+        let (device, compute) = create_dense_mlp_compute(config);
         let stream = Stream::new(&device);
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();
@@ -492,17 +473,17 @@ mod tests {
 
         let replay_output = Buffer::new_zeroed(&device, config.output_bytes(shape));
         let replay_gate_up = Buffer::new_zeroed(&device, config.gate_up_output_bytes(shape));
-        let replay_activation = Buffer::new_zeroed(&device, config.activation_shape(shape).bytes());
+        let replay_swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(shape));
         let mut builder = stream.create_replay_program();
-        builder.record(kernels.invoke(
+        builder.record(compute.invoke(
             shape,
             QuantizedDenseMLPBuffers {
                 hidden_state: &hidden_state,
                 next_hidden_state: &replay_output,
             },
             QuantizedDenseMLPScratch {
-                gate_up_proj: &replay_gate_up,
-                activation: &replay_activation,
+                gate_up: &replay_gate_up,
+                swiglu: &replay_swiglu,
             },
             weights,
         ));
@@ -554,7 +535,7 @@ mod tests {
             dtype: Dtype::Bfloat16,
         };
         let shape = QuantizedDenseMLPShape { num_tokens: 7 };
-        let (device, kernels) = create_dense_mlp_kernels(config);
+        let (device, compute) = create_dense_mlp_compute(config);
         let stream = Stream::new(&device);
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();
@@ -587,17 +568,17 @@ mod tests {
 
         let replay_output = Buffer::new_zeroed(&device, config.output_bytes(shape));
         let replay_gate_up = Buffer::new_zeroed(&device, config.gate_up_output_bytes(shape));
-        let replay_activation = Buffer::new_zeroed(&device, config.activation_shape(shape).bytes());
+        let replay_swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(shape));
         let mut builder = stream.create_replay_program();
-        builder.record(kernels.invoke(
+        builder.record(compute.invoke(
             shape,
             QuantizedDenseMLPBuffers {
                 hidden_state: &hidden_state,
                 next_hidden_state: &replay_output,
             },
             QuantizedDenseMLPScratch {
-                gate_up_proj: &replay_gate_up,
-                activation: &replay_activation,
+                gate_up: &replay_gate_up,
+                swiglu: &replay_swiglu,
             },
             QuantizedDenseMLPWeights {
                 gate_up_weight: &gate_up_weight,
@@ -642,10 +623,10 @@ mod tests {
         assert_close_rel(&actual, &expected, 2.0e-5, 8.0e-3);
     }
 
-    fn create_dense_mlp_kernels(config: QuantizedDenseMLPConfig) -> (Device, QuantizedDenseMLPKernels) {
+    fn create_dense_mlp_compute(config: QuantizedDenseMLPConfig) -> (Device, QuantizedDenseMLP) {
         let device = Device::system_default();
-        let kernels = QuantizedDenseMLPKernels::new(&device, config);
-        (device, kernels)
+        let compute = QuantizedDenseMLP::new(&device, config);
+        (device, compute)
     }
 
     fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {

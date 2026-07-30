@@ -1,5 +1,5 @@
 template <typename T, const int group_size, const int bits, const bool aligned_N, const int BM = 32, const int BK = 32, const int BN = 32>
-[[kernel]] void qmm_t_fused_gate_up_silu(
+[[kernel]] void qmm_t_gate_up_swiglu(
     const device uint32_t* w_gate [[buffer(0)]],
     const device T* scales_gate [[buffer(1)]],
     const device T* biases_gate [[buffer(2)]],
@@ -194,7 +194,7 @@ METAL_FUNC void qmv_impl(
 }
 
 template <typename T, int group_size, int bits>
-METAL_FUNC void qmv_gate_up_silu(
+METAL_FUNC void qmv_gate_up_swiglu(
     const device uint32_t* gate_w,
     const device T* gate_scales,
     const device T* gate_biases,
@@ -311,7 +311,7 @@ METAL_FUNC void qmv_gate_up_silu(
 }
 
 template <typename T, const int group_size, const int bits>
-[[kernel]] void dense_fused_gate_up_silu(
+[[kernel]] void dense_gate_up_swiglu(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
     const device T* biases [[buffer(2)]],
@@ -331,7 +331,7 @@ template <typename T, const int group_size, const int bits>
   const device T* gate_biases = biases;
   const device T* up_scales = scales + out_vec_size * in_vec_size_g;
   const device T* up_biases = biases + out_vec_size * in_vec_size_g;
-  qmv_gate_up_silu<T, group_size, bits>(
+  qmv_gate_up_swiglu<T, group_size, bits>(
       gate_w,
       gate_scales,
       gate_biases,
@@ -348,7 +348,7 @@ template <typename T, const int group_size, const int bits>
 }
 
 template <typename T, const int group_size, const int bits>
-[[kernel]] void split_fused_gate_up_silu(
+[[kernel]] void split_gate_up_swiglu(
     const device uint32_t* gate_w [[buffer(0)]],
     const device T* gate_scales [[buffer(1)]],
     const device T* gate_biases [[buffer(2)]],
@@ -362,7 +362,7 @@ template <typename T, const int group_size, const int bits>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  qmv_gate_up_silu<T, group_size, bits>(
+  qmv_gate_up_swiglu<T, group_size, bits>(
       gate_w,
       gate_scales,
       gate_biases,
@@ -379,7 +379,7 @@ template <typename T, const int group_size, const int bits>
 }
 
 template <typename T, const int group_size, const int bits>
-[[kernel]] void token_major_fused_gate_up_silu(
+[[kernel]] void token_major_gate_up_swiglu(
     const device uint32_t* gate_w [[buffer(0)]],
     const device T* gate_scales [[buffer(1)]],
     const device T* gate_biases [[buffer(2)]],
@@ -407,7 +407,7 @@ template <typename T, const int group_size, const int bits>
   const int in_vec_size_g = in_vec_size / group_size;
   const int expert_weight_stride = out_vec_size * in_vec_size_w;
   const int expert_affine_stride = out_vec_size * in_vec_size_g;
-  qmv_gate_up_silu<T, group_size, bits>(
+  qmv_gate_up_swiglu<T, group_size, bits>(
       (const device uint32_t*)((const device uint8_t*)gate_w + expert * expert_weight_stride),
       gate_scales + expert * expert_affine_stride,
       gate_biases + expert * expert_affine_stride,
@@ -462,7 +462,7 @@ template <typename T, const int group_size, const int bits>
 }
 
 template <typename T, const int group_size, const int bits>
-[[kernel]] void expert_major_fused_gate_up_silu(
+[[kernel]] void expert_major_gate_up_swiglu(
     const device uint32_t* gate_w [[buffer(0)]],
     const device T* gate_scales [[buffer(1)]],
     const device T* gate_biases [[buffer(2)]],
@@ -489,7 +489,7 @@ template <typename T, const int group_size, const int bits>
   const int expert_weight_stride = out_vec_size * in_vec_size_w;
   const int expert_affine_stride = out_vec_size * in_vec_size_g;
 
-  qmv_gate_up_silu<T, group_size, bits>(
+  qmv_gate_up_swiglu<T, group_size, bits>(
       (const device uint32_t*)((const device uint8_t*)gate_w + expert * expert_weight_stride),
       gate_scales + expert * expert_affine_stride,
       gate_biases + expert * expert_affine_stride,

@@ -150,7 +150,7 @@ pub fn qwen35_dense_mlp_core_and_metal(
     let metal = DenseMLPMetalConfig {
         group_size: defaults.group_size,
         bits: defaults.bits,
-        dtype: defaults.hidden_dtype,
+        io_dtype: defaults.hidden_dtype,
     };
     metal.validate();
     Ok((core, metal))
@@ -167,7 +167,7 @@ pub fn qwen35_moe_core_and_metal(
         model_layer_index,
         hidden_dim: text.hidden_size,
         intermediate_dim: text.moe_intermediate_size,
-        common_expert_intermediate_dim: (text.shared_expert_intermediate_size > 0)
+        shared_experts_intermediate_dim: (text.shared_expert_intermediate_size > 0)
             .then_some(text.shared_expert_intermediate_size),
         num_experts: text.num_experts,
         num_experts_per_token: text.num_experts_per_tok,
@@ -178,12 +178,12 @@ pub fn qwen35_moe_core_and_metal(
         group_size: defaults.group_size,
         bits: defaults.bits,
         router_bits: quant_bits_for(config, &format!("{layer_prefix}.mlp.gate.weight"), defaults.bits)?,
-        common_gate_bits: quant_bits_for(
+        shared_expert_gate_bits: quant_bits_for(
             config,
             &format!("{layer_prefix}.mlp.shared_expert_gate.weight"),
             defaults.bits,
         )?,
-        dtype: defaults.hidden_dtype,
+        io_dtype: defaults.hidden_dtype,
     };
     metal.validate();
     Ok((core, metal))

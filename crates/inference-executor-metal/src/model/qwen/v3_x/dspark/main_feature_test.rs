@@ -73,7 +73,7 @@ fn new_plan() -> Qwen3xDSparkPlan {
             mlp_metal: DenseMLPMetalConfig {
                 group_size: 32,
                 bits: 4,
-                dtype: Dtype::Bfloat16,
+                io_dtype: Dtype::Bfloat16,
             },
         }],
         norm_eps: 1e-6,

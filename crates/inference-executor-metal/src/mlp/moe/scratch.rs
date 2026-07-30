@@ -1,6 +1,8 @@
-use inference_backend_metal::components::MoECombineWithCommonShape;
-use inference_backend_metal::components::MoECombineWithoutCommonShape;
+use inference_backend_metal::components::MoECombineConfig;
+use inference_backend_metal::components::MoECombineShape;
+use inference_backend_metal::components::MoEExpertMajorConfig;
 use inference_backend_metal::components::MoEExpertMajorShape;
+use inference_backend_metal::components::MoERoutingConfig;
 use inference_backend_metal::components::MoERoutingShape;
 use inference_backend_metal::components::QuantizedSparseMLPConfig;
 use inference_backend_metal::components::QuantizedSparseMLPExpertMajorShape;
@@ -8,10 +10,8 @@ use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::moe::GatedMoECore;
 
-use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::dense::scratch::DenseMLPScratchBindings;
 use crate::mlp::moe::backend::GatedMoEMetalConfig;
@@ -19,7 +19,7 @@ use crate::mlp::moe::backend::GatedMoEMetalConfig;
 pub struct MoEScratch {
     routing: MoERoutingScratch,
     topk_experts: TopKExpertsScratch,
-    common_expert: Option<CommonExpertScratch>,
+    shared_experts: Option<SharedExpertsScratch>,
 }
 
 struct MoERoutingScratch {
@@ -33,7 +33,7 @@ struct TopKExpertsScratch {
     token_indices: Buffer,
     route_indices: Buffer,
     routed_hidden: Buffer,
-    sparse_activation: Buffer,
+    sparse_swiglu: Buffer,
     expert_counts: Buffer,
     expert_offsets: Buffer,
     expert_cursors: Buffer,
@@ -43,7 +43,7 @@ struct TopKExpertsScratch {
     packed_input: Buffer,
 }
 
-struct CommonExpertScratch {
+struct SharedExpertsScratch {
     hidden: Buffer,
     gate_logits: Buffer,
     dense_mlp: DenseMLPScratch,
@@ -68,7 +68,7 @@ pub struct TopKExpertsScratchBindings<'a> {
     pub token_indices: &'a Buffer,
     pub route_indices: &'a Buffer,
     pub routed_hidden: &'a Buffer,
-    pub sparse_activation: &'a Buffer,
+    pub sparse_swiglu: &'a Buffer,
     pub expert_counts: &'a Buffer,
     pub expert_offsets: &'a Buffer,
     pub expert_cursors: &'a Buffer,
@@ -79,7 +79,7 @@ pub struct TopKExpertsScratchBindings<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct CommonExpertScratchBindings<'a> {
+pub struct SharedExpertsScratchBindings<'a> {
     pub hidden: &'a Buffer,
     pub gate_logits: &'a Buffer,
     pub dense_mlp: DenseMLPScratchBindings<'a>,
@@ -100,8 +100,7 @@ impl MoEScratch {
                     .expect("MoE top-k expert count must fit u32"),
             )
             .expect("MoE scratch route capacity must fit u32");
-        let routing_shape = MoERoutingShape {
-            num_tokens: max_tokens_u32,
+        let routing_config = MoERoutingConfig {
             num_experts: core.num_experts.try_into().expect("MoE expert count must fit u32"),
             num_experts_per_token: core
                 .num_experts_per_token
@@ -109,33 +108,31 @@ impl MoEScratch {
                 .expect("MoE top-k expert count must fit u32"),
             norm_topk_prob: core.norm_topk_prob,
         };
-        routing_shape.validate();
+        let routing_shape = MoERoutingShape {
+            num_tokens: max_tokens_u32,
+        };
+        routing_config.validate_shape(routing_shape);
         let router_config = affine_config(core.num_experts, core.hidden_dim, config.router_bits, config);
-        let expert_major_shape = MoEExpertMajorShape::bf16(
-            max_tokens_u32,
+        let expert_major_config = MoEExpertMajorConfig::bf16(
             core.num_experts.try_into().expect("MoE expert count must fit u32"),
             core.num_experts_per_token
                 .try_into()
                 .expect("MoE top-k expert count must fit u32"),
             core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
         );
-        expert_major_shape.validate();
-        if core.has_common_expert() {
-            MoECombineWithCommonShape::bf16(
-                expert_major_shape.num_tokens,
-                expert_major_shape.num_experts_per_token,
-                expert_major_shape.hidden_dim,
-            )
-            .validate();
-        } else {
-            MoECombineWithoutCommonShape::bf16(
-                expert_major_shape.num_tokens,
-                expert_major_shape.num_experts_per_token,
-                expert_major_shape.hidden_dim,
-            )
-            .validate();
-        }
+        let expert_major_shape = MoEExpertMajorShape {
+            num_tokens: max_tokens_u32,
+        };
+        expert_major_config.validate_shape(expert_major_shape);
+        MoECombineConfig::bf16(
+            expert_major_config.num_experts_per_token,
+            expert_major_config.hidden_dim,
+        )
+        .validate_shape(MoECombineShape {
+            num_tokens: expert_major_shape.num_tokens,
+        });
         let sparse_config = QuantizedSparseMLPConfig {
+            num_experts: core.num_experts.try_into().expect("MoE expert count must fit u32"),
             hidden_dim: core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
             intermediate_dim: core
                 .intermediate_dim
@@ -143,7 +140,7 @@ impl MoEScratch {
                 .expect("MoE intermediate_dim must fit u32"),
             group_size: config.group_size,
             bits: config.bits,
-            dtype: config.dtype,
+            dtype: config.io_dtype,
         };
         let token_major_shape = QuantizedSparseMLPTokenMajorShape {
             num_routes,
@@ -154,8 +151,7 @@ impl MoEScratch {
                 .token_major_output_bytes(token_major_shape)
                 .max(
                     sparse_config.expert_major_output_bytes(QuantizedSparseMLPExpertMajorShape {
-                        num_experts: core.num_experts.try_into().expect("MoE expert count must fit u32"),
-                        num_routes: expert_major_shape.num_routes(),
+                        num_routes: expert_major_config.num_routes(expert_major_shape),
                     }),
                 );
         let topk: u32 = core
@@ -168,51 +164,41 @@ impl MoEScratch {
         let routing = MoERoutingScratch {
             router_logits: Buffer::new_zeroed(device, router_config.output_bytes(max_tokens_i32)),
             router_probs: Buffer::new_zeroed(device, router_config.output_bytes(max_tokens_i32)),
-            expert_indices: Buffer::new_zeroed(device, routing_shape.expert_indices_bytes()),
-            expert_probs: Buffer::new_zeroed(device, routing_shape.expert_probs_bytes()),
+            expert_indices: Buffer::new_zeroed(device, routing_config.expert_indices_bytes(routing_shape)),
+            expert_probs: Buffer::new_zeroed(device, routing_config.expert_probs_bytes(routing_shape)),
         };
         let topk_experts = TopKExpertsScratch {
             token_indices: Buffer::from_slice(device, &token_route_indices),
             route_indices: Buffer::from_slice(device, &identity_indices),
             routed_hidden: Buffer::new_zeroed(device, routed_hidden_bytes),
-            sparse_activation: Buffer::new_zeroed(device, sparse_config.activation_bytes(num_routes)),
-            expert_counts: Buffer::new_zeroed(device, expert_major_shape.expert_counts_bytes()),
-            expert_offsets: Buffer::new_zeroed(device, expert_major_shape.expert_offsets_bytes()),
-            expert_cursors: Buffer::new_zeroed(device, expert_major_shape.expert_counts_bytes()),
-            routes_by_expert: Buffer::new_zeroed(device, expert_major_shape.route_indices_bytes()),
-            routes_by_token: Buffer::new_zeroed(device, expert_major_shape.route_indices_bytes()),
-            experts_by_route: Buffer::new_zeroed(device, expert_major_shape.route_indices_bytes()),
-            packed_input: Buffer::new_zeroed(device, expert_major_shape.route_hidden_bytes()),
+            sparse_swiglu: Buffer::new_zeroed(device, sparse_config.swiglu_bytes(num_routes)),
+            expert_counts: Buffer::new_zeroed(device, expert_major_config.expert_counts_bytes()),
+            expert_offsets: Buffer::new_zeroed(device, expert_major_config.expert_offsets_bytes()),
+            expert_cursors: Buffer::new_zeroed(device, expert_major_config.expert_counts_bytes()),
+            routes_by_expert: Buffer::new_zeroed(device, expert_major_config.route_indices_bytes(expert_major_shape)),
+            routes_by_token: Buffer::new_zeroed(device, expert_major_config.route_indices_bytes(expert_major_shape)),
+            experts_by_route: Buffer::new_zeroed(device, expert_major_config.route_indices_bytes(expert_major_shape)),
+            packed_input: Buffer::new_zeroed(device, expert_major_config.route_hidden_bytes(expert_major_shape)),
         };
-        let common_expert = core.common_expert_intermediate_dim.map(|intermediate_dim| {
-            let dense_core = DenseMLPCore {
-                model_layer_index: core.model_layer_index,
-                hidden_dim: core.hidden_dim,
-                intermediate_dim,
-            };
-            let dense_config = DenseMLPMetalConfig {
-                group_size: config.group_size,
-                bits: config.bits,
-                dtype: config.dtype,
-            };
-            let gate_config = affine_config(1, core.hidden_dim, config.common_gate_bits, config);
-            CommonExpertScratch {
+        let shared_experts = core.shared_experts_core().map(|dense_core| {
+            let gate_config = affine_config(1, core.hidden_dim, config.shared_expert_gate_bits, config);
+            SharedExpertsScratch {
                 hidden: Buffer::new_zeroed_elements(
                     device,
                     max_tokens
                         .checked_mul(core.hidden_dim)
-                        .expect("MoE common-expert hidden element capacity must fit usize"),
-                    config.dtype,
+                        .expect("MoE shared-expert hidden element capacity must fit usize"),
+                    config.io_dtype,
                 ),
                 gate_logits: Buffer::new_zeroed(device, gate_config.output_bytes(max_tokens_i32)),
-                dense_mlp: DenseMLPScratch::new(device, &dense_core, dense_config, max_tokens),
+                dense_mlp: DenseMLPScratch::new(device, &dense_core, config.io_dtype, max_tokens),
             }
         });
 
         Self {
             routing,
             topk_experts,
-            common_expert,
+            shared_experts,
         }
     }
 
@@ -228,7 +214,7 @@ impl MoEScratch {
                 token_indices: &self.topk_experts.token_indices,
                 route_indices: &self.topk_experts.route_indices,
                 routed_hidden: &self.topk_experts.routed_hidden,
-                sparse_activation: &self.topk_experts.sparse_activation,
+                sparse_swiglu: &self.topk_experts.sparse_swiglu,
                 expert_counts: &self.topk_experts.expert_counts,
                 expert_offsets: &self.topk_experts.expert_offsets,
                 expert_cursors: &self.topk_experts.expert_cursors,
@@ -240,9 +226,9 @@ impl MoEScratch {
         }
     }
 
-    pub fn common_expert_bindings(&self) -> Option<CommonExpertScratchBindings<'_>> {
-        self.common_expert.as_ref().map(|scratch| {
-            CommonExpertScratchBindings {
+    pub fn shared_experts_bindings(&self) -> Option<SharedExpertsScratchBindings<'_>> {
+        self.shared_experts.as_ref().map(|scratch| {
+            SharedExpertsScratchBindings {
                 hidden: &scratch.hidden,
                 gate_logits: &scratch.gate_logits,
                 dense_mlp: scratch.dense_mlp.bindings(),
@@ -257,8 +243,8 @@ fn affine_config(n: usize, k: usize, bits: u32, config: GatedMoEMetalConfig) -> 
         k: k.try_into().expect("MoE affine k must fit i32"),
         group_size: config.group_size.try_into().expect("MoE group size must fit i32"),
         bits: bits.try_into().expect("MoE bits must fit i32"),
-        input_dtype: config.dtype,
-        output_dtype: config.dtype,
-        scale_bias_dtype: config.dtype,
+        input_dtype: config.io_dtype,
+        output_dtype: config.io_dtype,
+        scale_bias_dtype: config.io_dtype,
     }
 }

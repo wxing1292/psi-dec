@@ -1,7 +1,7 @@
 # MoE Executor
 
 This document describes the current MoE implementation.
-It covers routing, backend path selection, expert execution, common-expert composition, tests, and production
+It covers routing, compute-path selection, expert execution, shared-expert composition, tests, and production
 benchmarks.
 
 ## Source layout
@@ -20,7 +20,7 @@ crates/inference-executor-core/src/mlp/moe/
 crates/inference-executor-metal/src/mlp/moe/
   mod.rs      Metal MoE module root
   backend.rs   GatedMoEMetalConfig + GatedMoE
-  scratch.rs   routing, top-k-expert, and optional common-expert scratch ownership and bindings
+  scratch.rs   routing, top-k-expert, and optional shared-expert scratch ownership and bindings
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/layer/moe.rs  Qwen3xMoE, private checkpoint weights, load, and record
@@ -54,7 +54,7 @@ crates/inference-backend-metal/src/components/
 model_layer_index
 hidden_dim
 intermediate_dim
-common_expert_intermediate_dim (optional and independent from routed expert intermediate_dim)
+shared_experts_intermediate_dim (optional and independent from routed expert intermediate_dim)
 num_experts
 num_experts_per_token
 norm_topk_prob
@@ -80,52 +80,58 @@ It selects one implementation from the active replay shape.
 The backend implements the executor `ReplayLayer` contract.
 Qwen model and layer code use this contract to append MoE work to a larger e2e replay.
 The contract has one semantic input, one output, and a caller-owned recorder.
-The semantic replay input can include a common/shared expert branch:
+The semantic replay input can include a shared-expert branch:
 
 ```text
 router projection -> route top-k -> dispatch -> sparse expert MLP
-common expert + common gate
-combine/scatter with common contribution
+shared expert + shared gate
+combine/scatter with shared contribution
 ```
 
-Current MoE replay records dispatch/layout as part of the selected token-major or expert-major path.
+Current MoE replay records dispatch/layout as part of the selected token-major or expert-major compute path.
 The scheduler does not own a separate dispatch phase.
 Model and layer wiring treat the full MoE MLP as one component boundary in a larger layer/model ICB.
 The MoE backend records internal barriers where commands have RAW dependencies.
-These barriers separate router projection and routing, dispatch and layout, expert compute, common-expert work, and
+These barriers separate router projection and routing, dispatch and layout, expert compute, shared-expert work, and
 combine/scatter.
 
 `GatedMoEMetalConfig` keeps expert quantization bits separate from router and shared-gate
 quantization bits:
 
 ```text
-bits              top-k expert and common-expert MLP projections
+bits              top-k expert and shared-expert MLP projections
 router_bits       MoE router projection
-common_gate_bits  common-expert gate projection
+shared_expert_gate_bits  shared-expert gate projection
 ```
 
-Qwen3.6-35B-A3B uses 4-bit expert MLPs and 8-bit router/common-gate tensors through config quantization overrides.
+Qwen3.6-35B-A3B uses 4-bit expert MLPs and 8-bit router/shared-gate tensors through config quantization overrides.
 The Qwen component geometry helper resolves these overrides during semantic load.
 Benches must not assume one global bit width for all projections in a MoE layer.
 
-The router and common-gate projections each use one adaptive affine operator.
+The router and shared-gate projections each use one adaptive affine operator.
 `GatedMoE` provides the fixed projection geometry and quantization layout when it creates each operator.
 It provides the current active token count when it records each projection.
 The affine operator selects QMV or a QMM tile.
 `GatedMoE` does not store separate QMV/QMM kernels or a projection threshold.
 
-`GatedMoECore::common_expert_intermediate_dim` is the only semantic source for common-expert presence and shape.
+`GatedMoECore::shared_experts_intermediate_dim` is the only semantic source for shared-expert presence and shape.
 Code must not infer this information from `intermediate_dim`.
-Routed and common experts can use different intermediate widths.
+Routed and shared experts can use different intermediate widths.
 
-Weight loading derives from `common_expert_intermediate_dim`.
-Common-expert MLP construction and optional scratch allocation also derive from it.
-The Qwen weight owner groups the common gate and dense expert under one optional owner.
-Thus, a partially populated common-expert branch is not representable.
+Weight loading derives from `shared_experts_intermediate_dim`.
+Shared-expert MLP construction and optional scratch allocation also derive from it.
+The Qwen weight owner groups the shared gate and dense expert under one optional owner.
+Thus, a partially populated shared-expert branch is not representable.
+
+The Qwen MoE weight owner loads one bounded `TensorMap` from the exact MoE binding subtree.
+It removes router, top-k expert, and optional shared-expert tensors from that map.
+The private sparse-expert owner consumes its gate/up/down subset without creating a second checkpoint owner.
+Each owner validates and materializes the backend-required persistent layout during initialization.
+The map must be empty after the complete MoE owner is constructed.
 
 `QuantizedSparseMLP` remains a lower-level expert compute component.
 It exposes token-major and expert-major sparse expert MLP compute.
-It does not own routing, dispatch, combine, common-expert work, or path selection.
+It does not own routing, dispatch, combine, shared-expert work, or compute-path selection.
 
 Its token-major shape is `{ num_routes, num_tokens }`.
 Its expert-major shape is `{ num_experts, num_routes }`.
@@ -147,7 +153,7 @@ GatedMoEReplayInput
   next_hidden_state &Buffer
   scratch  MoEScratchBindings
   weights  GatedMoEWeights
-  common_expert optional GatedMoECommonExpertReplayInput
+  shared_experts optional GatedMoESharedExpertsReplayInput
 ```
 
 Replay returns `next_hidden_state` directly.
@@ -157,7 +163,7 @@ Focused production-path tests use the same `ReplayLayer::record(...)` entrypoint
 The full-forward MoE benchmark composes the lower-level backend components directly.
 This benchmark-only composition can force each implementation without adding a force option to the production API.
 
-The no-common-expert replay order is:
+The no-shared-expert replay order is:
 
 ```text
 hidden_state
@@ -169,13 +175,13 @@ hidden_state
   -> next_hidden_state
 ```
 
-The shared-expert replay order adds the common branch before the final combine:
+The shared-expert replay order adds the shared branch before the final combine:
 
 ```text
 hidden_state
-  -> common dense expert
-  -> common gate projection
-  -> combine routed contribution + common contribution
+  -> shared dense expert
+  -> shared gate projection
+  -> combine routed contribution + shared contribution
 ```
 
 MoE routing is a two-stage contract.
@@ -194,14 +200,14 @@ The shape contract is exact for the current microbatch:
 ```text
 num_tokens              current microbatch token count
 num_routes              num_tokens * num_experts_per_token
-backend path            selected from num_tokens
+compute path            selected from num_tokens
 ```
 
 The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
 `MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
 
 Production callers may allocate scratch with the executor's maximum token capacity.
-Each replay invocation selects the backend path from the current `num_tokens`.
+Each replay invocation selects `GatedMoEComputePath` from the current `num_tokens`.
 It validates that capacity buffers cover the current route, input, and output shapes.
 The token-major path consumes `token_indices` and `route_indices` directly.
 
@@ -213,16 +219,16 @@ The inverse route map is part of the contract.
 
 Qwen model replay keeps MoE scratch in one model-owned `MoEScratch`.
 It owns three explicit regions.
-They are routing, `topk_experts`, and optional `common_expert`.
+They are routing, `topk_experts`, and optional `shared_experts`.
 `bindings()` exposes routing and top-k-expert scratch.
-`common_expert_bindings()` exposes the optional common-expert branch.
+`shared_experts_bindings()` exposes the optional shared-expert branch.
 
 The model stream serializes Main and MTP execution.
-Thus, MoE layers can reuse router logits/probs, route metadata, sparse activation, expert-major packing, and optional
-common-expert scratch.
+Thus, MoE layers can reuse router logits/probs, route metadata, sparse swiglu, expert-major packing, and optional
+shared-expert scratch.
 Qwen asserts that scratch layout determinants are uniform across all Main and MTP MoE layers.
 
-The shared `Qwen3xMoE` leaf owns per-layer router, top-k, and common-expert weights.
+The shared `Qwen3xMoE` leaf owns per-layer router, top-k, and shared-expert weights.
 The role-specific layer and scratch types own output buffers and composition.
 These types are `Qwen35MainLayer`/`Qwen35MainLayerScratch` and `Qwen35MTPLayer`/`Qwen35MTPLayerScratch`.
 
@@ -231,7 +237,7 @@ They are not request metadata.
 Qwen initializes them once in `MoEScratch`.
 Each replay consumes the prefix for the current route count.
 
-When a shared expert is present, the routed and common-expert branches form a fork/join data flow.
+When a shared expert is present, the routed and shared-expert branches form a fork/join data flow.
 Both branches read the same normalized hidden input.
 They write disjoint scratch buffers and join only at final combine/scatter.
 Recommendation: Do not insert a barrier between these branches unless they share a buffer.
@@ -303,15 +309,15 @@ Token-major sparse MLP keeps routes in original token-major order:
 input hidden[tokens, hidden_dim]
 token_indices[routes]       token row for each route
 expert_indices[routes]      selected expert for each route
-route_indices[routes]       activation row used by down projection
+route_indices[routes]       swiglu row used by down projection
 
 fused gate/up/silu
   reads input[token_indices[route]]
   reads expert_indices[route] expert weights
-  writes activation[route, intermediate_dim]
+  writes swiglu[route, intermediate_dim]
 
 down
-  reads activation[route_indices[route]]
+  reads swiglu[route_indices[route]]
   reads expert_indices[route] expert weights
   writes routed_hidden[route, hidden_dim]
 ```
@@ -358,10 +364,10 @@ pack_input
 
 ragged sparse expert MLP
   reads packed_input + experts_by_route + expert weights
-  writes route_output[expert_route, hidden_dim]
+  writes packed_output[expert_route, hidden_dim]
 
 scatter/combine
-  reads route_output via routes_by_token
+  reads packed_output via routes_by_token
   reads expert_probs[token_route]
   writes next_hidden_state[token, hidden_dim]
 ```
@@ -371,23 +377,23 @@ The contract requires compact expert grouping and a correct inverse map for scat
 Expert-major affine kernels can process the resulting contiguous ragged segments.
 They do not require a rectangular `experts * routes_per_expert` layout.
 
-### Combine and Common Expert
+### Combine and Shared Expert
 
-Without a shared/common expert, combine computes:
+Without a shared expert, combine computes:
 
 ```text
 next_hidden[token, dim] =
   sum_{slot in topk} expert_probs[token_route] * routed_hidden[token_route, dim]
 ```
 
-With a shared expert, the routed branch and common branch are a fork/join:
+With a shared expert, the routed branch and shared branch are a fork/join:
 
 ```text
 routed branch: hidden -> routing -> sparse expert MLP -> routed contribution
-common branch: hidden -> common dense expert, hidden -> common gate projection
+shared branch: hidden -> shared dense expert, hidden -> shared gate projection
 
 next_hidden[token, dim] =
-  routed_sum[token, dim] + sigmoid(common_gate[token]) * common_hidden[token, dim]
+  routed_sum[token, dim] + sigmoid(shared_expert_gate[token]) * shared_hidden[token, dim]
 ```
 
 The branches read the same normalized hidden input and write disjoint scratch.
@@ -396,11 +402,11 @@ Recommendation: Add replay barriers only at these actual dependencies:
 - Router logits before softmax.
 - Probabilities before routing.
 - Routing/layout before sparse expert compute.
-- Expert output and common branch before final combine or scatter.
+- Expert output and shared branch before final combine or scatter.
 
 ### Backend selection boundary
 
-`GatedMoE` owns backend path selection.
+`GatedMoE` owns compute-path selection.
 `QuantizedSparseMLP` owns only expert inner compute.
 The current production selector is:
 
@@ -433,7 +439,7 @@ cargo bench -p inference-backend-metal --bench sparse_mlp
 
 The benches include Metal replay/ICB cases for MoE routing/combine.
 They include token-major sparse expert forward paths.
-Synthetic forward cases record router projection, routing, sparse expert MLP, common expert MLP, common gate, and
+Synthetic forward cases record router projection, routing, sparse expert MLP, shared expert MLP, shared gate, and
 scatter/combine.
 They record these operations in one batch.
 Token-major and expert-major implementations remain explicit replay cases.

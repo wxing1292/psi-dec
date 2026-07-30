@@ -1,56 +1,45 @@
-use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 
-use crate::mlp::dense::backend::DenseMLPMetalConfig;
-
 pub struct DenseMLPScratch {
-    gate_up_proj: Buffer,
-    activation: Buffer,
+    gate_up: Buffer,
+    swiglu: Buffer,
 }
 
 #[derive(Clone, Copy)]
 pub struct DenseMLPScratchBindings<'a> {
-    pub gate_up_proj: &'a Buffer,
-    pub activation: &'a Buffer,
+    pub gate_up: &'a Buffer,
+    pub swiglu: &'a Buffer,
 }
 
 impl DenseMLPScratch {
-    pub fn new(device: &Device, core: &DenseMLPCore, config: DenseMLPMetalConfig, max_tokens: usize) -> Self {
+    pub fn new(device: &Device, core: &DenseMLPCore, io_dtype: Dtype, max_tokens: usize) -> Self {
         core.validate();
-        config.validate();
         assert!(max_tokens > 0);
-
-        let backend_config = QuantizedDenseMLPConfig {
-            hidden_dim: core.hidden_dim.try_into().expect("dense MLP hidden_dim must fit u32"),
-            intermediate_dim: core
-                .intermediate_dim
-                .try_into()
-                .expect("dense MLP intermediate_dim must fit u32"),
-            group_size: config.group_size,
-            bits: config.bits,
-            dtype: config.dtype,
-        };
-        let shape = QuantizedDenseMLPShape {
-            num_tokens: max_tokens
-                .try_into()
-                .expect("dense MLP scratch token capacity must fit u32"),
-        };
-        let max_tokens_i32 = max_tokens
-            .try_into()
-            .expect("dense MLP scratch token capacity must fit i32");
+        match io_dtype {
+            Dtype::Bfloat16 => {},
+            Dtype::Float32 => todo!("F32 dense MLP model boundary is not supported"),
+            dtype => panic!("unsupported dense MLP model boundary dtype {dtype:?}"),
+        }
+        let gate_up_elements = max_tokens
+            .checked_mul(core.intermediate_dim)
+            .and_then(|count| count.checked_mul(2))
+            .expect("dense MLP gate-up scratch element capacity must fit usize");
+        let swiglu_elements = max_tokens
+            .checked_mul(core.intermediate_dim)
+            .expect("dense MLP SwiGLU scratch element capacity must fit usize");
         Self {
-            gate_up_proj: Buffer::new_zeroed(device, backend_config.gate_up_config().output_bytes(max_tokens_i32)),
-            activation: Buffer::new_zeroed(device, backend_config.activation_shape(shape).bytes()),
+            gate_up: Buffer::new_zeroed_elements(device, gate_up_elements, io_dtype),
+            swiglu: Buffer::new_zeroed_elements(device, swiglu_elements, io_dtype),
         }
     }
 
     pub fn bindings(&self) -> DenseMLPScratchBindings<'_> {
         DenseMLPScratchBindings {
-            gate_up_proj: &self.gate_up_proj,
-            activation: &self.activation,
+            gate_up: &self.gate_up,
+            swiglu: &self.swiglu,
         }
     }
 }

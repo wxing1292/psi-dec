@@ -6,9 +6,9 @@ use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
 use inference_backend_metal::components::QuantizedSparseMLPConfig;
+use inference_backend_metal::components::QuantizedSparseMLPScratch;
 use inference_backend_metal::components::QuantizedSparseMLPTokenMajorBuffers;
 use inference_backend_metal::components::QuantizedSparseMLPTokenMajorKernels;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorScratch;
 use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
 use inference_backend_metal::components::QuantizedSparseMLPWeights;
 use inference_backend_metal::metal::Buffer;
@@ -50,14 +50,14 @@ fn bench_sparse_mlp(c: &mut Criterion) {
         ));
         group.bench_function(
             format!(
-                "{SPARSE_MLP_PROFILE}/token_major/fused_gate_up_silu/num_tokens{num_tokens}/topk{TOPK_EXPERTS}/\
+                "{SPARSE_MLP_PROFILE}/token_major/gate_up_swiglu/num_tokens{num_tokens}/topk{TOPK_EXPERTS}/\
                  hidden{SPARSE_MLP_HIDDEN_DIM}/intermediate{SPARSE_MLP_INTERMEDIATE_DIM}/\
                  experts{SPARSE_MLP_NUM_EXPERTS}"
             ),
             |b| {
                 b.iter(|| {
-                    sparse_mlp.forward_gate_up_silu();
-                    black_box(&sparse_mlp.scratch.activation);
+                    sparse_mlp.forward_gate_up_swiglu();
+                    black_box(&sparse_mlp.scratch.swiglu);
                 });
             },
         );
@@ -70,7 +70,7 @@ fn bench_sparse_mlp(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     sparse_mlp.replay_token_major();
-                    black_box(&sparse_mlp.buffers.output);
+                    black_box(&sparse_mlp.buffers.routed_hidden);
                 });
             },
         );
@@ -83,7 +83,7 @@ fn bench_sparse_mlp(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     fixed_topk_sparse_mlp.replay_token_major();
-                    black_box(&fixed_topk_sparse_mlp.buffers.output);
+                    black_box(&fixed_topk_sparse_mlp.buffers.routed_hidden);
                 });
             },
         );
@@ -99,7 +99,7 @@ struct QuantizedSparseMLPFixture {
     buffers: QuantizedSparseMLPOwnedBuffers,
     scratch: QuantizedSparseMLPOwnedScratch,
     weights: QuantizedSparseMLPOwnedWeights,
-    gate_up_silu_replay: ReplayProgram,
+    gate_up_swiglu_replay: ReplayProgram,
     token_major_replay: ReplayProgram,
 }
 
@@ -126,6 +126,7 @@ impl QuantizedSparseMLPFixture {
 
     fn new_with_expert_indices(device: &Device, num_tokens: u32, expert_indices_values: Vec<u32>) -> Self {
         let config = QuantizedSparseMLPConfig {
+            num_experts: SPARSE_MLP_NUM_EXPERTS,
             hidden_dim: SPARSE_MLP_HIDDEN_DIM,
             intermediate_dim: SPARSE_MLP_INTERMEDIATE_DIM,
             group_size: SPARSE_MLP_GROUP_SIZE,
@@ -136,8 +137,8 @@ impl QuantizedSparseMLPFixture {
             num_routes: num_tokens * TOPK_EXPERTS,
             num_tokens,
         };
-        let fused_gate_up_silu_shape = config.token_major_fused_gate_up_silu_shape(shape);
-        let down_shape = config.token_major_down_shape(shape);
+        let gate_up_config = config.gate_up_config();
+        let down_config = config.down_config();
         let stream = Stream::new(device);
         let sparse_mlp = QuantizedSparseMLPTokenMajorKernels::new(device, config);
         let buffers = QuantizedSparseMLPOwnedBuffers {
@@ -148,57 +149,54 @@ impl QuantizedSparseMLPFixture {
             token_indices: Buffer::from_slice(device, &token_route_indices(num_tokens as usize, TOPK_EXPERTS as usize)),
             expert_indices: Buffer::from_slice(device, &expert_indices_values),
             route_indices: Buffer::from_slice(device, &identity_indices((num_tokens * TOPK_EXPERTS) as usize)),
-            output: Buffer::new_zeroed(device, config.token_major_output_bytes(shape)),
+            routed_hidden: Buffer::new_zeroed(device, config.token_major_output_bytes(shape)),
         };
         let scratch = QuantizedSparseMLPOwnedScratch {
-            activation: Buffer::new_zeroed(device, config.activation_bytes(shape.num_routes)),
+            swiglu: Buffer::new_zeroed(device, config.swiglu_bytes(shape.num_routes)),
         };
         let weights = QuantizedSparseMLPOwnedWeights {
-            gate_weight: quantized_weight_stack(device, fused_gate_up_silu_shape.weight_bytes_per_expert()),
+            gate_weight: quantized_weight_stack(device, gate_up_config.weight_bytes_per_expert()),
             gate_scales: bf16_buffer(
                 device,
                 &affine_param_fixture(
-                    SPARSE_MLP_NUM_EXPERTS as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert()
-                        / size_of::<u16>(),
+                    SPARSE_MLP_NUM_EXPERTS as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
                 ),
             ),
             gate_biases: bf16_buffer(
                 device,
                 &zero_fixture(
-                    SPARSE_MLP_NUM_EXPERTS as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert()
-                        / size_of::<u16>(),
+                    SPARSE_MLP_NUM_EXPERTS as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
                 ),
             ),
-            up_weight: quantized_weight_stack(device, fused_gate_up_silu_shape.weight_bytes_per_expert()),
+            up_weight: quantized_weight_stack(device, gate_up_config.weight_bytes_per_expert()),
             up_scales: bf16_buffer(
                 device,
                 &affine_param_fixture(
-                    SPARSE_MLP_NUM_EXPERTS as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert()
-                        / size_of::<u16>(),
+                    SPARSE_MLP_NUM_EXPERTS as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
                 ),
             ),
             up_biases: bf16_buffer(
                 device,
                 &zero_fixture(
-                    SPARSE_MLP_NUM_EXPERTS as usize * fused_gate_up_silu_shape.affine_param_bytes_per_expert()
-                        / size_of::<u16>(),
+                    SPARSE_MLP_NUM_EXPERTS as usize * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>(),
                 ),
             ),
-            down_weight: quantized_weight_stack(device, down_shape.weight_bytes_per_expert()),
+            down_weight: quantized_weight_stack(device, down_config.weight_bytes_per_expert()),
             down_scales: bf16_buffer(
                 device,
                 &affine_param_fixture(
-                    SPARSE_MLP_NUM_EXPERTS as usize * down_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+                    SPARSE_MLP_NUM_EXPERTS as usize * down_config.affine_param_bytes_per_expert() / size_of::<u16>(),
                 ),
             ),
             down_biases: bf16_buffer(
                 device,
                 &zero_fixture(
-                    SPARSE_MLP_NUM_EXPERTS as usize * down_shape.affine_param_bytes_per_expert() / size_of::<u16>(),
+                    SPARSE_MLP_NUM_EXPERTS as usize * down_config.affine_param_bytes_per_expert() / size_of::<u16>(),
                 ),
             ),
         };
-        let gate_up_silu_replay = build_gate_up_silu_replay(&stream, &sparse_mlp, shape, &buffers, &scratch, &weights);
+        let gate_up_swiglu_replay =
+            build_gate_up_swiglu_replay(&stream, &sparse_mlp, shape, &buffers, &scratch, &weights);
         let token_major_replay = build_token_major_replay(&stream, &sparse_mlp, shape, &buffers, &scratch, &weights);
         let fixture = Self {
             stream,
@@ -207,15 +205,15 @@ impl QuantizedSparseMLPFixture {
             buffers,
             scratch,
             weights,
-            gate_up_silu_replay,
+            gate_up_swiglu_replay,
             token_major_replay,
         };
         fixture.replay_token_major();
         fixture
     }
 
-    fn forward_gate_up_silu(&self) {
-        self.stream.submit_replay(&self.gate_up_silu_replay).wait();
+    fn forward_gate_up_swiglu(&self) {
+        self.stream.submit_replay(&self.gate_up_swiglu_replay).wait();
     }
 
     fn replay_token_major(&self) {
@@ -228,11 +226,11 @@ struct QuantizedSparseMLPOwnedBuffers {
     token_indices: Buffer,
     expert_indices: Buffer,
     route_indices: Buffer,
-    output: Buffer,
+    routed_hidden: Buffer,
 }
 
 struct QuantizedSparseMLPOwnedScratch {
-    activation: Buffer,
+    swiglu: Buffer,
 }
 
 struct QuantizedSparseMLPOwnedWeights {
@@ -251,7 +249,7 @@ fn quantized_weight_stack(device: &Device, bytes_per_expert: usize) -> Buffer {
     quantized_weight_stack_for_experts(device, SPARSE_MLP_NUM_EXPERTS as usize, bytes_per_expert)
 }
 
-fn build_gate_up_silu_replay(
+fn build_gate_up_swiglu_replay(
     stream: &Stream,
     sparse_mlp: &QuantizedSparseMLPTokenMajorKernels,
     shape: QuantizedSparseMLPTokenMajorShape,
@@ -260,17 +258,17 @@ fn build_gate_up_silu_replay(
     weights: &QuantizedSparseMLPOwnedWeights,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(sparse_mlp.invoke_fused_gate_up_silu(
+    builder.record(sparse_mlp.invoke_gate_up_swiglu(
         shape,
         QuantizedSparseMLPTokenMajorBuffers {
             input: &buffers.input,
             token_indices: &buffers.token_indices,
             expert_indices: &buffers.expert_indices,
             route_indices: &buffers.route_indices,
-            output: &buffers.output,
+            routed_hidden: &buffers.routed_hidden,
         },
-        QuantizedSparseMLPTokenMajorScratch {
-            activation: &scratch.activation,
+        QuantizedSparseMLPScratch {
+            swiglu: &scratch.swiglu,
         },
         owned_weights(weights),
     ));
@@ -293,10 +291,10 @@ fn build_token_major_replay(
             token_indices: &buffers.token_indices,
             expert_indices: &buffers.expert_indices,
             route_indices: &buffers.route_indices,
-            output: &buffers.output,
+            routed_hidden: &buffers.routed_hidden,
         },
-        QuantizedSparseMLPTokenMajorScratch {
-            activation: &scratch.activation,
+        QuantizedSparseMLPScratch {
+            swiglu: &scratch.swiglu,
         },
         owned_weights(weights),
     ));

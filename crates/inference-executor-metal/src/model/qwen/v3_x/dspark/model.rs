@@ -97,7 +97,7 @@ impl Qwen3xDSparkModel {
         let dense_scratch = Rc::new(DenseMLPScratch::new(
             device,
             &first_layer.mlp_core,
-            first_layer.mlp_metal,
+            first_layer.mlp_metal.io_dtype,
             max_block_tokens,
         ));
         let main_feature_projector = Rc::new(Qwen3xDSparkMainFeatureProjector::load(

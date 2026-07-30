@@ -4,6 +4,7 @@ use inference_backend_metal::components::QuantizedSparseMLPWeights;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::moe::GatedMoECore;
@@ -16,17 +17,17 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::moe::backend::GatedMoE;
-use crate::mlp::moe::backend::GatedMoECommonExpertReplayInput;
-use crate::mlp::moe::backend::GatedMoECommonExpertWeights;
 use crate::mlp::moe::backend::GatedMoEMetalConfig;
 use crate::mlp::moe::backend::GatedMoEReplayInput;
+use crate::mlp::moe::backend::GatedMoESharedExpertsReplayInput;
+use crate::mlp::moe::backend::GatedMoESharedExpertsWeights;
 use crate::mlp::moe::backend::GatedMoEWeights;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::qwen::v3_x::layer::dense_mlp::DenseMLPWeightBuffers;
 use crate::model::qwen::v3_x::weight::affine_config;
-use crate::model::qwen::v3_x::weight::quant_weight;
+use crate::model::qwen::v3_x::weight::remove_quant_weight;
+use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::sparse_affine_layout;
-use crate::model::qwen::v3_x::weight::typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xMoE {
@@ -55,17 +56,17 @@ impl Qwen3xMoE {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let common_expert = self.weights.common_expert.as_ref().map(|weights| {
-            GatedMoECommonExpertReplayInput {
+        let shared_experts = self.weights.shared_experts.as_ref().map(|weights| {
+            GatedMoESharedExpertsReplayInput {
                 scratch: self
                     .scratch
-                    .common_expert_bindings()
-                    .expect("qwen3.x common-expert weights require common-expert scratch"),
-                weights: GatedMoECommonExpertWeights {
-                    common_gate_weight: &weights.gate_weight,
-                    common_gate_scales: &weights.gate_scales,
-                    common_gate_biases: &weights.gate_biases,
-                    common_expert: weights.mlp.as_borrowed(),
+                    .shared_experts_bindings()
+                    .expect("qwen3.x shared-expert weights require shared-expert scratch"),
+                weights: GatedMoESharedExpertsWeights {
+                    shared_expert_gate_weight: &weights.gate_weight,
+                    shared_expert_gate_scales: &weights.gate_scales,
+                    shared_expert_gate_biases: &weights.gate_biases,
+                    shared_experts: weights.mlp.as_borrowed(),
                 },
             }
         });
@@ -83,7 +84,7 @@ impl Qwen3xMoE {
                     router_biases: &self.weights.router_biases,
                     topk_experts: self.weights.experts.as_borrowed(),
                 },
-                common_expert,
+                shared_experts,
             },
         );
     }
@@ -94,7 +95,7 @@ struct Qwen3xMoEWeights {
     router_scales: Buffer,
     router_biases: Buffer,
     experts: Qwen3xSparseExpertWeights,
-    common_expert: Option<Qwen3xCommonExpertWeightBuffers>,
+    shared_experts: Option<Qwen3xSharedExpertsWeightBuffers>,
 }
 
 struct Qwen3xSparseExpertWeights {
@@ -109,7 +110,7 @@ struct Qwen3xSparseExpertWeights {
     down_biases: Buffer,
 }
 
-struct Qwen3xCommonExpertWeightBuffers {
+struct Qwen3xSharedExpertsWeightBuffers {
     gate_weight: Buffer,
     gate_scales: Buffer,
     gate_biases: Buffer,
@@ -124,6 +125,21 @@ impl Qwen3xMoEWeights {
         core: &GatedMoECore,
         metal: GatedMoEMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
+        let mut tensor_names = Vec::new();
+        bindings.push_tensor_names(&mut tensor_names);
+        let mut tensors = store.load_tensors(tensor_names)?;
+        let weights = Self::from_tensors(device, &mut tensors, bindings, core, metal)?;
+        assert!(tensors.is_empty(), "MoE must consume its tensor map");
+        Ok(weights)
+    }
+
+    fn from_tensors(
+        device: &Device,
+        tensors: &mut TensorMap,
+        bindings: &Qwen3xMoEWeightBindings,
+        core: &GatedMoECore,
+        metal: GatedMoEMetalConfig,
+    ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
         let router_config = affine_config(
@@ -131,13 +147,15 @@ impl Qwen3xMoEWeights {
             core.hidden_dim,
             metal.group_size,
             metal.router_bits,
-            metal.dtype,
-            metal.dtype,
-            metal.dtype,
+            metal.io_dtype,
+            metal.io_dtype,
+            metal.io_dtype,
         );
-        let router_weight = quant_weight(store, &bindings.router.weight)?;
-        let router_scales = typed_tensor(store, &bindings.router.scales, safetensors::Dtype::BF16)?.into_data();
-        let router_biases = typed_tensor(store, &bindings.router.biases, safetensors::Dtype::BF16)?.into_data();
+        let router_weight = remove_quant_weight(tensors, &bindings.router.weight)?;
+        let router_scales =
+            remove_typed_tensor(tensors, &bindings.router.scales, safetensors::Dtype::BF16)?.into_data();
+        let router_biases =
+            remove_typed_tensor(tensors, &bindings.router.biases, safetensors::Dtype::BF16)?.into_data();
         validate_len(
             "sparse router weight",
             router_weight.len(),
@@ -154,63 +172,71 @@ impl Qwen3xMoEWeights {
             router_config.scale_or_bias_bytes(),
         )?;
 
-        let experts = Qwen3xSparseExpertWeights::load(device, store, &bindings.experts, core, metal)?;
-        let common_expert = if let Some(common_expert_intermediate_dim) = core.common_expert_intermediate_dim {
+        let experts = Qwen3xSparseExpertWeights::from_tensors(device, tensors, &bindings.experts, core, metal)?;
+        let shared_experts = if let Some(shared_experts_intermediate_dim) = core.shared_experts_intermediate_dim {
             let gate_bindings = bindings
                 .shared_expert_gate
                 .as_ref()
-                .expect("qwen3.x common expert geometry requires shared expert gate bindings");
+                .expect("qwen3.x shared expert geometry requires shared expert gate bindings");
             let expert_bindings = bindings
                 .shared_expert
                 .as_ref()
-                .expect("qwen3.x common expert geometry requires shared expert bindings");
+                .expect("qwen3.x shared expert geometry requires shared expert bindings");
             let gate_config = affine_config(
                 1,
                 core.hidden_dim,
                 metal.group_size,
-                metal.common_gate_bits,
-                metal.dtype,
-                metal.dtype,
-                metal.dtype,
+                metal.shared_expert_gate_bits,
+                metal.io_dtype,
+                metal.io_dtype,
+                metal.io_dtype,
             );
-            let gate_weight = quant_weight(store, &gate_bindings.weight)?;
-            let gate_scales = typed_tensor(store, &gate_bindings.scales, safetensors::Dtype::BF16)?.into_data();
-            let gate_biases = typed_tensor(store, &gate_bindings.biases, safetensors::Dtype::BF16)?.into_data();
+            let gate_weight = remove_quant_weight(tensors, &gate_bindings.weight)?;
+            let gate_scales =
+                remove_typed_tensor(tensors, &gate_bindings.scales, safetensors::Dtype::BF16)?.into_data();
+            let gate_biases =
+                remove_typed_tensor(tensors, &gate_bindings.biases, safetensors::Dtype::BF16)?.into_data();
             validate_len(
-                "sparse shared gate weight",
+                "sparse shared expert gate weight",
                 gate_weight.len(),
                 gate_config.weight_bytes(),
             )?;
             validate_len(
-                "sparse shared gate scales",
+                "sparse shared expert gate scales",
                 gate_scales.len(),
                 gate_config.scale_or_bias_bytes(),
             )?;
             validate_len(
-                "sparse shared gate biases",
+                "sparse shared expert gate biases",
                 gate_biases.len(),
                 gate_config.scale_or_bias_bytes(),
             )?;
-            let common_core = DenseMLPCore {
+            let shared_experts_core = DenseMLPCore {
                 model_layer_index: core.model_layer_index,
                 hidden_dim: core.hidden_dim,
-                intermediate_dim: common_expert_intermediate_dim,
+                intermediate_dim: shared_experts_intermediate_dim,
             };
-            let common_metal = DenseMLPMetalConfig {
+            let shared_experts_metal = DenseMLPMetalConfig {
                 group_size: metal.group_size,
                 bits: metal.bits,
-                dtype: metal.dtype,
+                io_dtype: metal.io_dtype,
             };
-            Some(Qwen3xCommonExpertWeightBuffers {
+            Some(Qwen3xSharedExpertsWeightBuffers {
                 gate_weight: Buffer::from_slice(device, &gate_weight),
                 gate_scales: Buffer::from_slice(device, &gate_scales),
                 gate_biases: Buffer::from_slice(device, &gate_biases),
-                mlp: DenseMLPWeightBuffers::load(device, store, expert_bindings, &common_core, common_metal)?,
+                mlp: DenseMLPWeightBuffers::from_tensors(
+                    device,
+                    tensors,
+                    expert_bindings,
+                    &shared_experts_core,
+                    shared_experts_metal,
+                )?,
             })
         } else {
             assert!(
                 bindings.shared_expert_gate.is_none() && bindings.shared_expert.is_none(),
-                "qwen3.x MoE without common expert geometry must not bind common expert tensors"
+                "qwen3.x MoE without shared expert geometry must not bind shared expert tensors"
             );
             None
         };
@@ -219,30 +245,30 @@ impl Qwen3xMoEWeights {
             router_scales: Buffer::from_slice(device, &router_scales),
             router_biases: Buffer::from_slice(device, &router_biases),
             experts,
-            common_expert,
+            shared_experts,
         })
     }
 }
 
 impl Qwen3xSparseExpertWeights {
-    fn load(
+    fn from_tensors(
         device: &Device,
-        store: &mut SafeTensorStore,
+        tensors: &mut TensorMap,
         bindings: &Qwen3xSparseExpertWeightBindings,
         core: &GatedMoECore,
         metal: GatedMoEMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
         let expert_gate_layout = sparse_affine_layout(core.num_experts, core.intermediate_dim, core.hidden_dim, metal);
         let expert_down_layout = sparse_affine_layout(core.num_experts, core.hidden_dim, core.intermediate_dim, metal);
-        let gate_weight = quant_weight(store, &bindings.gate.weight)?;
-        let gate_scales = typed_tensor(store, &bindings.gate.scales, safetensors::Dtype::BF16)?.into_data();
-        let gate_biases = typed_tensor(store, &bindings.gate.biases, safetensors::Dtype::BF16)?.into_data();
-        let up_weight = quant_weight(store, &bindings.up.weight)?;
-        let up_scales = typed_tensor(store, &bindings.up.scales, safetensors::Dtype::BF16)?.into_data();
-        let up_biases = typed_tensor(store, &bindings.up.biases, safetensors::Dtype::BF16)?.into_data();
-        let down_weight = quant_weight(store, &bindings.down.weight)?;
-        let down_scales = typed_tensor(store, &bindings.down.scales, safetensors::Dtype::BF16)?.into_data();
-        let down_biases = typed_tensor(store, &bindings.down.biases, safetensors::Dtype::BF16)?.into_data();
+        let gate_weight = remove_quant_weight(tensors, &bindings.gate.weight)?;
+        let gate_scales = remove_typed_tensor(tensors, &bindings.gate.scales, safetensors::Dtype::BF16)?.into_data();
+        let gate_biases = remove_typed_tensor(tensors, &bindings.gate.biases, safetensors::Dtype::BF16)?.into_data();
+        let up_weight = remove_quant_weight(tensors, &bindings.up.weight)?;
+        let up_scales = remove_typed_tensor(tensors, &bindings.up.scales, safetensors::Dtype::BF16)?.into_data();
+        let up_biases = remove_typed_tensor(tensors, &bindings.up.biases, safetensors::Dtype::BF16)?.into_data();
+        let down_weight = remove_quant_weight(tensors, &bindings.down.weight)?;
+        let down_scales = remove_typed_tensor(tensors, &bindings.down.scales, safetensors::Dtype::BF16)?.into_data();
+        let down_biases = remove_typed_tensor(tensors, &bindings.down.biases, safetensors::Dtype::BF16)?.into_data();
         validate_len(
             "sparse expert gate weight",
             gate_weight.len(),

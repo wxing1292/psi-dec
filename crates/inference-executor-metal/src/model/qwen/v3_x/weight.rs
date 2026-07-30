@@ -96,7 +96,7 @@ pub fn sparse_affine_layout(
         input_dim,
         group_size: metal.group_size as usize,
         bits: metal.bits as usize,
-        scale_bias_dtype: metal.dtype,
+        scale_bias_dtype: metal.io_dtype,
     }
 }
 

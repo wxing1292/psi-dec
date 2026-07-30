@@ -253,7 +253,7 @@ impl BlockFixture {
                 .expect("qwen3.5 layer bench dense schedule must contain a dense layer");
             let (core, metal) = qwen35_dense_mlp_core_and_metal(index, &config.text_config, defaults)
                 .expect("qwen3.5 layer bench requires valid dense MLP geometry");
-            Rc::new(DenseMLPScratch::new(device, &core, metal, max_tokens))
+            Rc::new(DenseMLPScratch::new(device, &core, metal.io_dtype, max_tokens))
         });
         let moe_scratch = counts.has_moe.then(|| {
             let index = (0..config.text_config.num_hidden_layers)

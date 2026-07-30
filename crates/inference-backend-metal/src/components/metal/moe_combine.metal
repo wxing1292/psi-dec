@@ -29,7 +29,7 @@ static inline float combine_topk(
     return acc;
 }
 
-kernel void moe_combine_without_common(
+kernel void moe_combine_without_shared_experts(
     device const bfloat16_t* routed_hidden [[buffer(0)]],
     device const float* routed_probs [[buffer(1)]],
     device bfloat16_t* output [[buffer(2)]],
@@ -45,11 +45,11 @@ kernel void moe_combine_without_common(
     write_bf16(output, gid, combine_topk(routed_hidden, routed_probs, token, dim, num_experts_per_token, hidden_dim));
 }
 
-kernel void moe_combine_with_common(
+kernel void moe_combine_with_shared_experts(
     device const bfloat16_t* routed_hidden [[buffer(0)]],
     device const float* routed_probs [[buffer(1)]],
-    device const bfloat16_t* common_hidden [[buffer(2)]],
-    device const bfloat16_t* common_gate_logits [[buffer(3)]],
+    device const bfloat16_t* shared_hidden [[buffer(2)]],
+    device const bfloat16_t* shared_expert_gate_logits [[buffer(3)]],
     device bfloat16_t* output [[buffer(4)]],
     constant uint& num_tokens [[buffer(5)]],
     constant uint& num_experts_per_token [[buffer(6)]],
@@ -69,7 +69,7 @@ kernel void moe_combine_with_common(
         num_experts_per_token,
         hidden_dim
     )));
-    const float common_gate = 1.0f / (1.0f + metal::exp(-read_bf16(common_gate_logits, token)));
-    const float value = routed_output + common_gate * read_bf16(common_hidden, gid);
+    const float shared_expert_gate = 1.0f / (1.0f + metal::exp(-read_bf16(shared_expert_gate_logits, token)));
+    const float value = routed_output + shared_expert_gate * read_bf16(shared_hidden, gid);
     write_bf16(output, gid, value);
 }

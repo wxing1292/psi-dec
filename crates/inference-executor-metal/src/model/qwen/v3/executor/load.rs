@@ -297,7 +297,7 @@ fn init_qwen_3_model_inner(
     let dense_scratch = Rc::new(DenseMLPScratch::new(
         &device,
         &dense_core,
-        dense_metal,
+        dense_metal.io_dtype,
         config.max_tokens,
     ));
 

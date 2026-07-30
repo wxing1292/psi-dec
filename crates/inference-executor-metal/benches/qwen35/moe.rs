@@ -7,30 +7,32 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
-use inference_backend_metal::components::MoECombineKernel;
-use inference_backend_metal::components::MoECombineWithCommonBuffers;
-use inference_backend_metal::components::MoECombineWithCommonShape;
+use inference_backend_metal::components::MoECombineConfig;
+use inference_backend_metal::components::MoECombineKernels;
+use inference_backend_metal::components::MoECombineShape;
+use inference_backend_metal::components::MoECombineWithSharedExpertsBuffers;
+use inference_backend_metal::components::MoEExpertMajorConfig;
 use inference_backend_metal::components::MoEExpertMajorKernels;
 use inference_backend_metal::components::MoEExpertMajorLayoutBuffers;
 use inference_backend_metal::components::MoEExpertMajorPackInputBuffers;
-use inference_backend_metal::components::MoEExpertMajorScatterWithCommonBuffers;
+use inference_backend_metal::components::MoEExpertMajorScatterWithSharedExpertsBuffers;
 use inference_backend_metal::components::MoEExpertMajorShape;
 use inference_backend_metal::components::MoERoutingBuffers;
+use inference_backend_metal::components::MoERoutingConfig;
 use inference_backend_metal::components::MoERoutingKernel;
 use inference_backend_metal::components::MoERoutingShape;
+use inference_backend_metal::components::QuantizedDenseMLP;
 use inference_backend_metal::components::QuantizedDenseMLPBuffers;
 use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPKernels;
 use inference_backend_metal::components::QuantizedDenseMLPScratch;
 use inference_backend_metal::components::QuantizedDenseMLPShape;
 use inference_backend_metal::components::QuantizedDenseMLPWeights;
 use inference_backend_metal::components::QuantizedSparseMLP;
 use inference_backend_metal::components::QuantizedSparseMLPConfig;
 use inference_backend_metal::components::QuantizedSparseMLPExpertMajorBuffers;
-use inference_backend_metal::components::QuantizedSparseMLPExpertMajorScratch;
 use inference_backend_metal::components::QuantizedSparseMLPExpertMajorShape;
+use inference_backend_metal::components::QuantizedSparseMLPScratch;
 use inference_backend_metal::components::QuantizedSparseMLPTokenMajorBuffers;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorScratch;
 use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
 use inference_backend_metal::components::QuantizedSparseMLPWeights;
 use inference_backend_metal::metal::Buffer;
@@ -40,15 +42,17 @@ use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::SoftmaxBuffers;
+use inference_backend_metal::operators::SoftmaxConfig;
 use inference_backend_metal::operators::SoftmaxKernel;
 use inference_backend_metal::operators::SoftmaxShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
 use inference_executor_metal::mlp::dense::scratch::DenseMLPScratchBindings;
-use inference_executor_metal::mlp::moe::scratch::CommonExpertScratchBindings;
 use inference_executor_metal::mlp::moe::scratch::MoERoutingScratchBindings;
 use inference_executor_metal::mlp::moe::scratch::MoEScratchBindings;
+use inference_executor_metal::mlp::moe::scratch::SharedExpertsScratchBindings;
 use inference_executor_metal::mlp::moe::scratch::TopKExpertsScratchBindings;
 use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
@@ -168,14 +172,14 @@ impl MoERealImpl {
 }
 
 struct ForcedMoEKernels {
-    router_projection: AffineQuantizedMatmul,
+    router: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
     routing: MoERoutingKernel,
     expert_major: MoEExpertMajorKernels,
     experts: QuantizedSparseMLP,
-    common_expert: QuantizedDenseMLPKernels,
-    common_gate_projection: AffineQuantizedMatmul,
-    combine: MoECombineKernel,
+    shared_experts: QuantizedDenseMLP,
+    shared_expert_gate: AffineQuantizedMatmul,
+    combine: MoECombineKernels,
 }
 
 #[derive(Clone, Copy)]
@@ -184,31 +188,29 @@ struct ForcedMoEWeights<'a> {
     router_scales: &'a Buffer,
     router_biases: &'a Buffer,
     experts: QuantizedSparseMLPWeights<'a>,
-    common_expert: QuantizedDenseMLPWeights<'a>,
-    common_gate_weight: &'a Buffer,
-    common_gate_scales: &'a Buffer,
-    common_gate_biases: &'a Buffer,
+    shared_experts: QuantizedDenseMLPWeights<'a>,
+    shared_expert_gate_weight: &'a Buffer,
+    shared_expert_gate_scales: &'a Buffer,
+    shared_expert_gate_biases: &'a Buffer,
 }
 
 impl ForcedMoEKernels {
-    fn new(device: &Device, max_tokens: u32) -> Self {
-        assert!(max_tokens > 0, "forced MoE bench requires token capacity");
+    fn new(device: &Device) -> Self {
         Self {
-            router_projection: AffineQuantizedMatmul::new(device, affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS)),
+            router: AffineQuantizedMatmul::new(device, affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS)),
             router_softmax: SoftmaxKernel::new(
                 device,
-                SoftmaxShape {
-                    num_rows: max_tokens,
+                SoftmaxConfig {
                     num_values_per_row: NUM_EXPERTS,
                     dtype: Dtype::Bfloat16,
                 },
             ),
-            routing: MoERoutingKernel::new(device),
-            expert_major: MoEExpertMajorKernels::new(device),
+            routing: MoERoutingKernel::new(device, routing_config()),
+            expert_major: MoEExpertMajorKernels::new(device, expert_major_config()),
             experts: QuantizedSparseMLP::new(device, sparse_config()),
-            common_expert: QuantizedDenseMLPKernels::new(device, dense_config()),
-            common_gate_projection: AffineQuantizedMatmul::new(device, affine_config(1, HIDDEN_DIM, ROUTER_BITS)),
-            combine: MoECombineKernel::new(device),
+            shared_experts: QuantizedDenseMLP::new(device, dense_config()),
+            shared_expert_gate: AffineQuantizedMatmul::new(device, affine_config(1, HIDDEN_DIM, ROUTER_BITS)),
+            combine: MoECombineKernels::new(device, MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM)),
         }
     }
 
@@ -221,13 +223,13 @@ impl ForcedMoEKernels {
         input: &'a Buffer,
         output: &'a Buffer,
         scratch: MoEScratchBindings<'a>,
-        common_scratch: CommonExpertScratchBindings<'a>,
+        shared_scratch: SharedExpertsScratchBindings<'a>,
         weights: ForcedMoEWeights<'a>,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let routing_shape = routing_shape(num_tokens);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_projection.invoke(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.router.invoke(
             num_tokens.try_into().expect("forced MoE token count must fit i32"),
             scratch.routing.router_logits,
             0,
@@ -240,14 +242,12 @@ impl ForcedMoEKernels {
             weights.router_biases,
             0,
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke_with_shape(
-            SoftmaxShape {
-                num_rows: num_tokens,
-                num_values_per_row: NUM_EXPERTS,
-                dtype: Dtype::Bfloat16,
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke(
+            SoftmaxShape { num_rows: num_tokens },
+            SoftmaxBuffers {
+                input: scratch.routing.router_logits,
+                output: scratch.routing.router_probs,
             },
-            scratch.routing.router_probs,
-            scratch.routing.router_logits,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke(
             routing_shape,
@@ -267,28 +267,28 @@ impl ForcedMoEKernels {
                         token_indices: scratch.topk_experts.token_indices,
                         expert_indices: scratch.routing.expert_indices,
                         route_indices: scratch.topk_experts.route_indices,
-                        output: scratch.topk_experts.routed_hidden,
+                        routed_hidden: scratch.topk_experts.routed_hidden,
                     },
-                    QuantizedSparseMLPTokenMajorScratch {
-                        activation: scratch.topk_experts.sparse_activation,
+                    QuantizedSparseMLPScratch {
+                        swiglu: scratch.topk_experts.sparse_swiglu,
                     },
                     weights.experts,
                 )));
-                self.record_common(recorder, num_tokens, input, common_scratch, weights);
-                recorder.record_with_barrier_before(ReplayOp::opaque(self.combine.invoke_with_common(
-                    MoECombineWithCommonShape::bf16(num_tokens, TOPK_EXPERTS, HIDDEN_DIM),
-                    MoECombineWithCommonBuffers {
+                self.record_shared(recorder, num_tokens, input, shared_scratch, weights);
+                recorder.record_with_barrier_before(ReplayOp::opaque(self.combine.invoke_with_shared_experts(
+                    MoECombineShape { num_tokens },
+                    MoECombineWithSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
-                        common_hidden: common_scratch.hidden,
-                        common_gate_logits: common_scratch.gate_logits,
+                        shared_hidden: shared_scratch.hidden,
+                        shared_expert_gate_logits: shared_scratch.gate_logits,
                         output,
                     },
                 )));
             },
             MoERealImpl::ExpertMajor => {
-                let shape = MoEExpertMajorShape::bf16(num_tokens, NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM);
-                self.record_common(recorder, num_tokens, input, common_scratch, weights);
+                let shape = MoEExpertMajorShape { num_tokens };
+                self.record_shared(recorder, num_tokens, input, shared_scratch, weights);
                 recorder.record(ReplayOp::opaque(self.expert_major.invoke_layout(
                     shape,
                     MoEExpertMajorLayoutBuffers {
@@ -312,7 +312,6 @@ impl ForcedMoEKernels {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
                     self.experts.invoke_expert_major(
                         QuantizedSparseMLPExpertMajorShape {
-                            num_experts: NUM_EXPERTS,
                             num_routes: num_tokens
                                 .checked_mul(TOPK_EXPERTS)
                                 .expect("forced MoE route count must fit u32"),
@@ -320,62 +319,64 @@ impl ForcedMoEKernels {
                         QuantizedSparseMLPExpertMajorBuffers {
                             packed_input: scratch.topk_experts.packed_input,
                             experts_by_route: scratch.topk_experts.experts_by_route,
-                            route_output: scratch.topk_experts.routed_hidden,
+                            packed_output: scratch.topk_experts.routed_hidden,
                         },
-                        QuantizedSparseMLPExpertMajorScratch {
-                            activation: scratch.topk_experts.sparse_activation,
+                        QuantizedSparseMLPScratch {
+                            swiglu: scratch.topk_experts.sparse_swiglu,
                         },
                         weights.experts,
                     ),
                 ));
-                recorder.record_with_barrier_before(ReplayOp::opaque(self.expert_major.invoke_scatter_with_common(
-                    shape,
-                    MoEExpertMajorScatterWithCommonBuffers {
-                        route_output: scratch.topk_experts.routed_hidden,
-                        routes_by_token: scratch.topk_experts.routes_by_token,
-                        routed_probs: scratch.routing.expert_probs,
-                        common_hidden: common_scratch.hidden,
-                        common_gate_logits: common_scratch.gate_logits,
-                        output,
-                    },
-                )));
+                recorder.record_with_barrier_before(ReplayOp::opaque(
+                    self.expert_major.invoke_scatter_with_shared_experts(
+                        shape,
+                        MoEExpertMajorScatterWithSharedExpertsBuffers {
+                            packed_output: scratch.topk_experts.routed_hidden,
+                            routes_by_token: scratch.topk_experts.routes_by_token,
+                            routed_probs: scratch.routing.expert_probs,
+                            shared_hidden: shared_scratch.hidden,
+                            shared_expert_gate_logits: shared_scratch.gate_logits,
+                            output,
+                        },
+                    ),
+                ));
             },
         }
     }
 
-    fn record_common<'a, R>(
+    fn record_shared<'a, R>(
         &'a self,
         recorder: &mut R,
         num_tokens: u32,
         input: &'a Buffer,
-        scratch: CommonExpertScratchBindings<'a>,
+        scratch: SharedExpertsScratchBindings<'a>,
         weights: ForcedMoEWeights<'a>,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        recorder.record(ReplayOp::opaque(self.common_expert.invoke(
+        recorder.record(ReplayOp::opaque(self.shared_experts.invoke(
             QuantizedDenseMLPShape { num_tokens },
             QuantizedDenseMLPBuffers {
                 hidden_state: input,
                 next_hidden_state: scratch.hidden,
             },
             QuantizedDenseMLPScratch {
-                gate_up_proj: scratch.dense_mlp.gate_up_proj,
-                activation: scratch.dense_mlp.activation,
+                gate_up: scratch.dense_mlp.gate_up,
+                swiglu: scratch.dense_mlp.swiglu,
             },
-            weights.common_expert,
+            weights.shared_experts,
         )));
-        recorder.record(ReplayOp::opaque(self.common_gate_projection.invoke(
+        recorder.record(ReplayOp::opaque(self.shared_expert_gate.invoke(
             num_tokens.try_into().expect("forced MoE token count must fit i32"),
             scratch.gate_logits,
             0,
             input,
             0,
-            weights.common_gate_weight,
+            weights.shared_expert_gate_weight,
             0,
-            weights.common_gate_scales,
+            weights.shared_expert_gate_scales,
             0,
-            weights.common_gate_biases,
+            weights.shared_expert_gate_biases,
             0,
         )));
     }
@@ -400,64 +401,67 @@ struct RealMoEFixture<'a> {
     _experts_by_route: Buffer,
     _packed_input: Buffer,
     _routed_hidden: Buffer,
-    _sparse_activation: Buffer,
-    _common_hidden: Buffer,
-    _common_gate_logits: Buffer,
-    _common_scratch: DenseMLPScratch,
+    _sparse_swiglu: Buffer,
+    _shared_hidden: Buffer,
+    _shared_expert_gate_logits: Buffer,
+    _shared_scratch: DenseMLPScratch,
     _weights: &'a RealMoEWeights,
 }
 
 impl<'a> RealMoEFixture<'a> {
     fn new(device: &Device, num_tokens: u32, weights: &'a RealMoEWeights, implementation: MoERealImpl) -> Self {
         let stream = Stream::new(device);
-        let router_projection_config = affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS);
-        let common_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
+        let router_config = affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS);
+        let shared_expert_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
         let num_tokens_i32 = num_tokens.try_into().expect("MoE token count must fit i32");
         let routing_shape = routing_shape(num_tokens);
         let sparse_config = sparse_config();
         let dense_config = dense_config();
         let sparse_shape = sparse_token_major_shape(num_tokens);
-        let expert_major_shape = MoEExpertMajorShape::bf16(num_tokens, NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM);
+        let expert_major_config = expert_major_config();
+        let expert_major_shape = MoEExpertMajorShape { num_tokens };
         let expert_major_sparse_shape = QuantizedSparseMLPTokenMajorShape {
-            num_routes: expert_major_shape.num_routes(),
-            num_tokens: expert_major_shape.num_routes(),
+            num_routes: expert_major_config.num_routes(expert_major_shape),
+            num_tokens: expert_major_config.num_routes(expert_major_shape),
         };
         let selected_sparse_shape = match implementation {
             MoERealImpl::TokenMajor => sparse_shape,
             MoERealImpl::ExpertMajor => expert_major_sparse_shape,
         };
         let dense_shape = QuantizedDenseMLPShape { num_tokens };
-        let combine_shape = MoECombineWithCommonShape::bf16(num_tokens, TOPK_EXPERTS, HIDDEN_DIM);
+        let combine_config = MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM);
+        let combine_shape = MoECombineShape { num_tokens };
         let num_routes = num_tokens as usize * TOPK_EXPERTS as usize;
         let input = Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, HIDDEN_DIM as usize));
-        let router_logits = Buffer::new_zeroed(device, router_projection_config.output_bytes(num_tokens_i32));
-        let router_probs = Buffer::new_zeroed(device, router_projection_config.output_bytes(num_tokens_i32));
-        let expert_indices = Buffer::new_zeroed(device, routing_shape.expert_indices_bytes());
-        let expert_probs = Buffer::new_zeroed(device, routing_shape.expert_probs_bytes());
+        let router_logits = Buffer::new_zeroed(device, router_config.output_bytes(num_tokens_i32));
+        let router_probs = Buffer::new_zeroed(device, router_config.output_bytes(num_tokens_i32));
+        let routing_config = routing_config();
+        let expert_indices = Buffer::new_zeroed(device, routing_config.expert_indices_bytes(routing_shape));
+        let expert_probs = Buffer::new_zeroed(device, routing_config.expert_probs_bytes(routing_shape));
         let token_indices =
             Buffer::from_slice(device, &token_route_indices(num_tokens as usize, TOPK_EXPERTS as usize));
         let route_indices = Buffer::from_slice(device, &identity_indices(num_routes));
-        let expert_counts = Buffer::new_zeroed(device, expert_major_shape.expert_counts_bytes());
-        let expert_offsets = Buffer::new_zeroed(device, expert_major_shape.expert_offsets_bytes());
-        let expert_cursors = Buffer::new_zeroed(device, expert_major_shape.expert_counts_bytes());
-        let routes_by_expert = Buffer::new_zeroed(device, expert_major_shape.route_indices_bytes());
-        let routes_by_token = Buffer::new_zeroed(device, expert_major_shape.route_indices_bytes());
-        let experts_by_route = Buffer::new_zeroed(device, expert_major_shape.route_indices_bytes());
-        let packed_input = Buffer::new_zeroed(device, expert_major_shape.route_hidden_bytes());
+        let expert_counts = Buffer::new_zeroed(device, expert_major_config.expert_counts_bytes());
+        let expert_offsets = Buffer::new_zeroed(device, expert_major_config.expert_offsets_bytes());
+        let expert_cursors = Buffer::new_zeroed(device, expert_major_config.expert_counts_bytes());
+        let routes_by_expert = Buffer::new_zeroed(device, expert_major_config.route_indices_bytes(expert_major_shape));
+        let routes_by_token = Buffer::new_zeroed(device, expert_major_config.route_indices_bytes(expert_major_shape));
+        let experts_by_route = Buffer::new_zeroed(device, expert_major_config.route_indices_bytes(expert_major_shape));
+        let packed_input = Buffer::new_zeroed(device, expert_major_config.route_hidden_bytes(expert_major_shape));
         let routed_hidden = Buffer::new_zeroed(device, sparse_config.token_major_output_bytes(selected_sparse_shape));
-        let sparse_activation =
-            Buffer::new_zeroed(device, sparse_config.activation_bytes(selected_sparse_shape.num_routes));
-        let common_hidden = Buffer::new_zeroed(device, dense_config.down_config().output_bytes(num_tokens_i32));
-        let common_gate_logits = Buffer::new_zeroed(device, common_gate_config.output_bytes(num_tokens_i32));
-        let output = Buffer::new_zeroed(device, combine_shape.output_bytes());
-        let common_scratch = DenseMLPScratch {
-            gate_up_proj: Buffer::new_zeroed(
+        let sparse_swiglu = Buffer::new_zeroed(device, sparse_config.swiglu_bytes(selected_sparse_shape.num_routes));
+        let shared_hidden = Buffer::new_zeroed(device, dense_config.down_config().output_bytes(num_tokens_i32));
+        let shared_expert_gate_logits =
+            Buffer::new_zeroed(device, shared_expert_gate_config.output_bytes(num_tokens_i32));
+        let output = Buffer::new_zeroed(device, combine_config.output_bytes(combine_shape));
+        let shared_scratch = DenseMLPScratch {
+            gate_up: Buffer::new_zeroed(
                 device,
                 num_tokens as usize * INTERMEDIATE_DIM as usize * 2 * Dtype::Bfloat16.item_size(),
             ),
-            activation: Buffer::new_zeroed(device, dense_config.activation_shape(dense_shape).bytes()),
+            swiglu: Buffer::new_zeroed(device, dense_config.swiglu_bytes(dense_shape)),
         };
-        let kernels = ForcedMoEKernels::new(device, num_tokens);
+        let kernels = ForcedMoEKernels::new(device);
         let mut builder = MetalReplayRuntime::new(&stream).create_recorder();
         kernels.record(
             &mut builder,
@@ -476,7 +480,7 @@ impl<'a> RealMoEFixture<'a> {
                     token_indices: &token_indices,
                     route_indices: &route_indices,
                     routed_hidden: &routed_hidden,
-                    sparse_activation: &sparse_activation,
+                    sparse_swiglu: &sparse_swiglu,
                     expert_counts: &expert_counts,
                     expert_offsets: &expert_offsets,
                     expert_cursors: &expert_cursors,
@@ -486,16 +490,16 @@ impl<'a> RealMoEFixture<'a> {
                     packed_input: &packed_input,
                 },
             },
-            common_scratch.as_common_scratch(&common_hidden, &common_gate_logits),
+            shared_scratch.as_shared_scratch(&shared_hidden, &shared_expert_gate_logits),
             ForcedMoEWeights {
                 router_weight: &weights.router_weight,
                 router_scales: &weights.router_scales,
                 router_biases: &weights.router_biases,
                 experts: weights.sparse.as_borrowed(),
-                common_expert: weights.common.as_borrowed(),
-                common_gate_weight: &weights.common_gate_weight,
-                common_gate_scales: &weights.common_gate_scales,
-                common_gate_biases: &weights.common_gate_biases,
+                shared_experts: weights.shared.as_borrowed(),
+                shared_expert_gate_weight: &weights.shared_expert_gate_weight,
+                shared_expert_gate_scales: &weights.shared_expert_gate_scales,
+                shared_expert_gate_biases: &weights.shared_expert_gate_biases,
             },
         );
         let replay = builder.build();
@@ -518,10 +522,10 @@ impl<'a> RealMoEFixture<'a> {
             _experts_by_route: experts_by_route,
             _packed_input: packed_input,
             _routed_hidden: routed_hidden,
-            _sparse_activation: sparse_activation,
-            _common_hidden: common_hidden,
-            _common_gate_logits: common_gate_logits,
-            _common_scratch: common_scratch,
+            _sparse_swiglu: sparse_swiglu,
+            _shared_hidden: shared_hidden,
+            _shared_expert_gate_logits: shared_expert_gate_logits,
+            _shared_scratch: shared_scratch,
             _weights: weights,
         }
     }
@@ -550,11 +554,11 @@ struct RealMoEWeights {
     router_weight: Buffer,
     router_scales: Buffer,
     router_biases: Buffer,
-    common_gate_weight: Buffer,
-    common_gate_scales: Buffer,
-    common_gate_biases: Buffer,
+    shared_expert_gate_weight: Buffer,
+    shared_expert_gate_scales: Buffer,
+    shared_expert_gate_biases: Buffer,
     sparse: SparseMLPWeights,
-    common: DenseMLPWeights,
+    shared: DenseMLPWeights,
 }
 
 impl RealMoEWeights {
@@ -582,17 +586,17 @@ impl RealMoEWeights {
             &tensor_name(model_layer_index, "gate.biases"),
             safetensors::Dtype::BF16,
         );
-        let common_gate_weight = tensor_bytes(
+        let shared_expert_gate_weight = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert_gate.weight"),
             safetensors::Dtype::U32,
         );
-        let common_gate_scales = tensor_bytes(
+        let shared_expert_gate_scales = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert_gate.scales"),
             safetensors::Dtype::BF16,
         );
-        let common_gate_biases = tensor_bytes(
+        let shared_expert_gate_biases = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert_gate.biases"),
             safetensors::Dtype::BF16,
@@ -671,40 +675,49 @@ impl RealMoEWeights {
                 ),
             ),
         };
-        let common_gate_weight_dense = tensor_bytes(
+        let shared_expert_gate_weight_dense = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert.gate_proj.weight"),
             safetensors::Dtype::U32,
         );
-        let common_up_weight = tensor_bytes(
+        let shared_experts_up_weight = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert.up_proj.weight"),
             safetensors::Dtype::U32,
         );
-        let common_gate_scales_dense = tensor_bytes(
+        let shared_expert_gate_scales_dense = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert.gate_proj.scales"),
             safetensors::Dtype::BF16,
         );
-        let common_up_scales = tensor_bytes(
+        let shared_experts_up_scales = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert.up_proj.scales"),
             safetensors::Dtype::BF16,
         );
-        let common_gate_biases_dense = tensor_bytes(
+        let shared_expert_gate_biases_dense = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert.gate_proj.biases"),
             safetensors::Dtype::BF16,
         );
-        let common_up_biases = tensor_bytes(
+        let shared_experts_up_biases = tensor_bytes(
             &tensors,
             &tensor_name(model_layer_index, "shared_expert.up_proj.biases"),
             safetensors::Dtype::BF16,
         );
-        let common = DenseMLPWeights {
-            gate_up_weight: Buffer::from_slice(device, &concat_bytes(&common_gate_weight_dense, &common_up_weight)),
-            gate_up_scales: Buffer::from_slice(device, &concat_bytes(&common_gate_scales_dense, &common_up_scales)),
-            gate_up_biases: Buffer::from_slice(device, &concat_bytes(&common_gate_biases_dense, &common_up_biases)),
+        let shared = DenseMLPWeights {
+            gate_up_weight: Buffer::from_slice(
+                device,
+                &concat_bytes(&shared_expert_gate_weight_dense, &shared_experts_up_weight),
+            ),
+            gate_up_scales: Buffer::from_slice(
+                device,
+                &concat_bytes(&shared_expert_gate_scales_dense, &shared_experts_up_scales),
+            ),
+            gate_up_biases: Buffer::from_slice(
+                device,
+                &concat_bytes(&shared_expert_gate_biases_dense, &shared_experts_up_biases),
+            ),
             down_weight: Buffer::from_slice(
                 device,
                 &tensor_bytes(
@@ -734,21 +747,21 @@ impl RealMoEWeights {
             &router_weight,
             &router_scales,
             &router_biases,
-            &common_gate_weight,
-            &common_gate_scales,
-            &common_gate_biases,
+            &shared_expert_gate_weight,
+            &shared_expert_gate_scales,
+            &shared_expert_gate_biases,
             &sparse,
-            &common,
+            &shared,
         );
         Self {
             router_weight: Buffer::from_slice(device, &router_weight),
             router_scales: Buffer::from_slice(device, &router_scales),
             router_biases: Buffer::from_slice(device, &router_biases),
-            common_gate_weight: Buffer::from_slice(device, &common_gate_weight),
-            common_gate_scales: Buffer::from_slice(device, &common_gate_scales),
-            common_gate_biases: Buffer::from_slice(device, &common_gate_biases),
+            shared_expert_gate_weight: Buffer::from_slice(device, &shared_expert_gate_weight),
+            shared_expert_gate_scales: Buffer::from_slice(device, &shared_expert_gate_scales),
+            shared_expert_gate_biases: Buffer::from_slice(device, &shared_expert_gate_biases),
             sparse,
-            common,
+            shared,
         }
     }
 }
@@ -804,29 +817,29 @@ impl DenseMLPWeights {
 }
 
 struct DenseMLPScratch {
-    gate_up_proj: Buffer,
-    activation: Buffer,
+    gate_up: Buffer,
+    swiglu: Buffer,
 }
 
 impl DenseMLPScratch {
     fn as_borrowed(&self) -> QuantizedDenseMLPScratch<'_> {
         QuantizedDenseMLPScratch {
-            gate_up_proj: &self.gate_up_proj,
-            activation: &self.activation,
+            gate_up: &self.gate_up,
+            swiglu: &self.swiglu,
         }
     }
 
-    fn as_common_scratch<'a>(
+    fn as_shared_scratch<'a>(
         &'a self,
-        common_hidden: &'a Buffer,
-        common_gate_logits: &'a Buffer,
-    ) -> CommonExpertScratchBindings<'a> {
-        CommonExpertScratchBindings {
-            hidden: common_hidden,
-            gate_logits: common_gate_logits,
+        shared_hidden: &'a Buffer,
+        shared_expert_gate_logits: &'a Buffer,
+    ) -> SharedExpertsScratchBindings<'a> {
+        SharedExpertsScratchBindings {
+            hidden: shared_hidden,
+            gate_logits: shared_expert_gate_logits,
             dense_mlp: DenseMLPScratchBindings {
-                gate_up_proj: &self.gate_up_proj,
-                activation: &self.activation,
+                gate_up: &self.gate_up,
+                swiglu: &self.swiglu,
             },
         }
     }
@@ -960,73 +973,83 @@ fn validate_weight_sizes(
     router_weight: &[u8],
     router_scales: &[u8],
     router_biases: &[u8],
-    common_gate_weight: &[u8],
-    common_gate_scales: &[u8],
-    common_gate_biases: &[u8],
+    shared_expert_gate_weight: &[u8],
+    shared_expert_gate_scales: &[u8],
+    shared_expert_gate_biases: &[u8],
     sparse: &SparseMLPWeights,
-    common: &DenseMLPWeights,
+    shared: &DenseMLPWeights,
 ) {
     let router_config = affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS);
-    let common_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
+    let shared_expert_gate_config = affine_config(1, HIDDEN_DIM, ROUTER_BITS);
     assert_eq!(router_weight.len(), router_config.weight_bytes());
     assert_eq!(router_scales.len(), router_config.scale_or_bias_bytes());
     assert_eq!(router_biases.len(), router_config.scale_or_bias_bytes());
-    assert_eq!(common_gate_weight.len(), common_gate_config.weight_bytes());
-    assert_eq!(common_gate_scales.len(), common_gate_config.scale_or_bias_bytes());
-    assert_eq!(common_gate_biases.len(), common_gate_config.scale_or_bias_bytes());
+    assert_eq!(
+        shared_expert_gate_weight.len(),
+        shared_expert_gate_config.weight_bytes()
+    );
+    assert_eq!(
+        shared_expert_gate_scales.len(),
+        shared_expert_gate_config.scale_or_bias_bytes()
+    );
+    assert_eq!(
+        shared_expert_gate_biases.len(),
+        shared_expert_gate_config.scale_or_bias_bytes()
+    );
     let sparse_config = sparse_config();
     let sparse_shape = QuantizedSparseMLPTokenMajorShape {
         num_routes: TOPK_EXPERTS,
         num_tokens: 1,
     };
-    let gate_up_shape = sparse_config.token_major_fused_gate_up_silu_shape(sparse_shape);
-    let down_shape = sparse_config.token_major_down_shape(sparse_shape);
+    let gate_up_config = sparse_config.gate_up_config();
+    let down_config = sparse_config.down_config();
     assert_eq!(
         sparse.gate_weight.len_bytes(),
-        NUM_EXPERTS as usize * gate_up_shape.weight_bytes_per_expert()
+        NUM_EXPERTS as usize * gate_up_config.weight_bytes_per_expert()
     );
     assert_eq!(
         sparse.gate_scales.len_bytes(),
-        NUM_EXPERTS as usize * gate_up_shape.affine_param_bytes_per_expert()
+        NUM_EXPERTS as usize * gate_up_config.affine_param_bytes_per_expert()
     );
     assert_eq!(
         sparse.gate_biases.len_bytes(),
-        NUM_EXPERTS as usize * gate_up_shape.affine_param_bytes_per_expert()
+        NUM_EXPERTS as usize * gate_up_config.affine_param_bytes_per_expert()
     );
     assert_eq!(sparse.up_weight.len_bytes(), sparse.gate_weight.len_bytes());
     assert_eq!(sparse.up_scales.len_bytes(), sparse.gate_scales.len_bytes());
     assert_eq!(sparse.up_biases.len_bytes(), sparse.gate_biases.len_bytes());
     assert_eq!(
         sparse.down_weight.len_bytes(),
-        NUM_EXPERTS as usize * down_shape.weight_bytes_per_expert()
+        NUM_EXPERTS as usize * down_config.weight_bytes_per_expert()
     );
     assert_eq!(
         sparse.down_scales.len_bytes(),
-        NUM_EXPERTS as usize * down_shape.affine_param_bytes_per_expert()
+        NUM_EXPERTS as usize * down_config.affine_param_bytes_per_expert()
     );
     assert_eq!(
         sparse.down_biases.len_bytes(),
-        NUM_EXPERTS as usize * down_shape.affine_param_bytes_per_expert()
+        NUM_EXPERTS as usize * down_config.affine_param_bytes_per_expert()
     );
     let dense_config = dense_config();
     let dense_gate_up_config = dense_config.gate_up_config();
     let dense_down_config = dense_config.down_config();
-    assert_eq!(common.gate_up_weight.len_bytes(), dense_gate_up_config.weight_bytes());
+    assert_eq!(shared.gate_up_weight.len_bytes(), dense_gate_up_config.weight_bytes());
     assert_eq!(
-        common.gate_up_scales.len_bytes(),
+        shared.gate_up_scales.len_bytes(),
         dense_gate_up_config.scale_or_bias_bytes()
     );
     assert_eq!(
-        common.gate_up_biases.len_bytes(),
+        shared.gate_up_biases.len_bytes(),
         dense_gate_up_config.scale_or_bias_bytes()
     );
-    assert_eq!(common.down_weight.len_bytes(), dense_down_config.weight_bytes());
-    assert_eq!(common.down_scales.len_bytes(), dense_down_config.scale_or_bias_bytes());
-    assert_eq!(common.down_biases.len_bytes(), dense_down_config.scale_or_bias_bytes());
+    assert_eq!(shared.down_weight.len_bytes(), dense_down_config.weight_bytes());
+    assert_eq!(shared.down_scales.len_bytes(), dense_down_config.scale_or_bias_bytes());
+    assert_eq!(shared.down_biases.len_bytes(), dense_down_config.scale_or_bias_bytes());
 }
 
 fn sparse_config() -> QuantizedSparseMLPConfig {
     QuantizedSparseMLPConfig {
+        num_experts: NUM_EXPERTS,
         hidden_dim: HIDDEN_DIM,
         intermediate_dim: INTERMEDIATE_DIM,
         group_size: GROUP_SIZE,
@@ -1058,12 +1081,19 @@ fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
 }
 
 fn routing_shape(num_tokens: u32) -> MoERoutingShape {
-    MoERoutingShape {
-        num_tokens,
+    MoERoutingShape { num_tokens }
+}
+
+fn routing_config() -> MoERoutingConfig {
+    MoERoutingConfig {
         num_experts: NUM_EXPERTS,
         num_experts_per_token: TOPK_EXPERTS,
         norm_topk_prob: true,
     }
+}
+
+fn expert_major_config() -> MoEExpertMajorConfig {
+    MoEExpertMajorConfig::bf16(NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM)
 }
 
 fn sparse_token_major_shape(num_tokens: u32) -> QuantizedSparseMLPTokenMajorShape {
