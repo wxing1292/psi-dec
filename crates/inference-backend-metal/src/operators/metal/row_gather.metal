@@ -1,3 +1,4 @@
+// Generic indexed row gather.
 #include <metal_stdlib>
 using namespace metal;
 typedef bfloat bfloat16_t;

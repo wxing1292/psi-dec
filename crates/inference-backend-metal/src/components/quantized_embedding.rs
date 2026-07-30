@@ -20,28 +20,6 @@ pub struct QuantizedEmbeddingConfig {
 }
 
 impl QuantizedEmbeddingConfig {
-    pub fn f32_to_bf16(vocab_size: u32, hidden_dim: u32, group_size: u32, bits: u32) -> Self {
-        Self {
-            vocab_size,
-            hidden_dim,
-            group_size,
-            bits,
-            scale_bias_dtype: Dtype::Float32,
-            output_dtype: Dtype::Bfloat16,
-        }
-    }
-
-    pub fn bf16_to_bf16(vocab_size: u32, hidden_dim: u32, group_size: u32, bits: u32) -> Self {
-        Self {
-            vocab_size,
-            hidden_dim,
-            group_size,
-            bits,
-            scale_bias_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-        }
-    }
-
     pub fn validate(self) {
         assert!(self.vocab_size > 0);
         assert!(self.hidden_dim > 0);
@@ -49,14 +27,13 @@ impl QuantizedEmbeddingConfig {
         assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
         assert_eq!(self.hidden_dim % self.group_size, 0);
         assert!(matches!(self.scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
-        assert_eq!(self.output_dtype, Dtype::Bfloat16);
+        match self.output_dtype {
+            Dtype::Bfloat16 => {},
+            Dtype::Float32 => todo!("F32 quantized embedding output is not implemented"),
+            dtype => panic!("unsupported quantized embedding output dtype {dtype:?}"),
+        }
         let _ = self.weight_bytes_unchecked();
         let _ = self.num_affine_params_unchecked();
-    }
-
-    pub fn packed_cols(self) -> usize {
-        self.validate();
-        self.packed_cols_unchecked()
     }
 
     fn packed_cols_unchecked(self) -> usize {
@@ -119,17 +96,20 @@ pub struct QuantizedEmbeddingBuffers<'a> {
 
 pub struct QuantizedEmbeddingKernel {
     config: QuantizedEmbeddingConfig,
-    f32_kernel: Kernel,
-    bf16_kernel: Kernel,
+    kernel: Kernel,
 }
 
 impl QuantizedEmbeddingKernel {
     pub fn new(device: &Device, config: QuantizedEmbeddingConfig) -> Self {
         config.validate();
+        let function_name = match config.scale_bias_dtype {
+            Dtype::Float32 => "quantized_embedding_f32_to_bf16",
+            Dtype::Bfloat16 => "quantized_embedding_bf16_to_bf16",
+            _ => unreachable!("validated quantized embedding scale/bias dtype"),
+        };
         Self {
             config,
-            f32_kernel: Kernel::new(device, QUANTIZED_EMBEDDING_SOURCE, "quantized_embedding_f32_to_bf16"),
-            bf16_kernel: Kernel::new(device, QUANTIZED_EMBEDDING_SOURCE, "quantized_embedding_bf16_to_bf16"),
+            kernel: Kernel::new(device, QUANTIZED_EMBEDDING_SOURCE, function_name),
         }
     }
 
@@ -157,12 +137,7 @@ impl Operator for QuantizedEmbeddingInvocation<'_> {
         self.shape.validate();
         validate_buffers(self.kernel.config, self.shape, &self.buffers);
         let config = self.kernel.config;
-        let kernel = match config.scale_bias_dtype {
-            Dtype::Float32 => &self.kernel.f32_kernel,
-            Dtype::Bfloat16 => &self.kernel.bf16_kernel,
-            other => panic!("unsupported quantized embedding affine dtype: {other:?}"),
-        };
-        builder.set_kernel(kernel);
+        builder.set_kernel(&self.kernel.kernel);
         builder.set_buffer_read(0, self.buffers.token_ids, 0);
         builder.set_buffer_read(1, self.buffers.weight, 0);
         builder.set_buffer_read(2, self.buffers.scales, 0);
@@ -196,4 +171,142 @@ fn validate_buffers(
     assert_eq!(buffers.scales.len_bytes(), affine_param_bytes);
     assert_eq!(buffers.biases.len_bytes(), affine_param_bytes);
     assert!(buffers.output.len_bytes() >= output_bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+
+    use super::QuantizedEmbeddingBuffers;
+    use super::QuantizedEmbeddingConfig;
+    use super::QuantizedEmbeddingKernel;
+    use super::QuantizedEmbeddingShape;
+    use crate::metal::Buffer;
+    use crate::metal::Device;
+    use crate::metal::Dtype;
+    use crate::metal::Stream;
+
+    const VOCAB_SIZE: u32 = 2;
+    const HIDDEN_DIM: u32 = 32;
+    const GROUP_SIZE: u32 = 32;
+    const BITS: u32 = 4;
+
+    #[test]
+    #[should_panic(expected = "F32 quantized embedding output is not implemented")]
+    fn test_f32_output_is_explicit_future_work() {
+        QuantizedEmbeddingConfig {
+            vocab_size: VOCAB_SIZE,
+            hidden_dim: HIDDEN_DIM,
+            group_size: GROUP_SIZE,
+            bits: BITS,
+            scale_bias_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Float32,
+        }
+        .validate();
+    }
+
+    #[test]
+    fn test_f32_scale_bias_reference() {
+        let scales = [0.5f32, 0.25];
+        let biases = [-1.0f32, 2.0];
+        test_reference(
+            Dtype::Float32,
+            &f32_bytes(&scales),
+            &f32_bytes(&biases),
+            &scales,
+            &biases,
+        );
+    }
+
+    #[test]
+    fn test_bf16_scale_bias_reference() {
+        let scales = [bf16::from_f32(0.5), bf16::from_f32(0.25)];
+        let biases = [bf16::from_f32(-1.0), bf16::from_f32(2.0)];
+        test_reference(
+            Dtype::Bfloat16,
+            &bf16_bytes(&scales),
+            &bf16_bytes(&biases),
+            &scales.map(bf16::to_f32),
+            &biases.map(bf16::to_f32),
+        );
+    }
+
+    fn test_reference(
+        scale_bias_dtype: Dtype,
+        scale_bytes: &[u8],
+        bias_bytes: &[u8],
+        scales: &[f32; 2],
+        biases: &[f32; 2],
+    ) {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = QuantizedEmbeddingConfig {
+            vocab_size: VOCAB_SIZE,
+            hidden_dim: HIDDEN_DIM,
+            group_size: GROUP_SIZE,
+            bits: BITS,
+            scale_bias_dtype,
+            output_dtype: Dtype::Bfloat16,
+        };
+        let shape = QuantizedEmbeddingShape { num_tokens: 4 };
+        let token_ids = [-1i32, 0, 1, 2];
+        let packed_weights = packed_q4_rows();
+        let token_ids = Buffer::from_slice(&device, &token_ids);
+        let weight = Buffer::from_slice(&device, &packed_weights);
+        let scales_buffer = Buffer::from_slice(&device, scale_bytes);
+        let biases_buffer = Buffer::from_slice(&device, bias_bytes);
+        let output = Buffer::new_zeroed_elements(&device, shape.num_output_values(config), Dtype::Bfloat16);
+        let kernel = QuantizedEmbeddingKernel::new(&device, config);
+        let mut recorder = stream.create_replay_program();
+        recorder.record(kernel.invoke(
+            shape,
+            QuantizedEmbeddingBuffers {
+                token_ids: &token_ids,
+                weight: &weight,
+                scales: &scales_buffer,
+                biases: &biases_buffer,
+                output: &output,
+            },
+        ));
+        stream.submit_replay(&recorder.build()).wait();
+
+        let actual = output.read_typed::<u16>(0, shape.num_output_values(config));
+        let expected = token_ids_reference(&[-1, 0, 1, 2], scales, biases);
+        assert_eq!(actual, expected);
+    }
+
+    fn packed_q4_rows() -> Vec<u8> {
+        (0..VOCAB_SIZE)
+            .flat_map(|row| {
+                (0..HIDDEN_DIM / 2).map(move |column| {
+                    let lo = (row * 3 + column * 2) & 0x0f;
+                    let hi = (row * 3 + column * 2 + 1) & 0x0f;
+                    (lo | (hi << 4)) as u8
+                })
+            })
+            .collect()
+    }
+
+    fn token_ids_reference(token_ids: &[i32], scales: &[f32; 2], biases: &[f32; 2]) -> Vec<u16> {
+        token_ids
+            .iter()
+            .flat_map(|&token_id| {
+                (0..HIDDEN_DIM).map(move |hidden_index| {
+                    if !(0..VOCAB_SIZE as i32).contains(&token_id) {
+                        return bf16::ZERO.to_bits();
+                    }
+                    let quantized = (token_id as u32 * 3 + hidden_index) & 0x0f;
+                    bf16::from_f32(quantized as f32 * scales[token_id as usize] + biases[token_id as usize]).to_bits()
+                })
+            })
+            .collect()
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_ne_bytes()).collect()
+    }
+
+    fn bf16_bytes(values: &[bf16]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_bits().to_ne_bytes()).collect()
+    }
 }

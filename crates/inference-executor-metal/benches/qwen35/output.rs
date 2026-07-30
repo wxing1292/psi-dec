@@ -336,7 +336,7 @@ impl HeadFixture {
                 layout.rms_norm_eps,
                 final_norm_weight,
             ),
-            gather: Gather::new(&device),
+            gather: Gather::new(&device, layout.hidden_dim),
             unembedder,
             sampler: TopKSampling::new(&device, sampler_bounds),
             sampler_output: TopKSamplingOutputBuffers::new(&device, sampler_bounds),
@@ -415,8 +415,6 @@ impl HeadFixture {
         self.gather.record(
             recorder,
             num_rows,
-            self.final_norm_hidden.len_bytes() as u32
-                / (microbatch.total_tokens() as u32 * Dtype::Bfloat16.item_size() as u32),
             &self.final_norm_hidden,
             &self.gather_flat_indices,
             &self.unembed_hidden,

@@ -1,3 +1,4 @@
+// Generic row-wise BF16 matrix concatenation.
 #include <metal_stdlib>
 using namespace metal;
 

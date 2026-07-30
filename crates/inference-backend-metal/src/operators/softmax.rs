@@ -10,31 +10,35 @@ use crate::metal::Operator;
 use crate::operators::mlx_headers::find_mlx_metal_header_root;
 use crate::operators::mlx_headers::read_mlx_metal_header;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SoftmaxConfig {
     pub num_values_per_row: u32,
     pub dtype: Dtype,
 }
 
 impl SoftmaxConfig {
-    pub fn validate(self) {
+    fn validate(self) {
         assert!(self.num_values_per_row > 0);
         assert!(self.num_values_per_row <= 4096);
-        assert_eq!(self.dtype, Dtype::Bfloat16);
+        match self.dtype {
+            Dtype::Bfloat16 => {},
+            Dtype::Float32 => todo!("F32 softmax is not implemented"),
+            dtype => panic!("unsupported softmax dtype {dtype:?}"),
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SoftmaxShape {
     pub num_rows: u32,
 }
 
 impl SoftmaxShape {
-    pub fn validate(self) {
+    fn validate(self) {
         assert!(self.num_rows > 0);
     }
 
-    pub fn bytes(self, config: SoftmaxConfig) -> usize {
+    fn bytes(self, config: SoftmaxConfig) -> usize {
         self.validate();
         config.validate();
         (self.num_rows as usize)
@@ -149,6 +153,16 @@ mod tests {
     use crate::metal::Device;
     use crate::metal::Dtype;
     use crate::metal::Stream;
+
+    #[test]
+    #[should_panic(expected = "F32 softmax is not implemented")]
+    fn test_f32_is_explicit_future_work() {
+        SoftmaxConfig {
+            num_values_per_row: 4,
+            dtype: Dtype::Float32,
+        }
+        .validate();
+    }
 
     #[test]
     fn test_reference() {

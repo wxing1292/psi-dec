@@ -7,12 +7,12 @@ use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::operators::AffineQuantizedMatmulConfig;
 use crate::operators::ExpertAffineQuantizedConfig;
+use crate::operators::GatherAffineQuantizedGateUpSwiGLUKernel;
 use crate::operators::GatherAffineQuantizedMatmulKernel;
 use crate::operators::GatherAffineQuantizedShape;
 use crate::operators::RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel;
 use crate::operators::RaggedExpertMajorAffineQuantizedMatmulKernel;
 use crate::operators::RaggedExpertMajorAffineQuantizedShape;
-use crate::operators::affine_quantized::GatherAffineQuantizedGateUpSwiGLUKernel;
 
 fn to_i32(value: u32, name: &str) -> i32 {
     value.try_into().unwrap_or_else(|_| panic!("{name} must fit i32"))

@@ -1,3 +1,5 @@
+//! Row-wise concatenation for two BF16 matrices.
+
 use std::mem::size_of;
 
 use crate::metal::Buffer;
@@ -10,47 +12,61 @@ const BF16_CONCAT_ROWS_SOURCE: &str = include_str!("metal/bf16_concat_rows.metal
 const NUM_THREADS_PER_THREADBLOCK: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Bf16ConcatRowsShape {
-    pub num_rows: u32,
+pub struct Bf16ConcatRowsConfig {
     pub num_cols: u32,
 }
 
-impl Bf16ConcatRowsShape {
-    pub fn validate(self) {
-        assert!(self.num_rows > 0, "bf16 row concat requires num_rows > 0");
+impl Bf16ConcatRowsConfig {
+    fn validate(self) {
         assert!(self.num_cols > 0, "bf16 row concat requires num_cols > 0");
-        u32::try_from(self.output_elements_u64())
+    }
+
+    fn validate_shape(self, shape: Bf16ConcatRowsShape) {
+        self.validate();
+        shape.validate();
+        u32::try_from(self.output_elements_u64(shape))
             .expect("bf16 row concat output elements exceeds the shader u32 count domain");
     }
 
-    fn input_elements_u64(self) -> u64 {
-        u64::from(self.num_rows)
+    fn input_elements_u64(self, shape: Bf16ConcatRowsShape) -> u64 {
+        u64::from(shape.num_rows)
             .checked_mul(u64::from(self.num_cols))
             .expect("bf16 row concat input element count must fit u64")
     }
 
-    fn output_elements_u64(self) -> u64 {
-        self.input_elements_u64()
+    fn output_elements_u64(self, shape: Bf16ConcatRowsShape) -> u64 {
+        self.input_elements_u64(shape)
             .checked_mul(2)
             .expect("bf16 row concat output element count must fit u64")
     }
 
-    fn input_bytes_u64(self) -> u64 {
-        self.input_elements_u64()
+    fn input_bytes_u64(self, shape: Bf16ConcatRowsShape) -> u64 {
+        self.input_elements_u64(shape)
             .checked_mul(size_of::<u16>().try_into().expect("bf16 item size must fit u64"))
             .expect("bf16 row concat input byte length must fit u64")
     }
 
-    fn output_bytes_u64(self) -> u64 {
-        self.output_elements_u64()
+    fn output_bytes_u64(self, shape: Bf16ConcatRowsShape) -> u64 {
+        self.output_elements_u64(shape)
             .checked_mul(size_of::<u16>().try_into().expect("bf16 item size must fit u64"))
             .expect("bf16 row concat output byte length must fit u64")
     }
 
-    fn num_values(self) -> usize {
-        self.output_elements_u64()
+    fn num_values(self, shape: Bf16ConcatRowsShape) -> usize {
+        self.output_elements_u64(shape)
             .try_into()
             .expect("bf16 row concat dispatch count must fit host usize")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bf16ConcatRowsShape {
+    pub num_rows: u32,
+}
+
+impl Bf16ConcatRowsShape {
+    fn validate(self) {
+        assert!(self.num_rows > 0, "bf16 row concat requires num_rows > 0");
     }
 }
 
@@ -62,12 +78,15 @@ pub struct Bf16ConcatRowsBuffers<'a> {
 }
 
 pub struct Bf16ConcatRowsKernel {
+    config: Bf16ConcatRowsConfig,
     kernel: Kernel,
 }
 
 impl Bf16ConcatRowsKernel {
-    pub fn new(device: &Device) -> Self {
+    pub fn new(device: &Device, config: Bf16ConcatRowsConfig) -> Self {
+        config.validate();
         Self {
+            config,
             kernel: Kernel::new(device, BF16_CONCAT_ROWS_SOURCE, "bf16_concat_rows"),
         }
     }
@@ -78,7 +97,7 @@ impl Bf16ConcatRowsKernel {
         buffers: Bf16ConcatRowsBuffers<'a>,
     ) -> Bf16ConcatRowsInvocation<'a> {
         Bf16ConcatRowsInvocation {
-            kernel: &self.kernel,
+            kernel: self,
             shape,
             buffers,
         }
@@ -86,36 +105,37 @@ impl Bf16ConcatRowsKernel {
 }
 
 pub struct Bf16ConcatRowsInvocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a Bf16ConcatRowsKernel,
     shape: Bf16ConcatRowsShape,
     buffers: Bf16ConcatRowsBuffers<'a>,
 }
 
 impl Operator for Bf16ConcatRowsInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.shape.validate();
-        validate_buffers(self.shape, self.buffers);
-        builder.set_kernel(self.kernel);
+        let config = self.kernel.config;
+        config.validate_shape(self.shape);
+        validate_buffers(config, self.shape, self.buffers);
+        builder.set_kernel(&self.kernel.kernel);
         builder.set_buffer_read(0, self.buffers.lhs, 0);
         builder.set_buffer_read(1, self.buffers.rhs, 0);
         builder.set_buffer_write(2, self.buffers.output, 0);
         builder.set_u32(3, self.shape.num_rows);
-        builder.set_u32(4, self.shape.num_cols);
-        builder.dispatch_1d(self.shape.num_values(), NUM_THREADS_PER_THREADBLOCK);
+        builder.set_u32(4, config.num_cols);
+        builder.dispatch_1d(config.num_values(self.shape), NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
-fn validate_buffers(shape: Bf16ConcatRowsShape, buffers: Bf16ConcatRowsBuffers<'_>) {
+fn validate_buffers(config: Bf16ConcatRowsConfig, shape: Bf16ConcatRowsShape, buffers: Bf16ConcatRowsBuffers<'_>) {
     assert!(
-        buffers.lhs.len_bytes_u64() >= shape.input_bytes_u64(),
+        buffers.lhs.len_bytes_u64() >= config.input_bytes_u64(shape),
         "bf16 row concat lhs buffer is too small"
     );
     assert!(
-        buffers.rhs.len_bytes_u64() >= shape.input_bytes_u64(),
+        buffers.rhs.len_bytes_u64() >= config.input_bytes_u64(shape),
         "bf16 row concat rhs buffer is too small"
     );
     assert!(
-        buffers.output.len_bytes_u64() >= shape.output_bytes_u64(),
+        buffers.output.len_bytes_u64() >= config.output_bytes_u64(shape),
         "bf16 row concat output buffer is too small"
     );
     assert_ne!(
@@ -133,6 +153,7 @@ fn validate_buffers(shape: Bf16ConcatRowsShape, buffers: Bf16ConcatRowsBuffers<'
 #[cfg(test)]
 mod tests {
     use super::Bf16ConcatRowsBuffers;
+    use super::Bf16ConcatRowsConfig;
     use super::Bf16ConcatRowsShape;
     use super::validate_buffers;
     use crate::metal::Buffer;
@@ -142,11 +163,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "bf16 row concat output elements exceeds the shader u32 count domain")]
     fn test_shape_rejects_doubled_output_count_overflow() {
-        Bf16ConcatRowsShape {
-            num_rows: u32::MAX,
-            num_cols: 1,
-        }
-        .validate();
+        Bf16ConcatRowsConfig { num_cols: 1 }.validate_shape(Bf16ConcatRowsShape { num_rows: u32::MAX });
     }
 
     #[test]
@@ -156,10 +173,8 @@ mod tests {
         let shared = Buffer::new_zeroed_elements(&device, 4, Dtype::Bfloat16);
         let rhs = Buffer::new_zeroed_elements(&device, 2, Dtype::Bfloat16);
         validate_buffers(
-            Bf16ConcatRowsShape {
-                num_rows: 1,
-                num_cols: 2,
-            },
+            Bf16ConcatRowsConfig { num_cols: 2 },
+            Bf16ConcatRowsShape { num_rows: 1 },
             Bf16ConcatRowsBuffers {
                 lhs: &shared,
                 rhs: &rhs,
@@ -175,10 +190,8 @@ mod tests {
         let lhs = Buffer::new_zeroed_elements(&device, 2, Dtype::Bfloat16);
         let shared = Buffer::new_zeroed_elements(&device, 4, Dtype::Bfloat16);
         validate_buffers(
-            Bf16ConcatRowsShape {
-                num_rows: 1,
-                num_cols: 2,
-            },
+            Bf16ConcatRowsConfig { num_cols: 2 },
+            Bf16ConcatRowsShape { num_rows: 1 },
             Bf16ConcatRowsBuffers {
                 lhs: &lhs,
                 rhs: &shared,

@@ -1,3 +1,5 @@
+//! Indexed row gather for dense Metal buffers.
+
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -10,56 +12,51 @@ const ROW_GATHER_SOURCE: &str = include_str!("metal/row_gather.metal");
 const NUM_THREADS_PER_THREADBLOCK: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RowGatherShape {
-    pub num_rows: u32,
+pub struct RowGatherConfig {
     pub num_cols: u32,
     pub dtype: Dtype,
 }
 
-impl RowGatherShape {
-    pub fn bf16(num_rows: u32, num_cols: u32) -> Self {
-        Self {
-            num_rows,
-            num_cols,
-            dtype: Dtype::Bfloat16,
-        }
-    }
-
-    pub fn f32(num_rows: u32, num_cols: u32) -> Self {
-        Self {
-            num_rows,
-            num_cols,
-            dtype: Dtype::Float32,
-        }
-    }
-
-    pub fn validate(self) {
-        assert!(self.num_rows > 0);
+impl RowGatherConfig {
+    fn validate(self) {
         assert!(self.num_cols > 0);
         assert!(matches!(self.dtype, Dtype::Bfloat16 | Dtype::Float32));
     }
 
-    pub fn min_input_bytes(self) -> usize {
+    fn row_bytes(self) -> usize {
         (self.num_cols as usize)
             .checked_mul(self.dtype.item_size())
-            .expect("row gather minimum input byte length must fit usize")
+            .expect("row gather byte length per row must fit usize")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RowGatherShape {
+    pub num_rows: u32,
+}
+
+impl RowGatherShape {
+    fn validate(self, config: RowGatherConfig) {
+        config.validate();
+        assert!(self.num_rows > 0);
+        self.num_values(config);
     }
 
-    pub fn row_indices_bytes(self) -> usize {
+    fn row_indices_bytes(self) -> usize {
         (self.num_rows as usize)
             .checked_mul(size_of::<u32>())
             .expect("row gather index byte length must fit usize")
     }
 
-    pub fn output_bytes(self) -> usize {
-        (self.num_values() as usize)
-            .checked_mul(self.dtype.item_size())
+    fn output_bytes(self, config: RowGatherConfig) -> usize {
+        (self.num_values(config) as usize)
+            .checked_mul(config.dtype.item_size())
             .expect("row gather output byte length must fit usize")
     }
 
-    fn num_values(self) -> u32 {
+    fn num_values(self, config: RowGatherConfig) -> u32 {
         self.num_rows
-            .checked_mul(self.num_cols)
+            .checked_mul(config.num_cols)
             .expect("row gather value count must fit the shader u32 index domain")
     }
 }
@@ -67,41 +64,42 @@ impl RowGatherShape {
 #[derive(Clone, Copy)]
 pub struct RowGatherBuffers<'a> {
     pub input: &'a Buffer,
+    /// Each active index must select a complete row from `input`.
     pub row_indices: &'a Buffer,
     pub output: &'a Buffer,
 }
 
 pub struct RowGatherKernel {
-    bf16_kernel: Kernel,
-    f32_kernel: Kernel,
+    config: RowGatherConfig,
+    kernel: Kernel,
 }
 
 impl RowGatherKernel {
-    pub fn new(device: &Device) -> Self {
+    pub fn new(device: &Device, config: RowGatherConfig) -> Self {
+        config.validate();
+        let function_name = match config.dtype {
+            Dtype::Bfloat16 => "row_gather_bf16",
+            Dtype::Float32 => "row_gather_f32",
+            _ => unreachable!("validated row gather dtype"),
+        };
         Self {
-            bf16_kernel: Kernel::new(device, ROW_GATHER_SOURCE, "row_gather_bf16"),
-            f32_kernel: Kernel::new(device, ROW_GATHER_SOURCE, "row_gather_f32"),
+            config,
+            kernel: Kernel::new(device, ROW_GATHER_SOURCE, function_name),
         }
     }
 
     pub fn invoke<'a>(&'a self, shape: RowGatherShape, buffers: RowGatherBuffers<'a>) -> RowGatherInvocation<'a> {
         RowGatherInvocation {
-            kernel: self.kernel(shape),
+            config: self.config,
+            kernel: &self.kernel,
             shape,
             buffers,
-        }
-    }
-
-    fn kernel(&self, shape: RowGatherShape) -> &Kernel {
-        match shape.dtype {
-            Dtype::Bfloat16 => &self.bf16_kernel,
-            Dtype::Float32 => &self.f32_kernel,
-            dtype => panic!("unsupported row gather dtype {dtype:?}"),
         }
     }
 }
 
 pub struct RowGatherInvocation<'a> {
+    config: RowGatherConfig,
     kernel: &'a Kernel,
     shape: RowGatherShape,
     buffers: RowGatherBuffers<'a>,
@@ -114,18 +112,18 @@ impl Operator for RowGatherInvocation<'_> {
         builder.set_buffer_read(0, self.buffers.input, 0);
         builder.set_buffer_read(1, self.buffers.row_indices, 0);
         builder.set_buffer_write(2, self.buffers.output, 0);
-        builder.set_u32(3, self.shape.num_cols);
+        builder.set_u32(3, self.config.num_cols);
         builder.set_u32(4, self.shape.num_rows);
-        builder.dispatch_1d(self.shape.num_values() as usize, NUM_THREADS_PER_THREADBLOCK);
+        builder.dispatch_1d(self.shape.num_values(self.config) as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
 impl RowGatherInvocation<'_> {
     fn validate(&self) {
-        self.shape.validate();
-        assert!(self.buffers.input.len_bytes() >= self.shape.min_input_bytes());
+        self.shape.validate(self.config);
+        assert!(self.buffers.input.len_bytes() >= self.config.row_bytes());
         assert!(self.buffers.row_indices.len_bytes() >= self.shape.row_indices_bytes());
-        assert!(self.buffers.output.len_bytes() >= self.shape.output_bytes());
+        assert!(self.buffers.output.len_bytes() >= self.shape.output_bytes(self.config));
     }
 }
 
@@ -138,7 +136,13 @@ mod tests {
     fn test_bf16() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = RowGatherKernel::new(&device);
+        let kernel = RowGatherKernel::new(
+            &device,
+            RowGatherConfig {
+                num_cols: 2,
+                dtype: Dtype::Bfloat16,
+            },
+        );
         let input = Buffer::from_slice(
             &device,
             &[0x3f80_u16, 0x4000_u16, 0x4040_u16, 0x4080_u16, 0x40a0_u16, 0x40c0_u16],
@@ -148,7 +152,7 @@ mod tests {
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
-            RowGatherShape::bf16(2, 2),
+            RowGatherShape { num_rows: 2 },
             RowGatherBuffers {
                 input: &input,
                 row_indices: &row_indices,

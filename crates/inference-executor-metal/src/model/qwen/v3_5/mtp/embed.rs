@@ -1,13 +1,14 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::Bf16ConcatRowsBuffers;
-use inference_backend_metal::components::Bf16ConcatRowsKernel;
-use inference_backend_metal::components::Bf16ConcatRowsShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::Bf16ConcatRowsBuffers;
+use inference_backend_metal::operators::Bf16ConcatRowsConfig;
+use inference_backend_metal::operators::Bf16ConcatRowsKernel;
+use inference_backend_metal::operators::Bf16ConcatRowsShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
@@ -30,7 +31,6 @@ use crate::replay::ReplayComponent;
 pub struct Qwen35MTPEmbed {
     embed: Rc<Embed>,
     input_gather: Gather,
-    hidden_dim: usize,
     hidden_norm: RMSNorm,
     embedding_norm: RMSNorm,
     concat: Bf16ConcatRowsKernel,
@@ -105,8 +105,12 @@ impl Qwen35MTPEmbed {
         u32::try_from(fused_elements).expect("qwen3.5 MTP fused capacity must fit shader u32 count");
         Ok(Self {
             embed,
-            input_gather: Gather::new(device),
-            hidden_dim,
+            input_gather: Gather::new(
+                device,
+                hidden_dim
+                    .try_into()
+                    .expect("qwen3.5 MTP hidden dimension must fit u32"),
+            ),
             hidden_norm: RMSNorm::new(
                 device,
                 hidden_dim,
@@ -119,7 +123,14 @@ impl Qwen35MTPEmbed {
                 config.text_config.rms_norm_eps,
                 token_hidden_norm_weight,
             ),
-            concat: Bf16ConcatRowsKernel::new(device),
+            concat: Bf16ConcatRowsKernel::new(
+                device,
+                Bf16ConcatRowsConfig {
+                    num_cols: hidden_dim
+                        .try_into()
+                        .expect("qwen3.5 MTP hidden dimension must fit u32"),
+                },
+            ),
             fc: AffineQuantizedMatmul::new(device, fc_config),
             fc_weight,
             fc_scales,
@@ -145,15 +156,8 @@ impl Qwen35MTPEmbed {
             .record_with_barrier(recorder, num_tokens, previous_hidden, &self.normed_hidden);
         self.embedding_norm
             .record(recorder, num_tokens, shifted_embeddings, &self.normed_embedding);
-        let hidden_dim = self
-            .hidden_dim
-            .try_into()
-            .expect("qwen3.5 MTP hidden dimension must fit u32");
         recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke(
-            Bf16ConcatRowsShape {
-                num_rows: num_tokens,
-                num_cols: hidden_dim,
-            },
+            Bf16ConcatRowsShape { num_rows: num_tokens },
             Bf16ConcatRowsBuffers {
                 lhs: &self.normed_embedding,
                 rhs: &self.normed_hidden,
@@ -184,9 +188,6 @@ impl Qwen35MTPEmbed {
         self.input_gather.record(
             recorder,
             num_tokens,
-            self.hidden_dim
-                .try_into()
-                .expect("qwen3.5 MTP hidden dimension must fit u32"),
             args.prev_hidden_source,
             args.prev_hidden_indices,
             args.prev_hidden_input,

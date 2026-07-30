@@ -35,12 +35,6 @@ fn assert_u32_index_domain(num_elements: usize, name: &str) {
     );
 }
 
-mod buffer_cast;
-pub use buffer_cast::BufferCastBuffers;
-pub use buffer_cast::BufferCastConfig;
-pub use buffer_cast::BufferCastKernel;
-pub use buffer_cast::BufferCastShape;
-
 mod buffer_copy;
 pub use buffer_copy::F32BufferCopyBuffers;
 pub use buffer_copy::F32BufferCopyKernel;
@@ -48,11 +42,6 @@ pub use buffer_copy::F32BufferCopyShape;
 pub use buffer_copy::U32BufferCopyBuffers;
 pub use buffer_copy::U32BufferCopyKernel;
 pub use buffer_copy::U32BufferCopyShape;
-
-mod bf16_concat_rows;
-pub use bf16_concat_rows::Bf16ConcatRowsBuffers;
-pub use bf16_concat_rows::Bf16ConcatRowsKernel;
-pub use bf16_concat_rows::Bf16ConcatRowsShape;
 
 mod quantized_dense_mlp;
 pub use quantized_dense_mlp::QuantizedDenseMLP;
@@ -192,11 +181,6 @@ pub use residual_add_rms_norm::ResidualAddRMSNormInvocation;
 pub use residual_add_rms_norm::ResidualAddRMSNormKernel;
 pub use residual_add_rms_norm::ResidualAddRMSNormKernelKind;
 pub use residual_add_rms_norm::ResidualAddRMSNormShape;
-
-mod row_gather;
-pub use row_gather::RowGatherBuffers;
-pub use row_gather::RowGatherKernel;
-pub use row_gather::RowGatherShape;
 
 mod replay;
 pub use replay::ReplayOp;

@@ -1,7 +1,3 @@
-use inference_backend_metal::components::BufferCastBuffers;
-use inference_backend_metal::components::BufferCastConfig;
-use inference_backend_metal::components::BufferCastKernel;
-use inference_backend_metal::components::BufferCastShape;
 use inference_backend_metal::components::GDNCompute;
 use inference_backend_metal::components::GDNComputeBuffers;
 use inference_backend_metal::components::GDNComputeConfig;
@@ -16,6 +12,10 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::BufferCastBuffers;
+use inference_backend_metal::operators::BufferCastConfig;
+use inference_backend_metal::operators::BufferCastKernel;
+use inference_backend_metal::operators::BufferCastShape;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::backend::recorder::Recorder;

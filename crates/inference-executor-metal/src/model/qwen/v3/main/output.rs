@@ -19,7 +19,6 @@ use crate::replay::ReplayComponent;
 pub struct Qwen3GatherUnembed {
     gather: Gather,
     unembed: Rc<Unembed>,
-    hidden_dim: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -44,9 +43,8 @@ impl Qwen3GatherUnembed {
 
     pub fn new(device: &Device, hidden_dim: u32, unembed: Rc<Unembed>) -> Self {
         Self {
-            gather: Gather::new(device),
+            gather: Gather::new(device, hidden_dim),
             unembed,
-            hidden_dim,
         }
     }
 
@@ -61,7 +59,6 @@ impl Qwen3GatherUnembed {
         self.gather.record(
             recorder,
             args.num_rows,
-            self.hidden_dim,
             args.hidden_input,
             args.row_indices,
             args.hidden_output,

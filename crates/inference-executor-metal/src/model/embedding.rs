@@ -7,6 +7,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
+use inference_executor_core::checkpoint::remove_tensor;
 use inference_executor_core::def::ModelExecutorError;
 
 use crate::checkpoint::SafeTensorStore;
@@ -138,15 +139,14 @@ impl EmbedWeights {
         config: QuantizedEmbeddingConfig,
         bindings: QuantizedTensorBindings,
     ) -> Result<Self, ModelExecutorError> {
-        let weight = store
-            .tensor_bytes(&bindings.weight, safetensors::Dtype::U32)?
-            .into_data();
-        let scales = store
-            .tensor_bytes(&bindings.scales, safetensors::Dtype::BF16)?
-            .into_data();
-        let biases = store
-            .tensor_bytes(&bindings.biases, safetensors::Dtype::BF16)?
-            .into_data();
+        let mut tensors = store.load_tensors([
+            bindings.weight.as_str(),
+            bindings.scales.as_str(),
+            bindings.biases.as_str(),
+        ])?;
+        let weight = remove_tensor(&mut tensors, &bindings.weight, safetensors::Dtype::U32)?.into_data();
+        let scales = remove_tensor(&mut tensors, &bindings.scales, safetensors::Dtype::BF16)?.into_data();
+        let biases = remove_tensor(&mut tensors, &bindings.biases, safetensors::Dtype::BF16)?.into_data();
         validate_len("embed weight", weight.len(), config.weight_bytes())?;
         validate_len(
             "embed scales",
@@ -154,11 +154,13 @@ impl EmbedWeights {
             config.num_affine_params() * config.scale_bias_dtype.item_size(),
         )?;
         validate_len("embed biases", biases.len(), scales.len())?;
-        Ok(Self {
+        let weights = Self {
             weight: Buffer::from_slice(device, &weight),
             scales: Buffer::from_slice(device, &scales),
             biases: Buffer::from_slice(device, &biases),
-        })
+        };
+        assert!(tensors.is_empty(), "embed must consume its tensor map");
+        Ok(weights)
     }
 }
 

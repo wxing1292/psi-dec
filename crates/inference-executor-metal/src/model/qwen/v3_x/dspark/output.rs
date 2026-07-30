@@ -16,7 +16,6 @@ use crate::sampling::spec_probs::SpecProbsStore;
 
 pub struct Qwen3xDSparkGatherUnembed {
     block_size: usize,
-    hidden_dim: u32,
     gather: Gather,
     unembed: Rc<Unembed>,
     row_indices: Buffer,
@@ -57,8 +56,7 @@ impl Qwen3xDSparkGatherUnembed {
         assert!(max_requests > 0, "Qwen3 DSpark GatherUnembed requires requests");
         Self {
             block_size,
-            hidden_dim,
-            gather: Gather::new(device),
+            gather: Gather::new(device, hidden_dim),
             unembed,
             row_indices: Buffer::new_zeroed_elements(
                 device,
@@ -113,7 +111,6 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
         self.gather.record(
             recorder,
             num_rows,
-            self.hidden_dim,
             input.hidden_input,
             &self.row_indices,
             input.hidden_output,

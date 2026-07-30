@@ -1,3 +1,5 @@
+//! Element-wise conversion between Metal buffer element types.
+
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
