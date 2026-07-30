@@ -39,9 +39,11 @@ impl Qwen3xGQAState {
             "qwen3.x cache page IDs must fit u32"
         );
         page_table_layout.validate();
+        let backend = Rc::new(GQA::new(device, core, metal));
+        let scratch = Rc::new(backend.new_scratch(max_tokens));
         Self {
-            backend: Rc::new(GQA::new(device, core.clone(), metal)),
-            scratch: Rc::new(GQAScratch::new(device, &core, metal, max_tokens)),
+            backend,
+            scratch,
             request_page_table: Rc::new(GQARequestPageTable::new(device, page_table_layout)),
             metadata: GQAMetadataBuffers::new(device, max_tokens),
             num_cache_pages,

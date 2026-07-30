@@ -50,16 +50,17 @@ crates/inference-executor-metal/src/model/qwen/
 crates/inference-backend-metal/src/components/
   gqa_attention.rs          reusable Metal paged SDPA component kernels
   gqa_block_attention.rs    reusable dense bidirectional block-SDPA partial kernel
-  gqa_projection.rs         gated QGKV projection split component
-  ungated_gqa_projection.rs ungated QKV projection split component
+  gqa_compute.rs            backend-owned GQA compute-path selection and geometry
+  gqa_qgkv_split.rs         gated QGKV split component
+  gqa_qkv_split.rs          ungated QKV split component
   gqa_norm_rope.rs          reusable Metal q/k fused and single-input norm/RoPE component kernels
-  gqa_kv_pages.rs           reusable Metal KV page update component kernels
+  gqa_kv_page_write.rs      reusable Metal KV page-write component
   gqa_tiled_attention.rs    reusable token/Q-head tiled paged SDPA component
   metal/
-    gqa_projection_split.metal  gated QGKV projection split source
-    ungated_gqa_projection_split.metal  ungated QKV projection split source
+    gqa_qgkv_split.metal       gated QGKV split source
+    gqa_qkv_split.metal        ungated QKV split source
     gqa_norm_rope.metal         Metal q/k norm and RoPE source
-    gqa_kv_pages.metal          Metal KV page-update source
+    gqa_kv_page_write.metal     Metal KV page-write source
     gqa_paged_sdpa_map.metal     Metal paged SDPA map source
     gqa_paged_sdpa_reduce.metal  Metal paged SDPA partial-output reduce source
     gqa_block_sdpa.metal         Metal dense block-SDPA partial-output source
@@ -83,7 +84,10 @@ It provides the current active token count when it records the projection.
 The affine operator selects QMV or a QMM tile.
 GQA code does not store separate QMV/QMM kernels or a projection threshold.
 This contract applies to fused QGKV/QKV projections, output projections, and DSpark context K/V projections.
-The SDPA single-Q-token/tiled-Q-token selection remains a separate attention-plan decision.
+The Metal GQA backend derives the SDPA tile and threadblock geometry from the attention shape.
+It also selects the single-Q-token or tiled-Q-token path from the prepared batch shape.
+Model plans do not specify Metal SDPA tiles or threadblock sizes.
+An exact backend microbenchmark may construct a low-level SDPA component with explicit geometry.
 
 ## Ownership
 
@@ -165,10 +169,10 @@ The runtime still owns physical page allocation and release.
 ```text
 req_slots[num_tokens]
 flat_token_indices[num_tokens]
-q_token_tiles[num_q_token_tiles][flat_token_start/flat_token_end]  // TiledQTokens
+q_token_tiles[num_q_token_tiles][flat_token_start/flat_token_end]  // TiledQueryTokens
 sdpa_map_task_templates[total_sdpa_map_task_templates][q_token_tile_index/kv_token_begin/kv_token_end]
-cu_sdpa_partial_outputs[num_tokens + 1]                              // SingleQToken
-cu_sdpa_partial_outputs[num_q_token_tiles + 1]                       // TiledQTokens
+cu_sdpa_partial_outputs[num_tokens + 1]                              // SingleQueryToken
+cu_sdpa_partial_outputs[num_q_token_tiles + 1]                       // TiledQueryTokens
 ```
 
 Each three-`u32` entry materializes one compact `SDPAMapTaskTemplate`. It contains a Q-token-tile index followed by the
@@ -178,7 +182,7 @@ The grid supplies `kv_head_index` and `q_head_tile_index`. These coordinates com
 logical `SDPAMapTask`. One threadblock owns each task in a `1:1` relation. The buffer does not duplicate the grid-derived
 coordinates.
 
-`SingleQToken` uses one-token Q tiles. `TiledQTokens` first builds request-local Q-token tiles.
+`SingleQueryToken` uses one-token Q tiles. `TiledQueryTokens` first builds request-local Q-token tiles.
 
 The planner assigns additional TaskTemplates to the Q-token tile with the most remaining KV-tile work. TaskTemplates
 for one Q-token tile are contiguous.
@@ -189,7 +193,7 @@ For a fixed Q-token/head output coordinate, adjacent `cu_sdpa_partial_outputs` v
 `total_sdpa_map_task_templates` is the power-of-two replay extent. Unused tail TaskTemplates contain an invalid
 Q-token-tile index and do not write a map result.
 
-The `SingleQToken` paged map also permits an invalid-Q-token-tile `SDPAMapTaskTemplate` in one token's TaskTemplate
+The `SingleQueryToken` paged map also permits an invalid-Q-token-tile `SDPAMapTaskTemplate` in one token's TaskTemplate
 range. This template does not write a paged partial output for that slot.
 
 A caller may populate the reserved max-logit, exp-sum, and normalized `SDPAPartialOutput` through
@@ -253,7 +257,7 @@ qgkv-proj
 split
 q-norm-rope
 k-norm-rope
-kv-update
+kv-page-write
 sdpa-single-q-token
 sdpa-tiled-q-tokens
 gate
@@ -268,8 +272,8 @@ not materialize a forward-local dense context window.
 
 The path does not upload per-forward block tables before it launches the selected Metal attention kernels.
 
-`SingleQToken` and `TiledQTokens` map/reduce generate Metal source from the exact recorded component geometry.
-Immutable head, dtype, page, scale, and tile choices become source constants.
+`SingleQueryToken` and `TiledQueryTokens` map/reduce generate Metal source from the exact selected component geometry.
+Immutable head, dtype, page, scale, and backend-selected tile choices become source constants.
 
 Replay work determines the cached recorded variant. This work includes `num_tokens`, Q-token tiles, the total map
 TaskTemplate extent, and the selected Q-head tile width.
@@ -280,7 +284,10 @@ as a replay argument.
 The common kernel source-hash cache reuses identical generated pipelines. This specialization does not introduce
 model-specific backend types or names.
 
-Paged `SingleQToken` SDPA exposes static geometry/tuning separately from dynamic replay work:
+Recording materializes the replay-specific `GQAPagedSDPAKernels` or `GQATiledSDPAKernels`. The recorded invocation
+retains its Metal pipelines. The GQA owner must not add a second pipeline cache.
+
+Paged `SingleQueryToken` SDPA exposes static geometry/tuning separately from dynamic replay work:
 
 ```text
 GQAPagedSDPAConfig              GQAPagedSDPAShape
@@ -294,7 +301,7 @@ GQAPagedSDPAConfig              GQAPagedSDPAShape
   kv_token_tile_size
   num_threads_per_threadblock
   q_head_tile_size
-  dtype
+  io_dtype
 ```
 
 `total_sdpa_map_task_templates` is the padded extent of compact TaskTemplates. It is not the raw number of KV-token
@@ -308,8 +315,14 @@ The backend configuration is model-independent.
 `model/qwen/v3_x/dspark/plan.rs` builds the Qwen3x DSpark ungated core.
 `model/qwen/v3_5/plan.rs` builds gated Main and MTP cores.
 
-Each concrete backend converts its core and `GQAMetalConfig` into a projection split. It also constructs the shared
-norm/RoPE, KV-update, paged-SDPA, and output-projection components.
+Each concrete backend converts its core and `GQAMetalConfig` into a projection split. `GQAMetalConfig` contains only
+model, quantization, storage, and RoPE facts. The backend derives Metal SDPA tuning from `head_dim`. It then constructs
+the shared norm/RoPE, KV-update, paged-SDPA, and output-projection components.
+
+The Qwen GQA weight owner loads one bounded `TensorMap` from its exact GQA binding subtree.
+It removes Q/K/V, norm, and output tensors from that map.
+It then materializes the fused QGKV or QKV buffers required by the selected backend ABI.
+The map must be empty after construction.
 
 Only gated `GQA` constructs the activation-gate component. Backend source and APIs contain no Qwen model names or Qwen
 configuration types.
@@ -339,10 +352,10 @@ The alias does not allocate or add a wrapper.
 Focused tests and benches use the same `ReplayLayer::record(...)` entrypoint as model replay. The data-flow section
 defines the stage order and buffer dependencies.
 
-KV page update uses the same model KV dtype as projection scratch and paged SDPA. The component derives its page stride
+KV page write uses the same model KV dtype as projection scratch and paged SDPA. The component derives its page stride
 and `num_tokens_per_page` with that dtype.
 
-The Metal component selects the matching bf16/f32 update kernel. `GQAKVPageUpdateConfig` owns the stable
+The Metal component selects the matching bf16/f32 update kernel. `GQAKVPageWriteConfig` owns the stable
 `num_kv_heads`, `head_dim`, `page_bytes`, dtype, and derived tokens-per-page.
 
 `num_token_writes`, `gqa_layer_index`, and page-table coordinates remain invocation data.
@@ -351,12 +364,12 @@ The replay shape separates fixed page-table layout from execution work:
 
 ```text
 num_tokens                 number of flat tokens in the microbatch
-num_q_token_tiles          request-local Q-token tiles; equals num_tokens for SingleQToken replay
+num_q_token_tiles          request-local Q-token tiles; equals num_tokens for SingleQueryToken replay
 total_sdpa_map_task_templates       padded SDPA map TaskTemplate extent used by dispatch and scratch
 reduce_sdpa_partial_outputs   whether the selected batch plan semantically requires partial reduction
 ```
 
-`SingleQToken` replay always records the reduce command. It records this command even when each token has only one map
+`SingleQueryToken` replay always records the reduce command. It records this command even when each token has only one map
 TaskTemplate.
 
 This rule lets both TaskTemplate layouts share one recorded program for the same Q-token-tile and map-TaskTemplate
@@ -389,11 +402,11 @@ each 32 KiB physical page.
 
 One logical block therefore owns two pages per GQA layer. It owns 80 pages across all 40 layers.
 
-For Qwen3.5 model replay, `GQARequestPageTable::prepare(...)` validates and writes the current runtime page updates to
+For Qwen3.5 model replay, `GQARequestPageTable::prepare(...)` validates and writes the current runtime page writes to
 the bound table. `GQA::prepare(...)` selects the SDPA path and builds the batch plan once. Every GQA layer reuses this
 plan.
 
-`SingleQToken` replay always records partial-output reduction. This rule also applies when each batch token has one
+`SingleQueryToken` replay always records partial-output reduction. This rule also applies when each batch token has one
 TaskTemplate.
 
 `Qwen35MainReplayKey` and `Qwen35MTPReplayKey` therefore include only `num_q_token_tiles` and
@@ -404,7 +417,16 @@ geometry. Both map-TaskTemplate layouts share the recorded program when their ge
 
 ### Execution strategy
 
-`GQASDPAPath` selects one of two production map/reduce kernel paths. Both paths partition a long visible KV context
+`GQAComputeConfig` contains the fixed workload facts: `io_dtype`, page bytes, Q-head count, KV-head count, and head
+dimension. `GQACompute::new(...)` derives the supported paths and all tile geometry from these facts. The
+executor must not supply a path-capability flag or a tile-policy flag.
+
+DSpark uses `GQACompute::new_dspark_history(...)`. Its paged-history map and block-bidirectional map must
+produce the same single-Q partial ABI for one shared reduce. This constructor applies that composition constraint. It
+does not let the caller select tile geometry.
+
+`GQACompute::select(...)` returns one `GQAComputePath`. The selected path and its complete geometry are stored with the
+prepared batch metadata. Recording executes that same path. Both paths partition a long visible KV context
 into independent `SDPAMapTaskTemplate`s.
 
 The paths differ in the number of Q tokens and Q heads that one map threadblock computes:
@@ -415,8 +437,8 @@ parallelism: TaskTemplate x KV head x Q-head tile
 input: normalized Q plus paged K/V selected through the request page table
 output: context-segment partials, followed by one numerically stable reduce
 
-SingleQToken    one Q token per Q-token tile; scalar dot/reduction work
-TiledQTokens    several Q tokens/Q heads per tile; SIMD-group matrix work
+SingleQueryToken    one Q token per Q-token tile; scalar dot/reduction work
+TiledQueryTokens    several Q tokens/Q heads per tile; SIMD-group matrix work
 ```
 
 Both paths use GQA head sharing. If `G = Hq / Hkv`, KV head `k` supplies K/V to Q heads
@@ -440,7 +462,7 @@ visible context [0, N)
 `cu_sdpa_partial_outputs` selects the consecutive partials for each Q-token tile. Padded replay TaskTemplates use
 `q_token_tile_index = u32::MAX`. Their threadblocks return without writing.
 
-The selector uses `SingleQToken` unless `TiledQTokens` supports the current shape. The explicit bf16 production
+The selector uses `SingleQueryToken` unless `TiledQueryTokens` supports the current shape. The explicit bf16 production
 profiles are `(D=128, 8 KV tokens/page)` and `(D=256, 16 KV tokens/page)`.
 
 Both profiles support at most 8 Q heads per KV head. The gated backend currently reaches only the `D=256` profile.
@@ -449,10 +471,10 @@ For supported shapes, the selector uses the average useful tokens per request-lo
 floating-point division:
 
 ```text
-num_tokens < 2 * num_q_token_tiles       -> SingleQToken
-D=128 profile                            -> TiledQTokens, full Q/KV group
-D=256 and num_tokens < 4 * tiles         -> TiledQTokens, roughly half the Q/KV group
-otherwise                                -> TiledQTokens, full Q/KV group
+num_tokens < 2 * num_q_token_tiles       -> SingleQueryToken
+D=128 profile                            -> TiledQueryTokens, full Q/KV group
+D=256 and num_tokens < 4 * tiles         -> TiledQueryTokens, roughly half the Q/KV group
+otherwise                                -> TiledQueryTokens, full Q/KV group
 ```
 
 The Q-head tile is capped at 256 threads. Current reachable model paths are:
@@ -460,15 +482,15 @@ The Q-head tile is capped at 256 threads. Current reachable model paths are:
 | Model | `Hq / Hkv / D` | KV tokens/page | Production path |
 | --- | --- | ---: | --- |
 | Qwen3-14B | `40 / 8 / 128` | 8 | selector above, tiled `Hq_tile=5` |
-| Qwen3.6-27B | `24 / 4 / 256` | 8 | `SingleQToken` |
+| Qwen3.6-27B | `24 / 4 / 256` | 8 | `SingleQueryToken` |
 | Qwen3.6-35B-A3B | `16 / 2 / 256` | 16 | selector above |
 | Qwen3 DSpark | checkpoint-derived | model-derived | paged history + block bidirectional |
 
-For 35B, `TiledQTokens` uses `Hq_tile=4` below four useful tokens/tile and `Hq_tile=8` otherwise.
+For 35B, `TiledQueryTokens` uses `Hq_tile=4` below four useful tokens/tile and `Hq_tile=8` otherwise.
 
-#### `SingleQToken`
+#### `SingleQueryToken`
 
-`SingleQToken` always uses `Tq_tile=1`. Qwen3-14B specializes `Tkv_tile=128`, 128 threads, and `Hq_tile=5`.
+`SingleQueryToken` always uses `Tq_tile=1`. Qwen3-14B specializes `Tkv_tile=128`, 128 threads, and `Hq_tile=5`.
 
 The Qwen3.5 profiles retain `Tkv_tile=256`, 256 threads, and their model-derived Q-head tile:
 
@@ -508,7 +530,7 @@ The Qwen3.5 `D=256` profiles use one active thread per output dimension. The 27B
 The kernels stream K/V from global memory instead of staging them as threadgroup tiles. Running statistics and owned
 output dimensions are MSL thread-local values.
 
-#### `TiledQTokens`
+#### `TiledQueryTokens`
 
 The common tiled geometry is:
 
@@ -558,18 +580,18 @@ fragments are MSL thread-local.
 
 The current kernel has one K workspace and one V workspace. It does not double-buffer consecutive K/V tiles.
 
-Both paths reduce context-segment partials by rescaling them to one global maximum. `SingleQToken` reduces flat
+Both paths reduce context-segment partials by rescaling them to one global maximum. `SingleQueryToken` reduces flat
 `[token, Q head, D]` elements.
 
-`TiledQTokens` launches one block per `(Q head, Q-token tile)`. The block strides over active `token x D` elements.
+`TiledQueryTokens` launches one block per `(Q head, Q-token tile)`. The block strides over active `token x D` elements.
 
-`SingleQToken` records reduce even for one TaskTemplate per token. This rule keeps the replay topology stable.
-`TiledQTokens` always records its tiled reduce.
+`SingleQueryToken` records reduce even for one TaskTemplate per token. This rule keeps the replay topology stable.
+`TiledQueryTokens` always records its tiled reduce.
 
 Focused fixed, request-tail, multi-tile, and ragged cases compare both paths with the CPU reference.
 
-Qwen3.5 keeps reusable gated-GQA scratch in the directly owned `Qwen3xGQAState`. Individual GQA layers do not own this
-scratch.
+Qwen3.5 keeps reusable gated-GQA scratch in the directly owned `Qwen3xGQAState`. The `GQA` backend creates this scratch
+from its one `GQACompute` capacity contract. Individual GQA layers do not own this scratch.
 
 The executor owns one Main `GQAScratch`. The optional MTP owns one matching scratch because its GQA configuration can
 differ.
@@ -577,8 +599,9 @@ differ.
 This scratch contains the buffers for QGKV projection, the projected gate, gated output, norm/RoPE, and SDPA. The fixed
 gated graph requires these buffers.
 
-Qwen3 Main owns `UngatedGQAScratch`. It contains the QKV projection, norm/RoPE, and SDPA buffers for the fixed ungated
-graph. It has no gate buffers.
+Qwen3 Main owns `UngatedGQAScratch`. The `UngatedGQA` backend creates this scratch from its one `GQACompute` capacity
+contract. The scratch contains the QKV projection, norm/RoPE, and SDPA buffers for the fixed ungated graph. It has no
+gate buffers.
 
 Both scratch types expose matching borrowed replay bindings. The model stream serializes Main and MTP execution.
 Therefore, submissions reuse their buffers without per-layer allocation.
@@ -588,8 +611,9 @@ This scratch contains proposal-local Q/K/V and both attention paths' partial out
 Its partial capacity is `next_power_of_two(2 * max_requests * block_size)`.
 It does not depend on `max_position_embeddings`.
 
-The bound for SDPA partial scratch is `max_tokens * tiled_q_token_tile_size * num_q_heads`. It is independent of
-`max_position_embeddings`.
+The bound for SDPA partial scratch is
+`max_tokens * backend_selected_tiled_q_token_tile_size * num_q_heads`.
+It is independent of `max_position_embeddings`.
 
 `GQAMetadataBuffers` owns the matching submission metadata. The owner receives its capacity once and updates its data
 for each submission. Its buffers are read-only during a recorded GQA layer forward.
@@ -600,7 +624,7 @@ The buffer contract is:
 hidden_state / next_hidden_state     bf16 model boundary buffers shaped [num_tokens, hidden_dim]
 req_slots                            request slot repeated per flat token
 flat_token_indices                   request-absolute token index per flat token; used for RoPE, KV write address, and causal context length
-q_token_tiles                       request-local flat-token ranges consumed by TiledQTokens SDPA
+q_token_tiles                       request-local flat-token ranges consumed by TiledQueryTokens SDPA
 sdpa_map_task_templates              materialized Q-token-tile index and KV-token segment for SDPA map Tasks
 cu_sdpa_partial_outputs              cumulative partial-output counts selected per Q-token tile by SDPA reduce
 page_ids                             fixed-stride [req_slot, gqa_layer_index, block_index, page_id_index]
@@ -706,10 +730,10 @@ reduce(flat_token, q_head)
 Reduce uses per-partial-output max logits to combine exp sums and weighted outputs. It does not materialize a dense
 context window.
 
-`SingleQToken` replay records this reduce even when each token has one TaskTemplate. This rule keeps the replay topology
+`SingleQueryToken` replay records this reduce even when each token has one TaskTemplate. This rule keeps the replay topology
 stable.
 
-Qwen3-14B `SingleQToken` uses `kv_token_tile_size=128`, `num_threads_per_threadblock=128`, and
+Qwen3-14B `SingleQueryToken` uses `kv_token_tile_size=128`, `num_threads_per_threadblock=128`, and
 `q_head_tile_size=5`.
 
 Qwen3.5 retains `kv_token_tile_size=256`, `num_threads_per_threadblock=256`, and `q_head_tile_size <= 8`.
@@ -837,27 +861,27 @@ The comparison replay reports `path=single_q_token` or `path=tiled_q_tokens`. Mo
 selector described above.
 
 `--gqa-single-q-token-kv-token-tile-size`, `--gqa-single-q-token-num-threads-per-threadblock`, and
-`--gqa-single-q-token-max-q-head-tile-size` override the `SingleQToken` defaults.
+`--gqa-single-q-token-max-q-head-tile-size` override the `SingleQueryToken` defaults.
 
 `--gqa-tiled-q-token-tile-size`, `--gqa-tiled-kv-token-tile-size`, and `--gqa-tiled-q-head-tile-size` configure the
-`TiledQTokens` comparison path.
+`TiledQueryTokens` comparison path.
 
 When the Q-head override is absent, the bench uses the production half/full Q/KV-group rule. Bench output uses the
 corresponding `q_token_tile_size`, `kv_token_tile_size`, and `q_head_tile_size` names.
 
-`--print-limits` prints the device threadblock-memory limit. It also prints the derived `SingleQToken`
+`--print-limits` prints the device threadblock-memory limit. It also prints the derived `SingleQueryToken`
 threadblock-memory footprint.
 
 The current backend records explicit data-dependency barriers. The replay layer also infers hazards from declared
 buffer usage. It does not add a conservative every-command fallback.
 
 This bench loads real Qwen3.6 layer weights. It measures the full replay path: qgkv projection, projection split, q/k
-norm+RoPE, KV page update, paged SDPA, activation gate, and output projection.
+norm+RoPE, KV page write, paged SDPA, activation gate, and output projection.
 
 Do not compare component-only paged-SDPA timings with full-forward numbers.
 
 Subcomponent probes use the same request-slot/page-table capacity contract as full-forward replay. Multi-request
-`kv-update` probes must pass the true `num_req_slots` through the page-table layout in `GQAKVPageUpdateShape`.
+`kv-page-write` probes must pass the true `num_req_slots` through the page-table layout in `GQAKVPageWriteShape`.
 
 Do not hard-code one request slot. That value under-validates the page-table contract, even if the kernel reads the
 larger backing buffer.

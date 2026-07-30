@@ -1,7 +1,7 @@
-use inference_backend_metal::components::GQAKVPageUpdate;
-use inference_backend_metal::components::GQAKVPageUpdateBuffers;
-use inference_backend_metal::components::GQAKVPageUpdateConfig;
-use inference_backend_metal::components::GQAKVPageUpdateShape;
+use inference_backend_metal::components::GQAKVPageWrite;
+use inference_backend_metal::components::GQAKVPageWriteBuffers;
+use inference_backend_metal::components::GQAKVPageWriteConfig;
+use inference_backend_metal::components::GQAKVPageWriteShape;
 use inference_backend_metal::components::GQANormRopeBuffers;
 use inference_backend_metal::components::GQANormRopeConfig;
 use inference_backend_metal::components::GQANormRopeKernel;
@@ -52,10 +52,10 @@ pub struct UngatedDSparkGQAContextInput<'a> {
 pub struct UngatedDSparkGQAContextAppender {
     core: UngatedDSparkGQACore,
     metal: GQAMetalConfig,
-    k_projection: AffineQuantizedMatmul,
-    v_projection: AffineQuantizedMatmul,
+    k: AffineQuantizedMatmul,
+    v: AffineQuantizedMatmul,
     k_norm_rope: GQANormRopeKernel,
-    kv_update: GQAKVPageUpdate,
+    kv_page_write: GQAKVPageWrite,
 }
 
 impl DSparkGQAContextScratch {
@@ -68,9 +68,9 @@ impl DSparkGQAContextScratch {
             .expect("DSpark context scratch K/V element count must fit usize");
         Self {
             max_tokens,
-            k: Buffer::new_zeroed_elements(device, kv_elements, metal.dtype),
-            v: Buffer::new_zeroed_elements(device, kv_elements, metal.dtype),
-            k_norm_rope: Buffer::new_zeroed_elements(device, kv_elements, metal.dtype),
+            k: Buffer::new_zeroed_elements(device, kv_elements, metal.io_dtype),
+            v: Buffer::new_zeroed_elements(device, kv_elements, metal.io_dtype),
+            k_norm_rope: Buffer::new_zeroed_elements(device, kv_elements, metal.io_dtype),
         }
     }
 
@@ -92,12 +92,12 @@ impl UngatedDSparkGQAContextAppender {
         assert!(metal.rope_dim as usize <= attention.head_dim);
         let kv_config = attention_kv_config(attention, metal);
         Self {
-            k_projection: AffineQuantizedMatmul::new(device, kv_config),
-            v_projection: AffineQuantizedMatmul::new(device, kv_config),
+            k: AffineQuantizedMatmul::new(device, kv_config),
+            v: AffineQuantizedMatmul::new(device, kv_config),
             k_norm_rope: GQANormRopeKernel::new(device, k_norm_rope_config(attention, metal)),
-            kv_update: GQAKVPageUpdate::new(
+            kv_page_write: GQAKVPageWrite::new(
                 device,
-                GQAKVPageUpdateConfig {
+                GQAKVPageWriteConfig {
                     num_kv_heads: attention
                         .num_kv_heads
                         .try_into()
@@ -107,7 +107,7 @@ impl UngatedDSparkGQAContextAppender {
                         .try_into()
                         .expect("DSpark context head_dim must fit u32"),
                     page_bytes: metal.page_bytes,
-                    dtype: metal.dtype,
+                    dtype: metal.io_dtype,
                 },
             ),
             core,
@@ -135,7 +135,7 @@ impl UngatedDSparkGQAContextAppender {
             .num_tokens
             .try_into()
             .expect("DSpark context token count must fit i32");
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.k_projection.invoke(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.k.invoke(
             num_tokens,
             input.scratch.k,
             0,
@@ -148,7 +148,7 @@ impl UngatedDSparkGQAContextAppender {
             input.weights.qkv_biases,
             offsets.k_affine,
         )));
-        recorder.record(ReplayOp::opaque(self.v_projection.invoke(
+        recorder.record(ReplayOp::opaque(self.v.invoke(
             num_tokens,
             input.scratch.v,
             0,
@@ -172,8 +172,8 @@ impl UngatedDSparkGQAContextAppender {
                 output: input.scratch.k_norm_rope,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_update.invoke(
-            GQAKVPageUpdateShape {
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
+            GQAKVPageWriteShape {
                 num_token_writes: input.num_tokens,
                 page_table_layout: MetalGQAPageTableLayout {
                     num_req_slots: input.page_table_layout.num_req_slots,
@@ -183,7 +183,7 @@ impl UngatedDSparkGQAContextAppender {
                 },
                 gqa_layer_index: input.gqa_layer_index,
             },
-            GQAKVPageUpdateBuffers {
+            GQAKVPageWriteBuffers {
                 pages: input.kv_cache.kv_pages,
                 flat_k: input.scratch.k_norm_rope,
                 flat_v: input.scratch.v,
@@ -215,9 +215,9 @@ impl QKVOffsets {
                 .try_into()
                 .expect("DSpark quantization group_size must fit i32"),
             bits: metal.bits.try_into().expect("DSpark quantization bits must fit i32"),
-            input_dtype: metal.dtype,
-            output_dtype: metal.dtype,
-            scale_bias_dtype: metal.dtype,
+            input_dtype: metal.io_dtype,
+            output_dtype: metal.io_dtype,
+            scale_bias_dtype: metal.io_dtype,
         };
         let k_config = AffineQuantizedMatmulConfig {
             n: core.k_dim().try_into().expect("DSpark K dimension must fit i32"),
@@ -256,9 +256,9 @@ fn attention_kv_config(
             .try_into()
             .expect("DSpark context group_size must fit i32"),
         bits: metal.bits.try_into().expect("DSpark context bits must fit i32"),
-        input_dtype: metal.dtype,
-        output_dtype: metal.dtype,
-        scale_bias_dtype: metal.dtype,
+        input_dtype: metal.io_dtype,
+        output_dtype: metal.io_dtype,
+        scale_bias_dtype: metal.io_dtype,
     }
 }
 
@@ -271,7 +271,7 @@ fn k_norm_rope_config(
         .try_into()
         .expect("DSpark context KV-head count must fit u32");
     let head_dim = core.head_dim.try_into().expect("DSpark context head_dim must fit u32");
-    match metal.dtype {
+    match metal.io_dtype {
         Dtype::Float32 => {
             GQANormRopeConfig::f32(
                 num_heads,
@@ -309,16 +309,11 @@ mod tests {
             group_size: 64,
             bits: 4,
             page_bytes: 32 * 1024,
-            single_q_token_kv_token_tile_size: 256,
-            single_q_token_num_threads_per_threadblock: 128,
-            single_q_token_max_q_head_tile_size: 8,
-            tiled_q_token_tile_size: 64,
-            tiled_kv_token_tile_size: 64,
             rope_dim: 128,
             norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
             rope_scale: 1.0,
-            dtype: Dtype::Bfloat16,
+            io_dtype: Dtype::Bfloat16,
         };
 
         let offsets = QKVOffsets::new(&core, metal);

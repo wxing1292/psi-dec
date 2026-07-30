@@ -7,17 +7,17 @@ use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
 
-const UNGATED_GQA_PROJECTION_SPLIT_SOURCE: &str = include_str!("metal/ungated_gqa_projection_split.metal");
+const GQA_QKV_SPLIT_SOURCE: &str = include_str!("metal/gqa_qkv_split.metal");
 
 #[derive(Clone, Copy, Debug)]
-pub struct UngatedGQAProjectionSplitConfig {
+pub struct GQAQKVSplitConfig {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub dtype: Dtype,
 }
 
-impl UngatedGQAProjectionSplitConfig {
+impl GQAQKVSplitConfig {
     pub fn f32(num_q_heads: u32, num_kv_heads: u32, head_dim: u32) -> Self {
         Self {
             num_q_heads,
@@ -44,14 +44,14 @@ impl UngatedGQAProjectionSplitConfig {
         let _ = self.qkv_width();
     }
 
-    pub fn num_qkv_slots(self, shape: UngatedGQAProjectionSplitShape) -> usize {
+    pub fn num_qkv_slots(self, shape: GQAQKVSplitShape) -> usize {
         checked_product(
             "ungated GQA projection element count",
             &[shape.num_tokens as usize, self.qkv_width()],
         )
     }
 
-    pub fn num_q_slots(self, shape: UngatedGQAProjectionSplitShape) -> usize {
+    pub fn num_q_slots(self, shape: GQAQKVSplitShape) -> usize {
         checked_product(
             "ungated GQA query element count",
             &[
@@ -62,7 +62,7 @@ impl UngatedGQAProjectionSplitConfig {
         )
     }
 
-    pub fn num_kv_slots(self, shape: UngatedGQAProjectionSplitShape) -> usize {
+    pub fn num_kv_slots(self, shape: GQAQKVSplitShape) -> usize {
         checked_product(
             "ungated GQA key/value element count",
             &[
@@ -73,21 +73,21 @@ impl UngatedGQAProjectionSplitConfig {
         )
     }
 
-    pub fn qkv_bytes(self, shape: UngatedGQAProjectionSplitShape) -> usize {
+    pub fn qkv_bytes(self, shape: GQAQKVSplitShape) -> usize {
         checked_product(
             "ungated GQA projection byte length",
             &[self.num_qkv_slots(shape), self.dtype.item_size()],
         )
     }
 
-    pub fn q_bytes(self, shape: UngatedGQAProjectionSplitShape) -> usize {
+    pub fn q_bytes(self, shape: GQAQKVSplitShape) -> usize {
         checked_product(
             "ungated GQA query byte length",
             &[self.num_q_slots(shape), self.dtype.item_size()],
         )
     }
 
-    pub fn kv_bytes(self, shape: UngatedGQAProjectionSplitShape) -> usize {
+    pub fn kv_bytes(self, shape: GQAQKVSplitShape) -> usize {
         checked_product(
             "ungated GQA key/value byte length",
             &[self.num_kv_slots(shape), self.dtype.item_size()],
@@ -108,12 +108,12 @@ impl UngatedGQAProjectionSplitConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct UngatedGQAProjectionSplitShape {
+pub struct GQAQKVSplitShape {
     pub num_tokens: u32,
 }
 
-impl UngatedGQAProjectionSplitShape {
-    pub fn validate(self, config: UngatedGQAProjectionSplitConfig) {
+impl GQAQKVSplitShape {
+    pub fn validate(self, config: GQAQKVSplitConfig) {
         config.validate();
         assert!(self.num_tokens > 0);
         assert_u32_count_domain(config.num_qkv_slots(self), "ungated GQA projection elements");
@@ -121,25 +121,25 @@ impl UngatedGQAProjectionSplitShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct UngatedGQAProjectionSplitBuffers<'a> {
+pub struct GQAQKVSplitBuffers<'a> {
     pub qkv: &'a Buffer,
     pub q: &'a Buffer,
     pub k: &'a Buffer,
     pub v: &'a Buffer,
 }
 
-pub struct UngatedGQAProjectionSplitKernel {
-    config: UngatedGQAProjectionSplitConfig,
+pub struct GQAQKVSplitKernel {
+    config: GQAQKVSplitConfig,
     kernel: Kernel,
 }
 
-impl UngatedGQAProjectionSplitKernel {
-    pub fn new(device: &Device, config: UngatedGQAProjectionSplitConfig) -> Self {
+impl GQAQKVSplitKernel {
+    pub fn new(device: &Device, config: GQAQKVSplitConfig) -> Self {
         config.validate();
-        let source = projection_split_source(config);
+        let source = qkv_split_source(config);
         let function_name = match config.dtype {
-            Dtype::Float32 => "ungated_gqa_projection_split_f32",
-            Dtype::Bfloat16 => "ungated_gqa_projection_split_bf16",
+            Dtype::Float32 => "gqa_qkv_split_f32",
+            Dtype::Bfloat16 => "gqa_qkv_split_bf16",
             dtype => panic!("unsupported ungated GQA projection split dtype {dtype:?}"),
         };
         Self {
@@ -148,12 +148,8 @@ impl UngatedGQAProjectionSplitKernel {
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: UngatedGQAProjectionSplitShape,
-        buffers: UngatedGQAProjectionSplitBuffers<'a>,
-    ) -> UngatedGQAProjectionSplitInvocation<'a> {
-        UngatedGQAProjectionSplitInvocation {
+    pub fn invoke<'a>(&'a self, shape: GQAQKVSplitShape, buffers: GQAQKVSplitBuffers<'a>) -> GQAQKVSplitInvocation<'a> {
+        GQAQKVSplitInvocation {
             config: self.config,
             kernel: &self.kernel,
             shape,
@@ -162,23 +158,23 @@ impl UngatedGQAProjectionSplitKernel {
     }
 }
 
-fn projection_split_source(config: UngatedGQAProjectionSplitConfig) -> String {
+fn qkv_split_source(config: GQAQKVSplitConfig) -> String {
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_q_heads = {}u;\nconstant uint num_kv_heads = {}u;\nconstant uint \
          head_dim = {}u;",
         config.num_q_heads, config.num_kv_heads, config.head_dim,
     );
-    UNGATED_GQA_PROJECTION_SPLIT_SOURCE.replacen("using namespace metal;", &constants, 1)
+    GQA_QKV_SPLIT_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
 
-pub struct UngatedGQAProjectionSplitInvocation<'a> {
-    config: UngatedGQAProjectionSplitConfig,
+pub struct GQAQKVSplitInvocation<'a> {
+    config: GQAQKVSplitConfig,
     kernel: &'a Kernel,
-    shape: UngatedGQAProjectionSplitShape,
-    buffers: UngatedGQAProjectionSplitBuffers<'a>,
+    shape: GQAQKVSplitShape,
+    buffers: GQAQKVSplitBuffers<'a>,
 }
 
-impl Operator for UngatedGQAProjectionSplitInvocation<'_> {
+impl Operator for GQAQKVSplitInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
@@ -192,7 +188,7 @@ impl Operator for UngatedGQAProjectionSplitInvocation<'_> {
     }
 }
 
-impl UngatedGQAProjectionSplitInvocation<'_> {
+impl GQAQKVSplitInvocation<'_> {
     fn validate(&self) {
         self.shape.validate(self.config);
         assert!(self.buffers.qkv.len_bytes() >= self.config.qkv_bytes(self.shape));
@@ -204,10 +200,10 @@ impl UngatedGQAProjectionSplitInvocation<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::UngatedGQAProjectionSplitBuffers;
-    use super::UngatedGQAProjectionSplitConfig;
-    use super::UngatedGQAProjectionSplitKernel;
-    use super::UngatedGQAProjectionSplitShape;
+    use super::GQAQKVSplitBuffers;
+    use super::GQAQKVSplitConfig;
+    use super::GQAQKVSplitKernel;
+    use super::GQAQKVSplitShape;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
@@ -217,18 +213,18 @@ mod tests {
     fn test_fixed() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = UngatedGQAProjectionSplitConfig::f32(2, 1, 2);
-        let shape = UngatedGQAProjectionSplitShape { num_tokens: 2 };
+        let config = GQAQKVSplitConfig::f32(2, 1, 2);
+        let shape = GQAQKVSplitShape { num_tokens: 2 };
         let qkv = Buffer::from_slice(&device, &(0..16).map(|value| value as f32).collect::<Vec<_>>());
         let q = Buffer::new_zeroed_elements(&device, config.num_q_slots(shape), Dtype::Float32);
         let k = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
         let v = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
-        let kernel = UngatedGQAProjectionSplitKernel::new(&device, config);
+        let kernel = GQAQKVSplitKernel::new(&device, config);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            UngatedGQAProjectionSplitBuffers {
+            GQAQKVSplitBuffers {
                 qkv: &qkv,
                 q: &q,
                 k: &k,
@@ -248,6 +244,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "ungated GQA projection elements exceeds the shader u32 count domain")]
     fn test_shape_rejects_shader_count_overflow() {
-        UngatedGQAProjectionSplitShape { num_tokens: 1 << 30 }.validate(UngatedGQAProjectionSplitConfig::f32(2, 1, 1));
+        GQAQKVSplitShape { num_tokens: 1 << 30 }.validate(GQAQKVSplitConfig::f32(2, 1, 1));
     }
 }

@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+use inference_backend_metal::components::GQAComputePath;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -7,17 +8,6 @@ use inference_executor_core::attn::GQAReplayShape;
 
 const NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS: usize = 3;
 const NUM_Q_TOKEN_TILE_FIELDS: usize = 2;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GQAMetadataBuffersPath {
-    SingleQToken {
-        kv_token_tile_size: u32,
-    },
-    TiledQTokens {
-        q_token_tile_size: u32,
-        kv_token_tile_size: u32,
-    },
-}
 
 /// Capacity-sized GPU metadata and replay shape refreshed from each model
 /// microbatch and shared by all GQA layers.
@@ -38,6 +28,7 @@ pub struct GQAMetadataBuffers {
     sdpa_map_task_templates: Buffer,
     cu_sdpa_partial_outputs: Buffer,
     replay_shape: Cell<Option<GQAReplayShape>>,
+    compute_path: Cell<Option<GQAComputePath>>,
 }
 
 impl GQAMetadataBuffers {
@@ -69,51 +60,18 @@ impl GQAMetadataBuffers {
                 Dtype::Uint32,
             ),
             replay_shape: Cell::new(None),
+            compute_path: Cell::new(None),
         }
     }
 
-    pub fn update_single_q_token(
+    pub fn update(
         &self,
         req_slots: &[u32],
         token_indices: &[u32],
         cu_tokens: &[u32],
-        kv_token_tile_size: u32,
+        compute_path: GQAComputePath,
     ) -> GQAReplayShape {
-        self.update(
-            req_slots,
-            token_indices,
-            cu_tokens,
-            GQAMetadataBuffersPath::SingleQToken { kv_token_tile_size },
-        )
-    }
-
-    pub fn update_tiled_q_tokens(
-        &self,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-        q_token_tile_size: u32,
-        kv_token_tile_size: u32,
-    ) -> GQAReplayShape {
-        self.update(
-            req_slots,
-            token_indices,
-            cu_tokens,
-            GQAMetadataBuffersPath::TiledQTokens {
-                q_token_tile_size,
-                kv_token_tile_size,
-            },
-        )
-    }
-
-    fn update(
-        &self,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-        path: GQAMetadataBuffersPath,
-    ) -> GQAReplayShape {
-        let tiled_q_tokens = matches!(path, GQAMetadataBuffersPath::TiledQTokens { .. });
+        let tiled_query_tokens = matches!(compute_path, GQAComputePath::TiledQueryTokens { .. });
         assert_eq!(req_slots.len(), token_indices.len());
         assert_eq!(cu_tokens.len(), req_slots.len() + 1);
         let num_tokens = cu_tokens.last().copied().unwrap_or_default() as usize;
@@ -147,8 +105,8 @@ impl GQAMetadataBuffers {
 
         let max_sdpa_map_task_templates =
             self.sdpa_map_task_templates.len_bytes() / (NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS * size_of::<u32>());
-        let (q_token_tiles, mut sdpa_map_task_templates, cu_sdpa_partial_outputs) = match path {
-            GQAMetadataBuffersPath::SingleQToken { kv_token_tile_size } => {
+        let (q_token_tiles, mut sdpa_map_task_templates, cu_sdpa_partial_outputs) = match compute_path {
+            GQAComputePath::SingleQueryToken { kv_token_tile_size, .. } => {
                 assert!(kv_token_tile_size > 0, "GQA KV-token tile size must be positive");
                 let (sdpa_map_task_templates, cu_sdpa_partial_outputs) = build_single_q_token_map_task_templates(
                     &flat_token_indices,
@@ -157,9 +115,10 @@ impl GQAMetadataBuffers {
                 );
                 (Vec::new(), sdpa_map_task_templates, cu_sdpa_partial_outputs)
             },
-            GQAMetadataBuffersPath::TiledQTokens {
+            GQAComputePath::TiledQueryTokens {
                 q_token_tile_size,
                 kv_token_tile_size,
+                ..
             } => {
                 build_tiled_q_tokens_map_task_templates(
                     token_indices,
@@ -197,10 +156,11 @@ impl GQAMetadataBuffers {
             total_sdpa_map_task_templates: total_sdpa_map_task_templates
                 .try_into()
                 .expect("GQA total SDPA map TaskTemplate count must fit u32"),
-            reduce_sdpa_partial_outputs: tiled_q_tokens || num_sdpa_map_task_templates > num_tokens,
+            reduce_sdpa_partial_outputs: tiled_query_tokens || num_sdpa_map_task_templates > num_tokens,
         };
         replay_shape.validate();
         self.replay_shape.set(Some(replay_shape));
+        self.compute_path.set(Some(compute_path));
         replay_shape
     }
 
@@ -226,6 +186,12 @@ impl GQAMetadataBuffers {
 
     pub fn replay_shape(&self) -> GQAReplayShape {
         self.replay_shape
+            .get()
+            .expect("GQA batch metadata must be updated before recording")
+    }
+
+    pub fn compute_path(&self) -> GQAComputePath {
+        self.compute_path
             .get()
             .expect("GQA batch metadata must be updated before recording")
     }
@@ -419,6 +385,7 @@ fn build_tiled_q_tokens_map_task_templates(
 
 #[cfg(test)]
 mod tests {
+    use inference_backend_metal::components::GQAComputePath;
     use inference_backend_metal::metal::Device;
     use inference_executor_core::attn::GQAReplayShape;
 
@@ -428,7 +395,12 @@ mod tests {
     fn test_single_q_token() {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 8);
-        let replay_shape = metadata.update_single_q_token(&[2, 5], &[7, 20], &[0, 2, 5], 8);
+        let compute_path = GQAComputePath::SingleQueryToken {
+            kv_token_tile_size: 8,
+            num_threads_per_threadblock: 32,
+            q_head_tile_size: 1,
+        };
+        let replay_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], compute_path);
 
         assert_eq!(metadata.req_slots().read_typed::<u32>(0, 5), vec![2, 2, 5, 5, 5]);
         assert_eq!(
@@ -455,13 +427,19 @@ mod tests {
             }
         );
         assert_eq!(replay_shape, metadata.replay_shape());
+        assert_eq!(compute_path, metadata.compute_path());
     }
 
     #[test]
     fn test_tiled_q_tokens() {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 8);
-        let replay_shape = metadata.update_tiled_q_tokens(&[2, 5], &[7, 20], &[0, 2, 5], 8, 4);
+        let compute_path = GQAComputePath::TiledQueryTokens {
+            q_token_tile_size: 8,
+            kv_token_tile_size: 4,
+            q_head_tile_size: 1,
+        };
+        let replay_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], compute_path);
 
         assert_eq!(metadata.q_token_tiles().read_typed::<u32>(0, 4), vec![0, 2, 2, 5]);
         assert_eq!(
@@ -482,5 +460,6 @@ mod tests {
             }
         );
         assert_eq!(replay_shape, metadata.replay_shape());
+        assert_eq!(compute_path, metadata.compute_path());
     }
 }

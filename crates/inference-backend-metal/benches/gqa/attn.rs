@@ -115,12 +115,10 @@ impl GQAFixture {
         let scratch = GQAPagedSDPAScratch::new(device, config, shape);
         let output = Buffer::new_zeroed(device, config.q_bytes(shape));
         let stream = Stream::new(device);
-        let kernels = GQAPagedSDPAKernels::new(device);
+        let kernels = GQAPagedSDPAKernels::new(device, config, shape);
         let replay = build_gqa_replay(
             &stream,
             &kernels,
-            config,
-            shape,
             &q,
             &kv_pages,
             &req_slots,
@@ -187,8 +185,6 @@ fn sdpa_map_task_template_plan(context_lens: &[u32]) -> (Vec<u32>, Vec<u32>) {
 fn build_gqa_replay(
     stream: &Stream,
     kernels: &GQAPagedSDPAKernels,
-    config: GQAPagedSDPAConfig,
-    shape: GQAPagedSDPAShape,
     q: &Buffer,
     kv_pages: &Buffer,
     req_slots: &Buffer,
@@ -199,12 +195,8 @@ fn build_gqa_replay(
     output: &Buffer,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map(
-        config,
-        shape,
-        scratch.map_buffers(q, kv_pages, req_slots, page_ids, sdpa_map_task_templates),
-    ));
-    builder.record(kernels.invoke_reduce(config, shape, scratch.reduce_buffers(cu_sdpa_partial_outputs, output)));
+    builder.record(kernels.invoke_map(scratch.map_buffers(q, kv_pages, req_slots, page_ids, sdpa_map_task_templates)));
+    builder.record(kernels.invoke_reduce(scratch.reduce_buffers(cu_sdpa_partial_outputs, output)));
     builder.build()
 }
 

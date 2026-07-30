@@ -3,7 +3,7 @@ using namespace metal;
 typedef bfloat bfloat16_t;
 
 template <typename T>
-void gqa_projection_split_impl(
+void gqa_qgkv_split_impl(
     device const T* qgkv,
     device T* q,
     device T* g,
@@ -42,7 +42,7 @@ void gqa_projection_split_impl(
     v[token * kv_slots + slot_index] = qgkv_slot;
 }
 
-kernel void gqa_projection_split_f32(
+kernel void gqa_qgkv_split_f32(
     device const float* qgkv [[buffer(0)]],
     device float* q [[buffer(1)]],
     device float* g [[buffer(2)]],
@@ -51,11 +51,11 @@ kernel void gqa_projection_split_f32(
     constant uint& total_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_projection_split_impl<float>(
+    gqa_qgkv_split_impl<float>(
         qgkv, q, g, k, v, total_tokens, gid);
 }
 
-kernel void gqa_projection_split_bf16(
+kernel void gqa_qgkv_split_bf16(
     device const bfloat16_t* qgkv [[buffer(0)]],
     device bfloat16_t* q [[buffer(1)]],
     device bfloat16_t* g [[buffer(2)]],
@@ -64,6 +64,6 @@ kernel void gqa_projection_split_bf16(
     constant uint& total_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_projection_split_impl<bfloat16_t>(
+    gqa_qgkv_split_impl<bfloat16_t>(
         qgkv, q, g, k, v, total_tokens, gid);
 }

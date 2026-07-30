@@ -11,13 +11,14 @@ use std::time::Instant;
 
 use half::bf16;
 use inference_backend_metal::components::GQAActivationGateConfig;
-use inference_backend_metal::components::GQAKVPageUpdateConfig;
+use inference_backend_metal::components::GQAKVPageWriteConfig;
 use inference_backend_metal::components::GQANormRopeConfig;
 use inference_backend_metal::components::GQANormRopeShape;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
 use inference_backend_metal::components::GQAPagedSDPAConfig;
 use inference_backend_metal::components::GQAPagedSDPAShape;
-use inference_backend_metal::components::GQAProjectionSplitConfig;
+use inference_backend_metal::components::GQAQGKVSplitConfig;
+use inference_backend_metal::components::GQATiledSDPAConfig;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -303,15 +304,15 @@ fn parse_usize(value: &str, name: &str) -> usize {
 
 fn default_gqa_subcomponents() -> Vec<String> {
     vec![
-        "qgkv-proj".to_string(),
-        "split".to_string(),
+        "qgkv".to_string(),
+        "qgkv-to-q-g-k-v".to_string(),
         "q-norm-rope".to_string(),
         "k-norm-rope".to_string(),
-        "kv-update".to_string(),
+        "kv-page-write".to_string(),
         "sdpa-single-q-token".to_string(),
         "sdpa-tiled-q-tokens".to_string(),
         "gate".to_string(),
-        "output-proj".to_string(),
+        "output".to_string(),
     ]
 }
 
@@ -326,7 +327,7 @@ fn print_help_and_exit() -> ! {
 --gqa-tokens-per-req 1,2,4,8
 --gqa-paths single_q_token,tiled_q_tokens
 --subcomponents
---gqa-subcomponents qgkv-proj,split,q-norm-rope,k-norm-rope,kv-update,sdpa-single-q-token,sdpa-tiled-q-tokens,gate,output-proj
+--gqa-subcomponents qgkv,qgkv-to-q-g-k-v,q-norm-rope,k-norm-rope,kv-page-write,sdpa-single-q-token,sdpa-tiled-q-tokens,gate,output
 --validate-tiled-q-tokens
 --gqa-single-q-token-kv-token-tile-size N
 --gqa-single-q-token-num-threads-per-threadblock N
@@ -672,8 +673,8 @@ fn gqa_output_affine_config(model: GQAModelProfile) -> AffineQuantizedMatmulConf
     }
 }
 
-fn gqa_projection_split_config(model: GQAModelProfile) -> GQAProjectionSplitConfig {
-    GQAProjectionSplitConfig::bf16(
+fn gqa_qgkv_to_q_g_k_v_config(model: GQAModelProfile) -> GQAQGKVSplitConfig {
+    GQAQGKVSplitConfig::bf16(
         model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         model.head_dim.try_into().expect("GQA head_dim must fit u32"),
@@ -695,8 +696,8 @@ fn gqa_norm_rope_shape(num_tokens: u32, _num_heads: usize, _model: GQAModelProfi
     GQANormRopeShape { num_tokens }
 }
 
-fn gqa_kv_update_config(model: GQAModelProfile, page_bytes: u32) -> GQAKVPageUpdateConfig {
-    GQAKVPageUpdateConfig {
+fn gqa_kv_page_write_config(model: GQAModelProfile, page_bytes: u32) -> GQAKVPageWriteConfig {
+    GQAKVPageWriteConfig {
         num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
         page_bytes,
@@ -704,7 +705,7 @@ fn gqa_kv_update_config(model: GQAModelProfile, page_bytes: u32) -> GQAKVPageUpd
     }
 }
 
-fn gqa_activation_gate_config(model: GQAModelProfile) -> GQAActivationGateConfig {
+fn gqa_gate_config(model: GQAModelProfile) -> GQAActivationGateConfig {
     GQAActivationGateConfig::bf16(
         model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         model.head_dim.try_into().expect("GQA head_dim must fit u32"),
@@ -738,6 +739,26 @@ fn gqa_sdpa_shape(replay_shape: GQAReplayShape) -> GQAPagedSDPAShape {
     GQAPagedSDPAShape {
         num_tokens: replay_shape.num_tokens,
         total_sdpa_map_task_templates: replay_shape.total_sdpa_map_task_templates,
+    }
+}
+
+fn gqa_tiled_sdpa_config(
+    page_table_layout: MetalGQAPageTableLayout,
+    params: GQABenchParams,
+    model: GQAModelProfile,
+) -> GQATiledSDPAConfig {
+    GQATiledSDPAConfig {
+        num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
+        num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
+        head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
+        q_head_tile_size: params.tiled_q_head_tile_size,
+        q_token_tile_size: params.tiled_q_token_tile_size,
+        kv_token_tile_size: params.tiled_kv_token_tile_size,
+        scale: (model.head_dim as f32).sqrt().recip(),
+        page_bytes: model.page_bytes(),
+        dtype: Dtype::Bfloat16,
+        page_table_layout,
+        gqa_layer_index: 0,
     }
 }
 

@@ -1,7 +1,11 @@
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState;
+
 use crate::components::assert_u32_count_domain;
 use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
-use crate::components::gqa_kv_pages::GQAPageTableLayout;
+use crate::components::gqa_kv_page_write::GQAPageTableLayout;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -284,38 +288,48 @@ impl GQAPagedSDPAScratch {
 }
 
 pub struct GQAPagedSDPAKernels {
-    device: Device,
+    config: GQAPagedSDPAConfig,
+    shape: GQAPagedSDPAShape,
+    map: Kernel,
+    reduce: Kernel,
 }
 
 impl GQAPagedSDPAKernels {
-    pub fn new(device: &Device) -> Self {
-        Self { device: device.clone() }
-    }
-
-    pub fn invoke_map<'a>(
-        &'a self,
-        config: GQAPagedSDPAConfig,
-        shape: GQAPagedSDPAShape,
-        buffers: GQAPagedSDPAMapBuffers<'a>,
-    ) -> GQAPagedSDPAMapInvocation<'a> {
-        GQAPagedSDPAMapInvocation {
-            device: &self.device,
+    pub fn new(device: &Device, config: GQAPagedSDPAConfig, shape: GQAPagedSDPAShape) -> Self {
+        shape.validate(config);
+        assert!(
+            config.single_q_token_threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
+            "GQA single-Q-token SDPA shape needs {} bytes of threadblock memory but device only supports {}",
+            config.single_q_token_threadblock_memory_bytes(),
+            device.max_threadblock_memory_length()
+        );
+        let reduce_function_name = match config.dtype {
+            Dtype::Float32 => "gqa_paged_sdpa_reduce_f32",
+            Dtype::Bfloat16 => "gqa_paged_sdpa_reduce_bf16",
+            dtype => panic!("unsupported GQA paged SDPA reduce dtype {dtype:?}"),
+        };
+        Self {
             config,
             shape,
+            map: Kernel::new(device, &gqa_paged_sdpa_map_source(config, shape), "gqa_paged_sdpa_map"),
+            reduce: Kernel::new(device, &gqa_paged_sdpa_reduce_source(config), reduce_function_name),
+        }
+    }
+
+    pub fn invoke_map<'a>(&self, buffers: GQAPagedSDPAMapBuffers<'a>) -> GQAPagedSDPAMapInvocation<'a> {
+        GQAPagedSDPAMapInvocation {
+            pipeline: self.map.as_raw_retained(),
+            config: self.config,
+            shape: self.shape,
             buffers,
         }
     }
 
-    pub fn invoke_reduce<'a>(
-        &'a self,
-        config: GQAPagedSDPAConfig,
-        shape: GQAPagedSDPAShape,
-        buffers: GQAPagedSDPAReduceBuffers<'a>,
-    ) -> GQAPagedSDPAReduceInvocation<'a> {
+    pub fn invoke_reduce<'a>(&self, buffers: GQAPagedSDPAReduceBuffers<'a>) -> GQAPagedSDPAReduceInvocation<'a> {
         GQAPagedSDPAReduceInvocation {
-            device: &self.device,
-            config,
-            shape,
+            pipeline: self.reduce.as_raw_retained(),
+            config: self.config,
+            shape: self.shape,
             buffers,
         }
     }
@@ -541,7 +555,7 @@ fn metal_dtype_name(dtype: Dtype) -> &'static str {
 }
 
 pub struct GQAPagedSDPAMapInvocation<'a> {
-    device: &'a Device,
+    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     config: GQAPagedSDPAConfig,
     shape: GQAPagedSDPAShape,
     buffers: GQAPagedSDPAMapBuffers<'a>,
@@ -551,9 +565,7 @@ impl Operator for GQAPagedSDPAMapInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
-        let source = gqa_paged_sdpa_map_source(self.config, shape);
-        let kernel = Kernel::new(self.device, &source, "gqa_paged_sdpa_map");
-        builder.set_kernel(&kernel);
+        builder.set_retained_pipeline_state(&self.pipeline);
         builder.set_buffer_read(0, self.buffers.q, 0);
         builder.set_buffer_read(1, self.buffers.kv_pages, 0);
         builder.set_buffer_read(2, self.buffers.req_slots, 0);
@@ -583,17 +595,11 @@ impl GQAPagedSDPAMapInvocation<'_> {
         assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
         assert!(self.buffers.partial_max_logits.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
         assert!(self.buffers.partial_output.len_bytes_u64() >= self.config.partial_output_bytes(self.shape));
-        assert!(
-            self.config.single_q_token_threadblock_memory_bytes() <= self.device.max_threadblock_memory_length(),
-            "GQA single-Q-token SDPA shape needs {} bytes of threadblock memory but device only supports {}",
-            self.config.single_q_token_threadblock_memory_bytes(),
-            self.device.max_threadblock_memory_length()
-        );
     }
 }
 
 pub struct GQAPagedSDPAReduceInvocation<'a> {
-    device: &'a Device,
+    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     config: GQAPagedSDPAConfig,
     shape: GQAPagedSDPAShape,
     buffers: GQAPagedSDPAReduceBuffers<'a>,
@@ -603,14 +609,7 @@ impl Operator for GQAPagedSDPAReduceInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
-        let source = gqa_paged_sdpa_reduce_source(self.config);
-        let function_name = match self.config.dtype {
-            Dtype::Float32 => "gqa_paged_sdpa_reduce_f32",
-            Dtype::Bfloat16 => "gqa_paged_sdpa_reduce_bf16",
-            dtype => panic!("unsupported GQA paged SDPA reduce dtype {dtype:?}"),
-        };
-        let kernel = Kernel::new(self.device, &source, function_name);
-        builder.set_kernel(&kernel);
+        builder.set_retained_pipeline_state(&self.pipeline);
         builder.set_buffer_read(0, self.buffers.partial_exp_sums, 0);
         builder.set_buffer_read(1, self.buffers.partial_max_logits, 0);
         builder.set_buffer_read(2, self.buffers.partial_output, 0);
@@ -896,7 +895,7 @@ mod tests {
     ) -> Vec<f32> {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernels = GQAPagedSDPAKernels::new(&device);
+        let kernels = GQAPagedSDPAKernels::new(&device, config, shape);
         let q = Buffer::from_slice(&device, input.q);
         let kv_pages = Buffer::from_slice(&device, input.kv_pages);
         let req_slots = Buffer::from_slice(&device, input.req_slots);
@@ -909,16 +908,16 @@ mod tests {
         let scratch = GQAPagedSDPAScratch::new(&device, config, shape);
 
         let mut builder = stream.create_replay_program();
-        builder.record(kernels.invoke_map(
-            config,
-            shape,
-            scratch.map_buffers(&q, &kv_pages, &req_slots, &page_ids, &sdpa_map_task_templates),
-        ));
-        builder.record_with_barrier_before(kernels.invoke_reduce(
-            config,
-            shape,
-            scratch.reduce_buffers(&cu_sdpa_partial_outputs, &output),
-        ));
+        builder.record(kernels.invoke_map(scratch.map_buffers(
+            &q,
+            &kv_pages,
+            &req_slots,
+            &page_ids,
+            &sdpa_map_task_templates,
+        )));
+        builder.record_with_barrier_before(
+            kernels.invoke_reduce(scratch.reduce_buffers(&cu_sdpa_partial_outputs, &output)),
+        );
         let replay = builder.build();
         stream.submit_replay(&replay).wait();
         output.read_typed::<f32>(0, config.num_output_values(shape))

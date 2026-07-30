@@ -2,6 +2,7 @@ use std::mem::size_of;
 
 use half::bf16;
 use inference_backend_metal::components::GQAPageTableLayout;
+use inference_backend_metal::components::GQATiledSDPAConfig;
 use inference_backend_metal::components::GQATiledSDPAKernels;
 use inference_backend_metal::components::GQATiledSDPAMapBuffers;
 use inference_backend_metal::components::GQATiledSDPAReduceBuffers;
@@ -114,10 +115,7 @@ fn run_case(
     let num_sdpa_map_task_templates = sdpa_map_task_template_values.len() / 3;
     let total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
     sdpa_map_task_template_values.resize(total_sdpa_map_task_templates * 3, u32::MAX);
-    let shape = GQATiledSDPAShape {
-        num_tokens: num_tokens.try_into().unwrap(),
-        num_q_token_tiles: num_q_token_tiles.try_into().unwrap(),
-        total_sdpa_map_task_templates: total_sdpa_map_task_templates.try_into().unwrap(),
+    let config = GQATiledSDPAConfig {
         num_q_heads: num_q_heads.try_into().unwrap(),
         num_kv_heads: num_kv_heads.try_into().unwrap(),
         head_dim: head_dim.try_into().unwrap(),
@@ -134,6 +132,11 @@ fn run_case(
             num_page_ids_per_block: 1,
         },
         gqa_layer_index: 0,
+    };
+    let shape = GQATiledSDPAShape {
+        num_tokens: num_tokens.try_into().unwrap(),
+        num_q_token_tiles: num_q_token_tiles.try_into().unwrap(),
+        total_sdpa_map_task_templates: total_sdpa_map_task_templates.try_into().unwrap(),
     };
 
     let q_bf16 = q_values
@@ -178,7 +181,7 @@ fn run_case(
             head_dim,
             num_q_heads,
             num_kv_heads,
-            shape.scale,
+            config.scale,
         ),
         GQAReferenceInput {
             cu_tokens: &cu_tokens,
@@ -212,34 +215,28 @@ fn run_case(
         &device,
         num_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
     );
-    let kernels = GQATiledSDPAKernels::new(&device);
+    let kernels = GQATiledSDPAKernels::new(&device, config, shape);
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map(
-        shape,
-        GQATiledSDPAMapBuffers {
-            q: &q,
-            kv_pages: &kv_pages,
-            req_slots: &req_slots,
-            page_ids: &page_ids,
-            flat_token_indices: &flat_token_indices,
-            q_token_tiles: &q_token_tiles,
-            sdpa_map_task_templates: &sdpa_map_task_templates,
-            partial_output: &partial_output,
-            partial_exp_sums: &partial_exp_sums,
-            partial_max_logits: &partial_max_logits,
-        },
-    ));
-    builder.record_with_barrier_before(kernels.invoke_reduce(
-        shape,
-        GQATiledSDPAReduceBuffers {
-            partial_output: &partial_output,
-            partial_exp_sums: &partial_exp_sums,
-            partial_max_logits: &partial_max_logits,
-            q_token_tiles: &q_token_tiles,
-            cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
-            output: &output,
-        },
-    ));
+    builder.record(kernels.invoke_map(GQATiledSDPAMapBuffers {
+        q: &q,
+        kv_pages: &kv_pages,
+        req_slots: &req_slots,
+        page_ids: &page_ids,
+        flat_token_indices: &flat_token_indices,
+        q_token_tiles: &q_token_tiles,
+        sdpa_map_task_templates: &sdpa_map_task_templates,
+        partial_output: &partial_output,
+        partial_exp_sums: &partial_exp_sums,
+        partial_max_logits: &partial_max_logits,
+    }));
+    builder.record_with_barrier_before(kernels.invoke_reduce(GQATiledSDPAReduceBuffers {
+        partial_output: &partial_output,
+        partial_exp_sums: &partial_exp_sums,
+        partial_max_logits: &partial_max_logits,
+        q_token_tiles: &q_token_tiles,
+        cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
+        output: &output,
+    }));
     let replay = builder.build();
     stream.submit_replay(&replay).wait();
     let actual = output

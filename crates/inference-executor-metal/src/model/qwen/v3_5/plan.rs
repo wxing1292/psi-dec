@@ -21,11 +21,6 @@ pub struct Qwen35MetalDefaults {
     pub group_size: u32,
     pub bits: u32,
     pub hidden_dtype: Dtype,
-    pub single_q_token_kv_token_tile_size: u32,
-    pub single_q_token_num_threads_per_threadblock: u32,
-    pub single_q_token_max_q_head_tile_size: u32,
-    pub tiled_q_token_tile_size: u32,
-    pub tiled_kv_token_tile_size: u32,
 }
 
 impl Default for Qwen35MetalDefaults {
@@ -34,11 +29,6 @@ impl Default for Qwen35MetalDefaults {
             group_size: 64,
             bits: 4,
             hidden_dtype: Dtype::Bfloat16,
-            single_q_token_kv_token_tile_size: 256,
-            single_q_token_num_threads_per_threadblock: 256,
-            single_q_token_max_q_head_tile_size: 8,
-            tiled_q_token_tile_size: 8,
-            tiled_kv_token_tile_size: 16,
         }
     }
 }
@@ -130,16 +120,11 @@ pub fn qwen35_gqa_core_and_metal(
         group_size: defaults.group_size,
         bits: defaults.bits,
         page_bytes: to_u32("Qwen3.5 GQA page_bytes", QWEN35_PAGE_SIZE_BYTES)?,
-        single_q_token_kv_token_tile_size: defaults.single_q_token_kv_token_tile_size,
-        single_q_token_num_threads_per_threadblock: defaults.single_q_token_num_threads_per_threadblock,
-        single_q_token_max_q_head_tile_size: defaults.single_q_token_max_q_head_tile_size,
-        tiled_q_token_tile_size: defaults.tiled_q_token_tile_size,
-        tiled_kv_token_tile_size: defaults.tiled_kv_token_tile_size,
         rope_dim: to_u32("Qwen3.5 GQA rope_dim", text.rope_dim)?,
         norm_eps: text.rms_norm_eps,
         rope_theta: text.rope_theta,
         rope_scale: 1.0,
-        dtype: defaults.hidden_dtype,
+        io_dtype: defaults.hidden_dtype,
     };
     metal.validate();
     assert!(metal.num_tokens_per_page(&core) > 0);

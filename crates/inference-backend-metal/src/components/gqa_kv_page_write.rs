@@ -7,7 +7,7 @@ use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
 
-const GQA_KV_PAGE_UPDATE_SOURCE: &str = include_str!("metal/gqa_kv_pages.metal");
+const GQA_KV_PAGE_WRITE_SOURCE: &str = include_str!("metal/gqa_kv_page_write.metal");
 
 const NUM_THREADS_PER_THREADBLOCK: usize = 256;
 
@@ -38,14 +38,14 @@ impl GQAPageTableLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQAKVPageUpdateConfig {
+pub struct GQAKVPageWriteConfig {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub page_bytes: u32,
     pub dtype: Dtype,
 }
 
-impl GQAKVPageUpdateConfig {
+impl GQAKVPageWriteConfig {
     pub fn validate(self) {
         assert!(self.num_kv_heads > 0);
         assert!(self.num_tokens_per_page() > 0);
@@ -68,21 +68,21 @@ impl GQAKVPageUpdateConfig {
         self.page_bytes / kv_bytes_per_token
     }
 
-    pub fn index_bytes(self, shape: GQAKVPageUpdateShape) -> usize {
+    pub fn index_bytes(self, shape: GQAKVPageWriteShape) -> usize {
         (shape.num_token_writes as usize)
             .checked_mul(size_of::<u32>())
-            .expect("GQA KV page-update index bytes must fit usize")
+            .expect("GQA KV page-write index bytes must fit usize")
     }
 
-    pub fn flat_kv_bytes(self, shape: GQAKVPageUpdateShape) -> usize {
+    pub fn flat_kv_bytes(self, shape: GQAKVPageWriteShape) -> usize {
         self.num_total_threads(shape)
             .checked_mul(self.dtype.item_size())
             .expect("GQA flattened K/V byte length must fit usize")
     }
 
-    pub fn num_total_threads(self, shape: GQAKVPageUpdateShape) -> usize {
+    pub fn num_total_threads(self, shape: GQAKVPageWriteShape) -> usize {
         checked_product(
-            "GQA KV page-update thread count",
+            "GQA KV page-write thread count",
             &[
                 shape.num_token_writes as usize,
                 self.num_kv_heads as usize,
@@ -93,19 +93,19 @@ impl GQAKVPageUpdateConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQAKVPageUpdateShape {
+pub struct GQAKVPageWriteShape {
     pub num_token_writes: u32,
     pub page_table_layout: GQAPageTableLayout,
     pub gqa_layer_index: u32,
 }
 
-impl GQAKVPageUpdateShape {
-    pub fn validate(self, config: GQAKVPageUpdateConfig) {
+impl GQAKVPageWriteShape {
+    pub fn validate(self, config: GQAKVPageWriteConfig) {
         config.validate();
         assert!(self.num_token_writes > 0);
         self.page_table_layout.validate();
         assert!(self.gqa_layer_index < self.page_table_layout.num_gqa_layers);
-        assert_u32_count_domain(config.num_total_threads(self), "GQA KV page-update threads");
+        assert_u32_count_domain(config.num_total_threads(self), "GQA KV page-write threads");
     }
 
     pub fn page_ids_bytes(self) -> usize {
@@ -114,7 +114,7 @@ impl GQAKVPageUpdateShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQAKVPageUpdateBuffers<'a> {
+pub struct GQAKVPageWriteBuffers<'a> {
     pub pages: &'a Buffer,
     pub flat_k: &'a Buffer,
     pub flat_v: &'a Buffer,
@@ -123,19 +123,19 @@ pub struct GQAKVPageUpdateBuffers<'a> {
     pub page_ids: &'a Buffer,
 }
 
-pub struct GQAKVPageUpdate {
-    config: GQAKVPageUpdateConfig,
+pub struct GQAKVPageWrite {
+    config: GQAKVPageWriteConfig,
     kernel: Kernel,
 }
 
-impl GQAKVPageUpdate {
-    pub fn new(device: &Device, config: GQAKVPageUpdateConfig) -> Self {
+impl GQAKVPageWrite {
+    pub fn new(device: &Device, config: GQAKVPageWriteConfig) -> Self {
         config.validate();
-        let source = kv_page_update_source(config);
+        let source = kv_page_write_source(config);
         let function_name = match config.dtype {
-            Dtype::Float32 => "gqa_kv_page_update_f32",
-            Dtype::Bfloat16 => "gqa_kv_page_update_u16",
-            dtype => panic!("unsupported GQA KV page update dtype {dtype:?}"),
+            Dtype::Float32 => "gqa_kv_page_write_f32",
+            Dtype::Bfloat16 => "gqa_kv_page_write_u16",
+            dtype => panic!("unsupported GQA KV page write dtype {dtype:?}"),
         };
         Self {
             config,
@@ -145,10 +145,10 @@ impl GQAKVPageUpdate {
 
     pub fn invoke<'a>(
         &'a self,
-        shape: GQAKVPageUpdateShape,
-        buffers: GQAKVPageUpdateBuffers<'a>,
-    ) -> GQAKVPageUpdateInvocation<'a> {
-        GQAKVPageUpdateInvocation {
+        shape: GQAKVPageWriteShape,
+        buffers: GQAKVPageWriteBuffers<'a>,
+    ) -> GQAKVPageWriteInvocation<'a> {
+        GQAKVPageWriteInvocation {
             config: self.config,
             kernel: &self.kernel,
             shape,
@@ -157,7 +157,7 @@ impl GQAKVPageUpdate {
     }
 }
 
-fn kv_page_update_source(config: GQAKVPageUpdateConfig) -> String {
+fn kv_page_write_source(config: GQAKVPageWriteConfig) -> String {
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_kv_heads = {}u;\nconstant uint head_dim = {}u;\nconstant uint \
          num_tokens_per_page = {}u;\nconstant uint page_bytes = {}u;",
@@ -166,17 +166,17 @@ fn kv_page_update_source(config: GQAKVPageUpdateConfig) -> String {
         config.num_tokens_per_page(),
         config.page_bytes,
     );
-    GQA_KV_PAGE_UPDATE_SOURCE.replacen("using namespace metal;", &constants, 1)
+    GQA_KV_PAGE_WRITE_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
 
-pub struct GQAKVPageUpdateInvocation<'a> {
-    config: GQAKVPageUpdateConfig,
+pub struct GQAKVPageWriteInvocation<'a> {
+    config: GQAKVPageWriteConfig,
     kernel: &'a Kernel,
-    shape: GQAKVPageUpdateShape,
-    buffers: GQAKVPageUpdateBuffers<'a>,
+    shape: GQAKVPageWriteShape,
+    buffers: GQAKVPageWriteBuffers<'a>,
 }
 
-impl Operator for GQAKVPageUpdateInvocation<'_> {
+impl Operator for GQAKVPageWriteInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
         builder.set_kernel(self.kernel);
@@ -195,7 +195,7 @@ impl Operator for GQAKVPageUpdateInvocation<'_> {
     }
 }
 
-impl GQAKVPageUpdateInvocation<'_> {
+impl GQAKVPageWriteInvocation<'_> {
     fn validate(&self) {
         self.shape.validate(self.config);
         assert!(self.buffers.flat_k.len_bytes() >= self.config.flat_kv_bytes(self.shape));
@@ -212,15 +212,15 @@ mod tests {
     use crate::metal::Stream;
 
     #[test]
-    #[should_panic(expected = "GQA KV page-update threads exceeds the shader u32 count domain")]
+    #[should_panic(expected = "GQA KV page-write threads exceeds the shader u32 count domain")]
     fn test_shape_rejects_shader_count_overflow() {
-        let config = GQAKVPageUpdateConfig {
+        let config = GQAKVPageWriteConfig {
             num_kv_heads: 2,
             head_dim: 2,
             page_bytes: 16,
             dtype: Dtype::Bfloat16,
         };
-        GQAKVPageUpdateShape {
+        GQAKVPageWriteShape {
             num_token_writes: 1 << 30,
             page_table_layout: GQAPageTableLayout {
                 num_req_slots: 1,
@@ -265,13 +265,13 @@ mod tests {
         let req_slots = Buffer::from_slice(device, &[0u32]);
         let flat_token_indices = Buffer::from_slice(device, &[1u32]);
         let page_ids = Buffer::from_slice(device, &[0u32]);
-        let config = GQAKVPageUpdateConfig {
+        let config = GQAKVPageWriteConfig {
             num_kv_heads: 1,
             head_dim: 2,
             page_bytes: pages.len_bytes() as u32,
             dtype,
         };
-        let shape = GQAKVPageUpdateShape {
+        let shape = GQAKVPageWriteShape {
             num_token_writes: 1,
             page_table_layout: GQAPageTableLayout {
                 num_req_slots: 1,
@@ -281,11 +281,11 @@ mod tests {
             },
             gqa_layer_index: 0,
         };
-        let kernel = GQAKVPageUpdate::new(device, config);
+        let kernel = GQAKVPageWrite::new(device, config);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            GQAKVPageUpdateBuffers {
+            GQAKVPageWriteBuffers {
                 pages,
                 flat_k: k,
                 flat_v: v,

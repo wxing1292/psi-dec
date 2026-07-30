@@ -3,17 +3,18 @@ use std::mem::size_of;
 use inference_backend_metal::components::GQAActivationGateBuffers;
 use inference_backend_metal::components::GQAActivationGateKernel;
 use inference_backend_metal::components::GQAActivationGateShape;
-use inference_backend_metal::components::GQAKVPageUpdate;
-use inference_backend_metal::components::GQAKVPageUpdateBuffers;
-use inference_backend_metal::components::GQAKVPageUpdateShape;
+use inference_backend_metal::components::GQAComputePath;
+use inference_backend_metal::components::GQAKVPageWrite;
+use inference_backend_metal::components::GQAKVPageWriteBuffers;
+use inference_backend_metal::components::GQAKVPageWriteShape;
 use inference_backend_metal::components::GQANormRopeBuffers;
 use inference_backend_metal::components::GQANormRopeKernel;
 use inference_backend_metal::components::GQAPagedSDPAKernels;
 use inference_backend_metal::components::GQAPagedSDPAMapBuffers;
 use inference_backend_metal::components::GQAPagedSDPAReduceBuffers;
-use inference_backend_metal::components::GQAProjectionSplitBuffers;
-use inference_backend_metal::components::GQAProjectionSplitKernel;
-use inference_backend_metal::components::GQAProjectionSplitShape;
+use inference_backend_metal::components::GQAQGKVSplitBuffers;
+use inference_backend_metal::components::GQAQGKVSplitKernel;
+use inference_backend_metal::components::GQAQGKVSplitShape;
 use inference_backend_metal::components::GQATiledSDPAKernels;
 use inference_backend_metal::components::GQATiledSDPAMapBuffers;
 use inference_backend_metal::components::GQATiledSDPAReduceBuffers;
@@ -53,17 +54,18 @@ use crate::TOKENS_PER_PAGE;
 use crate::assert_bf16_close;
 use crate::build_single_invocation_replay;
 use crate::cu_tokens;
-use crate::gqa_activation_gate_config;
 use crate::gqa_attention_reference_at;
-use crate::gqa_kv_update_config;
+use crate::gqa_gate_config;
+use crate::gqa_kv_page_write_config;
 use crate::gqa_norm_rope_config;
 use crate::gqa_norm_rope_shape;
 use crate::gqa_output_affine_config;
 use crate::gqa_page_table_layout;
-use crate::gqa_projection_split_config;
 use crate::gqa_qgkv_affine_config;
+use crate::gqa_qgkv_to_q_g_k_v_config;
 use crate::gqa_sdpa_config;
 use crate::gqa_sdpa_shape;
+use crate::gqa_tiled_sdpa_config;
 use crate::hidden_fixture;
 use crate::max_bf16_diff;
 use crate::measure_runs;
@@ -183,7 +185,7 @@ struct RealGQAFixture<'a> {
     _tiled_partial_output: Buffer,
     _tiled_partial_exp_sums: Buffer,
     _tiled_partial_max_logits: Buffer,
-    _qgkv_proj: Buffer,
+    _qgkv: Buffer,
     _q: Buffer,
     _g: Buffer,
     _k: Buffer,
@@ -238,16 +240,11 @@ impl<'a> RealGQAFixture<'a> {
             group_size: GROUP_SIZE,
             bits: BITS,
             page_bytes: model.page_bytes(),
-            single_q_token_kv_token_tile_size: params.single_q_token_kv_token_tile_size,
-            single_q_token_num_threads_per_threadblock: params.single_q_token_num_threads_per_threadblock,
-            single_q_token_max_q_head_tile_size: params.single_q_token_max_q_head_tile_size,
-            tiled_q_token_tile_size: params.tiled_q_token_tile_size,
-            tiled_kv_token_tile_size: params.tiled_kv_token_tile_size,
             rope_dim: GQA_ROPE_DIM,
             norm_eps: GQA_NORM_EPS,
             rope_theta: GQA_ROPE_THETA,
             rope_scale: 1.0,
-            dtype: Dtype::Bfloat16,
+            io_dtype: Dtype::Bfloat16,
         };
         let backend = GQA::new(device, core, config);
         let max_num_req_tokens = num_tokens_per_req.iter().copied().max().unwrap_or(0);
@@ -265,31 +262,17 @@ impl<'a> RealGQAFixture<'a> {
             num_reqs as usize * num_blocks as usize * config.page_bytes as usize,
         );
         assert!(num_tokens as usize <= GQA_MAX_TOKENS);
-        let batch_metadata = GQAMetadataBuffers::new(device, GQA_MAX_TOKENS);
-        let shape = batch_metadata.update_single_q_token(
-            &(0..num_reqs).collect::<Vec<_>>(),
-            &vec![existing_context_len; num_reqs as usize],
-            &cu_tokens(&num_tokens_per_req)
-                .into_iter()
-                .map(|value| value as u32)
-                .collect::<Vec<_>>(),
-            config.single_q_token_kv_token_tile_size,
-        );
-        let page_ids = Buffer::from_slice(device, &page_table(num_reqs, num_blocks));
-        let tiled_batch_metadata = GQAMetadataBuffers::new(device, GQA_MAX_TOKENS);
-        let tiled_replay_shape = tiled_batch_metadata.update_tiled_q_tokens(
-            &(0..num_reqs).collect::<Vec<_>>(),
-            &vec![existing_context_len; num_reqs as usize],
-            &cu_tokens(&num_tokens_per_req)
-                .into_iter()
-                .map(|value| value as u32)
-                .collect::<Vec<_>>(),
-            params.tiled_q_token_tile_size,
-            params.tiled_kv_token_tile_size,
-        );
+        let q_heads_per_kv_head = model.num_q_heads / model.num_kv_heads;
+        let single_q_head_tile_size = q_heads_per_kv_head
+            .min(params.single_q_token_max_q_head_tile_size as usize)
+            .try_into()
+            .expect("GQA Q-head tile size must fit u32");
+        let num_q_token_tiles = num_tokens_per_req
+            .iter()
+            .map(|&count| count.div_ceil(params.tiled_q_token_tile_size))
+            .sum::<u32>();
         if params.tiled_q_head_tile_size == 0 {
-            let q_heads_per_kv_head = model.num_q_heads / model.num_kv_heads;
-            let desired_q_head_tile_size = if (num_tokens as u64) < 4 * tiled_replay_shape.num_q_token_tiles as u64 {
+            let desired_q_head_tile_size = if (num_tokens as u64) < 4 * num_q_token_tiles as u64 {
                 q_heads_per_kv_head.div_ceil(2)
             } else {
                 q_heads_per_kv_head
@@ -300,7 +283,36 @@ impl<'a> RealGQAFixture<'a> {
                 .try_into()
                 .expect("GQA Q-head tile size must fit u32");
         }
-        let qgkv_proj = Buffer::new_zeroed(
+        let batch_metadata = GQAMetadataBuffers::new(device, GQA_MAX_TOKENS);
+        let shape = batch_metadata.update(
+            &(0..num_reqs).collect::<Vec<_>>(),
+            &vec![existing_context_len; num_reqs as usize],
+            &cu_tokens(&num_tokens_per_req)
+                .into_iter()
+                .map(|value| value as u32)
+                .collect::<Vec<_>>(),
+            GQAComputePath::SingleQueryToken {
+                kv_token_tile_size: params.single_q_token_kv_token_tile_size,
+                num_threads_per_threadblock: params.single_q_token_num_threads_per_threadblock,
+                q_head_tile_size: single_q_head_tile_size,
+            },
+        );
+        let page_ids = Buffer::from_slice(device, &page_table(num_reqs, num_blocks));
+        let tiled_batch_metadata = GQAMetadataBuffers::new(device, GQA_MAX_TOKENS);
+        let tiled_replay_shape = tiled_batch_metadata.update(
+            &(0..num_reqs).collect::<Vec<_>>(),
+            &vec![existing_context_len; num_reqs as usize],
+            &cu_tokens(&num_tokens_per_req)
+                .into_iter()
+                .map(|value| value as u32)
+                .collect::<Vec<_>>(),
+            GQAComputePath::TiledQueryTokens {
+                q_token_tile_size: params.tiled_q_token_tile_size,
+                kv_token_tile_size: params.tiled_kv_token_tile_size,
+                q_head_tile_size: params.tiled_q_head_tile_size,
+            },
+        );
+        let qgkv = Buffer::new_zeroed(
             device,
             num_tokens as usize * model.qgkv_dim() * Dtype::Bfloat16.item_size(),
         );
@@ -394,7 +406,7 @@ impl<'a> RealGQAFixture<'a> {
                     output_biases: &weights.output_biases,
                 },
                 scratch: GQAScratchBindings {
-                    qgkv_proj: &qgkv_proj,
+                    qgkv: &qgkv,
                     q: &q,
                     g: &g,
                     k: &k,
@@ -410,35 +422,25 @@ impl<'a> RealGQAFixture<'a> {
             },
         );
         let replay = builder.build();
-        let qgkv_projection = AffineQuantizedMatmul::new(device, gqa_qgkv_affine_config(model));
-        let projection_split = GQAProjectionSplitKernel::new(device, gqa_projection_split_config(model));
+        let qgkv_matmul = AffineQuantizedMatmul::new(device, gqa_qgkv_affine_config(model));
+        let qgkv_to_q_g_k_v = GQAQGKVSplitKernel::new(device, gqa_qgkv_to_q_g_k_v_config(model));
         let q_norm_rope_kernel = GQANormRopeKernel::new(device, gqa_norm_rope_config(model.num_q_heads, model));
         let k_norm_rope_kernel = GQANormRopeKernel::new(device, gqa_norm_rope_config(model.num_kv_heads, model));
-        let kv_update = GQAKVPageUpdate::new(device, gqa_kv_update_config(model, config.page_bytes));
-        let activation_gate = GQAActivationGateKernel::new(device, gqa_activation_gate_config(model));
-        let output_projection = AffineQuantizedMatmul::new(device, gqa_output_affine_config(model));
+        let kv_page_write = GQAKVPageWrite::new(device, gqa_kv_page_write_config(model, config.page_bytes));
+        let gate = GQAActivationGateKernel::new(device, gqa_gate_config(model));
+        let output = AffineQuantizedMatmul::new(device, gqa_output_affine_config(model));
         let metal_page_table_layout = gqa_page_table_layout(num_reqs, end_context_len);
+        let tiled_config = gqa_tiled_sdpa_config(metal_page_table_layout, params, model);
         let tiled_shape = GQATiledSDPAShape {
             num_tokens,
             num_q_token_tiles: tiled_replay_shape.num_q_token_tiles,
             total_sdpa_map_task_templates: tiled_replay_shape.total_sdpa_map_task_templates,
-            num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
-            num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
-            head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
-            q_head_tile_size: params.tiled_q_head_tile_size,
-            q_token_tile_size: params.tiled_q_token_tile_size,
-            kv_token_tile_size: params.tiled_kv_token_tile_size,
-            scale: (model.head_dim as f32).sqrt().recip(),
-            page_bytes: config.page_bytes,
-            dtype: Dtype::Bfloat16,
-            page_table_layout: metal_page_table_layout,
-            gqa_layer_index: 0,
         };
-        let tiled_kernel = GQATiledSDPAKernels::new(device);
+        let tiled_kernel = GQATiledSDPAKernels::new(device, tiled_config, tiled_shape);
         let mut tiled_builder = MetalReplayRuntime::new(&stream).create_recorder();
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(qgkv_projection.invoke(
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(qgkv_matmul.invoke(
             num_tokens.try_into().expect("GQA token count must fit i32"),
-            &qgkv_proj,
+            &qgkv,
             0,
             &hidden_state,
             0,
@@ -449,10 +451,10 @@ impl<'a> RealGQAFixture<'a> {
             &weights.qgkv_biases,
             0,
         )));
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(projection_split.invoke(
-            GQAProjectionSplitShape { num_tokens },
-            GQAProjectionSplitBuffers {
-                qgkv: &qgkv_proj,
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(qgkv_to_q_g_k_v.invoke(
+            GQAQGKVSplitShape { num_tokens },
+            GQAQGKVSplitBuffers {
+                qgkv: &qgkv,
                 q: &q,
                 g: &g,
                 k: &k,
@@ -477,13 +479,13 @@ impl<'a> RealGQAFixture<'a> {
                 output: &k_norm_rope,
             },
         )));
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(kv_update.invoke(
-            GQAKVPageUpdateShape {
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(kv_page_write.invoke(
+            GQAKVPageWriteShape {
                 num_token_writes: num_tokens,
                 page_table_layout: metal_page_table_layout,
                 gqa_layer_index: 0,
             },
-            GQAKVPageUpdateBuffers {
+            GQAKVPageWriteBuffers {
                 pages: &kv_pages,
                 flat_k: &k_norm_rope,
                 flat_v: &v,
@@ -492,23 +494,19 @@ impl<'a> RealGQAFixture<'a> {
                 page_ids: &page_ids,
             },
         )));
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_map(
-            tiled_shape,
-            GQATiledSDPAMapBuffers {
-                q: &q_norm_rope,
-                kv_pages: &kv_pages,
-                req_slots: batch_metadata.req_slots(),
-                page_ids: &page_ids,
-                flat_token_indices: tiled_batch_metadata.flat_token_indices(),
-                q_token_tiles: tiled_batch_metadata.q_token_tiles(),
-                sdpa_map_task_templates: tiled_batch_metadata.sdpa_map_task_templates(),
-                partial_output: &tiled_partial_output,
-                partial_exp_sums: &tiled_partial_exp_sums,
-                partial_max_logits: &tiled_partial_max_logits,
-            },
-        )));
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_map(GQATiledSDPAMapBuffers {
+            q: &q_norm_rope,
+            kv_pages: &kv_pages,
+            req_slots: batch_metadata.req_slots(),
+            page_ids: &page_ids,
+            flat_token_indices: tiled_batch_metadata.flat_token_indices(),
+            q_token_tiles: tiled_batch_metadata.q_token_tiles(),
+            sdpa_map_task_templates: tiled_batch_metadata.sdpa_map_task_templates(),
+            partial_output: &tiled_partial_output,
+            partial_exp_sums: &tiled_partial_exp_sums,
+            partial_max_logits: &tiled_partial_max_logits,
+        })));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
-            tiled_shape,
             GQATiledSDPAReduceBuffers {
                 partial_output: &tiled_partial_output,
                 partial_exp_sums: &tiled_partial_exp_sums,
@@ -518,7 +516,7 @@ impl<'a> RealGQAFixture<'a> {
                 output: &tiled_attention_output,
             },
         )));
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(activation_gate.invoke(
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(gate.invoke(
             GQAActivationGateShape { num_tokens },
             GQAActivationGateBuffers {
                 attention_output: &tiled_attention_output,
@@ -526,7 +524,7 @@ impl<'a> RealGQAFixture<'a> {
                 output: &gated_attention_output,
             },
         )));
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(output_projection.invoke(
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(output.invoke(
             num_tokens.try_into().expect("GQA token count must fit i32"),
             &tiled_next_hidden_state,
             0,
@@ -562,7 +560,7 @@ impl<'a> RealGQAFixture<'a> {
             _tiled_partial_output: tiled_partial_output,
             _tiled_partial_exp_sums: tiled_partial_exp_sums,
             _tiled_partial_max_logits: tiled_partial_max_logits,
-            _qgkv_proj: qgkv_proj,
+            _qgkv: qgkv,
             _q: q,
             _g: g,
             _k: k,
@@ -590,83 +588,63 @@ impl<'a> RealGQAFixture<'a> {
     }
 
     fn validate_tiled_q_tokens_attention(&self) {
-        let sdpa = GQAPagedSDPAKernels::new(&self.device);
         let sdpa_config = gqa_sdpa_config(self.num_reqs, self.end_context_len, self.params, self.model);
         let sdpa_shape = gqa_sdpa_shape(self.batch_metadata.replay_shape());
+        let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
         let single_q_token_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(sdpa.invoke_map(
-                sdpa_config,
-                sdpa_shape,
-                GQAPagedSDPAMapBuffers {
-                    q: &self._q_norm_rope,
-                    kv_pages: &self._kv_pages,
-                    req_slots: self.batch_metadata.req_slots(),
-                    page_ids: &self._page_ids,
-                    sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
-                    partial_exp_sums: &self._sdpa_partial_exp_sums,
-                    partial_max_logits: &self._sdpa_partial_max_logits,
-                    partial_output: &self._sdpa_partial_output,
-                },
-            )));
-            builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
-                sdpa_config,
-                sdpa_shape,
-                GQAPagedSDPAReduceBuffers {
-                    partial_exp_sums: &self._sdpa_partial_exp_sums,
-                    partial_max_logits: &self._sdpa_partial_max_logits,
-                    partial_output: &self._sdpa_partial_output,
-                    cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
-                    output: &self._attention_output,
-                },
-            )));
+            builder.record(ReplayOp::opaque(sdpa.invoke_map(GQAPagedSDPAMapBuffers {
+                q: &self._q_norm_rope,
+                kv_pages: &self._kv_pages,
+                req_slots: self.batch_metadata.req_slots(),
+                page_ids: &self._page_ids,
+                sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
+                partial_exp_sums: &self._sdpa_partial_exp_sums,
+                partial_max_logits: &self._sdpa_partial_max_logits,
+                partial_output: &self._sdpa_partial_output,
+            })));
+            builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
+                partial_exp_sums: &self._sdpa_partial_exp_sums,
+                partial_max_logits: &self._sdpa_partial_max_logits,
+                partial_output: &self._sdpa_partial_output,
+                cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
+                output: &self._attention_output,
+            })));
             builder.build()
         };
+        let tiled_config = gqa_tiled_sdpa_config(
+            gqa_page_table_layout(self.num_reqs, self.end_context_len),
+            self.params,
+            self.model,
+        );
         let tiled_shape = GQATiledSDPAShape {
             num_tokens: self.num_tokens,
             num_q_token_tiles: self.tiled_batch_metadata.replay_shape().num_q_token_tiles,
             total_sdpa_map_task_templates: self.tiled_batch_metadata.replay_shape().total_sdpa_map_task_templates,
-            num_q_heads: self.model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
-            num_kv_heads: self.model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
-            head_dim: self.model.head_dim.try_into().expect("GQA head_dim must fit u32"),
-            q_head_tile_size: self.params.tiled_q_head_tile_size,
-            q_token_tile_size: self.params.tiled_q_token_tile_size,
-            kv_token_tile_size: self.params.tiled_kv_token_tile_size,
-            scale: (self.model.head_dim as f32).sqrt().recip(),
-            page_bytes: self.model.page_bytes(),
-            dtype: Dtype::Bfloat16,
-            page_table_layout: gqa_page_table_layout(self.num_reqs, self.end_context_len),
-            gqa_layer_index: 0,
         };
-        let tiled = GQATiledSDPAKernels::new(&self.device);
+        let tiled = GQATiledSDPAKernels::new(&self.device, tiled_config, tiled_shape);
         let tiled_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(tiled.invoke_map(
-                tiled_shape,
-                GQATiledSDPAMapBuffers {
-                    q: &self._q_norm_rope,
-                    kv_pages: &self._kv_pages,
-                    req_slots: self.tiled_batch_metadata.req_slots(),
-                    page_ids: &self._page_ids,
-                    flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
-                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                    sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
-                    partial_output: &self._tiled_partial_output,
-                    partial_exp_sums: &self._tiled_partial_exp_sums,
-                    partial_max_logits: &self._tiled_partial_max_logits,
-                },
-            )));
-            builder.record_with_barrier_before(ReplayOp::opaque(tiled.invoke_reduce(
-                tiled_shape,
-                GQATiledSDPAReduceBuffers {
-                    partial_output: &self._tiled_partial_output,
-                    partial_exp_sums: &self._tiled_partial_exp_sums,
-                    partial_max_logits: &self._tiled_partial_max_logits,
-                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                    cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_sdpa_partial_outputs(),
-                    output: &self._tiled_attention_output,
-                },
-            )));
+            builder.record(ReplayOp::opaque(tiled.invoke_map(GQATiledSDPAMapBuffers {
+                q: &self._q_norm_rope,
+                kv_pages: &self._kv_pages,
+                req_slots: self.tiled_batch_metadata.req_slots(),
+                page_ids: &self._page_ids,
+                flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
+                q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
+                sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
+                partial_output: &self._tiled_partial_output,
+                partial_exp_sums: &self._tiled_partial_exp_sums,
+                partial_max_logits: &self._tiled_partial_max_logits,
+            })));
+            builder.record_with_barrier_before(ReplayOp::opaque(tiled.invoke_reduce(GQATiledSDPAReduceBuffers {
+                partial_output: &self._tiled_partial_output,
+                partial_exp_sums: &self._tiled_partial_exp_sums,
+                partial_max_logits: &self._tiled_partial_max_logits,
+                q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
+                cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_sdpa_partial_outputs(),
+                output: &self._tiled_attention_output,
+            })));
             builder.build()
         };
         let runtime = MetalReplayRuntime::new(&self.stream);
@@ -736,24 +714,27 @@ impl<'a> RealGQAFixture<'a> {
     }
 
     fn measure_subcomponents(&self, selected_subcomponents: &[String], warmup_iters: usize, iters: usize, runs: usize) {
-        let qgkv_projection = AffineQuantizedMatmul::new(&self.device, gqa_qgkv_affine_config(self.model));
-        let projection_split = GQAProjectionSplitKernel::new(&self.device, gqa_projection_split_config(self.model));
+        let qgkv_matmul = AffineQuantizedMatmul::new(&self.device, gqa_qgkv_affine_config(self.model));
+        let qgkv_to_q_g_k_v = GQAQGKVSplitKernel::new(&self.device, gqa_qgkv_to_q_g_k_v_config(self.model));
         let q_norm_rope =
             GQANormRopeKernel::new(&self.device, gqa_norm_rope_config(self.model.num_q_heads, self.model));
         let k_norm_rope =
             GQANormRopeKernel::new(&self.device, gqa_norm_rope_config(self.model.num_kv_heads, self.model));
-        let kv_update = GQAKVPageUpdate::new(&self.device, gqa_kv_update_config(self.model, self.model.page_bytes()));
-        let sdpa = GQAPagedSDPAKernels::new(&self.device);
-        let activation_gate = GQAActivationGateKernel::new(&self.device, gqa_activation_gate_config(self.model));
-        let output_projection = AffineQuantizedMatmul::new(&self.device, gqa_output_affine_config(self.model));
+        let kv_page_write = GQAKVPageWrite::new(
+            &self.device,
+            gqa_kv_page_write_config(self.model, self.model.page_bytes()),
+        );
+        let gate = GQAActivationGateKernel::new(&self.device, gqa_gate_config(self.model));
+        let output = AffineQuantizedMatmul::new(&self.device, gqa_output_affine_config(self.model));
         let sdpa_config = gqa_sdpa_config(self.num_reqs, self.end_context_len, self.params, self.model);
         let sdpa_shape = gqa_sdpa_shape(self.batch_metadata.replay_shape());
+        let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
 
         let qgkv_replay = build_single_invocation_replay(
             &self.stream,
-            qgkv_projection.invoke(
+            qgkv_matmul.invoke(
                 self.num_tokens.try_into().expect("GQA token count must fit i32"),
-                &self._qgkv_proj,
+                &self._qgkv,
                 0,
                 &self._hidden_state,
                 0,
@@ -767,12 +748,12 @@ impl<'a> RealGQAFixture<'a> {
         );
         let split_replay = build_single_invocation_replay(
             &self.stream,
-            projection_split.invoke(
-                GQAProjectionSplitShape {
+            qgkv_to_q_g_k_v.invoke(
+                GQAQGKVSplitShape {
                     num_tokens: self.num_tokens,
                 },
-                GQAProjectionSplitBuffers {
-                    qgkv: &self._qgkv_proj,
+                GQAQGKVSplitBuffers {
+                    qgkv: &self._qgkv,
                     q: &self._q,
                     g: &self._g,
                     k: &self._k,
@@ -805,15 +786,15 @@ impl<'a> RealGQAFixture<'a> {
             ),
         );
         let page_table_layout = gqa_page_table_layout(self.num_reqs, self.end_context_len);
-        let kv_update_replay = build_single_invocation_replay(
+        let kv_page_write_replay = build_single_invocation_replay(
             &self.stream,
-            kv_update.invoke(
-                GQAKVPageUpdateShape {
+            kv_page_write.invoke(
+                GQAKVPageWriteShape {
                     num_token_writes: self.num_tokens,
                     page_table_layout,
                     gqa_layer_index: 0,
                 },
-                GQAKVPageUpdateBuffers {
+                GQAKVPageWriteBuffers {
                     pages: &self._kv_pages,
                     flat_k: &self._k_norm_rope,
                     flat_v: &self._v,
@@ -825,69 +806,47 @@ impl<'a> RealGQAFixture<'a> {
         );
         let single_q_token_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(sdpa.invoke_map(
-                sdpa_config,
-                sdpa_shape,
-                GQAPagedSDPAMapBuffers {
-                    q: &self._q_norm_rope,
-                    kv_pages: &self._kv_pages,
-                    req_slots: self.batch_metadata.req_slots(),
-                    page_ids: &self._page_ids,
-                    sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
-                    partial_exp_sums: &self._sdpa_partial_exp_sums,
-                    partial_max_logits: &self._sdpa_partial_max_logits,
-                    partial_output: &self._sdpa_partial_output,
-                },
-            )));
-            builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
-                sdpa_config,
-                sdpa_shape,
-                GQAPagedSDPAReduceBuffers {
-                    partial_exp_sums: &self._sdpa_partial_exp_sums,
-                    partial_max_logits: &self._sdpa_partial_max_logits,
-                    partial_output: &self._sdpa_partial_output,
-                    cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
-                    output: &self._attention_output,
-                },
-            )));
+            builder.record(ReplayOp::opaque(sdpa.invoke_map(GQAPagedSDPAMapBuffers {
+                q: &self._q_norm_rope,
+                kv_pages: &self._kv_pages,
+                req_slots: self.batch_metadata.req_slots(),
+                page_ids: &self._page_ids,
+                sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
+                partial_exp_sums: &self._sdpa_partial_exp_sums,
+                partial_max_logits: &self._sdpa_partial_max_logits,
+                partial_output: &self._sdpa_partial_output,
+            })));
+            builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
+                partial_exp_sums: &self._sdpa_partial_exp_sums,
+                partial_max_logits: &self._sdpa_partial_max_logits,
+                partial_output: &self._sdpa_partial_output,
+                cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
+                output: &self._attention_output,
+            })));
             builder.build()
         };
+        let tiled_config = gqa_tiled_sdpa_config(page_table_layout, self.params, self.model);
         let tiled_shape = GQATiledSDPAShape {
             num_tokens: self.num_tokens,
             num_q_token_tiles: self.tiled_batch_metadata.replay_shape().num_q_token_tiles,
             total_sdpa_map_task_templates: self.tiled_batch_metadata.replay_shape().total_sdpa_map_task_templates,
-            num_q_heads: self.model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
-            num_kv_heads: self.model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
-            head_dim: self.model.head_dim.try_into().expect("GQA head_dim must fit u32"),
-            q_head_tile_size: self.params.tiled_q_head_tile_size,
-            q_token_tile_size: self.params.tiled_q_token_tile_size,
-            kv_token_tile_size: self.params.tiled_kv_token_tile_size,
-            scale: (self.model.head_dim as f32).sqrt().recip(),
-            page_bytes: self.model.page_bytes(),
-            dtype: Dtype::Bfloat16,
-            page_table_layout,
-            gqa_layer_index: 0,
         };
-        let tiled_kernel = GQATiledSDPAKernels::new(&self.device);
+        let tiled_kernel = GQATiledSDPAKernels::new(&self.device, tiled_config, tiled_shape);
         let tiled_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(tiled_kernel.invoke_map(
-                tiled_shape,
-                GQATiledSDPAMapBuffers {
-                    q: &self._q_norm_rope,
-                    kv_pages: &self._kv_pages,
-                    req_slots: self.tiled_batch_metadata.req_slots(),
-                    page_ids: &self._page_ids,
-                    flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
-                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                    sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
-                    partial_output: &self._tiled_partial_output,
-                    partial_exp_sums: &self._tiled_partial_exp_sums,
-                    partial_max_logits: &self._tiled_partial_max_logits,
-                },
-            )));
+            builder.record(ReplayOp::opaque(tiled_kernel.invoke_map(GQATiledSDPAMapBuffers {
+                q: &self._q_norm_rope,
+                kv_pages: &self._kv_pages,
+                req_slots: self.tiled_batch_metadata.req_slots(),
+                page_ids: &self._page_ids,
+                flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
+                q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
+                sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
+                partial_output: &self._tiled_partial_output,
+                partial_exp_sums: &self._tiled_partial_exp_sums,
+                partial_max_logits: &self._tiled_partial_max_logits,
+            })));
             builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
-                tiled_shape,
                 GQATiledSDPAReduceBuffers {
                     partial_output: &self._tiled_partial_output,
                     partial_exp_sums: &self._tiled_partial_exp_sums,
@@ -911,7 +870,7 @@ impl<'a> RealGQAFixture<'a> {
         );
         let gate_replay = build_single_invocation_replay(
             &self.stream,
-            activation_gate.invoke(
+            gate.invoke(
                 GQAActivationGateShape {
                     num_tokens: self.num_tokens,
                 },
@@ -922,9 +881,9 @@ impl<'a> RealGQAFixture<'a> {
                 },
             ),
         );
-        let output_projection_replay = build_single_invocation_replay(
+        let output_replay = build_single_invocation_replay(
             &self.stream,
-            output_projection.invoke(
+            output.invoke(
                 self.num_tokens.try_into().expect("GQA token count must fit i32"),
                 &self.next_hidden_state,
                 0,
@@ -939,17 +898,10 @@ impl<'a> RealGQAFixture<'a> {
             ),
         );
 
+        self.measure_subcomponent(selected_subcomponents, "qgkv", &qgkv_replay, warmup_iters, iters, runs);
         self.measure_subcomponent(
             selected_subcomponents,
-            "qgkv-proj",
-            &qgkv_replay,
-            warmup_iters,
-            iters,
-            runs,
-        );
-        self.measure_subcomponent(
-            selected_subcomponents,
-            "split",
+            "qgkv-to-q-g-k-v",
             &split_replay,
             warmup_iters,
             iters,
@@ -973,8 +925,8 @@ impl<'a> RealGQAFixture<'a> {
         );
         self.measure_subcomponent(
             selected_subcomponents,
-            "kv-update",
-            &kv_update_replay,
+            "kv-page-write",
+            &kv_page_write_replay,
             warmup_iters,
             iters,
             runs,
@@ -998,8 +950,8 @@ impl<'a> RealGQAFixture<'a> {
         self.measure_subcomponent(selected_subcomponents, "gate", &gate_replay, warmup_iters, iters, runs);
         self.measure_subcomponent(
             selected_subcomponents,
-            "output-proj",
-            &output_projection_replay,
+            "output",
+            &output_replay,
             warmup_iters,
             iters,
             runs,

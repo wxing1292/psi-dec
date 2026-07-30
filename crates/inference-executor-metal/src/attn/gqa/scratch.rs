@@ -1,3 +1,4 @@
+use inference_backend_metal::components::GQACompute;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -14,7 +15,7 @@ fn assert_u32_element_index_domain(num_elements: usize, name: &str) {
 }
 
 pub struct GQAScratch {
-    qgkv_proj: Buffer,
+    qgkv: Buffer,
     q: Buffer,
     g: Buffer,
     k: Buffer,
@@ -30,7 +31,7 @@ pub struct GQAScratch {
 
 #[derive(Clone, Copy)]
 pub struct GQAScratchBindings<'a> {
-    pub qgkv_proj: &'a Buffer,
+    pub qgkv: &'a Buffer,
     pub q: &'a Buffer,
     pub g: &'a Buffer,
     pub k: &'a Buffer,
@@ -45,15 +46,17 @@ pub struct GQAScratchBindings<'a> {
 }
 
 impl GQAScratch {
-    pub fn new(device: &Device, core: &GQACore, config: GQAMetalConfig, max_tokens: usize) -> Self {
+    pub(super) fn new(
+        device: &Device,
+        core: &GQACore,
+        config: GQAMetalConfig,
+        compute: GQACompute,
+        max_tokens: usize,
+    ) -> Self {
         core.validate();
         config.validate();
         assert!(max_tokens > 0);
-        let max_tokens_per_partial_output = if config.supports_tiled_q_tokens(core) {
-            config.tiled_q_token_tile_size as usize
-        } else {
-            1
-        };
+        let max_tokens_per_partial_output = compute.max_query_tokens_per_partial_output() as usize;
         let num_sdpa_partial_output_tokens = max_tokens
             .checked_mul(max_tokens_per_partial_output)
             .expect("GQA scratch partial-token capacity must fit usize");
@@ -73,24 +76,24 @@ impl GQAScratch {
             .expect("GQA SDPA partial output element count must fit usize");
         assert_u32_element_index_domain(num_sdpa_partial_output_values, "GQA SDPA partial output");
         Self {
-            qgkv_proj: Buffer::new_zeroed_elements(device, tensor_elements(core.qgkv_dim()), config.dtype),
-            q: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.dtype),
-            g: Buffer::new_zeroed_elements(device, tensor_elements(core.g_dim()), config.dtype),
-            k: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.dtype),
-            v: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), config.dtype),
-            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.dtype),
-            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.dtype),
+            qgkv: Buffer::new_zeroed_elements(device, tensor_elements(core.qgkv_dim()), config.io_dtype),
+            q: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
+            g: Buffer::new_zeroed_elements(device, tensor_elements(core.g_dim()), config.io_dtype),
+            k: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.io_dtype),
+            v: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), config.io_dtype),
+            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
+            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.io_dtype),
             sdpa_partial_exp_sums: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_stats, Dtype::Float32),
             sdpa_partial_max_logits: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_stats, Dtype::Float32),
-            sdpa_partial_output: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_values, config.dtype),
-            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.dtype),
-            gated_attention_output: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.dtype),
+            sdpa_partial_output: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_values, config.io_dtype),
+            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
+            gated_attention_output: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
         }
     }
 
     pub fn bindings(&self) -> GQAScratchBindings<'_> {
         GQAScratchBindings {
-            qgkv_proj: &self.qgkv_proj,
+            qgkv: &self.qgkv,
             q: &self.q,
             g: &self.g,
             k: &self.k,

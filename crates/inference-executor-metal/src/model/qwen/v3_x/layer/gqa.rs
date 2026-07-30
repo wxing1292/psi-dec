@@ -4,6 +4,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
 
@@ -20,9 +21,9 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::model::qwen::v3_x::weight::affine_config;
 use crate::model::qwen::v3_x::weight::concat_bytes;
-use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::qwen::v3_x::weight::quant_weight;
-use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::qwen::v3_x::weight::remove_quant_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xGQA {
@@ -111,17 +112,32 @@ impl Qwen3xGQAWeights {
         core: &GQACore,
         metal: GQAMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
+        let mut tensor_names = Vec::new();
+        bindings.push_tensor_names(&mut tensor_names);
+        let mut tensors = store.load_tensors(tensor_names)?;
+        let weights = Self::from_tensors(device, &mut tensors, bindings, core, metal)?;
+        assert!(tensors.is_empty(), "GQA must consume its tensor map");
+        Ok(weights)
+    }
+
+    fn from_tensors(
+        device: &Device,
+        tensors: &mut TensorMap,
+        bindings: &Qwen3xGQAWeightBindings,
+        core: &GQACore,
+        metal: GQAMetalConfig,
+    ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
-        let q_weight = quant_weight(store, &bindings.q.weight)?;
-        let k_weight = quant_weight(store, &bindings.k.weight)?;
-        let v_weight = quant_weight(store, &bindings.v.weight)?;
-        let q_scales = typed_tensor(store, &bindings.q.scales, safetensors::Dtype::BF16)?.into_data();
-        let k_scales = typed_tensor(store, &bindings.k.scales, safetensors::Dtype::BF16)?.into_data();
-        let v_scales = typed_tensor(store, &bindings.v.scales, safetensors::Dtype::BF16)?.into_data();
-        let q_biases = typed_tensor(store, &bindings.q.biases, safetensors::Dtype::BF16)?.into_data();
-        let k_biases = typed_tensor(store, &bindings.k.biases, safetensors::Dtype::BF16)?.into_data();
-        let v_biases = typed_tensor(store, &bindings.v.biases, safetensors::Dtype::BF16)?.into_data();
+        let q_weight = remove_quant_weight(tensors, &bindings.q.weight)?;
+        let k_weight = remove_quant_weight(tensors, &bindings.k.weight)?;
+        let v_weight = remove_quant_weight(tensors, &bindings.v.weight)?;
+        let q_scales = remove_typed_tensor(tensors, &bindings.q.scales, safetensors::Dtype::BF16)?.into_data();
+        let k_scales = remove_typed_tensor(tensors, &bindings.k.scales, safetensors::Dtype::BF16)?.into_data();
+        let v_scales = remove_typed_tensor(tensors, &bindings.v.scales, safetensors::Dtype::BF16)?.into_data();
+        let q_biases = remove_typed_tensor(tensors, &bindings.q.biases, safetensors::Dtype::BF16)?.into_data();
+        let k_biases = remove_typed_tensor(tensors, &bindings.k.biases, safetensors::Dtype::BF16)?.into_data();
+        let v_biases = remove_typed_tensor(tensors, &bindings.v.biases, safetensors::Dtype::BF16)?.into_data();
         let qgkv_weight = concat_bytes(&[&q_weight, &k_weight, &v_weight]);
         let qgkv_scales = concat_bytes(&[&q_scales, &k_scales, &v_scales]);
         let qgkv_biases = concat_bytes(&[&q_biases, &k_biases, &v_biases]);
@@ -131,9 +147,9 @@ impl Qwen3xGQAWeights {
             core.hidden_dim,
             metal.group_size,
             metal.bits,
-            metal.dtype,
-            metal.dtype,
-            metal.dtype,
+            metal.io_dtype,
+            metal.io_dtype,
+            metal.io_dtype,
         );
         validate_len("GQA qgkv weight", qgkv_weight.len(), qgkv_config.weight_bytes())?;
         validate_len("GQA qgkv scales", qgkv_scales.len(), qgkv_config.scale_or_bias_bytes())?;
@@ -143,13 +159,15 @@ impl Qwen3xGQAWeights {
             core.q_dim(),
             metal.group_size,
             metal.bits,
-            metal.dtype,
-            metal.dtype,
-            metal.dtype,
+            metal.io_dtype,
+            metal.io_dtype,
+            metal.io_dtype,
         );
-        let output_weight = quant_weight(store, &bindings.output.weight)?;
-        let output_scales = typed_tensor(store, &bindings.output.scales, safetensors::Dtype::BF16)?.into_data();
-        let output_biases = typed_tensor(store, &bindings.output.biases, safetensors::Dtype::BF16)?.into_data();
+        let output_weight = remove_quant_weight(tensors, &bindings.output.weight)?;
+        let output_scales =
+            remove_typed_tensor(tensors, &bindings.output.scales, safetensors::Dtype::BF16)?.into_data();
+        let output_biases =
+            remove_typed_tensor(tensors, &bindings.output.biases, safetensors::Dtype::BF16)?.into_data();
         validate_len("GQA output weight", output_weight.len(), output_config.weight_bytes())?;
         validate_len(
             "GQA output scales",
@@ -166,8 +184,8 @@ impl Qwen3xGQAWeights {
             qgkv_weight: Buffer::from_slice(device, &qgkv_weight),
             qgkv_scales: Buffer::from_slice(device, &qgkv_scales),
             qgkv_biases: Buffer::from_slice(device, &qgkv_biases),
-            q_norm_weight: load_qwen3x_norm_weight(device, store, &bindings.q_norm_weight, &[core.head_dim])?,
-            k_norm_weight: load_qwen3x_norm_weight(device, store, &bindings.k_norm_weight, &[core.head_dim])?,
+            q_norm_weight: remove_qwen3x_norm_weight(device, tensors, &bindings.q_norm_weight, &[core.head_dim])?,
+            k_norm_weight: remove_qwen3x_norm_weight(device, tensors, &bindings.k_norm_weight, &[core.head_dim])?,
             output_weight: Buffer::from_slice(device, &output_weight),
             output_scales: Buffer::from_slice(device, &output_scales),
             output_biases: Buffer::from_slice(device, &output_biases),

@@ -28,16 +28,11 @@ pub fn qwen3_gqa_core_and_metal(
         group_size,
         bits,
         page_bytes: to_u32("Qwen3 GQA page_bytes", QWEN3_PAGE_SIZE_BYTES)?,
-        single_q_token_kv_token_tile_size: 128,
-        single_q_token_num_threads_per_threadblock: 128,
-        single_q_token_max_q_head_tile_size: 5,
-        tiled_q_token_tile_size: 8,
-        tiled_kv_token_tile_size: 16,
         rope_dim: to_u32("Qwen3 GQA rope_dim", text.head_dim)?,
         norm_eps: text.rms_norm_eps,
         rope_theta: text.rope_theta,
         rope_scale: 1.0,
-        dtype: Dtype::Bfloat16,
+        io_dtype: Dtype::Bfloat16,
     };
     metal.validate();
     assert!(metal.num_ungated_tokens_per_page(&core) > 0);

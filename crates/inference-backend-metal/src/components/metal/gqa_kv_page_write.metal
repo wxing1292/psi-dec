@@ -3,7 +3,7 @@
 using namespace metal;
 
 template <typename T>
-void gqa_kv_page_update_impl(
+void gqa_kv_page_write_impl(
     device T* pages,
     device const T* flat_k,
     device const T* flat_v,
@@ -52,7 +52,7 @@ void gqa_kv_page_update_impl(
     pages[page_base + v_region_offset + page_token_offset] = flat_v[flat_offset];
 }
 
-kernel void gqa_kv_page_update_u16(
+kernel void gqa_kv_page_write_u16(
     device ushort* pages [[buffer(0)]],
     device const ushort* flat_k [[buffer(1)]],
     device const ushort* flat_v [[buffer(2)]],
@@ -66,7 +66,7 @@ kernel void gqa_kv_page_update_u16(
     constant uint& num_page_ids_per_block [[buffer(10)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_kv_page_update_impl(
+    gqa_kv_page_write_impl(
         pages,
         flat_k,
         flat_v,
@@ -82,7 +82,7 @@ kernel void gqa_kv_page_update_u16(
     );
 }
 
-kernel void gqa_kv_page_update_f32(
+kernel void gqa_kv_page_write_f32(
     device float* pages [[buffer(0)]],
     device const float* flat_k [[buffer(1)]],
     device const float* flat_v [[buffer(2)]],
@@ -96,7 +96,7 @@ kernel void gqa_kv_page_update_f32(
     constant uint& num_page_ids_per_block [[buffer(10)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_kv_page_update_impl(
+    gqa_kv_page_write_impl(
         pages,
         flat_k,
         flat_v,

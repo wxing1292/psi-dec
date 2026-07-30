@@ -8,7 +8,7 @@ use crate::attn::gqa::backend::GQAMetalConfig;
 
 pub struct DSparkBlockScratch {
     capacity: DSparkBlockCapacity,
-    qkv_proj: Buffer,
+    qkv: Buffer,
     q: Buffer,
     k: Buffer,
     v: Buffer,
@@ -23,7 +23,7 @@ pub struct DSparkBlockScratch {
 #[derive(Clone, Copy)]
 pub struct DSparkBlockScratchBindings<'a> {
     pub capacity: DSparkBlockCapacity,
-    pub qkv_proj: &'a Buffer,
+    pub qkv: &'a Buffer,
     pub q: &'a Buffer,
     pub k: &'a Buffer,
     pub v: &'a Buffer,
@@ -67,16 +67,16 @@ impl DSparkBlockScratch {
 
         Self {
             capacity,
-            qkv_proj: Buffer::new_zeroed_elements(device, tensor_elements(attention.qkv_dim()), metal.dtype),
-            q: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.dtype),
-            k: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), metal.dtype),
-            v: Buffer::new_zeroed_elements(device, tensor_elements(attention.v_dim()), metal.dtype),
-            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.dtype),
-            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), metal.dtype),
+            qkv: Buffer::new_zeroed_elements(device, tensor_elements(attention.qkv_dim()), metal.io_dtype),
+            q: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.io_dtype),
+            k: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), metal.io_dtype),
+            v: Buffer::new_zeroed_elements(device, tensor_elements(attention.v_dim()), metal.io_dtype),
+            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.io_dtype),
+            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), metal.io_dtype),
             partial_exp_sums: Buffer::new_zeroed_elements(device, partial_stats, Dtype::Float32),
             partial_max_logits: Buffer::new_zeroed_elements(device, partial_stats, Dtype::Float32),
-            partial_output: Buffer::new_zeroed_elements(device, partial_values, metal.dtype),
-            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.dtype),
+            partial_output: Buffer::new_zeroed_elements(device, partial_values, metal.io_dtype),
+            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.io_dtype),
         }
     }
 
@@ -87,7 +87,7 @@ impl DSparkBlockScratch {
     pub fn bindings(&self) -> DSparkBlockScratchBindings<'_> {
         DSparkBlockScratchBindings {
             capacity: self.capacity,
-            qkv_proj: &self.qkv_proj,
+            qkv: &self.qkv,
             q: &self.q,
             k: &self.k,
             v: &self.v,

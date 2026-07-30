@@ -120,29 +120,35 @@ pub use gqa_attention::GQAPagedSDPAScratch;
 pub use gqa_attention::GQAPagedSDPAShape;
 
 mod gqa_tiled_attention;
+pub use gqa_tiled_attention::GQATiledSDPAConfig;
 pub use gqa_tiled_attention::GQATiledSDPAKernels;
 pub use gqa_tiled_attention::GQATiledSDPAMapBuffers;
 pub use gqa_tiled_attention::GQATiledSDPAReduceBuffers;
 pub use gqa_tiled_attention::GQATiledSDPAShape;
 
-mod gqa_projection;
-pub use gqa_projection::GQAProjectionSplitBuffers;
-pub use gqa_projection::GQAProjectionSplitConfig;
-pub use gqa_projection::GQAProjectionSplitKernel;
-pub use gqa_projection::GQAProjectionSplitShape;
+mod gqa_compute;
+pub use gqa_compute::GQACompute;
+pub use gqa_compute::GQAComputeConfig;
+pub use gqa_compute::GQAComputePath;
 
-mod ungated_gqa_projection;
-pub use ungated_gqa_projection::UngatedGQAProjectionSplitBuffers;
-pub use ungated_gqa_projection::UngatedGQAProjectionSplitConfig;
-pub use ungated_gqa_projection::UngatedGQAProjectionSplitKernel;
-pub use ungated_gqa_projection::UngatedGQAProjectionSplitShape;
+mod gqa_qgkv_split;
+pub use gqa_qgkv_split::GQAQGKVSplitBuffers;
+pub use gqa_qgkv_split::GQAQGKVSplitConfig;
+pub use gqa_qgkv_split::GQAQGKVSplitKernel;
+pub use gqa_qgkv_split::GQAQGKVSplitShape;
 
-mod gqa_kv_pages;
-pub use gqa_kv_pages::GQAKVPageUpdate;
-pub use gqa_kv_pages::GQAKVPageUpdateBuffers;
-pub use gqa_kv_pages::GQAKVPageUpdateConfig;
-pub use gqa_kv_pages::GQAKVPageUpdateShape;
-pub use gqa_kv_pages::GQAPageTableLayout;
+mod gqa_qkv_split;
+pub use gqa_qkv_split::GQAQKVSplitBuffers;
+pub use gqa_qkv_split::GQAQKVSplitConfig;
+pub use gqa_qkv_split::GQAQKVSplitKernel;
+pub use gqa_qkv_split::GQAQKVSplitShape;
+
+mod gqa_kv_page_write;
+pub use gqa_kv_page_write::GQAKVPageWrite;
+pub use gqa_kv_page_write::GQAKVPageWriteBuffers;
+pub use gqa_kv_page_write::GQAKVPageWriteConfig;
+pub use gqa_kv_page_write::GQAKVPageWriteShape;
+pub use gqa_kv_page_write::GQAPageTableLayout;
 
 mod gqa_block_attention;
 pub use gqa_block_attention::GQABlockSDPABuffers;

@@ -1,3 +1,4 @@
+use inference_backend_metal::components::GQACompute;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -14,7 +15,7 @@ fn assert_u32_element_index_domain(num_elements: usize, name: &str) {
 }
 
 pub struct UngatedGQAScratch {
-    qkv_proj: Buffer,
+    qkv: Buffer,
     q: Buffer,
     k: Buffer,
     v: Buffer,
@@ -28,7 +29,7 @@ pub struct UngatedGQAScratch {
 
 #[derive(Clone, Copy)]
 pub struct UngatedGQAScratchBindings<'a> {
-    pub qkv_proj: &'a Buffer,
+    pub qkv: &'a Buffer,
     pub q: &'a Buffer,
     pub k: &'a Buffer,
     pub v: &'a Buffer,
@@ -41,15 +42,17 @@ pub struct UngatedGQAScratchBindings<'a> {
 }
 
 impl UngatedGQAScratch {
-    pub fn new(device: &Device, core: &UngatedGQACore, config: GQAMetalConfig, max_tokens: usize) -> Self {
+    pub(super) fn new(
+        device: &Device,
+        core: &UngatedGQACore,
+        config: GQAMetalConfig,
+        compute: GQACompute,
+        max_tokens: usize,
+    ) -> Self {
         core.validate();
         config.validate();
         assert!(max_tokens > 0);
-        let max_tokens_per_partial_output = if config.supports_ungated_tiled_q_tokens(core) {
-            config.tiled_q_token_tile_size as usize
-        } else {
-            1
-        };
+        let max_tokens_per_partial_output = compute.max_query_tokens_per_partial_output() as usize;
         let num_sdpa_partial_output_tokens = max_tokens
             .checked_mul(max_tokens_per_partial_output)
             .expect("ungated GQA scratch partial-token capacity must fit usize");
@@ -73,22 +76,22 @@ impl UngatedGQAScratch {
             .expect("ungated GQA SDPA partial output element count must fit usize");
         assert_u32_element_index_domain(num_sdpa_partial_output_values, "ungated GQA SDPA partial output");
         Self {
-            qkv_proj: Buffer::new_zeroed_elements(device, tensor_elements(core.qkv_dim()), config.dtype),
-            q: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.dtype),
-            k: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.dtype),
-            v: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), config.dtype),
-            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.dtype),
-            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.dtype),
+            qkv: Buffer::new_zeroed_elements(device, tensor_elements(core.qkv_dim()), config.io_dtype),
+            q: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
+            k: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.io_dtype),
+            v: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), config.io_dtype),
+            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
+            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.io_dtype),
             sdpa_partial_exp_sums: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_stats, Dtype::Float32),
             sdpa_partial_max_logits: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_stats, Dtype::Float32),
-            sdpa_partial_output: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_values, config.dtype),
-            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.dtype),
+            sdpa_partial_output: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_values, config.io_dtype),
+            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
         }
     }
 
     pub fn bindings(&self) -> UngatedGQAScratchBindings<'_> {
         UngatedGQAScratchBindings {
-            qkv_proj: &self.qkv_proj,
+            qkv: &self.qkv,
             q: &self.q,
             k: &self.k,
             v: &self.v,

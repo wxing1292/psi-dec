@@ -105,16 +105,11 @@ pub fn build_qwen3x_dspark_plan(
             group_size: to_u32("Qwen3 DSpark attention group_size", attention_quantization.group_size)?,
             bits: to_u32("Qwen3 DSpark attention bits", attention_quantization.bits)?,
             page_bytes: to_u32("Qwen3 DSpark GQA page_bytes", page_bytes)?,
-            single_q_token_kv_token_tile_size: 128,
-            single_q_token_num_threads_per_threadblock: 128,
-            single_q_token_max_q_head_tile_size: 8,
-            tiled_q_token_tile_size: 8,
-            tiled_kv_token_tile_size: 16,
             rope_dim: to_u32("Qwen3 DSpark rope_dim", config.head_dim)?,
             norm_eps: config.rms_norm_eps,
             rope_theta: config.rope_theta,
             rope_scale: 1.0,
-            dtype: Dtype::Bfloat16,
+            io_dtype: Dtype::Bfloat16,
         };
         attention_metal.validate();
         assert!(
