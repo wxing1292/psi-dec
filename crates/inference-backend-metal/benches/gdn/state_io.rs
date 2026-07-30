@@ -5,9 +5,9 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use inference_backend_metal::components::BufferCopy32Buffers;
-use inference_backend_metal::components::BufferCopy32Shape;
+use inference_backend_metal::components::F32BufferCopyBuffers;
 use inference_backend_metal::components::F32BufferCopyKernel;
+use inference_backend_metal::components::F32BufferCopyShape;
 use inference_backend_metal::components::GDNStatePageBatchRead;
 use inference_backend_metal::components::GDNStatePageBatchReadBuffers;
 use inference_backend_metal::components::GDNStatePageBatchShape;
@@ -230,10 +230,10 @@ fn legacy_restore(
             },
         ));
         builder.record(copy.invoke(
-            BufferCopy32Shape {
+            F32BufferCopyShape {
                 num_values: (recurrent_bytes / size_of::<f32>()) as u32,
             },
-            BufferCopy32Buffers {
+            F32BufferCopyBuffers {
                 input: recurrent_scratch,
                 output: recurrent_states,
                 input_offset_bytes: 0,
@@ -253,10 +253,10 @@ fn legacy_restore(
             },
         ));
         builder.record(copy.invoke(
-            BufferCopy32Shape {
+            F32BufferCopyShape {
                 num_values: (conv_bytes / size_of::<f32>()) as u32,
             },
-            BufferCopy32Buffers {
+            F32BufferCopyBuffers {
                 input: conv_scratch,
                 output: conv_states,
                 input_offset_bytes: 0,
@@ -323,10 +323,10 @@ fn legacy_publish(
     let mut builder = stream.create_replay_program();
     for state_io_request_index in 0..num_state_io_requests as usize {
         builder.record(copy.invoke(
-            BufferCopy32Shape {
+            F32BufferCopyShape {
                 num_values: (recurrent_bytes / size_of::<f32>()) as u32,
             },
-            BufferCopy32Buffers {
+            F32BufferCopyBuffers {
                 input: recurrent_states,
                 output: recurrent_scratch,
                 input_offset_bytes: state_io_request_index * recurrent_bytes,
@@ -346,10 +346,10 @@ fn legacy_publish(
             },
         ));
         builder.record(copy.invoke(
-            BufferCopy32Shape {
+            F32BufferCopyShape {
                 num_values: (conv_bytes / size_of::<f32>()) as u32,
             },
-            BufferCopy32Buffers {
+            F32BufferCopyBuffers {
                 input: conv_states,
                 output: conv_scratch,
                 input_offset_bytes: state_io_request_index * conv_bytes,

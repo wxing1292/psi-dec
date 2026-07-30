@@ -36,7 +36,9 @@ impl SiluShape {
     }
 
     pub fn bytes(self) -> usize {
-        self.num_values as usize * self.dtype.item_size()
+        (self.num_values as usize)
+            .checked_mul(self.dtype.item_size())
+            .expect("SiLU byte length must fit usize")
     }
 }
 
@@ -104,24 +106,36 @@ pub struct SiluInvocation<'a> {
 impl Operator for SiluInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
-    }
-}
-
-impl SiluInvocation<'_> {
-    fn validate(&self) {
-        self.shape.validate();
-        assert!(self.buffers.gate.len_bytes() >= self.offsets.gate_offset_bytes + self.shape.bytes());
-        assert!(self.buffers.up.len_bytes() >= self.offsets.up_offset_bytes + self.shape.bytes());
-        assert!(self.buffers.output.len_bytes() >= self.offsets.output_offset_bytes + self.shape.bytes());
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
         builder.set_kernel(self.kernel);
         builder.set_buffer_read(0, self.buffers.gate, self.offsets.gate_offset_bytes);
         builder.set_buffer_read(1, self.buffers.up, self.offsets.up_offset_bytes);
         builder.set_buffer_write(2, self.buffers.output, self.offsets.output_offset_bytes);
         builder.set_u32(3, self.shape.num_values);
         builder.dispatch_1d(self.shape.num_values as usize, NUM_THREADS_PER_THREADBLOCK);
+    }
+}
+
+impl SiluInvocation<'_> {
+    fn validate(&self) {
+        self.shape.validate();
+        let required_bytes = self.shape.bytes();
+        let gate_end_bytes = self
+            .offsets
+            .gate_offset_bytes
+            .checked_add(required_bytes)
+            .expect("SiLU gate byte range must fit usize");
+        let up_end_bytes = self
+            .offsets
+            .up_offset_bytes
+            .checked_add(required_bytes)
+            .expect("SiLU up byte range must fit usize");
+        let output_end_bytes = self
+            .offsets
+            .output_offset_bytes
+            .checked_add(required_bytes)
+            .expect("SiLU output byte range must fit usize");
+        assert!(self.buffers.gate.len_bytes() >= gate_end_bytes);
+        assert!(self.buffers.up.len_bytes() >= up_end_bytes);
+        assert!(self.buffers.output.len_bytes() >= output_end_bytes);
     }
 }

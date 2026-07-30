@@ -179,21 +179,6 @@ pub struct GQAKVPageUpdateInvocation<'a> {
 impl Operator for GQAKVPageUpdateInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
-    }
-}
-
-impl GQAKVPageUpdateInvocation<'_> {
-    fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.flat_k.len_bytes() >= self.config.flat_kv_bytes(self.shape));
-        assert!(self.buffers.flat_v.len_bytes() >= self.config.flat_kv_bytes(self.shape));
-        assert!(self.buffers.req_slots.len_bytes() >= self.config.index_bytes(self.shape));
-        assert!(self.buffers.flat_token_indices.len_bytes() >= self.config.index_bytes(self.shape));
-        assert!(self.buffers.page_ids.len_bytes() >= self.shape.page_ids_bytes());
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
         builder.set_kernel(self.kernel);
         builder.set_buffer_write(0, self.buffers.pages, 0);
         builder.set_buffer_read(1, self.buffers.flat_k, 0);
@@ -207,6 +192,17 @@ impl GQAKVPageUpdateInvocation<'_> {
         builder.set_u32(9, self.shape.page_table_layout.num_blocks);
         builder.set_u32(10, self.shape.page_table_layout.num_page_ids_per_block);
         builder.dispatch_1d(self.config.num_total_threads(self.shape), NUM_THREADS_PER_THREADBLOCK);
+    }
+}
+
+impl GQAKVPageUpdateInvocation<'_> {
+    fn validate(&self) {
+        self.shape.validate(self.config);
+        assert!(self.buffers.flat_k.len_bytes() >= self.config.flat_kv_bytes(self.shape));
+        assert!(self.buffers.flat_v.len_bytes() >= self.config.flat_kv_bytes(self.shape));
+        assert!(self.buffers.req_slots.len_bytes() >= self.config.index_bytes(self.shape));
+        assert!(self.buffers.flat_token_indices.len_bytes() >= self.config.index_bytes(self.shape));
+        assert!(self.buffers.page_ids.len_bytes() >= self.shape.page_ids_bytes());
     }
 }
 

@@ -38,14 +38,17 @@ fn assert_u32_index_domain(num_elements: usize, name: &str) {
 
 mod buffer_cast;
 pub use buffer_cast::BufferCastBuffers;
+pub use buffer_cast::BufferCastConfig;
 pub use buffer_cast::BufferCastKernel;
 pub use buffer_cast::BufferCastShape;
 
 mod buffer_copy;
-pub use buffer_copy::BufferCopy32Buffers;
-pub use buffer_copy::BufferCopy32Shape;
+pub use buffer_copy::F32BufferCopyBuffers;
 pub use buffer_copy::F32BufferCopyKernel;
+pub use buffer_copy::F32BufferCopyShape;
+pub use buffer_copy::U32BufferCopyBuffers;
 pub use buffer_copy::U32BufferCopyKernel;
+pub use buffer_copy::U32BufferCopyShape;
 
 mod bf16_concat_rows;
 pub use bf16_concat_rows::Bf16ConcatRowsBuffers;

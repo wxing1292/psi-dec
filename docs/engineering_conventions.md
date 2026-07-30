@@ -99,6 +99,32 @@ concepts.
 
 Recommendation: Outside an established domain, use the complete semantic noun.
 
+Let the type and the enclosing owner establish context. A field name must distinguish the field from its peers. Do not
+repeat the entity kind when the type already supplies it.
+
+Use `qgkv`, `qkvabz`, `gate_up`, `router`, and `output` for affine stages in a typed component. Do not add
+`projection`, `proj`, `kernel`, or `buffer` only to repeat the field type. Keep exact checkpoint tensor names such as
+`q_proj` and `down_proj` at the checkpoint boundary.
+
+Name a pure transform from its input to its outputs. Examples include:
+
+```text
+qgkv_to_q_g_k_v
+qkv_to_q_k_v
+qkvabz_to_qkv_a_b_z
+bf16_to_f32
+f32_to_bf16
+```
+
+Do not add a tensor role to a pure data-conversion name. For example, use `bf16_to_f32`, not
+`hidden_state_to_f32`.
+
+Use the exact operation name when it is part of the contract. Use `swiglu` for `SiLU(gate) * up`. Do not call this
+operation only `activation` or `silu`.
+
+Use `shared_experts` and `topk_experts` for MoE branches. Use `shared_expert_gate` for the one gate that controls the
+aggregate shared-expert branch.
+
 Use one symbolic convention for attention tensor and tile comments:
 
 ```text
@@ -333,6 +359,13 @@ executor components must not select or name backend kernels or tile configuratio
 
 A backend benchmark may force an exact backend path to measure a crossover. This benchmark control must remain at the
 backend boundary. It must not enter a model configuration or executor API.
+
+Use `*ComputePath` for alternatives that use different metadata, command graphs, or compute decompositions. Use
+`*KernelKind` for a selected low-level kernel family and tile. Do not use an unqualified `Path`, `Kind`, or
+`Algorithm` for these concepts.
+
+Production code must select a compute path and a kernel from complete workload facts. A benchmark may force a concrete
+implementation at the owning backend boundary. Do not add a compute-path enum when only one implementation exists.
 
 An adaptive affine quantized matmul uses these ownership boundaries:
 

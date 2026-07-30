@@ -1,4 +1,5 @@
 use inference_backend_metal::components::BufferCastBuffers;
+use inference_backend_metal::components::BufferCastConfig;
 use inference_backend_metal::components::BufferCastKernel;
 use inference_backend_metal::components::BufferCastShape;
 use inference_backend_metal::components::GDNCoreBuffers;
@@ -103,7 +104,8 @@ pub struct GDN {
     qkvabz_projection_qmm: AffineQuantizedMatmulKernel,
     projection_split: GDNProjectionSplitKernel,
     core_backend: GDNCoreBackend,
-    cast_pre_output_hidden_states: BufferCastKernel,
+    bf16_to_f32: BufferCastKernel,
+    f32_to_bf16: BufferCastKernel,
     output_projection_qmv: AffineQuantizedMatmulKernel,
     output_projection_qmm: AffineQuantizedMatmulKernel,
 }
@@ -142,7 +144,8 @@ impl GDN {
             ),
             projection_split: GDNProjectionSplitKernel::new(device),
             core_backend: GDNCoreBackend::new(device, core.clone(), config.recurrent_v_tile_size),
-            cast_pre_output_hidden_states: BufferCastKernel::new(device),
+            bf16_to_f32: BufferCastKernel::new(device, BufferCastConfig::bf16_to_f32()),
+            f32_to_bf16: BufferCastKernel::new(device, BufferCastConfig::f32_to_bf16()),
             output_projection_qmv: AffineQuantizedMatmulKernel::new(
                 device,
                 affine_config(
@@ -205,13 +208,13 @@ impl ReplayLayer for GDN {
             Dtype::Bfloat16 => hidden_state,
             Dtype::Float32 => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.cast_pre_output_hidden_states.invoke(
-                        BufferCastShape::bf16_to_f32(
-                            shape
+                    self.bf16_to_f32.invoke(
+                        BufferCastShape {
+                            num_values: shape
                                 .num_tokens
                                 .checked_mul(self.core.hidden_dim.try_into().expect("GDN hidden_dim must fit u32"))
                                 .expect("GDN hidden-state element count must fit u32"),
-                        ),
+                        },
                         BufferCastBuffers {
                             input: hidden_state,
                             output: scratch.hidden_state_f32,
@@ -290,13 +293,13 @@ impl ReplayLayer for GDN {
         let output_projection_input = match self.config.boundary_dtype() {
             Dtype::Bfloat16 => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.cast_pre_output_hidden_states.invoke(
-                        BufferCastShape::f32_to_bf16(
-                            shape
+                    self.f32_to_bf16.invoke(
+                        BufferCastShape {
+                            num_values: shape
                                 .num_tokens
                                 .checked_mul(u32::try_from(self.core.v_dim()).expect("GDN v_dim must fit u32"))
                                 .expect("GDN output element count must fit u32"),
-                        ),
+                        },
                         BufferCastBuffers {
                             input: scratch.pre_output_hidden_states,
                             output: scratch.pre_output_hidden_states_bf16,

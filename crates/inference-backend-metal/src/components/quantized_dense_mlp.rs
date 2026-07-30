@@ -414,7 +414,13 @@ struct QuantizedDenseMLPActivationRowMajorInvocation<'a> {
 impl Operator for QuantizedDenseMLPActivationRowMajorInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.gate_up_proj, 0);
+        builder.set_buffer_write(1, self.activation, 0);
+        builder.set_u32(2, self.shape.num_tokens);
+        builder.set_u32(3, self.config.intermediate_dim);
+        let num_values = self.config.activation_shape_unchecked(self.shape).num_values as usize;
+        builder.dispatch_1d(num_values, ELEMENTWISE_NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
@@ -431,16 +437,6 @@ impl QuantizedDenseMLPActivationRowMajorInvocation<'_> {
             self.activation.len_bytes() >= activation_bytes,
             "dense MLP activation buffer is too small"
         );
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.gate_up_proj, 0);
-        builder.set_buffer_write(1, self.activation, 0);
-        builder.set_u32(2, self.shape.num_tokens);
-        builder.set_u32(3, self.config.intermediate_dim);
-        let num_values = self.config.activation_shape_unchecked(self.shape).num_values as usize;
-        builder.dispatch_1d(num_values, ELEMENTWISE_NUM_THREADS_PER_THREADBLOCK);
     }
 }
 

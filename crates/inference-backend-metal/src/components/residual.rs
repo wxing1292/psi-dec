@@ -74,15 +74,21 @@ impl ResidualShape {
     }
 
     pub fn lhs_bytes(self) -> usize {
-        self.num_values as usize * self.lhs_dtype.item_size()
+        (self.num_values as usize)
+            .checked_mul(self.lhs_dtype.item_size())
+            .expect("residual lhs byte length must fit usize")
     }
 
     pub fn rhs_bytes(self) -> usize {
-        self.num_values as usize * self.rhs_dtype.item_size()
+        (self.num_values as usize)
+            .checked_mul(self.rhs_dtype.item_size())
+            .expect("residual rhs byte length must fit usize")
     }
 
     pub fn output_bytes(self) -> usize {
-        self.num_values as usize * self.output_dtype.item_size()
+        (self.num_values as usize)
+            .checked_mul(self.output_dtype.item_size())
+            .expect("residual output byte length must fit usize")
     }
 }
 
@@ -200,14 +206,24 @@ struct ResidualOwnedBuffers {
 impl Operator for ResidualInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.buffers.lhs, 0);
+        builder.set_buffer_read(1, self.buffers.rhs, 0);
+        builder.set_buffer_write(2, self.buffers.output, 0);
+        builder.set_u32(3, self.shape.num_values);
+        builder.dispatch_1d(self.shape.num_values as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
 impl Operator for ResidualReplayInvocation {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        builder.set_retained_pipeline_state(&self.pipeline);
+        builder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
+        builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
+        builder.set_retained_buffer_write(2, &self.buffers.output, 0);
+        builder.set_u32(3, self.shape.num_values);
+        builder.dispatch_1d(self.shape.num_values as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
@@ -283,15 +299,6 @@ impl ResidualInvocation<'_> {
         assert!(self.buffers.lhs.len_bytes() >= self.shape.lhs_bytes());
         assert!(self.buffers.rhs.len_bytes() >= self.shape.rhs_bytes());
         assert!(self.buffers.output.len_bytes() >= self.shape.output_bytes());
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.lhs, 0);
-        builder.set_buffer_read(1, self.buffers.rhs, 0);
-        builder.set_buffer_write(2, self.buffers.output, 0);
-        builder.set_u32(3, self.shape.num_values);
-        builder.dispatch_1d(self.shape.num_values as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
@@ -416,15 +423,6 @@ impl ResidualReplayInvocation {
         assert!(self.buffers.lhs_len_bytes >= self.shape.lhs_bytes());
         assert!(self.buffers.rhs_len_bytes >= self.shape.rhs_bytes());
         assert!(self.buffers.output_len_bytes >= self.shape.output_bytes());
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        builder.set_retained_pipeline_state(&self.pipeline);
-        builder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
-        builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
-        builder.set_retained_buffer_write(2, &self.buffers.output, 0);
-        builder.set_u32(3, self.shape.num_values);
-        builder.dispatch_1d(self.shape.num_values as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 

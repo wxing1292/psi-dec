@@ -47,15 +47,21 @@ impl ResidualRMSNormShape {
     }
 
     pub fn num_values(self) -> usize {
-        self.num_total_tokens as usize * self.hidden_dim as usize
+        (self.num_total_tokens as usize)
+            .checked_mul(self.hidden_dim as usize)
+            .expect("residual RMSNorm value count must fit usize")
     }
 
     pub fn bytes(self) -> usize {
-        self.num_values() * self.dtype.item_size()
+        self.num_values()
+            .checked_mul(self.dtype.item_size())
+            .expect("residual RMSNorm byte length must fit usize")
     }
 
     pub fn weight_bytes(self) -> usize {
-        self.hidden_dim as usize * self.dtype.item_size()
+        (self.hidden_dim as usize)
+            .checked_mul(self.dtype.item_size())
+            .expect("residual RMSNorm weight byte length must fit usize")
     }
 }
 

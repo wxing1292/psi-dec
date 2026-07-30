@@ -26,7 +26,9 @@ impl MLXElementwiseShape {
 
     pub fn bytes(self) -> usize {
         self.validate();
-        self.num_values as usize * self.dtype.item_size()
+        (self.num_values as usize)
+            .checked_mul(self.dtype.item_size())
+            .expect("MLX elementwise byte length must fit usize")
     }
 }
 
@@ -59,12 +61,6 @@ pub struct MLXSigmoidInvocation<'a> {
 
 impl Operator for MLXSigmoidInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.record_compute(builder);
-    }
-}
-
-impl MLXSigmoidInvocation<'_> {
-    fn record_compute(self, builder: &CommandRecorder) {
         let shape = self.kernel.shape;
         shape.validate();
         assert!(self.input.len_bytes() >= shape.bytes());
@@ -109,12 +105,6 @@ pub struct MLXMultiplyInvocation<'a> {
 
 impl Operator for MLXMultiplyInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.record_compute(builder);
-    }
-}
-
-impl MLXMultiplyInvocation<'_> {
-    fn record_compute(self, builder: &CommandRecorder) {
         let shape = self.kernel.shape;
         shape.validate();
         assert!(self.lhs.len_bytes() >= shape.bytes());

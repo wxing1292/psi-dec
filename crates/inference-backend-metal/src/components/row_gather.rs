@@ -40,19 +40,27 @@ impl RowGatherShape {
     }
 
     pub fn min_input_bytes(self) -> usize {
-        self.num_cols as usize * self.dtype.item_size()
+        (self.num_cols as usize)
+            .checked_mul(self.dtype.item_size())
+            .expect("row gather minimum input byte length must fit usize")
     }
 
     pub fn row_indices_bytes(self) -> usize {
-        self.num_rows as usize * size_of::<u32>()
+        (self.num_rows as usize)
+            .checked_mul(size_of::<u32>())
+            .expect("row gather index byte length must fit usize")
     }
 
     pub fn output_bytes(self) -> usize {
-        self.num_rows as usize * self.num_cols as usize * self.dtype.item_size()
+        (self.num_values() as usize)
+            .checked_mul(self.dtype.item_size())
+            .expect("row gather output byte length must fit usize")
     }
 
     fn num_values(self) -> u32 {
-        self.num_rows * self.num_cols
+        self.num_rows
+            .checked_mul(self.num_cols)
+            .expect("row gather value count must fit the shader u32 index domain")
     }
 }
 
@@ -102,7 +110,13 @@ pub struct RowGatherInvocation<'a> {
 impl Operator for RowGatherInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.buffers.input, 0);
+        builder.set_buffer_read(1, self.buffers.row_indices, 0);
+        builder.set_buffer_write(2, self.buffers.output, 0);
+        builder.set_u32(3, self.shape.num_cols);
+        builder.set_u32(4, self.shape.num_rows);
+        builder.dispatch_1d(self.shape.num_values() as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
@@ -112,16 +126,6 @@ impl RowGatherInvocation<'_> {
         assert!(self.buffers.input.len_bytes() >= self.shape.min_input_bytes());
         assert!(self.buffers.row_indices.len_bytes() >= self.shape.row_indices_bytes());
         assert!(self.buffers.output.len_bytes() >= self.shape.output_bytes());
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.input, 0);
-        builder.set_buffer_read(1, self.buffers.row_indices, 0);
-        builder.set_buffer_write(2, self.buffers.output, 0);
-        builder.set_u32(3, self.shape.num_cols);
-        builder.set_u32(4, self.shape.num_rows);
-        builder.dispatch_1d(self.shape.num_values() as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 

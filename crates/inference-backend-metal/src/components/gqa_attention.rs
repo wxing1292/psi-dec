@@ -441,7 +441,13 @@ pub struct GQAActivationGateInvocation<'a> {
 impl Operator for GQAActivationGateInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        let shape = self.shape;
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.buffers.attention_output, 0);
+        builder.set_buffer_read(1, self.buffers.g, 0);
+        builder.set_buffer_write(2, self.buffers.output, 0);
+        builder.set_u32(3, shape.num_tokens);
+        builder.dispatch_1d(self.config.num_values(shape), 256);
     }
 }
 
@@ -451,16 +457,6 @@ impl GQAActivationGateInvocation<'_> {
         assert!(self.buffers.attention_output.len_bytes() >= self.config.bytes(self.shape));
         assert!(self.buffers.g.len_bytes() >= self.config.bytes(self.shape));
         assert!(self.buffers.output.len_bytes() >= self.config.bytes(self.shape));
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        let shape = self.shape;
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.attention_output, 0);
-        builder.set_buffer_read(1, self.buffers.g, 0);
-        builder.set_buffer_write(2, self.buffers.output, 0);
-        builder.set_u32(3, shape.num_tokens);
-        builder.dispatch_1d(self.config.num_values(shape), 256);
     }
 }
 
@@ -554,7 +550,22 @@ pub struct GQAPagedSDPAMapInvocation<'a> {
 impl Operator for GQAPagedSDPAMapInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        let shape = self.shape;
+        let source = gqa_paged_sdpa_map_source(self.config, shape);
+        let kernel = Kernel::new(self.device, &source, "gqa_paged_sdpa_map");
+        builder.set_kernel(&kernel);
+        builder.set_buffer_read(0, self.buffers.q, 0);
+        builder.set_buffer_read(1, self.buffers.kv_pages, 0);
+        builder.set_buffer_read(2, self.buffers.req_slots, 0);
+        builder.set_buffer_read(3, self.buffers.page_ids, 0);
+        builder.set_buffer_read(4, self.buffers.sdpa_map_task_templates, 0);
+        builder.set_buffer_write(5, self.buffers.partial_exp_sums, 0);
+        builder.set_buffer_write(6, self.buffers.partial_max_logits, 0);
+        builder.set_buffer_write(7, self.buffers.partial_output, 0);
+        builder.dispatch_1d(
+            self.config.map_threads(shape),
+            self.config.num_threads_per_threadblock as usize,
+        );
     }
 }
 
@@ -579,25 +590,6 @@ impl GQAPagedSDPAMapInvocation<'_> {
             self.device.max_threadblock_memory_length()
         );
     }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        let shape = self.shape;
-        let source = gqa_paged_sdpa_map_source(self.config, shape);
-        let kernel = Kernel::new(self.device, &source, "gqa_paged_sdpa_map");
-        builder.set_kernel(&kernel);
-        builder.set_buffer_read(0, self.buffers.q, 0);
-        builder.set_buffer_read(1, self.buffers.kv_pages, 0);
-        builder.set_buffer_read(2, self.buffers.req_slots, 0);
-        builder.set_buffer_read(3, self.buffers.page_ids, 0);
-        builder.set_buffer_read(4, self.buffers.sdpa_map_task_templates, 0);
-        builder.set_buffer_write(5, self.buffers.partial_exp_sums, 0);
-        builder.set_buffer_write(6, self.buffers.partial_max_logits, 0);
-        builder.set_buffer_write(7, self.buffers.partial_output, 0);
-        builder.dispatch_1d(
-            self.config.map_threads(shape),
-            self.config.num_threads_per_threadblock as usize,
-        );
-    }
 }
 
 pub struct GQAPagedSDPAReduceInvocation<'a> {
@@ -610,24 +602,6 @@ pub struct GQAPagedSDPAReduceInvocation<'a> {
 impl Operator for GQAPagedSDPAReduceInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
-    }
-}
-
-impl GQAPagedSDPAReduceInvocation<'_> {
-    fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
-        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
-        assert!(self.buffers.partial_output.len_bytes_u64() >= self.config.partial_output_bytes(self.shape));
-        assert!(
-            self.buffers.cu_sdpa_partial_outputs.len_bytes_u64()
-                >= self.config.cu_sdpa_partial_outputs_bytes(self.shape)
-        );
-        assert!(self.buffers.output.len_bytes_u64() >= self.config.q_bytes(self.shape));
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
         let shape = self.shape;
         let source = gqa_paged_sdpa_reduce_source(self.config);
         let function_name = match self.config.dtype {
@@ -644,6 +618,20 @@ impl GQAPagedSDPAReduceInvocation<'_> {
         builder.set_buffer_write(4, self.buffers.output, 0);
         builder.set_u32(5, shape.num_tokens);
         builder.dispatch_1d(self.config.num_output_values(shape), 256);
+    }
+}
+
+impl GQAPagedSDPAReduceInvocation<'_> {
+    fn validate(&self) {
+        self.shape.validate(self.config);
+        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
+        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
+        assert!(self.buffers.partial_output.len_bytes_u64() >= self.config.partial_output_bytes(self.shape));
+        assert!(
+            self.buffers.cu_sdpa_partial_outputs.len_bytes_u64()
+                >= self.config.cu_sdpa_partial_outputs_bytes(self.shape)
+        );
+        assert!(self.buffers.output.len_bytes_u64() >= self.config.q_bytes(self.shape));
     }
 }
 

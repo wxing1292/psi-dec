@@ -49,15 +49,21 @@ impl RMSNormShape {
     }
 
     pub fn num_values(self) -> usize {
-        self.num_total_tokens as usize * self.hidden_dim as usize
+        (self.num_total_tokens as usize)
+            .checked_mul(self.hidden_dim as usize)
+            .expect("RMSNorm value count must fit usize")
     }
 
     pub fn bytes(self) -> usize {
-        self.num_values() * self.dtype.item_size()
+        self.num_values()
+            .checked_mul(self.dtype.item_size())
+            .expect("RMSNorm byte length must fit usize")
     }
 
     pub fn weight_bytes(self) -> usize {
-        self.hidden_dim as usize * self.dtype.item_size()
+        (self.hidden_dim as usize)
+            .checked_mul(self.dtype.item_size())
+            .expect("RMSNorm weight byte length must fit usize")
     }
 }
 
@@ -153,14 +159,34 @@ struct RMSNormOwnedBuffers {
 impl Operator for RMSNormInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.buffers.input, 0);
+        builder.set_buffer_read(1, self.buffers.weight, 0);
+        builder.set_buffer_write(2, self.buffers.output, 0);
+        record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
+        builder.set_u32(4, self.shape.hidden_dim);
+        builder.set_f32(5, self.eps);
+        builder.dispatch_1d(
+            self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
+            RMS_NUM_THREADS_PER_THREADBLOCK,
+        );
     }
 }
 
 impl Operator for RMSNormReplayInvocation {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        builder.set_retained_pipeline_state(&self.pipeline);
+        builder.set_retained_buffer_read(0, &self.buffers.input, 0);
+        builder.set_retained_buffer_read(1, &self.buffers.weight, 0);
+        builder.set_retained_buffer_write(2, &self.buffers.output, 0);
+        record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
+        builder.set_u32(4, self.shape.hidden_dim);
+        builder.set_f32(5, self.eps);
+        builder.dispatch_1d(
+            self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
+            RMS_NUM_THREADS_PER_THREADBLOCK,
+        );
     }
 }
 
@@ -188,20 +214,6 @@ impl RMSNormInvocation<'_> {
         assert!(self.buffers.weight.len_bytes() >= self.shape.weight_bytes());
         assert!(self.buffers.output.len_bytes() >= self.shape.bytes());
     }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.input, 0);
-        builder.set_buffer_read(1, self.buffers.weight, 0);
-        builder.set_buffer_write(2, self.buffers.output, 0);
-        record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
-        builder.set_u32(4, self.shape.hidden_dim);
-        builder.set_f32(5, self.eps);
-        builder.dispatch_1d(
-            self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
-            RMS_NUM_THREADS_PER_THREADBLOCK,
-        );
-    }
 }
 
 impl RMSNormReplayInvocation {
@@ -211,20 +223,6 @@ impl RMSNormReplayInvocation {
         assert!(self.buffers.input_len_bytes >= self.shape.bytes());
         assert!(self.buffers.weight_len_bytes >= self.shape.weight_bytes());
         assert!(self.buffers.output_len_bytes >= self.shape.bytes());
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        builder.set_retained_pipeline_state(&self.pipeline);
-        builder.set_retained_buffer_read(0, &self.buffers.input, 0);
-        builder.set_retained_buffer_read(1, &self.buffers.weight, 0);
-        builder.set_retained_buffer_write(2, &self.buffers.output, 0);
-        record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
-        builder.set_u32(4, self.shape.hidden_dim);
-        builder.set_f32(5, self.eps);
-        builder.dispatch_1d(
-            self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
-            RMS_NUM_THREADS_PER_THREADBLOCK,
-        );
     }
 }
 

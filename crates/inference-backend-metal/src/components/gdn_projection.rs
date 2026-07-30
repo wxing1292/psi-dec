@@ -132,28 +132,12 @@ impl GDNProjectionSplitKernel {
         }
     }
 
-    fn record_compute(
-        &self,
-        builder: &CommandRecorder,
-        shape: GDNProjectionSplitShape,
-        buffers: &GDNProjectionSplitBuffers<'_>,
-    ) {
-        let kernel = match shape.input_dtype {
+    fn kernel(&self, shape: GDNProjectionSplitShape) -> &Kernel {
+        match shape.input_dtype {
             Dtype::Float32 => &self.f32_kernel,
             Dtype::Bfloat16 => &self.bf16_to_f32_kernel,
             _ => panic!("GDN projection split input dtype must be f32 or bf16"),
-        };
-        builder.set_kernel(kernel);
-        builder.set_buffer_read(0, buffers.qkvabz, 0);
-        builder.set_buffer_write(1, buffers.projected_qkv, 0);
-        builder.set_buffer_write(2, buffers.a, 0);
-        builder.set_buffer_write(3, buffers.b, 0);
-        builder.set_buffer_write(4, buffers.z, 0);
-        builder.set_u32(5, shape.num_tokens);
-        builder.set_u32(6, shape.qkv_dim);
-        builder.set_u32(7, shape.num_v_heads);
-        builder.set_u32(8, shape.v_dim);
-        builder.dispatch_1d(shape.num_qkvabz_values(), 256);
+        }
     }
 }
 
@@ -167,16 +151,38 @@ impl Operator for GDNProjectionSplitInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.shape.validate();
         validate_projection_split_buffers(self.shape, &self.buffers);
-        self.kernel.record_compute(builder, self.shape, &self.buffers);
+        builder.set_kernel(self.kernel.kernel(self.shape));
+        builder.set_buffer_read(0, self.buffers.qkvabz, 0);
+        builder.set_buffer_write(1, self.buffers.projected_qkv, 0);
+        builder.set_buffer_write(2, self.buffers.a, 0);
+        builder.set_buffer_write(3, self.buffers.b, 0);
+        builder.set_buffer_write(4, self.buffers.z, 0);
+        builder.set_u32(5, self.shape.num_tokens);
+        builder.set_u32(6, self.shape.qkv_dim);
+        builder.set_u32(7, self.shape.num_v_heads);
+        builder.set_u32(8, self.shape.v_dim);
+        builder.dispatch_1d(self.shape.num_qkvabz_values(), 256);
     }
 }
 
 fn validate_projection_split_buffers(shape: GDNProjectionSplitShape, buffers: &GDNProjectionSplitBuffers<'_>) {
-    assert!(buffers.qkvabz.len_bytes() >= shape.num_qkvabz_values() * shape.input_dtype.item_size());
-    assert!(buffers.projected_qkv.len_bytes() >= shape.num_projected_qkv_values() * size_of::<f32>());
-    assert!(buffers.a.len_bytes() >= shape.num_gate_values() * size_of::<f32>());
-    assert!(buffers.b.len_bytes() >= shape.num_gate_values() * size_of::<f32>());
-    assert!(buffers.z.len_bytes() >= shape.num_z_values() * size_of::<f32>());
+    assert!(
+        buffers.qkvabz.len_bytes()
+            >= checked_product(
+                "GDN qkvabz input",
+                &[shape.num_qkvabz_values(), shape.input_dtype.item_size()]
+            )
+    );
+    assert!(
+        buffers.projected_qkv.len_bytes()
+            >= checked_product(
+                "GDN projected Q/K/V output",
+                &[shape.num_projected_qkv_values(), size_of::<f32>()]
+            )
+    );
+    assert!(buffers.a.len_bytes() >= checked_product("GDN a output", &[shape.num_gate_values(), size_of::<f32>()]));
+    assert!(buffers.b.len_bytes() >= checked_product("GDN b output", &[shape.num_gate_values(), size_of::<f32>()]));
+    assert!(buffers.z.len_bytes() >= checked_product("GDN z output", &[shape.num_z_values(), size_of::<f32>()]));
 }
 
 #[cfg(test)]

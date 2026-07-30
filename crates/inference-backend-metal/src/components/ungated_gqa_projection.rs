@@ -181,7 +181,14 @@ pub struct UngatedGQAProjectionSplitInvocation<'a> {
 impl Operator for UngatedGQAProjectionSplitInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        let shape = self.shape;
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.buffers.qkv, 0);
+        builder.set_buffer_write(1, self.buffers.q, 0);
+        builder.set_buffer_write(2, self.buffers.k, 0);
+        builder.set_buffer_write(3, self.buffers.v, 0);
+        builder.set_u32(4, shape.num_tokens);
+        builder.dispatch_1d(self.config.num_qkv_slots(shape), 256);
     }
 }
 
@@ -192,17 +199,6 @@ impl UngatedGQAProjectionSplitInvocation<'_> {
         assert!(self.buffers.q.len_bytes() >= self.config.q_bytes(self.shape));
         assert!(self.buffers.k.len_bytes() >= self.config.kv_bytes(self.shape));
         assert!(self.buffers.v.len_bytes() >= self.config.kv_bytes(self.shape));
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        let shape = self.shape;
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.qkv, 0);
-        builder.set_buffer_write(1, self.buffers.q, 0);
-        builder.set_buffer_write(2, self.buffers.k, 0);
-        builder.set_buffer_write(3, self.buffers.v, 0);
-        builder.set_u32(4, shape.num_tokens);
-        builder.dispatch_1d(self.config.num_qkv_slots(shape), 256);
     }
 }
 

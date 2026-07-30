@@ -181,7 +181,14 @@ pub struct GQANormRopeInvocation<'a> {
 impl Operator for GQANormRopeInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        self.record_compute(builder);
+        let shape = self.shape;
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.buffers.input, 0);
+        builder.set_buffer_read(1, self.buffers.norm_weight, 0);
+        builder.set_buffer_read(2, self.buffers.flat_token_indices, 0);
+        builder.set_buffer_write(3, self.buffers.output, 0);
+        builder.set_u32(4, shape.num_tokens);
+        builder.dispatch_1d(self.config.num_threads(shape), NUM_THREADS_PER_THREADBLOCK as usize);
     }
 }
 
@@ -192,17 +199,6 @@ impl GQANormRopeInvocation<'_> {
         assert!(self.buffers.norm_weight.len_bytes() >= self.config.norm_weight_bytes());
         assert!(self.buffers.flat_token_indices.len_bytes() >= self.config.flat_token_indices_bytes(self.shape));
         assert!(self.buffers.output.len_bytes() >= self.config.bytes(self.shape));
-    }
-
-    fn record_compute(self, builder: &CommandRecorder) {
-        let shape = self.shape;
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.input, 0);
-        builder.set_buffer_read(1, self.buffers.norm_weight, 0);
-        builder.set_buffer_read(2, self.buffers.flat_token_indices, 0);
-        builder.set_buffer_write(3, self.buffers.output, 0);
-        builder.set_u32(4, shape.num_tokens);
-        builder.dispatch_1d(self.config.num_threads(shape), NUM_THREADS_PER_THREADBLOCK as usize);
     }
 }
 

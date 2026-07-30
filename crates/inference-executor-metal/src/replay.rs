@@ -91,9 +91,9 @@ where
 mod tests {
     use std::cell::Cell;
 
-    use inference_backend_metal::components::BufferCopy32Buffers;
-    use inference_backend_metal::components::BufferCopy32Shape;
+    use inference_backend_metal::components::U32BufferCopyBuffers;
     use inference_backend_metal::components::U32BufferCopyKernel;
+    use inference_backend_metal::components::U32BufferCopyShape;
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Stream;
@@ -123,8 +123,8 @@ mod tests {
         fn record<'a>(&'a self, recorder: &mut ReplayRecorder, _input: &Self::Input<'a>) {
             self.records.set(self.records.get() + 1);
             recorder.record(ReplayOp::opaque(self.kernel.invoke(
-                BufferCopy32Shape { num_values: 1 },
-                BufferCopy32Buffers {
+                U32BufferCopyShape { num_values: 1 },
+                U32BufferCopyBuffers {
                     input: &self.input,
                     output: &self.output,
                     input_offset_bytes: 0,

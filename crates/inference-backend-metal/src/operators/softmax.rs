@@ -27,7 +27,10 @@ impl SoftmaxShape {
 
     pub fn bytes(self) -> usize {
         self.validate();
-        self.num_rows as usize * self.num_values_per_row as usize * self.dtype.item_size()
+        (self.num_rows as usize)
+            .checked_mul(self.num_values_per_row as usize)
+            .and_then(|num_values| num_values.checked_mul(self.dtype.item_size()))
+            .expect("softmax byte length must fit usize")
     }
 }
 
@@ -79,12 +82,6 @@ pub struct SoftmaxInvocation<'a> {
 
 impl Operator for SoftmaxInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.record_compute(builder);
-    }
-}
-
-impl SoftmaxInvocation<'_> {
-    fn record_compute(self, builder: &CommandRecorder) {
         let shape = self.shape;
         shape.validate();
         let bytes = shape.bytes();
