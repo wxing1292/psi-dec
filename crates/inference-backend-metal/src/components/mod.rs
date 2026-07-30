@@ -35,14 +35,6 @@ fn assert_u32_index_domain(num_elements: usize, name: &str) {
     );
 }
 
-mod buffer_copy;
-pub use buffer_copy::F32BufferCopyBuffers;
-pub use buffer_copy::F32BufferCopyKernel;
-pub use buffer_copy::F32BufferCopyShape;
-pub use buffer_copy::U32BufferCopyBuffers;
-pub use buffer_copy::U32BufferCopyKernel;
-pub use buffer_copy::U32BufferCopyShape;
-
 mod quantized_dense_mlp;
 pub use quantized_dense_mlp::QuantizedDenseMLP;
 pub use quantized_dense_mlp::QuantizedDenseMLPBuffers;
@@ -209,12 +201,6 @@ pub use sampling::TopKSamplingOperation;
 pub use sampling::TopKTileBuffers;
 pub use sampling::TopKTileKernels;
 pub use sampling::TopKWriteDistributionBuffers;
-
-mod silu;
-pub use silu::SiluBufferOffsets;
-pub use silu::SiluBuffers;
-pub use silu::SiluKernel;
-pub use silu::SiluShape;
 
 #[cfg(test)]
 mod tests {

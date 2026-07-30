@@ -17,8 +17,6 @@
 
 mod affine_quantized;
 mod bf16_concat_rows;
-mod buffer_cast;
-pub mod elementwise;
 mod mlx_headers;
 mod row_gather;
 mod softmax;
@@ -38,13 +36,6 @@ pub use bf16_concat_rows::Bf16ConcatRowsBuffers;
 pub use bf16_concat_rows::Bf16ConcatRowsConfig;
 pub use bf16_concat_rows::Bf16ConcatRowsKernel;
 pub use bf16_concat_rows::Bf16ConcatRowsShape;
-pub use buffer_cast::BufferCastBuffers;
-pub use buffer_cast::BufferCastConfig;
-pub use buffer_cast::BufferCastKernel;
-pub use buffer_cast::BufferCastShape;
-pub use elementwise::MLXElementwiseShape;
-pub use elementwise::MLXMultiplyKernel;
-pub use elementwise::MLXSigmoidKernel;
 pub use row_gather::RowGatherBuffers;
 pub use row_gather::RowGatherConfig;
 pub use row_gather::RowGatherKernel;

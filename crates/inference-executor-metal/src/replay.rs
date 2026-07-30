@@ -91,12 +91,13 @@ where
 mod tests {
     use std::cell::Cell;
 
-    use inference_backend_metal::components::U32BufferCopyBuffers;
-    use inference_backend_metal::components::U32BufferCopyKernel;
-    use inference_backend_metal::components::U32BufferCopyShape;
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Stream;
+    use inference_backend_metal::operators::Bf16ConcatRowsBuffers;
+    use inference_backend_metal::operators::Bf16ConcatRowsConfig;
+    use inference_backend_metal::operators::Bf16ConcatRowsKernel;
+    use inference_backend_metal::operators::Bf16ConcatRowsShape;
     use inference_executor_core::backend::recorder::Recorder;
 
     use super::Replay;
@@ -107,8 +108,9 @@ mod tests {
 
     struct CountedComponent {
         records: Cell<usize>,
-        kernel: U32BufferCopyKernel,
-        input: Buffer,
+        kernel: Bf16ConcatRowsKernel,
+        lhs: Buffer,
+        rhs: Buffer,
         output: Buffer,
     }
 
@@ -123,12 +125,11 @@ mod tests {
         fn record<'a>(&'a self, recorder: &mut ReplayRecorder, _input: &Self::Input<'a>) {
             self.records.set(self.records.get() + 1);
             recorder.record(ReplayOp::opaque(self.kernel.invoke(
-                U32BufferCopyShape { num_values: 1 },
-                U32BufferCopyBuffers {
-                    input: &self.input,
+                Bf16ConcatRowsShape { num_rows: 1 },
+                Bf16ConcatRowsBuffers {
+                    lhs: &self.lhs,
+                    rhs: &self.rhs,
                     output: &self.output,
-                    input_offset_bytes: 0,
-                    output_offset_bytes: 0,
                 },
             )));
         }
@@ -137,9 +138,10 @@ mod tests {
     fn component(device: &Device) -> CountedComponent {
         CountedComponent {
             records: Cell::new(0),
-            kernel: U32BufferCopyKernel::new(device),
-            input: Buffer::new_zeroed_elements(device, 1, inference_backend_metal::metal::Dtype::Uint32),
-            output: Buffer::new_zeroed_elements(device, 1, inference_backend_metal::metal::Dtype::Uint32),
+            kernel: Bf16ConcatRowsKernel::new(device, Bf16ConcatRowsConfig { num_cols: 1 }),
+            lhs: Buffer::new_zeroed_elements(device, 1, inference_backend_metal::metal::Dtype::Bfloat16),
+            rhs: Buffer::new_zeroed_elements(device, 1, inference_backend_metal::metal::Dtype::Bfloat16),
+            output: Buffer::new_zeroed_elements(device, 2, inference_backend_metal::metal::Dtype::Bfloat16),
         }
     }
 
