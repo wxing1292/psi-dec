@@ -67,8 +67,10 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 
 - `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts `single_q_token` or `tiled_q_tokens`. It can run an explicit
   untimed `--validate-tiled-q-tokens` comparison.
-- `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay and SDPA-only paths.
+- `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SDPA-only paths, and exact QKV/output
+  projection kernels.
 - `qwen3_gqa` exposes static tile geometry as CLI arguments. It can validate single-Q output against tiled output.
+  Its projection probes compare QMV, QMM BM8/BN32, and QMM BM16/BN32. These forced paths are benchmark-only.
 - `gqa_block_attn` measures the model-independent dense block-bidirectional SDPA map component.
   It accepts block size, request count, head geometry, and dtype as CLI arguments.
   The backend owns its one-SIMDgroup threadblock geometry.
@@ -79,9 +81,12 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 - `qwen3_dspark_forward` loads real Main and DSpark weights.
   It compares the complete `MainEmbed` and Main forward with `DSparkEmbed` plus the complete DSpark backbone and final
   norm.
-  Both cases use the same request count, seven rows per request, and history length.
+  The Main and DSpark depth-comparison cases use the same request count, seven rows per request, and history length.
   The result reports total and per-layer time.
   Use the per-layer value to compare the 40-layer Main stack with the five-layer DSpark stack.
+  The additional `main-verification` result uses eight rows per request and a DSpark-enabled Main executor.
+  It includes `MainEmbed`, all Main layers, Main residual capture, and DSpark context projection.
+  It excludes Main `GatherUnembed` and rejection sampling.
 - `qwen3_dspark_unembedding` loads the production `Qwen3xDSparkGatherUnembed` component.
   It uses DSpark-owned unembed weights when they exist.
   Otherwise, it uses the Main unembed weights, as the production executor does.

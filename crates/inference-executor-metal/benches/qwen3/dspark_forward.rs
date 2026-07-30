@@ -29,6 +29,7 @@ use inference_executor_metal::model::page_arena::PageArena;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model;
+use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model_with_dspark;
 use inference_executor_metal::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
 use inference_executor_metal::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedArgs;
 use inference_executor_metal::model::qwen::v3_x::dspark::model::Qwen3xDSparkBody;
@@ -49,33 +50,61 @@ fn main() {
     let args = Args::parse();
     let dspark_config =
         init_qwen3x_dspark_config(&args.dspark_model_dir).expect("unable to load Qwen3 DSpark benchmark config");
-    let mut main = MainFixture::new(
-        &args.model_dir,
-        args.num_requests,
-        args.context,
-        dspark_config.block_size,
-    );
-    let dspark = DSparkFixture::new(&args.model_dir, &args.dspark_model_dir, args.num_requests, args.context);
-    assert_eq!(
-        main.num_tokens, dspark.num_tokens,
-        "Main and DSpark comparison rows must match"
-    );
     let measurement = Measurement {
         warmup_iters: args.warmup_iters,
         iters: args.iters,
         runs: args.runs,
     };
 
-    measure_and_print(
-        ForwardCase {
-            name: "main",
-            num_tokens: main.num_tokens,
-            num_requests: args.num_requests,
-            context: args.context,
-        },
-        main.num_layers,
-        measurement,
-        || main.run(),
+    {
+        let mut main = MainFixture::new(
+            &args.model_dir,
+            args.num_requests,
+            args.context,
+            dspark_config.block_size,
+        );
+        measure_and_print(
+            ForwardCase {
+                name: "main",
+                num_tokens: main.num_tokens,
+                num_requests: args.num_requests,
+                context: args.context,
+            },
+            main.num_layers,
+            measurement,
+            || main.run(),
+        );
+    }
+    {
+        let mut main_verification = MainFixture::new_with_dspark(
+            &args.model_dir,
+            &args.dspark_model_dir,
+            args.num_requests,
+            args.context,
+            dspark_config
+                .block_size
+                .checked_add(1)
+                .expect("Main verification row count must fit usize"),
+        );
+        measure_segment_and_print(
+            ForwardCase {
+                name: "main-verification",
+                num_tokens: main_verification.num_tokens,
+                num_requests: args.num_requests,
+                context: args.context,
+            },
+            "embed-forward-context",
+            measurement,
+            || main_verification.run(),
+        );
+    }
+    let dspark = DSparkFixture::new(&args.model_dir, &args.dspark_model_dir, args.num_requests, args.context);
+    assert_eq!(
+        args.num_requests
+            .checked_mul(dspark_config.block_size)
+            .expect("Main and DSpark comparison row count must fit usize"),
+        dspark.num_tokens,
+        "Main and DSpark comparison rows must match"
     );
     measure_segment_and_print(
         ForwardCase {
@@ -175,29 +204,77 @@ struct MainFixture {
 
 impl MainFixture {
     fn new(model_dir: &Path, num_requests: usize, context: u32, tokens_per_request: usize) -> Self {
+        Self::load(model_dir, None, num_requests, context, tokens_per_request)
+    }
+
+    fn new_with_dspark(
+        model_dir: &Path,
+        dspark_model_dir: &Path,
+        num_requests: usize,
+        context: u32,
+        tokens_per_request: usize,
+    ) -> Self {
+        Self::load(
+            model_dir,
+            Some(dspark_model_dir),
+            num_requests,
+            context,
+            tokens_per_request,
+        )
+    }
+
+    fn load(
+        model_dir: &Path,
+        dspark_model_dir: Option<&Path>,
+        num_requests: usize,
+        context: u32,
+        tokens_per_request: usize,
+    ) -> Self {
         let config = init_qwen3_model_config(model_dir).expect("unable to load Qwen3 benchmark config");
         let num_layers = config.text_config.num_hidden_layers;
         let num_tokens = num_requests
             .checked_mul(tokens_per_request)
             .expect("Main comparison token count must fit usize");
+        let mut num_page_ids_per_block = qwen3_main_page_ids_per_cache_block(&config);
+        if let Some(dspark_model_dir) = dspark_model_dir {
+            let dspark_config =
+                init_qwen3x_dspark_config(dspark_model_dir).expect("unable to load Qwen3 DSpark benchmark config");
+            let dspark_plan = build_qwen3x_dspark_plan(&dspark_config, QWEN3_PAGE_SIZE_BYTES)
+                .expect("unable to build Qwen3 DSpark benchmark plan");
+            let first_layer = dspark_plan.layers.first().expect("Qwen3 DSpark requires layers");
+            let tokens_per_page = first_layer
+                .attention_metal
+                .num_ungated_tokens_per_page(&first_layer.attention_core.attention)
+                as usize;
+            num_page_ids_per_block = num_page_ids_per_block
+                .checked_add(
+                    dspark_plan
+                        .layers
+                        .len()
+                        .checked_mul(pages_per_cache_block(tokens_per_page))
+                        .expect("DSpark page IDs per cache block must fit usize"),
+                )
+                .expect("Main and DSpark page IDs per cache block must fit usize");
+        }
         let num_cache_pages = num_requests
-            .checked_mul(qwen3_main_page_ids_per_cache_block(&config))
+            .checked_mul(num_page_ids_per_block)
             .expect("Main comparison page count must fit usize");
-        let model = init_qwen_3_model(
-            model_dir,
-            Qwen3ExecutorConfig {
-                max_requests: num_requests,
-                max_tokens: num_tokens,
-                max_tokens_per_request: 1024,
-                num_cache_pages,
-                num_tokens_per_block: 1024,
-            },
-        )
+        let executor_config = Qwen3ExecutorConfig {
+            max_requests: num_requests,
+            max_tokens: num_tokens,
+            max_tokens_per_request: 1024,
+            num_cache_pages,
+            num_tokens_per_block: 1024,
+        };
+        let model = match dspark_model_dir {
+            Some(dspark_model_dir) => init_qwen_3_model_with_dspark(model_dir, dspark_model_dir, executor_config),
+            None => init_qwen_3_model(model_dir, executor_config),
+        }
         .expect("unable to initialize Main comparison executor");
-        let num_page_ids_per_block = model.num_kv_page_ids_per_block();
+        let actual_num_page_ids_per_block = model.num_kv_page_ids_per_block();
         assert!(
             num_requests
-                .checked_mul(num_page_ids_per_block)
+                .checked_mul(actual_num_page_ids_per_block)
                 .is_some_and(|pages| pages <= num_cache_pages),
             "Main comparison page IDs exceed the configured page arena"
         );
@@ -209,7 +286,7 @@ impl MainFixture {
             num_tokens,
             num_layers,
             num_cache_pages,
-            num_page_ids_per_block,
+            num_page_ids_per_block: actual_num_page_ids_per_block,
             next_sequence: 0,
         }
     }

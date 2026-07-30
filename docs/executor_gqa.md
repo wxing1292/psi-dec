@@ -806,6 +806,9 @@ Do not compare its timing directly with `gqa_block_attn`.
 
 `qwen3_gqa` loads the Qwen3 model config and first-layer ungated weights. It accepts explicit per-request token counts
 and context lengths. It reports full-replay and SDPA-only measurements.
+It also reports exact QKV and output-projection measurements for QMV, QMM BM8/BN32, and QMM BM16/BN32.
+These forced projection paths are benchmark-only.
+Production GQA continues to use `AffineQuantizedMatmul` selection from the complete shape and dtype.
 
 Its single-Q and tiled tile/thread arguments are configurable. `--validate` compares full single-Q and tiled outputs
 for a workload where production selects the tiled path.

@@ -1338,6 +1338,220 @@ It is not evidence of an incorrect submission boundary or replay-state flag.
 The BM8/BN32 dense-MLP path reduces this cost without changing executor orchestration.
 Confidence-guided verification lengths remain deferred.
 
+### Final Main verification audit
+
+The 2026-07-29 follow-up used base commit `b91b4464`.
+The production source was unchanged.
+The worktree contained two benchmark-only changes during the final measurements.
+The machine was an Apple M3 Max with 40 GPU cores and 48 GB of memory.
+No other GPU command ran concurrently.
+
+The Main checkpoint was `/Users/wenquanxing/Workspace/models/Qwen3-14B-4bit`.
+The DSpark checkpoint was `/Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine`.
+The full executor command used one request, context 128, five warmup iterations, 20 measured iterations, and five runs.
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --cases main,dspark \
+  --num-requests 1 \
+  --start-context 128 \
+  --warmup-iters 5 \
+  --iters 20 \
+  --runs 5
+```
+
+The full executor medians were:
+
+| Stage | Median |
+| --- | ---: |
+| One-row Main submission | 30.949 ms |
+| Eight-row Main verification submission | 58.760 ms |
+| Seven-row DSpark proposal submission | 11.184 ms |
+| Complete DSpark cycle | 70.048 ms |
+
+The synthetic executor trajectory proposed 700 tokens and accepted zero tokens.
+Thus, it fixed the Main and DSpark execution shapes but did not measure deployment acceptance.
+
+The verification-body command used `qwen3_dspark_forward` with the same checkpoints, request count, and context.
+The new `main-verification` case recorded `MainEmbed`, all 40 Main layers, Main residual capture, and DSpark context
+projection for eight rows.
+It did not record `GatherUnembed` or rejection sampling.
+Its median was `54.567 ms`.
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark_forward -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-requests 1 \
+  --context 128 \
+  --warmup-iters 5 \
+  --iters 20 \
+  --runs 5
+```
+
+The production DSpark `GatherUnembed` proxy used seven rows and the Main unembed weights.
+Its median was `2.930 ms`.
+The matching sparse-rejection benchmark used one request, seven proposal tokens, `top_k=1`, and vocabulary size
+151936.
+Its median was `0.283 ms`.
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_dspark_unembedding -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-requests 1 \
+  --warmup-iters 20 \
+  --iters 100 \
+  --runs 7
+
+cargo bench -p inference-backend-metal --bench rejection_sampling -- \
+  --mode rejection-sparse \
+  --num-reqs 1 \
+  --spec-tokens 7 \
+  --top-k 1 \
+  --vocab 151936 \
+  --warmup-iters 50 \
+  --iters 200 \
+  --runs 7
+```
+
+The independent measurements identify the principal contributors to the Main verification stage:
+
+```text
+MainEmbed + Main + residual/context capture   54.567 ms
+seven-row GatherUnembed proxy                  2.930 ms
+sparse rejection                               0.283 ms
+full eight-row Main stage                     58.760 ms
+```
+
+Do not add the independent medians as a substitute for the full-stage time.
+Each independent measurement has its own submit-and-wait boundary.
+The values show attribution only.
+
+The eight-row Qwen3 GQA benchmark measured:
+
+| GQA operation | Median |
+| --- | ---: |
+| Full tiled GQA | 0.649 ms |
+| Tiled SDPA only | 0.319 ms |
+| QKV QMV BN8/BK32 | 0.498 ms |
+| QKV QMM BM8/BN32 | 0.436 ms |
+| QKV QMM BM16/BN32 | 0.485 ms |
+| Output QMV BN8/BK32 | 0.433 ms |
+| Output QMM BM8/BN32 | 0.416 ms |
+| Output QMM BM16/BN32 | 0.445 ms |
+
+The existing QMM BM8/BN32 selection is correct for both eight-row GQA projections.
+The existing tiled SDPA `q_head_tile=5` also remained the best tested geometry.
+The eight-row dense-MLP replay measured `1.327 ms` with the existing QMM BM8/BN32 selection.
+
+```sh
+cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --tokens-per-req 8 \
+  --contexts 128 \
+  --iters 50 \
+  --warmup-iters 20 \
+  --runs 7 \
+  --validate
+
+cargo bench -p inference-executor-metal --bench qwen35_dense_mlp -- \
+  --model-dir /Users/wenquanxing/Workspace/models/Qwen3.6-27B-4bit \
+  --tokens 8 \
+  --cases full_auto,gate_up_auto,activation,down_auto \
+  --iters 50 \
+  --warmup-iters 20 \
+  --runs 7
+```
+
+Verdict: The remaining Main verification time is the real 40-layer transformer workload.
+It is not replay orchestration, `GatherUnembed`, or sparse-rejection overhead.
+No additional production kernel or submission change passed the evidence threshold.
+
+### Final deterministic end-to-end retest
+
+The final end-to-end comparison used the same base commit, machine, and checkpoints as the final Main audit.
+The worktree changes were benchmark and documentation changes only.
+Each service used:
+
+```sh
+target/release/qwen3 \
+  --grpc-listen-addr 127.0.0.1:50151 \
+  --http-listen-addr 127.0.0.1:8011 \
+  --hf-model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --num-cache-pages 4096 \
+  --max-requests 4 \
+  --max-tokens 128 \
+  --max-tokens-per-request 64 \
+  --logging info
+
+target/release/qwen3 \
+  --grpc-listen-addr 127.0.0.1:50151 \
+  --http-listen-addr 127.0.0.1:8011 \
+  --hf-model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --hf-dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --num-cache-pages 4096 \
+  --max-requests 4 \
+  --max-tokens 128 \
+  --max-tokens-per-request 64 \
+  --logging info
+```
+
+The two service commands ran separately.
+
+Each client used:
+
+```sh
+target/release/decode \
+  --server-url http://127.0.0.1:50151 \
+  --hf-model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
+  --prompt-str 'Explain in concise technical terms why the sky appears blue during the day.' \
+  --disable-thinking \
+  --max-sampled-tokens 256 \
+  --temperature 0 \
+  --top-k 1 \
+  --top-p 1 \
+  --seed 42 \
+  --show-stats
+```
+
+The common service limits were:
+
+```text
+--num-cache-pages 4096
+--max-requests 4
+--max-tokens 128
+--max-tokens-per-request 64
+```
+
+The request used the prompt:
+
+```text
+Explain in concise technical terms why the sky appears blue during the day.
+```
+
+It used `temperature=0`, `top_k=1`, `top_p=1`, `seed=42`, and a 256-token output limit.
+Both paths stopped after 98 sampled tokens.
+Both paths produced the same final text.
+
+The last three warmed samples were:
+
+| Path | Samples | Median | Output chunks |
+| --- | --- | ---: | ---: |
+| Main-only | 37.154, 36.565, 36.272 tok/s | 36.565 tok/s | 98 |
+| DSpark | 42.788, 43.023, 42.786 tok/s | 42.788 tok/s | 35 |
+
+DSpark was `17.0%` faster than Main-only.
+The deterministic DSpark request used 34 verification batches.
+It proposed 238 tokens and accepted 65 proposal tokens.
+Its proposal-token acceptance rate was `27.31%`.
+
+Verdict: The final deterministic output and trajectory are stable.
+The optimized fixed-block DSpark path now has a positive deployment-performance result for this one-request workload.
+Confidence-guided proposal length remains deferred.
+
 ## Main and MTP submission evidence
 
 The 2026-07-28 comparison used base commit `3be69962c392d6ae75f33b2bef65e9403b680b30`.

@@ -18,6 +18,9 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
+use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
+use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
@@ -177,6 +180,7 @@ struct Fixture {
     full_tiled: ReplayProgram,
     sdpa_single: ReplayProgram,
     sdpa_tiled: ReplayProgram,
+    projection_replays: Vec<ProjectionReplay>,
     single_output: Buffer,
     tiled_output: Buffer,
     _backend: UngatedGQA,
@@ -337,6 +341,17 @@ impl Fixture {
             &scratch,
             tiled_q_head_tile,
         );
+        let projection_replays = projection_replays(
+            device,
+            &stream,
+            &core,
+            config,
+            num_tokens,
+            &hidden,
+            &tiled_output,
+            weights,
+            &scratch,
+        );
         Self {
             device: device.clone(),
             stream,
@@ -356,6 +371,7 @@ impl Fixture {
             full_tiled,
             sdpa_single,
             sdpa_tiled,
+            projection_replays,
             single_output,
             tiled_output,
             _backend: backend,
@@ -451,6 +467,13 @@ impl Fixture {
                 measure(&self.stream, &self.sdpa_tiled, warmup_iters, iters, runs),
             );
         }
+        for projection in &self.projection_replays {
+            print_measurement(
+                projection.name,
+                &fields,
+                measure(&self.stream, &projection.replay, warmup_iters, iters, runs),
+            );
+        }
     }
 
     fn tiled_shape(&self) -> GQATiledSDPAShape {
@@ -476,6 +499,131 @@ impl Fixture {
             },
             gqa_layer_index: 0,
         }
+    }
+}
+
+struct ProjectionReplay {
+    name: &'static str,
+    replay: ReplayProgram,
+    _kernel: AffineQuantizedMatmulKernel,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn projection_replays(
+    device: &Device,
+    stream: &Stream,
+    core: &UngatedGQACore,
+    config: GQAMetalConfig,
+    num_tokens: u32,
+    hidden: &Buffer,
+    output: &Buffer,
+    weights: &Weights,
+    scratch: &UngatedGQAScratch,
+) -> Vec<ProjectionReplay> {
+    let scratch = scratch.bindings();
+    let qkv = core.qkv_shape();
+    let output_shape = core.output_shape();
+    let qkv_config = projection_config(qkv.out_dim, qkv.in_dim, config);
+    let output_config = projection_config(output_shape.out_dim, output_shape.in_dim, config);
+    let kernels = [
+        (
+            "gqa.qkv.qmv_bn8_bk32",
+            "gqa.output.qmv_bn8_bk32",
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+        ),
+        (
+            "gqa.qkv.qmm_bm8_bn32",
+            "gqa.output.qmm_bm8_bn32",
+            AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+        ),
+        (
+            "gqa.qkv.qmm_bm16_bn32",
+            "gqa.output.qmm_bm16_bn32",
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
+        ),
+    ];
+    let mut replays = Vec::with_capacity(kernels.len() * 2);
+    for &(qkv_name, _, kind) in &kernels {
+        replays.push(projection_replay(
+            device,
+            stream,
+            qkv_name,
+            qkv_config,
+            kind,
+            num_tokens,
+            scratch.qkv_proj,
+            hidden,
+            &weights.qkv_weight,
+            &weights.qkv_scales,
+            &weights.qkv_biases,
+        ));
+    }
+    for &(_, output_name, kind) in &kernels {
+        replays.push(projection_replay(
+            device,
+            stream,
+            output_name,
+            output_config,
+            kind,
+            num_tokens,
+            output,
+            scratch.attention_output,
+            &weights.output_weight,
+            &weights.output_scales,
+            &weights.output_biases,
+        ));
+    }
+    replays
+}
+
+#[allow(clippy::too_many_arguments)]
+fn projection_replay(
+    device: &Device,
+    stream: &Stream,
+    name: &'static str,
+    config: AffineQuantizedMatmulConfig,
+    kind: AffineQuantizedMatmulKernelKind,
+    num_tokens: u32,
+    output: &Buffer,
+    input: &Buffer,
+    weight: &Buffer,
+    scales: &Buffer,
+    biases: &Buffer,
+) -> ProjectionReplay {
+    let kernel = AffineQuantizedMatmulKernel::new(device, config, kind);
+    let mut recorder = stream.create_replay_program();
+    recorder.record(kernel.invoke(
+        num_tokens.try_into().expect("GQA projection row count must fit i32"),
+        output,
+        0,
+        input,
+        0,
+        weight,
+        0,
+        scales,
+        0,
+        biases,
+        0,
+    ));
+    ProjectionReplay {
+        name,
+        replay: recorder.build(),
+        _kernel: kernel,
+    }
+}
+
+fn projection_config(n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedMatmulConfig {
+    AffineQuantizedMatmulConfig {
+        n: n.try_into().expect("GQA projection n must fit i32"),
+        k: k.try_into().expect("GQA projection k must fit i32"),
+        group_size: config
+            .group_size
+            .try_into()
+            .expect("GQA projection group_size must fit i32"),
+        bits: config.bits.try_into().expect("GQA projection bits must fit i32"),
+        input_dtype: config.dtype,
+        output_dtype: config.dtype,
+        scale_bias_dtype: config.dtype,
     }
 }
 
