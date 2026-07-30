@@ -3,19 +3,20 @@ use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use inference_backend_metal::components::GDNCoreBuffers;
-use inference_backend_metal::components::GDNCoreConfig;
-use inference_backend_metal::components::GDNCoreKernels;
-use inference_backend_metal::components::GDNCoreShape;
-use inference_backend_metal::components::GDNProjectionSplitBuffers;
-use inference_backend_metal::components::GDNProjectionSplitKernel;
-use inference_backend_metal::components::GDNProjectionSplitShape;
+use inference_backend_metal::components::GDNCompute;
+use inference_backend_metal::components::GDNComputeBuffers;
+use inference_backend_metal::components::GDNComputeConfig;
+use inference_backend_metal::components::GDNComputeShape;
+use inference_backend_metal::components::GDNQKVABZSplitBuffers;
+use inference_backend_metal::components::GDNQKVABZSplitConfig;
+use inference_backend_metal::components::GDNQKVABZSplitKernel;
+use inference_backend_metal::components::GDNQKVABZSplitShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_metal::attn::gdn::backend::GDN;
 use inference_executor_metal::attn::gdn::backend::GDNInput;
@@ -46,7 +47,6 @@ use crate::HIDDEN_DIM;
 use crate::build_single_invocation_replay;
 use crate::concat_parts;
 use crate::cu_tokens;
-use crate::gdn_affine_kernel_kind;
 use crate::gdn_conv_state_fixture;
 use crate::gdn_output_affine_config;
 use crate::gdn_qkvabz_affine_config;
@@ -103,20 +103,18 @@ struct RealGDNFixture<'a> {
     next_hidden_state: Buffer,
     replay: ReplayProgram,
     hidden_state: Buffer,
-    hidden_state_f32: Buffer,
     batch_metadata: GDNMetadataBuffers,
     conv_state: Buffer,
     next_conv_state: Buffer,
     recurrent_state_arena: Buffer,
     qkvabz: Buffer,
-    projected_qkv: Buffer,
+    qkv: Buffer,
     a: Buffer,
     b: Buffer,
     z: Buffer,
     conv_qkv: Buffer,
     recurrent_output: Buffer,
-    pre_output_hidden_states: Buffer,
-    pre_output_hidden_states_bf16: Buffer,
+    norm_gated_output: Buffer,
     weights: &'a RealGDNWeights,
 }
 
@@ -146,15 +144,14 @@ impl<'a> RealGDNFixture<'a> {
         let config = GDNMetalConfig {
             group_size: GROUP_SIZE,
             bits: BITS,
-            recurrent_v_tile_size: 8,
             norm_eps: GDN_EPS,
-            input_dtype: Dtype::Float32,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
             qkvabz_scale_bias_dtype: Dtype::Bfloat16,
             output_scale_bias_dtype: Dtype::Bfloat16,
         };
         let backend = GDN::new(device, core, config);
         let hidden_state = Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, HIDDEN_DIM));
-        let hidden_state_f32 = Buffer::new_zeroed(device, num_tokens as usize * HIDDEN_DIM * size_of::<f32>());
         let next_hidden_state =
             Buffer::new_zeroed(device, num_tokens as usize * HIDDEN_DIM * Dtype::Bfloat16.item_size());
         let num_tokens_per_req = request_token_counts(num_tokens, num_reqs);
@@ -188,19 +185,14 @@ impl<'a> RealGDNFixture<'a> {
                 2 * num_reqs as usize * GDN_V_HEADS * GDN_V_HEAD_DIM * GDN_QK_HEAD_DIM,
             ),
         );
-        let qkvabz = Buffer::new_zeroed(
-            device,
-            num_tokens as usize * GDN_QKVABZ_DIM * config.internal_dtype().item_size(),
-        );
-        let projected_qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<f32>());
+        let qkvabz = Buffer::new_zeroed(device, num_tokens as usize * GDN_QKVABZ_DIM * size_of::<f32>());
+        let qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<f32>());
         let a = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_HEADS * size_of::<f32>());
         let b = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_HEADS * size_of::<f32>());
         let z = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
         let conv_qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<f32>());
         let recurrent_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
-        let pre_output_hidden_states = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
-        let pre_output_hidden_states_bf16 =
-            Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * Dtype::Bfloat16.item_size());
+        let norm_gated_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
         let mut builder = MetalReplayRuntime::new(&stream).create_recorder();
         let _ = <GDN as ReplayLayer>::record(
             &backend,
@@ -209,16 +201,14 @@ impl<'a> RealGDNFixture<'a> {
                 hidden_state: &hidden_state,
                 next_hidden_state: &next_hidden_state,
                 scratch: GDNScratchBindings {
-                    hidden_state_f32: &hidden_state_f32,
                     qkvabz: &qkvabz,
-                    projected_qkv: &projected_qkv,
+                    qkv: &qkv,
                     a: &a,
                     b: &b,
                     z: &z,
                     conv_qkv: &conv_qkv,
                     recurrent_output: &recurrent_output,
-                    pre_output_hidden_states: &pre_output_hidden_states,
-                    pre_output_hidden_states_bf16: &pre_output_hidden_states_bf16,
+                    norm_gated_output: &norm_gated_output,
                 },
                 batch_metadata: &batch_metadata,
                 state: GDNLayerStateBindings {
@@ -243,20 +233,18 @@ impl<'a> RealGDNFixture<'a> {
             next_hidden_state,
             replay,
             hidden_state,
-            hidden_state_f32,
             batch_metadata,
             conv_state,
             next_conv_state,
             recurrent_state_arena,
             qkvabz,
-            projected_qkv,
+            qkv,
             a,
             b,
             z,
             conv_qkv,
             recurrent_output,
-            pre_output_hidden_states,
-            pre_output_hidden_states_bf16,
+            norm_gated_output,
             weights,
         };
         fixture.run();
@@ -283,27 +271,26 @@ impl<'a> RealGDNFixture<'a> {
     fn measure_subcomponents(&self, warmup_iters: usize, iters: usize, runs: usize) {
         let device = &self.device;
         let qkvabz_config = gdn_qkvabz_affine_config();
-        let qkvabz_projection = AffineQuantizedMatmulKernel::new(
+        let qkvabz = AffineQuantizedMatmul::new(device, qkvabz_config);
+        let qkvabz_to_qkv_a_b_z = GDNQKVABZSplitKernel::new(
             device,
-            qkvabz_config,
-            gdn_affine_kernel_kind(self.num_tokens, qkvabz_config),
+            GDNQKVABZSplitConfig::new(
+                GDN_CONV_DIM.try_into().expect("GDN qkv_dim must fit u32"),
+                GDN_V_HEADS.try_into().expect("GDN V heads must fit u32"),
+                GDN_V_DIM.try_into().expect("GDN V dim must fit u32"),
+            ),
         );
-        let projection_split = GDNProjectionSplitKernel::new(device);
-        let core = GDNCoreKernels::new(device, gdn_core_config());
+        let compute = GDNCompute::new(device, gdn_compute_config());
         let output_config = gdn_output_affine_config();
-        let output_projection = AffineQuantizedMatmulKernel::new(
-            device,
-            output_config,
-            gdn_affine_kernel_kind(self.num_tokens, output_config),
-        );
+        let output = AffineQuantizedMatmul::new(device, output_config);
 
         let qkvabz_replay = build_single_invocation_replay(
             &self.stream,
-            qkvabz_projection.invoke(
+            qkvabz.invoke(
                 self.num_tokens.try_into().expect("GDN token count must fit i32"),
                 &self.qkvabz,
                 0,
-                &self.hidden_state_f32,
+                &self.hidden_state,
                 0,
                 &self.weights.qkvabz_weight,
                 0,
@@ -315,31 +302,28 @@ impl<'a> RealGDNFixture<'a> {
         );
         let split_replay = build_single_invocation_replay(
             &self.stream,
-            projection_split.invoke(
-                GDNProjectionSplitShape::f32(
-                    self.num_tokens,
-                    GDN_CONV_DIM.try_into().expect("GDN qkv_dim must fit u32"),
-                    GDN_V_HEADS.try_into().expect("GDN V heads must fit u32"),
-                    GDN_V_DIM.try_into().expect("GDN V dim must fit u32"),
-                ),
-                GDNProjectionSplitBuffers {
+            qkvabz_to_qkv_a_b_z.invoke(
+                GDNQKVABZSplitShape {
+                    num_tokens: self.num_tokens,
+                },
+                GDNQKVABZSplitBuffers {
                     qkvabz: &self.qkvabz,
-                    projected_qkv: &self.projected_qkv,
+                    qkv: &self.qkv,
                     a: &self.a,
                     b: &self.b,
                     z: &self.z,
                 },
             ),
         );
-        let core_replay = build_single_invocation_replay(
+        let compute_replay = build_single_invocation_replay(
             &self.stream,
-            core.invoke(
-                GDNCoreShape {
+            compute.invoke(
+                GDNComputeShape {
                     num_reqs: self.num_reqs,
                     num_tokens: self.num_tokens,
                 },
-                GDNCoreBuffers {
-                    projected_qkv: &self.projected_qkv,
+                GDNComputeBuffers {
+                    qkv: &self.qkv,
                     a: &self.a,
                     b: &self.b,
                     z: &self.z,
@@ -358,19 +342,17 @@ impl<'a> RealGDNFixture<'a> {
                     recurrent_state_arena_offset_bytes: 0,
                     conv_qkv: &self.conv_qkv,
                     recurrent_output: &self.recurrent_output,
-                    pre_output_hidden_states: &self.pre_output_hidden_states,
+                    norm_gated_output: &self.norm_gated_output,
                 },
-                (GDN_QK_HEAD_DIM as f32).sqrt().recip(),
-                GDN_EPS,
             ),
         );
-        let output_projection_replay = build_single_invocation_replay(
+        let output_replay = build_single_invocation_replay(
             &self.stream,
-            output_projection.invoke(
+            output.invoke(
                 self.num_tokens.try_into().expect("GDN token count must fit i32"),
                 &self.next_hidden_state,
                 0,
-                &self.pre_output_hidden_states,
+                &self.norm_gated_output,
                 0,
                 &self.weights.output_weight,
                 0,
@@ -381,10 +363,10 @@ impl<'a> RealGDNFixture<'a> {
             ),
         );
 
-        self.measure_subcomponent("qkvabz-proj", &qkvabz_replay, warmup_iters, iters, runs);
-        self.measure_subcomponent("split", &split_replay, warmup_iters, iters, runs);
-        self.measure_subcomponent("core", &core_replay, warmup_iters, iters, runs);
-        self.measure_subcomponent("output-proj", &output_projection_replay, warmup_iters, iters, runs);
+        self.measure_subcomponent("qkvabz", &qkvabz_replay, warmup_iters, iters, runs);
+        self.measure_subcomponent("qkvabz-to-qkv-a-b-z", &split_replay, warmup_iters, iters, runs);
+        self.measure_subcomponent("compute", &compute_replay, warmup_iters, iters, runs);
+        self.measure_subcomponent("output", &output_replay, warmup_iters, iters, runs);
     }
 
     fn measure_subcomponent(&self, name: &str, replay: &ReplayProgram, warmup_iters: usize, iters: usize, runs: usize) {
@@ -402,8 +384,8 @@ impl<'a> RealGDNFixture<'a> {
     }
 }
 
-fn gdn_core_config() -> GDNCoreConfig {
-    GDNCoreConfig {
+fn gdn_compute_config() -> GDNComputeConfig {
+    GDNComputeConfig {
         num_qk_heads: GDN_QK_HEADS.try_into().expect("GDN qk heads must fit u32"),
         qk_head_dim: GDN_QK_HEAD_DIM.try_into().expect("GDN qk head dim must fit u32"),
         num_v_heads: GDN_V_HEADS.try_into().expect("GDN V heads must fit u32"),
@@ -411,7 +393,8 @@ fn gdn_core_config() -> GDNCoreConfig {
         conv_kernel_size: GDN_CONV_KERNEL_SIZE
             .try_into()
             .expect("GDN conv kernel size must fit u32"),
-        v_dim_tile_size: 8,
+        q_scale: (GDN_QK_HEAD_DIM as f32).sqrt().recip(),
+        norm_eps: GDN_EPS,
     }
 }
 

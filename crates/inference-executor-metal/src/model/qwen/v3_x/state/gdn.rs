@@ -81,7 +81,7 @@ impl Qwen3xGDNState {
         ));
         Self {
             backend: Rc::new(GDN::new(device, representative.clone(), metal)),
-            scratch: Rc::new(GDNScratch::new(device, representative, metal, max_tokens)),
+            scratch: Rc::new(GDNScratch::new(device, representative, max_tokens)),
             request_state_table: Rc::clone(&request_state_table),
             metadata: GDNMetadataBuffers::new(device, num_req_slots, max_tokens),
             state_restore: Replay::new("qwen3.x GDN state restore", Rc::clone(&request_state_table)),

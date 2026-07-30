@@ -6,13 +6,13 @@ use crate::metal::Device;
 use crate::metal::Kernel;
 use crate::metal::Operator;
 
-const GDN_CORE_SOURCE: &str = include_str!("metal/gdn_core.metal");
+const GDN_COMPUTE_SOURCE: &str = include_str!("metal/gdn_compute.metal");
 
 const SHORT_CONV_NUM_THREADS_PER_THREADBLOCK: usize = 256;
 const RAGGED_RECURRENT_NUM_QK_DIM_THREADS: usize = 32;
 const OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK: usize = 128;
 
-/// Static geometry for the generic GDN core.
+/// Static geometry for the generic GDN compute graph.
 ///
 /// The core consumes projected `qkv`, `a`, `b`, and `z` tensors over flat token
 /// axis `T`. Q/K use `[T, Hqk, Dqk]`; V and recurrent output use
@@ -21,9 +21,9 @@ const OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK: usize = 128;
 /// short-convolution boundaries; it is unrelated to convolution-kernel width.
 ///
 /// ```text
-/// projected_qkv + conv_state + conv_weight
+/// qkv + conv_state + conv_weight
 ///   -> causal depthwise short_conv -> SiLU -> conv_qkv
-/// old conv_state + projected_qkv
+/// old conv_state + qkv
 ///   -> take final Ks inputs -> next_conv_state
 /// ```
 ///
@@ -31,16 +31,17 @@ const OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK: usize = 128;
 /// accumulation. `next_conv_state` contains the final `Ks = Kc - 1` inputs for
 /// the next invocation.
 #[derive(Clone, Copy, Debug)]
-pub struct GDNCoreConfig {
+pub struct GDNComputeConfig {
     pub num_qk_heads: u32,
     pub qk_head_dim: u32,
     pub num_v_heads: u32,
     pub v_head_dim: u32,
     pub conv_kernel_size: u32,
-    pub v_dim_tile_size: u32,
+    pub q_scale: f32,
+    pub norm_eps: f32,
 }
 
-impl GDNCoreConfig {
+impl GDNComputeConfig {
     pub fn qkv_dim(self) -> u32 {
         self.num_qk_heads
             .checked_mul(self.qk_head_dim)
@@ -68,7 +69,7 @@ impl GDNCoreConfig {
         )
     }
 
-    pub fn num_recurrent_output_values(self, shape: GDNCoreShape) -> usize {
+    pub fn num_recurrent_output_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN output element count",
             &[
@@ -79,14 +80,14 @@ impl GDNCoreConfig {
         )
     }
 
-    pub fn num_qkv_values(self, shape: GDNCoreShape) -> usize {
+    pub fn num_qkv_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN convolution element count",
             &[shape.num_tokens as usize, self.qkv_dim() as usize],
         )
     }
 
-    pub fn num_conv_state_values(self, shape: GDNCoreShape) -> usize {
+    pub fn num_conv_state_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN convolution state element count",
             &[
@@ -97,7 +98,7 @@ impl GDNCoreConfig {
         )
     }
 
-    fn num_candidate_conv_state_values(self, shape: GDNCoreShape) -> usize {
+    fn num_candidate_conv_state_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN candidate convolution state element count",
             &[
@@ -115,7 +116,7 @@ impl GDNCoreConfig {
         )
     }
 
-    fn total_output_norm_gate_threads(self, shape: GDNCoreShape) -> usize {
+    fn total_output_norm_gate_threads(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN output norm + gate thread count",
             &[
@@ -133,15 +134,15 @@ impl GDNCoreConfig {
         assert!(self.v_head_dim > 0);
         assert_eq!(self.num_v_heads % self.num_qk_heads, 0);
         assert!(self.conv_kernel_size > 1);
-        assert!(self.v_dim_tile_size > 0);
-        assert_eq!(self.v_head_dim % self.v_dim_tile_size, 0);
-        assert!(self.v_dim_tile_size as usize * RAGGED_RECURRENT_NUM_QK_DIM_THREADS <= 1024);
+        assert!(self.q_scale.is_finite() && self.q_scale > 0.0);
+        assert!(self.norm_eps.is_finite() && self.norm_eps > 0.0);
         let _ = self.qkv_dim();
         let _ = self.recurrent_state_stride();
         let _ = self.num_conv_weight_values();
+        let _ = selected_v_dim_tile_size(self);
     }
 
-    fn validate_shape(self, shape: GDNCoreShape) {
+    fn validate_shape(self, shape: GDNComputeShape) {
         self.validate();
         shape.validate();
         for (name, num_elements) in [
@@ -161,19 +162,29 @@ impl GDNCoreConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct GDNCoreShape {
+pub struct GDNComputeShape {
     pub num_reqs: u32,
     pub num_tokens: u32,
 }
 
-impl GDNCoreShape {
+impl GDNComputeShape {
     fn validate(self) {
         assert!(self.num_reqs > 0);
         assert!(self.num_tokens > 0);
     }
 }
 
-fn gdn_core_source(config: GDNCoreConfig) -> String {
+fn selected_v_dim_tile_size(config: GDNComputeConfig) -> u32 {
+    [8, 4, 2, 1]
+        .into_iter()
+        .find(|tile_size| {
+            config.v_head_dim.is_multiple_of(*tile_size)
+                && *tile_size as usize * RAGGED_RECURRENT_NUM_QK_DIM_THREADS <= 1024
+        })
+        .expect("GDN recurrent V-dimension tile selection requires a positive v_head_dim")
+}
+
+fn gdn_compute_source(config: GDNComputeConfig, v_dim_tile_size: u32) -> String {
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_qk_heads = {num_qk_heads}u;\nconstant uint qk_head_dim = \
          {qk_head_dim}u;\nconstant uint num_v_heads = {num_v_heads}u;\nconstant uint v_head_dim = \
@@ -187,14 +198,14 @@ fn gdn_core_source(config: GDNCoreConfig) -> String {
         conv_kernel_size = config.conv_kernel_size,
         qkv_dim = config.qkv_dim(),
         conv_state_len = config.conv_state_len(),
-        v_dim_tile_size = config.v_dim_tile_size,
+        v_dim_tile_size = v_dim_tile_size,
     );
-    GDN_CORE_SOURCE.replacen("using namespace metal;", &constants, 1)
+    GDN_COMPUTE_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
 
 #[derive(Clone, Copy)]
-pub struct GDNCoreBuffers<'a> {
-    pub projected_qkv: &'a Buffer,
+pub struct GDNComputeBuffers<'a> {
+    pub qkv: &'a Buffer,
     pub a: &'a Buffer,
     pub b: &'a Buffer,
     pub z: &'a Buffer,
@@ -213,17 +224,18 @@ pub struct GDNCoreBuffers<'a> {
     pub recurrent_state_arena_offset_bytes: u64,
     pub conv_qkv: &'a Buffer,
     pub recurrent_output: &'a Buffer,
-    pub pre_output_hidden_states: &'a Buffer,
+    pub norm_gated_output: &'a Buffer,
 }
 
 #[derive(Clone, Copy)]
-pub struct GDNCoreForwardCandidateStateUpdateBuffers<'a> {
-    pub core: GDNCoreBuffers<'a>,
+pub struct GDNComputeWithCandidateStateUpdateBuffers<'a> {
+    pub compute: GDNComputeBuffers<'a>,
     pub flat_candidate_state_slots: &'a Buffer,
 }
 
-pub struct GDNCoreKernels {
-    config: GDNCoreConfig,
+pub struct GDNCompute {
+    config: GDNComputeConfig,
+    v_dim_tile_size: u32,
     short_conv: Kernel,
     forward_conv_candidate_state: Kernel,
     ragged_recurrent: Kernel,
@@ -231,61 +243,51 @@ pub struct GDNCoreKernels {
     output_norm_gate: Kernel,
 }
 
-impl GDNCoreKernels {
-    pub fn new(device: &Device, config: GDNCoreConfig) -> Self {
+impl GDNCompute {
+    pub fn new(device: &Device, config: GDNComputeConfig) -> Self {
         config.validate();
-        let source = gdn_core_source(config);
+        let v_dim_tile_size = selected_v_dim_tile_size(config);
+        let source = gdn_compute_source(config, v_dim_tile_size);
         Self {
             config,
-            short_conv: Kernel::new(device, &source, "gdn_core_short_conv_f32"),
-            forward_conv_candidate_state: Kernel::new(device, &source, "gdn_core_forward_conv_candidate_state_f32"),
-            ragged_recurrent: Kernel::new(device, &source, "gdn_core_ragged_recurrent_f32"),
+            v_dim_tile_size,
+            short_conv: Kernel::new(device, &source, "gdn_compute_short_conv_f32"),
+            forward_conv_candidate_state: Kernel::new(device, &source, "gdn_compute_forward_conv_candidate_state_f32"),
+            ragged_recurrent: Kernel::new(device, &source, "gdn_compute_ragged_recurrent_f32"),
             ragged_recurrent_forward_candidate_state: Kernel::new(
                 device,
                 &source,
-                "gdn_core_ragged_recurrent_forward_candidate_state_f32",
+                "gdn_compute_ragged_recurrent_forward_candidate_state_f32",
             ),
-            output_norm_gate: Kernel::new(device, &source, "gdn_core_output_norm_gate_f32"),
+            output_norm_gate: Kernel::new(device, &source, "gdn_compute_output_norm_gate_f32"),
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GDNCoreShape,
-        buffers: GDNCoreBuffers<'a>,
-        q_scale: f32,
-        eps: f32,
-    ) -> GDNCoreInvocation<'a> {
-        GDNCoreInvocation {
-            kernels: self,
+    pub fn invoke<'a>(&'a self, shape: GDNComputeShape, buffers: GDNComputeBuffers<'a>) -> GDNComputeInvocation<'a> {
+        GDNComputeInvocation {
+            compute: self,
             shape,
             buffers,
-            q_scale,
-            eps,
         }
     }
 
-    pub fn invoke_forward_candidate_state_update<'a>(
+    pub fn invoke_with_candidate_state_update<'a>(
         &'a self,
-        shape: GDNCoreShape,
-        buffers: GDNCoreForwardCandidateStateUpdateBuffers<'a>,
-        q_scale: f32,
-        eps: f32,
-    ) -> GDNCoreForwardCandidateStateUpdateInvocation<'a> {
-        GDNCoreForwardCandidateStateUpdateInvocation {
-            kernels: self,
+        shape: GDNComputeShape,
+        buffers: GDNComputeWithCandidateStateUpdateBuffers<'a>,
+    ) -> GDNComputeWithCandidateStateUpdateInvocation<'a> {
+        GDNComputeWithCandidateStateUpdateInvocation {
+            compute: self,
             shape,
             buffers,
-            q_scale,
-            eps,
         }
     }
 
-    fn record_short_conv(&self, builder: &CommandRecorder, shape: GDNCoreShape, buffers: &GDNCoreBuffers<'_>) {
+    fn record_short_conv(&self, builder: &CommandRecorder, shape: GDNComputeShape, buffers: &GDNComputeBuffers<'_>) {
         builder.set_kernel(&self.short_conv);
         builder.set_buffer_write(0, buffers.conv_qkv, 0);
         builder.set_buffer_write(1, buffers.next_conv_state, 0);
-        builder.set_buffer_read(2, buffers.projected_qkv, 0);
+        builder.set_buffer_read(2, buffers.qkv, 0);
         builder.set_buffer_read(3, buffers.conv_state, 0);
         builder.set_buffer_read(4, buffers.conv_weight, 0);
         builder.set_buffer_read(5, buffers.src_state_slots, 0);
@@ -304,21 +306,21 @@ impl GDNCoreKernels {
     fn record_forward_conv_candidate_state(
         &self,
         builder: &CommandRecorder,
-        shape: GDNCoreShape,
-        buffers: &GDNCoreForwardCandidateStateUpdateBuffers<'_>,
+        shape: GDNComputeShape,
+        buffers: &GDNComputeWithCandidateStateUpdateBuffers<'_>,
     ) {
-        let core = &buffers.core;
+        let compute = &buffers.compute;
         builder.set_kernel(&self.forward_conv_candidate_state);
         builder.set_barrier_before();
-        builder.set_buffer_write(0, core.next_conv_state, 0);
-        builder.set_buffer_read(1, core.projected_qkv, 0);
-        builder.set_buffer_read(2, core.conv_state, 0);
-        builder.set_buffer_read(3, core.src_state_slots, 0);
+        builder.set_buffer_write(0, compute.next_conv_state, 0);
+        builder.set_buffer_read(1, compute.qkv, 0);
+        builder.set_buffer_read(2, compute.conv_state, 0);
+        builder.set_buffer_read(3, compute.src_state_slots, 0);
         builder.set_buffer_read(4, buffers.flat_candidate_state_slots, 0);
-        builder.set_buffer_read(5, core.cu_tokens, 0);
+        builder.set_buffer_read(5, compute.cu_tokens, 0);
         set_batch_args(builder, shape, 6);
-        builder.set_u64(8, core.conv_state_offset_bytes);
-        builder.set_u64(9, core.next_conv_state_offset_bytes);
+        builder.set_u64(8, compute.conv_state_offset_bytes);
+        builder.set_u64(9, compute.next_conv_state_offset_bytes);
         builder.dispatch_1d(
             self.config.num_candidate_conv_state_values(shape),
             SHORT_CONV_NUM_THREADS_PER_THREADBLOCK,
@@ -345,9 +347,8 @@ impl GDNCoreKernels {
     fn record_ragged_recurrent(
         &self,
         builder: &CommandRecorder,
-        shape: GDNCoreShape,
-        buffers: &GDNCoreBuffers<'_>,
-        q_scale: f32,
+        shape: GDNComputeShape,
+        buffers: &GDNComputeBuffers<'_>,
     ) {
         builder.set_kernel(&self.ragged_recurrent);
         builder.set_barrier_before();
@@ -361,10 +362,10 @@ impl GDNCoreKernels {
         builder.set_buffer_read(7, buffers.src_state_slots, 0);
         builder.set_buffer_read(8, buffers.dst_state_slots, 0);
         builder.set_buffer_read(9, buffers.cu_tokens, 0);
-        builder.set_f32(10, q_scale);
+        builder.set_f32(10, self.config.q_scale);
         set_batch_args(builder, shape, 11);
         builder.set_u64(13, buffers.recurrent_state_arena_offset_bytes);
-        let v_dim_tile_size = self.config.v_dim_tile_size as usize;
+        let v_dim_tile_size = self.v_dim_tile_size as usize;
         let num_v_dim_tiles = self.config.v_head_dim as usize / v_dim_tile_size;
         builder.dispatch_threadblocks(
             (
@@ -379,28 +380,27 @@ impl GDNCoreKernels {
     fn record_ragged_recurrent_forward_candidate_state(
         &self,
         builder: &CommandRecorder,
-        shape: GDNCoreShape,
-        buffers: &GDNCoreForwardCandidateStateUpdateBuffers<'_>,
-        q_scale: f32,
+        shape: GDNComputeShape,
+        buffers: &GDNComputeWithCandidateStateUpdateBuffers<'_>,
     ) {
-        let core = &buffers.core;
+        let compute = &buffers.compute;
         builder.set_kernel(&self.ragged_recurrent_forward_candidate_state);
         builder.set_barrier_before();
-        builder.set_buffer_write(0, core.recurrent_output, 0);
-        builder.set_buffer_read_write(1, core.recurrent_state_arena, 0);
-        builder.set_buffer_read(2, core.conv_qkv, 0);
-        builder.set_buffer_read(3, core.a, 0);
-        builder.set_buffer_read(4, core.b, 0);
-        builder.set_buffer_read(5, core.a_log, 0);
-        builder.set_buffer_read(6, core.dt_bias, 0);
-        builder.set_buffer_read(7, core.src_state_slots, 0);
-        builder.set_buffer_read(8, core.dst_state_slots, 0);
+        builder.set_buffer_write(0, compute.recurrent_output, 0);
+        builder.set_buffer_read_write(1, compute.recurrent_state_arena, 0);
+        builder.set_buffer_read(2, compute.conv_qkv, 0);
+        builder.set_buffer_read(3, compute.a, 0);
+        builder.set_buffer_read(4, compute.b, 0);
+        builder.set_buffer_read(5, compute.a_log, 0);
+        builder.set_buffer_read(6, compute.dt_bias, 0);
+        builder.set_buffer_read(7, compute.src_state_slots, 0);
+        builder.set_buffer_read(8, compute.dst_state_slots, 0);
         builder.set_buffer_read(9, buffers.flat_candidate_state_slots, 0);
-        builder.set_buffer_read(10, core.cu_tokens, 0);
-        builder.set_f32(11, q_scale);
+        builder.set_buffer_read(10, compute.cu_tokens, 0);
+        builder.set_f32(11, self.config.q_scale);
         set_batch_args(builder, shape, 12);
-        builder.set_u64(14, core.recurrent_state_arena_offset_bytes);
-        let v_dim_tile_size = self.config.v_dim_tile_size as usize;
+        builder.set_u64(14, compute.recurrent_state_arena_offset_bytes);
+        let v_dim_tile_size = self.v_dim_tile_size as usize;
         let num_v_dim_tiles = self.config.v_head_dim as usize / v_dim_tile_size;
         builder.dispatch_threadblocks(
             (
@@ -416,7 +416,7 @@ impl GDNCoreKernels {
     ///
     /// ```text
     /// recurrent_output [T, Hv, Dv] -> RMS norm * SiLU(z)
-    ///   -> pre_output_hidden_states [T, Hv, Dv]
+    ///   -> norm_gated_output [T, Hv, Dv]
     /// GDNOutputNormGateTask / threadblock: { flat_token_index, v_head_index }
     /// grid: (T * Hv, 1, 1); threadblock: (128, 1, 1)
     /// reduce: Dv; produces: one normalized/gated [Dv] vector
@@ -427,17 +427,16 @@ impl GDNCoreKernels {
     fn record_output_norm_gate(
         &self,
         builder: &CommandRecorder,
-        shape: GDNCoreShape,
-        buffers: &GDNCoreBuffers<'_>,
-        eps: f32,
+        shape: GDNComputeShape,
+        buffers: &GDNComputeBuffers<'_>,
     ) {
         builder.set_kernel(&self.output_norm_gate);
         builder.set_barrier_before();
-        builder.set_buffer_write(0, buffers.pre_output_hidden_states, 0);
+        builder.set_buffer_write(0, buffers.norm_gated_output, 0);
         builder.set_buffer_read(1, buffers.recurrent_output, 0);
         builder.set_buffer_read(2, buffers.z, 0);
         builder.set_buffer_read(3, buffers.norm_weight, 0);
-        builder.set_f32(4, eps);
+        builder.set_f32(4, self.config.norm_eps);
         set_batch_args(builder, shape, 5);
         builder.dispatch_1d(
             self.config.total_output_norm_gate_threads(shape),
@@ -446,66 +445,61 @@ impl GDNCoreKernels {
     }
 }
 
-pub struct GDNCoreInvocation<'a> {
-    kernels: &'a GDNCoreKernels,
-    shape: GDNCoreShape,
-    buffers: GDNCoreBuffers<'a>,
-    q_scale: f32,
-    eps: f32,
+pub struct GDNComputeInvocation<'a> {
+    compute: &'a GDNCompute,
+    shape: GDNComputeShape,
+    buffers: GDNComputeBuffers<'a>,
 }
 
-impl Operator for GDNCoreInvocation<'_> {
+impl Operator for GDNComputeInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.kernels.config.validate_shape(self.shape);
-        validate_buffers(self.kernels.config, self.shape, &self.buffers);
-        self.kernels.record_short_conv(builder, self.shape, &self.buffers);
+        self.compute.config.validate_shape(self.shape);
+        validate_buffers(self.compute.config, self.shape, &self.buffers);
+        self.compute.record_short_conv(builder, self.shape, &self.buffers);
         assert!(
             self.shape.num_tokens >= self.shape.num_reqs,
             "GDN ragged recurrent requires at least one token per request"
         );
-        self.kernels
-            .record_ragged_recurrent(builder, self.shape, &self.buffers, self.q_scale);
-        self.kernels
-            .record_output_norm_gate(builder, self.shape, &self.buffers, self.eps);
+        self.compute.record_ragged_recurrent(builder, self.shape, &self.buffers);
+        self.compute.record_output_norm_gate(builder, self.shape, &self.buffers);
     }
 }
 
-pub struct GDNCoreForwardCandidateStateUpdateInvocation<'a> {
-    kernels: &'a GDNCoreKernels,
-    shape: GDNCoreShape,
-    buffers: GDNCoreForwardCandidateStateUpdateBuffers<'a>,
-    q_scale: f32,
-    eps: f32,
+pub struct GDNComputeWithCandidateStateUpdateInvocation<'a> {
+    compute: &'a GDNCompute,
+    shape: GDNComputeShape,
+    buffers: GDNComputeWithCandidateStateUpdateBuffers<'a>,
 }
 
-impl Operator for GDNCoreForwardCandidateStateUpdateInvocation<'_> {
+impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.kernels.config.validate_shape(self.shape);
+        self.compute.config.validate_shape(self.shape);
         assert_u32_count_domain(
-            self.kernels.config.num_candidate_conv_state_values(self.shape),
+            self.compute.config.num_candidate_conv_state_values(self.shape),
             "GDN candidate convolution state",
         );
-        validate_buffers(self.kernels.config, self.shape, &self.buffers.core);
+        validate_buffers(self.compute.config, self.shape, &self.buffers.compute);
         assert!(
             self.buffers.flat_candidate_state_slots.len_bytes() >= self.shape.num_tokens as usize * size_of::<u32>(),
             "GDN flat_candidate_state_slots buffer is too small"
         );
-        self.kernels.record_short_conv(builder, self.shape, &self.buffers.core);
-        self.kernels
+        self.compute
+            .record_short_conv(builder, self.shape, &self.buffers.compute);
+        self.compute
             .record_forward_conv_candidate_state(builder, self.shape, &self.buffers);
-        self.kernels
-            .record_ragged_recurrent_forward_candidate_state(builder, self.shape, &self.buffers, self.q_scale);
-        self.kernels
-            .record_output_norm_gate(builder, self.shape, &self.buffers.core, self.eps);
+        self.compute
+            .record_ragged_recurrent_forward_candidate_state(builder, self.shape, &self.buffers);
+        self.compute
+            .record_output_norm_gate(builder, self.shape, &self.buffers.compute);
     }
 }
 
-fn set_batch_args(builder: &CommandRecorder, shape: GDNCoreShape, start_index: usize) {
+fn set_batch_args(builder: &CommandRecorder, shape: GDNComputeShape, start_index: usize) {
     builder.set_u32(start_index, shape.num_reqs);
     builder.set_u32(start_index + 1, shape.num_tokens);
 }
 
-fn validate_buffers(config: GDNCoreConfig, shape: GDNCoreShape, buffers: &GDNCoreBuffers<'_>) {
+fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &GDNComputeBuffers<'_>) {
     let f32_bytes = u64::try_from(size_of::<f32>()).expect("f32 item size must fit u64");
     for (name, offset_bytes) in [
         ("conv_state", buffers.conv_state_offset_bytes),
@@ -519,8 +513,8 @@ fn validate_buffers(config: GDNCoreConfig, shape: GDNCoreShape, buffers: &GDNCor
         );
     }
     assert!(
-        buffers.projected_qkv.len_bytes() >= config.num_qkv_values(shape) * size_of::<f32>(),
-        "GDN projected_qkv buffer is too small"
+        buffers.qkv.len_bytes() >= config.num_qkv_values(shape) * size_of::<f32>(),
+        "GDN qkv buffer is too small"
     );
     assert!(
         buffers.a.len_bytes() >= shape.num_tokens as usize * config.num_v_heads as usize * size_of::<f32>(),
@@ -605,11 +599,11 @@ fn validate_buffers(config: GDNCoreConfig, shape: GDNCoreShape, buffers: &GDNCor
         "GDN recurrent_output buffer is too small"
     );
     assert!(
-        buffers.pre_output_hidden_states.len_bytes() >= config.num_recurrent_output_values(shape) * size_of::<f32>(),
-        "GDN pre_output_hidden_states buffer is too small"
+        buffers.norm_gated_output.len_bytes() >= config.num_recurrent_output_values(shape) * size_of::<f32>(),
+        "GDN norm_gated_output buffer is too small"
     );
 }
 
 #[cfg(test)]
-#[path = "gdn_attention_test.rs"]
+#[path = "gdn_compute_test.rs"]
 mod tests;

@@ -19,7 +19,7 @@ crates/inference-executor-metal/src/attn/
   gdn/
     mod.rs                  GDN Metal module root
     batch_metadata.rs       state-domain-owned, capacity-sized GPU metadata updated per microbatch
-    backend.rs              GDN Metal replay wiring and core candidate state update sub-backend
+    backend.rs              GDN Metal replay wiring and candidate-state materialization
     scratch.rs              reusable GDN scratch allocation owner and borrowed replay bindings
     request_state_table.rs  private CPU request-slot/version/candidate mapping
     state_table.rs          public GDNRequestStateTable, live arenas, GDNStatePageIO, and lifecycle
@@ -33,14 +33,15 @@ crates/inference-executor-metal/src/model/qwen/
     plan.rs                 Qwen3.5 GDN geometry/config builder
 
 crates/inference-backend-metal/src/components/
-  gdn_attention.rs      reusable Metal GDN core component kernels
-  gdn_projection.rs     reusable Metal GDN projection-split component kernels
-  gdn_state_pages.rs    reusable Metal GDN single-state and batched state-page read/write helpers
+  gdn_compute.rs        reusable Metal GDN compute graph
+  gdn_compute_test.rs   GDN compute reference tests
+  gdn_qkvabz_split.rs  reusable QKVABZ split component
+  gdn_state_pages.rs    reusable GDN state-page read/write helpers
   metal/
-    gdn_core.metal                  short-convolution, ragged recurrent, and output-norm/gate source
-    gdn_projection_split.metal      projection-split source
-    gdn_state_page_read.metal       batched state-page restore source
-    gdn_state_page_write.metal      batched state-page publish source
+    gdn_compute.metal        short-convolution, ragged recurrent, and output-norm/gate source
+    gdn_qkvabz_split.metal  QKVABZ split source
+    gdn_state_page_read.metal
+    gdn_state_page_write.metal
 ```
 
 `crates/inference-executor-core` owns the backend-neutral GDN semantic metadata. `crates/inference-executor-metal` owns
@@ -75,7 +76,7 @@ The forward tensors are:
 ```text
 hidden_state                 [T, hidden_dim]
 qkvabz                       [T, Cqkv + 2 * Hv + Hv * Dv]
-projected_qkv                [T, Cqkv]
+qkv                           [T, Cqkv]
 a, b                         [T, Hv]
 z                            [T, Hv, Dv]
 conv_weight                  [Cqkv, Kc]
@@ -83,7 +84,7 @@ conv_state                   [S, Cqkv, Ks]
 conv_qkv                     [T, Cqkv]
 recurrent_state              [S, Hv, Dv, Dqk]
 recurrent_output             [T, Hv, Dv]
-pre_output_hidden_states     [T, Hv, Dv]
+norm_gated_output            [T, Hv, Dv]
 next_hidden_state            [T, hidden_dim]
 ```
 
@@ -101,11 +102,11 @@ dt_bias                            bf16
 Metal kernels promote BF16 parameters to F32 at the operation that consumes them. The loader does not create persistent
 F32 copies or derive `-exp(a_log)`. Convolution and recurrent state remain F32 runtime state.
 
-`projected_qkv` is the projection-split output and short-convolution input. `conv_qkv` is the short-convolution output
+`qkv` is the projection-split output and short-convolution input. `conv_qkv` is the short-convolution output
 and recurrent-core input.
 
 `recurrent_output` is the recurrent result before RMS normalization and the output gate. It is not attention output.
-`pre_output_hidden_states` is the normalized/gated tensor that output projection consumes.
+`norm_gated_output` is the normalized/gated tensor that output projection consumes.
 
 Request segments use `flat_token_begin`, `flat_token_end`, `num_req_tokens`, and `token_index_in_req`. Reserve `q` and
 `k` for actual Q/K tensor values and coordinates.
@@ -228,7 +229,7 @@ Output norm + gate is a cooperative reduction/map, not a matmul-like Tile. One c
 The task owns `{ flat_token_index, v_head_index }`. The grid derives both coordinates. The task RMS-normalizes and
 gates one `[Dv]` recurrent-output vector.
 
-Short convolution and projection split use flat map dispatches. Their threadblock grouping is incidental launch
+Short convolution and QKVABZ split use flat map dispatches. Their threadblock grouping is incidental launch
 tuning. Thus, their documentation describes tensors and grids without new `*Task` or `*Tile` nouns.
 
 ## Canonical metadata and host/Metal ABI
@@ -236,13 +237,13 @@ tuning. Thus, their documentation describes tensors and grids without new `*Task
 Canonical host structure order is unchanged:
 
 ```text
-GDNCoreShape / GDNReplayShape
+GDNComputeShape / GDNReplayShape
   num_reqs, num_tokens
 
-GDNCoreConfig
+GDNComputeConfig
   num_qk_heads, qk_head_dim,
   num_v_heads, v_head_dim,
-  conv_kernel_size, v_dim_tile_size
+  conv_kernel_size, q_scale, norm_eps
 
 GDNCore
   model_layer_index, hidden_dim,
@@ -250,25 +251,28 @@ GDNCore
   num_v_heads, v_head_dim,
   conv_kernel_size, q_scale
 
-GDNProjectionSplitShape
-  num_tokens, qkv_dim, num_v_heads, v_dim, input_dtype
+GDNQKVABZSplitConfig
+  qkv_dim, num_v_heads, v_dim, input_dtype
+
+GDNQKVABZSplitShape
+  num_tokens
 ```
 
-Generic `GDNCoreConfig` owns static geometry and tuning. The replay shape/key owns dynamic batch work.
+Generic `GDNComputeConfig` owns static geometry. `GDNCompute` derives its low-level V-dimension tile from that geometry.
+The replay shape/key owns dynamic batch work.
 
-The Qwen adapter supplies dimensions, weights, and measured defaults. Generic Rust and Metal contain no Qwen name or
-config type.
+The Qwen adapter supplies dimensions and weights. Generic Rust and Metal contain no Qwen name or config type.
 
 The canonical binding order and dispatch topology are:
 
 ```text
-projection split
-  buffers 0..4: qkvabz, projected_qkv, a, b, z
+QKVABZ split
+  buffers 0..4: qkvabz, qkv, a, b, z
   scalars 5..8: num_tokens, qkv_dim, num_v_heads, v_dim
   dispatch: T * (Cqkv + 2 * Hv + Hv * Dv), 256 threads/threadblock
 
 short convolution
-  buffers 0..7: conv_qkv, next_conv_state, projected_qkv, conv_state,
+  buffers 0..7: conv_qkv, next_conv_state, qkv, conv_state,
                 conv_weight, src_state_slots, dst_state_slots, cu_tokens
   parameter dtype: conv_weight bf16
   scalars 8..11: num_reqs, num_tokens, conv_state_offset_bytes,
@@ -284,7 +288,7 @@ ragged recurrent
   threads: (32, Dv_tile, 1)
 
 output_norm_gate
-  buffers 0..3: pre_output_hidden_states, recurrent_output, z, norm_weight
+  buffers 0..3: norm_gated_output, recurrent_output, z, norm_weight
   parameter dtype: norm_weight bf16
   scalars 4..6: eps, num_reqs, num_tokens
   dispatch: T * Hv * 128, 128 threads/threadblock
@@ -304,6 +308,11 @@ The invalid candidate-slot sentinel remains `u32::MAX`. The kernel does not writ
 
 ## Ownership
 
+The Qwen GDN weight owner loads one bounded `TensorMap` from its exact GDN binding subtree.
+It removes all QKV/A/B/Z, convolution, norm, state-parameter, and output tensors from that map.
+It materializes the fused QKVABZ buffers required by the backend ABI during initialization.
+The map must be empty after construction.
+
 `GDNCore` owns immutable layer metadata:
 
 ```text
@@ -318,22 +327,24 @@ q_scale
 The independent dimensions derive `qk_dim`, `v_dim`, `qkv_dim = Cqkv`, and the convolution history length.
 `GDNCore` and the backend invocation shape do not store duplicate fields.
 
-`GDNCore` fixes the internal dtype to f32 and the output boundary to bf16. Backend contract methods define both values.
-Configurable fields do not define them.
+The current GDN Metal execution contract uses BF16 model input and output boundaries. It uses F32 for projection outputs,
+GDN compute, and persistent recurrent state. `GDNCore` remains backend-neutral and does not define these data types.
 
-`GDNMetalConfig` owns shared execution tuning and numeric configuration. It includes the recurrent `Dv_tile` size, norm
-epsilon, input dtype, `qkvabz_scale_bias_dtype`, and `output_scale_bias_dtype`.
+`GDNMetalConfig` owns numeric and storage configuration. It includes norm epsilon, `input_dtype`, `output_dtype`,
+`qkvabz_scale_bias_dtype`, and `output_scale_bias_dtype`. The current implementation accepts only BF16 model boundaries.
+F32 model boundaries remain explicit future work. The config does not expose kernel tile configuration.
 
-The current mixed-dtype affine path owns one QMV BN8/BK32 kernel and one QMM BM32/BN32 kernel per projection.
-`GDN` selects between them from the active row count.
-The same-dtype adaptive `AffineQuantizedMatmul` does not own this mixed-dtype selection yet.
+`GDN` owns one adaptive `AffineQuantizedMatmul` for the qkvabz projection and one for the output projection.
+Each operator owns its QMV and QMM candidates.
+The backend selects the kernel family and tile from the fixed affine config and the active row count.
+`GDN` does not select or name an affine kernel.
 
-The Qwen adapter supplies its measured default `Dv_tile` value of 8. The reusable backend remains model-agnostic.
-
-During backend construction, the executor translates immutable `GDNCore` geometry and selected `Dv_tile` tuning into
-`GDNCoreConfig`. This backend-owned config specializes the generated Metal source for
-`num_qk_heads/qk_head_dim`, `num_v_heads/v_head_dim`, `conv_kernel_size`, derived `qkv_dim`, and
-`v_dim_tile_size`. `GDNCoreShape` contains only replay-varying `num_reqs/num_tokens`.
+`GDN` translates immutable `GDNCore` geometry into `GDNComputeConfig`. `GDNCompute::new` selects the recurrent
+`Dv_tile` from that config. It uses the measured 8-lane tile when `v_head_dim` permits it. It falls back through 4, 2,
+and 1 for other valid dimensions. The selected tile specializes the generated Metal source together with
+`num_qk_heads/qk_head_dim`, `num_v_heads/v_head_dim`, `conv_kernel_size`, and derived `qkv_dim`.
+The model adapter does not select this kernel configuration. `GDNComputeShape` contains only replay-varying
+`num_reqs/num_tokens`.
 
 Kernel source-hash caching shares compiled pipelines for identical component configs across layers and models. The backend
 API does not contain model names or model config types. Batch metadata objects and scratch bindings do not copy static
@@ -417,7 +428,7 @@ duplicate shape. Backend recording and replay-key construction both read the sto
 `GDNStateArenaBindings` borrows both aggregate arenas and the selected layer's checked `u64` byte bases. Production binds
 each arena at Metal offset zero. It passes the bases as Metal `ulong` kernel arguments.
 
-`GDNProjectionSplitBuffers` carries `projected_qkv`, `a`, `b`, and `z`. In qkvabz naming, `a` is the raw gate/dt
+`GDNQKVABZSplitBuffers` carries `qkv`, `a`, `b`, and `z`. In qkvabz naming, `a` is the raw gate/dt
 projection. `b` is the raw beta projection. `z` is the output gate projection.
 
 `g` is not projected. Gate preparation derives it as part of `beta = sigmoid(b)`,
@@ -432,16 +443,16 @@ Arena lengths and the leading dimensions derive the per-slot and per-layer byte 
 these strides. It directly derives aggregate allocation lengths and the all-layer page-ID count. It does not store derived
 f32-per-page counts, recurrent/conv page counts, or a selected layer coordinate.
 
-Backend code then runs the recurrent state update and output projection. GDN math keeps `projected_qkv`, gates,
-`conv_qkv`, recurrent state, `recurrent_output`, and `pre_output_hidden_states` in f32.
+Backend code then runs the recurrent state update and output projection. GDN math keeps `qkv`, gates,
+`conv_qkv`, recurrent state, `recurrent_output`, and `norm_gated_output` in f32.
 
 Qwen checkpoint weights and affine parameters remain packed U32 or BF16 in persistent Metal buffers. Quantized matmul
 kernels dequantize packed weights and promote BF16 affine parameters during execution. GDN core kernels promote
 `conv_weight`, `norm_weight`, `a_log`, and `dt_bias` when they read each value. The recurrent kernel computes
 `-exp(a_log)` in F32.
 
-`GDNMetalConfig::boundary_dtype()` returns bf16 at the Qwen3.6 model boundary. GDN state and pre-output math remain f32
-because bf16 can cause downstream NaN/Inf.
+`GDNMetalConfig` requires BF16 at both Qwen3.6 model boundaries. GDN state and internal math remain F32 because BF16 can
+cause downstream NaN/Inf.
 
 ## Replay contract
 
@@ -512,21 +523,34 @@ Dropping the model also waits through `ReplaySubmission` ownership. Runtime core
 The replay order is:
 
 ```text
-bf16 hidden_state
-  -> f32 hidden_state_f32 cast when qkvabz input dtype is f32
-  -> qkvabz packed-weight dequantization and BF16 affine-parameter promotion into f32
-  -> qkvabz projection split
-  -> f32 GDN core with BF16 parameter promotion: short convolution, ragged recurrent, output_norm_gate
-  -> f32-to-bf16 pre-output cast when the boundary dtype is bf16
-  -> output projection
-  -> bf16 next_hidden_state
+hidden_state (BF16)
+  -> qkvabz: AffineQuantizedMatmul (BF16 -> F32)
+  -> qkvabz (F32)
+  -> qkvabz_to_qkv_a_b_z
+     |- qkv (F32)
+     |- a (F32)
+     |- b (F32)
+     `- z (F32)
+          |
+          v
+       GDNCompute (F32)
+     short_conv -> ragged_recurrent -> output_norm_gate
+          |
+          v
+       norm_gated_output (F32)
+          |
+          v
+       output: AffineQuantizedMatmul (F32 -> BF16)
+          |
+          v
+       next_hidden_state (BF16)
 ```
 
 Stage nouns identify the operation. They do not overload one generic “attention” pipeline:
 
 ```text
-projection_split   elementwise map from qkvabz to projected_qkv/a/b/z
-short_conv         temporal convolution map from projected_qkv to conv_qkv plus next_conv_state
+qkvabz_to_qkv_a_b_z   elementwise map from qkvabz to qkv/a/b/z
+short_conv         temporal convolution map from qkv to conv_qkv plus next_conv_state
 ragged_recurrent   ordered recurrent state transition and recurrent_output production
 output_norm_gate  per-(token,V-head) RMS reduction, norm, and z-gate map
 ```
@@ -538,14 +562,16 @@ In ragged recurrent, each Q/K lane produces `q_square_sum_partial`, `k_square_su
 Output norm + gate uses `square_sum_partial` and threadgroup `square_sum_partials` before it computes the inverse RMS.
 No partial changes the existing dispatch, scratch, or ABI.
 
-The production GDN core uses only ragged recurrent execution. It handles one or more flat tokens per request with
+`GDNCompute` currently owns one compute path: ragged recurrent execution. It handles one or more flat tokens per request
+with
 `cu_tokens`. The recurrent kernel computes Q/K inverse norms, decay, and beta. It advances each request's tokens in order.
 It parallelizes across requests, V heads, V-dimension tiles, and Q/K-dimension lanes.
 
 ### Execution strategy
 
-`ragged_recurrent` is the current GDN recurrent execution path. It does not define GDN itself. Another execution path can
-share the tensor and state-tile vocabulary. That path owns a different Task and Grid contract. The current path is:
+`ragged_recurrent` is the current GDN compute path. It does not define GDN itself. Another compute path can share the
+tensor and state-tile vocabulary. That path owns a different Task and Grid contract. Do not add `GDNComputePath` until a
+second production implementation exists. The current path is:
 
 ```text
 shape: num_tokens >= num_reqs, segmented by cu_tokens
@@ -600,7 +626,7 @@ slot zeroed.
 
 This setup matches the production lifecycle. The lifecycle reads a verified current state and produces a candidate state.
 
-The replay shape contract is exact for the current microbatch. `GDNCoreConfig` owns static geometry:
+The replay shape and metadata contract is exact for the current microbatch:
 
 ```text
 num_reqs       number of request rows in the ragged batch
@@ -681,9 +707,9 @@ Publish records one all-layer batch write after commit.
 Publish is a separate replay from main forward and sampling. It consumes the already-selected committed state. It does not
 affect response tokens. It can execute while the scheduler processes that response.
 
-Qwen model replay keeps selected-path GDN transient scratch in one model-owned `GDNScratch`. This scratch includes hidden
-f32 cast scratch, qkvabz projection/split buffers, and convolution/core/pre-output buffers. GDN layers execute serially in
-the replay slice. Therefore, this scratch is reusable across layers.
+Qwen model replay keeps selected-path GDN transient scratch in one model-owned `GDNScratch`. This scratch includes the
+F32 qkvabz projection/split buffers and the F32 convolution/core/output-gate buffers. GDN layers execute serially in the
+replay slice. Therefore, this scratch is reusable across layers.
 
 State-page I/O writes directly between global state pages and the model-owned contiguous state arenas. It does not use
 page-value scratch. Every production state kernel binds the aggregate arena at Metal offset zero.
@@ -711,7 +737,7 @@ conv_states[layer, slot, Cqkv, Ks]
 recurrent_states[layer, slot, v_head, v_dim, qk_dim]
 ```
 
-Short convolution reads the source conv-state slot and `projected_qkv`. It writes `conv_qkv` for every current row. It
+Short convolution reads the source conv-state slot and `qkv`. It writes `conv_qkv` for every current row. It
 writes the next conv-state into the destination slot.
 
 The recurrent core reads `conv_qkv`, raw F32 `a`/`b`, and raw BF16 `a_log`/`dt_bias`. It promotes the BF16 parameters
@@ -780,24 +806,24 @@ and Qwen transaction semantics remain in the model-level state owner.
 The GDN benchmark uses these subcomponent names:
 
 ```text
-qkvabz-proj
-split
-core
-output-proj
+qkvabz
+qkvabz-to-qkv-a-b-z
+compute
+output
 ```
 
 Do not add dynamic values to profile paths.
 
 ## GDN kernel family
 
-The current replay path uses the Metal GDN core component in
-`crates/inference-backend-metal/src/components/`. It records projection split, short convolution, ragged recurrent,
+The current replay path uses `GDNCompute` in `crates/inference-backend-metal/src/components/`. It records QKVABZ split,
+short convolution, ragged recurrent,
 output_norm_gate, and state page read/write helpers through explicit replay invocations.
 
 Focused backend tests, component benches with parity checks, and Qwen real-weight wrapper/layer tests provide correctness
 coverage. Slow/reference implementations are test oracles. They are not runtime fallbacks.
 
-`gdn_attention` compares Metal execution with the CPU short-convolution and recurrent references. It covers fixed
+`gdn_compute_test.rs` compares Metal execution with the CPU short-convolution and recurrent references. It covers fixed
 one-request ragged decode, random ragged input, and a random multi-request ragged batch. Candidate-state tests compare each
 speculative prefix state with an independently evaluated CPU prefix reference.
 
@@ -823,7 +849,7 @@ cargo bench -p inference-executor-metal --bench qwen35_gdn -- \
 
 Append `-- --profile-time 1 --noplot` to either backend Criterion target for a representative full-target smoke run.
 
-`gdn_attn` records GDN core-with-state and candidate-state-update building blocks into Metal replay/ICB paths.
+`gdn_attn` records `GDNCompute` with state and candidate-state-update building blocks into Metal replay/ICB paths.
 `gdn_state_io` covers the reusable GDN state-page read/write component. Neither bench exposes direct-submit component or
 forward wiring.
 
@@ -842,7 +868,7 @@ declared buffer usage. It does not add a conservative every-command fallback.
 
 This bench loads real Qwen3.6 GDN weights. It adapts separate checkpoint qkv/a/b/z projections into the executor qkvabz
 replay layout without changing their checkpoint dtype. It measures the full replay path: qkvabz projection, projection
-split, the GDN core, and output projection. Do not compare component-only GDN core or candidate state update timings
+split, `GDNCompute`, and output projection. Do not compare component-only `GDNCompute` or candidate-state-update timings
 with full-forward numbers.
 
 Recommendation: GDN replay debugging separates transient scratch from persistent state. Layers execute serially.

@@ -5,6 +5,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGDNWeightBindings;
 
@@ -21,8 +22,8 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::model::qwen::v3_x::weight::affine_config;
 use crate::model::qwen::v3_x::weight::concat_bytes;
-use crate::model::qwen::v3_x::weight::quant_weight;
-use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::qwen::v3_x::weight::remove_quant_weight;
+use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xGDN {
@@ -109,20 +110,35 @@ impl Qwen3xGDNWeights {
         core: &GDNCore,
         metal: crate::attn::gdn::backend::GDNMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
+        let mut tensor_names = Vec::new();
+        bindings.push_tensor_names(&mut tensor_names);
+        let mut tensors = store.load_tensors(tensor_names)?;
+        let weights = Self::from_tensors(device, &mut tensors, bindings, core, metal)?;
+        assert!(tensors.is_empty(), "GDN must consume its tensor map");
+        Ok(weights)
+    }
+
+    fn from_tensors(
+        device: &Device,
+        tensors: &mut TensorMap,
+        bindings: &Qwen3xGDNWeightBindings,
+        core: &GDNCore,
+        metal: crate::attn::gdn::backend::GDNMetalConfig,
+    ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
-        let qkv_weight = quant_weight(store, &bindings.qkv.weight)?;
-        let a_weight = quant_weight(store, &bindings.a.weight)?;
-        let b_weight = quant_weight(store, &bindings.b.weight)?;
-        let z_weight = quant_weight(store, &bindings.z.weight)?;
-        let qkv_scales = typed_tensor(store, &bindings.qkv.scales, safetensors::Dtype::BF16)?.into_data();
-        let a_scales = typed_tensor(store, &bindings.a.scales, safetensors::Dtype::BF16)?.into_data();
-        let b_scales = typed_tensor(store, &bindings.b.scales, safetensors::Dtype::BF16)?.into_data();
-        let z_scales = typed_tensor(store, &bindings.z.scales, safetensors::Dtype::BF16)?.into_data();
-        let qkv_biases = typed_tensor(store, &bindings.qkv.biases, safetensors::Dtype::BF16)?.into_data();
-        let a_biases = typed_tensor(store, &bindings.a.biases, safetensors::Dtype::BF16)?.into_data();
-        let b_biases = typed_tensor(store, &bindings.b.biases, safetensors::Dtype::BF16)?.into_data();
-        let z_biases = typed_tensor(store, &bindings.z.biases, safetensors::Dtype::BF16)?.into_data();
+        let qkv_weight = remove_quant_weight(tensors, &bindings.qkv.weight)?;
+        let a_weight = remove_quant_weight(tensors, &bindings.a.weight)?;
+        let b_weight = remove_quant_weight(tensors, &bindings.b.weight)?;
+        let z_weight = remove_quant_weight(tensors, &bindings.z.weight)?;
+        let qkv_scales = remove_typed_tensor(tensors, &bindings.qkv.scales, safetensors::Dtype::BF16)?.into_data();
+        let a_scales = remove_typed_tensor(tensors, &bindings.a.scales, safetensors::Dtype::BF16)?.into_data();
+        let b_scales = remove_typed_tensor(tensors, &bindings.b.scales, safetensors::Dtype::BF16)?.into_data();
+        let z_scales = remove_typed_tensor(tensors, &bindings.z.scales, safetensors::Dtype::BF16)?.into_data();
+        let qkv_biases = remove_typed_tensor(tensors, &bindings.qkv.biases, safetensors::Dtype::BF16)?.into_data();
+        let a_biases = remove_typed_tensor(tensors, &bindings.a.biases, safetensors::Dtype::BF16)?.into_data();
+        let b_biases = remove_typed_tensor(tensors, &bindings.b.biases, safetensors::Dtype::BF16)?.into_data();
+        let z_biases = remove_typed_tensor(tensors, &bindings.z.biases, safetensors::Dtype::BF16)?.into_data();
         let qkvabz_weight = concat_bytes(&[&qkv_weight, &a_weight, &b_weight, &z_weight]);
         let qkvabz_scales = concat_bytes(&[&qkv_scales, &a_scales, &b_scales, &z_scales]);
         let qkvabz_biases = concat_bytes(&[&qkv_biases, &a_biases, &b_biases, &z_biases]);
@@ -133,7 +149,7 @@ impl Qwen3xGDNWeights {
             metal.group_size,
             metal.bits,
             metal.input_dtype,
-            metal.internal_dtype(),
+            Dtype::Float32,
             metal.qkvabz_scale_bias_dtype,
         );
         validate_len("GDN qkvabz weight", qkvabz_weight.len(), qkvabz_config.weight_bytes())?;
@@ -153,13 +169,15 @@ impl Qwen3xGDNWeights {
             core.v_dim(),
             metal.group_size,
             metal.bits,
-            metal.internal_dtype(),
-            metal.boundary_dtype(),
+            Dtype::Float32,
+            metal.output_dtype,
             metal.output_scale_bias_dtype,
         );
-        let output_weight = quant_weight(store, &bindings.output.weight)?;
-        let output_scales = typed_tensor(store, &bindings.output.scales, safetensors::Dtype::BF16)?.into_data();
-        let output_biases = typed_tensor(store, &bindings.output.biases, safetensors::Dtype::BF16)?.into_data();
+        let output_weight = remove_quant_weight(tensors, &bindings.output.weight)?;
+        let output_scales =
+            remove_typed_tensor(tensors, &bindings.output.scales, safetensors::Dtype::BF16)?.into_data();
+        let output_biases =
+            remove_typed_tensor(tensors, &bindings.output.biases, safetensors::Dtype::BF16)?.into_data();
         validate_len("GDN output weight", output_weight.len(), output_config.weight_bytes())?;
         validate_len(
             "GDN output scales",
@@ -172,20 +190,20 @@ impl Qwen3xGDNWeights {
             output_config.scale_or_bias_bytes(),
         )?;
 
-        let conv_weight = typed_tensor(store, &bindings.conv_weight, safetensors::Dtype::BF16)?.into_data();
+        let conv_weight = remove_typed_tensor(tensors, &bindings.conv_weight, safetensors::Dtype::BF16)?.into_data();
         validate_len(
             "GDN conv weight",
             conv_weight.len(),
             core.qkv_dim() * core.conv_kernel_size * Dtype::Bfloat16.item_size(),
         )?;
-        let norm_weight = typed_tensor(store, &bindings.norm_weight, safetensors::Dtype::BF16)?.into_data();
+        let norm_weight = remove_typed_tensor(tensors, &bindings.norm_weight, safetensors::Dtype::BF16)?.into_data();
         validate_len(
             "GDN norm weight",
             norm_weight.len(),
             core.v_head_dim * Dtype::Bfloat16.item_size(),
         )?;
-        let a_log = typed_tensor(store, &bindings.a_log, safetensors::Dtype::BF16)?.into_data();
-        let dt_bias = typed_tensor(store, &bindings.dt_bias, safetensors::Dtype::BF16)?.into_data();
+        let a_log = remove_typed_tensor(tensors, &bindings.a_log, safetensors::Dtype::BF16)?.into_data();
+        let dt_bias = remove_typed_tensor(tensors, &bindings.dt_bias, safetensors::Dtype::BF16)?.into_data();
         validate_len("GDN A_log", a_log.len(), core.num_v_heads * Dtype::Bfloat16.item_size())?;
         validate_len(
             "GDN dt_bias",

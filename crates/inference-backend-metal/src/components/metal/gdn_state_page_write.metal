@@ -2,26 +2,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void gdn_state_page_write_f32(
-    device float* pages [[buffer(0)]],
-    device const float* flat_state [[buffer(1)]],
-    device const uint* page_ids [[buffer(2)]],
-    constant uint& page_id_start_index [[buffer(3)]],
-    constant uint& num_pages [[buffer(4)]],
-    constant uint& state_bytes [[buffer(5)]],
-    constant uint& page_bytes [[buffer(6)]],
-    uint state_value_index [[thread_position_in_grid]]
-) {
-    const ulong state_byte_offset = (ulong)state_value_index * sizeof(float);
-    const uint page_index = (uint)(state_byte_offset / (ulong)page_bytes);
-    if (page_index >= num_pages) return;
-    const ulong value_index_in_page =
-        (state_byte_offset - (ulong)page_index * (ulong)page_bytes) / sizeof(float);
-    const ulong page_id = (ulong)page_ids[page_id_start_index + page_index];
-    pages[page_id * ((ulong)page_bytes / sizeof(float)) + value_index_in_page] =
-        state_byte_offset < (ulong)state_bytes ? flat_state[state_value_index] : 0.0f;
-}
-
 // One logical GDNStatePageWriteTask maps 1:1 to one threadblock and copies one
 // state-slot page into page storage. No Task value, TaskTemplate, or ABI buffer
 // is materialized:

@@ -1,5 +1,4 @@
 use crate::components::assert_u32_count_domain;
-use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
@@ -12,99 +11,6 @@ const GDN_STATE_PAGE_READ_SOURCE: &str = include_str!("metal/gdn_state_page_read
 
 const NUM_THREADS_PER_THREADBLOCK: usize = 256;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GDNStatePageShape {
-    pub state_bytes: u32,
-    pub page_bytes: u32,
-}
-
-impl GDNStatePageShape {
-    pub fn validate(self) {
-        assert!(self.page_bytes > 0);
-        assert_eq!(self.page_bytes % size_of::<f32>() as u32, 0);
-        assert!(self.state_bytes > 0);
-        assert_eq!(self.state_bytes % size_of::<f32>() as u32, 0);
-        assert_u32_index_domain(self.total_page_threads(), "GDN state-page threads");
-    }
-
-    pub fn num_pages(self) -> u32 {
-        self.state_bytes.div_ceil(self.page_bytes)
-    }
-
-    pub fn total_page_threads(self) -> usize {
-        checked_product(
-            "GDN state-page thread count",
-            &[self.num_pages() as usize, self.page_bytes as usize / size_of::<f32>()],
-        )
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct GDNStatePageWriteBuffers<'a> {
-    pub pages: &'a Buffer,
-    pub flat_state: &'a Buffer,
-    pub page_ids: &'a Buffer,
-    pub page_id_start_index: u32,
-}
-
-pub struct GDNStatePageWrite {
-    kernel: Kernel,
-}
-
-impl GDNStatePageWrite {
-    pub fn new(device: &Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_write_f32"),
-        }
-    }
-
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GDNStatePageShape,
-        buffers: GDNStatePageWriteBuffers<'a>,
-    ) -> GDNStatePageWriteInvocation<'a> {
-        GDNStatePageWriteInvocation {
-            kernel: &self.kernel,
-            shape,
-            buffers,
-        }
-    }
-}
-
-pub struct GDNStatePageWriteInvocation<'a> {
-    kernel: &'a Kernel,
-    shape: GDNStatePageShape,
-    buffers: GDNStatePageWriteBuffers<'a>,
-}
-
-impl Operator for GDNStatePageWriteInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
-        self.validate();
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_write(0, self.buffers.pages, 0);
-        builder.set_buffer_read(1, self.buffers.flat_state, 0);
-        builder.set_buffer_read(2, self.buffers.page_ids, 0);
-        builder.set_u32(3, self.buffers.page_id_start_index);
-        builder.set_u32(4, self.shape.num_pages());
-        builder.set_u32(5, self.shape.state_bytes);
-        builder.set_u32(6, self.shape.page_bytes);
-        builder.dispatch_1d(self.shape.total_page_threads(), NUM_THREADS_PER_THREADBLOCK);
-    }
-}
-
-impl GDNStatePageWriteInvocation<'_> {
-    fn validate(&self) {
-        self.shape.validate();
-        assert_eq!(self.buffers.page_ids.len_bytes() % size_of::<u32>(), 0);
-        let page_id_end = (self.buffers.page_id_start_index as usize)
-            .checked_add(self.shape.num_pages() as usize)
-            .and_then(|count| count.checked_mul(size_of::<u32>()))
-            .expect("GDN state-page write page-ID range must fit usize");
-        assert!(page_id_end <= self.buffers.page_ids.len_bytes());
-        assert!(self.buffers.flat_state.len_bytes() >= self.shape.state_bytes as usize);
-    }
-}
-
 /// Static batch geometry for GDN state-page I/O.
 ///
 /// Each state-I/O request selects one state slot and its page IDs across every GDN
@@ -115,44 +21,77 @@ impl GDNStatePageWriteInvocation<'_> {
 /// TaskTemplate, or ABI buffer is materialized. `page_id` and `state_slot` remain
 /// data inputs rather than Task coordinates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GDNStatePageBatchShape {
+pub struct GDNStatePageBatchConfig {
     pub num_gdn_layers: u32,
     pub num_state_slots: u32,
-    pub num_state_io_requests: u32,
+    pub recurrent_state_bytes: u32,
+    pub conv_state_bytes: u32,
     pub page_bytes: u32,
 }
 
-impl GDNStatePageBatchShape {
-    pub fn validate_vec4(self) {
+impl GDNStatePageBatchConfig {
+    pub fn validate(self) {
         assert!(self.num_gdn_layers > 0);
-        assert!(self.num_state_io_requests > 0);
         assert!(self.num_state_slots > 0);
+        assert!(self.recurrent_state_bytes > 0);
+        assert_eq!(self.recurrent_state_bytes % (4 * size_of::<f32>() as u32), 0);
+        assert!(self.conv_state_bytes > 0);
+        assert_eq!(self.conv_state_bytes % (4 * size_of::<f32>() as u32), 0);
         assert!(self.page_bytes > 0);
         assert_eq!(self.page_bytes % (4 * size_of::<f32>() as u32), 0);
     }
 
-    pub fn state_slots_bytes(self) -> usize {
+    pub fn validate_shape(self, shape: GDNStatePageBatchShape) {
+        self.validate();
+        shape.validate();
+        self.num_total_pages(shape);
+    }
+
+    pub fn state_slots_bytes(self, shape: GDNStatePageBatchShape) -> usize {
         checked_product(
             "GDN state-slot metadata byte length",
-            &[self.num_state_io_requests as usize, size_of::<u32>()],
+            &[shape.num_state_io_requests as usize, size_of::<u32>()],
         )
     }
 
-    fn num_total_pages(self, recurrent_state_bytes: u32, conv_state_bytes: u32) -> usize {
-        let pages_per_layer = recurrent_state_bytes
+    fn state_arena_bytes(self, state_bytes: u32) -> usize {
+        checked_product(
+            "GDN state arena byte length",
+            &[
+                self.num_gdn_layers as usize,
+                self.num_state_slots as usize,
+                state_bytes as usize,
+            ],
+        )
+    }
+
+    fn num_total_pages(self, shape: GDNStatePageBatchShape) -> usize {
+        let pages_per_layer = self
+            .recurrent_state_bytes
             .div_ceil(self.page_bytes)
-            .checked_add(conv_state_bytes.div_ceil(self.page_bytes))
+            .checked_add(self.conv_state_bytes.div_ceil(self.page_bytes))
             .expect("GDN pages per layer must fit u32");
         let num_pages = checked_product(
             "GDN state-page batch count",
             &[
                 self.num_gdn_layers as usize,
-                self.num_state_io_requests as usize,
+                shape.num_state_io_requests as usize,
                 pages_per_layer as usize,
             ],
         );
         assert_u32_count_domain(num_pages, "GDN state-page batch pages");
         num_pages
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GDNStatePageBatchShape {
+    pub num_state_io_requests: u32,
+}
+
+impl GDNStatePageBatchShape {
+    pub fn validate(self) {
+        assert!(self.num_state_io_requests > 0);
     }
 }
 
@@ -166,12 +105,15 @@ pub struct GDNStatePageBatchWriteBuffers<'a> {
 }
 
 pub struct GDNStatePageBatchWrite {
+    config: GDNStatePageBatchConfig,
     kernel: Kernel,
 }
 
 impl GDNStatePageBatchWrite {
-    pub fn new(device: &Device) -> Self {
+    pub fn new(device: &Device, config: GDNStatePageBatchConfig) -> Self {
+        config.validate();
         Self {
+            config,
             kernel: Kernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_batch_write_f32"),
         }
     }
@@ -182,7 +124,7 @@ impl GDNStatePageBatchWrite {
         buffers: GDNStatePageBatchWriteBuffers<'a>,
     ) -> GDNStatePageBatchWriteInvocation<'a> {
         GDNStatePageBatchWriteInvocation {
-            kernel: &self.kernel,
+            kernel: self,
             shape,
             buffers,
         }
@@ -190,7 +132,7 @@ impl GDNStatePageBatchWrite {
 }
 
 pub struct GDNStatePageBatchWriteInvocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a GDNStatePageBatchWrite,
     shape: GDNStatePageBatchShape,
     buffers: GDNStatePageBatchWriteBuffers<'a>,
 }
@@ -198,28 +140,23 @@ pub struct GDNStatePageBatchWriteInvocation<'a> {
 impl Operator for GDNStatePageBatchWriteInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        let recurrent_state_bytes = state_bytes_per_slot(self.shape, self.buffers.recurrent_states);
-        let conv_state_bytes = state_bytes_per_slot(self.shape, self.buffers.conv_states);
-        builder.set_kernel(self.kernel);
+        let config = self.kernel.config;
+        builder.set_kernel(&self.kernel.kernel);
         builder.set_buffer_write(0, self.buffers.pages, 0);
         builder.set_buffer_read(1, self.buffers.recurrent_states, 0);
         builder.set_buffer_read(2, self.buffers.conv_states, 0);
         builder.set_buffer_read(3, self.buffers.page_ids, 0);
         builder.set_buffer_read(4, self.buffers.state_slots, 0);
-        builder.set_u32(5, self.shape.num_gdn_layers);
-        builder.set_u32(6, self.shape.num_state_slots);
+        builder.set_u32(5, config.num_gdn_layers);
+        builder.set_u32(6, config.num_state_slots);
         builder.set_u32(7, self.shape.num_state_io_requests);
-        builder.set_u32(8, recurrent_state_bytes.div_ceil(self.shape.page_bytes));
-        builder.set_u32(9, recurrent_state_bytes);
-        builder.set_u32(10, conv_state_bytes.div_ceil(self.shape.page_bytes));
-        builder.set_u32(11, conv_state_bytes);
-        builder.set_u32(12, self.shape.page_bytes);
+        builder.set_u32(8, config.recurrent_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(9, config.recurrent_state_bytes);
+        builder.set_u32(10, config.conv_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(11, config.conv_state_bytes);
+        builder.set_u32(12, config.page_bytes);
         builder.dispatch_threadblocks(
-            (
-                self.shape.num_total_pages(recurrent_state_bytes, conv_state_bytes),
-                1,
-                1,
-            ),
+            (config.num_total_pages(self.shape), 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
     }
@@ -227,46 +164,12 @@ impl Operator for GDNStatePageBatchWriteInvocation<'_> {
 
 impl GDNStatePageBatchWriteInvocation<'_> {
     fn validate(&self) {
-        self.shape.validate_vec4();
-        let recurrent_state_bytes = state_bytes_per_slot(self.shape, self.buffers.recurrent_states);
-        let conv_state_bytes = state_bytes_per_slot(self.shape, self.buffers.conv_states);
-        assert!(
-            self.buffers.page_ids.len_bytes()
-                >= self.shape.num_total_pages(recurrent_state_bytes, conv_state_bytes) * size_of::<u32>()
-        );
-        assert!(self.buffers.state_slots.len_bytes() >= self.shape.state_slots_bytes());
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct GDNStatePageReadBuffers<'a> {
-    pub pages: &'a Buffer,
-    pub flat_state: &'a Buffer,
-    pub page_ids: &'a Buffer,
-    pub page_id_start_index: u32,
-}
-
-pub struct GDNStatePageRead {
-    kernel: Kernel,
-}
-
-impl GDNStatePageRead {
-    pub fn new(device: &Device) -> Self {
-        Self {
-            kernel: Kernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_read_f32"),
-        }
-    }
-
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GDNStatePageShape,
-        buffers: GDNStatePageReadBuffers<'a>,
-    ) -> GDNStatePageReadInvocation<'a> {
-        GDNStatePageReadInvocation {
-            kernel: &self.kernel,
-            shape,
-            buffers,
-        }
+        let config = self.kernel.config;
+        config.validate_shape(self.shape);
+        assert!(self.buffers.page_ids.len_bytes() >= config.num_total_pages(self.shape) * size_of::<u32>());
+        assert!(self.buffers.recurrent_states.len_bytes() >= config.state_arena_bytes(config.recurrent_state_bytes));
+        assert!(self.buffers.conv_states.len_bytes() >= config.state_arena_bytes(config.conv_state_bytes));
+        assert!(self.buffers.state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
     }
 }
 
@@ -280,12 +183,15 @@ pub struct GDNStatePageBatchReadBuffers<'a> {
 }
 
 pub struct GDNStatePageBatchRead {
+    config: GDNStatePageBatchConfig,
     kernel: Kernel,
 }
 
 impl GDNStatePageBatchRead {
-    pub fn new(device: &Device) -> Self {
+    pub fn new(device: &Device, config: GDNStatePageBatchConfig) -> Self {
+        config.validate();
         Self {
+            config,
             kernel: Kernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_batch_read_f32"),
         }
     }
@@ -296,7 +202,7 @@ impl GDNStatePageBatchRead {
         buffers: GDNStatePageBatchReadBuffers<'a>,
     ) -> GDNStatePageBatchReadInvocation<'a> {
         GDNStatePageBatchReadInvocation {
-            kernel: &self.kernel,
+            kernel: self,
             shape,
             buffers,
         }
@@ -304,7 +210,7 @@ impl GDNStatePageBatchRead {
 }
 
 pub struct GDNStatePageBatchReadInvocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a GDNStatePageBatchRead,
     shape: GDNStatePageBatchShape,
     buffers: GDNStatePageBatchReadBuffers<'a>,
 }
@@ -312,28 +218,23 @@ pub struct GDNStatePageBatchReadInvocation<'a> {
 impl Operator for GDNStatePageBatchReadInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.validate();
-        let recurrent_state_bytes = state_bytes_per_slot(self.shape, self.buffers.recurrent_states);
-        let conv_state_bytes = state_bytes_per_slot(self.shape, self.buffers.conv_states);
-        builder.set_kernel(self.kernel);
+        let config = self.kernel.config;
+        builder.set_kernel(&self.kernel.kernel);
         builder.set_buffer_read(0, self.buffers.pages, 0);
         builder.set_buffer_write(1, self.buffers.recurrent_states, 0);
         builder.set_buffer_write(2, self.buffers.conv_states, 0);
         builder.set_buffer_read(3, self.buffers.page_ids, 0);
         builder.set_buffer_read(4, self.buffers.state_slots, 0);
-        builder.set_u32(5, self.shape.num_gdn_layers);
-        builder.set_u32(6, self.shape.num_state_slots);
+        builder.set_u32(5, config.num_gdn_layers);
+        builder.set_u32(6, config.num_state_slots);
         builder.set_u32(7, self.shape.num_state_io_requests);
-        builder.set_u32(8, recurrent_state_bytes.div_ceil(self.shape.page_bytes));
-        builder.set_u32(9, recurrent_state_bytes);
-        builder.set_u32(10, conv_state_bytes.div_ceil(self.shape.page_bytes));
-        builder.set_u32(11, conv_state_bytes);
-        builder.set_u32(12, self.shape.page_bytes);
+        builder.set_u32(8, config.recurrent_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(9, config.recurrent_state_bytes);
+        builder.set_u32(10, config.conv_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(11, config.conv_state_bytes);
+        builder.set_u32(12, config.page_bytes);
         builder.dispatch_threadblocks(
-            (
-                self.shape.num_total_pages(recurrent_state_bytes, conv_state_bytes),
-                1,
-                1,
-            ),
+            (config.num_total_pages(self.shape), 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
     }
@@ -341,103 +242,54 @@ impl Operator for GDNStatePageBatchReadInvocation<'_> {
 
 impl GDNStatePageBatchReadInvocation<'_> {
     fn validate(&self) {
-        self.shape.validate_vec4();
-        let recurrent_state_bytes = state_bytes_per_slot(self.shape, self.buffers.recurrent_states);
-        let conv_state_bytes = state_bytes_per_slot(self.shape, self.buffers.conv_states);
-        assert!(
-            self.buffers.page_ids.len_bytes()
-                >= self.shape.num_total_pages(recurrent_state_bytes, conv_state_bytes) * size_of::<u32>()
-        );
-        assert!(self.buffers.state_slots.len_bytes() >= self.shape.state_slots_bytes());
-    }
-}
-
-pub struct GDNStatePageReadInvocation<'a> {
-    kernel: &'a Kernel,
-    shape: GDNStatePageShape,
-    buffers: GDNStatePageReadBuffers<'a>,
-}
-
-fn state_bytes_per_slot(shape: GDNStatePageBatchShape, states: &Buffer) -> u32 {
-    let num_state_slots = (shape.num_gdn_layers as usize)
-        .checked_mul(shape.num_state_slots as usize)
-        .expect("GDN local state-slot count must fit usize");
-    assert_eq!(states.len_bytes() % num_state_slots, 0);
-    let state_bytes = states.len_bytes() / num_state_slots;
-    assert!(state_bytes > 0);
-    assert_eq!(state_bytes % (4 * size_of::<f32>()), 0);
-    state_bytes.try_into().expect("GDN state bytes per slot must fit u32")
-}
-
-impl Operator for GDNStatePageReadInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
-        self.validate();
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.pages, 0);
-        builder.set_buffer_write(1, self.buffers.flat_state, 0);
-        builder.set_buffer_read(2, self.buffers.page_ids, 0);
-        builder.set_u32(3, self.buffers.page_id_start_index);
-        builder.set_u32(4, self.shape.num_pages());
-        builder.set_u32(5, self.shape.state_bytes);
-        builder.set_u32(6, self.shape.page_bytes);
-        builder.dispatch_1d(
-            self.shape.state_bytes as usize / size_of::<f32>(),
-            NUM_THREADS_PER_THREADBLOCK,
-        );
-    }
-}
-
-impl GDNStatePageReadInvocation<'_> {
-    fn validate(&self) {
-        self.shape.validate();
-        assert_eq!(self.buffers.page_ids.len_bytes() % size_of::<u32>(), 0);
-        let page_id_end = (self.buffers.page_id_start_index as usize)
-            .checked_add(self.shape.num_pages() as usize)
-            .and_then(|count| count.checked_mul(size_of::<u32>()))
-            .expect("GDN state-page read page-ID range must fit usize");
-        assert!(page_id_end <= self.buffers.page_ids.len_bytes());
-        assert!(self.buffers.flat_state.len_bytes() >= self.shape.state_bytes as usize);
+        let config = self.kernel.config;
+        config.validate_shape(self.shape);
+        assert!(self.buffers.page_ids.len_bytes() >= config.num_total_pages(self.shape) * size_of::<u32>());
+        assert!(self.buffers.recurrent_states.len_bytes() >= config.state_arena_bytes(config.recurrent_state_bytes));
+        assert!(self.buffers.conv_states.len_bytes() >= config.state_arena_bytes(config.conv_state_bytes));
+        assert!(self.buffers.state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::GDNStatePageBatchConfig;
     use super::GDNStatePageBatchRead;
     use super::GDNStatePageBatchReadBuffers;
     use super::GDNStatePageBatchShape;
     use super::GDNStatePageBatchWrite;
     use super::GDNStatePageBatchWriteBuffers;
-    use super::GDNStatePageShape;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Stream;
 
     #[test]
-    fn test_shape_accepts_maximum_aligned_u32_state_bytes() {
-        GDNStatePageShape {
-            state_bytes: u32::MAX - 3,
-            page_bytes: u32::MAX - 3,
-        }
-        .validate();
-    }
-
-    #[test]
     #[should_panic(expected = "GDN state-page batch pages exceeds the shader u32 count domain")]
     fn test_batch_shape_rejects_shader_count_overflow() {
-        GDNStatePageBatchShape {
+        GDNStatePageBatchConfig {
             num_gdn_layers: 1 << 30,
             num_state_slots: 1,
-            num_state_io_requests: 1,
+            recurrent_state_bytes: 16,
+            conv_state_bytes: 48,
             page_bytes: 16,
         }
-        .num_total_pages(16, 48);
+        .num_total_pages(GDNStatePageBatchShape {
+            num_state_io_requests: 1,
+        });
     }
 
     #[test]
     fn test_batch_read() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let page_read = GDNStatePageBatchRead::new(&device);
+        let config = GDNStatePageBatchConfig {
+            num_gdn_layers: 1,
+            num_state_slots: 2,
+            recurrent_state_bytes: 12 * size_of::<f32>() as u32,
+            conv_state_bytes: 4 * size_of::<f32>() as u32,
+            page_bytes: 32,
+        };
+        let page_read = GDNStatePageBatchRead::new(&device, config);
         let pages = Buffer::from_slice(
             &device,
             &[
@@ -455,10 +307,7 @@ mod tests {
         let page_ids = Buffer::from_slice(&device, &[1_u32, 3, 5, 2, 4, 6]);
         let state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
         let shape = GDNStatePageBatchShape {
-            num_gdn_layers: 1,
             num_state_io_requests: 2,
-            num_state_slots: 2,
-            page_bytes: 32,
         };
 
         let mut builder = stream.create_replay_program();
@@ -494,7 +343,14 @@ mod tests {
     fn test_batch_write() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let page_write = GDNStatePageBatchWrite::new(&device);
+        let config = GDNStatePageBatchConfig {
+            num_gdn_layers: 1,
+            num_state_slots: 2,
+            recurrent_state_bytes: 12 * size_of::<f32>() as u32,
+            conv_state_bytes: 4 * size_of::<f32>() as u32,
+            page_bytes: 32,
+        };
+        let page_write = GDNStatePageBatchWrite::new(&device, config);
         let pages = Buffer::from_slice(&device, &[-1.0_f32; 7 * 8]);
         let recurrent_states = Buffer::from_slice(
             &device,
@@ -513,10 +369,7 @@ mod tests {
         let page_ids = Buffer::from_slice(&device, &[1_u32, 3, 5, 2, 4, 6]);
         let state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
         let shape = GDNStatePageBatchShape {
-            num_gdn_layers: 1,
             num_state_io_requests: 2,
-            num_state_slots: 2,
-            page_bytes: 32,
         };
 
         let mut builder = stream.create_replay_program();
@@ -550,13 +403,17 @@ mod tests {
     fn test_batch_layers() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let page_read = GDNStatePageBatchRead::new(&device);
-        let page_write = GDNStatePageBatchWrite::new(&device);
-        let shape = GDNStatePageBatchShape {
+        let config = GDNStatePageBatchConfig {
             num_gdn_layers: 2,
-            num_state_io_requests: 2,
             num_state_slots: 3,
+            recurrent_state_bytes: 8 * size_of::<f32>() as u32,
+            conv_state_bytes: 4 * size_of::<f32>() as u32,
             page_bytes: 32,
+        };
+        let page_read = GDNStatePageBatchRead::new(&device, config);
+        let page_write = GDNStatePageBatchWrite::new(&device, config);
+        let shape = GDNStatePageBatchShape {
+            num_state_io_requests: 2,
         };
         let recurrent_values = (0..48).map(|value| value as f32 + 10.0).collect::<Vec<_>>();
         let conv_values = (0..24).map(|value| value as f32 + 100.0).collect::<Vec<_>>();

@@ -11,10 +11,10 @@ constant uint GDN_INVALID_STATE_SLOT_ID = 0xffffffffu;
 // Short convolution operates independently along Cqkv; conv_kernel_size is
 // its temporal kernel extent, not a tensor-channel dimension.
 
-kernel void gdn_core_short_conv_f32(
+kernel void gdn_compute_short_conv_f32(
     device float* conv_qkv [[buffer(0)]],
     device float* next_conv_state [[buffer(1)]],
-    device const float* projected_qkv [[buffer(2)]],
+    device const float* qkv [[buffer(2)]],
     device const float* conv_state [[buffer(3)]],
     device const bfloat16_t* conv_weight [[buffer(4)]],
     device const uint* src_state_slots [[buffer(5)]],
@@ -56,7 +56,7 @@ kernel void gdn_core_short_conv_f32(
                 x = conv_state[conv_state_base + (ulong)state_offset];
             } else {
                 const uint input_offset = (flat_token_begin + uint(sequence_index)) * qkv_dim + channel_index;
-                x = projected_qkv[input_offset];
+                x = qkv[input_offset];
             }
             const uint weight_offset = channel_index * conv_kernel_size + kernel_index;
             acc += x * float(conv_weight[weight_offset]);
@@ -83,16 +83,16 @@ kernel void gdn_core_short_conv_f32(
             x = conv_state[conv_state_base + (ulong)state_offset];
         } else {
             const uint input_offset = (flat_token_begin + uint(sequence_index)) * qkv_dim + channel_index;
-            x = projected_qkv[input_offset];
+            x = qkv[input_offset];
         }
         const uint dst_offset = (dst_state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
         next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
     }
 }
 
-kernel void gdn_core_forward_conv_candidate_state_f32(
+kernel void gdn_compute_forward_conv_candidate_state_f32(
     device float* next_conv_state [[buffer(0)]],
-    device const float* projected_qkv [[buffer(1)]],
+    device const float* qkv [[buffer(1)]],
     device const float* conv_state [[buffer(2)]],
     device const uint* src_state_slots [[buffer(3)]],
     device const uint* flat_candidate_state_slots [[buffer(4)]],
@@ -137,7 +137,7 @@ kernel void gdn_core_forward_conv_candidate_state_f32(
         x = conv_state[conv_state_base + (ulong)state_offset];
     } else {
         const uint input_offset = (flat_token_begin + uint(sequence_index)) * qkv_dim + channel_index;
-        x = projected_qkv[input_offset];
+        x = qkv[input_offset];
     }
     const uint dst_offset = (dst_state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
     next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
@@ -154,7 +154,7 @@ kernel void gdn_core_forward_conv_candidate_state_f32(
 //   flat_token_begin,   // derived from cu_tokens[req_index]
 //   flat_token_end,     // derived from cu_tokens[req_index + 1]
 // }
-kernel void gdn_core_ragged_recurrent_f32(
+kernel void gdn_compute_ragged_recurrent_f32(
     device float* recurrent_output [[buffer(0)]],
     device float* recurrent_state_arena [[buffer(1)]],
     device const float* conv_qkv [[buffer(2)]],
@@ -294,10 +294,10 @@ kernel void gdn_core_ragged_recurrent_f32(
 }
 
 // This candidate-state kernel uses the same comment-only
-// GDNRaggedRecurrentTask and grid as gdn_core_ragged_recurrent_f32.
+// GDNRaggedRecurrentTask and grid as gdn_compute_ragged_recurrent_f32.
 // flat_candidate_state_slots is data that selects optional state writes; it is
 // not a Task coordinate or TaskTemplate field.
-kernel void gdn_core_ragged_recurrent_forward_candidate_state_f32(
+kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     device float* recurrent_output [[buffer(0)]],
     device float* recurrent_state_arena [[buffer(1)]],
     device const float* conv_qkv [[buffer(2)]],
@@ -452,8 +452,8 @@ kernel void gdn_core_ragged_recurrent_forward_candidate_state_f32(
 //   flat_token_index,  // grid-derived from threadblock linear index / Hv
 //   v_head_index,      // grid-derived from threadblock linear index % Hv
 // }
-kernel void gdn_core_output_norm_gate_f32(
-    device float* pre_output_hidden_states [[buffer(0)]],
+kernel void gdn_compute_output_norm_gate_f32(
+    device float* norm_gated_output [[buffer(0)]],
     device const float* recurrent_output [[buffer(1)]],
     device const float* z [[buffer(2)]],
     device const bfloat16_t* norm_weight [[buffer(3)]],
@@ -494,6 +494,6 @@ kernel void gdn_core_output_norm_gate_f32(
         const float z_value = z[output_index];
         const float silu_z = z_value / (1.0f + metal::exp(-z_value));
         const float normalized_value = recurrent_output[output_index] * inv_rms * float(norm_weight[v_dim_index]);
-        pre_output_hidden_states[output_index] = normalized_value * silu_z;
+        norm_gated_output[output_index] = normalized_value * silu_z;
     }
 }

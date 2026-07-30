@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::mem::size_of;
 use std::mem::take;
 
+use inference_backend_metal::components::GDNStatePageBatchConfig;
 use inference_backend_metal::components::GDNStatePageBatchRead;
 use inference_backend_metal::components::GDNStatePageBatchReadBuffers;
 use inference_backend_metal::components::GDNStatePageBatchShape;
@@ -26,6 +27,8 @@ struct GDNStateLayout {
     num_gdn_layers: usize,
     num_state_slots: usize,
     max_state_io_requests: usize,
+    recurrent_state_bytes: usize,
+    conv_state_bytes: usize,
     page_bytes: usize,
 }
 
@@ -211,6 +214,8 @@ impl GDNRequestStateTable {
             num_gdn_layers,
             num_state_slots,
             max_state_io_requests,
+            recurrent_state_bytes,
+            conv_state_bytes,
             page_bytes,
         };
         let recurrent_layer_bytes = u64::try_from(layout.num_state_slots)
@@ -259,7 +264,7 @@ impl GDNRequestStateTable {
             restores: RefCell::new(Vec::with_capacity(num_req_slots)),
             publishes: RefCell::new(Vec::with_capacity(layout.max_state_io_requests)),
             pending_request_txns: RefCell::new(Vec::with_capacity(num_req_slots)),
-            page_io: GDNStatePageIO::new(device, num_page_ids, layout.max_state_io_requests),
+            page_io: GDNStatePageIO::new(device, num_page_ids, layout),
         }
     }
 
@@ -280,21 +285,11 @@ impl GDNRequestStateTable {
     }
 
     fn recurrent_state_bytes(&self) -> usize {
-        self.recurrent_states.len_bytes()
-            / self
-                .layout
-                .num_gdn_layers
-                .checked_mul(self.layout.num_state_slots)
-                .expect("GDN recurrent state leading dimensions must fit usize")
+        self.layout.recurrent_state_bytes
     }
 
     fn conv_state_bytes(&self) -> usize {
-        self.conv_states.len_bytes()
-            / self
-                .layout
-                .num_gdn_layers
-                .checked_mul(self.layout.num_state_slots)
-                .expect("GDN convolution state leading dimensions must fit usize")
+        self.layout.conv_state_bytes
     }
 
     pub fn layer_bindings(&self, gdn_layer_index: usize) -> GDNStateArenaBindings<'_> {
@@ -578,16 +573,17 @@ impl GDNRequestStateTable {
 }
 
 impl GDNStatePageIO {
-    fn new(device: &Device, num_page_ids: usize, max_state_io_requests: usize) -> Self {
+    fn new(device: &Device, num_page_ids: usize, layout: GDNStateLayout) -> Self {
+        let config = Self::config(layout);
         Self {
             page_ids: Buffer::new_zeroed_elements(device, num_page_ids, inference_backend_metal::metal::Dtype::Uint32),
             state_slots: Buffer::new_zeroed_elements(
                 device,
-                max_state_io_requests,
+                layout.max_state_io_requests,
                 inference_backend_metal::metal::Dtype::Uint32,
             ),
-            read: GDNStatePageBatchRead::new(device),
-            write: GDNStatePageBatchWrite::new(device),
+            read: GDNStatePageBatchRead::new(device, config),
+            write: GDNStatePageBatchWrite::new(device, config),
         }
     }
 
@@ -639,7 +635,7 @@ impl GDNStatePageIO {
             .expect("GDN restore I/O request count must fit u32");
         assert!(num_state_io_requests > 0, "GDN restore recording requires I/O requests");
         recorder.record(ReplayOp::opaque(self.read.invoke(
-            Self::shape(layout, num_state_io_requests),
+            Self::shape(num_state_io_requests),
             GDNStatePageBatchReadBuffers {
                 pages,
                 recurrent_states,
@@ -672,7 +668,7 @@ impl GDNStatePageIO {
             .expect("GDN publish I/O request count must fit u32");
         assert!(num_state_io_requests > 0, "GDN publish recording requires I/O requests");
         recorder.record(ReplayOp::opaque(self.write.invoke(
-            Self::shape(layout, num_state_io_requests),
+            Self::shape(num_state_io_requests),
             GDNStatePageBatchWriteBuffers {
                 pages,
                 recurrent_states,
@@ -683,14 +679,25 @@ impl GDNStatePageIO {
         )));
     }
 
-    fn shape(layout: GDNStateLayout, num_state_io_requests: u32) -> GDNStatePageBatchShape {
-        GDNStatePageBatchShape {
+    fn shape(num_state_io_requests: u32) -> GDNStatePageBatchShape {
+        GDNStatePageBatchShape { num_state_io_requests }
+    }
+
+    fn config(layout: GDNStateLayout) -> GDNStatePageBatchConfig {
+        GDNStatePageBatchConfig {
             num_gdn_layers: layout.num_gdn_layers.try_into().expect("GDN layer count must fit u32"),
-            num_state_io_requests,
             num_state_slots: layout
                 .num_state_slots
                 .try_into()
                 .expect("GDN state slot count must fit u32"),
+            recurrent_state_bytes: layout
+                .recurrent_state_bytes
+                .try_into()
+                .expect("GDN recurrent state bytes must fit u32"),
+            conv_state_bytes: layout
+                .conv_state_bytes
+                .try_into()
+                .expect("GDN convolution state bytes must fit u32"),
             page_bytes: layout.page_bytes.try_into().expect("GDN page bytes must fit u32"),
         }
     }

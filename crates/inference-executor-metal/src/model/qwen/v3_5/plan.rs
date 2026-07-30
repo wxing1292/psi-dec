@@ -21,7 +21,6 @@ pub struct Qwen35MetalDefaults {
     pub group_size: u32,
     pub bits: u32,
     pub hidden_dtype: Dtype,
-    pub gdn_recurrent_v_tile_size: u32,
     pub single_q_token_kv_token_tile_size: u32,
     pub single_q_token_num_threads_per_threadblock: u32,
     pub single_q_token_max_q_head_tile_size: u32,
@@ -35,7 +34,6 @@ impl Default for Qwen35MetalDefaults {
             group_size: 64,
             bits: 4,
             hidden_dtype: Dtype::Bfloat16,
-            gdn_recurrent_v_tile_size: 8,
             single_q_token_kv_token_tile_size: 256,
             single_q_token_num_threads_per_threadblock: 256,
             single_q_token_max_q_head_tile_size: 8,
@@ -104,9 +102,9 @@ pub fn qwen35_gdn_core_and_metal(
     let metal = GDNMetalConfig {
         group_size: defaults.group_size,
         bits: defaults.bits,
-        recurrent_v_tile_size: defaults.gdn_recurrent_v_tile_size,
         norm_eps: text.rms_norm_eps,
-        input_dtype: Dtype::Float32,
+        input_dtype: defaults.hidden_dtype,
+        output_dtype: defaults.hidden_dtype,
         qkvabz_scale_bias_dtype: Dtype::Bfloat16,
         output_scale_bias_dtype: Dtype::Bfloat16,
     };

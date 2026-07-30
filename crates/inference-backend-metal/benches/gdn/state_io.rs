@@ -5,19 +5,12 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use inference_backend_metal::components::F32BufferCopyBuffers;
-use inference_backend_metal::components::F32BufferCopyKernel;
-use inference_backend_metal::components::F32BufferCopyShape;
+use inference_backend_metal::components::GDNStatePageBatchConfig;
 use inference_backend_metal::components::GDNStatePageBatchRead;
 use inference_backend_metal::components::GDNStatePageBatchReadBuffers;
 use inference_backend_metal::components::GDNStatePageBatchShape;
 use inference_backend_metal::components::GDNStatePageBatchWrite;
 use inference_backend_metal::components::GDNStatePageBatchWriteBuffers;
-use inference_backend_metal::components::GDNStatePageRead;
-use inference_backend_metal::components::GDNStatePageReadBuffers;
-use inference_backend_metal::components::GDNStatePageShape;
-use inference_backend_metal::components::GDNStatePageWrite;
-use inference_backend_metal::components::GDNStatePageWriteBuffers;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
@@ -37,27 +30,15 @@ fn bench_gdn_state_io(c: &mut Criterion) {
     for num_state_io_requests in STATE_IO_REQUEST_COUNTS {
         let fixture = StateIOFixture::new(&device, num_state_io_requests);
         group.throughput(Throughput::Elements(fixture.total_pages() as u64));
-        group.bench_function(format!("restore/legacy/io_requests{num_state_io_requests}"), |b| {
+        group.bench_function(format!("restore/io_requests{num_state_io_requests}"), |b| {
             b.iter(|| {
-                fixture.restore_legacy();
+                fixture.restore();
                 black_box(&fixture.recurrent_state_arena);
             });
         });
-        group.bench_function(format!("restore/batch/io_requests{num_state_io_requests}"), |b| {
+        group.bench_function(format!("publish/io_requests{num_state_io_requests}"), |b| {
             b.iter(|| {
-                fixture.restore_batch();
-                black_box(&fixture.recurrent_state_arena);
-            });
-        });
-        group.bench_function(format!("publish/legacy/io_requests{num_state_io_requests}"), |b| {
-            b.iter(|| {
-                fixture.publish_legacy();
-                black_box(&fixture.pages);
-            });
-        });
-        group.bench_function(format!("publish/batch/io_requests{num_state_io_requests}"), |b| {
-            b.iter(|| {
-                fixture.publish_batch();
+                fixture.publish();
                 black_box(&fixture.pages);
             });
         });
@@ -69,18 +50,17 @@ struct StateIOFixture {
     stream: Stream,
     pages: Buffer,
     recurrent_state_arena: Buffer,
-    legacy_restore: ReplayProgram,
-    batch_restore: ReplayProgram,
-    legacy_publish: ReplayProgram,
-    batch_publish: ReplayProgram,
+    restore: ReplayProgram,
+    publish: ReplayProgram,
     total_pages: usize,
 }
 
 impl StateIOFixture {
     fn new(device: &Device, num_state_io_requests: u32) -> Self {
-        let page_bytes = STATE_PAGE_FLOATS * size_of::<f32>();
-        let recurrent_state_bytes = V_HEADS * V_HEAD_DIM * QK_HEAD_DIM * size_of::<f32>();
-        let conv_state_bytes = QKV_DIM * CONV_STATE_LEN * size_of::<f32>();
+        let config = state_io_config(num_state_io_requests);
+        let page_bytes = config.page_bytes as usize;
+        let recurrent_state_bytes = config.recurrent_state_bytes as usize;
+        let conv_state_bytes = config.conv_state_bytes as usize;
         let recurrent_pages_per_state = recurrent_state_bytes.div_ceil(page_bytes);
         let conv_pages_per_state = conv_state_bytes.div_ceil(page_bytes);
         let recurrent_page_count = num_state_io_requests as usize * recurrent_pages_per_state;
@@ -89,14 +69,7 @@ impl StateIOFixture {
         let stream = Stream::new(device);
         let pages = f32_pattern_buffer(device, total_pages * STATE_PAGE_FLOATS, 0.0001);
         let recurrent_state_arena = Buffer::new_zeroed(device, num_state_io_requests as usize * recurrent_state_bytes);
-        let conv_state = Buffer::new_zeroed(device, num_state_io_requests as usize * conv_state_bytes);
-        let recurrent_scratch = Buffer::new_zeroed(device, recurrent_state_bytes);
-        let conv_scratch = Buffer::new_zeroed(device, conv_state_bytes);
-        let recurrent_page_ids = Buffer::from_slice(device, &(0..recurrent_page_count as u32).collect::<Vec<_>>());
-        let conv_page_ids = Buffer::from_slice(
-            device,
-            &(recurrent_page_count as u32..(recurrent_page_count + conv_page_count) as u32).collect::<Vec<_>>(),
-        );
+        let conv_state_arena = Buffer::new_zeroed(device, num_state_io_requests as usize * conv_state_bytes);
         let page_ids = Buffer::from_slice(
             device,
             &(0..num_state_io_requests as usize)
@@ -110,164 +83,41 @@ impl StateIOFixture {
                 .collect::<Vec<_>>(),
         );
         let state_slots = Buffer::from_slice(device, &(0..num_state_io_requests).collect::<Vec<_>>());
+        let bindings = StateIOBindings {
+            pages: &pages,
+            page_ids: &page_ids,
+            state_slots: &state_slots,
+            recurrent_states: &recurrent_state_arena,
+            conv_states: &conv_state_arena,
+        };
         let fixture = Self {
-            legacy_restore: legacy_restore(
-                &stream,
-                num_state_io_requests,
-                &pages,
-                &recurrent_scratch,
-                &conv_scratch,
-                &recurrent_page_ids,
-                &conv_page_ids,
-                &recurrent_state_arena,
-                &conv_state,
-                recurrent_state_bytes,
-                conv_state_bytes,
-                recurrent_pages_per_state,
-                conv_pages_per_state,
-                device,
-            ),
-            batch_restore: batch_restore(
-                &stream,
-                num_state_io_requests,
-                BatchStateIO {
-                    pages: &pages,
-                    page_ids: &page_ids,
-                    state_slots: &state_slots,
-                    recurrent_states: &recurrent_state_arena,
-                    conv_states: &conv_state,
-                },
-                device,
-            ),
-            legacy_publish: legacy_publish(
-                &stream,
-                num_state_io_requests,
-                &pages,
-                &recurrent_scratch,
-                &conv_scratch,
-                &recurrent_page_ids,
-                &conv_page_ids,
-                &recurrent_state_arena,
-                &conv_state,
-                recurrent_state_bytes,
-                conv_state_bytes,
-                recurrent_pages_per_state,
-                conv_pages_per_state,
-                device,
-            ),
-            batch_publish: batch_publish(
-                &stream,
-                num_state_io_requests,
-                BatchStateIO {
-                    pages: &pages,
-                    page_ids: &page_ids,
-                    state_slots: &state_slots,
-                    recurrent_states: &recurrent_state_arena,
-                    conv_states: &conv_state,
-                },
-                device,
-            ),
+            restore: build_restore_replay(&stream, num_state_io_requests, config, bindings, device),
+            publish: build_publish_replay(&stream, num_state_io_requests, config, bindings, device),
             stream,
             pages,
             recurrent_state_arena,
             total_pages,
         };
-        fixture.restore_legacy();
-        fixture.restore_batch();
-        fixture.publish_legacy();
-        fixture.publish_batch();
+        fixture.restore();
+        fixture.publish();
         fixture
     }
 
     fn total_pages(&self) -> usize {
         self.total_pages
     }
-    fn restore_legacy(&self) {
-        self.stream.submit_replay(&self.legacy_restore).wait();
+
+    fn restore(&self) {
+        self.stream.submit_replay(&self.restore).wait();
     }
-    fn restore_batch(&self) {
-        self.stream.submit_replay(&self.batch_restore).wait();
-    }
-    fn publish_legacy(&self) {
-        self.stream.submit_replay(&self.legacy_publish).wait();
-    }
-    fn publish_batch(&self) {
-        self.stream.submit_replay(&self.batch_publish).wait();
+
+    fn publish(&self) {
+        self.stream.submit_replay(&self.publish).wait();
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn legacy_restore(
-    stream: &Stream,
-    num_state_io_requests: u32,
-    pages: &Buffer,
-    recurrent_scratch: &Buffer,
-    conv_scratch: &Buffer,
-    recurrent_page_ids: &Buffer,
-    conv_page_ids: &Buffer,
-    recurrent_states: &Buffer,
-    conv_states: &Buffer,
-    recurrent_bytes: usize,
-    conv_bytes: usize,
-    recurrent_pages: usize,
-    conv_pages: usize,
-    device: &Device,
-) -> ReplayProgram {
-    let read = GDNStatePageRead::new(device);
-    let copy = F32BufferCopyKernel::new(device);
-    let mut builder = stream.create_replay_program();
-    for state_io_request_index in 0..num_state_io_requests as usize {
-        builder.record(read.invoke(
-            GDNStatePageShape {
-                state_bytes: recurrent_bytes as u32,
-                page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
-            },
-            GDNStatePageReadBuffers {
-                pages,
-                flat_state: recurrent_scratch,
-                page_ids: recurrent_page_ids,
-                page_id_start_index: (state_io_request_index * recurrent_pages) as u32,
-            },
-        ));
-        builder.record(copy.invoke(
-            F32BufferCopyShape {
-                num_values: (recurrent_bytes / size_of::<f32>()) as u32,
-            },
-            F32BufferCopyBuffers {
-                input: recurrent_scratch,
-                output: recurrent_states,
-                input_offset_bytes: 0,
-                output_offset_bytes: state_io_request_index * recurrent_bytes,
-            },
-        ));
-        builder.record(read.invoke(
-            GDNStatePageShape {
-                state_bytes: conv_bytes as u32,
-                page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
-            },
-            GDNStatePageReadBuffers {
-                pages,
-                flat_state: conv_scratch,
-                page_ids: conv_page_ids,
-                page_id_start_index: (state_io_request_index * conv_pages) as u32,
-            },
-        ));
-        builder.record(copy.invoke(
-            F32BufferCopyShape {
-                num_values: (conv_bytes / size_of::<f32>()) as u32,
-            },
-            F32BufferCopyBuffers {
-                input: conv_scratch,
-                output: conv_states,
-                input_offset_bytes: 0,
-                output_offset_bytes: state_io_request_index * conv_bytes,
-            },
-        ));
-    }
-    builder.build()
-}
-
-struct BatchStateIO<'a> {
+#[derive(Clone, Copy)]
+struct StateIOBindings<'a> {
     pages: &'a Buffer,
     page_ids: &'a Buffer,
     state_slots: &'a Buffer,
@@ -275,127 +125,58 @@ struct BatchStateIO<'a> {
     conv_states: &'a Buffer,
 }
 
-fn batch_restore(
+fn build_restore_replay(
     stream: &Stream,
     num_state_io_requests: u32,
-    state_io: BatchStateIO<'_>,
+    config: GDNStatePageBatchConfig,
+    bindings: StateIOBindings<'_>,
     device: &Device,
 ) -> ReplayProgram {
-    let read = GDNStatePageBatchRead::new(device);
+    let read = GDNStatePageBatchRead::new(device, config);
     let mut builder = stream.create_replay_program();
     builder.record(read.invoke(
-        GDNStatePageBatchShape {
-            num_gdn_layers: 1,
-            num_state_io_requests,
-            num_state_slots: num_state_io_requests,
-            page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
-        },
+        GDNStatePageBatchShape { num_state_io_requests },
         GDNStatePageBatchReadBuffers {
-            pages: state_io.pages,
-            recurrent_states: state_io.recurrent_states,
-            conv_states: state_io.conv_states,
-            page_ids: state_io.page_ids,
-            state_slots: state_io.state_slots,
+            pages: bindings.pages,
+            recurrent_states: bindings.recurrent_states,
+            conv_states: bindings.conv_states,
+            page_ids: bindings.page_ids,
+            state_slots: bindings.state_slots,
         },
     ));
     builder.build()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn legacy_publish(
+fn build_publish_replay(
     stream: &Stream,
     num_state_io_requests: u32,
-    pages: &Buffer,
-    recurrent_scratch: &Buffer,
-    conv_scratch: &Buffer,
-    recurrent_page_ids: &Buffer,
-    conv_page_ids: &Buffer,
-    recurrent_states: &Buffer,
-    conv_states: &Buffer,
-    recurrent_bytes: usize,
-    conv_bytes: usize,
-    recurrent_pages: usize,
-    conv_pages: usize,
+    config: GDNStatePageBatchConfig,
+    bindings: StateIOBindings<'_>,
     device: &Device,
 ) -> ReplayProgram {
-    let write = GDNStatePageWrite::new(device);
-    let copy = F32BufferCopyKernel::new(device);
-    let mut builder = stream.create_replay_program();
-    for state_io_request_index in 0..num_state_io_requests as usize {
-        builder.record(copy.invoke(
-            F32BufferCopyShape {
-                num_values: (recurrent_bytes / size_of::<f32>()) as u32,
-            },
-            F32BufferCopyBuffers {
-                input: recurrent_states,
-                output: recurrent_scratch,
-                input_offset_bytes: state_io_request_index * recurrent_bytes,
-                output_offset_bytes: 0,
-            },
-        ));
-        builder.record(write.invoke(
-            GDNStatePageShape {
-                state_bytes: recurrent_bytes as u32,
-                page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
-            },
-            GDNStatePageWriteBuffers {
-                pages,
-                flat_state: recurrent_scratch,
-                page_ids: recurrent_page_ids,
-                page_id_start_index: (state_io_request_index * recurrent_pages) as u32,
-            },
-        ));
-        builder.record(copy.invoke(
-            F32BufferCopyShape {
-                num_values: (conv_bytes / size_of::<f32>()) as u32,
-            },
-            F32BufferCopyBuffers {
-                input: conv_states,
-                output: conv_scratch,
-                input_offset_bytes: state_io_request_index * conv_bytes,
-                output_offset_bytes: 0,
-            },
-        ));
-        builder.record(write.invoke(
-            GDNStatePageShape {
-                state_bytes: conv_bytes as u32,
-                page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
-            },
-            GDNStatePageWriteBuffers {
-                pages,
-                flat_state: conv_scratch,
-                page_ids: conv_page_ids,
-                page_id_start_index: (state_io_request_index * conv_pages) as u32,
-            },
-        ));
-    }
-    builder.build()
-}
-
-fn batch_publish(
-    stream: &Stream,
-    num_state_io_requests: u32,
-    state_io: BatchStateIO<'_>,
-    device: &Device,
-) -> ReplayProgram {
-    let write = GDNStatePageBatchWrite::new(device);
+    let write = GDNStatePageBatchWrite::new(device, config);
     let mut builder = stream.create_replay_program();
     builder.record(write.invoke(
-        GDNStatePageBatchShape {
-            num_gdn_layers: 1,
-            num_state_io_requests,
-            num_state_slots: num_state_io_requests,
-            page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
-        },
+        GDNStatePageBatchShape { num_state_io_requests },
         GDNStatePageBatchWriteBuffers {
-            pages: state_io.pages,
-            recurrent_states: state_io.recurrent_states,
-            conv_states: state_io.conv_states,
-            page_ids: state_io.page_ids,
-            state_slots: state_io.state_slots,
+            pages: bindings.pages,
+            recurrent_states: bindings.recurrent_states,
+            conv_states: bindings.conv_states,
+            page_ids: bindings.page_ids,
+            state_slots: bindings.state_slots,
         },
     ));
     builder.build()
+}
+
+fn state_io_config(num_state_slots: u32) -> GDNStatePageBatchConfig {
+    GDNStatePageBatchConfig {
+        num_gdn_layers: 1,
+        num_state_slots,
+        recurrent_state_bytes: (V_HEADS * V_HEAD_DIM * QK_HEAD_DIM * size_of::<f32>()) as u32,
+        conv_state_bytes: (QKV_DIM * CONV_STATE_LEN * size_of::<f32>()) as u32,
+        page_bytes: (STATE_PAGE_FLOATS * size_of::<f32>()) as u32,
+    }
 }
 
 fn f32_pattern_buffer(device: &Device, len: usize, scale: f32) -> Buffer {

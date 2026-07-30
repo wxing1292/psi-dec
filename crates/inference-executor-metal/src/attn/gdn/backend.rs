@@ -2,20 +2,20 @@ use inference_backend_metal::components::BufferCastBuffers;
 use inference_backend_metal::components::BufferCastConfig;
 use inference_backend_metal::components::BufferCastKernel;
 use inference_backend_metal::components::BufferCastShape;
-use inference_backend_metal::components::GDNCoreBuffers;
-use inference_backend_metal::components::GDNCoreConfig;
-use inference_backend_metal::components::GDNCoreForwardCandidateStateUpdateBuffers;
-use inference_backend_metal::components::GDNCoreKernels;
-use inference_backend_metal::components::GDNCoreShape;
-use inference_backend_metal::components::GDNProjectionSplitBuffers;
-use inference_backend_metal::components::GDNProjectionSplitKernel;
-use inference_backend_metal::components::GDNProjectionSplitShape;
+use inference_backend_metal::components::GDNCompute;
+use inference_backend_metal::components::GDNComputeBuffers;
+use inference_backend_metal::components::GDNComputeConfig;
+use inference_backend_metal::components::GDNComputeShape;
+use inference_backend_metal::components::GDNComputeWithCandidateStateUpdateBuffers;
+use inference_backend_metal::components::GDNQKVABZSplitBuffers;
+use inference_backend_metal::components::GDNQKVABZSplitConfig;
+use inference_backend_metal::components::GDNQKVABZSplitKernel;
+use inference_backend_metal::components::GDNQKVABZSplitShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
@@ -30,9 +30,9 @@ use crate::def::replay_op::ReplayOp;
 pub struct GDNMetalConfig {
     pub group_size: u32,
     pub bits: u32,
-    pub recurrent_v_tile_size: u32,
     pub norm_eps: f32,
     pub input_dtype: Dtype,
+    pub output_dtype: Dtype,
     pub qkvabz_scale_bias_dtype: Dtype,
     pub output_scale_bias_dtype: Dtype,
 }
@@ -41,19 +41,19 @@ impl GDNMetalConfig {
     pub fn validate(self) {
         assert!(matches!(self.group_size, 32 | 64 | 128));
         assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
-        assert!(self.recurrent_v_tile_size > 0);
         assert!(self.norm_eps > 0.0);
-        assert!(matches!(self.input_dtype, Dtype::Bfloat16 | Dtype::Float32));
+        validate_boundary_dtype("input", self.input_dtype);
+        validate_boundary_dtype("output", self.output_dtype);
         assert!(matches!(self.qkvabz_scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
         assert!(matches!(self.output_scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
+}
 
-    pub fn internal_dtype(self) -> Dtype {
-        Dtype::Float32
-    }
-
-    pub fn boundary_dtype(self) -> Dtype {
-        Dtype::Bfloat16
+fn validate_boundary_dtype(name: &str, dtype: Dtype) {
+    match dtype {
+        Dtype::Bfloat16 => {},
+        Dtype::Float32 => todo!("F32 GDN {name} boundary is not supported"),
+        dtype => panic!("unsupported GDN {name} boundary dtype {dtype:?}"),
     }
 }
 
@@ -97,17 +97,36 @@ pub struct GDNInput<'a> {
 /// The caller-owned next-hidden-state buffer returned by one GDN recording.
 pub type GDNOutput<'a> = &'a Buffer;
 
+/// GDN data flow:
+///
+/// ```text
+/// hidden_state (BF16)
+///   -> qkvabz
+///   -> scratch.qkvabz (F32)
+///   -> qkvabz_to_qkv_a_b_z
+///      |- scratch.qkv (F32)
+///      |- scratch.a (F32)
+///      |- scratch.b (F32)
+///      `- scratch.z (F32)
+///             |
+///             v
+///          compute (F32)
+///      short_conv -> ragged_recurrent -> output_norm_gate
+///             |
+///             v
+///      scratch.norm_gated_output (F32)
+///             |
+///             v
+///          output
+///             |
+///             v
+///      next_hidden_state (BF16)
+/// ```
 pub struct GDN {
-    core: GDNCore,
-    config: GDNMetalConfig,
-    qkvabz_projection_qmv: AffineQuantizedMatmulKernel,
-    qkvabz_projection_qmm: AffineQuantizedMatmulKernel,
-    projection_split: GDNProjectionSplitKernel,
-    core_backend: GDNCoreBackend,
-    bf16_to_f32: BufferCastKernel,
-    f32_to_bf16: BufferCastKernel,
-    output_projection_qmv: AffineQuantizedMatmulKernel,
-    output_projection_qmm: AffineQuantizedMatmulKernel,
+    qkvabz: AffineQuantizedMatmul,
+    qkvabz_to_qkv_a_b_z: GDNQKVABZSplitKernel,
+    compute: GDNCompute,
+    output: AffineQuantizedMatmul,
 }
 
 impl GDN {
@@ -116,59 +135,29 @@ impl GDN {
         config.validate();
         let qkvabz_dim = core.qkvabz_dim();
         Self {
-            core: core.clone(),
-            config,
-            qkvabz_projection_qmv: AffineQuantizedMatmulKernel::new(
+            qkvabz: AffineQuantizedMatmul::new(
                 device,
                 affine_config(
                     qkvabz_dim,
                     core.hidden_dim,
                     config.input_dtype,
-                    config.internal_dtype(),
+                    Dtype::Float32,
                     config.qkvabz_scale_bias_dtype,
                     config,
                 ),
-                AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
             ),
-            qkvabz_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_config(
-                    qkvabz_dim,
-                    core.hidden_dim,
-                    config.input_dtype,
-                    config.internal_dtype(),
-                    config.qkvabz_scale_bias_dtype,
-                    config,
-                ),
-                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
-            ),
-            projection_split: GDNProjectionSplitKernel::new(device),
-            core_backend: GDNCoreBackend::new(device, core.clone(), config.recurrent_v_tile_size),
-            bf16_to_f32: BufferCastKernel::new(device, BufferCastConfig::bf16_to_f32()),
-            f32_to_bf16: BufferCastKernel::new(device, BufferCastConfig::f32_to_bf16()),
-            output_projection_qmv: AffineQuantizedMatmulKernel::new(
+            qkvabz_to_qkv_a_b_z: GDNQKVABZSplitKernel::new(device, qkvabz_split_config(&core)),
+            compute: GDNCompute::new(device, compute_config(&core, config)),
+            output: AffineQuantizedMatmul::new(
                 device,
                 affine_config(
                     core.hidden_dim,
                     core.v_dim(),
-                    config.boundary_dtype(),
-                    config.boundary_dtype(),
+                    Dtype::Float32,
+                    config.output_dtype,
                     config.output_scale_bias_dtype,
                     config,
                 ),
-                AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-            ),
-            output_projection_qmm: AffineQuantizedMatmulKernel::new(
-                device,
-                affine_config(
-                    core.hidden_dim,
-                    core.v_dim(),
-                    config.boundary_dtype(),
-                    config.boundary_dtype(),
-                    config.output_scale_bias_dtype,
-                    config,
-                ),
-                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
             ),
         }
     }
@@ -204,32 +193,11 @@ impl ReplayLayer for GDN {
         let batch_metadata = input.batch_metadata;
         let state = input.state;
         let weights = input.weights;
-        let qkvabz_projection_input = match self.config.input_dtype {
-            Dtype::Bfloat16 => hidden_state,
-            Dtype::Float32 => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.bf16_to_f32.invoke(
-                        BufferCastShape {
-                            num_values: shape
-                                .num_tokens
-                                .checked_mul(self.core.hidden_dim.try_into().expect("GDN hidden_dim must fit u32"))
-                                .expect("GDN hidden-state element count must fit u32"),
-                        },
-                        BufferCastBuffers {
-                            input: hidden_state,
-                            output: scratch.hidden_state_f32,
-                        },
-                    ),
-                ));
-                scratch.hidden_state_f32
-            },
-            dtype => panic!("unsupported GDN input dtype {dtype:?}"),
-        };
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkvabz_projection(shape).invoke(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkvabz.invoke(
             shape.num_tokens.try_into().expect("GDN token count must fit i32"),
             scratch.qkvabz,
             0,
-            qkvabz_projection_input,
+            hidden_state,
             0,
             weights.qkvabz_weight,
             0,
@@ -238,18 +206,20 @@ impl ReplayLayer for GDN {
             weights.qkvabz_biases,
             0,
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.projection_split.invoke(
-            self.projection_split_shape(shape),
-            GDNProjectionSplitBuffers {
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkvabz_to_qkv_a_b_z.invoke(
+            GDNQKVABZSplitShape {
+                num_tokens: shape.num_tokens,
+            },
+            GDNQKVABZSplitBuffers {
                 qkvabz: scratch.qkvabz,
-                projected_qkv: scratch.projected_qkv,
+                qkv: scratch.qkv,
                 a: scratch.a,
                 b: scratch.b,
                 z: scratch.z,
             },
         )));
-        let core_buffers = GDNCoreBuffers {
-            projected_qkv: scratch.projected_qkv,
+        let compute_buffers = GDNComputeBuffers {
+            qkv: scratch.qkv,
             a: scratch.a,
             b: scratch.b,
             z: scratch.z,
@@ -268,54 +238,26 @@ impl ReplayLayer for GDN {
             recurrent_state_arena_offset_bytes: state.recurrent_state_arena_offset_bytes,
             conv_qkv: scratch.conv_qkv,
             recurrent_output: scratch.recurrent_output,
-            pre_output_hidden_states: scratch.pre_output_hidden_states,
+            norm_gated_output: scratch.norm_gated_output,
         };
         if input.materialize_candidate_states {
-            recorder.record_with_barrier_before(ReplayOp::opaque(
-                self.core_backend.kernels.invoke_forward_candidate_state_update(
-                    self.core_backend.backend_shape(shape),
-                    GDNCoreForwardCandidateStateUpdateBuffers {
-                        core: core_buffers,
-                        flat_candidate_state_slots: batch_metadata.flat_candidate_state_slots(),
-                    },
-                    self.core.q_scale,
-                    self.config.norm_eps,
-                ),
-            ));
-        } else {
-            recorder.record_with_barrier_before(ReplayOp::opaque(self.core_backend.kernels.invoke(
-                self.core_backend.backend_shape(shape),
-                core_buffers,
-                self.core.q_scale,
-                self.config.norm_eps,
+            recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_with_candidate_state_update(
+                compute_shape(shape),
+                GDNComputeWithCandidateStateUpdateBuffers {
+                    compute: compute_buffers,
+                    flat_candidate_state_slots: batch_metadata.flat_candidate_state_slots(),
+                },
             )));
+        } else {
+            recorder.record_with_barrier_before(ReplayOp::opaque(
+                self.compute.invoke(compute_shape(shape), compute_buffers),
+            ));
         }
-        let output_projection_input = match self.config.boundary_dtype() {
-            Dtype::Bfloat16 => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.f32_to_bf16.invoke(
-                        BufferCastShape {
-                            num_values: shape
-                                .num_tokens
-                                .checked_mul(u32::try_from(self.core.v_dim()).expect("GDN v_dim must fit u32"))
-                                .expect("GDN output element count must fit u32"),
-                        },
-                        BufferCastBuffers {
-                            input: scratch.pre_output_hidden_states,
-                            output: scratch.pre_output_hidden_states_bf16,
-                        },
-                    ),
-                ));
-                scratch.pre_output_hidden_states_bf16
-            },
-            Dtype::Float32 => scratch.pre_output_hidden_states,
-            dtype => panic!("unsupported GDN boundary dtype {dtype:?}"),
-        };
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.output_projection(shape).invoke(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.output.invoke(
             shape.num_tokens.try_into().expect("GDN token count must fit i32"),
             next_hidden_state,
             0,
-            output_projection_input,
+            scratch.norm_gated_output,
             0,
             weights.output_weight,
             0,
@@ -328,77 +270,33 @@ impl ReplayLayer for GDN {
     }
 }
 
-impl GDN {
-    fn qkvabz_projection(&self, shape: GDNReplayShape) -> &AffineQuantizedMatmulKernel {
-        if shape.num_tokens >= qmv_batch_limit(self.core.hidden_dim, self.core.qkvabz_dim()) {
-            &self.qkvabz_projection_qmm
-        } else {
-            &self.qkvabz_projection_qmv
-        }
-    }
-
-    fn output_projection(&self, shape: GDNReplayShape) -> &AffineQuantizedMatmulKernel {
-        if shape.num_tokens >= qmv_batch_limit(self.core.v_dim(), self.core.hidden_dim) {
-            &self.output_projection_qmm
-        } else {
-            &self.output_projection_qmv
-        }
-    }
-
-    fn projection_split_shape(&self, shape: GDNReplayShape) -> GDNProjectionSplitShape {
-        match self.config.internal_dtype() {
-            Dtype::Float32 => {
-                GDNProjectionSplitShape::f32(
-                    shape.num_tokens,
-                    self.core.qkv_dim().try_into().expect("GDN qkv_dim must fit u32"),
-                    self.core.num_v_heads.try_into().expect("GDN num_v_heads must fit u32"),
-                    self.core.v_dim().try_into().expect("GDN v_dim must fit u32"),
-                )
-            },
-            Dtype::Bfloat16 => {
-                GDNProjectionSplitShape::bf16_to_f32(
-                    shape.num_tokens,
-                    self.core.qkv_dim().try_into().expect("GDN qkv_dim must fit u32"),
-                    self.core.num_v_heads.try_into().expect("GDN num_v_heads must fit u32"),
-                    self.core.v_dim().try_into().expect("GDN v_dim must fit u32"),
-                )
-            },
-            dtype => panic!("unsupported GDN internal dtype {dtype:?}"),
-        }
+fn compute_config(core: &GDNCore, config: GDNMetalConfig) -> GDNComputeConfig {
+    GDNComputeConfig {
+        num_qk_heads: core.num_qk_heads.try_into().expect("GDN query/key heads must fit u32"),
+        qk_head_dim: core.qk_head_dim.try_into().expect("GDN qk_head_dim must fit u32"),
+        num_v_heads: core.num_v_heads.try_into().expect("GDN num_v_heads must fit u32"),
+        v_head_dim: core.v_head_dim.try_into().expect("GDN v_head_dim must fit u32"),
+        conv_kernel_size: core
+            .conv_kernel_size
+            .try_into()
+            .expect("GDN conv_kernel_size must fit u32"),
+        q_scale: core.q_scale,
+        norm_eps: config.norm_eps,
     }
 }
 
-struct GDNCoreBackend {
-    core: GDNCore,
-    kernels: GDNCoreKernels,
+fn compute_shape(shape: GDNReplayShape) -> GDNComputeShape {
+    GDNComputeShape {
+        num_reqs: shape.num_reqs,
+        num_tokens: shape.num_tokens,
+    }
 }
 
-impl GDNCoreBackend {
-    fn new(device: &Device, core: GDNCore, recurrent_v_dim_tile_size: u32) -> Self {
-        core.validate();
-        let config = GDNCoreConfig {
-            num_qk_heads: core.num_qk_heads.try_into().expect("GDN query/key heads must fit u32"),
-            qk_head_dim: core.qk_head_dim.try_into().expect("GDN qk_head_dim must fit u32"),
-            num_v_heads: core.num_v_heads.try_into().expect("GDN num_v_heads must fit u32"),
-            v_head_dim: core.v_head_dim.try_into().expect("GDN v_head_dim must fit u32"),
-            conv_kernel_size: core
-                .conv_kernel_size
-                .try_into()
-                .expect("GDN conv_kernel_size must fit u32"),
-            v_dim_tile_size: recurrent_v_dim_tile_size,
-        };
-        Self {
-            core,
-            kernels: GDNCoreKernels::new(device, config),
-        }
-    }
-
-    fn backend_shape(&self, shape: GDNReplayShape) -> GDNCoreShape {
-        GDNCoreShape {
-            num_reqs: shape.num_reqs,
-            num_tokens: shape.num_tokens,
-        }
-    }
+fn qkvabz_split_config(core: &GDNCore) -> GDNQKVABZSplitConfig {
+    let qkv_dim = core.qkv_dim().try_into().expect("GDN qkv_dim must fit u32");
+    let num_v_heads = core.num_v_heads.try_into().expect("GDN num_v_heads must fit u32");
+    let v_dim = core.v_dim().try_into().expect("GDN v_dim must fit u32");
+    GDNQKVABZSplitConfig::new(qkv_dim, num_v_heads, v_dim)
 }
 
 fn affine_config(
@@ -417,15 +315,5 @@ fn affine_config(
         input_dtype,
         output_dtype,
         scale_bias_dtype,
-    }
-}
-
-fn qmv_batch_limit(input_dim: usize, output_dim: usize) -> u32 {
-    if input_dim <= 2048 && output_dim <= 2048 {
-        18
-    } else if input_dim <= 4096 && output_dim <= 4096 {
-        12
-    } else {
-        10
     }
 }

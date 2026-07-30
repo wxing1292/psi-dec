@@ -685,10 +685,9 @@ Use this order for the marked follow-up work:
 | ---: | --- | --- |
 | 1 | Main multi-row verification investigation | Separate Main body, GatherUnembed, and sparse rejection evidence without adding a submission boundary. |
 | 2 | Deterministic DSpark end-to-end validation | Re-run throughput, proposal count, accepted-token count, acceptance efficiency, and stage timing after the retained proposal and Main changes. |
-| 3 | Deferred mixed-dtype affine ownership | Move GDN projections to backend-owned selection without adding QMV/QMM or tile controls to model APIs. |
-| 4 | Confidence and global scheduling | Execute the confidence head first. Add variable proposal lengths only when runtime scheduling owns the cross-request budget. |
-| 5 | Checkpoint-triggered DSpark variants | Add gated attention or other layout/head variants only for a real supported checkpoint. |
-| 6 | Replay and overlap evolution | Review these boundaries only after the fixed-block lifecycle and all in-flight owners are stable. |
+| 3 | Confidence and global scheduling | Execute the confidence head first. Add variable proposal lengths only when runtime scheduling owns the cross-request budget. |
+| 4 | Checkpoint-triggered DSpark variants | Add gated attention or other layout/head variants only for a real supported checkpoint. |
+| 5 | Replay and overlap evolution | Review these boundaries only after the fixed-block lifecycle and all in-flight owners are stable. |
 
 Items in a later row must not block an earlier row unless new correctness evidence identifies a dependency.
 
@@ -711,16 +710,14 @@ It must report proposal count, accepted-token count, acceptance efficiency, and 
 After a retained change, re-run the deterministic service comparison.
 Do not replace the current deployment verdict with isolated component timing.
 
-### Deferred mixed-dtype affine ownership
+### GDN adaptive affine ownership
 
-Future work: Extend adaptive affine selection for GDN mixed-dtype projections.
+Completed: GDN uses the adaptive affine owner for both projections.
 
-`Qwen35MTPEmbed` and `Qwen3xDSparkMainFeatureProjector` already use the adaptive affine owner.
-GDN remains the unsupported dtype case.
-
-The GDN `qkvabz` projection uses F32 input, BF16 affine parameters, and F32 output.
-The GDN layer casts its BF16 model-boundary input to F32 before this projection.
-The GDN output projection uses BF16 input, affine parameters, and output.
+The GDN `qkvabz` projection uses BF16 input, BF16 affine parameters, and F32 output.
+The GDN output projection uses F32 input, BF16 affine parameters, and BF16 output.
+Both projections perform the boundary conversion within `AffineQuantizedMatmul`. GDN does not record a separate buffer
+cast.
 
 `AffineQuantizedMatmulConfig` must provide these fixed workload facts:
 
@@ -738,21 +735,37 @@ output_dtype
 Metal buffers do not carry a tensor dtype.
 The model executor must provide each dtype.
 It must not provide a QMV/QMM family or tile selection.
-The backend must derive the supported kernel set from the dtype signature.
+The backend derives the supported kernel set from the dtype signature.
 It must select the kernel family and tile from the complete workload facts.
 
-The shared adaptive affine owner currently accepts only one common dtype.
-Extend it before migrating GDN.
-Use a private backend representation for the actual kernel capability sets.
-The same-dtype set can contain the tuned QMV and QMM BM8/BN32, BM16/BN32, and BM32/BN32 kernels.
-The first mixed-dtype set can contain the existing mixed QMV and QMM BM32/BN32 kernels.
-Add mixed QMM BM8/BN32 or BM16/BN32 kernels only after correctness coverage and crossover evidence exist.
+The shared adaptive affine owner supports all 27 combinations of F32, F16, and BF16 input, scale/bias, and output
+data types.
+QMV BN8/BK32 and QMM BM8/BN32, BM16/BN32, and BM32/BN32 provide this capability.
+QMV Quad BN64 remains a same-dtype specialization for its supported shapes.
+The adaptive owner falls back to QMV BN8/BK32 when QMV Quad BN64 is not valid.
 Do not add an executor-visible mixed-dtype mode.
-Do not weaken GDN precision to fit the current same-dtype adaptive API.
+Do not weaken GDN precision.
 
-Keep the backend extension and the GDN migration as separate reviewable changes.
-The backend change must include mixed-dtype reference coverage and exact-path benchmark controls.
-The GDN change must remove its manual QMV/QMM selection.
+The backend extension and the GDN migration remain separate reviewable changes.
+The backend extension includes exhaustive dtype-combination reference coverage and exact-path benchmark controls.
+The GDN migration removes its manual QMV/QMM selection.
+
+An alternating full-replay benchmark compared the retained manual QMV/BM32 policy with adaptive selection.
+Both runs used one request, context length 0, 30 warmup iterations, 100 measured iterations, and five runs.
+
+| Rows | Manual QMV/BM32 | Adaptive | Change |
+| ---: | ---: | ---: | ---: |
+| 1 | 324.055 us | 323.548 us | -0.2% |
+| 6 | 463.776 us | 426.542 us | -8.0% |
+| 8 | 520.372 us | 443.192 us | -14.8% |
+| 10 | 576.680 us | 515.592 us | -10.6% |
+| 12 | 660.710 us | 575.605 us | -12.9% |
+| 16 | 707.483 us | 575.712 us | -18.6% |
+| 18 | 733.124 us | 716.686 us | -2.2% |
+| 32 | 809.142 us | 813.413 us | +0.5% |
+
+Rows 1, 18, and 32 use the same kernel family in both policies and remain within run-to-run variance.
+Rows 6 through 16 benefit from the BM8/BN32 and BM16/BN32 candidates.
 
 The fused DSpark Markov map combines W1 lookup, W2 projection, corrected-logit addition, and vocabulary-tile Top-K.
 Do not replace its W2 stage mechanically with a standalone affine dispatch.

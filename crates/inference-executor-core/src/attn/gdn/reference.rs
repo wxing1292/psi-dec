@@ -14,7 +14,7 @@ pub fn gdn_short_conv_reference(
     core: &GDNCore,
     cu_tokens: &[u32],
     source_conv_state: &[f32],
-    projected_qkv: &[f32],
+    qkv: &[f32],
     conv_weight: &[f32],
 ) -> GDNShortConvReference {
     core.validate();
@@ -22,7 +22,7 @@ pub fn gdn_short_conv_reference(
     let num_tokens = *cu_tokens.last().unwrap() as usize;
     let conv_state_len = core.conv_state_len();
     assert_eq!(source_conv_state.len(), num_reqs * core.qkv_dim() * conv_state_len);
-    assert_eq!(projected_qkv.len(), num_tokens * core.qkv_dim());
+    assert_eq!(qkv.len(), num_tokens * core.qkv_dim());
     assert_eq!(conv_weight.len(), core.qkv_dim() * core.conv_kernel_size);
 
     let mut conv_qkv = vec![0.0; num_tokens * core.qkv_dim()];
@@ -42,8 +42,7 @@ pub fn gdn_short_conv_reference(
                         source_conv_state
                             [(req_index * core.qkv_dim() + qkv_channel_index) * conv_state_len + state_index]
                     } else {
-                        projected_qkv
-                            [((flat_token_begin + sequence_index as usize) * core.qkv_dim()) + qkv_channel_index]
+                        qkv[((flat_token_begin + sequence_index as usize) * core.qkv_dim()) + qkv_channel_index]
                     };
                     acc += x * conv_weight[qkv_channel_index * core.conv_kernel_size + kernel_index];
                 }
@@ -58,7 +57,7 @@ pub fn gdn_short_conv_reference(
                     source_conv_state
                         [(req_index * core.qkv_dim() + qkv_channel_index) * conv_state_len + source_state_index]
                 } else {
-                    projected_qkv[((flat_token_begin + sequence_index as usize) * core.qkv_dim()) + qkv_channel_index]
+                    qkv[((flat_token_begin + sequence_index as usize) * core.qkv_dim()) + qkv_channel_index]
                 };
                 next_conv_state[(req_index * core.qkv_dim() + qkv_channel_index) * conv_state_len + state_index] = x;
             }

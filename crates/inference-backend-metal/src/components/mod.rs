@@ -5,13 +5,12 @@
 //! They should not own model layer order, scheduler policy, or runtime page
 //! allocation.
 //!
-//! Components use `FooConfig` only when model/kernel configuration affects
-//! reusable kernel construction, operator specialization, weight layout, or
-//! object compatibility. `FooShape` owns invocation-time extents, scalar
-//! parameters, and runtime metadata. `FooBuffers` / `FooWeights` / `FooScratch`
-//! bind storage, `FooKernel` / `FooKernels` owns reusable compiled Metal
-//! execution state, and `FooInvocation` records one execution into a stream
-//! batch.
+//! `FooConfig` owns fixed workload facts. These facts include dtype,
+//! specialization constants, model dimensions, and fixed scalar parameters.
+//! `FooShape` owns invocation-time extents and runtime metadata.
+//! `FooBuffers` / `FooWeights` / `FooScratch` bind storage. `FooKernel` /
+//! `FooKernels` owns reusable compiled Metal execution state. `FooInvocation`
+//! records one execution into a stream batch.
 
 fn checked_product(name: &str, factors: &[usize]) -> usize {
     factors
@@ -87,29 +86,26 @@ pub use quantized_embedding::QuantizedEmbeddingConfig;
 pub use quantized_embedding::QuantizedEmbeddingKernel;
 pub use quantized_embedding::QuantizedEmbeddingShape;
 
-mod gdn_attention;
-pub use gdn_attention::GDNCoreBuffers;
-pub use gdn_attention::GDNCoreConfig;
-pub use gdn_attention::GDNCoreForwardCandidateStateUpdateBuffers;
-pub use gdn_attention::GDNCoreKernels;
-pub use gdn_attention::GDNCoreShape;
+mod gdn_compute;
+pub use gdn_compute::GDNCompute;
+pub use gdn_compute::GDNComputeBuffers;
+pub use gdn_compute::GDNComputeConfig;
+pub use gdn_compute::GDNComputeShape;
+pub use gdn_compute::GDNComputeWithCandidateStateUpdateBuffers;
 
-mod gdn_projection;
-pub use gdn_projection::GDNProjectionSplitBuffers;
-pub use gdn_projection::GDNProjectionSplitKernel;
-pub use gdn_projection::GDNProjectionSplitShape;
+mod gdn_qkvabz_split;
+pub use gdn_qkvabz_split::GDNQKVABZSplitBuffers;
+pub use gdn_qkvabz_split::GDNQKVABZSplitConfig;
+pub use gdn_qkvabz_split::GDNQKVABZSplitKernel;
+pub use gdn_qkvabz_split::GDNQKVABZSplitShape;
 
 mod gdn_state_pages;
+pub use gdn_state_pages::GDNStatePageBatchConfig;
 pub use gdn_state_pages::GDNStatePageBatchRead;
 pub use gdn_state_pages::GDNStatePageBatchReadBuffers;
 pub use gdn_state_pages::GDNStatePageBatchShape;
 pub use gdn_state_pages::GDNStatePageBatchWrite;
 pub use gdn_state_pages::GDNStatePageBatchWriteBuffers;
-pub use gdn_state_pages::GDNStatePageRead;
-pub use gdn_state_pages::GDNStatePageReadBuffers;
-pub use gdn_state_pages::GDNStatePageShape;
-pub use gdn_state_pages::GDNStatePageWrite;
-pub use gdn_state_pages::GDNStatePageWriteBuffers;
 
 mod gqa_attention;
 pub use gqa_attention::GQAActivationGateBuffers;

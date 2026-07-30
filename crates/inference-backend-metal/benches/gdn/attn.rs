@@ -5,11 +5,11 @@ use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
 use half::bf16;
-use inference_backend_metal::components::GDNCoreBuffers;
-use inference_backend_metal::components::GDNCoreConfig;
-use inference_backend_metal::components::GDNCoreForwardCandidateStateUpdateBuffers;
-use inference_backend_metal::components::GDNCoreKernels;
-use inference_backend_metal::components::GDNCoreShape;
+use inference_backend_metal::components::GDNCompute;
+use inference_backend_metal::components::GDNComputeBuffers;
+use inference_backend_metal::components::GDNComputeConfig;
+use inference_backend_metal::components::GDNComputeShape;
+use inference_backend_metal::components::GDNComputeWithCandidateStateUpdateBuffers;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
@@ -40,7 +40,7 @@ fn bench_gdn_attn(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     fixture.run_with_state_replay();
-                    black_box(&fixture.pre_output_hidden_states);
+                    black_box(&fixture.norm_gated_output);
                 });
             },
         );
@@ -61,24 +61,25 @@ fn bench_gdn_attn(c: &mut Criterion) {
 struct GDNFixture {
     stream: Stream,
     recurrent_state_arena: Buffer,
-    pre_output_hidden_states: Buffer,
+    norm_gated_output: Buffer,
     with_state_replay: ReplayProgram,
     forward_candidate_state_update_replay: ReplayProgram,
 }
 
 impl GDNFixture {
     fn new(device: &Device, batch: u32, tokens: u32) -> Self {
-        let shape = GDNCoreShape {
+        let shape = GDNComputeShape {
             num_reqs: batch,
             num_tokens: batch * tokens,
         };
-        let config = GDNCoreConfig {
+        let config = GDNComputeConfig {
             num_qk_heads: GDN_QK_HEADS,
             qk_head_dim: GDN_QK_HEAD_DIM,
             num_v_heads: GDN_V_HEADS,
             v_head_dim: GDN_V_HEAD_DIM,
             conv_kernel_size: GDN_CONV_KERNEL_SIZE,
-            v_dim_tile_size: 8,
+            q_scale: 1.0 / (GDN_QK_HEAD_DIM as f32).sqrt(),
+            norm_eps: 1.0e-6,
         };
         let cu_token_values = (0..=shape.num_reqs)
             .map(|req_index| (req_index * tokens) as i32)
@@ -91,9 +92,8 @@ impl GDNFixture {
         let state_slot_count = shape.num_reqs * 2 + shape.num_tokens;
 
         let stream = Stream::new(device);
-        let kernels = GDNCoreKernels::new(device, config);
-        let q_scale = 1.0 / (config.qk_head_dim as f32).sqrt();
-        let projected_qkv = f32_pattern_buffer(device, config.num_qkv_values(shape), 0.001);
+        let kernels = GDNCompute::new(device, config);
+        let qkv = f32_pattern_buffer(device, config.num_qkv_values(shape), 0.001);
         let a = f32_pattern_buffer(device, shape.num_tokens as usize * config.num_v_heads as usize, 0.002);
         let b = f32_pattern_buffer(device, shape.num_tokens as usize * config.num_v_heads as usize, -0.001);
         let z = f32_pattern_buffer(device, config.num_recurrent_output_values(shape), 0.0015);
@@ -121,10 +121,10 @@ impl GDNFixture {
         );
         let conv_qkv = Buffer::new_zeroed(device, config.num_qkv_values(shape) * size_of::<f32>());
         let recurrent_output = Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<f32>());
-        let pre_output_hidden_states =
+        let norm_gated_output =
             Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<f32>());
-        let buffers = GDNCoreBuffers {
-            projected_qkv: &projected_qkv,
+        let buffers = GDNComputeBuffers {
+            qkv: &qkv,
             a: &a,
             b: &b,
             z: &z,
@@ -143,23 +143,16 @@ impl GDNFixture {
             recurrent_state_arena_offset_bytes: 0,
             conv_qkv: &conv_qkv,
             recurrent_output: &recurrent_output,
-            pre_output_hidden_states: &pre_output_hidden_states,
+            norm_gated_output: &norm_gated_output,
         };
-        let with_state_replay = build_gdn_with_state_replay(&stream, &kernels, shape, buffers, q_scale, 1.0e-6);
-        let forward_candidate_state_update_replay = build_gdn_forward_candidate_state_update_replay(
-            &stream,
-            &kernels,
-            shape,
-            buffers,
-            &candidate_dst_slot_ids,
-            q_scale,
-            1.0e-6,
-        );
+        let with_state_replay = build_gdn_with_state_replay(&stream, &kernels, shape, buffers);
+        let forward_candidate_state_update_replay =
+            build_gdn_forward_candidate_state_update_replay(&stream, &kernels, shape, buffers, &candidate_dst_slot_ids);
 
         let fixture = Self {
             stream,
             recurrent_state_arena,
-            pre_output_hidden_states,
+            norm_gated_output,
             with_state_replay,
             forward_candidate_state_update_replay,
         };
@@ -181,35 +174,29 @@ impl GDNFixture {
 
 fn build_gdn_with_state_replay(
     stream: &Stream,
-    kernels: &GDNCoreKernels,
-    shape: GDNCoreShape,
-    buffers: GDNCoreBuffers<'_>,
-    q_scale: f32,
-    eps: f32,
+    kernels: &GDNCompute,
+    shape: GDNComputeShape,
+    buffers: GDNComputeBuffers<'_>,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke(shape, buffers, q_scale, eps));
+    builder.record(kernels.invoke(shape, buffers));
     builder.build()
 }
 
 fn build_gdn_forward_candidate_state_update_replay(
     stream: &Stream,
-    kernels: &GDNCoreKernels,
-    shape: GDNCoreShape,
-    buffers: GDNCoreBuffers<'_>,
+    kernels: &GDNCompute,
+    shape: GDNComputeShape,
+    buffers: GDNComputeBuffers<'_>,
     candidate_dst_slot_ids: &Buffer,
-    q_scale: f32,
-    eps: f32,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_forward_candidate_state_update(
+    builder.record(kernels.invoke_with_candidate_state_update(
         shape,
-        GDNCoreForwardCandidateStateUpdateBuffers {
-            core: buffers,
+        GDNComputeWithCandidateStateUpdateBuffers {
+            compute: buffers,
             flat_candidate_state_slots: candidate_dst_slot_ids,
         },
-        q_scale,
-        eps,
     ));
     builder.build()
 }
