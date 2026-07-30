@@ -25,14 +25,14 @@ use crate::model::qwen::v3_x::layer::Qwen3xGQA;
 use crate::model::qwen::v3_x::layer::Qwen3xMoE;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
-use crate::model::residual::Residual;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::residual_add::ResidualAdd;
+use crate::model::rms_norm::RMSNorm;
 
 pub struct Qwen35MTPLayer {
-    input_norm: RmsNorm,
+    input_norm: RMSNorm,
     attention: Qwen3xGQA,
-    residual: Residual,
-    post_attention_norm: RmsNorm,
+    residual_add: ResidualAdd,
+    post_attention_norm: RMSNorm,
     mlp: Qwen35MTPMLP,
     scratch: Rc<Qwen35MTPLayerScratch>,
 }
@@ -103,15 +103,15 @@ impl Qwen35MTPLayer {
         let eps = config.text_config.rms_norm_eps;
         let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
         let layer = Self {
-            input_norm: RmsNorm::new(
+            input_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 eps,
                 remove_qwen3x_norm_weight(device, &mut tensors, &input_norm_weight, &[hidden_dim])?,
             ),
             attention,
-            residual: Residual::new(device),
-            post_attention_norm: RmsNorm::new(
+            residual_add: ResidualAdd::new(device),
+            post_attention_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 eps,
@@ -151,13 +151,12 @@ impl ReplayLayer for Qwen35MTPLayer {
             input.pages,
             input.gqa,
         );
-        self.residual.record(
+        self.residual_add.record(
             recorder,
             num_values,
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
-            None,
         );
         self.post_attention_norm.record(
             recorder,
@@ -171,13 +170,12 @@ impl ReplayLayer for Qwen35MTPLayer {
             &self.scratch.branch_output,
             input.num_tokens,
         );
-        self.residual.record(
+        self.residual_add.record(
             recorder,
             num_values,
             &self.scratch.post_attention_hidden,
             &self.scratch.branch_output,
             &self.scratch.residual_output,
-            None,
         );
         &self.scratch.residual_output
     }

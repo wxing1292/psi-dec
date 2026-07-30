@@ -20,7 +20,7 @@ use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
 pub mod embed;
@@ -28,7 +28,7 @@ pub mod layer;
 
 pub struct Qwen35MTP {
     layer: Qwen35MTPLayer,
-    output_norm: RmsNorm,
+    output_norm: RMSNorm,
     request_page_table: Rc<crate::attn::gqa::request_page_table::GQARequestPageTable>,
 }
 
@@ -74,7 +74,7 @@ impl Qwen35MTP {
         assert!(tensors.is_empty(), "qwen3.5 MTP must consume its final norm tensor map");
         Ok(Self {
             layer,
-            output_norm: RmsNorm::new(device, hidden_dim, config.text_config.rms_norm_eps, final_norm_weight),
+            output_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps, final_norm_weight),
             request_page_table: Rc::clone(gqa_state.request_page_table()),
         })
     }

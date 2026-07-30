@@ -1,6 +1,6 @@
 use inference_backend_metal::components::RMSNormInvocation;
-use inference_backend_metal::components::ResidualCaptureTarget;
-use inference_backend_metal::components::ResidualInvocation;
+use inference_backend_metal::components::ResidualAddCaptureTarget;
+use inference_backend_metal::components::ResidualAddInvocation;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
@@ -125,7 +125,7 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
-    pub fn residual_add(invocation: ResidualInvocation<'a>) -> Self {
+    pub fn residual_add(invocation: ResidualAddInvocation<'a>) -> Self {
         Self {
             inner: inference_backend_metal::components::ReplayOp::residual_add(invocation),
         }
@@ -140,7 +140,10 @@ impl<'a> ReplayOp<'a> {
     /// checks are delayed until fusion because this wrapper does not own the
     /// RMSNorm shape or fused buffers. Unsupported vec4 destination alignment
     /// panics instead of falling back to a more generic kernel.
-    pub fn residual_add_with_capture(invocation: ResidualInvocation<'a>, capture: ResidualCaptureTarget<'a>) -> Self {
+    pub fn residual_add_with_capture(
+        invocation: ResidualAddInvocation<'a>,
+        capture: ResidualAddCaptureTarget<'a>,
+    ) -> Self {
         Self {
             inner: inference_backend_metal::components::ReplayOp::residual_add_with_capture(invocation, capture),
         }

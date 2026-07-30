@@ -183,18 +183,21 @@ pub use gqa_norm_rope::GQANormRopeConfig;
 pub use gqa_norm_rope::GQANormRopeKernel;
 pub use gqa_norm_rope::GQANormRopeShape;
 
-mod residual;
-pub use residual::ResidualBuffers;
-pub use residual::ResidualCaptureTarget;
-pub use residual::ResidualInvocation;
-pub use residual::ResidualKernel;
-pub use residual::ResidualShape;
+mod residual_add;
+pub use residual_add::ResidualAddBuffers;
+pub use residual_add::ResidualAddCaptureTarget;
+pub use residual_add::ResidualAddConfig;
+pub use residual_add::ResidualAddInvocation;
+pub use residual_add::ResidualAddKernel;
+pub use residual_add::ResidualAddShape;
 
-mod residual_rms_norm;
-pub use residual_rms_norm::ResidualRMSNormBuffers;
-pub use residual_rms_norm::ResidualRMSNormInvocation;
-pub use residual_rms_norm::ResidualRMSNormKernel;
-pub use residual_rms_norm::ResidualRMSNormShape;
+mod residual_add_rms_norm;
+pub use residual_add_rms_norm::ResidualAddRMSNormBuffers;
+pub use residual_add_rms_norm::ResidualAddRMSNormConfig;
+pub use residual_add_rms_norm::ResidualAddRMSNormInvocation;
+pub use residual_add_rms_norm::ResidualAddRMSNormKernel;
+pub use residual_add_rms_norm::ResidualAddRMSNormKernelKind;
+pub use residual_add_rms_norm::ResidualAddRMSNormShape;
 
 mod row_gather;
 pub use row_gather::RowGatherBuffers;
@@ -207,6 +210,7 @@ pub use replay::ReplayRecorder;
 
 mod rms_norm;
 pub use rms_norm::RMSNormBuffers;
+pub use rms_norm::RMSNormConfig;
 pub use rms_norm::RMSNormInvocation;
 pub use rms_norm::RMSNormKernel;
 pub use rms_norm::RMSNormShape;

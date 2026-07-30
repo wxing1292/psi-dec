@@ -1,10 +1,10 @@
 use crate::components::RMSNormInvocation;
-use crate::components::ResidualInvocation;
-use crate::components::residual::ResidualCaptureReplayOp;
-use crate::components::residual::ResidualCaptureTarget;
-use crate::components::residual::ResidualReplayOp;
-use crate::components::residual_rms_norm::ResidualCaptureRMSNormReplayInvocation;
-use crate::components::residual_rms_norm::ResidualRMSNormReplayInvocation;
+use crate::components::ResidualAddInvocation;
+use crate::components::residual_add::ResidualAddCaptureReplayOp;
+use crate::components::residual_add::ResidualAddCaptureTarget;
+use crate::components::residual_add::ResidualAddReplayOp;
+use crate::components::residual_add_rms_norm::ResidualAddCaptureRMSNormReplayInvocation;
+use crate::components::residual_add_rms_norm::ResidualAddRMSNormReplayInvocation;
 use crate::components::rms_norm::RMSNormReplayOp;
 use crate::metal::Operator;
 use crate::metal::ReplayProgram;
@@ -43,15 +43,15 @@ impl ReplayRecorder {
             },
             ReplayOpKind::RMSNorm(op) => {
                 if let Some((previous, residual_barrier_before)) = self.pop_residual_add_with_capture() {
-                    self.push_pending(PendingReplayOp::ResidualCaptureRMSNorm {
-                        op: previous.fuse_rms_norm(op),
+                    self.push_pending(PendingReplayOp::ResidualAddCaptureRMSNorm {
+                        op: ResidualAddCaptureRMSNormReplayInvocation::fuse(previous, op),
                         barrier_before: residual_barrier_before,
                     });
                     return;
                 }
-                if let Some((previous, residual_barrier_before)) = self.pop_residual_add() {
+                if let Some((previous, residual_barrier_before)) = self.pop_residual_add(&op) {
                     self.push_pending(PendingReplayOp::ResidualAddRMSNorm {
-                        op: previous.fuse_rms_norm(op),
+                        op: ResidualAddRMSNormReplayInvocation::fuse(previous, op),
                         barrier_before: residual_barrier_before,
                     });
                     return;
@@ -74,8 +74,11 @@ impl ReplayRecorder {
         self.pending.pop()
     }
 
-    fn pop_residual_add(&mut self) -> Option<(ResidualReplayOp, bool)> {
-        if !matches!(self.pending.last(), Some(PendingReplayOp::ResidualAdd { .. })) {
+    fn pop_residual_add(&mut self, rms_norm: &RMSNormReplayOp) -> Option<(ResidualAddReplayOp, bool)> {
+        let Some(PendingReplayOp::ResidualAdd { op, .. }) = self.pending.last() else {
+            return None;
+        };
+        if !ResidualAddRMSNormReplayInvocation::can_fuse(op, rms_norm) {
             return None;
         }
         let Some(PendingReplayOp::ResidualAdd { op, barrier_before }) = self.pop() else {
@@ -84,7 +87,7 @@ impl ReplayRecorder {
         Some((op, barrier_before))
     }
 
-    fn pop_residual_add_with_capture(&mut self) -> Option<(ResidualCaptureReplayOp, bool)> {
+    fn pop_residual_add_with_capture(&mut self) -> Option<(ResidualAddCaptureReplayOp, bool)> {
         if !matches!(
             self.pending.last(),
             Some(PendingReplayOp::ResidualAddWithCapture { .. })
@@ -92,7 +95,7 @@ impl ReplayRecorder {
             return None;
         }
         let Some(PendingReplayOp::ResidualAddWithCapture { op, barrier_before }) = self.pop() else {
-            panic!("pending replay op changed after residual capture check");
+            panic!("pending replay op changed after residual-add capture check");
         };
         Some((op, barrier_before))
     }
@@ -104,7 +107,7 @@ impl ReplayRecorder {
                     record_pending(&mut self.inner, op.into_replay(), barrier_before);
                 },
                 PendingReplayOp::ResidualAddWithCapture { .. } => {
-                    panic!("residual add with capture must be immediately fused with RMSNorm");
+                    panic!("residual-add with capture must be immediately fused with RMSNorm");
                 },
                 PendingReplayOp::RMSNorm { op, barrier_before } => {
                     record_pending(&mut self.inner, op.into_replay(), barrier_before);
@@ -112,7 +115,7 @@ impl ReplayRecorder {
                 PendingReplayOp::ResidualAddRMSNorm { op, barrier_before } => {
                     record_pending(&mut self.inner, op, barrier_before);
                 },
-                PendingReplayOp::ResidualCaptureRMSNorm { op, barrier_before } => {
+                PendingReplayOp::ResidualAddCaptureRMSNorm { op, barrier_before } => {
                     record_pending(&mut self.inner, op, barrier_before);
                 },
             }
@@ -134,8 +137,8 @@ pub struct ReplayOp<'a> {
 
 enum ReplayOpKind<'a> {
     Opaque(OpaqueReplayOp<'a>),
-    ResidualAdd(ResidualReplayOp),
-    ResidualAddWithCapture(ResidualCaptureReplayOp),
+    ResidualAdd(ResidualAddReplayOp),
+    ResidualAddWithCapture(ResidualAddCaptureReplayOp),
     RMSNorm(RMSNormReplayOp),
 }
 
@@ -149,7 +152,7 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
-    pub fn residual_add(invocation: ResidualInvocation<'a>) -> Self {
+    pub fn residual_add(invocation: ResidualAddInvocation<'a>) -> Self {
         Self {
             kind: ReplayOpKind::ResidualAdd(invocation.into_replay_op()),
         }
@@ -166,7 +169,10 @@ impl<'a> ReplayOp<'a> {
     /// scalar kernel. Shape, capacity, and alias checks are intentionally
     /// delayed because the residual invocation and capture target do not carry
     /// the RMSNorm shape or all fused buffers.
-    pub fn residual_add_with_capture(invocation: ResidualInvocation<'a>, capture: ResidualCaptureTarget<'a>) -> Self {
+    pub fn residual_add_with_capture(
+        invocation: ResidualAddInvocation<'a>,
+        capture: ResidualAddCaptureTarget<'a>,
+    ) -> Self {
         Self {
             kind: ReplayOpKind::ResidualAddWithCapture(invocation.into_capture_replay_op(capture)),
         }
@@ -181,11 +187,11 @@ impl<'a> ReplayOp<'a> {
 
 enum PendingReplayOp {
     ResidualAdd {
-        op: ResidualReplayOp,
+        op: ResidualAddReplayOp,
         barrier_before: bool,
     },
     ResidualAddWithCapture {
-        op: ResidualCaptureReplayOp,
+        op: ResidualAddCaptureReplayOp,
         barrier_before: bool,
     },
     RMSNorm {
@@ -193,11 +199,11 @@ enum PendingReplayOp {
         barrier_before: bool,
     },
     ResidualAddRMSNorm {
-        op: ResidualRMSNormReplayInvocation,
+        op: ResidualAddRMSNormReplayInvocation,
         barrier_before: bool,
     },
-    ResidualCaptureRMSNorm {
-        op: ResidualCaptureRMSNormReplayInvocation,
+    ResidualAddCaptureRMSNorm {
+        op: ResidualAddCaptureRMSNormReplayInvocation,
         barrier_before: bool,
     },
 }
@@ -238,12 +244,14 @@ mod tests {
     use super::ReplayOp;
     use super::ReplayRecorder;
     use crate::components::RMSNormBuffers;
+    use crate::components::RMSNormConfig;
     use crate::components::RMSNormKernel;
     use crate::components::RMSNormShape;
-    use crate::components::ResidualBuffers;
-    use crate::components::ResidualCaptureTarget;
-    use crate::components::ResidualKernel;
-    use crate::components::ResidualShape;
+    use crate::components::ResidualAddBuffers;
+    use crate::components::ResidualAddCaptureTarget;
+    use crate::components::ResidualAddConfig;
+    use crate::components::ResidualAddKernel;
+    use crate::components::ResidualAddShape;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::ReplayArguments;
@@ -256,10 +264,10 @@ mod tests {
     fn test_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let residual = ResidualKernel::new(&device);
-        let rms_norm = RMSNormKernel::new(&device);
         let tokens = 2;
         let hidden_dim = 8;
+        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
+        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim as u32, 1.0e-6));
         let num_values = tokens * hidden_dim;
         let bytes = num_values * size_of::<u16>();
         let lhs = Buffer::new_zeroed(&device, bytes);
@@ -269,22 +277,25 @@ mod tests {
         let weight = Buffer::new_zeroed(&device, hidden_dim * size_of::<u16>());
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
-        recorder.record(ReplayOp::residual_add(residual.invoke(
-            ResidualShape::bf16(num_values as u32),
-            ResidualBuffers {
+        recorder.record(ReplayOp::residual_add(residual_add.invoke(
+            ResidualAddShape {
+                num_values: num_values as u32,
+            },
+            ResidualAddBuffers {
                 lhs: &lhs,
                 rhs: &rhs,
                 output: &residual_output,
             },
         )));
         recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke(
-            RMSNormShape::bf16(tokens as u32, hidden_dim as u32),
+            RMSNormShape {
+                num_total_tokens: tokens as u32,
+            },
             RMSNormBuffers {
                 input: &residual_output,
                 weight: &weight,
                 output: &norm_output,
             },
-            1.0e-6,
         )));
 
         let replay = recorder.build();
@@ -295,14 +306,57 @@ mod tests {
     }
 
     #[test]
+    fn test_unrelated_residual_add_and_rms_norm_are_not_fused() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let tokens = 2;
+        let hidden_dim = 8;
+        let num_values = tokens * hidden_dim;
+        let bytes = num_values * size_of::<u16>();
+        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
+        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim as u32, 1.0e-6));
+        let lhs = Buffer::new_zeroed(&device, bytes);
+        let rhs = Buffer::new_zeroed(&device, bytes);
+        let residual_output = Buffer::new_zeroed(&device, bytes);
+        let unrelated_norm_input = Buffer::new_zeroed(&device, bytes);
+        let norm_output = Buffer::new_zeroed(&device, bytes);
+        let weight = Buffer::new_zeroed(&device, hidden_dim * size_of::<u16>());
+        let mut recorder = ReplayRecorder::new(stream.create_replay_program());
+
+        recorder.record(ReplayOp::residual_add(residual_add.invoke(
+            ResidualAddShape {
+                num_values: num_values as u32,
+            },
+            ResidualAddBuffers {
+                lhs: &lhs,
+                rhs: &rhs,
+                output: &residual_output,
+            },
+        )));
+        recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke(
+            RMSNormShape {
+                num_total_tokens: tokens as u32,
+            },
+            RMSNormBuffers {
+                input: &unrelated_norm_input,
+                weight: &weight,
+                output: &norm_output,
+            },
+        )));
+
+        let replay = recorder.build();
+        assert_eq!(replay.command_count(), 2);
+    }
+
+    #[test]
     fn test_bucketed_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let residual = ResidualKernel::new(&device);
-        let rms_norm = RMSNormKernel::new(&device);
         let num_active_tokens = 2_u32;
         let token_capacity = 4_u32;
         let hidden_dim = 8_u32;
+        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::f32());
+        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::f32(hidden_dim, 1.0e-6));
         let capacity_values = (token_capacity * hidden_dim) as usize;
         let active_values = (num_active_tokens * hidden_dim) as usize;
         let lhs = Buffer::from_slice(&device, &vec![1.0_f32; capacity_values]);
@@ -313,23 +367,26 @@ mod tests {
         let norm_output = Buffer::from_slice(&device, &vec![sentinel; capacity_values]);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
-        recorder.record(ReplayOp::residual_add(residual.invoke(
-            ResidualShape::f32(capacity_values as u32),
-            ResidualBuffers {
+        recorder.record(ReplayOp::residual_add(residual_add.invoke(
+            ResidualAddShape {
+                num_values: capacity_values as u32,
+            },
+            ResidualAddBuffers {
                 lhs: &lhs,
                 rhs: &rhs,
                 output: &residual_output,
             },
         )));
         recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke_bucketed(
-            RMSNormShape::f32(token_capacity, hidden_dim),
+            RMSNormShape {
+                num_total_tokens: token_capacity,
+            },
             NUM_ACTIVE_TOKENS,
             RMSNormBuffers {
                 input: &residual_output,
                 weight: &weight,
                 output: &norm_output,
             },
-            1.0e-6,
         )));
 
         let replay = recorder.build();
@@ -360,11 +417,11 @@ mod tests {
     fn test_bucketed_residual_capture_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let residual = ResidualKernel::new(&device);
-        let rms_norm = RMSNormKernel::new(&device);
         let num_active_tokens = 2_u32;
         let token_capacity = 4_u32;
         let hidden_dim = 8_u32;
+        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
+        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim, 1.0e-6));
         let capture_row_width = hidden_dim * 3;
         let capture_column_start = hidden_dim;
         let capture_column_end = capture_column_start + hidden_dim;
@@ -386,29 +443,32 @@ mod tests {
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
         recorder.record(ReplayOp::residual_add_with_capture(
-            residual.invoke(
-                ResidualShape::bf16(capacity_values as u32),
-                ResidualBuffers {
+            residual_add.invoke(
+                ResidualAddShape {
+                    num_values: capacity_values as u32,
+                },
+                ResidualAddBuffers {
                     lhs: &lhs,
                     rhs: &rhs,
                     output: &residual_output,
                 },
             ),
-            ResidualCaptureTarget::columns(
+            ResidualAddCaptureTarget::columns(
                 &capture_output,
                 capture_row_width,
                 capture_column_start..capture_column_end,
             ),
         ));
         recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke_bucketed(
-            RMSNormShape::bf16(token_capacity, hidden_dim),
+            RMSNormShape {
+                num_total_tokens: token_capacity,
+            },
             NUM_ACTIVE_TOKENS,
             RMSNormBuffers {
                 input: &residual_output,
                 weight: &weight,
                 output: &norm_output,
             },
-            1.0e-6,
         )));
 
         let replay = recorder.build();
@@ -449,10 +509,10 @@ mod tests {
     fn test_scalar_residual_capture_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let residual = ResidualKernel::new(&device);
-        let rms_norm = RMSNormKernel::new(&device);
         let tokens = 2_u32;
         let hidden_dim = 6_u32;
+        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
+        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim, 1.0e-6));
         let capture_row_width = 13_u32;
         let capture_column_start = 2_u32;
         let capture_column_end = capture_column_start + hidden_dim;
@@ -476,28 +536,31 @@ mod tests {
         let capture_output = Buffer::from_slice(&device, &vec![sentinel; (tokens * capture_row_width) as usize]);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
         recorder.record(ReplayOp::residual_add_with_capture(
-            residual.invoke(
-                ResidualShape::bf16(num_values as u32),
-                ResidualBuffers {
+            residual_add.invoke(
+                ResidualAddShape {
+                    num_values: num_values as u32,
+                },
+                ResidualAddBuffers {
                     lhs: &lhs,
                     rhs: &rhs,
                     output: &residual_output,
                 },
             ),
-            ResidualCaptureTarget::columns(
+            ResidualAddCaptureTarget::columns(
                 &capture_output,
                 capture_row_width,
                 capture_column_start..capture_column_end,
             ),
         ));
         recorder.record(ReplayOp::rms_norm(rms_norm.invoke(
-            RMSNormShape::bf16(tokens, hidden_dim),
+            RMSNormShape {
+                num_total_tokens: tokens,
+            },
             RMSNormBuffers {
                 input: &residual_output,
                 weight: &weight,
                 output: &norm_output,
             },
-            1.0e-6,
         )));
 
         stream.submit_replay(&recorder.build()).wait();
@@ -514,34 +577,34 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unsupported residual capture layout")]
+    #[should_panic(expected = "unsupported residual-add capture layout")]
     fn test_unaligned_vec4_capture_is_unsupported() {
         let device = Device::system_default();
         let capture_output = Buffer::new_zeroed(&device, 26 * size_of::<u16>());
-        let _ = ResidualCaptureTarget::columns(&capture_output, 13, 2..10);
+        let _ = ResidualAddCaptureTarget::columns(&capture_output, 13, 2..10);
     }
 
     #[test]
-    #[should_panic(expected = "residual add with capture must be immediately fused with RMSNorm")]
+    #[should_panic(expected = "residual-add with capture must be immediately fused with RMSNorm")]
     fn test_residual_capture_requires_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let residual = ResidualKernel::new(&device);
+        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
         let lhs = Buffer::new_zeroed(&device, 16);
         let rhs = Buffer::new_zeroed(&device, 16);
         let output = Buffer::new_zeroed(&device, 16);
         let capture_output = Buffer::new_zeroed(&device, 32);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
         recorder.record(ReplayOp::residual_add_with_capture(
-            residual.invoke(
-                ResidualShape::bf16(8),
-                ResidualBuffers {
+            residual_add.invoke(
+                ResidualAddShape { num_values: 8 },
+                ResidualAddBuffers {
                     lhs: &lhs,
                     rhs: &rhs,
                     output: &output,
                 },
             ),
-            ResidualCaptureTarget::columns(&capture_output, 8, 0..8),
+            ResidualAddCaptureTarget::columns(&capture_output, 8, 0..8),
         ));
 
         recorder.build();
@@ -551,9 +614,9 @@ mod tests {
     fn test_pending_non_residual() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let rms_norm = RMSNormKernel::new(&device);
         let tokens = 2;
         let hidden_dim = 8;
+        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim as u32, 1.0e-6));
         let bytes = tokens * hidden_dim * size_of::<u16>();
         let first_input = Buffer::new_zeroed(&device, bytes);
         let first_output = Buffer::new_zeroed(&device, bytes);
@@ -563,22 +626,24 @@ mod tests {
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
         recorder.record(ReplayOp::rms_norm(rms_norm.invoke(
-            RMSNormShape::bf16(tokens as u32, hidden_dim as u32),
+            RMSNormShape {
+                num_total_tokens: tokens as u32,
+            },
             RMSNormBuffers {
                 input: &first_input,
                 weight: &weight,
                 output: &first_output,
             },
-            1.0e-6,
         )));
         recorder.record(ReplayOp::rms_norm(rms_norm.invoke(
-            RMSNormShape::bf16(tokens as u32, hidden_dim as u32),
+            RMSNormShape {
+                num_total_tokens: tokens as u32,
+            },
             RMSNormBuffers {
                 input: &second_input,
                 weight: &weight,
                 output: &second_output,
             },
-            1.0e-6,
         )));
 
         let replay = recorder.build();

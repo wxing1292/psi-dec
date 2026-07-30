@@ -31,7 +31,7 @@ use inference_executor_metal::model::embedding::EmbedConfig;
 use inference_executor_metal::model::embedding::EmbedInput;
 use inference_executor_metal::model::gather::Gather;
 use inference_executor_metal::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use inference_executor_metal::model::rms_norm::RmsNorm;
+use inference_executor_metal::model::rms_norm::RMSNorm;
 use inference_executor_metal::model::unembedding::Unembed;
 use inference_executor_metal::model::unembedding::UnembedConfig;
 use inference_executor_metal::model::unembedding::UnembedInput;
@@ -275,7 +275,7 @@ struct HeadFixture {
     unembed_hidden: Buffer,
     unembed_logits: Buffer,
     embedding: Embed,
-    final_norm: RmsNorm,
+    final_norm: RMSNorm,
     gather: Gather,
     unembedder: Unembed,
     sampler: TopKSampling,
@@ -330,7 +330,7 @@ impl HeadFixture {
             unembed_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
             unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
             embedding,
-            final_norm: RmsNorm::new(
+            final_norm: RMSNorm::new(
                 &device,
                 layout.hidden_dim as usize,
                 layout.rms_norm_eps,

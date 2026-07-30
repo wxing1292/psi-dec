@@ -2,10 +2,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 use objc2_metal::MTLComputePipelineState;
-use objc2_metal::MTLResource;
 
-use crate::components::residual_rms_norm::ResidualCaptureRMSNormOwnedBuffers;
-use crate::components::residual_rms_norm::ResidualRMSNormOwnedBuffers;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -18,52 +15,65 @@ const RMS_NORM_SOURCE: &str = include_str!("metal/rms_norm.metal");
 
 const RMS_NUM_THREADS_PER_THREADBLOCK: usize = 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RMSNormShape {
-    pub num_total_tokens: u32,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RMSNormConfig {
     pub hidden_dim: u32,
-    pub dtype: Dtype,
+    pub eps: f32,
+    pub io_dtype: Dtype,
 }
 
-impl RMSNormShape {
-    pub fn f32(num_total_tokens: u32, hidden_dim: u32) -> Self {
+impl RMSNormConfig {
+    pub fn f32(hidden_dim: u32, eps: f32) -> Self {
         Self {
-            num_total_tokens,
             hidden_dim,
-            dtype: Dtype::Float32,
+            eps,
+            io_dtype: Dtype::Float32,
         }
     }
 
-    pub fn bf16(num_total_tokens: u32, hidden_dim: u32) -> Self {
+    pub fn bf16(hidden_dim: u32, eps: f32) -> Self {
         Self {
-            num_total_tokens,
             hidden_dim,
-            dtype: Dtype::Bfloat16,
+            eps,
+            io_dtype: Dtype::Bfloat16,
         }
     }
 
     pub fn validate(self) {
-        assert!(self.num_total_tokens > 0);
         assert!(self.hidden_dim > 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(self.eps.is_finite() && self.eps > 0.0);
+        assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
-    pub fn num_values(self) -> usize {
-        (self.num_total_tokens as usize)
+    pub fn num_values(self, shape: RMSNormShape) -> usize {
+        self.validate();
+        shape.validate();
+        (shape.num_total_tokens as usize)
             .checked_mul(self.hidden_dim as usize)
             .expect("RMSNorm value count must fit usize")
     }
 
-    pub fn bytes(self) -> usize {
-        self.num_values()
-            .checked_mul(self.dtype.item_size())
+    pub fn bytes(self, shape: RMSNormShape) -> usize {
+        self.num_values(shape)
+            .checked_mul(self.io_dtype.item_size())
             .expect("RMSNorm byte length must fit usize")
     }
 
     pub fn weight_bytes(self) -> usize {
         (self.hidden_dim as usize)
-            .checked_mul(self.dtype.item_size())
+            .checked_mul(self.io_dtype.item_size())
             .expect("RMSNorm weight byte length must fit usize")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RMSNormShape {
+    pub num_total_tokens: u32,
+}
+
+impl RMSNormShape {
+    pub fn validate(self) {
+        assert!(self.num_total_tokens > 0);
     }
 }
 
@@ -74,25 +84,33 @@ pub struct RMSNormBuffers<'a> {
     pub output: &'a Buffer,
 }
 
+/// RMSNorm data flow:
+///
+/// ```text
+/// buffers.input ----\
+///                    +--> RMSNorm --> buffers.output
+/// buffers.weight ---/
+/// ```
 pub struct RMSNormKernel {
-    f32_kernel: Kernel,
-    bf16_kernel: Kernel,
+    config: RMSNormConfig,
+    kernel: Kernel,
 }
 
 impl RMSNormKernel {
-    pub fn new(device: &Device) -> Self {
+    pub fn new(device: &Device, config: RMSNormConfig) -> Self {
+        config.validate();
         Self {
-            f32_kernel: Kernel::new(device, RMS_NORM_SOURCE, "rms_norm_f32"),
-            bf16_kernel: Kernel::new(device, RMS_NORM_SOURCE, "rms_norm_bf16"),
+            config,
+            kernel: Kernel::new(device, RMS_NORM_SOURCE, rms_norm_function_name(config)),
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: RMSNormShape, buffers: RMSNormBuffers<'a>, eps: f32) -> RMSNormInvocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: RMSNormShape, buffers: RMSNormBuffers<'a>) -> RMSNormInvocation<'a> {
         RMSNormInvocation {
-            kernel: self.kernel(shape),
+            kernel: &self.kernel,
+            config: self.config,
             shape,
             buffers,
-            eps,
             num_active_tokens_key: None,
         }
     }
@@ -103,57 +121,49 @@ impl RMSNormKernel {
         capacity_shape: RMSNormShape,
         num_active_tokens_key: ReplayParameterKey,
         buffers: RMSNormBuffers<'a>,
-        eps: f32,
     ) -> RMSNormInvocation<'a> {
         RMSNormInvocation {
-            kernel: self.kernel(capacity_shape),
+            kernel: &self.kernel,
+            config: self.config,
             shape: capacity_shape,
             buffers,
-            eps,
             num_active_tokens_key: Some(num_active_tokens_key),
-        }
-    }
-
-    fn kernel(&self, shape: RMSNormShape) -> &Kernel {
-        match shape.dtype {
-            Dtype::Float32 => &self.f32_kernel,
-            Dtype::Bfloat16 => &self.bf16_kernel,
-            dtype => panic!("unsupported RMSNorm dtype {dtype:?}"),
         }
     }
 }
 
 pub struct RMSNormInvocation<'a> {
     kernel: &'a Kernel,
+    config: RMSNormConfig,
     shape: RMSNormShape,
     buffers: RMSNormBuffers<'a>,
-    eps: f32,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub struct RMSNormReplayInvocation {
-    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    shape: RMSNormShape,
-    buffers: RMSNormOwnedBuffers,
-    eps: f32,
-    num_active_tokens_key: Option<ReplayParameterKey>,
+pub(super) struct RMSNormReplayInvocation {
+    pub(super) pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(super) config: RMSNormConfig,
+    pub(super) shape: RMSNormShape,
+    pub(super) buffers: RMSNormOwnedBuffers,
+    pub(super) num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub struct RMSNormReplayOp {
-    shape: RMSNormShape,
-    buffers: RMSNormOwnedBuffers,
-    eps: f32,
-    num_active_tokens_key: Option<ReplayParameterKey>,
+pub(super) struct RMSNormReplayOp {
+    pub(super) pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(super) config: RMSNormConfig,
+    pub(super) shape: RMSNormShape,
+    pub(super) buffers: RMSNormOwnedBuffers,
+    pub(super) num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 #[derive(Clone)]
-struct RMSNormOwnedBuffers {
-    input: Retained<ProtocolObject<dyn MTLBuffer>>,
-    input_len_bytes: usize,
-    weight: Retained<ProtocolObject<dyn MTLBuffer>>,
-    weight_len_bytes: usize,
-    output: Retained<ProtocolObject<dyn MTLBuffer>>,
-    output_len_bytes: usize,
+pub(super) struct RMSNormOwnedBuffers {
+    pub(super) input: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(super) input_len_bytes: usize,
+    pub(super) weight: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(super) weight_len_bytes: usize,
+    pub(super) output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(super) output_len_bytes: usize,
 }
 
 impl Operator for RMSNormInvocation<'_> {
@@ -164,8 +174,8 @@ impl Operator for RMSNormInvocation<'_> {
         builder.set_buffer_read(1, self.buffers.weight, 0);
         builder.set_buffer_write(2, self.buffers.output, 0);
         record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
-        builder.set_u32(4, self.shape.hidden_dim);
-        builder.set_f32(5, self.eps);
+        builder.set_u32(4, self.config.hidden_dim);
+        builder.set_f32(5, self.config.eps);
         builder.dispatch_1d(
             self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
             RMS_NUM_THREADS_PER_THREADBLOCK,
@@ -181,8 +191,8 @@ impl Operator for RMSNormReplayInvocation {
         builder.set_retained_buffer_read(1, &self.buffers.weight, 0);
         builder.set_retained_buffer_write(2, &self.buffers.output, 0);
         record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
-        builder.set_u32(4, self.shape.hidden_dim);
-        builder.set_f32(5, self.eps);
+        builder.set_u32(4, self.config.hidden_dim);
+        builder.set_f32(5, self.config.eps);
         builder.dispatch_1d(
             self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
             RMS_NUM_THREADS_PER_THREADBLOCK,
@@ -191,8 +201,10 @@ impl Operator for RMSNormReplayInvocation {
 }
 
 impl RMSNormInvocation<'_> {
-    pub fn into_replay_op(self) -> RMSNormReplayOp {
+    pub(super) fn into_replay_op(self) -> RMSNormReplayOp {
         RMSNormReplayOp {
+            pipeline: self.kernel.as_raw_retained(),
+            config: self.config,
             shape: self.shape,
             buffers: RMSNormOwnedBuffers {
                 input: self.buffers.input.as_raw_retained(),
@@ -202,107 +214,38 @@ impl RMSNormInvocation<'_> {
                 output: self.buffers.output.as_raw_retained(),
                 output_len_bytes: self.buffers.output.len_bytes(),
             },
-            eps: self.eps,
             num_active_tokens_key: self.num_active_tokens_key,
         }
     }
 
     fn validate(&self) {
+        self.config.validate();
         self.shape.validate();
-        assert!(self.eps > 0.0);
-        assert!(self.buffers.input.len_bytes() >= self.shape.bytes());
-        assert!(self.buffers.weight.len_bytes() >= self.shape.weight_bytes());
-        assert!(self.buffers.output.len_bytes() >= self.shape.bytes());
+        assert!(self.buffers.input.len_bytes() >= self.config.bytes(self.shape));
+        assert!(self.buffers.weight.len_bytes() >= self.config.weight_bytes());
+        assert!(self.buffers.output.len_bytes() >= self.config.bytes(self.shape));
     }
 }
 
 impl RMSNormReplayInvocation {
     fn validate(&self) {
+        self.config.validate();
         self.shape.validate();
-        assert!(self.eps > 0.0);
-        assert!(self.buffers.input_len_bytes >= self.shape.bytes());
-        assert!(self.buffers.weight_len_bytes >= self.shape.weight_bytes());
-        assert!(self.buffers.output_len_bytes >= self.shape.bytes());
+        assert!(self.buffers.input_len_bytes >= self.config.bytes(self.shape));
+        assert!(self.buffers.weight_len_bytes >= self.config.weight_bytes());
+        assert!(self.buffers.output_len_bytes >= self.config.bytes(self.shape));
     }
 }
 
 impl RMSNormReplayOp {
-    pub fn into_replay(self) -> RMSNormReplayInvocation {
-        let device = Device::from_raw_retained(self.buffers.input.device());
+    pub(super) fn into_replay(self) -> RMSNormReplayInvocation {
         RMSNormReplayInvocation {
-            pipeline: Kernel::new(&device, RMS_NORM_SOURCE, rms_norm_function_name(self.shape)).as_raw_retained(),
+            pipeline: self.pipeline,
+            config: self.config,
             shape: self.shape,
             buffers: self.buffers,
-            eps: self.eps,
             num_active_tokens_key: self.num_active_tokens_key,
         }
-    }
-
-    pub fn shape(&self) -> RMSNormShape {
-        self.shape
-    }
-
-    pub fn input_buffer(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
-        &self.buffers.input
-    }
-
-    pub fn into_residual_rms_norm_buffers(
-        self,
-        lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
-        lhs_len_bytes: usize,
-        rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
-        rhs_len_bytes: usize,
-        residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
-        residual_output_len_bytes: usize,
-    ) -> (ResidualRMSNormOwnedBuffers, f32, Option<ReplayParameterKey>) {
-        (
-            ResidualRMSNormOwnedBuffers::new(
-                lhs,
-                lhs_len_bytes,
-                rhs,
-                rhs_len_bytes,
-                self.buffers.weight,
-                self.buffers.weight_len_bytes,
-                residual_output,
-                residual_output_len_bytes,
-                self.buffers.output,
-                self.buffers.output_len_bytes,
-            ),
-            self.eps,
-            self.num_active_tokens_key,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn into_residual_capture_rms_norm_buffers(
-        self,
-        lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
-        lhs_len_bytes: usize,
-        rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
-        rhs_len_bytes: usize,
-        residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
-        residual_output_len_bytes: usize,
-        capture_output: Retained<ProtocolObject<dyn MTLBuffer>>,
-        capture_output_len_bytes: usize,
-    ) -> (ResidualCaptureRMSNormOwnedBuffers, f32, Option<ReplayParameterKey>) {
-        (
-            ResidualCaptureRMSNormOwnedBuffers::new(
-                lhs,
-                lhs_len_bytes,
-                rhs,
-                rhs_len_bytes,
-                self.buffers.weight,
-                self.buffers.weight_len_bytes,
-                residual_output,
-                residual_output_len_bytes,
-                capture_output,
-                capture_output_len_bytes,
-                self.buffers.output,
-                self.buffers.output_len_bytes,
-            ),
-            self.eps,
-            self.num_active_tokens_key,
-        )
     }
 }
 
@@ -318,8 +261,8 @@ fn record_num_active_tokens(
     }
 }
 
-fn rms_norm_function_name(shape: RMSNormShape) -> &'static str {
-    match shape.dtype {
+fn rms_norm_function_name(config: RMSNormConfig) -> &'static str {
+    match config.io_dtype {
         Dtype::Float32 => "rms_norm_f32",
         Dtype::Bfloat16 => "rms_norm_bf16",
         dtype => panic!("unsupported RMSNorm dtype {dtype:?}"),
@@ -340,12 +283,13 @@ mod tests {
     fn test_bucketed_fixed() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = RMSNormKernel::new(&device);
         let num_active_tokens = 2_u32;
         let num_total_tokens = 4_u32;
         let hidden_dim = 8_u32;
-        let shape = RMSNormShape::f32(num_total_tokens, hidden_dim);
-        let input_values = (0..shape.num_values())
+        let config = RMSNormConfig::f32(hidden_dim, 1.0e-6);
+        let shape = RMSNormShape { num_total_tokens };
+        let kernel = RMSNormKernel::new(&device, config);
+        let input_values = (0..config.num_values(shape))
             .map(|index| index as f32 * 0.03125 - 0.5)
             .collect::<Vec<_>>();
         let weight_values = (0..hidden_dim)
@@ -354,7 +298,7 @@ mod tests {
         let input = Buffer::from_slice(&device, &input_values);
         let weight = Buffer::from_slice(&device, &weight_values);
         let sentinel = -321.0_f32;
-        let output = Buffer::from_slice(&device, &vec![sentinel; shape.num_values()]);
+        let output = Buffer::from_slice(&device, &vec![sentinel; config.num_values(shape)]);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_bucketed(
@@ -365,7 +309,6 @@ mod tests {
                 weight: &weight,
                 output: &output,
             },
-            1.0e-6,
         ));
         let replay = builder.build();
         stream
@@ -386,8 +329,8 @@ mod tests {
         );
         assert_close(&output.read_typed::<f32>(0, active_values), &expected, 1.0e-5);
         assert_eq!(
-            output.read_typed::<f32>(active_values, shape.num_values() - active_values),
-            vec![sentinel; shape.num_values() - active_values]
+            output.read_typed::<f32>(active_values, config.num_values(shape) - active_values),
+            vec![sentinel; config.num_values(shape) - active_values]
         );
     }
 

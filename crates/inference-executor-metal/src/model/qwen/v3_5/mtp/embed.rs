@@ -24,15 +24,15 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
 pub struct Qwen35MTPEmbed {
     embed: Rc<Embed>,
     input_gather: Gather,
     hidden_dim: usize,
-    hidden_norm: RmsNorm,
-    embedding_norm: RmsNorm,
+    hidden_norm: RMSNorm,
+    embedding_norm: RMSNorm,
     concat: Bf16ConcatRowsKernel,
     fc: AffineQuantizedMatmul,
     fc_weight: Buffer,
@@ -107,13 +107,13 @@ impl Qwen35MTPEmbed {
             embed,
             input_gather: Gather::new(device),
             hidden_dim,
-            hidden_norm: RmsNorm::new(
+            hidden_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 config.text_config.rms_norm_eps,
                 prev_hidden_norm_weight,
             ),
-            embedding_norm: RmsNorm::new(
+            embedding_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 config.text_config.rms_norm_eps,
@@ -142,9 +142,9 @@ impl Qwen35MTPEmbed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.hidden_norm
-            .record_opaque_with_barrier(recorder, num_tokens, previous_hidden, &self.normed_hidden);
+            .record_with_barrier(recorder, num_tokens, previous_hidden, &self.normed_hidden);
         self.embedding_norm
-            .record_opaque(recorder, num_tokens, shifted_embeddings, &self.normed_embedding);
+            .record(recorder, num_tokens, shifted_embeddings, &self.normed_embedding);
         let hidden_dim = self
             .hidden_dim
             .try_into()

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::ResidualCaptureTarget;
+use inference_backend_metal::components::ResidualAddCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::backend::recorder::Recorder;
@@ -18,7 +18,7 @@ use crate::model::qwen::v3::main::layer::Qwen3MainLayer;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayerInput;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayerScratch;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
 pub mod embed;
@@ -29,7 +29,7 @@ pub mod plan;
 
 pub struct Qwen3Main {
     layers: Vec<Qwen3MainLayer>,
-    final_norm: RmsNorm,
+    final_norm: RMSNorm,
     residual_capture: Option<Rc<dyn Qwen3MainResidualCapture>>,
 }
 
@@ -48,7 +48,7 @@ pub struct Qwen3MainArgs<'a> {
 /// must keep returned buffers and their column ranges stable for the lifetime
 /// of Main, and destinations must not alias Main workspaces.
 pub trait Qwen3MainResidualCapture {
-    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>>;
+    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>>;
 }
 
 impl Qwen3Main {
@@ -91,7 +91,7 @@ impl Qwen3Main {
         let final_norm_weight = load_qwen3x_norm_weight(device, store, &final_norm_weight, &[text.hidden_size])?;
         Ok(Self {
             layers,
-            final_norm: RmsNorm::new(device, text.hidden_size, text.rms_norm_eps, final_norm_weight),
+            final_norm: RMSNorm::new(device, text.hidden_size, text.rms_norm_eps, final_norm_weight),
             residual_capture,
         })
     }

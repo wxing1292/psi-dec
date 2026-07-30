@@ -1,0 +1,782 @@
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer;
+use objc2_metal::MTLComputePipelineState;
+use objc2_metal::MTLResource;
+
+use crate::components::residual_add::ResidualAddCaptureReplayOp;
+use crate::components::residual_add::ResidualAddConfig;
+use crate::components::residual_add::ResidualAddReplayOp;
+use crate::components::rms_norm::RMSNormReplayOp;
+use crate::metal::Buffer;
+use crate::metal::CommandRecorder;
+use crate::metal::Device;
+use crate::metal::Dtype;
+use crate::metal::Kernel;
+use crate::metal::Operator;
+use crate::metal::ReplayParameterKey;
+
+const RESIDUAL_ADD_RMS_NORM_SOURCE: &str = include_str!("metal/residual_add_rms_norm.metal");
+
+const NUM_THREADS_PER_THREADBLOCK: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResidualAddRMSNormConfig {
+    pub hidden_dim: u32,
+    pub eps: f32,
+    pub io_dtype: Dtype,
+}
+
+impl ResidualAddRMSNormConfig {
+    pub fn f32(hidden_dim: u32, eps: f32) -> Self {
+        Self {
+            hidden_dim,
+            eps,
+            io_dtype: Dtype::Float32,
+        }
+    }
+
+    pub fn bf16(hidden_dim: u32, eps: f32) -> Self {
+        Self {
+            hidden_dim,
+            eps,
+            io_dtype: Dtype::Bfloat16,
+        }
+    }
+
+    pub fn validate(self) {
+        assert!(self.hidden_dim > 0);
+        assert!(self.eps.is_finite() && self.eps > 0.0);
+        assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
+    }
+
+    pub fn num_values(self, shape: ResidualAddRMSNormShape) -> usize {
+        self.validate();
+        shape.validate();
+        (shape.num_total_tokens as usize)
+            .checked_mul(self.hidden_dim as usize)
+            .expect("residual-add RMSNorm value count must fit usize")
+    }
+
+    pub fn bytes(self, shape: ResidualAddRMSNormShape) -> usize {
+        self.num_values(shape)
+            .checked_mul(self.io_dtype.item_size())
+            .expect("residual-add RMSNorm byte length must fit usize")
+    }
+
+    pub fn weight_bytes(self) -> usize {
+        (self.hidden_dim as usize)
+            .checked_mul(self.io_dtype.item_size())
+            .expect("residual-add RMSNorm weight byte length must fit usize")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidualAddRMSNormShape {
+    pub num_total_tokens: u32,
+}
+
+impl ResidualAddRMSNormShape {
+    pub fn validate(self) {
+        assert!(self.num_total_tokens > 0);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ResidualAddRMSNormBuffers<'a> {
+    pub lhs: &'a Buffer,
+    pub rhs: &'a Buffer,
+    pub weight: &'a Buffer,
+    pub residual_output: &'a Buffer,
+    pub norm_output: &'a Buffer,
+}
+
+/// Fused residual-add and RMSNorm data flow:
+///
+/// ```text
+/// buffers.lhs ----\
+///                  +--> residual add --> buffers.residual_output --\
+/// buffers.rhs ----/                                                 +--> RMSNorm --> buffers.norm_output
+/// buffers.weight ---------------------------------------------------/
+/// ```
+///
+/// The capture variant also writes the residual-add result to the selected
+/// columns in `capture_output`.
+pub struct ResidualAddRMSNormKernel {
+    config: ResidualAddRMSNormConfig,
+    kernel: Kernel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidualAddRMSNormKernelKind {
+    Scalar,
+    Bf16Vectorized,
+}
+
+impl ResidualAddRMSNormKernel {
+    pub fn new(device: &Device, config: ResidualAddRMSNormConfig) -> Self {
+        Self::new_with_kind(device, config, selected_kernel_kind(config))
+    }
+
+    /// Creates one exact backend path for backend tests and benchmarks.
+    ///
+    /// Model and executor code must use [`Self::new`].
+    pub fn new_with_kind(
+        device: &Device,
+        config: ResidualAddRMSNormConfig,
+        kind: ResidualAddRMSNormKernelKind,
+    ) -> Self {
+        config.validate();
+        validate_kernel_kind(config, kind);
+        Self {
+            config,
+            kernel: Kernel::new(
+                device,
+                RESIDUAL_ADD_RMS_NORM_SOURCE,
+                residual_add_rms_norm_function_name(config, kind),
+            ),
+        }
+    }
+
+    pub fn invoke<'a>(
+        &'a self,
+        shape: ResidualAddRMSNormShape,
+        buffers: ResidualAddRMSNormBuffers<'a>,
+    ) -> ResidualAddRMSNormInvocation<'a> {
+        ResidualAddRMSNormInvocation {
+            kernel: &self.kernel,
+            config: self.config,
+            shape,
+            buffers,
+            num_active_tokens_key: None,
+        }
+    }
+
+    /// Records a fixed-capacity grid whose active token count is supplied at submission.
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        capacity_shape: ResidualAddRMSNormShape,
+        num_active_tokens_key: ReplayParameterKey,
+        buffers: ResidualAddRMSNormBuffers<'a>,
+    ) -> ResidualAddRMSNormInvocation<'a> {
+        ResidualAddRMSNormInvocation {
+            kernel: &self.kernel,
+            config: self.config,
+            shape: capacity_shape,
+            buffers,
+            num_active_tokens_key: Some(num_active_tokens_key),
+        }
+    }
+}
+
+pub struct ResidualAddRMSNormInvocation<'a> {
+    kernel: &'a Kernel,
+    config: ResidualAddRMSNormConfig,
+    shape: ResidualAddRMSNormShape,
+    buffers: ResidualAddRMSNormBuffers<'a>,
+    num_active_tokens_key: Option<ReplayParameterKey>,
+}
+
+pub(super) struct ResidualAddRMSNormReplayInvocation {
+    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    config: ResidualAddRMSNormConfig,
+    shape: ResidualAddRMSNormShape,
+    buffers: ResidualAddRMSNormOwnedBuffers,
+    num_active_tokens_key: Option<ReplayParameterKey>,
+}
+
+pub(super) struct ResidualAddCaptureRMSNormReplayInvocation {
+    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    config: ResidualAddRMSNormConfig,
+    shape: ResidualAddRMSNormShape,
+    buffers: ResidualAddCaptureRMSNormOwnedBuffers,
+    capture_row_width: u32,
+    capture_column_start: u32,
+    num_active_tokens_key: Option<ReplayParameterKey>,
+}
+
+#[derive(Clone)]
+struct ResidualAddRMSNormOwnedBuffers {
+    lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+    lhs_len_bytes: usize,
+    rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+    rhs_len_bytes: usize,
+    weight: Retained<ProtocolObject<dyn MTLBuffer>>,
+    weight_len_bytes: usize,
+    residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    residual_output_len_bytes: usize,
+    norm_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    norm_output_len_bytes: usize,
+}
+
+struct ResidualAddCaptureRMSNormOwnedBuffers {
+    lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+    lhs_len_bytes: usize,
+    rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+    rhs_len_bytes: usize,
+    weight: Retained<ProtocolObject<dyn MTLBuffer>>,
+    weight_len_bytes: usize,
+    residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    residual_output_len_bytes: usize,
+    capture_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    capture_output_len_bytes: usize,
+    norm_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    norm_output_len_bytes: usize,
+}
+
+impl ResidualAddRMSNormOwnedBuffers {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+        lhs_len_bytes: usize,
+        rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+        rhs_len_bytes: usize,
+        weight: Retained<ProtocolObject<dyn MTLBuffer>>,
+        weight_len_bytes: usize,
+        residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+        residual_output_len_bytes: usize,
+        norm_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+        norm_output_len_bytes: usize,
+    ) -> Self {
+        Self {
+            lhs,
+            lhs_len_bytes,
+            rhs,
+            rhs_len_bytes,
+            weight,
+            weight_len_bytes,
+            residual_output,
+            residual_output_len_bytes,
+            norm_output,
+            norm_output_len_bytes,
+        }
+    }
+}
+
+impl ResidualAddCaptureRMSNormOwnedBuffers {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+        lhs_len_bytes: usize,
+        rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+        rhs_len_bytes: usize,
+        weight: Retained<ProtocolObject<dyn MTLBuffer>>,
+        weight_len_bytes: usize,
+        residual_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+        residual_output_len_bytes: usize,
+        capture_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+        capture_output_len_bytes: usize,
+        norm_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+        norm_output_len_bytes: usize,
+    ) -> Self {
+        Self {
+            lhs,
+            lhs_len_bytes,
+            rhs,
+            rhs_len_bytes,
+            weight,
+            weight_len_bytes,
+            residual_output,
+            residual_output_len_bytes,
+            capture_output,
+            capture_output_len_bytes,
+            norm_output,
+            norm_output_len_bytes,
+        }
+    }
+}
+
+impl Operator for ResidualAddRMSNormInvocation<'_> {
+    fn record(self, builder: &CommandRecorder<'_>) {
+        self.validate();
+        builder.set_kernel(self.kernel);
+        builder.set_buffer_read(0, self.buffers.lhs, 0);
+        builder.set_buffer_read(1, self.buffers.rhs, 0);
+        builder.set_buffer_read(2, self.buffers.weight, 0);
+        builder.set_buffer_write(3, self.buffers.residual_output, 0);
+        builder.set_buffer_write(4, self.buffers.norm_output, 0);
+        record_num_active_tokens(builder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
+        builder.set_u32(6, self.config.hidden_dim);
+        builder.set_f32(7, self.config.eps);
+        builder.dispatch_1d(
+            self.shape.num_total_tokens as usize * NUM_THREADS_PER_THREADBLOCK,
+            NUM_THREADS_PER_THREADBLOCK,
+        );
+    }
+}
+
+impl Operator for ResidualAddRMSNormReplayInvocation {
+    fn record(self, builder: &CommandRecorder<'_>) {
+        self.validate();
+        builder.set_retained_pipeline_state(&self.pipeline);
+        builder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
+        builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
+        builder.set_retained_buffer_read(2, &self.buffers.weight, 0);
+        builder.set_retained_buffer_write(3, &self.buffers.residual_output, 0);
+        builder.set_retained_buffer_write(4, &self.buffers.norm_output, 0);
+        record_num_active_tokens(builder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
+        builder.set_u32(6, self.config.hidden_dim);
+        builder.set_f32(7, self.config.eps);
+        builder.dispatch_1d(
+            self.shape.num_total_tokens as usize * NUM_THREADS_PER_THREADBLOCK,
+            NUM_THREADS_PER_THREADBLOCK,
+        );
+    }
+}
+
+impl Operator for ResidualAddCaptureRMSNormReplayInvocation {
+    fn record(self, builder: &CommandRecorder<'_>) {
+        self.validate();
+        builder.set_retained_pipeline_state(&self.pipeline);
+        builder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
+        builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
+        builder.set_retained_buffer_read(2, &self.buffers.weight, 0);
+        builder.set_retained_buffer_write(3, &self.buffers.residual_output, 0);
+        builder.set_retained_buffer_write(4, &self.buffers.capture_output, 0);
+        builder.set_retained_buffer_write(5, &self.buffers.norm_output, 0);
+        record_num_active_tokens(builder, 6, self.shape.num_total_tokens, self.num_active_tokens_key);
+        builder.set_u32(7, self.config.hidden_dim);
+        if self.config.hidden_dim.is_multiple_of(4) {
+            builder.set_u32(8, self.capture_row_width / 4);
+            builder.set_u32(9, self.capture_column_start / 4);
+        } else {
+            builder.set_u32(8, self.capture_row_width);
+            builder.set_u32(9, self.capture_column_start);
+        }
+        builder.set_f32(10, self.config.eps);
+        builder.dispatch_1d(
+            self.shape.num_total_tokens as usize * NUM_THREADS_PER_THREADBLOCK,
+            NUM_THREADS_PER_THREADBLOCK,
+        );
+    }
+}
+
+impl ResidualAddRMSNormInvocation<'_> {
+    fn validate(&self) {
+        self.config.validate();
+        self.shape.validate();
+        assert!(self.buffers.lhs.len_bytes() >= self.config.bytes(self.shape));
+        assert!(self.buffers.rhs.len_bytes() >= self.config.bytes(self.shape));
+        assert!(self.buffers.weight.len_bytes() >= self.config.weight_bytes());
+        assert!(self.buffers.residual_output.len_bytes() >= self.config.bytes(self.shape));
+        assert!(self.buffers.norm_output.len_bytes() >= self.config.bytes(self.shape));
+    }
+}
+
+impl ResidualAddRMSNormReplayInvocation {
+    pub(super) fn can_fuse(residual_add: &ResidualAddReplayOp, rms_norm: &RMSNormReplayOp) -> bool {
+        std::ptr::eq(
+            Retained::as_ptr(&residual_add.buffers.output),
+            Retained::as_ptr(&rms_norm.buffers.input),
+        )
+    }
+
+    pub(super) fn fuse(residual_add: ResidualAddReplayOp, rms_norm: RMSNormReplayOp) -> Self {
+        assert!(
+            Self::can_fuse(&residual_add, &rms_norm),
+            "residual-add output must be the fused RMSNorm input"
+        );
+        let residual_values = rms_norm
+            .shape
+            .num_total_tokens
+            .checked_mul(rms_norm.config.hidden_dim)
+            .expect("residual-add RMSNorm value count must fit u32");
+        assert_eq!(residual_add.shape.num_values, residual_values);
+        assert_eq!(residual_add.config.lhs_dtype, rms_norm.config.io_dtype);
+        assert_eq!(residual_add.config.rhs_dtype, rms_norm.config.io_dtype);
+        assert_eq!(residual_add.config.output_dtype, rms_norm.config.io_dtype);
+
+        let config = ResidualAddRMSNormConfig {
+            hidden_dim: rms_norm.config.hidden_dim,
+            eps: rms_norm.config.eps,
+            io_dtype: rms_norm.config.io_dtype,
+        };
+        let shape = ResidualAddRMSNormShape {
+            num_total_tokens: rms_norm.shape.num_total_tokens,
+        };
+        let buffers = ResidualAddRMSNormOwnedBuffers::new(
+            residual_add.buffers.lhs,
+            residual_add.buffers.lhs_len_bytes,
+            residual_add.buffers.rhs,
+            residual_add.buffers.rhs_len_bytes,
+            rms_norm.buffers.weight,
+            rms_norm.buffers.weight_len_bytes,
+            residual_add.buffers.output,
+            residual_add.buffers.output_len_bytes,
+            rms_norm.buffers.output,
+            rms_norm.buffers.output_len_bytes,
+        );
+        match rms_norm.num_active_tokens_key {
+            Some(key) => Self::new_bucketed(config, shape, key, buffers),
+            None => Self::new(config, shape, buffers),
+        }
+    }
+
+    fn new(
+        config: ResidualAddRMSNormConfig,
+        shape: ResidualAddRMSNormShape,
+        buffers: ResidualAddRMSNormOwnedBuffers,
+    ) -> Self {
+        let device = Device::from_raw_retained(buffers.lhs.device());
+        Self {
+            pipeline: Kernel::new(
+                &device,
+                RESIDUAL_ADD_RMS_NORM_SOURCE,
+                residual_add_rms_norm_function_name(config, selected_kernel_kind(config)),
+            )
+            .as_raw_retained(),
+            config,
+            shape,
+            buffers,
+            num_active_tokens_key: None,
+        }
+    }
+
+    fn new_bucketed(
+        config: ResidualAddRMSNormConfig,
+        capacity_shape: ResidualAddRMSNormShape,
+        num_active_tokens_key: ReplayParameterKey,
+        buffers: ResidualAddRMSNormOwnedBuffers,
+    ) -> Self {
+        let device = Device::from_raw_retained(buffers.lhs.device());
+        Self {
+            pipeline: Kernel::new(
+                &device,
+                RESIDUAL_ADD_RMS_NORM_SOURCE,
+                residual_add_rms_norm_function_name(config, selected_kernel_kind(config)),
+            )
+            .as_raw_retained(),
+            config,
+            shape: capacity_shape,
+            buffers,
+            num_active_tokens_key: Some(num_active_tokens_key),
+        }
+    }
+
+    fn validate(&self) {
+        self.config.validate();
+        self.shape.validate();
+        assert!(self.buffers.lhs_len_bytes >= self.config.bytes(self.shape));
+        assert!(self.buffers.rhs_len_bytes >= self.config.bytes(self.shape));
+        assert!(self.buffers.weight_len_bytes >= self.config.weight_bytes());
+        assert!(self.buffers.residual_output_len_bytes >= self.config.bytes(self.shape));
+        assert!(self.buffers.norm_output_len_bytes >= self.config.bytes(self.shape));
+    }
+}
+
+impl ResidualAddCaptureRMSNormReplayInvocation {
+    pub(super) fn fuse(residual_add: ResidualAddCaptureReplayOp, rms_norm: RMSNormReplayOp) -> Self {
+        assert_eq!(residual_add.residual.config, ResidualAddConfig::bf16());
+        assert_eq!(rms_norm.config.io_dtype, Dtype::Bfloat16);
+        assert!(
+            ResidualAddRMSNormReplayInvocation::can_fuse(&residual_add.residual, &rms_norm),
+            "residual-add output must be the fused RMSNorm input"
+        );
+        let residual_values = rms_norm
+            .shape
+            .num_total_tokens
+            .checked_mul(rms_norm.config.hidden_dim)
+            .expect("residual-add capture RMSNorm value count must fit u32");
+        assert_eq!(residual_add.residual.shape.num_values, residual_values);
+        assert_eq!(
+            residual_add.capture.column_end - residual_add.capture.column_start,
+            rms_norm.config.hidden_dim,
+            "residual-add capture column width must match hidden dimension"
+        );
+
+        let config = ResidualAddRMSNormConfig {
+            hidden_dim: rms_norm.config.hidden_dim,
+            eps: rms_norm.config.eps,
+            io_dtype: rms_norm.config.io_dtype,
+        };
+        let shape = ResidualAddRMSNormShape {
+            num_total_tokens: rms_norm.shape.num_total_tokens,
+        };
+        let capture_row_width = residual_add.capture.row_width;
+        let capture_column_start = residual_add.capture.column_start;
+        let buffers = ResidualAddCaptureRMSNormOwnedBuffers::new(
+            residual_add.residual.buffers.lhs,
+            residual_add.residual.buffers.lhs_len_bytes,
+            residual_add.residual.buffers.rhs,
+            residual_add.residual.buffers.rhs_len_bytes,
+            rms_norm.buffers.weight,
+            rms_norm.buffers.weight_len_bytes,
+            residual_add.residual.buffers.output,
+            residual_add.residual.buffers.output_len_bytes,
+            residual_add.capture.buffer,
+            residual_add.capture.buffer_len_bytes,
+            rms_norm.buffers.output,
+            rms_norm.buffers.output_len_bytes,
+        );
+        match rms_norm.num_active_tokens_key {
+            Some(key) => Self::new_bucketed(config, shape, key, buffers, capture_row_width, capture_column_start),
+            None => Self::new(config, shape, buffers, capture_row_width, capture_column_start),
+        }
+    }
+
+    fn new(
+        config: ResidualAddRMSNormConfig,
+        shape: ResidualAddRMSNormShape,
+        buffers: ResidualAddCaptureRMSNormOwnedBuffers,
+        capture_row_width: u32,
+        capture_column_start: u32,
+    ) -> Self {
+        let device = Device::from_raw_retained(buffers.lhs.device());
+        Self {
+            pipeline: Kernel::new(
+                &device,
+                RESIDUAL_ADD_RMS_NORM_SOURCE,
+                residual_add_capture_rms_norm_function_name(config),
+            )
+            .as_raw_retained(),
+            config,
+            shape,
+            buffers,
+            capture_row_width,
+            capture_column_start,
+            num_active_tokens_key: None,
+        }
+    }
+
+    fn new_bucketed(
+        config: ResidualAddRMSNormConfig,
+        capacity_shape: ResidualAddRMSNormShape,
+        num_active_tokens_key: ReplayParameterKey,
+        buffers: ResidualAddCaptureRMSNormOwnedBuffers,
+        capture_row_width: u32,
+        capture_column_start: u32,
+    ) -> Self {
+        let device = Device::from_raw_retained(buffers.lhs.device());
+        Self {
+            pipeline: Kernel::new(
+                &device,
+                RESIDUAL_ADD_RMS_NORM_SOURCE,
+                residual_add_capture_rms_norm_function_name(config),
+            )
+            .as_raw_retained(),
+            config,
+            shape: capacity_shape,
+            buffers,
+            capture_row_width,
+            capture_column_start,
+            num_active_tokens_key: Some(num_active_tokens_key),
+        }
+    }
+
+    fn validate(&self) {
+        self.config.validate();
+        self.shape.validate();
+        assert_eq!(self.config.io_dtype, Dtype::Bfloat16);
+        assert!(self.capture_row_width >= self.config.hidden_dim);
+        assert!(self.capture_column_start <= self.capture_row_width - self.config.hidden_dim);
+        if self.config.hidden_dim.is_multiple_of(4) {
+            assert!(
+                self.capture_row_width.is_multiple_of(4),
+                "unsupported residual-add capture layout: vec4 hidden dimension requires a four-element-aligned row \
+                 width"
+            );
+            assert!(
+                self.capture_column_start.is_multiple_of(4),
+                "unsupported residual-add capture layout: vec4 hidden dimension requires a four-element-aligned \
+                 column start"
+            );
+        }
+        assert!(self.buffers.lhs_len_bytes >= self.config.bytes(self.shape));
+        assert!(self.buffers.rhs_len_bytes >= self.config.bytes(self.shape));
+        assert!(self.buffers.weight_len_bytes >= self.config.weight_bytes());
+        assert!(self.buffers.residual_output_len_bytes >= self.config.bytes(self.shape));
+        assert!(self.buffers.norm_output_len_bytes >= self.config.bytes(self.shape));
+        let last_row_start = (self.shape.num_total_tokens as usize - 1)
+            .checked_mul(self.capture_row_width as usize)
+            .expect("residual-add capture last-row offset must fit usize");
+        let required_values = last_row_start
+            .checked_add(self.capture_column_start as usize)
+            .and_then(|value| value.checked_add(self.config.hidden_dim as usize))
+            .expect("residual-add capture value count must fit usize");
+        let required_bytes = required_values
+            .checked_mul(Dtype::Bfloat16.item_size())
+            .expect("residual-add capture byte count must fit usize");
+        assert!(self.buffers.capture_output_len_bytes >= required_bytes);
+        for other in [
+            &self.buffers.lhs,
+            &self.buffers.rhs,
+            &self.buffers.weight,
+            &self.buffers.residual_output,
+            &self.buffers.norm_output,
+        ] {
+            assert!(
+                !std::ptr::eq(Retained::as_ptr(&self.buffers.capture_output), Retained::as_ptr(other),),
+                "residual-add capture output must not alias another fused residual/RMSNorm buffer"
+            );
+        }
+    }
+}
+
+fn record_num_active_tokens(
+    builder: &CommandRecorder,
+    binding_index: usize,
+    token_capacity: u32,
+    key: Option<ReplayParameterKey>,
+) {
+    match key {
+        Some(key) => builder.bind_u32(binding_index, key, 1, token_capacity),
+        None => builder.set_u32(binding_index, token_capacity),
+    }
+}
+
+fn selected_kernel_kind(config: ResidualAddRMSNormConfig) -> ResidualAddRMSNormKernelKind {
+    match config.io_dtype {
+        Dtype::Bfloat16 if config.hidden_dim.is_multiple_of(4) => ResidualAddRMSNormKernelKind::Bf16Vectorized,
+        Dtype::Float32 | Dtype::Bfloat16 => ResidualAddRMSNormKernelKind::Scalar,
+        dtype => panic!("unsupported residual-add RMSNorm dtype {dtype:?}"),
+    }
+}
+
+fn validate_kernel_kind(config: ResidualAddRMSNormConfig, kind: ResidualAddRMSNormKernelKind) {
+    if kind == ResidualAddRMSNormKernelKind::Bf16Vectorized {
+        assert_eq!(config.io_dtype, Dtype::Bfloat16);
+        assert!(
+            config.hidden_dim.is_multiple_of(4),
+            "vectorized residual-add RMSNorm requires hidden_dim divisible by 4"
+        );
+    }
+}
+
+fn residual_add_rms_norm_function_name(
+    config: ResidualAddRMSNormConfig,
+    kind: ResidualAddRMSNormKernelKind,
+) -> &'static str {
+    match (config.io_dtype, kind) {
+        (Dtype::Float32, ResidualAddRMSNormKernelKind::Scalar) => "residual_add_rms_norm_f32",
+        (Dtype::Bfloat16, ResidualAddRMSNormKernelKind::Scalar) => "residual_add_rms_norm_bf16",
+        (Dtype::Bfloat16, ResidualAddRMSNormKernelKind::Bf16Vectorized) => "residual_add_rms_norm_bf16_vec4",
+        (dtype, kind) => panic!("unsupported residual-add RMSNorm kernel: dtype={dtype:?} kind={kind:?}"),
+    }
+}
+
+fn residual_add_capture_rms_norm_function_name(config: ResidualAddRMSNormConfig) -> &'static str {
+    match config.io_dtype {
+        Dtype::Bfloat16 if config.hidden_dim.is_multiple_of(4) => "residual_add_capture_rms_norm_bf16_vec4",
+        Dtype::Bfloat16 => "residual_add_capture_rms_norm_bf16",
+        dtype => panic!("unsupported residual-add capture RMSNorm dtype {dtype:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use half::bf16;
+
+    use super::*;
+    use crate::components::RMSNormBuffers;
+    use crate::components::RMSNormConfig;
+    use crate::components::RMSNormKernel;
+    use crate::components::RMSNormShape;
+    use crate::components::ResidualAddBuffers;
+    use crate::components::ResidualAddConfig;
+    use crate::components::ResidualAddKernel;
+    use crate::components::ResidualAddShape;
+    use crate::metal::Stream;
+
+    #[test]
+    fn test_bf16_fusion() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let tokens = 3;
+        let hidden_dim = 128;
+        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
+        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim as u32, 1.0e-6));
+        let config = ResidualAddRMSNormConfig::bf16(hidden_dim as u32, 1.0e-6);
+        let fused_scalar =
+            ResidualAddRMSNormKernel::new_with_kind(&device, config, ResidualAddRMSNormKernelKind::Scalar);
+        let fused = ResidualAddRMSNormKernel::new(&device, config);
+        let shape = ResidualAddRMSNormShape {
+            num_total_tokens: tokens as u32,
+        };
+        let num_values = tokens * hidden_dim;
+        let lhs = bf16_buffer(&device, num_values, 13, -0.75);
+        let rhs = bf16_buffer(&device, num_values, 17, -0.25);
+        let weight = bf16_buffer(&device, hidden_dim, 5, 0.001);
+        let unfused_residual = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
+        let unfused_norm = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
+        let fused_scalar_residual = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
+        let fused_scalar_norm = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
+        let fused_vec4_residual = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
+        let fused_vec4_norm = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
+
+        let mut builder = stream.create_replay_program();
+        builder.record(residual_add.invoke(
+            ResidualAddShape {
+                num_values: num_values as u32,
+            },
+            ResidualAddBuffers {
+                lhs: &lhs,
+                rhs: &rhs,
+                output: &unfused_residual,
+            },
+        ));
+        builder.record_with_barrier_before(rms_norm.invoke(
+            RMSNormShape {
+                num_total_tokens: tokens as u32,
+            },
+            RMSNormBuffers {
+                input: &unfused_residual,
+                weight: &weight,
+                output: &unfused_norm,
+            },
+        ));
+        stream.submit_replay(&builder.build()).wait();
+
+        let mut builder = stream.create_replay_program();
+        builder.record(fused_scalar.invoke(
+            shape,
+            ResidualAddRMSNormBuffers {
+                lhs: &lhs,
+                rhs: &rhs,
+                weight: &weight,
+                residual_output: &fused_scalar_residual,
+                norm_output: &fused_scalar_norm,
+            },
+        ));
+        stream.submit_replay(&builder.build()).wait();
+
+        assert_eq!(
+            unfused_residual.read_typed::<u16>(0, num_values),
+            fused_scalar_residual.read_typed::<u16>(0, num_values)
+        );
+        assert_eq!(
+            unfused_norm.read_typed::<u16>(0, num_values),
+            fused_scalar_norm.read_typed::<u16>(0, num_values)
+        );
+
+        let mut builder = stream.create_replay_program();
+        builder.record(fused.invoke(
+            shape,
+            ResidualAddRMSNormBuffers {
+                lhs: &lhs,
+                rhs: &rhs,
+                weight: &weight,
+                residual_output: &fused_vec4_residual,
+                norm_output: &fused_vec4_norm,
+            },
+        ));
+        stream.submit_replay(&builder.build()).wait();
+
+        assert_eq!(
+            unfused_residual.read_typed::<u16>(0, num_values),
+            fused_vec4_residual.read_typed::<u16>(0, num_values)
+        );
+        assert_eq!(
+            unfused_norm.read_typed::<u16>(0, num_values),
+            fused_vec4_norm.read_typed::<u16>(0, num_values)
+        );
+    }
+
+    fn bf16_buffer(device: &Device, len: usize, step: usize, base: f32) -> Buffer {
+        let values = (0..len)
+            .map(|index| bf16::from_f32(base + ((index * step) % 23) as f32 * 0.03125).to_bits())
+            .collect::<Vec<_>>();
+        Buffer::from_slice(device, &values)
+    }
+}

@@ -354,7 +354,7 @@ Similar workspace roles do not imply shared structural ownership.
 
 `Qwen3Main` exposes the model-specific `Qwen3MainResidualCapture` boundary.
 Main queries the capture owner immediately before each layer's final post-MLP residual add.
-The capture owner returns an optional opaque `ResidualCaptureTarget`.
+The capture owner returns an optional opaque `ResidualAddCaptureTarget`.
 The destination selects a stable BF16 column range that the capture owner owns.
 `None` records the ordinary residual add.
 

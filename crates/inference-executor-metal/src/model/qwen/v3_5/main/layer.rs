@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::ResidualCaptureTarget;
+use inference_backend_metal::components::ResidualAddCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -31,15 +31,15 @@ use crate::model::qwen::v3_x::layer::Qwen3xMoE;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::residual::Residual;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::residual_add::ResidualAdd;
+use crate::model::rms_norm::RMSNorm;
 
 pub struct Qwen35MainLayer {
     layer_index: usize,
-    input_norm: RmsNorm,
+    input_norm: RMSNorm,
     attention: Qwen35MainAttention,
-    residual: Residual,
-    post_attention_norm: RmsNorm,
+    residual_add: ResidualAdd,
+    post_attention_norm: RMSNorm,
     mlp: Qwen35MainMLP,
     scratch: Rc<Qwen35MainLayerScratch>,
 }
@@ -71,7 +71,7 @@ pub struct Qwen35MainLayerInput<'a> {
     pub pages: &'a Buffer,
     pub residual_input: &'a Buffer,
     pub residual_output: &'a Buffer,
-    pub residual_capture_dest: Option<ResidualCaptureTarget<'a>>,
+    pub residual_capture_dest: Option<ResidualAddCaptureTarget<'a>>,
 }
 
 enum Qwen35MainAttentionInput<'a> {
@@ -133,15 +133,15 @@ impl Qwen35MainLayer {
         let eps = config.text_config.rms_norm_eps;
         Ok(Self {
             layer_index: model_layer_index,
-            input_norm: RmsNorm::new(
+            input_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 eps,
                 load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim])?,
             ),
             attention,
-            residual: Residual::new(device),
-            post_attention_norm: RmsNorm::new(
+            residual_add: ResidualAdd::new(device),
+            post_attention_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 eps,
@@ -191,13 +191,12 @@ impl ReplayLayer for Qwen35MainLayer {
             &self.scratch.branch_output,
             attention_input,
         );
-        self.residual.record(
+        self.residual_add.record(
             recorder,
             num_values,
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
-            None,
         );
         self.post_attention_norm.record(
             recorder,
@@ -211,14 +210,27 @@ impl ReplayLayer for Qwen35MainLayer {
             &self.scratch.branch_output,
             input.num_tokens,
         );
-        self.residual.record(
-            recorder,
-            num_values,
-            &self.scratch.post_attention_hidden,
-            &self.scratch.branch_output,
-            input.residual_output,
-            input.residual_capture_dest,
-        );
+        match input.residual_capture_dest {
+            Some(capture) => {
+                self.residual_add.record_with_capture(
+                    recorder,
+                    num_values,
+                    &self.scratch.post_attention_hidden,
+                    &self.scratch.branch_output,
+                    input.residual_output,
+                    capture,
+                )
+            },
+            None => {
+                self.residual_add.record(
+                    recorder,
+                    num_values,
+                    &self.scratch.post_attention_hidden,
+                    &self.scratch.branch_output,
+                    input.residual_output,
+                )
+            },
+        }
         input.residual_output
     }
 }

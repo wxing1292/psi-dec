@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::ResidualCaptureTarget;
+use inference_backend_metal::components::ResidualAddCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNReplayShape;
@@ -23,7 +23,7 @@ use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
 pub mod embed;
@@ -32,7 +32,7 @@ pub mod output;
 
 pub struct Qwen35Main {
     layers: Vec<Qwen35MainLayer>,
-    final_norm: RmsNorm,
+    final_norm: RMSNorm,
     residual_capture: Option<Rc<dyn Qwen35MainResidualCapture>>,
 }
 
@@ -57,7 +57,7 @@ pub struct Qwen35MainArgs<'a> {
 /// replay topology. They must remain stable for the component's lifetime and
 /// must not alias Main inputs, outputs, or shared layer scratch.
 pub trait Qwen35MainResidualCapture {
-    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>>;
+    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>>;
 }
 
 impl Qwen35Main {
@@ -114,7 +114,7 @@ impl Qwen35Main {
             load_qwen3x_norm_weight(device, store, &final_norm_weight, &[config.text_config.hidden_size])?;
         Ok(Self {
             layers,
-            final_norm: RmsNorm::new(
+            final_norm: RMSNorm::new(
                 device,
                 config.text_config.hidden_size,
                 config.text_config.rms_norm_eps,
@@ -242,9 +242,9 @@ mod tests {
     }
 
     impl Qwen35MainResidualCapture for SelectedLayerCapture {
-        fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>> {
+        fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
             (model_layer_index == self.model_layer_index)
-                .then(|| ResidualCaptureTarget::columns(&self.capture_output, 16, 4..12))
+                .then(|| ResidualAddCaptureTarget::columns(&self.capture_output, 16, 4..12))
         }
     }
 

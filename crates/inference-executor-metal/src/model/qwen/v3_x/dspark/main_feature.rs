@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use inference_backend_metal::components::ResidualCaptureTarget;
+use inference_backend_metal::components::ResidualAddCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -19,7 +19,7 @@ use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::quant_weight;
 use crate::model::qwen::v3_x::weight::typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::rms_norm::RMSNorm;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Qwen3xDSparkMainFeatureLayout {
@@ -138,14 +138,14 @@ pub struct Qwen3xDSparkMainFeatureProjector {
     layout: Qwen3xDSparkMainFeatureLayout,
     residual_bindings: Qwen3xDSparkMainResidualBindings,
     fc: AffineQuantizedMatmul,
-    hidden_norm: RmsNorm,
+    hidden_norm: RMSNorm,
     weights: Qwen3xDSparkMainFeatureWeights,
     main_residuals: Buffer,
     main_feature: Buffer,
 }
 
 impl Qwen3MainResidualCapture for Qwen3xDSparkMainFeatureProjector {
-    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>> {
+    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
         Qwen3xDSparkMainFeatureProjector::capture_for_model_layer(self, model_layer_index)
     }
 }
@@ -199,7 +199,7 @@ impl Qwen3xDSparkMainFeatureProjector {
             layout,
             residual_bindings: Qwen3xDSparkMainResidualBindings::new(plan),
             fc: AffineQuantizedMatmul::new(device, fc_config),
-            hidden_norm: RmsNorm::new(device, layout.hidden_dim as usize, plan.hidden_norm_eps, norm_weight),
+            hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, plan.hidden_norm_eps, norm_weight),
             weights: Qwen3xDSparkMainFeatureWeights {
                 fc_weight: Buffer::from_slice(device, &weight),
                 fc_scales: Buffer::from_slice(device, &scales),
@@ -210,9 +210,9 @@ impl Qwen3xDSparkMainFeatureProjector {
         })
     }
 
-    pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualCaptureTarget<'_>> {
+    pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
         self.residual_bindings.get(model_layer_index).map(|residual| {
-            ResidualCaptureTarget::columns(
+            ResidualAddCaptureTarget::columns(
                 &self.main_residuals,
                 self.layout.selected_hidden_dim,
                 self.layout.capture_columns(residual.residual_slice_index),

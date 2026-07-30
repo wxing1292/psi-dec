@@ -16,15 +16,15 @@ use crate::model::qwen::v3_x::dspark::attention::Qwen3xDSparkAttention;
 use crate::model::qwen::v3_x::dspark::plan::Qwen3xDSparkLayerPlan;
 use crate::model::qwen::v3_x::layer::Qwen3xDenseMLP;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::residual::Residual;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::residual_add::ResidualAdd;
+use crate::model::rms_norm::RMSNorm;
 
 pub struct Qwen3xDSparkLayer {
     dspark_layer_index: usize,
-    input_norm: RmsNorm,
+    input_norm: RMSNorm,
     attention: Qwen3xDSparkAttention,
-    residual: Residual,
-    post_attention_norm: RmsNorm,
+    residual_add: ResidualAdd,
+    post_attention_norm: RMSNorm,
     mlp: Qwen3xDenseMLP,
     scratch: Rc<Qwen3xDSparkLayerScratch>,
 }
@@ -70,15 +70,15 @@ impl Qwen3xDSparkLayer {
         );
         Ok(Self {
             dspark_layer_index: plan.dspark_layer_index,
-            input_norm: RmsNorm::new(
+            input_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 plan.input_norm_eps,
                 load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim])?,
             ),
             attention: Qwen3xDSparkAttention::load(device, store, plan, gqa, gqa_state)?,
-            residual: Residual::new(device),
-            post_attention_norm: RmsNorm::new(
+            residual_add: ResidualAdd::new(device),
+            post_attention_norm: RMSNorm::new(
                 device,
                 hidden_dim,
                 plan.post_attention_norm_eps,
@@ -126,13 +126,12 @@ impl Qwen3xDSparkLayer {
             &self.scratch.branch_output,
             input.pages,
         );
-        self.residual.record(
+        self.residual_add.record(
             recorder,
             num_values,
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
-            None,
         );
         self.post_attention_norm.record(
             recorder,
@@ -146,13 +145,12 @@ impl Qwen3xDSparkLayer {
             &self.scratch.branch_output,
             input.num_tokens,
         );
-        self.residual.record(
+        self.residual_add.record(
             recorder,
             num_values,
             &self.scratch.post_attention_hidden,
             &self.scratch.branch_output,
             input.residual_output,
-            None,
         );
         input.residual_output
     }

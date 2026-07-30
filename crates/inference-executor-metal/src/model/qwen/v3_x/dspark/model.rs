@@ -18,13 +18,13 @@ use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerScratch;
 use crate::model::qwen::v3_x::dspark::main_feature::Qwen3xDSparkMainFeatureProjector;
 use crate::model::qwen::v3_x::dspark::plan::Qwen3xDSparkPlan;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::rms_norm::RmsNorm;
+use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
 pub struct Qwen3xDSparkModel {
     main_feature_projector: Rc<Qwen3xDSparkMainFeatureProjector>,
     layers: Vec<Qwen3xDSparkLayer>,
-    final_norm: RmsNorm,
+    final_norm: RMSNorm,
 }
 
 pub struct Qwen3xDSparkContext {
@@ -140,7 +140,7 @@ impl Qwen3xDSparkModel {
         Ok(Rc::new(Self {
             main_feature_projector,
             layers,
-            final_norm: RmsNorm::new(device, hidden_dim, plan.norm_eps, final_norm_weight),
+            final_norm: RMSNorm::new(device, hidden_dim, plan.norm_eps, final_norm_weight),
         }))
     }
 
