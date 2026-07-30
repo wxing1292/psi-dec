@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use inference_runtime_core::Result;
 use inference_runtime_core::config::SchedulerConfig;
 use inference_runtime_core::log_info_invalid_argument;
-use inference_runtime_service::observability::ProfileMode;
-use inference_runtime_service::observability::ProfilingConfig;
-use inference_runtime_service::observability::ServiceObservabilityConfig;
+use inference_runtime_service::telemetry::ProfileMode;
+use inference_runtime_service::telemetry::ProfilingConfig;
+use inference_runtime_service::telemetry::TelemetryConfig;
 
 use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::args::Qwen35Args;
@@ -26,7 +26,7 @@ pub struct Qwen3Config {
     http_listen_addr: SocketAddr,
     hf_model_dir: PathBuf,
     hf_dspark_model_dir: Option<PathBuf>,
-    observability: ServiceObservabilityConfig,
+    telemetry: TelemetryConfig,
     num_cache_pages: usize,
     scheduler_config: SchedulerConfig,
 }
@@ -59,7 +59,7 @@ impl Qwen3Config {
             http_listen_addr: args.http_listen_addr,
             hf_model_dir: args.hf_model_dir,
             hf_dspark_model_dir: args.hf_dspark_model_dir,
-            observability: ServiceObservabilityConfig {
+            telemetry: TelemetryConfig {
                 profiling: ProfilingConfig {
                     mode: args.profile.map(ProfileMode::from),
                     summary_every: args.profile.map_or(0, |_| 32),
@@ -92,8 +92,8 @@ impl Qwen3Config {
         self.hf_dspark_model_dir.as_deref()
     }
 
-    pub fn observability_config(&self) -> ServiceObservabilityConfig {
-        self.observability
+    pub fn telemetry_config(&self) -> TelemetryConfig {
+        self.telemetry
     }
 
     pub fn num_cache_pages(&self) -> usize {
@@ -111,7 +111,7 @@ pub struct Qwen35Config {
     http_listen_addr: SocketAddr,
     hf_model_dir: PathBuf,
     hf_mtp_model_dir: Option<PathBuf>,
-    observability: ServiceObservabilityConfig,
+    telemetry: TelemetryConfig,
     num_mtp_modules: usize,
     num_cache_pages: usize,
     scheduler_config: SchedulerConfig,
@@ -165,7 +165,7 @@ impl Qwen35Config {
             http_listen_addr: args.http_listen_addr,
             hf_model_dir: args.hf_model_dir,
             hf_mtp_model_dir: args.hf_mtp_model_dir,
-            observability: ServiceObservabilityConfig {
+            telemetry: TelemetryConfig {
                 profiling: ProfilingConfig {
                     mode: args.profile.map(ProfileMode::from),
                     summary_every: args.profile.map_or(0, |_| 32),
@@ -199,8 +199,8 @@ impl Qwen35Config {
         self.hf_mtp_model_dir.as_deref()
     }
 
-    pub fn observability_config(&self) -> ServiceObservabilityConfig {
-        self.observability
+    pub fn telemetry_config(&self) -> TelemetryConfig {
+        self.telemetry
     }
 
     pub fn num_mtp_modules(&self) -> usize {

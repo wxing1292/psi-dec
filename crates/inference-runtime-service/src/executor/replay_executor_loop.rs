@@ -18,10 +18,10 @@ use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
 
 use crate::perf_metrics::ExecutorBatchPerfMetrics;
-use crate::perf_metrics::emit_executor_batch_perf_metrics;
 use crate::perf_metrics::summarize_batch_device_request;
 use crate::perf_metrics::summarize_batch_device_response;
 use crate::profiling;
+use crate::telemetry::emit_executor_batch_perf_metrics;
 
 pub struct ReplayableModelExecutorLoop<M> {
     batch_dev_req_rx: Receiver<BatchDeviceRequest>,

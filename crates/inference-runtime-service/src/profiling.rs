@@ -176,12 +176,12 @@ fn emit_tree_profile_summary(
             seq = model_total_count,
             path = %path,
             n = stats.count,
-            incl_ms = stats.inclusive_total_ms,
-            incl_avg_ms = stats.inclusive_avg_ms(),
-            excl_ms = stats.exclusive_total_ms,
-            excl_avg_ms = stats.exclusive_avg_ms(),
-            min_ms = stats.min_ms,
-            max_ms = stats.max_ms,
+            incl_ms = %format_args!("{:.4}", stats.inclusive_total_ms),
+            incl_avg_ms = %format_args!("{:.4}", stats.inclusive_avg_ms()),
+            excl_ms = %format_args!("{:.4}", stats.exclusive_total_ms),
+            excl_avg_ms = %format_args!("{:.4}", stats.exclusive_avg_ms()),
+            min_ms = %format_args!("{:.4}", stats.min_ms),
+            max_ms = %format_args!("{:.4}", stats.max_ms),
         );
     }
 }

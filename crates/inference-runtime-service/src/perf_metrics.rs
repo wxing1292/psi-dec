@@ -90,99 +90,6 @@ pub fn summarize_batch_device_response(batch: &BatchDeviceResponse) -> BatchResp
     summary
 }
 
-pub fn emit_executor_batch_perf_metrics(
-    debug_logging: bool,
-    model_name: &str,
-    batch_seq: u64,
-    batch_summary: BatchRequestSummary,
-    response_summary: BatchResponseSummary,
-    metrics: ExecutorBatchPerfMetrics,
-) {
-    if debug_logging {
-        emit_executor_batch_perf_debug(model_name, batch_seq, &batch_summary, &response_summary, &metrics);
-    } else {
-        emit_executor_batch_perf_info(model_name, batch_seq, &batch_summary, &response_summary, &metrics);
-    }
-}
-
-fn emit_executor_batch_perf_info(
-    model_name: &str,
-    batch_seq: u64,
-    batch_summary: &BatchRequestSummary,
-    response_summary: &BatchResponseSummary,
-    metrics: &ExecutorBatchPerfMetrics,
-) {
-    let acceptance_rate = ratio(response_summary.accepted_spec_tokens, batch_summary.input_spec_tokens);
-    tracing::info!(
-        target: "inference-runtime-service::perf",
-        phase = "executor.batch.perf",
-        model = model_name,
-        batch_seq,
-        num_reqs = batch_summary.num_reqs,
-        num_tokens = batch_summary.query_tokens,
-        num_spec_tokens = batch_summary.input_spec_tokens,
-        num_accepted_tokens = response_summary.accepted_spec_tokens,
-        num_sampled_tokens = response_summary.sampled_tokens,
-        acceptance_rate,
-        latency_ms = ms(metrics.total_elapsed),
-        "executor batch perf"
-    );
-}
-
-fn emit_executor_batch_perf_debug(
-    model_name: &str,
-    batch_seq: u64,
-    batch_summary: &BatchRequestSummary,
-    response_summary: &BatchResponseSummary,
-    metrics: &ExecutorBatchPerfMetrics,
-) {
-    let rejected_spec_tokens = batch_summary
-        .input_spec_tokens
-        .saturating_sub(response_summary.accepted_spec_tokens);
-    let acceptance_rate = ratio(response_summary.accepted_spec_tokens, batch_summary.input_spec_tokens);
-    let rejection_rate = ratio(rejected_spec_tokens, batch_summary.input_spec_tokens);
-
-    tracing::debug!(
-        target: "inference-runtime-service::perf",
-        phase = "executor.batch.perf",
-        model = model_name,
-        batch_seq,
-        num_reqs = batch_summary.num_reqs,
-        num_tokens = batch_summary.query_tokens,
-        num_spec_tokens = batch_summary.input_spec_tokens,
-        num_accepted_tokens = response_summary.accepted_spec_tokens,
-        num_sampled_tokens = response_summary.sampled_tokens,
-        acceptance_rate,
-        latency_ms = ms(metrics.total_elapsed),
-        num_prefill_reqs = batch_summary.prefill_reqs,
-        num_decode_reqs = batch_summary.decode_reqs,
-        max_num_tokens = batch_summary.max_query_tokens,
-        num_spec_reqs = batch_summary.spec_decode_reqs,
-        num_rejected_tokens = rejected_spec_tokens,
-        num_output_spec_tokens = response_summary.output_spec_tokens,
-        rejection_rate,
-        sampled_rows = metrics.sampled_rows,
-        model_output_main_replay_ms = metrics.model_output_timing.map(|timing| ms(timing.main_replay_elapsed)),
-        model_output_main_sample_replay_ms =
-            metrics.model_output_timing.map(|timing| ms(timing.main_sample_replay_elapsed)),
-        model_output_sample_read_ms = metrics.model_output_timing.map(|timing| ms(timing.sample_read_elapsed)),
-        model_output_rejection_build_ms =
-            metrics.model_output_timing.map(|timing| ms(timing.rejection_build_elapsed)),
-        model_output_rejection_read_ms =
-            metrics.model_output_timing.map(|timing| ms(timing.rejection_read_elapsed)),
-        model_output_spec_build_ms = metrics.model_output_timing.map(|timing| ms(timing.spec_build_elapsed)),
-        model_output_spec_replay_ms = metrics.model_output_timing.map(|timing| ms(timing.spec_replay_elapsed)),
-        model_output_spec_read_ms = metrics.model_output_timing.map(|timing| ms(timing.spec_read_elapsed)),
-        model_output_spec_passes = metrics.model_output_timing.map(|timing| timing.spec_passes),
-        prepare_batch_ms = ms(metrics.prepare_batch_elapsed),
-        input_ms = ms(metrics.input_elapsed),
-        model_ms = ms(metrics.model_elapsed),
-        output_ms = ms(metrics.output_elapsed),
-        commit_batch_ms = ms(metrics.commit_batch_elapsed),
-        "executor batch perf"
-    );
-}
-
 #[derive(Clone, Debug)]
 pub struct DecodePerfMetrics {
     pub request_id: u64,
@@ -259,14 +166,6 @@ pub fn ms(duration: Duration) -> f64 {
 fn rate(tokens: usize, duration: Duration) -> Option<f64> {
     let seconds = duration.as_secs_f64();
     (seconds > 0.0).then_some(tokens as f64 / seconds)
-}
-
-fn ratio(numerator: usize, denominator: usize) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        numerator as f64 / denominator as f64
-    }
 }
 
 fn percentile_ms(values: &[Duration], percentile: f64) -> Option<f64> {
@@ -375,9 +274,5 @@ mod tests {
         assert_eq!(response_summary.accepted_spec_tokens, 1);
         assert_eq!(response_summary.sampled_tokens, 2);
         assert_eq!(response_summary.output_spec_tokens, 2);
-        assert_eq!(
-            ratio(response_summary.accepted_spec_tokens, request_summary.input_spec_tokens),
-            0.5
-        );
     }
 }

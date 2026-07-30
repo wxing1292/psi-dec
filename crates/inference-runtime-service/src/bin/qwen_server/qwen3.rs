@@ -11,9 +11,9 @@ use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_service::codec::qwen::QwenCodec;
-use inference_runtime_service::observability::CacheLaneLogSummary;
-use inference_runtime_service::observability::StartupLogger;
 use inference_runtime_service::runtime::serve_replay_model;
+use inference_runtime_service::telemetry::CacheLaneLogSummary;
+use inference_runtime_service::telemetry::StartupLogger;
 
 use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::config::QWEN3_MAX_RUNNING_REQUESTS;
@@ -36,8 +36,8 @@ pub fn run() {
 fn run_inner() -> Result<()> {
     let args = Qwen3Args::parse();
     let config = Qwen3Config::from_args(args)?;
-    let observability = config.observability_config();
-    let _observability = observability.init();
+    let telemetry = config.telemetry_config();
+    telemetry.init();
     let startup = StartupLogger::new("qwen3");
 
     tracing::info!(
@@ -109,7 +109,7 @@ fn run_inner() -> Result<()> {
         runtime_config,
         scheduler_config,
         model,
-        observability.debug_logging,
+        telemetry.debug_logging,
     )
 }
 

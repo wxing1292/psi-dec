@@ -15,9 +15,9 @@ use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
 use inference_runtime_service::codec::qwen::QwenCodec;
-use inference_runtime_service::observability::CacheLaneLogSummary;
-use inference_runtime_service::observability::StartupLogger;
 use inference_runtime_service::runtime::serve_replay_model;
+use inference_runtime_service::telemetry::CacheLaneLogSummary;
+use inference_runtime_service::telemetry::StartupLogger;
 
 use crate::qwen_server::args::Qwen35Args;
 use crate::qwen_server::config::QWEN35_MAX_RUNNING_REQUESTS;
@@ -61,8 +61,8 @@ fn run_or_exit(kind: ModelKind) {
 fn run(kind: ModelKind) -> Result<()> {
     let args = Qwen35Args::parse();
     let config = Qwen35Config::from_args(args)?;
-    let observability = config.observability_config();
-    let _observability = observability.init();
+    let telemetry = config.telemetry_config();
+    telemetry.init();
     let startup = StartupLogger::new(kind.label());
 
     startup.event("reading model config");
@@ -124,7 +124,7 @@ fn run(kind: ModelKind) -> Result<()> {
                 runtime_config,
                 scheduler_config,
                 model,
-                observability.debug_logging,
+                telemetry.debug_logging,
             )
         },
         1 => {
@@ -135,7 +135,7 @@ fn run(kind: ModelKind) -> Result<()> {
                 runtime_config,
                 scheduler_config,
                 model,
-                observability.debug_logging,
+                telemetry.debug_logging,
             )
         },
         _ => unreachable!("validated Qwen config supports at most one MTP module"),
