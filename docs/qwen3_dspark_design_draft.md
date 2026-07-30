@@ -1553,6 +1553,59 @@ Verdict: The final deterministic output and trajectory are stable.
 The optimized fixed-block DSpark path now has a positive deployment-performance result for this one-request workload.
 Confidence-guided proposal length remains deferred.
 
+### Acceptance correctness audit
+
+The 2026-07-29 audit used clean commit `dad01342fb8eb4fc828b4fdd00db51d8db65fe9f`.
+It ran on an Apple M3 Max with a 40-core GPU.
+It used `Qwen3-14B-4bit` and `dspark_qwen3_14b_block7-affine`.
+All GPU commands ran serially.
+
+Each request used:
+
+```text
+temperature=0
+top_k=1
+top_p=1
+seed=1
+```
+
+The four-prompt result was:
+
+| Workload | Output tokens | Verification rounds | Proposed | Accepted | Proposal acceptance | Accepted length |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Sky explanation | 98 | 34 | 238 | 65 | 27.31% | 2.91 |
+| Algebra | 128 | 20 | 140 | 113 | 80.71% | 6.65 |
+| Python code | 128 | 20 | 140 | 109 | 77.86% | 6.45 |
+| Database engineering | 128 | 40 | 280 | 93 | 33.21% | 3.33 |
+| Aggregate | 482 | 114 | 798 | 380 | 47.62% | 4.33 |
+
+`Accepted length` includes the Main continuation token from each verification round.
+Proposal acceptance uses only the seven draft slots.
+
+The aggregate position-conditional acceptance was:
+
+```text
+position:                 1      2      3      4      5      6      7
+conditional acceptance: 82.5%  79.8%  74.7%  87.5%  83.7%  85.4%  85.7%
+```
+
+This curve rules out an anchor or proposal-position shift.
+It also does not show suffix collapse.
+The workload spread follows the expected DSpark domain behavior.
+
+The audit compared all four DSpark greedy outputs with Main-only outputs.
+The sky, algebra, and code outputs matched byte for byte.
+The database-engineering output diverged at output token 51.
+The divergence repeated deterministically in each path.
+The DSpark proposal token at that position was `235`.
+Sparse rejection accepted zero draft tokens.
+The eight-row Main verification sampled token `117`.
+The one-row Main path sampled token `223`.
+
+Verdict: The divergence is not an incorrect draft acceptance.
+The audit found no DSpark proposal, Markov, attention, or sparse-rejection defect.
+Strict one-row and multi-row Main numerical parity remains a separate investigation.
+
 ## Main and MTP submission evidence
 
 The 2026-07-28 comparison used base commit `3be69962c392d6ae75f33b2bef65e9403b680b30`.

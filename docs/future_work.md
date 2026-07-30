@@ -134,31 +134,17 @@ component path as the design.
 
 ## Model and Backend Investigations
 
-- Recover Qwen3 DSpark end-to-end performance in this order:
-  1. Continue the Main multi-row verification investigation after the retained dense-MLP QMM BM8/BN32 change.
-     Preserve one Main submission for each batch.
-     Separate Main body, GatherUnembed, and sparse rejection evidence.
-  2. Re-run deterministic service throughput and acceptance with the retained DSpark proposal and Main-verification
-     optimizations.
-     Do not replace the earlier deployment verdict until this run is complete.
-  3. Execute the official confidence head and add dynamic proposal lengths.
-     Keep confidence generation in the model executor.
-     Keep global proposal ranking and verification-budget allocation in runtime scheduling.
-     Do not add variable proposal lengths until the scheduler owns this cross-request policy.
-
-  The first deterministic Qwen3-14B comparison measured `41.180 tok/s` for Main-only and `33.611 tok/s` for
-  fixed-block DSpark.
-  Stable DSpark batches spent approximately 75.3 ms in 8-row Main verification and rejection.
-  They spent approximately 12.7 ms in the complete DSpark proposal submission.
-  The proposal acceptance rate was `27.7%`.
-  The earlier dense-MLP diagnostic compared QMV with BM32/BN32 QMM.
-  A later same-process comparison measured `2075.433 µs` for the previous QMV path and `1406.506 µs` for
-  BM8/BN32 QMM at eight rows.
-  Production now uses QMV for 1–5 rows, BM8/BN32 for 6–8 rows, BM16/BN32 for 9–16 rows, and BM32/BN32 above 16
-  rows for large dense MLPs.
-  An eight-row Qwen3 GQA diagnostic measured `0.695479 ms` for the production tiled path and `0.725750 ms` for the
-  single-Q path.
-  Compare confidence-guided verification lengths with bounded Main multi-row verification work.
+- Execute the official Qwen3 DSpark confidence head and add dynamic proposal lengths.
+  Keep confidence generation in the model executor.
+  Keep global proposal ranking and verification-budget allocation in runtime scheduling.
+  Do not add variable proposal lengths until the scheduler owns this cross-request policy.
+- Investigate strict one-row and multi-row Qwen3 Main numerical parity.
+  The 2026-07-29 greedy acceptance audit found one deterministic output divergence in four prompts.
+  At the first divergence, sparse rejection accepted zero draft tokens.
+  The eight-row Main verification sampled token `117`.
+  The one-row Main path sampled token `223`.
+  Compare the Main GQA, dense MLP, and unembed outputs before changing production kernels.
+  Treat exact batch-shape reproducibility as a separate requirement from DSpark rejection correctness.
 - Add a separate gated DSpark GQA implementation when a supported checkpoint requires it.
   Do not add a runtime gate flag to `UngatedDSparkGQA`.
   Keep the history map, block map, reducer, page layout, and scratch contracts gate-neutral.
