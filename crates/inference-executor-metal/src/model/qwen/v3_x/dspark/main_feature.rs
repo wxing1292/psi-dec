@@ -8,16 +8,15 @@ use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainFeatureWeightBindings;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3::main::Qwen3MainResidualCapture;
-use crate::model::qwen::v3_x::dspark::plan::Qwen3xDSparkMainResidualPlan;
-use crate::model::qwen::v3_x::dspark::plan::Qwen3xDSparkPlan;
-use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::qwen::v3_x::weight::quant_weight;
-use crate::model::qwen::v3_x::weight::typed_tensor;
+use crate::model::main_residual_capture::MainResidualCapture;
+use crate::model::qwen::v3_x::weight::remove_quant_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 use crate::model::rms_norm::RMSNorm;
 
@@ -30,38 +29,27 @@ struct Qwen3xDSparkMainFeatureLayout {
 }
 
 impl Qwen3xDSparkMainFeatureLayout {
-    fn new(plan: &Qwen3xDSparkPlan, max_tokens: usize) -> Self {
+    fn new(config: &Qwen3xDSparkConfig, max_tokens: usize) -> Self {
         assert!(max_tokens > 0, "Qwen3 DSpark Main-feature workspace requires tokens");
         assert!(
-            !plan.main_residuals.is_empty(),
+            !config.target_layer_ids.is_empty(),
             "Qwen3 DSpark Main-feature workspace requires selected decoder outputs"
         );
         let max_tokens = max_tokens
             .try_into()
             .expect("Qwen3 DSpark Main-feature max_tokens must fit u32");
-        let num_selected_residuals = plan
-            .main_residuals
+        let num_selected_residuals = config
+            .target_layer_ids
             .len()
             .try_into()
             .expect("Qwen3 DSpark selected decoder-output count must fit u32");
-        let hidden_dim: u32 = plan
-            .fc
-            .output_dim
+        let hidden_dim: u32 = config
+            .hidden_size
             .try_into()
             .expect("Qwen3 DSpark Main hidden dimension must fit u32");
         let selected_hidden_dim = hidden_dim
             .checked_mul(num_selected_residuals)
             .expect("Qwen3 DSpark selected Main width must fit u32");
-        assert_eq!(
-            plan.fc.input_dim, selected_hidden_dim as usize,
-            "Qwen3 DSpark FC input must equal the selected Main width"
-        );
-        for (expected_slice, residual) in plan.main_residuals.iter().enumerate() {
-            assert_eq!(
-                residual.residual_slice_index, expected_slice,
-                "Qwen3 DSpark Main residual slices must preserve config order"
-            );
-        }
         Self {
             max_tokens,
             num_selected_residuals,
@@ -99,31 +87,30 @@ impl Qwen3xDSparkMainFeatureLayout {
 }
 
 struct Qwen3xDSparkMainResidualBindings {
-    by_model_layer: Vec<Option<Qwen3xDSparkMainResidualPlan>>,
+    by_model_layer: Vec<Option<usize>>,
 }
 
 impl Qwen3xDSparkMainResidualBindings {
-    fn new(plan: &Qwen3xDSparkPlan) -> Self {
-        let num_main_layers = plan
-            .main_residuals
+    fn new(target_layer_ids: &[usize]) -> Self {
+        let num_main_layers = target_layer_ids
             .iter()
-            .map(|residual| residual.model_layer_index)
+            .copied()
             .max()
             .and_then(|last_layer| last_layer.checked_add(1))
             .expect("Qwen3 DSpark Main residual bindings require layers");
         let mut by_model_layer = vec![None; num_main_layers];
-        for &residual in &plan.main_residuals {
-            let slot = &mut by_model_layer[residual.model_layer_index];
+        for (residual_slice_index, &model_layer_index) in target_layer_ids.iter().enumerate() {
+            let slot = &mut by_model_layer[model_layer_index];
             assert!(
                 slot.is_none(),
                 "Qwen3 DSpark selected Main decoder layers must be unique"
             );
-            *slot = Some(residual);
+            *slot = Some(residual_slice_index);
         }
         Self { by_model_layer }
     }
 
-    fn get(&self, model_layer_index: usize) -> Option<Qwen3xDSparkMainResidualPlan> {
+    fn get(&self, model_layer_index: usize) -> Option<usize> {
         self.by_model_layer.get(model_layer_index).copied().flatten()
     }
 }
@@ -144,7 +131,7 @@ pub struct Qwen3xDSparkMainFeatureProjector {
     main_feature: Buffer,
 }
 
-impl Qwen3MainResidualCapture for Qwen3xDSparkMainFeatureProjector {
+impl MainResidualCapture for Qwen3xDSparkMainFeatureProjector {
     fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
         Qwen3xDSparkMainFeatureProjector::capture_for_model_layer(self, model_layer_index)
     }
@@ -154,11 +141,19 @@ impl Qwen3xDSparkMainFeatureProjector {
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        plan: &Qwen3xDSparkPlan,
+        config: &Qwen3xDSparkConfig,
         bindings: &Qwen3xDSparkMainFeatureWeightBindings,
         max_tokens: usize,
     ) -> Result<Self, ModelExecutorError> {
-        let layout = Qwen3xDSparkMainFeatureLayout::new(plan, max_tokens);
+        let layout = Qwen3xDSparkMainFeatureLayout::new(config, max_tokens);
+        let mut tensor_names = Vec::new();
+        bindings.push_tensor_names(&mut tensor_names);
+        let mut tensors = store.load_tensors(tensor_names)?;
+        let quantization = config
+            .quantization
+            .as_ref()
+            .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark Main feature requires quantization config"))?
+            .resolve_for_tensor(&bindings.fc.weight);
         let fc_config = AffineQuantizedMatmulConfig::same_dtype(
             layout
                 .hidden_dim
@@ -168,16 +163,19 @@ impl Qwen3xDSparkMainFeatureProjector {
                 .selected_hidden_dim
                 .try_into()
                 .expect("Qwen3 DSpark selected Main width must fit i32"),
-            plan.fc
+            quantization
                 .group_size
                 .try_into()
                 .expect("Qwen3 DSpark Main FC group_size must fit i32"),
-            plan.fc.bits.try_into().expect("Qwen3 DSpark Main FC bits must fit i32"),
+            quantization
+                .bits
+                .try_into()
+                .expect("Qwen3 DSpark Main FC bits must fit i32"),
             Dtype::Bfloat16,
         );
-        let weight = quant_weight(store, &bindings.fc.weight)?;
-        let scales = typed_tensor(store, &bindings.fc.scales, safetensors::Dtype::BF16)?.into_data();
-        let biases = typed_tensor(store, &bindings.fc.biases, safetensors::Dtype::BF16)?.into_data();
+        let weight = remove_quant_weight(&mut tensors, &bindings.fc.weight)?;
+        let scales = remove_typed_tensor(&mut tensors, &bindings.fc.scales, safetensors::Dtype::BF16)?.into_data();
+        let biases = remove_typed_tensor(&mut tensors, &bindings.fc.biases, safetensors::Dtype::BF16)?.into_data();
         validate_len("Qwen3 DSpark Main FC weight", weight.len(), fc_config.weight_bytes())?;
         validate_len(
             "Qwen3 DSpark Main FC scales",
@@ -189,17 +187,17 @@ impl Qwen3xDSparkMainFeatureProjector {
             biases.len(),
             fc_config.scale_or_bias_bytes(),
         )?;
-        let norm_weight = load_qwen3x_norm_weight(
+        let norm_weight = remove_qwen3x_norm_weight(
             device,
-            store,
+            &mut tensors,
             &bindings.hidden_norm_weight,
             &[layout.hidden_dim as usize],
         )?;
-        Ok(Self {
+        let projector = Self {
             layout,
-            residual_bindings: Qwen3xDSparkMainResidualBindings::new(plan),
+            residual_bindings: Qwen3xDSparkMainResidualBindings::new(&config.target_layer_ids),
             fc: AffineQuantizedMatmul::new(device, fc_config),
-            hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, plan.hidden_norm_eps, norm_weight),
+            hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, config.rms_norm_eps, norm_weight),
             weights: Qwen3xDSparkMainFeatureWeights {
                 fc_weight: Buffer::from_slice(device, &weight),
                 fc_scales: Buffer::from_slice(device, &scales),
@@ -207,17 +205,24 @@ impl Qwen3xDSparkMainFeatureProjector {
             },
             main_residuals: Buffer::new_zeroed_elements(device, layout.main_residual_elements(), Dtype::Bfloat16),
             main_feature: Buffer::new_zeroed_elements(device, layout.main_feature_elements(), Dtype::Bfloat16),
-        })
+        };
+        assert!(
+            tensors.is_empty(),
+            "Qwen3x DSpark Main-feature projector must consume its tensor map"
+        );
+        Ok(projector)
     }
 
     pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
-        self.residual_bindings.get(model_layer_index).map(|residual| {
-            ResidualAddCaptureTarget::columns(
-                &self.main_residuals,
-                self.layout.selected_hidden_dim,
-                self.layout.capture_columns(residual.residual_slice_index),
-            )
-        })
+        self.residual_bindings
+            .get(model_layer_index)
+            .map(|residual_slice_index| {
+                ResidualAddCaptureTarget::columns(
+                    &self.main_residuals,
+                    self.layout.selected_hidden_dim,
+                    self.layout.capture_columns(residual_slice_index),
+                )
+            })
     }
 
     pub fn main_feature(&self) -> &Buffer {

@@ -3,7 +3,6 @@ use inference_backend_metal::components::GQAActivationGateConfig;
 use inference_backend_metal::components::GQAActivationGateKernel;
 use inference_backend_metal::components::GQAActivationGateShape;
 use inference_backend_metal::components::GQACompute;
-use inference_backend_metal::components::GQAComputeConfig;
 use inference_backend_metal::components::GQAComputePath;
 use inference_backend_metal::components::GQAKVPageWrite;
 use inference_backend_metal::components::GQAKVPageWriteBuffers;
@@ -38,6 +37,7 @@ use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 
+use super::gqa_compute_config;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::scratch::GQAScratch;
 use crate::attn::gqa::scratch::GQAScratchBindings;
@@ -75,21 +75,6 @@ impl GQAMetalConfig {
 
     pub fn num_tokens_per_page(self, core: &GQACore) -> u32 {
         gqa_compute_config(self, core.num_q_heads, core.num_kv_heads, core.head_dim).num_tokens_per_page()
-    }
-}
-
-pub(crate) fn gqa_compute_config(
-    metal: GQAMetalConfig,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> GQAComputeConfig {
-    GQAComputeConfig {
-        io_dtype: metal.io_dtype,
-        page_bytes: metal.page_bytes,
-        num_q_heads: num_q_heads.try_into().expect("GQA Q-head count must fit u32"),
-        num_kv_heads: num_kv_heads.try_into().expect("GQA KV-head count must fit u32"),
-        head_dim: head_dim.try_into().expect("GQA head_dim must fit u32"),
     }
 }
 

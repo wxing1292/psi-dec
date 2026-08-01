@@ -1,6 +1,5 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::ResidualAddCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::backend::recorder::Recorder;
@@ -13,6 +12,7 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
+use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayer;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayerInput;
@@ -30,7 +30,7 @@ pub mod plan;
 pub struct Qwen3Main {
     layers: Vec<Qwen3MainLayer>,
     final_norm: RMSNorm,
-    residual_capture: Option<Rc<dyn Qwen3MainResidualCapture>>,
+    residual_capture: Option<Rc<dyn MainResidualCapture>>,
 }
 
 #[derive(Clone, Copy)]
@@ -42,15 +42,6 @@ pub struct Qwen3MainArgs<'a> {
     pub pages: &'a Buffer,
 }
 
-/// Selects capture destinations for Qwen3 Main layer residual outputs.
-///
-/// Capture selection and destinations are fixed replay topology. The owner
-/// must keep returned buffers and their column ranges stable for the lifetime
-/// of Main, and destinations must not alias Main workspaces.
-pub trait Qwen3MainResidualCapture {
-    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>>;
-}
-
 impl Qwen3Main {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
@@ -59,7 +50,7 @@ impl Qwen3Main {
         config: &Qwen3ModelConfig,
         bindings: Qwen3MainWeightBindings,
         gqa_state: &Qwen3MainGQAState,
-        residual_capture: Option<Rc<dyn Qwen3MainResidualCapture>>,
+        residual_capture: Option<Rc<dyn MainResidualCapture>>,
         layer_scratch: Rc<Qwen3MainLayerScratch>,
         dense_scratch: &Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {

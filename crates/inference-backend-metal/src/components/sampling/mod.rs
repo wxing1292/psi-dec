@@ -26,7 +26,7 @@
 //!            +--> accepted draft tokens
 //!            +--> sampled bonus token
 //!
-//! base logits + previous token
+//! base logits + indexed Markov input token
 //!            |
 //!            v
 //! DSparkMarkovTopKMapKernel
@@ -59,6 +59,8 @@ fn checked_bytes(name: &str, num_elements: usize, item_size: usize) -> usize {
 }
 
 mod dspark_markov;
+pub use dspark_markov::DSparkConfidenceBuffers;
+pub use dspark_markov::DSparkConfidenceConfig;
 pub use dspark_markov::DSparkMarkovTopKMapBuffers;
 pub use dspark_markov::DSparkMarkovTopKMapConfig;
 pub use dspark_markov::DSparkMarkovTopKMapKernel;

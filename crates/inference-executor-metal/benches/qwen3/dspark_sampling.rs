@@ -9,14 +9,12 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::checkpoint::SafeTensorStore;
-use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
-use inference_executor_metal::model::qwen::v3_x::dspark::plan::build_qwen3x_dspark_plan;
-use inference_executor_metal::sampling::dspark_markov::DSparkMarkovSampling;
+use inference_executor_metal::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
 use inference_executor_metal::sampling::spec_probs::SpecProbsStore;
 
 fn main() {
@@ -136,10 +134,11 @@ struct Fixture {
     runtime: MetalRuntime,
     replay: ReplayProgram,
     replay_arguments: ReplayArguments,
-    markov: DSparkMarkovSampling,
+    markov: Qwen3xDSparkMarkov,
     distribution_store: SpecProbsStore,
     req_slots: Vec<u32>,
     _base_logits: Buffer,
+    _hidden: Buffer,
     block_size: usize,
     vocab_size: usize,
     markov_rank: usize,
@@ -156,8 +155,6 @@ impl Fixture {
     ) -> Self {
         let config = init_qwen3x_dspark_config(dspark_model_dir).expect("unable to load Qwen3 DSpark benchmark config");
         assert!(top_k <= config.vocab_size, "--top-k exceeds the DSpark vocabulary");
-        let plan = build_qwen3x_dspark_plan(&config, QWEN3_PAGE_SIZE_BYTES)
-            .expect("unable to build Qwen3 DSpark benchmark plan");
         let runtime = MetalRuntime::system_default();
         let device = runtime.device();
         let mut store =
@@ -174,9 +171,17 @@ impl Fixture {
                 .expect("DSpark sampling benchmark vocabulary must fit u32"),
             top_k: top_k.try_into().expect("DSpark sampling benchmark top_k must fit u32"),
         };
-        let markov = DSparkMarkovSampling::load(device, &mut store, &plan, &bindings.markov, num_requests, bounds)
-            .expect("unable to load Qwen3 DSpark Markov sampling");
-        let distribution_store = SpecProbsStore::new(device, plan.block_size, num_requests, top_k);
+        let markov = Qwen3xDSparkMarkov::load(
+            device,
+            &mut store,
+            &config,
+            &bindings.markov,
+            bindings.confidence.as_ref(),
+            num_requests,
+            bounds,
+        )
+        .expect("unable to load Qwen3 DSpark Markov sampling");
+        let distribution_store = SpecProbsStore::new(device, config.block_size, num_requests, top_k);
         let req_slots = (0..num_requests)
             .map(|req_slot| {
                 req_slot
@@ -205,14 +210,22 @@ impl Fixture {
         let base_logits = Buffer::new_zeroed_elements(
             device,
             num_requests
-                .checked_mul(plan.block_size)
+                .checked_mul(config.block_size)
                 .and_then(|rows| rows.checked_mul(config.vocab_size))
                 .expect("DSpark sampling benchmark logit capacity must fit usize"),
             Dtype::Bfloat16,
         );
+        let hidden = Buffer::new_zeroed_elements(
+            device,
+            num_requests
+                .checked_mul(config.block_size)
+                .and_then(|rows| rows.checked_mul(config.hidden_size))
+                .expect("DSpark sampling benchmark hidden capacity must fit usize"),
+            Dtype::Bfloat16,
+        );
         let replay_runtime = MetalReplayRuntime::new(runtime.stream());
         let mut recorder = replay_runtime.create_recorder();
-        markov.record(&mut recorder, shape, &base_logits, &distribution_store);
+        markov.record(&mut recorder, shape, &base_logits, &hidden, &distribution_store);
         let replay = recorder.build();
         let mut replay_arguments = ReplayArguments::new();
         markov.add_replay_arguments(shape, &mut replay_arguments);
@@ -224,7 +237,8 @@ impl Fixture {
             distribution_store,
             req_slots,
             _base_logits: base_logits,
-            block_size: plan.block_size,
+            _hidden: hidden,
+            block_size: config.block_size,
             vocab_size: config.vocab_size,
             markov_rank: config.markov_rank,
         }
@@ -257,9 +271,14 @@ impl Fixture {
             .iter()
             .map(|probs| probs.iter().map(|prob| prob.to_bits()).collect::<Vec<_>>())
             .collect::<Vec<_>>();
+        let confidence_bits = proposal
+            .confidences
+            .iter()
+            .map(|values| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
         println!(
             "output proposal_token_ids={:?} proposal_prob_bits={proposal_prob_bits:?} \
-             write_distribution_fingerprint={:016x}",
+             confidence_bits={confidence_bits:?} write_distribution_fingerprint={:016x}",
             proposal.token_ids,
             distribution_fingerprint(&distribution_token_ids, &distribution_probs),
         );

@@ -384,6 +384,7 @@ where
                     sampled_prob: output_sampled_prob,
                     spec_tokens: output_spec_tokens,
                     spec_probs: output_spec_probs,
+                    spec_confidences: output_spec_confidences,
                 },
             ) => {
                 debug_assert_eq!(self.epoch, input_epoch);
@@ -399,6 +400,7 @@ where
                 );
                 debug_assert_eq!(output_validated_tokens.len(), output_validated_probs.len());
                 debug_assert_eq!(output_spec_tokens.len(), output_spec_probs.len());
+                debug_assert_eq!(output_spec_tokens.len(), output_spec_confidences.len());
 
                 let ready_to_cached_token_window = input_tokens.len().saturating_sub(L - 1);
                 let queued_to_cached_token_window = min(

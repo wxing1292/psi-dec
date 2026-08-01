@@ -572,6 +572,7 @@ fn test_prepare_cancel_commit_decode_zero_token_index_wo_mtp() {
             sampled_prob: NotNan::new(0.5).unwrap(),
             spec_tokens: vec![],
             spec_probs: vec![],
+            spec_confidences: vec![],
         },
     );
     assert_state(&blocks, 1, &token_vec([1, 2, 3]), &[], &token_vec([4]), &[], &[]);
@@ -660,6 +661,7 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_wo_mtp() {
             sampled_prob: NotNan::new(0.5).unwrap(),
             spec_tokens: vec![],
             spec_probs: vec![],
+            spec_confidences: vec![],
         },
     );
     assert_state(
@@ -728,6 +730,7 @@ fn test_prepare_cancel_commit_full_block_wo_mtp() {
             sampled_prob: NotNan::new(0.5).unwrap(),
             spec_tokens: vec![],
             spec_probs: vec![],
+            spec_confidences: vec![],
         },
     );
     assert_state(&blocks, 0, &token_vec([1, 2, 3, 4]), &[], &[], &token_vec([5]), &[]);

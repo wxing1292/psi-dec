@@ -59,18 +59,22 @@ pub struct UngatedDSparkGQAContextAppender {
 }
 
 impl DSparkGQAContextScratch {
-    pub fn new(device: &Device, core: &UngatedDSparkGQACore, metal: GQAMetalConfig, max_tokens: usize) -> Self {
+    pub fn new(device: &Device, core: &UngatedDSparkGQACore, io_dtype: Dtype, max_tokens: usize) -> Self {
         core.validate();
-        metal.validate();
+        match io_dtype {
+            Dtype::Bfloat16 => {},
+            Dtype::Float32 => todo!("F32 DSpark GQA model boundary is not supported"),
+            dtype => panic!("unsupported DSpark GQA model boundary dtype {dtype:?}"),
+        }
         assert!(max_tokens > 0, "DSpark context scratch requires tokens");
         let kv_elements = max_tokens
             .checked_mul(core.attention.k_dim())
             .expect("DSpark context scratch K/V element count must fit usize");
         Self {
             max_tokens,
-            k: Buffer::new_zeroed_elements(device, kv_elements, metal.io_dtype),
-            v: Buffer::new_zeroed_elements(device, kv_elements, metal.io_dtype),
-            k_norm_rope: Buffer::new_zeroed_elements(device, kv_elements, metal.io_dtype),
+            k: Buffer::new_zeroed_elements(device, kv_elements, io_dtype),
+            v: Buffer::new_zeroed_elements(device, kv_elements, io_dtype),
+            k_norm_rope: Buffer::new_zeroed_elements(device, kv_elements, io_dtype),
         }
     }
 

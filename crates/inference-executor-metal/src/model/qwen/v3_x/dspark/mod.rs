@@ -4,4 +4,4 @@ pub mod layer;
 pub mod main_feature;
 pub mod model;
 pub mod output;
-pub mod plan;
+pub mod sampling;

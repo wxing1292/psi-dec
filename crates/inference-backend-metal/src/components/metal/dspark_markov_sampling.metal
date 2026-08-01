@@ -78,7 +78,7 @@ static inline float dequantized_value(
 }
 
 kernel void dspark_markov_top_k_map(
-    device const int* previous_token_ids [[buffer(0)]],
+    device const int* input_token_ids [[buffer(0)]],
     device const bfloat* base_logits [[buffer(1)]],
     device const uchar* w1_weight [[buffer(2)]],
     device const bfloat* w1_scales [[buffer(3)]],
@@ -92,6 +92,12 @@ kernel void dspark_markov_top_k_map(
     constant uint& top_k [[buffer(11)]],
     constant uint& num_tiles [[buffer(12)]],
     constant uint& base_logits_row_offset [[buffer(13)]],
+#if DSPARK_CONFIDENCE_ENABLED
+    device const bfloat* confidence_hidden [[buffer(14)]],
+    device const bfloat* confidence_weight [[buffer(15)]],
+    device const bfloat* confidence_bias [[buffer(16)]],
+    device float* confidence_output [[buffer(17)]],
+#endif
     uint global_thread_id [[thread_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
@@ -105,7 +111,7 @@ kernel void dspark_markov_top_k_map(
     const uint request = group / num_tiles;
     const uint tile = group - request * num_tiles;
     const uint tile_start = tile * DSPARK_MARKOV_VOCAB_TILE_SIZE;
-    const int previous_token_id = previous_token_ids[request];
+    const int input_token_id = input_token_ids[request];
 
     threadgroup bfloat latent[DSPARK_MARKOV_RANK];
     threadgroup float values[DSPARK_MARKOV_VOCAB_TILE_SIZE];
@@ -113,12 +119,12 @@ kernel void dspark_markov_top_k_map(
 
     for (uint rank_index = thread_index; rank_index < DSPARK_MARKOV_RANK; rank_index += THREADBLOCK_SIZE) {
         float value = 0.0f;
-        if (previous_token_id >= 0 && uint(previous_token_id) < DSPARK_MARKOV_VOCAB_SIZE) {
+        if (input_token_id >= 0 && uint(input_token_id) < DSPARK_MARKOV_VOCAB_SIZE) {
             value = dequantized_value(
                 w1_weight,
                 w1_scales,
                 w1_biases,
-                uint(previous_token_id),
+                uint(input_token_id),
                 rank_index,
                 DSPARK_MARKOV_RANK,
                 DSPARK_MARKOV_W1_GROUP_SIZE,
@@ -137,6 +143,41 @@ kernel void dspark_markov_top_k_map(
         latent_values[value_index] = value;
         latent_sum += value;
     }
+
+#if DSPARK_CONFIDENCE_ENABLED
+    if (tile == 0u) {
+        const ulong row = (ulong)base_logits_row_offset + (ulong)request;
+        const ulong hidden_base = row * (ulong)DSPARK_CONFIDENCE_HIDDEN_DIM;
+        float confidence_partial = 0.0f;
+        for (uint hidden_index = thread_index;
+             hidden_index < DSPARK_CONFIDENCE_HIDDEN_DIM;
+             hidden_index += THREADBLOCK_SIZE) {
+            confidence_partial += float(confidence_hidden[hidden_base + (ulong)hidden_index])
+                * float(confidence_weight[hidden_index]);
+        }
+#if DSPARK_CONFIDENCE_WITH_MARKOV
+        for (uint rank_index = thread_index;
+             rank_index < DSPARK_MARKOV_RANK;
+             rank_index += THREADBLOCK_SIZE) {
+            confidence_partial += float(latent[rank_index])
+                * float(confidence_weight[DSPARK_CONFIDENCE_HIDDEN_DIM + rank_index]);
+        }
+#endif
+        const float confidence_simd_sum = simd_sum(confidence_partial);
+        if (simd_lane == 0u) {
+            values[simd_group] = confidence_simd_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index == 0u) {
+            float confidence_raw = float(confidence_bias[0]);
+            for (uint group_index = 0u; group_index < NUM_SIMDGROUPS; ++group_index) {
+                confidence_raw += values[group_index];
+            }
+            confidence_output[row] = 1.0f / (1.0f + exp(-confidence_raw));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#endif
 
     for (uint wave = 0u; wave < DSPARK_MARKOV_VOCAB_TILE_SIZE / RESULTS_PER_WAVE; ++wave) {
         for (uint result_index = 0u; result_index < RESULTS_PER_SIMDGROUP; ++result_index) {

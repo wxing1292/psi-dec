@@ -2,7 +2,6 @@ use inference_backend_metal::components::GQABlockSDPABuffers;
 use inference_backend_metal::components::GQABlockSDPAConfig;
 use inference_backend_metal::components::GQABlockSDPAKernel;
 use inference_backend_metal::components::GQABlockSDPAShape;
-use inference_backend_metal::components::GQACompute;
 use inference_backend_metal::components::GQAComputePath;
 use inference_backend_metal::components::GQANormRopeBuffers;
 use inference_backend_metal::components::GQANormRopeConfig;
@@ -23,7 +22,6 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedDSparkGQACore;
@@ -33,7 +31,6 @@ use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
 use crate::attn::dspark::scratch::DSparkBlockScratchBindings;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::backend::GQAMetalConfig;
-use crate::attn::gqa::backend::gqa_compute_config;
 use crate::attn::gqa::ungated_backend::UngatedGQAWeights;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
@@ -54,7 +51,6 @@ pub struct UngatedDSparkGQA {
     device: Device,
     core: UngatedDSparkGQACore,
     metal: GQAMetalConfig,
-    compute: GQACompute,
     qkv: AffineQuantizedMatmul,
     qkv_to_q_k_v: GQAQKVSplitKernel,
     q_norm_rope: GQANormRopeKernel,
@@ -96,40 +92,19 @@ impl UngatedDSparkGQA {
                 },
             ),
             output: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, metal)),
-            compute: GQACompute::new_dspark_history(gqa_compute_config(
-                metal,
-                attention.num_q_heads,
-                attention.num_kv_heads,
-                attention.head_dim,
-            )),
             core,
             metal,
         }
     }
 
-    pub fn prepare(&self, metadata: &DSparkGQAMetadataBuffers, block: &DSparkBlockMetadata) -> GQAReplayShape {
-        let num_tokens = block
-            .num_tokens()
-            .try_into()
-            .expect("DSpark GQA token count must fit u32");
-        let GQAComputePath::SingleQueryToken { kv_token_tile_size, .. } = self.compute.select(num_tokens, num_tokens)
-        else {
-            unreachable!("DSpark history attention requires the single-query-token compute path")
-        };
-        metadata.update(block, kv_token_tile_size)
-    }
-
-    pub fn num_tokens_per_page(&self) -> u32 {
-        self.metal.num_ungated_tokens_per_page(&self.core.attention)
-    }
-
-    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> GQAReplayShape {
+    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, GQAComputePath) {
         input.page_table_layout.validate();
         assert!(
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
             "DSpark GQA layer index exceeds the page table"
         );
         let shape = input.metadata.replay_shape();
+        let compute_path = input.metadata.compute_path();
         shape.validate();
         assert_eq!(
             shape.num_q_token_tiles, shape.num_tokens,
@@ -137,23 +112,23 @@ impl UngatedDSparkGQA {
         );
         assert!(shape.reduce_sdpa_partial_outputs);
         assert!(
-            shape.num_tokens as usize <= input.scratch.capacity.max_tokens,
+            shape.num_tokens as usize <= input.scratch.capacity.block.max_tokens,
             "DSpark GQA replay token count exceeds scratch"
         );
         assert!(
-            shape.total_sdpa_map_task_templates as usize <= input.scratch.capacity.max_sdpa_map_task_templates,
+            shape.total_sdpa_map_task_templates as usize <= input.scratch.capacity.max_sdpa_partial_outputs,
             "DSpark GQA replay partial count exceeds scratch"
         );
         assert_eq!(
-            input.scratch.capacity.block_size, self.core.block_size,
+            input.scratch.capacity.block.block_size, self.core.block_size,
             "DSpark GQA scratch block size must match the backend"
         );
-        shape
+        (shape, compute_path)
     }
 
     fn paged_sdpa_config(
         &self,
-        shape: GQAReplayShape,
+        compute_path: GQAComputePath,
         page_table_layout: GQAPageTableLayout,
         gqa_layer_index: u32,
     ) -> GQAPagedSDPAConfig {
@@ -162,9 +137,9 @@ impl UngatedDSparkGQA {
             kv_token_tile_size,
             num_threads_per_threadblock,
             q_head_tile_size,
-        } = self.compute.select(shape.num_tokens, shape.num_q_token_tiles)
+        } = compute_path
         else {
-            unreachable!("DSpark history attention requires the single-query-token compute path")
+            panic!("DSpark history attention requires the single-query-token compute path")
         };
         GQAPagedSDPAConfig {
             num_q_heads: attention
@@ -196,7 +171,7 @@ impl ReplayLayer for UngatedDSparkGQA {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let shape = self.validate_input(&input);
+        let (shape, compute_path) = self.validate_input(&input);
         let attention = &self.core.attention;
         let scratch = input.scratch;
         recorder.record_with_barrier_before(ReplayOp::opaque(
@@ -251,7 +226,7 @@ impl ReplayLayer for UngatedDSparkGQA {
             },
         )));
 
-        let sdpa_config = self.paged_sdpa_config(shape, input.page_table_layout, input.gqa_layer_index);
+        let sdpa_config = self.paged_sdpa_config(compute_path, input.page_table_layout, input.gqa_layer_index);
         let sdpa_shape = GQAPagedSDPAShape {
             num_tokens: shape.num_tokens,
             total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,

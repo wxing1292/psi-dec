@@ -179,7 +179,10 @@ fn test_converts_main_decisions_to_core_response() {
     let decision = Qwen3DecodeDecision {
         sampled_token: 5,
         sampled_prob: 0.3,
-        ..Qwen3DecodeDecision::default()
+        spec_tokens: vec![6, 7],
+        spec_probs: vec![0.2, 0.1],
+        spec_confidences: vec![0.9, 0.8],
+        ..Default::default()
     };
 
     let response = to_core_batch_resp(core, vec![decision]);
@@ -197,14 +200,28 @@ fn test_converts_main_decisions_to_core_response() {
             sampled_token,
             spec_tokens,
             spec_probs,
+            spec_confidences,
             ..
         } => {
             assert_eq!(*epoch, 2);
             assert!(validated_tokens.is_empty());
             assert!(validated_probs.is_empty());
             assert_eq!(sampled_token.value(), 5);
-            assert!(spec_tokens.is_empty());
-            assert!(spec_probs.is_empty());
+            assert_eq!(
+                spec_tokens.iter().map(|token| token.value()).collect::<Vec<_>>(),
+                [6, 7]
+            );
+            assert_eq!(
+                spec_probs.iter().map(|value| value.into_inner()).collect::<Vec<_>>(),
+                [0.2, 0.1]
+            );
+            assert_eq!(
+                spec_confidences
+                    .iter()
+                    .map(|value| value.into_inner())
+                    .collect::<Vec<_>>(),
+                [0.9, 0.8]
+            );
         },
         SampledTokens::Prefill { .. } => panic!("expected decode sampled tokens"),
     }

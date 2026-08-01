@@ -2,9 +2,13 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
+use inference_executor_core::mlp::dense::DenseMLPCore;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkLayerWeightBindings;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainFeatureWeightBindings;
 
 use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
 use crate::attn::dspark::state::UngatedDSparkGQAState;
@@ -16,8 +20,7 @@ use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayer;
 use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerInput;
 use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerScratch;
 use crate::model::qwen::v3_x::dspark::main_feature::Qwen3xDSparkMainFeatureProjector;
-use crate::model::qwen::v3_x::dspark::plan::Qwen3xDSparkPlan;
-use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
@@ -68,79 +71,64 @@ impl Qwen3xDSparkModel {
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        plan: &Qwen3xDSparkPlan,
-        bindings: Qwen3xDSparkWeightBindings,
+        config: &Qwen3xDSparkConfig,
+        page_bytes: usize,
+        main_feature_bindings: Qwen3xDSparkMainFeatureWeightBindings,
+        layer_bindings: Vec<Qwen3xDSparkLayerWeightBindings>,
+        final_norm_weight: String,
         gqa_state: &UngatedDSparkGQAState,
         max_main_tokens: usize,
         max_block_tokens: usize,
     ) -> Result<Rc<Self>, ModelExecutorError> {
-        let Qwen3xDSparkWeightBindings {
-            embed: _,
-            main_feature,
-            layers: layer_bindings,
-            final_norm_weight,
-            unembed: _,
-            markov: _,
-            confidence: _,
-        } = bindings;
         assert_eq!(
-            plan.layers.len(),
             layer_bindings.len(),
-            "Qwen3 DSpark plan and checkpoint binding layer counts must match"
+            config.num_hidden_layers,
+            "Qwen3x DSpark config and checkpoint binding layer counts must match"
         );
-        let first_layer = plan
-            .layers
-            .first()
-            .expect("Qwen3 DSpark model requires transformer layers");
-        let hidden_dim = first_layer.attention_core.attention.hidden_dim;
+        let hidden_dim = config.hidden_size;
         let layer_scratch = Rc::new(Qwen3xDSparkLayerScratch::new(device, max_block_tokens, hidden_dim));
+        let dense_scratch_core = DenseMLPCore {
+            model_layer_index: 0,
+            hidden_dim,
+            intermediate_dim: config.intermediate_size,
+        };
         let dense_scratch = Rc::new(DenseMLPScratch::new(
             device,
-            &first_layer.mlp_core,
-            first_layer.mlp_metal.io_dtype,
+            &dense_scratch_core,
+            Dtype::Bfloat16,
             max_block_tokens,
         ));
         let main_feature_projector = Rc::new(Qwen3xDSparkMainFeatureProjector::load(
             device,
             store,
-            plan,
-            &main_feature,
+            config,
+            &main_feature_bindings,
             max_main_tokens,
         )?);
-        let mut layers = Vec::with_capacity(plan.layers.len());
-        for (layer_plan, bindings) in plan.layers.iter().zip(layer_bindings) {
-            assert_eq!(
-                layer_plan.attention_core.attention.hidden_dim, hidden_dim,
-                "Qwen3 DSpark layers must use one hidden dimension"
-            );
-            assert_eq!(
-                layer_plan.mlp_core.hidden_dim, hidden_dim,
-                "Qwen3 DSpark layer MLP hidden dimension must match attention"
-            );
-            assert_eq!(
-                layer_plan.mlp_core.intermediate_dim, first_layer.mlp_core.intermediate_dim,
-                "Qwen3 DSpark layers must share one MLP scratch geometry"
-            );
-            assert_eq!(
-                layer_plan.mlp_metal, first_layer.mlp_metal,
-                "Qwen3 DSpark layers must share one MLP Metal layout"
-            );
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for (dspark_layer_index, bindings) in layer_bindings.into_iter().enumerate() {
             layers.push(Qwen3xDSparkLayer::load(
                 device,
                 store,
-                layer_plan,
+                config,
+                dspark_layer_index,
+                page_bytes,
                 bindings,
                 gqa_state,
                 Rc::clone(&layer_scratch),
                 Rc::clone(&dense_scratch),
             )?);
-            store.unload_all();
         }
-        let final_norm_weight = load_qwen3x_norm_weight(device, store, &final_norm_weight, &[hidden_dim])?;
+        let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
+        let final_norm_weight = remove_qwen3x_norm_weight(device, &mut tensors, &final_norm_weight, &[hidden_dim])?;
+        assert!(
+            tensors.is_empty(),
+            "Qwen3x DSpark model must consume its final norm tensor map"
+        );
         Ok(Rc::new(Self {
             main_feature_projector,
             layers,
-            final_norm: RMSNorm::new(device, hidden_dim, plan.norm_eps, final_norm_weight),
+            final_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps, final_norm_weight),
         }))
     }
 

@@ -87,7 +87,7 @@ impl Qwen3Executor {
             block_token_ids.extend(std::iter::repeat_n(mask_token_id, self.dspark_block_size - 1));
         }
         self.write_token_ids(&block_token_ids);
-        let markov_shape = self
+        let markov_replay_shape = self
             .dspark_markov
             .as_ref()
             .expect("Qwen3 DSpark requires Markov sampling")
@@ -124,7 +124,7 @@ impl Qwen3Executor {
             .expect("Qwen3 DSpark requires DSparkEmbed")
             .record(&runtime, &input);
         recorder.dspark_embed_key = Some(key);
-        recorder.dspark_markov_shape = Some(markov_shape);
+        recorder.dspark_markov_replay_shape = Some(markov_replay_shape);
         recorder.dspark_req_slots = req_slots;
         hidden
     }
@@ -211,7 +211,7 @@ impl Qwen3Executor {
 
     fn record_dspark_sampling(&mut self, recorder: &mut Qwen3ModelOpsRecorder) {
         let shape = recorder
-            .dspark_markov_shape
+            .dspark_markov_replay_shape
             .expect("Qwen3 DSpark sampling requires a prepared Markov shape");
         let input = Qwen3xDSparkSamplingArgs {
             shape,
@@ -219,6 +219,10 @@ impl Qwen3Executor {
                 .dspark_logits
                 .as_ref()
                 .expect("Qwen3 DSpark sampling requires draft logits"),
+            hidden: self
+                .dspark_unembed_hidden
+                .as_ref()
+                .expect("Qwen3 DSpark sampling requires gathered hidden states"),
             distribution_store: &self.spec_probs,
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
@@ -251,13 +255,22 @@ impl Qwen3Executor {
             decisions.len(),
             "Qwen3 DSpark proposal must match Main decisions"
         );
-        for ((decision, token_ids), token_probs) in decisions
+        assert_eq!(
+            proposal.confidences.len(),
+            decisions.len(),
+            "Qwen3 DSpark confidence must match Main decisions"
+        );
+        for (((decision, token_ids), token_probs), confidences) in decisions
             .iter_mut()
             .zip(proposal.token_ids)
             .zip(proposal.token_probs)
+            .zip(proposal.confidences)
         {
+            assert_eq!(token_ids.len(), token_probs.len());
+            assert_eq!(token_ids.len(), confidences.len());
             decision.spec_tokens = token_ids;
             decision.spec_probs = token_probs;
+            decision.spec_confidences = confidences;
         }
         decisions
     }

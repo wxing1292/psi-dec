@@ -538,6 +538,8 @@ pub fn to_core_batch_resp(
                     let decision = decisions
                         .next()
                         .expect("qwen3.5 service requires one decision per sampled request");
+                    assert_eq!(decision.spec_tokens.len(), decision.spec_probs.len());
+                    let spec_confidences = vec![finite_probability(1.0); decision.spec_tokens.len()];
                     SampledTokens::Decode {
                         epoch: core_req.decoder_query_tokens.epoch(),
                         validated_tokens: decision.validated_tokens.into_iter().map(Token::new).collect(),
@@ -546,6 +548,7 @@ pub fn to_core_batch_resp(
                         sampled_prob: finite_probability(decision.sampled_prob),
                         spec_tokens: decision.spec_tokens.into_iter().map(Token::new).collect(),
                         spec_probs: decision.spec_probs.into_iter().map(finite_probability).collect(),
+                        spec_confidences,
                     }
                 },
             };
@@ -1007,12 +1010,14 @@ mod tests {
                 validated_tokens,
                 sampled_token,
                 spec_tokens,
+                spec_confidences,
                 ..
             } => {
                 assert_eq!(*epoch, 2);
                 assert_eq!(validated_tokens[0].value(), 4);
                 assert_eq!(sampled_token.value(), 5);
                 assert_eq!(spec_tokens[0].value(), 6);
+                assert_eq!(spec_confidences, &[finite_probability(1.0)]);
             },
             SampledTokens::Prefill { .. } => panic!("expected decode sampled tokens"),
         }

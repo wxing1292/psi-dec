@@ -11,17 +11,16 @@ crates/inference-executor-core/src/sampling/
   config.rs          sampler validation and optional request seed
   domain.rs          independent Main, Spec, accept, and resample RNG domains
   reference.rs       CPU top-k/top-p and rejection correctness oracle
+  dspark.rs          CPU reference for sequential Markov correction, confidence, and sampling
   rejection_sampling.rs
                      backend-neutral sparse rejection shape/request contracts
   request_state.rs   executor-owned request-slot seed lifecycle
   top_k_sampling.rs  backend-neutral sampling shape and request parameters
 
-crates/inference-executor-core/src/model/qwen/v3_x/dspark/
-  reference.rs       CPU reference for sequential Markov correction and sampling
-
 crates/inference-backend-metal/src/components/
-  sampling.rs                 generic Metal sampling and rejection components
-  dspark_markov_sampling.rs   fused DSpark Markov and tile-Top-K map component
+  sampling/top_k.rs           generic Metal top-k sampling components
+  sampling/rejection.rs       sparse rejection component
+  sampling/dspark_markov.rs   fused DSpark Markov, confidence, and tile-Top-K map component
   metal/sampling.metal
   metal/dspark_markov_sampling.metal
 
@@ -29,8 +28,11 @@ crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs       TopKSampling, parameter/scratch, and TopKSamplingOutputBuffers
   top_k_replay.rs         Sampling and DraftSampling replay components
   rejection_replay.rs     sparse rejection replay owner, microbatch contract/adapters, and bindings
-  dspark_markov.rs        sequential DSpark Markov correction and sampling
+  dspark_markov.rs        sequential DSpark Markov, confidence, and sampling composition
   spec_probs.rs           SpecProbsStore sparse draft/target probability workspace
+
+crates/inference-executor-metal/src/model/qwen/v3_x/dspark/
+  sampling.rs             Qwen3x Markov checkpoint weights and generic backend adapter
 ```
 
 Runtime core transports sampler configuration and sampled decisions.
@@ -131,11 +133,15 @@ The Qwen executor owns three distinct graph and cache stages:
 
 - `Replay<Sampling>` handles ordinary Main output.
 - `Replay<DraftSampling>` handles MTP draft sampling and sparse draft-distribution storage.
-- `Replay<Qwen3xDSparkSampling>` handles DSpark Markov correction, sampling, and sparse draft storage.
+- `Replay<Qwen3xDSparkSampling>` handles DSpark Markov correction, confidence, sampling, and sparse draft storage.
 - `Replay<RejectionSampling>` handles target write-distribution generation and sparse rejection.
 
 Main and MTP share one `Rc<TopKSampling>` implementation.
-DSpark owns its Markov runtime parameters, tile candidates, and per-step outputs.
+`DSparkMarkovSampling` owns model-neutral Markov runtime parameters, tile candidates, and per-step outputs.
+It accepts borrowed weights at record time.
+`Qwen3xDSparkMarkov` owns Qwen checkpoint buffers and delegates execution to this backend owner.
+It loads one bounded `TensorMap` for W1, W2, and the optional confidence head.
+It removes all tensors and requires the map to be empty before initialization completes.
 It reuses the generic sample-and-write-distribution reducer.
 The stages retain separate replay keys and programs.
 
@@ -149,22 +155,31 @@ One DSpark Markov step records two commands:
 
 ```text
 DSparkMarkovTopKMap
-  previous sampled token
+  input_token_ids[i]
+    i = 0: sampled_token / anchor_token
+    i > 0: spec_tokens[i - 1]
   -> affine W1 row
   -> affine W2 projection
   -> add one base-logit row
   -> 64-token tile-local Top-K
+  -> confidence projection and sigmoid
+  -> spec_confidence[i]
 
 TopKSampleAndWriteDistribution
   -> global Top-K merge
   -> top-p sampling
-  -> sampled token and sparse draft distribution
+  -> spec_token[i], spec_prob[i], and sparse draft distribution
 ```
 
 The sampled token from one reducer is the Markov input for the next map.
 The replay places a barrier at this dependency.
 A seven-token block records 14 commands in one submission.
 It does not materialize full-vocabulary Markov bias or corrected-logit buffers.
+
+`SampledTokens::Decode` carries `spec_tokens`, `spec_probs`, and `spec_confidences`.
+These vectors always have the same length.
+MTP and a DSpark checkpoint without a confidence head use `1.0` for each speculative confidence.
+The runtime does not apply a confidence threshold or proposal-length policy yet.
 
 The current fused map preserves the earlier BF16 storage boundaries.
 It dequantizes W1 to F32 and stores the latent row as BF16.
@@ -237,6 +252,13 @@ Both contracts sampled `[5310, 5390, 979, 14550, 448, 5091, 369]` in this isolat
 The BF16 write-distribution fingerprint was `31642210e096a9d7`.
 The F32 fingerprint was `9dacaff10a8cc01d`.
 The proposal probability bits also differed.
+
+The fused confidence check used base commit `a36024dc` with only the confidence change present in the worktree.
+It used the same machine, Markov weights, sampler settings, and benchmark command.
+The converted checkpoint also contained the official BF16 confidence projection and bias.
+The complete seven-step replay measured 4.061 ms.
+The sampled tokens and BF16 write-distribution fingerprint matched the 4.158 ms path.
+The confidence output contained seven finite, nonconstant values.
 
 The deterministic service comparison used Qwen3-14B-4bit, the same DSpark checkpoint, `temperature=0`, `top_k=1`,
 `top_p=1`, and `seed=42`.

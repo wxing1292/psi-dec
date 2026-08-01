@@ -15,6 +15,7 @@ pub enum SampledTokens {
         sampled_prob: NotNan<f32>,
         spec_tokens: Vec<Token>,
         spec_probs: Vec<NotNan<f32>>,
+        spec_confidences: Vec<NotNan<f32>>,
     },
 }
 

@@ -64,9 +64,9 @@ use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedReplayKey
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSampling;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingArgs;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingReplayKey;
+use crate::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
 use crate::replay::Replay;
-use crate::sampling::dspark_markov::DSparkMarkovSampling;
-use crate::sampling::dspark_markov::DSparkMarkovShape;
+use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
 use crate::sampling::rejection_replay::PreparedRejection;
 use crate::sampling::rejection_replay::RejectionReplayKey;
 use crate::sampling::rejection_replay::RejectionSamplerInput;
@@ -122,7 +122,7 @@ pub struct Qwen3Executor {
     dspark: Option<Replay<Qwen3xDSparkBody>>,
     dspark_gather_unembed: Option<Replay<Qwen3xDSparkGatherUnembed>>,
     dspark_sampling: Option<Replay<Qwen3xDSparkSampling>>,
-    dspark_markov: Option<Rc<DSparkMarkovSampling>>,
+    dspark_markov: Option<Rc<Qwen3xDSparkMarkov>>,
     dspark_hidden_input: Option<Rc<Buffer>>,
     dspark_hidden_output: Option<Rc<Buffer>>,
     dspark_unembed_hidden: Option<Buffer>,
@@ -153,7 +153,7 @@ pub struct Qwen3ModelOpsRecorder {
     dspark_gather_unembed_key: Option<Qwen3xDSparkGatherUnembedReplayKey>,
     dspark_sampling_key: Option<Qwen3xDSparkSamplingReplayKey>,
     dspark_sampling_arguments: ReplayArguments,
-    dspark_markov_shape: Option<DSparkMarkovShape>,
+    dspark_markov_replay_shape: Option<DSparkMarkovReplayShape>,
     dspark_req_slots: Vec<u32>,
     num_main_sample_rows: usize,
 }
@@ -297,7 +297,7 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
             dspark_gather_unembed_key: None,
             dspark_sampling_key: None,
             dspark_sampling_arguments: ReplayArguments::new(),
-            dspark_markov_shape: None,
+            dspark_markov_replay_shape: None,
             dspark_req_slots: Vec::new(),
             num_main_sample_rows: num_main_output_rows(model_batch_request.microbatch()),
         }

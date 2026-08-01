@@ -10,7 +10,6 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::checkpoint::SafeTensorStore;
-use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3::init_qwen3_model_config;
 use inference_executor_core::model::qwen::v3::weight_layout::resolve_qwen3_model_weight_bindings;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
@@ -18,7 +17,6 @@ use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_we
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembed;
 use inference_executor_metal::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedArgs;
-use inference_executor_metal::model::qwen::v3_x::dspark::plan::build_qwen3x_dspark_plan;
 use inference_executor_metal::model::unembedding::Unembed;
 use inference_executor_metal::model::unembedding::UnembedConfig;
 use inference_executor_metal::replay::ReplayComponent;
@@ -125,10 +123,8 @@ struct Fixture {
 impl Fixture {
     fn new(main_model_dir: &Path, dspark_model_dir: &Path, num_requests: usize) -> Self {
         let config = init_qwen3x_dspark_config(dspark_model_dir).expect("unable to load Qwen3 DSpark benchmark config");
-        let plan = build_qwen3x_dspark_plan(&config, QWEN3_PAGE_SIZE_BYTES)
-            .expect("unable to build Qwen3 DSpark benchmark plan");
         let num_rows = num_requests
-            .checked_mul(plan.block_size)
+            .checked_mul(config.block_size)
             .expect("DSpark GatherUnembed row count must fit usize");
         let runtime = MetalRuntime::system_default();
         let device = runtime.device();
@@ -136,30 +132,23 @@ impl Fixture {
             SafeTensorStore::from_model_dir(dspark_model_dir).expect("unable to open Qwen3 DSpark benchmark weights");
         let bindings = resolve_qwen3x_dspark_weight_bindings(&config, store.index().tensor_names())
             .expect("unable to resolve Qwen3 DSpark benchmark weights");
-        let unembed_config = UnembedConfig {
-            max_tokens: num_rows
-                .try_into()
-                .expect("DSpark GatherUnembed row count must fit u32"),
-            vocab_size: plan
-                .unembed
-                .output_dim
-                .try_into()
-                .expect("DSpark GatherUnembed vocabulary must fit u32"),
-            hidden_dim: plan
-                .unembed
-                .input_dim
-                .try_into()
-                .expect("DSpark GatherUnembed hidden dimension must fit u32"),
-            group_size: plan.unembed.group_size,
-            bits: plan.unembed.bits,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-            scale_bias_dtype: Dtype::Bfloat16,
-        };
-        let (unembed, weight_source) = if let Some(unembed_bindings) = bindings.unembed {
+        let (unembed, unembed_config, weight_source) = if let Some(unembed_bindings) = bindings.unembed {
+            let quantization = config
+                .quantization
+                .as_ref()
+                .expect("Qwen3 DSpark benchmark requires quantization")
+                .resolve_for_tensor(&unembed_bindings.weight);
+            let unembed_config = unembed_config(
+                num_rows,
+                config.vocab_size,
+                config.hidden_size,
+                quantization.group_size,
+                quantization.bits,
+            );
             (
                 Unembed::load(device, &mut store, unembed_config, unembed_bindings)
                     .expect("unable to load Qwen3 DSpark unembed weights"),
+                unembed_config,
                 "dspark",
             )
         } else {
@@ -169,15 +158,28 @@ impl Fixture {
                 SafeTensorStore::from_model_dir(main_model_dir).expect("unable to open Qwen3 benchmark Main weights");
             let main_bindings = resolve_qwen3_model_weight_bindings(&main_config, main_store.index().tensor_names())
                 .expect("unable to resolve Qwen3 benchmark Main weights");
+            let quantization = main_config
+                .quantization
+                .as_ref()
+                .expect("Qwen3 Main benchmark requires quantization")
+                .resolve_for_tensor(&main_bindings.unembed.weight);
+            let unembed_config = unembed_config(
+                num_rows,
+                main_config.text_config.vocab_size,
+                main_config.text_config.hidden_size,
+                quantization.group_size,
+                quantization.bits,
+            );
             (
                 Unembed::load(device, &mut main_store, unembed_config, main_bindings.unembed)
                     .expect("unable to load Qwen3 benchmark Main unembed weights"),
+                unembed_config,
                 "main",
             )
         };
         let gather_unembed = Qwen3xDSparkGatherUnembed::new(
             device,
-            plan.block_size,
+            config.block_size,
             num_requests,
             unembed_config.hidden_dim,
             Rc::new(unembed),
@@ -222,6 +224,33 @@ impl Fixture {
         MetalReplayRuntime::new(self.runtime.stream())
             .submit_replay_with_arguments(&self.replay, &self.replay_arguments)
             .wait();
+    }
+}
+
+fn unembed_config(
+    max_tokens: usize,
+    vocab_size: usize,
+    hidden_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> UnembedConfig {
+    UnembedConfig {
+        max_tokens: max_tokens
+            .try_into()
+            .expect("DSpark GatherUnembed row count must fit u32"),
+        vocab_size: vocab_size
+            .try_into()
+            .expect("DSpark GatherUnembed vocabulary must fit u32"),
+        hidden_dim: hidden_dim
+            .try_into()
+            .expect("DSpark GatherUnembed hidden dimension must fit u32"),
+        group_size: group_size
+            .try_into()
+            .expect("DSpark GatherUnembed group size must fit u32"),
+        bits: bits.try_into().expect("DSpark GatherUnembed bits must fit u32"),
+        input_dtype: Dtype::Bfloat16,
+        output_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
     }
 }
 

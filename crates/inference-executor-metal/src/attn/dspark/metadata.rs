@@ -1,11 +1,13 @@
 use std::cell::Cell;
 
+use inference_backend_metal::components::GQAComputePath;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::DSparkBlockCapacity;
 use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAReplayShape;
+
+use crate::attn::dspark::capacity::DSparkGQACapacity;
 
 const NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS: usize = 3;
 
@@ -17,29 +19,31 @@ struct DSparkGQAMetadata {
 }
 
 pub struct DSparkGQAMetadataBuffers {
-    capacity: DSparkBlockCapacity,
+    capacity: DSparkGQACapacity,
     req_slots: Buffer,
     flat_token_indices: Buffer,
     sdpa_map_task_templates: Buffer,
     cu_sdpa_partial_outputs: Buffer,
     block_sdpa_map_task_template_indices: Buffer,
     replay_shape: Cell<Option<GQAReplayShape>>,
+    compute_path: Cell<Option<GQAComputePath>>,
 }
 
 impl DSparkGQAMetadataBuffers {
-    pub fn new(device: &Device, capacity: DSparkBlockCapacity) -> Self {
+    pub fn new(device: &Device, capacity: DSparkGQACapacity) -> Self {
         let task_template_values = capacity
-            .max_sdpa_map_task_templates
+            .max_sdpa_partial_outputs
             .checked_mul(NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS)
             .expect("DSpark GQA TaskTemplate metadata capacity must fit usize");
         Self {
             capacity,
-            req_slots: Buffer::new_zeroed_elements(device, capacity.max_tokens, Dtype::Uint32),
-            flat_token_indices: Buffer::new_zeroed_elements(device, capacity.max_tokens, Dtype::Uint32),
+            req_slots: Buffer::new_zeroed_elements(device, capacity.block.max_tokens, Dtype::Uint32),
+            flat_token_indices: Buffer::new_zeroed_elements(device, capacity.block.max_tokens, Dtype::Uint32),
             sdpa_map_task_templates: Buffer::new_zeroed_elements(device, task_template_values, Dtype::Uint32),
             cu_sdpa_partial_outputs: Buffer::new_zeroed_elements(
                 device,
                 capacity
+                    .block
                     .max_tokens
                     .checked_add(1)
                     .expect("DSpark GQA cumulative partial-output capacity must fit usize"),
@@ -47,31 +51,35 @@ impl DSparkGQAMetadataBuffers {
             ),
             block_sdpa_map_task_template_indices: Buffer::new_zeroed_elements(
                 device,
-                capacity.max_tokens,
+                capacity.block.max_tokens,
                 Dtype::Uint32,
             ),
             replay_shape: Cell::new(None),
+            compute_path: Cell::new(None),
         }
     }
 
-    pub fn update(&self, block: &DSparkBlockMetadata, kv_token_tile_size: u32) -> GQAReplayShape {
+    pub fn update(&self, block: &DSparkBlockMetadata, compute_path: GQAComputePath) -> GQAReplayShape {
+        let GQAComputePath::SingleQueryToken { kv_token_tile_size, .. } = compute_path else {
+            panic!("DSpark history attention requires the single-query-token compute path")
+        };
         assert!(
-            block.num_requests() <= self.capacity.max_requests,
+            block.num_requests() <= self.capacity.block.max_requests,
             "DSpark GQA request count exceeds capacity"
         );
         assert_eq!(
             block.block_size(),
-            self.capacity.block_size,
+            self.capacity.block.block_size,
             "DSpark GQA block size must match the static capacity"
         );
         assert!(
-            block.num_tokens() <= self.capacity.max_tokens,
+            block.num_tokens() <= self.capacity.block.max_tokens,
             "DSpark GQA token count exceeds capacity"
         );
         self.req_slots.write_typed(0, block.req_slots());
         self.flat_token_indices.write_typed(0, block.flat_token_indices());
 
-        let metadata = build_metal_metadata(block, kv_token_tile_size, self.capacity.max_sdpa_map_task_templates);
+        let metadata = build_metal_metadata(block, kv_token_tile_size, self.capacity.max_sdpa_partial_outputs);
         self.sdpa_map_task_templates
             .write_typed(0, &metadata.sdpa_map_task_templates);
         self.cu_sdpa_partial_outputs
@@ -79,6 +87,7 @@ impl DSparkGQAMetadataBuffers {
         self.block_sdpa_map_task_template_indices
             .write_typed(0, &metadata.block_sdpa_map_task_template_indices);
         self.replay_shape.set(Some(metadata.replay_shape));
+        self.compute_path.set(Some(compute_path));
         metadata.replay_shape
     }
 
@@ -104,6 +113,12 @@ impl DSparkGQAMetadataBuffers {
 
     pub fn replay_shape(&self) -> GQAReplayShape {
         self.replay_shape
+            .get()
+            .expect("DSpark GQA metadata must be updated before recording")
+    }
+
+    pub fn compute_path(&self) -> GQAComputePath {
+        self.compute_path
             .get()
             .expect("DSpark GQA metadata must be updated before recording")
     }
@@ -234,7 +249,45 @@ fn build_metal_metadata(
 
 #[cfg(test)]
 mod tests {
+    use inference_executor_core::attn::DSparkBlockCapacity;
+
     use super::*;
+
+    #[test]
+    fn test_metadata_retains_backend_selected_compute_path() {
+        let device = Device::system_default();
+        let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(2, 3));
+        let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
+        let block = DSparkBlockMetadata::new(&[3, 7], &[11, 20], 3);
+        let compute_path = GQAComputePath::SingleQueryToken {
+            kv_token_tile_size: 4,
+            num_threads_per_threadblock: 32,
+            q_head_tile_size: 2,
+        };
+
+        let shape = buffers.update(&block, compute_path);
+
+        assert_eq!(shape.num_tokens, 6);
+        assert_eq!(compute_path, buffers.compute_path());
+    }
+
+    #[test]
+    #[should_panic(expected = "single-query-token compute path")]
+    fn test_metadata_rejects_tiled_partial_abi() {
+        let device = Device::system_default();
+        let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(1, 3));
+        let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
+        let block = DSparkBlockMetadata::new(&[3], &[11], 3);
+
+        buffers.update(
+            &block,
+            GQAComputePath::TiledQueryTokens {
+                q_token_tile_size: 8,
+                kv_token_tile_size: 16,
+                q_head_tile_size: 2,
+            },
+        );
+    }
 
     #[test]
     fn test_metal_metadata_reserves_one_block_partial_per_query() {

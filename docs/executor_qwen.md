@@ -34,8 +34,10 @@ crates/inference-executor-metal/src/
     embedding.rs            shared weight-bearing Embed component
     unembedding.rs          shared weight-bearing Unembed component and QMV/QMM selection
     gather.rs               shared row-gather model component
+    main_residual_capture.rs
+                            shared Main residual-capture contract
     page_arena.rs           shared physical page buffer
-    residual.rs             shared residual-add/capture model component
+    residual_add.rs         shared residual-add/capture model component
     rms_norm.rs             shared weight-bearing RMS-normalization component
     qwen/v3_x/
       dspark/
@@ -45,7 +47,7 @@ crates/inference-executor-metal/src/
         layer.rs            independent Qwen3xDSparkLayer
         model.rs            context and body replay owners
         output.rs           gather/unembed and Markov sampling
-        plan.rs             DSpark geometry and backend configuration
+        sampling.rs         Qwen3x Markov checkpoint weights and generic backend adapter
       layer/
         gqa.rs              shared Qwen3xGQA leaf load and record
         gdn.rs              shared Qwen3xGDN leaf load and record
@@ -57,7 +59,7 @@ crates/inference-executor-metal/src/
       weight.rs             shared Qwen checkpoint decoding/validation helpers
     qwen/v3/
       main/
-        mod.rs              Qwen3 Main owner, capture contract, and replay key
+        mod.rs              Qwen3 Main owner and replay key
         embed.rs            Qwen3 Main embedding component and replay key
         gqa.rs              Qwen3 Main ungated GQA weights, state, load, and record
         layer.rs            fixed Qwen3MainLayer and Qwen3MainLayerScratch
@@ -73,7 +75,7 @@ crates/inference-executor-metal/src/
         dspark.rs           DSpark Spec proposal orchestration
     qwen/v3_5/
       main/
-        mod.rs              Qwen35 Main owner, capture contract, and replay key
+        mod.rs              Qwen35 Main owner and replay key
         embed.rs            Qwen35 Main embedding component and replay key
         layer.rs            Qwen35MainLayer variants and role-specific scratch
         output.rs           Qwen35 gather/unembed component and replay key
@@ -277,10 +279,13 @@ The executor splits each runtime block between Main K/V and persistent DSpark co
 
 There is no Main/MTP plan object tree or aggregate component-weight owner.
 Qwen3 Main owns QKV GQA and dense-MLP geometry conversion in `qwen/v3/main/plan.rs`.
-Qwen3x DSpark owns its geometry conversion in `qwen/v3_x/dspark/plan.rs`.
 Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, and MTP validation in `qwen/v3_5/plan.rs`.
-Shared leaf loaders receive finalized core and Metal configurations.
-They do not receive model configuration or default bags.
+Qwen3x DSpark has no plan object or plan source file.
+Each DSpark semantic owner derives its fixed geometry from `Qwen3xDSparkConfig` and resolves its affine layout from
+the exact binding subtree that it consumes.
+Each owner loads a bounded `TensorMap`, removes its tensors, performs its required fusion, and requires an empty map.
+Each DSpark layer owns its weight-dependent GQA and dense-MLP backend.
+The DSpark state domain shares only page tables, metadata, scratch, and geometry-dependent compute selection.
 
 ## Replay ownership
 
@@ -352,7 +357,7 @@ Qwen3.5 Main constructs `Qwen35MainLayerScratch`.
 Qwen3.5 MTP owns separate layer scratch.
 Similar workspace roles do not imply shared structural ownership.
 
-`Qwen3Main` exposes the model-specific `Qwen3MainResidualCapture` boundary.
+`Qwen3Main` and `Qwen35Main` accept the shared `MainResidualCapture` boundary.
 Main queries the capture owner immediately before each layer's final post-MLP residual add.
 The capture owner returns an optional opaque `ResidualAddCaptureTarget`.
 The destination selects a stable BF16 column range that the capture owner owns.

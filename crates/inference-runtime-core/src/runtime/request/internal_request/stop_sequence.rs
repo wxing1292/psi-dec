@@ -277,6 +277,7 @@ mod tests {
             sampled_prob: prob(values.len() as f32 / 10.0),
             spec_tokens: vec![token(100), token(101)],
             spec_probs: vec![prob(0.8), prob(0.9)],
+            spec_confidences: vec![prob(1.0), prob(1.0)],
         }
     }
 

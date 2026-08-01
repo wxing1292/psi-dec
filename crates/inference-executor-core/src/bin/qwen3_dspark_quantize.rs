@@ -236,14 +236,7 @@ fn quantize_safetensors(
     let mut input = File::open(input_path)
         .map_err(|err| error(format!("unable to open BF16 DSpark checkpoint {input_path:?}: {err}")))?;
     let header = read_header(&mut input, input_path)?;
-    let mut bindings = validate_source_tensors(&header, config, input_path)?;
-    if bindings.confidence.is_some() {
-        eprintln!(
-            "warning: omitting Qwen3 DSpark confidence-head weights; this executor checkpoint uses fixed-block \
-             proposals"
-        );
-    }
-    bindings.confidence = None;
+    let bindings = validate_source_tensors(&header, config, input_path)?;
     let output_tensors = build_output_tensors(&header, options)?;
     validate_output_tensor_names(&output_tensors, &bindings)?;
     let output_by_name = output_tensors
@@ -303,11 +296,8 @@ fn quantize_safetensors(
         })?;
 
     for (name, info) in &header.tensors {
-        if is_deferred_tensor(name) {
-            continue;
-        }
         let source = read_tensor(&mut input, &header, name, info, input_path)?;
-        if info.shape.len() == 2 {
+        if info.shape.len() == 2 && !is_unquantized_matrix(name) {
             let bits = bits_for_tensor(name, options);
             let (weights, scales, biases) = quantize_bf16_matrix(&source, &info.shape, options.group_size, bits)?;
             write_output_tensor(
@@ -464,10 +454,7 @@ fn validate_output_tensor_names(output_tensors: &[OutputTensor], bindings: &Qwen
 fn build_output_tensors(header: &SafetensorsHeader, options: QuantizeOptions) -> Result<Vec<OutputTensor>> {
     let mut tensors = Vec::new();
     for (name, info) in &header.tensors {
-        if is_deferred_tensor(name) {
-            continue;
-        }
-        if info.shape.len() == 2 {
+        if info.shape.len() == 2 && !is_unquantized_matrix(name) {
             let bits = bits_for_tensor(name, options);
             let input_dim = info.shape[1];
             if !input_dim.is_multiple_of(options.group_size) {
@@ -511,8 +498,8 @@ fn build_output_tensors(header: &SafetensorsHeader, options: QuantizeOptions) ->
     Ok(tensors)
 }
 
-fn is_deferred_tensor(name: &str) -> bool {
-    name.starts_with("confidence_head.")
+fn is_unquantized_matrix(name: &str) -> bool {
+    name == "confidence_head.proj.weight"
 }
 
 fn output_tensor(name: String, dtype: Dtype, shape: Vec<usize>) -> Result<OutputTensor> {
@@ -932,8 +919,18 @@ mod tests {
             [128, 16]
         );
         assert_eq!(checkpoint.tensor("norm.weight").unwrap().dtype(), Dtype::BF16);
-        assert!(checkpoint.tensor("confidence_head.proj.weight").is_err());
-        assert!(checkpoint.tensor("confidence_head.proj.bias").is_err());
+        assert_eq!(
+            checkpoint.tensor("confidence_head.proj.weight").unwrap().dtype(),
+            Dtype::BF16
+        );
+        assert_eq!(
+            checkpoint.tensor("confidence_head.proj.weight").unwrap().shape(),
+            [1, 128]
+        );
+        assert_eq!(
+            checkpoint.tensor("confidence_head.proj.bias").unwrap().dtype(),
+            Dtype::BF16
+        );
         let output_config =
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(output_dir.join("config.json")).unwrap())
                 .unwrap();

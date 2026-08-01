@@ -3,8 +3,6 @@ pub use config::Qwen3xDSparkConfig;
 pub use config::Qwen3xDSparkMainConfig;
 pub use config::init_qwen3x_dspark_config;
 
-pub mod reference;
-
 pub mod weight_layout;
 pub use weight_layout::Qwen3xDSparkConfidenceWeightBindings;
 pub use weight_layout::Qwen3xDSparkLayerWeightBindings;

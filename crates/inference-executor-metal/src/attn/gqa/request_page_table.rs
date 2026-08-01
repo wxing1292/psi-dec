@@ -302,5 +302,12 @@ mod tests {
         assert_eq!(main.read_page_ids(1, 0, 2), vec![10, 11]);
         assert_eq!(main.read_page_ids(1, 1, 2), vec![20, 21]);
         assert_eq!(dspark.read_page_ids(1, 0, 2), vec![30, 31, 32]);
+
+        main.reset_req_slots(&[1]);
+        dspark.reset_req_slots(&[1]);
+
+        assert_eq!(main.read_page_ids(1, 0, 2), vec![0, 0]);
+        assert_eq!(main.read_page_ids(1, 1, 2), vec![0, 0]);
+        assert_eq!(dspark.read_page_ids(1, 0, 2), vec![0, 0, 0]);
     }
 }

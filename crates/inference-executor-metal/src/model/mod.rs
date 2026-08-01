@@ -1,5 +1,6 @@
 pub mod embedding;
 pub mod gather;
+pub mod main_residual_capture;
 pub mod page_arena;
 pub mod qwen;
 pub mod residual_add;

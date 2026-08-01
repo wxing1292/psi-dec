@@ -1,13 +1,12 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::DSparkBlockCapacity;
 use inference_executor_core::attn::UngatedDSparkGQACore;
 
-use crate::attn::gqa::backend::GQAMetalConfig;
+use crate::attn::dspark::capacity::DSparkGQACapacity;
 
 pub struct DSparkBlockScratch {
-    capacity: DSparkBlockCapacity,
+    capacity: DSparkGQACapacity,
     qkv: Buffer,
     q: Buffer,
     k: Buffer,
@@ -22,7 +21,7 @@ pub struct DSparkBlockScratch {
 
 #[derive(Clone, Copy)]
 pub struct DSparkBlockScratchBindings<'a> {
-    pub capacity: DSparkBlockCapacity,
+    pub capacity: DSparkGQACapacity,
     pub qkv: &'a Buffer,
     pub q: &'a Buffer,
     pub k: &'a Buffer,
@@ -36,27 +35,27 @@ pub struct DSparkBlockScratchBindings<'a> {
 }
 
 impl DSparkBlockScratch {
-    pub fn new(
-        device: &Device,
-        core: &UngatedDSparkGQACore,
-        metal: GQAMetalConfig,
-        capacity: DSparkBlockCapacity,
-    ) -> Self {
+    pub fn new(device: &Device, core: &UngatedDSparkGQACore, io_dtype: Dtype, capacity: DSparkGQACapacity) -> Self {
         core.validate();
-        metal.validate();
+        match io_dtype {
+            Dtype::Bfloat16 => {},
+            Dtype::Float32 => todo!("F32 DSpark GQA model boundary is not supported"),
+            dtype => panic!("unsupported DSpark GQA model boundary dtype {dtype:?}"),
+        }
         assert_eq!(
-            core.block_size, capacity.block_size,
+            core.block_size, capacity.block.block_size,
             "DSpark GQA core and scratch block sizes must match"
         );
         let attention = &core.attention;
         let tensor_elements = |dim: usize| {
             capacity
+                .block
                 .max_tokens
                 .checked_mul(dim)
                 .expect("DSpark block scratch tensor element count must fit usize")
         };
         let partial_stats = capacity
-            .max_sdpa_map_task_templates
+            .max_sdpa_partial_outputs
             .checked_mul(attention.num_q_heads)
             .expect("DSpark block scratch partial statistic count must fit usize");
         let partial_values = partial_stats
@@ -67,21 +66,17 @@ impl DSparkBlockScratch {
 
         Self {
             capacity,
-            qkv: Buffer::new_zeroed_elements(device, tensor_elements(attention.qkv_dim()), metal.io_dtype),
-            q: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.io_dtype),
-            k: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), metal.io_dtype),
-            v: Buffer::new_zeroed_elements(device, tensor_elements(attention.v_dim()), metal.io_dtype),
-            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.io_dtype),
-            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), metal.io_dtype),
+            qkv: Buffer::new_zeroed_elements(device, tensor_elements(attention.qkv_dim()), io_dtype),
+            q: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), io_dtype),
+            k: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), io_dtype),
+            v: Buffer::new_zeroed_elements(device, tensor_elements(attention.v_dim()), io_dtype),
+            q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), io_dtype),
+            k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), io_dtype),
             partial_exp_sums: Buffer::new_zeroed_elements(device, partial_stats, Dtype::Float32),
             partial_max_logits: Buffer::new_zeroed_elements(device, partial_stats, Dtype::Float32),
-            partial_output: Buffer::new_zeroed_elements(device, partial_values, metal.io_dtype),
-            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), metal.io_dtype),
+            partial_output: Buffer::new_zeroed_elements(device, partial_values, io_dtype),
+            attention_output: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), io_dtype),
         }
-    }
-
-    pub fn capacity(&self) -> DSparkBlockCapacity {
-        self.capacity
     }
 
     pub fn bindings(&self) -> DSparkBlockScratchBindings<'_> {

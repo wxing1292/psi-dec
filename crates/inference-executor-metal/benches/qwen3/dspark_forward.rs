@@ -19,6 +19,8 @@ use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3::Qwen3ModelConfig;
 use inference_executor_core::model::qwen::v3::init_qwen3_model_config;
 use inference_executor_core::model::qwen::v3::weight_layout::resolve_qwen3_model_weight_bindings;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
 use inference_executor_metal::attn::dspark::state::UngatedDSparkGQAState;
@@ -30,13 +32,13 @@ use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model_with_dspark;
+use inference_executor_metal::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_compute_config;
+use inference_executor_metal::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_core;
 use inference_executor_metal::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
 use inference_executor_metal::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedArgs;
 use inference_executor_metal::model::qwen::v3_x::dspark::model::Qwen3xDSparkBody;
 use inference_executor_metal::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyArgs;
 use inference_executor_metal::model::qwen::v3_x::dspark::model::Qwen3xDSparkModel;
-use inference_executor_metal::model::qwen::v3_x::dspark::plan::Qwen3xDSparkPlan;
-use inference_executor_metal::model::qwen::v3_x::dspark::plan::build_qwen3x_dspark_plan;
 use inference_executor_metal::replay::ReplayComponent;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::DecoderSyncBlocks;
@@ -239,18 +241,13 @@ impl MainFixture {
         if let Some(dspark_model_dir) = dspark_model_dir {
             let dspark_config =
                 init_qwen3x_dspark_config(dspark_model_dir).expect("unable to load Qwen3 DSpark benchmark config");
-            let dspark_plan = build_qwen3x_dspark_plan(&dspark_config, QWEN3_PAGE_SIZE_BYTES)
-                .expect("unable to build Qwen3 DSpark benchmark plan");
-            let first_layer = dspark_plan.layers.first().expect("Qwen3 DSpark requires layers");
-            let tokens_per_page = first_layer
-                .attention_metal
-                .num_ungated_tokens_per_page(&first_layer.attention_core.attention)
-                as usize;
+            let compute_config = qwen3x_dspark_gqa_compute_config(&dspark_config, QWEN3_PAGE_SIZE_BYTES)
+                .expect("unable to build Qwen3 DSpark GQA compute config");
+            let tokens_per_page = compute_config.num_tokens_per_page() as usize;
             num_page_ids_per_block = num_page_ids_per_block
                 .checked_add(
-                    dspark_plan
-                        .layers
-                        .len()
+                    dspark_config
+                        .num_hidden_layers
                         .checked_mul(pages_per_cache_block(tokens_per_page))
                         .expect("DSpark page IDs per cache block must fit usize"),
                 )
@@ -379,16 +376,18 @@ struct DSparkFixture {
 impl DSparkFixture {
     fn new(main_model_dir: &Path, dspark_model_dir: &Path, num_requests: usize, context: u32) -> Self {
         let config = init_qwen3x_dspark_config(dspark_model_dir).expect("unable to load Qwen3 DSpark benchmark config");
-        let plan = build_qwen3x_dspark_plan(&config, QWEN3_PAGE_SIZE_BYTES)
-            .expect("unable to build Qwen3 DSpark benchmark plan");
-        let num_layers = plan.layers.len();
         let runtime = MetalRuntime::system_default();
         let device = runtime.device();
-        let capacity = DSparkBlockCapacity::new(num_requests, plan.block_size);
-        let first_layer = plan.layers.first().expect("DSpark comparison requires layers");
-        let tokens_per_page = first_layer
-            .attention_metal
-            .num_ungated_tokens_per_page(&first_layer.attention_core.attention) as usize;
+        let mut store =
+            SafeTensorStore::from_model_dir(dspark_model_dir).expect("unable to open Qwen3 DSpark comparison weights");
+        let bindings = resolve_qwen3x_dspark_weight_bindings(&config, store.index().tensor_names())
+            .expect("unable to resolve Qwen3 DSpark comparison weights");
+        let attention_core = qwen3x_dspark_gqa_core(&config, 0);
+        let attention_compute_config = qwen3x_dspark_gqa_compute_config(&config, QWEN3_PAGE_SIZE_BYTES)
+            .expect("unable to build Qwen3 DSpark GQA compute config");
+        let num_layers = config.num_hidden_layers;
+        let capacity = DSparkBlockCapacity::new(num_requests, config.block_size);
+        let tokens_per_page = attention_compute_config.num_tokens_per_page() as usize;
         let num_page_ids_per_block = pages_per_cache_block(tokens_per_page);
         let page_table_layout = GQAPageTableLayout {
             num_req_slots: num_requests
@@ -408,8 +407,8 @@ impl DSparkFixture {
             .expect("DSpark comparison page count must fit usize");
         let gqa_state = UngatedDSparkGQAState::new(
             device,
-            first_layer.attention_core.clone(),
-            first_layer.attention_metal,
+            attention_core,
+            attention_compute_config,
             page_table_layout,
             capacity,
             capacity.max_tokens,
@@ -419,7 +418,7 @@ impl DSparkFixture {
         let block = DSparkBlockMetadata::new(
             &request_slots(num_requests),
             &vec![context; num_requests],
-            plan.block_size,
+            config.block_size,
         );
         gqa_state.prepare_block(&block);
         let request_page_table = gqa_state.request_page_table();
@@ -443,23 +442,29 @@ impl DSparkFixture {
             }
         }
 
-        let mut store =
-            SafeTensorStore::from_model_dir(dspark_model_dir).expect("unable to open Qwen3 DSpark comparison weights");
-        let bindings = resolve_qwen3x_dspark_weight_bindings(&config, store.index().tensor_names())
-            .expect("unable to resolve Qwen3 DSpark comparison weights");
+        let Qwen3xDSparkWeightBindings {
+            embed: embed_bindings,
+            main_feature: main_feature_bindings,
+            layers: layer_bindings,
+            final_norm_weight,
+            ..
+        } = bindings;
         let embed = Qwen3xDSparkEmbed::new(load_dspark_embed(
             device,
             main_model_dir,
             &mut store,
-            &plan,
+            &config,
             capacity.max_tokens,
-            bindings.embed.clone(),
+            embed_bindings,
         ));
         let model = Qwen3xDSparkModel::load(
             device,
             &mut store,
-            &plan,
-            bindings,
+            &config,
+            QWEN3_PAGE_SIZE_BYTES,
+            main_feature_bindings,
+            layer_bindings,
+            final_norm_weight,
             &gqa_state,
             capacity.max_tokens,
             capacity.max_tokens,
@@ -474,10 +479,11 @@ impl DSparkFixture {
             device,
             &(0..capacity.max_tokens)
                 .map(|index| {
-                    if index % plan.block_size == 0 {
+                    if index % config.block_size == 0 {
                         11
                     } else {
-                        plan.mask_token_id
+                        config
+                            .mask_token_id
                             .try_into()
                             .expect("DSpark MASK token ID must fit i32")
                     }
@@ -525,7 +531,7 @@ impl DSparkFixture {
             empty_arguments: ReplayArguments::new(),
             output,
             num_tokens: capacity.max_tokens,
-            num_layers: plan.layers.len(),
+            num_layers: config.num_hidden_layers,
             _embed: embed,
             _body: body,
             _model: model,
@@ -607,29 +613,38 @@ fn load_dspark_embed(
     device: &inference_backend_metal::metal::Device,
     main_model_dir: &Path,
     dspark_store: &mut SafeTensorStore,
-    plan: &Qwen3xDSparkPlan,
+    config: &Qwen3xDSparkConfig,
     max_tokens: usize,
     bindings: Option<inference_executor_core::checkpoint::QuantizedTensorBindings>,
 ) -> Rc<Embed> {
     if let Some(bindings) = bindings {
+        let quantization = config
+            .quantization
+            .as_ref()
+            .expect("DSpark comparison requires quantization")
+            .resolve_for_tensor(&bindings.weight);
         return Rc::new(
             Embed::load(
                 device,
                 dspark_store,
                 EmbedConfig {
                     max_tokens: max_tokens.try_into().expect("DSpark embed token capacity must fit u32"),
-                    vocab_size: plan
-                        .embedding
-                        .num_embeddings
+                    vocab_size: config
+                        .vocab_size
                         .try_into()
                         .expect("DSpark embedding vocabulary must fit u32"),
-                    hidden_dim: plan
-                        .embedding
-                        .embedding_dim
+                    hidden_dim: config
+                        .hidden_size
                         .try_into()
                         .expect("DSpark embedding dimension must fit u32"),
-                    group_size: plan.embedding.group_size,
-                    bits: plan.embedding.bits,
+                    group_size: quantization
+                        .group_size
+                        .try_into()
+                        .expect("DSpark embedding group size must fit u32"),
+                    bits: quantization
+                        .bits
+                        .try_into()
+                        .expect("DSpark embedding bits must fit u32"),
                     scale_bias_dtype: Dtype::Bfloat16,
                     output_dtype: Dtype::Bfloat16,
                 },

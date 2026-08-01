@@ -134,10 +134,18 @@ component path as the design.
 
 ## Model and Backend Investigations
 
-- Execute the official Qwen3 DSpark confidence head and add dynamic proposal lengths.
-  Keep confidence generation in the model executor.
+- Audit Qwen3 and Qwen3.5 tensor-level quantization overrides outside MoE routing.
+  Their current Main and MTP GQA, GDN, and MLP builders use model-level affine defaults.
+  Confirm the supported checkpoint contracts before changing the loaders.
+  If a checkpoint permits per-layer layouts, resolve each semantic layer from its exact binding subtree.
+  Keep page tables, metadata, and compatible scratch shared.
+  Do not share a weight-dependent backend across incompatible affine layouts.
+- Wire the reusable Qwen3x DSpark model into Qwen3.5 only when a supported checkpoint defines the Main compatibility
+  and executor lifecycle. Reuse `MainResidualCapture`, `Qwen3xDSparkModel`, `Qwen3xDSparkMarkov`, and the generic
+  DSpark attention/state owners. Do not create a parallel `qwen/v3_5/dspark` implementation.
+- Use the Qwen3 DSpark confidence output to add dynamic proposal lengths.
   Keep global proposal ranking and verification-budget allocation in runtime scheduling.
-  Do not add variable proposal lengths until the scheduler owns this cross-request policy.
+  Keep the executor output fixed at `block_size` until the scheduler owns this cross-request policy.
 - Investigate strict one-row and multi-row Qwen3 Main numerical parity.
   The 2026-07-29 greedy acceptance audit found one deterministic output divergence in four prompts.
   At the first divergence, sparse rejection accepted zero draft tokens.

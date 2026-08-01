@@ -80,7 +80,12 @@ impl Qwen3xDSparkWeightBindings {
                 w1: quantized_path("markov_head.markov_w1".to_string()),
                 w2: quantized_path("markov_head.markov_w2".to_string()),
             },
-            confidence: None,
+            confidence: config.enable_confidence_head.then(|| {
+                Qwen3xDSparkConfidenceWeightBindings {
+                    weight: "confidence_head.proj.weight".to_string(),
+                    bias: "confidence_head.proj.bias".to_string(),
+                }
+            }),
         }
     }
 
@@ -89,8 +94,7 @@ impl Qwen3xDSparkWeightBindings {
         if let Some(embed) = &self.embed {
             push_quantized_tensor_names(embed, &mut names);
         }
-        push_quantized_tensor_names(&self.main_feature.fc, &mut names);
-        names.push(self.main_feature.hidden_norm_weight.as_str());
+        self.main_feature.push_tensor_names(&mut names);
         for layer in &self.layers {
             layer.push_tensor_names(&mut names);
         }
@@ -98,10 +102,9 @@ impl Qwen3xDSparkWeightBindings {
         if let Some(unembed) = &self.unembed {
             push_quantized_tensor_names(unembed, &mut names);
         }
-        push_quantized_tensor_names(&self.markov.w1, &mut names);
-        push_quantized_tensor_names(&self.markov.w2, &mut names);
+        self.markov.push_tensor_names(&mut names);
         if let Some(confidence) = &self.confidence {
-            names.extend([confidence.weight.as_str(), confidence.bias.as_str()]);
+            confidence.push_tensor_names(&mut names);
         }
         names
     }
@@ -131,7 +134,7 @@ impl Qwen3xDSparkWeightBindings {
 }
 
 impl Qwen3xDSparkLayerWeightBindings {
-    fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+    pub fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
         names.extend([
             self.input_norm_weight.as_str(),
             self.post_attention_norm_weight.as_str(),
@@ -157,6 +160,26 @@ impl Qwen3xDSparkLayerWeightBindings {
     }
 }
 
+impl Qwen3xDSparkMainFeatureWeightBindings {
+    pub fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+        push_quantized_tensor_names(&self.fc, names);
+        names.push(&self.hidden_norm_weight);
+    }
+}
+
+impl Qwen3xDSparkMarkovWeightBindings {
+    pub fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+        push_quantized_tensor_names(&self.w1, names);
+        push_quantized_tensor_names(&self.w2, names);
+    }
+}
+
+impl Qwen3xDSparkConfidenceWeightBindings {
+    pub fn push_tensor_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+        names.extend([self.weight.as_str(), self.bias.as_str()]);
+    }
+}
+
 pub fn resolve_qwen3x_dspark_weight_bindings<'a>(
     config: &Qwen3xDSparkConfig,
     tensor_names: impl IntoIterator<Item = &'a str>,
@@ -179,9 +202,19 @@ pub fn resolve_qwen3x_dspark_weight_bindings<'a>(
     missing.sort_unstable();
     unexpected.sort_unstable();
     if !missing.is_empty() || !unexpected.is_empty() {
+        let missing_confidence = bindings.confidence.as_ref().is_some_and(|confidence| {
+            missing.contains(&confidence.weight.as_str()) || missing.contains(&confidence.bias.as_str())
+        });
+        let confidence_hint = if missing_confidence {
+            " The affine checkpoint is missing its enabled confidence head. Regenerate it from the official BF16 \
+             DSpark checkpoint with qwen3_dspark_quantize; do not reuse an affine checkpoint generated before \
+             confidence support."
+        } else {
+            ""
+        };
         return Err(ModelExecutorError::custom(format!(
             "Qwen3 DSpark checkpoint must match the exact affine tensor layout; missing={missing:?}, \
-             unexpected={unexpected:?}"
+             unexpected={unexpected:?}.{confidence_hint}"
         )));
     }
     Ok(bindings)
@@ -204,20 +237,6 @@ pub fn resolve_qwen3x_dspark_source_weight_bindings<'a>(
     bindings.unembed = actual
         .contains("lm_head.weight")
         .then(|| quantized_path("lm_head".to_string()));
-    let has_confidence_weight = actual.contains("confidence_head.proj.weight");
-    let has_confidence_bias = actual.contains("confidence_head.proj.bias");
-    if has_confidence_weight != has_confidence_bias {
-        return Err(ModelExecutorError::custom(
-            "Qwen3 DSpark source confidence head must contain both weight and bias",
-        ));
-    }
-    bindings.confidence = has_confidence_weight.then(|| {
-        Qwen3xDSparkConfidenceWeightBindings {
-            weight: "confidence_head.proj.weight".to_string(),
-            bias: "confidence_head.proj.bias".to_string(),
-        }
-    });
-
     let expected_names = bindings.source_tensor_names();
     let expected = expected_names.iter().copied().collect::<HashSet<_>>();
     let mut missing = expected.difference(&actual).copied().collect::<Vec<_>>();

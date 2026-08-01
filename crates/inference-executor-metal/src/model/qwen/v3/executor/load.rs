@@ -15,6 +15,7 @@ use inference_executor_core::model::qwen::v3::init_qwen3_model_config;
 use inference_executor_core::model::qwen::v3::weight_layout::Qwen3ModelWeightBindings;
 use inference_executor_core::model::qwen::v3::weight_layout::resolve_qwen3_model_weight_bindings;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
 use inference_executor_core::sampling::HFGenerationConfig;
@@ -28,30 +29,32 @@ use crate::checkpoint::SafeTensorStore;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
+use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::v3::executor::Qwen3Executor;
 use crate::model::qwen::v3::executor::Qwen3PendingTransactions;
 use crate::model::qwen::v3::executor::compact_target_distribution_indices;
 use crate::model::qwen::v3::executor::num_page_ids_per_block;
 use crate::model::qwen::v3::main::Qwen3Main;
-use crate::model::qwen::v3::main::Qwen3MainResidualCapture;
 use crate::model::qwen::v3::main::embed::Qwen3MainEmbed;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayerScratch;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembed;
 use crate::model::qwen::v3::main::plan::qwen3_dense_mlp_core_and_metal;
 use crate::model::qwen::v3::main::plan::qwen3_gqa_core_and_metal;
+use crate::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_compute_config;
+use crate::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_core;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBody;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContext;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkModel;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembed;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSampling;
-use crate::model::qwen::v3_x::dspark::plan::build_qwen3x_dspark_plan;
+use crate::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
+use crate::model::qwen::v3_x::weight::to_u32;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
-use crate::sampling::dspark_markov::DSparkMarkovSampling;
 use crate::sampling::rejection_replay::RejectionSampler;
 use crate::sampling::rejection_replay::RejectionSampling;
 use crate::sampling::spec_probs::SpecProbsStore;
@@ -125,7 +128,7 @@ struct Qwen3DSparkLoaded {
     model: Rc<Qwen3xDSparkModel>,
     embed: Rc<Embed>,
     unembed: Rc<Unembed>,
-    markov: Rc<DSparkMarkovSampling>,
+    markov: Rc<Qwen3xDSparkMarkov>,
     block_size: usize,
     mask_token_id: i32,
 }
@@ -336,7 +339,7 @@ fn init_qwen_3_model_inner(
         })
         .transpose()?;
     let residual_capture = dspark_loaded.as_ref().map(|loaded| {
-        let capture: Rc<dyn Qwen3MainResidualCapture> = loaded.model.main_feature_projector();
+        let capture: Rc<dyn MainResidualCapture> = loaded.model.main_feature_projector();
         capture
     });
     let main = Qwen3Main::load(
@@ -534,14 +537,19 @@ fn load_qwen3_dspark(
         max_position_embeddings: text.max_position_embeddings,
         rope_theta: text.rope_theta,
     })?;
-    let plan = build_qwen3x_dspark_plan(&config, QWEN3_PAGE_SIZE_BYTES)?;
-    let first_layer = plan
-        .layers
-        .first()
-        .expect("Qwen3 DSpark plan requires transformer layers");
-    let tokens_per_page = first_layer
-        .attention_metal
-        .num_ungated_tokens_per_page(&first_layer.attention_core.attention) as usize;
+    let mut store = SafeTensorStore::from_model_dir(model_dir)?;
+    let Qwen3xDSparkWeightBindings {
+        embed: embed_bindings,
+        main_feature: main_feature_bindings,
+        layers: layer_bindings,
+        final_norm_weight,
+        unembed: unembed_bindings,
+        markov: markov_bindings,
+        confidence: confidence_bindings,
+    } = resolve_qwen3x_dspark_weight_bindings(&config, store.index().tensor_names())?;
+    let attention_core = qwen3x_dspark_gqa_core(&config, 0);
+    let attention_compute_config = qwen3x_dspark_gqa_compute_config(&config, QWEN3_PAGE_SIZE_BYTES)?;
+    let tokens_per_page = attention_compute_config.num_tokens_per_page() as usize;
     let page_ids_per_block = num_page_ids_per_block(executor_config.num_tokens_per_block, tokens_per_page);
     let page_table_layout = GQAPageTableLayout {
         num_req_slots: executor_config
@@ -554,16 +562,15 @@ fn load_qwen3_dspark(
             .max(1)
             .try_into()
             .expect("Qwen3 DSpark block capacity must fit u32"),
-        num_gqa_layers: plan
-            .layers
-            .len()
+        num_gqa_layers: config
+            .num_hidden_layers
             .try_into()
             .expect("Qwen3 DSpark layer count must fit u32"),
         num_page_ids_per_block: page_ids_per_block
             .try_into()
             .expect("Qwen3 DSpark pages per block must fit u32"),
     };
-    let capacity = DSparkBlockCapacity::new(executor_config.max_requests, plan.block_size);
+    let capacity = DSparkBlockCapacity::new(executor_config.max_requests, config.block_size);
     if capacity.max_tokens > executor_config.max_tokens {
         return Err(ModelExecutorError::custom(format!(
             "Qwen3 DSpark proposal capacity={} exceeds executor max_tokens={}; increase --max-tokens or reduce the \
@@ -573,18 +580,21 @@ fn load_qwen3_dspark(
     }
     let gqa_state = UngatedDSparkGQAState::new(
         device,
-        first_layer.attention_core.clone(),
-        first_layer.attention_metal,
+        attention_core,
+        attention_compute_config,
         page_table_layout,
         capacity,
         executor_config.max_tokens,
         executor_config.num_cache_pages,
         0,
     );
-    let mut store = SafeTensorStore::from_model_dir(model_dir)?;
-    let bindings = resolve_qwen3x_dspark_weight_bindings(&config, store.index().tensor_names())?;
+    let quantization = config
+        .quantization
+        .as_ref()
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark Metal executor requires quantization config"))?;
     let max_block_tokens = capacity.max_tokens;
-    let embed = if let Some(embed_bindings) = bindings.embed.clone() {
+    let embed = if let Some(embed_bindings) = embed_bindings {
+        let resolved = quantization.resolve_for_tensor(&embed_bindings.weight);
         Rc::new(Embed::load(
             device,
             &mut store,
@@ -592,18 +602,16 @@ fn load_qwen3_dspark(
                 max_tokens: max_block_tokens
                     .try_into()
                     .expect("Qwen3 DSpark embed rows must fit u32"),
-                vocab_size: plan
-                    .embedding
-                    .num_embeddings
+                vocab_size: config
+                    .vocab_size
                     .try_into()
                     .expect("Qwen3 DSpark embedding vocabulary must fit u32"),
-                hidden_dim: plan
-                    .embedding
-                    .embedding_dim
+                hidden_dim: config
+                    .hidden_size
                     .try_into()
                     .expect("Qwen3 DSpark embedding width must fit u32"),
-                group_size: plan.embedding.group_size,
-                bits: plan.embedding.bits,
+                group_size: to_u32("Qwen3x DSpark embedding group_size", resolved.group_size)?,
+                bits: to_u32("Qwen3x DSpark embedding bits", resolved.bits)?,
                 scale_bias_dtype: Dtype::Bfloat16,
                 output_dtype: Dtype::Bfloat16,
             },
@@ -612,7 +620,8 @@ fn load_qwen3_dspark(
     } else {
         main_embed
     };
-    let unembed = if let Some(unembed_bindings) = bindings.unembed.clone() {
+    let unembed = if let Some(unembed_bindings) = unembed_bindings {
+        let resolved = quantization.resolve_for_tensor(&unembed_bindings.weight);
         Rc::new(Unembed::load(
             device,
             &mut store,
@@ -620,18 +629,16 @@ fn load_qwen3_dspark(
                 max_tokens: max_block_tokens
                     .try_into()
                     .expect("Qwen3 DSpark unembed rows must fit u32"),
-                vocab_size: plan
-                    .unembed
-                    .output_dim
+                vocab_size: config
+                    .vocab_size
                     .try_into()
                     .expect("Qwen3 DSpark unembed vocabulary must fit u32"),
-                hidden_dim: plan
-                    .unembed
-                    .input_dim
+                hidden_dim: config
+                    .hidden_size
                     .try_into()
                     .expect("Qwen3 DSpark unembed hidden width must fit u32"),
-                group_size: plan.unembed.group_size,
-                bits: plan.unembed.bits,
+                group_size: to_u32("Qwen3x DSpark unembed group_size", resolved.group_size)?,
+                bits: to_u32("Qwen3x DSpark unembed bits", resolved.bits)?,
                 input_dtype: Dtype::Bfloat16,
                 output_dtype: Dtype::Bfloat16,
                 scale_bias_dtype: Dtype::Bfloat16,
@@ -641,19 +648,23 @@ fn load_qwen3_dspark(
     } else {
         main_unembed
     };
-    let markov = Rc::new(DSparkMarkovSampling::load(
+    let markov = Rc::new(Qwen3xDSparkMarkov::load(
         device,
         &mut store,
-        &plan,
-        &bindings.markov,
+        &config,
+        &markov_bindings,
+        confidence_bindings.as_ref(),
         executor_config.max_requests,
         sampler_bounds,
     )?);
     let model = Qwen3xDSparkModel::load(
         device,
         &mut store,
-        &plan,
-        bindings,
+        &config,
+        QWEN3_PAGE_SIZE_BYTES,
+        main_feature_bindings,
+        layer_bindings,
+        final_norm_weight,
         &gqa_state,
         executor_config.max_tokens,
         max_block_tokens,
@@ -665,8 +676,8 @@ fn load_qwen3_dspark(
         embed,
         unembed,
         markov,
-        block_size: plan.block_size,
-        mask_token_id: plan
+        block_size: config.block_size,
+        mask_token_id: config
             .mask_token_id
             .try_into()
             .map_err(|_| ModelExecutorError::custom("Qwen3 DSpark MASK token ID must fit i32"))?,

@@ -262,6 +262,7 @@ mod tests {
                     sampled_prob: NotNan::new(0.8).unwrap(),
                     spec_tokens: vec![Token::new(14), Token::new(15)],
                     spec_probs: vec![NotNan::new(0.6).unwrap(), NotNan::new(0.7).unwrap()],
+                    spec_confidences: vec![NotNan::new(1.0).unwrap(), NotNan::new(1.0).unwrap()],
                 },
             }],
         );

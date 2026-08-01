@@ -33,9 +33,9 @@ use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 
+use super::gqa_compute_config;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::backend::GQAMetalConfig;
-use crate::attn::gqa::backend::gqa_compute_config;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::ungated_scratch::UngatedGQAScratch;
 use crate::attn::gqa::ungated_scratch::UngatedGQAScratchBindings;

@@ -270,6 +270,7 @@ pub struct Qwen3DecodeDecision {
     pub sampled_prob: f32,
     pub spec_tokens: Vec<u32>,
     pub spec_probs: Vec<f32>,
+    pub spec_confidences: Vec<f32>,
 }
 
 pub fn gather_flat_indices(microbatch: &Qwen3Microbatch) -> Vec<u32> {
@@ -361,6 +362,8 @@ pub fn to_core_batch_resp(
                     let decision = decisions
                         .next()
                         .expect("Qwen3 service requires one decision per sampled request");
+                    assert_eq!(decision.spec_tokens.len(), decision.spec_probs.len());
+                    assert_eq!(decision.spec_tokens.len(), decision.spec_confidences.len());
                     SampledTokens::Decode {
                         epoch: core_req.decoder_query_tokens.epoch(),
                         validated_tokens: decision.validated_tokens.into_iter().map(Token::new).collect(),
@@ -369,6 +372,7 @@ pub fn to_core_batch_resp(
                         sampled_prob: finite_probability(decision.sampled_prob),
                         spec_tokens: decision.spec_tokens.into_iter().map(Token::new).collect(),
                         spec_probs: decision.spec_probs.into_iter().map(finite_probability).collect(),
+                        spec_confidences: decision.spec_confidences.into_iter().map(finite_probability).collect(),
                     }
                 },
             };

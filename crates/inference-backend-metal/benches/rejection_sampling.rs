@@ -74,6 +74,9 @@ fn main() {
                 w1_bits: args.markov_w1_bits,
                 w2_group_size: args.markov_w2_group_size,
                 w2_bits: args.markov_w2_bits,
+                io_dtype: Dtype::Bfloat16,
+                scale_bias_dtype: Dtype::Bfloat16,
+                confidence: None,
             };
             for rows in args.rows {
                 let fixture = DSparkMarkovFixture::new(&device, rows, args.top_k, config);
@@ -222,7 +225,7 @@ impl DSparkMarkovFixture {
             vocab_size: config.vocab_size,
             top_k,
         };
-        let previous_token_ids = Buffer::new_zeroed_elements(device, rows as usize, Dtype::Int32);
+        let input_token_ids = Buffer::new_zeroed_elements(device, rows as usize, Dtype::Int32);
         let base_logits =
             Buffer::new_zeroed_elements(device, rows as usize * config.vocab_size as usize, Dtype::Bfloat16);
         let w1_weight = Buffer::new_zeroed(
@@ -249,7 +252,7 @@ impl DSparkMarkovFixture {
                 base_logits_row_offset: 0,
             },
             DSparkMarkovTopKMapBuffers {
-                previous_token_ids: &previous_token_ids,
+                input_token_ids: &input_token_ids,
                 base_logits: &base_logits,
                 w1_weight: &w1_weight,
                 w1_scales: &w1_scales,
@@ -259,6 +262,7 @@ impl DSparkMarkovFixture {
                 w2_biases: &w2_biases,
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
+                confidence: None,
             },
         ));
         let replay = builder.build();

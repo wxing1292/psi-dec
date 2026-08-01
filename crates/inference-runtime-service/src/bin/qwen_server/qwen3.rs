@@ -64,16 +64,25 @@ fn run_inner() -> Result<()> {
     };
     let model = match config.hf_dspark_model_dir() {
         Some(dspark_model_dir) => {
-            init_qwen_3_model_with_dspark(config.hf_model_dir(), dspark_model_dir, executor_config)
+            init_qwen_3_model_with_dspark(config.hf_model_dir(), dspark_model_dir, executor_config).map_err(
+                |error| {
+                    log_err_unavailable!(
+                        "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
+                        config.hf_model_dir(),
+                        dspark_model_dir,
+                    )
+                },
+            )?
         },
-        None => init_qwen_3_model(config.hf_model_dir(), executor_config),
-    }
-    .map_err(|error| {
-        log_err_unavailable!(
-            "unable to initialize qwen3 model from {:?}: {error}",
-            config.hf_model_dir()
-        )
-    })?;
+        None => {
+            init_qwen_3_model(config.hf_model_dir(), executor_config).map_err(|error| {
+                log_err_unavailable!(
+                    "unable to initialize qwen3 Main model from {:?}: {error}",
+                    config.hf_model_dir()
+                )
+            })?
+        },
+    };
     startup.event("model executor initialized");
     if let Some(dspark_model_dir) = config.hf_dspark_model_dir() {
         tracing::info!(
@@ -81,7 +90,6 @@ fn run_inner() -> Result<()> {
             component = "qwen3",
             dspark_model_dir = ?dspark_model_dir,
             proposal_mode = "fixed-block",
-            confidence_head_execution = false,
             "qwen3 DSpark configured"
         );
     }

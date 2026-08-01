@@ -740,6 +740,7 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_mtp_w_spec_token() {
             validated_probs: vec![NotNan::new(0.5).unwrap()],
             sampled_token: output_sampled_token,
             sampled_prob: NotNan::new(0.5).unwrap(),
+            spec_confidences: vec![NotNan::new(1.0).unwrap(); output_spec_tokens.len()],
             spec_tokens: output_spec_tokens,
             spec_probs: output_spec_probs,
         },
@@ -847,6 +848,7 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_w_mtp_w_spec_token() {
             validated_probs: vec![NotNan::new(0.5).unwrap()],
             sampled_token: output_sampled_token,
             sampled_prob: NotNan::new(0.5).unwrap(),
+            spec_confidences: vec![NotNan::new(1.0).unwrap(); output_spec_tokens.len()],
             spec_tokens: output_spec_tokens.clone(),
             spec_probs: output_spec_probs,
         },
@@ -1125,6 +1127,7 @@ fn test_prepare_commit_mutable_collision_additional_validated_token_w_mtp() {
             sampled_prob: NotNan::new(0.5).unwrap(),
             spec_tokens: token_vec([30, 31]),
             spec_probs: vec![NotNan::new(0.6).unwrap(), NotNan::new(0.7).unwrap()],
+            spec_confidences: vec![NotNan::new(1.0).unwrap(); 2],
         },
     );
     assert_eq!(0, blocks.num_in_sync_blocks);

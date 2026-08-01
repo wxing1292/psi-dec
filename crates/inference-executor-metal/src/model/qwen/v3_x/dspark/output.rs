@@ -7,11 +7,11 @@ use inference_backend_metal::metal::Dtype;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::gather::Gather;
+use crate::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
-use crate::sampling::dspark_markov::DSparkMarkovSampling;
-use crate::sampling::dspark_markov::DSparkMarkovShape;
+use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
 use crate::sampling::spec_probs::SpecProbsStore;
 
 pub struct Qwen3xDSparkGatherUnembed {
@@ -22,7 +22,7 @@ pub struct Qwen3xDSparkGatherUnembed {
 }
 
 pub struct Qwen3xDSparkSampling {
-    markov: Rc<DSparkMarkovSampling>,
+    markov: Rc<Qwen3xDSparkMarkov>,
 }
 
 #[derive(Clone, Copy)]
@@ -35,8 +35,9 @@ pub struct Qwen3xDSparkGatherUnembedArgs<'a> {
 
 #[derive(Clone, Copy)]
 pub struct Qwen3xDSparkSamplingArgs<'a> {
-    pub shape: DSparkMarkovShape,
+    pub shape: DSparkMarkovReplayShape,
     pub logits: &'a Buffer,
+    pub hidden: &'a Buffer,
     pub distribution_store: &'a SpecProbsStore,
 }
 
@@ -47,7 +48,7 @@ pub struct Qwen3xDSparkGatherUnembedReplayKey {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkSamplingReplayKey {
-    shape: DSparkMarkovShape,
+    shape: DSparkMarkovReplayShape,
 }
 
 impl Qwen3xDSparkGatherUnembed {
@@ -128,7 +129,7 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
 }
 
 impl Qwen3xDSparkSampling {
-    pub fn new(markov: Rc<DSparkMarkovSampling>) -> Self {
+    pub fn new(markov: Rc<Qwen3xDSparkMarkov>) -> Self {
         Self { markov }
     }
 }
@@ -142,8 +143,13 @@ impl ReplayComponent for Qwen3xDSparkSampling {
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.markov
-            .record(recorder, input.shape, input.logits, input.distribution_store);
+        self.markov.record(
+            recorder,
+            input.shape,
+            input.logits,
+            input.hidden,
+            input.distribution_store,
+        );
     }
 }
 

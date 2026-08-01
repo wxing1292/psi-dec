@@ -28,6 +28,7 @@ crates/inference-executor-metal/src/attn/
   dspark/
     mod.rs                  DSpark attention module root
     backend.rs              ungated paged-history plus block-bidirectional replay graph
+    capacity.rs             Metal DSpark GQA partial-output capacity
     context.rs              persistent DSpark context K/V append
     metadata.rs             proposal history and block metadata
     scratch.rs              fixed-capacity local Q/K/V and attention partials
@@ -35,7 +36,7 @@ crates/inference-executor-metal/src/attn/
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
-    dspark/                 Qwen3x DSpark attention, layer, model, and plan
+    dspark/                 Qwen3x DSpark attention, layer, and model
     layer/gqa.rs            Qwen3xGQA, private checkpoint weights, load, and record
     state/gqa.rs            Qwen3xGQAState page/metadata/reset lifecycle grouping
   v3/
@@ -235,6 +236,8 @@ single full-attention body uses `gqa_layer_index = 0`.
 Qwen3 DSpark has a separate page table.
 The Qwen3 executor splits one runtime cache-block page span into Main and DSpark page spans.
 Both page tables keep their own layer and page-stride geometry.
+The executor sends the same runtime request-slot reset notification to both tables before it reuses a slot.
+Both tables use `GQARequestPageTable::reset_req_slots`.
 
 The layout type uses generic `num_gqa_layers` for both tables. Each table instance owns its capacity and can use a
 different GQA configuration.
@@ -312,8 +315,15 @@ One TaskTemplate can cover several consecutive KV-token tiles. The planner round
 
 The backend configuration is model-independent.
 `model/qwen/v3/main/plan.rs` builds the Qwen3 Main ungated core.
-`model/qwen/v3_x/dspark/plan.rs` builds the Qwen3x DSpark ungated core.
+Each `model/qwen/v3_x/dspark/attention.rs` layer derives its ungated core and Metal configuration from the normalized
+DSpark config and its exact attention binding subtree.
 `model/qwen/v3_5/plan.rs` builds gated Main and MTP cores.
+
+Each DSpark layer owns its weight-dependent `UngatedDSparkGQA` and `UngatedDSparkGQAContextAppender`.
+`UngatedDSparkGQAState` owns the shared page table, metadata, scratch, and single-query history compute contract.
+Quantization layout is not part of the shared-state compatibility contract.
+The state receives complete geometry and storage facts through `GQAComputeConfig`.
+The backend owns the single-query kernel and tile selection.
 
 Each concrete backend converts its core and `GQAMetalConfig` into a projection split. `GQAMetalConfig` contains only
 model, quantization, storage, and RoPE facts. The backend derives Metal SDPA tuning from `head_dim`. It then constructs
@@ -426,7 +436,7 @@ produce the same single-Q partial ABI for one shared reduce. This constructor ap
 does not let the caller select tile geometry.
 
 `GQACompute::select(...)` returns one `GQAComputePath`. The selected path and its complete geometry are stored with the
-prepared batch metadata. Recording executes that same path. Both paths partition a long visible KV context
+prepared batch metadata. Recording executes that same path and does not select again. Both paths partition a long visible KV context
 into independent `SDPAMapTaskTemplate`s.
 
 The paths differ in the number of Q tokens and Q heads that one map threadblock computes:
@@ -610,6 +620,8 @@ Qwen3 DSpark owns `DSparkBlockScratch`.
 This scratch contains proposal-local Q/K/V and both attention paths' partial outputs.
 Its partial capacity is `next_power_of_two(2 * max_requests * block_size)`.
 It does not depend on `max_position_embeddings`.
+`DSparkGQACapacity` owns this Metal resource rule.
+The backend-neutral `DSparkBlockCapacity` contains only request and block geometry.
 
 The bound for SDPA partial scratch is
 `max_tokens * backend_selected_tiled_q_token_tile_size * num_q_heads`.

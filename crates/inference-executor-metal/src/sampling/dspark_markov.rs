@@ -1,8 +1,41 @@
+//! Model-neutral DSpark Markov sampling and confidence composition.
+//!
+//! ```text
+//! input_token_ids[i]
+//!   i = 0: sampled_token / anchor_token
+//!   i > 0: spec_tokens[i - 1]
+//!          |
+//!          v
+//! quantized Markov W1 embedding
+//!          |
+//!          +---------------------------------------------+
+//!          |                                             |
+//!          v                                             v
+//! quantized Markov W2                         [hidden[i], Markov W1 embedding]
+//!          |                                             |
+//!          v                                             v
+//! base_logits[i] + correction                 confidence projection + sigmoid
+//!          |                                             |
+//!          v                                             v
+//! tile-local Top-K                              spec_confidences[i]
+//!          |
+//!          v
+//! Top-K merge and sampling
+//!          |
+//!          +--> step_outputs[i].token_ids       = spec_tokens[i]
+//!          +--> step_outputs[i].token_probs     = spec_probs[i]
+//!          +--> sparse draft distribution
+//! ```
+//!
+//! `DSparkMarkovTopKMapKernel` computes both branches. The confidence branch
+//! reuses the current step's W1 embedding. It does not add a replay command.
+
+use inference_backend_metal::components::DSparkConfidenceBuffers;
+use inference_backend_metal::components::DSparkConfidenceConfig as DSparkBackendConfidenceConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapBuffers;
 use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
 use inference_backend_metal::components::DSparkMarkovTopKMapShape;
-use inference_backend_metal::components::QuantizedEmbeddingConfig;
 use inference_backend_metal::components::TopKMergeKernels;
 use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
 use inference_backend_metal::components::TopKSampleShape;
@@ -10,27 +43,19 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMarkovWeightBindings;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_executor_core::sampling::TopKSamplingShape;
 
-use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3_x::dspark::plan::Qwen3xDSparkPlan;
-use crate::model::qwen::v3_x::weight::quant_weight;
-use crate::model::qwen::v3_x::weight::typed_tensor;
-use crate::model::qwen::v3_x::weight::validate_len;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_sampling::TopKSamplingOutputBuffers;
 use crate::sampling::top_k_sampling::TopKSamplingRuntimeParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DSparkMarkovShape {
+pub struct DSparkMarkovReplayShape {
     pub num_requests: u32,
     pub sampling: TopKSamplingShape,
 }
@@ -39,21 +64,65 @@ pub struct DSparkMarkovShape {
 pub struct DSparkProposal {
     pub token_ids: Vec<Vec<u32>>,
     pub token_probs: Vec<Vec<f32>>,
+    pub confidences: Vec<Vec<f32>>,
 }
 
-struct DSparkMarkovWeights {
-    w1_weight: Buffer,
-    w1_scales: Buffer,
-    w1_biases: Buffer,
-    w2_weight: Buffer,
-    w2_scales: Buffer,
-    w2_biases: Buffer,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DSparkMarkovSamplingConfig {
+    pub block_size: usize,
+    pub vocab_size: u32,
+    pub rank: u32,
+    pub w1_group_size: u32,
+    pub w1_bits: u32,
+    pub w2_group_size: u32,
+    pub w2_bits: u32,
+    pub io_dtype: Dtype,
+    pub scale_bias_dtype: Dtype,
+    pub confidence: Option<DSparkMarkovConfidenceConfig>,
+    pub sampling: TopKSamplingBounds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DSparkMarkovConfidenceConfig {
+    pub hidden_dim: u32,
+    pub with_markov: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct DSparkMarkovWeights<'a> {
+    pub w1_weight: &'a Buffer,
+    pub w1_scales: &'a Buffer,
+    pub w1_biases: &'a Buffer,
+    pub w2_weight: &'a Buffer,
+    pub w2_scales: &'a Buffer,
+    pub w2_biases: &'a Buffer,
+}
+
+#[derive(Clone, Copy)]
+pub struct DSparkConfidenceWeights<'a> {
+    pub weight: &'a Buffer,
+    pub bias: &'a Buffer,
+}
+
+#[derive(Clone, Copy)]
+pub struct DSparkConfidenceInput<'a> {
+    pub hidden: &'a Buffer,
+    pub weights: DSparkConfidenceWeights<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub struct DSparkMarkovInput<'a> {
+    pub shape: DSparkMarkovReplayShape,
+    pub base_logits: &'a Buffer,
+    pub distribution_store: &'a SpecProbsStore,
+    pub weights: DSparkMarkovWeights<'a>,
+    pub confidence: Option<DSparkConfidenceInput<'a>>,
 }
 
 pub struct DSparkMarkovSampling {
     block_size: usize,
     max_requests: usize,
-    weights: DSparkMarkovWeights,
+    confidence_output: Option<Buffer>,
     top_k_map: DSparkMarkovTopKMapKernel,
     sample_reduce: TopKMergeKernels,
     anchor_token_ids: Buffer,
@@ -65,67 +134,33 @@ pub struct DSparkMarkovSampling {
 }
 
 impl DSparkMarkovSampling {
-    pub fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        plan: &Qwen3xDSparkPlan,
-        bindings: &Qwen3xDSparkMarkovWeightBindings,
-        max_requests: usize,
-        sampler_bounds: TopKSamplingBounds,
-    ) -> Result<Self, ModelExecutorError> {
-        assert!(plan.block_size > 0, "DSpark Markov sampling requires steps");
-        assert!(max_requests > 0, "DSpark Markov sampling requires requests");
-        sampler_bounds.validate();
-        let rank = to_u32("DSpark Markov rank", plan.markov_w1.embedding_dim);
-        let vocab_size = to_u32("DSpark Markov vocabulary", plan.markov_w1.num_embeddings);
-        assert_eq!(
-            vocab_size as usize, plan.markov_w2.output_dim,
-            "DSpark Markov W1 and W2 vocabularies must match"
-        );
-        assert_eq!(
-            rank as usize, plan.markov_w2.input_dim,
-            "DSpark Markov W1 and W2 ranks must match"
-        );
-        assert!(max_requests <= sampler_bounds.max_sampling_inputs as usize);
-        let markov_sampler_bounds = TopKSamplingBounds {
-            max_sampling_inputs: max_requests
-                .try_into()
-                .expect("DSpark maximum requests must fit sampling bounds"),
-            ..sampler_bounds
-        };
-        markov_sampler_bounds.validate();
-        let w1_config = QuantizedEmbeddingConfig {
-            vocab_size,
-            hidden_dim: rank,
-            group_size: plan.markov_w1.group_size,
-            bits: plan.markov_w1.bits,
-            scale_bias_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-        };
-        w1_config.validate();
-        let weights = DSparkMarkovWeights::load(device, store, plan, bindings, w1_config)?;
-        let top_k_map_config = DSparkMarkovTopKMapConfig {
-            vocab_size,
-            rank,
-            w1_group_size: plan.markov_w1.group_size,
-            w1_bits: plan.markov_w1.bits,
-            w2_group_size: plan.markov_w2.group_size,
-            w2_bits: plan.markov_w2.bits,
-        };
-        let top_k_map = DSparkMarkovTopKMapKernel::new(device, top_k_map_config);
-        let candidate_count = top_k_map.candidate_count(component_shape(markov_sampler_bounds.max_shape()));
-        let mut step_params = Vec::with_capacity(plan.block_size);
-        let mut step_outputs = Vec::with_capacity(plan.block_size);
-        let mut step_distribution_indices = Vec::with_capacity(plan.block_size);
-        for _ in 0..plan.block_size {
-            step_params.push(TopKSamplingRuntimeParams::new(device, markov_sampler_bounds));
-            step_outputs.push(TopKSamplingOutputBuffers::new(device, markov_sampler_bounds));
+    pub fn new(device: &Device, config: DSparkMarkovSamplingConfig) -> Self {
+        config.validate();
+        let max_requests = config.sampling.max_sampling_inputs as usize;
+        let confidence_output = config.confidence.map(|_| {
+            Buffer::new_zeroed_elements(
+                device,
+                config
+                    .block_size
+                    .checked_mul(max_requests)
+                    .expect("DSpark confidence output capacity must fit usize"),
+                Dtype::Float32,
+            )
+        });
+        let top_k_map = DSparkMarkovTopKMapKernel::new(device, map_config(config));
+        let candidate_count = top_k_map.candidate_count(component_shape(config.sampling.max_shape()));
+        let mut step_params = Vec::with_capacity(config.block_size);
+        let mut step_outputs = Vec::with_capacity(config.block_size);
+        let mut step_distribution_indices = Vec::with_capacity(config.block_size);
+        for _ in 0..config.block_size {
+            step_params.push(TopKSamplingRuntimeParams::new(device, config.sampling));
+            step_outputs.push(TopKSamplingOutputBuffers::new(device, config.sampling));
             step_distribution_indices.push(Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32));
         }
-        Ok(Self {
-            block_size: plan.block_size,
+        Self {
+            block_size: config.block_size,
             max_requests,
-            weights,
+            confidence_output,
             top_k_map,
             sample_reduce: TopKMergeKernels::new(device),
             anchor_token_ids: Buffer::new_zeroed_elements(device, max_requests, Dtype::Int32),
@@ -134,7 +169,7 @@ impl DSparkMarkovSampling {
             step_params,
             step_outputs,
             step_distribution_indices,
-        })
+        }
     }
 
     pub fn prepare(
@@ -144,7 +179,7 @@ impl DSparkMarkovSampling {
         anchor_positions: &[u32],
         sampler_configs: &[SamplerConfig],
         distribution_store: &SpecProbsStore,
-    ) -> DSparkMarkovShape {
+    ) -> DSparkMarkovReplayShape {
         assert!(!req_slots.is_empty(), "DSpark Markov sampling requires requests");
         assert_eq!(req_slots.len(), anchor_token_ids.len());
         assert_eq!(req_slots.len(), anchor_positions.len());
@@ -195,26 +230,22 @@ impl DSparkMarkovSampling {
                 None => sampling = Some(step_shape),
             }
         }
-        DSparkMarkovShape {
+        DSparkMarkovReplayShape {
             num_requests: req_slots.len().try_into().expect("DSpark request count must fit u32"),
             sampling: sampling.expect("DSpark Markov requires steps"),
         }
     }
 
-    pub fn record<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        shape: DSparkMarkovShape,
-        base_logits: &'a Buffer,
-        distribution_store: &'a SpecProbsStore,
-    ) where
+    pub fn record<'a, R>(&'a self, recorder: &mut R, input: DSparkMarkovInput<'a>)
+    where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
+        let shape = input.shape;
         assert!(shape.num_requests > 0 && shape.num_requests as usize <= self.max_requests);
         assert_eq!(shape.sampling.num_active_sampling_inputs, shape.num_requests);
         let sampling = component_shape(shape.sampling);
         for step_index in 0..self.block_size {
-            let previous_token_ids = if step_index == 0 {
+            let input_token_ids = if step_index == 0 {
                 &self.anchor_token_ids
             } else {
                 &self.step_outputs[step_index - 1].token_ids
@@ -229,16 +260,28 @@ impl DSparkMarkovSampling {
                             .expect("DSpark Markov base-logit row offset must fit u32"),
                     },
                     DSparkMarkovTopKMapBuffers {
-                        previous_token_ids,
-                        base_logits,
-                        w1_weight: &self.weights.w1_weight,
-                        w1_scales: &self.weights.w1_scales,
-                        w1_biases: &self.weights.w1_biases,
-                        w2_weight: &self.weights.w2_weight,
-                        w2_scales: &self.weights.w2_scales,
-                        w2_biases: &self.weights.w2_biases,
+                        input_token_ids,
+                        base_logits: input.base_logits,
+                        w1_weight: input.weights.w1_weight,
+                        w1_scales: input.weights.w1_scales,
+                        w1_biases: input.weights.w1_biases,
+                        w2_weight: input.weights.w2_weight,
+                        w2_scales: input.weights.w2_scales,
+                        w2_biases: input.weights.w2_biases,
                         tile_token_ids: &self.tile_token_ids,
                         tile_logits: &self.tile_logits,
+                        confidence: match (self.confidence_output.as_ref(), input.confidence) {
+                            (Some(output), Some(confidence)) => {
+                                Some(DSparkConfidenceBuffers {
+                                    hidden: confidence.hidden,
+                                    weight: confidence.weights.weight,
+                                    bias: confidence.weights.bias,
+                                    output,
+                                })
+                            },
+                            (None, None) => None,
+                            _ => panic!("DSpark confidence config and input must match"),
+                        },
                     },
                 ),
             ));
@@ -251,15 +294,16 @@ impl DSparkMarkovSampling {
                             tile_logits: &self.tile_logits,
                             sampled_token_ids: &self.step_outputs[step_index].token_ids,
                             sampled_token_probs: &self.step_outputs[step_index].token_probs,
-                            distribution_token_ids: distribution_store.draft_token_ids(),
-                            distribution_probs: distribution_store.draft_probs(),
+                            distribution_token_ids: input.distribution_store.draft_token_ids(),
+                            distribution_probs: input.distribution_store.draft_probs(),
                             runtime_params: self.step_params[step_index].buffer(),
                             output_distribution_indices: &self.step_distribution_indices[step_index],
-                            max_k: distribution_store
+                            max_k: input
+                                .distribution_store
                                 .max_k()
                                 .try_into()
                                 .expect("DSpark distribution width must fit u32"),
-                            num_output_distributions: distribution_store.num_draft_distributions(),
+                            num_output_distributions: input.distribution_store.num_draft_distributions(),
                         },
                         self.top_k_map.vocab_tile_size(),
                     ),
@@ -267,7 +311,7 @@ impl DSparkMarkovSampling {
         }
     }
 
-    pub fn add_replay_arguments(&self, shape: DSparkMarkovShape, arguments: &mut ReplayArguments) {
+    pub fn add_replay_arguments(&self, shape: DSparkMarkovReplayShape, arguments: &mut ReplayArguments) {
         for params in &self.step_params {
             params.consume(shape.sampling);
         }
@@ -297,6 +341,11 @@ impl DSparkMarkovSampling {
             .collect::<Vec<_>>();
         let mut token_ids = vec![Vec::with_capacity(self.block_size); req_slots.len()];
         let mut token_probs = vec![Vec::with_capacity(self.block_size); req_slots.len()];
+        let step_confidences = self
+            .confidence_output
+            .as_ref()
+            .map(|output| output.read_typed::<f32>(0, self.block_size * req_slots.len()));
+        let mut confidences = vec![Vec::with_capacity(self.block_size); req_slots.len()];
         for step_index in 0..self.block_size {
             for (request_index, &req_slot) in req_slots.iter().enumerate() {
                 let token_id: u32 = step_token_ids[step_index][request_index]
@@ -305,74 +354,50 @@ impl DSparkMarkovSampling {
                 distribution_store.set_expected_draft_token(req_slot, step_index, token_id);
                 token_ids[request_index].push(token_id);
                 token_probs[request_index].push(step_token_probs[step_index][request_index]);
+                confidences[request_index].push(
+                    step_confidences
+                        .as_ref()
+                        .map_or(1.0, |values| values[step_index * req_slots.len() + request_index]),
+                );
             }
         }
-        DSparkProposal { token_ids, token_probs }
+        DSparkProposal {
+            token_ids,
+            token_probs,
+            confidences,
+        }
     }
 }
 
-impl DSparkMarkovWeights {
-    fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        plan: &Qwen3xDSparkPlan,
-        bindings: &Qwen3xDSparkMarkovWeightBindings,
-        w1_config: QuantizedEmbeddingConfig,
-    ) -> Result<Self, ModelExecutorError> {
-        let w1_weight = quant_weight(store, &bindings.w1.weight)?;
-        let w1_scales = typed_tensor(store, &bindings.w1.scales, safetensors::Dtype::BF16)?.into_data();
-        let w1_biases = typed_tensor(store, &bindings.w1.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("DSpark Markov W1 weight", w1_weight.len(), w1_config.weight_bytes())?;
-        let w1_affine_bytes = w1_config
-            .num_affine_params()
-            .checked_mul(Dtype::Bfloat16.item_size())
-            .expect("DSpark Markov W1 affine byte length must fit usize");
-        validate_len("DSpark Markov W1 scales", w1_scales.len(), w1_affine_bytes)?;
-        validate_len("DSpark Markov W1 biases", w1_biases.len(), w1_affine_bytes)?;
-
-        let w2_config = w2_config(plan);
-        let w2_weight = quant_weight(store, &bindings.w2.weight)?;
-        let w2_scales = typed_tensor(store, &bindings.w2.scales, safetensors::Dtype::BF16)?.into_data();
-        let w2_biases = typed_tensor(store, &bindings.w2.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("DSpark Markov W2 weight", w2_weight.len(), w2_config.weight_bytes())?;
-        validate_len(
-            "DSpark Markov W2 scales",
-            w2_scales.len(),
-            w2_config.scale_or_bias_bytes(),
-        )?;
-        validate_len(
-            "DSpark Markov W2 biases",
-            w2_biases.len(),
-            w2_config.scale_or_bias_bytes(),
-        )?;
-        Ok(Self {
-            w1_weight: Buffer::from_slice(device, &w1_weight),
-            w1_scales: Buffer::from_slice(device, &w1_scales),
-            w1_biases: Buffer::from_slice(device, &w1_biases),
-            w2_weight: Buffer::from_slice(device, &w2_weight),
-            w2_scales: Buffer::from_slice(device, &w2_scales),
-            w2_biases: Buffer::from_slice(device, &w2_biases),
-        })
+impl DSparkMarkovSamplingConfig {
+    pub fn validate(self) {
+        assert!(self.block_size > 0, "DSpark Markov sampling requires steps");
+        map_config(self).validate();
+        self.sampling.validate();
+        assert_eq!(
+            self.vocab_size, self.sampling.vocab_size,
+            "DSpark Markov map and sampling vocabularies must match"
+        );
     }
 }
 
-fn w2_config(plan: &Qwen3xDSparkPlan) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig::same_dtype(
-        plan.markov_w2
-            .output_dim
-            .try_into()
-            .expect("DSpark vocabulary must fit i32"),
-        plan.markov_w2
-            .input_dim
-            .try_into()
-            .expect("DSpark Markov rank must fit i32"),
-        plan.markov_w2
-            .group_size
-            .try_into()
-            .expect("DSpark Markov group size must fit i32"),
-        plan.markov_w2.bits.try_into().expect("DSpark Markov bits must fit i32"),
-        Dtype::Bfloat16,
-    )
+fn map_config(config: DSparkMarkovSamplingConfig) -> DSparkMarkovTopKMapConfig {
+    DSparkMarkovTopKMapConfig {
+        vocab_size: config.vocab_size,
+        rank: config.rank,
+        w1_group_size: config.w1_group_size,
+        w1_bits: config.w1_bits,
+        w2_group_size: config.w2_group_size,
+        w2_bits: config.w2_bits,
+        io_dtype: config.io_dtype,
+        scale_bias_dtype: config.scale_bias_dtype,
+        confidence: config.confidence.map(|confidence| {
+            DSparkBackendConfidenceConfig {
+                hidden_dim: confidence.hidden_dim,
+                with_markov: confidence.with_markov,
+            }
+        }),
+    }
 }
 
 fn replay_bucket_capacity(num_active: u32, max_capacity: u32) -> u32 {
@@ -388,10 +413,6 @@ fn component_shape(shape: TopKSamplingShape) -> TopKSampleShape {
         vocab_size: shape.vocab_size,
         top_k: shape.top_k,
     }
-}
-
-fn to_u32(name: &str, value: usize) -> u32 {
-    value.try_into().unwrap_or_else(|_| panic!("{name} must fit u32"))
 }
 
 #[cfg(test)]

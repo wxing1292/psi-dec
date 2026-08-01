@@ -188,7 +188,10 @@ cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
 
 The output directory must not exist before you run the converter.
 The converter writes `model.safetensors` and `model.safetensors.index.json`.
-It omits confidence-head weights because the first milestone uses fixed-length proposals.
+It preserves the confidence projection and bias as BF16.
+The input must be the official BF16 DSpark checkpoint.
+An affine checkpoint that was generated before confidence support does not contain these tensors.
+Regenerate that checkpoint into a new output directory.
 
 Qwen3 Main-only startup:
 

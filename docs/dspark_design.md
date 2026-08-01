@@ -27,8 +27,8 @@ It supports an ungated GQA backbone and a `vanilla` Markov head.
 The first milestone has these limits:
 
 - It produces exactly `block_size` proposals for each active decode request.
-- It recognizes confidence-head fields and weights.
-- It does not materialize or execute the confidence head.
+- It executes the optional official confidence head.
+- It returns one confidence value for each proposal token.
 - It does not schedule variable proposal lengths.
 - It does not support a gated DSpark GQA checkpoint.
 - It permits one in-flight batch for each executor.
@@ -42,15 +42,16 @@ It does not own a DSpark implementation.
 crates/inference-executor-core/src/
   attn/gqa/
     dspark_core.rs               block geometry and metadata
+  sampling/
+    dspark.rs                    CPU Markov, sampling, and confidence reference
   model/qwen/v3_x/dspark/
     config.rs                    official configuration contract
-    reference.rs                 CPU Markov and sampling reference
     weight_layout.rs             exact source and affine binding trees
   bin/
     qwen3_dspark_quantize.rs     official BF16 -> affine converter
 
 crates/inference-backend-metal/src/components/
-  dspark_markov_sampling.rs      fused Markov and tile-Top-K map component
+  sampling/dspark_markov.rs      fused Markov, confidence, and tile-Top-K map component
   gqa_block_attention.rs         dense block-SDPA component
   metal/dspark_markov_sampling.metal
   metal/gqa_block_sdpa.metal     dense bidirectional block kernel
@@ -58,22 +59,25 @@ crates/inference-backend-metal/src/components/
 crates/inference-executor-metal/src/
   attn/dspark/
     backend.rs                   ungated DSpark GQA replay graph
+    capacity.rs                  Metal partial-output resource capacity
     context.rs                   persistent Main-context append
     metadata.rs                  history and block attention metadata
     scratch.rs                   fixed-capacity proposal scratch
     state.rs                     page-table and metadata lifecycle
-  model/qwen/v3_x/dspark/
-    attention.rs                 DSpark attention composition
-    embed.rs                     DSpark token embedding replay
-    layer.rs                     independent Qwen3xDSparkLayer
-    model.rs                     context and body replay owners
-    output.rs                    gather, unembed, and Markov sampling
-    plan.rs                      configuration-to-backend conversion
-    main_feature.rs              selected Main residual projection
-  model/qwen/v3/executor/
-    dspark.rs                    Qwen3 proposal orchestration
+  model/
+    main_residual_capture.rs     shared Main residual-capture contract
+    qwen/v3_x/dspark/
+      attention.rs               DSpark attention composition
+      embed.rs                   DSpark token embedding replay
+      layer.rs                   independent Qwen3xDSparkLayer
+      model.rs                   context and body replay owners
+      output.rs                  gather, unembed, and Markov sampling
+      main_feature.rs            selected Main residual projection
+      sampling.rs                Qwen3x Markov checkpoint weights and generic backend adapter
+    qwen/v3/executor/
+      dspark.rs                  Qwen3 proposal orchestration
   sampling/
-    dspark_markov.rs             sequential Markov correction and sampling
+    dspark_markov.rs             sequential Markov, confidence, and sampling composition
     rejection_replay.rs          shared sparse rejection replay and microbatch contract
 ```
 
@@ -109,25 +113,76 @@ The executor discards these values after proposal generation.
 The next Main batch verifies the proposed token sequence.
 
 The Markov head corrects proposal logits in position order.
-Position `i` depends on the token sampled at position `i - 1`.
+At index `0`, it uses the Main `sampled_token`, which is the anchor token.
+At an index greater than `0`, it uses `spec_tokens[i - 1]`.
 `DSparkMarkovSampling` owns this sequential correction and sampling loop.
+It owns the generic Metal operators, runtime parameters, scratch, and output buffers.
+It receives borrowed Markov and confidence weights for each replay recording.
+`Qwen3xDSparkMarkov` owns the Qwen checkpoint buffers and supplies those borrowed weights.
 It stores one sparse draft distribution for each proposed token.
+
+```text
+Qwen3xDSparkConfig + exact Qwen3x checkpoint bindings
+  -> Qwen3xDSparkMarkov
+       owns Qwen3xDSparkMarkovWeights
+       owns optional Qwen3xDSparkConfidenceWeights
+       owns DSparkMarkovSampling
+            |
+            | record(DSparkMarkovInput + borrowed weights)
+            v
+       DSparkMarkovTopKMapKernel -> TopKMergeKernels
+```
+
+This owner pattern matches Qwen3x GQA, GDN, and MLP.
+The Qwen wrapper owns checkpoint materialization.
+The generic executor owner owns backend execution resources.
+Each DSpark semantic owner loads one bounded `TensorMap` for its exact binding subtree.
+It removes every tensor before it creates Metal buffers, performs any required fusion, and requires the map to be empty.
 
 Each position records this pair:
 
 ```text
-DSparkMarkovTopKMap
-  previous token
-  -> quantized W1 row
-  -> quantized W2
-  -> add base logits
-  -> tile-local Top-K
+input_token_ids[i]
+  i = 0: sampled_token / anchor_token
+  i > 0: spec_tokens[i - 1]
+         |
+         v
+quantized Markov W1 embedding
+         |
+         +-----------------------------------------+
+         |                                         |
+         v                                         v
+quantized Markov W2                     [hidden[i], Markov W1 embedding]
+         |                                         |
+         v                                         v
+base_logits[i] + correction             confidence projection + sigmoid
+         |                                         |
+         v                                         v
+tile-local Top-K                         spec_confidence[i]
+         |
+         v
 
-generic TopKSampleAndWriteDistribution
+TopKSampleAndWriteDistribution
   -> global Top-K and top-p
-  -> sample
+  -> spec_token[i]
+  -> spec_prob[i]
   -> sparse draft distribution
 ```
+
+For the official `confidence_head_with_markov = true` checkpoint:
+
+```text
+confidence_input[i] = concat(hidden[i], MarkovW1(input_token_ids[i]))
+confidence_raw[i] = confidence_bias + dot(confidence_weight, confidence_input[i])
+spec_confidence[i] = sigmoid(confidence_raw[i])
+```
+
+The current executor uses the official default sigmoid temperature of `1.0`.
+`DSparkMarkovTopKMapConfig` states the BF16 I/O and scale/bias workload facts.
+The confidence weight, bias, hidden state, and Markov latent use BF16 storage.
+The dot product and sigmoid use F32.
+`DSparkMarkovTopKMap` computes the confidence branch from the existing W1 latent.
+It does not add a replay command or a wide temporary feature buffer.
 
 The implementation records all pairs before one Spec submission.
 The sampled token creates a GPU dependency between adjacent pairs.
@@ -157,8 +212,8 @@ The tile decision therefore also uses the source-level live-value count and a re
 
 ## Main context
 
-`Qwen3Main` exposes the narrow `Qwen3MainResidualCapture` contract.
-It does not depend on a DSpark model or a Metal recorder.
+`Qwen3Main` and `Qwen35Main` accept the shared `MainResidualCapture` contract.
+The contract does not depend on a DSpark model or a Metal recorder.
 
 `Qwen3xDSparkMainFeatureProjector` selects the configured Main residual outputs.
 It projects those outputs into one Main feature for each Main token.
@@ -175,11 +230,27 @@ MainEmbed
 Persistent DSpark context follows accepted Main history.
 Proposal-local K/V never enters this context.
 
+The reusable Qwen3x DSpark model, checkpoint-weight owners, and Main capture contract do not depend on the Qwen3
+executor.
+The Qwen3.5 executor can compose the same owners when it adds a DSpark lifecycle.
+The current Qwen3.5 executor does not wire that lifecycle.
+
 ## Attention composition
 
 The official Qwen3 checkpoint uses ungated GQA.
 `UngatedDSparkGQA` owns a model-neutral QKV attention graph.
 It does not add a mode to `UngatedGQA`.
+
+Each `Qwen3xDSparkLayer` resolves its exact Q/K/V/output affine layout from its weight bindings.
+It owns one `UngatedDSparkGQA` and one `UngatedDSparkGQAContextAppender`.
+Different layers can use different affine layouts.
+The Q/K/V/output tensors within one layer must use one layout because the current fused QKV ABI uses one
+`GQAMetalConfig`.
+
+`UngatedDSparkGQAState` owns only shared execution state.
+It owns the page table, metadata, shared block/context scratch, and backend-selected single-query history compute contract.
+The shared scratch contract requires equal attention geometry and I/O dtype across layers.
+It does not require equal quantization layout across layers.
 
 One DSpark attention call records this composition:
 
@@ -200,6 +271,11 @@ The existing `GQASDPAReduceKernel` combines both sets.
 The history metadata supplies a half-open visible range.
 For an anchor at position `p`, that range is `[0, p)`.
 The block kernel supplies the complete local block.
+
+`UngatedDSparkGQAState::prepare_block` gives fixed workload facts to `GQACompute`.
+The backend selects the constrained single-query-token partial ABI once.
+`DSparkGQAMetadataBuffers` stores that exact `GQAComputePath` with the replay shape.
+Recording uses the stored path and does not run a second selector.
 
 One block-bidirectional map Task owns one Q token and one Q head.
 The backend fixes this Task to one 32-thread SIMDgroup.
@@ -232,6 +308,12 @@ The executor updates separate Main and DSpark page tables.
 The runtime core allocates and releases both spans as one cache block.
 The runtime core does not parse the model-specific split.
 
+Main and DSpark use the same request-slot lifecycle.
+`Qwen3Executor::reset_req_slots` sends each runtime reset notification to both GQA state owners.
+Both owners call `GQARequestPageTable::reset_req_slots` for the released request slots.
+The reset clears executor page-table bindings.
+It does not clear physical pages that the runtime core owns and releases.
+
 The service derives:
 
 ```text
@@ -253,6 +335,12 @@ Define:
 T_capacity = max_requests * block_size
 P_capacity = next_power_of_two(2 * T_capacity)
 ```
+
+`DSparkBlockCapacity` is backend-neutral.
+It contains `max_requests`, `block_size`, and `max_tokens`.
+`DSparkGQACapacity` is Metal-specific.
+It derives `P_capacity` for metadata and partial scratch.
+The runtime core and executor core do not contain Metal `TaskTemplate` capacity.
 
 Each local query needs at least one history partial and one block partial.
 The metadata builder can divide long history across available history tasks.
@@ -344,7 +432,7 @@ cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
 The output directory must not exist.
 The converter writes `model.safetensors` and `model.safetensors.index.json`.
 It preserves DSpark-owned embedding and unembedding when the source provides them.
-It omits confidence weights and reports that limit.
+It also preserves the confidence projection and bias as BF16.
 
 ## Verification
 
@@ -353,6 +441,8 @@ Unit and Metal parity tests cover:
 - Official `target_layer_ids` validation
 - Exact source and affine bindings
 - Converter round-trip and safetensors index generation
+- Indexed confidence input-token semantics and CPU/Metal parity
+- Equal `spec_tokens`, `spec_probs`, and `spec_confidences` lengths
 - Anchor plus `N - 1` MASK construction
 - Flat Main and DSpark page splitting
 - Bidirectional block attention

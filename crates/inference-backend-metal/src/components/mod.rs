@@ -186,6 +186,8 @@ pub use rms_norm::RMSNormKernel;
 pub use rms_norm::RMSNormShape;
 
 mod sampling;
+pub use sampling::DSparkConfidenceBuffers;
+pub use sampling::DSparkConfidenceConfig;
 pub use sampling::DSparkMarkovTopKMapBuffers;
 pub use sampling::DSparkMarkovTopKMapConfig;
 pub use sampling::DSparkMarkovTopKMapKernel;

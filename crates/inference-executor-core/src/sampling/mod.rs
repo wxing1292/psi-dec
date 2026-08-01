@@ -5,6 +5,8 @@ pub use config::SamplerConfig;
 mod domain;
 pub use domain::SamplingDomain;
 
+pub mod dspark;
+
 mod request_state;
 pub use request_state::RequestSamplingState;
 

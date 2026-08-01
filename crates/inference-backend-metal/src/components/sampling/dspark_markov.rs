@@ -5,6 +5,7 @@ use super::top_k::TopKSampleShape;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
+use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayArguments;
@@ -30,6 +31,15 @@ pub struct DSparkMarkovTopKMapConfig {
     pub w1_bits: u32,
     pub w2_group_size: u32,
     pub w2_bits: u32,
+    pub io_dtype: Dtype,
+    pub scale_bias_dtype: Dtype,
+    pub confidence: Option<DSparkConfidenceConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DSparkConfidenceConfig {
+    pub hidden_dim: u32,
+    pub with_markov: bool,
 }
 
 impl DSparkMarkovTopKMapConfig {
@@ -38,12 +48,17 @@ impl DSparkMarkovTopKMapConfig {
         assert!(self.rank > 0);
         validate_affine_layout(self.rank, self.w1_group_size, self.w1_bits);
         validate_affine_layout(self.rank, self.w2_group_size, self.w2_bits);
+        validate_boundary_dtype("I/O", self.io_dtype);
+        validate_boundary_dtype("scale/bias", self.scale_bias_dtype);
+        if let Some(confidence) = self.confidence {
+            confidence.validate(self.rank);
+        }
         let _ = self.threadblock_memory_bytes();
     }
 
     fn threadblock_memory_bytes(self) -> usize {
         (self.rank as usize)
-            .checked_mul(size_of::<u16>())
+            .checked_mul(self.io_dtype.item_size())
             .and_then(|bytes| {
                 bytes.checked_add(DSPARK_MARKOV_VOCAB_TILE_SIZE as usize * (size_of::<f32>() + size_of::<i32>()))
             })
@@ -61,8 +76,25 @@ impl DSparkMarkovTopKMapConfig {
     fn affine_param_bytes(self, group_size: u32) -> usize {
         (self.vocab_size as usize)
             .checked_mul((self.rank / group_size) as usize)
-            .and_then(|values| values.checked_mul(size_of::<u16>()))
+            .and_then(|values| values.checked_mul(self.scale_bias_dtype.item_size()))
             .expect("DSpark Markov affine parameter byte length must fit usize")
+    }
+}
+
+impl DSparkConfidenceConfig {
+    pub fn validate(self, rank: u32) {
+        assert!(self.hidden_dim > 0);
+        let _ = self.input_dim(rank);
+    }
+
+    fn input_dim(self, rank: u32) -> u32 {
+        if self.with_markov {
+            self.hidden_dim
+                .checked_add(rank)
+                .expect("DSpark confidence input dimension must fit u32")
+        } else {
+            self.hidden_dim
+        }
     }
 }
 
@@ -89,7 +121,7 @@ impl DSparkMarkovTopKMapShape {
 
 #[derive(Clone, Copy)]
 pub struct DSparkMarkovTopKMapBuffers<'a> {
-    pub previous_token_ids: &'a Buffer,
+    pub input_token_ids: &'a Buffer,
     pub base_logits: &'a Buffer,
     pub w1_weight: &'a Buffer,
     pub w1_scales: &'a Buffer,
@@ -99,6 +131,15 @@ pub struct DSparkMarkovTopKMapBuffers<'a> {
     pub w2_biases: &'a Buffer,
     pub tile_token_ids: &'a Buffer,
     pub tile_logits: &'a Buffer,
+    pub confidence: Option<DSparkConfidenceBuffers<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct DSparkConfidenceBuffers<'a> {
+    pub hidden: &'a Buffer,
+    pub weight: &'a Buffer,
+    pub bias: &'a Buffer,
+    pub output: &'a Buffer,
 }
 
 pub struct DSparkMarkovTopKMapKernel {
@@ -223,7 +264,7 @@ impl Operator for DSparkMarkovTopKMapInvocation<'_> {
             .expect("DSpark Markov total thread count must fit u32");
 
         builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.previous_token_ids, 0);
+        builder.set_buffer_read(0, self.buffers.input_token_ids, 0);
         builder.set_buffer_read(1, self.buffers.base_logits, 0);
         builder.set_buffer_read(2, self.buffers.w1_weight, 0);
         builder.set_buffer_read(3, self.buffers.w1_scales, 0);
@@ -246,6 +287,16 @@ impl Operator for DSparkMarkovTopKMapInvocation<'_> {
         builder.set_u32(11, sampling.top_k);
         builder.set_u32(12, num_tiles);
         builder.set_u32(13, self.shape.base_logits_row_offset);
+        match (self.kernel.config.confidence, self.buffers.confidence) {
+            (Some(_), Some(confidence)) => {
+                builder.set_buffer_read(14, confidence.hidden, 0);
+                builder.set_buffer_read(15, confidence.weight, 0);
+                builder.set_buffer_read(16, confidence.bias, 0);
+                builder.set_buffer_write(17, confidence.output, 0);
+            },
+            (None, None) => {},
+            _ => panic!("DSpark Markov confidence config and buffers must match"),
+        }
         builder.dispatch_1d(
             num_total_threads as usize,
             DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK as usize,
@@ -266,11 +317,10 @@ impl DSparkMarkovTopKMapInvocation<'_> {
             .expect("DSpark Markov base-logit row count must fit u32");
         let base_logits_bytes = (base_rows as usize)
             .checked_mul(config.vocab_size as usize)
-            .and_then(|values| values.checked_mul(size_of::<u16>()))
+            .and_then(|values| values.checked_mul(config.io_dtype.item_size()))
             .expect("DSpark Markov base-logit byte length must fit usize");
         assert!(
-            self.buffers.previous_token_ids.len_bytes()
-                >= sampling.num_total_sampling_inputs as usize * size_of::<i32>()
+            self.buffers.input_token_ids.len_bytes() >= sampling.num_total_sampling_inputs as usize * size_of::<i32>()
         );
         assert!(self.buffers.base_logits.len_bytes() >= base_logits_bytes);
         assert_eq!(self.buffers.w1_weight.len_bytes(), config.weight_bytes(config.w1_bits));
@@ -303,6 +353,26 @@ impl DSparkMarkovTopKMapInvocation<'_> {
                     .checked_mul(size_of::<f32>())
                     .expect("DSpark Markov tile-logit byte length must fit usize")
         );
+        match (config.confidence, self.buffers.confidence) {
+            (Some(confidence), Some(buffers)) => {
+                let hidden_bytes = (base_rows as usize)
+                    .checked_mul(confidence.hidden_dim as usize)
+                    .and_then(|values| values.checked_mul(config.io_dtype.item_size()))
+                    .expect("DSpark confidence hidden byte length must fit usize");
+                let output_bytes = (base_rows as usize)
+                    .checked_mul(size_of::<f32>())
+                    .expect("DSpark confidence output byte length must fit usize");
+                assert!(buffers.hidden.len_bytes() >= hidden_bytes);
+                assert_eq!(
+                    buffers.weight.len_bytes(),
+                    confidence.input_dim(config.rank) as usize * config.io_dtype.item_size()
+                );
+                assert_eq!(buffers.bias.len_bytes(), config.io_dtype.item_size());
+                assert!(buffers.output.len_bytes() >= output_bytes);
+            },
+            (None, None) => {},
+            _ => panic!("DSpark Markov confidence config and buffers must match"),
+        }
     }
 }
 
@@ -318,17 +388,30 @@ fn validate_affine_layout(rank: u32, group_size: u32, bits: u32) {
     );
 }
 
+fn validate_boundary_dtype(name: &str, dtype: Dtype) {
+    match dtype {
+        Dtype::Bfloat16 => {},
+        Dtype::Float32 => todo!("F32 DSpark Markov {name} is not supported"),
+        dtype => panic!("unsupported DSpark Markov {name} dtype {dtype:?}"),
+    }
+}
+
 fn source(config: DSparkMarkovTopKMapConfig) -> String {
     let values_per_simd_lane = config.rank.div_ceil(DSPARK_MARKOV_SIMD_WIDTH);
     let w2_lane_group_aligned = config.rank.is_multiple_of(DSPARK_MARKOV_SIMD_WIDTH)
         && config.w2_group_size.is_multiple_of(values_per_simd_lane);
+    let (confidence_enabled, confidence_hidden_dim, confidence_with_markov) =
+        config.confidence.map_or((0, 0, 0), |confidence| {
+            (1, confidence.hidden_dim, u8::from(confidence.with_markov))
+        });
     format!(
         "#define DSPARK_MARKOV_THREADBLOCK_SIZE {}u\n#define DSPARK_MARKOV_SIMD_WIDTH {}u\n#define \
          DSPARK_MARKOV_RESULTS_PER_SIMDGROUP {}u\n#define DSPARK_MARKOV_VOCAB_SIZE {}u\n#define DSPARK_MARKOV_RANK \
          {}u\n#define DSPARK_MARKOV_W1_GROUP_SIZE {}u\n#define DSPARK_MARKOV_W1_BITS {}u\n#define \
          DSPARK_MARKOV_W2_GROUP_SIZE {}u\n#define DSPARK_MARKOV_W2_BITS {}u\n#define \
-         DSPARK_MARKOV_W2_LANE_GROUP_ALIGNED {}\n#define DSPARK_MARKOV_VOCAB_TILE_SIZE \
-         {}u\n{DSPARK_MARKOV_SAMPLING_SOURCE}",
+         DSPARK_MARKOV_W2_LANE_GROUP_ALIGNED {}\n#define DSPARK_MARKOV_VOCAB_TILE_SIZE {}u\n#define \
+         DSPARK_CONFIDENCE_ENABLED {}\n#define DSPARK_CONFIDENCE_HIDDEN_DIM {}u\n#define \
+         DSPARK_CONFIDENCE_WITH_MARKOV {}\n{DSPARK_MARKOV_SAMPLING_SOURCE}",
         DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK,
         DSPARK_MARKOV_SIMD_WIDTH,
         DSPARK_MARKOV_RESULTS_PER_SIMDGROUP,
@@ -340,5 +423,42 @@ fn source(config: DSparkMarkovTopKMapConfig) -> String {
         config.w2_bits,
         u8::from(w2_lane_group_aligned),
         DSPARK_MARKOV_VOCAB_TILE_SIZE,
+        confidence_enabled,
+        confidence_hidden_dim,
+        confidence_with_markov,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> DSparkMarkovTopKMapConfig {
+        DSparkMarkovTopKMapConfig {
+            vocab_size: 64,
+            rank: 64,
+            w1_group_size: 64,
+            w1_bits: 4,
+            w2_group_size: 64,
+            w2_bits: 4,
+            io_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn test_bf16_workload_contract_is_supported() {
+        config().validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "F32 DSpark Markov I/O is not supported")]
+    fn test_f32_workload_contract_is_explicit_future_work() {
+        DSparkMarkovTopKMapConfig {
+            io_dtype: Dtype::Float32,
+            ..config()
+        }
+        .validate();
+    }
 }

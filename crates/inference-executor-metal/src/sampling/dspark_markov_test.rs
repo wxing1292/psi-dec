@@ -1,23 +1,28 @@
 use half::bf16;
 use inference_backend_metal::MetalRuntime;
+use inference_backend_metal::components::DSparkConfidenceConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
-use inference_backend_metal::components::TopKMergeKernels;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
-use inference_executor_core::model::qwen::v3_x::dspark::reference::DSparkMarkovReferenceConfig;
-use inference_executor_core::model::qwen::v3_x::dspark::reference::DSparkMarkovReferenceWeights;
-use inference_executor_core::model::qwen::v3_x::dspark::reference::dspark_markov_reference;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::TopKSamplingBounds;
+use inference_executor_core::sampling::dspark::DSparkConfidenceReferenceConfig;
+use inference_executor_core::sampling::dspark::DSparkConfidenceReferenceWeights;
+use inference_executor_core::sampling::dspark::DSparkMarkovReferenceConfig;
+use inference_executor_core::sampling::dspark::DSparkMarkovReferenceWeights;
+use inference_executor_core::sampling::dspark::dspark_confidence_reference;
+use inference_executor_core::sampling::dspark::dspark_markov_reference;
 
+use super::DSparkConfidenceInput;
+use super::DSparkConfidenceWeights;
+use super::DSparkMarkovConfidenceConfig;
+use super::DSparkMarkovInput;
 use super::DSparkMarkovSampling;
+use super::DSparkMarkovSamplingConfig;
 use super::DSparkMarkovWeights;
 use super::SpecProbsStore;
-use super::TopKSamplingOutputBuffers;
-use super::TopKSamplingRuntimeParams;
-use super::component_shape;
 use super::replay_bucket_capacity;
 use crate::def::replay_op::MetalReplayRuntime;
 
@@ -28,12 +33,45 @@ fn test_sampling_bucket_caps_at_non_power_of_two_request_capacity() {
 }
 
 #[test]
+fn test_markov_map_compiles_supported_confidence_contracts() {
+    let runtime = MetalRuntime::system_default();
+    let device = runtime.device();
+    for confidence in [
+        None,
+        Some(DSparkConfidenceConfig {
+            hidden_dim: 32,
+            with_markov: false,
+        }),
+        Some(DSparkConfidenceConfig {
+            hidden_dim: 32,
+            with_markov: true,
+        }),
+    ] {
+        let _ = DSparkMarkovTopKMapKernel::new(
+            device,
+            DSparkMarkovTopKMapConfig {
+                vocab_size: 64,
+                rank: 64,
+                w1_group_size: 64,
+                w1_bits: 8,
+                w2_group_size: 64,
+                w2_bits: 8,
+                io_dtype: Dtype::Bfloat16,
+                scale_bias_dtype: Dtype::Bfloat16,
+                confidence,
+            },
+        );
+    }
+}
+
+#[test]
 fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
     const BLOCK_SIZE: usize = 3;
     const MAX_REQUESTS: usize = 6;
     const NUM_REQUESTS: usize = 3;
     const VOCAB_SIZE: usize = 64;
     const RANK: usize = 64;
+    const HIDDEN_DIM: usize = 32;
     const REQ_SLOTS: [u32; NUM_REQUESTS] = [0, 2, 5];
     const ANCHOR_TOKEN_IDS: [u32; NUM_REQUESTS] = [1, 21, 45];
     const ANCHOR_POSITIONS: [u32; NUM_REQUESTS] = [10, 20, 30];
@@ -52,6 +90,12 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         w1_bits: 8,
         w2_group_size: RANK as u32,
         w2_bits: 8,
+        io_dtype: Dtype::Bfloat16,
+        scale_bias_dtype: Dtype::Bfloat16,
+        confidence: Some(DSparkConfidenceConfig {
+            hidden_dim: HIDDEN_DIM as u32,
+            with_markov: true,
+        }),
     };
 
     let mut w1_weight = vec![0u8; VOCAB_SIZE * RANK];
@@ -93,35 +137,84 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         &base_logits_values,
         4,
     );
+    let hidden_values = (0..BLOCK_SIZE * NUM_REQUESTS * HIDDEN_DIM)
+        .map(|index| (index % HIDDEN_DIM) as f32 * 0.001)
+        .collect::<Vec<_>>();
+    let confidence_weight = (0..HIDDEN_DIM + RANK)
+        .map(|index| (index as f32 - 16.0) * 0.002)
+        .collect::<Vec<_>>();
+    let confidence_bias = -0.25;
+    let reference_confidences = dspark_confidence_reference(
+        DSparkMarkovReferenceConfig {
+            block_size: BLOCK_SIZE,
+            vocab_size: VOCAB_SIZE,
+            rank: RANK,
+            w1_group_size: RANK,
+            w1_bits: 8,
+            w2_group_size: RANK,
+            w2_bits: 8,
+        },
+        DSparkMarkovReferenceWeights {
+            w1_weight: &w1_weight,
+            w1_scales: &vec![1.0; VOCAB_SIZE],
+            w1_biases: &vec![0.0; VOCAB_SIZE],
+            w2_weight: &w2_weight,
+            w2_scales: &vec![1.0; VOCAB_SIZE],
+            w2_biases: &vec![0.0; VOCAB_SIZE],
+        },
+        DSparkConfidenceReferenceConfig {
+            hidden_dim: HIDDEN_DIM,
+            with_markov: true,
+        },
+        DSparkConfidenceReferenceWeights {
+            weight: &confidence_weight,
+            bias: confidence_bias,
+        },
+        &ANCHOR_TOKEN_IDS,
+        &reference,
+        &hidden_values,
+    );
+    let markov = DSparkMarkovSampling::new(
+        device,
+        DSparkMarkovSamplingConfig {
+            block_size: BLOCK_SIZE,
+            vocab_size: VOCAB_SIZE as u32,
+            rank: RANK as u32,
+            w1_group_size: RANK as u32,
+            w1_bits: 8,
+            w2_group_size: RANK as u32,
+            w2_bits: 8,
+            io_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+            confidence: Some(DSparkMarkovConfidenceConfig {
+                hidden_dim: HIDDEN_DIM as u32,
+                with_markov: true,
+            }),
+            sampling: bounds,
+        },
+    );
+    let w1_weight_buffer = Buffer::from_slice(device, &w1_weight);
+    let w1_scales = Buffer::from_slice(device, &unit_affine);
+    let w1_biases = Buffer::from_slice(device, &zero_affine);
+    let w2_weight_buffer = Buffer::from_slice(device, &w2_weight);
+    let w2_scales = Buffer::from_slice(device, &unit_affine);
+    let w2_biases = Buffer::from_slice(device, &zero_affine);
     let weights = DSparkMarkovWeights {
-        w1_weight: Buffer::from_slice(device, &w1_weight),
-        w1_scales: Buffer::from_slice(device, &unit_affine),
-        w1_biases: Buffer::from_slice(device, &zero_affine),
-        w2_weight: Buffer::from_slice(device, &w2_weight),
-        w2_scales: Buffer::from_slice(device, &unit_affine),
-        w2_biases: Buffer::from_slice(device, &zero_affine),
+        w1_weight: &w1_weight_buffer,
+        w1_scales: &w1_scales,
+        w1_biases: &w1_biases,
+        w2_weight: &w2_weight_buffer,
+        w2_scales: &w2_scales,
+        w2_biases: &w2_biases,
     };
-    let top_k_map = DSparkMarkovTopKMapKernel::new(device, map_config);
-    let candidate_count = top_k_map.candidate_count(component_shape(bounds.max_shape()));
-    let markov = DSparkMarkovSampling {
-        block_size: BLOCK_SIZE,
-        max_requests: MAX_REQUESTS,
-        weights,
-        top_k_map,
-        sample_reduce: TopKMergeKernels::new(device),
-        anchor_token_ids: Buffer::new_zeroed_elements(device, MAX_REQUESTS, Dtype::Int32),
-        tile_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
-        tile_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
-        step_params: (0..BLOCK_SIZE)
-            .map(|_| TopKSamplingRuntimeParams::new(device, bounds))
-            .collect(),
-        step_outputs: (0..BLOCK_SIZE)
-            .map(|_| TopKSamplingOutputBuffers::new(device, bounds))
-            .collect(),
-        step_distribution_indices: (0..BLOCK_SIZE)
-            .map(|_| Buffer::new_zeroed_elements(device, MAX_REQUESTS, Dtype::Uint32))
-            .collect(),
-    };
+    let confidence_weight_buffer = Buffer::from_slice(
+        device,
+        &confidence_weight
+            .iter()
+            .map(|&value| bf16::from_f32(value).to_bits())
+            .collect::<Vec<_>>(),
+    );
+    let confidence_bias_buffer = Buffer::from_slice(device, &[bf16::from_f32(confidence_bias).to_bits()]);
     let mut distribution_store = SpecProbsStore::new(device, BLOCK_SIZE, MAX_REQUESTS, 4);
     let shape = markov.prepare(
         &REQ_SLOTS,
@@ -137,9 +230,29 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         *output = bf16::from_f32(value).to_bits();
     }
     let base_logits = Buffer::from_slice(device, &base_logits_storage);
+    let mut hidden_storage = vec![bf16::ZERO.to_bits(); BLOCK_SIZE * MAX_REQUESTS * HIDDEN_DIM];
+    for (output, &value) in hidden_storage.iter_mut().zip(&hidden_values) {
+        *output = bf16::from_f32(value).to_bits();
+    }
+    let hidden = Buffer::from_slice(device, &hidden_storage);
     let replay_runtime = MetalReplayRuntime::new(runtime.stream());
     let mut recorder = replay_runtime.create_recorder();
-    markov.record(&mut recorder, shape, &base_logits, &distribution_store);
+    markov.record(
+        &mut recorder,
+        DSparkMarkovInput {
+            shape,
+            base_logits: &base_logits,
+            distribution_store: &distribution_store,
+            weights,
+            confidence: Some(DSparkConfidenceInput {
+                hidden: &hidden,
+                weights: DSparkConfidenceWeights {
+                    weight: &confidence_weight_buffer,
+                    bias: &confidence_bias_buffer,
+                },
+            }),
+        },
+    );
     let replay = recorder.build();
     let mut arguments = ReplayArguments::new();
     markov.add_replay_arguments(shape, &mut arguments);
@@ -158,6 +271,7 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         .collect::<Vec<_>>();
     assert_eq!(proposal.token_ids, expected_token_ids);
     assert_close_nested(&proposal.token_probs, &expected_token_probs, 1.0e-5);
+    assert_close_nested(&proposal.confidences, &reference_confidences, 1.0e-5);
 
     let distribution_slots = BLOCK_SIZE * MAX_REQUESTS * 4;
     let draft_token_ids = distribution_store

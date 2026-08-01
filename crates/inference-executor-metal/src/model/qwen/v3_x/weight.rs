@@ -5,10 +5,13 @@ use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::checkpoint::remove_tensor;
 use inference_executor_core::def::ModelExecutorError;
+use inference_executor_core::model::qwen::v3_x::QuantizationConfig;
+use inference_executor_core::model::qwen::v3_x::ResolvedQuantizationConfig;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::checkpoint::TensorBytes;
 use crate::mlp::moe::backend::GatedMoEMetalConfig;
+
 pub fn typed_tensor(
     store: &mut SafeTensorStore,
     name: &str,
@@ -62,6 +65,28 @@ pub fn concat_bytes(parts: &[&[u8]]) -> Vec<u8> {
         out.extend_from_slice(part);
     }
     out
+}
+
+pub fn resolve_uniform_quantization(
+    config: &QuantizationConfig,
+    tensor_names: &[&str],
+    component: &str,
+) -> Result<ResolvedQuantizationConfig, ModelExecutorError> {
+    let first_name = tensor_names
+        .first()
+        .expect("uniform quantization requires tensor names");
+    let first = config.resolve_for_tensor(first_name);
+    if let Some((tensor_name, resolved)) = tensor_names.iter().skip(1).find_map(|&tensor_name| {
+        let resolved = config.resolve_for_tensor(tensor_name);
+        (resolved != first).then_some((tensor_name, resolved))
+    }) {
+        return Err(ModelExecutorError::custom(format!(
+            "{component} requires one affine layout, but {first_name:?} uses group_size={} bits={} mode={:?} and \
+             {tensor_name:?} uses group_size={} bits={} mode={:?}",
+            first.group_size, first.bits, first.mode, resolved.group_size, resolved.bits, resolved.mode,
+        )));
+    }
+    Ok(first)
 }
 
 pub fn affine_config(

@@ -28,36 +28,36 @@ pub struct DSparkBlockCapacity {
     pub max_requests: usize,
     pub block_size: usize,
     pub max_tokens: usize,
-    pub max_sdpa_map_task_templates: usize,
 }
 
 impl DSparkBlockCapacity {
     pub fn new(max_requests: usize, block_size: usize) -> Self {
-        assert!(max_requests > 0, "DSpark block capacity requires requests");
-        assert!(block_size > 0, "DSpark block capacity requires block tokens");
         let max_tokens = max_requests
             .checked_mul(block_size)
             .expect("DSpark block token capacity must fit usize");
-        let min_partial_outputs = max_tokens
-            .checked_mul(2)
-            .expect("DSpark block partial-output capacity must fit usize");
-        let max_sdpa_map_task_templates = min_partial_outputs
-            .checked_next_power_of_two()
-            .expect("DSpark block TaskTemplate capacity must fit usize");
-        assert!(
-            u32::try_from(max_tokens).is_ok(),
-            "DSpark block token capacity must fit u32"
-        );
-        assert!(
-            u32::try_from(max_sdpa_map_task_templates).is_ok(),
-            "DSpark block TaskTemplate capacity must fit u32"
-        );
-        Self {
+        let capacity = Self {
             max_requests,
             block_size,
             max_tokens,
-            max_sdpa_map_task_templates,
-        }
+        };
+        capacity.validate();
+        capacity
+    }
+
+    pub fn validate(self) {
+        assert!(self.max_requests > 0, "DSpark block capacity requires requests");
+        assert!(self.block_size > 0, "DSpark block capacity requires block tokens");
+        assert_eq!(
+            self.max_tokens,
+            self.max_requests
+                .checked_mul(self.block_size)
+                .expect("DSpark block token capacity must fit usize"),
+            "DSpark block token capacity must match requests times block size"
+        );
+        assert!(
+            u32::try_from(self.max_tokens).is_ok(),
+            "DSpark block token capacity must fit u32"
+        );
     }
 }
 
@@ -156,13 +156,13 @@ impl DSparkBlockMetadata {
 mod tests {
     use super::*;
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn test_block_capacity_reserves_history_and_block_partials() {
+    fn test_block_capacity_contains_only_batch_geometry() {
         let capacity = DSparkBlockCapacity::new(3, 7);
 
+        assert_eq!(capacity.max_requests, 3);
+        assert_eq!(capacity.block_size, 7);
         assert_eq!(capacity.max_tokens, 21);
-        assert_eq!(capacity.max_sdpa_map_task_templates, 64);
     }
 
     #[test]

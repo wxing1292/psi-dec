@@ -1,6 +1,5 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::ResidualAddCaptureTarget;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNReplayShape;
@@ -16,6 +15,7 @@ use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
+use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::qwen::v3_5::main::layer::Qwen35MainLayer;
 use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerInput;
 use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerScratch;
@@ -33,7 +33,7 @@ pub mod output;
 pub struct Qwen35Main {
     layers: Vec<Qwen35MainLayer>,
     final_norm: RMSNorm,
-    residual_capture: Option<Rc<dyn Qwen35MainResidualCapture>>,
+    residual_capture: Option<Rc<dyn MainResidualCapture>>,
 }
 
 #[derive(Clone, Copy)]
@@ -46,20 +46,6 @@ pub struct Qwen35MainArgs<'a> {
     pub pages: &'a Buffer,
 }
 
-/// Selects capture destinations for Qwen3.5 Main layer residual outputs.
-///
-/// While recording each zero-based model layer, Main asks the capture owner
-/// for that layer's final, post-MLP residual destination. A returned
-/// destination receives the same BF16 values as the layer output. The owner
-/// owns the destination buffer and its column-range layout.
-///
-/// Capture selection and destinations are part of the Main component's fixed
-/// replay topology. They must remain stable for the component's lifetime and
-/// must not alias Main inputs, outputs, or shared layer scratch.
-pub trait Qwen35MainResidualCapture {
-    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>>;
-}
-
 impl Qwen35Main {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
@@ -70,7 +56,7 @@ impl Qwen35Main {
         bindings: Qwen35MainWeightBindings,
         gqa_state: &Qwen3xGQAState,
         gdn_state: &Qwen3xGDNState,
-        residual_capture: Option<Rc<dyn Qwen35MainResidualCapture>>,
+        residual_capture: Option<Rc<dyn MainResidualCapture>>,
         layer_scratch: Rc<Qwen35MainLayerScratch>,
         dense_scratch: Option<&Rc<DenseMLPScratch>>,
         moe_scratch: Option<&Rc<MoEScratch>>,
@@ -232,6 +218,7 @@ impl ReplayComponent for Qwen35Main {
 
 #[cfg(test)]
 mod tests {
+    use inference_backend_metal::components::ResidualAddCaptureTarget;
     use inference_backend_metal::metal::Dtype;
 
     use super::*;
@@ -241,7 +228,7 @@ mod tests {
         capture_output: Buffer,
     }
 
-    impl Qwen35MainResidualCapture for SelectedLayerCapture {
+    impl MainResidualCapture for SelectedLayerCapture {
         fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
             (model_layer_index == self.model_layer_index)
                 .then(|| ResidualAddCaptureTarget::columns(&self.capture_output, 16, 4..12))
@@ -257,7 +244,7 @@ mod tests {
             model_layer_index: 10,
             capture_output: Buffer::new_zeroed_elements(&device, 64, Dtype::Bfloat16),
         });
-        let erased_capture: Rc<dyn Qwen35MainResidualCapture> = capture.clone();
+        let erased_capture: Rc<dyn MainResidualCapture> = capture.clone();
 
         assert!(erased_capture.capture_for_model_layer(9).is_none());
         assert!(erased_capture.capture_for_model_layer(10).is_some());
@@ -268,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_absent_main_capture_never_captures() {
-        let capture: Option<Rc<dyn Qwen35MainResidualCapture>> = None;
+        let capture: Option<Rc<dyn MainResidualCapture>> = None;
         for model_layer_index in [0, 1, 10, usize::MAX] {
             assert!(
                 capture

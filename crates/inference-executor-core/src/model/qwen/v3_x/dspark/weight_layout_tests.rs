@@ -46,7 +46,10 @@ fn test_builds_qwen3x_component_bindings() {
     assert_eq!(bindings.markov.w2.scales, "markov_head.markov_w2.scales");
     assert!(bindings.embed.is_none());
     assert!(bindings.unembed.is_none());
-    assert!(bindings.confidence.is_none());
+    assert_eq!(
+        bindings.confidence.as_ref().unwrap().weight,
+        "confidence_head.proj.weight"
+    );
 }
 
 #[test]
@@ -74,21 +77,16 @@ fn test_resolves_complete_optional_weight_groups() {
 
     assert!(actual.embed.is_some());
     assert!(actual.unembed.is_some());
-    assert!(actual.confidence.is_none());
+    assert!(actual.confidence.is_some());
 }
 
 #[test]
 fn test_resolves_official_source_confidence_head() {
-    let bindings = Qwen3xDSparkWeightBindings::from_config(&config());
-    let mut names = bindings
+    let names = Qwen3xDSparkWeightBindings::from_config(&config())
         .source_tensor_names()
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    names.extend([
-        "confidence_head.proj.weight".to_string(),
-        "confidence_head.proj.bias".to_string(),
-    ]);
 
     let actual = resolve_qwen3x_dspark_source_weight_bindings(&config(), names.iter().map(String::as_str)).unwrap();
 
@@ -100,14 +98,33 @@ fn test_resolves_official_source_confidence_head() {
 }
 
 #[test]
-fn test_rejects_confidence_weights_in_first_milestone_affine_checkpoint() {
+fn test_rejects_missing_confidence_weights_when_enabled() {
     let mut names = required_names();
+    names.retain(|name| !name.starts_with("confidence_head."));
+
+    let error = resolve_qwen3x_dspark_weight_bindings(&config(), names.iter().map(String::as_str)).unwrap_err();
+
+    assert!(error.to_string().contains("confidence_head.proj.weight"));
+    assert!(error.to_string().contains("official BF16 DSpark checkpoint"));
+    assert!(error.to_string().contains("qwen3_dspark_quantize"));
+}
+
+#[test]
+fn test_rejects_confidence_weights_when_disabled() {
+    let mut config = config();
+    config.enable_confidence_head = false;
+    config.confidence_head_with_markov = false;
+    let mut names = Qwen3xDSparkWeightBindings::from_config(&config)
+        .tensor_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     names.extend([
         "confidence_head.proj.weight".to_string(),
         "confidence_head.proj.bias".to_string(),
     ]);
 
-    let error = resolve_qwen3x_dspark_weight_bindings(&config(), names.iter().map(String::as_str)).unwrap_err();
+    let error = resolve_qwen3x_dspark_weight_bindings(&config, names.iter().map(String::as_str)).unwrap_err();
 
     assert!(error.to_string().contains("confidence_head.proj.weight"));
 }
