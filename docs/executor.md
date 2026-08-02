@@ -135,6 +135,10 @@ remain explicit typed input. An artificial tensor-to-tensor API does not hide th
 
 Model weights are immutable after initialization.
 
+- Load only the tensor set for the current semantic owner or layer into a `TensorMap`.
+- Preserve each tensor key, storage dtype, shape, and bytes in the map value.
+- Let the semantic owner remove its exact tensors from the map.
+- Treat a nonempty map after owner construction as an incomplete ownership transfer.
 - Parse model layout and validate shapes while loading.
 - Complete required relayout, slicing, head reordering, and byte-level fusion during initialization.
 - Materialize backend-owned immutable buffers and views, then release checkpoint mmap and file ownership when possible.
@@ -152,6 +156,12 @@ and owner. Do not expose it as the loaded checkpoint weight. Record the supporti
 
 Recommendation: Do not use hot-path `contiguous` calls. If execution requires a layout, prepare it during
 initialization.
+
+`SafeTensorStore` reads safetensors into a bounded `TensorMap` and releases the mapped shards after the copy.
+It does not materialize the full checkpoint at one time.
+Exact binding trees contain keys only.
+They do not own tensor bytes or duplicate checkpoint values.
+Generic embedding and unembedding owners apply the same contract to their exact quantized tensor binding.
 
 ## Metal lowering boundary
 
