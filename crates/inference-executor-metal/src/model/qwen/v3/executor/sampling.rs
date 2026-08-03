@@ -51,7 +51,7 @@ impl Qwen3Executor {
     }
 
     fn record_rejection_sampling(&mut self, recorder: &mut Qwen3ModelOpsRecorder, microbatch: &Qwen3Microbatch) {
-        assert!(self.dspark_block_size > 0, "Qwen3 rejection sampling requires DSpark");
+        let dspark_block_size = self.speculator.dspark().execution.block_size();
         let sample_positions = sample_token_positions(microbatch);
         let sampler_configs = sample_sampler_configs(microbatch);
         let mut flat_draft_distribution_indices = Vec::new();
@@ -62,7 +62,7 @@ impl Qwen3Executor {
             let req_slot = microbatch.req_slots()[req_index];
             let num_spec_tokens = microbatch.num_spec_tokens(req_index) as usize;
             assert!(
-                num_spec_tokens <= self.dspark_block_size,
+                num_spec_tokens <= dspark_block_size,
                 "Qwen3 speculative suffix exceeds DSpark capacity"
             );
             let q_end = microbatch.cu_tokens()[req_index + 1] as usize;
@@ -70,21 +70,25 @@ impl Qwen3Executor {
                 .iter()
                 .enumerate()
             {
-                self.spec_probs.assert_expected_draft_token(
+                self.speculator.dspark().spec_probs.assert_expected_draft_token(
                     req_slot,
                     spec_token_index,
                     draft_token
                         .try_into()
                         .expect("Qwen3 request contained a negative draft token ID"),
                 );
-                flat_draft_distribution_indices
-                    .push(self.spec_probs.draft_distribution_index(req_slot, spec_token_index));
+                flat_draft_distribution_indices.push(
+                    self.speculator
+                        .dspark()
+                        .spec_probs
+                        .draft_distribution_index(req_slot, spec_token_index),
+                );
             }
         }
         let rejector = Rc::clone(
-            self.rejection_sampling
-                .as_ref()
-                .expect("Qwen3 DSpark requires rejection sampling")
+            self.speculator
+                .dspark()
+                .rejection_sampling
                 .component()
                 .rejector(),
         );
@@ -96,7 +100,7 @@ impl Qwen3Executor {
         let max_draft_distributions = self
             .config
             .max_requests
-            .checked_mul(self.dspark_block_size)
+            .checked_mul(dspark_block_size)
             .expect("Qwen3 rejection draft capacity must fit usize");
         let num_draft_distribution_capacity =
             replay_bucket_capacity_allow_zero(num_active_draft_distributions, max_draft_distributions);
@@ -104,7 +108,7 @@ impl Qwen3Executor {
             .config
             .max_requests
             .checked_mul(
-                self.dspark_block_size
+                dspark_block_size
                     .checked_add(1)
                     .expect("Qwen3 Main rows per request must fit usize"),
             )
@@ -120,6 +124,12 @@ impl Qwen3Executor {
                     .try_into()
                     .expect("Qwen3 target-distribution capacity must fit u32"),
             );
+        let Qwen3DSparkSpeculator {
+            rejection_sampling,
+            spec_probs,
+            target_distribution_indices,
+            ..
+        } = self.speculator.dspark_mut();
         let rejection_input = RejectionSamplerInput {
             num_active_decode_reqs,
             num_decode_req_capacity,
@@ -127,33 +137,28 @@ impl Qwen3Executor {
             num_active_draft_distributions,
             num_draft_distribution_capacity,
             top_k: target_shape.top_k,
-            target_token_ids: self.spec_probs.target_token_ids(),
-            target_probs: self.spec_probs.target_probs(),
-            draft_token_ids: self.spec_probs.draft_token_ids(),
-            draft_probs: self.spec_probs.draft_probs(),
+            target_token_ids: spec_probs.target_token_ids(),
+            target_probs: spec_probs.target_probs(),
+            draft_token_ids: spec_probs.draft_token_ids(),
+            draft_probs: spec_probs.draft_probs(),
         };
         let input = RejectionSamplingInput {
             target_shape,
             logits: &self.unembed_logits,
             target_sparse: TopKSamplingWriteDistributionOutput {
-                token_ids: self.spec_probs.target_token_ids(),
-                probs: self.spec_probs.target_probs(),
-                output_distribution_indices: &self.target_distribution_indices,
-                max_k: self
-                    .spec_probs
+                token_ids: spec_probs.target_token_ids(),
+                probs: spec_probs.target_probs(),
+                output_distribution_indices: target_distribution_indices,
+                max_k: spec_probs
                     .max_k()
                     .try_into()
                     .expect("Qwen3 distribution width must fit u32"),
-                num_output_distributions: self.spec_probs.num_target_distributions(),
+                num_output_distributions: spec_probs.num_target_distributions(),
             },
             rejection: rejection_input,
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (rejection_key, _) = self
-            .rejection_sampling
-            .as_mut()
-            .expect("Qwen3 DSpark requires rejection sampling")
-            .record(&runtime, &input);
+        let (rejection_key, _) = rejection_sampling.record(&runtime, &input);
         self.sampler
             .set_configs(&sampler_configs, &sample_positions, SamplingDomain::Target);
         let mut runtime_params = Vec::with_capacity(num_active_decode_reqs);
@@ -196,9 +201,9 @@ impl Qwen3Executor {
             .as_ref()
             .expect("Qwen3 rejection read requires prepared inputs");
         let rejector = self
+            .speculator
+            .dspark()
             .rejection_sampling
-            .as_ref()
-            .expect("Qwen3 rejection read requires DSpark")
             .component()
             .rejector();
         let results = rejector.read_results(

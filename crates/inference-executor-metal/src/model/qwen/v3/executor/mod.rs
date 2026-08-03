@@ -7,7 +7,6 @@ use inference_backend_metal::MetalRuntime;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
-use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::model::qwen::v3::Qwen3DecodeDecision;
 use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
@@ -35,7 +34,6 @@ use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
 
-use crate::attn::dspark::state::UngatedDSparkGQAState;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::page_arena::PageArena;
@@ -49,24 +47,11 @@ use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembed;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembedArgs;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembedReplayKey;
-use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
-use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedArgs;
-use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedReplayKey;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBody;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyArgs;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyReplayKey;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContext;
+use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
+use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
+use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkRecording;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextReplayKey;
-use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembed;
-use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedArgs;
-use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedReplayKey;
-use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSampling;
-use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingArgs;
-use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingReplayKey;
-use crate::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
 use crate::replay::Replay;
-use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
 use crate::sampling::rejection_replay::PreparedRejection;
 use crate::sampling::rejection_replay::RejectionReplayKey;
 use crate::sampling::rejection_replay::RejectionSamplerInput;
@@ -93,6 +78,52 @@ include!("main.rs");
 include!("recording.rs");
 include!("sampling.rs");
 
+enum Qwen3Speculator {
+    Vanilla,
+    DSpark(Box<Qwen3DSparkSpeculator>),
+}
+
+struct Qwen3DSparkSpeculator {
+    execution: Qwen3xDSparkExecution,
+    rejection_sampling: Replay<RejectionSampling>,
+    spec_probs: SpecProbsStore,
+    target_distribution_indices: Buffer,
+}
+
+impl Qwen3Speculator {
+    fn is_dspark(&self) -> bool {
+        matches!(self, Self::DSpark(_))
+    }
+
+    fn block_size(&self) -> usize {
+        match self {
+            Self::Vanilla => 0,
+            Self::DSpark(dspark) => dspark.execution.block_size(),
+        }
+    }
+
+    fn dspark(&self) -> &Qwen3DSparkSpeculator {
+        match self {
+            Self::Vanilla => panic!("Qwen3 Vanilla executor has no DSpark resources"),
+            Self::DSpark(dspark) => dspark,
+        }
+    }
+
+    fn dspark_mut(&mut self) -> &mut Qwen3DSparkSpeculator {
+        match self {
+            Self::Vanilla => panic!("Qwen3 Vanilla executor has no DSpark resources"),
+            Self::DSpark(dspark) => dspark,
+        }
+    }
+
+    fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]) {
+        if let Self::DSpark(dspark) = self {
+            dspark.execution.reset_req_slots(request_slots);
+            dspark.spec_probs.reset_req_slots(request_slots);
+        }
+    }
+}
+
 pub struct Qwen3Executor {
     model_name: String,
     model_config: Qwen3ModelConfig,
@@ -108,53 +139,30 @@ pub struct Qwen3Executor {
     unembed_logits: Buffer,
     main_embed: Replay<Qwen3MainEmbed>,
     main: Replay<Qwen3Main>,
-    dspark_context: Option<Replay<Qwen3xDSparkContext>>,
     gather_unembed: Replay<Qwen3GatherUnembed>,
     sampling: Replay<Sampling>,
-    rejection_sampling: Option<Replay<RejectionSampling>>,
     sampler: Rc<TopKSampling>,
     sampler_bounds: TopKSamplingBounds,
     sampler_output: TopKSamplingOutputBuffers,
     request_sampling: RequestSamplingState,
     main_gqa_state: Qwen3MainGQAState,
-    dspark_gqa_state: Option<UngatedDSparkGQAState>,
-    dspark_embed: Option<Replay<Qwen3xDSparkEmbed>>,
-    dspark: Option<Replay<Qwen3xDSparkBody>>,
-    dspark_gather_unembed: Option<Replay<Qwen3xDSparkGatherUnembed>>,
-    dspark_sampling: Option<Replay<Qwen3xDSparkSampling>>,
-    dspark_markov: Option<Rc<Qwen3xDSparkMarkov>>,
-    dspark_hidden_input: Option<Rc<Buffer>>,
-    dspark_hidden_output: Option<Rc<Buffer>>,
-    dspark_unembed_hidden: Option<Buffer>,
-    dspark_logits: Option<Buffer>,
-    spec_probs: SpecProbsStore,
-    target_distribution_indices: Buffer,
+    speculator: Qwen3Speculator,
     pages: PageArena,
     pending_transactions: Qwen3PendingTransactions,
     gqa_page_table_layout: GQAPageTableLayout,
-    dspark_page_table_layout: Option<GQAPageTableLayout>,
     num_runtime_page_ids_per_block: usize,
-    dspark_block_size: usize,
-    dspark_mask_token_id: Option<i32>,
 }
 
 pub struct Qwen3ModelOpsRecorder {
     main_embed_key: Qwen3MainEmbedReplayKey,
     main_key: Qwen3MainReplayKey,
-    dspark_context_key: Option<Qwen3xDSparkContextReplayKey>,
     gather_unembed_key: Option<Qwen3GatherUnembedReplayKey>,
     sampling_key: Option<TopKSamplingReplayKey>,
     sampling_arguments: ReplayArguments,
     rejection_key: Option<RejectionReplayKey>,
     rejection_arguments: ReplayArguments,
     rejection_prepared: Option<PreparedRejection>,
-    dspark_embed_key: Option<Qwen3xDSparkEmbedReplayKey>,
-    dspark_key: Option<Qwen3xDSparkBodyReplayKey>,
-    dspark_gather_unembed_key: Option<Qwen3xDSparkGatherUnembedReplayKey>,
-    dspark_sampling_key: Option<Qwen3xDSparkSamplingReplayKey>,
-    dspark_sampling_arguments: ReplayArguments,
-    dspark_markov_replay_shape: Option<DSparkMarkovReplayShape>,
-    dspark_req_slots: Vec<u32>,
+    dspark: Qwen3xDSparkRecording,
     num_main_sample_rows: usize,
 }
 
@@ -223,10 +231,7 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]) {
         self.request_sampling.reset(request_slots);
         self.main_gqa_state.reset_req_slots(request_slots);
-        if let Some(state) = &self.dspark_gqa_state {
-            state.reset_req_slots(request_slots);
-        }
-        self.spec_probs.reset_req_slots(request_slots);
+        self.speculator.reset_req_slots(request_slots);
     }
 
     fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
@@ -244,10 +249,10 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
         let model_batch_request = Qwen3ModelBatchRequest::from_core_batch(core_batch_req, sampler_configs);
         let microbatch = model_batch_request.microbatch();
         self.write_token_ids(microbatch.flat_token_ids());
-        if let Some(dspark_gqa_state) = &self.dspark_gqa_state {
+        if self.speculator.is_dspark() {
             self.main_gqa_state
                 .prepare_page_span(core_batch_req, self.num_runtime_page_ids_per_block, 0);
-            dspark_gqa_state.prepare_page_span(
+            self.speculator.dspark().execution.prepare_page_span(
                 core_batch_req,
                 self.num_runtime_page_ids_per_block,
                 self.num_main_gqa_page_ids_per_block(),
@@ -285,20 +290,13 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
         Qwen3ModelOpsRecorder {
             main_embed_key,
             main_key,
-            dspark_context_key: None,
+            dspark: Qwen3xDSparkRecording::new(),
             gather_unembed_key: None,
             sampling_key: None,
             sampling_arguments: ReplayArguments::new(),
             rejection_key: None,
             rejection_arguments: ReplayArguments::new(),
             rejection_prepared: None,
-            dspark_embed_key: None,
-            dspark_key: None,
-            dspark_gather_unembed_key: None,
-            dspark_sampling_key: None,
-            dspark_sampling_arguments: ReplayArguments::new(),
-            dspark_markov_replay_shape: None,
-            dspark_req_slots: Vec::new(),
             num_main_sample_rows: num_main_output_rows(model_batch_request.microbatch()),
         }
     }
@@ -353,7 +351,7 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
             recorded_key, recorder.main_key,
             "qwen3 Main replay input must match the prepared replay key"
         );
-        if let Some(dspark_context) = &mut self.dspark_context {
+        if self.speculator.is_dspark() {
             let context_input = Qwen3xDSparkContextArgs {
                 num_tokens: microbatch
                     .total_tokens()
@@ -363,8 +361,10 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
                 flat_token_indices: self.main_gqa_state.metadata().flat_token_indices(),
                 pages: self.pages.buffer(),
             };
-            let (context_key, _) = dspark_context.record(&runtime, &context_input);
-            recorder.dspark_context_key = Some(context_key);
+            self.speculator
+                .dspark_mut()
+                .execution
+                .record_context(&runtime, &context_input, &mut recorder.dspark);
         }
         self.pending_transactions.push(model_batch_req.compute_seq());
         Rc::clone(&self.hidden_output)
@@ -403,7 +403,7 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
         if num_main_sample_rows == 0 {
             return;
         }
-        if self.dspark_block_size > 0 {
+        if self.speculator.is_dspark() {
             self.record_rejection_sampling(recorder, microbatch);
         } else {
             assert!(
@@ -441,7 +441,7 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
             ..ModelOutputTiming::default()
         };
         let sample_read_start = Instant::now();
-        let decisions = if self.dspark_block_size > 0 {
+        let decisions = if self.speculator.is_dspark() {
             self.read_rejection_decisions(recorder, model_batch_req.microbatch())
         } else {
             self.read_sample_decisions(recorder.num_main_sample_rows)
@@ -451,7 +451,7 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
     }
 
     fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, sampled_output: &Self::SampledOutput) -> bool {
-        self.dspark.is_some() && !sampled_output.decisions.is_empty()
+        self.speculator.is_dspark() && !sampled_output.decisions.is_empty()
     }
 
     fn embed_spec(
@@ -497,7 +497,8 @@ impl ReplayableModelBatchExecutor for Qwen3Executor {
     }
 
     fn submit_spec(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission {
-        self.submit_dspark_recording(recorder)
+        let runtime = self.replay_runtime();
+        self.speculator.dspark().execution.submit(&runtime, &recorder.dspark)
     }
 
     fn read_spec(

@@ -34,7 +34,6 @@ pub struct DSparkMarkovReferenceWeights<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DSparkConfidenceReferenceConfig {
     pub hidden_dim: usize,
-    pub with_markov: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -177,20 +176,18 @@ pub fn dspark_confidence_reference(
             {
                 raw += round_bf16(value) * round_bf16(weight);
             }
-            if confidence_config.with_markov {
-                let latent = quantized_affine_weight_row_reference(
-                    w1_shape,
-                    input_token_id as usize,
-                    markov_weights.w1_weight,
-                    markov_weights.w1_scales,
-                    markov_weights.w1_biases,
-                );
-                for (&value, &weight) in latent.iter().zip(
-                    &confidence_weights.weight
-                        [confidence_config.hidden_dim..confidence_config.hidden_dim + markov_config.rank],
-                ) {
-                    raw += round_bf16(value) * round_bf16(weight);
-                }
+            let latent = quantized_affine_weight_row_reference(
+                w1_shape,
+                input_token_id as usize,
+                markov_weights.w1_weight,
+                markov_weights.w1_scales,
+                markov_weights.w1_biases,
+            );
+            for (&value, &weight) in latent.iter().zip(
+                &confidence_weights.weight
+                    [confidence_config.hidden_dim..confidence_config.hidden_dim + markov_config.rank],
+            ) {
+                raw += round_bf16(value) * round_bf16(weight);
             }
             confidences[request_index].push(1.0 / (1.0 + (-raw).exp()));
         }
@@ -235,13 +232,9 @@ impl DSparkConfidenceReferenceConfig {
     }
 
     fn input_dim(self, rank: usize) -> usize {
-        if self.with_markov {
-            self.hidden_dim
-                .checked_add(rank)
-                .expect("DSpark confidence reference input dimension must fit usize")
-        } else {
-            self.hidden_dim
-        }
+        self.hidden_dim
+            .checked_add(rank)
+            .expect("DSpark confidence reference input dimension must fit usize")
     }
 }
 
@@ -358,10 +351,7 @@ mod tests {
         let confidences = dspark_confidence_reference(
             config,
             weights,
-            DSparkConfidenceReferenceConfig {
-                hidden_dim: HIDDEN,
-                with_markov: true,
-            },
+            DSparkConfidenceReferenceConfig { hidden_dim: HIDDEN },
             DSparkConfidenceReferenceWeights {
                 weight: &confidence_weight,
                 bias: 0.0,

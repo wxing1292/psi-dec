@@ -18,7 +18,7 @@ pub struct Qwen3xDSparkWeightBindings {
     pub final_norm_weight: String,
     pub unembed: Option<QuantizedTensorBindings>,
     pub markov: Qwen3xDSparkMarkovWeightBindings,
-    pub confidence: Option<Qwen3xDSparkConfidenceWeightBindings>,
+    pub confidence: Qwen3xDSparkConfidenceWeightBindings,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,12 +80,10 @@ impl Qwen3xDSparkWeightBindings {
                 w1: quantized_path("markov_head.markov_w1".to_string()),
                 w2: quantized_path("markov_head.markov_w2".to_string()),
             },
-            confidence: config.enable_confidence_head.then(|| {
-                Qwen3xDSparkConfidenceWeightBindings {
-                    weight: "confidence_head.proj.weight".to_string(),
-                    bias: "confidence_head.proj.bias".to_string(),
-                }
-            }),
+            confidence: Qwen3xDSparkConfidenceWeightBindings {
+                weight: "confidence_head.proj.weight".to_string(),
+                bias: "confidence_head.proj.bias".to_string(),
+            },
         }
     }
 
@@ -103,9 +101,7 @@ impl Qwen3xDSparkWeightBindings {
             push_quantized_tensor_names(unembed, &mut names);
         }
         self.markov.push_tensor_names(&mut names);
-        if let Some(confidence) = &self.confidence {
-            confidence.push_tensor_names(&mut names);
-        }
+        self.confidence.push_tensor_names(&mut names);
         names
     }
 
@@ -126,9 +122,7 @@ impl Qwen3xDSparkWeightBindings {
             names.push(unembed.weight.as_str());
         }
         names.extend([self.markov.w1.weight.as_str(), self.markov.w2.weight.as_str()]);
-        if let Some(confidence) = &self.confidence {
-            names.extend([confidence.weight.as_str(), confidence.bias.as_str()]);
-        }
+        names.extend([self.confidence.weight.as_str(), self.confidence.bias.as_str()]);
         names
     }
 }
@@ -202,9 +196,8 @@ pub fn resolve_qwen3x_dspark_weight_bindings<'a>(
     missing.sort_unstable();
     unexpected.sort_unstable();
     if !missing.is_empty() || !unexpected.is_empty() {
-        let missing_confidence = bindings.confidence.as_ref().is_some_and(|confidence| {
-            missing.contains(&confidence.weight.as_str()) || missing.contains(&confidence.bias.as_str())
-        });
+        let missing_confidence = missing.contains(&bindings.confidence.weight.as_str())
+            || missing.contains(&bindings.confidence.bias.as_str());
         let confidence_hint = if missing_confidence {
             " The affine checkpoint is missing its enabled confidence head. Regenerate it from the official BF16 \
              DSpark checkpoint with qwen3_dspark_quantize; do not reuse an affine checkpoint generated before \

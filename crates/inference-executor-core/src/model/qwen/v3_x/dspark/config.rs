@@ -24,8 +24,6 @@ pub struct Qwen3xDSparkConfig {
     pub vocab_size: usize,
     pub markov_rank: usize,
     pub num_anchors: usize,
-    pub enable_confidence_head: bool,
-    pub confidence_head_with_markov: bool,
     pub quantization: Option<QuantizationConfig>,
 }
 
@@ -176,8 +174,6 @@ fn normalize_qwen3x_dspark_config(
         vocab_size: checkpoint.vocab_size,
         markov_rank: checkpoint.markov_rank,
         num_anchors: checkpoint.num_anchors,
-        enable_confidence_head: checkpoint.enable_confidence_head,
-        confidence_head_with_markov: checkpoint.confidence_head_with_markov,
         quantization: checkpoint.quantization,
     })
 }
@@ -257,9 +253,14 @@ fn validate_checkpoint_semantics(config: &Qwen3xDSparkCheckpointConfig) -> Resul
             config.markov_head_type
         )));
     }
-    if config.confidence_head_with_markov && !config.enable_confidence_head {
+    if !config.enable_confidence_head {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DSpark confidence_head_with_markov requires enable_confidence_head=true",
+            "Qwen3 DSpark requires enable_confidence_head=true",
+        ));
+    }
+    if !config.confidence_head_with_markov {
+        return Err(ModelExecutorError::custom(
+            "Qwen3 DSpark requires confidence_head_with_markov=true",
         ));
     }
     Ok(())
@@ -306,7 +307,7 @@ fn validate_attention_dimensions(config: &Qwen3xDSparkCheckpointConfig) -> Resul
             config.head_dim
         )));
     }
-    let q_dim = config
+    let _q_dim = config
         .num_attention_heads
         .checked_mul(config.head_dim)
         .ok_or_else(|| ModelExecutorError::custom("Qwen3 DSpark query dimension must fit usize"))?;
@@ -314,12 +315,6 @@ fn validate_attention_dimensions(config: &Qwen3xDSparkCheckpointConfig) -> Resul
         .num_key_value_heads
         .checked_mul(config.head_dim)
         .ok_or_else(|| ModelExecutorError::custom("Qwen3 DSpark key/value dimension must fit usize"))?;
-    if q_dim != config.hidden_size {
-        return Err(ModelExecutorError::custom(format!(
-            "Qwen3 DSpark num_attention_heads={} * head_dim={} must equal hidden_size={}",
-            config.num_attention_heads, config.head_dim, config.hidden_size
-        )));
-    }
     if !config.num_attention_heads.is_multiple_of(config.num_key_value_heads) {
         return Err(ModelExecutorError::custom(format!(
             "Qwen3 DSpark num_attention_heads={} must be divisible by num_key_value_heads={}",

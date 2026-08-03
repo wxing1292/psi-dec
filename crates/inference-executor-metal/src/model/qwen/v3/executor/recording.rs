@@ -11,12 +11,9 @@ impl Qwen3Executor {
             ReplayExecution::new(main_embed_replay, &empty_arguments),
             ReplayExecution::new(main_replay, &empty_arguments),
         ];
-        if let Some(context_key) = &recorder.dspark_context_key {
+        if self.speculator.is_dspark() {
             sequence.push(ReplayExecution::new(
-                self.dspark_context
-                    .as_ref()
-                    .expect("Qwen3 DSpark context key requires its replay owner")
-                    .replay(context_key),
+                self.speculator.dspark().execution.context_replay(&recorder.dspark),
                 &empty_arguments,
             ));
         }
@@ -35,9 +32,9 @@ impl Qwen3Executor {
                     "qwen3 Main recording must select one sampling path"
                 );
                 sequence.push(ReplayExecution::new(
-                    self.rejection_sampling
-                        .as_ref()
-                        .expect("Qwen3 rejection key requires its replay owner")
+                    self.speculator
+                        .dspark()
+                        .rejection_sampling
                         .replay(rejection_key),
                     &recorder.rejection_arguments,
                 ));
@@ -62,55 +59,5 @@ impl Qwen3Executor {
             );
         }
         self.replay_runtime().submit_replay_sequence(&sequence)
-    }
-
-    fn submit_dspark_recording(&self, recorder: &Qwen3ModelOpsRecorder) -> MetalReplaySubmission {
-        let empty_arguments = ReplayArguments::new();
-        let embed = self
-            .dspark_embed
-            .as_ref()
-            .expect("Qwen3 DSpark submission requires DSparkEmbed")
-            .replay(
-                recorder
-                    .dspark_embed_key
-                    .as_ref()
-                    .expect("Qwen3 DSpark submission requires an embed key"),
-            );
-        let body = self
-            .dspark
-            .as_ref()
-            .expect("Qwen3 DSpark submission requires its body")
-            .replay(
-                recorder
-                    .dspark_key
-                    .as_ref()
-                    .expect("Qwen3 DSpark submission requires a body key"),
-            );
-        let gather_unembed = self
-            .dspark_gather_unembed
-            .as_ref()
-            .expect("Qwen3 DSpark submission requires GatherUnembed")
-            .replay(
-                recorder
-                    .dspark_gather_unembed_key
-                    .as_ref()
-                    .expect("Qwen3 DSpark submission requires a GatherUnembed key"),
-            );
-        let sampling = self
-            .dspark_sampling
-            .as_ref()
-            .expect("Qwen3 DSpark submission requires Sampling")
-            .replay(
-                recorder
-                    .dspark_sampling_key
-                    .as_ref()
-                    .expect("Qwen3 DSpark submission requires a Sampling key"),
-            );
-        self.replay_runtime().submit_replay_sequence(&[
-            ReplayExecution::new(embed, &empty_arguments),
-            ReplayExecution::new(body, &empty_arguments),
-            ReplayExecution::new(gather_unembed, &empty_arguments),
-            ReplayExecution::new(sampling, &recorder.dspark_sampling_arguments),
-        ])
     }
 }

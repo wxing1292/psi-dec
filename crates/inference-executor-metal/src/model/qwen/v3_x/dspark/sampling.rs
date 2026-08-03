@@ -34,7 +34,7 @@ use crate::sampling::spec_probs::SpecProbsStore;
 pub struct Qwen3xDSparkMarkov {
     backend: DSparkMarkovSampling,
     weights: Qwen3xDSparkMarkovWeights,
-    confidence: Option<Qwen3xDSparkConfidenceWeights>,
+    confidence: Qwen3xDSparkConfidenceWeights,
 }
 
 struct Qwen3xDSparkMarkovWeights {
@@ -58,7 +58,7 @@ impl Qwen3xDSparkMarkov {
         store: &mut SafeTensorStore,
         model_config: &Qwen3xDSparkConfig,
         bindings: &Qwen3xDSparkMarkovWeightBindings,
-        confidence_bindings: Option<&Qwen3xDSparkConfidenceWeightBindings>,
+        confidence_bindings: &Qwen3xDSparkConfidenceWeightBindings,
         max_requests: usize,
         sampler_bounds: TopKSamplingBounds,
     ) -> Result<Self, ModelExecutorError> {
@@ -71,12 +71,9 @@ impl Qwen3xDSparkMarkov {
         let w2_quantization = quantization.resolve_for_tensor(&bindings.w2.weight);
         let rank = to_u32("Qwen3x DSpark Markov rank", model_config.markov_rank)?;
         let vocab_size = to_u32("Qwen3x DSpark Markov vocabulary", model_config.vocab_size)?;
-        let confidence_config = model_config
-            .enable_confidence_head
-            .then_some(DSparkMarkovConfidenceConfig {
-                hidden_dim: to_u32("Qwen3x DSpark confidence hidden dimension", model_config.hidden_size)?,
-                with_markov: model_config.confidence_head_with_markov,
-            });
+        let confidence_config = DSparkMarkovConfidenceConfig {
+            hidden_dim: to_u32("Qwen3x DSpark confidence hidden dimension", model_config.hidden_size)?,
+        };
         let config = DSparkMarkovSamplingConfig {
             block_size: model_config.block_size,
             vocab_size,
@@ -96,34 +93,18 @@ impl Qwen3xDSparkMarkov {
             },
         };
         config.validate();
-        match (confidence_config, confidence_bindings) {
-            (Some(_), Some(_)) | (None, None) => {},
-            _ => {
-                return Err(ModelExecutorError::custom(
-                    "Qwen3x DSpark confidence config and weight bindings must match",
-                ));
-            },
-        }
         let mut tensor_names = Vec::new();
         bindings.push_tensor_names(&mut tensor_names);
-        if let Some(bindings) = confidence_bindings {
-            bindings.push_tensor_names(&mut tensor_names);
-        }
+        confidence_bindings.push_tensor_names(&mut tensor_names);
         let mut tensors = store.load_tensors(tensor_names)?;
         let weights = Qwen3xDSparkMarkovWeights::from_tensors(device, &mut tensors, config, bindings)?;
-        let confidence = match (confidence_config, confidence_bindings) {
-            (Some(confidence), Some(bindings)) => {
-                Some(Qwen3xDSparkConfidenceWeights::from_tensors(
-                    device,
-                    &mut tensors,
-                    confidence,
-                    rank,
-                    bindings,
-                )?)
-            },
-            (None, None) => None,
-            _ => unreachable!("confidence config and bindings were validated"),
-        };
+        let confidence = Qwen3xDSparkConfidenceWeights::from_tensors(
+            device,
+            &mut tensors,
+            confidence_config,
+            rank,
+            confidence_bindings,
+        )?;
         assert!(tensors.is_empty(), "Qwen3x DSpark Markov must consume its tensor map");
         Ok(Self {
             backend: DSparkMarkovSampling::new(device, config),
@@ -166,12 +147,10 @@ impl Qwen3xDSparkMarkov {
                 base_logits,
                 distribution_store,
                 weights: self.weights.as_borrowed(),
-                confidence: self.confidence.as_ref().map(|weights| {
-                    DSparkConfidenceInput {
-                        hidden,
-                        weights: weights.as_borrowed(),
-                    }
-                }),
+                confidence: DSparkConfidenceInput {
+                    hidden,
+                    weights: self.confidence.as_borrowed(),
+                },
             },
         );
     }
@@ -284,13 +263,9 @@ impl Qwen3xDSparkConfidenceWeights {
         bindings: &Qwen3xDSparkConfidenceWeightBindings,
     ) -> Result<Self, ModelExecutorError> {
         let hidden_dim = config.hidden_dim as usize;
-        let input_dim = if config.with_markov {
-            hidden_dim
-                .checked_add(rank as usize)
-                .expect("Qwen3x DSpark confidence input dimension must fit usize")
-        } else {
-            hidden_dim
-        };
+        let input_dim = hidden_dim
+            .checked_add(rank as usize)
+            .expect("Qwen3x DSpark confidence input dimension must fit usize");
         let weight = remove_typed_tensor(tensors, &bindings.weight, safetensors::Dtype::BF16)?;
         validate_shape("Qwen3x DSpark confidence weight", weight.shape(), &[1, input_dim])?;
         let bias = remove_typed_tensor(tensors, &bindings.bias, safetensors::Dtype::BF16)?;

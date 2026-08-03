@@ -5,7 +5,6 @@ impl Qwen3Executor {
         microbatch: &Qwen3Microbatch,
         decisions: &[Qwen3DecodeDecision],
     ) -> Rc<Buffer> {
-        assert!(self.dspark_block_size > 0, "Qwen3 DSpark embed requires DSpark");
         let mut req_slots = Vec::new();
         let mut anchor_token_ids = Vec::new();
         let mut anchor_positions = Vec::new();
@@ -69,64 +68,20 @@ impl Qwen3Executor {
         );
         assert!(!req_slots.is_empty(), "Qwen3 DSpark proposal requires decode requests");
 
-        let block = DSparkBlockMetadata::new(&req_slots, &anchor_positions, self.dspark_block_size);
-        self.dspark_gqa_state
-            .as_ref()
-            .expect("Qwen3 DSpark requires GQA state")
-            .prepare_block(&block);
-        let mask_token_id = self
-            .dspark_mask_token_id
-            .expect("Qwen3 DSpark requires a MASK token ID");
-        let mut block_token_ids = Vec::with_capacity(block.num_tokens());
-        for &anchor_token_id in &anchor_token_ids {
-            block_token_ids.push(
-                anchor_token_id
-                    .try_into()
-                    .expect("Qwen3 DSpark anchor token ID must fit i32"),
-            );
-            block_token_ids.extend(std::iter::repeat_n(mask_token_id, self.dspark_block_size - 1));
-        }
-        self.write_token_ids(&block_token_ids);
-        let markov_replay_shape = self
-            .dspark_markov
-            .as_ref()
-            .expect("Qwen3 DSpark requires Markov sampling")
-            .prepare(
-                &req_slots,
+        let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        let dspark = self.speculator.dspark_mut();
+        dspark.execution.record_embed(
+            &runtime,
+            &self.token_ids,
+            Qwen3xDSparkProposalInput::new(
+                req_slots,
                 &anchor_token_ids,
                 &anchor_positions,
                 &sampler_configs,
-                &self.spec_probs,
-            );
-        self.dspark_gather_unembed
-            .as_ref()
-            .expect("Qwen3 DSpark requires GatherUnembed")
-            .component()
-            .prepare(req_slots.len());
-
-        let hidden = Rc::clone(
-            self.dspark_hidden_input
-                .as_ref()
-                .expect("Qwen3 DSpark requires an embed output"),
-        );
-        let input = Qwen3xDSparkEmbedArgs {
-            num_tokens: block
-                .num_tokens()
-                .try_into()
-                .expect("Qwen3 DSpark block token count must fit u32"),
-            token_ids: &self.token_ids,
-            hidden_output: &hidden,
-        };
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (key, _) = self
-            .dspark_embed
-            .as_mut()
-            .expect("Qwen3 DSpark requires DSparkEmbed")
-            .record(&runtime, &input);
-        recorder.dspark_embed_key = Some(key);
-        recorder.dspark_markov_replay_shape = Some(markov_replay_shape);
-        recorder.dspark_req_slots = req_slots;
-        hidden
+            ),
+            &dspark.spec_probs,
+            &mut recorder.dspark,
+        )
     }
 
     fn record_dspark(
@@ -134,40 +89,12 @@ impl Qwen3Executor {
         recorder: &mut Qwen3ModelOpsRecorder,
         hidden_input: Rc<Buffer>,
     ) -> Rc<Buffer> {
-        assert!(
-            Rc::ptr_eq(
-                &hidden_input,
-                self.dspark_hidden_input
-                    .as_ref()
-                    .expect("Qwen3 DSpark requires its body-input workspace")
-            ),
-            "Qwen3 DSpark must consume the DSparkEmbed workspace"
-        );
-        let hidden_output = Rc::clone(
-            self.dspark_hidden_output
-                .as_ref()
-                .expect("Qwen3 DSpark requires its body-output workspace"),
-        );
-        let metadata = self
-            .dspark_gqa_state
-            .as_ref()
-            .expect("Qwen3 DSpark requires GQA state")
-            .metadata();
-        let input = Qwen3xDSparkBodyArgs {
-            num_tokens: metadata.replay_shape().num_tokens,
-            metadata,
-            hidden_input: &hidden_input,
-            hidden_output: &hidden_output,
-            pages: self.pages.buffer(),
-        };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (key, _) = self
-            .dspark
-            .as_mut()
-            .expect("Qwen3 DSpark requires its body")
-            .record(&runtime, &input);
-        recorder.dspark_key = Some(key);
-        hidden_output
+        let pages = self.pages.buffer();
+        self.speculator
+            .dspark_mut()
+            .execution
+            .record_body(&runtime, pages, &mut recorder.dspark, hidden_input)
     }
 
     fn record_dspark_gather_unembed(
@@ -175,69 +102,19 @@ impl Qwen3Executor {
         recorder: &mut Qwen3ModelOpsRecorder,
         hidden_input: &Rc<Buffer>,
     ) {
-        assert!(
-            Rc::ptr_eq(
-                hidden_input,
-                self.dspark_hidden_output
-                    .as_ref()
-                    .expect("Qwen3 DSpark requires its body-output workspace")
-            ),
-            "Qwen3 DSpark GatherUnembed must consume the body output"
-        );
-        let input = Qwen3xDSparkGatherUnembedArgs {
-            num_requests: recorder
-                .dspark_req_slots
-                .len()
-                .try_into()
-                .expect("Qwen3 DSpark request count must fit u32"),
-            hidden_input,
-            hidden_output: self
-                .dspark_unembed_hidden
-                .as_ref()
-                .expect("Qwen3 DSpark requires GatherUnembed hidden scratch"),
-            logits: self
-                .dspark_logits
-                .as_ref()
-                .expect("Qwen3 DSpark requires draft logits"),
-        };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (key, _) = self
-            .dspark_gather_unembed
-            .as_mut()
-            .expect("Qwen3 DSpark requires GatherUnembed")
-            .record(&runtime, &input);
-        recorder.dspark_gather_unembed_key = Some(key);
+        self.speculator
+            .dspark_mut()
+            .execution
+            .record_gather_unembed(&runtime, &mut recorder.dspark, hidden_input);
     }
 
     fn record_dspark_sampling(&mut self, recorder: &mut Qwen3ModelOpsRecorder) {
-        let shape = recorder
-            .dspark_markov_replay_shape
-            .expect("Qwen3 DSpark sampling requires a prepared Markov shape");
-        let input = Qwen3xDSparkSamplingArgs {
-            shape,
-            logits: self
-                .dspark_logits
-                .as_ref()
-                .expect("Qwen3 DSpark sampling requires draft logits"),
-            hidden: self
-                .dspark_unembed_hidden
-                .as_ref()
-                .expect("Qwen3 DSpark sampling requires gathered hidden states"),
-            distribution_store: &self.spec_probs,
-        };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (key, _) = self
-            .dspark_sampling
-            .as_mut()
-            .expect("Qwen3 DSpark requires DraftSampling")
-            .record(&runtime, &input);
-        let mut arguments = ReplayArguments::new();
-        self.dspark_markov
-            .as_ref()
-            .expect("Qwen3 DSpark requires Markov sampling")
-            .add_replay_arguments(shape, &mut arguments);
-        recorder.dspark_sampling_key = Some(key);
-        recorder.dspark_sampling_arguments = arguments;
+        let dspark = self.speculator.dspark_mut();
+        dspark
+            .execution
+            .record_sampling(&runtime, &dspark.spec_probs, &mut recorder.dspark);
     }
 
     fn read_dspark_proposal(
@@ -245,11 +122,10 @@ impl Qwen3Executor {
         recorder: &Qwen3ModelOpsRecorder,
         mut decisions: Vec<Qwen3DecodeDecision>,
     ) -> Vec<Qwen3DecodeDecision> {
-        let proposal = self
-            .dspark_markov
-            .as_ref()
-            .expect("Qwen3 DSpark requires Markov sampling")
-            .read_proposal(&recorder.dspark_req_slots, &mut self.spec_probs);
+        let dspark = self.speculator.dspark_mut();
+        let proposal = dspark
+            .execution
+            .read_proposal(&recorder.dspark, &mut dspark.spec_probs);
         assert_eq!(
             proposal.token_ids.len(),
             decisions.len(),

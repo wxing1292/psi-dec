@@ -322,8 +322,6 @@ mod tests {
             vocab_size: 64,
             markov_rank: 8,
             num_anchors: 8,
-            enable_confidence_head: false,
-            confidence_head_with_markov: false,
             quantization: Some(QuantizationConfig {
                 group_size: 32,
                 bits: 4,

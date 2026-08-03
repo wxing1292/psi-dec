@@ -33,35 +33,23 @@ fn test_sampling_bucket_caps_at_non_power_of_two_request_capacity() {
 }
 
 #[test]
-fn test_markov_map_compiles_supported_confidence_contracts() {
+fn test_markov_map_compiles_required_confidence_contract() {
     let runtime = MetalRuntime::system_default();
     let device = runtime.device();
-    for confidence in [
-        None,
-        Some(DSparkConfidenceConfig {
-            hidden_dim: 32,
-            with_markov: false,
-        }),
-        Some(DSparkConfidenceConfig {
-            hidden_dim: 32,
-            with_markov: true,
-        }),
-    ] {
-        let _ = DSparkMarkovTopKMapKernel::new(
-            device,
-            DSparkMarkovTopKMapConfig {
-                vocab_size: 64,
-                rank: 64,
-                w1_group_size: 64,
-                w1_bits: 8,
-                w2_group_size: 64,
-                w2_bits: 8,
-                io_dtype: Dtype::Bfloat16,
-                scale_bias_dtype: Dtype::Bfloat16,
-                confidence,
-            },
-        );
-    }
+    let _ = DSparkMarkovTopKMapKernel::new(
+        device,
+        DSparkMarkovTopKMapConfig {
+            vocab_size: 64,
+            rank: 64,
+            w1_group_size: 64,
+            w1_bits: 8,
+            w2_group_size: 64,
+            w2_bits: 8,
+            io_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+            confidence: DSparkConfidenceConfig { hidden_dim: 32 },
+        },
+    );
 }
 
 #[test]
@@ -92,10 +80,9 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         w2_bits: 8,
         io_dtype: Dtype::Bfloat16,
         scale_bias_dtype: Dtype::Bfloat16,
-        confidence: Some(DSparkConfidenceConfig {
+        confidence: DSparkConfidenceConfig {
             hidden_dim: HIDDEN_DIM as u32,
-            with_markov: true,
-        }),
+        },
     };
 
     let mut w1_weight = vec![0u8; VOCAB_SIZE * RANK];
@@ -162,10 +149,7 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
             w2_scales: &vec![1.0; VOCAB_SIZE],
             w2_biases: &vec![0.0; VOCAB_SIZE],
         },
-        DSparkConfidenceReferenceConfig {
-            hidden_dim: HIDDEN_DIM,
-            with_markov: true,
-        },
+        DSparkConfidenceReferenceConfig { hidden_dim: HIDDEN_DIM },
         DSparkConfidenceReferenceWeights {
             weight: &confidence_weight,
             bias: confidence_bias,
@@ -186,10 +170,9 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
             w2_bits: 8,
             io_dtype: Dtype::Bfloat16,
             scale_bias_dtype: Dtype::Bfloat16,
-            confidence: Some(DSparkMarkovConfidenceConfig {
+            confidence: DSparkMarkovConfidenceConfig {
                 hidden_dim: HIDDEN_DIM as u32,
-                with_markov: true,
-            }),
+            },
             sampling: bounds,
         },
     );
@@ -244,13 +227,13 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
             base_logits: &base_logits,
             distribution_store: &distribution_store,
             weights,
-            confidence: Some(DSparkConfidenceInput {
+            confidence: DSparkConfidenceInput {
                 hidden: &hidden,
                 weights: DSparkConfidenceWeights {
                     weight: &confidence_weight_buffer,
                     bias: &confidence_bias_buffer,
                 },
-            }),
+            },
         },
     );
     let replay = recorder.build();

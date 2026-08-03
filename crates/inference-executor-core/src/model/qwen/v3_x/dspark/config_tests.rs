@@ -69,9 +69,28 @@ fn test_parses_official_flat_config() {
     assert_eq!(config.head_dim, 128);
     assert_eq!(config.rope_theta, 1_000_000.0);
     assert_eq!(config.markov_rank, 256);
-    assert!(config.enable_confidence_head);
-    assert!(config.confidence_head_with_markov);
     assert_eq!(config.quantization.unwrap().bits, 4);
+}
+
+#[test]
+fn test_requires_markov_confidence_head() {
+    let mut disabled = official_config();
+    disabled["enable_confidence_head"] = serde_json::json!(false);
+    assert!(
+        parse(disabled)
+            .unwrap_err()
+            .to_string()
+            .contains("enable_confidence_head=true")
+    );
+
+    let mut without_markov = official_config();
+    without_markov["confidence_head_with_markov"] = serde_json::json!(false);
+    assert!(
+        parse(without_markov)
+            .unwrap_err()
+            .to_string()
+            .contains("confidence_head_with_markov=true")
+    );
 }
 
 #[test]
@@ -137,6 +156,17 @@ fn test_rejects_invalid_attention_geometry() {
     let error = parse(value).unwrap_err();
 
     assert!(error.to_string().contains("must be divisible"));
+}
+
+#[test]
+fn test_accepts_query_width_distinct_from_hidden_width() {
+    let mut value = official_config();
+    value["num_attention_heads"] = serde_json::json!(32);
+
+    let config = parse(value).unwrap();
+
+    assert_eq!(config.hidden_size, 5120);
+    assert_eq!(config.num_attention_heads * config.head_dim, 4096);
 }
 
 #[test]

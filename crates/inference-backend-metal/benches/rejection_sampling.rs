@@ -4,6 +4,8 @@ use std::mem::size_of;
 use std::time::Duration;
 use std::time::Instant;
 
+use inference_backend_metal::components::DSparkConfidenceBuffers;
+use inference_backend_metal::components::DSparkConfidenceConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapBuffers;
 use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
@@ -76,7 +78,9 @@ fn main() {
                 w2_bits: args.markov_w2_bits,
                 io_dtype: Dtype::Bfloat16,
                 scale_bias_dtype: Dtype::Bfloat16,
-                confidence: None,
+                confidence: DSparkConfidenceConfig {
+                    hidden_dim: args.markov_confidence_hidden_dim,
+                },
             };
             for rows in args.rows {
                 let fixture = DSparkMarkovFixture::new(&device, rows, args.top_k, config);
@@ -127,6 +131,7 @@ struct Args {
     top_k: u32,
     vocab: u32,
     markov_rank: u32,
+    markov_confidence_hidden_dim: u32,
     markov_w1_group_size: u32,
     markov_w1_bits: u32,
     markov_w2_group_size: u32,
@@ -146,6 +151,7 @@ impl Args {
             top_k: 32,
             vocab: 32_768,
             markov_rank: 256,
+            markov_confidence_hidden_dim: 5120,
             markov_w1_group_size: 64,
             markov_w1_bits: 4,
             markov_w2_group_size: 64,
@@ -165,6 +171,9 @@ impl Args {
                 "--top-k" => args.top_k = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
                 "--vocab" => args.vocab = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
                 "--markov-rank" => args.markov_rank = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
+                "--markov-confidence-hidden-dim" => {
+                    args.markov_confidence_hidden_dim = parse_u32_arg(&next_arg(&mut iter, &arg), &arg)
+                },
                 "--markov-w1-group-size" => args.markov_w1_group_size = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
                 "--markov-w1-bits" => args.markov_w1_bits = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
                 "--markov-w2-group-size" => args.markov_w2_group_size = parse_u32_arg(&next_arg(&mut iter, &arg), &arg),
@@ -186,6 +195,10 @@ impl Args {
         assert!(args.vocab > 0, "--vocab must be positive");
         assert!(args.top_k <= args.vocab, "--top-k must be <= --vocab");
         assert!(args.markov_rank > 0, "--markov-rank must be positive");
+        assert!(
+            args.markov_confidence_hidden_dim > 0,
+            "--markov-confidence-hidden-dim must be positive"
+        );
         assert!(args.iters > 0, "--iters must be positive");
         assert!(args.runs > 0, "--runs must be positive");
         args
@@ -244,6 +257,22 @@ impl DSparkMarkovFixture {
         let candidate_count = kernel.candidate_count(shape);
         let tile_token_ids = Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32);
         let tile_logits = Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32);
+        let confidence_hidden = Buffer::new_zeroed_elements(
+            device,
+            rows as usize * config.confidence.hidden_dim as usize,
+            config.io_dtype,
+        );
+        let confidence_weight = Buffer::new_zeroed_elements(
+            device,
+            config
+                .confidence
+                .hidden_dim
+                .checked_add(config.rank)
+                .expect("DSpark confidence input dimension must fit u32") as usize,
+            config.io_dtype,
+        );
+        let confidence_bias = Buffer::new_zeroed_elements(device, 1, config.io_dtype);
+        let confidence_output = Buffer::new_zeroed_elements(device, rows as usize, Dtype::Float32);
         let stream = Stream::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_replay(
@@ -262,7 +291,12 @@ impl DSparkMarkovFixture {
                 w2_biases: &w2_biases,
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
-                confidence: None,
+                confidence: DSparkConfidenceBuffers {
+                    hidden: &confidence_hidden,
+                    weight: &confidence_weight,
+                    bias: &confidence_bias,
+                    output: &confidence_output,
+                },
             },
         ));
         let replay = builder.build();
@@ -747,12 +781,13 @@ fn print_dspark_markov_perf(
     let per_iter_us = sorted_per_iter_us(iters, samples);
     println!(
         "perf component=sampling case=dspark-markov-top-k-map rows={} top_k={} vocab={} markov_rank={} \
-         markov_w1_group_size={} markov_w1_bits={} markov_w2_group_size={} markov_w2_bits={} vocab_tile={} iters={} \
-         runs={} median_us={:.3} min_us={:.3} max_us={:.3}",
+         confidence_hidden_dim={} markov_w1_group_size={} markov_w1_bits={} markov_w2_group_size={} markov_w2_bits={} \
+         vocab_tile={} iters={} runs={} median_us={:.3} min_us={:.3} max_us={:.3}",
         rows,
         top_k,
         config.vocab_size,
         config.rank,
+        config.confidence.hidden_dim,
         config.w1_group_size,
         config.w1_bits,
         config.w2_group_size,
@@ -813,7 +848,8 @@ fn print_help_and_exit() -> ! {
         "sampling bench\n--mode \
          top-k-sample|top-k-write-distribution|top-k-sample-and-write-distribution|rejection-sparse|\
          dspark-markov-top-k-map\n--rows 1,4\n--num-reqs 1,4\n--spec-tokens 1,4\n--top-k 32\n--vocab \
-         32768\n--markov-rank 256\n--markov-w1-group-size 64\n--markov-w1-bits 4\n--markov-w2-group-size \
+         32768\n--markov-rank 256\n--markov-confidence-hidden-dim 5120\n--markov-w1-group-size \
+         64\n--markov-w1-bits 4\n--markov-w2-group-size \
          64\n--markov-w2-bits 8\n--iters 200 --warmup-iters 50 --runs 7"
     );
     std::process::exit(0);

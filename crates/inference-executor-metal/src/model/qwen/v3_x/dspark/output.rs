@@ -3,6 +3,8 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_executor_core::sampling::SamplerConfig;
 
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayRecorder;
@@ -12,6 +14,7 @@ use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
 use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
+use crate::sampling::dspark_markov::DSparkProposal;
 use crate::sampling::spec_probs::SpecProbsStore;
 
 pub struct Qwen3xDSparkGatherUnembed {
@@ -22,7 +25,7 @@ pub struct Qwen3xDSparkGatherUnembed {
 }
 
 pub struct Qwen3xDSparkSampling {
-    markov: Rc<Qwen3xDSparkMarkov>,
+    markov: Qwen3xDSparkMarkov,
 }
 
 #[derive(Clone, Copy)]
@@ -129,8 +132,33 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
 }
 
 impl Qwen3xDSparkSampling {
-    pub fn new(markov: Rc<Qwen3xDSparkMarkov>) -> Self {
+    pub fn new(markov: Qwen3xDSparkMarkov) -> Self {
         Self { markov }
+    }
+
+    pub fn prepare(
+        &self,
+        req_slots: &[u32],
+        anchor_token_ids: &[u32],
+        anchor_positions: &[u32],
+        sampler_configs: &[SamplerConfig],
+        distribution_store: &SpecProbsStore,
+    ) -> DSparkMarkovReplayShape {
+        self.markov.prepare(
+            req_slots,
+            anchor_token_ids,
+            anchor_positions,
+            sampler_configs,
+            distribution_store,
+        )
+    }
+
+    pub fn add_replay_arguments(&self, shape: DSparkMarkovReplayShape, arguments: &mut ReplayArguments) {
+        self.markov.add_replay_arguments(shape, arguments);
+    }
+
+    pub fn read_proposal(&self, req_slots: &[u32], distribution_store: &mut SpecProbsStore) -> DSparkProposal {
+        self.markov.read_proposal(req_slots, distribution_store)
     }
 }
 

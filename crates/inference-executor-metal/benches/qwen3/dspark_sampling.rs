@@ -176,7 +176,7 @@ impl Fixture {
             &mut store,
             &config,
             &bindings.markov,
-            bindings.confidence.as_ref(),
+            &bindings.confidence,
             num_requests,
             bounds,
         )

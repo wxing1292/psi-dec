@@ -78,14 +78,13 @@ pub struct DSparkMarkovSamplingConfig {
     pub w2_bits: u32,
     pub io_dtype: Dtype,
     pub scale_bias_dtype: Dtype,
-    pub confidence: Option<DSparkMarkovConfidenceConfig>,
+    pub confidence: DSparkMarkovConfidenceConfig,
     pub sampling: TopKSamplingBounds,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DSparkMarkovConfidenceConfig {
     pub hidden_dim: u32,
-    pub with_markov: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -116,13 +115,13 @@ pub struct DSparkMarkovInput<'a> {
     pub base_logits: &'a Buffer,
     pub distribution_store: &'a SpecProbsStore,
     pub weights: DSparkMarkovWeights<'a>,
-    pub confidence: Option<DSparkConfidenceInput<'a>>,
+    pub confidence: DSparkConfidenceInput<'a>,
 }
 
 pub struct DSparkMarkovSampling {
     block_size: usize,
     max_requests: usize,
-    confidence_output: Option<Buffer>,
+    confidence_output: Buffer,
     top_k_map: DSparkMarkovTopKMapKernel,
     sample_reduce: TopKMergeKernels,
     anchor_token_ids: Buffer,
@@ -137,16 +136,14 @@ impl DSparkMarkovSampling {
     pub fn new(device: &Device, config: DSparkMarkovSamplingConfig) -> Self {
         config.validate();
         let max_requests = config.sampling.max_sampling_inputs as usize;
-        let confidence_output = config.confidence.map(|_| {
-            Buffer::new_zeroed_elements(
-                device,
-                config
-                    .block_size
-                    .checked_mul(max_requests)
-                    .expect("DSpark confidence output capacity must fit usize"),
-                Dtype::Float32,
-            )
-        });
+        let confidence_output = Buffer::new_zeroed_elements(
+            device,
+            config
+                .block_size
+                .checked_mul(max_requests)
+                .expect("DSpark confidence output capacity must fit usize"),
+            Dtype::Float32,
+        );
         let top_k_map = DSparkMarkovTopKMapKernel::new(device, map_config(config));
         let candidate_count = top_k_map.candidate_count(component_shape(config.sampling.max_shape()));
         let mut step_params = Vec::with_capacity(config.block_size);
@@ -270,17 +267,11 @@ impl DSparkMarkovSampling {
                         w2_biases: input.weights.w2_biases,
                         tile_token_ids: &self.tile_token_ids,
                         tile_logits: &self.tile_logits,
-                        confidence: match (self.confidence_output.as_ref(), input.confidence) {
-                            (Some(output), Some(confidence)) => {
-                                Some(DSparkConfidenceBuffers {
-                                    hidden: confidence.hidden,
-                                    weight: confidence.weights.weight,
-                                    bias: confidence.weights.bias,
-                                    output,
-                                })
-                            },
-                            (None, None) => None,
-                            _ => panic!("DSpark confidence config and input must match"),
+                        confidence: DSparkConfidenceBuffers {
+                            hidden: input.confidence.hidden,
+                            weight: input.confidence.weights.weight,
+                            bias: input.confidence.weights.bias,
+                            output: &self.confidence_output,
                         },
                     },
                 ),
@@ -343,8 +334,7 @@ impl DSparkMarkovSampling {
         let mut token_probs = vec![Vec::with_capacity(self.block_size); req_slots.len()];
         let step_confidences = self
             .confidence_output
-            .as_ref()
-            .map(|output| output.read_typed::<f32>(0, self.block_size * req_slots.len()));
+            .read_typed::<f32>(0, self.block_size * req_slots.len());
         let mut confidences = vec![Vec::with_capacity(self.block_size); req_slots.len()];
         for step_index in 0..self.block_size {
             for (request_index, &req_slot) in req_slots.iter().enumerate() {
@@ -354,11 +344,7 @@ impl DSparkMarkovSampling {
                 distribution_store.set_expected_draft_token(req_slot, step_index, token_id);
                 token_ids[request_index].push(token_id);
                 token_probs[request_index].push(step_token_probs[step_index][request_index]);
-                confidences[request_index].push(
-                    step_confidences
-                        .as_ref()
-                        .map_or(1.0, |values| values[step_index * req_slots.len() + request_index]),
-                );
+                confidences[request_index].push(step_confidences[step_index * req_slots.len() + request_index]);
             }
         }
         DSparkProposal {
@@ -391,12 +377,9 @@ fn map_config(config: DSparkMarkovSamplingConfig) -> DSparkMarkovTopKMapConfig {
         w2_bits: config.w2_bits,
         io_dtype: config.io_dtype,
         scale_bias_dtype: config.scale_bias_dtype,
-        confidence: config.confidence.map(|confidence| {
-            DSparkBackendConfidenceConfig {
-                hidden_dim: confidence.hidden_dim,
-                with_markov: confidence.with_markov,
-            }
-        }),
+        confidence: DSparkBackendConfidenceConfig {
+            hidden_dim: config.confidence.hidden_dim,
+        },
     }
 }
 
