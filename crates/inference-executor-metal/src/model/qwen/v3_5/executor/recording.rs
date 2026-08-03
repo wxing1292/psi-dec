@@ -24,6 +24,12 @@ impl Qwen35Executor {
             ReplayExecution::new(main_embed_replay, &empty_arguments),
             ReplayExecution::new(main_replay, &empty_arguments),
         ];
+        if self.speculator.is_dspark() {
+            sequence.push(ReplayExecution::new(
+                self.speculator.dspark().execution.context_replay(&recorder.dspark),
+                &empty_arguments,
+            ));
+        }
         if let Some(gather_unembed_key) = &recorder.gather_unembed_key {
             assert!(
                 recorder.num_main_sample_rows > 0,
@@ -39,7 +45,7 @@ impl Qwen35Executor {
                     "qwen3.5 Main recording must select one sampling path"
                 );
                 sequence.push(ReplayExecution::new(
-                    self.rejection_sampling.replay(rejection_key),
+                    self.speculator.common().rejection_sampling.replay(rejection_key),
                     &recorder.rejection_arguments,
                 ));
             } else {
@@ -74,7 +80,6 @@ impl Qwen35Executor {
         });
         submission
     }
-
     fn submit_gdn_state_restore(&mut self) -> Duration {
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         let start = Instant::now();

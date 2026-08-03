@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -14,32 +13,32 @@ use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::args::Qwen35Args;
 use crate::qwen_server::args::QwenLogLevel;
 use crate::qwen_server::args::QwenProfileMode;
-use crate::qwen_server::sizing::QWEN3_DEFAULT_NUM_CACHE_PAGES;
-use crate::qwen_server::sizing::QWEN35_DEFAULT_NUM_CACHE_PAGES;
 
-pub const QWEN3_MAX_RUNNING_REQUESTS: usize = 8;
-pub const QWEN35_MAX_RUNNING_REQUESTS: usize = 8;
+const MAX_QUEUED_REQUESTS: usize = 32;
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Qwen3ModelMode {
+    Vanilla,
+    DSpark { model_dir: PathBuf },
+}
 
 #[derive(Debug)]
 pub struct Qwen3Config {
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
     hf_model_dir: PathBuf,
-    hf_dspark_model_dir: Option<PathBuf>,
+    model_mode: Qwen3ModelMode,
     telemetry: TelemetryConfig,
     num_cache_pages: usize,
+    max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
 }
 
 impl Qwen3Config {
     pub fn from_args(args: Qwen3Args) -> Result<Self> {
-        let num_cache_pages = args
-            .num_cache_pages
-            .map_or(QWEN3_DEFAULT_NUM_CACHE_PAGES, NonZeroUsize::get);
-        if args.max_requests.get() > QWEN3_MAX_RUNNING_REQUESTS {
+        if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
-                "--max-requests={} exceeds the Qwen3 runtime capacity {QWEN3_MAX_RUNNING_REQUESTS}",
-                args.max_requests
+                "--max-requests must fit the u32 request-slot domain"
             ));
         }
         if i32::try_from(args.max_tokens.get()).is_err() {
@@ -48,17 +47,21 @@ impl Qwen3Config {
         if u32::try_from(args.max_tokens_per_request.get()).is_err() {
             return Err(log_info_invalid_argument!("--max-tokens-per-request must fit u32"));
         }
-        if u32::try_from(num_cache_pages - 1).is_err() {
+        if u32::try_from(args.num_cache_pages.get()).is_err() {
             return Err(log_info_invalid_argument!(
                 "--num-cache-pages must fit the u32 page-ID domain"
             ));
         }
 
+        let model_mode = match args.hf_dspark_model_dir {
+            Some(model_dir) => Qwen3ModelMode::DSpark { model_dir },
+            None => Qwen3ModelMode::Vanilla,
+        };
         Ok(Self {
             grpc_listen_addr: args.grpc_listen_addr,
             http_listen_addr: args.http_listen_addr,
             hf_model_dir: args.hf_model_dir,
-            hf_dspark_model_dir: args.hf_dspark_model_dir,
+            model_mode,
             telemetry: TelemetryConfig {
                 profiling: ProfilingConfig {
                     mode: args.profile.map(ProfileMode::from),
@@ -66,7 +69,8 @@ impl Qwen3Config {
                 },
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
-            num_cache_pages,
+            num_cache_pages: args.num_cache_pages.get(),
+            max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
                 max_tokens: args.max_tokens.get(),
@@ -88,8 +92,8 @@ impl Qwen3Config {
         self.hf_model_dir.as_path()
     }
 
-    pub fn hf_dspark_model_dir(&self) -> Option<&Path> {
-        self.hf_dspark_model_dir.as_deref()
+    pub fn model_mode(&self) -> &Qwen3ModelMode {
+        &self.model_mode
     }
 
     pub fn telemetry_config(&self) -> TelemetryConfig {
@@ -100,8 +104,29 @@ impl Qwen3Config {
         self.num_cache_pages
     }
 
+    pub fn max_queued_requests(&self) -> usize {
+        self.max_queued_requests
+    }
+
+    pub fn max_running_requests(&self) -> usize {
+        self.scheduler_config.max_requests
+    }
+
     pub fn scheduler_config(&self) -> SchedulerConfig {
         self.scheduler_config
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Qwen35ModelMode {
+    Vanilla,
+    Mtp { model_dir: PathBuf },
+    DSpark { model_dir: PathBuf },
+}
+
+impl Qwen35ModelMode {
+    pub fn num_mtp_modules(&self) -> usize {
+        usize::from(matches!(self, Self::Mtp { .. }))
     }
 }
 
@@ -110,21 +135,23 @@ pub struct Qwen35Config {
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
     hf_model_dir: PathBuf,
-    hf_mtp_model_dir: Option<PathBuf>,
+    model_mode: Qwen35ModelMode,
     telemetry: TelemetryConfig,
-    num_mtp_modules: usize,
     num_cache_pages: usize,
+    max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
 }
 
 impl Qwen35Config {
     pub fn from_args(args: Qwen35Args) -> Result<Self> {
-        let num_cache_pages = args
-            .num_cache_pages
-            .map_or(QWEN35_DEFAULT_NUM_CACHE_PAGES, NonZeroUsize::get);
         let num_mtp_modules = args
             .mtp_module
             .unwrap_or_else(|| usize::from(args.hf_mtp_model_dir.is_some()));
+        if args.hf_dspark_model_dir.is_some() && (args.hf_mtp_model_dir.is_some() || num_mtp_modules != 0) {
+            return Err(log_info_invalid_argument!(
+                "--hf-dspark-model-dir is mutually exclusive with Qwen3.5 MTP"
+            ));
+        }
         if num_mtp_modules > 1 {
             return Err(log_info_invalid_argument!(
                 "--mtp-module must be 0 or 1, got {num_mtp_modules}"
@@ -135,10 +162,9 @@ impl Qwen35Config {
                 "--hf-mtp-model-dir is required when --mtp-module is 1"
             ));
         }
-        if args.max_requests.get() > QWEN35_MAX_RUNNING_REQUESTS {
+        if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
-                "--max-requests={} exceeds the Qwen runtime capacity {QWEN35_MAX_RUNNING_REQUESTS}",
-                args.max_requests
+                "--max-requests must fit the u32 request-slot domain"
             ));
         }
         if num_mtp_modules + 1 > args.max_tokens_per_request.get() {
@@ -154,17 +180,23 @@ impl Qwen35Config {
         if u32::try_from(args.max_tokens_per_request.get()).is_err() {
             return Err(log_info_invalid_argument!("--max-tokens-per-request must fit u32"));
         }
-        if u32::try_from(num_cache_pages - 1).is_err() {
+        if u32::try_from(args.num_cache_pages.get()).is_err() {
             return Err(log_info_invalid_argument!(
                 "--num-cache-pages must fit the u32 page-ID domain"
             ));
         }
 
+        let model_mode = match (args.hf_mtp_model_dir, args.hf_dspark_model_dir, num_mtp_modules) {
+            (_, Some(model_dir), 0) => Qwen35ModelMode::DSpark { model_dir },
+            (Some(model_dir), None, 1) => Qwen35ModelMode::Mtp { model_dir },
+            (_, None, 0) => Qwen35ModelMode::Vanilla,
+            _ => unreachable!("validated Qwen3.5 model mode must be complete and exclusive"),
+        };
         Ok(Self {
             grpc_listen_addr: args.grpc_listen_addr,
             http_listen_addr: args.http_listen_addr,
             hf_model_dir: args.hf_model_dir,
-            hf_mtp_model_dir: args.hf_mtp_model_dir,
+            model_mode,
             telemetry: TelemetryConfig {
                 profiling: ProfilingConfig {
                     mode: args.profile.map(ProfileMode::from),
@@ -172,8 +204,8 @@ impl Qwen35Config {
                 },
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
-            num_mtp_modules,
-            num_cache_pages,
+            num_cache_pages: args.num_cache_pages.get(),
+            max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
                 max_requests: args.max_requests.get(),
                 max_tokens: args.max_tokens.get(),
@@ -195,8 +227,8 @@ impl Qwen35Config {
         self.hf_model_dir.as_path()
     }
 
-    pub fn hf_mtp_model_dir(&self) -> Option<&Path> {
-        self.hf_mtp_model_dir.as_deref()
+    pub fn model_mode(&self) -> &Qwen35ModelMode {
+        &self.model_mode
     }
 
     pub fn telemetry_config(&self) -> TelemetryConfig {
@@ -204,11 +236,19 @@ impl Qwen35Config {
     }
 
     pub fn num_mtp_modules(&self) -> usize {
-        self.num_mtp_modules
+        self.model_mode.num_mtp_modules()
     }
 
     pub fn num_cache_pages(&self) -> usize {
         self.num_cache_pages
+    }
+
+    pub fn max_queued_requests(&self) -> usize {
+        self.max_queued_requests
+    }
+
+    pub fn max_running_requests(&self) -> usize {
+        self.scheduler_config.max_requests
     }
 
     pub fn scheduler_config(&self) -> SchedulerConfig {

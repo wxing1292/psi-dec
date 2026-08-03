@@ -5,7 +5,7 @@ use std::time::Instant;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35ExecutorConfig;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model;
-use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_hf_mtp;
+use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_mtp;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::DecoderSyncBlocks;
@@ -56,17 +56,10 @@ impl Case {
         }
     }
 
-    fn num_mtp_modules(self) -> usize {
-        match self {
-            Self::E2EWithoutMTP => 0,
-            Self::E2EWithMTP => 1,
-        }
-    }
-
     fn max_spec_tokens(self) -> usize {
         match self {
             Self::E2EWithoutMTP => 0,
-            Self::E2EWithMTP => self.num_mtp_modules(),
+            Self::E2EWithMTP => 1,
         }
     }
 }
@@ -133,12 +126,11 @@ impl ExecutorFixture {
             max_tokens_per_request: NUM_TOKENS_PER_BLOCK,
             num_cache_pages: NUM_CACHE_PAGES,
             num_tokens_per_block: NUM_TOKENS_PER_BLOCK,
-            num_mtp_modules: case.num_mtp_modules(),
         };
         let model = match case {
             Case::E2EWithoutMTP => init_qwen_3_5_model(&args.model_dir, config),
             Case::E2EWithMTP => {
-                init_qwen_3_5_model_with_hf_mtp(
+                init_qwen_3_5_model_with_mtp(
                     &args.model_dir,
                     args.mtp_model_dir
                         .as_ref()

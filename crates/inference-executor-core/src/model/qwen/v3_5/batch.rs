@@ -365,6 +365,7 @@ pub struct Qwen35DecodeDecision {
     pub sampled_prob: f32,
     pub spec_tokens: Vec<u32>,
     pub spec_probs: Vec<f32>,
+    pub spec_confidences: Vec<f32>,
 }
 
 pub fn gather_flat_indices(microbatch: &Qwen35Microbatch) -> Vec<u32> {
@@ -539,7 +540,7 @@ pub fn to_core_batch_resp(
                         .next()
                         .expect("qwen3.5 service requires one decision per sampled request");
                     assert_eq!(decision.spec_tokens.len(), decision.spec_probs.len());
-                    let spec_confidences = vec![finite_probability(1.0); decision.spec_tokens.len()];
+                    assert_eq!(decision.spec_tokens.len(), decision.spec_confidences.len());
                     SampledTokens::Decode {
                         epoch: core_req.decoder_query_tokens.epoch(),
                         validated_tokens: decision.validated_tokens.into_iter().map(Token::new).collect(),
@@ -548,7 +549,7 @@ pub fn to_core_batch_resp(
                         sampled_prob: finite_probability(decision.sampled_prob),
                         spec_tokens: decision.spec_tokens.into_iter().map(Token::new).collect(),
                         spec_probs: decision.spec_probs.into_iter().map(finite_probability).collect(),
-                        spec_confidences,
+                        spec_confidences: decision.spec_confidences.into_iter().map(finite_probability).collect(),
                     }
                 },
             };
@@ -995,6 +996,7 @@ mod tests {
             sampled_prob: 0.3,
             spec_tokens: vec![6],
             spec_probs: vec![0.2],
+            spec_confidences: vec![0.9],
         };
 
         let response = to_core_batch_resp(core, vec![decision]);
@@ -1017,7 +1019,7 @@ mod tests {
                 assert_eq!(validated_tokens[0].value(), 4);
                 assert_eq!(sampled_token.value(), 5);
                 assert_eq!(spec_tokens[0].value(), 6);
-                assert_eq!(spec_confidences, &[finite_probability(1.0)]);
+                assert_eq!(spec_confidences, &[finite_probability(0.9)]);
             },
             SampledTokens::Prefill { .. } => panic!("expected decode sampled tokens"),
         }

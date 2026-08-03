@@ -19,6 +19,19 @@ impl Qwen35Executor {
                 request.decoder_query_tokens.token_consumption(),
                 self.config.max_tokens_per_request
             );
+            let num_spec_tokens = request.decoder_query_tokens.num_spec_tokens();
+            let max_spec_tokens = self.num_speculative_tokens();
+            if max_spec_tokens == 0 {
+                assert_eq!(
+                    num_spec_tokens, 0,
+                    "qwen3.5 executor without a speculator does not accept speculative input tokens"
+                );
+            } else {
+                assert!(
+                    num_spec_tokens <= max_spec_tokens,
+                    "qwen3.5 speculative-token count exceeds speculator capacity"
+                );
+            }
         }
         let max_context_tokens = core_batch_req
             .dev_reqs
@@ -41,6 +54,17 @@ impl Qwen35Executor {
             num_physical_pages,
             page_capacity
         );
+        if self.speculator.is_dspark() {
+            let dspark = &self.speculator.dspark().execution;
+            let num_dspark_pages = max_context_tokens.div_ceil(dspark.num_tokens_per_page());
+            let dspark_page_capacity = dspark.num_physical_pages_per_request();
+            assert!(
+                num_dspark_pages <= dspark_page_capacity,
+                "qwen3.5 DSpark request context needs {} physical pages but capacity is {}",
+                num_dspark_pages,
+                dspark_page_capacity
+            );
+        }
     }
 
     pub fn num_main_gqa_page_ids_per_block(&self) -> usize {
@@ -51,17 +75,21 @@ impl Qwen35Executor {
         usize::try_from(num_page_ids).expect("qwen3.5 main GQA page IDs per block must fit usize")
     }
 
+    pub fn num_main_lane_gqa_page_ids_per_block(&self) -> usize {
+        self.num_runtime_page_ids_per_main_block
+    }
+
     pub fn num_mtp_gqa_page_ids_per_block(&self) -> Vec<usize> {
-        self.mtp_gqa_state
-            .iter()
-            .map(|state| {
-                let layout = state.request_page_table().layout();
+        match &self.speculator {
+            Qwen35Speculator::Vanilla | Qwen35Speculator::DSpark(_) => Vec::new(),
+            Qwen35Speculator::Mtp(mtp) => {
+                let layout = mtp.gqa_state.request_page_table().layout();
                 let num_page_ids = u64::from(layout.num_gqa_layers)
                     .checked_mul(u64::from(layout.num_page_ids_per_block))
                     .expect("qwen3.5 MTP GQA page IDs per block overflow");
-                usize::try_from(num_page_ids).expect("qwen3.5 MTP GQA page IDs per block must fit usize")
-            })
-            .collect()
+                vec![usize::try_from(num_page_ids).expect("qwen3.5 MTP GQA page IDs per block must fit usize")]
+            },
+        }
     }
 
     pub fn num_gdn_state_page_ids_per_block(&self) -> usize {

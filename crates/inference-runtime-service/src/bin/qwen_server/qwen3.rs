@@ -16,15 +16,14 @@ use inference_runtime_service::telemetry::CacheLaneLogSummary;
 use inference_runtime_service::telemetry::StartupLogger;
 
 use crate::qwen_server::args::Qwen3Args;
-use crate::qwen_server::config::QWEN3_MAX_RUNNING_REQUESTS;
 use crate::qwen_server::config::Qwen3Config;
+use crate::qwen_server::config::Qwen3ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
 
 // Qwen3 has no GDN snapshot to amortize across a large logical block. Two
 // eight-token physical KV pages per layer keep trie granularity small without
 // making each physical page a separate runtime block.
 const TOKENS_PER_CACHE_BLOCK: usize = 16;
-const MAX_QUEUED_REQUESTS: usize = 32;
 
 pub fn run() {
     if let Err(error) = run_inner() {
@@ -54,16 +53,20 @@ fn run_inner() -> Result<()> {
 
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
+    let max_queued_requests = config.max_queued_requests();
+    let max_running_requests = config.max_running_requests();
     startup.event("initializing model executor");
     let executor_config = Qwen3ExecutorConfig {
-        max_requests: QWEN3_MAX_RUNNING_REQUESTS,
+        max_requests: max_running_requests,
         max_tokens: scheduler_config.max_tokens,
         max_tokens_per_request: scheduler_config.max_tokens_per_request,
         num_cache_pages,
         num_tokens_per_block: TOKENS_PER_CACHE_BLOCK,
     };
-    let model = match config.hf_dspark_model_dir() {
-        Some(dspark_model_dir) => {
+    let model = match config.model_mode() {
+        Qwen3ModelMode::DSpark {
+            model_dir: dspark_model_dir,
+        } => {
             init_qwen_3_model_with_dspark(config.hf_model_dir(), dspark_model_dir, executor_config).map_err(
                 |error| {
                     log_err_unavailable!(
@@ -74,7 +77,7 @@ fn run_inner() -> Result<()> {
                 },
             )?
         },
-        None => {
+        Qwen3ModelMode::Vanilla => {
             init_qwen_3_model(config.hf_model_dir(), executor_config).map_err(|error| {
                 log_err_unavailable!(
                     "unable to initialize qwen3 Main model from {:?}: {error}",
@@ -84,7 +87,10 @@ fn run_inner() -> Result<()> {
         },
     };
     startup.event("model executor initialized");
-    if let Some(dspark_model_dir) = config.hf_dspark_model_dir() {
+    if let Qwen3ModelMode::DSpark {
+        model_dir: dspark_model_dir,
+    } = config.model_mode()
+    {
         tracing::info!(
             target: "inference-runtime-service::startup",
             component = "qwen3",
@@ -94,15 +100,15 @@ fn run_inner() -> Result<()> {
         );
     }
 
-    let runtime_config = build_runtime_config(&startup, num_cache_pages, &model)?;
+    let runtime_config = build_runtime_config(&startup, &config, &model)?;
 
     tracing::info!(
         target: "inference-runtime-service::startup",
         component = "qwen3",
         num_cache_pages,
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
-        max_queued_requests = MAX_QUEUED_REQUESTS,
-        max_running_requests = QWEN3_MAX_RUNNING_REQUESTS,
+        max_queued_requests,
+        max_running_requests,
         max_batch_requests = scheduler_config.max_requests,
         max_tokens = scheduler_config.max_tokens,
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
@@ -123,9 +129,10 @@ fn run_inner() -> Result<()> {
 
 fn build_runtime_config(
     startup: &StartupLogger,
-    num_cache_pages: usize,
+    service_config: &Qwen3Config,
     model: &Qwen3Executor,
 ) -> Result<RuntimeConfig> {
+    let num_cache_pages = service_config.num_cache_pages();
     let model_config = model.model_config();
     let text = &model_config.text_config;
     let num_pages_per_kv_block = model.num_kv_page_ids_per_block();
@@ -138,8 +145,8 @@ fn build_runtime_config(
         block_cache_capacity: cache_lane.block_cache_capacity,
     });
     Ok(RuntimeConfig {
-        max_queued_requests: MAX_QUEUED_REQUESTS,
-        max_running_requests: QWEN3_MAX_RUNNING_REQUESTS,
+        max_queued_requests: service_config.max_queued_requests(),
+        max_running_requests: service_config.max_running_requests(),
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
         num_kv_heads: text.num_key_value_heads,
         kv_head_dim: text.head_dim,

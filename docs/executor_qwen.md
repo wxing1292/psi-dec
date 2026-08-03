@@ -2,8 +2,8 @@
 
 This document describes the current Qwen3 and Qwen3.5/Qwen3.6 Metal executors.
 The document covers checkpoint configuration, top-down loading, state preparation, cached replay, and sampling.
-Qwen3 can load an optional fixed-block DSpark speculator.
-Qwen3.5 owns its single-module MTP path.
+Qwen3 supports separate Vanilla and fixed-block DSpark modes.
+Qwen3.5 supports separate Vanilla, single-module MTP, and fixed-block DSpark modes.
 The `v3_x` directories contain version-neutral leaf components, utilities, and the Qwen3x DSpark model.
 Each model owns its structural contracts and execution graph.
 
@@ -42,6 +42,8 @@ crates/inference-executor-metal/src/
     qwen/v3_x/
       dspark/
         embed.rs            Qwen3x DSpark embedding replay
+        execution.rs        shared execution resources and per-batch recording
+        load.rs             shared checkpoint and resource load
         main_feature.rs     selected Main residual projection
         attention.rs        paged-history plus block-bidirectional attention
         layer.rs            independent Qwen3xDSparkLayer
@@ -67,7 +69,7 @@ crates/inference-executor-metal/src/
         plan.rs             Qwen3 QKV GQA and dense-MLP core/Metal configuration
       executor/
         mod.rs              Qwen3Executor, private pending transactions, and runtime integration
-        load.rs             Main and optional DSpark top-down load
+        load.rs             separate Vanilla and DSpark top-down load
         batch.rs            validation, prepare, reset, and commit lifecycle
         recording.rs        recorder lifecycle and Main replay submission
         main.rs             MainEmbed, Main, and GatherUnembed orchestration
@@ -86,12 +88,13 @@ crates/inference-executor-metal/src/
       plan.rs               Qwen35 component configuration and MTP validation
       executor/
         mod.rs              Qwen35Executor fields and ReplayableModelBatchExecutor integration
-        load.rs             layer count pass and top-down load
+        load.rs             layer count pass and separate Vanilla/MTP/DSpark top-down load
         batch.rs            validation, prepare, reset, and commit lifecycle
         recording.rs        recorder lifecycle and common replay submission
         main.rs             MainEmbed, Main, and GatherUnembed orchestration
         sampling.rs         Main/Spec/rejection orchestration and readback
         mtp.rs              MTP request, proposal-batch, and proposal flow
+        dspark.rs           DSpark Spec proposal orchestration
 
 crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs         TopKSampling and TopKSamplingOutputBuffers
@@ -133,38 +136,70 @@ Qwen3 has no GDN transaction, state-page metadata, MTP lane, or Qwen3.5 replay k
 ```text
 Qwen3Executor
   main_gqa_state: Qwen3MainGQAState
-  dspark_gqa_state: Option<UngatedDSparkGQAState>
   main_embed: Replay<Qwen3MainEmbed>
   main: Replay<Qwen3Main>
-  dspark_context: Option<Replay<Qwen3xDSparkContext>>
   gather_unembed: Replay<Qwen3GatherUnembed>
   sampling: Replay<Sampling>
-  rejection_sampling: Option<Replay<RejectionSampling>>
-  dspark_embed: Option<Replay<Qwen3xDSparkEmbed>>
-  dspark: Option<Replay<Qwen3xDSparkBody>>
-  dspark_gather_unembed: Option<Replay<Qwen3xDSparkGatherUnembed>>
-  dspark_sampling: Option<Replay<Qwen3xDSparkSampling>>
-  spec_probs: SpecProbsStore
+  speculator: Qwen3Speculator
+    Vanilla
+    DSpark
+      execution: Qwen3xDSparkExecution
+      rejection_sampling: Replay<RejectionSampling>
+      spec_probs: SpecProbsStore
   pages: PageArena
 
 Qwen35Executor
   main_gqa_state: Qwen3xGQAState
   main_gdn_state: Qwen3xGDNState
-  mtp_gqa_state: Option<Qwen3xGQAState>
   main_embed: Replay<Qwen35MainEmbed>
   main: Replay<Qwen35Main>
   gather_unembed: Replay<Qwen35GatherUnembed>
   sampling: Replay<Sampling>
-  mtp_embed: Option<Replay<Qwen35MTPEmbed>>
-  mtp: Option<Replay<Qwen35MTP>>
-  mtp_sampling: Replay<DraftSampling>
-  rejection_sampling: Replay<RejectionSampling>
+  speculator: Qwen35Speculator
+    Vanilla
+    MTP
+      gqa_state: Qwen3xGQAState
+      embed: Replay<Qwen35MTPEmbed>
+      body: Replay<Qwen35MTP>
+      sampling: Replay<DraftSampling>
+      common: Qwen35SpeculativeResources
+    DSpark
+      execution: Qwen3xDSparkExecution
+      common: Qwen35SpeculativeResources
   pages: PageArena
+
+Qwen35SpeculativeResources
+  rejection_sampling: Replay<RejectionSampling>
+  spec_probs: SpecProbsStore
+
+Qwen3xDSparkExecution
+  context: Replay<Qwen3xDSparkContext>
+  gqa_state: UngatedDSparkGQAState
+  embed: Replay<Qwen3xDSparkEmbed>
+  body: Replay<Qwen3xDSparkBody>
+  gather_unembed: Replay<Qwen3xDSparkGatherUnembed>
+  sampling: Replay<Qwen3xDSparkSampling>
+    markov: Qwen3xDSparkMarkov
+  reusable hidden/logit workspaces
+  page layout and block geometry
+
+Qwen3ModelOpsRecorder / Qwen35ModelOpsRecorder
+  dspark: Qwen3xDSparkRecording
+
+Qwen3xDSparkRecording
+  context/embed/body/gather/sampling replay keys
+  sampling arguments and Markov replay shape
+  request slots
 ```
 
 Semantic components own weights, static configuration, and `load + record`.
 `Replay<T>` owns the related replay cache.
 Each executor owns its dynamic workspaces, lifecycle order, and submissions.
+Each executor stores one closed speculator enum.
+The enum cannot represent a partial resource set or simultaneous MTP and DSpark resources.
+Vanilla executors do not allocate rejection or speculative-probability resources.
+Per-batch recorders retain optional replay keys because a batch can omit output or Spec stages.
+These lifecycle keys do not own initialized model resources.
 
 Embedding, unembedding, row gather, residual add/capture, and RMS normalization remain shared model components.
 These components hide backend kernel and invocation details.
@@ -204,11 +239,19 @@ Markov head.
 That schema includes layer-kind, MoE, MTP, and partial-RoPE fields.
 `Qwen3ExecutorConfig` and `Qwen35ExecutorConfig` keep runtime capacities model-specific.
 
+CLI parser structs accept `Option` values for checkpoint arguments.
+The service validates these values once and converts them to `Qwen3ModelMode` or `Qwen35ModelMode`.
+The normalized service configuration stores only the closed model mode.
+The executor public API has one initializer for each supported mode.
+The private loader receives one closed init enum.
+The constructed executor receives one closed speculator enum.
+
 `Qwen35ExecutorConfig::max_requests` is the executor request-slot capacity.
-It is not the scheduler per-batch request budget.
-The service initializes it from `RuntimeConfig::max_running_requests`.
+`Qwen35Config` derives it from the same `--max-requests` value as the scheduler per-batch request capacity.
+The service passes that value to `Qwen35ExecutorConfig::max_requests`, `RuntimeConfig::max_running_requests`, and
+`SchedulerConfig::max_requests`.
 GQA page tables, GDN request state, sampling state, and request-indexed workspaces share this slot domain.
-Runtime initialization also requires `SchedulerConfig::max_requests` to be no larger than this capacity.
+Main, MTP, and DSpark use this same configuration flow.
 
 Each model resolves its own exact typed binding tree before real tensor reads:
 
@@ -235,7 +278,7 @@ Qwen3xDSparkWeightBindings
   final_norm_weight
   optional unembed: QuantizedTensorBindings
   markov: Qwen3xDSparkMarkovWeightBindings
-  optional confidence: Qwen3xDSparkConfidenceWeightBindings
+  confidence: Qwen3xDSparkConfidenceWeightBindings
 
 Qwen35ModelWeightBindings
   embed: QuantizedTensorBindings
@@ -257,22 +300,30 @@ Qwen35MTPWeightBindings
 
 Initialization is top-down:
 
-1. Parse and validate the model-specific Main and optional MTP or DSpark configurations.
-2. Resolve exact binding trees.
+1. Select one closed Vanilla, MTP, or DSpark init mode.
+2. Parse and validate the Main configuration and the selected Spec configuration.
 3. Count Main GQA/GDN layers and Dense/MoE scratch requirements.
-4. Construct Main GQA/GDN state domains and optional MTP GQA state before models that clone their handles.
+4. Construct Main state domains and the selected Spec state domain.
 5. Construct the model-local layer scratch, component scratch, and token `Embed`.
 6. Move each exact binding subtree to its semantic owner. Each owner reads and validates its own real weights.
-7. Construct Main, optional DSpark context and Spec stages, optional MTP stages, sampling owners, and `PageArena`.
-8. Wrap every cached stage in `Replay<T>`.
+7. Construct Main and the selected Spec stages.
+8. Aggregate all selected Spec resources into one enum variant.
+9. Construct `PageArena` and wrap each cached stage in `Replay<T>`.
 
-Qwen3 follows the same ownership order with an optional DSpark graph.
+Qwen3 follows the same ownership order with separate Vanilla and DSpark graphs.
 It parses its flat configuration and resolves its Main binding tree.
-When configured, it parses the DSpark configuration and resolves its independent binding tree.
+When configured, it parses the DSpark configuration and passes it to the shared DSpark loader.
 It constructs one QKV GQA state domain and dense scratch.
 It constructs a second ungated GQA state domain and `DSparkBlockScratch` when DSpark is enabled.
-It loads Main, Main output, optional DSpark context and Spec components, and sampling.
-It then wraps each cached stage in `Replay<T>`.
+It loads Main and Main output for both modes.
+The DSpark mode also loads the shared DSpark execution owner and rejection resources.
+
+Qwen3.5 loads Vanilla, its MTP graph, or the reusable Qwen3x DSpark graph.
+The loader cannot receive or construct both speculators.
+For DSpark, the loader validates Main hidden width, layer count, vocabulary, position limit, and RoPE values.
+It permits the DSpark query projection width to differ from the Main hidden width.
+The shared loader requires `block_size + 1 <= max_tokens_per_request` for both Main versions.
+It adds DSpark context K/V pages to the Main cache lane and retains the Main GDN state domain.
 
 Qwen3 has one runtime cache lane and allocates no GDN state domain.
 The executor splits each runtime block between Main K/V and persistent DSpark context K/V.
@@ -367,8 +418,8 @@ The object-safe capture contract returns only this descriptor.
 It never receives a recorder.
 Both Main record methods remain generic over `Recorder<Operator = ReplayOp>`.
 
-The Qwen3 loader supplies no capture owner when DSpark is disabled.
-When DSpark is enabled, `Qwen3xDSparkMainFeatureProjector` owns the capture destinations.
+The Qwen3 and Qwen3.5 loaders supply no capture owner when DSpark is disabled.
+When DSpark is enabled for Qwen3 or Qwen3.5, `Qwen3xDSparkMainFeatureProjector` owns the capture destinations.
 `Qwen3xDSparkContext` records Main-feature projection and context append after Main.
 Main does not depend on a concrete DSpark type.
 
@@ -388,7 +439,7 @@ The executor does not store a separate submitted-state flag.
 
 `embed_main` materializes MainEmbed.
 `forward_main` materializes Main.
-For Qwen3 DSpark, it also materializes `Qwen3xDSparkContext`.
+For Qwen3 or Qwen3.5 DSpark, it also materializes `Qwen3xDSparkContext`.
 It registers the pending model transaction.
 It does not submit backend work.
 
@@ -406,6 +457,8 @@ For a batch with no sampled rows, the sequence is:
 MainEmbed -> Main
 ```
 
+When DSpark is enabled, the same sequence appends `DSparkContext` after Main.
+
 For ordinary sampling, the sequence is:
 
 ```text
@@ -414,10 +467,16 @@ MainEmbed -> Main -> GatherUnembed -> Sampling
 
 When a speculator is enabled, `sample_main` materializes RejectionSampling for both initial and speculative input.
 RejectionSampling supports a ragged `0..N` speculative-token count per request.
-`submit_main` submits this sequence:
+For MTP, `submit_main` submits this sequence:
 
 ```text
 MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+```
+
+For DSpark, it submits this sequence:
+
+```text
+MainEmbed -> Main -> DSparkContext -> GatherUnembed -> RejectionSampling
 ```
 
 The service waits for the Main submission.
@@ -426,16 +485,16 @@ It then calls `read_main`.
 
 The service calls `run_spec` after `read_main`.
 Qwen3 requires a configured DSpark model and at least one Main decode result.
-Qwen3.5 uses its configured MTP capability.
+Qwen3.5 uses its configured MTP or DSpark capability.
 Qwen3.5 also records MTP during prefill because MTP owns a persistent KV lane.
-Qwen3 records DSpark context in the Main submission.
-It records DSpark Spec only after Main returns a sampled anchor.
+Qwen3 and Qwen3.5 record DSpark context in the Main submission.
+They record DSpark Spec only after Main returns a sampled anchor.
 The lifecycle does not use a per-batch submitted-state flag.
 When the gate is true, the service calls `embed_spec`.
 `embed_spec` consumes the completed Main output and sampled results.
 
-For Qwen3.5, these hooks materialize MTPEmbed, MTP, GatherUnembed, and DraftSampling.
-For Qwen3, they materialize DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
+For MTP, these hooks materialize MTPEmbed, MTP, GatherUnembed, and DraftSampling.
+For DSpark, they materialize DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
 These hooks do not submit backend work or read backend output.
 
 `submit_spec` submits one model-specific Spec sequence.
@@ -445,7 +504,7 @@ The Qwen3.5 MTP sequence is:
 MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
 ```
 
-The Qwen3 DSpark sequence is:
+The Qwen3x DSpark sequence is:
 
 ```text
 DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
@@ -495,7 +554,7 @@ Main GQA prepare_pages
 Main GQA prepare_metadata
 Main GDN prepare_states(req_slots, block_indices, token_indices, cu_tokens, state_txns, state_page_ids_by_req)
 Main GDN prepare_metadata(cu_tokens, prepared_states)
-optional MTP GQA prepare_pages
+MTP-mode GQA prepare_pages
 optional GDN restore + wait
 ```
 
@@ -513,7 +572,7 @@ Runtime core can receive the response while publish continues.
 The next prepare or reset waits before it reuses shared page-I/O or live-state resources.
 
 Whole-request reset enters through `Qwen35Executor::reset_req_slots`.
-It fans out to sampling, Main GQA, optional MTP GQA, debug speculative-probability metadata, and Main GDN.
+It fans out to sampling, Main GQA, the selected Spec owner, and Main GDN.
 Inner state tables do not infer reset from token indices.
 A state version ahead of its token index is a lifecycle invariant violation and panics.
 
@@ -548,17 +607,18 @@ Main batch submission:
 
 ## Supported DSpark
 
-The Qwen3 executor supports one optional fixed-block DSpark checkpoint.
-The Qwen3.5 executor does not use DSpark.
+DSpark support is experimental.
+The Qwen3 and Qwen3.5 DSpark modes support one fixed-block DSpark checkpoint.
+Qwen3.5 MTP and DSpark are mutually exclusive.
 
-Qwen3 records persistent context updates in the Main submission:
+Each DSpark-enabled executor records persistent context updates in the Main submission:
 
 ```text
 MainEmbed -> Main -> DSparkContext -> GatherUnembed -> RejectionSampling
 ```
 
 The CPU reads the Main result before it constructs the anchor block.
-Qwen3 then records one Spec submission:
+The executor then records one Spec submission:
 
 ```text
 DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
@@ -572,6 +632,10 @@ Main verification distributions use compact active-row identity because they exi
 Main K/V and persistent DSpark context K/V share one runtime cache-block lifecycle.
 The executor owns separate page tables and splits each runtime page span.
 Proposal-local Q/K/V and attention partials remain in executor-owned `DSparkBlockScratch`.
+
+Qwen3.5 GDN keeps one current state and `block_size + 1` candidate states for each request slot.
+The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, and DSpark.
+These state buffers remain allocated, reusable, and resident with the cached replay resources.
 
 [`dspark_design.md`](dspark_design.md) documents the complete current component contract.
 
@@ -589,7 +653,7 @@ Unit tests cover:
 - DSpark configuration, bindings, attention, Markov sampling, and page splitting.
 
 End-to-end tests exercise Qwen3 Main-only and Qwen3 DSpark through server/decode.
-They also exercise Qwen3.5 Main and optional MTP.
+They also exercise Qwen3.5 Vanilla, MTP, and DSpark modes.
 The tests inspect generated text.
 Performance evidence follows [`executor_benchmarks.md`](executor_benchmarks.md).
 Collect that evidence serially.

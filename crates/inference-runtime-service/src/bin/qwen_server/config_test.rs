@@ -1,9 +1,10 @@
 use clap::Parser;
 use inference_runtime_core::Error;
 
-use super::QWEN3_MAX_RUNNING_REQUESTS;
 use super::Qwen3Config;
+use super::Qwen3ModelMode;
 use super::Qwen35Config;
+use super::Qwen35ModelMode;
 use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::args::Qwen35Args;
 
@@ -35,6 +36,33 @@ fn test_scheduler_overrides() {
     assert_eq!(scheduler.max_requests, 8);
     assert_eq!(scheduler.max_tokens, 256);
     assert_eq!(scheduler.max_tokens_per_request, 32);
+    assert_eq!(config.max_queued_requests(), 32);
+    assert_eq!(config.max_running_requests(), 8);
+}
+
+#[test]
+fn test_qwen35_request_slots_follow_max_requests_for_all_spec_modes() {
+    let main = Qwen35Config::from_args(parse_qwen35(&["--max-requests", "3"])).unwrap();
+    let mtp = Qwen35Config::from_args(parse_qwen35(&[
+        "--hf-mtp-model-dir",
+        "mtp-model",
+        "--max-requests",
+        "3",
+    ]))
+    .unwrap();
+    let dspark = Qwen35Config::from_args(parse_qwen35(&[
+        "--hf-dspark-model-dir",
+        "dspark-model",
+        "--max-requests",
+        "3",
+    ]))
+    .unwrap();
+
+    for config in [&main, &mtp, &dspark] {
+        assert_eq!(config.scheduler_config().max_requests, 3);
+        assert_eq!(config.max_queued_requests(), 32);
+        assert_eq!(config.max_running_requests(), 3);
+    }
 }
 
 #[test]
@@ -55,13 +83,40 @@ fn test_listener_overrides() {
 fn test_mtp_defaults_from_checkpoint_presence() {
     let main_only = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
     assert_eq!(main_only.num_mtp_modules(), 0);
+    assert_eq!(main_only.model_mode(), &Qwen35ModelMode::Vanilla);
 
     let mtp = Qwen35Config::from_args(parse_qwen35(&["--hf-mtp-model-dir", "mtp-model"])).unwrap();
     assert_eq!(mtp.num_mtp_modules(), 1);
+    assert_eq!(
+        mtp.model_mode(),
+        &Qwen35ModelMode::Mtp {
+            model_dir: "mtp-model".into()
+        }
+    );
 
     let disabled =
         Qwen35Config::from_args(parse_qwen35(&["--hf-mtp-model-dir", "mtp-model", "--mtp-module", "0"])).unwrap();
     assert_eq!(disabled.num_mtp_modules(), 0);
+    assert_eq!(disabled.model_mode(), &Qwen35ModelMode::Vanilla);
+}
+
+#[test]
+fn test_dspark_inputs_normalize_to_one_model_mode() {
+    let qwen3 = Qwen3Config::from_args(parse_qwen3(&["--hf-dspark-model-dir", "qwen3-dspark"])).unwrap();
+    assert_eq!(
+        qwen3.model_mode(),
+        &Qwen3ModelMode::DSpark {
+            model_dir: "qwen3-dspark".into()
+        }
+    );
+
+    let qwen35 = Qwen35Config::from_args(parse_qwen35(&["--hf-dspark-model-dir", "qwen35-dspark"])).unwrap();
+    assert_eq!(
+        qwen35.model_mode(),
+        &Qwen35ModelMode::DSpark {
+            model_dir: "qwen35-dspark".into()
+        }
+    );
 }
 
 #[test]
@@ -73,6 +128,28 @@ fn test_mtp_validation() {
     assert!(matches!(
         Qwen35Config::from_args(parse_qwen35(&["--mtp-module", "2"])),
         Err(Error::InvalidArgument(message)) if message.contains("must be 0 or 1")
+    ));
+}
+
+#[test]
+fn test_qwen35_dspark_and_mtp_are_mutually_exclusive() {
+    assert!(matches!(
+        Qwen35Config::from_args(parse_qwen35(&[
+            "--hf-mtp-model-dir",
+            "mtp-model",
+            "--hf-dspark-model-dir",
+            "dspark-model",
+        ])),
+        Err(Error::InvalidArgument(message)) if message.contains("mutually exclusive")
+    ));
+    assert!(matches!(
+        Qwen35Config::from_args(parse_qwen35(&[
+            "--hf-dspark-model-dir",
+            "dspark-model",
+            "--mtp-module",
+            "1",
+        ])),
+        Err(Error::InvalidArgument(message)) if message.contains("mutually exclusive")
     ));
 }
 
@@ -101,21 +178,22 @@ fn test_qwen3_scheduler_and_listener_overrides() {
     assert_eq!(scheduler.max_requests, 8);
     assert_eq!(scheduler.max_tokens, 256);
     assert_eq!(scheduler.max_tokens_per_request, 32);
+    assert_eq!(config.max_queued_requests(), 32);
+    assert_eq!(config.max_running_requests(), 8);
 }
 
 #[test]
-fn test_qwen3_default_cache_pages() {
-    assert_eq!(
-        Qwen3Config::from_args(parse_qwen3(&[])).unwrap().num_cache_pages(),
-        384 * 1024
-    );
+fn test_qwen3_request_slots_follow_max_requests_without_a_hidden_limit() {
+    let config = Qwen3Config::from_args(parse_qwen3(&["--max-requests", "9"])).unwrap();
+
+    assert_eq!(config.scheduler_config().max_requests, 9);
+    assert_eq!(config.max_running_requests(), 9);
 }
 
 #[test]
-fn test_qwen3_scheduler_cannot_exceed_executor_slots() {
-    let requested_slots = (QWEN3_MAX_RUNNING_REQUESTS + 1).to_string();
-    assert!(matches!(
-        Qwen3Config::from_args(parse_qwen3(&["--max-requests", &requested_slots])),
-        Err(Error::InvalidArgument(message)) if message.contains("exceeds the Qwen3 runtime capacity")
-    ));
+fn test_qwen35_request_slots_follow_max_requests_without_a_hidden_limit() {
+    let config = Qwen35Config::from_args(parse_qwen35(&["--max-requests", "9"])).unwrap();
+
+    assert_eq!(config.scheduler_config().max_requests, 9);
+    assert_eq!(config.max_running_requests(), 9);
 }

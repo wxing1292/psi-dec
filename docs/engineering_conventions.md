@@ -253,6 +253,14 @@ Replay keys contain only facts that change these items:
 - Scratch extent
 - A necessary algorithm choice
 
+When one replay stage is the only consumer of a component, `Replay<T>` must be its single owner and access path.
+Use `Replay::component()` for prepare, replay-argument, and read operations that belong to that stage.
+Do not keep a sibling `Rc<T>` only to bypass the replay owner.
+
+A separate shared handle is valid only when multiple independent stages or semantic owners consume the same resource.
+Examples include one sampler shared by Main, MTP, and rejection, or one GDN state table shared by layers, restore, and
+publish.
+
 Put request slots and dynamic values in batch metadata or submission arguments. Dynamic values include these examples:
 
 - Valid counts

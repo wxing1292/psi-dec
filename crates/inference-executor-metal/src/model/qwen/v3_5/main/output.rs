@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::backend::recorder::Recorder;
@@ -18,7 +20,7 @@ use crate::replay::ReplayComponent;
 
 pub struct Qwen35GatherUnembed {
     gather: Gather,
-    unembed: Unembed,
+    unembed: Rc<Unembed>,
 }
 
 #[derive(Clone, Copy)]
@@ -37,11 +39,19 @@ impl Qwen35GatherUnembed {
         config: UnembedConfig,
         bindings: QuantizedTensorBindings,
     ) -> Result<Self, ModelExecutorError> {
-        let unembed = Unembed::load(device, store, config, bindings)?;
-        Ok(Self {
-            gather: Gather::new(device, config.hidden_dim),
+        let unembed = Rc::new(Unembed::load(device, store, config, bindings)?);
+        Ok(Self::new(device, config.hidden_dim, unembed))
+    }
+
+    pub fn new(device: &Device, hidden_dim: u32, unembed: Rc<Unembed>) -> Self {
+        Self {
+            gather: Gather::new(device, hidden_dim),
             unembed,
-        })
+        }
+    }
+
+    pub fn unembed(&self) -> Rc<Unembed> {
+        Rc::clone(&self.unembed)
     }
 
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen35GatherUnembedArgs<'a>) -> &'a Buffer

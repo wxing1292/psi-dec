@@ -15,6 +15,9 @@ use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MTPWeightBindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_model_weight_bindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_mtp_weight_bindings;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_core::sampling::HFGenerationConfig;
 use inference_executor_core::sampling::MAX_TOP_K;
 use inference_executor_core::sampling::RequestSamplingState;
@@ -26,8 +29,13 @@ use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
+use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
+use crate::model::qwen::v3_5::executor::Qwen35DSparkSpeculator;
 use crate::model::qwen::v3_5::executor::Qwen35Executor;
+use crate::model::qwen::v3_5::executor::Qwen35MTPSpeculator;
+use crate::model::qwen::v3_5::executor::Qwen35SpeculativeResources;
+use crate::model::qwen::v3_5::executor::Qwen35Speculator;
 use crate::model::qwen::v3_5::executor::num_page_ids_per_block;
 use crate::model::qwen::v3_5::main::Qwen35Main;
 use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbed;
@@ -43,6 +51,10 @@ use crate::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
 use crate::model::qwen::v3_5::plan::qwen35_layer_counts;
 use crate::model::qwen::v3_5::plan::qwen35_moe_core_and_metal;
 use crate::model::qwen::v3_5::plan::validate_qwen35_mtp_config;
+use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
+use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
+use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
+use crate::model::qwen::v3_x::dspark::load::load_qwen3x_dspark;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::unembedding::UnembedConfig;
@@ -63,7 +75,6 @@ pub struct Qwen35ExecutorConfig {
     pub max_tokens_per_request: usize,
     pub num_cache_pages: usize,
     pub num_tokens_per_block: usize,
-    pub num_mtp_modules: usize,
 }
 
 impl Qwen35ExecutorConfig {
@@ -76,16 +87,6 @@ impl Qwen35ExecutorConfig {
         assert!(
             self.max_tokens_per_request > 0,
             "qwen3.5 replay executor requires max_tokens_per_request > 0"
-        );
-        let min_mtp_forward_tokens = self
-            .num_mtp_modules
-            .checked_add(1)
-            .expect("qwen3.5 MTP forward token count overflow");
-        assert!(
-            min_mtp_forward_tokens <= self.max_tokens_per_request,
-            "qwen3.5 MTP forward tokens={} exceed scheduler max_tokens_per_request={}",
-            min_mtp_forward_tokens,
-            self.max_tokens_per_request
         );
         assert!(
             self.num_cache_pages > 0,
@@ -111,7 +112,6 @@ impl Qwen35ExecutorConfig {
             u32::try_from(self.num_tokens_per_block).is_ok(),
             "qwen3.5 num_tokens_per_block must fit the u32 cache-block domain"
         );
-        assert!(self.num_mtp_modules <= 1, "qwen3.5 supports zero or one MTP module");
         assert!(
             u32::try_from(self.num_cache_pages - 1).is_ok(),
             "qwen3.5 cache page IDs must fit u32"
@@ -222,33 +222,109 @@ impl Qwen35ModelLayout {
     }
 }
 
+enum Qwen35InitMode<'a> {
+    Vanilla,
+    Mtp {
+        model_dir: &'a Path,
+        config: Box<Qwen35ModelConfig>,
+    },
+    DSpark {
+        model_dir: &'a Path,
+        config: Box<Qwen3xDSparkConfig>,
+    },
+}
+
+struct Qwen35MtpLoad {
+    config: Qwen35ModelConfig,
+    store: SafeTensorStore,
+    bindings: Qwen35MTPWeightBindings,
+    gqa_state: Qwen3xGQAState,
+}
+
+enum Qwen35SpecSource<'a> {
+    Vanilla,
+    Mtp(Box<Qwen35MtpLoad>),
+    DSpark {
+        model_dir: &'a Path,
+        config: Box<Qwen3xDSparkConfig>,
+    },
+}
+
+enum Qwen35SpecLoad {
+    Vanilla,
+    Mtp(Box<Qwen35MtpLoad>),
+    DSpark(Box<Qwen3xDSparkLoaded>),
+}
+
 pub fn init_qwen_3_5_model(
     model_dir: impl AsRef<Path>,
     config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
-    init_qwen_3_5_model_inner(model_dir.as_ref(), None, config)
+    init_qwen_3_5_model_inner(model_dir.as_ref(), Qwen35InitMode::Vanilla, config)
 }
 
-pub fn init_qwen_3_5_model_with_hf_mtp(
+pub fn init_qwen_3_5_model_with_mtp(
     model_dir: impl AsRef<Path>,
     mtp_model_dir: impl AsRef<Path>,
     config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
-    init_qwen_3_5_model_inner(model_dir.as_ref(), Some(mtp_model_dir.as_ref()), config)
+    let mtp_model_dir = mtp_model_dir.as_ref();
+    let mtp_config = init_qwen35_model_config(mtp_model_dir)?;
+    init_qwen_3_5_model_inner(
+        model_dir.as_ref(),
+        Qwen35InitMode::Mtp {
+            model_dir: mtp_model_dir,
+            config: Box::new(mtp_config),
+        },
+        config,
+    )
+}
+
+pub fn init_qwen_3_5_model_with_dspark(
+    model_dir: impl AsRef<Path>,
+    dspark_model_dir: impl AsRef<Path>,
+    config: Qwen35ExecutorConfig,
+) -> Result<Qwen35Executor, ModelExecutorError> {
+    let dspark_model_dir = dspark_model_dir.as_ref();
+    let dspark_config = init_qwen3x_dspark_config(dspark_model_dir)?;
+    init_qwen_3_5_model_inner(
+        model_dir.as_ref(),
+        Qwen35InitMode::DSpark {
+            model_dir: dspark_model_dir,
+            config: Box::new(dspark_config),
+        },
+        config,
+    )
 }
 
 fn init_qwen_3_5_model_inner(
     model_dir: &Path,
-    mtp_model_dir: Option<&Path>,
+    init_mode: Qwen35InitMode<'_>,
     config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
     config.validate();
-    let model_config = init_qwen35_model_config(model_dir)?;
-    if config.num_mtp_modules > 0 {
+    if matches!(&init_mode, Qwen35InitMode::Mtp { .. }) {
         assert!(
-            mtp_model_dir.is_some(),
-            "qwen3.5 replay model requires hf_mtp_model_dir when num_mtp_modules > 0"
+            config.max_tokens_per_request >= 2,
+            "qwen3.5 MTP requires max_tokens_per_request >= 2"
         );
+    }
+    let model_config = init_qwen35_model_config(model_dir)?;
+    match &init_mode {
+        Qwen35InitMode::Vanilla => {},
+        Qwen35InitMode::Mtp { config: mtp_config, .. } => validate_qwen35_mtp_config(&model_config, mtp_config)?,
+        Qwen35InitMode::DSpark {
+            config: dspark_config, ..
+        } => {
+            let text = &model_config.text_config;
+            dspark_config.validate_main(Qwen3xDSparkMainConfig {
+                hidden_size: text.hidden_size,
+                num_hidden_layers: text.num_hidden_layers,
+                vocab_size: text.vocab_size,
+                max_position_embeddings: text.max_position_embeddings,
+                rope_theta: text.rope_theta,
+            })?;
+        },
     }
     let generation_config = HFGenerationConfig::load(model_dir)?;
     let sampler_config = generation_config.sampler();
@@ -318,49 +394,6 @@ fn init_qwen_3_5_model_inner(
             .expect("qwen3.5 GQA pages per block must fit u32"),
     };
     let gqa_page_table_layout = main_gqa_page_table_layout;
-    let mut mtp_load = if config.num_mtp_modules == 1 {
-        let mtp_model_dir = mtp_model_dir.expect("qwen3.5 replay model checked MTP model dir");
-        let mtp_model_config = init_qwen35_model_config(mtp_model_dir)?;
-        validate_qwen35_mtp_config(&model_config, &mtp_model_config)?;
-        let mtp_store = SafeTensorStore::from_model_dir(mtp_model_dir)?;
-        let mtp_weight_bindings =
-            resolve_qwen35_mtp_weight_bindings(&mtp_model_config, 1, mtp_store.index().tensor_names())?;
-        Some((mtp_model_config, mtp_store, mtp_weight_bindings))
-    } else {
-        None
-    };
-    let mtp_gqa_geometry = mtp_load
-        .as_ref()
-        .map(|(mtp_config, ..)| {
-            qwen35_gqa_core_and_metal(
-                model_config.text_config.num_hidden_layers,
-                &mtp_config.text_config,
-                Qwen35MetalDefaults::from_quantization(mtp_config.quantization.as_ref())?,
-            )
-        })
-        .transpose()?;
-    let mtp_gqa_page_table_layout = mtp_gqa_geometry.as_ref().map(|(core, metal)| {
-        GQAPageTableLayout {
-            num_req_slots: config
-                .max_requests
-                .try_into()
-                .expect("qwen3.5 max requests must fit u32"),
-            num_blocks: model_config
-                .text_config
-                .max_position_embeddings
-                .div_ceil(config.num_tokens_per_block)
-                .max(1)
-                .try_into()
-                .expect("qwen3.5 MTP GQA block capacity must fit u32"),
-            num_gqa_layers: 1,
-            num_page_ids_per_block: num_page_ids_per_block(
-                config.num_tokens_per_block,
-                metal.num_tokens_per_page(core) as usize,
-            )
-            .try_into()
-            .expect("qwen3.5 MTP GQA pages per block must fit u32"),
-        }
-    });
     let main_gqa_state = Qwen3xGQAState::load(
         &device,
         main_gqa_core,
@@ -370,19 +403,66 @@ fn init_qwen_3_5_model_inner(
         config.num_cache_pages,
         0,
     );
-    let mtp_gqa_state = mtp_gqa_geometry
-        .zip(mtp_gqa_page_table_layout)
-        .map(|((core, metal), page_table_layout)| {
-            Qwen3xGQAState::load(
+    let spec_source = match init_mode {
+        Qwen35InitMode::Vanilla => Qwen35SpecSource::Vanilla,
+        Qwen35InitMode::Mtp {
+            model_dir: mtp_model_dir,
+            config: mtp_model_config,
+        } => {
+            let mtp_store = SafeTensorStore::from_model_dir(mtp_model_dir)?;
+            let mtp_weight_bindings =
+                resolve_qwen35_mtp_weight_bindings(&mtp_model_config, 1, mtp_store.index().tensor_names())?;
+            let (mtp_gqa_core, mtp_gqa_metal) = qwen35_gqa_core_and_metal(
+                model_config.text_config.num_hidden_layers,
+                &mtp_model_config.text_config,
+                Qwen35MetalDefaults::from_quantization(mtp_model_config.quantization.as_ref())?,
+            )?;
+            let mtp_gqa_page_table_layout = GQAPageTableLayout {
+                num_req_slots: config
+                    .max_requests
+                    .try_into()
+                    .expect("qwen3.5 max requests must fit u32"),
+                num_blocks: model_config
+                    .text_config
+                    .max_position_embeddings
+                    .div_ceil(config.num_tokens_per_block)
+                    .max(1)
+                    .try_into()
+                    .expect("qwen3.5 MTP GQA block capacity must fit u32"),
+                num_gqa_layers: 1,
+                num_page_ids_per_block: num_page_ids_per_block(
+                    config.num_tokens_per_block,
+                    mtp_gqa_metal.num_tokens_per_page(&mtp_gqa_core) as usize,
+                )
+                .try_into()
+                .expect("qwen3.5 MTP GQA pages per block must fit u32"),
+            };
+            let mtp_gqa_state = Qwen3xGQAState::load(
                 &device,
-                core,
-                metal,
-                page_table_layout,
+                mtp_gqa_core,
+                mtp_gqa_metal,
+                mtp_gqa_page_table_layout,
                 config.max_tokens,
                 config.num_cache_pages,
                 1,
-            )
-        });
+            );
+            Qwen35SpecSource::Mtp(Box::new(Qwen35MtpLoad {
+                config: *mtp_model_config,
+                store: mtp_store,
+                bindings: mtp_weight_bindings,
+                gqa_state: mtp_gqa_state,
+            }))
+        },
+        Qwen35InitMode::DSpark {
+            model_dir: dspark_model_dir,
+            config: dspark_config,
+        } => {
+            Qwen35SpecSource::DSpark {
+                model_dir: dspark_model_dir,
+                config: dspark_config,
+            }
+        },
+    };
     let gdn_layers = (0..model_config.text_config.num_hidden_layers)
         .filter(|&index| {
             model_config
@@ -395,7 +475,11 @@ fn init_qwen_3_5_model_inner(
         .map(|&index| qwen35_gdn_core_and_metal(index, &model_config.text_config, metal_defaults).map(|pair| pair.0))
         .collect::<Result<Vec<_>, _>>()?;
     let (_, gdn_metal) = qwen35_gdn_core_and_metal(gdn_layers[0], &model_config.text_config, metal_defaults)?;
-    let max_spec_tokens = config.num_mtp_modules;
+    let max_spec_tokens = match &spec_source {
+        Qwen35SpecSource::Vanilla => 0,
+        Qwen35SpecSource::Mtp(_) => 1,
+        Qwen35SpecSource::DSpark { config, .. } => config.block_size,
+    };
     let main_gdn_state = Qwen3xGDNState::load(
         &device,
         &gdn_cores,
@@ -412,15 +496,18 @@ fn init_qwen_3_5_model_inner(
         config.max_tokens,
         layout.hidden_dim as usize,
     ));
-    let dense_mlp_scratch = if layer_counts.has_dense_mlp
-        || mtp_load
-            .as_ref()
-            .is_some_and(|(mtp_config, ..)| !mtp_config.layer_uses_moe(0))
-    {
+    let mtp_uses_dense = matches!(
+        &spec_source,
+        Qwen35SpecSource::Mtp(mtp) if !mtp.config.layer_uses_moe(0)
+    );
+    let dense_mlp_scratch = if layer_counts.has_dense_mlp || mtp_uses_dense {
         let source = (0..model_config.text_config.num_hidden_layers)
             .find(|&index| !model_config.layer_uses_moe(index))
             .map(|index| (&model_config, index))
-            .or_else(|| mtp_load.as_ref().map(|(mtp_config, ..)| (mtp_config, 0)))
+            .or(match &spec_source {
+                Qwen35SpecSource::Mtp(mtp) => Some((&mtp.config, 0)),
+                Qwen35SpecSource::Vanilla | Qwen35SpecSource::DSpark { .. } => None,
+            })
             .expect("qwen3.5 dense scratch requires a dense layer");
         let defaults = Qwen35MetalDefaults::from_quantization(source.0.quantization.as_ref())?;
         let (core, metal) = qwen35_dense_mlp_core_and_metal(source.1, &source.0.text_config, defaults)?;
@@ -433,15 +520,18 @@ fn init_qwen_3_5_model_inner(
     } else {
         None
     };
-    let moe_scratch = if layer_counts.has_moe
-        || mtp_load
-            .as_ref()
-            .is_some_and(|(mtp_config, ..)| mtp_config.layer_uses_moe(0))
-    {
+    let mtp_uses_moe = matches!(
+        &spec_source,
+        Qwen35SpecSource::Mtp(mtp) if mtp.config.layer_uses_moe(0)
+    );
+    let moe_scratch = if layer_counts.has_moe || mtp_uses_moe {
         let source = (0..model_config.text_config.num_hidden_layers)
             .find(|&index| model_config.layer_uses_moe(index))
             .map(|index| (&model_config, index))
-            .or_else(|| mtp_load.as_ref().map(|(mtp_config, ..)| (mtp_config, 0)))
+            .or(match &spec_source {
+                Qwen35SpecSource::Mtp(mtp) => Some((&mtp.config, 0)),
+                Qwen35SpecSource::Vanilla | Qwen35SpecSource::DSpark { .. } => None,
+            })
             .expect("qwen3.5 MoE scratch requires an MoE layer");
         let defaults = Qwen35MetalDefaults::from_quantization(source.0.quantization.as_ref())?;
         let (core, metal) = qwen35_moe_core_and_metal(&format!("layers.{}", source.1), source.1, source.0, defaults)?;
@@ -467,10 +557,40 @@ fn init_qwen_3_5_model_inner(
     )?);
     let token_hidden_input = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
     let hidden_output = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
-    let mtp_hidden_input = mtp_load
-        .as_ref()
-        .map(|_| Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes())));
     let gather_unembed = Qwen35GatherUnembed::load(&device, &mut store, unembed_config, unembed_bindings)?;
+    let spec_load = match spec_source {
+        Qwen35SpecSource::Vanilla => Qwen35SpecLoad::Vanilla,
+        Qwen35SpecSource::Mtp(mtp) => Qwen35SpecLoad::Mtp(mtp),
+        Qwen35SpecSource::DSpark {
+            model_dir: dspark_model_dir,
+            config: dspark_config,
+        } => {
+            Qwen35SpecLoad::DSpark(Box::new(load_qwen3x_dspark(
+                &device,
+                dspark_model_dir,
+                &dspark_config,
+                Qwen3xDSparkLoadConfig {
+                    page_size_bytes: QWEN35_PAGE_SIZE_BYTES,
+                    max_position_embeddings: model_config.text_config.max_position_embeddings,
+                    max_requests: config.max_requests,
+                    max_tokens: config.max_tokens,
+                    max_tokens_per_request: config.max_tokens_per_request,
+                    num_cache_pages: config.num_cache_pages,
+                    num_tokens_per_block: config.num_tokens_per_block,
+                },
+                Rc::clone(&embed),
+                gather_unembed.unembed(),
+                sampler_bounds,
+            )?))
+        },
+    };
+    let residual_capture = match &spec_load {
+        Qwen35SpecLoad::Vanilla | Qwen35SpecLoad::Mtp(_) => None,
+        Qwen35SpecLoad::DSpark(loaded) => {
+            let capture: Rc<dyn MainResidualCapture> = loaded.model.main_feature_projector();
+            Some(capture)
+        },
+    };
     let main = Qwen35Main::load(
         &device,
         &mut store,
@@ -479,63 +599,113 @@ fn init_qwen_3_5_model_inner(
         main_bindings,
         &main_gqa_state,
         &main_gdn_state,
-        None,
+        residual_capture,
         std::rc::Rc::clone(&main_layer_scratch),
         dense_mlp_scratch.as_ref(),
         moe_scratch.as_ref(),
     )?;
-    let mtp = if let Some((mtp_model_config, mut mtp_store, mtp_bindings)) = mtp_load.take() {
-        let mtp_layer_scratch = std::rc::Rc::new(Qwen35MTPLayerScratch::new(
-            &device,
-            config.max_tokens,
-            layout.hidden_dim as usize,
-        ));
-        let Qwen35MTPWeightBindings {
-            embed: mtp_embed_bindings,
-            body,
-            final_norm_weight,
-        } = mtp_bindings;
-        let mtp_embed = Qwen35MTPEmbed::load(
-            &device,
-            &mut mtp_store,
-            &mtp_model_config,
-            mtp_embed_bindings,
-            Rc::clone(&embed),
-            config.max_tokens,
-        )?;
-        let mtp = Qwen35MTP::load(
-            &device,
-            &mut mtp_store,
-            &model_config,
-            &mtp_model_config,
-            Qwen35MetalDefaults::from_quantization(mtp_model_config.quantization.as_ref())?,
-            body,
-            final_norm_weight,
-            mtp_gqa_state
-                .as_ref()
-                .expect("qwen3.5 enabled MTP requires a distinct GQA state"),
-            mtp_layer_scratch,
-            dense_mlp_scratch.as_ref(),
-            moe_scratch.as_ref(),
-        )?;
-        Some((mtp_embed, mtp))
-    } else {
-        None
-    };
     drop(store);
-    let pages = PageArena::new(&device, config.num_cache_pages, QWEN35_PAGE_SIZE_BYTES);
-    let target_distribution_indices = Buffer::from_slice(&device, &(0..layout.max_tokens).collect::<Vec<_>>());
     let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));
-    let rejection_sampler = Rc::new(RejectionSampler::new(
-        &device,
-        max_spec_tokens,
-        config.max_requests,
-        sampler_bounds.top_k,
-    ));
-    let (mtp_embed, mtp) = match mtp {
-        Some((mtp_embed, mtp)) => (Some(mtp_embed), Some(mtp)),
-        None => (None, None),
+    let speculative_resources = || {
+        let rejection_sampler = Rc::new(RejectionSampler::new(
+            &device,
+            max_spec_tokens,
+            config.max_requests,
+            sampler_bounds.top_k,
+        ));
+        Qwen35SpeculativeResources {
+            rejection_sampling: Replay::new(
+                "qwen3.5 rejection sampling",
+                RejectionSampling::new(Rc::clone(&sampler), rejection_sampler),
+            ),
+            spec_probs: SpecProbsStore::new(
+                &device,
+                max_spec_tokens,
+                config.max_requests,
+                sampler_bounds.top_k as usize,
+            ),
+            target_distribution_indices: Buffer::from_slice(&device, &(0..layout.max_tokens).collect::<Vec<_>>()),
+        }
     };
+    let speculator = match spec_load {
+        Qwen35SpecLoad::Vanilla => Qwen35Speculator::Vanilla,
+        Qwen35SpecLoad::Mtp(mtp_load) => {
+            let Qwen35MtpLoad {
+                config: mtp_model_config,
+                mut store,
+                bindings: mtp_bindings,
+                gqa_state,
+            } = *mtp_load;
+            let mtp_layer_scratch = Rc::new(Qwen35MTPLayerScratch::new(
+                &device,
+                config.max_tokens,
+                layout.hidden_dim as usize,
+            ));
+            let Qwen35MTPWeightBindings {
+                embed: mtp_embed_bindings,
+                body,
+                final_norm_weight,
+            } = mtp_bindings;
+            let mtp_embed = Qwen35MTPEmbed::load(
+                &device,
+                &mut store,
+                &mtp_model_config,
+                mtp_embed_bindings,
+                Rc::clone(&embed),
+                config.max_tokens,
+            )?;
+            let mtp = Qwen35MTP::load(
+                &device,
+                &mut store,
+                &model_config,
+                &mtp_model_config,
+                Qwen35MetalDefaults::from_quantization(mtp_model_config.quantization.as_ref())?,
+                body,
+                final_norm_weight,
+                &gqa_state,
+                mtp_layer_scratch,
+                dense_mlp_scratch.as_ref(),
+                moe_scratch.as_ref(),
+            )?;
+            Qwen35Speculator::Mtp(Box::new(Qwen35MTPSpeculator {
+                common: speculative_resources(),
+                hidden_input: Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes())),
+                input_gather_flat_indices: Buffer::new_zeroed_elements(&device, config.max_tokens, Dtype::Uint32),
+                draft_distribution_indices: Buffer::new_zeroed_elements(&device, config.max_requests, Dtype::Uint32),
+                previous_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
+                embed: Replay::new("qwen3.5 MTPEmbed", mtp_embed),
+                body: Replay::new("qwen3.5 MTP", mtp),
+                sampling: Replay::new(
+                    "qwen3.5 draft sampling",
+                    DraftSampling {
+                        sampler: Rc::clone(&sampler),
+                    },
+                ),
+                gqa_state,
+            }))
+        },
+        Qwen35SpecLoad::DSpark(loaded) => {
+            Qwen35Speculator::DSpark(Box::new(Qwen35DSparkSpeculator {
+                common: speculative_resources(),
+                execution: Qwen3xDSparkExecution::new(&device, *loaded, config.max_requests, unembed_config),
+            }))
+        },
+    };
+    let num_main_page_ids_per_block = usize::try_from(gqa_page_table_layout.num_gqa_layers)
+        .expect("qwen3.5 Main GQA layer count must fit usize")
+        .checked_mul(
+            usize::try_from(gqa_page_table_layout.num_page_ids_per_block)
+                .expect("qwen3.5 Main GQA page count must fit usize"),
+        )
+        .expect("qwen3.5 Main page IDs per block must fit usize");
+    let num_dspark_page_ids_per_block = match &speculator {
+        Qwen35Speculator::Vanilla | Qwen35Speculator::Mtp(_) => 0,
+        Qwen35Speculator::DSpark(dspark) => dspark.execution.num_runtime_page_ids_per_block(),
+    };
+    let num_runtime_page_ids_per_main_block = num_main_page_ids_per_block
+        .checked_add(num_dspark_page_ids_per_block)
+        .expect("qwen3.5 runtime page IDs per Main block must fit usize");
+    let pages = PageArena::new(&device, config.num_cache_pages, QWEN35_PAGE_SIZE_BYTES);
     let model = Qwen35Executor {
         model_name: model_config.model_type,
         default_stop_sequences,
@@ -545,11 +715,6 @@ fn init_qwen_3_5_model_inner(
         token_ids: Buffer::new_zeroed(&device, layout.token_id_bytes()),
         token_hidden_input,
         hidden_output,
-        mtp_hidden_input,
-        mtp_input_gather_flat_indices: Buffer::new_zeroed_elements(&device, config.max_tokens, Dtype::Uint32),
-        draft_distribution_indices: Buffer::new_zeroed_elements(&device, config.max_requests, Dtype::Uint32),
-        target_distribution_indices,
-        mtp_previous_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
         gather_flat_indices: Buffer::new_zeroed_elements(&device, config.max_tokens, Dtype::Uint32),
         unembed_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
         unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
@@ -562,34 +727,17 @@ fn init_qwen_3_5_model_inner(
                 sampler: Rc::clone(&sampler),
             },
         ),
-        mtp_embed: mtp_embed.map(|mtp_embed| Replay::new("qwen3.5 MTPEmbed", mtp_embed)),
-        mtp: mtp.map(|mtp| Replay::new("qwen3.5 MTP", mtp)),
-        mtp_sampling: Replay::new(
-            "qwen3.5 draft sampling",
-            DraftSampling {
-                sampler: Rc::clone(&sampler),
-            },
-        ),
-        rejection_sampling: Replay::new(
-            "qwen3.5 rejection sampling",
-            RejectionSampling::new(Rc::clone(&sampler), rejection_sampler),
-        ),
         sampler: Rc::clone(&sampler),
         sampler_bounds,
         sampler_output: TopKSamplingOutputBuffers::new(&device, sampler_bounds),
         request_sampling: RequestSamplingState::new(config.max_requests),
         main_gqa_state,
         main_gdn_state,
-        mtp_gqa_state,
-        spec_probs: SpecProbsStore::new(
-            &device,
-            max_spec_tokens,
-            config.max_requests,
-            sampler_bounds.top_k as usize,
-        ),
+        speculator,
         pages,
         pending_transactions: Qwen35PendingTransactions::new(),
         gqa_page_table_layout,
+        num_runtime_page_ids_per_main_block,
     };
     Ok(model)
 }

@@ -140,7 +140,7 @@ Main and MTP share one `Rc<TopKSampling>` implementation.
 `DSparkMarkovSampling` owns model-neutral Markov runtime parameters, tile candidates, and per-step outputs.
 It accepts borrowed weights at record time.
 `Qwen3xDSparkMarkov` owns Qwen checkpoint buffers and delegates execution to this backend owner.
-It loads one bounded `TensorMap` for W1, W2, and the optional confidence head.
+It loads one bounded `TensorMap` for W1, W2, and the required Markov-conditioned confidence head.
 It removes all tensors and requires the map to be empty before initialization completes.
 It reuses the generic sample-and-write-distribution reducer.
 The stages retain separate replay keys and programs.
@@ -178,7 +178,9 @@ It does not materialize full-vocabulary Markov bias or corrected-logit buffers.
 
 `SampledTokens::Decode` carries `spec_tokens`, `spec_probs`, and `spec_confidences`.
 These vectors always have the same length.
-MTP and a DSpark checkpoint without a confidence head use `1.0` for each speculative confidence.
+MTP uses `1.0` for each speculative confidence because MTP has no confidence head.
+Qwen3x DSpark requires and evaluates its confidence head.
+The Qwen3 and Qwen3.5 response adapters preserve DSpark confidence values across the executor/runtime boundary.
 The runtime does not apply a confidence threshold or proposal-length policy yet.
 
 The current fused map preserves the earlier BF16 storage boundaries.
@@ -323,4 +325,5 @@ cargo bench -p inference-backend-metal --bench rejection_sampling -- \
 Supported modes are `top-k-sample`, `top-k-write-distribution`, `top-k-sample-and-write-distribution`,
 `rejection-sparse`, and `dspark-markov-top-k-map`.
 The model-executor targets are `qwen35_sampling` and `qwen3_dspark_sampling`.
+Qwen3.5 DSpark reuses the Qwen3x Markov component benchmark and adds end-to-end service validation.
 [`executor_benchmarks.md`](executor_benchmarks.md) defines shared measurement and provenance rules.

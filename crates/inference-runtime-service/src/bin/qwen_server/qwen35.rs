@@ -7,7 +7,8 @@ use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35ExecutorConfig;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model;
-use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_hf_mtp;
+use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_dspark;
+use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_mtp;
 use inference_runtime_core::Result;
 use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
@@ -20,13 +21,12 @@ use inference_runtime_service::telemetry::CacheLaneLogSummary;
 use inference_runtime_service::telemetry::StartupLogger;
 
 use crate::qwen_server::args::Qwen35Args;
-use crate::qwen_server::config::QWEN35_MAX_RUNNING_REQUESTS;
 use crate::qwen_server::config::Qwen35Config;
+use crate::qwen_server::config::Qwen35ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
 use crate::qwen_server::sizing::kv_dtype_bytes;
 
 const TOKENS_PER_CACHE_BLOCK: usize = 2048;
-const MAX_QUEUED_REQUESTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelKind {
@@ -81,18 +81,19 @@ fn run(kind: ModelKind) -> Result<()> {
     startup.event("Qwen codec loaded");
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
+    let max_queued_requests = config.max_queued_requests();
+    let max_running_requests = config.max_running_requests();
 
     startup.event("initializing model executor");
     let model = build_model(
         kind,
         &config,
         Qwen35ExecutorConfig {
-            max_requests: QWEN35_MAX_RUNNING_REQUESTS,
+            max_requests: max_running_requests,
             max_tokens: scheduler_config.max_tokens,
             max_tokens_per_request: scheduler_config.max_tokens_per_request,
             num_cache_pages,
             num_tokens_per_block: TOKENS_PER_CACHE_BLOCK,
-            num_mtp_modules: config.num_mtp_modules(),
         },
     )?;
     startup.event("model executor initialized");
@@ -102,21 +103,22 @@ fn run(kind: ModelKind) -> Result<()> {
         component = kind.label(),
         detected_mtp_modules = model_config.text_config.mtp_num_hidden_layers,
         num_mtp_modules = config.num_mtp_modules(),
+        model_mode = ?config.model_mode(),
         num_cache_pages,
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
-        max_queued_requests = MAX_QUEUED_REQUESTS,
-        max_running_requests = QWEN35_MAX_RUNNING_REQUESTS,
+        max_queued_requests,
+        max_running_requests,
         max_batch_requests = scheduler_config.max_requests,
         max_tokens = scheduler_config.max_tokens,
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
-        "qwen3.5 MTP/cache configuration"
+        "qwen3.5 Spec/cache configuration"
     );
 
-    let runtime_config = build_runtime_config(&startup, &model_config, num_cache_pages, &model)?;
+    let runtime_config = build_runtime_config(&startup, &config, &model_config, &model)?;
 
     startup.event("initializing runtime");
-    match config.num_mtp_modules() {
-        0 => {
+    match config.model_mode() {
+        Qwen35ModelMode::Vanilla | Qwen35ModelMode::DSpark { .. } => {
             serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 1, _>(
                 config.grpc_listen_addr(),
                 config.http_listen_addr(),
@@ -127,7 +129,7 @@ fn run(kind: ModelKind) -> Result<()> {
                 telemetry.debug_logging,
             )
         },
-        1 => {
+        Qwen35ModelMode::Mtp { .. } => {
             serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 2, _>(
                 config.grpc_listen_addr(),
                 config.http_listen_addr(),
@@ -138,7 +140,6 @@ fn run(kind: ModelKind) -> Result<()> {
                 telemetry.debug_logging,
             )
         },
-        _ => unreachable!("validated Qwen config supports at most one MTP module"),
     }
 }
 
@@ -191,35 +192,32 @@ fn build_model(
     executor_config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor> {
     let hf_model_dir = config.hf_model_dir();
-    let hf_mtp_model_dir = config.hf_mtp_model_dir();
-    let init_result = match config.num_mtp_modules() {
-        0 => init_qwen_3_5_model(hf_model_dir, executor_config),
-        1 => {
-            init_qwen_3_5_model_with_hf_mtp(
-                hf_model_dir,
-                hf_mtp_model_dir.expect("validated Qwen MTP model directory"),
-                executor_config,
-            )
+    let init_result = match config.model_mode() {
+        Qwen35ModelMode::Vanilla => init_qwen_3_5_model(hf_model_dir, executor_config),
+        Qwen35ModelMode::Mtp { model_dir } => init_qwen_3_5_model_with_mtp(hf_model_dir, model_dir, executor_config),
+        Qwen35ModelMode::DSpark { model_dir } => {
+            init_qwen_3_5_model_with_dspark(hf_model_dir, model_dir, executor_config)
         },
-        _ => unreachable!("validated Qwen config supports at most one MTP module"),
     };
     init_result.map_err(|error| {
         log_err_unavailable!(
-            "unable to initialize {} model from {hf_model_dir:?} with hf_mtp_model_dir={hf_mtp_model_dir:?}: {error}",
-            kind.label()
+            "unable to initialize {} model from {hf_model_dir:?} in mode {:?}: {error}",
+            kind.label(),
+            config.model_mode(),
         )
     })
 }
 
 fn build_runtime_config(
     startup: &StartupLogger,
+    service_config: &Qwen35Config,
     model_config: &Qwen35ModelConfig,
-    num_cache_pages: usize,
     model: &Qwen35Executor,
 ) -> Result<RuntimeConfig> {
+    let num_cache_pages = service_config.num_cache_pages();
     let text = &model_config.text_config;
     let kv_dtype_bytes = kv_dtype_bytes(text.dtype.as_deref())?;
-    let num_gqa_pages_per_main_block = model.num_main_gqa_page_ids_per_block();
+    let num_gqa_pages_per_main_block = model.num_main_lane_gqa_page_ids_per_block();
     let num_gdn_pages_per_main_block = model.num_gdn_state_page_ids_per_block();
     let mtp_gqa_page_ids_per_block = model.num_mtp_gqa_page_ids_per_block();
     let block_cache_capacity = all_lane_block_cache_capacity(
@@ -241,8 +239,8 @@ fn build_runtime_config(
         });
     }
     let runtime_config = RuntimeConfig {
-        max_queued_requests: MAX_QUEUED_REQUESTS,
-        max_running_requests: QWEN35_MAX_RUNNING_REQUESTS,
+        max_queued_requests: service_config.max_queued_requests(),
+        max_running_requests: service_config.max_running_requests(),
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
         num_kv_heads: text.num_key_value_heads,
         kv_head_dim: text.head_dim,

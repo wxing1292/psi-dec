@@ -25,10 +25,18 @@ pub struct Qwen3Args {
     #[arg(long, value_enum, default_value_t = QwenLogLevel::Info)]
     pub logging: QwenLogLevel,
 
-    #[arg(long, help = "Total physical pages used by the Qwen3 GQA KV cache")]
-    pub num_cache_pages: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        default_value = "262144",
+        help = "Total shared cache pages used by GQA KV cache and GDN state cache"
+    )]
+    pub num_cache_pages: NonZeroUsize,
 
-    #[arg(long, default_value = "4", help = "Maximum requests scheduled per batch")]
+    #[arg(
+        long,
+        default_value = "4",
+        help = "Maximum running requests and requests scheduled per batch"
+    )]
     pub max_requests: NonZeroUsize,
 
     #[arg(long, default_value = "128", help = "Maximum flattened tokens scheduled per batch")]
@@ -53,8 +61,19 @@ pub struct Qwen35Args {
     #[arg(long, value_name = "DIR")]
     pub hf_model_dir: PathBuf,
 
-    #[arg(long, value_name = "DIR", help = "Optional Qwen3.5 HF MTP model directory")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Optional matching Qwen3.5/Qwen3.6 MTP checkpoint directory"
+    )]
     pub hf_mtp_model_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Optional matching Qwen3x DSpark checkpoint directory"
+    )]
+    pub hf_dspark_model_dir: Option<PathBuf>,
 
     #[arg(long, value_enum)]
     pub profile: Option<QwenProfileMode>,
@@ -64,14 +83,22 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        help = "Number of Qwen3.5 MTP modules to enable; defaults to 1 when --hf-mtp-model-dir is set, otherwise 0"
+        help = "Optional Qwen3.5 MTP module-count override; an MTP checkpoint enables 1 by default, otherwise 0"
     )]
     pub mtp_module: Option<usize>,
 
-    #[arg(long, help = "Total shared cache pages used by GQA KV cache and GDN state cache")]
-    pub num_cache_pages: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        default_value = "262144",
+        help = "Total shared cache pages used by GQA KV cache and GDN state cache"
+    )]
+    pub num_cache_pages: NonZeroUsize,
 
-    #[arg(long, default_value = "4", help = "Maximum requests scheduled per batch")]
+    #[arg(
+        long,
+        default_value = "4",
+        help = "Maximum running requests and requests scheduled per batch"
+    )]
     pub max_requests: NonZeroUsize,
 
     #[arg(long, default_value = "128", help = "Maximum flattened tokens scheduled per batch")]
@@ -111,6 +138,7 @@ mod tests {
         assert_eq!(args.max_requests.get(), 4);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
+        assert_eq!(args.num_cache_pages.get(), 262_144);
     }
 
     #[test]
@@ -122,7 +150,7 @@ mod tests {
         assert_eq!(args.max_requests.get(), 4);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-        assert_eq!(args.num_cache_pages, None);
+        assert_eq!(args.num_cache_pages.get(), 262_144);
         assert_eq!(args.hf_dspark_model_dir, None);
     }
 
@@ -132,6 +160,48 @@ mod tests {
             Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", "--hf-dspark-model-dir", "dspark"]).unwrap();
 
         assert_eq!(args.hf_dspark_model_dir, Some("dspark".into()));
+    }
+
+    #[test]
+    fn test_qwen35_accepts_dspark_checkpoint() {
+        let args =
+            Qwen35Args::try_parse_from(["qwen3.5", "--hf-model-dir", "model", "--hf-dspark-model-dir", "dspark"])
+                .unwrap();
+
+        assert_eq!(args.hf_dspark_model_dir, Some("dspark".into()));
+    }
+
+    #[test]
+    fn test_qwen35_mtp_and_dspark_commands_share_common_capacity_args() {
+        let common = [
+            "--hf-model-dir",
+            "main",
+            "--max-requests",
+            "3",
+            "--max-tokens",
+            "96",
+            "--max-tokens-per-request",
+            "48",
+        ];
+        let mut mtp_argv = vec!["qwen3.5"];
+        mtp_argv.extend(common);
+        mtp_argv.extend(["--hf-mtp-model-dir", "mtp"]);
+        let mut dspark_argv = vec!["qwen3.5"];
+        dspark_argv.extend(common);
+        dspark_argv.extend(["--hf-dspark-model-dir", "dspark"]);
+
+        let mtp = Qwen35Args::try_parse_from(mtp_argv).unwrap();
+        let dspark = Qwen35Args::try_parse_from(dspark_argv).unwrap();
+
+        assert_eq!(mtp.max_requests, dspark.max_requests);
+        assert_eq!(mtp.max_tokens, dspark.max_tokens);
+        assert_eq!(mtp.max_tokens_per_request, dspark.max_tokens_per_request);
+        assert_eq!(mtp.hf_mtp_model_dir, Some("mtp".into()));
+        assert_eq!(mtp.hf_dspark_model_dir, None);
+        assert_eq!(dspark.hf_mtp_model_dir, None);
+        assert_eq!(dspark.hf_dspark_model_dir, Some("dspark".into()));
+        assert_eq!(mtp.mtp_module, None);
+        assert_eq!(dspark.mtp_module, None);
     }
 
     #[test]

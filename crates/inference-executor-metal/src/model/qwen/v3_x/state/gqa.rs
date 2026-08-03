@@ -72,6 +72,21 @@ impl Qwen3xGQAState {
             .prepare(core_batch, self.cache_lane, self.num_cache_pages);
     }
 
+    pub fn prepare_page_span(
+        &self,
+        core_batch: &BatchDeviceRequest,
+        num_runtime_page_ids_per_block: usize,
+        page_id_offset: usize,
+    ) {
+        self.request_page_table.prepare_span(
+            core_batch,
+            self.cache_lane,
+            self.num_cache_pages,
+            num_runtime_page_ids_per_block,
+            page_id_offset,
+        );
+    }
+
     pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
         self.backend
             .prepare(&self.metadata, req_slots, token_indices, cu_tokens)

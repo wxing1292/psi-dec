@@ -154,14 +154,16 @@ The inference server does not own these controls:
 
 ## Binaries and checkpoints
 
-The service provides a Qwen3 binary with optional DSpark.
+The service provides Qwen3 and Qwen3.5 binaries with optional DSpark.
+DSpark support is experimental.
+Its checkpoint contract, CLI, cache sizing, and proposal policy may change.
 It also provides Qwen3.5 binaries that retain their names for current Qwen3.6 MLX checkpoints:
 
 | Model                  | Binary           | Main checkpoint                      | Optional Spec checkpoint                  |
 | ---------------------- | ---------------- | ------------------------------------ | ----------------------------------------- |
 | Qwen3 dense 14B        | `qwen3`          | `mlx-community/Qwen3-14B-4bit`       | optional official Qwen3 DSpark checkpoint |
-| Qwen3.6 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.6-27B-4bit`     | `mlx-community/Qwen3.6-27B-MTP-4bit`      |
-| Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | `mlx-community/Qwen3.6-35B-A3B-MTP-4bit`  |
+| Qwen3.6 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.6-27B-4bit`     | matching MTP or official Qwen3x DSpark    |
+| Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | matching MTP or official Qwen3x DSpark    |
 
 Download with the Hugging Face CLI:
 
@@ -175,9 +177,9 @@ hf download mlx-community/Qwen3.6-27B-MTP-4bit --local-dir models/Qwen3.6-27B-MT
 Use the corresponding 35B-A3B names for the sparse model. MTP checkpoints contain Spec weights. They must match the
 Main model family.
 
-### Qwen3 DSpark conversion
+### Qwen3x DSpark conversion
 
-Convert an official BF16 Qwen3 DSpark checkpoint to the affine executor format:
+Convert an official BF16 Qwen3x DSpark checkpoint to the affine executor format:
 
 ```sh
 cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
@@ -190,6 +192,8 @@ The output directory must not exist before you run the converter.
 The converter writes `model.safetensors` and `model.safetensors.index.json`.
 It preserves the confidence projection and bias as BF16.
 The input must be the official BF16 DSpark checkpoint.
+The flat DSpark query projection width can differ from `hidden_size`.
+The converter and loader derive the query width from `num_attention_heads * head_dim`.
 An affine checkpoint that was generated before confidence support does not contain these tensors.
 Regenerate that checkpoint into a new output directory.
 
@@ -213,7 +217,20 @@ cargo run --release --bin qwen3 -- \
 ```
 
 The Qwen3 executor gets stop tokens from the checkpoint configuration when `generation_config.json` is absent.
-The Qwen3.5 services do not accept `--hf-dspark-model-dir`.
+
+Qwen3.5/Qwen3.6 dense startup with DSpark:
+
+```sh
+cargo run --release --bin qwen3_5_dense -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
+  --hf-dspark-model-dir "$PWD/models/Qwen3.6-27B-DSpark-affine"
+```
+
+The Qwen3.5 services reject a configuration that specifies both `--hf-mtp-model-dir` and
+`--hf-dspark-model-dir`.
+Omit `--mtp-module` for DSpark. Its default is `0` when no MTP directory is present.
 
 Qwen3.5 startup with MTP enabled:
 
@@ -224,8 +241,7 @@ cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
-  --mtp-module 1
+  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit"
 ```
 
 Sparse:
@@ -235,9 +251,19 @@ cargo run --release --bin qwen3_5_sparse -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
-  --mtp-module 1
+  --hf-mtp-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit"
 ```
+
+The normal MTP and DSpark commands use the same service and scheduler arguments.
+Only the Spec checkpoint argument changes:
+
+```text
+--hf-mtp-model-dir DIR
+--hf-dspark-model-dir DIR
+```
+
+An MTP checkpoint enables one MTP module by default.
+Do not pass `--mtp-module 1` in the normal MTP command.
 
 The gRPC address defaults to `127.0.0.1:50051`. The HTTP address defaults to `127.0.0.1:8000`.
 
@@ -253,16 +279,16 @@ One lifecycle owner stops both listeners in these conditions:
 Value `1` requires that directory. Explicit `--mtp-module 0` ignores an optional MTP directory. Use this value for
 controlled Main-only tests.
 
-Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 384K pages. The Qwen3-14B geometry stores eight
+Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 256K pages. The Qwen3-14B geometry stores eight
 tokens in one physical page.
 
-Its 16-token logical cache block uses 80 pages across 40 layers. Thus, the default holds 4,915 complete blocks. These
-blocks contain 78,640 resident tokens in aggregate.
+Its 16-token logical cache block uses 80 pages across 40 layers. Thus, the default holds 3,276 complete blocks. These
+blocks contain 52,416 resident tokens in aggregate.
 
 When DSpark is enabled, the executor adds persistent DSpark context pages to the same logical block.
 The page count depends on the DSpark layer and KV geometry.
 
-Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 384K shared pages.
+Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 256K shared pages.
 
 At startup, each service derives the page count for one block from the initialized executor. The service rejects
 `--num-cache-pages` when one complete block cannot fit.
@@ -272,10 +298,40 @@ The rejection reports this dynamic minimum.
 Recommendation: For performance comparisons, pass `--num-cache-pages` explicitly. This setting controls memory
 pressure.
 
-The services default to 32 queued requests and 8 running request slots. Queued requests do not consume executor
+`Qwen3Config` and `Qwen35Config` resolve the queued-request, running-request, and per-batch capacities.
+CLI checkpoint arguments remain optional parser inputs.
+Configuration validation converts them to one `Vanilla`, `MTP`, or `DSpark` model mode.
+The validated configuration does not store independent MTP and DSpark options.
+`--max-requests` defines both the running request-slot capacity and the per-batch request capacity.
+The model service passes this value to the executor, `RuntimeConfig`, and `SchedulerConfig`.
+The services default to 32 queued requests and 4 running request slots. Queued requests do not consume executor
 request-slot state.
 
-Admission assigns a slot before a request enters the scheduler. `--max-requests` cannot exceed the eight executor slots.
+Admission assigns a slot before a request enters the scheduler.
+GQA page tables, GDN request state, sampling state, and request-indexed workspaces use the same slot domain.
+For Qwen3.5 DSpark, GDN retains one candidate state for every possible accepted proposal prefix in each slot.
+Thus, `--max-requests` also bounds the persistent GDN candidate-state arena.
+Buffers, scratch allocations, replay resources, and resident model resources remain reusable.
+
+The Qwen3.5 GDN arena uses this request-local slot count:
+
+```text
+candidate_states = max(
+  max_spec_tokens + 1,
+  ceil((max_tokens_per_request - 1) / num_tokens_per_block) + 1
+)
+state_slots = 1 + candidate_states
+```
+
+The leading slot stores the current request state.
+The other slots store forward candidates and logical cache-block boundary states.
+The total arena scales with `--max-requests * state_slots * full_model_state_bytes`.
+
+For the Qwen3.6-27B checkpoint, one full-model GDN state is 149.625 MiB.
+With the default `--max-requests 4`, Main and one-module MTP use three state slots for each request and allocate
+approximately 1.75 GiB for the arena.
+A DSpark checkpoint with `block_size=15` uses 17 state slots for each request and allocates approximately 9.94 GiB.
+These values do not include model weights, cache pages, or other executor workspaces.
 
 One default batch has these scheduler limits:
 
@@ -538,7 +594,7 @@ The model-neutral speculator timing fields are:
 - `model_output_spec_passes`
 
 A pass is one auxiliary speculator forward that runs.
-For Qwen3.5, each MTP module forward is one pass.
+For Qwen3.5, each MTP module forward or DSpark block forward is one pass.
 For Qwen3, each DSpark block forward is one pass.
 Qwen3 does not run DSpark Spec for a prefill-only batch because no sampled anchor exists.
 
@@ -632,7 +688,7 @@ It used these settings:
 - Four running requests
 - The 4/128/64 scheduler configuration
 
-The current default uses eight running requests. Thus, this baseline is not comparable until it is refreshed.
+The current default uses four running requests.
 
 A summary reports `baseline_status=comparable` only when all comparison inputs match. It then reports typed decode,
 TTFT, and inter-chunk delta percentages.

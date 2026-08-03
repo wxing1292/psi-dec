@@ -1,6 +1,8 @@
-# Qwen3 DSpark
+# Qwen3x DSpark
 
-This document describes the current fixed-block Qwen3 DSpark implementation.
+This document describes the current fixed-block Qwen3 and Qwen3.5 DSpark implementation.
+DSpark support is experimental.
+Its checkpoint contract, CLI, cache sizing, and proposal policy may change.
 [`executor_qwen.md`](executor_qwen.md) owns the Qwen executor lifecycle.
 [`executor_sampling.md`](executor_sampling.md) owns sparse sampling and rejection.
 [`executor_gqa.md`](executor_gqa.md) owns GQA page and attention-kernel details.
@@ -20,21 +22,20 @@ None of these names identify model roles.
 
 ## Current scope
 
-The Qwen3 executor can load one optional DSpark checkpoint.
+Qwen3 and Qwen3.5 provide separate Vanilla and DSpark initializer paths.
 The implementation follows the official flat `Qwen3xDSparkConfig` schema.
 It supports an ungated GQA backbone and a `vanilla` Markov head.
+It requires the official Markov-conditioned confidence head.
+Qwen3.5 MTP and DSpark are mutually exclusive.
 
 The first milestone has these limits:
 
 - It produces exactly `block_size` proposals for each active decode request.
-- It executes the optional official confidence head.
+- It executes the required official confidence head.
 - It returns one confidence value for each proposal token.
 - It does not schedule variable proposal lengths.
 - It does not support a gated DSpark GQA checkpoint.
 - It permits one in-flight batch for each executor.
-
-The Qwen3.5 executor continues to use MTP.
-It does not own a DSpark implementation.
 
 ## Source layout
 
@@ -69,20 +70,27 @@ crates/inference-executor-metal/src/
     qwen/v3_x/dspark/
       attention.rs               DSpark attention composition
       embed.rs                   DSpark token embedding replay
+      execution.rs               shared execution resources and per-batch recording
       layer.rs                   independent Qwen3xDSparkLayer
+      load.rs                    shared checkpoint and resource load
       model.rs                   context and body replay owners
       output.rs                  gather, unembed, and Markov sampling
       main_feature.rs            selected Main residual projection
       sampling.rs                Qwen3x Markov checkpoint weights and generic backend adapter
     qwen/v3/executor/
       dspark.rs                  Qwen3 proposal orchestration
+    qwen/v3_5/executor/
+      load.rs                    separate Qwen3.5 Vanilla/MTP/DSpark load
+      dspark.rs                  Qwen3.5 DSpark proposal orchestration
   sampling/
     dspark_markov.rs             sequential Markov, confidence, and sampling composition
     rejection_replay.rs          shared sparse rejection replay and microbatch contract
 ```
 
-The source does not retain the earlier `qwen/v3_5/dspark/` implementation.
-The current Qwen3 path does not wire that implementation through a compatibility layer.
+Qwen3 and Qwen3.5 compose the same `qwen/v3_x/dspark/` owners.
+The shared loader resolves DSpark bindings and constructs the checkpoint-owned resources once.
+The model-specific executors keep Main validation, batches, transactions, and proposal-result adaptation in their
+executor directories.
 
 ## Model semantics
 
@@ -125,7 +133,7 @@ It stores one sparse draft distribution for each proposed token.
 Qwen3xDSparkConfig + exact Qwen3x checkpoint bindings
   -> Qwen3xDSparkMarkov
        owns Qwen3xDSparkMarkovWeights
-       owns optional Qwen3xDSparkConfidenceWeights
+       owns Qwen3xDSparkConfidenceWeights
        owns DSparkMarkovSampling
             |
             | record(DSparkMarkovInput + borrowed weights)
@@ -138,6 +146,14 @@ The Qwen wrapper owns checkpoint materialization.
 The generic executor owner owns backend execution resources.
 Each DSpark semantic owner loads one bounded `TensorMap` for its exact binding subtree.
 It removes every tensor before it creates Metal buffers, performs any required fusion, and requires the map to be empty.
+
+`Qwen3xDSparkExecution` is the single DSpark execution owner in each DSpark enum variant.
+It owns the DSpark replay caches, request state, page layout, and reusable workspaces.
+`Replay<Qwen3xDSparkSampling>` is the single Markov owner and access path.
+The executor uses `Replay::component()` for Markov prepare, replay arguments, and proposal reads.
+`Qwen3xDSparkRecording` owns only keys, replay arguments, replay shape, and request slots for one batch.
+The executor speculator enums prevent partially initialized DSpark field combinations.
+It also keeps replay programs and workspaces reusable across submissions.
 
 Each position records this pair:
 
@@ -169,7 +185,8 @@ TopKSampleAndWriteDistribution
   -> sparse draft distribution
 ```
 
-For the official `confidence_head_with_markov = true` checkpoint:
+The loader requires `enable_confidence_head = true` and `confidence_head_with_markov = true`.
+The confidence contract is:
 
 ```text
 confidence_input[i] = concat(hidden[i], MarkovW1(input_token_ids[i]))
@@ -219,7 +236,7 @@ The contract does not depend on a DSpark model or a Metal recorder.
 It projects those outputs into one Main feature for each Main token.
 Each DSpark layer projects that feature to its persistent context K/V.
 
-`Qwen3xDSparkContext` records this work after `Qwen3Main` in the same Main submission:
+`Qwen3xDSparkContext` records this work after the model-specific Main graph in the same Main submission:
 
 ```text
 MainEmbed
@@ -230,14 +247,13 @@ MainEmbed
 Persistent DSpark context follows accepted Main history.
 Proposal-local K/V never enters this context.
 
-The reusable Qwen3x DSpark model, checkpoint-weight owners, and Main capture contract do not depend on the Qwen3
-executor.
-The Qwen3.5 executor can compose the same owners when it adds a DSpark lifecycle.
-The current Qwen3.5 executor does not wire that lifecycle.
+The reusable Qwen3x DSpark model, checkpoint-weight owners, and Main capture contract do not depend on one Main model
+version.
+Both executors compose these owners with their model-specific lifecycle.
 
 ## Attention composition
 
-The official Qwen3 checkpoint uses ungated GQA.
+The supported official Qwen3x DSpark checkpoints use ungated GQA.
 `UngatedDSparkGQA` owns a model-neutral QKV attention graph.
 It does not add a mode to `UngatedGQA`.
 
@@ -309,7 +325,7 @@ The runtime core allocates and releases both spans as one cache block.
 The runtime core does not parse the model-specific split.
 
 Main and DSpark use the same request-slot lifecycle.
-`Qwen3Executor::reset_req_slots` sends each runtime reset notification to both GQA state owners.
+The model-specific executor sends each runtime reset notification to both GQA state owners.
 Both owners call `GQARequestPageTable::reset_req_slots` for the released request slots.
 The reset clears executor page-table bindings.
 It does not clear physical pages that the runtime core owns and releases.
@@ -322,7 +338,7 @@ num_pages_per_kv_block =
   + dspark_pages_per_block
 ```
 
-A DSpark-disabled Qwen3 executor uses only the Main span.
+A DSpark-disabled Qwen3 or Qwen3.5 executor uses only the Main span.
 
 ## Scratch capacity
 
@@ -356,6 +372,15 @@ partial_output[P_capacity, num_q_heads, head_dim] model dtype
 
 Context length does not set this capacity.
 One history task can process many K/V tiles with online softmax.
+
+Qwen3.5 GDN also allocates candidate recurrent states for every possible accepted proposal prefix.
+`Qwen35Config` resolves the request-slot capacity from `--max-requests` for Main, MTP, and DSpark.
+The service passes the same capacity to the executor, runtime, and scheduler.
+This rule bounds the persistent GDN arena without changing buffer, scratch, replay, or residency reuse.
+
+The shared DSpark loader validates `block_size + 1 <= max_tokens_per_request`.
+The extra token is the Main target token that precedes one complete proposal suffix.
+Both model executors use this same forward-capacity contract.
 
 ## Sparse distribution identity
 
@@ -416,8 +441,9 @@ It does not create a dummy completed submission.
 
 ## Configuration and conversion
 
-The loader validates the DSpark configuration against the Qwen3 Main configuration.
+The loader validates the DSpark configuration against the Qwen3 or Qwen3.5 Main configuration.
 It rejects unsupported attention, dtype, RoPE, `target_layer_ids`, and Markov variants.
+It permits the query projection width to differ from `hidden_size` when the head geometry is valid.
 The affine loader requires exact semantic bindings.
 
 Convert an official checkpoint with this command:
