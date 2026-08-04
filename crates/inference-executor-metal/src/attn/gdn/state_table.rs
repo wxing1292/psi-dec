@@ -33,54 +33,43 @@ struct GDNStateLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GDNStateCapacity {
+pub struct GDNStateCapacity {
     num_state_slots_per_req: usize,
     max_candidate_states_per_req: usize,
     max_publish_jobs_per_req: usize,
 }
 
 impl GDNStateCapacity {
-    fn derive(max_spec_tokens: usize, max_tokens_per_request: usize, num_tokens_per_block: usize) -> Self {
-        assert!(
-            max_tokens_per_request > 0,
-            "GDN state requires positive max tokens per request"
-        );
-        assert!(num_tokens_per_block > 0, "GDN state requires positive tokens per block");
-
-        let max_speculative_candidates = max_spec_tokens
-            .checked_add(1)
-            .expect("GDN speculative candidate count overflow");
-        let max_boundary_candidates = max_tokens_per_request
-            .checked_sub(1)
-            .expect("GDN max tokens per request must be positive")
-            .div_ceil(num_tokens_per_block)
-            .checked_add(1)
-            .expect("GDN boundary candidate count overflow");
-        // An aligned request ends at a block boundary and shares its final
-        // candidate with that boundary. An unaligned request can have one
-        // additional final candidate after every crossed boundary.
-        let max_candidate_states_per_req = max_speculative_candidates.max(max_boundary_candidates);
-        let num_state_slots_per_req = max_candidate_states_per_req
-            .checked_add(1)
-            .expect("GDN per-request state slot count overflow");
-        let max_publish_jobs_per_req = max_tokens_per_request.div_ceil(num_tokens_per_block);
-
-        // Speculative prefix candidates include every state version reached by the
-        // forward, including logical cache-block boundaries, so their capacities
-        // overlap rather than add.
-        Self {
+    pub fn new(
+        num_state_slots_per_req: usize,
+        max_candidate_states_per_req: usize,
+        max_publish_jobs_per_req: usize,
+    ) -> Self {
+        let capacity = Self {
             num_state_slots_per_req,
             max_candidate_states_per_req,
             max_publish_jobs_per_req,
-        }
+        };
+        capacity.validate();
+        capacity
+    }
+
+    fn validate(self) {
+        assert!(
+            self.max_candidate_states_per_req > 0,
+            "GDN state requires candidate capacity"
+        );
+        assert!(
+            self.num_state_slots_per_req > self.max_candidate_states_per_req,
+            "GDN state slots must include current state and all candidate states"
+        );
+        assert!(self.max_publish_jobs_per_req > 0, "GDN state requires publish capacity");
     }
 }
 
 pub struct GDNRequestStateTable {
     layout: GDNStateLayout,
     num_tokens_per_block: usize,
-    max_spec_tokens: usize,
-    max_tokens_per_request: usize,
     max_candidate_states_per_req: usize,
     max_publish_jobs_per_req: usize,
     recurrent_states: Buffer,
@@ -115,7 +104,6 @@ struct GDNPrepareOutput {
 
 struct GDNPrepareInput {
     num_tokens_per_block: usize,
-    max_spec_tokens: usize,
     max_candidate_states_per_req: usize,
     request_table: GDNRequestSlots,
     req_slots: Vec<u32>,
@@ -147,8 +135,7 @@ impl GDNRequestStateTable {
         device: &Device,
         cores: &[GDNCore],
         num_req_slots: usize,
-        max_spec_tokens: usize,
-        max_tokens_per_request: usize,
+        capacity: GDNStateCapacity,
         num_tokens_per_block: usize,
         page_bytes: usize,
     ) -> Self {
@@ -159,7 +146,7 @@ impl GDNRequestStateTable {
             page_bytes.is_multiple_of(size_of::<f32>() * 4),
             "GDN page size must contain an integral number of float4 values"
         );
-        let capacity = GDNStateCapacity::derive(max_spec_tokens, max_tokens_per_request, num_tokens_per_block);
+        capacity.validate();
         let request_table = GDNRequestSlots::new(num_req_slots, capacity.num_state_slots_per_req);
         let num_state_slots = num_req_slots
             .checked_mul(capacity.num_state_slots_per_req)
@@ -254,8 +241,6 @@ impl GDNRequestStateTable {
         Self {
             layout,
             num_tokens_per_block,
-            max_spec_tokens,
-            max_tokens_per_request,
             max_candidate_states_per_req: capacity.max_candidate_states_per_req,
             max_publish_jobs_per_req: capacity.max_publish_jobs_per_req,
             recurrent_states: Buffer::new_zeroed(device, recurrent_states_bytes),
@@ -433,7 +418,6 @@ impl GDNRequestStateTable {
     ) -> GDNPrepareInput {
         GDNPrepareInput {
             num_tokens_per_block: self.num_tokens_per_block,
-            max_spec_tokens: self.max_spec_tokens,
             max_candidate_states_per_req: self.max_candidate_states_per_req,
             request_table: self.request_table.borrow().clone(),
             req_slots: req_slots.to_vec(),
@@ -446,23 +430,23 @@ impl GDNRequestStateTable {
         }
     }
 
-    pub fn commit(&self, verified_state_versions: &[u32]) {
+    pub fn commit(&self, state_versions: &[u32]) {
         let pending_request_txns = self.pending_request_txns.borrow();
         let mut publishes_out = self.publishes.borrow_mut();
         let mut request_table = self.request_table.borrow_mut();
-        assert_eq!(pending_request_txns.len(), verified_state_versions.len());
+        assert_eq!(pending_request_txns.len(), state_versions.len());
         publishes_out.clear();
-        for (request_txn, &state_version) in pending_request_txns.iter().zip(verified_state_versions) {
+        for (request_txn, &state_version) in pending_request_txns.iter().zip(state_versions) {
             if state_version != request_table.current_state_version(request_txn.req_slot) {
                 assert!(
                     request_txn.txn.contains_candidate_state_version(state_version),
-                    "GDN state version must select a recorded candidate"
+                    "GDN commit state version must select a recorded candidate"
                 );
             }
             let publishes = request_table.commit_txn(request_txn.req_slot, state_version);
             assert!(
                 publishes.len() <= self.max_publish_jobs_per_req,
-                "GDN publishes exceed scheduler-derived per-request capacity"
+                "GDN publishes exceed per-request capacity"
             );
             publishes_out.extend(publishes);
         }
@@ -548,26 +532,17 @@ impl GDNRequestStateTable {
                 .checked_sub(cu_tokens[req_index])
                 .expect("GDN state batch cu_tokens must be nondecreasing");
             assert!(num_tokens > 0, "GDN state batch requires tokens for every request");
-            assert_eq!(txn.token_index, token_indices[req_index]);
-            assert_eq!(txn.num_total_tokens, num_tokens);
-            assert!(
-                txn.num_total_tokens as usize <= self.max_tokens_per_request,
-                "GDN request tokens exceed scheduler-derived per-request capacity"
+            assert_eq!(txn.start_state_version(), token_indices[req_index]);
+            assert_eq!(txn.num_forward_tokens(), num_tokens);
+            assert_eq!(
+                txn.candidate_end_state_version(),
+                txn.end_state_version(),
+                "GDN forward output state requires a candidate slot"
             );
             assert!(
-                txn.num_spec_tokens as usize <= self.max_spec_tokens,
-                "GDN speculative suffix exceeds candidate state capacity"
+                txn.num_candidate_states() as usize <= self.max_candidate_states_per_req,
+                "GDN candidate range exceeds per-request capacity"
             );
-            if txn.num_spec_tokens > 0 {
-                assert!(
-                    txn.num_total_tokens as usize
-                        <= self
-                            .max_spec_tokens
-                            .checked_add(1)
-                            .expect("GDN speculative candidate capacity must fit usize"),
-                    "GDN candidate states require decode-sized token batches"
-                );
-            }
         }
     }
 }
@@ -803,28 +778,18 @@ impl GDNPrepareInput {
         let mut candidate_versions_by_req = Vec::with_capacity(self.req_slots.len());
         for (req_index, &req_slot) in self.req_slots.iter().enumerate() {
             let txn = self.state_txns[req_index];
-            let mut candidate_versions = Vec::with_capacity(
-                self.max_spec_tokens
-                    .checked_add(1)
-                    .expect("GDN candidate-version capacity must fit usize"),
-            );
-            candidate_versions.push(txn.last_candidate_state_version());
+            let mut candidate_versions = Vec::with_capacity(self.max_candidate_states_per_req);
+            candidate_versions.push(txn.candidate_end_state_version());
             candidate_versions.extend(
                 self.request_table
                     .txn_publish_state_versions(req_slot)
-                    .filter(|&state_version| state_version <= txn.last_candidate_state_version()),
+                    .filter(|&state_version| state_version <= txn.candidate_end_state_version()),
             );
-            if txn.num_spec_tokens > 0 {
-                for num_tokens_since_txn_start in 1..=txn.num_total_tokens {
-                    candidate_versions.push(
-                        txn.token_index
-                            .checked_add(num_tokens_since_txn_start)
-                            .expect("GDN candidate state version must fit u32"),
-                    );
-                }
+            for candidate_state_version in txn.candidate_start_state_version()..=txn.candidate_end_state_version() {
+                candidate_versions.push(candidate_state_version);
             }
             for pages in &txn_publish_pages[req_index] {
-                if pages.state_version <= txn.last_candidate_state_version() {
+                if pages.state_version <= txn.candidate_end_state_version() {
                     candidate_versions.push(pages.state_version);
                 }
             }
@@ -832,7 +797,7 @@ impl GDNPrepareInput {
             candidate_versions.dedup();
             assert!(
                 candidate_versions.len() <= self.max_candidate_states_per_req,
-                "GDN candidate states exceed scheduler-derived per-request capacity"
+                "GDN candidate states exceed per-request capacity"
             );
             self.request_table
                 .begin_txn(req_slot, &candidate_versions, take(&mut txn_publish_pages[req_index]));
@@ -850,7 +815,7 @@ impl GDNPrepareInput {
             .enumerate()
             .map(|(req_index, &req_slot)| {
                 self.request_table
-                    .candidate_state_slot(req_slot, self.state_txns[req_index].last_candidate_state_version())
+                    .candidate_state_slot(req_slot, self.state_txns[req_index].end_state_version())
             })
             .collect::<Vec<_>>();
         let num_tokens = self.cu_tokens.last().copied().unwrap_or_default() as usize;
@@ -862,7 +827,7 @@ impl GDNPrepareInput {
             let flat_end = self.cu_tokens[req_index + 1];
             for flat_index in flat_start..flat_end {
                 let state_version = txn
-                    .token_index
+                    .start_state_version()
                     .checked_add(flat_index - flat_start + 1)
                     .expect("GDN candidate state version must fit u32");
                 flat_candidate_state_slots.push(if candidate_versions.contains(&state_version) {
@@ -916,14 +881,10 @@ mod tests {
 
     const TEST_PAGE_BYTES: usize = 32 * 1024;
 
-    fn normal_forward_capacity(token_index: usize, num_tokens: usize, num_tokens_per_block: usize) -> (usize, usize) {
-        let final_state_version = token_index
-            .checked_add(num_tokens)
-            .expect("test GDN state version overflow");
-        let num_publish_jobs = final_state_version / num_tokens_per_block - token_index / num_tokens_per_block;
-        let num_candidate_states =
-            num_publish_jobs + usize::from(!final_state_version.is_multiple_of(num_tokens_per_block));
-        (num_candidate_states, num_publish_jobs)
+    #[test]
+    #[should_panic(expected = "GDN state slots must include current state and all candidate states")]
+    fn test_capacity_requires_current_state_slot() {
+        let _ = GDNStateCapacity::new(3, 3, 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -954,32 +915,16 @@ mod tests {
     }
 
     #[test]
-    fn test_capacity_for_aligned_and_unaligned_cache_block_starts() {
-        let capacity = GDNStateCapacity::derive(0, 2048, 1024);
-
-        assert_eq!(normal_forward_capacity(0, 2048, 1024), (2, 2));
-        assert_eq!(normal_forward_capacity(1, 2048, 1024), (3, 2));
-
-        // A 2-block aligned request shares its final candidate with the last
-        // boundary; starting one token later adds a distinct final candidate.
-        assert_eq!(capacity.max_candidate_states_per_req, 3);
-        assert_eq!(capacity.num_state_slots_per_req, 4);
-        assert_eq!(capacity.max_publish_jobs_per_req, 2);
-    }
-
-    #[test]
-    fn test_capacity_prefers_speculative_prefix_candidates() {
-        let capacity = GDNStateCapacity::derive(4, 1024, 1024);
-
-        assert_eq!(capacity.max_candidate_states_per_req, 5);
-        assert_eq!(capacity.num_state_slots_per_req, 6);
-        assert_eq!(capacity.max_publish_jobs_per_req, 1);
-    }
-
-    #[test]
     fn test_layout() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 2, 2, 16, 16, TEST_PAGE_BYTES);
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            2,
+            GDNStateCapacity::new(4, 3, 1),
+            16,
+            TEST_PAGE_BYTES,
+        );
 
         assert_eq!(state.layer_bindings(0).recurrent_layer_offset_bytes, 0);
         assert_eq!(state.layer_bindings(0).conv_layer_offset_bytes, 0);
@@ -1006,7 +951,7 @@ mod tests {
     #[should_panic(expected = "runtime supplied a page ID outside the cache-page buffer")]
     fn test_page_id_domain_panics() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0)], 1, 1, 2, 2, 16);
+        let state = GDNRequestStateTable::new(&device, &[core(0)], 1, GDNStateCapacity::new(3, 2, 1), 2, 16);
         let pages = inference_backend_metal::metal::Buffer::new_zeroed(&device, 2 * 16);
         let page_ids = [2_u32];
 
@@ -1018,7 +963,14 @@ mod tests {
     #[test]
     fn test_transaction() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 2, 2, 16, 16, TEST_PAGE_BYTES);
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            2,
+            GDNStateCapacity::new(4, 3, 1),
+            16,
+            TEST_PAGE_BYTES,
+        );
         let batch_metadata = GDNMetadataBuffers::new(&device, 2, 8);
         prepare_state(
             &state,
@@ -1043,9 +995,92 @@ mod tests {
     }
 
     #[test]
+    fn test_transaction_materializes_only_candidate_versions() {
+        let device = Device::system_default();
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(4, 3, 1),
+            16,
+            TEST_PAGE_BYTES,
+        );
+        let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
+        prepare_state(
+            &state,
+            &batch_metadata,
+            &[0],
+            &[0],
+            &[0],
+            &[0, 4],
+            &[GDNStateTxn::new(0, 4, 2)],
+            &[Vec::new()],
+        );
+
+        let state_version_2_slot = state.request_table.borrow().candidate_state_slot(0, 2);
+        let state_version_3_slot = state.request_table.borrow().candidate_state_slot(0, 3);
+        let state_version_4_slot = state.request_table.borrow().candidate_state_slot(0, 4);
+        assert_eq!(
+            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 4),
+            vec![
+                u32::MAX,
+                state_version_2_slot,
+                state_version_3_slot,
+                state_version_4_slot
+            ]
+        );
+
+        state.commit(&[2]);
+        assert_eq!(state.request_table.borrow().current_state_version(0), 2);
+    }
+
+    #[test]
+    fn test_transaction_promotes_selected_state() {
+        let device = Device::system_default();
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(4, 3, 1),
+            16,
+            TEST_PAGE_BYTES,
+        );
+        let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
+        prepare_state(
+            &state,
+            &batch_metadata,
+            &[0],
+            &[0],
+            &[0],
+            &[0, 4],
+            &[GDNStateTxn::from_state_versions(0, 4, 2, 4)],
+            &[Vec::new()],
+        );
+
+        let table = state.request_table.borrow();
+        let state_version_2_slot = table.candidate_state_slot(0, 2);
+        let state_version_3_slot = table.candidate_state_slot(0, 3);
+        let output_state_slot = table.candidate_state_slot(0, 4);
+        assert_ne!(output_state_slot, state_version_2_slot);
+        assert_ne!(output_state_slot, state_version_3_slot);
+        drop(table);
+        assert_eq!(
+            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 4),
+            vec![u32::MAX, state_version_2_slot, state_version_3_slot, output_state_slot]
+        );
+        assert_eq!(
+            batch_metadata.dst_state_slots().read_typed::<u32>(0, 1),
+            vec![output_state_slot]
+        );
+
+        state.commit(&[3]);
+        assert_eq!(state.request_table.borrow().current_state_version(0), 3);
+    }
+
+    #[test]
     fn test_future_publish_page_ids() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, 3, 6, 2, 16);
+        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(5, 4, 3), 2, 16);
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 8);
         prepare_state(
             &state,
@@ -1068,18 +1103,25 @@ mod tests {
             &[0],
             &[0],
             &[1],
-            &[0, 3],
-            &[GDNStateTxn::new(1, 3, 0)],
+            &[0, 4],
+            &[GDNStateTxn::new(1, 4, 2)],
             &[Vec::new()],
         );
         let state_version_2_slot = state.request_table.borrow().candidate_state_slot(0, 2);
+        let state_version_3_slot = state.request_table.borrow().candidate_state_slot(0, 3);
         let state_version_4_slot = state.request_table.borrow().candidate_state_slot(0, 4);
+        let state_version_5_slot = state.request_table.borrow().candidate_state_slot(0, 5);
         assert_eq!(
-            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 3),
-            vec![state_version_2_slot, u32::MAX, state_version_4_slot]
+            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 4),
+            vec![
+                state_version_2_slot,
+                state_version_3_slot,
+                state_version_4_slot,
+                state_version_5_slot
+            ]
         );
 
-        state.commit(&[4]);
+        state.commit(&[5]);
         assert_eq!(
             state
                 .publishes()
@@ -1096,7 +1138,7 @@ mod tests {
     #[test]
     fn test_snapshot_restore_then_apply_tokens() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, 2, 2, 2, 16);
+        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(4, 3, 1), 2, 16);
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 8);
         let snapshot_page_ids = vec![10, 11, 12, 13, 14, 15, 16, 17];
         prepare_state(
@@ -1122,7 +1164,14 @@ mod tests {
     #[test]
     fn test_snapshot_restore_at_a_1024_token_logical_cache_boundary() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, 2, 1024, 1024, 16);
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(4, 3, 1),
+            1024,
+            16,
+        );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 8);
         let snapshot_page_ids = vec![10, 11, 12, 13, 14, 15, 16, 17];
         prepare_state(

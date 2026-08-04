@@ -85,12 +85,7 @@ impl Qwen35ModelWeightBindings {
 }
 
 impl Qwen35MTPWeightBindings {
-    fn from_config(model_config: &Qwen35ModelConfig, num_modules: usize) -> Result<Self, ModelExecutorError> {
-        assert_eq!(num_modules, 1, "qwen3.5 supports exactly one MTP module");
-        assert!(
-            num_modules <= model_config.text_config.num_hidden_layers,
-            "qwen3.5 MTP binding count exceeds configured layers"
-        );
+    fn from_config(model_config: &Qwen35ModelConfig) -> Result<Self, ModelExecutorError> {
         let uses_moe = model_config.layer_uses_moe(0);
         let has_shared_expert = model_config.text_config.shared_expert_intermediate_size > 0;
         Ok(Self {
@@ -325,7 +320,6 @@ pub fn resolve_qwen35_model_weight_bindings<'a>(
 
 pub fn resolve_qwen35_mtp_weight_bindings<'a>(
     model_config: &Qwen35ModelConfig,
-    num_modules: usize,
     tensor_names: impl IntoIterator<Item = &'a str>,
 ) -> Result<Qwen35MTPWeightBindings, ModelExecutorError> {
     let tensor_names = tensor_names.into_iter().collect::<HashSet<_>>();
@@ -334,7 +328,7 @@ pub fn resolve_qwen35_mtp_weight_bindings<'a>(
             "qwen3.5 MTP checkpoint layout resolution requires a nonempty tensor manifest",
         ));
     }
-    let bindings = Qwen35MTPWeightBindings::from_config(model_config, num_modules)?;
+    let bindings = Qwen35MTPWeightBindings::from_config(model_config)?;
     let mut missing = bindings
         .tensor_names()
         .into_iter()

@@ -213,10 +213,10 @@ impl Qwen3Executor {
         let mut flat_draft_index = 0usize;
         let mut decisions = Vec::with_capacity(prepared.num_active_decode_reqs());
         for decode_req_index in 0..prepared.num_active_decode_reqs() {
-            let num_accepted = results.num_accepted_tokens(decode_req_index);
+            let num_accepted_tokens = results.num_accepted_tokens(decode_req_index);
             decisions.push(Qwen3DecodeDecision {
                 validated_tokens: results
-                    .accepted_token_ids(flat_draft_index, num_accepted)
+                    .accepted_token_ids(flat_draft_index, num_accepted_tokens)
                     .iter()
                     .map(|&token_id| {
                         token_id
@@ -224,7 +224,7 @@ impl Qwen3Executor {
                             .expect("Qwen3 rejection returned a negative accepted token")
                     })
                     .collect(),
-                validated_probs: results.accepted_probs(flat_draft_index, num_accepted).to_vec(),
+                validated_probs: results.accepted_probs(flat_draft_index, num_accepted_tokens).to_vec(),
                 sampled_token: results
                     .sampled_token_id(decode_req_index)
                     .try_into()

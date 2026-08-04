@@ -168,16 +168,16 @@ fn rejects_mixed_gdn_component_names() {
 }
 
 #[test]
-fn resolves_single_mtp_module_from_complete_names() {
+fn resolves_single_physical_mtp_layer_from_complete_names() {
     let config = model_config(0);
-    let expected = super::Qwen35MTPWeightBindings::from_config(&config, 1).unwrap();
+    let expected = super::Qwen35MTPWeightBindings::from_config(&config).unwrap();
     let names = expected
         .tensor_names()
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
 
-    let actual = resolve_qwen35_mtp_weight_bindings(&config, 1, names.iter().map(String::as_str)).unwrap();
+    let actual = resolve_qwen35_mtp_weight_bindings(&config, names.iter().map(String::as_str)).unwrap();
 
     assert_eq!(actual, expected);
     assert_eq!(actual.embed.projection.weight, "fc.weight");
@@ -187,7 +187,7 @@ fn resolves_single_mtp_module_from_complete_names() {
 #[test]
 fn rejects_missing_mtp_body_tensor() {
     let config = model_config(0);
-    let expected = super::Qwen35MTPWeightBindings::from_config(&config, 1).unwrap();
+    let expected = super::Qwen35MTPWeightBindings::from_config(&config).unwrap();
     let missing = expected.body.input_norm_weight.clone();
     let names = expected
         .tensor_names()
@@ -196,13 +196,7 @@ fn rejects_missing_mtp_body_tensor() {
         .map(str::to_string)
         .collect::<Vec<_>>();
 
-    let err = resolve_qwen35_mtp_weight_bindings(&config, 1, names.iter().map(String::as_str)).unwrap_err();
+    let err = resolve_qwen35_mtp_weight_bindings(&config, names.iter().map(String::as_str)).unwrap_err();
 
     assert!(err.to_string().contains(&missing));
-}
-
-#[test]
-#[should_panic(expected = "qwen3.5 supports exactly one MTP module")]
-fn rejects_multiple_mtp_modules() {
-    let _ = super::Qwen35MTPWeightBindings::from_config(&model_config(0), 2);
 }

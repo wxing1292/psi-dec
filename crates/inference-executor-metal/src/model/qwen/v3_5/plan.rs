@@ -216,12 +216,10 @@ pub fn validate_qwen35_mtp_config(
             mtp.num_experts
         )));
     }
-    if mtp.mtp_num_hidden_layers != 1 {
-        return Err(ModelExecutorError::custom(format!(
-            "qwen3.5 MTP checkpoint must contain exactly one body layer, got {}",
-            mtp.mtp_num_hidden_layers
-        )));
-    }
+    assert_eq!(
+        mtp.mtp_num_hidden_layers, 1,
+        "qwen3.5 MTP checkpoint must contain exactly one physical body layer"
+    );
     if mtp.mtp_use_dedicated_embeddings {
         return Err(ModelExecutorError::custom(
             "qwen3.5 MTP checkpoint must share the Main token embedding",

@@ -26,7 +26,13 @@ mod dependency;
 
 mod parameter;
 pub use parameter::ReplayArguments;
+pub use parameter::ReplayF32;
+pub use parameter::ReplayI32;
+pub use parameter::ReplayI64;
 pub use parameter::ReplayParameterKey;
+pub use parameter::ReplayU32;
+pub use parameter::ReplayU64;
+pub use parameter::ReplayValue;
 
 mod residency;
 use residency::ResidencySet;
@@ -163,6 +169,7 @@ mod tests {
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayExecution;
     use crate::metal::ReplayParameterKey;
+    use crate::metal::ReplayU32;
     use crate::metal::Stream;
 
     const ADD_ONE_SOURCE: &str = r#"
@@ -180,6 +187,27 @@ mod tests {
         }
     "#;
 
+    const SCALAR_REPLAY_SOURCE: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void write_scalars(
+            device ulong* output_u64 [[buffer(0)]],
+            device int* output_i32 [[buffer(1)]],
+            device long* output_i64 [[buffer(2)]],
+            device float* output_f32 [[buffer(3)]],
+            constant ulong& value_u64 [[buffer(4)]],
+            constant int& value_i32 [[buffer(5)]],
+            constant long& value_i64 [[buffer(6)]],
+            constant float& value_f32 [[buffer(7)]]
+        ) {
+            output_u64[0] = value_u64;
+            output_i32[0] = value_i32;
+            output_i64[0] = value_i64;
+            output_f32[0] = value_f32;
+        }
+    "#;
+
     struct AddOneInvocation<'a> {
         kernel: &'a Kernel,
         values: &'a Buffer,
@@ -189,10 +217,22 @@ mod tests {
     struct AddOneReplayInvocation<'a> {
         kernel: &'a Kernel,
         values: &'a Buffer,
-        num_active_threads_key: ReplayParameterKey,
+        num_active_threads: ReplayU32,
         min_num_active_threads: u32,
         num_total_threads: u32,
         num_threads_per_threadblock: u32,
+    }
+
+    struct ScalarReplayInvocation<'a> {
+        kernel: &'a Kernel,
+        output_u64: &'a Buffer,
+        output_i32: &'a Buffer,
+        output_i64: &'a Buffer,
+        output_f32: &'a Buffer,
+        value_u64: ReplayParameterKey,
+        value_i32: ReplayParameterKey,
+        value_i64: ReplayParameterKey,
+        value_f32: ReplayParameterKey,
     }
 
     impl Operator for AddOneInvocation<'_> {
@@ -209,16 +249,37 @@ mod tests {
             builder.set_kernel(self.kernel);
             builder.set_buffer_read_write(0, self.values, 0);
             assert!(self.min_num_active_threads <= self.num_total_threads);
-            builder.bind_u32(
-                1,
-                self.num_active_threads_key,
-                self.min_num_active_threads,
-                self.num_total_threads,
-            );
+            match self.num_active_threads {
+                ReplayU32::Fixed(num_active_threads) => {
+                    assert!(
+                        num_active_threads >= self.min_num_active_threads
+                            && num_active_threads <= self.num_total_threads
+                    );
+                    builder.set_u32(1, num_active_threads);
+                },
+                ReplayU32::Parameter(key) => {
+                    builder.bind_u32(1, key, self.min_num_active_threads, self.num_total_threads);
+                },
+            }
             builder.dispatch_1d(
                 self.num_total_threads as usize,
                 self.num_threads_per_threadblock as usize,
             );
+        }
+    }
+
+    impl Operator for ScalarReplayInvocation<'_> {
+        fn record(self, builder: &CommandRecorder<'_>) {
+            builder.set_kernel(self.kernel);
+            builder.set_buffer_write(0, self.output_u64, 0);
+            builder.set_buffer_write(1, self.output_i32, 0);
+            builder.set_buffer_write(2, self.output_i64, 0);
+            builder.set_buffer_write(3, self.output_f32, 0);
+            builder.bind_u64(4, self.value_u64, 1, 10_000_000_000);
+            builder.bind_i32(5, self.value_i32, -10, 10);
+            builder.bind_i64(6, self.value_i64, -10_000_000_000, 10_000_000_000);
+            builder.bind_f32(7, self.value_f32, -2.0, 2.0);
+            builder.dispatch_1d(1, 1);
         }
     }
 
@@ -236,7 +297,7 @@ mod tests {
         builder.record(AddOneReplayInvocation {
             kernel: &kernel,
             values: &values,
-            num_active_threads_key: NUM_ACTIVE_THREADS,
+            num_active_threads: ReplayU32::Parameter(NUM_ACTIVE_THREADS),
             min_num_active_threads: 1,
             num_total_threads: 4,
             num_threads_per_threadblock: 2,
@@ -316,7 +377,7 @@ mod tests {
         second_builder.record(AddOneReplayInvocation {
             kernel: &kernel,
             values: &values,
-            num_active_threads_key: ACTIVE_LEN,
+            num_active_threads: ReplayU32::Parameter(ACTIVE_LEN),
             min_num_active_threads: 1,
             num_total_threads: 3,
             num_threads_per_threadblock: 2,
@@ -401,7 +462,7 @@ mod tests {
             builder.record(AddOneReplayInvocation {
                 kernel: &kernel,
                 values: &values,
-                num_active_threads_key: ACTIVE_LEN,
+                num_active_threads: ReplayU32::Parameter(ACTIVE_LEN),
                 min_num_active_threads: 1,
                 num_total_threads: 4,
                 num_threads_per_threadblock: 2,
@@ -431,7 +492,7 @@ mod tests {
         builder.record(AddOneReplayInvocation {
             kernel: &kernel,
             values: &values,
-            num_active_threads_key: ACTIVE_LEN,
+            num_active_threads: ReplayU32::Parameter(ACTIVE_LEN),
             min_num_active_threads: 1,
             num_total_threads: 4,
             num_threads_per_threadblock: 2,
@@ -443,6 +504,69 @@ mod tests {
         let max = ReplayArguments::new().with_u32(ACTIVE_LEN, 4);
         stream.submit_replay_with_arguments(&program, &max).wait();
         assert_eq!(values.read_typed::<f32>(0, 4), vec![2.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_fixed_replay_u32() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let values = Buffer::from_slice(&device, &[0.0_f32; 4]);
+
+        let mut builder = stream.create_replay_program();
+        builder.record(AddOneReplayInvocation {
+            kernel: &kernel,
+            values: &values,
+            num_active_threads: ReplayU32::Fixed(2),
+            min_num_active_threads: 1,
+            num_total_threads: 4,
+            num_threads_per_threadblock: 2,
+        });
+        stream.submit_replay(&builder.build()).wait();
+
+        assert_eq!(values.read_typed::<f32>(0, 4), vec![1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_replay_scalar_parameter_types() {
+        const VALUE_U64: ReplayParameterKey = ReplayParameterKey::new("test.scalar.value_u64");
+        const VALUE_I32: ReplayParameterKey = ReplayParameterKey::new("test.scalar.value_i32");
+        const VALUE_I64: ReplayParameterKey = ReplayParameterKey::new("test.scalar.value_i64");
+        const VALUE_F32: ReplayParameterKey = ReplayParameterKey::new("test.scalar.value_f32");
+
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let kernel = Kernel::new(&device, SCALAR_REPLAY_SOURCE, "write_scalars");
+        let output_u64 = Buffer::from_slice(&device, &[0_u64]);
+        let output_i32 = Buffer::from_slice(&device, &[0_i32]);
+        let output_i64 = Buffer::from_slice(&device, &[0_i64]);
+        let output_f32 = Buffer::from_slice(&device, &[0_f32]);
+
+        let mut builder = stream.create_replay_program();
+        builder.record(ScalarReplayInvocation {
+            kernel: &kernel,
+            output_u64: &output_u64,
+            output_i32: &output_i32,
+            output_i64: &output_i64,
+            output_f32: &output_f32,
+            value_u64: VALUE_U64,
+            value_i32: VALUE_I32,
+            value_i64: VALUE_I64,
+            value_f32: VALUE_F32,
+        });
+        let program = builder.build();
+        let arguments = ReplayArguments::new()
+            .with_u64(VALUE_U64, 9_000_000_000)
+            .with_i32(VALUE_I32, -7)
+            .with_i64(VALUE_I64, -9_000_000_000)
+            .with_f32(VALUE_F32, 1.25);
+
+        stream.submit_replay_with_arguments(&program, &arguments).wait();
+
+        assert_eq!(output_u64.read_typed::<u64>(0, 1), vec![9_000_000_000]);
+        assert_eq!(output_i32.read_typed::<i32>(0, 1), vec![-7]);
+        assert_eq!(output_i64.read_typed::<i64>(0, 1), vec![-9_000_000_000]);
+        assert_eq!(output_f32.read_typed::<f32>(0, 1), vec![1.25]);
     }
 
     #[test]

@@ -193,7 +193,7 @@ request's `TrieDecoderBlocks`:
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ MultiLaneBlockCache                                                        │
-│ reserve/commit/free all main + MTP cache lanes as one request operation    │
+│ reserve/commit/free all configured cache lanes as one request operation    │
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -229,6 +229,13 @@ TrieDecoderBlocks::prepare_blocks()
   -> DeviceRequest
   -> model executor page/state tables
 ```
+
+The runtime core carries the compile-time cache-lane count as const `L`.
+`MultiLaneTrieBlockCache<P, L, ...>`, runtime requests, and service runtime types preserve this const through scheduling.
+`RuntimeConfig::cache_lanes` must contain exactly `L` lane configurations.
+Each multi-lane allocation, reserve, commit, and free operation requires one entry for every lane.
+Qwen3.5 MTP configures one Main lane and one lane for each logical MTP step.
+Thus, Qwen3.5 uses `L = num_mtp_steps + 1`.
 
 Mutable and semi-immutable blocks are request-local lifecycle objects. Trie nodes represent immutable identity. Pin
 counts protect reusable nodes from eviction. S3FIFO tracks eligible unpinned leaves.

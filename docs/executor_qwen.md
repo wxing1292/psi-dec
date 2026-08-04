@@ -3,7 +3,7 @@
 This document describes the current Qwen3 and Qwen3.5/Qwen3.6 Metal executors.
 The document covers checkpoint configuration, top-down loading, state preparation, cached replay, and sampling.
 Qwen3 supports separate Vanilla and fixed-block DSpark modes.
-Qwen3.5 supports separate Vanilla, single-module MTP, and fixed-block DSpark modes.
+Qwen3.5 supports separate Vanilla, reusable-layer MTP, and fixed-block DSpark modes.
 The `v3_x` directories contain version-neutral leaf components, utilities, and the Qwen3x DSpark model.
 Each model owns its structural contracts and execution graph.
 
@@ -158,10 +158,12 @@ Qwen35Executor
   speculator: Qwen35Speculator
     Vanilla
     MTP
+      num_steps: usize
       gqa_state: Qwen3xGQAState
       embed: Replay<Qwen35MTPEmbed>
       body: Replay<Qwen35MTP>
       sampling: Replay<DraftSampling>
+      execution: Qwen35MTPExecution
       common: Qwen35SpeculativeResources
     DSpark
       execution: Qwen3xDSparkExecution
@@ -368,7 +370,7 @@ Replay<Qwen35Main>           all Main layers -> final norm
 Replay<Qwen35GatherUnembed>  gather -> unembed
 Replay<Sampling>             ordinary Main sampling
 Replay<Qwen35MTPEmbed>       previous-hidden gather + token embed + input projection
-Replay<Qwen35MTP>            one GQA body layer -> final norm
+Replay<Qwen35MTP>            one physical GQA body layer -> final norm
 Replay<DraftSampling>        draft sampling + sparse draft distribution
 Replay<RejectionSampling>    Main sparse distribution + rejection
 Replay<Rc<GDNRequestStateTable>>
@@ -406,6 +408,7 @@ There is no `final_residual` field, accessor, or allocation.
 Qwen3 Main constructs `Qwen3MainLayerScratch`.
 Qwen3.5 Main constructs `Qwen35MainLayerScratch`.
 Qwen3.5 MTP owns separate layer scratch.
+All configured logical MTP steps reuse this scratch and the same physical weights.
 Similar workspace roles do not imply shared structural ownership.
 
 `Qwen3Main` and `Qwen35Main` accept the shared `MainResidualCapture` boundary.
@@ -493,16 +496,28 @@ The lifecycle does not use a per-batch submitted-state flag.
 When the gate is true, the service calls `embed_spec`.
 `embed_spec` consumes the completed Main output and sampled results.
 
-For MTP, these hooks materialize MTPEmbed, MTP, GatherUnembed, and DraftSampling.
+For MTP, these hooks materialize MTPEmbed, MTP, GatherUnembed, and DraftSampling once.
 For DSpark, they materialize DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
 These hooks do not submit backend work or read backend output.
 
-`submit_spec` submits one model-specific Spec sequence.
-The Qwen3.5 MTP sequence is:
+`submit_spec` starts one model-specific Spec transaction.
+For `--num-mtp-steps K`, the Qwen3.5 MTP owner executes this dependent sequence K times:
 
 ```text
-MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
+for step_index in 0..K:
+    MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
+    sampled token becomes the next step's token input
 ```
+
+The physical weights, scratch, buffer bindings, and replay programs remain the same for every step.
+The MTP output overwrites the stable previous-hidden source buffer, so the next replay consumes the prior MTP output
+without changing a buffer binding.
+The step index is a replay argument for GQA page selection and distribution-row selection.
+It is not part of an MTP replay key.
+
+The current implementation waits and reads after each non-final MTP pass.
+`submit_spec` returns the final submission, and the service performs the final wait and `read_spec` call.
+This preserves one external Spec lifecycle while the MTP owner controls K internal passes.
 
 The Qwen3x DSpark sequence is:
 
@@ -554,7 +569,7 @@ Main GQA prepare_pages
 Main GQA prepare_metadata
 Main GDN prepare_states(req_slots, block_indices, token_indices, cu_tokens, state_txns, state_page_ids_by_req)
 Main GDN prepare_metadata(cu_tokens, prepared_states)
-MTP-mode GQA prepare_pages
+Qwen3.5 MTP page-table prepare
 optional GDN restore + wait
 ```
 
@@ -568,6 +583,20 @@ It records only on a replay miss and waits before Main.
 Commit selects verified state versions.
 It starts an uncached publish when jobs exist.
 
+MTP keeps the GDN current version aligned with the Main runtime cache frontier.
+For one request, Main calculates `num_fixed_tokens = q_len - num_spec_tokens`.
+It commits `input_state_version + num_fixed_tokens + num_accepted_tokens`.
+`num_mtp_steps` does not directly adjust this state version.
+MTP decode replays K - 1 verified tail tokens in the next Main call.
+Qwen verification keeps the verified state version unchanged and calculates
+`replay_source_state_version = verified_state_version - (K - 1)`. It passes this physical source to GDN commit as the
+state version that becomes current.
+The transaction materializes the union of all verified and replay-source choices.
+The next newly sampled token index remains the verified state version.
+Runtime can represent a full prompt as `QueryTokens::Decode` when the prompt fits the token budget, so this rule also
+applies to that zero-spec warm-up.
+`QueryTokens::Prefill` commits its full window without the replay shift.
+
 Runtime core can receive the response while publish continues.
 The next prepare or reset waits before it reuses shared page-I/O or live-state resources.
 
@@ -578,15 +607,19 @@ A state version ahead of its token index is a lifecycle invariant violation and 
 
 ## Supported MTP
 
-The executor supports zero or one MTP module.
-The current checkpoint contract requires one GQA body layer and shared Main token embedding.
+The executor supports zero or more logical MTP steps.
+The current checkpoint contract requires exactly one physical GQA body layer and shared Main token embedding.
 It does not permit dedicated MTP embeddings.
+`num_mtp_steps = K` chains that one physical layer K times.
+The logical model has K+1 token and cache lanes: Main plus one MTP lane for each dependent step.
 
 `Qwen35MTPEmbed` owns previous-hidden gather, the shared `Rc<Embed>`, two checkpoint norms, concatenation, and quantized
 input projection.
 It also owns its private temporary buffers.
 `Qwen35MTP` owns the single `Qwen35MTPLayer`, final norm, and MTP GQA page-table handle.
-There is no separate input-projector type or module loop.
+It maps runtime cache lanes `1..=K` to the matching MTP page-table rows.
+`Qwen35MTPSpeculator` owns the internal step loop and one execution accumulator.
+There is no physical layer vector and no duplicated weight owner.
 
 The composed proposal sequence remains:
 
@@ -594,8 +627,8 @@ The composed proposal sequence remains:
 Main batch submission:
     MainEmbed -> Main -> GatherUnembed -> RejectionSampling
 CPU sampling feedback
-MTP batch submission:
-    MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
+MTP internal passes:
+    K * (MTPEmbed -> MTP -> GatherUnembed -> DraftSampling)
 ```
 
 Normal non-MTP sampling remains:
@@ -633,7 +666,8 @@ Main K/V and persistent DSpark context K/V share one runtime cache-block lifecyc
 The executor owns separate page tables and splits each runtime page span.
 Proposal-local Q/K/V and attention partials remain in executor-owned `DSparkBlockScratch`.
 
-Qwen3.5 GDN keeps one current state and `block_size + 1` candidate states for each request slot.
+Qwen3.5 GDN keeps one current state and `block_size + 1` decision candidates for each DSpark request slot.
+It also reserves cache-block boundary candidates.
 The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, and DSpark.
 These state buffers remain allocated, reusable, and resident with the cached replay resources.
 

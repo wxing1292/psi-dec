@@ -21,7 +21,6 @@ MAX_REQUESTS=4
 MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
 CACHE_BLOCK_TOKENS=16
-MAX_RUNNING_REQUESTS=8
 
 MODEL_ROOT="$HOME/Workspace/models"
 MODEL_DIR=""
@@ -726,7 +725,7 @@ ARCH="$(uname -m)"
 MACHINE="$(machine_id)"
 PROMPT_SHA256="$(printf '%s' "$PROMPT" | shasum -a 256 | awk '{print $1}')"
 
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH model=$MODEL_DIR dspark=$DSPARK_DIR tokenizer=$TOKENIZER_DIR cases=$CASES max_new=$TOKENS runs=$RUNS build=$BUILD grpc_port=$GRPC_PORT http_port=$HTTP_PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_running_requests=$MAX_RUNNING_REQUESTS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_sha256=$PROMPT_SHA256 prompt_chars=${#PROMPT}"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH model=$MODEL_DIR dspark=$DSPARK_DIR tokenizer=$TOKENIZER_DIR cases=$CASES max_new=$TOKENS runs=$RUNS build=$BUILD grpc_port=$GRPC_PORT http_port=$HTTP_PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_sha256=$PROMPT_SHA256 prompt_chars=${#PROMPT}"
 
 for index in "${!SELECTED_CASES[@]}"; do
     case_name="${SELECTED_CASES[$index]}"

@@ -83,9 +83,10 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        help = "Optional Qwen3.5 MTP module-count override; an MTP checkpoint enables 1 by default, otherwise 0"
+        help = "Number of speculative steps that reuse the single Qwen3.5 MTP weight set; defaults to 1 when \
+                --hf-mtp-model-dir is present"
     )]
-    pub mtp_module: Option<usize>,
+    pub num_mtp_steps: Option<NonZeroUsize>,
 
     #[arg(
         long,
@@ -200,8 +201,8 @@ mod tests {
         assert_eq!(mtp.hf_dspark_model_dir, None);
         assert_eq!(dspark.hf_mtp_model_dir, None);
         assert_eq!(dspark.hf_dspark_model_dir, Some("dspark".into()));
-        assert_eq!(mtp.mtp_module, None);
-        assert_eq!(dspark.mtp_module, None);
+        assert_eq!(mtp.num_mtp_steps, None);
+        assert_eq!(dspark.num_mtp_steps, None);
     }
 
     #[test]

@@ -135,6 +135,7 @@ impl ExecutorFixture {
                     args.mtp_model_dir
                         .as_ref()
                         .expect("e2e_w_mtp requires MTP model directory"),
+                    std::num::NonZeroUsize::MIN,
                     config,
                 )
             },
@@ -324,7 +325,7 @@ fn mtp_target_input(response: &BatchDeviceResponse, expected_drafts: usize) -> (
     assert_eq!(
         spec_tokens.len(),
         expected_drafts,
-        "MTP benchmark proposal must produce one draft per configured module"
+        "MTP benchmark proposal must produce one draft per configured step"
     );
     (*sampled_token, spec_tokens.clone())
 }

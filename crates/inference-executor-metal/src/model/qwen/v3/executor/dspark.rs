@@ -35,7 +35,7 @@ impl Qwen3Executor {
                     })),
                 "Qwen3 accepted tokens must match the speculative input prefix"
             );
-            let num_base_tokens = microbatch
+            let num_fixed_tokens = microbatch
                 .q_len(req_index)
                 .checked_sub(
                     num_spec_tokens
@@ -44,7 +44,7 @@ impl Qwen3Executor {
                 )
                 .expect("Qwen3 speculative suffix must fit q_len");
             let anchor_position = microbatch.token_indices()[req_index]
-                .checked_add(num_base_tokens)
+                .checked_add(num_fixed_tokens)
                 .and_then(|position| {
                     position.checked_add(
                         decision

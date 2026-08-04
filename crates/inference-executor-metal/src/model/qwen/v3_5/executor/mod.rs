@@ -93,9 +93,10 @@ include!("mtp.rs");
 include!("recording.rs");
 include!("sampling.rs");
 
+#[allow(clippy::upper_case_acronyms)]
 enum Qwen35Speculator {
     Vanilla,
-    Mtp(Box<Qwen35MTPSpeculator>),
+    MTP(Box<Qwen35MTPSpeculator>),
     DSpark(Box<Qwen35DSparkSpeculator>),
 }
 
@@ -107,6 +108,7 @@ struct Qwen35SpeculativeResources {
 
 struct Qwen35MTPSpeculator {
     common: Qwen35SpeculativeResources,
+    num_steps: usize,
     hidden_input: Rc<Buffer>,
     input_gather_flat_indices: Buffer,
     draft_distribution_indices: Buffer,
@@ -115,6 +117,46 @@ struct Qwen35MTPSpeculator {
     body: Replay<Qwen35MTP>,
     sampling: Replay<DraftSampling>,
     gqa_state: Qwen3xGQAState,
+    execution: Qwen35MTPExecution,
+}
+
+struct Qwen35MTPExecution {
+    requests: Vec<Qwen35MTPRequest>,
+    draft_token_ids: Vec<i32>,
+    draft_probs: Vec<f32>,
+    read_elapsed: Duration,
+    completed_steps: usize,
+}
+
+impl Qwen35MTPExecution {
+    fn new(max_requests: usize, num_steps: usize) -> Self {
+        let proposal_capacity = max_requests
+            .checked_mul(num_steps)
+            .expect("qwen3.5 MTP proposal capacity must fit usize");
+        Self {
+            requests: Vec::with_capacity(max_requests),
+            draft_token_ids: Vec::with_capacity(proposal_capacity),
+            draft_probs: Vec::with_capacity(proposal_capacity),
+            read_elapsed: Duration::ZERO,
+            completed_steps: 0,
+        }
+    }
+
+    fn begin(&mut self, requests: Vec<Qwen35MTPRequest>) {
+        self.requests = requests;
+        self.draft_token_ids.clear();
+        self.draft_probs.clear();
+        self.read_elapsed = Duration::ZERO;
+        self.completed_steps = 0;
+    }
+
+    fn push_step(&mut self, draft_token_ids: &[i32], draft_probs: &[f32], read_elapsed: Duration) {
+        assert_eq!(draft_token_ids.len(), draft_probs.len());
+        self.draft_token_ids.extend_from_slice(draft_token_ids);
+        self.draft_probs.extend_from_slice(draft_probs);
+        self.read_elapsed += read_elapsed;
+        self.completed_steps += 1;
+    }
 }
 
 struct Qwen35DSparkSpeculator {
@@ -128,7 +170,7 @@ impl Qwen35Speculator {
     }
 
     fn is_mtp(&self) -> bool {
-        matches!(self, Self::Mtp(_))
+        matches!(self, Self::MTP(_))
     }
 
     fn is_dspark(&self) -> bool {
@@ -138,21 +180,28 @@ impl Qwen35Speculator {
     fn num_speculative_tokens(&self) -> usize {
         match self {
             Self::Vanilla => 0,
-            Self::Mtp(_) => 1,
+            Self::MTP(mtp) => mtp.num_steps,
             Self::DSpark(dspark) => dspark.execution.block_size(),
+        }
+    }
+
+    fn num_mtp_steps(&self) -> usize {
+        match self {
+            Self::MTP(mtp) => mtp.num_steps,
+            Self::Vanilla | Self::DSpark(_) => 0,
         }
     }
 
     fn mtp(&self) -> &Qwen35MTPSpeculator {
         match self {
-            Self::Mtp(mtp) => mtp,
+            Self::MTP(mtp) => mtp,
             Self::Vanilla | Self::DSpark(_) => panic!("qwen3.5 executor has no MTP resources"),
         }
     }
 
     fn mtp_mut(&mut self) -> &mut Qwen35MTPSpeculator {
         match self {
-            Self::Mtp(mtp) => mtp,
+            Self::MTP(mtp) => mtp,
             Self::Vanilla | Self::DSpark(_) => panic!("qwen3.5 executor has no MTP resources"),
         }
     }
@@ -160,21 +209,21 @@ impl Qwen35Speculator {
     fn dspark(&self) -> &Qwen35DSparkSpeculator {
         match self {
             Self::DSpark(dspark) => dspark,
-            Self::Vanilla | Self::Mtp(_) => panic!("qwen3.5 executor has no DSpark resources"),
+            Self::Vanilla | Self::MTP(_) => panic!("qwen3.5 executor has no DSpark resources"),
         }
     }
 
     fn dspark_mut(&mut self) -> &mut Qwen35DSparkSpeculator {
         match self {
             Self::DSpark(dspark) => dspark,
-            Self::Vanilla | Self::Mtp(_) => panic!("qwen3.5 executor has no DSpark resources"),
+            Self::Vanilla | Self::MTP(_) => panic!("qwen3.5 executor has no DSpark resources"),
         }
     }
 
     fn common(&self) -> &Qwen35SpeculativeResources {
         match self {
             Self::Vanilla => panic!("qwen3.5 Vanilla executor has no speculative resources"),
-            Self::Mtp(mtp) => &mtp.common,
+            Self::MTP(mtp) => &mtp.common,
             Self::DSpark(dspark) => &dspark.common,
         }
     }
@@ -182,7 +231,7 @@ impl Qwen35Speculator {
     fn common_mut(&mut self) -> &mut Qwen35SpeculativeResources {
         match self {
             Self::Vanilla => panic!("qwen3.5 Vanilla executor has no speculative resources"),
-            Self::Mtp(mtp) => &mut mtp.common,
+            Self::MTP(mtp) => &mut mtp.common,
             Self::DSpark(dspark) => &mut dspark.common,
         }
     }
@@ -190,7 +239,7 @@ impl Qwen35Speculator {
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]) {
         match self {
             Self::Vanilla => {},
-            Self::Mtp(mtp) => {
+            Self::MTP(mtp) => {
                 mtp.gqa_state.reset_req_slots(request_slots);
                 mtp.common.spec_probs.reset_req_slots(request_slots);
             },
@@ -278,6 +327,7 @@ impl Qwen35ModelOpsRecorder {
 struct Qwen35MTPRequest {
     num_tokens: usize,
     current_token_ids: Vec<i32>,
+    prefill_token_ids_by_step: Vec<Vec<i32>>,
     next_token_id: Option<i32>,
     decision_index: Option<usize>,
 }
@@ -290,13 +340,14 @@ struct Qwen35MTPBatch {
     sample_positions: Vec<u32>,
 }
 
-fn mtp_proposal_sample_position(token_index: u32, num_tokens: usize) -> u32 {
+fn mtp_proposal_sample_position(token_index: u32, num_tokens: usize, step_index: usize) -> u32 {
     token_index
         .checked_add(
             num_tokens
                 .try_into()
                 .expect("qwen3.5 MTP request token count must fit u32"),
         )
+        .and_then(|position| position.checked_add(step_index.try_into().expect("qwen3.5 MTP step index must fit u32")))
         .and_then(|position| position.checked_add(1))
         .expect("qwen3.5 MTP proposal sample position overflow")
 }
@@ -348,11 +399,8 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
                 SamplerConfig::from_runtime(&request.sampling_config, seed)
             })
             .collect();
-        let model_batch_request = Qwen35ModelBatchRequest::from_core_batch(
-            core_batch_req,
-            usize::from(self.speculator.is_mtp()),
-            sampler_configs,
-        );
+        let model_batch_request =
+            Qwen35ModelBatchRequest::from_core_batch(core_batch_req, self.speculator.num_mtp_steps(), sampler_configs);
         let microbatch = model_batch_request.microbatch();
         trace::qwen35_state(|| {
             format!(
@@ -362,9 +410,10 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
                 microbatch.req_slots(),
                 microbatch.token_indices(),
                 microbatch
-                    .gdn_state_txns()
+                    .req_slots()
                     .iter()
-                    .map(|txn| txn.num_spec_tokens)
+                    .enumerate()
+                    .map(|(req_index, _)| microbatch.num_spec_tokens(req_index))
                     .collect::<Vec<_>>(),
                 microbatch
                     .sampler_configs()
@@ -414,7 +463,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         debug_assert_eq!(gdn_shape.num_tokens as usize, microbatch.total_tokens());
         debug_assert_eq!(gdn_shape.num_reqs as usize, microbatch.num_reqs());
         if self.speculator.is_mtp() {
-            self.speculator.mtp().gqa_state.prepare_pages(core_batch_req);
+            self.speculator.mtp().body.component().prepare_pages(core_batch_req);
         }
         let prepare_elapsed = prepare_start.elapsed();
         trace::qwen35_state(|| {
@@ -649,7 +698,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
     }
 
     fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, sampled_output: &Self::SampledOutput) -> bool {
-        self.speculator.is_enabled() && !sampled_output.decisions.is_empty()
+        self.speculator.is_mtp() || (self.speculator.is_dspark() && !sampled_output.decisions.is_empty())
     }
 
     fn embed_spec(
@@ -840,8 +889,9 @@ mod tests {
     use super::replay_bucket_capacity;
 
     #[test]
-    fn test_mtp_proposal_sample_position_follows_single_body() {
-        assert_eq!(mtp_proposal_sample_position(17, 3), 21);
+    fn test_mtp_proposal_sample_position_advances_per_step() {
+        assert_eq!(mtp_proposal_sample_position(17, 3, 0), 21);
+        assert_eq!(mtp_proposal_sample_position(17, 3, 3), 24);
     }
 
     #[test]
@@ -854,7 +904,7 @@ mod tests {
     #[test]
     fn test_embed_keys_separate_token_counts() {
         assert_ne!(Qwen35MainEmbedReplayKey::new(1), Qwen35MainEmbedReplayKey::new(2));
-        assert_ne!(Qwen35MTPEmbedReplayKey::new(0, 1), Qwen35MTPEmbedReplayKey::new(0, 2));
+        assert_ne!(Qwen35MTPEmbedReplayKey::new(1), Qwen35MTPEmbedReplayKey::new(2));
     }
 
     #[test]

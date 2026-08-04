@@ -16,6 +16,7 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
+use crate::model::qwen::v3_5::mtp::QWEN35_MTP_GQA_LAYER_INDEX;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
 use crate::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
@@ -87,7 +88,7 @@ impl Qwen35MTPLayer {
                     store,
                     &core,
                     metal,
-                    0,
+                    inference_backend_metal::metal::ReplayU32::Parameter(QWEN35_MTP_GQA_LAYER_INDEX),
                     bindings,
                     Rc::clone(gqa_state.backend()),
                     Rc::clone(gqa_state.scratch()),

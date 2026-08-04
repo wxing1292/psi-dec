@@ -19,6 +19,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
@@ -502,7 +503,6 @@ impl Fixture {
                 num_gqa_layers: self.page_table_layout.num_gqa_layers,
                 num_page_ids_per_block: self.page_table_layout.num_page_ids_per_block,
             },
-            gqa_layer_index: 0,
         }
     }
 }
@@ -697,7 +697,6 @@ fn single_sdpa_replay(
             num_gqa_layers: page_table_layout.num_gqa_layers,
             num_page_ids_per_block: page_table_layout.num_page_ids_per_block,
         },
-        gqa_layer_index: 0,
         kv_token_tile_size: params.single_kv_tile,
         num_threads_per_threadblock: params.single_threads,
         q_head_tile_size: q_head_tile,
@@ -706,16 +705,19 @@ fn single_sdpa_replay(
     let kernels = GQAPagedSDPAKernels::new(device, sdpa_config, sdpa_shape);
     let scratch = scratch.bindings();
     let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
-    recorder.record(ReplayOp::opaque(kernels.invoke_map(GQAPagedSDPAMapBuffers {
-        q: scratch.q_norm_rope,
-        kv_pages: pages,
-        req_slots: metadata.req_slots(),
-        page_ids,
-        sdpa_map_task_templates: metadata.sdpa_map_task_templates(),
-        partial_exp_sums: scratch.sdpa_partial_exp_sums,
-        partial_max_logits: scratch.sdpa_partial_max_logits,
-        partial_output: scratch.sdpa_partial_output,
-    })));
+    recorder.record(ReplayOp::opaque(kernels.invoke_map(
+        GQAPagedSDPAMapBuffers {
+            q: scratch.q_norm_rope,
+            kv_pages: pages,
+            req_slots: metadata.req_slots(),
+            page_ids,
+            sdpa_map_task_templates: metadata.sdpa_map_task_templates(),
+            partial_exp_sums: scratch.sdpa_partial_exp_sums,
+            partial_max_logits: scratch.sdpa_partial_max_logits,
+            partial_output: scratch.sdpa_partial_output,
+        },
+        ReplayU32::Fixed(0),
+    )));
     recorder.record_with_barrier_before(ReplayOp::opaque(kernels.invoke_reduce(GQAPagedSDPAReduceBuffers {
         partial_exp_sums: scratch.sdpa_partial_exp_sums,
         partial_max_logits: scratch.sdpa_partial_max_logits,
@@ -757,7 +759,6 @@ fn tiled_sdpa_replay(
             num_gqa_layers: page_table_layout.num_gqa_layers,
             num_page_ids_per_block: page_table_layout.num_page_ids_per_block,
         },
-        gqa_layer_index: 0,
     };
     let tiled_shape = GQATiledSDPAShape {
         num_tokens: shape.num_tokens,
@@ -767,18 +768,21 @@ fn tiled_sdpa_replay(
     let kernels = GQATiledSDPAKernels::new(device, tiled_config, tiled_shape);
     let scratch = scratch.bindings();
     let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
-    recorder.record(ReplayOp::opaque(kernels.invoke_map(GQATiledSDPAMapBuffers {
-        q: scratch.q_norm_rope,
-        kv_pages: pages,
-        req_slots: metadata.req_slots(),
-        page_ids,
-        flat_token_indices: metadata.flat_token_indices(),
-        q_token_tiles: metadata.q_token_tiles(),
-        sdpa_map_task_templates: metadata.sdpa_map_task_templates(),
-        partial_output: scratch.sdpa_partial_output,
-        partial_exp_sums: scratch.sdpa_partial_exp_sums,
-        partial_max_logits: scratch.sdpa_partial_max_logits,
-    })));
+    recorder.record(ReplayOp::opaque(kernels.invoke_map(
+        GQATiledSDPAMapBuffers {
+            q: scratch.q_norm_rope,
+            kv_pages: pages,
+            req_slots: metadata.req_slots(),
+            page_ids,
+            flat_token_indices: metadata.flat_token_indices(),
+            q_token_tiles: metadata.q_token_tiles(),
+            sdpa_map_task_templates: metadata.sdpa_map_task_templates(),
+            partial_output: scratch.sdpa_partial_output,
+            partial_exp_sums: scratch.sdpa_partial_exp_sums,
+            partial_max_logits: scratch.sdpa_partial_max_logits,
+        },
+        ReplayU32::Fixed(0),
+    )));
     recorder.record_with_barrier_before(ReplayOp::opaque(kernels.invoke_reduce(GQATiledSDPAReduceBuffers {
         partial_output: scratch.sdpa_partial_output,
         partial_exp_sums: scratch.sdpa_partial_exp_sums,

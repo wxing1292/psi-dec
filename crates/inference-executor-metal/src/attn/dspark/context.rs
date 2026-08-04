@@ -10,6 +10,7 @@ use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTable
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::GQAPageTableLayout;
@@ -185,7 +186,6 @@ impl UngatedDSparkGQAContextAppender {
                     num_blocks: input.page_table_layout.num_blocks,
                     num_page_ids_per_block: input.page_table_layout.num_page_ids_per_block,
                 },
-                gqa_layer_index: input.gqa_layer_index,
             },
             GQAKVPageWriteBuffers {
                 pages: input.kv_cache.kv_pages,
@@ -195,6 +195,7 @@ impl UngatedDSparkGQAContextAppender {
                 flat_token_indices: input.flat_token_indices,
                 page_ids: input.kv_cache.page_ids,
             },
+            ReplayU32::Fixed(input.gqa_layer_index),
         )));
     }
 }

@@ -148,6 +148,8 @@ The stages retain separate replay keys and programs.
 Main, MTP, and DSpark body token counts remain exact.
 The complete upstream model slice does not yet share an inactive-lane ABI.
 MTP draft sampling is a distinct replay after MTP GatherUnembed.
+For K MTP steps, each pass writes one request-local draft-distribution row at `step_index`.
+The step index is runtime metadata and does not enter the sampling replay key.
 DSpark Markov sampling is a distinct replay after `Qwen3xDSparkGatherUnembed`.
 Sparse Main distributions and rejection form one Main-stage replay.
 

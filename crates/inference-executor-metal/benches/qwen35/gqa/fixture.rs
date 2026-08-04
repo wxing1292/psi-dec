@@ -23,6 +23,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_executor_core::attn::GQACore;
@@ -387,7 +388,7 @@ impl<'a> RealGQAFixture<'a> {
             &mut builder,
             GQAInput {
                 page_table_layout,
-                gqa_layer_index: 0,
+                gqa_layer_index: ReplayU32::Fixed(0),
                 batch_metadata: &batch_metadata,
                 hidden_state: &hidden_state,
                 next_hidden_state: &next_hidden_state,
@@ -483,7 +484,6 @@ impl<'a> RealGQAFixture<'a> {
             GQAKVPageWriteShape {
                 num_token_writes: num_tokens,
                 page_table_layout: metal_page_table_layout,
-                gqa_layer_index: 0,
             },
             GQAKVPageWriteBuffers {
                 pages: &kv_pages,
@@ -493,19 +493,23 @@ impl<'a> RealGQAFixture<'a> {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 page_ids: &page_ids,
             },
+            ReplayU32::Fixed(0),
         )));
-        tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_map(GQATiledSDPAMapBuffers {
-            q: &q_norm_rope,
-            kv_pages: &kv_pages,
-            req_slots: batch_metadata.req_slots(),
-            page_ids: &page_ids,
-            flat_token_indices: tiled_batch_metadata.flat_token_indices(),
-            q_token_tiles: tiled_batch_metadata.q_token_tiles(),
-            sdpa_map_task_templates: tiled_batch_metadata.sdpa_map_task_templates(),
-            partial_output: &tiled_partial_output,
-            partial_exp_sums: &tiled_partial_exp_sums,
-            partial_max_logits: &tiled_partial_max_logits,
-        })));
+        tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_map(
+            GQATiledSDPAMapBuffers {
+                q: &q_norm_rope,
+                kv_pages: &kv_pages,
+                req_slots: batch_metadata.req_slots(),
+                page_ids: &page_ids,
+                flat_token_indices: tiled_batch_metadata.flat_token_indices(),
+                q_token_tiles: tiled_batch_metadata.q_token_tiles(),
+                sdpa_map_task_templates: tiled_batch_metadata.sdpa_map_task_templates(),
+                partial_output: &tiled_partial_output,
+                partial_exp_sums: &tiled_partial_exp_sums,
+                partial_max_logits: &tiled_partial_max_logits,
+            },
+            ReplayU32::Fixed(0),
+        )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
             GQATiledSDPAReduceBuffers {
                 partial_output: &tiled_partial_output,
@@ -593,16 +597,19 @@ impl<'a> RealGQAFixture<'a> {
         let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
         let single_q_token_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(sdpa.invoke_map(GQAPagedSDPAMapBuffers {
-                q: &self._q_norm_rope,
-                kv_pages: &self._kv_pages,
-                req_slots: self.batch_metadata.req_slots(),
-                page_ids: &self._page_ids,
-                sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
-                partial_exp_sums: &self._sdpa_partial_exp_sums,
-                partial_max_logits: &self._sdpa_partial_max_logits,
-                partial_output: &self._sdpa_partial_output,
-            })));
+            builder.record(ReplayOp::opaque(sdpa.invoke_map(
+                GQAPagedSDPAMapBuffers {
+                    q: &self._q_norm_rope,
+                    kv_pages: &self._kv_pages,
+                    req_slots: self.batch_metadata.req_slots(),
+                    page_ids: &self._page_ids,
+                    sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
+                    partial_exp_sums: &self._sdpa_partial_exp_sums,
+                    partial_max_logits: &self._sdpa_partial_max_logits,
+                    partial_output: &self._sdpa_partial_output,
+                },
+                ReplayU32::Fixed(0),
+            )));
             builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
                 partial_exp_sums: &self._sdpa_partial_exp_sums,
                 partial_max_logits: &self._sdpa_partial_max_logits,
@@ -625,18 +632,21 @@ impl<'a> RealGQAFixture<'a> {
         let tiled = GQATiledSDPAKernels::new(&self.device, tiled_config, tiled_shape);
         let tiled_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(tiled.invoke_map(GQATiledSDPAMapBuffers {
-                q: &self._q_norm_rope,
-                kv_pages: &self._kv_pages,
-                req_slots: self.tiled_batch_metadata.req_slots(),
-                page_ids: &self._page_ids,
-                flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
-                q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
-                partial_output: &self._tiled_partial_output,
-                partial_exp_sums: &self._tiled_partial_exp_sums,
-                partial_max_logits: &self._tiled_partial_max_logits,
-            })));
+            builder.record(ReplayOp::opaque(tiled.invoke_map(
+                GQATiledSDPAMapBuffers {
+                    q: &self._q_norm_rope,
+                    kv_pages: &self._kv_pages,
+                    req_slots: self.tiled_batch_metadata.req_slots(),
+                    page_ids: &self._page_ids,
+                    flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
+                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
+                    sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
+                    partial_output: &self._tiled_partial_output,
+                    partial_exp_sums: &self._tiled_partial_exp_sums,
+                    partial_max_logits: &self._tiled_partial_max_logits,
+                },
+                ReplayU32::Fixed(0),
+            )));
             builder.record_with_barrier_before(ReplayOp::opaque(tiled.invoke_reduce(GQATiledSDPAReduceBuffers {
                 partial_output: &self._tiled_partial_output,
                 partial_exp_sums: &self._tiled_partial_exp_sums,
@@ -792,7 +802,6 @@ impl<'a> RealGQAFixture<'a> {
                 GQAKVPageWriteShape {
                     num_token_writes: self.num_tokens,
                     page_table_layout,
-                    gqa_layer_index: 0,
                 },
                 GQAKVPageWriteBuffers {
                     pages: &self._kv_pages,
@@ -802,20 +811,24 @@ impl<'a> RealGQAFixture<'a> {
                     flat_token_indices: self.batch_metadata.flat_token_indices(),
                     page_ids: &self._page_ids,
                 },
+                ReplayU32::Fixed(0),
             ),
         );
         let single_q_token_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(sdpa.invoke_map(GQAPagedSDPAMapBuffers {
-                q: &self._q_norm_rope,
-                kv_pages: &self._kv_pages,
-                req_slots: self.batch_metadata.req_slots(),
-                page_ids: &self._page_ids,
-                sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
-                partial_exp_sums: &self._sdpa_partial_exp_sums,
-                partial_max_logits: &self._sdpa_partial_max_logits,
-                partial_output: &self._sdpa_partial_output,
-            })));
+            builder.record(ReplayOp::opaque(sdpa.invoke_map(
+                GQAPagedSDPAMapBuffers {
+                    q: &self._q_norm_rope,
+                    kv_pages: &self._kv_pages,
+                    req_slots: self.batch_metadata.req_slots(),
+                    page_ids: &self._page_ids,
+                    sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
+                    partial_exp_sums: &self._sdpa_partial_exp_sums,
+                    partial_max_logits: &self._sdpa_partial_max_logits,
+                    partial_output: &self._sdpa_partial_output,
+                },
+                ReplayU32::Fixed(0),
+            )));
             builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
                 partial_exp_sums: &self._sdpa_partial_exp_sums,
                 partial_max_logits: &self._sdpa_partial_max_logits,
@@ -834,18 +847,21 @@ impl<'a> RealGQAFixture<'a> {
         let tiled_kernel = GQATiledSDPAKernels::new(&self.device, tiled_config, tiled_shape);
         let tiled_replay = {
             let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(tiled_kernel.invoke_map(GQATiledSDPAMapBuffers {
-                q: &self._q_norm_rope,
-                kv_pages: &self._kv_pages,
-                req_slots: self.tiled_batch_metadata.req_slots(),
-                page_ids: &self._page_ids,
-                flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
-                q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
-                partial_output: &self._tiled_partial_output,
-                partial_exp_sums: &self._tiled_partial_exp_sums,
-                partial_max_logits: &self._tiled_partial_max_logits,
-            })));
+            builder.record(ReplayOp::opaque(tiled_kernel.invoke_map(
+                GQATiledSDPAMapBuffers {
+                    q: &self._q_norm_rope,
+                    kv_pages: &self._kv_pages,
+                    req_slots: self.tiled_batch_metadata.req_slots(),
+                    page_ids: &self._page_ids,
+                    flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
+                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
+                    sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
+                    partial_output: &self._tiled_partial_output,
+                    partial_exp_sums: &self._tiled_partial_exp_sums,
+                    partial_max_logits: &self._tiled_partial_max_logits,
+                },
+                ReplayU32::Fixed(0),
+            )));
             builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
                 GQATiledSDPAReduceBuffers {
                     partial_output: &self._tiled_partial_output,

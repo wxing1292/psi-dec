@@ -4,8 +4,7 @@ use inference_runtime_core::runtime::RawComputeSlotSeq;
 
 use crate::model::qwen::v3_5::Qwen35DecodeDecision;
 use crate::model::qwen::v3_5::Qwen35Microbatch;
-use crate::model::qwen::v3_5::verified_state_versions;
-use crate::model::qwen::v3_5::verified_state_versions_for_decisions;
+use crate::model::qwen::v3_5::gdn_commit_state_versions;
 
 #[derive(Clone, Debug)]
 pub struct Qwen35PendingTransactions {
@@ -64,11 +63,7 @@ impl Qwen35PendingTransactions {
             .pop_front()
             .expect("qwen3.5 verified pending transaction must remain available");
         let microbatch = transaction.microbatch;
-        if decisions.is_empty() {
-            verified_state_versions(&microbatch)
-        } else {
-            verified_state_versions_for_decisions(&microbatch, decisions)
-        }
+        gdn_commit_state_versions(&microbatch, decisions)
     }
 }
 
@@ -107,7 +102,7 @@ mod tests {
 
         transactions.push(1, request);
 
-        assert_eq!(transactions.commit(1, &[]), vec![6]);
+        assert_eq!(transactions.commit(1, &[Qwen35DecodeDecision::default()]), vec![6]);
     }
 
     #[test]
@@ -126,9 +121,9 @@ mod tests {
         transactions.push(2, request_with_tokens(vec![12], vec![]));
 
         assert_eq!(transactions.pending_microbatch(1).flat_token_ids(), &[11]);
-        assert_eq!(transactions.commit(1, &[]), vec![5]);
+        assert_eq!(transactions.commit(1, &[Qwen35DecodeDecision::default()]), vec![5]);
         assert_eq!(transactions.pending_microbatch(2).flat_token_ids(), &[12]);
-        assert_eq!(transactions.commit(2, &[]), vec![5]);
+        assert_eq!(transactions.commit(2, &[Qwen35DecodeDecision::default()]), vec![5]);
         assert!(transactions.transactions.is_empty());
     }
 

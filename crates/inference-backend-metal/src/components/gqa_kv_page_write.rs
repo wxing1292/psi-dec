@@ -6,6 +6,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const GQA_KV_PAGE_WRITE_SOURCE: &str = include_str!("metal/gqa_kv_page_write.metal");
 
@@ -96,7 +97,6 @@ impl GQAKVPageWriteConfig {
 pub struct GQAKVPageWriteShape {
     pub num_token_writes: u32,
     pub page_table_layout: GQAPageTableLayout,
-    pub gqa_layer_index: u32,
 }
 
 impl GQAKVPageWriteShape {
@@ -104,7 +104,6 @@ impl GQAKVPageWriteShape {
         config.validate();
         assert!(self.num_token_writes > 0);
         self.page_table_layout.validate();
-        assert!(self.gqa_layer_index < self.page_table_layout.num_gqa_layers);
         assert_u32_count_domain(config.num_total_threads(self), "GQA KV page-write threads");
     }
 
@@ -147,12 +146,14 @@ impl GQAKVPageWrite {
         &'a self,
         shape: GQAKVPageWriteShape,
         buffers: GQAKVPageWriteBuffers<'a>,
+        page_table_index: ReplayU32,
     ) -> GQAKVPageWriteInvocation<'a> {
         GQAKVPageWriteInvocation {
             config: self.config,
             kernel: &self.kernel,
             shape,
             buffers,
+            page_table_index,
         }
     }
 }
@@ -174,6 +175,7 @@ pub struct GQAKVPageWriteInvocation<'a> {
     kernel: &'a Kernel,
     shape: GQAKVPageWriteShape,
     buffers: GQAKVPageWriteBuffers<'a>,
+    page_table_index: ReplayU32,
 }
 
 impl Operator for GQAKVPageWriteInvocation<'_> {
@@ -187,7 +189,17 @@ impl Operator for GQAKVPageWriteInvocation<'_> {
         builder.set_buffer_read(4, self.buffers.flat_token_indices, 0);
         builder.set_buffer_read(5, self.buffers.page_ids, 0);
         builder.set_u32(6, self.shape.num_token_writes);
-        builder.set_u32(7, self.shape.gqa_layer_index);
+        let max_page_table_index = self.shape.page_table_layout.num_gqa_layers - 1;
+        match self.page_table_index {
+            ReplayU32::Fixed(page_table_index) => {
+                assert!(
+                    page_table_index <= max_page_table_index,
+                    "GQA page-table index exceeds layer count"
+                );
+                builder.set_u32(7, page_table_index);
+            },
+            ReplayU32::Parameter(key) => builder.bind_u32(7, key, 0, max_page_table_index),
+        }
         builder.set_u32(8, self.shape.page_table_layout.num_gqa_layers);
         builder.set_u32(9, self.shape.page_table_layout.num_blocks);
         builder.set_u32(10, self.shape.page_table_layout.num_page_ids_per_block);
@@ -228,7 +240,6 @@ mod tests {
                 num_blocks: 1,
                 num_page_ids_per_block: 1,
             },
-            gqa_layer_index: 0,
         }
         .validate(config);
     }
@@ -279,7 +290,6 @@ mod tests {
                 num_blocks: 1,
                 num_page_ids_per_block: 1,
             },
-            gqa_layer_index: 0,
         };
         let kernel = GQAKVPageWrite::new(device, config);
         let mut builder = stream.create_replay_program();
@@ -293,6 +303,7 @@ mod tests {
                 flat_token_indices: &flat_token_indices,
                 page_ids: &page_ids,
             },
+            ReplayU32::Fixed(0),
         ));
         stream.submit_replay(&builder.build()).wait();
     }

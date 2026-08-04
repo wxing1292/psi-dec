@@ -9,21 +9,21 @@ impl Qwen35Executor {
                 let decision = &decisions[decision_index];
                 let num_spec_tokens = microbatch.num_spec_tokens(req_index) as usize;
                 assert!(
-                    num_spec_tokens <= usize::from(self.speculator.is_mtp()),
+                    num_spec_tokens <= self.speculator.num_speculative_tokens(),
                     "qwen3.5 MTP proposal num_spec_tokens exceeds initialized MTP capacity"
                 );
-                let num_base_tokens = (flat_end - flat_start)
+                let num_fixed_tokens = (flat_end - flat_start)
                     .checked_sub(num_spec_tokens)
                     .expect("qwen3.5 MTP proposal requires num_spec_tokens <= q_len");
                 assert!(
-                    num_base_tokens > 0,
+                    num_fixed_tokens > 0,
                     "qwen3.5 MTP proposal requires a non-spec anchor token"
                 );
                 assert!(
                     decision.validated_tokens.len() <= num_spec_tokens,
                     "qwen3.5 MTP proposal accepted tokens exceed speculative suffix"
                 );
-                let accepted_start = flat_start + num_base_tokens;
+                let accepted_start = flat_start + num_fixed_tokens;
                 let accepted_end = accepted_start + decision.validated_tokens.len();
                 assert!(
                     microbatch.flat_token_ids()[accepted_start..accepted_end]
@@ -34,10 +34,11 @@ impl Qwen35Executor {
                         })),
                     "qwen3.5 MTP accepted tokens must be the speculative input prefix"
                 );
-                let num_tokens = num_base_tokens + decision.validated_tokens.len();
+                let num_tokens = num_fixed_tokens + decision.validated_tokens.len();
                 requests.push(Qwen35MTPRequest {
                     num_tokens,
                     current_token_ids: microbatch.flat_token_ids()[flat_start..flat_start + num_tokens].to_vec(),
+                    prefill_token_ids_by_step: Vec::new(),
                     next_token_id: Some(
                         decision
                             .sampled_token
@@ -51,6 +52,9 @@ impl Qwen35Executor {
                 requests.push(Qwen35MTPRequest {
                     num_tokens: flat_end - flat_start,
                     current_token_ids: Vec::new(),
+                    prefill_token_ids_by_step: (1..=self.speculator.mtp().num_steps)
+                        .map(|lane| microbatch.token_ids_for_lane(req_index, lane).to_vec())
+                        .collect(),
                     next_token_id: None,
                     decision_index: None,
                 });
@@ -68,7 +72,12 @@ impl Qwen35Executor {
         requests
     }
 
-    fn mtp_batch(&self, microbatch: &Qwen35Microbatch, requests: &mut [Qwen35MTPRequest]) -> Qwen35MTPBatch {
+    fn mtp_batch(
+        &self,
+        microbatch: &Qwen35Microbatch,
+        requests: &mut [Qwen35MTPRequest],
+        step_index: usize,
+    ) -> Qwen35MTPBatch {
         let mut flat_token_ids = Vec::new();
         let mut flat_sample_mask = Vec::new();
         let mut cu_tokens = Vec::with_capacity(requests.len() + 1);
@@ -89,7 +98,7 @@ impl Qwen35Executor {
                 flat_token_ids.push(next_token_id);
                 request.current_token_ids = flat_token_ids[flat_start..flat_start + request.num_tokens].to_vec();
             } else {
-                let lane_tokens = microbatch.token_ids_for_lane(req_index, 1);
+                let lane_tokens = &request.prefill_token_ids_by_step[step_index];
                 assert_eq!(
                     lane_tokens.len(),
                     request.num_tokens,
@@ -117,12 +126,13 @@ impl Qwen35Executor {
                         .mtp()
                         .common
                         .spec_probs
-                        .draft_distribution_index(req_slot, 0),
+                        .draft_distribution_index(req_slot, step_index),
                 );
                 sampler_configs.push(microbatch.sampler_configs()[req_index]);
                 sample_positions.push(mtp_proposal_sample_position(
                     microbatch.token_indices()[req_index],
                     request.num_tokens,
+                    step_index,
                 ));
             }
             cu_tokens.push(
@@ -136,8 +146,9 @@ impl Qwen35Executor {
             .iter()
             .enumerate()
             .map(|(req_index, request)| {
+                let token_index = microbatch.token_indices()[req_index];
                 GDNStateTxn::new(
-                    microbatch.token_indices()[req_index],
+                    token_index,
                     request
                         .num_tokens
                         .try_into()
@@ -181,7 +192,7 @@ impl Qwen35Executor {
             "qwen3.5 MTP proposal requires one decision per decode request"
         );
         let mut requests = self.mtp_requests(microbatch, decisions);
-        let module_batch = self.mtp_batch(microbatch, &mut requests);
+        let module_batch = self.mtp_batch(microbatch, &mut requests, 0);
         let num_tokens = module_batch.microbatch.total_tokens();
         let num_mtp_sample_rows = module_batch.sampler_configs.len();
         self.write_token_ids(module_batch.microbatch.flat_token_ids());
@@ -200,8 +211,8 @@ impl Qwen35Executor {
                 .draft_distribution_indices
                 .write_typed(0, &module_batch.draft_distribution_indices);
         }
-        let mtp_key = Qwen35MTPReplayKey::new(0, num_tokens, mtp_gqa_shape);
-        let mtp_embed_key = Qwen35MTPEmbedReplayKey::new(0, num_tokens);
+        let mtp_key = Qwen35MTPReplayKey::new(num_tokens, mtp_gqa_shape);
+        let mtp_embed_key = Qwen35MTPEmbedReplayKey::new(num_tokens);
         let mtp_hidden_input = Rc::clone(&self.speculator.mtp().hidden_input);
         let mtp_embed_build_start = Instant::now();
         let mtp = self.speculator.mtp_mut();
@@ -235,13 +246,13 @@ impl Qwen35Executor {
                     .expect("qwen3.5 MTP decode request requires a decision")
             })
             .collect();
+        self.speculator.mtp_mut().execution.begin(requests);
         trace::qwen35_state(|| {
             format!(
-                "event=mtp_embed_record mtp_module_index={} num_tokens={} num_reqs={} num_sample_rows={} cache_hit={} \
+                "event=mtp_embed_record num_tokens={} num_reqs={} num_sample_rows={} cache_hit={} \
                  key={:?}",
-                0,
                 num_tokens,
-                requests.len(),
+                microbatch.num_reqs(),
                 num_mtp_sample_rows,
                 mtp_embed_cache_hit,
                 mtp_embed_key,
@@ -295,9 +306,8 @@ impl Qwen35Executor {
         }
         trace::qwen35_state(|| {
             format!(
-                "event=mtp_record mtp_module_index={} num_tokens={} num_reqs={} num_sample_rows={} \
+                "event=mtp_record num_tokens={} num_reqs={} num_sample_rows={} \
                  mtp_embed_cache_hit={} cache_hit={} key={:?}",
-                0,
                 num_tokens,
                 microbatch.num_reqs(),
                 recorder.num_mtp_sample_rows(),
@@ -337,7 +347,7 @@ impl Qwen35Executor {
         recorder.mtp_sampling_arguments = mtp_sampling_arguments;
     }
 
-    fn submit_mtp_recording(&self, recorder: &Qwen35ModelOpsRecorder) -> MetalReplaySubmission {
+    fn submit_mtp_step(&self, recorder: &Qwen35ModelOpsRecorder, step_index: usize) -> MetalReplaySubmission {
         let mtp_embed_key = recorder
             .mtp_embed_key
             .as_ref()
@@ -350,10 +360,17 @@ impl Qwen35Executor {
         let mtp_embed_replay = mtp.embed.replay(mtp_embed_key);
         let mtp_replay = mtp.body.replay(mtp_key);
         let empty_arguments = ReplayArguments::new();
+        let gqa_layer_index = step_index
+            .try_into()
+            .expect("qwen3.5 MTP GQA layer index must fit u32");
+        let mtp_arguments = ReplayArguments::new().with_u32(
+            crate::model::qwen::v3_5::mtp::QWEN35_MTP_GQA_LAYER_INDEX,
+            gqa_layer_index,
+        );
         if recorder.num_mtp_sample_rows() == 0 {
             return self.replay_runtime().submit_replay_sequence(&[
                 ReplayExecution::new(mtp_embed_replay, &empty_arguments),
-                ReplayExecution::new(mtp_replay, &empty_arguments),
+                ReplayExecution::new(mtp_replay, &mtp_arguments),
             ]);
         }
         let gather_unembed_key = recorder
@@ -366,13 +383,105 @@ impl Qwen35Executor {
             .expect("qwen3.5 MTP sampled output requires Sampling replay");
         self.replay_runtime().submit_replay_sequence(&[
             ReplayExecution::new(mtp_embed_replay, &empty_arguments),
-            ReplayExecution::new(mtp_replay, &empty_arguments),
+            ReplayExecution::new(mtp_replay, &mtp_arguments),
             ReplayExecution::new(self.gather_unembed.replay(gather_unembed_key), &empty_arguments),
             ReplayExecution::new(
                 mtp.sampling.replay(mtp_sampling_key),
                 &recorder.mtp_sampling_arguments,
             ),
         ])
+    }
+
+    fn prepare_next_mtp_step(
+        &mut self,
+        recorder: &Qwen35ModelOpsRecorder,
+        step_index: usize,
+        previous_draft_token_ids: &[i32],
+    ) {
+        let num_sample_rows = recorder.num_mtp_sample_rows();
+        assert_eq!(previous_draft_token_ids.len(), num_sample_rows);
+        let mut sample_index = 0usize;
+        let mut flat_token_ids = Vec::with_capacity(
+            recorder
+                .mtp_microbatch
+                .as_ref()
+                .expect("qwen3.5 MTP step requires its microbatch")
+                .total_tokens(),
+        );
+        {
+            let mtp = self.speculator.mtp_mut();
+            assert!(step_index < mtp.num_steps, "qwen3.5 MTP step index exceeds configured steps");
+            for request in &mut mtp.execution.requests {
+                if request.decision_index.is_some() {
+                    let next_token_id = previous_draft_token_ids[sample_index];
+                    sample_index += 1;
+                    assert_eq!(request.current_token_ids.len(), request.num_tokens);
+                    request.current_token_ids.rotate_left(1);
+                    *request
+                        .current_token_ids
+                        .last_mut()
+                        .expect("qwen3.5 MTP decode request requires tokens") = next_token_id;
+                    flat_token_ids.extend_from_slice(&request.current_token_ids);
+                } else {
+                    let lane_tokens = &request.prefill_token_ids_by_step[step_index];
+                    assert_eq!(lane_tokens.len(), request.num_tokens);
+                    flat_token_ids.extend_from_slice(lane_tokens);
+                }
+            }
+        }
+        assert_eq!(sample_index, num_sample_rows);
+        self.write_token_ids(&flat_token_ids);
+        let draft_distribution_indices = recorder
+            .mtp_sample_req_slots
+            .iter()
+            .map(|&req_slot| {
+                self.speculator
+                    .mtp()
+                    .common
+                    .spec_probs
+                    .draft_distribution_index(req_slot, step_index)
+            })
+            .collect::<Vec<_>>();
+        self.speculator
+            .mtp()
+            .draft_distribution_indices
+            .write_typed(0, &draft_distribution_indices);
+        let sample_positions = recorder
+            .mtp_sample_positions
+            .iter()
+            .map(|&position| {
+                position
+                    .checked_add(step_index.try_into().expect("qwen3.5 MTP step index must fit u32"))
+                    .expect("qwen3.5 MTP sample position must fit u32")
+            })
+            .collect::<Vec<_>>();
+        self.sampler
+            .set_configs(&recorder.mtp_sampler_configs, &sample_positions, SamplingDomain::Draft);
+    }
+
+    fn read_mtp_step(&self, num_sample_rows: usize) -> (Vec<i32>, Vec<f32>, Duration) {
+        let read_start = Instant::now();
+        let draft_token_ids = self.sampler_output.token_ids.read_typed::<i32>(0, num_sample_rows);
+        let draft_probs = self
+            .sampler_output
+            .token_probs
+            .read_typed::<f32>(0, num_sample_rows);
+        (draft_token_ids, draft_probs, read_start.elapsed())
+    }
+
+    fn submit_mtp_recording(&mut self, recorder: &Qwen35ModelOpsRecorder) -> MetalReplaySubmission {
+        let num_steps = self.speculator.mtp().num_steps;
+        for step_index in 0..num_steps - 1 {
+            let submission = self.submit_mtp_step(recorder, step_index);
+            submission.wait();
+            let (draft_token_ids, draft_probs, read_elapsed) = self.read_mtp_step(recorder.num_mtp_sample_rows());
+            self.speculator
+                .mtp_mut()
+                .execution
+                .push_step(&draft_token_ids, &draft_probs, read_elapsed);
+            self.prepare_next_mtp_step(recorder, step_index + 1, &draft_token_ids);
+        }
+        self.submit_mtp_step(recorder, num_steps - 1)
     }
 
     fn read_mtp_proposal(
@@ -384,36 +493,35 @@ impl Qwen35Executor {
         let mut timing = ModelOutputTiming {
             spec_build_elapsed: recorder.mtp_build_elapsed,
             spec_replay_elapsed: replay_elapsed,
-            spec_passes: 1,
+            spec_passes: self.speculator.mtp().num_steps,
             ..ModelOutputTiming::default()
         };
         let num_mtp_sample_rows = recorder.num_mtp_sample_rows();
+        assert_eq!(
+            recorder.mtp_sample_decision_indices.len(),
+            num_mtp_sample_rows,
+            "qwen3.5 MTP decisions must match draft sampling rows"
+        );
+        let (draft_token_ids, draft_probs, read_elapsed) = self.read_mtp_step(num_mtp_sample_rows);
+        let mtp = self.speculator.mtp_mut();
+        mtp.execution.push_step(&draft_token_ids, &draft_probs, read_elapsed);
+        assert_eq!(mtp.execution.completed_steps, mtp.num_steps);
+        timing.spec_read_elapsed += mtp.execution.read_elapsed;
         if num_mtp_sample_rows > 0 {
-            assert_eq!(
-                recorder.mtp_sample_decision_indices.len(),
-                num_mtp_sample_rows,
-                "qwen3.5 MTP decisions must match draft sampling rows"
-            );
-            let mtp_read_start = Instant::now();
-            let draft_token_ids = self.sampler_output.token_ids.read_typed::<i32>(0, num_mtp_sample_rows);
-            let draft_probs = self
-                .sampler_output
-                .token_probs
-                .read_typed::<f32>(0, num_mtp_sample_rows);
-            timing.spec_read_elapsed += mtp_read_start.elapsed();
-            for sample_index in 0..num_mtp_sample_rows {
-                let draft_token = draft_token_ids[sample_index]
+            for step_index in 0..mtp.num_steps {
+                for sample_index in 0..num_mtp_sample_rows {
+                    let flat_index = step_index * num_mtp_sample_rows + sample_index;
+                    let draft_token = mtp.execution.draft_token_ids[flat_index]
                     .try_into()
                     .expect("qwen3.5 sampler returned a negative draft token ID");
-                self.speculator
-                    .mtp_mut()
-                    .common
+                    mtp.common
                     .spec_probs
-                    .set_expected_draft_token(recorder.mtp_sample_req_slots[sample_index], 0, draft_token);
-                let decision = &mut decisions[recorder.mtp_sample_decision_indices[sample_index]];
-                decision.spec_tokens.push(draft_token);
-                decision.spec_probs.push(draft_probs[sample_index]);
-                decision.spec_confidences.push(1.0);
+                    .set_expected_draft_token(recorder.mtp_sample_req_slots[sample_index], step_index, draft_token);
+                    let decision = &mut decisions[recorder.mtp_sample_decision_indices[sample_index]];
+                    decision.spec_tokens.push(draft_token);
+                    decision.spec_probs.push(mtp.execution.draft_probs[flat_index]);
+                    decision.spec_confidences.push(1.0);
+                }
             }
         }
         trace_decisions("mtp_propose_done", decisions);

@@ -230,7 +230,7 @@ cargo run --release --bin qwen3_5_dense -- \
 
 The Qwen3.5 services reject a configuration that specifies both `--hf-mtp-model-dir` and
 `--hf-dspark-model-dir`.
-Omit `--mtp-module` for DSpark. Its default is `0` when no MTP directory is present.
+Do not specify `--num-mtp-steps` for DSpark.
 
 Qwen3.5 startup with MTP enabled:
 
@@ -241,7 +241,8 @@ cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit"
+  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
+  --num-mtp-steps 4
 ```
 
 Sparse:
@@ -262,8 +263,27 @@ Only the Spec checkpoint argument changes:
 --hf-dspark-model-dir DIR
 ```
 
-An MTP checkpoint enables one MTP module by default.
-Do not pass `--mtp-module 1` in the normal MTP command.
+An MTP checkpoint enables one speculative MTP step by default.
+`--num-mtp-steps K` accepts any positive `usize` value.
+The executor reuses the checkpoint's one physical MTP layer for K dependent logical steps.
+Omit `--num-mtp-steps` to use one step.
+
+The service specialization module provides the model-independent worker build and process lifecycle.
+`SpecializedWorker` uses `escargot` to build an executable for the active profile and target.
+It owns the dedicated target directory, build environment, artifact path, and process replacement.
+A model launcher supplies its worker manifest, binary name, specialization target directory, build environment, and worker arguments.
+
+`qwen3_5_dense` and `qwen3_5_sparse` are thin model-specific launchers.
+Each launcher validates the normal CLI and calculates `L = K + 1`.
+It configures `SpecializedWorker` to build a const-specialized copy of the same `qwen3_5_dense` or `qwen3_5_sparse` binary.
+The `inference-runtime-service` `build.rs` generates compile-time const `L`.
+An internal environment marker makes the specialized binary run the model instead of starting another build.
+The launcher then replaces itself with that specialized binary.
+
+Each K value uses `target/qwen3_5_specialized/mtp_steps_K` as its Cargo target directory.
+Cargo fingerprints the source, features, target, and active debug or release profile in that directory.
+A warm launch checks and reuses the existing artifact.
+A cold launch requires the repository source, Cargo, the pinned Rust toolchain, and access to all required build inputs.
 
 The gRPC address defaults to `127.0.0.1:50051`. The HTTP address defaults to `127.0.0.1:8000`.
 
@@ -273,11 +293,9 @@ One lifecycle owner stops both listeners in these conditions:
 - A listener fails.
 - The process receives SIGINT or SIGTERM.
 
-`--mtp-module` accepts `0` or `1`. It defaults to `1` when `--hf-mtp-model-dir` is present. Otherwise, it defaults to
-`0`.
-
-Value `1` requires that directory. Explicit `--mtp-module 0` ignores an optional MTP directory. Use this value for
-controlled Main-only tests.
+`--num-mtp-steps` requires `--hf-mtp-model-dir`.
+The service rejects zero, a missing MTP directory, or a simultaneous DSpark directory.
+For a Main-only run, omit both MTP arguments.
 
 Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 256K pages. The Qwen3-14B geometry stores eight
 tokens in one physical page.
@@ -289,6 +307,8 @@ When DSpark is enabled, the executor adds persistent DSpark context pages to the
 The page count depends on the DSpark layer and KV geometry.
 
 Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 256K shared pages.
+MTP step K adds K logical KV cache lanes to the Main lane.
+All lanes allocate from the same shared physical-page arena.
 
 At startup, each service derives the page count for one block from the initialized executor. The service rejects
 `--num-cache-pages` when one complete block cannot fit.
@@ -313,24 +333,33 @@ For Qwen3.5 DSpark, GDN retains one candidate state for every possible accepted 
 Thus, `--max-requests` also bounds the persistent GDN candidate-state arena.
 Buffers, scratch allocations, replay resources, and resident model resources remain reusable.
 
-The Qwen3.5 GDN arena uses this request-local slot count:
+Qwen3.5 wiring derives this request-local GDN slot count:
 
 ```text
-candidate_states = max(
-  max_spec_tokens + 1,
-  ceil((max_tokens_per_request - 1) / num_tokens_per_block) + 1
-)
+decision_candidate_states = match mode {
+  Vanilla => 1,
+  MTP { num_steps } => 2 * num_steps,
+  DSpark { block_size } => block_size + 1,
+}
+block_boundary_candidates = ceil(max_tokens_per_request / num_tokens_per_block)
+candidate_states = decision_candidate_states + block_boundary_candidates
 state_slots = 1 + candidate_states
 ```
 
-The leading slot stores the current request state.
-The other slots store forward candidates and logical cache-block boundary states.
+The leading slot stores the current state.
+Candidate slots store verified prefixes, MTP replay frontiers, and logical cache-block boundary states.
+The two candidate sets can be disjoint when a request contains more than one fixed token.
+For MTP decode, the verified and replay-source ranges overlap and contain at most `2 * num_steps` states in total.
+Qwen verification calculates both boundaries. GDN commit receives only the replay frontier and selects it as the next
+physical source.
 The total arena scales with `--max-requests * state_slots * full_model_state_bytes`.
 
 For the Qwen3.6-27B checkpoint, one full-model GDN state is 149.625 MiB.
-With the default `--max-requests 4`, Main and one-module MTP use three state slots for each request and allocate
-approximately 1.75 GiB for the arena.
-A DSpark checkpoint with `block_size=15` uses 17 state slots for each request and allocates approximately 9.94 GiB.
+With the default `--max-requests 4`, one-step MTP uses four state slots for each request and allocates
+approximately 2.34 GiB for the arena.
+Two-step MTP uses six state slots for each request and allocates approximately 3.51 GiB.
+Four-step MTP uses ten state slots for each request and allocates approximately 5.84 GiB.
+A DSpark checkpoint with `block_size=15` uses 18 state slots for each request and allocates approximately 10.52 GiB.
 These values do not include model weights, cache pages, or other executor workspaces.
 
 One default batch has these scheduler limits:
@@ -546,8 +575,11 @@ Normal sampling submits these replay programs in one ordered Metal command buffe
 
 Speculative Main verification replaces Sampling with RejectionSampling.
 
-An MTP proposal uses a separate submission with MTPEmbed, MTP, GatherUnembed, and DraftSampling. Rejection decisions
-cross the CPU boundary before the next proposal input.
+An MTP proposal uses K ordered passes of MTPEmbed, MTP, GatherUnembed, and DraftSampling.
+The public Spec lifecycle remains one `submit_spec -> wait -> read_spec` transaction.
+The current implementation submits each dependent pass separately and reads its sampled token on the CPU before it
+prepares the next pass.
+All passes reuse the same recorded replay programs, weights, scratch, and bound workspaces.
 
 A DSpark proposal uses a separate submission with DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
 The Main submission records DSparkContext before GatherUnembed.
@@ -594,7 +626,7 @@ The model-neutral speculator timing fields are:
 - `model_output_spec_passes`
 
 A pass is one auxiliary speculator forward that runs.
-For Qwen3.5, each MTP module forward or DSpark block forward is one pass.
+For Qwen3.5, each logical MTP step or DSpark block forward is one pass.
 For Qwen3, each DSpark block forward is one pass.
 Qwen3 does not run DSpark Spec for a prefill-only batch because no sampled anchor exists.
 
@@ -654,23 +686,29 @@ The helper uses the model directory for tokenization by default.
 Set `PSI_DEC_QWEN3_TOKENIZER_DIR` or use `--tokenizer` to select a different directory.
 Use `--tokens` to select the comma-separated output-token counts.
 
-The Qwen3.5/3.6 helper runs controlled 27B/35B, MTP-off/on comparisons:
+The Qwen3.5/3.6 helper runs controlled 27B/35B Main-only and MTP comparisons:
 
 ```sh
-PSI_DEC_QWEN_TOKENIZER_DIR=<tokenizer-model-dir> \
-PSI_DEC_QWEN_27B_MODEL_DIR=<27b-model-dir> \
-PSI_DEC_QWEN_27B_MTP_DIR=<27b-mtp-model-dir> \
-PSI_DEC_QWEN_35B_MODEL_DIR=<35b-model-dir> \
-PSI_DEC_QWEN_35B_MTP_DIR=<35b-mtp-model-dir> \
-scripts/qwen35_e2e_decode_perf.sh --runs 7
+scripts/qwen35_e2e_decode_perf.sh \
+  --tokenizer <tokenizer-model-dir> \
+  --model-27b <27b-model-dir> \
+  --mtp-27b <27b-mtp-model-dir> \
+  --model-35b <35b-model-dir> \
+  --mtp-35b <35b-mtp-model-dir> \
+  --runs 7
 ```
+
+Each `27b_on` or `35b_on` group runs `--num-mtp-steps 1`, `2`, `3`, and `4` in this order.
+The helper stops the server between step counts.
+It applies the configured cooldown before each subsequent step count.
+Each summary label includes the step count, for example, `27b_mtp3`.
 
 Both helpers print these facts:
 
 - Commit and dirty state
 - Model directories
 - Machine and operating system
-- Cache and runtime request capacity
+- Cache and request capacity
 - Scheduler capacities
 - Sampling configuration and seed
 - Trajectory fields
@@ -679,7 +717,8 @@ The Qwen3.5/3.6 helper also prints cooldown and speculative-acceptance fields.
 
 The Qwen3 helper does not contain a checked-in performance baseline.
 
-The Qwen3.5/3.6 helper contains an M3 Max baseline.
+The Qwen3.5/3.6 helper contains an M3 Max baseline for Main-only and one-step MTP cases.
+Two-step, three-step, and four-step MTP cases report that no hardware baseline exists.
 The baseline was recorded on 2026-07-21 at `132c5073`.
 It used these settings:
 

@@ -13,6 +13,7 @@ use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
 use crate::attn::gdn::scratch::GDNScratch;
 use crate::attn::gdn::state_table::GDNPreparedRequestState;
 use crate::attn::gdn::state_table::GDNRequestStateTable;
+use crate::attn::gdn::state_table::GDNStateCapacity;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::def::replay_op::ReplayRecorder;
@@ -61,9 +62,8 @@ impl Qwen3xGDNState {
         cores: &[GDNCore],
         metal: GDNMetalConfig,
         num_req_slots: usize,
-        max_spec_tokens: usize,
+        state_capacity: GDNStateCapacity,
         max_tokens: usize,
-        max_tokens_per_request: usize,
         num_tokens_per_block: usize,
         page_bytes: usize,
     ) -> Self {
@@ -74,8 +74,7 @@ impl Qwen3xGDNState {
             device,
             cores,
             num_req_slots,
-            max_spec_tokens,
-            max_tokens_per_request,
+            state_capacity,
             num_tokens_per_block,
             page_bytes,
         ));
@@ -140,12 +139,12 @@ impl Qwen3xGDNState {
         runtime.submit_replay(self.state_restore.replay(&key)).wait();
     }
 
-    pub fn commit(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer, verified_state_versions: &[u32]) {
+    pub fn commit(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer, state_versions: &[u32]) {
         assert!(
             self.pending_publish.is_none(),
             "GDN cache publish cannot overlap a previous publish"
         );
-        self.request_state_table.commit(verified_state_versions);
+        self.request_state_table.commit(state_versions);
         let mut recorder = runtime.create_recorder();
         if self.request_state_table.record_publish(&mut recorder, pages) {
             self.pending_publish = Some(runtime.submit_replay(&recorder.build()));

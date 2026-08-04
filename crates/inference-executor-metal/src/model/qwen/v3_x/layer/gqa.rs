@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::TensorMap;
@@ -27,7 +28,7 @@ use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xGQA {
-    compact_gqa_layer_index: usize,
+    gqa_layer_index: ReplayU32,
     weights: Qwen3xGQAWeights,
     backend: Rc<GQA>,
     scratch: Rc<GQAScratch>,
@@ -41,14 +42,14 @@ impl Qwen3xGQA {
         store: &mut SafeTensorStore,
         core: &GQACore,
         metal: GQAMetalConfig,
-        compact_gqa_layer_index: usize,
+        gqa_layer_index: ReplayU32,
         bindings: Qwen3xGQAWeightBindings,
         backend: Rc<GQA>,
         scratch: Rc<GQAScratch>,
         request_page_table: Rc<GQARequestPageTable>,
     ) -> Result<Self, ModelExecutorError> {
         Ok(Self {
-            compact_gqa_layer_index,
+            gqa_layer_index,
             weights: Qwen3xGQAWeights::load(device, store, &bindings, core, metal)?,
             backend,
             scratch,
@@ -71,10 +72,7 @@ impl Qwen3xGQA {
             recorder,
             GQAInput {
                 page_table_layout: self.request_page_table.layout(),
-                gqa_layer_index: self
-                    .compact_gqa_layer_index
-                    .try_into()
-                    .expect("qwen3.x compact GQA layer index must fit u32"),
+                gqa_layer_index: self.gqa_layer_index,
                 batch_metadata: metadata,
                 hidden_state: input,
                 next_hidden_state: output,

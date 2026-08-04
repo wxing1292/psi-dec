@@ -21,7 +21,6 @@ CASE_COOLDOWN_SECS=30
 LOGGING=info
 SEED=42
 NUM_CACHE_PAGES=393216
-MAX_RUNNING_REQUESTS=8
 MAX_REQUESTS=4
 MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
@@ -32,7 +31,6 @@ BASELINE_OS_VERSION="27.0"
 BASELINE_ARCH="arm64"
 BASELINE_NUM_CACHE_PAGES=393216
 BASELINE_CACHE_BLOCK_TOKENS=2048
-BASELINE_MAX_RUNNING_REQUESTS=4
 BASELINE_MAX_REQUESTS=4
 BASELINE_MAX_TOKENS=128
 BASELINE_MAX_TOKENS_PER_REQUEST=64
@@ -72,10 +70,11 @@ Options:
   --runs N              Runs per token-count case. Default: 7
   --cases LIST          Comma-separated cases. Default: 27b_off,27b_on,35b_off,35b_on
                         Available: 27b_off,27b_on,35b_off,35b_on
+                        Each *_on case runs MTP steps 1, 2, 3, and 4 in order.
   --port N              Server port. Default: 50061
   --prompt TEXT         Prompt string.
   --seed N              Fixed request seed. Default: 42
-  --num-cache-pages N   Shared cache pages. Default: 393216 (current service default)
+  --num-cache-pages N   Shared cache pages. Default: 393216 (baseline workload)
   --max-requests N      Scheduler request capacity. Default: 4
   --max-tokens N        Scheduler flattened-token capacity. Default: 128
   --max-tokens-per-request N
@@ -487,7 +486,6 @@ baseline_config_mismatches() {
     [[ "$current_arch" == "$BASELINE_ARCH" ]] || mismatches="${mismatches:+$mismatches,}arch"
     [[ "$NUM_CACHE_PAGES" == "$BASELINE_NUM_CACHE_PAGES" ]] || mismatches="${mismatches:+$mismatches,}num_cache_pages"
     [[ "$CACHE_BLOCK_TOKENS" == "$BASELINE_CACHE_BLOCK_TOKENS" ]] || mismatches="${mismatches:+$mismatches,}cache_block_tokens"
-    [[ "$MAX_RUNNING_REQUESTS" == "$BASELINE_MAX_RUNNING_REQUESTS" ]] || mismatches="${mismatches:+$mismatches,}max_running_requests"
     [[ "$MAX_REQUESTS" == "$BASELINE_MAX_REQUESTS" ]] || mismatches="${mismatches:+$mismatches,}max_requests"
     [[ "$MAX_TOKENS" == "$BASELINE_MAX_TOKENS" ]] || mismatches="${mismatches:+$mismatches,}max_tokens"
     [[ "$MAX_TOKENS_PER_REQUEST" == "$BASELINE_MAX_TOKENS_PER_REQUEST" ]] || mismatches="${mismatches:+$mismatches,}max_tokens_per_request"
@@ -520,12 +518,12 @@ baseline_metrics() {
     case "$1:$2:$3" in
     apple_m3_max_40_gpu_cores:27b_off:256) echo "22.561,335.410,44.383,45.088" ;;
     apple_m3_max_40_gpu_cores:27b_off:384) echo "22.490,339.124,44.820,45.101" ;;
-    apple_m3_max_40_gpu_cores:27b_on:256) echo "38.826,338.567,49.179,49.851" ;;
-    apple_m3_max_40_gpu_cores:27b_on:384) echo "36.921,358.611,51.069,51.663" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:256) echo "38.826,338.567,49.179,49.851" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:384) echo "36.921,358.611,51.069,51.663" ;;
     apple_m3_max_40_gpu_cores:35b_off:256) echo "95.597,77.732,10.509,10.910" ;;
     apple_m3_max_40_gpu_cores:35b_off:1024) echo "92.860,74.288,10.822,10.948" ;;
-    apple_m3_max_40_gpu_cores:35b_on:256) echo "147.397,78.127,13.030,13.383" ;;
-    apple_m3_max_40_gpu_cores:35b_on:1024) echo "129.709,75.905,13.585,14.221" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:256) echo "147.397,78.127,13.030,13.383" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:1024) echo "129.709,75.905,13.585,14.221" ;;
     *) return 1 ;;
     esac
 }
@@ -535,12 +533,12 @@ baseline_trajectory() {
     case "$1:$2:$3" in
     apple_m3_max_40_gpu_cores:27b_off:256) echo "34,256,256,0,0" ;;
     apple_m3_max_40_gpu_cores:27b_off:384) echo "34,384,384,0,0" ;;
-    apple_m3_max_40_gpu_cores:27b_on:256) echo "34,256,135,134,122" ;;
-    apple_m3_max_40_gpu_cores:27b_on:384) echo "34,384,205,204,180" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:256) echo "34,256,135,134,122" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:384) echo "34,384,205,204,180" ;;
     apple_m3_max_40_gpu_cores:35b_off:256) echo "34,256,256,0,0" ;;
     apple_m3_max_40_gpu_cores:35b_off:1024) echo "34,1024,1024,0,0" ;;
-    apple_m3_max_40_gpu_cores:35b_on:256) echo "34,256,134,133,123" ;;
-    apple_m3_max_40_gpu_cores:35b_on:1024) echo "34,1024,583,582,442" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:256) echo "34,256,134,133,123" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:1024) echo "34,1024,583,582,442" ;;
     *) return 1 ;;
     esac
 }
@@ -873,49 +871,56 @@ PY
     cleanup_active_server
 }
 
+run_mtp_case_sequence() {
+    local model_label="$1"
+    local token_list="$2"
+    local server_binary="$3"
+    local model_dir="$4"
+    local mtp_model_dir="$5"
+
+    for num_mtp_steps in 1 2; do
+        local label="${model_label}_mtp${num_mtp_steps}"
+        if ((num_mtp_steps > 1 && CASE_COOLDOWN_SECS > 0)); then
+            echo "COOLDOWN before=$label seconds=$CASE_COOLDOWN_SECS"
+            sleep "$CASE_COOLDOWN_SECS"
+        fi
+        run_server_case "$label" "$token_list" "$server_binary" \
+            --grpc-listen-addr "127.0.0.1:${PORT}" \
+            --hf-model-dir "$model_dir" \
+            --hf-mtp-model-dir "$mtp_model_dir" \
+            --num-mtp-steps "$num_mtp_steps" \
+            --num-cache-pages "$NUM_CACHE_PAGES" \
+            --max-requests "$MAX_REQUESTS" \
+            --max-tokens "$MAX_TOKENS" \
+            --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
+    done
+}
+
 run_named_case() {
     case "$1" in
     27b_off)
         run_server_case 27b_off "256 384" target/release/qwen3_5_dense \
             --grpc-listen-addr "127.0.0.1:${PORT}" \
             --hf-model-dir "$MODEL_27B" \
-            --mtp-module 0 \
             --num-cache-pages "$NUM_CACHE_PAGES" \
             --max-requests "$MAX_REQUESTS" \
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
     27b_on)
-        run_server_case 27b_on "256 384" target/release/qwen3_5_dense \
-            --grpc-listen-addr "127.0.0.1:${PORT}" \
-            --hf-model-dir "$MODEL_27B" \
-            --hf-mtp-model-dir "$MTP_27B" \
-            --mtp-module 1 \
-            --num-cache-pages "$NUM_CACHE_PAGES" \
-            --max-requests "$MAX_REQUESTS" \
-            --max-tokens "$MAX_TOKENS" \
-            --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
+        run_mtp_case_sequence 27b "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$MTP_27B"
         ;;
     35b_off)
         run_server_case 35b_off "256 1024" target/release/qwen3_5_sparse \
             --grpc-listen-addr "127.0.0.1:${PORT}" \
             --hf-model-dir "$MODEL_35B" \
-            --mtp-module 0 \
             --num-cache-pages "$NUM_CACHE_PAGES" \
             --max-requests "$MAX_REQUESTS" \
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
     35b_on)
-        run_server_case 35b_on "256 1024" target/release/qwen3_5_sparse \
-            --grpc-listen-addr "127.0.0.1:${PORT}" \
-            --hf-model-dir "$MODEL_35B" \
-            --hf-mtp-model-dir "$MTP_35B" \
-            --mtp-module 1 \
-            --num-cache-pages "$NUM_CACHE_PAGES" \
-            --max-requests "$MAX_REQUESTS" \
-            --max-tokens "$MAX_TOKENS" \
-            --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
+        run_mtp_case_sequence 35b "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$MTP_35B"
         ;;
     *)
         echo "unknown case: $1" >&2
@@ -937,7 +942,7 @@ OS_VERSION="$(sw_vers -productVersion 2>/dev/null || uname -s)"
 ARCH="$(uname -m)"
 MACHINE="$(current_machine_id)"
 BASELINE_CONFIG_MISMATCHES="$(baseline_config_mismatches "$MACHINE" "$OS_VERSION" "$ARCH")"
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH baseline_machine=$BASELINE_MACHINE baseline_date=$BASELINE_DATE baseline_commit=$BASELINE_COMMIT baseline_os=$BASELINE_OS_VERSION baseline_arch=$BASELINE_ARCH baseline_num_cache_pages=$BASELINE_NUM_CACHE_PAGES baseline_cache_block_tokens=$BASELINE_CACHE_BLOCK_TOKENS baseline_max_running_requests=$BASELINE_MAX_RUNNING_REQUESTS baseline_max_requests=$BASELINE_MAX_REQUESTS baseline_max_tokens=$BASELINE_MAX_TOKENS baseline_max_tokens_per_request=$BASELINE_MAX_TOKENS_PER_REQUEST baseline_case_cooldown_secs=$BASELINE_CASE_COOLDOWN_SECS baseline_logging=$BASELINE_LOGGING baseline_seed=$BASELINE_SEED baseline_min_runs=$BASELINE_MIN_RUNS baseline_config_mismatches=${BASELINE_CONFIG_MISMATCHES:-none} num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_running_requests=$MAX_RUNNING_REQUESTS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_chars=${#PROMPT} tokenizer=$TOKENIZER model_27b=$MODEL_27B mtp_27b=$MTP_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH baseline_machine=$BASELINE_MACHINE baseline_date=$BASELINE_DATE baseline_commit=$BASELINE_COMMIT baseline_os=$BASELINE_OS_VERSION baseline_arch=$BASELINE_ARCH baseline_num_cache_pages=$BASELINE_NUM_CACHE_PAGES baseline_cache_block_tokens=$BASELINE_CACHE_BLOCK_TOKENS baseline_max_requests=$BASELINE_MAX_REQUESTS baseline_max_tokens=$BASELINE_MAX_TOKENS baseline_max_tokens_per_request=$BASELINE_MAX_TOKENS_PER_REQUEST baseline_case_cooldown_secs=$BASELINE_CASE_COOLDOWN_SECS baseline_logging=$BASELINE_LOGGING baseline_seed=$BASELINE_SEED baseline_min_runs=$BASELINE_MIN_RUNS baseline_config_mismatches=${BASELINE_CONFIG_MISMATCHES:-none} num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_steps=1,2,3,4 cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_chars=${#PROMPT} tokenizer=$TOKENIZER model_27b=$MODEL_27B mtp_27b=$MTP_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B"
 for case_index in "${!selected_cases[@]}"; do
     case_name="${selected_cases[$case_index]}"
     if [[ "$case_index" -gt 0 && "$CASE_COOLDOWN_SECS" -gt 0 ]]; then

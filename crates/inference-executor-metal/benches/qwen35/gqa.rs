@@ -725,7 +725,6 @@ fn gqa_sdpa_config(
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         page_table_layout: gqa_page_table_layout(num_reqs, end_context_len),
-        gqa_layer_index: 0,
         kv_token_tile_size: params.single_q_token_kv_token_tile_size,
         num_threads_per_threadblock: params.single_q_token_num_threads_per_threadblock,
         q_head_tile_size: u32::try_from(model.num_q_heads / model.num_kv_heads)
@@ -758,7 +757,6 @@ fn gqa_tiled_sdpa_config(
         page_bytes: model.page_bytes(),
         dtype: Dtype::Bfloat16,
         page_table_layout,
-        gqa_layer_index: 0,
     }
 }
 

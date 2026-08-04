@@ -92,8 +92,7 @@ impl Qwen35MainLayer {
         config: &Qwen35ModelConfig,
         defaults: Qwen35MetalDefaults,
         model_layer_index: usize,
-        compact_gqa_layer_index: usize,
-        compact_gdn_layer_index: usize,
+        attn_layer_index: usize,
         bindings: Qwen35LayerWeightBindings,
         gqa_state: &Qwen3xGQAState,
         gdn_state: &Qwen3xGDNState,
@@ -113,8 +112,7 @@ impl Qwen35MainLayer {
             config,
             defaults,
             model_layer_index,
-            compact_gqa_layer_index,
-            compact_gdn_layer_index,
+            attn_layer_index,
             attention,
             gqa_state,
             gdn_state,
@@ -243,21 +241,25 @@ impl Qwen35MainAttention {
         config: &Qwen35ModelConfig,
         defaults: Qwen35MetalDefaults,
         model_layer_index: usize,
-        compact_gqa_layer_index: usize,
-        compact_gdn_layer_index: usize,
+        attn_layer_index: usize,
         bindings: Qwen35AttentionWeightBindings,
         gqa_state: &Qwen3xGQAState,
         gdn_state: &Qwen3xGDNState,
     ) -> Result<Self, ModelExecutorError> {
         match (config.layer_type_at(model_layer_index)?, bindings) {
             (LayerType::FullAttention, Qwen35AttentionWeightBindings::GQA(bindings)) => {
+                let gqa_layer_index = attn_layer_index;
                 let (core, metal) = qwen35_gqa_core_and_metal(model_layer_index, &config.text_config, defaults)?;
                 Ok(Self::Gqa(Qwen3xGQA::load(
                     device,
                     store,
                     &core,
                     metal,
-                    compact_gqa_layer_index,
+                    inference_backend_metal::metal::ReplayU32::Fixed(
+                        gqa_layer_index
+                            .try_into()
+                            .expect("qwen3.5 GQA layer index must fit u32"),
+                    ),
                     bindings,
                     Rc::clone(gqa_state.backend()),
                     Rc::clone(gqa_state.scratch()),
@@ -265,13 +267,14 @@ impl Qwen35MainAttention {
                 )?))
             },
             (LayerType::GDN, Qwen35AttentionWeightBindings::GDN(bindings)) => {
+                let gdn_layer_index = attn_layer_index;
                 let (core, metal) = qwen35_gdn_core_and_metal(model_layer_index, &config.text_config, defaults)?;
                 Ok(Self::Gdn(Qwen3xGDN::load(
                     device,
                     store,
                     &core,
                     metal,
-                    compact_gdn_layer_index,
+                    gdn_layer_index,
                     bindings,
                     Rc::clone(gdn_state.backend()),
                     Rc::clone(gdn_state.scratch()),

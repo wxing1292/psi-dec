@@ -22,10 +22,32 @@ impl ReplayParameterKey {
     }
 }
 
+/// Source for one scalar kernel argument in a replay program.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayValue<T> {
+    Fixed(T),
+    Parameter(ReplayParameterKey),
+}
+
+/// Source for one `u32` kernel argument in a replay program.
+pub type ReplayU32 = ReplayValue<u32>;
+
+/// Source for one `u64` kernel argument in a replay program.
+pub type ReplayU64 = ReplayValue<u64>;
+
+/// Source for one `i32` kernel argument in a replay program.
+pub type ReplayI32 = ReplayValue<i32>;
+
+/// Source for one `i64` kernel argument in a replay program.
+pub type ReplayI64 = ReplayValue<i64>;
+
+/// Source for one `f32` kernel argument in a replay program.
+pub type ReplayF32 = ReplayValue<f32>;
+
 /// Submission values keyed by the replay parameter table declared while recording.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ReplayArguments {
-    values: HashMap<ReplayParameterKey, u32>,
+    values: HashMap<ReplayParameterKey, ReplayArgumentValue>,
 }
 
 impl ReplayArguments {
@@ -34,17 +56,66 @@ impl ReplayArguments {
     }
 
     pub fn set_u32(&mut self, key: ReplayParameterKey, value: u32) {
-        assert!(
-            self.values.insert(key, value).is_none(),
-            "Metal replay argument {:?} was set twice",
-            key
-        );
+        self.insert(key, ReplayArgumentValue::U32(value));
     }
 
     pub fn with_u32(mut self, key: ReplayParameterKey, value: u32) -> Self {
         self.set_u32(key, value);
         self
     }
+
+    pub fn set_u64(&mut self, key: ReplayParameterKey, value: u64) {
+        self.insert(key, ReplayArgumentValue::U64(value));
+    }
+
+    pub fn with_u64(mut self, key: ReplayParameterKey, value: u64) -> Self {
+        self.set_u64(key, value);
+        self
+    }
+
+    pub fn set_i32(&mut self, key: ReplayParameterKey, value: i32) {
+        self.insert(key, ReplayArgumentValue::I32(value));
+    }
+
+    pub fn with_i32(mut self, key: ReplayParameterKey, value: i32) -> Self {
+        self.set_i32(key, value);
+        self
+    }
+
+    pub fn set_i64(&mut self, key: ReplayParameterKey, value: i64) {
+        self.insert(key, ReplayArgumentValue::I64(value));
+    }
+
+    pub fn with_i64(mut self, key: ReplayParameterKey, value: i64) -> Self {
+        self.set_i64(key, value);
+        self
+    }
+
+    pub fn set_f32(&mut self, key: ReplayParameterKey, value: f32) {
+        self.insert(key, ReplayArgumentValue::F32(value.to_bits()));
+    }
+
+    pub fn with_f32(mut self, key: ReplayParameterKey, value: f32) -> Self {
+        self.set_f32(key, value);
+        self
+    }
+
+    fn insert(&mut self, key: ReplayParameterKey, value: ReplayArgumentValue) {
+        assert!(
+            self.values.insert(key, value).is_none(),
+            "Metal replay argument {:?} was set twice",
+            key
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayArgumentValue {
+    U32(u32),
+    U64(u64),
+    I32(i32),
+    I64(i64),
+    F32(u32),
 }
 
 #[derive(Debug)]
@@ -55,8 +126,40 @@ pub struct ReplayParameterTable {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReplayParameterEntry {
     offset_bytes: usize,
-    min_value: u32,
-    max_value: u32,
+    domain: ReplayParameterDomain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayParameterDomain {
+    U32 { min_value: u32, max_value: u32 },
+    U64 { min_value: u64, max_value: u64 },
+    I32 { min_value: i32, max_value: i32 },
+    I64 { min_value: i64, max_value: i64 },
+    F32 { min_bits: u32, max_bits: u32 },
+}
+
+impl ReplayParameterDomain {
+    fn contains(self, value: ReplayArgumentValue) -> bool {
+        match (self, value) {
+            (Self::U32 { min_value, max_value }, ReplayArgumentValue::U32(value)) => {
+                value >= min_value && value <= max_value
+            },
+            (Self::U64 { min_value, max_value }, ReplayArgumentValue::U64(value)) => {
+                value >= min_value && value <= max_value
+            },
+            (Self::I32 { min_value, max_value }, ReplayArgumentValue::I32(value)) => {
+                value >= min_value && value <= max_value
+            },
+            (Self::I64 { min_value, max_value }, ReplayArgumentValue::I64(value)) => {
+                value >= min_value && value <= max_value
+            },
+            (Self::F32 { min_bits, max_bits }, ReplayArgumentValue::F32(value_bits)) => {
+                let value = f32::from_bits(value_bits);
+                value >= f32::from_bits(min_bits) && value <= f32::from_bits(max_bits)
+            },
+            _ => false,
+        }
+    }
 }
 
 impl ReplayParameterTable {
@@ -81,30 +184,16 @@ impl ReplayParameterTable {
                 .copied()
                 .unwrap_or_else(|| panic!("Metal replay submission is missing parameter {:?}", key));
             assert!(
-                value >= entry.min_value && value <= entry.max_value,
-                "Metal replay parameter {:?} value={} is outside {}..={}",
-                key,
-                value,
-                entry.min_value,
-                entry.max_value
+                entry.domain.contains(value),
+                "Metal replay parameter {key:?} value {value:?} has the wrong type or is outside domain {:?}",
+                entry.domain
             );
         }
     }
 
     pub fn write(&self, buffer: &ProtocolObject<dyn MTLBuffer>, arguments: &ReplayArguments) {
         for (&key, entry) in &self.entries {
-            let value = arguments.values[&key];
-            assert!(
-                entry.offset_bytes + std::mem::size_of::<u32>() <= buffer.length(),
-                "Metal replay parameter offset exceeds parameter buffer"
-            );
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    std::ptr::from_ref(&value).cast::<u8>(),
-                    buffer.contents().as_ptr().cast::<u8>().add(entry.offset_bytes),
-                    std::mem::size_of::<u32>(),
-                );
-            }
+            write_argument_value(buffer, entry.offset_bytes, arguments.values[&key]);
         }
     }
 }
@@ -149,27 +238,78 @@ impl CommandParameterLayoutBuilder {
 
     pub fn bind_u32(&self, key: ReplayParameterKey, min_value: u32, max_value: u32) -> usize {
         assert!(min_value <= max_value, "Metal replay parameter domain is empty");
+        self.bind(key, ReplayParameterDomain::U32 { min_value, max_value }, 0_u32)
+    }
+
+    pub fn bind_u64(&self, key: ReplayParameterKey, min_value: u64, max_value: u64) -> usize {
+        assert!(min_value <= max_value, "Metal replay parameter domain is empty");
+        self.bind(key, ReplayParameterDomain::U64 { min_value, max_value }, 0_u64)
+    }
+
+    pub fn bind_i32(&self, key: ReplayParameterKey, min_value: i32, max_value: i32) -> usize {
+        assert!(min_value <= max_value, "Metal replay parameter domain is empty");
+        self.bind(key, ReplayParameterDomain::I32 { min_value, max_value }, 0_i32)
+    }
+
+    pub fn bind_i64(&self, key: ReplayParameterKey, min_value: i64, max_value: i64) -> usize {
+        assert!(min_value <= max_value, "Metal replay parameter domain is empty");
+        self.bind(key, ReplayParameterDomain::I64 { min_value, max_value }, 0_i64)
+    }
+
+    pub fn bind_f32(&self, key: ReplayParameterKey, min_value: f32, max_value: f32) -> usize {
+        assert!(min_value <= max_value, "Metal replay parameter domain is empty");
+        self.bind(
+            key,
+            ReplayParameterDomain::F32 {
+                min_bits: min_value.to_bits(),
+                max_bits: max_value.to_bits(),
+            },
+            0_f32,
+        )
+    }
+
+    fn bind<T>(&self, key: ReplayParameterKey, domain: ReplayParameterDomain, zero: T) -> usize {
         if let Some(entry) = self.replay_entries.borrow().get(&key).copied() {
             assert_eq!(
-                (entry.min_value, entry.max_value),
-                (min_value, max_value),
+                entry.domain, domain,
                 "Metal replay parameter {:?} has inconsistent domains",
                 key
             );
             return entry.offset_bytes;
         }
 
-        let offset_bytes = self.push_bytes(&[0_u32]);
-        let previous = self.replay_entries.borrow_mut().insert(
-            key,
-            ReplayParameterEntry {
-                offset_bytes,
-                min_value,
-                max_value,
-            },
-        );
+        let offset_bytes = self.push_bytes(&[zero]);
+        let previous = self
+            .replay_entries
+            .borrow_mut()
+            .insert(key, ReplayParameterEntry { offset_bytes, domain });
         assert!(previous.is_none());
         offset_bytes
+    }
+}
+
+fn write_argument_value(buffer: &ProtocolObject<dyn MTLBuffer>, offset_bytes: usize, value: ReplayArgumentValue) {
+    match value {
+        ReplayArgumentValue::U32(value) | ReplayArgumentValue::F32(value) => {
+            write_argument(buffer, offset_bytes, value)
+        },
+        ReplayArgumentValue::U64(value) => write_argument(buffer, offset_bytes, value),
+        ReplayArgumentValue::I32(value) => write_argument(buffer, offset_bytes, value),
+        ReplayArgumentValue::I64(value) => write_argument(buffer, offset_bytes, value),
+    }
+}
+
+fn write_argument<T>(buffer: &ProtocolObject<dyn MTLBuffer>, offset_bytes: usize, value: T) {
+    assert!(
+        offset_bytes + std::mem::size_of::<T>() <= buffer.length(),
+        "Metal replay parameter offset exceeds parameter buffer"
+    );
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::from_ref(&value).cast::<u8>(),
+            buffer.contents().as_ptr().cast::<u8>().add(offset_bytes),
+            std::mem::size_of::<T>(),
+        );
     }
 }
 
@@ -204,17 +344,37 @@ fn align_up(value: usize, alignment: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::CommandParameterLayoutBuilder;
+    use super::ReplayArguments;
     use super::ReplayParameterKey;
 
     const NUM_ACTIVE_THREADS: ReplayParameterKey = ReplayParameterKey::new("test.num_active_threads");
+    const OFFSET_BYTES: ReplayParameterKey = ReplayParameterKey::new("test.offset_bytes");
+    const SIGNED_INDEX: ReplayParameterKey = ReplayParameterKey::new("test.signed_index");
+    const SIGNED_OFFSET: ReplayParameterKey = ReplayParameterKey::new("test.signed_offset");
+    const SCALE: ReplayParameterKey = ReplayParameterKey::new("test.scale");
 
     #[test]
     fn test_key_reuse() {
         let builder = CommandParameterLayoutBuilder::default();
         let first = builder.bind_u32(NUM_ACTIVE_THREADS, 64, 128);
         let second = builder.bind_u32(NUM_ACTIVE_THREADS, 64, 128);
+        builder.bind_u64(OFFSET_BYTES, 0, 1024);
+        builder.bind_i32(SIGNED_INDEX, -8, 8);
+        builder.bind_i64(SIGNED_OFFSET, -1024, 1024);
+        builder.bind_f32(SCALE, 0.0, 1.0);
 
         assert_eq!(first, second);
-        assert_eq!(builder.build().replay_parameter_table.len(), 1);
+        assert_eq!(builder.build().replay_parameter_table.len(), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "wrong type or is outside domain")]
+    fn test_argument_type_must_match_parameter_type() {
+        let builder = CommandParameterLayoutBuilder::default();
+        builder.bind_u64(OFFSET_BYTES, 0, 1024);
+        builder
+            .build()
+            .replay_parameter_table
+            .validate(&ReplayArguments::new().with_u32(OFFSET_BYTES, 4));
     }
 }

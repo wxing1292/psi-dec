@@ -10,15 +10,15 @@ use inference_runtime_core::Result;
 use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_unavailable;
-use inference_runtime_service::codec::qwen::QwenCodec;
-use inference_runtime_service::runtime::serve_replay_model;
-use inference_runtime_service::telemetry::CacheLaneLogSummary;
-use inference_runtime_service::telemetry::StartupLogger;
 
+use crate::codec::qwen::QwenCodec;
 use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::config::Qwen3Config;
 use crate::qwen_server::config::Qwen3ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
+use crate::runtime::serve_replay_model;
+use crate::telemetry::CacheLaneLogSummary;
+use crate::telemetry::StartupLogger;
 
 // Qwen3 has no GDN snapshot to amortize across a large logical block. Two
 // eight-token physical KV pages per layer keep trie granularity small without

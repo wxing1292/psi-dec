@@ -30,7 +30,7 @@ impl<const N: usize, const L: usize, const P: usize> HTTPServer<N, L, P> {
     }
 
     fn router(self) -> Router {
-        Router::new()
+        Router::<Self>::new()
             .route("/v1/chat/completions", post(chat_completions::handle::<N, L, P>))
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .with_state(self)

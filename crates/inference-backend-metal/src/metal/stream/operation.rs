@@ -181,16 +181,43 @@ impl<'a> CommandRecorder<'a> {
 
     /// Binds a `u32` kernel argument to a replay parameter key supplied at submission.
     pub fn bind_u32(&self, index: usize, key: ReplayParameterKey, min_value: u32, max_value: u32) {
+        self.bind_parameter(index, self.parameters.bind_u32(key, min_value, max_value));
+    }
+
+    /// Binds a `u64` kernel argument to a replay parameter key supplied at submission.
+    pub fn bind_u64(&self, index: usize, key: ReplayParameterKey, min_value: u64, max_value: u64) {
+        self.bind_parameter(index, self.parameters.bind_u64(key, min_value, max_value));
+    }
+
+    /// Binds an `i32` kernel argument to a replay parameter key supplied at submission.
+    pub fn bind_i32(&self, index: usize, key: ReplayParameterKey, min_value: i32, max_value: i32) {
+        self.bind_parameter(index, self.parameters.bind_i32(key, min_value, max_value));
+    }
+
+    /// Binds an `i64` kernel argument to a replay parameter key supplied at submission.
+    pub fn bind_i64(&self, index: usize, key: ReplayParameterKey, min_value: i64, max_value: i64) {
+        self.bind_parameter(index, self.parameters.bind_i64(key, min_value, max_value));
+    }
+
+    /// Binds an `f32` kernel argument to a replay parameter key supplied at submission.
+    pub fn bind_f32(&self, index: usize, key: ReplayParameterKey, min_value: f32, max_value: f32) {
+        self.bind_parameter(index, self.parameters.bind_f32(key, min_value, max_value));
+    }
+
+    fn bind_parameter(&self, index: usize, offset_bytes: usize) {
         assert!(index < MAX_BUFFER_BINDINGS);
         let mut command = self.active.borrow_mut();
         let command = command
             .as_mut()
             .expect("Metal command must set a kernel before binding replay parameters");
-        let offset_bytes = self.parameters.bind_u32(key, min_value, max_value);
         command.set_binding(index, CommandBinding::Parameter { offset_bytes });
     }
 
     pub fn set_i32(&self, index: usize, value: i32) {
+        self.set_bytes(index, std::slice::from_ref(&value));
+    }
+
+    pub fn set_i64(&self, index: usize, value: i64) {
         self.set_bytes(index, std::slice::from_ref(&value));
     }
 

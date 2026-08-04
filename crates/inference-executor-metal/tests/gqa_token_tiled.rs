@@ -10,6 +10,7 @@ use inference_backend_metal::components::GQATiledSDPAShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::gqa::reference::GQAReferenceInput;
@@ -131,7 +132,6 @@ fn run_case(
             num_gqa_layers: 1,
             num_page_ids_per_block: 1,
         },
-        gqa_layer_index: 0,
     };
     let shape = GQATiledSDPAShape {
         num_tokens: num_tokens.try_into().unwrap(),
@@ -217,18 +217,21 @@ fn run_case(
     );
     let kernels = GQATiledSDPAKernels::new(&device, config, shape);
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map(GQATiledSDPAMapBuffers {
-        q: &q,
-        kv_pages: &kv_pages,
-        req_slots: &req_slots,
-        page_ids: &page_ids,
-        flat_token_indices: &flat_token_indices,
-        q_token_tiles: &q_token_tiles,
-        sdpa_map_task_templates: &sdpa_map_task_templates,
-        partial_output: &partial_output,
-        partial_exp_sums: &partial_exp_sums,
-        partial_max_logits: &partial_max_logits,
-    }));
+    builder.record(kernels.invoke_map(
+        GQATiledSDPAMapBuffers {
+            q: &q,
+            kv_pages: &kv_pages,
+            req_slots: &req_slots,
+            page_ids: &page_ids,
+            flat_token_indices: &flat_token_indices,
+            q_token_tiles: &q_token_tiles,
+            sdpa_map_task_templates: &sdpa_map_task_templates,
+            partial_output: &partial_output,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+        },
+        ReplayU32::Fixed(0),
+    ));
     builder.record_with_barrier_before(kernels.invoke_reduce(GQATiledSDPAReduceBuffers {
         partial_output: &partial_output,
         partial_exp_sums: &partial_exp_sums,

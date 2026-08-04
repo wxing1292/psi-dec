@@ -70,18 +70,22 @@ impl Qwen35Main {
             config.text_config.num_hidden_layers,
             "qwen3.5 Main config and checkpoint binding layer counts must match"
         );
-        let mut compact_gqa_layer_index = 0;
-        let mut compact_gdn_layer_index = 0;
+        let mut num_loaded_gqa_layers = 0;
+        let mut num_loaded_gdn_layers = 0;
         let mut layers = Vec::with_capacity(layer_bindings.len());
         for (layer_index, bindings) in layer_bindings.into_iter().enumerate() {
+            let layer_type = config.layer_type_at(layer_index)?;
+            let attn_layer_index = match layer_type {
+                LayerType::FullAttention => num_loaded_gqa_layers,
+                LayerType::GDN => num_loaded_gdn_layers,
+            };
             layers.push(Qwen35MainLayer::load(
                 device,
                 store,
                 config,
                 defaults,
                 layer_index,
-                compact_gqa_layer_index,
-                compact_gdn_layer_index,
+                attn_layer_index,
                 bindings,
                 gqa_state,
                 gdn_state,
@@ -89,9 +93,9 @@ impl Qwen35Main {
                 dense_scratch,
                 moe_scratch,
             )?);
-            match config.layer_type_at(layer_index)? {
-                LayerType::FullAttention => compact_gqa_layer_index += 1,
-                LayerType::GDN => compact_gdn_layer_index += 1,
+            match layer_type {
+                LayerType::FullAttention => num_loaded_gqa_layers += 1,
+                LayerType::GDN => num_loaded_gdn_layers += 1,
             }
             store.unload_all();
         }

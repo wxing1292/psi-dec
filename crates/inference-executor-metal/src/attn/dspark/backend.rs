@@ -20,6 +20,7 @@ use inference_backend_metal::components::GQAQKVSplitShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::GQAPageTableLayout;
@@ -130,7 +131,6 @@ impl UngatedDSparkGQA {
         &self,
         compute_path: GQAComputePath,
         page_table_layout: GQAPageTableLayout,
-        gqa_layer_index: u32,
     ) -> GQAPagedSDPAConfig {
         let attention = &self.core.attention;
         let GQAComputePath::SingleQueryToken {
@@ -154,7 +154,6 @@ impl UngatedDSparkGQA {
             scale: attention.scale,
             page_bytes: self.metal.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            gqa_layer_index,
             kv_token_tile_size,
             num_threads_per_threadblock,
             q_head_tile_size,
@@ -226,22 +225,25 @@ impl ReplayLayer for UngatedDSparkGQA {
             },
         )));
 
-        let sdpa_config = self.paged_sdpa_config(compute_path, input.page_table_layout, input.gqa_layer_index);
+        let sdpa_config = self.paged_sdpa_config(compute_path, input.page_table_layout);
         let sdpa_shape = GQAPagedSDPAShape {
             num_tokens: shape.num_tokens,
             total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
         };
         let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
-        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(GQAPagedSDPAMapBuffers {
-            q: scratch.q_norm_rope,
-            kv_pages: input.kv_cache.kv_pages,
-            req_slots: input.metadata.req_slots(),
-            page_ids: input.kv_cache.page_ids,
-            sdpa_map_task_templates: input.metadata.sdpa_map_task_templates(),
-            partial_exp_sums: scratch.partial_exp_sums,
-            partial_max_logits: scratch.partial_max_logits,
-            partial_output: scratch.partial_output,
-        })));
+        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
+            GQAPagedSDPAMapBuffers {
+                q: scratch.q_norm_rope,
+                kv_pages: input.kv_cache.kv_pages,
+                req_slots: input.metadata.req_slots(),
+                page_ids: input.kv_cache.page_ids,
+                sdpa_map_task_templates: input.metadata.sdpa_map_task_templates(),
+                partial_exp_sums: scratch.partial_exp_sums,
+                partial_max_logits: scratch.partial_max_logits,
+                partial_output: scratch.partial_output,
+            },
+            ReplayU32::Fixed(input.gqa_layer_index),
+        )));
         recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
             GQABlockSDPAShape {
                 num_tokens: shape.num_tokens,

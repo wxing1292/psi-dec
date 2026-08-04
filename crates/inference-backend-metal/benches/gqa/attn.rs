@@ -86,7 +86,6 @@ impl GQAFixture {
             scale: 1.0 / (GQA_HEAD_DIM as f32).sqrt(),
             page_bytes: 2 * GQA_NUM_KV_HEADS * GQA_TOKENS_PER_PAGE * GQA_HEAD_DIM * Dtype::Bfloat16.item_size() as u32,
             page_table_layout,
-            gqa_layer_index: 0,
             kv_token_tile_size: GQA_KV_TOKEN_TILE_SIZE,
             num_threads_per_threadblock: GQA_NUM_THREADS_PER_THREADBLOCK,
             q_head_tile_size: (GQA_NUM_Q_HEADS / GQA_NUM_KV_HEADS).min(GQA_Q_HEAD_TILE_SIZE_CAP),
@@ -195,7 +194,10 @@ fn build_gqa_replay(
     output: &Buffer,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map(scratch.map_buffers(q, kv_pages, req_slots, page_ids, sdpa_map_task_templates)));
+    builder.record(kernels.invoke_map(
+        scratch.map_buffers(q, kv_pages, req_slots, page_ids, sdpa_map_task_templates),
+        inference_backend_metal::metal::ReplayU32::Fixed(0),
+    ));
     builder.record(kernels.invoke_reduce(scratch.reduce_buffers(cu_sdpa_partial_outputs, output)));
     builder.build()
 }

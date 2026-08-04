@@ -12,6 +12,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("metal/gqa_tiled_attention.metal");
 
@@ -53,7 +54,6 @@ pub struct GQATiledSDPAConfig {
     pub page_bytes: u32,
     pub dtype: Dtype,
     pub page_table_layout: GQAPageTableLayout,
-    pub gqa_layer_index: u32,
 }
 
 impl GQATiledSDPAConfig {
@@ -75,7 +75,6 @@ impl GQATiledSDPAConfig {
         assert!(self.scale > 0.0);
         assert_eq!(self.dtype, Dtype::Bfloat16, "tiled GQA specializes bf16");
         self.page_table_layout.validate();
-        assert!(self.gqa_layer_index < self.page_table_layout.num_gqa_layers);
         assert_u32_count_domain(self.num_head_groups(), "GQA tiled SDPA head groups");
     }
 
@@ -259,12 +258,17 @@ impl GQATiledSDPAKernels {
         }
     }
 
-    pub fn invoke_map<'a>(&self, buffers: GQATiledSDPAMapBuffers<'a>) -> GQATiledSDPAMapInvocation<'a> {
+    pub fn invoke_map<'a>(
+        &self,
+        buffers: GQATiledSDPAMapBuffers<'a>,
+        page_table_index: ReplayU32,
+    ) -> GQATiledSDPAMapInvocation<'a> {
         GQATiledSDPAMapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
             buffers,
+            page_table_index,
         }
     }
 
@@ -283,6 +287,7 @@ pub struct GQATiledSDPAMapInvocation<'a> {
     config: GQATiledSDPAConfig,
     shape: GQATiledSDPAShape,
     buffers: GQATiledSDPAMapBuffers<'a>,
+    page_table_index: ReplayU32,
 }
 
 impl Operator for GQATiledSDPAMapInvocation<'_> {
@@ -314,6 +319,17 @@ impl Operator for GQATiledSDPAMapInvocation<'_> {
         recorder.set_buffer_write(7, self.buffers.partial_output, 0);
         recorder.set_buffer_write(8, self.buffers.partial_exp_sums, 0);
         recorder.set_buffer_write(9, self.buffers.partial_max_logits, 0);
+        let max_page_table_index = config.page_table_layout.num_gqa_layers - 1;
+        match self.page_table_index {
+            ReplayU32::Fixed(page_table_index) => {
+                assert!(
+                    page_table_index <= max_page_table_index,
+                    "GQA page-table index exceeds layer count"
+                );
+                recorder.set_u32(10, page_table_index);
+            },
+            ReplayU32::Parameter(key) => recorder.bind_u32(10, key, 0, max_page_table_index),
+        }
         recorder.set_threadblock_memory_length(0, config.map_threadblock_memory_bytes());
         recorder.dispatch_threadblocks(
             (
@@ -378,7 +394,6 @@ fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
 #define NUM_GQA_LAYERS {num_gqa_layers}
 #define NUM_BLOCKS {num_blocks}
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
-#define GQA_LAYER_INDEX {gqa_layer_index}
 #define Q_TOKEN_TILE_SIZE {q_token_tile_size}
 #define KV_TOKEN_TILE_SIZE {kv_token_tile_size}
 #define NUM_THREADS_PER_THREADBLOCK {num_threads_per_threadblock}
@@ -397,7 +412,6 @@ fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
         num_gqa_layers = config.page_table_layout.num_gqa_layers,
         num_blocks = config.page_table_layout.num_blocks,
         num_page_ids_per_block = config.page_table_layout.num_page_ids_per_block,
-        gqa_layer_index = config.gqa_layer_index,
         q_token_tile_size = config.q_token_tile_size,
         kv_token_tile_size = config.kv_token_tile_size,
         num_threads_per_threadblock = config.num_threads_per_threadblock(),
@@ -408,14 +422,24 @@ fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
 #[cfg(test)]
 mod tests {
     use super::GQATiledSDPAConfig;
+    use super::GQATiledSDPAKernels;
     use super::GQATiledSDPAShape;
     use crate::components::GQAPageTableLayout;
+    use crate::metal::Device;
     use crate::metal::Dtype;
 
     #[test]
     fn test_shape_accepts_qwen3_profile() {
         let (config, shape) = tiled_workload(128, 8);
         shape.validate(config);
+    }
+
+    #[test]
+    fn test_kernel_compiles_qwen3_profile() {
+        let device = Device::system_default();
+        let (config, shape) = tiled_workload(128, 8);
+
+        let _ = GQATiledSDPAKernels::new(&device, config, shape);
     }
 
     #[test]
@@ -449,7 +473,6 @@ mod tests {
                 num_blocks: 1,
                 num_page_ids_per_block: 1,
             },
-            gqa_layer_index: 0,
         };
         shape.validate(config);
     }
@@ -472,7 +495,6 @@ mod tests {
                     num_blocks: 1,
                     num_page_ids_per_block: 1,
                 },
-                gqa_layer_index: 0,
             },
             GQATiledSDPAShape {
                 num_tokens: 8,

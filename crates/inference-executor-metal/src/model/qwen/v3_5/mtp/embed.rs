@@ -283,16 +283,12 @@ impl Qwen35MTPEmbedWeights {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35MTPEmbedReplayKey {
-    mtp_module_index: usize,
     num_tokens: usize,
 }
 
 impl Qwen35MTPEmbedReplayKey {
-    pub fn new(mtp_module_index: usize, num_tokens: usize) -> Self {
-        Self {
-            mtp_module_index,
-            num_tokens,
-        }
+    pub fn new(num_tokens: usize) -> Self {
+        Self { num_tokens }
     }
 }
 
@@ -302,7 +298,6 @@ impl ReplayComponent for Qwen35MTPEmbed {
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         Self::Key {
-            mtp_module_index: 0,
             num_tokens: input.num_tokens as usize,
         }
     }

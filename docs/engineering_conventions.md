@@ -67,7 +67,9 @@ base_block_index + block_offset
 state_version
 candidate_state_versions
 verified_state_version
-first_candidate_state_version
+replay_source_state_version
+candidate_start_state_version
+candidate_end_state_version
 ```
 
 Recommendation: Do not use `absolute_*` unless another coordinate system exists. Do not use an unqualified `offset` or

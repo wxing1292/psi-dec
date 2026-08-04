@@ -232,8 +232,7 @@ impl BlockFixture {
             &gdn_cores,
             gdn_metal,
             1,
-            0,
-            max_tokens,
+            inference_executor_metal::attn::gdn::state_table::GDNStateCapacity::new(2, 1, 1),
             max_tokens,
             CACHE_BLOCK_TOKENS,
             QWEN35_PAGE_SIZE_BYTES,
@@ -349,14 +348,20 @@ fn load_layer(
         })
         .count();
     let compact_gdn_layer_index = model_layer_index - compact_gqa_layer_index;
+    let attn_layer_index = match config
+        .layer_type_at(model_layer_index)
+        .expect("benchmark layer type must be valid")
+    {
+        LayerType::FullAttention => compact_gqa_layer_index,
+        LayerType::GDN => compact_gdn_layer_index,
+    };
     Qwen35MainLayer::load(
         device,
         store,
         config,
         defaults,
         model_layer_index,
-        compact_gqa_layer_index,
-        compact_gdn_layer_index,
+        attn_layer_index,
         bindings,
         gqa_state,
         gdn_state,

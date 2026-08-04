@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -15,18 +16,24 @@ use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
-use inference_runtime_service::codec::qwen::QwenCodec;
-use inference_runtime_service::runtime::serve_replay_model;
-use inference_runtime_service::telemetry::CacheLaneLogSummary;
-use inference_runtime_service::telemetry::StartupLogger;
 
+use crate::codec::qwen::QwenCodec;
 use crate::qwen_server::args::Qwen35Args;
 use crate::qwen_server::config::Qwen35Config;
 use crate::qwen_server::config::Qwen35ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
 use crate::qwen_server::sizing::kv_dtype_bytes;
+use crate::runtime::serve_replay_model;
+use crate::specialization::SpecializedWorker;
+use crate::telemetry::CacheLaneLogSummary;
+use crate::telemetry::StartupLogger;
 
 const TOKENS_PER_CACHE_BLOCK: usize = 2048;
+const QWEN35_DENSE_BIN: &str = "qwen3_5_dense";
+const QWEN35_SPARSE_BIN: &str = "qwen3_5_sparse";
+const QWEN35_BUILD_CACHE_LANES_ENV: &str = "PSI_QWEN35_CACHE_LANES";
+const QWEN35_SPECIALIZED_RUN_ENV: &str = "PSI_QWEN35_SPECIALIZED_WORKER";
+const QWEN35_SPECIALIZED_TARGET_DIR_NAME: &str = "qwen3_5_specialized";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelKind {
@@ -41,26 +48,74 @@ impl ModelKind {
             ModelKind::Sparse => "qwen3.5 sparse 35B-A3B",
         }
     }
+
+    fn binary(self) -> &'static str {
+        match self {
+            ModelKind::Dense => QWEN35_DENSE_BIN,
+            ModelKind::Sparse => QWEN35_SPARSE_BIN,
+        }
+    }
 }
 
-pub fn run_dense() {
-    run_or_exit(ModelKind::Dense);
+pub fn run_dense<const L: usize>() {
+    run_or_launch::<L>(ModelKind::Dense);
 }
 
-pub fn run_sparse() {
-    run_or_exit(ModelKind::Sparse);
+pub fn run_sparse<const L: usize>() {
+    run_or_launch::<L>(ModelKind::Sparse);
 }
 
-fn run_or_exit(kind: ModelKind) {
-    if let Err(error) = run(kind) {
+fn run_or_launch<const L: usize>(kind: ModelKind) {
+    if std::env::var_os(QWEN35_SPECIALIZED_RUN_ENV).is_some() {
+        run_worker::<L>(kind, Qwen35Args::parse());
+    } else {
+        launch_or_exit(kind);
+    }
+}
+
+fn launch_or_exit(kind: ModelKind) {
+    if let Err(error) = launch_worker(kind) {
         eprintln!("unable to start {}: {error}", kind.label());
         std::process::exit(1);
     }
 }
 
-fn run(kind: ModelKind) -> Result<()> {
-    let args = Qwen35Args::parse();
+fn launch_worker(kind: ModelKind) -> Result<()> {
+    let config = Qwen35Config::from_args(Qwen35Args::parse())?;
+    let num_mtp_steps = config.num_mtp_steps();
+    let num_cache_lanes = num_mtp_steps
+        .checked_add(1)
+        .ok_or_else(|| log_info_invalid_argument!("--num-mtp-steps is too large"))?;
+    let service_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let worker_manifest = service_manifest_dir.join("Cargo.toml");
+    let worker_target_dir = service_manifest_dir
+        .join("../../target")
+        .join(QWEN35_SPECIALIZED_TARGET_DIR_NAME)
+        .join(format!("mtp_steps_{num_mtp_steps}"));
+    SpecializedWorker::new(worker_manifest, kind.binary(), worker_target_dir)
+        .build_env(QWEN35_BUILD_CACHE_LANES_ENV, num_cache_lanes.to_string())
+        .run_env(QWEN35_SPECIALIZED_RUN_ENV, "1")
+        .exec(std::env::args_os().skip(1))
+}
+
+fn run_worker<const L: usize>(kind: ModelKind, args: Qwen35Args) {
+    if let Err(error) = run_service::<L>(kind, args) {
+        eprintln!("unable to start {}: {error}", kind.label());
+        std::process::exit(1);
+    }
+}
+
+fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> {
     let config = Qwen35Config::from_args(args)?;
+    assert!(L > 0, "qwen3.5 worker requires at least the Main cache lane");
+    assert_eq!(
+        L,
+        config
+            .num_mtp_steps()
+            .checked_add(1)
+            .expect("qwen3.5 configured cache lane count must fit usize"),
+        "qwen3.5 worker const L must equal num_mtp_steps + 1"
+    );
     let telemetry = config.telemetry_config();
     telemetry.init();
     let startup = StartupLogger::new(kind.label());
@@ -101,8 +156,8 @@ fn run(kind: ModelKind) -> Result<()> {
     tracing::info!(
         target: "inference-runtime-service::startup",
         component = kind.label(),
-        detected_mtp_modules = model_config.text_config.mtp_num_hidden_layers,
-        num_mtp_modules = config.num_mtp_modules(),
+        checkpoint_mtp_layers = model_config.text_config.mtp_num_hidden_layers,
+        num_mtp_steps = config.num_mtp_steps(),
         model_mode = ?config.model_mode(),
         num_cache_pages,
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
@@ -117,30 +172,15 @@ fn run(kind: ModelKind) -> Result<()> {
     let runtime_config = build_runtime_config(&startup, &config, &model_config, &model)?;
 
     startup.event("initializing runtime");
-    match config.model_mode() {
-        Qwen35ModelMode::Vanilla | Qwen35ModelMode::DSpark { .. } => {
-            serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 1, _>(
-                config.grpc_listen_addr(),
-                config.http_listen_addr(),
-                qwen_codec,
-                runtime_config,
-                scheduler_config,
-                model,
-                telemetry.debug_logging,
-            )
-        },
-        Qwen35ModelMode::Mtp { .. } => {
-            serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 2, _>(
-                config.grpc_listen_addr(),
-                config.http_listen_addr(),
-                qwen_codec,
-                runtime_config,
-                scheduler_config,
-                model,
-                telemetry.debug_logging,
-            )
-        },
-    }
+    serve_replay_model::<TOKENS_PER_CACHE_BLOCK, L, _>(
+        config.grpc_listen_addr(),
+        config.http_listen_addr(),
+        qwen_codec,
+        runtime_config,
+        scheduler_config,
+        model,
+        telemetry.debug_logging,
+    )
 }
 
 fn validate_checkpoint_kind(kind: ModelKind, model_config: &Qwen35ModelConfig) -> Result<()> {
@@ -194,7 +234,9 @@ fn build_model(
     let hf_model_dir = config.hf_model_dir();
     let init_result = match config.model_mode() {
         Qwen35ModelMode::Vanilla => init_qwen_3_5_model(hf_model_dir, executor_config),
-        Qwen35ModelMode::Mtp { model_dir } => init_qwen_3_5_model_with_mtp(hf_model_dir, model_dir, executor_config),
+        Qwen35ModelMode::MTP { model_dir, num_steps } => {
+            init_qwen_3_5_model_with_mtp(hf_model_dir, model_dir, *num_steps, executor_config)
+        },
         Qwen35ModelMode::DSpark { model_dir } => {
             init_qwen_3_5_model_with_dspark(hf_model_dir, model_dir, executor_config)
         },

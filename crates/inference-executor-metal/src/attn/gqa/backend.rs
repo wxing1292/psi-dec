@@ -30,6 +30,7 @@ use inference_backend_metal::components::GQATiledSDPAShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::GQACore;
@@ -101,7 +102,7 @@ pub struct GQAWeights<'a> {
 #[derive(Clone, Copy)]
 pub struct GQAInput<'a> {
     pub page_table_layout: GQAPageTableLayout,
-    pub gqa_layer_index: u32,
+    pub gqa_layer_index: ReplayU32,
     pub batch_metadata: &'a GQAMetadataBuffers,
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
@@ -162,7 +163,9 @@ impl GQA {
     fn validate_input(&self, input: &GQAInput<'_>) {
         input.batch_metadata.replay_shape().validate();
         input.page_table_layout.validate();
-        assert!(input.gqa_layer_index < input.page_table_layout.num_gqa_layers);
+        if let ReplayU32::Fixed(index) = input.gqa_layer_index {
+            assert!(index < input.page_table_layout.num_gqa_layers);
+        }
     }
 
     pub fn new(device: &Device, core: GQACore, config: GQAMetalConfig) -> Self {
@@ -229,7 +232,7 @@ impl ReplayLayer for GQA {
         self.validate_input(&input);
         let shape = input.batch_metadata.replay_shape();
         let page_table_layout = input.page_table_layout;
-        let gqa_layer_index = input.gqa_layer_index;
+        let page_table_index = input.gqa_layer_index;
         let hidden_state = input.hidden_state;
         let next_hidden_state = input.next_hidden_state;
         let kv_cache = input.kv_cache;
@@ -277,17 +280,19 @@ impl ReplayLayer for GQA {
                 output: scratch.k_norm_rope,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
-            self.kv_page_write_shape(shape, page_table_layout, gqa_layer_index),
-            GQAKVPageWriteBuffers {
-                pages: kv_cache.kv_pages,
-                flat_k: scratch.k_norm_rope,
-                flat_v: scratch.v,
-                req_slots: batch_metadata.req_slots(),
-                flat_token_indices: batch_metadata.flat_token_indices(),
-                page_ids: kv_cache.page_ids,
-            },
-        )));
+        let kv_page_write_shape = self.kv_page_write_shape(shape, page_table_layout);
+        let kv_page_write_buffers = GQAKVPageWriteBuffers {
+            pages: kv_cache.kv_pages,
+            flat_k: scratch.k_norm_rope,
+            flat_v: scratch.v,
+            req_slots: batch_metadata.req_slots(),
+            flat_token_indices: batch_metadata.flat_token_indices(),
+            page_ids: kv_cache.page_ids,
+        };
+        let kv_page_write = self
+            .kv_page_write
+            .invoke(kv_page_write_shape, kv_page_write_buffers, page_table_index);
+        recorder.record_with_barrier_before(ReplayOp::opaque(kv_page_write));
         let attention_output = match batch_metadata.compute_path() {
             GQAComputePath::SingleQueryToken {
                 kv_token_tile_size,
@@ -296,14 +301,13 @@ impl ReplayLayer for GQA {
             } => {
                 let sdpa_config = self.paged_sdpa_config(
                     page_table_layout,
-                    gqa_layer_index,
                     kv_token_tile_size,
                     num_threads_per_threadblock,
                     q_head_tile_size,
                 );
                 let sdpa_shape = self.paged_sdpa_shape(shape);
                 let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
-                recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(GQAPagedSDPAMapBuffers {
+                let buffers = GQAPagedSDPAMapBuffers {
                     q: scratch.q_norm_rope,
                     kv_pages: kv_cache.kv_pages,
                     req_slots: batch_metadata.req_slots(),
@@ -312,7 +316,9 @@ impl ReplayLayer for GQA {
                     partial_exp_sums: scratch.sdpa_partial_exp_sums,
                     partial_max_logits: scratch.sdpa_partial_max_logits,
                     partial_output: scratch.sdpa_partial_output,
-                })));
+                };
+                let map = sdpa.invoke_map(buffers, page_table_index);
+                recorder.record_with_barrier_before(ReplayOp::opaque(map));
                 recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
                     partial_exp_sums: scratch.sdpa_partial_exp_sums,
                     partial_max_logits: scratch.sdpa_partial_max_logits,
@@ -329,14 +335,13 @@ impl ReplayLayer for GQA {
             } => {
                 let sdpa_config = self.tiled_sdpa_config(
                     page_table_layout,
-                    gqa_layer_index,
                     q_token_tile_size,
                     kv_token_tile_size,
                     q_head_tile_size,
                 );
                 let sdpa_shape = self.tiled_sdpa_shape(shape);
                 let sdpa = GQATiledSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
-                recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(GQATiledSDPAMapBuffers {
+                let buffers = GQATiledSDPAMapBuffers {
                     q: scratch.q_norm_rope,
                     kv_pages: kv_cache.kv_pages,
                     req_slots: batch_metadata.req_slots(),
@@ -347,7 +352,9 @@ impl ReplayLayer for GQA {
                     partial_output: scratch.sdpa_partial_output,
                     partial_exp_sums: scratch.sdpa_partial_exp_sums,
                     partial_max_logits: scratch.sdpa_partial_max_logits,
-                })));
+                };
+                let map = sdpa.invoke_map(buffers, page_table_index);
+                recorder.record_with_barrier_before(ReplayOp::opaque(map));
                 recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQATiledSDPAReduceBuffers {
                     partial_output: scratch.sdpa_partial_output,
                     partial_exp_sums: scratch.sdpa_partial_exp_sums,
@@ -397,23 +404,16 @@ impl GQA {
         }
     }
 
-    fn kv_page_write_shape(
-        &self,
-        shape: GQAReplayShape,
-        page_table_layout: GQAPageTableLayout,
-        gqa_layer_index: u32,
-    ) -> GQAKVPageWriteShape {
+    fn kv_page_write_shape(&self, shape: GQAReplayShape, page_table_layout: GQAPageTableLayout) -> GQAKVPageWriteShape {
         GQAKVPageWriteShape {
             num_token_writes: shape.num_tokens,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            gqa_layer_index,
         }
     }
 
     fn paged_sdpa_config(
         &self,
         page_table_layout: GQAPageTableLayout,
-        gqa_layer_index: u32,
         kv_token_tile_size: u32,
         num_threads_per_threadblock: u32,
         q_head_tile_size: u32,
@@ -425,7 +425,6 @@ impl GQA {
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            gqa_layer_index,
             kv_token_tile_size,
             num_threads_per_threadblock,
             q_head_tile_size,
@@ -443,7 +442,6 @@ impl GQA {
     fn tiled_sdpa_config(
         &self,
         page_table_layout: GQAPageTableLayout,
-        gqa_layer_index: u32,
         q_token_tile_size: u32,
         kv_token_tile_size: u32,
         q_head_tile_size: u32,
@@ -459,7 +457,6 @@ impl GQA {
             page_bytes: self.config.page_bytes,
             dtype: self.config.io_dtype,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            gqa_layer_index,
         }
     }
 

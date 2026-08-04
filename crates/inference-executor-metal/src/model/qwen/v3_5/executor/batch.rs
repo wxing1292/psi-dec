@@ -82,12 +82,13 @@ impl Qwen35Executor {
     pub fn num_mtp_gqa_page_ids_per_block(&self) -> Vec<usize> {
         match &self.speculator {
             Qwen35Speculator::Vanilla | Qwen35Speculator::DSpark(_) => Vec::new(),
-            Qwen35Speculator::Mtp(mtp) => {
+            Qwen35Speculator::MTP(mtp) => {
                 let layout = mtp.gqa_state.request_page_table().layout();
-                let num_page_ids = u64::from(layout.num_gqa_layers)
-                    .checked_mul(u64::from(layout.num_page_ids_per_block))
-                    .expect("qwen3.5 MTP GQA page IDs per block overflow");
-                vec![usize::try_from(num_page_ids).expect("qwen3.5 MTP GQA page IDs per block must fit usize")]
+                vec![
+                    usize::try_from(layout.num_page_ids_per_block)
+                        .expect("qwen3.5 MTP GQA page IDs per block must fit usize");
+                    mtp.num_steps
+                ]
             },
         }
     }
@@ -97,17 +98,12 @@ impl Qwen35Executor {
     }
 
     fn commit(&mut self, compute_seq: RawComputeSlotSeq, decisions: &[Qwen35DecodeDecision]) {
-        let verified_state_versions = self.pending_transactions.commit(compute_seq, decisions);
+        let state_versions = self.pending_transactions.commit(compute_seq, decisions);
         trace_decisions("model_commit_decisions", decisions);
-        trace::qwen35_state(|| {
-            format!(
-                "event=model_commit verified_state_versions={:?}",
-                verified_state_versions
-            )
-        });
+        trace::qwen35_state(|| format!("event=model_commit state_versions={state_versions:?}"));
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         self.main_gdn_state
-            .commit(&runtime, self.pages.buffer(), &verified_state_versions);
+            .commit(&runtime, self.pages.buffer(), &state_versions);
         // Publish is submitted asynchronously here and overlaps returning the
         // response to runtime core. The next prepare/reset waits before reusing
         // the shared GDN page-I/O staging and live-state resources.

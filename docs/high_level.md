@@ -295,14 +295,14 @@ Model
     main layers
     final norm / unembedding
     sampling / rejection sampling
-    MTP modules
+    MTP graph and logical steps
     request state, replay caches, and stage ordering
 
 Layer / Component
   owns semantic model computation:
     GQA, GDN, dense MLP, MoE
     embedding, unembedding, sampling, rejection sampling
-    MTP layer/module semantics
+    MTP physical-layer and logical-step semantics
     model-level shape/input/output contract
     weights, request metadata, state/page metadata at that semantic boundary
     record support for replay composition

@@ -95,7 +95,7 @@ for (uint kv_token_tile_begin = kv_token_begin; kv_token_tile_begin < kv_token_e
         uint page_id_index = (kv_token_index / uint(NUM_TOKENS)) % uint(NUM_PAGE_IDS_PER_BLOCK);
         uint page_token_index = kv_token_index % uint(NUM_TOKENS);
         ulong page_id_table_index =
-            ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)GQA_LAYER_INDEX)
+            ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)gqa_layer_index)
               * (ulong)NUM_BLOCKS
               + (ulong)block_index)
              * (ulong)NUM_PAGE_IDS_PER_BLOCK)
@@ -194,7 +194,7 @@ for (uint kv_token_tile_begin = kv_token_begin; kv_token_tile_begin < kv_token_e
             uint page_id_index = (kv_token_index / uint(NUM_TOKENS)) % uint(NUM_PAGE_IDS_PER_BLOCK);
             uint page_token_index = kv_token_index % uint(NUM_TOKENS);
             ulong page_id_table_index =
-                ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)GQA_LAYER_INDEX)
+                ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)gqa_layer_index)
                   * (ulong)NUM_BLOCKS
                   + (ulong)block_index)
                  * (ulong)NUM_PAGE_IDS_PER_BLOCK)

@@ -230,8 +230,10 @@ For a flat token, the page lookup is exactly:
 req_slot -> gqa_layer_index -> block_index -> page_id_index -> page_id -> KV page
 ```
 
-The main page-ID table uses compact main `gqa_layer_index`. The supported optional MTP has an independent table. Its
-single full-attention body uses `gqa_layer_index = 0`.
+The main page-ID table uses a fixed compact main `gqa_layer_index`.
+The optional MTP has an independent table with `K` GQA layer rows.
+Runtime cache lane `step_index + 1` supplies the page IDs for MTP table row `step_index`.
+`Qwen35MTP` performs this model-specific lane-to-row conversion through the generic page-table write API.
 
 Qwen3 DSpark has a separate page table.
 The Qwen3 executor splits one runtime cache-block page span into Main and DSpark page spans.
@@ -246,10 +248,14 @@ The Qwen executor updates Main state once for each Main batch.
 It updates optional MTP metadata once for the MTP stage.
 It updates DSpark proposal metadata once for the DSpark Spec stage.
 
-Main GQA layers borrow the Main state domain. The optional MTP owns its backend, scratch, and compact page-ID table.
+Main GQA layers borrow the Main state domain. The optional MTP owns its backend, scratch, and logical-lane page-ID table.
 
 Layer owners retain immutable weights and a `gqa_layer_index`. A main layer does not retain model-level GQA
-configuration or batch metadata. Each current MTP full-attention body uses coordinate 0 in its own table.
+configuration or batch metadata.
+The physical MTP layer binds its logical `gqa_layer_index` as a submission-time replay parameter.
+MTP step `step_index` binds GQA layer row `step_index`.
+Page preparation maps runtime cache lane `step_index + 1` to that row.
+The step index does not enter the replay key.
 
 ## Backend specialization
 
@@ -300,7 +306,6 @@ GQAPagedSDPAConfig              GQAPagedSDPAShape
   scale
   page_bytes
   page_table_layout
-  gqa_layer_index
   kv_token_tile_size
   num_threads_per_threadblock
   q_head_tile_size
@@ -369,6 +374,10 @@ The Metal component selects the matching bf16/f32 update kernel. `GQAKVPageWrite
 `num_kv_heads`, `head_dim`, `page_bytes`, dtype, and derived tokens-per-page.
 
 `num_token_writes`, `gqa_layer_index`, and page-table coordinates remain invocation data.
+The Metal replay core provides symmetric fixed-or-parameter scalar sources for `u32`, `u64`, `i32`, `i64`, and `f32`.
+`ReplayArguments`, `CommandParameterLayoutBuilder`, and `CommandRecorder` support the same scalar set. GQA uses
+`ReplayU32::Fixed(value)` or `ReplayU32::Parameter(key)` through the same kernel and invocation path. The GQA component
+does not define a replay-indexed constructor, kernel variant, or model-specific flag.
 
 The replay shape separates fixed page-table layout from execution work:
 
@@ -422,8 +431,10 @@ TaskTemplate.
 `Qwen35MainReplayKey` and `Qwen35MTPReplayKey` therefore include only `num_q_token_tiles` and
 `total_sdpa_map_task_templates`. The main key also contains the non-optional GDN request-count subkey.
 
-MTP keeps its separate pure-GQA key. An ICB recorded for one selector or dispatch geometry cannot serve another
-geometry. Both map-TaskTemplate layouts share the recorded program when their geometry matches.
+MTP keeps its separate pure-GQA key.
+All MTP steps in one batch have the same token and attention shape, so they reuse one recorded program.
+The replay argument selects the logical MTP GQA layer at execution time.
+Main recording supplies each physical layer's fixed index through the same kernel ABI.
 
 ### Execution strategy
 
@@ -604,7 +615,7 @@ Qwen3.5 keeps reusable gated-GQA scratch in the directly owned `Qwen3xGQAState`.
 from its one `GQACompute` capacity contract. Individual GQA layers do not own this scratch.
 
 The executor owns one Main `GQAScratch`. The optional MTP owns one matching scratch because its GQA configuration can
-differ.
+differ. All logical MTP steps reuse this one MTP scratch owner.
 
 This scratch contains the buffers for QGKV projection, the projected gate, gated output, norm/RoPE, and SDPA. The fixed
 gated graph requires these buffers.

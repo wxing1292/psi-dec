@@ -12,6 +12,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const GQA_PAGED_SDPA_MAP_BODY: &str = include_str!("metal/gqa_paged_sdpa_map.metal");
 const GQA_PAGED_SDPA_REDUCE_SOURCE: &str = include_str!("metal/gqa_paged_sdpa_reduce.metal");
@@ -50,7 +51,6 @@ pub struct GQAPagedSDPAConfig {
     pub scale: f32,
     pub page_bytes: u32,
     pub page_table_layout: GQAPageTableLayout,
-    pub gqa_layer_index: u32,
     pub kv_token_tile_size: u32,
     pub num_threads_per_threadblock: u32,
     pub q_head_tile_size: u32,
@@ -66,7 +66,6 @@ impl GQAPagedSDPAConfig {
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         assert!(self.num_tokens_per_page() > 0);
         self.page_table_layout.validate();
-        assert!(self.gqa_layer_index < self.page_table_layout.num_gqa_layers);
         assert!(self.kv_token_tile_size > 0 && self.kv_token_tile_size <= 1024);
         assert!(self.num_threads_per_threadblock.is_power_of_two() && self.num_threads_per_threadblock <= 256);
         assert!(self.q_head_tile_size > 0 && self.q_head_tile_size <= 8);
@@ -316,12 +315,17 @@ impl GQAPagedSDPAKernels {
         }
     }
 
-    pub fn invoke_map<'a>(&self, buffers: GQAPagedSDPAMapBuffers<'a>) -> GQAPagedSDPAMapInvocation<'a> {
+    pub fn invoke_map<'a>(
+        &self,
+        buffers: GQAPagedSDPAMapBuffers<'a>,
+        page_table_index: ReplayU32,
+    ) -> GQAPagedSDPAMapInvocation<'a> {
         GQAPagedSDPAMapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
             buffers,
+            page_table_index,
         }
     }
 
@@ -505,7 +509,6 @@ typedef bfloat bfloat16_t;
 #define KV_TOKEN_TILE_SIZE {kv_token_tile_size}
 #define TOTAL_SDPA_MAP_TASK_TEMPLATES {total_sdpa_map_task_templates}
 #define NUM_THREADS_PER_THREADBLOCK {num_threads_per_threadblock}
-#define GQA_LAYER_INDEX {gqa_layer_index}
 #define NUM_GQA_LAYERS {num_gqa_layers}
 #define NUM_BLOCKS {num_blocks}
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
@@ -519,6 +522,7 @@ kernel void gqa_paged_sdpa_map(
     device float* partial_exp_sums [[buffer(5)]],
     device float* partial_max_logits [[buffer(6)]],
     device T* partial_output [[buffer(7)]],
+    constant uint& gqa_layer_index [[buffer(8)]],
     uint global_thread_index [[thread_position_in_grid]]
 ) {{
 {body}
@@ -538,7 +542,6 @@ kernel void gqa_paged_sdpa_map(
         kv_token_tile_size = config.kv_token_tile_size,
         total_sdpa_map_task_templates = shape.total_sdpa_map_task_templates,
         num_threads_per_threadblock = config.num_threads_per_threadblock,
-        gqa_layer_index = config.gqa_layer_index,
         num_gqa_layers = config.page_table_layout.num_gqa_layers,
         num_blocks = config.page_table_layout.num_blocks,
         num_page_ids_per_block = config.page_table_layout.num_page_ids_per_block,
@@ -559,6 +562,7 @@ pub struct GQAPagedSDPAMapInvocation<'a> {
     config: GQAPagedSDPAConfig,
     shape: GQAPagedSDPAShape,
     buffers: GQAPagedSDPAMapBuffers<'a>,
+    page_table_index: ReplayU32,
 }
 
 impl Operator for GQAPagedSDPAMapInvocation<'_> {
@@ -574,6 +578,17 @@ impl Operator for GQAPagedSDPAMapInvocation<'_> {
         builder.set_buffer_write(5, self.buffers.partial_exp_sums, 0);
         builder.set_buffer_write(6, self.buffers.partial_max_logits, 0);
         builder.set_buffer_write(7, self.buffers.partial_output, 0);
+        let max_page_table_index = self.config.page_table_layout.num_gqa_layers - 1;
+        match self.page_table_index {
+            ReplayU32::Fixed(page_table_index) => {
+                assert!(
+                    page_table_index <= max_page_table_index,
+                    "GQA page-table index exceeds layer count"
+                );
+                builder.set_u32(8, page_table_index);
+            },
+            ReplayU32::Parameter(key) => builder.bind_u32(8, key, 0, max_page_table_index),
+        }
         builder.dispatch_1d(
             self.config.map_threads(shape),
             self.config.num_threads_per_threadblock as usize,
@@ -666,7 +681,6 @@ mod tests {
                 num_blocks: 1,
                 num_page_ids_per_block: 1,
             },
-            gqa_layer_index: 0,
             kv_token_tile_size: 1,
             num_threads_per_threadblock: 32,
             q_head_tile_size: 1,
@@ -853,7 +867,6 @@ mod tests {
                 num_gqa_layers: 1,
                 num_page_ids_per_block: 1,
             },
-            gqa_layer_index: 0,
             kv_token_tile_size: 4,
             num_threads_per_threadblock: 64,
             q_head_tile_size: 2,
@@ -908,13 +921,10 @@ mod tests {
         let scratch = GQAPagedSDPAScratch::new(&device, config, shape);
 
         let mut builder = stream.create_replay_program();
-        builder.record(kernels.invoke_map(scratch.map_buffers(
-            &q,
-            &kv_pages,
-            &req_slots,
-            &page_ids,
-            &sdpa_map_task_templates,
-        )));
+        builder.record(kernels.invoke_map(
+            scratch.map_buffers(&q, &kv_pages, &req_slots, &page_ids, &sdpa_map_task_templates),
+            ReplayU32::Fixed(0),
+        ));
         builder.record_with_barrier_before(
             kernels.invoke_reduce(scratch.reduce_buffers(&cu_sdpa_partial_outputs, &output)),
         );

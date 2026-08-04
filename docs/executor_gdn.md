@@ -403,11 +403,14 @@ Runtime page IDs remain CPU transaction data in `GDNStatePages` vectors. `GDNSta
 `page_ids`/`state_slots` GPU staging buffers and the batched read/write kernels. It fills the staging buffers immediately
 before restore or publish recording. The buffers do not represent persistent request-page ownership.
 
-At initialization, GDN derives per-request state-slot and publish-staging capacity from the scheduler's
-`max_tokens_per_request` and the logical cache-block size. The candidate-state bound is the larger of the
-speculative-prefix count and the unaligned normal-forward boundary count.
+At initialization, Qwen wiring derives direct per-request state-slot, candidate-state, and publish-staging capacities.
+`GDNRequestStateTable` consumes these direct resource bounds. It does not inspect scheduler, MTP, DSpark, or sampling
+configuration.
 
-Speculative prefixes already include the boundary versions that they cross. Therefore, these two bounds do not add.
+Speculative candidate suffixes and cache-block boundary versions can be disjoint when a request has more than one fixed
+token. Therefore, the resource bound adds the maximum decision-candidate count and maximum crossed-boundary count.
+Qwen3.5 MTP decode also materializes the possible replay-source states for the K - 1 rows that Main replays.
+The verified and replay-source ranges overlap. Their union contains at most `2 * K` states.
 Publish staging permits every block boundary that one maximum-length request can cross across all active request slots.
 
 The public table directly owns a private `GDNRequestSlots` mapping, pending restore/publish state transactions, and one
@@ -417,6 +420,15 @@ The public table directly owns a private `GDNRequestSlots` mapping, pending rest
 `GDNRequestStateTable::prepare(...)` through `commit(...)`. The prepare boundary receives explicit request slots,
 block/token indices, cumulative token counts, transactions, and runtime state-page IDs. It does not depend on a Qwen
 microbatch type.
+The transaction stores two ranges. One forward generates the exclusive token-end boundaries in
+`(start_state_version, end_state_version]`. The inclusive range
+`[candidate_start_state_version, candidate_end_state_version]` contains the states that must remain selectable through
+commit. The candidate range is inside `[start_state_version, end_state_version]`. A candidate equal to
+`start_state_version` reuses the current slot. Each later candidate uses a candidate slot. Qwen3.x wiring expands the
+candidate range to contain each possible Main replay source.
+Qwen wiring converts rejection results to a logical verified state version and a physical replay-source state version.
+It validates both values against `GDNStateTxn`. It passes only the replay-source value to GDN commit as the state version
+that becomes current. `GDNStateTxn` is common Qwen3.x GDN metadata.
 
 `GDNMetadataBuffers` is the state-domain-owned, capacity-sized GPU metadata object that all GDN layers share. Prepare
 writes its `cu_tokens` and src/dst/candidate state slots. Prepare then returns and stores the authoritative
@@ -647,7 +659,7 @@ GDNRequestStateTable
   txn cache-boundary publish state_version -> page_ids mappings
 
 src_state_slots          current source state slot per request
-dst_state_slots          candidate destination slot per request
+dst_state_slots          final output state slot per request
 conv_state               f32 slot arena for convolution state
 next_conv_state          destination conv-state arena; may be the same backing as conv_state
 recurrent_state_arena    f32 slot arena for recurrent state
@@ -666,17 +678,38 @@ publish_state_versions
   cache-boundary versions whose selected snapshot should be written to runtime-owned state pages
 ```
 
-The candidate set contains every version that commit/publish can select. Replay records these candidate state slots in the
-GDN metadata. Commit selects the candidate whose `state_version` matches the verified state version.
+The candidate set contains every replay-source or publish version that the transaction can select. Replay records
+these state slots in the GDN metadata. The output destination is the last candidate slot.
+Qwen wiring validates the verified state version against the transaction's forward range. It validates the
+replay-source state version against the candidate range. Commit receives only this physical state version. It promotes
+the matching slot as the current mutable source and releases other candidate slots.
 
 A commit to the current version leaves the current slot unchanged. It clears uncommitted txn state slots.
 
-Speculative Main verification must not promote a candidate written after rejected rows. If a forward contains
-`base + draft` rows and rejection accepts only a shorter verified prefix, Qwen replay records prefix candidate states.
-It uses additional per-request slots.
+Speculative Main verification must not promote a candidate written after rejected rows. Qwen wiring sets the candidate
+version range to the versions that commit can select. GDN materializes those versions without interpreting their model
+meaning.
 
-The normal GDN forward materializes candidate states while it scans rows. It writes each requested row to its candidate
-slot. Commit selects by verified state version. Therefore, it discards rejected candidate slots before the next forward.
+For one Main request, Qwen calculates `num_fixed_tokens = q_len - num_spec_tokens`.
+It selects `input_state_version + num_fixed_tokens + num_accepted_tokens`.
+For input state 93, two fixed tokens, and two speculative tokens, accept counts 0, 1, and 2 select states 95, 96, and 97.
+`num_mtp_steps` does not directly change this calculation.
+
+MTP decode replays K - 1 verified tail tokens in the next Main forward.
+Therefore, `replay_source_state_version = verified_state_version - (K - 1)` for this physical state selection.
+This replay boundary does not change the verified state formula.
+The next newly sampled token index equals `verified_state_version`.
+The next Main `QueryTokens::token_index` can equal `replay_source_state_version` because that call includes the replayed
+tail. For K = 2 and verified states 95, 96, and 97, the replay-source states are 94, 95, and 96.
+`QueryTokens::Prefill` commits its full window and does not use this replay shift.
+
+A logical cache-block boundary strictly inside the verified prefix remains selectable for cache publication. The state
+table allocates one additional candidate for each such boundary. A boundary in the draft suffix already coincides with
+a rejection candidate.
+
+The normal GDN forward materializes candidate states while it scans rows. It writes only requested rows to candidate
+slots. The final row writes the last candidate slot. Commit retains the selected replay state and discards the other
+candidates before the next forward.
 
 Cache-boundary publish is a separate requirement. When commit selects a registered publish version, publish must write
 the matching candidate/current slot to its page IDs.
@@ -685,9 +718,10 @@ GDN page read/write helpers remain separate recordable backend-metal components.
 pages. Runtime core owns page IDs and cache notifications. The model executor owns GDN state layout, request-slot
 interpretation, and candidate slot promotion. It owns only CPU transaction copies of runtime-provided page-ID vectors.
 
-`begin_txn(...)` registers candidate state-slot mappings and future immutable-page mappings. It stores them as typed
-`GDNStatePages` values for the current request txn. After registration, `candidate_state_slot(...)` is a read-only lookup.
-It asserts if the mapping was not registered.
+`begin_txn(...)` registers candidate state-slot mappings and future immutable-page mappings.
+It stores page mappings as typed `GDNStatePages` values for the current request txn.
+After registration, `candidate_state_slot(...)` is a read-only lookup.
+It asserts if the requested mapping was not registered.
 
 `restore(...)` returns a `GDNStateRestore` job. It updates the table's current state slot/version.
 
@@ -731,7 +765,7 @@ The replay-order section defines the hidden-state pipeline. Mutable request stat
 
 ```text
 src_state_slots[num_reqs]          committed current state slot for each request
-dst_state_slots[num_reqs]          final candidate slot for the full forward
+dst_state_slots[num_reqs]          last candidate slot for each request
 flat_candidate_state_slots[num_tokens]  optional prefix candidate slot per flat token, or u32::MAX
 conv_states[layer, slot, Cqkv, Ks]
 recurrent_states[layer, slot, v_head, v_dim, qk_dim]
@@ -785,7 +819,7 @@ forward
   may materialize prefix/cache-boundary candidate versions
 
 commit after rejection/sampling
-  verified_state_version -> current slot
+  state_version -> current slot
   satisfied publish versions -> page write jobs
 
 publish

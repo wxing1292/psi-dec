@@ -57,6 +57,7 @@ kernel void gqa_tiled_sdpa_map(
     device bfloat16_t* partial_output [[buffer(7)]],
     device float* partial_exp_sums [[buffer(8)]],
     device float* partial_max_logits [[buffer(9)]],
+    constant uint& gqa_layer_index [[buffer(10)]],
     threadgroup char* shared_mem [[threadgroup(0)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -163,7 +164,7 @@ kernel void gqa_tiled_sdpa_map(
                     (kv_token_index / uint(NUM_TOKENS_PER_PAGE)) % uint(NUM_PAGE_IDS_PER_BLOCK);
                 const uint page_token_index = kv_token_index % uint(NUM_TOKENS_PER_PAGE);
                 const ulong page_table_index =
-                    ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)GQA_LAYER_INDEX)
+                    ((((ulong)req_slot * (ulong)NUM_GQA_LAYERS + (ulong)gqa_layer_index)
                       * (ulong)NUM_BLOCKS + (ulong)block_index)
                      * (ulong)NUM_PAGE_IDS_PER_BLOCK) + (ulong)page_id_index;
                 const ulong page_id = (ulong)page_ids[page_table_index];
