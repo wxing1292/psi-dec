@@ -36,21 +36,18 @@ pub fn token_consumption<const L: usize>(
         }
     }
 
-    let num_cachable_tokens = num_queued_tokens.saturating_sub(L - 1);
-    let cachable_tokens_end = num_ready_tokens + num_cachable_tokens;
-    let decode_tokens_start = num_ready_tokens + num_queued_tokens;
-    let decode_tokens_end = decode_tokens_start + num_spec_tokens;
-    if decode_tokens_end == 0 {
-        return TokenConsumption::Skip;
-    }
-
-    // ready token | num_queued_tokens
-    if token_budget >= decode_tokens_start {
-        TokenConsumption::Decode(min(token_budget, decode_tokens_end))
-    } else if cachable_tokens_end == 0 {
+    let num_base_tokens = num_ready_tokens + num_queued_tokens;
+    if num_base_tokens == 0 {
         TokenConsumption::Skip
+    } else if token_budget >= num_base_tokens {
+        TokenConsumption::Decode(min(token_budget, num_base_tokens + num_spec_tokens))
     } else {
-        TokenConsumption::Prefill(min(token_budget, cachable_tokens_end))
+        let num_prefill_tokens = min(token_budget, num_base_tokens.saturating_sub(L - 1));
+        if num_prefill_tokens == 0 {
+            TokenConsumption::Skip
+        } else {
+            TokenConsumption::Prefill(num_prefill_tokens)
+        }
     }
 }
 
