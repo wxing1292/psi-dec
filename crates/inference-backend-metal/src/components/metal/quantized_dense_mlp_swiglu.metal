@@ -7,12 +7,12 @@ template <typename T>
 void dense_mlp_swiglu_impl(
     device const T* gate_up,
     device T* output,
-    constant uint& total_tokens,
+    constant uint& num_active_tokens,
     constant uint& intermediate_dim,
     uint gid
 ) {
-    const uint num_values = total_tokens * intermediate_dim;
-    if (gid >= num_values) return;
+    const uint num_active_values = num_active_tokens * intermediate_dim;
+    if (gid >= num_active_values) return;
     const uint row = gid / intermediate_dim;
     const uint col = gid - row * intermediate_dim;
     const uint row_base = row * intermediate_dim * 2;
@@ -24,19 +24,19 @@ void dense_mlp_swiglu_impl(
 kernel void dense_mlp_swiglu_f32(
     device const float* gate_up [[buffer(0)]],
     device float* output [[buffer(1)]],
-    constant uint& total_tokens [[buffer(2)]],
+    constant uint& num_active_tokens [[buffer(2)]],
     constant uint& intermediate_dim [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    dense_mlp_swiglu_impl<float>(gate_up, output, total_tokens, intermediate_dim, gid);
+    dense_mlp_swiglu_impl<float>(gate_up, output, num_active_tokens, intermediate_dim, gid);
 }
 
 kernel void dense_mlp_swiglu_bf16(
     device const bfloat16_t* gate_up [[buffer(0)]],
     device bfloat16_t* output [[buffer(1)]],
-    constant uint& total_tokens [[buffer(2)]],
+    constant uint& num_active_tokens [[buffer(2)]],
     constant uint& intermediate_dim [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    dense_mlp_swiglu_impl<bfloat16_t>(gate_up, output, total_tokens, intermediate_dim, gid);
+    dense_mlp_swiglu_impl<bfloat16_t>(gate_up, output, num_active_tokens, intermediate_dim, gid);
 }

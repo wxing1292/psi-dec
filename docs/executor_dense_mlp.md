@@ -93,10 +93,13 @@ hidden_state
   -> next_hidden_state
 ```
 
-`DenseMLPReplayShape.num_tokens` is the current backend-neutral microbatch row count.
+`DenseMLPReplayShape.num_tokens` is the backend-neutral row count for an exact replay.
 Only `crates/inference-executor-metal` maps it to `QuantizedDenseMLPShape`.
+The additive bucketed path uses `DenseMLPBucketedReplayInput.num_total_tokens` as the recorded row capacity.
+It accepts a caller-owned `ReplayParameterKey` for `num_active_tokens`.
 Production callers allocate scratch for model capacity.
-Each replay invocation validates and uses only the current token count.
+An exact invocation validates the exact token count.
+A bucketed invocation validates every buffer against `num_total_tokens`.
 All buffers and weights must match the configured dimensions, group size, bit width, and dtype.
 This requirement covers hidden buffers, gate/up scratch, swiglu scratch, and immutable weights.
 
@@ -115,6 +118,52 @@ The weight owner loads one bounded `TensorMap` from that exact gate/up/down bind
 It removes every tensor and materializes fused gate-up buffers while it keeps the down projection separate.
 The map must be empty after construction.
 At initialization, Qwen validates scratch layout compatibility across every Main and optional MTP dense layer.
+
+### Bucketed replay
+
+`QuantizedDenseMLP` exposes one composite topology identity:
+
+```text
+QuantizedDenseMLPReplayTopology
+  gate_up_affine
+  down_affine
+```
+
+It also exposes the sorted union of the `gate_up` and `down` affine topology boundaries.
+The owner of a larger replay stage must union these boundaries with the boundaries from all other token-domain components.
+The larger replay stage then selects one shared `num_total_tokens` capacity.
+Dense MLP does not own that final policy.
+
+The replay key must contain `num_total_tokens` and the composite dense MLP topology.
+The key must not contain `num_active_tokens`.
+The submission supplies `num_active_tokens` through the caller-owned replay parameter key.
+
+The three dense MLP stages bind the same `u32` key with the same `1..=num_total_tokens` domain:
+
+```text
+gate_up affine
+SwiGLU
+down affine
+```
+
+Thus, a standalone bucketed dense MLP replay declares one parameter.
+An exact replay declares no parameters.
+
+Each stage records work for `num_total_tokens` rows.
+Affine QMV returns for each inactive row before it reads input or writes output.
+Affine QMM skips fully inactive tiles and masks inactive rows in a partially active tile.
+SwiGLU dispatches `num_total_tokens * intermediate_dim` threads.
+It returns when `gid >= num_active_tokens * intermediate_dim`.
+This return occurs before row calculation, gate/up scratch reads, and SwiGLU scratch writes.
+
+Inactive scratch rows can contain poison, output from an earlier full submission, or other stale values.
+The implementation does not clear these rows.
+The guards ensure that later stages do not consume or overwrite them.
+
+`Qwen3xDenseMLP` keeps its exact `record` API.
+It also exposes topology accessors and an additive `record_bucketed` API.
+Qwen3.5 Main and MTP do not use this API until every participating component supports the same top-level bucket.
+The DSpark path remains exact.
 
 ## Data flow and backend stages
 
@@ -165,9 +214,10 @@ Each stage consumes scratch from the previous stage.
 Model replay records additional layer-level barriers around residual and norm consumers.
 It does not put these barriers inside the dense MLP component.
 
-Dense MLP has no token-major or expert-major policy.
+Dense MLP has no expert-major policy.
 Every active token row runs the same dense expert.
-The only shape input is `num_tokens`.
+The exact path uses `num_tokens`.
+The bucketed path uses recorded `num_total_tokens` and submission-time `num_active_tokens`.
 Capacity buffers can be larger.
 Each replay invocation uses the current active prefix.
 

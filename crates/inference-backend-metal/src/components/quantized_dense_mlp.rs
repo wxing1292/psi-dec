@@ -4,8 +4,10 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayParameterKey;
 use crate::operators::AffineQuantizedMatmul;
 use crate::operators::AffineQuantizedMatmulConfig;
+use crate::operators::AffineQuantizedMatmulKernelKind;
 
 const DENSE_MLP_SWIGLU_SOURCE: &str = include_str!("metal/quantized_dense_mlp_swiglu.metal");
 
@@ -113,6 +115,12 @@ impl QuantizedDenseMLPShape {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct QuantizedDenseMLPReplayTopology {
+    pub gate_up_affine: AffineQuantizedMatmulKernelKind,
+    pub down_affine: AffineQuantizedMatmulKernelKind,
+}
+
 #[derive(Clone, Copy)]
 pub struct QuantizedDenseMLPBuffers<'a> {
     pub hidden_state: &'a Buffer,
@@ -189,7 +197,44 @@ impl QuantizedDenseMLP {
             buffers,
             scratch,
             weights,
+            num_active_tokens_key: None,
         }
+    }
+
+    /// Records a fixed-capacity dense MLP whose active token count is supplied at submission.
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        buffers: QuantizedDenseMLPBuffers<'a>,
+        scratch: QuantizedDenseMLPScratch<'a>,
+        weights: QuantizedDenseMLPWeights<'a>,
+    ) -> QuantizedDenseMLPInvocation<'a> {
+        let shape = capacity_shape(num_total_tokens);
+        QuantizedDenseMLPInvocation {
+            compute: self,
+            shape,
+            buffers,
+            scratch,
+            weights,
+            num_active_tokens_key: Some(num_active_tokens_key),
+        }
+    }
+
+    pub fn topology(&self, num_total_tokens: u32) -> QuantizedDenseMLPReplayTopology {
+        let shape = capacity_shape(num_total_tokens);
+        QuantizedDenseMLPReplayTopology {
+            gate_up_affine: self.gate_up.topology(shape.num_tokens),
+            down_affine: self.down.topology(shape.num_tokens),
+        }
+    }
+
+    pub fn topology_boundaries(&self) -> Box<[u32]> {
+        let mut boundaries = self.gate_up.topology_boundaries().into_vec();
+        boundaries.extend(self.down.topology_boundaries());
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries.into_boxed_slice()
     }
 
     pub fn invoke_gate_up<'a>(
@@ -205,6 +250,25 @@ impl QuantizedDenseMLP {
             hidden_state,
             gate_up,
             weights,
+            num_active_tokens_key: None,
+        }
+    }
+
+    pub fn invoke_gate_up_bucketed<'a>(
+        &'a self,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        hidden_state: &'a Buffer,
+        gate_up: &'a Buffer,
+        weights: QuantizedDenseMLPWeights<'a>,
+    ) -> QuantizedDenseMLPGateUpInvocation<'a> {
+        QuantizedDenseMLPGateUpInvocation {
+            compute: self,
+            shape: capacity_shape(num_total_tokens),
+            hidden_state,
+            gate_up,
+            weights,
+            num_active_tokens_key: Some(num_active_tokens_key),
         }
     }
 
@@ -219,6 +283,23 @@ impl QuantizedDenseMLP {
             shape,
             gate_up,
             swiglu,
+            num_active_tokens_key: None,
+        }
+    }
+
+    pub fn invoke_swiglu_bucketed<'a>(
+        &'a self,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        gate_up: &'a Buffer,
+        swiglu: &'a Buffer,
+    ) -> QuantizedDenseMLPSwiGLUInvocation<'a> {
+        QuantizedDenseMLPSwiGLUInvocation {
+            compute: self,
+            shape: capacity_shape(num_total_tokens),
+            gate_up,
+            swiglu,
+            num_active_tokens_key: Some(num_active_tokens_key),
         }
     }
 
@@ -235,8 +316,35 @@ impl QuantizedDenseMLP {
             swiglu,
             next_hidden_state,
             weights,
+            num_active_tokens_key: None,
         }
     }
+
+    pub fn invoke_down_bucketed<'a>(
+        &'a self,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        swiglu: &'a Buffer,
+        next_hidden_state: &'a Buffer,
+        weights: QuantizedDenseMLPWeights<'a>,
+    ) -> QuantizedDenseMLPDownInvocation<'a> {
+        QuantizedDenseMLPDownInvocation {
+            compute: self,
+            shape: capacity_shape(num_total_tokens),
+            swiglu,
+            next_hidden_state,
+            weights,
+            num_active_tokens_key: Some(num_active_tokens_key),
+        }
+    }
+}
+
+fn capacity_shape(num_total_tokens: u32) -> QuantizedDenseMLPShape {
+    let shape = QuantizedDenseMLPShape {
+        num_tokens: num_total_tokens,
+    };
+    shape.validate();
+    shape
 }
 
 pub struct QuantizedDenseMLPInvocation<'a> {
@@ -245,29 +353,35 @@ pub struct QuantizedDenseMLPInvocation<'a> {
     buffers: QuantizedDenseMLPBuffers<'a>,
     scratch: QuantizedDenseMLPScratch<'a>,
     weights: QuantizedDenseMLPWeights<'a>,
+    num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for QuantizedDenseMLPInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.compute
-            .invoke_gate_up(
-                self.shape,
-                self.buffers.hidden_state,
-                self.scratch.gate_up,
-                self.weights,
-            )
-            .record(builder);
-        builder.record_with_barrier_before(self.compute.invoke_swiglu(
-            self.shape,
-            self.scratch.gate_up,
-            self.scratch.swiglu,
-        ));
-        builder.record_with_barrier_before(self.compute.invoke_down(
-            self.shape,
-            self.scratch.swiglu,
-            self.buffers.next_hidden_state,
-            self.weights,
-        ));
+        QuantizedDenseMLPGateUpInvocation {
+            compute: self.compute,
+            shape: self.shape,
+            hidden_state: self.buffers.hidden_state,
+            gate_up: self.scratch.gate_up,
+            weights: self.weights,
+            num_active_tokens_key: self.num_active_tokens_key,
+        }
+        .record(builder);
+        builder.record_with_barrier_before(QuantizedDenseMLPSwiGLUInvocation {
+            compute: self.compute,
+            shape: self.shape,
+            gate_up: self.scratch.gate_up,
+            swiglu: self.scratch.swiglu,
+            num_active_tokens_key: self.num_active_tokens_key,
+        });
+        builder.record_with_barrier_before(QuantizedDenseMLPDownInvocation {
+            compute: self.compute,
+            shape: self.shape,
+            swiglu: self.scratch.swiglu,
+            next_hidden_state: self.buffers.next_hidden_state,
+            weights: self.weights,
+            num_active_tokens_key: self.num_active_tokens_key,
+        });
     }
 }
 
@@ -277,29 +391,48 @@ pub struct QuantizedDenseMLPGateUpInvocation<'a> {
     hidden_state: &'a Buffer,
     gate_up: &'a Buffer,
     weights: QuantizedDenseMLPWeights<'a>,
+    num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for QuantizedDenseMLPGateUpInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.compute
-            .gate_up
-            .invoke(
-                self.shape
-                    .num_tokens
-                    .try_into()
-                    .expect("dense MLP token count must fit i32"),
-                self.gate_up,
-                0,
-                self.hidden_state,
-                0,
-                self.weights.gate_up_weight,
-                0,
-                self.weights.gate_up_scales,
-                0,
-                self.weights.gate_up_biases,
-                0,
-            )
-            .record(builder);
+        let invocation = match self.num_active_tokens_key {
+            Some(key) => {
+                self.compute.gate_up.invoke_bucketed(
+                    self.shape.num_tokens,
+                    key,
+                    self.gate_up,
+                    0,
+                    self.hidden_state,
+                    0,
+                    self.weights.gate_up_weight,
+                    0,
+                    self.weights.gate_up_scales,
+                    0,
+                    self.weights.gate_up_biases,
+                    0,
+                )
+            },
+            None => {
+                self.compute.gate_up.invoke(
+                    self.shape
+                        .num_tokens
+                        .try_into()
+                        .expect("dense MLP token count must fit i32"),
+                    self.gate_up,
+                    0,
+                    self.hidden_state,
+                    0,
+                    self.weights.gate_up_weight,
+                    0,
+                    self.weights.gate_up_scales,
+                    0,
+                    self.weights.gate_up_biases,
+                    0,
+                )
+            },
+        };
+        invocation.record(builder);
     }
 }
 
@@ -308,13 +441,20 @@ pub struct QuantizedDenseMLPSwiGLUInvocation<'a> {
     shape: QuantizedDenseMLPShape,
     gate_up: &'a Buffer,
     swiglu: &'a Buffer,
+    num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for QuantizedDenseMLPSwiGLUInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.compute
             .swiglu
-            .invoke(self.compute.config, self.shape, self.gate_up, self.swiglu)
+            .invoke(
+                self.compute.config,
+                self.shape,
+                self.gate_up,
+                self.swiglu,
+                self.num_active_tokens_key,
+            )
             .record(builder);
     }
 }
@@ -325,29 +465,48 @@ pub struct QuantizedDenseMLPDownInvocation<'a> {
     swiglu: &'a Buffer,
     next_hidden_state: &'a Buffer,
     weights: QuantizedDenseMLPWeights<'a>,
+    num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for QuantizedDenseMLPDownInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
-        self.compute
-            .down
-            .invoke(
-                self.shape
-                    .num_tokens
-                    .try_into()
-                    .expect("dense MLP token count must fit i32"),
-                self.next_hidden_state,
-                0,
-                self.swiglu,
-                0,
-                self.weights.down_weight,
-                0,
-                self.weights.down_scales,
-                0,
-                self.weights.down_biases,
-                0,
-            )
-            .record(builder);
+        let invocation = match self.num_active_tokens_key {
+            Some(key) => {
+                self.compute.down.invoke_bucketed(
+                    self.shape.num_tokens,
+                    key,
+                    self.next_hidden_state,
+                    0,
+                    self.swiglu,
+                    0,
+                    self.weights.down_weight,
+                    0,
+                    self.weights.down_scales,
+                    0,
+                    self.weights.down_biases,
+                    0,
+                )
+            },
+            None => {
+                self.compute.down.invoke(
+                    self.shape
+                        .num_tokens
+                        .try_into()
+                        .expect("dense MLP token count must fit i32"),
+                    self.next_hidden_state,
+                    0,
+                    self.swiglu,
+                    0,
+                    self.weights.down_weight,
+                    0,
+                    self.weights.down_scales,
+                    0,
+                    self.weights.down_biases,
+                    0,
+                )
+            },
+        };
+        invocation.record(builder);
     }
 }
 
@@ -373,6 +532,7 @@ impl QuantizedDenseMLPSwiGLUKernel {
         shape: QuantizedDenseMLPShape,
         gate_up: &'a Buffer,
         swiglu: &'a Buffer,
+        num_active_tokens_key: Option<ReplayParameterKey>,
     ) -> QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
         QuantizedDenseMLPSwiGLURowMajorInvocation {
             kernel: &self.kernel,
@@ -380,6 +540,7 @@ impl QuantizedDenseMLPSwiGLUKernel {
             shape,
             gate_up,
             swiglu,
+            num_active_tokens_key,
         }
     }
 }
@@ -390,6 +551,7 @@ struct QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
     shape: QuantizedDenseMLPShape,
     gate_up: &'a Buffer,
     swiglu: &'a Buffer,
+    num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
@@ -398,7 +560,10 @@ impl Operator for QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
         builder.set_kernel(self.kernel);
         builder.set_buffer_read(0, self.gate_up, 0);
         builder.set_buffer_write(1, self.swiglu, 0);
-        builder.set_u32(2, self.shape.num_tokens);
+        match self.num_active_tokens_key {
+            Some(key) => builder.bind_u32(2, key, 1, self.shape.num_tokens),
+            None => builder.set_u32(2, self.shape.num_tokens),
+        }
         builder.set_u32(3, self.config.intermediate_dim);
         let num_values = self.config.swiglu_num_values_unchecked(self.shape) as usize;
         builder.dispatch_1d(num_values, ELEMENTWISE_NUM_THREADS_PER_THREADBLOCK);
@@ -429,10 +594,19 @@ mod tests {
     use inference_executor_core::mlp::dense::DenseMLPCore;
     use inference_executor_core::mlp::dense::reference::QuantizedDenseMLPReferenceWeights;
     use inference_executor_core::mlp::dense::reference::quantized_dense_mlp_reference;
+    use inference_executor_core::replay::ReplayBucketPolicy;
 
     use super::*;
     use crate::metal::Buffer;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayProgram;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.dense_mlp.num_active_tokens");
+    const HIDDEN_POISON: u16 = 0x7fc1;
+    const GATE_UP_CANARY: u16 = 0x3555;
+    const SWIGLU_CANARY: u16 = 0x3aaa;
+    const OUTPUT_CANARY: u16 = 0x3c00;
 
     #[test]
     fn test_fixed() {
@@ -621,6 +795,444 @@ mod tests {
             .map(|bits| bf16::from_bits(bits).to_f32())
             .collect::<Vec<_>>();
         assert_close_rel(&actual, &expected, 2.0e-5, 8.0e-3);
+    }
+
+    #[test]
+    fn test_bucket_topology_unions_both_affines_and_preserves_active_identity() {
+        let device = Device::system_default();
+        let matching_boundaries = QuantizedDenseMLP::new(&device, bucket_test_config());
+        assert_eq!(&*matching_boundaries.topology_boundaries(), &[6, 9, 17]);
+        assert_policy_preserves_topology(&matching_boundaries, 64);
+
+        let different_boundaries = QuantizedDenseMLP::new(
+            &device,
+            QuantizedDenseMLPConfig {
+                hidden_dim: 128,
+                intermediate_dim: 4096,
+                group_size: 32,
+                bits: 4,
+                dtype: Dtype::Bfloat16,
+            },
+        );
+        assert_eq!(&*different_boundaries.topology_boundaries(), &[6, 9, 12, 17]);
+        assert_policy_preserves_topology(&different_boundaries, 64);
+    }
+
+    #[test]
+    fn test_exact_and_bucketed_parameter_counts_and_validation() {
+        let fixture = BucketedDenseMLPFixture::new(20);
+        assert_eq!(fixture.exact_replay(20).stats().parameter_count, 0);
+        let replay = fixture.bucketed_replay(20);
+        assert_eq!(replay.stats().parameter_count, 1);
+
+        assert_panics(|| {
+            let _ = fixture.stream.submit_replay(&replay);
+        });
+        assert_panics(|| {
+            let arguments = ReplayArguments::new().with_i32(NUM_ACTIVE_TOKENS, 17);
+            let _ = fixture.stream.submit_replay_with_arguments(&replay, &arguments);
+        });
+        for invalid_num_active_tokens in [0, 21] {
+            assert_panics(|| {
+                let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, invalid_num_active_tokens);
+                let _ = fixture.stream.submit_replay_with_arguments(&replay, &arguments);
+            });
+        }
+
+        fixture.assert_total_buffer_validation();
+    }
+
+    #[test]
+    fn test_bucketed_replay_preserves_poisoned_tails_across_topologies_and_shrink() {
+        let fixture = BucketedDenseMLPFixture::new(20);
+        for (num_total_tokens, num_active_tokens, seed) in [
+            (4, 3, 0x1000_0001),
+            (8, 7, 0x1000_0002),
+            (12, 9, 0x1000_0003),
+            (20, 17, 0x1000_0004),
+        ] {
+            fixture.reset_canaries();
+            let hidden = fixture.write_hidden(num_active_tokens, seed);
+            let replay = fixture.bucketed_replay(num_total_tokens);
+            assert_eq!(replay.stats().parameter_count, 1);
+            fixture.submit(&replay, num_active_tokens);
+            fixture.assert_active_output(&hidden, num_active_tokens);
+            fixture.assert_canary_tails(num_active_tokens);
+        }
+
+        let replay = fixture.bucketed_replay(20);
+        fixture.reset_canaries();
+        let first_hidden = fixture.write_hidden(18, 0x2000_0001);
+        fixture.submit(&replay, 18);
+        fixture.assert_active_output(&first_hidden, 18);
+        fixture.assert_canary_tails(18);
+
+        let full_hidden = fixture.write_hidden(20, 0x2000_0002);
+        fixture.submit(&replay, 20);
+        fixture.assert_active_output(&full_hidden, 20);
+        let full_gate_up = fixture.read_gate_up();
+        let full_swiglu = fixture.read_swiglu();
+        let full_output = fixture.read_output();
+
+        let smaller_hidden = fixture.write_hidden(17, 0x2000_0003);
+        fixture.submit(&replay, 17);
+        fixture.assert_active_output(&smaller_hidden, 17);
+        fixture.assert_tails_equal(17, &full_gate_up, &full_swiglu, &full_output);
+    }
+
+    struct BucketedDenseMLPFixture {
+        device: Device,
+        stream: Stream,
+        config: QuantizedDenseMLPConfig,
+        compute: QuantizedDenseMLP,
+        num_allocated_tokens: u32,
+        hidden_state: Buffer,
+        next_hidden_state: Buffer,
+        gate_up: Buffer,
+        swiglu: Buffer,
+        weights: BucketedDenseMLPWeights,
+    }
+
+    impl BucketedDenseMLPFixture {
+        fn new(num_allocated_tokens: u32) -> Self {
+            let config = bucket_test_config();
+            let shape = QuantizedDenseMLPShape {
+                num_tokens: num_allocated_tokens,
+            };
+            let device = Device::system_default();
+            let stream = Stream::new(&device);
+            let compute = QuantizedDenseMLP::new(&device, config);
+            let weights = BucketedDenseMLPWeights::new(&device, config);
+            Self {
+                hidden_state: Buffer::new_zeroed(&device, config.input_bytes(shape)),
+                next_hidden_state: Buffer::new_zeroed(&device, config.output_bytes(shape)),
+                gate_up: Buffer::new_zeroed(&device, config.gate_up_output_bytes(shape)),
+                swiglu: Buffer::new_zeroed(&device, config.swiglu_bytes(shape)),
+                device,
+                stream,
+                config,
+                compute,
+                num_allocated_tokens,
+                weights,
+            }
+        }
+
+        fn exact_replay(&self, num_tokens: u32) -> ReplayProgram {
+            let mut builder = self.stream.create_replay_program();
+            builder.record(self.compute.invoke(
+                QuantizedDenseMLPShape { num_tokens },
+                self.buffers(),
+                self.scratch(),
+                self.weights.as_borrowed(),
+            ));
+            builder.build()
+        }
+
+        fn bucketed_replay(&self, num_total_tokens: u32) -> ReplayProgram {
+            let mut builder = self.stream.create_replay_program();
+            builder.record(self.compute.invoke_bucketed(
+                num_total_tokens,
+                NUM_ACTIVE_TOKENS,
+                self.buffers(),
+                self.scratch(),
+                self.weights.as_borrowed(),
+            ));
+            builder.build()
+        }
+
+        fn buffers(&self) -> QuantizedDenseMLPBuffers<'_> {
+            QuantizedDenseMLPBuffers {
+                hidden_state: &self.hidden_state,
+                next_hidden_state: &self.next_hidden_state,
+            }
+        }
+
+        fn scratch(&self) -> QuantizedDenseMLPScratch<'_> {
+            QuantizedDenseMLPScratch {
+                gate_up: &self.gate_up,
+                swiglu: &self.swiglu,
+            }
+        }
+
+        fn reset_canaries(&self) {
+            self.gate_up.write_typed(
+                0,
+                &vec![GATE_UP_CANARY; self.num_allocated_tokens as usize * self.config.intermediate_dim as usize * 2],
+            );
+            self.swiglu.write_typed(
+                0,
+                &vec![SWIGLU_CANARY; self.num_allocated_tokens as usize * self.config.intermediate_dim as usize],
+            );
+            self.next_hidden_state.write_typed(
+                0,
+                &vec![OUTPUT_CANARY; self.num_allocated_tokens as usize * self.config.hidden_dim as usize],
+            );
+        }
+
+        fn write_hidden(&self, num_active_tokens: u32, seed: u32) -> Vec<f32> {
+            assert!(num_active_tokens <= self.num_allocated_tokens);
+            let num_active_values = num_active_tokens as usize * self.config.hidden_dim as usize;
+            let active_values = bf16_values(&generated_values(num_active_values, seed));
+            let mut all_bits =
+                vec![HIDDEN_POISON; self.num_allocated_tokens as usize * self.config.hidden_dim as usize];
+            for (bits, value) in all_bits.iter_mut().zip(&active_values) {
+                *bits = bf16::from_f32(*value).to_bits();
+            }
+            self.hidden_state.write_typed(0, &all_bits);
+            active_values
+        }
+
+        fn submit(&self, replay: &ReplayProgram, num_active_tokens: u32) {
+            let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens);
+            self.stream.submit_replay_with_arguments(replay, &arguments).wait();
+        }
+
+        fn assert_active_output(&self, hidden: &[f32], num_active_tokens: u32) {
+            let num_output_values = num_active_tokens as usize * self.config.hidden_dim as usize;
+            let expected = quantized_dense_mlp_reference(
+                &DenseMLPCore {
+                    model_layer_index: 0,
+                    hidden_dim: self.config.hidden_dim as usize,
+                    intermediate_dim: self.config.intermediate_dim as usize,
+                },
+                hidden,
+                num_active_tokens as usize,
+                self.config.group_size as usize,
+                self.config.bits as usize,
+                self.weights.as_reference(),
+            )
+            .into_iter()
+            .map(|value| bf16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+            let actual = self
+                .next_hidden_state
+                .read_typed::<u16>(0, num_output_values)
+                .into_iter()
+                .map(|bits| bf16::from_bits(bits).to_f32())
+                .collect::<Vec<_>>();
+            assert_close_rel(&actual, &expected, 2.0e-5, 8.0e-3);
+        }
+
+        fn assert_canary_tails(&self, num_active_tokens: u32) {
+            let gate_up_tail = num_active_tokens as usize * self.config.intermediate_dim as usize * 2;
+            let swiglu_tail = num_active_tokens as usize * self.config.intermediate_dim as usize;
+            let output_tail = num_active_tokens as usize * self.config.hidden_dim as usize;
+            assert!(
+                self.read_gate_up()[gate_up_tail..]
+                    .iter()
+                    .all(|&bits| bits == GATE_UP_CANARY)
+            );
+            assert!(
+                self.read_swiglu()[swiglu_tail..]
+                    .iter()
+                    .all(|&bits| bits == SWIGLU_CANARY)
+            );
+            assert!(
+                self.read_output()[output_tail..]
+                    .iter()
+                    .all(|&bits| bits == OUTPUT_CANARY)
+            );
+        }
+
+        fn assert_tails_equal(
+            &self,
+            num_active_tokens: u32,
+            expected_gate_up: &[u16],
+            expected_swiglu: &[u16],
+            expected_output: &[u16],
+        ) {
+            let gate_up_tail = num_active_tokens as usize * self.config.intermediate_dim as usize * 2;
+            let swiglu_tail = num_active_tokens as usize * self.config.intermediate_dim as usize;
+            let output_tail = num_active_tokens as usize * self.config.hidden_dim as usize;
+            assert_eq!(&self.read_gate_up()[gate_up_tail..], &expected_gate_up[gate_up_tail..]);
+            assert_eq!(&self.read_swiglu()[swiglu_tail..], &expected_swiglu[swiglu_tail..]);
+            assert_eq!(&self.read_output()[output_tail..], &expected_output[output_tail..]);
+        }
+
+        fn read_gate_up(&self) -> Vec<u16> {
+            self.gate_up.read_typed(
+                0,
+                self.num_allocated_tokens as usize * self.config.intermediate_dim as usize * 2,
+            )
+        }
+
+        fn read_swiglu(&self) -> Vec<u16> {
+            self.swiglu.read_typed(
+                0,
+                self.num_allocated_tokens as usize * self.config.intermediate_dim as usize,
+            )
+        }
+
+        fn read_output(&self) -> Vec<u16> {
+            self.next_hidden_state
+                .read_typed(0, self.num_allocated_tokens as usize * self.config.hidden_dim as usize)
+        }
+
+        fn assert_total_buffer_validation(&self) {
+            let short_shape = QuantizedDenseMLPShape {
+                num_tokens: self.num_allocated_tokens - 1,
+            };
+            let short_hidden = Buffer::new_zeroed(&self.device, self.config.input_bytes(short_shape));
+            let short_gate_up = Buffer::new_zeroed(&self.device, self.config.gate_up_output_bytes(short_shape));
+            let short_swiglu = Buffer::new_zeroed(&self.device, self.config.swiglu_bytes(short_shape));
+            let short_output = Buffer::new_zeroed(&self.device, self.config.output_bytes(short_shape));
+
+            assert_panics(|| {
+                let mut builder = self.stream.create_replay_program();
+                builder.record(self.compute.invoke_bucketed(
+                    self.num_allocated_tokens,
+                    NUM_ACTIVE_TOKENS,
+                    QuantizedDenseMLPBuffers {
+                        hidden_state: &short_hidden,
+                        next_hidden_state: &self.next_hidden_state,
+                    },
+                    self.scratch(),
+                    self.weights.as_borrowed(),
+                ));
+            });
+            assert_panics(|| {
+                let mut builder = self.stream.create_replay_program();
+                builder.record(self.compute.invoke_bucketed(
+                    self.num_allocated_tokens,
+                    NUM_ACTIVE_TOKENS,
+                    self.buffers(),
+                    QuantizedDenseMLPScratch {
+                        gate_up: &short_gate_up,
+                        swiglu: &self.swiglu,
+                    },
+                    self.weights.as_borrowed(),
+                ));
+            });
+            assert_panics(|| {
+                let mut builder = self.stream.create_replay_program();
+                builder.record(self.compute.invoke_bucketed(
+                    self.num_allocated_tokens,
+                    NUM_ACTIVE_TOKENS,
+                    self.buffers(),
+                    QuantizedDenseMLPScratch {
+                        gate_up: &self.gate_up,
+                        swiglu: &short_swiglu,
+                    },
+                    self.weights.as_borrowed(),
+                ));
+            });
+            assert_panics(|| {
+                let mut builder = self.stream.create_replay_program();
+                builder.record(self.compute.invoke_bucketed(
+                    self.num_allocated_tokens,
+                    NUM_ACTIVE_TOKENS,
+                    QuantizedDenseMLPBuffers {
+                        hidden_state: &self.hidden_state,
+                        next_hidden_state: &short_output,
+                    },
+                    self.scratch(),
+                    self.weights.as_borrowed(),
+                ));
+            });
+        }
+    }
+
+    struct BucketedDenseMLPWeights {
+        gate_up_weight: Buffer,
+        gate_up_scales: Buffer,
+        gate_up_biases: Buffer,
+        down_weight: Buffer,
+        down_scales: Buffer,
+        down_biases: Buffer,
+        gate_up_weight_values: Vec<u8>,
+        gate_up_scale_values: Vec<f32>,
+        gate_up_bias_values: Vec<f32>,
+        down_weight_values: Vec<u8>,
+        down_scale_values: Vec<f32>,
+        down_bias_values: Vec<f32>,
+    }
+
+    impl BucketedDenseMLPWeights {
+        fn new(device: &Device, config: QuantizedDenseMLPConfig) -> Self {
+            let gate_up_config = config.gate_up_config();
+            let down_config = config.down_config();
+            let gate_up_weight_values = generated_bytes(gate_up_config.weight_bytes(), 0x3000_0001);
+            let gate_up_scale_values = bf16_values(&generated_scales(
+                gate_up_config.scale_or_bias_bytes() / size_of::<u16>(),
+                0x3000_0002,
+            ));
+            let gate_up_bias_values = bf16_values(&generated_biases(
+                gate_up_config.scale_or_bias_bytes() / size_of::<u16>(),
+                0x3000_0003,
+            ));
+            let down_weight_values = generated_bytes(down_config.weight_bytes(), 0x3000_0004);
+            let down_scale_values = bf16_values(&generated_scales(
+                down_config.scale_or_bias_bytes() / size_of::<u16>(),
+                0x3000_0005,
+            ));
+            let down_bias_values = bf16_values(&generated_biases(
+                down_config.scale_or_bias_bytes() / size_of::<u16>(),
+                0x3000_0006,
+            ));
+            Self {
+                gate_up_weight: Buffer::from_slice(device, &gate_up_weight_values),
+                gate_up_scales: bf16_buffer(device, &gate_up_scale_values),
+                gate_up_biases: bf16_buffer(device, &gate_up_bias_values),
+                down_weight: Buffer::from_slice(device, &down_weight_values),
+                down_scales: bf16_buffer(device, &down_scale_values),
+                down_biases: bf16_buffer(device, &down_bias_values),
+                gate_up_weight_values,
+                gate_up_scale_values,
+                gate_up_bias_values,
+                down_weight_values,
+                down_scale_values,
+                down_bias_values,
+            }
+        }
+
+        fn as_borrowed(&self) -> QuantizedDenseMLPWeights<'_> {
+            QuantizedDenseMLPWeights {
+                gate_up_weight: &self.gate_up_weight,
+                gate_up_scales: &self.gate_up_scales,
+                gate_up_biases: &self.gate_up_biases,
+                down_weight: &self.down_weight,
+                down_scales: &self.down_scales,
+                down_biases: &self.down_biases,
+            }
+        }
+
+        fn as_reference(&self) -> QuantizedDenseMLPReferenceWeights<'_> {
+            QuantizedDenseMLPReferenceWeights {
+                gate_up_weight: &self.gate_up_weight_values,
+                gate_up_scales: &self.gate_up_scale_values,
+                gate_up_biases: &self.gate_up_bias_values,
+                down_weight: &self.down_weight_values,
+                down_scales: &self.down_scale_values,
+                down_biases: &self.down_bias_values,
+            }
+        }
+    }
+
+    fn bucket_test_config() -> QuantizedDenseMLPConfig {
+        QuantizedDenseMLPConfig {
+            hidden_dim: 64,
+            intermediate_dim: 4160,
+            group_size: 32,
+            bits: 4,
+            dtype: Dtype::Bfloat16,
+        }
+    }
+
+    fn assert_policy_preserves_topology(compute: &QuantizedDenseMLP, max_tokens: u32) {
+        let boundaries = compute.topology_boundaries();
+        let policy = ReplayBucketPolicy::with_topology_boundaries(max_tokens, &boundaries);
+        for num_active_tokens in 1..=max_tokens {
+            let num_total_tokens = policy.capacity(num_active_tokens);
+            assert_eq!(
+                compute.topology(num_active_tokens),
+                compute.topology(num_total_tokens),
+                "num_active_tokens={num_active_tokens} num_total_tokens={num_total_tokens}"
+            );
+        }
+    }
+
+    fn assert_panics(f: impl FnOnce()) {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 
     fn create_dense_mlp_compute(config: QuantizedDenseMLPConfig) -> (Device, QuantizedDenseMLP) {

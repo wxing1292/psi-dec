@@ -1,8 +1,10 @@
 use std::rc::Rc;
 
+use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
 use inference_backend_metal::components::QuantizedDenseMLPWeights;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
@@ -14,6 +16,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLP;
+use crate::mlp::dense::backend::DenseMLPBucketedReplayInput;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::dense::backend::DenseMLPReplayInput;
 use crate::mlp::dense::scratch::DenseMLPScratch;
@@ -45,6 +48,14 @@ impl Qwen3xDenseMLP {
         })
     }
 
+    pub fn replay_topology(&self, num_total_tokens: u32) -> QuantizedDenseMLPReplayTopology {
+        self.backend.replay_topology(num_total_tokens)
+    }
+
+    pub fn replay_topology_boundaries(&self) -> Box<[u32]> {
+        self.backend.replay_topology_boundaries()
+    }
+
     pub fn record<'a, R>(&'a self, recorder: &mut R, input: &'a Buffer, output: &'a Buffer, num_tokens: u32)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
@@ -54,6 +65,29 @@ impl Qwen3xDenseMLP {
             recorder,
             DenseMLPReplayInput {
                 shape: DenseMLPReplayShape { num_tokens },
+                hidden_state: input,
+                next_hidden_state: output,
+                scratch: self.scratch.bindings(),
+                weights: self.weights.as_borrowed(),
+            },
+        );
+    }
+
+    pub fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        input: &'a Buffer,
+        output: &'a Buffer,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        let _ = self.backend.record_bucketed(
+            recorder,
+            DenseMLPBucketedReplayInput {
+                num_total_tokens,
+                num_active_tokens_key,
                 hidden_state: input,
                 next_hidden_state: output,
                 scratch: self.scratch.bindings(),

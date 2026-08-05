@@ -39,6 +39,7 @@ mod quantized_dense_mlp;
 pub use quantized_dense_mlp::QuantizedDenseMLP;
 pub use quantized_dense_mlp::QuantizedDenseMLPBuffers;
 pub use quantized_dense_mlp::QuantizedDenseMLPConfig;
+pub use quantized_dense_mlp::QuantizedDenseMLPReplayTopology;
 pub use quantized_dense_mlp::QuantizedDenseMLPScratch;
 pub use quantized_dense_mlp::QuantizedDenseMLPShape;
 pub use quantized_dense_mlp::QuantizedDenseMLPWeights;
