@@ -875,23 +875,80 @@ fn replay_bucket_capacity_allow_zero(active: usize, max_capacity: usize) -> usiz
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use inference_backend_metal::metal::Buffer;
+    use inference_backend_metal::metal::Device;
+    use inference_backend_metal::metal::Dtype;
+    use inference_backend_metal::metal::Stream;
     use inference_executor_core::attn::GDNReplayShape;
     use inference_executor_core::attn::GQAReplayShape;
     use inference_executor_core::attn::gdn::state::GDNStateTxn;
     use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
     use inference_executor_core::sampling::SamplerConfig;
+    use inference_executor_core::sampling::TopKSamplingBounds;
 
+    use super::DraftSampling;
+    use super::DraftSamplingInput;
+    use super::MetalReplayRuntime;
     use super::Qwen35GatherUnembedReplayKey;
     use super::Qwen35MTPEmbedReplayKey;
     use super::Qwen35MainEmbedReplayKey;
     use super::Qwen35MainReplayKey;
+    use super::Replay;
+    use super::TopKSampling;
+    use super::TopKSamplingOutputBuffers;
+    use super::TopKSamplingWriteDistributionOutput;
     use super::mtp_proposal_sample_position;
+    use super::mtp_sample_replay_shape;
     use super::replay_bucket_capacity;
 
     #[test]
     fn test_mtp_proposal_sample_position_advances_per_step() {
         assert_eq!(mtp_proposal_sample_position(17, 3, 0), 21);
         assert_eq!(mtp_proposal_sample_position(17, 3, 3), 24);
+    }
+
+    #[test]
+    fn test_mtp_sample_replay_shape_caps_bucket_at_max_requests() {
+        let config = SamplerConfig {
+            temperature: 0.0,
+            ..SamplerConfig::default()
+        };
+        let bounds = TopKSamplingBounds::from_config(&config, 8, 8).unwrap();
+        let configs = vec![config; 5];
+        let shape = mtp_sample_replay_shape(bounds, &configs, 6);
+        assert_eq!(shape.num_active_sampling_inputs, 5);
+        assert_eq!(shape.num_total_sampling_inputs, 6);
+
+        let device = Device::system_default();
+        let sampler = Rc::new(TopKSampling::new(&device, bounds));
+        let output = TopKSamplingOutputBuffers::new(&device, bounds);
+        let logits_elements = bounds.max_sampling_inputs as usize * bounds.vocab_size as usize;
+        let logits = Buffer::new_zeroed_elements(&device, logits_elements, Dtype::Bfloat16);
+        let distribution_token_ids = Buffer::new_zeroed_elements(&device, 6, Dtype::Int32);
+        let distribution_probs = Buffer::new_zeroed_elements(&device, 6, Dtype::Float32);
+        let distribution_indices = Buffer::new_zeroed_elements(&device, 6, Dtype::Uint32);
+        let input = DraftSamplingInput {
+            shape,
+            logits: &logits,
+            output: output.as_output(),
+            sparse: TopKSamplingWriteDistributionOutput {
+                token_ids: &distribution_token_ids,
+                probs: &distribution_probs,
+                output_distribution_indices: &distribution_indices,
+                max_k: 1,
+                num_output_distributions: 6,
+            },
+        };
+        let stream = Stream::new(&device);
+        let runtime = MetalReplayRuntime::new(&stream);
+        let mut replay = Replay::new("qwen3.5 MTP sampling capacity test", DraftSampling { sampler });
+
+        let (key, cache_hit) = replay.record(&runtime, &input);
+
+        assert!(!cache_hit);
+        assert_eq!(key.num_sampling_input_capacity, 6);
     }
 
     #[test]

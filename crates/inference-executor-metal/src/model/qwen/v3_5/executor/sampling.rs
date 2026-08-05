@@ -1,5 +1,5 @@
 impl Qwen35Executor {
-    fn sample_replay_shape(&self, sampler_configs: &[SamplerConfig]) -> TopKSamplingShape {
+    fn target_sample_replay_shape(&self, sampler_configs: &[SamplerConfig]) -> TopKSamplingShape {
         let shape = self.sampler.active_shape(sampler_configs);
         shape.with_num_total_sampling_inputs(replay_bucket_capacity(
             shape.num_active_sampling_inputs,
@@ -17,7 +17,7 @@ impl Qwen35Executor {
             sample_positions.len(),
             "qwen3.5 sample runtime configs and positions must have equal lengths"
         );
-        let sample_shape = self.sample_replay_shape(sampler_configs);
+        let sample_shape = self.target_sample_replay_shape(sampler_configs);
         let input = SamplingInput {
             shape: sample_shape,
             logits: &self.unembed_logits,
@@ -42,7 +42,7 @@ impl Qwen35Executor {
             sample_positions.len(),
             "qwen3.5 MTP sample runtime configs and positions must have equal lengths"
         );
-        let sample_shape = self.sample_replay_shape(sampler_configs);
+        let sample_shape = mtp_sample_replay_shape(self.sampler_bounds, sampler_configs, self.config.max_requests);
         let mtp = self.speculator.mtp_mut();
         let input = DraftSamplingInput {
             shape: sample_shape,
@@ -345,4 +345,20 @@ impl Qwen35Executor {
     fn num_speculative_tokens(&self) -> usize {
         self.speculator.num_speculative_tokens()
     }
+}
+
+fn mtp_sample_replay_shape(
+    sampler_bounds: TopKSamplingBounds,
+    sampler_configs: &[SamplerConfig],
+    max_requests: usize,
+) -> TopKSamplingShape {
+    let shape = sampler_bounds
+        .active_shape(sampler_configs)
+        .expect("qwen3.5 MTP sampling config must fit bounds");
+    let max_requests = u32::try_from(max_requests).expect("qwen3.5 MTP request capacity must fit u32");
+    let max_capacity = max_requests.min(sampler_bounds.max_sampling_inputs);
+    shape.with_num_total_sampling_inputs(replay_bucket_capacity(
+        shape.num_active_sampling_inputs,
+        max_capacity,
+    ))
 }
