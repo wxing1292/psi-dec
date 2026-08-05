@@ -213,12 +213,20 @@ impl Qwen35Executor {
         }
         let mtp_gqa_topology = self.speculator.mtp().gqa_state.replay_topology();
         let mtp_key = Qwen35MTPReplayKey::new(num_tokens, mtp_gqa_shape, mtp_gqa_topology);
-        let mtp_embed_key = Qwen35MTPEmbedReplayKey::new(num_tokens);
+        let num_active_tokens = num_tokens
+            .try_into()
+            .expect("qwen3.5 MTPEmbed token count must fit u32");
+        let (mtp_embed_key, mtp_embed_arguments) = self
+            .speculator
+            .mtp()
+            .embed
+            .component()
+            .prepare_replay(num_active_tokens);
         let mtp_hidden_input = Rc::clone(&self.speculator.mtp().hidden_input);
         let mtp_embed_build_start = Instant::now();
         let mtp = self.speculator.mtp_mut();
         let input = Qwen35MTPEmbedArgs {
-            num_tokens: num_tokens.try_into().expect("qwen3.5 MTP token count must fit u32"),
+            num_tokens: num_active_tokens,
             prev_hidden_source: &main_hidden,
             prev_hidden_indices: &mtp.input_gather_flat_indices,
             prev_hidden_input: &mtp.previous_hidden,
@@ -260,6 +268,7 @@ impl Qwen35Executor {
             )
         });
         recorder.mtp_embed_key = Some(mtp_embed_key);
+        recorder.mtp_embed_arguments = mtp_embed_arguments;
         recorder.mtp_key = Some(mtp_key);
         recorder.mtp_gqa_shape = Some(mtp_gqa_shape);
         recorder.mtp_gqa_topology = Some(mtp_gqa_topology);
@@ -383,7 +392,7 @@ impl Qwen35Executor {
         );
         if recorder.num_mtp_sample_rows() == 0 {
             return self.replay_runtime().submit_replay_sequence(&[
-                ReplayExecution::new(mtp_embed_replay, &empty_arguments),
+                ReplayExecution::new(mtp_embed_replay, &recorder.mtp_embed_arguments),
                 ReplayExecution::new(mtp_replay, &mtp_arguments),
             ]);
         }
@@ -396,7 +405,7 @@ impl Qwen35Executor {
             .as_ref()
             .expect("qwen3.5 MTP sampled output requires Sampling replay");
         self.replay_runtime().submit_replay_sequence(&[
-            ReplayExecution::new(mtp_embed_replay, &empty_arguments),
+            ReplayExecution::new(mtp_embed_replay, &recorder.mtp_embed_arguments),
             ReplayExecution::new(mtp_replay, &mtp_arguments),
             ReplayExecution::new(self.gather_unembed.replay(gather_unembed_key), &empty_arguments),
             ReplayExecution::new(
