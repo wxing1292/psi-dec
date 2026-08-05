@@ -262,6 +262,28 @@ The two explicit paths have different command topology.
 The full MoE owner must keep the token-major/expert-major path boundary at token count `5` in its composite policy.
 The sparse leaf does not select the path and does not enable bucketed full `GatedMoE` replay.
 
+The token-major combine leaf also has additive bucket-readiness APIs:
+
+```text
+MoECombineKernels::invoke_without_shared_experts_bucketed(...)
+MoECombineKernels::invoke_with_shared_experts_bucketed(...)
+```
+
+Both APIs record a fixed `num_total_tokens` capacity in `MoECombineShape`.
+The caller supplies `num_active_tokens` through one `ReplayParameterKey`.
+The total token count determines the dispatch grid and the required routed, probability, shared-branch, and output
+buffer capacities.
+The active token count does not change command topology.
+
+Each combine kernel returns for an inactive output element before it reads routed data, route probabilities, shared
+hidden state, or shared-gate logits.
+It also returns before it writes the output tail.
+The exact combine APIs remain unchanged and declare zero replay parameters.
+Each bucketed combine replay declares one replay parameter.
+The combine kernels do not change topology with token count, so they add no token-count boundary to a composite
+policy.
+These leaf APIs do not enable bucketed full `GatedMoE` replay.
+
 The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
 `MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
 

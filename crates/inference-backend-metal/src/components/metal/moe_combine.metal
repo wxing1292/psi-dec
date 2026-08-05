@@ -33,13 +33,12 @@ kernel void moe_combine_without_shared_experts(
     device const bfloat16_t* routed_hidden [[buffer(0)]],
     device const float* routed_probs [[buffer(1)]],
     device bfloat16_t* output [[buffer(2)]],
-    constant uint& num_tokens [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(3)]],
     constant uint& num_experts_per_token [[buffer(4)]],
     constant uint& hidden_dim [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    const uint total = num_tokens * hidden_dim;
-    if (gid >= total) return;
+    if (gid >= num_active_tokens * hidden_dim) return;
     const uint token = gid / hidden_dim;
     const uint dim = gid - token * hidden_dim;
     write_bf16(output, gid, combine_topk(routed_hidden, routed_probs, token, dim, num_experts_per_token, hidden_dim));
@@ -51,13 +50,12 @@ kernel void moe_combine_with_shared_experts(
     device const bfloat16_t* shared_hidden [[buffer(2)]],
     device const bfloat16_t* shared_expert_gate_logits [[buffer(3)]],
     device bfloat16_t* output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     constant uint& num_experts_per_token [[buffer(6)]],
     constant uint& hidden_dim [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    const uint total = num_tokens * hidden_dim;
-    if (gid >= total) return;
+    if (gid >= num_active_tokens * hidden_dim) return;
     const uint token = gid / hidden_dim;
     const uint dim = gid - token * hidden_dim;
 
