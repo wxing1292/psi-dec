@@ -20,22 +20,22 @@ kernel void gdn_compute_short_conv_f32(
     device const uint* src_state_slots [[buffer(5)]],
     device const uint* dst_state_slots [[buffer(6)]],
     device const uint* cu_tokens [[buffer(7)]],
-    constant uint& num_reqs [[buffer(8)]],
-    constant uint& num_tokens [[buffer(9)]],
+    constant uint& num_active_reqs [[buffer(8)]],
+    constant uint& num_active_tokens [[buffer(9)]],
     constant ulong& conv_state_offset_bytes [[buffer(10)]],
     constant ulong& next_conv_state_offset_bytes [[buffer(11)]],
     uint global_linear_index [[thread_position_in_grid]]
 ) {
     const ulong conv_state_base = conv_state_offset_bytes / sizeof(float);
     const ulong next_conv_state_base = next_conv_state_offset_bytes / sizeof(float);
-    const uint num_conv_qkv_values = num_tokens * qkv_dim;
-    const uint num_next_conv_state_values = num_reqs * qkv_dim * conv_state_len;
+    const uint num_conv_qkv_values = num_active_tokens * qkv_dim;
+    const uint num_next_conv_state_values = num_active_reqs * qkv_dim * conv_state_len;
 
     if (global_linear_index < num_conv_qkv_values) {
         const uint channel_index = global_linear_index % qkv_dim;
         const uint flat_token_index = global_linear_index / qkv_dim;
         uint req_index = 0;
-        for (uint candidate_req_index = 0; candidate_req_index < num_reqs; ++candidate_req_index) {
+        for (uint candidate_req_index = 0; candidate_req_index < num_active_reqs; ++candidate_req_index) {
             if (flat_token_index < cu_tokens[candidate_req_index + 1]) {
                 req_index = candidate_req_index;
                 break;
@@ -97,8 +97,8 @@ kernel void gdn_compute_forward_conv_candidate_state_f32(
     device const uint* src_state_slots [[buffer(3)]],
     device const uint* flat_candidate_state_slots [[buffer(4)]],
     device const uint* cu_tokens [[buffer(5)]],
-    constant uint& num_reqs [[buffer(6)]],
-    constant uint& num_tokens [[buffer(7)]],
+    constant uint& num_active_reqs [[buffer(6)]],
+    constant uint& num_active_tokens [[buffer(7)]],
     constant ulong& conv_state_offset_bytes [[buffer(8)]],
     constant ulong& next_conv_state_offset_bytes [[buffer(9)]],
     uint global_linear_index [[thread_position_in_grid]]
@@ -109,12 +109,12 @@ kernel void gdn_compute_forward_conv_candidate_state_f32(
     uint coordinate_linear_index = global_linear_index / conv_state_len;
     const uint channel_index = coordinate_linear_index % qkv_dim;
     const uint flat_token_index = coordinate_linear_index / qkv_dim;
-    if (flat_token_index >= num_tokens) {
+    if (flat_token_index >= num_active_tokens) {
         return;
     }
 
     uint req_index = 0;
-    for (uint candidate_req_index = 0; candidate_req_index < num_reqs; ++candidate_req_index) {
+    for (uint candidate_req_index = 0; candidate_req_index < num_active_reqs; ++candidate_req_index) {
         if (flat_token_index < cu_tokens[candidate_req_index + 1]) {
             req_index = candidate_req_index;
             break;
@@ -166,9 +166,8 @@ kernel void gdn_compute_ragged_recurrent_f32(
     device const uint* dst_state_slots [[buffer(8)]],
     device const uint* cu_tokens [[buffer(9)]],
     constant float& q_scale [[buffer(10)]],
-    constant uint& num_reqs [[buffer(11)]],
-    constant uint& num_tokens [[buffer(12)]],
-    constant ulong& recurrent_state_offset_bytes [[buffer(13)]],
+    constant uint& num_active_reqs [[buffer(11)]],
+    constant ulong& recurrent_state_offset_bytes [[buffer(12)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadblock [[thread_position_in_threadgroup]]
 ) {
@@ -182,6 +181,9 @@ kernel void gdn_compute_ragged_recurrent_f32(
     const uint v_head_index = req_v_head_linear_index % num_v_heads;
     const uint req_index = req_v_head_linear_index / num_v_heads;
     const uint v_dim_index = v_dim_tile_index * v_dim_tile_size + v_dim_index_in_tile;
+    if (req_index >= num_active_reqs) {
+        return;
+    }
 
     const uint num_v_heads_per_qk_head = num_v_heads / num_qk_heads;
     const uint qk_head_index = v_head_index / num_v_heads_per_qk_head;
@@ -310,9 +312,8 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     device const uint* flat_candidate_state_slots [[buffer(9)]],
     device const uint* cu_tokens [[buffer(10)]],
     constant float& q_scale [[buffer(11)]],
-    constant uint& num_reqs [[buffer(12)]],
-    constant uint& num_tokens [[buffer(13)]],
-    constant ulong& recurrent_state_offset_bytes [[buffer(14)]],
+    constant uint& num_active_reqs [[buffer(12)]],
+    constant ulong& recurrent_state_offset_bytes [[buffer(13)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadblock [[thread_position_in_threadgroup]]
 ) {
@@ -326,6 +327,9 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     const uint v_head_index = req_v_head_linear_index % num_v_heads;
     const uint req_index = req_v_head_linear_index / num_v_heads;
     const uint v_dim_index = v_dim_tile_index * v_dim_tile_size + v_dim_index_in_tile;
+    if (req_index >= num_active_reqs) {
+        return;
+    }
 
     const uint num_v_heads_per_qk_head = num_v_heads / num_qk_heads;
     const uint qk_head_index = v_head_index / num_v_heads_per_qk_head;
@@ -458,13 +462,12 @@ kernel void gdn_compute_output_norm_gate_f32(
     device const float* z [[buffer(2)]],
     device const bfloat16_t* norm_weight [[buffer(3)]],
     constant float& eps [[buffer(4)]],
-    constant uint& num_reqs [[buffer(5)]],
-    constant uint& num_tokens [[buffer(6)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     uint global_thread_index [[thread_position_in_grid]]
 ) {
     const uint reduction_thread_index = global_thread_index % 128;
     const uint token_head_index = global_thread_index / 128;
-    const uint num_token_heads = num_tokens * num_v_heads;
+    const uint num_token_heads = num_active_tokens * num_v_heads;
     if (token_head_index >= num_token_heads) {
         return;
     }

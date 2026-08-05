@@ -1,9 +1,42 @@
 use std::cell::Cell;
+use std::mem::size_of;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GDNReplayShape;
+use inference_executor_core::replay::ReplayBucketPolicy;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GDNReplayBucketPolicy {
+    requests: ReplayBucketPolicy,
+    tokens: ReplayBucketPolicy,
+}
+
+impl GDNReplayBucketPolicy {
+    pub fn new(max_requests: u32, max_tokens: u32, token_topology_boundaries: &[u32]) -> Self {
+        Self {
+            requests: ReplayBucketPolicy::new(max_requests),
+            tokens: ReplayBucketPolicy::with_topology_boundaries(max_tokens, token_topology_boundaries),
+        }
+    }
+
+    pub fn max_requests(&self) -> u32 {
+        self.requests.max_capacity()
+    }
+
+    pub fn max_tokens(&self) -> u32 {
+        self.tokens.max_capacity()
+    }
+
+    fn capacities(&self, num_reqs: u32, num_tokens: u32) -> (u32, u32) {
+        (self.requests.capacity(num_reqs), self.tokens.capacity(num_tokens))
+    }
+
+    fn request_capacity(&self, num_reqs: u32) -> u32 {
+        self.requests.capacity(num_reqs)
+    }
+}
 
 /// Capacity-sized GPU metadata and replay shape refreshed during GDN state
 /// preparation and shared by all GDN layers.
@@ -59,6 +92,83 @@ impl GDNMetadataBuffers {
         dst_state_slots: &[u32],
         flat_candidate_state_slots: &[u32],
     ) -> GDNReplayShape {
+        self.update_with_policy(
+            cu_tokens,
+            src_state_slots,
+            dst_state_slots,
+            flat_candidate_state_slots,
+            None,
+            None,
+        )
+    }
+
+    pub fn update_bucketed(
+        &self,
+        cu_tokens: &[u32],
+        src_state_slots: &[u32],
+        dst_state_slots: &[u32],
+        flat_candidate_state_slots: &[u32],
+        policy: &GDNReplayBucketPolicy,
+    ) -> GDNReplayShape {
+        self.validate_bucket_policy(policy);
+        self.update_with_policy(
+            cu_tokens,
+            src_state_slots,
+            dst_state_slots,
+            flat_candidate_state_slots,
+            Some(policy),
+            None,
+        )
+    }
+
+    pub fn update_bucketed_with_token_capacity(
+        &self,
+        cu_tokens: &[u32],
+        src_state_slots: &[u32],
+        dst_state_slots: &[u32],
+        flat_candidate_state_slots: &[u32],
+        policy: &GDNReplayBucketPolicy,
+        total_tokens: u32,
+    ) -> GDNReplayShape {
+        self.validate_bucket_policy(policy);
+        self.update_with_policy(
+            cu_tokens,
+            src_state_slots,
+            dst_state_slots,
+            flat_candidate_state_slots,
+            Some(policy),
+            Some(total_tokens),
+        )
+    }
+
+    fn validate_bucket_policy(&self, policy: &GDNReplayBucketPolicy) {
+        assert_eq!(
+            policy.max_requests() as usize + 1,
+            self.cu_tokens.len_bytes() / size_of::<u32>(),
+            "GDN replay request policy must match metadata capacity"
+        );
+        assert_eq!(
+            policy.max_requests() as usize,
+            self.src_state_slots.len_bytes() / size_of::<u32>(),
+            "GDN replay request policy must match state-slot metadata capacity"
+        );
+        assert_eq!(self.src_state_slots.len_bytes(), self.dst_state_slots.len_bytes());
+        assert_eq!(
+            policy.max_tokens() as usize,
+            self.flat_candidate_state_slots.len_bytes() / size_of::<u32>(),
+            "GDN replay token policy must match metadata capacity"
+        );
+    }
+
+    fn update_with_policy(
+        &self,
+        cu_tokens: &[u32],
+        src_state_slots: &[u32],
+        dst_state_slots: &[u32],
+        flat_candidate_state_slots: &[u32],
+        policy: Option<&GDNReplayBucketPolicy>,
+        selected_total_tokens: Option<u32>,
+    ) -> GDNReplayShape {
         assert!(!src_state_slots.is_empty(), "GDN batch metadata requires requests");
         assert_eq!(cu_tokens.len(), src_state_slots.len() + 1);
         assert_eq!(src_state_slots.len(), dst_state_slots.len());
@@ -71,14 +181,28 @@ impl GDNMetadataBuffers {
         let num_tokens = cu_tokens[cu_tokens.len() - 1] as usize;
         assert_eq!(flat_candidate_state_slots.len(), num_tokens);
         assert!(num_tokens <= self.flat_candidate_state_slots.len_bytes() / size_of::<u32>());
-        let replay_shape = GDNReplayShape {
-            num_reqs: src_state_slots
-                .len()
-                .try_into()
-                .expect("GDN batch metadata count must fit u32"),
-            num_tokens: num_tokens.try_into().expect("GDN batch token count must fit u32"),
+        let num_reqs = src_state_slots
+            .len()
+            .try_into()
+            .expect("GDN batch metadata count must fit u32");
+        let num_tokens = num_tokens.try_into().expect("GDN batch token count must fit u32");
+        let (total_reqs, total_tokens) = match (policy, selected_total_tokens) {
+            (Some(policy), Some(total_tokens)) => {
+                assert!(
+                    total_tokens >= num_tokens,
+                    "GDN caller-owned token capacity must contain all active tokens"
+                );
+                assert!(
+                    total_tokens <= policy.max_tokens(),
+                    "GDN caller-owned token capacity must not exceed the metadata capacity"
+                );
+                (policy.request_capacity(num_reqs), total_tokens)
+            },
+            (Some(policy), None) => policy.capacities(num_reqs, num_tokens),
+            (None, None) => (num_reqs, num_tokens),
+            (None, Some(_)) => panic!("GDN caller-owned token capacity requires a replay bucket policy"),
         };
-        replay_shape.validate();
+        let replay_shape = GDNReplayShape::new(num_reqs, total_reqs, num_tokens, total_tokens);
 
         self.cu_tokens.write_typed(0, cu_tokens);
         self.src_state_slots.write_typed(0, src_state_slots);
@@ -99,8 +223,10 @@ impl GDNMetadataBuffers {
 #[cfg(test)]
 mod tests {
     use inference_backend_metal::metal::Device;
+    use inference_executor_core::attn::GDNReplayShape;
 
     use super::GDNMetadataBuffers;
+    use super::GDNReplayBucketPolicy;
 
     #[test]
     fn test_update_accepts_request_capacity() {
@@ -109,6 +235,7 @@ mod tests {
 
         let shape = metadata.update(&[0, 1, 2], &[3, 4], &[5, 6], &[7, 8]);
 
+        assert_eq!(shape, GDNReplayShape::new(2, 2, 2, 2));
         assert_eq!(shape, metadata.replay_shape());
         assert_eq!(metadata.src_state_slots().read_typed::<u32>(0, 2), vec![3, 4]);
         assert_eq!(metadata.dst_state_slots().read_typed::<u32>(0, 2), vec![5, 6]);
@@ -116,6 +243,63 @@ mod tests {
             metadata.flat_candidate_state_slots().read_typed::<u32>(0, 2),
             vec![7, 8]
         );
+    }
+
+    #[test]
+    fn test_bucketed_update_uses_independent_request_and_token_capacities() {
+        let device = Device::system_default();
+        let metadata = GDNMetadataBuffers::new(&device, 6, 8);
+        let policy = GDNReplayBucketPolicy::new(6, 8, &[]);
+
+        let shape = metadata.update_bucketed(
+            &[0, 1, 2, 3, 4, 7],
+            &[10, 11, 12, 13, 14],
+            &[20, 21, 22, 23, 24],
+            &[u32::MAX; 7],
+            &policy,
+        );
+
+        assert_eq!(shape, GDNReplayShape::new(5, 6, 7, 8));
+        assert_eq!(shape, metadata.replay_shape());
+    }
+
+    #[test]
+    fn test_bucketed_update_uses_caller_owned_token_capacity_without_rebucketing() {
+        let device = Device::system_default();
+        let metadata = GDNMetadataBuffers::new(&device, 6, 8);
+        let policy = GDNReplayBucketPolicy::new(6, 8, &[]);
+
+        let shape = metadata.update_bucketed_with_token_capacity(
+            &[0, 1, 2, 3, 4, 7],
+            &[10, 11, 12, 13, 14],
+            &[20, 21, 22, 23, 24],
+            &[u32::MAX; 7],
+            &policy,
+            7,
+        );
+
+        assert_eq!(shape, GDNReplayShape::new(5, 6, 7, 7));
+        assert_eq!(shape, metadata.replay_shape());
+    }
+
+    #[test]
+    #[should_panic(expected = "GDN caller-owned token capacity must contain all active tokens")]
+    fn test_bucketed_update_rejects_small_caller_owned_token_capacity() {
+        let device = Device::system_default();
+        let metadata = GDNMetadataBuffers::new(&device, 1, 8);
+        let policy = GDNReplayBucketPolicy::new(1, 8, &[]);
+
+        metadata.update_bucketed_with_token_capacity(&[0, 7], &[10], &[20], &[u32::MAX; 7], &policy, 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "GDN caller-owned token capacity must not exceed the metadata capacity")]
+    fn test_bucketed_update_rejects_large_caller_owned_token_capacity() {
+        let device = Device::system_default();
+        let metadata = GDNMetadataBuffers::new(&device, 1, 8);
+        let policy = GDNReplayBucketPolicy::new(1, 8, &[]);
+
+        metadata.update_bucketed_with_token_capacity(&[0, 1], &[10], &[20], &[u32::MAX], &policy, 9);
     }
 
     #[test]

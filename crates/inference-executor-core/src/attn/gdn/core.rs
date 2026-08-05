@@ -71,20 +71,55 @@ impl GDNCore {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GDNReplayShape {
+    /// Current valid request count.
     pub num_reqs: u32,
+    /// Recorded request capacity.
+    pub total_reqs: u32,
+    /// Current valid flat-token count.
     pub num_tokens: u32,
+    /// Recorded flat-token capacity.
+    pub total_tokens: u32,
 }
 
 impl GDNReplayShape {
+    pub fn new(num_reqs: u32, total_reqs: u32, num_tokens: u32, total_tokens: u32) -> Self {
+        let shape = Self {
+            num_reqs,
+            total_reqs,
+            num_tokens,
+            total_tokens,
+        };
+        shape.validate();
+        shape
+    }
+
     pub fn validate(self) {
         assert!(self.num_reqs > 0);
+        assert!(self.num_reqs <= self.total_reqs);
         assert!(self.num_tokens > 0);
+        assert!(self.num_tokens <= self.total_tokens);
+        assert!(
+            self.num_reqs <= self.num_tokens,
+            "GDN replay requires at least one active token per request"
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::GDNCore;
+    use super::GDNReplayShape;
+
+    #[test]
+    fn test_replay_shape_allows_independent_capacities() {
+        GDNReplayShape::new(2, 4, 2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "GDN replay requires at least one active token per request")]
+    fn test_replay_shape_rejects_more_active_requests_than_tokens() {
+        GDNReplayShape::new(3, 4, 2, 4);
+    }
 
     #[test]
     #[should_panic(expected = "GDN fused projection dimension must fit usize")]

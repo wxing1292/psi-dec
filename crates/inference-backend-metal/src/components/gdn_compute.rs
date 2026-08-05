@@ -5,6 +5,7 @@ use crate::metal::CommandRecorder;
 use crate::metal::Device;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const GDN_COMPUTE_SOURCE: &str = include_str!("metal/gdn_compute.metal");
 
@@ -264,10 +265,32 @@ impl GDNCompute {
     }
 
     pub fn invoke<'a>(&'a self, shape: GDNComputeShape, buffers: GDNComputeBuffers<'a>) -> GDNComputeInvocation<'a> {
+        assert!(
+            shape.num_tokens >= shape.num_reqs,
+            "GDN ragged recurrent requires at least one token per request"
+        );
         GDNComputeInvocation {
             compute: self,
             shape,
             buffers,
+            num_active_reqs: ReplayU32::Fixed(shape.num_reqs),
+            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+        }
+    }
+
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: GDNComputeShape,
+        buffers: GDNComputeBuffers<'a>,
+        num_active_reqs: ReplayU32,
+        num_active_tokens: ReplayU32,
+    ) -> GDNComputeInvocation<'a> {
+        GDNComputeInvocation {
+            compute: self,
+            shape,
+            buffers,
+            num_active_reqs,
+            num_active_tokens,
         }
     }
 
@@ -276,14 +299,43 @@ impl GDNCompute {
         shape: GDNComputeShape,
         buffers: GDNComputeWithCandidateStateUpdateBuffers<'a>,
     ) -> GDNComputeWithCandidateStateUpdateInvocation<'a> {
+        assert!(
+            shape.num_tokens >= shape.num_reqs,
+            "GDN ragged recurrent requires at least one token per request"
+        );
         GDNComputeWithCandidateStateUpdateInvocation {
             compute: self,
             shape,
             buffers,
+            num_active_reqs: ReplayU32::Fixed(shape.num_reqs),
+            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
         }
     }
 
-    fn record_short_conv(&self, builder: &CommandRecorder, shape: GDNComputeShape, buffers: &GDNComputeBuffers<'_>) {
+    pub fn invoke_with_candidate_state_update_bucketed<'a>(
+        &'a self,
+        shape: GDNComputeShape,
+        buffers: GDNComputeWithCandidateStateUpdateBuffers<'a>,
+        num_active_reqs: ReplayU32,
+        num_active_tokens: ReplayU32,
+    ) -> GDNComputeWithCandidateStateUpdateInvocation<'a> {
+        GDNComputeWithCandidateStateUpdateInvocation {
+            compute: self,
+            shape,
+            buffers,
+            num_active_reqs,
+            num_active_tokens,
+        }
+    }
+
+    fn record_short_conv(
+        &self,
+        builder: &CommandRecorder,
+        shape: GDNComputeShape,
+        buffers: &GDNComputeBuffers<'_>,
+        num_active_reqs: ReplayU32,
+        num_active_tokens: ReplayU32,
+    ) {
         builder.set_kernel(&self.short_conv);
         builder.set_buffer_write(0, buffers.conv_qkv, 0);
         builder.set_buffer_write(1, buffers.next_conv_state, 0);
@@ -293,7 +345,7 @@ impl GDNCompute {
         builder.set_buffer_read(5, buffers.src_state_slots, 0);
         builder.set_buffer_read(6, buffers.dst_state_slots, 0);
         builder.set_buffer_read(7, buffers.cu_tokens, 0);
-        set_batch_args(builder, shape, 8);
+        set_batch_args(builder, shape, 8, num_active_reqs, num_active_tokens);
         builder.set_u64(10, buffers.conv_state_offset_bytes);
         builder.set_u64(11, buffers.next_conv_state_offset_bytes);
         let total_short_conv_threads = self
@@ -308,6 +360,8 @@ impl GDNCompute {
         builder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeWithCandidateStateUpdateBuffers<'_>,
+        num_active_reqs: ReplayU32,
+        num_active_tokens: ReplayU32,
     ) {
         let compute = &buffers.compute;
         builder.set_kernel(&self.forward_conv_candidate_state);
@@ -318,7 +372,7 @@ impl GDNCompute {
         builder.set_buffer_read(3, compute.src_state_slots, 0);
         builder.set_buffer_read(4, buffers.flat_candidate_state_slots, 0);
         builder.set_buffer_read(5, compute.cu_tokens, 0);
-        set_batch_args(builder, shape, 6);
+        set_batch_args(builder, shape, 6, num_active_reqs, num_active_tokens);
         builder.set_u64(8, compute.conv_state_offset_bytes);
         builder.set_u64(9, compute.next_conv_state_offset_bytes);
         builder.dispatch_1d(
@@ -349,6 +403,7 @@ impl GDNCompute {
         builder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
+        num_active_reqs: ReplayU32,
     ) {
         builder.set_kernel(&self.ragged_recurrent);
         builder.set_barrier_before();
@@ -363,8 +418,8 @@ impl GDNCompute {
         builder.set_buffer_read(8, buffers.dst_state_slots, 0);
         builder.set_buffer_read(9, buffers.cu_tokens, 0);
         builder.set_f32(10, self.config.q_scale);
-        set_batch_args(builder, shape, 11);
-        builder.set_u64(13, buffers.recurrent_state_arena_offset_bytes);
+        set_replay_u32(builder, 11, num_active_reqs, shape.num_reqs, "GDN active request count");
+        builder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
         let v_dim_tile_size = self.v_dim_tile_size as usize;
         let num_v_dim_tiles = self.config.v_head_dim as usize / v_dim_tile_size;
         builder.dispatch_threadblocks(
@@ -382,6 +437,7 @@ impl GDNCompute {
         builder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeWithCandidateStateUpdateBuffers<'_>,
+        num_active_reqs: ReplayU32,
     ) {
         let compute = &buffers.compute;
         builder.set_kernel(&self.ragged_recurrent_forward_candidate_state);
@@ -398,8 +454,8 @@ impl GDNCompute {
         builder.set_buffer_read(9, buffers.flat_candidate_state_slots, 0);
         builder.set_buffer_read(10, compute.cu_tokens, 0);
         builder.set_f32(11, self.config.q_scale);
-        set_batch_args(builder, shape, 12);
-        builder.set_u64(14, compute.recurrent_state_arena_offset_bytes);
+        set_replay_u32(builder, 12, num_active_reqs, shape.num_reqs, "GDN active request count");
+        builder.set_u64(13, compute.recurrent_state_arena_offset_bytes);
         let v_dim_tile_size = self.v_dim_tile_size as usize;
         let num_v_dim_tiles = self.config.v_head_dim as usize / v_dim_tile_size;
         builder.dispatch_threadblocks(
@@ -429,6 +485,7 @@ impl GDNCompute {
         builder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
+        num_active_tokens: ReplayU32,
     ) {
         builder.set_kernel(&self.output_norm_gate);
         builder.set_barrier_before();
@@ -437,7 +494,13 @@ impl GDNCompute {
         builder.set_buffer_read(2, buffers.z, 0);
         builder.set_buffer_read(3, buffers.norm_weight, 0);
         builder.set_f32(4, self.config.norm_eps);
-        set_batch_args(builder, shape, 5);
+        set_replay_u32(
+            builder,
+            5,
+            num_active_tokens,
+            shape.num_tokens,
+            "GDN active token count",
+        );
         builder.dispatch_1d(
             self.config.total_output_norm_gate_threads(shape),
             OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK,
@@ -449,19 +512,25 @@ pub struct GDNComputeInvocation<'a> {
     compute: &'a GDNCompute,
     shape: GDNComputeShape,
     buffers: GDNComputeBuffers<'a>,
+    num_active_reqs: ReplayU32,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for GDNComputeInvocation<'_> {
     fn record(self, builder: &CommandRecorder<'_>) {
         self.compute.config.validate_shape(self.shape);
         validate_buffers(self.compute.config, self.shape, &self.buffers);
-        self.compute.record_short_conv(builder, self.shape, &self.buffers);
-        assert!(
-            self.shape.num_tokens >= self.shape.num_reqs,
-            "GDN ragged recurrent requires at least one token per request"
+        self.compute.record_short_conv(
+            builder,
+            self.shape,
+            &self.buffers,
+            self.num_active_reqs,
+            self.num_active_tokens,
         );
-        self.compute.record_ragged_recurrent(builder, self.shape, &self.buffers);
-        self.compute.record_output_norm_gate(builder, self.shape, &self.buffers);
+        self.compute
+            .record_ragged_recurrent(builder, self.shape, &self.buffers, self.num_active_reqs);
+        self.compute
+            .record_output_norm_gate(builder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
 
@@ -469,6 +538,8 @@ pub struct GDNComputeWithCandidateStateUpdateInvocation<'a> {
     compute: &'a GDNCompute,
     shape: GDNComputeShape,
     buffers: GDNComputeWithCandidateStateUpdateBuffers<'a>,
+    num_active_reqs: ReplayU32,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
@@ -483,20 +554,63 @@ impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
             self.buffers.flat_candidate_state_slots.len_bytes() >= self.shape.num_tokens as usize * size_of::<u32>(),
             "GDN flat_candidate_state_slots buffer is too small"
         );
+        self.compute.record_short_conv(
+            builder,
+            self.shape,
+            &self.buffers.compute,
+            self.num_active_reqs,
+            self.num_active_tokens,
+        );
+        self.compute.record_forward_conv_candidate_state(
+            builder,
+            self.shape,
+            &self.buffers,
+            self.num_active_reqs,
+            self.num_active_tokens,
+        );
+        self.compute.record_ragged_recurrent_forward_candidate_state(
+            builder,
+            self.shape,
+            &self.buffers,
+            self.num_active_reqs,
+        );
         self.compute
-            .record_short_conv(builder, self.shape, &self.buffers.compute);
-        self.compute
-            .record_forward_conv_candidate_state(builder, self.shape, &self.buffers);
-        self.compute
-            .record_ragged_recurrent_forward_candidate_state(builder, self.shape, &self.buffers);
-        self.compute
-            .record_output_norm_gate(builder, self.shape, &self.buffers.compute);
+            .record_output_norm_gate(builder, self.shape, &self.buffers.compute, self.num_active_tokens);
     }
 }
 
-fn set_batch_args(builder: &CommandRecorder, shape: GDNComputeShape, start_index: usize) {
-    builder.set_u32(start_index, shape.num_reqs);
-    builder.set_u32(start_index + 1, shape.num_tokens);
+fn set_batch_args(
+    builder: &CommandRecorder,
+    shape: GDNComputeShape,
+    start_index: usize,
+    num_active_reqs: ReplayU32,
+    num_active_tokens: ReplayU32,
+) {
+    set_replay_u32(
+        builder,
+        start_index,
+        num_active_reqs,
+        shape.num_reqs,
+        "GDN active request count",
+    );
+    set_replay_u32(
+        builder,
+        start_index + 1,
+        num_active_tokens,
+        shape.num_tokens,
+        "GDN active token count",
+    );
+}
+
+fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+    match value {
+        ReplayU32::Fixed(value) => {
+            assert!(value > 0, "{name} must be positive");
+            assert!(value <= max_value, "{name} exceeds recorded capacity");
+            builder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
+    }
 }
 
 fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &GDNComputeBuffers<'_>) {

@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
@@ -9,7 +10,11 @@ use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::backend::GDN;
 use crate::attn::gdn::backend::GDNMetalConfig;
+use crate::attn::gdn::backend::GDNReplayTopology;
+use crate::attn::gdn::backend::add_gdn_private_replay_arguments;
+use crate::attn::gdn::backend::add_gdn_replay_arguments;
 use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
+use crate::attn::gdn::batch_metadata::GDNReplayBucketPolicy;
 use crate::attn::gdn::scratch::GDNScratch;
 use crate::attn::gdn::state_table::GDNPreparedRequestState;
 use crate::attn::gdn::state_table::GDNRequestStateTable;
@@ -26,6 +31,7 @@ pub struct Qwen3xGDNState {
     scratch: Rc<GDNScratch>,
     request_state_table: Rc<GDNRequestStateTable>,
     metadata: GDNMetadataBuffers,
+    replay_bucket_policy: GDNReplayBucketPolicy,
     state_restore: Replay<Rc<GDNRequestStateTable>>,
     pending_publish: Option<MetalReplaySubmission>,
 }
@@ -78,11 +84,18 @@ impl Qwen3xGDNState {
             num_tokens_per_block,
             page_bytes,
         ));
+        let backend = Rc::new(GDN::new(device, representative.clone(), metal));
+        let max_requests = num_req_slots
+            .try_into()
+            .expect("qwen3.x GDN request capacity must fit u32");
+        let max_tokens_u32 = max_tokens.try_into().expect("qwen3.x GDN token capacity must fit u32");
+        let replay_bucket_policy = backend.replay_bucket_policy(max_requests, max_tokens_u32);
         Self {
-            backend: Rc::new(GDN::new(device, representative.clone(), metal)),
+            backend,
             scratch: Rc::new(GDNScratch::new(device, representative, max_tokens)),
             request_state_table: Rc::clone(&request_state_table),
             metadata: GDNMetadataBuffers::new(device, num_req_slots, max_tokens),
+            replay_bucket_policy,
             state_restore: Replay::new("qwen3.x GDN state restore", Rc::clone(&request_state_table)),
             pending_publish: None,
         }
@@ -126,6 +139,42 @@ impl Qwen3xGDNState {
 
     pub fn prepare_metadata(&self, cu_tokens: &[u32], prepared: &GDNPreparedRequestState) -> GDNReplayShape {
         self.backend.prepare(&self.metadata, cu_tokens, prepared)
+    }
+
+    pub fn prepare_metadata_bucketed(&self, cu_tokens: &[u32], prepared: &GDNPreparedRequestState) -> GDNReplayShape {
+        self.backend
+            .prepare_bucketed(&self.metadata, cu_tokens, prepared, &self.replay_bucket_policy)
+    }
+
+    pub fn prepare_metadata_bucketed_with_token_capacity(
+        &self,
+        cu_tokens: &[u32],
+        prepared: &GDNPreparedRequestState,
+        total_tokens: u32,
+    ) -> GDNReplayShape {
+        self.backend.prepare_bucketed_with_token_capacity(
+            &self.metadata,
+            cu_tokens,
+            prepared,
+            &self.replay_bucket_policy,
+            total_tokens,
+        )
+    }
+
+    pub fn replay_token_topology_boundaries(&self) -> Box<[u32]> {
+        self.backend.replay_token_topology_boundaries()
+    }
+
+    pub fn replay_topology(&self) -> GDNReplayTopology {
+        self.backend.replay_topology(&self.metadata, true)
+    }
+
+    pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
+        add_gdn_replay_arguments(self.metadata.replay_shape(), arguments);
+    }
+
+    pub fn add_private_replay_arguments(&self, arguments: &mut ReplayArguments) {
+        add_gdn_private_replay_arguments(self.metadata.replay_shape(), arguments);
     }
 
     pub fn restore(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer) {

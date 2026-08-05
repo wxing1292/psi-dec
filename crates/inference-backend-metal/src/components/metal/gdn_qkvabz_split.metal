@@ -12,14 +12,14 @@ kernel void gdn_qkvabz_split_f32(
     device float* a [[buffer(2)]],
     device float* b [[buffer(3)]],
     device float* z [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     constant uint& qkv_dim [[buffer(6)]],
     constant uint& num_v_heads [[buffer(7)]],
     constant uint& v_dim [[buffer(8)]],
     uint global_linear_index [[thread_position_in_grid]]
 ) {
     uint qkvabz_row_stride = qkv_dim + num_v_heads * 2 + v_dim;
-    uint num_qkvabz_values = num_tokens * qkvabz_row_stride;
+    uint num_qkvabz_values = num_active_tokens * qkvabz_row_stride;
     if (global_linear_index >= num_qkvabz_values) {
         return;
     }

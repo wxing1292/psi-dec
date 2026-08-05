@@ -463,7 +463,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         let gdn_metadata_start = Instant::now();
         let gdn_shape = self
             .main_gdn_state
-            .prepare_metadata(microbatch.cu_tokens(), &gdn_prepared);
+            .prepare_metadata_bucketed(microbatch.cu_tokens(), &gdn_prepared);
         let gdn_metadata_elapsed = gdn_metadata_start.elapsed();
         debug_assert_eq!(gdn_shape.num_tokens as usize, microbatch.total_tokens());
         debug_assert_eq!(gdn_shape.num_reqs as usize, microbatch.num_reqs());
@@ -513,9 +513,11 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             self.main_gqa_state.metadata().replay_shape(),
             self.main_gqa_state.replay_topology(),
             self.main_gdn_state.metadata().replay_shape(),
+            self.main_gdn_state.replay_topology(),
         );
         let mut main_arguments = ReplayArguments::new();
         self.main_gqa_state.add_replay_arguments(&mut main_arguments);
+        self.main_gdn_state.add_replay_arguments(&mut main_arguments);
         trace::qwen35_state(|| {
             format!(
                 "event=begin_ops_recording main_embed_key={:?} main_key={:?}",
@@ -599,6 +601,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             gqa: self.main_gqa_state.metadata(),
             gqa_replay_topology: self.main_gqa_state.replay_topology(),
             gdn: self.main_gdn_state.metadata(),
+            gdn_replay_topology: self.main_gdn_state.replay_topology(),
             pages: self.pages.buffer(),
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
@@ -916,6 +919,7 @@ mod tests {
     use super::mtp_proposal_sample_position;
     use super::mtp_sample_replay_shape;
     use super::replay_bucket_capacity;
+    use crate::attn::gdn::backend::GDNReplayTopology;
     use crate::attn::gqa::backend::GQAReplayTopology;
 
     #[test]
@@ -969,9 +973,10 @@ mod tests {
     #[test]
     fn test_main_key() {
         let topology = single_gqa_topology();
-        let key = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), topology, gdn_shape(1));
+        let gdn_topology = gdn_topology();
+        let key = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), topology, gdn_shape(1), gdn_topology);
 
-        assert_eq!(key.debug_parts(), (4, 4, 4, 4, 1, topology));
+        assert_eq!(key.debug_parts(), (4, 4, 4, 4, 1, 4, topology, gdn_topology));
     }
 
     #[test]
@@ -983,18 +988,36 @@ mod tests {
     #[test]
     fn test_main_key_tiled() {
         let topology = tiled_gqa_topology();
-        let key = Qwen35MainReplayKey::from_shapes(tiled_gqa_shape(), topology, gdn_shape(1));
+        let gdn_topology = gdn_topology();
+        let key = Qwen35MainReplayKey::from_shapes(tiled_gqa_shape(), topology, gdn_shape(1), gdn_topology);
 
-        assert_eq!(key.debug_parts(), (4, 4, 1, 1, 1, topology));
+        assert_eq!(key.debug_parts(), (4, 4, 1, 1, 1, 4, topology, gdn_topology));
     }
 
     #[test]
-    fn test_main_key_separates_gdn_request_geometry() {
-        let one_req = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), single_gqa_topology(), gdn_shape(1));
-        let two_reqs =
-            Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), single_gqa_topology(), gdn_shape(2));
+    fn test_main_key_uses_gdn_request_capacity() {
+        let topology = gdn_topology();
+        let one_req = Qwen35MainReplayKey::from_shapes(
+            single_q_token_gqa_shape(),
+            single_gqa_topology(),
+            GDNReplayShape::new(1, 2, 4, 4),
+            topology,
+        );
+        let two_reqs = Qwen35MainReplayKey::from_shapes(
+            single_q_token_gqa_shape(),
+            single_gqa_topology(),
+            GDNReplayShape::new(2, 2, 4, 4),
+            topology,
+        );
+        let larger_capacity = Qwen35MainReplayKey::from_shapes(
+            single_q_token_gqa_shape(),
+            single_gqa_topology(),
+            GDNReplayShape::new(2, 4, 4, 4),
+            topology,
+        );
 
-        assert_ne!(one_req, two_reqs);
+        assert_eq!(one_req, two_reqs);
+        assert_ne!(one_req, larger_capacity);
     }
 
     #[test]
@@ -1006,8 +1029,18 @@ mod tests {
         };
 
         assert_eq!(
-            Qwen35MainReplayKey::from_shapes(one_task_template_per_token, single_gqa_topology(), gdn_shape(1)),
-            Qwen35MainReplayKey::from_shapes(multiple_task_templates_per_token, single_gqa_topology(), gdn_shape(1))
+            Qwen35MainReplayKey::from_shapes(
+                one_task_template_per_token,
+                single_gqa_topology(),
+                gdn_shape(1),
+                gdn_topology(),
+            ),
+            Qwen35MainReplayKey::from_shapes(
+                multiple_task_templates_per_token,
+                single_gqa_topology(),
+                gdn_shape(1),
+                gdn_topology(),
+            )
         );
     }
 
@@ -1062,9 +1095,14 @@ mod tests {
     }
 
     fn gdn_shape(num_reqs: u32) -> GDNReplayShape {
-        GDNReplayShape {
-            num_reqs,
-            num_tokens: 4,
+        GDNReplayShape::new(num_reqs, num_reqs, 4, 4)
+    }
+
+    fn gdn_topology() -> GDNReplayTopology {
+        GDNReplayTopology {
+            materialize_candidate_states: true,
+            qkvabz_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
         }
     }
 

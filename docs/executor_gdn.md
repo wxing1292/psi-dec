@@ -234,10 +234,14 @@ tuning. Thus, their documentation describes tensors and grids without new `*Task
 
 ## Canonical metadata and host/Metal ABI
 
-Canonical host structure order is unchanged:
+Canonical host structures use these dynamic work domains:
 
 ```text
-GDNComputeShape / GDNReplayShape
+GDNReplayShape
+  num_reqs, total_reqs,
+  num_tokens, total_tokens
+
+GDNComputeShape
   num_reqs, num_tokens
 
 GDNComputeConfig
@@ -252,14 +256,15 @@ GDNCore
   conv_kernel_size, q_scale
 
 GDNQKVABZSplitConfig
-  qkv_dim, num_v_heads, v_dim, input_dtype
+  qkv_dim, num_v_heads, v_dim
 
 GDNQKVABZSplitShape
   num_tokens
 ```
 
 Generic `GDNComputeConfig` owns static geometry. `GDNCompute` derives its low-level V-dimension tile from that geometry.
-The replay shape/key owns dynamic batch work.
+For a bucketed invocation, `GDNComputeShape` contains recorded capacities. Submission arguments contain active counts.
+For an exact invocation, the shape counts are both active counts and dispatch extents.
 
 The Qwen adapter supplies dimensions and weights. Generic Rust and Metal contain no Qwen name or config type.
 
@@ -268,30 +273,30 @@ The canonical binding order and dispatch topology are:
 ```text
 QKVABZ split
   buffers 0..4: qkvabz, qkv, a, b, z
-  scalars 5..8: num_tokens, qkv_dim, num_v_heads, v_dim
-  dispatch: T * (Cqkv + 2 * Hv + Hv * Dv), 256 threads/threadblock
+  scalars 5..8: num_active_tokens, qkv_dim, num_v_heads, v_dim
+  dispatch: total_tokens * (Cqkv + 2 * Hv + Hv * Dv), 256 threads/threadblock
 
 short convolution
   buffers 0..7: conv_qkv, next_conv_state, qkv, conv_state,
                 conv_weight, src_state_slots, dst_state_slots, cu_tokens
   parameter dtype: conv_weight bf16
-  scalars 8..11: num_reqs, num_tokens, conv_state_offset_bytes,
+  scalars 8..11: num_active_reqs, num_active_tokens, conv_state_offset_bytes,
                  next_conv_state_offset_bytes
-  dispatch: max(T * Cqkv, R * Cqkv * Ks), 256 threads/threadblock
+  dispatch: max(total_tokens * Cqkv, total_reqs * Cqkv * Ks), 256 threads/threadblock
 
 ragged recurrent
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
                 a_log, dt_bias, src_state_slots, dst_state_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
-  scalars 10..13: q_scale, num_reqs, num_tokens, recurrent_state_offset_bytes
-  grid: (Dv / Dv_tile, R * Hv, 1)
+  scalars 10..12: q_scale, num_active_reqs, recurrent_state_offset_bytes
+  grid: (Dv / Dv_tile, total_reqs * Hv, 1)
   threads: (32, Dv_tile, 1)
 
 output_norm_gate
   buffers 0..3: norm_gated_output, recurrent_output, z, norm_weight
   parameter dtype: norm_weight bf16
-  scalars 4..6: eps, num_reqs, num_tokens
-  dispatch: T * Hv * 128, 128 threads/threadblock
+  scalars 4..5: eps, num_active_tokens
+  dispatch: total_tokens * Hv * 128, 128 threads/threadblock
 
 batched state-page read/write
   buffers 0..4: pages, recurrent_states, conv_states, page_ids, state_slots
@@ -301,8 +306,12 @@ batched state-page read/write
   grid: (total_pages, 1, 1), threads: (256, 1, 1)
 ```
 
+Candidate convolution materialization uses buffers 0..5 for `next_conv_state`, `qkv`, `conv_state`,
+`src_state_slots`, `flat_candidate_state_slots`, and `cu_tokens`. Its scalars 6..9 are `num_active_reqs`,
+`num_active_tokens`, `conv_state_offset_bytes`, and `next_conv_state_offset_bytes`.
+
 Candidate recurrent materialization adds `flat_candidate_state_slots` at buffer 9. It shifts `cu_tokens` to 10 and
-uses scalars 11..14.
+uses scalars 11..13.
 
 The invalid candidate-slot sentinel remains `u32::MAX`. The kernel does not write for that token.
 
@@ -336,15 +345,17 @@ F32 model boundaries remain explicit future work. The config does not expose ker
 
 `GDN` owns one adaptive `AffineQuantizedMatmul` for the qkvabz projection and one for the output projection.
 Each operator owns its QMV and QMM candidates.
-The backend selects the kernel family and tile from the fixed affine config and the active row count.
+The backend selects the kernel family and tile from the fixed affine config and the recorded row capacity.
+The GDN token bucket policy unions both affine topology boundaries. Thus, one bucket cannot cross a kernel-selection
+boundary.
 `GDN` does not select or name an affine kernel.
 
 `GDN` translates immutable `GDNCore` geometry into `GDNComputeConfig`. `GDNCompute::new` selects the recurrent
 `Dv_tile` from that config. It uses the measured 8-lane tile when `v_head_dim` permits it. It falls back through 4, 2,
 and 1 for other valid dimensions. The selected tile specializes the generated Metal source together with
 `num_qk_heads/qk_head_dim`, `num_v_heads/v_head_dim`, `conv_kernel_size`, and derived `qkv_dim`.
-The model adapter does not select this kernel configuration. `GDNComputeShape` contains only replay-varying
-`num_reqs/num_tokens`.
+The model adapter does not select this kernel configuration. `GDNComputeShape` contains only recorded request and token
+extents.
 
 Kernel source-hash caching shares compiled pipelines for identical component configs across layers and models. The backend
 API does not contain model names or model config types. Batch metadata objects and scratch bindings do not copy static
@@ -362,8 +373,11 @@ caller’s `Recorder`.
 
 State preparation also keeps the leaf boundary model-neutral. `Qwen3xGDNState::prepare_states` receives the request-slot,
 block-index, token-index, cumulative-token, state-transaction, and state-page slices that `GDNRequestStateTable`
-consumes. `prepare_metadata` receives cumulative tokens and the prepared state. The Qwen3.5 executor extracts these slices
-from its own microbatch before it calls the shared leaf.
+consumes. `prepare_metadata_bucketed` receives cumulative tokens and the prepared state. It selects independent request
+and token capacities with the component-local policy. `prepare_metadata_bucketed_with_token_capacity` accepts a token
+capacity that a composite replay stage already selected. This path buckets only the private request capacity. It does not
+bucket the token capacity again. The Qwen3.5 executor extracts these slices from its own microbatch before it calls the
+shared leaf.
 
 `GDNRequestStateTable` owns all GDN layers at model level. It owns two contiguous aggregate arenas: one recurrent arena
 and one convolution arena.
@@ -482,14 +496,54 @@ GDNInput
   scratch        GDNScratchBindings
   materialize_candidate_states
   weights        GDNWeights
+  replay_mode    GDNReplayMode
 ```
 
 `GDNOutput<'a>` is the named alias for the returned `&'a Buffer`. It is the caller-owned `next_hidden_state` buffer.
 It does not allocate or add a wrapper.
 
+`GDNReplayMode::Exact` preserves the fixed-scalar leaf APIs. An exact GDN program has no replay parameters.
+`GDNReplayMode::Bucketed` records request and token capacities and uses these submission parameters:
+
+```text
+gdn.num_active_requests  u32 [1, total_reqs]
+gdn.num_active_tokens    u32 [1, total_tokens]
+```
+
+`GDNReplayMode::BucketedWithTokenKey` replaces `gdn.num_active_tokens` with one caller-owned
+`ReplayParameterKey`. A composite stage uses this mode so all token consumers share one active-token parameter. The stage
+sets that parameter once. GDN adds only its private `gdn.num_active_requests` argument. The default bucketed API and
+`add_gdn_replay_arguments` retain both GDN-owned keys for standalone users.
+
+Each command binds only the domains that it consumes:
+
+```text
+qkvabz affine                         active tokens
+QKVABZ split                          active tokens
+short convolution                     active requests and active tokens
+candidate convolution materialization active requests and active tokens
+ragged recurrent                      active requests
+output norm + gate                    active tokens
+output affine                         active tokens
+```
+
+One bucketed GDN program therefore has two deduplicated `u32` parameters. Every padded command returns before an
+inactive lane reads input or metadata, mutates state, reaches a threadblock barrier, or writes output. The ragged
+recurrent request guard is uniform for the complete threadblock.
+
+`GDNReplayBucketPolicy` owns independent request and token policies. The token policy includes the topology boundaries
+from both affine operators. `GDNReplayTopology` contains `materialize_candidate_states`, `qkvabz_affine`, and
+`output_affine`. The GDN replay subkey contains `total_reqs`, `total_tokens`, and this topology. Active counts do not enter
+the GDN subkey. `replay_token_topology_boundaries` exposes the affine boundaries to a composite-stage policy. A
+caller-owned token capacity must contain all active tokens and must not exceed the initialized token capacity. It must
+also select the same QKVABZ and output affine topologies as the active token count. GDN validates these conditions before
+it updates metadata. The outer Qwen3.5 Main key still contains the exact model token count until all Main token consumers
+use one composite bucket policy.
+
 Focused tests and benches use the same `ReplayLayer::record(...)` entrypoint as model replay.
 
-State page restore/publish belongs to `GDNRequestStateTable`, not to individual layer backends. Runtime supplies one
+State page restore/publish belongs to `GDNRequestStateTable`, not to individual layer backends. These lifecycle stages
+retain exact keys and fixed arguments. They are not part of the forward request/token bucket policy. Runtime supplies one
 state-page vector per cache block. The vector contains every GDN layer in model order.
 
 The manager splits that vector into recurrent and convolution page-ID staging. It then records one flattened all-layer
@@ -638,16 +692,19 @@ slot zeroed.
 
 This setup matches the production lifecycle. The lifecycle reads a verified current state and produces a candidate state.
 
-The replay shape and metadata contract is exact for the current microbatch:
+The replay shape keeps active work separate from recorded capacities:
 
 ```text
-num_reqs       number of request rows in the ragged batch
-num_tokens   total flattened tokens across those requests
-cu_tokens      length num_reqs + 1, cumulative flat-token counts for each request
+num_reqs      active request count
+total_reqs    recorded request capacity
+num_tokens    active flattened-token count
+total_tokens  recorded flattened-token capacity
+cu_tokens     active prefix length num_reqs + 1
 ```
 
-Each active request in a recorded GDN replay must contribute at least one row. The committed source state slot represents
-existing context. Padding rows do not represent it.
+Each active request must contribute at least one token. Thus, `num_reqs <= num_tokens`. Request and token capacities are
+independent and do not require `total_reqs <= total_tokens`. Inactive metadata tails do not represent requests, tokens, or
+state. The committed source state slot represents existing context.
 
 The state contract is slot based:
 
@@ -850,16 +907,18 @@ Do not add dynamic values to profile paths.
 
 ## GDN kernel family
 
-The current replay path uses `GDNCompute` in `crates/inference-backend-metal/src/components/`. It records QKVABZ split,
-short convolution, ragged recurrent,
-output_norm_gate, and state page read/write helpers through explicit replay invocations.
+The current forward replay path uses `GDNCompute` in `crates/inference-backend-metal/src/components/`. It records QKVABZ
+split, short convolution, ragged recurrent, and `output_norm_gate` through explicit replay invocations. State page read and
+write helpers belong to the separate exact restore/publish lifecycle stages.
 
 Focused backend tests, component benches with parity checks, and Qwen real-weight wrapper/layer tests provide correctness
 coverage. Slow/reference implementations are test oracles. They are not runtime fallbacks.
 
 `gdn_compute_test.rs` compares Metal execution with the CPU short-convolution and recurrent references. It covers fixed
 one-request ragged decode, random ragged input, and a random multi-request ragged batch. Candidate-state tests compare each
-speculative prefix state with an independently evaluated CPU prefix reference.
+speculative prefix state with an independently evaluated CPU prefix reference. The bucketed candidate test reuses one
+program for `1 -> 2 -> 1` active requests and tokens. It poisons inactive token and metadata tails. It verifies active
+output/state parity and inactive scratch/state canaries.
 
 ## Tests and benches
 

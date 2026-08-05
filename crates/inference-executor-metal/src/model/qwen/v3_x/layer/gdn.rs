@@ -3,6 +3,7 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::TensorMap;
@@ -13,6 +14,7 @@ use crate::attn::gdn::backend::GDN;
 use crate::attn::gdn::backend::GDNInput;
 use crate::attn::gdn::backend::GDNLayerStateBindings;
 use crate::attn::gdn::backend::GDNMetalConfig;
+use crate::attn::gdn::backend::GDNReplayMode;
 use crate::attn::gdn::backend::GDNWeights;
 use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
 use crate::attn::gdn::scratch::GDNScratch;
@@ -65,6 +67,38 @@ impl Qwen3xGDN {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
+        self.record_with_mode(recorder, input, output, metadata, GDNReplayMode::Bucketed);
+    }
+
+    pub fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        input: &'a Buffer,
+        output: &'a Buffer,
+        metadata: &'a GDNMetadataBuffers,
+        num_active_tokens_key: ReplayParameterKey,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        self.record_with_mode(
+            recorder,
+            input,
+            output,
+            metadata,
+            GDNReplayMode::BucketedWithTokenKey(num_active_tokens_key),
+        );
+    }
+
+    fn record_with_mode<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        input: &'a Buffer,
+        output: &'a Buffer,
+        metadata: &'a GDNMetadataBuffers,
+        replay_mode: GDNReplayMode,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
         let state = self.request_state_table.layer_bindings(self.compact_gdn_layer_index);
         let _ = <GDN as ReplayLayer>::record(
             &self.backend,
@@ -84,6 +118,7 @@ impl Qwen3xGDN {
                 },
                 materialize_candidate_states: true,
                 weights: self.weights.as_borrowed(),
+                replay_mode,
             },
         );
     }

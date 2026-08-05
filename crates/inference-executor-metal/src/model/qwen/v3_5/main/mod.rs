@@ -9,6 +9,7 @@ use inference_executor_core::model::qwen::v3_5::LayerType;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MainWeightBindings;
 
+use crate::attn::gdn::backend::GDNReplayTopology;
 use crate::attn::gqa::backend::GQAReplayTopology;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
@@ -46,6 +47,7 @@ pub struct Qwen35MainArgs<'a> {
     pub gqa: &'a crate::attn::gqa::batch_metadata::GQAMetadataBuffers,
     pub gqa_replay_topology: GQAReplayTopology,
     pub gdn: &'a crate::attn::gdn::batch_metadata::GDNMetadataBuffers,
+    pub gdn_replay_topology: GDNReplayTopology,
     pub pages: &'a Buffer,
 }
 
@@ -159,6 +161,7 @@ impl Qwen35MainReplayKey {
         gqa_shape: inference_executor_core::attn::GQAReplayShape,
         gqa_topology: GQAReplayTopology,
         gdn_shape: GDNReplayShape,
+        gdn_topology: GDNReplayTopology,
     ) -> Self {
         gqa_shape.validate();
         gdn_shape.validate();
@@ -169,34 +172,40 @@ impl Qwen35MainReplayKey {
         Self {
             num_tokens: gqa_shape.num_tokens,
             gqa: Qwen35GQAReplayKey::new(gqa_shape, gqa_topology),
-            gdn: Qwen35MainGDNReplayKey::from_shape(gdn_shape),
+            gdn: Qwen35MainGDNReplayKey::new(gdn_shape, gdn_topology),
         }
     }
 
     #[cfg(test)]
-    pub fn debug_parts(&self) -> (u32, u32, u32, u32, u32, GQAReplayTopology) {
+    pub fn debug_parts(&self) -> (u32, u32, u32, u32, u32, u32, GQAReplayTopology, GDNReplayTopology) {
         let (total_tokens, total_q_token_tiles, total_task_templates, topology) = self.gqa.debug_parts();
         (
             self.num_tokens,
             total_tokens,
             total_q_token_tiles,
             total_task_templates,
-            self.gdn.num_reqs,
+            self.gdn.total_reqs,
+            self.gdn.total_tokens,
             topology,
+            self.gdn.topology,
         )
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Qwen35MainGDNReplayKey {
-    num_reqs: u32,
+    total_reqs: u32,
+    total_tokens: u32,
+    topology: GDNReplayTopology,
 }
 
 impl Qwen35MainGDNReplayKey {
-    fn from_shape(gdn_shape: GDNReplayShape) -> Self {
+    fn new(gdn_shape: GDNReplayShape, topology: GDNReplayTopology) -> Self {
         gdn_shape.validate();
         Self {
-            num_reqs: gdn_shape.num_reqs,
+            total_reqs: gdn_shape.total_reqs,
+            total_tokens: gdn_shape.total_tokens,
+            topology,
         }
     }
 }
@@ -210,6 +219,7 @@ impl ReplayComponent for Qwen35Main {
             input.gqa.replay_shape(),
             input.gqa_replay_topology,
             input.gdn.replay_shape(),
+            input.gdn_replay_topology,
         )
     }
 
@@ -222,6 +232,7 @@ impl ReplayComponent for Qwen35Main {
 mod tests {
     use inference_backend_metal::components::ResidualAddCaptureTarget;
     use inference_backend_metal::metal::Dtype;
+    use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 
     use super::*;
 
@@ -238,6 +249,47 @@ mod tests {
     }
 
     fn assert_replay_component<T: ReplayComponent>() {}
+
+    #[test]
+    fn test_gdn_key_uses_capacities_and_topology() {
+        let topology = GDNReplayTopology {
+            materialize_candidate_states: true,
+            qkvabz_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+        };
+        let base = Qwen35MainGDNReplayKey::new(GDNReplayShape::new(1, 2, 3, 4), topology);
+        assert_eq!(
+            base,
+            Qwen35MainGDNReplayKey::new(GDNReplayShape::new(2, 2, 4, 4), topology)
+        );
+        assert_ne!(
+            base,
+            Qwen35MainGDNReplayKey::new(GDNReplayShape::new(2, 4, 4, 4), topology)
+        );
+        assert_ne!(
+            base,
+            Qwen35MainGDNReplayKey::new(GDNReplayShape::new(1, 2, 3, 6), topology)
+        );
+        for different in [
+            GDNReplayTopology {
+                materialize_candidate_states: false,
+                ..topology
+            },
+            GDNReplayTopology {
+                qkvabz_affine: AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+                ..topology
+            },
+            GDNReplayTopology {
+                output_affine: AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+                ..topology
+            },
+        ] {
+            assert_ne!(
+                base,
+                Qwen35MainGDNReplayKey::new(GDNReplayShape::new(1, 2, 3, 4), different)
+            );
+        }
+    }
 
     #[test]
     fn test_residual_capture_selects_only_the_configured_model_layer() {

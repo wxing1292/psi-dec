@@ -221,6 +221,7 @@ impl<'a> RealGDNFixture<'a> {
                 },
                 materialize_candidate_states: false,
                 weights: weights.as_borrowed(),
+                replay_mode: inference_executor_metal::attn::gdn::backend::GDNReplayMode::Exact,
             },
         );
         let replay = builder.build();
