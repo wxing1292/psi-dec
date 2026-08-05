@@ -390,9 +390,19 @@ An adaptive affine quantized matmul uses these ownership boundaries:
 - `AffineQuantizedMatmulConfig` contains fixed workload facts. These facts are `N`, `K`, quantization parameters, and
   data types. It does not contain `M`.
 - `AffineQuantizedMatmul` owns the candidate kernels. It selects one kernel from the runtime `M` and the fixed config.
+- `AffineQuantizedMatmul` exposes the selected `AffineQuantizedMatmulKernelKind` as a stable topology identity. It also
+  exposes the first `M` for each topology change. A replay bucket policy must use these boundaries. Model code must not
+  duplicate the selector thresholds.
 - `AffineQuantizedMatmulKernel` owns one compiled specialization. Its `AffineQuantizedMatmulKernelKind` fixes the
   QMV or QMM family and its tile dimensions.
-- `AffineQuantizedMatmulInvocation` contains the runtime `M`, buffers, and byte offsets.
+- An exact `AffineQuantizedMatmulInvocation` contains one fixed `M`, buffers, and byte offsets.
+- A bucketed `AffineQuantizedMatmulInvocation` contains `num_total_rows` and a `u32` replay parameter key for
+  `num_active_rows`. Kernel selection, dispatch, and buffer validation use `num_total_rows`.
+
+An inactive QMV row must return before it reads the input or writes the output. An inactive QMM row threadgroup must
+return before it derives input pointers or reaches a threadgroup barrier. The Metal entry points and replay parameter
+table use `u32` for the active row count. The backend rejects total row counts above the positive `i32` range because
+the internal MLX matrix dimensions use `int`.
 
 `AffineQuantizedMatmul` must support each combination of F32, F16, and BF16 input, scale/bias, and output data types.
 QMV BN8/BK32 and QMM BM8/BN32, BM16/BN32, and BM32/BN32 provide this complete capability set.

@@ -9,6 +9,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayParameterKey;
 use crate::operators::mlx_headers::find_mlx_metal_header_root;
 use crate::operators::mlx_headers::read_mlx_metal_header;
 
@@ -870,7 +871,8 @@ fn packed_dim(k: i32, bits: i32) -> i32 {
     total_bits / 32
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Stable identity for the kernel topology recorded by one affine invocation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AffineQuantizedMatmulKernelKind {
     QmvBn8Bk32,
     QmvQuadBn64,
@@ -918,7 +920,43 @@ impl AffineQuantizedMatmulKernel {
         assert!(m > 0);
         AffineQuantizedMatmulInvocation {
             kernel: self,
-            m,
+            num_total_rows: m as u32,
+            num_active_rows_key: None,
+            output,
+            output_offset_bytes,
+            input,
+            input_offset_bytes,
+            weight,
+            weight_offset_bytes,
+            scales,
+            scales_offset_bytes,
+            biases,
+            biases_offset_bytes,
+        }
+    }
+
+    /// Records a fixed-capacity grid whose active row count is supplied at submission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        num_total_rows: u32,
+        num_active_rows_key: ReplayParameterKey,
+        output: &'a Buffer,
+        output_offset_bytes: usize,
+        input: &'a Buffer,
+        input_offset_bytes: usize,
+        weight: &'a Buffer,
+        weight_offset_bytes: usize,
+        scales: &'a Buffer,
+        scales_offset_bytes: usize,
+        biases: &'a Buffer,
+        biases_offset_bytes: usize,
+    ) -> AffineQuantizedMatmulInvocation<'a> {
+        validate_num_total_rows(num_total_rows);
+        AffineQuantizedMatmulInvocation {
+            kernel: self,
+            num_total_rows,
+            num_active_rows_key: Some(num_active_rows_key),
             output,
             output_offset_bytes,
             input,
@@ -984,8 +1022,63 @@ impl AffineQuantizedMatmul {
         )
     }
 
+    /// Records a fixed-capacity grid whose active row count is supplied at submission.
+    ///
+    /// Kernel selection and dispatch use `num_total_rows`. Callers must prevent a
+    /// replay bucket from crossing a value returned by [`Self::topology_boundaries`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        num_total_rows: u32,
+        num_active_rows_key: ReplayParameterKey,
+        output: &'a Buffer,
+        output_offset_bytes: usize,
+        input: &'a Buffer,
+        input_offset_bytes: usize,
+        weight: &'a Buffer,
+        weight_offset_bytes: usize,
+        scales: &'a Buffer,
+        scales_offset_bytes: usize,
+        biases: &'a Buffer,
+        biases_offset_bytes: usize,
+    ) -> AffineQuantizedMatmulInvocation<'a> {
+        self.kernel_for_topology(self.topology(num_total_rows)).invoke_bucketed(
+            num_total_rows,
+            num_active_rows_key,
+            output,
+            output_offset_bytes,
+            input,
+            input_offset_bytes,
+            weight,
+            weight_offset_bytes,
+            scales,
+            scales_offset_bytes,
+            biases,
+            biases_offset_bytes,
+        )
+    }
+
+    /// Returns the recorded kernel topology for one total row count.
+    pub fn topology(&self, num_total_rows: u32) -> AffineQuantizedMatmulKernelKind {
+        validate_num_total_rows(num_total_rows);
+        select_kernel_kind(
+            self.config,
+            i32::try_from(num_total_rows).expect("affine total row count must fit i32"),
+        )
+    }
+
+    /// Returns the first row count for each change in recorded kernel topology.
+    pub fn topology_boundaries(&self) -> Box<[u32]> {
+        adaptive_topology_boundaries(self.config)
+    }
+
     pub fn selected_kernel(&self, m: i32) -> &AffineQuantizedMatmulKernel {
-        match select_kernel_kind(self.config, m) {
+        assert!(m > 0);
+        self.kernel_for_topology(select_kernel_kind(self.config, m))
+    }
+
+    fn kernel_for_topology(&self, topology: AffineQuantizedMatmulKernelKind) -> &AffineQuantizedMatmulKernel {
+        match topology {
             AffineQuantizedMatmulKernelKind::QmvBn8Bk32 | AffineQuantizedMatmulKernelKind::QmvQuadBn64 => &self.qmv,
             AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => &self.qmm_bm8_bn32,
             AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => &self.qmm_bm16_bn32,
@@ -996,7 +1089,8 @@ impl AffineQuantizedMatmul {
 
 pub struct AffineQuantizedMatmulInvocation<'a> {
     kernel: &'a AffineQuantizedMatmulKernel,
-    m: i32,
+    num_total_rows: u32,
+    num_active_rows_key: Option<ReplayParameterKey>,
     output: &'a Buffer,
     output_offset_bytes: usize,
     input: &'a Buffer,
@@ -1023,10 +1117,11 @@ impl Operator for AffineQuantizedMatmulInvocation<'_> {
         let biases = self.biases;
         let biases_offset_bytes = self.biases_offset_bytes;
         let config = kernel.config;
-        let m = self.m;
+        let num_total_rows = self.num_total_rows;
+        let num_total_rows_i32 = i32::try_from(num_total_rows).expect("affine total row count must fit i32");
         validate_buffer_ranges(
             config,
-            m,
+            num_total_rows_i32,
             output,
             output_offset_bytes,
             input,
@@ -1047,68 +1142,73 @@ impl Operator for AffineQuantizedMatmulInvocation<'_> {
         builder.set_buffer_write(4, output, output_offset_bytes);
         builder.set_i32(5, config.k);
         builder.set_i32(6, config.n);
+        record_num_active_rows(builder, 7, num_total_rows, self.num_active_rows_key);
 
         match kernel.kind {
             AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => {
-                builder.set_i32(7, m);
-                set_non_batched_qmm_metadata(builder);
                 builder.dispatch_threadblocks(
-                    (ceil_div_i32(config.n, 32) as usize, ceil_div_i32(m, 8) as usize, 1),
+                    (
+                        ceil_div_i32(config.n, 32) as usize,
+                        ceil_div_i32(num_total_rows_i32, 8) as usize,
+                        1,
+                    ),
                     (32, 2, 1),
                 );
             },
             AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => {
-                builder.set_i32(7, m);
-                set_non_batched_qmm_metadata(builder);
                 builder.dispatch_threadblocks(
-                    (ceil_div_i32(config.n, 32) as usize, ceil_div_i32(m, 16) as usize, 1),
+                    (
+                        ceil_div_i32(config.n, 32) as usize,
+                        ceil_div_i32(num_total_rows_i32, 16) as usize,
+                        1,
+                    ),
                     (32, 2, 1),
                 );
             },
             AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => {
-                builder.set_i32(7, m);
-                set_non_batched_qmm_metadata(builder);
                 builder.dispatch_threadblocks(
-                    (ceil_div_i32(config.n, 32) as usize, ceil_div_i32(m, 32) as usize, 1),
+                    (
+                        ceil_div_i32(config.n, 32) as usize,
+                        ceil_div_i32(num_total_rows_i32, 32) as usize,
+                        1,
+                    ),
                     (32, 2, 2),
                 );
             },
             AffineQuantizedMatmulKernelKind::QmvQuadBn64 => {
-                set_non_batched_qmv_metadata(builder);
-                builder.dispatch_threadblocks((m as usize, ceil_div_i32(config.n, 64) as usize, 1), (32, 1, 1));
+                builder.dispatch_threadblocks(
+                    (num_total_rows as usize, ceil_div_i32(config.n, 64) as usize, 1),
+                    (32, 1, 1),
+                );
             },
             AffineQuantizedMatmulKernelKind::QmvBn8Bk32 => {
-                set_non_batched_qmv_metadata(builder);
-                builder.dispatch_threadblocks((m as usize, ceil_div_i32(config.n, 8) as usize, 1), (32, 2, 1));
+                builder.dispatch_threadblocks(
+                    (num_total_rows as usize, ceil_div_i32(config.n, 8) as usize, 1),
+                    (32, 2, 1),
+                );
             },
         }
     }
 }
 
-fn set_non_batched_qmv_metadata(builder: &CommandRecorder) {
-    const DUMMY_SHAPE: [i32; 1] = [0];
-    const DUMMY_STRIDES: [i64; 1] = [0];
-    builder.set_i32(7, 0);
-    builder.set_i32_slice(8, &DUMMY_SHAPE);
-    builder.set_i64_slice(9, &DUMMY_STRIDES);
-    builder.set_i32(10, 0);
-    builder.set_i32_slice(11, &DUMMY_SHAPE);
-    builder.set_i64_slice(12, &DUMMY_STRIDES);
-    builder.set_i64_slice(13, &DUMMY_STRIDES);
-    builder.set_i64_slice(14, &DUMMY_STRIDES);
+fn record_num_active_rows(
+    builder: &CommandRecorder,
+    binding_index: usize,
+    num_total_rows: u32,
+    key: Option<ReplayParameterKey>,
+) {
+    match key {
+        Some(key) => builder.bind_u32(binding_index, key, 1, num_total_rows),
+        None => builder.set_u32(binding_index, num_total_rows),
+    }
 }
 
-fn set_non_batched_qmm_metadata(builder: &CommandRecorder) {
-    const DUMMY_SHAPE: [i32; 1] = [0];
-    const DUMMY_STRIDES: [i64; 1] = [0];
-    builder.set_i32(8, 0);
-    builder.set_i32_slice(9, &DUMMY_SHAPE);
-    builder.set_i64_slice(10, &DUMMY_STRIDES);
-    builder.set_i32(11, 0);
-    builder.set_i32_slice(12, &DUMMY_SHAPE);
-    builder.set_i64_slice(13, &DUMMY_STRIDES);
-    builder.set_i64_slice(14, &DUMMY_STRIDES);
-    builder.set_i64_slice(15, &DUMMY_STRIDES);
+fn validate_num_total_rows(num_total_rows: u32) {
+    assert!(num_total_rows > 0, "affine total row count must be positive");
+    assert!(
+        i32::try_from(num_total_rows).is_ok(),
+        "affine total row count must fit i32"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1219,12 +1319,12 @@ fn affine_qmm_bn32_source(config: AffineQuantizedMatmulConfig, bm: usize) -> (St
         let type_string = metal_type_string(config.input_dtype);
         let aligned = config.n % 32 == 0;
         let kernel_name = format!(
-            "qmm_t_{type_string}_gs_{}_b_{}_alN_{}_batch_0",
+            "psi_dec_qmm_t_{type_string}_gs_{}_b_{}_alN_{}_batch_0",
             config.group_size, config.bits, aligned
         );
         let template_definition = template_definition(
             &kernel_name,
-            "qmm_t",
+            "psi_dec_qmm_t",
             &[
                 type_string.to_string(),
                 config.group_size.to_string(),
@@ -1233,7 +1333,10 @@ fn affine_qmm_bn32_source(config: AffineQuantizedMatmulConfig, bm: usize) -> (St
                 "false".to_string(),
             ],
         );
-        return (kernel_name, affine_quantized_source(&template_definition));
+        return (
+            kernel_name,
+            affine_quantized_source(&format!("{GUARDED_AFFINE_SOURCE}\n{template_definition}")),
+        );
     }
 
     let type_string = metal_type_string(config.input_dtype);
@@ -1289,7 +1392,7 @@ fn affine_qmv_bn8_bk32_source(config: AffineQuantizedMatmulConfig) -> (String, S
 
     let type_string = metal_type_string(config.input_dtype);
     let fast = config.n % 8 == 0 && config.k % 512 == 0;
-    let function_name = if fast { "qmv_fast" } else { "qmv" };
+    let function_name = if fast { "psi_dec_qmv_fast" } else { "psi_dec_qmv" };
     let kernel_name = format!(
         "{function_name}_{type_string}_gs_{}_b_{}_batch_0",
         config.group_size, config.bits
@@ -1304,18 +1407,21 @@ fn affine_qmv_bn8_bk32_source(config: AffineQuantizedMatmulConfig) -> (String, S
             "false".to_string(),
         ],
     );
-    (kernel_name, affine_quantized_source(&template_definition))
+    (
+        kernel_name,
+        affine_quantized_source(&format!("{GUARDED_AFFINE_SOURCE}\n{template_definition}")),
+    )
 }
 
 fn affine_qmv_quad_bn64_source(config: AffineQuantizedMatmulConfig) -> (String, String) {
     let type_string = metal_type_string(config.input_dtype);
     let kernel_name = format!(
-        "qmv_quad_{type_string}_gs_{}_b_{}_d_{}_batch_0",
+        "psi_dec_qmv_quad_{type_string}_gs_{}_b_{}_d_{}_batch_0",
         config.group_size, config.bits, config.k
     );
     let template_definition = template_definition(
         &kernel_name,
-        "qmv_quad",
+        "psi_dec_qmv_quad",
         &[
             type_string.to_string(),
             config.group_size.to_string(),
@@ -1324,7 +1430,10 @@ fn affine_qmv_quad_bn64_source(config: AffineQuantizedMatmulConfig) -> (String, 
             "false".to_string(),
         ],
     );
-    (kernel_name, affine_quantized_source(&template_definition))
+    (
+        kernel_name,
+        affine_quantized_source(&format!("{GUARDED_AFFINE_SOURCE}\n{template_definition}")),
+    )
 }
 
 fn ceil_div_i32(value: i32, divisor: i32) -> i32 {
@@ -1357,14 +1466,36 @@ fn adaptive_qmv_batch_limit(config: AffineQuantizedMatmulConfig) -> i32 {
     }
 }
 
+const QMM_BM8_MAX_ROWS: i32 = 8;
+const QMM_BM16_MAX_ROWS: i32 = 16;
+
+fn adaptive_topology_boundaries(config: AffineQuantizedMatmulConfig) -> Box<[u32]> {
+    let mut candidates = [
+        adaptive_qmv_batch_limit(config),
+        QMM_BM8_MAX_ROWS + 1,
+        QMM_BM16_MAX_ROWS + 1,
+    ];
+    candidates.sort_unstable();
+    let mut boundaries = Vec::with_capacity(candidates.len());
+    for boundary in candidates {
+        if boundary > 1 && select_kernel_kind(config, boundary - 1) != select_kernel_kind(config, boundary) {
+            let boundary = u32::try_from(boundary).expect("affine topology boundary must fit u32");
+            if boundaries.last() != Some(&boundary) {
+                boundaries.push(boundary);
+            }
+        }
+    }
+    boundaries.into_boxed_slice()
+}
+
 fn select_kernel_kind(config: AffineQuantizedMatmulConfig, m: i32) -> AffineQuantizedMatmulKernelKind {
     config.validate();
     assert!(m > 0);
     if m < adaptive_qmv_batch_limit(config) {
         select_qmv_kernel_kind(config)
-    } else if config.n < 65_536 && (config.n > 4096 || config.k > 4096) && m <= 8 {
+    } else if config.n < 65_536 && (config.n > 4096 || config.k > 4096) && m <= QMM_BM8_MAX_ROWS {
         AffineQuantizedMatmulKernelKind::QmmBm8Bn32
-    } else if m <= 16 {
+    } else if m <= QMM_BM16_MAX_ROWS {
         AffineQuantizedMatmulKernelKind::QmmBm16Bn32
     } else {
         AffineQuantizedMatmulKernelKind::QmmBm32Bn32
@@ -1490,6 +1621,8 @@ const QMM_BM8_BM16_BN32_SOURCE: &str = include_str!("metal/affine_quantized_qmm_
 
 const MIXED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_mixed_qmv_qmm.metal");
 
+const GUARDED_AFFINE_SOURCE: &str = include_str!("metal/affine_quantized_guarded_qmv_qmm.metal");
+
 const GATE_UP_SWIGLU_SOURCE: &str = include_str!("metal/affine_quantized_gate_up_swiglu_qmv_qmm.metal");
 
 fn mlx_metal_header_root() -> PathBuf {
@@ -1505,16 +1638,23 @@ fn has_compatible_quantized_headers(root: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(quantized) else {
         return false;
     };
-    content.contains("[[kernel]] void qmv_quad(") && content.contains("[[kernel]] void qmm_t(")
+    content.contains("METAL_FUNC void qmv_quad_impl(")
+        && content.contains("METAL_FUNC void qmv_fast_impl(")
+        && content.contains("METAL_FUNC void qmv_impl(")
+        && content.contains("METAL_FUNC void qmm_t_impl(")
 }
 
 #[cfg(test)]
 mod tests {
     use half::bf16;
     use half::f16;
+    use inference_executor_core::replay::ReplayBucketPolicy;
 
     use super::*;
+    use crate::metal::ReplayArguments;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.affine.num_active_rows");
 
     fn adaptive_config(n: i32, k: i32, dtype: Dtype) -> AffineQuantizedMatmulConfig {
         AffineQuantizedMatmulConfig::same_dtype(n, k, 64, 4, dtype)
@@ -1599,6 +1739,228 @@ mod tests {
             select_kernel_kind(common_projection, 18),
             AffineQuantizedMatmulKernelKind::QmmBm32Bn32
         );
+    }
+
+    #[test]
+    fn test_adaptive_topology_boundaries_follow_selector() {
+        let cases = [
+            (adaptive_config(151_936, 2048, Dtype::Bfloat16), &[5, 17][..]),
+            (adaptive_config(151_936, 5120, Dtype::Bfloat16), &[6, 17][..]),
+            (adaptive_config(34_816, 5120, Dtype::Bfloat16), &[6, 9, 17][..]),
+            (adaptive_config(4096, 4096, Dtype::Bfloat16), &[12, 17][..]),
+            (adaptive_config(1024, 2048, Dtype::Bfloat16), &[18][..]),
+        ];
+
+        for (config, expected) in cases {
+            assert_eq!(&*adaptive_topology_boundaries(config), expected, "config={config:?}");
+
+            let boundaries = adaptive_topology_boundaries(config);
+            let policy = ReplayBucketPolicy::with_topology_boundaries(64, &boundaries);
+            for num_active_rows in 1..=64 {
+                let num_total_rows = policy.capacity(num_active_rows);
+                assert_eq!(
+                    select_kernel_kind(config, num_active_rows as i32),
+                    select_kernel_kind(config, num_total_rows as i32),
+                    "config={config:?} num_active_rows={num_active_rows} num_total_rows={num_total_rows}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bucketed_qmv_variants_match_exact_and_preserve_tail() {
+        let same_qmv = AffineQuantizedMatmulConfig::same_dtype(4, 32, 32, 8, Dtype::Float32);
+        let same_qmv_fast = AffineQuantizedMatmulConfig::same_dtype(8, 512, 64, 8, Dtype::Float32);
+        let same_qmv_quad = AffineQuantizedMatmulConfig::same_dtype(9, 64, 64, 8, Dtype::Float32);
+        let mixed_qmv = AffineQuantizedMatmulConfig {
+            n: 4,
+            k: 32,
+            group_size: 32,
+            bits: 8,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Float32,
+        };
+        let mixed_qmv_fast = AffineQuantizedMatmulConfig {
+            n: 8,
+            k: 512,
+            group_size: 64,
+            bits: 8,
+            input_dtype: Dtype::Float16,
+            output_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Float32,
+        };
+
+        for (config, kind) in [
+            (same_qmv, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
+            (same_qmv_fast, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
+            (same_qmv_quad, AffineQuantizedMatmulKernelKind::QmvQuadBn64),
+            (mixed_qmv, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
+            (mixed_qmv_fast, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
+        ] {
+            assert_bucketed_parity_and_canary(config, kind, 4, 3);
+        }
+    }
+
+    #[test]
+    fn test_bucketed_qmm_variants_match_exact_and_preserve_tail() {
+        let same = AffineQuantizedMatmulConfig::same_dtype(32, 32, 32, 8, Dtype::Float32);
+        let same_unaligned = AffineQuantizedMatmulConfig::same_dtype(1, 32, 32, 8, Dtype::Float32);
+        let same_q4_bf16 = AffineQuantizedMatmulConfig::same_dtype(32, 64, 64, 4, Dtype::Bfloat16);
+        let mixed_unaligned = AffineQuantizedMatmulConfig {
+            n: 3,
+            k: 32,
+            group_size: 32,
+            bits: 8,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Float32,
+        };
+
+        for (config, kind, num_total_rows, num_active_rows) in [
+            (same, AffineQuantizedMatmulKernelKind::QmmBm8Bn32, 16, 5),
+            (same, AffineQuantizedMatmulKernelKind::QmmBm16Bn32, 32, 9),
+            (same, AffineQuantizedMatmulKernelKind::QmmBm32Bn32, 64, 17),
+            (same_q4_bf16, AffineQuantizedMatmulKernelKind::QmmBm16Bn32, 32, 9),
+            (same_unaligned, AffineQuantizedMatmulKernelKind::QmmBm32Bn32, 64, 17),
+            (mixed_unaligned, AffineQuantizedMatmulKernelKind::QmmBm8Bn32, 16, 5),
+            (mixed_unaligned, AffineQuantizedMatmulKernelKind::QmmBm16Bn32, 32, 9),
+            (mixed_unaligned, AffineQuantizedMatmulKernelKind::QmmBm32Bn32, 64, 17),
+        ] {
+            assert_bucketed_parity_and_canary(config, kind, num_total_rows, num_active_rows);
+        }
+    }
+
+    fn assert_bucketed_parity_and_canary(
+        config: AffineQuantizedMatmulConfig,
+        kind: AffineQuantizedMatmulKernelKind,
+        num_total_rows: i32,
+        num_active_rows: i32,
+    ) {
+        assert!(matches!(config.bits, 4 | 8));
+        assert!(num_active_rows < num_total_rows);
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let input_source = fixture_values(num_total_rows as usize * config.k as usize, 0.00390625);
+        let input_values = round_values_to_dtype(&input_source, config.input_dtype);
+        let num_weight_values = config.n as usize * config.k as usize;
+        let weight_values = if config.bits == 4 {
+            fixture_q4_values(num_weight_values)
+        } else {
+            fixture_weight_bytes(num_weight_values)
+        };
+        let num_affine_values = config.n as usize * (config.k / config.group_size) as usize;
+        let scales = round_values_to_dtype(&fixture_values(num_affine_values, 0.001953125), config.scale_bias_dtype);
+        let biases = round_values_to_dtype(
+            &fixture_values(num_affine_values, -0.0009765625),
+            config.scale_bias_dtype,
+        );
+        let input = buffer_from_f32(&device, &input_values, config.input_dtype);
+        let weight = if config.bits == 4 {
+            Buffer::from_slice(&device, &pack_q4(&weight_values))
+        } else {
+            Buffer::from_slice(&device, &weight_values)
+        };
+        let scales_buffer = buffer_from_f32(&device, &scales, config.scale_bias_dtype);
+        let biases_buffer = buffer_from_f32(&device, &biases, config.scale_bias_dtype);
+        let sentinel = round_values_to_dtype(&[-123.0], config.output_dtype)[0];
+        let bucketed_output = buffer_from_f32(
+            &device,
+            &vec![sentinel; num_total_rows as usize * config.n as usize],
+            config.output_dtype,
+        );
+        let exact_output = Buffer::new_zeroed(&device, config.output_bytes(num_active_rows));
+        let kernel = AffineQuantizedMatmulKernel::new(&device, config, kind);
+
+        let mut exact_builder = stream.create_replay_program();
+        exact_builder.record(kernel.invoke(
+            num_active_rows,
+            &exact_output,
+            0,
+            &input,
+            0,
+            &weight,
+            0,
+            &scales_buffer,
+            0,
+            &biases_buffer,
+            0,
+        ));
+        let exact_replay = exact_builder.build();
+        stream.submit_replay(&exact_replay).wait();
+
+        let mut bucketed_builder = stream.create_replay_program();
+        bucketed_builder.record(kernel.invoke_bucketed(
+            num_total_rows as u32,
+            NUM_ACTIVE_ROWS,
+            &bucketed_output,
+            0,
+            &input,
+            0,
+            &weight,
+            0,
+            &scales_buffer,
+            0,
+            &biases_buffer,
+            0,
+        ));
+        let bucketed_replay = bucketed_builder.build();
+        assert_eq!(bucketed_replay.stats().parameter_count, 1);
+        stream
+            .submit_replay_with_arguments(
+                &bucketed_replay,
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
+            )
+            .wait();
+
+        let num_active_values = num_active_rows as usize * config.n as usize;
+        let num_total_values = num_total_rows as usize * config.n as usize;
+        let tolerance = output_tolerance(config.output_dtype);
+        let exact = read_f32(&exact_output, num_active_values, config.output_dtype);
+        let bucketed = read_f32(&bucketed_output, num_active_values, config.output_dtype);
+        assert_close_case(&bucketed, &exact, tolerance, config, kind);
+        let bucketed_values = read_f32(&bucketed_output, num_total_values, config.output_dtype);
+        assert_eq!(
+            &bucketed_values[num_active_values..],
+            vec![sentinel; num_total_values - num_active_values],
+            "bucketed affine wrote inactive output rows: config={config:?} kind={kind:?}"
+        );
+
+        stream
+            .submit_replay_with_arguments(
+                &bucketed_replay,
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_total_rows as u32),
+            )
+            .wait();
+        let expected = round_values_to_dtype(
+            &cpu_affine_reference(config, num_total_rows, &input_values, &weight_values, &scales, &biases),
+            config.output_dtype,
+        );
+        let actual = read_f32(&bucketed_output, num_total_values, config.output_dtype);
+        assert_close_case(&actual, &expected, tolerance, config, kind);
+
+        stream
+            .submit_replay_with_arguments(
+                &bucketed_replay,
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
+            )
+            .wait();
+        let shrunk = read_f32(&bucketed_output, num_total_values, config.output_dtype);
+        assert_close_case(&shrunk[..num_active_values], &exact, tolerance, config, kind);
+        assert_eq!(
+            &shrunk[num_active_values..],
+            &actual[num_active_values..],
+            "bucketed affine rewrote rows after the active prefix: config={config:?} kind={kind:?}"
+        );
+    }
+
+    fn output_tolerance(dtype: Dtype) -> f32 {
+        match dtype {
+            Dtype::Float32 => 1.0e-3,
+            Dtype::Float16 => 0.02,
+            Dtype::Bfloat16 => 0.125,
+            _ => unreachable!(),
+        }
     }
 
     fn execute_matmul(stream: &Stream, invocation: AffineQuantizedMatmulInvocation<'_>) {

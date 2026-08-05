@@ -7,25 +7,13 @@ template <typename InT, typename ParamT, typename OutT, int group_size, int bits
     device OutT* y [[buffer(4)]],
     const constant int& in_vec_size [[buffer(5)]],
     const constant int& out_vec_size [[buffer(6)]],
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
+    const constant uint& num_active_rows [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  (void)b_strides;
+  if (tid.x >= num_active_rows) {
+    return;
+  }
 
   constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
@@ -90,25 +78,13 @@ template <typename InT, typename ParamT, typename OutT, int group_size, int bits
     device OutT* y [[buffer(4)]],
     const constant int& in_vec_size [[buffer(5)]],
     const constant int& out_vec_size [[buffer(6)]],
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
+    const constant uint& num_active_rows [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  (void)b_strides;
+  if (tid.x >= num_active_rows) {
+    return;
+  }
 
   constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
   constexpr int num_simdgroups = 2;
@@ -415,7 +391,7 @@ METAL_FUNC void mixed_qmm_t_impl(
     threadgroup float* Ws,
     const constant int& K,
     const constant int& N,
-    const constant int& M,
+    const int M,
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -539,27 +515,14 @@ template <
     device OutT* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
-    const constant int& M [[buffer(7)]],
-    const constant int& x_batch_ndims [[buffer(8)]],
-    const constant int* x_shape [[buffer(9)]],
-    const constant int64_t* x_strides [[buffer(10)]],
-    const constant int& w_batch_ndims [[buffer(11)]],
-    const constant int* w_shape [[buffer(12)]],
-    const constant int64_t* w_strides [[buffer(13)]],
-    const constant int64_t* s_strides [[buffer(14)]],
-    const constant int64_t* b_strides [[buffer(15)]],
+    const constant uint& num_active_rows [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  (void)b_strides;
+  if (tid.y * BM >= num_active_rows) {
+    return;
+  }
 
   constexpr int BK_padded = (BK + 16 / sizeof(float));
 
@@ -567,5 +530,18 @@ template <
   threadgroup float Ws[BN * BK_padded];
 
   mixed_qmm_t_impl<InT, ParamT, OutT, group_size, bits, aligned_N, BM, BK, BN>(
-      w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      static_cast<int>(num_active_rows),
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
 }

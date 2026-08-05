@@ -7,26 +7,13 @@ template <typename T, const int group_size, const int bits, const bool aligned_N
     device T* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
-    const constant int& M [[buffer(7)]],
-    const constant int& x_batch_ndims [[buffer(8)]],
-    const constant int* x_shape [[buffer(9)]],
-    const constant int64_t* x_strides [[buffer(10)]],
-    const constant int& w_batch_ndims [[buffer(11)]],
-    const constant int* w_shape [[buffer(12)]],
-    const constant int64_t* w_strides [[buffer(13)]],
-    const constant int64_t* s_strides [[buffer(14)]],
-    const constant int64_t* b_strides [[buffer(15)]],
+    const constant uint& num_active_rows [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  (void)b_strides;
+  if (tid.y * BM >= num_active_rows) {
+    return;
+  }
 
   constexpr int BK = 32;
   constexpr int BN = 32;
@@ -62,7 +49,7 @@ template <typename T, const int group_size, const int bits, const bool aligned_N
   biases += y_col * K_g;
   y += y_row * static_cast<int64_t>(N) + y_col;
 
-  const short num_els = min(BM, M - y_row);
+  const short num_els = min(BM, static_cast<int>(num_active_rows) - y_row);
   const short num_outs = min(BN, N - y_col);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
