@@ -195,7 +195,7 @@ This contract aligns replay resource dependencies with the data flow.
 The routing kernel renormalizes selected probabilities only when `norm_topk_prob=true`.
 `expert_indices` and `expert_probs` are route-major with `num_tokens * num_experts_per_token` entries.
 
-The full `GatedMoE` replay shape contract is exact for the current microbatch:
+`ReplayLayer::record(...)` keeps the exact `GatedMoE` replay shape contract for the current microbatch:
 
 ```text
 num_tokens              current microbatch token count
@@ -203,7 +203,53 @@ num_routes              num_tokens * num_experts_per_token
 compute path            selected from num_tokens
 ```
 
-The backend also has a routing-only bucket-readiness API.
+The backend also has an additive full-MoE bucketed replay API:
+
+```text
+GatedMoEBucketedReplayInput
+  num_total_tokens       fixed recorded token capacity
+  num_active_tokens_key  caller-owned ReplayParameterKey
+  hidden_state           &Buffer
+  next_hidden_state      &Buffer
+  scratch                MoEScratchBindings
+  weights                GatedMoEWeights
+  shared_experts         optional GatedMoESharedExpertsReplayInput
+```
+
+`GatedMoE::record_bucketed(...)` selects the token-major or expert-major path from `num_total_tokens`.
+It records all dispatch grids and validates all buffers at this total capacity.
+The caller supplies `num_active_tokens` at submission.
+The value must be in `[1, num_total_tokens]`.
+
+The routing, sparse MLP, expert-major, combine, optional shared dense MLP, and optional shared-gate commands use
+one caller-owned replay parameter key.
+They use the same type and the same domain.
+The replay therefore declares one parameter.
+No component declares a separate active-route parameter.
+Each route-based command derives
+`num_active_routes = num_active_tokens * num_experts_per_token` from the active token count and fixed top-k value.
+
+The fixed total token count determines the full command topology.
+The active token count does not select a compute path or affine kernel.
+`GatedMoEReplayTopology` identifies the selected compute path, router affine topology, optional shared-gate affine
+topology, and optional shared dense MLP gate-up/down topology.
+`GatedMoE::replay_topology_boundaries()` returns the union of:
+
+- the token-major/expert-major boundary at token count `5`;
+- router affine boundaries;
+- optional shared-gate affine boundaries; and
+- optional shared dense MLP gate-up/down affine boundaries.
+
+A caller must construct `ReplayBucketPolicy` with these boundaries.
+The policy must not pad an active token count across a topology boundary.
+Sparse MLP, expert-major layout/pack/scatter, and combine keep one topology inside their selected path and add no
+token-count boundary.
+
+The exact `ReplayLayer::record(...)` path remains unchanged and declares zero replay parameters.
+The additive `record_bucketed(...)` path returns `next_hidden_state` and declares one replay parameter.
+The Qwen layer and replay cache do not yet call this full bucketed API.
+
+The backend retains a routing-only bucket-readiness API.
 This API records this chain:
 
 ```text
@@ -229,11 +275,8 @@ reaches a threadgroup barrier.
 It does not add the full MoE token-major/expert-major boundary at token count `5`.
 An affine topology change can independently occur at token count `5`.
 
-The routing-only API does not enable bucketed replay through `ReplayLayer`.
-The full `GatedMoE` replay remains exact.
-A future full-MoE bucket policy must include the compute-path boundary at token count `5`.
-It must also include all topology boundaries from sparse MLP, expert-major layout/pack/scatter, combine, shared
-experts, and shared-expert gate components.
+The routing-only API does not change the exact `ReplayLayer` contract.
+The full bucketed composition also uses this routing chain with the same active-token key.
 
 The ragged expert-major layout, pack, and scatter leaf also has additive bucket-readiness APIs:
 
@@ -265,7 +308,7 @@ One composite bucketed expert-major replay declares one replay parameter.
 These kernels do not change topology with token count.
 They add no token-count boundary to a composite policy.
 The full MoE owner must still keep the token-major/expert-major path boundary at token count `5`.
-These leaf APIs do not enable bucketed full `GatedMoE` replay.
+The full bucketed `GatedMoE` replay composes these leaf APIs on the expert-major path.
 
 The backend sparse MLP leaf also has additive bucket-readiness APIs:
 
@@ -292,7 +335,8 @@ Each bucketed sparse MLP replay declares one replay parameter.
 Route count does not select a different sparse MLP kernel in either explicit path.
 The two explicit paths have different command topology.
 The full MoE owner must keep the token-major/expert-major path boundary at token count `5` in its composite policy.
-The sparse leaf does not select the path and does not enable bucketed full `GatedMoE` replay.
+The sparse leaf does not select the path.
+The full bucketed `GatedMoE` replay composes the selected leaf path.
 
 The token-major combine leaf also has additive bucket-readiness APIs:
 
@@ -314,14 +358,15 @@ The exact combine APIs remain unchanged and declare zero replay parameters.
 Each bucketed combine replay declares one replay parameter.
 The combine kernels do not change topology with token count, so they add no token-count boundary to a composite
 policy.
-These leaf APIs do not enable bucketed full `GatedMoE` replay.
+The full bucketed `GatedMoE` replay composes these leaf APIs on the token-major path.
 
 The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
 `MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
 
 Production callers may allocate scratch with the executor's maximum token capacity.
-Each replay invocation selects `GatedMoEComputePath` from the current `num_tokens`.
-It validates that capacity buffers cover the current route, input, and output shapes.
+An exact replay selects `GatedMoEComputePath` from the current `num_tokens`.
+A bucketed replay selects it from `num_total_tokens`.
+Each path validates that buffers cover its recorded total route, input, scratch, and output shapes.
 The token-major path consumes `token_indices` and `route_indices` directly.
 
 The expert-major path builds compact expert-grouped routes and packs hidden rows.
