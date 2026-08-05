@@ -387,6 +387,15 @@ It binds the caller-provided active-token key with the range `1..=capacity`.
 The kernel checks the active token count before it reads `token_ids` or writes the output row.
 The current Qwen MainEmbed and MTPEmbed stages still select exact recording.
 
+The shared row-gather leaf supports exact and bucketed recording.
+Exact recording fixes the active row count to `RowGatherShape::num_rows` and declares no replay parameter.
+Bucketed recording interprets `RowGatherShape::num_rows` as the recorded capacity.
+It validates the row-index and output buffers and dispatches the grid for that capacity.
+It binds the caller-provided active-row key with the range `1..=capacity`.
+The kernel checks the active row count before it reads an inactive row index or input value and before it writes an
+inactive output value.
+The current Qwen compositions still select exact row-gather recording.
+
 Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed.
 Its Main key owns only the token count and GQA replay topology.
 It never aliases a Qwen3.5 key or stores an optional GDN key.
