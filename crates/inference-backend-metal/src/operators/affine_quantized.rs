@@ -213,24 +213,77 @@ impl RaggedExpertMajorAffineQuantizedShape {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ExpertAffineBucketedRoutes {
+    num_total_tokens: u32,
+    num_experts_per_token: u32,
+    num_active_tokens_key: ReplayParameterKey,
+}
+
+impl ExpertAffineBucketedRoutes {
+    fn new(
+        config: ExpertAffineQuantizedConfig,
+        num_total_routes: i32,
+        num_total_tokens: u32,
+        num_experts_per_token: u32,
+        num_active_tokens_key: ReplayParameterKey,
+    ) -> Self {
+        config.validate();
+        assert!(num_total_tokens > 0);
+        assert!(num_experts_per_token > 0);
+        assert!(
+            num_experts_per_token <= config.num_experts as u32,
+            "expert affine routes per token must not exceed expert count"
+        );
+        let derived_num_total_routes = num_total_tokens
+            .checked_mul(num_experts_per_token)
+            .expect("expert affine total route count must fit u32");
+        assert_eq!(
+            u32::try_from(num_total_routes).expect("expert affine total route count must be positive"),
+            derived_num_total_routes,
+            "expert affine total routes must equal total tokens times experts per token"
+        );
+        i32::try_from(derived_num_total_routes).expect("expert affine total route count must fit i32");
+        Self {
+            num_total_tokens,
+            num_experts_per_token,
+            num_active_tokens_key,
+        }
+    }
+
+    fn bind(self, builder: &CommandRecorder<'_>, token_binding_index: usize, topk_binding_index: usize) {
+        builder.bind_u32(
+            token_binding_index,
+            self.num_active_tokens_key,
+            1,
+            self.num_total_tokens,
+        );
+        builder.set_u32(topk_binding_index, self.num_experts_per_token);
+    }
+}
+
 pub struct GatherAffineQuantizedMatmulKernel {
     config: ExpertAffineQuantizedConfig,
     kernel: Kernel,
+    bucketed_kernel: Kernel,
 }
 
 pub struct GatherAffineQuantizedGateUpSwiGLUKernel {
     config: ExpertAffineQuantizedConfig,
     kernel: Kernel,
+    bucketed_kernel: Kernel,
 }
 
 pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
     config: ExpertAffineQuantizedConfig,
     kernel: Kernel,
+    bucketed_kernel: Kernel,
 }
 
 pub struct RaggedExpertMajorAffineQuantizedMatmulKernel {
     config: ExpertAffineQuantizedConfig,
     kernel: Kernel,
+    bucketed_kernel: Kernel,
 }
 
 impl GatherAffineQuantizedMatmulKernel {
@@ -242,7 +295,7 @@ impl GatherAffineQuantizedMatmulKernel {
         let fast = matmul.n % bn == 0 && matmul.k % 512 == 0;
         let func = if fast { "gather_qmv_fast" } else { "gather_qmv" };
         let kernel_name = format!("{func}_{type_string}_gs_{}_b_{}", matmul.group_size, matmul.bits);
-        let template_definition = template_definition(
+        let exact_template_definition = template_definition(
             &kernel_name,
             func,
             &[
@@ -251,9 +304,30 @@ impl GatherAffineQuantizedMatmulKernel {
                 matmul.bits.to_string(),
             ],
         );
-        let source = affine_quantized_source(&template_definition);
+        let source = affine_quantized_source(&exact_template_definition);
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { config, kernel }
+        let bucketed_kernel_name = format!(
+            "token_major_down_matmul_bucketed_{type_string}_gs_{}_b_{}",
+            matmul.group_size, matmul.bits
+        );
+        let bucketed_template_definition = template_definition(
+            &bucketed_kernel_name,
+            "token_major_down_matmul_bucketed",
+            &[
+                type_string.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
+                fast.to_string(),
+            ],
+        );
+        let bucketed_source =
+            affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
+        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        Self {
+            config,
+            kernel,
+            bucketed_kernel,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -278,6 +352,44 @@ impl GatherAffineQuantizedMatmulKernel {
             biases,
             lhs_indices,
             rhs_indices,
+            bucketed_routes: None,
+        }
+    }
+
+    /// Records a fixed route-capacity grid whose active route count derives from active tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: GatherAffineQuantizedShape,
+        num_total_tokens: u32,
+        num_experts_per_token: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        output: &'a Buffer,
+        input: &'a Buffer,
+        weight: &'a Buffer,
+        scales: &'a Buffer,
+        biases: &'a Buffer,
+        lhs_indices: &'a Buffer,
+        rhs_indices: &'a Buffer,
+    ) -> GatherAffineQuantizedMatmulInvocation<'a> {
+        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+            self.config,
+            shape.num_routes,
+            num_total_tokens,
+            num_experts_per_token,
+            num_active_tokens_key,
+        );
+        GatherAffineQuantizedMatmulInvocation {
+            kernel: self,
+            shape,
+            output,
+            input,
+            weight,
+            scales,
+            biases,
+            lhs_indices,
+            rhs_indices,
+            bucketed_routes: Some(bucketed_routes),
         }
     }
 }
@@ -291,7 +403,7 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
             "token_major_gate_up_swiglu_{type_string}_gs_{}_b_{}",
             matmul.group_size, matmul.bits
         );
-        let template_definition = template_definition(
+        let exact_template_definition = template_definition(
             &kernel_name,
             "token_major_gate_up_swiglu",
             &[
@@ -300,9 +412,29 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
                 matmul.bits.to_string(),
             ],
         );
-        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{template_definition}"));
+        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { config, kernel }
+        let bucketed_kernel_name = format!(
+            "token_major_gate_up_swiglu_bucketed_{type_string}_gs_{}_b_{}",
+            matmul.group_size, matmul.bits
+        );
+        let bucketed_template_definition = template_definition(
+            &bucketed_kernel_name,
+            "token_major_gate_up_swiglu_bucketed",
+            &[
+                type_string.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
+            ],
+        );
+        let bucketed_source =
+            affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
+        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        Self {
+            config,
+            kernel,
+            bucketed_kernel,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -333,6 +465,50 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
             up_biases,
             lhs_indices,
             rhs_indices,
+            bucketed_routes: None,
+        }
+    }
+
+    /// Records a fixed route-capacity grid whose active route count derives from active tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: GatherAffineQuantizedShape,
+        num_total_tokens: u32,
+        num_experts_per_token: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        output: &'a Buffer,
+        input: &'a Buffer,
+        gate_weight: &'a Buffer,
+        gate_scales: &'a Buffer,
+        gate_biases: &'a Buffer,
+        up_weight: &'a Buffer,
+        up_scales: &'a Buffer,
+        up_biases: &'a Buffer,
+        lhs_indices: &'a Buffer,
+        rhs_indices: &'a Buffer,
+    ) -> GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
+        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+            self.config,
+            shape.num_routes,
+            num_total_tokens,
+            num_experts_per_token,
+            num_active_tokens_key,
+        );
+        GatherAffineQuantizedGateUpSwiGLUInvocation {
+            kernel: self,
+            shape,
+            output,
+            input,
+            gate_weight,
+            gate_scales,
+            gate_biases,
+            up_weight,
+            up_scales,
+            up_biases,
+            lhs_indices,
+            rhs_indices,
+            bucketed_routes: Some(bucketed_routes),
         }
     }
 }
@@ -346,7 +522,7 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
             "expert_major_gate_up_swiglu_{type_string}_gs_{}_b_{}",
             matmul.group_size, matmul.bits
         );
-        let template_definition = template_definition(
+        let exact_template_definition = template_definition(
             &kernel_name,
             "expert_major_gate_up_swiglu",
             &[
@@ -355,9 +531,29 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
                 matmul.bits.to_string(),
             ],
         );
-        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{template_definition}"));
+        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { config, kernel }
+        let bucketed_kernel_name = format!(
+            "expert_major_gate_up_swiglu_bucketed_{type_string}_gs_{}_b_{}",
+            matmul.group_size, matmul.bits
+        );
+        let bucketed_template_definition = template_definition(
+            &bucketed_kernel_name,
+            "expert_major_gate_up_swiglu_bucketed",
+            &[
+                type_string.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
+            ],
+        );
+        let bucketed_source =
+            affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
+        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        Self {
+            config,
+            kernel,
+            bucketed_kernel,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -386,6 +582,48 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
             up_scales,
             up_biases,
             experts_by_route,
+            bucketed_routes: None,
+        }
+    }
+
+    /// Records a fixed route-capacity grid whose active route count derives from active tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: RaggedExpertMajorAffineQuantizedShape,
+        num_total_tokens: u32,
+        num_experts_per_token: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        output: &'a Buffer,
+        input: &'a Buffer,
+        gate_weight: &'a Buffer,
+        gate_scales: &'a Buffer,
+        gate_biases: &'a Buffer,
+        up_weight: &'a Buffer,
+        up_scales: &'a Buffer,
+        up_biases: &'a Buffer,
+        experts_by_route: &'a Buffer,
+    ) -> RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
+        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+            self.config,
+            shape.num_routes,
+            num_total_tokens,
+            num_experts_per_token,
+            num_active_tokens_key,
+        );
+        RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation {
+            kernel: self,
+            shape,
+            output,
+            input,
+            gate_weight,
+            gate_scales,
+            gate_biases,
+            up_weight,
+            up_scales,
+            up_biases,
+            experts_by_route,
+            bucketed_routes: Some(bucketed_routes),
         }
     }
 }
@@ -399,7 +637,7 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
             "expert_major_down_matmul_{type_string}_gs_{}_b_{}",
             matmul.group_size, matmul.bits
         );
-        let template_definition = template_definition(
+        let exact_template_definition = template_definition(
             &kernel_name,
             "expert_major_down_matmul",
             &[
@@ -408,9 +646,29 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
                 matmul.bits.to_string(),
             ],
         );
-        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{template_definition}"));
+        let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
         let kernel = Kernel::new(device, &source, &kernel_name);
-        Self { config, kernel }
+        let bucketed_kernel_name = format!(
+            "expert_major_down_matmul_bucketed_{type_string}_gs_{}_b_{}",
+            matmul.group_size, matmul.bits
+        );
+        let bucketed_template_definition = template_definition(
+            &bucketed_kernel_name,
+            "expert_major_down_matmul_bucketed",
+            &[
+                type_string.to_string(),
+                matmul.group_size.to_string(),
+                matmul.bits.to_string(),
+            ],
+        );
+        let bucketed_source =
+            affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
+        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        Self {
+            config,
+            kernel,
+            bucketed_kernel,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -433,6 +691,42 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
             scales,
             biases,
             experts_by_route,
+            bucketed_routes: None,
+        }
+    }
+
+    /// Records a fixed route-capacity grid whose active route count derives from active tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: RaggedExpertMajorAffineQuantizedShape,
+        num_total_tokens: u32,
+        num_experts_per_token: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        output: &'a Buffer,
+        input: &'a Buffer,
+        weight: &'a Buffer,
+        scales: &'a Buffer,
+        biases: &'a Buffer,
+        experts_by_route: &'a Buffer,
+    ) -> RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
+        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+            self.config,
+            shape.num_routes,
+            num_total_tokens,
+            num_experts_per_token,
+            num_active_tokens_key,
+        );
+        RaggedExpertMajorAffineQuantizedMatmulInvocation {
+            kernel: self,
+            shape,
+            output,
+            input,
+            weight,
+            scales,
+            biases,
+            experts_by_route,
+            bucketed_routes: Some(bucketed_routes),
         }
     }
 }
@@ -447,6 +741,7 @@ pub struct GatherAffineQuantizedMatmulInvocation<'a> {
     biases: &'a Buffer,
     lhs_indices: &'a Buffer,
     rhs_indices: &'a Buffer,
+    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
 }
 
 pub struct GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
@@ -462,6 +757,7 @@ pub struct GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
     up_biases: &'a Buffer,
     lhs_indices: &'a Buffer,
     rhs_indices: &'a Buffer,
+    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
 }
 
 pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
@@ -476,6 +772,7 @@ pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
     up_scales: &'a Buffer,
     up_biases: &'a Buffer,
     experts_by_route: &'a Buffer,
+    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
 }
 
 pub struct RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
@@ -487,6 +784,7 @@ pub struct RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
     scales: &'a Buffer,
     biases: &'a Buffer,
     experts_by_route: &'a Buffer,
+    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
 }
 
 impl Operator for RaggedExpertMajorAffineQuantizedMatmulInvocation<'_> {
@@ -505,7 +803,11 @@ impl Operator for RaggedExpertMajorAffineQuantizedMatmulInvocation<'_> {
             self.experts_by_route,
         );
 
-        builder.set_kernel(&self.kernel.kernel);
+        let kernel = match self.bucketed_routes {
+            Some(_) => &self.kernel.bucketed_kernel,
+            None => &self.kernel.kernel,
+        };
+        builder.set_kernel(kernel);
         builder.set_buffer_read(0, self.weight, 0);
         builder.set_buffer_read(1, self.scales, 0);
         builder.set_buffer_read(2, self.biases, 0);
@@ -515,6 +817,9 @@ impl Operator for RaggedExpertMajorAffineQuantizedMatmulInvocation<'_> {
         builder.set_i32(6, matmul.k);
         builder.set_i32(7, matmul.n);
         builder.set_i32(8, config.num_experts);
+        if let Some(bucketed_routes) = self.bucketed_routes {
+            bucketed_routes.bind(builder, 9, 10);
+        }
         builder.dispatch_threadblocks(
             (shape.num_routes as usize, ceil_div_i32(matmul.n, 8) as usize, 1),
             (32, 2, 1),
@@ -541,7 +846,11 @@ impl Operator for RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'_> {
             self.experts_by_route,
         );
 
-        builder.set_kernel(&self.kernel.kernel);
+        let kernel = match self.bucketed_routes {
+            Some(_) => &self.kernel.bucketed_kernel,
+            None => &self.kernel.kernel,
+        };
+        builder.set_kernel(kernel);
         builder.set_buffer_read(0, self.gate_weight, 0);
         builder.set_buffer_read(1, self.gate_scales, 0);
         builder.set_buffer_read(2, self.gate_biases, 0);
@@ -554,6 +863,9 @@ impl Operator for RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'_> {
         builder.set_i32(9, matmul.k);
         builder.set_i32(10, matmul.n);
         builder.set_i32(11, config.num_experts);
+        if let Some(bucketed_routes) = self.bucketed_routes {
+            bucketed_routes.bind(builder, 12, 13);
+        }
         builder.dispatch_threadblocks(
             (shape.num_routes as usize, ceil_div_i32(matmul.n, 8) as usize, 1),
             (32, 2, 1),
@@ -580,7 +892,11 @@ impl Operator for GatherAffineQuantizedGateUpSwiGLUInvocation<'_> {
             self.lhs_indices,
             self.rhs_indices,
         );
-        builder.set_kernel(&self.kernel.kernel);
+        let kernel = match self.bucketed_routes {
+            Some(_) => &self.kernel.bucketed_kernel,
+            None => &self.kernel.kernel,
+        };
+        builder.set_kernel(kernel);
         builder.set_buffer_read(0, self.gate_weight, 0);
         builder.set_buffer_read(1, self.gate_scales, 0);
         builder.set_buffer_read(2, self.gate_biases, 0);
@@ -594,6 +910,9 @@ impl Operator for GatherAffineQuantizedGateUpSwiGLUInvocation<'_> {
         builder.set_i32(10, matmul.k);
         builder.set_i32(11, matmul.n);
         builder.set_i32(12, config.num_experts);
+        if let Some(bucketed_routes) = self.bucketed_routes {
+            bucketed_routes.bind(builder, 13, 14);
+        }
         builder.dispatch_threadblocks(
             (1, ceil_div_i32(matmul.n, 8) as usize, shape.num_routes as usize),
             (32, 2, 1),
@@ -619,7 +938,11 @@ impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
         );
         let packed_k = packed_dim(matmul.k, matmul.bits);
         let groups = matmul.k / matmul.group_size;
-        builder.set_kernel(&self.kernel.kernel);
+        let kernel = match self.bucketed_routes {
+            Some(_) => &self.kernel.bucketed_kernel,
+            None => &self.kernel.kernel,
+        };
+        builder.set_kernel(kernel);
         builder.set_buffer_read(0, self.weight, 0);
         builder.set_buffer_read(1, self.scales, 0);
         builder.set_buffer_read(2, self.biases, 0);
@@ -657,6 +980,9 @@ impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
         builder.set_i32_slice(18, &batch_shape);
         builder.set_i64_slice(19, &route_strides);
         builder.set_i64_slice(20, &route_strides);
+        if let Some(bucketed_routes) = self.bucketed_routes {
+            bucketed_routes.bind(builder, 21, 22);
+        }
 
         let bn = 8;
         let bk = 32;

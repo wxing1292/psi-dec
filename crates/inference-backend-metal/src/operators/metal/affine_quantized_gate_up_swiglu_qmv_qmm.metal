@@ -424,6 +424,141 @@ template <typename T, const int group_size, const int bits>
 }
 
 template <typename T, const int group_size, const int bits>
+[[kernel]] void token_major_gate_up_swiglu_bucketed(
+    const device uint32_t* gate_w [[buffer(0)]],
+    const device T* gate_scales [[buffer(1)]],
+    const device T* gate_biases [[buffer(2)]],
+    const device uint32_t* up_w [[buffer(3)]],
+    const device T* up_scales [[buffer(4)]],
+    const device T* up_biases [[buffer(5)]],
+    const device T* x [[buffer(6)]],
+    const device uint32_t* lhs_indices [[buffer(7)]],
+    const device uint32_t* rhs_indices [[buffer(8)]],
+    device T* y [[buffer(9)]],
+    const constant int& in_vec_size [[buffer(10)]],
+    const constant int& out_vec_size [[buffer(11)]],
+    const constant int& num_experts [[buffer(12)]],
+    const constant uint& num_active_tokens [[buffer(13)]],
+    const constant uint& num_experts_per_token [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint route = tid.z;
+  const uint num_active_routes = num_active_tokens * num_experts_per_token;
+  if (route >= num_active_routes) {
+    return;
+  }
+  const uint input_row = lhs_indices[route];
+  const uint expert = rhs_indices[route];
+  if (expert >= uint(num_experts)) {
+    return;
+  }
+  const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
+      (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int expert_weight_stride = out_vec_size * in_vec_size_w;
+  const int expert_affine_stride = out_vec_size * in_vec_size_g;
+  qmv_gate_up_swiglu<T, group_size, bits>(
+      (const device uint32_t*)((const device uint8_t*)gate_w + expert * expert_weight_stride),
+      gate_scales + expert * expert_affine_stride,
+      gate_biases + expert * expert_affine_stride,
+      (const device uint32_t*)((const device uint8_t*)up_w + expert * expert_weight_stride),
+      up_scales + expert * expert_affine_stride,
+      up_biases + expert * expert_affine_stride,
+      x + input_row * in_vec_size,
+      y + route * out_vec_size,
+      in_vec_size,
+      out_vec_size,
+      tid.y,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, const int group_size, const int bits, const bool fast>
+[[kernel]] void token_major_down_matmul_bucketed(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* rhs_indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& in_vec_size [[buffer(7)]],
+    const constant int& out_vec_size [[buffer(8)]],
+    const constant int& x_batch_ndims [[buffer(9)]],
+    const constant int* x_shape [[buffer(10)]],
+    const constant int64_t* x_strides [[buffer(11)]],
+    const constant int& w_batch_ndims [[buffer(12)]],
+    const constant int* w_shape [[buffer(13)]],
+    const constant int64_t* w_strides [[buffer(14)]],
+    const constant int64_t* s_strides [[buffer(15)]],
+    const constant int64_t* b_strides [[buffer(16)]],
+    const constant int& batch_ndims [[buffer(17)]],
+    const constant int* batch_shape [[buffer(18)]],
+    const constant int64_t* lhs_strides [[buffer(19)]],
+    const constant int64_t* rhs_strides [[buffer(20)]],
+    const constant uint& num_active_tokens [[buffer(21)]],
+    const constant uint& num_experts_per_token [[buffer(22)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint route = tid.z;
+  const uint num_active_routes = num_active_tokens * num_experts_per_token;
+  if (route >= num_active_routes) {
+    return;
+  }
+
+  const int M = x_shape[x_batch_ndims];
+  adjust_matrix_offsets<T>(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      y,
+      out_vec_size * M,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      b_strides,
+      tid);
+  if constexpr (fast) {
+    qmv_fast_impl<T, group_size, bits>(
+        w,
+        scales,
+        biases,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+  } else {
+    qmv_impl<T, group_size, bits>(
+        w,
+        scales,
+        biases,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+template <typename T, const int group_size, const int bits>
 [[kernel]] void expert_major_down_matmul(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -438,6 +573,50 @@ template <typename T, const int group_size, const int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   const uint route = tid.x;
+  const uint expert = experts_by_route[route];
+  if (expert >= uint(num_experts)) {
+    return;
+  }
+  const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
+      (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int expert_weight_stride = out_vec_size * in_vec_size_w;
+  const int expert_affine_stride = out_vec_size * in_vec_size_g;
+
+  qmv_impl<T, group_size, bits>(
+      (const device uint32_t*)((const device uint8_t*)w + expert * expert_weight_stride),
+      scales + expert * expert_affine_stride,
+      biases + expert * expert_affine_stride,
+      x + route * in_vec_size,
+      y + route * out_vec_size,
+      in_vec_size,
+      out_vec_size,
+      tid.y,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, const int group_size, const int bits>
+[[kernel]] void expert_major_down_matmul_bucketed(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device uint32_t* experts_by_route [[buffer(4)]],
+    device T* y [[buffer(5)]],
+    const constant int& in_vec_size [[buffer(6)]],
+    const constant int& out_vec_size [[buffer(7)]],
+    const constant int& num_experts [[buffer(8)]],
+    const constant uint& num_active_tokens [[buffer(9)]],
+    const constant uint& num_experts_per_token [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint route = tid.x;
+  const uint num_active_routes = num_active_tokens * num_experts_per_token;
+  if (route >= num_active_routes) {
+    return;
+  }
   const uint expert = experts_by_route[route];
   if (expert >= uint(num_experts)) {
     return;
@@ -479,6 +658,56 @@ template <typename T, const int group_size, const int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   const uint route = tid.x;
+  const uint expert = experts_by_route[route];
+  if (expert >= uint(num_experts)) {
+    return;
+  }
+  const int in_vec_size_w = in_vec_size * (bits == 3 || bits == 6 ? 3 : 4) /
+      (bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits);
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int expert_weight_stride = out_vec_size * in_vec_size_w;
+  const int expert_affine_stride = out_vec_size * in_vec_size_g;
+
+  qmv_gate_up_swiglu<T, group_size, bits>(
+      (const device uint32_t*)((const device uint8_t*)gate_w + expert * expert_weight_stride),
+      gate_scales + expert * expert_affine_stride,
+      gate_biases + expert * expert_affine_stride,
+      (const device uint32_t*)((const device uint8_t*)up_w + expert * expert_weight_stride),
+      up_scales + expert * expert_affine_stride,
+      up_biases + expert * expert_affine_stride,
+      x + route * in_vec_size,
+      y + route * out_vec_size,
+      in_vec_size,
+      out_vec_size,
+      tid.y,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, const int group_size, const int bits>
+[[kernel]] void expert_major_gate_up_swiglu_bucketed(
+    const device uint32_t* gate_w [[buffer(0)]],
+    const device T* gate_scales [[buffer(1)]],
+    const device T* gate_biases [[buffer(2)]],
+    const device uint32_t* up_w [[buffer(3)]],
+    const device T* up_scales [[buffer(4)]],
+    const device T* up_biases [[buffer(5)]],
+    const device T* x [[buffer(6)]],
+    const device uint32_t* experts_by_route [[buffer(7)]],
+    device T* y [[buffer(8)]],
+    const constant int& in_vec_size [[buffer(9)]],
+    const constant int& out_vec_size [[buffer(10)]],
+    const constant int& num_experts [[buffer(11)]],
+    const constant uint& num_active_tokens [[buffer(12)]],
+    const constant uint& num_experts_per_token [[buffer(13)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint route = tid.x;
+  const uint num_active_routes = num_active_tokens * num_experts_per_token;
+  if (route >= num_active_routes) {
+    return;
+  }
   const uint expert = experts_by_route[route];
   if (expert >= uint(num_experts)) {
     return;

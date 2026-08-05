@@ -235,6 +235,33 @@ A future full-MoE bucket policy must include the compute-path boundary at token 
 It must also include all topology boundaries from sparse MLP, expert-major layout/pack/scatter, combine, shared
 experts, and shared-expert gate components.
 
+The backend sparse MLP leaf also has additive bucket-readiness APIs:
+
+```text
+QuantizedSparseMLP::invoke_token_major_bucketed(...)
+QuantizedSparseMLP::invoke_expert_major_bucketed(...)
+```
+
+Both APIs record `num_total_tokens` and fixed `num_experts_per_token` values.
+The host derives `num_total_routes = num_total_tokens * num_experts_per_token` with checked arithmetic.
+It uses this total route count for dispatch and for all route, input, output, and SwiGLU scratch buffer validation.
+The caller supplies one `num_active_tokens` replay parameter.
+All four expert affine commands use the same parameter key and the same `[1, num_total_tokens]` domain.
+Each Metal command derives `num_active_routes = num_active_tokens * num_experts_per_token`.
+The leaf does not declare a second active-route parameter.
+
+The token-major gate/up command returns before it reads `token_indices` or `expert_indices` for an inactive route.
+The token-major down command returns before the gather code reads `route_indices` or `expert_indices`.
+The expert-major gate/up and down commands return before they read `experts_by_route`.
+Inactive commands do not read route inputs or write SwiGLU and output tails.
+
+The exact token-major and expert-major APIs remain unchanged and declare zero replay parameters.
+Each bucketed sparse MLP replay declares one replay parameter.
+Route count does not select a different sparse MLP kernel in either explicit path.
+The two explicit paths have different command topology.
+The full MoE owner must keep the token-major/expert-major path boundary at token count `5` in its composite policy.
+The sparse leaf does not select the path and does not enable bucketed full `GatedMoE` replay.
+
 The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
 `MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
 
