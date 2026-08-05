@@ -10,6 +10,8 @@ use inference_backend_metal::components::GQATiledSDPAShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::attn::GQACore;
@@ -18,6 +20,9 @@ use inference_executor_core::attn::gqa::reference::projected_gqa_reference;
 
 const Q_TOKEN_TILE_SIZE: u32 = 8;
 const KV_TOKEN_TILE_SIZE: u32 = 16;
+const NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_q_tiles");
+const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_tokens");
+const NUM_ACTIVE_TASK_TEMPLATES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_task_templates");
 
 #[test]
 fn test_fixed() {
@@ -37,6 +42,201 @@ fn test_multiple_tiles() {
 #[test]
 fn test_qwen3_profile() {
     run_case(&[1, 4, 8, 13], 5, 128, 8, 9);
+}
+
+#[test]
+fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let num_q_heads = 4usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 128usize;
+    let num_tokens_per_page = 8usize;
+    let num_total_tokens = 16usize;
+    let num_blocks = 2usize;
+    let page_bytes = 2 * num_kv_heads * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size();
+    let config = GQATiledSDPAConfig {
+        num_q_heads: num_q_heads as u32,
+        num_kv_heads: num_kv_heads as u32,
+        head_dim: head_dim as u32,
+        q_head_tile_size: num_q_heads as u32,
+        q_token_tile_size: Q_TOKEN_TILE_SIZE,
+        kv_token_tile_size: KV_TOKEN_TILE_SIZE,
+        scale: (head_dim as f32).sqrt().recip(),
+        page_bytes: page_bytes as u32,
+        dtype: Dtype::Bfloat16,
+        page_table_layout: GQAPageTableLayout {
+            num_req_slots: 1,
+            num_blocks: num_blocks as u32,
+            num_gqa_layers: 1,
+            num_page_ids_per_block: 1,
+        },
+    };
+    let shape = GQATiledSDPAShape {
+        num_tokens: num_total_tokens as u32,
+        num_q_token_tiles: 2,
+        total_sdpa_map_task_templates: 2,
+    };
+    let q_values = pattern(num_total_tokens * num_q_heads * head_dim, 29, 0.015625);
+    let k_values = pattern(num_total_tokens * head_dim, 31, 0.015625);
+    let v_values = pattern(num_total_tokens * head_dim, 37, 0.03125);
+    let q_bf16 = q_values
+        .iter()
+        .map(|value| bf16::from_f32(*value).to_bits())
+        .collect::<Vec<_>>();
+    let k_f32 = k_values
+        .iter()
+        .map(|value| bf16::from_f32(*value).to_f32())
+        .collect::<Vec<_>>();
+    let v_f32 = v_values
+        .iter()
+        .map(|value| bf16::from_f32(*value).to_f32())
+        .collect::<Vec<_>>();
+    let q_f32 = q_bf16
+        .iter()
+        .map(|bits| bf16::from_bits(*bits).to_f32())
+        .collect::<Vec<_>>();
+    let mut kv_page_values = Vec::new();
+    for block_index in 0..num_blocks {
+        let start = block_index * num_tokens_per_page * head_dim;
+        let end = start + num_tokens_per_page * head_dim;
+        kv_page_values.extend(
+            k_values[start..end]
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits()),
+        );
+        kv_page_values.extend(
+            v_values[start..end]
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits()),
+        );
+    }
+
+    let q = Buffer::from_slice(&device, &q_bf16);
+    let kv_pages = Buffer::from_slice(&device, &kv_page_values);
+    let req_slots = Buffer::from_slice(&device, &[0_u32; 16]);
+    let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
+    let flat_token_indices = Buffer::from_slice(&device, &(0_u32..16).collect::<Vec<_>>());
+    let q_token_tiles = Buffer::from_slice(&device, &[0_u32, 5, u32::MAX, u32::MAX]);
+    let task_templates = Buffer::from_slice(&device, &[0_u32, 0, 5, u32::MAX, u32::MAX, u32::MAX]);
+    let cu_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1, u32::MAX]);
+    let num_partial_tokens = 2 * Q_TOKEN_TILE_SIZE as usize;
+    let partial_output = Buffer::new_zeroed(
+        &device,
+        num_partial_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
+    );
+    let partial_exp_sums = Buffer::new_zeroed(&device, num_partial_tokens * num_q_heads * size_of::<f32>());
+    let partial_max_logits = Buffer::new_zeroed(&device, num_partial_tokens * num_q_heads * size_of::<f32>());
+    let sentinel = bf16::from_f32(-123.0).to_bits();
+    let output = Buffer::from_slice(&device, &vec![sentinel; num_total_tokens * num_q_heads * head_dim]);
+    let kernels = GQATiledSDPAKernels::new(&device, config, shape);
+    let mut builder = stream.create_replay_program();
+    builder.record(kernels.invoke_map_bucketed(
+        GQATiledSDPAMapBuffers {
+            q: &q,
+            kv_pages: &kv_pages,
+            req_slots: &req_slots,
+            page_ids: &page_ids,
+            flat_token_indices: &flat_token_indices,
+            q_token_tiles: &q_token_tiles,
+            sdpa_map_task_templates: &task_templates,
+            partial_output: &partial_output,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+        },
+        ReplayU32::Fixed(0),
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+        ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
+        ReplayU32::Parameter(NUM_ACTIVE_TASK_TEMPLATES),
+    ));
+    builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
+        GQATiledSDPAReduceBuffers {
+            partial_output: &partial_output,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+            q_token_tiles: &q_token_tiles,
+            cu_sdpa_partial_outputs: &cu_partial_outputs,
+            output: &output,
+        },
+        ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
+    ));
+    let replay = builder.build();
+    assert_eq!(replay.stats().parameter_count, 3);
+
+    for num_active_tokens in [5_usize, 16] {
+        let num_active_tiles = num_active_tokens.div_ceil(Q_TOKEN_TILE_SIZE as usize);
+        q_token_tiles.write_typed(
+            0,
+            if num_active_tiles == 1 {
+                &[0_u32, 5, u32::MAX, u32::MAX]
+            } else {
+                &[0_u32, 8, 8, 16]
+            },
+        );
+        task_templates.write_typed(
+            0,
+            if num_active_tiles == 1 {
+                &[0_u32, 0, 5, u32::MAX, u32::MAX, u32::MAX]
+            } else {
+                &[0_u32, 0, 8, 1, 0, 16]
+            },
+        );
+        cu_partial_outputs.write_typed(
+            0,
+            if num_active_tiles == 1 {
+                &[0_u32, 1, u32::MAX]
+            } else {
+                &[0_u32, 1, 2]
+            },
+        );
+        output.write_typed(0, &vec![sentinel; num_total_tokens * num_q_heads * head_dim]);
+        stream
+            .submit_replay_with_arguments(
+                &replay,
+                &ReplayArguments::new()
+                    .with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32)
+                    .with_u32(NUM_ACTIVE_Q_TOKEN_TILES, num_active_tiles as u32)
+                    .with_u32(NUM_ACTIVE_TASK_TEMPLATES, num_active_tiles as u32),
+            )
+            .wait();
+
+        let num_active_values = num_active_tokens * num_q_heads * head_dim;
+        let actual = output
+            .read_typed::<u16>(0, num_active_values)
+            .into_iter()
+            .map(|bits| bf16::from_bits(bits).to_f32())
+            .collect::<Vec<_>>();
+        let expected = projected_gqa_reference(
+            &GQACore::new(
+                0,
+                num_q_heads * head_dim,
+                head_dim,
+                num_q_heads,
+                num_kv_heads,
+                config.scale,
+            ),
+            GQAReferenceInput {
+                cu_tokens: &[0, num_active_tokens as u32],
+                token_indices: &[0],
+                q: &q_f32[..num_active_values],
+                context_k_by_req: &[&k_f32[..num_active_tokens * head_dim]],
+                context_v_by_req: &[&v_f32[..num_active_tokens * head_dim]],
+            },
+        );
+        let max_abs_diff = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual_value, expected_value)| (actual_value - expected_value).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs_diff <= 0.02, "max_abs_diff={max_abs_diff}");
+        assert_eq!(
+            output.read_typed::<u16>(
+                num_active_values,
+                (num_total_tokens - num_active_tokens) * num_q_heads * head_dim,
+            ),
+            vec![sentinel; (num_total_tokens - num_active_tokens) * num_q_heads * head_dim]
+        );
+    }
 }
 
 fn run_case(

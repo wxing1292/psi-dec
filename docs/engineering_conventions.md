@@ -205,10 +205,12 @@ Put component coordinates, ABI records, and cumulative-offset examples in the ow
 
 Keep runtime or replay shapes separate from initialization capacity and storage layouts.
 
-`*ReplayShape` contains only values that describe the current recorded execution. Examples include active token,
-request, and runtime-partition counts.
+`*ReplayShape` contains only values that describe one recorded execution and its submissions. Examples include active
+token, request, and runtime-partition counts. A bucketed replay shape can also contain the recorded capacity for each
+active work domain.
 
-It does not contain initialization capacities, persistent-buffer strides, or storage coordinates.
+It does not contain initialization capacities, persistent-buffer strides, or storage coordinates. A replay capacity
+can equal an initialization limit, but it has a different owner and meaning.
 
 Use `*Layout` for an object that primarily describes persistent tensor dimensions. Do not name this object `*Shape`.
 
@@ -254,6 +256,14 @@ Replay keys contain only facts that change these items:
 - Static geometry
 - Scratch extent
 - A necessary algorithm choice
+
+A reusable leaf component must expose its topology identity and topology boundaries for each bucketed work domain. The
+owner of a composite replay stage must union the boundaries from all participating leaf components before it selects a
+capacity. A component-local policy is not the final policy for a larger replay stage.
+
+Two bindings may use the same replay parameter key only when they use the same scalar type, active work domain, and
+validated range. A selected topology must declare and submit only the parameters that its recorded commands consume.
+Do not add an unused replay parameter to make peer paths look symmetric.
 
 When one replay stage is the only consumer of a component, `Replay<T>` must be its single owner and access path.
 Use `Replay::component()` for prepare, replay-argument, and read operations that belong to that stage.

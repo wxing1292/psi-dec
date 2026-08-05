@@ -191,8 +191,9 @@ for one Q-token tile are contiguous.
 For a fixed Q-token/head output coordinate, adjacent `cu_sdpa_partial_outputs` values select the
 `SDPAPartialOutput`s for the reducer.
 
-`total_sdpa_map_task_templates` is the power-of-two replay extent. Unused tail TaskTemplates contain an invalid
-Q-token-tile index and do not write a map result.
+`total_sdpa_map_task_templates` is the recorded replay capacity. The legacy exact-token metadata path uses its existing
+power-of-two padding. The bucketed Qwen3.5 path uses the shared replay bucket policy. Unused tail TaskTemplates contain
+an invalid Q-token-tile index and do not write a map result.
 
 The `SingleQueryToken` paged map also permits an invalid-Q-token-tile `SDPAMapTaskTemplate` in one token's TaskTemplate
 range. This template does not write a paged partial output for that slot.
@@ -379,14 +380,20 @@ The Metal replay core provides symmetric fixed-or-parameter scalar sources for `
 `ReplayU32::Fixed(value)` or `ReplayU32::Parameter(key)` through the same kernel and invocation path. The GQA component
 does not define a replay-indexed constructor, kernel variant, or model-specific flag.
 
-The replay shape separates fixed page-table layout from execution work:
+The replay shape separates fixed page-table layout from active work and recorded capacity:
 
 ```text
-num_tokens                 number of flat tokens in the microbatch
-num_q_token_tiles          request-local Q-token tiles; equals num_tokens for SingleQueryToken replay
-total_sdpa_map_task_templates       padded SDPA map TaskTemplate extent used by dispatch and scratch
-reduce_sdpa_partial_outputs   whether the selected batch plan semantically requires partial reduction
+num_tokens                         active flat Q tokens in the microbatch
+total_tokens                       recorded flat-Q-token capacity
+num_q_token_tiles                  active request-local Q-token tiles
+total_q_token_tiles                recorded Q-token-tile capacity
+num_sdpa_map_task_templates        active SDPA map TaskTemplates
+total_sdpa_map_task_templates      recorded SDPA map TaskTemplate capacity
+reduce_sdpa_partial_outputs        whether the active batch plan semantically requires partial reduction
 ```
+
+For `SingleQueryToken`, `num_q_token_tiles` equals `num_tokens`. The path does not consume the active-Q-token-tile
+replay parameter.
 
 `SingleQueryToken` replay always records the reduce command. It records this command even when each token has only one map
 TaskTemplate.
@@ -394,8 +401,42 @@ TaskTemplate.
 This rule lets both TaskTemplate layouts share one recorded program for the same Q-token-tile and map-TaskTemplate
 geometry. The flag remains batch-plan metadata and does not enter the replay key.
 
-`GQAMetadataBuffers::update_*` derives and stores this shape from the compact request metadata. It is the sole owner of
-the current replay shape.
+`GQAMetadataBuffers::update(...)` keeps the legacy exact token and Q-token-tile extents. It can retain the existing
+padded TaskTemplate extent. `GQAMetadataBuffers::update_bucketed(...)` applies the shared capacity policy independently
+to tokens, Q-token tiles, and TaskTemplates. Both methods derive and store the shape from compact request metadata.
+`GQAMetadataBuffers` is the sole owner of the current replay shape.
+
+`GQAMetadataBuffers::update_bucketed_with_token_capacity(...)` accepts a token capacity from a composite replay stage.
+GQA does not apply its token bucket policy again on this path. GQA still selects Q-token-tile and TaskTemplate
+capacities with its private policies.
+
+The caller-owned token capacity must satisfy `num_tokens <= total_tokens <= max_tokens`. It must also preserve the
+QGKV and output affine topologies selected for `num_tokens`. GQA validates these topologies during preparation and
+recording. The recording check prevents a direct metadata update from bypassing the topology contract.
+
+The GQA token policy includes topology boundaries from both affine projections. The Q-token-tile and TaskTemplate
+policies use the shared default buckets. `GQA::replay_token_topology_boundaries()` exposes the union to composite
+stage policies. `GQAComputePath` remains an explicit topology identity in the replay key.
+
+The bucketed kernels consume these submission values:
+
+```text
+gqa.num_active_tokens                    qgkv/output affine, KV write, and attention token guards
+gqa.num_active_q_token_tiles             TiledQueryTokens map and reduce guards
+gqa.num_active_sdpa_map_task_templates   attention map guard
+```
+
+Projection split, norm/RoPE, KV write, activation gate, and the qgkv/output affine kernels return before an inactive
+token reads input or metadata, mutates a page, or writes output. Paged and tiled attention also return before inactive
+TaskTemplates or Q-token tiles read their metadata. All token-domain commands use the same active-token parameter key
+and range.
+
+The default bucketed API uses `gqa.num_active_tokens`. A composite stage can supply a stage-owned
+`ReplayParameterKey` through `GQAReplayMode::BucketedWithTokenKey(...)` and `Qwen3xGQA::record_bucketed(...)`.
+The supplied key must differ from the private Q-token-tile and TaskTemplate keys.
+
+`add_gqa_replay_arguments(...)` supplies all default GQA arguments. A composite stage supplies its active-token
+argument once. It then calls `add_gqa_private_replay_arguments(...)` for the Q-token-tile and TaskTemplate arguments.
 
 `GQAInput` borrows the metadata object instead of carrying a duplicate shape. Backend recording and replay-key
 construction both read the stored shape. Therefore, a batch plan cannot use a different dispatch shape.
@@ -428,13 +469,23 @@ plan.
 `SingleQueryToken` replay always records partial-output reduction. This rule also applies when each batch token has one
 TaskTemplate.
 
-`Qwen35MainReplayKey` and `Qwen35MTPReplayKey` therefore include only `num_q_token_tiles` and
-`total_sdpa_map_task_templates`. The main key also contains the non-optional GDN request-count subkey.
+The shared `Qwen35GQAReplayKey` contains the three recorded capacities. It also contains the complete
+`GQAComputePath`, qgkv affine topology, and output affine topology. Active counts remain submission values and do not
+enter this GQA subkey.
+
+`Qwen35MainReplayKey` and `Qwen35MTPReplayKey` use this shared GQA subkey. Their top-level token counts remain exact
+until every other component in each replay stage supports the same capacity. Thus, this change makes GQA locally ready
+for bucket reuse. It does not yet make the complete Main or MTP forward replay bucketed. The main key also contains the
+non-optional GDN request-count subkey.
 
 MTP keeps its separate pure-GQA key.
 All MTP steps in one batch have the same token and attention shape, so they reuse one recorded program.
 The replay argument selects the logical MTP GQA layer at execution time.
 Main recording supplies each physical layer's fixed index through the same kernel ABI.
+
+Qwen3 uses its separate ungated GQA implementation. DSpark keeps its existing exact replay key and submission ABI.
+DSpark only uses the expanded shared replay-shape fields with equal active and total token/tile values and its existing
+TaskTemplate padding.
 
 ### Execution strategy
 

@@ -9,6 +9,7 @@ use inference_executor_core::model::qwen::v3_5::LayerType;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MainWeightBindings;
 
+use crate::attn::gqa::backend::GQAReplayTopology;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
@@ -16,6 +17,7 @@ use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::main_residual_capture::MainResidualCapture;
+use crate::model::qwen::v3_5::Qwen35GQAReplayKey;
 use crate::model::qwen::v3_5::main::layer::Qwen35MainLayer;
 use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerInput;
 use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerScratch;
@@ -42,6 +44,7 @@ pub struct Qwen35MainArgs<'a> {
     pub hidden_input: &'a Buffer,
     pub hidden_output: &'a Buffer,
     pub gqa: &'a crate::attn::gqa::batch_metadata::GQAMetadataBuffers,
+    pub gqa_replay_topology: GQAReplayTopology,
     pub gdn: &'a crate::attn::gdn::batch_metadata::GDNMetadataBuffers,
     pub pages: &'a Buffer,
 }
@@ -145,30 +148,18 @@ impl Qwen35Main {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct Qwen35MainGQAReplayKey {
-    num_q_token_tiles: u32,
-    total_sdpa_map_task_templates: u32,
-}
-
-impl Qwen35MainGQAReplayKey {
-    fn from_shape(gqa_shape: inference_executor_core::attn::GQAReplayShape) -> Self {
-        gqa_shape.validate();
-        Self {
-            num_q_token_tiles: gqa_shape.num_q_token_tiles,
-            total_sdpa_map_task_templates: gqa_shape.total_sdpa_map_task_templates,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35MainReplayKey {
     num_tokens: u32,
-    gqa: Qwen35MainGQAReplayKey,
+    gqa: Qwen35GQAReplayKey,
     gdn: Qwen35MainGDNReplayKey,
 }
 
 impl Qwen35MainReplayKey {
-    pub fn from_shapes(gqa_shape: inference_executor_core::attn::GQAReplayShape, gdn_shape: GDNReplayShape) -> Self {
+    pub fn from_shapes(
+        gqa_shape: inference_executor_core::attn::GQAReplayShape,
+        gqa_topology: GQAReplayTopology,
+        gdn_shape: GDNReplayShape,
+    ) -> Self {
         gqa_shape.validate();
         gdn_shape.validate();
         assert_eq!(
@@ -177,18 +168,21 @@ impl Qwen35MainReplayKey {
         );
         Self {
             num_tokens: gqa_shape.num_tokens,
-            gqa: Qwen35MainGQAReplayKey::from_shape(gqa_shape),
+            gqa: Qwen35GQAReplayKey::new(gqa_shape, gqa_topology),
             gdn: Qwen35MainGDNReplayKey::from_shape(gdn_shape),
         }
     }
 
     #[cfg(test)]
-    pub fn debug_parts(&self) -> (u32, u32, u32, u32) {
+    pub fn debug_parts(&self) -> (u32, u32, u32, u32, u32, GQAReplayTopology) {
+        let (total_tokens, total_q_token_tiles, total_task_templates, topology) = self.gqa.debug_parts();
         (
             self.num_tokens,
-            self.gqa.num_q_token_tiles,
-            self.gqa.total_sdpa_map_task_templates,
+            total_tokens,
+            total_q_token_tiles,
+            total_task_templates,
             self.gdn.num_reqs,
+            topology,
         )
     }
 }
@@ -212,7 +206,11 @@ impl ReplayComponent for Qwen35Main {
     type Input<'a> = Qwen35MainArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Qwen35MainReplayKey::from_shapes(input.gqa.replay_shape(), input.gdn.replay_shape())
+        Qwen35MainReplayKey::from_shapes(
+            input.gqa.replay_shape(),
+            input.gqa_replay_topology,
+            input.gdn.replay_shape(),
+        )
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {

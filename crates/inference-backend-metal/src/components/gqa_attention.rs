@@ -326,6 +326,26 @@ impl GQAPagedSDPAKernels {
             shape: self.shape,
             buffers,
             page_table_index,
+            num_active_tokens: ReplayU32::Fixed(self.shape.num_tokens),
+            num_active_sdpa_map_task_templates: ReplayU32::Fixed(self.shape.total_sdpa_map_task_templates),
+        }
+    }
+
+    pub fn invoke_map_bucketed<'a>(
+        &self,
+        buffers: GQAPagedSDPAMapBuffers<'a>,
+        page_table_index: ReplayU32,
+        num_active_tokens: ReplayU32,
+        num_active_sdpa_map_task_templates: ReplayU32,
+    ) -> GQAPagedSDPAMapInvocation<'a> {
+        GQAPagedSDPAMapInvocation {
+            pipeline: self.map.as_raw_retained(),
+            config: self.config,
+            shape: self.shape,
+            buffers,
+            page_table_index,
+            num_active_tokens,
+            num_active_sdpa_map_task_templates,
         }
     }
 
@@ -335,6 +355,21 @@ impl GQAPagedSDPAKernels {
             config: self.config,
             shape: self.shape,
             buffers,
+            num_active_tokens: ReplayU32::Fixed(self.shape.num_tokens),
+        }
+    }
+
+    pub fn invoke_reduce_bucketed<'a>(
+        &self,
+        buffers: GQAPagedSDPAReduceBuffers<'a>,
+        num_active_tokens: ReplayU32,
+    ) -> GQAPagedSDPAReduceInvocation<'a> {
+        GQAPagedSDPAReduceInvocation {
+            pipeline: self.reduce.as_raw_retained(),
+            config: self.config,
+            shape: self.shape,
+            buffers,
+            num_active_tokens,
         }
     }
 }
@@ -437,6 +472,22 @@ impl GQAActivationGateKernel {
             kernel: &self.kernel,
             shape,
             buffers,
+            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+        }
+    }
+
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: GQAActivationGateShape,
+        buffers: GQAActivationGateBuffers<'a>,
+        num_active_tokens: ReplayU32,
+    ) -> GQAActivationGateInvocation<'a> {
+        GQAActivationGateInvocation {
+            config: self.config,
+            kernel: &self.kernel,
+            shape,
+            buffers,
+            num_active_tokens,
         }
     }
 }
@@ -454,6 +505,7 @@ pub struct GQAActivationGateInvocation<'a> {
     kernel: &'a Kernel,
     shape: GQAActivationGateShape,
     buffers: GQAActivationGateBuffers<'a>,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for GQAActivationGateInvocation<'_> {
@@ -464,7 +516,13 @@ impl Operator for GQAActivationGateInvocation<'_> {
         builder.set_buffer_read(0, self.buffers.attention_output, 0);
         builder.set_buffer_read(1, self.buffers.g, 0);
         builder.set_buffer_write(2, self.buffers.output, 0);
-        builder.set_u32(3, shape.num_tokens);
+        set_replay_u32(
+            builder,
+            3,
+            self.num_active_tokens,
+            shape.num_tokens,
+            "GQA activation-gate active token count",
+        );
         builder.dispatch_1d(self.config.num_values(shape), 256);
     }
 }
@@ -504,7 +562,6 @@ typedef bfloat bfloat16_t;
 #define Q_HEAD_TILE_SIZE {q_head_tile_size}
 #define NUM_Q_HEAD_TILES_PER_KV_HEAD {num_q_head_tiles_per_kv_head}
 #define NUM_TOKENS {num_tokens}
-#define NUM_ACTIVE_TOKENS {num_active_tokens}
 #define PAGE_BYTES {page_bytes}
 #define KV_TOKEN_TILE_SIZE {kv_token_tile_size}
 #define TOTAL_SDPA_MAP_TASK_TEMPLATES {total_sdpa_map_task_templates}
@@ -523,6 +580,8 @@ kernel void gqa_paged_sdpa_map(
     device float* partial_max_logits [[buffer(6)]],
     device T* partial_output [[buffer(7)]],
     constant uint& gqa_layer_index [[buffer(8)]],
+    constant uint& num_active_tokens [[buffer(9)]],
+    constant uint& num_active_sdpa_map_task_templates [[buffer(10)]],
     uint global_thread_index [[thread_position_in_grid]]
 ) {{
 {body}
@@ -536,7 +595,6 @@ kernel void gqa_paged_sdpa_map(
         num_q_head_tiles_per_kv_head = config.num_q_head_tiles_per_kv_head(),
         num_kv_heads = config.num_kv_heads,
         num_tokens = config.num_tokens_per_page(),
-        num_active_tokens = shape.num_tokens,
         num_q_heads = config.num_q_heads,
         page_bytes = config.page_bytes,
         kv_token_tile_size = config.kv_token_tile_size,
@@ -563,6 +621,8 @@ pub struct GQAPagedSDPAMapInvocation<'a> {
     shape: GQAPagedSDPAShape,
     buffers: GQAPagedSDPAMapBuffers<'a>,
     page_table_index: ReplayU32,
+    num_active_tokens: ReplayU32,
+    num_active_sdpa_map_task_templates: ReplayU32,
 }
 
 impl Operator for GQAPagedSDPAMapInvocation<'_> {
@@ -589,6 +649,20 @@ impl Operator for GQAPagedSDPAMapInvocation<'_> {
             },
             ReplayU32::Parameter(key) => builder.bind_u32(8, key, 0, max_page_table_index),
         }
+        set_replay_u32(
+            builder,
+            9,
+            self.num_active_tokens,
+            shape.num_tokens,
+            "GQA paged SDPA active token count",
+        );
+        set_replay_u32(
+            builder,
+            10,
+            self.num_active_sdpa_map_task_templates,
+            shape.total_sdpa_map_task_templates,
+            "GQA paged SDPA active TaskTemplate count",
+        );
         builder.dispatch_1d(
             self.config.map_threads(shape),
             self.config.num_threads_per_threadblock as usize,
@@ -618,6 +692,7 @@ pub struct GQAPagedSDPAReduceInvocation<'a> {
     config: GQAPagedSDPAConfig,
     shape: GQAPagedSDPAShape,
     buffers: GQAPagedSDPAReduceBuffers<'a>,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for GQAPagedSDPAReduceInvocation<'_> {
@@ -630,8 +705,25 @@ impl Operator for GQAPagedSDPAReduceInvocation<'_> {
         builder.set_buffer_read(2, self.buffers.partial_output, 0);
         builder.set_buffer_read(3, self.buffers.cu_sdpa_partial_outputs, 0);
         builder.set_buffer_write(4, self.buffers.output, 0);
-        builder.set_u32(5, shape.num_tokens);
+        set_replay_u32(
+            builder,
+            5,
+            self.num_active_tokens,
+            shape.num_tokens,
+            "GQA paged SDPA active token count",
+        );
         builder.dispatch_1d(self.config.num_output_values(shape), 256);
+    }
+}
+
+fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+    match value {
+        ReplayU32::Fixed(value) => {
+            assert!(value > 0, "{name} must be positive");
+            assert!(value <= max_value, "{name} exceeds recorded capacity");
+            builder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
     }
 }
 
@@ -664,7 +756,13 @@ mod tests {
     use inference_executor_core::attn::gqa::reference::projected_gqa_reference;
 
     use super::*;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.paged.active_tokens");
+    const NUM_ACTIVE_TASK_TEMPLATES: ReplayParameterKey =
+        ReplayParameterKey::new("test.gqa.paged.active_task_templates");
 
     #[test]
     #[should_panic(expected = "GQA SDPA query/output exceeds the shader u32 count domain")]
@@ -729,6 +827,74 @@ mod tests {
             },
         );
         assert_close(&actual, &expected, 2.0e-5);
+    }
+
+    #[test]
+    fn test_bucketed_replay_matches_active_prefix_and_preserves_output_tail() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = fixture_config();
+        let shape = GQAPagedSDPAShape {
+            num_tokens: 4,
+            total_sdpa_map_task_templates: 4,
+        };
+        let q = generated_values(config.num_output_values(shape), 0x8B1D_5A73);
+        let kv_stride = config.num_kv_heads as usize * config.head_dim as usize;
+        let k = generated_values(4 * kv_stride, 0x8B1D_5A74);
+        let v = generated_values(4 * kv_stride, 0x8B1D_5A75);
+        let kv_pages = kv_page_values(config, &[(&k, &v)]);
+        let q_buffer = Buffer::from_slice(&device, &q);
+        let kv_pages_buffer = Buffer::from_slice(&device, &kv_pages);
+        let req_slots = Buffer::from_slice(&device, &[0_u32; 4]);
+        let page_ids = Buffer::from_slice(&device, &[0_u32]);
+        let task_templates = Buffer::from_slice(&device, &[0_u32, 0, 1, 1, 0, 2, 2, 0, 3, 3, 0, 4]);
+        let cu_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1, 2, 3, 4]);
+        let sentinel = -321.0_f32;
+        let output = Buffer::from_slice(&device, &vec![sentinel; config.num_output_values(shape)]);
+        let scratch = GQAPagedSDPAScratch::new(&device, config, shape);
+        let kernels = GQAPagedSDPAKernels::new(&device, config, shape);
+        let mut builder = stream.create_replay_program();
+        builder.record(kernels.invoke_map_bucketed(
+            scratch.map_buffers(&q_buffer, &kv_pages_buffer, &req_slots, &page_ids, &task_templates),
+            ReplayU32::Fixed(0),
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ReplayU32::Parameter(NUM_ACTIVE_TASK_TEMPLATES),
+        ));
+        builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
+            scratch.reduce_buffers(&cu_partial_outputs, &output),
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+        ));
+        let replay = builder.build();
+        assert_eq!(replay.stats().parameter_count, 2);
+
+        for num_active_tokens in [3_usize, 4] {
+            output.write_typed(0, &vec![sentinel; config.num_output_values(shape)]);
+            stream
+                .submit_replay_with_arguments(
+                    &replay,
+                    &ReplayArguments::new()
+                        .with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32)
+                        .with_u32(NUM_ACTIVE_TASK_TEMPLATES, num_active_tokens as u32),
+                )
+                .wait();
+            let num_active_values = num_active_tokens * config.num_q_heads as usize * config.head_dim as usize;
+            let actual = output.read_typed::<f32>(0, num_active_values);
+            let expected = projected_gqa_reference(
+                &fixture_core(config),
+                GQAReferenceInput {
+                    cu_tokens: &[0, num_active_tokens as u32],
+                    token_indices: &[0],
+                    q: &q[..num_active_values],
+                    context_k_by_req: &[&k[..num_active_tokens * kv_stride]],
+                    context_v_by_req: &[&v[..num_active_tokens * kv_stride]],
+                },
+            );
+            assert_close(&actual, &expected, 2.0e-5);
+            assert_eq!(
+                output.read_typed::<f32>(num_active_values, config.num_output_values(shape) - num_active_values,),
+                vec![sentinel; config.num_output_values(shape) - num_active_values]
+            );
+        }
     }
 
     #[test]

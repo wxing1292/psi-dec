@@ -10,6 +10,7 @@ use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35LayerWeightBindings;
 use inference_runtime_core::compute::BatchDeviceRequest;
 
+use crate::attn::gqa::backend::GQAReplayTopology;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
@@ -17,6 +18,7 @@ use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
+use crate::model::qwen::v3_5::Qwen35GQAReplayKey;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayer;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerInput;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
@@ -45,6 +47,7 @@ pub struct Qwen35MTPArgs<'a> {
     pub hidden_input: &'a Buffer,
     pub hidden_output: &'a Buffer,
     pub gqa: &'a crate::attn::gqa::batch_metadata::GQAMetadataBuffers,
+    pub gqa_replay_topology: GQAReplayTopology,
     pub pages: &'a Buffer,
 }
 
@@ -181,17 +184,19 @@ impl Qwen35MTP {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35MTPReplayKey {
     num_tokens: usize,
-    num_q_token_tiles: u32,
-    total_sdpa_map_task_templates: u32,
+    gqa: Qwen35GQAReplayKey,
 }
 
 impl Qwen35MTPReplayKey {
-    pub fn new(num_tokens: usize, gqa_shape: inference_executor_core::attn::GQAReplayShape) -> Self {
+    pub fn new(
+        num_tokens: usize,
+        gqa_shape: inference_executor_core::attn::GQAReplayShape,
+        gqa_topology: GQAReplayTopology,
+    ) -> Self {
         gqa_shape.validate();
         Self {
             num_tokens,
-            num_q_token_tiles: gqa_shape.num_q_token_tiles,
-            total_sdpa_map_task_templates: gqa_shape.total_sdpa_map_task_templates,
+            gqa: Qwen35GQAReplayKey::new(gqa_shape, gqa_topology),
         }
     }
 }
@@ -201,7 +206,11 @@ impl ReplayComponent for Qwen35MTP {
     type Input<'a> = Qwen35MTPArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Self::Key::new(input.num_tokens as usize, input.gqa.replay_shape())
+        Self::Key::new(
+            input.num_tokens as usize,
+            input.gqa.replay_shape(),
+            input.gqa_replay_topology,
+        )
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {

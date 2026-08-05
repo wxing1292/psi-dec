@@ -6,6 +6,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const GQA_QGKV_SPLIT_SOURCE: &str = include_str!("metal/gqa_qgkv_split.metal");
 
@@ -175,6 +176,22 @@ impl GQAQGKVSplitKernel {
             kernel: &self.kernel,
             shape,
             buffers,
+            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+        }
+    }
+
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: GQAQGKVSplitShape,
+        buffers: GQAQGKVSplitBuffers<'a>,
+        num_active_tokens: ReplayU32,
+    ) -> GQAQGKVSplitInvocation<'a> {
+        GQAQGKVSplitInvocation {
+            config: self.config,
+            kernel: &self.kernel,
+            shape,
+            buffers,
+            num_active_tokens,
         }
     }
 }
@@ -193,6 +210,7 @@ pub struct GQAQGKVSplitInvocation<'a> {
     kernel: &'a Kernel,
     shape: GQAQGKVSplitShape,
     buffers: GQAQGKVSplitBuffers<'a>,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for GQAQGKVSplitInvocation<'_> {
@@ -205,8 +223,25 @@ impl Operator for GQAQGKVSplitInvocation<'_> {
         builder.set_buffer_write(2, self.buffers.g, 0);
         builder.set_buffer_write(3, self.buffers.k, 0);
         builder.set_buffer_write(4, self.buffers.v, 0);
-        builder.set_u32(5, shape.num_tokens);
+        set_replay_u32(
+            builder,
+            5,
+            self.num_active_tokens,
+            shape.num_tokens,
+            "GQA projection-split active token count",
+        );
         builder.dispatch_1d(self.config.num_qgkv_slots(shape), 256);
+    }
+}
+
+fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+    match value {
+        ReplayU32::Fixed(value) => {
+            assert!(value > 0, "{name} must be positive");
+            assert!(value <= max_value, "{name} exceeds recorded capacity");
+            builder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
     }
 }
 

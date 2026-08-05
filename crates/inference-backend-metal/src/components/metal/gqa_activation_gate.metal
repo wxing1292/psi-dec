@@ -30,10 +30,10 @@ void gqa_activation_gate_impl(
     device const T* attention_output,
     device const T* gates,
     device T* output,
-    constant uint& total_tokens,
+    constant uint& num_active_tokens,
     uint gid
 ) {
-    const uint total = total_tokens * num_q_heads * head_dim;
+    const uint total = num_active_tokens * num_q_heads * head_dim;
     if (gid >= total) return;
     output[gid] = T(attention_output[gid] * gqa_sigmoid(gates[gid]));
 }
@@ -42,18 +42,18 @@ kernel void gqa_activation_gate_f32(
     device const float* attention_output [[buffer(0)]],
     device const float* gates [[buffer(1)]],
     device float* output [[buffer(2)]],
-    constant uint& total_tokens [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_activation_gate_impl<float>(attention_output, gates, output, total_tokens, gid);
+    gqa_activation_gate_impl<float>(attention_output, gates, output, num_active_tokens, gid);
 }
 
 kernel void gqa_activation_gate_bf16(
     device const bfloat16_t* attention_output [[buffer(0)]],
     device const bfloat16_t* gates [[buffer(1)]],
     device bfloat16_t* output [[buffer(2)]],
-    constant uint& total_tokens [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_activation_gate_impl<bfloat16_t>(attention_output, gates, output, total_tokens, gid);
+    gqa_activation_gate_impl<bfloat16_t>(attention_output, gates, output, num_active_tokens, gid);
 }

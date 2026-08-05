@@ -7,6 +7,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const GQA_NORM_ROPE_SOURCE: &str = include_str!("metal/gqa_norm_rope.metal");
 
@@ -157,6 +158,22 @@ impl GQANormRopeKernel {
             kernel: &self.kernel,
             shape,
             buffers,
+            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+        }
+    }
+
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: GQANormRopeShape,
+        buffers: GQANormRopeBuffers<'a>,
+        num_active_tokens: ReplayU32,
+    ) -> GQANormRopeInvocation<'a> {
+        GQANormRopeInvocation {
+            config: self.config,
+            kernel: &self.kernel,
+            shape,
+            buffers,
+            num_active_tokens,
         }
     }
 }
@@ -176,6 +193,7 @@ pub struct GQANormRopeInvocation<'a> {
     kernel: &'a Kernel,
     shape: GQANormRopeShape,
     buffers: GQANormRopeBuffers<'a>,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for GQANormRopeInvocation<'_> {
@@ -187,8 +205,25 @@ impl Operator for GQANormRopeInvocation<'_> {
         builder.set_buffer_read(1, self.buffers.norm_weight, 0);
         builder.set_buffer_read(2, self.buffers.flat_token_indices, 0);
         builder.set_buffer_write(3, self.buffers.output, 0);
-        builder.set_u32(4, shape.num_tokens);
+        set_replay_u32(
+            builder,
+            4,
+            self.num_active_tokens,
+            shape.num_tokens,
+            "GQA norm/RoPE active token count",
+        );
         builder.dispatch_1d(self.config.num_threads(shape), NUM_THREADS_PER_THREADBLOCK as usize);
+    }
+}
+
+fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+    match value {
+        ReplayU32::Fixed(value) => {
+            assert!(value > 0, "{name} must be positive");
+            assert!(value <= max_value, "{name} exceeds recorded capacity");
+            builder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
     }
 }
 

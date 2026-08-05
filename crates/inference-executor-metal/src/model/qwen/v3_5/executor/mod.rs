@@ -8,6 +8,7 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::attn::GQAPageTableLayout;
+use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::backend::runtime::Runtime;
 use inference_executor_core::model::qwen::v3_5::Qwen35DecodeDecision;
@@ -36,6 +37,7 @@ use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
 
+use crate::attn::gqa::backend::add_gqa_replay_arguments;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::def::replay_op::ReplayRecorder;
@@ -283,6 +285,7 @@ pub struct Qwen35Executor {
 pub struct Qwen35ModelOpsRecorder {
     main_embed_key: Qwen35MainEmbedReplayKey,
     main_key: Qwen35MainReplayKey,
+    main_arguments: ReplayArguments,
     main_embed_cache_hit: bool,
     main_cache_hit: bool,
     gather_unembed_key: Option<Qwen35GatherUnembedReplayKey>,
@@ -295,6 +298,8 @@ pub struct Qwen35ModelOpsRecorder {
     num_main_sample_rows: usize,
     mtp_embed_key: Option<Qwen35MTPEmbedReplayKey>,
     mtp_key: Option<Qwen35MTPReplayKey>,
+    mtp_gqa_shape: Option<GQAReplayShape>,
+    mtp_gqa_topology: Option<crate::attn::gqa::backend::GQAReplayTopology>,
     mtp_microbatch: Option<Qwen35Microbatch>,
     mtp_sampler_configs: Vec<SamplerConfig>,
     mtp_sample_positions: Vec<u32>,
@@ -438,7 +443,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         } else {
             self.main_gqa_state.prepare_pages(core_batch_req);
         }
-        let gqa_shape = self.main_gqa_state.prepare_metadata(
+        let gqa_shape = self.main_gqa_state.prepare_metadata_bucketed(
             microbatch.req_slots(),
             microbatch.token_indices(),
             microbatch.cu_tokens(),
@@ -506,8 +511,11 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         );
         let main_key = Qwen35MainReplayKey::from_shapes(
             self.main_gqa_state.metadata().replay_shape(),
+            self.main_gqa_state.replay_topology(),
             self.main_gdn_state.metadata().replay_shape(),
         );
+        let mut main_arguments = ReplayArguments::new();
+        self.main_gqa_state.add_replay_arguments(&mut main_arguments);
         trace::qwen35_state(|| {
             format!(
                 "event=begin_ops_recording main_embed_key={:?} main_key={:?}",
@@ -517,6 +525,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         Qwen35ModelOpsRecorder {
             main_embed_key,
             main_key,
+            main_arguments,
             main_embed_cache_hit: false,
             main_cache_hit: false,
             dspark: Qwen3xDSparkRecording::new(),
@@ -530,6 +539,8 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             num_main_sample_rows: num_main_output_rows(model_batch_request.microbatch()),
             mtp_embed_key: None,
             mtp_key: None,
+            mtp_gqa_shape: None,
+            mtp_gqa_topology: None,
             mtp_microbatch: None,
             mtp_sampler_configs: Vec::new(),
             mtp_sample_positions: Vec::new(),
@@ -586,6 +597,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             hidden_input: &model_batch_hidden,
             hidden_output: &self.hidden_output,
             gqa: self.main_gqa_state.metadata(),
+            gqa_replay_topology: self.main_gqa_state.replay_topology(),
             gdn: self.main_gdn_state.metadata(),
             pages: self.pages.buffer(),
         };
@@ -877,10 +889,12 @@ fn replay_bucket_capacity_allow_zero(active: usize, max_capacity: usize) -> usiz
 mod tests {
     use std::rc::Rc;
 
+    use inference_backend_metal::components::GQAComputePath;
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
     use inference_backend_metal::metal::Stream;
+    use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
     use inference_executor_core::attn::GDNReplayShape;
     use inference_executor_core::attn::GQAReplayShape;
     use inference_executor_core::attn::gdn::state::GDNStateTxn;
@@ -902,6 +916,7 @@ mod tests {
     use super::mtp_proposal_sample_position;
     use super::mtp_sample_replay_shape;
     use super::replay_bucket_capacity;
+    use crate::attn::gqa::backend::GQAReplayTopology;
 
     #[test]
     fn test_mtp_proposal_sample_position_advances_per_step() {
@@ -953,9 +968,10 @@ mod tests {
 
     #[test]
     fn test_main_key() {
-        let key = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), gdn_shape(1));
+        let topology = single_gqa_topology();
+        let key = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), topology, gdn_shape(1));
 
-        assert_eq!(key.debug_parts(), (4, 4, 4, 1));
+        assert_eq!(key.debug_parts(), (4, 4, 4, 4, 1, topology));
     }
 
     #[test]
@@ -966,15 +982,17 @@ mod tests {
 
     #[test]
     fn test_main_key_tiled() {
-        let key = Qwen35MainReplayKey::from_shapes(tiled_gqa_shape(), gdn_shape(1));
+        let topology = tiled_gqa_topology();
+        let key = Qwen35MainReplayKey::from_shapes(tiled_gqa_shape(), topology, gdn_shape(1));
 
-        assert_eq!(key.debug_parts(), (4, 1, 1, 1));
+        assert_eq!(key.debug_parts(), (4, 4, 1, 1, 1, topology));
     }
 
     #[test]
     fn test_main_key_separates_gdn_request_geometry() {
-        let one_req = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), gdn_shape(1));
-        let two_reqs = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), gdn_shape(2));
+        let one_req = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), single_gqa_topology(), gdn_shape(1));
+        let two_reqs =
+            Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), single_gqa_topology(), gdn_shape(2));
 
         assert_ne!(one_req, two_reqs);
     }
@@ -988,8 +1006,8 @@ mod tests {
         };
 
         assert_eq!(
-            Qwen35MainReplayKey::from_shapes(one_task_template_per_token, gdn_shape(1)),
-            Qwen35MainReplayKey::from_shapes(multiple_task_templates_per_token, gdn_shape(1))
+            Qwen35MainReplayKey::from_shapes(one_task_template_per_token, single_gqa_topology(), gdn_shape(1)),
+            Qwen35MainReplayKey::from_shapes(multiple_task_templates_per_token, single_gqa_topology(), gdn_shape(1))
         );
     }
 
@@ -1034,7 +1052,10 @@ mod tests {
     fn single_q_token_gqa_shape() -> GQAReplayShape {
         GQAReplayShape {
             num_tokens: 4,
+            total_tokens: 4,
             num_q_token_tiles: 4,
+            total_q_token_tiles: 4,
+            num_sdpa_map_task_templates: 4,
             total_sdpa_map_task_templates: 4,
             reduce_sdpa_partial_outputs: false,
         }
@@ -1050,9 +1071,36 @@ mod tests {
     fn tiled_gqa_shape() -> GQAReplayShape {
         GQAReplayShape {
             num_tokens: 4,
+            total_tokens: 4,
             num_q_token_tiles: 1,
+            total_q_token_tiles: 1,
+            num_sdpa_map_task_templates: 1,
             total_sdpa_map_task_templates: 1,
             reduce_sdpa_partial_outputs: true,
+        }
+    }
+
+    fn single_gqa_topology() -> GQAReplayTopology {
+        GQAReplayTopology {
+            compute_path: GQAComputePath::SingleQueryToken {
+                kv_token_tile_size: 256,
+                num_threads_per_threadblock: 256,
+                q_head_tile_size: 6,
+            },
+            qgkv_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+        }
+    }
+
+    fn tiled_gqa_topology() -> GQAReplayTopology {
+        GQAReplayTopology {
+            compute_path: GQAComputePath::TiledQueryTokens {
+                q_token_tile_size: 8,
+                kv_token_tile_size: 16,
+                q_head_tile_size: 6,
+            },
+            qgkv_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
         }
     }
 }

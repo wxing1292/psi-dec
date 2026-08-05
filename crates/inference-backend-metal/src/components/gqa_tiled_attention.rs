@@ -269,6 +269,29 @@ impl GQATiledSDPAKernels {
             shape: self.shape,
             buffers,
             page_table_index,
+            num_active_tokens: ReplayU32::Fixed(self.shape.num_tokens),
+            num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_q_token_tiles),
+            num_active_sdpa_map_task_templates: ReplayU32::Fixed(self.shape.total_sdpa_map_task_templates),
+        }
+    }
+
+    pub fn invoke_map_bucketed<'a>(
+        &self,
+        buffers: GQATiledSDPAMapBuffers<'a>,
+        page_table_index: ReplayU32,
+        num_active_tokens: ReplayU32,
+        num_active_q_token_tiles: ReplayU32,
+        num_active_sdpa_map_task_templates: ReplayU32,
+    ) -> GQATiledSDPAMapInvocation<'a> {
+        GQATiledSDPAMapInvocation {
+            pipeline: self.map.as_raw_retained(),
+            config: self.config,
+            shape: self.shape,
+            buffers,
+            page_table_index,
+            num_active_tokens,
+            num_active_q_token_tiles,
+            num_active_sdpa_map_task_templates,
         }
     }
 
@@ -278,6 +301,21 @@ impl GQATiledSDPAKernels {
             config: self.config,
             shape: self.shape,
             buffers,
+            num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_q_token_tiles),
+        }
+    }
+
+    pub fn invoke_reduce_bucketed<'a>(
+        &self,
+        buffers: GQATiledSDPAReduceBuffers<'a>,
+        num_active_q_token_tiles: ReplayU32,
+    ) -> GQATiledSDPAReduceInvocation<'a> {
+        GQATiledSDPAReduceInvocation {
+            pipeline: self.reduce.as_raw_retained(),
+            config: self.config,
+            shape: self.shape,
+            buffers,
+            num_active_q_token_tiles,
         }
     }
 }
@@ -288,6 +326,9 @@ pub struct GQATiledSDPAMapInvocation<'a> {
     shape: GQATiledSDPAShape,
     buffers: GQATiledSDPAMapBuffers<'a>,
     page_table_index: ReplayU32,
+    num_active_tokens: ReplayU32,
+    num_active_q_token_tiles: ReplayU32,
+    num_active_sdpa_map_task_templates: ReplayU32,
 }
 
 impl Operator for GQATiledSDPAMapInvocation<'_> {
@@ -330,6 +371,27 @@ impl Operator for GQATiledSDPAMapInvocation<'_> {
             },
             ReplayU32::Parameter(key) => recorder.bind_u32(10, key, 0, max_page_table_index),
         }
+        set_replay_u32(
+            recorder,
+            11,
+            self.num_active_q_token_tiles,
+            shape.num_q_token_tiles,
+            "GQA tiled SDPA active Q-token-tile count",
+        );
+        set_replay_u32(
+            recorder,
+            12,
+            self.num_active_sdpa_map_task_templates,
+            shape.total_sdpa_map_task_templates,
+            "GQA tiled SDPA active TaskTemplate count",
+        );
+        set_replay_u32(
+            recorder,
+            13,
+            self.num_active_tokens,
+            shape.num_tokens,
+            "GQA tiled SDPA active token count",
+        );
         recorder.set_threadblock_memory_length(0, config.map_threadblock_memory_bytes());
         recorder.dispatch_threadblocks(
             (
@@ -347,6 +409,7 @@ pub struct GQATiledSDPAReduceInvocation<'a> {
     config: GQATiledSDPAConfig,
     shape: GQATiledSDPAShape,
     buffers: GQATiledSDPAReduceBuffers<'a>,
+    num_active_q_token_tiles: ReplayU32,
 }
 
 impl Operator for GQATiledSDPAReduceInvocation<'_> {
@@ -371,6 +434,13 @@ impl Operator for GQATiledSDPAReduceInvocation<'_> {
         recorder.set_buffer_read(3, self.buffers.q_token_tiles, 0);
         recorder.set_buffer_read(4, self.buffers.cu_sdpa_partial_outputs, 0);
         recorder.set_buffer_write(5, self.buffers.output, 0);
+        set_replay_u32(
+            recorder,
+            6,
+            self.num_active_q_token_tiles,
+            shape.num_q_token_tiles,
+            "GQA tiled SDPA active Q-token-tile count",
+        );
         recorder.dispatch_threadblocks(
             (config.num_q_heads as usize, shape.num_q_token_tiles as usize, 1),
             (config.num_threads_per_threadblock() as usize, 1, 1),
@@ -382,7 +452,6 @@ fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
     format!(
         r#"
 #define NUM_TOKENS {num_tokens}
-#define NUM_Q_TOKEN_TILES {num_q_token_tiles}
 #define NUM_Q_HEADS {num_q_heads}
 #define NUM_KV_HEADS {num_kv_heads}
 #define Q_HEAD_TILE_SIZE {q_head_tile_size}
@@ -400,7 +469,6 @@ fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
 {body}
 "#,
         num_tokens = shape.num_tokens,
-        num_q_token_tiles = shape.num_q_token_tiles,
         num_q_heads = config.num_q_heads,
         num_kv_heads = config.num_kv_heads,
         q_head_tile_size = config.q_head_tile_size,
@@ -417,6 +485,17 @@ fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
         num_threads_per_threadblock = config.num_threads_per_threadblock(),
         body = SOURCE,
     )
+}
+
+fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+    match value {
+        ReplayU32::Fixed(value) => {
+            assert!(value > 0, "{name} must be positive");
+            assert!(value <= max_value, "{name} exceeds recorded capacity");
+            recorder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => recorder.bind_u32(index, key, 1, max_value),
+    }
 }
 
 #[cfg(test)]

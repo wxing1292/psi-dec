@@ -32,7 +32,6 @@ uint global_thread_index = thread_position_in_grid.x;
 uint thread_index_in_threadblock = global_thread_index % (uint)NUM_THREADS_PER_THREADBLOCK;
 uint threadblock_linear_index = global_thread_index / (uint)NUM_THREADS_PER_THREADBLOCK;
 
-constexpr uint num_active_tokens = uint(NUM_ACTIVE_TOKENS);
 constexpr uint num_q_heads = uint(NUM_Q_HEADS);
 if (threadblock_linear_index >=
     (uint)(TOTAL_SDPA_MAP_TASK_TEMPLATES * NUM_KV_HEADS * NUM_Q_HEAD_TILES_PER_KV_HEAD)) {
@@ -40,6 +39,9 @@ if (threadblock_linear_index >=
 }
 
 uint sdpa_map_task_template_index = threadblock_linear_index % (uint)TOTAL_SDPA_MAP_TASK_TEMPLATES;
+if (sdpa_map_task_template_index >= num_active_sdpa_map_task_templates) {
+    return;
+}
 uint head_group_index = threadblock_linear_index / (uint)TOTAL_SDPA_MAP_TASK_TEMPLATES;
 uint q_head_tile_index = head_group_index % (uint)NUM_Q_HEAD_TILES_PER_KV_HEAD;
 uint kv_head_index = head_group_index / (uint)NUM_Q_HEAD_TILES_PER_KV_HEAD;

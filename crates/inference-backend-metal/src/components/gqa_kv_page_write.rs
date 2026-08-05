@@ -153,6 +153,24 @@ impl GQAKVPageWrite {
             kernel: &self.kernel,
             shape,
             buffers,
+            num_active_token_writes: ReplayU32::Fixed(shape.num_token_writes),
+            page_table_index,
+        }
+    }
+
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: GQAKVPageWriteShape,
+        buffers: GQAKVPageWriteBuffers<'a>,
+        num_active_token_writes: ReplayU32,
+        page_table_index: ReplayU32,
+    ) -> GQAKVPageWriteInvocation<'a> {
+        GQAKVPageWriteInvocation {
+            config: self.config,
+            kernel: &self.kernel,
+            shape,
+            buffers,
+            num_active_token_writes,
             page_table_index,
         }
     }
@@ -175,6 +193,7 @@ pub struct GQAKVPageWriteInvocation<'a> {
     kernel: &'a Kernel,
     shape: GQAKVPageWriteShape,
     buffers: GQAKVPageWriteBuffers<'a>,
+    num_active_token_writes: ReplayU32,
     page_table_index: ReplayU32,
 }
 
@@ -188,7 +207,14 @@ impl Operator for GQAKVPageWriteInvocation<'_> {
         builder.set_buffer_read(3, self.buffers.req_slots, 0);
         builder.set_buffer_read(4, self.buffers.flat_token_indices, 0);
         builder.set_buffer_read(5, self.buffers.page_ids, 0);
-        builder.set_u32(6, self.shape.num_token_writes);
+        match self.num_active_token_writes {
+            ReplayU32::Fixed(num_active_token_writes) => {
+                assert!(num_active_token_writes > 0);
+                assert!(num_active_token_writes <= self.shape.num_token_writes);
+                builder.set_u32(6, num_active_token_writes);
+            },
+            ReplayU32::Parameter(key) => builder.bind_u32(6, key, 1, self.shape.num_token_writes),
+        }
         let max_page_table_index = self.shape.page_table_layout.num_gqa_layers - 1;
         match self.page_table_index {
             ReplayU32::Fixed(page_table_index) => {
@@ -221,7 +247,11 @@ impl GQAKVPageWriteInvocation<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_WRITES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.kv.active_writes");
 
     #[test]
     #[should_panic(expected = "GQA KV page-write threads exceeds the shader u32 count domain")]
@@ -248,6 +278,69 @@ mod tests {
     fn test_fixed() {
         test_u16();
         test_f32();
+    }
+
+    #[test]
+    fn test_bucketed_replay_preserves_inactive_kv_page() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let sentinel = 0x7777_u16;
+        let page_values = 16;
+        let pages = Buffer::from_slice(&device, &vec![sentinel; 2 * page_values]);
+        let flat_k = Buffer::from_slice(&device, &[10_u16, 11, 12, 13, 14, 15, 16, 17]);
+        let flat_v = Buffer::from_slice(&device, &[20_u16, 21, 22, 23, 24, 25, 26, 27]);
+        let req_slots = Buffer::from_slice(&device, &[0_u32, 0, 0, 1]);
+        let flat_token_indices = Buffer::from_slice(&device, &[0_u32, 1, 2, 0]);
+        let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
+        let config = GQAKVPageWriteConfig {
+            num_kv_heads: 1,
+            head_dim: 2,
+            page_bytes: (page_values * size_of::<u16>()) as u32,
+            dtype: Dtype::Bfloat16,
+        };
+        let shape = GQAKVPageWriteShape {
+            num_token_writes: 4,
+            page_table_layout: GQAPageTableLayout {
+                num_req_slots: 2,
+                num_gqa_layers: 1,
+                num_blocks: 1,
+                num_page_ids_per_block: 1,
+            },
+        };
+        let kernel = GQAKVPageWrite::new(&device, config);
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_bucketed(
+            shape,
+            GQAKVPageWriteBuffers {
+                pages: &pages,
+                flat_k: &flat_k,
+                flat_v: &flat_v,
+                req_slots: &req_slots,
+                flat_token_indices: &flat_token_indices,
+                page_ids: &page_ids,
+            },
+            ReplayU32::Parameter(NUM_ACTIVE_WRITES),
+            ReplayU32::Fixed(0),
+        ));
+        let replay = builder.build();
+        assert_eq!(replay.stats().parameter_count, 1);
+
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, 3))
+            .wait();
+        assert_eq!(
+            pages.read_typed::<u16>(page_values, page_values),
+            vec![sentinel; page_values]
+        );
+
+        pages.write_typed(0, &vec![sentinel; 2 * page_values]);
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, 4))
+            .wait();
+        assert_ne!(
+            pages.read_typed::<u16>(page_values, page_values),
+            vec![sentinel; page_values]
+        );
     }
 
     fn test_u16() {

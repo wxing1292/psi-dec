@@ -232,7 +232,12 @@ fn build_metal_metadata(
     let num_tokens = num_tokens.try_into().expect("DSpark GQA token count must fit u32");
     let replay_shape = GQAReplayShape {
         num_tokens,
+        total_tokens: num_tokens,
         num_q_token_tiles: num_tokens,
+        total_q_token_tiles: num_tokens,
+        num_sdpa_map_task_templates: num_task_templates
+            .try_into()
+            .expect("DSpark GQA active TaskTemplate count must fit u32"),
         total_sdpa_map_task_templates: total_sdpa_map_task_templates
             .try_into()
             .expect("DSpark GQA TaskTemplate count must fit u32"),

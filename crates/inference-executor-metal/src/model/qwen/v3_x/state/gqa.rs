@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
@@ -9,7 +10,11 @@ use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gqa::backend::GQA;
 use crate::attn::gqa::backend::GQAMetalConfig;
+use crate::attn::gqa::backend::GQAReplayTopology;
+use crate::attn::gqa::backend::add_gqa_private_replay_arguments;
+use crate::attn::gqa::backend::add_gqa_replay_arguments;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
+use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::attn::gqa::scratch::GQAScratch;
 
@@ -18,6 +23,7 @@ pub struct Qwen3xGQAState {
     scratch: Rc<GQAScratch>,
     request_page_table: Rc<GQARequestPageTable>,
     metadata: GQAMetadataBuffers,
+    replay_bucket_policy: GQAReplayBucketPolicy,
     num_cache_pages: usize,
     cache_lane: usize,
 }
@@ -41,11 +47,14 @@ impl Qwen3xGQAState {
         page_table_layout.validate();
         let backend = Rc::new(GQA::new(device, core, metal));
         let scratch = Rc::new(backend.new_scratch(max_tokens));
+        let max_tokens_u32 = max_tokens.try_into().expect("qwen3.x GQA token capacity must fit u32");
+        let replay_bucket_policy = backend.replay_bucket_policy(max_tokens_u32);
         Self {
             backend,
             scratch,
             request_page_table: Rc::new(GQARequestPageTable::new(device, page_table_layout)),
             metadata: GQAMetadataBuffers::new(device, max_tokens),
+            replay_bucket_policy,
             num_cache_pages,
             cache_lane,
         }
@@ -90,6 +99,54 @@ impl Qwen3xGQAState {
     pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
         self.backend
             .prepare(&self.metadata, req_slots, token_indices, cu_tokens)
+    }
+
+    pub fn prepare_metadata_bucketed(
+        &self,
+        req_slots: &[u32],
+        token_indices: &[u32],
+        cu_tokens: &[u32],
+    ) -> GQAReplayShape {
+        self.backend.prepare_bucketed(
+            &self.metadata,
+            req_slots,
+            token_indices,
+            cu_tokens,
+            &self.replay_bucket_policy,
+        )
+    }
+
+    pub fn prepare_metadata_bucketed_with_token_capacity(
+        &self,
+        req_slots: &[u32],
+        token_indices: &[u32],
+        cu_tokens: &[u32],
+        total_tokens: u32,
+    ) -> GQAReplayShape {
+        self.backend.prepare_bucketed_with_token_capacity(
+            &self.metadata,
+            req_slots,
+            token_indices,
+            cu_tokens,
+            &self.replay_bucket_policy,
+            total_tokens,
+        )
+    }
+
+    pub fn replay_token_topology_boundaries(&self) -> Box<[u32]> {
+        self.backend.replay_token_topology_boundaries()
+    }
+
+    pub fn replay_topology(&self) -> GQAReplayTopology {
+        self.backend.replay_topology(&self.metadata)
+    }
+
+    pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
+        add_gqa_replay_arguments(self.metadata.replay_shape(), self.replay_topology(), arguments);
+    }
+
+    pub fn add_private_replay_arguments(&self, arguments: &mut ReplayArguments) {
+        add_gqa_private_replay_arguments(self.metadata.replay_shape(), self.replay_topology(), arguments);
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {

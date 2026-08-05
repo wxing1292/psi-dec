@@ -196,7 +196,7 @@ impl Qwen35Executor {
         let num_tokens = module_batch.microbatch.total_tokens();
         let num_mtp_sample_rows = module_batch.sampler_configs.len();
         self.write_token_ids(module_batch.microbatch.flat_token_ids());
-        let mtp_gqa_shape = self.speculator.mtp().gqa_state.prepare_metadata(
+        let mtp_gqa_shape = self.speculator.mtp().gqa_state.prepare_metadata_bucketed(
             module_batch.microbatch.req_slots(),
             module_batch.microbatch.token_indices(),
             module_batch.microbatch.cu_tokens(),
@@ -211,7 +211,8 @@ impl Qwen35Executor {
                 .draft_distribution_indices
                 .write_typed(0, &module_batch.draft_distribution_indices);
         }
-        let mtp_key = Qwen35MTPReplayKey::new(num_tokens, mtp_gqa_shape);
+        let mtp_gqa_topology = self.speculator.mtp().gqa_state.replay_topology();
+        let mtp_key = Qwen35MTPReplayKey::new(num_tokens, mtp_gqa_shape, mtp_gqa_topology);
         let mtp_embed_key = Qwen35MTPEmbedReplayKey::new(num_tokens);
         let mtp_hidden_input = Rc::clone(&self.speculator.mtp().hidden_input);
         let mtp_embed_build_start = Instant::now();
@@ -260,6 +261,8 @@ impl Qwen35Executor {
         });
         recorder.mtp_embed_key = Some(mtp_embed_key);
         recorder.mtp_key = Some(mtp_key);
+        recorder.mtp_gqa_shape = Some(mtp_gqa_shape);
+        recorder.mtp_gqa_topology = Some(mtp_gqa_topology);
         recorder.mtp_microbatch = Some(module_batch.microbatch);
         recorder.mtp_sampler_configs = module_batch.sampler_configs;
         recorder.mtp_sample_positions = module_batch.sample_positions;
@@ -296,6 +299,7 @@ impl Qwen35Executor {
             hidden_input: &mtp_hidden_input,
             hidden_output: &self.hidden_output,
             gqa: mtp.gqa_state.metadata(),
+            gqa_replay_topology: mtp.gqa_state.replay_topology(),
             pages: self.pages.buffer(),
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
@@ -363,7 +367,17 @@ impl Qwen35Executor {
         let gqa_layer_index = step_index
             .try_into()
             .expect("qwen3.5 MTP GQA layer index must fit u32");
-        let mtp_arguments = ReplayArguments::new().with_u32(
+        let mut mtp_arguments = ReplayArguments::new();
+        add_gqa_replay_arguments(
+            recorder
+                .mtp_gqa_shape
+                .expect("qwen3.5 MTP submission requires GQA replay arguments"),
+            recorder
+                .mtp_gqa_topology
+                .expect("qwen3.5 MTP submission requires GQA replay topology"),
+            &mut mtp_arguments,
+        );
+        mtp_arguments.set_u32(
             crate::model::qwen::v3_5::mtp::QWEN35_MTP_GQA_LAYER_INDEX,
             gqa_layer_index,
         );

@@ -4,7 +4,7 @@ use crate::metal::Dtype;
 ///
 /// Production callers provide workload facts to [`GQACompute`]. They do not
 /// select a path, kernel family, or tile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GQAComputePath {
     SingleQueryToken {
         kv_token_tile_size: u32,

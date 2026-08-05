@@ -578,7 +578,10 @@ mod tests {
     fn test_main_key_contains_only_token_and_gqa_topology() {
         let shape = GQAReplayShape {
             num_tokens: 4,
+            total_tokens: 4,
             num_q_token_tiles: 2,
+            total_q_token_tiles: 2,
+            num_sdpa_map_task_templates: 3,
             total_sdpa_map_task_templates: 3,
             reduce_sdpa_partial_outputs: true,
         };

@@ -33,6 +33,7 @@ use inference_executor_metal::attn::gqa::backend::GQA;
 use inference_executor_metal::attn::gqa::backend::GQAInput;
 use inference_executor_metal::attn::gqa::backend::GQAKVCacheBindings;
 use inference_executor_metal::attn::gqa::backend::GQAMetalConfig;
+use inference_executor_metal::attn::gqa::backend::GQAReplayMode;
 use inference_executor_metal::attn::gqa::backend::GQAWeights;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use inference_executor_metal::attn::gqa::scratch::GQAScratchBindings;
@@ -420,6 +421,7 @@ impl<'a> RealGQAFixture<'a> {
                     attention_output: &attention_output,
                     gated_attention_output: &gated_attention_output,
                 },
+                replay_mode: GQAReplayMode::Exact,
             },
         );
         let replay = builder.build();

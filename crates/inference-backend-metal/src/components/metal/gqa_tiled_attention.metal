@@ -58,6 +58,9 @@ kernel void gqa_tiled_sdpa_map(
     device float* partial_exp_sums [[buffer(8)]],
     device float* partial_max_logits [[buffer(9)]],
     constant uint& gqa_layer_index [[buffer(10)]],
+    constant uint& num_active_q_token_tiles [[buffer(11)]],
+    constant uint& num_active_sdpa_map_task_templates [[buffer(12)]],
+    constant uint& num_active_tokens [[buffer(13)]],
     threadgroup char* shared_mem [[threadgroup(0)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -73,12 +76,18 @@ kernel void gqa_tiled_sdpa_map(
     static_assert(NUM_SIMDGROUPS == NUM_SIMDGROUPS_PER_Q_HEAD * Q_HEAD_TILE_SIZE);
 
     const uint sdpa_map_task_template_index = threadblock_position.y;
+    if (sdpa_map_task_template_index >= num_active_sdpa_map_task_templates) {
+        return;
+    }
     const uint q_token_tile_index = sdpa_map_task_templates[sdpa_map_task_template_index * 3];
-    if (q_token_tile_index >= uint(NUM_Q_TOKEN_TILES)) {
+    if (q_token_tile_index >= num_active_q_token_tiles) {
         return;
     }
     const uint flat_token_start = q_token_tiles[q_token_tile_index * 2];
     const uint flat_token_end = q_token_tiles[q_token_tile_index * 2 + 1];
+    if (flat_token_start >= num_active_tokens || flat_token_end > num_active_tokens) {
+        return;
+    }
     const uint num_tile_tokens = flat_token_end - flat_token_start;
     const uint kv_token_begin = sdpa_map_task_templates[sdpa_map_task_template_index * 3 + 1];
     const uint kv_token_end = sdpa_map_task_templates[sdpa_map_task_template_index * 3 + 2];
@@ -319,11 +328,15 @@ kernel void gqa_tiled_sdpa_reduce(
     device const uint* q_token_tiles [[buffer(3)]],
     device const uint* cu_sdpa_partial_outputs [[buffer(4)]],
     device bfloat16_t* output [[buffer(5)]],
+    constant uint& num_active_q_token_tiles [[buffer(6)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]])
 {
     const uint q_head_index = threadblock_position.x;
     const uint q_token_tile_index = threadblock_position.y;
+    if (q_token_tile_index >= num_active_q_token_tiles) {
+        return;
+    }
     const uint flat_token_start = q_token_tiles[q_token_tile_index * 2];
     const uint flat_token_end = q_token_tiles[q_token_tile_index * 2 + 1];
     const uint num_tile_tokens = flat_token_end - flat_token_start;
