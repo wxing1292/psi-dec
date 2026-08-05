@@ -405,6 +405,27 @@ The kernel checks the active row count before it reads an input value or writes 
 The row-concat leaf has one fixed topology and adds no replay bucket boundary.
 The current Qwen3.5 MTPEmbed stage still selects exact row-concat recording.
 
+The shared RMS-normalization leaf supports exact and bucketed recording.
+Exact recording fixes the token count and declares no replay parameter.
+Bucketed recording dispatches the recorded token capacity and binds the caller-provided active-token key with the
+range `1..=capacity`.
+The RMS-normalization kernel checks the active token count before it reads or writes a row.
+
+Replay recording can fuse a residual add with the immediately following RMS normalization.
+The required-fusion residual path makes this adjacency and buffer-identity contract mandatory.
+Replay construction fails if another operator occurs first or if the RMS normalization consumes a different buffer.
+The residual shape contains `capacity * hidden_dim` values.
+The fused command inherits the active-token key and token capacity from the RMS normalization.
+It does not declare a separate active-value parameter.
+The ordinary and capture fused kernels check the active token count before they read or write a row.
+The capture variant validates its destination for the recorded capacity and writes only active rows.
+
+Standalone residual-add recording remains exact.
+A bucketed Qwen stage must use required residual/RMS-normalization fusion instead of a standalone residual dispatch.
+RMS normalization and residual/RMS-normalization fusion have fixed token-count topology and add no replay bucket
+boundary.
+The current Qwen3.5 stages still select exact normalization and residual recording.
+
 Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed.
 Its Main key owns only the token count and GQA replay topology.
 It never aliases a Qwen3.5 key or stores an optional GDN key.

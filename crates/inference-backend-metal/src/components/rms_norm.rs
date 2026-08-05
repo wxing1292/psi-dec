@@ -271,6 +271,7 @@ fn rms_norm_function_name(config: RMSNormConfig) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
     use inference_executor_core::reference::rms_norm_reference;
 
     use super::*;
@@ -334,6 +335,183 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bucketed_bf16_preserves_inactive_tail_across_grow_and_shrink() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let num_total_tokens = 2_u32;
+        let hidden_dim = 8_u32;
+        let config = RMSNormConfig::bf16(hidden_dim, 1.0e-6);
+        let shape = RMSNormShape { num_total_tokens };
+        let kernel = RMSNormKernel::new(&device, config);
+        let input_values = (0..config.num_values(shape))
+            .map(|index| index as f32 * 0.125 - 0.75)
+            .collect::<Vec<_>>();
+        let weight_values = (0..hidden_dim)
+            .map(|index| 0.75 + index as f32 * 0.0625)
+            .collect::<Vec<_>>();
+        let input = Buffer::from_slice(
+            &device,
+            &input_values
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .map(bf16::to_bits)
+                .collect::<Vec<_>>(),
+        );
+        let weight = Buffer::from_slice(
+            &device,
+            &weight_values
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .map(bf16::to_bits)
+                .collect::<Vec<_>>(),
+        );
+        let sentinel = bf16::from_f32(-321.0).to_bits();
+        let output = Buffer::from_slice(&device, &vec![sentinel; config.num_values(shape)]);
+
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_bucketed(
+            shape,
+            NUM_ACTIVE_TOKENS,
+            RMSNormBuffers {
+                input: &input,
+                weight: &weight,
+                output: &output,
+            },
+        ));
+        let replay = builder.build();
+        assert_eq!(replay.stats().parameter_count, 1);
+
+        assert_bf16_submission(
+            &stream,
+            &replay,
+            &output,
+            &input_values,
+            &weight_values,
+            1,
+            hidden_dim as usize,
+            sentinel,
+        );
+        assert_bf16_submission(
+            &stream,
+            &replay,
+            &output,
+            &input_values,
+            &weight_values,
+            2,
+            hidden_dim as usize,
+            sentinel,
+        );
+
+        let row_values = hidden_dim as usize;
+        input.write_typed(row_values, &vec![0x7fc1_u16; row_values]);
+        output.write_typed(row_values, &vec![sentinel; row_values]);
+        assert_bf16_submission(
+            &stream,
+            &replay,
+            &output,
+            &input_values,
+            &weight_values,
+            1,
+            row_values,
+            sentinel,
+        );
+    }
+
+    #[test]
+    fn test_bucketed_replay_validates_arguments_and_total_capacity_buffers() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = RMSNormConfig::bf16(8, 1.0e-6);
+        let shape = RMSNormShape { num_total_tokens: 2 };
+        let active_shape = RMSNormShape { num_total_tokens: 1 };
+        let input = Buffer::new_zeroed(&device, config.bytes(shape));
+        let active_input = Buffer::new_zeroed(&device, config.bytes(active_shape));
+        let weight = Buffer::new_zeroed(&device, config.weight_bytes());
+        let output = Buffer::new_zeroed(&device, config.bytes(shape));
+        let active_output = Buffer::new_zeroed(&device, config.bytes(active_shape));
+        let kernel = RMSNormKernel::new(&device, config);
+        let buffers = |input, output| {
+            RMSNormBuffers {
+                input,
+                weight: &weight,
+                output,
+            }
+        };
+
+        let mut exact_builder = stream.create_replay_program();
+        exact_builder.record(kernel.invoke(shape, buffers(&input, &output)));
+        assert_eq!(exact_builder.build().stats().parameter_count, 0);
+
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_bucketed(shape, NUM_ACTIVE_TOKENS, buffers(&input, &output)));
+        let replay = builder.build();
+        assert_eq!(replay.stats().parameter_count, 1);
+        assert_panics(|| {
+            let _ = stream.submit_replay(&replay);
+        });
+        assert_panics(|| {
+            let arguments = ReplayArguments::new().with_i32(NUM_ACTIVE_TOKENS, 1);
+            let _ = stream.submit_replay_with_arguments(&replay, &arguments);
+        });
+        for invalid_num_active_tokens in [0, 3] {
+            assert_panics(|| {
+                let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, invalid_num_active_tokens);
+                let _ = stream.submit_replay_with_arguments(&replay, &arguments);
+            });
+        }
+
+        assert_panics(|| {
+            let mut builder = stream.create_replay_program();
+            builder.record(kernel.invoke_bucketed(shape, NUM_ACTIVE_TOKENS, buffers(&active_input, &output)));
+        });
+        assert_panics(|| {
+            let mut builder = stream.create_replay_program();
+            builder.record(kernel.invoke_bucketed(shape, NUM_ACTIVE_TOKENS, buffers(&input, &active_output)));
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_bf16_submission(
+        stream: &Stream,
+        replay: &crate::metal::ReplayProgram,
+        output: &Buffer,
+        input_values: &[f32],
+        weight_values: &[f32],
+        num_active_tokens: usize,
+        hidden_dim: usize,
+        sentinel: u16,
+    ) {
+        stream
+            .submit_replay_with_arguments(
+                replay,
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32),
+            )
+            .wait();
+        let active_values = num_active_tokens * hidden_dim;
+        let expected = rms_norm_reference(
+            &input_values[..active_values],
+            weight_values,
+            None,
+            num_active_tokens,
+            hidden_dim,
+            1.0e-6,
+        );
+        let actual = output
+            .read_typed::<u16>(0, active_values)
+            .into_iter()
+            .map(bf16::from_bits)
+            .map(bf16::to_f32)
+            .collect::<Vec<_>>();
+        assert_close(&actual, &expected, 0.02);
+        assert_eq!(
+            output.read_typed::<u16>(active_values, input_values.len() - active_values),
+            vec![sentinel; input_values.len() - active_values]
+        );
+    }
+
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(actual.len(), expected.len());
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
@@ -342,5 +520,9 @@ mod tests {
                 "RMSNorm mismatch at {index}: expected={expected} actual={actual} tolerance={tolerance}"
             );
         }
+    }
+
+    fn assert_panics(f: impl FnOnce()) {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }

@@ -41,6 +41,31 @@ impl ResidualAdd {
         recorder.record_with_barrier_before(ReplayOp::residual_add(invocation));
     }
 
+    /// Records a residual add that must fuse with the next RMSNorm.
+    ///
+    /// `num_values` is the recorded capacity. The following RMSNorm owns the
+    /// active-token replay parameter for the fused operation.
+    pub fn record_requiring_rms_norm<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_values: u32,
+        lhs: &'a Buffer,
+        rhs: &'a Buffer,
+        residual_output: &'a Buffer,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        let invocation = self.compute.invoke(
+            ResidualAddShape { num_values },
+            ResidualAddBuffers {
+                lhs,
+                rhs,
+                output: residual_output,
+            },
+        );
+        recorder.record_with_barrier_before(ReplayOp::residual_add_requiring_rms_norm(invocation));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_with_capture<'a, R>(
         &'a self,

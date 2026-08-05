@@ -5,6 +5,7 @@ use inference_backend_metal::components::RMSNormKernel;
 use inference_backend_metal::components::RMSNormShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::backend::recorder::Recorder;
 
 use crate::def::replay_op::ReplayOp;
@@ -38,6 +39,24 @@ impl RMSNorm {
         )
     }
 
+    fn bucketed_invocation<'a>(
+        &'a self,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        input: &'a Buffer,
+        output: &'a Buffer,
+    ) -> RMSNormInvocation<'a> {
+        self.compute.invoke_bucketed(
+            RMSNormShape { num_total_tokens },
+            num_active_tokens_key,
+            RMSNormBuffers {
+                input,
+                weight: &self.weight,
+                output,
+            },
+        )
+    }
+
     pub fn record<'a, R>(&'a self, recorder: &mut R, num_tokens: u32, input: &'a Buffer, output: &'a Buffer)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
@@ -55,5 +74,41 @@ impl RMSNorm {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         recorder.record_with_barrier_before(ReplayOp::rms_norm(self.invocation(num_tokens, input, output)));
+    }
+
+    pub fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        input: &'a Buffer,
+        output: &'a Buffer,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        recorder.record(ReplayOp::rms_norm(self.bucketed_invocation(
+            num_total_tokens,
+            num_active_tokens_key,
+            input,
+            output,
+        )));
+    }
+
+    pub fn record_bucketed_with_barrier<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        input: &'a Buffer,
+        output: &'a Buffer,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        recorder.record_with_barrier_before(ReplayOp::rms_norm(self.bucketed_invocation(
+            num_total_tokens,
+            num_active_tokens_key,
+            input,
+            output,
+        )));
     }
 }

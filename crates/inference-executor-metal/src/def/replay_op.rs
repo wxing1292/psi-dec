@@ -131,6 +131,16 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
+    /// Records a residual add that must fuse with the next RMSNorm.
+    ///
+    /// Replay construction panics if another operator occurs first or if the
+    /// RMSNorm does not consume this residual output.
+    pub fn residual_add_requiring_rms_norm(invocation: ResidualAddInvocation<'a>) -> Self {
+        Self {
+            inner: inference_backend_metal::components::ReplayOp::residual_add_requiring_rms_norm(invocation),
+        }
+    }
+
     /// Records a BF16 residual add that captures every complete output row.
     ///
     /// The next recorded operator must be the RMSNorm consuming this residual
