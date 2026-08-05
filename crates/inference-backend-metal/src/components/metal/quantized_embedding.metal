@@ -65,14 +65,14 @@ static inline void quantized_embedding_impl(
     device const T* scales,
     device const T* biases,
     device ushort* output,
-    uint num_tokens,
+    uint num_active_tokens,
     uint vocab_size,
     uint hidden_dim,
     uint group_size,
     uint bits,
     uint gid
 ) {
-    const uint total = num_tokens * hidden_dim;
+    const uint total = num_active_tokens * hidden_dim;
     if (gid >= total) {
         return;
     }
@@ -100,7 +100,7 @@ kernel void quantized_embedding_f32_to_bf16(
     device const float* scales [[buffer(2)]],
     device const float* biases [[buffer(3)]],
     device ushort* output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     constant uint& vocab_size [[buffer(6)]],
     constant uint& hidden_dim [[buffer(7)]],
     constant uint& group_size [[buffer(8)]],
@@ -108,7 +108,7 @@ kernel void quantized_embedding_f32_to_bf16(
     uint gid [[thread_position_in_grid]]
 ) {
     quantized_embedding_impl<float>(
-        token_ids, weight, scales, biases, output, num_tokens, vocab_size, hidden_dim, group_size, bits, gid);
+        token_ids, weight, scales, biases, output, num_active_tokens, vocab_size, hidden_dim, group_size, bits, gid);
 }
 
 kernel void quantized_embedding_bf16_to_bf16(
@@ -117,7 +117,7 @@ kernel void quantized_embedding_bf16_to_bf16(
     device const bfloat* scales [[buffer(2)]],
     device const bfloat* biases [[buffer(3)]],
     device ushort* output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     constant uint& vocab_size [[buffer(6)]],
     constant uint& hidden_dim [[buffer(7)]],
     constant uint& group_size [[buffer(8)]],
@@ -125,5 +125,5 @@ kernel void quantized_embedding_bf16_to_bf16(
     uint gid [[thread_position_in_grid]]
 ) {
     quantized_embedding_impl<bfloat>(
-        token_ids, weight, scales, biases, output, num_tokens, vocab_size, hidden_dim, group_size, bits, gid);
+        token_ids, weight, scales, biases, output, num_active_tokens, vocab_size, hidden_dim, group_size, bits, gid);
 }

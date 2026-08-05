@@ -6,6 +6,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayParameterKey;
 
 const QUANTIZED_EMBEDDING_SOURCE: &str = include_str!("metal/quantized_embedding.metal");
 
@@ -122,6 +123,22 @@ impl QuantizedEmbeddingKernel {
             kernel: self,
             shape,
             buffers,
+            num_active_tokens_key: None,
+        }
+    }
+
+    /// Records a fixed-capacity grid whose active token count is supplied at submission.
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        capacity_shape: QuantizedEmbeddingShape,
+        num_active_tokens_key: ReplayParameterKey,
+        buffers: QuantizedEmbeddingBuffers<'a>,
+    ) -> QuantizedEmbeddingInvocation<'a> {
+        QuantizedEmbeddingInvocation {
+            kernel: self,
+            shape: capacity_shape,
+            buffers,
+            num_active_tokens_key: Some(num_active_tokens_key),
         }
     }
 }
@@ -130,6 +147,7 @@ pub struct QuantizedEmbeddingInvocation<'a> {
     kernel: &'a QuantizedEmbeddingKernel,
     shape: QuantizedEmbeddingShape,
     buffers: QuantizedEmbeddingBuffers<'a>,
+    num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for QuantizedEmbeddingInvocation<'_> {
@@ -143,7 +161,10 @@ impl Operator for QuantizedEmbeddingInvocation<'_> {
         builder.set_buffer_read(2, self.buffers.scales, 0);
         builder.set_buffer_read(3, self.buffers.biases, 0);
         builder.set_buffer_write(4, self.buffers.output, 0);
-        builder.set_u32(5, self.shape.num_tokens);
+        match self.num_active_tokens_key {
+            Some(key) => builder.bind_u32(5, key, 1, self.shape.num_tokens),
+            None => builder.set_u32(5, self.shape.num_tokens),
+        }
         builder.set_u32(6, config.vocab_size);
         builder.set_u32(7, config.hidden_dim);
         builder.set_u32(8, config.group_size);
@@ -184,12 +205,16 @@ mod tests {
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
 
     const VOCAB_SIZE: u32 = 2;
     const HIDDEN_DIM: u32 = 32;
     const GROUP_SIZE: u32 = 32;
     const BITS: u32 = 4;
+    const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.quantized_embedding.num_active_tokens");
+    const OUTPUT_CANARY: u16 = 0x7fc1;
 
     #[test]
     #[should_panic(expected = "F32 quantized embedding output is not implemented")]
@@ -231,6 +256,149 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bucketed_replay_preserves_inactive_tail_across_grow_and_shrink() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let scales = [0.5f32, 0.25];
+        let biases = [-1.0f32, 2.0];
+        let config = QuantizedEmbeddingConfig {
+            vocab_size: VOCAB_SIZE,
+            hidden_dim: HIDDEN_DIM,
+            group_size: GROUP_SIZE,
+            bits: BITS,
+            scale_bias_dtype: Dtype::Float32,
+            output_dtype: Dtype::Bfloat16,
+        };
+        let shape = QuantizedEmbeddingShape { num_tokens: 4 };
+        let token_ids = Buffer::from_slice(&device, &[0_u32, 1, 0, u32::MAX]);
+        let weight = Buffer::from_slice(&device, &packed_q4_rows());
+        let scales_buffer = Buffer::from_slice(&device, &f32_bytes(&scales));
+        let biases_buffer = Buffer::from_slice(&device, &f32_bytes(&biases));
+        let output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; shape.num_output_values(config)]);
+        let kernel = QuantizedEmbeddingKernel::new(&device, config);
+
+        let mut recorder = stream.create_replay_program();
+        recorder.record(kernel.invoke_bucketed(
+            shape,
+            NUM_ACTIVE_TOKENS,
+            QuantizedEmbeddingBuffers {
+                token_ids: &token_ids,
+                weight: &weight,
+                scales: &scales_buffer,
+                biases: &biases_buffer,
+                output: &output,
+            },
+        ));
+        let replay = recorder.build();
+        assert_eq!(replay.stats().parameter_count, 1);
+
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 3))
+            .wait();
+        let active_values = 3 * HIDDEN_DIM as usize;
+        let expected_active = token_ids_reference(&[0, 1, 0], &scales, &biases);
+        assert_eq!(output.read_typed::<u16>(0, active_values), expected_active);
+        assert_eq!(
+            output.read_typed::<u16>(active_values, HIDDEN_DIM as usize),
+            vec![OUTPUT_CANARY; HIDDEN_DIM as usize]
+        );
+
+        let exact_output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; active_values]);
+        let mut exact_recorder = stream.create_replay_program();
+        exact_recorder.record(kernel.invoke(
+            QuantizedEmbeddingShape { num_tokens: 3 },
+            QuantizedEmbeddingBuffers {
+                token_ids: &token_ids,
+                weight: &weight,
+                scales: &scales_buffer,
+                biases: &biases_buffer,
+                output: &exact_output,
+            },
+        ));
+        let exact_replay = exact_recorder.build();
+        assert_eq!(exact_replay.stats().parameter_count, 0);
+        stream.submit_replay(&exact_replay).wait();
+        assert_eq!(exact_output.read_typed::<u16>(0, active_values), expected_active);
+
+        token_ids.write_typed(3, &[1_u32]);
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 4))
+            .wait();
+        let expected_full = token_ids_reference(&[0, 1, 0, 1], &scales, &biases);
+        let full_output = output.read_typed::<u16>(0, shape.num_output_values(config));
+        assert_eq!(full_output, expected_full);
+
+        token_ids.write_typed(3, &[u32::MAX]);
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 3))
+            .wait();
+        assert_eq!(output.read_typed::<u16>(0, active_values), expected_active);
+        assert_eq!(
+            output.read_typed::<u16>(active_values, HIDDEN_DIM as usize),
+            full_output[active_values..]
+        );
+    }
+
+    #[test]
+    fn test_bucketed_replay_validates_arguments_and_total_capacity_buffers() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = QuantizedEmbeddingConfig {
+            vocab_size: VOCAB_SIZE,
+            hidden_dim: HIDDEN_DIM,
+            group_size: GROUP_SIZE,
+            bits: BITS,
+            scale_bias_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+        };
+        let shape = QuantizedEmbeddingShape { num_tokens: 4 };
+        let token_ids = Buffer::from_slice(&device, &[0_i32; 4]);
+        let active_token_ids = Buffer::from_slice(&device, &[0_i32; 3]);
+        let weight = Buffer::from_slice(&device, &packed_q4_rows());
+        let scales = Buffer::from_slice(&device, &[bf16::ONE.to_bits(); 2]);
+        let biases = Buffer::from_slice(&device, &[bf16::ZERO.to_bits(); 2]);
+        let output = Buffer::new_zeroed_elements(&device, shape.num_output_values(config), Dtype::Bfloat16);
+        let active_output = Buffer::new_zeroed_elements(&device, 3 * HIDDEN_DIM as usize, Dtype::Bfloat16);
+        let kernel = QuantizedEmbeddingKernel::new(&device, config);
+        let buffers = |token_ids, output| {
+            QuantizedEmbeddingBuffers {
+                token_ids,
+                weight: &weight,
+                scales: &scales,
+                biases: &biases,
+                output,
+            }
+        };
+
+        let mut recorder = stream.create_replay_program();
+        recorder.record(kernel.invoke_bucketed(shape, NUM_ACTIVE_TOKENS, buffers(&token_ids, &output)));
+        let replay = recorder.build();
+        assert_eq!(replay.stats().parameter_count, 1);
+        assert_panics(|| {
+            let _ = stream.submit_replay(&replay);
+        });
+        assert_panics(|| {
+            let arguments = ReplayArguments::new().with_i32(NUM_ACTIVE_TOKENS, 3);
+            let _ = stream.submit_replay_with_arguments(&replay, &arguments);
+        });
+        for invalid_num_active_tokens in [0, 5] {
+            assert_panics(|| {
+                let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, invalid_num_active_tokens);
+                let _ = stream.submit_replay_with_arguments(&replay, &arguments);
+            });
+        }
+
+        assert_panics(|| {
+            let mut recorder = stream.create_replay_program();
+            recorder.record(kernel.invoke_bucketed(shape, NUM_ACTIVE_TOKENS, buffers(&active_token_ids, &output)));
+        });
+        assert_panics(|| {
+            let mut recorder = stream.create_replay_program();
+            recorder.record(kernel.invoke_bucketed(shape, NUM_ACTIVE_TOKENS, buffers(&token_ids, &active_output)));
+        });
+    }
+
     fn test_reference(
         scale_bias_dtype: Dtype,
         scale_bytes: &[u8],
@@ -268,7 +436,9 @@ mod tests {
                 output: &output,
             },
         ));
-        stream.submit_replay(&recorder.build()).wait();
+        let replay = recorder.build();
+        assert_eq!(replay.stats().parameter_count, 0);
+        stream.submit_replay(&replay).wait();
 
         let actual = output.read_typed::<u16>(0, shape.num_output_values(config));
         let expected = token_ids_reference(&[-1, 0, 1, 2], scales, biases);
@@ -308,5 +478,9 @@ mod tests {
 
     fn bf16_bytes(values: &[bf16]) -> Vec<u8> {
         values.iter().flat_map(|value| value.to_bits().to_ne_bytes()).collect()
+    }
+
+    fn assert_panics(f: impl FnOnce()) {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }

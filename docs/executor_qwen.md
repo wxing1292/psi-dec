@@ -379,6 +379,14 @@ Replay<Rc<GDNRequestStateTable>>
 
 MainEmbed and MTPEmbed are separate replay boundaries with their own keys.
 
+The shared quantized embedding leaf supports exact and bucketed recording.
+Exact recording fixes the active token count to `QuantizedEmbeddingShape::num_tokens` and declares no replay parameter.
+Bucketed recording interprets `QuantizedEmbeddingShape::num_tokens` as the recorded capacity.
+It validates buffers and dispatches the grid for that capacity.
+It binds the caller-provided active-token key with the range `1..=capacity`.
+The kernel checks the active token count before it reads `token_ids` or writes the output row.
+The current Qwen MainEmbed and MTPEmbed stages still select exact recording.
+
 Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed.
 Its Main key owns only the token count and GQA replay topology.
 It never aliases a Qwen3.5 key or stores an optional GDN key.

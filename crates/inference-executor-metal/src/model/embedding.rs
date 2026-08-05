@@ -5,6 +5,7 @@ use inference_backend_metal::components::QuantizedEmbeddingShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::checkpoint::remove_tensor;
@@ -70,13 +71,7 @@ pub struct EmbedInput<'a> {
 
 impl Embed {
     fn validate_input(&self, input: EmbedInput<'_>) {
-        assert!(input.num_tokens > 0, "embedding requires at least one token");
-        assert!(
-            input.num_tokens <= self.config.max_tokens,
-            "embedding num_tokens={} exceed max_tokens={}",
-            input.num_tokens,
-            self.config.max_tokens
-        );
+        self.validate_num_tokens(input.num_tokens);
     }
 
     pub fn load(
@@ -104,6 +99,44 @@ impl Embed {
             config.num_affine_params() * self.config.scale_bias_dtype.item_size()
         );
         assert_eq!(self.weights.biases.len_bytes(), self.weights.scales.len_bytes());
+    }
+
+    pub fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        token_ids: &'a Buffer,
+        output_hidden: &'a Buffer,
+    ) -> &'a Buffer
+    where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        self.validate_num_tokens(num_total_tokens);
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke_bucketed(
+            QuantizedEmbeddingShape {
+                num_tokens: num_total_tokens,
+            },
+            num_active_tokens_key,
+            QuantizedEmbeddingBuffers {
+                token_ids,
+                weight: &self.weights.weight,
+                scales: &self.weights.scales,
+                biases: &self.weights.biases,
+                output: output_hidden,
+            },
+        )));
+        output_hidden
+    }
+
+    fn validate_num_tokens(&self, num_tokens: u32) {
+        assert!(num_tokens > 0, "embedding requires at least one token");
+        assert!(
+            num_tokens <= self.config.max_tokens,
+            "embedding num_tokens={} exceed max_tokens={}",
+            num_tokens,
+            self.config.max_tokens
+        );
     }
 }
 
