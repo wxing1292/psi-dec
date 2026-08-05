@@ -195,13 +195,45 @@ This contract aligns replay resource dependencies with the data flow.
 The routing kernel renormalizes selected probabilities only when `norm_topk_prob=true`.
 `expert_indices` and `expert_probs` are route-major with `num_tokens * num_experts_per_token` entries.
 
-The shape contract is exact for the current microbatch:
+The full `GatedMoE` replay shape contract is exact for the current microbatch:
 
 ```text
 num_tokens              current microbatch token count
 num_routes              num_tokens * num_experts_per_token
 compute path            selected from num_tokens
 ```
+
+The backend also has a routing-only bucket-readiness API.
+This API records this chain:
+
+```text
+router affine -> router softmax -> top-k routing
+```
+
+`GatedMoE::record_routing_bucketed(...)` records a fixed `num_total_tokens` capacity.
+The caller supplies `num_active_tokens` at submission through one `ReplayParameterKey`.
+The router affine, softmax, and top-k routing commands use the same key and the same domain.
+The exact routing chain has zero replay parameters.
+The bucketed routing chain has one replay parameter.
+
+The fixed total token count determines the recorded affine kernel and all dispatch grids.
+The active token count does not determine topology or replay identity.
+All routing-chain buffers must cover `num_total_tokens`.
+The router affine uses its active-row replay ABI.
+The softmax kernel returns uniformly for an inactive row before it reads logits or reaches a threadgroup barrier.
+The top-k routing kernel returns uniformly for an inactive token before it reads probabilities, writes outputs, or
+reaches a threadgroup barrier.
+
+`GatedMoE::routing_replay_topology(...)` reports only `{ router_affine }`.
+`GatedMoE::routing_replay_topology_boundaries()` reports only router affine topology changes.
+It does not add the full MoE token-major/expert-major boundary at token count `5`.
+An affine topology change can independently occur at token count `5`.
+
+The routing-only API does not enable bucketed replay through `ReplayLayer`.
+The full `GatedMoE` replay remains exact.
+A future full-MoE bucket policy must include the compute-path boundary at token count `5`.
+It must also include all topology boundaries from sparse MLP, expert-major layout/pack/scatter, combine, shared
+experts, and shared-expert gate components.
 
 The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
 `MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.

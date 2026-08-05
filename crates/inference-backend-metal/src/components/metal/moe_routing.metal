@@ -15,14 +15,14 @@ kernel void moe_route_topk(
     device const bfloat16_t* router_probs [[buffer(0)]],
     device uint* expert_indices [[buffer(1)]],
     device float* expert_probs [[buffer(2)]],
-    constant uint& num_tokens [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(3)]],
     constant uint& num_experts [[buffer(4)]],
     constant uint& num_experts_per_token [[buffer(5)]],
     constant uint& norm_topk_prob [[buffer(6)]],
     uint token [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
-    if (token >= num_tokens) return;
+    if (token >= num_active_tokens) return;
     const uint base = token * num_experts;
     threadgroup float candidate_probs[256];
     threadgroup uint candidate_experts[256];

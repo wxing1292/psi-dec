@@ -7,6 +7,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayParameterKey;
 use crate::operators::mlx_headers::find_mlx_metal_header_root;
 use crate::operators::mlx_headers::read_mlx_metal_header;
 
@@ -62,8 +63,11 @@ pub struct SoftmaxBuffers<'a> {
 impl SoftmaxKernel {
     pub fn new(device: &Device, config: SoftmaxConfig) -> Self {
         config.validate();
-        let kernel = Kernel::new(device, &softmax_source(), "block_softmax_bfloat16");
-        Self { config, kernel }
+        let source = softmax_source();
+        Self {
+            config,
+            kernel: Kernel::new(device, &source, "block_softmax_bfloat16"),
+        }
     }
 
     pub fn invoke<'a>(&'a self, shape: SoftmaxShape, buffers: SoftmaxBuffers<'a>) -> SoftmaxInvocation<'a> {
@@ -72,6 +76,23 @@ impl SoftmaxKernel {
             kernel: self,
             shape,
             buffers,
+            num_active_rows_key: None,
+        }
+    }
+
+    /// Records a fixed-capacity grid whose active row count is supplied at submission.
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: SoftmaxShape,
+        num_active_rows_key: ReplayParameterKey,
+        buffers: SoftmaxBuffers<'a>,
+    ) -> SoftmaxInvocation<'a> {
+        shape.validate();
+        SoftmaxInvocation {
+            kernel: self,
+            shape,
+            buffers,
+            num_active_rows_key: Some(num_active_rows_key),
         }
     }
 }
@@ -80,6 +101,7 @@ pub struct SoftmaxInvocation<'a> {
     kernel: &'a SoftmaxKernel,
     shape: SoftmaxShape,
     buffers: SoftmaxBuffers<'a>,
+    num_active_rows_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for SoftmaxInvocation<'_> {
@@ -95,6 +117,10 @@ impl Operator for SoftmaxInvocation<'_> {
         builder.set_buffer_read(0, self.buffers.input, 0);
         builder.set_buffer_write(1, self.buffers.output, 0);
         builder.set_i32(2, config.num_values_per_row as i32);
+        match self.num_active_rows_key {
+            Some(key) => builder.bind_u32(3, key, 1, shape.num_rows),
+            None => builder.set_u32(3, shape.num_rows),
+        }
 
         let n_reads = 4usize;
         let simd_size = 32usize;
@@ -130,12 +156,107 @@ fn softmax_source() -> String {
         "mlx/backend/metal/kernels/softmax.h",
         &mut included,
     ));
-    source.push_str(
-        "\ntemplate [[host_name(\"block_softmax_bfloat16\")]] [[kernel]] decltype(softmax_single_row<bfloat16_t, \
-         bfloat16_t>) softmax_single_row<bfloat16_t, bfloat16_t>;\n",
-    );
+    source.push_str(BUCKETED_SOFTMAX_SOURCE);
     source
 }
+
+// This kernel is the MLX single-row softmax with one fixed-capacity replay guard.
+// The guard is uniform across the whole threadgroup and occurs before all input
+// reads and threadgroup barriers.
+const BUCKETED_SOFTMAX_SOURCE: &str = r#"
+template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
+[[kernel]] void softmax_single_row_bucketed(
+    const device T* in,
+    device T* out,
+    constant int& axis_size,
+    constant uint& num_active_rows,
+    uint gid [[threadgroup_position_in_grid]],
+    uint _lid [[thread_position_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  if (gid >= num_active_rows) {
+    return;
+  }
+
+  int lid = _lid;
+  constexpr int SIMD_SIZE = 32;
+  threadgroup AccT local_max[SIMD_SIZE];
+  threadgroup AccT local_normalizer[SIMD_SIZE];
+  AccT ld[N_READS];
+
+  in += gid * size_t(axis_size) + lid * N_READS;
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      ld[i] = AccT(in[i]);
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      ld[i] =
+          ((lid * N_READS + i) < axis_size) ? AccT(in[i]) : Limits<AccT>::min;
+    }
+  }
+  if (simd_group_id == 0) {
+    local_max[simd_lane_id] = Limits<AccT>::min;
+    local_normalizer[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  AccT maxval = Limits<AccT>::finite_min;
+  for (int i = 0; i < N_READS; i++) {
+    maxval = (maxval < ld[i]) ? ld[i] : maxval;
+  }
+  maxval = simd_max(maxval);
+  if (simd_lane_id == 0) {
+    local_max[simd_group_id] = maxval;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    maxval = simd_max(local_max[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_max[0] = maxval;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  maxval = local_max[0];
+
+  AccT normalizer = 0;
+  for (int i = 0; i < N_READS; i++) {
+    AccT exp_x = softmax_exp(ld[i] - maxval);
+    ld[i] = exp_x;
+    normalizer += exp_x;
+  }
+  normalizer = simd_sum(normalizer);
+  if (simd_lane_id == 0) {
+    local_normalizer[simd_group_id] = normalizer;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    normalizer = simd_sum(local_normalizer[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_normalizer[0] = normalizer;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  normalizer = 1 / local_normalizer[0];
+
+  out += gid * size_t(axis_size) + lid * N_READS;
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      out[i] = T(ld[i] * normalizer);
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if ((lid * N_READS + i) < axis_size) {
+        out[i] = T(ld[i] * normalizer);
+      }
+    }
+  }
+}
+
+template [[host_name("block_softmax_bfloat16")]] [[kernel]]
+decltype(softmax_single_row_bucketed<bfloat16_t, bfloat16_t>)
+softmax_single_row_bucketed<bfloat16_t, bfloat16_t>;
+"#;
 
 fn mlx_metal_header_root() -> PathBuf {
     find_mlx_metal_header_root("softmax.h", |_| true, "softmax")
@@ -152,7 +273,11 @@ mod tests {
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.softmax.num_active_rows");
 
     #[test]
     #[should_panic(expected = "F32 softmax is not implemented")]
@@ -186,6 +311,7 @@ mod tests {
             },
         ));
         let replay = builder.build();
+        assert_eq!(replay.stats().parameter_count, 0);
         stream.submit_replay(&replay).wait();
 
         let actual = read_bf16_values(&output, input_values.len());
@@ -195,6 +321,134 @@ mod tests {
             config.num_values_per_row as usize,
         );
         assert_close(&actual, &expected, 0.01);
+    }
+
+    #[test]
+    fn test_bucketed_active_rows_are_total_and_reusable() {
+        let config = SoftmaxConfig {
+            num_values_per_row: 4,
+            dtype: Dtype::Bfloat16,
+        };
+        let shape = SoftmaxShape { num_rows: 4 };
+        let (device, kernel) = create_softmax_kernel(config);
+        let stream = Stream::new(&device);
+        let all_input_values = [
+            -2.0, -1.0, 0.0, 1.0, 4.0, 2.0, 0.0, -2.0, 0.5, -0.5, 1.5, 2.5, -3.0, 3.0, 2.0, 1.0,
+        ];
+        let mut three_row_input_values = all_input_values;
+        three_row_input_values[12..].fill(f32::NAN);
+        let input = bf16_buffer(&device, &three_row_input_values);
+        let sentinel = bf16::from_f32(-777.0).to_f32();
+        let output = bf16_buffer(&device, &[sentinel; 16]);
+
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_bucketed(
+            shape,
+            NUM_ACTIVE_ROWS,
+            SoftmaxBuffers {
+                input: &input,
+                output: &output,
+            },
+        ));
+        let replay = builder.build();
+        assert_eq!(replay.stats().parameter_count, 1);
+
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
+            .wait();
+        let expected_three = cpu_softmax_bf16_rows(&all_input_values[..12], 3, 4);
+        let first = read_bf16_values(&output, 16);
+        assert_close(&first[..12], &expected_three, 0.01);
+        assert_eq!(&first[12..], &[sentinel; 4]);
+
+        write_bf16_values(&input, &all_input_values);
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 4))
+            .wait();
+        let expected_four = cpu_softmax_bf16_rows(&all_input_values, 4, 4);
+        let full = read_bf16_values(&output, 16);
+        assert_close(&full, &expected_four, 0.01);
+
+        write_bf16_values(&input, &three_row_input_values);
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
+            .wait();
+        let shrunk = read_bf16_values(&output, 16);
+        assert_close(&shrunk[..12], &expected_three, 0.01);
+        assert_eq!(&shrunk[12..], &full[12..]);
+    }
+
+    #[test]
+    fn test_bucketed_submission_validates_active_rows() {
+        let config = SoftmaxConfig {
+            num_values_per_row: 4,
+            dtype: Dtype::Bfloat16,
+        };
+        let shape = SoftmaxShape { num_rows: 4 };
+        let (device, kernel) = create_softmax_kernel(config);
+        let stream = Stream::new(&device);
+        let input = Buffer::new_zeroed(&device, shape.bytes(config));
+        let output = Buffer::new_zeroed(&device, shape.bytes(config));
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_bucketed(
+            shape,
+            NUM_ACTIVE_ROWS,
+            SoftmaxBuffers {
+                input: &input,
+                output: &output,
+            },
+        ));
+        let replay = builder.build();
+
+        assert_panics(|| {
+            let _ = stream.submit_replay_with_arguments(&replay, &ReplayArguments::new());
+        });
+        assert_panics(|| {
+            let _ = stream.submit_replay_with_arguments(&replay, &ReplayArguments::new().with_i32(NUM_ACTIVE_ROWS, 3));
+        });
+        for value in [0, 5] {
+            assert_panics(|| {
+                let _ = stream
+                    .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, value));
+            });
+        }
+    }
+
+    #[test]
+    fn test_bucketed_buffer_validation_uses_total_rows() {
+        let config = SoftmaxConfig {
+            num_values_per_row: 4,
+            dtype: Dtype::Bfloat16,
+        };
+        let shape = SoftmaxShape { num_rows: 4 };
+        let active_shape = SoftmaxShape { num_rows: 3 };
+        let (device, kernel) = create_softmax_kernel(config);
+        let stream = Stream::new(&device);
+        let full = Buffer::new_zeroed(&device, shape.bytes(config));
+        let short = Buffer::new_zeroed(&device, active_shape.bytes(config));
+
+        assert_panics(|| {
+            let mut builder = stream.create_replay_program();
+            builder.record(kernel.invoke_bucketed(
+                shape,
+                NUM_ACTIVE_ROWS,
+                SoftmaxBuffers {
+                    input: &short,
+                    output: &full,
+                },
+            ));
+        });
+        assert_panics(|| {
+            let mut builder = stream.create_replay_program();
+            builder.record(kernel.invoke_bucketed(
+                shape,
+                NUM_ACTIVE_ROWS,
+                SoftmaxBuffers {
+                    input: &full,
+                    output: &short,
+                },
+            ));
+        });
     }
 
     fn create_softmax_kernel(config: SoftmaxConfig) -> (Device, SoftmaxKernel) {
@@ -221,6 +475,11 @@ mod tests {
         Buffer::from_slice(device, &bits)
     }
 
+    fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
+        let bits: Vec<u16> = values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect();
+        buffer.write_typed(0, &bits);
+    }
+
     fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {
         buffer
             .read_typed::<u16>(0, len)
@@ -237,5 +496,9 @@ mod tests {
                 "value mismatch at {index}: actual={actual} expected={expected} tolerance={tolerance}"
             );
         }
+    }
+
+    fn assert_panics(f: impl FnOnce()) {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }

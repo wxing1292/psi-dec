@@ -6,6 +6,7 @@ use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Kernel;
 use crate::metal::Operator;
+use crate::metal::ReplayParameterKey;
 
 const MOE_ROUTING_SOURCE: &str = include_str!("metal/moe_routing.metal");
 
@@ -80,7 +81,7 @@ impl MoERoutingConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MoERoutingShape {
     pub num_tokens: u32,
 }
@@ -116,6 +117,22 @@ impl MoERoutingKernel {
             kernel: self,
             shape,
             buffers,
+            num_active_tokens_key: None,
+        }
+    }
+
+    /// Records a fixed-capacity grid whose active token count is supplied at submission.
+    pub fn invoke_bucketed<'a>(
+        &'a self,
+        shape: MoERoutingShape,
+        num_active_tokens_key: ReplayParameterKey,
+        buffers: MoERoutingBuffers<'a>,
+    ) -> MoERoutingInvocation<'a> {
+        MoERoutingInvocation {
+            kernel: self,
+            shape,
+            buffers,
+            num_active_tokens_key: Some(num_active_tokens_key),
         }
     }
 }
@@ -124,6 +141,7 @@ pub struct MoERoutingInvocation<'a> {
     kernel: &'a MoERoutingKernel,
     shape: MoERoutingShape,
     buffers: MoERoutingBuffers<'a>,
+    num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 impl Operator for MoERoutingInvocation<'_> {
@@ -134,7 +152,10 @@ impl Operator for MoERoutingInvocation<'_> {
         builder.set_buffer_read(0, self.buffers.router_probs, 0);
         builder.set_buffer_write(1, self.buffers.expert_indices, 0);
         builder.set_buffer_write(2, self.buffers.expert_probs, 0);
-        builder.set_u32(3, self.shape.num_tokens);
+        match self.num_active_tokens_key {
+            Some(key) => builder.bind_u32(3, key, 1, self.shape.num_tokens),
+            None => builder.set_u32(3, self.shape.num_tokens),
+        }
         builder.set_u32(4, self.kernel.config.num_experts);
         builder.set_u32(5, self.kernel.config.num_experts_per_token);
         builder.set_u32(6, u32::from(self.kernel.config.norm_topk_prob));
@@ -179,7 +200,11 @@ mod tests {
     use super::*;
     use crate::metal::Buffer;
     use crate::metal::Device;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.moe.routing.num_active_tokens");
 
     #[test]
     #[should_panic(expected = "MoE routing supports at most 256 experts")]
@@ -251,6 +276,7 @@ mod tests {
             },
         ));
         let program = builder.build();
+        assert_eq!(program.stats().parameter_count, 0);
         let submitted = stream.submit_replay(&program);
         submitted.wait();
 
@@ -298,6 +324,97 @@ mod tests {
         assert_eq!(expert_indices.read_typed::<u32>(0, 2), expected.expert_indices);
         let actual = expert_probs.read_typed::<f32>(0, 2);
         assert_close(&actual, &expected.expert_probs, 1.0e-6);
+    }
+
+    #[test]
+    fn test_bucketed_active_tokens_are_total_and_reusable_with_both_norm_modes() {
+        for norm_topk_prob in [false, true] {
+            run_bucketed_active_tokens_case(norm_topk_prob);
+        }
+    }
+
+    #[test]
+    fn test_bucketed_submission_validates_active_tokens() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = MoERoutingConfig {
+            num_experts: 4,
+            num_experts_per_token: 2,
+            norm_topk_prob: true,
+        };
+        let shape = MoERoutingShape { num_tokens: 4 };
+        let router_probs = Buffer::new_zeroed(&device, config.router_probs_bytes(shape));
+        let expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(shape));
+        let expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(shape));
+        let kernel = MoERoutingKernel::new(&device, config);
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_bucketed(
+            shape,
+            NUM_ACTIVE_TOKENS,
+            MoERoutingBuffers {
+                router_probs: &router_probs,
+                expert_indices: &expert_indices,
+                expert_probs: &expert_probs,
+            },
+        ));
+        let replay = builder.build();
+
+        assert_panics(|| {
+            let _ = stream.submit_replay_with_arguments(&replay, &ReplayArguments::new());
+        });
+        assert_panics(|| {
+            let _ =
+                stream.submit_replay_with_arguments(&replay, &ReplayArguments::new().with_i32(NUM_ACTIVE_TOKENS, 3));
+        });
+        for value in [0, 5] {
+            assert_panics(|| {
+                let _ = stream
+                    .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, value));
+            });
+        }
+    }
+
+    #[test]
+    fn test_bucketed_buffer_validation_uses_total_tokens() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = MoERoutingConfig {
+            num_experts: 4,
+            num_experts_per_token: 2,
+            norm_topk_prob: true,
+        };
+        let total_shape = MoERoutingShape { num_tokens: 4 };
+        let active_shape = MoERoutingShape { num_tokens: 3 };
+        let full_router_probs = Buffer::new_zeroed(&device, config.router_probs_bytes(total_shape));
+        let full_expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(total_shape));
+        let full_expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(total_shape));
+        let short_router_probs = Buffer::new_zeroed(&device, config.router_probs_bytes(active_shape));
+        let short_expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(active_shape));
+        let short_expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(active_shape));
+        let kernel = MoERoutingKernel::new(&device, config);
+
+        for buffers in [
+            MoERoutingBuffers {
+                router_probs: &short_router_probs,
+                expert_indices: &full_expert_indices,
+                expert_probs: &full_expert_probs,
+            },
+            MoERoutingBuffers {
+                router_probs: &full_router_probs,
+                expert_indices: &short_expert_indices,
+                expert_probs: &full_expert_probs,
+            },
+            MoERoutingBuffers {
+                router_probs: &full_router_probs,
+                expert_indices: &full_expert_indices,
+                expert_probs: &short_expert_probs,
+            },
+        ] {
+            assert_panics(|| {
+                let mut builder = stream.create_replay_program();
+                builder.record(kernel.invoke_bucketed(total_shape, NUM_ACTIVE_TOKENS, buffers));
+            });
+        }
     }
 
     #[test]
@@ -368,9 +485,99 @@ mod tests {
         probs
     }
 
+    fn run_bucketed_active_tokens_case(norm_topk_prob: bool) {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = MoERoutingConfig {
+            num_experts: 8,
+            num_experts_per_token: 3,
+            norm_topk_prob,
+        };
+        let shape = MoERoutingShape { num_tokens: 4 };
+        let all_probs = generated_probs(4, config.num_experts as usize, 0x5A17_920B);
+        let mut three_token_probs = all_probs.clone();
+        three_token_probs[3 * config.num_experts as usize..].fill(f32::NAN);
+        let router_probs = bf16_buffer(&device, &three_token_probs);
+        let num_routes = config.num_routes(shape);
+        let index_sentinel = 0xDEAD_BEEF_u32;
+        let prob_sentinel = -777.0_f32;
+        let expert_indices = Buffer::from_slice(&device, &vec![index_sentinel; num_routes]);
+        let expert_probs = Buffer::from_slice(&device, &vec![prob_sentinel; num_routes]);
+        let kernel = MoERoutingKernel::new(&device, config);
+
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_bucketed(
+            shape,
+            NUM_ACTIVE_TOKENS,
+            MoERoutingBuffers {
+                router_probs: &router_probs,
+                expert_indices: &expert_indices,
+                expert_probs: &expert_probs,
+            },
+        ));
+        let replay = builder.build();
+        assert_eq!(replay.stats().parameter_count, 1);
+
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 3))
+            .wait();
+        let active_routes = 3 * config.num_experts_per_token as usize;
+        let expected_three = moe_routing_from_bf16_probs_reference(
+            &all_probs[..3 * config.num_experts as usize],
+            3,
+            config.num_experts as usize,
+            config.num_experts_per_token as usize,
+            norm_topk_prob,
+        );
+        let first_indices = expert_indices.read_typed::<u32>(0, num_routes);
+        let first_probs = expert_probs.read_typed::<f32>(0, num_routes);
+        assert_eq!(&first_indices[..active_routes], expected_three.expert_indices);
+        assert_close(&first_probs[..active_routes], &expected_three.expert_probs, 1.0e-3);
+        assert_eq!(
+            &first_indices[active_routes..],
+            &vec![index_sentinel; num_routes - active_routes]
+        );
+        assert_eq!(
+            &first_probs[active_routes..],
+            &vec![prob_sentinel; num_routes - active_routes]
+        );
+
+        write_bf16_values(&router_probs, &all_probs);
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 4))
+            .wait();
+        let expected_four = moe_routing_from_bf16_probs_reference(
+            &all_probs,
+            4,
+            config.num_experts as usize,
+            config.num_experts_per_token as usize,
+            norm_topk_prob,
+        );
+        let full_indices = expert_indices.read_typed::<u32>(0, num_routes);
+        let full_probs = expert_probs.read_typed::<f32>(0, num_routes);
+        assert_eq!(full_indices, expected_four.expert_indices);
+        assert_close(&full_probs, &expected_four.expert_probs, 1.0e-3);
+
+        write_bf16_values(&router_probs, &three_token_probs);
+        stream
+            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 3))
+            .wait();
+        let shrunk_indices = expert_indices.read_typed::<u32>(0, num_routes);
+        let shrunk_probs = expert_probs.read_typed::<f32>(0, num_routes);
+        assert_eq!(&shrunk_indices[..active_routes], expected_three.expert_indices);
+        assert_close(&shrunk_probs[..active_routes], &expected_three.expert_probs, 1.0e-3);
+        assert_eq!(&shrunk_indices[active_routes..], &full_indices[active_routes..]);
+        assert_eq!(&shrunk_probs[active_routes..], &full_probs[active_routes..]);
+    }
+
     fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
         let bits: Vec<u16> = values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect();
         Buffer::from_slice(device, &bits)
+    }
+
+    fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
+        let bits: Vec<u16> = values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect();
+        buffer.write_typed(0, &bits);
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
@@ -381,5 +588,9 @@ mod tests {
                 "value mismatch at index={index}: actual={actual} expected={expected} tolerance={tolerance}"
             );
         }
+    }
+
+    fn assert_panics(f: impl FnOnce()) {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }
