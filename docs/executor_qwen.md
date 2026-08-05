@@ -322,6 +322,14 @@ The DSpark mode also loads the shared DSpark execution owner and rejection resou
 
 Qwen3.5 loads Vanilla, its MTP graph, or the reusable Qwen3x DSpark graph.
 The loader cannot receive or construct both speculators.
+When Main and MTP both use MoE, they reuse one model-owned `MoEScratch`.
+The MTP compatibility check requires exact matches for `num_experts_per_tok`, `moe_intermediate_size`, and
+`shared_expert_intermediate_size` before it allocates this scratch.
+For `shared_expert_intermediate_size`, `0` means that the shared-expert branch is absent.
+A positive value means that the branch is present, and both models must specify the same value.
+`norm_topk_prob` does not determine scratch geometry and may differ.
+If only Main or only MTP uses MoE, the unused model-side MoE geometry does not constrain the scratch allocation.
+An incompatible shared geometry returns a recoverable model initialization error.
 For DSpark, the loader validates Main hidden width, layer count, vocabulary, position limit, and RoPE values.
 It permits the DSpark query projection width to differ from the Main hidden width.
 The shared loader requires `block_size + 1 <= max_tokens_per_request` for both Main versions.

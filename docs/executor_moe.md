@@ -339,7 +339,14 @@ They are routing, `topk_experts`, and optional `shared_experts`.
 The model stream serializes Main and MTP execution.
 Thus, MoE layers can reuse router logits/probs, route metadata, sparse swiglu, expert-major packing, and optional
 shared-expert scratch.
-Qwen asserts that scratch layout determinants are uniform across all Main and MTP MoE layers.
+When Main and MTP both use MoE, the Qwen3.5 loader rejects incompatible scratch geometry before allocation.
+The shared geometry requires the same hidden dimension, expert count, selected experts per token, routed-expert
+intermediate dimension, and optional shared-expert intermediate dimension.
+A zero shared-expert intermediate dimension means that the branch is absent.
+Both models must have the same shared-expert presence, and a present branch must have the same dimension.
+The executor provides one maximum token capacity and the current Qwen3.5 plan fixes the scratch dtype to BF16.
+`norm_topk_prob` changes routing semantics but does not change scratch geometry.
+If only Main or only MTP uses MoE, the scratch derives from that one consumer.
 
 The shared `Qwen3xMoE` leaf owns per-layer router, top-k, and shared-expert weights.
 The role-specific layer and scratch types own output buffers and composition.

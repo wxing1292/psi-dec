@@ -105,7 +105,7 @@ This requirement covers hidden buffers, gate/up scratch, swiglu scratch, and imm
 
 Qwen model replay keeps dense MLP scratch in one model-owned `DenseMLPScratch`.
 Its `bindings()` method exposes borrowed `DenseMLPScratchBindings` during replay recording.
-Scratch allocation accepts only model geometry, capacity, and `io_dtype`.
+Scratch allocation geometry consists of `max_tokens`, `intermediate_dim`, and `io_dtype`.
 It does not accept quantization group size or bit width because those weight facts do not affect scratch layout.
 The model stream serializes Main and MTP execution.
 Thus, layers can reuse `gate_up` and swiglu scratch.
@@ -117,7 +117,9 @@ Their model-specific binding trees contain `Qwen3xDenseMLPWeightBindings` at the
 The weight owner loads one bounded `TensorMap` from that exact gate/up/down binding subtree.
 It removes every tensor and materializes fused gate-up buffers while it keeps the down projection separate.
 The map must be empty after construction.
-At initialization, Qwen validates scratch layout compatibility across every Main and optional MTP dense layer.
+When Main and MTP both use dense MLP, Qwen3.5 initialization requires their `intermediate_size` values to match.
+Both users share the executor `max_tokens` value and the current BF16 model boundary.
+If only one graph uses dense MLP, the loader derives the scratch geometry from that graph.
 
 ### Bucketed replay
 

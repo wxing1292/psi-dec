@@ -216,6 +216,36 @@ pub fn validate_qwen35_mtp_config(
             mtp.num_experts
         )));
     }
+    let main_uses_dense_mlp =
+        (0..main.num_hidden_layers).any(|model_layer_index| !main_model_config.layer_uses_moe(model_layer_index));
+    let mtp_uses_dense_mlp = !mtp_model_config.layer_uses_moe(0);
+    if main_uses_dense_mlp && mtp_uses_dense_mlp && main.intermediate_size != mtp.intermediate_size {
+        return Err(ModelExecutorError::custom(format!(
+            "qwen3.5 shared dense MLP scratch requires matching intermediate_size: main={} mtp={}",
+            main.intermediate_size, mtp.intermediate_size
+        )));
+    }
+    let main_uses_moe =
+        (0..main.num_hidden_layers).any(|model_layer_index| main_model_config.layer_uses_moe(model_layer_index));
+    let mtp_uses_moe = mtp_model_config.layer_uses_moe(0);
+    if main_uses_moe
+        && mtp_uses_moe
+        && (main.num_experts_per_tok != mtp.num_experts_per_tok
+            || main.moe_intermediate_size != mtp.moe_intermediate_size
+            || main.shared_expert_intermediate_size != mtp.shared_expert_intermediate_size)
+    {
+        return Err(ModelExecutorError::custom(format!(
+            "qwen3.5 shared MoE scratch requires matching geometry: main num_experts_per_tok={} \
+             moe_intermediate_size={} shared_expert_intermediate_size={} mtp num_experts_per_tok={} \
+             moe_intermediate_size={} shared_expert_intermediate_size={}",
+            main.num_experts_per_tok,
+            main.moe_intermediate_size,
+            main.shared_expert_intermediate_size,
+            mtp.num_experts_per_tok,
+            mtp.moe_intermediate_size,
+            mtp.shared_expert_intermediate_size
+        )));
+    }
     assert_eq!(
         mtp.mtp_num_hidden_layers, 1,
         "qwen3.5 MTP checkpoint must contain exactly one physical body layer"
@@ -235,4 +265,170 @@ fn quant_bits_for(config: &Qwen35ModelConfig, tensor_name: &str, default_bits: u
         .map(|quantization| quantization.resolve_for_tensor(tensor_name).bits)
         .unwrap_or(default_bits as usize);
     to_u32("Qwen3.5 quantization bits", bits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_dense_scratch_accepts_matching_intermediate_size() {
+        let main = model_config(16, 0, 1);
+        let mtp = model_config(16, 0, 1);
+
+        assert_eq!(validate_qwen35_mtp_config(&main, &mtp), Ok(()));
+    }
+
+    #[test]
+    fn shared_dense_scratch_rejects_mismatched_intermediate_size() {
+        let main = model_config(16, 0, 1);
+        let mtp = model_config(32, 0, 1);
+
+        let error = validate_qwen35_mtp_config(&main, &mtp).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "qwen3.5 shared dense MLP scratch requires matching intermediate_size: main=16 mtp=32"
+        );
+    }
+
+    #[test]
+    fn dense_scratch_geometry_does_not_constrain_a_single_dense_user() {
+        let main_dense = model_config(16, 8, 2);
+        let mtp_moe = model_config(32, 8, 1);
+        assert!(!main_dense.layer_uses_moe(0));
+        assert!(mtp_moe.layer_uses_moe(0));
+        assert_eq!(validate_qwen35_mtp_config(&main_dense, &mtp_moe), Ok(()));
+
+        let main_moe = model_config(16, 8, 1);
+        let mtp_dense = model_config(32, 8, 2);
+        assert!(main_moe.layer_uses_moe(0));
+        assert!(!mtp_dense.layer_uses_moe(0));
+        assert_eq!(validate_qwen35_mtp_config(&main_moe, &mtp_dense), Ok(()));
+    }
+
+    #[test]
+    fn shared_moe_scratch_accepts_matching_geometry_and_non_geometry_difference() {
+        let main = model_config(16, 8, 1);
+        let mut mtp = model_config(16, 8, 1);
+        mtp.text_config.norm_topk_prob = false;
+
+        assert_eq!(validate_qwen35_mtp_config(&main, &mtp), Ok(()));
+    }
+
+    #[test]
+    fn shared_moe_scratch_rejects_each_mismatched_geometry_field() {
+        let base_main = model_config(16, 8, 1);
+        let base_mtp = model_config(16, 8, 1);
+
+        let mut topk_mismatch = base_mtp.clone();
+        topk_mismatch.text_config.num_experts_per_tok = 3;
+        let mut routed_intermediate_mismatch = base_mtp.clone();
+        routed_intermediate_mismatch.text_config.moe_intermediate_size = 12;
+        let mut shared_intermediate_mismatch = base_mtp.clone();
+        shared_intermediate_mismatch.text_config.shared_expert_intermediate_size = 24;
+        let mut shared_absent_main = base_main.clone();
+        shared_absent_main.text_config.shared_expert_intermediate_size = 0;
+        let mut shared_absent_mtp = base_mtp.clone();
+        shared_absent_mtp.text_config.shared_expert_intermediate_size = 0;
+
+        let cases = [
+            ("num_experts_per_tok", base_main.clone(), topk_mismatch),
+            ("moe_intermediate_size", base_main.clone(), routed_intermediate_mismatch),
+            (
+                "shared_expert_intermediate_size value",
+                base_main.clone(),
+                shared_intermediate_mismatch,
+            ),
+            ("shared expert absent in Main", shared_absent_main, base_mtp.clone()),
+            ("shared expert absent in MTP", base_main, shared_absent_mtp),
+        ];
+
+        for (case, main, mtp) in cases {
+            let error = validate_qwen35_mtp_config(&main, &mtp).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("qwen3.5 shared MoE scratch requires matching geometry"),
+                "unexpected error for {case}: {message}"
+            );
+            assert!(
+                message.contains("num_experts_per_tok="),
+                "missing top-k values for {case}"
+            );
+            assert!(
+                message.contains("moe_intermediate_size="),
+                "missing routed intermediate values for {case}"
+            );
+            assert!(
+                message.contains("shared_expert_intermediate_size="),
+                "missing shared-expert presence/value for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_scratch_geometry_does_not_constrain_a_single_moe_user() {
+        let mut main_dense = model_config(16, 8, 2);
+        main_dense.text_config.num_experts_per_tok = 3;
+        main_dense.text_config.moe_intermediate_size = 12;
+        main_dense.text_config.shared_expert_intermediate_size = 0;
+        let mtp_moe = model_config(32, 8, 1);
+        assert!(!main_dense.layer_uses_moe(0));
+        assert!(mtp_moe.layer_uses_moe(0));
+        assert_eq!(validate_qwen35_mtp_config(&main_dense, &mtp_moe), Ok(()));
+
+        let main_moe = model_config(16, 8, 1);
+        let mut mtp_dense = model_config(32, 8, 2);
+        mtp_dense.text_config.num_experts_per_tok = 3;
+        mtp_dense.text_config.moe_intermediate_size = 12;
+        mtp_dense.text_config.shared_expert_intermediate_size = 0;
+        assert!(main_moe.layer_uses_moe(0));
+        assert!(!mtp_dense.layer_uses_moe(0));
+        assert_eq!(validate_qwen35_mtp_config(&main_moe, &mtp_dense), Ok(()));
+    }
+
+    fn model_config(intermediate_size: usize, num_experts: usize, decoder_sparse_step: usize) -> Qwen35ModelConfig {
+        Qwen35ModelConfig {
+            model_type: "qwen3_5".to_string(),
+            tie_word_embeddings: false,
+            text_config: Qwen35TextConfig {
+                model_type: "qwen3_5_text".to_string(),
+                hidden_size: 8,
+                hidden_act: "silu".to_string(),
+                intermediate_size,
+                num_hidden_layers: 1,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 4,
+                rms_norm_eps: 1e-6,
+                vocab_size: 16,
+                max_position_embeddings: 32,
+                attention_bias: false,
+                tie_word_embeddings: false,
+                layer_types: vec!["full_attention".to_string()],
+                full_attention_interval: 1,
+                linear_num_value_heads: 2,
+                linear_num_key_heads: 1,
+                linear_key_head_dim: 4,
+                linear_value_head_dim: 4,
+                linear_conv_kernel_dim: 4,
+                decoder_sparse_step,
+                num_experts,
+                num_experts_per_tok: usize::from(num_experts > 0) * 2,
+                shared_expert_intermediate_size: usize::from(num_experts > 0) * 16,
+                moe_intermediate_size: usize::from(num_experts > 0) * 8,
+                norm_topk_prob: true,
+                mtp_num_hidden_layers: 1,
+                mtp_use_dedicated_embeddings: false,
+                rope_theta: 10_000.0,
+                partial_rotary_factor: 1.0,
+                rope_parameters: None,
+                use_cache: true,
+                dtype: None,
+                scale: 0.5,
+                rope_dim: 4,
+            },
+            quantization: None,
+        }
+    }
 }
