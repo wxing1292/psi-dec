@@ -404,6 +404,17 @@ The kernel checks the active row count before it reads an inactive row index or 
 inactive output value.
 The current Qwen compositions still select exact row-gather recording.
 
+The shared unembedding leaf supports exact and bucketed recording.
+Exact recording fixes the active row count and declares no replay parameter.
+Bucketed recording uses the caller-provided total row capacity and active-row key.
+It validates that the total row capacity is in `1..=UnembedConfig::max_tokens`.
+It validates the hidden input and logits output ranges against this total row capacity.
+The affine replay parameter validates the submitted active row count in `1..=capacity`.
+The leaf exposes the affine kernel topology for a row capacity and every row count that changes this topology.
+The stage bucket policy must include these topology boundaries.
+This rule lets Gather and Unembed use one active-row key without padding across an affine kernel change.
+The current Qwen compositions still select exact unembedding recording.
+
 The shared BF16 row-concat leaf supports exact and bucketed recording.
 Exact recording fixes the active row count to `Bf16ConcatRowsShape::num_rows` and declares no replay parameter.
 Bucketed recording interprets `Bf16ConcatRowsShape::num_rows` as the recorded capacity.

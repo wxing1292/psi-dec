@@ -1,8 +1,10 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::operators::AffineQuantizedMatmul;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::checkpoint::remove_tensor;
@@ -80,6 +82,14 @@ pub struct UnembedInput<'a> {
     pub logits: &'a Buffer,
 }
 
+#[derive(Clone, Copy)]
+pub struct UnembedBucketedInput<'a> {
+    pub num_total_rows: u32,
+    pub num_active_rows_key: ReplayParameterKey,
+    pub hidden: &'a Buffer,
+    pub logits: &'a Buffer,
+}
+
 impl Unembed {
     pub fn load(
         device: &Device,
@@ -104,6 +114,47 @@ impl Unembed {
         assert_eq!(self.weights.weight.len_bytes(), config.weight_bytes());
         assert_eq!(self.weights.scales.len_bytes(), config.scale_or_bias_bytes());
         assert_eq!(self.weights.biases.len_bytes(), self.weights.scales.len_bytes());
+    }
+
+    pub fn replay_topology(&self, num_total_rows: u32) -> AffineQuantizedMatmulKernelKind {
+        self.validate_num_rows(num_total_rows);
+        self.matmul.topology(num_total_rows)
+    }
+
+    pub fn replay_topology_boundaries(&self) -> Box<[u32]> {
+        self.matmul.topology_boundaries()
+    }
+
+    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: UnembedBucketedInput<'a>) -> &'a Buffer
+    where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        self.validate_num_rows(input.num_total_rows);
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.matmul.invoke_bucketed(
+            input.num_total_rows,
+            input.num_active_rows_key,
+            input.logits,
+            0,
+            input.hidden,
+            0,
+            &self.weights.weight,
+            0,
+            &self.weights.scales,
+            0,
+            &self.weights.biases,
+            0,
+        )));
+        input.logits
+    }
+
+    fn validate_num_rows(&self, num_rows: u32) {
+        assert!(num_rows > 0, "unembed requires at least one row");
+        assert!(
+            num_rows <= self.config.max_tokens,
+            "unembed num_rows={} exceed max_tokens={}",
+            num_rows,
+            self.config.max_tokens
+        );
     }
 }
 
@@ -187,8 +238,24 @@ fn validate_quantized_unembedding(max_tokens: u32, vocab_size: u32, hidden_dim: 
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
+    use inference_backend_metal::metal::Buffer;
+    use inference_backend_metal::metal::Device;
+    use inference_backend_metal::metal::ReplayArguments;
+    use inference_backend_metal::metal::ReplayParameterKey;
+    use inference_backend_metal::metal::Stream;
+    use inference_executor_core::replay::ReplayBucketPolicy;
+
     use super::Dtype;
+    use super::Unembed;
+    use super::UnembedBucketedInput;
     use super::UnembedConfig;
+    use super::UnembedInput;
+    use super::UnembedWeights;
+    use crate::def::layer::ReplayLayer;
+    use crate::def::replay_op::MetalReplayRuntime;
+
+    const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.unembed.num_active_rows");
 
     #[test]
     #[should_panic(expected = "unembed requires BF16 affine parameters")]
@@ -204,5 +271,254 @@ mod tests {
             scale_bias_dtype: Dtype::Float32,
         };
         config.validate();
+    }
+
+    #[test]
+    fn test_topology_boundaries_preserve_recorded_affine_topology() {
+        let device = Device::system_default();
+        let unembed = test_unembed(&device, test_config(32));
+        let boundaries = unembed.replay_topology_boundaries();
+        let policy = ReplayBucketPolicy::with_topology_boundaries(32, &boundaries);
+
+        assert_eq!(&*boundaries, &[18]);
+        for num_active_rows in 1..=32 {
+            let num_total_rows = policy.capacity(num_active_rows);
+            assert_eq!(
+                unembed.replay_topology(num_active_rows),
+                unembed.replay_topology(num_total_rows),
+                "num_active_rows={num_active_rows} num_total_rows={num_total_rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exact_and_bucketed_replay_parity_and_grow_shrink_guards() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let runtime = MetalReplayRuntime::new(&stream);
+        let config = test_config(4);
+        let unembed = test_unembed(&device, config);
+        let num_values_per_hidden_row = config.hidden_dim as usize;
+        let num_values_per_logits_row = config.vocab_size as usize;
+        let num_total_hidden_values = config.max_tokens as usize * num_values_per_hidden_row;
+        let num_total_logits_values = config.max_tokens as usize * num_values_per_logits_row;
+        let sentinel = bf16::from_f32(-123.0).to_f32();
+        let hidden = bf16_buffer(&device, &vec![0.0; num_total_hidden_values]);
+        let exact_logits = bf16_buffer(&device, &vec![sentinel; num_total_logits_values]);
+
+        let mut exact_recorder = runtime.create_recorder();
+        let exact_output = unembed.record(
+            &mut exact_recorder,
+            UnembedInput {
+                num_rows: 1,
+                hidden: &hidden,
+                logits: &exact_logits,
+            },
+        );
+        assert!(std::ptr::eq(exact_output, &exact_logits));
+        let exact_replay = exact_recorder.build();
+        assert_eq!(exact_replay.stats().parameter_count, 0);
+        runtime.submit_replay(&exact_replay).wait();
+        let exact_values = read_bf16_values(&exact_logits, num_total_logits_values);
+        assert_eq!(
+            &exact_values[..num_values_per_logits_row],
+            &vec![0.0; num_values_per_logits_row]
+        );
+        assert_eq!(
+            &exact_values[num_values_per_logits_row..],
+            &vec![sentinel; num_total_logits_values - num_values_per_logits_row]
+        );
+
+        let logits = bf16_buffer(&device, &vec![sentinel; num_total_logits_values]);
+        let mut bucketed_recorder = runtime.create_recorder();
+        let bucketed_output = unembed.record_bucketed(
+            &mut bucketed_recorder,
+            UnembedBucketedInput {
+                num_total_rows: config.max_tokens,
+                num_active_rows_key: NUM_ACTIVE_ROWS,
+                hidden: &hidden,
+                logits: &logits,
+            },
+        );
+        assert!(std::ptr::eq(bucketed_output, &logits));
+        let bucketed_replay = bucketed_recorder.build();
+        assert_eq!(bucketed_replay.stats().parameter_count, 1);
+
+        assert_invalid_active_rows(&stream, &bucketed_replay, config.max_tokens);
+
+        let active_one = ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 1);
+        write_bf16_values(
+            &hidden,
+            &poisoned_hidden_values(config.max_tokens, num_values_per_hidden_row),
+        );
+        runtime
+            .submit_replay_with_arguments(&bucketed_replay, &active_one)
+            .wait();
+        let first_values = read_bf16_values(&logits, num_total_logits_values);
+        assert_eq!(
+            &first_values[..num_values_per_logits_row],
+            &exact_values[..num_values_per_logits_row]
+        );
+        assert_eq!(
+            &first_values[num_values_per_logits_row..],
+            &vec![sentinel; num_total_logits_values - num_values_per_logits_row]
+        );
+
+        write_bf16_values(&hidden, &vec![0.0; num_total_hidden_values]);
+        runtime
+            .submit_replay_with_arguments(
+                &bucketed_replay,
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, config.max_tokens),
+            )
+            .wait();
+        assert_eq!(
+            read_bf16_values(&logits, num_total_logits_values),
+            vec![0.0; num_total_logits_values]
+        );
+
+        write_bf16_values(&logits, &vec![sentinel; num_total_logits_values]);
+        write_bf16_values(
+            &hidden,
+            &poisoned_hidden_values(config.max_tokens, num_values_per_hidden_row),
+        );
+        runtime
+            .submit_replay_with_arguments(&bucketed_replay, &active_one)
+            .wait();
+        let shrunk_values = read_bf16_values(&logits, num_total_logits_values);
+        assert_eq!(
+            &shrunk_values[..num_values_per_logits_row],
+            &exact_values[..num_values_per_logits_row]
+        );
+        assert_eq!(
+            &shrunk_values[num_values_per_logits_row..],
+            &vec![sentinel; num_total_logits_values - num_values_per_logits_row]
+        );
+
+        for num_total_rows in [0, config.max_tokens + 1] {
+            assert_panics(|| {
+                let mut recorder = runtime.create_recorder();
+                unembed.record_bucketed(
+                    &mut recorder,
+                    UnembedBucketedInput {
+                        num_total_rows,
+                        num_active_rows_key: NUM_ACTIVE_ROWS,
+                        hidden: &hidden,
+                        logits: &logits,
+                    },
+                );
+            });
+        }
+
+        let short_hidden = bf16_buffer(&device, &vec![0.0; num_values_per_hidden_row]);
+        assert_panics(|| {
+            let mut recorder = runtime.create_recorder();
+            unembed.record_bucketed(
+                &mut recorder,
+                UnembedBucketedInput {
+                    num_total_rows: config.max_tokens,
+                    num_active_rows_key: NUM_ACTIVE_ROWS,
+                    hidden: &short_hidden,
+                    logits: &logits,
+                },
+            );
+        });
+
+        let short_logits = bf16_buffer(&device, &vec![sentinel; num_values_per_logits_row]);
+        assert_panics(|| {
+            let mut recorder = runtime.create_recorder();
+            unembed.record_bucketed(
+                &mut recorder,
+                UnembedBucketedInput {
+                    num_total_rows: config.max_tokens,
+                    num_active_rows_key: NUM_ACTIVE_ROWS,
+                    hidden: &hidden,
+                    logits: &short_logits,
+                },
+            );
+        });
+    }
+
+    fn test_config(max_tokens: u32) -> UnembedConfig {
+        UnembedConfig {
+            max_tokens,
+            vocab_size: 32,
+            hidden_dim: 32,
+            group_size: 32,
+            bits: 8,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+        }
+    }
+
+    fn test_unembed(device: &Device, config: UnembedConfig) -> Unembed {
+        config.validate();
+        let affine_config = config.affine_config();
+        let unembed = Unembed {
+            config,
+            matmul: super::AffineQuantizedMatmul::new(device, affine_config),
+            weights: UnembedWeights {
+                weight: Buffer::new_zeroed(device, affine_config.weight_bytes()),
+                scales: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
+                biases: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
+            },
+        };
+        unembed.validate_weights();
+        unembed
+    }
+
+    fn poisoned_hidden_values(num_rows: u32, num_values_per_row: usize) -> Vec<f32> {
+        let mut values = vec![f32::NAN; num_rows as usize * num_values_per_row];
+        values[..num_values_per_row].fill(0.0);
+        values
+    }
+
+    fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
+        let bits = values
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect::<Vec<_>>();
+        Buffer::from_slice(device, &bits)
+    }
+
+    fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
+        let bits = values
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect::<Vec<_>>();
+        buffer.write_typed(0, &bits);
+    }
+
+    fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {
+        buffer
+            .read_typed::<u16>(0, len)
+            .into_iter()
+            .map(|bits| bf16::from_bits(bits).to_f32())
+            .collect()
+    }
+
+    fn assert_invalid_active_rows(
+        stream: &Stream,
+        replay: &inference_backend_metal::metal::ReplayProgram,
+        num_total_rows: u32,
+    ) {
+        assert_panics(|| {
+            let _ = stream.submit_replay_with_arguments(replay, &ReplayArguments::new());
+        });
+        assert_panics(|| {
+            let _ = stream.submit_replay_with_arguments(replay, &ReplayArguments::new().with_i32(NUM_ACTIVE_ROWS, 1));
+        });
+        for num_active_rows in [0, num_total_rows + 1] {
+            assert_panics(|| {
+                let _ = stream.submit_replay_with_arguments(
+                    replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows),
+                );
+            });
+        }
+    }
+
+    fn assert_panics(f: impl FnOnce()) {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }
