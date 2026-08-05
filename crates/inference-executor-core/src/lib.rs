@@ -5,4 +5,5 @@ pub mod def;
 pub mod model;
 pub mod mlp;
 pub mod reference;
+pub mod replay;
 pub mod sampling;

@@ -232,7 +232,7 @@ dynamic / submission-scoped
   other values consumed through current batch metadata
 ```
 
-Power-of-two capacity replay is safe only when each participating kernel causes inactive lanes to return before these
+Capacity-bucket replay is safe only when each participating kernel causes inactive lanes to return before these
 actions:
 
 - Reading input
@@ -242,6 +242,24 @@ actions:
 
 Otherwise, the replay key keeps the exact count. Padding is a dispatch property. It does not permit changes to valid
 work or semantic descriptor counts.
+
+The shared default capacity policy starts with these buckets:
+
+```text
+1 2 4 6 8 12 16 20 24 32 40 48 56 64
+```
+
+Above `64`, the policy divides each power-of-two interval into quarters. For example, the next buckets are `80`,
+`96`, `112`, and `128`. The configured capacity is always a terminal bucket. A bucket must not exceed allocated
+scratch or buffer capacity.
+
+A component must insert a terminal bucket before each recorded-topology boundary. The component must keep categorical
+topology choices in its replay key. Capacity bucketing must not combine different kernel selections, command counts,
+or dispatch structures. A topology boundary identifies the first active count for the new topology. The policy ignores
+a boundary above the configured capacity. The backend component that selects the topology must own these boundaries.
+
+Some work domains permit zero active work. In this case, a policy result of zero means that the domain does not record
+or dispatch work. Zero is not a replay capacity.
 
 `ReplayArguments` contain keyed submission values that recording declares. Submission validates that the caller
 provides each declared value exactly once and within its recorded bounds.
