@@ -8,12 +8,12 @@ kernel void bf16_concat_rows(
     device const bfloat16_t* lhs [[buffer(0)]],
     device const bfloat16_t* rhs [[buffer(1)]],
     device bfloat16_t* output [[buffer(2)]],
-    constant uint& num_rows [[buffer(3)]],
+    constant uint& num_active_rows [[buffer(3)]],
     constant uint& num_cols [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    const uint total = num_rows * num_cols * 2;
-    if (gid >= total) {
+    const uint num_active_values = num_active_rows * num_cols * 2;
+    if (gid >= num_active_values) {
         return;
     }
     const uint row = gid / (num_cols * 2);
