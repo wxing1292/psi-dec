@@ -235,6 +235,38 @@ A future full-MoE bucket policy must include the compute-path boundary at token 
 It must also include all topology boundaries from sparse MLP, expert-major layout/pack/scatter, combine, shared
 experts, and shared-expert gate components.
 
+The ragged expert-major layout, pack, and scatter leaf also has additive bucket-readiness APIs:
+
+```text
+MoEExpertMajorKernels::invoke_layout_bucketed(...)
+MoEExpertMajorKernels::invoke_pack_input_bucketed(...)
+MoEExpertMajorKernels::invoke_scatter_without_shared_experts_bucketed(...)
+MoEExpertMajorKernels::invoke_scatter_with_shared_experts_bucketed(...)
+```
+
+Each API records a fixed `num_total_tokens` capacity and a fixed `num_experts_per_token` value.
+The caller supplies one `num_active_tokens` replay parameter.
+The layout, pack, and scatter commands use the same key and the same `[1, num_total_tokens]` domain.
+The Metal layout-count, layout-scatter, and pack commands derive
+`num_active_routes = num_active_tokens * num_experts_per_token`.
+The leaf does not declare an active-route parameter.
+
+The total token capacity determines the count/scatter, pack, and output dispatch grids.
+It also determines all token-major and route-major buffer validation.
+Layout clear and prefix always process the fixed expert domain.
+Layout count and layout scatter return before they read an inactive `expert_indices` route.
+Pack returns before it reads an inactive route map or input row.
+Both scatter variants return before they read inactive route maps, probabilities, packed output, shared output, or
+shared-gate logits.
+They also return before they write the inactive output tail.
+
+The exact layout, pack, and scatter APIs remain unchanged and declare zero replay parameters.
+One composite bucketed expert-major replay declares one replay parameter.
+These kernels do not change topology with token count.
+They add no token-count boundary to a composite policy.
+The full MoE owner must still keep the token-major/expert-major path boundary at token count `5`.
+These leaf APIs do not enable bucketed full `GatedMoE` replay.
+
 The backend sparse MLP leaf also has additive bucket-readiness APIs:
 
 ```text

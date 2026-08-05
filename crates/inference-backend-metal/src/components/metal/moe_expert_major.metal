@@ -25,11 +25,13 @@ kernel void moe_expert_major_layout_clear(
 kernel void moe_expert_major_layout_count(
     device const uint* expert_indices [[buffer(0)]],
     device atomic_uint* expert_counts [[buffer(1)]],
-    constant uint& num_routes [[buffer(2)]],
-    constant uint& num_experts [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(2)]],
+    constant uint& num_experts_per_token [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
     uint route [[thread_position_in_grid]]
 ) {
-    if (route >= num_routes) return;
+    const uint num_active_routes = num_active_tokens * num_experts_per_token;
+    if (route >= num_active_routes) return;
     const uint expert = expert_indices[route];
     if (expert >= num_experts) return;
     atomic_fetch_add_explicit(expert_counts + expert, 1, memory_order_relaxed);
@@ -59,11 +61,13 @@ kernel void moe_expert_major_layout_scatter(
     device uint* routes_by_expert [[buffer(2)]],
     device uint* routes_by_token [[buffer(3)]],
     device uint* experts_by_route [[buffer(4)]],
-    constant uint& num_routes [[buffer(5)]],
-    constant uint& num_experts [[buffer(6)]],
+    constant uint& num_active_tokens [[buffer(5)]],
+    constant uint& num_experts_per_token [[buffer(6)]],
+    constant uint& num_experts [[buffer(7)]],
     uint route [[thread_position_in_grid]]
 ) {
-    if (route >= num_routes) return;
+    const uint num_active_routes = num_active_tokens * num_experts_per_token;
+    if (route >= num_active_routes) return;
     const uint expert = expert_indices[route];
     if (expert >= num_experts) return;
     const uint expert_route = atomic_fetch_add_explicit(expert_cursors + expert, 1, memory_order_relaxed);
@@ -76,14 +80,14 @@ kernel void moe_expert_major_pack_input(
     device const bfloat16_t* input [[buffer(0)]],
     device const uint* routes_by_expert [[buffer(1)]],
     device bfloat16_t* packed_input [[buffer(2)]],
-    constant uint& num_routes [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(3)]],
     constant uint& num_experts_per_token [[buffer(4)]],
     constant uint& hidden_dim [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    const uint total = num_routes * hidden_dim;
-    if (gid >= total) return;
     const uint route = gid / hidden_dim;
+    const uint num_active_routes = num_active_tokens * num_experts_per_token;
+    if (route >= num_active_routes) return;
     const uint dim = gid - route * hidden_dim;
     const uint original_route = routes_by_expert[route];
     const uint token = original_route / num_experts_per_token;
@@ -115,13 +119,12 @@ kernel void moe_expert_major_scatter_without_shared_experts(
     device const uint* routes_by_token [[buffer(1)]],
     device const float* routed_probs [[buffer(2)]],
     device bfloat16_t* output [[buffer(3)]],
-    constant uint& num_tokens [[buffer(4)]],
+    constant uint& num_active_tokens [[buffer(4)]],
     constant uint& num_experts_per_token [[buffer(5)]],
     constant uint& hidden_dim [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    const uint total = num_tokens * hidden_dim;
-    if (gid >= total) return;
+    if (gid >= num_active_tokens * hidden_dim) return;
     const uint token = gid / hidden_dim;
     const uint dim = gid - token * hidden_dim;
     write_bf16(output, gid, scatter_topk(packed_output, routes_by_token, routed_probs, token, dim, num_experts_per_token, hidden_dim));
@@ -134,13 +137,12 @@ kernel void moe_expert_major_scatter_with_shared_experts(
     device const bfloat16_t* shared_hidden [[buffer(3)]],
     device const bfloat16_t* shared_expert_gate_logits [[buffer(4)]],
     device bfloat16_t* output [[buffer(5)]],
-    constant uint& num_tokens [[buffer(6)]],
+    constant uint& num_active_tokens [[buffer(6)]],
     constant uint& num_experts_per_token [[buffer(7)]],
     constant uint& hidden_dim [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    const uint total = num_tokens * hidden_dim;
-    if (gid >= total) return;
+    if (gid >= num_active_tokens * hidden_dim) return;
     const uint token = gid / hidden_dim;
     const uint dim = gid - token * hidden_dim;
     const float routed_output = float(bfloat16_t(scatter_topk(
