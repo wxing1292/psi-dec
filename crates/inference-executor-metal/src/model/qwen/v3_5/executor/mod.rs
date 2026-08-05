@@ -284,6 +284,7 @@ pub struct Qwen35Executor {
 
 pub struct Qwen35ModelOpsRecorder {
     main_embed_key: Qwen35MainEmbedReplayKey,
+    main_embed_arguments: ReplayArguments,
     main_key: Qwen35MainReplayKey,
     main_arguments: ReplayArguments,
     main_embed_cache_hit: bool,
@@ -502,13 +503,12 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
     }
 
     fn begin_ops_recording(&mut self, model_batch_request: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {
-        let main_embed_key = Qwen35MainEmbedReplayKey::new(
-            model_batch_request
-                .microbatch()
-                .total_tokens()
-                .try_into()
-                .expect("qwen3.5 MainEmbed token count must fit u32"),
-        );
+        let num_main_active_tokens = model_batch_request
+            .microbatch()
+            .total_tokens()
+            .try_into()
+            .expect("qwen3.5 MainEmbed token count must fit u32");
+        let (main_embed_key, main_embed_arguments) = self.main_embed.component().prepare_replay(num_main_active_tokens);
         let main_key = Qwen35MainReplayKey::from_shapes(
             self.main_gqa_state.metadata().replay_shape(),
             self.main_gqa_state.replay_topology(),
@@ -526,6 +526,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         });
         Qwen35ModelOpsRecorder {
             main_embed_key,
+            main_embed_arguments,
             main_key,
             main_arguments,
             main_embed_cache_hit: false,
@@ -910,7 +911,6 @@ mod tests {
     use super::MetalReplayRuntime;
     use super::Qwen35GatherUnembedReplayKey;
     use super::Qwen35MTPEmbedReplayKey;
-    use super::Qwen35MainEmbedReplayKey;
     use super::Qwen35MainReplayKey;
     use super::Replay;
     use super::TopKSampling;
@@ -980,8 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_keys_separate_token_counts() {
-        assert_ne!(Qwen35MainEmbedReplayKey::new(1), Qwen35MainEmbedReplayKey::new(2));
+    fn test_mtp_embed_key_separates_token_counts() {
         assert_ne!(Qwen35MTPEmbedReplayKey::new(1), Qwen35MTPEmbedReplayKey::new(2));
     }
 

@@ -70,6 +70,11 @@ pub struct EmbedInput<'a> {
 }
 
 impl Embed {
+    /// Returns the token-row capacity of the embedding buffers.
+    pub fn max_tokens(&self) -> u32 {
+        self.config.max_tokens
+    }
+
     fn validate_input(&self, input: EmbedInput<'_>) {
         self.validate_num_tokens(input.num_tokens);
     }

@@ -393,7 +393,12 @@ Bucketed recording interprets `QuantizedEmbeddingShape::num_tokens` as the recor
 It validates buffers and dispatches the grid for that capacity.
 It binds the caller-provided active-token key with the range `1..=capacity`.
 The kernel checks the active token count before it reads `token_ids` or writes the output row.
-The current Qwen MainEmbed and MTPEmbed stages still select exact recording.
+Qwen3.5 MainEmbed reads the configured token-row capacity from `Embed::max_tokens()`.
+It owns a base `ReplayBucketPolicy` capped by this capacity.
+It records the bucket capacity in `Qwen35MainEmbedReplayKey` and never records the active token count in the key.
+It uses the stage-owned `qwen3.5.main_embed.num_active_tokens` replay parameter for submission.
+The executor stores this argument with the prepared key and submits both to the same replay program.
+Qwen3 MainEmbed and Qwen3.5 MTPEmbed still select exact recording.
 
 The shared row-gather leaf supports exact and bucketed recording.
 Exact recording fixes the active row count to `RowGatherShape::num_rows` and declares no replay parameter.

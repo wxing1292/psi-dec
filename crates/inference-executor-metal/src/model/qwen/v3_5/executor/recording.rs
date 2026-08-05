@@ -21,7 +21,7 @@ impl Qwen35Executor {
         let main_replay = self.main.replay(&recorder.main_key);
         let empty_arguments = ReplayArguments::new();
         let mut sequence = vec![
-            ReplayExecution::new(main_embed_replay, &empty_arguments),
+            ReplayExecution::new(main_embed_replay, &recorder.main_embed_arguments),
             ReplayExecution::new(main_replay, &recorder.main_arguments),
         ];
         if self.speculator.is_dspark() {
