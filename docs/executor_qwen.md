@@ -409,7 +409,8 @@ It binds the caller-provided active-row key with the range `1..=capacity`.
 The kernel checks the active row count before it reads an inactive row index or input value and before it writes an
 inactive output value.
 Qwen3.5 MTPEmbed selects bucketed row-gather recording.
-The other current Qwen compositions still select exact row-gather recording.
+Qwen3.5 GatherUnembed also selects bucketed row-gather recording.
+Qwen3 and DSpark GatherUnembed still select exact row-gather recording.
 
 The shared unembedding leaf supports exact and bucketed recording.
 Exact recording fixes the active row count and declares no replay parameter.
@@ -420,7 +421,8 @@ The affine replay parameter validates the submitted active row count in `1..=cap
 The leaf exposes the affine kernel topology for a row capacity and every row count that changes this topology.
 The stage bucket policy must include these topology boundaries.
 This rule lets Gather and Unembed use one active-row key without padding across an affine kernel change.
-The current Qwen compositions still select exact unembedding recording.
+Qwen3.5 GatherUnembed selects bucketed unembedding recording.
+Qwen3 and DSpark GatherUnembed still select exact unembedding recording.
 
 The shared BF16 row-concat leaf supports exact and bucketed recording.
 Exact recording fixes the active row count to `Bf16ConcatRowsShape::num_rows` and declares no replay parameter.
@@ -464,6 +466,23 @@ The composed Gather, Embed, both RMS normalizations, BF16 concat, and FC command
 `qwen3.5.mtp_embed.num_active_tokens` parameter.
 The composed replay declares exactly one parameter.
 The executor stores this argument with the MTPEmbed key and reuses it for every MTP step.
+
+Qwen3.5 GatherUnembed owns one output-row-capacity replay domain.
+Its replay policy combines the shared base bucket ladder with every unembed affine topology boundary.
+`UnembedConfig::max_tokens` caps this policy.
+The loader requires this cap to equal the executor `max_tokens` workspace capacity.
+This cap counts output rows, not requests.
+One speculative request can produce more than one output row.
+`Qwen35GatherUnembed::prepare_replay(...)` maps each nonzero active row count to one recorded capacity.
+The production replay key records `num_total_rows` and the categorical unembed topology.
+The active row count does not enter this key.
+The source-compatible `Qwen35GatherUnembedReplayKey::from_microbatch(...)` constructor creates only a legacy
+exact/manual identity.
+The composed Gather and Unembed commands use the same `qwen3.5.gather_unembed.num_active_rows` parameter.
+The composed replay declares exactly one parameter.
+Main and MTP use the same replay cache because they bind the same stable buffers.
+The recorder stores separate Main and MTP `ReplayArguments` because their active row counts can differ.
+An active row count of zero omits GatherUnembed replay.
 
 Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed.
 Its Main key owns only the token count and GQA replay topology.

@@ -340,7 +340,7 @@ impl Qwen35Executor {
         if recorder.num_mtp_sample_rows() == 0 {
             return;
         }
-        let gather_unembed_key = self.prepare_gather_unembed_replay(
+        let (gather_unembed_key, gather_unembed_arguments) = self.prepare_gather_unembed_replay(
             recorder
                 .mtp_microbatch
                 .as_ref()
@@ -348,6 +348,7 @@ impl Qwen35Executor {
             mtp_hidden_output,
         );
         recorder.mtp_gather_unembed_key = Some(gather_unembed_key);
+        recorder.mtp_gather_unembed_arguments = gather_unembed_arguments;
     }
 
     fn record_mtp_sampling(&mut self, recorder: &mut Qwen35ModelOpsRecorder) {
@@ -372,7 +373,6 @@ impl Qwen35Executor {
         let mtp = self.speculator.mtp();
         let mtp_embed_replay = mtp.embed.replay(mtp_embed_key);
         let mtp_replay = mtp.body.replay(mtp_key);
-        let empty_arguments = ReplayArguments::new();
         let gqa_layer_index = step_index
             .try_into()
             .expect("qwen3.5 MTP GQA layer index must fit u32");
@@ -407,7 +407,10 @@ impl Qwen35Executor {
         self.replay_runtime().submit_replay_sequence(&[
             ReplayExecution::new(mtp_embed_replay, &recorder.mtp_embed_arguments),
             ReplayExecution::new(mtp_replay, &mtp_arguments),
-            ReplayExecution::new(self.gather_unembed.replay(gather_unembed_key), &empty_arguments),
+            ReplayExecution::new(
+                self.gather_unembed.replay(gather_unembed_key),
+                &recorder.mtp_gather_unembed_arguments,
+            ),
             ReplayExecution::new(
                 mtp.sampling.replay(mtp_sampling_key),
                 &recorder.mtp_sampling_arguments,

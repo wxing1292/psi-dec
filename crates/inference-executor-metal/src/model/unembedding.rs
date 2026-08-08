@@ -116,6 +116,10 @@ impl Unembed {
         assert_eq!(self.weights.biases.len_bytes(), self.weights.scales.len_bytes());
     }
 
+    pub fn max_tokens(&self) -> u32 {
+        self.config.max_tokens
+    }
+
     pub fn replay_topology(&self, num_total_rows: u32) -> AffineQuantizedMatmulKernelKind {
         self.validate_num_rows(num_total_rows);
         self.matmul.topology(num_total_rows)

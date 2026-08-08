@@ -289,7 +289,8 @@ pub struct Qwen35ModelOpsRecorder {
     main_arguments: ReplayArguments,
     main_embed_cache_hit: bool,
     main_cache_hit: bool,
-    gather_unembed_key: Option<Qwen35GatherUnembedReplayKey>,
+    main_gather_unembed_key: Option<Qwen35GatherUnembedReplayKey>,
+    main_gather_unembed_arguments: ReplayArguments,
     sampling_key: Option<TopKSamplingReplayKey>,
     sampling_arguments: ReplayArguments,
     rejection_key: Option<RejectionReplayKey>,
@@ -307,6 +308,7 @@ pub struct Qwen35ModelOpsRecorder {
     mtp_sample_positions: Vec<u32>,
     mtp_embed_cache_hit: bool,
     mtp_gather_unembed_key: Option<Qwen35GatherUnembedReplayKey>,
+    mtp_gather_unembed_arguments: ReplayArguments,
     mtp_sampling_key: Option<TopKSamplingReplayKey>,
     mtp_sampling_arguments: ReplayArguments,
     mtp_sample_req_slots: Vec<u32>,
@@ -533,7 +535,8 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             main_embed_cache_hit: false,
             main_cache_hit: false,
             dspark: Qwen3xDSparkRecording::new(),
-            gather_unembed_key: None,
+            main_gather_unembed_key: None,
+            main_gather_unembed_arguments: ReplayArguments::new(),
             sampling_key: None,
             sampling_arguments: ReplayArguments::new(),
             rejection_key: None,
@@ -551,6 +554,7 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             mtp_sample_positions: Vec::new(),
             mtp_embed_cache_hit: false,
             mtp_gather_unembed_key: None,
+            mtp_gather_unembed_arguments: ReplayArguments::new(),
             mtp_sampling_key: None,
             mtp_sampling_arguments: ReplayArguments::new(),
             mtp_sample_req_slots: Vec::new(),
@@ -658,8 +662,10 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         if num_main_output_rows(model_batch_req.microbatch()) == 0 {
             return Qwen35ModelBatchResponse;
         }
-        recorder.gather_unembed_key =
-            Some(self.prepare_gather_unembed_replay(model_batch_req.microbatch(), model_batch_hidden));
+        let (gather_unembed_key, gather_unembed_arguments) =
+            self.prepare_gather_unembed_replay(model_batch_req.microbatch(), model_batch_hidden);
+        recorder.main_gather_unembed_key = Some(gather_unembed_key);
+        recorder.main_gather_unembed_arguments = gather_unembed_arguments;
         Qwen35ModelBatchResponse
     }
 

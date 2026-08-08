@@ -613,7 +613,16 @@ fn init_qwen_3_5_model_inner(
     )?);
     let token_hidden_input = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
     let hidden_output = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
+    assert_eq!(
+        unembed_config.max_tokens as usize, config.max_tokens,
+        "qwen3.5 GatherUnembed output-row capacity must match executor max_tokens"
+    );
     let gather_unembed = Qwen35GatherUnembed::load(&device, &mut store, unembed_config, unembed_bindings)?;
+    assert_eq!(
+        gather_unembed.max_rows() as usize,
+        config.max_tokens,
+        "qwen3.5 GatherUnembed policy and executor output-row capacities must match"
+    );
     let spec_load = match spec_source {
         Qwen35SpecSource::Vanilla => Qwen35SpecLoad::Vanilla,
         Qwen35SpecSource::MTP(mtp) => Qwen35SpecLoad::MTP(mtp),

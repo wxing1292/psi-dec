@@ -30,14 +30,14 @@ impl Qwen35Executor {
                 &empty_arguments,
             ));
         }
-        if let Some(gather_unembed_key) = &recorder.gather_unembed_key {
+        if let Some(gather_unembed_key) = &recorder.main_gather_unembed_key {
             assert!(
                 recorder.num_main_sample_rows > 0,
                 "qwen3.5 GatherUnembed replay requires Main sampling rows"
             );
             sequence.push(ReplayExecution::new(
                 self.gather_unembed.replay(gather_unembed_key),
-                &empty_arguments,
+                &recorder.main_gather_unembed_arguments,
             ));
             if let Some(rejection_key) = &recorder.rejection_key {
                 assert!(
