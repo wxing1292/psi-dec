@@ -11,17 +11,25 @@ impl ReplayBucketPolicy {
         Self::with_topology_boundaries(max_capacity, &[])
     }
 
-    /// `topology_boundaries` contains the first active count for each new
-    /// recorded topology. The policy inserts the preceding count as a terminal
-    /// bucket so that padding cannot cross the boundary. It ignores boundaries
-    /// above `max_capacity`.
+    /// `topology_boundaries` contains the exclusive upper boundary of each
+    /// preceding recorded topology. Boundary `b` separates the half-open
+    /// topology domains `[.., b)` and `[b, ..)`.
+    ///
+    /// Unlike the repository-default half-open interval representation, each
+    /// replay bucket is a positive inclusive upper capacity. `capacity` selects
+    /// the first bucket that is greater than or equal to the active count. The
+    /// policy therefore inserts `boundary - 1` as the final bucket for the
+    /// preceding topology. Boundary `1` has no preceding positive capacity.
+    /// Boundaries above `max_capacity` cannot affect this policy and are
+    /// ignored.
     pub fn with_topology_boundaries(max_capacity: u32, topology_boundaries: &[u32]) -> Self {
         assert!(max_capacity > 0, "replay bucket capacity must be positive");
         let mut buckets = default_buckets(max_capacity);
         for &boundary in topology_boundaries {
             assert!(boundary > 0, "replay topology boundary must be positive");
             if boundary > 1 && boundary <= max_capacity {
-                buckets.push(boundary - 1);
+                let preceding_topology_inclusive_max_capacity = boundary - 1;
+                buckets.push(preceding_topology_inclusive_max_capacity);
             }
         }
         buckets.push(max_capacity);
@@ -38,8 +46,8 @@ impl ReplayBucketPolicy {
         self.max_capacity
     }
 
-    /// Returns the strictly increasing buckets. The final bucket is
-    /// `max_capacity`.
+    /// Returns the strictly increasing positive inclusive upper capacities.
+    /// The final capacity is `max_capacity`.
     pub fn buckets(&self) -> &[u32] {
         &self.buckets
     }
@@ -129,12 +137,30 @@ mod tests {
     fn topology_boundaries_prevent_cross_topology_padding() {
         let policy = ReplayBucketPolicy::with_topology_boundaries(64, &[5, 6, 10, 12, 18]);
 
+        assert!(!policy.buckets().contains(&0));
         assert_eq!(policy.capacity(5), 5);
         assert_eq!(policy.capacity(9), 9);
         assert_eq!(policy.capacity(10), 11);
         assert_eq!(policy.capacity(11), 11);
         assert_eq!(policy.capacity(17), 17);
         assert_eq!(policy.capacity(18), 20);
+    }
+
+    #[test]
+    fn first_topology_boundary_has_no_preceding_bucket() {
+        let policy = ReplayBucketPolicy::with_topology_boundaries(6, &[1]);
+
+        assert_eq!(policy.buckets(), [1, 2, 4, 6]);
+    }
+
+    #[test]
+    fn exclusive_topology_boundary_adds_the_preceding_inclusive_capacity() {
+        let policy = ReplayBucketPolicy::with_topology_boundaries(8, &[6]);
+
+        assert_eq!(policy.buckets(), [1, 2, 4, 5, 6, 8]);
+        assert_eq!(policy.capacity(5), 5);
+        assert_eq!(policy.capacity(6), 6);
+        assert_eq!(policy.capacity(7), 8);
     }
 
     #[test]

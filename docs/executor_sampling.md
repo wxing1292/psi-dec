@@ -129,7 +129,7 @@ It then clears the armed state.
 Replay without a fresh write is an invariant violation.
 It does not permit reuse of stale parameter rows.
 
-The Qwen executor owns three distinct graph and cache stages:
+The Qwen executor owns four distinct graph and cache stages:
 
 - `Replay<Sampling>` handles ordinary Main output.
 - `Replay<DraftSampling>` handles MTP draft sampling and sparse draft-distribution storage.

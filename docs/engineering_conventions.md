@@ -40,6 +40,10 @@ Do not use `element` or an unqualified `size` for a tensor or domain. Use `*_byt
 Use unsigned integers for counts, slots, and IDs. Use signed integers for real negative values, sentinels, or imported
 ABI contracts.
 
+Use half-open intervals `[start, end)` by default. Rust source must use `start..end` for this interval. An owning
+contract may use a different interval representation when that representation is necessary. In that case, document
+the endpoint semantics at the owning type or function. Do not infer inclusive or exclusive endpoints from context.
+
 Use checked `u64` values for host byte offsets and address arithmetic. Use `ulong` for flattened Metal addresses.
 Convert to `usize` only at a Rust slice, pointer, or Objective-C API boundary.
 
@@ -260,6 +264,11 @@ Replay keys contain only facts that change these items:
 A reusable leaf component must expose its topology identity and topology boundaries for each bucketed work domain. The
 owner of a composite replay stage must union the boundaries from all participating leaf components before it selects a
 capacity. A component-local policy is not the final policy for a larger replay stage.
+
+Replay bucket capacities are an explicit exception to the default half-open interval convention. Each stored bucket is
+a positive inclusive upper capacity. A topology boundary `b` is the exclusive upper boundary of the preceding topology.
+It separates the half-open topology domains `[.., b)` and `[b, ..)`. The policy must add `b - 1` as the final inclusive
+capacity for the preceding topology. Zero means that the work domain is absent. It must not be a replay bucket capacity.
 
 Two bindings may use the same replay parameter key only when they use the same scalar type, active work domain, and
 validated range. A selected topology must declare and submit only the parameters that its recorded commands consume.

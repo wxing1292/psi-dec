@@ -501,8 +501,7 @@ mod tests {
     fn test_bucketed_residual_capture_fusion() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let num_active_tokens = 2_u32;
-        let token_capacity = 4_u32;
+        let token_capacity = 2_u32;
         let hidden_dim = 8_u32;
         let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
         let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim, 1.0e-6));
@@ -510,19 +509,14 @@ mod tests {
         let capture_column_start = hidden_dim;
         let capture_column_end = capture_column_start + hidden_dim;
         let capacity_values = (token_capacity * hidden_dim) as usize;
-        let capture_values = (token_capacity * capture_row_width) as usize;
-        let lhs_values = (0..capacity_values)
-            .map(|index| bf16::from_f32(index as f32 * 0.03125 - 0.5).to_bits())
-            .collect::<Vec<_>>();
-        let rhs_values = (0..capacity_values)
-            .map(|index| bf16::from_f32(index as f32 * -0.015625 + 0.25).to_bits())
-            .collect::<Vec<_>>();
-        let lhs = Buffer::from_slice(&device, &lhs_values);
-        let rhs = Buffer::from_slice(&device, &rhs_values);
+        let capture_capacity_values = (token_capacity * capture_row_width) as usize;
+        let input_poison = 0x7fc1_u16;
+        let lhs = Buffer::from_slice(&device, &vec![input_poison; capacity_values]);
+        let rhs = Buffer::from_slice(&device, &vec![input_poison; capacity_values]);
         let weight = Buffer::from_slice(&device, &vec![bf16::from_f32(1.0).to_bits(); hidden_dim as usize]);
         let sentinel = bf16::from_f32(-321.0).to_bits();
         let residual_output = Buffer::from_slice(&device, &vec![sentinel; capacity_values]);
-        let capture_output = Buffer::from_slice(&device, &vec![sentinel; capture_values]);
+        let capture_output = Buffer::from_slice(&device, &vec![sentinel; capture_capacity_values]);
         let norm_output = Buffer::from_slice(&device, &vec![sentinel; capacity_values]);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
@@ -558,35 +552,66 @@ mod tests {
         let replay = recorder.build();
         assert_eq!(replay.command_count(), 1);
         assert_eq!(replay.stats().retained_buffer_count, 6);
-        stream
-            .submit_replay_with_arguments(
-                &replay,
-                &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
-            )
-            .wait();
+        assert_eq!(replay.stats().parameter_count, 1);
 
-        let residual_values = residual_output.read_typed::<u16>(0, capacity_values);
-        let capture_values = capture_output.read_typed::<u16>(0, capture_values);
-        for row in 0..token_capacity as usize {
-            for column in 0..capture_row_width as usize {
-                let actual = capture_values[row * capture_row_width as usize + column];
-                let in_capture_columns =
-                    column >= capture_column_start as usize && column < capture_column_end as usize;
-                if row < num_active_tokens as usize && in_capture_columns {
-                    assert_eq!(
-                        actual,
-                        residual_values[row * hidden_dim as usize + column - capture_column_start as usize]
-                    );
-                } else {
-                    assert_eq!(actual, sentinel);
+        let run_round = |rows: &[(f32, f32)]| {
+            let num_active_tokens = u32::try_from(rows.len()).unwrap();
+            assert!(num_active_tokens > 0);
+            assert!(num_active_tokens <= token_capacity);
+
+            let mut lhs_values = vec![input_poison; capacity_values];
+            let mut rhs_values = vec![input_poison; capacity_values];
+            for (row, &(lhs_value, rhs_value)) in rows.iter().enumerate() {
+                let row_start = row * hidden_dim as usize;
+                lhs_values[row_start..row_start + hidden_dim as usize].fill(bf16::from_f32(lhs_value).to_bits());
+                rhs_values[row_start..row_start + hidden_dim as usize].fill(bf16::from_f32(rhs_value).to_bits());
+            }
+            lhs.write_typed(0, &lhs_values);
+            rhs.write_typed(0, &rhs_values);
+            residual_output.write_typed(0, &vec![sentinel; capacity_values]);
+            capture_output.write_typed(0, &vec![sentinel; capture_capacity_values]);
+            norm_output.write_typed(0, &vec![sentinel; capacity_values]);
+
+            stream
+                .submit_replay_with_arguments(
+                    &replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
+                )
+                .wait();
+
+            let residual_values = residual_output.read_typed::<u16>(0, capacity_values);
+            let capture_values = capture_output.read_typed::<u16>(0, capture_capacity_values);
+            let norm_values = norm_output.read_typed::<u16>(0, capacity_values);
+            for row in 0..token_capacity as usize {
+                let expected_residual = rows
+                    .get(row)
+                    .map(|&(lhs_value, rhs_value)| bf16::from_f32(lhs_value + rhs_value).to_bits());
+                for column in 0..hidden_dim as usize {
+                    let index = row * hidden_dim as usize + column;
+                    if let Some(expected_residual) = expected_residual {
+                        assert_eq!(residual_values[index], expected_residual);
+                        assert_eq!(norm_values[index], bf16::ONE.to_bits());
+                    } else {
+                        assert_eq!(residual_values[index], sentinel);
+                        assert_eq!(norm_values[index], sentinel);
+                    }
+                }
+                for column in 0..capture_row_width as usize {
+                    let actual = capture_values[row * capture_row_width as usize + column];
+                    let in_capture_columns =
+                        column >= capture_column_start as usize && column < capture_column_end as usize;
+                    if let (Some(expected_residual), true) = (expected_residual, in_capture_columns) {
+                        assert_eq!(actual, expected_residual);
+                    } else {
+                        assert_eq!(actual, sentinel);
+                    }
                 }
             }
-        }
-        assert!(
-            residual_values[(num_active_tokens * hidden_dim) as usize..]
-                .iter()
-                .all(|&value| value == sentinel)
-        );
+        };
+
+        run_round(&[(1.0, 2.0)]);
+        run_round(&[(4.0, 5.0), (6.0, 7.0)]);
+        run_round(&[(8.0, 9.0)]);
     }
 
     #[test]

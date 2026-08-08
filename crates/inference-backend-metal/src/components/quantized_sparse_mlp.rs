@@ -1871,6 +1871,36 @@ mod tests {
             assert_panics(|| {
                 let mut builder = self.stream.create_replay_program();
                 let mut buffers = self.token_major_buffers();
+                buffers.expert_indices = &short_route_indices;
+                builder.record(self.compute.invoke_token_major_bucketed(
+                    self.num_total_tokens,
+                    self.num_experts_per_token,
+                    NUM_ACTIVE_TOKENS,
+                    buffers,
+                    QuantizedSparseMLPScratch {
+                        swiglu: &self.token_major_swiglu,
+                    },
+                    self.weights.as_borrowed(),
+                ));
+            });
+            assert_panics(|| {
+                let mut builder = self.stream.create_replay_program();
+                let mut buffers = self.token_major_buffers();
+                buffers.route_indices = &short_route_indices;
+                builder.record(self.compute.invoke_token_major_bucketed(
+                    self.num_total_tokens,
+                    self.num_experts_per_token,
+                    NUM_ACTIVE_TOKENS,
+                    buffers,
+                    QuantizedSparseMLPScratch {
+                        swiglu: &self.token_major_swiglu,
+                    },
+                    self.weights.as_borrowed(),
+                ));
+            });
+            assert_panics(|| {
+                let mut builder = self.stream.create_replay_program();
+                let mut buffers = self.token_major_buffers();
                 buffers.routed_hidden = &short_output;
                 builder.record(self.compute.invoke_token_major_bucketed(
                     self.num_total_tokens,
