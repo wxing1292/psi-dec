@@ -249,7 +249,8 @@ The exact `ReplayLayer::record(...)` path remains unchanged and declares zero re
 The additive `record_bucketed(...)` path returns `next_hidden_state` and declares one replay parameter.
 Qwen3.5 Main calls this full bucketed API through `Qwen3xMoE` with the Main stage-owned token capacity and active-token
 key.
-The Qwen3.5 MTP body does not yet call this API.
+Qwen3.5 MTP calls the same full bucketed API with its separate body stage-owned token capacity and active-token key
+when the physical MTP layer uses MoE.
 
 The backend retains a routing-only bucket-readiness API.
 This API records this chain:

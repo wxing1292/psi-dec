@@ -1,8 +1,10 @@
 use std::rc::Rc;
 
+use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
@@ -15,6 +17,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::scratch::DenseMLPScratch;
+use crate::mlp::moe::backend::GatedMoEReplayTopology;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::qwen::v3_5::mtp::QWEN35_MTP_GQA_LAYER_INDEX;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
@@ -50,6 +53,12 @@ pub struct Qwen35MTPLayerScratch {
 enum Qwen35MTPMLP {
     Dense(Qwen3xDenseMLP),
     MoE(Qwen3xMoE),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Qwen35MTPMLPReplayTopology {
+    Dense(QuantizedDenseMLPReplayTopology),
+    MoE(GatedMoEReplayTopology),
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +136,81 @@ impl Qwen35MTPLayer {
 
     pub fn gqa_tokens_per_page(&self) -> usize {
         self.attention.num_tokens_per_page()
+    }
+
+    pub fn mlp_replay_topology(&self, num_total_tokens: u32) -> Qwen35MTPMLPReplayTopology {
+        self.mlp.replay_topology(num_total_tokens)
+    }
+
+    pub fn mlp_replay_topology_boundaries(&self) -> Box<[u32]> {
+        self.mlp.replay_topology_boundaries()
+    }
+
+    /// Records the MTP layer at one caller-selected token capacity.
+    ///
+    /// The caller must immediately record an RMS normalization that consumes
+    /// the returned residual buffer. This completes the final required
+    /// residual/RMS-normalization fusion.
+    pub fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+        input: Qwen35MTPLayerInput<'a>,
+    ) -> &'a Buffer
+    where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        assert!(input.num_tokens > 0, "qwen3.5 MTP replay requires active tokens");
+        assert!(
+            input.num_tokens <= num_total_tokens,
+            "qwen3.5 MTP active tokens must not exceed the replay capacity"
+        );
+        let num_values = residual_values(num_total_tokens, self.scratch.hidden_dim);
+        self.input_norm.record_bucketed_with_barrier(
+            recorder,
+            num_total_tokens,
+            num_active_tokens_key,
+            input.residual_input,
+            &self.scratch.normalized_hidden,
+        );
+        self.attention.record_bucketed(
+            recorder,
+            &self.scratch.normalized_hidden,
+            &self.scratch.branch_output,
+            input.pages,
+            input.gqa,
+            num_active_tokens_key,
+        );
+        self.residual_add.record_requiring_rms_norm(
+            recorder,
+            num_values,
+            input.residual_input,
+            &self.scratch.branch_output,
+            &self.scratch.post_attention_hidden,
+        );
+        self.post_attention_norm.record_bucketed(
+            recorder,
+            num_total_tokens,
+            num_active_tokens_key,
+            &self.scratch.post_attention_hidden,
+            &self.scratch.normalized_hidden,
+        );
+        self.mlp.record_bucketed(
+            recorder,
+            &self.scratch.normalized_hidden,
+            &self.scratch.branch_output,
+            num_total_tokens,
+            num_active_tokens_key,
+        );
+        self.residual_add.record_requiring_rms_norm(
+            recorder,
+            num_values,
+            &self.scratch.post_attention_hidden,
+            &self.scratch.branch_output,
+            &self.scratch.residual_output,
+        );
+        &self.scratch.residual_output
     }
 }
 
@@ -226,6 +310,40 @@ impl Qwen35MTPMLP {
         match self {
             Self::Dense(component) => component.record(recorder, input, output, num_tokens),
             Self::MoE(component) => component.record(recorder, input, output, num_tokens),
+        }
+    }
+
+    fn replay_topology(&self, num_total_tokens: u32) -> Qwen35MTPMLPReplayTopology {
+        match self {
+            Self::Dense(component) => Qwen35MTPMLPReplayTopology::Dense(component.replay_topology(num_total_tokens)),
+            Self::MoE(component) => Qwen35MTPMLPReplayTopology::MoE(component.replay_topology(num_total_tokens)),
+        }
+    }
+
+    fn replay_topology_boundaries(&self) -> Box<[u32]> {
+        match self {
+            Self::Dense(component) => component.replay_topology_boundaries(),
+            Self::MoE(component) => component.replay_topology_boundaries(),
+        }
+    }
+
+    fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        input: &'a Buffer,
+        output: &'a Buffer,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        match self {
+            Self::Dense(component) => {
+                component.record_bucketed(recorder, input, output, num_total_tokens, num_active_tokens_key)
+            },
+            Self::MoE(component) => {
+                component.record_bucketed(recorder, input, output, num_total_tokens, num_active_tokens_key)
+            },
         }
     }
 }

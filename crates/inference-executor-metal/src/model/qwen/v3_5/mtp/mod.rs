@@ -2,15 +2,19 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
+use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35LayerWeightBindings;
+use inference_executor_core::replay::ReplayBucketPolicy;
 use inference_runtime_core::compute::BatchDeviceRequest;
 
 use crate::attn::gqa::backend::GQAReplayTopology;
+use crate::attn::gqa::backend::add_gqa_private_replay_arguments;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
@@ -22,6 +26,7 @@ use crate::model::qwen::v3_5::Qwen35GQAReplayKey;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayer;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerInput;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
+use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPMLPReplayTopology;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
@@ -32,6 +37,7 @@ pub mod embed;
 pub mod layer;
 
 pub const QWEN35_MTP_GQA_LAYER_INDEX: ReplayParameterKey = ReplayParameterKey::new("qwen3.5.mtp.gqa_layer_index");
+const QWEN35_MTP_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("qwen3.5.mtp.num_active_tokens");
 const QWEN35_MTP_FIRST_CACHE_LANE: usize = 1;
 
 pub struct Qwen35MTP {
@@ -39,6 +45,7 @@ pub struct Qwen35MTP {
     output_norm: RMSNorm,
     request_page_table: Rc<GQARequestPageTable>,
     num_cache_pages: usize,
+    replay_bucket_policy: ReplayBucketPolicy,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +65,7 @@ impl Qwen35MTP {
         store: &mut SafeTensorStore,
         main_config: &Qwen35ModelConfig,
         config: &Qwen35ModelConfig,
+        max_tokens: usize,
         defaults: Qwen35MetalDefaults,
         bindings: Qwen35LayerWeightBindings,
         final_norm_weight: String,
@@ -83,12 +91,41 @@ impl Qwen35MTP {
         let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
         let final_norm_weight = remove_qwen3x_norm_weight(device, &mut tensors, &final_norm_weight, &[hidden_dim])?;
         assert!(tensors.is_empty(), "qwen3.5 MTP must consume its final norm tensor map");
+        let max_tokens = max_tokens
+            .try_into()
+            .expect("qwen3.5 MTP replay token capacity must fit u32");
+        let mut topology_boundaries = gqa_state.replay_token_topology_boundaries().into_vec();
+        topology_boundaries.extend(layer.mlp_replay_topology_boundaries());
         Ok(Self {
             layer,
             output_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps, final_norm_weight),
             request_page_table: Rc::clone(gqa_state.request_page_table()),
             num_cache_pages,
+            replay_bucket_policy: mtp_replay_bucket_policy(max_tokens, topology_boundaries),
         })
+    }
+
+    pub fn replay_token_capacity(&self, num_active_tokens: u32) -> u32 {
+        self.replay_bucket_policy.capacity(num_active_tokens)
+    }
+
+    pub fn prepare_replay(
+        &self,
+        num_active_tokens: u32,
+        gqa_shape: GQAReplayShape,
+        gqa_topology: GQAReplayTopology,
+    ) -> Qwen35MTPReplayKey {
+        self.bucketed_replay_key(num_active_tokens, gqa_shape, gqa_topology)
+    }
+
+    pub fn replay_arguments(
+        &self,
+        gqa_shape: GQAReplayShape,
+        gqa_topology: GQAReplayTopology,
+        gqa_layer_index: u32,
+    ) -> ReplayArguments {
+        self.validate_bucketed_capacity(gqa_shape.num_tokens, gqa_shape.total_tokens);
+        mtp_replay_arguments(gqa_shape, gqa_topology, gqa_layer_index)
     }
 
     pub fn prepare_pages(&self, batch: &BatchDeviceRequest) {
@@ -179,15 +216,112 @@ impl Qwen35MTP {
             .record(recorder, num_tokens, hidden, args.hidden_output);
         args.hidden_output
     }
+
+    pub fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        args: Qwen35MTPArgs<'a>,
+    ) -> &'a Buffer
+    where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        self.validate_bucketed_capacity(args.num_tokens, num_total_tokens);
+        let hidden = self.layer.record_bucketed(
+            recorder,
+            num_total_tokens,
+            QWEN35_MTP_NUM_ACTIVE_TOKENS,
+            Qwen35MTPLayerInput {
+                gqa: args.gqa,
+                num_tokens: args.num_tokens,
+                pages: args.pages,
+                residual_input: args.hidden_input,
+            },
+        );
+        self.output_norm.record_bucketed(
+            recorder,
+            num_total_tokens,
+            QWEN35_MTP_NUM_ACTIVE_TOKENS,
+            hidden,
+            args.hidden_output,
+        );
+        args.hidden_output
+    }
+
+    fn bucketed_replay_key(
+        &self,
+        num_active_tokens: u32,
+        gqa_shape: GQAReplayShape,
+        gqa_topology: GQAReplayTopology,
+    ) -> Qwen35MTPReplayKey {
+        gqa_shape.validate();
+        assert_eq!(
+            gqa_shape.num_tokens, num_active_tokens,
+            "qwen3.5 MTP GQA active tokens must match the stage"
+        );
+        let num_total_tokens = gqa_shape.total_tokens;
+        self.validate_bucketed_capacity(num_active_tokens, num_total_tokens);
+        Qwen35MTPReplayKey::for_bucketed(
+            num_total_tokens,
+            gqa_shape,
+            gqa_topology,
+            self.layer.mlp_replay_topology(num_total_tokens),
+        )
+    }
+
+    fn validate_bucketed_capacity(&self, num_active_tokens: u32, num_total_tokens: u32) {
+        assert_eq!(
+            self.replay_token_capacity(num_active_tokens),
+            num_total_tokens,
+            "qwen3.5 MTP metadata token capacity must match the stage policy"
+        );
+        assert_eq!(
+            self.layer.mlp_replay_topology(num_active_tokens),
+            self.layer.mlp_replay_topology(num_total_tokens),
+            "qwen3.5 MTP replay token capacity must preserve the MLP topology"
+        );
+    }
+}
+
+fn mtp_replay_bucket_policy(max_tokens: u32, mut topology_boundaries: Vec<u32>) -> ReplayBucketPolicy {
+    topology_boundaries.sort_unstable();
+    topology_boundaries.dedup();
+    ReplayBucketPolicy::with_topology_boundaries(max_tokens, &topology_boundaries)
+}
+
+fn mtp_replay_arguments(
+    gqa_shape: GQAReplayShape,
+    gqa_topology: GQAReplayTopology,
+    gqa_layer_index: u32,
+) -> ReplayArguments {
+    let mut arguments = ReplayArguments::new().with_u32(QWEN35_MTP_NUM_ACTIVE_TOKENS, gqa_shape.num_tokens);
+    add_gqa_private_replay_arguments(gqa_shape, gqa_topology, &mut arguments);
+    arguments.set_u32(QWEN35_MTP_GQA_LAYER_INDEX, gqa_layer_index);
+    arguments
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35MTPReplayKey {
-    num_tokens: usize,
+    mode: Qwen35MTPReplayMode,
     gqa: Qwen35GQAReplayKey,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum Qwen35MTPReplayMode {
+    Legacy {
+        num_tokens: usize,
+    },
+    Bucketed {
+        num_total_tokens: u32,
+        mlp_topology: Qwen35MTPMLPReplayTopology,
+    },
+}
+
 impl Qwen35MTPReplayKey {
+    /// Creates a source-compatible legacy exact/manual identity.
+    ///
+    /// Production replay uses the MTP-owned bucket policy and records the MLP
+    /// topology through [`Qwen35MTP::prepare_replay`].
     pub fn new(
         num_tokens: usize,
         gqa_shape: inference_executor_core::attn::GQAReplayShape,
@@ -195,8 +329,37 @@ impl Qwen35MTPReplayKey {
     ) -> Self {
         gqa_shape.validate();
         Self {
-            num_tokens,
+            mode: Qwen35MTPReplayMode::Legacy { num_tokens },
             gqa: Qwen35GQAReplayKey::new(gqa_shape, gqa_topology),
+        }
+    }
+
+    fn for_bucketed(
+        num_total_tokens: u32,
+        gqa_shape: GQAReplayShape,
+        gqa_topology: GQAReplayTopology,
+        mlp_topology: Qwen35MTPMLPReplayTopology,
+    ) -> Self {
+        gqa_shape.validate();
+        assert_eq!(
+            gqa_shape.total_tokens, num_total_tokens,
+            "qwen3.5 MTP GQA key capacity must match the stage"
+        );
+        Self {
+            mode: Qwen35MTPReplayMode::Bucketed {
+                num_total_tokens,
+                mlp_topology,
+            },
+            gqa: Qwen35GQAReplayKey::new(gqa_shape, gqa_topology),
+        }
+    }
+
+    fn bucketed_num_total_tokens(&self) -> u32 {
+        match self.mode {
+            Qwen35MTPReplayMode::Legacy { .. } => {
+                panic!("legacy qwen3.5 MTP replay key does not select a bucketed token capacity")
+            },
+            Qwen35MTPReplayMode::Bucketed { num_total_tokens, .. } => num_total_tokens,
         }
     }
 }
@@ -206,21 +369,21 @@ impl ReplayComponent for Qwen35MTP {
     type Input<'a> = Qwen35MTPArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Self::Key::new(
-            input.num_tokens as usize,
-            input.gqa.replay_shape(),
-            input.gqa_replay_topology,
-        )
+        self.bucketed_replay_key(input.num_tokens, input.gqa.replay_shape(), input.gqa_replay_topology)
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        Qwen35MTP::record(self, recorder, *input);
+        let key = self.replay_key(input);
+        self.record_bucketed(recorder, key.bucketed_num_total_tokens(), *input);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use inference_backend_metal::components::GQAComputePath;
+    use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
     use inference_backend_metal::metal::Device;
+    use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
     use inference_executor_core::attn::GQAPageTableLayout;
     use inference_runtime_core::compute::BatchDeviceRequest;
     use inference_runtime_core::compute::DecoderSyncBlocks;
@@ -229,8 +392,125 @@ mod tests {
     use inference_runtime_core::config::SamplingConfig;
     use inference_runtime_core::runtime::Token;
 
-    use super::GQARequestPageTable;
-    use super::prepare_request_page_table;
+    use super::*;
+    use crate::attn::gqa::backend::GQA_NUM_ACTIVE_Q_TOKEN_TILES;
+    use crate::attn::gqa::backend::GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES;
+    use crate::mlp::moe::backend::GatedMoEComputePath;
+    use crate::mlp::moe::backend::GatedMoEReplayTopology;
+
+    fn gqa_topology() -> GQAReplayTopology {
+        GQAReplayTopology {
+            compute_path: GQAComputePath::SingleQueryToken {
+                kv_token_tile_size: 256,
+                num_threads_per_threadblock: 256,
+                q_head_tile_size: 6,
+            },
+            qgkv_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+        }
+    }
+
+    fn dense_topology() -> Qwen35MTPMLPReplayTopology {
+        Qwen35MTPMLPReplayTopology::Dense(QuantizedDenseMLPReplayTopology {
+            gate_up_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            down_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+        })
+    }
+
+    fn moe_topology() -> Qwen35MTPMLPReplayTopology {
+        Qwen35MTPMLPReplayTopology::MoE(GatedMoEReplayTopology {
+            compute_path: GatedMoEComputePath::TokenMajor,
+            router_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            shared_expert_gate_affine: None,
+            shared_experts_dense: None,
+        })
+    }
+
+    fn gqa_shape(num_tokens: u32, total_tokens: u32) -> GQAReplayShape {
+        GQAReplayShape::new(num_tokens, total_tokens, 1, 2, 2, 4, false)
+    }
+
+    #[test]
+    fn test_mtp_policy_composes_base_buckets_and_topology_boundaries() {
+        let policy = mtp_replay_bucket_policy(16, vec![10, 5, 10]);
+
+        assert_eq!(policy.buckets(), [1, 2, 4, 6, 8, 9, 12, 16]);
+        assert_eq!(policy.capacity(3), 4);
+        assert_eq!(policy.capacity(4), 4);
+        assert_eq!(policy.capacity(5), 6);
+        assert_eq!(policy.capacity(9), 9);
+        assert_eq!(policy.capacity(10), 12);
+    }
+
+    #[test]
+    fn test_mtp_arguments_use_stage_token_private_gqa_values_and_layer_index() {
+        let shape = gqa_shape(3, 4);
+        let single_arguments = mtp_replay_arguments(shape, gqa_topology(), 7);
+        assert_eq!(
+            single_arguments,
+            ReplayArguments::new()
+                .with_u32(QWEN35_MTP_NUM_ACTIVE_TOKENS, 3)
+                .with_u32(GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 2)
+                .with_u32(QWEN35_MTP_GQA_LAYER_INDEX, 7)
+        );
+
+        let tiled_topology = GQAReplayTopology {
+            compute_path: GQAComputePath::TiledQueryTokens {
+                q_token_tile_size: 8,
+                kv_token_tile_size: 16,
+                q_head_tile_size: 6,
+            },
+            ..gqa_topology()
+        };
+        let tiled_arguments = mtp_replay_arguments(shape, tiled_topology, 8);
+        assert_eq!(
+            tiled_arguments,
+            ReplayArguments::new()
+                .with_u32(QWEN35_MTP_NUM_ACTIVE_TOKENS, 3)
+                .with_u32(GQA_NUM_ACTIVE_Q_TOKEN_TILES, 1)
+                .with_u32(GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 2)
+                .with_u32(QWEN35_MTP_GQA_LAYER_INDEX, 8)
+        );
+    }
+
+    #[test]
+    fn test_bucketed_mtp_key_ignores_active_count_and_isolates_legacy_mode() {
+        let active_three = Qwen35MTPReplayKey::for_bucketed(4, gqa_shape(3, 4), gqa_topology(), dense_topology());
+        let active_four = Qwen35MTPReplayKey::for_bucketed(4, gqa_shape(4, 4), gqa_topology(), dense_topology());
+        let legacy = Qwen35MTPReplayKey::new(3, gqa_shape(3, 4), gqa_topology());
+
+        assert_eq!(active_three, active_four);
+        assert_ne!(active_three, legacy);
+        assert_eq!(active_three.bucketed_num_total_tokens(), 4);
+    }
+
+    #[test]
+    fn test_bucketed_mtp_key_separates_capacity_gqa_and_mlp_topology() {
+        let base = Qwen35MTPReplayKey::for_bucketed(4, gqa_shape(3, 4), gqa_topology(), dense_topology());
+        let different_capacity = Qwen35MTPReplayKey::for_bucketed(6, gqa_shape(3, 6), gqa_topology(), dense_topology());
+        let different_gqa_capacity = Qwen35MTPReplayKey::for_bucketed(
+            4,
+            GQAReplayShape::new(3, 4, 1, 4, 2, 4, false),
+            gqa_topology(),
+            dense_topology(),
+        );
+        let different_gqa_topology = Qwen35MTPReplayKey::for_bucketed(
+            4,
+            gqa_shape(3, 4),
+            GQAReplayTopology {
+                qgkv_affine: AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+                ..gqa_topology()
+            },
+            dense_topology(),
+        );
+        let different_mlp_topology =
+            Qwen35MTPReplayKey::for_bucketed(4, gqa_shape(3, 4), gqa_topology(), moe_topology());
+
+        assert_ne!(base, different_capacity);
+        assert_ne!(base, different_gqa_capacity);
+        assert_ne!(base, different_gqa_topology);
+        assert_ne!(base, different_mlp_topology);
+    }
 
     #[test]
     fn test_prepare_request_page_table_maps_cache_lanes_to_gqa_layers() {

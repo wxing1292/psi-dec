@@ -454,7 +454,7 @@ RMS normalization and residual/RMS-normalization fusion have fixed token-count t
 boundary.
 Qwen3.5 MTPEmbed selects bucketed normalization recording.
 Qwen3.5 Main selects bucketed normalization and required residual/RMS-normalization fusion.
-The current Qwen3.5 MTP body still selects exact normalization and residual recording.
+Qwen3.5 MTP selects bucketed normalization and required residual/RMS-normalization fusion.
 
 Qwen3.5 Main owns one token-capacity replay domain.
 The executor selects this capacity before it prepares Main attention metadata.
@@ -501,6 +501,36 @@ The composed Gather, Embed, both RMS normalizations, BF16 concat, and FC command
 `qwen3.5.mtp_embed.num_active_tokens` parameter.
 The composed replay declares exactly one parameter.
 The executor stores this argument with the MTPEmbed key and reuses it for every MTP step.
+
+Qwen3.5 MTP owns a separate body token-capacity replay domain.
+Its policy uses the shared base bucket ladder.
+It also includes every GQA token-topology boundary and the actual physical MTP layer MLP topology boundaries.
+The MLP is either dense MLP or full MoE.
+The full-MoE boundaries include the token-major/expert-major boundary between four and five tokens.
+The executor token workspace capacity caps this policy.
+
+The executor selects the MTP body capacity before it prepares MTP GQA metadata.
+It forces the GQA token capacity to the selected stage capacity.
+GQA continues to bucket Q-token tiles and SDPA map TaskTemplates independently as private replay dimensions.
+All MTP body token-row commands use the single `qwen3.5.mtp.num_active_tokens` parameter.
+The body does not declare the component-local `gqa.num_active_tokens` parameter.
+Each MTP step also supplies `qwen3.5.mtp.gqa_layer_index`.
+A single-query MTP replay declares three parameters: the MTP token count, the GQA TaskTemplate count, and the dynamic
+GQA layer index.
+A tiled-query MTP replay also declares the GQA Q-token-tile count.
+
+The production MTP replay key records the selected token capacity, all GQA capacities and categorical topology, and
+the categorical dense-MLP or full-MoE topology.
+The active token count and logical MTP step index do not enter this key.
+`Qwen35MTPReplayKey::new(...)` remains a source-compatible legacy identity.
+An explicit key-mode discriminator prevents a legacy identity from aliasing a production bucketed identity.
+The public `Qwen35MTP::record(...)` path remains available for legacy/manual composition.
+Production `Replay<Qwen35MTP>` recording uses the bucketed path.
+
+The attention residual fuses with the post-attention normalization.
+The final MLP residual fuses with the output normalization.
+Every logical MTP step uses the same active token count, selected capacity, metadata shape, and recorded program.
+MTPEmbed, MTP body, and GatherUnembed retain separate replay parameter domains.
 
 Qwen3.5 GatherUnembed owns one output-row-capacity replay domain.
 Its replay policy combines the shared base bucket ladder with every unembed affine topology boundary.

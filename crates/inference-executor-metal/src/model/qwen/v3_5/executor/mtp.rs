@@ -194,13 +194,27 @@ impl Qwen35Executor {
         let mut requests = self.mtp_requests(microbatch, decisions);
         let module_batch = self.mtp_batch(microbatch, &mut requests, 0);
         let num_tokens = module_batch.microbatch.total_tokens();
+        let num_active_tokens = num_tokens
+            .try_into()
+            .expect("qwen3.5 MTP token count must fit u32");
+        let num_total_tokens = self
+            .speculator
+            .mtp()
+            .body
+            .component()
+            .replay_token_capacity(num_active_tokens);
         let num_mtp_sample_rows = module_batch.sampler_configs.len();
         self.write_token_ids(module_batch.microbatch.flat_token_ids());
-        let mtp_gqa_shape = self.speculator.mtp().gqa_state.prepare_metadata_bucketed(
-            module_batch.microbatch.req_slots(),
-            module_batch.microbatch.token_indices(),
-            module_batch.microbatch.cu_tokens(),
-        );
+        let mtp_gqa_shape = self
+            .speculator
+            .mtp()
+            .gqa_state
+            .prepare_metadata_bucketed_with_token_capacity(
+                module_batch.microbatch.req_slots(),
+                module_batch.microbatch.token_indices(),
+                module_batch.microbatch.cu_tokens(),
+                num_total_tokens,
+            );
         self.speculator
             .mtp()
             .input_gather_flat_indices
@@ -212,10 +226,11 @@ impl Qwen35Executor {
                 .write_typed(0, &module_batch.draft_distribution_indices);
         }
         let mtp_gqa_topology = self.speculator.mtp().gqa_state.replay_topology();
-        let mtp_key = Qwen35MTPReplayKey::new(num_tokens, mtp_gqa_shape, mtp_gqa_topology);
-        let num_active_tokens = num_tokens
-            .try_into()
-            .expect("qwen3.5 MTPEmbed token count must fit u32");
+        let mtp_key = self.speculator.mtp().body.component().prepare_replay(
+            num_active_tokens,
+            mtp_gqa_shape,
+            mtp_gqa_topology,
+        );
         let (mtp_embed_key, mtp_embed_arguments) = self
             .speculator
             .mtp()
@@ -376,18 +391,13 @@ impl Qwen35Executor {
         let gqa_layer_index = step_index
             .try_into()
             .expect("qwen3.5 MTP GQA layer index must fit u32");
-        let mut mtp_arguments = ReplayArguments::new();
-        add_gqa_replay_arguments(
+        let mtp_arguments = mtp.body.component().replay_arguments(
             recorder
                 .mtp_gqa_shape
                 .expect("qwen3.5 MTP submission requires GQA replay arguments"),
             recorder
                 .mtp_gqa_topology
                 .expect("qwen3.5 MTP submission requires GQA replay topology"),
-            &mut mtp_arguments,
-        );
-        mtp_arguments.set_u32(
-            crate::model::qwen::v3_5::mtp::QWEN35_MTP_GQA_LAYER_INDEX,
             gqa_layer_index,
         );
         if recorder.num_mtp_sample_rows() == 0 {
@@ -456,6 +466,23 @@ impl Qwen35Executor {
             }
         }
         assert_eq!(sample_index, num_sample_rows);
+        let mtp_gqa_shape = recorder
+            .mtp_gqa_shape
+            .expect("qwen3.5 MTP step requires the recorded GQA shape");
+        assert_eq!(
+            flat_token_ids.len(),
+            mtp_gqa_shape.num_tokens as usize,
+            "qwen3.5 MTP steps must preserve the active token count"
+        );
+        assert_eq!(
+            self.speculator
+                .mtp()
+                .body
+                .component()
+                .replay_token_capacity(mtp_gqa_shape.num_tokens),
+            mtp_gqa_shape.total_tokens,
+            "qwen3.5 MTP steps must preserve the replay token capacity"
+        );
         self.write_token_ids(&flat_token_ids);
         let draft_distribution_indices = recorder
             .mtp_sample_req_slots

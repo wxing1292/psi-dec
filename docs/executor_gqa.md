@@ -476,10 +476,11 @@ enter this GQA subkey.
 `Qwen35MainReplayKey` and `Qwen35MTPReplayKey` use this shared GQA subkey. Qwen3.5 Main selects one composite token
 capacity and forces GQA metadata to use it. All Main token-row commands use the caller-owned Main active-token key.
 The Q-token-tile and TaskTemplate counts remain private GQA replay dimensions. The Main key also contains the
-non-optional GDN request-count subkey. The Qwen3.5 MTP body top-level token count remains exact and continues to use the
-component-local GQA bucketed path.
+non-optional GDN request-count subkey. Qwen3.5 MTP independently selects one composite body token capacity and forces
+its GQA metadata to use it. All MTP body token-row commands use the caller-owned MTP active-token key. MTP does not
+declare the component-local GQA active-token parameter.
 
-MTP keeps its separate pure-GQA key.
+MTP keeps its separate GQA and MLP composite key.
 All MTP steps in one batch have the same token and attention shape, so they reuse one recorded program.
 The replay argument selects the logical MTP GQA layer at execution time.
 Main recording supplies each physical layer's fixed index through the same kernel ABI.

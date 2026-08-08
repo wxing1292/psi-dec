@@ -90,10 +90,6 @@ component path as the design.
   Keep the shared execution lifecycle backend-agnostic.
   Keep Metal replay and fusion in the Metal backend.
   Recommendation: Do not mirror replay operator and recorder APIs across the backend and executor.
-- Evaluate capacity-bucketed main and MTP forward replays only after each participating kernel meets two requirements.
-  Each kernel must have a guarded inactive-lane ABI.
-  Each kernel must have parity coverage.
-  Main and MTP counts remain exact until then.
 - Add a bounded replay catalog only if measured replay-memory growth justifies it.
   Its eviction policy must account for all stage caches.
   The policy must retain in-flight resources through GPU completion.

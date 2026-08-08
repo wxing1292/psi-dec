@@ -726,6 +726,7 @@ fn init_qwen_3_5_model_inner(
                 &mut store,
                 &model_config,
                 &mtp_model_config,
+                config.max_tokens,
                 Qwen35MetalDefaults::from_quantization(mtp_model_config.quantization.as_ref())?,
                 body,
                 final_norm_weight,
