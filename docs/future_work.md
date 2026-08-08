@@ -84,6 +84,12 @@ component path as the design.
 
 ## Replay Evolution
 
+- Audit row-count names for each remaining leaf that supports both exact and bucketed recording.
+  Use `num_total_rows` for the recorded capacity.
+  Use `num_active_rows` for the submission-time prefix.
+  Keep `num_rows` only where one exact logical row count has no active-versus-total distinction.
+  Start with `RowGatherShape` and `SoftmaxShape`.
+  Remove an exact API only after repository-wide reference analysis confirms that production does not use it.
 - Revisit the backend-neutral replay boundary before adding another backend.
   The current neutral `Runtime` and `Recorder` contracts coexist with Metal-only replay programs and fusion.
   They also coexist with executor-side adapters.

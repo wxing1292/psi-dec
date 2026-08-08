@@ -925,7 +925,6 @@ mod tests {
     use super::DraftSamplingInput;
     use super::MetalReplayRuntime;
     use super::Qwen35GatherUnembedReplayKey;
-    use super::Qwen35MTPEmbedReplayKey;
     use super::Qwen35MainReplayKey;
     use super::Replay;
     use super::TopKSampling;
@@ -992,11 +991,6 @@ mod tests {
         let key = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), topology, gdn_shape(1), gdn_topology);
 
         assert_eq!(key.debug_parts(), (4, 4, 4, 4, 1, 4, topology, gdn_topology));
-    }
-
-    #[test]
-    fn test_mtp_embed_key_separates_token_counts() {
-        assert_ne!(Qwen35MTPEmbedReplayKey::new(1), Qwen35MTPEmbedReplayKey::new(2));
     }
 
     #[test]

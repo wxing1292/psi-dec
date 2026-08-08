@@ -97,7 +97,6 @@ mod tests {
     use inference_backend_metal::operators::Bf16ConcatRowsBuffers;
     use inference_backend_metal::operators::Bf16ConcatRowsConfig;
     use inference_backend_metal::operators::Bf16ConcatRowsKernel;
-    use inference_backend_metal::operators::Bf16ConcatRowsShape;
     use inference_executor_core::backend::recorder::Recorder;
 
     use super::Replay;
@@ -105,6 +104,9 @@ mod tests {
     use crate::def::replay_op::MetalReplayRuntime;
     use crate::def::replay_op::ReplayOp;
     use crate::def::replay_op::ReplayRecorder;
+
+    const NUM_ACTIVE_ROWS: inference_backend_metal::metal::ReplayParameterKey =
+        inference_backend_metal::metal::ReplayParameterKey::new("test.replay.num_active_rows");
 
     struct CountedComponent {
         records: Cell<usize>,
@@ -124,8 +126,9 @@ mod tests {
 
         fn record<'a>(&'a self, recorder: &mut ReplayRecorder, _input: &Self::Input<'a>) {
             self.records.set(self.records.get() + 1);
-            recorder.record(ReplayOp::opaque(self.kernel.invoke(
-                Bf16ConcatRowsShape { num_rows: 1 },
+            recorder.record(ReplayOp::opaque(self.kernel.invoke_bucketed(
+                1,
+                NUM_ACTIVE_ROWS,
                 Bf16ConcatRowsBuffers {
                     lhs: &self.lhs,
                     rhs: &self.rhs,
@@ -138,10 +141,10 @@ mod tests {
     fn component(device: &Device) -> CountedComponent {
         CountedComponent {
             records: Cell::new(0),
-            kernel: Bf16ConcatRowsKernel::new(device, Bf16ConcatRowsConfig { num_cols: 1 }),
-            lhs: Buffer::new_zeroed_elements(device, 1, inference_backend_metal::metal::Dtype::Bfloat16),
-            rhs: Buffer::new_zeroed_elements(device, 1, inference_backend_metal::metal::Dtype::Bfloat16),
-            output: Buffer::new_zeroed_elements(device, 2, inference_backend_metal::metal::Dtype::Bfloat16),
+            kernel: Bf16ConcatRowsKernel::new(device, Bf16ConcatRowsConfig { num_columns: 4 }),
+            lhs: Buffer::new_zeroed_elements(device, 4, inference_backend_metal::metal::Dtype::Bfloat16),
+            rhs: Buffer::new_zeroed_elements(device, 4, inference_backend_metal::metal::Dtype::Bfloat16),
+            output: Buffer::new_zeroed_elements(device, 8, inference_backend_metal::metal::Dtype::Bfloat16),
         }
     }
 

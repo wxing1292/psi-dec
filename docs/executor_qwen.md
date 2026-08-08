@@ -424,10 +424,13 @@ This rule lets Gather and Unembed use one active-row key without padding across 
 Qwen3.5 GatherUnembed selects bucketed unembedding recording.
 Qwen3 and DSpark GatherUnembed still select exact unembedding recording.
 
-The shared BF16 row-concat leaf supports exact and bucketed recording.
-Exact recording fixes the active row count to `Bf16ConcatRowsShape::num_rows` and declares no replay parameter.
-Bucketed recording interprets `Bf16ConcatRowsShape::num_rows` as the recorded capacity.
-It validates both input buffers and the output buffer and dispatches the grid for that capacity.
+The shared BF16 row-concat leaf supports bucketed recording.
+The API names the recorded row capacity `num_total_rows` and the submission parameter `num_active_rows`.
+The configuration names the logical input row width `num_columns`.
+`num_columns` must be divisible by four.
+The three buffer base addresses must be 8-byte aligned.
+The kernel copies one `bfloat4` vector per thread.
+It validates both input buffers and the output buffer against `num_total_rows`.
 It binds the caller-provided active-row key with the range `1..=capacity`.
 The kernel checks the active row count before it reads an input value or writes an output value.
 The row-concat leaf has one fixed topology and adds no replay bucket boundary.
@@ -504,7 +507,6 @@ Its replay policy uses the shared base bucket ladder and the input-projection FC
 The policy is capped by the executor token workspace capacity.
 The selected capacity and FC topology identify a production replay key.
 The active token count does not enter this key.
-The source-compatible `Qwen35MTPEmbedReplayKey::new(...)` constructor creates only a legacy exact/manual identity.
 Production recording uses `Qwen35MTPEmbed::prepare_replay(...)`.
 The composed Gather, Embed, both RMS normalizations, BF16 concat, and FC commands use the same
 `qwen3.5.mtp_embed.num_active_tokens` parameter.

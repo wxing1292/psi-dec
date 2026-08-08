@@ -35,7 +35,6 @@ pub use affine_quantized::RaggedExpertMajorAffineQuantizedShape;
 pub use bf16_concat_rows::Bf16ConcatRowsBuffers;
 pub use bf16_concat_rows::Bf16ConcatRowsConfig;
 pub use bf16_concat_rows::Bf16ConcatRowsKernel;
-pub use bf16_concat_rows::Bf16ConcatRowsShape;
 pub use row_gather::RowGatherBuffers;
 pub use row_gather::RowGatherConfig;
 pub use row_gather::RowGatherKernel;

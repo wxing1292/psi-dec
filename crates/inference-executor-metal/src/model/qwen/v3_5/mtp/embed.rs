@@ -11,7 +11,6 @@ use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 use inference_backend_metal::operators::Bf16ConcatRowsBuffers;
 use inference_backend_metal::operators::Bf16ConcatRowsConfig;
 use inference_backend_metal::operators::Bf16ConcatRowsKernel;
-use inference_backend_metal::operators::Bf16ConcatRowsShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
@@ -19,10 +18,12 @@ use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MTPEmbedWei
 use inference_executor_core::replay::ReplayBucketPolicy;
 
 use crate::checkpoint::SafeTensorStore;
+#[cfg(test)]
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
+#[cfg(test)]
 use crate::model::embedding::EmbedInput;
 use crate::model::gather::Gather;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
@@ -34,6 +35,9 @@ use crate::replay::ReplayComponent;
 
 const QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
     ReplayParameterKey::new("qwen3.5.mtp_embed.num_active_tokens");
+#[cfg(test)]
+const QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS: ReplayParameterKey =
+    ReplayParameterKey::new("test.qwen3.5.mtp_embed.reference_num_active_tokens");
 
 pub struct Qwen35MTPEmbed {
     embed: Rc<Embed>,
@@ -143,7 +147,7 @@ impl Qwen35MTPEmbed {
             concat: Bf16ConcatRowsKernel::new(
                 device,
                 Bf16ConcatRowsConfig {
-                    num_cols: hidden_dim
+                    num_columns: hidden_dim
                         .try_into()
                         .expect("qwen3.5 MTP hidden dimension must fit u32"),
                 },
@@ -159,7 +163,8 @@ impl Qwen35MTPEmbed {
         })
     }
 
-    fn record_projection<'a, R>(
+    #[cfg(test)]
+    fn record_projection_reference<'a, R>(
         &'a self,
         recorder: &mut R,
         num_tokens: u32,
@@ -174,8 +179,9 @@ impl Qwen35MTPEmbed {
             .record_with_barrier(recorder, num_tokens, previous_hidden, &self.normed_hidden);
         self.embedding_norm
             .record(recorder, num_tokens, shifted_embeddings, &self.normed_embedding);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke(
-            Bf16ConcatRowsShape { num_rows: num_tokens },
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke_bucketed(
+            num_tokens,
+            QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS,
             Bf16ConcatRowsBuffers {
                 lhs: &self.normed_embedding,
                 rhs: &self.normed_hidden,
@@ -224,9 +230,7 @@ impl Qwen35MTPEmbed {
             &self.normed_embedding,
         );
         recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke_bucketed(
-            Bf16ConcatRowsShape {
-                num_rows: num_total_tokens,
-            },
+            num_total_tokens,
             QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
             Bf16ConcatRowsBuffers {
                 lhs: &self.normed_embedding,
@@ -251,7 +255,8 @@ impl Qwen35MTPEmbed {
         output
     }
 
-    pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen35MTPEmbedArgs<'a>) -> &'a Buffer
+    #[cfg(test)]
+    fn record_reference<'a, R>(&'a self, recorder: &mut R, args: Qwen35MTPEmbedArgs<'a>) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -272,7 +277,7 @@ impl Qwen35MTPEmbed {
                 output_hidden: args.token_hidden_input,
             },
         );
-        self.record_projection(
+        self.record_projection_reference(
             recorder,
             num_tokens,
             args.prev_hidden_input,
@@ -409,27 +414,14 @@ impl Qwen35MTPEmbedWeights {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35MTPEmbedReplayKey {
     num_total_tokens: u32,
-    fc_topology: Option<AffineQuantizedMatmulKernelKind>,
+    fc_topology: AffineQuantizedMatmulKernelKind,
 }
 
 impl Qwen35MTPEmbedReplayKey {
-    /// Creates a source-compatible legacy exact/manual identity.
-    ///
-    /// Production bucketed replay uses the component-owned capacity policy and
-    /// records the selected FC topology through [`Qwen35MTPEmbed::prepare_replay`].
-    pub fn new(num_tokens: usize) -> Self {
-        Self {
-            num_total_tokens: num_tokens
-                .try_into()
-                .expect("qwen3.5 MTPEmbed replay token count must fit u32"),
-            fc_topology: None,
-        }
-    }
-
     fn for_capacity(num_total_tokens: u32, fc_topology: AffineQuantizedMatmulKernelKind) -> Self {
         Self {
             num_total_tokens,
-            fc_topology: Some(fc_topology),
+            fc_topology,
         }
     }
 }
@@ -539,7 +531,7 @@ mod tests {
         assert_eq!(three_key, four_key);
         assert_eq!(five_key.num_total_tokens, 6);
         assert_ne!(four_key, five_key);
-        assert!(three_key.fc_topology.is_some());
+        assert_eq!(three_key.fc_topology, component.fc.topology(three_key.num_total_tokens));
         assert_eq!(component.replay_key(&input(3)), three_key);
         assert_eq!(
             three_arguments,
@@ -562,7 +554,7 @@ mod tests {
                 "num_active_tokens={num_active_tokens} num_total_tokens={}",
                 key.num_total_tokens
             );
-            assert_eq!(key.fc_topology, Some(component.fc.topology(key.num_total_tokens)));
+            assert_eq!(key.fc_topology, component.fc.topology(key.num_total_tokens));
         }
         for boundary in component.fc.topology_boundaries() {
             if boundary > 1 && boundary <= MAX_TOKENS {
@@ -570,10 +562,6 @@ mod tests {
             }
         }
 
-        let legacy = Qwen35MTPEmbedReplayKey::new(4);
-        assert_eq!(legacy.num_total_tokens, 4);
-        assert_eq!(legacy.fc_topology, None);
-        assert_ne!(legacy, three_key);
         assert_ne!(
             Qwen35MTPEmbedReplayKey::for_capacity(4, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
             Qwen35MTPEmbedReplayKey::for_capacity(4, AffineQuantizedMatmulKernelKind::QmmBm8Bn32)
@@ -588,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn bucketed_replay_matches_exact_and_preserves_tails_across_grow_and_shrink() {
+    fn bucketed_replay_matches_fixed_capacity_reference_and_preserves_tails_across_grow_and_shrink() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
@@ -597,12 +585,17 @@ mod tests {
 
         buffers.fill_stage_outputs(&component, OUTPUT_CANARY);
         buffers.write_active_inputs(3);
-        let mut exact_recorder = runtime.create_recorder();
-        component.record(&mut exact_recorder, buffers.input(3));
-        let exact_replay = exact_recorder.build();
-        assert_eq!(exact_replay.stats().parameter_count, 0);
-        runtime.submit_replay(&exact_replay).wait();
-        let exact_output = buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize * 3);
+        let mut reference_recorder = runtime.create_recorder();
+        component.record_reference(&mut reference_recorder, buffers.input(3));
+        let reference_replay = reference_recorder.build();
+        assert_eq!(reference_replay.stats().parameter_count, 1);
+        runtime
+            .submit_replay_with_arguments(
+                &reference_replay,
+                &ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS, 3),
+            )
+            .wait();
+        let reference_output = buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize * 3);
 
         buffers.fill_stage_outputs(&component, OUTPUT_CANARY);
         buffers.write_active_inputs(3);
@@ -618,7 +611,7 @@ mod tests {
             .wait();
         assert_eq!(
             buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize * 3),
-            exact_output
+            reference_output
         );
         assert_stage_output_tails(replay.component(), &buffers, 3);
 
@@ -859,7 +852,12 @@ mod tests {
                 1e-6,
                 Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16),
             ),
-            concat: Bf16ConcatRowsKernel::new(device, Bf16ConcatRowsConfig { num_cols: HIDDEN_DIM }),
+            concat: Bf16ConcatRowsKernel::new(
+                device,
+                Bf16ConcatRowsConfig {
+                    num_columns: HIDDEN_DIM,
+                },
+            ),
             fc,
             fc_weight: Buffer::new_zeroed(device, fc_config.weight_bytes()),
             fc_scales: Buffer::new_zeroed(device, fc_config.scale_or_bias_bytes()),
