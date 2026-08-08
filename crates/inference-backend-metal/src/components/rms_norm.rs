@@ -13,7 +13,8 @@ use crate::metal::ReplayParameterKey;
 
 const RMS_NORM_SOURCE: &str = include_str!("metal/rms_norm.metal");
 
-const RMS_NUM_THREADS_PER_THREADBLOCK: usize = 1024;
+const BF16_VECTOR_WIDTH: u32 = 4;
+const NUM_THREADS_PER_THREADBLOCK: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RMSNormConfig {
@@ -31,6 +32,7 @@ impl RMSNormConfig {
         }
     }
 
+    /// Creates a BF16 configuration. `hidden_dim` must be divisible by 4.
     pub fn bf16(hidden_dim: u32, eps: f32) -> Self {
         Self {
             hidden_dim,
@@ -43,6 +45,10 @@ impl RMSNormConfig {
         assert!(self.hidden_dim > 0);
         assert!(self.eps.is_finite() && self.eps > 0.0);
         assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(
+            self.io_dtype != Dtype::Bfloat16 || self.hidden_dim.is_multiple_of(BF16_VECTOR_WIDTH),
+            "BF16 RMSNorm hidden_dim must be divisible by {BF16_VECTOR_WIDTH}"
+        );
     }
 
     pub fn num_values(self, shape: RMSNormShape) -> usize {
@@ -60,6 +66,7 @@ impl RMSNormConfig {
     }
 
     pub fn weight_bytes(self) -> usize {
+        self.validate();
         (self.hidden_dim as usize)
             .checked_mul(self.io_dtype.item_size())
             .expect("RMSNorm weight byte length must fit usize")
@@ -176,9 +183,9 @@ impl Operator for RMSNormInvocation<'_> {
         record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
         builder.set_u32(4, self.config.hidden_dim);
         builder.set_f32(5, self.config.eps);
-        builder.dispatch_1d(
-            self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
-            RMS_NUM_THREADS_PER_THREADBLOCK,
+        builder.dispatch_threadblocks(
+            (self.shape.num_total_tokens as usize, 1, 1),
+            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
     }
 }
@@ -193,9 +200,9 @@ impl Operator for RMSNormReplayInvocation {
         record_num_active_tokens(builder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
         builder.set_u32(4, self.config.hidden_dim);
         builder.set_f32(5, self.config.eps);
-        builder.dispatch_1d(
-            self.shape.num_total_tokens as usize * RMS_NUM_THREADS_PER_THREADBLOCK,
-            RMS_NUM_THREADS_PER_THREADBLOCK,
+        builder.dispatch_threadblocks(
+            (self.shape.num_total_tokens as usize, 1, 1),
+            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
     }
 }
@@ -264,7 +271,7 @@ fn record_num_active_tokens(
 fn rms_norm_function_name(config: RMSNormConfig) -> &'static str {
     match config.io_dtype {
         Dtype::Float32 => "rms_norm_f32",
-        Dtype::Bfloat16 => "rms_norm_bf16",
+        Dtype::Bfloat16 => "rms_norm_bf16_vec4",
         dtype => panic!("unsupported RMSNorm dtype {dtype:?}"),
     }
 }
@@ -340,15 +347,15 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let num_total_tokens = 2_u32;
-        let hidden_dim = 8_u32;
+        let hidden_dim = 5120_u32;
         let config = RMSNormConfig::bf16(hidden_dim, 1.0e-6);
         let shape = RMSNormShape { num_total_tokens };
         let kernel = RMSNormKernel::new(&device, config);
         let input_values = (0..config.num_values(shape))
-            .map(|index| index as f32 * 0.125 - 0.75)
+            .map(|index| ((index * 37) % 251) as f32 * 0.03125 - 3.5)
             .collect::<Vec<_>>();
         let weight_values = (0..hidden_dim)
-            .map(|index| 0.75 + index as f32 * 0.0625)
+            .map(|index| 0.5 + ((index * 19) % 31) as f32 * 0.03125)
             .collect::<Vec<_>>();
         let input = Buffer::from_slice(
             &device,
@@ -418,6 +425,12 @@ mod tests {
             row_values,
             sentinel,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "BF16 RMSNorm hidden_dim must be divisible by 4")]
+    fn test_bf16_rejects_non_vector_width() {
+        RMSNormConfig::bf16(3, 1.0e-6).validate();
     }
 
     #[test]

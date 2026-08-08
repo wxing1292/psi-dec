@@ -172,10 +172,9 @@ pub(super) struct ResidualAddCaptureReplayOp {
 /// dimension, and the destination buffer must not alias any fused
 /// residual/RMSNorm buffer.
 ///
-/// Capture rows whose width is a multiple of four use the vec4 kernel and
-/// therefore require four-element-aligned destination rows and column starts.
-/// Other layouts in that variant are unsupported and panic instead of falling
-/// back to a more generic kernel.
+/// BF16 RMSNorm requires a hidden dimension that is divisible by four. The
+/// capture uses the same vec4 kernel. The destination range width, row width,
+/// and column start must therefore be divisible by four.
 ///
 /// The target alone does not know the residual row width, replay token
 /// capacity, or fused buffers. Those remaining invariants, including
@@ -236,13 +235,12 @@ impl<'a> ResidualAddCaptureTarget<'a> {
     ///
     /// `row_width` and `columns` are tensor coordinates, not byte offsets.
     /// This constructor verifies that the range is non-empty and contained in
-    /// a destination row. When the range width is a multiple of four, the
-    /// destination row width and column start must also be multiples of four;
-    /// unsupported layouts panic rather than falling back to the scalar
-    /// variant. The range width must equal the fused BF16 RMSNorm hidden
-    /// dimension; replay fusion asserts that delayed invariant together with
-    /// the immediate-fusion, no-alias, and capacity contracts. Replay fusion
-    /// owns the dtype-specific byte and vector-width lowering.
+    /// a destination row. The range width, destination row width, and column
+    /// start must be multiples of four. The range width must equal the fused
+    /// BF16 RMSNorm hidden dimension; replay fusion asserts that delayed
+    /// invariant together with the immediate-fusion, no-alias, and capacity
+    /// contracts. Replay fusion owns the dtype-specific byte and vector-width
+    /// lowering.
     pub fn columns(buffer: &'a Buffer, row_width: u32, columns: Range<u32>) -> Self {
         assert!(row_width > 0, "residual-add capture row width must be positive");
         assert!(
@@ -254,13 +252,14 @@ impl<'a> ResidualAddCaptureTarget<'a> {
             "residual-add capture columns must be within the row"
         );
         let column_width = columns.end - columns.start;
-        if column_width.is_multiple_of(4) {
-            assert!(
-                row_width.is_multiple_of(4) && columns.start.is_multiple_of(4),
-                "unsupported residual-add capture layout: a capture width divisible by four requires aligned row \
-                 width and column start"
-            );
-        }
+        assert!(
+            column_width.is_multiple_of(4),
+            "unsupported residual-add capture layout: BF16 capture width must be divisible by four"
+        );
+        assert!(
+            row_width.is_multiple_of(4) && columns.start.is_multiple_of(4),
+            "unsupported residual-add capture layout: BF16 capture requires aligned row width and column start"
+        );
         Self {
             buffer,
             row_width,

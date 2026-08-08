@@ -31,6 +31,7 @@ use support::hidden_fixture;
 const BENCH_TOKENS: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
 const HIDDEN_DIMS: [u32; 2] = [2048, 5120];
 const EPS: f32 = 1.0e-6;
+const RMS_ONLY_COMMANDS: usize = 64;
 
 fn bench_residual_add_rms_norm(c: &mut Criterion) {
     let device = Device::system_default();
@@ -39,6 +40,18 @@ fn bench_residual_add_rms_norm(c: &mut Criterion) {
     for hidden_dim in HIDDEN_DIMS {
         for tokens in BENCH_TOKENS {
             let fixture = ResidualAddRMSNormFixture::new(&device, tokens, hidden_dim);
+            group.throughput(Throughput::Elements(
+                tokens as u64 * hidden_dim as u64 * RMS_ONLY_COMMANDS as u64,
+            ));
+            group.bench_function(
+                format!("rms-only/replay{RMS_ONLY_COMMANDS}/tokens{tokens}/hidden{hidden_dim}"),
+                |b| {
+                    b.iter(|| {
+                        fixture.replay_rms_only();
+                        black_box(&fixture.rms_only_output);
+                    });
+                },
+            );
             group.throughput(Throughput::Elements(tokens as u64 * hidden_dim as u64));
             group.bench_function(format!("unfused/replay/tokens{tokens}/hidden{hidden_dim}"), |b| {
                 b.iter(|| {
@@ -66,9 +79,11 @@ fn bench_residual_add_rms_norm(c: &mut Criterion) {
 
 struct ResidualAddRMSNormFixture {
     stream: Stream,
+    rms_only_replay: ReplayProgram,
     unfused_replay: ReplayProgram,
     fused_scalar_replay: ReplayProgram,
     fused_vec4_replay: ReplayProgram,
+    rms_only_output: Buffer,
     unfused_norm_output: Buffer,
     fused_scalar_norm_output: Buffer,
     fused_vec4_norm_output: Buffer,
@@ -97,6 +112,30 @@ impl ResidualAddRMSNormFixture {
         let fused_scalar_norm_output = Buffer::new_zeroed(device, num_values * size_of::<u16>());
         let fused_vec4_residual_output = Buffer::new_zeroed(device, num_values * size_of::<u16>());
         let fused_vec4_norm_output = Buffer::new_zeroed(device, num_values * size_of::<u16>());
+        let rms_only_a = bf16_buffer(device, &hidden_fixture(tokens as usize, hidden_dim as usize));
+        let rms_only_b = Buffer::new_zeroed(device, num_values * size_of::<u16>());
+
+        let rms_only_replay = {
+            let mut builder = stream.create_replay_program();
+            for command_index in 0..RMS_ONLY_COMMANDS {
+                let (input, output) = if command_index.is_multiple_of(2) {
+                    (&rms_only_a, &rms_only_b)
+                } else {
+                    (&rms_only_b, &rms_only_a)
+                };
+                builder.record_with_barrier_before(rms_norm.invoke(
+                    RMSNormShape {
+                        num_total_tokens: tokens,
+                    },
+                    RMSNormBuffers {
+                        input,
+                        weight: &weight,
+                        output,
+                    },
+                ));
+            }
+            builder.build()
+        };
 
         let unfused_replay = {
             let mut builder = stream.create_replay_program();
@@ -153,13 +192,16 @@ impl ResidualAddRMSNormFixture {
 
         let fixture = Self {
             stream,
+            rms_only_replay,
             unfused_replay,
             fused_scalar_replay,
             fused_vec4_replay,
+            rms_only_output: rms_only_a,
             unfused_norm_output,
             fused_scalar_norm_output,
             fused_vec4_norm_output,
         };
+        fixture.replay_rms_only();
         fixture.replay_unfused();
         fixture.replay_fused_scalar();
         fixture.replay_fused_vec4();
@@ -174,6 +216,10 @@ impl ResidualAddRMSNormFixture {
             "vectorized fused residual-add RMSNorm must match residual add -> RMSNorm"
         );
         fixture
+    }
+
+    fn replay_rms_only(&self) {
+        self.stream.submit_replay(&self.rms_only_replay).wait();
     }
 
     fn replay_unfused(&self) {

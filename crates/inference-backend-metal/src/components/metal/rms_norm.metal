@@ -2,15 +2,13 @@
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
-typedef bfloat bfloat16_t;
 
-constant int RMS_N_READS = 4;
+constant uint RMS_NORM_F32_VALUES_PER_THREAD = 4;
 
-template <typename T>
-void rms_norm_impl(
-    device const T* input,
-    device const T* weight,
-    device T* output,
+void rms_norm_f32_impl(
+    device const float* input,
+    device const float* weight,
+    device float* output,
     constant uint& num_tokens,
     constant uint& hidden_dim,
     constant float& eps,
@@ -25,19 +23,18 @@ void rms_norm_impl(
     const uint row = gid;
     if (row >= num_tokens) return;
 
-    constexpr int SIMD_SIZE = 32;
     float acc = 0.0f;
-    const device T* row_input = input + row * size_t(hidden_dim) + lid * RMS_N_READS;
-    for (uint r = 0; r < hidden_dim; r += lsize * RMS_N_READS) {
-        if (r + lid * RMS_N_READS + RMS_N_READS <= hidden_dim) {
-            for (int i = 0; i < RMS_N_READS; i++) {
-                float x = float(row_input[i + r]);
+    const device float* row_input = input + row * size_t(hidden_dim) + lid * RMS_NORM_F32_VALUES_PER_THREAD;
+    for (uint r = 0; r < hidden_dim; r += lsize * RMS_NORM_F32_VALUES_PER_THREAD) {
+        if (r + lid * RMS_NORM_F32_VALUES_PER_THREAD + RMS_NORM_F32_VALUES_PER_THREAD <= hidden_dim) {
+            for (uint i = 0; i < RMS_NORM_F32_VALUES_PER_THREAD; i++) {
+                float x = row_input[i + r];
                 acc += x * x;
             }
         } else {
-            for (int i = 0; i < RMS_N_READS; i++) {
-                if (r + lid * RMS_N_READS + i < hidden_dim) {
-                    float x = float(row_input[i + r]);
+            for (uint i = 0; i < RMS_NORM_F32_VALUES_PER_THREAD; i++) {
+                if (r + lid * RMS_NORM_F32_VALUES_PER_THREAD + i < hidden_dim) {
+                    float x = row_input[i + r];
                     acc += x * x;
                 }
             }
@@ -60,17 +57,17 @@ void rms_norm_impl(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device T* row_output = output + row * size_t(hidden_dim) + lid * RMS_N_READS;
-    const device T* row_weight = weight + lid * RMS_N_READS;
-    for (uint r = 0; r < hidden_dim; r += lsize * RMS_N_READS) {
-        if (r + lid * RMS_N_READS + RMS_N_READS <= hidden_dim) {
-            for (int i = 0; i < RMS_N_READS; i++) {
-                row_output[i + r] = row_weight[i + r] * T(row_input[i + r] * local_inv_mean[0]);
+    device float* row_output = output + row * size_t(hidden_dim) + lid * RMS_NORM_F32_VALUES_PER_THREAD;
+    const device float* row_weight = weight + lid * RMS_NORM_F32_VALUES_PER_THREAD;
+    for (uint r = 0; r < hidden_dim; r += lsize * RMS_NORM_F32_VALUES_PER_THREAD) {
+        if (r + lid * RMS_NORM_F32_VALUES_PER_THREAD + RMS_NORM_F32_VALUES_PER_THREAD <= hidden_dim) {
+            for (uint i = 0; i < RMS_NORM_F32_VALUES_PER_THREAD; i++) {
+                row_output[i + r] = row_weight[i + r] * (row_input[i + r] * local_inv_mean[0]);
             }
         } else {
-            for (int i = 0; i < RMS_N_READS; i++) {
-                if (r + lid * RMS_N_READS + i < hidden_dim) {
-                    row_output[i + r] = row_weight[i + r] * T(row_input[i + r] * local_inv_mean[0]);
+            for (uint i = 0; i < RMS_NORM_F32_VALUES_PER_THREAD; i++) {
+                if (r + lid * RMS_NORM_F32_VALUES_PER_THREAD + i < hidden_dim) {
+                    row_output[i + r] = row_weight[i + r] * (row_input[i + r] * local_inv_mean[0]);
                 }
             }
         }
@@ -92,15 +89,15 @@ kernel void rms_norm_f32(
 ) {
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
-    rms_norm_impl<float>(
+    rms_norm_f32_impl(
         input, weight, output, num_tokens, hidden_dim, eps, local_inv_mean, local_sums, gid, lid, lsize,
         simd_lane_id, simd_group_id);
 }
 
-kernel void rms_norm_bf16(
-    device const bfloat16_t* input [[buffer(0)]],
-    device const bfloat16_t* weight [[buffer(1)]],
-    device bfloat16_t* output [[buffer(2)]],
+kernel void rms_norm_bf16_vec4(
+    device const bfloat4* input [[buffer(0)]],
+    device const bfloat4* weight [[buffer(1)]],
+    device bfloat4* output [[buffer(2)]],
     constant uint& num_tokens [[buffer(3)]],
     constant uint& hidden_dim [[buffer(4)]],
     constant float& eps [[buffer(5)]],
@@ -110,9 +107,39 @@ kernel void rms_norm_bf16(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
+    const uint row = gid;
+    if (row >= num_tokens) return;
+
+    // One thread processes one bfloat4 at a time. Adjacent threads process adjacent vectors.
+    const uint hidden_dim_vec = hidden_dim / 4;
+    float acc = 0.0f;
+    const device bfloat4* row_input = input + row * size_t(hidden_dim_vec);
+    for (uint vector_index = lid; vector_index < hidden_dim_vec; vector_index += lsize) {
+        float4 x = float4(row_input[vector_index]);
+        acc += dot(x, x);
+    }
+    acc = simd_sum(acc);
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
-    rms_norm_impl<bfloat16_t>(
-        input, weight, output, num_tokens, hidden_dim, eps, local_inv_mean, local_sums, gid, lid, lsize,
-        simd_lane_id, simd_group_id);
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        acc = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / float(hidden_dim) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device bfloat4* row_output = output + row * size_t(hidden_dim_vec);
+    for (uint vector_index = lid; vector_index < hidden_dim_vec; vector_index += lsize) {
+        row_output[vector_index] =
+            weight[vector_index] * bfloat4(float4(row_input[vector_index]) * local_inv_mean[0]);
+    }
 }

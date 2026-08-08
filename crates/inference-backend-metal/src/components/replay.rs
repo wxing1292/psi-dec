@@ -201,12 +201,11 @@ impl<'a> ReplayOp<'a> {
     /// The next recorded operator must be the RMSNorm consuming this residual
     /// output. Fusion asserts that the capture range width equals the RMSNorm
     /// hidden dimension, that the capture buffer has sufficient capacity and
-    /// does not alias any fused residual/RMSNorm buffer. A hidden dimension
-    /// divisible by four uses the vec4 kernel and requires aligned destination
-    /// coordinates; unsupported layouts panic rather than falling back to the
-    /// scalar kernel. Shape, capacity, and alias checks are intentionally
-    /// delayed because the residual invocation and capture target do not carry
-    /// the RMSNorm shape or all fused buffers.
+    /// does not alias any fused residual/RMSNorm buffer. BF16 RMSNorm requires
+    /// a hidden dimension divisible by four. Capture destination coordinates
+    /// must use the same four-element alignment. Shape, capacity, and alias
+    /// checks are intentionally delayed because the residual invocation and
+    /// capture target do not carry the RMSNorm shape or all fused buffers.
     pub fn residual_add_with_capture(
         invocation: ResidualAddInvocation<'a>,
         capture: ResidualAddCaptureTarget<'a>,
@@ -615,74 +614,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_residual_capture_fusion() {
+    #[should_panic(expected = "BF16 capture width must be divisible by four")]
+    fn test_non_vector_width_capture_is_unsupported() {
         let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let tokens = 2_u32;
-        let hidden_dim = 6_u32;
-        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
-        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim, 1.0e-6));
-        let capture_row_width = 13_u32;
-        let capture_column_start = 2_u32;
-        let capture_column_end = capture_column_start + hidden_dim;
-        let num_values = (tokens * hidden_dim) as usize;
-        let lhs = Buffer::from_slice(
-            &device,
-            &(0..num_values)
-                .map(|index| bf16::from_f32(index as f32 * 0.125 - 0.75).to_bits())
-                .collect::<Vec<_>>(),
-        );
-        let rhs = Buffer::from_slice(
-            &device,
-            &(0..num_values)
-                .map(|index| bf16::from_f32(index as f32 * -0.0625 + 0.5).to_bits())
-                .collect::<Vec<_>>(),
-        );
-        let weight = Buffer::from_slice(&device, &vec![bf16::from_f32(1.0).to_bits(); hidden_dim as usize]);
-        let residual_output = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
-        let norm_output = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
-        let sentinel = bf16::from_f32(-123.0).to_bits();
-        let capture_output = Buffer::from_slice(&device, &vec![sentinel; (tokens * capture_row_width) as usize]);
-        let mut recorder = ReplayRecorder::new(stream.create_replay_program());
-        recorder.record(ReplayOp::residual_add_with_capture(
-            residual_add.invoke(
-                ResidualAddShape {
-                    num_values: num_values as u32,
-                },
-                ResidualAddBuffers {
-                    lhs: &lhs,
-                    rhs: &rhs,
-                    output: &residual_output,
-                },
-            ),
-            ResidualAddCaptureTarget::columns(
-                &capture_output,
-                capture_row_width,
-                capture_column_start..capture_column_end,
-            ),
-        ));
-        recorder.record(ReplayOp::rms_norm(rms_norm.invoke(
-            RMSNormShape {
-                num_total_tokens: tokens,
-            },
-            RMSNormBuffers {
-                input: &residual_output,
-                weight: &weight,
-                output: &norm_output,
-            },
-        )));
-
-        stream.submit_replay(&recorder.build()).wait();
-
-        let residual_values = residual_output.read_typed::<u16>(0, num_values);
-        let capture_values = capture_output.read_typed::<u16>(0, (tokens * capture_row_width) as usize);
-        for row in 0..tokens as usize {
-            assert_eq!(
-                &capture_values[row * capture_row_width as usize + capture_column_start as usize
-                    ..row * capture_row_width as usize + capture_column_end as usize],
-                &residual_values[row * hidden_dim as usize..(row + 1) * hidden_dim as usize]
-            );
-        }
+        let capture_output = Buffer::new_zeroed(&device, 24 * size_of::<u16>());
+        let _ = ResidualAddCaptureTarget::columns(&capture_output, 12, 0..6);
     }
 
     #[test]

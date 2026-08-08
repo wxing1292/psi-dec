@@ -65,6 +65,9 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 
 ## Target meanings
 
+- `norm` measures standalone RMSNorm and residual-add RMSNorm variants.
+  The `rms-only/replay64` cases record 64 standalone BF16 RMSNorm commands in one replay.
+  This method amortizes command submission and wait overhead for kernel-level comparisons.
 - `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts `single_q_token` or `tiled_q_tokens`. It can run an explicit
   untimed `--validate-tiled-q-tokens` comparison.
 - `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SDPA-only paths, and exact QKV/output

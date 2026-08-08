@@ -36,6 +36,7 @@ impl ResidualAddRMSNormConfig {
         }
     }
 
+    /// Creates a BF16 configuration. `hidden_dim` must be divisible by 4.
     pub fn bf16(hidden_dim: u32, eps: f32) -> Self {
         Self {
             hidden_dim,
@@ -48,6 +49,10 @@ impl ResidualAddRMSNormConfig {
         assert!(self.hidden_dim > 0);
         assert!(self.eps.is_finite() && self.eps > 0.0);
         assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(
+            self.io_dtype != Dtype::Bfloat16 || self.hidden_dim.is_multiple_of(4),
+            "BF16 residual-add RMSNorm hidden_dim must be divisible by 4"
+        );
     }
 
     pub fn num_values(self, shape: ResidualAddRMSNormShape) -> usize {
@@ -65,6 +70,7 @@ impl ResidualAddRMSNormConfig {
     }
 
     pub fn weight_bytes(self) -> usize {
+        self.validate();
         (self.hidden_dim as usize)
             .checked_mul(self.io_dtype.item_size())
             .expect("residual-add RMSNorm weight byte length must fit usize")
@@ -336,13 +342,8 @@ impl Operator for ResidualAddCaptureRMSNormReplayInvocation {
         builder.set_retained_buffer_write(5, &self.buffers.norm_output, 0);
         record_num_active_tokens(builder, 6, self.shape.num_total_tokens, self.num_active_tokens_key);
         builder.set_u32(7, self.config.hidden_dim);
-        if self.config.hidden_dim.is_multiple_of(4) {
-            builder.set_u32(8, self.capture_row_width / 4);
-            builder.set_u32(9, self.capture_column_start / 4);
-        } else {
-            builder.set_u32(8, self.capture_row_width);
-            builder.set_u32(9, self.capture_column_start);
-        }
+        builder.set_u32(8, self.capture_row_width / 4);
+        builder.set_u32(9, self.capture_column_start / 4);
         builder.set_f32(10, self.config.eps);
         builder.dispatch_1d(
             self.shape.num_total_tokens as usize * NUM_THREADS_PER_THREADBLOCK,
@@ -569,18 +570,14 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         assert_eq!(self.config.io_dtype, Dtype::Bfloat16);
         assert!(self.capture_row_width >= self.config.hidden_dim);
         assert!(self.capture_column_start <= self.capture_row_width - self.config.hidden_dim);
-        if self.config.hidden_dim.is_multiple_of(4) {
-            assert!(
-                self.capture_row_width.is_multiple_of(4),
-                "unsupported residual-add capture layout: vec4 hidden dimension requires a four-element-aligned row \
-                 width"
-            );
-            assert!(
-                self.capture_column_start.is_multiple_of(4),
-                "unsupported residual-add capture layout: vec4 hidden dimension requires a four-element-aligned \
-                 column start"
-            );
-        }
+        assert!(
+            self.capture_row_width.is_multiple_of(4),
+            "unsupported residual-add capture layout: BF16 capture row width must be divisible by four"
+        );
+        assert!(
+            self.capture_column_start.is_multiple_of(4),
+            "unsupported residual-add capture layout: BF16 capture column start must be divisible by four"
+        );
         assert!(self.buffers.lhs_len_bytes >= self.config.bytes(self.shape));
         assert!(self.buffers.rhs_len_bytes >= self.config.bytes(self.shape));
         assert!(self.buffers.weight_len_bytes >= self.config.weight_bytes());
@@ -626,8 +623,8 @@ fn record_num_active_tokens(
 
 fn selected_kernel_kind(config: ResidualAddRMSNormConfig) -> ResidualAddRMSNormKernelKind {
     match config.io_dtype {
-        Dtype::Bfloat16 if config.hidden_dim.is_multiple_of(4) => ResidualAddRMSNormKernelKind::Bf16Vectorized,
-        Dtype::Float32 | Dtype::Bfloat16 => ResidualAddRMSNormKernelKind::Scalar,
+        Dtype::Float32 => ResidualAddRMSNormKernelKind::Scalar,
+        Dtype::Bfloat16 => ResidualAddRMSNormKernelKind::Bf16Vectorized,
         dtype => panic!("unsupported residual-add RMSNorm dtype {dtype:?}"),
     }
 }
@@ -656,8 +653,7 @@ fn residual_add_rms_norm_function_name(
 
 fn residual_add_capture_rms_norm_function_name(config: ResidualAddRMSNormConfig) -> &'static str {
     match config.io_dtype {
-        Dtype::Bfloat16 if config.hidden_dim.is_multiple_of(4) => "residual_add_capture_rms_norm_bf16_vec4",
-        Dtype::Bfloat16 => "residual_add_capture_rms_norm_bf16",
+        Dtype::Bfloat16 => "residual_add_capture_rms_norm_bf16_vec4",
         dtype => panic!("unsupported residual-add capture RMSNorm dtype {dtype:?}"),
     }
 }
@@ -678,6 +674,12 @@ mod tests {
     use crate::components::ResidualAddKernel;
     use crate::components::ResidualAddShape;
     use crate::metal::Stream;
+
+    #[test]
+    #[should_panic(expected = "BF16 residual-add RMSNorm hidden_dim must be divisible by 4")]
+    fn test_bf16_rejects_non_vector_width() {
+        ResidualAddRMSNormConfig::bf16(6, 1.0e-6).validate();
+    }
 
     #[test]
     fn test_bf16_fusion() {
