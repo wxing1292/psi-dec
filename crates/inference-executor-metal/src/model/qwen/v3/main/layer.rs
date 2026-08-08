@@ -134,7 +134,7 @@ impl ReplayLayer for Qwen3MainLayer {
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record(
+        self.post_attention_norm.record_with_barrier(
             recorder,
             input.num_tokens,
             &self.scratch.post_attention_hidden,
@@ -150,7 +150,8 @@ impl ReplayLayer for Qwen3MainLayer {
             Some(capture) => {
                 self.residual_add.record_with_capture(
                     recorder,
-                    num_values,
+                    input.num_tokens,
+                    u32::try_from(self.scratch.hidden_dim()).expect("hidden dimension must fit u32"),
                     &self.scratch.post_attention_hidden,
                     &self.scratch.branch_output,
                     input.residual_output,

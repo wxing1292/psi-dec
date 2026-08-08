@@ -213,7 +213,7 @@ impl Qwen35MTP {
             },
         );
         self.output_norm
-            .record(recorder, num_tokens, hidden, args.hidden_output);
+            .record_with_barrier(recorder, num_tokens, hidden, args.hidden_output);
         args.hidden_output
     }
 
@@ -238,7 +238,7 @@ impl Qwen35MTP {
                 residual_input: args.hidden_input,
             },
         );
-        self.output_norm.record_bucketed(
+        self.output_norm.record_bucketed_with_barrier(
             recorder,
             num_total_tokens,
             QWEN35_MTP_NUM_ACTIVE_TOKENS,

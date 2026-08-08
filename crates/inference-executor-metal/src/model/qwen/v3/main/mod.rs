@@ -111,7 +111,7 @@ impl Qwen3Main {
             );
         }
         self.final_norm
-            .record(recorder, args.num_tokens, hidden, args.hidden_output);
+            .record_with_barrier(recorder, args.num_tokens, hidden, args.hidden_output);
         args.hidden_output
     }
 }

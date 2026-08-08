@@ -180,7 +180,8 @@ impl Qwen35Main {
                 },
             );
         }
-        self.final_norm.record(recorder, num_tokens, hidden, args.hidden_output);
+        self.final_norm
+            .record_with_barrier(recorder, num_tokens, hidden, args.hidden_output);
         args.hidden_output
     }
 
@@ -215,7 +216,7 @@ impl Qwen35Main {
                 },
             );
         }
-        self.final_norm.record_bucketed(
+        self.final_norm.record_bucketed_with_barrier(
             recorder,
             num_total_tokens,
             QWEN35_MAIN_NUM_ACTIVE_TOKENS,

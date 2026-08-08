@@ -131,25 +131,10 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
-    /// Records a residual add that must fuse with the next RMSNorm.
-    ///
-    /// Replay construction panics if another operator occurs first or if the
-    /// RMSNorm does not consume this residual output.
-    pub fn residual_add_requiring_rms_norm(invocation: ResidualAddInvocation<'a>) -> Self {
-        Self {
-            inner: inference_backend_metal::components::ReplayOp::residual_add_requiring_rms_norm(invocation),
-        }
-    }
-
     /// Records a BF16 residual add that captures every complete output row.
     ///
-    /// The next recorded operator must be the RMSNorm consuming this residual
-    /// output. Backend replay fusion then asserts that the destination range
-    /// width equals the RMSNorm hidden dimension, has sufficient capacity and
-    /// alignment, and does not alias any fused residual/RMSNorm buffer. Those
-    /// checks are delayed until fusion because this wrapper does not own the
-    /// RMSNorm shape or fused buffers. Unsupported vec4 destination alignment
-    /// panics instead of falling back to a more generic kernel.
+    /// An adjacent compatible RMSNorm fuses opportunistically. Otherwise, the
+    /// backend records an independent padding-safe capture operation.
     pub fn residual_add_with_capture(
         invocation: ResidualAddInvocation<'a>,
         capture: ResidualAddCaptureTarget<'a>,

@@ -190,7 +190,7 @@ impl Qwen35MainLayer {
             input.num_tokens <= num_total_tokens,
             "qwen3.5 Main active tokens must not exceed the replay capacity"
         );
-        let num_values = residual_values(num_total_tokens, self.scratch.hidden_dim());
+        let hidden_dim = u32::try_from(self.scratch.hidden_dim()).expect("hidden dimension must fit u32");
         let attention_input = match &self.attention {
             Qwen35MainAttention::Gqa(_) => {
                 Qwen35MainAttentionInput::Gqa {
@@ -214,14 +214,16 @@ impl Qwen35MainLayer {
             attention_input,
             num_active_tokens_key,
         );
-        self.residual_add.record_requiring_rms_norm(
+        self.residual_add.record_bucketed(
             recorder,
-            num_values,
+            num_total_tokens,
+            hidden_dim,
+            num_active_tokens_key,
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record_bucketed(
+        self.post_attention_norm.record_bucketed_with_barrier(
             recorder,
             num_total_tokens,
             num_active_tokens_key,
@@ -237,9 +239,11 @@ impl Qwen35MainLayer {
         );
         match input.residual_capture_dest {
             Some(capture) => {
-                self.residual_add.record_with_capture(
+                self.residual_add.record_bucketed_with_capture(
                     recorder,
-                    num_values,
+                    num_total_tokens,
+                    hidden_dim,
+                    num_active_tokens_key,
                     &self.scratch.post_attention_hidden,
                     &self.scratch.branch_output,
                     input.residual_output,
@@ -247,9 +251,11 @@ impl Qwen35MainLayer {
                 )
             },
             None => {
-                self.residual_add.record_requiring_rms_norm(
+                self.residual_add.record_bucketed(
                     recorder,
-                    num_values,
+                    num_total_tokens,
+                    hidden_dim,
+                    num_active_tokens_key,
                     &self.scratch.post_attention_hidden,
                     &self.scratch.branch_output,
                     input.residual_output,
@@ -297,7 +303,7 @@ impl ReplayLayer for Qwen35MainLayer {
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record(
+        self.post_attention_norm.record_with_barrier(
             recorder,
             input.num_tokens,
             &self.scratch.post_attention_hidden,
@@ -313,7 +319,8 @@ impl ReplayLayer for Qwen35MainLayer {
             Some(capture) => {
                 self.residual_add.record_with_capture(
                     recorder,
-                    num_values,
+                    input.num_tokens,
+                    u32::try_from(self.scratch.hidden_dim()).expect("hidden dimension must fit u32"),
                     &self.scratch.post_attention_hidden,
                     &self.scratch.branch_output,
                     input.residual_output,

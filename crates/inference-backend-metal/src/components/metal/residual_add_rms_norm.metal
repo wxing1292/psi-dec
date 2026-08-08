@@ -200,7 +200,7 @@ kernel void residual_add_capture_rms_norm_bf16_vec4(
     device bfloat4* norm_output [[buffer(5)]],
     constant uint& num_tokens [[buffer(6)]],
     constant uint& hidden_dim [[buffer(7)]],
-    constant uint& capture_row_width_vec [[buffer(8)]],
+    constant uint& capture_num_columns_vec [[buffer(8)]],
     constant uint& capture_column_start_vec [[buffer(9)]],
     constant float& eps [[buffer(10)]],
     uint gid [[threadgroup_position_in_grid]],
@@ -218,7 +218,7 @@ kernel void residual_add_capture_rms_norm_bf16_vec4(
     const device bfloat4* row_rhs = rhs + row * size_t(hidden_dim_vec) + lid;
     device bfloat4* row_residual_output = residual_output + row * size_t(hidden_dim_vec) + lid;
     device bfloat4* row_capture_output =
-        capture_output + row * size_t(capture_row_width_vec) + capture_column_start_vec + lid;
+        capture_output + row * size_t(capture_num_columns_vec) + capture_column_start_vec + lid;
     for (uint r = 0; r < hidden_dim_vec; r += lsize) {
         if (r + lid < hidden_dim_vec) {
             bfloat4 residual = bfloat4(float4(row_lhs[r]) + float4(row_rhs[r]));

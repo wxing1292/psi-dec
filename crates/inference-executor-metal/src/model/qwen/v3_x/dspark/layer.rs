@@ -162,7 +162,7 @@ impl Qwen3xDSparkLayer {
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record(
+        self.post_attention_norm.record_with_barrier(
             recorder,
             input.num_tokens,
             &self.scratch.post_attention_hidden,

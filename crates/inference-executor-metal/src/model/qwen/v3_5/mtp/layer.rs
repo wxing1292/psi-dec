@@ -148,9 +148,8 @@ impl Qwen35MTPLayer {
 
     /// Records the MTP layer at one caller-selected token capacity.
     ///
-    /// The caller must immediately record an RMS normalization that consumes
-    /// the returned residual buffer. This completes the final required
-    /// residual/RMS-normalization fusion.
+    /// An adjacent compatible RMS normalization can fuse with the final
+    /// residual add. The residual add remains valid when fusion is unavailable.
     pub fn record_bucketed<'a, R>(
         &'a self,
         recorder: &mut R,
@@ -166,7 +165,7 @@ impl Qwen35MTPLayer {
             input.num_tokens <= num_total_tokens,
             "qwen3.5 MTP active tokens must not exceed the replay capacity"
         );
-        let num_values = residual_values(num_total_tokens, self.scratch.hidden_dim);
+        let hidden_dim = u32::try_from(self.scratch.hidden_dim).expect("hidden dimension must fit u32");
         self.input_norm.record_bucketed_with_barrier(
             recorder,
             num_total_tokens,
@@ -182,14 +181,16 @@ impl Qwen35MTPLayer {
             input.gqa,
             num_active_tokens_key,
         );
-        self.residual_add.record_requiring_rms_norm(
+        self.residual_add.record_bucketed(
             recorder,
-            num_values,
+            num_total_tokens,
+            hidden_dim,
+            num_active_tokens_key,
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record_bucketed(
+        self.post_attention_norm.record_bucketed_with_barrier(
             recorder,
             num_total_tokens,
             num_active_tokens_key,
@@ -203,9 +204,11 @@ impl Qwen35MTPLayer {
             num_total_tokens,
             num_active_tokens_key,
         );
-        self.residual_add.record_requiring_rms_norm(
+        self.residual_add.record_bucketed(
             recorder,
-            num_values,
+            num_total_tokens,
+            hidden_dim,
+            num_active_tokens_key,
             &self.scratch.post_attention_hidden,
             &self.scratch.branch_output,
             &self.scratch.residual_output,
@@ -243,7 +246,7 @@ impl ReplayLayer for Qwen35MTPLayer {
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record(
+        self.post_attention_norm.record_with_barrier(
             recorder,
             input.num_tokens,
             &self.scratch.post_attention_hidden,

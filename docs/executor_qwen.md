@@ -440,21 +440,29 @@ range `1..=capacity`.
 The RMS-normalization kernel checks the active token count before it reads or writes a row.
 
 Replay recording can fuse a residual add with the immediately following RMS normalization.
-The required-fusion residual path makes this adjacency and buffer-identity contract mandatory.
-Replay construction fails if another operator occurs first or if the RMS normalization consumes a different buffer.
-The residual shape contains `capacity * hidden_dim` values.
-The fused command inherits the active-token key and token capacity from the RMS normalization.
+Fusion is an optional recorder optimization.
+The recorder fuses the operations only when their buffer, dtype, capacity, hidden dimension, and replay parameter
+domains match.
+An intervening operation or an incompatible RMS normalization disables fusion and does not fail replay construction.
+Each dependent RMS normalization records its own consumer barrier.
+Fusion preserves a barrier requested by either source operation.
+Exact residual recording uses `ResidualAddShape::num_values`.
+Exact capture and bucketed residual recording use
+`ResidualAddRowShape { num_total_rows, num_columns }`.
+Both fields count tensor elements, not bytes.
+Bucketed recording also uses the caller-provided active-token key.
+The fused command uses the shared active-token key and token capacity.
 It does not declare a separate active-value parameter.
-The ordinary and capture fused kernels check the active token count before they read or write a row.
-The capture variant validates its destination for the recorded capacity and writes only active rows.
-
-Standalone residual-add recording remains exact.
-A bucketed Qwen stage must use required residual/RMS-normalization fusion instead of a standalone residual dispatch.
+The standalone bucketed residual kernel and both fused kernels check the active token count before they read or
+write a value or row.
+Residual capture is also independently recordable.
+Its BF16 vec4 kernel writes the residual output and the selected capture columns only for active rows.
+An adjacent compatible RMS normalization can replace it with the fused capture kernel.
+Both paths validate the capture destination for the recorded capacity.
 RMS normalization and residual/RMS-normalization fusion have fixed token-count topology and add no replay bucket
 boundary.
 Qwen3.5 MTPEmbed selects bucketed normalization recording.
-Qwen3.5 Main selects bucketed normalization and required residual/RMS-normalization fusion.
-Qwen3.5 MTP selects bucketed normalization and required residual/RMS-normalization fusion.
+Qwen3.5 Main and MTP select bucketed residual and normalization recording.
 
 Qwen3.5 Main owns one token-capacity replay domain.
 The executor selects this capacity before it prepares Main attention metadata.
@@ -483,10 +491,11 @@ The public `Qwen35Main::record(...)` path remains available for legacy/manual co
 component-local GQA and GDN replay behavior.
 Production `Replay<Qwen35Main>` recording uses the bucketed path.
 
-Each bucketed Main attention residual must fuse with the following post-attention RMS normalization.
-Each bucketed Main MLP residual must fuse with the next layer input normalization or with the final normalization.
-The Main residual-capture path uses the same required adjacency.
-The fused capture command writes only active rows.
+The recorder normally fuses each Main attention residual with the following post-attention RMS normalization.
+It also normally fuses each Main MLP residual with the next layer input normalization or the final normalization.
+These adjacencies are optimization opportunities, not correctness requirements.
+The Main residual-capture path has the same optional fusion opportunity.
+Both the standalone and fused capture commands write only active rows.
 DSpark can consume this Main capture, but DSpark-owned replay keys, arguments, and recording policies remain
 unchanged.
 
@@ -527,8 +536,9 @@ An explicit key-mode discriminator prevents a legacy identity from aliasing a pr
 The public `Qwen35MTP::record(...)` path remains available for legacy/manual composition.
 Production `Replay<Qwen35MTP>` recording uses the bucketed path.
 
-The attention residual fuses with the post-attention normalization.
-The final MLP residual fuses with the output normalization.
+The recorder normally fuses the attention residual with the post-attention normalization.
+It also normally fuses the final MLP residual with the output normalization.
+The bucketed residual kernels remain correct if either fusion opportunity is unavailable.
 Every logical MTP step uses the same active token count, selected capacity, metadata shape, and recorded program.
 MTPEmbed, MTP body, and GatherUnembed retain separate replay parameter domains.
 

@@ -196,7 +196,7 @@ pub(super) struct ResidualAddCaptureRMSNormReplayInvocation {
     config: ResidualAddRMSNormConfig,
     shape: ResidualAddRMSNormShape,
     buffers: ResidualAddCaptureRMSNormOwnedBuffers,
-    capture_row_width: u32,
+    capture_num_columns: u32,
     capture_column_start: u32,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
@@ -304,9 +304,9 @@ impl Operator for ResidualAddRMSNormInvocation<'_> {
         record_num_active_tokens(builder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
         builder.set_u32(6, self.config.hidden_dim);
         builder.set_f32(7, self.config.eps);
-        builder.dispatch_1d(
-            self.shape.num_total_tokens as usize * NUM_THREADS_PER_THREADBLOCK,
-            NUM_THREADS_PER_THREADBLOCK,
+        builder.dispatch_threadblocks(
+            (self.shape.num_total_tokens as usize, 1, 1),
+            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
     }
 }
@@ -323,9 +323,9 @@ impl Operator for ResidualAddRMSNormReplayInvocation {
         record_num_active_tokens(builder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
         builder.set_u32(6, self.config.hidden_dim);
         builder.set_f32(7, self.config.eps);
-        builder.dispatch_1d(
-            self.shape.num_total_tokens as usize * NUM_THREADS_PER_THREADBLOCK,
-            NUM_THREADS_PER_THREADBLOCK,
+        builder.dispatch_threadblocks(
+            (self.shape.num_total_tokens as usize, 1, 1),
+            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
     }
 }
@@ -342,12 +342,12 @@ impl Operator for ResidualAddCaptureRMSNormReplayInvocation {
         builder.set_retained_buffer_write(5, &self.buffers.norm_output, 0);
         record_num_active_tokens(builder, 6, self.shape.num_total_tokens, self.num_active_tokens_key);
         builder.set_u32(7, self.config.hidden_dim);
-        builder.set_u32(8, self.capture_row_width / 4);
+        builder.set_u32(8, self.capture_num_columns / 4);
         builder.set_u32(9, self.capture_column_start / 4);
         builder.set_f32(10, self.config.eps);
-        builder.dispatch_1d(
-            self.shape.num_total_tokens as usize * NUM_THREADS_PER_THREADBLOCK,
-            NUM_THREADS_PER_THREADBLOCK,
+        builder.dispatch_threadblocks(
+            (self.shape.num_total_tokens as usize, 1, 1),
+            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
     }
 }
@@ -365,28 +365,37 @@ impl ResidualAddRMSNormInvocation<'_> {
 }
 
 impl ResidualAddRMSNormReplayInvocation {
-    pub(super) fn can_fuse(residual_add: &ResidualAddReplayOp, rms_norm: &RMSNormReplayOp) -> bool {
-        std::ptr::eq(
-            Retained::as_ptr(&residual_add.buffers.output),
-            Retained::as_ptr(&rms_norm.buffers.input),
-        )
+    pub(super) fn is_residual_add_rms_norm_fusion_compatible(
+        residual_add: &ResidualAddReplayOp,
+        rms_norm: &RMSNormReplayOp,
+    ) -> bool {
+        let Some(residual_values) = rms_norm.shape.num_total_tokens.checked_mul(rms_norm.config.hidden_dim) else {
+            return false;
+        };
+        let row_shape_matches = residual_add.row_shape.is_none_or(|shape| {
+            shape.num_total_rows == rms_norm.shape.num_total_tokens && shape.num_columns == rms_norm.config.hidden_dim
+        });
+        let replay_domain_matches = match (residual_add.num_active_rows_key, rms_norm.num_active_tokens_key) {
+            (None, None) => row_shape_matches,
+            (Some(residual_key), Some(rms_norm_key)) => residual_key == rms_norm_key && row_shape_matches,
+            _ => false,
+        };
+        replay_domain_matches
+            && residual_add.shape.num_values == residual_values
+            && residual_add.config.lhs_dtype == rms_norm.config.io_dtype
+            && residual_add.config.rhs_dtype == rms_norm.config.io_dtype
+            && residual_add.config.output_dtype == rms_norm.config.io_dtype
+            && std::ptr::eq(
+                Retained::as_ptr(&residual_add.buffers.output),
+                Retained::as_ptr(&rms_norm.buffers.input),
+            )
     }
 
-    pub(super) fn fuse(residual_add: ResidualAddReplayOp, rms_norm: RMSNormReplayOp) -> Self {
+    pub(super) fn fuse_residual_add_rms_norm(residual_add: ResidualAddReplayOp, rms_norm: RMSNormReplayOp) -> Self {
         assert!(
-            Self::can_fuse(&residual_add, &rms_norm),
+            Self::is_residual_add_rms_norm_fusion_compatible(&residual_add, &rms_norm),
             "residual-add output must be the fused RMSNorm input"
         );
-        let residual_values = rms_norm
-            .shape
-            .num_total_tokens
-            .checked_mul(rms_norm.config.hidden_dim)
-            .expect("residual-add RMSNorm value count must fit u32");
-        assert_eq!(residual_add.shape.num_values, residual_values);
-        assert_eq!(residual_add.config.lhs_dtype, rms_norm.config.io_dtype);
-        assert_eq!(residual_add.config.rhs_dtype, rms_norm.config.io_dtype);
-        assert_eq!(residual_add.config.output_dtype, rms_norm.config.io_dtype);
-
         let config = ResidualAddRMSNormConfig {
             hidden_dim: rms_norm.config.hidden_dim,
             eps: rms_norm.config.eps,
@@ -466,23 +475,27 @@ impl ResidualAddRMSNormReplayInvocation {
 }
 
 impl ResidualAddCaptureRMSNormReplayInvocation {
-    pub(super) fn fuse(residual_add: ResidualAddCaptureReplayOp, rms_norm: RMSNormReplayOp) -> Self {
-        assert_eq!(residual_add.residual.config, ResidualAddConfig::bf16());
-        assert_eq!(rms_norm.config.io_dtype, Dtype::Bfloat16);
+    pub(super) fn is_residual_add_capture_rms_norm_fusion_compatible(
+        residual_add: &ResidualAddCaptureReplayOp,
+        rms_norm: &RMSNormReplayOp,
+    ) -> bool {
+        residual_add.residual.config == ResidualAddConfig::bf16()
+            && rms_norm.config.io_dtype == Dtype::Bfloat16
+            && residual_add.residual.row_shape.is_some()
+            && residual_add.capture.column_end - residual_add.capture.column_start == rms_norm.config.hidden_dim
+            && ResidualAddRMSNormReplayInvocation::is_residual_add_rms_norm_fusion_compatible(
+                &residual_add.residual,
+                rms_norm,
+            )
+    }
+
+    pub(super) fn fuse_residual_add_capture_rms_norm(
+        residual_add: ResidualAddCaptureReplayOp,
+        rms_norm: RMSNormReplayOp,
+    ) -> Self {
         assert!(
-            ResidualAddRMSNormReplayInvocation::can_fuse(&residual_add.residual, &rms_norm),
-            "residual-add output must be the fused RMSNorm input"
-        );
-        let residual_values = rms_norm
-            .shape
-            .num_total_tokens
-            .checked_mul(rms_norm.config.hidden_dim)
-            .expect("residual-add capture RMSNorm value count must fit u32");
-        assert_eq!(residual_add.residual.shape.num_values, residual_values);
-        assert_eq!(
-            residual_add.capture.column_end - residual_add.capture.column_start,
-            rms_norm.config.hidden_dim,
-            "residual-add capture column width must match hidden dimension"
+            Self::is_residual_add_capture_rms_norm_fusion_compatible(&residual_add, &rms_norm),
+            "residual-add capture and RMSNorm must have compatible buffers, shapes, dtypes, and replay domains"
         );
 
         let config = ResidualAddRMSNormConfig {
@@ -493,7 +506,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         let shape = ResidualAddRMSNormShape {
             num_total_tokens: rms_norm.shape.num_total_tokens,
         };
-        let capture_row_width = residual_add.capture.row_width;
+        let capture_num_columns = residual_add.capture.num_destination_columns;
         let capture_column_start = residual_add.capture.column_start;
         let buffers = ResidualAddCaptureRMSNormOwnedBuffers::new(
             residual_add.residual.buffers.lhs,
@@ -510,8 +523,8 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             rms_norm.buffers.output_len_bytes,
         );
         match rms_norm.num_active_tokens_key {
-            Some(key) => Self::new_bucketed(config, shape, key, buffers, capture_row_width, capture_column_start),
-            None => Self::new(config, shape, buffers, capture_row_width, capture_column_start),
+            Some(key) => Self::new_bucketed(config, shape, key, buffers, capture_num_columns, capture_column_start),
+            None => Self::new(config, shape, buffers, capture_num_columns, capture_column_start),
         }
     }
 
@@ -519,7 +532,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         config: ResidualAddRMSNormConfig,
         shape: ResidualAddRMSNormShape,
         buffers: ResidualAddCaptureRMSNormOwnedBuffers,
-        capture_row_width: u32,
+        capture_num_columns: u32,
         capture_column_start: u32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
@@ -533,7 +546,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             config,
             shape,
             buffers,
-            capture_row_width,
+            capture_num_columns,
             capture_column_start,
             num_active_tokens_key: None,
         }
@@ -544,7 +557,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         capacity_shape: ResidualAddRMSNormShape,
         num_active_tokens_key: ReplayParameterKey,
         buffers: ResidualAddCaptureRMSNormOwnedBuffers,
-        capture_row_width: u32,
+        capture_num_columns: u32,
         capture_column_start: u32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
@@ -558,7 +571,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             config,
             shape: capacity_shape,
             buffers,
-            capture_row_width,
+            capture_num_columns,
             capture_column_start,
             num_active_tokens_key: Some(num_active_tokens_key),
         }
@@ -568,11 +581,11 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         self.config.validate();
         self.shape.validate();
         assert_eq!(self.config.io_dtype, Dtype::Bfloat16);
-        assert!(self.capture_row_width >= self.config.hidden_dim);
-        assert!(self.capture_column_start <= self.capture_row_width - self.config.hidden_dim);
+        assert!(self.capture_num_columns >= self.config.hidden_dim);
+        assert!(self.capture_column_start <= self.capture_num_columns - self.config.hidden_dim);
         assert!(
-            self.capture_row_width.is_multiple_of(4),
-            "unsupported residual-add capture layout: BF16 capture row width must be divisible by four"
+            self.capture_num_columns.is_multiple_of(4),
+            "unsupported residual-add capture layout: BF16 capture column count must be divisible by four"
         );
         assert!(
             self.capture_column_start.is_multiple_of(4),
@@ -584,7 +597,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         assert!(self.buffers.residual_output_len_bytes >= self.config.bytes(self.shape));
         assert!(self.buffers.norm_output_len_bytes >= self.config.bytes(self.shape));
         let last_row_start = (self.shape.num_total_tokens as usize - 1)
-            .checked_mul(self.capture_row_width as usize)
+            .checked_mul(self.capture_num_columns as usize)
             .expect("residual-add capture last-row offset must fit usize");
         let required_values = last_row_start
             .checked_add(self.capture_column_start as usize)

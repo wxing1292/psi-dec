@@ -165,6 +165,7 @@ pub use residual_add::ResidualAddCaptureTarget;
 pub use residual_add::ResidualAddConfig;
 pub use residual_add::ResidualAddInvocation;
 pub use residual_add::ResidualAddKernel;
+pub use residual_add::ResidualAddRowShape;
 pub use residual_add::ResidualAddShape;
 
 mod residual_add_rms_norm;
