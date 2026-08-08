@@ -247,7 +247,9 @@ token-count boundary.
 
 The exact `ReplayLayer::record(...)` path remains unchanged and declares zero replay parameters.
 The additive `record_bucketed(...)` path returns `next_hidden_state` and declares one replay parameter.
-The Qwen layer and replay cache do not yet call this full bucketed API.
+Qwen3.5 Main calls this full bucketed API through `Qwen3xMoE` with the Main stage-owned token capacity and active-token
+key.
+The Qwen3.5 MTP body does not yet call this API.
 
 The backend retains a routing-only bucket-readiness API.
 This API records this chain:

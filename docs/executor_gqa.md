@@ -473,10 +473,11 @@ The shared `Qwen35GQAReplayKey` contains the three recorded capacities. It also 
 `GQAComputePath`, qgkv affine topology, and output affine topology. Active counts remain submission values and do not
 enter this GQA subkey.
 
-`Qwen35MainReplayKey` and `Qwen35MTPReplayKey` use this shared GQA subkey. Their top-level token counts remain exact
-until every other component in each replay stage supports the same capacity. Thus, this change makes GQA locally ready
-for bucket reuse. It does not yet make the complete Main or MTP forward replay bucketed. The main key also contains the
-non-optional GDN request-count subkey.
+`Qwen35MainReplayKey` and `Qwen35MTPReplayKey` use this shared GQA subkey. Qwen3.5 Main selects one composite token
+capacity and forces GQA metadata to use it. All Main token-row commands use the caller-owned Main active-token key.
+The Q-token-tile and TaskTemplate counts remain private GQA replay dimensions. The Main key also contains the
+non-optional GDN request-count subkey. The Qwen3.5 MTP body top-level token count remains exact and continues to use the
+component-local GQA bucketed path.
 
 MTP keeps its separate pure-GQA key.
 All MTP steps in one batch have the same token and attention shape, so they reuse one recorded program.

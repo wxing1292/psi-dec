@@ -660,6 +660,7 @@ fn init_qwen_3_5_model_inner(
         &device,
         &mut store,
         &model_config,
+        config.max_tokens,
         metal_defaults,
         main_bindings,
         &main_gqa_state,

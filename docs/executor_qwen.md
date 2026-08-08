@@ -453,7 +453,42 @@ A bucketed Qwen stage must use required residual/RMS-normalization fusion instea
 RMS normalization and residual/RMS-normalization fusion have fixed token-count topology and add no replay bucket
 boundary.
 Qwen3.5 MTPEmbed selects bucketed normalization recording.
-The current Qwen3.5 body stages still select exact normalization and residual recording.
+Qwen3.5 Main selects bucketed normalization and required residual/RMS-normalization fusion.
+The current Qwen3.5 MTP body still selects exact normalization and residual recording.
+
+Qwen3.5 Main owns one token-capacity replay domain.
+The executor selects this capacity before it prepares Main attention metadata.
+The stage replay policy uses the shared base bucket ladder.
+It also includes every GQA and GDN token-topology boundary and every actual Main layer MLP topology boundary.
+The MLP boundary union includes the full-MoE compute-path boundary between four and five tokens.
+It also includes dense MLP, router, and optional shared-expert affine and dense boundaries.
+The executor token workspace capacity caps this policy.
+
+The executor forces both GQA and GDN metadata to use the selected Main token capacity.
+GQA continues to bucket Q-token tiles and SDPA map TaskTemplates independently.
+GDN continues to bucket requests independently.
+These dimensions use private replay arguments.
+All Main token-row commands use the single `qwen3.5.main.num_active_tokens` parameter.
+The Main replay does not declare the GQA or GDN component-local active-token parameters.
+A single-query Main replay declares three parameters: the Main token count, the GQA TaskTemplate count, and the GDN
+request count.
+A tiled-query Main replay also declares the GQA Q-token-tile count.
+
+The production Main replay key records the selected token capacity, all GQA and GDN capacities and categorical
+topologies, and the ordered MLP topology for every model layer.
+The active token count does not enter this key.
+`Qwen35MainReplayKey::from_shapes(...)` remains a source-compatible legacy identity.
+An explicit key-mode discriminator prevents a legacy identity from aliasing a production bucketed identity.
+The public `Qwen35Main::record(...)` path remains available for legacy/manual composition with the existing
+component-local GQA and GDN replay behavior.
+Production `Replay<Qwen35Main>` recording uses the bucketed path.
+
+Each bucketed Main attention residual must fuse with the following post-attention RMS normalization.
+Each bucketed Main MLP residual must fuse with the next layer input normalization or with the final normalization.
+The Main residual-capture path uses the same required adjacency.
+The fused capture command writes only active rows.
+DSpark can consume this Main capture, but DSpark-owned replay keys, arguments, and recording policies remain
+unchanged.
 
 Qwen3.5 MTPEmbed owns one token-capacity replay domain.
 Its replay policy uses the shared base bucket ladder and the input-projection FC topology boundaries.

@@ -3,6 +3,7 @@ use std::rc::Rc;
 use inference_backend_metal::components::QuantizedSparseMLPWeights;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
@@ -17,8 +18,10 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::moe::backend::GatedMoE;
+use crate::mlp::moe::backend::GatedMoEBucketedReplayInput;
 use crate::mlp::moe::backend::GatedMoEMetalConfig;
 use crate::mlp::moe::backend::GatedMoEReplayInput;
+use crate::mlp::moe::backend::GatedMoEReplayTopology;
 use crate::mlp::moe::backend::GatedMoESharedExpertsReplayInput;
 use crate::mlp::moe::backend::GatedMoESharedExpertsWeights;
 use crate::mlp::moe::backend::GatedMoEWeights;
@@ -52,6 +55,14 @@ impl Qwen3xMoE {
         })
     }
 
+    pub fn replay_topology(&self, num_total_tokens: u32) -> GatedMoEReplayTopology {
+        self.backend.replay_topology(num_total_tokens)
+    }
+
+    pub fn replay_topology_boundaries(&self) -> Box<[u32]> {
+        self.backend.replay_topology_boundaries()
+    }
+
     pub fn record<'a, R>(&'a self, recorder: &mut R, input: &'a Buffer, output: &'a Buffer, num_tokens: u32)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
@@ -75,6 +86,49 @@ impl Qwen3xMoE {
             recorder,
             GatedMoEReplayInput {
                 shape: GatedMoEReplayShape { num_tokens },
+                hidden_state: input,
+                next_hidden_state: output,
+                scratch: self.scratch.bindings(),
+                weights: GatedMoEWeights {
+                    router_weight: &self.weights.router_weight,
+                    router_scales: &self.weights.router_scales,
+                    router_biases: &self.weights.router_biases,
+                    topk_experts: self.weights.experts.as_borrowed(),
+                },
+                shared_experts,
+            },
+        );
+    }
+
+    pub fn record_bucketed<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        input: &'a Buffer,
+        output: &'a Buffer,
+        num_total_tokens: u32,
+        num_active_tokens_key: ReplayParameterKey,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        let shared_experts = self.weights.shared_experts.as_ref().map(|weights| {
+            GatedMoESharedExpertsReplayInput {
+                scratch: self
+                    .scratch
+                    .shared_experts_bindings()
+                    .expect("qwen3.x shared-expert weights require shared-expert scratch"),
+                weights: GatedMoESharedExpertsWeights {
+                    shared_expert_gate_weight: &weights.gate_weight,
+                    shared_expert_gate_scales: &weights.gate_scales,
+                    shared_expert_gate_biases: &weights.gate_biases,
+                    shared_experts: weights.mlp.as_borrowed(),
+                },
+            }
+        });
+        let _ = self.backend.record_bucketed(
+            recorder,
+            GatedMoEBucketedReplayInput {
+                num_total_tokens,
+                num_active_tokens_key,
                 hidden_state: input,
                 next_hidden_state: output,
                 scratch: self.scratch.bindings(),

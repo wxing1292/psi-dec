@@ -537,8 +537,10 @@ from both affine operators. `GDNReplayTopology` contains `materialize_candidate_
 the GDN subkey. `replay_token_topology_boundaries` exposes the affine boundaries to a composite-stage policy. A
 caller-owned token capacity must contain all active tokens and must not exceed the initialized token capacity. It must
 also select the same QKVABZ and output affine topologies as the active token count. GDN validates these conditions before
-it updates metadata. The outer Qwen3.5 Main key still contains the exact model token count until all Main token consumers
-use one composite bucket policy.
+it updates metadata. Qwen3.5 Main selects one composite token capacity before it updates GQA or GDN metadata. It forces
+GDN metadata to use this capacity. The outer Main key records the composite token capacity and the GDN capacity and
+topology subkey. Main supplies the stage-owned active-token key. The GDN request count remains a private replay
+dimension.
 
 Focused tests and benches use the same `ReplayLayer::record(...)` entrypoint as model replay.
 

@@ -164,7 +164,8 @@ The guards ensure that later stages do not consume or overwrite them.
 
 `Qwen3xDenseMLP` keeps its exact `record` API.
 It also exposes topology accessors and an additive `record_bucketed` API.
-Qwen3.5 Main and MTP do not use this API until every participating component supports the same top-level bucket.
+Qwen3.5 Main calls this API with the Main stage-owned token capacity and active-token key.
+The Qwen3.5 MTP body does not yet call this API.
 The DSpark path remains exact.
 
 ## Data flow and backend stages

@@ -434,6 +434,11 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             )
         });
         self.write_token_ids(microbatch.flat_token_ids());
+        let num_main_active_tokens = microbatch
+            .total_tokens()
+            .try_into()
+            .expect("qwen3.5 Main token count must fit u32");
+        let num_main_total_tokens = self.main.component().replay_token_capacity(num_main_active_tokens);
         let prepare_start = Instant::now();
         let gqa_start = Instant::now();
         if self.speculator.is_dspark() {
@@ -447,10 +452,11 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         } else {
             self.main_gqa_state.prepare_pages(core_batch_req);
         }
-        let gqa_shape = self.main_gqa_state.prepare_metadata_bucketed(
+        let gqa_shape = self.main_gqa_state.prepare_metadata_bucketed_with_token_capacity(
             microbatch.req_slots(),
             microbatch.token_indices(),
             microbatch.cu_tokens(),
+            num_main_total_tokens,
         );
         let gqa_elapsed = gqa_start.elapsed();
         debug_assert_eq!(gqa_shape.num_tokens as usize, microbatch.total_tokens());
@@ -465,9 +471,11 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
         );
         let gdn_states_elapsed = gdn_states_start.elapsed();
         let gdn_metadata_start = Instant::now();
-        let gdn_shape = self
-            .main_gdn_state
-            .prepare_metadata_bucketed(microbatch.cu_tokens(), &gdn_prepared);
+        let gdn_shape = self.main_gdn_state.prepare_metadata_bucketed_with_token_capacity(
+            microbatch.cu_tokens(),
+            &gdn_prepared,
+            num_main_total_tokens,
+        );
         let gdn_metadata_elapsed = gdn_metadata_start.elapsed();
         debug_assert_eq!(gdn_shape.num_tokens as usize, microbatch.total_tokens());
         debug_assert_eq!(gdn_shape.num_reqs as usize, microbatch.num_reqs());
@@ -510,17 +518,17 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
             .microbatch()
             .total_tokens()
             .try_into()
-            .expect("qwen3.5 MainEmbed token count must fit u32");
+            .expect("qwen3.5 Main token count must fit u32");
         let (main_embed_key, main_embed_arguments) = self.main_embed.component().prepare_replay(num_main_active_tokens);
-        let main_key = Qwen35MainReplayKey::from_shapes(
+        let (main_key, mut main_arguments) = self.main.component().prepare_replay(
+            num_main_active_tokens,
             self.main_gqa_state.metadata().replay_shape(),
             self.main_gqa_state.replay_topology(),
             self.main_gdn_state.metadata().replay_shape(),
             self.main_gdn_state.replay_topology(),
         );
-        let mut main_arguments = ReplayArguments::new();
-        self.main_gqa_state.add_replay_arguments(&mut main_arguments);
-        self.main_gdn_state.add_replay_arguments(&mut main_arguments);
+        self.main_gqa_state.add_private_replay_arguments(&mut main_arguments);
+        self.main_gdn_state.add_private_replay_arguments(&mut main_arguments);
         trace::qwen35_state(|| {
             format!(
                 "event=begin_ops_recording main_embed_key={:?} main_key={:?}",
