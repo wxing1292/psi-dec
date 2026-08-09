@@ -2,7 +2,7 @@
 set -euo pipefail
 
 RUNS=7
-CASES="14b_off,14b_on"
+CASES="14b_off,14b_dspark"
 TOKENS="256,1024"
 GRPC_PORT=50061
 HTTP_PORT=8000
@@ -51,15 +51,15 @@ Usage: scripts/qwen3_e2e_decode_perf.sh [options]
 Runs Qwen3-14B with DSpark disabled/enabled, one server at a time.
 
 Cases:
-  14b_off              Qwen3-14B target only
-  14b_on               Qwen3-14B + affine-quantized DSpark
+  14b_off              Qwen3-14B Main only
+  14b_dspark           Qwen3-14B + affine DSpark with 1 and 2 speculative tokens
 
 Model options:
   --model-root DIR     Default: $HOME/Workspace/models
   --model DIR          Default: MODEL_ROOT/Qwen3-14B-4bit
   --dspark DIR         Default: MODEL_ROOT/dspark_qwen3_14b_block7-affine
-  --tokenizer DIR      Default: target model directory
-  --model-repo REPO    Download source if target is missing.
+  --tokenizer DIR      Default: Main model directory
+  --model-repo REPO    Download source if Main is missing.
                        Default: mlx-community/Qwen3-14B-4bit
   --dspark-repo REPO   Download source if affine DSpark is missing.
                        No default is assumed because the official DeepSeek
@@ -67,7 +67,7 @@ Model options:
                        quantization config.
 
 Benchmark options:
-  --cases LIST         Default: 14b_off,14b_on
+  --cases LIST         Default: 14b_off,14b_dspark
   --runs N             Default: 7
   --tokens LIST        Default: 256,1024
   --grpc-port N        Default: 50061
@@ -91,13 +91,13 @@ Benchmark options:
 Examples:
   scripts/qwen3_e2e_decode_perf.sh \
     --model-root "$HOME/Workspace/models" \
-    --cases 14b_off,14b_on \
+    --cases 14b_off,14b_dspark \
     --runs 3
 
   scripts/qwen3_e2e_decode_perf.sh \
     --model "$HOME/Workspace/models/Qwen3-14B-4bit" \
     --dspark "$HOME/Workspace/models/dspark_qwen3_14b_block7-affine" \
-    --cases 14b_on \
+    --cases 14b_dspark \
     --runs 3
 USAGE
 }
@@ -306,7 +306,7 @@ NEED_DSPARK=0
 for case_name in "${SELECTED_CASES[@]}"; do
     case "$case_name" in
     14b_off) ;;
-    14b_on) NEED_DSPARK=1 ;;
+    14b_dspark) NEED_DSPARK=1 ;;
     *)
         echo "unknown case: $case_name" >&2
         exit 2
@@ -423,10 +423,16 @@ if not isinstance(quantization, dict):
         f"{path} has no quantization config; use the affine DSpark checkpoint "
         "(for example, dspark_qwen3_14b_block7-affine)"
     )
+
+block_size = config.get("block_size")
+if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 2:
+    raise SystemExit(
+        f"{path} must have block_size >= 2 for the DSpark 1/2 benchmark matrix"
+    )
 PY
 }
 
-ensure_checkpoint "target" "$MODEL_REPO" "$MODEL_DIR"
+ensure_checkpoint "Main" "$MODEL_REPO" "$MODEL_DIR"
 if ((NEED_DSPARK)); then
     ensure_checkpoint "DSpark" "$DSPARK_REPO" "$DSPARK_DIR"
     validate_affine_dspark
@@ -687,6 +693,27 @@ run_server_case() {
     cleanup_server
 }
 
+run_dspark_case_sequence() {
+    for num_spec_tokens in 1 2; do
+        local label="14b_dspark${num_spec_tokens}"
+        if ((num_spec_tokens > 1 && CASE_COOLDOWN_SECS > 0)); then
+            echo "COOLDOWN before=$label seconds=$CASE_COOLDOWN_SECS"
+            sleep "$CASE_COOLDOWN_SECS"
+        fi
+        run_server_case "$label" \
+            target/release/qwen3 \
+            --grpc-listen-addr "127.0.0.1:${GRPC_PORT}" \
+            --http-listen-addr "127.0.0.1:${HTTP_PORT}" \
+            --hf-model-dir "$MODEL_DIR" \
+            --hf-dspark-model-dir "$DSPARK_DIR" \
+            --num-spec-tokens "$num_spec_tokens" \
+            --num-cache-pages "$NUM_CACHE_PAGES" \
+            --max-requests "$MAX_REQUESTS" \
+            --max-tokens "$MAX_TOKENS" \
+            --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
+    done
+}
+
 run_case() {
     case "$1" in
     14b_off)
@@ -700,18 +727,7 @@ run_case() {
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
-    14b_on)
-        run_server_case 14b_on \
-            target/release/qwen3 \
-            --grpc-listen-addr "127.0.0.1:${GRPC_PORT}" \
-            --http-listen-addr "127.0.0.1:${HTTP_PORT}" \
-            --hf-model-dir "$MODEL_DIR" \
-            --hf-dspark-model-dir "$DSPARK_DIR" \
-            --num-cache-pages "$NUM_CACHE_PAGES" \
-            --max-requests "$MAX_REQUESTS" \
-            --max-tokens "$MAX_TOKENS" \
-            --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
-        ;;
+    14b_dspark) run_dspark_case_sequence ;;
     esac
 }
 
@@ -725,7 +741,7 @@ ARCH="$(uname -m)"
 MACHINE="$(machine_id)"
 PROMPT_SHA256="$(printf '%s' "$PROMPT" | shasum -a 256 | awk '{print $1}')"
 
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH model=$MODEL_DIR dspark=$DSPARK_DIR tokenizer=$TOKENIZER_DIR cases=$CASES max_new=$TOKENS runs=$RUNS build=$BUILD grpc_port=$GRPC_PORT http_port=$HTTP_PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_sha256=$PROMPT_SHA256 prompt_chars=${#PROMPT}"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH model=$MODEL_DIR dspark=$DSPARK_DIR tokenizer=$TOKENIZER_DIR cases=$CASES max_new=$TOKENS runs=$RUNS build=$BUILD grpc_port=$GRPC_PORT http_port=$HTTP_PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST num_spec_tokens=1,2 case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_sha256=$PROMPT_SHA256 prompt_chars=${#PROMPT}"
 
 for index in "${!SELECTED_CASES[@]}"; do
     case_name="${SELECTED_CASES[$index]}"

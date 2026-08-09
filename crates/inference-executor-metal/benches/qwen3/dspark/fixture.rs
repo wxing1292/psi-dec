@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
@@ -24,7 +25,7 @@ pub const NUM_TOKENS_PER_BLOCK: usize = 1024;
 pub struct Fixture {
     model: Qwen3Executor,
     case: Case,
-    block_size: usize,
+    num_spec_tokens: usize,
     num_cache_pages: usize,
     num_kv_page_ids_per_block: usize,
     next_sequence: u64,
@@ -91,20 +92,24 @@ impl Fixture {
         num_requests: usize,
         start_context: usize,
         num_cache_pages: usize,
+        requested_num_spec_tokens: Option<NonZeroUsize>,
     ) -> Self {
-        let block_size = match case {
+        let num_spec_tokens = match case {
             Case::Main => 0,
             Case::DSpark => {
-                init_qwen3x_dspark_config(
+                let config = init_qwen3x_dspark_config(
                     dspark_model_dir.expect("Qwen3 DSpark benchmark case requires a DSpark model directory"),
                 )
-                .expect("unable to load Qwen3 DSpark benchmark config")
-                .block_size
+                .expect("unable to load Qwen3 DSpark benchmark config");
+                config
+                    .resolve_num_spec_tokens(requested_num_spec_tokens)
+                    .expect("invalid Qwen3 DSpark benchmark num_spec_tokens")
+                    .get()
             },
         };
         let max_tokens = num_requests
             .checked_mul(
-                block_size
+                num_spec_tokens
                     .checked_add(1)
                     .expect("Qwen3 DSpark benchmark tokens per request must fit usize"),
             )
@@ -122,12 +127,13 @@ impl Fixture {
                 init_qwen_3_model_with_dspark(
                     model_dir,
                     dspark_model_dir.expect("Qwen3 DSpark benchmark requires a DSpark model directory"),
-                    None,
+                    requested_num_spec_tokens,
                     config,
                 )
             },
         }
         .unwrap_or_else(|error| panic!("unable to initialize Qwen3 {} benchmark: {error}", case.key()));
+        assert_eq!(model.num_spec_tokens(), num_spec_tokens);
         let num_kv_page_ids_per_block = model.num_kv_page_ids_per_block();
         let required_cache_pages = num_requests
             .checked_mul(num_kv_page_ids_per_block)
@@ -153,7 +159,7 @@ impl Fixture {
         Self {
             model,
             case,
-            block_size,
+            num_spec_tokens,
             num_cache_pages,
             num_kv_page_ids_per_block,
             next_sequence: 0,
@@ -161,8 +167,8 @@ impl Fixture {
         }
     }
 
-    pub fn block_size(&self) -> usize {
-        self.block_size
+    pub fn num_spec_tokens(&self) -> usize {
+        self.num_spec_tokens
     }
 
     pub fn run(&mut self) -> (ExecutionTiming, Trajectory) {
@@ -342,7 +348,7 @@ impl Fixture {
                 Case::DSpark => {
                     assert_eq!(
                         spec_tokens.len(),
-                        self.block_size,
+                        self.num_spec_tokens,
                         "Qwen3 DSpark benchmark must produce one fixed proposal block"
                     );
                     spec_tokens

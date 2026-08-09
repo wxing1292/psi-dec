@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -22,6 +23,7 @@ fn main() {
             args.num_requests,
             args.start_context,
             args.num_cache_pages,
+            args.num_spec_tokens,
         );
         let setup_elapsed = setup_start.elapsed();
         let cache_miss_start = Instant::now();
@@ -33,7 +35,7 @@ fn main() {
         let samples = measure_runs(args.runs, args.iters, || fixture.run());
         print_result(
             case,
-            fixture.block_size(),
+            fixture.num_spec_tokens(),
             args.num_requests,
             args.start_context,
             setup_elapsed,
@@ -67,6 +69,7 @@ struct Args {
     num_requests: usize,
     start_context: usize,
     num_cache_pages: usize,
+    num_spec_tokens: Option<NonZeroUsize>,
     warmup_iters: usize,
     iters: usize,
     runs: usize,
@@ -81,6 +84,7 @@ impl Args {
             num_requests: 1,
             start_context: 0,
             num_cache_pages: 32 * 1024,
+            num_spec_tokens: None,
             warmup_iters: 2,
             iters: 10,
             runs: 3,
@@ -95,6 +99,9 @@ impl Args {
                 "--num-requests" => args.num_requests = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--start-context" => args.start_context = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--num-cache-pages" => args.num_cache_pages = parse_usize(&next_arg(&mut values, &arg), &arg),
+                "--num-spec-tokens" => {
+                    args.num_spec_tokens = Some(parse_nonzero_usize(&next_arg(&mut values, &arg), &arg))
+                },
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--iters" => args.iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--runs" => args.runs = parse_usize(&next_arg(&mut values, &arg), &arg),
@@ -108,6 +115,10 @@ impl Args {
         assert!(args.num_cache_pages > 0, "--num-cache-pages must be positive");
         assert!(args.iters > 0, "--iters must be positive");
         assert!(args.runs > 0, "--runs must be positive");
+        assert!(
+            args.num_spec_tokens.is_none() || args.cases.contains(&Case::DSpark),
+            "--num-spec-tokens requires the dspark case"
+        );
         let total_batches = 1usize
             .checked_add(args.warmup_iters)
             .and_then(|value| value.checked_add(args.iters.checked_mul(args.runs)?))
@@ -119,7 +130,9 @@ impl Args {
                 .expect("the dspark case requires --dspark-model-dir");
             init_qwen3x_dspark_config(dspark_model_dir)
                 .expect("unable to load Qwen3 DSpark benchmark config")
-                .block_size
+                .resolve_num_spec_tokens(args.num_spec_tokens)
+                .expect("invalid Qwen3 DSpark benchmark num_spec_tokens")
+                .get()
                 .checked_add(1)
                 .expect("Qwen3 DSpark benchmark token advance must fit usize")
         } else {
@@ -166,7 +179,7 @@ fn measure_runs(runs: usize, iters: usize, mut run: impl FnMut() -> (ExecutionTi
 #[allow(clippy::too_many_arguments)]
 fn print_result(
     case: Case,
-    block_size: usize,
+    num_spec_tokens: usize,
     num_requests: usize,
     start_context: usize,
     setup_elapsed: Duration,
@@ -194,15 +207,15 @@ fn print_result(
         trajectory.accepted_tokens as f64 / trajectory.proposed_tokens as f64
     };
     println!(
-        "perf component=qwen3-dspark-executor case={} num_requests={} block_size={} start_context={} setup_us={:.3} \
-         cache_miss_wall_us={:.3} cache_miss_main_submit_us={:.3} cache_miss_spec_submit_us={:.3} iters={} runs={} \
-         wall_median_us={:.3} prepare_median_us={:.3} main_record_median_us={:.3} main_submit_median_us={:.3} \
-         main_read_median_us={:.3} spec_record_median_us={:.3} spec_submit_median_us={:.3} spec_read_median_us={:.3} \
-         commit_median_us={:.3} proposed_tokens={} accepted_tokens={} generated_proposals={} sampled_tokens={} \
-         acceptance={:.6}",
+        "perf component=qwen3-dspark-executor case={} num_requests={} num_spec_tokens={} start_context={} \
+         setup_us={:.3} cache_miss_wall_us={:.3} cache_miss_main_submit_us={:.3} cache_miss_spec_submit_us={:.3} \
+         iters={} runs={} wall_median_us={:.3} prepare_median_us={:.3} main_record_median_us={:.3} \
+         main_submit_median_us={:.3} main_read_median_us={:.3} spec_record_median_us={:.3} \
+         spec_submit_median_us={:.3} spec_read_median_us={:.3} commit_median_us={:.3} proposed_tokens={} \
+         accepted_tokens={} generated_proposals={} sampled_tokens={} acceptance={:.6}",
         case.key(),
         num_requests,
-        block_size,
+        num_spec_tokens,
         start_context,
         setup_elapsed.as_secs_f64() * 1.0e6,
         cache_miss_wall.as_secs_f64() * 1.0e6,
@@ -262,6 +275,10 @@ fn parse_usize(value: &str, flag: &str) -> usize {
     value.parse().unwrap_or_else(|_| panic!("{flag} requires a usize"))
 }
 
+fn parse_nonzero_usize(value: &str, flag: &str) -> NonZeroUsize {
+    NonZeroUsize::new(parse_usize(value, flag)).unwrap_or_else(|| panic!("{flag} requires a positive usize"))
+}
+
 fn next_arg(values: &mut impl Iterator<Item = String>, flag: &str) -> String {
     values.next().unwrap_or_else(|| panic!("{flag} requires a value"))
 }
@@ -269,7 +286,7 @@ fn next_arg(values: &mut impl Iterator<Item = String>, flag: &str) -> String {
 fn print_help_and_exit() -> ! {
     println!(
         "qwen3_dspark bench\n--model-dir PATH\n--dspark-model-dir PATH\n--cases main,dspark\n--num-requests \
-         N\n--start-context N\n--num-cache-pages N\n--warmup-iters N\n--iters N\n--runs N"
+         N\n--start-context N\n--num-cache-pages N\n--num-spec-tokens N\n--warmup-iters N\n--iters N\n--runs N"
     );
     std::process::exit(0);
 }

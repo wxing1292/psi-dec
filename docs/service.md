@@ -682,16 +682,21 @@ Investigate cold-start stalls separately from later decode stalls.
 
 ## End-to-end performance helper
 
-The Qwen3 helper runs Main-only decode measurements:
+The Qwen3 helper runs Main-only and DSpark decode measurements:
 
 ```sh
-PSI_DEC_QWEN3_MODEL_DIR=<qwen3-model-dir> \
-scripts/qwen3_e2e_decode_perf.sh --runs 7
+scripts/qwen3_e2e_decode_perf.sh \
+  --model <qwen3-model-dir> \
+  --dspark <qwen3-affine-dspark-model-dir> \
+  --runs 7
 ```
 
 The helper uses the model directory for tokenization by default.
-Set `PSI_DEC_QWEN3_TOKENIZER_DIR` or use `--tokenizer` to select a different directory.
+Use `--tokenizer` to select a different directory.
 Use `--tokens` to select the comma-separated output-token counts.
+The default Qwen3 matrix runs `14b_off` and `14b_dspark`.
+The `14b_dspark` group runs `--num-spec-tokens 1` and then `--num-spec-tokens 2`.
+Each summary label includes the selected value, for example, `14b_dspark1` or `14b_dspark2`.
 
 The Qwen3.5/3.6 helper runs controlled 27B/35B Main-only, MTP, and DSpark comparisons:
 
@@ -723,7 +728,7 @@ Both helpers print these facts:
 - Sampling configuration and seed
 - Trajectory fields
 
-The Qwen3.5/3.6 helper also prints cooldown and speculative-acceptance fields.
+Both helpers also print cooldown and speculative-acceptance fields.
 
 The Qwen3 helper does not contain a checked-in performance baseline.
 
