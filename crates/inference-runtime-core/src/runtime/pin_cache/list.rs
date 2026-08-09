@@ -350,7 +350,7 @@ mod tests {
     }
 
     fn box_into_nn<T>(node: Box<LinkedNode<T>>) -> NonNull<LinkedNode<T>> {
-        unsafe { NonNull::new_unchecked(Box::into_raw(node)) }
+        NonNull::from_mut(Box::leak(node))
     }
 
     fn nn_into_box<T>(node: NonNull<LinkedNode<T>>) -> Box<LinkedNode<T>> {

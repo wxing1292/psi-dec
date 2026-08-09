@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 ahash = { workspace = true }
 async-channel = { workspace = true }
-async-trait = { workspace = true }
 comfy-table = { workspace = true }
 crossbeam-channel = { workspace = true }
 crossbeam-queue = { workspace = true }

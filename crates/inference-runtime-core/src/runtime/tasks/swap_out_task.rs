@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use futures_lite::future::Boxed;
 
 use crate::compute::DevReq;
@@ -22,7 +21,6 @@ where
     }
 }
 
-#[async_trait]
 impl<UserReq, DeviceReq, DeviceResp> AsyncTask for SwapOutTask<UserReq, DeviceReq, DeviceResp>
 where
     UserReq: UserRequest<DeviceReq, DeviceResp>,

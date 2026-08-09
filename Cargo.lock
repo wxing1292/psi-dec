@@ -1190,7 +1190,6 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "async-channel",
- "async-trait",
  "comfy-table",
  "crossbeam-channel",
  "crossbeam-queue",

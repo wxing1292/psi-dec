@@ -114,7 +114,7 @@ where
         }
 
         let new_entry = Entry::new(1, weight, key.clone(), value);
-        let new_node_nn = unsafe { NonNull::new_unchecked(Box::into_raw(LinkedNode::new(new_entry))) };
+        let new_node_nn = NonNull::from_mut(Box::leak(LinkedNode::new(new_entry)));
         let collision = self.map.insert(key, new_node_nn);
         debug_assert!(collision.is_none());
         (PinCacheResult::Ok { entry: new_node_nn }, evict_key_values)

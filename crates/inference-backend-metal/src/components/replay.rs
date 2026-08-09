@@ -596,10 +596,10 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
-        let lhs = Buffer::from_slice(&device, &vec![bf16::from_f32(1.0).to_bits(); 8]);
-        let rhs = Buffer::from_slice(&device, &vec![bf16::from_f32(2.0).to_bits(); 8]);
-        let output = Buffer::from_slice(&device, &vec![bf16::ZERO.to_bits(); 8]);
-        let capture_output = Buffer::from_slice(&device, &vec![bf16::ZERO.to_bits(); 16]);
+        let lhs = Buffer::from_slice(&device, &[bf16::from_f32(1.0).to_bits(); 8]);
+        let rhs = Buffer::from_slice(&device, &[bf16::from_f32(2.0).to_bits(); 8]);
+        let output = Buffer::from_slice(&device, &[bf16::ZERO.to_bits(); 8]);
+        let capture_output = Buffer::from_slice(&device, &[bf16::ZERO.to_bits(); 16]);
         let mut recorder = ReplayRecorder::new(stream.create_replay_program());
         recorder.record(ReplayOp::residual_add_with_capture(
             residual_add.invoke_rows(

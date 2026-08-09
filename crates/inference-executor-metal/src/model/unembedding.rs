@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -555,4 +557,3 @@ mod tests {
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }
-use std::rc::Rc;

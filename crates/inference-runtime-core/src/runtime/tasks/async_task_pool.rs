@@ -1,7 +1,7 @@
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 
 use async_channel::Receiver;
-use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TrySendError;
 use futures_util::FutureExt;
@@ -9,11 +9,10 @@ use futures_util::FutureExt;
 use crate::Result;
 use crate::channel::Shutdown;
 
-#[async_trait]
 pub trait AsyncTask: Send + 'static {
     type Output: Send + 'static;
 
-    async fn run(self) -> Self::Output;
+    fn run(self) -> impl Future<Output = Self::Output> + Send;
 }
 
 pub struct AsyncTaskPool<T>
@@ -170,12 +169,11 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl AsyncTask for MockTask {
         type Output = usize;
 
-        async fn run(self) -> Self::Output {
-            MockTask::run(self).await
+        fn run(self) -> impl Future<Output = Self::Output> + Send {
+            MockTask::run(self)
         }
     }
 

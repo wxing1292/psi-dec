@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use inference_backend_metal::components::QuantizedEmbeddingBuffers;
 use inference_backend_metal::components::QuantizedEmbeddingConfig;
 use inference_backend_metal::components::QuantizedEmbeddingKernel;
@@ -285,4 +287,3 @@ mod tests {
         assert!(Rc::ptr_eq(&embed.weights, &expanded.weights));
     }
 }
-use std::rc::Rc;
