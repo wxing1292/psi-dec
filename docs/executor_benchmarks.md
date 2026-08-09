@@ -116,7 +116,8 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer4`, `first4`, or `main_all`.
 - `qwen35_output` begins at final norm, gather, and unembedding. It can isolate sampling and readback.
-- `qwen35_executor` measures the public executor contract with fixed `e2e_wo_mtp` and `e2e_w_mtp` cases.
+- `qwen35_executor` measures the public executor contract with `e2e_wo_mtp` and `e2e_w_mtp` cases.
+- The `e2e_w_mtp` case accepts `--num-spec-tokens N` and defaults to one speculative token.
 - The `qwen35_executor` MTP case obtains proposal and draft tokens from production execution. It does not substitute a
   static draft.
 - The `qwen35_executor` fixture obtains Main and MTP page-table widths from the loaded executor.
@@ -170,7 +171,8 @@ cargo bench -p inference-executor-metal --bench qwen35_layers -- \
 
 cargo bench -p inference-executor-metal --bench qwen35_executor -- \
   --model-dir <35b-model-dir> --mtp-model-dir <35b-mtp-model-dir> \
-  --cases e2e_w_mtp --iters 1 --warmup-iters 0 --runs 1
+  --cases e2e_w_mtp --num-spec-tokens 2 \
+  --iters 1 --warmup-iters 0 --runs 1
 ```
 
 Run one performance command at a time. List the planned cases first. GPU contention and memory pressure invalidate

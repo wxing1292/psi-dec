@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -23,8 +24,9 @@ fn main() {
     let args = Args::parse();
     for &case in &args.cases {
         println!(
-            "bench_start component=qwen35-executor case={} model_dir={} mtp_model_dir={}",
+            "bench_start component=qwen35-executor case={} num_spec_tokens={} model_dir={} mtp_model_dir={}",
             case.key(),
+            args.num_spec_tokens(case),
             args.model_dir.display(),
             args.mtp_model_dir
                 .as_ref()
@@ -38,7 +40,15 @@ fn main() {
         let cache_miss_wall = cache_miss_start.elapsed();
         fixture.warmup(args.warmup_iters);
         let samples = measure_runs(args.runs, args.iters, || fixture.run());
-        print_result(case, setup_elapsed, cache_miss_wall, cache_miss, args.iters, &samples);
+        print_result(
+            case,
+            fixture.num_spec_tokens,
+            setup_elapsed,
+            cache_miss_wall,
+            cache_miss,
+            args.iters,
+            &samples,
+        );
     }
 }
 
@@ -55,19 +65,13 @@ impl Case {
             Self::E2EWithMTP => "e2e_w_mtp",
         }
     }
-
-    fn max_spec_tokens(self) -> usize {
-        match self {
-            Self::E2EWithoutMTP => 0,
-            Self::E2EWithMTP => 1,
-        }
-    }
 }
 
 struct Args {
     model_dir: PathBuf,
     mtp_model_dir: Option<PathBuf>,
     cases: Vec<Case>,
+    num_spec_tokens: Option<NonZeroUsize>,
     iters: usize,
     warmup_iters: usize,
     runs: usize,
@@ -79,6 +83,7 @@ impl Args {
             model_dir: PathBuf::new(),
             mtp_model_dir: None,
             cases: vec![Case::E2EWithoutMTP],
+            num_spec_tokens: None,
             iters: 10,
             warmup_iters: 2,
             runs: 3,
@@ -89,6 +94,9 @@ impl Args {
                 "--model-dir" => args.model_dir = PathBuf::from(next_arg(&mut values, &arg)),
                 "--mtp-model-dir" => args.mtp_model_dir = Some(PathBuf::from(next_arg(&mut values, &arg))),
                 "--cases" => args.cases = parse_cases(&next_arg(&mut values, &arg)),
+                "--num-spec-tokens" => {
+                    args.num_spec_tokens = Some(parse_nonzero_usize(&next_arg(&mut values, &arg), &arg))
+                },
                 "--iters" => args.iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--runs" => args.runs = parse_usize(&next_arg(&mut values, &arg), &arg),
@@ -104,13 +112,25 @@ impl Args {
         if args.cases.contains(&Case::E2EWithMTP) {
             assert!(args.mtp_model_dir.is_some(), "e2e_w_mtp requires --mtp-model-dir");
         }
+        assert!(
+            args.num_spec_tokens.is_none() || args.cases.contains(&Case::E2EWithMTP),
+            "--num-spec-tokens requires the e2e_w_mtp case"
+        );
         args
+    }
+
+    fn num_spec_tokens(&self, case: Case) -> usize {
+        match case {
+            Case::E2EWithoutMTP => 0,
+            Case::E2EWithMTP => self.num_spec_tokens.unwrap_or(NonZeroUsize::MIN).get(),
+        }
     }
 }
 
 struct ExecutorFixture {
     model: Qwen35Executor,
     case: Case,
+    num_spec_tokens: usize,
     main_gqa_page_ids_per_block: usize,
     mtp_gqa_page_ids_per_block: Vec<usize>,
     next_sequence: u64,
@@ -120,9 +140,14 @@ struct ExecutorFixture {
 
 impl ExecutorFixture {
     fn new(args: &Args, case: Case) -> Self {
+        let num_spec_tokens = args.num_spec_tokens(case);
         let config = Qwen35ExecutorConfig {
             max_requests: 1,
-            max_tokens: 1 + case.max_spec_tokens(),
+            // The target cycle verifies one sampled anchor and the complete
+            // K-token proposal.
+            max_tokens: num_spec_tokens
+                .checked_add(1)
+                .expect("Qwen3.5 executor benchmark token capacity must fit usize"),
             max_tokens_per_request: NUM_TOKENS_PER_BLOCK,
             num_cache_pages: NUM_CACHE_PAGES,
             num_tokens_per_block: NUM_TOKENS_PER_BLOCK,
@@ -135,7 +160,7 @@ impl ExecutorFixture {
                     args.mtp_model_dir
                         .as_ref()
                         .expect("e2e_w_mtp requires MTP model directory"),
-                    std::num::NonZeroUsize::MIN,
+                    NonZeroUsize::new(num_spec_tokens).expect("e2e_w_mtp requires speculative tokens"),
                     config,
                 )
             },
@@ -150,6 +175,7 @@ impl ExecutorFixture {
         Self {
             model,
             case,
+            num_spec_tokens,
             main_gqa_page_ids_per_block,
             mtp_gqa_page_ids_per_block,
             next_sequence: 0,
@@ -174,7 +200,7 @@ impl ExecutorFixture {
 
     fn run_mtp_cycle(&mut self) -> (ExecutionTiming, BatchDeviceResponse) {
         let (proposal_timing, proposal_response) = self.run_decode_batch(Vec::new());
-        let (target_token, draft_tokens) = mtp_target_input(&proposal_response, self.case.max_spec_tokens());
+        let (target_token, draft_tokens) = mtp_target_input(&proposal_response, self.num_spec_tokens);
         assert_eq!(
             target_token, self.next_token,
             "MTP benchmark must verify the sampled token from the proposal batch"
@@ -394,6 +420,7 @@ fn measure_runs(runs: usize, iters: usize, mut run: impl FnMut() -> ExecutionTim
 
 fn print_result(
     case: Case,
+    num_spec_tokens: usize,
     setup_elapsed: Duration,
     cache_miss_wall: Duration,
     cache_miss: ExecutionTiming,
@@ -451,11 +478,12 @@ fn print_result(
     let cache_miss_wall_us = cache_miss_wall.as_secs_f64() * 1.0e6;
     let cache_build_estimate_us = cache_miss.cache_build_cpu_estimate().as_secs_f64() * 1.0e6;
     println!(
-        "perf component=qwen35-executor case={} setup_us={:.3} cache_miss_wall_us={:.3} cache_build_estimate_us={:.3} \
-         timing=executor-wall iters={} runs={} wall_median_us={:.3} main_median_us={:.3} main_sample_median_us={:.3} \
-         spec_median_us={:.3} prepare_median_us={:.3} record_cpu_estimate_median_us={:.3} \
-         finish_cpu_estimate_median_us={:.3} feedback_median_us={:.3}",
+        "perf component=qwen35-executor case={} num_spec_tokens={} setup_us={:.3} cache_miss_wall_us={:.3} \
+         cache_build_estimate_us={:.3} timing=executor-wall iters={} runs={} wall_median_us={:.3} \
+         main_median_us={:.3} main_sample_median_us={:.3} spec_median_us={:.3} prepare_median_us={:.3} \
+         record_cpu_estimate_median_us={:.3} finish_cpu_estimate_median_us={:.3} feedback_median_us={:.3}",
         case.key(),
+        num_spec_tokens,
         setup_elapsed.as_secs_f64() * 1.0e6,
         cache_miss_wall_us,
         cache_build_estimate_us,
@@ -502,10 +530,14 @@ fn parse_usize(value: &str, flag: &str) -> usize {
     value.parse().unwrap_or_else(|_| panic!("{flag} requires a usize"))
 }
 
+fn parse_nonzero_usize(value: &str, flag: &str) -> NonZeroUsize {
+    NonZeroUsize::new(parse_usize(value, flag)).unwrap_or_else(|| panic!("{flag} requires a positive usize"))
+}
+
 fn print_help_and_exit() -> ! {
     println!(
-        "qwen35_executor bench\n--model-dir PATH\n--mtp-model-dir PATH\n--cases e2e_wo_mtp,e2e_w_mtp\n--iters \
-         N\n--warmup-iters N\n--runs N"
+        "qwen35_executor bench\n--model-dir PATH\n--mtp-model-dir PATH\n--cases \
+         e2e_wo_mtp,e2e_w_mtp\n--num-spec-tokens N\n--iters N\n--warmup-iters N\n--runs N"
     );
     std::process::exit(0);
 }
