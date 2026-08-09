@@ -98,12 +98,14 @@ impl Qwen35Executor {
     }
 
     fn commit(&mut self, compute_seq: RawComputeSlotSeq, decisions: &[Qwen35DecodeDecision]) {
-        let state_versions = self.pending_transactions.commit(compute_seq, decisions);
+        let dst_state_versions = self.pending_transactions.commit(compute_seq, decisions);
         trace_decisions("model_commit_decisions", decisions);
-        trace::qwen35_state(|| format!("event=model_commit state_versions={state_versions:?}"));
+        trace::qwen35_state(|| {
+            format!("event=model_commit dst_state_versions={dst_state_versions:?}")
+        });
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         self.main_gdn_state
-            .commit(&runtime, self.pages.buffer(), &state_versions);
+            .commit(&runtime, self.pages.buffer(), &dst_state_versions);
         // Publish is submitted asynchronously here and overlaps returning the
         // response to runtime core. The next prepare/reset waits before reusing
         // the shared GDN page-I/O staging and live-state resources.

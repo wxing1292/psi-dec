@@ -9,7 +9,6 @@ use inference_backend_metal::components::GDNCompute;
 use inference_backend_metal::components::GDNComputeBuffers;
 use inference_backend_metal::components::GDNComputeConfig;
 use inference_backend_metal::components::GDNComputeShape;
-use inference_backend_metal::components::GDNComputeWithCandidateStateUpdateBuffers;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
@@ -86,6 +85,10 @@ impl GDNFixture {
             .collect::<Vec<_>>();
         let src_state_slot_values = (0..shape.num_reqs).collect::<Vec<_>>();
         let dst_slot_id_values = (shape.num_reqs..shape.num_reqs * 2).collect::<Vec<_>>();
+        let mut flat_final_state_slot_values = vec![u32::MAX; shape.num_tokens as usize];
+        for (req_index, &dst_state_slot) in dst_slot_id_values.iter().enumerate() {
+            flat_final_state_slot_values[(req_index as u32 * tokens + tokens - 1) as usize] = dst_state_slot;
+        }
         let candidate_dst_slot_id_values = (0..shape.num_tokens)
             .map(|flat_token_index| shape.num_reqs * 2 + flat_token_index)
             .collect::<Vec<_>>();
@@ -107,7 +110,7 @@ impl GDNFixture {
         let dt_bias = bf16_constant_buffer(device, config.num_v_heads as usize, 0.02);
         let cu_tokens = Buffer::from_slice(device, &cu_token_values);
         let src_state_slots = Buffer::from_slice(device, &src_state_slot_values);
-        let dst_slot_ids = Buffer::from_slice(device, &dst_slot_id_values);
+        let flat_final_state_slots = Buffer::from_slice(device, &flat_final_state_slot_values);
         let candidate_dst_slot_ids = Buffer::from_slice(device, &candidate_dst_slot_id_values);
         let conv_state = f32_pattern_buffer(device, config.num_conv_state_values(shape), 0.001);
         let next_conv_state = Buffer::new_zeroed(
@@ -134,7 +137,7 @@ impl GDNFixture {
             dt_bias: &dt_bias,
             cu_tokens: &cu_tokens,
             src_state_slots: &src_state_slots,
-            dst_state_slots: &dst_slot_ids,
+            flat_materialized_state_slots: &flat_final_state_slots,
             conv_state: &conv_state,
             conv_state_offset_bytes: 0,
             next_conv_state: &next_conv_state,
@@ -146,8 +149,15 @@ impl GDNFixture {
             norm_gated_output: &norm_gated_output,
         };
         let with_state_replay = build_gdn_with_state_replay(&stream, &kernels, shape, buffers);
-        let forward_candidate_state_update_replay =
-            build_gdn_forward_candidate_state_update_replay(&stream, &kernels, shape, buffers, &candidate_dst_slot_ids);
+        let forward_candidate_state_update_replay = build_gdn_forward_candidate_state_update_replay(
+            &stream,
+            &kernels,
+            shape,
+            GDNComputeBuffers {
+                flat_materialized_state_slots: &candidate_dst_slot_ids,
+                ..buffers
+            },
+        );
 
         let fixture = Self {
             stream,
@@ -188,16 +198,9 @@ fn build_gdn_forward_candidate_state_update_replay(
     kernels: &GDNCompute,
     shape: GDNComputeShape,
     buffers: GDNComputeBuffers<'_>,
-    candidate_dst_slot_ids: &Buffer,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_with_candidate_state_update(
-        shape,
-        GDNComputeWithCandidateStateUpdateBuffers {
-            compute: buffers,
-            flat_candidate_state_slots: candidate_dst_slot_ids,
-        },
-    ));
+    builder.record(kernels.invoke_with_candidate_state_update(shape, buffers));
     builder.build()
 }
 

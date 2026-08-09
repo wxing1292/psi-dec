@@ -65,7 +65,7 @@ impl GDNRequestSlots {
     }
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
-    pub fn begin_txn(&mut self, req_slot: u32, candidate_state_versions: &[u32], publish_pages: Vec<GDNStatePages>) {
+    pub fn begin_txn(&mut self, req_slot: u32, materialized_state_versions: &[u32], publish_pages: Vec<GDNStatePages>) {
         let raw_req_slot = req_slot;
         let req_slot_index = self.req_slot_index(req_slot);
         trace::gdn_state(|| {
@@ -74,12 +74,12 @@ impl GDNRequestSlots {
                 .map(|pages| pages.state_version)
                 .collect::<Vec<_>>();
             format!(
-                "event=gdn_table_begin_txn req_slot={} current_slot={} current_version={} candidates={:?} \
+                "event=gdn_table_begin_txn req_slot={} current_slot={} current_version={} materialized_versions={:?} \
                  publish_versions={:?} free_slots={}",
                 raw_req_slot,
                 self.current_state_slots[req_slot_index],
                 self.current_state_versions[req_slot_index],
-                candidate_state_versions,
+                materialized_state_versions,
                 publish_versions,
                 self.free_state_slots.len()
             )
@@ -89,16 +89,18 @@ impl GDNRequestSlots {
             "GDN request state table cannot begin a txn with live candidate state slots"
         );
         let current_state_version = self.current_state_versions[req_slot_index];
-        for &candidate_state_version in candidate_state_versions {
+        debug_assert!(
+            materialized_state_versions
+                .windows(2)
+                .all(|versions| versions[0] < versions[1]),
+            "GDN materialized state versions must be unique and increasing"
+        );
+        for &materialized_state_version in materialized_state_versions {
             assert!(
-                candidate_state_version >= current_state_version,
-                "GDN candidate state_version must not precede current state_version"
+                materialized_state_version >= current_state_version,
+                "GDN materialized state_version must not precede current state_version"
             );
-            if candidate_state_version == current_state_version
-                || self.txn_state_slots[req_slot_index]
-                    .iter()
-                    .any(|&(state_version, _)| state_version == candidate_state_version)
-            {
+            if materialized_state_version == current_state_version {
                 continue;
             }
             assert!(
@@ -109,9 +111,8 @@ impl GDNRequestSlots {
                 .free_state_slots
                 .pop_front()
                 .expect("GDN request state table free state slots exhausted");
-            self.txn_state_slots[req_slot_index].push((candidate_state_version, state_slot));
+            self.txn_state_slots[req_slot_index].push((materialized_state_version, state_slot));
         }
-        self.txn_state_slots[req_slot_index].sort_by_key(|&(state_version, _)| state_version);
         self.txn_publish_pages[req_slot_index].retain(|(state_version, _)| *state_version > current_state_version);
         for pages in publish_pages {
             self.set_txn_publish_pages(req_slot_index, pages.state_version, pages.page_ids);
@@ -325,15 +326,10 @@ impl GDNRequestSlots {
             "GDN txn publish pages must target a future state_version"
         );
         let publish_pages = &mut self.txn_publish_pages[req_slot];
-        if let Some((_, existing_page_ids)) = publish_pages
-            .iter_mut()
-            .find(|(publish_state_version, _)| *publish_state_version == state_version)
-        {
-            *existing_page_ids = page_ids;
-            return;
+        match publish_pages.binary_search_by_key(&state_version, |(publish_state_version, _)| *publish_state_version) {
+            Ok(index) => publish_pages[index].1 = page_ids,
+            Err(index) => publish_pages.insert(index, (state_version, page_ids)),
         }
-        publish_pages.push((state_version, page_ids));
-        publish_pages.sort_by_key(|(publish_state_version, _)| *publish_state_version);
     }
 
     fn sanity_check(&self) {

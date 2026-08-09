@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::mem::size_of;
 use std::mem::take;
 
@@ -12,6 +13,8 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
+use inference_executor_core::attn::gdn::state::to_candidate_state_version;
+use inference_executor_core::attn::gdn::state::to_state_version;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_runtime_core::runtime::RawRequestSlot;
 
@@ -35,19 +38,19 @@ struct GDNStateLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GDNStateCapacity {
     num_state_slots_per_req: usize,
-    max_candidate_states_per_req: usize,
+    max_materialized_states_per_req: usize,
     max_publish_jobs_per_req: usize,
 }
 
 impl GDNStateCapacity {
     pub fn new(
         num_state_slots_per_req: usize,
-        max_candidate_states_per_req: usize,
+        max_materialized_states_per_req: usize,
         max_publish_jobs_per_req: usize,
     ) -> Self {
         let capacity = Self {
             num_state_slots_per_req,
-            max_candidate_states_per_req,
+            max_materialized_states_per_req,
             max_publish_jobs_per_req,
         };
         capacity.validate();
@@ -56,12 +59,12 @@ impl GDNStateCapacity {
 
     fn validate(self) {
         assert!(
-            self.max_candidate_states_per_req > 0,
-            "GDN state requires candidate capacity"
+            self.max_materialized_states_per_req > 0,
+            "GDN state requires materialized-state capacity"
         );
         assert!(
-            self.num_state_slots_per_req > self.max_candidate_states_per_req,
-            "GDN state slots must include current state and all candidate states"
+            self.num_state_slots_per_req > self.max_materialized_states_per_req,
+            "GDN state slots must include current state and all materialized states"
         );
         assert!(self.max_publish_jobs_per_req > 0, "GDN state requires publish capacity");
     }
@@ -70,7 +73,7 @@ impl GDNStateCapacity {
 pub struct GDNRequestStateTable {
     layout: GDNStateLayout,
     num_tokens_per_block: usize,
-    max_candidate_states_per_req: usize,
+    max_materialized_states_per_req: usize,
     max_publish_jobs_per_req: usize,
     recurrent_states: Buffer,
     conv_states: Buffer,
@@ -90,8 +93,11 @@ pub struct GDNStatePageIO {
 
 pub struct GDNPreparedRequestState {
     pub src_state_slots: Vec<u32>,
-    pub dst_state_slots: Vec<u32>,
-    pub flat_candidate_state_slots: Vec<u32>,
+    /// Persistent state slot for each forward row.
+    ///
+    /// `u32::MAX` means that the row produces its normal output, but its convolution and
+    /// recurrent states must not be written to the persistent state arenas.
+    pub flat_materialized_state_slots: Vec<u32>,
 }
 
 struct GDNPrepareOutput {
@@ -104,7 +110,7 @@ struct GDNPrepareOutput {
 
 struct GDNPrepareInput {
     num_tokens_per_block: usize,
-    max_candidate_states_per_req: usize,
+    max_materialized_states_per_req: usize,
     request_table: GDNRequestSlots,
     req_slots: Vec<u32>,
     block_indices: Vec<usize>,
@@ -241,7 +247,7 @@ impl GDNRequestStateTable {
         Self {
             layout,
             num_tokens_per_block,
-            max_candidate_states_per_req: capacity.max_candidate_states_per_req,
+            max_materialized_states_per_req: capacity.max_materialized_states_per_req,
             max_publish_jobs_per_req: capacity.max_publish_jobs_per_req,
             recurrent_states: Buffer::new_zeroed(device, recurrent_states_bytes),
             conv_states: Buffer::new_zeroed(device, conv_states_bytes),
@@ -418,7 +424,7 @@ impl GDNRequestStateTable {
     ) -> GDNPrepareInput {
         GDNPrepareInput {
             num_tokens_per_block: self.num_tokens_per_block,
-            max_candidate_states_per_req: self.max_candidate_states_per_req,
+            max_materialized_states_per_req: self.max_materialized_states_per_req,
             request_table: self.request_table.borrow().clone(),
             req_slots: req_slots.to_vec(),
             block_indices: block_indices.to_vec(),
@@ -430,20 +436,26 @@ impl GDNRequestStateTable {
         }
     }
 
-    pub fn commit(&self, state_versions: &[u32]) {
+    pub fn commit(&self, dst_state_versions: &[u32]) {
         let pending_request_txns = self.pending_request_txns.borrow();
         let mut publishes_out = self.publishes.borrow_mut();
         let mut request_table = self.request_table.borrow_mut();
-        assert_eq!(pending_request_txns.len(), state_versions.len());
+        assert_eq!(pending_request_txns.len(), dst_state_versions.len());
         publishes_out.clear();
-        for (request_txn, &state_version) in pending_request_txns.iter().zip(state_versions) {
-            if state_version != request_table.current_state_version(request_txn.req_slot) {
-                assert!(
-                    request_txn.txn.contains_candidate_state_version(state_version),
-                    "GDN commit state version must select a recorded candidate"
-                );
-            }
-            let publishes = request_table.commit_txn(request_txn.req_slot, state_version);
+        for (request_txn, &dst_state_version) in pending_request_txns.iter().zip(dst_state_versions) {
+            assert!(
+                request_txn.txn.contains_dst_state_version(dst_state_version),
+                "GDN commit state version must select the transaction's destination range"
+            );
+            let candidate_state_version =
+                to_candidate_state_version(dst_state_version, request_txn.txn.candidate_state_version_shift());
+            assert!(
+                request_txn
+                    .txn
+                    .contains_candidate_state_version(candidate_state_version),
+                "GDN shifted commit state version must select a recorded candidate"
+            );
+            let publishes = request_table.commit_txn(request_txn.req_slot, candidate_state_version);
             assert!(
                 publishes.len() <= self.max_publish_jobs_per_req,
                 "GDN publishes exceed per-request capacity"
@@ -532,15 +544,13 @@ impl GDNRequestStateTable {
                 .checked_sub(cu_tokens[req_index])
                 .expect("GDN state batch cu_tokens must be nondecreasing");
             assert!(num_tokens > 0, "GDN state batch requires tokens for every request");
-            assert_eq!(txn.start_state_version(), token_indices[req_index]);
-            assert_eq!(txn.num_forward_tokens(), num_tokens);
             assert_eq!(
-                txn.candidate_end_state_version(),
-                txn.end_state_version(),
-                "GDN forward output state requires a candidate slot"
+                txn.dst_start_state_version(),
+                to_state_version(token_indices[req_index])
             );
+            assert_eq!(txn.num_forward_tokens(), num_tokens);
             assert!(
-                txn.num_candidate_states() as usize <= self.max_candidate_states_per_req,
+                txn.num_candidate_states() as usize <= self.max_materialized_states_per_req,
                 "GDN candidate range exceeds per-request capacity"
             );
         }
@@ -712,6 +722,23 @@ impl GDNStatePageIO {
 }
 
 impl GDNPrepareInput {
+    /// Resolves candidate states and cache-boundary snapshots into one ordered
+    /// set of materialized state versions.
+    ///
+    /// The transaction keeps the complete destination range separate from the
+    /// shifted candidate range. A cache boundary can precede the candidate range:
+    ///
+    /// ```text
+    /// destination states   11   12   13   14
+    /// candidate range                     [14, 15)
+    /// cache boundaries          ^         ^
+    /// materialized              12        14
+    /// row state slots       MAX slot12 MAX slot14
+    /// ```
+    ///
+    /// `flat_materialized_state_slots` maps the union to the exact row that produces
+    /// each version. `u32::MAX` means that the row produces its normal output but
+    /// does not write its state to the persistent arenas.
     fn resolve(mut self) -> GDNPrepareOutput {
         let mut restores = Vec::new();
         let publishes = Vec::new();
@@ -774,34 +801,62 @@ impl GDNPrepareInput {
                     .restore(self.req_slots[req_index], state_version, page_ids),
             );
         }
+        for (req_index, &req_slot) in self.req_slots.iter().enumerate() {
+            assert_eq!(
+                self.request_table.current_state_version(req_slot),
+                self.token_indices[req_index],
+                "GDN current state version must match the runtime input token index"
+            );
+        }
 
-        let mut candidate_versions_by_req = Vec::with_capacity(self.req_slots.len());
+        let mut materialized_versions_by_req = Vec::with_capacity(self.req_slots.len());
         for (req_index, &req_slot) in self.req_slots.iter().enumerate() {
             let txn = self.state_txns[req_index];
-            let mut candidate_versions = Vec::with_capacity(self.max_candidate_states_per_req);
-            candidate_versions.push(txn.candidate_end_state_version());
-            candidate_versions.extend(
-                self.request_table
-                    .txn_publish_state_versions(req_slot)
-                    .filter(|&state_version| state_version <= txn.candidate_end_state_version()),
+            debug_assert!(
+                txn_publish_pages[req_index]
+                    .windows(2)
+                    .all(|pages| pages[0].state_version < pages[1].state_version),
+                "GDN runtime publish state versions must be unique and increasing"
             );
-            for candidate_state_version in txn.candidate_start_state_version()..=txn.candidate_end_state_version() {
-                candidate_versions.push(candidate_state_version);
-            }
-            for pages in &txn_publish_pages[req_index] {
-                if pages.state_version <= txn.candidate_end_state_version() {
-                    candidate_versions.push(pages.state_version);
+            let mut publish_versions = merge_ordered_unique_state_versions(
+                self.request_table.txn_publish_state_versions(req_slot),
+                txn_publish_pages[req_index].iter().map(|pages| pages.state_version),
+            )
+            .take_while(|&state_version| state_version < txn.candidate_end_state_version())
+            .peekable();
+            let mut materialized_versions = Vec::with_capacity(self.max_materialized_states_per_req);
+            for candidate_state_version in txn.candidate_state_versions() {
+                while publish_versions
+                    .peek()
+                    .is_some_and(|&publish_state_version| publish_state_version <= candidate_state_version)
+                {
+                    materialized_versions.push(
+                        publish_versions
+                            .next()
+                            .expect("GDN publish state version must remain available"),
+                    );
+                }
+                if materialized_versions.last().copied() != Some(candidate_state_version) {
+                    materialized_versions.push(candidate_state_version);
                 }
             }
-            candidate_versions.sort_unstable();
-            candidate_versions.dedup();
             assert!(
-                candidate_versions.len() <= self.max_candidate_states_per_req,
-                "GDN candidate states exceed per-request capacity"
+                materialized_versions.len() <= self.max_materialized_states_per_req,
+                "GDN materialized states exceed per-request capacity"
             );
-            self.request_table
-                .begin_txn(req_slot, &candidate_versions, take(&mut txn_publish_pages[req_index]));
-            candidate_versions_by_req.push(candidate_versions);
+            debug_assert!(
+                materialized_versions
+                    .windows(2)
+                    .all(|versions| versions[0] < versions[1]),
+                "GDN materialized state versions must be unique and increasing"
+            );
+            drop(publish_versions);
+            self.request_table.begin_txn(
+                req_slot,
+                &materialized_versions,
+                take(&mut txn_publish_pages[req_index]),
+            );
+            materialized_versions_by_req.push(materialized_versions);
         }
 
         let src_state_slots = self
@@ -809,39 +864,40 @@ impl GDNPrepareInput {
             .iter()
             .map(|&req_slot| self.request_table.current_state_slot(req_slot))
             .collect::<Vec<_>>();
-        let dst_state_slots = self
-            .req_slots
-            .iter()
-            .enumerate()
-            .map(|(req_index, &req_slot)| {
-                self.request_table
-                    .candidate_state_slot(req_slot, self.state_txns[req_index].end_state_version())
-            })
-            .collect::<Vec<_>>();
         let num_tokens = self.cu_tokens.last().copied().unwrap_or_default() as usize;
-        let mut flat_candidate_state_slots = Vec::with_capacity(num_tokens);
-        for (req_index, candidate_versions) in candidate_versions_by_req.iter().enumerate() {
+        let mut flat_materialized_state_slots = Vec::with_capacity(num_tokens);
+        for (req_index, materialized_versions) in materialized_versions_by_req.iter().enumerate() {
             let txn = self.state_txns[req_index];
             let req_slot = self.req_slots[req_index];
             let flat_start = self.cu_tokens[req_index];
             let flat_end = self.cu_tokens[req_index + 1];
-            for flat_index in flat_start..flat_end {
-                let state_version = txn
-                    .start_state_version()
-                    .checked_add(flat_index - flat_start + 1)
-                    .expect("GDN candidate state version must fit u32");
-                flat_candidate_state_slots.push(if candidate_versions.contains(&state_version) {
-                    self.request_table.candidate_state_slot(req_slot, state_version)
-                } else {
-                    u32::MAX
-                });
+            let mut materialized_versions = materialized_versions.iter().copied().peekable();
+            for (flat_index, dst_state_version) in (flat_start..flat_end).zip(txn.dst_state_versions()) {
+                debug_assert_eq!(
+                    flat_index - flat_start,
+                    dst_state_version - txn.dst_start_state_version(),
+                    "GDN flat token and destination state offsets must match"
+                );
+                while materialized_versions
+                    .peek()
+                    .is_some_and(|&materialized_state_version| materialized_state_version < dst_state_version)
+                {
+                    materialized_versions.next();
+                }
+                flat_materialized_state_slots.push(
+                    if materialized_versions.peek().copied() == Some(dst_state_version) {
+                        materialized_versions.next();
+                        self.request_table.candidate_state_slot(req_slot, dst_state_version)
+                    } else {
+                        u32::MAX
+                    },
+                );
             }
         }
         GDNPrepareOutput {
             prepared: GDNPreparedRequestState {
                 src_state_slots,
-                dst_state_slots,
-                flat_candidate_state_slots,
+                flat_materialized_state_slots,
             },
             request_table: self.request_table,
             restores,
@@ -849,6 +905,31 @@ impl GDNPrepareInput {
             pending_request_txns,
         }
     }
+}
+
+fn merge_ordered_unique_state_versions(
+    left: impl Iterator<Item = u32>,
+    right: impl Iterator<Item = u32>,
+) -> impl Iterator<Item = u32> {
+    let mut left = left.peekable();
+    let mut right = right.peekable();
+    std::iter::from_fn(move || {
+        match (left.peek(), right.peek()) {
+            (Some(&left_version), Some(&right_version)) => {
+                match left_version.cmp(&right_version) {
+                    Ordering::Less => left.next(),
+                    Ordering::Greater => right.next(),
+                    Ordering::Equal => {
+                        right.next();
+                        left.next()
+                    },
+                }
+            },
+            (Some(_), None) => left.next(),
+            (None, Some(_)) => right.next(),
+            (None, None) => None,
+        }
+    })
 }
 
 fn assert_u32_element_index_domain(len_bytes: u64, item_size: usize, name: &str) {
@@ -882,36 +963,9 @@ mod tests {
     const TEST_PAGE_BYTES: usize = 32 * 1024;
 
     #[test]
-    #[should_panic(expected = "GDN state slots must include current state and all candidate states")]
+    #[should_panic(expected = "GDN state slots must include current state and all materialized states")]
     fn test_capacity_requires_current_state_slot() {
         let _ = GDNStateCapacity::new(3, 3, 1);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_state(
-        state: &GDNRequestStateTable,
-        metadata: &GDNMetadataBuffers,
-        req_slots: &[u32],
-        block_indices: &[usize],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-        state_txns: &[GDNStateTxn],
-        state_page_ids_by_req: &[Vec<Vec<u32>>],
-    ) -> GDNReplayShape {
-        let prepared = state.prepare(
-            req_slots,
-            block_indices,
-            token_indices,
-            cu_tokens,
-            state_txns,
-            state_page_ids_by_req,
-        );
-        metadata.update(
-            cu_tokens,
-            &prepared.src_state_slots,
-            &prepared.dst_state_slots,
-            &prepared.flat_candidate_state_slots,
-        )
     }
 
     #[test]
@@ -984,9 +1038,8 @@ mod tests {
         );
 
         assert_eq!(batch_metadata.src_state_slots().read_typed::<u32>(0, 1), vec![0]);
-        assert_eq!(batch_metadata.dst_state_slots().read_typed::<u32>(0, 1), vec![2]);
         assert_eq!(
-            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 1),
+            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 1),
             vec![2]
         );
         state.commit(&[1]);
@@ -1021,7 +1074,7 @@ mod tests {
         let state_version_3_slot = state.request_table.borrow().candidate_state_slot(0, 3);
         let state_version_4_slot = state.request_table.borrow().candidate_state_slot(0, 4);
         assert_eq!(
-            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 4),
+            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
             vec![
                 u32::MAX,
                 state_version_2_slot,
@@ -1035,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_promotes_selected_state() {
+    fn test_prepare_commit_without_mtp_keeps_destination_state_version() {
         let device = Device::system_default();
         let state = GDNRequestStateTable::new(
             &device,
@@ -1053,28 +1106,104 @@ mod tests {
             &[0],
             &[0],
             &[0, 4],
-            &[GDNStateTxn::from_state_versions(0, 4, 2, 4)],
+            &[GDNStateTxn::from_state_versions(1, 5, 3, 0)],
             &[Vec::new()],
         );
 
         let table = state.request_table.borrow();
         let state_version_2_slot = table.candidate_state_slot(0, 2);
         let state_version_3_slot = table.candidate_state_slot(0, 3);
-        let output_state_slot = table.candidate_state_slot(0, 4);
-        assert_ne!(output_state_slot, state_version_2_slot);
-        assert_ne!(output_state_slot, state_version_3_slot);
+        let state_version_4_slot = table.candidate_state_slot(0, 4);
         drop(table);
         assert_eq!(
-            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 4),
-            vec![u32::MAX, state_version_2_slot, state_version_3_slot, output_state_slot]
-        );
-        assert_eq!(
-            batch_metadata.dst_state_slots().read_typed::<u32>(0, 1),
-            vec![output_state_slot]
+            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            vec![
+                u32::MAX,
+                state_version_2_slot,
+                state_version_3_slot,
+                state_version_4_slot
+            ]
         );
 
         state.commit(&[3]);
-        assert_eq!(state.request_table.borrow().current_state_version(0), 3);
+
+        let table = state.request_table.borrow();
+        assert_eq!(table.current_state_version(0), 3);
+        assert_eq!(table.current_state_slot(0), state_version_3_slot);
+    }
+
+    #[test]
+    fn test_prepare_commit_with_mtp_shifts_destination_state_version() {
+        let device = Device::system_default();
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(4, 3, 1),
+            16,
+            TEST_PAGE_BYTES,
+        );
+        let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
+        prepare_state(
+            &state,
+            &batch_metadata,
+            &[0],
+            &[0],
+            &[0],
+            &[0, 4],
+            &[GDNStateTxn::from_state_versions(1, 5, 3, 1)],
+            &[Vec::new()],
+        );
+
+        let table = state.request_table.borrow();
+        let state_version_1_slot = table.candidate_state_slot(0, 1);
+        let state_version_2_slot = table.candidate_state_slot(0, 2);
+        let state_version_3_slot = table.candidate_state_slot(0, 3);
+        drop(table);
+        assert_eq!(
+            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            vec![
+                state_version_1_slot,
+                state_version_2_slot,
+                state_version_3_slot,
+                u32::MAX
+            ]
+        );
+
+        state.commit(&[3]);
+
+        let table = state.request_table.borrow();
+        assert_eq!(table.current_state_version(0), 2);
+        assert_eq!(table.current_state_slot(0), state_version_2_slot);
+    }
+
+    #[test]
+    fn test_cache_boundary_before_the_candidate_range_is_materialized() {
+        let device = Device::system_default();
+        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(4, 3, 2), 2, 16);
+        let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
+        prepare_state(
+            &state,
+            &batch_metadata,
+            &[0],
+            &[0],
+            &[0],
+            &[0, 4],
+            &[GDNStateTxn::from_state_versions(1, 5, 1, 0)],
+            &[vec![
+                vec![10, 11, 12, 13, 14, 15, 16, 17],
+                vec![20, 21, 22, 23, 24, 25, 26, 27],
+            ]],
+        );
+
+        let table = state.request_table.borrow();
+        let first_boundary_slot = table.candidate_state_slot(0, 2);
+        let candidate_slot = table.candidate_state_slot(0, 4);
+        drop(table);
+        assert_eq!(
+            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            vec![u32::MAX, first_boundary_slot, u32::MAX, candidate_slot]
+        );
     }
 
     #[test]
@@ -1112,7 +1241,7 @@ mod tests {
         let state_version_4_slot = state.request_table.borrow().candidate_state_slot(0, 4);
         let state_version_5_slot = state.request_table.borrow().candidate_state_slot(0, 5);
         assert_eq!(
-            batch_metadata.flat_candidate_state_slots().read_typed::<u32>(0, 4),
+            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
             vec![
                 state_version_2_slot,
                 state_version_3_slot,
@@ -1162,7 +1291,26 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_restore_at_a_1024_token_logical_cache_boundary() {
+    #[should_panic(expected = "GDN current state version must match the runtime input token index")]
+    fn test_prepare_requires_source_state_for_first_input_token() {
+        let device = Device::system_default();
+        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(4, 3, 1), 2, 16);
+        let batch_metadata = GDNMetadataBuffers::new(&device, 1, 1);
+
+        prepare_state(
+            &state,
+            &batch_metadata,
+            &[0],
+            &[0],
+            &[2],
+            &[0, 1],
+            &[GDNStateTxn::new(2, 1, 0)],
+            &[Vec::new()],
+        );
+    }
+
+    #[test]
+    fn test_snapshot_restore_at_a_1024_token_cache_boundary() {
         let device = Device::system_default();
         let state = GDNRequestStateTable::new(
             &device,
@@ -1190,6 +1338,32 @@ mod tests {
         assert_eq!(state.restores()[0].page_ids, snapshot_page_ids);
         state.commit(&[1025]);
         assert_eq!(state.request_table.borrow().current_state_version(0), 1025);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_state(
+        state: &GDNRequestStateTable,
+        metadata: &GDNMetadataBuffers,
+        req_slots: &[u32],
+        block_indices: &[usize],
+        token_indices: &[u32],
+        cu_tokens: &[u32],
+        state_txns: &[GDNStateTxn],
+        state_page_ids_by_req: &[Vec<Vec<u32>>],
+    ) -> GDNReplayShape {
+        let prepared = state.prepare(
+            req_slots,
+            block_indices,
+            token_indices,
+            cu_tokens,
+            state_txns,
+            state_page_ids_by_req,
+        );
+        metadata.update(
+            cu_tokens,
+            &prepared.src_state_slots,
+            &prepared.flat_materialized_state_slots,
+        )
     }
 
     fn core(model_layer_index: usize) -> GDNCore {

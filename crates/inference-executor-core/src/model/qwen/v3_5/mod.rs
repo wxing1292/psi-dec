@@ -4,7 +4,6 @@ pub use batch::Qwen35Microbatch;
 pub use batch::Qwen35ModelBatchRequest;
 pub use batch::Qwen35SampledTokens;
 pub use batch::gather_flat_indices;
-pub use batch::gdn_commit_state_versions;
 pub use batch::num_main_output_rows;
 pub use batch::sample_decisions_from_sampled_tokens;
 pub use batch::sample_sampler_configs;

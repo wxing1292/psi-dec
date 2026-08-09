@@ -2,7 +2,6 @@ use inference_backend_metal::components::GDNCompute;
 use inference_backend_metal::components::GDNComputeBuffers;
 use inference_backend_metal::components::GDNComputeConfig;
 use inference_backend_metal::components::GDNComputeShape;
-use inference_backend_metal::components::GDNComputeWithCandidateStateUpdateBuffers;
 use inference_backend_metal::components::GDNQKVABZSplitBuffers;
 use inference_backend_metal::components::GDNQKVABZSplitConfig;
 use inference_backend_metal::components::GDNQKVABZSplitKernel;
@@ -213,12 +212,7 @@ impl GDN {
         cu_tokens: &[u32],
         state: &GDNPreparedRequestState,
     ) -> GDNReplayShape {
-        metadata.update(
-            cu_tokens,
-            &state.src_state_slots,
-            &state.dst_state_slots,
-            &state.flat_candidate_state_slots,
-        )
+        metadata.update(cu_tokens, &state.src_state_slots, &state.flat_materialized_state_slots)
     }
 
     pub fn prepare_bucketed(
@@ -231,8 +225,7 @@ impl GDN {
         metadata.update_bucketed(
             cu_tokens,
             &state.src_state_slots,
-            &state.dst_state_slots,
-            &state.flat_candidate_state_slots,
+            &state.flat_materialized_state_slots,
             policy,
         )
     }
@@ -254,8 +247,7 @@ impl GDN {
         metadata.update_bucketed_with_token_capacity(
             cu_tokens,
             &state.src_state_slots,
-            &state.dst_state_slots,
-            &state.flat_candidate_state_slots,
+            &state.flat_materialized_state_slots,
             policy,
             total_tokens,
         )
@@ -404,7 +396,7 @@ impl ReplayLayer for GDN {
             dt_bias: weights.dt_bias,
             cu_tokens: batch_metadata.cu_tokens(),
             src_state_slots: batch_metadata.src_state_slots(),
-            dst_state_slots: batch_metadata.dst_state_slots(),
+            flat_materialized_state_slots: batch_metadata.flat_materialized_state_slots(),
             conv_state: state.conv_state,
             conv_state_offset_bytes: state.conv_state_offset_bytes,
             next_conv_state: state.next_conv_state,
@@ -417,19 +409,16 @@ impl ReplayLayer for GDN {
         };
         let compute_shape = compute_shape(shape);
         if input.materialize_candidate_states {
-            let buffers = GDNComputeWithCandidateStateUpdateBuffers {
-                compute: compute_buffers,
-                flat_candidate_state_slots: batch_metadata.flat_candidate_state_slots(),
-            };
             let compute = if bucketed {
                 self.compute.invoke_with_candidate_state_update_bucketed(
                     compute_shape,
-                    buffers,
+                    compute_buffers,
                     active_reqs,
                     active_tokens,
                 )
             } else {
-                self.compute.invoke_with_candidate_state_update(compute_shape, buffers)
+                self.compute
+                    .invoke_with_candidate_state_update(compute_shape, compute_buffers)
             };
             recorder.record_with_barrier_before(ReplayOp::opaque(compute));
         } else {
@@ -562,8 +551,7 @@ mod tests {
         for num_tokens in 1..=64 {
             let state = GDNPreparedRequestState {
                 src_state_slots: vec![0],
-                dst_state_slots: vec![1],
-                flat_candidate_state_slots: vec![u32::MAX; num_tokens as usize],
+                flat_materialized_state_slots: vec![u32::MAX; num_tokens as usize],
             };
             let shape = backend.prepare_bucketed(&metadata, &[0, num_tokens], &state, &policy);
             let topology = backend.replay_topology(&metadata, true);
@@ -591,8 +579,7 @@ mod tests {
         let num_tokens = topology_boundary - 1;
         let state = GDNPreparedRequestState {
             src_state_slots: vec![0],
-            dst_state_slots: vec![1],
-            flat_candidate_state_slots: vec![u32::MAX; num_tokens as usize],
+            flat_materialized_state_slots: vec![u32::MAX; num_tokens as usize],
         };
 
         backend.prepare_bucketed_with_token_capacity(&metadata, &[0, num_tokens], &state, &policy, topology_boundary);
@@ -646,8 +633,7 @@ mod tests {
         let metadata = GDNMetadataBuffers::new(&device, 2, 2);
         let state = GDNPreparedRequestState {
             src_state_slots: vec![0, 2],
-            dst_state_slots: vec![1, 3],
-            flat_candidate_state_slots: vec![u32::MAX; 2],
+            flat_materialized_state_slots: vec![u32::MAX; 2],
         };
         let hidden_state = Buffer::new_zeroed_elements(&device, 2 * core.hidden_dim, Dtype::Bfloat16);
         let next_hidden_state = Buffer::new_zeroed_elements(&device, 2 * core.hidden_dim, Dtype::Bfloat16);

@@ -197,7 +197,8 @@ The threadblock loads its source tile into distributed thread-local fragments. I
 flat-token segment.
 
 The threadblock writes `recurrent_output [T, Hv, Dv]`. It materializes registered prefix candidates when requested.
-It then writes the final fragments to the destination recurrent-state slot.
+It writes the final fragments only when the final state version is registered. Otherwise, it discards the final state
+after it produces the row output.
 
 ```text
 parallel: requests, V heads, V-dimension tiles, Dqk lanes
@@ -278,15 +279,15 @@ QKVABZ split
 
 short convolution
   buffers 0..7: conv_qkv, next_conv_state, qkv, conv_state,
-                conv_weight, src_state_slots, dst_state_slots, cu_tokens
+                conv_weight, src_state_slots, flat_materialized_state_slots, cu_tokens
   parameter dtype: conv_weight bf16
-  scalars 8..11: num_active_reqs, num_active_tokens, conv_state_offset_bytes,
-                 next_conv_state_offset_bytes
+  scalars 8..12: num_active_reqs, num_active_tokens, conv_state_offset_bytes,
+                 next_conv_state_offset_bytes, write_final_state
   dispatch: max(total_tokens * Cqkv, total_reqs * Cqkv * Ks), 256 threads/threadblock
 
 ragged recurrent
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
-                a_log, dt_bias, src_state_slots, dst_state_slots, cu_tokens
+                a_log, dt_bias, src_state_slots, flat_materialized_state_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
   scalars 10..12: q_scale, num_active_reqs, recurrent_state_offset_bytes
   grid: (Dv / Dv_tile, total_reqs * Hv, 1)
@@ -307,13 +308,15 @@ batched state-page read/write
 ```
 
 Candidate convolution materialization uses buffers 0..5 for `next_conv_state`, `qkv`, `conv_state`,
-`src_state_slots`, `flat_candidate_state_slots`, and `cu_tokens`. Its scalars 6..9 are `num_active_reqs`,
+`src_state_slots`, `flat_materialized_state_slots`, and `cu_tokens`. Its scalars 6..9 are `num_active_reqs`,
 `num_active_tokens`, `conv_state_offset_bytes`, and `next_conv_state_offset_bytes`.
 
-Candidate recurrent materialization adds `flat_candidate_state_slots` at buffer 9. It shifts `cu_tokens` to 10 and
-uses scalars 11..13.
+Candidate recurrent materialization uses `flat_materialized_state_slots` at buffer 8 and `cu_tokens` at buffer 9. It uses
+scalars 10..12.
 
-The invalid candidate-slot sentinel remains `u32::MAX`. The kernel does not write for that token.
+The invalid state-slot sentinel is `u32::MAX`. All compute variants use the same row-level contract. A row always
+produces its normal output. A kernel writes the row's convolution and recurrent states only when the corresponding
+`flat_materialized_state_slots` entry contains a valid slot.
 
 ## Ownership
 
@@ -421,32 +424,53 @@ At initialization, Qwen wiring derives direct per-request state-slot, candidate-
 `GDNRequestStateTable` consumes these direct resource bounds. It does not inspect scheduler, MTP, DSpark, or sampling
 configuration.
 
-Speculative candidate suffixes and cache-block boundary versions can be disjoint when a request has more than one fixed
-token. Therefore, the resource bound adds the maximum decision-candidate count and maximum crossed-boundary count.
-Qwen3.5 MTP decode also materializes the possible replay-source states for the K - 1 rows that Main replays.
-The verified and replay-source ranges overlap. Their union contains at most `2 * K` states.
+Speculative candidate suffixes and cache-block boundary versions can be disjoint. Therefore, the resource bound adds
+the maximum candidate count and maximum crossed-boundary count. For `P = num_spec_tokens`, both DSpark and MTP have
+`P + 1` candidates. The candidates represent accepted counts `0..=P`. MTP shifts the complete candidate range by
+`P - 1`. It does not add candidates.
 Publish staging permits every block boundary that one maximum-length request can cross across all active request slots.
+
+For `M = max_tokens_per_request` and cache-block width `B`, Qwen3.5 uses this safe per-request bound:
+
+```text
+max_materialized_states = (P + 1) + ceil(M / B)
+num_state_slots         = 1 + max_materialized_states
+                          ^ current state
+```
+
+Candidate states and boundary states can overlap. The bound does not depend on that overlap. Prepare removes overlap by
+merging the two ordered inputs.
 
 The public table directly owns a private `GDNRequestSlots` mapping, pending restore/publish state transactions, and one
 `GDNStatePageIO`. It has no second public state table or mutable aggregate wrapper.
 
-`GDNStateTxn` is backend-neutral per-request metadata for the state versions that one microbatch produces. It lives from
-`GDNRequestStateTable::prepare(...)` through `commit(...)`. The prepare boundary receives explicit request slots,
-block/token indices, cumulative token counts, transactions, and runtime state-page IDs. It does not depend on a Qwen
-microbatch type.
-The transaction stores two ranges. One forward generates the exclusive token-end boundaries in
-`(start_state_version, end_state_version]`. The inclusive range
-`[candidate_start_state_version, candidate_end_state_version]` contains the states that must remain selectable through
-commit. The candidate range is inside `[start_state_version, end_state_version]`. A candidate equal to
-`start_state_version` reuses the current slot. Each later candidate uses a candidate slot. Qwen3.x wiring expands the
-candidate range to contain each possible Main replay source.
-Qwen wiring converts rejection results to a logical verified state version and a physical replay-source state version.
-It validates both values against `GDNStateTxn`. It passes only the replay-source value to GDN commit as the state version
-that becomes current. `GDNStateTxn` is common Qwen3.x GDN metadata.
+`GDNStateTxn` is backend-neutral per-request metadata for one microbatch. It lives from
+`GDNRequestStateTable::prepare(...)` through `commit(...)`. The prepare boundary receives request slots, block and token
+indices, cumulative token counts, transactions, and runtime state-page IDs. It does not depend on a Qwen microbatch
+type.
+
+The transaction stores two canonical half-open ranges:
+
+```text
+destination states  [dst_start_state_version, dst_end_state_version)
+candidate states    [candidate_start_state_version, candidate_end_state_version)
+```
+
+If the first input has `token_index = V`, its output state has version `V + 1`. A state version is also the expected
+index of the next input token. The destination range contains the unshifted states that the forward produces. The
+candidate range contains the states that commit can select. A candidate can equal the committed source version. In that
+case, it reuses the current slot and does not require a forward-row write.
+
+Prepare restores the source state before it materializes the transaction. The restored or current state version must
+equal the request `token_index`.
+
+Qwen passes only an unshifted destination version to GDN commit. GDN applies the transaction's candidate shift and
+validates the shifted version against the candidate range. Qwen and sampling code do not expose candidate versions.
+`GDNStateTxn` is common Qwen3.x GDN metadata.
 
 `GDNMetadataBuffers` is the state-domain-owned, capacity-sized GPU metadata object that all GDN layers share. Prepare
-writes its `cu_tokens` and src/dst/candidate state slots. Prepare then returns and stores the authoritative
-`GDNReplayShape`.
+writes `cu_tokens`, `src_state_slots`, and `flat_materialized_state_slots`. Prepare then returns and stores the
+authoritative `GDNReplayShape`.
 
 `GDNMetadataBuffers` is the sole owner of the current replay shape. `GDNInput` borrows the metadata object instead of a
 duplicate shape. Backend recording and replay-key construction both read the stored shape.
@@ -645,7 +669,7 @@ second production implementation exists. The current path is:
 shape: num_tokens >= num_reqs, segmented by cu_tokens
 parallelism: request x v_head x v_dim_tile, with Q/K-dimension lanes inside the threadblock
 input: one or more contiguous rows per request
-state: load source-state fragments once, advance them in MSL thread-local storage, then write the final destination slot
+state: load source-state fragments once, advance them in MSL thread-local storage, then optionally write the final state
 ```
 
 This path uses 32 Q/K-dimension threads and the configured `Dv_tile`. Qwen's measured default tile of 8 produces a
@@ -672,9 +696,10 @@ distributed thread-local state_fragments[4] per thread
                               |
                               +--> optional registered prefix candidate writes
                               |
-                              | segment-end final store
+                              | optional segment-end final store
                               v
 recurrent_state_arena[dst slot, v_head, 8 V rows, 128 Dqk values]
+                              or discard when dst slot is u32::MAX
 ```
 
 For each token, Q and K stream from global memory/cache. Lane-local scalar partials accumulate them before SIMD-group
@@ -714,11 +739,12 @@ The state contract is slot based:
 GDNRequestStateTable
   current state slot per request slot
   current state_version per request slot
-  txn candidate state_version -> state_slot mappings
+  txn materialized state_version -> state_slot mappings
   txn cache-boundary publish state_version -> page_ids mappings
 
 src_state_slots          current source state slot per request
-dst_state_slots          final output state slot per request
+flat_materialized_state_slots
+                         persistent state slot per forward row, or u32::MAX
 conv_state               f32 slot arena for convolution state
 next_conv_state          destination conv-state arena; may be the same backing as conv_state
 recurrent_state_arena    f32 slot arena for recurrent state
@@ -727,21 +753,30 @@ recurrent_state_arena    f32 slot arena for recurrent state
 When `conv_state` and `next_conv_state` share backing storage, source and destination slot IDs must name distinct slots
 for committed updates. Qwen replay allocates current and candidate state slots from the request-state table.
 
-Each forward starts a txn and registers two absolute-version sets:
+Each forward starts a transaction and registers two state-version sets:
 
 ```text
 candidate_state_versions
-  versions that rejection/commit may select as the new current state
+  half-open range that commit can select as the new current state
 
 publish_state_versions
-  cache-boundary versions whose selected snapshot should be written to runtime-owned state pages
+  ordered cache-boundary versions whose selected snapshots can be written to runtime-owned state pages
 ```
 
-The candidate set contains every replay-source or publish version that the transaction can select. Replay records
-these state slots in the GDN metadata. The output destination is the last candidate slot.
-Qwen wiring validates the verified state version against the transaction's forward range. It validates the
-replay-source state version against the candidate range. Commit receives only this physical state version. It promotes
-the matching slot as the current mutable source and releases other candidate slots.
+Prepare materializes this ordered union:
+
+```text
+publish_state_versions where version < candidate_end_state_version
+union
+[candidate_start_state_version, candidate_end_state_version)
+```
+
+Both inputs are ordered and unique. Prepare merges them in one pass. It does not sort the result. A publish version can
+precede `candidate_start_state_version`. A publish version at or after `candidate_end_state_version` remains pending for
+a later transaction.
+
+`flat_materialized_state_slots` maps each materialized version to the forward row that produces it. All other rows contain
+`u32::MAX`. Commit promotes the selected candidate slot and releases the other transaction slots.
 
 A commit to the current version leaves the current slot unchanged. It clears uncommitted txn state slots.
 
@@ -754,21 +789,48 @@ It selects `input_state_version + num_fixed_tokens + num_accepted_tokens`.
 For input state 93, two fixed tokens, and two speculative tokens, accept counts 0, 1, and 2 select states 95, 96, and 97.
 `num_spec_tokens` does not directly change this calculation.
 
-MTP decode replays K - 1 verified tail tokens in the next Main forward.
-Therefore, `replay_source_state_version = verified_state_version - (K - 1)` for this physical state selection.
-This replay boundary does not change the verified state formula.
-The next newly sampled token index equals `verified_state_version`.
-The next Main `QueryTokens::token_index` can equal `replay_source_state_version` because that call includes the replayed
-tail. For K = 2 and verified states 95, 96, and 97, the replay-source states are 94, 95, and 96.
-`QueryTokens::Prefill` commits its full window and does not use this replay shift.
+The cache-lane topology owns the candidate shift:
 
-A logical cache-block boundary strictly inside the verified prefix remains selectable for cache publication. The state
-table allocates one additional candidate for each such boundary. A boundary in the draft suffix already coincides with
-a rejection candidate.
+```text
+candidate_shift = num_cache_lanes.saturating_sub(2)
 
-The normal GDN forward materializes candidate states while it scans rows. It writes only requested rows to candidate
-slots. The final row writes the last candidate slot. Commit retains the selected replay state and discards the other
-candidates before the next forward.
+Vanilla  L = 1      shift = 0
+DSpark   L = 1      shift = 0
+MTP      L = P + 1  shift = P - 1
+```
+
+GDN converts a destination version to a candidate version with
+`candidate_state_version = dst_state_version - candidate_shift`. It uses the inverse addition only when it must map a
+candidate version back to a destination decision. `QueryTokens::Prefill` commits its full window and uses shift zero.
+
+The complete MTP candidate range shifts. Its length stays equal to the DSpark range length:
+
+```text
+P = 3, S = 3, shift = P - 1 = 2
+
+DSpark Main rows        fixed   spec0   spec1   spec2
+state after row           V+1     V+2     V+3     V+4
+accepted count              0       1       2       3
+candidate state           V+1     V+2     V+3     V+4
+
+MTP Main rows           fixed0  fixed1  fixed2  spec0   spec1   spec2
+state after row           V+1     V+2     V+3     V+4     V+5     V+6
+accepted count              0       1       2       3
+candidate state           V+1     V+2     V+3     V+4
+                          |------- S + 1 states -------|
+
+MTP destination range    [V+1, V+7)
+MTP candidate range      [V+1, V+5)
+```
+
+The MTP destination end can follow the candidate end. This condition does not require another candidate state.
+
+A cache-block boundary before `candidate_end_state_version` can be published by this transaction. It can precede the
+candidate range. The state table allocates one materialized slot for each boundary that is not already a candidate.
+
+The normal GDN forward materializes requested states while it scans rows. If the final row is not materialized, its state
+remains local to the kernel and is discarded. Commit retains the selected candidate state and discards the other
+transaction states before the next forward.
 
 Cache-boundary publish is a separate requirement. When commit selects a registered publish version, publish must write
 the matching candidate/current slot to its page IDs.
@@ -824,27 +886,27 @@ The replay-order section defines the hidden-state pipeline. Mutable request stat
 
 ```text
 src_state_slots[num_reqs]          committed current state slot for each request
-dst_state_slots[num_reqs]          last candidate slot for each request
-flat_candidate_state_slots[num_tokens]  optional prefix candidate slot per flat token, or u32::MAX
+flat_materialized_state_slots[num_tokens]  persistent state slot per flat token, or u32::MAX
 conv_states[layer, slot, Cqkv, Ks]
 recurrent_states[layer, slot, v_head, v_dim, qk_dim]
 ```
 
-Short convolution reads the source conv-state slot and `qkv`. It writes `conv_qkv` for every current row. It
-writes the next conv-state into the destination slot.
+Short convolution reads the source conv-state slot and `qkv`. It writes `conv_qkv` for every current row. It writes the
+next conv-state only when the row's state slot is valid.
 
 The recurrent core reads `conv_qkv`, raw F32 `a`/`b`, and raw BF16 `a_log`/`dt_bias`. It promotes the BF16 parameters
 and derives normalized q/k, beta, decay, and output values in F32. It then advances the recurrent state in token order
 for each request segment.
 
 Each Q/K-dimension lane loads its strided source-state fragment once. It keeps that MSL `thread` fragment local across the
-segment. It writes the final fragment to the destination slot after the last token.
+segment. It writes a fragment to persistent state only when the row's state slot is valid.
 
-Candidate state materialization is part of the normal forward. For a request with base state version `V` and `n` rows,
-the row after `i` tokens corresponds to state version `V + i`.
+Candidate state materialization is part of the normal forward. If the first input token has index `V`, row zero produces
+state version `V + 1`. Each later row increments the version by one.
 
-If that version appears in the txn's candidate set, the core writes the current conv/recurrent state into that row's
-candidate slot. Commit later selects the slot whose state version equals the verified state version.
+If that version appears in the materialized union, the core writes the current conv/recurrent state into that row's
+state slot. The union contains commit candidates and cache-boundary candidates. Commit receives a destination version,
+converts it to a candidate version, and selects the corresponding slot.
 
 Cache-boundary publish separately consumes the same materialized candidate/current slots. It emits a publish job only when
 the committed verified path satisfies that publish version.
@@ -853,7 +915,7 @@ The important invariant is:
 
 ```text
 all selectable versions must be materialized during the forward that computes them
-commit selects by absolute state_version
+commit shifts and validates one destination state_version in the GDN owner
 publish writes only committed/verified versions
 rejected speculative rows leave their candidate slots uncommitted
 ```
@@ -920,7 +982,8 @@ coverage. Slow/reference implementations are test oracles. They are not runtime 
 one-request ragged decode, random ragged input, and a random multi-request ragged batch. Candidate-state tests compare each
 speculative prefix state with an independently evaluated CPU prefix reference. The bucketed candidate test reuses one
 program for `1 -> 2 -> 1` active requests and tokens. It poisons inactive token and metadata tails. It verifies active
-output/state parity and inactive scratch/state canaries.
+output/state parity and inactive scratch/state canaries. Its one-request rounds also use `u32::MAX` as the final
+row slot and verify that normal output remains correct while persistent state stays unmodified.
 
 ## Tests and benches
 

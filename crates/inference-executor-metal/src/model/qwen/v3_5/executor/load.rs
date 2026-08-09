@@ -271,37 +271,41 @@ fn qwen35_gdn_state_capacity(
     max_tokens_per_request: usize,
     num_tokens_per_block: usize,
 ) -> GDNStateCapacity {
+    let num_spec_tokens = match spec_source {
+        Qwen35SpecSource::Vanilla => 0,
+        Qwen35SpecSource::MTP(mtp) => mtp.num_spec_tokens.get(),
+        Qwen35SpecSource::DSpark { num_spec_tokens, .. } => num_spec_tokens.get(),
+    };
+    qwen35_gdn_state_capacity_for_num_spec_tokens(num_spec_tokens, max_tokens_per_request, num_tokens_per_block)
+}
+
+fn qwen35_gdn_state_capacity_for_num_spec_tokens(
+    num_spec_tokens: usize,
+    max_tokens_per_request: usize,
+    num_tokens_per_block: usize,
+) -> GDNStateCapacity {
     assert!(max_tokens_per_request > 0, "qwen3.5 GDN state requires request tokens");
     assert!(num_tokens_per_block > 0, "qwen3.5 GDN state requires tokens per block");
 
-    let max_decision_candidates = match spec_source {
-        Qwen35SpecSource::Vanilla => 1,
-        Qwen35SpecSource::MTP(mtp) => {
-            mtp.num_spec_tokens
-                .get()
-                .checked_mul(2)
-                .expect("qwen3.5 MTP GDN candidate count must fit usize")
-        },
-        Qwen35SpecSource::DSpark { num_spec_tokens, .. } => {
-            num_spec_tokens
-                .get()
-                .checked_add(1)
-                .expect("qwen3.5 DSpark GDN candidate count must fit usize")
-        },
-    };
+    // Main can accept 0..=num_spec_tokens draft tokens. DSpark stores those
+    // states at their verified versions. MTP shifts the complete version range
+    // but keeps the same number of decisions.
+    let max_commit_candidates = num_spec_tokens
+        .checked_add(1)
+        .expect("qwen3.5 GDN commit-candidate count must fit usize");
     let max_block_boundary_candidates = max_tokens_per_request.div_ceil(num_tokens_per_block);
-    // The speculative candidate suffix and crossed cache-block boundaries can
-    // be disjoint when the request has more than one fixed token.
-    let max_candidate_states_per_req = max_decision_candidates
+    // The candidate range and crossed cache-block boundaries can be disjoint.
+    // Keep one slot for the current state in addition to this safe union bound.
+    let max_materialized_states_per_req = max_commit_candidates
         .checked_add(max_block_boundary_candidates)
-        .expect("qwen3.5 GDN candidate count must fit usize");
-    let num_state_slots_per_req = max_candidate_states_per_req
+        .expect("qwen3.5 GDN materialized-state count must fit usize");
+    let num_state_slots_per_req = max_materialized_states_per_req
         .checked_add(1)
         .expect("qwen3.5 GDN state-slot count must fit usize");
     let max_publish_jobs_per_req = max_tokens_per_request.div_ceil(num_tokens_per_block);
     GDNStateCapacity::new(
         num_state_slots_per_req,
-        max_candidate_states_per_req,
+        max_materialized_states_per_req,
         max_publish_jobs_per_req,
     )
 }
@@ -826,33 +830,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dspark_gdn_capacity_uses_selected_spec_tokens() {
-        let spec_source = Qwen35SpecSource::DSpark {
-            model_dir: Path::new("unused"),
-            config: Box::new(Qwen3xDSparkConfig {
-                block_size: 7,
-                mask_token_id: 15,
-                target_layer_ids: vec![1, 4],
-                num_target_layers: 8,
-                hidden_size: 32,
-                intermediate_size: 64,
-                num_hidden_layers: 2,
-                num_attention_heads: 4,
-                num_key_value_heads: 1,
-                head_dim: 8,
-                rms_norm_eps: 1e-6,
-                rope_theta: 10_000.0,
-                max_position_embeddings: 32,
-                vocab_size: 64,
-                markov_rank: 8,
-                num_anchors: 8,
-                quantization: None,
-            }),
-            num_spec_tokens: NonZeroUsize::new(3).unwrap(),
-        };
-
+    fn test_gdn_capacity_adds_current_commit_and_cache_boundary_states() {
         assert_eq!(
-            qwen35_gdn_state_capacity(&spec_source, 16, 8),
+            qwen35_gdn_state_capacity_for_num_spec_tokens(0, 16, 8),
+            GDNStateCapacity::new(4, 3, 2)
+        );
+        assert_eq!(
+            qwen35_gdn_state_capacity_for_num_spec_tokens(1, 16, 8),
+            GDNStateCapacity::new(5, 4, 2)
+        );
+        assert_eq!(
+            qwen35_gdn_state_capacity_for_num_spec_tokens(3, 16, 8),
             GDNStateCapacity::new(7, 6, 2)
         );
     }

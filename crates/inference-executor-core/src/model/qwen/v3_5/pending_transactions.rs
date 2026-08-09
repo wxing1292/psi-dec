@@ -4,7 +4,7 @@ use inference_runtime_core::runtime::RawComputeSlotSeq;
 
 use crate::model::qwen::v3_5::Qwen35DecodeDecision;
 use crate::model::qwen::v3_5::Qwen35Microbatch;
-use crate::model::qwen::v3_5::gdn_commit_state_versions;
+use crate::model::qwen::v3_5::verified_state_versions_for_decisions;
 
 #[derive(Clone, Debug)]
 pub struct Qwen35PendingTransactions {
@@ -63,7 +63,7 @@ impl Qwen35PendingTransactions {
             .pop_front()
             .expect("qwen3.5 verified pending transaction must remain available");
         let microbatch = transaction.microbatch;
-        gdn_commit_state_versions(&microbatch, decisions)
+        verified_state_versions_for_decisions(&microbatch, decisions)
     }
 }
 

@@ -156,14 +156,18 @@ impl<'a> RealGDNFixture<'a> {
             Buffer::new_zeroed(device, num_tokens as usize * HIDDEN_DIM * Dtype::Bfloat16.item_size());
         let num_tokens_per_req = request_token_counts(num_tokens, num_reqs);
         let batch_metadata = GDNMetadataBuffers::new(device, num_reqs as usize, num_tokens as usize);
+        let cu_tokens = cu_tokens(&num_tokens_per_req)
+            .into_iter()
+            .map(|value| value as u32)
+            .collect::<Vec<_>>();
+        let mut flat_materialized_state_slots = vec![u32::MAX; num_tokens as usize];
+        for (req_index, &flat_end) in cu_tokens.iter().skip(1).enumerate() {
+            flat_materialized_state_slots[flat_end as usize - 1] = num_reqs + req_index as u32;
+        }
         batch_metadata.update(
-            &cu_tokens(&num_tokens_per_req)
-                .into_iter()
-                .map(|value| value as u32)
-                .collect::<Vec<_>>(),
+            &cu_tokens,
             &(0..num_reqs).collect::<Vec<_>>(),
-            &(num_reqs..2 * num_reqs).collect::<Vec<_>>(),
-            &vec![u32::MAX; num_tokens as usize],
+            &flat_materialized_state_slots,
         );
         let conv_state = Buffer::from_slice(
             device,
@@ -334,7 +338,7 @@ impl<'a> RealGDNFixture<'a> {
                     dt_bias: &self.weights.dt_bias,
                     cu_tokens: self.batch_metadata.cu_tokens(),
                     src_state_slots: self.batch_metadata.src_state_slots(),
-                    dst_state_slots: self.batch_metadata.dst_state_slots(),
+                    flat_materialized_state_slots: self.batch_metadata.flat_materialized_state_slots(),
                     conv_state: &self.conv_state,
                     conv_state_offset_bytes: 0,
                     next_conv_state: &self.next_conv_state,

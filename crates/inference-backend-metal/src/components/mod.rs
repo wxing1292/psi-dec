@@ -66,7 +66,6 @@ pub use gdn_compute::GDNCompute;
 pub use gdn_compute::GDNComputeBuffers;
 pub use gdn_compute::GDNComputeConfig;
 pub use gdn_compute::GDNComputeShape;
-pub use gdn_compute::GDNComputeWithCandidateStateUpdateBuffers;
 
 mod gdn_qkvabz_split;
 pub use gdn_qkvabz_split::GDNQKVABZSplitBuffers;

@@ -18,12 +18,13 @@ kernel void gdn_compute_short_conv_f32(
     device const float* conv_state [[buffer(3)]],
     device const bfloat16_t* conv_weight [[buffer(4)]],
     device const uint* src_state_slots [[buffer(5)]],
-    device const uint* dst_state_slots [[buffer(6)]],
+    device const uint* flat_materialized_state_slots [[buffer(6)]],
     device const uint* cu_tokens [[buffer(7)]],
     constant uint& num_active_reqs [[buffer(8)]],
     constant uint& num_active_tokens [[buffer(9)]],
     constant ulong& conv_state_offset_bytes [[buffer(10)]],
     constant ulong& next_conv_state_offset_bytes [[buffer(11)]],
+    constant uint& write_final_state [[buffer(12)]],
     uint global_linear_index [[thread_position_in_grid]]
 ) {
     const ulong conv_state_base = conv_state_offset_bytes / sizeof(float);
@@ -73,7 +74,8 @@ kernel void gdn_compute_short_conv_f32(
         const uint flat_token_end = cu_tokens[req_index + 1];
         const uint num_req_tokens = flat_token_end - flat_token_begin;
         const uint src_state_slot = src_state_slots[req_index];
-        const uint dst_state_slot = dst_state_slots[req_index];
+        // An invalid slot keeps the row output but does not materialize its state.
+        const uint state_slot = flat_materialized_state_slots[flat_token_end - 1];
         const long sequence_index = (long)num_req_tokens + (long)state_index - (long)conv_state_len;
         float x = 0.0f;
         if (sequence_index < 0) {
@@ -85,8 +87,10 @@ kernel void gdn_compute_short_conv_f32(
             const uint input_offset = (flat_token_begin + uint(sequence_index)) * qkv_dim + channel_index;
             x = qkv[input_offset];
         }
-        const uint dst_offset = (dst_state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
-        next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
+        if (write_final_state != 0 && state_slot != GDN_INVALID_STATE_SLOT_ID) {
+            const uint dst_offset = (state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
+            next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
+        }
     }
 }
 
@@ -95,7 +99,7 @@ kernel void gdn_compute_forward_conv_candidate_state_f32(
     device const float* qkv [[buffer(1)]],
     device const float* conv_state [[buffer(2)]],
     device const uint* src_state_slots [[buffer(3)]],
-    device const uint* flat_candidate_state_slots [[buffer(4)]],
+    device const uint* flat_materialized_state_slots [[buffer(4)]],
     device const uint* cu_tokens [[buffer(5)]],
     constant uint& num_active_reqs [[buffer(6)]],
     constant uint& num_active_tokens [[buffer(7)]],
@@ -124,8 +128,8 @@ kernel void gdn_compute_forward_conv_candidate_state_f32(
     const uint flat_token_begin = cu_tokens[req_index];
     const uint num_verified_req_tokens = flat_token_index - flat_token_begin + 1;
     const uint src_state_slot = src_state_slots[req_index];
-    const uint dst_state_slot = flat_candidate_state_slots[flat_token_index];
-    if (dst_state_slot == GDN_INVALID_STATE_SLOT_ID) {
+    const uint state_slot = flat_materialized_state_slots[flat_token_index];
+    if (state_slot == GDN_INVALID_STATE_SLOT_ID) {
         return;
     }
     const long sequence_index =
@@ -139,7 +143,7 @@ kernel void gdn_compute_forward_conv_candidate_state_f32(
         const uint input_offset = (flat_token_begin + uint(sequence_index)) * qkv_dim + channel_index;
         x = qkv[input_offset];
     }
-    const uint dst_offset = (dst_state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
+    const uint dst_offset = (state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
     next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
 }
 
@@ -163,7 +167,7 @@ kernel void gdn_compute_ragged_recurrent_f32(
     device const bfloat16_t* a_log [[buffer(5)]],
     device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_state_slots [[buffer(7)]],
-    device const uint* dst_state_slots [[buffer(8)]],
+    device const uint* flat_materialized_state_slots [[buffer(8)]],
     device const uint* cu_tokens [[buffer(9)]],
     constant float& q_scale [[buffer(10)]],
     constant uint& num_active_reqs [[buffer(11)]],
@@ -194,7 +198,8 @@ kernel void gdn_compute_ragged_recurrent_f32(
     const uint v_base = k_base + num_qk_heads * qk_head_dim;
     const uint recurrent_state_stride = num_v_heads * v_head_dim * qk_head_dim;
     const uint src_state_slot = src_state_slots[req_index];
-    const uint dst_state_slot = dst_state_slots[req_index];
+    // An invalid slot keeps the row output but does not materialize its state.
+    const uint state_slot = flat_materialized_state_slots[flat_token_end - 1];
 
     threadgroup float q_inv_norm_shared;
     threadgroup float k_inv_norm_shared;
@@ -284,20 +289,22 @@ kernel void gdn_compute_ragged_recurrent_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments; ++state_fragment_index) {
-        const uint qk_dim_index = qk_dim_thread_index + state_fragment_index * num_qk_dim_threads;
-        if (qk_dim_index < qk_head_dim) {
-            recurrent_state_arena[
-                recurrent_state_base
-                + (ulong)(dst_state_slot * recurrent_state_stride + state_row_offset + qk_dim_index)] =
-                state_fragments[state_fragment_index];
+    if (state_slot != GDN_INVALID_STATE_SLOT_ID) {
+        for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments; ++state_fragment_index) {
+            const uint qk_dim_index = qk_dim_thread_index + state_fragment_index * num_qk_dim_threads;
+            if (qk_dim_index < qk_head_dim) {
+                recurrent_state_arena[
+                    recurrent_state_base
+                    + (ulong)(state_slot * recurrent_state_stride + state_row_offset + qk_dim_index)] =
+                    state_fragments[state_fragment_index];
+            }
         }
     }
 }
 
 // This candidate-state kernel uses the same comment-only
 // GDNRaggedRecurrentTask and grid as gdn_compute_ragged_recurrent_f32.
-// flat_candidate_state_slots is data that selects optional state writes; it is
+// flat_materialized_state_slots is data that selects optional state writes; it is
 // not a Task coordinate or TaskTemplate field.
 kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     device float* recurrent_output [[buffer(0)]],
@@ -308,12 +315,11 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     device const bfloat16_t* a_log [[buffer(5)]],
     device const bfloat16_t* dt_bias [[buffer(6)]],
     device const uint* src_state_slots [[buffer(7)]],
-    device const uint* dst_state_slots [[buffer(8)]],
-    device const uint* flat_candidate_state_slots [[buffer(9)]],
-    device const uint* cu_tokens [[buffer(10)]],
-    constant float& q_scale [[buffer(11)]],
-    constant uint& num_active_reqs [[buffer(12)]],
-    constant ulong& recurrent_state_offset_bytes [[buffer(13)]],
+    device const uint* flat_materialized_state_slots [[buffer(8)]],
+    device const uint* cu_tokens [[buffer(9)]],
+    constant float& q_scale [[buffer(10)]],
+    constant uint& num_active_reqs [[buffer(11)]],
+    constant ulong& recurrent_state_offset_bytes [[buffer(12)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadblock [[thread_position_in_threadgroup]]
 ) {
@@ -340,7 +346,6 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     const uint v_base = k_base + num_qk_heads * qk_head_dim;
     const uint recurrent_state_stride = num_v_heads * v_head_dim * qk_head_dim;
     const uint src_state_slot = src_state_slots[req_index];
-    const uint dst_state_slot = dst_state_slots[req_index];
 
     threadgroup float q_inv_norm_shared;
     threadgroup float k_inv_norm_shared;
@@ -351,8 +356,9 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
         return;
     }
 
-    // Prefix candidates still materialize after their token; only the final
-    // destination state stays thread-local until the request segment ends.
+    // Registered decision and cache-boundary states materialize after their
+    // token. GDN_INVALID_STATE_SLOT_ID keeps the row output but discards that
+    // row's state.
     const uint state_row_offset = (v_head_index * v_head_dim + v_dim_index) * qk_head_dim;
     thread float state_fragments[num_state_fragments];
     for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments; ++state_fragment_index) {
@@ -422,7 +428,7 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
             const float q_norm = conv_qkv[q_value_index] * q_inv_norm_shared;
             const float updated_state = state_fragments[state_fragment_index] + k_norm * delta;
             state_fragments[state_fragment_index] = updated_state;
-            const uint candidate_state_slot = flat_candidate_state_slots[flat_token_index];
+            const uint candidate_state_slot = flat_materialized_state_slots[flat_token_index];
             if (candidate_state_slot != GDN_INVALID_STATE_SLOT_ID) {
                 recurrent_state_arena[
                     recurrent_state_base
@@ -437,15 +443,6 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments; ++state_fragment_index) {
-        const uint qk_dim_index = qk_dim_thread_index + state_fragment_index * num_qk_dim_threads;
-        if (qk_dim_index < qk_head_dim) {
-            recurrent_state_arena[
-                recurrent_state_base
-                + (ulong)(dst_state_slot * recurrent_state_stride + state_row_offset + qk_dim_index)] =
-                state_fragments[state_fragment_index];
-        }
-    }
 }
 
 // One logical GDNOutputNormGateTask maps 1:1 to one 128-thread threadblock. It

@@ -349,8 +349,7 @@ Qwen3.5 wiring derives this request-local GDN slot count:
 ```text
 decision_candidate_states = match mode {
   Vanilla => 1,
-  MTP { num_spec_tokens } => 2 * num_spec_tokens,
-  DSpark { num_spec_tokens } => num_spec_tokens + 1,
+  MTP { num_spec_tokens } | DSpark { num_spec_tokens } => num_spec_tokens + 1,
 }
 block_boundary_candidates = ceil(max_tokens_per_request / num_tokens_per_block)
 candidate_states = decision_candidate_states + block_boundary_candidates
@@ -358,18 +357,18 @@ state_slots = 1 + candidate_states
 ```
 
 The leading slot stores the current state.
-Candidate slots store verified prefixes, MTP replay frontiers, and logical cache-block boundary states.
-The two candidate sets can be disjoint when a request contains more than one fixed token.
-For MTP decode, the verified and replay-source ranges overlap and contain at most `2 * num_spec_tokens` states in total.
-Qwen verification calculates both boundaries. GDN commit receives only the replay frontier and selects it as the next
-physical source.
+Candidate slots store decision prefixes and logical cache-block boundary states.
+The two sets can be disjoint when a request contains more than one fixed token.
+MTP shifts the complete decision-candidate version range by `num_spec_tokens - 1`.
+The shift changes the physical replay frontier. It does not change the candidate count.
+Qwen verification calculates the shifted range. GDN commit receives one selected physical version as its next source.
 The total arena scales with `--max-requests * state_slots * full_model_state_bytes`.
 
 For the Qwen3.6-27B checkpoint, one full-model GDN state is 149.625 MiB.
 With the default `--max-requests 4`, one-step MTP uses four state slots for each request and allocates
 approximately 2.34 GiB for the arena.
-Two-step MTP uses six state slots for each request and allocates approximately 3.51 GiB.
-Four-step MTP uses ten state slots for each request and allocates approximately 5.84 GiB.
+Two-step MTP uses five state slots for each request and allocates approximately 2.92 GiB.
+Four-step MTP uses seven state slots for each request and allocates approximately 4.09 GiB.
 A DSpark run with `num_spec_tokens=15` uses 18 state slots for each request and allocates approximately 10.52 GiB.
 These values do not include model weights, cache pages, or other executor workspaces.
 

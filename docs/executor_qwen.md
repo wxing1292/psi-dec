@@ -780,7 +780,12 @@ MTP decode replays K - 1 verified tail tokens in the next Main call.
 Qwen verification keeps the verified state version unchanged and calculates
 `replay_source_state_version = verified_state_version - (K - 1)`. It passes this physical source to GDN commit as the
 state version that becomes current.
-The transaction materializes the union of all verified and replay-source choices.
+The transaction shifts both ends of the complete decision-candidate range by `K - 1`.
+It keeps `S + 1` candidates for a request that verifies `S` speculative tokens.
+DSpark and MTP therefore use the same candidate count. Only the physical MTP state versions shift.
+Cache-boundary versions are an independent materialization requirement.
+If the Main forward end is neither a decision candidate nor a cache boundary, GDN produces the row output and discards
+that final recurrent/convolution state.
 The next newly sampled token index remains the verified state version.
 Runtime can represent a full prompt as `QueryTokens::Decode` when the prompt fits the token budget, so this rule also
 applies to that zero-spec warm-up.
@@ -861,7 +866,8 @@ The executor owns separate page tables and splits each runtime page span.
 Proposal-local Q/K/V and attention partials remain in executor-owned `DSparkBlockScratch`.
 
 Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidates for each DSpark request slot.
-It also reserves cache-block boundary candidates.
+MTP uses the same decision-candidate count and shifts their physical state versions by `num_spec_tokens - 1`.
+Both modes also reserve cache-block boundary candidates.
 The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, and DSpark.
 These state buffers remain allocated, reusable, and resident with the cached replay resources.
 

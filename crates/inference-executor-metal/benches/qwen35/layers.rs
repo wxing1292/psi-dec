@@ -237,9 +237,11 @@ impl BlockFixture {
             CACHE_BLOCK_TOKENS,
             QWEN35_PAGE_SIZE_BYTES,
         );
+        let mut flat_materialized_state_slots = vec![u32::MAX; max_tokens];
+        flat_materialized_state_slots[shape.num_tokens as usize - 1] = 1;
         gdn_state
             .metadata()
-            .update(&[0, shape.num_tokens], &[0], &[0], &vec![0; max_tokens]);
+            .update(&[0, shape.num_tokens], &[0], &flat_materialized_state_slots);
 
         let layer_scratch = Rc::new(Qwen35MainLayerScratch::new(
             device,
