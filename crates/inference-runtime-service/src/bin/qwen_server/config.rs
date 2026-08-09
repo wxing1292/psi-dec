@@ -45,6 +45,7 @@ impl Qwen3Config {
                 "--hf-dspark-model-dir is required when --num-spec-tokens is set"
             ));
         }
+        validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
                 "--max-requests must fit the u32 request-slot domain"
@@ -187,6 +188,7 @@ impl Qwen35Config {
             .hf_mtp_model_dir
             .as_ref()
             .map(|_| args.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
+        validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
         validate_mtp_scheduler_capacity(num_mtp_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
@@ -296,6 +298,15 @@ fn validate_mtp_scheduler_capacity(
         return Err(log_info_invalid_argument!(
             "--max-tokens-per-request={max_tokens_per_request} must be at least --num-spec-tokens={num_spec_tokens} \
              for MTP cache-lane initialization"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scheduler_token_capacity(max_tokens: NonZeroUsize, max_tokens_per_request: NonZeroUsize) -> Result<()> {
+    if max_tokens_per_request.get() > max_tokens.get() {
+        return Err(log_info_invalid_argument!(
+            "--max-tokens-per-request={max_tokens_per_request} must not exceed --max-tokens={max_tokens}"
         ));
     }
     Ok(())

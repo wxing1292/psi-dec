@@ -41,6 +41,20 @@ fn test_scheduler_overrides() {
 }
 
 #[test]
+fn test_scheduler_rejects_per_request_token_capacity_above_batch_capacity() {
+    assert!(matches!(
+        Qwen3Config::from_args(parse_qwen3(&["--max-tokens", "3", "--max-tokens-per-request", "4"])),
+        Err(Error::InvalidArgument(message))
+            if message.contains("--max-tokens-per-request=4 must not exceed --max-tokens=3")
+    ));
+    assert!(matches!(
+        Qwen35Config::from_args(parse_qwen35(&["--max-tokens", "3", "--max-tokens-per-request", "4"])),
+        Err(Error::InvalidArgument(message))
+            if message.contains("--max-tokens-per-request=4 must not exceed --max-tokens=3")
+    ));
+}
+
+#[test]
 fn test_qwen35_request_slots_follow_max_requests_for_all_spec_modes() {
     let main = Qwen35Config::from_args(parse_qwen35(&["--max-requests", "3"])).unwrap();
     let mtp = Qwen35Config::from_args(parse_qwen35(&[

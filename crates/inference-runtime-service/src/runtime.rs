@@ -80,6 +80,12 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             scheduler_config.max_tokens_per_request > 0,
             "runtime requires per-request token capacity"
         );
+        assert!(
+            scheduler_config.max_tokens_per_request <= scheduler_config.max_tokens,
+            "runtime per-request token capacity={} exceeds batch token capacity={}",
+            scheduler_config.max_tokens_per_request,
+            scheduler_config.max_tokens
+        );
         assert!(scheduler_config.max_compute_slots > 0, "runtime requires compute slots");
         assert!(
             model_runtime_config.max_queued_requests > 0,
@@ -385,7 +391,7 @@ mod tests {
             runtime_config,
             SchedulerConfig {
                 max_requests: 1,
-                max_tokens: 1,
+                max_tokens: 1024,
                 max_tokens_per_request: 1024,
                 max_compute_slots: 1,
             },

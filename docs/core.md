@@ -125,6 +125,7 @@ user-request channel. `RuntimeConfig::max_running_requests` bounds the request-s
 channels.
 
 `SchedulerConfig::max_requests`, `max_tokens`, and `max_tokens_per_request` remain per-batch limits.
+`max_tokens_per_request` must not exceed `max_tokens`.
 `SchedulerConfig::max_compute_slots` bounds outstanding batches. It therefore also bounds the batch-request and
 batch-response channels.
 

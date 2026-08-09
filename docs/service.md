@@ -268,6 +268,7 @@ An MTP checkpoint enables one speculative MTP step by default.
 `--num-spec-tokens K` takes a positive `usize` value for MTP or DSpark.
 The executor reuses the checkpoint's one physical MTP layer for K dependent logical steps.
 For MTP, omit `--num-spec-tokens` to use one step.
+`--max-tokens-per-request` must not exceed `--max-tokens`.
 For MTP with K speculative tokens, `--max-tokens-per-request` must be at least K.
 An MTP decode request must contain at least K initial input tokens.
 For DSpark, omit `--num-spec-tokens` to use the checkpoint `block_size`.
