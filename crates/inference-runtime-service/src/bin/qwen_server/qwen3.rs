@@ -9,6 +9,7 @@ use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model_with_
 use inference_runtime_core::Result;
 use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
+use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 
 use crate::codec::qwen::QwenCodec;
@@ -75,7 +76,7 @@ fn run_inner() -> Result<()> {
                 executor_config,
             )
             .map_err(|error| {
-                log_err_unavailable!(
+                log_err_internal!(
                     "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
                     config.hf_model_dir(),
                     dspark_model_dir,
@@ -84,7 +85,7 @@ fn run_inner() -> Result<()> {
         },
         Qwen3ModelMode::Vanilla => {
             init_qwen_3_model(config.hf_model_dir(), executor_config).map_err(|error| {
-                log_err_unavailable!(
+                log_err_internal!(
                     "unable to initialize qwen3 Main model from {:?}: {error}",
                     config.hf_model_dir()
                 )

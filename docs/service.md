@@ -322,6 +322,7 @@ All lanes allocate from the same shared physical-page arena.
 
 At startup, each service derives the page count for one block from the initialized executor. The service rejects
 `--num-cache-pages` when one complete block cannot fit.
+The service classifies a model-executor initialization failure as an internal startup error.
 
 The rejection reports this dynamic minimum.
 

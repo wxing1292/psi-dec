@@ -238,7 +238,7 @@ fn build_model(
         } => init_qwen_3_5_model_with_dspark(hf_model_dir, model_dir, *num_spec_tokens, executor_config),
     };
     init_result.map_err(|error| {
-        log_err_unavailable!(
+        log_err_internal!(
             "unable to initialize {} model from {hf_model_dir:?} in mode {:?}: {error}",
             kind.label(),
             config.model_mode(),
