@@ -235,7 +235,7 @@ The runtime core carries the compile-time cache-lane count as const `L`.
 `RuntimeConfig::cache_lanes` must contain exactly `L` lane configurations.
 Each multi-lane allocation, reserve, commit, and free operation requires one entry for every lane.
 Qwen3.5 MTP configures one Main lane and one lane for each logical MTP step.
-Thus, Qwen3.5 uses `L = num_mtp_steps + 1`.
+Thus, Qwen3.5 uses `L = num_spec_tokens + 1`.
 
 Mutable and semi-immutable blocks are request-local lifecycle objects. Trie nodes represent immutable identity. Pin
 counts protect reusable nodes from eviction. S3FIFO tracks eligible unpinned leaves.

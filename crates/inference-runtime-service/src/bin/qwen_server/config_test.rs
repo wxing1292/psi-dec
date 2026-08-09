@@ -80,29 +80,36 @@ fn test_listener_overrides() {
 }
 
 #[test]
-fn test_mtp_defaults_from_checkpoint_presence() {
+fn test_mtp_defaults_to_one_spec_token_and_two_cache_lanes() {
     let main_only = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
-    assert_eq!(main_only.num_mtp_steps(), 0);
+    assert_eq!(main_only.num_cache_lanes(), 1);
     assert_eq!(main_only.model_mode(), &Qwen35ModelMode::Vanilla);
 
     let mtp = Qwen35Config::from_args(parse_qwen35(&["--hf-mtp-model-dir", "mtp-model"])).unwrap();
-    assert_eq!(mtp.num_mtp_steps(), 1);
+    assert_eq!(mtp.num_cache_lanes(), 2);
     assert_eq!(
         mtp.model_mode(),
         &Qwen35ModelMode::MTP {
             model_dir: "mtp-model".into(),
-            num_steps: std::num::NonZeroUsize::MIN,
+            num_spec_tokens: std::num::NonZeroUsize::MIN,
         }
     );
 
     let four_steps = Qwen35Config::from_args(parse_qwen35(&[
         "--hf-mtp-model-dir",
         "mtp-model",
-        "--num-mtp-steps",
+        "--num-spec-tokens",
         "4",
     ]))
     .unwrap();
-    assert_eq!(four_steps.num_mtp_steps(), 4);
+    assert_eq!(four_steps.num_cache_lanes(), 5);
+    assert_eq!(
+        four_steps.model_mode(),
+        &Qwen35ModelMode::MTP {
+            model_dir: "mtp-model".into(),
+            num_spec_tokens: std::num::NonZeroUsize::new(4).unwrap(),
+        }
+    );
 }
 
 #[test]
@@ -111,7 +118,8 @@ fn test_dspark_inputs_normalize_to_one_model_mode() {
     assert_eq!(
         qwen3.model_mode(),
         &Qwen3ModelMode::DSpark {
-            model_dir: "qwen3-dspark".into()
+            model_dir: "qwen3-dspark".into(),
+            num_spec_tokens: None,
         }
     );
 
@@ -119,29 +127,94 @@ fn test_dspark_inputs_normalize_to_one_model_mode() {
     assert_eq!(
         qwen35.model_mode(),
         &Qwen35ModelMode::DSpark {
-            model_dir: "qwen35-dspark".into()
+            model_dir: "qwen35-dspark".into(),
+            num_spec_tokens: None,
         }
     );
+    assert_eq!(qwen35.num_cache_lanes(), 1);
 }
 
 #[test]
-fn test_mtp_validation() {
+fn test_spec_token_validation() {
     assert!(matches!(
-        Qwen35Config::from_args(parse_qwen35(&["--num-mtp-steps", "1"])),
-        Err(Error::InvalidArgument(message)) if message.contains("--hf-mtp-model-dir")
+        Qwen35Config::from_args(parse_qwen35(&["--num-spec-tokens", "1"])),
+        Err(Error::InvalidArgument(message)) if message.contains("--hf-mtp-model-dir or --hf-dspark-model-dir")
     ));
-    assert!(Qwen35Args::try_parse_from(["qwen3.5", "--hf-model-dir", "model", "--num-mtp-steps", "0"]).is_err());
+    assert!(matches!(
+        Qwen3Config::from_args(parse_qwen3(&["--num-spec-tokens", "1"])),
+        Err(Error::InvalidArgument(message)) if message.contains("--hf-dspark-model-dir")
+    ));
     assert!(matches!(
         Qwen35Config::from_args(parse_qwen35(&[
             "--hf-mtp-model-dir",
             "mtp-model",
-            "--num-mtp-steps",
+            "--num-spec-tokens",
             "4",
             "--max-tokens-per-request",
             "4",
         ])),
-        Err(Error::InvalidArgument(message)) if message.contains("cannot schedule 5 target/MTP tokens")
+        Err(Error::InvalidArgument(message)) if message.contains("cannot schedule 5 target/speculative tokens")
     ));
+}
+
+#[test]
+fn test_dspark_accepts_configured_spec_tokens_without_adding_cache_lanes() {
+    let qwen3 = Qwen3Config::from_args(parse_qwen3(&[
+        "--hf-dspark-model-dir",
+        "qwen3-dspark",
+        "--num-spec-tokens",
+        "4",
+    ]))
+    .unwrap();
+    let qwen35 = Qwen35Config::from_args(parse_qwen35(&[
+        "--hf-dspark-model-dir",
+        "qwen35-dspark",
+        "--num-spec-tokens",
+        "4",
+    ]))
+    .unwrap();
+    let configured = Some(std::num::NonZeroUsize::new(4).unwrap());
+
+    assert_eq!(
+        qwen3.model_mode(),
+        &Qwen3ModelMode::DSpark {
+            model_dir: "qwen3-dspark".into(),
+            num_spec_tokens: configured,
+        }
+    );
+    assert_eq!(
+        qwen35.model_mode(),
+        &Qwen35ModelMode::DSpark {
+            model_dir: "qwen35-dspark".into(),
+            num_spec_tokens: configured,
+        }
+    );
+    assert_eq!(qwen35.num_cache_lanes(), 1);
+}
+
+#[test]
+fn test_dspark_proposal_length_is_independent_of_main_request_budget() {
+    let qwen3 = Qwen3Config::from_args(parse_qwen3(&[
+        "--hf-dspark-model-dir",
+        "qwen3-dspark",
+        "--num-spec-tokens",
+        "7",
+        "--max-tokens-per-request",
+        "2",
+    ]))
+    .unwrap();
+    let qwen35 = Qwen35Config::from_args(parse_qwen35(&[
+        "--hf-dspark-model-dir",
+        "qwen35-dspark",
+        "--num-spec-tokens",
+        "7",
+        "--max-tokens-per-request",
+        "2",
+    ]))
+    .unwrap();
+
+    assert!(matches!(qwen3.model_mode(), Qwen3ModelMode::DSpark { .. }));
+    assert!(matches!(qwen35.model_mode(), Qwen35ModelMode::DSpark { .. }));
 }
 
 #[test]
@@ -152,15 +225,6 @@ fn test_qwen35_dspark_and_mtp_are_mutually_exclusive() {
             "mtp-model",
             "--hf-dspark-model-dir",
             "dspark-model",
-        ])),
-        Err(Error::InvalidArgument(message)) if message.contains("mutually exclusive")
-    ));
-    assert!(matches!(
-        Qwen35Config::from_args(parse_qwen35(&[
-            "--hf-dspark-model-dir",
-            "dspark-model",
-            "--num-mtp-steps",
-            "1",
         ])),
         Err(Error::InvalidArgument(message)) if message.contains("mutually exclusive")
     ));

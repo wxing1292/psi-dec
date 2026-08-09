@@ -56,7 +56,7 @@ cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
   --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
-  --num-mtp-steps 1
+  --num-spec-tokens 1
 ```
 
 Stream an HTTP Chat Completions response:

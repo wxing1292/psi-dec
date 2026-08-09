@@ -57,6 +57,7 @@ impl Qwen3xDSparkMarkov {
         device: &Device,
         store: &mut SafeTensorStore,
         model_config: &Qwen3xDSparkConfig,
+        num_spec_tokens: usize,
         bindings: &Qwen3xDSparkMarkovWeightBindings,
         confidence_bindings: &Qwen3xDSparkConfidenceWeightBindings,
         max_requests: usize,
@@ -75,7 +76,7 @@ impl Qwen3xDSparkMarkov {
             hidden_dim: to_u32("Qwen3x DSpark confidence hidden dimension", model_config.hidden_size)?,
         };
         let config = DSparkMarkovSamplingConfig {
-            block_size: model_config.block_size,
+            block_size: num_spec_tokens,
             vocab_size,
             rank,
             w1_group_size: to_u32("Qwen3x DSpark Markov W1 group_size", w1_quantization.group_size)?,

@@ -66,16 +66,21 @@ fn run_inner() -> Result<()> {
     let model = match config.model_mode() {
         Qwen3ModelMode::DSpark {
             model_dir: dspark_model_dir,
+            num_spec_tokens,
         } => {
-            init_qwen_3_model_with_dspark(config.hf_model_dir(), dspark_model_dir, executor_config).map_err(
-                |error| {
-                    log_err_unavailable!(
-                        "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
-                        config.hf_model_dir(),
-                        dspark_model_dir,
-                    )
-                },
-            )?
+            init_qwen_3_model_with_dspark(
+                config.hf_model_dir(),
+                dspark_model_dir,
+                *num_spec_tokens,
+                executor_config,
+            )
+            .map_err(|error| {
+                log_err_unavailable!(
+                    "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
+                    config.hf_model_dir(),
+                    dspark_model_dir,
+                )
+            })?
         },
         Qwen3ModelMode::Vanilla => {
             init_qwen_3_model(config.hf_model_dir(), executor_config).map_err(|error| {
@@ -89,12 +94,14 @@ fn run_inner() -> Result<()> {
     startup.event("model executor initialized");
     if let Qwen3ModelMode::DSpark {
         model_dir: dspark_model_dir,
+        ..
     } = config.model_mode()
     {
         tracing::info!(
             target: "inference-runtime-service::startup",
             component = "qwen3",
             dspark_model_dir = ?dspark_model_dir,
+            num_spec_tokens = model.num_spec_tokens(),
             proposal_mode = "fixed-block",
             "qwen3 DSpark configured"
         );

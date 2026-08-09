@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use serde_json::Value;
 
 use super::Qwen3xDSparkCheckpointConfig;
@@ -70,6 +72,23 @@ fn test_parses_official_flat_config() {
     assert_eq!(config.rope_theta, 1_000_000.0);
     assert_eq!(config.markov_rank, 256);
     assert_eq!(config.quantization.unwrap().bits, 4);
+}
+
+#[test]
+fn test_resolves_configured_spec_tokens_within_checkpoint_limit() {
+    let config = parse(official_config()).unwrap();
+
+    assert_eq!(config.resolve_num_spec_tokens(None).unwrap().get(), 7);
+    assert_eq!(config.resolve_num_spec_tokens(NonZeroUsize::new(1)).unwrap().get(), 1);
+    assert_eq!(config.resolve_num_spec_tokens(NonZeroUsize::new(4)).unwrap().get(), 4);
+    assert_eq!(config.resolve_num_spec_tokens(NonZeroUsize::new(7)).unwrap().get(), 7);
+    assert!(
+        config
+            .resolve_num_spec_tokens(NonZeroUsize::new(8))
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds Qwen3 DSpark checkpoint block_size=7")
+    );
 }
 
 #[test]

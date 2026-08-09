@@ -752,7 +752,7 @@ meaning.
 For one Main request, Qwen calculates `num_fixed_tokens = q_len - num_spec_tokens`.
 It selects `input_state_version + num_fixed_tokens + num_accepted_tokens`.
 For input state 93, two fixed tokens, and two speculative tokens, accept counts 0, 1, and 2 select states 95, 96, and 97.
-`num_mtp_steps` does not directly change this calculation.
+`num_spec_tokens` does not directly change this calculation.
 
 MTP decode replays K - 1 verified tail tokens in the next Main forward.
 Therefore, `replay_source_state_version = verified_state_version - (K - 1)` for this physical state selection.

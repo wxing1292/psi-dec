@@ -175,6 +175,7 @@ impl Fixture {
             device,
             &mut store,
             &config,
+            config.block_size,
             &bindings.markov,
             &bindings.confidence,
             num_requests,

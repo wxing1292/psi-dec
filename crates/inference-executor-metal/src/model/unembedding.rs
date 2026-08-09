@@ -65,8 +65,8 @@ impl UnembedConfig {
 
 pub struct Unembed {
     config: UnembedConfig,
-    matmul: AffineQuantizedMatmul,
-    weights: UnembedWeights,
+    matmul: Rc<AffineQuantizedMatmul>,
+    weights: Rc<UnembedWeights>,
 }
 
 struct UnembedWeights {
@@ -102,8 +102,8 @@ impl Unembed {
         let weights = UnembedWeights::load(device, store, affine_config, bindings)?;
         let unembed = Self {
             config,
-            matmul: AffineQuantizedMatmul::new(device, affine_config),
-            weights,
+            matmul: Rc::new(AffineQuantizedMatmul::new(device, affine_config)),
+            weights: Rc::new(weights),
         };
         unembed.validate_weights();
         Ok(unembed)
@@ -118,6 +118,20 @@ impl Unembed {
 
     pub fn max_tokens(&self) -> u32 {
         self.config.max_tokens
+    }
+
+    /// Returns a row-capacity view that shares the immutable matmul and weights.
+    pub fn with_max_tokens(&self, max_tokens: u32) -> Self {
+        let config = UnembedConfig {
+            max_tokens,
+            ..self.config
+        };
+        config.validate();
+        Self {
+            config,
+            matmul: Rc::clone(&self.matmul),
+            weights: Rc::clone(&self.weights),
+        }
     }
 
     pub fn replay_topology(&self, num_total_rows: u32) -> AffineQuantizedMatmulKernelKind {
@@ -242,6 +256,8 @@ fn validate_quantized_unembedding(max_tokens: u32, vocab_size: u32, hidden_dim: 
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use half::bf16;
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Device;
@@ -293,6 +309,19 @@ mod tests {
                 "num_active_rows={num_active_rows} num_total_rows={num_total_rows}"
             );
         }
+    }
+
+    #[test]
+    fn test_capacity_view_shares_matmul_and_weights() {
+        let device = Device::system_default();
+        let unembed = test_unembed(&device, test_config(2));
+
+        let expanded = unembed.with_max_tokens(7);
+
+        assert_eq!(unembed.max_tokens(), 2);
+        assert_eq!(expanded.max_tokens(), 7);
+        assert!(Rc::ptr_eq(&unembed.matmul, &expanded.matmul));
+        assert!(Rc::ptr_eq(&unembed.weights, &expanded.weights));
     }
 
     #[test]
@@ -460,12 +489,12 @@ mod tests {
         let affine_config = config.affine_config();
         let unembed = Unembed {
             config,
-            matmul: super::AffineQuantizedMatmul::new(device, affine_config),
-            weights: UnembedWeights {
+            matmul: Rc::new(super::AffineQuantizedMatmul::new(device, affine_config)),
+            weights: Rc::new(UnembedWeights {
                 weight: Buffer::new_zeroed(device, affine_config.weight_bytes()),
                 scales: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
                 biases: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
-            },
+            }),
         };
         unembed.validate_weights();
         unembed
@@ -526,3 +555,4 @@ mod tests {
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }
+use std::rc::Rc;

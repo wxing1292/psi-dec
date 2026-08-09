@@ -9,7 +9,7 @@ impl Qwen35Executor {
                 let decision = &decisions[decision_index];
                 let num_spec_tokens = microbatch.num_spec_tokens(req_index) as usize;
                 assert!(
-                    num_spec_tokens <= self.speculator.num_speculative_tokens(),
+                    num_spec_tokens <= self.speculator.num_spec_tokens(),
                     "qwen3.5 MTP proposal num_spec_tokens exceeds initialized MTP capacity"
                 );
                 let num_fixed_tokens = (flat_end - flat_start)
@@ -52,7 +52,7 @@ impl Qwen35Executor {
                 requests.push(Qwen35MTPRequest {
                     num_tokens: flat_end - flat_start,
                     current_token_ids: Vec::new(),
-                    prefill_token_ids_by_step: (1..=self.speculator.mtp().num_steps)
+                    prefill_token_ids_by_step: (1..=self.speculator.mtp().num_spec_tokens)
                         .map(|lane| microbatch.token_ids_for_lane(req_index, lane).to_vec())
                         .collect(),
                     next_token_id: None,
@@ -446,7 +446,7 @@ impl Qwen35Executor {
         );
         {
             let mtp = self.speculator.mtp_mut();
-            assert!(step_index < mtp.num_steps, "qwen3.5 MTP step index exceeds configured steps");
+            assert!(step_index < mtp.num_spec_tokens, "qwen3.5 MTP step index exceeds configured steps");
             for request in &mut mtp.execution.requests {
                 if request.decision_index.is_some() {
                     let next_token_id = previous_draft_token_ids[sample_index];
@@ -523,8 +523,8 @@ impl Qwen35Executor {
     }
 
     fn submit_mtp_recording(&mut self, recorder: &Qwen35ModelOpsRecorder) -> MetalReplaySubmission {
-        let num_steps = self.speculator.mtp().num_steps;
-        for step_index in 0..num_steps - 1 {
+        let num_spec_tokens = self.speculator.mtp().num_spec_tokens;
+        for step_index in 0..num_spec_tokens - 1 {
             let submission = self.submit_mtp_step(recorder, step_index);
             submission.wait();
             let (draft_token_ids, draft_probs, read_elapsed) = self.read_mtp_step(recorder.num_mtp_sample_rows());
@@ -534,7 +534,7 @@ impl Qwen35Executor {
                 .push_step(&draft_token_ids, &draft_probs, read_elapsed);
             self.prepare_next_mtp_step(recorder, step_index + 1, &draft_token_ids);
         }
-        self.submit_mtp_step(recorder, num_steps - 1)
+        self.submit_mtp_step(recorder, num_spec_tokens - 1)
     }
 
     fn read_mtp_proposal(
@@ -546,7 +546,7 @@ impl Qwen35Executor {
         let mut timing = ModelOutputTiming {
             spec_build_elapsed: recorder.mtp_build_elapsed,
             spec_replay_elapsed: replay_elapsed,
-            spec_passes: self.speculator.mtp().num_steps,
+            spec_passes: self.speculator.mtp().num_spec_tokens,
             ..ModelOutputTiming::default()
         };
         let num_mtp_sample_rows = recorder.num_mtp_sample_rows();
@@ -558,10 +558,10 @@ impl Qwen35Executor {
         let (draft_token_ids, draft_probs, read_elapsed) = self.read_mtp_step(num_mtp_sample_rows);
         let mtp = self.speculator.mtp_mut();
         mtp.execution.push_step(&draft_token_ids, &draft_probs, read_elapsed);
-        assert_eq!(mtp.execution.completed_steps, mtp.num_steps);
+        assert_eq!(mtp.execution.completed_steps, mtp.num_spec_tokens);
         timing.spec_read_elapsed += mtp.execution.read_elapsed;
         if num_mtp_sample_rows > 0 {
-            for step_index in 0..mtp.num_steps {
+            for step_index in 0..mtp.num_spec_tokens {
                 for sample_index in 0..num_mtp_sample_rows {
                     let flat_index = step_index * num_mtp_sample_rows + sample_index;
                     let draft_token = mtp.execution.draft_token_ids[flat_index]

@@ -95,10 +95,10 @@ impl Qwen3Speculator {
         matches!(self, Self::DSpark(_))
     }
 
-    fn block_size(&self) -> usize {
+    fn num_spec_tokens(&self) -> usize {
         match self {
             Self::Vanilla => 0,
-            Self::DSpark(dspark) => dspark.execution.block_size(),
+            Self::DSpark(dspark) => dspark.execution.num_spec_tokens(),
         }
     }
 

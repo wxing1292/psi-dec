@@ -122,6 +122,7 @@ impl Fixture {
                 init_qwen_3_model_with_dspark(
                     model_dir,
                     dspark_model_dir.expect("Qwen3 DSpark benchmark requires a DSpark model directory"),
+                    None,
                     config,
                 )
             },

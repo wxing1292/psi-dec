@@ -109,7 +109,7 @@ struct Qwen35SpeculativeResources {
 
 struct Qwen35MTPSpeculator {
     common: Qwen35SpeculativeResources,
-    num_steps: usize,
+    num_spec_tokens: usize,
     hidden_input: Rc<Buffer>,
     input_gather_flat_indices: Buffer,
     draft_distribution_indices: Buffer,
@@ -130,9 +130,9 @@ struct Qwen35MTPExecution {
 }
 
 impl Qwen35MTPExecution {
-    fn new(max_requests: usize, num_steps: usize) -> Self {
+    fn new(max_requests: usize, num_spec_tokens: usize) -> Self {
         let proposal_capacity = max_requests
-            .checked_mul(num_steps)
+            .checked_mul(num_spec_tokens)
             .expect("qwen3.5 MTP proposal capacity must fit usize");
         Self {
             requests: Vec::with_capacity(max_requests),
@@ -178,18 +178,11 @@ impl Qwen35Speculator {
         matches!(self, Self::DSpark(_))
     }
 
-    fn num_speculative_tokens(&self) -> usize {
+    fn num_spec_tokens(&self) -> usize {
         match self {
             Self::Vanilla => 0,
-            Self::MTP(mtp) => mtp.num_steps,
-            Self::DSpark(dspark) => dspark.execution.block_size(),
-        }
-    }
-
-    fn num_mtp_steps(&self) -> usize {
-        match self {
-            Self::MTP(mtp) => mtp.num_steps,
-            Self::Vanilla | Self::DSpark(_) => 0,
+            Self::MTP(mtp) => mtp.num_spec_tokens,
+            Self::DSpark(dspark) => dspark.execution.num_spec_tokens(),
         }
     }
 
@@ -407,8 +400,12 @@ impl ReplayableModelBatchExecutor for Qwen35Executor {
                 SamplerConfig::from_runtime(&request.sampling_config, seed)
             })
             .collect();
+        let num_spec_tokens = match &self.speculator {
+            Qwen35Speculator::MTP(mtp) => mtp.num_spec_tokens,
+            Qwen35Speculator::Vanilla | Qwen35Speculator::DSpark(_) => 0,
+        };
         let model_batch_request =
-            Qwen35ModelBatchRequest::from_core_batch(core_batch_req, self.speculator.num_mtp_steps(), sampler_configs);
+            Qwen35ModelBatchRequest::from_core_batch(core_batch_req, num_spec_tokens, sampler_configs);
         let microbatch = model_batch_request.microbatch();
         trace::qwen35_state(|| {
             format!(

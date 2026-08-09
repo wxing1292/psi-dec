@@ -682,7 +682,7 @@ Therefore, submissions reuse their buffers without per-layer allocation.
 
 Qwen3 DSpark owns `DSparkBlockScratch`.
 This scratch contains proposal-local Q/K/V and both attention paths' partial outputs.
-Its partial capacity is `next_power_of_two(2 * max_requests * block_size)`.
+Its partial capacity is `next_power_of_two(2 * max_requests * num_spec_tokens)`.
 It does not depend on `max_position_embeddings`.
 `DSparkGQACapacity` owns this Metal resource rule.
 The backend-neutral `DSparkBlockCapacity` contains only request and block geometry.

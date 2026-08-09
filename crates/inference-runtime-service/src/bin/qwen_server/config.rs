@@ -20,7 +20,10 @@ const MAX_QUEUED_REQUESTS: usize = 32;
 #[derive(Debug, Eq, PartialEq)]
 pub enum Qwen3ModelMode {
     Vanilla,
-    DSpark { model_dir: PathBuf },
+    DSpark {
+        model_dir: PathBuf,
+        num_spec_tokens: Option<NonZeroUsize>,
+    },
 }
 
 #[derive(Debug)]
@@ -37,6 +40,11 @@ pub struct Qwen3Config {
 
 impl Qwen3Config {
     pub fn from_args(args: Qwen3Args) -> Result<Self> {
+        if args.num_spec_tokens.is_some() && args.hf_dspark_model_dir.is_none() {
+            return Err(log_info_invalid_argument!(
+                "--hf-dspark-model-dir is required when --num-spec-tokens is set"
+            ));
+        }
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
                 "--max-requests must fit the u32 request-slot domain"
@@ -55,7 +63,12 @@ impl Qwen3Config {
         }
 
         let model_mode = match args.hf_dspark_model_dir {
-            Some(model_dir) => Qwen3ModelMode::DSpark { model_dir },
+            Some(model_dir) => {
+                Qwen3ModelMode::DSpark {
+                    model_dir,
+                    num_spec_tokens: args.num_spec_tokens,
+                }
+            },
             None => Qwen3ModelMode::Vanilla,
         };
         Ok(Self {
@@ -124,18 +137,24 @@ pub enum Qwen35ModelMode {
     Vanilla,
     MTP {
         model_dir: PathBuf,
-        num_steps: NonZeroUsize,
+        num_spec_tokens: NonZeroUsize,
     },
     DSpark {
         model_dir: PathBuf,
+        num_spec_tokens: Option<NonZeroUsize>,
     },
 }
 
 impl Qwen35ModelMode {
-    pub fn num_mtp_steps(&self) -> usize {
+    pub fn num_cache_lanes(&self) -> usize {
         match self {
-            Self::MTP { num_steps, .. } => num_steps.get(),
-            Self::Vanilla | Self::DSpark { .. } => 0,
+            Self::MTP { num_spec_tokens, .. } => {
+                num_spec_tokens
+                    .get()
+                    .checked_add(1)
+                    .expect("validated Qwen3.5 MTP cache-lane count must fit usize")
+            },
+            Self::Vanilla | Self::DSpark { .. } => 1,
         }
     }
 }
@@ -154,33 +173,24 @@ pub struct Qwen35Config {
 
 impl Qwen35Config {
     pub fn from_args(args: Qwen35Args) -> Result<Self> {
-        if args.hf_dspark_model_dir.is_some() && (args.hf_mtp_model_dir.is_some() || args.num_mtp_steps.is_some()) {
+        if args.hf_dspark_model_dir.is_some() && args.hf_mtp_model_dir.is_some() {
             return Err(log_info_invalid_argument!(
                 "--hf-dspark-model-dir is mutually exclusive with Qwen3.5 MTP"
             ));
         }
-        if args.num_mtp_steps.is_some() && args.hf_mtp_model_dir.is_none() {
+        if args.num_spec_tokens.is_some() && args.hf_mtp_model_dir.is_none() && args.hf_dspark_model_dir.is_none() {
             return Err(log_info_invalid_argument!(
-                "--hf-mtp-model-dir is required when --num-mtp-steps is set"
+                "--hf-mtp-model-dir or --hf-dspark-model-dir is required when --num-spec-tokens is set"
             ));
         }
-        let num_mtp_steps = args
+        let num_mtp_tokens = args
             .hf_mtp_model_dir
             .as_ref()
-            .map(|_| args.num_mtp_steps.unwrap_or(NonZeroUsize::MIN));
-        let num_model_lanes = num_mtp_steps
-            .map_or(Some(1), |num_steps| num_steps.get().checked_add(1))
-            .ok_or_else(|| log_info_invalid_argument!("--num-mtp-steps is too large"))?;
+            .map(|_| args.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
+        validate_mtp_num_spec_tokens(num_mtp_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
                 "--max-requests must fit the u32 request-slot domain"
-            ));
-        }
-        if num_model_lanes > args.max_tokens_per_request.get() {
-            return Err(log_info_invalid_argument!(
-                "--max-tokens-per-request={} cannot schedule {} target/MTP tokens",
-                args.max_tokens_per_request,
-                num_model_lanes
             ));
         }
         if i32::try_from(args.max_tokens.get()).is_err() {
@@ -195,9 +205,19 @@ impl Qwen35Config {
             ));
         }
 
-        let model_mode = match (args.hf_mtp_model_dir, args.hf_dspark_model_dir, num_mtp_steps) {
-            (None, Some(model_dir), None) => Qwen35ModelMode::DSpark { model_dir },
-            (Some(model_dir), None, Some(num_steps)) => Qwen35ModelMode::MTP { model_dir, num_steps },
+        let model_mode = match (args.hf_mtp_model_dir, args.hf_dspark_model_dir, num_mtp_tokens) {
+            (None, Some(model_dir), None) => {
+                Qwen35ModelMode::DSpark {
+                    model_dir,
+                    num_spec_tokens: args.num_spec_tokens,
+                }
+            },
+            (Some(model_dir), None, Some(num_spec_tokens)) => {
+                Qwen35ModelMode::MTP {
+                    model_dir,
+                    num_spec_tokens,
+                }
+            },
             (None, None, None) => Qwen35ModelMode::Vanilla,
             _ => unreachable!("validated Qwen3.5 model mode must be complete and exclusive"),
         };
@@ -244,8 +264,8 @@ impl Qwen35Config {
         self.telemetry
     }
 
-    pub fn num_mtp_steps(&self) -> usize {
-        self.model_mode.num_mtp_steps()
+    pub fn num_cache_lanes(&self) -> usize {
+        self.model_mode.num_cache_lanes()
     }
 
     pub fn num_cache_pages(&self) -> usize {
@@ -263,6 +283,26 @@ impl Qwen35Config {
     pub fn scheduler_config(&self) -> SchedulerConfig {
         self.scheduler_config
     }
+}
+
+fn validate_mtp_num_spec_tokens(
+    num_spec_tokens: Option<NonZeroUsize>,
+    max_tokens_per_request: NonZeroUsize,
+) -> Result<()> {
+    let Some(num_spec_tokens) = num_spec_tokens else {
+        return Ok(());
+    };
+    let num_forward_tokens = num_spec_tokens
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| log_info_invalid_argument!("--num-spec-tokens is too large"))?;
+    if num_forward_tokens > max_tokens_per_request.get() {
+        return Err(log_info_invalid_argument!(
+            "--max-tokens-per-request={} cannot schedule {num_forward_tokens} target/speculative tokens",
+            max_tokens_per_request
+        ));
+    }
+    Ok(())
 }
 
 impl From<QwenProfileMode> for ProfileMode {

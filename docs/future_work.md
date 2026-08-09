@@ -147,7 +147,7 @@ component path as the design.
   DSpark attention/state owners. Do not create a parallel `qwen/v3_5/dspark` implementation.
 - Use the Qwen3 DSpark confidence output to add dynamic proposal lengths.
   Keep global proposal ranking and verification-budget allocation in runtime scheduling.
-  Keep the executor output fixed at `block_size` until the scheduler owns this cross-request policy.
+  Keep each executor run fixed at its configured `num_spec_tokens` until the scheduler owns this cross-request policy.
 - Investigate strict one-row and multi-row Qwen3 Main numerical parity.
   The 2026-07-29 greedy acceptance audit found one deterministic output divergence in four prompts.
   At the first divergence, sparse rejection accepted zero draft tokens.

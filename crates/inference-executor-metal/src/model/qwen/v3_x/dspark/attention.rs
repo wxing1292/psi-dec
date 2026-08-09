@@ -124,11 +124,12 @@ impl Qwen3xDSparkAttention {
 
 pub fn qwen3x_dspark_gqa_core_and_metal(
     config: &Qwen3xDSparkConfig,
+    num_spec_tokens: usize,
     dspark_layer_index: usize,
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
 ) -> Result<(UngatedDSparkGQACore, GQAMetalConfig), ModelExecutorError> {
-    let core = qwen3x_dspark_gqa_core(config, dspark_layer_index);
+    let core = qwen3x_dspark_gqa_core(config, num_spec_tokens, dspark_layer_index);
     let metal = qwen3x_dspark_gqa_metal_config(config, bindings, page_bytes)?;
     assert!(
         metal.num_ungated_tokens_per_page(&core.attention) > 0,
@@ -137,7 +138,19 @@ pub fn qwen3x_dspark_gqa_core_and_metal(
     Ok((core, metal))
 }
 
-pub fn qwen3x_dspark_gqa_core(config: &Qwen3xDSparkConfig, dspark_layer_index: usize) -> UngatedDSparkGQACore {
+pub fn qwen3x_dspark_gqa_core(
+    config: &Qwen3xDSparkConfig,
+    num_spec_tokens: usize,
+    dspark_layer_index: usize,
+) -> UngatedDSparkGQACore {
+    assert!(
+        num_spec_tokens > 0,
+        "Qwen3x DSpark attention requires speculative tokens"
+    );
+    assert!(
+        num_spec_tokens <= config.block_size,
+        "Qwen3x DSpark attention proposal length must not exceed the checkpoint block_size"
+    );
     assert!(
         dspark_layer_index < config.num_hidden_layers,
         "Qwen3x DSpark attention layer index must be within the model"
@@ -151,7 +164,7 @@ pub fn qwen3x_dspark_gqa_core(config: &Qwen3xDSparkConfig, dspark_layer_index: u
         (config.head_dim as f32).sqrt().recip(),
     );
     attention.validate();
-    UngatedDSparkGQACore::new(attention, config.block_size)
+    UngatedDSparkGQACore::new(attention, num_spec_tokens)
 }
 
 pub fn qwen3x_dspark_gqa_compute_config(
@@ -215,7 +228,8 @@ mod tests {
         let config = config();
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
-        let (core, metal) = qwen3x_dspark_gqa_core_and_metal(&config, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
+        let (core, metal) =
+            qwen3x_dspark_gqa_core_and_metal(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
 
         assert_eq!(core.block_size, 7);
         assert_eq!(core.attention.model_layer_index, 1);
@@ -224,6 +238,22 @@ mod tests {
         assert_eq!(core.attention.num_kv_heads, 1);
         assert_eq!(metal.group_size, 32);
         assert_eq!(metal.bits, 4);
+    }
+
+    #[test]
+    fn test_gqa_uses_configured_spec_tokens_below_checkpoint_limit() {
+        let config = config();
+        let core = qwen3x_dspark_gqa_core(&config, 3, 0);
+
+        assert_eq!(config.block_size, 7);
+        assert_eq!(core.block_size, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not exceed the checkpoint block_size")]
+    fn test_gqa_rejects_configured_spec_tokens_above_checkpoint_limit() {
+        let config = config();
+        let _ = qwen3x_dspark_gqa_core(&config, 8, 0);
     }
 
     #[test]
@@ -242,9 +272,9 @@ mod tests {
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
         let (_, layer_0_metal) =
-            qwen3x_dspark_gqa_core_and_metal(&config, 0, &bindings.layers[0].gqa, 32 * 1024).unwrap();
+            qwen3x_dspark_gqa_core_and_metal(&config, 7, 0, &bindings.layers[0].gqa, 32 * 1024).unwrap();
         let (_, layer_1_metal) =
-            qwen3x_dspark_gqa_core_and_metal(&config, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
+            qwen3x_dspark_gqa_core_and_metal(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
 
         assert_eq!(layer_0_metal.bits, 4);
         assert_eq!(layer_1_metal.bits, 8);
@@ -285,7 +315,7 @@ mod tests {
         );
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
-        let error = qwen3x_dspark_gqa_core_and_metal(&config, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap_err();
+        let error = qwen3x_dspark_gqa_core_and_metal(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap_err();
 
         assert!(error.to_string().contains("GQA requires one affine layout"));
     }

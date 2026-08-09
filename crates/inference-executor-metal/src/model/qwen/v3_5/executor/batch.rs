@@ -20,7 +20,7 @@ impl Qwen35Executor {
                 self.config.max_tokens_per_request
             );
             let num_spec_tokens = request.decoder_query_tokens.num_spec_tokens();
-            let max_spec_tokens = self.num_speculative_tokens();
+            let max_spec_tokens = self.num_spec_tokens();
             if max_spec_tokens == 0 {
                 assert_eq!(
                     num_spec_tokens, 0,
@@ -87,7 +87,7 @@ impl Qwen35Executor {
                 vec![
                     usize::try_from(layout.num_page_ids_per_block)
                         .expect("qwen3.5 MTP GQA page IDs per block must fit usize");
-                    mtp.num_steps
+                    mtp.num_spec_tokens
                 ]
             },
         }

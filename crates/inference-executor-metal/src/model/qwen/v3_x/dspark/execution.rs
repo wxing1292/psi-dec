@@ -49,7 +49,7 @@ pub struct Qwen3xDSparkExecution {
     unembed_hidden: Buffer,
     logits: Buffer,
     page_table_layout: GQAPageTableLayout,
-    block_size: usize,
+    num_spec_tokens: usize,
     mask_token_id: i32,
 }
 
@@ -88,11 +88,11 @@ impl Qwen3xDSparkExecution {
     ) -> Self {
         assert!(max_requests > 0, "Qwen3x DSpark execution requires requests");
         assert!(
-            loaded.block_size > 0,
-            "Qwen3x DSpark execution requires a positive block size"
+            loaded.num_spec_tokens > 0,
+            "Qwen3x DSpark execution requires speculative tokens"
         );
         let max_block_tokens = max_requests
-            .checked_mul(loaded.block_size)
+            .checked_mul(loaded.num_spec_tokens)
             .expect("Qwen3x DSpark block token capacity must fit usize");
         let hidden_bytes = max_block_tokens
             .checked_mul(unembed_config.hidden_dim as usize)
@@ -116,7 +116,7 @@ impl Qwen3xDSparkExecution {
                 "Qwen3x DSpark GatherUnembed",
                 Qwen3xDSparkGatherUnembed::new(
                     device,
-                    loaded.block_size,
+                    loaded.num_spec_tokens,
                     max_requests,
                     unembed_config.hidden_dim,
                     loaded.unembed,
@@ -128,13 +128,13 @@ impl Qwen3xDSparkExecution {
             unembed_hidden: Buffer::new_zeroed(device, hidden_bytes),
             logits: Buffer::new_zeroed(device, dspark_unembed_config.logits_bytes()),
             page_table_layout: loaded.page_table_layout,
-            block_size: loaded.block_size,
+            num_spec_tokens: loaded.num_spec_tokens,
             mask_token_id: loaded.mask_token_id,
         }
     }
 
-    pub fn block_size(&self) -> usize {
-        self.block_size
+    pub fn num_spec_tokens(&self) -> usize {
+        self.num_spec_tokens
     }
 
     pub fn num_runtime_page_ids_per_block(&self) -> usize {
@@ -230,7 +230,7 @@ impl Qwen3xDSparkExecution {
         distribution_store: &SpecProbsStore,
         recording: &mut Qwen3xDSparkRecording,
     ) -> Rc<Buffer> {
-        let block = DSparkBlockMetadata::new(&proposal.req_slots, proposal.anchor_positions, self.block_size);
+        let block = DSparkBlockMetadata::new(&proposal.req_slots, proposal.anchor_positions, self.num_spec_tokens);
         self.gqa_state.prepare_block(&block);
         let mut block_token_ids = Vec::with_capacity(block.num_tokens());
         for &anchor_token_id in proposal.anchor_token_ids {
@@ -239,7 +239,7 @@ impl Qwen3xDSparkExecution {
                     .try_into()
                     .expect("Qwen3x DSpark anchor token ID must fit i32"),
             );
-            block_token_ids.extend(std::iter::repeat_n(self.mask_token_id, self.block_size - 1));
+            block_token_ids.extend(std::iter::repeat_n(self.mask_token_id, self.num_spec_tokens - 1));
         }
         token_ids.write_typed(0, &block_token_ids);
         let markov_replay_shape = self.sampling.component().prepare(

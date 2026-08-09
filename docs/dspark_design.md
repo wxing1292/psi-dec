@@ -28,9 +28,13 @@ It supports an ungated GQA backbone and a `vanilla` Markov head.
 It requires the official Markov-conditioned confidence head.
 Qwen3.5 MTP and DSpark are mutually exclusive.
 
-The first milestone has these limits:
+At startup, `--num-spec-tokens N` selects one fixed proposal length.
+`N` must not exceed the checkpoint `block_size`.
+When the option is absent, the executor uses the checkpoint `block_size`.
 
-- It produces exactly `block_size` proposals for each active decode request.
+The current implementation has these limits:
+
+- It produces exactly `N` proposals for each active decode request.
 - It executes the required official confidence head.
 - It returns one confidence value for each proposal token.
 - It does not schedule variable proposal lengths.
@@ -297,10 +301,10 @@ One block-bidirectional map Task owns one Q token and one Q head.
 The backend fixes this Task to one 32-thread SIMDgroup.
 For the official `head_dim = 128`, each thread keeps four F32 Q values.
 The logical Q register payload is 16 bytes per thread.
-The threadblock keeps seven F32 logits in 28 bytes of shared memory.
+The threadblock keeps `N` F32 logits in `4 * N` bytes of shared memory.
 It does not keep a shared reduction array.
 
-This geometry preserves `block_size * num_q_heads` independent threadblocks for one request.
+This geometry preserves `N * num_q_heads` independent threadblocks for one request.
 The 32 lanes cooperate on each 128-value Q/K dot product.
 Each lane then computes four output dimensions.
 Larger threadblocks add SIMDgroups without independent work at this Task boundary.
@@ -348,12 +352,12 @@ It contains local Q/K/V, normalized Q/K, attention partials, and reduced output.
 Define:
 
 ```text
-T_capacity = max_requests * block_size
+T_capacity = max_requests * num_spec_tokens
 P_capacity = next_power_of_two(2 * T_capacity)
 ```
 
 `DSparkBlockCapacity` is backend-neutral.
-It contains `max_requests`, `block_size`, and `max_tokens`.
+It contains `max_requests`, the selected proposal length as `block_size`, and `max_tokens`.
 `DSparkGQACapacity` is Metal-specific.
 It derives `P_capacity` for metadata and partial scratch.
 The runtime core and executor core do not contain Metal `TaskTemplate` capacity.
@@ -378,9 +382,18 @@ Qwen3.5 GDN also allocates candidate recurrent states for every possible accepte
 The service passes the same capacity to the executor, runtime, and scheduler.
 This rule bounds the persistent GDN arena without changing buffer, scratch, replay, or residency reuse.
 
-The shared DSpark loader validates `block_size + 1 <= max_tokens_per_request`.
-The extra token is the Main target token that precedes one complete proposal suffix.
-Both model executors use this same forward-capacity contract.
+The shared DSpark loader validates these limits:
+
+```text
+1 <= num_spec_tokens <= checkpoint block_size
+```
+
+`num_spec_tokens` controls the DSpark proposal width. It does not set the Main
+per-request verification budget. The scheduler may send only a proposal prefix
+to Main. DSpark derives its own `max_requests * num_spec_tokens` row capacity.
+When DSpark reuses Main embedding or unembedding weights, it creates a
+DSpark-capacity view over the same immutable kernel and weights. It does not use
+the Main scheduler row capacity.
 
 ## Sparse distribution identity
 
@@ -389,7 +402,7 @@ Their identity is request-slot based:
 
 ```text
 draft_distribution_index =
-    req_slot * block_size
+    req_slot * num_spec_tokens
   + proposal_position
 ```
 

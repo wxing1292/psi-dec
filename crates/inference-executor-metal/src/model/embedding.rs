@@ -52,8 +52,8 @@ impl EmbedConfig {
 
 pub struct Embed {
     config: EmbedConfig,
-    kernel: QuantizedEmbeddingKernel,
-    weights: EmbedWeights,
+    kernel: Rc<QuantizedEmbeddingKernel>,
+    weights: Rc<EmbedWeights>,
 }
 
 struct EmbedWeights {
@@ -75,6 +75,20 @@ impl Embed {
         self.config.max_tokens
     }
 
+    /// Returns a token-capacity view that shares the immutable kernel and weights.
+    pub fn with_max_tokens(&self, max_tokens: u32) -> Self {
+        let config = EmbedConfig {
+            max_tokens,
+            ..self.config
+        };
+        config.validate();
+        Self {
+            config,
+            kernel: Rc::clone(&self.kernel),
+            weights: Rc::clone(&self.weights),
+        }
+    }
+
     fn validate_input(&self, input: EmbedInput<'_>) {
         self.validate_num_tokens(input.num_tokens);
     }
@@ -89,8 +103,8 @@ impl Embed {
         let weights = EmbedWeights::load(device, store, config.config(), bindings)?;
         let embedding = Self {
             config,
-            kernel: QuantizedEmbeddingKernel::new(device, config.config()),
-            weights,
+            kernel: Rc::new(QuantizedEmbeddingKernel::new(device, config.config())),
+            weights: Rc::new(weights),
         };
         embedding.validate_weights();
         Ok(embedding)
@@ -219,3 +233,56 @@ fn validate_quantized_embedding(max_tokens: u32, vocab_size: u32, hidden_dim: u3
     assert!(matches!(bits, 2 | 3 | 4 | 6 | 8));
     assert_eq!(hidden_dim % group_size, 0);
 }
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use inference_backend_metal::metal::Buffer;
+    use inference_backend_metal::metal::Device;
+
+    use super::Dtype;
+    use super::Embed;
+    use super::EmbedConfig;
+    use super::EmbedWeights;
+    use super::QuantizedEmbeddingKernel;
+
+    #[test]
+    fn test_capacity_view_shares_kernel_and_weights() {
+        let device = Device::system_default();
+        let config = EmbedConfig {
+            max_tokens: 2,
+            vocab_size: 32,
+            hidden_dim: 32,
+            group_size: 32,
+            bits: 8,
+            scale_bias_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+        };
+        let kernel_config = config.config();
+        let embed = Embed {
+            config,
+            kernel: Rc::new(QuantizedEmbeddingKernel::new(&device, kernel_config)),
+            weights: Rc::new(EmbedWeights {
+                weight: Buffer::new_zeroed(&device, kernel_config.weight_bytes()),
+                scales: Buffer::new_zeroed(
+                    &device,
+                    kernel_config.num_affine_params() * config.scale_bias_dtype.item_size(),
+                ),
+                biases: Buffer::new_zeroed(
+                    &device,
+                    kernel_config.num_affine_params() * config.scale_bias_dtype.item_size(),
+                ),
+            }),
+        };
+        embed.validate_weights();
+
+        let expanded = embed.with_max_tokens(7);
+
+        assert_eq!(embed.max_tokens(), 2);
+        assert_eq!(expanded.max_tokens(), 7);
+        assert!(Rc::ptr_eq(&embed.kernel, &expanded.kernel));
+        assert!(Rc::ptr_eq(&embed.weights, &expanded.weights));
+    }
+}
+use std::rc::Rc;

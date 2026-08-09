@@ -58,6 +58,7 @@ impl Qwen3xDSparkLayer {
         device: &Device,
         store: &mut SafeTensorStore,
         config: &Qwen3xDSparkConfig,
+        num_spec_tokens: usize,
         dspark_layer_index: usize,
         page_bytes: usize,
         bindings: Qwen3xDSparkLayerWeightBindings,
@@ -72,7 +73,7 @@ impl Qwen3xDSparkLayer {
             mlp,
         } = bindings;
         let (attention_core, attention_metal) =
-            qwen3x_dspark_gqa_core_and_metal(config, dspark_layer_index, &gqa, page_bytes)?;
+            qwen3x_dspark_gqa_core_and_metal(config, num_spec_tokens, dspark_layer_index, &gqa, page_bytes)?;
         let (mlp_core, mlp_metal) = qwen3x_dspark_dense_mlp_core_and_metal(config, dspark_layer_index, &mlp)?;
         let hidden_dim = attention_core.attention.hidden_dim;
         assert_eq!(

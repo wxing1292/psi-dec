@@ -77,12 +77,12 @@ impl Qwen35Microbatch {
     }
 
     pub fn from_requests(requests: &[DeviceRequest], sampler_configs: Vec<SamplerConfig>) -> Self {
-        Self::from_requests_with_mtp_steps(requests, 0, sampler_configs)
+        Self::from_requests_with_spec_tokens(requests, 0, sampler_configs)
     }
 
-    pub fn from_requests_with_mtp_steps(
+    pub fn from_requests_with_spec_tokens(
         requests: &[DeviceRequest],
-        num_mtp_steps: usize,
+        num_spec_tokens: usize,
         sampler_configs: Vec<SamplerConfig>,
     ) -> Self {
         assert_eq!(
@@ -94,7 +94,7 @@ impl Qwen35Microbatch {
         let mut req_slots = Vec::with_capacity(requests.len());
         let mut block_indices = Vec::with_capacity(requests.len());
         let mut token_indices = Vec::with_capacity(requests.len());
-        let num_lanes = num_mtp_steps
+        let num_lanes = num_spec_tokens
             .checked_add(1)
             .expect("qwen3.5 MTP lane count must fit usize");
         let cu_capacity = requests
@@ -150,7 +150,7 @@ impl Qwen35Microbatch {
                 .expect("qwen3.5 Main output suffix must fit q_len");
             flat_sample_mask.extend((0..q_len).map(|token_offset| token_offset >= first_main_output_offset));
 
-            for lane in 0..=num_mtp_steps {
+            for lane in 0..=num_spec_tokens {
                 let needs_runtime_lane =
                     lane == 0 || matches!(request.decoder_query_tokens, QueryTokens::Prefill { .. });
                 let token_ids: Vec<i32> = if needs_runtime_lane {
@@ -200,7 +200,7 @@ impl Qwen35Microbatch {
                 QueryTokens::Decode { .. } => {
                     verified_start_state_version
                         .checked_sub(
-                            u32::try_from(num_mtp_steps.saturating_sub(1))
+                            u32::try_from(num_spec_tokens.saturating_sub(1))
                                 .expect("qwen3.5 MTP replay token count must fit u32"),
                         )
                         .expect("qwen3.5 decode fixed prefix must cover its MTP replay rows")
@@ -238,7 +238,7 @@ impl Qwen35Microbatch {
             batch.cu_tokens(),
             batch.gdn_state_txns(),
             batch.flat_sample_mask(),
-            num_mtp_steps.saturating_sub(1),
+            num_spec_tokens.saturating_sub(1),
         );
         batch
     }
@@ -342,14 +342,14 @@ pub struct Qwen35ModelBatchRequest {
 impl Qwen35ModelBatchRequest {
     pub fn from_core_batch(
         core_batch_req: &BatchDeviceRequest,
-        num_mtp_steps: usize,
+        num_spec_tokens: usize,
         sampler_configs: Vec<SamplerConfig>,
     ) -> Self {
         Self {
             compute_seq: core_batch_req.seq,
-            microbatch: Qwen35Microbatch::from_requests_with_mtp_steps(
+            microbatch: Qwen35Microbatch::from_requests_with_spec_tokens(
                 &core_batch_req.dev_reqs,
-                num_mtp_steps,
+                num_spec_tokens,
                 sampler_configs,
             ),
         }
@@ -818,7 +818,7 @@ mod tests {
             2,
         )];
 
-        let batch = Qwen35Microbatch::from_requests_with_mtp_steps(&requests, 2, vec![SamplerConfig::default()]);
+        let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
 
         assert_eq!(batch.token_ids_for_lane(0, 0), &[100, 101, 102]);
         assert_eq!(batch.token_ids_for_lane(0, 1), &[101, 102, 103]);
@@ -839,7 +839,7 @@ mod tests {
             2,
         )];
 
-        let batch = Qwen35Microbatch::from_requests_with_mtp_steps(&requests, 2, vec![SamplerConfig::default()]);
+        let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
 
         assert_eq!(batch.token_ids_for_lane(0, 0), &[100]);
         assert!(batch.token_ids_for_lane(0, 1).is_empty());
@@ -860,7 +860,7 @@ mod tests {
             4,
         )];
 
-        let batch = Qwen35Microbatch::from_requests_with_mtp_steps(&requests, 2, vec![SamplerConfig::default()]);
+        let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
         let txn = batch.gdn_state_txns()[0];
 
         assert_eq!(txn.start_state_version(), 10);
@@ -883,7 +883,7 @@ mod tests {
             4,
         )];
 
-        let batch = Qwen35Microbatch::from_requests_with_mtp_steps(&requests, 2, vec![SamplerConfig::default()]);
+        let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
         let txn = batch.gdn_state_txns()[0];
 
         assert_eq!(txn.start_state_version(), 10);
@@ -908,7 +908,7 @@ mod tests {
             4,
         )];
 
-        let batch = Qwen35Microbatch::from_requests_with_mtp_steps(&requests, 2, vec![SamplerConfig::default()]);
+        let batch = Qwen35Microbatch::from_requests_with_spec_tokens(&requests, 2, vec![SamplerConfig::default()]);
         let decision = Qwen35DecodeDecision {
             sampled_token: 99,
             sampled_prob: 0.2,
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn test_verified_state_versions_include_fixed_and_accepted_tokens() {
-        let request = Qwen35Microbatch::from_requests_with_mtp_steps(
+        let request = Qwen35Microbatch::from_requests_with_spec_tokens(
             &[device_request(
                 10,
                 0,

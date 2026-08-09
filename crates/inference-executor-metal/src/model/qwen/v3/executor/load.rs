@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -208,6 +209,7 @@ enum Qwen3InitMode<'a> {
     DSpark {
         model_dir: &'a Path,
         config: Box<Qwen3xDSparkConfig>,
+        num_spec_tokens: NonZeroUsize,
     },
 }
 
@@ -226,15 +228,18 @@ pub fn init_qwen_3_model(
 pub fn init_qwen_3_model_with_dspark(
     model_dir: impl AsRef<Path>,
     dspark_model_dir: impl AsRef<Path>,
+    requested_num_spec_tokens: Option<NonZeroUsize>,
     config: Qwen3ExecutorConfig,
 ) -> Result<Qwen3Executor, ModelExecutorError> {
     let dspark_model_dir = dspark_model_dir.as_ref();
     let dspark_config = init_qwen3x_dspark_config(dspark_model_dir)?;
+    let num_spec_tokens = dspark_config.resolve_num_spec_tokens(requested_num_spec_tokens)?;
     init_qwen_3_model_inner(
         model_dir.as_ref(),
         Qwen3InitMode::DSpark {
             model_dir: dspark_model_dir,
             config: Box::new(dspark_config),
+            num_spec_tokens,
         },
         config,
     )
@@ -346,17 +351,18 @@ fn init_qwen_3_model_inner(
         Qwen3InitMode::DSpark {
             model_dir: dspark_model_dir,
             config: dspark_config,
+            num_spec_tokens,
         } => {
             Qwen3SpecLoad::DSpark(Box::new(load_qwen3x_dspark(
                 &device,
                 dspark_model_dir,
                 dspark_config,
                 Qwen3xDSparkLoadConfig {
+                    num_spec_tokens: *num_spec_tokens,
                     page_size_bytes: QWEN3_PAGE_SIZE_BYTES,
                     max_position_embeddings: text.max_position_embeddings,
                     max_requests: config.max_requests,
                     max_tokens: config.max_tokens,
-                    max_tokens_per_request: config.max_tokens_per_request,
                     num_cache_pages: config.num_cache_pages,
                     num_tokens_per_block: config.num_tokens_per_block,
                 },
@@ -390,19 +396,19 @@ fn init_qwen_3_model_inner(
         Qwen3SpecLoad::Vanilla => (Qwen3Speculator::Vanilla, 0),
         Qwen3SpecLoad::DSpark(loaded) => {
             let execution = Qwen3xDSparkExecution::new(&device, *loaded, config.max_requests, unembed_config);
-            let block_size = execution.block_size();
+            let num_spec_tokens = execution.num_spec_tokens();
             let num_page_ids_per_block = execution.num_runtime_page_ids_per_block();
             let max_target_distributions = config
                 .max_requests
                 .checked_mul(
-                    block_size
+                    num_spec_tokens
                         .checked_add(1)
                         .expect("Qwen3 target distributions per request must fit usize"),
                 )
                 .expect("Qwen3 target distribution capacity must fit usize");
             let rejector = Rc::new(RejectionSampler::new(
                 &device,
-                block_size,
+                num_spec_tokens,
                 config.max_requests,
                 sampler_bounds.top_k,
             ));
@@ -413,7 +419,7 @@ fn init_qwen_3_model_inner(
                         "qwen3 rejection sampling",
                         RejectionSampling::new(Rc::clone(&sampler), rejector),
                     ),
-                    spec_probs: SpecProbsStore::new(&device, block_size, config.max_requests, MAX_TOP_K),
+                    spec_probs: SpecProbsStore::new(&device, num_spec_tokens, config.max_requests, MAX_TOP_K),
                     target_distribution_indices: Buffer::from_slice(
                         &device,
                         &compact_target_distribution_indices(max_target_distributions),

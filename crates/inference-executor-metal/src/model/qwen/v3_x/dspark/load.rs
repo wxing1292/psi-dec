@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -25,11 +26,11 @@ use crate::model::unembedding::UnembedConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3xDSparkLoadConfig {
+    pub num_spec_tokens: NonZeroUsize,
     pub page_size_bytes: usize,
     pub max_position_embeddings: usize,
     pub max_requests: usize,
     pub max_tokens: usize,
-    pub max_tokens_per_request: usize,
     pub num_cache_pages: usize,
     pub num_tokens_per_block: usize,
 }
@@ -41,7 +42,7 @@ pub struct Qwen3xDSparkLoaded {
     pub embed: Rc<Embed>,
     pub unembed: Rc<Unembed>,
     pub markov: Qwen3xDSparkMarkov,
-    pub block_size: usize,
+    pub num_spec_tokens: usize,
     pub mask_token_id: i32,
 }
 
@@ -54,7 +55,7 @@ pub fn load_qwen3x_dspark(
     main_unembed: Rc<Unembed>,
     sampler_bounds: TopKSamplingBounds,
 ) -> Result<Qwen3xDSparkLoaded, ModelExecutorError> {
-    validate_forward_capacity(config.block_size, load_config.max_tokens_per_request)?;
+    let num_spec_tokens = config.resolve_num_spec_tokens(Some(load_config.num_spec_tokens))?.get();
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
     let Qwen3xDSparkWeightBindings {
         embed: embed_bindings,
@@ -65,7 +66,7 @@ pub fn load_qwen3x_dspark(
         markov: markov_bindings,
         confidence: confidence_bindings,
     } = resolve_qwen3x_dspark_weight_bindings(config, store.index().tensor_names())?;
-    let attention_core = qwen3x_dspark_gqa_core(config, 0);
+    let attention_core = qwen3x_dspark_gqa_core(config, num_spec_tokens, 0);
     let attention_compute_config = qwen3x_dspark_gqa_compute_config(config, load_config.page_size_bytes)?;
     let tokens_per_page = attention_compute_config.num_tokens_per_page() as usize;
     let page_ids_per_block = num_page_ids_per_block(load_config.num_tokens_per_block, tokens_per_page);
@@ -88,14 +89,7 @@ pub fn load_qwen3x_dspark(
             .try_into()
             .expect("Qwen3x DSpark pages per block must fit u32"),
     };
-    let capacity = DSparkBlockCapacity::new(load_config.max_requests, config.block_size);
-    if capacity.max_tokens > load_config.max_tokens {
-        return Err(ModelExecutorError::custom(format!(
-            "Qwen3x DSpark proposal capacity={} exceeds executor max_tokens={}; increase --max-tokens or reduce the \
-             executor request capacity",
-            capacity.max_tokens, load_config.max_tokens
-        )));
-    }
+    let capacity = DSparkBlockCapacity::new(load_config.max_requests, num_spec_tokens);
     let gqa_state = UngatedDSparkGQAState::new(
         device,
         attention_core,
@@ -136,7 +130,13 @@ pub fn load_qwen3x_dspark(
             embed_bindings,
         )?)
     } else {
-        main_embed
+        Rc::new(
+            main_embed.with_max_tokens(
+                max_block_tokens
+                    .try_into()
+                    .expect("Qwen3x DSpark shared embed rows must fit u32"),
+            ),
+        )
     };
     let unembed = if let Some(unembed_bindings) = unembed_bindings {
         let resolved = quantization.resolve_for_tensor(&unembed_bindings.weight);
@@ -164,12 +164,19 @@ pub fn load_qwen3x_dspark(
             unembed_bindings,
         )?)
     } else {
-        main_unembed
+        Rc::new(
+            main_unembed.with_max_tokens(
+                max_block_tokens
+                    .try_into()
+                    .expect("Qwen3x DSpark shared unembed rows must fit u32"),
+            ),
+        )
     };
     let markov = Qwen3xDSparkMarkov::load(
         device,
         &mut store,
         config,
+        num_spec_tokens,
         &markov_bindings,
         &confidence_bindings,
         load_config.max_requests,
@@ -179,6 +186,7 @@ pub fn load_qwen3x_dspark(
         device,
         &mut store,
         config,
+        num_spec_tokens,
         load_config.page_size_bytes,
         main_feature_bindings,
         layer_bindings,
@@ -194,24 +202,12 @@ pub fn load_qwen3x_dspark(
         embed,
         unembed,
         markov,
-        block_size: config.block_size,
+        num_spec_tokens,
         mask_token_id: config
             .mask_token_id
             .try_into()
             .map_err(|_| ModelExecutorError::custom("Qwen3x DSpark MASK token ID must fit i32"))?,
     })
-}
-
-fn validate_forward_capacity(block_size: usize, max_tokens_per_request: usize) -> Result<(), ModelExecutorError> {
-    let min_forward_tokens = block_size
-        .checked_add(1)
-        .expect("Qwen3x DSpark forward token count overflow");
-    if min_forward_tokens > max_tokens_per_request {
-        return Err(ModelExecutorError::custom(format!(
-            "Qwen3x DSpark requires max_tokens_per_request >= {min_forward_tokens}, got {max_tokens_per_request}"
-        )));
-    }
-    Ok(())
 }
 
 fn num_page_ids_per_block(num_tokens_per_block: usize, num_tokens_per_page: usize) -> usize {
@@ -228,15 +224,4 @@ fn num_page_ids_per_block(num_tokens_per_block: usize, num_tokens_per_page: usiz
         "Qwen3x DSpark GQA tokens per block must be divisible by tokens per page"
     );
     num_tokens_per_block / num_tokens_per_page
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_forward_capacity;
-
-    #[test]
-    fn test_forward_capacity_includes_target_token() {
-        assert!(validate_forward_capacity(15, 16).is_ok());
-        assert!(validate_forward_capacity(15, 15).is_err());
-    }
 }

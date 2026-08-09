@@ -51,7 +51,7 @@ impl Qwen3Executor {
     }
 
     fn record_rejection_sampling(&mut self, recorder: &mut Qwen3ModelOpsRecorder, microbatch: &Qwen3Microbatch) {
-        let dspark_block_size = self.speculator.dspark().execution.block_size();
+        let max_spec_tokens = self.speculator.dspark().execution.num_spec_tokens();
         let sample_positions = sample_token_positions(microbatch);
         let sampler_configs = sample_sampler_configs(microbatch);
         let mut flat_draft_distribution_indices = Vec::new();
@@ -62,7 +62,7 @@ impl Qwen3Executor {
             let req_slot = microbatch.req_slots()[req_index];
             let num_spec_tokens = microbatch.num_spec_tokens(req_index) as usize;
             assert!(
-                num_spec_tokens <= dspark_block_size,
+                num_spec_tokens <= max_spec_tokens,
                 "Qwen3 speculative suffix exceeds DSpark capacity"
             );
             let q_end = microbatch.cu_tokens()[req_index + 1] as usize;
@@ -100,7 +100,7 @@ impl Qwen3Executor {
         let max_draft_distributions = self
             .config
             .max_requests
-            .checked_mul(dspark_block_size)
+            .checked_mul(max_spec_tokens)
             .expect("Qwen3 rejection draft capacity must fit usize");
         let num_draft_distribution_capacity =
             replay_bucket_capacity_allow_zero(num_active_draft_distributions, max_draft_distributions);
@@ -108,7 +108,7 @@ impl Qwen3Executor {
             .config
             .max_requests
             .checked_mul(
-                dspark_block_size
+                max_spec_tokens
                     .checked_add(1)
                     .expect("Qwen3 Main rows per request must fit usize"),
             )

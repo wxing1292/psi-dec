@@ -12,7 +12,7 @@ impl Qwen3Executor {
             self.config.max_tokens,
             core_batch_req.token_cost()
         );
-        let dspark_block_size = self.speculator.block_size();
+        let max_spec_tokens = self.speculator.num_spec_tokens();
         for request in &core_batch_req.dev_reqs {
             assert!(
                 request.decoder_query_tokens.token_consumption() <= self.config.max_tokens_per_request,
@@ -21,15 +21,15 @@ impl Qwen3Executor {
                 self.config.max_tokens_per_request
             );
             let num_spec_tokens = request.decoder_query_tokens.num_spec_tokens();
-            if dspark_block_size == 0 {
+            if max_spec_tokens == 0 {
                 assert_eq!(
                     num_spec_tokens, 0,
                     "qwen3 executor without DSpark does not accept speculative input tokens"
                 );
             } else {
                 assert!(
-                    num_spec_tokens <= dspark_block_size,
-                    "qwen3 speculative-token count exceeds DSpark block size"
+                    num_spec_tokens <= max_spec_tokens,
+                    "qwen3 speculative-token count exceeds the configured DSpark capacity"
                 );
             }
         }
@@ -68,6 +68,10 @@ impl Qwen3Executor {
 
     pub fn model_config(&self) -> &Qwen3ModelConfig {
         &self.model_config
+    }
+
+    pub fn num_spec_tokens(&self) -> usize {
+        self.speculator.num_spec_tokens()
     }
 
     pub fn num_main_gqa_page_ids_per_block(&self) -> usize {

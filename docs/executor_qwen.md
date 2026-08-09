@@ -158,7 +158,7 @@ Qwen35Executor
   speculator: Qwen35Speculator
     Vanilla
     MTP
-      num_steps: usize
+      num_spec_tokens: usize
       gqa_state: Qwen3xGQAState
       embed: Replay<Qwen35MTPEmbed>
       body: Replay<Qwen35MTP>
@@ -332,7 +332,14 @@ If only Main or only MTP uses MoE, the unused model-side MoE geometry does not c
 An incompatible shared geometry returns a recoverable model initialization error.
 For DSpark, the loader validates Main hidden width, layer count, vocabulary, position limit, and RoPE values.
 It permits the DSpark query projection width to differ from the Main hidden width.
-The shared loader requires `block_size + 1 <= max_tokens_per_request` for both Main versions.
+The checkpoint `block_size` is the maximum supported DSpark proposal length.
+`--num-spec-tokens` selects the fixed execution length and defaults to that checkpoint maximum.
+The shared loader requires `num_spec_tokens <= block_size` for both Main versions.
+The DSpark proposal length is independent of the Main per-request verification budget.
+The scheduler may verify only a proposal prefix.
+DSpark derives its row capacity as `max_requests * num_spec_tokens`.
+If the checkpoint omits embedding or unembedding weights, DSpark creates a
+caller-capacity view that shares the immutable Main kernel and weights.
 It adds DSpark context K/V pages to the Main cache lane and retains the Main GDN state domain.
 
 Qwen3 has one runtime cache lane and allocates no GDN state domain.
@@ -342,8 +349,8 @@ There is no Main/MTP plan object tree or aggregate component-weight owner.
 Qwen3 Main owns QKV GQA and dense-MLP geometry conversion in `qwen/v3/main/plan.rs`.
 Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, and MTP validation in `qwen/v3_5/plan.rs`.
 Qwen3x DSpark has no plan object or plan source file.
-Each DSpark semantic owner derives its fixed geometry from `Qwen3xDSparkConfig` and resolves its affine layout from
-the exact binding subtree that it consumes.
+Each DSpark semantic owner derives its model geometry from `Qwen3xDSparkConfig`, uses the selected
+`num_spec_tokens` for proposal geometry, and resolves its affine layout from the exact binding subtree that it consumes.
 Each owner loads a bounded `TensorMap`, removes its tensors, performs its required fusion, and requires an empty map.
 Each DSpark layer owns its weight-dependent GQA and dense-MLP backend.
 The DSpark state domain shares only page tables, metadata, scratch, and geometry-dependent compute selection.
@@ -683,7 +690,7 @@ For DSpark, they materialize DSparkEmbed, DSpark, DSparkGatherUnembed, and DSpar
 These hooks do not submit backend work or read backend output.
 
 `submit_spec` starts one model-specific Spec transaction.
-For `--num-mtp-steps K`, the Qwen3.5 MTP owner executes this dependent sequence K times:
+For `--num-spec-tokens K`, the Qwen3.5 MTP owner executes this dependent sequence K times:
 
 ```text
 for step_index in 0..K:
@@ -768,7 +775,7 @@ It starts an uncached publish when jobs exist.
 MTP keeps the GDN current version aligned with the Main runtime cache frontier.
 For one request, Main calculates `num_fixed_tokens = q_len - num_spec_tokens`.
 It commits `input_state_version + num_fixed_tokens + num_accepted_tokens`.
-`num_mtp_steps` does not directly adjust this state version.
+`num_spec_tokens` does not directly adjust this state version.
 MTP decode replays K - 1 verified tail tokens in the next Main call.
 Qwen verification keeps the verified state version unchanged and calculates
 `replay_source_state_version = verified_state_version - (K - 1)`. It passes this physical source to GDN commit as the
@@ -792,7 +799,7 @@ A state version ahead of its token index is a lifecycle invariant violation and 
 The executor supports zero or more logical MTP steps.
 The current checkpoint contract requires exactly one physical GQA body layer and shared Main token embedding.
 It does not permit dedicated MTP embeddings.
-`num_mtp_steps = K` chains that one physical layer K times.
+`num_spec_tokens = K` chains that one physical layer K times.
 The logical model has K+1 token and cache lanes: Main plus one MTP lane for each dependent step.
 
 `Qwen35MTPEmbed` owns previous-hidden gather, the shared `Rc<Embed>`, two checkpoint norms, concatenation, and quantized
@@ -824,6 +831,9 @@ Main batch submission:
 
 DSpark support is experimental.
 The Qwen3 and Qwen3.5 DSpark modes support one fixed-block DSpark checkpoint.
+`--num-spec-tokens K` selects a fixed proposal length at startup.
+K must not exceed the checkpoint `block_size`.
+Without the option, K equals the checkpoint `block_size`.
 Qwen3.5 MTP and DSpark are mutually exclusive.
 
 Each DSpark-enabled executor records persistent context updates in the Main submission:
@@ -848,7 +858,7 @@ Main K/V and persistent DSpark context K/V share one runtime cache-block lifecyc
 The executor owns separate page tables and splits each runtime page span.
 Proposal-local Q/K/V and attention partials remain in executor-owned `DSparkBlockScratch`.
 
-Qwen3.5 GDN keeps one current state and `block_size + 1` decision candidates for each DSpark request slot.
+Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidates for each DSpark request slot.
 It also reserves cache-block boundary candidates.
 The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, and DSpark.
 These state buffers remain allocated, reusable, and resident with the cached replay resources.

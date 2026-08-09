@@ -264,7 +264,7 @@ impl MainFixture {
             num_tokens_per_block: 1024,
         };
         let model = match dspark_model_dir {
-            Some(dspark_model_dir) => init_qwen_3_model_with_dspark(model_dir, dspark_model_dir, executor_config),
+            Some(dspark_model_dir) => init_qwen_3_model_with_dspark(model_dir, dspark_model_dir, None, executor_config),
             None => init_qwen_3_model(model_dir, executor_config),
         }
         .expect("unable to initialize Main comparison executor");
@@ -382,7 +382,7 @@ impl DSparkFixture {
             SafeTensorStore::from_model_dir(dspark_model_dir).expect("unable to open Qwen3 DSpark comparison weights");
         let bindings = resolve_qwen3x_dspark_weight_bindings(&config, store.index().tensor_names())
             .expect("unable to resolve Qwen3 DSpark comparison weights");
-        let attention_core = qwen3x_dspark_gqa_core(&config, 0);
+        let attention_core = qwen3x_dspark_gqa_core(&config, config.block_size, 0);
         let attention_compute_config = qwen3x_dspark_gqa_compute_config(&config, QWEN3_PAGE_SIZE_BYTES)
             .expect("unable to build Qwen3 DSpark GQA compute config");
         let num_layers = config.num_hidden_layers;
@@ -461,6 +461,7 @@ impl DSparkFixture {
             device,
             &mut store,
             &config,
+            config.block_size,
             QWEN3_PAGE_SIZE_BYTES,
             main_feature_bindings,
             layer_bindings,

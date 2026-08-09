@@ -119,7 +119,7 @@ impl Qwen35Executor {
         let num_main_output_rows = num_main_output_rows(microbatch);
         let sampler_configs = sample_sampler_configs(microbatch);
         let mut flat_draft_distribution_indices = Vec::new();
-        let max_spec_tokens = self.num_speculative_tokens();
+        let max_spec_tokens = self.num_spec_tokens();
         assert!(
             max_spec_tokens > 0,
             "qwen3.5 target rejection sampling requires a speculator"
@@ -342,8 +342,8 @@ impl Qwen35Executor {
         (decisions, timing)
     }
 
-    fn num_speculative_tokens(&self) -> usize {
-        self.speculator.num_speculative_tokens()
+    pub fn num_spec_tokens(&self) -> usize {
+        self.speculator.num_spec_tokens()
     }
 }
 

@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -37,6 +38,19 @@ pub struct Qwen3xDSparkMainConfig {
 }
 
 impl Qwen3xDSparkConfig {
+    pub fn resolve_num_spec_tokens(&self, requested: Option<NonZeroUsize>) -> Result<NonZeroUsize, ModelExecutorError> {
+        let num_spec_tokens = requested.unwrap_or_else(|| {
+            NonZeroUsize::new(self.block_size).expect("validated Qwen3 DSpark checkpoint block_size must be positive")
+        });
+        if num_spec_tokens.get() > self.block_size {
+            return Err(ModelExecutorError::custom(format!(
+                "requested num_spec_tokens={num_spec_tokens} exceeds Qwen3 DSpark checkpoint block_size={}",
+                self.block_size
+            )));
+        }
+        Ok(num_spec_tokens)
+    }
+
     pub fn validate_main(&self, main: Qwen3xDSparkMainConfig) -> Result<(), ModelExecutorError> {
         let mismatches = [
             (self.hidden_size != main.hidden_size)
