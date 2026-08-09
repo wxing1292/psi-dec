@@ -53,6 +53,7 @@ Runs Qwen3-14B with DSpark disabled/enabled, one server at a time.
 Cases:
   14b_off              Qwen3-14B Main only
   14b_dspark           Qwen3-14B + affine DSpark with 1 and 2 speculative tokens
+                       A missing DSpark checkpoint without a repo is warned and skipped.
 
 Model options:
   --model-root DIR     Default: $HOME/Workspace/models
@@ -283,6 +284,10 @@ if ((GRPC_PORT > 65535 || HTTP_PORT > 65535)); then
     echo "ports must be at most 65535" >&2
     exit 2
 fi
+if ((MAX_TOKENS_PER_REQUEST > MAX_TOKENS)); then
+    echo "--max-tokens-per-request must not exceed --max-tokens" >&2
+    exit 2
+fi
 
 case "$LOGGING" in
 info | debug) ;;
@@ -405,6 +410,24 @@ ensure_checkpoint() {
     fi
 }
 
+ensure_optional_checkpoint() {
+    local case_name="$1"
+    local option="$2"
+    local repo="$3"
+    local dir="$4"
+
+    if checkpoint_present "$dir"; then
+        echo "==> Found DSpark checkpoint: $dir"
+        return 0
+    fi
+    if [[ -z "$repo" ]]; then
+        echo "WARNING: skipping $case_name because its checkpoint is missing: $dir" >&2
+        echo "Pass $option DIR or ${option}-repo REPO to enable this case." >&2
+        return 1
+    fi
+    ensure_checkpoint DSpark "$repo" "$dir"
+}
+
 validate_affine_dspark() {
     DSPARK_DIR="$DSPARK_DIR" python3 - <<'PY'
 import json
@@ -432,9 +455,28 @@ if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size
 PY
 }
 
+if ((NEED_DSPARK)); then
+    if ! ensure_optional_checkpoint 14b_dspark --dspark "$DSPARK_REPO" "$DSPARK_DIR"; then
+        NEED_DSPARK=0
+        runnable_cases=()
+        for case_name in "${SELECTED_CASES[@]}"; do
+            [[ "$case_name" == 14b_dspark ]] || runnable_cases+=("$case_name")
+        done
+        if ((${#runnable_cases[@]})); then
+            SELECTED_CASES=("${runnable_cases[@]}")
+        else
+            SELECTED_CASES=()
+        fi
+        if ((${#SELECTED_CASES[@]} == 0)); then
+            echo "WARNING: no runnable cases remain after checkpoint discovery; exiting." >&2
+            exit 0
+        fi
+        CASES="$(IFS=,; printf '%s' "${SELECTED_CASES[*]}")"
+    fi
+fi
+
 ensure_checkpoint "Main" "$MODEL_REPO" "$MODEL_DIR"
 if ((NEED_DSPARK)); then
-    ensure_checkpoint "DSpark" "$DSPARK_REPO" "$DSPARK_DIR"
     validate_affine_dspark
 fi
 

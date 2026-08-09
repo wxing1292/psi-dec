@@ -700,6 +700,8 @@ Use `--tokens` to select the comma-separated output-token counts.
 The default Qwen3 matrix runs `14b_off` and `14b_dspark`.
 The `14b_dspark` group runs `--num-spec-tokens 1` and then `--num-spec-tokens 2`.
 Each summary label includes the selected value, for example, `14b_dspark1` or `14b_dspark2`.
+If the DSpark checkpoint is absent and no download repository is configured, the helper prints a warning and skips
+that case. A missing Main checkpoint remains an error.
 
 The Qwen3.5/3.6 helper runs controlled 27B/35B Main-only, MTP, and DSpark comparisons:
 
@@ -717,6 +719,8 @@ scripts/qwen35_e2e_decode_perf.sh \
 
 Each `*_mtp` or `*_dspark` group runs `--num-spec-tokens 1` and then `--num-spec-tokens 2`.
 The default case matrix runs `27b_off`, `27b_mtp`, `27b_dspark`, `35b_off`, `35b_mtp`, and `35b_dspark`.
+If an MTP or DSpark checkpoint is absent and no download repository is configured, the helper prints a warning and
+skips that case. A missing Main checkpoint remains an error.
 The helper stops the server between speculative-token counts.
 It applies the configured cooldown before the second count.
 Each summary label includes the speculative mode and token count, for example, `27b_mtp2` or `27b_dspark2`.

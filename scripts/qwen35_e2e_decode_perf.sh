@@ -76,6 +76,8 @@ Options:
                         Default: 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark
                         Available: 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark
                         Each *_mtp or *_dspark case runs 1 and then 2 speculative tokens.
+                        Group cases: 27b_on and 35b_on run both MTP and DSpark.
+                        Missing Spec checkpoints without a repo are warned and skipped.
   --port N              Server port. Default: 50061
   --prompt TEXT         Prompt string.
   --seed N              Fixed request seed. Default: 42
@@ -85,18 +87,18 @@ Options:
   --max-tokens-per-request N
                         Scheduler per-request token capacity. Default: 64
   --model-root DIR      Default checkpoint root. Default: $HOME/Workspace/models
-  --tokenizer DIR       Tokenizer/chat-template directory. Default: selected target model.
-  --model-27b DIR       27B target directory. Default: MODEL_ROOT/Qwen3.6-27B-4bit
+  --tokenizer DIR       Tokenizer/chat-template directory. Default: selected Main model.
+  --model-27b DIR       27B Main directory. Default: MODEL_ROOT/Qwen3.6-27B-4bit
   --mtp-27b DIR         27B MTP directory. Default: MODEL_ROOT/Qwen3.6-27B-MTP-4bit
   --dspark-27b DIR      27B DSpark directory. Default: MODEL_ROOT/Qwen3.6-27B-DSpark-affine
-  --model-35b DIR       35B target directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-4bit
+  --model-35b DIR       35B Main directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-4bit
   --mtp-35b DIR         35B MTP directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit
   --dspark-35b DIR      35B DSpark directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine
-  --model-27b-repo REPO Hugging Face repo used if the 27B target is missing.
+  --model-27b-repo REPO Hugging Face repo used if the 27B Main model is missing.
   --mtp-27b-repo REPO   Hugging Face repo used if the 27B MTP model is missing.
   --dspark-27b-repo REPO
                         Hugging Face repo used if the 27B affine DSpark model is missing.
-  --model-35b-repo REPO Hugging Face repo used if the 35B target is missing.
+  --model-35b-repo REPO Hugging Face repo used if the 35B Main model is missing.
   --mtp-35b-repo REPO   Hugging Face repo used if the 35B MTP model is missing.
   --dspark-35b-repo REPO
                         Hugging Face repo used if the 35B affine DSpark model is missing.
@@ -387,6 +389,10 @@ if ((PORT > 65535)); then
     echo "--port must be at most 65535" >&2
     exit 2
 fi
+if ((MAX_TOKENS_PER_REQUEST > MAX_TOKENS)); then
+    echo "--max-tokens-per-request must not exceed --max-tokens" >&2
+    exit 2
+fi
 
 [[ -n "$MODEL_27B" ]] || MODEL_27B="$MODEL_ROOT/Qwen3.6-27B-4bit"
 [[ -n "$MTP_27B" ]] || MTP_27B="$MODEL_ROOT/Qwen3.6-27B-MTP-4bit"
@@ -396,6 +402,36 @@ fi
 [[ -n "$DSPARK_35B" ]] || DSPARK_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine"
 
 IFS=, read -r -a selected_cases <<<"$CASES"
+requested_cases=("${selected_cases[@]}")
+selected_cases=()
+
+append_case() {
+    local candidate="$1"
+    local existing
+    if ((${#selected_cases[@]})); then
+        for existing in "${selected_cases[@]}"; do
+            if [[ "$existing" == "$candidate" ]]; then
+                return
+            fi
+        done
+    fi
+    selected_cases+=("$candidate")
+}
+
+for case_name in "${requested_cases[@]}"; do
+    case "$case_name" in
+    27b_on)
+        append_case 27b_mtp
+        append_case 27b_dspark
+        ;;
+    35b_on)
+        append_case 35b_mtp
+        append_case 35b_dspark
+        ;;
+    *) append_case "$case_name" ;;
+    esac
+done
+
 need_27b=0
 need_27b_mtp=0
 need_27b_dspark=0
@@ -428,6 +464,7 @@ for case_name in "${selected_cases[@]}"; do
         ;;
     esac
 done
+CASES="$(IFS=,; printf '%s' "${selected_cases[*]}")"
 
 if [[ ${#selected_cases[@]} -eq 0 ]]; then
     echo "--cases must include at least one case" >&2
@@ -441,6 +478,33 @@ require_dir() {
         echo "$option must name an existing directory" >&2
         exit 2
     fi
+}
+
+validate_affine_dspark() {
+    local option="$1"
+    local dir="$2"
+    DSPARK_DIR="$dir" DSPARK_OPTION="$option" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+option = os.environ["DSPARK_OPTION"]
+path = Path(os.environ["DSPARK_DIR"]) / "config.json"
+try:
+    config = json.loads(path.read_text())
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"unable to read {path}: {exc}") from exc
+
+quantization = config.get("quantization_config") or config.get("quantization")
+if not isinstance(quantization, dict):
+    raise SystemExit(f"{option} must name an affine-quantized DSpark checkpoint")
+
+block_size = config.get("block_size")
+if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 2:
+    raise SystemExit(
+        f"{path} must have block_size >= 2 for the DSpark 1/2 benchmark matrix"
+    )
+PY
 }
 
 model_present() {
@@ -487,6 +551,67 @@ ensure_model() {
     fi
 }
 
+ensure_optional_model() {
+    local case_name="$1"
+    local option="$2"
+    local repo="$3"
+    local dir="$4"
+
+    if model_present "$dir"; then
+        echo "==> Found checkpoint: $dir"
+        return 0
+    fi
+    if [[ -z "$repo" ]]; then
+        echo "WARNING: skipping $case_name because its checkpoint is missing: $dir" >&2
+        echo "Pass $option DIR or ${option}-repo REPO to enable this case." >&2
+        return 1
+    fi
+    ensure_model "$repo" "$dir"
+}
+
+if ((need_27b_mtp)); then
+    ensure_optional_model 27b_mtp --mtp-27b "$MTP_27B_REPO" "$MTP_27B" || need_27b_mtp=0
+fi
+if ((need_27b_dspark)); then
+    ensure_optional_model 27b_dspark --dspark-27b "$DSPARK_27B_REPO" "$DSPARK_27B" || need_27b_dspark=0
+fi
+if ((need_35b_mtp)); then
+    ensure_optional_model 35b_mtp --mtp-35b "$MTP_35B_REPO" "$MTP_35B" || need_35b_mtp=0
+fi
+if ((need_35b_dspark)); then
+    ensure_optional_model 35b_dspark --dspark-35b "$DSPARK_35B_REPO" "$DSPARK_35B" || need_35b_dspark=0
+fi
+
+runnable_cases=()
+for case_name in "${selected_cases[@]}"; do
+    case "$case_name" in
+    27b_mtp) ((need_27b_mtp)) || continue ;;
+    27b_dspark) ((need_27b_dspark)) || continue ;;
+    35b_mtp) ((need_35b_mtp)) || continue ;;
+    35b_dspark) ((need_35b_dspark)) || continue ;;
+    esac
+    runnable_cases+=("$case_name")
+done
+if ((${#runnable_cases[@]})); then
+    selected_cases=("${runnable_cases[@]}")
+else
+    selected_cases=()
+fi
+if ((${#selected_cases[@]} == 0)); then
+    echo "WARNING: no runnable cases remain after checkpoint discovery; exiting." >&2
+    exit 0
+fi
+CASES="$(IFS=,; printf '%s' "${selected_cases[*]}")"
+
+need_27b=0
+need_35b=0
+for case_name in "${selected_cases[@]}"; do
+    case "$case_name" in
+    27b_*) need_27b=1 ;;
+    35b_*) need_35b=1 ;;
+    esac
+done
+
 if [[ -z "$TOKENIZER" ]]; then
     if ((need_35b)); then
         TOKENIZER="$MODEL_35B"
@@ -498,20 +623,8 @@ fi
 if ((need_27b)); then
     ensure_model "$MODEL_27B_REPO" "$MODEL_27B"
 fi
-if ((need_27b_mtp)); then
-    ensure_model "$MTP_27B_REPO" "$MTP_27B"
-fi
-if ((need_27b_dspark)); then
-    ensure_model "$DSPARK_27B_REPO" "$DSPARK_27B"
-fi
 if ((need_35b)); then
     ensure_model "$MODEL_35B_REPO" "$MODEL_35B"
-fi
-if ((need_35b_mtp)); then
-    ensure_model "$MTP_35B_REPO" "$MTP_35B"
-fi
-if ((need_35b_dspark)); then
-    ensure_model "$DSPARK_35B_REPO" "$DSPARK_35B"
 fi
 
 require_dir "--tokenizer" "$TOKENIZER"
@@ -532,6 +645,12 @@ if ((need_35b_mtp)); then
 fi
 if ((need_35b_dspark)); then
     require_dir "--dspark-35b" "$DSPARK_35B"
+fi
+if ((need_27b_dspark)); then
+    validate_affine_dspark "--dspark-27b" "$DSPARK_27B"
+fi
+if ((need_35b_dspark)); then
+    validate_affine_dspark "--dspark-35b" "$DSPARK_35B"
 fi
 
 current_machine_id() {
