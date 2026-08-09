@@ -604,9 +604,13 @@ where
 }
 
 #[cfg(test)]
-#[path = "./api_test_wo_mtp.rs"]
-mod api_test_wo_mtp;
+#[path = "./api_test_vanilla.rs"]
+mod api_test_vanilla;
 
 #[cfg(test)]
 #[path = "./api_test_w_mtp.rs"]
 mod api_test_w_mtp;
+
+#[cfg(test)]
+#[path = "./api_test_w_dspark.rs"]
+mod api_test_w_dspark;

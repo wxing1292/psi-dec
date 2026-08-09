@@ -47,7 +47,7 @@ type TestTrieBlocks =
     TrieDecoderBlocks<NUM_TOKEN_PER_BLOCK, NUM_TRIE_PARTITION, NUM_CACHE_LANE, TestMultiLaneTrieKVBlockCache>;
 
 #[test]
-fn test_init_block_once_half_block_success_wo_mtp() {
+fn test_init_block_once_half_block_success_vanilla() {
     let total_tokens = token_vec([1, 2]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -64,7 +64,7 @@ fn test_init_block_once_half_block_success_wo_mtp() {
 }
 
 #[test]
-fn test_init_block_once_half_block_resource_limit_exceeded_wo_mtp() {
+fn test_init_block_once_half_block_resource_limit_exceeded_vanilla() {
     let total_tokens = token_vec([1, 2]);
     let block_cache = initialize_block_cache(2);
     let random_block = allocate_mutable_block(&block_cache);
@@ -80,7 +80,7 @@ fn test_init_block_once_half_block_resource_limit_exceeded_wo_mtp() {
 }
 
 #[test]
-fn test_init_block_once_full_block_cache_bypass_wo_mtp() {
+fn test_init_block_once_full_block_cache_bypass_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4]);
     let block_cache = initialize_block_cache(1024);
     insert_immutable_block(&block_cache, 0, None, total_tokens.clone());
@@ -98,7 +98,7 @@ fn test_init_block_once_full_block_cache_bypass_wo_mtp() {
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_hit_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_hit_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6]);
     let block_cache = initialize_block_cache(1024);
     insert_immutable_block(&block_cache, 0, None, token_vec([1, 2, 3, 4]));
@@ -116,7 +116,7 @@ fn test_init_block_once_full_and_half_block_cache_hit_wo_mtp() {
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_miss_no_semi_immutable_success_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_miss_no_semi_immutable_success_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -133,7 +133,7 @@ fn test_init_block_once_full_and_half_block_cache_miss_no_semi_immutable_success
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_miss_no_semi_immutable_resource_limit_exceeded_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_miss_no_semi_immutable_resource_limit_exceeded_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6]);
     let block_cache = initialize_block_cache(2);
     let random_block = allocate_mutable_block(&block_cache);
@@ -149,7 +149,7 @@ fn test_init_block_once_full_and_half_block_cache_miss_no_semi_immutable_resourc
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_reserved_await_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_reserved_await_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6]);
     let block_cache = initialize_block_cache(1024);
     let mut random_block = reserve_semi_immutable_block(&block_cache, 0, None, token_vec([1, 2, 3, 4]));
@@ -189,7 +189,7 @@ fn test_init_block_once_full_and_half_block_cache_reserved_await_wo_mtp() {
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_bypass_with_semi_immutable_success_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_bypass_with_semi_immutable_success_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -219,7 +219,7 @@ fn test_init_block_once_full_and_half_block_cache_bypass_with_semi_immutable_suc
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_bypass_with_semi_immutable_resource_limit_exceeded_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_bypass_with_semi_immutable_resource_limit_exceeded_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     let block_cache = initialize_block_cache(2);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -246,7 +246,7 @@ fn test_init_block_once_full_and_half_block_cache_bypass_with_semi_immutable_res
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_bypass_with_mutable_success_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_bypass_with_mutable_success_vanilla() {
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, token_vec([1, 2]));
 
@@ -278,7 +278,7 @@ fn test_init_block_once_full_and_half_block_cache_bypass_with_mutable_success_wo
 }
 
 #[test]
-fn test_init_block_once_full_and_half_block_cache_bypass_with_mutable_resource_limit_exceeded_wo_mtp() {
+fn test_init_block_once_full_and_half_block_cache_bypass_with_mutable_resource_limit_exceeded_vanilla() {
     let block_cache = initialize_block_cache(2);
     let mut blocks = initialize_blocks(block_cache, token_vec([1, 2]));
 
@@ -307,7 +307,7 @@ fn test_init_block_once_full_and_half_block_cache_bypass_with_mutable_resource_l
 }
 
 #[test]
-fn test_uninit_block_once_noop_block_wo_mtp() {
+fn test_uninit_block_once_noop_block_vanilla() {
     let total_tokens = token_vec([1, 2]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -323,7 +323,7 @@ fn test_uninit_block_once_noop_block_wo_mtp() {
 }
 
 #[test]
-fn test_uninit_block_once_mutable_block_wo_mtp() {
+fn test_uninit_block_once_mutable_block_vanilla() {
     let total_tokens = token_vec([1, 2]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -344,7 +344,7 @@ fn test_uninit_block_once_mutable_block_wo_mtp() {
 }
 
 #[test]
-fn test_uninit_block_once_semi_immutable_block_wo_mtp() {
+fn test_uninit_block_once_semi_immutable_block_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -365,7 +365,7 @@ fn test_uninit_block_once_semi_immutable_block_wo_mtp() {
 }
 
 #[test]
-fn test_uninit_block_once_immutable_block_wo_mtp() {
+fn test_uninit_block_once_immutable_block_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6]);
     let block_cache = initialize_block_cache(1024);
     insert_immutable_block(&block_cache, 0, None, token_vec([1, 2, 3, 4]));
@@ -388,7 +388,7 @@ fn test_uninit_block_once_immutable_block_wo_mtp() {
 }
 
 #[test]
-fn test_prepare_cancel_commit_prefill_zero_token_index_wo_mtp() {
+fn test_prepare_cancel_commit_prefill_zero_token_index_vanilla() {
     let total_tokens = token_vec([1, 2, 3]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
@@ -435,7 +435,7 @@ fn test_prepare_cancel_commit_prefill_zero_token_index_wo_mtp() {
 }
 
 #[test]
-fn test_prepare_cancel_commit_prefill_nonzero_token_index_wo_mtp() {
+fn test_prepare_cancel_commit_prefill_nonzero_token_index_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6, 7]);
     let block_cache = initialize_block_cache(1024);
     insert_immutable_block(&block_cache, 0, None, token_vec([1, 2, 3, 4]));
@@ -519,7 +519,7 @@ fn test_prepare_cancel_commit_prefill_nonzero_token_index_wo_mtp() {
 }
 
 #[test]
-fn test_prepare_cancel_commit_decode_zero_token_index_wo_mtp() {
+fn test_prepare_cancel_commit_decode_zero_token_index_vanilla() {
     let total_tokens = token_vec([1, 2, 3]);
     let output_sampled_token = Token::new(4);
     let block_cache = initialize_block_cache(1024);
@@ -579,7 +579,7 @@ fn test_prepare_cancel_commit_decode_zero_token_index_wo_mtp() {
 }
 
 #[test]
-fn test_prepare_cancel_commit_decode_nonzero_token_index_wo_mtp() {
+fn test_prepare_cancel_commit_decode_nonzero_token_index_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4, 5, 6, 7]);
     let output_sampled_token = Token::new(8);
     let block_cache = initialize_block_cache(1024);
@@ -676,7 +676,7 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_wo_mtp() {
 }
 
 #[test]
-fn test_prepare_cancel_commit_full_block_wo_mtp() {
+fn test_prepare_cancel_commit_full_block_vanilla() {
     let total_tokens = token_vec([1, 2, 3, 4]);
     let output_sampled_token = Token::new(5);
     let block_cache = initialize_block_cache(1024);
@@ -737,7 +737,7 @@ fn test_prepare_cancel_commit_full_block_wo_mtp() {
 }
 
 #[test]
-fn test_prepare_commit_full_and_half_block_semi_immutable_collision_wo_mtp() {
+fn test_prepare_commit_full_and_half_block_semi_immutable_collision_vanilla() {
     let total_tokens = token_vec([0, 1, 2, 3, 4, 5]);
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache.clone(), total_tokens.clone());
@@ -795,7 +795,7 @@ fn test_prepare_commit_full_and_half_block_semi_immutable_collision_wo_mtp() {
 }
 
 #[test]
-fn test_prepare_commit_full_and_half_block_mutable_collision_wo_mtp() {
+fn test_prepare_commit_full_and_half_block_mutable_collision_vanilla() {
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache.clone(), token_vec([0, 1]));
     let InitBlockOnceResult::Success { ready_token_slots } = blocks.init_block_once() else {
@@ -855,7 +855,7 @@ fn test_prepare_commit_full_and_half_block_mutable_collision_wo_mtp() {
 }
 
 #[test]
-fn test_enqueue_tokens_wo_mtp() {
+fn test_enqueue_tokens_vanilla() {
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, token_vec([1, 2]));
 
@@ -874,7 +874,7 @@ fn test_enqueue_tokens_wo_mtp() {
 }
 
 #[test]
-fn test_parent_node_wo_mtp() {
+fn test_parent_node_vanilla() {
     let root_total_tokens = token_vec([1, 2, 3, 4]);
     let child_total_tokens = token_vec([5, 6, 7, 8]);
     let block_cache = initialize_block_cache(1024);

@@ -24,7 +24,9 @@ pub fn token_consumption<const L: usize>(
     num_spec_tokens: usize,
 ) -> TokenConsumption {
     debug_assert!(1 <= token_budget);
-    debug_assert!(num_spec_tokens < L);
+    // MTP binds each speculative position to one of its additional cache
+    // lanes. DSpark keeps one cache lane and stores its proposal separately.
+    debug_assert!(L == 1 || num_spec_tokens < L);
     if 1 == L {
         // noop
     } else {
