@@ -151,10 +151,36 @@ fn test_spec_token_validation() {
             "--num-spec-tokens",
             "4",
             "--max-tokens-per-request",
-            "4",
+            "3",
         ])),
-        Err(Error::InvalidArgument(message)) if message.contains("cannot schedule 5 target/speculative tokens")
+        Err(Error::InvalidArgument(message)) if message.contains("--max-tokens-per-request=3")
     ));
+    assert!(matches!(
+        Qwen35Config::from_args(parse_qwen35(&[
+            "--hf-mtp-model-dir",
+            "mtp-model",
+            "--num-spec-tokens",
+            "4",
+            "--max-tokens",
+            "4",
+            "--max-tokens-per-request",
+            "3",
+        ])),
+        Err(Error::InvalidArgument(message)) if message.contains("--max-tokens-per-request=3")
+    ));
+    let exact = Qwen35Config::from_args(parse_qwen35(&[
+        "--hf-mtp-model-dir",
+        "mtp-model",
+        "--num-spec-tokens",
+        "4",
+        "--max-tokens",
+        "4",
+        "--max-tokens-per-request",
+        "4",
+    ]))
+    .unwrap();
+    assert_eq!(exact.scheduler_config().max_tokens, 4);
+    assert_eq!(exact.scheduler_config().max_tokens_per_request, 4);
 }
 
 #[test]

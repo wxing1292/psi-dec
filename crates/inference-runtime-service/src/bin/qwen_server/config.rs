@@ -187,7 +187,7 @@ impl Qwen35Config {
             .hf_mtp_model_dir
             .as_ref()
             .map(|_| args.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
-        validate_mtp_num_spec_tokens(num_mtp_tokens, args.max_tokens_per_request)?;
+        validate_mtp_scheduler_capacity(num_mtp_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
                 "--max-requests must fit the u32 request-slot domain"
@@ -285,21 +285,17 @@ impl Qwen35Config {
     }
 }
 
-fn validate_mtp_num_spec_tokens(
+fn validate_mtp_scheduler_capacity(
     num_spec_tokens: Option<NonZeroUsize>,
     max_tokens_per_request: NonZeroUsize,
 ) -> Result<()> {
     let Some(num_spec_tokens) = num_spec_tokens else {
         return Ok(());
     };
-    let num_forward_tokens = num_spec_tokens
-        .get()
-        .checked_add(1)
-        .ok_or_else(|| log_info_invalid_argument!("--num-spec-tokens is too large"))?;
-    if num_forward_tokens > max_tokens_per_request.get() {
+    if num_spec_tokens.get() > max_tokens_per_request.get() {
         return Err(log_info_invalid_argument!(
-            "--max-tokens-per-request={} cannot schedule {num_forward_tokens} target/speculative tokens",
-            max_tokens_per_request
+            "--max-tokens-per-request={max_tokens_per_request} must be at least --num-spec-tokens={num_spec_tokens} \
+             for MTP cache-lane initialization"
         ));
     }
     Ok(())

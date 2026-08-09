@@ -129,6 +129,9 @@ channels.
 batch-response channels.
 
 Runtime initialization requires the per-batch request limit to be no larger than the running-request limit.
+Request admission requires at least `max(1, L - 1)` initial input tokens. This rule gives each configured cache lane
+its required initial token. The runtime returns `InvalidArgument` before it constructs Trie blocks when the request is
+too short.
 
 A queued request owns no request slot. The synchronous event loop registers the user-request receiver only when the
 request-slot allocator reports free capacity.

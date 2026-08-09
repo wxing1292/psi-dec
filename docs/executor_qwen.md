@@ -801,6 +801,8 @@ The current checkpoint contract requires exactly one physical GQA body layer and
 It does not permit dedicated MTP embeddings.
 `num_spec_tokens = K` chains that one physical layer K times.
 The logical model has K+1 token and cache lanes: Main plus one MTP lane for each dependent step.
+The Main flattened-token capacity and per-request capacity must each be at least K. This minimum lets the runtime
+initialize the K additional cache lanes. It does not require Main to verify an existing speculative suffix.
 
 `Qwen35MTPEmbed` owns previous-hidden gather, the shared `Rc<Embed>`, two checkpoint norms, concatenation, and quantized
 input projection.

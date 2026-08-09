@@ -360,8 +360,8 @@ fn init_qwen_3_5_model_inner(
     config.validate();
     if let Qwen35InitMode::MTP { num_spec_tokens, .. } = &init_mode {
         assert!(
-            config.max_tokens_per_request > num_spec_tokens.get(),
-            "qwen3.5 MTP requires max_tokens_per_request >= num_spec_tokens + 1"
+            config.max_tokens_per_request >= num_spec_tokens.get(),
+            "qwen3.5 MTP requires max_tokens_per_request >= num_spec_tokens"
         );
     }
     let model_config = init_qwen35_model_config(model_dir)?;

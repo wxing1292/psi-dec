@@ -207,7 +207,14 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         request_id: RawRequestID,
         tokens: Vec<Token>,
         sampling_config: SamplingConfig,
-    ) -> (RuntimeQueuedRequest<N, P, L>, ExternalRequest) {
+    ) -> Result<(RuntimeQueuedRequest<N, P, L>, ExternalRequest)> {
+        let min_initial_tokens = usize::max(1, L - 1);
+        if tokens.len() < min_initial_tokens {
+            return Err(Error::invalid_argument(format!(
+                "decode request minimum initial token count is {min_initial_tokens} for {L} cache lanes, got {}",
+                tokens.len()
+            )));
+        }
         let req_status = AtomicRequestStatus::new();
         let decoder_kv_blocks = TrieDecoderBlocks::new(self.block_cache.clone(), [], tokens, []);
         let (token_prob_tx, token_prob_rx) = async_unbounded();
@@ -219,7 +226,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             sampling_config,
         );
         let external_request = ExternalRequest::new(request_id, req_status, token_prob_rx);
-        (queued_request, external_request)
+        Ok((queued_request, external_request))
     }
 
     pub fn submit_req(&self, queued_request: RuntimeQueuedRequest<N, P, L>) -> Result<()> {
@@ -342,10 +349,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use inference_runtime_core::Error;
     use inference_runtime_core::channel::Shutdown;
     use inference_runtime_core::config::CacheLaneRuntimeConfig;
     use inference_runtime_core::config::RuntimeConfig;
+    use inference_runtime_core::config::SamplingConfig;
     use inference_runtime_core::config::SchedulerConfig;
+    use inference_runtime_core::runtime::Token;
 
     use super::InferenceRuntime;
 
@@ -384,5 +394,65 @@ mod tests {
         );
         assert_eq!(runtime.model_runtime_config.num_tokens_per_cache_block(), 1024);
         shutdown.shutdown();
+    }
+
+    #[test]
+    fn test_runtime_validates_initial_tokens_for_cache_lanes() {
+        let (single_lane, single_lane_shutdown, _single_lane_async_runtime) = test_runtime::<1>();
+        assert!(matches!(
+            single_lane.initialize_req(1, Vec::new(), SamplingConfig::default()),
+            Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 1")
+        ));
+        single_lane_shutdown.shutdown();
+
+        let (mtp, mtp_shutdown, _mtp_async_runtime) = test_runtime::<4>();
+        assert!(matches!(
+            mtp.initialize_req(1, vec![Token::new(1), Token::new(2)], SamplingConfig::default()),
+            Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 3")
+        ));
+        assert!(
+            mtp.initialize_req(
+                2,
+                vec![Token::new(1), Token::new(2), Token::new(3)],
+                SamplingConfig::default(),
+            )
+            .is_ok()
+        );
+        mtp_shutdown.shutdown();
+    }
+
+    fn test_runtime<const L: usize>() -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
+        let shutdown = Shutdown::new();
+        let async_runtime = tokio::runtime::Runtime::new().expect("test Tokio runtime should initialize");
+        let runtime = InferenceRuntime::<1024, L, 4>::new(
+            RuntimeConfig {
+                max_queued_requests: 1,
+                max_running_requests: 1,
+                num_tokens_per_cache_block: 1024,
+                num_kv_heads: 1,
+                kv_head_dim: 1,
+                kv_dtype_bytes: 1,
+                num_pages: 64 * L,
+                page_bytes: 32,
+                cache_lanes: (0..L)
+                    .map(|_| {
+                        CacheLaneRuntimeConfig {
+                            num_pages_per_kv_block: 64,
+                            num_pages_per_state_block: 0,
+                            block_cache_capacity: 1,
+                        }
+                    })
+                    .collect(),
+            },
+            SchedulerConfig {
+                max_requests: 1,
+                max_tokens: usize::max(1, L - 1),
+                max_tokens_per_request: usize::max(1, L - 1),
+                max_compute_slots: 1,
+            },
+            shutdown.clone(),
+            async_runtime.handle(),
+        );
+        (runtime, shutdown, async_runtime)
     }
 }
