@@ -9,13 +9,17 @@ MODEL_ROOT="$HOME/Workspace/models"
 TOKENIZER=""
 MODEL_27B=""
 MTP_27B=""
+DSPARK_27B=""
 MODEL_35B=""
 MTP_35B=""
+DSPARK_35B=""
 MODEL_27B_REPO="mlx-community/Qwen3.6-27B-4bit"
 MTP_27B_REPO="mlx-community/Qwen3.6-27B-MTP-4bit"
+DSPARK_27B_REPO=""
 MODEL_35B_REPO="mlx-community/Qwen3.6-35B-A3B-4bit"
 MTP_35B_REPO="mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
-CASES="27b_off,27b_on,35b_off,35b_on"
+DSPARK_35B_REPO=""
+CASES="27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark"
 BASELINE=1
 CASE_COOLDOWN_SECS=30
 LOGGING=info
@@ -68,9 +72,10 @@ decode throughput, TTFT, inter-chunk latency, and speculative acceptance.
 
 Options:
   --runs N              Runs per token-count case. Default: 7
-  --cases LIST          Comma-separated cases. Default: 27b_off,27b_on,35b_off,35b_on
-                        Available: 27b_off,27b_on,35b_off,35b_on
-                        Each *_on case runs MTP steps 1, 2, 3, and 4 in order.
+  --cases LIST          Comma-separated cases.
+                        Default: 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark
+                        Available: 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark
+                        Each *_mtp or *_dspark case runs 1 and then 2 speculative tokens.
   --port N              Server port. Default: 50061
   --prompt TEXT         Prompt string.
   --seed N              Fixed request seed. Default: 42
@@ -83,12 +88,18 @@ Options:
   --tokenizer DIR       Tokenizer/chat-template directory. Default: selected target model.
   --model-27b DIR       27B target directory. Default: MODEL_ROOT/Qwen3.6-27B-4bit
   --mtp-27b DIR         27B MTP directory. Default: MODEL_ROOT/Qwen3.6-27B-MTP-4bit
+  --dspark-27b DIR      27B DSpark directory. Default: MODEL_ROOT/Qwen3.6-27B-DSpark-affine
   --model-35b DIR       35B target directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-4bit
   --mtp-35b DIR         35B MTP directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit
+  --dspark-35b DIR      35B DSpark directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine
   --model-27b-repo REPO Hugging Face repo used if the 27B target is missing.
   --mtp-27b-repo REPO   Hugging Face repo used if the 27B MTP model is missing.
+  --dspark-27b-repo REPO
+                        Hugging Face repo used if the 27B affine DSpark model is missing.
   --model-35b-repo REPO Hugging Face repo used if the 35B target is missing.
   --mtp-35b-repo REPO   Hugging Face repo used if the 35B MTP model is missing.
+  --dspark-35b-repo REPO
+                        Hugging Face repo used if the 35B affine DSpark model is missing.
   --no-build            Skip release build.
   --no-baseline         Do not compare summary rows with the checked-in M3 Max baseline.
   --case-cooldown-secs N
@@ -101,12 +112,13 @@ Options:
 Examples:
   scripts/qwen35_e2e_decode_perf.sh \
     --model-root "$HOME/Workspace/models" \
-    --cases 27b_off,35b_off,27b_on,35b_on --runs 3
+    --cases 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark --runs 3
 
   scripts/qwen35_e2e_decode_perf.sh \
     --model-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-4bit" \
     --mtp-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-MTP-4bit" \
-    --cases 35b_on --runs 3
+    --dspark-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-DSpark-affine" \
+    --cases 35b_mtp,35b_dspark --runs 3
 EOF
 }
 
@@ -216,6 +228,14 @@ while [[ $# -gt 0 ]]; do
         MTP_27B="$2"
         shift 2
         ;;
+    --dspark-27b)
+        [[ $# -ge 2 ]] || {
+            echo "--dspark-27b requires a value" >&2
+            exit 2
+        }
+        DSPARK_27B="$2"
+        shift 2
+        ;;
     --model-35b)
         [[ $# -ge 2 ]] || {
             echo "--model-35b requires a value" >&2
@@ -230,6 +250,14 @@ while [[ $# -gt 0 ]]; do
             exit 2
         }
         MTP_35B="$2"
+        shift 2
+        ;;
+    --dspark-35b)
+        [[ $# -ge 2 ]] || {
+            echo "--dspark-35b requires a value" >&2
+            exit 2
+        }
+        DSPARK_35B="$2"
         shift 2
         ;;
     --model-27b-repo)
@@ -248,6 +276,14 @@ while [[ $# -gt 0 ]]; do
         MTP_27B_REPO="$2"
         shift 2
         ;;
+    --dspark-27b-repo)
+        [[ $# -ge 2 ]] || {
+            echo "--dspark-27b-repo requires a value" >&2
+            exit 2
+        }
+        DSPARK_27B_REPO="$2"
+        shift 2
+        ;;
     --model-35b-repo)
         [[ $# -ge 2 ]] || {
             echo "--model-35b-repo requires a value" >&2
@@ -262,6 +298,14 @@ while [[ $# -gt 0 ]]; do
             exit 2
         }
         MTP_35B_REPO="$2"
+        shift 2
+        ;;
+    --dspark-35b-repo)
+        [[ $# -ge 2 ]] || {
+            echo "--dspark-35b-repo requires a value" >&2
+            exit 2
+        }
+        DSPARK_35B_REPO="$2"
         shift 2
         ;;
     --no-build)
@@ -346,25 +390,37 @@ fi
 
 [[ -n "$MODEL_27B" ]] || MODEL_27B="$MODEL_ROOT/Qwen3.6-27B-4bit"
 [[ -n "$MTP_27B" ]] || MTP_27B="$MODEL_ROOT/Qwen3.6-27B-MTP-4bit"
+[[ -n "$DSPARK_27B" ]] || DSPARK_27B="$MODEL_ROOT/Qwen3.6-27B-DSpark-affine"
 [[ -n "$MODEL_35B" ]] || MODEL_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-4bit"
 [[ -n "$MTP_35B" ]] || MTP_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit"
+[[ -n "$DSPARK_35B" ]] || DSPARK_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine"
 
 IFS=, read -r -a selected_cases <<<"$CASES"
 need_27b=0
 need_27b_mtp=0
+need_27b_dspark=0
 need_35b=0
 need_35b_mtp=0
+need_35b_dspark=0
 for case_name in "${selected_cases[@]}"; do
     case "$case_name" in
     27b_off) need_27b=1 ;;
-    27b_on)
+    27b_mtp)
         need_27b=1
         need_27b_mtp=1
         ;;
+    27b_dspark)
+        need_27b=1
+        need_27b_dspark=1
+        ;;
     35b_off) need_35b=1 ;;
-    35b_on)
+    35b_mtp)
         need_35b=1
         need_35b_mtp=1
+        ;;
+    35b_dspark)
+        need_35b=1
+        need_35b_dspark=1
         ;;
     *)
         echo "unknown case: $case_name" >&2
@@ -405,6 +461,12 @@ ensure_model() {
         return
     fi
 
+    if [[ -z "$repo" ]]; then
+        echo "checkpoint is missing: $dir" >&2
+        echo "Pass the matching checkpoint directory or configure its --*-repo option." >&2
+        exit 1
+    fi
+
     if command -v hf >/dev/null 2>&1; then
         download_command=(hf download)
     elif command -v huggingface-cli >/dev/null 2>&1; then
@@ -439,11 +501,17 @@ fi
 if ((need_27b_mtp)); then
     ensure_model "$MTP_27B_REPO" "$MTP_27B"
 fi
+if ((need_27b_dspark)); then
+    ensure_model "$DSPARK_27B_REPO" "$DSPARK_27B"
+fi
 if ((need_35b)); then
     ensure_model "$MODEL_35B_REPO" "$MODEL_35B"
 fi
 if ((need_35b_mtp)); then
     ensure_model "$MTP_35B_REPO" "$MTP_35B"
+fi
+if ((need_35b_dspark)); then
+    ensure_model "$DSPARK_35B_REPO" "$DSPARK_35B"
 fi
 
 require_dir "--tokenizer" "$TOKENIZER"
@@ -453,11 +521,17 @@ fi
 if ((need_27b_mtp)); then
     require_dir "--mtp-27b" "$MTP_27B"
 fi
+if ((need_27b_dspark)); then
+    require_dir "--dspark-27b" "$DSPARK_27B"
+fi
 if ((need_35b)); then
     require_dir "--model-35b" "$MODEL_35B"
 fi
 if ((need_35b_mtp)); then
     require_dir "--mtp-35b" "$MTP_35B"
+fi
+if ((need_35b_dspark)); then
+    require_dir "--dspark-35b" "$DSPARK_35B"
 fi
 
 current_machine_id() {
@@ -871,24 +945,35 @@ PY
     cleanup_active_server
 }
 
-run_mtp_case_sequence() {
+run_spec_case_sequence() {
     local model_label="$1"
-    local token_list="$2"
-    local server_binary="$3"
-    local model_dir="$4"
-    local mtp_model_dir="$5"
+    local spec_mode="$2"
+    local token_list="$3"
+    local server_binary="$4"
+    local model_dir="$5"
+    local spec_model_dir="$6"
+    local spec_model_option
 
-    for num_mtp_steps in 1 2; do
-        local label="${model_label}_mtp${num_mtp_steps}"
-        if ((num_mtp_steps > 1 && CASE_COOLDOWN_SECS > 0)); then
+    case "$spec_mode" in
+    mtp) spec_model_option="--hf-mtp-model-dir" ;;
+    dspark) spec_model_option="--hf-dspark-model-dir" ;;
+    *)
+        echo "unsupported speculative mode: $spec_mode" >&2
+        exit 2
+        ;;
+    esac
+
+    for num_spec_tokens in 1 2; do
+        local label="${model_label}_${spec_mode}${num_spec_tokens}"
+        if ((num_spec_tokens > 1 && CASE_COOLDOWN_SECS > 0)); then
             echo "COOLDOWN before=$label seconds=$CASE_COOLDOWN_SECS"
             sleep "$CASE_COOLDOWN_SECS"
         fi
         run_server_case "$label" "$token_list" "$server_binary" \
             --grpc-listen-addr "127.0.0.1:${PORT}" \
             --hf-model-dir "$model_dir" \
-            --hf-mtp-model-dir "$mtp_model_dir" \
-            --num-mtp-steps "$num_mtp_steps" \
+            "$spec_model_option" "$spec_model_dir" \
+            --num-spec-tokens "$num_spec_tokens" \
             --num-cache-pages "$NUM_CACHE_PAGES" \
             --max-requests "$MAX_REQUESTS" \
             --max-tokens "$MAX_TOKENS" \
@@ -907,8 +992,11 @@ run_named_case() {
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
-    27b_on)
-        run_mtp_case_sequence 27b "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$MTP_27B"
+    27b_mtp)
+        run_spec_case_sequence 27b mtp "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$MTP_27B"
+        ;;
+    27b_dspark)
+        run_spec_case_sequence 27b dspark "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$DSPARK_27B"
         ;;
     35b_off)
         run_server_case 35b_off "256 1024" target/release/qwen3_5_sparse \
@@ -919,8 +1007,11 @@ run_named_case() {
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
-    35b_on)
-        run_mtp_case_sequence 35b "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$MTP_35B"
+    35b_mtp)
+        run_spec_case_sequence 35b mtp "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$MTP_35B"
+        ;;
+    35b_dspark)
+        run_spec_case_sequence 35b dspark "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$DSPARK_35B"
         ;;
     *)
         echo "unknown case: $1" >&2
@@ -942,7 +1033,7 @@ OS_VERSION="$(sw_vers -productVersion 2>/dev/null || uname -s)"
 ARCH="$(uname -m)"
 MACHINE="$(current_machine_id)"
 BASELINE_CONFIG_MISMATCHES="$(baseline_config_mismatches "$MACHINE" "$OS_VERSION" "$ARCH")"
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH baseline_machine=$BASELINE_MACHINE baseline_date=$BASELINE_DATE baseline_commit=$BASELINE_COMMIT baseline_os=$BASELINE_OS_VERSION baseline_arch=$BASELINE_ARCH baseline_num_cache_pages=$BASELINE_NUM_CACHE_PAGES baseline_cache_block_tokens=$BASELINE_CACHE_BLOCK_TOKENS baseline_max_requests=$BASELINE_MAX_REQUESTS baseline_max_tokens=$BASELINE_MAX_TOKENS baseline_max_tokens_per_request=$BASELINE_MAX_TOKENS_PER_REQUEST baseline_case_cooldown_secs=$BASELINE_CASE_COOLDOWN_SECS baseline_logging=$BASELINE_LOGGING baseline_seed=$BASELINE_SEED baseline_min_runs=$BASELINE_MIN_RUNS baseline_config_mismatches=${BASELINE_CONFIG_MISMATCHES:-none} num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_steps=1,2,3,4 cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_chars=${#PROMPT} tokenizer=$TOKENIZER model_27b=$MODEL_27B mtp_27b=$MTP_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH baseline_machine=$BASELINE_MACHINE baseline_date=$BASELINE_DATE baseline_commit=$BASELINE_COMMIT baseline_os=$BASELINE_OS_VERSION baseline_arch=$BASELINE_ARCH baseline_num_cache_pages=$BASELINE_NUM_CACHE_PAGES baseline_cache_block_tokens=$BASELINE_CACHE_BLOCK_TOKENS baseline_max_requests=$BASELINE_MAX_REQUESTS baseline_max_tokens=$BASELINE_MAX_TOKENS baseline_max_tokens_per_request=$BASELINE_MAX_TOKENS_PER_REQUEST baseline_case_cooldown_secs=$BASELINE_CASE_COOLDOWN_SECS baseline_logging=$BASELINE_LOGGING baseline_seed=$BASELINE_SEED baseline_min_runs=$BASELINE_MIN_RUNS baseline_config_mismatches=${BASELINE_CONFIG_MISMATCHES:-none} num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST num_spec_tokens=1,2 cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_chars=${#PROMPT} tokenizer=$TOKENIZER model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B"
 for case_index in "${!selected_cases[@]}"; do
     case_name="${selected_cases[$case_index]}"
     if [[ "$case_index" -gt 0 && "$CASE_COOLDOWN_SECS" -gt 0 ]]; then
