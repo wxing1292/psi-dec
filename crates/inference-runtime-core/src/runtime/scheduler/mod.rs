@@ -26,6 +26,11 @@ pub use fifo_batcher::FIFOBatcher;
 mod schedule_queue;
 pub use schedule_queue::ScheduleQueue;
 
+mod token_budget_allocator;
+pub use token_budget_allocator::BatchBudget;
+pub use token_budget_allocator::ReqTokenInventory;
+pub use token_budget_allocator::allocate_sticky_token_budgets;
+
 #[mockall::automock]
 pub trait Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>
 where
