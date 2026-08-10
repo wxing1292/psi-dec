@@ -11,11 +11,12 @@ use crate::compute::DevReq;
 use crate::compute::DevResp;
 use crate::runtime::RawRequestID;
 use crate::runtime::scheduler::UserRequest;
+use crate::runtime::scheduler::dedup_vec_deque::DedupVecDeque;
 use crate::runtime::tasks::SwapOutTask;
 
 pub struct ScheduleQueue<UserReq, DeviceReq, DeviceResp> {
     id_requests: HashMap<RawRequestID, UserReq>,
-    run_queue: VecDeque<RawRequestID>,
+    run_queue: DedupVecDeque<RawRequestID>,
 
     new_queue: VecDeque<UserReq>,
     swap_out_task_tx: Sender<SwapOutTask<UserReq, DeviceReq, DeviceResp>>,
@@ -35,7 +36,7 @@ where
             id_requests: hash_map! {},
 
             new_queue: VecDeque::new(),
-            run_queue: VecDeque::new(),
+            run_queue: DedupVecDeque::new(),
             swap_out_task_tx,
 
             phantom_data_dev_req: PhantomData,

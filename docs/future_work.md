@@ -48,6 +48,11 @@ document that owns the component.
 
 ## Pipeline Parallelism
 
+- Define per-request in-flight readiness for overlapping Prefill and Decode batches. A response for an earlier batch
+  must not make a request runnable when a later request-local Decode is still in flight. Cover Prefill-to-Prefill and
+  Prefill-to-Decode sequences with `max_compute_slots > 1`.
+- Audit the Trie Decode fallback `token_index` after an overlapping MTP Prefill. The current no-ready-token path uses
+  `num_cached_tokens()`. It must account for the preceding scheduled range before runtime commit.
 - Add a bounded final-response reorder buffer for the scheduler and runtime core.
   The buffer holds completed future sequences.
   It releases only the next compute-slot sequence to FIFO commit.

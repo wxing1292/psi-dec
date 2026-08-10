@@ -1,5 +1,6 @@
 use crate::compute::DeviceRequest;
 use crate::compute::DeviceResponse;
+use crate::compute::QueryTokens;
 use crate::compute::SampledTokens;
 use crate::runtime::RawRequestID;
 use crate::runtime::decoder::trie_cache::DecoderBlocks;
@@ -12,6 +13,7 @@ use crate::runtime::request::internal_request::StopSequenceMatch;
 use crate::runtime::request::internal_request::stop_sequence::StopSequences;
 use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
+use crate::runtime::scheduler::PreparePhase;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::UserRequest;
 
@@ -69,6 +71,10 @@ where
 
         match self.decoder_blocks.prepare(token_budget) {
             Some(decoder_query_tokens) => {
+                let phase = match &decoder_query_tokens {
+                    QueryTokens::Prefill { .. } => PreparePhase::Prefill,
+                    QueryTokens::Decode { .. } => PreparePhase::Decode,
+                };
                 let decoder_sync_blocks = self.decoder_blocks.prepare_blocks();
                 let dev_req = DeviceRequest::new(
                     self.req_id(),
@@ -77,7 +83,7 @@ where
                     decoder_sync_blocks,
                     self.sampling_config().clone(),
                 );
-                PrepareResult::Continue(dev_req)
+                PrepareResult::Continue { dev_req, phase }
             },
             None => PrepareResult::Pending,
         }

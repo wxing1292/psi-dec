@@ -70,8 +70,14 @@ pub enum PrepareResult<DeviceReq> {
     ResourceLimitExceeded,
     Await { wait: Boxed<()> },
     Pending,
-    Continue(DeviceReq),
+    Continue { dev_req: DeviceReq, phase: PreparePhase },
     Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparePhase {
+    Prefill,
+    Decode,
 }
 
 pub enum CommitResult {

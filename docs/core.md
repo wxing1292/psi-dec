@@ -68,7 +68,7 @@ then use that block as a non-terminal prefix.
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ ScheduleQueue                                                              │
-│ new_queue | run_queue | ID -> request map | bounded swap-out task sender   │
+│ new_queue | unique run_queue | ID -> request map | swap-out task sender    │
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -94,8 +94,9 @@ then use that block as a non-terminal prefix.
            v               v                v                  v
 ┌──────────────────┐  ┌───────────────┐  ┌────────────────┐  ┌───────────────┐
 │ BatchDeviceReq   │  │ ID map only   │  │ swap-out task  │  │ preempt/drop  │
-│ ragged requests  │  │ await response│  │ async wait     │  │ or terminal   │
-└────────┬─────────┘  └───────────────┘  └────────────────┘  └───────────────┘
+│ Prefill: requeue │  │ await response│  │ async wait     │  │ or terminal   │
+│ Decode: map only │  └───────────────┘  └────────────────┘  └───────────────┘
+└────────┬─────────┘
          │ executor submission
          v
 ┌──────────────────┐     ┌───────────────────────────────────────────────────┐
@@ -119,6 +120,14 @@ then use that block as a non-terminal prefix.
 
 `PrepareResult::Pending` deliberately leaves the request in the ID map. It does not put the request on `run_queue`.
 Previously submitted work owns the next transition. The executor response returns the request through `commit`.
+
+`PrepareResult::Continue` carries a `PreparePhase`. A Prefill query returns to `run_queue` after preparation so that
+another Prefill query can enter the pipeline. A Decode query stays only in the ID map until a response commits or a
+cancellation restores it.
+
+`run_queue` stores each request ID at most once. `push_front` moves an existing ID to the front. `push_back` keeps an
+existing ID at its current position. Commit and cancellation can therefore restore a request without creating a
+second runnable occurrence.
 
 Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_queued_requests` bounds the
 user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and both reservation-task
@@ -426,6 +435,9 @@ request-ID map. It does not put the request back on the run queue. The model exe
 
 Do not requeue `Pending` requests. Device batch responses currently commit in submission order because decoder
 scheduled token ranges are FIFO-owned.
+
+Commit and cancellation put a continuing request at the front of the run queue. The queue deduplicates an ID that is
+already runnable.
 
 Pipeline stages can overlap. Their final responses must preserve submission order until core owns an explicit epoch or
 reorder buffer.

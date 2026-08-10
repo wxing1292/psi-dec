@@ -6,6 +6,7 @@ use crate::compute::DevResp;
 use crate::runtime::scheduler::Batcher;
 use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
+use crate::runtime::scheduler::PreparePhase;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::ScheduleQueue;
 use crate::runtime::scheduler::UserRequest;
@@ -108,7 +109,7 @@ where
                 PrepareResult::Pending => {
                     schedule_queue.insert(user_req);
                 },
-                PrepareResult::Continue(dev_req) => {
+                PrepareResult::Continue { dev_req, phase } => {
                     let req_cost = dev_req.req_cost();
                     let token_cost = dev_req.token_cost();
                     debug_assert!(
@@ -121,7 +122,10 @@ where
                     );
                     req_budget -= req_cost;
                     token_budget -= token_cost;
-                    self.running_reqs.push(user_req);
+                    match phase {
+                        PreparePhase::Prefill => self.running_reqs.push(user_req),
+                        PreparePhase::Decode => schedule_queue.insert(user_req),
+                    }
                     dev_reqs.push(dev_req);
                 },
                 PrepareResult::Terminal => { /* noop */ },
@@ -193,8 +197,27 @@ mod tests {
             new_test_scheduled_req(2, 8, 1, 8),
             new_test_scheduled_req(3, 8, 1, 8),
         ];
+        let mut seq = Sequence::new();
+        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len());
+        for scheduled_req in &scheduled_reqs {
+            let mut user_req = mock_user_req(scheduled_req.req_id);
+            expect_prefill_prepare(&mut seq, &mut user_req, scheduled_req);
+            user_reqs.push(user_req);
+        }
+        for user_req in &mut user_reqs {
+            expect_cancel(&mut seq, user_req);
+        }
 
-        test_prepare_cancel(req_budget, token_budget, max_token_per_req, &scheduled_reqs, &[]);
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        for user_req in user_reqs {
+            schedule_queue.push_back(user_req);
+        }
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), scheduled_reqs.len());
+        batcher.cancel(&mut schedule_queue, dev_reqs);
     }
 
     #[test]
@@ -203,8 +226,28 @@ mod tests {
         let token_budget = 12;
         let max_token_per_req = 8;
         let scheduled_reqs = [new_test_scheduled_req(1, 8, 1, 8), new_test_scheduled_req(2, 4, 1, 4)];
+        let mut seq = Sequence::new();
+        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len() + 1);
+        for scheduled_req in &scheduled_reqs {
+            let mut user_req = mock_user_req(scheduled_req.req_id);
+            expect_prefill_prepare(&mut seq, &mut user_req, scheduled_req);
+            user_reqs.push(user_req);
+        }
+        user_reqs.push(mock_user_req(3));
+        for user_req in user_reqs.iter_mut().take(scheduled_reqs.len()) {
+            expect_cancel(&mut seq, user_req);
+        }
 
-        test_prepare_cancel(req_budget, token_budget, max_token_per_req, &scheduled_reqs, &[3]);
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        for user_req in user_reqs {
+            schedule_queue.push_back(user_req);
+        }
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), scheduled_reqs.len());
+        batcher.cancel(&mut schedule_queue, dev_reqs);
     }
 
     #[test]
@@ -213,8 +256,28 @@ mod tests {
         let token_budget = 24;
         let max_token_per_req = 8;
         let scheduled_reqs = [new_test_scheduled_req(1, 8, 1, 8), new_test_scheduled_req(2, 8, 1, 8)];
+        let mut seq = Sequence::new();
+        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len() + 1);
+        for scheduled_req in &scheduled_reqs {
+            let mut user_req = mock_user_req(scheduled_req.req_id);
+            expect_prefill_prepare(&mut seq, &mut user_req, scheduled_req);
+            user_reqs.push(user_req);
+        }
+        user_reqs.push(mock_user_req(3));
+        for user_req in user_reqs.iter_mut().take(scheduled_reqs.len()) {
+            expect_cancel(&mut seq, user_req);
+        }
 
-        test_prepare_cancel(req_budget, token_budget, max_token_per_req, &scheduled_reqs, &[3]);
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        for user_req in user_reqs {
+            schedule_queue.push_back(user_req);
+        }
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), scheduled_reqs.len());
+        batcher.cancel(&mut schedule_queue, dev_reqs);
     }
 
     #[test]
@@ -227,8 +290,31 @@ mod tests {
             new_test_scheduled_req(2, 8, 1, 8),
             new_test_scheduled_req(3, 8, 1, 8),
         ];
+        let mut seq = Sequence::new();
+        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len());
+        for scheduled_req in &scheduled_reqs {
+            let mut user_req = mock_user_req(scheduled_req.req_id);
+            expect_prefill_prepare(&mut seq, &mut user_req, scheduled_req);
+            user_reqs.push(user_req);
+        }
+        for user_req in &mut user_reqs {
+            expect_commit(&mut seq, user_req);
+        }
 
-        test_prepare_commit(req_budget, token_budget, max_token_per_req, &scheduled_reqs, &[]);
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        for user_req in user_reqs {
+            schedule_queue.push_back(user_req);
+        }
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), scheduled_reqs.len());
+        let dev_resps = scheduled_reqs
+            .iter()
+            .map(|scheduled_req| mock_dev_resp(scheduled_req.req_id))
+            .collect();
+        batcher.commit(&mut schedule_queue, dev_resps);
     }
 
     #[test]
@@ -237,8 +323,32 @@ mod tests {
         let token_budget = 12;
         let max_token_per_req = 8;
         let scheduled_reqs = [new_test_scheduled_req(1, 8, 1, 8), new_test_scheduled_req(2, 4, 1, 4)];
+        let mut seq = Sequence::new();
+        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len() + 1);
+        for scheduled_req in &scheduled_reqs {
+            let mut user_req = mock_user_req(scheduled_req.req_id);
+            expect_prefill_prepare(&mut seq, &mut user_req, scheduled_req);
+            user_reqs.push(user_req);
+        }
+        user_reqs.push(mock_user_req(3));
+        for user_req in user_reqs.iter_mut().take(scheduled_reqs.len()) {
+            expect_commit(&mut seq, user_req);
+        }
 
-        test_prepare_commit(req_budget, token_budget, max_token_per_req, &scheduled_reqs, &[3]);
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        for user_req in user_reqs {
+            schedule_queue.push_back(user_req);
+        }
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), scheduled_reqs.len());
+        let dev_resps = scheduled_reqs
+            .iter()
+            .map(|scheduled_req| mock_dev_resp(scheduled_req.req_id))
+            .collect();
+        batcher.commit(&mut schedule_queue, dev_resps);
     }
 
     #[test]
@@ -247,8 +357,217 @@ mod tests {
         let token_budget = 24;
         let max_token_per_req = 8;
         let scheduled_reqs = [new_test_scheduled_req(1, 8, 1, 8), new_test_scheduled_req(2, 8, 1, 8)];
+        let mut seq = Sequence::new();
+        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len() + 1);
+        for scheduled_req in &scheduled_reqs {
+            let mut user_req = mock_user_req(scheduled_req.req_id);
+            expect_prefill_prepare(&mut seq, &mut user_req, scheduled_req);
+            user_reqs.push(user_req);
+        }
+        user_reqs.push(mock_user_req(3));
+        for user_req in user_reqs.iter_mut().take(scheduled_reqs.len()) {
+            expect_commit(&mut seq, user_req);
+        }
 
-        test_prepare_commit(req_budget, token_budget, max_token_per_req, &scheduled_reqs, &[3]);
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        for user_req in user_reqs {
+            schedule_queue.push_back(user_req);
+        }
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), scheduled_reqs.len());
+        let dev_resps = scheduled_reqs
+            .iter()
+            .map(|scheduled_req| mock_dev_resp(scheduled_req.req_id))
+            .collect();
+        batcher.commit(&mut schedule_queue, dev_resps);
+    }
+
+    #[test]
+    fn test_prepare_cancel_tracks_prefill_and_decode() {
+        let prefill_req_id = 1;
+        let decode_req_id = 2;
+        let token_budget_per_req = 8;
+        let mut seq = Sequence::new();
+
+        let mut prefill_req = mock_user_req(prefill_req_id);
+        prefill_req
+            .expect_token_estimate()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_const(token_budget_per_req);
+        prefill_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(move |_| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(prefill_req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget_per_req);
+                PrepareResult::Continue {
+                    dev_req,
+                    phase: PreparePhase::Prefill,
+                }
+            });
+
+        let mut decode_req = mock_user_req(decode_req_id);
+        decode_req
+            .expect_token_estimate()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_const(token_budget_per_req);
+        decode_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(move |_| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(decode_req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget_per_req);
+                PrepareResult::Continue {
+                    dev_req,
+                    phase: PreparePhase::Decode,
+                }
+            });
+
+        prefill_req
+            .expect_cancel()
+            .once()
+            .in_sequence(&mut seq)
+            .return_once(|_| CancelResult::Continue);
+        decode_req
+            .expect_cancel()
+            .once()
+            .in_sequence(&mut seq)
+            .return_once(|_| CancelResult::Continue);
+
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        schedule_queue.push_back(prefill_req);
+        schedule_queue.push_back(decode_req);
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(2, 2 * token_budget_per_req, token_budget_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), 2);
+        assert!(schedule_queue.get(&prefill_req_id).is_some());
+        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 1);
+
+        let prefill_req = schedule_queue
+            .pop_front()
+            .expect("prepared Prefill request must remain runnable");
+        assert_eq!(prefill_req.id(), prefill_req_id);
+        assert!(schedule_queue.pop_front().is_none());
+        schedule_queue.push_back(prefill_req);
+
+        batcher.cancel(&mut schedule_queue, dev_reqs);
+        assert!(schedule_queue.get(&prefill_req_id).is_some());
+        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 2);
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(decode_req_id));
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(prefill_req_id));
+        assert!(schedule_queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_prepare_commit_tracks_prefill_and_decode() {
+        let prefill_req_id = 1;
+        let decode_req_id = 2;
+        let token_budget_per_req = 8;
+        let mut seq = Sequence::new();
+
+        let mut prefill_req = mock_user_req(prefill_req_id);
+        prefill_req
+            .expect_token_estimate()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_const(token_budget_per_req);
+        prefill_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(move |_| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(prefill_req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget_per_req);
+                PrepareResult::Continue {
+                    dev_req,
+                    phase: PreparePhase::Prefill,
+                }
+            });
+
+        let mut decode_req = mock_user_req(decode_req_id);
+        decode_req
+            .expect_token_estimate()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_const(token_budget_per_req);
+        decode_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(move |_| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(decode_req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget_per_req);
+                PrepareResult::Continue {
+                    dev_req,
+                    phase: PreparePhase::Decode,
+                }
+            });
+
+        prefill_req
+            .expect_commit()
+            .once()
+            .in_sequence(&mut seq)
+            .return_once(|_| CommitResult::Continue);
+        decode_req
+            .expect_commit()
+            .once()
+            .in_sequence(&mut seq)
+            .return_once(|_| CommitResult::Continue);
+
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        schedule_queue.push_back(prefill_req);
+        schedule_queue.push_back(decode_req);
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(2, 2 * token_budget_per_req, token_budget_per_req, &mut schedule_queue);
+        assert_eq!(dev_reqs.len(), 2);
+        assert!(schedule_queue.get(&prefill_req_id).is_some());
+        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 1);
+
+        let prefill_req = schedule_queue
+            .pop_front()
+            .expect("prepared Prefill request must remain runnable");
+        assert_eq!(prefill_req.id(), prefill_req_id);
+        assert!(schedule_queue.pop_front().is_none());
+        schedule_queue.push_back(prefill_req);
+
+        let mut prefill_resp = MockDevResp::new();
+        prefill_resp.expect_id().return_const(prefill_req_id);
+        let mut decode_resp = MockDevResp::new();
+        decode_resp.expect_id().return_const(decode_req_id);
+        batcher.commit(&mut schedule_queue, vec![prefill_resp, decode_resp]);
+
+        assert!(schedule_queue.get(&prefill_req_id).is_some());
+        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 2);
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(decode_req_id));
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(prefill_req_id));
+        assert!(schedule_queue.pop_front().is_none());
     }
 
     #[test]
@@ -330,94 +649,6 @@ mod tests {
         assert_eq!(schedule_queue.run_queue_size(), 0);
     }
 
-    fn test_prepare_cancel(
-        req_budget: usize,
-        token_budget: usize,
-        max_token_per_req: usize,
-        scheduled_reqs: &[TestScheduledReq],
-        unscheduled_req_ids: &[RawRequestID],
-    ) {
-        let mut seq = Sequence::new();
-        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len() + unscheduled_req_ids.len());
-
-        for scheduled_req in scheduled_reqs {
-            let mut user_req = mock_user_req(scheduled_req.req_id);
-            expect_prepare(
-                &mut seq,
-                &mut user_req,
-                scheduled_req.prepare_token_budget,
-                scheduled_req.req_id,
-                scheduled_req.req_cost,
-                scheduled_req.token_cost,
-            );
-            user_reqs.push(user_req);
-        }
-        for &req_id in unscheduled_req_ids {
-            user_reqs.push(mock_user_req(req_id));
-        }
-        for user_req in user_reqs.iter_mut().take(scheduled_reqs.len()) {
-            expect_cancel(&mut seq, user_req);
-        }
-
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
-        for user_req in user_reqs {
-            schedule_queue.push_back(user_req);
-        }
-
-        let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
-        assert_eq!(scheduled_reqs.len(), dev_reqs.len());
-
-        batcher.cancel(&mut schedule_queue, dev_reqs);
-    }
-
-    fn test_prepare_commit(
-        req_budget: usize,
-        token_budget: usize,
-        max_token_per_req: usize,
-        scheduled_reqs: &[TestScheduledReq],
-        unscheduled_req_ids: &[RawRequestID],
-    ) {
-        let mut seq = Sequence::new();
-        let mut user_reqs = Vec::with_capacity(scheduled_reqs.len() + unscheduled_req_ids.len());
-
-        for scheduled_req in scheduled_reqs {
-            let mut user_req = mock_user_req(scheduled_req.req_id);
-            expect_prepare(
-                &mut seq,
-                &mut user_req,
-                scheduled_req.prepare_token_budget,
-                scheduled_req.req_id,
-                scheduled_req.req_cost,
-                scheduled_req.token_cost,
-            );
-            user_reqs.push(user_req);
-        }
-        for &req_id in unscheduled_req_ids {
-            user_reqs.push(mock_user_req(req_id));
-        }
-        for user_req in user_reqs.iter_mut().take(scheduled_reqs.len()) {
-            expect_commit(&mut seq, user_req);
-        }
-
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
-        for user_req in user_reqs {
-            schedule_queue.push_back(user_req);
-        }
-
-        let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
-        assert_eq!(scheduled_reqs.len(), dev_reqs.len());
-
-        let dev_resps = scheduled_reqs
-            .iter()
-            .map(|scheduled_req| mock_dev_resp(scheduled_req.req_id))
-            .collect();
-        batcher.commit(&mut schedule_queue, dev_resps);
-    }
-
     #[derive(Clone, Copy)]
     struct TestScheduledReq {
         req_id: RawRequestID,
@@ -446,30 +677,32 @@ mod tests {
         user_req
     }
 
-    fn expect_prepare(
-        seq: &mut Sequence,
-        user_req: &mut TestUserReq,
-        token_budget: usize,
-        req_id: RawRequestID,
-        req_cost: usize,
-        token_cost: usize,
-    ) {
+    fn expect_prefill_prepare(seq: &mut Sequence, user_req: &mut TestUserReq, scheduled_req: &TestScheduledReq) {
+        let TestScheduledReq {
+            req_id,
+            prepare_token_budget,
+            req_cost,
+            token_cost,
+        } = *scheduled_req;
         user_req
             .expect_token_estimate()
-            .with(eq(token_budget))
+            .with(eq(prepare_token_budget))
             .in_sequence(seq)
-            .return_const(token_budget);
+            .return_const(prepare_token_budget);
         user_req
             .expect_prepare()
             .once()
-            .with(eq(token_budget))
+            .with(eq(prepare_token_budget))
             .in_sequence(seq)
             .return_once(move |_| {
                 let mut dev_req = MockDevReq::new();
                 dev_req.expect_id().return_const(req_id);
                 dev_req.expect_req_cost().once().return_const(req_cost);
                 dev_req.expect_token_cost().once().return_const(token_cost);
-                PrepareResult::Continue(dev_req)
+                PrepareResult::Continue {
+                    dev_req,
+                    phase: PreparePhase::Prefill,
+                }
             });
     }
 
