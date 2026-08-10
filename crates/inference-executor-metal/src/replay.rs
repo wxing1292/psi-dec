@@ -33,6 +33,10 @@ impl<T: ReplayComponent> Replay<T> {
         &self.component
     }
 
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
     pub fn record<'a>(&'a mut self, runtime: &MetalReplayRuntime<'_>, input: &T::Input<'a>) -> (T::Key, bool) {
         let key = self.component.replay_key(input);
         let cache_hit = self.cache.contains(&key);
@@ -84,6 +88,10 @@ where
         self.entries
             .get(key)
             .unwrap_or_else(|| panic!("{} replay cache missing recorded batch for key {:?}", self.name, key))
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 

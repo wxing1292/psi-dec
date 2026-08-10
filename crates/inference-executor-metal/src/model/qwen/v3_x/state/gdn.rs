@@ -207,6 +207,14 @@ impl Qwen3xGDNState {
         submission.wait();
     }
 
+    pub fn clear_replay_cache(&mut self) {
+        assert!(
+            self.pending_publish.is_none(),
+            "GDN replay cache cannot be cleared while a state publish is pending"
+        );
+        self.state_restore.clear();
+    }
+
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {
         self.request_state_table.reset_req_slots(req_slots);
     }

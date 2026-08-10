@@ -122,6 +122,13 @@ impl Qwen3Speculator {
             dspark.spec_probs.reset_req_slots(request_slots);
         }
     }
+
+    fn clear_replay_cache(&mut self) {
+        if let Self::DSpark(dspark) = self {
+            dspark.execution.clear_replay_cache();
+            dspark.rejection_sampling.clear();
+        }
+    }
 }
 
 pub struct Qwen3Executor {
@@ -151,6 +158,16 @@ pub struct Qwen3Executor {
     pending_transactions: Qwen3PendingTransactions,
     gqa_page_table_layout: GQAPageTableLayout,
     num_runtime_page_ids_per_block: usize,
+}
+
+impl Qwen3Executor {
+    pub fn clear_replay_cache(&mut self) {
+        self.main_embed.clear();
+        self.main.clear();
+        self.gather_unembed.clear();
+        self.sampling.clear();
+        self.speculator.clear_replay_cache();
+    }
 }
 
 pub struct Qwen3ModelOpsRecorder {

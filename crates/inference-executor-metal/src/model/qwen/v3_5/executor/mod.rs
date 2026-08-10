@@ -243,6 +243,22 @@ impl Qwen35Speculator {
             },
         }
     }
+
+    fn clear_replay_cache(&mut self) {
+        match self {
+            Self::Vanilla => {},
+            Self::MTP(mtp) => {
+                mtp.embed.clear();
+                mtp.body.clear();
+                mtp.sampling.clear();
+                mtp.common.rejection_sampling.clear();
+            },
+            Self::DSpark(dspark) => {
+                dspark.execution.clear_replay_cache();
+                dspark.common.rejection_sampling.clear();
+            },
+        }
+    }
 }
 
 pub struct Qwen35Executor {
@@ -272,6 +288,17 @@ pub struct Qwen35Executor {
     pending_transactions: Qwen35PendingTransactions,
     gqa_page_table_layout: GQAPageTableLayout,
     num_runtime_page_ids_per_main_block: usize,
+}
+
+impl Qwen35Executor {
+    pub fn clear_replay_cache(&mut self) {
+        self.main_embed.clear();
+        self.main.clear();
+        self.gather_unembed.clear();
+        self.sampling.clear();
+        self.main_gdn_state.clear_replay_cache();
+        self.speculator.clear_replay_cache();
+    }
 }
 
 pub struct Qwen35ModelOpsRecorder {

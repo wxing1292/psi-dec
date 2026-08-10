@@ -159,6 +159,14 @@ impl Qwen3xDSparkExecution {
         self.gqa_state.reset_req_slots(request_slots);
     }
 
+    pub fn clear_replay_cache(&mut self) {
+        self.context.clear();
+        self.embed.clear();
+        self.body.clear();
+        self.gather_unembed.clear();
+        self.sampling.clear();
+    }
+
     pub fn prepare_page_span(
         &self,
         core_batch: &BatchDeviceRequest,
