@@ -250,6 +250,15 @@ impl Qwen3xDSparkMainFeatureProjector {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(
+            self.weights.is_some(),
+            "Qwen3.x DSpark Main-feature weights are not loaded"
+        );
+        self.weights.take();
+        self.hidden_norm.unload_weights();
+    }
+
     pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
         self.residual_bindings
             .get(model_layer_index)

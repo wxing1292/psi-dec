@@ -140,6 +140,13 @@ impl Qwen35MTPLayer {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.post_attention_norm.unload_weights();
+        self.input_norm.unload_weights();
+        self.mlp.unload_weights();
+        self.attention.unload_weights();
+    }
+
     pub fn gqa_tokens_per_page(&self) -> usize {
         self.attention.num_tokens_per_page()
     }
@@ -320,6 +327,13 @@ impl Qwen35MTPMLP {
                 component.load_weights(device, store, &core, metal, *bindings)
             },
             _ => panic!("qwen3.5 MTP layer MLP config and checkpoint bindings must have the same kind"),
+        }
+    }
+
+    fn unload_weights(&mut self) {
+        match self {
+            Self::Dense(component) => component.unload_weights(),
+            Self::MoE(component) => component.unload_weights(),
         }
     }
 

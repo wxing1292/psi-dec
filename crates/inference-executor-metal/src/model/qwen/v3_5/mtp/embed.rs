@@ -40,7 +40,7 @@ const QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS: ReplayParameterKey =
     ReplayParameterKey::new("test.qwen3.5.mtp_embed.reference_num_active_tokens");
 
 pub struct Qwen35MTPEmbed {
-    embed: Rc<Embed>,
+    embed: Option<Rc<Embed>>,
     input_gather: Gather,
     hidden_norm: RMSNorm,
     embedding_norm: RMSNorm,
@@ -113,7 +113,7 @@ impl Qwen35MTPEmbed {
         let replay_bucket_policy =
             ReplayBucketPolicy::with_topology_boundaries(max_tokens_u32, &fc.topology_boundaries());
         Ok(Self {
-            embed,
+            embed: Some(embed),
             input_gather: Gather::new(
                 device,
                 hidden_dim
@@ -166,10 +166,36 @@ impl Qwen35MTPEmbed {
         Ok(())
     }
 
+    pub fn load_shared_weights(&mut self, embed: Rc<Embed>) {
+        assert!(
+            self.embed.is_none(),
+            "qwen3.5 MTP shared embed weights are already loaded"
+        );
+        self.embed = Some(embed);
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(
+            self.projection_weights.is_some(),
+            "qwen3.5 MTP embed weights are not loaded"
+        );
+        self.projection_weights.take();
+        self.embedding_norm.unload_weights();
+        self.hidden_norm.unload_weights();
+        assert!(self.embed.is_some(), "qwen3.5 MTP shared embed weights are not loaded");
+        self.embed.take();
+    }
+
     fn projection_weights(&self) -> &Qwen35MTPProjectionWeights {
         self.projection_weights
             .as_ref()
             .expect("qwen3.5 MTP embed weights must be loaded before execution")
+    }
+
+    fn loaded_embed(&self) -> &Embed {
+        self.embed
+            .as_deref()
+            .expect("qwen3.5 MTP shared embed weights must be loaded before execution")
     }
 
     #[cfg(test)]
@@ -280,7 +306,7 @@ impl Qwen35MTPEmbed {
             args.prev_hidden_input,
         );
         let _ = <Embed as ReplayLayer>::record(
-            &self.embed,
+            self.loaded_embed(),
             recorder,
             EmbedInput {
                 num_tokens,
@@ -330,7 +356,7 @@ impl Qwen35MTPEmbed {
             args.prev_hidden_indices,
             args.prev_hidden_input,
         );
-        let _ = self.embed.record_bucketed(
+        let _ = self.loaded_embed().record_bucketed(
             recorder,
             num_total_tokens,
             QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
@@ -862,7 +888,7 @@ mod tests {
         let mut embedding_norm = RMSNorm::new(device, HIDDEN_DIM as usize, 1e-6);
         embedding_norm.load_weights(Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16));
         Qwen35MTPEmbed {
-            embed,
+            embed: Some(embed),
             input_gather: Gather::new(device, HIDDEN_DIM),
             hidden_norm,
             embedding_norm,

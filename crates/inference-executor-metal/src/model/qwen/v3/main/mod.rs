@@ -102,6 +102,22 @@ impl Qwen3Main {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.final_norm.unload_weights();
+        for layer in self.layers.iter_mut().rev() {
+            layer.unload_weights();
+        }
+        self.residual_capture.take();
+    }
+
+    pub fn set_residual_capture(&mut self, residual_capture: Option<Rc<dyn MainResidualCapture>>) {
+        assert!(
+            self.residual_capture.is_none(),
+            "qwen3 Main residual capture is already attached"
+        );
+        self.residual_capture = residual_capture;
+    }
+
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen3MainArgs<'a>) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,

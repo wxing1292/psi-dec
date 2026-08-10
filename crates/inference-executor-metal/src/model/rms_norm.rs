@@ -31,6 +31,11 @@ impl RMSNorm {
         self.weight = Some(weight);
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(self.weight.is_some(), "RMS norm weights are not loaded");
+        self.weight.take();
+    }
+
     fn weight(&self) -> &Buffer {
         self.weight
             .as_ref()

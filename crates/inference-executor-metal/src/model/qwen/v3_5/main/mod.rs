@@ -145,6 +145,22 @@ impl Qwen35Main {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.final_norm.unload_weights();
+        for layer in self.layers.iter_mut().rev() {
+            layer.unload_weights();
+        }
+        self.residual_capture.take();
+    }
+
+    pub fn set_residual_capture(&mut self, residual_capture: Option<Rc<dyn MainResidualCapture>>) {
+        assert!(
+            self.residual_capture.is_none(),
+            "qwen3.5 Main residual capture is already attached"
+        );
+        self.residual_capture = residual_capture;
+    }
+
     pub fn replay_token_capacity(&self, num_active_tokens: u32) -> u32 {
         self.replay_bucket_policy.capacity(num_active_tokens)
     }

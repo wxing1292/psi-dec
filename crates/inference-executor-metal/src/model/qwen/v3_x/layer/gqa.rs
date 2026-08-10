@@ -66,6 +66,11 @@ impl Qwen3xGQA {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(self.weights.is_some(), "Qwen3.x GQA weights are not loaded");
+        self.weights.take();
+    }
+
     fn weights(&self) -> &Qwen3xGQAWeights {
         self.weights
             .as_ref()

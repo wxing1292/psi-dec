@@ -128,6 +128,11 @@ impl Qwen35MTP {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.output_norm.unload_weights();
+        self.layer.unload_weights();
+    }
+
     pub fn replay_token_capacity(&self, num_active_tokens: u32) -> u32 {
         self.replay_bucket_policy.capacity(num_active_tokens)
     }

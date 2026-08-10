@@ -133,6 +133,15 @@ impl Qwen3xDSparkMarkov {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(
+            self.weights.is_some() && self.confidence.is_some(),
+            "Qwen3.x DSpark Markov weights are not loaded"
+        );
+        self.confidence.take();
+        self.weights.take();
+    }
+
     pub fn prepare(
         &self,
         req_slots: &[u32],

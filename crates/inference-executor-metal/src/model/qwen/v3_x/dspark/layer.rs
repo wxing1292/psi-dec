@@ -143,6 +143,13 @@ impl Qwen3xDSparkLayer {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.post_attention_norm.unload_weights();
+        self.input_norm.unload_weights();
+        self.mlp.unload_weights();
+        self.attention.unload_weights();
+    }
+
     pub fn residual_output(&self) -> &Buffer {
         self.scratch.residual_stream(self.dspark_layer_index)
     }

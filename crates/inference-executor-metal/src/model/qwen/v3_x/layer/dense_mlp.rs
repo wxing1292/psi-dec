@@ -54,6 +54,11 @@ impl Qwen3xDenseMLP {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(self.weights.is_some(), "Qwen3.x dense MLP weights are not loaded");
+        self.weights.take();
+    }
+
     fn weights(&self) -> &DenseMLPWeightBuffers {
         self.weights
             .as_ref()

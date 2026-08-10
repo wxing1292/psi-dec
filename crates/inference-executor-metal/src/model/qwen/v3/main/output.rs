@@ -14,7 +14,7 @@ use crate::replay::ReplayComponent;
 
 pub struct Qwen3GatherUnembed {
     gather: Gather,
-    unembed: Rc<Unembed>,
+    unembed: Option<Rc<Unembed>>,
 }
 
 #[derive(Clone, Copy)]
@@ -30,12 +30,32 @@ impl Qwen3GatherUnembed {
     pub fn new(device: &Device, hidden_dim: u32, unembed: Rc<Unembed>) -> Self {
         Self {
             gather: Gather::new(device, hidden_dim),
-            unembed,
+            unembed: Some(unembed),
         }
     }
 
     pub fn unembed(&self) -> Rc<Unembed> {
-        Rc::clone(&self.unembed)
+        Rc::clone(
+            self.unembed
+                .as_ref()
+                .expect("qwen3 GatherUnembed weights must be loaded before use"),
+        )
+    }
+
+    pub fn load_weights(&mut self, unembed: Rc<Unembed>) {
+        assert!(self.unembed.is_none(), "qwen3 GatherUnembed weights are already loaded");
+        self.unembed = Some(unembed);
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(self.unembed.is_some(), "qwen3 GatherUnembed weights are not loaded");
+        self.unembed.take();
+    }
+
+    fn loaded_unembed(&self) -> &Unembed {
+        self.unembed
+            .as_deref()
+            .expect("qwen3 GatherUnembed weights must be loaded before execution")
     }
 
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen3GatherUnembedArgs<'a>) -> &'a Buffer
@@ -50,7 +70,7 @@ impl Qwen3GatherUnembed {
             args.hidden_output,
         );
         <Unembed as ReplayLayer>::record(
-            &self.unembed,
+            self.loaded_unembed(),
             recorder,
             UnembedInput {
                 num_rows: args.num_rows,

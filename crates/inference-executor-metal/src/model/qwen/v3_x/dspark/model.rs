@@ -161,6 +161,16 @@ impl Qwen3xDSparkModel {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.final_norm.unload_weights();
+        for layer in self.layers.iter_mut().rev() {
+            layer.unload_weights();
+        }
+        Rc::get_mut(&mut self.main_feature_projector)
+            .expect("DSpark Main-feature projector must be uniquely owned during weight unloading")
+            .unload_weights();
+    }
+
     pub fn main_feature_projector(&self) -> Rc<Qwen3xDSparkMainFeatureProjector> {
         Rc::clone(&self.main_feature_projector)
     }

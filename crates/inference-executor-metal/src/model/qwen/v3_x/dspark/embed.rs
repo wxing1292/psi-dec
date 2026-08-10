@@ -9,7 +9,7 @@ use crate::model::embedding::EmbedInput;
 use crate::replay::ReplayComponent;
 
 pub struct Qwen3xDSparkEmbed {
-    embed: Rc<Embed>,
+    embed: Option<Rc<Embed>>,
 }
 
 #[derive(Clone, Copy)]
@@ -26,7 +26,23 @@ pub struct Qwen3xDSparkEmbedReplayKey {
 
 impl Qwen3xDSparkEmbed {
     pub fn new(embed: Rc<Embed>) -> Self {
-        Self { embed }
+        Self { embed: Some(embed) }
+    }
+
+    pub fn load_weights(&mut self, embed: Rc<Embed>) {
+        assert!(self.embed.is_none(), "Qwen3.x DSpark embed weights are already loaded");
+        self.embed = Some(embed);
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(self.embed.is_some(), "Qwen3.x DSpark embed weights are not loaded");
+        self.embed.take();
+    }
+
+    fn embed(&self) -> &Embed {
+        self.embed
+            .as_deref()
+            .expect("Qwen3.x DSpark embed weights must be loaded before execution")
     }
 }
 
@@ -42,7 +58,7 @@ impl ReplayComponent for Qwen3xDSparkEmbed {
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         let _ = <Embed as ReplayLayer>::record(
-            &self.embed,
+            self.embed(),
             recorder,
             EmbedInput {
                 num_tokens: input.num_tokens,

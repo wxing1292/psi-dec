@@ -121,6 +121,11 @@ impl Embed {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(self.weights.is_some(), "embedding weights are not loaded");
+        self.weights.take();
+    }
+
     fn validate_weights(&self) {
         let config = self.config.config();
         let weights = self.weights();

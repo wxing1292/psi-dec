@@ -24,7 +24,7 @@ const QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS: ReplayParameterKey =
 
 pub struct Qwen35GatherUnembed {
     gather: Gather,
-    unembed: Rc<Unembed>,
+    unembed: Option<Rc<Unembed>>,
     replay_bucket_policy: ReplayBucketPolicy,
 }
 
@@ -43,13 +43,36 @@ impl Qwen35GatherUnembed {
             ReplayBucketPolicy::with_topology_boundaries(unembed.max_tokens(), &unembed.replay_topology_boundaries());
         Self {
             gather: Gather::new(device, hidden_dim),
-            unembed,
+            unembed: Some(unembed),
             replay_bucket_policy,
         }
     }
 
     pub fn unembed(&self) -> Rc<Unembed> {
-        Rc::clone(&self.unembed)
+        Rc::clone(
+            self.unembed
+                .as_ref()
+                .expect("qwen3.5 GatherUnembed weights must be loaded before use"),
+        )
+    }
+
+    pub fn load_weights(&mut self, unembed: Rc<Unembed>) {
+        assert!(
+            self.unembed.is_none(),
+            "qwen3.5 GatherUnembed weights are already loaded"
+        );
+        self.unembed = Some(unembed);
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(self.unembed.is_some(), "qwen3.5 GatherUnembed weights are not loaded");
+        self.unembed.take();
+    }
+
+    fn loaded_unembed(&self) -> &Unembed {
+        self.unembed
+            .as_deref()
+            .expect("qwen3.5 GatherUnembed weights must be loaded before execution")
     }
 
     pub fn max_rows(&self) -> u32 {
@@ -68,7 +91,7 @@ impl Qwen35GatherUnembed {
             args.hidden_output,
         );
         <Unembed as ReplayLayer>::record(
-            &self.unembed,
+            self.loaded_unembed(),
             recorder,
             UnembedInput {
                 num_rows: args.num_rows,
@@ -99,8 +122,8 @@ impl Qwen35GatherUnembed {
             "qwen3.5 GatherUnembed replay total row count must match its selected bucket"
         );
         assert_eq!(
-            self.unembed.replay_topology(args.num_rows),
-            self.unembed.replay_topology(num_total_rows),
+            self.loaded_unembed().replay_topology(args.num_rows),
+            self.loaded_unembed().replay_topology(num_total_rows),
             "qwen3.5 GatherUnembed replay bucket must preserve unembed topology"
         );
         self.gather.record_bucketed(
@@ -111,7 +134,7 @@ impl Qwen35GatherUnembed {
             args.row_indices,
             args.hidden_output,
         );
-        self.unembed.record_bucketed(
+        self.loaded_unembed().record_bucketed(
             recorder,
             UnembedBucketedInput {
                 num_total_rows,
@@ -124,7 +147,10 @@ impl Qwen35GatherUnembed {
 
     fn replay_key_for_active_rows(&self, num_active_rows: u32) -> Qwen35GatherUnembedReplayKey {
         let num_total_rows = self.replay_bucket_policy.capacity(num_active_rows);
-        Qwen35GatherUnembedReplayKey::for_capacity(num_total_rows, self.unembed.replay_topology(num_total_rows))
+        Qwen35GatherUnembedReplayKey::for_capacity(
+            num_total_rows,
+            self.loaded_unembed().replay_topology(num_total_rows),
+        )
     }
 }
 
@@ -298,17 +324,17 @@ mod tests {
         for num_active_rows in 1..=MAX_ROWS {
             let key = component.replay_key_for_active_rows(num_active_rows);
             assert_eq!(
-                component.unembed.replay_topology(num_active_rows),
-                component.unembed.replay_topology(key.num_total_rows),
+                component.loaded_unembed().replay_topology(num_active_rows),
+                component.loaded_unembed().replay_topology(key.num_total_rows),
                 "num_active_rows={num_active_rows} num_total_rows={}",
                 key.num_total_rows
             );
             assert_eq!(
                 key.unembed_topology,
-                Some(component.unembed.replay_topology(key.num_total_rows))
+                Some(component.loaded_unembed().replay_topology(key.num_total_rows))
             );
         }
-        for boundary in component.unembed.replay_topology_boundaries() {
+        for boundary in component.loaded_unembed().replay_topology_boundaries() {
             if boundary > 1 && boundary <= MAX_ROWS {
                 assert_eq!(component.replay_bucket_policy.capacity(boundary - 1), boundary - 1);
             }

@@ -11,7 +11,7 @@ use crate::model::embedding::EmbedInput;
 use crate::replay::ReplayComponent;
 
 pub struct Qwen3MainEmbed {
-    embed: Rc<Embed>,
+    embed: Option<Rc<Embed>>,
 }
 
 #[derive(Clone, Copy)]
@@ -23,7 +23,23 @@ pub struct Qwen3MainEmbedArgs<'a> {
 
 impl Qwen3MainEmbed {
     pub fn new(embed: Rc<Embed>) -> Self {
-        Self { embed }
+        Self { embed: Some(embed) }
+    }
+
+    pub fn load_weights(&mut self, embed: Rc<Embed>) {
+        assert!(self.embed.is_none(), "qwen3 Main embed weights are already loaded");
+        self.embed = Some(embed);
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(self.embed.is_some(), "qwen3 Main embed weights are not loaded");
+        self.embed.take();
+    }
+
+    fn embed(&self) -> &Embed {
+        self.embed
+            .as_deref()
+            .expect("qwen3 Main embed weights must be loaded before execution")
     }
 
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen3MainEmbedArgs<'a>) -> &'a Buffer
@@ -31,7 +47,7 @@ impl Qwen3MainEmbed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         <Embed as ReplayLayer>::record(
-            &self.embed,
+            self.embed(),
             recorder,
             EmbedInput {
                 num_tokens: args.num_tokens,

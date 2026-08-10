@@ -17,7 +17,7 @@ const QWEN35_MAIN_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
     ReplayParameterKey::new("qwen3.5.main_embed.num_active_tokens");
 
 pub struct Qwen35MainEmbed {
-    embed: Rc<Embed>,
+    embed: Option<Rc<Embed>>,
     replay_bucket_policy: ReplayBucketPolicy,
 }
 
@@ -32,9 +32,25 @@ impl Qwen35MainEmbed {
     pub fn new(embed: Rc<Embed>) -> Self {
         let max_tokens = embed.max_tokens();
         Self {
-            embed,
+            embed: Some(embed),
             replay_bucket_policy: ReplayBucketPolicy::new(max_tokens),
         }
+    }
+
+    pub fn load_weights(&mut self, embed: Rc<Embed>) {
+        assert!(self.embed.is_none(), "qwen3.5 Main embed weights are already loaded");
+        self.embed = Some(embed);
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(self.embed.is_some(), "qwen3.5 Main embed weights are not loaded");
+        self.embed.take();
+    }
+
+    fn embed(&self) -> &Embed {
+        self.embed
+            .as_deref()
+            .expect("qwen3.5 Main embed weights must be loaded before execution")
     }
 
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen35MainEmbedArgs<'a>) -> &'a Buffer
@@ -42,7 +58,7 @@ impl Qwen35MainEmbed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         <Embed as ReplayLayer>::record(
-            &self.embed,
+            self.embed(),
             recorder,
             EmbedInput {
                 num_tokens: args.num_tokens,
@@ -71,7 +87,7 @@ impl Qwen35MainEmbed {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.embed.record_bucketed(
+        self.embed().record_bucketed(
             recorder,
             num_total_tokens,
             QWEN35_MAIN_EMBED_NUM_ACTIVE_TOKENS,

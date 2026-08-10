@@ -61,6 +61,11 @@ impl Qwen3xMoE {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(self.weights.is_some(), "Qwen3.x MoE weights are not loaded");
+        self.weights.take();
+    }
+
     fn weights(&self) -> &Qwen3xMoEWeights {
         self.weights
             .as_deref()

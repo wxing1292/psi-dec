@@ -156,6 +156,13 @@ impl Qwen35MainLayer {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.post_attention_norm.unload_weights();
+        self.input_norm.unload_weights();
+        self.mlp.unload_weights();
+        self.attention.unload_weights();
+    }
+
     pub fn layer_index(&self) -> usize {
         self.layer_index
     }
@@ -392,6 +399,13 @@ impl Qwen35MainAttention {
         }
     }
 
+    fn unload_weights(&mut self) {
+        match self {
+            Self::Gqa(component) => component.unload_weights(),
+            Self::Gdn(component) => component.unload_weights(),
+        }
+    }
+
     fn record<'a, R>(
         &'a self,
         recorder: &mut R,
@@ -483,6 +497,13 @@ impl Qwen35MainMLP {
                 component.load_weights(device, store, &core, metal, *bindings)
             },
             _ => panic!("qwen3.5 Main layer MLP config and checkpoint bindings must have the same kind"),
+        }
+    }
+
+    fn unload_weights(&mut self) {
+        match self {
+            Self::Dense(component) => component.unload_weights(),
+            Self::MoE(component) => component.unload_weights(),
         }
     }
 

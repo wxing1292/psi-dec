@@ -113,6 +113,13 @@ impl Qwen3MainLayer {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        self.post_attention_norm.unload_weights();
+        self.input_norm.unload_weights();
+        self.mlp.unload_weights();
+        self.attention.unload_weights();
+    }
+
     pub fn layer_index(&self) -> usize {
         self.layer_index
     }

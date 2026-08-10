@@ -4,8 +4,12 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
+use inference_executor_core::def::ModelExecutorError;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfidenceWeightBindings;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMarkovWeightBindings;
 use inference_executor_core::sampling::SamplerConfig;
 
+use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::gather::Gather;
@@ -20,7 +24,7 @@ use crate::sampling::spec_probs::SpecProbsStore;
 pub struct Qwen3xDSparkGatherUnembed {
     block_size: usize,
     gather: Gather,
-    unembed: Rc<Unembed>,
+    unembed: Option<Rc<Unembed>>,
     row_indices: Buffer,
 }
 
@@ -61,7 +65,7 @@ impl Qwen3xDSparkGatherUnembed {
         Self {
             block_size,
             gather: Gather::new(device, hidden_dim),
-            unembed,
+            unembed: Some(unembed),
             row_indices: Buffer::new_zeroed_elements(
                 device,
                 max_requests
@@ -70,6 +74,25 @@ impl Qwen3xDSparkGatherUnembed {
                 Dtype::Uint32,
             ),
         }
+    }
+
+    pub fn load_weights(&mut self, unembed: Rc<Unembed>) {
+        assert!(
+            self.unembed.is_none(),
+            "Qwen3.x DSpark unembed weights are already loaded"
+        );
+        self.unembed = Some(unembed);
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(self.unembed.is_some(), "Qwen3.x DSpark unembed weights are not loaded");
+        self.unembed.take();
+    }
+
+    fn unembed(&self) -> &Unembed {
+        self.unembed
+            .as_deref()
+            .expect("Qwen3.x DSpark unembed weights must be loaded before execution")
     }
 
     pub fn prepare(&self, num_requests: usize) {
@@ -120,7 +143,7 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
             input.hidden_output,
         );
         let _ = <Unembed as ReplayLayer>::record(
-            &self.unembed,
+            self.unembed(),
             recorder,
             UnembedInput {
                 num_rows,
@@ -134,6 +157,20 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
 impl Qwen3xDSparkSampling {
     pub fn new(markov: Qwen3xDSparkMarkov) -> Self {
         Self { markov }
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        bindings: &Qwen3xDSparkMarkovWeightBindings,
+        confidence_bindings: &Qwen3xDSparkConfidenceWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
+        self.markov.load_weights(device, store, bindings, confidence_bindings)
+    }
+
+    pub fn unload_weights(&mut self) {
+        self.markov.unload_weights();
     }
 
     pub fn prepare(

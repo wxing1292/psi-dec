@@ -120,6 +120,11 @@ impl Unembed {
         Ok(())
     }
 
+    pub fn unload_weights(&mut self) {
+        assert!(self.weights.is_some(), "unembed weights are not loaded");
+        self.weights.take();
+    }
+
     fn validate_weights(&self) {
         let config = self.config.affine_config();
         let weights = self.weights();
