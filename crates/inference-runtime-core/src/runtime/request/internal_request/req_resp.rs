@@ -6,7 +6,6 @@ use crate::runtime::RawRequestID;
 use crate::runtime::decoder::trie_cache::DecoderBlocks;
 use crate::runtime::decoder::trie_cache::InitBlockOnceResult;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
-use crate::runtime::decoder::trie_cache::token_consumption;
 use crate::runtime::request::CompletionReason;
 use crate::runtime::request::InternalRequest;
 use crate::runtime::request::internal_request::StopSequenceMatch;
@@ -15,6 +14,7 @@ use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
 use crate::runtime::scheduler::PreparePhase;
 use crate::runtime::scheduler::PrepareResult;
+use crate::runtime::scheduler::ReqTokenInventory;
 use crate::runtime::scheduler::UserRequest;
 
 impl<const N: usize, const P: usize, const L: usize, DBC> UserRequest<DeviceRequest, DeviceResponse>
@@ -42,19 +42,25 @@ where
         1
     }
 
-    fn token_estimate(&self, token_budget: usize) -> usize {
-        let num_ready_tokens = self.decoder_blocks.num_ready_tokens();
-        let num_queued_tokens = self.decoder_blocks.num_queued_tokens();
-        let num_spec_tokens = self.decoder_blocks.num_spec_tokens();
-        let token_consumption =
-            token_consumption::<L>(token_budget, num_ready_tokens, num_queued_tokens, num_spec_tokens);
-        token_consumption.token_consumption()
+    fn token_estimate(&self) -> ReqTokenInventory<'_> {
+        ReqTokenInventory::new::<L>(
+            self.req_id,
+            self.decoder_blocks.num_ready_tokens(),
+            self.decoder_blocks.num_queued_tokens(),
+            self.decoder_blocks.num_spec_tokens(),
+            self.decoder_blocks.spec_confidences(),
+        )
     }
 
     fn prepare(&mut self, token_budget: usize) -> PrepareResult<DeviceRequest> {
         if self.status().is_terminal() {
             return PrepareResult::Terminal;
         }
+        debug_assert_eq!(
+            self.token_estimate().token_consumption(token_budget),
+            token_budget,
+            "request prepare requires a valid token consumption"
+        );
 
         let mut ready_token_slots = self.decoder_blocks.ready_token_slots();
         while ready_token_slots < token_budget {

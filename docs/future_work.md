@@ -155,9 +155,11 @@ component path as the design.
   cache lane. Add a Main-only warm-up phase that creates enough verified history before it enables MTP. The runtime
   core must own the mode transition and cache-lane initialization. Do not use placeholder tokens or partially
   initialized cache lanes.
-- Use the Qwen3 DSpark confidence output to add dynamic proposal lengths.
-  Keep global proposal ranking and verification-budget allocation in runtime scheduling.
-  Keep each executor run fixed at its configured `num_spec_tokens` until the scheduler owns this cross-request policy.
+- Calibrate and evaluate confidence-aware verification scheduling.
+  The runtime scheduler currently ranks request-local proposal candidates and selects the next Main verification prefix.
+  Keep each executor proposal run fixed at its configured `num_spec_tokens`.
+  Add shadow telemetry before a policy uses an absolute confidence threshold or a measured cost decision.
+  Use [`token_budget_allocator.md`](token_budget_allocator.md) for the current policy and open decisions.
 - Investigate strict one-row and multi-row Qwen3 Main numerical parity.
   The 2026-07-29 greedy acceptance audit found one deterministic output divergence in four prompts.
   At the first divergence, sparse rejection accepted zero draft tokens.

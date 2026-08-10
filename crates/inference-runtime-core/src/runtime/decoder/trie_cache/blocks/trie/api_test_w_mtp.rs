@@ -674,6 +674,8 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_mtp_w_spec_token() {
     }
     assert!(6 <= ready_token_slots);
     blocks.spec_tokens = spec_tokens.clone();
+    blocks.spec_probs = vec![NotNan::new(1.0).unwrap(); spec_tokens.len()];
+    blocks.spec_confidences = vec![NotNan::new(1.0).unwrap(); spec_tokens.len()];
 
     let query_tokens = blocks.prepare(6).unwrap();
     let sync_blocks = blocks.prepare_blocks();
@@ -782,6 +784,8 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_w_mtp_w_spec_token() {
     }
     assert!(6 <= ready_token_slots);
     blocks.spec_tokens = spec_tokens.clone();
+    blocks.spec_probs = vec![NotNan::new(1.0).unwrap(); spec_tokens.len()];
+    blocks.spec_confidences = vec![NotNan::new(1.0).unwrap(); spec_tokens.len()];
 
     let query_tokens = blocks.prepare(6).unwrap();
     let sync_blocks = blocks.prepare_blocks();
@@ -1067,6 +1071,8 @@ fn test_prepare_commit_mutable_collision_additional_validated_token_w_mtp() {
     let block_cache = initialize_block_cache([1024; NUM_CACHE_LANE]);
     let mut blocks = initialize_blocks(block_cache.clone(), token_vec([0, 1, 2, 3, 4, 5]));
     blocks.spec_tokens = token_vec([10]);
+    blocks.spec_probs = vec![NotNan::new(1.0).unwrap()];
+    blocks.spec_confidences = vec![NotNan::new(1.0).unwrap()];
     let InitBlockOnceResult::Success { ready_token_slots } = blocks.init_block_once() else {
         unreachable!()
     };

@@ -81,8 +81,10 @@ then use that block as a non-terminal prefix.
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ FIFOBatcher::prepare                                                       │
-│ apply scheduler-provided limits to FIFO preparation                        │
-│ pop requests, estimate token cost, call InternalRequest::prepare           │
+│ plan slot-local sticky requests without changing request state             │
+│ allocate minimum validated, maximum validated, then speculative budgets    │
+│ use remaining request and token budgets for FIFO preparation               │
+│ call InternalRequest::prepare with one absolute token budget per request   │
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -128,6 +130,16 @@ cancellation restores it.
 `run_queue` stores each request ID at most once. `push_front` moves an existing ID to the front. `push_back` keeps an
 existing ID at its current position. Commit and cancellation can therefore restore a request without creating a
 second runnable occurrence.
+
+Each compute slot keeps the request ID order from its most recent device batch. The next use of that slot treats these
+IDs as its sticky working set. Different compute slots can contain the same request ID during pipelined Prefill. One
+device batch must contain each request ID at most once.
+
+`SimpleScheduler` resolves only runnable sticky IDs. It skips IDs that are pending, terminal, swapped, or absent. It
+first creates immutable `ReqTokenInventory` values. It then allocates minimum validated, maximum validated, and
+speculative token budgets. The speculative phase uses a request-local causal candidate heap. The allocator returns a
+request-ID-to-token-budget map. `FIFOBatcher` consumes this map before it uses the remaining hard request and token
+budgets for the normal FIFO queue.
 
 Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_queued_requests` bounds the
 user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and both reservation-task
@@ -188,6 +200,14 @@ The event loop submits immediately when the scheduler has runnable token work an
 
 Request and token budgets remain hard per-batch limits in `FIFOBatcher::prepare`. They are not mutable aggregation
 thresholds. The current path has no scheduler flush timer.
+
+The trie decoder keeps proposal tokens, probabilities, and confidence values in one request-local proposal state.
+These vectors must have the same length. A verification-prefix trim changes all three vectors. Proposal confidence
+does not change rejection sampling.
+
+The initial scheduler policy applies an identity transform to proposal confidence. It uses cumulative confidence as a
+ranking score. The runtime does not yet have evidence that these values are calibrated or comparable across requests.
+The policy does not use an absolute confidence threshold.
 
 The trie cache is the storage and reuse subsystem reached through each
 request's `TrieDecoderBlocks`:

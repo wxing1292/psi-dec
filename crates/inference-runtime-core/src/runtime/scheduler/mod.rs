@@ -1,3 +1,4 @@
+use ahash::AHashMap;
 use futures_lite::future::Boxed;
 
 use crate::compute::BatchDevReq;
@@ -61,6 +62,7 @@ where
         req_budget: usize,
         token_budget: usize,
         max_token_per_req: usize,
+        sticky_token_budgets: AHashMap<RawRequestID, usize>,
         schedule_queue: &mut ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
     ) -> Vec<DeviceReq>;
     fn cancel(&mut self, schedule_queue: &mut ScheduleQueue<UserReq, DeviceReq, DeviceResp>, dev_reqs: Vec<DeviceReq>);
@@ -108,7 +110,7 @@ where
     fn is_terminal(&self) -> bool;
 
     fn request_estimate(&self) -> usize;
-    fn token_estimate(&self, token_budget: usize) -> usize;
+    fn token_estimate(&self) -> ReqTokenInventory<'_>;
 
     fn prepare(&mut self, token_budget: usize) -> PrepareResult<DeviceReq>;
     fn cancel(&mut self, dev_req: DeviceReq) -> CancelResult;

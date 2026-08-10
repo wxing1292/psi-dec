@@ -1,15 +1,20 @@
 use std::collections::VecDeque;
 
+use ahash::AHashMap;
+
 use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
 use crate::runtime::RawComputeSlotSeq;
+use crate::runtime::RawRequestID;
+use crate::runtime::scheduler::BatchBudget;
 use crate::runtime::scheduler::Batcher;
 use crate::runtime::scheduler::ComputeSlot;
 use crate::runtime::scheduler::ScheduleQueue;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
+use crate::runtime::scheduler::allocate_sticky_token_budgets;
 
 pub struct SimpleScheduler<UserReq, DeviceReq, DeviceResp, B> {
     schedule_queue: ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
@@ -119,14 +124,34 @@ where
         let compute_slot_seq = self.next_compute_slot_seq;
         compute_slot.prepare(compute_slot_seq);
         self.next_compute_slot_seq += 1;
-        self.used_compute_slots.push_back(compute_slot);
 
+        let sticky_token_budgets = allocate_slot_token_budgets(
+            &compute_slot,
+            &self.schedule_queue,
+            BatchBudget {
+                req_budget: self.max_req_budget,
+                token_budget: self.max_token_budget,
+                max_token_per_req: self.max_token_per_req,
+            },
+        );
         let dev_reqs = self.batcher.prepare(
             self.max_req_budget,
             self.max_token_budget,
             self.max_token_per_req,
+            sticky_token_budgets,
             &mut self.schedule_queue,
         );
+        let sticky_req_ids = compute_slot.sticky_req_ids_mut();
+        sticky_req_ids.clear();
+        sticky_req_ids.extend(dev_reqs.iter().map(DevReq::id));
+        debug_assert!(
+            sticky_req_ids
+                .iter()
+                .enumerate()
+                .all(|(req_index, req_id)| { !sticky_req_ids[..req_index].contains(req_id) }),
+            "compute slot batch request IDs must be unique"
+        );
+        self.used_compute_slots.push_back(compute_slot);
         BatchDeviceReq::from_parts(compute_slot_seq, dev_reqs)
     }
 
@@ -140,6 +165,14 @@ where
             compute_slot.seq(),
             Some(compute_slot_seq),
             "simple scheduler cancellation compute slot sequence mismatch"
+        );
+        debug_assert!(
+            compute_slot
+                .sticky_req_ids_ref()
+                .iter()
+                .copied()
+                .eq(dev_reqs.iter().map(DevReq::id)),
+            "simple scheduler cancellation request IDs mismatch"
         );
         compute_slot.reset();
         self.free_compute_slots.push_front(compute_slot);
@@ -158,11 +191,37 @@ where
             Some(compute_slot_seq),
             "simple scheduler commit compute slot sequence mismatch"
         );
+        assert!(
+            compute_slot
+                .sticky_req_ids_ref()
+                .iter()
+                .copied()
+                .eq(dev_resps.iter().map(DevResp::id)),
+            "simple scheduler commit request IDs mismatch"
+        );
         compute_slot.reset();
         self.free_compute_slots.push_back(compute_slot);
 
         self.batcher.commit(&mut self.schedule_queue, dev_resps);
     }
+}
+
+fn allocate_slot_token_budgets<UserReq, DeviceReq, DeviceResp>(
+    compute_slot: &ComputeSlot,
+    schedule_queue: &ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
+    batch_budget: BatchBudget,
+) -> AHashMap<RawRequestID, usize>
+where
+    UserReq: UserRequest<DeviceReq, DeviceResp>,
+    DeviceReq: DevReq,
+    DeviceResp: DevResp,
+{
+    let sticky_token_inventories = compute_slot
+        .sticky_req_ids_ref()
+        .iter()
+        .filter_map(|req_id| schedule_queue.get_ref(req_id).map(UserRequest::token_estimate))
+        .collect::<Vec<_>>();
+    allocate_sticky_token_budgets(batch_budget, &sticky_token_inventories)
 }
 
 #[cfg(test)]
@@ -175,6 +234,7 @@ mod tests {
     use crate::compute::MockDevResp;
     use crate::runtime::scheduler::MockBatcher;
     use crate::runtime::scheduler::MockUserRequest;
+    use crate::runtime::scheduler::ReqTokenInventory;
 
     type TestUserReq = MockUserRequest<MockDevReq, MockDevResp>;
     type TestBatcher = MockBatcher<TestUserReq, MockDevReq, MockDevResp>;
@@ -222,8 +282,13 @@ mod tests {
                 mockall::predicate::eq(max_token_budget),
                 mockall::predicate::eq(max_token_per_req),
                 mockall::predicate::always(),
+                mockall::predicate::always(),
             )
-            .return_once(|_, _, _, _| vec![MockDevReq::new()]);
+            .return_once(|_, _, _, _, _| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().times(2).return_const(1usize);
+                vec![dev_req]
+            });
         batcher.expect_cancel().once().return_once(|_, _| {});
 
         let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
@@ -245,9 +310,8 @@ mod tests {
             let mut user_req = TestUserReq::new();
             user_req
                 .expect_token_estimate()
-                .with(mockall::predicate::eq(max_token_per_req))
                 .times(2)
-                .return_const(1usize);
+                .returning(|| ReqTokenInventory::new::<1>(1, 1, 0, 0, &[]));
             scheduler.enqueue(user_req);
             assert!(scheduler.can_flush());
 
@@ -260,5 +324,34 @@ mod tests {
         }
         assert_eq!(scheduler.last_compute_slot_seq(), 1);
         assert_eq!(scheduler.next_compute_slot_seq(), Some(2));
+    }
+
+    #[test]
+    fn test_allocate_slot_token_budgets() {
+        let req_id = 7;
+        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
+        let mut schedule_queue = ScheduleQueue::new(swap_out_task_tx);
+        let mut user_req = TestUserReq::new();
+        user_req.expect_id().return_const(req_id);
+        user_req
+            .expect_token_estimate()
+            .once()
+            .returning(move || ReqTokenInventory::new::<1>(req_id, 1, 0, 0, &[]));
+        schedule_queue.push_back(user_req);
+        let mut compute_slot = ComputeSlot::new(0);
+        compute_slot.sticky_req_ids_mut().push(req_id);
+
+        assert_eq!(
+            allocate_slot_token_budgets(
+                &compute_slot,
+                &schedule_queue,
+                BatchBudget {
+                    req_budget: 1,
+                    token_budget: 8,
+                    max_token_per_req: 4,
+                },
+            ),
+            AHashMap::from([(req_id, 1)])
+        );
     }
 }

@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use ordered_float::NotNan;
+
 use crate::compute::DecoderSyncBlocks;
 use crate::runtime::Token;
 #[cfg(debug_assertions)]
@@ -26,6 +28,8 @@ where
     num_prompt_tokens: usize,
     queued_tokens: VecDeque<Token>,
     spec_tokens: Vec<Token>,
+    spec_probs: Vec<NotNan<f32>>,
+    spec_confidences: Vec<NotNan<f32>>,
 
     num_in_sync_blocks: usize,
 
@@ -64,6 +68,8 @@ where
             num_prompt_tokens,
             queued_tokens,
             spec_tokens: vec![],
+            spec_probs: vec![],
+            spec_confidences: vec![],
 
             num_in_sync_blocks: 0,
 
@@ -112,6 +118,16 @@ where
 
         queued_tokens.extend(self.queued_tokens.iter().copied());
         spec_tokens.extend(self.spec_tokens.iter().copied());
+        debug_assert_eq!(
+            self.spec_tokens.len(),
+            self.spec_probs.len(),
+            "speculative token and probability counts must match"
+        );
+        debug_assert_eq!(
+            self.spec_tokens.len(),
+            self.spec_confidences.len(),
+            "speculative token and confidence counts must match"
+        );
 
         debug_assert_eq!(self.num_cached_tokens(), cached_tokens.len());
         debug_assert_eq!(self.num_scheduled_tokens(), scheduled_tokens.len());

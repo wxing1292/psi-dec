@@ -525,13 +525,17 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_dspark_w_spec_token() {
     let output_sampled_token = Token::new(20);
     let output_spec_tokens = token_vec([30, 31]);
     let output_spec_probs = vec![NotNan::new(0.6).unwrap(); output_spec_tokens.len()];
+    let output_spec_confidences = vec![NotNan::new(0.75).unwrap(); output_spec_tokens.len()];
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
     let InitBlockOnceResult::Success { ready_token_slots } = blocks.init_block_once() else {
         unreachable!()
     };
     assert_eq!(NUM_TOKEN_PER_BLOCK, ready_token_slots);
+    let num_spec_tokens = spec_tokens.len();
     blocks.spec_tokens = spec_tokens;
+    blocks.spec_probs = vec![NotNan::new(1.0).unwrap(); num_spec_tokens];
+    blocks.spec_confidences = vec![NotNan::new(1.0).unwrap(); num_spec_tokens];
 
     let query_tokens = blocks.prepare(3).unwrap();
     let sync_blocks = blocks.prepare_blocks();
@@ -574,7 +578,7 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_dspark_w_spec_token() {
             validated_probs: vec![NotNan::new(0.5).unwrap()],
             sampled_token: output_sampled_token,
             sampled_prob: NotNan::new(0.5).unwrap(),
-            spec_confidences: vec![NotNan::new(0.75).unwrap(); output_spec_tokens.len()],
+            spec_confidences: output_spec_confidences.clone(),
             spec_tokens: output_spec_tokens,
             spec_probs: output_spec_probs,
         },
@@ -588,6 +592,7 @@ fn test_prepare_cancel_commit_decode_zero_token_index_w_dspark_w_spec_token() {
         &[],
         &token_vec([30, 31]),
     );
+    assert_eq!(blocks.spec_confidences(), output_spec_confidences);
 }
 
 #[test]
@@ -608,7 +613,10 @@ fn test_prepare_cancel_commit_decode_nonzero_token_index_w_dspark_w_spec_token()
         unreachable!()
     };
     assert_eq!(NUM_TOKEN_PER_BLOCK, ready_token_slots);
+    let num_spec_tokens = spec_tokens.len();
     blocks.spec_tokens = spec_tokens;
+    blocks.spec_probs = vec![NotNan::new(1.0).unwrap(); num_spec_tokens];
+    blocks.spec_confidences = vec![NotNan::new(1.0).unwrap(); num_spec_tokens];
 
     let query_tokens = blocks.prepare(3).unwrap();
     let sync_blocks = blocks.prepare_blocks();
@@ -875,6 +883,8 @@ fn test_prepare_commit_mutable_collision_additional_validated_token_w_dspark() {
     let block_cache = initialize_block_cache(1024);
     let mut blocks = initialize_blocks(block_cache.clone(), token_vec([0, 1, 2]));
     blocks.spec_tokens = token_vec([10]);
+    blocks.spec_probs = vec![NotNan::new(1.0).unwrap()];
+    blocks.spec_confidences = vec![NotNan::new(1.0).unwrap()];
     let InitBlockOnceResult::Success { ready_token_slots } = blocks.init_block_once() else {
         unreachable!()
     };

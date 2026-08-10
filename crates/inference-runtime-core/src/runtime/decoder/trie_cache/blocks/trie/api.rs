@@ -21,13 +21,11 @@ use crate::runtime::decoder::trie_cache::ReserveMultiLaneSemiImmutableBlockResul
 use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use crate::runtime::decoder::trie_cache::TrieNodeKey;
 use crate::runtime::decoder::trie_cache::UninitBlockOnceResult;
-use crate::runtime::decoder::trie_cache::blocks::TokenConsumption;
 use crate::runtime::decoder::trie_cache::blocks::cache_tokens;
 use crate::runtime::decoder::trie_cache::blocks::pop_front_queued_tokens;
 use crate::runtime::decoder::trie_cache::blocks::push_front_queued_tokens;
 use crate::runtime::decoder::trie_cache::blocks::push_tokens;
 use crate::runtime::decoder::trie_cache::blocks::schedule_tokens;
-use crate::runtime::decoder::trie_cache::blocks::token_consumption;
 use crate::runtime::decoder::trie_cache::blocks::unschedule_tokens;
 
 impl<const N: usize, const P: usize, const L: usize, BC> DecoderBlocks for TrieDecoderBlocks<N, P, L, BC>
@@ -190,7 +188,8 @@ where
 
         let num_ready_tokens = self.num_ready_tokens();
         let num_queued_tokens = self.num_queued_tokens();
-        let num_spec_tokens = self.num_spec_tokens();
+        let num_validated_tokens = num_ready_tokens + num_queued_tokens;
+        debug_assert!(num_validated_tokens != 0);
 
         let mut token_index = None;
         let mut block_index = self.immutable_blocks.len();
@@ -241,36 +240,35 @@ where
             }
         }
 
-        match token_consumption::<L>(token_budget, num_ready_tokens, num_queued_tokens, num_spec_tokens) {
-            TokenConsumption::Skip => None,
-            TokenConsumption::Prefill(consumption) => {
-                debug_assert_eq!(tokens.len(), consumption,);
-                debug_assert!(token_index.is_some());
-                debug_assert!(L - 1 <= self.num_queued_tokens());
-                tokens.extend(self.queued_tokens.iter().take(L - 1).copied());
-                Some(QueryTokens::Prefill {
-                    epoch: self.epoch,
-                    token_index: token_index.unwrap(),
-                    tokens,
-                    window: consumption,
-                })
-            },
-            TokenConsumption::Decode(consumption) => {
-                debug_assert!(tokens.len() <= consumption);
-                debug_assert!(self.num_queued_tokens() < L);
-                tokens.extend(&self.queued_tokens);
-                debug_assert!(tokens.len() <= consumption);
-                debug_assert!(consumption - tokens.len() <= self.spec_tokens.len());
-                self.spec_tokens.truncate(consumption - tokens.len());
-                let spec_tokens = self.spec_tokens.clone();
+        if token_budget < num_validated_tokens {
+            debug_assert_eq!(tokens.len(), token_budget);
+            debug_assert!(token_index.is_some());
+            debug_assert!(L - 1 <= self.num_queued_tokens());
+            tokens.extend(self.queued_tokens.iter().take(L - 1).copied());
+            Some(QueryTokens::Prefill {
+                epoch: self.epoch,
+                token_index: token_index.unwrap(),
+                tokens,
+                window: token_budget,
+            })
+        } else {
+            debug_assert!(tokens.len() <= token_budget);
+            debug_assert!(self.num_queued_tokens() < L);
+            tokens.extend(&self.queued_tokens);
+            debug_assert!(tokens.len() <= token_budget);
+            let num_selected_spec_tokens = token_budget - tokens.len();
+            debug_assert!(num_selected_spec_tokens <= self.spec_tokens.len());
+            self.spec_tokens.truncate(num_selected_spec_tokens);
+            self.spec_probs.truncate(num_selected_spec_tokens);
+            self.spec_confidences.truncate(num_selected_spec_tokens);
+            let spec_tokens = self.spec_tokens.clone();
 
-                Some(QueryTokens::Decode {
-                    epoch: self.epoch,
-                    token_index: token_index.unwrap_or(self.num_cached_tokens()),
-                    tokens,
-                    spec_tokens,
-                })
-            },
+            Some(QueryTokens::Decode {
+                epoch: self.epoch,
+                token_index: token_index.unwrap_or(self.num_cached_tokens()),
+                tokens,
+                spec_tokens,
+            })
         }
     }
 
@@ -300,7 +298,7 @@ where
                 debug_assert_eq!(self.epoch, epoch);
                 debug_assert!(token_index < self.num_total_tokens());
                 debug_assert!(!tokens.is_empty());
-                debug_assert_eq!(&self.spec_tokens, &spec_tokens);
+                debug_assert_eq!(self.spec_tokens, spec_tokens);
 
                 tokens
             },
@@ -411,6 +409,8 @@ where
                 self.queued_tokens.push_back(output_sampled_token);
                 self.queued_tokens.drain(..queued_to_cached_token_window);
                 self.spec_tokens = output_spec_tokens;
+                self.spec_probs = output_spec_probs;
+                self.spec_confidences = output_spec_confidences;
 
                 let ready_to_cached_tokens = input_tokens;
                 let queued_to_cached_tokens = ready_to_cached_tokens

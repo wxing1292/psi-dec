@@ -121,8 +121,8 @@ where
         self.id_requests.remove(req_id)
     }
 
-    pub fn get(&mut self, req_id: &RawRequestID) -> Option<&mut UserReq> {
-        self.id_requests.get_mut(req_id)
+    pub fn get_ref(&self, req_id: &RawRequestID) -> Option<&UserReq> {
+        self.id_requests.get(req_id)
     }
 
     pub fn request_estimate(&self) -> usize {
@@ -134,12 +134,11 @@ where
             sum + self
                 .id_requests
                 .get(req_id)
-                .map(|user_req| user_req.token_estimate(max_token_per_req))
+                .map(|user_req| user_req.token_estimate().token_consumption(max_token_per_req))
                 .unwrap_or(0)
-        }) + self
-            .new_queue
-            .iter()
-            .fold(0, |sum, user_req| sum + user_req.token_estimate(max_token_per_req))
+        }) + self.new_queue.iter().fold(0, |sum, user_req| {
+            sum + user_req.token_estimate().token_consumption(max_token_per_req)
+        })
     }
 
     pub fn run_queue_size(&self) -> usize {

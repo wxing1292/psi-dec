@@ -105,6 +105,10 @@ where
         self.spec_tokens.iter().copied()
     }
 
+    pub fn spec_confidences(&self) -> &[ordered_float::NotNan<f32>] {
+        &self.spec_confidences
+    }
+
     pub fn num_history_tokens(&self) -> usize {
         self.num_history_tokens
     }

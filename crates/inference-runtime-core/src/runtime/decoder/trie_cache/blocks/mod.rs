@@ -6,10 +6,6 @@ use crate::compute::SampledTokens;
 mod trie;
 pub use trie::TrieDecoderBlocks;
 
-mod consumption;
-pub use consumption::TokenConsumption;
-pub use consumption::token_consumption;
-
 mod util;
 pub use util::cache_tokens;
 pub use util::pop_front_queued_tokens;

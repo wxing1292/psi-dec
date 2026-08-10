@@ -21,10 +21,8 @@ pub use cache::SingleLaneTrieBlockCache;
 mod blocks;
 pub use blocks::DecoderBlocks;
 pub use blocks::InitBlockOnceResult;
-pub use blocks::TokenConsumption;
 pub use blocks::TrieDecoderBlocks;
 pub use blocks::UninitBlockOnceResult;
-pub use blocks::token_consumption;
 
 mod block;
 pub use block::BlockMetadata;

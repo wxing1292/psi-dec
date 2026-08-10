@@ -1,8 +1,11 @@
 use std::cmp::min;
 use std::marker::PhantomData;
 
+use ahash::AHashMap;
+
 use crate::compute::DevReq;
 use crate::compute::DevResp;
+use crate::runtime::RawRequestID;
 use crate::runtime::scheduler::Batcher;
 use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
@@ -46,6 +49,7 @@ where
         mut req_budget: usize,
         mut token_budget: usize,
         max_token_per_req: usize,
+        mut sticky_token_budgets: AHashMap<RawRequestID, usize>,
         schedule_queue: &mut ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
     ) -> Vec<DeviceReq> {
         debug_assert!(0 < req_budget, "fifo batcher requires a positive request budget");
@@ -63,7 +67,23 @@ where
                 self.running_reqs.push(user_req);
                 break 'prepare_loop;
             }
-            let token_estimate = user_req.token_estimate(min(max_token_per_req, token_budget));
+            let req_id = user_req.id();
+            let token_estimate = match sticky_token_budgets.get(&req_id).copied() {
+                Some(token_budget) => token_budget,
+                None => {
+                    assert!(
+                        sticky_token_budgets.is_empty(),
+                        "fifo request reached batcher before all sticky token budgets were consumed"
+                    );
+                    user_req
+                        .token_estimate()
+                        .token_consumption(min(max_token_per_req, token_budget))
+                },
+            };
+            debug_assert!(
+                token_estimate <= token_budget,
+                "planned request token budget exceeds remaining batch token budget"
+            );
             if token_estimate == 0 {
                 self.running_reqs.push(user_req);
                 continue 'prepare_loop;
@@ -94,6 +114,7 @@ where
                     }
                 },
                 PrepareResult::Await { wait } => {
+                    sticky_token_budgets.remove(&req_id);
                     let swap_out_task = SwapOutTask::await_reservation(user_req, wait);
                     match schedule_queue.push_swap_out(swap_out_task) {
                         Ok(()) => {},
@@ -107,14 +128,20 @@ where
                     continue 'prepare_loop;
                 },
                 PrepareResult::Pending => {
+                    sticky_token_budgets.remove(&req_id);
                     schedule_queue.insert(user_req);
                 },
                 PrepareResult::Continue { dev_req, phase } => {
+                    sticky_token_budgets.remove(&req_id);
                     let req_cost = dev_req.req_cost();
                     let token_cost = dev_req.token_cost();
                     debug_assert!(
                         req_cost <= req_budget,
                         "prepared request cost exceeds fifo batch request budget"
+                    );
+                    debug_assert!(
+                        token_cost <= token_estimate,
+                        "prepared request token cost exceeds assigned request token budget"
                     );
                     debug_assert!(
                         token_cost <= token_budget,
@@ -128,7 +155,9 @@ where
                     }
                     dev_reqs.push(dev_req);
                 },
-                PrepareResult::Terminal => { /* noop */ },
+                PrepareResult::Terminal => {
+                    sticky_token_budgets.remove(&req_id);
+                },
             }
         }
         for user_req in self.running_reqs.drain(..).rev() {
@@ -181,8 +210,8 @@ mod tests {
     use super::*;
     use crate::compute::MockDevReq;
     use crate::compute::MockDevResp;
-    use crate::runtime::RawRequestID;
     use crate::runtime::scheduler::MockUserRequest;
+    use crate::runtime::scheduler::ReqTokenInventory;
 
     type TestUserReq = MockUserRequest<MockDevReq, MockDevResp>;
     type TestScheduleQueue = ScheduleQueue<TestUserReq, MockDevReq, MockDevResp>;
@@ -215,7 +244,13 @@ mod tests {
         }
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), scheduled_reqs.len());
         batcher.cancel(&mut schedule_queue, dev_reqs);
     }
@@ -245,7 +280,13 @@ mod tests {
         }
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), scheduled_reqs.len());
         batcher.cancel(&mut schedule_queue, dev_reqs);
     }
@@ -275,7 +316,13 @@ mod tests {
         }
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), scheduled_reqs.len());
         batcher.cancel(&mut schedule_queue, dev_reqs);
     }
@@ -308,7 +355,13 @@ mod tests {
         }
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), scheduled_reqs.len());
         let dev_resps = scheduled_reqs
             .iter()
@@ -342,7 +395,13 @@ mod tests {
         }
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), scheduled_reqs.len());
         let dev_resps = scheduled_reqs
             .iter()
@@ -376,7 +435,13 @@ mod tests {
         }
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), scheduled_reqs.len());
         let dev_resps = scheduled_reqs
             .iter()
@@ -395,9 +460,8 @@ mod tests {
         let mut prefill_req = mock_user_req(prefill_req_id);
         prefill_req
             .expect_token_estimate()
-            .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
-            .return_const(token_budget_per_req);
+            .returning(move || ReqTokenInventory::new::<1>(prefill_req_id, token_budget_per_req, 0, 0, &[]));
         prefill_req
             .expect_prepare()
             .once()
@@ -417,9 +481,8 @@ mod tests {
         let mut decode_req = mock_user_req(decode_req_id);
         decode_req
             .expect_token_estimate()
-            .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
-            .return_const(token_budget_per_req);
+            .returning(move || ReqTokenInventory::new::<1>(decode_req_id, token_budget_per_req, 0, 0, &[]));
         decode_req
             .expect_prepare()
             .once()
@@ -453,10 +516,16 @@ mod tests {
         schedule_queue.push_back(decode_req);
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(2, 2 * token_budget_per_req, token_budget_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            2,
+            2 * token_budget_per_req,
+            token_budget_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), 2);
-        assert!(schedule_queue.get(&prefill_req_id).is_some());
-        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
+        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 1);
 
         let prefill_req = schedule_queue
@@ -467,8 +536,8 @@ mod tests {
         schedule_queue.push_back(prefill_req);
 
         batcher.cancel(&mut schedule_queue, dev_reqs);
-        assert!(schedule_queue.get(&prefill_req_id).is_some());
-        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
+        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 2);
         assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(decode_req_id));
         assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(prefill_req_id));
@@ -485,9 +554,8 @@ mod tests {
         let mut prefill_req = mock_user_req(prefill_req_id);
         prefill_req
             .expect_token_estimate()
-            .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
-            .return_const(token_budget_per_req);
+            .returning(move || ReqTokenInventory::new::<1>(prefill_req_id, token_budget_per_req, 0, 0, &[]));
         prefill_req
             .expect_prepare()
             .once()
@@ -507,9 +575,8 @@ mod tests {
         let mut decode_req = mock_user_req(decode_req_id);
         decode_req
             .expect_token_estimate()
-            .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
-            .return_const(token_budget_per_req);
+            .returning(move || ReqTokenInventory::new::<1>(decode_req_id, token_budget_per_req, 0, 0, &[]));
         decode_req
             .expect_prepare()
             .once()
@@ -543,10 +610,16 @@ mod tests {
         schedule_queue.push_back(decode_req);
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(2, 2 * token_budget_per_req, token_budget_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            2,
+            2 * token_budget_per_req,
+            token_budget_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert_eq!(dev_reqs.len(), 2);
-        assert!(schedule_queue.get(&prefill_req_id).is_some());
-        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
+        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 1);
 
         let prefill_req = schedule_queue
@@ -562,11 +635,102 @@ mod tests {
         decode_resp.expect_id().return_const(decode_req_id);
         batcher.commit(&mut schedule_queue, vec![prefill_resp, decode_resp]);
 
-        assert!(schedule_queue.get(&prefill_req_id).is_some());
-        assert!(schedule_queue.get(&decode_req_id).is_some());
+        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
+        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 2);
         assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(decode_req_id));
         assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(prefill_req_id));
+        assert!(schedule_queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_prepare_w_sticky_token_budgets() {
+        let mut sticky_req_1 = mock_user_req(1);
+        sticky_req_1.expect_prepare().once().with(eq(3)).return_once(|_| {
+            let mut dev_req = MockDevReq::new();
+            dev_req.expect_id().once().return_const(1usize);
+            dev_req.expect_req_cost().once().return_const(1usize);
+            dev_req.expect_token_cost().once().return_const(3usize);
+            PrepareResult::Continue {
+                dev_req,
+                phase: PreparePhase::Decode,
+            }
+        });
+
+        let mut sticky_req_2 = mock_user_req(2);
+        sticky_req_2.expect_prepare().once().with(eq(2)).return_once(|_| {
+            let mut dev_req = MockDevReq::new();
+            dev_req.expect_id().once().return_const(2usize);
+            dev_req.expect_req_cost().once().return_const(1usize);
+            dev_req.expect_token_cost().once().return_const(2usize);
+            PrepareResult::Continue {
+                dev_req,
+                phase: PreparePhase::Decode,
+            }
+        });
+
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        schedule_queue.push_back(sticky_req_1);
+        schedule_queue.push_back(sticky_req_2);
+
+        let mut batcher = FIFOBatcher::new();
+        let sticky_token_budgets = AHashMap::from([(1, 3), (2, 2)]);
+        let dev_reqs = batcher.prepare(2, 5, 3, sticky_token_budgets, &mut schedule_queue);
+
+        assert_eq!(dev_reqs.iter().map(DevReq::id).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(schedule_queue.get_ref(&1).is_some());
+        assert!(schedule_queue.get_ref(&2).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 0);
+        assert!(schedule_queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_prepare_wo_sticky_token_budgets() {
+        let mut req_1 = mock_user_req(1);
+        req_1
+            .expect_token_estimate()
+            .once()
+            .returning(|| ReqTokenInventory::new::<1>(1, 3, 0, 0, &[]));
+        req_1.expect_prepare().once().with(eq(3)).return_once(|_| {
+            let mut dev_req = MockDevReq::new();
+            dev_req.expect_id().once().return_const(1usize);
+            dev_req.expect_req_cost().once().return_const(1usize);
+            dev_req.expect_token_cost().once().return_const(3usize);
+            PrepareResult::Continue {
+                dev_req,
+                phase: PreparePhase::Decode,
+            }
+        });
+
+        let mut req_2 = mock_user_req(2);
+        req_2
+            .expect_token_estimate()
+            .once()
+            .returning(|| ReqTokenInventory::new::<1>(2, 2, 0, 0, &[]));
+        req_2.expect_prepare().once().with(eq(2)).return_once(|_| {
+            let mut dev_req = MockDevReq::new();
+            dev_req.expect_id().once().return_const(2usize);
+            dev_req.expect_req_cost().once().return_const(1usize);
+            dev_req.expect_token_cost().once().return_const(2usize);
+            PrepareResult::Continue {
+                dev_req,
+                phase: PreparePhase::Decode,
+            }
+        });
+
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        schedule_queue.push_back(req_1);
+        schedule_queue.push_back(req_2);
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(2, 5, 3, AHashMap::new(), &mut schedule_queue);
+
+        assert_eq!(dev_reqs.iter().map(DevReq::id).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(schedule_queue.get_ref(&1).is_some());
+        assert!(schedule_queue.get_ref(&2).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 0);
         assert!(schedule_queue.pop_front().is_none());
     }
 
@@ -581,9 +745,8 @@ mod tests {
         let mut user_req = mock_user_req(req_id);
         user_req
             .expect_token_estimate()
-            .with(eq(token_budget))
             .in_sequence(&mut seq)
-            .return_const(token_budget);
+            .returning(move || ReqTokenInventory::new::<1>(req_id, token_budget, 0, 0, &[]));
         user_req
             .expect_prepare()
             .once()
@@ -600,7 +763,13 @@ mod tests {
         schedule_queue.push_back(user_req);
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
         assert!(dev_reqs.is_empty());
 
         let _swap_out_task = swap_out_task_rx
@@ -620,8 +789,7 @@ mod tests {
         current_req
             .expect_token_estimate()
             .times(2)
-            .with(eq(token_budget))
-            .return_const(token_budget);
+            .returning(move || ReqTokenInventory::new::<1>(current_req_id, token_budget, 0, 0, &[]));
         let mut prepare_count = 0;
         current_req
             .expect_prepare()
@@ -643,7 +811,13 @@ mod tests {
         schedule_queue.push_back(preempted_req);
 
         let mut batcher = FIFOBatcher::new();
-        let dev_reqs = batcher.prepare(req_budget, token_budget, max_token_per_req, &mut schedule_queue);
+        let dev_reqs = batcher.prepare(
+            req_budget,
+            token_budget,
+            max_token_per_req,
+            AHashMap::new(),
+            &mut schedule_queue,
+        );
 
         assert!(dev_reqs.is_empty());
         assert_eq!(schedule_queue.run_queue_size(), 0);
@@ -674,6 +848,7 @@ mod tests {
     fn mock_user_req(req_id: RawRequestID) -> TestUserReq {
         let mut user_req = TestUserReq::new();
         user_req.expect_id().return_const(req_id);
+        user_req.expect_is_terminal().return_const(false);
         user_req
     }
 
@@ -686,9 +861,8 @@ mod tests {
         } = *scheduled_req;
         user_req
             .expect_token_estimate()
-            .with(eq(prepare_token_budget))
             .in_sequence(seq)
-            .return_const(prepare_token_budget);
+            .returning(move || ReqTokenInventory::new::<1>(req_id, prepare_token_budget, 0, 0, &[]));
         user_req
             .expect_prepare()
             .once()
