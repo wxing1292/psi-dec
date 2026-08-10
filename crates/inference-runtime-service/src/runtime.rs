@@ -14,7 +14,7 @@ use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::channel::ShutdownGuard;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
-use inference_runtime_core::compute::ReplayableModelBatchExecutor;
+use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::config::SamplingConfig;
 use inference_runtime_core::config::SchedulerConfig;
@@ -44,7 +44,7 @@ use inference_runtime_core::runtime::tasks::AsyncTaskPool;
 use crate::api::Inference;
 use crate::codec::qwen::QwenCodec;
 use crate::consts::NUM_TRIE_PARTITION;
-use crate::executor::ReplayableModelExecutorLoop;
+use crate::executor::ReplayableModelEventLoop;
 use crate::rpc;
 
 type RuntimeBlockCache<const P: usize, const L: usize> =
@@ -306,7 +306,7 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
     debug_logging: bool,
 ) -> Result<()>
 where
-    M: ReplayableModelBatchExecutor,
+    M: ReplayableModel,
 {
     let shutdown = Shutdown::new();
     let server_tokio_runtime = tokio::runtime::Runtime::new()
@@ -336,7 +336,7 @@ where
         })
         .map_err(|error| log_err_unavailable!("unable to start RPC server thread: {error}"))?;
 
-    let executor = ReplayableModelExecutorLoop::new(
+    let executor = ReplayableModelEventLoop::new(
         runtime.batch_device_request_rx(),
         runtime.batch_device_response_tx(),
         runtime.request_slot_reset_notifier(),

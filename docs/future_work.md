@@ -47,7 +47,7 @@ document that owns the component.
   snapshot storage.
   Preserve full-file checksums, atomic publication, and synchronous model-executor lifecycle APIs.
   Add selective I/O only with a compact index that identifies each resource, page, request, layer, and state slot.
-- When a later change revises the service and executor boundary, move `ReplayableModelBatchExecutor` and the executor
+- When a later change revises the service and executor boundary, move `ReplayableModel` and the executor
   timing and output traits out of `inference-runtime-core`.
 
 ## Pipeline Parallelism

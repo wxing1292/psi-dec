@@ -17,8 +17,8 @@ pub use response::DeviceResponse;
 pub use response::MockBatchDevResp;
 pub use response::MockDevResp;
 
-mod batch_executor;
-pub use batch_executor::ExecutionSubmission;
-pub use batch_executor::ModelOutputTiming;
-pub use batch_executor::ReplayableModelBatchExecutor;
-pub use batch_executor::page_ids_by_layer_for_lane;
+mod replayable_model;
+pub use replayable_model::ExecutionSubmission;
+pub use replayable_model::ModelOutputTiming;
+pub use replayable_model::ReplayableModel;
+pub use replayable_model::page_ids_by_layer_for_lane;

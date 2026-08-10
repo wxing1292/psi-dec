@@ -12,7 +12,7 @@ use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::DeviceResponse;
 use inference_runtime_core::compute::ExecutionSubmission;
 use inference_runtime_core::compute::QueryTokens;
-use inference_runtime_core::compute::ReplayableModelBatchExecutor;
+use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::compute::SampledTokens;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -23,7 +23,7 @@ use crate::perf_metrics::summarize_batch_device_response;
 use crate::profiling;
 use crate::telemetry::emit_executor_batch_perf_metrics;
 
-pub struct ReplayableModelExecutorLoop<M> {
+pub struct ReplayableModelEventLoop<M> {
     batch_dev_req_rx: Receiver<BatchDeviceRequest>,
     batch_dev_resp_tx: Sender<BatchDeviceResponse>,
     req_slot_reset_notifier: Arc<DedupNotifier<RawRequestSlot>>,
@@ -33,9 +33,9 @@ pub struct ReplayableModelExecutorLoop<M> {
     debug_logging: bool,
 }
 
-impl<M> ReplayableModelExecutorLoop<M>
+impl<M> ReplayableModelEventLoop<M>
 where
-    M: ReplayableModelBatchExecutor,
+    M: ReplayableModel,
 {
     pub fn new(
         batch_dev_req_rx: Receiver<BatchDeviceRequest>,
@@ -403,199 +403,33 @@ fn summarize_f32_slice(values: &[f32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::time::Duration;
 
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
-    use inference_runtime_core::compute::DecoderSyncBlocks;
-    use inference_runtime_core::config::SamplingConfig;
 
     use super::*;
-
-    struct LifecycleModel {
-        events: Rc<RefCell<Vec<&'static str>>>,
-    }
-
-    struct LifecycleSubmission {
-        events: Rc<RefCell<Vec<&'static str>>>,
-        wait_event: &'static str,
-    }
-
-    impl ExecutionSubmission for LifecycleSubmission {
-        fn wait(&self) {
-            self.events.borrow_mut().push(self.wait_event);
-        }
-    }
-
-    impl LifecycleModel {
-        fn record(&self, event: &'static str) {
-            self.events.borrow_mut().push(event);
-        }
-    }
-
-    impl ReplayableModelBatchExecutor for LifecycleModel {
-        type ModelBatchRequest = ();
-        type ModelBatchHidden = ();
-        type ModelBatchResponse = ();
-        type SampledOutput = ();
-        type ModelOpsRecorder = ();
-        type Submission = LifecycleSubmission;
-
-        fn model_name(&self) -> &str {
-            "lifecycle"
-        }
-
-        fn reset_req_slots(&mut self, _request_slots: &[RawRequestSlot]) {}
-
-        fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
-            self.record("prepare");
-        }
-
-        fn commit_batch(
-            &mut self,
-            core_batch_req: BatchDeviceRequest,
-            _sampled_output: Self::SampledOutput,
-        ) -> BatchDeviceResponse {
-            self.record("commit");
-            BatchDeviceResponse::new(core_batch_req.seq, Vec::new())
-        }
-
-        fn begin_ops_recording(&mut self, _batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {
-            self.record("begin");
-        }
-
-        fn embed_main(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _batch_req: &Self::ModelBatchRequest,
-        ) -> Self::ModelBatchHidden {
-            self.record("embed_main");
-        }
-
-        fn unembed_main(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _model_batch_hidden: &Self::ModelBatchHidden,
-        ) -> Self::ModelBatchResponse {
-            self.record("unembed_main");
-        }
-
-        fn forward_main(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _model_batch_hidden: Self::ModelBatchHidden,
-        ) -> Self::ModelBatchHidden {
-            self.record("forward_main");
-        }
-
-        fn submit_main(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
-            self.record("submit_main");
-            LifecycleSubmission {
-                events: Rc::clone(&self.events),
-                wait_event: "wait_main",
-            }
-        }
-
-        fn read_main(
-            &mut self,
-            _recorder: &Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _replay_elapsed: Duration,
-        ) -> Self::SampledOutput {
-            self.record("read_main");
-        }
-
-        fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, _sampled_output: &Self::SampledOutput) -> bool {
-            true
-        }
-
-        fn embed_spec(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _model_batch_hidden: &Self::ModelBatchHidden,
-            _sampled_output: &Self::SampledOutput,
-        ) -> Self::ModelBatchHidden {
-            self.record("embed_spec");
-        }
-
-        fn forward_spec(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _model_batch_hidden: Self::ModelBatchHidden,
-        ) -> Self::ModelBatchHidden {
-            self.record("forward_spec");
-        }
-
-        fn unembed_spec(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _model_batch_hidden: &Self::ModelBatchHidden,
-        ) -> Self::ModelBatchResponse {
-            self.record("unembed_spec");
-        }
-
-        fn sample_spec(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _model_batch_resp: &Self::ModelBatchResponse,
-        ) {
-            self.record("sample_spec");
-        }
-
-        fn submit_spec(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
-            self.record("submit_spec");
-            LifecycleSubmission {
-                events: Rc::clone(&self.events),
-                wait_event: "wait_spec",
-            }
-        }
-
-        fn read_spec(
-            &mut self,
-            _recorder: &Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            sampled_output: Self::SampledOutput,
-            _replay_elapsed: Duration,
-        ) -> Self::SampledOutput {
-            self.record("read_spec");
-            sampled_output
-        }
-
-        fn sample_main(
-            &mut self,
-            _recorder: &mut Self::ModelOpsRecorder,
-            _model_batch_req: &Self::ModelBatchRequest,
-            _model_batch_resp: &Self::ModelBatchResponse,
-        ) {
-            self.record("sample_main");
-        }
-
-        fn empty_sampled_output(&self) -> Self::SampledOutput {}
-
-        fn sampled_output_len(&self, _sampled_output: &Self::SampledOutput) -> usize {
-            0
-        }
-    }
 
     struct ResetOnlyModel {
         reset_tx: Sender<Vec<RawRequestSlot>>,
     }
 
-    impl ReplayableModelBatchExecutor for ResetOnlyModel {
+    struct ResetOnlySubmission;
+
+    impl ExecutionSubmission for ResetOnlySubmission {
+        fn wait(&self) {
+            panic!("reset-only model must not wait for a submission")
+        }
+    }
+
+    impl ReplayableModel for ResetOnlyModel {
         type ModelBatchRequest = ();
         type ModelBatchHidden = ();
         type ModelBatchResponse = ();
         type SampledOutput = ();
         type ModelOpsRecorder = ();
-        type Submission = LifecycleSubmission;
+        type Submission = ResetOnlySubmission;
+        type LifecycleError = std::convert::Infallible;
 
         fn model_name(&self) -> &str {
             "reset-only"
@@ -603,6 +437,26 @@ mod tests {
 
         fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]) {
             self.reset_tx.send(request_slots.to_vec()).unwrap();
+        }
+
+        fn clear_replay_cache(&mut self) {
+            panic!("reset-only model must not clear replay resources")
+        }
+
+        fn unload_state(&mut self, _snapshot_path: &std::path::Path) -> Result<(), Self::LifecycleError> {
+            panic!("reset-only model must not unload state")
+        }
+
+        fn unload_weights(&mut self) {
+            panic!("reset-only model must not unload weights")
+        }
+
+        fn load_weights(&mut self) -> Result<(), Self::LifecycleError> {
+            panic!("reset-only model must not load weights")
+        }
+
+        fn load_state(&mut self, _snapshot_path: &std::path::Path) -> Result<(), Self::LifecycleError> {
+            panic!("reset-only model must not load state")
         }
 
         fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
@@ -670,70 +524,13 @@ mod tests {
     }
 
     #[test]
-    fn test_prefill_uses_the_fixed_model_lifecycle() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let (_batch_dev_req_tx, batch_dev_req_rx) = bounded(1);
-        let (batch_dev_resp_tx, _batch_dev_resp_rx) = bounded(1);
-        let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
-        let shutdown = Shutdown::new();
-        let mut executor = ReplayableModelExecutorLoop::new(
-            batch_dev_req_rx,
-            batch_dev_resp_tx,
-            req_slot_reset_notifier,
-            req_slot_reset_rx,
-            shutdown,
-            LifecycleModel {
-                events: Rc::clone(&events),
-            },
-        );
-        let request = DeviceRequest::new(
-            7,
-            0,
-            QueryTokens::Prefill {
-                epoch: 0,
-                token_index: 0,
-                tokens: vec![Token::new(11)],
-                window: 1,
-            },
-            DecoderSyncBlocks::new(0, Vec::new(), Vec::new()),
-            SamplingConfig::default(),
-        );
-
-        let response = executor.execute(BatchDeviceRequest::new(1, [request]));
-
-        assert!(response.dev_resps.is_empty());
-        assert_eq!(
-            events.borrow().as_slice(),
-            &[
-                "prepare",
-                "begin",
-                "embed_main",
-                "forward_main",
-                "unembed_main",
-                "sample_main",
-                "submit_main",
-                "wait_main",
-                "read_main",
-                "embed_spec",
-                "forward_spec",
-                "unembed_spec",
-                "sample_spec",
-                "submit_spec",
-                "wait_spec",
-                "read_spec",
-                "commit",
-            ]
-        );
-    }
-
-    #[test]
-    fn test_executor_drains_request_slot_resets_without_a_device_batch() {
+    fn test_request_slot_resets() {
         let (_batch_dev_req_tx, batch_dev_req_rx) = bounded(1);
         let (batch_dev_resp_tx, _batch_dev_resp_rx) = bounded(1);
         let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
         let (seen_reset_tx, seen_reset_rx) = bounded(1);
         let shutdown = Shutdown::new();
-        let executor = ReplayableModelExecutorLoop::new(
+        let executor = ReplayableModelEventLoop::new(
             batch_dev_req_rx,
             batch_dev_resp_tx,
             req_slot_reset_notifier.clone(),

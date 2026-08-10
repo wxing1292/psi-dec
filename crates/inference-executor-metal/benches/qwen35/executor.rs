@@ -13,7 +13,7 @@ use inference_runtime_core::compute::DecoderSyncBlocks;
 use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::ModelOutputTiming;
 use inference_runtime_core::compute::QueryTokens;
-use inference_runtime_core::compute::ReplayableModelBatchExecutor;
+use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::compute::SampledTokens;
 use inference_runtime_core::runtime::Token;
 

@@ -1,2 +1,2 @@
-mod replay_executor_loop;
-pub use replay_executor_loop::ReplayableModelExecutorLoop;
+mod replayable_model_event_loop;
+pub use replayable_model_event_loop::ReplayableModelEventLoop;

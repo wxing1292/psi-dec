@@ -44,7 +44,7 @@ use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::DecoderSyncBlocks;
 use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::QueryTokens;
-use inference_runtime_core::compute::ReplayableModelBatchExecutor;
+use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::config::SamplingConfig;
 use inference_runtime_core::runtime::Token;
 

@@ -31,7 +31,7 @@ use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::ModelOutputTiming;
-use inference_runtime_core::compute::ReplayableModelBatchExecutor;
+use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -300,7 +300,7 @@ impl Qwen3PendingTransactions {
     }
 }
 
-impl ReplayableModelBatchExecutor for Qwen3Executor {
+impl ReplayableModel for Qwen3Executor {
     type ModelBatchRequest = Qwen3ModelBatchRequest;
     type ModelBatchHidden = Rc<Buffer>;
     type ModelBatchResponse = Qwen3ModelBatchResponse;
@@ -641,7 +641,7 @@ fn replay_bucket_capacity(active: u32, max_capacity: u32) -> u32 {
 mod tests {
     use inference_executor_core::attn::GQAReplayShape;
     use inference_executor_core::model::qwen::v3::Qwen3ModelBatchRequest;
-    use inference_runtime_core::compute::ReplayableModelBatchExecutor;
+    use inference_runtime_core::compute::ReplayableModel;
 
     use super::Qwen3Executor;
     use super::Qwen3ExecutorConfig;
@@ -658,7 +658,7 @@ mod tests {
             num_tokens_per_block: 1024,
         }
         .validate();
-        fn assert_compact_qwen3_batch<T: ReplayableModelBatchExecutor<ModelBatchRequest = Qwen3ModelBatchRequest>>() {}
+        fn assert_compact_qwen3_batch<T: ReplayableModel<ModelBatchRequest = Qwen3ModelBatchRequest>>() {}
         assert_compact_qwen3_batch::<Qwen3Executor>();
     }
 

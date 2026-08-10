@@ -34,7 +34,7 @@ use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::ModelOutputTiming;
-use inference_runtime_core::compute::ReplayableModelBatchExecutor;
+use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -488,7 +488,7 @@ pub struct Qwen35SampledOutput {
     timing: ModelOutputTiming,
 }
 
-impl ReplayableModelBatchExecutor for Qwen35Executor {
+impl ReplayableModel for Qwen35Executor {
     type ModelBatchRequest = Qwen35ModelBatchRequest;
     type ModelBatchHidden = Rc<Buffer>;
     type ModelBatchResponse = Qwen35ModelBatchResponse;

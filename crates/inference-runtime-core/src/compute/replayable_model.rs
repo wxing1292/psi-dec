@@ -10,7 +10,7 @@ pub trait ExecutionSubmission {
     fn wait(&self);
 }
 
-pub trait ReplayableModelBatchExecutor {
+pub trait ReplayableModel {
     type ModelBatchRequest;
     type ModelBatchHidden;
     type ModelBatchResponse;
