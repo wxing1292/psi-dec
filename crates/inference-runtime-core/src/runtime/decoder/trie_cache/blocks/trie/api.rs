@@ -405,7 +405,7 @@ where
                 let ready_to_cached_token_window = input_tokens.len().saturating_sub(L - 1);
                 let queued_to_cached_token_window = min(
                     input_tokens.len() + output_validated_tokens.len(),
-                    input_tokens.len() + output_validated_tokens.len() + 1 - L + 1,
+                    (input_tokens.len() + output_validated_tokens.len() + 1).saturating_sub(L - 1),
                 ) - ready_to_cached_token_window;
                 self.queued_tokens.extend(output_validated_tokens.iter().copied());
                 self.queued_tokens.push_back(output_sampled_token);
@@ -590,6 +590,16 @@ where
         if block_index > 0 {
             std::array::from_fn(|_| vec![].into())
         } else {
+            // MTP root lane identity, L = 4:
+            //
+            // verified tokens  t0  t1  t2  ...
+            // lane 0 root      t0  t1  t2  ...
+            // lane 1 root          t1  t2  ...  prefix: [t0]
+            // lane 2 root              t2  ...  prefix: [t0, t1]
+            // lane 3 root                  ...  prefix: [t0, t1, t2]
+            //
+            // TODO: Allow a short MTP root to defer its lane-specific PrefixTokens annotation until verified history
+            // contains that lane's complete prefix.
             std::array::from_fn(|lane| {
                 if lane == 0 {
                     vec![].into()
