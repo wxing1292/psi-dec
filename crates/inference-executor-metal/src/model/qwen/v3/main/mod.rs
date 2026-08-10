@@ -44,16 +44,40 @@ pub struct Qwen3MainArgs<'a> {
 
 impl Qwen3Main {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         config: &Qwen3ModelConfig,
-        bindings: Qwen3MainWeightBindings,
         gqa_state: &Qwen3MainGQAState,
         residual_capture: Option<Rc<dyn MainResidualCapture>>,
         layer_scratch: Rc<Qwen3MainLayerScratch>,
         dense_scratch: &Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
+        let text = &config.text_config;
+        let mut layers = Vec::with_capacity(text.num_hidden_layers);
+        for model_layer_index in 0..text.num_hidden_layers {
+            layers.push(Qwen3MainLayer::new(
+                device,
+                config,
+                model_layer_index,
+                gqa_state,
+                Rc::clone(&layer_scratch),
+                Rc::clone(dense_scratch),
+            )?);
+        }
+        Ok(Self {
+            layers,
+            final_norm: RMSNorm::new(device, text.hidden_size, text.rms_norm_eps),
+            residual_capture,
+        })
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        config: &Qwen3ModelConfig,
+        bindings: Qwen3MainWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
         let Qwen3MainWeightBindings {
             final_norm_weight,
             layers: layer_bindings,
@@ -63,28 +87,19 @@ impl Qwen3Main {
             config.text_config.num_hidden_layers,
             "qwen3 Main config and checkpoint binding layer counts must match"
         );
-        let text = &config.text_config;
-        let mut layers = Vec::with_capacity(layer_bindings.len());
-        for (model_layer_index, bindings) in layer_bindings.into_iter().enumerate() {
-            layers.push(Qwen3MainLayer::load(
-                device,
-                store,
-                config,
-                model_layer_index,
-                bindings,
-                gqa_state,
-                Rc::clone(&layer_scratch),
-                Rc::clone(dense_scratch),
-            )?);
+        assert_eq!(
+            self.layers.len(),
+            layer_bindings.len(),
+            "qwen3 Main component and checkpoint binding layer counts must match"
+        );
+        for (layer, bindings) in self.layers.iter_mut().zip(layer_bindings) {
+            layer.load_weights(device, store, config, bindings)?;
             store.unload_all();
         }
-
+        let text = &config.text_config;
         let final_norm_weight = load_qwen3x_norm_weight(device, store, &final_norm_weight, &[text.hidden_size])?;
-        Ok(Self {
-            layers,
-            final_norm: RMSNorm::new(device, text.hidden_size, text.rms_norm_eps, final_norm_weight),
-            residual_capture,
-        })
+        self.final_norm.load_weights(final_norm_weight);
+        Ok(())
     }
 
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen3MainArgs<'a>) -> &'a Buffer

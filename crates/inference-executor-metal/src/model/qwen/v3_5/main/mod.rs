@@ -61,13 +61,11 @@ pub struct Qwen35MainArgs<'a> {
 
 impl Qwen35Main {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         config: &Qwen35ModelConfig,
         max_tokens: usize,
         defaults: Qwen35MetalDefaults,
-        bindings: Qwen35MainWeightBindings,
         gqa_state: &Qwen3xGQAState,
         gdn_state: &Qwen3xGDNState,
         residual_capture: Option<Rc<dyn MainResidualCapture>>,
@@ -75,32 +73,21 @@ impl Qwen35Main {
         dense_scratch: Option<&Rc<DenseMLPScratch>>,
         moe_scratch: Option<&Rc<MoEScratch>>,
     ) -> Result<Self, ModelExecutorError> {
-        let Qwen35MainWeightBindings {
-            final_norm_weight,
-            layers: layer_bindings,
-        } = bindings;
-        assert_eq!(
-            layer_bindings.len(),
-            config.text_config.num_hidden_layers,
-            "qwen3.5 Main config and checkpoint binding layer counts must match"
-        );
         let mut num_loaded_gqa_layers = 0;
         let mut num_loaded_gdn_layers = 0;
-        let mut layers = Vec::with_capacity(layer_bindings.len());
-        for (layer_index, bindings) in layer_bindings.into_iter().enumerate() {
+        let mut layers = Vec::with_capacity(config.text_config.num_hidden_layers);
+        for layer_index in 0..config.text_config.num_hidden_layers {
             let layer_type = config.layer_type_at(layer_index)?;
             let attn_layer_index = match layer_type {
                 LayerType::FullAttention => num_loaded_gqa_layers,
                 LayerType::GDN => num_loaded_gdn_layers,
             };
-            layers.push(Qwen35MainLayer::load(
+            layers.push(Qwen35MainLayer::new(
                 device,
-                store,
                 config,
                 defaults,
                 layer_index,
                 attn_layer_index,
-                bindings,
                 gqa_state,
                 gdn_state,
                 Rc::clone(&layer_scratch),
@@ -111,11 +98,7 @@ impl Qwen35Main {
                 LayerType::FullAttention => num_loaded_gqa_layers += 1,
                 LayerType::GDN => num_loaded_gdn_layers += 1,
             }
-            store.unload_all();
         }
-
-        let final_norm_weight =
-            load_qwen3x_norm_weight(device, store, &final_norm_weight, &[config.text_config.hidden_size])?;
         let max_tokens = max_tokens
             .try_into()
             .expect("qwen3.5 Main replay token capacity must fit u32");
@@ -126,15 +109,40 @@ impl Qwen35Main {
         }
         Ok(Self {
             layers,
-            final_norm: RMSNorm::new(
-                device,
-                config.text_config.hidden_size,
-                config.text_config.rms_norm_eps,
-                final_norm_weight,
-            ),
+            final_norm: RMSNorm::new(device, config.text_config.hidden_size, config.text_config.rms_norm_eps),
             residual_capture,
             replay_bucket_policy: main_replay_bucket_policy(max_tokens, topology_boundaries),
         })
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        config: &Qwen35ModelConfig,
+        defaults: Qwen35MetalDefaults,
+        bindings: Qwen35MainWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
+        let Qwen35MainWeightBindings {
+            final_norm_weight,
+            layers: layer_bindings,
+        } = bindings;
+        assert_eq!(
+            self.layers.len(),
+            layer_bindings.len(),
+            "qwen3.5 Main component and checkpoint binding layer counts must match"
+        );
+        for (layer, bindings) in self.layers.iter_mut().zip(layer_bindings) {
+            layer.load_weights(device, store, config, defaults, bindings)?;
+            store.unload_all();
+        }
+        self.final_norm.load_weights(load_qwen3x_norm_weight(
+            device,
+            store,
+            &final_norm_weight,
+            &[config.text_config.hidden_size],
+        )?);
+        Ok(())
     }
 
     pub fn replay_token_capacity(&self, num_active_tokens: u32) -> u32 {

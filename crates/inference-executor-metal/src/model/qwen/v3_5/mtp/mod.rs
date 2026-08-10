@@ -60,15 +60,12 @@ pub struct Qwen35MTPArgs<'a> {
 
 impl Qwen35MTP {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         main_config: &Qwen35ModelConfig,
         config: &Qwen35ModelConfig,
         max_tokens: usize,
         defaults: Qwen35MetalDefaults,
-        bindings: Qwen35LayerWeightBindings,
-        final_norm_weight: String,
         gqa_state: &Qwen3xGQAState,
         num_cache_pages: usize,
         layer_scratch: Rc<Qwen35MTPLayerScratch>,
@@ -76,21 +73,16 @@ impl Qwen35MTP {
         moe_scratch: Option<&Rc<MoEScratch>>,
     ) -> Result<Self, ModelExecutorError> {
         let hidden_dim = config.text_config.hidden_size;
-        let layer = Qwen35MTPLayer::load(
+        let layer = Qwen35MTPLayer::new(
             device,
-            store,
             config,
             defaults,
             main_config.text_config.num_hidden_layers,
-            bindings,
             gqa_state,
             layer_scratch,
             dense_scratch,
             moe_scratch,
         )?;
-        let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
-        let final_norm_weight = remove_qwen3x_norm_weight(device, &mut tensors, &final_norm_weight, &[hidden_dim])?;
-        assert!(tensors.is_empty(), "qwen3.5 MTP must consume its final norm tensor map");
         let max_tokens = max_tokens
             .try_into()
             .expect("qwen3.5 MTP replay token capacity must fit u32");
@@ -98,11 +90,42 @@ impl Qwen35MTP {
         topology_boundaries.extend(layer.mlp_replay_topology_boundaries());
         Ok(Self {
             layer,
-            output_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps, final_norm_weight),
+            output_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
             request_page_table: Rc::clone(gqa_state.request_page_table()),
             num_cache_pages,
             replay_bucket_policy: mtp_replay_bucket_policy(max_tokens, topology_boundaries),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        main_config: &Qwen35ModelConfig,
+        config: &Qwen35ModelConfig,
+        defaults: Qwen35MetalDefaults,
+        bindings: Qwen35LayerWeightBindings,
+        final_norm_weight: String,
+    ) -> Result<(), ModelExecutorError> {
+        self.layer.load_weights(
+            device,
+            store,
+            config,
+            defaults,
+            main_config.text_config.num_hidden_layers,
+            bindings,
+        )?;
+        let hidden_dim = config.text_config.hidden_size;
+        let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
+        self.output_norm.load_weights(remove_qwen3x_norm_weight(
+            device,
+            &mut tensors,
+            &final_norm_weight,
+            &[hidden_dim],
+        )?);
+        assert!(tensors.is_empty(), "qwen3.5 MTP must consume its final norm tensor map");
+        Ok(())
     }
 
     pub fn replay_token_capacity(&self, num_active_tokens: u32) -> u32 {

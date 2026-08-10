@@ -71,18 +71,44 @@ pub struct Qwen35MTPLayerInput<'a> {
 
 impl Qwen35MTPLayer {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
+        device: &Device,
+        config: &Qwen35ModelConfig,
+        defaults: Qwen35MetalDefaults,
+        model_layer_index: usize,
+        gqa_state: &Qwen3xGQAState,
+        scratch: Rc<Qwen35MTPLayerScratch>,
+        dense_scratch: Option<&Rc<DenseMLPScratch>>,
+        moe_scratch: Option<&Rc<MoEScratch>>,
+    ) -> Result<Self, ModelExecutorError> {
+        let attention = Qwen3xGQA::new(
+            inference_backend_metal::metal::ReplayU32::Parameter(QWEN35_MTP_GQA_LAYER_INDEX),
+            Rc::clone(gqa_state.backend()),
+            Rc::clone(gqa_state.scratch()),
+            Rc::clone(gqa_state.request_page_table()),
+        );
+        let mlp = Qwen35MTPMLP::new(device, config, defaults, dense_scratch, moe_scratch)?;
+        let hidden_dim = config.text_config.hidden_size;
+        let eps = config.text_config.rms_norm_eps;
+        Ok(Self {
+            input_norm: RMSNorm::new(device, hidden_dim, eps),
+            attention,
+            residual_add: ResidualAdd::new(device),
+            post_attention_norm: RMSNorm::new(device, hidden_dim, eps),
+            mlp,
+            scratch,
+        })
+    }
+
+    pub fn load_weights(
+        &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
         config: &Qwen35ModelConfig,
         defaults: Qwen35MetalDefaults,
         model_layer_index: usize,
         bindings: Qwen35LayerWeightBindings,
-        gqa_state: &Qwen3xGQAState,
-        scratch: Rc<Qwen35MTPLayerScratch>,
-        dense_scratch: Option<&Rc<DenseMLPScratch>>,
-        moe_scratch: Option<&Rc<MoEScratch>>,
-    ) -> Result<Self, ModelExecutorError> {
+    ) -> Result<(), ModelExecutorError> {
         let Qwen35LayerWeightBindings {
             input_norm_weight,
             post_attention_norm_weight,
@@ -90,48 +116,28 @@ impl Qwen35MTPLayer {
             mlp,
         } = bindings;
         let attention = match attention {
-            Qwen35AttentionWeightBindings::GQA(bindings) => {
-                let (core, metal) = qwen35_gqa_core_and_metal(model_layer_index, &config.text_config, defaults)?;
-                Qwen3xGQA::load(
-                    device,
-                    store,
-                    &core,
-                    metal,
-                    inference_backend_metal::metal::ReplayU32::Parameter(QWEN35_MTP_GQA_LAYER_INDEX),
-                    bindings,
-                    Rc::clone(gqa_state.backend()),
-                    Rc::clone(gqa_state.scratch()),
-                    Rc::clone(gqa_state.request_page_table()),
-                )?
-            },
-            Qwen35AttentionWeightBindings::GDN(_) => {
-                panic!("qwen3.5 MTP layer bindings must contain GQA attention")
-            },
+            Qwen35AttentionWeightBindings::GQA(bindings) => bindings,
+            Qwen35AttentionWeightBindings::GDN(_) => panic!("qwen3.5 MTP layer bindings must contain GQA attention"),
         };
-        let mlp = Qwen35MTPMLP::load(device, store, config, defaults, mlp, dense_scratch, moe_scratch)?;
+        let (core, metal) = qwen35_gqa_core_and_metal(model_layer_index, &config.text_config, defaults)?;
+        self.attention.load_weights(device, store, &core, metal, attention)?;
+        self.mlp.load_weights(device, store, config, defaults, mlp)?;
         let hidden_dim = config.text_config.hidden_size;
-        let eps = config.text_config.rms_norm_eps;
         let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
-        let layer = Self {
-            input_norm: RMSNorm::new(
-                device,
-                hidden_dim,
-                eps,
-                remove_qwen3x_norm_weight(device, &mut tensors, &input_norm_weight, &[hidden_dim])?,
-            ),
-            attention,
-            residual_add: ResidualAdd::new(device),
-            post_attention_norm: RMSNorm::new(
-                device,
-                hidden_dim,
-                eps,
-                remove_qwen3x_norm_weight(device, &mut tensors, &post_attention_norm_weight, &[hidden_dim])?,
-            ),
-            mlp,
-            scratch,
-        };
+        self.input_norm.load_weights(remove_qwen3x_norm_weight(
+            device,
+            &mut tensors,
+            &input_norm_weight,
+            &[hidden_dim],
+        )?);
+        self.post_attention_norm.load_weights(remove_qwen3x_norm_weight(
+            device,
+            &mut tensors,
+            &post_attention_norm_weight,
+            &[hidden_dim],
+        )?);
         assert!(tensors.is_empty(), "qwen3.5 MTP layer must consume its norm tensor map");
-        Ok(layer)
+        Ok(())
     }
 
     pub fn gqa_tokens_per_page(&self) -> usize {
@@ -270,37 +276,48 @@ impl ReplayLayer for Qwen35MTPLayer {
 }
 
 impl Qwen35MTPMLP {
-    fn load(
+    fn new(
+        device: &Device,
+        config: &Qwen35ModelConfig,
+        defaults: Qwen35MetalDefaults,
+        dense_scratch: Option<&Rc<DenseMLPScratch>>,
+        moe_scratch: Option<&Rc<MoEScratch>>,
+    ) -> Result<Self, ModelExecutorError> {
+        if config.layer_uses_moe(0) {
+            let (core, metal) = qwen35_moe_core_and_metal("layers.0", 0, config, defaults)?;
+            Ok(Self::MoE(Qwen3xMoE::new(
+                device,
+                &core,
+                metal,
+                Rc::clone(moe_scratch.expect("qwen3.5 MTP MoE layer requires shared MoE scratch")),
+            )))
+        } else {
+            let (core, metal) = qwen35_dense_mlp_core_and_metal(0, &config.text_config, defaults)?;
+            Ok(Self::Dense(Qwen3xDenseMLP::new(
+                device,
+                &core,
+                metal,
+                Rc::clone(dense_scratch.expect("qwen3.5 MTP dense layer requires shared dense scratch")),
+            )))
+        }
+    }
+
+    fn load_weights(
+        &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
         config: &Qwen35ModelConfig,
         defaults: Qwen35MetalDefaults,
         bindings: Qwen35MLPWeightBindings,
-        dense_scratch: Option<&Rc<DenseMLPScratch>>,
-        moe_scratch: Option<&Rc<MoEScratch>>,
-    ) -> Result<Self, ModelExecutorError> {
-        match (config.layer_uses_moe(0), bindings) {
-            (false, Qwen35MLPWeightBindings::Dense(bindings)) => {
+    ) -> Result<(), ModelExecutorError> {
+        match (self, config.layer_uses_moe(0), bindings) {
+            (Self::Dense(component), false, Qwen35MLPWeightBindings::Dense(bindings)) => {
                 let (core, metal) = qwen35_dense_mlp_core_and_metal(0, &config.text_config, defaults)?;
-                Ok(Self::Dense(Qwen3xDenseMLP::load(
-                    device,
-                    store,
-                    &core,
-                    metal,
-                    *bindings,
-                    Rc::clone(dense_scratch.expect("qwen3.5 MTP dense layer requires shared dense scratch")),
-                )?))
+                component.load_weights(device, store, &core, metal, *bindings)
             },
-            (true, Qwen35MLPWeightBindings::MoE(bindings)) => {
+            (Self::MoE(component), true, Qwen35MLPWeightBindings::MoE(bindings)) => {
                 let (core, metal) = qwen35_moe_core_and_metal("layers.0", 0, config, defaults)?;
-                Ok(Self::MoE(Qwen3xMoE::load(
-                    device,
-                    store,
-                    &core,
-                    metal,
-                    *bindings,
-                    Rc::clone(moe_scratch.expect("qwen3.5 MTP MoE layer requires shared MoE scratch")),
-                )?))
+                component.load_weights(device, store, &core, metal, *bindings)
             },
             _ => panic!("qwen3.5 MTP layer MLP config and checkpoint bindings must have the same kind"),
         }

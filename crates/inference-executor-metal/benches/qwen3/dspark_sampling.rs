@@ -171,17 +171,18 @@ impl Fixture {
                 .expect("DSpark sampling benchmark vocabulary must fit u32"),
             top_k: top_k.try_into().expect("DSpark sampling benchmark top_k must fit u32"),
         };
-        let markov = Qwen3xDSparkMarkov::load(
+        let mut markov = Qwen3xDSparkMarkov::new(
             device,
-            &mut store,
             &config,
             config.block_size,
             &bindings.markov,
-            &bindings.confidence,
             num_requests,
             bounds,
         )
-        .expect("unable to load Qwen3 DSpark Markov sampling");
+        .expect("unable to construct Qwen3 DSpark Markov sampling");
+        markov
+            .load_weights(device, &mut store, &bindings.markov, &bindings.confidence)
+            .expect("unable to load Qwen3 DSpark Markov sampling");
         let distribution_store = SpecProbsStore::new(device, config.block_size, num_requests, top_k);
         let req_slots = (0..num_requests)
             .map(|req_slot| {

@@ -55,7 +55,7 @@ impl EmbedConfig {
 pub struct Embed {
     config: EmbedConfig,
     kernel: Rc<QuantizedEmbeddingKernel>,
-    weights: Rc<EmbedWeights>,
+    weights: Option<Rc<EmbedWeights>>,
 }
 
 struct EmbedWeights {
@@ -87,7 +87,7 @@ impl Embed {
         Self {
             config,
             kernel: Rc::clone(&self.kernel),
-            weights: Rc::clone(&self.weights),
+            weights: self.weights.as_ref().map(Rc::clone),
         }
     }
 
@@ -95,31 +95,47 @@ impl Embed {
         self.validate_num_tokens(input.num_tokens);
     }
 
-    pub fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        config: EmbedConfig,
-        bindings: QuantizedTensorBindings,
-    ) -> Result<Self, ModelExecutorError> {
+    pub fn new(device: &Device, config: EmbedConfig) -> Self {
         config.validate();
-        let weights = EmbedWeights::load(device, store, config.config(), bindings)?;
-        let embedding = Self {
+        Self {
             config,
             kernel: Rc::new(QuantizedEmbeddingKernel::new(device, config.config())),
-            weights: Rc::new(weights),
-        };
-        embedding.validate_weights();
-        Ok(embedding)
+            weights: None,
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        bindings: QuantizedTensorBindings,
+    ) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "embedding weights are already loaded");
+        self.weights = Some(Rc::new(EmbedWeights::load(
+            device,
+            store,
+            self.config.config(),
+            bindings,
+        )?));
+        self.validate_weights();
+        Ok(())
     }
 
     fn validate_weights(&self) {
         let config = self.config.config();
-        assert_eq!(self.weights.weight.len_bytes(), config.weight_bytes());
+        let weights = self.weights();
+        assert_eq!(weights.weight.len_bytes(), config.weight_bytes());
         assert_eq!(
-            self.weights.scales.len_bytes(),
+            weights.scales.len_bytes(),
             config.num_affine_params() * self.config.scale_bias_dtype.item_size()
         );
-        assert_eq!(self.weights.biases.len_bytes(), self.weights.scales.len_bytes());
+        assert_eq!(weights.biases.len_bytes(), weights.scales.len_bytes());
+    }
+
+    fn weights(&self) -> &EmbedWeights {
+        self.weights
+            .as_deref()
+            .expect("embedding weights must be loaded before execution")
     }
 
     pub fn record_bucketed<'a, R>(
@@ -134,6 +150,7 @@ impl Embed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.validate_num_tokens(num_total_tokens);
+        let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke_bucketed(
             QuantizedEmbeddingShape {
                 num_tokens: num_total_tokens,
@@ -141,9 +158,9 @@ impl Embed {
             num_active_tokens_key,
             QuantizedEmbeddingBuffers {
                 token_ids,
-                weight: &self.weights.weight,
-                scales: &self.weights.scales,
-                biases: &self.weights.biases,
+                weight: &weights.weight,
+                scales: &weights.scales,
+                biases: &weights.biases,
                 output: output_hidden,
             },
         )));
@@ -170,15 +187,16 @@ impl ReplayLayer for Embed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.validate_input(input);
+        let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke(
             QuantizedEmbeddingShape {
                 num_tokens: input.num_tokens,
             },
             QuantizedEmbeddingBuffers {
                 token_ids: input.token_ids,
-                weight: &self.weights.weight,
-                scales: &self.weights.scales,
-                biases: &self.weights.biases,
+                weight: &weights.weight,
+                scales: &weights.scales,
+                biases: &weights.biases,
                 output: input.output_hidden,
             },
         )));
@@ -265,7 +283,7 @@ mod tests {
         let embed = Embed {
             config,
             kernel: Rc::new(QuantizedEmbeddingKernel::new(&device, kernel_config)),
-            weights: Rc::new(EmbedWeights {
+            weights: Some(Rc::new(EmbedWeights {
                 weight: Buffer::new_zeroed(&device, kernel_config.weight_bytes()),
                 scales: Buffer::new_zeroed(
                     &device,
@@ -275,7 +293,7 @@ mod tests {
                     &device,
                     kernel_config.num_affine_params() * config.scale_bias_dtype.item_size(),
                 ),
-            }),
+            })),
         };
         embed.validate_weights();
 
@@ -284,6 +302,9 @@ mod tests {
         assert_eq!(embed.max_tokens(), 2);
         assert_eq!(expanded.max_tokens(), 7);
         assert!(Rc::ptr_eq(&embed.kernel, &expanded.kernel));
-        assert!(Rc::ptr_eq(&embed.weights, &expanded.weights));
+        assert!(Rc::ptr_eq(
+            embed.weights.as_ref().expect("test embed weights must exist"),
+            expanded.weights.as_ref().expect("expanded embed weights must exist")
+        ));
     }
 }

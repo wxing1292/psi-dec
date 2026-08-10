@@ -54,14 +54,13 @@ pub struct Qwen3xDSparkLayerInput<'a> {
 
 impl Qwen3xDSparkLayer {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         config: &Qwen3xDSparkConfig,
         num_spec_tokens: usize,
         dspark_layer_index: usize,
         page_bytes: usize,
-        bindings: Qwen3xDSparkLayerWeightBindings,
+        bindings: &Qwen3xDSparkLayerWeightBindings,
         gqa_state: &UngatedDSparkGQAState,
         scratch: Rc<Qwen3xDSparkLayerScratch>,
         dense_scratch: Rc<DenseMLPScratch>,
@@ -73,8 +72,8 @@ impl Qwen3xDSparkLayer {
             mlp,
         } = bindings;
         let (attention_core, attention_metal) =
-            qwen3x_dspark_gqa_core_and_metal(config, num_spec_tokens, dspark_layer_index, &gqa, page_bytes)?;
-        let (mlp_core, mlp_metal) = qwen3x_dspark_dense_mlp_core_and_metal(config, dspark_layer_index, &mlp)?;
+            qwen3x_dspark_gqa_core_and_metal(config, num_spec_tokens, dspark_layer_index, gqa, page_bytes)?;
+        let (mlp_core, mlp_metal) = qwen3x_dspark_dense_mlp_core_and_metal(config, dspark_layer_index, mlp)?;
         let hidden_dim = attention_core.attention.hidden_dim;
         assert_eq!(
             hidden_dim, mlp_core.hidden_dim,
@@ -84,39 +83,64 @@ impl Qwen3xDSparkLayer {
             mlp_core.model_layer_index, dspark_layer_index,
             "Qwen3 DSpark MLP core must match the layer index"
         );
-        let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
-        let layer = Self {
+        Ok(Self {
             dspark_layer_index,
-            input_norm: RMSNorm::new(
+            input_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps),
+            attention: Qwen3xDSparkAttention::new(
                 device,
-                hidden_dim,
-                config.rms_norm_eps,
-                remove_qwen3x_norm_weight(device, &mut tensors, &input_norm_weight, &[hidden_dim])?,
-            ),
-            attention: Qwen3xDSparkAttention::load(
-                device,
-                store,
                 &attention_core,
                 attention_metal,
                 dspark_layer_index,
-                gqa,
                 gqa_state,
-            )?,
-            residual_add: ResidualAdd::new(device),
-            post_attention_norm: RMSNorm::new(
-                device,
-                hidden_dim,
-                config.rms_norm_eps,
-                remove_qwen3x_norm_weight(device, &mut tensors, &post_attention_norm_weight, &[hidden_dim])?,
             ),
-            mlp: Qwen3xDenseMLP::load(device, store, &mlp_core, mlp_metal, mlp, dense_scratch)?,
+            residual_add: ResidualAdd::new(device),
+            post_attention_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps),
+            mlp: Qwen3xDenseMLP::new(device, &mlp_core, mlp_metal, dense_scratch),
             scratch,
-        };
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        config: &Qwen3xDSparkConfig,
+        num_spec_tokens: usize,
+        page_bytes: usize,
+        bindings: Qwen3xDSparkLayerWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
+        let Qwen3xDSparkLayerWeightBindings {
+            input_norm_weight,
+            post_attention_norm_weight,
+            gqa,
+            mlp,
+        } = bindings;
+        let (attention_core, attention_metal) =
+            qwen3x_dspark_gqa_core_and_metal(config, num_spec_tokens, self.dspark_layer_index, &gqa, page_bytes)?;
+        let (mlp_core, mlp_metal) = qwen3x_dspark_dense_mlp_core_and_metal(config, self.dspark_layer_index, &mlp)?;
+        self.attention
+            .load_weights(device, store, &attention_core, attention_metal, gqa)?;
+        self.mlp.load_weights(device, store, &mlp_core, mlp_metal, mlp)?;
+        let hidden_dim = attention_core.attention.hidden_dim;
+        let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
+        self.input_norm.load_weights(remove_qwen3x_norm_weight(
+            device,
+            &mut tensors,
+            &input_norm_weight,
+            &[hidden_dim],
+        )?);
+        self.post_attention_norm.load_weights(remove_qwen3x_norm_weight(
+            device,
+            &mut tensors,
+            &post_attention_norm_weight,
+            &[hidden_dim],
+        )?);
         assert!(
             tensors.is_empty(),
             "Qwen3x DSpark layer must consume its norm tensor map"
         );
-        Ok(layer)
+        Ok(())
     }
 
     pub fn residual_output(&self) -> &Buffer {

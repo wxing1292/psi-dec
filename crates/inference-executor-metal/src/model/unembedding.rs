@@ -68,7 +68,7 @@ impl UnembedConfig {
 pub struct Unembed {
     config: UnembedConfig,
     matmul: Rc<AffineQuantizedMatmul>,
-    weights: Rc<UnembedWeights>,
+    weights: Option<Rc<UnembedWeights>>,
 }
 
 struct UnembedWeights {
@@ -93,29 +93,45 @@ pub struct UnembedBucketedInput<'a> {
 }
 
 impl Unembed {
-    pub fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        config: UnembedConfig,
-        bindings: QuantizedTensorBindings,
-    ) -> Result<Self, ModelExecutorError> {
+    pub fn new(device: &Device, config: UnembedConfig) -> Self {
         config.validate();
         let affine_config = config.affine_config();
-        let weights = UnembedWeights::load(device, store, affine_config, bindings)?;
-        let unembed = Self {
+        Self {
             config,
             matmul: Rc::new(AffineQuantizedMatmul::new(device, affine_config)),
-            weights: Rc::new(weights),
-        };
-        unembed.validate_weights();
-        Ok(unembed)
+            weights: None,
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        bindings: QuantizedTensorBindings,
+    ) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "unembed weights are already loaded");
+        self.weights = Some(Rc::new(UnembedWeights::load(
+            device,
+            store,
+            self.config.affine_config(),
+            bindings,
+        )?));
+        self.validate_weights();
+        Ok(())
     }
 
     fn validate_weights(&self) {
         let config = self.config.affine_config();
-        assert_eq!(self.weights.weight.len_bytes(), config.weight_bytes());
-        assert_eq!(self.weights.scales.len_bytes(), config.scale_or_bias_bytes());
-        assert_eq!(self.weights.biases.len_bytes(), self.weights.scales.len_bytes());
+        let weights = self.weights();
+        assert_eq!(weights.weight.len_bytes(), config.weight_bytes());
+        assert_eq!(weights.scales.len_bytes(), config.scale_or_bias_bytes());
+        assert_eq!(weights.biases.len_bytes(), weights.scales.len_bytes());
+    }
+
+    fn weights(&self) -> &UnembedWeights {
+        self.weights
+            .as_deref()
+            .expect("unembed weights must be loaded before execution")
     }
 
     pub fn max_tokens(&self) -> u32 {
@@ -132,7 +148,7 @@ impl Unembed {
         Self {
             config,
             matmul: Rc::clone(&self.matmul),
-            weights: Rc::clone(&self.weights),
+            weights: self.weights.as_ref().map(Rc::clone),
         }
     }
 
@@ -150,6 +166,7 @@ impl Unembed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.validate_num_rows(input.num_total_rows);
+        let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.matmul.invoke_bucketed(
             input.num_total_rows,
             input.num_active_rows_key,
@@ -157,11 +174,11 @@ impl Unembed {
             0,
             input.hidden,
             0,
-            &self.weights.weight,
+            &weights.weight,
             0,
-            &self.weights.scales,
+            &weights.scales,
             0,
-            &self.weights.biases,
+            &weights.biases,
             0,
         )));
         input.logits
@@ -193,17 +210,18 @@ impl ReplayLayer for Unembed {
             input.num_rows,
             self.config.max_tokens
         );
+        let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.matmul.invoke(
             input.num_rows.try_into().expect("unembed row count must fit i32"),
             input.logits,
             0,
             input.hidden,
             0,
-            &self.weights.weight,
+            &weights.weight,
             0,
-            &self.weights.scales,
+            &weights.scales,
             0,
-            &self.weights.biases,
+            &weights.biases,
             0,
         )));
         input.logits
@@ -323,7 +341,10 @@ mod tests {
         assert_eq!(unembed.max_tokens(), 2);
         assert_eq!(expanded.max_tokens(), 7);
         assert!(Rc::ptr_eq(&unembed.matmul, &expanded.matmul));
-        assert!(Rc::ptr_eq(&unembed.weights, &expanded.weights));
+        assert!(Rc::ptr_eq(
+            unembed.weights.as_ref().expect("test unembed weights must exist"),
+            expanded.weights.as_ref().expect("expanded unembed weights must exist")
+        ));
     }
 
     #[test]
@@ -492,11 +513,11 @@ mod tests {
         let unembed = Unembed {
             config,
             matmul: Rc::new(super::AffineQuantizedMatmul::new(device, affine_config)),
-            weights: Rc::new(UnembedWeights {
+            weights: Some(Rc::new(UnembedWeights {
                 weight: Buffer::new_zeroed(device, affine_config.weight_bytes()),
                 scales: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
                 biases: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
-            }),
+            })),
         };
         unembed.validate_weights();
         unembed

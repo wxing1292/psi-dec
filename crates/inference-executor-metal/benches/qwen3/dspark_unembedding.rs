@@ -145,12 +145,11 @@ impl Fixture {
                 quantization.group_size,
                 quantization.bits,
             );
-            (
-                Unembed::load(device, &mut store, unembed_config, unembed_bindings)
-                    .expect("unable to load Qwen3 DSpark unembed weights"),
-                unembed_config,
-                "dspark",
-            )
+            let mut unembed = Unembed::new(device, unembed_config);
+            unembed
+                .load_weights(device, &mut store, unembed_bindings)
+                .expect("unable to load Qwen3 DSpark unembed weights");
+            (unembed, unembed_config, "dspark")
         } else {
             let main_config =
                 init_qwen3_model_config(main_model_dir).expect("unable to load Qwen3 benchmark Main config");
@@ -170,12 +169,11 @@ impl Fixture {
                 quantization.group_size,
                 quantization.bits,
             );
-            (
-                Unembed::load(device, &mut main_store, unembed_config, main_bindings.unembed)
-                    .expect("unable to load Qwen3 benchmark Main unembed weights"),
-                unembed_config,
-                "main",
-            )
+            let mut unembed = Unembed::new(device, unembed_config);
+            unembed
+                .load_weights(device, &mut main_store, main_bindings.unembed)
+                .expect("unable to load Qwen3 benchmark Main unembed weights");
+            (unembed, unembed_config, "main")
         };
         let gather_unembed = Qwen3xDSparkGatherUnembed::new(
             device,

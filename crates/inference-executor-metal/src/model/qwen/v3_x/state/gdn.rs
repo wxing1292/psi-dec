@@ -63,7 +63,7 @@ impl ReplayComponent for Rc<GDNRequestStateTable> {
 
 impl Qwen3xGDNState {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
         cores: &[GDNCore],
         metal: GDNMetalConfig,

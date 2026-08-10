@@ -31,32 +31,45 @@ use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xGQA {
     gqa_layer_index: ReplayU32,
-    weights: Qwen3xGQAWeights,
+    weights: Option<Qwen3xGQAWeights>,
     backend: Rc<GQA>,
     scratch: Rc<GQAScratch>,
     request_page_table: Rc<GQARequestPageTable>,
 }
 
 impl Qwen3xGQA {
-    #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
+        gqa_layer_index: ReplayU32,
+        backend: Rc<GQA>,
+        scratch: Rc<GQAScratch>,
+        request_page_table: Rc<GQARequestPageTable>,
+    ) -> Self {
+        Self {
+            gqa_layer_index,
+            weights: None,
+            backend,
+            scratch,
+            request_page_table,
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
         core: &GQACore,
         metal: GQAMetalConfig,
-        gqa_layer_index: ReplayU32,
         bindings: Qwen3xGQAWeightBindings,
-        backend: Rc<GQA>,
-        scratch: Rc<GQAScratch>,
-        request_page_table: Rc<GQARequestPageTable>,
-    ) -> Result<Self, ModelExecutorError> {
-        Ok(Self {
-            gqa_layer_index,
-            weights: Qwen3xGQAWeights::load(device, store, &bindings, core, metal)?,
-            backend,
-            scratch,
-            request_page_table,
-        })
+    ) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "Qwen3.x GQA weights are already loaded");
+        self.weights = Some(Qwen3xGQAWeights::load(device, store, &bindings, core, metal)?);
+        Ok(())
+    }
+
+    fn weights(&self) -> &Qwen3xGQAWeights {
+        self.weights
+            .as_ref()
+            .expect("Qwen3.x GQA weights must be loaded before execution")
     }
 
     pub fn record<'a, R>(
@@ -117,7 +130,7 @@ impl Qwen3xGQA {
                     kv_pages: pages,
                     page_ids: self.request_page_table.page_ids_buffer(),
                 },
-                weights: self.weights.as_borrowed(),
+                weights: self.weights().as_borrowed(),
                 scratch: self.scratch.bindings(),
                 replay_mode,
             },

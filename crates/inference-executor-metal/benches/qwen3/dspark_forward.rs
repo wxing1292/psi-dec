@@ -457,20 +457,31 @@ impl DSparkFixture {
             capacity.max_tokens,
             embed_bindings,
         ));
-        let model = Qwen3xDSparkModel::load(
+        let mut model = Qwen3xDSparkModel::new(
             device,
-            &mut store,
             &config,
             config.block_size,
             QWEN3_PAGE_SIZE_BYTES,
-            main_feature_bindings,
-            layer_bindings,
-            final_norm_weight,
+            &main_feature_bindings,
+            &layer_bindings,
             &gqa_state,
             capacity.max_tokens,
             capacity.max_tokens,
         )
-        .expect("unable to load Qwen3 DSpark comparison model");
+        .expect("unable to construct Qwen3 DSpark comparison model");
+        model
+            .load_weights(
+                device,
+                &mut store,
+                &config,
+                config.block_size,
+                QWEN3_PAGE_SIZE_BYTES,
+                &main_feature_bindings,
+                layer_bindings,
+                final_norm_weight,
+            )
+            .expect("unable to load Qwen3 DSpark comparison model");
+        let model = Rc::new(model);
         let body = Qwen3xDSparkBody::new(Rc::clone(&model));
         let hidden_elements = capacity
             .max_tokens
@@ -582,9 +593,8 @@ fn load_main_embed(
         .quantization
         .as_ref()
         .expect("Main comparison requires quantization");
-    Embed::load(
+    let mut embed = Embed::new(
         device,
-        store,
         EmbedConfig {
             max_tokens,
             vocab_size: config
@@ -605,9 +615,11 @@ fn load_main_embed(
             scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         },
-        bindings,
-    )
-    .expect("unable to load Main comparison embedding")
+    );
+    embed
+        .load_weights(device, store, bindings)
+        .expect("unable to load Main comparison embedding");
+    embed
 }
 
 fn load_dspark_embed(
@@ -624,35 +636,34 @@ fn load_dspark_embed(
             .as_ref()
             .expect("DSpark comparison requires quantization")
             .resolve_for_tensor(&bindings.weight);
-        return Rc::new(
-            Embed::load(
-                device,
-                dspark_store,
-                EmbedConfig {
-                    max_tokens: max_tokens.try_into().expect("DSpark embed token capacity must fit u32"),
-                    vocab_size: config
-                        .vocab_size
-                        .try_into()
-                        .expect("DSpark embedding vocabulary must fit u32"),
-                    hidden_dim: config
-                        .hidden_size
-                        .try_into()
-                        .expect("DSpark embedding dimension must fit u32"),
-                    group_size: quantization
-                        .group_size
-                        .try_into()
-                        .expect("DSpark embedding group size must fit u32"),
-                    bits: quantization
-                        .bits
-                        .try_into()
-                        .expect("DSpark embedding bits must fit u32"),
-                    scale_bias_dtype: Dtype::Bfloat16,
-                    output_dtype: Dtype::Bfloat16,
-                },
-                bindings,
-            )
-            .expect("unable to load DSpark comparison embedding"),
+        let mut embed = Embed::new(
+            device,
+            EmbedConfig {
+                max_tokens: max_tokens.try_into().expect("DSpark embed token capacity must fit u32"),
+                vocab_size: config
+                    .vocab_size
+                    .try_into()
+                    .expect("DSpark embedding vocabulary must fit u32"),
+                hidden_dim: config
+                    .hidden_size
+                    .try_into()
+                    .expect("DSpark embedding dimension must fit u32"),
+                group_size: quantization
+                    .group_size
+                    .try_into()
+                    .expect("DSpark embedding group size must fit u32"),
+                bits: quantization
+                    .bits
+                    .try_into()
+                    .expect("DSpark embedding bits must fit u32"),
+                scale_bias_dtype: Dtype::Bfloat16,
+                output_dtype: Dtype::Bfloat16,
+            },
         );
+        embed
+            .load_weights(device, dspark_store, bindings)
+            .expect("unable to load DSpark comparison embedding");
+        return Rc::new(embed);
     }
 
     let main_config = init_qwen3_model_config(main_model_dir).expect("unable to load Main embedding config");

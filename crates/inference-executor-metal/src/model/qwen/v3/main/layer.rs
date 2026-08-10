@@ -53,16 +53,38 @@ pub struct Qwen3MainLayerInput<'a> {
 
 impl Qwen3MainLayer {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         config: &Qwen3ModelConfig,
         layer_index: usize,
-        bindings: Qwen3LayerWeightBindings,
         gqa_state: &Qwen3MainGQAState,
         scratch: Rc<Qwen3MainLayerScratch>,
         dense_scratch: Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
+        let hidden_dim = config.text_config.hidden_size;
+        let eps = config.text_config.rms_norm_eps;
+        let (gqa_core, _) = qwen3_gqa_core_and_metal(layer_index, config)?;
+        let attention = Qwen3MainGQA::new(&gqa_core, gqa_state);
+        let (mlp_core, mlp_metal) = qwen3_dense_mlp_core_and_metal(layer_index, config)?;
+        let mlp = Qwen3xDenseMLP::new(device, &mlp_core, mlp_metal, dense_scratch);
+        Ok(Self {
+            layer_index,
+            input_norm: RMSNorm::new(device, hidden_dim, eps),
+            attention,
+            residual_add: ResidualAdd::new(device),
+            post_attention_norm: RMSNorm::new(device, hidden_dim, eps),
+            mlp,
+            scratch,
+        })
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        config: &Qwen3ModelConfig,
+        bindings: Qwen3LayerWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
         let Qwen3LayerWeightBindings {
             input_norm_weight,
             post_attention_norm_weight,
@@ -70,30 +92,25 @@ impl Qwen3MainLayer {
             mlp: mlp_bindings,
         } = bindings;
         let hidden_dim = config.text_config.hidden_size;
-        let eps = config.text_config.rms_norm_eps;
-        let (gqa_core, gqa_metal) = qwen3_gqa_core_and_metal(layer_index, config)?;
-        let attention = Qwen3MainGQA::load(device, store, &gqa_core, gqa_metal, attention_bindings, gqa_state)?;
-        let (mlp_core, mlp_metal) = qwen3_dense_mlp_core_and_metal(layer_index, config)?;
-        let mlp = Qwen3xDenseMLP::load(device, store, &mlp_core, mlp_metal, mlp_bindings, dense_scratch)?;
-        Ok(Self {
-            layer_index,
-            input_norm: RMSNorm::new(
-                device,
-                hidden_dim,
-                eps,
-                load_qwen3x_norm_weight(device, store, &input_norm_weight, &[hidden_dim])?,
-            ),
-            attention,
-            residual_add: ResidualAdd::new(device),
-            post_attention_norm: RMSNorm::new(
-                device,
-                hidden_dim,
-                eps,
-                load_qwen3x_norm_weight(device, store, &post_attention_norm_weight, &[hidden_dim])?,
-            ),
-            mlp,
-            scratch,
-        })
+        let (gqa_core, gqa_metal) = qwen3_gqa_core_and_metal(self.layer_index, config)?;
+        self.attention
+            .load_weights(device, store, &gqa_core, gqa_metal, attention_bindings)?;
+        let (mlp_core, mlp_metal) = qwen3_dense_mlp_core_and_metal(self.layer_index, config)?;
+        self.mlp
+            .load_weights(device, store, &mlp_core, mlp_metal, mlp_bindings)?;
+        self.input_norm.load_weights(load_qwen3x_norm_weight(
+            device,
+            store,
+            &input_norm_weight,
+            &[hidden_dim],
+        )?);
+        self.post_attention_norm.load_weights(load_qwen3x_norm_weight(
+            device,
+            store,
+            &post_attention_norm_weight,
+            &[hidden_dim],
+        )?);
+        Ok(())
     }
 
     pub fn layer_index(&self) -> usize {

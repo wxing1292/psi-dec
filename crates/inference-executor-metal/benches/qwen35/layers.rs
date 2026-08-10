@@ -169,7 +169,7 @@ impl BlockFixture {
             .checked_mul(num_blocks)
             .and_then(|value| value.checked_mul(num_page_ids_per_block))
             .expect("qwen3.5 layer bench cache page count must fit usize");
-        let gqa_state = Qwen3xGQAState::load(
+        let gqa_state = Qwen3xGQAState::new(
             device,
             gqa_core,
             gqa_metal,
@@ -227,7 +227,7 @@ impl BlockFixture {
         let gdn_metal = qwen35_gdn_core_and_metal(gdn_layers[0], &config.text_config, defaults)
             .expect("qwen3.5 layer bench requires valid GDN geometry")
             .1;
-        let gdn_state = Qwen3xGDNState::load(
+        let gdn_state = Qwen3xGDNState::new(
             device,
             &gdn_cores,
             gdn_metal,
@@ -357,21 +357,23 @@ fn load_layer(
         LayerType::FullAttention => compact_gqa_layer_index,
         LayerType::GDN => compact_gdn_layer_index,
     };
-    Qwen35MainLayer::load(
+    let mut layer = Qwen35MainLayer::new(
         device,
-        store,
         config,
         defaults,
         model_layer_index,
         attn_layer_index,
-        bindings,
         gqa_state,
         gdn_state,
         layer_scratch,
         dense_scratch,
         moe_scratch,
     )
-    .unwrap_or_else(|err| panic!("unable to load layer {model_layer_index}: {err}"))
+    .unwrap_or_else(|err| panic!("unable to construct layer {model_layer_index}: {err}"));
+    layer
+        .load_weights(device, store, config, defaults, bindings)
+        .unwrap_or_else(|err| panic!("unable to load layer {model_layer_index}: {err}"));
+    layer
 }
 
 fn main() {

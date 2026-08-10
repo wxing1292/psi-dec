@@ -1,18 +1,14 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::checkpoint::QuantizedTensorBindings;
-use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
 use inference_executor_core::model::qwen::v3::num_main_output_rows;
 
-use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::gather::Gather;
 use crate::model::unembedding::Unembed;
-use crate::model::unembedding::UnembedConfig;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
 
@@ -31,16 +27,6 @@ pub struct Qwen3GatherUnembedArgs<'a> {
 }
 
 impl Qwen3GatherUnembed {
-    pub fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        config: UnembedConfig,
-        bindings: QuantizedTensorBindings,
-    ) -> Result<Self, ModelExecutorError> {
-        let unembed = Rc::new(Unembed::load(device, store, config, bindings)?);
-        Ok(Self::new(device, config.hidden_dim, unembed))
-    }
-
     pub fn new(device: &Device, hidden_dim: u32, unembed: Rc<Unembed>) -> Self {
         Self {
             gather: Gather::new(device, hidden_dim),

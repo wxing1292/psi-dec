@@ -30,32 +30,45 @@ use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xGDN {
     compact_gdn_layer_index: usize,
-    weights: Qwen3xGDNWeights,
+    weights: Option<Qwen3xGDNWeights>,
     backend: Rc<GDN>,
     scratch: Rc<GDNScratch>,
     request_state_table: Rc<GDNRequestStateTable>,
 }
 
 impl Qwen3xGDN {
-    #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
+        compact_gdn_layer_index: usize,
+        backend: Rc<GDN>,
+        scratch: Rc<GDNScratch>,
+        request_state_table: Rc<GDNRequestStateTable>,
+    ) -> Self {
+        Self {
+            compact_gdn_layer_index,
+            weights: None,
+            backend,
+            scratch,
+            request_state_table,
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
         core: &GDNCore,
         metal: GDNMetalConfig,
-        compact_gdn_layer_index: usize,
         bindings: Qwen3xGDNWeightBindings,
-        backend: Rc<GDN>,
-        scratch: Rc<GDNScratch>,
-        request_state_table: Rc<GDNRequestStateTable>,
-    ) -> Result<Self, ModelExecutorError> {
-        Ok(Self {
-            compact_gdn_layer_index,
-            weights: Qwen3xGDNWeights::load(device, store, &bindings, core, metal)?,
-            backend,
-            scratch,
-            request_state_table,
-        })
+    ) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "Qwen3.x GDN weights are already loaded");
+        self.weights = Some(Qwen3xGDNWeights::load(device, store, &bindings, core, metal)?);
+        Ok(())
+    }
+
+    fn weights(&self) -> &Qwen3xGDNWeights {
+        self.weights
+            .as_ref()
+            .expect("Qwen3.x GDN weights must be loaded before execution")
     }
 
     pub fn record<'a, R>(
@@ -117,7 +130,7 @@ impl Qwen3xGDN {
                     recurrent_state_arena_offset_bytes: state.recurrent_layer_offset_bytes,
                 },
                 materialize_candidate_states: true,
-                weights: self.weights.as_borrowed(),
+                weights: self.weights().as_borrowed(),
                 replay_mode,
             },
         );

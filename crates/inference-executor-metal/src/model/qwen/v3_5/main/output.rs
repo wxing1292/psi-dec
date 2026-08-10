@@ -6,20 +6,16 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::checkpoint::QuantizedTensorBindings;
-use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::num_main_output_rows;
 use inference_executor_core::replay::ReplayBucketPolicy;
 
-use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::gather::Gather;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedBucketedInput;
-use crate::model::unembedding::UnembedConfig;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
 
@@ -42,16 +38,6 @@ pub struct Qwen35GatherUnembedArgs<'a> {
 }
 
 impl Qwen35GatherUnembed {
-    pub fn load(
-        device: &Device,
-        store: &mut SafeTensorStore,
-        config: UnembedConfig,
-        bindings: QuantizedTensorBindings,
-    ) -> Result<Self, ModelExecutorError> {
-        let unembed = Rc::new(Unembed::load(device, store, config, bindings)?);
-        Ok(Self::new(device, config.hidden_dim, unembed))
-    }
-
     pub fn new(device: &Device, hidden_dim: u32, unembed: Rc<Unembed>) -> Self {
         let replay_bucket_policy =
             ReplayBucketPolicy::with_topology_boundaries(unembed.max_tokens(), &unembed.replay_topology_boundaries());
@@ -213,6 +199,7 @@ mod tests {
     use inference_backend_metal::metal::Dtype;
     use inference_backend_metal::metal::Stream;
     use inference_executor_core::attn::gdn::state::GDNStateTxn;
+    use inference_executor_core::checkpoint::QuantizedTensorBindings;
     use inference_executor_core::checkpoint::SafeTensorIndex;
     use inference_executor_core::sampling::SamplerConfig;
     use safetensors::Dtype as SafeTensorDtype;
@@ -220,7 +207,9 @@ mod tests {
     use safetensors::tensor::serialize_to_file;
 
     use super::*;
+    use crate::checkpoint::SafeTensorStore;
     use crate::def::replay_op::MetalReplayRuntime;
+    use crate::model::unembedding::UnembedConfig;
     use crate::replay::Replay;
 
     const MAX_ROWS: u32 = 32;
@@ -599,26 +588,29 @@ mod tests {
         )
         .unwrap();
         let mut store = SafeTensorStore::new(&model_dir.0, index);
-        Qwen35GatherUnembed::load(
-            device,
-            &mut store,
-            UnembedConfig {
-                max_tokens: MAX_ROWS,
-                vocab_size: VOCAB_SIZE,
-                hidden_dim: HIDDEN_DIM,
-                group_size: GROUP_SIZE,
-                bits: 8,
-                input_dtype: Dtype::Bfloat16,
-                output_dtype: Dtype::Bfloat16,
-                scale_bias_dtype: Dtype::Bfloat16,
-            },
-            QuantizedTensorBindings {
-                weight: WEIGHT.to_string(),
-                scales: SCALES.to_string(),
-                biases: BIASES.to_string(),
-            },
-        )
-        .unwrap()
+        let config = UnembedConfig {
+            max_tokens: MAX_ROWS,
+            vocab_size: VOCAB_SIZE,
+            hidden_dim: HIDDEN_DIM,
+            group_size: GROUP_SIZE,
+            bits: 8,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+        };
+        let mut unembed = Unembed::new(device, config);
+        unembed
+            .load_weights(
+                device,
+                &mut store,
+                QuantizedTensorBindings {
+                    weight: WEIGHT.to_string(),
+                    scales: SCALES.to_string(),
+                    biases: BIASES.to_string(),
+                },
+            )
+            .unwrap();
+        Qwen35GatherUnembed::new(device, config.hidden_dim, Rc::new(unembed))
     }
 
     fn one_request_microbatch(num_tokens: u32, num_spec_tokens: u32) -> Qwen35Microbatch {

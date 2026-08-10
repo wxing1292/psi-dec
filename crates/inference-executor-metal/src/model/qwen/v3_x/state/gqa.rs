@@ -30,7 +30,7 @@ pub struct Qwen3xGQAState {
 
 impl Qwen3xGQAState {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
         core: GQACore,
         metal: GQAMetalConfig,

@@ -107,28 +107,26 @@ pub fn load_qwen3x_dspark(
     let max_block_tokens = capacity.max_tokens;
     let embed = if let Some(embed_bindings) = embed_bindings {
         let resolved = quantization.resolve_for_tensor(&embed_bindings.weight);
-        Rc::new(Embed::load(
-            device,
-            &mut store,
-            EmbedConfig {
-                max_tokens: max_block_tokens
-                    .try_into()
-                    .expect("Qwen3x DSpark embed rows must fit u32"),
-                vocab_size: config
-                    .vocab_size
-                    .try_into()
-                    .expect("Qwen3x DSpark embedding vocabulary must fit u32"),
-                hidden_dim: config
-                    .hidden_size
-                    .try_into()
-                    .expect("Qwen3x DSpark embedding width must fit u32"),
-                group_size: to_u32("Qwen3x DSpark embedding group_size", resolved.group_size)?,
-                bits: to_u32("Qwen3x DSpark embedding bits", resolved.bits)?,
-                scale_bias_dtype: Dtype::Bfloat16,
-                output_dtype: Dtype::Bfloat16,
-            },
-            embed_bindings,
-        )?)
+        let embed_config = EmbedConfig {
+            max_tokens: max_block_tokens
+                .try_into()
+                .expect("Qwen3x DSpark embed rows must fit u32"),
+            vocab_size: config
+                .vocab_size
+                .try_into()
+                .expect("Qwen3x DSpark embedding vocabulary must fit u32"),
+            hidden_dim: config
+                .hidden_size
+                .try_into()
+                .expect("Qwen3x DSpark embedding width must fit u32"),
+            group_size: to_u32("Qwen3x DSpark embedding group_size", resolved.group_size)?,
+            bits: to_u32("Qwen3x DSpark embedding bits", resolved.bits)?,
+            scale_bias_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+        };
+        let mut embed = Embed::new(device, embed_config);
+        embed.load_weights(device, &mut store, embed_bindings)?;
+        Rc::new(embed)
     } else {
         Rc::new(
             main_embed.with_max_tokens(
@@ -140,29 +138,27 @@ pub fn load_qwen3x_dspark(
     };
     let unembed = if let Some(unembed_bindings) = unembed_bindings {
         let resolved = quantization.resolve_for_tensor(&unembed_bindings.weight);
-        Rc::new(Unembed::load(
-            device,
-            &mut store,
-            UnembedConfig {
-                max_tokens: max_block_tokens
-                    .try_into()
-                    .expect("Qwen3x DSpark unembed rows must fit u32"),
-                vocab_size: config
-                    .vocab_size
-                    .try_into()
-                    .expect("Qwen3x DSpark unembed vocabulary must fit u32"),
-                hidden_dim: config
-                    .hidden_size
-                    .try_into()
-                    .expect("Qwen3x DSpark unembed hidden width must fit u32"),
-                group_size: to_u32("Qwen3x DSpark unembed group_size", resolved.group_size)?,
-                bits: to_u32("Qwen3x DSpark unembed bits", resolved.bits)?,
-                input_dtype: Dtype::Bfloat16,
-                output_dtype: Dtype::Bfloat16,
-                scale_bias_dtype: Dtype::Bfloat16,
-            },
-            unembed_bindings,
-        )?)
+        let unembed_config = UnembedConfig {
+            max_tokens: max_block_tokens
+                .try_into()
+                .expect("Qwen3x DSpark unembed rows must fit u32"),
+            vocab_size: config
+                .vocab_size
+                .try_into()
+                .expect("Qwen3x DSpark unembed vocabulary must fit u32"),
+            hidden_dim: config
+                .hidden_size
+                .try_into()
+                .expect("Qwen3x DSpark unembed hidden width must fit u32"),
+            group_size: to_u32("Qwen3x DSpark unembed group_size", resolved.group_size)?,
+            bits: to_u32("Qwen3x DSpark unembed bits", resolved.bits)?,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+        };
+        let mut unembed = Unembed::new(device, unembed_config);
+        unembed.load_weights(device, &mut store, unembed_bindings)?;
+        Rc::new(unembed)
     } else {
         Rc::new(
             main_unembed.with_max_tokens(
@@ -172,29 +168,37 @@ pub fn load_qwen3x_dspark(
             ),
         )
     };
-    let markov = Qwen3xDSparkMarkov::load(
+    let mut markov = Qwen3xDSparkMarkov::new(
         device,
-        &mut store,
         config,
         num_spec_tokens,
         &markov_bindings,
-        &confidence_bindings,
         load_config.max_requests,
         sampler_bounds,
     )?;
-    let model = Qwen3xDSparkModel::load(
+    markov.load_weights(device, &mut store, &markov_bindings, &confidence_bindings)?;
+    let mut model = Qwen3xDSparkModel::new(
+        device,
+        config,
+        num_spec_tokens,
+        load_config.page_size_bytes,
+        &main_feature_bindings,
+        &layer_bindings,
+        &gqa_state,
+        load_config.max_tokens,
+        max_block_tokens,
+    )?;
+    model.load_weights(
         device,
         &mut store,
         config,
         num_spec_tokens,
         load_config.page_size_bytes,
-        main_feature_bindings,
+        &main_feature_bindings,
         layer_bindings,
         final_norm_weight,
-        &gqa_state,
-        load_config.max_tokens,
-        max_block_tokens,
     )?;
+    let model = Rc::new(model);
     Ok(Qwen3xDSparkLoaded {
         page_table_layout,
         gqa_state,

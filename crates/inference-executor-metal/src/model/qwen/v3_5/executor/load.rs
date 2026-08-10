@@ -60,6 +60,7 @@ use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
 use crate::model::qwen::v3_x::dspark::load::load_qwen3x_dspark;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
+use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::rejection_replay::RejectionSampler;
@@ -453,7 +454,7 @@ fn init_qwen_3_5_model_inner(
             .expect("qwen3.5 GQA pages per block must fit u32"),
     };
     let gqa_page_table_layout = main_gqa_page_table_layout;
-    let main_gqa_state = Qwen3xGQAState::load(
+    let main_gqa_state = Qwen3xGQAState::new(
         &device,
         main_gqa_core,
         main_gqa_metal,
@@ -500,7 +501,7 @@ fn init_qwen_3_5_model_inner(
                 .try_into()
                 .expect("qwen3.5 MTP GQA pages per block must fit u32"),
             };
-            let mtp_gqa_state = Qwen3xGQAState::load(
+            let mtp_gqa_state = Qwen3xGQAState::new(
                 &device,
                 mtp_gqa_core,
                 mtp_gqa_metal,
@@ -548,7 +549,7 @@ fn init_qwen_3_5_model_inner(
         Qwen35SpecSource::MTP(mtp) => mtp.num_spec_tokens.get(),
         Qwen35SpecSource::DSpark { num_spec_tokens, .. } => num_spec_tokens.get(),
     };
-    let main_gdn_state = Qwen3xGDNState::load(
+    let main_gdn_state = Qwen3xGDNState::new(
         &device,
         &gdn_cores,
         gdn_metal,
@@ -616,19 +617,18 @@ fn init_qwen_3_5_model_inner(
         main: main_bindings,
         unembed: unembed_bindings,
     } = weight_bindings;
-    let embed = std::rc::Rc::new(Embed::load(
-        &device,
-        &mut store,
-        layout.embedding_config(),
-        embed_bindings,
-    )?);
+    let mut embed = Embed::new(&device, layout.embedding_config());
+    embed.load_weights(&device, &mut store, embed_bindings)?;
+    let embed = std::rc::Rc::new(embed);
     let token_hidden_input = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
     let hidden_output = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
     assert_eq!(
         unembed_config.max_tokens as usize, config.max_tokens,
         "qwen3.5 GatherUnembed output-row capacity must match executor max_tokens"
     );
-    let gather_unembed = Qwen35GatherUnembed::load(&device, &mut store, unembed_config, unembed_bindings)?;
+    let mut unembed = Unembed::new(&device, unembed_config);
+    unembed.load_weights(&device, &mut store, unembed_bindings)?;
+    let gather_unembed = Qwen35GatherUnembed::new(&device, unembed_config.hidden_dim, Rc::new(unembed));
     assert_eq!(
         gather_unembed.max_rows() as usize,
         config.max_tokens,
@@ -668,13 +668,11 @@ fn init_qwen_3_5_model_inner(
             Some(capture)
         },
     };
-    let main = Qwen35Main::load(
+    let mut main = Qwen35Main::new(
         &device,
-        &mut store,
         &model_config,
         config.max_tokens,
         metal_defaults,
-        main_bindings,
         &main_gqa_state,
         &main_gdn_state,
         residual_capture,
@@ -682,6 +680,7 @@ fn init_qwen_3_5_model_inner(
         dense_mlp_scratch.as_ref(),
         moe_scratch.as_ref(),
     )?;
+    main.load_weights(&device, &mut store, &model_config, metal_defaults, main_bindings)?;
     drop(store);
     let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));
     let speculative_resources = || {
@@ -725,28 +724,29 @@ fn init_qwen_3_5_model_inner(
                 body,
                 final_norm_weight,
             } = mtp_bindings;
-            let mtp_embed = Qwen35MTPEmbed::load(
+            let mut mtp_embed = Qwen35MTPEmbed::new(&device, &mtp_model_config, Rc::clone(&embed), config.max_tokens)?;
+            mtp_embed.load_weights(&device, &mut store, &mtp_model_config, mtp_embed_bindings)?;
+            let mtp_defaults = Qwen35MetalDefaults::from_quantization(mtp_model_config.quantization.as_ref())?;
+            let mut mtp = Qwen35MTP::new(
                 &device,
-                &mut store,
-                &mtp_model_config,
-                mtp_embed_bindings,
-                Rc::clone(&embed),
-                config.max_tokens,
-            )?;
-            let mtp = Qwen35MTP::load(
-                &device,
-                &mut store,
                 &model_config,
                 &mtp_model_config,
                 config.max_tokens,
-                Qwen35MetalDefaults::from_quantization(mtp_model_config.quantization.as_ref())?,
-                body,
-                final_norm_weight,
+                mtp_defaults,
                 &gqa_state,
                 config.num_cache_pages,
                 mtp_layer_scratch,
                 dense_mlp_scratch.as_ref(),
                 moe_scratch.as_ref(),
+            )?;
+            mtp.load_weights(
+                &device,
+                &mut store,
+                &model_config,
+                &mtp_model_config,
+                mtp_defaults,
+                body,
+                final_norm_weight,
             )?;
             Qwen35Speculator::MTP(Box::new(Qwen35MTPSpeculator {
                 common: speculative_resources(),

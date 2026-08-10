@@ -46,6 +46,7 @@ use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
 use crate::model::qwen::v3_x::dspark::load::load_qwen3x_dspark;
+use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::rejection_replay::RejectionSampler;
@@ -303,7 +304,7 @@ fn init_qwen_3_model_inner(
     let runtime = MetalRuntime::new(device.clone());
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
     let weight_bindings = resolve_qwen3_model_weight_bindings(&model_config, store.index().tensor_names())?;
-    let main_gqa_state = Qwen3MainGQAState::load(
+    let main_gqa_state = Qwen3MainGQAState::new(
         &device,
         main_gqa_core,
         main_gqa_metal,
@@ -330,16 +331,15 @@ fn init_qwen_3_model_inner(
         main: main_bindings,
         unembed: unembed_bindings,
     } = weight_bindings;
-    let embed = Rc::new(Embed::load(
-        &device,
-        &mut store,
-        layout.embedding_config(),
-        embed_bindings,
-    )?);
+    let mut embed = Embed::new(&device, layout.embedding_config());
+    embed.load_weights(&device, &mut store, embed_bindings)?;
+    let embed = Rc::new(embed);
     let token_hidden_input = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
     let hidden_output = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
     let unembed_config = layout.unembed_config();
-    let gather_unembed = Qwen3GatherUnembed::load(&device, &mut store, unembed_config, unembed_bindings)?;
+    let mut unembed = Unembed::new(&device, unembed_config);
+    unembed.load_weights(&device, &mut store, unembed_bindings)?;
+    let gather_unembed = Qwen3GatherUnembed::new(&device, unembed_config.hidden_dim, Rc::new(unembed));
     let sampler_bounds = TopKSamplingBounds {
         max_sampling_inputs: layout.max_tokens,
         vocab_size: layout.vocab_size,
@@ -379,16 +379,15 @@ fn init_qwen_3_model_inner(
             Some(capture)
         },
     };
-    let main = Qwen3Main::load(
+    let mut main = Qwen3Main::new(
         &device,
-        &mut store,
         &model_config,
-        main_bindings,
         &main_gqa_state,
         residual_capture,
         layer_scratch,
         &dense_scratch,
     )?;
+    main.load_weights(&device, &mut store, &model_config, main_bindings)?;
     drop(store);
 
     let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));

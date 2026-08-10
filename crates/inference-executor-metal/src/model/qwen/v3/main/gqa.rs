@@ -25,7 +25,7 @@ use crate::model::qwen::v3_x::layer::Qwen3xUngatedGQAWeightBuffers;
 
 pub struct Qwen3MainGQA {
     model_layer_index: usize,
-    weights: Qwen3xUngatedGQAWeightBuffers,
+    weights: Option<Qwen3xUngatedGQAWeightBuffers>,
     backend: Rc<UngatedGQA>,
     scratch: Rc<UngatedGQAScratch>,
     request_page_table: Rc<GQARequestPageTable>,
@@ -41,22 +41,35 @@ pub struct Qwen3MainGQAState {
 }
 
 impl Qwen3MainGQA {
-    #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(core: &UngatedGQACore, state: &Qwen3MainGQAState) -> Self {
+        Self {
+            model_layer_index: core.model_layer_index,
+            weights: None,
+            backend: Rc::clone(&state.backend),
+            scratch: Rc::clone(&state.scratch),
+            request_page_table: Rc::clone(&state.request_page_table),
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
         core: &UngatedGQACore,
         metal: GQAMetalConfig,
         bindings: Qwen3xGQAWeightBindings,
-        state: &Qwen3MainGQAState,
-    ) -> Result<Self, ModelExecutorError> {
-        Ok(Self {
-            model_layer_index: core.model_layer_index,
-            weights: Qwen3xUngatedGQAWeightBuffers::load(device, store, &bindings, core, metal)?,
-            backend: Rc::clone(&state.backend),
-            scratch: Rc::clone(&state.scratch),
-            request_page_table: Rc::clone(&state.request_page_table),
-        })
+    ) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "Qwen3 Main GQA weights are already loaded");
+        self.weights = Some(Qwen3xUngatedGQAWeightBuffers::load(
+            device, store, &bindings, core, metal,
+        )?);
+        Ok(())
+    }
+
+    fn weights(&self) -> &Qwen3xUngatedGQAWeightBuffers {
+        self.weights
+            .as_ref()
+            .expect("Qwen3 Main GQA weights must be loaded before execution")
     }
 
     pub fn record<'a, R>(
@@ -85,7 +98,7 @@ impl Qwen3MainGQA {
                     kv_pages: pages,
                     page_ids: self.request_page_table.page_ids_buffer(),
                 },
-                weights: self.weights.as_borrowed(),
+                weights: self.weights().as_borrowed(),
                 scratch: self.scratch.bindings(),
             },
         );
@@ -94,7 +107,7 @@ impl Qwen3MainGQA {
 
 impl Qwen3MainGQAState {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
         core: UngatedGQACore,
         metal: GQAMetalConfig,

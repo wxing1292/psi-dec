@@ -318,9 +318,8 @@ mod tests {
         ]))
         .unwrap();
         let mut store = SafeTensorStore::new(&model_dir.0, index);
-        Embed::load(
+        let mut embed = Embed::new(
             device,
-            &mut store,
             EmbedConfig {
                 max_tokens: MAX_TOKENS,
                 vocab_size: VOCAB_SIZE,
@@ -330,13 +329,19 @@ mod tests {
                 scale_bias_dtype: Dtype::Bfloat16,
                 output_dtype: Dtype::Bfloat16,
             },
-            QuantizedTensorBindings {
-                weight: WEIGHT.to_string(),
-                scales: SCALES.to_string(),
-                biases: BIASES.to_string(),
-            },
-        )
-        .unwrap()
+        );
+        embed
+            .load_weights(
+                device,
+                &mut store,
+                QuantizedTensorBindings {
+                    weight: WEIGHT.to_string(),
+                    scales: SCALES.to_string(),
+                    biases: BIASES.to_string(),
+                },
+            )
+            .unwrap();
+        embed
     }
 
     fn assert_panics(f: impl FnOnce()) {

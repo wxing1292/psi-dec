@@ -126,7 +126,7 @@ pub struct Qwen3xDSparkMainFeatureProjector {
     residual_bindings: Qwen3xDSparkMainResidualBindings,
     fc: AffineQuantizedMatmul,
     hidden_norm: RMSNorm,
-    weights: Qwen3xDSparkMainFeatureWeights,
+    weights: Option<Qwen3xDSparkMainFeatureWeights>,
     main_residuals: Buffer,
     main_feature: Buffer,
 }
@@ -138,17 +138,13 @@ impl MainResidualCapture for Qwen3xDSparkMainFeatureProjector {
 }
 
 impl Qwen3xDSparkMainFeatureProjector {
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         config: &Qwen3xDSparkConfig,
         bindings: &Qwen3xDSparkMainFeatureWeightBindings,
         max_tokens: usize,
     ) -> Result<Self, ModelExecutorError> {
         let layout = Qwen3xDSparkMainFeatureLayout::new(config, max_tokens);
-        let mut tensor_names = Vec::new();
-        bindings.push_tensor_names(&mut tensor_names);
-        let mut tensors = store.load_tensors(tensor_names)?;
         let quantization = config
             .quantization
             .as_ref()
@@ -160,6 +156,55 @@ impl Qwen3xDSparkMainFeatureProjector {
                 .try_into()
                 .expect("Qwen3 DSpark Main hidden_dim must fit i32"),
             layout
+                .selected_hidden_dim
+                .try_into()
+                .expect("Qwen3 DSpark selected Main width must fit i32"),
+            quantization
+                .group_size
+                .try_into()
+                .expect("Qwen3 DSpark Main FC group_size must fit i32"),
+            quantization
+                .bits
+                .try_into()
+                .expect("Qwen3 DSpark Main FC bits must fit i32"),
+            Dtype::Bfloat16,
+        );
+        Ok(Self {
+            layout,
+            residual_bindings: Qwen3xDSparkMainResidualBindings::new(&config.target_layer_ids),
+            fc: AffineQuantizedMatmul::new(device, fc_config),
+            hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, config.rms_norm_eps),
+            weights: None,
+            main_residuals: Buffer::new_zeroed_elements(device, layout.main_residual_elements(), Dtype::Bfloat16),
+            main_feature: Buffer::new_zeroed_elements(device, layout.main_feature_elements(), Dtype::Bfloat16),
+        })
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        config: &Qwen3xDSparkConfig,
+        bindings: &Qwen3xDSparkMainFeatureWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.weights.is_none(),
+            "Qwen3.x DSpark Main-feature weights are already loaded"
+        );
+        let mut tensor_names = Vec::new();
+        bindings.push_tensor_names(&mut tensor_names);
+        let mut tensors = store.load_tensors(tensor_names)?;
+        let quantization = config
+            .quantization
+            .as_ref()
+            .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark Main feature requires quantization config"))?
+            .resolve_for_tensor(&bindings.fc.weight);
+        let fc_config = AffineQuantizedMatmulConfig::same_dtype(
+            self.layout
+                .hidden_dim
+                .try_into()
+                .expect("Qwen3 DSpark Main hidden_dim must fit i32"),
+            self.layout
                 .selected_hidden_dim
                 .try_into()
                 .expect("Qwen3 DSpark selected Main width must fit i32"),
@@ -187,30 +232,22 @@ impl Qwen3xDSparkMainFeatureProjector {
             biases.len(),
             fc_config.scale_or_bias_bytes(),
         )?;
-        let norm_weight = remove_qwen3x_norm_weight(
+        self.hidden_norm.load_weights(remove_qwen3x_norm_weight(
             device,
             &mut tensors,
             &bindings.hidden_norm_weight,
-            &[layout.hidden_dim as usize],
-        )?;
-        let projector = Self {
-            layout,
-            residual_bindings: Qwen3xDSparkMainResidualBindings::new(&config.target_layer_ids),
-            fc: AffineQuantizedMatmul::new(device, fc_config),
-            hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, config.rms_norm_eps, norm_weight),
-            weights: Qwen3xDSparkMainFeatureWeights {
-                fc_weight: Buffer::from_slice(device, &weight),
-                fc_scales: Buffer::from_slice(device, &scales),
-                fc_biases: Buffer::from_slice(device, &biases),
-            },
-            main_residuals: Buffer::new_zeroed_elements(device, layout.main_residual_elements(), Dtype::Bfloat16),
-            main_feature: Buffer::new_zeroed_elements(device, layout.main_feature_elements(), Dtype::Bfloat16),
-        };
+            &[self.layout.hidden_dim as usize],
+        )?);
+        self.weights = Some(Qwen3xDSparkMainFeatureWeights {
+            fc_weight: Buffer::from_slice(device, &weight),
+            fc_scales: Buffer::from_slice(device, &scales),
+            fc_biases: Buffer::from_slice(device, &biases),
+        });
         assert!(
             tensors.is_empty(),
             "Qwen3x DSpark Main-feature projector must consume its tensor map"
         );
-        Ok(projector)
+        Ok(())
     }
 
     pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
@@ -238,6 +275,10 @@ impl Qwen3xDSparkMainFeatureProjector {
             num_tokens <= self.layout.max_tokens,
             "Qwen3 DSpark Main projection exceeds capacity"
         );
+        let weights = self
+            .weights
+            .as_ref()
+            .expect("Qwen3.x DSpark Main-feature weights must be loaded before execution");
         recorder.record_with_barrier_before(ReplayOp::opaque(
             self.fc.invoke(
                 num_tokens
@@ -247,11 +288,11 @@ impl Qwen3xDSparkMainFeatureProjector {
                 0,
                 &self.main_residuals,
                 0,
-                &self.weights.fc_weight,
+                &weights.fc_weight,
                 0,
-                &self.weights.fc_scales,
+                &weights.fc_scales,
                 0,
-                &self.weights.fc_biases,
+                &weights.fc_biases,
                 0,
             ),
         ));

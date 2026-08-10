@@ -46,9 +46,7 @@ pub struct Qwen35MTPEmbed {
     embedding_norm: RMSNorm,
     concat: Bf16ConcatRowsKernel,
     fc: AffineQuantizedMatmul,
-    fc_weight: Buffer,
-    fc_scales: Buffer,
-    fc_biases: Buffer,
+    projection_weights: Option<Qwen35MTPProjectionWeights>,
     normed_hidden: Buffer,
     normed_embedding: Buffer,
     fused_input: Buffer,
@@ -67,11 +65,9 @@ pub struct Qwen35MTPEmbedArgs<'a> {
 }
 
 impl Qwen35MTPEmbed {
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         config: &Qwen35ModelConfig,
-        bindings: Qwen35MTPEmbedWeightBindings,
         embed: Rc<Embed>,
         max_tokens: usize,
     ) -> Result<Self, ModelExecutorError> {
@@ -80,14 +76,6 @@ impl Qwen35MTPEmbed {
             .quantization
             .as_ref()
             .ok_or_else(|| ModelExecutorError::custom("qwen3.5 MTP requires quantized checkpoint weights"))?;
-        let weights = Qwen35MTPEmbedWeights::load(device, store, &bindings, hidden_dim, quant.group_size, quant.bits)?;
-        let Qwen35MTPEmbedWeights {
-            token_hidden_norm_weight,
-            prev_hidden_norm_weight,
-            fc_weight,
-            fc_scales,
-            fc_biases,
-        } = weights;
         let fused_hidden_dim = hidden_dim
             .checked_mul(2)
             .expect("qwen3.5 MTP fused hidden dimension must fit usize");
@@ -132,18 +120,8 @@ impl Qwen35MTPEmbed {
                     .try_into()
                     .expect("qwen3.5 MTP hidden dimension must fit u32"),
             ),
-            hidden_norm: RMSNorm::new(
-                device,
-                hidden_dim,
-                config.text_config.rms_norm_eps,
-                prev_hidden_norm_weight,
-            ),
-            embedding_norm: RMSNorm::new(
-                device,
-                hidden_dim,
-                config.text_config.rms_norm_eps,
-                token_hidden_norm_weight,
-            ),
+            hidden_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
+            embedding_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
             concat: Bf16ConcatRowsKernel::new(
                 device,
                 Bf16ConcatRowsConfig {
@@ -153,14 +131,45 @@ impl Qwen35MTPEmbed {
                 },
             ),
             fc,
-            fc_weight,
-            fc_scales,
-            fc_biases,
+            projection_weights: None,
             normed_hidden: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             normed_embedding: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             fused_input: Buffer::new_zeroed_elements(device, fused_elements, Dtype::Bfloat16),
             replay_bucket_policy,
         })
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        config: &Qwen35ModelConfig,
+        bindings: Qwen35MTPEmbedWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.projection_weights.is_none(),
+            "qwen3.5 MTP embed weights are already loaded"
+        );
+        let hidden_dim = config.text_config.hidden_size;
+        let quant = config
+            .quantization
+            .as_ref()
+            .ok_or_else(|| ModelExecutorError::custom("qwen3.5 MTP requires quantized checkpoint weights"))?;
+        let weights = Qwen35MTPEmbedWeights::load(device, store, &bindings, hidden_dim, quant.group_size, quant.bits)?;
+        self.hidden_norm.load_weights(weights.prev_hidden_norm_weight);
+        self.embedding_norm.load_weights(weights.token_hidden_norm_weight);
+        self.projection_weights = Some(Qwen35MTPProjectionWeights {
+            weight: weights.fc_weight,
+            scales: weights.fc_scales,
+            biases: weights.fc_biases,
+        });
+        Ok(())
+    }
+
+    fn projection_weights(&self) -> &Qwen35MTPProjectionWeights {
+        self.projection_weights
+            .as_ref()
+            .expect("qwen3.5 MTP embed weights must be loaded before execution")
     }
 
     #[cfg(test)]
@@ -188,17 +197,18 @@ impl Qwen35MTPEmbed {
                 output: &self.fused_input,
             },
         )));
+        let projection_weights = self.projection_weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke(
             num_tokens.try_into().expect("qwen3.5 MTP token count must fit i32"),
             output,
             0,
             &self.fused_input,
             0,
-            &self.fc_weight,
+            &projection_weights.weight,
             0,
-            &self.fc_scales,
+            &projection_weights.scales,
             0,
-            &self.fc_biases,
+            &projection_weights.biases,
             0,
         )));
         output
@@ -238,6 +248,7 @@ impl Qwen35MTPEmbed {
                 output: &self.fused_input,
             },
         )));
+        let projection_weights = self.projection_weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke_bucketed(
             num_total_tokens,
             QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
@@ -245,11 +256,11 @@ impl Qwen35MTPEmbed {
             0,
             &self.fused_input,
             0,
-            &self.fc_weight,
+            &projection_weights.weight,
             0,
-            &self.fc_scales,
+            &projection_weights.scales,
             0,
-            &self.fc_biases,
+            &projection_weights.biases,
             0,
         )));
         output
@@ -347,6 +358,12 @@ struct Qwen35MTPEmbedWeights {
     fc_weight: Buffer,
     fc_scales: Buffer,
     fc_biases: Buffer,
+}
+
+struct Qwen35MTPProjectionWeights {
+    weight: Buffer,
+    scales: Buffer,
+    biases: Buffer,
 }
 
 impl Qwen35MTPEmbedWeights {
@@ -813,45 +830,42 @@ mod tests {
         )
         .unwrap();
         let mut store = SafeTensorStore::new(&model_dir.0, index);
-        let embed = Rc::new(
-            Embed::load(
+        let mut embed = Embed::new(
+            device,
+            EmbedConfig {
+                max_tokens: MAX_TOKENS,
+                vocab_size: VOCAB_SIZE,
+                hidden_dim: HIDDEN_DIM,
+                group_size: GROUP_SIZE,
+                bits: 8,
+                scale_bias_dtype: Dtype::Bfloat16,
+                output_dtype: Dtype::Bfloat16,
+            },
+        );
+        embed
+            .load_weights(
                 device,
                 &mut store,
-                EmbedConfig {
-                    max_tokens: MAX_TOKENS,
-                    vocab_size: VOCAB_SIZE,
-                    hidden_dim: HIDDEN_DIM,
-                    group_size: GROUP_SIZE,
-                    bits: 8,
-                    scale_bias_dtype: Dtype::Bfloat16,
-                    output_dtype: Dtype::Bfloat16,
-                },
                 QuantizedTensorBindings {
                     weight: EMBED_WEIGHT.to_string(),
                     scales: EMBED_SCALES.to_string(),
                     biases: EMBED_BIASES.to_string(),
                 },
             )
-            .unwrap(),
-        );
+            .unwrap();
+        let embed = Rc::new(embed);
         let fc = AffineQuantizedMatmul::new(device, fc_config);
         let replay_bucket_policy = ReplayBucketPolicy::with_topology_boundaries(MAX_TOKENS, &fc.topology_boundaries());
         let hidden_elements = MAX_TOKENS as usize * HIDDEN_DIM as usize;
+        let mut hidden_norm = RMSNorm::new(device, HIDDEN_DIM as usize, 1e-6);
+        hidden_norm.load_weights(Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16));
+        let mut embedding_norm = RMSNorm::new(device, HIDDEN_DIM as usize, 1e-6);
+        embedding_norm.load_weights(Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16));
         Qwen35MTPEmbed {
             embed,
             input_gather: Gather::new(device, HIDDEN_DIM),
-            hidden_norm: RMSNorm::new(
-                device,
-                HIDDEN_DIM as usize,
-                1e-6,
-                Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16),
-            ),
-            embedding_norm: RMSNorm::new(
-                device,
-                HIDDEN_DIM as usize,
-                1e-6,
-                Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16),
-            ),
+            hidden_norm,
+            embedding_norm,
             concat: Bf16ConcatRowsKernel::new(
                 device,
                 Bf16ConcatRowsConfig {
@@ -859,9 +873,11 @@ mod tests {
                 },
             ),
             fc,
-            fc_weight: Buffer::new_zeroed(device, fc_config.weight_bytes()),
-            fc_scales: Buffer::new_zeroed(device, fc_config.scale_or_bias_bytes()),
-            fc_biases: Buffer::new_zeroed(device, fc_config.scale_or_bias_bytes()),
+            projection_weights: Some(Qwen35MTPProjectionWeights {
+                weight: Buffer::new_zeroed(device, fc_config.weight_bytes()),
+                scales: Buffer::new_zeroed(device, fc_config.scale_or_bias_bytes()),
+                biases: Buffer::new_zeroed(device, fc_config.scale_or_bias_bytes()),
+            }),
             normed_hidden: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             normed_embedding: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             fused_input: Buffer::new_zeroed_elements(device, hidden_elements * 2, Dtype::Bfloat16),

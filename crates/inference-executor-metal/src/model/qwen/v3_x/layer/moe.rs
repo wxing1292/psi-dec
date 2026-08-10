@@ -35,24 +35,36 @@ use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xMoE {
     backend: GatedMoE,
-    weights: Box<Qwen3xMoEWeights>,
+    weights: Option<Box<Qwen3xMoEWeights>>,
     scratch: Rc<MoEScratch>,
 }
 
 impl Qwen3xMoE {
-    pub fn load(
+    pub fn new(device: &Device, core: &GatedMoECore, metal: GatedMoEMetalConfig, scratch: Rc<MoEScratch>) -> Self {
+        Self {
+            backend: GatedMoE::new(device, core.clone(), metal),
+            weights: None,
+            scratch,
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
         core: &GatedMoECore,
         metal: GatedMoEMetalConfig,
         bindings: Qwen3xMoEWeightBindings,
-        scratch: Rc<MoEScratch>,
-    ) -> Result<Self, ModelExecutorError> {
-        Ok(Self {
-            backend: GatedMoE::new(device, core.clone(), metal),
-            weights: Box::new(Qwen3xMoEWeights::load(device, store, &bindings, core, metal)?),
-            scratch,
-        })
+    ) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "Qwen3.x MoE weights are already loaded");
+        self.weights = Some(Box::new(Qwen3xMoEWeights::load(device, store, &bindings, core, metal)?));
+        Ok(())
+    }
+
+    fn weights(&self) -> &Qwen3xMoEWeights {
+        self.weights
+            .as_deref()
+            .expect("Qwen3.x MoE weights must be loaded before execution")
     }
 
     pub fn replay_topology(&self, num_total_tokens: u32) -> GatedMoEReplayTopology {
@@ -67,7 +79,8 @@ impl Qwen3xMoE {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let shared_experts = self.weights.shared_experts.as_ref().map(|weights| {
+        let weights = self.weights();
+        let shared_experts = weights.shared_experts.as_ref().map(|weights| {
             GatedMoESharedExpertsReplayInput {
                 scratch: self
                     .scratch
@@ -90,10 +103,10 @@ impl Qwen3xMoE {
                 next_hidden_state: output,
                 scratch: self.scratch.bindings(),
                 weights: GatedMoEWeights {
-                    router_weight: &self.weights.router_weight,
-                    router_scales: &self.weights.router_scales,
-                    router_biases: &self.weights.router_biases,
-                    topk_experts: self.weights.experts.as_borrowed(),
+                    router_weight: &weights.router_weight,
+                    router_scales: &weights.router_scales,
+                    router_biases: &weights.router_biases,
+                    topk_experts: weights.experts.as_borrowed(),
                 },
                 shared_experts,
             },
@@ -110,7 +123,8 @@ impl Qwen3xMoE {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let shared_experts = self.weights.shared_experts.as_ref().map(|weights| {
+        let weights = self.weights();
+        let shared_experts = weights.shared_experts.as_ref().map(|weights| {
             GatedMoESharedExpertsReplayInput {
                 scratch: self
                     .scratch
@@ -133,10 +147,10 @@ impl Qwen3xMoE {
                 next_hidden_state: output,
                 scratch: self.scratch.bindings(),
                 weights: GatedMoEWeights {
-                    router_weight: &self.weights.router_weight,
-                    router_scales: &self.weights.router_scales,
-                    router_biases: &self.weights.router_biases,
-                    topk_experts: self.weights.experts.as_borrowed(),
+                    router_weight: &weights.router_weight,
+                    router_scales: &weights.router_scales,
+                    router_biases: &weights.router_biases,
+                    topk_experts: weights.experts.as_borrowed(),
                 },
                 shared_experts,
             },

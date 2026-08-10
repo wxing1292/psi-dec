@@ -11,19 +11,30 @@ use inference_executor_core::backend::recorder::Recorder;
 use crate::def::replay_op::ReplayOp;
 
 pub struct RMSNorm {
-    weight: Buffer,
+    weight: Option<Buffer>,
     compute: RMSNormKernel,
 }
 
 impl RMSNorm {
-    pub fn new(device: &Device, hidden_dim: usize, eps: f32, weight: Buffer) -> Self {
+    pub fn new(device: &Device, hidden_dim: usize, eps: f32) -> Self {
         assert!(hidden_dim > 0, "RMS norm hidden dimension must be positive");
         assert!(eps.is_finite() && eps > 0.0, "RMS norm epsilon must be positive");
         let hidden_dim = hidden_dim.try_into().expect("RMS norm hidden dimension must fit u32");
         Self {
-            weight,
+            weight: None,
             compute: RMSNormKernel::new(device, RMSNormConfig::bf16(hidden_dim, eps)),
         }
+    }
+
+    pub fn load_weights(&mut self, weight: Buffer) {
+        assert!(self.weight.is_none(), "RMS norm weights are already loaded");
+        self.weight = Some(weight);
+    }
+
+    fn weight(&self) -> &Buffer {
+        self.weight
+            .as_ref()
+            .expect("RMS norm weights must be loaded before execution")
     }
 
     fn invocation<'a>(&'a self, num_tokens: u32, input: &'a Buffer, output: &'a Buffer) -> RMSNormInvocation<'a> {
@@ -33,7 +44,7 @@ impl RMSNorm {
             },
             RMSNormBuffers {
                 input,
-                weight: &self.weight,
+                weight: self.weight(),
                 output,
             },
         )
@@ -51,7 +62,7 @@ impl RMSNorm {
             num_active_tokens_key,
             RMSNormBuffers {
                 input,
-                weight: &self.weight,
+                weight: self.weight(),
                 output,
             },
         )

@@ -68,19 +68,17 @@ pub struct Qwen3xDSparkBodyReplayKey {
 
 impl Qwen3xDSparkModel {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         config: &Qwen3xDSparkConfig,
         num_spec_tokens: usize,
         page_bytes: usize,
-        main_feature_bindings: Qwen3xDSparkMainFeatureWeightBindings,
-        layer_bindings: Vec<Qwen3xDSparkLayerWeightBindings>,
-        final_norm_weight: String,
+        main_feature_bindings: &Qwen3xDSparkMainFeatureWeightBindings,
+        layer_bindings: &[Qwen3xDSparkLayerWeightBindings],
         gqa_state: &UngatedDSparkGQAState,
         max_main_tokens: usize,
         max_block_tokens: usize,
-    ) -> Result<Rc<Self>, ModelExecutorError> {
+    ) -> Result<Self, ModelExecutorError> {
         assert_eq!(
             layer_bindings.len(),
             config.num_hidden_layers,
@@ -99,18 +97,16 @@ impl Qwen3xDSparkModel {
             Dtype::Bfloat16,
             max_block_tokens,
         ));
-        let main_feature_projector = Rc::new(Qwen3xDSparkMainFeatureProjector::load(
+        let main_feature_projector = Rc::new(Qwen3xDSparkMainFeatureProjector::new(
             device,
-            store,
             config,
-            &main_feature_bindings,
+            main_feature_bindings,
             max_main_tokens,
         )?);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for (dspark_layer_index, bindings) in layer_bindings.into_iter().enumerate() {
-            layers.push(Qwen3xDSparkLayer::load(
+        for (dspark_layer_index, bindings) in layer_bindings.iter().enumerate() {
+            layers.push(Qwen3xDSparkLayer::new(
                 device,
-                store,
                 config,
                 num_spec_tokens,
                 dspark_layer_index,
@@ -121,17 +117,48 @@ impl Qwen3xDSparkModel {
                 Rc::clone(&dense_scratch),
             )?);
         }
+        Ok(Self {
+            main_feature_projector,
+            layers,
+            final_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        config: &Qwen3xDSparkConfig,
+        num_spec_tokens: usize,
+        page_bytes: usize,
+        main_feature_bindings: &Qwen3xDSparkMainFeatureWeightBindings,
+        layer_bindings: Vec<Qwen3xDSparkLayerWeightBindings>,
+        final_norm_weight: String,
+    ) -> Result<(), ModelExecutorError> {
+        let projector = Rc::get_mut(&mut self.main_feature_projector)
+            .expect("DSpark Main-feature projector must be uniquely owned during weight loading");
+        projector.load_weights(device, store, config, main_feature_bindings)?;
+        assert_eq!(
+            self.layers.len(),
+            layer_bindings.len(),
+            "Qwen3x DSpark component and checkpoint binding layer counts must match"
+        );
+        for (layer, bindings) in self.layers.iter_mut().zip(layer_bindings) {
+            layer.load_weights(device, store, config, num_spec_tokens, page_bytes, bindings)?;
+        }
         let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
-        let final_norm_weight = remove_qwen3x_norm_weight(device, &mut tensors, &final_norm_weight, &[hidden_dim])?;
+        self.final_norm.load_weights(remove_qwen3x_norm_weight(
+            device,
+            &mut tensors,
+            &final_norm_weight,
+            &[config.hidden_size],
+        )?);
         assert!(
             tensors.is_empty(),
             "Qwen3x DSpark model must consume its final norm tensor map"
         );
-        Ok(Rc::new(Self {
-            main_feature_projector,
-            layers,
-            final_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps, final_norm_weight),
-        }))
+        Ok(())
     }
 
     pub fn main_feature_projector(&self) -> Rc<Qwen3xDSparkMainFeatureProjector> {

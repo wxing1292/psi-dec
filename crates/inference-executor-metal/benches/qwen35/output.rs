@@ -308,7 +308,9 @@ impl HeadFixture {
                 )
             });
         let Qwen35ModelWeightBindings { embed, main, unembed } = weight_bindings;
-        let embedding = Embed::load(&device, &mut store, layout.embedding_config(), embed)
+        let mut embedding = Embed::new(&device, layout.embedding_config());
+        embedding
+            .load_weights(&device, &mut store, embed)
             .unwrap_or_else(|err| panic!("unable to load qwen35 embedding: {err}"));
         let final_norm_weight = load_qwen3x_norm_weight(
             &device,
@@ -317,8 +319,12 @@ impl HeadFixture {
             &[layout.hidden_dim as usize],
         )
         .unwrap_or_else(|err| panic!("unable to load qwen35 final norm: {err}"));
-        let unembedder = Unembed::load(&device, &mut store, unembed_config, unembed)
+        let mut unembedder = Unembed::new(&device, unembed_config);
+        unembedder
+            .load_weights(&device, &mut store, unembed)
             .unwrap_or_else(|err| panic!("unable to load qwen35 unembed: {err}"));
+        let mut final_norm = RMSNorm::new(&device, layout.hidden_dim as usize, layout.rms_norm_eps);
+        final_norm.load_weights(final_norm_weight);
         store.unload_all();
         Self {
             stream: Stream::new(&device),
@@ -330,12 +336,7 @@ impl HeadFixture {
             unembed_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
             unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
             embedding,
-            final_norm: RMSNorm::new(
-                &device,
-                layout.hidden_dim as usize,
-                layout.rms_norm_eps,
-                final_norm_weight,
-            ),
+            final_norm,
             gather: Gather::new(&device, layout.hidden_dim),
             unembedder,
             sampler: TopKSampling::new(&device, sampler_bounds),

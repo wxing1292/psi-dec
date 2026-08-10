@@ -33,8 +33,9 @@ use crate::sampling::spec_probs::SpecProbsStore;
 
 pub struct Qwen3xDSparkMarkov {
     backend: DSparkMarkovSampling,
-    weights: Qwen3xDSparkMarkovWeights,
-    confidence: Qwen3xDSparkConfidenceWeights,
+    config: DSparkMarkovSamplingConfig,
+    weights: Option<Qwen3xDSparkMarkovWeights>,
+    confidence: Option<Qwen3xDSparkConfidenceWeights>,
 }
 
 struct Qwen3xDSparkMarkovWeights {
@@ -53,13 +54,11 @@ struct Qwen3xDSparkConfidenceWeights {
 
 impl Qwen3xDSparkMarkov {
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         model_config: &Qwen3xDSparkConfig,
         num_spec_tokens: usize,
         bindings: &Qwen3xDSparkMarkovWeightBindings,
-        confidence_bindings: &Qwen3xDSparkConfidenceWeightBindings,
         max_requests: usize,
         sampler_bounds: TopKSamplingBounds,
     ) -> Result<Self, ModelExecutorError> {
@@ -94,24 +93,44 @@ impl Qwen3xDSparkMarkov {
             },
         };
         config.validate();
+        Ok(Self {
+            backend: DSparkMarkovSampling::new(device, config),
+            config,
+            weights: None,
+            confidence: None,
+        })
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        bindings: &Qwen3xDSparkMarkovWeightBindings,
+        confidence_bindings: &Qwen3xDSparkConfidenceWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.weights.is_none() && self.confidence.is_none(),
+            "Qwen3.x DSpark Markov weights are already loaded"
+        );
         let mut tensor_names = Vec::new();
         bindings.push_tensor_names(&mut tensor_names);
         confidence_bindings.push_tensor_names(&mut tensor_names);
         let mut tensors = store.load_tensors(tensor_names)?;
-        let weights = Qwen3xDSparkMarkovWeights::from_tensors(device, &mut tensors, config, bindings)?;
-        let confidence = Qwen3xDSparkConfidenceWeights::from_tensors(
+        self.weights = Some(Qwen3xDSparkMarkovWeights::from_tensors(
             device,
             &mut tensors,
-            confidence_config,
-            rank,
+            self.config,
+            bindings,
+        )?);
+        self.confidence = Some(Qwen3xDSparkConfidenceWeights::from_tensors(
+            device,
+            &mut tensors,
+            self.config.confidence,
+            self.config.rank,
             confidence_bindings,
-        )?;
+        )?);
         assert!(tensors.is_empty(), "Qwen3x DSpark Markov must consume its tensor map");
-        Ok(Self {
-            backend: DSparkMarkovSampling::new(device, config),
-            weights,
-            confidence,
-        })
+        Ok(())
     }
 
     pub fn prepare(
@@ -141,16 +160,24 @@ impl Qwen3xDSparkMarkov {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
+        let weights = self
+            .weights
+            .as_ref()
+            .expect("Qwen3.x DSpark Markov weights must be loaded before execution");
+        let confidence = self
+            .confidence
+            .as_ref()
+            .expect("Qwen3.x DSpark confidence weights must be loaded before execution");
         self.backend.record(
             recorder,
             DSparkMarkovInput {
                 shape,
                 base_logits,
                 distribution_store,
-                weights: self.weights.as_borrowed(),
+                weights: weights.as_borrowed(),
                 confidence: DSparkConfidenceInput {
                     hidden,
-                    weights: self.confidence.as_borrowed(),
+                    weights: confidence.as_borrowed(),
                 },
             },
         );

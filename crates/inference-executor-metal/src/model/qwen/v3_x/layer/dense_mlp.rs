@@ -28,24 +28,36 @@ use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xDenseMLP {
     backend: DenseMLP,
-    weights: DenseMLPWeightBuffers,
+    weights: Option<DenseMLPWeightBuffers>,
     scratch: Rc<DenseMLPScratch>,
 }
 
 impl Qwen3xDenseMLP {
-    pub fn load(
+    pub fn new(device: &Device, core: &DenseMLPCore, metal: DenseMLPMetalConfig, scratch: Rc<DenseMLPScratch>) -> Self {
+        Self {
+            backend: DenseMLP::new(device, core.clone(), metal),
+            weights: None,
+            scratch,
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
         core: &DenseMLPCore,
         metal: DenseMLPMetalConfig,
         bindings: Qwen3xDenseMLPWeightBindings,
-        scratch: Rc<DenseMLPScratch>,
-    ) -> Result<Self, ModelExecutorError> {
-        Ok(Self {
-            backend: DenseMLP::new(device, core.clone(), metal),
-            weights: DenseMLPWeightBuffers::load(device, store, &bindings, core, metal)?,
-            scratch,
-        })
+    ) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "Qwen3.x dense MLP weights are already loaded");
+        self.weights = Some(DenseMLPWeightBuffers::load(device, store, &bindings, core, metal)?);
+        Ok(())
+    }
+
+    fn weights(&self) -> &DenseMLPWeightBuffers {
+        self.weights
+            .as_ref()
+            .expect("Qwen3.x dense MLP weights must be loaded before execution")
     }
 
     pub fn replay_topology(&self, num_total_tokens: u32) -> QuantizedDenseMLPReplayTopology {
@@ -68,7 +80,7 @@ impl Qwen3xDenseMLP {
                 hidden_state: input,
                 next_hidden_state: output,
                 scratch: self.scratch.bindings(),
-                weights: self.weights.as_borrowed(),
+                weights: self.weights().as_borrowed(),
             },
         );
     }
@@ -91,7 +103,7 @@ impl Qwen3xDenseMLP {
                 hidden_state: input,
                 next_hidden_state: output,
                 scratch: self.scratch.bindings(),
-                weights: self.weights.as_borrowed(),
+                weights: self.weights().as_borrowed(),
             },
         );
     }

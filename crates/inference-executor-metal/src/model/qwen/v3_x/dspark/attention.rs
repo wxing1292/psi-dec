@@ -31,7 +31,7 @@ use crate::model::qwen::v3_x::weight::to_u32;
 
 pub struct Qwen3xDSparkAttention {
     dspark_layer_index: u32,
-    weights: Qwen3xUngatedGQAWeightBuffers,
+    weights: Option<Qwen3xUngatedGQAWeightBuffers>,
     backend: UngatedDSparkGQA,
     context_appender: UngatedDSparkGQAContextAppender,
     block_scratch: Rc<DSparkBlockScratch>,
@@ -40,26 +40,52 @@ pub struct Qwen3xDSparkAttention {
 }
 
 impl Qwen3xDSparkAttention {
-    pub fn load(
+    pub fn new(
         device: &Device,
-        store: &mut SafeTensorStore,
         core: &UngatedDSparkGQACore,
         metal: GQAMetalConfig,
         dspark_layer_index: usize,
-        bindings: Qwen3xGQAWeightBindings,
         state: &UngatedDSparkGQAState,
-    ) -> Result<Self, ModelExecutorError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             dspark_layer_index: dspark_layer_index
                 .try_into()
                 .expect("Qwen3 DSpark layer index must fit u32"),
-            weights: Qwen3xUngatedGQAWeightBuffers::load(device, store, &bindings, &core.attention, metal)?,
+            weights: None,
             backend: UngatedDSparkGQA::new(device, core.clone(), metal),
             context_appender: UngatedDSparkGQAContextAppender::new(device, core.clone(), metal),
             block_scratch: state.block_scratch(),
             context_scratch: state.context_scratch(),
             request_page_table: state.request_page_table(),
-        })
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        store: &mut SafeTensorStore,
+        core: &UngatedDSparkGQACore,
+        metal: GQAMetalConfig,
+        bindings: Qwen3xGQAWeightBindings,
+    ) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.weights.is_none(),
+            "Qwen3.x DSpark attention weights are already loaded"
+        );
+        self.weights = Some(Qwen3xUngatedGQAWeightBuffers::load(
+            device,
+            store,
+            &bindings,
+            &core.attention,
+            metal,
+        )?);
+        Ok(())
+    }
+
+    fn weights(&self) -> &Qwen3xUngatedGQAWeightBuffers {
+        self.weights
+            .as_ref()
+            .expect("Qwen3.x DSpark attention weights must be loaded before execution")
     }
 
     pub fn record_context<'a, R>(
@@ -86,7 +112,7 @@ impl Qwen3xDSparkAttention {
                     kv_pages: pages,
                     page_ids: self.request_page_table.page_ids_buffer(),
                 },
-                weights: self.weights.as_borrowed(),
+                weights: self.weights().as_borrowed(),
                 scratch: self.context_scratch.bindings(),
             },
         );
@@ -115,7 +141,7 @@ impl Qwen3xDSparkAttention {
                     kv_pages: pages,
                     page_ids: self.request_page_table.page_ids_buffer(),
                 },
-                weights: self.weights.as_borrowed(),
+                weights: self.weights().as_borrowed(),
                 scratch: self.block_scratch.bindings(),
             },
         );
