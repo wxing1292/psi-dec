@@ -9,6 +9,8 @@ use crate::runtime::RawRequestID;
 mod compute_slot;
 pub use compute_slot::ComputeSlot;
 
+mod dedup_vec_deque;
+
 mod event_loop;
 pub use event_loop::EventLoop;
 
