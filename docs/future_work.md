@@ -145,6 +145,11 @@ component path as the design.
 - Wire the reusable Qwen3x DSpark model into Qwen3.5 only when a supported checkpoint defines the Main compatibility
   and executor lifecycle. Reuse `MainResidualCapture`, `Qwen3xDSparkModel`, `Qwen3xDSparkMarkov`, and the generic
   DSpark attention/state owners. Do not create a parallel `qwen/v3_5/dspark` implementation.
+- Allow an MTP request to start with fewer than `num_spec_tokens` input tokens.
+  The runtime currently returns `InvalidArgument` because Trie initialization requires one input token for each MTP
+  cache lane. Add a Main-only warm-up phase that creates enough verified history before it enables MTP. The runtime
+  core must own the mode transition and cache-lane initialization. Do not use placeholder tokens or partially
+  initialized cache lanes.
 - Use the Qwen3 DSpark confidence output to add dynamic proposal lengths.
   Keep global proposal ranking and verification-budget allocation in runtime scheduling.
   Keep each executor run fixed at its configured `num_spec_tokens` until the scheduler owns this cross-request policy.
