@@ -339,9 +339,11 @@ The executor finishes or clears transient restore, publish, and batch transactio
 It attaches consumers only after all state reads succeed.
 It releases all new resources after a read failure.
 
-The service does not invoke these operations yet.
-The runtime-to-device protocol and idle policy remain design work.
-See [`model_idle_unload.md`](model_idle_unload.md) for the current boundary and the planned wiring.
+`ReplayableModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
+It also starts a stopped model before it executes a batch.
+Runtime core currently sends only batch requests.
+Executor residency tracking and idle policy remain design work.
+See [`model_idle_unload.md`](model_idle_unload.md) for the current boundary and remaining wiring.
 
 ## Verification boundary
 

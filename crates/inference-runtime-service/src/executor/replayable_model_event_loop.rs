@@ -1,3 +1,5 @@
+use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -32,12 +34,21 @@ pub struct ReplayableModelEventLoop<M> {
     req_slot_reset_rx: Receiver<()>,
     shutdown: Shutdown,
     model: M,
+    model_state: ModelExecutorState,
+    state_snapshot_path: PathBuf,
     debug_logging: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelExecutorState {
+    Started,
+    Stopped,
 }
 
 impl<M> ReplayableModelEventLoop<M>
 where
     M: ReplayableModel,
+    M::LifecycleError: Display,
 {
     pub fn new(
         model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
@@ -46,6 +57,7 @@ where
         req_slot_reset_rx: Receiver<()>,
         shutdown: Shutdown,
         model: M,
+        state_snapshot_path: PathBuf,
     ) -> Self {
         Self {
             model_executor_req_rx,
@@ -54,6 +66,8 @@ where
             req_slot_reset_rx,
             shutdown,
             model,
+            model_state: ModelExecutorState::Started,
+            state_snapshot_path,
             debug_logging: false,
         }
     }
@@ -85,7 +99,10 @@ where
                 },
                 _ if op_index == op_recv_req_slot_reset => {
                     match op.recv(&self.req_slot_reset_rx) {
-                        Ok(()) => self.reset_req_slots(),
+                        Ok(()) if self.model_state == ModelExecutorState::Started => self.reset_req_slots(),
+                        Ok(()) => {
+                            tracing::debug!("model is stopped; deferring request slot resets until start");
+                        },
                         Err(_) => {
                             tracing::info!("request slot reset channel closed, stopping");
                             break 'event_loop;
@@ -95,21 +112,31 @@ where
                 _ if op_index == op_recv_model_executor_req => {
                     match op.recv(&self.model_executor_req_rx) {
                         Ok(ReplayableModelExecutorRequest::Batch(batch_dev_req)) => {
+                            if !self.start() {
+                                break 'event_loop;
+                            }
                             self.reset_req_slots();
                             let batch_dev_resp = self.execute(batch_dev_req);
-                            if let Err(err) = self
-                                .model_executor_resp_tx
-                                .send(ReplayableModelExecutorResponse::Batch(batch_dev_resp))
-                            {
-                                tracing::info!("unable to send model executor response, err: {err}, stopping");
+                            if !self.send_response(ReplayableModelExecutorResponse::Batch(batch_dev_resp)) {
                                 break 'event_loop;
                             }
                         },
                         Ok(ReplayableModelExecutorRequest::Start) => {
-                            panic!("model executor Start is not wired")
+                            if !self.start() {
+                                break 'event_loop;
+                            }
+                            self.reset_req_slots();
+                            if !self.send_response(ReplayableModelExecutorResponse::Started) {
+                                break 'event_loop;
+                            }
                         },
                         Ok(ReplayableModelExecutorRequest::Stop) => {
-                            panic!("model executor Stop is not wired")
+                            if !self.stop() {
+                                break 'event_loop;
+                            }
+                            if !self.send_response(ReplayableModelExecutorResponse::Stopped) {
+                                break 'event_loop;
+                            }
                         },
                         Err(_) => {
                             tracing::info!("model executor request channel closed, stopping");
@@ -121,8 +148,118 @@ where
             }
         }
 
+        self.remove_state_snapshot();
         self.shutdown.shutdown();
         tracing::info!("stopped");
+    }
+
+    fn start(&mut self) -> bool {
+        if self.model_state == ModelExecutorState::Started {
+            return true;
+        }
+
+        let start = Instant::now();
+        tracing::info!(
+            target: "inference-runtime-service::lifecycle",
+            phase = "model.start.begin",
+            model = self.model.model_name(),
+            snapshot_path = %self.state_snapshot_path.display(),
+            "starting model"
+        );
+        if let Err(error) = self.model.load_weights() {
+            tracing::error!(
+                target: "inference-runtime-service::lifecycle",
+                phase = "model.start.failed",
+                model = self.model.model_name(),
+                error = %error,
+                "unable to load model weights; shutting down"
+            );
+            self.shutdown.shutdown();
+            return false;
+        }
+        if let Err(error) = self.model.load_state(&self.state_snapshot_path) {
+            tracing::error!(
+                target: "inference-runtime-service::lifecycle",
+                phase = "model.start.failed",
+                model = self.model.model_name(),
+                error = %error,
+                "unable to load model state; shutting down"
+            );
+            self.shutdown.shutdown();
+            return false;
+        }
+        self.model_state = ModelExecutorState::Started;
+        self.remove_state_snapshot();
+        tracing::info!(
+            target: "inference-runtime-service::lifecycle",
+            phase = "model.start.complete",
+            model = self.model.model_name(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "model started"
+        );
+        true
+    }
+
+    fn stop(&mut self) -> bool {
+        if self.model_state == ModelExecutorState::Stopped {
+            return true;
+        }
+
+        let start = Instant::now();
+        tracing::info!(
+            target: "inference-runtime-service::lifecycle",
+            phase = "model.stop.begin",
+            model = self.model.model_name(),
+            snapshot_path = %self.state_snapshot_path.display(),
+            "stopping model"
+        );
+        self.reset_req_slots();
+        self.model.clear_replay_cache();
+        if let Err(error) = self.model.unload_state(&self.state_snapshot_path) {
+            tracing::error!(
+                target: "inference-runtime-service::lifecycle",
+                phase = "model.stop.failed",
+                model = self.model.model_name(),
+                error = %error,
+                "unable to unload model state; shutting down"
+            );
+            self.shutdown.shutdown();
+            return false;
+        }
+        self.model.unload_weights();
+        self.model_state = ModelExecutorState::Stopped;
+        tracing::info!(
+            target: "inference-runtime-service::lifecycle",
+            phase = "model.stop.complete",
+            model = self.model.model_name(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "model stopped"
+        );
+        true
+    }
+
+    fn send_response(&self, response: ReplayableModelExecutorResponse) -> bool {
+        if let Err(error) = self.model_executor_resp_tx.send(response) {
+            tracing::info!("unable to send model executor response, err: {error}, stopping");
+            return false;
+        }
+        true
+    }
+
+    fn remove_state_snapshot(&self) {
+        match std::fs::remove_file(&self.state_snapshot_path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => {
+                tracing::warn!(
+                    target: "inference-runtime-service::lifecycle",
+                    model = self.model.model_name(),
+                    snapshot_path = %self.state_snapshot_path.display(),
+                    error = %error,
+                    "unable to remove model state snapshot"
+                );
+            },
+        }
     }
 
     fn reset_req_slots(&mut self) {
@@ -414,64 +551,101 @@ fn summarize_f32_slice(values: &[f32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
+    use crossbeam_channel::unbounded;
 
     use super::*;
 
-    struct ResetOnlyModel {
-        reset_tx: Sender<Vec<RawRequestSlot>>,
+    #[derive(Debug, Eq, PartialEq)]
+    enum ModelEvent {
+        ResetRequestSlots(Vec<RawRequestSlot>),
+        ClearReplayCache,
+        UnloadState,
+        UnloadWeights,
+        LoadWeights,
+        LoadState,
     }
 
-    struct ResetOnlySubmission;
+    struct TestModel {
+        event_tx: Sender<ModelEvent>,
+        weights_loaded: bool,
+        state_loaded: bool,
+    }
 
-    impl ExecutionSubmission for ResetOnlySubmission {
+    struct TestSubmission;
+
+    impl ExecutionSubmission for TestSubmission {
         fn wait(&self) {
-            panic!("reset-only model must not wait for a submission")
+            panic!("test model must not wait for a submission")
         }
     }
 
-    impl ReplayableModel for ResetOnlyModel {
+    impl ReplayableModel for TestModel {
         type ModelBatchRequest = ();
         type ModelBatchHidden = ();
         type ModelBatchResponse = ();
         type SampledOutput = ();
         type ModelOpsRecorder = ();
-        type Submission = ResetOnlySubmission;
-        type LifecycleError = std::convert::Infallible;
+        type Submission = TestSubmission;
+        type LifecycleError = std::io::Error;
 
         fn model_name(&self) -> &str {
-            "reset-only"
+            "test"
         }
 
         fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]) {
-            self.reset_tx.send(request_slots.to_vec()).unwrap();
+            assert!(self.weights_loaded);
+            assert!(self.state_loaded);
+            self.event_tx
+                .send(ModelEvent::ResetRequestSlots(request_slots.to_vec()))
+                .unwrap();
         }
 
         fn clear_replay_cache(&mut self) {
-            panic!("reset-only model must not clear replay resources")
+            assert!(self.weights_loaded);
+            assert!(self.state_loaded);
+            self.event_tx.send(ModelEvent::ClearReplayCache).unwrap();
         }
 
-        fn unload_state(&mut self, _snapshot_path: &std::path::Path) -> Result<(), Self::LifecycleError> {
-            panic!("reset-only model must not unload state")
+        fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+            assert!(self.weights_loaded);
+            assert!(self.state_loaded);
+            std::fs::write(snapshot_path, b"test model state")?;
+            self.state_loaded = false;
+            self.event_tx.send(ModelEvent::UnloadState).unwrap();
+            Ok(())
         }
 
         fn unload_weights(&mut self) {
-            panic!("reset-only model must not unload weights")
+            assert!(self.weights_loaded);
+            assert!(!self.state_loaded);
+            self.weights_loaded = false;
+            self.event_tx.send(ModelEvent::UnloadWeights).unwrap();
         }
 
         fn load_weights(&mut self) -> Result<(), Self::LifecycleError> {
-            panic!("reset-only model must not load weights")
+            assert!(!self.weights_loaded);
+            assert!(!self.state_loaded);
+            self.weights_loaded = true;
+            self.event_tx.send(ModelEvent::LoadWeights).unwrap();
+            Ok(())
         }
 
-        fn load_state(&mut self, _snapshot_path: &std::path::Path) -> Result<(), Self::LifecycleError> {
-            panic!("reset-only model must not load state")
+        fn load_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+            assert!(self.weights_loaded);
+            assert!(!self.state_loaded);
+            assert_eq!(std::fs::read(snapshot_path)?, b"test model state");
+            self.state_loaded = true;
+            self.event_tx.send(ModelEvent::LoadState).unwrap();
+            Ok(())
         }
 
         fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
-            panic!("reset-only model must not execute a batch")
+            panic!("test model must not execute a non-empty batch")
         }
 
         fn commit_batch(
@@ -479,7 +653,7 @@ mod tests {
             _core_batch_req: BatchDeviceRequest,
             _sampled_output: Self::SampledOutput,
         ) -> BatchDeviceResponse {
-            panic!("reset-only model must not commit a batch")
+            panic!("test model must not commit a non-empty batch")
         }
 
         fn begin_ops_recording(&mut self, _batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {}
@@ -508,7 +682,7 @@ mod tests {
         }
 
         fn submit_main(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
-            panic!("reset-only model must not submit a batch")
+            panic!("test model must not submit a non-empty batch")
         }
 
         fn read_main(
@@ -534,29 +708,131 @@ mod tests {
         }
     }
 
+    fn test_snapshot_path(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "psi-dec-{test_name}-{}-{:?}.state",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
     #[test]
     fn test_request_slot_resets() {
         let (_model_executor_req_tx, model_executor_req_rx) = bounded(1);
         let (model_executor_resp_tx, _model_executor_resp_rx) = bounded(1);
         let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
-        let (seen_reset_tx, seen_reset_rx) = bounded(1);
+        let (event_tx, event_rx) = unbounded();
         let shutdown = Shutdown::new();
+        let snapshot_path = test_snapshot_path("request-slot-resets");
         let executor = ReplayableModelEventLoop::new(
             model_executor_req_rx,
             model_executor_resp_tx,
             req_slot_reset_notifier.clone(),
             req_slot_reset_rx,
             shutdown.clone(),
-            ResetOnlyModel {
-                reset_tx: seen_reset_tx,
+            TestModel {
+                event_tx,
+                weights_loaded: true,
+                state_loaded: true,
             },
+            snapshot_path,
         );
         let executor_thread = std::thread::spawn(move || executor.event_loop());
 
         req_slot_reset_notifier.send_one(3);
-        assert_eq!(seen_reset_rx.recv_timeout(Duration::from_secs(1)).unwrap(), vec![3]);
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ModelEvent::ResetRequestSlots(vec![3])
+        );
         req_slot_reset_notifier.send_one(7);
-        assert_eq!(seen_reset_rx.recv_timeout(Duration::from_secs(1)).unwrap(), vec![7]);
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ModelEvent::ResetRequestSlots(vec![7])
+        );
+
+        shutdown.shutdown();
+        executor_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_start_stop_and_batch_start_are_idempotent() {
+        let (model_executor_req_tx, model_executor_req_rx) = bounded(1);
+        let (model_executor_resp_tx, model_executor_resp_rx) = bounded(1);
+        let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
+        let (event_tx, event_rx) = unbounded();
+        let shutdown = Shutdown::new();
+        let snapshot_path = test_snapshot_path("start-stop");
+        let executor = ReplayableModelEventLoop::new(
+            model_executor_req_rx,
+            model_executor_resp_tx,
+            req_slot_reset_notifier.clone(),
+            req_slot_reset_rx,
+            shutdown.clone(),
+            TestModel {
+                event_tx,
+                weights_loaded: true,
+                state_loaded: true,
+            },
+            snapshot_path.clone(),
+        );
+        let executor_thread = std::thread::spawn(move || executor.event_loop());
+
+        model_executor_req_tx
+            .send(ReplayableModelExecutorRequest::Start)
+            .unwrap();
+        assert!(matches!(
+            model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorResponse::Started
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        model_executor_req_tx
+            .send(ReplayableModelExecutorRequest::Stop)
+            .unwrap();
+        assert!(matches!(
+            model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorResponse::Stopped
+        ));
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::ClearReplayCache);
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::UnloadState);
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::UnloadWeights);
+
+        model_executor_req_tx
+            .send(ReplayableModelExecutorRequest::Stop)
+            .unwrap();
+        assert!(matches!(
+            model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorResponse::Stopped
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        req_slot_reset_notifier.send_one(11);
+        assert!(event_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        model_executor_req_tx
+            .send(ReplayableModelExecutorRequest::Batch(BatchDeviceRequest::new(
+                7,
+                Vec::new(),
+            )))
+            .unwrap();
+        let ReplayableModelExecutorResponse::Batch(batch_response) =
+            model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("empty batch must return a batch response")
+        };
+        assert_eq!(batch_response.seq, 7);
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::LoadWeights);
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::LoadState);
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::ResetRequestSlots(vec![11]));
+        assert!(!snapshot_path.exists());
+
+        model_executor_req_tx
+            .send(ReplayableModelExecutorRequest::Start)
+            .unwrap();
+        assert!(matches!(
+            model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorResponse::Started
+        ));
+        assert!(event_rx.try_recv().is_err());
 
         shutdown.shutdown();
         executor_thread.join().unwrap();

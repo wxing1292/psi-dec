@@ -614,6 +614,13 @@ Main decisions cross the CPU boundary before DSpark constructs the anchor block.
 
 It does not duplicate an INFO event.
 
+Internal model `Start` and `Stop` commands emit INFO lifecycle events on the
+`inference-runtime-service::lifecycle` target.
+The events use `model.start.begin`, `model.start.complete`, `model.stop.begin`, and `model.stop.complete` phases.
+Completion events include elapsed milliseconds.
+Failure events include the model name and error, and then trigger global shutdown.
+Runtime core does not issue these commands or apply an idle timeout yet.
+
 The Main timing fields are:
 
 - `model_output_main_replay_ms`: `MainEmbed -> Main` when the batch has no sampling rows

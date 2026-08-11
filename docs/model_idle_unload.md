@@ -1,8 +1,7 @@
-# Model Idle Unload Design Draft
+# Model Idle Unload Design
 
-This document records the implemented model resource operations and the planned service wiring.
-The service wiring is not implemented.
-The runtime-to-device protocol is not final.
+This document records the implemented model resource operations, executor protocol, and service event-loop wiring.
+Runtime idle detection and model residency tracking are not implemented.
 
 ## Objective
 
@@ -39,9 +38,17 @@ Qwen3 and Qwen3.5 implement these operations.
 GQA, GDN, MTP, DSpark, MLP, embed, unembed, and sampling owners participate in symmetric resource traversal.
 The operations run synchronously on the model executor thread.
 
-`ReplayableModelEventLoop` currently accepts only batch requests and request-slot reset notifications.
-It does not invoke model resource operations.
-The service has no start command, stop command, idle timer, lifecycle status, or status route.
+`ReplayableModelEventLoop` owns the loaded model, its stable `Started` or `Stopped` state, and one state snapshot path.
+It handles `Batch`, `Start`, and `Stop` requests synchronously on the executor thread.
+`Start` and `Stop` are idempotent.
+`Batch` starts a stopped model before it executes the batch.
+
+The event loop defers request-slot resets while the model is stopped.
+It applies all deferred resets after state loading and before it acknowledges `Start` or executes a batch.
+
+Runtime core currently sends only `Batch` requests.
+It does not track executor residency or send `Start` and `Stop`.
+The service has no idle timer, lifecycle status API, or status route.
 
 ## Current resource order
 
@@ -129,9 +136,9 @@ The future service wiring must own the idle policy and operation order.
 Runtime core must not parse model-specific state.
 The model executor must not allocate or free runtime-owned page IDs.
 
-## Planned runtime-to-device protocol
+## Runtime-to-device protocol
 
-The preferred protocol shape is symmetric, but it is not final and is not implemented:
+The protocol is symmetric:
 
 ```rust
 pub enum ReplayableModelExecutorRequest {
@@ -147,7 +154,7 @@ pub enum ReplayableModelExecutorResponse {
 }
 ```
 
-The intended request-response pairs are:
+The request-response pairs are:
 
 ```text
 Batch(request) -> Batch(response)
@@ -155,14 +162,18 @@ Start          -> Started
 Stop           -> Stopped
 ```
 
-`Start` and `Stop` must be idempotent.
-The final protocol must define ordering with batch execution and request-slot reset notifications.
-It must not require runtime core to interpret service policy.
+`Start` and `Stop` are idempotent.
+One request channel orders `Batch`, `Start`, and `Stop`.
+One response channel preserves the matching response order.
+The model event loop processes one request at a time.
 
-The future wiring belongs in a separate commit.
-That commit must define admission control, idle detection, runtime cache coordination, failure handling, and status exposure.
+Runtime core wraps prepared device batches in `Batch` and unwraps matching `Batch` responses.
+It treats `Started` or `Stopped` as an internal contract violation because it does not send lifecycle commands yet.
 
-## Planned flow
+Future runtime wiring must define idle detection, executor residency tracking, runtime cache coordination, and status
+exposure.
+
+## Lifecycle flow
 
 ```text
 runtime core                        ReplayableModelEventLoop
@@ -187,12 +198,31 @@ The stop boundary must preserve any completed request state that runtime core st
 The model must not serialize an in-flight GPU job.
 Runtime core and the model executor must agree on a completed batch boundary before `Stop` runs.
 
+The event loop uses this operation order:
+
+```text
+Stop:
+  drain request-slot resets
+  clear_replay_cache
+  unload_state(snapshot path)
+  unload_weights
+
+Start or Batch while stopped:
+  load_weights
+  load_state(snapshot path)
+  remove snapshot
+  drain deferred request-slot resets
+```
+
+Each event-loop instance uses a unique process-local path in the system temporary directory.
+The event loop removes the snapshot after a successful start and when the event loop exits.
+
 ## Failure contract
 
 Snapshot and checkpoint I/O failures are recoverable operation errors.
 Lifecycle misuse is an internal invariant violation.
 
-The final wiring must fail closed after these errors:
+The event-loop wiring fails closed after these errors:
 
 - Snapshot write failure.
 - Snapshot corruption.
@@ -201,8 +231,9 @@ The final wiring must fail closed after these errors:
 - Weight load failure.
 - State load failure.
 
-The failure path must invoke global shutdown or rebuild the full runtime cache generation.
-It must not continue with runtime page IDs that refer to invalid executor state.
+The current failure path invokes global shutdown and does not send a success response.
+Process shutdown discards the full runtime cache generation.
+The service must not continue with runtime page IDs that refer to invalid executor state.
 
 ## Integration verification
 

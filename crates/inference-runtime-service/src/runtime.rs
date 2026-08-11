@@ -1,5 +1,8 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use async_channel::bounded as async_bounded;
 use async_channel::unbounded as async_unbounded;
@@ -307,6 +310,7 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
 ) -> Result<()>
 where
     M: ReplayableModel,
+    M::LifecycleError: std::fmt::Display,
 {
     let shutdown = Shutdown::new();
     let server_tokio_runtime = tokio::runtime::Runtime::new()
@@ -343,6 +347,7 @@ where
         runtime.request_slot_reset_rx(),
         shutdown,
         model,
+        default_model_state_snapshot_path(),
     )
     .with_debug_logging(debug_logging);
     executor.event_loop();
@@ -351,6 +356,16 @@ where
     server_thread
         .join()
         .map_err(|_| log_err_internal!("RPC server thread panicked"))?
+}
+
+fn default_model_state_snapshot_path() -> PathBuf {
+    static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(0);
+
+    let snapshot_id = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "psi-dec-model-state-{}-{snapshot_id}.state",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
