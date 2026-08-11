@@ -38,7 +38,7 @@ impl<Sch> InstrumentedScheduler<Sch> {
 
     pub fn stats_table(&self) -> Table {
         let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
+        table.load_style(UTF8_FULL.with_rounded_corners());
 
         let mut header = vec![Cell::new("scheduler api"), Cell::new("count")];
         header.extend(COLUMNS.iter().map(|(name, _)| Cell::new(*name)));

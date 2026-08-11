@@ -25,7 +25,7 @@ async-stream = "0.3"
 async-trait = "0.1"
 block2 = "0.6"
 clap = "4.6"
-comfy-table = "7.2"
+comfy-table = "8"
 criterion = "0.8"
 crc32fast = "1.5"
 crossbeam-channel = "0.5"
@@ -39,7 +39,7 @@ futures-lite = "2.6"
 futures-util = "0.3"
 half = "2.7"
 hdrhistogram = "7.6"
-hf-chat-template = "=0.2.1"
+hf-chat-template = "1.0"
 inference-backend-metal = { path = "crates/inference-backend-metal" }
 inference-executor-core = { path = "crates/inference-executor-core" }
 inference-executor-metal = { path = "crates/inference-executor-metal" }
