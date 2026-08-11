@@ -48,16 +48,20 @@ document that owns the component.
 
 ## Pipeline Parallelism
 
+- Fill all free compute slots while runnable work exists. The event loop currently calls `do_flush()` at most once for
+  each received event. It must call `do_flush()` until `Scheduler::can_flush()` is false. `can_flush()` must stop the
+  loop when no compute slot is free. This behavior fills the pipeline when `max_compute_slots` equals the pipeline
+  stage count. Implement this loop with the PP>1 request lifecycle.
 - Define per-request in-flight readiness for overlapping Prefill and Decode batches. A response for an earlier batch
   must not make a request runnable when a later request-local Decode is still in flight. Cover Prefill-to-Prefill and
   Prefill-to-Decode sequences with `max_compute_slots > 1`.
+- Add a `FIFOBatcher` regression test for an unused sticky token budget. Cover an ID-map-only request whose later
+  Decode remains in flight. Verify that the unused map entry does not block the next runnable FIFO request.
 - Audit the Trie Decode fallback `token_index` after an overlapping MTP Prefill. The current no-ready-token path uses
   `num_cached_tokens()`. It must account for the preceding scheduled range before runtime commit.
-- Add a bounded final-response reorder buffer for the scheduler and runtime core.
-  The buffer holds completed future sequences.
-  It releases only the next compute-slot sequence to FIFO commit.
-  Cover the case where `n + 1` arrives before `n`.
-  Do not weaken the FIFO contract or requeue pending requests.
+- Enforce request-local FIFO commit and LIFO cancellation before either operation changes scheduler state.
+- Preserve strict compute-sequence FIFO order across compute slots, batch requests, and batch responses. Validate the
+  response sequence directly. Treat an out-of-order response as a contract violation. Do not add a reorder buffer.
 - Define a model-agnostic `PipelineStageResult` transport envelope.
   The envelope carries compute sequence, stage, request-slot identity, and model-specific stage payload.
   The Qwen payload must preserve ragged hidden-state row association.
@@ -72,6 +76,23 @@ document that owns the component.
   It must commit the transaction before the final response returns to runtime core.
 - Permit multiple batches to overlap only after each stage uses bounded, sequence-ordered pending transactions.
   Transport, commit notification, and in-flight cache-publish ownership preserve the same per-request causal order.
+
+## Confidence-aware Scheduling
+
+Complete the PP>1 request lifecycle before the following work:
+
+- Add shadow telemetry for proposal position, confidence bin, selected prefix length, validation result, request, and
+  model. Use this data to verify that confidence values are calibrated and comparable across requests.
+- Add a runtime-owned `ConfidenceCalibration` component. Keep the identity transform until shadow telemetry supports a
+  different calibration. Do not add an absolute confidence threshold before this gate passes.
+- Add a measured cost estimator to the token-budget allocator. Include request-side fixed cost, Main rows, padding,
+  replay bucket changes, validated-token transitions, and new-request admission. Use measured latency and throughput
+  data. Do not guess a threshold.
+- Add page-feasibility feedback to the planning pass. Keep page capacity separate from token-budget capacity.
+- Add end-to-end verification for mixed Prefill and Decode requests, request-local proposal-prefix trimming, the
+  proposal token/probability/confidence length invariant, visible-token limits, and PP pipeline fill and drain.
+- Keep each executor proposal run fixed at its configured `num_spec_tokens` until these follow-up items are complete.
+  Use [`token_budget_allocator.md`](token_budget_allocator.md) for the current policy and open decisions.
 
 ## Prefill
 
@@ -155,11 +176,6 @@ component path as the design.
   cache lane. Add a Main-only warm-up phase that creates enough verified history before it enables MTP. The runtime
   core must own the mode transition and cache-lane initialization. Do not use placeholder tokens or partially
   initialized cache lanes.
-- Calibrate and evaluate confidence-aware verification scheduling.
-  The runtime scheduler currently ranks request-local proposal candidates and selects the next Main verification prefix.
-  Keep each executor proposal run fixed at its configured `num_spec_tokens`.
-  Add shadow telemetry before a policy uses an absolute confidence threshold or a measured cost decision.
-  Use [`token_budget_allocator.md`](token_budget_allocator.md) for the current policy and open decisions.
 - Investigate strict one-row and multi-row Qwen3 Main numerical parity.
   The 2026-07-29 greedy acceptance audit found one deterministic output divergence in four prompts.
   At the first divergence, sparse rejection accepted zero draft tokens.
