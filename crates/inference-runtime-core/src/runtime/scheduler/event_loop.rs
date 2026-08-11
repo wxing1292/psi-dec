@@ -10,6 +10,8 @@ use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
+use crate::compute::ReplayableModelExecutorRequest;
+use crate::compute::ReplayableModelExecutorResponse;
 use crate::log_err_internal;
 use crate::runtime::RequestSlot;
 use crate::runtime::RequestSlotAllocationResult;
@@ -21,8 +23,8 @@ use crate::runtime::scheduler::UserRequest;
 pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
     user_req_rx: Receiver<QueuedReq>,
     swap_in_task_rx: Receiver<UserReq>,
-    batch_dev_req_tx: Sender<BatchDeviceReq>,
-    batch_dev_resp_rx: Receiver<BatchDeviceResp>,
+    model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
+    model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
 
     scheduler: InstrumentedScheduler<S>,
     request_slot_allocator: RequestSlotAllocator,
@@ -46,8 +48,8 @@ where
     pub fn new(
         user_req_rx: Receiver<QueuedReq>,
         swap_in_task_rx: Receiver<UserReq>,
-        batch_dev_req_tx: Sender<BatchDeviceReq>,
-        batch_dev_resp_rx: Receiver<BatchDeviceResp>,
+        model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
+        model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
         scheduler: InstrumentedScheduler<S>,
         request_slot_allocator: RequestSlotAllocator,
         shutdown: Shutdown,
@@ -55,8 +57,8 @@ where
         Self {
             user_req_rx,
             swap_in_task_rx,
-            batch_dev_req_tx,
-            batch_dev_resp_rx,
+            model_executor_req_tx,
+            model_executor_resp_rx,
 
             scheduler,
             request_slot_allocator,
@@ -77,7 +79,7 @@ where
         'event_loop: while !self.shutdown.is_shutdown() {
             let mut select = Select::new();
             let op_shutdown = select.recv(&shutdown_rx);
-            let op_recv_batch_dev_resp = select.recv(&self.batch_dev_resp_rx);
+            let op_recv_model_executor_resp = select.recv(&self.model_executor_resp_rx);
             let op_recv_swap_in_task = select.recv(&self.swap_in_task_rx);
             let op_recv_req = if self.request_slot_allocator.free() > 0 {
                 Some(select.recv(&self.user_req_rx))
@@ -92,19 +94,25 @@ where
                     tracing::info!("received shutdown signal, stopping");
                     break 'event_loop;
                 },
-                _ if op_index == op_recv_batch_dev_resp => {
-                    let batch_dev_resp = op.recv(&self.batch_dev_resp_rx);
-                    match batch_dev_resp {
-                        Ok(batch_dev_resp) => {
+                _ if op_index == op_recv_model_executor_resp => {
+                    let model_executor_resp = op.recv(&self.model_executor_resp_rx);
+                    match model_executor_resp {
+                        Ok(ReplayableModelExecutorResponse::Batch(batch_dev_resp)) => {
                             self.scheduler.commit(batch_dev_resp);
                             if self.scheduler.can_flush()
-                                && do_flush(&mut self.scheduler, &self.batch_dev_req_tx).is_err()
+                                && do_flush(&mut self.scheduler, &self.model_executor_req_tx).is_err()
                             {
                                 break 'event_loop;
                             }
                         },
+                        Ok(ReplayableModelExecutorResponse::Started) => {
+                            panic!("runtime event loop received Started without issuing Start")
+                        },
+                        Ok(ReplayableModelExecutorResponse::Stopped) => {
+                            panic!("runtime event loop received Stopped without issuing Stop")
+                        },
                         Err(_) => {
-                            tracing::debug!("batch device response channel closed, stopping");
+                            tracing::debug!("model executor response channel closed, stopping");
                             break 'event_loop;
                         },
                     }
@@ -132,7 +140,8 @@ where
                     }
                     // TODO: drain both ready request receivers before flushing
                     // so swap-in priority does not depend on Select order.
-                    if self.scheduler.can_flush() && do_flush(&mut self.scheduler, &self.batch_dev_req_tx).is_err() {
+                    if self.scheduler.can_flush() && do_flush(&mut self.scheduler, &self.model_executor_req_tx).is_err()
+                    {
                         break 'event_loop;
                     }
                 },
@@ -150,7 +159,7 @@ where
                             user_req.store_running();
                             self.scheduler.enqueue(user_req);
                             if self.scheduler.can_flush()
-                                && do_flush(&mut self.scheduler, &self.batch_dev_req_tx).is_err()
+                                && do_flush(&mut self.scheduler, &self.model_executor_req_tx).is_err()
                             {
                                 break 'event_loop;
                             }
@@ -174,7 +183,7 @@ where
 
 fn do_flush<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>(
     scheduler: &mut S,
-    batch_dev_req_tx: &Sender<BatchDeviceReq>,
+    model_executor_req_tx: &Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
 ) -> Result<()>
 where
     UserReq: UserRequest<DeviceReq, DeviceResp>,
@@ -185,10 +194,12 @@ where
     S: Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
 {
     let batch_dev_req = scheduler.prepare();
-    match batch_dev_req_tx.try_send(batch_dev_req) {
+    match model_executor_req_tx.try_send(ReplayableModelExecutorRequest::Batch(batch_dev_req)) {
         Ok(()) => Ok(()),
         Err(err) => {
-            let batch_dev_req = err.into_inner();
+            let ReplayableModelExecutorRequest::Batch(batch_dev_req) = err.into_inner() else {
+                unreachable!("runtime scheduler only sends Batch model executor requests")
+            };
             scheduler.cancel(batch_dev_req);
             Err(log_err_internal!(
                 "batch device request channel full / closed, stopping"

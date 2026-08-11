@@ -335,6 +335,19 @@ object. Use them together only when they operate on clearly different objects.
 
 ## Executor notification contract
 
+Runtime core and the model executor use one ordered request-response protocol:
+
+```text
+Batch(request) -> Batch(response)
+Start          -> Started
+Stop           -> Stopped
+```
+
+The current runtime event loop wraps each prepared device batch in `Batch` and unwraps its matching `Batch` response.
+It does not send `Start` or `Stop` yet.
+It treats an unsolicited `Started` or `Stopped` response as an internal contract violation.
+Runtime state tracking and idle-stop policy are separate work.
+
 Recommendation: Send core-owned lifecycle changes from core to the executor:
 
 ```text

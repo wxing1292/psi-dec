@@ -12,9 +12,9 @@ use inference_runtime_core::Result;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::channel::ShutdownGuard;
-use inference_runtime_core::compute::BatchDeviceRequest;
-use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::ReplayableModel;
+use inference_runtime_core::compute::ReplayableModelExecutorRequest;
+use inference_runtime_core::compute::ReplayableModelExecutorResponse;
 use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::config::SamplingConfig;
 use inference_runtime_core::config::SchedulerConfig;
@@ -61,8 +61,8 @@ pub struct InferenceRuntime<const N: usize, const L: usize, const P: usize> {
     block_cache: Arc<RuntimeBlockCache<P, L>>,
 
     user_req_tx: Sender<RuntimeQueuedRequest<N, P, L>>,
-    batch_dev_req_rx: Receiver<BatchDeviceRequest>,
-    batch_dev_resp_tx: Sender<BatchDeviceResponse>,
+    model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
+    model_executor_resp_tx: Sender<ReplayableModelExecutorResponse>,
     request_slot_reset_notifier: Arc<DedupNotifier<RawRequestSlot>>,
     request_slot_reset_rx: Receiver<()>,
 }
@@ -142,8 +142,8 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         };
 
         let (user_req_tx, user_req_rx) = sync_bounded(model_runtime_config.max_queued_requests);
-        let (batch_dev_req_tx, batch_dev_req_rx) = sync_bounded(scheduler_config.max_compute_slots);
-        let (batch_dev_resp_tx, batch_dev_resp_rx) = sync_bounded(scheduler_config.max_compute_slots);
+        let (model_executor_req_tx, model_executor_req_rx) = sync_bounded(scheduler_config.max_compute_slots);
+        let (model_executor_resp_tx, model_executor_resp_rx) = sync_bounded(scheduler_config.max_compute_slots);
         let (swap_out_task_tx, swap_out_task_rx) = async_bounded(model_runtime_config.max_running_requests);
         let (swap_in_task_tx, swap_in_task_rx) =
             sync_bounded::<RuntimeRequest<N, P, L>>(model_runtime_config.max_running_requests);
@@ -162,8 +162,8 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             let event_loop = EventLoop::new(
                 user_req_rx,
                 swap_in_task_rx,
-                batch_dev_req_tx,
-                batch_dev_resp_rx,
+                model_executor_req_tx,
+                model_executor_resp_rx,
                 scheduler,
                 req_slot_allocator,
                 shutdown.clone(),
@@ -201,8 +201,8 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             block_cache,
 
             user_req_tx,
-            batch_dev_req_rx,
-            batch_dev_resp_tx,
+            model_executor_req_rx,
+            model_executor_resp_tx,
             request_slot_reset_notifier,
             request_slot_reset_rx,
         }
@@ -268,12 +268,12 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         }
     }
 
-    pub fn batch_device_request_rx(&self) -> Receiver<BatchDeviceRequest> {
-        self.batch_dev_req_rx.clone()
+    pub fn model_executor_request_rx(&self) -> Receiver<ReplayableModelExecutorRequest> {
+        self.model_executor_req_rx.clone()
     }
 
-    pub fn batch_device_response_tx(&self) -> Sender<BatchDeviceResponse> {
-        self.batch_dev_resp_tx.clone()
+    pub fn model_executor_response_tx(&self) -> Sender<ReplayableModelExecutorResponse> {
+        self.model_executor_resp_tx.clone()
     }
 
     pub fn request_slot_reset_notifier(&self) -> Arc<DedupNotifier<RawRequestSlot>> {
@@ -337,8 +337,8 @@ where
         .map_err(|error| log_err_unavailable!("unable to start RPC server thread: {error}"))?;
 
     let executor = ReplayableModelEventLoop::new(
-        runtime.batch_device_request_rx(),
-        runtime.batch_device_response_tx(),
+        runtime.model_executor_request_rx(),
+        runtime.model_executor_response_tx(),
         runtime.request_slot_reset_notifier(),
         runtime.request_slot_reset_rx(),
         shutdown,

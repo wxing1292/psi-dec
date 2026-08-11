@@ -13,6 +13,8 @@ use inference_runtime_core::compute::DeviceResponse;
 use inference_runtime_core::compute::ExecutionSubmission;
 use inference_runtime_core::compute::QueryTokens;
 use inference_runtime_core::compute::ReplayableModel;
+use inference_runtime_core::compute::ReplayableModelExecutorRequest;
+use inference_runtime_core::compute::ReplayableModelExecutorResponse;
 use inference_runtime_core::compute::SampledTokens;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -24,8 +26,8 @@ use crate::profiling;
 use crate::telemetry::emit_executor_batch_perf_metrics;
 
 pub struct ReplayableModelEventLoop<M> {
-    batch_dev_req_rx: Receiver<BatchDeviceRequest>,
-    batch_dev_resp_tx: Sender<BatchDeviceResponse>,
+    model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
+    model_executor_resp_tx: Sender<ReplayableModelExecutorResponse>,
     req_slot_reset_notifier: Arc<DedupNotifier<RawRequestSlot>>,
     req_slot_reset_rx: Receiver<()>,
     shutdown: Shutdown,
@@ -38,16 +40,16 @@ where
     M: ReplayableModel,
 {
     pub fn new(
-        batch_dev_req_rx: Receiver<BatchDeviceRequest>,
-        batch_dev_resp_tx: Sender<BatchDeviceResponse>,
+        model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
+        model_executor_resp_tx: Sender<ReplayableModelExecutorResponse>,
         req_slot_reset_notifier: Arc<DedupNotifier<RawRequestSlot>>,
         req_slot_reset_rx: Receiver<()>,
         shutdown: Shutdown,
         model: M,
     ) -> Self {
         Self {
-            batch_dev_req_rx,
-            batch_dev_resp_tx,
+            model_executor_req_rx,
+            model_executor_resp_tx,
             req_slot_reset_notifier,
             req_slot_reset_rx,
             shutdown,
@@ -71,7 +73,7 @@ where
             let mut select = Select::new();
             let op_shutdown = select.recv(&shutdown_rx);
             let op_recv_req_slot_reset = select.recv(&self.req_slot_reset_rx);
-            let op_recv_batch_dev_req = select.recv(&self.batch_dev_req_rx);
+            let op_recv_model_executor_req = select.recv(&self.model_executor_req_rx);
 
             let op = select.select();
             let op_index = op.index();
@@ -90,18 +92,27 @@ where
                         },
                     }
                 },
-                _ if op_index == op_recv_batch_dev_req => {
-                    match op.recv(&self.batch_dev_req_rx) {
-                        Ok(batch_dev_req) => {
+                _ if op_index == op_recv_model_executor_req => {
+                    match op.recv(&self.model_executor_req_rx) {
+                        Ok(ReplayableModelExecutorRequest::Batch(batch_dev_req)) => {
                             self.reset_req_slots();
                             let batch_dev_resp = self.execute(batch_dev_req);
-                            if let Err(err) = self.batch_dev_resp_tx.send(batch_dev_resp) {
-                                tracing::info!("unable to send batch device response, err: {err}, stopping");
+                            if let Err(err) = self
+                                .model_executor_resp_tx
+                                .send(ReplayableModelExecutorResponse::Batch(batch_dev_resp))
+                            {
+                                tracing::info!("unable to send model executor response, err: {err}, stopping");
                                 break 'event_loop;
                             }
                         },
+                        Ok(ReplayableModelExecutorRequest::Start) => {
+                            panic!("model executor Start is not wired")
+                        },
+                        Ok(ReplayableModelExecutorRequest::Stop) => {
+                            panic!("model executor Stop is not wired")
+                        },
                         Err(_) => {
-                            tracing::info!("batch device request channel closed, stopping");
+                            tracing::info!("model executor request channel closed, stopping");
                             break 'event_loop;
                         },
                     }
@@ -525,14 +536,14 @@ mod tests {
 
     #[test]
     fn test_request_slot_resets() {
-        let (_batch_dev_req_tx, batch_dev_req_rx) = bounded(1);
-        let (batch_dev_resp_tx, _batch_dev_resp_rx) = bounded(1);
+        let (_model_executor_req_tx, model_executor_req_rx) = bounded(1);
+        let (model_executor_resp_tx, _model_executor_resp_rx) = bounded(1);
         let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
         let (seen_reset_tx, seen_reset_rx) = bounded(1);
         let shutdown = Shutdown::new();
         let executor = ReplayableModelEventLoop::new(
-            batch_dev_req_rx,
-            batch_dev_resp_tx,
+            model_executor_req_rx,
+            model_executor_resp_tx,
             req_slot_reset_notifier.clone(),
             req_slot_reset_rx,
             shutdown.clone(),
