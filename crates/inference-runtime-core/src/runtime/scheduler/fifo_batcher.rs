@@ -71,10 +71,9 @@ where
             let token_estimate = match sticky_token_budgets.get(&req_id).copied() {
                 Some(token_budget) => token_budget,
                 None => {
-                    assert!(
-                        sticky_token_budgets.is_empty(),
-                        "fifo request reached batcher before all sticky token budgets were consumed"
-                    );
+                    // With PP > 1, a final Prefill can commit while a later Decode for the same request remains in
+                    // flight. The request then stays in the ID map without a run-queue entry, so its sticky token
+                    // budget remains unused.
                     user_req
                         .token_estimate()
                         .token_consumption(min(max_token_per_req, token_budget))
