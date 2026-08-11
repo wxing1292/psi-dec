@@ -22,11 +22,15 @@ use crate::model::state_snapshot::StateSnapshotWriter;
 
 pub struct UngatedDSparkGQAState {
     compute: GQACompute,
-    block_scratch: Rc<DSparkBlockScratch>,
-    context_scratch: Rc<DSparkGQAContextScratch>,
+    block_scratch: Option<Rc<DSparkBlockScratch>>,
+    context_scratch: Option<Rc<DSparkGQAContextScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
+    metadata: Option<DSparkGQAMetadataBuffers>,
+    core: UngatedDSparkGQACore,
+    compute_config: GQAComputeConfig,
+    capacity: DSparkGQACapacity,
+    max_context_tokens: usize,
     page_table_layout: GQAPageTableLayout,
-    metadata: DSparkGQAMetadataBuffers,
     num_tokens_per_page: usize,
     num_cache_pages: usize,
     cache_lane: usize,
@@ -66,21 +70,25 @@ impl UngatedDSparkGQAState {
         let num_tokens_per_page = compute_config.num_tokens_per_page() as usize;
         Self {
             compute,
-            block_scratch: Rc::new(DSparkBlockScratch::new(
+            block_scratch: Some(Rc::new(DSparkBlockScratch::new(
                 device,
                 &core,
                 compute_config.io_dtype,
                 gqa_capacity,
-            )),
-            context_scratch: Rc::new(DSparkGQAContextScratch::new(
+            ))),
+            context_scratch: Some(Rc::new(DSparkGQAContextScratch::new(
                 device,
                 &core,
                 compute_config.io_dtype,
                 max_context_tokens,
-            )),
+            ))),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
+            metadata: Some(DSparkGQAMetadataBuffers::new(device, gqa_capacity)),
+            core,
+            compute_config,
+            capacity: gqa_capacity,
+            max_context_tokens,
             page_table_layout,
-            metadata: DSparkGQAMetadataBuffers::new(device, gqa_capacity),
             num_tokens_per_page,
             num_cache_pages,
             cache_lane,
@@ -97,7 +105,7 @@ impl UngatedDSparkGQAState {
             .try_into()
             .expect("DSpark GQA token count must fit u32");
         let compute_path = self.compute.select(num_tokens, num_tokens);
-        self.metadata.update(block, compute_path)
+        self.metadata().update(block, compute_path)
     }
 
     pub fn prepare_page_span(
@@ -120,11 +128,19 @@ impl UngatedDSparkGQAState {
     }
 
     pub fn block_scratch(&self) -> Rc<DSparkBlockScratch> {
-        Rc::clone(&self.block_scratch)
+        Rc::clone(
+            self.block_scratch
+                .as_ref()
+                .expect("DSpark GQA block scratch state must be loaded"),
+        )
     }
 
     pub fn context_scratch(&self) -> Rc<DSparkGQAContextScratch> {
-        Rc::clone(&self.context_scratch)
+        Rc::clone(
+            self.context_scratch
+                .as_ref()
+                .expect("DSpark GQA context scratch state must be loaded"),
+        )
     }
 
     pub fn request_page_table(&self) -> Rc<GQARequestPageTable> {
@@ -132,25 +148,53 @@ impl UngatedDSparkGQAState {
     }
 
     pub fn metadata(&self) -> &DSparkGQAMetadataBuffers {
-        &self.metadata
+        self.metadata
+            .as_ref()
+            .expect("DSpark GQA metadata state must be loaded")
     }
 
     pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
         self.request_page_table_ref().write_full_state(writer, resource)
     }
 
-    pub fn unload_state(&mut self) {
+    pub fn release_resources(&mut self) {
+        assert!(
+            self.block_scratch.is_some()
+                && self.context_scratch.is_some()
+                && self.request_page_table.is_some()
+                && self.metadata.is_some(),
+            "DSpark GQA state resources are not loaded"
+        );
         self.request_page_table
             .take()
             .expect("DSpark GQA request page-table state must be loaded");
+        self.metadata.take();
+        self.context_scratch.take();
+        self.block_scratch.take();
     }
 
-    pub fn load_state(&mut self, device: &Device) {
+    pub fn allocate_resources(&mut self, device: &Device) {
         assert!(
-            self.request_page_table.is_none(),
-            "DSpark GQA request page-table state is already loaded"
+            self.block_scratch.is_none()
+                && self.context_scratch.is_none()
+                && self.request_page_table.is_none()
+                && self.metadata.is_none(),
+            "DSpark GQA state resources are already loaded"
         );
+        self.block_scratch = Some(Rc::new(DSparkBlockScratch::new(
+            device,
+            &self.core,
+            self.compute_config.io_dtype,
+            self.capacity,
+        )));
+        self.context_scratch = Some(Rc::new(DSparkGQAContextScratch::new(
+            device,
+            &self.core,
+            self.compute_config.io_dtype,
+            self.max_context_tokens,
+        )));
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
+        self.metadata = Some(DSparkGQAMetadataBuffers::new(device, self.capacity));
     }
 
     pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {

@@ -22,11 +22,14 @@ use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
 
 pub struct Qwen3xGQAState {
-    backend: Rc<GQA>,
-    scratch: Rc<GQAScratch>,
+    backend: Option<Rc<GQA>>,
+    scratch: Option<Rc<GQAScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
+    metadata: Option<GQAMetadataBuffers>,
+    core: GQACore,
+    metal: GQAMetalConfig,
     page_table_layout: GQAPageTableLayout,
-    metadata: GQAMetadataBuffers,
+    max_tokens: usize,
     replay_bucket_policy: GQAReplayBucketPolicy,
     num_cache_pages: usize,
     cache_lane: usize,
@@ -49,16 +52,19 @@ impl Qwen3xGQAState {
             "qwen3.x cache page IDs must fit u32"
         );
         page_table_layout.validate();
-        let backend = Rc::new(GQA::new(device, core, metal));
+        let backend = Rc::new(GQA::new(device, core.clone(), metal));
         let scratch = Rc::new(backend.new_scratch(max_tokens));
         let max_tokens_u32 = max_tokens.try_into().expect("qwen3.x GQA token capacity must fit u32");
         let replay_bucket_policy = backend.replay_bucket_policy(max_tokens_u32);
         Self {
-            backend,
-            scratch,
+            backend: Some(backend),
+            scratch: Some(scratch),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
+            metadata: Some(GQAMetadataBuffers::new(device, max_tokens)),
+            core,
+            metal,
             page_table_layout,
-            metadata: GQAMetadataBuffers::new(device, max_tokens),
+            max_tokens,
             replay_bucket_policy,
             num_cache_pages,
             cache_lane,
@@ -66,11 +72,11 @@ impl Qwen3xGQAState {
     }
 
     pub fn backend(&self) -> &Rc<GQA> {
-        &self.backend
+        self.backend.as_ref().expect("Qwen3.x GQA backend state must be loaded")
     }
 
     pub fn scratch(&self) -> &Rc<GQAScratch> {
-        &self.scratch
+        self.scratch.as_ref().expect("Qwen3.x GQA scratch state must be loaded")
     }
 
     pub fn request_page_table(&self) -> &Rc<GQARequestPageTable> {
@@ -80,7 +86,9 @@ impl Qwen3xGQAState {
     }
 
     pub fn metadata(&self) -> &GQAMetadataBuffers {
-        &self.metadata
+        self.metadata
+            .as_ref()
+            .expect("Qwen3.x GQA metadata state must be loaded")
     }
 
     pub fn prepare_pages(&self, core_batch: &BatchDeviceRequest) {
@@ -104,8 +112,8 @@ impl Qwen3xGQAState {
     }
 
     pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
-        self.backend
-            .prepare(&self.metadata, req_slots, token_indices, cu_tokens)
+        self.backend()
+            .prepare(self.metadata(), req_slots, token_indices, cu_tokens)
     }
 
     pub fn prepare_metadata_bucketed(
@@ -114,8 +122,8 @@ impl Qwen3xGQAState {
         token_indices: &[u32],
         cu_tokens: &[u32],
     ) -> GQAReplayShape {
-        self.backend.prepare_bucketed(
-            &self.metadata,
+        self.backend().prepare_bucketed(
+            self.metadata(),
             req_slots,
             token_indices,
             cu_tokens,
@@ -130,8 +138,8 @@ impl Qwen3xGQAState {
         cu_tokens: &[u32],
         total_tokens: u32,
     ) -> GQAReplayShape {
-        self.backend.prepare_bucketed_with_token_capacity(
-            &self.metadata,
+        self.backend().prepare_bucketed_with_token_capacity(
+            self.metadata(),
             req_slots,
             token_indices,
             cu_tokens,
@@ -141,19 +149,19 @@ impl Qwen3xGQAState {
     }
 
     pub fn replay_token_topology_boundaries(&self) -> Box<[u32]> {
-        self.backend.replay_token_topology_boundaries()
+        self.backend().replay_token_topology_boundaries()
     }
 
     pub fn replay_topology(&self) -> GQAReplayTopology {
-        self.backend.replay_topology(&self.metadata)
+        self.backend().replay_topology(self.metadata())
     }
 
     pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
-        add_gqa_replay_arguments(self.metadata.replay_shape(), self.replay_topology(), arguments);
+        add_gqa_replay_arguments(self.metadata().replay_shape(), self.replay_topology(), arguments);
     }
 
     pub fn add_private_replay_arguments(&self, arguments: &mut ReplayArguments) {
-        add_gqa_private_replay_arguments(self.metadata.replay_shape(), self.replay_topology(), arguments);
+        add_gqa_private_replay_arguments(self.metadata().replay_shape(), self.replay_topology(), arguments);
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {
@@ -164,21 +172,189 @@ impl Qwen3xGQAState {
         self.request_page_table().write_full_state(writer, resource)
     }
 
-    pub fn unload_state(&mut self) {
+    pub fn release_resources(&mut self) {
+        assert!(
+            self.backend.is_some()
+                && self.scratch.is_some()
+                && self.request_page_table.is_some()
+                && self.metadata.is_some(),
+            "Qwen3.x GQA state resources are not loaded"
+        );
         self.request_page_table
             .take()
             .expect("Qwen3.x GQA request page-table state must be loaded");
+        self.metadata.take();
+        self.scratch.take();
+        self.backend.take();
     }
 
-    pub fn load_state(&mut self, device: &Device) {
+    pub fn allocate_resources(&mut self, device: &Device) {
         assert!(
-            self.request_page_table.is_none(),
-            "Qwen3.x GQA request page-table state is already loaded"
+            self.backend.is_none()
+                && self.scratch.is_none()
+                && self.request_page_table.is_none()
+                && self.metadata.is_none(),
+            "Qwen3.x GQA state resources are already loaded"
         );
+        let backend = Rc::new(GQA::new(device, self.core.clone(), self.metal));
+        let scratch = Rc::new(backend.new_scratch(self.max_tokens));
+        self.backend = Some(backend);
+        self.scratch = Some(scratch);
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
+        self.metadata = Some(GQAMetadataBuffers::new(device, self.max_tokens));
     }
 
     pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
         self.request_page_table().read_full_state(reader, resource)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use inference_backend_metal::metal::Device;
+    use inference_backend_metal::metal::Dtype;
+    use inference_executor_core::attn::GQACore;
+    use inference_executor_core::attn::GQAPageTableLayout;
+
+    use super::Qwen3xGQAState;
+    use crate::attn::gqa::backend::GQAMetalConfig;
+    use crate::model::state_snapshot::ModelFingerprint;
+    use crate::model::state_snapshot::StateSnapshotReader;
+    use crate::model::state_snapshot::StateSnapshotWriter;
+
+    const NUM_REQ_SLOTS: usize = 2;
+    const NUM_GQA_LAYERS: usize = 2;
+    const NUM_BLOCKS: usize = 2;
+    const NUM_PAGE_IDS_PER_BLOCK: usize = 2;
+    const NUM_CACHE_PAGES: u32 = 64;
+    const STATE_RESOURCE: u32 = 1;
+
+    #[test]
+    fn test_unload_load_fixed_state() {
+        assert_unload_load("fixed", vec![1, 7, 11, 29, 31, 63, 4, 19, 2, 8, 12, 30, 32, 62, 5, 20]);
+    }
+
+    #[test]
+    fn test_unload_load_random_state() {
+        let mut random = TestRandom::new(0x4751_415f_5354_4154);
+        let page_ids = (0..num_page_ids())
+            .map(|_| random.next_u32() % NUM_CACHE_PAGES)
+            .collect();
+        assert_unload_load("random", page_ids);
+    }
+
+    fn assert_unload_load(name: &str, expected_page_ids: Vec<u32>) {
+        assert_eq!(expected_page_ids.len(), num_page_ids());
+        assert!(expected_page_ids.iter().all(|&page_id| page_id < NUM_CACHE_PAGES));
+
+        let device = Device::system_default();
+        let mut state = new_state(&device);
+        write_page_ids(&state, &expected_page_ids);
+
+        let snapshot_path = snapshot_path(name);
+        let fingerprint = ModelFingerprint::new([0x47; 16]);
+        let mut writer = StateSnapshotWriter::new(&snapshot_path, fingerprint).unwrap();
+        state.write_full_state(&mut writer, STATE_RESOURCE).unwrap();
+        writer.commit().unwrap();
+
+        state.release_resources();
+        state.allocate_resources(&device);
+
+        let mut reader = StateSnapshotReader::open(&snapshot_path, fingerprint).unwrap();
+        state.read_full_state(&mut reader, STATE_RESOURCE).unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(read_page_ids(&state), expected_page_ids);
+        std::fs::remove_file(snapshot_path).unwrap();
+    }
+
+    fn new_state(device: &Device) -> Qwen3xGQAState {
+        Qwen3xGQAState::new(
+            device,
+            GQACore::new(0, 128, 128, 1, 1, 1.0),
+            GQAMetalConfig {
+                group_size: 32,
+                bits: 4,
+                page_bytes: 4096,
+                rope_dim: 128,
+                norm_eps: 1.0e-6,
+                rope_theta: 1_000_000.0,
+                rope_scale: 1.0,
+                io_dtype: Dtype::Bfloat16,
+            },
+            GQAPageTableLayout {
+                num_req_slots: NUM_REQ_SLOTS as u32,
+                num_gqa_layers: NUM_GQA_LAYERS as u32,
+                num_blocks: NUM_BLOCKS as u32,
+                num_page_ids_per_block: NUM_PAGE_IDS_PER_BLOCK as u32,
+            },
+            2,
+            NUM_CACHE_PAGES as usize,
+            0,
+        )
+    }
+
+    fn write_page_ids(state: &Qwen3xGQAState, page_ids: &[u32]) {
+        let (entries, remainder) = page_ids.as_chunks::<NUM_PAGE_IDS_PER_BLOCK>();
+        assert!(remainder.is_empty());
+        let mut entries = entries.iter();
+        for req_slot in 0..NUM_REQ_SLOTS as u32 {
+            for layer_index in 0..NUM_GQA_LAYERS {
+                for block_index in 0..NUM_BLOCKS {
+                    state.request_page_table().write_page_ids(
+                        req_slot,
+                        layer_index,
+                        block_index,
+                        entries.next().unwrap(),
+                    );
+                }
+            }
+        }
+        assert!(entries.next().is_none());
+    }
+
+    fn read_page_ids(state: &Qwen3xGQAState) -> Vec<u32> {
+        let mut page_ids = Vec::with_capacity(num_page_ids());
+        for req_slot in 0..NUM_REQ_SLOTS as u32 {
+            for layer_index in 0..NUM_GQA_LAYERS {
+                for block_index in 0..NUM_BLOCKS {
+                    page_ids.extend(
+                        state
+                            .request_page_table()
+                            .read_page_ids(req_slot, layer_index, block_index),
+                    );
+                }
+            }
+        }
+        page_ids
+    }
+
+    fn num_page_ids() -> usize {
+        NUM_REQ_SLOTS * NUM_GQA_LAYERS * NUM_BLOCKS * NUM_PAGE_IDS_PER_BLOCK
+    }
+
+    fn snapshot_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "psi-dec-gqa-state-unload-load-{}-{name}.state",
+            std::process::id()
+        ))
+    }
+
+    struct TestRandom(u64);
+
+    impl TestRandom {
+        fn new(seed: u64) -> Self {
+            assert_ne!(seed, 0);
+            Self(seed)
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 as u32
+        }
     }
 }

@@ -6,6 +6,7 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedInput;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::replay::ReplayComponent;
 
 pub struct Qwen3xDSparkEmbed {
@@ -34,9 +35,12 @@ impl Qwen3xDSparkEmbed {
         self.embed = Some(embed);
     }
 
-    pub fn unload_weights(&mut self) {
-        assert!(self.embed.is_some(), "Qwen3.x DSpark embed weights are not loaded");
-        self.embed.take();
+    pub fn unload_weights(&mut self) -> Rc<Embed> {
+        self.embed.take().expect("Qwen3.x DSpark embed weights are not loaded")
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.embed().hash_weights(hasher, prefix);
     }
 
     fn embed(&self) -> &Embed {

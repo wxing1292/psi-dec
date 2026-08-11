@@ -28,6 +28,7 @@ use crate::def::replay_op::ReplayOp;
 use crate::model::qwen::v3_x::layer::Qwen3xUngatedGQAWeightBuffers;
 use crate::model::qwen::v3_x::weight::resolve_uniform_quantization;
 use crate::model::qwen::v3_x::weight::to_u32;
+use crate::model::residency_digest::ModelResidencyHasher;
 
 pub struct Qwen3xDSparkAttention {
     dspark_layer_index: u32,
@@ -88,6 +89,10 @@ impl Qwen3xDSparkAttention {
             "Qwen3.x DSpark attention weights are not loaded"
         );
         self.weights.take();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.weights().hash(hasher, prefix);
     }
 
     pub fn unload_state(&mut self) {

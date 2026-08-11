@@ -33,6 +33,7 @@ use crate::model::qwen::v3::executor::Qwen3DSparkSpeculator;
 use crate::model::qwen::v3::executor::Qwen3Executor;
 use crate::model::qwen::v3::executor::Qwen3PendingTransactions;
 use crate::model::qwen::v3::executor::Qwen3Speculator;
+use crate::model::qwen::v3::executor::Qwen3WeightSource;
 use crate::model::qwen::v3::executor::compact_target_distribution_indices;
 use crate::model::qwen::v3::executor::num_page_ids_per_block;
 use crate::model::qwen::v3::main::Qwen3Main;
@@ -438,8 +439,19 @@ fn init_qwen_3_model_inner(
     let num_runtime_page_ids_per_block = num_main_page_ids_per_block
         .checked_add(num_dspark_page_ids_per_block)
         .expect("Qwen3 runtime page IDs per block must fit usize");
+    let weight_source = match &init_mode {
+        Qwen3InitMode::Vanilla => Qwen3WeightSource::Vanilla,
+        Qwen3InitMode::DSpark { model_dir, config, .. } => {
+            Qwen3WeightSource::DSpark {
+                model_dir: model_dir.to_path_buf(),
+                config: config.clone(),
+            }
+        },
+    };
     Ok(Qwen3Executor {
         model_name: "qwen3".to_string(),
+        model_dir: model_dir.to_path_buf(),
+        weight_source,
         model_config,
         default_stop_sequences,
         config,
@@ -471,5 +483,7 @@ fn init_qwen_3_model_inner(
         gqa_page_table_layout,
         num_runtime_page_ids_per_block,
         state_fingerprint: crate::model::state_snapshot::ModelFingerprint::for_process_instance("qwen3"),
+        unloaded_embed: None,
+        unloaded_unembed: None,
     })
 }

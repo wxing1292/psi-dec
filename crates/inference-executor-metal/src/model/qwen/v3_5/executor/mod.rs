@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
@@ -16,6 +17,7 @@ use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35DecodeDecision;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelBatchRequest;
+use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::Qwen35PendingTransactions;
 use inference_executor_core::model::qwen::v3_5::Qwen35SampledTokens;
 use inference_executor_core::model::qwen::v3_5::gather_flat_indices;
@@ -24,6 +26,11 @@ use inference_executor_core::model::qwen::v3_5::sample_decisions_from_sampled_to
 use inference_executor_core::model::qwen::v3_5::sample_sampler_configs;
 use inference_executor_core::model::qwen::v3_5::sample_token_positions;
 use inference_executor_core::model::qwen::v3_5::to_core_batch_resp;
+use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MTPWeightBindings;
+use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35ModelWeightBindings;
+use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_model_weight_bindings;
+use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_mtp_weight_bindings;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::sampling::RequestSamplingState;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
@@ -39,9 +46,12 @@ use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
 
+use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::def::replay_op::ReplayRecorder;
+use crate::model::embedding::Embed;
+use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::v3_5::main::Qwen35Main;
 use crate::model::qwen::v3_5::main::Qwen35MainArgs;
@@ -58,15 +68,19 @@ use crate::model::qwen::v3_5::mtp::Qwen35MTPReplayKey;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedArgs;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedReplayKey;
+use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkRecording;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
+use crate::model::residency_digest::ModelResidencyDigest;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::state_snapshot::ModelFingerprint;
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
+use crate::model::unembedding::Unembed;
 use crate::replay::Replay;
 use crate::sampling::rejection_replay::PreparedRejection;
 use crate::sampling::rejection_replay::RejectionReplayKey;
@@ -104,12 +118,26 @@ const QWEN35_STATE_MAIN_GQA_TABLE: u32 = 2;
 const QWEN35_STATE_MAIN_GDN_RECURRENT: u32 = 3;
 const QWEN35_STATE_MAIN_GDN_CONV: u32 = 4;
 const QWEN35_STATE_SPEC_GQA_TABLE: u32 = 5;
+const QWEN35_STATE_MAIN_GDN_REQUEST_TABLE: u32 = 6;
 
 #[allow(clippy::upper_case_acronyms)]
 enum Qwen35Speculator {
     Vanilla,
     MTP(Box<Qwen35MTPSpeculator>),
     DSpark(Box<Qwen35DSparkSpeculator>),
+}
+
+#[allow(clippy::upper_case_acronyms)]
+enum Qwen35WeightSource {
+    Vanilla,
+    MTP {
+        model_dir: PathBuf,
+        config: Box<Qwen35ModelConfig>,
+    },
+    DSpark {
+        model_dir: PathBuf,
+        config: Box<Qwen3xDSparkConfig>,
+    },
 }
 
 struct Qwen35SpeculativeResources {
@@ -271,6 +299,73 @@ impl Qwen35Speculator {
         }
     }
 
+    fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        match self {
+            Self::Vanilla => {},
+            Self::MTP(mtp) => {
+                mtp.embed
+                    .component()
+                    .hash_weights(hasher, &format!("{prefix}.mtp.embed"));
+                mtp.body.component().hash_weights(hasher, &format!("{prefix}.mtp.body"));
+            },
+            Self::DSpark(dspark) => dspark.execution.hash_weights(hasher, &format!("{prefix}.dspark")),
+        }
+    }
+
+    fn unload_weights(&mut self) {
+        match self {
+            Self::Vanilla => {},
+            Self::MTP(mtp) => {
+                mtp.body.component_mut().unload_weights();
+                drop(mtp.embed.component_mut().unload_weights());
+            },
+            Self::DSpark(dspark) => dspark.execution.unload_weights(),
+        }
+    }
+
+    fn load_weights(
+        &mut self,
+        device: &inference_backend_metal::metal::Device,
+        source: &Qwen35WeightSource,
+        main_config: &Qwen35ModelConfig,
+        main_embed: &Rc<Embed>,
+        main_unembed: &Rc<Unembed>,
+    ) -> Result<Option<Rc<dyn MainResidualCapture>>, ModelExecutorError> {
+        match (self, source) {
+            (Self::Vanilla, Qwen35WeightSource::Vanilla) => Ok(None),
+            (Self::MTP(mtp), Qwen35WeightSource::MTP { model_dir, config }) => {
+                let mut store = SafeTensorStore::from_model_dir(model_dir)?;
+                let Qwen35MTPWeightBindings {
+                    embed,
+                    body,
+                    final_norm_weight,
+                } = resolve_qwen35_mtp_weight_bindings(config, store.index().tensor_names())?;
+                mtp.embed
+                    .component_mut()
+                    .load_weights(device, &mut store, config, embed)?;
+                mtp.embed.component_mut().load_shared_weights(Rc::clone(main_embed));
+                mtp.body.component_mut().load_weights(
+                    device,
+                    &mut store,
+                    main_config,
+                    config,
+                    Qwen35MetalDefaults::from_quantization(config.quantization.as_ref())?,
+                    body,
+                    final_norm_weight,
+                )?;
+                Ok(None)
+            },
+            (Self::DSpark(dspark), Qwen35WeightSource::DSpark { model_dir, config }) => {
+                dspark
+                    .execution
+                    .load_weights(device, model_dir, config, main_embed, main_unembed)?;
+                let capture: Rc<dyn MainResidualCapture> = dspark.execution.main_feature_projector();
+                Ok(Some(capture))
+            },
+            _ => panic!("qwen3.5 speculator and weight source must have matching variants"),
+        }
+    }
+
     fn write_full_state(&self, writer: &mut StateSnapshotWriter) -> Result<(), ModelExecutorError> {
         match self {
             Self::Vanilla => Ok(()),
@@ -284,20 +379,35 @@ impl Qwen35Speculator {
             Self::Vanilla => {},
             Self::MTP(mtp) => {
                 mtp.body.component_mut().unload_state();
-                mtp.gqa_state.unload_state();
+                mtp.gqa_state.release_resources();
             },
             Self::DSpark(dspark) => dspark.execution.unload_state(),
         }
     }
 
-    fn load_state(&mut self, device: &inference_backend_metal::metal::Device) {
+    fn allocate_resources(&mut self, device: &inference_backend_metal::metal::Device) {
         match self {
             Self::Vanilla => {},
             Self::MTP(mtp) => {
-                mtp.gqa_state.load_state(device);
-                mtp.body.component_mut().load_state(&mtp.gqa_state);
+                mtp.gqa_state.allocate_resources(device);
             },
-            Self::DSpark(dspark) => dspark.execution.load_state(device),
+            Self::DSpark(dspark) => dspark.execution.allocate_resources(device),
+        }
+    }
+
+    fn release_resources(&mut self) {
+        match self {
+            Self::Vanilla => {},
+            Self::MTP(mtp) => mtp.gqa_state.release_resources(),
+            Self::DSpark(dspark) => dspark.execution.release_resources(),
+        }
+    }
+
+    fn attach_state(&mut self) {
+        match self {
+            Self::Vanilla => {},
+            Self::MTP(mtp) => mtp.body.component_mut().load_state(&mtp.gqa_state),
+            Self::DSpark(dspark) => dspark.execution.attach_state(),
         }
     }
 
@@ -312,6 +422,9 @@ impl Qwen35Speculator {
 
 pub struct Qwen35Executor {
     model_name: String,
+    model_dir: PathBuf,
+    model_config: Qwen35ModelConfig,
+    weight_source: Qwen35WeightSource,
     default_stop_sequences: Vec<Vec<Token>>,
     config: Qwen35ExecutorConfig,
     runtime: MetalRuntime,
@@ -338,10 +451,13 @@ pub struct Qwen35Executor {
     gqa_page_table_layout: GQAPageTableLayout,
     num_runtime_page_ids_per_main_block: usize,
     state_fingerprint: ModelFingerprint,
+    unloaded_embed: Option<Embed>,
+    unloaded_unembed: Option<Unembed>,
 }
 
 impl Qwen35Executor {
     pub fn clear_replay_cache(&mut self) {
+        self.finish_cache_publish();
         self.main_embed.clear();
         self.main.clear();
         self.gather_unembed.clear();
@@ -350,52 +466,139 @@ impl Qwen35Executor {
         self.speculator.clear_replay_cache();
     }
 
-    pub fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+    pub fn unload_weights(&mut self) {
+        let embed = self.main_embed.component_mut().unload_weights();
+        let unembed = self.gather_unembed.component_mut().unload_weights();
+
+        self.main.component_mut().unset_residual_capture();
+        self.speculator.unload_weights();
+        self.main.component_mut().unload_weights();
+
+        let mut unembed = Rc::try_unwrap(unembed)
+            .unwrap_or_else(|_| panic!("qwen3.5 Main unembed must be uniquely owned during weight unloading"));
+        unembed.unload_weights();
+        self.unloaded_unembed = Some(unembed);
+
+        let mut embed = Rc::try_unwrap(embed)
+            .unwrap_or_else(|_| panic!("qwen3.5 Main embed must be uniquely owned during weight unloading"));
+        embed.unload_weights();
+        self.unloaded_embed = Some(embed);
+    }
+
+    pub fn load_weights(&mut self) -> Result<(), ModelExecutorError> {
+        let device = self.runtime.device().clone();
+        let mut store = SafeTensorStore::from_model_dir(&self.model_dir)?;
+        let Qwen35ModelWeightBindings { embed, main, unembed } =
+            resolve_qwen35_model_weight_bindings(&self.model_config, store.index().tensor_names())?;
+        let mut loaded_embed = self
+            .unloaded_embed
+            .take()
+            .expect("qwen3.5 Main embed shell must exist during weight loading");
+        loaded_embed.load_weights(&device, &mut store, embed)?;
+        let loaded_embed = Rc::new(loaded_embed);
+        let mut loaded_unembed = self
+            .unloaded_unembed
+            .take()
+            .expect("qwen3.5 Main unembed shell must exist during weight loading");
+        loaded_unembed.load_weights(&device, &mut store, unembed)?;
+        let loaded_unembed = Rc::new(loaded_unembed);
+        self.main.component_mut().load_weights(
+            &device,
+            &mut store,
+            &self.model_config,
+            Qwen35MetalDefaults::from_quantization(self.model_config.quantization.as_ref())?,
+            main,
+        )?;
+        let residual_capture = self.speculator.load_weights(
+            &device,
+            &self.weight_source,
+            &self.model_config,
+            &loaded_embed,
+            &loaded_unembed,
+        )?;
+        self.main.component_mut().set_residual_capture(residual_capture);
+        self.main_embed.component_mut().load_weights(loaded_embed);
+        self.gather_unembed.component_mut().load_weights(loaded_unembed);
+        Ok(())
+    }
+
+    fn write_full_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+        self.finish_cache_publish();
         assert!(
             self.pending_transactions.is_empty(),
-            "qwen3.5 state unloading requires all pending model transactions to complete"
+            "qwen3.5 state snapshots require all pending model transactions to complete"
         );
         let mut writer = StateSnapshotWriter::new(snapshot_path, self.state_fingerprint)?;
         self.main_gqa_state
             .write_full_state(&mut writer, QWEN35_STATE_MAIN_GQA_TABLE)?;
         self.main_gdn_state.write_full_state(
             &mut writer,
+            QWEN35_STATE_MAIN_GDN_REQUEST_TABLE,
             QWEN35_STATE_MAIN_GDN_RECURRENT,
             QWEN35_STATE_MAIN_GDN_CONV,
         )?;
         self.speculator.write_full_state(&mut writer)?;
         self.pages.write_full_state(&mut writer, QWEN35_STATE_PAGE_ARENA)?;
-        writer.commit()?;
+        writer.commit()
+    }
 
-        self.main.component_mut().unload_state();
+    pub fn residency_digest(&mut self, state_path: &Path) -> Result<ModelResidencyDigest, ModelExecutorError> {
+        self.write_full_state(state_path)?;
+        let mut hasher = ModelResidencyHasher::new();
+        self.main_embed.component().hash_weights(&mut hasher, "main.embed");
+        self.main.component().hash_weights(&mut hasher, "main.body");
+        self.gather_unembed
+            .component()
+            .hash_weights(&mut hasher, "main.unembed");
+        self.speculator.hash_weights(&mut hasher, "speculator");
+        hasher.file("state", state_path)?;
+        Ok(hasher.finish())
+    }
+
+    pub fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+        self.write_full_state(snapshot_path)?;
+
         self.speculator.unload_state();
-        self.main_gqa_state.unload_state();
-        self.main_gdn_state.unload_state();
-        self.pages.unload_state();
+        self.main.component_mut().unload_state();
+        self.main_gqa_state.release_resources();
+        self.main_gdn_state.release_resources();
+        self.pages.release_resources();
         Ok(())
     }
 
     pub fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
         let mut reader = StateSnapshotReader::open(snapshot_path, self.state_fingerprint)?;
         let device = self.runtime.device().clone();
-        self.main_gqa_state.load_state(&device);
-        self.main_gdn_state.load_state(&device);
-        self.speculator.load_state(&device);
-        self.pages.load_state(&device);
+        self.main_gqa_state.allocate_resources(&device);
+        self.main_gdn_state.allocate_resources(&device);
+        self.speculator.allocate_resources(&device);
+        self.pages.allocate_resources(&device);
+
+        let result = (|| {
+            self.main_gqa_state
+                .read_full_state(&mut reader, QWEN35_STATE_MAIN_GQA_TABLE)?;
+            self.main_gdn_state.read_full_state(
+                &mut reader,
+                QWEN35_STATE_MAIN_GDN_REQUEST_TABLE,
+                QWEN35_STATE_MAIN_GDN_RECURRENT,
+                QWEN35_STATE_MAIN_GDN_CONV,
+            )?;
+            self.speculator.read_full_state(&mut reader)?;
+            self.pages.read_full_state(&mut reader, QWEN35_STATE_PAGE_ARENA)?;
+            reader.finish()
+        })();
+        if let Err(error) = result {
+            self.pages.release_resources();
+            self.speculator.release_resources();
+            self.main_gdn_state.release_resources();
+            self.main_gqa_state.release_resources();
+            return Err(error);
+        }
+
         self.main
             .component_mut()
             .load_state(&self.main_gqa_state, &self.main_gdn_state);
-
-        self.main_gqa_state
-            .read_full_state(&mut reader, QWEN35_STATE_MAIN_GQA_TABLE)?;
-        self.main_gdn_state.read_full_state(
-            &mut reader,
-            QWEN35_STATE_MAIN_GDN_RECURRENT,
-            QWEN35_STATE_MAIN_GDN_CONV,
-        )?;
-        self.speculator.read_full_state(&mut reader)?;
-        self.pages.read_full_state(&mut reader, QWEN35_STATE_PAGE_ARENA)?;
-        reader.finish()?;
+        self.speculator.attach_state();
         Ok(())
     }
 }
@@ -495,6 +698,7 @@ impl ReplayableModel for Qwen35Executor {
     type SampledOutput = Qwen35SampledOutput;
     type ModelOpsRecorder = Qwen35ModelOpsRecorder;
     type Submission = MetalReplaySubmission;
+    type LifecycleError = ModelExecutorError;
 
     fn model_name(&self) -> &str {
         &self.model_name
@@ -510,6 +714,26 @@ impl ReplayableModel for Qwen35Executor {
         self.main_gqa_state.reset_req_slots(request_slots);
         self.speculator.reset_req_slots(request_slots);
         self.main_gdn_state.reset_req_slots(request_slots);
+    }
+
+    fn clear_replay_cache(&mut self) {
+        Qwen35Executor::clear_replay_cache(self);
+    }
+
+    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+        Qwen35Executor::unload_state(self, snapshot_path)
+    }
+
+    fn unload_weights(&mut self) {
+        Qwen35Executor::unload_weights(self);
+    }
+
+    fn load_weights(&mut self) -> Result<(), Self::LifecycleError> {
+        Qwen35Executor::load_weights(self)
+    }
+
+    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+        Qwen35Executor::load_state(self, snapshot_path)
     }
 
     fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {

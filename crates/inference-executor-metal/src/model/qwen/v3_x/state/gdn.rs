@@ -31,9 +31,13 @@ use crate::replay::ReplayComponent;
 use crate::trace;
 
 pub struct Qwen3xGDNState {
-    backend: Rc<GDN>,
-    scratch: Rc<GDNScratch>,
-    metadata: GDNMetadataBuffers,
+    backend: Option<Rc<GDN>>,
+    scratch: Option<Rc<GDNScratch>>,
+    metadata: Option<GDNMetadataBuffers>,
+    representative_core: GDNCore,
+    metal: GDNMetalConfig,
+    num_req_slots: usize,
+    max_tokens: usize,
     replay_bucket_policy: GDNReplayBucketPolicy,
     request_state_table: GDNRequestStateTable,
     state_restore: Replay<GDNStateRestore>,
@@ -98,9 +102,13 @@ impl Qwen3xGDNState {
         let max_tokens_u32 = max_tokens.try_into().expect("qwen3.x GDN token capacity must fit u32");
         let replay_bucket_policy = backend.replay_bucket_policy(max_requests, max_tokens_u32);
         Self {
-            backend,
-            scratch: Rc::new(GDNScratch::new(device, representative, max_tokens)),
-            metadata: GDNMetadataBuffers::new(device, num_req_slots, max_tokens),
+            backend: Some(backend),
+            scratch: Some(Rc::new(GDNScratch::new(device, representative, max_tokens))),
+            metadata: Some(GDNMetadataBuffers::new(device, num_req_slots, max_tokens)),
+            representative_core: representative.clone(),
+            metal,
+            num_req_slots,
+            max_tokens,
             replay_bucket_policy,
             request_state_table,
             state_restore: Replay::new("qwen3.x GDN state restore", GDNStateRestore),
@@ -109,11 +117,11 @@ impl Qwen3xGDNState {
     }
 
     pub fn backend(&self) -> &Rc<GDN> {
-        &self.backend
+        self.backend.as_ref().expect("Qwen3.x GDN backend state must be loaded")
     }
 
     pub fn scratch(&self) -> &Rc<GDNScratch> {
-        &self.scratch
+        self.scratch.as_ref().expect("Qwen3.x GDN scratch state must be loaded")
     }
 
     pub fn request_state_resources(&self) -> &Rc<GDNRequestStateResources> {
@@ -121,7 +129,9 @@ impl Qwen3xGDNState {
     }
 
     pub fn metadata(&self) -> &GDNMetadataBuffers {
-        &self.metadata
+        self.metadata
+            .as_ref()
+            .expect("Qwen3.x GDN metadata state must be loaded")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -145,12 +155,12 @@ impl Qwen3xGDNState {
     }
 
     pub fn prepare_metadata(&self, cu_tokens: &[u32], prepared: &GDNPreparedRequestState) -> GDNReplayShape {
-        self.backend.prepare(&self.metadata, cu_tokens, prepared)
+        self.backend().prepare(self.metadata(), cu_tokens, prepared)
     }
 
     pub fn prepare_metadata_bucketed(&self, cu_tokens: &[u32], prepared: &GDNPreparedRequestState) -> GDNReplayShape {
-        self.backend
-            .prepare_bucketed(&self.metadata, cu_tokens, prepared, &self.replay_bucket_policy)
+        self.backend()
+            .prepare_bucketed(self.metadata(), cu_tokens, prepared, &self.replay_bucket_policy)
     }
 
     pub fn prepare_metadata_bucketed_with_token_capacity(
@@ -159,8 +169,8 @@ impl Qwen3xGDNState {
         prepared: &GDNPreparedRequestState,
         total_tokens: u32,
     ) -> GDNReplayShape {
-        self.backend.prepare_bucketed_with_token_capacity(
-            &self.metadata,
+        self.backend().prepare_bucketed_with_token_capacity(
+            self.metadata(),
             cu_tokens,
             prepared,
             &self.replay_bucket_policy,
@@ -169,19 +179,19 @@ impl Qwen3xGDNState {
     }
 
     pub fn replay_token_topology_boundaries(&self) -> Box<[u32]> {
-        self.backend.replay_token_topology_boundaries()
+        self.backend().replay_token_topology_boundaries()
     }
 
     pub fn replay_topology(&self) -> GDNReplayTopology {
-        self.backend.replay_topology(&self.metadata, true)
+        self.backend().replay_topology(self.metadata(), true)
     }
 
     pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
-        add_gdn_replay_arguments(self.metadata.replay_shape(), arguments);
+        add_gdn_replay_arguments(self.metadata().replay_shape(), arguments);
     }
 
     pub fn add_private_replay_arguments(&self, arguments: &mut ReplayArguments) {
-        add_gdn_private_replay_arguments(self.metadata.replay_shape(), arguments);
+        add_gdn_private_replay_arguments(self.metadata().replay_shape(), arguments);
     }
 
     pub fn restore(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer) {
@@ -196,6 +206,7 @@ impl Qwen3xGDNState {
         let (key, cache_hit) = self.state_restore.record(runtime, &input);
         trace::gdn_state(|| format!("event=gdn_restore key={key:?} cache_hit={cache_hit}"));
         runtime.submit_replay(self.state_restore.replay(&key)).wait();
+        self.request_state_table.finish_restore();
     }
 
     pub fn commit(&mut self, runtime: &MetalReplayRuntime<'_>, pages: &Buffer, state_versions: &[u32]) {
@@ -211,10 +222,10 @@ impl Qwen3xGDNState {
     }
 
     pub fn finish_publish(&mut self) {
-        let Some(submission) = self.pending_publish.take() else {
-            return;
-        };
-        submission.wait();
+        if let Some(submission) = self.pending_publish.take() {
+            submission.wait();
+        }
+        self.request_state_table.finish_publish();
     }
 
     pub fn clear_replay_cache(&mut self) {
@@ -228,29 +239,50 @@ impl Qwen3xGDNState {
     pub fn write_full_state(
         &self,
         writer: &mut StateSnapshotWriter,
+        request_table_resource: u32,
         recurrent_resource: u32,
         conv_resource: u32,
     ) -> Result<(), ModelExecutorError> {
         self.request_state_table
-            .write_full_state(writer, recurrent_resource, conv_resource)
+            .write_full_state(writer, request_table_resource, recurrent_resource, conv_resource)
     }
 
-    pub fn unload_state(&mut self) {
-        self.request_state_table.unload_state();
+    pub fn release_resources(&mut self) {
+        assert!(
+            self.backend.is_some() && self.scratch.is_some() && self.metadata.is_some(),
+            "Qwen3.x GDN state resources are not loaded"
+        );
+        self.request_state_table.release_resources();
+        self.metadata.take();
+        self.scratch.take();
+        self.backend.take();
     }
 
-    pub fn load_state(&mut self, device: &Device) {
-        self.request_state_table.load_state(device);
+    pub fn allocate_resources(&mut self, device: &Device) {
+        assert!(
+            self.backend.is_none() && self.scratch.is_none() && self.metadata.is_none(),
+            "Qwen3.x GDN state resources are already loaded"
+        );
+        let backend = Rc::new(GDN::new(device, self.representative_core.clone(), self.metal));
+        self.scratch = Some(Rc::new(GDNScratch::new(
+            device,
+            &self.representative_core,
+            self.max_tokens,
+        )));
+        self.metadata = Some(GDNMetadataBuffers::new(device, self.num_req_slots, self.max_tokens));
+        self.backend = Some(backend);
+        self.request_state_table.allocate_resources(device);
     }
 
     pub fn read_full_state(
-        &self,
+        &mut self,
         reader: &mut StateSnapshotReader,
+        request_table_resource: u32,
         recurrent_resource: u32,
         conv_resource: u32,
     ) -> Result<(), ModelExecutorError> {
         self.request_state_table
-            .read_full_state(reader, recurrent_resource, conv_resource)
+            .read_full_state(reader, request_table_resource, recurrent_resource, conv_resource)
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {

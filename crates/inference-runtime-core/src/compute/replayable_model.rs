@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use crate::compute::BatchDeviceRequest;
@@ -17,6 +18,7 @@ pub trait ReplayableModel {
     type SampledOutput;
     type ModelOpsRecorder;
     type Submission: ExecutionSubmission;
+    type LifecycleError;
 
     fn model_name(&self) -> &str;
 
@@ -25,6 +27,12 @@ pub trait ReplayableModel {
     }
 
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]);
+
+    fn clear_replay_cache(&mut self);
+    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError>;
+    fn unload_weights(&mut self);
+    fn load_weights(&mut self) -> Result<(), Self::LifecycleError>;
+    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError>;
 
     fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest;
     fn commit_batch(

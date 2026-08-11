@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
@@ -9,17 +10,23 @@ use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
+use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::dspark::state::UngatedDSparkGQAState;
+use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
+use crate::model::embedding::Embed;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedArgs;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedReplayKey;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
+use crate::model::qwen::v3_x::dspark::main_feature::Qwen3xDSparkMainFeatureProjector;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBody;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyArgs;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyReplayKey;
@@ -33,8 +40,10 @@ use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedReplayKey
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSampling;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingArgs;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingReplayKey;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
+use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
@@ -49,6 +58,10 @@ pub struct Qwen3xDSparkExecution {
     gather_unembed: Replay<Qwen3xDSparkGatherUnembed>,
     sampling: Replay<Qwen3xDSparkSampling>,
     unloaded_model: Option<Qwen3xDSparkModel>,
+    unloaded_embed: Option<Embed>,
+    unloaded_unembed: Option<Unembed>,
+    embed_uses_main: bool,
+    unembed_uses_main: bool,
     hidden_input: Rc<Buffer>,
     hidden_output: Rc<Buffer>,
     unembed_hidden: Buffer,
@@ -56,6 +69,7 @@ pub struct Qwen3xDSparkExecution {
     page_table_layout: GQAPageTableLayout,
     num_spec_tokens: usize,
     mask_token_id: i32,
+    page_bytes: usize,
 }
 
 pub struct Qwen3xDSparkProposalInput<'a> {
@@ -129,6 +143,10 @@ impl Qwen3xDSparkExecution {
             ),
             sampling: Replay::new("Qwen3x DSpark Sampling", Qwen3xDSparkSampling::new(loaded.markov)),
             unloaded_model: None,
+            unloaded_embed: None,
+            unloaded_unembed: None,
+            embed_uses_main: loaded.embed_uses_main,
+            unembed_uses_main: loaded.unembed_uses_main,
             hidden_input: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
             hidden_output: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
             unembed_hidden: Buffer::new_zeroed(device, hidden_bytes),
@@ -136,6 +154,7 @@ impl Qwen3xDSparkExecution {
             page_table_layout: loaded.page_table_layout,
             num_spec_tokens: loaded.num_spec_tokens,
             mask_token_id: loaded.mask_token_id,
+            page_bytes: loaded.page_bytes,
         }
     }
 
@@ -173,6 +192,141 @@ impl Qwen3xDSparkExecution {
         self.sampling.clear();
     }
 
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        assert!(
+            self.unloaded_model.is_none(),
+            "Qwen3.x DSpark weights can only be hashed while state is loaded"
+        );
+        self.embed.component().hash_weights(hasher, &format!("{prefix}.embed"));
+        self.context
+            .component()
+            .hash_weights(hasher, &format!("{prefix}.model"));
+        self.gather_unembed
+            .component()
+            .hash_weights(hasher, &format!("{prefix}.unembed"));
+        self.sampling
+            .component()
+            .hash_weights(hasher, &format!("{prefix}.sampling"));
+    }
+
+    pub fn unload_weights(&mut self) {
+        self.unloaded_model
+            .as_mut()
+            .expect("Qwen3.x DSpark state must be unloaded before weights")
+            .unload_weights();
+        self.sampling.component_mut().unload_weights();
+
+        let unembed = self.gather_unembed.component_mut().unload_weights();
+        let mut unembed = Rc::try_unwrap(unembed)
+            .unwrap_or_else(|_| panic!("Qwen3.x DSpark unembed must be uniquely owned during weight unloading"));
+        if self.unembed_uses_main {
+            drop(unembed);
+        } else {
+            unembed.unload_weights();
+            self.unloaded_unembed = Some(unembed);
+        }
+
+        let embed = self.embed.component_mut().unload_weights();
+        let mut embed = Rc::try_unwrap(embed)
+            .unwrap_or_else(|_| panic!("Qwen3.x DSpark embed must be uniquely owned during weight unloading"));
+        if self.embed_uses_main {
+            drop(embed);
+        } else {
+            embed.unload_weights();
+            self.unloaded_embed = Some(embed);
+        }
+    }
+
+    pub fn load_weights(
+        &mut self,
+        device: &Device,
+        model_dir: &Path,
+        config: &Qwen3xDSparkConfig,
+        main_embed: &Rc<Embed>,
+        main_unembed: &Rc<Unembed>,
+    ) -> Result<(), ModelExecutorError> {
+        let mut store = SafeTensorStore::from_model_dir(model_dir)?;
+        let Qwen3xDSparkWeightBindings {
+            embed,
+            main_feature,
+            layers,
+            final_norm_weight,
+            unembed,
+            markov,
+            confidence,
+        } = resolve_qwen3x_dspark_weight_bindings(config, store.index().tensor_names())?;
+        let max_block_tokens = self
+            .num_spec_tokens
+            .checked_mul(self.page_table_layout.num_req_slots as usize)
+            .expect("Qwen3.x DSpark block token capacity must fit usize");
+
+        let embed = match embed {
+            Some(bindings) => {
+                let mut embed = self
+                    .unloaded_embed
+                    .take()
+                    .expect("Qwen3.x DSpark dedicated embed shell must exist during weight loading");
+                embed.load_weights(device, &mut store, bindings)?;
+                Rc::new(embed)
+            },
+            None => {
+                Rc::new(
+                    main_embed.with_max_tokens(
+                        max_block_tokens
+                            .try_into()
+                            .expect("Qwen3.x DSpark embed row capacity must fit u32"),
+                    ),
+                )
+            },
+        };
+        let unembed = match unembed {
+            Some(bindings) => {
+                let mut unembed = self
+                    .unloaded_unembed
+                    .take()
+                    .expect("Qwen3.x DSpark dedicated unembed shell must exist during weight loading");
+                unembed.load_weights(device, &mut store, bindings)?;
+                Rc::new(unembed)
+            },
+            None => {
+                Rc::new(
+                    main_unembed.with_max_tokens(
+                        max_block_tokens
+                            .try_into()
+                            .expect("Qwen3.x DSpark unembed row capacity must fit u32"),
+                    ),
+                )
+            },
+        };
+
+        self.unloaded_model
+            .as_mut()
+            .expect("Qwen3.x DSpark state must remain unloaded during weight loading")
+            .load_weights(
+                device,
+                &mut store,
+                config,
+                self.num_spec_tokens,
+                self.page_bytes,
+                &main_feature,
+                layers,
+                final_norm_weight,
+            )?;
+        self.sampling
+            .component_mut()
+            .load_weights(device, &mut store, &markov, &confidence)?;
+        self.embed.component_mut().load_weights(embed);
+        self.gather_unembed.component_mut().load_weights(unembed);
+        Ok(())
+    }
+
+    pub fn main_feature_projector(&self) -> Rc<Qwen3xDSparkMainFeatureProjector> {
+        self.unloaded_model
+            .as_ref()
+            .expect("Qwen3.x DSpark state must be unloaded while restoring Main shared weights")
+            .main_feature_projector()
+    }
+
     pub fn unload_state(&mut self) {
         assert!(
             self.unloaded_model.is_none(),
@@ -189,11 +343,18 @@ impl Qwen3xDSparkExecution {
             .unwrap_or_else(|_| panic!("Qwen3.x DSpark model must be uniquely owned during state unloading"));
         model.unload_state();
         self.unloaded_model = Some(model);
-        self.gqa_state.unload_state();
+        self.gqa_state.release_resources();
     }
 
-    pub fn load_state(&mut self, device: &Device) {
-        self.gqa_state.load_state(device);
+    pub fn allocate_resources(&mut self, device: &Device) {
+        self.gqa_state.allocate_resources(device);
+    }
+
+    pub fn release_resources(&mut self) {
+        self.gqa_state.release_resources();
+    }
+
+    pub fn attach_state(&mut self) {
         let mut model = self
             .unloaded_model
             .take()

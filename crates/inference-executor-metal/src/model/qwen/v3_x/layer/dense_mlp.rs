@@ -25,6 +25,7 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::to_u32;
 use crate::model::qwen::v3_x::weight::validate_len;
+use crate::model::residency_digest::ModelResidencyHasher;
 
 pub struct Qwen3xDenseMLP {
     backend: DenseMLP,
@@ -57,6 +58,10 @@ impl Qwen3xDenseMLP {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "Qwen3.x dense MLP weights are not loaded");
         self.weights.take();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.weights().hash(hasher, prefix);
     }
 
     fn weights(&self) -> &DenseMLPWeightBuffers {
@@ -126,6 +131,15 @@ pub struct DenseMLPWeightBuffers {
 }
 
 impl DenseMLPWeightBuffers {
+    pub fn hash(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        hasher.buffer(&format!("{prefix}.gate_up.weight"), &self.gate_up_weight);
+        hasher.buffer(&format!("{prefix}.gate_up.scales"), &self.gate_up_scales);
+        hasher.buffer(&format!("{prefix}.gate_up.biases"), &self.gate_up_biases);
+        hasher.buffer(&format!("{prefix}.down.weight"), &self.down_weight);
+        hasher.buffer(&format!("{prefix}.down.scales"), &self.down_scales);
+        hasher.buffer(&format!("{prefix}.down.biases"), &self.down_biases);
+    }
+
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,

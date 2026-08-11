@@ -22,6 +22,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::model::qwen::v3_x::layer::Qwen3xUngatedGQAWeightBuffers;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
 
@@ -34,11 +35,14 @@ pub struct Qwen3MainGQA {
 }
 
 pub struct Qwen3MainGQAState {
-    backend: Rc<UngatedGQA>,
-    scratch: Rc<UngatedGQAScratch>,
+    backend: Option<Rc<UngatedGQA>>,
+    scratch: Option<Rc<UngatedGQAScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
+    metadata: Option<GQAMetadataBuffers>,
+    core: UngatedGQACore,
+    metal: GQAMetalConfig,
     page_table_layout: GQAPageTableLayout,
-    metadata: GQAMetadataBuffers,
+    max_tokens: usize,
     num_cache_pages: usize,
     cache_lane: usize,
 }
@@ -48,8 +52,8 @@ impl Qwen3MainGQA {
         Self {
             model_layer_index: core.model_layer_index,
             weights: None,
-            backend: Some(Rc::clone(&state.backend)),
-            scratch: Some(Rc::clone(&state.scratch)),
+            backend: Some(Rc::clone(state.backend())),
+            scratch: Some(Rc::clone(state.scratch())),
             request_page_table: Some(Rc::clone(state.request_page_table())),
         }
     }
@@ -74,6 +78,10 @@ impl Qwen3MainGQA {
         self.weights.take();
     }
 
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.weights().hash(hasher, prefix);
+    }
+
     pub fn unload_state(&mut self) {
         assert!(
             self.backend.is_some() && self.scratch.is_some() && self.request_page_table.is_some(),
@@ -89,8 +97,8 @@ impl Qwen3MainGQA {
             self.backend.is_none() && self.scratch.is_none() && self.request_page_table.is_none(),
             "qwen3 Main GQA state is already loaded"
         );
-        self.backend = Some(Rc::clone(&state.backend));
-        self.scratch = Some(Rc::clone(&state.scratch));
+        self.backend = Some(Rc::clone(state.backend()));
+        self.scratch = Some(Rc::clone(state.scratch()));
         self.request_page_table = Some(Rc::clone(state.request_page_table()));
     }
 
@@ -168,25 +176,42 @@ impl Qwen3MainGQAState {
             "qwen3 Main cache page IDs must fit u32"
         );
         page_table_layout.validate();
-        let backend = Rc::new(UngatedGQA::new(device, core, metal));
+        let backend = Rc::new(UngatedGQA::new(device, core.clone(), metal));
         let scratch = Rc::new(backend.new_scratch(max_tokens));
         Self {
-            backend,
-            scratch,
+            backend: Some(backend),
+            scratch: Some(scratch),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
+            metadata: Some(GQAMetadataBuffers::new(device, max_tokens)),
+            core,
+            metal,
             page_table_layout,
-            metadata: GQAMetadataBuffers::new(device, max_tokens),
+            max_tokens,
             num_cache_pages,
             cache_lane,
         }
     }
 
     pub fn num_tokens_per_page(&self) -> usize {
-        self.backend.num_tokens_per_page() as usize
+        self.backend().num_tokens_per_page() as usize
     }
 
     pub fn metadata(&self) -> &GQAMetadataBuffers {
-        &self.metadata
+        self.metadata
+            .as_ref()
+            .expect("qwen3 Main GQA metadata state must be loaded")
+    }
+
+    fn backend(&self) -> &Rc<UngatedGQA> {
+        self.backend
+            .as_ref()
+            .expect("qwen3 Main GQA backend state must be loaded")
+    }
+
+    fn scratch(&self) -> &Rc<UngatedGQAScratch> {
+        self.scratch
+            .as_ref()
+            .expect("qwen3 Main GQA scratch state must be loaded")
     }
 
     fn request_page_table(&self) -> &Rc<GQARequestPageTable> {
@@ -216,8 +241,8 @@ impl Qwen3MainGQAState {
     }
 
     pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
-        self.backend
-            .prepare(&self.metadata, req_slots, token_indices, cu_tokens)
+        self.backend()
+            .prepare(self.metadata(), req_slots, token_indices, cu_tokens)
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {
@@ -228,18 +253,36 @@ impl Qwen3MainGQAState {
         self.request_page_table().write_full_state(writer, resource)
     }
 
-    pub fn unload_state(&mut self) {
+    pub fn release_resources(&mut self) {
+        assert!(
+            self.backend.is_some()
+                && self.scratch.is_some()
+                && self.request_page_table.is_some()
+                && self.metadata.is_some(),
+            "qwen3 Main GQA state resources are not loaded"
+        );
         self.request_page_table
             .take()
             .expect("qwen3 Main GQA request page-table state must be loaded");
+        self.metadata.take();
+        self.scratch.take();
+        self.backend.take();
     }
 
-    pub fn load_state(&mut self, device: &Device) {
+    pub fn allocate_resources(&mut self, device: &Device) {
         assert!(
-            self.request_page_table.is_none(),
-            "qwen3 Main GQA request page-table state is already loaded"
+            self.backend.is_none()
+                && self.scratch.is_none()
+                && self.request_page_table.is_none()
+                && self.metadata.is_none(),
+            "qwen3 Main GQA state resources are already loaded"
         );
+        let backend = Rc::new(UngatedGQA::new(device, self.core.clone(), self.metal));
+        let scratch = Rc::new(backend.new_scratch(self.max_tokens));
+        self.backend = Some(backend);
+        self.scratch = Some(scratch);
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
+        self.metadata = Some(GQAMetadataBuffers::new(device, self.max_tokens));
     }
 
     pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {

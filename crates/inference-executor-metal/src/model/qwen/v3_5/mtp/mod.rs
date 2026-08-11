@@ -30,6 +30,7 @@ use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPMLPReplayTopology;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
@@ -131,6 +132,11 @@ impl Qwen35MTP {
     pub fn unload_weights(&mut self) {
         self.output_norm.unload_weights();
         self.layer.unload_weights();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.layer.hash_weights(hasher, &format!("{prefix}.layer"));
+        self.output_norm.hash_weights(hasher, &format!("{prefix}.output_norm"));
     }
 
     pub fn unload_state(&mut self) {

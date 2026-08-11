@@ -1,9 +1,14 @@
 use std::collections::VecDeque;
 
+use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_macro::sanity_check;
 
 use crate::trace;
+
+const GDN_REQUEST_SLOTS_MAGIC: [u8; 8] = *b"GDNSLOTS";
+const GDN_REQUEST_SLOTS_VERSION: u32 = 1;
+const GDN_REQUEST_SLOTS_HEADER_BYTES: usize = 24;
 
 #[derive(Clone, Debug)]
 pub struct GDNRequestSlots {
@@ -11,7 +16,7 @@ pub struct GDNRequestSlots {
     current_state_versions: Vec<u32>,
     free_state_slots: VecDeque<u32>,
     txn_state_slots: Vec<Vec<(u32, u32)>>,
-    txn_publish_pages: Vec<Vec<(u32, Vec<u32>)>>,
+    pending_publish_pages: Vec<Vec<(u32, Vec<u32>)>>,
     num_state_slots_per_req: usize,
 }
 
@@ -44,7 +49,7 @@ impl GDNRequestSlots {
             current_state_versions: vec![0; num_req_slots],
             free_state_slots,
             txn_state_slots: vec![Vec::new(); num_req_slots],
-            txn_publish_pages: vec![Vec::new(); num_req_slots],
+            pending_publish_pages: vec![Vec::new(); num_req_slots],
             num_state_slots_per_req,
         };
         #[cfg(debug_assertions)]
@@ -113,16 +118,16 @@ impl GDNRequestSlots {
                 .expect("GDN request state table free state slots exhausted");
             self.txn_state_slots[req_slot_index].push((materialized_state_version, state_slot));
         }
-        self.txn_publish_pages[req_slot_index].retain(|(state_version, _)| *state_version > current_state_version);
+        self.pending_publish_pages[req_slot_index].retain(|(state_version, _)| *state_version > current_state_version);
         for pages in publish_pages {
-            self.set_txn_publish_pages(req_slot_index, pages.state_version, pages.page_ids);
+            self.set_pending_publish_pages(req_slot_index, pages.state_version, pages.page_ids);
         }
         trace::gdn_state(|| {
             format!(
                 "event=gdn_table_begin_txn_done req_slot={} txn_slots={:?} queued_publish_versions={:?} free_slots={}",
                 raw_req_slot,
                 self.txn_state_slots[req_slot_index],
-                self.txn_publish_pages[req_slot_index]
+                self.pending_publish_pages[req_slot_index]
                     .iter()
                     .map(|(state_version, _)| *state_version)
                     .collect::<Vec<_>>(),
@@ -150,7 +155,7 @@ impl GDNRequestSlots {
     }
 
     pub fn txn_publish_state_versions(&self, req_slot: u32) -> impl Iterator<Item = u32> + '_ {
-        self.txn_publish_pages[self.req_slot_index(req_slot)]
+        self.pending_publish_pages[self.req_slot_index(req_slot)]
             .iter()
             .map(|(state_version, _)| *state_version)
     }
@@ -184,7 +189,7 @@ impl GDNRequestSlots {
             .pop_front()
             .expect("GDN request state table reset requires a free state slot");
         self.current_state_versions[req_slot_index] = 0;
-        self.txn_publish_pages[req_slot_index].clear();
+        self.pending_publish_pages[req_slot_index].clear();
     }
 
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
@@ -225,7 +230,7 @@ impl GDNRequestSlots {
             let new_current_state_slot = self.txn_state_slots[req_slot_index][txn_index].1;
             let mut publishes = Vec::new();
             let mut remaining_publish_pages = Vec::new();
-            for (publish_state_version, page_ids) in self.txn_publish_pages[req_slot_index].drain(..) {
+            for (publish_state_version, page_ids) in self.pending_publish_pages[req_slot_index].drain(..) {
                 if publish_state_version <= state_version {
                     let src_state_slot = if publish_state_version == self.current_state_versions[req_slot_index] {
                         self.current_state_slots[req_slot_index]
@@ -246,7 +251,7 @@ impl GDNRequestSlots {
                     remaining_publish_pages.push((publish_state_version, page_ids));
                 }
             }
-            self.txn_publish_pages[req_slot_index] = remaining_publish_pages;
+            self.pending_publish_pages[req_slot_index] = remaining_publish_pages;
             self.free_state_slots
                 .push_back(self.current_state_slots[req_slot_index]);
             for (candidate_state_version, state_slot) in self.txn_state_slots[req_slot_index].drain(..) {
@@ -301,7 +306,7 @@ impl GDNRequestSlots {
         });
         self.current_state_slots[req_slot_index] = dst_state_slot;
         self.current_state_versions[req_slot_index] = state_version;
-        self.txn_publish_pages[req_slot_index]
+        self.pending_publish_pages[req_slot_index]
             .retain(|(publish_state_version, _)| *publish_state_version > state_version);
         GDNStateRestore {
             req_slot,
@@ -309,6 +314,230 @@ impl GDNRequestSlots {
             state_version,
             page_ids,
         }
+    }
+
+    pub fn encode_durable_state(
+        &self,
+        max_pending_publishes_per_req: usize,
+        num_pages_per_state_slot: usize,
+    ) -> Vec<u8> {
+        assert!(
+            self.txn_state_slots.iter().all(Vec::is_empty),
+            "GDN state snapshots require all candidate state transactions to complete"
+        );
+        assert!(
+            self.pending_publish_pages
+                .iter()
+                .all(|pages| pages.len() <= max_pending_publishes_per_req),
+            "GDN pending publish metadata exceeds its configured capacity"
+        );
+        assert!(
+            self.pending_publish_pages
+                .iter()
+                .flatten()
+                .all(|(_, page_ids)| page_ids.len() == num_pages_per_state_slot),
+            "GDN pending publish metadata must contain one complete state-slot page mapping"
+        );
+        #[cfg(debug_assertions)]
+        self.sanity_check();
+
+        let mut bytes = Vec::with_capacity(self.durable_state_bytes());
+        bytes.extend_from_slice(&GDN_REQUEST_SLOTS_MAGIC);
+        push_u32(&mut bytes, GDN_REQUEST_SLOTS_VERSION);
+        push_usize(&mut bytes, self.num_req_slots(), "GDN request-slot count");
+        push_usize(
+            &mut bytes,
+            self.num_state_slots_per_req,
+            "GDN per-request state-slot count",
+        );
+        push_usize(&mut bytes, self.free_state_slots.len(), "GDN free state-slot count");
+        for &state_slot in &self.current_state_slots {
+            push_u32(&mut bytes, state_slot);
+        }
+        for &state_version in &self.current_state_versions {
+            push_u32(&mut bytes, state_version);
+        }
+        for &state_slot in &self.free_state_slots {
+            push_u32(&mut bytes, state_slot);
+        }
+        for pending_pages in &self.pending_publish_pages {
+            push_usize(&mut bytes, pending_pages.len(), "GDN pending publish count");
+            for (state_version, page_ids) in pending_pages {
+                push_u32(&mut bytes, *state_version);
+                push_usize(&mut bytes, page_ids.len(), "GDN pending publish page count");
+                for &page_id in page_ids {
+                    push_u32(&mut bytes, page_id);
+                }
+            }
+        }
+        bytes
+    }
+
+    pub fn decode_durable_state(
+        bytes: &[u8],
+        num_req_slots: usize,
+        num_state_slots_per_req: usize,
+        max_pending_publishes_per_req: usize,
+        num_pages_per_state_slot: usize,
+    ) -> Result<Self, ModelExecutorError> {
+        let mut decoder = GDNRequestSlotsDecoder::new(bytes);
+        decoder.expect_magic()?;
+        decoder.expect_u32(GDN_REQUEST_SLOTS_VERSION, "version")?;
+        decoder.expect_usize(num_req_slots, "request-slot count")?;
+        decoder.expect_usize(num_state_slots_per_req, "per-request state-slot count")?;
+        let num_state_slots = num_req_slots
+            .checked_mul(num_state_slots_per_req)
+            .ok_or_else(|| ModelExecutorError::custom("GDN snapshot state-slot count overflow"))?;
+        let num_free_state_slots = decoder.read_usize("free state-slot count")?;
+        if num_free_state_slots > num_state_slots {
+            return Err(ModelExecutorError::custom(
+                "GDN snapshot free state-slot count exceeds state capacity",
+            ));
+        }
+        let current_state_slots = decoder.read_u32_vec(num_req_slots, "current state slots")?;
+        let current_state_versions = decoder.read_u32_vec(num_req_slots, "current state versions")?;
+        let free_state_slots = decoder.read_u32_vec(num_free_state_slots, "free state slots")?.into();
+        let mut pending_publish_pages = Vec::with_capacity(num_req_slots);
+        for req_slot in 0..num_req_slots {
+            let num_pending = decoder.read_usize("pending publish count")?;
+            if num_pending > max_pending_publishes_per_req {
+                return Err(ModelExecutorError::custom(format!(
+                    "GDN snapshot pending publish count exceeds request capacity: req_slot={req_slot} \
+                     count={num_pending} capacity={max_pending_publishes_per_req}"
+                )));
+            }
+            let mut request_pending = Vec::with_capacity(num_pending);
+            for _ in 0..num_pending {
+                let state_version = decoder.read_u32("pending publish state version")?;
+                let num_page_ids = decoder.read_usize("pending publish page count")?;
+                if num_page_ids != num_pages_per_state_slot {
+                    return Err(ModelExecutorError::custom(format!(
+                        "GDN snapshot pending publish page count mismatch: expected={num_pages_per_state_slot} \
+                         actual={num_page_ids}"
+                    )));
+                }
+                let page_ids = decoder.read_u32_vec(num_page_ids, "pending publish page IDs")?;
+                request_pending.push((state_version, page_ids));
+            }
+            pending_publish_pages.push(request_pending);
+        }
+        decoder.finish()?;
+
+        let table = Self {
+            current_state_slots,
+            current_state_versions,
+            free_state_slots,
+            txn_state_slots: vec![Vec::new(); num_req_slots],
+            pending_publish_pages,
+            num_state_slots_per_req,
+        };
+        table.validate_durable_state(max_pending_publishes_per_req, num_pages_per_state_slot)?;
+        Ok(table)
+    }
+
+    pub fn max_durable_state_bytes(
+        num_req_slots: usize,
+        num_state_slots_per_req: usize,
+        max_pending_publishes_per_req: usize,
+        num_pages_per_state_slot: usize,
+    ) -> usize {
+        let num_state_slots = num_req_slots
+            .checked_mul(num_state_slots_per_req)
+            .expect("GDN snapshot state-slot count must fit usize");
+        let fixed_bytes = GDN_REQUEST_SLOTS_HEADER_BYTES
+            .checked_add(
+                num_req_slots
+                    .checked_mul(8)
+                    .expect("GDN snapshot request metadata must fit usize"),
+            )
+            .and_then(|bytes| bytes.checked_add(num_state_slots.checked_mul(4)?))
+            .and_then(|bytes| bytes.checked_add(num_req_slots.checked_mul(4)?))
+            .expect("GDN snapshot fixed metadata size must fit usize");
+        let pending_entry_bytes = 8usize
+            .checked_add(
+                num_pages_per_state_slot
+                    .checked_mul(4)
+                    .expect("GDN snapshot page metadata must fit usize"),
+            )
+            .expect("GDN snapshot pending metadata size must fit usize");
+        fixed_bytes
+            .checked_add(
+                num_req_slots
+                    .checked_mul(max_pending_publishes_per_req)
+                    .and_then(|entries| entries.checked_mul(pending_entry_bytes))
+                    .expect("GDN snapshot pending metadata capacity must fit usize"),
+            )
+            .expect("GDN snapshot metadata capacity must fit usize")
+    }
+
+    fn durable_state_bytes(&self) -> usize {
+        GDN_REQUEST_SLOTS_HEADER_BYTES
+            + self.current_state_slots.len() * 4
+            + self.current_state_versions.len() * 4
+            + self.free_state_slots.len() * 4
+            + self.pending_publish_pages.len() * 4
+            + self
+                .pending_publish_pages
+                .iter()
+                .flatten()
+                .map(|(_, page_ids)| 8 + page_ids.len() * 4)
+                .sum::<usize>()
+    }
+
+    fn validate_durable_state(
+        &self,
+        max_pending_publishes_per_req: usize,
+        num_pages_per_state_slot: usize,
+    ) -> Result<(), ModelExecutorError> {
+        if self.current_state_slots.len() != self.current_state_versions.len()
+            || self.current_state_slots.len() != self.txn_state_slots.len()
+            || self.current_state_slots.len() != self.pending_publish_pages.len()
+            || self.txn_state_slots.iter().any(|slots| !slots.is_empty())
+        {
+            return Err(ModelExecutorError::custom(
+                "GDN snapshot request-table dimensions are inconsistent",
+            ));
+        }
+        let num_state_slots = self
+            .num_req_slots()
+            .checked_mul(self.num_state_slots_per_req)
+            .ok_or_else(|| ModelExecutorError::custom("GDN snapshot state-slot count overflow"))?;
+        let mut owned = vec![false; num_state_slots];
+        for &state_slot in self.current_state_slots.iter().chain(&self.free_state_slots) {
+            let state_slot = usize::try_from(state_slot)
+                .map_err(|_| ModelExecutorError::custom("GDN snapshot state slot must fit host usize"))?;
+            let is_owned = owned
+                .get_mut(state_slot)
+                .ok_or_else(|| ModelExecutorError::custom("GDN snapshot state slot is out of range"))?;
+            if *is_owned {
+                return Err(ModelExecutorError::custom(
+                    "GDN snapshot state slot has multiple owners",
+                ));
+            }
+            *is_owned = true;
+        }
+        if owned.into_iter().any(|is_owned| !is_owned) {
+            return Err(ModelExecutorError::custom(
+                "GDN snapshot contains an unowned state slot",
+            ));
+        }
+        for (req_slot, pending_pages) in self.pending_publish_pages.iter().enumerate() {
+            if pending_pages.len() > max_pending_publishes_per_req {
+                return Err(ModelExecutorError::custom(
+                    "GDN snapshot pending publish metadata exceeds request capacity",
+                ));
+            }
+            let mut previous_version = self.current_state_versions[req_slot];
+            for (state_version, page_ids) in pending_pages {
+                if *state_version <= previous_version || page_ids.len() != num_pages_per_state_slot {
+                    return Err(ModelExecutorError::custom(
+                        "GDN snapshot pending publish metadata is invalid",
+                    ));
+                }
+                previous_version = *state_version;
+            }
+        }
+        Ok(())
     }
 
     fn req_slot_index(&self, req_slot: u32) -> usize {
@@ -320,12 +549,12 @@ impl GDNRequestSlots {
         req_slot_index
     }
 
-    fn set_txn_publish_pages(&mut self, req_slot: usize, state_version: u32, page_ids: Vec<u32>) {
+    fn set_pending_publish_pages(&mut self, req_slot: usize, state_version: u32, page_ids: Vec<u32>) {
         assert!(
             state_version > self.current_state_versions[req_slot],
             "GDN txn publish pages must target a future state_version"
         );
-        let publish_pages = &mut self.txn_publish_pages[req_slot];
+        let publish_pages = &mut self.pending_publish_pages[req_slot];
         match publish_pages.binary_search_by_key(&state_version, |(publish_state_version, _)| *publish_state_version) {
             Ok(index) => publish_pages[index].1 = page_ids,
             Err(index) => publish_pages.insert(index, (state_version, page_ids)),
@@ -335,7 +564,7 @@ impl GDNRequestSlots {
     fn sanity_check(&self) {
         debug_assert_eq!(self.current_state_slots.len(), self.current_state_versions.len());
         debug_assert_eq!(self.current_state_slots.len(), self.txn_state_slots.len());
-        debug_assert_eq!(self.current_state_slots.len(), self.txn_publish_pages.len());
+        debug_assert_eq!(self.current_state_slots.len(), self.pending_publish_pages.len());
         let num_state_slots = self
             .num_req_slots()
             .checked_mul(self.num_state_slots_per_req)
@@ -375,7 +604,7 @@ impl GDNRequestSlots {
                 claim(state_slot, "candidate");
             }
             let mut previous_publish_version = current_version;
-            for (state_version, _) in &self.txn_publish_pages[req_slot] {
+            for (state_version, _) in &self.pending_publish_pages[req_slot] {
                 debug_assert!(
                     *state_version > previous_publish_version,
                     "GDN publish state versions must be unique, future, and increasing"
@@ -384,6 +613,96 @@ impl GDNRequestSlots {
             }
         }
         debug_assert!(owned.into_iter().all(|is_owned| is_owned), "GDN state slot is unowned");
+    }
+}
+
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_usize(bytes: &mut Vec<u8>, value: usize, field: &str) {
+    let value = u32::try_from(value).unwrap_or_else(|_| panic!("{field} must fit u32"));
+    push_u32(bytes, value);
+}
+
+struct GDNRequestSlotsDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> GDNRequestSlotsDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn expect_magic(&mut self) -> Result<(), ModelExecutorError> {
+        let magic = self.read_exact(GDN_REQUEST_SLOTS_MAGIC.len(), "magic")?;
+        if magic != GDN_REQUEST_SLOTS_MAGIC {
+            return Err(ModelExecutorError::custom("GDN request-state snapshot magic mismatch"));
+        }
+        Ok(())
+    }
+
+    fn expect_u32(&mut self, expected: u32, field: &str) -> Result<(), ModelExecutorError> {
+        let actual = self.read_u32(field)?;
+        if actual != expected {
+            return Err(ModelExecutorError::custom(format!(
+                "GDN request-state snapshot {field} mismatch: expected={expected} actual={actual}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn expect_usize(&mut self, expected: usize, field: &str) -> Result<(), ModelExecutorError> {
+        let actual = self.read_usize(field)?;
+        if actual != expected {
+            return Err(ModelExecutorError::custom(format!(
+                "GDN request-state snapshot {field} mismatch: expected={expected} actual={actual}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32, ModelExecutorError> {
+        let bytes = self.read_exact(4, field)?;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("GDN snapshot u32 width must match"),
+        ))
+    }
+
+    fn read_usize(&mut self, field: &str) -> Result<usize, ModelExecutorError> {
+        usize::try_from(self.read_u32(field)?)
+            .map_err(|_| ModelExecutorError::custom(format!("GDN request-state snapshot {field} must fit usize")))
+    }
+
+    fn read_u32_vec(&mut self, len: usize, field: &str) -> Result<Vec<u32>, ModelExecutorError> {
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(self.read_u32(field)?);
+        }
+        Ok(values)
+    }
+
+    fn read_exact(&mut self, len: usize, field: &str) -> Result<&'a [u8], ModelExecutorError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| ModelExecutorError::custom("GDN request-state snapshot offset overflow"))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| ModelExecutorError::custom(format!("GDN request-state snapshot {field} is truncated")))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn finish(self) -> Result<(), ModelExecutorError> {
+        if self.offset != self.bytes.len() {
+            return Err(ModelExecutorError::custom(
+                "GDN request-state snapshot contains trailing bytes",
+            ));
+        }
+        Ok(())
     }
 }
 

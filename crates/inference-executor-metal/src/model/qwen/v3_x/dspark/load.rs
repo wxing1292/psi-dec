@@ -44,6 +44,9 @@ pub struct Qwen3xDSparkLoaded {
     pub markov: Qwen3xDSparkMarkov,
     pub num_spec_tokens: usize,
     pub mask_token_id: i32,
+    pub page_bytes: usize,
+    pub embed_uses_main: bool,
+    pub unembed_uses_main: bool,
 }
 
 pub fn load_qwen3x_dspark(
@@ -105,6 +108,7 @@ pub fn load_qwen3x_dspark(
         .as_ref()
         .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark Metal executor requires quantization config"))?;
     let max_block_tokens = capacity.max_tokens;
+    let embed_uses_main = embed_bindings.is_none();
     let embed = if let Some(embed_bindings) = embed_bindings {
         let resolved = quantization.resolve_for_tensor(&embed_bindings.weight);
         let embed_config = EmbedConfig {
@@ -136,6 +140,7 @@ pub fn load_qwen3x_dspark(
             ),
         )
     };
+    let unembed_uses_main = unembed_bindings.is_none();
     let unembed = if let Some(unembed_bindings) = unembed_bindings {
         let resolved = quantization.resolve_for_tensor(&unembed_bindings.weight);
         let unembed_config = UnembedConfig {
@@ -211,6 +216,9 @@ pub fn load_qwen3x_dspark(
             .mask_token_id
             .try_into()
             .map_err(|_| ModelExecutorError::custom("Qwen3x DSpark MASK token ID must fit i32"))?,
+        page_bytes: load_config.page_size_bytes,
+        embed_uses_main,
+        unembed_uses_main,
     })
 }
 

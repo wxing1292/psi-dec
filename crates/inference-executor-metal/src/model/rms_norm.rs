@@ -9,6 +9,7 @@ use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::backend::recorder::Recorder;
 
 use crate::def::replay_op::ReplayOp;
+use crate::model::residency_digest::ModelResidencyHasher;
 
 pub struct RMSNorm {
     weight: Option<Buffer>,
@@ -34,6 +35,10 @@ impl RMSNorm {
     pub fn unload_weights(&mut self) {
         assert!(self.weight.is_some(), "RMS norm weights are not loaded");
         self.weight.take();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, name: &str) {
+        hasher.buffer(name, self.weight());
     }
 
     fn weight(&self) -> &Buffer {

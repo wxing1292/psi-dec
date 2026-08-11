@@ -18,6 +18,7 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::rms_norm::RMSNorm;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +258,17 @@ impl Qwen3xDSparkMainFeatureProjector {
         );
         self.weights.take();
         self.hidden_norm.unload_weights();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.hidden_norm.hash_weights(hasher, &format!("{prefix}.hidden_norm"));
+        let weights = self
+            .weights
+            .as_ref()
+            .expect("Qwen3.x DSpark Main-feature weights must be loaded before hashing");
+        hasher.buffer(&format!("{prefix}.fc.weight"), &weights.fc_weight);
+        hasher.buffer(&format!("{prefix}.fc.scales"), &weights.fc_scales);
+        hasher.buffer(&format!("{prefix}.fc.biases"), &weights.fc_biases);
     }
 
     pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {

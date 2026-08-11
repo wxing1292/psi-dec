@@ -39,6 +39,7 @@ use crate::model::qwen::v3_5::executor::Qwen35MTPExecution;
 use crate::model::qwen::v3_5::executor::Qwen35MTPSpeculator;
 use crate::model::qwen::v3_5::executor::Qwen35SpeculativeResources;
 use crate::model::qwen::v3_5::executor::Qwen35Speculator;
+use crate::model::qwen::v3_5::executor::Qwen35WeightSource;
 use crate::model::qwen::v3_5::executor::num_page_ids_per_block;
 use crate::model::qwen::v3_5::main::Qwen35Main;
 use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbed;
@@ -363,6 +364,21 @@ fn init_qwen_3_5_model_inner(
     config: Qwen35ExecutorConfig,
 ) -> Result<Qwen35Executor, ModelExecutorError> {
     config.validate();
+    let weight_source = match &init_mode {
+        Qwen35InitMode::Vanilla => Qwen35WeightSource::Vanilla,
+        Qwen35InitMode::MTP { model_dir, config, .. } => {
+            Qwen35WeightSource::MTP {
+                model_dir: model_dir.to_path_buf(),
+                config: config.clone(),
+            }
+        },
+        Qwen35InitMode::DSpark { model_dir, config, .. } => {
+            Qwen35WeightSource::DSpark {
+                model_dir: model_dir.to_path_buf(),
+                config: config.clone(),
+            }
+        },
+    };
     if let Qwen35InitMode::MTP { num_spec_tokens, .. } = &init_mode {
         assert!(
             config.max_tokens_per_request >= num_spec_tokens.get(),
@@ -790,7 +806,10 @@ fn init_qwen_3_5_model_inner(
         .expect("qwen3.5 runtime page IDs per Main block must fit usize");
     let pages = PageArena::new(&device, config.num_cache_pages, QWEN35_PAGE_SIZE_BYTES);
     let model = Qwen35Executor {
-        model_name: model_config.model_type,
+        model_name: model_config.model_type.clone(),
+        model_dir: model_dir.to_path_buf(),
+        model_config,
+        weight_source,
         default_stop_sequences,
         config,
         runtime,
@@ -822,6 +841,8 @@ fn init_qwen_3_5_model_inner(
         gqa_page_table_layout,
         num_runtime_page_ids_per_main_block,
         state_fingerprint: crate::model::state_snapshot::ModelFingerprint::for_process_instance("qwen3.5"),
+        unloaded_embed: None,
+        unloaded_unembed: None,
     };
     Ok(model)
 }

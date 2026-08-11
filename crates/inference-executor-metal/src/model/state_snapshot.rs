@@ -181,6 +181,62 @@ impl StateSnapshotWriter {
         Ok(())
     }
 
+    pub fn write_bytes(&mut self, resource: u32, bytes: &[u8]) -> Result<(), ModelExecutorError> {
+        if resource == 0 || bytes.is_empty() {
+            return Err(ModelExecutorError::custom(
+                "model state snapshot resources and byte payloads must not be empty",
+            ));
+        }
+        if self.resources.contains(&resource) {
+            return Err(ModelExecutorError::custom(format!(
+                "model state snapshot resource was written twice: resource={resource}"
+            )));
+        }
+
+        let payload_bytes = u64::try_from(bytes.len())
+            .map_err(|_| ModelExecutorError::custom("model state byte payload length must fit u64"))?;
+        let file = self
+            .file
+            .as_mut()
+            .expect("model state snapshot writer file must exist before commit");
+        let section_header_offset = file.stream_position().map_err(|error| {
+            ModelExecutorError::custom(format!(
+                "unable to inspect temporary model state snapshot {:?}: {error}",
+                self.temp_path
+            ))
+        })?;
+        file.write_all(&[0; SECTION_HEADER_BYTES as usize]).map_err(|error| {
+            ModelExecutorError::custom(format!(
+                "unable to reserve model state section header in {:?}: {error}",
+                self.temp_path
+            ))
+        })?;
+        file.write_all(bytes).map_err(|error| {
+            ModelExecutorError::custom(format!(
+                "unable to write model state resource {resource} to {:?}: {error}",
+                self.temp_path
+            ))
+        })?;
+        let payload_end = file.stream_position().map_err(|error| {
+            ModelExecutorError::custom(format!(
+                "unable to inspect temporary model state snapshot {:?}: {error}",
+                self.temp_path
+            ))
+        })?;
+        let header = section_header(resource, payload_bytes, crc32fast::hash(bytes));
+        file.seek(SeekFrom::Start(section_header_offset))
+            .and_then(|_| file.write_all(&header))
+            .and_then(|_| file.seek(SeekFrom::Start(payload_end)))
+            .map_err(|error| {
+                ModelExecutorError::custom(format!(
+                    "unable to finalize model state resource {resource} in {:?}: {error}",
+                    self.temp_path
+                ))
+            })?;
+        self.resources.push(resource);
+        Ok(())
+    }
+
     pub fn commit(mut self) -> Result<(), ModelExecutorError> {
         let section_count = u64::try_from(self.resources.len())
             .map_err(|_| ModelExecutorError::custom("model state section count must fit u64"))?;
@@ -357,6 +413,41 @@ impl StateSnapshotReader {
         }
         self.consumed[section_index] = true;
         Ok(())
+    }
+
+    pub fn read_bytes(&mut self, resource: u32, max_bytes: usize) -> Result<Vec<u8>, ModelExecutorError> {
+        let section_index = self
+            .sections
+            .binary_search_by_key(&resource, |section| section.resource)
+            .ok()
+            .ok_or_else(|| {
+                ModelExecutorError::custom(format!("model state snapshot resource is missing: resource={resource}"))
+            })?;
+        if self.consumed[section_index] {
+            return Err(ModelExecutorError::custom(format!(
+                "model state snapshot resource was read twice: resource={resource}"
+            )));
+        }
+        let section = self.sections[section_index];
+        let payload_bytes = usize::try_from(section.payload_bytes)
+            .map_err(|_| ModelExecutorError::custom("model state byte payload length must fit host usize"))?;
+        if payload_bytes > max_bytes {
+            return Err(ModelExecutorError::custom(format!(
+                "model state snapshot byte resource exceeds its limit: resource={resource} limit={max_bytes} \
+                 actual={payload_bytes}"
+            )));
+        }
+        self.file
+            .seek(SeekFrom::Start(section.payload_offset))
+            .map_err(|error| {
+                ModelExecutorError::custom(format!("unable to seek to model state resource {resource}: {error}"))
+            })?;
+        let mut bytes = vec![0; payload_bytes];
+        self.file.read_exact(&mut bytes).map_err(|error| {
+            ModelExecutorError::custom(format!("unable to read model state resource {resource}: {error}"))
+        })?;
+        self.consumed[section_index] = true;
+        Ok(bytes)
     }
 
     pub fn finish(self) -> Result<(), ModelExecutorError> {

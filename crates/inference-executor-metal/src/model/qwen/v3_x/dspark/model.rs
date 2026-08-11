@@ -21,11 +21,12 @@ use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerInput;
 use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerScratch;
 use crate::model::qwen::v3_x::dspark::main_feature::Qwen3xDSparkMainFeatureProjector;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
 pub struct Qwen3xDSparkModel {
-    main_feature_projector: Rc<Qwen3xDSparkMainFeatureProjector>,
+    main_feature_projector: Option<Rc<Qwen3xDSparkMainFeatureProjector>>,
     layers: Vec<Qwen3xDSparkLayer>,
     final_norm: RMSNorm,
 }
@@ -118,7 +119,7 @@ impl Qwen3xDSparkModel {
             )?);
         }
         Ok(Self {
-            main_feature_projector,
+            main_feature_projector: Some(main_feature_projector),
             layers,
             final_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps),
         })
@@ -136,9 +137,15 @@ impl Qwen3xDSparkModel {
         layer_bindings: Vec<Qwen3xDSparkLayerWeightBindings>,
         final_norm_weight: String,
     ) -> Result<(), ModelExecutorError> {
-        let projector = Rc::get_mut(&mut self.main_feature_projector)
-            .expect("DSpark Main-feature projector must be uniquely owned during weight loading");
-        projector.load_weights(device, store, config, main_feature_bindings)?;
+        let projector = self
+            .main_feature_projector
+            .take()
+            .expect("DSpark Main-feature projector shell must exist during weight loading");
+        let mut projector = Rc::try_unwrap(projector)
+            .unwrap_or_else(|_| panic!("DSpark Main-feature projector must be uniquely owned during weight loading"));
+        let load_result = projector.load_weights(device, store, config, main_feature_bindings);
+        self.main_feature_projector = Some(Rc::new(projector));
+        load_result?;
         assert_eq!(
             self.layers.len(),
             layer_bindings.len(),
@@ -166,9 +173,23 @@ impl Qwen3xDSparkModel {
         for layer in self.layers.iter_mut().rev() {
             layer.unload_weights();
         }
-        Rc::get_mut(&mut self.main_feature_projector)
-            .expect("DSpark Main-feature projector must be uniquely owned during weight unloading")
-            .unload_weights();
+        let projector = self
+            .main_feature_projector
+            .take()
+            .expect("DSpark Main-feature projector must exist during weight unloading");
+        let mut projector = Rc::try_unwrap(projector)
+            .unwrap_or_else(|_| panic!("DSpark Main-feature projector must be uniquely owned during weight unloading"));
+        projector.unload_weights();
+        self.main_feature_projector = Some(Rc::new(projector));
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.main_feature_projector()
+            .hash_weights(hasher, &format!("{prefix}.main_feature"));
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            layer.hash_weights(hasher, &format!("{prefix}.layers.{layer_index}"));
+        }
+        self.final_norm.hash_weights(hasher, &format!("{prefix}.final_norm"));
     }
 
     pub fn unload_state(&mut self) {
@@ -184,14 +205,22 @@ impl Qwen3xDSparkModel {
     }
 
     pub fn main_feature_projector(&self) -> Rc<Qwen3xDSparkMainFeatureProjector> {
-        Rc::clone(&self.main_feature_projector)
+        Rc::clone(
+            self.main_feature_projector
+                .as_ref()
+                .expect("DSpark Main-feature projector shell must exist"),
+        )
     }
 
     fn record_context<'a, R>(&'a self, recorder: &mut R, args: Qwen3xDSparkContextArgs<'a>)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let main_feature = self.main_feature_projector.record(recorder, args.num_tokens);
+        let main_feature = self
+            .main_feature_projector
+            .as_ref()
+            .expect("DSpark Main-feature projector shell must exist")
+            .record(recorder, args.num_tokens);
         for layer in &self.layers {
             layer.record_context(
                 recorder,
@@ -251,6 +280,10 @@ impl Qwen3xDSparkContext {
         self.model
             .as_deref()
             .expect("Qwen3.x DSpark context model state must be loaded before execution")
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.model().hash_weights(hasher, prefix);
     }
 }
 

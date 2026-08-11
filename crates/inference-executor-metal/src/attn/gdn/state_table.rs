@@ -76,11 +76,13 @@ impl GDNStateCapacity {
 
 pub struct GDNRequestStateTable {
     layout: GDNStateLayout,
+    num_req_slots: usize,
+    num_state_slots_per_req: usize,
     num_tokens_per_block: usize,
     max_materialized_states_per_req: usize,
     max_publish_jobs_per_req: usize,
     resources: Option<Rc<GDNRequestStateResources>>,
-    request_table: RefCell<GDNRequestSlots>,
+    request_table: Option<RefCell<GDNRequestSlots>>,
     restores: RefCell<Vec<GDNStateRestore>>,
     publishes: RefCell<Vec<GDNStatePublish>>,
     pending_request_txns: RefCell<Vec<GDNStateRequestTxn>>,
@@ -222,11 +224,13 @@ impl GDNRequestStateTable {
         };
         Self {
             layout,
+            num_req_slots,
+            num_state_slots_per_req: capacity.num_state_slots_per_req,
             num_tokens_per_block,
             max_materialized_states_per_req: capacity.max_materialized_states_per_req,
             max_publish_jobs_per_req: capacity.max_publish_jobs_per_req,
             resources: Some(Rc::new(GDNRequestStateResources::new(device, layout))),
-            request_table: RefCell::new(request_table),
+            request_table: Some(RefCell::new(request_table)),
             restores: RefCell::new(Vec::with_capacity(num_req_slots)),
             publishes: RefCell::new(Vec::with_capacity(layout.max_state_io_requests)),
             pending_request_txns: RefCell::new(Vec::with_capacity(num_req_slots)),
@@ -242,7 +246,7 @@ impl GDNRequestStateTable {
     }
 
     pub fn num_req_slots(&self) -> usize {
-        self.request_table.borrow().num_req_slots()
+        self.request_table().borrow().num_req_slots()
     }
 
     pub fn num_layers(&self) -> usize {
@@ -252,36 +256,67 @@ impl GDNRequestStateTable {
     pub fn write_full_state(
         &self,
         writer: &mut StateSnapshotWriter,
+        request_table_resource: u32,
         recurrent_resource: u32,
         conv_resource: u32,
     ) -> Result<(), ModelExecutorError> {
+        self.assert_snapshot_ready();
+        let request_table = self
+            .request_table()
+            .borrow()
+            .encode_durable_state(self.max_publish_jobs_per_req, self.num_pages_per_state_slot());
+        writer.write_bytes(request_table_resource, &request_table)?;
         writer.write_buffer(recurrent_resource, &self.resources().recurrent_states)?;
         writer.write_buffer(conv_resource, &self.resources().conv_states)?;
         Ok(())
     }
 
-    pub fn unload_state(&mut self) {
+    pub fn release_resources(&mut self) {
+        self.assert_snapshot_ready();
+        self.request_table
+            .take()
+            .expect("GDN request-state table must be loaded");
         self.resources
             .take()
             .expect("GDN request-state resources must be loaded");
     }
 
-    pub fn load_state(&mut self, device: &Device) {
+    pub fn allocate_resources(&mut self, device: &Device) {
         assert!(
-            self.resources.is_none(),
+            self.request_table.is_none() && self.resources.is_none(),
             "GDN request-state resources are already loaded"
         );
+        self.request_table = Some(RefCell::new(GDNRequestSlots::new(
+            self.num_req_slots,
+            self.num_state_slots_per_req,
+        )));
         self.resources = Some(Rc::new(GDNRequestStateResources::new(device, self.layout)));
     }
 
     pub fn read_full_state(
-        &self,
+        &mut self,
         reader: &mut StateSnapshotReader,
+        request_table_resource: u32,
         recurrent_resource: u32,
         conv_resource: u32,
     ) -> Result<(), ModelExecutorError> {
+        let max_request_table_bytes = GDNRequestSlots::max_durable_state_bytes(
+            self.num_req_slots,
+            self.num_state_slots_per_req,
+            self.max_publish_jobs_per_req,
+            self.num_pages_per_state_slot(),
+        );
+        let request_table_bytes = reader.read_bytes(request_table_resource, max_request_table_bytes)?;
+        let request_table = GDNRequestSlots::decode_durable_state(
+            &request_table_bytes,
+            self.num_req_slots,
+            self.num_state_slots_per_req,
+            self.max_publish_jobs_per_req,
+            self.num_pages_per_state_slot(),
+        )?;
         reader.read_buffer(recurrent_resource, &self.resources().recurrent_states)?;
         reader.read_buffer(conv_resource, &self.resources().conv_states)?;
+        self.request_table = Some(RefCell::new(request_table));
         Ok(())
     }
 
@@ -297,6 +332,27 @@ impl GDNRequestStateTable {
         self.resources
             .as_ref()
             .expect("GDN request-state resources must be loaded before execution")
+    }
+
+    fn request_table(&self) -> &RefCell<GDNRequestSlots> {
+        self.request_table
+            .as_ref()
+            .expect("GDN request-state table must be loaded before execution")
+    }
+
+    fn assert_snapshot_ready(&self) {
+        assert!(
+            self.restores.borrow().is_empty(),
+            "GDN state snapshot requires no restore jobs"
+        );
+        assert!(
+            self.publishes.borrow().is_empty(),
+            "GDN state snapshot requires no publish jobs"
+        );
+        assert!(
+            self.pending_request_txns.borrow().is_empty(),
+            "GDN state snapshot requires no pending batch transactions"
+        );
     }
 
     fn state_slot_offset(&self, layer_index: usize, state_slot: u32, state_bytes: usize) -> usize {
@@ -328,7 +384,7 @@ impl GDNRequestStateTable {
             return false;
         }
         assert!(
-            restores.len() <= self.request_table.borrow().num_req_slots(),
+            restores.len() <= self.request_table().borrow().num_req_slots(),
             "GDN restore I/O requests exceed request-slot capacity"
         );
         self.resources()
@@ -351,6 +407,10 @@ impl GDNRequestStateTable {
             self.layout,
             &restores,
         );
+    }
+
+    pub fn finish_restore(&self) {
+        self.restores.borrow_mut().clear();
     }
 
     pub fn record_publish<'a, R>(&'a self, recorder: &mut R, pages: &'a Buffer) -> bool
@@ -378,6 +438,10 @@ impl GDNRequestStateTable {
             &publishes,
         );
         true
+    }
+
+    pub fn finish_publish(&self) {
+        self.publishes.borrow_mut().clear();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -408,7 +472,7 @@ impl GDNRequestStateTable {
                 state_page_ids_by_req,
             )
             .resolve();
-        *self.request_table.borrow_mut() = output.request_table;
+        *self.request_table().borrow_mut() = output.request_table;
         *self.restores.borrow_mut() = take(&mut output.restores);
         *self.publishes.borrow_mut() = take(&mut output.publishes);
         *self.pending_request_txns.borrow_mut() = take(&mut output.pending_request_txns);
@@ -428,7 +492,7 @@ impl GDNRequestStateTable {
         GDNPrepareInput {
             num_tokens_per_block: self.num_tokens_per_block,
             max_materialized_states_per_req: self.max_materialized_states_per_req,
-            request_table: self.request_table.borrow().clone(),
+            request_table: self.request_table().borrow().clone(),
             req_slots: req_slots.to_vec(),
             block_indices: block_indices.to_vec(),
             token_indices: token_indices.to_vec(),
@@ -440,9 +504,9 @@ impl GDNRequestStateTable {
     }
 
     pub fn commit(&self, dst_state_versions: &[u32]) {
-        let pending_request_txns = self.pending_request_txns.borrow();
+        let pending_request_txns = take(&mut *self.pending_request_txns.borrow_mut());
         let mut publishes_out = self.publishes.borrow_mut();
-        let mut request_table = self.request_table.borrow_mut();
+        let mut request_table = self.request_table().borrow_mut();
         assert_eq!(pending_request_txns.len(), dst_state_versions.len());
         publishes_out.clear();
         for (request_txn, &dst_state_version) in pending_request_txns.iter().zip(dst_state_versions) {
@@ -468,7 +532,7 @@ impl GDNRequestStateTable {
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {
-        let mut request_table = self.request_table.borrow_mut();
+        let mut request_table = self.request_table().borrow_mut();
         request_table.reset_req_slots(req_slots);
         for &req_slot in req_slots {
             self.zero_state_slot(request_table.current_state_slot(req_slot));
@@ -540,7 +604,7 @@ impl GDNRequestStateTable {
         assert_eq!(cu_tokens.len(), req_slots.len() + 1);
         assert_eq!(cu_tokens[0], 0, "GDN state batch cu_tokens must start at zero");
         assert!(
-            req_slots.len() <= self.request_table.borrow().num_req_slots(),
+            req_slots.len() <= self.request_table().borrow().num_req_slots(),
             "GDN request count exceeds state-table capacity"
         );
         for req_index in 0..req_slots.len() {
@@ -846,7 +910,7 @@ impl GDNPrepareInput {
         }
 
         let mut restore_targets = vec![None; self.req_slots.len()];
-        let mut txn_publish_pages = vec![Vec::new(); self.req_slots.len()];
+        let mut pending_publish_pages = vec![Vec::new(); self.req_slots.len()];
         for req_index in 0..self.req_slots.len() {
             let token_index = self.token_indices[req_index] as usize;
             let base_block_index = self.block_indices[req_index];
@@ -874,7 +938,7 @@ impl GDNPrepareInput {
                         restore_targets[req_index] = Some((state_version, block_page_ids.clone()));
                     }
                 } else {
-                    txn_publish_pages[req_index].push(GDNStatePages {
+                    pending_publish_pages[req_index].push(GDNStatePages {
                         state_version,
                         page_ids: block_page_ids.clone(),
                     });
@@ -902,14 +966,14 @@ impl GDNPrepareInput {
         for (req_index, &req_slot) in self.req_slots.iter().enumerate() {
             let txn = self.state_txns[req_index];
             debug_assert!(
-                txn_publish_pages[req_index]
+                pending_publish_pages[req_index]
                     .windows(2)
                     .all(|pages| pages[0].state_version < pages[1].state_version),
                 "GDN runtime publish state versions must be unique and increasing"
             );
             let mut publish_versions = merge_ordered_unique_state_versions(
                 self.request_table.txn_publish_state_versions(req_slot),
-                txn_publish_pages[req_index].iter().map(|pages| pages.state_version),
+                pending_publish_pages[req_index].iter().map(|pages| pages.state_version),
             )
             .take_while(|&state_version| state_version < txn.candidate_end_state_version())
             .peekable();
@@ -943,7 +1007,7 @@ impl GDNPrepareInput {
             self.request_table.begin_txn(
                 req_slot,
                 &materialized_versions,
-                take(&mut txn_publish_pages[req_index]),
+                take(&mut pending_publish_pages[req_index]),
             );
             materialized_versions_by_req.push(materialized_versions);
         }
@@ -1039,6 +1103,7 @@ fn assert_u32_element_index_domain(len_bytes: u64, item_size: usize, name: &str)
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
+    use std::path::PathBuf;
 
     use inference_backend_metal::metal::Device;
     use inference_executor_core::attn::GDNCore;
@@ -1048,8 +1113,62 @@ mod tests {
     use super::GDNRequestStateTable;
     use super::GDNStateCapacity;
     use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
+    use crate::model::state_snapshot::ModelFingerprint;
+    use crate::model::state_snapshot::StateSnapshotReader;
+    use crate::model::state_snapshot::StateSnapshotWriter;
 
     const TEST_PAGE_BYTES: usize = 32 * 1024;
+    const LIFECYCLE_PAGE_BYTES: usize = 16;
+    const REQUEST_TABLE_RESOURCE: u32 = 1;
+    const RECURRENT_STATE_RESOURCE: u32 = 2;
+    const CONV_STATE_RESOURCE: u32 = 3;
+
+    #[derive(Debug, PartialEq)]
+    struct GDNStateReference {
+        durable_request_state: Vec<u8>,
+        recurrent_state: Vec<f32>,
+        conv_state: Vec<f32>,
+    }
+
+    #[test]
+    fn test_unload_load_fixed_state() {
+        let device = Device::system_default();
+        let mut state = new_lifecycle_state(&device);
+        let pages_per_state = state.num_pages_per_state_slot();
+        let page_ids = (0..2 * pages_per_state)
+            .map(|index| u32::try_from(10 + index).unwrap())
+            .collect::<Vec<_>>();
+        populate_durable_request_state(&state, &device, &page_ids);
+
+        let (num_recurrent_values, num_conv_values) = state_value_counts(&state);
+        let recurrent_state = fixed_values(num_recurrent_values, 0.25);
+        let conv_state = fixed_values(num_conv_values, -0.5);
+        write_state_values(&state, &recurrent_state, &conv_state);
+        let reference = capture_state(&state);
+
+        assert_eq!(reference.recurrent_state, recurrent_state);
+        assert_eq!(reference.conv_state, conv_state);
+        assert_unload_load("fixed", &device, &mut state, reference);
+    }
+
+    #[test]
+    fn test_unload_load_random_state() {
+        let device = Device::system_default();
+        let mut state = new_lifecycle_state(&device);
+        let mut random = TestRandom::new(0x4744_4e5f_5354_4154);
+        let page_ids = (0..2 * state.num_pages_per_state_slot())
+            .map(|_| random.next_u32() % 1024)
+            .collect::<Vec<_>>();
+        populate_durable_request_state(&state, &device, &page_ids);
+
+        let (num_recurrent_values, num_conv_values) = state_value_counts(&state);
+        let recurrent_state = random.values(num_recurrent_values);
+        let conv_state = random.values(num_conv_values);
+        write_state_values(&state, &recurrent_state, &conv_state);
+        let reference = capture_state(&state);
+
+        assert_unload_load("random", &device, &mut state, reference);
+    }
 
     #[test]
     #[should_panic(expected = "GDN state slots must include current state and all materialized states")]
@@ -1133,8 +1252,8 @@ mod tests {
             vec![2]
         );
         state.commit(&[1]);
-        assert_eq!(state.request_table.borrow().current_state_slot(0), 2);
-        assert_eq!(state.request_table.borrow().current_state_version(0), 1);
+        assert_eq!(state.request_table().borrow().current_state_slot(0), 2);
+        assert_eq!(state.request_table().borrow().current_state_version(0), 1);
     }
 
     #[test]
@@ -1160,9 +1279,9 @@ mod tests {
             &[Vec::new()],
         );
 
-        let state_version_2_slot = state.request_table.borrow().candidate_state_slot(0, 2);
-        let state_version_3_slot = state.request_table.borrow().candidate_state_slot(0, 3);
-        let state_version_4_slot = state.request_table.borrow().candidate_state_slot(0, 4);
+        let state_version_2_slot = state.request_table().borrow().candidate_state_slot(0, 2);
+        let state_version_3_slot = state.request_table().borrow().candidate_state_slot(0, 3);
+        let state_version_4_slot = state.request_table().borrow().candidate_state_slot(0, 4);
         assert_eq!(
             batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
             vec![
@@ -1174,7 +1293,7 @@ mod tests {
         );
 
         state.commit(&[2]);
-        assert_eq!(state.request_table.borrow().current_state_version(0), 2);
+        assert_eq!(state.request_table().borrow().current_state_version(0), 2);
     }
 
     #[test]
@@ -1200,7 +1319,7 @@ mod tests {
             &[Vec::new()],
         );
 
-        let table = state.request_table.borrow();
+        let table = state.request_table().borrow();
         let state_version_2_slot = table.candidate_state_slot(0, 2);
         let state_version_3_slot = table.candidate_state_slot(0, 3);
         let state_version_4_slot = table.candidate_state_slot(0, 4);
@@ -1217,7 +1336,7 @@ mod tests {
 
         state.commit(&[3]);
 
-        let table = state.request_table.borrow();
+        let table = state.request_table().borrow();
         assert_eq!(table.current_state_version(0), 3);
         assert_eq!(table.current_state_slot(0), state_version_3_slot);
     }
@@ -1245,7 +1364,7 @@ mod tests {
             &[Vec::new()],
         );
 
-        let table = state.request_table.borrow();
+        let table = state.request_table().borrow();
         let state_version_1_slot = table.candidate_state_slot(0, 1);
         let state_version_2_slot = table.candidate_state_slot(0, 2);
         let state_version_3_slot = table.candidate_state_slot(0, 3);
@@ -1262,7 +1381,7 @@ mod tests {
 
         state.commit(&[3]);
 
-        let table = state.request_table.borrow();
+        let table = state.request_table().borrow();
         assert_eq!(table.current_state_version(0), 2);
         assert_eq!(table.current_state_slot(0), state_version_2_slot);
     }
@@ -1286,7 +1405,7 @@ mod tests {
             ]],
         );
 
-        let table = state.request_table.borrow();
+        let table = state.request_table().borrow();
         let first_boundary_slot = table.candidate_state_slot(0, 2);
         let candidate_slot = table.candidate_state_slot(0, 4);
         drop(table);
@@ -1326,10 +1445,10 @@ mod tests {
             &[GDNStateTxn::new(1, 4, 2)],
             &[Vec::new()],
         );
-        let state_version_2_slot = state.request_table.borrow().candidate_state_slot(0, 2);
-        let state_version_3_slot = state.request_table.borrow().candidate_state_slot(0, 3);
-        let state_version_4_slot = state.request_table.borrow().candidate_state_slot(0, 4);
-        let state_version_5_slot = state.request_table.borrow().candidate_state_slot(0, 5);
+        let state_version_2_slot = state.request_table().borrow().candidate_state_slot(0, 2);
+        let state_version_3_slot = state.request_table().borrow().candidate_state_slot(0, 3);
+        let state_version_4_slot = state.request_table().borrow().candidate_state_slot(0, 4);
+        let state_version_5_slot = state.request_table().borrow().candidate_state_slot(0, 5);
         assert_eq!(
             batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
             vec![
@@ -1377,7 +1496,7 @@ mod tests {
         assert_eq!(batch_metadata.src_state_slots().read_typed::<u32>(0, 1), vec![0]);
 
         state.commit(&[3]);
-        assert_eq!(state.request_table.borrow().current_state_version(0), 3);
+        assert_eq!(state.request_table().borrow().current_state_version(0), 3);
     }
 
     #[test]
@@ -1427,7 +1546,137 @@ mod tests {
         assert_eq!(state.restores()[0].state_version, 1024);
         assert_eq!(state.restores()[0].page_ids, snapshot_page_ids);
         state.commit(&[1025]);
-        assert_eq!(state.request_table.borrow().current_state_version(0), 1025);
+        assert_eq!(state.request_table().borrow().current_state_version(0), 1025);
+    }
+
+    fn assert_unload_load(name: &str, device: &Device, state: &mut GDNRequestStateTable, reference: GDNStateReference) {
+        let snapshot_path = snapshot_path(name);
+        let fingerprint = ModelFingerprint::new([0x44; 16]);
+        let mut writer = StateSnapshotWriter::new(&snapshot_path, fingerprint).unwrap();
+        state
+            .write_full_state(
+                &mut writer,
+                REQUEST_TABLE_RESOURCE,
+                RECURRENT_STATE_RESOURCE,
+                CONV_STATE_RESOURCE,
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        state.release_resources();
+        state.allocate_resources(device);
+
+        let mut reader = StateSnapshotReader::open(&snapshot_path, fingerprint).unwrap();
+        state
+            .read_full_state(
+                &mut reader,
+                REQUEST_TABLE_RESOURCE,
+                RECURRENT_STATE_RESOURCE,
+                CONV_STATE_RESOURCE,
+            )
+            .unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(capture_state(state), reference);
+        std::fs::remove_file(snapshot_path).unwrap();
+    }
+
+    fn new_lifecycle_state(device: &Device) -> GDNRequestStateTable {
+        GDNRequestStateTable::new(
+            device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(5, 4, 3),
+            2,
+            LIFECYCLE_PAGE_BYTES,
+        )
+    }
+
+    fn populate_durable_request_state(state: &GDNRequestStateTable, device: &Device, page_ids: &[u32]) {
+        let pages_per_state = state.num_pages_per_state_slot();
+        assert_eq!(page_ids.len(), 2 * pages_per_state);
+        let metadata = GDNMetadataBuffers::new(device, 1, 1);
+        prepare_state(
+            state,
+            &metadata,
+            &[0],
+            &[0],
+            &[0],
+            &[0, 1],
+            &[GDNStateTxn::new(0, 1, 0)],
+            &[page_ids.chunks_exact(pages_per_state).map(<[u32]>::to_vec).collect()],
+        );
+        state.commit(&[1]);
+    }
+
+    fn write_state_values(state: &GDNRequestStateTable, recurrent_state: &[f32], conv_state: &[f32]) {
+        let resources = state.resources();
+        assert_eq!(
+            std::mem::size_of_val(recurrent_state),
+            resources.recurrent_states.len_bytes()
+        );
+        assert_eq!(std::mem::size_of_val(conv_state), resources.conv_states.len_bytes());
+        resources.recurrent_states.write_typed(0, recurrent_state);
+        resources.conv_states.write_typed(0, conv_state);
+    }
+
+    fn capture_state(state: &GDNRequestStateTable) -> GDNStateReference {
+        let resources = state.resources();
+        let (num_recurrent_values, num_conv_values) = state_value_counts(state);
+        GDNStateReference {
+            durable_request_state: state
+                .request_table()
+                .borrow()
+                .encode_durable_state(state.max_publish_jobs_per_req, state.num_pages_per_state_slot()),
+            recurrent_state: resources.recurrent_states.read_typed(0, num_recurrent_values),
+            conv_state: resources.conv_states.read_typed(0, num_conv_values),
+        }
+    }
+
+    fn state_value_counts(state: &GDNRequestStateTable) -> (usize, usize) {
+        let resources = state.resources();
+        (
+            resources.recurrent_states.len_bytes() / size_of::<f32>(),
+            resources.conv_states.len_bytes() / size_of::<f32>(),
+        )
+    }
+
+    fn fixed_values(len: usize, offset: f32) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index % 17) as f32 - 8.0) * 0.25 + offset)
+            .collect()
+    }
+
+    fn snapshot_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "psi-dec-gdn-state-unload-load-{}-{name}.state",
+            std::process::id()
+        ))
+    }
+
+    struct TestRandom(u64);
+
+    impl TestRandom {
+        fn new(seed: u64) -> Self {
+            assert_ne!(seed, 0);
+            Self(seed)
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 as u32
+        }
+
+        fn values(&mut self, len: usize) -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    let value = (self.next_u32() % 20_001) as i32 - 10_000;
+                    value as f32 / 128.0
+                })
+                .collect()
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

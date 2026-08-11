@@ -32,6 +32,7 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::sparse_affine_layout;
 use crate::model::qwen::v3_x::weight::validate_len;
+use crate::model::residency_digest::ModelResidencyHasher;
 
 pub struct Qwen3xMoE {
     backend: GatedMoE,
@@ -64,6 +65,10 @@ impl Qwen3xMoE {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "Qwen3.x MoE weights are not loaded");
         self.weights.take();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.weights().hash(hasher, prefix);
     }
 
     fn weights(&self) -> &Qwen3xMoEWeights {
@@ -191,6 +196,19 @@ struct Qwen3xSharedExpertsWeightBuffers {
 }
 
 impl Qwen3xMoEWeights {
+    fn hash(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        hasher.buffer(&format!("{prefix}.router.weight"), &self.router_weight);
+        hasher.buffer(&format!("{prefix}.router.scales"), &self.router_scales);
+        hasher.buffer(&format!("{prefix}.router.biases"), &self.router_biases);
+        self.experts.hash(hasher, &format!("{prefix}.experts"));
+        if let Some(shared) = &self.shared_experts {
+            hasher.buffer(&format!("{prefix}.shared.gate.weight"), &shared.gate_weight);
+            hasher.buffer(&format!("{prefix}.shared.gate.scales"), &shared.gate_scales);
+            hasher.buffer(&format!("{prefix}.shared.gate.biases"), &shared.gate_biases);
+            shared.mlp.hash(hasher, &format!("{prefix}.shared.mlp"));
+        }
+    }
+
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
@@ -324,6 +342,18 @@ impl Qwen3xMoEWeights {
 }
 
 impl Qwen3xSparseExpertWeights {
+    fn hash(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        hasher.buffer(&format!("{prefix}.gate.weight"), &self.gate_weight);
+        hasher.buffer(&format!("{prefix}.gate.scales"), &self.gate_scales);
+        hasher.buffer(&format!("{prefix}.gate.biases"), &self.gate_biases);
+        hasher.buffer(&format!("{prefix}.up.weight"), &self.up_weight);
+        hasher.buffer(&format!("{prefix}.up.scales"), &self.up_scales);
+        hasher.buffer(&format!("{prefix}.up.biases"), &self.up_biases);
+        hasher.buffer(&format!("{prefix}.down.weight"), &self.down_weight);
+        hasher.buffer(&format!("{prefix}.down.scales"), &self.down_scales);
+        hasher.buffer(&format!("{prefix}.down.biases"), &self.down_biases);
+    }
+
     fn from_tensors(
         device: &Device,
         tensors: &mut TensorMap,

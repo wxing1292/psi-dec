@@ -30,6 +30,7 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
@@ -174,16 +175,29 @@ impl Qwen35MTPEmbed {
         self.embed = Some(embed);
     }
 
-    pub fn unload_weights(&mut self) {
+    pub fn unload_weights(&mut self) -> Rc<Embed> {
         assert!(
             self.projection_weights.is_some(),
             "qwen3.5 MTP embed weights are not loaded"
         );
+        let embed = self
+            .embed
+            .take()
+            .expect("qwen3.5 MTP shared embed weights are not loaded");
         self.projection_weights.take();
         self.embedding_norm.unload_weights();
         self.hidden_norm.unload_weights();
-        assert!(self.embed.is_some(), "qwen3.5 MTP shared embed weights are not loaded");
-        self.embed.take();
+        embed
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.hidden_norm.hash_weights(hasher, &format!("{prefix}.hidden_norm"));
+        self.embedding_norm
+            .hash_weights(hasher, &format!("{prefix}.embedding_norm"));
+        let weights = self.projection_weights();
+        hasher.buffer(&format!("{prefix}.projection.weight"), &weights.weight);
+        hasher.buffer(&format!("{prefix}.projection.scales"), &weights.scales);
+        hasher.buffer(&format!("{prefix}.projection.biases"), &weights.biases);
     }
 
     fn projection_weights(&self) -> &Qwen35MTPProjectionWeights {

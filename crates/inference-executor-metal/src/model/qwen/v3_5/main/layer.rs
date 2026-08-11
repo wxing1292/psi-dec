@@ -34,6 +34,7 @@ use crate::model::qwen::v3_x::layer::Qwen3xMoE;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
+use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::residual_add::ResidualAdd;
 use crate::model::rms_norm::RMSNorm;
 
@@ -161,6 +162,14 @@ impl Qwen35MainLayer {
         self.input_norm.unload_weights();
         self.mlp.unload_weights();
         self.attention.unload_weights();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.input_norm.hash_weights(hasher, &format!("{prefix}.input_norm"));
+        self.attention.hash_weights(hasher, &format!("{prefix}.attention"));
+        self.post_attention_norm
+            .hash_weights(hasher, &format!("{prefix}.post_attention_norm"));
+        self.mlp.hash_weights(hasher, &format!("{prefix}.mlp"));
     }
 
     pub fn unload_state(&mut self) {
@@ -354,6 +363,13 @@ impl ReplayLayer for Qwen35MainLayer {
 }
 
 impl Qwen35MainAttention {
+    fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        match self {
+            Self::Gqa(gqa) => gqa.hash_weights(hasher, prefix),
+            Self::Gdn(gdn) => gdn.hash_weights(hasher, prefix),
+        }
+    }
+
     fn new(
         config: &Qwen35ModelConfig,
         model_layer_index: usize,
@@ -471,6 +487,13 @@ impl Qwen35MainAttention {
 }
 
 impl Qwen35MainMLP {
+    fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        match self {
+            Self::Dense(dense) => dense.hash_weights(hasher, prefix),
+            Self::MoE(moe) => moe.hash_weights(hasher, prefix),
+        }
+    }
+
     fn new(
         device: &Device,
         config: &Qwen35ModelConfig,

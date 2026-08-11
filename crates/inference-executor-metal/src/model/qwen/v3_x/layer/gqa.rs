@@ -29,6 +29,7 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
+use crate::model::residency_digest::ModelResidencyHasher;
 
 pub struct Qwen3xGQA {
     gqa_layer_index: ReplayU32,
@@ -70,6 +71,10 @@ impl Qwen3xGQA {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "Qwen3.x GQA weights are not loaded");
         self.weights.take();
+    }
+
+    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        self.weights().hash(hasher, prefix);
     }
 
     pub fn unload_state(&mut self) {
@@ -198,6 +203,17 @@ struct Qwen3xGQAWeights {
 }
 
 impl Qwen3xGQAWeights {
+    fn hash(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
+        hasher.buffer(&format!("{prefix}.qgkv.weight"), &self.qgkv_weight);
+        hasher.buffer(&format!("{prefix}.qgkv.scales"), &self.qgkv_scales);
+        hasher.buffer(&format!("{prefix}.qgkv.biases"), &self.qgkv_biases);
+        hasher.buffer(&format!("{prefix}.q_norm.weight"), &self.q_norm_weight);
+        hasher.buffer(&format!("{prefix}.k_norm.weight"), &self.k_norm_weight);
+        hasher.buffer(&format!("{prefix}.output.weight"), &self.output_weight);
+        hasher.buffer(&format!("{prefix}.output.scales"), &self.output_scales);
+        hasher.buffer(&format!("{prefix}.output.biases"), &self.output_biases);
+    }
+
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
