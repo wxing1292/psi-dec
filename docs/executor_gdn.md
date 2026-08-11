@@ -880,6 +880,14 @@ Per-layer owners retain weights and immutable component configuration. `GDNReque
 state, request-slot lifecycle, page-ID staging, and restore/publish jobs. Their versions and slots are common across all
 GDN layers.
 
+During `unload_state`, each layer first drops its shared GDN backend, scratch, and request-state resources.
+The model state owner then releases the final references, batch metadata, state arenas, and page-I/O resources.
+State load rebuilds transient resources before it restores the full arenas and durable request metadata.
+
+Durable metadata includes current slots, state versions, free-slot order, and future publish page IDs.
+Submitted restore jobs, submitted publish jobs, and current batch transactions are transient.
+The executor must finish or clear them before it writes a snapshot.
+
 ## State data flow
 
 The replay-order section defines the hidden-state pipeline. Mutable request state flows beside it:
@@ -1032,10 +1040,11 @@ with full-forward numbers.
 Recommendation: GDN replay debugging separates transient scratch from persistent state. Layers execute serially.
 Thus, model-level code can reuse projection/core scratch.
 
-Current/candidate conv/recurrent slot arenas and GPU page-ID staging buffers are model-owned persistent resources.
+Current/candidate conv/recurrent slot arenas are model-owned persistent resources.
+GPU page-ID staging buffers are transient model-owned resources.
 
-`GDNRequestStateTable` owns CPU-side current state slots, current `state_version`s, txn candidate slot mappings, and
-restore/publish job metadata.
+`GDNRequestStateTable` owns CPU-side current state slots, current `state_version`s, transaction candidate mappings,
+future publish page IDs, and submitted restore/publish jobs.
 
 Recommendation: Barrier audits follow this data flow:
 

@@ -976,6 +976,10 @@ replay programs through the same recorder path.
 Each model state binds one shared scratch allocation for compatible layers. Therefore, decode replay reuse does not
 multiply scratch by the layer count.
 
+During `unload_state`, each layer first drops its shared GQA backend, scratch, and request-page-table references.
+The model state owner then releases the final references and its batch metadata.
+State load rebuilds these transient resources before it restores the full `GQARequestPageTable` payload.
+
 The core `scale` is part of both attention contracts. The executor passes it to paged SDPA kernels. Kernels must not
 silently substitute `1 / sqrt(head_dim)`.
 

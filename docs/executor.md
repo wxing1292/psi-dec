@@ -133,7 +133,8 @@ remain explicit typed input. An artificial tensor-to-tensor API does not hide th
 
 ## Weight contract
 
-Model weights are immutable after initialization.
+Model weights are immutable while loaded.
+Each later load must materialize the same checkpoint representation.
 
 - Load only the tensor set for the current semantic owner or layer into a `TensorMap`.
 - Preserve each tensor key, storage dtype, shape, and bytes in the map value.
@@ -316,6 +317,31 @@ remain confined to one thread unless an API explicitly states otherwise.
 
 Runtime core still owns the durable request and cache lifecycle. The executor reports sampled decisions and component
 results. It does not free globally owned pages or commit scheduler state independently.
+
+`ReplayableModel` also defines synchronous model residency operations.
+Current Qwen model executors support this order:
+
+```text
+stop: clear_replay_cache -> unload_state -> unload_weights
+start: load_weights -> load_state
+```
+
+The model shell remains allocated while its resources are unloaded.
+Weight-bearing component shells remain allocated and fail fast if execution accesses missing weights.
+The unload traversal must remove all shared `Rc` owners.
+The final owner releases the shared Metal resource.
+
+`unload_state` writes full `PageArena`, GQA, and GDN payloads to SSD before it releases their buffers.
+The snapshot also stores durable GDN request state and future publish page IDs.
+The executor finishes or clears transient restore, publish, and batch transactions before it writes the snapshot.
+
+`load_state` validates the complete snapshot before it allocates state resources.
+It attaches consumers only after all state reads succeed.
+It releases all new resources after a read failure.
+
+The service does not invoke these operations yet.
+The runtime-to-device protocol and idle policy remain design work.
+See [`model_idle_unload.md`](model_idle_unload.md) for the current boundary and the planned wiring.
 
 ## Verification boundary
 

@@ -869,7 +869,9 @@ Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidate
 MTP uses the same decision-candidate count and shifts their physical state versions by `num_spec_tokens - 1`.
 Both modes also reserve cache-block boundary candidates.
 The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, and DSpark.
-These state buffers remain allocated, reusable, and resident with the cached replay resources.
+These state buffers remain allocated and reusable while model state is loaded.
+`unload_state` writes persistent cache state to SSD and releases its loaded resources.
+`clear_replay_cache` and `unload_weights` release replay resources and model weights.
 
 [`dspark_design.md`](dspark_design.md) documents the complete current component contract.
 
