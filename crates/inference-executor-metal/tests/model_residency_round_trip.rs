@@ -4,6 +4,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use inference_executor_core::model::ReplayableModel;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35ExecutorConfig;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_dspark;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_with_mtp;
@@ -11,7 +12,6 @@ use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::DecoderSyncBlocks;
 use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::QueryTokens;
-use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::runtime::Token;
 
 const MODEL_27B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_27B_MODEL_DIR";

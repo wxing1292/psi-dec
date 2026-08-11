@@ -120,6 +120,7 @@ fn run_inner() -> Result<()> {
         max_batch_requests = scheduler_config.max_requests,
         max_tokens = scheduler_config.max_tokens,
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
+        model_idle_timeout_secs = config.model_idle_timeout().as_secs(),
         "qwen3 Main/cache configuration"
     );
 
@@ -155,6 +156,7 @@ fn build_runtime_config(
     Ok(RuntimeConfig {
         max_queued_requests: service_config.max_queued_requests(),
         max_running_requests: service_config.max_running_requests(),
+        model_idle_timeout: service_config.model_idle_timeout(),
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
         num_kv_heads: text.num_key_value_heads,
         kv_head_dim: text.head_dim,

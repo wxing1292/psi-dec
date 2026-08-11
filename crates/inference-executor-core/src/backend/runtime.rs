@@ -1,6 +1,5 @@
-use inference_runtime_core::compute::ExecutionSubmission;
-
 use crate::backend::recorder::Recorder;
+use crate::model::ExecutionSubmission;
 
 /// Backend runtime boundary for replay creation and submission.
 ///

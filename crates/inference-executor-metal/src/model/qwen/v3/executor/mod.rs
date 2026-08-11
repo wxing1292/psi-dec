@@ -11,6 +11,8 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
+use inference_executor_core::model::ModelOutputTiming;
+use inference_executor_core::model::ReplayableModel;
 use inference_executor_core::model::qwen::v3::Qwen3DecodeDecision;
 use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
 use inference_executor_core::model::qwen::v3::Qwen3ModelBatchRequest;
@@ -34,8 +36,6 @@ use inference_executor_core::sampling::TopKSamplingShape;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
-use inference_runtime_core::compute::ModelOutputTiming;
-use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -434,7 +434,6 @@ impl ReplayableModel for Qwen3Executor {
     type SampledOutput = Qwen3SampledOutput;
     type ModelOpsRecorder = Qwen3ModelOpsRecorder;
     type Submission = MetalReplaySubmission;
-    type LifecycleError = ModelExecutorError;
 
     fn model_name(&self) -> &str {
         &self.model_name
@@ -454,7 +453,7 @@ impl ReplayableModel for Qwen3Executor {
         Qwen3Executor::clear_replay_cache(self);
     }
 
-    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
         Qwen3Executor::unload_state(self, snapshot_path)
     }
 
@@ -462,11 +461,11 @@ impl ReplayableModel for Qwen3Executor {
         Qwen3Executor::unload_weights(self);
     }
 
-    fn load_weights(&mut self) -> Result<(), Self::LifecycleError> {
+    fn load_weights(&mut self) -> Result<(), ModelExecutorError> {
         Qwen3Executor::load_weights(self)
     }
 
-    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
         Qwen3Executor::load_state(self, snapshot_path)
     }
 
@@ -788,8 +787,8 @@ fn replay_bucket_capacity(active: u32, max_capacity: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use inference_executor_core::attn::GQAReplayShape;
+    use inference_executor_core::model::ReplayableModel;
     use inference_executor_core::model::qwen::v3::Qwen3ModelBatchRequest;
-    use inference_runtime_core::compute::ReplayableModel;
 
     use super::Qwen3Executor;
     use super::Qwen3ExecutorConfig;

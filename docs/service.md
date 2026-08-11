@@ -297,6 +297,12 @@ A cold launch requires the repository source, Cargo, the pinned Rust toolchain, 
 
 The gRPC address defaults to `127.0.0.1:50051`. The HTTP address defaults to `127.0.0.1:8000`.
 
+The model idle timeout defaults to 300 seconds.
+After this period without executable model work, the service writes model state to SSD and unloads model resources.
+The listeners and runtime requests remain active.
+The next executable batch loads weights and state before execution.
+`--model-idle-timeout-secs` accepts a positive integer.
+
 One lifecycle owner stops both listeners in these conditions:
 
 - The runtime stops.
@@ -619,7 +625,7 @@ Internal model `Start` and `Stop` commands emit INFO lifecycle events on the
 The events use `model.start.begin`, `model.start.complete`, `model.stop.begin`, and `model.stop.complete` phases.
 Completion events include elapsed milliseconds.
 Failure events include the model name and error, and then trigger global shutdown.
-Runtime core does not issue these commands or apply an idle timeout yet.
+Runtime core issues these commands after the configured idle timeout.
 
 The Main timing fields are:
 

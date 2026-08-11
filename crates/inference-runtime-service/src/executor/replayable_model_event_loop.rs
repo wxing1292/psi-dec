@@ -1,20 +1,20 @@
-use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Select;
+use crossbeam_channel::SelectedOperation;
 use crossbeam_channel::Sender;
+use inference_executor_core::model::ExecutionSubmission;
+use inference_executor_core::model::ReplayableModel;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::DeviceResponse;
-use inference_runtime_core::compute::ExecutionSubmission;
 use inference_runtime_core::compute::QueryTokens;
-use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::compute::ReplayableModelExecutorRequest;
 use inference_runtime_core::compute::ReplayableModelExecutorResponse;
 use inference_runtime_core::compute::SampledTokens;
@@ -48,7 +48,6 @@ enum ModelExecutorState {
 impl<M> ReplayableModelEventLoop<M>
 where
     M: ReplayableModel,
-    M::LifecycleError: Display,
 {
     pub fn new(
         model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
@@ -110,8 +109,11 @@ where
                     }
                 },
                 _ if op_index == op_recv_model_executor_req => {
-                    match op.recv(&self.model_executor_req_rx) {
-                        Ok(ReplayableModelExecutorRequest::Batch(batch_dev_req)) => {
+                    let Some(request) = self.recv_request(op) else {
+                        break 'event_loop;
+                    };
+                    match request {
+                        ReplayableModelExecutorRequest::Batch(batch_dev_req) => {
                             if !self.start() {
                                 break 'event_loop;
                             }
@@ -121,7 +123,7 @@ where
                                 break 'event_loop;
                             }
                         },
-                        Ok(ReplayableModelExecutorRequest::Start) => {
+                        ReplayableModelExecutorRequest::Start => {
                             if !self.start() {
                                 break 'event_loop;
                             }
@@ -130,17 +132,13 @@ where
                                 break 'event_loop;
                             }
                         },
-                        Ok(ReplayableModelExecutorRequest::Stop) => {
+                        ReplayableModelExecutorRequest::Stop => {
                             if !self.stop() {
                                 break 'event_loop;
                             }
                             if !self.send_response(ReplayableModelExecutorResponse::Stopped) {
                                 break 'event_loop;
                             }
-                        },
-                        Err(_) => {
-                            tracing::info!("model executor request channel closed, stopping");
-                            break 'event_loop;
                         },
                     }
                 },
@@ -236,6 +234,16 @@ where
             "model stopped"
         );
         true
+    }
+
+    fn recv_request(&self, operation: SelectedOperation<'_>) -> Option<ReplayableModelExecutorRequest> {
+        match operation.recv(&self.model_executor_req_rx) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                tracing::info!("unable to receive model executor request, err: {error}, stopping");
+                None
+            },
+        }
     }
 
     fn send_response(&self, response: ReplayableModelExecutorResponse) -> bool {
@@ -557,6 +565,7 @@ mod tests {
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
     use crossbeam_channel::unbounded;
+    use inference_executor_core::def::ModelExecutorError;
 
     use super::*;
 
@@ -591,7 +600,6 @@ mod tests {
         type SampledOutput = ();
         type ModelOpsRecorder = ();
         type Submission = TestSubmission;
-        type LifecycleError = std::io::Error;
 
         fn model_name(&self) -> &str {
             "test"
@@ -611,10 +619,11 @@ mod tests {
             self.event_tx.send(ModelEvent::ClearReplayCache).unwrap();
         }
 
-        fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+        fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
             assert!(self.weights_loaded);
             assert!(self.state_loaded);
-            std::fs::write(snapshot_path, b"test model state")?;
+            std::fs::write(snapshot_path, b"test model state")
+                .map_err(|error| ModelExecutorError::custom(error.to_string()))?;
             self.state_loaded = false;
             self.event_tx.send(ModelEvent::UnloadState).unwrap();
             Ok(())
@@ -627,7 +636,7 @@ mod tests {
             self.event_tx.send(ModelEvent::UnloadWeights).unwrap();
         }
 
-        fn load_weights(&mut self) -> Result<(), Self::LifecycleError> {
+        fn load_weights(&mut self) -> Result<(), ModelExecutorError> {
             assert!(!self.weights_loaded);
             assert!(!self.state_loaded);
             self.weights_loaded = true;
@@ -635,10 +644,11 @@ mod tests {
             Ok(())
         }
 
-        fn load_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+        fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
             assert!(self.weights_loaded);
             assert!(!self.state_loaded);
-            assert_eq!(std::fs::read(snapshot_path)?, b"test model state");
+            let state = std::fs::read(snapshot_path).map_err(|error| ModelExecutorError::custom(error.to_string()))?;
+            assert_eq!(state, b"test model state");
             self.state_loaded = true;
             self.event_tx.send(ModelEvent::LoadState).unwrap();
             Ok(())

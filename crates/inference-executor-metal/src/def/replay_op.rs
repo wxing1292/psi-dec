@@ -9,7 +9,7 @@ use inference_backend_metal::metal::ReplaySubmission;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::backend::runtime::Runtime;
-use inference_runtime_core::compute::ExecutionSubmission;
+use inference_executor_core::model::ExecutionSubmission;
 
 pub struct MetalReplayRuntime<'a> {
     stream: &'a Stream,

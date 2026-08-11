@@ -1,7 +1,7 @@
 # Model Idle Unload Design
 
 This document records the implemented model resource operations, executor protocol, and service event-loop wiring.
-Runtime idle detection and model residency tracking are not implemented.
+Runtime idle detection and model residency tracking are implemented.
 
 ## Objective
 
@@ -14,23 +14,22 @@ It must discard runtime cache metadata after any snapshot or restore failure.
 
 ## Current implementation boundary
 
-`ReplayableModel` defines batch execution and these synchronous resource operations:
+`inference-executor-core` owns `ReplayableModel`.
+The trait defines batch execution and these synchronous resource operations:
 
 ```rust
 trait ReplayableModel {
-    type LifecycleError;
-
     fn clear_replay_cache(&mut self);
     fn unload_state(
         &mut self,
         snapshot_path: &Path,
-    ) -> Result<(), Self::LifecycleError>;
+    ) -> Result<(), ModelExecutorError>;
     fn unload_weights(&mut self);
-    fn load_weights(&mut self) -> Result<(), Self::LifecycleError>;
+    fn load_weights(&mut self) -> Result<(), ModelExecutorError>;
     fn load_state(
         &mut self,
         snapshot_path: &Path,
-    ) -> Result<(), Self::LifecycleError>;
+    ) -> Result<(), ModelExecutorError>;
 }
 ```
 
@@ -46,9 +45,16 @@ It handles `Batch`, `Start`, and `Stop` requests synchronously on the executor t
 The event loop defers request-slot resets while the model is stopped.
 It applies all deferred resets after state loading and before it acknowledges `Start` or executes a batch.
 
-Runtime core currently sends only `Batch` requests.
-It does not track executor residency or send `Start` and `Stop`.
-The service has no idle timer, lifecycle status API, or status route.
+Runtime core tracks the commanded `Started` or `Stopped` state.
+It appends `Stop` after all batches that it has already sent.
+The model event loop completes those batches before it handles `Stop`.
+It sends `Start` when a stopped executor has work to flush.
+It can append a batch after `Start` without a separate transition state.
+The ordered request channel guarantees that the model event loop handles `Start` before that batch.
+
+The idle timeout defaults to 300 seconds.
+`--model-idle-timeout-secs` accepts a positive integer.
+The service does not have a lifecycle status API or status route.
 
 ## Current resource order
 
@@ -132,7 +138,9 @@ The model executor owns these resources:
 - Component-local state interpretation.
 - Replay programs and retained Metal resources.
 
-The future service wiring must own the idle policy and operation order.
+Runtime core owns idle detection and executor protocol state.
+The service owns the configured idle timeout.
+The model event loop owns the resource operation order.
 Runtime core must not parse model-specific state.
 The model executor must not allocate or free runtime-owned page IDs.
 
@@ -166,12 +174,13 @@ Stop           -> Stopped
 One request channel orders `Batch`, `Start`, and `Stop`.
 One response channel preserves the matching response order.
 The model event loop processes one request at a time.
+Each channel reserves one entry in addition to the compute-slot capacity.
+This entry lets `Stop` follow a full set of submitted batches.
 
-Runtime core wraps prepared device batches in `Batch` and unwraps matching `Batch` responses.
-It treats `Started` or `Stopped` as an internal contract violation because it does not send lifecycle commands yet.
-
-Future runtime wiring must define idle detection, executor residency tracking, runtime cache coordination, and status
-exposure.
+Runtime core sends and receives all protocol variants.
+It consumes `Started` and `Stopped` as acknowledgements and then attempts the next flush.
+It does not maintain separate transition states for these acknowledgements.
+Future wiring may expose the tracked residency through a status API.
 
 ## Lifecycle flow
 
@@ -197,6 +206,9 @@ runtime core                        ReplayableModelEventLoop
 The stop boundary must preserve any completed request state that runtime core still owns.
 The model must not serialize an in-flight GPU job.
 Runtime core and the model executor must agree on a completed batch boundary before `Stop` runs.
+Runtime core can retain live requests across this boundary.
+If a live request becomes runnable after `Stop` is queued, runtime core appends `Start` and then the next batch.
+The request channel preserves the required `Stop`, `Start`, and `Batch` execution order.
 
 The event loop uses this operation order:
 

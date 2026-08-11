@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
+use inference_executor_core::model::ModelOutputTiming;
+use inference_executor_core::model::ReplayableModel;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35ExecutorConfig;
 use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model;
@@ -11,9 +13,7 @@ use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::DecoderSyncBlocks;
 use inference_runtime_core::compute::DeviceRequest;
-use inference_runtime_core::compute::ModelOutputTiming;
 use inference_runtime_core::compute::QueryTokens;
-use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::compute::SampledTokens;
 use inference_runtime_core::runtime::Token;
 

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
+use inference_executor_core::model::ModelOutputTiming;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
-use inference_runtime_core::compute::ModelOutputTiming;
 use inference_runtime_core::compute::QueryTokens;
 use inference_runtime_core::compute::SampledTokens;
 use serde_json::json;

@@ -14,6 +14,8 @@ use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::backend::runtime::Runtime;
 use inference_executor_core::def::ModelExecutorError;
+use inference_executor_core::model::ModelOutputTiming;
+use inference_executor_core::model::ReplayableModel;
 use inference_executor_core::model::qwen::v3_5::Qwen35DecodeDecision;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelBatchRequest;
@@ -40,8 +42,6 @@ use inference_executor_core::sampling::TopKSamplingShape;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
-use inference_runtime_core::compute::ModelOutputTiming;
-use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -698,7 +698,6 @@ impl ReplayableModel for Qwen35Executor {
     type SampledOutput = Qwen35SampledOutput;
     type ModelOpsRecorder = Qwen35ModelOpsRecorder;
     type Submission = MetalReplaySubmission;
-    type LifecycleError = ModelExecutorError;
 
     fn model_name(&self) -> &str {
         &self.model_name
@@ -720,7 +719,7 @@ impl ReplayableModel for Qwen35Executor {
         Qwen35Executor::clear_replay_cache(self);
     }
 
-    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
         Qwen35Executor::unload_state(self, snapshot_path)
     }
 
@@ -728,11 +727,11 @@ impl ReplayableModel for Qwen35Executor {
         Qwen35Executor::unload_weights(self);
     }
 
-    fn load_weights(&mut self) -> Result<(), Self::LifecycleError> {
+    fn load_weights(&mut self) -> Result<(), ModelExecutorError> {
         Qwen35Executor::load_weights(self)
     }
 
-    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError> {
+    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
         Qwen35Executor::load_state(self, snapshot_path)
     }
 

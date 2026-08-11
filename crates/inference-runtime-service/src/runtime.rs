@@ -10,12 +10,12 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TrySendError;
 use crossbeam_channel::bounded as sync_bounded;
+use inference_executor_core::model::ReplayableModel;
 use inference_runtime_core::Error;
 use inference_runtime_core::Result;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::channel::ShutdownGuard;
-use inference_runtime_core::compute::ReplayableModel;
 use inference_runtime_core::compute::ReplayableModelExecutorRequest;
 use inference_runtime_core::compute::ReplayableModelExecutorResponse;
 use inference_runtime_core::config::RuntimeConfig;
@@ -145,8 +145,12 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         };
 
         let (user_req_tx, user_req_rx) = sync_bounded(model_runtime_config.max_queued_requests);
-        let (model_executor_req_tx, model_executor_req_rx) = sync_bounded(scheduler_config.max_compute_slots);
-        let (model_executor_resp_tx, model_executor_resp_rx) = sync_bounded(scheduler_config.max_compute_slots);
+        let model_executor_channel_capacity = scheduler_config
+            .max_compute_slots
+            .checked_add(1)
+            .expect("model executor channel capacity must fit usize");
+        let (model_executor_req_tx, model_executor_req_rx) = sync_bounded(model_executor_channel_capacity);
+        let (model_executor_resp_tx, model_executor_resp_rx) = sync_bounded(model_executor_channel_capacity);
         let (swap_out_task_tx, swap_out_task_rx) = async_bounded(model_runtime_config.max_running_requests);
         let (swap_in_task_tx, swap_in_task_rx) =
             sync_bounded::<RuntimeRequest<N, P, L>>(model_runtime_config.max_running_requests);
@@ -169,6 +173,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                 model_executor_resp_rx,
                 scheduler,
                 req_slot_allocator,
+                model_runtime_config.model_idle_timeout,
                 shutdown.clone(),
             );
             let scheduler_shutdown = shutdown.clone();
@@ -310,7 +315,6 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
 ) -> Result<()>
 where
     M: ReplayableModel,
-    M::LifecycleError: std::fmt::Display,
 {
     let shutdown = Shutdown::new();
     let server_tokio_runtime = tokio::runtime::Runtime::new()
@@ -370,9 +374,14 @@ fn default_model_state_snapshot_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use inference_runtime_core::Error;
     use inference_runtime_core::channel::Shutdown;
+    use inference_runtime_core::compute::ReplayableModelExecutorRequest;
+    use inference_runtime_core::compute::ReplayableModelExecutorResponse;
     use inference_runtime_core::config::CacheLaneRuntimeConfig;
+    use inference_runtime_core::config::DEFAULT_MODEL_IDLE_TIMEOUT;
     use inference_runtime_core::config::RuntimeConfig;
     use inference_runtime_core::config::SamplingConfig;
     use inference_runtime_core::config::SchedulerConfig;
@@ -387,6 +396,7 @@ mod tests {
         let runtime_config = RuntimeConfig {
             max_queued_requests: 1,
             max_running_requests: 1,
+            model_idle_timeout: DEFAULT_MODEL_IDLE_TIMEOUT,
             num_tokens_per_cache_block: 1024,
             num_kv_heads: 1,
             kv_head_dim: 1,
@@ -442,13 +452,53 @@ mod tests {
         mtp_shutdown.shutdown();
     }
 
+    #[test]
+    fn test_model_executor_stops_when_idle_and_starts_before_batch() {
+        let (runtime, shutdown, _async_runtime) = test_runtime_with_idle_timeout::<1>(Duration::from_millis(20));
+        let request_rx = runtime.model_executor_request_rx();
+        let response_tx = runtime.model_executor_response_tx();
+
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorRequest::Stop
+        ));
+        response_tx.send(ReplayableModelExecutorResponse::Stopped).unwrap();
+
+        let (queued_request, _external_request) = runtime
+            .initialize_req(1, vec![Token::new(1)], SamplingConfig::default())
+            .unwrap();
+        runtime.submit_req(queued_request).unwrap();
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorRequest::Start
+        ));
+        response_tx.send(ReplayableModelExecutorResponse::Started).unwrap();
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorRequest::Batch(_)
+        ));
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReplayableModelExecutorRequest::Stop
+        ));
+
+        shutdown.shutdown();
+    }
+
     fn test_runtime<const L: usize>() -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
+        test_runtime_with_idle_timeout(DEFAULT_MODEL_IDLE_TIMEOUT)
+    }
+
+    fn test_runtime_with_idle_timeout<const L: usize>(
+        model_idle_timeout: Duration,
+    ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
         let shutdown = Shutdown::new();
         let async_runtime = tokio::runtime::Runtime::new().expect("test Tokio runtime should initialize");
         let runtime = InferenceRuntime::<1024, L, 4>::new(
             RuntimeConfig {
                 max_queued_requests: 1,
                 max_running_requests: 1,
+                model_idle_timeout,
                 num_tokens_per_cache_block: 1024,
                 num_kv_heads: 1,
                 kv_head_dim: 1,

@@ -343,10 +343,20 @@ Start          -> Started
 Stop           -> Stopped
 ```
 
-The current runtime event loop wraps each prepared device batch in `Batch` and unwraps its matching `Batch` response.
-It does not send `Start` or `Stop` yet.
-It treats an unsolicited `Started` or `Stopped` response as an internal contract violation.
-Runtime state tracking and idle-stop policy are separate work.
+The runtime event loop tracks the commanded `Started` or `Stopped` state.
+It appends `Stop` to the same ordered channel after all batches that it has already sent.
+The executor completes those batches before it handles `Stop`.
+It sends `Start` when a stopped executor has work to flush.
+It can append a batch after `Start` without a separate transition state.
+The ordered channel guarantees that the executor handles `Start` before that batch.
+The runtime consumes `Started` and `Stopped` as acknowledgements and then attempts the next flush.
+
+Each protocol channel reserves one entry in addition to the compute-slot capacity.
+This entry lets runtime core append `Stop` after every compute slot has submitted a batch.
+
+The idle condition does not require zero live requests.
+A request can remain in runtime core while it waits for resources.
+The model state snapshot preserves executor state for that request across stop and start.
 
 Recommendation: Send core-owned lifecycle changes from core to the executor:
 

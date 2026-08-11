@@ -1,8 +1,11 @@
+use std::time::Duration;
+
 use crate::runtime::Token;
 
 pub const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_SAMPLING_TOP_K: usize = 20;
 pub const DEFAULT_SAMPLING_TOP_P: f32 = 0.8;
+pub const DEFAULT_MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_SAMPLING_TOP_K: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
@@ -16,6 +19,7 @@ pub struct CacheLaneRuntimeConfig {
 pub struct RuntimeConfig {
     pub max_queued_requests: usize,
     pub max_running_requests: usize,
+    pub model_idle_timeout: Duration,
 
     /// Logical token extent of one shared trie/GQA/GDN cache block.
     pub num_tokens_per_cache_block: usize,

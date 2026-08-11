@@ -59,6 +59,9 @@ cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
   --num-spec-tokens 1
 ```
 
+The service unloads model state and weights after 300 seconds without executable model work.
+The next request reloads them automatically.
+
 Stream an HTTP Chat Completions response:
 
 ```sh

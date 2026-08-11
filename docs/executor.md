@@ -318,7 +318,9 @@ remain confined to one thread unless an API explicitly states otherwise.
 Runtime core still owns the durable request and cache lifecycle. The executor reports sampled decisions and component
 results. It does not free globally owned pages or commit scheduler state independently.
 
+`inference-executor-core` owns `ReplayableModel`, executor timing, submission, and page interpretation contracts.
 `ReplayableModel` also defines synchronous model residency operations.
+All recoverable model operations return `ModelExecutorError`.
 Current Qwen model executors support this order:
 
 ```text
@@ -341,9 +343,8 @@ It releases all new resources after a read failure.
 
 `ReplayableModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
 It also starts a stopped model before it executes a batch.
-Runtime core currently sends only batch requests.
-Executor residency tracking and idle policy remain design work.
-See [`model_idle_unload.md`](model_idle_unload.md) for the current boundary and remaining wiring.
+Runtime core tracks executor residency and sends ordered lifecycle commands after the configured idle period.
+See [`model_idle_unload.md`](model_idle_unload.md) for the current lifecycle and remaining work.
 
 ## Verification boundary
 

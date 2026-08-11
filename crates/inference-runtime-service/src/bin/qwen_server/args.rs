@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -31,6 +32,13 @@ pub struct Qwen3Args {
 
     #[arg(long, value_enum, default_value_t = QwenLogLevel::Info)]
     pub logging: QwenLogLevel,
+
+    #[arg(
+        long,
+        default_value = "300",
+        help = "Seconds without model execution before state and weights unload"
+    )]
+    pub model_idle_timeout_secs: NonZeroU64,
 
     #[arg(
         long,
@@ -87,6 +95,13 @@ pub struct Qwen35Args {
 
     #[arg(long, value_enum, default_value_t = QwenLogLevel::Info)]
     pub logging: QwenLogLevel,
+
+    #[arg(
+        long,
+        default_value = "300",
+        help = "Seconds without model execution before state and weights unload"
+    )]
+    pub model_idle_timeout_secs: NonZeroU64,
 
     #[arg(
         long,
@@ -147,6 +162,7 @@ mod tests {
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages.get(), 262_144);
+        assert_eq!(args.model_idle_timeout_secs.get(), 300);
     }
 
     #[test]
@@ -161,6 +177,7 @@ mod tests {
         assert_eq!(args.num_cache_pages.get(), 262_144);
         assert_eq!(args.hf_dspark_model_dir, None);
         assert_eq!(args.num_spec_tokens, None);
+        assert_eq!(args.model_idle_timeout_secs.get(), 300);
     }
 
     #[test]
@@ -254,6 +271,7 @@ mod tests {
     #[test]
     fn test_positive_capacities_reject_zero() {
         for flag in [
+            "--model-idle-timeout-secs",
             "--num-cache-pages",
             "--max-requests",
             "--max-tokens",

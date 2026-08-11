@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use inference_runtime_core::Result;
 use inference_runtime_core::config::SchedulerConfig;
@@ -33,6 +34,7 @@ pub struct Qwen3Config {
     hf_model_dir: PathBuf,
     model_mode: Qwen3ModelMode,
     telemetry: TelemetryConfig,
+    model_idle_timeout: Duration,
     num_cache_pages: usize,
     max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
@@ -84,6 +86,7 @@ impl Qwen3Config {
                 },
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
+            model_idle_timeout: Duration::from_secs(args.model_idle_timeout_secs.get()),
             num_cache_pages: args.num_cache_pages.get(),
             max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
@@ -113,6 +116,10 @@ impl Qwen3Config {
 
     pub fn telemetry_config(&self) -> TelemetryConfig {
         self.telemetry
+    }
+
+    pub fn model_idle_timeout(&self) -> Duration {
+        self.model_idle_timeout
     }
 
     pub fn num_cache_pages(&self) -> usize {
@@ -167,6 +174,7 @@ pub struct Qwen35Config {
     hf_model_dir: PathBuf,
     model_mode: Qwen35ModelMode,
     telemetry: TelemetryConfig,
+    model_idle_timeout: Duration,
     num_cache_pages: usize,
     max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
@@ -235,6 +243,7 @@ impl Qwen35Config {
                 },
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
+            model_idle_timeout: Duration::from_secs(args.model_idle_timeout_secs.get()),
             num_cache_pages: args.num_cache_pages.get(),
             max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
@@ -264,6 +273,10 @@ impl Qwen35Config {
 
     pub fn telemetry_config(&self) -> TelemetryConfig {
         self.telemetry
+    }
+
+    pub fn model_idle_timeout(&self) -> Duration {
+        self.model_idle_timeout
     }
 
     pub fn num_cache_lanes(&self) -> usize {

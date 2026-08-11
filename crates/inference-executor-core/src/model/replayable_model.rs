@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::compute::BatchDeviceRequest;
-use crate::compute::BatchDeviceResponse;
-use crate::compute::DeviceRequest;
-use crate::runtime::RawRequestSlot;
-use crate::runtime::Token;
+use inference_runtime_core::compute::BatchDeviceRequest;
+use inference_runtime_core::compute::BatchDeviceResponse;
+use inference_runtime_core::compute::DeviceRequest;
+use inference_runtime_core::runtime::RawRequestSlot;
+use inference_runtime_core::runtime::Token;
+
+use crate::def::ModelExecutorError;
 
 pub trait ExecutionSubmission {
     fn wait(&self);
@@ -18,7 +20,6 @@ pub trait ReplayableModel {
     type SampledOutput;
     type ModelOpsRecorder;
     type Submission: ExecutionSubmission;
-    type LifecycleError;
 
     fn model_name(&self) -> &str;
 
@@ -29,10 +30,10 @@ pub trait ReplayableModel {
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]);
 
     fn clear_replay_cache(&mut self);
-    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError>;
+    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError>;
     fn unload_weights(&mut self);
-    fn load_weights(&mut self) -> Result<(), Self::LifecycleError>;
-    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), Self::LifecycleError>;
+    fn load_weights(&mut self) -> Result<(), ModelExecutorError>;
+    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError>;
 
     fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest;
     fn commit_batch(

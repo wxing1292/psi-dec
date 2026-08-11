@@ -43,12 +43,25 @@ document that owns the component.
   It defines their cross-thread contract explicitly.
   Then implement KV and state onload and offload as a separate lifecycle.
   This lifecycle must remain distinct from the existing reservation-wait task.
-- Replace full model-state snapshot CPU staging with aligned direct or mapped I/O between shared Metal buffers and
-  snapshot storage.
-  Preserve full-file checksums, atomic publication, and synchronous model-executor lifecycle APIs.
-  Add selective I/O only with a compact index that identifies each resource, page, request, layer, and state slot.
-- When a later change revises the service and executor boundary, move `ReplayableModel` and the executor
-  timing and output traits out of `inference-runtime-core`.
+- Optimize full model-state snapshot I/O.
+  Keep weight handling outside this path.
+  `unload_weights()` must drop Metal weight residency without writing weights to the snapshot.
+  `load_weights()` must reload weights from the original checkpoint.
+  Replace bounded CPU staging with mapped or aligned direct I/O between shared Metal buffers and snapshot storage.
+  Coalesce adjacent state ranges to reduce copies and system calls.
+  Avoid per-record allocations and duplicate checksum scans.
+  Preserve the model fingerprint, header and section checksums, temporary-file sync, atomic rename, and synchronous
+  model-executor lifecycle APIs.
+  Record snapshot bytes, write and read duration, effective bandwidth, and peak host-memory overhead before and after
+  the change.
+- Add selective model-state snapshot I/O after the full-state path is measured and correct.
+  Runtime core must supply the valid page IDs and request slots for one runtime cache generation.
+  The selection must include referenced GDN state slots and future-publish mappings.
+  It must cover Main, MTP, and DSpark cache lanes.
+  The snapshot index must identify each resource, lane, layer, page, request, and state slot.
+  State write and read APIs must remain symmetric.
+  Snapshot load must reject a stale cache generation, invalid selection, missing resource, or checksum mismatch.
+  Any validation or I/O failure must shut down the service and discard the runtime cache generation.
 
 ## Pipeline Parallelism
 

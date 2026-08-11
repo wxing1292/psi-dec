@@ -1,8 +1,11 @@
 use std::marker::PhantomData;
+use std::time::Duration;
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Select;
 use crossbeam_channel::Sender;
+use crossbeam_channel::after;
 
 use crate::Result;
 use crate::channel::Shutdown;
@@ -28,11 +31,21 @@ pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, 
 
     scheduler: InstrumentedScheduler<S>,
     request_slot_allocator: RequestSlotAllocator,
+    model_executor_state: ModelExecutorState,
+    model_idle_timeout: Duration,
+    model_idle_timer: Receiver<Instant>,
+    idle_heartbeat: Instant,
 
     shutdown: Shutdown,
 
     phantom_data_device_req: PhantomData<DeviceReq>,
     phantom_data_device_resp: PhantomData<DeviceResp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelExecutorState {
+    Started,
+    Stopped,
 }
 
 impl<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
@@ -45,6 +58,7 @@ where
     BatchDeviceResp: BatchDevResp<DeviceResp>,
     S: Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_req_rx: Receiver<QueuedReq>,
         swap_in_task_rx: Receiver<UserReq>,
@@ -52,16 +66,24 @@ where
         model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
         scheduler: InstrumentedScheduler<S>,
         request_slot_allocator: RequestSlotAllocator,
+        model_idle_timeout: Duration,
         shutdown: Shutdown,
     ) -> Self {
+        assert!(
+            !model_idle_timeout.is_zero(),
+            "runtime model idle timeout must be positive"
+        );
         Self {
             user_req_rx,
             swap_in_task_rx,
             model_executor_req_tx,
             model_executor_resp_rx,
-
             scheduler,
             request_slot_allocator,
+            model_executor_state: ModelExecutorState::Started,
+            model_idle_timeout,
+            model_idle_timer: after(model_idle_timeout),
+            idle_heartbeat: Instant::now(),
 
             shutdown,
 
@@ -86,6 +108,10 @@ where
             } else {
                 None
             };
+            let op_model_idle_timer = match self.model_executor_state {
+                ModelExecutorState::Started => Some(select.recv(&self.model_idle_timer)),
+                ModelExecutorState::Stopped => None,
+            };
             let op = select.select();
             let op_index = op.index();
             match op_index {
@@ -95,83 +121,61 @@ where
                     break 'event_loop;
                 },
                 _ if op_index == op_recv_model_executor_resp => {
-                    let model_executor_resp = op.recv(&self.model_executor_resp_rx);
+                    let model_executor_resp = op.recv(&self.model_executor_resp_rx).map_err(|error| {
+                        log_err_internal!("model executor response channel closed, stopping: {error}")
+                    })?;
                     match model_executor_resp {
-                        Ok(ReplayableModelExecutorResponse::Batch(batch_dev_resp)) => {
+                        ReplayableModelExecutorResponse::Batch(batch_dev_resp) => {
                             self.scheduler.commit(batch_dev_resp);
-                            if self.scheduler.can_flush()
-                                && do_flush(&mut self.scheduler, &self.model_executor_req_tx).is_err()
-                            {
-                                break 'event_loop;
-                            }
+                            self.idle_heartbeat = Instant::now();
                         },
-                        Ok(ReplayableModelExecutorResponse::Started) => {
-                            panic!("runtime event loop received Started without issuing Start")
-                        },
-                        Ok(ReplayableModelExecutorResponse::Stopped) => {
-                            panic!("runtime event loop received Stopped without issuing Stop")
-                        },
-                        Err(_) => {
-                            tracing::debug!("model executor response channel closed, stopping");
-                            break 'event_loop;
-                        },
+                        ReplayableModelExecutorResponse::Started | ReplayableModelExecutorResponse::Stopped => {},
                     }
                 },
                 _ if op_index == op_recv_swap_in_task => {
-                    let user_req = op.recv(&self.swap_in_task_rx);
-                    match user_req {
-                        Ok(user_req) => {
-                            if user_req.is_terminal() {
-                                tracing::debug!(
-                                    target: "inference-runtime-core::scheduler",
-                                    phase = "request.reservation_wait_terminal",
-                                    request_id = user_req.id(),
-                                    "terminal reservation-wait request dropped"
-                                );
-                                drop(user_req);
-                            } else {
-                                self.scheduler.swap_in(user_req);
-                            }
-                        },
-                        Err(_) => {
-                            tracing::debug!("swap-in request channel closed, stopping");
-                            break 'event_loop;
-                        },
-                    }
-                    // TODO: drain both ready request receivers before flushing
-                    // so swap-in priority does not depend on Select order.
-                    if self.scheduler.can_flush() && do_flush(&mut self.scheduler, &self.model_executor_req_tx).is_err()
-                    {
-                        break 'event_loop;
+                    let user_req = op
+                        .recv(&self.swap_in_task_rx)
+                        .map_err(|error| log_err_internal!("swap-in request channel closed, stopping: {error}"))?;
+                    if user_req.is_terminal() {
+                        tracing::debug!(
+                            target: "inference-runtime-core::scheduler",
+                            phase = "request.reservation_wait_terminal",
+                            request_id = user_req.id(),
+                            "terminal reservation-wait request dropped"
+                        );
+                        drop(user_req);
+                    } else {
+                        self.scheduler.swap_in(user_req);
                     }
                 },
                 _ if Some(op_index) == op_recv_req => {
-                    let queued_req = op.recv(&self.user_req_rx);
-                    match queued_req {
-                        Ok(queued_req) => {
-                            let request_slot = match self.request_slot_allocator.allocate() {
-                                RequestSlotAllocationResult::Ok { request_slot } => request_slot,
-                                RequestSlotAllocationResult::ResourceLimitExceeded => {
-                                    panic!("available request-slot capacity must allow allocation")
-                                },
-                            };
-                            let user_req = UserReq::from((queued_req, request_slot));
-                            user_req.store_running();
-                            self.scheduler.enqueue(user_req);
-                            if self.scheduler.can_flush()
-                                && do_flush(&mut self.scheduler, &self.model_executor_req_tx).is_err()
-                            {
-                                break 'event_loop;
-                            }
+                    let queued_req = op
+                        .recv(&self.user_req_rx)
+                        .map_err(|error| log_err_internal!("user request channel closed, stopping: {error}"))?;
+                    let request_slot = match self.request_slot_allocator.allocate() {
+                        RequestSlotAllocationResult::Ok { request_slot } => request_slot,
+                        RequestSlotAllocationResult::ResourceLimitExceeded => {
+                            panic!("available request-slot capacity must allow allocation")
                         },
-                        Err(_) => {
-                            tracing::debug!("user request channel closed, stopping");
-                            break 'event_loop;
-                        },
+                    };
+                    let user_req = UserReq::from((queued_req, request_slot));
+                    user_req.store_running();
+                    self.scheduler.enqueue(user_req);
+                },
+                _ if Some(op_index) == op_model_idle_timer => {
+                    let _ = op
+                        .recv(&self.model_idle_timer)
+                        .expect("selected model idle timer must fire");
+                    let idle_duration = self.idle_heartbeat.elapsed();
+                    if idle_duration >= self.model_idle_timeout {
+                        self.stop_model_executor()?;
+                    } else {
+                        self.model_idle_timer = after(self.model_idle_timeout - idle_duration);
                     }
                 },
                 _ => unreachable!(),
             }
+            self.do_flush()?;
         }
 
         self.shutdown.shutdown();
@@ -179,31 +183,62 @@ where
         tracing::info!("stopped");
         Ok(())
     }
-}
 
-fn do_flush<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>(
-    scheduler: &mut S,
-    model_executor_req_tx: &Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
-) -> Result<()>
-where
-    UserReq: UserRequest<DeviceReq, DeviceResp>,
-    DeviceReq: DevReq,
-    DeviceResp: DevResp,
-    BatchDeviceReq: BatchDevReq<DeviceReq>,
-    BatchDeviceResp: BatchDevResp<DeviceResp>,
-    S: Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp>,
-{
-    let batch_dev_req = scheduler.prepare();
-    match model_executor_req_tx.try_send(ReplayableModelExecutorRequest::Batch(batch_dev_req)) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let ReplayableModelExecutorRequest::Batch(batch_dev_req) = err.into_inner() else {
-                unreachable!("runtime scheduler only sends Batch model executor requests")
-            };
-            scheduler.cancel(batch_dev_req);
-            Err(log_err_internal!(
-                "batch device request channel full / closed, stopping"
-            ))
-        },
+    fn do_flush(&mut self) -> Result<()> {
+        match self.model_executor_state {
+            ModelExecutorState::Started => {
+                while self.scheduler.can_flush() {
+                    let batch_dev_req = self.scheduler.prepare();
+                    match self
+                        .model_executor_req_tx
+                        .try_send(ReplayableModelExecutorRequest::Batch(batch_dev_req))
+                    {
+                        Ok(()) => {
+                            self.idle_heartbeat = Instant::now();
+                        },
+                        Err(error) => {
+                            let ReplayableModelExecutorRequest::Batch(batch_dev_req) = error.into_inner() else {
+                                unreachable!("runtime scheduler only sends Batch model executor requests")
+                            };
+                            self.scheduler.cancel(batch_dev_req);
+                            return Err(log_err_internal!(
+                                "batch device request channel full / closed, stopping"
+                            ));
+                        },
+                    }
+                }
+            },
+            ModelExecutorState::Stopped if self.scheduler.can_flush() => {
+                self.start_model_executor()?;
+            },
+            ModelExecutorState::Stopped => {},
+        }
+        Ok(())
+    }
+
+    fn start_model_executor(&mut self) -> Result<()> {
+        debug_assert_eq!(self.model_executor_state, ModelExecutorState::Stopped);
+
+        self.model_executor_req_tx
+            .try_send(ReplayableModelExecutorRequest::Start)
+            .map_err(|error| {
+                log_err_internal!("model executor request channel full / closed while starting, stopping: {error}")
+            })?;
+        self.model_executor_state = ModelExecutorState::Started;
+        self.model_idle_timer = after(self.model_idle_timeout);
+        self.idle_heartbeat = Instant::now();
+        Ok(())
+    }
+
+    fn stop_model_executor(&mut self) -> Result<()> {
+        debug_assert_eq!(self.model_executor_state, ModelExecutorState::Started);
+
+        self.model_executor_req_tx
+            .try_send(ReplayableModelExecutorRequest::Stop)
+            .map_err(|error| {
+                log_err_internal!("model executor request channel full / closed while stopping, stopping: {error}")
+            })?;
+        self.model_executor_state = ModelExecutorState::Stopped;
+        Ok(())
     }
 }
