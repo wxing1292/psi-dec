@@ -1,7 +1,11 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GQAPageTableLayout;
+use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::compute::BatchDeviceRequest;
+
+use crate::model::state_snapshot::StateSnapshotReader;
+use crate::model::state_snapshot::StateSnapshotWriter;
 
 #[derive(Debug)]
 pub struct GQARequestPageTable {
@@ -47,7 +51,7 @@ impl GQARequestPageTable {
         self.assert_layer_index(layer_index);
         self.assert_block_index(block_index);
         let start = self.page_ids_start_index(req_slot, layer_index, block_index);
-        self.page_ids.read_typed(start, self.num_page_ids_per_block())
+        self.page_ids_buffer().read_typed(start, self.num_page_ids_per_block())
     }
 
     pub fn page_ids_buffer(&self) -> &Buffer {
@@ -64,7 +68,7 @@ impl GQARequestPageTable {
             "GQA page-id count must match one request/GQA-layer/block entry"
         );
         let start = self.page_ids_start_index(req_slot, layer_index, block_index);
-        self.page_ids.write_typed(start, page_ids);
+        self.page_ids_buffer().write_typed(start, page_ids);
     }
 
     pub fn prepare(&self, batch: &BatchDeviceRequest, cache_lane: usize, num_cache_pages: usize) {
@@ -137,7 +141,15 @@ impl GQARequestPageTable {
             .and_then(|count| count.checked_mul(self.num_page_ids_per_block()))
             .and_then(|count| count.checked_mul(size_of::<u32>()))
             .expect("GQA request page-table reset byte length must fit usize");
-        self.page_ids.zero_bytes(start, len);
+        self.page_ids_buffer().zero_bytes(start, len);
+    }
+
+    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
+        writer.write_buffer(resource, self.page_ids_buffer())
+    }
+
+    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
+        reader.read_buffer(resource, self.page_ids_buffer())
     }
 
     pub fn reset_req_slots(&self, req_slots: &[u32]) {
@@ -182,6 +194,13 @@ impl GQARequestPageTable {
             .and_then(|index| index.checked_add(block_index))
             .and_then(|index| index.checked_mul(self.num_page_ids_per_block()))
             .expect("GQA request page-table flat index must fit usize")
+    }
+
+    fn page_ids_per_request(&self) -> usize {
+        self.num_layers()
+            .checked_mul(self.num_blocks())
+            .and_then(|count| count.checked_mul(self.num_page_ids_per_block()))
+            .expect("GQA request page-table row length must fit usize")
     }
 
     fn write_runtime_block_span(

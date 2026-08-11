@@ -5,4 +5,5 @@ pub mod page_arena;
 pub mod qwen;
 pub mod residual_add;
 pub mod rms_norm;
+pub mod state_snapshot;
 pub mod unembedding;

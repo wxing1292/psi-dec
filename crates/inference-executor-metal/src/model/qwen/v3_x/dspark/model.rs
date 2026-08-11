@@ -31,11 +31,11 @@ pub struct Qwen3xDSparkModel {
 }
 
 pub struct Qwen3xDSparkContext {
-    model: Rc<Qwen3xDSparkModel>,
+    model: Option<Rc<Qwen3xDSparkModel>>,
 }
 
 pub struct Qwen3xDSparkBody {
-    model: Rc<Qwen3xDSparkModel>,
+    model: Option<Rc<Qwen3xDSparkModel>>,
 }
 
 #[derive(Clone, Copy)]
@@ -171,6 +171,18 @@ impl Qwen3xDSparkModel {
             .unload_weights();
     }
 
+    pub fn unload_state(&mut self) {
+        for layer in self.layers.iter_mut().rev() {
+            layer.unload_state();
+        }
+    }
+
+    pub fn load_state(&mut self, state: &UngatedDSparkGQAState) {
+        for layer in &mut self.layers {
+            layer.load_state(state);
+        }
+    }
+
     pub fn main_feature_projector(&self) -> Rc<Qwen3xDSparkMainFeatureProjector> {
         Rc::clone(&self.main_feature_projector)
     }
@@ -218,7 +230,27 @@ impl Qwen3xDSparkModel {
 
 impl Qwen3xDSparkContext {
     pub fn new(model: Rc<Qwen3xDSparkModel>) -> Self {
-        Self { model }
+        Self { model: Some(model) }
+    }
+
+    pub fn take_model(&mut self) -> Rc<Qwen3xDSparkModel> {
+        self.model
+            .take()
+            .expect("Qwen3.x DSpark context model state must be loaded")
+    }
+
+    pub fn set_model(&mut self, model: Rc<Qwen3xDSparkModel>) {
+        assert!(
+            self.model.is_none(),
+            "Qwen3.x DSpark context model state is already loaded"
+        );
+        self.model = Some(model);
+    }
+
+    fn model(&self) -> &Qwen3xDSparkModel {
+        self.model
+            .as_deref()
+            .expect("Qwen3.x DSpark context model state must be loaded before execution")
     }
 }
 
@@ -233,13 +265,33 @@ impl ReplayComponent for Qwen3xDSparkContext {
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.model.record_context(recorder, *input);
+        self.model().record_context(recorder, *input);
     }
 }
 
 impl Qwen3xDSparkBody {
     pub fn new(model: Rc<Qwen3xDSparkModel>) -> Self {
-        Self { model }
+        Self { model: Some(model) }
+    }
+
+    pub fn take_model(&mut self) -> Rc<Qwen3xDSparkModel> {
+        self.model
+            .take()
+            .expect("Qwen3.x DSpark body model state must be loaded")
+    }
+
+    pub fn set_model(&mut self, model: Rc<Qwen3xDSparkModel>) {
+        assert!(
+            self.model.is_none(),
+            "Qwen3.x DSpark body model state is already loaded"
+        );
+        self.model = Some(model);
+    }
+
+    fn model(&self) -> &Qwen3xDSparkModel {
+        self.model
+            .as_deref()
+            .expect("Qwen3.x DSpark body model state must be loaded before execution")
     }
 }
 
@@ -256,6 +308,6 @@ impl ReplayComponent for Qwen3xDSparkBody {
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.model.record_body(recorder, *input);
+        self.model().record_body(recorder, *input);
     }
 }

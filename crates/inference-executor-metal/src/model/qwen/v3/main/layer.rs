@@ -120,6 +120,14 @@ impl Qwen3MainLayer {
         self.attention.unload_weights();
     }
 
+    pub fn unload_state(&mut self) {
+        self.attention.unload_state();
+    }
+
+    pub fn load_state(&mut self, state: &Qwen3MainGQAState) {
+        self.attention.load_state(state);
+    }
+
     pub fn layer_index(&self) -> usize {
         self.layer_index
     }

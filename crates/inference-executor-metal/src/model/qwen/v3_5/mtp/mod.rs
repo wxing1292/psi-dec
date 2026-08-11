@@ -43,7 +43,7 @@ const QWEN35_MTP_FIRST_CACHE_LANE: usize = 1;
 pub struct Qwen35MTP {
     layer: Qwen35MTPLayer,
     output_norm: RMSNorm,
-    request_page_table: Rc<GQARequestPageTable>,
+    request_page_table: Option<Rc<GQARequestPageTable>>,
     num_cache_pages: usize,
     replay_bucket_policy: ReplayBucketPolicy,
 }
@@ -91,7 +91,7 @@ impl Qwen35MTP {
         Ok(Self {
             layer,
             output_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
-            request_page_table: Rc::clone(gqa_state.request_page_table()),
+            request_page_table: Some(Rc::clone(gqa_state.request_page_table())),
             num_cache_pages,
             replay_bucket_policy: mtp_replay_bucket_policy(max_tokens, topology_boundaries),
         })
@@ -133,6 +133,22 @@ impl Qwen35MTP {
         self.layer.unload_weights();
     }
 
+    pub fn unload_state(&mut self) {
+        self.layer.unload_state();
+        self.request_page_table
+            .take()
+            .expect("qwen3.5 MTP request page-table state must be loaded");
+    }
+
+    pub fn load_state(&mut self, state: &Qwen3xGQAState) {
+        assert!(
+            self.request_page_table.is_none(),
+            "qwen3.5 MTP request page-table state is already loaded"
+        );
+        self.request_page_table = Some(Rc::clone(state.request_page_table()));
+        self.layer.load_state(state);
+    }
+
     pub fn replay_token_capacity(&self, num_active_tokens: u32) -> u32 {
         self.replay_bucket_policy.capacity(num_active_tokens)
     }
@@ -157,7 +173,7 @@ impl Qwen35MTP {
     }
 
     pub fn prepare_pages(&self, batch: &BatchDeviceRequest) {
-        prepare_request_page_table(&self.request_page_table, batch, self.num_cache_pages);
+        prepare_request_page_table(self.request_page_table(), batch, self.num_cache_pages);
     }
 
     pub fn validate_batch(&self, microbatch: &Qwen35Microbatch) {
@@ -170,15 +186,21 @@ impl Qwen35MTP {
             .max()
             .expect("qwen3.5 MTP batch requires requests") as usize;
         let page_capacity = self
-            .request_page_table
+            .request_page_table()
             .num_blocks()
-            .checked_mul(self.request_page_table.num_page_ids_per_block())
+            .checked_mul(self.request_page_table().num_page_ids_per_block())
             .expect("qwen3.5 MTP GQA page capacity must fit usize");
         let tokens_per_page = self.layer.gqa_tokens_per_page();
         assert!(
             max_context_tokens.div_ceil(tokens_per_page.max(1)) <= page_capacity,
             "qwen3.5 MTP GQA request context exceeds page-table capacity"
         );
+    }
+
+    fn request_page_table(&self) -> &GQARequestPageTable {
+        self.request_page_table
+            .as_deref()
+            .expect("qwen3.5 MTP request page-table state must be loaded before execution")
     }
 }
 

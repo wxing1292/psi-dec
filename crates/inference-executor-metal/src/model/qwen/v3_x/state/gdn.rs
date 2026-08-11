@@ -6,6 +6,7 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
+use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::backend::GDN;
@@ -17,11 +18,14 @@ use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
 use crate::attn::gdn::batch_metadata::GDNReplayBucketPolicy;
 use crate::attn::gdn::scratch::GDNScratch;
 use crate::attn::gdn::state_table::GDNPreparedRequestState;
+use crate::attn::gdn::state_table::GDNRequestStateResources;
 use crate::attn::gdn::state_table::GDNRequestStateTable;
 use crate::attn::gdn::state_table::GDNStateCapacity;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::def::replay_op::ReplayRecorder;
+use crate::model::state_snapshot::StateSnapshotReader;
+use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::replay::Replay;
 use crate::replay::ReplayComponent;
 use crate::trace;
@@ -29,10 +33,10 @@ use crate::trace;
 pub struct Qwen3xGDNState {
     backend: Rc<GDN>,
     scratch: Rc<GDNScratch>,
-    request_state_table: Rc<GDNRequestStateTable>,
     metadata: GDNMetadataBuffers,
     replay_bucket_policy: GDNReplayBucketPolicy,
-    state_restore: Replay<Rc<GDNRequestStateTable>>,
+    request_state_table: GDNRequestStateTable,
+    state_restore: Replay<GDNStateRestore>,
     pending_publish: Option<MetalReplaySubmission>,
 }
 
@@ -43,21 +47,24 @@ pub struct GDNStateRestoreKey {
 
 #[derive(Clone, Copy)]
 pub struct GDNStateRestoreInput<'a> {
+    request_state_table: &'a GDNRequestStateTable,
     pages: &'a Buffer,
 }
 
-impl ReplayComponent for Rc<GDNRequestStateTable> {
+pub struct GDNStateRestore;
+
+impl ReplayComponent for GDNStateRestore {
     type Key = GDNStateRestoreKey;
     type Input<'a> = GDNStateRestoreInput<'a>;
 
-    fn replay_key(&self, _input: &Self::Input<'_>) -> Self::Key {
-        let num_state_io_requests = self.restores().len();
+    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
+        let num_state_io_requests = input.request_state_table.restores().len();
         assert!(num_state_io_requests > 0, "GDN restore replay requires restore jobs");
         GDNStateRestoreKey { num_state_io_requests }
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        GDNRequestStateTable::record_restore(self, recorder, input.pages);
+        input.request_state_table.record_restore(recorder, input.pages);
     }
 }
 
@@ -76,14 +83,14 @@ impl Qwen3xGDNState {
         let representative = cores
             .first()
             .expect("qwen3.x GDN state requires at least one GDN layer");
-        let request_state_table = Rc::new(GDNRequestStateTable::new(
+        let request_state_table = GDNRequestStateTable::new(
             device,
             cores,
             num_req_slots,
             state_capacity,
             num_tokens_per_block,
             page_bytes,
-        ));
+        );
         let backend = Rc::new(GDN::new(device, representative.clone(), metal));
         let max_requests = num_req_slots
             .try_into()
@@ -93,10 +100,10 @@ impl Qwen3xGDNState {
         Self {
             backend,
             scratch: Rc::new(GDNScratch::new(device, representative, max_tokens)),
-            request_state_table: Rc::clone(&request_state_table),
             metadata: GDNMetadataBuffers::new(device, num_req_slots, max_tokens),
             replay_bucket_policy,
-            state_restore: Replay::new("qwen3.x GDN state restore", Rc::clone(&request_state_table)),
+            request_state_table,
+            state_restore: Replay::new("qwen3.x GDN state restore", GDNStateRestore),
             pending_publish: None,
         }
     }
@@ -109,8 +116,8 @@ impl Qwen3xGDNState {
         &self.scratch
     }
 
-    pub fn request_state_table(&self) -> &Rc<GDNRequestStateTable> {
-        &self.request_state_table
+    pub fn request_state_resources(&self) -> &Rc<GDNRequestStateResources> {
+        self.request_state_table.resources()
     }
 
     pub fn metadata(&self) -> &GDNMetadataBuffers {
@@ -182,7 +189,10 @@ impl Qwen3xGDNState {
             trace::gdn_state(|| "event=gdn_restore skipped=true".to_string());
             return;
         }
-        let input = GDNStateRestoreInput { pages };
+        let input = GDNStateRestoreInput {
+            request_state_table: &self.request_state_table,
+            pages,
+        };
         let (key, cache_hit) = self.state_restore.record(runtime, &input);
         trace::gdn_state(|| format!("event=gdn_restore key={key:?} cache_hit={cache_hit}"));
         runtime.submit_replay(self.state_restore.replay(&key)).wait();
@@ -213,6 +223,34 @@ impl Qwen3xGDNState {
             "GDN replay cache cannot be cleared while a state publish is pending"
         );
         self.state_restore.clear();
+    }
+
+    pub fn write_full_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        recurrent_resource: u32,
+        conv_resource: u32,
+    ) -> Result<(), ModelExecutorError> {
+        self.request_state_table
+            .write_full_state(writer, recurrent_resource, conv_resource)
+    }
+
+    pub fn unload_state(&mut self) {
+        self.request_state_table.unload_state();
+    }
+
+    pub fn load_state(&mut self, device: &Device) {
+        self.request_state_table.load_state(device);
+    }
+
+    pub fn read_full_state(
+        &self,
+        reader: &mut StateSnapshotReader,
+        recurrent_resource: u32,
+        conv_resource: u32,
+    ) -> Result<(), ModelExecutorError> {
+        self.request_state_table
+            .read_full_state(reader, recurrent_resource, conv_resource)
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {

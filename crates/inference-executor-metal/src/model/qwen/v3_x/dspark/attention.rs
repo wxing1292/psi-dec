@@ -34,9 +34,9 @@ pub struct Qwen3xDSparkAttention {
     weights: Option<Qwen3xUngatedGQAWeightBuffers>,
     backend: UngatedDSparkGQA,
     context_appender: UngatedDSparkGQAContextAppender,
-    block_scratch: Rc<DSparkBlockScratch>,
-    context_scratch: Rc<DSparkGQAContextScratch>,
-    request_page_table: Rc<GQARequestPageTable>,
+    block_scratch: Option<Rc<DSparkBlockScratch>>,
+    context_scratch: Option<Rc<DSparkGQAContextScratch>>,
+    request_page_table: Option<Rc<GQARequestPageTable>>,
 }
 
 impl Qwen3xDSparkAttention {
@@ -54,9 +54,9 @@ impl Qwen3xDSparkAttention {
             weights: None,
             backend: UngatedDSparkGQA::new(device, core.clone(), metal),
             context_appender: UngatedDSparkGQAContextAppender::new(device, core.clone(), metal),
-            block_scratch: state.block_scratch(),
-            context_scratch: state.context_scratch(),
-            request_page_table: state.request_page_table(),
+            block_scratch: Some(state.block_scratch()),
+            context_scratch: Some(state.context_scratch()),
+            request_page_table: Some(state.request_page_table()),
         }
     }
 
@@ -90,6 +90,26 @@ impl Qwen3xDSparkAttention {
         self.weights.take();
     }
 
+    pub fn unload_state(&mut self) {
+        assert!(
+            self.block_scratch.is_some() && self.context_scratch.is_some() && self.request_page_table.is_some(),
+            "Qwen3.x DSpark attention state is not loaded"
+        );
+        self.request_page_table.take();
+        self.context_scratch.take();
+        self.block_scratch.take();
+    }
+
+    pub fn load_state(&mut self, state: &UngatedDSparkGQAState) {
+        assert!(
+            self.block_scratch.is_none() && self.context_scratch.is_none() && self.request_page_table.is_none(),
+            "Qwen3.x DSpark attention state is already loaded"
+        );
+        self.block_scratch = Some(state.block_scratch());
+        self.context_scratch = Some(state.context_scratch());
+        self.request_page_table = Some(state.request_page_table());
+    }
+
     fn weights(&self) -> &Qwen3xUngatedGQAWeightBuffers {
         self.weights
             .as_ref()
@@ -111,17 +131,17 @@ impl Qwen3xDSparkAttention {
             recorder,
             UngatedDSparkGQAContextInput {
                 num_tokens,
-                page_table_layout: self.request_page_table.layout(),
+                page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dspark_layer_index,
                 main_feature,
                 req_slots,
                 flat_token_indices,
                 kv_cache: GQAKVCacheBindings {
                     kv_pages: pages,
-                    page_ids: self.request_page_table.page_ids_buffer(),
+                    page_ids: self.request_page_table().page_ids_buffer(),
                 },
                 weights: self.weights().as_borrowed(),
-                scratch: self.context_scratch.bindings(),
+                scratch: self.context_scratch().bindings(),
             },
         );
     }
@@ -140,19 +160,37 @@ impl Qwen3xDSparkAttention {
             &self.backend,
             recorder,
             UngatedDSparkGQAInput {
-                page_table_layout: self.request_page_table.layout(),
+                page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dspark_layer_index,
                 metadata,
                 hidden_state: hidden_input,
                 next_hidden_state: hidden_output,
                 kv_cache: GQAKVCacheBindings {
                     kv_pages: pages,
-                    page_ids: self.request_page_table.page_ids_buffer(),
+                    page_ids: self.request_page_table().page_ids_buffer(),
                 },
                 weights: self.weights().as_borrowed(),
-                scratch: self.block_scratch.bindings(),
+                scratch: self.block_scratch().bindings(),
             },
         );
+    }
+
+    fn block_scratch(&self) -> &DSparkBlockScratch {
+        self.block_scratch
+            .as_deref()
+            .expect("Qwen3.x DSpark block scratch must be loaded before execution")
+    }
+
+    fn context_scratch(&self) -> &DSparkGQAContextScratch {
+        self.context_scratch
+            .as_deref()
+            .expect("Qwen3.x DSpark context scratch must be loaded before execution")
+    }
+
+    fn request_page_table(&self) -> &GQARequestPageTable {
+        self.request_page_table
+            .as_deref()
+            .expect("Qwen3.x DSpark request page-table state must be loaded before execution")
     }
 }
 

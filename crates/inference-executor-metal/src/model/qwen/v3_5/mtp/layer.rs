@@ -147,6 +147,14 @@ impl Qwen35MTPLayer {
         self.attention.unload_weights();
     }
 
+    pub fn unload_state(&mut self) {
+        self.attention.unload_state();
+    }
+
+    pub fn load_state(&mut self, state: &Qwen3xGQAState) {
+        self.attention.load_state(state);
+    }
+
     pub fn gqa_tokens_per_page(&self) -> usize {
         self.attention.num_tokens_per_page()
     }

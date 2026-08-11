@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
@@ -11,6 +12,7 @@ use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::backend::runtime::Runtime;
+use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35DecodeDecision;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelBatchRequest;
@@ -62,6 +64,9 @@ use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkRecording;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
+use crate::model::state_snapshot::ModelFingerprint;
+use crate::model::state_snapshot::StateSnapshotReader;
+use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::replay::Replay;
 use crate::sampling::rejection_replay::PreparedRejection;
 use crate::sampling::rejection_replay::RejectionReplayKey;
@@ -93,6 +98,12 @@ include!("main.rs");
 include!("mtp.rs");
 include!("recording.rs");
 include!("sampling.rs");
+
+const QWEN35_STATE_PAGE_ARENA: u32 = 1;
+const QWEN35_STATE_MAIN_GQA_TABLE: u32 = 2;
+const QWEN35_STATE_MAIN_GDN_RECURRENT: u32 = 3;
+const QWEN35_STATE_MAIN_GDN_CONV: u32 = 4;
+const QWEN35_STATE_SPEC_GQA_TABLE: u32 = 5;
 
 #[allow(clippy::upper_case_acronyms)]
 enum Qwen35Speculator {
@@ -259,6 +270,44 @@ impl Qwen35Speculator {
             },
         }
     }
+
+    fn write_full_state(&self, writer: &mut StateSnapshotWriter) -> Result<(), ModelExecutorError> {
+        match self {
+            Self::Vanilla => Ok(()),
+            Self::MTP(mtp) => mtp.gqa_state.write_full_state(writer, QWEN35_STATE_SPEC_GQA_TABLE),
+            Self::DSpark(dspark) => dspark.execution.write_full_state(writer, QWEN35_STATE_SPEC_GQA_TABLE),
+        }
+    }
+
+    fn unload_state(&mut self) {
+        match self {
+            Self::Vanilla => {},
+            Self::MTP(mtp) => {
+                mtp.body.component_mut().unload_state();
+                mtp.gqa_state.unload_state();
+            },
+            Self::DSpark(dspark) => dspark.execution.unload_state(),
+        }
+    }
+
+    fn load_state(&mut self, device: &inference_backend_metal::metal::Device) {
+        match self {
+            Self::Vanilla => {},
+            Self::MTP(mtp) => {
+                mtp.gqa_state.load_state(device);
+                mtp.body.component_mut().load_state(&mtp.gqa_state);
+            },
+            Self::DSpark(dspark) => dspark.execution.load_state(device),
+        }
+    }
+
+    fn read_full_state(&self, reader: &mut StateSnapshotReader) -> Result<(), ModelExecutorError> {
+        match self {
+            Self::Vanilla => Ok(()),
+            Self::MTP(mtp) => mtp.gqa_state.read_full_state(reader, QWEN35_STATE_SPEC_GQA_TABLE),
+            Self::DSpark(dspark) => dspark.execution.read_full_state(reader, QWEN35_STATE_SPEC_GQA_TABLE),
+        }
+    }
 }
 
 pub struct Qwen35Executor {
@@ -288,6 +337,7 @@ pub struct Qwen35Executor {
     pending_transactions: Qwen35PendingTransactions,
     gqa_page_table_layout: GQAPageTableLayout,
     num_runtime_page_ids_per_main_block: usize,
+    state_fingerprint: ModelFingerprint,
 }
 
 impl Qwen35Executor {
@@ -298,6 +348,55 @@ impl Qwen35Executor {
         self.sampling.clear();
         self.main_gdn_state.clear_replay_cache();
         self.speculator.clear_replay_cache();
+    }
+
+    pub fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+        assert!(
+            self.pending_transactions.is_empty(),
+            "qwen3.5 state unloading requires all pending model transactions to complete"
+        );
+        let mut writer = StateSnapshotWriter::new(snapshot_path, self.state_fingerprint)?;
+        self.main_gqa_state
+            .write_full_state(&mut writer, QWEN35_STATE_MAIN_GQA_TABLE)?;
+        self.main_gdn_state.write_full_state(
+            &mut writer,
+            QWEN35_STATE_MAIN_GDN_RECURRENT,
+            QWEN35_STATE_MAIN_GDN_CONV,
+        )?;
+        self.speculator.write_full_state(&mut writer)?;
+        self.pages.write_full_state(&mut writer, QWEN35_STATE_PAGE_ARENA)?;
+        writer.commit()?;
+
+        self.main.component_mut().unload_state();
+        self.speculator.unload_state();
+        self.main_gqa_state.unload_state();
+        self.main_gdn_state.unload_state();
+        self.pages.unload_state();
+        Ok(())
+    }
+
+    pub fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+        let mut reader = StateSnapshotReader::open(snapshot_path, self.state_fingerprint)?;
+        let device = self.runtime.device().clone();
+        self.main_gqa_state.load_state(&device);
+        self.main_gdn_state.load_state(&device);
+        self.speculator.load_state(&device);
+        self.pages.load_state(&device);
+        self.main
+            .component_mut()
+            .load_state(&self.main_gqa_state, &self.main_gdn_state);
+
+        self.main_gqa_state
+            .read_full_state(&mut reader, QWEN35_STATE_MAIN_GQA_TABLE)?;
+        self.main_gdn_state.read_full_state(
+            &mut reader,
+            QWEN35_STATE_MAIN_GDN_RECURRENT,
+            QWEN35_STATE_MAIN_GDN_CONV,
+        )?;
+        self.speculator.read_full_state(&mut reader)?;
+        self.pages.read_full_state(&mut reader, QWEN35_STATE_PAGE_ARENA)?;
+        reader.finish()?;
+        Ok(())
     }
 }
 

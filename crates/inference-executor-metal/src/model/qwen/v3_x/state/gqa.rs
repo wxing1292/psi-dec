@@ -5,6 +5,7 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
+use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
 
@@ -17,11 +18,14 @@ use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::attn::gqa::scratch::GQAScratch;
+use crate::model::state_snapshot::StateSnapshotReader;
+use crate::model::state_snapshot::StateSnapshotWriter;
 
 pub struct Qwen3xGQAState {
     backend: Rc<GQA>,
     scratch: Rc<GQAScratch>,
-    request_page_table: Rc<GQARequestPageTable>,
+    request_page_table: Option<Rc<GQARequestPageTable>>,
+    page_table_layout: GQAPageTableLayout,
     metadata: GQAMetadataBuffers,
     replay_bucket_policy: GQAReplayBucketPolicy,
     num_cache_pages: usize,
@@ -52,7 +56,8 @@ impl Qwen3xGQAState {
         Self {
             backend,
             scratch,
-            request_page_table: Rc::new(GQARequestPageTable::new(device, page_table_layout)),
+            request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
+            page_table_layout,
             metadata: GQAMetadataBuffers::new(device, max_tokens),
             replay_bucket_policy,
             num_cache_pages,
@@ -69,7 +74,9 @@ impl Qwen3xGQAState {
     }
 
     pub fn request_page_table(&self) -> &Rc<GQARequestPageTable> {
-        &self.request_page_table
+        self.request_page_table
+            .as_ref()
+            .expect("Qwen3.x GQA request page-table state must be loaded")
     }
 
     pub fn metadata(&self) -> &GQAMetadataBuffers {
@@ -77,7 +84,7 @@ impl Qwen3xGQAState {
     }
 
     pub fn prepare_pages(&self, core_batch: &BatchDeviceRequest) {
-        self.request_page_table
+        self.request_page_table()
             .prepare(core_batch, self.cache_lane, self.num_cache_pages);
     }
 
@@ -87,7 +94,7 @@ impl Qwen3xGQAState {
         num_runtime_page_ids_per_block: usize,
         page_id_offset: usize,
     ) {
-        self.request_page_table.prepare_span(
+        self.request_page_table().prepare_span(
             core_batch,
             self.cache_lane,
             self.num_cache_pages,
@@ -150,6 +157,28 @@ impl Qwen3xGQAState {
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {
-        self.request_page_table.reset_req_slots(req_slots);
+        self.request_page_table().reset_req_slots(req_slots);
+    }
+
+    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
+        self.request_page_table().write_full_state(writer, resource)
+    }
+
+    pub fn unload_state(&mut self) {
+        self.request_page_table
+            .take()
+            .expect("Qwen3.x GQA request page-table state must be loaded");
+    }
+
+    pub fn load_state(&mut self, device: &Device) {
+        assert!(
+            self.request_page_table.is_none(),
+            "Qwen3.x GQA request page-table state is already loaded"
+        );
+        self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
+    }
+
+    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
+        self.request_page_table().read_full_state(reader, resource)
     }
 }

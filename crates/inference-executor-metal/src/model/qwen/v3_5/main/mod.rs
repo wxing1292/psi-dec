@@ -161,6 +161,18 @@ impl Qwen35Main {
         self.residual_capture = residual_capture;
     }
 
+    pub fn unload_state(&mut self) {
+        for layer in self.layers.iter_mut().rev() {
+            layer.unload_state();
+        }
+    }
+
+    pub fn load_state(&mut self, gqa_state: &Qwen3xGQAState, gdn_state: &Qwen3xGDNState) {
+        for layer in &mut self.layers {
+            layer.load_state(gqa_state, gdn_state);
+        }
+    }
+
     pub fn replay_token_capacity(&self, num_active_tokens: u32) -> u32 {
         self.replay_bucket_policy.capacity(num_active_tokens)
     }

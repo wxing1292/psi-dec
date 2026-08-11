@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::mem::size_of;
 use std::mem::take;
+use std::rc::Rc;
 
 use inference_backend_metal::components::GDNStatePageBatchConfig;
 use inference_backend_metal::components::GDNStatePageBatchRead;
@@ -16,6 +17,7 @@ use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::attn::gdn::state::to_candidate_state_version;
 use inference_executor_core::attn::gdn::state::to_state_version;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::request_state_table::GDNRequestSlots;
@@ -23,6 +25,8 @@ use crate::attn::gdn::request_state_table::GDNStatePages;
 use crate::attn::gdn::request_state_table::GDNStatePublish;
 use crate::attn::gdn::request_state_table::GDNStateRestore;
 use crate::def::replay_op::ReplayOp;
+use crate::model::state_snapshot::StateSnapshotReader;
+use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::trace;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,12 +79,17 @@ pub struct GDNRequestStateTable {
     num_tokens_per_block: usize,
     max_materialized_states_per_req: usize,
     max_publish_jobs_per_req: usize,
-    recurrent_states: Buffer,
-    conv_states: Buffer,
+    resources: Option<Rc<GDNRequestStateResources>>,
     request_table: RefCell<GDNRequestSlots>,
     restores: RefCell<Vec<GDNStateRestore>>,
     publishes: RefCell<Vec<GDNStatePublish>>,
     pending_request_txns: RefCell<Vec<GDNStateRequestTxn>>,
+}
+
+pub struct GDNRequestStateResources {
+    layout: GDNStateLayout,
+    recurrent_states: Buffer,
+    conv_states: Buffer,
     page_io: GDNStatePageIO,
 }
 
@@ -211,51 +220,16 @@ impl GDNRequestStateTable {
             conv_state_bytes,
             page_bytes,
         };
-        let recurrent_layer_bytes = u64::try_from(layout.num_state_slots)
-            .expect("GDN state-slot count must fit u64")
-            .checked_mul(recurrent_state_bytes_u64)
-            .expect("GDN recurrent layer byte length must fit u64");
-        let conv_layer_bytes = u64::try_from(layout.num_state_slots)
-            .expect("GDN state-slot count must fit u64")
-            .checked_mul(conv_state_bytes_u64)
-            .expect("GDN convolution layer byte length must fit u64");
-        // Kernels bind the aggregate arenas at offset zero and add these layer
-        // bases with Metal `ulong`. Their layer-local element indices remain u32.
-        assert_u32_element_index_domain(recurrent_layer_bytes, size_of::<f32>(), "GDN recurrent layer state");
-        assert_u32_element_index_domain(conv_layer_bytes, size_of::<f32>(), "GDN convolution layer state");
-        let num_gdn_layers_u64 = u64::try_from(layout.num_gdn_layers).expect("GDN layer count must fit u64");
-        let recurrent_states_bytes = num_gdn_layers_u64
-            .checked_mul(recurrent_layer_bytes)
-            .expect("GDN recurrent state arena byte length must fit u64");
-        let conv_states_bytes = num_gdn_layers_u64
-            .checked_mul(conv_layer_bytes)
-            .expect("GDN convolution state arena byte length must fit u64");
-        let num_page_ids = max_state_io_requests
-            .checked_mul(
-                layout
-                    .num_gdn_layers
-                    .checked_mul(
-                        recurrent_state_bytes
-                            .div_ceil(layout.page_bytes)
-                            .checked_add(conv_state_bytes.div_ceil(layout.page_bytes))
-                            .expect("GDN per-layer state page count overflow"),
-                    )
-                    .expect("GDN all-layer state page count overflow"),
-            )
-            .expect("GDN page-ID size overflow");
-
         Self {
             layout,
             num_tokens_per_block,
             max_materialized_states_per_req: capacity.max_materialized_states_per_req,
             max_publish_jobs_per_req: capacity.max_publish_jobs_per_req,
-            recurrent_states: Buffer::new_zeroed(device, recurrent_states_bytes),
-            conv_states: Buffer::new_zeroed(device, conv_states_bytes),
+            resources: Some(Rc::new(GDNRequestStateResources::new(device, layout))),
             request_table: RefCell::new(request_table),
             restores: RefCell::new(Vec::with_capacity(num_req_slots)),
             publishes: RefCell::new(Vec::with_capacity(layout.max_state_io_requests)),
             pending_request_txns: RefCell::new(Vec::with_capacity(num_req_slots)),
-            page_io: GDNStatePageIO::new(device, num_page_ids, layout),
         }
     }
 
@@ -275,6 +249,42 @@ impl GDNRequestStateTable {
         self.layout.num_gdn_layers
     }
 
+    pub fn write_full_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        recurrent_resource: u32,
+        conv_resource: u32,
+    ) -> Result<(), ModelExecutorError> {
+        writer.write_buffer(recurrent_resource, &self.resources().recurrent_states)?;
+        writer.write_buffer(conv_resource, &self.resources().conv_states)?;
+        Ok(())
+    }
+
+    pub fn unload_state(&mut self) {
+        self.resources
+            .take()
+            .expect("GDN request-state resources must be loaded");
+    }
+
+    pub fn load_state(&mut self, device: &Device) {
+        assert!(
+            self.resources.is_none(),
+            "GDN request-state resources are already loaded"
+        );
+        self.resources = Some(Rc::new(GDNRequestStateResources::new(device, self.layout)));
+    }
+
+    pub fn read_full_state(
+        &self,
+        reader: &mut StateSnapshotReader,
+        recurrent_resource: u32,
+        conv_resource: u32,
+    ) -> Result<(), ModelExecutorError> {
+        reader.read_buffer(recurrent_resource, &self.resources().recurrent_states)?;
+        reader.read_buffer(conv_resource, &self.resources().conv_states)?;
+        Ok(())
+    }
+
     fn recurrent_state_bytes(&self) -> usize {
         self.layout.recurrent_state_bytes
     }
@@ -283,37 +293,25 @@ impl GDNRequestStateTable {
         self.layout.conv_state_bytes
     }
 
+    pub fn resources(&self) -> &Rc<GDNRequestStateResources> {
+        self.resources
+            .as_ref()
+            .expect("GDN request-state resources must be loaded before execution")
+    }
+
+    fn state_slot_offset(&self, layer_index: usize, state_slot: u32, state_bytes: usize) -> usize {
+        assert!(layer_index < self.layout.num_gdn_layers);
+        let state_slot = state_slot as usize;
+        assert!(state_slot < self.layout.num_state_slots);
+        layer_index
+            .checked_mul(self.layout.num_state_slots)
+            .and_then(|index| index.checked_add(state_slot))
+            .and_then(|index| index.checked_mul(state_bytes))
+            .expect("GDN state slot byte offset must fit usize")
+    }
+
     pub fn layer_bindings(&self, gdn_layer_index: usize) -> GDNStateArenaBindings<'_> {
-        assert!(gdn_layer_index < self.layout.num_gdn_layers);
-        let recurrent_layer_offset_bytes = u64::try_from(gdn_layer_index)
-            .expect("GDN layer index must fit u64")
-            .checked_mul(
-                u64::try_from(self.layout.num_state_slots)
-                    .expect("GDN state-slot count must fit u64")
-                    .checked_mul(
-                        u64::try_from(self.recurrent_state_bytes())
-                            .expect("GDN recurrent state slot bytes must fit u64"),
-                    )
-                    .expect("GDN recurrent layer byte length must fit u64"),
-            )
-            .expect("GDN recurrent layer byte offset must fit u64");
-        let conv_layer_offset_bytes = u64::try_from(gdn_layer_index)
-            .expect("GDN layer index must fit u64")
-            .checked_mul(
-                u64::try_from(self.layout.num_state_slots)
-                    .expect("GDN state-slot count must fit u64")
-                    .checked_mul(
-                        u64::try_from(self.conv_state_bytes()).expect("GDN convolution state slot bytes must fit u64"),
-                    )
-                    .expect("GDN convolution layer byte length must fit u64"),
-            )
-            .expect("GDN convolution layer byte offset must fit u64");
-        GDNStateArenaBindings {
-            recurrent_states: &self.recurrent_states,
-            recurrent_layer_offset_bytes,
-            conv_states: &self.conv_states,
-            conv_layer_offset_bytes,
-        }
+        self.resources().layer_bindings(gdn_layer_index)
     }
 
     pub fn restores(&self) -> Vec<GDNStateRestore> {
@@ -333,7 +331,9 @@ impl GDNRequestStateTable {
             restores.len() <= self.request_table.borrow().num_req_slots(),
             "GDN restore I/O requests exceed request-slot capacity"
         );
-        self.page_io.prepare_restore(&restores, self.num_pages_per_state_slot());
+        self.resources()
+            .page_io
+            .prepare_restore(&restores, self.num_pages_per_state_slot());
         true
     }
 
@@ -342,11 +342,12 @@ impl GDNRequestStateTable {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let restores = self.restores.borrow();
-        self.page_io.record_restore(
+        let resources = self.resources();
+        resources.page_io.record_restore(
             recorder,
             pages,
-            &self.recurrent_states,
-            &self.conv_states,
+            &resources.recurrent_states,
+            &resources.conv_states,
             self.layout,
             &restores,
         );
@@ -364,13 +365,15 @@ impl GDNRequestStateTable {
             publishes.len() <= self.layout.max_state_io_requests,
             "GDN publish I/O requests exceed state-I/O request capacity"
         );
-        self.page_io
+        let resources = self.resources();
+        resources
+            .page_io
             .prepare_publish(&publishes, self.num_pages_per_state_slot());
-        self.page_io.record_publish(
+        resources.page_io.record_publish(
             recorder,
             pages,
-            &self.recurrent_states,
-            &self.conv_states,
+            &resources.recurrent_states,
+            &resources.conv_states,
             self.layout,
             &publishes,
         );
@@ -495,7 +498,8 @@ impl GDNRequestStateTable {
                 .expect("GDN recurrent arena byte offset must fit u64")
                 .try_into()
                 .expect("GDN recurrent arena byte offset must fit host usize");
-            self.recurrent_states
+            self.resources()
+                .recurrent_states
                 .zero_bytes(recurrent_state_slot_offset_bytes, self.recurrent_state_bytes());
             let conv_state_slot_offset_bytes = layer
                 .conv_layer_offset_bytes
@@ -511,7 +515,8 @@ impl GDNRequestStateTable {
                 .expect("GDN convolution arena byte offset must fit u64")
                 .try_into()
                 .expect("GDN convolution arena byte offset must fit host usize");
-            self.conv_states
+            self.resources()
+                .conv_states
                 .zero_bytes(conv_state_slot_offset_bytes, self.conv_state_bytes());
         }
         trace::gdn_state(|| format!("event=gdn_state_zero slot={state_slot}"));
@@ -553,6 +558,90 @@ impl GDNRequestStateTable {
                 txn.num_candidate_states() as usize <= self.max_materialized_states_per_req,
                 "GDN candidate range exceeds per-request capacity"
             );
+        }
+    }
+}
+
+impl GDNRequestStateResources {
+    fn new(device: &Device, layout: GDNStateLayout) -> Self {
+        let recurrent_layer_bytes = u64::try_from(layout.num_state_slots)
+            .expect("GDN state-slot count must fit u64")
+            .checked_mul(
+                layout
+                    .recurrent_state_bytes
+                    .try_into()
+                    .expect("GDN recurrent state slot bytes must fit u64"),
+            )
+            .expect("GDN recurrent layer byte length must fit u64");
+        let conv_layer_bytes = u64::try_from(layout.num_state_slots)
+            .expect("GDN state-slot count must fit u64")
+            .checked_mul(
+                layout
+                    .conv_state_bytes
+                    .try_into()
+                    .expect("GDN convolution state slot bytes must fit u64"),
+            )
+            .expect("GDN convolution layer byte length must fit u64");
+        // Kernels bind the aggregate arenas at offset zero and add these layer
+        // bases with Metal `ulong`. Their layer-local element indices remain u32.
+        assert_u32_element_index_domain(recurrent_layer_bytes, size_of::<f32>(), "GDN recurrent layer state");
+        assert_u32_element_index_domain(conv_layer_bytes, size_of::<f32>(), "GDN convolution layer state");
+        let num_gdn_layers: u64 = layout.num_gdn_layers.try_into().expect("GDN layer count must fit u64");
+        let recurrent_states_bytes = num_gdn_layers
+            .checked_mul(recurrent_layer_bytes)
+            .expect("GDN recurrent state arena byte length must fit u64");
+        let conv_states_bytes = num_gdn_layers
+            .checked_mul(conv_layer_bytes)
+            .expect("GDN convolution state arena byte length must fit u64");
+        let pages_per_state_slot = layout
+            .recurrent_state_bytes
+            .div_ceil(layout.page_bytes)
+            .checked_add(layout.conv_state_bytes.div_ceil(layout.page_bytes))
+            .and_then(|pages| pages.checked_mul(layout.num_gdn_layers))
+            .expect("GDN all-layer pages per state slot must fit usize");
+        let num_page_ids = layout
+            .max_state_io_requests
+            .checked_mul(pages_per_state_slot)
+            .expect("GDN page-ID size overflow");
+        Self {
+            layout,
+            recurrent_states: Buffer::new_zeroed(device, recurrent_states_bytes),
+            conv_states: Buffer::new_zeroed(device, conv_states_bytes),
+            page_io: GDNStatePageIO::new(device, num_page_ids, layout),
+        }
+    }
+
+    pub fn layer_bindings(&self, gdn_layer_index: usize) -> GDNStateArenaBindings<'_> {
+        assert!(gdn_layer_index < self.layout.num_gdn_layers);
+        let recurrent_layer_offset_bytes = u64::try_from(gdn_layer_index)
+            .expect("GDN layer index must fit u64")
+            .checked_mul(
+                u64::try_from(self.layout.num_state_slots)
+                    .expect("GDN state-slot count must fit u64")
+                    .checked_mul(
+                        u64::try_from(self.layout.recurrent_state_bytes)
+                            .expect("GDN recurrent state slot bytes must fit u64"),
+                    )
+                    .expect("GDN recurrent layer byte length must fit u64"),
+            )
+            .expect("GDN recurrent layer byte offset must fit u64");
+        let conv_layer_offset_bytes = u64::try_from(gdn_layer_index)
+            .expect("GDN layer index must fit u64")
+            .checked_mul(
+                u64::try_from(self.layout.num_state_slots)
+                    .expect("GDN state-slot count must fit u64")
+                    .checked_mul(
+                        u64::try_from(self.layout.conv_state_bytes)
+                            .expect("GDN convolution state slot bytes must fit u64"),
+                    )
+                    .expect("GDN convolution layer byte length must fit u64"),
+            )
+            .expect("GDN convolution layer byte offset must fit u64");
+        GDNStateArenaBindings {
+            recurrent_states: &self.recurrent_states,
+            recurrent_layer_offset_bytes,
+            conv_states: &self.conv_states,
+            conv_layer_offset_bytes,
         }
     }
 }
@@ -1010,6 +1099,7 @@ mod tests {
         let page_ids = [2_u32];
 
         state
+            .resources()
             .page_io
             .assert_page_buffer_and_ids(&pages, state.layout.page_bytes, page_ids.iter());
     }

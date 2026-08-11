@@ -24,6 +24,10 @@ impl Qwen35PendingTransactions {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+    }
+
     pub fn pending_microbatch(&self, compute_seq: RawComputeSlotSeq) -> &Qwen35Microbatch {
         let transaction = self
             .transactions

@@ -8,6 +8,7 @@ use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedDSparkGQACore;
+use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
 
@@ -16,12 +17,15 @@ use crate::attn::dspark::context::DSparkGQAContextScratch;
 use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
 use crate::attn::dspark::scratch::DSparkBlockScratch;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
+use crate::model::state_snapshot::StateSnapshotReader;
+use crate::model::state_snapshot::StateSnapshotWriter;
 
 pub struct UngatedDSparkGQAState {
     compute: GQACompute,
     block_scratch: Rc<DSparkBlockScratch>,
     context_scratch: Rc<DSparkGQAContextScratch>,
-    request_page_table: Rc<GQARequestPageTable>,
+    request_page_table: Option<Rc<GQARequestPageTable>>,
+    page_table_layout: GQAPageTableLayout,
     metadata: DSparkGQAMetadataBuffers,
     num_tokens_per_page: usize,
     num_cache_pages: usize,
@@ -74,7 +78,8 @@ impl UngatedDSparkGQAState {
                 compute_config.io_dtype,
                 max_context_tokens,
             )),
-            request_page_table: Rc::new(GQARequestPageTable::new(device, page_table_layout)),
+            request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
+            page_table_layout,
             metadata: DSparkGQAMetadataBuffers::new(device, gqa_capacity),
             num_tokens_per_page,
             num_cache_pages,
@@ -101,7 +106,7 @@ impl UngatedDSparkGQAState {
         num_runtime_page_ids_per_block: usize,
         page_id_offset: usize,
     ) {
-        self.request_page_table.prepare_span(
+        self.request_page_table_ref().prepare_span(
             batch,
             self.cache_lane,
             self.num_cache_pages,
@@ -111,7 +116,7 @@ impl UngatedDSparkGQAState {
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {
-        self.request_page_table.reset_req_slots(req_slots);
+        self.request_page_table_ref().reset_req_slots(req_slots);
     }
 
     pub fn block_scratch(&self) -> Rc<DSparkBlockScratch> {
@@ -123,10 +128,38 @@ impl UngatedDSparkGQAState {
     }
 
     pub fn request_page_table(&self) -> Rc<GQARequestPageTable> {
-        Rc::clone(&self.request_page_table)
+        Rc::clone(self.request_page_table_ref())
     }
 
     pub fn metadata(&self) -> &DSparkGQAMetadataBuffers {
         &self.metadata
+    }
+
+    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
+        self.request_page_table_ref().write_full_state(writer, resource)
+    }
+
+    pub fn unload_state(&mut self) {
+        self.request_page_table
+            .take()
+            .expect("DSpark GQA request page-table state must be loaded");
+    }
+
+    pub fn load_state(&mut self, device: &Device) {
+        assert!(
+            self.request_page_table.is_none(),
+            "DSpark GQA request page-table state is already loaded"
+        );
+        self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
+    }
+
+    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
+        self.request_page_table_ref().read_full_state(reader, resource)
+    }
+
+    fn request_page_table_ref(&self) -> &Rc<GQARequestPageTable> {
+        self.request_page_table
+            .as_ref()
+            .expect("DSpark GQA request page-table state must be loaded")
     }
 }

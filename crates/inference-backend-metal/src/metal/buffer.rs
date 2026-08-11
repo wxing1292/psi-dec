@@ -172,6 +172,34 @@ impl Buffer {
         }
     }
 
+    pub fn write_bytes(&self, start_bytes: usize, values: &[u8]) {
+        let buffer_len = self.len_bytes();
+        assert!(start_bytes <= buffer_len);
+        let end_bytes = start_bytes
+            .checked_add(values.len())
+            .expect("byte buffer write end offset must fit usize");
+        assert!(end_bytes <= buffer_len);
+
+        let dst = unsafe { self.contents().cast::<u8>().add(start_bytes) };
+        unsafe {
+            dst.copy_from_nonoverlapping(values.as_ptr(), values.len());
+        }
+    }
+
+    pub fn read_bytes(&self, start_bytes: usize, output: &mut [u8]) {
+        let buffer_len = self.len_bytes();
+        assert!(start_bytes <= buffer_len);
+        let end_bytes = start_bytes
+            .checked_add(output.len())
+            .expect("byte buffer read end offset must fit usize");
+        assert!(end_bytes <= buffer_len);
+
+        let src = unsafe { self.contents().cast::<u8>().add(start_bytes) };
+        unsafe {
+            output.as_mut_ptr().copy_from_nonoverlapping(src, output.len());
+        }
+    }
+
     pub fn write_typed<T: MetalBufferElement>(&self, start: usize, values: &[T]) {
         let start_bytes = start
             .checked_mul(T::DTYPE.item_size())

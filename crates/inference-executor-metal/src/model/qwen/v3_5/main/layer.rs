@@ -163,6 +163,14 @@ impl Qwen35MainLayer {
         self.attention.unload_weights();
     }
 
+    pub fn unload_state(&mut self) {
+        self.attention.unload_state();
+    }
+
+    pub fn load_state(&mut self, gqa_state: &Qwen3xGQAState, gdn_state: &Qwen3xGDNState) {
+        self.attention.load_state(gqa_state, gdn_state);
+    }
+
     pub fn layer_index(&self) -> usize {
         self.layer_index
     }
@@ -371,7 +379,7 @@ impl Qwen35MainAttention {
                     attn_layer_index,
                     Rc::clone(gdn_state.backend()),
                     Rc::clone(gdn_state.scratch()),
-                    Rc::clone(gdn_state.request_state_table()),
+                    Rc::clone(gdn_state.request_state_resources()),
                 )))
             },
         }
@@ -403,6 +411,20 @@ impl Qwen35MainAttention {
         match self {
             Self::Gqa(component) => component.unload_weights(),
             Self::Gdn(component) => component.unload_weights(),
+        }
+    }
+
+    fn unload_state(&mut self) {
+        match self {
+            Self::Gqa(component) => component.unload_state(),
+            Self::Gdn(component) => component.unload_state(),
+        }
+    }
+
+    fn load_state(&mut self, gqa_state: &Qwen3xGQAState, gdn_state: &Qwen3xGDNState) {
+        match self {
+            Self::Gqa(component) => component.load_state(gqa_state),
+            Self::Gdn(component) => component.load_state(gdn_state),
         }
     }
 

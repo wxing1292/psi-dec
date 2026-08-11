@@ -33,6 +33,10 @@ impl<T: ReplayComponent> Replay<T> {
         &self.component
     }
 
+    pub fn component_mut(&mut self) -> &mut T {
+        &mut self.component
+    }
+
     pub fn clear(&mut self) {
         self.cache.clear();
     }

@@ -43,6 +43,10 @@ document that owns the component.
   It defines their cross-thread contract explicitly.
   Then implement KV and state onload and offload as a separate lifecycle.
   This lifecycle must remain distinct from the existing reservation-wait task.
+- Replace full model-state snapshot CPU staging with aligned direct or mapped I/O between shared Metal buffers and
+  snapshot storage.
+  Preserve full-file checksums, atomic publication, and synchronous model-executor lifecycle APIs.
+  Add selective I/O only with a compact index that identifies each resource, page, request, layer, and state slot.
 - When a later change revises the service and executor boundary, move `ReplayableModelBatchExecutor` and the executor
   timing and output traits out of `inference-runtime-core`.
 

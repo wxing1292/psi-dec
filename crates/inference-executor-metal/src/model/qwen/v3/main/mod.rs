@@ -118,6 +118,18 @@ impl Qwen3Main {
         self.residual_capture = residual_capture;
     }
 
+    pub fn unload_state(&mut self) {
+        for layer in self.layers.iter_mut().rev() {
+            layer.unload_state();
+        }
+    }
+
+    pub fn load_state(&mut self, state: &Qwen3MainGQAState) {
+        for layer in &mut self.layers {
+            layer.load_state(state);
+        }
+    }
+
     pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen3MainArgs<'a>) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+crc32fast = { workspace = true }
 half = { workspace = true }
 inference-backend-metal = { workspace = true }
 inference-executor-core = { workspace = true }

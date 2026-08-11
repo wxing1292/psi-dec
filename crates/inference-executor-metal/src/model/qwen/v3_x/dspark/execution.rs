@@ -8,6 +8,7 @@ use inference_backend_metal::metal::ReplayExecution;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
+use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
@@ -25,12 +26,15 @@ use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyReplayKey;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContext;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextReplayKey;
+use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkModel;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembed;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedArgs;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedReplayKey;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSampling;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingArgs;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingReplayKey;
+use crate::model::state_snapshot::StateSnapshotReader;
+use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
@@ -44,6 +48,7 @@ pub struct Qwen3xDSparkExecution {
     body: Replay<Qwen3xDSparkBody>,
     gather_unembed: Replay<Qwen3xDSparkGatherUnembed>,
     sampling: Replay<Qwen3xDSparkSampling>,
+    unloaded_model: Option<Qwen3xDSparkModel>,
     hidden_input: Rc<Buffer>,
     hidden_output: Rc<Buffer>,
     unembed_hidden: Buffer,
@@ -123,6 +128,7 @@ impl Qwen3xDSparkExecution {
                 ),
             ),
             sampling: Replay::new("Qwen3x DSpark Sampling", Qwen3xDSparkSampling::new(loaded.markov)),
+            unloaded_model: None,
             hidden_input: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
             hidden_output: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
             unembed_hidden: Buffer::new_zeroed(device, hidden_bytes),
@@ -165,6 +171,45 @@ impl Qwen3xDSparkExecution {
         self.body.clear();
         self.gather_unembed.clear();
         self.sampling.clear();
+    }
+
+    pub fn unload_state(&mut self) {
+        assert!(
+            self.unloaded_model.is_none(),
+            "Qwen3.x DSpark model state is already unloaded"
+        );
+        let context_model = self.context.component_mut().take_model();
+        let body_model = self.body.component_mut().take_model();
+        assert!(
+            Rc::ptr_eq(&context_model, &body_model),
+            "Qwen3.x DSpark context and body must share one model"
+        );
+        drop(body_model);
+        let mut model = Rc::try_unwrap(context_model)
+            .unwrap_or_else(|_| panic!("Qwen3.x DSpark model must be uniquely owned during state unloading"));
+        model.unload_state();
+        self.unloaded_model = Some(model);
+        self.gqa_state.unload_state();
+    }
+
+    pub fn load_state(&mut self, device: &Device) {
+        self.gqa_state.load_state(device);
+        let mut model = self
+            .unloaded_model
+            .take()
+            .expect("Qwen3.x DSpark model state is not unloaded");
+        model.load_state(&self.gqa_state);
+        let model = Rc::new(model);
+        self.context.component_mut().set_model(Rc::clone(&model));
+        self.body.component_mut().set_model(model);
+    }
+
+    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
+        self.gqa_state.write_full_state(writer, resource)
+    }
+
+    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
+        self.gqa_state.read_full_state(reader, resource)
     }
 
     pub fn prepare_page_span(

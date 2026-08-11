@@ -150,6 +150,14 @@ impl Qwen3xDSparkLayer {
         self.attention.unload_weights();
     }
 
+    pub fn unload_state(&mut self) {
+        self.attention.unload_state();
+    }
+
+    pub fn load_state(&mut self, state: &UngatedDSparkGQAState) {
+        self.attention.load_state(state);
+    }
+
     pub fn residual_output(&self) -> &Buffer {
         self.scratch.residual_stream(self.dspark_layer_index)
     }

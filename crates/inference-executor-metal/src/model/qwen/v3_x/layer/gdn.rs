@@ -18,10 +18,11 @@ use crate::attn::gdn::backend::GDNReplayMode;
 use crate::attn::gdn::backend::GDNWeights;
 use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
 use crate::attn::gdn::scratch::GDNScratch;
-use crate::attn::gdn::state_table::GDNRequestStateTable;
+use crate::attn::gdn::state_table::GDNRequestStateResources;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
+use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::weight::affine_config;
 use crate::model::qwen::v3_x::weight::concat_bytes;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
@@ -31,9 +32,9 @@ use crate::model::qwen::v3_x::weight::validate_len;
 pub struct Qwen3xGDN {
     compact_gdn_layer_index: usize,
     weights: Option<Qwen3xGDNWeights>,
-    backend: Rc<GDN>,
-    scratch: Rc<GDNScratch>,
-    request_state_table: Rc<GDNRequestStateTable>,
+    backend: Option<Rc<GDN>>,
+    scratch: Option<Rc<GDNScratch>>,
+    request_state_resources: Option<Rc<GDNRequestStateResources>>,
 }
 
 impl Qwen3xGDN {
@@ -41,14 +42,14 @@ impl Qwen3xGDN {
         compact_gdn_layer_index: usize,
         backend: Rc<GDN>,
         scratch: Rc<GDNScratch>,
-        request_state_table: Rc<GDNRequestStateTable>,
+        request_state_resources: Rc<GDNRequestStateResources>,
     ) -> Self {
         Self {
             compact_gdn_layer_index,
             weights: None,
-            backend,
-            scratch,
-            request_state_table,
+            backend: Some(backend),
+            scratch: Some(scratch),
+            request_state_resources: Some(request_state_resources),
         }
     }
 
@@ -68,6 +69,26 @@ impl Qwen3xGDN {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "Qwen3.x GDN weights are not loaded");
         self.weights.take();
+    }
+
+    pub fn unload_state(&mut self) {
+        assert!(
+            self.backend.is_some() && self.scratch.is_some() && self.request_state_resources.is_some(),
+            "Qwen3.x GDN state is not loaded"
+        );
+        self.request_state_resources.take();
+        self.scratch.take();
+        self.backend.take();
+    }
+
+    pub fn load_state(&mut self, state: &Qwen3xGDNState) {
+        assert!(
+            self.backend.is_none() && self.scratch.is_none() && self.request_state_resources.is_none(),
+            "Qwen3.x GDN state is already loaded"
+        );
+        self.backend = Some(Rc::clone(state.backend()));
+        self.scratch = Some(Rc::clone(state.scratch()));
+        self.request_state_resources = Some(Rc::clone(state.request_state_resources()));
     }
 
     fn weights(&self) -> &Qwen3xGDNWeights {
@@ -117,14 +138,16 @@ impl Qwen3xGDN {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let state = self.request_state_table.layer_bindings(self.compact_gdn_layer_index);
+        let state = self
+            .request_state_resources()
+            .layer_bindings(self.compact_gdn_layer_index);
         let _ = <GDN as ReplayLayer>::record(
-            &self.backend,
+            self.backend(),
             recorder,
             GDNInput {
                 hidden_state: input,
                 next_hidden_state: output,
-                scratch: self.scratch.bindings(),
+                scratch: self.scratch().bindings(),
                 batch_metadata: metadata,
                 state: GDNLayerStateBindings {
                     conv_state: state.conv_states,
@@ -139,6 +162,24 @@ impl Qwen3xGDN {
                 replay_mode,
             },
         );
+    }
+
+    fn backend(&self) -> &GDN {
+        self.backend
+            .as_deref()
+            .expect("Qwen3.x GDN state must be loaded before execution")
+    }
+
+    fn scratch(&self) -> &GDNScratch {
+        self.scratch
+            .as_deref()
+            .expect("Qwen3.x GDN state must be loaded before execution")
+    }
+
+    fn request_state_resources(&self) -> &GDNRequestStateResources {
+        self.request_state_resources
+            .as_deref()
+            .expect("Qwen3.x GDN state must be loaded before execution")
     }
 }
 

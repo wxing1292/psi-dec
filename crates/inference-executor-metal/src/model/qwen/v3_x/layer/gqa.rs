@@ -22,6 +22,7 @@ use crate::attn::gqa::scratch::GQAScratch;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
+use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::affine_config;
 use crate::model::qwen::v3_x::weight::concat_bytes;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
@@ -32,9 +33,9 @@ use crate::model::qwen::v3_x::weight::validate_len;
 pub struct Qwen3xGQA {
     gqa_layer_index: ReplayU32,
     weights: Option<Qwen3xGQAWeights>,
-    backend: Rc<GQA>,
-    scratch: Rc<GQAScratch>,
-    request_page_table: Rc<GQARequestPageTable>,
+    backend: Option<Rc<GQA>>,
+    scratch: Option<Rc<GQAScratch>>,
+    request_page_table: Option<Rc<GQARequestPageTable>>,
 }
 
 impl Qwen3xGQA {
@@ -47,9 +48,9 @@ impl Qwen3xGQA {
         Self {
             gqa_layer_index,
             weights: None,
-            backend,
-            scratch,
-            request_page_table,
+            backend: Some(backend),
+            scratch: Some(scratch),
+            request_page_table: Some(request_page_table),
         }
     }
 
@@ -69,6 +70,26 @@ impl Qwen3xGQA {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "Qwen3.x GQA weights are not loaded");
         self.weights.take();
+    }
+
+    pub fn unload_state(&mut self) {
+        assert!(
+            self.backend.is_some() && self.scratch.is_some() && self.request_page_table.is_some(),
+            "Qwen3.x GQA state is not loaded"
+        );
+        self.request_page_table.take();
+        self.scratch.take();
+        self.backend.take();
+    }
+
+    pub fn load_state(&mut self, state: &Qwen3xGQAState) {
+        assert!(
+            self.backend.is_none() && self.scratch.is_none() && self.request_page_table.is_none(),
+            "Qwen3.x GQA state is already loaded"
+        );
+        self.backend = Some(Rc::clone(state.backend()));
+        self.scratch = Some(Rc::clone(state.scratch()));
+        self.request_page_table = Some(Rc::clone(state.request_page_table()));
     }
 
     fn weights(&self) -> &Qwen3xGQAWeights {
@@ -123,27 +144,45 @@ impl Qwen3xGQA {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let _ = <GQA as ReplayLayer>::record(
-            &self.backend,
+            self.backend(),
             recorder,
             GQAInput {
-                page_table_layout: self.request_page_table.layout(),
+                page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.gqa_layer_index,
                 batch_metadata: metadata,
                 hidden_state: input,
                 next_hidden_state: output,
                 kv_cache: GQAKVCacheBindings {
                     kv_pages: pages,
-                    page_ids: self.request_page_table.page_ids_buffer(),
+                    page_ids: self.request_page_table().page_ids_buffer(),
                 },
                 weights: self.weights().as_borrowed(),
-                scratch: self.scratch.bindings(),
+                scratch: self.scratch().bindings(),
                 replay_mode,
             },
         );
     }
 
     pub fn num_tokens_per_page(&self) -> usize {
-        self.backend.num_tokens_per_page() as usize
+        self.backend().num_tokens_per_page() as usize
+    }
+
+    fn backend(&self) -> &GQA {
+        self.backend
+            .as_deref()
+            .expect("Qwen3.x GQA state must be loaded before execution")
+    }
+
+    fn scratch(&self) -> &GQAScratch {
+        self.scratch
+            .as_deref()
+            .expect("Qwen3.x GQA state must be loaded before execution")
+    }
+
+    fn request_page_table(&self) -> &GQARequestPageTable {
+        self.request_page_table
+            .as_deref()
+            .expect("Qwen3.x GQA state must be loaded before execution")
     }
 }
 
