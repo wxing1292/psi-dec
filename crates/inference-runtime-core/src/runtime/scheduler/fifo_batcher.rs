@@ -245,6 +245,59 @@ mod tests {
     type TestScheduleQueue = ScheduleQueue<TestUserReq, MockDevReq, MockDevResp>;
 
     #[test]
+    fn test_pop_preemption_candidate_success() {
+        let mut candidate = mock_user_req(1);
+        candidate.expect_num_in_flight_computes().once().return_const(0usize);
+        let mut in_flight_req_1 = mock_user_req(2);
+        in_flight_req_1
+            .expect_num_in_flight_computes()
+            .once()
+            .return_const(1usize);
+        let mut in_flight_req_2 = mock_user_req(3);
+        in_flight_req_2
+            .expect_num_in_flight_computes()
+            .once()
+            .return_const(2usize);
+
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        schedule_queue.push_back(candidate);
+        schedule_queue.push_back(in_flight_req_1);
+        schedule_queue.push_back(in_flight_req_2);
+
+        let candidate = pop_preemption_candidate(&mut schedule_queue).unwrap();
+
+        assert_eq!(candidate.id(), 1);
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(2));
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(3));
+        assert!(schedule_queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_pop_preemption_candidate_fail() {
+        let mut in_flight_req_1 = mock_user_req(1);
+        in_flight_req_1
+            .expect_num_in_flight_computes()
+            .once()
+            .return_const(1usize);
+        let mut in_flight_req_2 = mock_user_req(2);
+        in_flight_req_2
+            .expect_num_in_flight_computes()
+            .once()
+            .return_const(2usize);
+
+        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        schedule_queue.push_back(in_flight_req_1);
+        schedule_queue.push_back(in_flight_req_2);
+
+        assert!(pop_preemption_candidate(&mut schedule_queue).is_none());
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(1));
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(2));
+        assert!(schedule_queue.pop_front().is_none());
+    }
+
+    #[test]
     fn test_prepare_cancel_schedules_all() {
         let req_budget = 3;
         let token_budget = 24;
@@ -502,7 +555,10 @@ mod tests {
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
                     dev_req,
-                    phase: PreparePhase::Prefill,
+                    compute_phase: ComputePhase::Prefill {
+                        epoch: 0,
+                        token_index: 0,
+                    },
                 }
             });
 
@@ -523,7 +579,10 @@ mod tests {
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
                     dev_req,
-                    phase: PreparePhase::Decode,
+                    compute_phase: ComputePhase::Decode {
+                        epoch: 0,
+                        token_index: 0,
+                    },
                 }
             });
 
@@ -596,7 +655,10 @@ mod tests {
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
                     dev_req,
-                    phase: PreparePhase::Prefill,
+                    compute_phase: ComputePhase::Prefill {
+                        epoch: 0,
+                        token_index: 0,
+                    },
                 }
             });
 
@@ -617,7 +679,10 @@ mod tests {
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
                     dev_req,
-                    phase: PreparePhase::Decode,
+                    compute_phase: ComputePhase::Decode {
+                        epoch: 0,
+                        token_index: 0,
+                    },
                 }
             });
 
@@ -681,7 +746,10 @@ mod tests {
             dev_req.expect_token_cost().once().return_const(3usize);
             PrepareResult::Continue {
                 dev_req,
-                phase: PreparePhase::Decode,
+                compute_phase: ComputePhase::Decode {
+                    epoch: 0,
+                    token_index: 0,
+                },
             }
         });
 
@@ -693,7 +761,10 @@ mod tests {
             dev_req.expect_token_cost().once().return_const(2usize);
             PrepareResult::Continue {
                 dev_req,
-                phase: PreparePhase::Decode,
+                compute_phase: ComputePhase::Decode {
+                    epoch: 0,
+                    token_index: 0,
+                },
             }
         });
 
@@ -727,7 +798,10 @@ mod tests {
             dev_req.expect_token_cost().once().return_const(3usize);
             PrepareResult::Continue {
                 dev_req,
-                phase: PreparePhase::Decode,
+                compute_phase: ComputePhase::Decode {
+                    epoch: 0,
+                    token_index: 0,
+                },
             }
         });
 
@@ -743,7 +817,10 @@ mod tests {
             dev_req.expect_token_cost().once().return_const(2usize);
             PrepareResult::Continue {
                 dev_req,
-                phase: PreparePhase::Decode,
+                compute_phase: ComputePhase::Decode {
+                    epoch: 0,
+                    token_index: 0,
+                },
             }
         });
 
@@ -831,7 +908,11 @@ mod tests {
                     PrepareResult::Terminal
                 }
             });
-        let preempted_req = mock_user_req(preempted_req_id);
+        let mut preempted_req = mock_user_req(preempted_req_id);
+        preempted_req
+            .expect_num_in_flight_computes()
+            .once()
+            .return_const(0usize);
 
         let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
         let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
@@ -903,7 +984,10 @@ mod tests {
                 dev_req.expect_token_cost().once().return_const(token_cost);
                 PrepareResult::Continue {
                     dev_req,
-                    phase: PreparePhase::Prefill,
+                    compute_phase: ComputePhase::Prefill {
+                        epoch: 0,
+                        token_index: 0,
+                    },
                 }
             });
     }

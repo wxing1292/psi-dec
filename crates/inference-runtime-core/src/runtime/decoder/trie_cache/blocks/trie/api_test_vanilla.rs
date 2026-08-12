@@ -519,6 +519,76 @@ fn test_prepare_cancel_commit_prefill_nonzero_token_index_vanilla() {
 }
 
 #[test]
+fn test_prepare_cancel_commit_overlapping_prefill_decode_vanilla() {
+    let total_tokens = token_vec([1, 2, 3]);
+    let block_cache = initialize_block_cache(1024);
+    let mut blocks = initialize_blocks(block_cache, total_tokens.clone());
+    let InitBlockOnceResult::Success { ready_token_slots } = blocks.init_block_once() else {
+        unreachable!()
+    };
+    assert_eq!(NUM_TOKEN_PER_BLOCK, ready_token_slots);
+
+    let prefill_query_tokens = blocks.prepare(2).unwrap();
+    let prefill_sync_blocks = blocks.prepare_blocks();
+    let decode_query_tokens = blocks.prepare(1).unwrap();
+    let decode_sync_blocks = blocks.prepare_blocks();
+    assert_eq!(
+        QueryTokens::Prefill {
+            epoch: 0,
+            token_index: 0,
+            tokens: token_vec([1, 2]),
+            window: 2,
+        },
+        prefill_query_tokens
+    );
+    assert_eq!(
+        QueryTokens::Decode {
+            epoch: 0,
+            token_index: 2,
+            tokens: token_vec([3]),
+            spec_tokens: token_vec([]),
+        },
+        decode_query_tokens
+    );
+    let expected_prefill_query_tokens = prefill_query_tokens.clone();
+    let expected_decode_query_tokens = decode_query_tokens.clone();
+    assert_state(&blocks, 1, &[], &token_vec([1, 2, 3]), &[], &[], &[]);
+
+    blocks.cancel_blocks(decode_sync_blocks);
+    blocks.cancel(decode_query_tokens);
+    blocks.cancel_blocks(prefill_sync_blocks);
+    blocks.cancel(prefill_query_tokens);
+    assert_state(&blocks, 0, &[], &[], &total_tokens, &[], &[]);
+
+    let prefill_query_tokens = blocks.prepare(2).unwrap();
+    let prefill_sync_blocks = blocks.prepare_blocks();
+    let decode_query_tokens = blocks.prepare(1).unwrap();
+    let decode_sync_blocks = blocks.prepare_blocks();
+    assert_eq!(expected_prefill_query_tokens, prefill_query_tokens);
+    assert_eq!(expected_decode_query_tokens, decode_query_tokens);
+
+    let epoch = prefill_query_tokens.epoch();
+    blocks.commit_blocks(prefill_sync_blocks);
+    blocks.commit(prefill_query_tokens, SampledTokens::Prefill { epoch });
+    let epoch = decode_query_tokens.epoch();
+    blocks.commit_blocks(decode_sync_blocks);
+    blocks.commit(
+        decode_query_tokens,
+        SampledTokens::Decode {
+            epoch,
+            validated_tokens: token_vec([]),
+            validated_probs: vec![],
+            sampled_token: Token::new(4),
+            sampled_prob: NotNan::new(0.5).unwrap(),
+            spec_tokens: token_vec([]),
+            spec_probs: vec![],
+            spec_confidences: vec![],
+        },
+    );
+    assert_state(&blocks, 1, &total_tokens, &[], &token_vec([4]), &[], &[]);
+}
+
+#[test]
 fn test_prepare_cancel_commit_decode_zero_token_index_vanilla() {
     let total_tokens = token_vec([1, 2, 3]);
     let output_sampled_token = Token::new(4);

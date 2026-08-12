@@ -229,7 +229,6 @@ mod tests {
     use async_channel::bounded;
 
     use super::*;
-    use crate::compute::MockBatchDevResp;
     use crate::compute::MockDevReq;
     use crate::compute::MockDevResp;
     use crate::runtime::scheduler::MockBatcher;
@@ -238,7 +237,6 @@ mod tests {
 
     type TestUserReq = MockUserRequest<MockDevReq, MockDevResp>;
     type TestBatcher = MockBatcher<TestUserReq, MockDevReq, MockDevResp>;
-    type TestBatchDeviceResp = MockBatchDevResp<MockDevResp>;
 
     struct TestBatchDevReq {
         seq: RawComputeSlotSeq,
@@ -264,6 +262,25 @@ mod tests {
 
         fn into_inner(self) -> (RawComputeSlotSeq, Vec<MockDevReq>) {
             (self.seq, self.dev_reqs)
+        }
+    }
+
+    struct TestBatchDeviceResp {
+        seq: RawComputeSlotSeq,
+        dev_resps: Vec<MockDevResp>,
+    }
+
+    impl BatchDevResp<MockDevResp> for TestBatchDeviceResp {
+        fn seq(&self) -> RawComputeSlotSeq {
+            self.seq
+        }
+
+        fn from_parts(seq: RawComputeSlotSeq, dev_resps: Vec<MockDevResp>) -> Self {
+            Self { seq, dev_resps }
+        }
+
+        fn into_inner(self) -> (RawComputeSlotSeq, Vec<MockDevResp>) {
+            (self.seq, self.dev_resps)
         }
     }
 
@@ -324,6 +341,68 @@ mod tests {
         }
         assert_eq!(scheduler.last_compute_slot_seq(), 1);
         assert_eq!(scheduler.next_compute_slot_seq(), Some(2));
+    }
+
+    #[test]
+    fn test_prepare_commit() {
+        let mut batcher = TestBatcher::new();
+        batcher.expect_prepare().times(3).returning(|_, _, _, _, _| Vec::new());
+        batcher.expect_commit().times(3).returning(|_, _| {});
+
+        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
+        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(swap_out_task_tx), batcher, 1, 8, 4, 3);
+        let (first, second, third) = {
+            let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
+                &mut scheduler;
+            let first = scheduler.prepare();
+            let second = scheduler.prepare();
+            let third = scheduler.prepare();
+            assert_eq!(first.seq(), 1);
+            assert_eq!(second.seq(), 2);
+            assert_eq!(third.seq(), 3);
+            (first, second, third)
+        };
+        assert_eq!(scheduler.next_compute_slot_seq(), None);
+
+        {
+            let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
+                &mut scheduler;
+            scheduler.commit(TestBatchDeviceResp::from_parts(first.seq(), Vec::new()));
+            scheduler.commit(TestBatchDeviceResp::from_parts(second.seq(), Vec::new()));
+            scheduler.commit(TestBatchDeviceResp::from_parts(third.seq(), Vec::new()));
+        }
+        assert_eq!(scheduler.next_compute_slot_seq(), Some(4));
+    }
+
+    #[test]
+    fn test_prepare_cancel() {
+        let mut batcher = TestBatcher::new();
+        batcher.expect_prepare().times(3).returning(|_, _, _, _, _| Vec::new());
+        batcher.expect_cancel().times(3).returning(|_, _| {});
+
+        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
+        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(swap_out_task_tx), batcher, 1, 8, 4, 3);
+        let (first, second, third) = {
+            let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
+                &mut scheduler;
+            let first = scheduler.prepare();
+            let second = scheduler.prepare();
+            let third = scheduler.prepare();
+            assert_eq!(first.seq(), 1);
+            assert_eq!(second.seq(), 2);
+            assert_eq!(third.seq(), 3);
+            (first, second, third)
+        };
+        assert_eq!(scheduler.next_compute_slot_seq(), None);
+
+        {
+            let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
+                &mut scheduler;
+            scheduler.cancel(third);
+            scheduler.cancel(second);
+            scheduler.cancel(first);
+        }
+        assert_eq!(scheduler.next_compute_slot_seq(), Some(4));
     }
 
     #[test]

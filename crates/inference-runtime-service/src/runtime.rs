@@ -417,7 +417,7 @@ mod tests {
     use inference_runtime_core::runtime::RequestStatus;
     use inference_runtime_core::runtime::Token;
     use inference_runtime_core::runtime::scheduler::CommitResult;
-    use inference_runtime_core::runtime::scheduler::PreparePhase;
+    use inference_runtime_core::runtime::scheduler::ComputePhase;
     use inference_runtime_core::runtime::scheduler::PrepareResult;
     use inference_runtime_core::runtime::scheduler::UserRequest;
     use ordered_float::NotNan;
@@ -748,7 +748,7 @@ mod tests {
         match request.prepare(token_budget) {
             PrepareResult::Continue {
                 dev_req,
-                phase: PreparePhase::Decode,
+                compute_phase: ComputePhase::Decode { .. },
             } => dev_req.decoder_query_tokens,
             _ => panic!("test request should prepare Decode"),
         }
