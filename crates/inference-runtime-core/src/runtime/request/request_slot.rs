@@ -77,6 +77,10 @@ impl RequestSlotAllocator {
         self.allocator.capacity()
     }
 
+    pub fn allocated_ids_bitmap_iter(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.allocator.allocated_ids_bitmap_iter()
+    }
+
     pub fn allocate(&self) -> RequestSlotAllocationResult {
         match self.allocator.alloc_one() {
             Ok(request_slot) => {

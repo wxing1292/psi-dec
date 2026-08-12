@@ -15,6 +15,8 @@ mod dedup_vec_deque;
 mod event_loop;
 pub use event_loop::EventLoop;
 
+mod executor_hibernate;
+
 mod simple_scheduler;
 pub use simple_scheduler::SimpleScheduler;
 
