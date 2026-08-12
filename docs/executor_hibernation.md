@@ -1,9 +1,10 @@
-# Model Idle Unload Design
+# Executor Hibernation Design
 
 This document records the implemented model resource operations, executor protocol, and service event-loop wiring.
 Runtime idle detection and model residency tracking are implemented.
 
-[`model_state_io.md`](model_state_io.md) defines the planned selected-state and request-mobility design.
+[`model_state_io.md`](model_state_io.md) defines the implemented full and selected snapshot paths and the planned
+request-mobility design.
 
 ## Objective
 
@@ -25,12 +26,14 @@ trait ReplayableModel {
     fn unload_state(
         &mut self,
         snapshot_path: &Path,
+        plan: &ExecutorHibernationPlan,
     ) -> Result<(), ModelExecutorError>;
     fn unload_weights(&mut self);
     fn load_weights(&mut self) -> Result<(), ModelExecutorError>;
     fn load_state(
         &mut self,
         snapshot_path: &Path,
+        plan: &ExecutorHibernationPlan,
     ) -> Result<(), ModelExecutorError>;
 }
 ```
@@ -41,21 +44,22 @@ The operations run synchronously on the model executor thread.
 
 `ReplayableModelEventLoop` owns the loaded model, its stable `Started` or `Stopped` state, and one state snapshot path.
 It handles `Batch`, `Start`, and `Stop` requests synchronously on the executor thread.
-`Start` and `Stop` are idempotent.
+`Start` and `Stop` are idempotent when repeated with the same hibernation plan.
 `Batch` starts a stopped model before it executes the batch.
 
 The event loop defers request-slot resets while the model is stopped.
 It applies all deferred resets after state loading and before it acknowledges `Start` or executes a batch.
 
-Runtime core tracks the commanded `Started` or `Stopped` state.
+Runtime core tracks the commanded `Started` or `Stopped(ExecutorHibernationPlan)` state.
 It appends `Stop` after all batches that it has already sent.
 The model event loop completes those batches before it handles `Stop`.
 It sends `Start` when a stopped executor has work to flush.
 It can append a batch after `Start` without a separate transition state.
 The ordered request channel guarantees that the model event loop handles `Start` before that batch.
 
-The idle timeout defaults to 300 seconds.
-`--model-idle-timeout-secs` accepts a positive integer.
+The executor hibernation timeout defaults to 300 seconds.
+`--executor-hibernation-timeout-secs` accepts a positive integer.
+`--executor-hibernation-mode` accepts `all` or `selected`. It defaults to `all`.
 The service does not have a lifecycle status API or status route.
 
 ## Current resource order
@@ -66,7 +70,7 @@ The implemented resource sequence is:
 clear_replay_cache
     |
     v
-unload_state(snapshot path)
+unload_state(snapshot path, plan)
     |
     v
 unload_weights
@@ -74,7 +78,7 @@ unload_weights
 load_weights
     |
     v
-load_state(snapshot path)
+load_state(snapshot path, plan)
 ```
 
 `clear_replay_cache` removes recorded programs that retain Metal resources.
@@ -86,17 +90,24 @@ Names and ownership levels must also remain symmetric.
 
 ## State snapshot
 
-The current implementation stores complete resources.
-It does not select page IDs or request slots.
+`RuntimeConfig::executor_hibernation_mode` fixes the Stop/Start plan policy at runtime construction.
+The Qwen services default to `ExecutorHibernationMode::All`.
+Use `--executor-hibernation-mode selected` to enable selected-state hibernation.
+The direct model integration tests can use `ExecutorHibernationPlan::All`.
 
-The snapshot contains these resources:
+The selected snapshot contains these resources:
 
-- The full `PageArena` payload.
-- The full Main GQA request page table.
-- The full MTP or DSpark GQA request page table when configured.
-- The full GDN recurrent arena.
-- The full GDN convolution arena.
+- The `PageArena` payload for every allocated runtime page ID.
+- Main GQA request rows for every allocated request slot.
+- MTP or DSpark GQA request rows for every allocated request slot when configured.
+- The current GDN recurrent state for every allocated request slot.
+- The current GDN convolution state for every allocated request slot.
 - The durable GDN request state table.
+
+The page-ID selection includes active requests and reusable trie cache blocks.
+The shared runtime page allocator assigns unique IDs across Main, MTP, DSpark, KV, and GDN state pages.
+Runtime core scans this allocator bitmap and converts the allocated IDs directly to canonical ranges.
+It scans the request-slot allocator bitmap in the same way.
 
 The durable GDN request state table contains these values:
 
@@ -110,16 +121,17 @@ The snapshot does not store submitted restore jobs, submitted publish jobs, or c
 The model must finish or clear this transient work before it writes the snapshot.
 
 The snapshot is one directory with a `manifest` file and one file for each semantic state item.
-The manifest contains a magic value, schema version, file kind, and exact byte length.
+The manifest contains a magic value, schema version, hibernation plan, file kind, and exact byte length.
 The manifest and durable GDN request-state table use native-endian `wincode` metadata.
+Both paths stream `wincode` without an intermediate encoded byte buffer.
 The GDN path serializes `GDNRequestSlots` directly. It does not use a snapshot DTO.
 Metal buffer resources use uncached `BufferIO` without an application staging buffer.
 The writer syncs all state files and the manifest before it publishes the directory with an atomic rename.
 It then syncs the parent directory.
 
-The current full-state components use symmetric `write_full_state` and `read_full_state` operations through
-`FullStateIO`. Future selective I/O must define a separate symmetric selection contract.
-Its metadata must identify each resource, page, request, layer, and state slot.
+Components use symmetric `write_full_state` and `read_full_state` operations through `FullStateIO`.
+They use symmetric `write_selected_state` and `read_selected_state` operations through `SelectedStateIO`.
+Selected buffer files pack entries in the order derived from canonical ID ranges and the component layout.
 
 ## Ownership boundary
 
@@ -142,7 +154,7 @@ The model executor owns these resources:
 - Replay programs and retained Metal resources.
 
 Runtime core owns idle detection and executor protocol state.
-The service owns the configured idle timeout.
+The service owns the configured executor hibernation timeout.
 The model event loop owns the resource operation order.
 Runtime core must not parse model-specific state.
 The model executor must not allocate or free runtime-owned page IDs.
@@ -154,8 +166,8 @@ The protocol is symmetric:
 ```rust
 pub enum ReplayableModelExecutorRequest {
     Batch(BatchDeviceRequest),
-    Start,
-    Stop,
+    Start(ExecutorHibernationPlan),
+    Stop(ExecutorHibernationPlan),
 }
 
 pub enum ReplayableModelExecutorResponse {
@@ -169,11 +181,12 @@ The request-response pairs are:
 
 ```text
 Batch(request) -> Batch(response)
-Start          -> Started
-Stop           -> Stopped
+Start(plan)   -> Started
+Stop(plan)    -> Stopped
 ```
 
-`Start` and `Stop` are idempotent.
+`Start` and `Stop` are idempotent when repeated with the same hibernation plan.
+Runtime core stores the Stop plan and reuses it for Start.
 One request channel orders `Batch`, `Start`, and `Stop`.
 One response channel preserves the matching response order.
 The model event loop processes one request at a time.
@@ -190,7 +203,7 @@ Future wiring may expose the tracked residency through a status API.
 ```text
 runtime core                        ReplayableModelEventLoop
     |                                         |
-    | Stop                                    |
+    | Stop(plan)                                  |
     |---------------------------------------->|
     |                                         | clear replay cache
     |                                         | unload state to SSD
@@ -198,7 +211,7 @@ runtime core                        ReplayableModelEventLoop
     | Stopped                                 |
     |<----------------------------------------|
     |                                         |
-    | Start                                   |
+    | Start(plan)                                 |
     |---------------------------------------->|
     |                                         | load weights
     |                                         | load state from SSD
@@ -219,12 +232,12 @@ The event loop uses this operation order:
 Stop:
   drain request-slot resets
   clear_replay_cache
-  unload_state(snapshot path)
+  unload_state(snapshot path, plan)
   unload_weights
 
 Start or Batch while stopped:
   load_weights
-  load_state(snapshot path)
+  load_state(snapshot path, plan)
   remove snapshot
   drain deferred request-slot resets
 ```
@@ -267,6 +280,8 @@ decode
 
 The two semantic snapshot directories must be byte-for-byte equal.
 The final decode verifies the reloaded checkpoint weights and the second state restore.
+The tests run both `ExecutorHibernationPlan::All` and `ExecutorHibernationPlan::Selected` for each loaded model.
+The selected plan uses request-slot and page-ID ranges from the synthetic decode.
 The test matrix contains Qwen3.6 27B and 35B with MTP and DSpark.
 Each test requires the matching Main and speculative checkpoint environment variables.
 

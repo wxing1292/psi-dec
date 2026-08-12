@@ -15,6 +15,7 @@ use inference_executor_metal::model::qwen::v3_5::executor::init_qwen_3_5_model_w
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::DecoderSyncBlocks;
 use inference_runtime_core::compute::DeviceRequest;
+use inference_runtime_core::compute::ExecutorHibernationPlan;
 use inference_runtime_core::compute::QueryTokens;
 use inference_runtime_core::runtime::Token;
 
@@ -29,7 +30,7 @@ const SNAPSHOT_COMPARE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 #[test]
 #[ignore = "requires Qwen3.6 27B Main and MTP checkpoints and substantial unified memory"]
-fn model_state_io_27b_mtp_round_trip() {
+fn model_state_io_27b_mtp_unload_load() {
     let model = init_qwen_3_5_model_with_mtp(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(MTP_27B_DIR_ENV),
@@ -37,12 +38,12 @@ fn model_state_io_27b_mtp_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 27B with MTP must initialize");
-    run_model_state_io_round_trip(model);
+    run_model_state_io_unload_load(model);
 }
 
 #[test]
 #[ignore = "requires Qwen3.6 27B Main and DSpark checkpoints and substantial unified memory"]
-fn model_state_io_27b_dspark_round_trip() {
+fn model_state_io_27b_dspark_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(DSPARK_27B_DIR_ENV),
@@ -50,12 +51,12 @@ fn model_state_io_27b_dspark_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 27B with DSpark must initialize");
-    run_model_state_io_round_trip(model);
+    run_model_state_io_unload_load(model);
 }
 
 #[test]
 #[ignore = "requires Qwen3.6 35B Main and MTP checkpoints and substantial unified memory"]
-fn model_state_io_35b_mtp_round_trip() {
+fn model_state_io_35b_mtp_unload_load() {
     let model = init_qwen_3_5_model_with_mtp(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(MTP_35B_DIR_ENV),
@@ -63,12 +64,12 @@ fn model_state_io_35b_mtp_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 35B with MTP must initialize");
-    run_model_state_io_round_trip(model);
+    run_model_state_io_unload_load(model);
 }
 
 #[test]
 #[ignore = "requires Qwen3.6 35B Main and DSpark checkpoints and substantial unified memory"]
-fn model_state_io_35b_dspark_round_trip() {
+fn model_state_io_35b_dspark_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(DSPARK_35B_DIR_ENV),
@@ -76,7 +77,7 @@ fn model_state_io_35b_dspark_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 35B with DSpark must initialize");
-    run_model_state_io_round_trip(model);
+    run_model_state_io_unload_load(model);
 }
 
 fn model_dir(variable: &str) -> PathBuf {
@@ -99,10 +100,29 @@ fn executor_config() -> Qwen35ExecutorConfig {
     }
 }
 
-fn run_model_state_io_round_trip(mut model: inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor) {
-    run_one_decode(&mut model);
+fn run_model_state_io_unload_load(mut model: inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor) {
+    let num_page_ids = std::iter::once(model.num_main_lane_gqa_page_ids_per_block())
+        .chain(model.num_mtp_gqa_page_ids_per_block())
+        .sum::<usize>();
+    let num_page_ids = u32::try_from(num_page_ids).expect("test page ID count must fit u32");
+    let selected_plan = ExecutorHibernationPlan::selected(
+        std::iter::once(0..1).collect(),
+        std::iter::once(0..num_page_ids).collect(),
+    );
+
+    for (plan_name, plan) in [("all", ExecutorHibernationPlan::All), ("selected", selected_plan)] {
+        run_hibernation_plan_unload_load(&mut model, plan_name, &plan);
+    }
+}
+
+fn run_hibernation_plan_unload_load(
+    model: &mut inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor,
+    plan_name: &str,
+    plan: &ExecutorHibernationPlan,
+) {
+    run_one_decode(model);
     let temp_dir = std::env::temp_dir().join(format!(
-        "psi-dec-model-state-io-{}-{}",
+        "psi-dec-model-state-io-{plan_name}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -115,22 +135,23 @@ fn run_model_state_io_round_trip(mut model: inference_executor_metal::model::qwe
 
     model.clear_replay_cache();
     model
-        .unload_state(&first_snapshot)
+        .unload_state(&first_snapshot, plan)
         .expect("initial model state must unload");
     model.unload_weights();
     model.load_weights().expect("model weights must reload");
     model
-        .load_state(&first_snapshot)
+        .load_state(&first_snapshot, plan)
         .expect("initial model state must reload");
     model
-        .unload_state(&second_snapshot)
+        .unload_state(&second_snapshot, plan)
         .expect("restored model state must unload");
     assert_snapshot_directories_equal(&first_snapshot, &second_snapshot);
     model
-        .load_state(&second_snapshot)
+        .load_state(&second_snapshot, plan)
         .expect("verified model state must reload");
     model.reset_req_slots(&[0]);
-    run_one_decode(&mut model);
+    run_one_decode(model);
+    model.reset_req_slots(&[0]);
 
     std::fs::remove_dir_all(&temp_dir).expect("test snapshot directory must be removed");
 }

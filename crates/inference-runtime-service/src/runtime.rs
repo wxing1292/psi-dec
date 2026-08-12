@@ -128,8 +128,8 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         let (req_slot_allocator, request_slot_reset_rx) =
             RequestSlotAllocator::new(model_runtime_config.max_running_requests as u64);
         let request_slot_reset_notifier = req_slot_allocator.reset_notifier();
+        let page_id_allocator = Arc::new(U32IDAllocator::new(model_runtime_config.num_pages as u64));
         let block_cache = {
-            let page_id_allocator = Arc::new(U32IDAllocator::new(model_runtime_config.num_pages as u64));
             let block_cache_vec = std::array::from_fn(|cache_lane| {
                 let kv_block_allocator = TPKVBlockAllocator::new(
                     model_runtime_config.num_pages_per_kv_block(cache_lane),
@@ -179,7 +179,9 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                 model_executor_resp_rx,
                 scheduler,
                 req_slot_allocator,
-                model_runtime_config.idle_timeout,
+                page_id_allocator,
+                model_runtime_config.executor_hibernation_mode,
+                model_runtime_config.executor_hibernation_timeout,
                 shutdown.clone(),
             );
             let scheduler_shutdown = shutdown.clone();
@@ -402,12 +404,14 @@ mod tests {
     use inference_runtime_core::channel::Shutdown;
     use inference_runtime_core::compute::BatchDeviceResponse;
     use inference_runtime_core::compute::DeviceResponse;
+    use inference_runtime_core::compute::ExecutorHibernationPlan;
     use inference_runtime_core::compute::QueryTokens;
     use inference_runtime_core::compute::ReplayableModelExecutorRequest;
     use inference_runtime_core::compute::ReplayableModelExecutorResponse;
     use inference_runtime_core::compute::SampledTokens;
     use inference_runtime_core::config::CacheLaneRuntimeConfig;
-    use inference_runtime_core::config::DEFAULT_MODEL_IDLE_TIMEOUT;
+    use inference_runtime_core::config::DEFAULT_EXECUTOR_HIBERNATION_TIMEOUT;
+    use inference_runtime_core::config::ExecutorHibernationMode;
     use inference_runtime_core::config::RuntimeConfig;
     use inference_runtime_core::config::SamplingConfig;
     use inference_runtime_core::config::SchedulerConfig;
@@ -435,7 +439,8 @@ mod tests {
         let runtime_config = RuntimeConfig {
             max_queued_requests: 1,
             max_running_requests: 1,
-            idle_timeout: DEFAULT_MODEL_IDLE_TIMEOUT,
+            executor_hibernation_timeout: DEFAULT_EXECUTOR_HIBERNATION_TIMEOUT,
+            executor_hibernation_mode: ExecutorHibernationMode::Selected,
             context_window: 4096,
             num_tokens_per_cache_block: 1024,
             num_kv_heads: 1,
@@ -650,15 +655,18 @@ mod tests {
     }
 
     #[test]
-    fn test_model_executor_stops_when_idle_and_starts_before_batch() {
-        let (runtime, shutdown, _async_runtime) = test_runtime_with_idle_timeout::<1>(Duration::from_millis(20));
+    fn test_model_executor_hibernates_when_idle_and_starts_before_batch() {
+        let (runtime, shutdown, _async_runtime) =
+            test_runtime_with_executor_hibernation_timeout::<1>(Duration::from_millis(20));
         let request_rx = runtime.model_executor_request_rx();
         let response_tx = runtime.model_executor_response_tx();
 
-        assert!(matches!(
-            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ReplayableModelExecutorRequest::Stop
-        ));
+        let ReplayableModelExecutorRequest::Stop(stopped_plan) =
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("idle runtime must stop the model executor")
+        };
+        assert_eq!(stopped_plan, ExecutorHibernationPlan::selected(Vec::new(), Vec::new()));
         response_tx.send(ReplayableModelExecutorResponse::Stopped).unwrap();
 
         let (queued_request, _external_request) = runtime
@@ -671,42 +679,77 @@ mod tests {
             )
             .unwrap();
         runtime.submit_req(queued_request).unwrap();
-        assert!(matches!(
-            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ReplayableModelExecutorRequest::Start
-        ));
+        let ReplayableModelExecutorRequest::Start(started_plan) =
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("queued request must start the model executor")
+        };
+        assert_eq!(started_plan, stopped_plan);
         response_tx.send(ReplayableModelExecutorResponse::Started).unwrap();
         assert!(matches!(
             request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             ReplayableModelExecutorRequest::Batch(_)
         ));
-        assert!(matches!(
-            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ReplayableModelExecutorRequest::Stop
-        ));
+        let ReplayableModelExecutorRequest::Stop(active_plan) =
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("idle runtime must stop the model executor after the batch")
+        };
+        assert_eq!(
+            active_plan,
+            ExecutorHibernationPlan::selected(std::iter::once(0..1).collect(), std::iter::once(0..64).collect())
+        );
 
         shutdown.shutdown();
     }
 
+    #[test]
+    fn test_model_executor_uses_fixed_all_hibernation_mode() {
+        let (runtime, shutdown, _async_runtime) =
+            test_runtime_with_executor_hibernation_mode::<1>(Duration::from_millis(20), ExecutorHibernationMode::All);
+
+        let ReplayableModelExecutorRequest::Stop(plan) = runtime
+            .model_executor_request_rx()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+        else {
+            panic!("idle runtime must stop the model executor")
+        };
+        assert_eq!(plan, ExecutorHibernationPlan::All);
+        shutdown.shutdown();
+    }
+
     fn test_runtime<const L: usize>() -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
-        test_runtime_with_idle_timeout(DEFAULT_MODEL_IDLE_TIMEOUT)
+        test_runtime_with_executor_hibernation_timeout(DEFAULT_EXECUTOR_HIBERNATION_TIMEOUT)
     }
 
     fn test_runtime_with_context<const L: usize>(
         context_window: usize,
     ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
-        test_runtime_with_config(context_window, DEFAULT_MODEL_IDLE_TIMEOUT)
+        test_runtime_with_config(
+            context_window,
+            DEFAULT_EXECUTOR_HIBERNATION_TIMEOUT,
+            ExecutorHibernationMode::Selected,
+        )
     }
 
-    fn test_runtime_with_idle_timeout<const L: usize>(
-        idle_timeout: Duration,
+    fn test_runtime_with_executor_hibernation_timeout<const L: usize>(
+        executor_hibernation_timeout: Duration,
     ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
-        test_runtime_with_config(4096, idle_timeout)
+        test_runtime_with_executor_hibernation_mode(executor_hibernation_timeout, ExecutorHibernationMode::Selected)
+    }
+
+    fn test_runtime_with_executor_hibernation_mode<const L: usize>(
+        executor_hibernation_timeout: Duration,
+        executor_hibernation_mode: ExecutorHibernationMode,
+    ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
+        test_runtime_with_config(4096, executor_hibernation_timeout, executor_hibernation_mode)
     }
 
     fn test_runtime_with_config<const L: usize>(
         context_window: usize,
-        idle_timeout: Duration,
+        executor_hibernation_timeout: Duration,
+        executor_hibernation_mode: ExecutorHibernationMode,
     ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
         let shutdown = Shutdown::new();
         let async_runtime = tokio::runtime::Runtime::new().expect("test Tokio runtime should initialize");
@@ -714,7 +757,8 @@ mod tests {
             RuntimeConfig {
                 max_queued_requests: 1,
                 max_running_requests: 1,
-                idle_timeout,
+                executor_hibernation_timeout,
+                executor_hibernation_mode,
                 context_window,
                 num_tokens_per_cache_block: 1024,
                 num_kv_heads: 1,

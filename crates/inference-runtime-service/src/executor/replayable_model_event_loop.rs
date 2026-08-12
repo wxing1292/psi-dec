@@ -14,6 +14,7 @@ use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::DeviceResponse;
+use inference_runtime_core::compute::ExecutorHibernationPlan;
 use inference_runtime_core::compute::QueryTokens;
 use inference_runtime_core::compute::ReplayableModelExecutorRequest;
 use inference_runtime_core::compute::ReplayableModelExecutorResponse;
@@ -39,10 +40,10 @@ pub struct ReplayableModelEventLoop<M> {
     debug_logging: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ModelExecutorState {
     Started,
-    Stopped,
+    Stopped(ExecutorHibernationPlan),
 }
 
 impl<M> ReplayableModelEventLoop<M>
@@ -98,9 +99,12 @@ where
                 },
                 _ if op_index == op_recv_req_slot_reset => {
                     match op.recv(&self.req_slot_reset_rx) {
-                        Ok(()) if self.model_state == ModelExecutorState::Started => self.reset_req_slots(),
                         Ok(()) => {
-                            tracing::debug!("model is stopped; deferring request slot resets until start");
+                            if matches!(self.model_state, ModelExecutorState::Started) {
+                                self.reset_req_slots();
+                            } else {
+                                tracing::debug!("model is stopped; deferring request slot resets until start");
+                            }
                         },
                         Err(_) => {
                             tracing::info!("request slot reset channel closed, stopping");
@@ -114,7 +118,7 @@ where
                     };
                     match request {
                         ReplayableModelExecutorRequest::Batch(batch_dev_req) => {
-                            if !self.start() {
+                            if !self.start(None) {
                                 break 'event_loop;
                             }
                             self.reset_req_slots();
@@ -123,8 +127,8 @@ where
                                 break 'event_loop;
                             }
                         },
-                        ReplayableModelExecutorRequest::Start => {
-                            if !self.start() {
+                        ReplayableModelExecutorRequest::Start(plan) => {
+                            if !self.start(Some(plan)) {
                                 break 'event_loop;
                             }
                             self.reset_req_slots();
@@ -132,8 +136,8 @@ where
                                 break 'event_loop;
                             }
                         },
-                        ReplayableModelExecutorRequest::Stop => {
-                            if !self.stop() {
+                        ReplayableModelExecutorRequest::Stop(plan) => {
+                            if !self.stop(plan) {
                                 break 'event_loop;
                             }
                             if !self.send_response(ReplayableModelExecutorResponse::Stopped) {
@@ -151,10 +155,17 @@ where
         tracing::info!("stopped");
     }
 
-    fn start(&mut self) -> bool {
-        if self.model_state == ModelExecutorState::Started {
+    fn start(&mut self, requested_plan: Option<ExecutorHibernationPlan>) -> bool {
+        let ModelExecutorState::Stopped(snapshot_plan) = &self.model_state else {
             return true;
+        };
+        if let Some(requested_plan) = requested_plan {
+            assert_eq!(
+                requested_plan, *snapshot_plan,
+                "model Start hibernation plan must match the preceding Stop plan"
+            );
         }
+        let snapshot_plan = snapshot_plan.clone();
 
         let start = Instant::now();
         tracing::info!(
@@ -175,7 +186,7 @@ where
             self.shutdown.shutdown();
             return false;
         }
-        if let Err(error) = self.model.load_state(&self.state_snapshot_path) {
+        if let Err(error) = self.model.load_state(&self.state_snapshot_path, &snapshot_plan) {
             tracing::error!(
                 target: "inference-runtime-service::lifecycle",
                 phase = "model.start.failed",
@@ -198,10 +209,15 @@ where
         true
     }
 
-    fn stop(&mut self) -> bool {
-        if self.model_state == ModelExecutorState::Stopped {
+    fn stop(&mut self, plan: ExecutorHibernationPlan) -> bool {
+        if let ModelExecutorState::Stopped(snapshot_plan) = &self.model_state {
+            assert_eq!(
+                plan, *snapshot_plan,
+                "idempotent model Stop must use the existing hibernation plan"
+            );
             return true;
         }
+        plan.assert_valid();
 
         let start = Instant::now();
         tracing::info!(
@@ -213,7 +229,7 @@ where
         );
         self.reset_req_slots();
         self.model.clear_replay_cache();
-        if let Err(error) = self.model.unload_state(&self.state_snapshot_path) {
+        if let Err(error) = self.model.unload_state(&self.state_snapshot_path, &plan) {
             tracing::error!(
                 target: "inference-runtime-service::lifecycle",
                 phase = "model.stop.failed",
@@ -225,7 +241,7 @@ where
             return false;
         }
         self.model.unload_weights();
-        self.model_state = ModelExecutorState::Stopped;
+        self.model_state = ModelExecutorState::Stopped(plan);
         tracing::info!(
             target: "inference-runtime-service::lifecycle",
             phase = "model.stop.complete",
@@ -579,10 +595,10 @@ mod tests {
     enum ModelEvent {
         ResetRequestSlots(Vec<RawRequestSlot>),
         ClearReplayCache,
-        UnloadState,
+        UnloadState(ExecutorHibernationPlan),
         UnloadWeights,
         LoadWeights,
-        LoadState,
+        LoadState(ExecutorHibernationPlan),
     }
 
     struct TestModel {
@@ -625,14 +641,18 @@ mod tests {
             self.event_tx.send(ModelEvent::ClearReplayCache).unwrap();
         }
 
-        fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+        fn unload_state(
+            &mut self,
+            snapshot_path: &Path,
+            plan: &ExecutorHibernationPlan,
+        ) -> Result<(), ModelExecutorError> {
             assert!(self.weights_loaded);
             assert!(self.state_loaded);
             std::fs::create_dir(snapshot_path)
                 .and_then(|()| std::fs::write(snapshot_path.join("state"), b"test model state"))
                 .map_err(|error| ModelExecutorError::custom(error.to_string()))?;
             self.state_loaded = false;
-            self.event_tx.send(ModelEvent::UnloadState).unwrap();
+            self.event_tx.send(ModelEvent::UnloadState(plan.clone())).unwrap();
             Ok(())
         }
 
@@ -651,14 +671,18 @@ mod tests {
             Ok(())
         }
 
-        fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+        fn load_state(
+            &mut self,
+            snapshot_path: &Path,
+            plan: &ExecutorHibernationPlan,
+        ) -> Result<(), ModelExecutorError> {
             assert!(self.weights_loaded);
             assert!(!self.state_loaded);
             let state = std::fs::read(snapshot_path.join("state"))
                 .map_err(|error| ModelExecutorError::custom(error.to_string()))?;
             assert_eq!(state, b"test model state");
             self.state_loaded = true;
-            self.event_tx.send(ModelEvent::LoadState).unwrap();
+            self.event_tx.send(ModelEvent::LoadState(plan.clone())).unwrap();
             Ok(())
         }
 
@@ -734,6 +758,10 @@ mod tests {
         ))
     }
 
+    fn test_executor_hibernation_plan() -> ExecutorHibernationPlan {
+        ExecutorHibernationPlan::selected(vec![2..3, 5..6], vec![7..9, 12..13])
+    }
+
     #[test]
     fn test_request_slot_resets() {
         let (_model_executor_req_tx, model_executor_req_rx) = bounded(1);
@@ -794,9 +822,10 @@ mod tests {
             snapshot_path.clone(),
         );
         let executor_thread = std::thread::spawn(move || executor.event_loop());
+        let plan = test_executor_hibernation_plan();
 
         model_executor_req_tx
-            .send(ReplayableModelExecutorRequest::Start)
+            .send(ReplayableModelExecutorRequest::Start(plan.clone()))
             .unwrap();
         assert!(matches!(
             model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -805,18 +834,18 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
 
         model_executor_req_tx
-            .send(ReplayableModelExecutorRequest::Stop)
+            .send(ReplayableModelExecutorRequest::Stop(plan.clone()))
             .unwrap();
         assert!(matches!(
             model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             ReplayableModelExecutorResponse::Stopped
         ));
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::ClearReplayCache);
-        assert_eq!(event_rx.recv().unwrap(), ModelEvent::UnloadState);
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::UnloadState(plan.clone()));
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::UnloadWeights);
 
         model_executor_req_tx
-            .send(ReplayableModelExecutorRequest::Stop)
+            .send(ReplayableModelExecutorRequest::Stop(plan.clone()))
             .unwrap();
         assert!(matches!(
             model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -839,12 +868,12 @@ mod tests {
         };
         assert_eq!(batch_response.seq, 7);
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::LoadWeights);
-        assert_eq!(event_rx.recv().unwrap(), ModelEvent::LoadState);
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::LoadState(plan.clone()));
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::ResetRequestSlots(vec![11]));
         assert!(!snapshot_path.exists());
 
         model_executor_req_tx
-            .send(ReplayableModelExecutorRequest::Start)
+            .send(ReplayableModelExecutorRequest::Start(plan))
             .unwrap();
         assert!(matches!(
             model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),

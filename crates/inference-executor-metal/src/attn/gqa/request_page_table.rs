@@ -139,8 +139,17 @@ impl GQARequestPageTable {
 mod tests {
     use inference_backend_metal::metal::Device;
     use inference_executor_core::attn::GQAPageTableLayout;
+    use inference_runtime_core::compute::ExecutorHibernationPlan;
 
     use super::GQARequestPageTable;
+    use crate::model::state_snapshot::GQAStateSnapshotFiles;
+    use crate::model::state_snapshot::SelectedStateIO;
+    use crate::model::state_snapshot::StateSnapshotFile;
+    use crate::model::state_snapshot::StateSnapshotReader;
+    use crate::model::state_snapshot::StateSnapshotWriter;
+
+    const SNAPSHOT_FILES: GQAStateSnapshotFiles =
+        GQAStateSnapshotFiles::new(StateSnapshotFile::MainGQARequestPageTable);
 
     #[test]
     fn test_read_write() {
@@ -194,5 +203,50 @@ mod tests {
         assert_eq!(page_table.read_page_ids(2, 0, 0), vec![0, 0]);
         assert_eq!(page_table.read_page_ids(2, 2, 0), vec![0, 0]);
         assert_eq!(page_table.read_page_ids(3, 1, 0), vec![300, 301]);
+    }
+
+    #[test]
+    fn test_selected_state_unload_load() {
+        let device = Device::system_default();
+        let layout = GQAPageTableLayout {
+            num_req_slots: 4,
+            num_gqa_layers: 2,
+            num_blocks: 2,
+            num_page_ids_per_block: 2,
+        };
+        let source = GQARequestPageTable::new(&device, layout);
+        let source_values = (100_u32..132).collect::<Vec<_>>();
+        source.page_ids_buffer().write_typed(0, &source_values);
+        let selected_request_slot_ranges = [1..2, 3..4];
+        let plan = ExecutorHibernationPlan::selected(selected_request_slot_ranges.to_vec(), Vec::new());
+        let snapshot_path =
+            std::env::temp_dir().join(format!("psi-dec-gqa-selected-state-{}.state", std::process::id()));
+        let buffer_io = inference_backend_metal::metal::BufferIO::new(&device);
+        let snapshot_files = [SNAPSHOT_FILES.request_page_table()];
+
+        let mut writer = StateSnapshotWriter::new(&snapshot_path, &snapshot_files, &plan, &buffer_io).unwrap();
+        source
+            .write_selected_state(&mut writer, SNAPSHOT_FILES, &selected_request_slot_ranges)
+            .unwrap();
+        writer.commit().unwrap();
+
+        let mut restored = GQARequestPageTable::new(&device, layout);
+        let mut reader = StateSnapshotReader::open(&snapshot_path, &snapshot_files, &plan, &buffer_io).unwrap();
+        restored
+            .read_selected_state(&mut reader, SNAPSHOT_FILES, &selected_request_slot_ranges)
+            .unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(
+            restored.page_ids_buffer().read_typed::<u32>(0, 32),
+            [
+                vec![0; 8],
+                source_values[8..16].to_vec(),
+                vec![0; 8],
+                source_values[24..32].to_vec()
+            ]
+            .concat()
+        );
+        std::fs::remove_dir_all(snapshot_path).unwrap();
     }
 }

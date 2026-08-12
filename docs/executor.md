@@ -333,13 +333,14 @@ Weight-bearing component shells remain allocated and fail fast if execution acce
 The unload traversal must remove all shared `Rc` owners.
 The final owner releases the shared Metal resource.
 
-`unload_state` writes full `PageArena`, GQA, and GDN payloads to SSD before it releases their buffers.
+`unload_state` writes the selected `PageArena`, GQA, and GDN payloads to SSD before it releases their buffers.
+Direct callers can still select `ExecutorHibernationPlan::All`.
 The snapshot also stores durable GDN request state and future publish page IDs.
 The executor finishes or clears transient restore, publish, and batch transactions before it writes the snapshot.
 
-State-bearing components implement the symmetric `FullStateIO` trait. `PageArenaStateSnapshotFiles`,
-`GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify their semantic files. The read method requires mutable
-component state.
+State-bearing components implement the symmetric `FullStateIO` and `SelectedStateIO` traits.
+`PageArenaStateSnapshotFiles`, `GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify their semantic files.
+Read methods require mutable component state.
 
 The writer and reader validate the same topology-specific semantic file set.
 `load_state` validates the snapshot container before it allocates state resources.
@@ -351,15 +352,16 @@ The Metal backend also provides the standalone `BufferIO` component.
 It transfers byte ranges between files and shared Metal buffers without an application staging buffer.
 `BufferIOFile` owns the POSIX and Metal handles for one file.
 `BufferIOFileCacheMode::Uncached` bypasses the macOS data cache for positional and Metal file I/O.
-The current v2 directory snapshot uses `BufferIO` for each Metal buffer resource.
+The current v3 directory snapshot uses `BufferIO` for each Metal buffer resource.
 It uses native-endian `wincode` for the manifest. It streams direct `GDNRequestSlots` metadata with the same
 configuration. It does not use a GDN snapshot DTO.
+The manifest stores the exact `ExecutorHibernationPlan` used by Stop and Start.
 See [`model_state_io.md`](model_state_io.md) for the current format and remaining work.
 
 `ReplayableModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
 It also starts a stopped model before it executes a batch.
 Runtime core tracks executor residency and sends ordered lifecycle commands after the configured idle period.
-See [`model_idle_unload.md`](model_idle_unload.md) for the current lifecycle and remaining work.
+See [`executor_hibernation.md`](executor_hibernation.md) for the current lifecycle and remaining work.
 
 ## Verification boundary
 

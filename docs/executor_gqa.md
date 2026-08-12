@@ -26,7 +26,7 @@ crates/inference-executor-metal/src/attn/
     ungated_scratch.rs      ungated QKV scratch allocation and borrowed replay bindings
     request_page_table.rs   per-request, per-layer KV page table for runtime-supplied page IDs
     request_page_table/
-      file_io.rs            symmetric full-state file I/O
+      file_io.rs            symmetric full and selected state file I/O
   dspark/
     mod.rs                  DSpark attention module root
     backend.rs              ungated paged-history plus block-bidirectional replay graph
@@ -36,17 +36,17 @@ crates/inference-executor-metal/src/attn/
     scratch.rs              fixed-capacity local Q/K/V and attention partials
     state.rs                DSpark page-table and proposal metadata lifecycle
     state/
-      file_io.rs            DSpark full-state file I/O
+      file_io.rs            DSpark full and selected state file I/O
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
     dspark/                 Qwen3x DSpark attention, layer, and model
     layer/gqa.rs            Qwen3xGQA, private checkpoint weights, load, and record
     state/gqa.rs            Qwen3xGQAState page/metadata/reset lifecycle grouping
-    state/gqa/file_io.rs    Qwen3xGQAState full-state file I/O
+    state/gqa/file_io.rs    Qwen3xGQAState full and selected state file I/O
   v3/
     main/gqa.rs             Qwen3 Main ungated GQA weights, state, load, and record
-    main/gqa/file_io.rs     Qwen3 Main GQA full-state file I/O
+    main/gqa/file_io.rs     Qwen3 Main GQA full and selected state file I/O
     main/layer.rs           fixed QKV Qwen3MainLayer composition
     main/plan.rs            Qwen3 Main QKV GQA geometry/config builder
   v3_5/

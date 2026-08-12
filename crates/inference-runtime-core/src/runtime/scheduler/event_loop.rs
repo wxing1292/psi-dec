@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -7,15 +8,19 @@ use crossbeam_channel::Select;
 use crossbeam_channel::Sender;
 use crossbeam_channel::after;
 
+use super::executor_hibernate::collect_allocated_id_ranges;
 use crate::Result;
 use crate::channel::Shutdown;
 use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
+use crate::compute::ExecutorHibernationPlan;
 use crate::compute::ReplayableModelExecutorRequest;
 use crate::compute::ReplayableModelExecutorResponse;
+use crate::config::ExecutorHibernationMode;
 use crate::log_err_internal;
+use crate::memory::U32IDAllocator;
 use crate::runtime::RequestSlot;
 use crate::runtime::RequestSlotAllocationResult;
 use crate::runtime::RequestSlotAllocator;
@@ -31,9 +36,11 @@ pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, 
 
     scheduler: InstrumentedScheduler<S>,
     request_slot_allocator: RequestSlotAllocator,
+    page_id_allocator: Arc<U32IDAllocator>,
     model_executor_state: ModelExecutorState,
-    model_idle_timeout: Duration,
-    model_idle_timer: Receiver<Instant>,
+    executor_hibernation_mode: ExecutorHibernationMode,
+    executor_hibernation_timeout: Duration,
+    executor_hibernation_timer: Receiver<Instant>,
     idle_heartbeat: Instant,
 
     shutdown: Shutdown,
@@ -42,10 +49,10 @@ pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, 
     phantom_data_device_resp: PhantomData<DeviceResp>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ModelExecutorState {
     Started,
-    Stopped,
+    Stopped(ExecutorHibernationPlan),
 }
 
 impl<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S>
@@ -66,12 +73,14 @@ where
         model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
         scheduler: InstrumentedScheduler<S>,
         request_slot_allocator: RequestSlotAllocator,
-        model_idle_timeout: Duration,
+        page_id_allocator: Arc<U32IDAllocator>,
+        executor_hibernation_mode: ExecutorHibernationMode,
+        executor_hibernation_timeout: Duration,
         shutdown: Shutdown,
     ) -> Self {
         assert!(
-            !model_idle_timeout.is_zero(),
-            "runtime model idle timeout must be positive"
+            !executor_hibernation_timeout.is_zero(),
+            "runtime executor hibernation timeout must be positive"
         );
         Self {
             user_req_rx,
@@ -80,9 +89,11 @@ where
             model_executor_resp_rx,
             scheduler,
             request_slot_allocator,
+            page_id_allocator,
             model_executor_state: ModelExecutorState::Started,
-            model_idle_timeout,
-            model_idle_timer: after(model_idle_timeout),
+            executor_hibernation_mode,
+            executor_hibernation_timeout,
+            executor_hibernation_timer: after(executor_hibernation_timeout),
             idle_heartbeat: Instant::now(),
 
             shutdown,
@@ -108,9 +119,9 @@ where
             } else {
                 None
             };
-            let op_model_idle_timer = match self.model_executor_state {
-                ModelExecutorState::Started => Some(select.recv(&self.model_idle_timer)),
-                ModelExecutorState::Stopped => None,
+            let op_executor_hibernation_timer = match &self.model_executor_state {
+                ModelExecutorState::Started => Some(select.recv(&self.executor_hibernation_timer)),
+                ModelExecutorState::Stopped(_) => None,
             };
             let op = select.select();
             let op_index = op.index();
@@ -162,15 +173,15 @@ where
                     user_req.store_running();
                     self.scheduler.enqueue(user_req);
                 },
-                _ if Some(op_index) == op_model_idle_timer => {
+                _ if Some(op_index) == op_executor_hibernation_timer => {
                     let _ = op
-                        .recv(&self.model_idle_timer)
-                        .expect("selected model idle timer must fire");
+                        .recv(&self.executor_hibernation_timer)
+                        .expect("selected executor hibernation timer must fire");
                     let idle_duration = self.idle_heartbeat.elapsed();
-                    if idle_duration >= self.model_idle_timeout {
+                    if idle_duration >= self.executor_hibernation_timeout {
                         self.stop_model_executor()?;
                     } else {
-                        self.model_idle_timer = after(self.model_idle_timeout - idle_duration);
+                        self.executor_hibernation_timer = after(self.executor_hibernation_timeout - idle_duration);
                     }
                 },
                 _ => unreachable!(),
@@ -185,7 +196,7 @@ where
     }
 
     fn do_flush(&mut self) -> Result<()> {
-        match self.model_executor_state {
+        match &self.model_executor_state {
             ModelExecutorState::Started => {
                 while self.scheduler.can_flush() {
                     let batch_dev_req = self.scheduler.prepare();
@@ -208,24 +219,26 @@ where
                     }
                 }
             },
-            ModelExecutorState::Stopped if self.scheduler.can_flush() => {
+            ModelExecutorState::Stopped(_) if self.scheduler.can_flush() => {
                 self.start_model_executor()?;
             },
-            ModelExecutorState::Stopped => {},
+            ModelExecutorState::Stopped(_) => {},
         }
         Ok(())
     }
 
     fn start_model_executor(&mut self) -> Result<()> {
-        debug_assert_eq!(self.model_executor_state, ModelExecutorState::Stopped);
+        let ModelExecutorState::Stopped(plan) = &self.model_executor_state else {
+            panic!("runtime can start only a stopped model executor")
+        };
 
         self.model_executor_req_tx
-            .try_send(ReplayableModelExecutorRequest::Start)
+            .try_send(ReplayableModelExecutorRequest::Start(plan.clone()))
             .map_err(|error| {
                 log_err_internal!("model executor request channel full / closed while starting, stopping: {error}")
             })?;
         self.model_executor_state = ModelExecutorState::Started;
-        self.model_idle_timer = after(self.model_idle_timeout);
+        self.executor_hibernation_timer = after(self.executor_hibernation_timeout);
         self.idle_heartbeat = Instant::now();
         Ok(())
     }
@@ -233,12 +246,22 @@ where
     fn stop_model_executor(&mut self) -> Result<()> {
         debug_assert_eq!(self.model_executor_state, ModelExecutorState::Started);
 
+        let plan = match self.executor_hibernation_mode {
+            ExecutorHibernationMode::All => ExecutorHibernationPlan::All,
+            ExecutorHibernationMode::Selected => {
+                ExecutorHibernationPlan::selected(
+                    collect_allocated_id_ranges(self.request_slot_allocator.allocated_ids_bitmap_iter()),
+                    collect_allocated_id_ranges(self.page_id_allocator.allocated_ids_bitmap_iter()),
+                )
+            },
+        };
+
         self.model_executor_req_tx
-            .try_send(ReplayableModelExecutorRequest::Stop)
+            .try_send(ReplayableModelExecutorRequest::Stop(plan.clone()))
             .map_err(|error| {
                 log_err_internal!("model executor request channel full / closed while stopping, stopping: {error}")
             })?;
-        self.model_executor_state = ModelExecutorState::Stopped;
+        self.model_executor_state = ModelExecutorState::Stopped(plan);
         Ok(())
     }
 }

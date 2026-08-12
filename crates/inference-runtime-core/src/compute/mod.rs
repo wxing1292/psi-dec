@@ -18,5 +18,6 @@ pub use response::MockBatchDevResp;
 pub use response::MockDevResp;
 
 mod model_executor_protocol;
+pub use model_executor_protocol::ExecutorHibernationPlan;
 pub use model_executor_protocol::ReplayableModelExecutorRequest;
 pub use model_executor_protocol::ReplayableModelExecutorResponse;

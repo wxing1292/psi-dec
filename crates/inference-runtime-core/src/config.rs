@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::runtime::Token;
@@ -5,8 +6,26 @@ use crate::runtime::Token;
 pub const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_SAMPLING_TOP_K: usize = 20;
 pub const DEFAULT_SAMPLING_TOP_P: f32 = 0.8;
-pub const DEFAULT_MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_EXECUTOR_HIBERNATION_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_SAMPLING_TOP_K: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutorHibernationMode {
+    All,
+    Selected,
+}
+
+impl FromStr for ExecutorHibernationMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "all" => Ok(Self::All),
+            "selected" => Ok(Self::Selected),
+            _ => Err("executor hibernation mode must be 'all' or 'selected'"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CacheLaneRuntimeConfig {
@@ -19,7 +38,8 @@ pub struct CacheLaneRuntimeConfig {
 pub struct RuntimeConfig {
     pub max_queued_requests: usize,
     pub max_running_requests: usize,
-    pub idle_timeout: Duration,
+    pub executor_hibernation_timeout: Duration,
+    pub executor_hibernation_mode: ExecutorHibernationMode,
     pub context_window: usize,
 
     /// Logical token extent of one shared trie/GQA/GDN cache block.

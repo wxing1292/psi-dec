@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Seek;
-use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -13,6 +13,9 @@ use inference_backend_metal::metal::BufferIO;
 use inference_backend_metal::metal::BufferIOFile;
 use inference_backend_metal::metal::BufferIOFileCacheMode;
 use inference_executor_core::def::ModelExecutorError;
+use inference_runtime_core::compute::ExecutorHibernationPlan;
+use inference_runtime_core::runtime::RawPageID;
+use inference_runtime_core::runtime::RawRequestSlot;
 use wincode::SchemaRead;
 use wincode::SchemaReadOwned;
 use wincode::SchemaWrite;
@@ -27,14 +30,15 @@ use wincode::io::std_read::ReadAdapter;
 use wincode::io::std_write::WriteAdapter;
 use wincode::len::FixIntLen;
 
-mod full_state_io;
-pub use full_state_io::FullStateIO;
-pub use full_state_io::GDNStateSnapshotFiles;
-pub use full_state_io::GQAStateSnapshotFiles;
-pub use full_state_io::PageArenaStateSnapshotFiles;
+mod state_io;
+pub use state_io::FullStateIO;
+pub use state_io::GDNStateSnapshotFiles;
+pub use state_io::GQAStateSnapshotFiles;
+pub use state_io::PageArenaStateSnapshotFiles;
+pub use state_io::SelectedStateIO;
 
 const SNAPSHOT_MAGIC: [u8; 8] = *b"PSISTATE";
-const SNAPSHOT_VERSION: u32 = 2;
+const SNAPSHOT_VERSION: u32 = 3;
 const MANIFEST_FILE_NAME: &str = "manifest";
 
 static NEXT_TEMP_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -98,7 +102,52 @@ struct StateSnapshotManifestEntry {
 struct StateSnapshotManifest {
     magic: [u8; 8],
     version: u32,
+    plan: StateSnapshotPlan,
     files: Vec<StateSnapshotManifestEntry>,
+}
+
+#[derive(Debug, Eq, PartialEq, SchemaRead, SchemaWrite)]
+#[wincode(tag_encoding = "u8")]
+enum StateSnapshotPlan {
+    All,
+    Selected {
+        request_slot_ranges: Vec<Range<RawRequestSlot>>,
+        page_id_ranges: Vec<Range<RawPageID>>,
+    },
+}
+
+impl StateSnapshotPlan {
+    fn from_model_plan(plan: &ExecutorHibernationPlan) -> Self {
+        match plan {
+            ExecutorHibernationPlan::All => Self::All,
+            ExecutorHibernationPlan::Selected {
+                request_slot_ranges,
+                page_id_ranges,
+            } => {
+                Self::Selected {
+                    request_slot_ranges: request_slot_ranges.clone(),
+                    page_id_ranges: page_id_ranges.clone(),
+                }
+            },
+        }
+    }
+
+    fn matches(&self, plan: &ExecutorHibernationPlan) -> bool {
+        match (self, plan) {
+            (Self::All, ExecutorHibernationPlan::All) => true,
+            (
+                Self::Selected {
+                    request_slot_ranges: snapshot_request_slot_ranges,
+                    page_id_ranges: snapshot_page_id_ranges,
+                },
+                ExecutorHibernationPlan::Selected {
+                    request_slot_ranges,
+                    page_id_ranges,
+                },
+            ) => snapshot_request_slot_ranges == request_slot_ranges && snapshot_page_id_ranges == page_id_ranges,
+            _ => false,
+        }
+    }
 }
 
 enum StateSnapshotWriteFile {
@@ -119,6 +168,7 @@ pub struct StateSnapshotWriter<'a> {
     destination: PathBuf,
     temp_path: PathBuf,
     buffer_io: &'a BufferIO,
+    plan: StateSnapshotPlan,
     expected_files: Box<[StateSnapshotFile]>,
     files: Vec<(StateSnapshotManifestEntry, StateSnapshotWriteFile)>,
     published: bool,
@@ -135,8 +185,10 @@ impl<'a> StateSnapshotWriter<'a> {
     pub fn new(
         destination: &Path,
         expected_files: &[StateSnapshotFile],
+        plan: &ExecutorHibernationPlan,
         buffer_io: &'a BufferIO,
     ) -> Result<Self, ModelExecutorError> {
+        plan.assert_valid();
         validate_expected_file_set(expected_files)?;
         let parent = destination.parent().ok_or_else(|| {
             ModelExecutorError::custom(format!("model state snapshot path has no parent: {destination:?}"))
@@ -173,25 +225,47 @@ impl<'a> StateSnapshotWriter<'a> {
             destination: destination.to_path_buf(),
             temp_path,
             buffer_io,
+            plan: StateSnapshotPlan::from_model_plan(plan),
             expected_files: expected_files.into(),
             files: Vec::new(),
             published: false,
         })
     }
 
-    pub fn write_buffer(
+    pub fn write_full_buffer(
         &mut self,
         snapshot_file: StateSnapshotFile,
         buffer: &Buffer,
     ) -> Result<(), ModelExecutorError> {
-        if snapshot_file.kind() != StateSnapshotFileKind::Buffer {
-            return Err(ModelExecutorError::custom(format!(
-                "model state snapshot file does not contain a buffer: file={snapshot_file:?}"
-            )));
-        }
         if buffer.len_bytes() == 0 {
             return Err(ModelExecutorError::custom(format!(
                 "model state snapshot buffer must not be empty: file={snapshot_file:?}"
+            )));
+        }
+        let range = 0..buffer.len_bytes_u64();
+        self.write_buffer_ranges(snapshot_file, buffer, std::slice::from_ref(&range))
+    }
+
+    pub fn write_selected_buffer(
+        &mut self,
+        snapshot_file: StateSnapshotFile,
+        buffer: &Buffer,
+        entry_ranges: &[Range<u32>],
+        entry_bytes: usize,
+    ) -> Result<(), ModelExecutorError> {
+        let ranges = selected_buffer_ranges(buffer, entry_ranges, entry_bytes);
+        self.write_buffer_ranges(snapshot_file, buffer, &ranges)
+    }
+
+    fn write_buffer_ranges(
+        &mut self,
+        snapshot_file: StateSnapshotFile,
+        buffer: &Buffer,
+        ranges: &[Range<u64>],
+    ) -> Result<(), ModelExecutorError> {
+        if snapshot_file.kind() != StateSnapshotFileKind::Buffer {
+            return Err(ModelExecutorError::custom(format!(
+                "model state snapshot file does not contain a buffer: file={snapshot_file:?}"
             )));
         }
         self.assert_file_is_new(snapshot_file)?;
@@ -204,14 +278,20 @@ impl<'a> StateSnapshotWriter<'a> {
                     "unable to create model state buffer file {snapshot_file:?} at {path:?}: {error}"
                 ))
             })?;
-        let payload_bytes = buffer.len_bytes_u64();
-        self.buffer_io
-            .buffer_to_file(buffer, 0, &output_file, 0, payload_bytes)
-            .map_err(|error| {
-                ModelExecutorError::custom(format!(
-                    "unable to write model state buffer file {snapshot_file:?} to {path:?}: {error}"
-                ))
-            })?;
+        let mut payload_bytes = 0_u64;
+        for range in ranges {
+            let len_bytes = range.end - range.start;
+            self.buffer_io
+                .buffer_to_file(buffer, range.start, &output_file, payload_bytes, len_bytes)
+                .map_err(|error| {
+                    ModelExecutorError::custom(format!(
+                        "unable to write model state buffer file {snapshot_file:?} to {path:?}: {error}"
+                    ))
+                })?;
+            payload_bytes = payload_bytes
+                .checked_add(len_bytes)
+                .expect("model state snapshot payload length must fit u64");
+        }
         self.files.push((
             StateSnapshotManifestEntry {
                 file: snapshot_file,
@@ -237,17 +317,6 @@ impl<'a> StateSnapshotWriter<'a> {
             )));
         }
         self.assert_file_is_new(snapshot_file)?;
-        let payload_bytes =
-            wincode::config::serialized_size(metadata, state_snapshot_wincode_config()).map_err(|error| {
-                ModelExecutorError::custom(format!(
-                    "unable to size model state metadata file {snapshot_file:?}: {error}"
-                ))
-            })?;
-        if payload_bytes == 0 {
-            return Err(ModelExecutorError::custom(format!(
-                "model state snapshot metadata must not be empty: file={snapshot_file:?}"
-            )));
-        }
         let path = self.temp_path.join(snapshot_file.file_name());
         let mut output_file = OpenOptions::new()
             .create_new(true)
@@ -268,6 +337,16 @@ impl<'a> StateSnapshotWriter<'a> {
                 "unable to encode model state metadata file {snapshot_file:?} to {path:?}: {error}"
             ))
         })?;
+        let payload_bytes = output_file.stream_position().map_err(|error| {
+            ModelExecutorError::custom(format!(
+                "unable to inspect model state metadata file {snapshot_file:?} at {path:?}: {error}"
+            ))
+        })?;
+        if payload_bytes == 0 {
+            return Err(ModelExecutorError::custom(format!(
+                "model state snapshot metadata must not be empty: file={snapshot_file:?}"
+            )));
+        }
         self.files.push((
             StateSnapshotManifestEntry {
                 file: snapshot_file,
@@ -295,9 +374,9 @@ impl<'a> StateSnapshotWriter<'a> {
         let manifest = StateSnapshotManifest {
             magic: SNAPSHOT_MAGIC,
             version: SNAPSHOT_VERSION,
+            plan: std::mem::replace(&mut self.plan, StateSnapshotPlan::All),
             files: manifest_entries,
         };
-        let manifest_bytes = encode_manifest(&manifest)?;
         let manifest_path = self.temp_path.join(MANIFEST_FILE_NAME);
         let mut manifest_file = OpenOptions::new()
             .create_new(true)
@@ -308,9 +387,14 @@ impl<'a> StateSnapshotWriter<'a> {
                     "unable to create model state manifest {manifest_path:?}: {error}"
                 ))
             })?;
-        manifest_file.write_all(&manifest_bytes).map_err(|error| {
+        wincode::config::serialize_into(
+            WriteAdapter::new(&mut manifest_file),
+            &manifest,
+            state_snapshot_wincode_config(),
+        )
+        .map_err(|error| {
             ModelExecutorError::custom(format!(
-                "unable to write model state manifest {manifest_path:?}: {error}"
+                "unable to encode model state manifest {manifest_path:?}: {error}"
             ))
         })?;
         manifest_file.sync_all().map_err(|error| {
@@ -373,8 +457,10 @@ impl<'a> StateSnapshotReader<'a> {
     pub fn open(
         path: &Path,
         expected_files: &[StateSnapshotFile],
+        plan: &ExecutorHibernationPlan,
         buffer_io: &'a BufferIO,
     ) -> Result<Self, ModelExecutorError> {
+        plan.assert_valid();
         validate_expected_file_set(expected_files)?;
         let directory_metadata = std::fs::symlink_metadata(path).map_err(|error| {
             ModelExecutorError::custom(format!("unable to inspect model state snapshot {path:?}: {error}"))
@@ -386,18 +472,43 @@ impl<'a> StateSnapshotReader<'a> {
         }
 
         let manifest_path = path.join(MANIFEST_FILE_NAME);
-        let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        let mut manifest_file = File::open(&manifest_path).map_err(|error| {
             ModelExecutorError::custom(format!(
-                "unable to read model state manifest {manifest_path:?}: {error}"
+                "unable to open model state manifest {manifest_path:?}: {error}"
             ))
         })?;
         let manifest: StateSnapshotManifest =
-            wincode::config::deserialize_exact(&manifest_bytes, state_snapshot_wincode_config()).map_err(|error| {
+            wincode::config::deserialize_from(ReadAdapter::new(&mut manifest_file), state_snapshot_wincode_config())
+                .map_err(|error| {
+                    ModelExecutorError::custom(format!(
+                        "unable to decode model state manifest {manifest_path:?}: {error}"
+                    ))
+                })?;
+        let manifest_bytes = manifest_file.stream_position().map_err(|error| {
+            ModelExecutorError::custom(format!(
+                "unable to inspect model state manifest {manifest_path:?}: {error}"
+            ))
+        })?;
+        let actual_manifest_bytes = manifest_file
+            .metadata()
+            .map_err(|error| {
                 ModelExecutorError::custom(format!(
-                    "unable to decode model state manifest {manifest_path:?}: {error}"
+                    "unable to inspect model state manifest {manifest_path:?}: {error}"
                 ))
-            })?;
+            })?
+            .len();
+        if manifest_bytes != actual_manifest_bytes {
+            return Err(ModelExecutorError::custom(format!(
+                "model state manifest contains trailing bytes: path={manifest_path:?} \
+                 file_bytes={actual_manifest_bytes} consumed={manifest_bytes}"
+            )));
+        }
         validate_manifest(&manifest)?;
+        if !manifest.plan.matches(plan) {
+            return Err(ModelExecutorError::custom(
+                "model state snapshot hibernation plan does not match the requested plan",
+            ));
+        }
         validate_expected_files(&manifest.files, expected_files)?;
         validate_snapshot_directory(path, &manifest.files)?;
 
@@ -410,15 +521,47 @@ impl<'a> StateSnapshotReader<'a> {
         })
     }
 
-    pub fn read_buffer(&mut self, snapshot_file: StateSnapshotFile, buffer: &Buffer) -> Result<(), ModelExecutorError> {
+    pub fn read_full_buffer(
+        &mut self,
+        snapshot_file: StateSnapshotFile,
+        buffer: &Buffer,
+    ) -> Result<(), ModelExecutorError> {
+        let range = 0..buffer.len_bytes_u64();
+        self.read_buffer_ranges(snapshot_file, buffer, std::slice::from_ref(&range))
+    }
+
+    pub fn read_selected_buffer(
+        &mut self,
+        snapshot_file: StateSnapshotFile,
+        buffer: &Buffer,
+        entry_ranges: &[Range<u32>],
+        entry_bytes: usize,
+    ) -> Result<(), ModelExecutorError> {
+        let ranges = selected_buffer_ranges(buffer, entry_ranges, entry_bytes);
+        self.read_buffer_ranges(snapshot_file, buffer, &ranges)
+    }
+
+    fn read_buffer_ranges(
+        &mut self,
+        snapshot_file: StateSnapshotFile,
+        buffer: &Buffer,
+        ranges: &[Range<u64>],
+    ) -> Result<(), ModelExecutorError> {
         let file_index = self.file_index(snapshot_file, StateSnapshotFileKind::Buffer)?;
         let entry = self.files[file_index];
-        if entry.payload_bytes != buffer.len_bytes_u64() {
+        let expected_payload_bytes = ranges
+            .iter()
+            .try_fold(0_u64, |total, range| total.checked_add(range.end - range.start));
+        let expected_payload_bytes = expected_payload_bytes.expect("model state snapshot payload length must fit u64");
+        if entry.payload_bytes != expected_payload_bytes {
             return Err(ModelExecutorError::custom(format!(
                 "model state snapshot file length mismatch: file={snapshot_file:?} expected={} actual={}",
-                buffer.len_bytes_u64(),
-                entry.payload_bytes
+                expected_payload_bytes, entry.payload_bytes
             )));
+        }
+        if ranges.is_empty() {
+            self.consumed[file_index] = true;
+            return Ok(());
         }
         let path = self.path.join(snapshot_file.file_name());
         let input_file = self
@@ -429,13 +572,20 @@ impl<'a> StateSnapshotReader<'a> {
                     "unable to open model state buffer file {snapshot_file:?} at {path:?}: {error}"
                 ))
             })?;
-        self.buffer_io
-            .file_to_buffer(&input_file, 0, buffer, 0, entry.payload_bytes)
-            .map_err(|error| {
-                ModelExecutorError::custom(format!(
-                    "unable to read model state buffer file {snapshot_file:?} from {path:?}: {error}"
-                ))
-            })?;
+        let mut file_offset_bytes = 0_u64;
+        for range in ranges {
+            let len_bytes = range.end - range.start;
+            self.buffer_io
+                .file_to_buffer(&input_file, file_offset_bytes, buffer, range.start, len_bytes)
+                .map_err(|error| {
+                    ModelExecutorError::custom(format!(
+                        "unable to read model state buffer file {snapshot_file:?} from {path:?}: {error}"
+                    ))
+                })?;
+            file_offset_bytes = file_offset_bytes
+                .checked_add(len_bytes)
+                .expect("model state snapshot file offset must fit u64");
+        }
         self.consumed[file_index] = true;
         Ok(())
     }
@@ -521,6 +671,7 @@ const fn state_snapshot_wincode_config() -> StateSnapshotWincodeConfig {
         .with_tag_encoding::<u8>()
 }
 
+#[cfg(test)]
 fn encode_manifest(manifest: &StateSnapshotManifest) -> Result<Vec<u8>, ModelExecutorError> {
     wincode::config::serialize(manifest, state_snapshot_wincode_config())
         .map_err(|error| ModelExecutorError::custom(format!("unable to encode model state manifest: {error}")))
@@ -536,6 +687,7 @@ fn validate_manifest(manifest: &StateSnapshotManifest) -> Result<(), ModelExecut
             manifest.version
         )));
     }
+    validate_snapshot_plan(&manifest.plan)?;
     if manifest.files.is_empty() {
         return Err(ModelExecutorError::custom(
             "model state snapshot must contain at least one file",
@@ -550,9 +702,13 @@ fn validate_manifest(manifest: &StateSnapshotManifest) -> Result<(), ModelExecut
             "model state snapshot files must be unique and sorted",
         ));
     }
-    if manifest.files.iter().any(|entry| entry.payload_bytes == 0) {
+    if manifest
+        .files
+        .iter()
+        .any(|entry| entry.kind == StateSnapshotFileKind::Metadata && entry.payload_bytes == 0)
+    {
         return Err(ModelExecutorError::custom(
-            "model state snapshot files must not be empty",
+            "model state snapshot metadata files must not be empty",
         ));
     }
     if manifest.files.iter().any(|entry| entry.kind != entry.file.kind()) {
@@ -561,6 +717,62 @@ fn validate_manifest(manifest: &StateSnapshotManifest) -> Result<(), ModelExecut
         ));
     }
     Ok(())
+}
+
+fn validate_snapshot_plan(plan: &StateSnapshotPlan) -> Result<(), ModelExecutorError> {
+    let StateSnapshotPlan::Selected {
+        request_slot_ranges,
+        page_id_ranges,
+    } = plan
+    else {
+        return Ok(());
+    };
+    if !are_canonical_ranges(request_slot_ranges) {
+        return Err(ModelExecutorError::custom(
+            "model state snapshot request slot ranges must be nonempty, sorted, disjoint, and nonadjacent",
+        ));
+    }
+    if !are_canonical_ranges(page_id_ranges) {
+        return Err(ModelExecutorError::custom(
+            "model state snapshot page ID ranges must be nonempty, sorted, disjoint, and nonadjacent",
+        ));
+    }
+    Ok(())
+}
+
+fn selected_buffer_ranges(buffer: &Buffer, entry_ranges: &[Range<u32>], entry_bytes: usize) -> Vec<Range<u64>> {
+    assert!(
+        entry_bytes > 0,
+        "model state snapshot buffer entry size must be positive"
+    );
+    let entry_bytes = u64::try_from(entry_bytes).expect("model state snapshot buffer entry size must fit u64");
+    assert!(
+        are_canonical_ranges(entry_ranges),
+        "model state snapshot buffer entry ranges must be nonempty, sorted, disjoint, and nonadjacent"
+    );
+    entry_ranges
+        .iter()
+        .map(|entry_range| {
+            let start = u64::from(entry_range.start)
+                .checked_mul(entry_bytes)
+                .expect("model state snapshot buffer entry offset must fit u64");
+            let end = u64::from(entry_range.end)
+                .checked_mul(entry_bytes)
+                .expect("model state snapshot buffer entry end must fit u64");
+            assert!(
+                end <= buffer.len_bytes_u64(),
+                "model state snapshot buffer entry range is out of bounds: entry_range={entry_range:?} entry_bytes={} \
+                 buffer_bytes={}",
+                entry_bytes,
+                buffer.len_bytes_u64()
+            );
+            start..end
+        })
+        .collect()
+}
+
+fn are_canonical_ranges(ranges: &[Range<u32>]) -> bool {
+    ranges.iter().all(|range| range.start < range.end) && ranges.windows(2).all(|pair| pair[0].end < pair[1].start)
 }
 
 fn validate_snapshot_directory(path: &Path, files: &[StateSnapshotManifestEntry]) -> Result<(), ModelExecutorError> {
@@ -672,6 +884,7 @@ fn temp_path(destination: &Path) -> PathBuf {
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write as _;
+    use std::mem::size_of;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
@@ -679,6 +892,7 @@ mod tests {
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::BufferIO;
     use inference_backend_metal::metal::Device;
+    use inference_runtime_core::compute::ExecutorHibernationPlan;
     use wincode::SchemaRead;
     use wincode::SchemaWrite;
 
@@ -701,7 +915,7 @@ mod tests {
     const GDN_METADATA_FILES: &[StateSnapshotFile] = &[StateSnapshotFile::MainGDNRequestStateTable];
 
     #[test]
-    fn test_directory_snapshot_round_trip() {
+    fn test_directory_snapshot_unload_load() {
         let device = Device::system_default();
         let buffer_io = BufferIO::new(&device);
         let source_values = (0..4096).map(|index| (index % 251) as u8).collect::<Vec<_>>();
@@ -710,10 +924,16 @@ mod tests {
         let metadata = TestMetadata {
             slots: vec![3, 5, 8, 13],
         };
-        let path = test_path("round-trip");
+        let path = test_path("unload-load");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_AND_GDN_METADATA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let mut writer = StateSnapshotWriter::new(
+            &path,
+            PAGE_ARENA_AND_GDN_METADATA_FILES,
+            &ExecutorHibernationPlan::All,
+            &buffer_io,
+        )
+        .unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
         writer
             .write_metadata(StateSnapshotFile::MainGDNRequestStateTable, &metadata)
             .unwrap();
@@ -723,8 +943,16 @@ mod tests {
         assert!(path.join("page-arena").is_file());
         assert!(path.join("main-gdn-request-state-table").is_file());
 
-        let mut reader = StateSnapshotReader::open(&path, PAGE_ARENA_AND_GDN_METADATA_FILES, &buffer_io).unwrap();
-        reader.read_buffer(StateSnapshotFile::PageArena, &restored).unwrap();
+        let mut reader = StateSnapshotReader::open(
+            &path,
+            PAGE_ARENA_AND_GDN_METADATA_FILES,
+            &ExecutorHibernationPlan::All,
+            &buffer_io,
+        )
+        .unwrap();
+        reader
+            .read_full_buffer(StateSnapshotFile::PageArena, &restored)
+            .unwrap();
         let restored_metadata: TestMetadata = reader
             .read_metadata(StateSnapshotFile::MainGDNRequestStateTable)
             .unwrap();
@@ -736,18 +964,172 @@ mod tests {
     }
 
     #[test]
+    fn test_selected_buffer_entries_unload_load() {
+        let device = Device::system_default();
+        let buffer_io = BufferIO::new(&device);
+        let source_values = (10_u32..18).collect::<Vec<_>>();
+        let source = Buffer::from_slice(&device, &source_values);
+        let restored = Buffer::from_slice(&device, &[u32::MAX; 8]);
+        let selected_entry_ranges = [1..3, 5..6];
+        let request_slot_ranges = std::iter::once(3..4).collect();
+        let plan = ExecutorHibernationPlan::selected(request_slot_ranges, selected_entry_ranges.to_vec());
+        let path = test_path("selected-buffer-entries");
+
+        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &plan, &buffer_io).unwrap();
+        writer
+            .write_selected_buffer(
+                StateSnapshotFile::PageArena,
+                &source,
+                &selected_entry_ranges,
+                size_of::<u32>(),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(std::fs::metadata(path.join("page-arena")).unwrap().len(), 12);
+        let mut reader = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &plan, &buffer_io).unwrap();
+        reader
+            .read_selected_buffer(
+                StateSnapshotFile::PageArena,
+                &restored,
+                &selected_entry_ranges,
+                size_of::<u32>(),
+            )
+            .unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(
+            restored.read_typed::<u32>(0, 8),
+            vec![u32::MAX, 11, 12, u32::MAX, u32::MAX, 15, u32::MAX, u32::MAX]
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "model state snapshot buffer entry ranges must be nonempty, sorted, disjoint, and nonadjacent"
+    )]
+    fn test_selected_buffer_entries_reject_adjacent_ranges() {
+        let device = Device::system_default();
+        let source = Buffer::new_zeroed_elements(&device, 8, inference_backend_metal::metal::Dtype::Uint32);
+        let _ = super::selected_buffer_ranges(&source, &[1..2, 2..3], size_of::<u32>());
+    }
+
+    #[test]
+    #[should_panic(expected = "model state snapshot buffer entry range is out of bounds")]
+    fn test_selected_buffer_entries_reject_out_of_bounds_range() {
+        let device = Device::system_default();
+        let source = Buffer::new_zeroed_elements(&device, 8, inference_backend_metal::metal::Dtype::Uint32);
+        let entry_range = 8..9;
+        let _ = super::selected_buffer_ranges(&source, std::slice::from_ref(&entry_range), size_of::<u32>());
+    }
+
+    #[test]
+    fn test_empty_selected_buffer_unload_load() {
+        let device = Device::system_default();
+        let buffer_io = BufferIO::new(&device);
+        let source = Buffer::new_zeroed(&device, 16);
+        let plan = ExecutorHibernationPlan::selected(Vec::new(), Vec::new());
+        let path = test_path("empty-selected-buffer");
+
+        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &plan, &buffer_io).unwrap();
+        writer
+            .write_selected_buffer(StateSnapshotFile::PageArena, &source, &[], 4)
+            .unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(std::fs::metadata(path.join("page-arena")).unwrap().len(), 0);
+        let mut reader = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &plan, &buffer_io).unwrap();
+        reader
+            .read_selected_buffer(StateSnapshotFile::PageArena, &source, &[], 4)
+            .unwrap();
+        reader.finish().unwrap();
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn test_reader_rejects_mismatched_plan() {
+        let device = Device::system_default();
+        let buffer_io = BufferIO::new(&device);
+        let source = Buffer::new_zeroed(&device, 16);
+        let written_plan =
+            ExecutorHibernationPlan::selected(std::iter::once(1..2).collect(), std::iter::once(2..3).collect());
+        let requested_plan =
+            ExecutorHibernationPlan::selected(std::iter::once(1..2).collect(), std::iter::once(3..4).collect());
+        let path = test_path("hibernation-plan-mismatch");
+
+        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &written_plan, &buffer_io).unwrap();
+        let entry_range = 2..3;
+        writer
+            .write_selected_buffer(
+                StateSnapshotFile::PageArena,
+                &source,
+                std::slice::from_ref(&entry_range),
+                4,
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &requested_plan, &buffer_io)
+            .err()
+            .expect("mismatched plan must fail snapshot validation");
+        assert!(error.to_string().contains("plan does not match"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn test_reader_rejects_noncanonical_plan_ranges() {
+        let device = Device::system_default();
+        let buffer_io = BufferIO::new(&device);
+        let source = Buffer::new_zeroed(&device, 16);
+        let plan = ExecutorHibernationPlan::selected(Vec::new(), std::iter::once(2..3).collect());
+        let path = test_path("noncanonical-plan-ranges");
+
+        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &plan, &buffer_io).unwrap();
+        let entry_range = 2..3;
+        writer
+            .write_selected_buffer(
+                StateSnapshotFile::PageArena,
+                &source,
+                std::slice::from_ref(&entry_range),
+                4,
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        let mut manifest = read_manifest(&path);
+        manifest.plan = super::StateSnapshotPlan::Selected {
+            request_slot_ranges: Vec::new(),
+            page_id_ranges: vec![2..4, 4..5],
+        };
+        std::fs::write(path.join("manifest"), super::encode_manifest(&manifest).unwrap()).unwrap();
+
+        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &plan, &buffer_io)
+            .err()
+            .expect("noncanonical manifest plan ranges must fail snapshot validation");
+        assert!(
+            error
+                .to_string()
+                .contains("page ID ranges must be nonempty, sorted, disjoint, and nonadjacent")
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn test_reader_rejects_unexpected_file() {
         let device = Device::system_default();
         let buffer_io = BufferIO::new(&device);
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("unexpected-file");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
         writer.commit().unwrap();
         std::fs::write(path.join("unexpected"), b"unexpected").unwrap();
 
-        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &buffer_io)
+        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io)
             .err()
             .expect("unexpected file must fail snapshot validation");
         assert!(error.to_string().contains("unexpected file"));
@@ -761,8 +1143,9 @@ mod tests {
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("truncated-file");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
         writer.commit().unwrap();
         OpenOptions::new()
             .write(true)
@@ -771,7 +1154,7 @@ mod tests {
             .set_len(8)
             .unwrap();
 
-        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &buffer_io)
+        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io)
             .err()
             .expect("truncated file must fail snapshot validation");
         assert!(error.to_string().contains("length mismatch"));
@@ -784,10 +1167,11 @@ mod tests {
         let buffer_io = BufferIO::new(&device);
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("writer-kind-mismatch");
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
 
         let buffer_error = writer
-            .write_buffer(StateSnapshotFile::MainGDNRequestStateTable, &source)
+            .write_full_buffer(StateSnapshotFile::MainGDNRequestStateTable, &source)
             .unwrap_err();
         assert!(buffer_error.to_string().contains("does not contain a buffer"));
         let metadata_error = writer
@@ -806,18 +1190,44 @@ mod tests {
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("manifest-kind-mismatch");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
         writer.commit().unwrap();
 
         let mut manifest = read_manifest(&path);
         manifest.files[0].kind = super::StateSnapshotFileKind::Metadata;
         std::fs::write(path.join("manifest"), super::encode_manifest(&manifest).unwrap()).unwrap();
 
-        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &buffer_io)
+        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io)
             .err()
             .expect("semantic file kind mismatch must fail snapshot validation");
         assert!(error.to_string().contains("kind does not match"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn test_reader_rejects_manifest_trailing_bytes() {
+        let device = Device::system_default();
+        let buffer_io = BufferIO::new(&device);
+        let source = Buffer::new_zeroed(&device, 16);
+        let path = test_path("manifest-trailing-bytes");
+
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        writer.commit().unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(path.join("manifest"))
+            .unwrap()
+            .write_all(&[0xaa])
+            .unwrap();
+
+        let error = StateSnapshotReader::open(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io)
+            .err()
+            .expect("manifest trailing bytes must fail snapshot validation");
+        assert!(error.to_string().contains("manifest contains trailing bytes"));
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -828,13 +1238,15 @@ mod tests {
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("duplicate-expected-file");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
         writer.commit().unwrap();
 
         let error = StateSnapshotReader::open(
             &path,
             &[StateSnapshotFile::PageArena, StateSnapshotFile::PageArena],
+            &ExecutorHibernationPlan::All,
             &buffer_io,
         )
         .err()
@@ -850,8 +1262,14 @@ mod tests {
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("incomplete-expected-file-set");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_AND_GDN_METADATA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let mut writer = StateSnapshotWriter::new(
+            &path,
+            PAGE_ARENA_AND_GDN_METADATA_FILES,
+            &ExecutorHibernationPlan::All,
+            &buffer_io,
+        )
+        .unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
         let error = writer.commit().unwrap_err();
 
         assert!(error.to_string().contains("file is missing"));
@@ -865,10 +1283,11 @@ mod tests {
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("writer-unexpected-file");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
         writer
-            .write_buffer(StateSnapshotFile::MainGQARequestPageTable, &source)
+            .write_full_buffer(StateSnapshotFile::MainGQARequestPageTable, &source)
             .unwrap();
         let error = writer.commit().unwrap_err();
 
@@ -883,9 +1302,12 @@ mod tests {
         let source = Buffer::new_zeroed(&device, 16);
         let path = test_path("writer-duplicate-file");
 
-        let mut writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
-        writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap();
-        let error = writer.write_buffer(StateSnapshotFile::PageArena, &source).unwrap_err();
+        let mut writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
+        writer.write_full_buffer(StateSnapshotFile::PageArena, &source).unwrap();
+        let error = writer
+            .write_full_buffer(StateSnapshotFile::PageArena, &source)
+            .unwrap_err();
 
         assert!(error.to_string().contains("written twice"));
         drop(writer);
@@ -898,7 +1320,8 @@ mod tests {
         let buffer_io = BufferIO::new(&device);
         let path = test_path("metadata-trailing-bytes");
 
-        let mut writer = StateSnapshotWriter::new(&path, GDN_METADATA_FILES, &buffer_io).unwrap();
+        let mut writer =
+            StateSnapshotWriter::new(&path, GDN_METADATA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
         writer
             .write_metadata(
                 StateSnapshotFile::MainGDNRequestStateTable,
@@ -918,7 +1341,8 @@ mod tests {
         manifest.files[0].payload_bytes += 1;
         std::fs::write(path.join("manifest"), super::encode_manifest(&manifest).unwrap()).unwrap();
 
-        let mut reader = StateSnapshotReader::open(&path, GDN_METADATA_FILES, &buffer_io).unwrap();
+        let mut reader =
+            StateSnapshotReader::open(&path, GDN_METADATA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
         let error = reader
             .read_metadata::<TestMetadata>(StateSnapshotFile::MainGDNRequestStateTable)
             .unwrap_err();
@@ -931,7 +1355,8 @@ mod tests {
         let device = Device::system_default();
         let buffer_io = BufferIO::new(&device);
         let path = test_path("uncommitted-drop");
-        let writer = StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &buffer_io).unwrap();
+        let writer =
+            StateSnapshotWriter::new(&path, PAGE_ARENA_FILES, &ExecutorHibernationPlan::All, &buffer_io).unwrap();
         let temp_path = writer.temp_path.clone();
 
         assert!(temp_path.is_dir());

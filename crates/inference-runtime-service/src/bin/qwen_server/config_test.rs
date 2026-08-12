@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use inference_runtime_core::Error;
+use inference_runtime_core::config::ExecutorHibernationMode;
 
 use super::Qwen3Config;
 use super::Qwen3ModelMode;
@@ -24,16 +25,36 @@ fn parse_qwen3(extra: &[&str]) -> Qwen3Args {
 }
 
 #[test]
-fn test_model_idle_timeout() {
+fn test_executor_hibernation_timeout() {
     let qwen3_default = Qwen3Config::from_args(parse_qwen3(&[])).unwrap();
     let qwen35_default = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
-    let qwen3_override = Qwen3Config::from_args(parse_qwen3(&["--model-idle-timeout-secs", "17"])).unwrap();
-    let qwen35_override = Qwen35Config::from_args(parse_qwen35(&["--model-idle-timeout-secs", "17"])).unwrap();
+    let qwen3_override = Qwen3Config::from_args(parse_qwen3(&["--executor-hibernation-timeout-secs", "17"])).unwrap();
+    let qwen35_override =
+        Qwen35Config::from_args(parse_qwen35(&["--executor-hibernation-timeout-secs", "17"])).unwrap();
 
-    assert_eq!(qwen3_default.model_idle_timeout(), Duration::from_secs(300));
-    assert_eq!(qwen35_default.model_idle_timeout(), Duration::from_secs(300));
-    assert_eq!(qwen3_override.model_idle_timeout(), Duration::from_secs(17));
-    assert_eq!(qwen35_override.model_idle_timeout(), Duration::from_secs(17));
+    assert_eq!(qwen3_default.executor_hibernation_timeout(), Duration::from_secs(300));
+    assert_eq!(qwen35_default.executor_hibernation_timeout(), Duration::from_secs(300));
+    assert_eq!(qwen3_override.executor_hibernation_timeout(), Duration::from_secs(17));
+    assert_eq!(qwen35_override.executor_hibernation_timeout(), Duration::from_secs(17));
+}
+
+#[test]
+fn test_executor_hibernation_mode() {
+    let qwen3_default = Qwen3Config::from_args(parse_qwen3(&[])).unwrap();
+    let qwen35_default = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
+    let qwen3_selected = Qwen3Config::from_args(parse_qwen3(&["--executor-hibernation-mode", "selected"])).unwrap();
+    let qwen35_selected = Qwen35Config::from_args(parse_qwen35(&["--executor-hibernation-mode", "selected"])).unwrap();
+
+    assert_eq!(qwen3_default.executor_hibernation_mode(), ExecutorHibernationMode::All);
+    assert_eq!(qwen35_default.executor_hibernation_mode(), ExecutorHibernationMode::All);
+    assert_eq!(
+        qwen3_selected.executor_hibernation_mode(),
+        ExecutorHibernationMode::Selected
+    );
+    assert_eq!(
+        qwen35_selected.executor_hibernation_mode(),
+        ExecutorHibernationMode::Selected
+    );
 }
 
 #[test]

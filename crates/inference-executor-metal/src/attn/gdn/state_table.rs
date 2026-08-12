@@ -1071,6 +1071,7 @@ mod tests {
     use inference_executor_core::attn::GDNCore;
     use inference_executor_core::attn::GDNReplayShape;
     use inference_executor_core::attn::gdn::state::GDNStateTxn;
+    use inference_runtime_core::compute::ExecutorHibernationPlan;
 
     use super::GDNRequestStateTable;
     use super::GDNStateCapacity;
@@ -1078,6 +1079,7 @@ mod tests {
     use crate::attn::gdn::request_state_table::GDNRequestSlots;
     use crate::model::state_snapshot::FullStateIO;
     use crate::model::state_snapshot::GDNStateSnapshotFiles;
+    use crate::model::state_snapshot::SelectedStateIO;
     use crate::model::state_snapshot::StateSnapshotFile;
     use crate::model::state_snapshot::StateSnapshotReader;
     use crate::model::state_snapshot::StateSnapshotWriter;
@@ -1099,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unload_load_fixed_state() {
+    fn test_full_state_unload_load_fixed() {
         let device = Device::system_default();
         let mut state = new_lifecycle_state(&device);
         let pages_per_state = state.num_pages_per_state_slot();
@@ -1120,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unload_load_random_state() {
+    fn test_full_state_unload_load_random() {
         let device = Device::system_default();
         let mut state = new_lifecycle_state(&device);
         let mut random = TestRandom::new(0x4744_4e5f_5354_4154);
@@ -1136,6 +1138,74 @@ mod tests {
         let reference = capture_state(&state);
 
         assert_unload_load("random", &device, &mut state, reference);
+    }
+
+    #[test]
+    fn test_selected_state_unload_load() {
+        let device = Device::system_default();
+        let mut state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            3,
+            GDNStateCapacity::new(3, 2, 1),
+            2,
+            TEST_NUM_CACHE_PAGES,
+            LIFECYCLE_PAGE_BYTES,
+        );
+        {
+            let mut request_table = state.request_table().borrow_mut();
+            request_table.begin_txn(1, &[1], Vec::new());
+            assert!(request_table.commit_txn(1, 1).is_empty());
+        }
+        let selected_state_slot = usize::try_from(state.request_table().borrow().current_state_slot(1)).unwrap();
+        let request_state = state.request_table().borrow().clone();
+        let (num_recurrent_values, num_conv_values) = state_value_counts(&state);
+        let recurrent_state = fixed_values(num_recurrent_values, 0.25);
+        let conv_state = fixed_values(num_conv_values, -0.5);
+        write_state_values(&state, &recurrent_state, &conv_state);
+
+        let selected_request_slot_ranges = std::iter::once(1..2).collect::<Vec<_>>();
+        let plan = ExecutorHibernationPlan::selected(selected_request_slot_ranges.to_vec(), Vec::new());
+        let snapshot_path = snapshot_path("selected");
+        let buffer_io = inference_backend_metal::metal::BufferIO::new(&device);
+        let snapshot_files = [
+            SNAPSHOT_FILES.request_state_table(),
+            SNAPSHOT_FILES.recurrent_state(),
+            SNAPSHOT_FILES.conv_state(),
+        ];
+        let mut writer = StateSnapshotWriter::new(&snapshot_path, &snapshot_files, &plan, &buffer_io).unwrap();
+        state
+            .write_selected_state(&mut writer, SNAPSHOT_FILES, &selected_request_slot_ranges)
+            .unwrap();
+        writer.commit().unwrap();
+
+        state.release_resources();
+        state.allocate_resources(&device);
+        let mut reader = StateSnapshotReader::open(&snapshot_path, &snapshot_files, &plan, &buffer_io).unwrap();
+        state
+            .read_selected_state(&mut reader, SNAPSHOT_FILES, &selected_request_slot_ranges)
+            .unwrap();
+        reader.finish().unwrap();
+
+        let restored = capture_state(&state);
+        assert_eq!(restored.request_state, request_state);
+        assert_selected_state_values(
+            &restored.recurrent_state,
+            &recurrent_state,
+            state.layout.num_gdn_layers,
+            state.layout.num_state_slots,
+            selected_state_slot,
+            state.recurrent_state_bytes() / size_of::<f32>(),
+        );
+        assert_selected_state_values(
+            &restored.conv_state,
+            &conv_state,
+            state.layout.num_gdn_layers,
+            state.layout.num_state_slots,
+            selected_state_slot,
+            state.conv_state_bytes() / size_of::<f32>(),
+        );
+        std::fs::remove_dir_all(snapshot_path).unwrap();
     }
 
     #[test]
@@ -1563,14 +1633,26 @@ mod tests {
             SNAPSHOT_FILES.recurrent_state(),
             SNAPSHOT_FILES.conv_state(),
         ];
-        let mut writer = StateSnapshotWriter::new(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        let mut writer = StateSnapshotWriter::new(
+            &snapshot_path,
+            &snapshot_files,
+            &ExecutorHibernationPlan::All,
+            &buffer_io,
+        )
+        .unwrap();
         state.write_full_state(&mut writer, SNAPSHOT_FILES).unwrap();
         writer.commit().unwrap();
 
         state.release_resources();
         state.allocate_resources(device);
 
-        let mut reader = StateSnapshotReader::open(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        let mut reader = StateSnapshotReader::open(
+            &snapshot_path,
+            &snapshot_files,
+            &ExecutorHibernationPlan::All,
+            &buffer_io,
+        )
+        .unwrap();
         state.read_full_state(&mut reader, SNAPSHOT_FILES).unwrap();
         reader.finish().unwrap();
 
@@ -1640,6 +1722,23 @@ mod tests {
         (0..len)
             .map(|index| ((index % 17) as f32 - 8.0) * 0.25 + offset)
             .collect()
+    }
+
+    fn assert_selected_state_values(
+        restored: &[f32],
+        source: &[f32],
+        num_layers: usize,
+        num_state_slots: usize,
+        selected_state_slot: usize,
+        values_per_state: usize,
+    ) {
+        let mut expected = vec![0.0; source.len()];
+        for layer_index in 0..num_layers {
+            let start = (layer_index * num_state_slots + selected_state_slot) * values_per_state;
+            let end = start + values_per_state;
+            expected[start..end].copy_from_slice(&source[start..end]);
+        }
+        assert_eq!(restored, expected);
     }
 
     fn snapshot_path(name: &str) -> PathBuf {

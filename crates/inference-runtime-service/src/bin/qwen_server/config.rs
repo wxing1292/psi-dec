@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use inference_runtime_core::Result;
+use inference_runtime_core::config::ExecutorHibernationMode;
 use inference_runtime_core::config::SchedulerConfig;
 use inference_runtime_core::log_info_invalid_argument;
 
@@ -34,7 +35,8 @@ pub struct Qwen3Config {
     hf_model_dir: PathBuf,
     model_mode: Qwen3ModelMode,
     telemetry: TelemetryConfig,
-    model_idle_timeout: Duration,
+    executor_hibernation_timeout: Duration,
+    executor_hibernation_mode: ExecutorHibernationMode,
     num_cache_pages: usize,
     max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
@@ -86,7 +88,8 @@ impl Qwen3Config {
                 },
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
-            model_idle_timeout: Duration::from_secs(args.model_idle_timeout_secs.get()),
+            executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
+            executor_hibernation_mode: args.executor_hibernation_mode,
             num_cache_pages: args.num_cache_pages.get(),
             max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
@@ -118,8 +121,12 @@ impl Qwen3Config {
         self.telemetry
     }
 
-    pub fn model_idle_timeout(&self) -> Duration {
-        self.model_idle_timeout
+    pub fn executor_hibernation_timeout(&self) -> Duration {
+        self.executor_hibernation_timeout
+    }
+
+    pub fn executor_hibernation_mode(&self) -> ExecutorHibernationMode {
+        self.executor_hibernation_mode
     }
 
     pub fn num_cache_pages(&self) -> usize {
@@ -174,7 +181,8 @@ pub struct Qwen35Config {
     hf_model_dir: PathBuf,
     model_mode: Qwen35ModelMode,
     telemetry: TelemetryConfig,
-    model_idle_timeout: Duration,
+    executor_hibernation_timeout: Duration,
+    executor_hibernation_mode: ExecutorHibernationMode,
     num_cache_pages: usize,
     max_queued_requests: usize,
     scheduler_config: SchedulerConfig,
@@ -243,7 +251,8 @@ impl Qwen35Config {
                 },
                 debug_logging: matches!(args.logging, QwenLogLevel::Debug),
             },
-            model_idle_timeout: Duration::from_secs(args.model_idle_timeout_secs.get()),
+            executor_hibernation_timeout: Duration::from_secs(args.executor_hibernation_timeout_secs.get()),
+            executor_hibernation_mode: args.executor_hibernation_mode,
             num_cache_pages: args.num_cache_pages.get(),
             max_queued_requests: MAX_QUEUED_REQUESTS,
             scheduler_config: SchedulerConfig {
@@ -275,8 +284,12 @@ impl Qwen35Config {
         self.telemetry
     }
 
-    pub fn model_idle_timeout(&self) -> Duration {
-        self.model_idle_timeout
+    pub fn executor_hibernation_timeout(&self) -> Duration {
+        self.executor_hibernation_timeout
+    }
+
+    pub fn executor_hibernation_mode(&self) -> ExecutorHibernationMode {
+        self.executor_hibernation_mode
     }
 
     pub fn num_cache_lanes(&self) -> usize {

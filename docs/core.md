@@ -4,7 +4,7 @@ Runtime core owns scheduling, request lifecycle, and page and cache ownership.
 
 Recommendation: Keep runtime core model-agnostic and separate from the model executor.
 
-## Scope
+## Selection
 
 Core may know requests, batches, token and block indices, page IDs, lifecycle state, and allocation ownership.
 
@@ -347,14 +347,14 @@ Runtime core and the model executor use one ordered request-response protocol:
 
 ```text
 Batch(request) -> Batch(response)
-Start          -> Started
-Stop           -> Stopped
+Start(plan)   -> Started
+Stop(plan)    -> Stopped
 ```
 
-The runtime event loop tracks the commanded `Started` or `Stopped` state.
+The runtime event loop tracks the commanded `Started` or `Stopped(plan)` state.
 It appends `Stop` to the same ordered channel after all batches that it has already sent.
 The executor completes those batches before it handles `Stop`.
-It sends `Start` when a stopped executor has work to flush.
+It sends `Start` with the stored Stop plan when a stopped executor has work to flush.
 It can append a batch after `Start` without a separate transition state.
 The ordered channel guarantees that the executor handles `Start` before that batch.
 The runtime consumes `Started` and `Stopped` as acknowledgements and then attempts the next flush.
@@ -365,6 +365,17 @@ This entry lets runtime core append `Stop` after every compute slot has submitte
 The idle condition does not require zero live requests.
 A request can remain in runtime core while it waits for resources.
 The model state snapshot preserves executor state for that request across stop and start.
+
+`RuntimeConfig::executor_hibernation_mode` fixes the Stop/Start plan policy at runtime construction.
+For `Selected`, runtime core scans the allocation bitmaps for request slots and page IDs.
+It converts set bits directly to sorted, disjoint, and nonadjacent ID ranges.
+The page ranges include active requests, reusable trie cache blocks, and resources held by runtime tasks.
+For `All`, runtime core sends `ExecutorHibernationPlan::All`.
+
+The bitmap scan is not linearizable.
+An allocation that occurs after its bitmap word is read cannot publish executor-visible state before the queued `Stop`.
+A free that occurs after its bitmap word is read can add unused state to the snapshot without changing correctness.
+Runtime core must quiesce future independent per-request I/O tasks before it scans the bitmaps.
 
 Recommendation: Send core-owned lifecycle changes from core to the executor:
 

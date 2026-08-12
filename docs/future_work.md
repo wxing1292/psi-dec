@@ -32,15 +32,19 @@ document that owns the component.
 - Rename the current reservation-wait `SwapOutTask` before per-request swap is implemented.
   Keep the request status `Running` while it waits for a reservation.
   Reserve `Swapped` for a request whose model state is not device-resident.
-- Measure and optimize full model-state snapshot I/O.
+- Measure and optimize full and selected model-state snapshot I/O.
   Keep weight handling outside this path.
   `unload_weights()` must drop Metal weight residency without writing weights to the snapshot.
   `load_weights()` must reload weights from the original checkpoint.
-  The current v2 path uses one snapshot directory and one semantic file for each resource.
+  The current v3 path uses one snapshot directory and one semantic file for each resource.
   It uses the Metal backend `BufferIO` primitive without an application staging buffer.
   It opens Metal buffer files with `BufferIOFileCacheMode::Uncached`.
   It uses native-endian `wincode` for the manifest and streams direct `GDNRequestSlots` metadata.
-  Future selected-state I/O must coalesce adjacent ranges within each semantic state file.
+  Selected-state I/O converts allocation bitmaps directly to canonical ranges.
+  Measure allocation-bitmap scanning at production page capacity.
+  Keep this work on the runtime event-loop thread unless measurements justify a worker.
+  A worker must preserve the FIFO Stop boundary and must not let a later batch overtake Stop.
+  Measure batched Metal read submission and vectored positional writes for workloads with many noncontiguous ranges.
   Preserve temporary-directory sync, atomic rename, parent-directory sync, and synchronous model-executor lifecycle
   APIs.
   The current writer and reader validate one topology-specific file set.
@@ -54,19 +58,6 @@ document that owns the component.
   Record snapshot bytes, write and read duration, effective bandwidth, and peak host-memory overhead before and after
   the change.
   Follow [`model_state_io.md`](model_state_io.md).
-- Add selective model-state snapshot I/O after the full-state path is measured and correct.
-  Add one shared `ModelStateScope` argument to the existing `Stop` and `Start` protocol variants.
-  Define `ModelStateScope::Full` and `ModelStateScope::Selected { request_slots, page_ids }`.
-  `Stop` and `Start` must use the same scope variant and fields.
-  Runtime core must supply sorted unique page IDs and valid request slots.
-  The selection must include all valid trie cache blocks, including reusable blocks with no active request reference.
-  The selection must include referenced GDN state slots and future-publish mappings.
-  It must cover Main, MTP, and DSpark cache lanes.
-  The snapshot index must identify each resource, lane, layer, page, request, and state slot.
-  State write and read APIs must remain symmetric.
-  Snapshot load must reject an invalid selection, missing resource, or invalid byte range.
-  Any validation or I/O failure must shut down the service and discard the runtime cache metadata.
-
 ## Pipeline Parallelism
 
 - Fill all free compute slots while runnable work exists. The event loop currently calls `do_flush()` at most once for

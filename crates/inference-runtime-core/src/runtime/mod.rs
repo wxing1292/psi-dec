@@ -20,5 +20,6 @@ pub use token::Token;
 
 pub type RawRequestID = usize;
 pub type RawRequestSlot = u32;
+pub type RawPageID = u32;
 pub type RawComputeSlotID = usize;
 pub type RawComputeSlotSeq = u64;

@@ -3,7 +3,7 @@
 This document defines the model-state I/O design. It separates current source from planned work.
 
 [`high_level.md`](high_level.md) defines the runtime-core and model-executor boundary.
-[`model_idle_unload.md`](model_idle_unload.md) describes the current whole-model Stop/Start path.
+[`executor_hibernation.md`](executor_hibernation.md) describes the current whole-model Stop/Start path.
 
 This document uses `checkpoint` only for the original immutable external model weights.
 It uses `snapshot` only for executor-generated mutable state from the same-executor Stop/Start lifecycle.
@@ -14,13 +14,13 @@ The repository has two model-state I/O projects.
 
 | Project | Workstream | Status |
 | --- | --- | --- |
-| Whole-model residency | Full-state Stop/Start | Implemented with the v2 directory snapshot path |
-| Whole-model residency | Selected-state Stop/Start | Planned |
+| Whole-model residency | Full-state Stop/Start | Implemented with the v3 directory snapshot path |
+| Whole-model residency | Selected-state Stop/Start | Implemented with the v3 directory snapshot path |
 | Request and cache mobility | Per-request swap | Planned |
 | Request and cache mobility | Trie cache-block I/O | Planned |
 
 The Metal backend implements the standalone `BufferIO` primitive.
-The v2 model snapshot format uses `BufferIO` for each Metal buffer resource.
+The v3 model snapshot format uses `BufferIO` for each Metal buffer resource.
 
 The model executor uses one `FullStateIO` trait for component state:
 
@@ -48,6 +48,34 @@ file set at the model-role boundary.
 
 Each component keeps its `FullStateIO` implementation in an adjacent `file_io.rs` file. This layout keeps storage logic
 separate from forward execution and resource allocation.
+
+The same components implement the symmetric `SelectedStateIO` trait:
+
+```rust
+use std::ops::Range;
+
+pub trait SelectedStateIO: FullStateIO {
+    type ID;
+
+    fn write_selected_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        files: Self::Files,
+        id_ranges: &[Range<Self::ID>],
+    ) -> Result<(), ModelExecutorError>;
+
+    fn read_selected_state(
+        &mut self,
+        reader: &mut StateSnapshotReader,
+        files: Self::Files,
+        id_ranges: &[Range<Self::ID>],
+    ) -> Result<(), ModelExecutorError>;
+}
+```
+
+The supertrait enforces one file identity for all-state and selected-state I/O. `PageArena` uses `RawPageID` as its
+`ID`. GQA and GDN owners use `RawRequestSlot`. These aliases expose the ID domain at each component API. The
+model owner passes each field to the component that owns its interpretation.
 
 ## Shared model
 
@@ -157,7 +185,7 @@ The current full-state lifecycle is synchronous.
 
 ```text
 runtime Stop
-  -> finish the current batch and commit
+  -> complete each earlier batch in the ordered executor queue
   -> clear executor replay state
   -> write all mutable model state
   -> publish the snapshot
@@ -178,54 +206,98 @@ Weights are not snapshot data.
 `unload_weights()` drops Metal weight residency.
 `load_weights()` reloads the original checkpoint.
 
-The v2 snapshot uses one directory and one file for each logical resource.
+The v3 snapshot uses one directory and one file for each logical resource.
 Metal buffer files use `BufferIOFileCacheMode::Uncached`.
 The writer does not allocate an application staging buffer.
 The reader transfers each file directly into its destination Metal buffer.
+The snapshot layer uses symmetric buffer APIs:
+
+```text
+write_full_buffer / read_full_buffer
+write_selected_buffer / read_selected_buffer
+```
 Local payload files do not contain checksums.
 
 ## Whole-model selected state
 
 Selected Stop/Start persists all runtime-valid state, not only active-request state.
+This path is implemented.
 
-The runtime core supplies this semantic selection:
+The runtime core supplies this semantic selection as canonical ID ranges:
 
 ```text
-request slots
+allocated request-slot ranges
 +
-page IDs for all valid trie and cache blocks
+allocated page-ID ranges
 ```
 
 The page set includes reusable trie blocks with no active request reference.
 Omission of these pages leaves valid runtime metadata with missing executor payload.
 
-The semantic block-to-page mapping keeps logical order.
-The executor derives a separate physical I/O order:
+Runtime core scans the shared page allocator bitmap.
+This set includes pages for active requests, unpinned reusable cache nodes, and runtime tasks.
+The scan converts set bits directly to canonical ranges.
+The executor converts those ID ranges to byte ranges:
 
 ```text
-semantic page IDs
-  -> flatten
-  -> deduplicate
-  -> sort by PageArena offset
-  -> coalesce adjacent ranges
+canonical page-ID ranges
+  -> scale by PageArena entry bytes
+  -> direct file ranges
 ```
 
-The runtime must provide sorted and unique page IDs at the Stop/Start protocol boundary.
-The executor can then validate this invariant and derive byte ranges.
+Runtime core scans the request-slot allocator bitmap in the same way.
+The bitmap scan can include a newly allocated but not yet initialized resource or a resource that is freed during the
+scan. Saving that unused state is safe.
+No omitted ID can publish executor-visible payload ahead of the queued `Stop`.
+Future independent per-request I/O tasks must be quiescent before this scan.
+`ExecutorHibernationPlan::selected(...)` enforces the canonical range contracts.
 
-Recommendation: Add one shared scope to the existing protocol variants:
+The protocol carries one shared hibernation plan:
 
 ```text
-ModelStateScope::Full
-ModelStateScope::Selected { request_slots, page_ids }
+ExecutorHibernationPlan::All
+ExecutorHibernationPlan::Selected { request_slot_ranges, page_id_ranges }
 
-ReplayableModelExecutorRequest::Stop(ModelStateScope)
-ReplayableModelExecutorRequest::Start(ModelStateScope)
+ReplayableModelExecutorRequest::Stop(ExecutorHibernationPlan)
+ReplayableModelExecutorRequest::Start(ExecutorHibernationPlan)
 ```
 
-`Stop` and `Start` must use the same scope variant and fields.
-Selected Start supplies the selection again.
-The executor must compare the Start selection with the snapshot metadata.
+`RuntimeConfig::executor_hibernation_mode` fixes the policy when the runtime starts:
+
+```text
+ExecutorHibernationMode::All      -> ExecutorHibernationPlan::All
+ExecutorHibernationMode::Selected -> scan allocated request slots and page IDs
+```
+
+The Qwen services default to `ExecutorHibernationMode::All`. Use `--executor-hibernation-mode selected` to enable
+selected-state hibernation. Runtime core creates the concrete plan at Stop. The executor consumes that plan and does
+not own a second policy setting.
+
+`Stop` and `Start` must use the same plan variant and fields.
+Runtime core stores the exact Stop plan and supplies it again on Start.
+The executor compares the Start plan with the snapshot manifest before it allocates restore resources.
+
+The selected resource mapping is:
+
+| Resource | Selection | File order |
+| --- | --- | --- |
+| `PageArena` | Allocated page-ID ranges | Increasing page ID |
+| Main GQA request page table | Allocated request-slot ranges | Increasing request slot |
+| MTP or DSpark GQA request page table | Allocated request-slot ranges | Increasing request slot |
+| GDN recurrent state | Current state slot for each allocated request slot | Layer, then increasing state slot |
+| GDN convolution state | Current state slot for each allocated request slot | Layer, then increasing state slot |
+| GDN request state table | Complete durable table | Native `GDNRequestSlots` order |
+
+The GDN request-state table remains complete because it owns one global state-slot allocator and its free-slot order.
+It also contains current versions and future-publish mappings. The recurrent and convolution payload files contain only
+the current slots for selected requests.
+
+Selected restore allocates fresh GQA and GDN buffers before it reads payload files. Their unselected entries keep the
+zero-initialized state for free request slots. Unselected `PageArena` entries are unspecified because runtime core does
+not own those page IDs.
+
+Each selected Metal file packs its selected entries without padding. The hibernation plan and component layout derive
+every file range. The format does not need a second per-entry index or resource-coordinate graph.
 
 Selected Stop/Start does not change runtime state:
 
@@ -243,7 +315,7 @@ The synchronous lifecycle keeps the same runtime object graph alive.
 
 ## Snapshot format and publication
 
-The v2 snapshot uses this flat directory layout:
+The v3 snapshot uses this flat directory layout:
 
 ```text
 snapshot/
@@ -258,15 +330,17 @@ snapshot/
 ```
 
 `manifest` uses `wincode` with native byte order, fixed-width integers, `u32` sequence lengths, and `u8` enum tags.
-It stores the format magic, format version, file kind, and exact file length.
+It stores the format magic, format version, hibernation plan, file kind, and exact file length.
 The GDN request-state table uses the same `wincode` configuration. The writer serializes `GDNRequestSlots` directly.
 It does not create a snapshot DTO or clone page mappings into an intermediate metadata graph.
 The snapshot codec disables the `wincode` preallocation limit. The local snapshot is a trusted artifact from the same
 executor instance. GDN does not calculate or supply a serialized-size limit. The reader streams the manifest-sized
 metadata file into the decoder.
 
-The metadata writer streams `wincode` output into the semantic file. The metadata reader streams the semantic file
-into its owned Rust value and rejects trailing bytes. These paths do not allocate a second full metadata byte buffer.
+The manifest and metadata writers stream `wincode` output into their files.
+The metadata writer records the actual file position after encoding. It does not run a separate serialized-size pass.
+Their readers stream each file into its owned Rust value and reject trailing bytes.
+These paths do not allocate a second full encoded byte buffer.
 
 Each Metal buffer has one semantic file name.
 The writer opens these files with `BufferIOFileCacheMode::Uncached`.
@@ -389,8 +463,8 @@ It must not publish a partial placement change.
 1. Measure standalone `BufferIO` file-to-buffer and buffer-to-file throughput. Complete.
 2. Add the v2 semantic-resource directory snapshot. Complete.
 3. Migrate full-state Stop/Start from v1 staging to `BufferIO`. Complete.
-4. Measure full-state snapshot throughput and peak memory with production model layouts.
-5. Add `ModelStateScope` to the existing `Stop` and `Start` protocol variants.
+4. Add `ExecutorHibernationPlan` and selected component I/O. Complete.
+5. Measure full-state and selected-state throughput and peak memory with production model layouts.
 6. Add per-request swap at the scheduler commit boundary.
 7. Add unified trie placement and `BlockIOTask`.
 8. Add cross-node transfer only after local I/O is correct.
@@ -400,9 +474,9 @@ It must not publish a partial placement change.
 The following details remain open:
 
 - The `BufferIO` concurrency and queue-count policy.
+- Batched Metal command submission for many noncontiguous selected read ranges.
+- Vectored positional writes for many noncontiguous selected write ranges.
 - Uncached range alignment and other filesystem tuning.
-- Selected-state metadata encoding.
-- Request-slot GQA and GDN gather/scatter format.
 - Trie insertion and duplicate-load coordination.
 - Disk replica retention after a concurrent request pin.
 - Prefill/decode transfer identity and remote publication.

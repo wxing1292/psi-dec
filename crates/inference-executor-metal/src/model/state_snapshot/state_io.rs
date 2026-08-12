@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use inference_executor_core::def::ModelExecutorError;
 
 use crate::model::state_snapshot::StateSnapshotFile;
@@ -89,5 +91,23 @@ pub trait FullStateIO {
         &mut self,
         reader: &mut StateSnapshotReader,
         files: Self::Files,
+    ) -> Result<(), ModelExecutorError>;
+}
+
+pub trait SelectedStateIO: FullStateIO {
+    type ID;
+
+    fn write_selected_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        files: Self::Files,
+        id_ranges: &[Range<Self::ID>],
+    ) -> Result<(), ModelExecutorError>;
+
+    fn read_selected_state(
+        &mut self,
+        reader: &mut StateSnapshotReader,
+        files: Self::Files,
+        id_ranges: &[Range<Self::ID>],
     ) -> Result<(), ModelExecutorError>;
 }

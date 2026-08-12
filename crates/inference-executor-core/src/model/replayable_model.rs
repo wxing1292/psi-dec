@@ -4,6 +4,7 @@ use std::time::Duration;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::DeviceRequest;
+use inference_runtime_core::compute::ExecutorHibernationPlan;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
 
@@ -30,10 +31,10 @@ pub trait ReplayableModel {
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]);
 
     fn clear_replay_cache(&mut self);
-    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError>;
+    fn unload_state(&mut self, snapshot_path: &Path, plan: &ExecutorHibernationPlan) -> Result<(), ModelExecutorError>;
     fn unload_weights(&mut self);
     fn load_weights(&mut self) -> Result<(), ModelExecutorError>;
-    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError>;
+    fn load_state(&mut self, snapshot_path: &Path, plan: &ExecutorHibernationPlan) -> Result<(), ModelExecutorError>;
 
     fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest;
     fn commit_batch(

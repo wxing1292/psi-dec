@@ -1,7 +1,7 @@
 use crate::attn::gdn::request_state_table::GDNRequestSlots;
 
 impl GDNRequestSlots {
-    pub fn assert_full_state_ready(
+    pub fn assert_snapshot_ready(
         &self,
         max_pending_publishes_per_req: usize,
         num_pages_per_state_slot: usize,

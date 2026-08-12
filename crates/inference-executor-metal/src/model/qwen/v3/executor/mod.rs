@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -36,6 +37,7 @@ use inference_executor_core::sampling::TopKSamplingShape;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
+use inference_runtime_core::compute::ExecutorHibernationPlan;
 use inference_runtime_core::runtime::RawComputeSlotSeq;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
@@ -64,6 +66,7 @@ use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
 use crate::model::state_snapshot::FullStateIO;
 use crate::model::state_snapshot::GQAStateSnapshotFiles;
 use crate::model::state_snapshot::PageArenaStateSnapshotFiles;
+use crate::model::state_snapshot::SelectedStateIO;
 use crate::model::state_snapshot::StateSnapshotFile;
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
@@ -101,11 +104,11 @@ const MAIN_GQA_STATE_FILES: GQAStateSnapshotFiles =
     GQAStateSnapshotFiles::new(StateSnapshotFile::MainGQARequestPageTable);
 const DSPARK_GQA_STATE_FILES: GQAStateSnapshotFiles =
     GQAStateSnapshotFiles::new(StateSnapshotFile::DSparkGQARequestPageTable);
-const VANILLA_FULL_STATE_SNAPSHOT_FILES: &[StateSnapshotFile] = &[
+const VANILLA_STATE_SNAPSHOT_FILES: &[StateSnapshotFile] = &[
     PAGE_ARENA_STATE_FILES.pages(),
     MAIN_GQA_STATE_FILES.request_page_table(),
 ];
-const DSPARK_FULL_STATE_SNAPSHOT_FILES: &[StateSnapshotFile] = &[
+const DSPARK_STATE_SNAPSHOT_FILES: &[StateSnapshotFile] = &[
     PAGE_ARENA_STATE_FILES.pages(),
     MAIN_GQA_STATE_FILES.request_page_table(),
     DSPARK_GQA_STATE_FILES.request_page_table(),
@@ -197,6 +200,21 @@ impl Qwen3Speculator {
         }
     }
 
+    fn write_selected_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        request_slot_ranges: &[Range<RawRequestSlot>],
+    ) -> Result<(), ModelExecutorError> {
+        match self {
+            Self::Vanilla => Ok(()),
+            Self::DSpark(dspark) => {
+                dspark
+                    .execution
+                    .write_selected_state(writer, DSPARK_GQA_STATE_FILES, request_slot_ranges)
+            },
+        }
+    }
+
     fn unload_state(&mut self) {
         if let Self::DSpark(dspark) = self {
             dspark.execution.unload_state();
@@ -225,6 +243,21 @@ impl Qwen3Speculator {
         match self {
             Self::Vanilla => Ok(()),
             Self::DSpark(dspark) => dspark.execution.read_full_state(reader, DSPARK_GQA_STATE_FILES),
+        }
+    }
+
+    fn read_selected_state(
+        &mut self,
+        reader: &mut StateSnapshotReader,
+        request_slot_ranges: &[Range<RawRequestSlot>],
+    ) -> Result<(), ModelExecutorError> {
+        match self {
+            Self::Vanilla => Ok(()),
+            Self::DSpark(dspark) => {
+                dspark
+                    .execution
+                    .read_selected_state(reader, DSPARK_GQA_STATE_FILES, request_slot_ranges)
+            },
         }
     }
 }
@@ -263,10 +296,10 @@ pub struct Qwen3Executor {
 }
 
 impl Qwen3Executor {
-    fn full_state_snapshot_files(&self) -> &'static [StateSnapshotFile] {
+    fn state_snapshot_files(&self) -> &'static [StateSnapshotFile] {
         match &self.speculator {
-            Qwen3Speculator::Vanilla => VANILLA_FULL_STATE_SNAPSHOT_FILES,
-            Qwen3Speculator::DSpark(_) => DSPARK_FULL_STATE_SNAPSHOT_FILES,
+            Qwen3Speculator::Vanilla => VANILLA_STATE_SNAPSHOT_FILES,
+            Qwen3Speculator::DSpark(_) => DSPARK_STATE_SNAPSHOT_FILES,
         }
     }
 
@@ -338,25 +371,44 @@ impl Qwen3Executor {
         Ok(())
     }
 
-    fn write_full_state(&self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+    fn write_state(&self, snapshot_path: &Path, plan: &ExecutorHibernationPlan) -> Result<(), ModelExecutorError> {
         assert!(
             self.pending_transactions.transactions.is_empty(),
             "qwen3 state snapshots require all pending model transactions to complete"
         );
         let mut writer = StateSnapshotWriter::new(
             snapshot_path,
-            self.full_state_snapshot_files(),
+            self.state_snapshot_files(),
+            plan,
             self.runtime.buffer_io(),
         )?;
-        self.main_gqa_state
-            .write_full_state(&mut writer, MAIN_GQA_STATE_FILES)?;
-        self.speculator.write_full_state(&mut writer)?;
-        self.pages.write_full_state(&mut writer, PAGE_ARENA_STATE_FILES)?;
+        match plan {
+            ExecutorHibernationPlan::All => {
+                self.main_gqa_state
+                    .write_full_state(&mut writer, MAIN_GQA_STATE_FILES)?;
+                self.speculator.write_full_state(&mut writer)?;
+                self.pages.write_full_state(&mut writer, PAGE_ARENA_STATE_FILES)?;
+            },
+            ExecutorHibernationPlan::Selected {
+                request_slot_ranges,
+                page_id_ranges,
+            } => {
+                self.main_gqa_state
+                    .write_selected_state(&mut writer, MAIN_GQA_STATE_FILES, request_slot_ranges)?;
+                self.speculator.write_selected_state(&mut writer, request_slot_ranges)?;
+                self.pages
+                    .write_selected_state(&mut writer, PAGE_ARENA_STATE_FILES, page_id_ranges)?;
+            },
+        }
         writer.commit()
     }
 
-    pub fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
-        self.write_full_state(snapshot_path)?;
+    pub fn unload_state(
+        &mut self,
+        snapshot_path: &Path,
+        plan: &ExecutorHibernationPlan,
+    ) -> Result<(), ModelExecutorError> {
+        self.write_state(snapshot_path, plan)?;
 
         self.speculator.unload_state();
         self.main.component_mut().unload_state();
@@ -365,10 +417,15 @@ impl Qwen3Executor {
         Ok(())
     }
 
-    pub fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
+    pub fn load_state(
+        &mut self,
+        snapshot_path: &Path,
+        plan: &ExecutorHibernationPlan,
+    ) -> Result<(), ModelExecutorError> {
         let mut reader = StateSnapshotReader::open(
             snapshot_path,
-            self.full_state_snapshot_files(),
+            self.state_snapshot_files(),
+            plan,
             self.runtime.buffer_io(),
         )?;
         let device = self.runtime.device().clone();
@@ -377,9 +434,23 @@ impl Qwen3Executor {
         self.pages.allocate_resources(&device);
 
         let result = (|| {
-            self.main_gqa_state.read_full_state(&mut reader, MAIN_GQA_STATE_FILES)?;
-            self.speculator.read_full_state(&mut reader)?;
-            self.pages.read_full_state(&mut reader, PAGE_ARENA_STATE_FILES)?;
+            match plan {
+                ExecutorHibernationPlan::All => {
+                    self.main_gqa_state.read_full_state(&mut reader, MAIN_GQA_STATE_FILES)?;
+                    self.speculator.read_full_state(&mut reader)?;
+                    self.pages.read_full_state(&mut reader, PAGE_ARENA_STATE_FILES)?;
+                },
+                ExecutorHibernationPlan::Selected {
+                    request_slot_ranges,
+                    page_id_ranges,
+                } => {
+                    self.main_gqa_state
+                        .read_selected_state(&mut reader, MAIN_GQA_STATE_FILES, request_slot_ranges)?;
+                    self.speculator.read_selected_state(&mut reader, request_slot_ranges)?;
+                    self.pages
+                        .read_selected_state(&mut reader, PAGE_ARENA_STATE_FILES, page_id_ranges)?;
+                },
+            }
             reader.finish()
         })();
         if let Err(error) = result {
@@ -480,8 +551,8 @@ impl ReplayableModel for Qwen3Executor {
         Qwen3Executor::clear_replay_cache(self);
     }
 
-    fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
-        Qwen3Executor::unload_state(self, snapshot_path)
+    fn unload_state(&mut self, snapshot_path: &Path, plan: &ExecutorHibernationPlan) -> Result<(), ModelExecutorError> {
+        Qwen3Executor::unload_state(self, snapshot_path, plan)
     }
 
     fn unload_weights(&mut self) {
@@ -492,8 +563,8 @@ impl ReplayableModel for Qwen3Executor {
         Qwen3Executor::load_weights(self)
     }
 
-    fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
-        Qwen3Executor::load_state(self, snapshot_path)
+    fn load_state(&mut self, snapshot_path: &Path, plan: &ExecutorHibernationPlan) -> Result<(), ModelExecutorError> {
+        Qwen3Executor::load_state(self, snapshot_path, plan)
     }
 
     fn prepare_batch(&mut self, core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {

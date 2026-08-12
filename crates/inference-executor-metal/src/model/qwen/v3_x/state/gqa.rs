@@ -220,6 +220,7 @@ mod tests {
     use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::GQACore;
     use inference_executor_core::attn::GQAPageTableLayout;
+    use inference_runtime_core::compute::ExecutorHibernationPlan;
 
     use super::Qwen3xGQAState;
     use crate::attn::gqa::backend::GQAMetalConfig;
@@ -238,12 +239,12 @@ mod tests {
         GQAStateSnapshotFiles::new(StateSnapshotFile::MainGQARequestPageTable);
 
     #[test]
-    fn test_unload_load_fixed_state() {
+    fn test_full_state_unload_load_fixed() {
         assert_unload_load("fixed", vec![1, 7, 11, 29, 31, 63, 4, 19, 2, 8, 12, 30, 32, 62, 5, 20]);
     }
 
     #[test]
-    fn test_unload_load_random_state() {
+    fn test_full_state_unload_load_random() {
         let mut random = TestRandom::new(0x4751_415f_5354_4154);
         let page_ids = (0..num_page_ids())
             .map(|_| random.next_u32() % NUM_CACHE_PAGES)
@@ -292,14 +293,26 @@ mod tests {
         let snapshot_path = snapshot_path(name);
         let buffer_io = inference_backend_metal::metal::BufferIO::new(&device);
         let snapshot_files = [SNAPSHOT_FILES.request_page_table()];
-        let mut writer = StateSnapshotWriter::new(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        let mut writer = StateSnapshotWriter::new(
+            &snapshot_path,
+            &snapshot_files,
+            &ExecutorHibernationPlan::All,
+            &buffer_io,
+        )
+        .unwrap();
         state.write_full_state(&mut writer, SNAPSHOT_FILES).unwrap();
         writer.commit().unwrap();
 
         state.release_resources();
         state.allocate_resources(&device);
 
-        let mut reader = StateSnapshotReader::open(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        let mut reader = StateSnapshotReader::open(
+            &snapshot_path,
+            &snapshot_files,
+            &ExecutorHibernationPlan::All,
+            &buffer_io,
+        )
+        .unwrap();
         state.read_full_state(&mut reader, SNAPSHOT_FILES).unwrap();
         reader.finish().unwrap();
 

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::ValueEnum;
+use inference_runtime_core::config::ExecutorHibernationMode;
 
 #[derive(Debug, Parser)]
 pub struct Qwen3Args {
@@ -38,7 +39,15 @@ pub struct Qwen3Args {
         default_value = "300",
         help = "Seconds without model execution before state and weights unload"
     )]
-    pub model_idle_timeout_secs: NonZeroU64,
+    pub executor_hibernation_timeout_secs: NonZeroU64,
+
+    #[arg(
+        long,
+        default_value = "all",
+        value_name = "MODE",
+        help = "Executor hibernation state scope: all or selected"
+    )]
+    pub executor_hibernation_mode: ExecutorHibernationMode,
 
     #[arg(
         long,
@@ -101,7 +110,15 @@ pub struct Qwen35Args {
         default_value = "300",
         help = "Seconds without model execution before state and weights unload"
     )]
-    pub model_idle_timeout_secs: NonZeroU64,
+    pub executor_hibernation_timeout_secs: NonZeroU64,
+
+    #[arg(
+        long,
+        default_value = "all",
+        value_name = "MODE",
+        help = "Executor hibernation state scope: all or selected"
+    )]
+    pub executor_hibernation_mode: ExecutorHibernationMode,
 
     #[arg(
         long,
@@ -150,6 +167,7 @@ pub enum QwenLogLevel {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use inference_runtime_core::config::ExecutorHibernationMode;
 
     use super::Qwen3Args;
     use super::Qwen35Args;
@@ -162,7 +180,8 @@ mod tests {
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages.get(), 262_144);
-        assert_eq!(args.model_idle_timeout_secs.get(), 300);
+        assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
+        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::All);
     }
 
     #[test]
@@ -177,7 +196,31 @@ mod tests {
         assert_eq!(args.num_cache_pages.get(), 262_144);
         assert_eq!(args.hf_dspark_model_dir, None);
         assert_eq!(args.num_spec_tokens, None);
-        assert_eq!(args.model_idle_timeout_secs.get(), 300);
+        assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
+        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::All);
+    }
+
+    #[test]
+    fn test_executor_hibernation_mode_accepts_selected() {
+        let qwen3 = Qwen3Args::try_parse_from([
+            "qwen3",
+            "--hf-model-dir",
+            "model",
+            "--executor-hibernation-mode",
+            "selected",
+        ])
+        .unwrap();
+        let qwen35 = Qwen35Args::try_parse_from([
+            "qwen3.5",
+            "--hf-model-dir",
+            "model",
+            "--executor-hibernation-mode",
+            "selected",
+        ])
+        .unwrap();
+
+        assert_eq!(qwen3.executor_hibernation_mode, ExecutorHibernationMode::Selected);
+        assert_eq!(qwen35.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }
 
     #[test]
@@ -271,7 +314,7 @@ mod tests {
     #[test]
     fn test_positive_capacities_reject_zero() {
         for flag in [
-            "--model-idle-timeout-secs",
+            "--executor-hibernation-timeout-secs",
             "--num-cache-pages",
             "--max-requests",
             "--max-tokens",

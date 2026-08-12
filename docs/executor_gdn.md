@@ -23,16 +23,16 @@ crates/inference-executor-metal/src/attn/
     scratch.rs              reusable GDN scratch allocation owner and borrowed replay bindings
     request_state_table.rs  private CPU request-slot/version/candidate mapping
     request_state_table/
-      file_io.rs            full-state readiness and decoded-metadata validation
+      file_io.rs            snapshot readiness validation
     state_table.rs          public GDNRequestStateTable, live arenas, GDNStatePageIO, and lifecycle
     state_table/
-      file_io.rs            symmetric full-state metadata and arena file I/O
+      file_io.rs            symmetric full and selected metadata and arena file I/O
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
     layer/gdn.rs            Qwen3xGDN, private checkpoint weights, load, and record
     state/gdn.rs            Qwen3xGDNState prepare/restore/commit/publish/reset lifecycle
-    state/gdn/file_io.rs    Qwen3xGDNState full-state file I/O
+    state/gdn/file_io.rs    Qwen3xGDNState full and selected state file I/O
   v3_5/
     main/layer.rs           Qwen3.5 QGKV-GQA/GDN layer variants
     plan.rs                 Qwen3.5 GDN geometry/config builder
