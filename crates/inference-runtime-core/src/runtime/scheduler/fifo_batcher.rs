@@ -532,25 +532,27 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_cancel_tracks_prefill_and_decode() {
-        let prefill_req_id = 1;
-        let decode_req_id = 2;
+    fn test_prepare_cancel_req_state() {
+        let continue_req_id = 1;
+        let pending_req_id = 2;
+        let terminal_req_id = 3;
+        let skip_req_id = 4;
         let token_budget_per_req = 8;
         let mut seq = Sequence::new();
 
-        let mut prefill_req = mock_user_req(prefill_req_id);
-        prefill_req
+        let mut continue_req = mock_user_req(continue_req_id);
+        continue_req
             .expect_token_estimate()
             .in_sequence(&mut seq)
-            .returning(move || ReqTokenInventory::new::<1>(prefill_req_id, token_budget_per_req, 0, 0, &[]));
-        prefill_req
+            .returning(move || ReqTokenInventory::new::<1>(continue_req_id, token_budget_per_req, 0, 0, &[]));
+        continue_req
             .expect_prepare()
             .once()
             .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
             .return_once(move |_| {
                 let mut dev_req = MockDevReq::new();
-                dev_req.expect_id().return_const(prefill_req_id);
+                dev_req.expect_id().return_const(continue_req_id);
                 dev_req.expect_req_cost().once().return_const(1usize);
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
@@ -562,19 +564,19 @@ mod tests {
                 }
             });
 
-        let mut decode_req = mock_user_req(decode_req_id);
-        decode_req
+        let mut pending_req = mock_user_req(pending_req_id);
+        pending_req
             .expect_token_estimate()
             .in_sequence(&mut seq)
-            .returning(move || ReqTokenInventory::new::<1>(decode_req_id, token_budget_per_req, 0, 0, &[]));
-        decode_req
+            .returning(move || ReqTokenInventory::new::<1>(pending_req_id, token_budget_per_req, 0, 0, &[]));
+        pending_req
             .expect_prepare()
             .once()
             .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
             .return_once(move |_| {
                 let mut dev_req = MockDevReq::new();
-                dev_req.expect_id().return_const(decode_req_id);
+                dev_req.expect_id().return_const(pending_req_id);
                 dev_req.expect_req_cost().once().return_const(1usize);
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
@@ -586,71 +588,116 @@ mod tests {
                 }
             });
 
-        prefill_req
+        let mut terminal_req = mock_user_req(terminal_req_id);
+        terminal_req
+            .expect_token_estimate()
+            .in_sequence(&mut seq)
+            .returning(move || ReqTokenInventory::new::<1>(terminal_req_id, token_budget_per_req, 0, 0, &[]));
+        terminal_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(move |_| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(terminal_req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget_per_req);
+                PrepareResult::Continue {
+                    dev_req,
+                    compute_phase: ComputePhase::Decode {
+                        epoch: 0,
+                        token_index: 0,
+                    },
+                }
+            });
+
+        let mut skip_req = mock_user_req(skip_req_id);
+        skip_req
+            .expect_token_estimate()
+            .in_sequence(&mut seq)
+            .returning(move || ReqTokenInventory::new::<1>(skip_req_id, token_budget_per_req, 0, 0, &[]));
+        skip_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(|_| PrepareResult::Skip);
+
+        continue_req
             .expect_cancel()
             .once()
             .in_sequence(&mut seq)
             .return_once(|_| CancelResult::Continue);
-        decode_req
+        pending_req
             .expect_cancel()
             .once()
             .in_sequence(&mut seq)
-            .return_once(|_| CancelResult::Continue);
+            .return_once(|_| CancelResult::Pending);
+        terminal_req
+            .expect_cancel()
+            .once()
+            .in_sequence(&mut seq)
+            .return_once(|_| CancelResult::Terminal);
 
         let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
         let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
-        schedule_queue.push_back(prefill_req);
-        schedule_queue.push_back(decode_req);
+        schedule_queue.push_back(continue_req);
+        schedule_queue.push_back(pending_req);
+        schedule_queue.push_back(terminal_req);
+        schedule_queue.push_back(skip_req);
 
         let mut batcher = FIFOBatcher::new();
         let dev_reqs = batcher.prepare(
-            2,
-            2 * token_budget_per_req,
+            4,
+            4 * token_budget_per_req,
             token_budget_per_req,
             AHashMap::new(),
             &mut schedule_queue,
         );
-        assert_eq!(dev_reqs.len(), 2);
-        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
-        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
+        assert_eq!(dev_reqs.iter().map(DevReq::id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(schedule_queue.get_ref(&continue_req_id).is_some());
+        assert!(schedule_queue.get_ref(&pending_req_id).is_some());
+        assert!(schedule_queue.get_ref(&terminal_req_id).is_some());
+        assert!(schedule_queue.get_ref(&skip_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 1);
-
-        let prefill_req = schedule_queue
-            .pop_front()
-            .expect("prepared Prefill request must remain runnable");
-        assert_eq!(prefill_req.id(), prefill_req_id);
+        let continue_req = schedule_queue.pop_front().unwrap();
+        assert_eq!(continue_req.id(), continue_req_id);
         assert!(schedule_queue.pop_front().is_none());
-        schedule_queue.push_back(prefill_req);
+        schedule_queue.push_back(continue_req);
 
         batcher.cancel(&mut schedule_queue, dev_reqs);
-        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
-        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
-        assert_eq!(schedule_queue.run_queue_size(), 2);
-        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(decode_req_id));
-        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(prefill_req_id));
+        assert!(schedule_queue.get_ref(&continue_req_id).is_some());
+        assert!(schedule_queue.get_ref(&pending_req_id).is_some());
+        assert!(schedule_queue.get_ref(&terminal_req_id).is_none());
+        assert!(schedule_queue.get_ref(&skip_req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 1);
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(continue_req_id));
         assert!(schedule_queue.pop_front().is_none());
     }
 
     #[test]
-    fn test_prepare_commit_tracks_prefill_and_decode() {
-        let prefill_req_id = 1;
-        let decode_req_id = 2;
+    fn test_prepare_commit_req_state() {
+        let continue_req_id = 1;
+        let pending_req_id = 2;
+        let terminal_req_id = 3;
+        let skip_req_id = 4;
         let token_budget_per_req = 8;
         let mut seq = Sequence::new();
 
-        let mut prefill_req = mock_user_req(prefill_req_id);
-        prefill_req
+        let mut continue_req = mock_user_req(continue_req_id);
+        continue_req
             .expect_token_estimate()
             .in_sequence(&mut seq)
-            .returning(move || ReqTokenInventory::new::<1>(prefill_req_id, token_budget_per_req, 0, 0, &[]));
-        prefill_req
+            .returning(move || ReqTokenInventory::new::<1>(continue_req_id, token_budget_per_req, 0, 0, &[]));
+        continue_req
             .expect_prepare()
             .once()
             .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
             .return_once(move |_| {
                 let mut dev_req = MockDevReq::new();
-                dev_req.expect_id().return_const(prefill_req_id);
+                dev_req.expect_id().return_const(continue_req_id);
                 dev_req.expect_req_cost().once().return_const(1usize);
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
@@ -662,19 +709,19 @@ mod tests {
                 }
             });
 
-        let mut decode_req = mock_user_req(decode_req_id);
-        decode_req
+        let mut pending_req = mock_user_req(pending_req_id);
+        pending_req
             .expect_token_estimate()
             .in_sequence(&mut seq)
-            .returning(move || ReqTokenInventory::new::<1>(decode_req_id, token_budget_per_req, 0, 0, &[]));
-        decode_req
+            .returning(move || ReqTokenInventory::new::<1>(pending_req_id, token_budget_per_req, 0, 0, &[]));
+        pending_req
             .expect_prepare()
             .once()
             .with(eq(token_budget_per_req))
             .in_sequence(&mut seq)
             .return_once(move |_| {
                 let mut dev_req = MockDevReq::new();
-                dev_req.expect_id().return_const(decode_req_id);
+                dev_req.expect_id().return_const(pending_req_id);
                 dev_req.expect_req_cost().once().return_const(1usize);
                 dev_req.expect_token_cost().once().return_const(token_budget_per_req);
                 PrepareResult::Continue {
@@ -686,53 +733,99 @@ mod tests {
                 }
             });
 
-        prefill_req
+        let mut terminal_req = mock_user_req(terminal_req_id);
+        terminal_req
+            .expect_token_estimate()
+            .in_sequence(&mut seq)
+            .returning(move || ReqTokenInventory::new::<1>(terminal_req_id, token_budget_per_req, 0, 0, &[]));
+        terminal_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(move |_| {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(terminal_req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget_per_req);
+                PrepareResult::Continue {
+                    dev_req,
+                    compute_phase: ComputePhase::Decode {
+                        epoch: 0,
+                        token_index: 0,
+                    },
+                }
+            });
+
+        let mut skip_req = mock_user_req(skip_req_id);
+        skip_req
+            .expect_token_estimate()
+            .in_sequence(&mut seq)
+            .returning(move || ReqTokenInventory::new::<1>(skip_req_id, token_budget_per_req, 0, 0, &[]));
+        skip_req
+            .expect_prepare()
+            .once()
+            .with(eq(token_budget_per_req))
+            .in_sequence(&mut seq)
+            .return_once(|_| PrepareResult::Skip);
+
+        continue_req
             .expect_commit()
             .once()
             .in_sequence(&mut seq)
             .return_once(|_| CommitResult::Continue);
-        decode_req
+        pending_req
             .expect_commit()
             .once()
             .in_sequence(&mut seq)
-            .return_once(|_| CommitResult::Continue);
+            .return_once(|_| CommitResult::Pending);
+        terminal_req
+            .expect_commit()
+            .once()
+            .in_sequence(&mut seq)
+            .return_once(|_| CommitResult::Terminal);
 
         let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
         let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
-        schedule_queue.push_back(prefill_req);
-        schedule_queue.push_back(decode_req);
+        schedule_queue.push_back(continue_req);
+        schedule_queue.push_back(pending_req);
+        schedule_queue.push_back(terminal_req);
+        schedule_queue.push_back(skip_req);
 
         let mut batcher = FIFOBatcher::new();
         let dev_reqs = batcher.prepare(
-            2,
-            2 * token_budget_per_req,
+            4,
+            4 * token_budget_per_req,
             token_budget_per_req,
             AHashMap::new(),
             &mut schedule_queue,
         );
-        assert_eq!(dev_reqs.len(), 2);
-        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
-        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
+        assert_eq!(dev_reqs.iter().map(DevReq::id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(schedule_queue.get_ref(&continue_req_id).is_some());
+        assert!(schedule_queue.get_ref(&pending_req_id).is_some());
+        assert!(schedule_queue.get_ref(&terminal_req_id).is_some());
+        assert!(schedule_queue.get_ref(&skip_req_id).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 1);
-
-        let prefill_req = schedule_queue
-            .pop_front()
-            .expect("prepared Prefill request must remain runnable");
-        assert_eq!(prefill_req.id(), prefill_req_id);
+        let continue_req = schedule_queue.pop_front().unwrap();
+        assert_eq!(continue_req.id(), continue_req_id);
         assert!(schedule_queue.pop_front().is_none());
-        schedule_queue.push_back(prefill_req);
+        schedule_queue.push_back(continue_req);
 
-        let mut prefill_resp = MockDevResp::new();
-        prefill_resp.expect_id().return_const(prefill_req_id);
-        let mut decode_resp = MockDevResp::new();
-        decode_resp.expect_id().return_const(decode_req_id);
-        batcher.commit(&mut schedule_queue, vec![prefill_resp, decode_resp]);
+        batcher.commit(
+            &mut schedule_queue,
+            vec![
+                mock_dev_resp(continue_req_id),
+                mock_dev_resp(pending_req_id),
+                mock_dev_resp(terminal_req_id),
+            ],
+        );
 
-        assert!(schedule_queue.get_ref(&prefill_req_id).is_some());
-        assert!(schedule_queue.get_ref(&decode_req_id).is_some());
-        assert_eq!(schedule_queue.run_queue_size(), 2);
-        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(decode_req_id));
-        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(prefill_req_id));
+        assert!(schedule_queue.get_ref(&continue_req_id).is_some());
+        assert!(schedule_queue.get_ref(&pending_req_id).is_some());
+        assert!(schedule_queue.get_ref(&terminal_req_id).is_none());
+        assert!(schedule_queue.get_ref(&skip_req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 1);
+        assert_eq!(schedule_queue.pop_front().map(|req| req.id()), Some(continue_req_id));
         assert!(schedule_queue.pop_front().is_none());
     }
 
