@@ -14,7 +14,6 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
 use inference_executor_core::sampling::SamplerConfig;
-use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::dspark::state::UngatedDSparkGQAState;
@@ -162,7 +161,7 @@ impl Qwen3xDSparkExecution {
         self.num_spec_tokens
     }
 
-    pub fn num_runtime_page_ids_per_block(&self) -> usize {
+    pub fn num_gqa_page_ids_per_block(&self) -> usize {
         usize::try_from(self.page_table_layout.num_gqa_layers)
             .expect("Qwen3x DSpark GQA layer count must fit usize")
             .checked_mul(
@@ -373,14 +372,12 @@ impl Qwen3xDSparkExecution {
         self.gqa_state.read_full_state(reader, resource)
     }
 
-    pub fn prepare_page_span(
-        &self,
-        core_batch: &BatchDeviceRequest,
-        num_runtime_page_ids_per_block: usize,
-        page_id_offset: usize,
-    ) {
-        self.gqa_state
-            .prepare_page_span(core_batch, num_runtime_page_ids_per_block, page_id_offset);
+    pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
+        self.gqa_state.write_page_ids(req_slot, block_index, page_ids);
+    }
+
+    pub fn read_page_ids(&self, req_slot: u32, block_index: usize) -> Vec<u32> {
+        self.gqa_state.read_page_ids(req_slot, block_index)
     }
 
     pub fn record_context(

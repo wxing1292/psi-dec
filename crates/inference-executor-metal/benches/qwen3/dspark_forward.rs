@@ -413,7 +413,6 @@ impl DSparkFixture {
             capacity,
             capacity.max_tokens,
             num_cache_pages,
-            0,
         );
         let block = DSparkBlockMetadata::new(
             &request_slots(num_requests),

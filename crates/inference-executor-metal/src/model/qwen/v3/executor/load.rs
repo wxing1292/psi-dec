@@ -312,7 +312,6 @@ fn init_qwen_3_model_inner(
         gqa_page_table_layout,
         config.max_tokens,
         config.num_cache_pages,
-        0,
     );
     let layer_scratch = Rc::new(Qwen3MainLayerScratch::new(
         &device,
@@ -392,12 +391,12 @@ fn init_qwen_3_model_inner(
     drop(store);
 
     let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));
-    let (speculator, num_dspark_page_ids_per_block) = match spec_load {
+    let (speculator, num_dspark_gqa_page_ids_per_block) = match spec_load {
         Qwen3SpecLoad::Vanilla => (Qwen3Speculator::Vanilla, 0),
         Qwen3SpecLoad::DSpark(loaded) => {
             let execution = Qwen3xDSparkExecution::new(&device, *loaded, config.max_requests, unembed_config);
             let num_spec_tokens = execution.num_spec_tokens();
-            let num_page_ids_per_block = execution.num_runtime_page_ids_per_block();
+            let num_gqa_page_ids_per_block = execution.num_gqa_page_ids_per_block();
             let max_target_distributions = config
                 .max_requests
                 .checked_mul(
@@ -425,20 +424,20 @@ fn init_qwen_3_model_inner(
                         &compact_target_distribution_indices(max_target_distributions),
                     ),
                 })),
-                num_page_ids_per_block,
+                num_gqa_page_ids_per_block,
             )
         },
     };
-    let num_main_page_ids_per_block = usize::try_from(gqa_page_table_layout.num_gqa_layers)
+    let num_main_gqa_page_ids_per_block = usize::try_from(gqa_page_table_layout.num_gqa_layers)
         .expect("qwen3 Main GQA layer count must fit usize")
         .checked_mul(
             usize::try_from(gqa_page_table_layout.num_page_ids_per_block)
                 .expect("qwen3 Main GQA page count must fit usize"),
         )
         .expect("qwen3 Main page IDs per block must fit usize");
-    let num_runtime_page_ids_per_block = num_main_page_ids_per_block
-        .checked_add(num_dspark_page_ids_per_block)
-        .expect("Qwen3 runtime page IDs per block must fit usize");
+    let num_gqa_page_ids_per_main_lane_block = num_main_gqa_page_ids_per_block
+        .checked_add(num_dspark_gqa_page_ids_per_block)
+        .expect("Qwen3 Main cache-lane page IDs per block must fit usize");
     let weight_source = match &init_mode {
         Qwen3InitMode::Vanilla => Qwen3WeightSource::Vanilla,
         Qwen3InitMode::DSpark { model_dir, config, .. } => {
@@ -481,7 +480,7 @@ fn init_qwen_3_model_inner(
         pages: PageArena::new(&device, config.num_cache_pages, QWEN3_PAGE_SIZE_BYTES),
         pending_transactions: Qwen3PendingTransactions::new(),
         gqa_page_table_layout,
-        num_runtime_page_ids_per_block,
+        num_gqa_page_ids_per_main_lane_block,
         state_fingerprint: crate::model::state_snapshot::ModelFingerprint::for_process_instance("qwen3"),
         unloaded_embed: None,
         unloaded_unembed: None,

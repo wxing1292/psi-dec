@@ -2,7 +2,6 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
-use inference_runtime_core::compute::BatchDeviceRequest;
 
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
@@ -69,64 +68,6 @@ impl GQARequestPageTable {
         );
         let start = self.page_ids_start_index(req_slot, layer_index, block_index);
         self.page_ids_buffer().write_typed(start, page_ids);
-    }
-
-    pub fn prepare(&self, batch: &BatchDeviceRequest, cache_lane: usize, num_cache_pages: usize) {
-        self.prepare_span(
-            batch,
-            cache_lane,
-            num_cache_pages,
-            self.num_layers()
-                .checked_mul(self.num_page_ids_per_block())
-                .expect("GQA runtime page-id count must fit usize"),
-            0,
-        );
-    }
-
-    pub fn prepare_span(
-        &self,
-        batch: &BatchDeviceRequest,
-        cache_lane: usize,
-        num_cache_pages: usize,
-        num_runtime_page_ids_per_block: usize,
-        page_id_offset: usize,
-    ) {
-        let num_table_page_ids = self
-            .num_layers()
-            .checked_mul(self.num_page_ids_per_block())
-            .expect("GQA page-table span length must fit usize");
-        assert!(
-            page_id_offset
-                .checked_add(num_table_page_ids)
-                .is_some_and(|end| end <= num_runtime_page_ids_per_block),
-            "GQA page-table span exceeds one runtime cache block"
-        );
-        for request in &batch.dev_reqs {
-            let page_ids_by_lane_and_block = request.decoder_sync_blocks.kv_page_ids();
-            let page_ids_by_block = page_ids_by_lane_and_block
-                .get(cache_lane)
-                .unwrap_or_else(|| panic!("GQA request page table missing cache lane {cache_lane} for kv page ids"));
-            for (block_offset, page_ids) in page_ids_by_block.iter().enumerate() {
-                assert_eq!(
-                    page_ids.len(),
-                    num_runtime_page_ids_per_block,
-                    "GQA request page table expects {num_runtime_page_ids_per_block} page IDs for each runtime cache \
-                     block in lane {cache_lane}, got {}",
-                    page_ids.len()
-                );
-                self.write_runtime_block_span(
-                    request.req_slot,
-                    request
-                        .decoder_sync_blocks
-                        .block_index()
-                        .checked_add(block_offset)
-                        .expect("GQA cache-block index must fit usize"),
-                    page_ids,
-                    page_id_offset,
-                    num_cache_pages,
-                );
-            }
-        }
     }
 
     pub fn reset_req_slot(&self, req_slot: u32) {
@@ -202,33 +143,6 @@ impl GQARequestPageTable {
             .and_then(|count| count.checked_mul(self.num_page_ids_per_block()))
             .expect("GQA request page-table row length must fit usize")
     }
-
-    fn write_runtime_block_span(
-        &self,
-        req_slot: u32,
-        block_index: usize,
-        runtime_page_ids: &[u32],
-        page_id_offset: usize,
-        num_cache_pages: usize,
-    ) {
-        let num_table_page_ids = self
-            .num_layers()
-            .checked_mul(self.num_page_ids_per_block())
-            .expect("GQA page-table span length must fit usize");
-        let span_end = page_id_offset
-            .checked_add(num_table_page_ids)
-            .expect("GQA page-table span end must fit usize");
-        let page_ids = runtime_page_ids
-            .get(page_id_offset..span_end)
-            .expect("GQA page-table span must fit one runtime cache block");
-        assert!(
-            page_ids.iter().all(|&page_id| (page_id as usize) < num_cache_pages),
-            "runtime supplied a GQA page ID outside the cache-page buffer"
-        );
-        for (layer_index, layer_page_ids) in page_ids.chunks_exact(self.num_page_ids_per_block()).enumerate() {
-            self.write_page_ids(req_slot, layer_index, block_index, layer_page_ids);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -290,43 +204,5 @@ mod tests {
         assert_eq!(page_table.read_page_ids(2, 0, 0), vec![0, 0]);
         assert_eq!(page_table.read_page_ids(2, 2, 0), vec![0, 0]);
         assert_eq!(page_table.read_page_ids(3, 1, 0), vec![300, 301]);
-    }
-
-    #[test]
-    fn test_write_runtime_block_span() {
-        let device = Device::system_default();
-        let main = GQARequestPageTable::new(
-            &device,
-            GQAPageTableLayout {
-                num_req_slots: 2,
-                num_gqa_layers: 2,
-                num_blocks: 3,
-                num_page_ids_per_block: 2,
-            },
-        );
-        let dspark = GQARequestPageTable::new(
-            &device,
-            GQAPageTableLayout {
-                num_req_slots: 2,
-                num_gqa_layers: 1,
-                num_blocks: 3,
-                num_page_ids_per_block: 3,
-            },
-        );
-        let runtime_page_ids = [10, 11, 20, 21, 30, 31, 32];
-
-        main.write_runtime_block_span(1, 2, &runtime_page_ids, 0, 64);
-        dspark.write_runtime_block_span(1, 2, &runtime_page_ids, 4, 64);
-
-        assert_eq!(main.read_page_ids(1, 0, 2), vec![10, 11]);
-        assert_eq!(main.read_page_ids(1, 1, 2), vec![20, 21]);
-        assert_eq!(dspark.read_page_ids(1, 0, 2), vec![30, 31, 32]);
-
-        main.reset_req_slots(&[1]);
-        dspark.reset_req_slots(&[1]);
-
-        assert_eq!(main.read_page_ids(1, 0, 2), vec![0, 0]);
-        assert_eq!(main.read_page_ids(1, 1, 2), vec![0, 0]);
-        assert_eq!(dspark.read_page_ids(1, 0, 2), vec![0, 0, 0]);
     }
 }

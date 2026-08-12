@@ -76,8 +76,9 @@ The Metal GQA executor backend implements the executor `ReplayLayer` contract. Q
 contract to append GQA work to a larger replay. A semantic layer input and output connect the work to a caller-owned
 `Recorder`.
 
-`request_page_table.rs` owns the executor request-slot KV page table. This table accumulates runtime-supplied page IDs
-between reset notifications. The runtime core owns physical page allocation and release.
+`request_page_table.rs` owns the executor request-slot KV page table. This table accumulates page IDs between reset
+notifications. The runtime core owns physical page allocation and release. The model executor converts runtime cache
+lanes into model-role and GQA-layer coordinates before it writes the table.
 
 The gated, ungated, and DSpark GQA backends give each quantized projection to one adaptive affine operator.
 The caller provides the fixed projection dimensions, quantization layout, and dtype when it creates the operator.
@@ -237,10 +238,23 @@ Runtime cache lane `step_index + 1` supplies the page IDs for MTP table row `ste
 `Qwen35MTP` performs this model-specific lane-to-row conversion through the generic page-table write API.
 
 Qwen3 DSpark has a separate page table.
-The Qwen3 executor splits one runtime cache-block page span into Main and DSpark page spans.
+Runtime cache lane 0 contains one flat page-ID list for each block: `[Main IDs | DSpark IDs]` in DSpark mode.
+The Qwen executor validates the exact combined length and splits this list once at the model prepare boundary.
+Vanilla mode requires an empty DSpark remainder.
 Both page tables keep their own layer and page-stride geometry.
 The executor sends the same runtime request-slot reset notification to both tables before it reuses a slot.
 Both tables use `GQARequestPageTable::reset_req_slots`.
+
+`GQARequestPageTable` does not parse runtime cache lanes or model-role composition. It exposes symmetric per-entry
+access:
+
+```text
+write_page_ids(req_slot, layer_index, block_index, page_ids)
+read_page_ids(req_slot, layer_index, block_index)
+```
+
+Main and DSpark state owners accept one complete role-local block. They validate the exact role-local length and the
+cache-page ID domain. They then write one table entry for each GQA layer.
 
 The layout type uses generic `num_gqa_layers` for both tables. Each table instance owns its capacity and can use a
 different GQA configuration.
@@ -462,9 +476,10 @@ each 32 KiB physical page.
 
 One logical block therefore owns two pages per GQA layer. It owns 80 pages across all 40 layers.
 
-For Qwen3.5 model replay, `GQARequestPageTable::prepare(...)` validates and writes the current runtime page writes to
-the bound table. `GQA::prepare(...)` selects the SDPA path and builds the batch plan once. Every GQA layer reuses this
-plan.
+For Qwen3.5 model replay, the Qwen executor validates runtime cache lane 0 and writes the Main page table. DSpark mode
+also writes the independent DSpark page table. `Qwen35MTP` separately maps runtime cache lane `step_index + 1` to MTP
+GQA layer row `step_index`. `GQA::prepare(...)` selects the SDPA path and builds the batch plan once. Every GQA layer
+reuses this plan.
 
 `SingleQueryToken` replay always records partial-output reduction. This rule also applies when each batch token has one
 TaskTemplate.

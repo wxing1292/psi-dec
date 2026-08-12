@@ -8,7 +8,6 @@ use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
-use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gqa::backend::GQAKVCacheBindings;
@@ -44,7 +43,6 @@ pub struct Qwen3MainGQAState {
     page_table_layout: GQAPageTableLayout,
     max_tokens: usize,
     num_cache_pages: usize,
-    cache_lane: usize,
 }
 
 impl Qwen3MainGQA {
@@ -160,7 +158,6 @@ impl Qwen3MainGQA {
 }
 
 impl Qwen3MainGQAState {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
         core: UngatedGQACore,
@@ -168,7 +165,6 @@ impl Qwen3MainGQAState {
         page_table_layout: GQAPageTableLayout,
         max_tokens: usize,
         num_cache_pages: usize,
-        cache_lane: usize,
     ) -> Self {
         assert!(num_cache_pages > 0, "qwen3 Main GQA state requires cache pages");
         assert!(
@@ -188,7 +184,6 @@ impl Qwen3MainGQAState {
             page_table_layout,
             max_tokens,
             num_cache_pages,
-            cache_lane,
         }
     }
 
@@ -220,24 +215,41 @@ impl Qwen3MainGQAState {
             .expect("qwen3 Main GQA request page-table state must be loaded")
     }
 
-    pub fn prepare_pages(&self, core_batch: &BatchDeviceRequest) {
-        self.request_page_table()
-            .prepare(core_batch, self.cache_lane, self.num_cache_pages);
+    pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
+        let request_page_table = self.request_page_table();
+        let num_page_ids_per_layer = request_page_table.num_page_ids_per_block();
+        let expected_page_ids = request_page_table
+            .num_layers()
+            .checked_mul(num_page_ids_per_layer)
+            .expect("qwen3 Main GQA page-ID count must fit usize");
+        assert_eq!(
+            page_ids.len(),
+            expected_page_ids,
+            "qwen3 Main GQA cache block must contain all layer page IDs"
+        );
+        assert!(
+            page_ids
+                .iter()
+                .all(|&page_id| (page_id as usize) < self.num_cache_pages),
+            "runtime supplied a qwen3 Main GQA page ID outside the cache-page buffer"
+        );
+        for (layer_index, layer_page_ids) in page_ids.chunks_exact(num_page_ids_per_layer).enumerate() {
+            request_page_table.write_page_ids(req_slot, layer_index, block_index, layer_page_ids);
+        }
     }
 
-    pub fn prepare_page_span(
-        &self,
-        core_batch: &BatchDeviceRequest,
-        num_runtime_page_ids_per_block: usize,
-        page_id_offset: usize,
-    ) {
-        self.request_page_table().prepare_span(
-            core_batch,
-            self.cache_lane,
-            self.num_cache_pages,
-            num_runtime_page_ids_per_block,
-            page_id_offset,
+    pub fn read_page_ids(&self, req_slot: u32, block_index: usize) -> Vec<u32> {
+        let request_page_table = self.request_page_table();
+        let mut page_ids = Vec::with_capacity(
+            request_page_table
+                .num_layers()
+                .checked_mul(request_page_table.num_page_ids_per_block())
+                .expect("qwen3 Main GQA page-ID count must fit usize"),
         );
+        for layer_index in 0..request_page_table.num_layers() {
+            page_ids.extend(request_page_table.read_page_ids(req_slot, layer_index, block_index));
+        }
+        page_ids
     }
 
     pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {

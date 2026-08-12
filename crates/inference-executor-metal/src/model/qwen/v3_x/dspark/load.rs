@@ -101,7 +101,6 @@ pub fn load_qwen3x_dspark(
         capacity,
         load_config.max_tokens,
         load_config.num_cache_pages,
-        0,
     );
     let quantization = config
         .quantization

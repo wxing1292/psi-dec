@@ -9,7 +9,6 @@ use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedDSparkGQACore;
 use inference_executor_core::def::ModelExecutorError;
-use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::dspark::capacity::DSparkGQACapacity;
@@ -33,11 +32,9 @@ pub struct UngatedDSparkGQAState {
     page_table_layout: GQAPageTableLayout,
     num_tokens_per_page: usize,
     num_cache_pages: usize,
-    cache_lane: usize,
 }
 
 impl UngatedDSparkGQAState {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
         core: UngatedDSparkGQACore,
@@ -46,7 +43,6 @@ impl UngatedDSparkGQAState {
         capacity: DSparkBlockCapacity,
         max_context_tokens: usize,
         num_cache_pages: usize,
-        cache_lane: usize,
     ) -> Self {
         assert!(max_context_tokens > 0, "DSpark context scratch requires tokens");
         assert!(num_cache_pages > 0, "DSpark GQA state requires cache pages");
@@ -91,7 +87,6 @@ impl UngatedDSparkGQAState {
             page_table_layout,
             num_tokens_per_page,
             num_cache_pages,
-            cache_lane,
         }
     }
 
@@ -108,19 +103,41 @@ impl UngatedDSparkGQAState {
         self.metadata().update(block, compute_path)
     }
 
-    pub fn prepare_page_span(
-        &self,
-        batch: &BatchDeviceRequest,
-        num_runtime_page_ids_per_block: usize,
-        page_id_offset: usize,
-    ) {
-        self.request_page_table_ref().prepare_span(
-            batch,
-            self.cache_lane,
-            self.num_cache_pages,
-            num_runtime_page_ids_per_block,
-            page_id_offset,
+    pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
+        let request_page_table = self.request_page_table_ref();
+        let num_page_ids_per_layer = request_page_table.num_page_ids_per_block();
+        let expected_page_ids = request_page_table
+            .num_layers()
+            .checked_mul(num_page_ids_per_layer)
+            .expect("DSpark GQA page-ID count must fit usize");
+        assert_eq!(
+            page_ids.len(),
+            expected_page_ids,
+            "DSpark GQA cache block must contain all layer page IDs"
         );
+        assert!(
+            page_ids
+                .iter()
+                .all(|&page_id| (page_id as usize) < self.num_cache_pages),
+            "runtime supplied a DSpark GQA page ID outside the cache-page buffer"
+        );
+        for (layer_index, layer_page_ids) in page_ids.chunks_exact(num_page_ids_per_layer).enumerate() {
+            request_page_table.write_page_ids(req_slot, layer_index, block_index, layer_page_ids);
+        }
+    }
+
+    pub fn read_page_ids(&self, req_slot: u32, block_index: usize) -> Vec<u32> {
+        let request_page_table = self.request_page_table_ref();
+        let mut page_ids = Vec::with_capacity(
+            request_page_table
+                .num_layers()
+                .checked_mul(request_page_table.num_page_ids_per_block())
+                .expect("DSpark GQA page-ID count must fit usize"),
+        );
+        for layer_index in 0..request_page_table.num_layers() {
+            page_ids.extend(request_page_table.read_page_ids(req_slot, layer_index, block_index));
+        }
+        page_ids
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {
@@ -205,5 +222,60 @@ impl UngatedDSparkGQAState {
         self.request_page_table
             .as_ref()
             .expect("DSpark GQA request page-table state must be loaded")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inference_backend_metal::components::GQAComputeConfig;
+    use inference_backend_metal::metal::Device;
+    use inference_backend_metal::metal::Dtype;
+    use inference_executor_core::attn::DSparkBlockCapacity;
+    use inference_executor_core::attn::GQAPageTableLayout;
+    use inference_executor_core::attn::UngatedDSparkGQACore;
+    use inference_executor_core::attn::UngatedGQACore;
+
+    use super::UngatedDSparkGQAState;
+
+    #[test]
+    fn test_write_read_page_ids_uses_complete_dspark_block() {
+        let device = Device::system_default();
+        let state = new_state(&device);
+
+        state.write_page_ids(1, 1, &[30, 31, 40, 41]);
+
+        assert_eq!(state.read_page_ids(1, 1), vec![30, 31, 40, 41]);
+    }
+
+    #[test]
+    #[should_panic(expected = "runtime supplied a DSpark GQA page ID outside the cache-page buffer")]
+    fn test_write_page_ids_rejects_page_id_outside_cache() {
+        let device = Device::system_default();
+        let state = new_state(&device);
+
+        state.write_page_ids(1, 1, &[30, 31, 40, 64]);
+    }
+
+    fn new_state(device: &Device) -> UngatedDSparkGQAState {
+        UngatedDSparkGQAState::new(
+            device,
+            UngatedDSparkGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
+            GQAComputeConfig {
+                io_dtype: Dtype::Bfloat16,
+                page_bytes: 4096,
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 128,
+            },
+            GQAPageTableLayout {
+                num_req_slots: 2,
+                num_gqa_layers: 2,
+                num_blocks: 2,
+                num_page_ids_per_block: 2,
+            },
+            DSparkBlockCapacity::new(2, 1),
+            2,
+            64,
+        )
     }
 }

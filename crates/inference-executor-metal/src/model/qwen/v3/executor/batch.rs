@@ -83,7 +83,38 @@ impl Qwen3Executor {
     }
 
     pub fn num_kv_page_ids_per_block(&self) -> usize {
-        self.num_runtime_page_ids_per_block
+        self.num_gqa_page_ids_per_main_lane_block
+    }
+
+    fn prepare_gqa_page_ids(&self, batch: &BatchDeviceRequest) {
+        let num_main_gqa_page_ids = self.num_main_gqa_page_ids_per_block();
+        let num_speculator_gqa_page_ids = self.speculator.num_gqa_page_ids_per_main_lane_block();
+        debug_assert_eq!(
+            num_main_gqa_page_ids
+                .checked_add(num_speculator_gqa_page_ids)
+                .expect("qwen3 Main cache-lane page-ID count must fit usize"),
+            self.num_gqa_page_ids_per_main_lane_block
+        );
+        for request in &batch.dev_reqs {
+            let page_ids_by_block = request
+                .decoder_sync_blocks
+                .kv_page_ids()
+                .first()
+                .expect("qwen3 Main GQA request requires runtime cache lane 0");
+            for (block_offset, page_ids) in page_ids_by_block.iter().enumerate() {
+                let block_index = request
+                    .decoder_sync_blocks
+                    .block_index()
+                    .checked_add(block_offset)
+                    .expect("qwen3 Main cache-block index must fit usize");
+                let (main_page_ids, speculator_page_ids) =
+                    split_main_lane_page_ids(page_ids, num_main_gqa_page_ids, num_speculator_gqa_page_ids);
+                self.main_gqa_state
+                    .write_page_ids(request.req_slot, block_index, main_page_ids);
+                self.speculator
+                    .write_page_ids(request.req_slot, block_index, speculator_page_ids);
+            }
+        }
     }
 
     fn write_token_ids(&self, token_ids: &[i32]) {

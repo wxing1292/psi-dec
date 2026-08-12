@@ -188,7 +188,6 @@ impl BlockFixture {
             },
             max_tokens,
             num_cache_pages,
-            0,
         );
         let mut next_page_id = 0u32;
         for layer_index in 0..counts.gqa {

@@ -46,6 +46,7 @@ use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::embedding::Embed;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
+use crate::model::qwen::split_main_lane_page_ids;
 use crate::model::qwen::v3::main::Qwen3Main;
 use crate::model::qwen::v3::main::Qwen3MainArgs;
 use crate::model::qwen::v3::main::Qwen3MainReplayKey;
@@ -126,6 +127,25 @@ impl Qwen3Speculator {
         match self {
             Self::Vanilla => 0,
             Self::DSpark(dspark) => dspark.execution.num_spec_tokens(),
+        }
+    }
+
+    fn num_gqa_page_ids_per_main_lane_block(&self) -> usize {
+        match self {
+            Self::Vanilla => 0,
+            Self::DSpark(dspark) => dspark.execution.num_gqa_page_ids_per_block(),
+        }
+    }
+
+    fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
+        match self {
+            Self::Vanilla => {
+                assert!(
+                    page_ids.is_empty(),
+                    "Qwen3 Vanilla Main cache block must not contain speculator page IDs"
+                )
+            },
+            Self::DSpark(dspark) => dspark.execution.write_page_ids(req_slot, block_index, page_ids),
         }
     }
 
@@ -230,7 +250,7 @@ pub struct Qwen3Executor {
     pages: PageArena,
     pending_transactions: Qwen3PendingTransactions,
     gqa_page_table_layout: GQAPageTableLayout,
-    num_runtime_page_ids_per_block: usize,
+    num_gqa_page_ids_per_main_lane_block: usize,
     state_fingerprint: ModelFingerprint,
     unloaded_embed: Option<Embed>,
     unloaded_unembed: Option<Unembed>,
@@ -484,17 +504,7 @@ impl ReplayableModel for Qwen3Executor {
         let model_batch_request = Qwen3ModelBatchRequest::from_core_batch(core_batch_req, sampler_configs);
         let microbatch = model_batch_request.microbatch();
         self.write_token_ids(microbatch.flat_token_ids());
-        if self.speculator.is_dspark() {
-            self.main_gqa_state
-                .prepare_page_span(core_batch_req, self.num_runtime_page_ids_per_block, 0);
-            self.speculator.dspark().execution.prepare_page_span(
-                core_batch_req,
-                self.num_runtime_page_ids_per_block,
-                self.num_main_gqa_page_ids_per_block(),
-            );
-        } else {
-            self.main_gqa_state.prepare_pages(core_batch_req);
-        }
+        self.prepare_gqa_page_ids(core_batch_req);
         let gqa_shape = self.main_gqa_state.prepare_metadata(
             microbatch.req_slots(),
             microbatch.token_indices(),

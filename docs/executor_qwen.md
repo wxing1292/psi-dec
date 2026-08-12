@@ -732,22 +732,26 @@ commit
 
 ## GQA/GDN lifecycle
 
-`Qwen3MainGQAState` groups the Qwen3 ungated backend, scratch, request page table, metadata buffers, and cache-lane
-information.
-It resets and prepares only KV page metadata.
+`Qwen3MainGQAState` groups the Qwen3 ungated backend, scratch, request page table, and metadata buffers.
+It accepts only complete Qwen3 Main page-ID blocks. It does not interpret runtime cache lanes.
 Qwen3 has zero state pages.
 It does not construct, restore, publish, commit, or reset a GDN state table.
 `UngatedDSparkGQAState` owns a separate DSpark page table, metadata buffers, backend, and block scratch.
-Both Qwen3 GQA states consume spans from the same runtime cache block.
-`prepare_batch` splits each flat runtime page-ID span before it updates these tables.
+In DSpark mode, runtime cache lane 0 stores `[Main page IDs | DSpark page IDs]` for each logical block.
+`prepare_batch` validates the exact combined length and splits this list once.
+It sends each complete role-local list to the applicable state owner.
 Qwen3.5 Main and MTP own distinct gated `Qwen3xGQAState` domains.
-Both state types expose the same lifecycle concepts:
+The Main and DSpark state owners expose symmetric role-local state access:
 
 ```text
-prepare_pages(core_batch)
+write_page_ids(req_slot, block_index, page_ids)
+read_page_ids(req_slot, block_index)
 prepare_metadata(req_slots, token_indices, cu_tokens)
 reset_req_slots(runtime_notification)
 ```
+
+The generic `GQARequestPageTable` exposes only per-layer entry access for page IDs.
+`Qwen35MTP` keeps its separate runtime lane-to-GQA-layer mapping.
 
 `Qwen3xGDNState` groups a backend, scratch, request state table, metadata, cached restore replay, and one optional
 asynchronous publish.
@@ -755,7 +759,7 @@ The current Qwen3.5 executor must own one `Qwen3xGDNState`.
 The executor thread prepares it synchronously:
 
 ```text
-Main GQA prepare_pages
+Main GQA write_page_ids
 Main GQA prepare_metadata
 Main GDN prepare_states(req_slots, block_indices, token_indices, cu_tokens, state_txns, state_page_ids_by_req)
 Main GDN prepare_metadata(cu_tokens, prepared_states)

@@ -316,8 +316,8 @@ The implementation therefore validates the logical live-value count and measures
 
 ## Page ownership
 
-The runtime core allocates one flat page-ID span for each logical cache block.
-The executor splits that span:
+The runtime core allocates one flat page-ID list for each logical cache block.
+The executor splits that list:
 
 ```text
 [0 .. main_page_count)             Main K/V

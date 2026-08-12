@@ -477,7 +477,6 @@ fn init_qwen_3_5_model_inner(
         gqa_page_table_layout,
         config.max_tokens,
         config.num_cache_pages,
-        0,
     );
     let spec_source = match init_mode {
         Qwen35InitMode::Vanilla => Qwen35SpecSource::Vanilla,
@@ -524,7 +523,6 @@ fn init_qwen_3_5_model_inner(
                 mtp_gqa_page_table_layout,
                 config.max_tokens,
                 config.num_cache_pages,
-                1,
             );
             Qwen35SpecSource::MTP(Box::new(Qwen35MTPLoad {
                 config: *mtp_model_config,
@@ -790,20 +788,20 @@ fn init_qwen_3_5_model_inner(
             }))
         },
     };
-    let num_main_page_ids_per_block = usize::try_from(gqa_page_table_layout.num_gqa_layers)
+    let num_main_gqa_page_ids_per_block = usize::try_from(gqa_page_table_layout.num_gqa_layers)
         .expect("qwen3.5 Main GQA layer count must fit usize")
         .checked_mul(
             usize::try_from(gqa_page_table_layout.num_page_ids_per_block)
                 .expect("qwen3.5 Main GQA page count must fit usize"),
         )
         .expect("qwen3.5 Main page IDs per block must fit usize");
-    let num_dspark_page_ids_per_block = match &speculator {
+    let num_dspark_gqa_page_ids_per_block = match &speculator {
         Qwen35Speculator::Vanilla | Qwen35Speculator::MTP(_) => 0,
-        Qwen35Speculator::DSpark(dspark) => dspark.execution.num_runtime_page_ids_per_block(),
+        Qwen35Speculator::DSpark(dspark) => dspark.execution.num_gqa_page_ids_per_block(),
     };
-    let num_runtime_page_ids_per_main_block = num_main_page_ids_per_block
-        .checked_add(num_dspark_page_ids_per_block)
-        .expect("qwen3.5 runtime page IDs per Main block must fit usize");
+    let num_gqa_page_ids_per_main_lane_block = num_main_gqa_page_ids_per_block
+        .checked_add(num_dspark_gqa_page_ids_per_block)
+        .expect("qwen3.5 Main cache-lane page IDs per block must fit usize");
     let pages = PageArena::new(&device, config.num_cache_pages, QWEN35_PAGE_SIZE_BYTES);
     let model = Qwen35Executor {
         model_name: model_config.model_type.clone(),
@@ -839,7 +837,7 @@ fn init_qwen_3_5_model_inner(
         pages,
         pending_transactions: Qwen35PendingTransactions::new(),
         gqa_page_table_layout,
-        num_runtime_page_ids_per_main_block,
+        num_gqa_page_ids_per_main_lane_block,
         state_fingerprint: crate::model::state_snapshot::ModelFingerprint::for_process_instance("qwen3.5"),
         unloaded_embed: None,
         unloaded_unembed: None,

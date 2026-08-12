@@ -179,7 +179,55 @@ impl Qwen35MTP {
     }
 
     pub fn prepare_pages(&self, batch: &BatchDeviceRequest) {
-        prepare_request_page_table(self.request_page_table(), batch, self.num_cache_pages);
+        let request_page_table = self.request_page_table();
+        assert!(
+            request_page_table.num_layers() > 0,
+            "qwen3.5 MTP page table requires logical layers"
+        );
+        for request in &batch.dev_reqs {
+            let page_ids_by_lane_and_block = request.decoder_sync_blocks.kv_page_ids();
+            for gqa_layer_index in 0..request_page_table.num_layers() {
+                let cache_lane = QWEN35_MTP_FIRST_CACHE_LANE
+                    .checked_add(gqa_layer_index)
+                    .expect("qwen3.5 MTP cache lane must fit usize");
+                let page_ids_by_block = page_ids_by_lane_and_block
+                    .get(cache_lane)
+                    .unwrap_or_else(|| panic!("qwen3.5 MTP request page table missing cache lane {cache_lane}"));
+                for (block_offset, page_ids) in page_ids_by_block.iter().enumerate() {
+                    assert_eq!(
+                        page_ids.len(),
+                        request_page_table.num_page_ids_per_block(),
+                        "qwen3.5 MTP cache lane {cache_lane} must contain one physical layer's page IDs"
+                    );
+                    self.write_page_ids(
+                        request.req_slot,
+                        gqa_layer_index,
+                        request
+                            .decoder_sync_blocks
+                            .block_index()
+                            .checked_add(block_offset)
+                            .expect("qwen3.5 MTP cache-block index must fit usize"),
+                        page_ids,
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn write_page_ids(&self, req_slot: u32, layer_index: usize, block_index: usize, page_ids: &[u32]) {
+        assert!(
+            page_ids
+                .iter()
+                .all(|&page_id| (page_id as usize) < self.num_cache_pages),
+            "runtime supplied a qwen3.5 MTP page ID outside the cache-page buffer"
+        );
+        self.request_page_table()
+            .write_page_ids(req_slot, layer_index, block_index, page_ids);
+    }
+
+    pub fn read_page_ids(&self, req_slot: u32, layer_index: usize, block_index: usize) -> Vec<u32> {
+        self.request_page_table()
+            .read_page_ids(req_slot, layer_index, block_index)
     }
 
     pub fn validate_batch(&self, microbatch: &Qwen35Microbatch) {
@@ -207,49 +255,6 @@ impl Qwen35MTP {
         self.request_page_table
             .as_deref()
             .expect("qwen3.5 MTP request page-table state must be loaded before execution")
-    }
-}
-
-fn prepare_request_page_table(
-    request_page_table: &GQARequestPageTable,
-    batch: &BatchDeviceRequest,
-    num_cache_pages: usize,
-) {
-    assert!(
-        request_page_table.num_layers() > 0,
-        "qwen3.5 MTP page table requires logical layers"
-    );
-    for request in &batch.dev_reqs {
-        let page_ids_by_lane_and_block = request.decoder_sync_blocks.kv_page_ids();
-        for gqa_layer_index in 0..request_page_table.num_layers() {
-            let cache_lane = QWEN35_MTP_FIRST_CACHE_LANE
-                .checked_add(gqa_layer_index)
-                .expect("qwen3.5 MTP cache lane must fit usize");
-            let page_ids_by_block = page_ids_by_lane_and_block
-                .get(cache_lane)
-                .unwrap_or_else(|| panic!("qwen3.5 MTP request page table missing cache lane {cache_lane}"));
-            for (block_offset, page_ids) in page_ids_by_block.iter().enumerate() {
-                assert_eq!(
-                    page_ids.len(),
-                    request_page_table.num_page_ids_per_block(),
-                    "qwen3.5 MTP cache lane {cache_lane} must contain one physical layer's page IDs"
-                );
-                assert!(
-                    page_ids.iter().all(|&page_id| (page_id as usize) < num_cache_pages),
-                    "runtime supplied a qwen3.5 MTP page ID outside the cache-page buffer"
-                );
-                request_page_table.write_page_ids(
-                    request.req_slot,
-                    gqa_layer_index,
-                    request
-                        .decoder_sync_blocks
-                        .block_index()
-                        .checked_add(block_offset)
-                        .expect("qwen3.5 MTP cache-block index must fit usize"),
-                    page_ids,
-                );
-            }
-        }
     }
 }
 
@@ -436,11 +441,14 @@ impl ReplayComponent for Qwen35MTP {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use inference_backend_metal::components::GQAComputePath;
     use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
     use inference_executor_core::attn::GQAPageTableLayout;
+    use inference_executor_core::model::qwen::v3_5::Qwen35TextConfig;
     use inference_runtime_core::compute::BatchDeviceRequest;
     use inference_runtime_core::compute::DecoderSyncBlocks;
     use inference_runtime_core::compute::DeviceRequest;
@@ -453,6 +461,8 @@ mod tests {
     use crate::attn::gqa::backend::GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES;
     use crate::mlp::moe::backend::GatedMoEComputePath;
     use crate::mlp::moe::backend::GatedMoEReplayTopology;
+    use crate::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
+    use crate::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
 
     fn gqa_topology() -> GQAReplayTopology {
         GQAReplayTopology {
@@ -569,17 +579,9 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_request_page_table_maps_cache_lanes_to_gqa_layers() {
+    fn test_prepare_pages_maps_cache_lanes_to_gqa_layers() {
         let device = Device::system_default();
-        let page_table = GQARequestPageTable::new(
-            &device,
-            GQAPageTableLayout {
-                num_req_slots: 2,
-                num_gqa_layers: 3,
-                num_blocks: 4,
-                num_page_ids_per_block: 2,
-            },
-        );
+        let mtp = test_mtp(&device);
         let batch = BatchDeviceRequest::new(
             1,
             [DeviceRequest::new(
@@ -605,13 +607,102 @@ mod tests {
             )],
         );
 
-        prepare_request_page_table(&page_table, &batch, 64);
+        mtp.prepare_pages(&batch);
 
-        assert_eq!(page_table.read_page_ids(1, 0, 1), vec![10, 11]);
-        assert_eq!(page_table.read_page_ids(1, 0, 2), vec![12, 13]);
-        assert_eq!(page_table.read_page_ids(1, 1, 1), vec![20, 21]);
-        assert_eq!(page_table.read_page_ids(1, 1, 2), vec![22, 23]);
-        assert_eq!(page_table.read_page_ids(1, 2, 1), vec![30, 31]);
-        assert_eq!(page_table.read_page_ids(1, 2, 2), vec![32, 33]);
+        assert_eq!(mtp.read_page_ids(1, 0, 1), vec![10, 11]);
+        assert_eq!(mtp.read_page_ids(1, 0, 2), vec![12, 13]);
+        assert_eq!(mtp.read_page_ids(1, 1, 1), vec![20, 21]);
+        assert_eq!(mtp.read_page_ids(1, 1, 2), vec![22, 23]);
+        assert_eq!(mtp.read_page_ids(1, 2, 1), vec![30, 31]);
+        assert_eq!(mtp.read_page_ids(1, 2, 2), vec![32, 33]);
+    }
+
+    fn test_mtp(device: &Device) -> Qwen35MTP {
+        let main_config = test_model_config();
+        let mtp_config = test_model_config();
+        let defaults = Qwen35MetalDefaults::default();
+        let (gqa_core, gqa_metal) = qwen35_gqa_core_and_metal(
+            main_config.text_config.num_hidden_layers,
+            &mtp_config.text_config,
+            defaults,
+        )
+        .unwrap();
+        let gqa_state = Qwen3xGQAState::new(
+            device,
+            gqa_core,
+            gqa_metal,
+            GQAPageTableLayout {
+                num_req_slots: 2,
+                num_gqa_layers: 3,
+                num_blocks: 4,
+                num_page_ids_per_block: 2,
+            },
+            2,
+            64,
+        );
+        let (dense_core, dense_metal) = qwen35_dense_mlp_core_and_metal(0, &mtp_config.text_config, defaults).unwrap();
+        let dense_scratch = Rc::new(DenseMLPScratch::new(device, &dense_core, dense_metal.io_dtype, 2));
+        Qwen35MTP::new(
+            device,
+            &main_config,
+            &mtp_config,
+            2,
+            defaults,
+            &gqa_state,
+            64,
+            Rc::new(Qwen35MTPLayerScratch::new(
+                device,
+                2,
+                mtp_config.text_config.hidden_size,
+            )),
+            Some(&dense_scratch),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn test_model_config() -> Qwen35ModelConfig {
+        Qwen35ModelConfig {
+            model_type: "qwen3_5".to_string(),
+            tie_word_embeddings: false,
+            text_config: Qwen35TextConfig {
+                model_type: "qwen3_5_text".to_string(),
+                hidden_size: 128,
+                hidden_act: "silu".to_string(),
+                intermediate_size: 128,
+                num_hidden_layers: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 128,
+                rms_norm_eps: 1e-6,
+                vocab_size: 16,
+                max_position_embeddings: 32,
+                attention_bias: false,
+                tie_word_embeddings: false,
+                layer_types: vec!["full_attention".to_string()],
+                full_attention_interval: 1,
+                linear_num_value_heads: 1,
+                linear_num_key_heads: 1,
+                linear_key_head_dim: 128,
+                linear_value_head_dim: 128,
+                linear_conv_kernel_dim: 4,
+                decoder_sparse_step: 1,
+                num_experts: 0,
+                num_experts_per_tok: 0,
+                shared_expert_intermediate_size: 0,
+                moe_intermediate_size: 0,
+                norm_topk_prob: true,
+                mtp_num_hidden_layers: 1,
+                mtp_use_dedicated_embeddings: false,
+                rope_theta: 10_000.0,
+                partial_rotary_factor: 1.0,
+                rope_parameters: None,
+                use_cache: true,
+                dtype: None,
+                scale: 1.0 / 128.0_f32.sqrt(),
+                rope_dim: 128,
+            },
+            quantization: None,
+        }
     }
 }
