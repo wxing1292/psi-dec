@@ -17,6 +17,10 @@ Recommendation: Keep these details out of runtime core:
 `RuntimeConfig::num_tokens_per_cache_block` is model-neutral cache metadata. It gives the token extent of one trie
 block and its attached opaque KV and state-page vectors.
 
+The service compiles this extent as const `N` for each production artifact. Production selects the artifact and its
+configuration at build and deployment time. Runtime initialization requires
+`RuntimeConfig::num_tokens_per_cache_block == N`. One live runtime does not change this extent.
+
 This extent differs from the token capacity of one physical KV page. The executor interprets each vector according to
 its model layout. Core only allocates, shares, and reports the vector as one logical block.
 
@@ -402,15 +406,16 @@ EOS token IDs. The service merges caller-provided token sequences with model
 defaults and de-duplicates them before submitting the request to core.
 
 Per-request token and probability delivery must not silently drop committed output. The current runtime uses an
-unbounded internal channel between request commit and the transport-neutral `DecodeResponse`.
+unbounded internal channel between request commit and the transport-neutral `DecodeResponse`. This channel keeps
+synchronous request commit non-blocking and preserves every committed output. `max_running_requests` bounds the number
+of admitted request channels. `max_sampled_tokens` and `context_window` bound the caller-visible output of each request.
+The runtime does not terminate a request only because its transport consumer is slow.
 
 Dropping that response causes three actions:
 
 - It drops the external request.
 - It closes the receiver.
 - It cancels the request lifecycle.
-
-Slow-consumer memory accounting and a bounded request-local cancellation policy remain future work.
 
 `max_sampled_tokens` and `context_window` are caller-visible output limits. A speculative step can commit more sampled
 tokens to decoder state than the caller's remaining budget.

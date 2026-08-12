@@ -60,11 +60,9 @@ content.
 
 Each response stream keeps its incremental detokenization and Qwen response-grammar state private.
 
-The runtime token and probability channel remains `async_channel::unbounded`. Dropping a `DecodeResponse` drops its
-`ExternalRequest`. This action cancels only that request.
-
-[`future_work.md`](future_work.md) contains the bounded slow-consumer work. The service keeps one output channel at its
-current capacity.
+The runtime token and probability channel is intentionally `async_channel::unbounded`. It preserves committed output
+without blocking synchronous runtime commit. Dropping a `DecodeResponse` drops its `ExternalRequest`. This action
+cancels only that request. A slow transport consumer does not terminate the request.
 
 ## Tool state
 

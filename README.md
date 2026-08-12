@@ -1,6 +1,6 @@
 # psi-dec
 
-`psi-dec` runs Qwen decoder models on Apple Silicon.
+`psi-dec` is a production-quality Qwen inference engine for Apple Silicon.
 It combines a model-agnostic Rust runtime, a Qwen executor, and a Metal replay backend.
 
 ## Architecture
@@ -21,13 +21,6 @@ Each layer has a separate owner:
 - **Qwen executor:** Owns model layout, components, sampling, MTP, and replay order.
 - **Metal backend:** Owns devices, buffers, kernels, recording, and ICB submission.
 
-HTTP accepts messages and tools.
-The checkpoint chat template and tokenizer convert them to token IDs.
-The HTTP and gRPC paths use the same token-level decode API.
-The runtime owns scheduling and cache page lifecycles.
-The executor owns Qwen model computation.
-The Metal backend owns GPU execution.
-
 ## Quick start
 
 You need these items:
@@ -37,18 +30,27 @@ You need these items:
 - Xcode command-line tools
 - Hugging Face CLI with access to the model
 
-Download the matching Main and MTP checkpoints:
+Download the Qwen3.6 Main and MTP checkpoints:
 
 ```sh
 hf auth login
+
 hf download mlx-community/Qwen3.6-27B-4bit \
   --local-dir models/Qwen3.6-27B-4bit
 
 hf download mlx-community/Qwen3.6-27B-MTP-4bit \
   --local-dir models/Qwen3.6-27B-MTP-4bit
+
+hf download mlx-community/Qwen3.6-35B-A3B-4bit \
+  --local-dir models/Qwen3.6-35B-A3B-4bit
+
+hf download mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
+  --local-dir models/Qwen3.6-35B-A3B-MTP-4bit
 ```
 
-Start gRPC and HTTP listeners with MTP enabled:
+The `qwen3_5_*` binaries support compatible Qwen3.5 and Qwen3.6 checkpoints.
+
+Start the dense 27B service with MTP:
 
 ```sh
 cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
@@ -56,6 +58,17 @@ cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
   --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
+  --num-spec-tokens 1
+```
+
+Start the sparse 35B-A3B service with MTP:
+
+```sh
+cargo run --release -p inference-runtime-service --bin qwen3_5_sparse -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
+  --hf-mtp-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
   --num-spec-tokens 1
 ```
 
@@ -81,7 +94,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-The [service guide](docs/service.md) includes the sparse 35B-A3B command, Main-only startup, gRPC decode, tool calls, and the supported OpenAI-compatible subset.
+The [service guide](docs/service.md) also covers Main-only startup, gRPC, tool calls, and the HTTP API.
 
 ## Workspace map
 
@@ -97,33 +110,26 @@ All paths above live under `crates/`.
 
 ## Documentation
 
-- Use the [service guide](docs/service.md) to run or test the server.
-- Use the [runtime core guide](docs/core.md) to understand request and cache lifecycles.
-- Use the [executor architecture](docs/executor.md) to follow Qwen execution.
-- Use the [Metal backend guide](crates/inference-backend-metal/README.md) to inspect replay and kernels.
-- Use [executor verification](docs/executor_benchmarks.md) to benchmark or profile changes.
-- Apply the rules in [high-level guidance](docs/high_level.md).
-- Apply the [technical English guide](docs/technical_english.md) when you write documentation.
-- Review active work in [future work](docs/future_work.md).
-
-The [documentation index](docs/README.md) links all current component guides.
+- [Service](docs/service.md): Setup, APIs, operations, and end-to-end checks.
+- [Runtime core](docs/core.md): Scheduling, request lifecycle, and cache ownership.
+- [Executor](docs/executor.md): Qwen execution and component composition.
+- [Metal backend](crates/inference-backend-metal/README.md): Resources, kernels, and replay.
+- [Verification](docs/executor_benchmarks.md): Correctness, benchmarks, profiling, and performance evidence.
+- [Documentation index](docs/README.md): Component guides, engineering rules, and current work.
 
 ## Acknowledgements
 
-`psi-dec` is an independent Rust and Metal implementation.
-These open-source projects inspired its design:
+`psi-dec` is an independent Rust and Metal implementation inspired by these projects:
 
 - [vLLM](https://github.com/vllm-project/vllm)
 - [SGLang](https://github.com/sgl-project/sglang)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
 
-Credit goes to their authors and contributor communities.
 The project uses [MLX](https://github.com/ml-explore/mlx) by Apple.
-The build process downloads and embeds the MLX Metal kernel headers.
-The project retains the MIT notice in [`NOTICE`](NOTICE).
-The [Qwen team](https://qwen.ai/) develops the supported Qwen models.
-Model weights are separate artifacts, and their own terms apply.
+The build embeds downloaded MLX Metal kernel headers and retains their MIT notice in [`NOTICE`](NOTICE).
+The [Qwen team](https://qwen.ai/) develops the supported models.
+Model weights are separate artifacts with their own terms.
 
 ## License
 

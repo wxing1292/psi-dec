@@ -20,17 +20,8 @@ document that owns the component.
 
 ## Runtime Lifecycle
 
-- Make trie and request cache-block extent runtime-dynamic before offering arbitrary Qwen cache-block CLI values.
-  The extent is currently a const generic.
-  Runtime, request, trie block, cache, and RPC service types share this generic.
-  Many power-of-two monomorphizations would increase code size and maintenance cost for one simple option.
 - Drain the user and reservation-completion channels before flushing when both channels are ready.
   This behavior prevents queue priority from depending on crossbeam select order.
-- Replace the unbounded per-request token-output channel with bounded slow-consumer handling.
-  Base the handling on explicit per-request or service-level byte accounting.
-  Saturation must terminate only the affected request.
-  It must return a clear RPC error.
-  It must not silently drop committed output or panic the service.
 - Redesign host-pinned segment ownership before enabling offload.
   An allocation must have unique ownership for mutation and free operations.
   The new design permits only read-only shared views.
