@@ -1,3 +1,4 @@
+use crate::metal::BufferIO;
 use crate::metal::Device;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayProgram;
@@ -8,6 +9,7 @@ use crate::metal::Stream;
 #[derive(Debug)]
 pub struct MetalRuntime {
     device: Device,
+    buffer_io: BufferIO,
     stream: Stream,
 }
 
@@ -17,8 +19,13 @@ impl MetalRuntime {
     }
 
     pub fn new(device: Device) -> Self {
+        let buffer_io = BufferIO::new(&device);
         let stream = Stream::new(&device);
-        Self { device, stream }
+        Self {
+            device,
+            buffer_io,
+            stream,
+        }
     }
 
     pub fn device(&self) -> &Device {
@@ -27,6 +34,10 @@ impl MetalRuntime {
 
     pub fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    pub fn buffer_io(&self) -> &BufferIO {
+        &self.buffer_io
     }
 
     pub fn create_recorder(&self) -> ReplayProgramBuilder {

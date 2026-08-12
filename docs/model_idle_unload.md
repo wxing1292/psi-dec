@@ -3,6 +3,8 @@
 This document records the implemented model resource operations, executor protocol, and service event-loop wiring.
 Runtime idle detection and model residency tracking are implemented.
 
+[`model_state_io.md`](model_state_io.md) defines the planned selected-state and request-mobility design.
+
 ## Objective
 
 The final service must release model weights and backend state after an idle period.
@@ -244,7 +246,7 @@ The event-loop wiring fails closed after these errors:
 - State load failure.
 
 The current failure path invokes global shutdown and does not send a success response.
-Process shutdown discards the full runtime cache generation.
+Process shutdown discards the full runtime cache metadata.
 The service must not continue with runtime page IDs that refer to invalid executor state.
 
 ## Integration verification

@@ -28,25 +28,38 @@ document that owns the component.
   It defines their cross-thread contract explicitly.
   Then implement KV and state onload and offload as a separate lifecycle.
   This lifecycle must remain distinct from the existing reservation-wait task.
+  Follow the ownership and lifecycle design in [`model_state_io.md`](model_state_io.md).
+- Rename the current reservation-wait `SwapOutTask` before per-request swap is implemented.
+  Keep the request status `Running` while it waits for a reservation.
+  Reserve `Swapped` for a request whose model state is not device-resident.
 - Optimize full model-state snapshot I/O.
   Keep weight handling outside this path.
   `unload_weights()` must drop Metal weight residency without writing weights to the snapshot.
   `load_weights()` must reload weights from the original checkpoint.
-  Replace bounded CPU staging with mapped or aligned direct I/O between shared Metal buffers and snapshot storage.
+  Replace bounded CPU staging with the Metal backend `BufferIO` primitive.
   Coalesce adjacent state ranges to reduce copies and system calls.
-  Avoid per-record allocations and duplicate checksum scans.
-  Preserve the model fingerprint, header and section checksums, temporary-file sync, atomic rename, and synchronous
-  model-executor lifecycle APIs.
+  Avoid per-record allocations and duplicate payload scans.
+  Use one snapshot directory with separate metadata and aligned data files.
+  Open the data file with `BufferIOFileCacheMode::Uncached`.
+  Sync the data file once after all payload ranges are written.
+  Preserve temporary-directory sync, atomic rename, parent-directory sync, and synchronous model-executor lifecycle
+  APIs.
+  Validate the local snapshot schema, exact lengths, offsets, and resource set.
   Record snapshot bytes, write and read duration, effective bandwidth, and peak host-memory overhead before and after
   the change.
+  Follow [`model_state_io.md`](model_state_io.md).
 - Add selective model-state snapshot I/O after the full-state path is measured and correct.
-  Runtime core must supply the valid page IDs and request slots for one runtime cache generation.
+  Add one shared `ModelStateScope` argument to the existing `Stop` and `Start` protocol variants.
+  Define `ModelStateScope::Full` and `ModelStateScope::Selected { request_slots, page_ids }`.
+  `Stop` and `Start` must use the same scope variant and fields.
+  Runtime core must supply sorted unique page IDs and valid request slots.
+  The selection must include all valid trie cache blocks, including reusable blocks with no active request reference.
   The selection must include referenced GDN state slots and future-publish mappings.
   It must cover Main, MTP, and DSpark cache lanes.
   The snapshot index must identify each resource, lane, layer, page, request, and state slot.
   State write and read APIs must remain symmetric.
-  Snapshot load must reject a stale cache generation, invalid selection, missing resource, or checksum mismatch.
-  Any validation or I/O failure must shut down the service and discard the runtime cache generation.
+  Snapshot load must reject an invalid selection, missing resource, or invalid byte range.
+  Any validation or I/O failure must shut down the service and discard the runtime cache metadata.
 
 ## Pipeline Parallelism
 

@@ -3,6 +3,7 @@
 //! This module owns raw mutable Metal storage and command-dispatch concepts.
 
 pub mod buffer;
+pub mod buffer_io;
 pub mod device;
 pub mod dtype;
 pub mod kernel;
@@ -15,6 +16,9 @@ pub use buffer::GpuAllocationSite;
 pub use buffer::buffer_allocation_summary;
 pub use buffer::record_gpu_buffer_alloc;
 pub use buffer::record_gpu_buffer_free;
+pub use buffer_io::BufferIO;
+pub use buffer_io::BufferIOFile;
+pub use buffer_io::BufferIOFileCacheMode;
 pub use device::Device;
 pub use dtype::Dtype;
 pub use dtype::MetalBufferElement;

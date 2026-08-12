@@ -341,6 +341,13 @@ The executor finishes or clears transient restore, publish, and batch transactio
 It attaches consumers only after all state reads succeed.
 It releases all new resources after a read failure.
 
+The Metal backend also provides the standalone `BufferIO` component.
+It transfers byte ranges between files and shared Metal buffers without an application staging buffer.
+`BufferIOFile` owns the POSIX and Metal handles for one file.
+`BufferIOFileCacheMode::Uncached` bypasses the macOS data cache for positional and Metal file I/O.
+The current v1 snapshot path does not use `BufferIO`.
+See [`model_state_io.md`](model_state_io.md) for the current primitive and the planned snapshot migration.
+
 `ReplayableModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
 It also starts a stopped model before it executes a batch.
 Runtime core tracks executor residency and sends ordered lifecycle commands after the configured idle period.

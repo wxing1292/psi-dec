@@ -1,0 +1,351 @@
+# Model State I/O Design
+
+This document defines the model-state I/O design. It separates current source from planned work.
+
+[`high_level.md`](high_level.md) defines the runtime-core and model-executor boundary.
+[`model_idle_unload.md`](model_idle_unload.md) describes the current whole-model Stop/Start path.
+
+## Status
+
+The repository has two model-state I/O projects.
+
+| Project | Workstream | Status |
+| --- | --- | --- |
+| Whole-model residency | Full-state Stop/Start | Implemented with the v1 staged snapshot path |
+| Whole-model residency | Selected-state Stop/Start | Planned |
+| Request and cache mobility | Per-request swap | Planned |
+| Request and cache mobility | Trie cache-block I/O | Planned |
+
+The Metal backend implements the standalone `BufferIO` primitive.
+The v1 model snapshot does not use `BufferIO` yet.
+
+## Shared model
+
+Whole-model I/O and request mobility share state descriptions and byte-range I/O.
+They do not share one lifecycle contract.
+
+```text
+                                shared metadata and I/O
+                               request slots + page IDs
+                                          |
+                    +---------------------+---------------------+
+                    |                                           |
+                    v                                           v
+       whole-model Selected                            request and block I/O
+       physical identity is stable                      placement can change
+       synchronous Stop/Start                           asynchronous tasks
+       runtime metadata is unchanged                    runtime updates placement
+```
+
+This division produces two projects, not three projects.
+Full-state and selected-state I/O are two phases of whole-model residency.
+
+## Ownership
+
+Runtime core owns these concepts:
+
+- Request lifecycle and request slots.
+- Trie metadata and logical cache blocks.
+- KV and state page allocation.
+- Physical page IDs and block placement.
+- Cache eviction policy.
+
+The model executor owns these concepts:
+
+- `PageArena` payload interpretation.
+- GQA page-table interpretation.
+- GDN recurrent and convolution state.
+- GDN request state and future-publish mappings.
+- Model-specific gather and scatter operations.
+
+The Metal backend owns these concepts:
+
+- `Buffer`, `Device`, and compute `Stream`.
+- The `BufferIO` Metal I/O queue.
+- The `BufferIOFile` POSIX and Metal file handles.
+- File-to-buffer and buffer-to-file byte-range transfers.
+
+## `BufferIO`
+
+`BufferIO` is a concrete Metal backend component.
+It is not an executor-core trait.
+
+`BufferIO::new(&Device)` creates one serial `MTLIOCommandQueue`.
+This queue is independent from the `MTL4CommandQueue` in the compute `Stream`.
+`MetalRuntime` owns one compute `Stream` and one `BufferIO`.
+
+`BufferIO::create` creates a new output file with an explicit `BufferIOFileCacheMode`.
+`BufferIO::open` opens an existing input file with the same explicit mode.
+Both methods return one `BufferIOFile`.
+`BufferIOFile` retains one POSIX file handle and one `MTLIOFileHandle` for the same file.
+This owner prevents each range transfer from reopening the file.
+The public API does not accept `OpenOptions`.
+This restriction prevents append mode from breaking positional file offsets.
+
+`BufferIOFileCacheMode::Cached` uses the default macOS data cache.
+`BufferIOFileCacheMode::Uncached` applies `F_NOCACHE` and `F_GLOBAL_NOCACHE` before it creates the Metal file handle.
+`F_NOCACHE` selects the uncached positional-I/O path used by `buffer_to_file`.
+`F_GLOBAL_NOCACHE` applies the same cache policy to the Metal URL-backed file handle used by `file_to_buffer`.
+This mode bypasses the macOS data cache.
+It does not guarantee bypass of an SSD controller cache.
+
+The API has direction-based names:
+
+```text
+file_to_buffer(BufferIOFile, file_offset_bytes, Buffer, buffer_offset_bytes, len_bytes)
+buffer_to_file(Buffer, buffer_offset_bytes, BufferIOFile, file_offset_bytes, len_bytes)
+```
+
+Each method lists the source and its byte offset before the destination and its byte offset.
+Both methods use checked `u64` byte coordinates.
+Both methods return `std::io::Result`.
+The model executor must map a failure to `ModelExecutorError` at its boundary.
+
+`file_to_buffer` uses `MTLIOCommandBuffer::loadBuffer`.
+The method waits for Metal I/O completion before it returns.
+
+`buffer_to_file` writes from `Buffer::contents()` with positional file I/O.
+The method does not allocate an application staging buffer.
+The method does not sync or publish the file.
+`BufferIOFile::sync_all` syncs the file when the snapshot owner requests it.
+
+The caller must complete earlier GPU access before either method starts.
+The caller owns later GPU synchronization, file sync, and snapshot publication.
+
+The two directions use different platform mechanisms:
+
+```text
+file -> shared Metal buffer     MTLIOCommandQueue
+shared Metal buffer -> file     positional file I/O
+```
+
+`MTL4CommandQueue` cannot use a filesystem file as a command source or destination.
+
+## Whole-model full state
+
+The current full-state lifecycle is synchronous.
+
+```text
+runtime Stop
+  -> finish the current batch and commit
+  -> clear executor replay state
+  -> write all mutable model state
+  -> publish the snapshot
+  -> release mutable Metal state
+  -> unload weights
+  -> Stopped
+
+runtime Start
+  -> reload weights from the original checkpoint
+  -> allocate mutable Metal state
+  -> read all mutable model state
+  -> attach the restored state
+  -> remove the snapshot
+  -> Started
+```
+
+Weights are not snapshot data.
+`unload_weights()` drops Metal weight residency.
+`load_weights()` reloads the original checkpoint.
+
+The current v1 snapshot uses one file, a 4 MiB staging buffer, and CRC32.
+The current reader scans each payload for CRC32 and then reads it again for restore.
+
+Recommendation: Migrate the v1 snapshot only after the standalone `BufferIO` measurements are stable.
+
+## Whole-model selected state
+
+Selected Stop/Start persists all runtime-valid state, not only active-request state.
+
+The runtime core supplies this semantic selection:
+
+```text
+request slots
++
+page IDs for all valid trie and cache blocks
+```
+
+The page set includes reusable trie blocks with no active request reference.
+Omission of these pages leaves valid runtime metadata with missing executor payload.
+
+The semantic block-to-page mapping keeps logical order.
+The executor derives a separate physical I/O order:
+
+```text
+semantic page IDs
+  -> flatten
+  -> deduplicate
+  -> sort by PageArena offset
+  -> coalesce adjacent ranges
+```
+
+The runtime must provide sorted and unique page IDs at the Stop/Start protocol boundary.
+The executor can then validate this invariant and derive byte ranges.
+
+Recommendation: Add one shared scope to the existing protocol variants:
+
+```text
+ModelStateScope::Full
+ModelStateScope::Selected { request_slots, page_ids }
+
+ReplayableModelExecutorRequest::Stop(ModelStateScope)
+ReplayableModelExecutorRequest::Start(ModelStateScope)
+```
+
+`Stop` and `Start` must use the same scope variant and fields.
+Selected Start supplies the selection again.
+The executor must compare the Start selection with the snapshot metadata.
+
+Selected Stop/Start does not change runtime state:
+
+```text
+trie metadata       unchanged
+DeviceBlock         unchanged
+placement           unchanged
+page IDs            unchanged
+request slots       unchanged
+num_in_sync_blocks  unchanged
+```
+
+The design does not need a cache-generation ID.
+The synchronous lifecycle keeps the same runtime object graph alive.
+
+## Snapshot publication
+
+Recommendation: Use one snapshot directory with two files.
+
+```text
+snapshot/
+  metadata
+  data
+```
+
+`metadata` stores logical resource records and data offsets.
+`data` stores aligned, concatenated payload ranges with padding.
+Open `data` with `BufferIOFileCacheMode::Uncached`.
+The metadata file can use the default cached path because it is small and receives an explicit sync.
+
+Publish a new snapshot in this order:
+
+```text
+create snapshot.tmp-<id>/
+  -> write data
+  -> write metadata
+  -> sync data
+  -> sync metadata
+  -> sync snapshot.tmp-<id>/
+  -> rename snapshot.tmp-<id>/ to snapshot/
+  -> sync the parent directory
+```
+
+The reader must only open the final `snapshot/` name.
+An incomplete temporary directory is not a valid snapshot.
+
+Local Stop/Start does not need a payload checksum.
+The reader must validate the schema, exact lengths, offsets, and resource set.
+Cross-node transfer can calculate SHA-256 while it reads the published data file.
+
+This whole-model lifecycle is not a process-restart checkpoint.
+It keeps runtime metadata in the live process while model residency is stopped.
+
+## Per-request swap
+
+Per-request swap is separate from whole-model residency.
+It changes runtime-visible placement and physical identity.
+
+Swap-out can start only at this scheduler boundary:
+
+```text
+the request's last prepared or in-flight batch commits
+  -> no later batch is prepared
+  -> submit request swap-out
+```
+
+Swap-in can start only for a request whose state is `Swapped`.
+The scheduler must not prepare a batch before swap-in completes.
+
+Successful swap-out releases request-slot executor resources.
+It also releases request-private device pages.
+Swap-in can allocate a different request slot and different page IDs.
+
+The scheduler owns the asynchronous task.
+The executor uses a separate I/O execution path.
+The request task submits the operation and waits for completion.
+
+The current reservation-wait task must not use `Swapped` as its status.
+The request remains `Running` while it waits for a reservation.
+Reserve `Swapped` for state that is not device-resident.
+
+## Trie cache-block I/O
+
+The trie is one logical cache across Device, Host, and Disk placement.
+
+```text
+logical trie block
+  -> Device(page IDs)
+  -> Host(...)
+  -> Disk(...)
+```
+
+Cache eviction policy owns cache-block unload decisions.
+Request swap-out releases its references and private resources.
+It does not independently evict shared trie blocks.
+
+Use one `BlockIOTask` type with Load and Unload operations.
+The task owns its temporary pin and any S3FIFO reservation.
+Cancellation or failure must release the pin and reject an unfinished reservation.
+
+An unload completion must check the pin count and replace placement under one trie-node mutation lock.
+
+```text
+only the task pin remains
+  -> replace Device with Disk
+  -> release DeviceBlock
+
+a request pin exists
+  -> keep Device
+  -> optionally keep the Disk replica
+```
+
+This lock prevents a request from observing released page IDs.
+
+New request initialization runs in its existing Tokio task.
+It walks and pins the unified trie before scheduler enqueue.
+It submits `BlockIOTask::Load` for each non-device block and waits in place.
+The request enters the scheduler only after all selected blocks have Device placement.
+
+## Failure behavior
+
+A whole-model snapshot failure fails the Stop or Start operation.
+The current service can use global shutdown because it has no rollback response protocol.
+
+A failed Stop write leaves model state and weights resident.
+The executor releases state only after snapshot publication succeeds.
+
+A failed Start must release provisional allocations.
+It must not attach partial state.
+
+A request or block I/O failure must remain request-scoped or block-scoped.
+It must not publish a partial placement change.
+
+## Implementation order
+
+1. Measure standalone `BufferIO` file-to-buffer and buffer-to-file throughput.
+2. Add the directory snapshot format and aligned data layout.
+3. Migrate full-state Stop/Start from v1 staging to `BufferIO`.
+4. Add `ModelStateScope` to the existing `Stop` and `Start` protocol variants.
+5. Add per-request swap at the scheduler commit boundary.
+6. Add unified trie placement and `BlockIOTask`.
+7. Add cross-node transfer only after local I/O is correct.
+
+## Deferred decisions
+
+The following details remain open:
+
+- The `BufferIO` concurrency and queue-count policy.
+- Uncached range alignment and other filesystem tuning.
+- Selected-state metadata encoding.
+- Request-slot GQA and GDN gather/scatter format.
+- Trie insertion and duplicate-load coordination.
+- Disk replica retention after a concurrent request pin.
+- Prefill/decode transfer identity and remote publication.

@@ -43,7 +43,7 @@ Backend Criterion targets:
 
 ```text
 dense_mlp  sparse_mlp  moe  gqa_attn  gqa_block_attn  gdn_attn  gdn_state_io
-embedding  unembedding  norm
+embedding  unembedding  norm  buffer_io
 ```
 
 `rejection_sampling` is the backend custom-CLI target. Model-executor targets:
@@ -68,6 +68,38 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 - `norm` measures standalone RMSNorm and residual-add RMSNorm variants.
   The `rms-only/replay64` cases record 64 standalone BF16 RMSNorm commands in one replay.
   This method amortizes command submission and wait overhead for kernel-level comparisons.
+- `buffer_io` measures the production Metal `BufferIO` API at `4`, `64`, and `128 MiB`.
+
+  | Benchmark key | Direction | macOS data cache | Timed completion |
+  | --- | --- | --- | --- |
+  | `file_to_buffer_uncached` | File to shared Metal buffer | Disabled | `BufferIO::file_to_buffer` returns |
+  | `buffer_to_file_uncached_sync` | Shared Metal buffer to file | Disabled | `BufferIOFile::sync_all` returns |
+
+  It excludes snapshot metadata, rename, and parent-directory sync.
+  Set `PSI_DEC_BUFFER_IO_BENCH_DIR` to select the storage volume.
+  The default directory is the operating-system temporary directory.
+
+  Each size uses this untimed setup:
+
+  ```text
+  allocate one shared source Metal buffer
+    -> fill it with a repeated 1 MiB byte pattern
+    -> allocate one shared destination Metal buffer
+    -> create the benchmark file with F_NOCACHE and F_GLOBAL_NOCACHE
+    -> buffer_to_file the complete range
+    -> sync_all the file
+    -> open a separate uncached read handle
+    -> file_to_buffer the complete range
+    -> validate every destination byte in 1 MiB chunks
+  ```
+
+  The timed file-to-buffer case repeatedly reads the same file and range into the same destination buffer.
+  `F_GLOBAL_NOCACHE` keeps the Metal URL-backed file handle outside the macOS data cache.
+  This condition does not bypass an SSD controller cache.
+
+  The timed buffer-to-file case overwrites the same range with `F_NOCACHE` enabled and calls `sync_all` during each
+  iteration.
+  File creation, file opening, pattern generation, correctness validation, and cleanup remain outside all timed cases.
 - `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts `single_q_token` or `tiled_q_tokens`. It can run an explicit
   untimed `--validate-tiled-q-tokens` comparison.
 - `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SDPA-only paths, and exact QKV/output
@@ -130,6 +162,9 @@ Representative smoke commands:
 cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1 \
   --iters 1 --warmup-iters 0 --runs 1
+
+PSI_DEC_BUFFER_IO_BENCH_DIR=<storage-directory> \
+  cargo bench -p inference-backend-metal --bench buffer_io
 
 cargo bench -p inference-backend-metal --bench rejection_sampling -- \
   --mode dspark-markov-top-k-map --rows 1 --top-k 20 --vocab 151936 \

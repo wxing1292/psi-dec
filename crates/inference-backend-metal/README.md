@@ -48,11 +48,13 @@ replays through Metal 4.
 │   ├─ Buffer                                      // owns one MTLBuffer                     │
 │   │    └─ BufferView                             // borrow + dtype + shape + offset        │
 │   ├─ Kernel                                      // compiled MTLComputePipelineState       │
-│   └─ Stream                                                                                │
-│        ├─ command queue                          // MTL4CommandQueue                       │
-│        ├─ command allocator                      // MTL4CommandAllocator                   │
-│        ├─ commit completion                      // MTL4 commit feedback                    │
-│        └─ ResidencySet                           // wraps queue-attached MTLResidencySet   │
+│   ├─ Stream                                                                                │
+│   │    ├─ command queue                          // MTL4CommandQueue                       │
+│   │    ├─ command allocator                      // MTL4CommandAllocator                   │
+│   │    ├─ commit completion                      // MTL4 commit feedback                    │
+│   │    └─ ResidencySet                           // wraps queue-attached MTLResidencySet   │
+│   └─ BufferIO                                                                              │
+│        └─ I/O command queue                      // serial MTLIOCommandQueue               │
 └──────────────────────────────────────────┬─────────────────────────────────────────────────┘
                                            │ buffers + kernels + semantic order
                                            v
@@ -122,6 +124,19 @@ can retain their bindings while buffer contents change.
 
 The executor writes runtime input one time for each submission. `num_total_threads` is part of the recorded dispatch
 capacity. `num_active_threads` masks unused capacity for one submission.
+
+`MetalRuntime` owns one compute `Stream` and one `BufferIO`.
+`BufferIO::create` creates a new output file.
+`BufferIO::open` opens an existing input file.
+Both methods require `BufferIOFileCacheMode::Cached` or `BufferIOFileCacheMode::Uncached`.
+The uncached mode applies `F_NOCACHE` for positional I/O and `F_GLOBAL_NOCACHE` for all handles of that file.
+Both methods return one `BufferIOFile` that owns the POSIX and Metal handles for the same file.
+`BufferIO::file_to_buffer` uses the Metal I/O queue.
+`BufferIO::buffer_to_file` writes directly from shared `MTLBuffer` storage with positional file I/O.
+Both methods are synchronous.
+Both methods list the source range before the destination range.
+The caller must complete earlier GPU access before it starts a transfer.
+The snapshot owner controls file synchronization and publication.
 
 ## Add One
 

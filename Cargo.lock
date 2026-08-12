@@ -1151,6 +1151,7 @@ dependencies = [
  "criterion",
  "half",
  "inference-executor-core",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
