@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use async_channel::Sender;
 use async_channel::TrySendError;
 
@@ -11,6 +13,7 @@ use crate::runtime::request::AtomicRequestStatus;
 use crate::runtime::request::CompletionReason;
 use crate::runtime::request::RequestStatus;
 use crate::runtime::request::TokenProbs;
+use crate::runtime::scheduler::ComputePhase;
 
 mod req_resp;
 
@@ -25,6 +28,7 @@ where
     req_slot: RequestSlot,
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+    in_flight_computes: VecDeque<ComputePhase>,
     token_prob_tx: Sender<TokenProbs>,
 
     sampling_config: SamplingConfig,
@@ -49,6 +53,7 @@ where
             req_slot,
             req_status,
             decoder_blocks,
+            in_flight_computes: VecDeque::new(),
             token_prob_tx,
             sampling_config,
             context_window,

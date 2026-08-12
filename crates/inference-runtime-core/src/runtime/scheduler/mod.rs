@@ -73,27 +73,34 @@ where
     );
 }
 
-pub enum PrepareResult<DeviceReq> {
-    ResourceLimitExceeded,
-    Await { wait: Boxed<()> },
-    Pending,
-    Continue { dev_req: DeviceReq, phase: PreparePhase },
-    Terminal,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputePhase {
+    Prefill { epoch: usize, token_index: usize },
+    Decode { epoch: usize, token_index: usize },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PreparePhase {
-    Prefill,
-    Decode,
+pub enum PrepareResult<DeviceReq> {
+    ResourceLimitExceeded,
+    Await {
+        wait: Boxed<()>,
+    },
+    Skip,
+    Continue {
+        dev_req: DeviceReq,
+        compute_phase: ComputePhase,
+    },
+    Terminal,
 }
 
 pub enum CommitResult {
     Continue,
+    Pending,
     Terminal,
 }
 
 pub enum CancelResult {
     Continue,
+    Pending,
     Terminal,
 }
 
@@ -108,6 +115,7 @@ where
     fn store_running(&self) -> bool;
     fn store_swapped(&self) -> bool;
     fn is_terminal(&self) -> bool;
+    fn num_in_flight_computes(&self) -> usize;
 
     fn request_estimate(&self) -> usize;
     fn token_estimate(&self) -> ReqTokenInventory<'_>;

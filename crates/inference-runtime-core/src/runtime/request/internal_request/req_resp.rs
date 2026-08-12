@@ -14,7 +14,7 @@ use crate::runtime::request::internal_request::StopSequenceMatch;
 use crate::runtime::request::internal_request::stop_sequence::StopSequences;
 use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
-use crate::runtime::scheduler::PreparePhase;
+use crate::runtime::scheduler::ComputePhase;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::ReqTokenInventory;
 use crate::runtime::scheduler::UserRequest;
@@ -40,6 +40,10 @@ where
         self.status().is_terminal()
     }
 
+    fn num_in_flight_computes(&self) -> usize {
+        self.in_flight_computes.len()
+    }
+
     fn request_estimate(&self) -> usize {
         1
     }
@@ -56,7 +60,14 @@ where
 
     fn prepare(&mut self, token_budget: usize) -> PrepareResult<DeviceRequest> {
         if self.status().is_terminal() {
-            return PrepareResult::Terminal;
+            return if self.in_flight_computes.is_empty() {
+                PrepareResult::Terminal
+            } else {
+                PrepareResult::Skip
+            };
+        }
+        if matches!(self.in_flight_computes.back(), Some(ComputePhase::Decode { .. })) {
+            return PrepareResult::Skip;
         }
         debug_assert_eq!(
             self.token_estimate().token_consumption(token_budget),
@@ -68,10 +79,19 @@ where
         while ready_token_slots < token_budget {
             ready_token_slots = match self.decoder_blocks.init_block_once() {
                 InitBlockOnceResult::ResourceLimitExceeded => {
-                    return PrepareResult::ResourceLimitExceeded;
+                    return if self.in_flight_computes.is_empty() {
+                        PrepareResult::ResourceLimitExceeded
+                    } else {
+                        PrepareResult::Skip
+                    };
                 },
                 InitBlockOnceResult::Await { wait } => {
-                    return PrepareResult::Await { wait };
+                    return if self.in_flight_computes.is_empty() {
+                        PrepareResult::Await { wait }
+                    } else {
+                        drop(wait);
+                        PrepareResult::Skip
+                    };
                 },
                 InitBlockOnceResult::Success { ready_token_slots } => ready_token_slots,
             }
@@ -84,10 +104,8 @@ where
                         <= self.context_window,
                     "request model input exceeds its context window"
                 );
-                let phase = match &decoder_query_tokens {
-                    QueryTokens::Prefill { .. } => PreparePhase::Prefill,
-                    QueryTokens::Decode { .. } => PreparePhase::Decode,
-                };
+                let compute_phase = compute_phase(&decoder_query_tokens);
+                self.in_flight_computes.push_back(compute_phase);
                 let decoder_sync_blocks = self.decoder_blocks.prepare_blocks();
                 let dev_req = DeviceRequest::new(
                     self.req_id(),
@@ -96,9 +114,9 @@ where
                     decoder_sync_blocks,
                     self.sampling_config().clone(),
                 );
-                PrepareResult::Continue { dev_req, phase }
+                PrepareResult::Continue { dev_req, compute_phase }
             },
-            None => PrepareResult::Pending,
+            None => PrepareResult::Skip,
         }
     }
 
@@ -112,13 +130,27 @@ where
         } = dev_req;
         assert_eq!(self.req_id(), req_id, "cancel response request ID mismatch");
         assert_eq!(self.req_slot(), req_slot, "cancel response request slot mismatch");
+        let cancelled_compute = self.in_flight_computes.pop_back();
+        debug_assert_eq!(
+            cancelled_compute,
+            Some(compute_phase(&decoder_query_tokens)),
+            "request cancellation must retire the latest compute"
+        );
 
         self.decoder_blocks.cancel_blocks(decoder_sync_blocks);
         self.decoder_blocks.cancel(decoder_query_tokens);
 
         if self.status().is_terminal() {
-            CancelResult::Terminal
+            if self.in_flight_computes.is_empty() {
+                CancelResult::Terminal
+            } else {
+                CancelResult::Pending
+            }
         } else {
+            debug_assert!(
+                !matches!(self.in_flight_computes.back(), Some(ComputePhase::Decode { .. })),
+                "cancelling the latest compute must not leave an in-flight Decode"
+            );
             CancelResult::Continue
         }
     }
@@ -130,6 +162,12 @@ where
             mut sampled_tokens,
         } = dev_resp;
         assert_eq!(self.req_id, req_id, "device response request ID mismatch");
+        let committed_compute = self.in_flight_computes.pop_front();
+        debug_assert_eq!(
+            committed_compute,
+            Some(compute_phase(&query_tokens)),
+            "request commit must retire the earliest compute"
+        );
         debug_assert!(self.decoder_blocks.num_sampled_tokens() < self.sampling_config().max_sampled_tokens);
         debug_assert!(self.decoder_blocks.num_total_tokens() < self.context_window);
         let remaining_sampled_tokens =
@@ -177,10 +215,33 @@ where
         }
 
         if self.status().is_terminal() {
-            CommitResult::Terminal
+            if self.in_flight_computes.is_empty() {
+                CommitResult::Terminal
+            } else {
+                CommitResult::Pending
+            }
+        } else if matches!(self.in_flight_computes.back(), Some(ComputePhase::Decode { .. })) {
+            CommitResult::Pending
         } else {
             CommitResult::Continue
         }
+    }
+}
+
+fn compute_phase(query_tokens: &QueryTokens) -> ComputePhase {
+    match query_tokens {
+        QueryTokens::Prefill { epoch, token_index, .. } => {
+            ComputePhase::Prefill {
+                epoch: *epoch,
+                token_index: *token_index,
+            }
+        },
+        QueryTokens::Decode { epoch, token_index, .. } => {
+            ComputePhase::Decode {
+                epoch: *epoch,
+                token_index: *token_index,
+            }
+        },
     }
 }
 

@@ -118,6 +118,7 @@ where
     }
 
     pub fn remove(&mut self, req_id: &RawRequestID) -> Option<UserReq> {
+        self.run_queue.remove(req_id);
         self.id_requests.remove(req_id)
     }
 

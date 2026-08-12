@@ -265,7 +265,7 @@ where
 
             Some(QueryTokens::Decode {
                 epoch: self.epoch,
-                token_index: token_index.unwrap_or(self.num_cached_tokens()),
+                token_index: token_index.unwrap_or(self.num_cached_tokens() + self.num_scheduled_tokens()),
                 tokens,
                 spec_tokens,
             })

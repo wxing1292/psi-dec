@@ -9,7 +9,7 @@ use crate::runtime::RawRequestID;
 use crate::runtime::scheduler::Batcher;
 use crate::runtime::scheduler::CancelResult;
 use crate::runtime::scheduler::CommitResult;
-use crate::runtime::scheduler::PreparePhase;
+use crate::runtime::scheduler::ComputePhase;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::ScheduleQueue;
 use crate::runtime::scheduler::UserRequest;
@@ -89,7 +89,7 @@ where
             }
             match user_req.prepare(token_estimate) {
                 PrepareResult::ResourceLimitExceeded => {
-                    if let Some(preempted_req) = schedule_queue.pop_back() {
+                    if let Some(preempted_req) = pop_preemption_candidate(schedule_queue) {
                         // TODO uninit and put to async queue
                         tracing::warn!(
                             target: "inference-runtime-core::scheduler",
@@ -126,11 +126,11 @@ where
                     }
                     continue 'prepare_loop;
                 },
-                PrepareResult::Pending => {
+                PrepareResult::Skip => {
                     sticky_token_budgets.remove(&req_id);
                     schedule_queue.insert(user_req);
                 },
-                PrepareResult::Continue { dev_req, phase } => {
+                PrepareResult::Continue { dev_req, compute_phase } => {
                     sticky_token_budgets.remove(&req_id);
                     let req_cost = dev_req.req_cost();
                     let token_cost = dev_req.token_cost();
@@ -148,9 +148,9 @@ where
                     );
                     req_budget -= req_cost;
                     token_budget -= token_cost;
-                    match phase {
-                        PreparePhase::Prefill => self.running_reqs.push(user_req),
-                        PreparePhase::Decode => schedule_queue.insert(user_req),
+                    match compute_phase {
+                        ComputePhase::Prefill { .. } => self.running_reqs.push(user_req),
+                        ComputePhase::Decode { .. } => schedule_queue.insert(user_req),
                     }
                     dev_reqs.push(dev_req);
                 },
@@ -176,6 +176,7 @@ where
                 .expect("fifo batch cancellation requires a matching request");
             match user_req.cancel(dev_req) {
                 CancelResult::Continue => schedule_queue.push_front(user_req),
+                CancelResult::Pending => schedule_queue.insert(user_req),
                 CancelResult::Terminal => { /* noop */ },
             }
         }
@@ -194,10 +195,38 @@ where
                 .expect("fifo batch commit requires a matching request");
             match user_req.commit(dev_resp) {
                 CommitResult::Continue => schedule_queue.push_front(user_req),
+                CommitResult::Pending => schedule_queue.insert(user_req),
                 CommitResult::Terminal => { /* noop */ },
             }
         }
     }
+}
+
+fn pop_preemption_candidate<UserReq, DeviceReq, DeviceResp>(
+    schedule_queue: &mut ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
+) -> Option<UserReq>
+where
+    UserReq: UserRequest<DeviceReq, DeviceResp>,
+    DeviceReq: DevReq,
+    DeviceResp: DevResp,
+{
+    let mut in_flight_reqs = Vec::new();
+    let candidate = loop {
+        match schedule_queue.pop_back() {
+            Some(user_req) => {
+                if user_req.num_in_flight_computes() == 0 {
+                    break Some(user_req);
+                } else {
+                    in_flight_reqs.push(user_req);
+                }
+            },
+            None => break None,
+        }
+    };
+    for user_req in in_flight_reqs.into_iter().rev() {
+        schedule_queue.push_back(user_req);
+    }
+    candidate
 }
 
 #[cfg(test)]
