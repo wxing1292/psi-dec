@@ -19,7 +19,8 @@ pub struct CacheLaneRuntimeConfig {
 pub struct RuntimeConfig {
     pub max_queued_requests: usize,
     pub max_running_requests: usize,
-    pub model_idle_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub context_window: usize,
 
     /// Logical token extent of one shared trie/GQA/GDN cache block.
     pub num_tokens_per_cache_block: usize,

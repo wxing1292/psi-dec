@@ -1,3 +1,5 @@
+use std::cmp::min;
+
 use crate::compute::DeviceRequest;
 use crate::compute::DeviceResponse;
 use crate::compute::QueryTokens;
@@ -77,6 +79,11 @@ where
 
         match self.decoder_blocks.prepare(token_budget) {
             Some(decoder_query_tokens) => {
+                debug_assert!(
+                    decoder_query_tokens.token_index() + decoder_query_tokens.token_consumption()
+                        <= self.context_window,
+                    "request model input exceeds its context window"
+                );
                 let phase = match &decoder_query_tokens {
                     QueryTokens::Prefill { .. } => PreparePhase::Prefill,
                     QueryTokens::Decode { .. } => PreparePhase::Decode,
@@ -120,18 +127,40 @@ where
         let DeviceResponse {
             req_id,
             query_tokens,
-            sampled_tokens,
+            mut sampled_tokens,
         } = dev_resp;
         assert_eq!(self.req_id, req_id, "device response request ID mismatch");
-        let remaining_visible_tokens = self
-            .sampling_config()
-            .max_sampled_tokens
-            .saturating_sub(self.decoder_blocks.num_sampled_tokens());
+        debug_assert!(self.decoder_blocks.num_sampled_tokens() < self.sampling_config().max_sampled_tokens);
+        debug_assert!(self.decoder_blocks.num_total_tokens() < self.context_window);
+        let remaining_sampled_tokens =
+            self.sampling_config().max_sampled_tokens - self.decoder_blocks.num_sampled_tokens();
+        let remaining_context_tokens = self.context_window - self.decoder_blocks.num_total_tokens();
+        let remaining_visible_tokens = min(remaining_sampled_tokens, remaining_context_tokens);
         let stop_match = self.match_stop_sequence(&sampled_tokens);
         let mut token_probs = stop_match.visible_token_probs(&sampled_tokens);
         if let Some(token_probs) = &mut token_probs {
             token_probs.tokens.truncate(remaining_visible_tokens);
             token_probs.probs.truncate(remaining_visible_tokens);
+        }
+        let num_validated_sampled_tokens = sampled_tokens.num_validated_sampled_tokens();
+        if let SampledTokens::Decode {
+            validated_tokens,
+            spec_tokens,
+            spec_probs,
+            spec_confidences,
+            ..
+        } = &mut sampled_tokens
+        {
+            debug_assert_eq!(
+                num_validated_sampled_tokens,
+                validated_tokens.len() + 1,
+                "decode responses must contain one final sampled token"
+            );
+            let num_total_tokens = self.decoder_blocks.num_total_tokens() + num_validated_sampled_tokens;
+            let max_spec_tokens = self.context_window - min(self.context_window, num_total_tokens);
+            spec_tokens.truncate(max_spec_tokens);
+            spec_probs.truncate(max_spec_tokens);
+            spec_confidences.truncate(max_spec_tokens);
         }
         self.decoder_blocks.commit(query_tokens, sampled_tokens);
         if let Some(token_probs) = token_probs
@@ -143,6 +172,8 @@ where
             self.store_completed(CompletionReason::StopSequence);
         } else if self.decoder_blocks.num_sampled_tokens() >= self.sampling_config().max_sampled_tokens {
             self.store_completed(CompletionReason::LengthLimit);
+        } else if self.decoder_blocks.num_total_tokens() >= self.context_window {
+            self.store_completed(CompletionReason::ContextLimit);
         }
 
         if self.status().is_terminal() {

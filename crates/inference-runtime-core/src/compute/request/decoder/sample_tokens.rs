@@ -26,4 +26,11 @@ impl SampledTokens {
             Self::Decode { epoch, .. } => *epoch,
         }
     }
+
+    pub fn num_validated_sampled_tokens(&self) -> usize {
+        match self {
+            Self::Prefill { .. } => 0,
+            Self::Decode { validated_tokens, .. } => validated_tokens.len() + 1,
+        }
+    }
 }

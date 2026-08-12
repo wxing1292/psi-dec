@@ -98,6 +98,12 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             model_runtime_config.max_running_requests > 0,
             "runtime requires running-request capacity"
         );
+        let min_initial_tokens = usize::max(1, L - 1);
+        assert!(
+            model_runtime_config.context_window > min_initial_tokens,
+            "runtime context window={} must exceed the minimum initial token count={min_initial_tokens}",
+            model_runtime_config.context_window
+        );
         assert!(
             scheduler_config.max_requests <= model_runtime_config.max_running_requests,
             "scheduler batch request capacity={} exceeds runtime running-request capacity={}",
@@ -173,7 +179,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                 model_executor_resp_rx,
                 scheduler,
                 req_slot_allocator,
-                model_runtime_config.model_idle_timeout,
+                model_runtime_config.idle_timeout,
                 shutdown.clone(),
             );
             let scheduler_shutdown = shutdown.clone();
@@ -219,18 +225,35 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
     pub fn initialize_req(
         &self,
         request_id: RawRequestID,
-        tokens: Vec<Token>,
+        history_tokens: Vec<Token>,
+        prompt_tokens: Vec<Token>,
+        sampled_tokens: Vec<Token>,
         sampling_config: SamplingConfig,
     ) -> Result<(RuntimeQueuedRequest<N, P, L>, ExternalRequest)> {
+        let num_initial_tokens = history_tokens.len() + prompt_tokens.len() + sampled_tokens.len();
         let min_initial_tokens = usize::max(1, L - 1);
-        if tokens.len() < min_initial_tokens {
+        if num_initial_tokens < min_initial_tokens {
             return Err(Error::invalid_argument(format!(
                 "decode request minimum initial token count is {min_initial_tokens} for {L} cache lanes, got {}",
-                tokens.len()
+                num_initial_tokens
+            )));
+        }
+        if num_initial_tokens >= self.model_runtime_config.context_window {
+            return Err(Error::invalid_argument(format!(
+                "decode request initial token count={num_initial_tokens} must be less than context window={}",
+                self.model_runtime_config.context_window
+            )));
+        }
+        if sampled_tokens.len() >= sampling_config.max_sampled_tokens {
+            return Err(Error::invalid_argument(format!(
+                "decode request initial sampled token count={} must be less than max_sampled_tokens={}",
+                sampled_tokens.len(),
+                sampling_config.max_sampled_tokens
             )));
         }
         let req_status = AtomicRequestStatus::new();
-        let decoder_kv_blocks = TrieDecoderBlocks::new(self.block_cache.clone(), [], tokens, []);
+        let decoder_kv_blocks =
+            TrieDecoderBlocks::new(self.block_cache.clone(), history_tokens, prompt_tokens, sampled_tokens);
         let (token_prob_tx, token_prob_rx) = async_unbounded();
         let queued_request = QueuedRequest::new(
             request_id,
@@ -238,6 +261,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             decoder_kv_blocks,
             token_prob_tx,
             sampling_config,
+            self.model_runtime_config.context_window,
         );
         let external_request = ExternalRequest::new(request_id, req_status, token_prob_rx);
         Ok((queued_request, external_request))
@@ -374,20 +398,38 @@ fn default_model_state_snapshot_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use inference_runtime_core::Error;
     use inference_runtime_core::channel::Shutdown;
+    use inference_runtime_core::compute::BatchDeviceResponse;
+    use inference_runtime_core::compute::DeviceResponse;
+    use inference_runtime_core::compute::QueryTokens;
     use inference_runtime_core::compute::ReplayableModelExecutorRequest;
     use inference_runtime_core::compute::ReplayableModelExecutorResponse;
+    use inference_runtime_core::compute::SampledTokens;
     use inference_runtime_core::config::CacheLaneRuntimeConfig;
     use inference_runtime_core::config::DEFAULT_MODEL_IDLE_TIMEOUT;
     use inference_runtime_core::config::RuntimeConfig;
     use inference_runtime_core::config::SamplingConfig;
     use inference_runtime_core::config::SchedulerConfig;
+    use inference_runtime_core::runtime::CompletionReason;
+    use inference_runtime_core::runtime::RequestSlotAllocationResult;
+    use inference_runtime_core::runtime::RequestSlotAllocator;
+    use inference_runtime_core::runtime::RequestStatus;
     use inference_runtime_core::runtime::Token;
+    use inference_runtime_core::runtime::scheduler::CommitResult;
+    use inference_runtime_core::runtime::scheduler::PreparePhase;
+    use inference_runtime_core::runtime::scheduler::PrepareResult;
+    use inference_runtime_core::runtime::scheduler::UserRequest;
+    use ordered_float::NotNan;
+    use tokio_stream::StreamExt;
 
     use super::InferenceRuntime;
+    use crate::api::Inference;
+    use crate::api::decode::DecodeEvent;
+    use crate::api::decode::DecodeRequest;
 
     #[test]
     fn test_runtime_accepts_a_logical_cache_block_larger_than_one_physical_kv_page() {
@@ -396,7 +438,8 @@ mod tests {
         let runtime_config = RuntimeConfig {
             max_queued_requests: 1,
             max_running_requests: 1,
-            model_idle_timeout: DEFAULT_MODEL_IDLE_TIMEOUT,
+            idle_timeout: DEFAULT_MODEL_IDLE_TIMEOUT,
+            context_window: 4096,
             num_tokens_per_cache_block: 1024,
             num_kv_heads: 1,
             kv_head_dim: 1,
@@ -431,25 +474,182 @@ mod tests {
     fn test_runtime_validates_initial_tokens_for_cache_lanes() {
         let (single_lane, single_lane_shutdown, _single_lane_async_runtime) = test_runtime::<1>();
         assert!(matches!(
-            single_lane.initialize_req(1, Vec::new(), SamplingConfig::default()),
+            single_lane.initialize_req(1, Vec::new(), Vec::new(), Vec::new(), SamplingConfig::default()),
             Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 1")
         ));
         single_lane_shutdown.shutdown();
 
         let (mtp, mtp_shutdown, _mtp_async_runtime) = test_runtime::<4>();
         assert!(matches!(
-            mtp.initialize_req(1, vec![Token::new(1), Token::new(2)], SamplingConfig::default()),
+            mtp.initialize_req(
+                1,
+                Vec::new(),
+                vec![Token::new(1), Token::new(2)],
+                Vec::new(),
+                SamplingConfig::default(),
+            ),
             Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 3")
         ));
         assert!(
             mtp.initialize_req(
                 2,
+                Vec::new(),
                 vec![Token::new(1), Token::new(2), Token::new(3)],
+                Vec::new(),
                 SamplingConfig::default(),
             )
             .is_ok()
         );
         mtp_shutdown.shutdown();
+    }
+
+    #[test]
+    fn test_runtime_rejects_initial_tokens_without_output_capacity() {
+        let (runtime, shutdown, _async_runtime) = test_runtime_with_context::<1>(4);
+        let sampling = SamplingConfig {
+            max_sampled_tokens: 2,
+            ..SamplingConfig::default()
+        };
+        assert!(matches!(
+            runtime.initialize_req(
+                1,
+                vec![Token::new(1)],
+                vec![Token::new(2), Token::new(3)],
+                vec![Token::new(4)],
+                sampling,
+            ),
+            Err(Error::InvalidArgument(message))
+                if message.contains("initial token count=4") && message.contains("context window=4")
+        ));
+        shutdown.shutdown();
+    }
+
+    #[test]
+    fn test_runtime_rejects_exhausted_initial_sampled_limit() {
+        let (runtime, shutdown, _async_runtime) = test_runtime_with_context::<1>(4);
+        let sampling = SamplingConfig {
+            max_sampled_tokens: 2,
+            ..SamplingConfig::default()
+        };
+        assert!(matches!(
+            runtime.initialize_req(
+                1,
+                Vec::new(),
+                vec![Token::new(1)],
+                vec![Token::new(2), Token::new(3)],
+                sampling,
+            ),
+            Err(Error::InvalidArgument(message))
+                if message.contains("initial sampled token count=2")
+                    && message.contains("max_sampled_tokens=2")
+        ));
+        shutdown.shutdown();
+    }
+
+    #[test]
+    fn test_commit_trims_spec_input_and_context_visible_output() {
+        let (runtime, shutdown, _async_runtime) = test_runtime_with_context::<1>(4);
+        let sampling = SamplingConfig {
+            max_sampled_tokens: 8,
+            ..SamplingConfig::default()
+        };
+        let (queued_request, external_request) = runtime
+            .initialize_req(1, Vec::new(), vec![Token::new(1), Token::new(2)], Vec::new(), sampling)
+            .unwrap();
+        let (request_slot_allocator, _request_slot_reset_rx) = RequestSlotAllocator::new(1);
+        let request_slot = match request_slot_allocator.allocate() {
+            RequestSlotAllocationResult::Ok { request_slot } => request_slot,
+            RequestSlotAllocationResult::ResourceLimitExceeded => panic!("test request slot should allocate"),
+        };
+        let mut request = super::RuntimeRequest::from((queued_request, request_slot));
+        assert!(request.store_running());
+
+        let first_query = prepare_decode(&mut request, 2);
+        assert!(matches!(
+            request.commit(decode_response(1, first_query, &[], 3, &[4, 5, 6])),
+            CommitResult::Continue
+        ));
+        let first_visible = external_request.token_prob_rx().try_recv().unwrap();
+
+        let second_query = prepare_decode(&mut request, 2);
+        let QueryTokens::Decode { spec_tokens, .. } = &second_query else {
+            panic!("test request should prepare Decode")
+        };
+        assert_eq!(spec_tokens, &[Token::new(4)]);
+        assert!(matches!(
+            request.commit(decode_response(1, second_query, &[4], 5, &[6, 7, 8])),
+            CommitResult::Terminal
+        ));
+        let second_visible = external_request.token_prob_rx().try_recv().unwrap();
+        assert_eq!(
+            [first_visible.tokens, second_visible.tokens].concat(),
+            vec![Token::new(3), Token::new(4)]
+        );
+        assert_eq!(
+            external_request.status(),
+            RequestStatus::Completed(CompletionReason::ContextLimit)
+        );
+        shutdown.shutdown();
+    }
+
+    #[test]
+    fn test_commit_completion_priority_for_tied_limits() {
+        assert_eq!(
+            single_decode_completion(1, vec![vec![Token::new(4)]]),
+            CompletionReason::StopSequence
+        );
+        assert_eq!(single_decode_completion(1, Vec::new()), CompletionReason::LengthLimit);
+    }
+
+    #[test]
+    fn test_decode_completes_at_context_window_through_runtime_event_loop() {
+        let (runtime, shutdown, async_runtime) = test_runtime_with_context::<1>(4);
+        let runtime = Arc::new(runtime);
+        let inference = Inference::new(runtime.clone(), Vec::new());
+        let sampling = SamplingConfig {
+            max_sampled_tokens: 8,
+            ..SamplingConfig::default()
+        };
+        let mut response = Box::pin(
+            inference
+                .decode(DecodeRequest::new(vec![Token::new(1), Token::new(2), Token::new(3)], sampling).unwrap())
+                .unwrap(),
+        );
+
+        let ReplayableModelExecutorRequest::Batch(batch_request) = runtime
+            .model_executor_request_rx()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+        else {
+            panic!("runtime should submit a device batch")
+        };
+        let mut dev_reqs = batch_request.dev_reqs;
+        assert_eq!(dev_reqs.len(), 1);
+        let dev_req = dev_reqs.pop().unwrap();
+        let dev_resp = decode_response(dev_req.req_id, dev_req.decoder_query_tokens, &[], 4, &[]);
+        runtime
+            .model_executor_response_tx()
+            .send(ReplayableModelExecutorResponse::Batch(BatchDeviceResponse::new(
+                batch_request.seq,
+                [dev_resp],
+            )))
+            .unwrap();
+
+        async_runtime.block_on(async {
+            let DecodeEvent::TokenProbs(token_probs) = response.next().await.unwrap().unwrap() else {
+                panic!("decode response should contain the sampled token")
+            };
+            assert_eq!(token_probs.tokens, vec![Token::new(4)]);
+            assert!(matches!(
+                response.next().await.unwrap().unwrap(),
+                DecodeEvent::Completed {
+                    reason: CompletionReason::ContextLimit,
+                    num_output_tokens: 1,
+                }
+            ));
+            assert!(response.next().await.is_none());
+        });
+        shutdown.shutdown();
     }
 
     #[test]
@@ -465,7 +665,13 @@ mod tests {
         response_tx.send(ReplayableModelExecutorResponse::Stopped).unwrap();
 
         let (queued_request, _external_request) = runtime
-            .initialize_req(1, vec![Token::new(1)], SamplingConfig::default())
+            .initialize_req(
+                1,
+                Vec::new(),
+                vec![Token::new(1)],
+                Vec::new(),
+                SamplingConfig::default(),
+            )
             .unwrap();
         runtime.submit_req(queued_request).unwrap();
         assert!(matches!(
@@ -489,8 +695,21 @@ mod tests {
         test_runtime_with_idle_timeout(DEFAULT_MODEL_IDLE_TIMEOUT)
     }
 
+    fn test_runtime_with_context<const L: usize>(
+        context_window: usize,
+    ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
+        test_runtime_with_config(context_window, DEFAULT_MODEL_IDLE_TIMEOUT)
+    }
+
     fn test_runtime_with_idle_timeout<const L: usize>(
-        model_idle_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
+        test_runtime_with_config(4096, idle_timeout)
+    }
+
+    fn test_runtime_with_config<const L: usize>(
+        context_window: usize,
+        idle_timeout: Duration,
     ) -> (InferenceRuntime<1024, L, 4>, Shutdown, tokio::runtime::Runtime) {
         let shutdown = Shutdown::new();
         let async_runtime = tokio::runtime::Runtime::new().expect("test Tokio runtime should initialize");
@@ -498,7 +717,8 @@ mod tests {
             RuntimeConfig {
                 max_queued_requests: 1,
                 max_running_requests: 1,
-                model_idle_timeout,
+                idle_timeout,
+                context_window,
                 num_tokens_per_cache_block: 1024,
                 num_kv_heads: 1,
                 kv_head_dim: 1,
@@ -517,13 +737,82 @@ mod tests {
             },
             SchedulerConfig {
                 max_requests: 1,
-                max_tokens: usize::max(1, L - 1),
-                max_tokens_per_request: usize::max(1, L - 1),
+                max_tokens: 1024,
+                max_tokens_per_request: 1024,
                 max_compute_slots: 1,
             },
             shutdown.clone(),
             async_runtime.handle(),
         );
         (runtime, shutdown, async_runtime)
+    }
+
+    fn prepare_decode(request: &mut super::RuntimeRequest<1024, 4, 1>, token_budget: usize) -> QueryTokens {
+        match request.prepare(token_budget) {
+            PrepareResult::Continue {
+                dev_req,
+                phase: PreparePhase::Decode,
+            } => dev_req.decoder_query_tokens,
+            _ => panic!("test request should prepare Decode"),
+        }
+    }
+
+    fn single_decode_completion(max_sampled_tokens: usize, stop_sequences: Vec<Vec<Token>>) -> CompletionReason {
+        let (runtime, shutdown, _async_runtime) = test_runtime_with_context::<1>(4);
+        let sampling = SamplingConfig {
+            max_sampled_tokens,
+            stop_sequences,
+            ..SamplingConfig::default()
+        };
+        let (queued_request, external_request) = runtime
+            .initialize_req(
+                1,
+                Vec::new(),
+                vec![Token::new(1), Token::new(2), Token::new(3)],
+                Vec::new(),
+                sampling,
+            )
+            .unwrap();
+        let (request_slot_allocator, _request_slot_reset_rx) = RequestSlotAllocator::new(1);
+        let request_slot = match request_slot_allocator.allocate() {
+            RequestSlotAllocationResult::Ok { request_slot } => request_slot,
+            RequestSlotAllocationResult::ResourceLimitExceeded => panic!("test request slot should allocate"),
+        };
+        let mut request = super::RuntimeRequest::from((queued_request, request_slot));
+        assert!(request.store_running());
+        let query_tokens = prepare_decode(&mut request, 3);
+        assert!(matches!(
+            request.commit(decode_response(1, query_tokens, &[], 4, &[])),
+            CommitResult::Terminal
+        ));
+        let RequestStatus::Completed(completion) = external_request.status() else {
+            panic!("test request should complete")
+        };
+        shutdown.shutdown();
+        completion
+    }
+
+    fn decode_response(
+        req_id: usize,
+        query_tokens: QueryTokens,
+        validated_tokens: &[u32],
+        sampled_token: u32,
+        spec_tokens: &[u32],
+    ) -> DeviceResponse {
+        let probability = NotNan::new(1.0).unwrap();
+        DeviceResponse {
+            req_id,
+            sampled_tokens: SampledTokens::Decode {
+                epoch: query_tokens.epoch(),
+                validated_tokens: validated_tokens.iter().copied().map(Token::new).collect(),
+                validated_probs: vec![probability; validated_tokens.len()],
+                sampled_token: Token::new(sampled_token),
+                sampled_prob: probability,
+                spec_tokens: spec_tokens.iter().copied().map(Token::new).collect(),
+                spec_probs: vec![probability; spec_tokens.len()],
+                spec_confidences: vec![probability; spec_tokens.len()],
+            },
+            query_tokens,
+        }
     }
 }

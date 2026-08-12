@@ -17,6 +17,7 @@ use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::config::Qwen3Config;
 use crate::qwen_server::config::Qwen3ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
+use crate::qwen_server::sizing::context_window;
 use crate::runtime::serve_replay_model;
 use crate::telemetry::CacheLaneLogSummary;
 use crate::telemetry::StartupLogger;
@@ -117,6 +118,7 @@ fn run_inner() -> Result<()> {
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
         max_queued_requests,
         max_running_requests,
+        context_window = runtime_config.context_window,
         max_batch_requests = scheduler_config.max_requests,
         max_tokens = scheduler_config.max_tokens,
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
@@ -146,6 +148,10 @@ fn build_runtime_config(
     let text = &model_config.text_config;
     let num_pages_per_kv_block = model.num_kv_page_ids_per_block();
     let cache_lane = main_cache_lane(num_cache_pages, num_pages_per_kv_block)?;
+    let dspark_num_spec_tokens = match service_config.model_mode() {
+        Qwen3ModelMode::Vanilla => 0,
+        Qwen3ModelMode::DSpark { .. } => model.num_spec_tokens(),
+    };
     startup.cache_lane_config(CacheLaneLogSummary {
         cache_lane: 0,
         mtp: false,
@@ -156,7 +162,8 @@ fn build_runtime_config(
     Ok(RuntimeConfig {
         max_queued_requests: service_config.max_queued_requests(),
         max_running_requests: service_config.max_running_requests(),
-        model_idle_timeout: service_config.model_idle_timeout(),
+        idle_timeout: service_config.model_idle_timeout(),
+        context_window: context_window(text.max_position_embeddings, dspark_num_spec_tokens)?,
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
         num_kv_heads: text.num_key_value_heads,
         kv_head_dim: text.head_dim,

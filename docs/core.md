@@ -155,6 +155,10 @@ Request admission requires at least `max(1, L - 1)` initial input tokens. This r
 its required initial token. The runtime returns `InvalidArgument` before it constructs Trie blocks when the request is
 too short.
 
+`RuntimeConfig::context_window` is the effective model-input token limit. Request initialization validates
+`history.len() + prompt.len() + sampled.len() < context_window` before it constructs Trie blocks. It also requires the
+initial sampled-token count to be less than `max_sampled_tokens`.
+
 A queued request owns no request slot. The synchronous event loop registers the user-request receiver only when the
 request-slot allocator reports free capacity.
 
@@ -388,13 +392,10 @@ The successful status records one of these completion reasons:
 
 - `CompletionReason::StopSequence` when the stop matcher observed a match
 - `LengthLimit` when caller-visible output reaches its limit
-- `ContextLimit` when a future context window reaches its limit
+- `ContextLimit` when caller-visible output reaches the effective context window
 
-The current runtime produces the first two reasons. [`future_work.md`](future_work.md) tracks context-window
-enforcement.
-
-A stop match wins when both current conditions occur on the same commit. Service layers map the recorded reason. They
-must not infer it from the emitted token count.
+A stop match wins when multiple completion conditions occur on the same commit. `LengthLimit` wins a tie with
+`ContextLimit`. Service layers map the recorded reason. They must not infer it from the emitted token count.
 
 Model executors may provide model-specific default stop sequences, such as Qwen
 EOS token IDs. The service merges caller-provided token sequences with model
@@ -411,12 +412,17 @@ Dropping that response causes three actions:
 
 Slow-consumer memory accounting and a bounded request-local cancellation policy remain future work.
 
-`max_sampled_tokens` is a caller-visible output limit. A speculative step can
-commit more sampled tokens to decoder and cache state than the caller's remaining
-budget.
+`max_sampled_tokens` and `context_window` are caller-visible output limits. A speculative step can commit more sampled
+tokens to decoder state than the caller's remaining budget.
 
 Core truncates only the `TokenProbs` sent to the caller. It leaves the sampled-token commit unchanged and marks the
-request completed. Request drop then releases its decoder and cache ownership.
+request completed. Tokens that entered cache were valid model inputs inside `context_window`. The final sampled token
+can remain in a terminal request's queued-token state beyond the caller-visible context boundary. It does not enter
+cache or another model input. Request drop then releases its decoder and cache ownership.
+
+If the request continues, commit truncates the next speculative token, probability, and confidence vectors to the
+remaining model-input extent. `InternalRequest::prepare` asserts that the resulting model-input extent does not exceed
+`context_window`.
 
 Request-slot drop adds its slot to a deduplicated reset set. It does this before it returns the slot to the allocator.
 

@@ -82,7 +82,7 @@ pub fn summarize_batch_device_response(batch: &BatchDeviceResponse) -> BatchResp
         } = &response.sampled_tokens
         {
             summary.accepted_spec_tokens += validated_tokens.len();
-            summary.sampled_tokens += validated_tokens.len() + 1;
+            summary.sampled_tokens += response.sampled_tokens.num_validated_sampled_tokens();
             summary.output_spec_tokens += spec_tokens.len();
         }
     }

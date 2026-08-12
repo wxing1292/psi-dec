@@ -20,12 +20,6 @@ document that owns the component.
 
 ## Runtime Lifecycle
 
-- Enforce each model's context window in the shared request lifecycle.
-  Thread the model limit through admission and decode commit.
-  Reject prompts that leave no output capacity.
-  Produce the reserved `CompletionReason::ContextLimit`.
-  Map this reason to each RPC protocol.
-  Do not infer the reason from emitted token counts.
 - Make trie and request cache-block extent runtime-dynamic before offering arbitrary Qwen cache-block CLI values.
   The extent is currently a const generic.
   Runtime, request, trie block, cache, and RPC service types share this generic.

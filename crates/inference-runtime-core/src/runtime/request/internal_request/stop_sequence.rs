@@ -23,7 +23,7 @@ impl<'a> StopSequences<'a> {
     where
         I: Iterator<Item = Token> + Clone,
     {
-        let suffix_len = suffix_len(sampled_tokens);
+        let suffix_len = sampled_tokens.num_validated_sampled_tokens();
         if suffix_len == 0 {
             return StopSequenceMatch::no_match(0);
         }
@@ -77,7 +77,7 @@ impl StopSequenceMatch {
             "validated token and probability counts must match"
         );
 
-        let num_suffix_tokens = validated_tokens.len() + 1;
+        let num_suffix_tokens = sampled_tokens.num_validated_sampled_tokens();
         debug_assert!(
             self.num_visible_tokens <= num_suffix_tokens,
             "visible decode tokens must be a prefix of committed decode tokens"
@@ -110,13 +110,6 @@ fn suffix_tokens(sampled_tokens: &SampledTokens) -> impl Iterator<Item = Token> 
         SampledTokens::Prefill { .. } => (&[][..], None),
     };
     validated_tokens.iter().copied().chain(sampled_token)
-}
-
-fn suffix_len(sampled_tokens: &SampledTokens) -> usize {
-    match sampled_tokens {
-        SampledTokens::Decode { validated_tokens, .. } => validated_tokens.len() + 1,
-        SampledTokens::Prefill { .. } => 0,
-    }
 }
 
 #[cfg(test)]

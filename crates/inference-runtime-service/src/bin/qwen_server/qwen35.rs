@@ -22,6 +22,7 @@ use crate::qwen_server::args::Qwen35Args;
 use crate::qwen_server::config::Qwen35Config;
 use crate::qwen_server::config::Qwen35ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
+use crate::qwen_server::sizing::context_window;
 use crate::qwen_server::sizing::kv_dtype_bytes;
 use crate::runtime::serve_replay_model;
 use crate::specialization::SpecializedWorker;
@@ -147,6 +148,8 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
     )?;
     startup.event("model executor initialized");
 
+    let runtime_config = build_runtime_config(&startup, &config, &model_config, &model)?;
+
     tracing::info!(
         target: "inference-runtime-service::startup",
         component = kind.label(),
@@ -157,14 +160,13 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
         max_queued_requests,
         max_running_requests,
+        context_window = runtime_config.context_window,
         max_batch_requests = scheduler_config.max_requests,
         max_tokens = scheduler_config.max_tokens,
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
         model_idle_timeout_secs = config.model_idle_timeout().as_secs(),
         "qwen3.5 Spec/cache configuration"
     );
-
-    let runtime_config = build_runtime_config(&startup, &config, &model_config, &model)?;
 
     startup.event("initializing runtime");
     serve_replay_model::<TOKENS_PER_CACHE_BLOCK, L, _>(
@@ -277,10 +279,15 @@ fn build_runtime_config(
             block_cache_capacity,
         });
     }
+    let dspark_num_spec_tokens = match service_config.model_mode() {
+        Qwen35ModelMode::DSpark { .. } => model.num_spec_tokens(),
+        Qwen35ModelMode::Vanilla | Qwen35ModelMode::MTP { .. } => 0,
+    };
     let runtime_config = RuntimeConfig {
         max_queued_requests: service_config.max_queued_requests(),
         max_running_requests: service_config.max_running_requests(),
-        model_idle_timeout: service_config.model_idle_timeout(),
+        idle_timeout: service_config.model_idle_timeout(),
+        context_window: context_window(text.max_position_embeddings, dspark_num_spec_tokens)?,
         num_tokens_per_cache_block: TOKENS_PER_CACHE_BLOCK,
         num_kv_heads: text.num_key_value_heads,
         kv_head_dim: text.head_dim,

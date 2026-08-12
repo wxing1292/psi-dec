@@ -330,6 +330,10 @@ At startup, each service derives the page count for one block from the initializ
 `--num-cache-pages` when one complete block cannot fit.
 The service classifies a model-executor initialization failure as an internal startup error.
 
+The service also derives the runtime `context_window` from the Main model's `max_position_embeddings`. Vanilla and MTP
+use the Main value. DSpark subtracts its actual `num_spec_tokens` because the DSpark GQA block applies RoPE to the Main
+sampled anchor and the complete proposal block. Startup configuration logs include the effective `context_window`.
+
 The rejection reports this dynamic minimum.
 
 Recommendation: For performance comparisons, pass `--num-cache-pages` explicitly. This setting controls memory
@@ -396,7 +400,7 @@ Each response has one of these forms:
 - A `chunk` with equal, non-empty token and probability arrays
 - One `completion` event
 
-Completion reasons are `STOP_SEQUENCE`, `LENGTH_LIMIT`, and the reserved `CONTEXT_LIMIT`. EOF without a completion event
+Completion reasons are `STOP_SEQUENCE`, `LENGTH_LIMIT`, and `CONTEXT_LIMIT`. EOF without a completion event
 means that the stream failed.
 
 The external diagnostic client remains a gRPC client:

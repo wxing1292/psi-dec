@@ -28,6 +28,7 @@ where
     token_prob_tx: Sender<TokenProbs>,
 
     sampling_config: SamplingConfig,
+    context_window: usize,
 }
 
 impl<const N: usize, const P: usize, const L: usize, DBC> InternalRequest<N, P, L, DBC>
@@ -41,6 +42,7 @@ where
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
+        context_window: usize,
     ) -> Self {
         Self {
             req_id,
@@ -49,6 +51,7 @@ where
             decoder_blocks,
             token_prob_tx,
             sampling_config,
+            context_window,
         }
     }
 
