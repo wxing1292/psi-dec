@@ -390,10 +390,7 @@ fn default_model_state_snapshot_path() -> PathBuf {
     static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(0);
 
     let snapshot_id = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "psi-dec-model-state-{}-{snapshot_id}.state",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("psi-dec-model-state-{}-{snapshot_id}", std::process::id()))
 }
 
 #[cfg(test)]

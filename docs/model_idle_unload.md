@@ -109,15 +109,16 @@ The durable GDN request state table contains these values:
 The snapshot does not store submitted restore jobs, submitted publish jobs, or current batch transactions.
 The model must finish or clear this transient work before it writes the snapshot.
 
-The snapshot header contains a magic value, schema version, process-local model fingerprint, section count, and checksum.
-Each section contains a resource ID, byte length, and payload checksum.
-The writer syncs a temporary file before it publishes the snapshot with an atomic rename.
+The snapshot is one directory with a `manifest` file and one file for each semantic state item.
+The manifest contains a magic value, schema version, file kind, and exact byte length.
+The manifest and durable GDN request-state table use native-endian `wincode` metadata.
+The GDN path serializes `GDNRequestSlots` directly. It does not use a snapshot DTO.
+Metal buffer resources use uncached `BufferIO` without an application staging buffer.
+The writer syncs all state files and the manifest before it publishes the directory with an atomic rename.
+It then syncs the parent directory.
 
-The first implementation uses bounded CPU staging buffers.
-Future state I/O may use mapped storage or aligned direct I/O.
-It must preserve complete validation, atomic publication, and synchronous model APIs.
-
-Future selective I/O may add symmetric `write_state` and `read_state` operations.
+The current full-state components use symmetric `write_full_state` and `read_full_state` operations through
+`FullStateIO`. Future selective I/O must define a separate symmetric selection contract.
 Its metadata must identify each resource, page, request, layer, and state slot.
 
 ## Ownership boundary
@@ -239,11 +240,8 @@ Lifecycle misuse is an internal invariant violation.
 The event-loop wiring fails closed after these errors:
 
 - Snapshot write failure.
-- Snapshot corruption.
-- Snapshot schema mismatch.
-- Model fingerprint mismatch.
+- Snapshot read failure.
 - Weight load failure.
-- State load failure.
 
 The current failure path invokes global shutdown and does not send a success response.
 Process shutdown discards the full runtime cache metadata.
@@ -251,19 +249,24 @@ The service must not continue with runtime page IDs that refer to invalid execut
 
 ## Integration verification
 
-The ignored model residency integration tests cover this sequence:
+The ignored model state I/O integration tests cover this sequence:
 
 ```text
-hash(state + weights)
+decode
   -> clear_replay_cache
-  -> unload_state
+  -> unload_state(first snapshot)
   -> unload_weights
   -> load_weights
-  -> load_state
-  -> hash(state + weights)
+  -> load_state(first snapshot)
+  -> unload_state(second snapshot)
+  -> compare snapshot file sets and bytes
+  -> load_state(second snapshot)
+  -> reset request slot
+  -> decode
 ```
 
-The digests must be equal.
+The two semantic snapshot directories must be byte-for-byte equal.
+The final decode verifies the reloaded checkpoint weights and the second state restore.
 The test matrix contains Qwen3.6 27B and 35B with MTP and DSpark.
 Each test requires the matching Main and speculative checkpoint environment variables.
 
@@ -271,5 +274,5 @@ Run the matrix with this command:
 
 ```sh
 cargo test --release -p inference-executor-metal \
-  --test model_residency_round_trip -- --ignored --nocapture
+  --test model_state_io -- --ignored --nocapture
 ```

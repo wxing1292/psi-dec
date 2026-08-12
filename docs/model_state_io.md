@@ -14,7 +14,7 @@ The repository has two model-state I/O projects.
 
 | Project | Workstream | Status |
 | --- | --- | --- |
-| Whole-model residency | Full-state Stop/Start | v2 executor state I/O implemented; event-loop cutover pending |
+| Whole-model residency | Full-state Stop/Start | Implemented with the v2 directory snapshot path |
 | Whole-model residency | Selected-state Stop/Start | Planned |
 | Request and cache mobility | Per-request swap | Planned |
 | Request and cache mobility | Trie cache-block I/O | Planned |
@@ -388,7 +388,7 @@ It must not publish a partial placement change.
 
 1. Measure standalone `BufferIO` file-to-buffer and buffer-to-file throughput. Complete.
 2. Add the v2 semantic-resource directory snapshot. Complete.
-3. Migrate full-state Stop/Start from v1 staging to `BufferIO`.
+3. Migrate full-state Stop/Start from v1 staging to `BufferIO`. Complete.
 4. Measure full-state snapshot throughput and peak memory with production model layouts.
 5. Add `ModelStateScope` to the existing `Stop` and `Start` protocol variants.
 6. Add per-request swap at the scheduler commit boundary.

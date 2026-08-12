@@ -18,18 +18,18 @@ use inference_runtime_core::compute::DeviceRequest;
 use inference_runtime_core::compute::QueryTokens;
 use inference_runtime_core::runtime::Token;
 
-const MODEL_27B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_27B_MODEL_DIR";
-const MTP_27B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_27B_MTP_MODEL_DIR";
-const DSPARK_27B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_27B_DSPARK_MODEL_DIR";
-const MODEL_35B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_35B_MODEL_DIR";
-const MTP_35B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_35B_MTP_MODEL_DIR";
-const DSPARK_35B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_35B_DSPARK_MODEL_DIR";
+const MODEL_27B_DIR_ENV: &str = "PSI_DEC_MODEL_STATE_IO_TEST_27B_MODEL_DIR";
+const MTP_27B_DIR_ENV: &str = "PSI_DEC_MODEL_STATE_IO_TEST_27B_MTP_MODEL_DIR";
+const DSPARK_27B_DIR_ENV: &str = "PSI_DEC_MODEL_STATE_IO_TEST_27B_DSPARK_MODEL_DIR";
+const MODEL_35B_DIR_ENV: &str = "PSI_DEC_MODEL_STATE_IO_TEST_35B_MODEL_DIR";
+const MTP_35B_DIR_ENV: &str = "PSI_DEC_MODEL_STATE_IO_TEST_35B_MTP_MODEL_DIR";
+const DSPARK_35B_DIR_ENV: &str = "PSI_DEC_MODEL_STATE_IO_TEST_35B_DSPARK_MODEL_DIR";
 const NUM_CACHE_PAGES: usize = 1024;
 const SNAPSHOT_COMPARE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 #[test]
 #[ignore = "requires Qwen3.6 27B Main and MTP checkpoints and substantial unified memory"]
-fn model_residency_27b_mtp_round_trip() {
+fn model_state_io_27b_mtp_round_trip() {
     let model = init_qwen_3_5_model_with_mtp(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(MTP_27B_DIR_ENV),
@@ -37,12 +37,12 @@ fn model_residency_27b_mtp_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 27B with MTP must initialize");
-    run_residency_round_trip(model);
+    run_model_state_io_round_trip(model);
 }
 
 #[test]
 #[ignore = "requires Qwen3.6 27B Main and DSpark checkpoints and substantial unified memory"]
-fn model_residency_27b_dspark_round_trip() {
+fn model_state_io_27b_dspark_round_trip() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(DSPARK_27B_DIR_ENV),
@@ -50,12 +50,12 @@ fn model_residency_27b_dspark_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 27B with DSpark must initialize");
-    run_residency_round_trip(model);
+    run_model_state_io_round_trip(model);
 }
 
 #[test]
 #[ignore = "requires Qwen3.6 35B Main and MTP checkpoints and substantial unified memory"]
-fn model_residency_35b_mtp_round_trip() {
+fn model_state_io_35b_mtp_round_trip() {
     let model = init_qwen_3_5_model_with_mtp(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(MTP_35B_DIR_ENV),
@@ -63,12 +63,12 @@ fn model_residency_35b_mtp_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 35B with MTP must initialize");
-    run_residency_round_trip(model);
+    run_model_state_io_round_trip(model);
 }
 
 #[test]
 #[ignore = "requires Qwen3.6 35B Main and DSpark checkpoints and substantial unified memory"]
-fn model_residency_35b_dspark_round_trip() {
+fn model_state_io_35b_dspark_round_trip() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(DSPARK_35B_DIR_ENV),
@@ -76,7 +76,7 @@ fn model_residency_35b_dspark_round_trip() {
         executor_config(),
     )
     .expect("Qwen3.6 35B with DSpark must initialize");
-    run_residency_round_trip(model);
+    run_model_state_io_round_trip(model);
 }
 
 fn model_dir(variable: &str) -> PathBuf {
@@ -99,10 +99,10 @@ fn executor_config() -> Qwen35ExecutorConfig {
     }
 }
 
-fn run_residency_round_trip(mut model: inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor) {
+fn run_model_state_io_round_trip(mut model: inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor) {
     run_one_decode(&mut model);
     let temp_dir = std::env::temp_dir().join(format!(
-        "psi-dec-model-residency-round-trip-{}-{}",
+        "psi-dec-model-state-io-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

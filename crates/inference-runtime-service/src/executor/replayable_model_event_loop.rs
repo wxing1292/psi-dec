@@ -255,7 +255,13 @@ where
     }
 
     fn remove_state_snapshot(&self) {
-        match std::fs::remove_file(&self.state_snapshot_path) {
+        let result = match std::fs::symlink_metadata(&self.state_snapshot_path) {
+            Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(&self.state_snapshot_path),
+            Ok(_) => std::fs::remove_file(&self.state_snapshot_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(()) => {},
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
             Err(error) => {
@@ -622,7 +628,8 @@ mod tests {
         fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
             assert!(self.weights_loaded);
             assert!(self.state_loaded);
-            std::fs::write(snapshot_path, b"test model state")
+            std::fs::create_dir(snapshot_path)
+                .and_then(|()| std::fs::write(snapshot_path.join("state"), b"test model state"))
                 .map_err(|error| ModelExecutorError::custom(error.to_string()))?;
             self.state_loaded = false;
             self.event_tx.send(ModelEvent::UnloadState).unwrap();
@@ -647,7 +654,8 @@ mod tests {
         fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
             assert!(self.weights_loaded);
             assert!(!self.state_loaded);
-            let state = std::fs::read(snapshot_path).map_err(|error| ModelExecutorError::custom(error.to_string()))?;
+            let state = std::fs::read(snapshot_path.join("state"))
+                .map_err(|error| ModelExecutorError::custom(error.to_string()))?;
             assert_eq!(state, b"test model state");
             self.state_loaded = true;
             self.event_tx.send(ModelEvent::LoadState).unwrap();
