@@ -32,19 +32,25 @@ document that owns the component.
 - Rename the current reservation-wait `SwapOutTask` before per-request swap is implemented.
   Keep the request status `Running` while it waits for a reservation.
   Reserve `Swapped` for a request whose model state is not device-resident.
-- Optimize full model-state snapshot I/O.
+- Measure and optimize full model-state snapshot I/O.
   Keep weight handling outside this path.
   `unload_weights()` must drop Metal weight residency without writing weights to the snapshot.
   `load_weights()` must reload weights from the original checkpoint.
-  Replace bounded CPU staging with the Metal backend `BufferIO` primitive.
-  Coalesce adjacent state ranges to reduce copies and system calls.
-  Avoid per-record allocations and duplicate payload scans.
-  Use one snapshot directory with separate metadata and aligned data files.
-  Open the data file with `BufferIOFileCacheMode::Uncached`.
-  Sync the data file once after all payload ranges are written.
+  The current v2 path uses one snapshot directory and one semantic file for each resource.
+  It uses the Metal backend `BufferIO` primitive without an application staging buffer.
+  It opens Metal buffer files with `BufferIOFileCacheMode::Uncached`.
+  It uses native-endian `wincode` for the manifest and streams direct `GDNRequestSlots` metadata.
+  Future selected-state I/O must coalesce adjacent ranges within each semantic state file.
   Preserve temporary-directory sync, atomic rename, parent-directory sync, and synchronous model-executor lifecycle
   APIs.
-  Validate the local snapshot schema, exact lengths, offsets, and resource set.
+  The current writer and reader validate one topology-specific file set.
+  The reader validates the local snapshot schema, manifest lengths, and directory contents before allocation.
+  Each component validates its resource length before transfer.
+  Evaluate optional per-file integrity hashing without a second SSD pass.
+  `buffer_to_file` can update a CRC or SHA digest over each successfully written byte range from the shared Metal
+  buffer pointer. The metadata path can use a hashing writer. `file_to_buffer` can verify the digest with one CPU scan
+  of the loaded shared Metal buffer after Metal I/O completes. Measure the added CPU memory scan before selecting a
+  digest algorithm or enabling this feature.
   Record snapshot bytes, write and read duration, effective bandwidth, and peak host-memory overhead before and after
   the change.
   Follow [`model_state_io.md`](model_state_io.md).

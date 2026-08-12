@@ -481,7 +481,6 @@ fn init_qwen_3_model_inner(
         pending_transactions: Qwen3PendingTransactions::new(),
         gqa_page_table_layout,
         num_gqa_page_ids_per_main_lane_block,
-        state_fingerprint: crate::model::state_snapshot::ModelFingerprint::for_process_instance("qwen3"),
         unloaded_embed: None,
         unloaded_unembed: None,
     })

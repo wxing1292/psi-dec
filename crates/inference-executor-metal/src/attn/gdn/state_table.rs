@@ -17,7 +17,6 @@ use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::attn::gdn::state::to_candidate_state_version;
 use inference_executor_core::attn::gdn::state::to_state_version;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::request_state_table::GDNRequestSlots;
@@ -25,9 +24,9 @@ use crate::attn::gdn::request_state_table::GDNStatePages;
 use crate::attn::gdn::request_state_table::GDNStatePublish;
 use crate::attn::gdn::request_state_table::GDNStateRestore;
 use crate::def::replay_op::ReplayOp;
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::trace;
+
+mod file_io;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GDNStateLayout {
@@ -79,6 +78,7 @@ pub struct GDNRequestStateTable {
     num_req_slots: usize,
     num_state_slots_per_req: usize,
     num_tokens_per_block: usize,
+    num_cache_pages: usize,
     max_materialized_states_per_req: usize,
     max_publish_jobs_per_req: usize,
     resources: Option<Rc<GDNRequestStateResources>>,
@@ -154,10 +154,16 @@ impl GDNRequestStateTable {
         num_req_slots: usize,
         capacity: GDNStateCapacity,
         num_tokens_per_block: usize,
+        num_cache_pages: usize,
         page_bytes: usize,
     ) -> Self {
         assert!(!cores.is_empty(), "GDN state requires layers");
         assert!(num_tokens_per_block > 0, "GDN state requires tokens per block");
+        assert!(num_cache_pages > 0, "GDN state requires cache pages");
+        assert!(
+            u32::try_from(num_cache_pages - 1).is_ok(),
+            "GDN cache page IDs must fit u32"
+        );
         assert!(page_bytes.is_power_of_two(), "GDN page size must be a power of two");
         assert!(
             page_bytes.is_multiple_of(size_of::<f32>() * 4),
@@ -227,6 +233,7 @@ impl GDNRequestStateTable {
             num_req_slots,
             num_state_slots_per_req: capacity.num_state_slots_per_req,
             num_tokens_per_block,
+            num_cache_pages,
             max_materialized_states_per_req: capacity.max_materialized_states_per_req,
             max_publish_jobs_per_req: capacity.max_publish_jobs_per_req,
             resources: Some(Rc::new(GDNRequestStateResources::new(device, layout))),
@@ -253,24 +260,6 @@ impl GDNRequestStateTable {
         self.layout.num_gdn_layers
     }
 
-    pub fn write_full_state(
-        &self,
-        writer: &mut StateSnapshotWriter,
-        request_table_resource: u32,
-        recurrent_resource: u32,
-        conv_resource: u32,
-    ) -> Result<(), ModelExecutorError> {
-        self.assert_snapshot_ready();
-        let request_table = self
-            .request_table()
-            .borrow()
-            .encode_durable_state(self.max_publish_jobs_per_req, self.num_pages_per_state_slot());
-        writer.write_bytes(request_table_resource, &request_table)?;
-        writer.write_buffer(recurrent_resource, &self.resources().recurrent_states)?;
-        writer.write_buffer(conv_resource, &self.resources().conv_states)?;
-        Ok(())
-    }
-
     pub fn release_resources(&mut self) {
         self.assert_snapshot_ready();
         self.request_table
@@ -291,33 +280,6 @@ impl GDNRequestStateTable {
             self.num_state_slots_per_req,
         )));
         self.resources = Some(Rc::new(GDNRequestStateResources::new(device, self.layout)));
-    }
-
-    pub fn read_full_state(
-        &mut self,
-        reader: &mut StateSnapshotReader,
-        request_table_resource: u32,
-        recurrent_resource: u32,
-        conv_resource: u32,
-    ) -> Result<(), ModelExecutorError> {
-        let max_request_table_bytes = GDNRequestSlots::max_durable_state_bytes(
-            self.num_req_slots,
-            self.num_state_slots_per_req,
-            self.max_publish_jobs_per_req,
-            self.num_pages_per_state_slot(),
-        );
-        let request_table_bytes = reader.read_bytes(request_table_resource, max_request_table_bytes)?;
-        let request_table = GDNRequestSlots::decode_durable_state(
-            &request_table_bytes,
-            self.num_req_slots,
-            self.num_state_slots_per_req,
-            self.max_publish_jobs_per_req,
-            self.num_pages_per_state_slot(),
-        )?;
-        reader.read_buffer(recurrent_resource, &self.resources().recurrent_states)?;
-        reader.read_buffer(conv_resource, &self.resources().conv_states)?;
-        self.request_table = Some(RefCell::new(request_table));
-        Ok(())
     }
 
     fn recurrent_state_bytes(&self) -> usize {
@@ -1113,19 +1075,25 @@ mod tests {
     use super::GDNRequestStateTable;
     use super::GDNStateCapacity;
     use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
-    use crate::model::state_snapshot::ModelFingerprint;
+    use crate::attn::gdn::request_state_table::GDNRequestSlots;
+    use crate::model::state_snapshot::FullStateIO;
+    use crate::model::state_snapshot::GDNStateSnapshotFiles;
+    use crate::model::state_snapshot::StateSnapshotFile;
     use crate::model::state_snapshot::StateSnapshotReader;
     use crate::model::state_snapshot::StateSnapshotWriter;
 
     const TEST_PAGE_BYTES: usize = 32 * 1024;
     const LIFECYCLE_PAGE_BYTES: usize = 16;
-    const REQUEST_TABLE_RESOURCE: u32 = 1;
-    const RECURRENT_STATE_RESOURCE: u32 = 2;
-    const CONV_STATE_RESOURCE: u32 = 3;
+    const TEST_NUM_CACHE_PAGES: usize = 1024;
+    const SNAPSHOT_FILES: GDNStateSnapshotFiles = GDNStateSnapshotFiles::new(
+        StateSnapshotFile::MainGDNRequestStateTable,
+        StateSnapshotFile::MainGDNRecurrentState,
+        StateSnapshotFile::MainGDNConvState,
+    );
 
     #[derive(Debug, PartialEq)]
     struct GDNStateReference {
-        durable_request_state: Vec<u8>,
+        request_state: GDNRequestSlots,
         recurrent_state: Vec<f32>,
         conv_state: Vec<f32>,
     }
@@ -1185,6 +1153,7 @@ mod tests {
             2,
             GDNStateCapacity::new(4, 3, 1),
             16,
+            TEST_NUM_CACHE_PAGES,
             TEST_PAGE_BYTES,
         );
 
@@ -1213,7 +1182,7 @@ mod tests {
     #[should_panic(expected = "runtime supplied a page ID outside the cache-page buffer")]
     fn test_page_id_domain_panics() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0)], 1, GDNStateCapacity::new(3, 2, 1), 2, 16);
+        let state = GDNRequestStateTable::new(&device, &[core(0)], 1, GDNStateCapacity::new(3, 2, 1), 2, 2, 16);
         let pages = inference_backend_metal::metal::Buffer::new_zeroed(&device, 2 * 16);
         let page_ids = [2_u32];
 
@@ -1232,6 +1201,7 @@ mod tests {
             2,
             GDNStateCapacity::new(4, 3, 1),
             16,
+            TEST_NUM_CACHE_PAGES,
             TEST_PAGE_BYTES,
         );
         let batch_metadata = GDNMetadataBuffers::new(&device, 2, 8);
@@ -1265,6 +1235,7 @@ mod tests {
             1,
             GDNStateCapacity::new(4, 3, 1),
             16,
+            TEST_NUM_CACHE_PAGES,
             TEST_PAGE_BYTES,
         );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
@@ -1305,6 +1276,7 @@ mod tests {
             1,
             GDNStateCapacity::new(4, 3, 1),
             16,
+            TEST_NUM_CACHE_PAGES,
             TEST_PAGE_BYTES,
         );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
@@ -1350,6 +1322,7 @@ mod tests {
             1,
             GDNStateCapacity::new(4, 3, 1),
             16,
+            TEST_NUM_CACHE_PAGES,
             TEST_PAGE_BYTES,
         );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
@@ -1389,7 +1362,15 @@ mod tests {
     #[test]
     fn test_cache_boundary_before_the_candidate_range_is_materialized() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(4, 3, 2), 2, 16);
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(4, 3, 2),
+            2,
+            TEST_NUM_CACHE_PAGES,
+            16,
+        );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 4);
         prepare_state(
             &state,
@@ -1418,7 +1399,15 @@ mod tests {
     #[test]
     fn test_future_publish_page_ids() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(5, 4, 3), 2, 16);
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(5, 4, 3),
+            2,
+            TEST_NUM_CACHE_PAGES,
+            16,
+        );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 8);
         prepare_state(
             &state,
@@ -1476,7 +1465,15 @@ mod tests {
     #[test]
     fn test_snapshot_restore_then_apply_tokens() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(4, 3, 1), 2, 16);
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(4, 3, 1),
+            2,
+            TEST_NUM_CACHE_PAGES,
+            16,
+        );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 8);
         let snapshot_page_ids = vec![10, 11, 12, 13, 14, 15, 16, 17];
         prepare_state(
@@ -1503,7 +1500,15 @@ mod tests {
     #[should_panic(expected = "GDN current state version must match the runtime input token index")]
     fn test_prepare_requires_source_state_for_first_input_token() {
         let device = Device::system_default();
-        let state = GDNRequestStateTable::new(&device, &[core(0), core(1)], 1, GDNStateCapacity::new(4, 3, 1), 2, 16);
+        let state = GDNRequestStateTable::new(
+            &device,
+            &[core(0), core(1)],
+            1,
+            GDNStateCapacity::new(4, 3, 1),
+            2,
+            TEST_NUM_CACHE_PAGES,
+            16,
+        );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 1);
 
         prepare_state(
@@ -1527,6 +1532,7 @@ mod tests {
             1,
             GDNStateCapacity::new(4, 3, 1),
             1024,
+            TEST_NUM_CACHE_PAGES,
             16,
         );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 8);
@@ -1551,34 +1557,25 @@ mod tests {
 
     fn assert_unload_load(name: &str, device: &Device, state: &mut GDNRequestStateTable, reference: GDNStateReference) {
         let snapshot_path = snapshot_path(name);
-        let fingerprint = ModelFingerprint::new([0x44; 16]);
-        let mut writer = StateSnapshotWriter::new(&snapshot_path, fingerprint).unwrap();
-        state
-            .write_full_state(
-                &mut writer,
-                REQUEST_TABLE_RESOURCE,
-                RECURRENT_STATE_RESOURCE,
-                CONV_STATE_RESOURCE,
-            )
-            .unwrap();
+        let buffer_io = inference_backend_metal::metal::BufferIO::new(device);
+        let snapshot_files = [
+            SNAPSHOT_FILES.request_state_table(),
+            SNAPSHOT_FILES.recurrent_state(),
+            SNAPSHOT_FILES.conv_state(),
+        ];
+        let mut writer = StateSnapshotWriter::new(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        state.write_full_state(&mut writer, SNAPSHOT_FILES).unwrap();
         writer.commit().unwrap();
 
         state.release_resources();
         state.allocate_resources(device);
 
-        let mut reader = StateSnapshotReader::open(&snapshot_path, fingerprint).unwrap();
-        state
-            .read_full_state(
-                &mut reader,
-                REQUEST_TABLE_RESOURCE,
-                RECURRENT_STATE_RESOURCE,
-                CONV_STATE_RESOURCE,
-            )
-            .unwrap();
+        let mut reader = StateSnapshotReader::open(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        state.read_full_state(&mut reader, SNAPSHOT_FILES).unwrap();
         reader.finish().unwrap();
 
         assert_eq!(capture_state(state), reference);
-        std::fs::remove_file(snapshot_path).unwrap();
+        std::fs::remove_dir_all(snapshot_path).unwrap();
     }
 
     fn new_lifecycle_state(device: &Device) -> GDNRequestStateTable {
@@ -1588,6 +1585,7 @@ mod tests {
             1,
             GDNStateCapacity::new(5, 4, 3),
             2,
+            TEST_NUM_CACHE_PAGES,
             LIFECYCLE_PAGE_BYTES,
         )
     }
@@ -1624,10 +1622,7 @@ mod tests {
         let resources = state.resources();
         let (num_recurrent_values, num_conv_values) = state_value_counts(state);
         GDNStateReference {
-            durable_request_state: state
-                .request_table()
-                .borrow()
-                .encode_durable_state(state.max_publish_jobs_per_req, state.num_pages_per_state_slot()),
+            request_state: state.request_table().borrow().clone(),
             recurrent_state: resources.recurrent_states.read_typed(0, num_recurrent_values),
             conv_state: resources.conv_states.read_typed(0, num_conv_values),
         }

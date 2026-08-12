@@ -21,9 +21,8 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::model::qwen::v3_x::layer::Qwen3xUngatedGQAWeightBuffers;
-use crate::model::residency_digest::ModelResidencyHasher;
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
+
+mod file_io;
 
 pub struct Qwen3MainGQA {
     model_layer_index: usize,
@@ -74,10 +73,6 @@ impl Qwen3MainGQA {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "Qwen3 Main GQA weights are not loaded");
         self.weights.take();
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.weights().hash(hasher, prefix);
     }
 
     pub fn unload_state(&mut self) {
@@ -261,10 +256,6 @@ impl Qwen3MainGQAState {
         self.request_page_table().reset_req_slots(req_slots);
     }
 
-    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
-        self.request_page_table().write_full_state(writer, resource)
-    }
-
     pub fn release_resources(&mut self) {
         assert!(
             self.backend.is_some()
@@ -295,9 +286,5 @@ impl Qwen3MainGQAState {
         self.scratch = Some(scratch);
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
         self.metadata = Some(GQAMetadataBuffers::new(device, self.max_tokens));
-    }
-
-    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
-        self.request_page_table().read_full_state(reader, resource)
     }
 }

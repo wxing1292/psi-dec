@@ -1,9 +1,7 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
-use inference_executor_core::def::ModelExecutorError;
 
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
+mod file_io;
 
 pub struct PageArena {
     pages: Option<Buffer>,
@@ -31,10 +29,6 @@ impl PageArena {
             .expect("page arena state must be loaded before execution")
     }
 
-    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
-        writer.write_buffer(resource, self.buffer())
-    }
-
     pub fn release_resources(&mut self) {
         assert!(self.pages.is_some(), "page arena state is not loaded");
         self.pages.take();
@@ -49,10 +43,6 @@ impl PageArena {
                 .expect("page arena byte length must fit usize"),
         ));
     }
-
-    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
-        reader.read_buffer(resource, self.buffer())
-    }
 }
 
 #[cfg(test)]
@@ -62,13 +52,15 @@ mod tests {
     use inference_backend_metal::metal::Device;
 
     use super::PageArena;
-    use crate::model::state_snapshot::ModelFingerprint;
+    use crate::model::state_snapshot::FullStateIO;
+    use crate::model::state_snapshot::PageArenaStateSnapshotFiles;
+    use crate::model::state_snapshot::StateSnapshotFile;
     use crate::model::state_snapshot::StateSnapshotReader;
     use crate::model::state_snapshot::StateSnapshotWriter;
 
     const NUM_PAGES: usize = 3;
     const PAGE_BYTES: usize = 16;
-    const STATE_RESOURCE: u32 = 1;
+    const SNAPSHOT_FILES: PageArenaStateSnapshotFiles = PageArenaStateSnapshotFiles::new(StateSnapshotFile::PageArena);
 
     #[test]
     fn test_unload_load_fixed_state() {
@@ -91,22 +83,23 @@ mod tests {
         arena.buffer().write_bytes(0, &expected);
 
         let snapshot_path = snapshot_path(name);
-        let fingerprint = ModelFingerprint::new([0x50; 16]);
-        let mut writer = StateSnapshotWriter::new(&snapshot_path, fingerprint).unwrap();
-        arena.write_full_state(&mut writer, STATE_RESOURCE).unwrap();
+        let buffer_io = inference_backend_metal::metal::BufferIO::new(&device);
+        let snapshot_files = [SNAPSHOT_FILES.pages()];
+        let mut writer = StateSnapshotWriter::new(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        arena.write_full_state(&mut writer, SNAPSHOT_FILES).unwrap();
         writer.commit().unwrap();
 
         arena.release_resources();
         arena.allocate_resources(&device);
 
-        let mut reader = StateSnapshotReader::open(&snapshot_path, fingerprint).unwrap();
-        arena.read_full_state(&mut reader, STATE_RESOURCE).unwrap();
+        let mut reader = StateSnapshotReader::open(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        arena.read_full_state(&mut reader, SNAPSHOT_FILES).unwrap();
         reader.finish().unwrap();
 
         let mut actual = vec![0; expected.len()];
         arena.buffer().read_bytes(0, &mut actual);
         assert_eq!(actual, expected);
-        std::fs::remove_file(snapshot_path).unwrap();
+        std::fs::remove_dir_all(snapshot_path).unwrap();
     }
 
     fn snapshot_path(name: &str) -> PathBuf {

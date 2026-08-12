@@ -7,13 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-crc32fast = { workspace = true }
 half = { workspace = true }
 inference-backend-metal = { workspace = true }
 inference-executor-core = { workspace = true }
 inference-runtime-core = { path = "../inference-runtime-core" }
 inference-runtime-macro = { path = "../inference-runtime-macro" }
 safetensors = { workspace = true }
+wincode = { workspace = true }
 
 [[bench]]
 name = "qwen35_gqa"

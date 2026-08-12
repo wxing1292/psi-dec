@@ -234,6 +234,7 @@ impl BlockFixture {
             inference_executor_metal::attn::gdn::state_table::GDNStateCapacity::new(2, 1, 1),
             max_tokens,
             CACHE_BLOCK_TOKENS,
+            num_cache_pages,
             QWEN35_PAGE_SIZE_BYTES,
         );
         let mut flat_materialized_state_slots = vec![u32::MAX; max_tokens];

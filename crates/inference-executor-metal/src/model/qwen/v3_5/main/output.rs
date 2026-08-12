@@ -14,7 +14,6 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::gather::Gather;
-use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedBucketedInput;
 use crate::model::unembedding::UnembedInput;
@@ -69,10 +68,6 @@ impl Qwen35GatherUnembed {
         self.unembed
             .take()
             .expect("qwen3.5 GatherUnembed weights are not loaded")
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.loaded_unembed().hash_weights(hasher, prefix);
     }
 
     fn loaded_unembed(&self) -> &Unembed {

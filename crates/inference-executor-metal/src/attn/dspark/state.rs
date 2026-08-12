@@ -8,7 +8,6 @@ use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedDSparkGQACore;
-use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::dspark::capacity::DSparkGQACapacity;
@@ -16,8 +15,8 @@ use crate::attn::dspark::context::DSparkGQAContextScratch;
 use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
 use crate::attn::dspark::scratch::DSparkBlockScratch;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
+
+mod file_io;
 
 pub struct UngatedDSparkGQAState {
     compute: GQACompute,
@@ -170,10 +169,6 @@ impl UngatedDSparkGQAState {
             .expect("DSpark GQA metadata state must be loaded")
     }
 
-    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
-        self.request_page_table_ref().write_full_state(writer, resource)
-    }
-
     pub fn release_resources(&mut self) {
         assert!(
             self.block_scratch.is_some()
@@ -212,10 +207,6 @@ impl UngatedDSparkGQAState {
         )));
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
         self.metadata = Some(DSparkGQAMetadataBuffers::new(device, self.capacity));
-    }
-
-    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
-        self.request_page_table_ref().read_full_state(reader, resource)
     }
 
     fn request_page_table_ref(&self) -> &Rc<GQARequestPageTable> {

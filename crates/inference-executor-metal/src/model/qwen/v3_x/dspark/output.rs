@@ -14,7 +14,6 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::gather::Gather;
 use crate::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
-use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
@@ -89,10 +88,6 @@ impl Qwen3xDSparkGatherUnembed {
         self.unembed
             .take()
             .expect("Qwen3.x DSpark unembed weights are not loaded")
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.unembed().hash_weights(hasher, prefix);
     }
 
     fn unembed(&self) -> &Unembed {
@@ -177,10 +172,6 @@ impl Qwen3xDSparkSampling {
 
     pub fn unload_weights(&mut self) {
         self.markov.unload_weights();
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.markov.hash_weights(hasher, prefix);
     }
 
     pub fn prepare(

@@ -28,7 +28,6 @@ use crate::model::qwen::v3_x::weight::concat_bytes;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
-use crate::model::residency_digest::ModelResidencyHasher;
 
 pub struct Qwen3xGDN {
     compact_gdn_layer_index: usize,
@@ -70,10 +69,6 @@ impl Qwen3xGDN {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "Qwen3.x GDN weights are not loaded");
         self.weights.take();
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.weights().hash(hasher, prefix);
     }
 
     pub fn unload_state(&mut self) {
@@ -202,19 +197,6 @@ struct Qwen3xGDNWeights {
 }
 
 impl Qwen3xGDNWeights {
-    fn hash(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        hasher.buffer(&format!("{prefix}.qkvabz.weight"), &self.qkvabz_weight);
-        hasher.buffer(&format!("{prefix}.qkvabz.scales"), &self.qkvabz_scales);
-        hasher.buffer(&format!("{prefix}.qkvabz.biases"), &self.qkvabz_biases);
-        hasher.buffer(&format!("{prefix}.conv.weight"), &self.conv_weight);
-        hasher.buffer(&format!("{prefix}.norm.weight"), &self.norm_weight);
-        hasher.buffer(&format!("{prefix}.a_log"), &self.a_log);
-        hasher.buffer(&format!("{prefix}.dt_bias"), &self.dt_bias);
-        hasher.buffer(&format!("{prefix}.output.weight"), &self.output_weight);
-        hasher.buffer(&format!("{prefix}.output.scales"), &self.output_scales);
-        hasher.buffer(&format!("{prefix}.output.biases"), &self.output_biases);
-    }
-
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,

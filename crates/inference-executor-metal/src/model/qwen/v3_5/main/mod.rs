@@ -31,7 +31,6 @@ use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
@@ -155,13 +154,6 @@ impl Qwen35Main {
         for layer in self.layers.iter_mut().rev() {
             layer.unload_weights();
         }
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            layer.hash_weights(hasher, &format!("{prefix}.layers.{layer_index}"));
-        }
-        self.final_norm.hash_weights(hasher, &format!("{prefix}.final_norm"));
     }
 
     pub fn set_residual_capture(&mut self, residual_capture: Option<Rc<dyn MainResidualCapture>>) {

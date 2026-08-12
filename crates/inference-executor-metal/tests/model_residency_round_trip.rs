@@ -1,4 +1,8 @@
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -21,6 +25,7 @@ const MODEL_35B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_35B_MODEL_DIR";
 const MTP_35B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_35B_MTP_MODEL_DIR";
 const DSPARK_35B_DIR_ENV: &str = "PSI_DEC_MODEL_RESIDENCY_TEST_35B_DSPARK_MODEL_DIR";
 const NUM_CACHE_PAGES: usize = 1024;
+const SNAPSHOT_COMPARE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 #[test]
 #[ignore = "requires Qwen3.6 27B Main and MTP checkpoints and substantial unified memory"]
@@ -105,28 +110,94 @@ fn run_residency_round_trip(mut model: inference_executor_metal::model::qwen::v3
             .as_nanos()
     ));
     std::fs::create_dir_all(&temp_dir).expect("test snapshot directory must be created");
-    let lifecycle_snapshot = temp_dir.join("lifecycle.state");
-    let digest_snapshot = temp_dir.join("digest.state");
+    let first_snapshot = temp_dir.join("first.state");
+    let second_snapshot = temp_dir.join("second.state");
 
-    let before = model
-        .residency_digest(&digest_snapshot)
-        .expect("initial model residency must be hashed");
     model.clear_replay_cache();
     model
-        .unload_state(&lifecycle_snapshot)
-        .expect("model state must unload");
+        .unload_state(&first_snapshot)
+        .expect("initial model state must unload");
     model.unload_weights();
     model.load_weights().expect("model weights must reload");
-    model.load_state(&lifecycle_snapshot).expect("model state must reload");
-    let after = model
-        .residency_digest(&digest_snapshot)
-        .expect("restored model residency must be hashed");
+    model
+        .load_state(&first_snapshot)
+        .expect("initial model state must reload");
+    model
+        .unload_state(&second_snapshot)
+        .expect("restored model state must unload");
+    assert_snapshot_directories_equal(&first_snapshot, &second_snapshot);
+    model
+        .load_state(&second_snapshot)
+        .expect("verified model state must reload");
+    model.reset_req_slots(&[0]);
+    run_one_decode(&mut model);
 
-    assert_eq!(
-        before, after,
-        "model weights and state changed across the residency round trip"
-    );
     std::fs::remove_dir_all(&temp_dir).expect("test snapshot directory must be removed");
+}
+
+fn assert_snapshot_directories_equal(expected: &Path, actual: &Path) {
+    let expected_files = snapshot_file_names(expected);
+    let actual_files = snapshot_file_names(actual);
+    assert_eq!(expected_files, actual_files, "model state snapshot file sets differ");
+
+    let mut expected_bytes = vec![0; SNAPSHOT_COMPARE_CHUNK_BYTES];
+    let mut actual_bytes = vec![0; SNAPSHOT_COMPARE_CHUNK_BYTES];
+    for file_name in expected_files {
+        let expected_path = expected.join(&file_name);
+        let actual_path = actual.join(&file_name);
+        let mut expected_file = File::open(&expected_path).expect("expected snapshot file must open");
+        let mut actual_file = File::open(&actual_path).expect("actual snapshot file must open");
+        let expected_len = expected_file
+            .metadata()
+            .expect("expected snapshot file metadata must load")
+            .len();
+        let actual_len = actual_file
+            .metadata()
+            .expect("actual snapshot file metadata must load")
+            .len();
+        assert_eq!(
+            expected_len, actual_len,
+            "model state snapshot file lengths differ: file={file_name:?}"
+        );
+
+        let mut remaining = expected_len;
+        while remaining > 0 {
+            let chunk_bytes = usize::try_from(remaining.min(SNAPSHOT_COMPARE_CHUNK_BYTES as u64)).unwrap();
+            expected_file
+                .read_exact(&mut expected_bytes[..chunk_bytes])
+                .expect("expected snapshot file must read");
+            actual_file
+                .read_exact(&mut actual_bytes[..chunk_bytes])
+                .expect("actual snapshot file must read");
+            assert_eq!(
+                expected_bytes[..chunk_bytes],
+                actual_bytes[..chunk_bytes],
+                "model state snapshot file contents differ: file={file_name:?} offset={}",
+                expected_len - remaining
+            );
+            remaining -= chunk_bytes as u64;
+        }
+    }
+}
+
+fn snapshot_file_names(path: &Path) -> Vec<OsString> {
+    let mut file_names = std::fs::read_dir(path)
+        .expect("model state snapshot directory must open")
+        .map(|entry| {
+            let entry = entry.expect("model state snapshot directory entry must load");
+            assert!(
+                entry
+                    .file_type()
+                    .expect("model state snapshot entry type must load")
+                    .is_file(),
+                "model state snapshot entry must be a regular file: {:?}",
+                entry.path()
+            );
+            entry.file_name()
+        })
+        .collect::<Vec<_>>();
+    file_names.sort_unstable();
+    file_names
 }
 
 fn run_one_decode(model: &mut inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor) {

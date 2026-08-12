@@ -20,7 +20,6 @@ use crate::model::qwen::v3::main::plan::qwen3_dense_mlp_core_and_metal;
 use crate::model::qwen::v3::main::plan::qwen3_gqa_core_and_metal;
 use crate::model::qwen::v3_x::layer::Qwen3xDenseMLP;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
-use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::residual_add::ResidualAdd;
 use crate::model::rms_norm::RMSNorm;
 
@@ -119,14 +118,6 @@ impl Qwen3MainLayer {
         self.input_norm.unload_weights();
         self.mlp.unload_weights();
         self.attention.unload_weights();
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.input_norm.hash_weights(hasher, &format!("{prefix}.input_norm"));
-        self.attention.hash_weights(hasher, &format!("{prefix}.attention"));
-        self.post_attention_norm
-            .hash_weights(hasher, &format!("{prefix}.post_attention_norm"));
-        self.mlp.hash_weights(hasher, &format!("{prefix}.mlp"));
     }
 
     pub fn unload_state(&mut self) {

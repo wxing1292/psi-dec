@@ -5,19 +5,49 @@ This document defines the model-state I/O design. It separates current source fr
 [`high_level.md`](high_level.md) defines the runtime-core and model-executor boundary.
 [`model_idle_unload.md`](model_idle_unload.md) describes the current whole-model Stop/Start path.
 
+This document uses `checkpoint` only for the original immutable external model weights.
+It uses `snapshot` only for executor-generated mutable state from the same-executor Stop/Start lifecycle.
+
 ## Status
 
 The repository has two model-state I/O projects.
 
 | Project | Workstream | Status |
 | --- | --- | --- |
-| Whole-model residency | Full-state Stop/Start | Implemented with the v1 staged snapshot path |
+| Whole-model residency | Full-state Stop/Start | v2 executor state I/O implemented; event-loop cutover pending |
 | Whole-model residency | Selected-state Stop/Start | Planned |
 | Request and cache mobility | Per-request swap | Planned |
 | Request and cache mobility | Trie cache-block I/O | Planned |
 
 The Metal backend implements the standalone `BufferIO` primitive.
-The v1 model snapshot does not use `BufferIO` yet.
+The v2 model snapshot format uses `BufferIO` for each Metal buffer resource.
+
+The model executor uses one `FullStateIO` trait for component state:
+
+```rust
+pub trait FullStateIO {
+    type Files: Copy;
+
+    fn write_full_state(
+        &self,
+        writer: &mut StateSnapshotWriter,
+        files: Self::Files,
+    ) -> Result<(), ModelExecutorError>;
+
+    fn read_full_state(
+        &mut self,
+        reader: &mut StateSnapshotReader,
+        files: Self::Files,
+    ) -> Result<(), ModelExecutorError>;
+}
+```
+
+`PageArenaStateSnapshotFiles`, `GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify the files for each
+component. The same GQA implementation can serve Main, MTP, or DSpark. The executor therefore supplies the semantic
+file set at the model-role boundary.
+
+Each component keeps its `FullStateIO` implementation in an adjacent `file_io.rs` file. This layout keeps storage logic
+separate from forward execution and resource allocation.
 
 ## Shared model
 
@@ -31,7 +61,7 @@ They do not share one lifecycle contract.
                     +---------------------+---------------------+
                     |                                           |
                     v                                           v
-       whole-model Selected                            request and block I/O
+       whole-model selected                            request and block I/O
        physical identity is stable                      placement can change
        synchronous Stop/Start                           asynchronous tasks
        runtime metadata is unchanged                    runtime updates placement
@@ -148,10 +178,11 @@ Weights are not snapshot data.
 `unload_weights()` drops Metal weight residency.
 `load_weights()` reloads the original checkpoint.
 
-The current v1 snapshot uses one file, a 4 MiB staging buffer, and CRC32.
-The current reader scans each payload for CRC32 and then reads it again for restore.
-
-Recommendation: Migrate the v1 snapshot only after the standalone `BufferIO` measurements are stable.
+The v2 snapshot uses one directory and one file for each logical resource.
+Metal buffer files use `BufferIOFileCacheMode::Uncached`.
+The writer does not allocate an application staging buffer.
+The reader transfers each file directly into its destination Metal buffer.
+Local payload files do not contain checksums.
 
 ## Whole-model selected state
 
@@ -210,29 +241,56 @@ num_in_sync_blocks  unchanged
 The design does not need a cache-generation ID.
 The synchronous lifecycle keeps the same runtime object graph alive.
 
-## Snapshot publication
+## Snapshot format and publication
 
-Recommendation: Use one snapshot directory with two files.
+The v2 snapshot uses this flat directory layout:
 
 ```text
 snapshot/
-  metadata
-  data
+  manifest
+  page-arena
+  main-gqa-request-page-table
+  main-gdn-request-state-table
+  main-gdn-recurrent-state
+  main-gdn-conv-state
+  mtp-gqa-request-page-table
+  dspark-gqa-request-page-table
 ```
 
-`metadata` stores logical resource records and data offsets.
-`data` stores aligned, concatenated payload ranges with padding.
-Open `data` with `BufferIOFileCacheMode::Uncached`.
-The metadata file can use the default cached path because it is small and receives an explicit sync.
+`manifest` uses `wincode` with native byte order, fixed-width integers, `u32` sequence lengths, and `u8` enum tags.
+It stores the format magic, format version, file kind, and exact file length.
+The GDN request-state table uses the same `wincode` configuration. The writer serializes `GDNRequestSlots` directly.
+It does not create a snapshot DTO or clone page mappings into an intermediate metadata graph.
+The snapshot codec disables the `wincode` preallocation limit. The local snapshot is a trusted artifact from the same
+executor instance. GDN does not calculate or supply a serialized-size limit. The reader streams the manifest-sized
+metadata file into the decoder.
+
+The metadata writer streams `wincode` output into the semantic file. The metadata reader streams the semantic file
+into its owned Rust value and rejects trailing bytes. These paths do not allocate a second full metadata byte buffer.
+
+Each Metal buffer has one semantic file name.
+The writer opens these files with `BufferIOFileCacheMode::Uncached`.
+The MTP and DSpark GQA files are topology-dependent.
+A snapshot contains at most one of them.
+
+The writer and reader validate the same topology-specific expected file set.
+The writer rejects an incomplete set before it publishes the snapshot.
+The reader validates the manifest, sorted unique file set, semantic file kind, exact directory contents, regular-file
+type, and manifest file lengths before the model allocates restore buffers.
+Each component validates its expected buffer length before it transfers file data.
+The local format does not add a payload checksum.
+The manifest does not contain a model fingerprint or a model-instance nonce.
+The live executor shell and its unique event-loop snapshot path establish identity for same-process Stop/Start.
+The reader must not use this format to restore another executor instance, model setup, or process.
 
 Publish a new snapshot in this order:
 
 ```text
 create snapshot.tmp-<id>/
-  -> write data
-  -> write metadata
-  -> sync data
-  -> sync metadata
+  -> write each semantic state file
+  -> sync each state file
+  -> write manifest
+  -> sync manifest
   -> sync snapshot.tmp-<id>/
   -> rename snapshot.tmp-<id>/ to snapshot/
   -> sync the parent directory
@@ -241,9 +299,7 @@ create snapshot.tmp-<id>/
 The reader must only open the final `snapshot/` name.
 An incomplete temporary directory is not a valid snapshot.
 
-Local Stop/Start does not need a payload checksum.
-The reader must validate the schema, exact lengths, offsets, and resource set.
-Cross-node transfer can calculate SHA-256 while it reads the published data file.
+Cross-node transfer can calculate SHA-256 while it reads the published state files.
 
 This whole-model lifecycle is not a process-restart checkpoint.
 It keeps runtime metadata in the live process while model residency is stopped.
@@ -330,13 +386,14 @@ It must not publish a partial placement change.
 
 ## Implementation order
 
-1. Measure standalone `BufferIO` file-to-buffer and buffer-to-file throughput.
-2. Add the directory snapshot format and aligned data layout.
+1. Measure standalone `BufferIO` file-to-buffer and buffer-to-file throughput. Complete.
+2. Add the v2 semantic-resource directory snapshot. Complete.
 3. Migrate full-state Stop/Start from v1 staging to `BufferIO`.
-4. Add `ModelStateScope` to the existing `Stop` and `Start` protocol variants.
-5. Add per-request swap at the scheduler commit boundary.
-6. Add unified trie placement and `BlockIOTask`.
-7. Add cross-node transfer only after local I/O is correct.
+4. Measure full-state snapshot throughput and peak memory with production model layouts.
+5. Add `ModelStateScope` to the existing `Stop` and `Start` protocol variants.
+6. Add per-request swap at the scheduler commit boundary.
+7. Add unified trie placement and `BlockIOTask`.
+8. Add cross-node transfer only after local I/O is correct.
 
 ## Deferred decisions
 

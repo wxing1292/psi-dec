@@ -25,6 +25,8 @@ crates/inference-executor-metal/src/attn/
     ungated_backend.rs      ungated QKV Metal replay wiring
     ungated_scratch.rs      ungated QKV scratch allocation and borrowed replay bindings
     request_page_table.rs   per-request, per-layer KV page table for runtime-supplied page IDs
+    request_page_table/
+      file_io.rs            symmetric full-state file I/O
   dspark/
     mod.rs                  DSpark attention module root
     backend.rs              ungated paged-history plus block-bidirectional replay graph
@@ -33,14 +35,18 @@ crates/inference-executor-metal/src/attn/
     metadata.rs             proposal history and block metadata
     scratch.rs              fixed-capacity local Q/K/V and attention partials
     state.rs                DSpark page-table and proposal metadata lifecycle
+    state/
+      file_io.rs            DSpark full-state file I/O
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
     dspark/                 Qwen3x DSpark attention, layer, and model
     layer/gqa.rs            Qwen3xGQA, private checkpoint weights, load, and record
     state/gqa.rs            Qwen3xGQAState page/metadata/reset lifecycle grouping
+    state/gqa/file_io.rs    Qwen3xGQAState full-state file I/O
   v3/
     main/gqa.rs             Qwen3 Main ungated GQA weights, state, load, and record
+    main/gqa/file_io.rs     Qwen3 Main GQA full-state file I/O
     main/layer.rs           fixed QKV Qwen3MainLayer composition
     main/plan.rs            Qwen3 Main QKV GQA geometry/config builder
   v3_5/
@@ -994,6 +1000,9 @@ multiply scratch by the layer count.
 During `unload_state`, each layer first drops its shared GQA backend, scratch, and request-page-table references.
 The model state owner then releases the final references and its batch metadata.
 State load rebuilds these transient resources before it restores the full `GQARequestPageTable` payload.
+Each GQA state owner implements `FullStateIO` with `GQAStateSnapshotFiles`. `read_full_state` requires mutable state and
+a unique `Rc<GQARequestPageTable>`. This contract prevents restore from overwriting a page table that is still attached
+to an execution graph.
 
 The core `scale` is part of both attention contracts. The executor passes it to paged SDPA kernels. Kernels must not
 silently substitute `1 / sqrt(head_dim)`.

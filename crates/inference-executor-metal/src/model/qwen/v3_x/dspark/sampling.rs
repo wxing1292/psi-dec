@@ -20,7 +20,6 @@ use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::to_u32;
 use crate::model::qwen::v3_x::weight::validate_len;
 use crate::model::qwen::v3_x::weight::validate_shape;
-use crate::model::residency_digest::ModelResidencyHasher;
 use crate::sampling::dspark_markov::DSparkConfidenceInput;
 use crate::sampling::dspark_markov::DSparkConfidenceWeights;
 use crate::sampling::dspark_markov::DSparkMarkovConfidenceConfig;
@@ -141,25 +140,6 @@ impl Qwen3xDSparkMarkov {
         );
         self.confidence.take();
         self.weights.take();
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        let weights = self
-            .weights
-            .as_ref()
-            .expect("Qwen3.x DSpark Markov weights must be loaded before hashing");
-        hasher.buffer(&format!("{prefix}.w1.weight"), &weights.w1_weight);
-        hasher.buffer(&format!("{prefix}.w1.scales"), &weights.w1_scales);
-        hasher.buffer(&format!("{prefix}.w1.biases"), &weights.w1_biases);
-        hasher.buffer(&format!("{prefix}.w2.weight"), &weights.w2_weight);
-        hasher.buffer(&format!("{prefix}.w2.scales"), &weights.w2_scales);
-        hasher.buffer(&format!("{prefix}.w2.biases"), &weights.w2_biases);
-        let confidence = self
-            .confidence
-            .as_ref()
-            .expect("Qwen3.x DSpark confidence weights must be loaded before hashing");
-        hasher.buffer(&format!("{prefix}.confidence.weight"), &confidence.weight);
-        hasher.buffer(&format!("{prefix}.confidence.bias"), &confidence.bias);
     }
 
     pub fn prepare(

@@ -571,6 +571,7 @@ fn init_qwen_3_5_model_inner(
         gdn_state_capacity,
         config.max_tokens,
         config.num_tokens_per_block,
+        config.num_cache_pages,
         QWEN35_PAGE_SIZE_BYTES,
     );
     let main_layer_scratch = std::rc::Rc::new(Qwen35MainLayerScratch::new(
@@ -838,7 +839,6 @@ fn init_qwen_3_5_model_inner(
         pending_transactions: Qwen35PendingTransactions::new(),
         gqa_page_table_layout,
         num_gqa_page_ids_per_main_lane_block,
-        state_fingerprint: crate::model::state_snapshot::ModelFingerprint::for_process_instance("qwen3.5"),
         unloaded_embed: None,
         unloaded_unembed: None,
     };

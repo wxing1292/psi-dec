@@ -6,7 +6,6 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
-use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gdn::backend::GDN;
@@ -24,11 +23,11 @@ use crate::attn::gdn::state_table::GDNStateCapacity;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::def::replay_op::ReplayRecorder;
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::replay::Replay;
 use crate::replay::ReplayComponent;
 use crate::trace;
+
+mod file_io;
 
 pub struct Qwen3xGDNState {
     backend: Option<Rc<GDN>>,
@@ -82,6 +81,7 @@ impl Qwen3xGDNState {
         state_capacity: GDNStateCapacity,
         max_tokens: usize,
         num_tokens_per_block: usize,
+        num_cache_pages: usize,
         page_bytes: usize,
     ) -> Self {
         let representative = cores
@@ -93,6 +93,7 @@ impl Qwen3xGDNState {
             num_req_slots,
             state_capacity,
             num_tokens_per_block,
+            num_cache_pages,
             page_bytes,
         );
         let backend = Rc::new(GDN::new(device, representative.clone(), metal));
@@ -236,17 +237,6 @@ impl Qwen3xGDNState {
         self.state_restore.clear();
     }
 
-    pub fn write_full_state(
-        &self,
-        writer: &mut StateSnapshotWriter,
-        request_table_resource: u32,
-        recurrent_resource: u32,
-        conv_resource: u32,
-    ) -> Result<(), ModelExecutorError> {
-        self.request_state_table
-            .write_full_state(writer, request_table_resource, recurrent_resource, conv_resource)
-    }
-
     pub fn release_resources(&mut self) {
         assert!(
             self.backend.is_some() && self.scratch.is_some() && self.metadata.is_some(),
@@ -272,17 +262,6 @@ impl Qwen3xGDNState {
         self.metadata = Some(GDNMetadataBuffers::new(device, self.num_req_slots, self.max_tokens));
         self.backend = Some(backend);
         self.request_state_table.allocate_resources(device);
-    }
-
-    pub fn read_full_state(
-        &mut self,
-        reader: &mut StateSnapshotReader,
-        request_table_resource: u32,
-        recurrent_resource: u32,
-        conv_resource: u32,
-    ) -> Result<(), ModelExecutorError> {
-        self.request_state_table
-            .read_full_state(reader, request_table_resource, recurrent_resource, conv_resource)
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {

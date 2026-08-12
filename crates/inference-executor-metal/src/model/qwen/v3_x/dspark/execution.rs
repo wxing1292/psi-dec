@@ -39,15 +39,14 @@ use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedReplayKey
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSampling;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingArgs;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingReplayKey;
-use crate::model::residency_digest::ModelResidencyHasher;
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
 use crate::sampling::dspark_markov::DSparkProposal;
 use crate::sampling::spec_probs::SpecProbsStore;
+
+mod file_io;
 
 pub struct Qwen3xDSparkExecution {
     context: Replay<Qwen3xDSparkContext>,
@@ -189,23 +188,6 @@ impl Qwen3xDSparkExecution {
         self.body.clear();
         self.gather_unembed.clear();
         self.sampling.clear();
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        assert!(
-            self.unloaded_model.is_none(),
-            "Qwen3.x DSpark weights can only be hashed while state is loaded"
-        );
-        self.embed.component().hash_weights(hasher, &format!("{prefix}.embed"));
-        self.context
-            .component()
-            .hash_weights(hasher, &format!("{prefix}.model"));
-        self.gather_unembed
-            .component()
-            .hash_weights(hasher, &format!("{prefix}.unembed"));
-        self.sampling
-            .component()
-            .hash_weights(hasher, &format!("{prefix}.sampling"));
     }
 
     pub fn unload_weights(&mut self) {
@@ -362,14 +344,6 @@ impl Qwen3xDSparkExecution {
         let model = Rc::new(model);
         self.context.component_mut().set_model(Rc::clone(&model));
         self.body.component_mut().set_model(model);
-    }
-
-    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
-        self.gqa_state.write_full_state(writer, resource)
-    }
-
-    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
-        self.gqa_state.read_full_state(reader, resource)
     }
 
     pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {

@@ -337,7 +337,13 @@ The final owner releases the shared Metal resource.
 The snapshot also stores durable GDN request state and future publish page IDs.
 The executor finishes or clears transient restore, publish, and batch transactions before it writes the snapshot.
 
-`load_state` validates the complete snapshot before it allocates state resources.
+State-bearing components implement the symmetric `FullStateIO` trait. `PageArenaStateSnapshotFiles`,
+`GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify their semantic files. The read method requires mutable
+component state.
+
+The writer and reader validate the same topology-specific semantic file set.
+`load_state` validates the snapshot container before it allocates state resources.
+Each component validates its resource length before it reads the resource.
 It attaches consumers only after all state reads succeed.
 It releases all new resources after a read failure.
 
@@ -345,8 +351,10 @@ The Metal backend also provides the standalone `BufferIO` component.
 It transfers byte ranges between files and shared Metal buffers without an application staging buffer.
 `BufferIOFile` owns the POSIX and Metal handles for one file.
 `BufferIOFileCacheMode::Uncached` bypasses the macOS data cache for positional and Metal file I/O.
-The current v1 snapshot path does not use `BufferIO`.
-See [`model_state_io.md`](model_state_io.md) for the current primitive and the planned snapshot migration.
+The current v2 directory snapshot uses `BufferIO` for each Metal buffer resource.
+It uses native-endian `wincode` for the manifest. It streams direct `GDNRequestSlots` metadata with the same
+configuration. It does not use a GDN snapshot DTO.
+See [`model_state_io.md`](model_state_io.md) for the current format and remaining work.
 
 `ReplayableModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
 It also starts a stopped model before it executes a batch.

@@ -22,12 +22,17 @@ crates/inference-executor-metal/src/attn/
     backend.rs              GDN Metal replay wiring and candidate-state materialization
     scratch.rs              reusable GDN scratch allocation owner and borrowed replay bindings
     request_state_table.rs  private CPU request-slot/version/candidate mapping
+    request_state_table/
+      file_io.rs            full-state readiness and decoded-metadata validation
     state_table.rs          public GDNRequestStateTable, live arenas, GDNStatePageIO, and lifecycle
+    state_table/
+      file_io.rs            symmetric full-state metadata and arena file I/O
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
     layer/gdn.rs            Qwen3xGDN, private checkpoint weights, load, and record
     state/gdn.rs            Qwen3xGDNState prepare/restore/commit/publish/reset lifecycle
+    state/gdn/file_io.rs    Qwen3xGDNState full-state file I/O
   v3_5/
     main/layer.rs           Qwen3.5 QGKV-GQA/GDN layer variants
     plan.rs                 Qwen3.5 GDN geometry/config builder
@@ -1045,6 +1050,11 @@ GPU page-ID staging buffers are transient model-owned resources.
 
 `GDNRequestStateTable` owns CPU-side current state slots, current `state_version`s, transaction candidate mappings,
 future publish page IDs, and submitted restore/publish jobs.
+
+`GDNRequestStateTable` and `Qwen3xGDNState` implement `FullStateIO` with `GDNStateSnapshotFiles`. The metadata path uses
+native-endian `wincode` directly on `GDNRequestSlots`. It does not clone state into a snapshot DTO. Stop validates the
+live transaction and future-publish invariants before serialization. Start decodes the table from the same executor
+instance and attaches it only after all GDN resources load successfully.
 
 Recommendation: Barrier audits follow this data flow:
 

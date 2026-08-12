@@ -14,7 +14,6 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
-use crate::model::residency_digest::ModelResidencyHasher;
 
 pub struct Qwen3xUngatedGQAWeightBuffers {
     qkv_weight: Buffer,
@@ -28,17 +27,6 @@ pub struct Qwen3xUngatedGQAWeightBuffers {
 }
 
 impl Qwen3xUngatedGQAWeightBuffers {
-    pub fn hash(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        hasher.buffer(&format!("{prefix}.qkv.weight"), &self.qkv_weight);
-        hasher.buffer(&format!("{prefix}.qkv.scales"), &self.qkv_scales);
-        hasher.buffer(&format!("{prefix}.qkv.biases"), &self.qkv_biases);
-        hasher.buffer(&format!("{prefix}.q_norm.weight"), &self.q_norm_weight);
-        hasher.buffer(&format!("{prefix}.k_norm.weight"), &self.k_norm_weight);
-        hasher.buffer(&format!("{prefix}.output.weight"), &self.output_weight);
-        hasher.buffer(&format!("{prefix}.output.scales"), &self.output_scales);
-        hasher.buffer(&format!("{prefix}.output.biases"), &self.output_biases);
-    }
-
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,

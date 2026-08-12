@@ -21,7 +21,6 @@ use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerInput;
 use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerScratch;
 use crate::model::qwen::v3_x::dspark::main_feature::Qwen3xDSparkMainFeatureProjector;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
-use crate::model::residency_digest::ModelResidencyHasher;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
@@ -183,15 +182,6 @@ impl Qwen3xDSparkModel {
         self.main_feature_projector = Some(Rc::new(projector));
     }
 
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.main_feature_projector()
-            .hash_weights(hasher, &format!("{prefix}.main_feature"));
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            layer.hash_weights(hasher, &format!("{prefix}.layers.{layer_index}"));
-        }
-        self.final_norm.hash_weights(hasher, &format!("{prefix}.final_norm"));
-    }
-
     pub fn unload_state(&mut self) {
         for layer in self.layers.iter_mut().rev() {
             layer.unload_state();
@@ -280,10 +270,6 @@ impl Qwen3xDSparkContext {
         self.model
             .as_deref()
             .expect("Qwen3.x DSpark context model state must be loaded before execution")
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        self.model().hash_weights(hasher, prefix);
     }
 }
 

@@ -16,7 +16,6 @@ use inference_executor_core::def::ModelExecutorError;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
-use crate::model::residency_digest::ModelResidencyHasher;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EmbedConfig {
@@ -125,13 +124,6 @@ impl Embed {
     pub fn unload_weights(&mut self) {
         assert!(self.weights.is_some(), "embedding weights are not loaded");
         self.weights.take();
-    }
-
-    pub fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        let weights = self.weights();
-        hasher.buffer(&format!("{prefix}.weight"), &weights.weight);
-        hasher.buffer(&format!("{prefix}.scales"), &weights.scales);
-        hasher.buffer(&format!("{prefix}.biases"), &weights.biases);
     }
 
     fn validate_weights(&self) {

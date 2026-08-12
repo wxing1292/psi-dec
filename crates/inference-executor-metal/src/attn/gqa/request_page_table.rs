@@ -1,10 +1,8 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GQAPageTableLayout;
-use inference_executor_core::def::ModelExecutorError;
 
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
+mod file_io;
 
 #[derive(Debug)]
 pub struct GQARequestPageTable {
@@ -83,14 +81,6 @@ impl GQARequestPageTable {
             .and_then(|count| count.checked_mul(size_of::<u32>()))
             .expect("GQA request page-table reset byte length must fit usize");
         self.page_ids_buffer().zero_bytes(start, len);
-    }
-
-    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
-        writer.write_buffer(resource, self.page_ids_buffer())
-    }
-
-    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
-        reader.read_buffer(resource, self.page_ids_buffer())
     }
 
     pub fn reset_req_slots(&self, req_slots: &[u32]) {

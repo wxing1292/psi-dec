@@ -2,7 +2,6 @@ pub mod embedding;
 pub mod gather;
 pub mod main_residual_capture;
 pub mod page_arena;
-pub mod residency_digest;
 pub mod qwen;
 pub mod residual_add;
 pub mod rms_norm;

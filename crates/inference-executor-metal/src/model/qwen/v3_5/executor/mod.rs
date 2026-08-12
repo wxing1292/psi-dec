@@ -76,9 +76,11 @@ use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkRecording;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
-use crate::model::residency_digest::ModelResidencyDigest;
-use crate::model::residency_digest::ModelResidencyHasher;
-use crate::model::state_snapshot::ModelFingerprint;
+use crate::model::state_snapshot::FullStateIO;
+use crate::model::state_snapshot::GDNStateSnapshotFiles;
+use crate::model::state_snapshot::GQAStateSnapshotFiles;
+use crate::model::state_snapshot::PageArenaStateSnapshotFiles;
+use crate::model::state_snapshot::StateSnapshotFile;
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
 use crate::model::unembedding::Unembed;
@@ -114,12 +116,42 @@ include!("mtp.rs");
 include!("recording.rs");
 include!("sampling.rs");
 
-const QWEN35_STATE_PAGE_ARENA: u32 = 1;
-const QWEN35_STATE_MAIN_GQA_TABLE: u32 = 2;
-const QWEN35_STATE_MAIN_GDN_RECURRENT: u32 = 3;
-const QWEN35_STATE_MAIN_GDN_CONV: u32 = 4;
-const QWEN35_STATE_SPEC_GQA_TABLE: u32 = 5;
-const QWEN35_STATE_MAIN_GDN_REQUEST_TABLE: u32 = 6;
+const PAGE_ARENA_STATE_FILES: PageArenaStateSnapshotFiles =
+    PageArenaStateSnapshotFiles::new(StateSnapshotFile::PageArena);
+const MAIN_GQA_STATE_FILES: GQAStateSnapshotFiles =
+    GQAStateSnapshotFiles::new(StateSnapshotFile::MainGQARequestPageTable);
+const MAIN_GDN_STATE_FILES: GDNStateSnapshotFiles = GDNStateSnapshotFiles::new(
+    StateSnapshotFile::MainGDNRequestStateTable,
+    StateSnapshotFile::MainGDNRecurrentState,
+    StateSnapshotFile::MainGDNConvState,
+);
+const MTP_GQA_STATE_FILES: GQAStateSnapshotFiles =
+    GQAStateSnapshotFiles::new(StateSnapshotFile::MTPGQARequestPageTable);
+const DSPARK_GQA_STATE_FILES: GQAStateSnapshotFiles =
+    GQAStateSnapshotFiles::new(StateSnapshotFile::DSparkGQARequestPageTable);
+const VANILLA_FULL_STATE_SNAPSHOT_FILES: &[StateSnapshotFile] = &[
+    PAGE_ARENA_STATE_FILES.pages(),
+    MAIN_GQA_STATE_FILES.request_page_table(),
+    MAIN_GDN_STATE_FILES.request_state_table(),
+    MAIN_GDN_STATE_FILES.recurrent_state(),
+    MAIN_GDN_STATE_FILES.conv_state(),
+];
+const MTP_FULL_STATE_SNAPSHOT_FILES: &[StateSnapshotFile] = &[
+    PAGE_ARENA_STATE_FILES.pages(),
+    MAIN_GQA_STATE_FILES.request_page_table(),
+    MAIN_GDN_STATE_FILES.request_state_table(),
+    MAIN_GDN_STATE_FILES.recurrent_state(),
+    MAIN_GDN_STATE_FILES.conv_state(),
+    MTP_GQA_STATE_FILES.request_page_table(),
+];
+const DSPARK_FULL_STATE_SNAPSHOT_FILES: &[StateSnapshotFile] = &[
+    PAGE_ARENA_STATE_FILES.pages(),
+    MAIN_GQA_STATE_FILES.request_page_table(),
+    MAIN_GDN_STATE_FILES.request_state_table(),
+    MAIN_GDN_STATE_FILES.recurrent_state(),
+    MAIN_GDN_STATE_FILES.conv_state(),
+    DSPARK_GQA_STATE_FILES.request_page_table(),
+];
 
 #[allow(clippy::upper_case_acronyms)]
 enum Qwen35Speculator {
@@ -319,19 +351,6 @@ impl Qwen35Speculator {
         }
     }
 
-    fn hash_weights(&self, hasher: &mut ModelResidencyHasher, prefix: &str) {
-        match self {
-            Self::Vanilla => {},
-            Self::MTP(mtp) => {
-                mtp.embed
-                    .component()
-                    .hash_weights(hasher, &format!("{prefix}.mtp.embed"));
-                mtp.body.component().hash_weights(hasher, &format!("{prefix}.mtp.body"));
-            },
-            Self::DSpark(dspark) => dspark.execution.hash_weights(hasher, &format!("{prefix}.dspark")),
-        }
-    }
-
     fn unload_weights(&mut self) {
         match self {
             Self::Vanilla => {},
@@ -389,8 +408,8 @@ impl Qwen35Speculator {
     fn write_full_state(&self, writer: &mut StateSnapshotWriter) -> Result<(), ModelExecutorError> {
         match self {
             Self::Vanilla => Ok(()),
-            Self::MTP(mtp) => mtp.gqa_state.write_full_state(writer, QWEN35_STATE_SPEC_GQA_TABLE),
-            Self::DSpark(dspark) => dspark.execution.write_full_state(writer, QWEN35_STATE_SPEC_GQA_TABLE),
+            Self::MTP(mtp) => mtp.gqa_state.write_full_state(writer, MTP_GQA_STATE_FILES),
+            Self::DSpark(dspark) => dspark.execution.write_full_state(writer, DSPARK_GQA_STATE_FILES),
         }
     }
 
@@ -431,11 +450,11 @@ impl Qwen35Speculator {
         }
     }
 
-    fn read_full_state(&self, reader: &mut StateSnapshotReader) -> Result<(), ModelExecutorError> {
+    fn read_full_state(&mut self, reader: &mut StateSnapshotReader) -> Result<(), ModelExecutorError> {
         match self {
             Self::Vanilla => Ok(()),
-            Self::MTP(mtp) => mtp.gqa_state.read_full_state(reader, QWEN35_STATE_SPEC_GQA_TABLE),
-            Self::DSpark(dspark) => dspark.execution.read_full_state(reader, QWEN35_STATE_SPEC_GQA_TABLE),
+            Self::MTP(mtp) => mtp.gqa_state.read_full_state(reader, MTP_GQA_STATE_FILES),
+            Self::DSpark(dspark) => dspark.execution.read_full_state(reader, DSPARK_GQA_STATE_FILES),
         }
     }
 }
@@ -470,12 +489,19 @@ pub struct Qwen35Executor {
     pending_transactions: Qwen35PendingTransactions,
     gqa_page_table_layout: GQAPageTableLayout,
     num_gqa_page_ids_per_main_lane_block: usize,
-    state_fingerprint: ModelFingerprint,
     unloaded_embed: Option<Embed>,
     unloaded_unembed: Option<Unembed>,
 }
 
 impl Qwen35Executor {
+    fn full_state_snapshot_files(&self) -> &'static [StateSnapshotFile] {
+        match &self.speculator {
+            Qwen35Speculator::Vanilla => VANILLA_FULL_STATE_SNAPSHOT_FILES,
+            Qwen35Speculator::MTP(_) => MTP_FULL_STATE_SNAPSHOT_FILES,
+            Qwen35Speculator::DSpark(_) => DSPARK_FULL_STATE_SNAPSHOT_FILES,
+        }
+    }
+
     pub fn clear_replay_cache(&mut self) {
         self.finish_cache_publish();
         self.main_embed.clear();
@@ -548,31 +574,18 @@ impl Qwen35Executor {
             self.pending_transactions.is_empty(),
             "qwen3.5 state snapshots require all pending model transactions to complete"
         );
-        let mut writer = StateSnapshotWriter::new(snapshot_path, self.state_fingerprint)?;
-        self.main_gqa_state
-            .write_full_state(&mut writer, QWEN35_STATE_MAIN_GQA_TABLE)?;
-        self.main_gdn_state.write_full_state(
-            &mut writer,
-            QWEN35_STATE_MAIN_GDN_REQUEST_TABLE,
-            QWEN35_STATE_MAIN_GDN_RECURRENT,
-            QWEN35_STATE_MAIN_GDN_CONV,
+        let mut writer = StateSnapshotWriter::new(
+            snapshot_path,
+            self.full_state_snapshot_files(),
+            self.runtime.buffer_io(),
         )?;
+        self.main_gqa_state
+            .write_full_state(&mut writer, MAIN_GQA_STATE_FILES)?;
+        self.main_gdn_state
+            .write_full_state(&mut writer, MAIN_GDN_STATE_FILES)?;
         self.speculator.write_full_state(&mut writer)?;
-        self.pages.write_full_state(&mut writer, QWEN35_STATE_PAGE_ARENA)?;
+        self.pages.write_full_state(&mut writer, PAGE_ARENA_STATE_FILES)?;
         writer.commit()
-    }
-
-    pub fn residency_digest(&mut self, state_path: &Path) -> Result<ModelResidencyDigest, ModelExecutorError> {
-        self.write_full_state(state_path)?;
-        let mut hasher = ModelResidencyHasher::new();
-        self.main_embed.component().hash_weights(&mut hasher, "main.embed");
-        self.main.component().hash_weights(&mut hasher, "main.body");
-        self.gather_unembed
-            .component()
-            .hash_weights(&mut hasher, "main.unembed");
-        self.speculator.hash_weights(&mut hasher, "speculator");
-        hasher.file("state", state_path)?;
-        Ok(hasher.finish())
     }
 
     pub fn unload_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
@@ -587,7 +600,11 @@ impl Qwen35Executor {
     }
 
     pub fn load_state(&mut self, snapshot_path: &Path) -> Result<(), ModelExecutorError> {
-        let mut reader = StateSnapshotReader::open(snapshot_path, self.state_fingerprint)?;
+        let mut reader = StateSnapshotReader::open(
+            snapshot_path,
+            self.full_state_snapshot_files(),
+            self.runtime.buffer_io(),
+        )?;
         let device = self.runtime.device().clone();
         self.main_gqa_state.allocate_resources(&device);
         self.main_gdn_state.allocate_resources(&device);
@@ -595,16 +612,10 @@ impl Qwen35Executor {
         self.pages.allocate_resources(&device);
 
         let result = (|| {
-            self.main_gqa_state
-                .read_full_state(&mut reader, QWEN35_STATE_MAIN_GQA_TABLE)?;
-            self.main_gdn_state.read_full_state(
-                &mut reader,
-                QWEN35_STATE_MAIN_GDN_REQUEST_TABLE,
-                QWEN35_STATE_MAIN_GDN_RECURRENT,
-                QWEN35_STATE_MAIN_GDN_CONV,
-            )?;
+            self.main_gqa_state.read_full_state(&mut reader, MAIN_GQA_STATE_FILES)?;
+            self.main_gdn_state.read_full_state(&mut reader, MAIN_GDN_STATE_FILES)?;
             self.speculator.read_full_state(&mut reader)?;
-            self.pages.read_full_state(&mut reader, QWEN35_STATE_PAGE_ARENA)?;
+            self.pages.read_full_state(&mut reader, PAGE_ARENA_STATE_FILES)?;
             reader.finish()
         })();
         if let Err(error) = result {

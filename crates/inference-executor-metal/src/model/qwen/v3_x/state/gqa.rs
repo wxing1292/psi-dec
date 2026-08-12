@@ -5,7 +5,6 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
-use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::gqa::backend::GQA;
@@ -17,8 +16,8 @@ use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::attn::gqa::scratch::GQAScratch;
-use crate::model::state_snapshot::StateSnapshotReader;
-use crate::model::state_snapshot::StateSnapshotWriter;
+
+mod file_io;
 
 pub struct Qwen3xGQAState {
     backend: Option<Rc<GQA>>,
@@ -180,10 +179,6 @@ impl Qwen3xGQAState {
         self.request_page_table().reset_req_slots(req_slots);
     }
 
-    pub fn write_full_state(&self, writer: &mut StateSnapshotWriter, resource: u32) -> Result<(), ModelExecutorError> {
-        self.request_page_table().write_full_state(writer, resource)
-    }
-
     pub fn release_resources(&mut self) {
         assert!(
             self.backend.is_some()
@@ -215,10 +210,6 @@ impl Qwen3xGQAState {
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
         self.metadata = Some(GQAMetadataBuffers::new(device, self.max_tokens));
     }
-
-    pub fn read_full_state(&self, reader: &mut StateSnapshotReader, resource: u32) -> Result<(), ModelExecutorError> {
-        self.request_page_table().read_full_state(reader, resource)
-    }
 }
 
 #[cfg(test)]
@@ -232,7 +223,9 @@ mod tests {
 
     use super::Qwen3xGQAState;
     use crate::attn::gqa::backend::GQAMetalConfig;
-    use crate::model::state_snapshot::ModelFingerprint;
+    use crate::model::state_snapshot::FullStateIO;
+    use crate::model::state_snapshot::GQAStateSnapshotFiles;
+    use crate::model::state_snapshot::StateSnapshotFile;
     use crate::model::state_snapshot::StateSnapshotReader;
     use crate::model::state_snapshot::StateSnapshotWriter;
 
@@ -241,7 +234,8 @@ mod tests {
     const NUM_BLOCKS: usize = 2;
     const NUM_PAGE_IDS_PER_BLOCK: usize = 2;
     const NUM_CACHE_PAGES: u32 = 64;
-    const STATE_RESOURCE: u32 = 1;
+    const SNAPSHOT_FILES: GQAStateSnapshotFiles =
+        GQAStateSnapshotFiles::new(StateSnapshotFile::MainGQARequestPageTable);
 
     #[test]
     fn test_unload_load_fixed_state() {
@@ -296,20 +290,21 @@ mod tests {
         write_page_ids(&state, &expected_page_ids);
 
         let snapshot_path = snapshot_path(name);
-        let fingerprint = ModelFingerprint::new([0x47; 16]);
-        let mut writer = StateSnapshotWriter::new(&snapshot_path, fingerprint).unwrap();
-        state.write_full_state(&mut writer, STATE_RESOURCE).unwrap();
+        let buffer_io = inference_backend_metal::metal::BufferIO::new(&device);
+        let snapshot_files = [SNAPSHOT_FILES.request_page_table()];
+        let mut writer = StateSnapshotWriter::new(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        state.write_full_state(&mut writer, SNAPSHOT_FILES).unwrap();
         writer.commit().unwrap();
 
         state.release_resources();
         state.allocate_resources(&device);
 
-        let mut reader = StateSnapshotReader::open(&snapshot_path, fingerprint).unwrap();
-        state.read_full_state(&mut reader, STATE_RESOURCE).unwrap();
+        let mut reader = StateSnapshotReader::open(&snapshot_path, &snapshot_files, &buffer_io).unwrap();
+        state.read_full_state(&mut reader, SNAPSHOT_FILES).unwrap();
         reader.finish().unwrap();
 
         assert_eq!(read_page_ids(&state), expected_page_ids);
-        std::fs::remove_file(snapshot_path).unwrap();
+        std::fs::remove_dir_all(snapshot_path).unwrap();
     }
 
     fn new_state(device: &Device) -> Qwen3xGQAState {
