@@ -31,18 +31,18 @@ impl SoftmaxConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SoftmaxShape {
-    pub num_rows: u32,
+    pub num_total_rows: u32,
 }
 
 impl SoftmaxShape {
     fn validate(self) {
-        assert!(self.num_rows > 0);
+        assert!(self.num_total_rows > 0);
     }
 
     fn bytes(self, config: SoftmaxConfig) -> usize {
         self.validate();
         config.validate();
-        (self.num_rows as usize)
+        (self.num_total_rows as usize)
             .checked_mul(config.num_values_per_row as usize)
             .and_then(|num_values| num_values.checked_mul(config.dtype.item_size()))
             .expect("softmax byte length must fit usize")
@@ -83,14 +83,14 @@ impl SoftmaxKernel {
     /// Records a fixed-capacity grid whose active row count is supplied at submission.
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: SoftmaxShape,
+        capacity_shape: SoftmaxShape,
         num_active_rows_key: ReplayParameterKey,
         buffers: SoftmaxBuffers<'a>,
     ) -> SoftmaxInvocation<'a> {
-        shape.validate();
+        capacity_shape.validate();
         SoftmaxInvocation {
             kernel: self,
-            shape,
+            shape: capacity_shape,
             buffers,
             num_active_rows_key: Some(num_active_rows_key),
         }
@@ -118,8 +118,8 @@ impl Operator for SoftmaxInvocation<'_> {
         builder.set_buffer_write(1, self.buffers.output, 0);
         builder.set_i32(2, config.num_values_per_row as i32);
         match self.num_active_rows_key {
-            Some(key) => builder.bind_u32(3, key, 1, shape.num_rows),
-            None => builder.set_u32(3, shape.num_rows),
+            Some(key) => builder.bind_u32(3, key, 1, shape.num_total_rows),
+            None => builder.set_u32(3, shape.num_total_rows),
         }
 
         let n_reads = 4usize;
@@ -128,7 +128,7 @@ impl Operator for SoftmaxInvocation<'_> {
         let num_simdgroups = num_threads_needed.div_ceil(simd_size);
         let num_threads_per_threadblock = simd_size * num_simdgroups;
         builder.dispatch_1d(
-            shape.num_rows as usize * num_threads_per_threadblock,
+            shape.num_total_rows as usize * num_threads_per_threadblock,
             num_threads_per_threadblock,
         );
     }
@@ -295,7 +295,7 @@ mod tests {
             num_values_per_row: 4,
             dtype: Dtype::Bfloat16,
         };
-        let shape = SoftmaxShape { num_rows: 2 };
+        let shape = SoftmaxShape { num_total_rows: 2 };
         let (device, kernel) = create_softmax_kernel(config);
         let stream = Stream::new(&device);
         let input_values = [-2.0, -1.0, 0.0, 1.0, 4.0, 2.0, 0.0, -2.0];
@@ -317,19 +317,19 @@ mod tests {
         let actual = read_bf16_values(&output, input_values.len());
         let expected = cpu_softmax_bf16_rows(
             &input_values,
-            shape.num_rows as usize,
+            shape.num_total_rows as usize,
             config.num_values_per_row as usize,
         );
         assert_close(&actual, &expected, 0.01);
     }
 
     #[test]
-    fn test_bucketed_active_rows_are_total_and_reusable() {
+    fn test_bucketed_replay_preserves_inactive_tail_across_grow_and_shrink() {
         let config = SoftmaxConfig {
             num_values_per_row: 4,
             dtype: Dtype::Bfloat16,
         };
-        let shape = SoftmaxShape { num_rows: 4 };
+        let shape = SoftmaxShape { num_total_rows: 4 };
         let (device, kernel) = create_softmax_kernel(config);
         let stream = Stream::new(&device);
         let all_input_values = [
@@ -384,7 +384,7 @@ mod tests {
             num_values_per_row: 4,
             dtype: Dtype::Bfloat16,
         };
-        let shape = SoftmaxShape { num_rows: 4 };
+        let shape = SoftmaxShape { num_total_rows: 4 };
         let (device, kernel) = create_softmax_kernel(config);
         let stream = Stream::new(&device);
         let input = Buffer::new_zeroed(&device, shape.bytes(config));
@@ -420,8 +420,8 @@ mod tests {
             num_values_per_row: 4,
             dtype: Dtype::Bfloat16,
         };
-        let shape = SoftmaxShape { num_rows: 4 };
-        let active_shape = SoftmaxShape { num_rows: 3 };
+        let shape = SoftmaxShape { num_total_rows: 4 };
+        let active_shape = SoftmaxShape { num_total_rows: 3 };
         let (device, kernel) = create_softmax_kernel(config);
         let stream = Stream::new(&device);
         let full = Buffer::new_zeroed(&device, shape.bytes(config));

@@ -916,7 +916,7 @@ where
     );
     builder.record_with_barrier_before(record.router_softmax.invoke(
         SoftmaxShape {
-            num_rows: record.routing_shape.num_tokens,
+            num_total_rows: record.routing_shape.num_tokens,
         },
         SoftmaxBuffers {
             input: record.router_logits,
@@ -1010,7 +1010,7 @@ where
     );
     builder.record_with_barrier_before(record.router_softmax.invoke(
         SoftmaxShape {
-            num_rows: record.routing_shape.num_tokens,
+            num_total_rows: record.routing_shape.num_tokens,
         },
         SoftmaxBuffers {
             input: record.router_logits,

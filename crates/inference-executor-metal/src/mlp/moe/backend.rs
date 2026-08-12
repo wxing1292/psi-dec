@@ -902,8 +902,10 @@ impl GatedMoE {
         MoERoutingShape { num_tokens }
     }
 
-    fn router_softmax_shape(&self, num_tokens: u32) -> SoftmaxShape {
-        SoftmaxShape { num_rows: num_tokens }
+    fn router_softmax_shape(&self, num_total_tokens: u32) -> SoftmaxShape {
+        SoftmaxShape {
+            num_total_rows: num_total_tokens,
+        }
     }
 
     fn token_major_shape(&self, shape: GatedMoEReplayShape) -> QuantizedSparseMLPTokenMajorShape {

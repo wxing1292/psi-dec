@@ -213,6 +213,18 @@ Keep runtime or replay shapes separate from initialization capacity and storage 
 token, request, and runtime-partition counts. A bucketed replay shape can also contain the recorded capacity for each
 active work domain.
 
+A reusable leaf component may use one `*Shape` for exact and bucketed invocations. Keep this shape when it owns shape
+validation or derived execution extents, or when it preserves the contract of peer components. Do not remove it only
+because it contains one field.
+
+For a shared exact and bucketed shape, use `num_total_<domain>` for the recorded grid or capacity. The exact invocation
+uses the total count as its active count. It must not declare an unused active-count replay parameter. The bucketed
+invocation binds `num_active_<domain>` at submission and must validate `0 < num_active_<domain> <= num_total_<domain>`.
+Use `num_<domain>` only when the component has no active and total distinction.
+
+Remove an exact API or a shared shape only after a repository-wide reference audit confirms that production does not
+use it. Tests and benchmarks are not sufficient evidence of production ownership.
+
 It does not contain initialization capacities, persistent-buffer strides, or storage coordinates. A replay capacity
 can equal an initialization limit, but it has a different owner and meaning.
 

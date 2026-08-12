@@ -33,18 +33,18 @@ impl RowGatherConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RowGatherShape {
-    pub num_rows: u32,
+    pub num_total_rows: u32,
 }
 
 impl RowGatherShape {
     fn validate(self, config: RowGatherConfig) {
         config.validate();
-        assert!(self.num_rows > 0);
+        assert!(self.num_total_rows > 0);
         self.num_values(config);
     }
 
     fn row_indices_bytes(self) -> usize {
-        (self.num_rows as usize)
+        (self.num_total_rows as usize)
             .checked_mul(size_of::<u32>())
             .expect("row gather index byte length must fit usize")
     }
@@ -56,7 +56,7 @@ impl RowGatherShape {
     }
 
     fn num_values(self, config: RowGatherConfig) -> u32 {
-        self.num_rows
+        self.num_total_rows
             .checked_mul(config.num_cols)
             .expect("row gather value count must fit the shader u32 index domain")
     }
@@ -133,8 +133,8 @@ impl Operator for RowGatherInvocation<'_> {
         builder.set_buffer_write(2, self.buffers.output, 0);
         builder.set_u32(3, self.config.num_cols);
         match self.num_active_rows_key {
-            Some(key) => builder.bind_u32(4, key, 1, self.shape.num_rows),
-            None => builder.set_u32(4, self.shape.num_rows),
+            Some(key) => builder.bind_u32(4, key, 1, self.shape.num_total_rows),
+            None => builder.set_u32(4, self.shape.num_total_rows),
         }
         builder.dispatch_1d(self.shape.num_values(self.config) as usize, NUM_THREADS_PER_THREADBLOCK);
     }
@@ -178,7 +178,7 @@ mod tests {
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
-            RowGatherShape { num_rows: 2 },
+            RowGatherShape { num_total_rows: 2 },
             RowGatherBuffers {
                 input: &input,
                 row_indices: &row_indices,
@@ -208,7 +208,7 @@ mod tests {
             num_cols: 3,
             dtype: Dtype::Bfloat16,
         };
-        let shape = RowGatherShape { num_rows: 4 };
+        let shape = RowGatherShape { num_total_rows: 4 };
         let kernel = RowGatherKernel::new(&device, config);
         let input = Buffer::new_zeroed(&device, config.row_bytes());
         let row_indices = Buffer::from_slice(&device, &[0_u32; 4]);
@@ -273,8 +273,8 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = RowGatherConfig { num_cols: 3, dtype };
-        let capacity_shape = RowGatherShape { num_rows: 4 };
-        let active_shape = RowGatherShape { num_rows: 3 };
+        let capacity_shape = RowGatherShape { num_total_rows: 4 };
+        let active_shape = RowGatherShape { num_total_rows: 3 };
         let row_bytes = config.row_bytes();
         let input_values = (0..4 * row_bytes)
             .map(|index| u8::try_from(index + 1).unwrap())

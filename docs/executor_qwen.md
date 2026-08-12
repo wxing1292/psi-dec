@@ -409,8 +409,9 @@ Qwen3 MainEmbed still selects exact recording.
 Qwen3.5 MTPEmbed selects bucketed embedding recording as part of its composed replay.
 
 The shared row-gather leaf supports exact and bucketed recording.
-Exact recording fixes the active row count to `RowGatherShape::num_rows` and declares no replay parameter.
-Bucketed recording interprets `RowGatherShape::num_rows` as the recorded capacity.
+`RowGatherShape::num_total_rows` is the recorded grid extent for both paths.
+Exact recording fixes the active row count to this extent and declares no replay parameter.
+Bucketed recording supplies the active row count at submission.
 It validates the row-index and output buffers and dispatches the grid for that capacity.
 It binds the caller-provided active-row key with the range `1..=capacity`.
 The kernel checks the active row count before it reads an inactive row index or input value and before it writes an

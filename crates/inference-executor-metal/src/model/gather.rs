@@ -38,7 +38,9 @@ impl Gather {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.op.invoke(
-            RowGatherShape { num_rows },
+            RowGatherShape {
+                num_total_rows: num_rows,
+            },
             RowGatherBuffers {
                 input,
                 row_indices,
@@ -59,9 +61,7 @@ impl Gather {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.op.invoke_bucketed(
-            RowGatherShape {
-                num_rows: num_total_rows,
-            },
+            RowGatherShape { num_total_rows },
             num_active_rows_key,
             RowGatherBuffers {
                 input,

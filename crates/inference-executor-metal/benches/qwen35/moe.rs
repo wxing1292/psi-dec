@@ -243,7 +243,9 @@ impl ForcedMoEKernels {
             0,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke(
-            SoftmaxShape { num_rows: num_tokens },
+            SoftmaxShape {
+                num_total_rows: num_tokens,
+            },
             SoftmaxBuffers {
                 input: scratch.routing.router_logits,
                 output: scratch.routing.router_probs,
