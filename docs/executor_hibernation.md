@@ -111,9 +111,11 @@ It scans the request-slot allocator bitmap in the same way.
 
 The durable GDN request state table contains these values:
 
-- The current state slot for each request slot.
+- The current recurrent state slot for each request slot.
+- The current convolution state slot for each request slot.
 - The current state version for each request slot.
-- Free state slots in allocator order.
+- Free recurrent state slots in recurrent allocator order.
+- Free convolution state slots in convolution allocator order.
 - Future state versions that must publish to runtime-owned page IDs.
 - The page IDs for each future publish.
 

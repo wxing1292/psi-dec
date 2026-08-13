@@ -166,6 +166,9 @@ TaskTemplate, or ABI buffer.
 
 Thread position `x = 0..31` selects a Dqk lane. Position `y = 0..7` selects a V row in the tile.
 
+The normal final-state path uses this configured tile. The following diagram shows the normal final-state
+`Dv_tile=8` partition.
+
 For Qwen `Dqk=128`, one thread owns four strided state values:
 
 ```text
@@ -198,6 +201,11 @@ row.
 
 This pattern describes memory access. It does not guarantee one 512-byte hardware transaction.
 
+The candidate-state path uses the independently tuned register-V partition. One SIMDgroup owns a `[2, 128]` state
+tile. Each lane owns `2 * 4 = 8` F32 state values. Two SIMDgroups form one 64-thread threadgroup and collectively own a
+`[4, 128]` state tile. They share normalized Q/K and gate scalars. The candidate-state threadgroup does not use the
+eight-SIMDgroup partition from the normal final-state diagram.
+
 The threadblock loads its source tile into distributed thread-local fragments. It advances them across the request's
 flat-token segment.
 
@@ -212,8 +220,9 @@ ordered:  tokens within one request
 
 State-page I/O is a copy operation, not matmul-like math. Therefore, it has no required `*Tile`.
 
-Each state-I/O request selects one state slot and its page IDs across every GDN layer and state kind. The owning Metal
-kernels map one logical `GDNStatePageReadTask` or `GDNStatePageWriteTask` 1:1 to one threadblock:
+Each state-I/O request selects one logical state version, one recurrent physical slot, one convolution physical slot,
+and its page IDs across every GDN layer. The owning Metal kernels map one logical `GDNStatePageReadTask` or
+`GDNStatePageWriteTask` 1:1 to one threadblock:
 
 ```text
 GDNStatePageReadTask / GDNStatePageWriteTask {  // logical; one per threadblock
@@ -224,8 +233,9 @@ GDNStatePageReadTask / GDNStatePageWriteTask {  // logical; one per threadblock
 }
 ```
 
-The implementation does not materialize a Task value, TaskTemplate, or ABI buffer. `page_id` and `state_slot` are data
-inputs, not Task coordinates.
+The implementation does not materialize a Task value, TaskTemplate, or ABI buffer. `page_id`,
+`recurrent_state_slot`, and `conv_state_slot` are data inputs, not Task coordinates. `state_kind` selects which
+physical slot applies to the task.
 
 One threadblock copies one page with `float4` lanes. The grid launches all requested state-page copies.
 
@@ -284,7 +294,7 @@ QKVABZ split
 
 short convolution
   buffers 0..7: conv_qkv, next_conv_state, qkv, conv_state,
-                conv_weight, src_state_slots, flat_materialized_state_slots, cu_tokens
+                conv_weight, src_conv_state_slots, flat_materialized_conv_state_slots, cu_tokens
   parameter dtype: conv_weight bf16
   scalars 8..12: num_active_reqs, num_active_tokens, conv_state_offset_bytes,
                  next_conv_state_offset_bytes, write_final_state
@@ -292,7 +302,8 @@ short convolution
 
 ragged recurrent
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
-                a_log, dt_bias, src_state_slots, flat_materialized_state_slots, cu_tokens
+                a_log, dt_bias, src_recurrent_state_slots,
+                flat_materialized_recurrent_state_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
   scalars 10..12: q_scale, num_active_reqs, recurrent_state_offset_bytes
   grid: (Dv / Dv_tile, total_reqs * Hv, 1)
@@ -305,23 +316,27 @@ output_norm_gate
   dispatch: total_tokens * Hv * 128, 128 threads/threadblock
 
 batched state-page read/write
-  buffers 0..4: pages, recurrent_states, conv_states, page_ids, state_slots
-  scalars 5..12: num_gdn_layers, num_state_slots, num_state_io_requests,
+  buffers 0..5: pages, recurrent_states, conv_states, page_ids,
+                recurrent_state_slots, conv_state_slots
+  scalars 6..13: num_gdn_layers, num_state_slots, num_state_io_requests,
                  num_recurrent_pages_per_state_slot, recurrent_state_bytes,
                  num_conv_pages_per_state_slot, conv_state_bytes, page_bytes
   grid: (total_pages, 1, 1), threads: (256, 1, 1)
 ```
 
 Candidate convolution materialization uses buffers 0..5 for `next_conv_state`, `qkv`, `conv_state`,
-`src_state_slots`, `flat_materialized_state_slots`, and `cu_tokens`. Its scalars 6..9 are `num_active_reqs`,
+`src_conv_state_slots`, `flat_materialized_conv_state_slots`, and `cu_tokens`. Its scalars 6..9 are `num_active_reqs`,
 `num_active_tokens`, `conv_state_offset_bytes`, and `next_conv_state_offset_bytes`.
 
-Candidate recurrent materialization uses `flat_materialized_state_slots` at buffer 8 and `cu_tokens` at buffer 9. It uses
-scalars 10..12.
+Candidate recurrent materialization uses `src_recurrent_state_slots` at buffer 7,
+`flat_materialized_recurrent_state_slots` at buffer 8, and `cu_tokens` at buffer 9. It uses scalars 10..12. One SIMDgroup
+owns one `[2, Dqk]` register tile. Two SIMDgroups share normalized Q/K and gate scalars through threadgroup memory. The
+grid is `(Dv / 4, total_reqs * Hv, 1)`. The threadgroup shape is `(32, 2, 1)`. The candidate path requires `Dqk % 32 ==
+0`, `Dv % 2 == 0`, and an even `Dv / 2` tile count. These requirements are initialization-time geometry contracts.
 
 The invalid state-slot sentinel is `u32::MAX`. All compute variants use the same row-level contract. A row always
-produces its normal output. A kernel writes the row's convolution and recurrent states only when the corresponding
-`flat_materialized_state_slots` entry contains a valid slot.
+produces its normal output. A kernel writes the row's convolution or recurrent state only when the corresponding domain
+entry contains a valid slot.
 
 ## Ownership
 
@@ -358,9 +373,10 @@ The GDN token bucket policy unions both affine topology boundaries. Thus, one bu
 boundary.
 `GDN` does not select or name an affine kernel.
 
-`GDN` translates immutable `GDNCore` geometry into `GDNComputeConfig`. `GDNCompute::new` selects the recurrent
-`Dv_tile` from that config. It uses the measured 8-lane tile when `v_head_dim` permits it. It falls back through 4, 2,
-and 1 for other valid dimensions. The selected tile specializes the generated Metal source together with
+`GDN` translates immutable `GDNCore` geometry into `GDNComputeConfig`. `GDNCompute::new` selects the normal recurrent
+`Dv_tile` from that config. It uses the measured 8-lane tile when `v_head_dim` permits it. It falls back to 4 for other
+valid dimensions. The production candidate-state kernel uses the independently tuned two-row register-V tile and two
+SIMDgroups per threadgroup. These selected tiles specialize the generated Metal source together with
 `num_qk_heads/qk_head_dim`, `num_v_heads/v_head_dim`, `conv_kernel_size`, and derived `qkv_dim`.
 The model adapter does not select this kernel configuration. `GDNComputeShape` contains only recorded request and token
 extents.
@@ -404,25 +420,34 @@ The logical model-level GDN storage shape is:
 recurrent_states[num_gdn_layers][num_state_slots][num_v_heads][v_head_dim][qk_head_dim]
 conv_states[num_gdn_layers][num_state_slots][Cqkv][Ks]
 
-one state_slot:
-  recurrent_states[gdn_layer_index][state_slot]
-  conv_states[gdn_layer_index][state_slot]
+one logical state_version -> (recurrent_state_slot, conv_state_slot)
+
+one recurrent slot:
+  recurrent_states[gdn_layer_index][recurrent_state_slot]
+
+one convolution slot:
+  conv_states[gdn_layer_index][conv_state_slot]
 
 page_ids_staging[state_io_request]
   [num_gdn_layers]
     [num_recurrent_pages_per_state_slot]
     [num_conv_pages_per_state_slot]
+recurrent_state_slots_staging[state_io_request]
+conv_state_slots_staging[state_io_request]
 ```
 
-`num_state_slots` is the only state-slot dimension. One slot names one complete GDN state with its recurrent and
-convolution substates. Their trailing dimensions come directly from the shared GDN core. They are not separate request-slot
-axes.
+Each arena currently has the same `num_state_slots` physical capacity. The state-table boundary names recurrent and
+convolution physical slots independently. Fresh C0-only allocation can produce equal numeric IDs because the two pools
+start in the same order. ID equality is not a contract. C0 prepare, compute, commit, publish, restore, and snapshot paths
+consume the two IDs independently. The trailing dimensions come directly from the shared GDN core. They are not separate
+request-slot axes.
 
 `page_bytes` is the raw allocation unit. Page I/O divides by `sizeof(f32)` only when it indexes f32 state. A layout or
 state object never stores that derived capacity.
 
 Runtime page IDs remain CPU transaction data in `GDNStatePages` vectors. `GDNStatePageIO` owns the reusable
-`page_ids`/`state_slots` GPU staging buffers and the batched read/write kernels. It fills the staging buffers immediately
+`page_ids`, `recurrent_state_slots`, and `conv_state_slots` GPU staging buffers and the batched read/write kernels. It
+fills the staging buffers immediately
 before restore or publish recording. The buffers do not represent persistent request-page ownership.
 
 At initialization, Qwen wiring derives direct per-request state-slot, candidate-state, and publish-staging capacities.
@@ -449,6 +474,12 @@ merging the two ordered inputs.
 The public table directly owns a private `GDNRequestSlots` mapping, pending restore/publish state transactions, and one
 `GDNStatePageIO`. It has no second public state table or mutable aggregate wrapper.
 
+`GDNRequestSlots` owns `current_recurrent_state_slots` and `current_conv_state_slots`. It also owns separate free pools
+and separate transaction maps from state version to physical slot for the two domains. `begin_txn(...)` receives
+`recurrent_materialized_state_versions` and `conv_materialized_state_versions` independently. Current C0 preparation
+passes the same ordered union to both inputs. The owner pairs domain slots only when a committed current state or a
+page publish requires both.
+
 `GDNStateTxn` is backend-neutral per-request metadata for one microbatch. It lives from
 `GDNRequestStateTable::prepare(...)` through `commit(...)`. The prepare boundary receives request slots, block and token
 indices, cumulative token counts, transactions, and runtime state-page IDs. It does not depend on a Qwen microbatch
@@ -474,7 +505,8 @@ validates the shifted version against the candidate range. Qwen and sampling cod
 `GDNStateTxn` is common Qwen3.x GDN metadata.
 
 `GDNMetadataBuffers` is the state-domain-owned, capacity-sized GPU metadata object that all GDN layers share. Prepare
-writes `cu_tokens`, `src_state_slots`, and `flat_materialized_state_slots`. Prepare then returns and stores the
+writes `cu_tokens`, `src_recurrent_state_slots`, `src_conv_state_slots`,
+`flat_materialized_recurrent_state_slots`, and `flat_materialized_conv_state_slots`. Prepare then returns and stores the
 authoritative `GDNReplayShape`.
 
 `GDNMetadataBuffers` is the sole owner of the current replay shape. `GDNInput` borrows the metadata object instead of a
@@ -659,16 +691,17 @@ In ragged recurrent, each Q/K lane produces `q_square_sum_partial`, `k_square_su
 Output norm + gate uses `square_sum_partial` and threadgroup `square_sum_partials` before it computes the inverse RMS.
 No partial changes the existing dispatch, scratch, or ABI.
 
-`GDNCompute` currently owns one compute path: ragged recurrent execution. It handles one or more flat tokens per request
-with
-`cu_tokens`. The recurrent kernel computes Q/K inverse norms, decay, and beta. It advances each request's tokens in order.
+`GDNCompute` owns one mathematical compute path: ragged recurrent execution. It has a final-state kernel and a
+candidate-state kernel for the two materialization contracts. It handles one or more flat tokens per request with
+`cu_tokens`. Each recurrent kernel computes Q/K inverse norms, decay, and beta. It advances each request's tokens in order.
 It parallelizes across requests, V heads, V-dimension tiles, and Q/K-dimension lanes.
 
 ### Execution strategy
 
-`ragged_recurrent` is the current GDN compute path. It does not define GDN itself. Another compute path can share the
-tensor and state-tile vocabulary. That path owns a different Task and Grid contract. Do not add `GDNComputePath` until a
-second production implementation exists. The current path is:
+`ragged_recurrent` is the current GDN compute path. It does not define GDN itself. The final-state and candidate-state
+kernels use the same operation order and row segmentation. They use independently tuned state-tile partitions for their
+different write contracts. Do not add `GDNComputePath` until a second mathematical production implementation exists. The
+current path is:
 
 ```text
 shape: num_tokens >= num_reqs, segmented by cu_tokens
@@ -677,9 +710,10 @@ input: one or more contiguous rows per request
 state: load source-state fragments once, advance them in MSL thread-local storage, then optionally write the final state
 ```
 
-This path uses 32 Q/K-dimension threads and the configured `Dv_tile`. Qwen's measured default tile of 8 produces a
-256-thread threadblock. `v_head_dim` and the configured tile derive the number of V-dimension tiles. The backend does not
-store this number. The current state dataflow is:
+The final-state kernel uses 32 Q/K-dimension threads and the configured `Dv_tile`. Qwen's measured default tile of 8
+produces a 256-thread threadblock. The candidate-state kernel uses two 32-thread SIMDgroups and a two-row tile per
+SIMDgroup. `v_head_dim` and the selected tile derive the number of V-dimension tiles. The backend does not store this
+number. The final-state dataflow is:
 
 ```text
 recurrent_state_arena[src slot, v_head, 8 V rows, 128 Dqk values]
@@ -699,13 +733,15 @@ distributed thread-local state_fragments[4] per thread
              | -> simd_sum                     | -> state_k/state_q simd_sum
              +----------------+----------------+
                               |
-                              +--> optional registered prefix candidate writes
-                              |
                               | optional segment-end final store
                               v
 recurrent_state_arena[dst slot, v_head, 8 V rows, 128 Dqk values]
                               or discard when dst slot is u32::MAX
 ```
+
+The normal final-state kernel reads only the materialization entry for `flat_token_end - 1`. It can store only the
+segment-end state. The candidate-state register-V kernel reads each row's materialization entry while it scans the
+segment. It can store registered candidate and cache-boundary states after any current row.
 
 For each token, Q and K stream from global memory/cache. Lane-local scalar partials accumulate them before SIMD-group
 reductions.
@@ -736,20 +772,23 @@ cu_tokens     active prefix length num_reqs + 1
 
 Each active request must contribute at least one token. Thus, `num_reqs <= num_tokens`. Request and token capacities are
 independent and do not require `total_reqs <= total_tokens`. Inactive metadata tails do not represent requests, tokens, or
-state. The committed source state slot represents existing context.
+state. The committed recurrent and convolution source slots represent existing context.
 
 The state contract is slot based:
 
 ```text
 GDNRequestStateTable
-  current state slot per request slot
+  current recurrent and convolution state slots per request slot
   current state_version per request slot
-  txn materialized state_version -> state_slot mappings
+  txn materialized state_version -> recurrent and convolution state-slot mappings
   txn cache-boundary publish state_version -> page_ids mappings
 
-src_state_slots          current source state slot per request
-flat_materialized_state_slots
-                         persistent state slot per forward row, or u32::MAX
+src_recurrent_state_slots          current recurrent source slot per request
+src_conv_state_slots               current convolution source slot per request
+flat_materialized_recurrent_state_slots
+                                    persistent recurrent slot per forward row, or u32::MAX
+flat_materialized_conv_state_slots
+                                    persistent convolution slot per forward row, or u32::MAX
 conv_state               f32 slot arena for convolution state
 next_conv_state          destination conv-state arena; may be the same backing as conv_state
 recurrent_state_arena    f32 slot arena for recurrent state
@@ -780,10 +819,14 @@ Both inputs are ordered and unique. Prepare merges them in one pass. It does not
 precede `candidate_start_state_version`. A publish version at or after `candidate_end_state_version` remains pending for
 a later transaction.
 
-`flat_materialized_state_slots` maps each materialized version to the forward row that produces it. All other rows contain
-`u32::MAX`. Commit promotes the selected candidate slot and releases the other transaction slots.
+The two `flat_materialized_*_state_slots` arrays map each materialized version to the forward row that produces it. All
+other rows contain `u32::MAX`. Fresh aligned C0-only pools can assign the same numeric ID to both domains. The metadata,
+compute, selected snapshot, restore, publish, and page-I/O boundaries never depend on that equality. Commit promotes the
+selected recurrent and convolution candidate slots independently. It releases the other transaction slots in each
+domain.
 
-A commit to the current version leaves the current slot unchanged. It clears uncommitted txn state slots.
+A commit to the current version leaves the current recurrent and convolution slots unchanged. It clears uncommitted
+transaction slots in both domains.
 
 Speculative Main verification must not promote a candidate written after rejected rows. Qwen wiring sets the candidate
 version range to the versions that commit can select. GDN materializes those versions without interpreting their model
@@ -846,10 +889,11 @@ interpretation, and candidate slot promotion. It owns only CPU transaction copie
 
 `begin_txn(...)` registers candidate state-slot mappings and future immutable-page mappings.
 It stores page mappings as typed `GDNStatePages` values for the current request txn.
-After registration, `candidate_state_slot(...)` is a read-only lookup.
-It asserts if the requested mapping was not registered.
+After registration, `candidate_recurrent_state_slot(...)` and `candidate_conv_state_slot(...)` are read-only lookups.
+Each lookup asserts only if the requested version is absent from that state domain.
 
-`restore(...)` returns a `GDNStateRestore` job. It updates the table's current state slot/version.
+`restore(...)` returns a `GDNStateRestore` job. It updates the table's current recurrent and convolution slots and its
+current state version.
 
 `commit_txn(...)` returns `GDNStatePublish` jobs for registered publish versions that the committed path satisfies. Qwen
 includes publish versions inside the current forward in the candidate-state materialization set. A commit can therefore
@@ -898,28 +942,36 @@ The executor must finish or clear them before it writes a snapshot.
 The replay-order section defines the hidden-state pipeline. Mutable request state flows beside it:
 
 ```text
-src_state_slots[num_reqs]          committed current state slot for each request
-flat_materialized_state_slots[num_tokens]  persistent state slot per flat token, or u32::MAX
+src_recurrent_state_slots[num_reqs]  committed recurrent source slot for each request
+src_conv_state_slots[num_reqs]       committed convolution source slot for each request
+flat_materialized_recurrent_state_slots[num_tokens]
+                                      persistent recurrent slot per flat token, or u32::MAX
+flat_materialized_conv_state_slots[num_tokens]
+                                      persistent convolution slot per flat token, or u32::MAX
 conv_states[layer, slot, Cqkv, Ks]
 recurrent_states[layer, slot, v_head, v_dim, qk_dim]
 ```
 
 Short convolution reads the source conv-state slot and `qkv`. It writes `conv_qkv` for every current row. It writes the
-next conv-state only when the row's state slot is valid.
+next conv-state only when the row's convolution state slot is valid.
 
 The recurrent core reads `conv_qkv`, raw F32 `a`/`b`, and raw BF16 `a_log`/`dt_bias`. It promotes the BF16 parameters
 and derives normalized q/k, beta, decay, and output values in F32. It then advances the recurrent state in token order
 for each request segment.
 
-Each Q/K-dimension lane loads its strided source-state fragment once. It keeps that MSL `thread` fragment local across the
-segment. It writes a fragment to persistent state only when the row's state slot is valid.
+For candidate materialization, one SIMDgroup loads a `[2, Dqk]` source-state tile into registers. It keeps the tile local
+across the segment. Two SIMDgroups share one normalized Q/K vector and gate pair. Each SIMDgroup writes its tile to
+persistent state only when the row's recurrent state slot is valid. The operation order remains
+`decayed_state = state * decay`, `delta = (v - decayed_state * k) * beta`, and
+`state = decayed_state + k * delta`.
 
 Candidate state materialization is part of the normal forward. If the first input token has index `V`, row zero produces
 state version `V + 1`. Each later row increments the version by one.
 
 If that version appears in the materialized union, the core writes the current conv/recurrent state into that row's
-state slot. The union contains commit candidates and cache-boundary candidates. Commit receives a destination version,
-converts it to a candidate version, and selects the corresponding slot.
+corresponding domain slots. The union contains commit candidates and cache-boundary candidates. Commit receives a
+destination version, converts it to a candidate version, and selects the corresponding recurrent and convolution
+slots.
 
 Cache-boundary publish separately consumes the same materialized candidate/current slots. It emits a publish job only when
 the committed verified path satisfies that publish version.
@@ -933,9 +985,9 @@ publish writes only committed/verified versions
 rejected speculative rows leave their candidate slots uncommitted
 ```
 
-`ragged_recurrent` handles every current row shape. This includes decode and MTP verification batches where each request
-has one row. One threadblock selects a request, V head, and V-dimension tile. Its Q/K-dimension lanes load distributed
-source-state fragments. They then scan the request segment in order.
+`ragged_recurrent` handles every current row shape. This includes decode and MTP verification batches with one or more
+rows per request, segmented by `cu_tokens`. One threadblock selects a request, V head, and V-dimension tile. Its
+Q/K-dimension lanes load distributed source-state fragments. They then scan the request segment in order.
 
 For `num_tokens=1,num_reqs=1`, this operation is still a one-step state update. For
 `num_tokens=spec+1,num_reqs=1`, it verifies the full Main segment. It materializes any requested prefix candidate
@@ -945,19 +997,19 @@ Restore and publish page I/O are outside the core math:
 
 ```text
 restore before forward
-  runtime page IDs -> current state slot
+  runtime page IDs -> current recurrent and convolution slots
   updates GDNRequestStateTable current state_version
 
 forward
-  current slot -> candidate slots
+  current recurrent and convolution slots -> candidate slots in each domain
   may materialize prefix/cache-boundary candidate versions
 
 commit after rejection/sampling
-  state_version -> current slot
+  state_version -> current recurrent and convolution slots
   satisfied publish versions -> page write jobs
 
 publish
-  committed slot -> runtime page IDs
+  committed recurrent and convolution slots -> runtime page IDs
 ```
 
 Runtime core owns state page IDs and cache lifecycle notifications. The executor owns GDN state tensor layout,
@@ -966,8 +1018,8 @@ request-slot current/candidate slot mapping, and all-layer page-I/O command reco
 `state_version` is the canonical absolute coordinate of verified mutable state. Immutable fp32 state pages are boundary
 checkpoints. Restore loads one into mutable state after a prefix hit. Publish writes only a verified commit.
 
-Backend page-I/O components receive compact page IDs, state slots, and `page_bytes`. Request slots, versions, cache policy,
-and Qwen transaction semantics remain in the model-level state owner.
+Backend page-I/O components receive compact page IDs, recurrent and convolution state slots, and `page_bytes`. Request
+slots, versions, cache policy, and Qwen transaction semantics remain in the model-level state owner.
 
 ## Profile keys
 
@@ -1016,6 +1068,10 @@ cargo bench -p inference-backend-metal --bench gdn_state_io
 cargo bench -p inference-executor-metal --bench qwen35_gdn -- \
   --model-dir <35b-a3b-model-dir> --tokens 1 --contexts 0 --num-reqs 1 \
   --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-executor-metal --bench qwen35_gdn -- \
+  --model-dir <35b-a3b-model-dir> --tokens 2 --contexts 128 --num-reqs 1 \
+  --candidate-states --subcomponents --iters 1 --warmup-iters 0 --runs 1
 ```
 
 Append `-- --profile-time 1 --noplot` to either backend Criterion target for a representative full-target smoke run.
@@ -1030,6 +1086,11 @@ context/state that exists before the measured forward.
 
 The bench distributes rows as evenly as possible across requests. It builds `cu_tokens`, source state slots, and
 candidate destination slots from these options.
+
+`--candidate-states` materializes every current row into a distinct candidate slot. It selects the production
+convolution and recurrent candidate-state kernels. `--subcomponents` reports the full set of projection, split,
+compute, and output subcomponents. Candidate compute uses the `gdn.compute_candidate_state` key. Normal recurrent
+compute uses the `gdn.compute` key.
 
 For current GDN paths, the source state slot represents prior history. The bench reports `ctx` for comparison hygiene.
 The value does not change recurrent kernel metadata yet. Invalid batch-shape combinations print a structured `skip` line.
@@ -1048,8 +1109,8 @@ Thus, model-level code can reuse projection/core scratch.
 Current/candidate conv/recurrent slot arenas are model-owned persistent resources.
 GPU page-ID staging buffers are transient model-owned resources.
 
-`GDNRequestStateTable` owns CPU-side current state slots, current `state_version`s, transaction candidate mappings,
-future publish page IDs, and submitted restore/publish jobs.
+`GDNRequestStateTable` owns CPU-side current recurrent and convolution state slots, current `state_version`s,
+transaction candidate mappings, future publish page IDs, and submitted restore/publish jobs.
 
 `GDNRequestStateTable` and `Qwen3xGDNState` implement `FullStateIO` with `GDNStateSnapshotFiles`. The metadata path uses
 native-endian `wincode` directly on `GDNRequestSlots`. It does not clone state into a snapshot DTO. Stop validates the

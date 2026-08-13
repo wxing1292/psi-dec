@@ -11,6 +11,8 @@ const GDN_COMPUTE_SOURCE: &str = include_str!("metal/gdn_compute.metal");
 
 const SHORT_CONV_NUM_THREADS_PER_THREADBLOCK: usize = 256;
 const RAGGED_RECURRENT_NUM_QK_DIM_THREADS: usize = 32;
+const CANDIDATE_V_ROWS_PER_SIMDGROUP: usize = 2;
+const CANDIDATE_SIMDGROUPS_PER_THREADBLOCK: usize = 2;
 const OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK: usize = 128;
 
 /// Static geometry for the generic GDN compute graph.
@@ -137,6 +139,21 @@ impl GDNComputeConfig {
         assert!(self.conv_kernel_size > 1);
         assert!(self.q_scale.is_finite() && self.q_scale > 0.0);
         assert!(self.norm_eps.is_finite() && self.norm_eps > 0.0);
+        assert_eq!(
+            self.qk_head_dim % RAGGED_RECURRENT_NUM_QK_DIM_THREADS as u32,
+            0,
+            "GDN candidate register-V requires Dqk divisible by the SIMDgroup width"
+        );
+        assert_eq!(
+            self.v_head_dim % CANDIDATE_V_ROWS_PER_SIMDGROUP as u32,
+            0,
+            "GDN candidate register-V requires Dv divisible by the selected tile"
+        );
+        assert_eq!(
+            (self.v_head_dim / CANDIDATE_V_ROWS_PER_SIMDGROUP as u32) % CANDIDATE_SIMDGROUPS_PER_THREADBLOCK as u32,
+            0,
+            "GDN candidate register-V tiles must divide the grouped launch"
+        );
         let _ = self.qkv_dim();
         let _ = self.recurrent_state_stride();
         let _ = self.num_conv_weight_values();
@@ -176,13 +193,13 @@ impl GDNComputeShape {
 }
 
 fn selected_v_dim_tile_size(config: GDNComputeConfig) -> u32 {
-    [8, 4, 2, 1]
+    [8, 4]
         .into_iter()
         .find(|tile_size| {
             config.v_head_dim.is_multiple_of(*tile_size)
                 && *tile_size as usize * RAGGED_RECURRENT_NUM_QK_DIM_THREADS <= 1024
         })
-        .expect("GDN recurrent V-dimension tile selection requires a positive v_head_dim")
+        .expect("GDN recurrent V-dimension tile selection requires Dv divisible by four")
 }
 
 fn gdn_compute_source(config: GDNComputeConfig, v_dim_tile_size: u32) -> String {
@@ -191,7 +208,8 @@ fn gdn_compute_source(config: GDNComputeConfig, v_dim_tile_size: u32) -> String 
          {qk_head_dim}u;\nconstant uint num_v_heads = {num_v_heads}u;\nconstant uint v_head_dim = \
          {v_head_dim}u;\nconstant uint conv_kernel_size = {conv_kernel_size}u;\nconstant uint qkv_dim = \
          {qkv_dim}u;\nconstant uint conv_state_len = {conv_state_len}u;\nconstant uint v_dim_tile_size = \
-         {v_dim_tile_size}u;",
+         {v_dim_tile_size}u;\nconstant uint candidate_v_dim_tile_size = {candidate_v_rows_per_simdgroup}u;\nconstant \
+         uint candidate_simdgroups_per_threadgroup = {candidate_simdgroups_per_threadgroup}u;",
         num_qk_heads = config.num_qk_heads,
         qk_head_dim = config.qk_head_dim,
         num_v_heads = config.num_v_heads,
@@ -200,6 +218,8 @@ fn gdn_compute_source(config: GDNComputeConfig, v_dim_tile_size: u32) -> String 
         qkv_dim = config.qkv_dim(),
         conv_state_len = config.conv_state_len(),
         v_dim_tile_size = v_dim_tile_size,
+        candidate_v_rows_per_simdgroup = CANDIDATE_V_ROWS_PER_SIMDGROUP,
+        candidate_simdgroups_per_threadgroup = CANDIDATE_SIMDGROUPS_PER_THREADBLOCK,
     );
     GDN_COMPUTE_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
@@ -215,11 +235,16 @@ pub struct GDNComputeBuffers<'a> {
     pub a_log: &'a Buffer,
     pub dt_bias: &'a Buffer,
     pub cu_tokens: &'a Buffer,
-    pub src_state_slots: &'a Buffer,
-    /// Persistent state slot for each forward row.
+    pub src_recurrent_state_slots: &'a Buffer,
+    pub src_conv_state_slots: &'a Buffer,
+    /// Persistent recurrent state slot for each forward row.
     ///
-    /// `u32::MAX` keeps the row output but discards the row's convolution and recurrent states.
-    pub flat_materialized_state_slots: &'a Buffer,
+    /// `u32::MAX` keeps the row output but discards the row's recurrent state.
+    pub flat_materialized_recurrent_state_slots: &'a Buffer,
+    /// Persistent convolution state slot for each forward row.
+    ///
+    /// `u32::MAX` keeps the row output but discards the row's convolution state.
+    pub flat_materialized_conv_state_slots: &'a Buffer,
     pub conv_state: &'a Buffer,
     pub conv_state_offset_bytes: u64,
     pub next_conv_state: &'a Buffer,
@@ -340,8 +365,8 @@ impl GDNCompute {
         builder.set_buffer_read(2, buffers.qkv, 0);
         builder.set_buffer_read(3, buffers.conv_state, 0);
         builder.set_buffer_read(4, buffers.conv_weight, 0);
-        builder.set_buffer_read(5, buffers.src_state_slots, 0);
-        builder.set_buffer_read(6, buffers.flat_materialized_state_slots, 0);
+        builder.set_buffer_read(5, buffers.src_conv_state_slots, 0);
+        builder.set_buffer_read(6, buffers.flat_materialized_conv_state_slots, 0);
         builder.set_buffer_read(7, buffers.cu_tokens, 0);
         set_batch_args(builder, shape, 8, num_active_reqs, num_active_tokens);
         builder.set_u64(10, buffers.conv_state_offset_bytes);
@@ -367,8 +392,8 @@ impl GDNCompute {
         builder.set_buffer_write(0, buffers.next_conv_state, 0);
         builder.set_buffer_read(1, buffers.qkv, 0);
         builder.set_buffer_read(2, buffers.conv_state, 0);
-        builder.set_buffer_read(3, buffers.src_state_slots, 0);
-        builder.set_buffer_read(4, buffers.flat_materialized_state_slots, 0);
+        builder.set_buffer_read(3, buffers.src_conv_state_slots, 0);
+        builder.set_buffer_read(4, buffers.flat_materialized_conv_state_slots, 0);
         builder.set_buffer_read(5, buffers.cu_tokens, 0);
         set_batch_args(builder, shape, 6, num_active_reqs, num_active_tokens);
         builder.set_u64(8, buffers.conv_state_offset_bytes);
@@ -412,8 +437,8 @@ impl GDNCompute {
         builder.set_buffer_read(4, buffers.b, 0);
         builder.set_buffer_read(5, buffers.a_log, 0);
         builder.set_buffer_read(6, buffers.dt_bias, 0);
-        builder.set_buffer_read(7, buffers.src_state_slots, 0);
-        builder.set_buffer_read(8, buffers.flat_materialized_state_slots, 0);
+        builder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
+        builder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
         builder.set_buffer_read(9, buffers.cu_tokens, 0);
         builder.set_f32(10, self.config.q_scale);
         set_replay_u32(builder, 11, num_active_reqs, shape.num_reqs, "GDN active request count");
@@ -446,21 +471,25 @@ impl GDNCompute {
         builder.set_buffer_read(4, buffers.b, 0);
         builder.set_buffer_read(5, buffers.a_log, 0);
         builder.set_buffer_read(6, buffers.dt_bias, 0);
-        builder.set_buffer_read(7, buffers.src_state_slots, 0);
-        builder.set_buffer_read(8, buffers.flat_materialized_state_slots, 0);
+        builder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
+        builder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
         builder.set_buffer_read(9, buffers.cu_tokens, 0);
         builder.set_f32(10, self.config.q_scale);
         set_replay_u32(builder, 11, num_active_reqs, shape.num_reqs, "GDN active request count");
         builder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
-        let v_dim_tile_size = self.v_dim_tile_size as usize;
-        let num_v_dim_tiles = self.config.v_head_dim as usize / v_dim_tile_size;
+        let num_v_dim_tiles = self.config.v_head_dim as usize / CANDIDATE_V_ROWS_PER_SIMDGROUP;
+        debug_assert_eq!(num_v_dim_tiles % CANDIDATE_SIMDGROUPS_PER_THREADBLOCK, 0);
         builder.dispatch_threadblocks(
             (
-                num_v_dim_tiles,
+                num_v_dim_tiles / CANDIDATE_SIMDGROUPS_PER_THREADBLOCK,
                 shape.num_reqs as usize * self.config.num_v_heads as usize,
                 1,
             ),
-            (RAGGED_RECURRENT_NUM_QK_DIM_THREADS, v_dim_tile_size, 1),
+            (
+                RAGGED_RECURRENT_NUM_QK_DIM_THREADS,
+                CANDIDATE_SIMDGROUPS_PER_THREADBLOCK,
+                1,
+            ),
         );
     }
 
@@ -660,12 +689,20 @@ fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &
         "GDN cu_tokens buffer is too small"
     );
     assert!(
-        buffers.src_state_slots.len_bytes() >= shape.num_reqs as usize * size_of::<u32>(),
-        "GDN src_state_slots buffer is too small"
+        buffers.src_recurrent_state_slots.len_bytes() >= shape.num_reqs as usize * size_of::<u32>(),
+        "GDN src_recurrent_state_slots buffer is too small"
     );
     assert!(
-        buffers.flat_materialized_state_slots.len_bytes() >= shape.num_tokens as usize * size_of::<u32>(),
-        "GDN flat_materialized_state_slots buffer is too small"
+        buffers.src_conv_state_slots.len_bytes() >= shape.num_reqs as usize * size_of::<u32>(),
+        "GDN src_conv_state_slots buffer is too small"
+    );
+    assert!(
+        buffers.flat_materialized_recurrent_state_slots.len_bytes() >= shape.num_tokens as usize * size_of::<u32>(),
+        "GDN flat_materialized_recurrent_state_slots buffer is too small"
+    );
+    assert!(
+        buffers.flat_materialized_conv_state_slots.len_bytes() >= shape.num_tokens as usize * size_of::<u32>(),
+        "GDN flat_materialized_conv_state_slots buffer is too small"
     );
     let conv_state_region_bytes = u64::try_from(config.num_conv_state_values(shape))
         .expect("GDN convolution state element count must fit u64")

@@ -42,8 +42,10 @@ impl GDNReplayBucketPolicy {
 /// preparation and shared by all GDN layers.
 pub struct GDNMetadataBuffers {
     cu_tokens: Buffer,
-    src_state_slots: Buffer,
-    flat_materialized_state_slots: Buffer,
+    src_recurrent_state_slots: Buffer,
+    src_conv_state_slots: Buffer,
+    flat_materialized_recurrent_state_slots: Buffer,
+    flat_materialized_conv_state_slots: Buffer,
     replay_shape: Cell<Option<GDNReplayShape>>,
 }
 
@@ -61,8 +63,10 @@ impl GDNMetadataBuffers {
                     .expect("GDN cumulative-token capacity must fit usize"),
                 Dtype::Uint32,
             ),
-            src_state_slots: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
-            flat_materialized_state_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
+            src_recurrent_state_slots: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
+            src_conv_state_slots: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
+            flat_materialized_recurrent_state_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
+            flat_materialized_conv_state_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
             replay_shape: Cell::new(None),
         }
     }
@@ -71,53 +75,80 @@ impl GDNMetadataBuffers {
         &self.cu_tokens
     }
 
-    pub fn src_state_slots(&self) -> &Buffer {
-        &self.src_state_slots
+    pub fn src_recurrent_state_slots(&self) -> &Buffer {
+        &self.src_recurrent_state_slots
     }
 
-    pub fn flat_materialized_state_slots(&self) -> &Buffer {
-        &self.flat_materialized_state_slots
+    pub fn src_conv_state_slots(&self) -> &Buffer {
+        &self.src_conv_state_slots
+    }
+
+    pub fn flat_materialized_recurrent_state_slots(&self) -> &Buffer {
+        &self.flat_materialized_recurrent_state_slots
+    }
+
+    pub fn flat_materialized_conv_state_slots(&self) -> &Buffer {
+        &self.flat_materialized_conv_state_slots
     }
 
     pub fn update(
         &self,
         cu_tokens: &[u32],
-        src_state_slots: &[u32],
-        flat_materialized_state_slots: &[u32],
+        src_recurrent_state_slots: &[u32],
+        src_conv_state_slots: &[u32],
+        flat_materialized_recurrent_state_slots: &[u32],
+        flat_materialized_conv_state_slots: &[u32],
     ) -> GDNReplayShape {
-        self.update_with_policy(cu_tokens, src_state_slots, flat_materialized_state_slots, None, None)
+        self.update_with_policy(
+            cu_tokens,
+            src_recurrent_state_slots,
+            src_conv_state_slots,
+            flat_materialized_recurrent_state_slots,
+            flat_materialized_conv_state_slots,
+            None,
+            None,
+        )
     }
 
     pub fn update_bucketed(
         &self,
         cu_tokens: &[u32],
-        src_state_slots: &[u32],
-        flat_materialized_state_slots: &[u32],
+        src_recurrent_state_slots: &[u32],
+        src_conv_state_slots: &[u32],
+        flat_materialized_recurrent_state_slots: &[u32],
+        flat_materialized_conv_state_slots: &[u32],
         policy: &GDNReplayBucketPolicy,
     ) -> GDNReplayShape {
         self.validate_bucket_policy(policy);
         self.update_with_policy(
             cu_tokens,
-            src_state_slots,
-            flat_materialized_state_slots,
+            src_recurrent_state_slots,
+            src_conv_state_slots,
+            flat_materialized_recurrent_state_slots,
+            flat_materialized_conv_state_slots,
             Some(policy),
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_bucketed_with_token_capacity(
         &self,
         cu_tokens: &[u32],
-        src_state_slots: &[u32],
-        flat_materialized_state_slots: &[u32],
+        src_recurrent_state_slots: &[u32],
+        src_conv_state_slots: &[u32],
+        flat_materialized_recurrent_state_slots: &[u32],
+        flat_materialized_conv_state_slots: &[u32],
         policy: &GDNReplayBucketPolicy,
         total_tokens: u32,
     ) -> GDNReplayShape {
         self.validate_bucket_policy(policy);
         self.update_with_policy(
             cu_tokens,
-            src_state_slots,
-            flat_materialized_state_slots,
+            src_recurrent_state_slots,
+            src_conv_state_slots,
+            flat_materialized_recurrent_state_slots,
+            flat_materialized_conv_state_slots,
             Some(policy),
             Some(total_tokens),
         )
@@ -131,36 +162,52 @@ impl GDNMetadataBuffers {
         );
         assert_eq!(
             policy.max_requests() as usize,
-            self.src_state_slots.len_bytes() / size_of::<u32>(),
-            "GDN replay request policy must match state-slot metadata capacity"
+            self.src_recurrent_state_slots.len_bytes() / size_of::<u32>(),
+            "GDN replay request policy must match recurrent state-slot metadata capacity"
         );
         assert_eq!(
             policy.max_tokens() as usize,
-            self.flat_materialized_state_slots.len_bytes() / size_of::<u32>(),
-            "GDN replay token policy must match metadata capacity"
+            self.flat_materialized_recurrent_state_slots.len_bytes() / size_of::<u32>(),
+            "GDN replay token policy must match recurrent state-slot metadata capacity"
+        );
+        debug_assert_eq!(
+            self.src_recurrent_state_slots.len_bytes(),
+            self.src_conv_state_slots.len_bytes()
+        );
+        debug_assert_eq!(
+            self.flat_materialized_recurrent_state_slots.len_bytes(),
+            self.flat_materialized_conv_state_slots.len_bytes()
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_with_policy(
         &self,
         cu_tokens: &[u32],
-        src_state_slots: &[u32],
-        flat_materialized_state_slots: &[u32],
+        src_recurrent_state_slots: &[u32],
+        src_conv_state_slots: &[u32],
+        flat_materialized_recurrent_state_slots: &[u32],
+        flat_materialized_conv_state_slots: &[u32],
         policy: Option<&GDNReplayBucketPolicy>,
         selected_total_tokens: Option<u32>,
     ) -> GDNReplayShape {
-        assert!(!src_state_slots.is_empty(), "GDN batch metadata requires requests");
-        assert_eq!(cu_tokens.len(), src_state_slots.len() + 1);
-        assert!(src_state_slots.len() < self.cu_tokens.len_bytes() / size_of::<u32>());
+        assert!(
+            !src_recurrent_state_slots.is_empty(),
+            "GDN batch metadata requires requests"
+        );
+        assert_eq!(src_recurrent_state_slots.len(), src_conv_state_slots.len());
+        assert_eq!(cu_tokens.len(), src_recurrent_state_slots.len() + 1);
+        assert!(src_recurrent_state_slots.len() < self.cu_tokens.len_bytes() / size_of::<u32>());
         assert_eq!(cu_tokens[0], 0, "GDN batch cu_tokens must start at zero");
         assert!(
             cu_tokens.windows(2).all(|window| window[0] < window[1]),
             "GDN batch cu_tokens must assign at least one token to every request"
         );
         let num_tokens = cu_tokens[cu_tokens.len() - 1] as usize;
-        assert_eq!(flat_materialized_state_slots.len(), num_tokens);
-        assert!(num_tokens <= self.flat_materialized_state_slots.len_bytes() / size_of::<u32>());
-        let num_reqs = src_state_slots
+        assert_eq!(flat_materialized_recurrent_state_slots.len(), num_tokens);
+        assert_eq!(flat_materialized_conv_state_slots.len(), num_tokens);
+        assert!(num_tokens <= self.flat_materialized_recurrent_state_slots.len_bytes() / size_of::<u32>());
+        let num_reqs = src_recurrent_state_slots
             .len()
             .try_into()
             .expect("GDN batch metadata count must fit u32");
@@ -184,9 +231,12 @@ impl GDNMetadataBuffers {
         let replay_shape = GDNReplayShape::new(num_reqs, total_reqs, num_tokens, total_tokens);
 
         self.cu_tokens.write_typed(0, cu_tokens);
-        self.src_state_slots.write_typed(0, src_state_slots);
-        self.flat_materialized_state_slots
-            .write_typed(0, flat_materialized_state_slots);
+        self.src_recurrent_state_slots.write_typed(0, src_recurrent_state_slots);
+        self.src_conv_state_slots.write_typed(0, src_conv_state_slots);
+        self.flat_materialized_recurrent_state_slots
+            .write_typed(0, flat_materialized_recurrent_state_slots);
+        self.flat_materialized_conv_state_slots
+            .write_typed(0, flat_materialized_conv_state_slots);
         self.replay_shape.set(Some(replay_shape));
         replay_shape
     }
@@ -211,14 +261,21 @@ mod tests {
         let device = Device::system_default();
         let metadata = GDNMetadataBuffers::new(&device, 2, 2);
 
-        let shape = metadata.update(&[0, 1, 2], &[3, 4], &[7, 8]);
+        let shape = metadata.update(&[0, 1, 2], &[3, 4], &[5, 6], &[7, 8], &[9, 10]);
 
         assert_eq!(shape, GDNReplayShape::new(2, 2, 2, 2));
         assert_eq!(shape, metadata.replay_shape());
-        assert_eq!(metadata.src_state_slots().read_typed::<u32>(0, 2), vec![3, 4]);
+        assert_eq!(metadata.src_recurrent_state_slots().read_typed::<u32>(0, 2), vec![3, 4]);
+        assert_eq!(metadata.src_conv_state_slots().read_typed::<u32>(0, 2), vec![5, 6]);
         assert_eq!(
-            metadata.flat_materialized_state_slots().read_typed::<u32>(0, 2),
+            metadata
+                .flat_materialized_recurrent_state_slots()
+                .read_typed::<u32>(0, 2),
             vec![7, 8]
+        );
+        assert_eq!(
+            metadata.flat_materialized_conv_state_slots().read_typed::<u32>(0, 2),
+            vec![9, 10]
         );
     }
 
@@ -228,7 +285,14 @@ mod tests {
         let metadata = GDNMetadataBuffers::new(&device, 6, 8);
         let policy = GDNReplayBucketPolicy::new(6, 8, &[]);
 
-        let shape = metadata.update_bucketed(&[0, 1, 2, 3, 4, 7], &[10, 11, 12, 13, 14], &[u32::MAX; 7], &policy);
+        let shape = metadata.update_bucketed(
+            &[0, 1, 2, 3, 4, 7],
+            &[10, 11, 12, 13, 14],
+            &[20, 21, 22, 23, 24],
+            &[u32::MAX; 7],
+            &[u32::MAX; 7],
+            &policy,
+        );
 
         assert_eq!(shape, GDNReplayShape::new(5, 6, 7, 8));
         assert_eq!(shape, metadata.replay_shape());
@@ -243,6 +307,8 @@ mod tests {
         let shape = metadata.update_bucketed_with_token_capacity(
             &[0, 1, 2, 3, 4, 7],
             &[10, 11, 12, 13, 14],
+            &[20, 21, 22, 23, 24],
+            &[u32::MAX; 7],
             &[u32::MAX; 7],
             &policy,
             7,
@@ -259,7 +325,7 @@ mod tests {
         let metadata = GDNMetadataBuffers::new(&device, 1, 8);
         let policy = GDNReplayBucketPolicy::new(1, 8, &[]);
 
-        metadata.update_bucketed_with_token_capacity(&[0, 7], &[10], &[u32::MAX; 7], &policy, 6);
+        metadata.update_bucketed_with_token_capacity(&[0, 7], &[10], &[20], &[u32::MAX; 7], &[u32::MAX; 7], &policy, 6);
     }
 
     #[test]
@@ -269,7 +335,7 @@ mod tests {
         let metadata = GDNMetadataBuffers::new(&device, 1, 8);
         let policy = GDNReplayBucketPolicy::new(1, 8, &[]);
 
-        metadata.update_bucketed_with_token_capacity(&[0, 1], &[10], &[u32::MAX], &policy, 9);
+        metadata.update_bucketed_with_token_capacity(&[0, 1], &[10], &[20], &[u32::MAX], &[u32::MAX], &policy, 9);
     }
 
     #[test]
@@ -278,7 +344,7 @@ mod tests {
         let device = Device::system_default();
         let metadata = GDNMetadataBuffers::new(&device, 1, 2);
 
-        metadata.update(&[1, 2], &[3], &[5, 6]);
+        metadata.update(&[1, 2], &[3], &[4], &[5, 6], &[7, 8]);
     }
 
     #[test]
@@ -287,6 +353,6 @@ mod tests {
         let device = Device::system_default();
         let metadata = GDNMetadataBuffers::new(&device, 2, 2);
 
-        metadata.update(&[0, 1, 1], &[3, 4], &[7]);
+        metadata.update(&[0, 1, 1], &[3, 4], &[5, 6], &[7], &[8]);
     }
 }

@@ -84,7 +84,14 @@ pub fn run(args: Args) {
                 continue;
             }
             for &existing_context_len in &contexts {
-                let fixture = RealGDNFixture::new(&device, num_tokens, num_reqs, existing_context_len, &weights);
+                let fixture = RealGDNFixture::new(
+                    &device,
+                    num_tokens,
+                    num_reqs,
+                    existing_context_len,
+                    args.candidate_states,
+                    &weights,
+                );
                 fixture.measure(args.warmup_iters, args.iters, args.runs);
                 if args.subcomponents {
                     fixture.measure_subcomponents(args.warmup_iters, args.iters, args.runs);
@@ -100,6 +107,7 @@ struct RealGDNFixture<'a> {
     num_tokens: u32,
     num_reqs: u32,
     existing_context_len: u32,
+    materialize_candidate_states: bool,
     next_hidden_state: Buffer,
     replay: ReplayProgram,
     hidden_state: Buffer,
@@ -124,6 +132,7 @@ impl<'a> RealGDNFixture<'a> {
         num_tokens: u32,
         num_reqs: u32,
         existing_context_len: u32,
+        materialize_candidate_states: bool,
         weights: &'a RealGDNWeights,
     ) -> Self {
         assert!(
@@ -161,32 +170,53 @@ impl<'a> RealGDNFixture<'a> {
             .map(|value| value as u32)
             .collect::<Vec<_>>();
         let mut flat_materialized_state_slots = vec![u32::MAX; num_tokens as usize];
-        for (req_index, &flat_end) in cu_tokens.iter().skip(1).enumerate() {
-            flat_materialized_state_slots[flat_end as usize - 1] = num_reqs + req_index as u32;
+        if materialize_candidate_states {
+            for (flat_token_index, state_slot) in flat_materialized_state_slots.iter_mut().enumerate() {
+                *state_slot = num_reqs
+                    .checked_add(u32::try_from(flat_token_index).expect("GDN bench flat token index must fit u32"))
+                    .expect("GDN bench candidate state slot ID must fit u32");
+            }
+        } else {
+            for (req_index, &flat_end) in cu_tokens.iter().skip(1).enumerate() {
+                flat_materialized_state_slots[flat_end as usize - 1] = num_reqs
+                    .checked_add(u32::try_from(req_index).expect("GDN bench request index must fit u32"))
+                    .expect("GDN bench final state slot ID must fit u32");
+            }
         }
         batch_metadata.update(
             &cu_tokens,
             &(0..num_reqs).collect::<Vec<_>>(),
+            &(0..num_reqs).collect::<Vec<_>>(),
+            &flat_materialized_state_slots,
             &flat_materialized_state_slots,
         );
+        let num_state_slots = if materialize_candidate_states {
+            num_reqs
+                .checked_add(num_tokens)
+                .expect("GDN bench candidate state-slot count must fit u32")
+        } else {
+            num_reqs
+                .checked_mul(2)
+                .expect("GDN bench source and destination state-slot count must fit u32")
+        };
         let conv_state = Buffer::from_slice(
             device,
             &gdn_conv_state_fixture(
                 existing_context_len,
                 num_reqs as usize,
-                2 * num_reqs as usize * GDN_CONV_DIM * (GDN_CONV_KERNEL_SIZE - 1),
+                num_state_slots as usize * GDN_CONV_DIM * (GDN_CONV_KERNEL_SIZE - 1),
             ),
         );
         let next_conv_state = Buffer::new_zeroed(
             device,
-            2 * num_reqs as usize * GDN_CONV_DIM * (GDN_CONV_KERNEL_SIZE - 1) * size_of::<f32>(),
+            num_state_slots as usize * GDN_CONV_DIM * (GDN_CONV_KERNEL_SIZE - 1) * size_of::<f32>(),
         );
         let recurrent_state_arena = Buffer::from_slice(
             device,
             &gdn_recurrent_state_fixture(
                 existing_context_len,
                 num_reqs as usize,
-                2 * num_reqs as usize * GDN_V_HEADS * GDN_V_HEAD_DIM * GDN_QK_HEAD_DIM,
+                num_state_slots as usize * GDN_V_HEADS * GDN_V_HEAD_DIM * GDN_QK_HEAD_DIM,
             ),
         );
         let qkvabz = Buffer::new_zeroed(device, num_tokens as usize * GDN_QKVABZ_DIM * size_of::<f32>());
@@ -223,7 +253,7 @@ impl<'a> RealGDNFixture<'a> {
                     recurrent_state_arena: &recurrent_state_arena,
                     recurrent_state_arena_offset_bytes: 0,
                 },
-                materialize_candidate_states: false,
+                materialize_candidate_states,
                 weights: weights.as_borrowed(),
                 replay_mode: inference_executor_metal::attn::gdn::backend::GDNReplayMode::Exact,
             },
@@ -235,6 +265,7 @@ impl<'a> RealGDNFixture<'a> {
             num_tokens,
             num_reqs,
             existing_context_len,
+            materialize_candidate_states,
             next_hidden_state,
             replay,
             hidden_state,
@@ -267,7 +298,11 @@ impl<'a> RealGDNFixture<'a> {
             self.num_tokens,
             self.num_reqs,
             Some(self.existing_context_len),
-            Some("ragged_recurrent"),
+            Some(if self.materialize_candidate_states {
+                "forward_candidate_state"
+            } else {
+                "ragged_recurrent"
+            }),
             iters,
             &samples,
         );
@@ -320,37 +355,42 @@ impl<'a> RealGDNFixture<'a> {
                 },
             ),
         );
-        let compute_replay = build_single_invocation_replay(
-            &self.stream,
-            compute.invoke(
-                GDNComputeShape {
-                    num_reqs: self.num_reqs,
-                    num_tokens: self.num_tokens,
-                },
-                GDNComputeBuffers {
-                    qkv: &self.qkv,
-                    a: &self.a,
-                    b: &self.b,
-                    z: &self.z,
-                    conv_weight: &self.weights.conv_weight,
-                    norm_weight: &self.weights.norm_weight,
-                    a_log: &self.weights.a_log,
-                    dt_bias: &self.weights.dt_bias,
-                    cu_tokens: self.batch_metadata.cu_tokens(),
-                    src_state_slots: self.batch_metadata.src_state_slots(),
-                    flat_materialized_state_slots: self.batch_metadata.flat_materialized_state_slots(),
-                    conv_state: &self.conv_state,
-                    conv_state_offset_bytes: 0,
-                    next_conv_state: &self.next_conv_state,
-                    next_conv_state_offset_bytes: 0,
-                    recurrent_state_arena: &self.recurrent_state_arena,
-                    recurrent_state_arena_offset_bytes: 0,
-                    conv_qkv: &self.conv_qkv,
-                    recurrent_output: &self.recurrent_output,
-                    norm_gated_output: &self.norm_gated_output,
-                },
-            ),
-        );
+        let compute_shape = GDNComputeShape {
+            num_reqs: self.num_reqs,
+            num_tokens: self.num_tokens,
+        };
+        let compute_buffers = GDNComputeBuffers {
+            qkv: &self.qkv,
+            a: &self.a,
+            b: &self.b,
+            z: &self.z,
+            conv_weight: &self.weights.conv_weight,
+            norm_weight: &self.weights.norm_weight,
+            a_log: &self.weights.a_log,
+            dt_bias: &self.weights.dt_bias,
+            cu_tokens: self.batch_metadata.cu_tokens(),
+            src_recurrent_state_slots: self.batch_metadata.src_recurrent_state_slots(),
+            src_conv_state_slots: self.batch_metadata.src_conv_state_slots(),
+            flat_materialized_recurrent_state_slots: self.batch_metadata.flat_materialized_recurrent_state_slots(),
+            flat_materialized_conv_state_slots: self.batch_metadata.flat_materialized_conv_state_slots(),
+            conv_state: &self.conv_state,
+            conv_state_offset_bytes: 0,
+            next_conv_state: &self.next_conv_state,
+            next_conv_state_offset_bytes: 0,
+            recurrent_state_arena: &self.recurrent_state_arena,
+            recurrent_state_arena_offset_bytes: 0,
+            conv_qkv: &self.conv_qkv,
+            recurrent_output: &self.recurrent_output,
+            norm_gated_output: &self.norm_gated_output,
+        };
+        let compute_replay = if self.materialize_candidate_states {
+            build_single_invocation_replay(
+                &self.stream,
+                compute.invoke_with_candidate_state_update(compute_shape, compute_buffers),
+            )
+        } else {
+            build_single_invocation_replay(&self.stream, compute.invoke(compute_shape, compute_buffers))
+        };
         let output_replay = build_single_invocation_replay(
             &self.stream,
             output.invoke(
@@ -370,7 +410,17 @@ impl<'a> RealGDNFixture<'a> {
 
         self.measure_subcomponent("qkvabz", &qkvabz_replay, warmup_iters, iters, runs);
         self.measure_subcomponent("qkvabz-to-qkv-a-b-z", &split_replay, warmup_iters, iters, runs);
-        self.measure_subcomponent("compute", &compute_replay, warmup_iters, iters, runs);
+        self.measure_subcomponent(
+            if self.materialize_candidate_states {
+                "compute_candidate_state"
+            } else {
+                "compute"
+            },
+            &compute_replay,
+            warmup_iters,
+            iters,
+            runs,
+        );
         self.measure_subcomponent("output", &output_replay, warmup_iters, iters, runs);
     }
 

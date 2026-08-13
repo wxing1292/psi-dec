@@ -55,6 +55,7 @@ struct Args {
     warmup_iters: usize,
     runs: usize,
     subcomponents: bool,
+    candidate_states: bool,
 }
 
 impl Args {
@@ -68,6 +69,7 @@ impl Args {
             warmup_iters: 20,
             runs: 1,
             subcomponents: false,
+            candidate_states: false,
         };
         let mut values = std::env::args().skip(1);
         while let Some(arg) = values.next() {
@@ -81,6 +83,7 @@ impl Args {
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--runs" => args.runs = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--subcomponents" => args.subcomponents = true,
+                "--candidate-states" => args.candidate_states = true,
                 "--bench" => {},
                 other => panic!("unknown argument {other:?}; pass --help for usage"),
             }
@@ -148,6 +151,7 @@ fn print_help_and_exit() -> ! {
 --tokens 1,2,4,8,16,32,64
 --contexts 0,128
 --num-reqs 1,2,4
+--candidate-states
 --subcomponents
 --iters N
 --warmup-iters N

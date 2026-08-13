@@ -349,24 +349,46 @@ impl Qwen35ModelBatchRequest {
 /// shift.
 ///
 /// ```text
-/// DSpark, S = 3, shift = 0
+/// DSpark/no shift, S = 3, shift = 0
 ///
-/// Main rows              fixed   spec0   spec1   spec2
-/// state after row          V+1     V+2     V+3     V+4
-/// accepted count             0       1       2       3
-/// candidate state          V+1     V+2     V+3     V+4
+/// Forward mapping:
 ///
-/// MTP, P = 3, S = 3, shift = P - 1 = 2
+/// source state version          V       V+1       V+2       V+3
+/// forward row               fixed     spec0     spec1     spec2
+/// destination state version   V+1       V+2       V+3       V+4
+/// candidate state version     V+1       V+2       V+3       V+4
 ///
-/// Main rows              fixed0  fixed1  fixed2  spec0   spec1   spec2
-/// state after row          V+1     V+2     V+3     V+4     V+5     V+6
-/// accepted count             0       1       2       3
-/// candidate state          V+1     V+2     V+3     V+4
-///                           |------- S + 1 states -------|
+/// Commit mapping:
 ///
-/// destination range       [V+1, V+7)
-/// candidate range         [V+1, V+5)
+/// accepted count                0         1         2         3
+/// destination state version   V+1       V+2       V+3       V+4
+/// candidate state version     V+1       V+2       V+3       V+4
+///
+/// destination range         [V+1, V+5)
+/// selectable dst range      [V+1, V+5)
+/// candidate range           [V+1, V+5)
+///
+/// MTP/shift, L = 4, S = 3, shift = L - 2 = 2
+///
+/// Forward mapping:
+///
+/// source state version          V       V+1       V+2       V+3       V+4       V+5
+/// forward row              fixed0    fixed1    fixed2     spec0     spec1     spec2
+/// destination state version   V+1       V+2       V+3       V+4       V+5       V+6
+/// candidate state version     V+1       V+2       V+3       V+4         -         -
+///
+/// Commit mapping:
+///
+/// accepted count                0         1         2         3
+/// destination state version   V+3       V+4       V+5       V+6
+/// candidate state version     V+1       V+2       V+3       V+4
+///
+/// destination range         [V+1, V+7)
+/// selectable dst range      [V+3, V+7)
+/// candidate range           [V+1, V+5)
 /// ```
+///
+/// Cache-boundary materialization is independent of the candidate ranges.
 ///
 /// The candidate count is `S + 1` for both modes. MTP shifts the candidate
 /// range earlier. It does not add candidates. Prefill commits its full window

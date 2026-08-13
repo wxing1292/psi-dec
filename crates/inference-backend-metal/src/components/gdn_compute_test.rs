@@ -28,10 +28,32 @@ fn test_recurrent_v_dim_tile_selection() {
     assert_eq!(selected_v_dim_tile_size(config), 8);
     config.v_head_dim = 12;
     assert_eq!(selected_v_dim_tile_size(config), 4);
+    config.v_head_dim = 4;
+    assert_eq!(selected_v_dim_tile_size(config), 4);
+}
+
+#[test]
+#[should_panic(expected = "GDN candidate register-V requires Dv divisible by the selected tile")]
+fn test_candidate_register_v_rejects_v_dim_tail() {
+    let mut config = fixture_config();
+    config.v_head_dim = 5;
+    config.validate();
+}
+
+#[test]
+#[should_panic(expected = "GDN candidate register-V requires Dqk divisible by the SIMDgroup width")]
+fn test_candidate_register_v_rejects_qk_dim_tail_at_init() {
+    let mut config = fixture_config();
+    config.qk_head_dim = 33;
+    config.validate();
+}
+
+#[test]
+#[should_panic(expected = "GDN candidate register-V tiles must divide the grouped launch")]
+fn test_candidate_register_v_rejects_incomplete_grouped_launch_at_init() {
+    let mut config = fixture_config();
     config.v_head_dim = 6;
-    assert_eq!(selected_v_dim_tile_size(config), 2);
-    config.v_head_dim = 3;
-    assert_eq!(selected_v_dim_tile_size(config), 1);
+    config.validate();
 }
 
 #[test]
@@ -39,9 +61,9 @@ fn test_recurrent_v_dim_tile_selection() {
 fn test_shape_rejects_shader_count_overflow() {
     let config = GDNComputeConfig {
         num_qk_heads: 1,
-        qk_head_dim: 1,
+        qk_head_dim: 32,
         num_v_heads: 1,
-        v_head_dim: 2,
+        v_head_dim: 4,
         conv_kernel_size: 2,
         q_scale: 1.0,
         norm_eps: 1.0e-6,
@@ -68,8 +90,10 @@ fn test_shape_rejects_shader_count_overflow() {
             a_log: &buffer,
             dt_bias: &buffer,
             cu_tokens: &buffer,
-            src_state_slots: &buffer,
-            flat_materialized_state_slots: &buffer,
+            src_recurrent_state_slots: &buffer,
+            src_conv_state_slots: &buffer,
+            flat_materialized_recurrent_state_slots: &buffer,
+            flat_materialized_conv_state_slots: &buffer,
             conv_state: &buffer,
             conv_state_offset_bytes: 0,
             next_conv_state: &buffer,
@@ -284,6 +308,187 @@ fn test_ragged_multi_random() {
 }
 
 #[test]
+fn test_candidate_state_preserves_distinct_source_slots() {
+    const NUM_REQS: usize = 2;
+    const ROWS_PER_REQ: usize = 4;
+    const NUM_STATE_SLOTS: usize = 8;
+    const CANARY: f32 = -777.0;
+
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let config = GDNComputeConfig {
+        num_qk_heads: 2,
+        qk_head_dim: 128,
+        num_v_heads: 4,
+        v_head_dim: 128,
+        conv_kernel_size: 3,
+        q_scale: 128.0_f32.sqrt().recip(),
+        norm_eps: 1.0e-6,
+    };
+    let shape = fixture_shape(NUM_REQS as u32, (NUM_REQS * ROWS_PER_REQ) as u32);
+    let kernels = GDNCompute::new(&device, config);
+    let qkv_values = fixture_values(config.num_qkv_values(shape), 0.03125, 3);
+    let a_values = fixture_values(shape.num_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
+    let b_values = fixture_values(shape.num_tokens as usize * config.num_v_heads as usize, 0.0625, 7);
+    let z_values = fixture_values(config.num_recurrent_output_values(shape), 0.03125, 11);
+    let conv_weight_values = fixture_values(config.num_conv_weight_values(), 0.00390625, 13);
+    let norm_weight_values = vec![1.0; config.v_head_dim as usize];
+    let a_log_values = vec![-0.25; config.num_v_heads as usize];
+    let dt_bias_values = vec![0.125; config.num_v_heads as usize];
+    let cu_tokens_values = [0_u32, 4, 8];
+    let src_recurrent_state_slot_values = [0_u32, 1];
+    let src_conv_state_slot_values = [1_u32, 0];
+    let recurrent_candidate_slot_values = [2_u32, 3, 4, u32::MAX, 5, 6, 7, u32::MAX];
+    let conv_candidate_slot_values = [7_u32, 6, 5, u32::MAX, 4, 3, 2, u32::MAX];
+    let qkv = Buffer::from_slice(&device, &qkv_values);
+    let a = Buffer::from_slice(&device, &a_values);
+    let b = Buffer::from_slice(&device, &b_values);
+    let z = Buffer::from_slice(&device, &z_values);
+    let conv_weight = bf16_buffer(&device, &conv_weight_values);
+    let norm_weight = bf16_buffer(&device, &norm_weight_values);
+    let a_log = bf16_buffer(&device, &a_log_values);
+    let dt_bias = bf16_buffer(&device, &dt_bias_values);
+    let cu_tokens = Buffer::from_slice(&device, &cu_tokens_values);
+    let src_recurrent_state_slots = Buffer::from_slice(&device, &src_recurrent_state_slot_values);
+    let src_conv_state_slots = Buffer::from_slice(&device, &src_conv_state_slot_values);
+    let recurrent_candidate_slots = Buffer::from_slice(&device, &recurrent_candidate_slot_values);
+    let conv_candidate_slots = Buffer::from_slice(&device, &conv_candidate_slot_values);
+    let conv_stride = config.qkv_dim() as usize * config.conv_state_len() as usize;
+    let recurrent_stride = config.recurrent_state_stride();
+    let reference_core = GDNCore {
+        model_layer_index: 0,
+        hidden_dim: config.num_v_heads as usize * config.v_head_dim as usize,
+        num_qk_heads: config.num_qk_heads as usize,
+        qk_head_dim: config.qk_head_dim as usize,
+        num_v_heads: config.num_v_heads as usize,
+        v_head_dim: config.v_head_dim as usize,
+        conv_kernel_size: config.conv_kernel_size as usize,
+        q_scale: config.q_scale,
+    };
+    let source_conv = fixture_values(NUM_REQS * conv_stride, 0.015625, 17);
+    let source_recurrent = fixture_values(NUM_REQS * recurrent_stride, 0.0078125, 19);
+
+    let conv_arena = Buffer::new_zeroed_elements(&device, NUM_STATE_SLOTS * conv_stride, Dtype::Float32);
+    conv_arena.write_typed(0, &vec![CANARY; NUM_STATE_SLOTS * conv_stride]);
+    conv_arena.write_typed(0, &source_conv);
+    let recurrent_arena = Buffer::new_zeroed_elements(&device, NUM_STATE_SLOTS * recurrent_stride, Dtype::Float32);
+    recurrent_arena.write_typed(0, &vec![CANARY; NUM_STATE_SLOTS * recurrent_stride]);
+    recurrent_arena.write_typed(0, &source_recurrent);
+    let conv_qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
+    let recurrent_output =
+        Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
+    let norm_gated_output =
+        Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
+    let buffers = GDNComputeBuffers {
+        qkv: &qkv,
+        a: &a,
+        b: &b,
+        z: &z,
+        conv_weight: &conv_weight,
+        norm_weight: &norm_weight,
+        a_log: &a_log,
+        dt_bias: &dt_bias,
+        cu_tokens: &cu_tokens,
+        src_recurrent_state_slots: &src_recurrent_state_slots,
+        src_conv_state_slots: &src_conv_state_slots,
+        flat_materialized_recurrent_state_slots: &recurrent_candidate_slots,
+        flat_materialized_conv_state_slots: &conv_candidate_slots,
+        conv_state: &conv_arena,
+        conv_state_offset_bytes: 0,
+        next_conv_state: &conv_arena,
+        next_conv_state_offset_bytes: 0,
+        recurrent_state_arena: &recurrent_arena,
+        recurrent_state_arena_offset_bytes: 0,
+        conv_qkv: &conv_qkv,
+        recurrent_output: &recurrent_output,
+        norm_gated_output: &norm_gated_output,
+    };
+    let mut builder = stream.create_replay_program();
+    builder.record(kernels.invoke_with_candidate_state_update(shape, buffers));
+    stream.submit_replay(&builder.build()).wait();
+
+    let actual_conv_qkv = conv_qkv.read_typed::<f32>(0, config.num_qkv_values(shape));
+    let actual_recurrent_output = recurrent_output.read_typed::<f32>(0, config.num_recurrent_output_values(shape));
+    let actual_norm_gated_output = norm_gated_output.read_typed::<f32>(0, config.num_recurrent_output_values(shape));
+    let actual_conv_arena = conv_arena.read_typed::<f32>(0, NUM_STATE_SLOTS * conv_stride);
+    let actual_recurrent_arena = recurrent_arena.read_typed::<f32>(0, NUM_STATE_SLOTS * recurrent_stride);
+    let mut expected_conv_qkv = vec![0.0; config.num_qkv_values(shape)];
+    let mut expected_recurrent_output = vec![0.0; config.num_recurrent_output_values(shape)];
+    let mut expected_norm_gated_output = vec![0.0; config.num_recurrent_output_values(shape)];
+    let mut expected_conv_arena = vec![CANARY; NUM_STATE_SLOTS * conv_stride];
+    expected_conv_arena[..NUM_REQS * conv_stride].copy_from_slice(&source_conv);
+    let mut expected_recurrent_arena = vec![CANARY; NUM_STATE_SLOTS * recurrent_stride];
+    expected_recurrent_arena[..NUM_REQS * recurrent_stride].copy_from_slice(&source_recurrent);
+
+    for req_index in 0..NUM_REQS {
+        let flat_start = req_index * ROWS_PER_REQ;
+        let source_conv_slot = src_conv_state_slot_values[req_index] as usize;
+        let source_recurrent_slot = src_recurrent_state_slot_values[req_index] as usize;
+        for num_prefix_rows in 1..=ROWS_PER_REQ {
+            let qkv_start = flat_start * config.qkv_dim() as usize;
+            let qkv_end = (flat_start + num_prefix_rows) * config.qkv_dim() as usize;
+            let gate_start = flat_start * config.num_v_heads as usize;
+            let gate_end = (flat_start + num_prefix_rows) * config.num_v_heads as usize;
+            let output_start = flat_start * config.num_v_heads as usize * config.v_head_dim as usize;
+            let output_end = (flat_start + num_prefix_rows) * config.num_v_heads as usize * config.v_head_dim as usize;
+            let prefix_cu_tokens = [0_u32, num_prefix_rows as u32];
+            let conv_reference = gdn_short_conv_reference(
+                &reference_core,
+                &prefix_cu_tokens,
+                &source_conv[source_conv_slot * conv_stride..(source_conv_slot + 1) * conv_stride],
+                &qkv_values[qkv_start..qkv_end],
+                &conv_weight_values,
+            );
+            let recurrent_reference = gdn_recurrent_reference(
+                &reference_core,
+                GDNRecurrentReferenceInput {
+                    cu_tokens: &prefix_cu_tokens,
+                    source_recurrent_state: &source_recurrent
+                        [source_recurrent_slot * recurrent_stride..(source_recurrent_slot + 1) * recurrent_stride],
+                    conv_qkv: &conv_reference.conv_qkv,
+                    a: &a_values[gate_start..gate_end],
+                    b: &b_values[gate_start..gate_end],
+                    a_log: &a_log_values,
+                    dt_bias: &dt_bias_values,
+                },
+            );
+            if num_prefix_rows == ROWS_PER_REQ {
+                expected_conv_qkv[qkv_start..qkv_end].copy_from_slice(&conv_reference.conv_qkv);
+                expected_recurrent_output[output_start..output_end]
+                    .copy_from_slice(&recurrent_reference.recurrent_output);
+                expected_norm_gated_output[output_start..output_end].copy_from_slice(&output_norm_gate_reference(
+                    &recurrent_reference.recurrent_output,
+                    &z_values[output_start..output_end],
+                    &norm_weight_values,
+                    config,
+                ));
+            }
+            let flat_row = flat_start + num_prefix_rows - 1;
+            let conv_candidate_slot = conv_candidate_slot_values[flat_row];
+            if conv_candidate_slot != u32::MAX {
+                let candidate_slot = conv_candidate_slot as usize;
+                expected_conv_arena[candidate_slot * conv_stride..(candidate_slot + 1) * conv_stride]
+                    .copy_from_slice(&conv_reference.next_conv_state);
+            }
+            let recurrent_candidate_slot = recurrent_candidate_slot_values[flat_row];
+            if recurrent_candidate_slot != u32::MAX {
+                let candidate_slot = recurrent_candidate_slot as usize;
+                expected_recurrent_arena[candidate_slot * recurrent_stride..(candidate_slot + 1) * recurrent_stride]
+                    .copy_from_slice(&recurrent_reference.next_recurrent_state);
+            }
+        }
+    }
+
+    assert_close(&actual_conv_qkv, &expected_conv_qkv, 2.0e-5);
+    assert_close(&actual_recurrent_output, &expected_recurrent_output, 2.0e-5);
+    assert_close(&actual_norm_gated_output, &expected_norm_gated_output, 2.0e-5);
+    assert_close(&actual_conv_arena, &expected_conv_arena, 2.0e-5);
+    assert_close(&actual_recurrent_arena, &expected_recurrent_arena, 2.0e-5);
+    assert_eq!(&actual_conv_arena[..NUM_REQS * conv_stride], source_conv);
+    assert_eq!(&actual_recurrent_arena[..NUM_REQS * recurrent_stride], source_recurrent);
+}
+
+#[test]
 fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state() {
     const NUM_STATE_SLOTS: usize = 6;
     const CANARY: f32 = -777.0;
@@ -350,8 +555,10 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
             a_log: &a_log,
             dt_bias: &dt_bias,
             cu_tokens: &cu_tokens,
-            src_state_slots: &src_state_slots,
-            flat_materialized_state_slots: &flat_materialized_state_slots,
+            src_recurrent_state_slots: &src_state_slots,
+            src_conv_state_slots: &src_state_slots,
+            flat_materialized_recurrent_state_slots: &flat_materialized_state_slots,
+            flat_materialized_conv_state_slots: &flat_materialized_state_slots,
             conv_state: &conv_state_arena,
             conv_state_offset_bytes: 0,
             next_conv_state: &conv_state_arena,
@@ -746,8 +953,10 @@ fn test_candidate_states_above_u32_byte_offset() {
             a_log: &a_log,
             dt_bias: &dt_bias,
             cu_tokens: &cu_tokens,
-            src_state_slots: &src_state_slots,
-            flat_materialized_state_slots: &candidate_dst_slot_ids,
+            src_recurrent_state_slots: &src_state_slots,
+            src_conv_state_slots: &src_state_slots,
+            flat_materialized_recurrent_state_slots: &candidate_dst_slot_ids,
+            flat_materialized_conv_state_slots: &candidate_dst_slot_ids,
             conv_state: &state_arena,
             conv_state_offset_bytes,
             next_conv_state: &state_arena,
@@ -891,8 +1100,10 @@ fn run_gdn_core(
             a_log: &a_log,
             dt_bias: &dt_bias,
             cu_tokens: &cu_tokens,
-            src_state_slots: &src_state_slots,
-            flat_materialized_state_slots: &flat_materialized_state_slots,
+            src_recurrent_state_slots: &src_state_slots,
+            src_conv_state_slots: &src_state_slots,
+            flat_materialized_recurrent_state_slots: &flat_materialized_state_slots,
+            flat_materialized_conv_state_slots: &flat_materialized_state_slots,
             conv_state: &conv_state,
             conv_state_offset_bytes: state_offset_bytes,
             next_conv_state: &next_conv_state,
@@ -989,8 +1200,10 @@ fn run_gdn_forward_candidate_state(
         a_log: &a_log,
         dt_bias: &dt_bias,
         cu_tokens: &cu_tokens,
-        src_state_slots: &src_state_slots,
-        flat_materialized_state_slots: &candidate_dst_slot_ids,
+        src_recurrent_state_slots: &src_state_slots,
+        src_conv_state_slots: &src_state_slots,
+        flat_materialized_recurrent_state_slots: &candidate_dst_slot_ids,
+        flat_materialized_conv_state_slots: &candidate_dst_slot_ids,
         conv_state: &conv_state,
         conv_state_offset_bytes: state_offset_bytes,
         next_conv_state: &next_conv_state,
@@ -1122,7 +1335,7 @@ fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
 fn fixture_config() -> GDNComputeConfig {
     GDNComputeConfig {
         num_qk_heads: 1,
-        qk_head_dim: 4,
+        qk_head_dim: 32,
         num_v_heads: 1,
         v_head_dim: 8,
         conv_kernel_size: 3,

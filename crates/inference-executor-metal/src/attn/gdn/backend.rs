@@ -212,7 +212,13 @@ impl GDN {
         cu_tokens: &[u32],
         state: &GDNPreparedRequestState,
     ) -> GDNReplayShape {
-        metadata.update(cu_tokens, &state.src_state_slots, &state.flat_materialized_state_slots)
+        metadata.update(
+            cu_tokens,
+            &state.src_recurrent_state_slots,
+            &state.src_conv_state_slots,
+            &state.flat_materialized_recurrent_state_slots,
+            &state.flat_materialized_conv_state_slots,
+        )
     }
 
     pub fn prepare_bucketed(
@@ -224,8 +230,10 @@ impl GDN {
     ) -> GDNReplayShape {
         metadata.update_bucketed(
             cu_tokens,
-            &state.src_state_slots,
-            &state.flat_materialized_state_slots,
+            &state.src_recurrent_state_slots,
+            &state.src_conv_state_slots,
+            &state.flat_materialized_recurrent_state_slots,
+            &state.flat_materialized_conv_state_slots,
             policy,
         )
     }
@@ -246,8 +254,10 @@ impl GDN {
         self.validate_token_capacity(num_tokens, total_tokens);
         metadata.update_bucketed_with_token_capacity(
             cu_tokens,
-            &state.src_state_slots,
-            &state.flat_materialized_state_slots,
+            &state.src_recurrent_state_slots,
+            &state.src_conv_state_slots,
+            &state.flat_materialized_recurrent_state_slots,
+            &state.flat_materialized_conv_state_slots,
             policy,
             total_tokens,
         )
@@ -395,8 +405,10 @@ impl ReplayLayer for GDN {
             a_log: weights.a_log,
             dt_bias: weights.dt_bias,
             cu_tokens: batch_metadata.cu_tokens(),
-            src_state_slots: batch_metadata.src_state_slots(),
-            flat_materialized_state_slots: batch_metadata.flat_materialized_state_slots(),
+            src_recurrent_state_slots: batch_metadata.src_recurrent_state_slots(),
+            src_conv_state_slots: batch_metadata.src_conv_state_slots(),
+            flat_materialized_recurrent_state_slots: batch_metadata.flat_materialized_recurrent_state_slots(),
+            flat_materialized_conv_state_slots: batch_metadata.flat_materialized_conv_state_slots(),
             conv_state: state.conv_state,
             conv_state_offset_bytes: state.conv_state_offset_bytes,
             next_conv_state: state.next_conv_state,
@@ -550,8 +562,10 @@ mod tests {
 
         for num_tokens in 1..=64 {
             let state = GDNPreparedRequestState {
-                src_state_slots: vec![0],
-                flat_materialized_state_slots: vec![u32::MAX; num_tokens as usize],
+                src_recurrent_state_slots: vec![0],
+                src_conv_state_slots: vec![0],
+                flat_materialized_recurrent_state_slots: vec![u32::MAX; num_tokens as usize],
+                flat_materialized_conv_state_slots: vec![u32::MAX; num_tokens as usize],
             };
             let shape = backend.prepare_bucketed(&metadata, &[0, num_tokens], &state, &policy);
             let topology = backend.replay_topology(&metadata, true);
@@ -578,8 +592,10 @@ mod tests {
             .expect("test GDN affine topology must change within the token capacity");
         let num_tokens = topology_boundary - 1;
         let state = GDNPreparedRequestState {
-            src_state_slots: vec![0],
-            flat_materialized_state_slots: vec![u32::MAX; num_tokens as usize],
+            src_recurrent_state_slots: vec![0],
+            src_conv_state_slots: vec![0],
+            flat_materialized_recurrent_state_slots: vec![u32::MAX; num_tokens as usize],
+            flat_materialized_conv_state_slots: vec![u32::MAX; num_tokens as usize],
         };
 
         backend.prepare_bucketed_with_token_capacity(&metadata, &[0, num_tokens], &state, &policy, topology_boundary);
@@ -632,8 +648,10 @@ mod tests {
         let scratch = GDNScratch::new(&device, &core, 2);
         let metadata = GDNMetadataBuffers::new(&device, 2, 2);
         let state = GDNPreparedRequestState {
-            src_state_slots: vec![0, 2],
-            flat_materialized_state_slots: vec![u32::MAX; 2],
+            src_recurrent_state_slots: vec![0, 2],
+            src_conv_state_slots: vec![0, 2],
+            flat_materialized_recurrent_state_slots: vec![u32::MAX; 2],
+            flat_materialized_conv_state_slots: vec![u32::MAX; 2],
         };
         let hidden_state = Buffer::new_zeroed_elements(&device, 2 * core.hidden_dim, Dtype::Bfloat16);
         let next_hidden_state = Buffer::new_zeroed_elements(&device, 2 * core.hidden_dim, Dtype::Bfloat16);

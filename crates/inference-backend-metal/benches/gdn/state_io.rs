@@ -86,7 +86,8 @@ impl StateIOFixture {
         let bindings = StateIOBindings {
             pages: &pages,
             page_ids: &page_ids,
-            state_slots: &state_slots,
+            recurrent_state_slots: &state_slots,
+            conv_state_slots: &state_slots,
             recurrent_states: &recurrent_state_arena,
             conv_states: &conv_state_arena,
         };
@@ -120,7 +121,8 @@ impl StateIOFixture {
 struct StateIOBindings<'a> {
     pages: &'a Buffer,
     page_ids: &'a Buffer,
-    state_slots: &'a Buffer,
+    recurrent_state_slots: &'a Buffer,
+    conv_state_slots: &'a Buffer,
     recurrent_states: &'a Buffer,
     conv_states: &'a Buffer,
 }
@@ -141,7 +143,8 @@ fn build_restore_replay(
             recurrent_states: bindings.recurrent_states,
             conv_states: bindings.conv_states,
             page_ids: bindings.page_ids,
-            state_slots: bindings.state_slots,
+            recurrent_state_slots: bindings.recurrent_state_slots,
+            conv_state_slots: bindings.conv_state_slots,
         },
     ));
     builder.build()
@@ -163,7 +166,8 @@ fn build_publish_replay(
             recurrent_states: bindings.recurrent_states,
             conv_states: bindings.conv_states,
             page_ids: bindings.page_ids,
-            state_slots: bindings.state_slots,
+            recurrent_state_slots: bindings.recurrent_state_slots,
+            conv_state_slots: bindings.conv_state_slots,
         },
     ));
     builder.build()

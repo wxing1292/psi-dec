@@ -58,18 +58,29 @@ impl SelectedStateIO for GDNRequestStateTable {
             self.num_pages_per_state_slot(),
             self.num_cache_pages,
         );
-        let state_entry_ranges = selected_state_entry_ranges(&request_table, request_slot_ranges, self.layout);
+        let recurrent_state_entry_ranges = selected_state_entry_ranges(
+            &request_table,
+            request_slot_ranges,
+            self.layout,
+            GDNRequestSlots::current_recurrent_state_slot,
+        );
+        let conv_state_entry_ranges = selected_state_entry_ranges(
+            &request_table,
+            request_slot_ranges,
+            self.layout,
+            GDNRequestSlots::current_conv_state_slot,
+        );
         writer.write_metadata(files.request_state_table(), &*request_table)?;
         writer.write_selected_buffer(
             files.recurrent_state(),
             &self.resources().recurrent_states,
-            &state_entry_ranges,
+            &recurrent_state_entry_ranges,
             self.recurrent_state_bytes(),
         )?;
         writer.write_selected_buffer(
             files.conv_state(),
             &self.resources().conv_states,
-            &state_entry_ranges,
+            &conv_state_entry_ranges,
             self.conv_state_bytes(),
         )?;
         Ok(())
@@ -82,17 +93,28 @@ impl SelectedStateIO for GDNRequestStateTable {
         request_slot_ranges: &[Range<RawRequestSlot>],
     ) -> Result<(), ModelExecutorError> {
         let request_table: GDNRequestSlots = reader.read_metadata(files.request_state_table())?;
-        let state_entry_ranges = selected_state_entry_ranges(&request_table, request_slot_ranges, self.layout);
+        let recurrent_state_entry_ranges = selected_state_entry_ranges(
+            &request_table,
+            request_slot_ranges,
+            self.layout,
+            GDNRequestSlots::current_recurrent_state_slot,
+        );
+        let conv_state_entry_ranges = selected_state_entry_ranges(
+            &request_table,
+            request_slot_ranges,
+            self.layout,
+            GDNRequestSlots::current_conv_state_slot,
+        );
         reader.read_selected_buffer(
             files.recurrent_state(),
             &self.resources().recurrent_states,
-            &state_entry_ranges,
+            &recurrent_state_entry_ranges,
             self.recurrent_state_bytes(),
         )?;
         reader.read_selected_buffer(
             files.conv_state(),
             &self.resources().conv_states,
-            &state_entry_ranges,
+            &conv_state_entry_ranges,
             self.conv_state_bytes(),
         )?;
         self.request_table = Some(RefCell::new(request_table));
@@ -104,6 +126,7 @@ fn selected_state_entry_ranges(
     request_table: &GDNRequestSlots,
     request_slot_ranges: &[Range<RawRequestSlot>],
     layout: super::GDNStateLayout,
+    current_state_slot: fn(&GDNRequestSlots, RawRequestSlot) -> u32,
 ) -> Vec<Range<u32>> {
     let selected_request_count = request_slot_ranges
         .iter()
@@ -113,7 +136,7 @@ fn selected_state_entry_ranges(
         .iter()
         .flat_map(|range| range.clone())
         .map(|req_slot| {
-            usize::try_from(request_table.current_state_slot(req_slot)).expect("GDN state slot must fit host usize")
+            usize::try_from(current_state_slot(request_table, req_slot)).expect("GDN state slot must fit host usize")
         })
         .collect::<Vec<_>>();
     state_slots.sort_unstable();

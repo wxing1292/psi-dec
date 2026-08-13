@@ -136,6 +136,10 @@ component path as the design.
 
 ## Performance Investigations
 
+- Audit repeated inner-path `checked_add` and `checked_sub` operations whose operands are already constrained by
+  init-time or prepare-input validation. Remove only operations whose safety proof is explicit and remains valid at
+  the use site. Do not remove checked arithmetic mechanically. Keep checked arithmetic for allocation sizing,
+  external inputs, cross-type conversions, and real overflow boundaries.
 - Evaluate software-pipelined K and V loads for GQA `TiledQTokens` as a bounded experiment.
   The current `Tkv=16`, `D=256` K and V threadgroup tiles use 16.5 KiB.
   Duplicating them with the existing eight-value row padding requires 33 KiB.
@@ -168,6 +172,10 @@ component path as the design.
 
 ## Model and Backend Investigations
 
+- Extend the independent GDN recurrent/conv version maps for C4 only after the owner can late-bind recurrent slots.
+  The selected recurrent version is not known at `begin_txn(...)`. Commit 2 must bind one replay destination slot to
+  the accepted state version and to each known publish target that replay satisfies. It must not register every
+  candidate version in `recurrent_materialized_state_versions`. That behavior would recreate C0 recurrent capacity.
 - Audit Qwen3 and Qwen3.5 tensor-level quantization overrides outside MoE routing.
   Their current Main and MTP GQA, GDN, and MLP builders use model-level affine defaults.
   Confirm the supported checkpoint contracts before changing the loaders.

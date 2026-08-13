@@ -8,8 +8,9 @@ impl GDNRequestSlots {
         num_cache_pages: usize,
     ) {
         assert!(
-            self.txn_state_slots.iter().all(Vec::is_empty),
-            "GDN state snapshots require all candidate state transactions to complete"
+            self.txn_recurrent_state_slots.iter().all(Vec::is_empty)
+                && self.txn_conv_state_slots.iter().all(Vec::is_empty),
+            "GDN state snapshots require all recurrent and convolution candidate state transactions to complete"
         );
         assert!(
             self.pending_publish_pages

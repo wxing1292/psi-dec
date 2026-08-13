@@ -97,18 +97,25 @@ pub struct GDNRequestStateResources {
 
 pub struct GDNStatePageIO {
     page_ids: Buffer,
-    state_slots: Buffer,
+    recurrent_state_slots: Buffer,
+    conv_state_slots: Buffer,
     read: GDNStatePageBatchRead,
     write: GDNStatePageBatchWrite,
 }
 
 pub struct GDNPreparedRequestState {
-    pub src_state_slots: Vec<u32>,
-    /// Persistent state slot for each forward row.
+    pub src_recurrent_state_slots: Vec<u32>,
+    pub src_conv_state_slots: Vec<u32>,
+    /// Persistent recurrent state slot for each forward row.
     ///
-    /// `u32::MAX` means that the row produces its normal output, but its convolution and
-    /// recurrent states must not be written to the persistent state arenas.
-    pub flat_materialized_state_slots: Vec<u32>,
+    /// `u32::MAX` means that the row produces its normal output, but its recurrent state
+    /// must not be written to the persistent recurrent state arena.
+    pub flat_materialized_recurrent_state_slots: Vec<u32>,
+    /// Persistent convolution state slot for each forward row.
+    ///
+    /// `u32::MAX` means that the row produces its normal output, but its convolution state
+    /// must not be written to the persistent convolution state arena.
+    pub flat_materialized_conv_state_slots: Vec<u32>,
 }
 
 struct GDNPrepareOutput {
@@ -497,7 +504,10 @@ impl GDNRequestStateTable {
         let mut request_table = self.request_table().borrow_mut();
         request_table.reset_req_slots(req_slots);
         for &req_slot in req_slots {
-            self.zero_state_slot(request_table.current_state_slot(req_slot));
+            self.zero_state_slots(
+                request_table.current_recurrent_state_slot(req_slot),
+                request_table.current_conv_state_slot(req_slot),
+            );
         }
     }
 
@@ -505,16 +515,20 @@ impl GDNRequestStateTable {
         self.reset_req_slots(&[req_slot]);
     }
 
-    fn zero_state_slot(&self, state_slot: u32) {
-        let state_slot_index = usize::try_from(state_slot).expect("GDN state slot must fit host usize");
-        assert!(state_slot_index < self.layout.num_state_slots);
+    fn zero_state_slots(&self, recurrent_state_slot: u32, conv_state_slot: u32) {
+        let recurrent_state_slot_index =
+            usize::try_from(recurrent_state_slot).expect("GDN recurrent state slot must fit host usize");
+        let conv_state_slot_index =
+            usize::try_from(conv_state_slot).expect("GDN convolution state slot must fit host usize");
+        assert!(recurrent_state_slot_index < self.layout.num_state_slots);
+        assert!(conv_state_slot_index < self.layout.num_state_slots);
         for gdn_layer_index in 0..self.layout.num_gdn_layers {
             let layer = self.layer_bindings(gdn_layer_index);
             let recurrent_state_slot_offset_bytes = layer
                 .recurrent_layer_offset_bytes
                 .checked_add(
-                    u64::try_from(state_slot_index)
-                        .expect("GDN state slot must fit u64")
+                    u64::try_from(recurrent_state_slot_index)
+                        .expect("GDN recurrent state slot must fit u64")
                         .checked_mul(
                             u64::try_from(self.recurrent_state_bytes())
                                 .expect("GDN recurrent state slot bytes must fit u64"),
@@ -530,8 +544,8 @@ impl GDNRequestStateTable {
             let conv_state_slot_offset_bytes = layer
                 .conv_layer_offset_bytes
                 .checked_add(
-                    u64::try_from(state_slot_index)
-                        .expect("GDN state slot must fit u64")
+                    u64::try_from(conv_state_slot_index)
+                        .expect("GDN convolution state slot must fit u64")
                         .checked_mul(
                             u64::try_from(self.conv_state_bytes())
                                 .expect("GDN convolution state slot bytes must fit u64"),
@@ -545,7 +559,9 @@ impl GDNRequestStateTable {
                 .conv_states
                 .zero_bytes(conv_state_slot_offset_bytes, self.conv_state_bytes());
         }
-        trace::gdn_state(|| format!("event=gdn_state_zero slot={state_slot}"));
+        trace::gdn_state(|| {
+            format!("event=gdn_state_zero recurrent_slot={recurrent_state_slot} conv_slot={conv_state_slot}")
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -677,7 +693,12 @@ impl GDNStatePageIO {
         let config = Self::config(layout);
         Self {
             page_ids: Buffer::new_zeroed_elements(device, num_page_ids, inference_backend_metal::metal::Dtype::Uint32),
-            state_slots: Buffer::new_zeroed_elements(
+            recurrent_state_slots: Buffer::new_zeroed_elements(
+                device,
+                layout.max_state_io_requests,
+                inference_backend_metal::metal::Dtype::Uint32,
+            ),
+            conv_state_slots: Buffer::new_zeroed_elements(
                 device,
                 layout.max_state_io_requests,
                 inference_backend_metal::metal::Dtype::Uint32,
@@ -688,11 +709,18 @@ impl GDNStatePageIO {
     }
 
     fn prepare_restore(&self, restores: &[GDNStateRestore], num_pages_per_state_slot: usize) {
-        self.state_slots.write_typed(
+        self.recurrent_state_slots.write_typed(
             0,
             &restores
                 .iter()
-                .map(|restore| restore.dst_state_slot)
+                .map(|restore| restore.dst_recurrent_state_slot)
+                .collect::<Vec<_>>(),
+        );
+        self.conv_state_slots.write_typed(
+            0,
+            &restores
+                .iter()
+                .map(|restore| restore.dst_conv_state_slot)
                 .collect::<Vec<_>>(),
         );
         for (state_io_request_index, restore) in restores.iter().enumerate() {
@@ -701,11 +729,18 @@ impl GDNStatePageIO {
     }
 
     fn prepare_publish(&self, publishes: &[GDNStatePublish], num_pages_per_state_slot: usize) {
-        self.state_slots.write_typed(
+        self.recurrent_state_slots.write_typed(
             0,
             &publishes
                 .iter()
-                .map(|publish| publish.src_state_slot)
+                .map(|publish| publish.src_recurrent_state_slot)
+                .collect::<Vec<_>>(),
+        );
+        self.conv_state_slots.write_typed(
+            0,
+            &publishes
+                .iter()
+                .map(|publish| publish.src_conv_state_slot)
                 .collect::<Vec<_>>(),
         );
         for (state_io_request_index, publish) in publishes.iter().enumerate() {
@@ -741,7 +776,8 @@ impl GDNStatePageIO {
                 recurrent_states,
                 conv_states,
                 page_ids: &self.page_ids,
-                state_slots: &self.state_slots,
+                recurrent_state_slots: &self.recurrent_state_slots,
+                conv_state_slots: &self.conv_state_slots,
             },
         )));
     }
@@ -774,7 +810,8 @@ impl GDNStatePageIO {
                 recurrent_states,
                 conv_states,
                 page_ids: &self.page_ids,
-                state_slots: &self.state_slots,
+                recurrent_state_slots: &self.recurrent_state_slots,
+                conv_state_slots: &self.conv_state_slots,
             },
         )));
     }
@@ -851,9 +888,9 @@ impl GDNPrepareInput {
     /// row state slots       MAX slot12 MAX slot14
     /// ```
     ///
-    /// `flat_materialized_state_slots` maps the union to the exact row that produces
-    /// each version. `u32::MAX` means that the row produces its normal output but
-    /// does not write its state to the persistent arenas.
+    /// The recurrent and convolution materialization arrays map the union to the
+    /// exact row that produces each version. `u32::MAX` means that the row produces
+    /// its normal output but does not write that state domain to its persistent arena.
     fn resolve(mut self) -> GDNPrepareOutput {
         let mut restores = Vec::new();
         let publishes = Vec::new();
@@ -969,18 +1006,25 @@ impl GDNPrepareInput {
             self.request_table.begin_txn(
                 req_slot,
                 &materialized_versions,
+                &materialized_versions,
                 take(&mut pending_publish_pages[req_index]),
             );
             materialized_versions_by_req.push(materialized_versions);
         }
 
-        let src_state_slots = self
+        let src_recurrent_state_slots = self
             .req_slots
             .iter()
-            .map(|&req_slot| self.request_table.current_state_slot(req_slot))
+            .map(|&req_slot| self.request_table.current_recurrent_state_slot(req_slot))
+            .collect::<Vec<_>>();
+        let src_conv_state_slots = self
+            .req_slots
+            .iter()
+            .map(|&req_slot| self.request_table.current_conv_state_slot(req_slot))
             .collect::<Vec<_>>();
         let num_tokens = self.cu_tokens.last().copied().unwrap_or_default() as usize;
-        let mut flat_materialized_state_slots = Vec::with_capacity(num_tokens);
+        let mut flat_materialized_recurrent_state_slots = Vec::with_capacity(num_tokens);
+        let mut flat_materialized_conv_state_slots = Vec::with_capacity(num_tokens);
         for (req_index, materialized_versions) in materialized_versions_by_req.iter().enumerate() {
             let txn = self.state_txns[req_index];
             let req_slot = self.req_slots[req_index];
@@ -999,20 +1043,28 @@ impl GDNPrepareInput {
                 {
                     materialized_versions.next();
                 }
-                flat_materialized_state_slots.push(
-                    if materialized_versions.peek().copied() == Some(dst_state_version) {
-                        materialized_versions.next();
-                        self.request_table.candidate_state_slot(req_slot, dst_state_version)
-                    } else {
-                        u32::MAX
-                    },
-                );
+                if materialized_versions.peek().copied() == Some(dst_state_version) {
+                    materialized_versions.next();
+                    flat_materialized_recurrent_state_slots.push(
+                        self.request_table
+                            .candidate_recurrent_state_slot(req_slot, dst_state_version),
+                    );
+                    flat_materialized_conv_state_slots.push(
+                        self.request_table
+                            .candidate_conv_state_slot(req_slot, dst_state_version),
+                    );
+                } else {
+                    flat_materialized_recurrent_state_slots.push(u32::MAX);
+                    flat_materialized_conv_state_slots.push(u32::MAX);
+                }
             }
         }
         GDNPrepareOutput {
             prepared: GDNPreparedRequestState {
-                src_state_slots,
-                flat_materialized_state_slots,
+                src_recurrent_state_slots,
+                src_conv_state_slots,
+                flat_materialized_recurrent_state_slots,
+                flat_materialized_conv_state_slots,
             },
             request_table: self.request_table,
             restores,
@@ -1109,6 +1161,7 @@ mod tests {
             .map(|index| u32::try_from(10 + index).unwrap())
             .collect::<Vec<_>>();
         populate_durable_request_state(&state, &device, &page_ids);
+        advance_to_distinct_state_slots(&state, 1);
 
         let (num_recurrent_values, num_conv_values) = state_value_counts(&state);
         let recurrent_state = fixed_values(num_recurrent_values, 0.25);
@@ -1130,6 +1183,7 @@ mod tests {
             .map(|_| random.next_u32() % 1024)
             .collect::<Vec<_>>();
         populate_durable_request_state(&state, &device, &page_ids);
+        advance_to_distinct_state_slots(&state, 1);
 
         let (num_recurrent_values, num_conv_values) = state_value_counts(&state);
         let recurrent_state = random.values(num_recurrent_values);
@@ -1152,12 +1206,12 @@ mod tests {
             TEST_NUM_CACHE_PAGES,
             LIFECYCLE_PAGE_BYTES,
         );
-        {
-            let mut request_table = state.request_table().borrow_mut();
-            request_table.begin_txn(1, &[1], Vec::new());
-            assert!(request_table.commit_txn(1, 1).is_empty());
-        }
-        let selected_state_slot = usize::try_from(state.request_table().borrow().current_state_slot(1)).unwrap();
+        advance_to_distinct_state_slots_for_req(&state, 1, 0);
+        let selected_recurrent_state_slot =
+            usize::try_from(state.request_table().borrow().current_recurrent_state_slot(1)).unwrap();
+        let selected_conv_state_slot =
+            usize::try_from(state.request_table().borrow().current_conv_state_slot(1)).unwrap();
+        assert_ne!(selected_recurrent_state_slot, selected_conv_state_slot);
         let request_state = state.request_table().borrow().clone();
         let (num_recurrent_values, num_conv_values) = state_value_counts(&state);
         let recurrent_state = fixed_values(num_recurrent_values, 0.25);
@@ -1194,7 +1248,7 @@ mod tests {
             &recurrent_state,
             state.layout.num_gdn_layers,
             state.layout.num_state_slots,
-            selected_state_slot,
+            selected_recurrent_state_slot,
             state.recurrent_state_bytes() / size_of::<f32>(),
         );
         assert_selected_state_values(
@@ -1202,7 +1256,7 @@ mod tests {
             &conv_state,
             state.layout.num_gdn_layers,
             state.layout.num_state_slots,
-            selected_state_slot,
+            selected_conv_state_slot,
             state.conv_state_bytes() / size_of::<f32>(),
         );
         std::fs::remove_dir_all(snapshot_path).unwrap();
@@ -1286,13 +1340,19 @@ mod tests {
             &[Vec::new()],
         );
 
-        assert_eq!(batch_metadata.src_state_slots().read_typed::<u32>(0, 1), vec![0]);
         assert_eq!(
-            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 1),
+            batch_metadata.src_recurrent_state_slots().read_typed::<u32>(0, 1),
+            vec![0]
+        );
+        assert_eq!(
+            batch_metadata
+                .flat_materialized_recurrent_state_slots()
+                .read_typed::<u32>(0, 1),
             vec![2]
         );
         state.commit(&[1]);
-        assert_eq!(state.request_table().borrow().current_state_slot(0), 2);
+        assert_eq!(state.request_table().borrow().current_recurrent_state_slot(0), 2);
+        assert_eq!(state.request_table().borrow().current_conv_state_slot(0), 2);
         assert_eq!(state.request_table().borrow().current_state_version(0), 1);
     }
 
@@ -1320,11 +1380,13 @@ mod tests {
             &[Vec::new()],
         );
 
-        let state_version_2_slot = state.request_table().borrow().candidate_state_slot(0, 2);
-        let state_version_3_slot = state.request_table().borrow().candidate_state_slot(0, 3);
-        let state_version_4_slot = state.request_table().borrow().candidate_state_slot(0, 4);
+        let state_version_2_slot = state.request_table().borrow().candidate_recurrent_state_slot(0, 2);
+        let state_version_3_slot = state.request_table().borrow().candidate_recurrent_state_slot(0, 3);
+        let state_version_4_slot = state.request_table().borrow().candidate_recurrent_state_slot(0, 4);
         assert_eq!(
-            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            batch_metadata
+                .flat_materialized_recurrent_state_slots()
+                .read_typed::<u32>(0, 4),
             vec![
                 u32::MAX,
                 state_version_2_slot,
@@ -1362,12 +1424,14 @@ mod tests {
         );
 
         let table = state.request_table().borrow();
-        let state_version_2_slot = table.candidate_state_slot(0, 2);
-        let state_version_3_slot = table.candidate_state_slot(0, 3);
-        let state_version_4_slot = table.candidate_state_slot(0, 4);
+        let state_version_2_slot = table.candidate_recurrent_state_slot(0, 2);
+        let state_version_3_slot = table.candidate_recurrent_state_slot(0, 3);
+        let state_version_4_slot = table.candidate_recurrent_state_slot(0, 4);
         drop(table);
         assert_eq!(
-            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            batch_metadata
+                .flat_materialized_recurrent_state_slots()
+                .read_typed::<u32>(0, 4),
             vec![
                 u32::MAX,
                 state_version_2_slot,
@@ -1380,7 +1444,8 @@ mod tests {
 
         let table = state.request_table().borrow();
         assert_eq!(table.current_state_version(0), 3);
-        assert_eq!(table.current_state_slot(0), state_version_3_slot);
+        assert_eq!(table.current_recurrent_state_slot(0), state_version_3_slot);
+        assert_eq!(table.current_conv_state_slot(0), state_version_3_slot);
     }
 
     #[test]
@@ -1408,12 +1473,14 @@ mod tests {
         );
 
         let table = state.request_table().borrow();
-        let state_version_1_slot = table.candidate_state_slot(0, 1);
-        let state_version_2_slot = table.candidate_state_slot(0, 2);
-        let state_version_3_slot = table.candidate_state_slot(0, 3);
+        let state_version_1_slot = table.candidate_recurrent_state_slot(0, 1);
+        let state_version_2_slot = table.candidate_recurrent_state_slot(0, 2);
+        let state_version_3_slot = table.candidate_recurrent_state_slot(0, 3);
         drop(table);
         assert_eq!(
-            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            batch_metadata
+                .flat_materialized_recurrent_state_slots()
+                .read_typed::<u32>(0, 4),
             vec![
                 state_version_1_slot,
                 state_version_2_slot,
@@ -1426,7 +1493,8 @@ mod tests {
 
         let table = state.request_table().borrow();
         assert_eq!(table.current_state_version(0), 2);
-        assert_eq!(table.current_state_slot(0), state_version_2_slot);
+        assert_eq!(table.current_recurrent_state_slot(0), state_version_2_slot);
+        assert_eq!(table.current_conv_state_slot(0), state_version_2_slot);
     }
 
     #[test]
@@ -1457,11 +1525,13 @@ mod tests {
         );
 
         let table = state.request_table().borrow();
-        let first_boundary_slot = table.candidate_state_slot(0, 2);
-        let candidate_slot = table.candidate_state_slot(0, 4);
+        let first_boundary_slot = table.candidate_recurrent_state_slot(0, 2);
+        let candidate_slot = table.candidate_recurrent_state_slot(0, 4);
         drop(table);
         assert_eq!(
-            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            batch_metadata
+                .flat_materialized_recurrent_state_slots()
+                .read_typed::<u32>(0, 4),
             vec![u32::MAX, first_boundary_slot, u32::MAX, candidate_slot]
         );
     }
@@ -1504,12 +1574,14 @@ mod tests {
             &[GDNStateTxn::new(1, 4, 2)],
             &[Vec::new()],
         );
-        let state_version_2_slot = state.request_table().borrow().candidate_state_slot(0, 2);
-        let state_version_3_slot = state.request_table().borrow().candidate_state_slot(0, 3);
-        let state_version_4_slot = state.request_table().borrow().candidate_state_slot(0, 4);
-        let state_version_5_slot = state.request_table().borrow().candidate_state_slot(0, 5);
+        let state_version_2_slot = state.request_table().borrow().candidate_recurrent_state_slot(0, 2);
+        let state_version_3_slot = state.request_table().borrow().candidate_recurrent_state_slot(0, 3);
+        let state_version_4_slot = state.request_table().borrow().candidate_recurrent_state_slot(0, 4);
+        let state_version_5_slot = state.request_table().borrow().candidate_recurrent_state_slot(0, 5);
         assert_eq!(
-            batch_metadata.flat_materialized_state_slots().read_typed::<u32>(0, 4),
+            batch_metadata
+                .flat_materialized_recurrent_state_slots()
+                .read_typed::<u32>(0, 4),
             vec![
                 state_version_2_slot,
                 state_version_3_slot,
@@ -1560,7 +1632,10 @@ mod tests {
         assert_eq!(state.restores().len(), 1);
         assert_eq!(state.restores()[0].state_version, 2);
         assert_eq!(state.restores()[0].page_ids, snapshot_page_ids);
-        assert_eq!(batch_metadata.src_state_slots().read_typed::<u32>(0, 1), vec![0]);
+        assert_eq!(
+            batch_metadata.src_recurrent_state_slots().read_typed::<u32>(0, 1),
+            vec![0]
+        );
 
         state.commit(&[3]);
         assert_eq!(state.request_table().borrow().current_state_version(0), 3);
@@ -1607,6 +1682,15 @@ mod tests {
         );
         let batch_metadata = GDNMetadataBuffers::new(&device, 1, 8);
         let snapshot_page_ids = vec![10, 11, 12, 13, 14, 15, 16, 17];
+        advance_to_distinct_state_slots_for_req(&state, 0, 0);
+        let (expected_recurrent_state_slot, expected_conv_state_slot) = {
+            let request_table = state.request_table().borrow();
+            (
+                request_table.current_recurrent_state_slot(0),
+                request_table.current_conv_state_slot(0),
+            )
+        };
+        assert_ne!(expected_recurrent_state_slot, expected_conv_state_slot);
         prepare_state(
             &state,
             &batch_metadata,
@@ -1621,6 +1705,19 @@ mod tests {
         assert_eq!(state.restores().len(), 1);
         assert_eq!(state.restores()[0].state_version, 1024);
         assert_eq!(state.restores()[0].page_ids, snapshot_page_ids);
+        assert_eq!(
+            state.restores()[0].dst_recurrent_state_slot,
+            expected_recurrent_state_slot
+        );
+        assert_eq!(state.restores()[0].dst_conv_state_slot, expected_conv_state_slot);
+        assert_eq!(
+            batch_metadata.src_recurrent_state_slots().read_typed::<u32>(0, 1),
+            vec![expected_recurrent_state_slot]
+        );
+        assert_eq!(
+            batch_metadata.src_conv_state_slots().read_typed::<u32>(0, 1),
+            vec![expected_conv_state_slot]
+        );
         state.commit(&[1025]);
         assert_eq!(state.request_table().borrow().current_state_version(0), 1025);
     }
@@ -1687,6 +1784,33 @@ mod tests {
             &[page_ids.chunks_exact(pages_per_state).map(<[u32]>::to_vec).collect()],
         );
         state.commit(&[1]);
+    }
+
+    fn advance_to_distinct_state_slots(state: &GDNRequestStateTable, current_state_version: u32) {
+        advance_to_distinct_state_slots_for_req(state, 0, current_state_version);
+    }
+
+    fn advance_to_distinct_state_slots_for_req(
+        state: &GDNRequestStateTable,
+        req_slot: u32,
+        current_state_version: u32,
+    ) {
+        let first_state_version = current_state_version + 1;
+        let second_state_version = first_state_version + 1;
+        let mut request_table = state.request_table().borrow_mut();
+        request_table.begin_txn(
+            req_slot,
+            &[first_state_version],
+            &[first_state_version, second_state_version],
+            Vec::new(),
+        );
+        let _ = request_table.commit_txn(req_slot, first_state_version);
+        request_table.begin_txn(req_slot, &[second_state_version], &[second_state_version], Vec::new());
+        let _ = request_table.commit_txn(req_slot, second_state_version);
+        assert_ne!(
+            request_table.current_recurrent_state_slot(req_slot),
+            request_table.current_conv_state_slot(req_slot)
+        );
     }
 
     fn write_state_values(state: &GDNRequestStateTable, recurrent_state: &[f32], conv_state: &[f32]) {
@@ -1794,8 +1918,10 @@ mod tests {
         );
         metadata.update(
             cu_tokens,
-            &prepared.src_state_slots,
-            &prepared.flat_materialized_state_slots,
+            &prepared.src_recurrent_state_slots,
+            &prepared.src_conv_state_slots,
+            &prepared.flat_materialized_recurrent_state_slots,
+            &prepared.flat_materialized_conv_state_slots,
         )
     }
 

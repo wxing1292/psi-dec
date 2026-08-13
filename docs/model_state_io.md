@@ -285,11 +285,12 @@ The selected resource mapping is:
 | `PageArena` | Allocated page-ID ranges | Increasing page ID |
 | Main GQA request page table | Allocated request-slot ranges | Increasing request slot |
 | MTP or DSpark GQA request page table | Allocated request-slot ranges | Increasing request slot |
-| GDN recurrent state | Current state slot for each allocated request slot | Layer, then increasing state slot |
-| GDN convolution state | Current state slot for each allocated request slot | Layer, then increasing state slot |
+| GDN recurrent state | Current recurrent slot for each allocated request slot | Layer, then increasing recurrent slot |
+| GDN convolution state | Current convolution slot for each allocated request slot | Layer, then increasing convolution slot |
 | GDN request state table | Complete durable table | Native `GDNRequestSlots` order |
 
-The GDN request-state table remains complete because it owns one global state-slot allocator and its free-slot order.
+The GDN request-state table remains complete because it owns independent recurrent and convolution slot allocators and
+their free-slot orders.
 It also contains current versions and future-publish mappings. The recurrent and convolution payload files contain only
 the current slots for selected requests.
 

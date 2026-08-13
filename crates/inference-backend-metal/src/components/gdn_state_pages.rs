@@ -13,13 +13,15 @@ const NUM_THREADS_PER_THREADBLOCK: usize = 256;
 
 /// Static batch geometry for GDN state-page I/O.
 ///
-/// Each state-I/O request selects one state slot and its page IDs across every GDN
-/// layer and state kind. One `GDNStatePageReadTask` or `GDNStatePageWriteTask` maps
-/// 1:1 to one threadblock and has the complete logical coordinates
+/// Each state-I/O request selects one logical state version, one recurrent physical
+/// slot, one convolution physical slot, and its page IDs across every GDN layer.
+/// One `GDNStatePageReadTask` or `GDNStatePageWriteTask` maps 1:1 to one
+/// threadblock and has the complete logical coordinates
 /// `{ state_io_request_index, gdn_layer_index, state_kind, page_index_in_state }`.
 /// The grid and shape values derive every coordinate, so no Task value,
-/// TaskTemplate, or ABI buffer is materialized. `page_id` and `state_slot` remain
-/// data inputs rather than Task coordinates.
+/// TaskTemplate, or ABI buffer is materialized. `page_id`,
+/// `recurrent_state_slot`, and `conv_state_slot` remain data inputs rather than
+/// Task coordinates. `state_kind` selects the applicable physical slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GDNStatePageBatchConfig {
     pub num_gdn_layers: u32,
@@ -101,7 +103,8 @@ pub struct GDNStatePageBatchWriteBuffers<'a> {
     pub recurrent_states: &'a Buffer,
     pub conv_states: &'a Buffer,
     pub page_ids: &'a Buffer,
-    pub state_slots: &'a Buffer,
+    pub recurrent_state_slots: &'a Buffer,
+    pub conv_state_slots: &'a Buffer,
 }
 
 pub struct GDNStatePageBatchWrite {
@@ -146,15 +149,16 @@ impl Operator for GDNStatePageBatchWriteInvocation<'_> {
         builder.set_buffer_read(1, self.buffers.recurrent_states, 0);
         builder.set_buffer_read(2, self.buffers.conv_states, 0);
         builder.set_buffer_read(3, self.buffers.page_ids, 0);
-        builder.set_buffer_read(4, self.buffers.state_slots, 0);
-        builder.set_u32(5, config.num_gdn_layers);
-        builder.set_u32(6, config.num_state_slots);
-        builder.set_u32(7, self.shape.num_state_io_requests);
-        builder.set_u32(8, config.recurrent_state_bytes.div_ceil(config.page_bytes));
-        builder.set_u32(9, config.recurrent_state_bytes);
-        builder.set_u32(10, config.conv_state_bytes.div_ceil(config.page_bytes));
-        builder.set_u32(11, config.conv_state_bytes);
-        builder.set_u32(12, config.page_bytes);
+        builder.set_buffer_read(4, self.buffers.recurrent_state_slots, 0);
+        builder.set_buffer_read(5, self.buffers.conv_state_slots, 0);
+        builder.set_u32(6, config.num_gdn_layers);
+        builder.set_u32(7, config.num_state_slots);
+        builder.set_u32(8, self.shape.num_state_io_requests);
+        builder.set_u32(9, config.recurrent_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(10, config.recurrent_state_bytes);
+        builder.set_u32(11, config.conv_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(12, config.conv_state_bytes);
+        builder.set_u32(13, config.page_bytes);
         builder.dispatch_threadblocks(
             (config.num_total_pages(self.shape), 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
@@ -169,7 +173,8 @@ impl GDNStatePageBatchWriteInvocation<'_> {
         assert!(self.buffers.page_ids.len_bytes() >= config.num_total_pages(self.shape) * size_of::<u32>());
         assert!(self.buffers.recurrent_states.len_bytes() >= config.state_arena_bytes(config.recurrent_state_bytes));
         assert!(self.buffers.conv_states.len_bytes() >= config.state_arena_bytes(config.conv_state_bytes));
-        assert!(self.buffers.state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
+        assert!(self.buffers.recurrent_state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
+        assert!(self.buffers.conv_state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
     }
 }
 
@@ -179,7 +184,8 @@ pub struct GDNStatePageBatchReadBuffers<'a> {
     pub recurrent_states: &'a Buffer,
     pub conv_states: &'a Buffer,
     pub page_ids: &'a Buffer,
-    pub state_slots: &'a Buffer,
+    pub recurrent_state_slots: &'a Buffer,
+    pub conv_state_slots: &'a Buffer,
 }
 
 pub struct GDNStatePageBatchRead {
@@ -224,15 +230,16 @@ impl Operator for GDNStatePageBatchReadInvocation<'_> {
         builder.set_buffer_write(1, self.buffers.recurrent_states, 0);
         builder.set_buffer_write(2, self.buffers.conv_states, 0);
         builder.set_buffer_read(3, self.buffers.page_ids, 0);
-        builder.set_buffer_read(4, self.buffers.state_slots, 0);
-        builder.set_u32(5, config.num_gdn_layers);
-        builder.set_u32(6, config.num_state_slots);
-        builder.set_u32(7, self.shape.num_state_io_requests);
-        builder.set_u32(8, config.recurrent_state_bytes.div_ceil(config.page_bytes));
-        builder.set_u32(9, config.recurrent_state_bytes);
-        builder.set_u32(10, config.conv_state_bytes.div_ceil(config.page_bytes));
-        builder.set_u32(11, config.conv_state_bytes);
-        builder.set_u32(12, config.page_bytes);
+        builder.set_buffer_read(4, self.buffers.recurrent_state_slots, 0);
+        builder.set_buffer_read(5, self.buffers.conv_state_slots, 0);
+        builder.set_u32(6, config.num_gdn_layers);
+        builder.set_u32(7, config.num_state_slots);
+        builder.set_u32(8, self.shape.num_state_io_requests);
+        builder.set_u32(9, config.recurrent_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(10, config.recurrent_state_bytes);
+        builder.set_u32(11, config.conv_state_bytes.div_ceil(config.page_bytes));
+        builder.set_u32(12, config.conv_state_bytes);
+        builder.set_u32(13, config.page_bytes);
         builder.dispatch_threadblocks(
             (config.num_total_pages(self.shape), 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
@@ -247,7 +254,8 @@ impl GDNStatePageBatchReadInvocation<'_> {
         assert!(self.buffers.page_ids.len_bytes() >= config.num_total_pages(self.shape) * size_of::<u32>());
         assert!(self.buffers.recurrent_states.len_bytes() >= config.state_arena_bytes(config.recurrent_state_bytes));
         assert!(self.buffers.conv_states.len_bytes() >= config.state_arena_bytes(config.conv_state_bytes));
-        assert!(self.buffers.state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
+        assert!(self.buffers.recurrent_state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
+        assert!(self.buffers.conv_state_slots.len_bytes() >= config.state_slots_bytes(self.shape));
     }
 }
 
@@ -305,7 +313,8 @@ mod tests {
         let recurrent_states = Buffer::new_zeroed(&device, 2 * 12 * size_of::<f32>());
         let conv_states = Buffer::new_zeroed(&device, 2 * 4 * size_of::<f32>());
         let page_ids = Buffer::from_slice(&device, &[1_u32, 3, 5, 2, 4, 6]);
-        let state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
+        let recurrent_state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
+        let conv_state_slots = Buffer::from_slice(&device, &[0_u32, 1]);
         let shape = GDNStatePageBatchShape {
             num_state_io_requests: 2,
         };
@@ -318,7 +327,8 @@ mod tests {
                 recurrent_states: &recurrent_states,
                 conv_states: &conv_states,
                 page_ids: &page_ids,
-                state_slots: &state_slots,
+                recurrent_state_slots: &recurrent_state_slots,
+                conv_state_slots: &conv_state_slots,
             },
         ));
         stream.submit_replay(&builder.build()).wait();
@@ -333,8 +343,8 @@ mod tests {
         assert_eq!(
             conv_states.read_typed::<f32>(0, 8),
             vec![
-                60.0, 61.0, 62.0, 63.0, //
-                50.0, 51.0, 52.0, 53.0,
+                50.0, 51.0, 52.0, 53.0, //
+                60.0, 61.0, 62.0, 63.0,
             ]
         );
     }
@@ -367,7 +377,8 @@ mod tests {
             ],
         );
         let page_ids = Buffer::from_slice(&device, &[1_u32, 3, 5, 2, 4, 6]);
-        let state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
+        let recurrent_state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
+        let conv_state_slots = Buffer::from_slice(&device, &[0_u32, 1]);
         let shape = GDNStatePageBatchShape {
             num_state_io_requests: 2,
         };
@@ -380,7 +391,8 @@ mod tests {
                 recurrent_states: &recurrent_states,
                 conv_states: &conv_states,
                 page_ids: &page_ids,
-                state_slots: &state_slots,
+                recurrent_state_slots: &recurrent_state_slots,
+                conv_state_slots: &conv_state_slots,
             },
         ));
         stream.submit_replay(&builder.build()).wait();
@@ -393,8 +405,8 @@ mod tests {
                 100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, //
                 208.0, 209.0, 210.0, 211.0, 0.0, 0.0, 0.0, 0.0, //
                 108.0, 109.0, 110.0, 111.0, 0.0, 0.0, 0.0, 0.0, //
-                400.0, 401.0, 402.0, 403.0, 0.0, 0.0, 0.0, 0.0, //
-                300.0, 301.0, 302.0, 303.0, 0.0, 0.0, 0.0, 0.0,
+                300.0, 301.0, 302.0, 303.0, 0.0, 0.0, 0.0, 0.0, //
+                400.0, 401.0, 402.0, 403.0, 0.0, 0.0, 0.0, 0.0,
             ]
         );
     }
@@ -423,7 +435,8 @@ mod tests {
         let conv_target = Buffer::new_zeroed(&device, conv_values.len() * size_of::<f32>());
         let pages = Buffer::new_zeroed(&device, 9 * 8 * size_of::<f32>());
         let page_ids = Buffer::from_slice(&device, &[1_u32, 3, 5, 7, 2, 4, 6, 8]);
-        let state_slots = Buffer::from_slice(&device, &[2_u32, 0]);
+        let recurrent_state_slots = Buffer::from_slice(&device, &[2_u32, 0]);
+        let conv_state_slots = Buffer::from_slice(&device, &[1_u32, 0]);
 
         let mut write = stream.create_replay_program();
         write.record(page_write.invoke(
@@ -433,7 +446,8 @@ mod tests {
                 recurrent_states: &recurrent_source,
                 conv_states: &conv_source,
                 page_ids: &page_ids,
-                state_slots: &state_slots,
+                recurrent_state_slots: &recurrent_state_slots,
+                conv_state_slots: &conv_state_slots,
             },
         ));
         stream.submit_replay(&write.build()).wait();
@@ -446,7 +460,8 @@ mod tests {
                 recurrent_states: &recurrent_target,
                 conv_states: &conv_target,
                 page_ids: &page_ids,
-                state_slots: &state_slots,
+                recurrent_state_slots: &recurrent_state_slots,
+                conv_state_slots: &conv_state_slots,
             },
         ));
         stream.submit_replay(&read.build()).wait();
@@ -458,6 +473,8 @@ mod tests {
                     recurrent_target.read_typed::<f32>(recurrent_start, 8),
                     recurrent_values[recurrent_start..recurrent_start + 8]
                 );
+            }
+            for state_slot in [0, 1] {
                 let conv_start = (layer * 3 + state_slot) * 4;
                 assert_eq!(
                     conv_target.read_typed::<f32>(conv_start, 4),

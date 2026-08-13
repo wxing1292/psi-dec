@@ -144,7 +144,9 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
     -> Markov correction + sampling
   ```
 
-- `qwen35_gdn` measures the current ragged recurrent GDN path with the 35B-A3B profile.
+- `qwen35_gdn` measures the current ragged recurrent GDN path with the 35B-A3B profile. `--candidate-states`
+  materializes every current row into a distinct slot and uses the production candidate-state kernels.
+  `--subcomponents` reports candidate compute as `gdn.compute_candidate_state`.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
 - `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer4`, `first4`, or `main_all`.
 - `qwen35_output` begins at final norm, gather, and unembedding. It can isolate sampling and readback.

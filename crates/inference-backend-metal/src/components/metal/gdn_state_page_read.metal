@@ -13,21 +13,23 @@ using namespace metal;
 //   page_index_in_state,   // grid-derived
 // }
 //
-// page_id and state_slot are data inputs, not Task coordinates.
+// page_id, recurrent_state_slot, and conv_state_slot are data inputs, not Task
+// coordinates. state_kind selects the applicable physical slot.
 kernel void gdn_state_page_batch_read_f32(
     device const uchar* pages [[buffer(0)]],
     device uchar* recurrent_states [[buffer(1)]],
     device uchar* conv_states [[buffer(2)]],
     device const uint* page_ids [[buffer(3)]],
-    device const uint* state_slots [[buffer(4)]],
-    constant uint& num_gdn_layers [[buffer(5)]],
-    constant uint& num_state_slots [[buffer(6)]],
-    constant uint& num_state_io_requests [[buffer(7)]],
-    constant uint& num_recurrent_pages_per_state_slot [[buffer(8)]],
-    constant uint& recurrent_state_bytes [[buffer(9)]],
-    constant uint& num_conv_pages_per_state_slot [[buffer(10)]],
-    constant uint& conv_state_bytes [[buffer(11)]],
-    constant uint& page_bytes [[buffer(12)]],
+    device const uint* recurrent_state_slots [[buffer(4)]],
+    device const uint* conv_state_slots [[buffer(5)]],
+    constant uint& num_gdn_layers [[buffer(6)]],
+    constant uint& num_state_slots [[buffer(7)]],
+    constant uint& num_state_io_requests [[buffer(8)]],
+    constant uint& num_recurrent_pages_per_state_slot [[buffer(9)]],
+    constant uint& recurrent_state_bytes [[buffer(10)]],
+    constant uint& num_conv_pages_per_state_slot [[buffer(11)]],
+    constant uint& conv_state_bytes [[buffer(12)]],
+    constant uint& page_bytes [[buffer(13)]],
     uint state_page_threadblock_index [[threadgroup_position_in_grid]],
     uint thread_index_in_threadblock [[thread_position_in_threadgroup]],
     uint num_threads_per_threadblock [[threads_per_threadgroup]]
@@ -46,7 +48,9 @@ kernel void gdn_state_page_batch_read_f32(
         is_recurrent_state ? page_index_in_layer : page_index_in_layer - num_recurrent_pages_per_state_slot;
     const uint state_bytes = is_recurrent_state ? recurrent_state_bytes : conv_state_bytes;
     const ulong page_id = (ulong)page_ids[state_page_threadblock_index];
-    const ulong state_slot = (ulong)state_slots[state_io_request_index];
+    const ulong state_slot = is_recurrent_state
+        ? (ulong)recurrent_state_slots[state_io_request_index]
+        : (ulong)conv_state_slots[state_io_request_index];
     device uchar* states = is_recurrent_state ? recurrent_states : conv_states;
     const ulong page_offset_bytes = page_id * (ulong)page_bytes;
     const ulong state_slot_offset_bytes =
