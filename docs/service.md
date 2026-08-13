@@ -300,8 +300,8 @@ After this period without executable model work, the service writes model state 
 The listeners and runtime requests remain active.
 The next executable batch loads weights and state before execution.
 `--executor-hibernation-timeout-secs` accepts a positive integer.
-`--executor-hibernation-mode` accepts `all` or `selected`. It defaults to `all`.
-Use `selected` only after selected-state hibernation has passed sustained production validation.
+`--executor-hibernation-mode` accepts `all` or `selected`. It defaults to `selected`.
+Use `all` to write every state entry.
 
 One lifecycle owner stops both listeners in these conditions:
 

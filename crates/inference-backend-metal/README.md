@@ -131,7 +131,8 @@ capacity. `num_active_threads` masks unused capacity for one submission.
 Both methods require `BufferIOFileCacheMode::Cached` or `BufferIOFileCacheMode::Uncached`.
 The uncached mode applies `F_NOCACHE` for positional I/O and `F_GLOBAL_NOCACHE` for all handles of that file.
 Both methods return one `BufferIOFile` that owns the POSIX and Metal handles for the same file.
-`BufferIO::file_to_buffer` uses the Metal I/O queue.
+`BufferIO::file_to_buffer` uses the Metal I/O queue. It divides ranges larger than 1 GiB into serial commands because
+Metal I/O rejects one command when its size reaches 2 GiB on the supported Apple Silicon path.
 `BufferIO::buffer_to_file` writes directly from shared `MTLBuffer` storage with positional file I/O.
 Both methods are synchronous.
 Both methods list the source range before the destination range.

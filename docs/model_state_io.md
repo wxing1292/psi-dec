@@ -159,7 +159,8 @@ Both methods use checked `u64` byte coordinates.
 Both methods return `std::io::Result`.
 The model executor must map a failure to `ModelExecutorError` at its boundary.
 
-`file_to_buffer` uses `MTLIOCommandBuffer::loadBuffer`.
+`file_to_buffer` uses `MTLIOCommandBuffer::loadBuffer`. It divides ranges larger than 1 GiB into serial commands.
+Metal I/O rejects one command when its size reaches 2 GiB on the supported Apple Silicon path.
 The method waits for Metal I/O completion before it returns.
 
 `buffer_to_file` writes from `Buffer::contents()` with positional file I/O.
@@ -269,9 +270,9 @@ ExecutorHibernationMode::All      -> ExecutorHibernationPlan::All
 ExecutorHibernationMode::Selected -> scan allocated request slots and page IDs
 ```
 
-The Qwen services default to `ExecutorHibernationMode::All`. Use `--executor-hibernation-mode selected` to enable
-selected-state hibernation. Runtime core creates the concrete plan at Stop. The executor consumes that plan and does
-not own a second policy setting.
+The Qwen services default to `ExecutorHibernationMode::Selected`. Use `--executor-hibernation-mode all` to write every
+state entry. Runtime core creates the concrete plan at Stop. The executor consumes that plan and does not own a second
+policy setting.
 
 `Stop` and `Start` must use the same plan variant and fields.
 Runtime core stores the exact Stop plan and supplies it again on Start.

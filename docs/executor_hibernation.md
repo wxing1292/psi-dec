@@ -59,7 +59,7 @@ The ordered request channel guarantees that the model event loop handles `Start`
 
 The executor hibernation timeout defaults to 300 seconds.
 `--executor-hibernation-timeout-secs` accepts a positive integer.
-`--executor-hibernation-mode` accepts `all` or `selected`. It defaults to `all`.
+`--executor-hibernation-mode` accepts `all` or `selected`. It defaults to `selected`.
 The service does not have a lifecycle status API or status route.
 
 ## Current resource order
@@ -91,8 +91,8 @@ Names and ownership levels must also remain symmetric.
 ## State snapshot
 
 `RuntimeConfig::executor_hibernation_mode` fixes the Stop/Start plan policy at runtime construction.
-The Qwen services default to `ExecutorHibernationMode::All`.
-Use `--executor-hibernation-mode selected` to enable selected-state hibernation.
+The Qwen services default to `ExecutorHibernationMode::Selected`.
+Use `--executor-hibernation-mode all` to write every state entry.
 The direct model integration tests can use `ExecutorHibernationPlan::All`.
 
 The selected snapshot contains these resources:

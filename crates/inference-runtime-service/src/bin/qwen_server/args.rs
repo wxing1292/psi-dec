@@ -43,7 +43,7 @@ pub struct Qwen3Args {
 
     #[arg(
         long,
-        default_value = "all",
+        default_value = "selected",
         value_name = "MODE",
         help = "Executor hibernation state scope: all or selected"
     )]
@@ -114,7 +114,7 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        default_value = "all",
+        default_value = "selected",
         value_name = "MODE",
         help = "Executor hibernation state scope: all or selected"
     )]
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages.get(), 262_144);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
-        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::All);
+        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }
 
     #[test]
@@ -197,30 +197,25 @@ mod tests {
         assert_eq!(args.hf_dspark_model_dir, None);
         assert_eq!(args.num_spec_tokens, None);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
-        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::All);
+        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }
 
     #[test]
-    fn test_executor_hibernation_mode_accepts_selected() {
-        let qwen3 = Qwen3Args::try_parse_from([
-            "qwen3",
-            "--hf-model-dir",
-            "model",
-            "--executor-hibernation-mode",
-            "selected",
-        ])
-        .unwrap();
+    fn test_executor_hibernation_mode_accepts_all() {
+        let qwen3 =
+            Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", "--executor-hibernation-mode", "all"])
+                .unwrap();
         let qwen35 = Qwen35Args::try_parse_from([
             "qwen3.5",
             "--hf-model-dir",
             "model",
             "--executor-hibernation-mode",
-            "selected",
+            "all",
         ])
         .unwrap();
 
-        assert_eq!(qwen3.executor_hibernation_mode, ExecutorHibernationMode::Selected);
-        assert_eq!(qwen35.executor_hibernation_mode, ExecutorHibernationMode::Selected);
+        assert_eq!(qwen3.executor_hibernation_mode, ExecutorHibernationMode::All);
+        assert_eq!(qwen35.executor_hibernation_mode, ExecutorHibernationMode::All);
     }
 
     #[test]

@@ -20,6 +20,10 @@ use objc2_metal::MTLIOStatus;
 use crate::metal::Buffer;
 use crate::metal::Device;
 
+// Metal I/O rejects one `loadBuffer` command when its size reaches 2^31 bytes. Use 1 GiB commands so large public
+// transfers stay below that internal boundary.
+const FILE_TO_BUFFER_COMMAND_BYTES: u64 = 1 << 30;
+
 /// Transfers byte ranges between files and shared Metal buffers.
 ///
 /// One `BufferIO` owns one serial Metal I/O queue. `file_to_buffer` uses that
@@ -113,6 +117,29 @@ impl BufferIO {
             return Ok(());
         }
 
+        let mut transferred_bytes = 0_u64;
+        while transferred_bytes < len_bytes {
+            let command_bytes = (len_bytes - transferred_bytes).min(FILE_TO_BUFFER_COMMAND_BYTES);
+            self.file_to_buffer_command(
+                file,
+                file_offset_bytes + transferred_bytes,
+                buffer,
+                buffer_offset_bytes + transferred_bytes,
+                command_bytes,
+            )?;
+            transferred_bytes += command_bytes;
+        }
+        Ok(())
+    }
+
+    fn file_to_buffer_command(
+        &self,
+        file: &BufferIOFile,
+        file_offset_bytes: u64,
+        buffer: &Buffer,
+        buffer_offset_bytes: u64,
+        len_bytes: u64,
+    ) -> io::Result<()> {
         let command_buffer = self.queue.commandBuffer();
         let buffer_offset = to_usize(buffer_offset_bytes, "buffer_offset_bytes")?;
         let len = to_usize(len_bytes, "len_bytes")?;
@@ -137,7 +164,8 @@ impl BufferIO {
             |error| error.to_string(),
         );
         Err(io::Error::other(format!(
-            "Metal file-to-buffer transfer failed: {error}"
+            "Metal file-to-buffer command failed: file_offset_bytes={file_offset_bytes} \
+             buffer_offset_bytes={buffer_offset_bytes} len_bytes={len_bytes}: {error}"
         )))
     }
 

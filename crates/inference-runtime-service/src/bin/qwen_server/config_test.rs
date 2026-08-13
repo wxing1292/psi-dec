@@ -42,19 +42,19 @@ fn test_executor_hibernation_timeout() {
 fn test_executor_hibernation_mode() {
     let qwen3_default = Qwen3Config::from_args(parse_qwen3(&[])).unwrap();
     let qwen35_default = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
-    let qwen3_selected = Qwen3Config::from_args(parse_qwen3(&["--executor-hibernation-mode", "selected"])).unwrap();
-    let qwen35_selected = Qwen35Config::from_args(parse_qwen35(&["--executor-hibernation-mode", "selected"])).unwrap();
+    let qwen3_all = Qwen3Config::from_args(parse_qwen3(&["--executor-hibernation-mode", "all"])).unwrap();
+    let qwen35_all = Qwen35Config::from_args(parse_qwen35(&["--executor-hibernation-mode", "all"])).unwrap();
 
-    assert_eq!(qwen3_default.executor_hibernation_mode(), ExecutorHibernationMode::All);
-    assert_eq!(qwen35_default.executor_hibernation_mode(), ExecutorHibernationMode::All);
     assert_eq!(
-        qwen3_selected.executor_hibernation_mode(),
+        qwen3_default.executor_hibernation_mode(),
         ExecutorHibernationMode::Selected
     );
     assert_eq!(
-        qwen35_selected.executor_hibernation_mode(),
+        qwen35_default.executor_hibernation_mode(),
         ExecutorHibernationMode::Selected
     );
+    assert_eq!(qwen3_all.executor_hibernation_mode(), ExecutorHibernationMode::All);
+    assert_eq!(qwen35_all.executor_hibernation_mode(), ExecutorHibernationMode::All);
 }
 
 #[test]
