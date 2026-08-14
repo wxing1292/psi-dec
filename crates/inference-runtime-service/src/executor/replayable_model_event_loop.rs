@@ -72,8 +72,7 @@ where
     }
 
     pub fn event_loop(mut self) {
-        let span = tracing::info_span!("replayable executor loop");
-        let _enter = span.enter();
+        let _span = tracing::info_span!("replayable-executor", model = self.model.model_name()).entered();
         tracing::info!("started");
 
         let shutdown_rx = self.shutdown.sync_rx().clone();
@@ -88,7 +87,6 @@ where
             match op_index {
                 _ if op_index == op_shutdown => {
                     let _ = op.recv(&shutdown_rx);
-                    tracing::info!("received shutdown signal, stopping");
                     break 'event_loop;
                 },
                 _ if op_index == op_recv_req_slot_reset => {
@@ -101,7 +99,7 @@ where
                             }
                         },
                         Err(_) => {
-                            tracing::info!("request slot reset channel closed, stopping");
+                            tracing::debug!("request slot reset channel closed");
                             break 'event_loop;
                         },
                     }
@@ -164,7 +162,8 @@ where
         let start = Instant::now();
         tracing::info!(
             target: "inference-runtime-service::lifecycle",
-            phase = "model.start.begin",
+            component = "model",
+            phase = "start.begin",
             model = self.model.model_name(),
             snapshot_path = %self.state_snapshot_path.display(),
             "starting model"
@@ -172,7 +171,8 @@ where
         if let Err(error) = self.model.load_weights() {
             tracing::error!(
                 target: "inference-runtime-service::lifecycle",
-                phase = "model.start.failed",
+                component = "model",
+                phase = "start.failed",
                 model = self.model.model_name(),
                 error = %error,
                 "unable to load model weights; shutting down"
@@ -183,7 +183,8 @@ where
         if let Err(error) = self.model.load_state(&self.state_snapshot_path, &snapshot_plan) {
             tracing::error!(
                 target: "inference-runtime-service::lifecycle",
-                phase = "model.start.failed",
+                component = "model",
+                phase = "start.failed",
                 model = self.model.model_name(),
                 error = %error,
                 "unable to load model state; shutting down"
@@ -195,7 +196,8 @@ where
         self.remove_state_snapshot();
         tracing::info!(
             target: "inference-runtime-service::lifecycle",
-            phase = "model.start.complete",
+            component = "model",
+            phase = "start.complete",
             model = self.model.model_name(),
             elapsed_ms = start.elapsed().as_millis(),
             "model started"
@@ -216,7 +218,8 @@ where
         let start = Instant::now();
         tracing::info!(
             target: "inference-runtime-service::lifecycle",
-            phase = "model.stop.begin",
+            component = "model",
+            phase = "stop.begin",
             model = self.model.model_name(),
             snapshot_path = %self.state_snapshot_path.display(),
             "stopping model"
@@ -226,7 +229,8 @@ where
         if let Err(error) = self.model.unload_state(&self.state_snapshot_path, &plan) {
             tracing::error!(
                 target: "inference-runtime-service::lifecycle",
-                phase = "model.stop.failed",
+                component = "model",
+                phase = "stop.failed",
                 model = self.model.model_name(),
                 error = %error,
                 "unable to unload model state; shutting down"
@@ -238,7 +242,8 @@ where
         self.model_state = ModelExecutorState::Stopped(plan);
         tracing::info!(
             target: "inference-runtime-service::lifecycle",
-            phase = "model.stop.complete",
+            component = "model",
+            phase = "stop.complete",
             model = self.model.model_name(),
             elapsed_ms = start.elapsed().as_millis(),
             "model stopped"
@@ -250,7 +255,7 @@ where
         match operation.recv(&self.model_executor_req_rx) {
             Ok(request) => Some(request),
             Err(error) => {
-                tracing::info!("unable to receive model executor request, err: {error}, stopping");
+                tracing::debug!("model executor request channel closed: {error}");
                 None
             },
         }
@@ -258,7 +263,7 @@ where
 
     fn send_response(&self, response: ReplayableModelExecutorResponse) -> bool {
         if let Err(error) = self.model_executor_resp_tx.send(response) {
-            tracing::info!("unable to send model executor response, err: {error}, stopping");
+            tracing::debug!("model executor response channel closed: {error}");
             return false;
         }
         true

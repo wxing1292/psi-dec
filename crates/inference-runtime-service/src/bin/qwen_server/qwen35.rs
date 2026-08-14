@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use inference_executor_core::model::ReplayableModel;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
@@ -26,8 +27,6 @@ use crate::qwen_server::sizing::context_window;
 use crate::qwen_server::sizing::kv_dtype_bytes;
 use crate::runtime::serve_replay_model;
 use crate::specialization::SpecializedWorker;
-use crate::telemetry::CacheLaneLogSummary;
-use crate::telemetry::StartupLogger;
 
 const TOKENS_PER_CACHE_BLOCK: usize = 2048;
 const QWEN35_DENSE_BIN: &str = "qwen3_5_dense";
@@ -111,30 +110,22 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         config.num_cache_lanes(),
         "qwen3.5 worker const L must equal the configured cache-lane count"
     );
-    let telemetry = config.telemetry_config();
-    telemetry.init();
-    let startup = StartupLogger::new(kind.label());
+    config.telemetry_config().init();
+    let startup_span = tracing::info_span!("qwen-startup", model = kind.label()).entered();
 
-    startup.event("reading model config");
     let model_config = load_model_config(config.hf_model_dir())?;
-    tracing::info!(
-        target: "inference-runtime-service::startup",
-        grpc_listen_addr = %config.grpc_listen_addr(),
-        http_listen_addr = %config.http_listen_addr(),
-        "decode service listeners configured"
-    );
     validate_checkpoint_kind(kind, &model_config)?;
-    startup.event("loading Qwen codec");
+    tracing::info!("loading Qwen codec");
     let qwen_codec = Arc::new(QwenCodec::load(config.hf_model_dir()).map_err(|error| {
         log_err_unavailable!("unable to load Qwen codec from {:?}: {error}", config.hf_model_dir())
     })?);
-    startup.event("Qwen codec loaded");
+    tracing::info!("Qwen codec loaded");
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
     let max_queued_requests = config.max_queued_requests();
     let max_running_requests = config.max_running_requests();
 
-    startup.event("initializing model executor");
+    tracing::info!("initializing model executor");
     let model = build_model(
         kind,
         &config,
@@ -146,16 +137,27 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
             num_tokens_per_block: TOKENS_PER_CACHE_BLOCK,
         },
     )?;
-    startup.event("model executor initialized");
+    tracing::info!("model executor initialized");
 
-    let runtime_config = build_runtime_config(&startup, &config, &model_config, &model)?;
+    let runtime_config = build_runtime_config(&config, &model_config, &model)?;
+    for cache_lane in 0..runtime_config.num_cache_lanes() {
+        let lane = runtime_config.cache_lane(cache_lane);
+        tracing::info!(
+            cache_lane,
+            mtp = cache_lane > 0,
+            num_kv_pages_per_block = lane.num_pages_per_kv_block,
+            num_state_pages_per_block = lane.num_pages_per_state_block,
+            block_cache_capacity = lane.block_cache_capacity,
+            "cache lane configured"
+        );
+    }
 
     tracing::info!(
-        target: "inference-runtime-service::startup",
-        component = kind.label(),
         checkpoint_mtp_layers = model_config.text_config.mtp_num_hidden_layers,
         num_spec_tokens = model.num_spec_tokens(),
-        model_mode = ?config.model_mode(),
+        model_mode = model.model_mode(),
+        grpc_listen_addr = %config.grpc_listen_addr(),
+        http_listen_addr = %config.http_listen_addr(),
         num_cache_pages,
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
         max_queued_requests,
@@ -166,10 +168,10 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
         executor_hibernation_timeout_secs = config.executor_hibernation_timeout().as_secs(),
         executor_hibernation_mode = ?config.executor_hibernation_mode(),
-        "qwen3.5 Spec/cache configuration"
+        "configured"
     );
+    drop(startup_span);
 
-    startup.event("initializing runtime");
     serve_replay_model::<TOKENS_PER_CACHE_BLOCK, L, _>(
         config.grpc_listen_addr(),
         config.http_listen_addr(),
@@ -250,7 +252,6 @@ fn build_model(
 }
 
 fn build_runtime_config(
-    startup: &StartupLogger,
     service_config: &Qwen35Config,
     model_config: &Qwen35ModelConfig,
     model: &Qwen35Executor,
@@ -297,16 +298,6 @@ fn build_runtime_config(
         page_bytes: QWEN35_PAGE_SIZE_BYTES,
         cache_lanes,
     };
-    for cache_lane in 0..runtime_config.num_cache_lanes() {
-        let lane = runtime_config.cache_lane(cache_lane);
-        startup.cache_lane_config(CacheLaneLogSummary {
-            cache_lane,
-            mtp: cache_lane > 0,
-            num_kv_pages_per_block: lane.num_pages_per_kv_block,
-            num_state_pages_per_block: lane.num_pages_per_state_block,
-            block_cache_capacity: lane.block_cache_capacity,
-        });
-    }
     Ok(runtime_config)
 }
 

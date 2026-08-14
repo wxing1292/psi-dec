@@ -4,6 +4,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::post;
 use inference_runtime_core::channel::Shutdown;
+use tracing::Instrument;
 
 use crate::api::Inference;
 use crate::codec::qwen::QwenCodec;
@@ -45,10 +46,16 @@ pub async fn run<const N: usize, const L: usize, const P: usize>(
     shutdown: Shutdown,
 ) -> Result<(), std::io::Error> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    tracing::info!(%listen_addr, "inference runtime service: starting HTTP server");
-    axum::serve(listener, HTTPServer::new(model_name, inference, qwen_codec).router())
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.async_rx().recv().await;
-        })
-        .await
+    async move {
+        tracing::info!("started");
+        let result = axum::serve(listener, HTTPServer::new(model_name, inference, qwen_codec).router())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.async_rx().recv().await;
+            })
+            .await;
+        tracing::info!("stopped");
+        result
+    }
+    .instrument(tracing::info_span!("http-server", %listen_addr))
+    .await
 }

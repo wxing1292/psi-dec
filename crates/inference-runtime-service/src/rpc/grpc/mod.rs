@@ -5,6 +5,7 @@ use inference_runtime_core::channel::Shutdown;
 use inference_runtime_proto::inference_runtime_service::inference_runtime_server::InferenceRuntimeServer;
 use tonic::Status;
 use tonic::transport::Server;
+use tracing::Instrument;
 
 use crate::api::Inference;
 
@@ -26,13 +27,19 @@ pub async fn run<const N: usize, const L: usize, const P: usize>(
     inference: Arc<Inference<N, L, P>>,
     shutdown: Shutdown,
 ) -> Result<(), tonic::transport::Error> {
-    tracing::info!(%listen_addr, "inference runtime service: starting gRPC server");
-    Server::builder()
-        .add_service(InferenceRuntimeServer::new(GRPCServer::new(inference)))
-        .serve_with_shutdown(listen_addr, async move {
-            let _ = shutdown.async_rx().recv().await;
-        })
-        .await
+    async move {
+        tracing::info!("started");
+        let result = Server::builder()
+            .add_service(InferenceRuntimeServer::new(GRPCServer::new(inference)))
+            .serve_with_shutdown(listen_addr, async move {
+                let _ = shutdown.async_rx().recv().await;
+            })
+            .await;
+        tracing::info!("stopped");
+        result
+    }
+    .instrument(tracing::info_span!("grpc-server", %listen_addr))
+    .await
 }
 
 fn map_error(error: Error) -> Status {

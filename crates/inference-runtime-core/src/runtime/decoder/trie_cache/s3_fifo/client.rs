@@ -130,8 +130,7 @@ fn s3_fifo_event_loop<K>(
 ) where
     K: Copy + Eq + Hash + Send + Sync + 'static,
 {
-    let span = tracing::info_span!("s3 fifo event loop");
-    let _enter = span.enter();
+    let _span = tracing::info_span!("s3-fifo").entered();
     tracing::info!("started");
 
     let mut server = S3FIFOServer::new(evictions, shutdown);
@@ -139,7 +138,6 @@ fn s3_fifo_event_loop<K>(
     'event_loop: loop {
         let control = crossbeam_channel::select! {
             recv(shutdown_receiver) -> _ => {
-                tracing::info!("received shutdown signal, stopping");
                 break 'event_loop;
             },
             recv(control_receiver) -> control => match control {

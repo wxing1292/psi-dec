@@ -319,7 +319,6 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
     }
 
     pub fn shutdown(&self) {
-        tracing::info!("inference runtime service: shutdown requested");
         self.shutdown.shutdown();
     }
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use inference_executor_core::model::ReplayableModel;
 use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
@@ -19,8 +20,6 @@ use crate::qwen_server::config::Qwen3ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
 use crate::qwen_server::sizing::context_window;
 use crate::runtime::serve_replay_model;
-use crate::telemetry::CacheLaneLogSummary;
-use crate::telemetry::StartupLogger;
 
 // Qwen3 has no GDN snapshot to amortize across a large logical block. Two
 // eight-token physical KV pages per layer keep trie granularity small without
@@ -37,27 +36,20 @@ pub fn run() {
 fn run_inner() -> Result<()> {
     let args = Qwen3Args::parse();
     let config = Qwen3Config::from_args(args)?;
-    let telemetry = config.telemetry_config();
-    telemetry.init();
-    let startup = StartupLogger::new("qwen3");
+    config.telemetry_config().init();
+    let startup_span = tracing::info_span!("qwen-startup", model = "qwen3").entered();
 
-    tracing::info!(
-        target: "inference-runtime-service::startup",
-        grpc_listen_addr = %config.grpc_listen_addr(),
-        http_listen_addr = %config.http_listen_addr(),
-        "decode service listeners configured"
-    );
-    startup.event("loading Qwen codec");
+    tracing::info!("loading Qwen codec");
     let qwen_codec = Arc::new(QwenCodec::load(config.hf_model_dir()).map_err(|error| {
         log_err_unavailable!("unable to load Qwen codec from {:?}: {error}", config.hf_model_dir())
     })?);
-    startup.event("Qwen codec loaded");
+    tracing::info!("Qwen codec loaded");
 
     let scheduler_config = config.scheduler_config();
     let num_cache_pages = config.num_cache_pages();
     let max_queued_requests = config.max_queued_requests();
     let max_running_requests = config.max_running_requests();
-    startup.event("initializing model executor");
+    tracing::info!("initializing model executor");
     let executor_config = Qwen3ExecutorConfig {
         max_requests: max_running_requests,
         max_tokens: scheduler_config.max_tokens,
@@ -93,27 +85,26 @@ fn run_inner() -> Result<()> {
             })?
         },
     };
-    startup.event("model executor initialized");
-    if let Qwen3ModelMode::DSpark {
-        model_dir: dspark_model_dir,
-        ..
-    } = config.model_mode()
-    {
+    tracing::info!("model executor initialized");
+
+    let runtime_config = build_runtime_config(&config, &model)?;
+    for cache_lane in 0..runtime_config.num_cache_lanes() {
+        let lane = runtime_config.cache_lane(cache_lane);
         tracing::info!(
-            target: "inference-runtime-service::startup",
-            component = "qwen3",
-            dspark_model_dir = ?dspark_model_dir,
-            num_spec_tokens = model.num_spec_tokens(),
-            proposal_mode = "fixed-block",
-            "qwen3 DSpark configured"
+            cache_lane,
+            mtp = cache_lane > 0,
+            num_kv_pages_per_block = lane.num_pages_per_kv_block,
+            num_state_pages_per_block = lane.num_pages_per_state_block,
+            block_cache_capacity = lane.block_cache_capacity,
+            "cache lane configured"
         );
     }
 
-    let runtime_config = build_runtime_config(&startup, &config, &model)?;
-
     tracing::info!(
-        target: "inference-runtime-service::startup",
-        component = "qwen3",
+        model_mode = model.model_mode(),
+        num_spec_tokens = model.num_spec_tokens(),
+        grpc_listen_addr = %config.grpc_listen_addr(),
+        http_listen_addr = %config.http_listen_addr(),
         num_cache_pages,
         cache_block_tokens = TOKENS_PER_CACHE_BLOCK,
         max_queued_requests,
@@ -124,10 +115,10 @@ fn run_inner() -> Result<()> {
         max_tokens_per_request = scheduler_config.max_tokens_per_request,
         executor_hibernation_timeout_secs = config.executor_hibernation_timeout().as_secs(),
         executor_hibernation_mode = ?config.executor_hibernation_mode(),
-        "qwen3 Main/cache configuration"
+        "configured"
     );
+    drop(startup_span);
 
-    startup.event("initializing runtime");
     serve_replay_model::<TOKENS_PER_CACHE_BLOCK, 1, _>(
         config.grpc_listen_addr(),
         config.http_listen_addr(),
@@ -138,11 +129,7 @@ fn run_inner() -> Result<()> {
     )
 }
 
-fn build_runtime_config(
-    startup: &StartupLogger,
-    service_config: &Qwen3Config,
-    model: &Qwen3Executor,
-) -> Result<RuntimeConfig> {
+fn build_runtime_config(service_config: &Qwen3Config, model: &Qwen3Executor) -> Result<RuntimeConfig> {
     let num_cache_pages = service_config.num_cache_pages();
     let model_config = model.model_config();
     let text = &model_config.text_config;
@@ -152,13 +139,6 @@ fn build_runtime_config(
         Qwen3ModelMode::Vanilla => 0,
         Qwen3ModelMode::DSpark { .. } => model.num_spec_tokens(),
     };
-    startup.cache_lane_config(CacheLaneLogSummary {
-        cache_lane: 0,
-        mtp: false,
-        num_kv_pages_per_block: cache_lane.num_pages_per_kv_block,
-        num_state_pages_per_block: cache_lane.num_pages_per_state_block,
-        block_cache_capacity: cache_lane.block_cache_capacity,
-    });
     Ok(RuntimeConfig {
         max_queued_requests: service_config.max_queued_requests(),
         max_running_requests: service_config.max_running_requests(),

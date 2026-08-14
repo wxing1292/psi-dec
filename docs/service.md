@@ -645,7 +645,7 @@ emit a second DEBUG performance event.
 
 Internal model `Start` and `Stop` commands emit INFO lifecycle events on the
 `inference-runtime-service::lifecycle` target.
-The events use `model.start.begin`, `model.start.complete`, `model.stop.begin`, and `model.stop.complete` phases.
+The events use `component="model"` with `start.begin`, `start.complete`, `stop.begin`, and `stop.complete` phases.
 Completion events include elapsed milliseconds.
 Failure events include the model name and error, and then trigger global shutdown.
 Runtime core issues these commands after the configured executor hibernation timeout.
@@ -666,6 +666,21 @@ Qwen3 does not run DSpark Spec for a prefill-only batch because no sampled ancho
 
 Runtime shutdown emits a scheduler table. The table contains call counts and latency percentiles for the runtime
 lifetime.
+
+Long-running service and runtime components use these spans:
+
+```text
+runtime
+replayable-executor
+async-task-pool
+s3-fifo
+grpc-server
+http-server
+```
+
+Each component emits one INFO `started` event and one INFO `stopped` event in its span. Normal shutdown receipt does not
+emit a separate INFO event. The `runtime` span belongs to the runtime-core event loop in
+`runtime/scheduler/event_loop.rs`; it is not a second service-level wrapper.
 
 Enqueue and swap-in operations report request counts. Prepare, cancel, and commit operations report counts and latency
 percentiles.

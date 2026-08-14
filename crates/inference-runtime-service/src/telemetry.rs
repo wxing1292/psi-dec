@@ -50,43 +50,6 @@ impl TelemetryConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct StartupLogger {
-    component: &'static str,
-}
-
-impl StartupLogger {
-    pub fn new(component: &'static str) -> Self {
-        Self { component }
-    }
-
-    pub fn event(&self, message: &'static str) {
-        tracing::info!(target: "inference-runtime-service::startup", component = self.component, message);
-    }
-
-    pub fn cache_lane_config(&self, summary: CacheLaneLogSummary) {
-        tracing::info!(
-            target: "inference-runtime-service::startup",
-            component = self.component,
-            cache_lane = summary.cache_lane,
-            mtp = summary.mtp,
-            num_kv_pages_per_block = summary.num_kv_pages_per_block,
-            num_state_pages_per_block = summary.num_state_pages_per_block,
-            block_cache_capacity = summary.block_cache_capacity,
-            "runtime cache lane configured"
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct CacheLaneLogSummary {
-    pub cache_lane: usize,
-    pub mtp: bool,
-    pub num_kv_pages_per_block: usize,
-    pub num_state_pages_per_block: usize,
-    pub block_cache_capacity: usize,
-}
-
 struct FourDecimal(f64);
 
 impl Display for FourDecimal {

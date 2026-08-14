@@ -104,8 +104,7 @@ where
     }
 
     pub fn event_loop(mut self) -> Result<()> {
-        let span = tracing::info_span!("event loop");
-        let _enter = span.enter();
+        let _span = tracing::info_span!("runtime").entered();
         tracing::info!("started");
 
         let shutdown_rx = self.shutdown.sync_rx().clone();
@@ -128,7 +127,6 @@ where
             match op_index {
                 _ if op_index == op_shutdown => {
                     let _ = op.recv(&shutdown_rx);
-                    tracing::info!("received shutdown signal, stopping");
                     break 'event_loop;
                 },
                 _ if op_index == op_recv_model_executor_resp => {
@@ -190,7 +188,10 @@ where
         }
 
         self.shutdown.shutdown();
-        tracing::info!("\n{}", self.scheduler.stats_table());
+        tracing::info!(
+            stats = %format_args!("\n{}", self.scheduler.stats_table()),
+            "scheduler stats"
+        );
         tracing::info!("stopped");
         Ok(())
     }

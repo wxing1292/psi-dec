@@ -602,6 +602,24 @@ Put backend execution constraints in the matching backend or executor document. 
 
 ## General source clarity
 
+Use explicit tracing macro paths for INFO and DEBUG events:
+
+```rust
+let _span = tracing::info_span!("runtime").entered();
+tracing::info!("started");
+tracing::debug!(request_id, "request prepared");
+tracing::info!("stopped");
+```
+
+Do not import or invoke bare `info!` or `debug!` macros. Give each long-running component a short kebab-case span name.
+Put stable component fields on the span. Emit only `started` and `stopped` at INFO for its lifetime. Do not repeat the
+component name, a `component` field, or a `phase` field in these events. Instrument an async future with its span. Do not
+hold an entered span guard across `.await`. Do not emit an additional INFO event only to report receipt of the shared
+shutdown signal. Individual worker or runner lifecycle events must not be INFO.
+
+Keep operation transactions and machine-consumed telemetry separate from component lifetime events. They may use
+structured phase, result, and timing fields.
+
 Recommendation: Use concrete nouns such as `file_name_for`, `file_path`, and `mapped_files`. Do not use overloaded
 shorthand unless it is a stable module contract.
 

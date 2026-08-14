@@ -5,6 +5,7 @@ use async_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TrySendError;
 use futures_util::FutureExt;
+use tracing::Instrument;
 
 use crate::Result;
 use crate::channel::Shutdown;
@@ -45,32 +46,34 @@ where
     }
 
     pub async fn event_loop(self) -> Result<()> {
-        let span = tracing::info_span!("async task pool");
-        let _enter = span.enter();
-        tracing::info!("started with {} runners", self.num_runners);
+        let span = tracing::info_span!("async-task-pool", num_runners = self.num_runners);
+        async move {
+            tracing::info!("started");
 
-        let shutdown_rx = self.shutdown.async_rx().clone();
-        let mut runners = tokio::task::JoinSet::new();
-        for runner_id in 0..self.num_runners {
-            runners.spawn(async_task_runner_guard(
-                runner_id,
-                self.task_in_rx.clone(),
-                self.task_out_tx.clone(),
-                self.shutdown.clone(),
-            ));
-        }
-
-        let _ = shutdown_rx.recv().await;
-        tracing::info!("received shutdown signal, stopping");
-
-        while let Some(result) = runners.join_next().await {
-            if let Err(err) = result {
-                tracing::info!("async task runner failed during shutdown, err: {err}");
+            let shutdown_rx = self.shutdown.async_rx().clone();
+            let mut runners = tokio::task::JoinSet::new();
+            for runner_id in 0..self.num_runners {
+                runners.spawn(async_task_runner_guard(
+                    runner_id,
+                    self.task_in_rx.clone(),
+                    self.task_out_tx.clone(),
+                    self.shutdown.clone(),
+                ));
             }
+
+            let _ = shutdown_rx.recv().await;
+
+            while let Some(result) = runners.join_next().await {
+                if let Err(err) = result {
+                    tracing::error!(error = %err, "async task runner failed during shutdown");
+                }
+            }
+            while self.task_in_rx.try_recv().is_ok() {}
+            tracing::info!("stopped");
+            Ok(())
         }
-        while self.task_in_rx.try_recv().is_ok() {}
-        tracing::info!("stopped");
-        Ok(())
+        .instrument(span)
+        .await
     }
 }
 
@@ -87,7 +90,7 @@ async fn async_task_runner_guard<T>(
         .catch_unwind()
         .await;
     if let Err(payload) = result {
-        tracing::info!("async task runner panicked, stopping");
+        tracing::error!(runner_id, "async task runner panicked");
         shutdown_on_panic.shutdown();
         std::panic::resume_unwind(payload);
     }
@@ -101,51 +104,51 @@ async fn async_task_runner_loop<T>(
 ) where
     T: AsyncTask,
 {
-    let span = tracing::info_span!("async task runner", runner_id);
-    let _enter = span.enter();
-    tracing::info!("started");
+    let span = tracing::info_span!("async-task-runner", runner_id);
+    async move {
+        let shutdown_rx = shutdown.async_rx().clone();
+        'event_loop: while !shutdown.is_shutdown() {
+            let task = tokio::select! {
+                shutdown = shutdown_rx.recv() => {
+                    let _ = shutdown;
+                    break 'event_loop;
+                },
+                task = task_in_rx.recv() => {
+                    match task {
+                        Ok(task) => task,
+                        Err(err) => {
+                            tracing::debug!(error = %err, "async task input channel closed");
+                            break 'event_loop;
+                        },
+                    }
+                },
+            };
 
-    let shutdown_rx = shutdown.async_rx().clone();
-    'event_loop: while !shutdown.is_shutdown() {
-        let task = tokio::select! {
-            shutdown = shutdown_rx.recv() => {
-                let _ = shutdown;
-                break 'event_loop;
-            },
-            task = task_in_rx.recv() => {
-                match task {
-                    Ok(task) => task,
-                    Err(err) => {
-                        tracing::info!("unable to receive async task, err: {err}, stopping");
-                        break 'event_loop;
-                    },
-                }
-            },
-        };
-
-        let output = tokio::select! {
-            biased;
-            shutdown = shutdown_rx.recv() => {
-                let _ = shutdown;
-                break 'event_loop;
-            },
-            output = task.run() => output,
-        };
-        match task_out_tx.try_send(output) {
-            Ok(()) => {},
-            Err(TrySendError::Full(_)) => {
-                panic!("async task output channel is full")
-            },
-            Err(TrySendError::Disconnected(_)) => {
-                tracing::info!("unable to send async task output, channel closed, stopping");
-                shutdown.shutdown();
-                break 'event_loop;
-            },
+            let output = tokio::select! {
+                biased;
+                shutdown = shutdown_rx.recv() => {
+                    let _ = shutdown;
+                    break 'event_loop;
+                },
+                output = task.run() => output,
+            };
+            match task_out_tx.try_send(output) {
+                Ok(()) => {},
+                Err(TrySendError::Full(_)) => {
+                    panic!("async task output channel is full")
+                },
+                Err(TrySendError::Disconnected(_)) => {
+                    tracing::debug!("async task output channel closed");
+                    shutdown.shutdown();
+                    break 'event_loop;
+                },
+            }
         }
-    }
 
-    shutdown.shutdown();
-    tracing::info!("stopped");
+        shutdown.shutdown();
+    }
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]
