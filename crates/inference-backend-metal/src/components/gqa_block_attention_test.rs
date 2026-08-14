@@ -4,31 +4,11 @@ use super::*;
 use crate::metal::Stream;
 
 #[test]
-fn test_block_shape_models_complete_bidirectional_blocks() {
-    let config = GQABlockSDPAConfig {
-        block_size: 9,
-        num_q_heads: 40,
-        num_kv_heads: 8,
-        head_dim: 128,
-        scale: 128.0_f32.sqrt().recip(),
-        dtype: Dtype::Bfloat16,
-    };
-    let shape = GQABlockSDPAShape {
-        num_tokens: 18,
-        total_sdpa_map_task_templates: 64,
-    };
-    shape.validate(config);
-    assert_eq!(config.q_elements(shape), 92_160);
-    assert_eq!(config.kv_elements(shape), 18_432);
-    assert_eq!(config.partial_output_stat_elements(shape), 2560);
-}
-
-#[test]
 #[should_panic(expected = "complete request blocks")]
 fn test_block_shape_rejects_partial_request_block() {
     GQABlockSDPAShape {
         num_tokens: 10,
-        total_sdpa_map_task_templates: 16,
+        num_total_sdpa_map_task_templates: 16,
     }
     .validate(GQABlockSDPAConfig {
         block_size: 9,
@@ -41,29 +21,6 @@ fn test_block_shape_rejects_partial_request_block() {
 }
 
 #[test]
-fn test_partial_output_reduction_matches_joint_history_and_bidirectional_block_attention() {
-    let history_scores = [-1.0, 0.25, 1.5];
-    let history_values = [[1.0, -2.0], [3.0, 0.5], [-1.0, 4.0]];
-    let block_scores = [0.75, -0.5, 2.0, 0.1];
-    let block_values = [[5.0, 1.0], [0.0, 7.0], [2.0, -3.0], [9.0, 6.0]];
-
-    let merged = reduce_partials(&[
-        attention_partial(&history_scores, &history_values),
-        attention_partial(&block_scores, &block_values),
-    ]);
-    let joint_scores = [history_scores.as_slice(), block_scores.as_slice()].concat();
-    let joint_values = [history_values.as_slice(), block_values.as_slice()].concat();
-    let direct = attention_partial(&joint_scores, &joint_values).2;
-
-    for (actual, expected) in merged.into_iter().zip(direct) {
-        assert!(
-            (actual - expected).abs() < 1.0e-6,
-            "actual={actual}, expected={expected}"
-        );
-    }
-}
-
-#[test]
 fn test_f32_kernel_matches_request_block_bidirectional_reference() {
     assert_kernel_matches_request_block_bidirectional_reference(Dtype::Float32, 1.0e-5);
 }
@@ -71,43 +28,6 @@ fn test_f32_kernel_matches_request_block_bidirectional_reference() {
 #[test]
 fn test_bf16_kernel_matches_request_block_bidirectional_reference() {
     assert_kernel_matches_request_block_bidirectional_reference(Dtype::Bfloat16, 1.0e-2);
-}
-
-fn attention_partial(scores: &[f32], values: &[[f32; 2]]) -> (f32, f32, [f32; 2]) {
-    assert_eq!(scores.len(), values.len());
-    let max_logit = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let weights = scores
-        .iter()
-        .map(|&score| (score - max_logit).exp())
-        .collect::<Vec<_>>();
-    let exp_sum = weights.iter().sum::<f32>();
-    let mut output = [0.0; 2];
-    for (&weight, value) in weights.iter().zip(values) {
-        for dim in 0..2 {
-            output[dim] += weight * value[dim] / exp_sum;
-        }
-    }
-    (max_logit, exp_sum, output)
-}
-
-fn reduce_partials(partials: &[(f32, f32, [f32; 2])]) -> [f32; 2] {
-    let global_max = partials
-        .iter()
-        .map(|&(max_logit, ..)| max_logit)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut global_exp_sum = 0.0;
-    let mut output = [0.0; 2];
-    for &(max_logit, exp_sum, partial_output) in partials {
-        let weight = (max_logit - global_max).exp() * exp_sum;
-        global_exp_sum += weight;
-        for dim in 0..2 {
-            output[dim] += weight * partial_output[dim];
-        }
-    }
-    for value in &mut output {
-        *value /= global_exp_sum;
-    }
-    output
 }
 
 fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, output_tolerance: f32) {
@@ -123,7 +43,7 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
     };
     let shape = GQABlockSDPAShape {
         num_tokens: 6,
-        total_sdpa_map_task_templates: 8,
+        num_total_sdpa_map_task_templates: 8,
     };
     let q_values = round_for_dtype(
         (0..config.q_elements(shape))

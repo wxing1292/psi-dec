@@ -13,10 +13,10 @@ void gqa_paged_sdpa_reduce_impl(
     device const T* partial_output,
     device const uint* cu_sdpa_partial_outputs,
     device T* output,
-    constant uint& num_tokens,
+    constant uint& num_active_tokens,
     uint gid
 ) {
-    const uint total = num_tokens * num_q_heads * head_dim;
+    const uint total = num_active_tokens * num_q_heads * head_dim;
     if (gid >= total) return;
     const uint dim_index = gid % head_dim;
     const uint q_head_index = (gid / head_dim) % num_q_heads;
@@ -54,12 +54,12 @@ kernel void gqa_paged_sdpa_reduce_f32(
     device const float* partial_output [[buffer(2)]],
     device const uint* cu_sdpa_partial_outputs [[buffer(3)]],
     device float* output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     gqa_paged_sdpa_reduce_impl<float>(
         partial_exp_sums, partial_max_logits, partial_output, cu_sdpa_partial_outputs, output,
-        num_tokens, gid);
+        num_active_tokens, gid);
 }
 
 kernel void gqa_paged_sdpa_reduce_bf16(
@@ -68,10 +68,10 @@ kernel void gqa_paged_sdpa_reduce_bf16(
     device const bfloat16_t* partial_output [[buffer(2)]],
     device const uint* cu_sdpa_partial_outputs [[buffer(3)]],
     device bfloat16_t* output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     gqa_paged_sdpa_reduce_impl<bfloat16_t>(
         partial_exp_sums, partial_max_logits, partial_output, cu_sdpa_partial_outputs, output,
-        num_tokens, gid);
+        num_active_tokens, gid);
 }

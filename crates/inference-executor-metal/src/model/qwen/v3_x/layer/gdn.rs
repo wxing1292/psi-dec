@@ -31,6 +31,8 @@ use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xGDN {
     compact_gdn_layer_index: usize,
+    core: GDNCore,
+    metal: GDNMetalConfig,
     weights: Option<Qwen3xGDNWeights>,
     backend: Option<Rc<GDN>>,
     scratch: Option<Rc<GDNScratch>>,
@@ -40,12 +42,16 @@ pub struct Qwen3xGDN {
 impl Qwen3xGDN {
     pub fn new(
         compact_gdn_layer_index: usize,
+        core: GDNCore,
+        metal: GDNMetalConfig,
         backend: Rc<GDN>,
         scratch: Rc<GDNScratch>,
         request_state_resources: Rc<GDNRequestStateResources>,
     ) -> Self {
         Self {
             compact_gdn_layer_index,
+            core,
+            metal,
             weights: None,
             backend: Some(backend),
             scratch: Some(scratch),
@@ -57,12 +63,12 @@ impl Qwen3xGDN {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        core: &GDNCore,
-        metal: GDNMetalConfig,
         bindings: Qwen3xGDNWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(self.weights.is_none(), "Qwen3.x GDN weights are already loaded");
-        self.weights = Some(Qwen3xGDNWeights::load(device, store, &bindings, core, metal)?);
+        self.weights = Some(Qwen3xGDNWeights::load(
+            device, store, &bindings, &self.core, self.metal,
+        )?);
         Ok(())
     }
 

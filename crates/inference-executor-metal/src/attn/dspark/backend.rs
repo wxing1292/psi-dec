@@ -117,7 +117,7 @@ impl UngatedDSparkGQA {
             "DSpark GQA replay token count exceeds scratch"
         );
         assert!(
-            shape.total_sdpa_map_task_templates as usize <= input.scratch.capacity.max_sdpa_partial_outputs,
+            shape.num_total_sdpa_map_task_templates as usize <= input.scratch.capacity.max_sdpa_partial_outputs,
             "DSpark GQA replay partial count exceeds scratch"
         );
         assert_eq!(
@@ -204,7 +204,7 @@ impl ReplayLayer for UngatedDSparkGQA {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.q_norm_rope.invoke(
             GQANormRopeShape {
-                num_tokens: shape.num_tokens,
+                num_total_tokens: shape.num_tokens,
             },
             GQANormRopeBuffers {
                 input: scratch.q,
@@ -215,7 +215,7 @@ impl ReplayLayer for UngatedDSparkGQA {
         )));
         recorder.record(ReplayOp::opaque(self.k_norm_rope.invoke(
             GQANormRopeShape {
-                num_tokens: shape.num_tokens,
+                num_total_tokens: shape.num_tokens,
             },
             GQANormRopeBuffers {
                 input: scratch.k,
@@ -227,8 +227,8 @@ impl ReplayLayer for UngatedDSparkGQA {
 
         let sdpa_config = self.paged_sdpa_config(compute_path, input.page_table_layout);
         let sdpa_shape = GQAPagedSDPAShape {
-            num_tokens: shape.num_tokens,
-            total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+            num_total_tokens: shape.num_tokens,
+            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         };
         let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
         recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
@@ -247,7 +247,7 @@ impl ReplayLayer for UngatedDSparkGQA {
         recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
             GQABlockSDPAShape {
                 num_tokens: shape.num_tokens,
-                total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+                num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
             },
             GQABlockSDPABuffers {
                 q: scratch.q_norm_rope,

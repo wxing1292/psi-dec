@@ -88,10 +88,7 @@ impl Qwen3xGQAState {
     pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
         let request_page_table = self.request_page_table();
         let num_page_ids_per_layer = request_page_table.num_page_ids_per_block();
-        let expected_page_ids = request_page_table
-            .num_layers()
-            .checked_mul(num_page_ids_per_layer)
-            .expect("qwen3.x GQA page-ID count must fit usize");
+        let expected_page_ids = request_page_table.num_layers() * num_page_ids_per_layer;
         assert_eq!(
             page_ids.len(),
             expected_page_ids,
@@ -110,12 +107,8 @@ impl Qwen3xGQAState {
 
     pub fn read_page_ids(&self, req_slot: u32, block_index: usize) -> Vec<u32> {
         let request_page_table = self.request_page_table();
-        let mut page_ids = Vec::with_capacity(
-            request_page_table
-                .num_layers()
-                .checked_mul(request_page_table.num_page_ids_per_block())
-                .expect("qwen3.x GQA page-ID count must fit usize"),
-        );
+        let mut page_ids =
+            Vec::with_capacity(request_page_table.num_layers() * request_page_table.num_page_ids_per_block());
         for layer_index in 0..request_page_table.num_layers() {
             page_ids.extend(request_page_table.read_page_ids(req_slot, layer_index, block_index));
         }
@@ -147,7 +140,7 @@ impl Qwen3xGQAState {
         req_slots: &[u32],
         token_indices: &[u32],
         cu_tokens: &[u32],
-        total_tokens: u32,
+        num_total_tokens: u32,
     ) -> GQAReplayShape {
         self.backend().prepare_bucketed_with_token_capacity(
             self.metadata(),
@@ -155,7 +148,7 @@ impl Qwen3xGQAState {
             token_indices,
             cu_tokens,
             &self.replay_bucket_policy,
-            total_tokens,
+            num_total_tokens,
         )
     }
 

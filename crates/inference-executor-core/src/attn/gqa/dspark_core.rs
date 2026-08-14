@@ -80,6 +80,10 @@ impl DSparkBlockMetadata {
             "DSpark block metadata requires one anchor position per request"
         );
         assert!(block_size > 0, "DSpark block metadata requires block tokens");
+        assert!(
+            u32::try_from(block_size).is_ok(),
+            "DSpark block metadata block_size must fit u32"
+        );
         debug_assert!(
             req_slots
                 .iter()
@@ -105,7 +109,7 @@ impl DSparkBlockMetadata {
                 req_slots_by_token.push(req_slot);
                 flat_token_indices.push(
                     anchor_position
-                        .checked_add(block_offset.try_into().expect("DSpark block token offset must fit u32"))
+                        .checked_add(block_offset as u32)
                         .expect("DSpark block token position must fit u32"),
                 );
                 history_token_begins.push(0);

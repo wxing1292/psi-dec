@@ -21,10 +21,11 @@ crates/inference-executor-metal/src/attn/
     batch_metadata.rs       state-domain-owned, capacity-sized GPU metadata updated per microbatch
     backend.rs              GDN Metal replay wiring and candidate-state materialization
     scratch.rs              reusable GDN scratch allocation owner and borrowed replay bindings
-    request_state_table.rs  private CPU request-slot/version/candidate mapping
-    request_state_table/
+    request_slots.rs        private CPU request-slot/version/candidate mapping
+    request_slots/
       file_io.rs            snapshot readiness validation
     state_table.rs          public GDNRequestStateTable, live arenas, GDNStatePageIO, and lifecycle
+    state_table_test.rs     request-state API-set and transaction lifecycle tests
     state_table/
       file_io.rs            symmetric full and selected metadata and arena file I/O
 
@@ -254,11 +255,11 @@ Canonical host structures use these dynamic work domains:
 
 ```text
 GDNReplayShape
-  num_reqs, total_reqs,
-  num_tokens, total_tokens
+  num_reqs, num_total_reqs,
+  num_tokens, num_total_tokens
 
 GDNComputeShape
-  num_reqs, num_tokens
+  num_total_reqs, num_total_tokens
 
 GDNComputeConfig
   num_qk_heads, qk_head_dim,
@@ -275,7 +276,7 @@ GDNQKVABZSplitConfig
   qkv_dim, num_v_heads, v_dim
 
 GDNQKVABZSplitShape
-  num_tokens
+  num_total_tokens
 ```
 
 Generic `GDNComputeConfig` owns static geometry. `GDNCompute` derives its low-level V-dimension tile from that geometry.
@@ -290,7 +291,7 @@ The canonical binding order and dispatch topology are:
 QKVABZ split
   buffers 0..4: qkvabz, qkv, a, b, z
   scalars 5..8: num_active_tokens, qkv_dim, num_v_heads, v_dim
-  dispatch: total_tokens * (Cqkv + 2 * Hv + Hv * Dv), 256 threads/threadblock
+  dispatch: num_total_tokens * (Cqkv + 2 * Hv + Hv * Dv), 256 threads/threadblock
 
 short convolution
   buffers 0..7: conv_qkv, next_conv_state, qkv, conv_state,
@@ -298,7 +299,7 @@ short convolution
   parameter dtype: conv_weight bf16
   scalars 8..12: num_active_reqs, num_active_tokens, conv_state_offset_bytes,
                  next_conv_state_offset_bytes, write_final_state
-  dispatch: max(total_tokens * Cqkv, total_reqs * Cqkv * Ks), 256 threads/threadblock
+  dispatch: max(num_total_tokens * Cqkv, num_total_reqs * Cqkv * Ks), 256 threads/threadblock
 
 ragged recurrent
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
@@ -306,14 +307,14 @@ ragged recurrent
                 flat_materialized_recurrent_state_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
   scalars 10..12: q_scale, num_active_reqs, recurrent_state_offset_bytes
-  grid: (Dv / Dv_tile, total_reqs * Hv, 1)
+  grid: (Dv / Dv_tile, num_total_reqs * Hv, 1)
   threads: (32, Dv_tile, 1)
 
 output_norm_gate
   buffers 0..3: norm_gated_output, recurrent_output, z, norm_weight
   parameter dtype: norm_weight bf16
   scalars 4..5: eps, num_active_tokens
-  dispatch: total_tokens * Hv * 128, 128 threads/threadblock
+  dispatch: num_total_tokens * Hv * 128, 128 threads/threadblock
 
 batched state-page read/write
   buffers 0..5: pages, recurrent_states, conv_states, page_ids,
@@ -331,7 +332,7 @@ Candidate convolution materialization uses buffers 0..5 for `next_conv_state`, `
 Candidate recurrent materialization uses `src_recurrent_state_slots` at buffer 7,
 `flat_materialized_recurrent_state_slots` at buffer 8, and `cu_tokens` at buffer 9. It uses scalars 10..12. One SIMDgroup
 owns one `[2, Dqk]` register tile. Two SIMDgroups share normalized Q/K and gate scalars through threadgroup memory. The
-grid is `(Dv / 4, total_reqs * Hv, 1)`. The threadgroup shape is `(32, 2, 1)`. The candidate path requires `Dqk % 32 ==
+grid is `(Dv / 4, num_total_reqs * Hv, 1)`. The threadgroup shape is `(32, 2, 1)`. The candidate path requires `Dqk % 32 ==
 0`, `Dv % 2 == 0`, and an even `Dv / 2` tile count. These requirements are initialization-time geometry contracts.
 
 The invalid state-slot sentinel is `u32::MAX`. All compute variants use the same row-level contract. A row always
@@ -389,6 +390,10 @@ geometry or tuning.
 the shared `Rc<GDNRequestStateTable>`, reusable `GDNMetadataBuffers`, cached restore replay, and optional pending publish.
 Each `Qwen3xGDN` layer owns immutable weights, a compact `gdn_layer_index`, and cloned backend, scratch, and state-table
 handles.
+
+Construction validates every shared `GDNCore` against the representative core. Only `model_layer_index` may differ.
+The shared backend must have one compute and affine layout. The `GDN` backend retains the device and creates its scratch
+from the validated core geometry.
 
 The current Qwen3.5 executor imports and owns `Qwen3xGDNState` directly. Its model layers own `Qwen3xGDN` directly.
 Sharing the implementation does not move the GDN lifecycle into another executor. The backend records qkvabz projection,
@@ -512,8 +517,9 @@ authoritative `GDNReplayShape`.
 `GDNMetadataBuffers` is the sole owner of the current replay shape. `GDNInput` borrows the metadata object instead of a
 duplicate shape. Backend recording and replay-key construction both read the stored shape.
 
-`GDNStateArenaBindings` borrows both aggregate arenas and the selected layer's checked `u64` byte bases. Production binds
-each arena at Metal offset zero. It passes the bases as Metal `ulong` kernel arguments.
+`GDNStateArenaBindings` borrows both aggregate arenas and the selected layer's `u64` byte bases. Initialization validates
+the aggregate arena lengths and layer strides. Record-time layer selection uses direct arithmetic and debug bounds.
+Production binds each arena at Metal offset zero. It passes the bases as Metal `ulong` kernel arguments.
 
 `GDNQKVABZSplitBuffers` carries `qkv`, `a`, `b`, and `z`. In qkvabz naming, `a` is the raw gate/dt
 projection. `b` is the raw beta projection. `z` is the output gate projection.
@@ -567,8 +573,8 @@ It does not allocate or add a wrapper.
 `GDNReplayMode::Bucketed` records request and token capacities and uses these submission parameters:
 
 ```text
-gdn.num_active_requests  u32 [1, total_reqs]
-gdn.num_active_tokens    u32 [1, total_tokens]
+gdn.num_active_requests  u32 [1, num_total_reqs]
+gdn.num_active_tokens    u32 [1, num_total_tokens]
 ```
 
 `GDNReplayMode::BucketedWithTokenKey` replaces `gdn.num_active_tokens` with one caller-owned
@@ -594,9 +600,9 @@ recurrent request guard is uniform for the complete threadblock.
 
 `GDNReplayBucketPolicy` owns independent request and token policies. The token policy includes the topology boundaries
 from both affine operators. `GDNReplayTopology` contains `materialize_candidate_states`, `qkvabz_affine`, and
-`output_affine`. The GDN replay subkey contains `total_reqs`, `total_tokens`, and this topology. Active counts do not enter
-the GDN subkey. `replay_token_topology_boundaries` exposes the affine boundaries to a composite-stage policy. A
-caller-owned token capacity must contain all active tokens and must not exceed the initialized token capacity. It must
+`output_affine`. The GDN replay subkey contains `num_total_reqs`, `num_total_tokens`, and this topology. Active counts do
+not enter the GDN subkey. `replay_token_topology_boundaries` exposes the affine boundaries to a composite-stage policy.
+A caller-owned token capacity must contain all active tokens and must not exceed the initialized token capacity. It must
 also select the same QKVABZ and output affine topologies as the active token count. GDN validates these conditions before
 it updates metadata. Qwen3.5 Main selects one composite token capacity before it updates GQA or GDN metadata. It forces
 GDN metadata to use this capacity. The outer Main key records the composite token capacity and the GDN capacity and
@@ -763,16 +769,16 @@ This setup matches the production lifecycle. The lifecycle reads a verified curr
 The replay shape keeps active work separate from recorded capacities:
 
 ```text
-num_reqs      active request count
-total_reqs    recorded request capacity
-num_tokens    active flattened-token count
-total_tokens  recorded flattened-token capacity
-cu_tokens     active prefix length num_reqs + 1
+num_reqs          active request count
+num_total_reqs    recorded request capacity
+num_tokens        active flattened-token count
+num_total_tokens  recorded flattened-token capacity
+cu_tokens         active prefix length num_reqs + 1
 ```
 
 Each active request must contribute at least one token. Thus, `num_reqs <= num_tokens`. Request and token capacities are
-independent and do not require `total_reqs <= total_tokens`. Inactive metadata tails do not represent requests, tokens, or
-state. The committed recurrent and convolution source slots represent existing context.
+independent and do not require `num_total_reqs <= num_total_tokens`. Inactive metadata tails do not represent requests,
+tokens, or state. The committed recurrent and convolution source slots represent existing context.
 
 The state contract is slot based:
 
@@ -911,15 +917,16 @@ Publish records one all-layer batch write after commit.
 Publish is a separate replay from main forward and sampling. It consumes the already-selected committed state. It does not
 affect response tokens. It can execute while the scheduler processes that response.
 
-Qwen model replay keeps selected-path GDN transient scratch in one model-owned `GDNScratch`. This scratch includes the
-F32 qkvabz projection/split buffers and the F32 convolution/core/output-gate buffers. GDN layers execute serially in the
-replay slice. Therefore, this scratch is reusable across layers.
+Qwen model replay keeps selected-path GDN transient scratch in one model-owned `GDNScratch`. The shared `GDN` backend
+creates this scratch from its retained device and validated geometry. The scratch includes the F32 qkvabz
+projection/split buffers and the F32 convolution/core/output-gate buffers. GDN layers execute serially in the replay
+slice. Therefore, this scratch is reusable across layers.
 
 State-page I/O writes directly between global state pages and the model-owned contiguous state arenas. It does not use
 page-value scratch. Every production state kernel binds the aggregate arena at Metal offset zero.
 
-Forward kernels receive a checked host `u64` layer byte base. They add it with Metal `ulong`. Page I/O derives the
-all-layer state address directly with `ulong`.
+Forward kernels receive an initialization-validated host `u64` layer byte base. They add it with Metal `ulong`. Page
+I/O derives the all-layer state address directly with `ulong`.
 
 Layer-local element indices remain `uint`. The executor validates them independently from the aggregate arena allocation.
 This design preserves contiguous storage without an ICB nonzero buffer-binding offset above 4 GiB. It matters for MTP
@@ -928,6 +935,7 @@ rejection because a committed prefix can select an intermediate candidate state.
 Per-layer owners retain weights and immutable component configuration. `GDNRequestStateTable` shares current/candidate
 state, request-slot lifecycle, page-ID staging, and restore/publish jobs. Their versions and slots are common across all
 GDN layers.
+Weight reload uses the retained core and Metal configuration that created each backend.
 
 During `unload_state`, each layer first drops its shared GDN backend, scratch, and request-state resources.
 The model state owner then releases the final references, batch metadata, state arenas, and page-I/O resources.
@@ -1049,6 +1057,10 @@ speculative prefix state with an independently evaluated CPU prefix reference. T
 program for `1 -> 2 -> 1` active requests and tokens. It poisons inactive token and metadata tails. It verifies active
 output/state parity and inactive scratch/state canaries. Its one-request rounds also use `u32::MAX` as the final
 row slot and verify that normal output remains correct while persistent state stays unmodified.
+
+The state-page component test writes and reads two requests across two GDN layers. It compares the written page layout
+with an independent expected layout. It also verifies the selected recurrent and convolution slots and preserves all
+unselected state-slot canaries.
 
 ## Tests and benches
 

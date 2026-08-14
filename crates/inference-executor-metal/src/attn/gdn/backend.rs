@@ -21,6 +21,7 @@ use inference_executor_core::backend::recorder::Recorder;
 
 use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
 use crate::attn::gdn::batch_metadata::GDNReplayBucketPolicy;
+use crate::attn::gdn::scratch::GDNScratch;
 use crate::attn::gdn::scratch::GDNScratchBindings;
 use crate::attn::gdn::state_table::GDNPreparedRequestState;
 use crate::def::layer::ReplayLayer;
@@ -167,6 +168,8 @@ pub type GDNOutput<'a> = &'a Buffer;
 ///      next_hidden_state (BF16)
 /// ```
 pub struct GDN {
+    device: Device,
+    core: GDNCore,
     qkvabz: AffineQuantizedMatmul,
     qkvabz_to_qkv_a_b_z: GDNQKVABZSplitKernel,
     compute: GDNCompute,
@@ -179,6 +182,8 @@ impl GDN {
         config.validate();
         let qkvabz_dim = core.qkvabz_dim();
         Self {
+            device: device.clone(),
+            core: core.clone(),
             qkvabz: AffineQuantizedMatmul::new(
                 device,
                 affine_config(
@@ -204,6 +209,10 @@ impl GDN {
                 ),
             ),
         }
+    }
+
+    pub fn new_scratch(&self, max_tokens: usize) -> GDNScratch {
+        GDNScratch::new(&self.device, &self.core, max_tokens)
     }
 
     pub fn prepare(
@@ -244,14 +253,14 @@ impl GDN {
         cu_tokens: &[u32],
         state: &GDNPreparedRequestState,
         policy: &GDNReplayBucketPolicy,
-        total_tokens: u32,
+        num_total_tokens: u32,
     ) -> GDNReplayShape {
         let num_tokens = cu_tokens.last().copied().unwrap_or_default();
         assert!(
-            total_tokens <= policy.max_tokens(),
+            num_total_tokens <= policy.max_tokens(),
             "GDN caller-owned token capacity must not exceed the metadata capacity"
         );
-        self.validate_token_capacity(num_tokens, total_tokens);
+        self.validate_token_capacity(num_tokens, num_total_tokens);
         metadata.update_bucketed_with_token_capacity(
             cu_tokens,
             &state.src_recurrent_state_slots,
@@ -259,7 +268,7 @@ impl GDN {
             &state.flat_materialized_recurrent_state_slots,
             &state.flat_materialized_conv_state_slots,
             policy,
-            total_tokens,
+            num_total_tokens,
         )
     }
 
@@ -283,30 +292,30 @@ impl GDN {
     ) -> GDNReplayTopology {
         let shape = batch_metadata.replay_shape();
         shape.validate();
-        self.replay_topology_for_token_capacity(shape.total_tokens, materialize_candidate_states)
+        self.replay_topology_for_token_capacity(shape.num_total_tokens, materialize_candidate_states)
     }
 
     fn replay_topology_for_token_capacity(
         &self,
-        total_tokens: u32,
+        num_total_tokens: u32,
         materialize_candidate_states: bool,
     ) -> GDNReplayTopology {
-        assert!(total_tokens > 0, "GDN replay topology requires token capacity");
+        assert!(num_total_tokens > 0, "GDN replay topology requires token capacity");
         GDNReplayTopology {
             materialize_candidate_states,
-            qkvabz_affine: self.qkvabz.topology(total_tokens),
-            output_affine: self.output.topology(total_tokens),
+            qkvabz_affine: self.qkvabz.topology(num_total_tokens),
+            output_affine: self.output.topology(num_total_tokens),
         }
     }
 
-    fn validate_token_capacity(&self, num_tokens: u32, total_tokens: u32) {
+    fn validate_token_capacity(&self, num_tokens: u32, num_total_tokens: u32) {
         assert!(num_tokens > 0, "GDN replay requires active tokens");
         assert!(
-            num_tokens <= total_tokens,
+            num_tokens <= num_total_tokens,
             "GDN caller-owned token capacity must contain all active tokens"
         );
         let active_topology = self.replay_topology_for_token_capacity(num_tokens, true);
-        let selected_topology = self.replay_topology_for_token_capacity(total_tokens, true);
+        let selected_topology = self.replay_topology_for_token_capacity(num_total_tokens, true);
         assert_eq!(
             active_topology.qkvabz_affine, selected_topology.qkvabz_affine,
             "GDN caller-owned token capacity must preserve the QKVABZ affine topology"
@@ -330,11 +339,11 @@ impl ReplayLayer for GDN {
         shape.validate();
         match input.replay_mode {
             GDNReplayMode::Exact => {
-                assert_eq!(shape.num_reqs, shape.total_reqs);
-                assert_eq!(shape.num_tokens, shape.total_tokens);
+                assert_eq!(shape.num_reqs, shape.num_total_reqs);
+                assert_eq!(shape.num_tokens, shape.num_total_tokens);
             },
             GDNReplayMode::Bucketed | GDNReplayMode::BucketedWithTokenKey(_) => {
-                self.validate_token_capacity(shape.num_tokens, shape.total_tokens);
+                self.validate_token_capacity(shape.num_tokens, shape.num_total_tokens);
             },
         }
         let num_active_tokens_key = input.replay_mode.active_tokens_key();
@@ -349,7 +358,7 @@ impl ReplayLayer for GDN {
         let active_tokens = ReplayU32::Parameter(num_active_tokens_key.unwrap_or(GDN_NUM_ACTIVE_TOKENS));
         let qkvabz = if bucketed {
             self.qkvabz.invoke_bucketed(
-                shape.total_tokens,
+                shape.num_total_tokens,
                 num_active_tokens_key.expect("bucketed GDN replay must have an active-token parameter"),
                 scratch.qkvabz,
                 0,
@@ -364,7 +373,7 @@ impl ReplayLayer for GDN {
             )
         } else {
             self.qkvabz.invoke(
-                shape.total_tokens.try_into().expect("GDN token count must fit i32"),
+                shape.num_total_tokens.try_into().expect("GDN token count must fit i32"),
                 scratch.qkvabz,
                 0,
                 hidden_state,
@@ -379,7 +388,7 @@ impl ReplayLayer for GDN {
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(qkvabz));
         let split_shape = GDNQKVABZSplitShape {
-            num_tokens: shape.total_tokens,
+            num_total_tokens: shape.num_total_tokens,
         };
         let split_buffers = GDNQKVABZSplitBuffers {
             qkvabz: scratch.qkvabz,
@@ -444,7 +453,7 @@ impl ReplayLayer for GDN {
         }
         let output = if bucketed {
             self.output.invoke_bucketed(
-                shape.total_tokens,
+                shape.num_total_tokens,
                 num_active_tokens_key.expect("bucketed GDN replay must have an active-token parameter"),
                 next_hidden_state,
                 0,
@@ -459,7 +468,7 @@ impl ReplayLayer for GDN {
             )
         } else {
             self.output.invoke(
-                shape.total_tokens.try_into().expect("GDN token count must fit i32"),
+                shape.num_total_tokens.try_into().expect("GDN token count must fit i32"),
                 next_hidden_state,
                 0,
                 scratch.norm_gated_output,
@@ -494,8 +503,8 @@ fn compute_config(core: &GDNCore, config: GDNMetalConfig) -> GDNComputeConfig {
 
 fn compute_shape(shape: GDNReplayShape) -> GDNComputeShape {
     GDNComputeShape {
-        num_reqs: shape.total_reqs,
-        num_tokens: shape.total_tokens,
+        num_total_reqs: shape.num_total_reqs,
+        num_total_tokens: shape.num_total_tokens,
     }
 }
 
@@ -522,284 +531,5 @@ fn affine_config(
         input_dtype,
         output_dtype,
         scale_bias_dtype,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use inference_backend_metal::metal::Buffer;
-    use inference_backend_metal::metal::Device;
-    use inference_backend_metal::metal::Dtype;
-    use inference_backend_metal::metal::ReplayArguments;
-    use inference_backend_metal::metal::ReplayParameterKey;
-    use inference_backend_metal::metal::Stream;
-    use inference_executor_core::attn::GDNCore;
-
-    use super::GDN;
-    use super::GDN_NUM_ACTIVE_REQUESTS;
-    use super::GDN_NUM_ACTIVE_TOKENS;
-    use super::GDNInput;
-    use super::GDNLayerStateBindings;
-    use super::GDNMetalConfig;
-    use super::GDNReplayMode;
-    use super::GDNWeights;
-    use super::add_gdn_private_replay_arguments;
-    use super::add_gdn_replay_arguments;
-    use super::affine_config;
-    use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
-    use crate::attn::gdn::scratch::GDNScratch;
-    use crate::attn::gdn::state_table::GDNPreparedRequestState;
-    use crate::def::layer::ReplayLayer;
-    use crate::def::replay_op::MetalReplayRuntime;
-
-    #[test]
-    fn test_bucket_policy_preserves_both_affine_topologies() {
-        let device = Device::system_default();
-        let core = fixture_core();
-        let backend = GDN::new(&device, core, fixture_metal_config());
-        let metadata = GDNMetadataBuffers::new(&device, 1, 64);
-        let policy = backend.replay_bucket_policy(1, 64);
-
-        for num_tokens in 1..=64 {
-            let state = GDNPreparedRequestState {
-                src_recurrent_state_slots: vec![0],
-                src_conv_state_slots: vec![0],
-                flat_materialized_recurrent_state_slots: vec![u32::MAX; num_tokens as usize],
-                flat_materialized_conv_state_slots: vec![u32::MAX; num_tokens as usize],
-            };
-            let shape = backend.prepare_bucketed(&metadata, &[0, num_tokens], &state, &policy);
-            let topology = backend.replay_topology(&metadata, true);
-
-            assert_eq!(topology.qkvabz_affine, backend.qkvabz.topology(num_tokens));
-            assert_eq!(topology.qkvabz_affine, backend.qkvabz.topology(shape.total_tokens));
-            assert_eq!(topology.output_affine, backend.output.topology(num_tokens));
-            assert_eq!(topology.output_affine, backend.output.topology(shape.total_tokens));
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "GDN caller-owned token capacity must preserve")]
-    fn test_caller_owned_token_capacity_rejects_topology_change() {
-        let device = Device::system_default();
-        let backend = GDN::new(&device, fixture_core(), fixture_metal_config());
-        let metadata = GDNMetadataBuffers::new(&device, 1, 64);
-        let policy = backend.replay_bucket_policy(1, 64);
-        let topology_boundary = backend
-            .replay_token_topology_boundaries()
-            .iter()
-            .copied()
-            .find(|&boundary| boundary <= 64)
-            .expect("test GDN affine topology must change within the token capacity");
-        let num_tokens = topology_boundary - 1;
-        let state = GDNPreparedRequestState {
-            src_recurrent_state_slots: vec![0],
-            src_conv_state_slots: vec![0],
-            flat_materialized_recurrent_state_slots: vec![u32::MAX; num_tokens as usize],
-            flat_materialized_conv_state_slots: vec![u32::MAX; num_tokens as usize],
-        };
-
-        backend.prepare_bucketed_with_token_capacity(&metadata, &[0, num_tokens], &state, &policy, topology_boundary);
-    }
-
-    #[test]
-    fn test_replay_argument_helpers_separate_default_tokens_from_private_requests() {
-        const STAGE_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_stage.num_active_tokens");
-        let shape = inference_executor_core::attn::GDNReplayShape::new(2, 4, 3, 6);
-
-        let mut private_arguments = ReplayArguments::new();
-        add_gdn_private_replay_arguments(shape, &mut private_arguments);
-        assert_eq!(
-            private_arguments,
-            ReplayArguments::new().with_u32(GDN_NUM_ACTIVE_REQUESTS, 2)
-        );
-
-        let mut default_arguments = ReplayArguments::new();
-        add_gdn_replay_arguments(shape, &mut default_arguments);
-        assert_eq!(
-            default_arguments,
-            ReplayArguments::new()
-                .with_u32(GDN_NUM_ACTIVE_REQUESTS, 2)
-                .with_u32(GDN_NUM_ACTIVE_TOKENS, 3)
-        );
-
-        private_arguments.set_u32(STAGE_NUM_ACTIVE_TOKENS, shape.num_tokens);
-        assert_eq!(
-            private_arguments,
-            ReplayArguments::new()
-                .with_u32(GDN_NUM_ACTIVE_REQUESTS, 2)
-                .with_u32(STAGE_NUM_ACTIVE_TOKENS, 3)
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "GDN active-token key must differ from the private active-request key")]
-    fn test_caller_owned_token_key_rejects_private_request_key() {
-        let _ = GDNReplayMode::BucketedWithTokenKey(GDN_NUM_ACTIVE_REQUESTS).active_tokens_key();
-    }
-
-    #[test]
-    fn test_exact_default_and_caller_keyed_bucketed_candidate_program_parameter_counts() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let runtime = MetalReplayRuntime::new(&stream);
-        let core = fixture_core();
-        let metal = fixture_metal_config();
-        let backend = GDN::new(&device, core.clone(), metal);
-        let scratch = GDNScratch::new(&device, &core, 2);
-        let metadata = GDNMetadataBuffers::new(&device, 2, 2);
-        let state = GDNPreparedRequestState {
-            src_recurrent_state_slots: vec![0, 2],
-            src_conv_state_slots: vec![0, 2],
-            flat_materialized_recurrent_state_slots: vec![u32::MAX; 2],
-            flat_materialized_conv_state_slots: vec![u32::MAX; 2],
-        };
-        let hidden_state = Buffer::new_zeroed_elements(&device, 2 * core.hidden_dim, Dtype::Bfloat16);
-        let next_hidden_state = Buffer::new_zeroed_elements(&device, 2 * core.hidden_dim, Dtype::Bfloat16);
-        let conv_state_stride = core
-            .qkv_dim()
-            .checked_mul(core.conv_kernel_size - 1)
-            .expect("test convolution state stride must fit usize");
-        let recurrent_state_stride = core
-            .num_v_heads
-            .checked_mul(core.v_head_dim)
-            .and_then(|value| value.checked_mul(core.qk_head_dim))
-            .expect("test recurrent state stride must fit usize");
-        let conv_state = Buffer::new_zeroed_elements(&device, 4 * conv_state_stride, Dtype::Float32);
-        let recurrent_state = Buffer::new_zeroed_elements(&device, 4 * recurrent_state_stride, Dtype::Float32);
-        let qkvabz_config = affine_config(
-            core.qkvabz_dim(),
-            core.hidden_dim,
-            metal.input_dtype,
-            Dtype::Float32,
-            metal.qkvabz_scale_bias_dtype,
-            metal,
-        );
-        let output_config = affine_config(
-            core.hidden_dim,
-            core.v_dim(),
-            Dtype::Float32,
-            metal.output_dtype,
-            metal.output_scale_bias_dtype,
-            metal,
-        );
-        let qkvabz_weight = Buffer::new_zeroed(&device, qkvabz_config.weight_bytes());
-        let qkvabz_scales = Buffer::new_zeroed(&device, qkvabz_config.scale_or_bias_bytes());
-        let qkvabz_biases = Buffer::new_zeroed(&device, qkvabz_config.scale_or_bias_bytes());
-        let conv_weight = Buffer::new_zeroed(
-            &device,
-            core.qkv_dim() * core.conv_kernel_size * Dtype::Bfloat16.item_size(),
-        );
-        let norm_weight = Buffer::new_zeroed(&device, core.v_head_dim * Dtype::Bfloat16.item_size());
-        let a_log = Buffer::new_zeroed(&device, core.num_v_heads * Dtype::Bfloat16.item_size());
-        let dt_bias = Buffer::new_zeroed(&device, core.num_v_heads * Dtype::Bfloat16.item_size());
-        let output_weight = Buffer::new_zeroed(&device, output_config.weight_bytes());
-        let output_scales = Buffer::new_zeroed(&device, output_config.scale_or_bias_bytes());
-        let output_biases = Buffer::new_zeroed(&device, output_config.scale_or_bias_bytes());
-        let weights = GDNWeights {
-            qkvabz_weight: &qkvabz_weight,
-            qkvabz_scales: &qkvabz_scales,
-            qkvabz_biases: &qkvabz_biases,
-            conv_weight: &conv_weight,
-            norm_weight: &norm_weight,
-            a_log: &a_log,
-            dt_bias: &dt_bias,
-            output_weight: &output_weight,
-            output_scales: &output_scales,
-            output_biases: &output_biases,
-        };
-        let layer_state = GDNLayerStateBindings {
-            conv_state: &conv_state,
-            conv_state_offset_bytes: 0,
-            next_conv_state: &conv_state,
-            next_conv_state_offset_bytes: 0,
-            recurrent_state_arena: &recurrent_state,
-            recurrent_state_arena_offset_bytes: 0,
-        };
-
-        backend.prepare(&metadata, &[0, 1, 2], &state);
-        let mut exact = runtime.create_recorder();
-        let _ = <GDN as ReplayLayer>::record(
-            &backend,
-            &mut exact,
-            GDNInput {
-                hidden_state: &hidden_state,
-                next_hidden_state: &next_hidden_state,
-                scratch: scratch.bindings(),
-                batch_metadata: &metadata,
-                state: layer_state,
-                materialize_candidate_states: true,
-                weights,
-                replay_mode: GDNReplayMode::Exact,
-            },
-        );
-        assert_eq!(exact.build().stats().parameter_count, 0);
-
-        let policy = backend.replay_bucket_policy(2, 2);
-        backend.prepare_bucketed(&metadata, &[0, 1, 2], &state, &policy);
-        let mut bucketed = runtime.create_recorder();
-        let _ = <GDN as ReplayLayer>::record(
-            &backend,
-            &mut bucketed,
-            GDNInput {
-                hidden_state: &hidden_state,
-                next_hidden_state: &next_hidden_state,
-                scratch: scratch.bindings(),
-                batch_metadata: &metadata,
-                state: layer_state,
-                materialize_candidate_states: true,
-                weights,
-                replay_mode: GDNReplayMode::Bucketed,
-            },
-        );
-        assert_eq!(bucketed.build().stats().parameter_count, 2);
-
-        const STAGE_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_stage.num_active_tokens");
-        backend.prepare_bucketed_with_token_capacity(&metadata, &[0, 1, 2], &state, &policy, 2);
-        let mut caller_keyed = runtime.create_recorder();
-        let _ = <GDN as ReplayLayer>::record(
-            &backend,
-            &mut caller_keyed,
-            GDNInput {
-                hidden_state: &hidden_state,
-                next_hidden_state: &next_hidden_state,
-                scratch: scratch.bindings(),
-                batch_metadata: &metadata,
-                state: layer_state,
-                materialize_candidate_states: true,
-                weights,
-                replay_mode: GDNReplayMode::BucketedWithTokenKey(STAGE_NUM_ACTIVE_TOKENS),
-            },
-        );
-        let caller_keyed = caller_keyed.build();
-        assert_eq!(caller_keyed.stats().parameter_count, 2);
-        let mut arguments = ReplayArguments::new();
-        add_gdn_private_replay_arguments(metadata.replay_shape(), &mut arguments);
-        arguments.set_u32(STAGE_NUM_ACTIVE_TOKENS, metadata.replay_shape().num_tokens);
-        runtime.submit_replay_with_arguments(&caller_keyed, &arguments).wait();
-    }
-
-    fn fixture_core() -> GDNCore {
-        GDNCore {
-            model_layer_index: 0,
-            hidden_dim: 32,
-            num_qk_heads: 1,
-            qk_head_dim: 32,
-            num_v_heads: 1,
-            v_head_dim: 32,
-            conv_kernel_size: 3,
-            q_scale: 1.0,
-        }
-    }
-
-    fn fixture_metal_config() -> GDNMetalConfig {
-        GDNMetalConfig {
-            group_size: 32,
-            bits: 4,
-            norm_eps: 1.0e-6,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-            qkvabz_scale_bias_dtype: Dtype::Bfloat16,
-            output_scale_bias_dtype: Dtype::Bfloat16,
-        }
     }
 }

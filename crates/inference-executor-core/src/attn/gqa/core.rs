@@ -95,15 +95,15 @@ pub struct GQAReplayShape {
     /// Current valid flattened Q-token count (`Tq`).
     pub num_tokens: u32,
     /// Recorded flattened Q-token capacity.
-    pub total_tokens: u32,
+    pub num_total_tokens: u32,
     /// Current valid request-local Q-token-tile count along `Tq`.
     pub num_q_token_tiles: u32,
     /// Recorded request-local Q-token-tile capacity.
-    pub total_q_token_tiles: u32,
+    pub num_total_q_token_tiles: u32,
     /// Current valid `SDPAMapTaskTemplate` count.
     pub num_sdpa_map_task_templates: u32,
     /// Recorded `SDPAMapTaskTemplate` capacity.
-    pub total_sdpa_map_task_templates: u32,
+    pub num_total_sdpa_map_task_templates: u32,
     /// Whether the unpadded batch plan semantically has partial outputs to merge.
     pub reduce_sdpa_partial_outputs: bool,
 }
@@ -112,20 +112,20 @@ impl GQAReplayShape {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_tokens: u32,
-        total_tokens: u32,
+        num_total_tokens: u32,
         num_q_token_tiles: u32,
-        total_q_token_tiles: u32,
+        num_total_q_token_tiles: u32,
         num_sdpa_map_task_templates: u32,
-        total_sdpa_map_task_templates: u32,
+        num_total_sdpa_map_task_templates: u32,
         reduce_sdpa_partial_outputs: bool,
     ) -> Self {
         let shape = Self {
             num_tokens,
-            total_tokens,
+            num_total_tokens,
             num_q_token_tiles,
-            total_q_token_tiles,
+            num_total_q_token_tiles,
             num_sdpa_map_task_templates,
-            total_sdpa_map_task_templates,
+            num_total_sdpa_map_task_templates,
             reduce_sdpa_partial_outputs,
         };
         shape.validate();
@@ -134,11 +134,11 @@ impl GQAReplayShape {
 
     pub fn validate(self) {
         assert!(self.num_tokens > 0);
-        assert!(self.num_tokens <= self.total_tokens);
+        assert!(self.num_tokens <= self.num_total_tokens);
         assert!(self.num_q_token_tiles > 0 && self.num_q_token_tiles <= self.num_tokens);
-        assert!(self.num_q_token_tiles <= self.total_q_token_tiles);
+        assert!(self.num_q_token_tiles <= self.num_total_q_token_tiles);
         assert!(self.num_sdpa_map_task_templates >= self.num_q_token_tiles);
-        assert!(self.num_sdpa_map_task_templates <= self.total_sdpa_map_task_templates);
+        assert!(self.num_sdpa_map_task_templates <= self.num_total_sdpa_map_task_templates);
     }
 }
 

@@ -42,7 +42,7 @@ pub struct UngatedGQAScratchBindings<'a> {
 }
 
 impl UngatedGQAScratch {
-    pub(super) fn new(
+    pub fn new(
         device: &Device,
         core: &UngatedGQACore,
         config: GQAMetalConfig,

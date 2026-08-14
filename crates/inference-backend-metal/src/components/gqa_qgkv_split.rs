@@ -48,7 +48,7 @@ impl GQAQGKVSplitConfig {
     pub fn num_qgkv_slots(self, shape: GQAQGKVSplitShape) -> usize {
         checked_product(
             "GQA projection element count",
-            &[shape.num_tokens as usize, self.qgkv_width()],
+            &[shape.num_total_tokens as usize, self.qgkv_width()],
         )
     }
 
@@ -56,7 +56,7 @@ impl GQAQGKVSplitConfig {
         checked_product(
             "GQA query element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_q_heads as usize,
                 self.head_dim as usize,
             ],
@@ -67,7 +67,7 @@ impl GQAQGKVSplitConfig {
         checked_product(
             "GQA key/value element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_kv_heads as usize,
                 self.head_dim as usize,
             ],
@@ -114,13 +114,13 @@ impl GQAQGKVSplitConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct GQAQGKVSplitShape {
-    pub num_tokens: u32,
+    pub num_total_tokens: u32,
 }
 
 impl GQAQGKVSplitShape {
     pub fn validate(self, config: GQAQGKVSplitConfig) {
         config.validate();
-        assert!(self.num_tokens > 0);
+        assert!(self.num_total_tokens > 0);
         assert_u32_count_domain(config.num_qgkv_slots(self), "GQA projection elements");
     }
 }
@@ -133,7 +133,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "GQA projection elements exceeds the shader u32 count domain")]
     fn test_shape_rejects_shader_count_overflow() {
-        GQAQGKVSplitShape { num_tokens: 1 << 30 }.validate(GQAQGKVSplitConfig::f32(1, 1, 1));
+        GQAQGKVSplitShape {
+            num_total_tokens: 1 << 30,
+        }
+        .validate(GQAQGKVSplitConfig::f32(1, 1, 1));
     }
 }
 
@@ -176,7 +179,7 @@ impl GQAQGKVSplitKernel {
             kernel: &self.kernel,
             shape,
             buffers,
-            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
         }
     }
 
@@ -214,34 +217,34 @@ pub struct GQAQGKVSplitInvocation<'a> {
 }
 
 impl Operator for GQAQGKVSplitInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.qgkv, 0);
-        builder.set_buffer_write(1, self.buffers.q, 0);
-        builder.set_buffer_write(2, self.buffers.g, 0);
-        builder.set_buffer_write(3, self.buffers.k, 0);
-        builder.set_buffer_write(4, self.buffers.v, 0);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.qgkv, 0);
+        recorder.set_buffer_write(1, self.buffers.q, 0);
+        recorder.set_buffer_write(2, self.buffers.g, 0);
+        recorder.set_buffer_write(3, self.buffers.k, 0);
+        recorder.set_buffer_write(4, self.buffers.v, 0);
         set_replay_u32(
-            builder,
+            recorder,
             5,
             self.num_active_tokens,
-            shape.num_tokens,
+            shape.num_total_tokens,
             "GQA projection-split active token count",
         );
-        builder.dispatch_1d(self.config.num_qgkv_slots(shape), 256);
+        recorder.dispatch_1d(self.config.num_qgkv_slots(shape), 256);
     }
 }
 
-fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
     match value {
         ReplayU32::Fixed(value) => {
             assert!(value > 0, "{name} must be positive");
             assert!(value <= max_value, "{name} exceeds recorded capacity");
-            builder.set_u32(index, value);
+            recorder.set_u32(index, value);
         },
-        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
+        ReplayU32::Parameter(key) => recorder.bind_u32(index, key, 1, max_value),
     }
 }
 

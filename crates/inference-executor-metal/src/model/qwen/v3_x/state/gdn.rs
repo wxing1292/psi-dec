@@ -87,6 +87,15 @@ impl Qwen3xGDNState {
         let representative = cores
             .first()
             .expect("qwen3.x GDN state requires at least one GDN layer");
+        for core in cores {
+            core.validate();
+            let mut shared_core = core.clone();
+            shared_core.model_layer_index = representative.model_layer_index;
+            assert_eq!(
+                &shared_core, representative,
+                "qwen3.x GDN layers that share one backend must have compatible compute and affine layouts"
+            );
+        }
         let request_state_table = GDNRequestStateTable::new(
             device,
             cores,
@@ -103,8 +112,8 @@ impl Qwen3xGDNState {
         let max_tokens_u32 = max_tokens.try_into().expect("qwen3.x GDN token capacity must fit u32");
         let replay_bucket_policy = backend.replay_bucket_policy(max_requests, max_tokens_u32);
         Self {
+            scratch: Some(Rc::new(backend.new_scratch(max_tokens))),
             backend: Some(backend),
-            scratch: Some(Rc::new(GDNScratch::new(device, representative, max_tokens))),
             metadata: Some(GDNMetadataBuffers::new(device, num_req_slots, max_tokens)),
             representative_core: representative.clone(),
             metal,
@@ -168,14 +177,14 @@ impl Qwen3xGDNState {
         &self,
         cu_tokens: &[u32],
         prepared: &GDNPreparedRequestState,
-        total_tokens: u32,
+        num_total_tokens: u32,
     ) -> GDNReplayShape {
         self.backend().prepare_bucketed_with_token_capacity(
             self.metadata(),
             cu_tokens,
             prepared,
             &self.replay_bucket_policy,
-            total_tokens,
+            num_total_tokens,
         )
     }
 
@@ -254,11 +263,7 @@ impl Qwen3xGDNState {
             "Qwen3.x GDN state resources are already loaded"
         );
         let backend = Rc::new(GDN::new(device, self.representative_core.clone(), self.metal));
-        self.scratch = Some(Rc::new(GDNScratch::new(
-            device,
-            &self.representative_core,
-            self.max_tokens,
-        )));
+        self.scratch = Some(Rc::new(backend.new_scratch(self.max_tokens)));
         self.metadata = Some(GDNMetadataBuffers::new(device, self.num_req_slots, self.max_tokens));
         self.backend = Some(backend);
         self.request_state_table.allocate_resources(device);

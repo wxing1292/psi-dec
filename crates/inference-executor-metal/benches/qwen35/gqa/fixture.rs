@@ -342,7 +342,7 @@ impl<'a> RealGQAFixture<'a> {
             device,
             num_tokens as usize * model.kv_dim() * Dtype::Bfloat16.item_size(),
         );
-        let num_sdpa_partial_outputs = shape.total_sdpa_map_task_templates as usize * model.num_q_heads;
+        let num_sdpa_partial_outputs = shape.num_total_sdpa_map_task_templates as usize * model.num_q_heads;
         let sdpa_partial_exp_sums = Buffer::new_zeroed(device, num_sdpa_partial_outputs * size_of::<f32>());
         let sdpa_partial_max_logits = Buffer::new_zeroed(device, num_sdpa_partial_outputs * size_of::<f32>());
         let sdpa_partial_output = Buffer::new_zeroed(
@@ -358,7 +358,7 @@ impl<'a> RealGQAFixture<'a> {
             num_tokens as usize * model.q_dim() * Dtype::Bfloat16.item_size(),
         );
         let num_sdpa_partial_output_tokens =
-            tiled_replay_shape.total_sdpa_map_task_templates as usize * params.tiled_q_token_tile_size as usize;
+            tiled_replay_shape.num_total_sdpa_map_task_templates as usize * params.tiled_q_token_tile_size as usize;
         let tiled_partial_output = Buffer::new_zeroed(
             device,
             num_sdpa_partial_output_tokens * model.q_dim() * Dtype::Bfloat16.item_size(),
@@ -383,10 +383,10 @@ impl<'a> RealGQAFixture<'a> {
             device,
             num_tokens as usize * model.hidden_dim * Dtype::Bfloat16.item_size(),
         );
-        let mut builder = MetalReplayRuntime::new(&stream).create_recorder();
+        let mut recorder = MetalReplayRuntime::new(&stream).create_recorder();
         let _ = <GQA as ReplayLayer>::record(
             &backend,
-            &mut builder,
+            &mut recorder,
             GQAInput {
                 page_table_layout,
                 gqa_layer_index: ReplayU32::Fixed(0),
@@ -424,7 +424,7 @@ impl<'a> RealGQAFixture<'a> {
                 replay_mode: GQAReplayMode::Exact,
             },
         );
-        let replay = builder.build();
+        let replay = recorder.build();
         let qgkv_matmul = AffineQuantizedMatmul::new(device, gqa_qgkv_affine_config(model));
         let qgkv_to_q_g_k_v = GQAQGKVSplitKernel::new(device, gqa_qgkv_to_q_g_k_v_config(model));
         let q_norm_rope_kernel = GQANormRopeKernel::new(device, gqa_norm_rope_config(model.num_q_heads, model));
@@ -435,9 +435,9 @@ impl<'a> RealGQAFixture<'a> {
         let metal_page_table_layout = gqa_page_table_layout(num_reqs, end_context_len);
         let tiled_config = gqa_tiled_sdpa_config(metal_page_table_layout, params, model);
         let tiled_shape = GQATiledSDPAShape {
-            num_tokens,
-            num_q_token_tiles: tiled_replay_shape.num_q_token_tiles,
-            total_sdpa_map_task_templates: tiled_replay_shape.total_sdpa_map_task_templates,
+            num_total_tokens: num_tokens,
+            num_total_q_token_tiles: tiled_replay_shape.num_q_token_tiles,
+            num_total_sdpa_map_task_templates: tiled_replay_shape.num_total_sdpa_map_task_templates,
         };
         let tiled_kernel = GQATiledSDPAKernels::new(device, tiled_config, tiled_shape);
         let mut tiled_builder = MetalReplayRuntime::new(&stream).create_recorder();
@@ -455,7 +455,9 @@ impl<'a> RealGQAFixture<'a> {
             0,
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(qgkv_to_q_g_k_v.invoke(
-            GQAQGKVSplitShape { num_tokens },
+            GQAQGKVSplitShape {
+                num_total_tokens: num_tokens,
+            },
             GQAQGKVSplitBuffers {
                 qgkv: &qgkv,
                 q: &q,
@@ -484,7 +486,7 @@ impl<'a> RealGQAFixture<'a> {
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(kv_page_write.invoke(
             GQAKVPageWriteShape {
-                num_token_writes: num_tokens,
+                num_total_token_writes: num_tokens,
                 page_table_layout: metal_page_table_layout,
             },
             GQAKVPageWriteBuffers {
@@ -523,7 +525,9 @@ impl<'a> RealGQAFixture<'a> {
             },
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(gate.invoke(
-            GQAActivationGateShape { num_tokens },
+            GQAActivationGateShape {
+                num_total_tokens: num_tokens,
+            },
             GQAActivationGateBuffers {
                 attention_output: &tiled_attention_output,
                 g: &g,
@@ -598,8 +602,8 @@ impl<'a> RealGQAFixture<'a> {
         let sdpa_shape = gqa_sdpa_shape(self.batch_metadata.replay_shape());
         let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
         let single_q_token_replay = {
-            let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(sdpa.invoke_map(
+            let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
+            recorder.record(ReplayOp::opaque(sdpa.invoke_map(
                 GQAPagedSDPAMapBuffers {
                     q: &self._q_norm_rope,
                     kv_pages: &self._kv_pages,
@@ -612,14 +616,14 @@ impl<'a> RealGQAFixture<'a> {
                 },
                 ReplayU32::Fixed(0),
             )));
-            builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
+            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
                 partial_exp_sums: &self._sdpa_partial_exp_sums,
                 partial_max_logits: &self._sdpa_partial_max_logits,
                 partial_output: &self._sdpa_partial_output,
                 cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
                 output: &self._attention_output,
             })));
-            builder.build()
+            recorder.build()
         };
         let tiled_config = gqa_tiled_sdpa_config(
             gqa_page_table_layout(self.num_reqs, self.end_context_len),
@@ -627,14 +631,17 @@ impl<'a> RealGQAFixture<'a> {
             self.model,
         );
         let tiled_shape = GQATiledSDPAShape {
-            num_tokens: self.num_tokens,
-            num_q_token_tiles: self.tiled_batch_metadata.replay_shape().num_q_token_tiles,
-            total_sdpa_map_task_templates: self.tiled_batch_metadata.replay_shape().total_sdpa_map_task_templates,
+            num_total_tokens: self.num_tokens,
+            num_total_q_token_tiles: self.tiled_batch_metadata.replay_shape().num_q_token_tiles,
+            num_total_sdpa_map_task_templates: self
+                .tiled_batch_metadata
+                .replay_shape()
+                .num_total_sdpa_map_task_templates,
         };
         let tiled = GQATiledSDPAKernels::new(&self.device, tiled_config, tiled_shape);
         let tiled_replay = {
-            let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(tiled.invoke_map(
+            let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
+            recorder.record(ReplayOp::opaque(tiled.invoke_map(
                 GQATiledSDPAMapBuffers {
                     q: &self._q_norm_rope,
                     kv_pages: &self._kv_pages,
@@ -649,7 +656,7 @@ impl<'a> RealGQAFixture<'a> {
                 },
                 ReplayU32::Fixed(0),
             )));
-            builder.record_with_barrier_before(ReplayOp::opaque(tiled.invoke_reduce(GQATiledSDPAReduceBuffers {
+            recorder.record_with_barrier_before(ReplayOp::opaque(tiled.invoke_reduce(GQATiledSDPAReduceBuffers {
                 partial_output: &self._tiled_partial_output,
                 partial_exp_sums: &self._tiled_partial_exp_sums,
                 partial_max_logits: &self._tiled_partial_max_logits,
@@ -657,7 +664,7 @@ impl<'a> RealGQAFixture<'a> {
                 cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_sdpa_partial_outputs(),
                 output: &self._tiled_attention_output,
             })));
-            builder.build()
+            recorder.build()
         };
         let runtime = MetalReplayRuntime::new(&self.stream);
         runtime.submit_replay(&single_q_token_replay).wait();
@@ -762,7 +769,7 @@ impl<'a> RealGQAFixture<'a> {
             &self.stream,
             qgkv_to_q_g_k_v.invoke(
                 GQAQGKVSplitShape {
-                    num_tokens: self.num_tokens,
+                    num_total_tokens: self.num_tokens,
                 },
                 GQAQGKVSplitBuffers {
                     qgkv: &self._qgkv,
@@ -802,7 +809,7 @@ impl<'a> RealGQAFixture<'a> {
             &self.stream,
             kv_page_write.invoke(
                 GQAKVPageWriteShape {
-                    num_token_writes: self.num_tokens,
+                    num_total_token_writes: self.num_tokens,
                     page_table_layout,
                 },
                 GQAKVPageWriteBuffers {
@@ -817,8 +824,8 @@ impl<'a> RealGQAFixture<'a> {
             ),
         );
         let single_q_token_replay = {
-            let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(sdpa.invoke_map(
+            let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
+            recorder.record(ReplayOp::opaque(sdpa.invoke_map(
                 GQAPagedSDPAMapBuffers {
                     q: &self._q_norm_rope,
                     kv_pages: &self._kv_pages,
@@ -831,25 +838,28 @@ impl<'a> RealGQAFixture<'a> {
                 },
                 ReplayU32::Fixed(0),
             )));
-            builder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
+            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
                 partial_exp_sums: &self._sdpa_partial_exp_sums,
                 partial_max_logits: &self._sdpa_partial_max_logits,
                 partial_output: &self._sdpa_partial_output,
                 cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
                 output: &self._attention_output,
             })));
-            builder.build()
+            recorder.build()
         };
         let tiled_config = gqa_tiled_sdpa_config(page_table_layout, self.params, self.model);
         let tiled_shape = GQATiledSDPAShape {
-            num_tokens: self.num_tokens,
-            num_q_token_tiles: self.tiled_batch_metadata.replay_shape().num_q_token_tiles,
-            total_sdpa_map_task_templates: self.tiled_batch_metadata.replay_shape().total_sdpa_map_task_templates,
+            num_total_tokens: self.num_tokens,
+            num_total_q_token_tiles: self.tiled_batch_metadata.replay_shape().num_q_token_tiles,
+            num_total_sdpa_map_task_templates: self
+                .tiled_batch_metadata
+                .replay_shape()
+                .num_total_sdpa_map_task_templates,
         };
         let tiled_kernel = GQATiledSDPAKernels::new(&self.device, tiled_config, tiled_shape);
         let tiled_replay = {
-            let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-            builder.record(ReplayOp::opaque(tiled_kernel.invoke_map(
+            let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
+            recorder.record(ReplayOp::opaque(tiled_kernel.invoke_map(
                 GQATiledSDPAMapBuffers {
                     q: &self._q_norm_rope,
                     kv_pages: &self._kv_pages,
@@ -864,7 +874,7 @@ impl<'a> RealGQAFixture<'a> {
                 },
                 ReplayU32::Fixed(0),
             )));
-            builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
+            recorder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
                 GQATiledSDPAReduceBuffers {
                     partial_output: &self._tiled_partial_output,
                     partial_exp_sums: &self._tiled_partial_exp_sums,
@@ -874,7 +884,7 @@ impl<'a> RealGQAFixture<'a> {
                     output: &self._tiled_attention_output,
                 },
             )));
-            builder.build()
+            recorder.build()
         };
         let runtime = MetalReplayRuntime::new(&self.stream);
         runtime.submit_replay(&single_q_token_replay).wait();
@@ -890,7 +900,7 @@ impl<'a> RealGQAFixture<'a> {
             &self.stream,
             gate.invoke(
                 GQAActivationGateShape {
-                    num_tokens: self.num_tokens,
+                    num_total_tokens: self.num_tokens,
                 },
                 GQAActivationGateBuffers {
                     attention_output: &self._attention_output,

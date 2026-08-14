@@ -1,4 +1,4 @@
-use crate::attn::gdn::request_state_table::GDNRequestSlots;
+use crate::attn::gdn::request_slots::GDNRequestSlots;
 
 impl GDNRequestSlots {
     pub fn assert_snapshot_ready(

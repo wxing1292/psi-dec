@@ -218,27 +218,27 @@ fn build_metal_metadata(
     }
 
     let num_task_templates = sdpa_map_task_templates.len() / NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS;
-    let total_sdpa_map_task_templates = num_task_templates
+    let num_total_sdpa_map_task_templates = num_task_templates
         .checked_next_power_of_two()
         .expect("DSpark GQA replay TaskTemplate count must fit usize");
     assert!(
-        total_sdpa_map_task_templates <= max_sdpa_map_task_templates,
+        num_total_sdpa_map_task_templates <= max_sdpa_map_task_templates,
         "DSpark GQA replay TaskTemplate count exceeds capacity"
     );
     sdpa_map_task_templates.resize(
-        total_sdpa_map_task_templates * NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS,
+        num_total_sdpa_map_task_templates * NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS,
         u32::MAX,
     );
     let num_tokens = num_tokens.try_into().expect("DSpark GQA token count must fit u32");
     let replay_shape = GQAReplayShape {
         num_tokens,
-        total_tokens: num_tokens,
+        num_total_tokens: num_tokens,
         num_q_token_tiles: num_tokens,
-        total_q_token_tiles: num_tokens,
+        num_total_q_token_tiles: num_tokens,
         num_sdpa_map_task_templates: num_task_templates
             .try_into()
             .expect("DSpark GQA active TaskTemplate count must fit u32"),
-        total_sdpa_map_task_templates: total_sdpa_map_task_templates
+        num_total_sdpa_map_task_templates: num_total_sdpa_map_task_templates
             .try_into()
             .expect("DSpark GQA TaskTemplate count must fit u32"),
         reduce_sdpa_partial_outputs: true,
@@ -317,7 +317,7 @@ mod tests {
                 assert!(fields[2] <= 11);
             }
         }
-        assert_eq!(metadata.replay_shape.total_sdpa_map_task_templates, 32);
+        assert_eq!(metadata.replay_shape.num_total_sdpa_map_task_templates, 32);
     }
 
     #[test]
@@ -336,6 +336,6 @@ mod tests {
             assert_eq!(history.last().expect("history task")[2], anchor);
             assert!(history.windows(2).all(|pair| pair[0][2] == pair[1][1]));
         }
-        assert_eq!(metadata.replay_shape.total_sdpa_map_task_templates, 16);
+        assert_eq!(metadata.replay_shape.num_total_sdpa_map_task_templates, 16);
     }
 }

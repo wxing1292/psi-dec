@@ -68,8 +68,8 @@ struct GDNFixture {
 impl GDNFixture {
     fn new(device: &Device, batch: u32, tokens: u32) -> Self {
         let shape = GDNComputeShape {
-            num_reqs: batch,
-            num_tokens: batch * tokens,
+            num_total_reqs: batch,
+            num_total_tokens: batch * tokens,
         };
         let config = GDNComputeConfig {
             num_qk_heads: GDN_QK_HEADS,
@@ -80,25 +80,33 @@ impl GDNFixture {
             q_scale: 1.0 / (GDN_QK_HEAD_DIM as f32).sqrt(),
             norm_eps: 1.0e-6,
         };
-        let cu_token_values = (0..=shape.num_reqs)
+        let cu_token_values = (0..=shape.num_total_reqs)
             .map(|req_index| (req_index * tokens) as i32)
             .collect::<Vec<_>>();
-        let src_state_slot_values = (0..shape.num_reqs).collect::<Vec<_>>();
-        let dst_slot_id_values = (shape.num_reqs..shape.num_reqs * 2).collect::<Vec<_>>();
-        let mut flat_final_state_slot_values = vec![u32::MAX; shape.num_tokens as usize];
+        let src_state_slot_values = (0..shape.num_total_reqs).collect::<Vec<_>>();
+        let dst_slot_id_values = (shape.num_total_reqs..shape.num_total_reqs * 2).collect::<Vec<_>>();
+        let mut flat_final_state_slot_values = vec![u32::MAX; shape.num_total_tokens as usize];
         for (req_index, &dst_state_slot) in dst_slot_id_values.iter().enumerate() {
             flat_final_state_slot_values[(req_index as u32 * tokens + tokens - 1) as usize] = dst_state_slot;
         }
-        let candidate_dst_slot_id_values = (0..shape.num_tokens)
-            .map(|flat_token_index| shape.num_reqs * 2 + flat_token_index)
+        let candidate_dst_slot_id_values = (0..shape.num_total_tokens)
+            .map(|flat_token_index| shape.num_total_reqs * 2 + flat_token_index)
             .collect::<Vec<_>>();
-        let state_slot_count = shape.num_reqs * 2 + shape.num_tokens;
+        let state_slot_count = shape.num_total_reqs * 2 + shape.num_total_tokens;
 
         let stream = Stream::new(device);
         let kernels = GDNCompute::new(device, config);
         let qkv = f32_pattern_buffer(device, config.num_qkv_values(shape), 0.001);
-        let a = f32_pattern_buffer(device, shape.num_tokens as usize * config.num_v_heads as usize, 0.002);
-        let b = f32_pattern_buffer(device, shape.num_tokens as usize * config.num_v_heads as usize, -0.001);
+        let a = f32_pattern_buffer(
+            device,
+            shape.num_total_tokens as usize * config.num_v_heads as usize,
+            0.002,
+        );
+        let b = f32_pattern_buffer(
+            device,
+            shape.num_total_tokens as usize * config.num_v_heads as usize,
+            -0.001,
+        );
         let z = f32_pattern_buffer(device, config.num_recurrent_output_values(shape), 0.0015);
         let conv_weight = bf16_pattern_buffer(
             device,

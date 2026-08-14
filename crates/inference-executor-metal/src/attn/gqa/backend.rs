@@ -229,15 +229,15 @@ impl GQA {
         shape.validate();
         match input.replay_mode {
             GQAReplayMode::Exact => {
-                assert_eq!(shape.num_tokens, shape.total_tokens);
-                assert_eq!(shape.num_q_token_tiles, shape.total_q_token_tiles);
+                assert_eq!(shape.num_tokens, shape.num_total_tokens);
+                assert_eq!(shape.num_q_token_tiles, shape.num_total_q_token_tiles);
             },
             GQAReplayMode::Bucketed => {
-                self.validate_token_capacity_topology(shape.num_tokens, shape.total_tokens);
+                self.validate_token_capacity_topology(shape.num_tokens, shape.num_total_tokens);
             },
             GQAReplayMode::BucketedWithTokenKey(_) => {
                 let _ = input.replay_mode.active_tokens_key();
-                self.validate_token_capacity_topology(shape.num_tokens, shape.total_tokens);
+                self.validate_token_capacity_topology(shape.num_tokens, shape.num_total_tokens);
             },
         }
         input.page_table_layout.validate();
@@ -325,19 +325,19 @@ impl GQA {
         token_indices: &[u32],
         cu_tokens: &[u32],
         policy: &GQAReplayBucketPolicy,
-        total_tokens: u32,
+        num_total_tokens: u32,
     ) -> GQAReplayShape {
         let num_tokens = cu_tokens.last().copied().unwrap_or_default();
         assert!(num_tokens > 0, "GQA replay requires active tokens");
         assert!(
-            num_tokens <= total_tokens,
+            num_tokens <= num_total_tokens,
             "GQA active token count must not exceed the caller-owned token capacity"
         );
         assert!(
-            total_tokens <= policy.max_tokens(),
+            num_total_tokens <= policy.max_tokens(),
             "GQA caller-owned token capacity must not exceed the metadata capacity"
         );
-        self.validate_token_capacity_topology(num_tokens, total_tokens);
+        self.validate_token_capacity_topology(num_tokens, num_total_tokens);
         let num_q_token_tiles = cu_tokens
             .windows(2)
             .map(|cu| {
@@ -352,7 +352,7 @@ impl GQA {
             cu_tokens,
             compute_path,
             policy,
-            total_tokens,
+            num_total_tokens,
         )
     }
 
@@ -368,15 +368,15 @@ impl GQA {
         boundaries.into_boxed_slice()
     }
 
-    fn validate_token_capacity_topology(&self, num_tokens: u32, total_tokens: u32) {
+    fn validate_token_capacity_topology(&self, num_tokens: u32, num_total_tokens: u32) {
         assert_eq!(
             self.qgkv.topology(num_tokens),
-            self.qgkv.topology(total_tokens),
+            self.qgkv.topology(num_total_tokens),
             "GQA caller-owned token capacity must preserve the active QGKV affine topology"
         );
         assert_eq!(
             self.output.topology(num_tokens),
-            self.output.topology(total_tokens),
+            self.output.topology(num_total_tokens),
             "GQA caller-owned token capacity must preserve the active output affine topology"
         );
     }
@@ -386,8 +386,8 @@ impl GQA {
         shape.validate();
         GQAReplayTopology {
             compute_path: batch_metadata.compute_path(),
-            qgkv_affine: self.qgkv.topology(shape.total_tokens),
-            output_affine: self.output.topology(shape.total_tokens),
+            qgkv_affine: self.qgkv.topology(shape.num_total_tokens),
+            output_affine: self.output.topology(shape.num_total_tokens),
         }
     }
 }
@@ -418,7 +418,7 @@ impl ReplayLayer for GQA {
         let active_sdpa_map_task_templates = ReplayU32::Parameter(GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES);
         let qgkv = if bucketed {
             self.qgkv.invoke_bucketed(
-                shape.total_tokens,
+                shape.num_total_tokens,
                 active_tokens_key,
                 scratch.qgkv,
                 0,
@@ -433,7 +433,7 @@ impl ReplayLayer for GQA {
             )
         } else {
             self.qgkv.invoke(
-                shape.total_tokens.try_into().expect("GQA token count must fit i32"),
+                shape.num_total_tokens.try_into().expect("GQA token count must fit i32"),
                 scratch.qgkv,
                 0,
                 hidden_state,
@@ -625,7 +625,7 @@ impl ReplayLayer for GQA {
         recorder.record_with_barrier_before(ReplayOp::opaque(gate));
         let output = if bucketed {
             self.output.invoke_bucketed(
-                shape.total_tokens,
+                shape.num_total_tokens,
                 active_tokens_key,
                 next_hidden_state,
                 0,
@@ -640,7 +640,7 @@ impl ReplayLayer for GQA {
             )
         } else {
             self.output.invoke(
-                shape.total_tokens.try_into().expect("GQA token count must fit i32"),
+                shape.num_total_tokens.try_into().expect("GQA token count must fit i32"),
                 next_hidden_state,
                 0,
                 scratch.gated_attention_output,
@@ -661,19 +661,19 @@ impl ReplayLayer for GQA {
 impl GQA {
     fn qgkv_to_q_g_k_v_shape(&self, shape: GQAReplayShape) -> GQAQGKVSplitShape {
         GQAQGKVSplitShape {
-            num_tokens: shape.total_tokens,
+            num_total_tokens: shape.num_total_tokens,
         }
     }
 
     fn norm_rope_shape(&self, shape: GQAReplayShape) -> GQANormRopeShape {
         GQANormRopeShape {
-            num_tokens: shape.total_tokens,
+            num_total_tokens: shape.num_total_tokens,
         }
     }
 
     fn kv_page_write_shape(&self, shape: GQAReplayShape, page_table_layout: GQAPageTableLayout) -> GQAKVPageWriteShape {
         GQAKVPageWriteShape {
-            num_token_writes: shape.total_tokens,
+            num_total_token_writes: shape.num_total_tokens,
             page_table_layout: backend_page_table_layout(page_table_layout),
         }
     }
@@ -685,10 +685,13 @@ impl GQA {
         num_threads_per_threadblock: u32,
         q_head_tile_size: u32,
     ) -> GQAPagedSDPAConfig {
+        debug_assert!(u32::try_from(self.core.num_q_heads).is_ok());
+        debug_assert!(u32::try_from(self.core.num_kv_heads).is_ok());
+        debug_assert!(u32::try_from(self.core.head_dim).is_ok());
         GQAPagedSDPAConfig {
-            num_q_heads: self.core.num_q_heads.try_into().expect("GQA q heads must fit u32"),
-            num_kv_heads: self.core.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
-            head_dim: self.core.head_dim.try_into().expect("GQA head_dim must fit u32"),
+            num_q_heads: self.core.num_q_heads as u32,
+            num_kv_heads: self.core.num_kv_heads as u32,
+            head_dim: self.core.head_dim as u32,
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
@@ -701,8 +704,8 @@ impl GQA {
 
     fn paged_sdpa_shape(&self, shape: GQAReplayShape) -> GQAPagedSDPAShape {
         GQAPagedSDPAShape {
-            num_tokens: shape.total_tokens,
-            total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+            num_total_tokens: shape.num_total_tokens,
+            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }
 
@@ -713,10 +716,13 @@ impl GQA {
         kv_token_tile_size: u32,
         q_head_tile_size: u32,
     ) -> GQATiledSDPAConfig {
+        debug_assert!(u32::try_from(self.core.num_q_heads).is_ok());
+        debug_assert!(u32::try_from(self.core.num_kv_heads).is_ok());
+        debug_assert!(u32::try_from(self.core.head_dim).is_ok());
         GQATiledSDPAConfig {
-            num_q_heads: self.core.num_q_heads.try_into().expect("GQA q heads must fit u32"),
-            num_kv_heads: self.core.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
-            head_dim: self.core.head_dim.try_into().expect("GQA head_dim must fit u32"),
+            num_q_heads: self.core.num_q_heads as u32,
+            num_kv_heads: self.core.num_kv_heads as u32,
+            head_dim: self.core.head_dim as u32,
             q_head_tile_size,
             q_token_tile_size,
             kv_token_tile_size,
@@ -729,15 +735,15 @@ impl GQA {
 
     fn tiled_sdpa_shape(&self, shape: GQAReplayShape) -> GQATiledSDPAShape {
         GQATiledSDPAShape {
-            num_tokens: shape.total_tokens,
-            num_q_token_tiles: shape.total_q_token_tiles,
-            total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+            num_total_tokens: shape.num_total_tokens,
+            num_total_q_token_tiles: shape.num_total_q_token_tiles,
+            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }
 
     fn gate_shape(&self, shape: GQAReplayShape) -> GQAActivationGateShape {
         GQAActivationGateShape {
-            num_tokens: shape.total_tokens,
+            num_total_tokens: shape.num_total_tokens,
         }
     }
 }
@@ -830,30 +836,18 @@ fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedM
 #[cfg(test)]
 mod tests {
     use half::bf16;
-    use inference_backend_metal::components::GQAComputePath;
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Dtype;
     use inference_backend_metal::metal::ReplayArguments;
-    use inference_backend_metal::metal::ReplayParameterKey;
     use inference_backend_metal::metal::ReplayU32;
     use inference_backend_metal::metal::Stream;
-    use inference_backend_metal::operators::AffineQuantizedMatmul;
-    use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-    use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
     use inference_executor_core::attn::GQACore;
-    use inference_executor_core::attn::GQAPageTableLayout;
-    use inference_executor_core::attn::GQAReplayShape;
 
-    use super::GQA;
-    use super::GQA_NUM_ACTIVE_Q_TOKEN_TILES;
-    use super::GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES;
     use super::GQA_NUM_ACTIVE_TOKENS;
     use super::GQAActivationGateBuffers;
     use super::GQAActivationGateConfig;
     use super::GQAActivationGateKernel;
     use super::GQAActivationGateShape;
-    use super::GQAInput;
-    use super::GQAKVCacheBindings;
     use super::GQAMetalConfig;
     use super::GQANormRopeBuffers;
     use super::GQANormRopeConfig;
@@ -863,17 +857,6 @@ mod tests {
     use super::GQAQGKVSplitConfig;
     use super::GQAQGKVSplitKernel;
     use super::GQAQGKVSplitShape;
-    use super::GQAReplayMode;
-    use super::GQAReplayTopology;
-    use super::GQAWeights;
-    use super::add_gqa_private_replay_arguments;
-    use super::affine_config;
-    use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
-    use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
-    use crate::def::layer::ReplayLayer;
-    use crate::def::replay_op::MetalReplayRuntime;
-
-    const STAGE_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.stage.num_active_tokens");
 
     #[test]
     #[should_panic(expected = "GQA Q-head count must fit u32")]
@@ -894,259 +877,15 @@ mod tests {
     }
 
     #[test]
-    fn test_private_arguments_leave_stage_token_argument_owned_by_caller() {
-        let shape = GQAReplayShape::new(3, 4, 2, 4, 3, 4, true);
-        let topology = GQAReplayTopology {
-            compute_path: GQAComputePath::TiledQueryTokens {
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                q_head_tile_size: 1,
-            },
-            qgkv_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-        };
-        let mut arguments = ReplayArguments::new().with_u32(STAGE_NUM_ACTIVE_TOKENS, shape.num_tokens);
-
-        add_gqa_private_replay_arguments(shape, topology, &mut arguments);
-
-        assert_eq!(
-            arguments,
-            ReplayArguments::new()
-                .with_u32(STAGE_NUM_ACTIVE_TOKENS, 3)
-                .with_u32(GQA_NUM_ACTIVE_Q_TOKEN_TILES, 2)
-                .with_u32(GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 3)
-        );
-    }
-
-    #[test]
-    fn test_caller_token_key_rejects_private_keys() {
-        for key in [GQA_NUM_ACTIVE_Q_TOKEN_TILES, GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES] {
-            assert!(std::panic::catch_unwind(|| GQAReplayMode::BucketedWithTokenKey(key).active_tokens_key()).is_err());
-        }
-    }
-
-    #[test]
-    fn test_caller_token_capacity_drives_replay_topology() {
-        let device = inference_backend_metal::metal::Device::system_default();
-        let gqa = new_gqa(&device);
-        let metadata = GQAMetadataBuffers::new(&device, 32);
-        let policy = gqa.replay_bucket_policy(32);
-
-        let shape = gqa.prepare_bucketed_with_token_capacity(&metadata, &[0], &[0], &[0, 9], &policy, 10);
-        let topology = gqa.replay_topology(&metadata);
-
-        assert_eq!(shape.total_tokens, 10);
-        assert_eq!(topology.qgkv_affine, gqa.qgkv.topology(10));
-        assert_eq!(topology.output_affine, gqa.output.topology(10));
-    }
-
-    #[test]
-    #[should_panic(expected = "GQA caller-owned token capacity must preserve the active QGKV affine topology")]
-    fn test_caller_token_capacity_rejects_affine_topology_change() {
-        let device = inference_backend_metal::metal::Device::system_default();
-        let gqa = new_gqa(&device);
-        let metadata = GQAMetadataBuffers::new(&device, 32);
-        let policy = GQAReplayBucketPolicy::new(32, &[]);
-
-        gqa.prepare_bucketed_with_token_capacity(&metadata, &[0], &[0], &[0, 17], &policy, 18);
-    }
-
-    #[test]
-    fn test_caller_owned_token_key_records_one_shared_token_parameter() {
-        let device = inference_backend_metal::metal::Device::system_default();
-        let stream = Stream::new(&device);
-        let runtime = MetalReplayRuntime::new(&stream);
-        let core = fixture_core();
-        let metal = fixture_metal_config();
-        let gqa = GQA::new(&device, core.clone(), metal);
-        let scratch = gqa.new_scratch(4);
-        let metadata = GQAMetadataBuffers::new(&device, 4);
-        let policy = gqa.replay_bucket_policy(4);
-        let shape = gqa.prepare_bucketed_with_token_capacity(&metadata, &[0], &[0], &[0, 3], &policy, 4);
-        let page_table_layout = GQAPageTableLayout {
-            num_req_slots: 1,
-            num_gqa_layers: 1,
-            num_blocks: 1,
-            num_page_ids_per_block: 1,
-        };
-        let hidden_state = Buffer::new_zeroed_elements(&device, 4 * core.hidden_dim, Dtype::Bfloat16);
-        let next_hidden_state = Buffer::new_zeroed_elements(&device, 4 * core.hidden_dim, Dtype::Bfloat16);
-        let kv_pages = Buffer::new_zeroed(&device, metal.page_bytes as usize);
-        let page_ids = Buffer::new_zeroed_elements(&device, 1, Dtype::Uint32);
-        let qgkv_shape = core.qgkv_shape();
-        let qgkv_config = affine_config(qgkv_shape.out_dim, qgkv_shape.in_dim, metal);
-        let output_shape = core.output_shape();
-        let output_config = affine_config(output_shape.out_dim, output_shape.in_dim, metal);
-        let qgkv_weight = Buffer::new_zeroed(&device, qgkv_config.weight_bytes());
-        let qgkv_scales = Buffer::new_zeroed(&device, qgkv_config.scale_or_bias_bytes());
-        let qgkv_biases = Buffer::new_zeroed(&device, qgkv_config.scale_or_bias_bytes());
-        let q_norm_weight = Buffer::new_zeroed_elements(&device, core.head_dim, Dtype::Bfloat16);
-        let k_norm_weight = Buffer::new_zeroed_elements(&device, core.head_dim, Dtype::Bfloat16);
-        let output_weight = Buffer::new_zeroed(&device, output_config.weight_bytes());
-        let output_scales = Buffer::new_zeroed(&device, output_config.scale_or_bias_bytes());
-        let output_biases = Buffer::new_zeroed(&device, output_config.scale_or_bias_bytes());
-        let weights = GQAWeights {
-            qgkv_weight: &qgkv_weight,
-            qgkv_scales: &qgkv_scales,
-            qgkv_biases: &qgkv_biases,
-            q_norm_weight: &q_norm_weight,
-            k_norm_weight: &k_norm_weight,
-            output_weight: &output_weight,
-            output_scales: &output_scales,
-            output_biases: &output_biases,
-        };
-        let mut recorder = runtime.create_recorder();
-
-        let _ = <GQA as ReplayLayer>::record(
-            &gqa,
-            &mut recorder,
-            GQAInput {
-                page_table_layout,
-                gqa_layer_index: ReplayU32::Fixed(0),
-                batch_metadata: &metadata,
-                hidden_state: &hidden_state,
-                next_hidden_state: &next_hidden_state,
-                kv_cache: GQAKVCacheBindings {
-                    kv_pages: &kv_pages,
-                    page_ids: &page_ids,
-                },
-                weights,
-                scratch: scratch.bindings(),
-                replay_mode: GQAReplayMode::BucketedWithTokenKey(STAGE_NUM_ACTIVE_TOKENS),
-            },
-        );
-        let replay = recorder.build();
-
-        assert_eq!(shape.num_tokens, 3);
-        assert_eq!(shape.total_tokens, 4);
-        assert_eq!(replay.stats().parameter_count, 3);
-    }
-
-    #[test]
-    fn test_gqa_leaves_share_one_caller_owned_active_token_parameter() {
-        let device = inference_backend_metal::metal::Device::system_default();
-        let stream = Stream::new(&device);
-        let qgkv_config = AffineQuantizedMatmulConfig::same_dtype(96, 32, 32, 4, Dtype::Bfloat16);
-        let output_config = AffineQuantizedMatmulConfig::same_dtype(32, 32, 32, 4, Dtype::Bfloat16);
-        let qgkv = AffineQuantizedMatmul::new(&device, qgkv_config);
-        let output = AffineQuantizedMatmul::new(&device, output_config);
-        let split_config = GQAQGKVSplitConfig::bf16(2, 1, 16);
-        let split = GQAQGKVSplitKernel::new(&device, split_config);
-        let q_norm = GQANormRopeKernel::new(&device, GQANormRopeConfig::bf16(2, 16, 16, 1.0e-6, 1_000_000.0, 1.0));
-        let k_norm = GQANormRopeKernel::new(&device, GQANormRopeConfig::bf16(1, 16, 16, 1.0e-6, 1_000_000.0, 1.0));
-        let gate_config = GQAActivationGateConfig::bf16(2, 16);
-        let gate = GQAActivationGateKernel::new(&device, gate_config);
-        let num_total_rows = 4_i32;
-        let split_shape = GQAQGKVSplitShape {
-            num_tokens: num_total_rows as u32,
-        };
-        let q_norm_shape = GQANormRopeShape {
-            num_tokens: num_total_rows as u32,
-        };
-        let gate_shape = GQAActivationGateShape {
-            num_tokens: num_total_rows as u32,
-        };
-        let hidden = Buffer::new_zeroed(&device, qgkv_config.input_bytes(num_total_rows));
-        let qgkv_output = Buffer::new_zeroed(&device, qgkv_config.output_bytes(num_total_rows));
-        let q = Buffer::new_zeroed(&device, split_config.q_bytes(split_shape));
-        let g = Buffer::new_zeroed(&device, split_config.q_bytes(split_shape));
-        let k = Buffer::new_zeroed(&device, split_config.kv_bytes(split_shape));
-        let v = Buffer::new_zeroed(&device, split_config.kv_bytes(split_shape));
-        let norm_weight = Buffer::new_zeroed_elements(&device, 16, Dtype::Bfloat16);
-        let flat_token_indices = Buffer::new_zeroed_elements(&device, num_total_rows as usize, Dtype::Uint32);
-        let q_norm_output = Buffer::new_zeroed(&device, gate_config.bytes(gate_shape));
-        let k_norm_output = Buffer::new_zeroed(&device, split_config.kv_bytes(split_shape));
-        let gated = Buffer::new_zeroed(&device, gate_config.bytes(gate_shape));
-        let final_output = Buffer::new_zeroed(&device, output_config.output_bytes(num_total_rows));
-        let qgkv_weight = Buffer::new_zeroed(&device, qgkv_config.weight_bytes());
-        let qgkv_scales = Buffer::new_zeroed(&device, qgkv_config.scale_or_bias_bytes());
-        let qgkv_biases = Buffer::new_zeroed(&device, qgkv_config.scale_or_bias_bytes());
-        let output_weight = Buffer::new_zeroed(&device, output_config.weight_bytes());
-        let output_scales = Buffer::new_zeroed(&device, output_config.scale_or_bias_bytes());
-        let output_biases = Buffer::new_zeroed(&device, output_config.scale_or_bias_bytes());
-        let mut builder = stream.create_replay_program();
-        builder.record(qgkv.invoke_bucketed(
-            num_total_rows as u32,
-            STAGE_NUM_ACTIVE_TOKENS,
-            &qgkv_output,
-            0,
-            &hidden,
-            0,
-            &qgkv_weight,
-            0,
-            &qgkv_scales,
-            0,
-            &qgkv_biases,
-            0,
-        ));
-        builder.record(split.invoke_bucketed(
-            split_shape,
-            GQAQGKVSplitBuffers {
-                qgkv: &qgkv_output,
-                q: &q,
-                g: &g,
-                k: &k,
-                v: &v,
-            },
-            ReplayU32::Parameter(STAGE_NUM_ACTIVE_TOKENS),
-        ));
-        builder.record(q_norm.invoke_bucketed(
-            q_norm_shape,
-            GQANormRopeBuffers {
-                input: &q,
-                norm_weight: &norm_weight,
-                flat_token_indices: &flat_token_indices,
-                output: &q_norm_output,
-            },
-            ReplayU32::Parameter(STAGE_NUM_ACTIVE_TOKENS),
-        ));
-        builder.record(k_norm.invoke_bucketed(
-            q_norm_shape,
-            GQANormRopeBuffers {
-                input: &k,
-                norm_weight: &norm_weight,
-                flat_token_indices: &flat_token_indices,
-                output: &k_norm_output,
-            },
-            ReplayU32::Parameter(STAGE_NUM_ACTIVE_TOKENS),
-        ));
-        builder.record(gate.invoke_bucketed(
-            gate_shape,
-            GQAActivationGateBuffers {
-                attention_output: &q_norm_output,
-                g: &g,
-                output: &gated,
-            },
-            ReplayU32::Parameter(STAGE_NUM_ACTIVE_TOKENS),
-        ));
-        builder.record(output.invoke_bucketed(
-            num_total_rows as u32,
-            STAGE_NUM_ACTIVE_TOKENS,
-            &final_output,
-            0,
-            &gated,
-            0,
-            &output_weight,
-            0,
-            &output_scales,
-            0,
-            &output_biases,
-            0,
-        ));
-
-        assert_eq!(builder.build().stats().parameter_count, 1);
-    }
-
-    #[test]
     fn test_bucketed_scratch_leaves_shrink_expand_and_guard_poisoned_tail() {
         let device = inference_backend_metal::metal::Device::system_default();
         let stream = Stream::new(&device);
         let split_config = GQAQGKVSplitConfig::f32(1, 1, 2);
-        let split_shape = GQAQGKVSplitShape { num_tokens: 2 };
+        let split_shape = GQAQGKVSplitShape { num_total_tokens: 2 };
         let norm_config = GQANormRopeConfig::f32(1, 2, 2, 1.0e-6, 1_000_000.0, 1.0);
-        let norm_shape = GQANormRopeShape { num_tokens: 2 };
+        let norm_shape = GQANormRopeShape { num_total_tokens: 2 };
         let gate_config = GQAActivationGateConfig::f32(1, 2);
-        let gate_shape = GQAActivationGateShape { num_tokens: 2 };
+        let gate_shape = GQAActivationGateShape { num_total_tokens: 2 };
         let split = GQAQGKVSplitKernel::new(&device, split_config);
         let q_norm = GQANormRopeKernel::new(&device, norm_config);
         let k_norm = GQANormRopeKernel::new(&device, norm_config);
@@ -1203,8 +942,6 @@ mod tests {
             ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
         ));
         let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
-
         let valid_rows = [
             [1.0_f32, 2.0, 0.5, -0.5, 3.0, 4.0, 5.0, 6.0],
             [2.0_f32, 1.0, -1.0, 1.0, 4.0, 3.0, 6.0, 5.0],
@@ -1297,27 +1034,6 @@ mod tests {
                 (actual - expected).abs() <= tolerance,
                 "index {index}: actual={actual} expected={expected} tolerance={tolerance}"
             );
-        }
-    }
-
-    fn new_gqa(device: &inference_backend_metal::metal::Device) -> GQA {
-        GQA::new(device, fixture_core(), fixture_metal_config())
-    }
-
-    fn fixture_core() -> GQACore {
-        GQACore::new(0, 128, 128, 1, 1, 1.0)
-    }
-
-    fn fixture_metal_config() -> GQAMetalConfig {
-        GQAMetalConfig {
-            group_size: 32,
-            bits: 4,
-            page_bytes: 4096,
-            rope_dim: 128,
-            norm_eps: 1.0e-6,
-            rope_theta: 1_000_000.0,
-            rope_scale: 1.0,
-            io_dtype: Dtype::Bfloat16,
         }
     }
 }

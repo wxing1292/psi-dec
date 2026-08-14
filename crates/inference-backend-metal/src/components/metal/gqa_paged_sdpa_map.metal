@@ -22,11 +22,11 @@
 // kv_pages       : [num_pages, K/V, num_kv_heads, num_tokens, kv_head_dim]
 // req_slots      : [num_tokens]
 // page_ids       : [num_req_slots, num_gqa_layers, num_blocks, num_page_ids_per_block]
-// sdpa_map_task_templates : [total_sdpa_map_task_templates, q_token_tile_index/kv_token_begin/kv_token_end]
+// sdpa_map_task_templates : [num_total_sdpa_map_task_templates, q_token_tile_index/kv_token_begin/kv_token_end]
 //
-// partial_exp_sums       : [total_sdpa_map_task_templates, num_q_heads]
-// partial_max_logits     : [total_sdpa_map_task_templates, num_q_heads]
-// partial_output        : [total_sdpa_map_task_templates, num_q_heads, kv_head_dim]
+// partial_exp_sums       : [num_total_sdpa_map_task_templates, num_q_heads]
+// partial_max_logits     : [num_total_sdpa_map_task_templates, num_q_heads]
+// partial_output        : [num_total_sdpa_map_task_templates, num_q_heads, kv_head_dim]
 
 uint global_thread_index = thread_position_in_grid.x;
 uint thread_index_in_threadblock = global_thread_index % (uint)NUM_THREADS_PER_THREADBLOCK;

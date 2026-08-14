@@ -71,8 +71,8 @@ impl GQAFixture {
         let (mut sdpa_map_task_template_values, cu_sdpa_partial_output_values) =
             sdpa_map_task_template_plan(context_lens);
         let num_sdpa_map_task_templates = sdpa_map_task_template_values.len() as u32 / 3;
-        let total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
-        sdpa_map_task_template_values.resize(total_sdpa_map_task_templates as usize * 3, u32::MAX);
+        let num_total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
+        sdpa_map_task_template_values.resize(num_total_sdpa_map_task_templates as usize * 3, u32::MAX);
         let page_table_layout = GQAPageTableLayout {
             num_req_slots: num_tokens,
             num_blocks,
@@ -92,8 +92,8 @@ impl GQAFixture {
             dtype: Dtype::Bfloat16,
         };
         let shape = GQAPagedSDPAShape {
-            num_tokens,
-            total_sdpa_map_task_templates,
+            num_total_tokens: num_tokens,
+            num_total_sdpa_map_task_templates,
         };
         shape.validate(config);
 

@@ -73,9 +73,9 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
         },
     };
     let shape = GQATiledSDPAShape {
-        num_tokens: num_total_tokens as u32,
-        num_q_token_tiles: 2,
-        total_sdpa_map_task_templates: 2,
+        num_total_tokens: num_total_tokens as u32,
+        num_total_q_token_tiles: 2,
+        num_total_sdpa_map_task_templates: 2,
     };
     let q_values = pattern(num_total_tokens * num_q_heads * head_dim, 29, 0.015625);
     let k_values = pattern(num_total_tokens * head_dim, 31, 0.015625);
@@ -314,8 +314,8 @@ fn run_case(
     }
     let num_q_token_tiles = q_token_tile_values.len() / 2;
     let num_sdpa_map_task_templates = sdpa_map_task_template_values.len() / 3;
-    let total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
-    sdpa_map_task_template_values.resize(total_sdpa_map_task_templates * 3, u32::MAX);
+    let num_total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
+    sdpa_map_task_template_values.resize(num_total_sdpa_map_task_templates * 3, u32::MAX);
     let config = GQATiledSDPAConfig {
         num_q_heads: num_q_heads.try_into().unwrap(),
         num_kv_heads: num_kv_heads.try_into().unwrap(),
@@ -334,9 +334,9 @@ fn run_case(
         },
     };
     let shape = GQATiledSDPAShape {
-        num_tokens: num_tokens.try_into().unwrap(),
-        num_q_token_tiles: num_q_token_tiles.try_into().unwrap(),
-        total_sdpa_map_task_templates: total_sdpa_map_task_templates.try_into().unwrap(),
+        num_total_tokens: num_tokens.try_into().unwrap(),
+        num_total_q_token_tiles: num_q_token_tiles.try_into().unwrap(),
+        num_total_sdpa_map_task_templates: num_total_sdpa_map_task_templates.try_into().unwrap(),
     };
 
     let q_bf16 = q_values
@@ -403,7 +403,7 @@ fn run_case(
     let q_token_tiles = Buffer::from_slice(&device, &q_token_tile_values);
     let sdpa_map_task_templates = Buffer::from_slice(&device, &sdpa_map_task_template_values);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &cu_sdpa_partial_output_values);
-    let num_sdpa_partial_output_tokens = total_sdpa_map_task_templates * Q_TOKEN_TILE_SIZE as usize;
+    let num_sdpa_partial_output_tokens = num_total_sdpa_map_task_templates * Q_TOKEN_TILE_SIZE as usize;
     let partial_output = Buffer::new_zeroed(
         &device,
         num_sdpa_partial_output_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),

@@ -31,6 +31,8 @@ use crate::model::qwen::v3_x::weight::to_u32;
 
 pub struct Qwen3xDSparkAttention {
     dspark_layer_index: u32,
+    core: UngatedDSparkGQACore,
+    metal: GQAMetalConfig,
     weights: Option<Qwen3xUngatedGQAWeightBuffers>,
     backend: UngatedDSparkGQA,
     context_appender: UngatedDSparkGQAContextAppender,
@@ -42,7 +44,7 @@ pub struct Qwen3xDSparkAttention {
 impl Qwen3xDSparkAttention {
     pub fn new(
         device: &Device,
-        core: &UngatedDSparkGQACore,
+        core: UngatedDSparkGQACore,
         metal: GQAMetalConfig,
         dspark_layer_index: usize,
         state: &UngatedDSparkGQAState,
@@ -51,9 +53,11 @@ impl Qwen3xDSparkAttention {
             dspark_layer_index: dspark_layer_index
                 .try_into()
                 .expect("Qwen3 DSpark layer index must fit u32"),
+            core: core.clone(),
+            metal,
             weights: None,
             backend: UngatedDSparkGQA::new(device, core.clone(), metal),
-            context_appender: UngatedDSparkGQAContextAppender::new(device, core.clone(), metal),
+            context_appender: UngatedDSparkGQAContextAppender::new(device, core, metal),
             block_scratch: Some(state.block_scratch()),
             context_scratch: Some(state.context_scratch()),
             request_page_table: Some(state.request_page_table()),
@@ -64,8 +68,6 @@ impl Qwen3xDSparkAttention {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        core: &UngatedDSparkGQACore,
-        metal: GQAMetalConfig,
         bindings: Qwen3xGQAWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(
@@ -76,8 +78,8 @@ impl Qwen3xDSparkAttention {
             device,
             store,
             &bindings,
-            &core.attention,
-            metal,
+            &self.core.attention,
+            self.metal,
         )?);
         Ok(())
     }
@@ -194,7 +196,7 @@ impl Qwen3xDSparkAttention {
     }
 }
 
-pub fn qwen3x_dspark_gqa_core_and_metal(
+pub fn derive_qwen3x_dspark_gqa_configs(
     config: &Qwen3xDSparkConfig,
     num_spec_tokens: usize,
     dspark_layer_index: usize,
@@ -301,7 +303,7 @@ mod tests {
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
         let (core, metal) =
-            qwen3x_dspark_gqa_core_and_metal(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
+            derive_qwen3x_dspark_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
 
         assert_eq!(core.block_size, 7);
         assert_eq!(core.attention.model_layer_index, 1);
@@ -344,9 +346,9 @@ mod tests {
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
         let (_, layer_0_metal) =
-            qwen3x_dspark_gqa_core_and_metal(&config, 7, 0, &bindings.layers[0].gqa, 32 * 1024).unwrap();
+            derive_qwen3x_dspark_gqa_configs(&config, 7, 0, &bindings.layers[0].gqa, 32 * 1024).unwrap();
         let (_, layer_1_metal) =
-            qwen3x_dspark_gqa_core_and_metal(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
+            derive_qwen3x_dspark_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
 
         assert_eq!(layer_0_metal.bits, 4);
         assert_eq!(layer_1_metal.bits, 8);
@@ -387,7 +389,7 @@ mod tests {
         );
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
-        let error = qwen3x_dspark_gqa_core_and_metal(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap_err();
+        let error = derive_qwen3x_dspark_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap_err();
 
         assert!(error.to_string().contains("GQA requires one affine layout"));
     }

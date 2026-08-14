@@ -360,13 +360,13 @@ impl UngatedGQA {
 
     fn norm_rope_shape(&self, shape: GQAReplayShape) -> GQANormRopeShape {
         GQANormRopeShape {
-            num_tokens: shape.num_tokens,
+            num_total_tokens: shape.num_tokens,
         }
     }
 
     fn kv_page_write_shape(&self, shape: GQAReplayShape, page_table_layout: GQAPageTableLayout) -> GQAKVPageWriteShape {
         GQAKVPageWriteShape {
-            num_token_writes: shape.num_tokens,
+            num_total_token_writes: shape.num_tokens,
             page_table_layout: backend_page_table_layout(page_table_layout),
         }
     }
@@ -406,8 +406,8 @@ impl UngatedGQA {
 
     fn paged_sdpa_shape(&self, shape: GQAReplayShape) -> GQAPagedSDPAShape {
         GQAPagedSDPAShape {
-            num_tokens: shape.num_tokens,
-            total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+            num_total_tokens: shape.num_tokens,
+            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }
 
@@ -446,9 +446,9 @@ impl UngatedGQA {
 
     fn tiled_sdpa_shape(&self, shape: GQAReplayShape) -> GQATiledSDPAShape {
         GQATiledSDPAShape {
-            num_tokens: shape.num_tokens,
-            num_q_token_tiles: shape.num_q_token_tiles,
-            total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+            num_total_tokens: shape.num_tokens,
+            num_total_q_token_tiles: shape.num_q_token_tiles,
+            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }
 }

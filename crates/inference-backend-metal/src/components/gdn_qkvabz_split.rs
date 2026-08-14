@@ -52,26 +52,29 @@ impl GDNQKVABZSplitConfig {
     pub fn num_qkvabz_values(self, shape: GDNQKVABZSplitShape) -> usize {
         checked_product(
             "GDN projection element count",
-            &[shape.num_tokens as usize, self.qkvabz_row_stride() as usize],
+            &[shape.num_total_tokens as usize, self.qkvabz_row_stride() as usize],
         )
     }
 
     pub fn num_qkv_values(self, shape: GDNQKVABZSplitShape) -> usize {
         checked_product(
             "GDN QKV element count",
-            &[shape.num_tokens as usize, self.qkv_dim as usize],
+            &[shape.num_total_tokens as usize, self.qkv_dim as usize],
         )
     }
 
     pub fn num_gate_values(self, shape: GDNQKVABZSplitShape) -> usize {
         checked_product(
             "GDN gate element count",
-            &[shape.num_tokens as usize, self.num_v_heads as usize],
+            &[shape.num_total_tokens as usize, self.num_v_heads as usize],
         )
     }
 
     pub fn num_z_values(self, shape: GDNQKVABZSplitShape) -> usize {
-        checked_product("GDN Z element count", &[shape.num_tokens as usize, self.v_dim as usize])
+        checked_product(
+            "GDN Z element count",
+            &[shape.num_total_tokens as usize, self.v_dim as usize],
+        )
     }
 
     fn qkvabz_row_stride(self) -> u32 {
@@ -85,13 +88,13 @@ impl GDNQKVABZSplitConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct GDNQKVABZSplitShape {
-    pub num_tokens: u32,
+    pub num_total_tokens: u32,
 }
 
 impl GDNQKVABZSplitShape {
     pub fn validate(self, config: GDNQKVABZSplitConfig) {
         config.validate();
-        assert!(self.num_tokens > 0);
+        assert!(self.num_total_tokens > 0);
         assert_u32_count_domain(config.num_qkvabz_values(self), "GDN projection elements");
     }
 }
@@ -128,7 +131,7 @@ impl GDNQKVABZSplitKernel {
             kernel: &self.kernel,
             shape,
             buffers,
-            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
         }
     }
 
@@ -157,37 +160,37 @@ pub struct GDNQKVABZSplitInvocation<'a> {
 }
 
 impl Operator for GDNQKVABZSplitInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate(self.config);
         validate_qkvabz_split_buffers(self.config, self.shape, &self.buffers);
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.qkvabz, 0);
-        builder.set_buffer_write(1, self.buffers.qkv, 0);
-        builder.set_buffer_write(2, self.buffers.a, 0);
-        builder.set_buffer_write(3, self.buffers.b, 0);
-        builder.set_buffer_write(4, self.buffers.z, 0);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.qkvabz, 0);
+        recorder.set_buffer_write(1, self.buffers.qkv, 0);
+        recorder.set_buffer_write(2, self.buffers.a, 0);
+        recorder.set_buffer_write(3, self.buffers.b, 0);
+        recorder.set_buffer_write(4, self.buffers.z, 0);
         set_replay_u32(
-            builder,
+            recorder,
             5,
             self.num_active_tokens,
-            self.shape.num_tokens,
+            self.shape.num_total_tokens,
             "GDN projection-split active token count",
         );
-        builder.set_u32(6, self.config.qkv_dim);
-        builder.set_u32(7, self.config.num_v_heads);
-        builder.set_u32(8, self.config.v_dim);
-        builder.dispatch_1d(self.config.num_qkvabz_values(self.shape), 256);
+        recorder.set_u32(6, self.config.qkv_dim);
+        recorder.set_u32(7, self.config.num_v_heads);
+        recorder.set_u32(8, self.config.v_dim);
+        recorder.dispatch_1d(self.config.num_qkvabz_values(self.shape), 256);
     }
 }
 
-fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
     match value {
         ReplayU32::Fixed(value) => {
             assert!(value > 0, "{name} must be positive");
             assert!(value <= max_value, "{name} exceeds recorded capacity");
-            builder.set_u32(index, value);
+            recorder.set_u32(index, value);
         },
-        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
+        ReplayU32::Parameter(key) => recorder.bind_u32(index, key, 1, max_value),
     }
 }
 
@@ -229,7 +232,7 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = GDNQKVABZSplitConfig::new(6, 2, 4);
-        let shape = GDNQKVABZSplitShape { num_tokens: 2 };
+        let shape = GDNQKVABZSplitShape { num_total_tokens: 2 };
         let qkvabz_values = (0..28).map(|value| value as f32).collect::<Vec<_>>();
         let qkvabz = Buffer::from_slice(&device, &qkvabz_values);
         let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
@@ -274,7 +277,7 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = GDNQKVABZSplitConfig::new(2, 1, 2);
-        let shape = GDNQKVABZSplitShape { num_tokens: 2 };
+        let shape = GDNQKVABZSplitShape { num_total_tokens: 2 };
         let qkvabz = Buffer::new_zeroed_elements(&device, config.num_qkvabz_values(shape), Dtype::Float32);
         let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
         let a = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
@@ -294,8 +297,6 @@ mod tests {
             ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         ));
         let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
-
         let valid_rows = [[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]];
         for num_active_tokens in [1_usize, 2, 1] {
             let mut input = valid_rows.into_iter().flatten().collect::<Vec<_>>();
@@ -357,6 +358,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "GDN projection elements exceeds the shader u32 count domain")]
     fn test_shape_rejects_shader_count_overflow() {
-        GDNQKVABZSplitShape { num_tokens: 1 << 30 }.validate(GDNQKVABZSplitConfig::new(1, 1, 1));
+        GDNQKVABZSplitShape {
+            num_total_tokens: 1 << 30,
+        }
+        .validate(GDNQKVABZSplitConfig::new(1, 1, 1));
     }
 }

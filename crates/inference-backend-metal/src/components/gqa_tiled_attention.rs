@@ -116,10 +116,10 @@ impl GQATiledSDPAConfig {
         checked_product_u64(
             "GQA tiled query byte length",
             &[
-                u64::from(shape.num_tokens),
-                u64::from(self.num_q_heads),
-                u64::from(self.head_dim),
-                self.dtype.item_size().try_into().expect("dtype item size must fit u64"),
+                shape.num_total_tokens as u64,
+                self.num_q_heads as u64,
+                self.head_dim as u64,
+                self.dtype.item_size() as u64,
             ],
         )
     }
@@ -128,11 +128,11 @@ impl GQATiledSDPAConfig {
         checked_product_u64(
             "GQA tiled partial output byte length",
             &[
-                u64::from(shape.total_sdpa_map_task_templates),
-                u64::from(self.num_q_heads),
-                u64::from(self.q_token_tile_size),
-                u64::from(self.head_dim),
-                self.dtype.item_size().try_into().expect("dtype item size must fit u64"),
+                shape.num_total_sdpa_map_task_templates as u64,
+                self.num_q_heads as u64,
+                self.q_token_tile_size as u64,
+                self.head_dim as u64,
+                self.dtype.item_size() as u64,
             ],
         )
     }
@@ -141,10 +141,10 @@ impl GQATiledSDPAConfig {
         checked_product_u64(
             "GQA tiled partial statistic byte length",
             &[
-                u64::from(shape.total_sdpa_map_task_templates),
-                u64::from(self.num_q_heads),
-                u64::from(self.q_token_tile_size),
-                size_of::<f32>().try_into().expect("f32 item size must fit u64"),
+                shape.num_total_sdpa_map_task_templates as u64,
+                self.num_q_heads as u64,
+                self.q_token_tile_size as u64,
+                size_of::<f32>() as u64,
             ],
         )
     }
@@ -165,17 +165,17 @@ impl GQATiledSDPAConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GQATiledSDPAShape {
-    pub num_tokens: u32,
-    pub num_q_token_tiles: u32,
-    pub total_sdpa_map_task_templates: u32,
+    pub num_total_tokens: u32,
+    pub num_total_q_token_tiles: u32,
+    pub num_total_sdpa_map_task_templates: u32,
 }
 
 impl GQATiledSDPAShape {
     pub fn validate(self, config: GQATiledSDPAConfig) {
         config.validate();
-        assert!(self.num_tokens > 0);
-        assert!(self.num_q_token_tiles > 0 && self.num_q_token_tiles <= self.num_tokens);
-        assert!(self.total_sdpa_map_task_templates >= self.num_q_token_tiles);
+        assert!(self.num_total_tokens > 0);
+        assert!(self.num_total_q_token_tiles > 0 && self.num_total_q_token_tiles <= self.num_total_tokens);
+        assert!(self.num_total_sdpa_map_task_templates >= self.num_total_q_token_tiles);
         assert_u32_index_domain(self.num_q_token_tile_values(), "GQA tiled SDPA Q-token-tile metadata");
         assert_u32_index_domain(
             self.num_sdpa_map_task_template_values(),
@@ -186,19 +186,19 @@ impl GQATiledSDPAShape {
     fn num_q_token_tile_values(self) -> usize {
         checked_product(
             "GQA tiled SDPA Q-token-tile metadata element count",
-            &[self.num_q_token_tiles as usize, 2],
+            &[self.num_total_q_token_tiles as usize, 2],
         )
     }
 
     fn num_sdpa_map_task_template_values(self) -> usize {
         checked_product(
             "GQA tiled SDPA map TaskTemplate metadata element count",
-            &[self.total_sdpa_map_task_templates as usize, 3],
+            &[self.num_total_sdpa_map_task_templates as usize, 3],
         )
     }
 
     fn num_cu_sdpa_partial_output_values(self) -> usize {
-        self.num_q_token_tiles as usize + 1
+        self.num_total_q_token_tiles as usize + 1
     }
 }
 
@@ -269,9 +269,9 @@ impl GQATiledSDPAKernels {
             shape: self.shape,
             buffers,
             page_table_index,
-            num_active_tokens: ReplayU32::Fixed(self.shape.num_tokens),
-            num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_q_token_tiles),
-            num_active_sdpa_map_task_templates: ReplayU32::Fixed(self.shape.total_sdpa_map_task_templates),
+            num_active_tokens: ReplayU32::Fixed(self.shape.num_total_tokens),
+            num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_total_q_token_tiles),
+            num_active_sdpa_map_task_templates: ReplayU32::Fixed(self.shape.num_total_sdpa_map_task_templates),
         }
     }
 
@@ -301,7 +301,7 @@ impl GQATiledSDPAKernels {
             config: self.config,
             shape: self.shape,
             buffers,
-            num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_q_token_tiles),
+            num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_total_q_token_tiles),
         }
     }
 
@@ -338,9 +338,9 @@ impl Operator for GQATiledSDPAMapInvocation<'_> {
         shape.validate(config);
         assert!(self.buffers.q.len_bytes_u64() >= config.q_bytes(shape));
         assert!(self.buffers.kv_pages.len_bytes() >= config.page_bytes as usize);
-        assert!(self.buffers.req_slots.len_bytes() >= shape.num_tokens as usize * size_of::<u32>());
+        assert!(self.buffers.req_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
         assert!(self.buffers.page_ids.len_bytes() >= config.page_table_layout.bytes());
-        assert!(self.buffers.flat_token_indices.len_bytes() >= shape.num_tokens as usize * size_of::<u32>());
+        assert!(self.buffers.flat_token_indices.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
         assert!(self.buffers.q_token_tiles.len_bytes() >= shape.num_q_token_tile_values() * size_of::<u32>());
         assert!(
             self.buffers.sdpa_map_task_templates.len_bytes()
@@ -375,28 +375,28 @@ impl Operator for GQATiledSDPAMapInvocation<'_> {
             recorder,
             11,
             self.num_active_q_token_tiles,
-            shape.num_q_token_tiles,
+            shape.num_total_q_token_tiles,
             "GQA tiled SDPA active Q-token-tile count",
         );
         set_replay_u32(
             recorder,
             12,
             self.num_active_sdpa_map_task_templates,
-            shape.total_sdpa_map_task_templates,
+            shape.num_total_sdpa_map_task_templates,
             "GQA tiled SDPA active TaskTemplate count",
         );
         set_replay_u32(
             recorder,
             13,
             self.num_active_tokens,
-            shape.num_tokens,
+            shape.num_total_tokens,
             "GQA tiled SDPA active token count",
         );
         recorder.set_threadblock_memory_length(0, config.map_threadblock_memory_bytes());
         recorder.dispatch_threadblocks(
             (
                 config.num_head_groups(),
-                shape.total_sdpa_map_task_templates as usize,
+                shape.num_total_sdpa_map_task_templates as usize,
                 1,
             ),
             (config.num_threads_per_threadblock() as usize, 1, 1),
@@ -438,11 +438,11 @@ impl Operator for GQATiledSDPAReduceInvocation<'_> {
             recorder,
             6,
             self.num_active_q_token_tiles,
-            shape.num_q_token_tiles,
+            shape.num_total_q_token_tiles,
             "GQA tiled SDPA active Q-token-tile count",
         );
         recorder.dispatch_threadblocks(
-            (config.num_q_heads as usize, shape.num_q_token_tiles as usize, 1),
+            (config.num_q_heads as usize, shape.num_total_q_token_tiles as usize, 1),
             (config.num_threads_per_threadblock() as usize, 1, 1),
         );
     }
@@ -468,7 +468,7 @@ fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
 #define NUM_THREADS_PER_THREADBLOCK {num_threads_per_threadblock}
 {body}
 "#,
-        num_tokens = shape.num_tokens,
+        num_tokens = shape.num_total_tokens,
         num_q_heads = config.num_q_heads,
         num_kv_heads = config.num_kv_heads,
         q_head_tile_size = config.q_head_tile_size,
@@ -499,87 +499,5 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 }
 
 #[cfg(test)]
-mod tests {
-    use super::GQATiledSDPAConfig;
-    use super::GQATiledSDPAKernels;
-    use super::GQATiledSDPAShape;
-    use crate::components::GQAPageTableLayout;
-    use crate::metal::Device;
-    use crate::metal::Dtype;
-
-    #[test]
-    fn test_shape_accepts_qwen3_profile() {
-        let (config, shape) = tiled_workload(128, 8);
-        shape.validate(config);
-    }
-
-    #[test]
-    fn test_kernel_compiles_qwen3_profile() {
-        let device = Device::system_default();
-        let (config, shape) = tiled_workload(128, 8);
-
-        let _ = GQATiledSDPAKernels::new(&device, config, shape);
-    }
-
-    #[test]
-    #[should_panic(expected = "tiled GQA supports only")]
-    fn test_shape_rejects_unsupported_profile() {
-        let (config, shape) = tiled_workload(192, 8);
-        shape.validate(config);
-    }
-
-    #[test]
-    #[should_panic(expected = "GQA tiled SDPA Q-token-tile metadata exceeds the shader u32 element-index domain")]
-    fn test_shape_rejects_shader_index_overflow() {
-        let shape = GQATiledSDPAShape {
-            num_tokens: u32::MAX,
-            num_q_token_tiles: u32::MAX,
-            total_sdpa_map_task_templates: u32::MAX,
-        };
-        let config = GQATiledSDPAConfig {
-            num_q_heads: 1,
-            num_kv_heads: 1,
-            head_dim: 256,
-            q_head_tile_size: 1,
-            q_token_tile_size: 8,
-            kv_token_tile_size: 8,
-            scale: 1.0,
-            page_bytes: 16 * 2 * 256 * 2,
-            dtype: Dtype::Bfloat16,
-            page_table_layout: GQAPageTableLayout {
-                num_req_slots: 1,
-                num_gqa_layers: 1,
-                num_blocks: 1,
-                num_page_ids_per_block: 1,
-            },
-        };
-        shape.validate(config);
-    }
-
-    fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (GQATiledSDPAConfig, GQATiledSDPAShape) {
-        (
-            GQATiledSDPAConfig {
-                num_q_heads: 5,
-                num_kv_heads: 1,
-                head_dim,
-                q_head_tile_size: 5,
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                scale: 1.0,
-                page_bytes: 2 * num_tokens_per_page * head_dim * 2,
-                dtype: Dtype::Bfloat16,
-                page_table_layout: GQAPageTableLayout {
-                    num_req_slots: 1,
-                    num_gqa_layers: 1,
-                    num_blocks: 1,
-                    num_page_ids_per_block: 1,
-                },
-            },
-            GQATiledSDPAShape {
-                num_tokens: 8,
-                num_q_token_tiles: 1,
-                total_sdpa_map_task_templates: 1,
-            },
-        )
-    }
-}
+#[path = "gqa_tiled_attention_test.rs"]
+mod tests;

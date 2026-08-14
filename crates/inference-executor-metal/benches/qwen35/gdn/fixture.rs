@@ -227,10 +227,10 @@ impl<'a> RealGDNFixture<'a> {
         let conv_qkv = Buffer::new_zeroed(device, num_tokens as usize * GDN_CONV_DIM * size_of::<f32>());
         let recurrent_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
         let norm_gated_output = Buffer::new_zeroed(device, num_tokens as usize * GDN_V_DIM * size_of::<f32>());
-        let mut builder = MetalReplayRuntime::new(&stream).create_recorder();
+        let mut recorder = MetalReplayRuntime::new(&stream).create_recorder();
         let _ = <GDN as ReplayLayer>::record(
             &backend,
-            &mut builder,
+            &mut recorder,
             GDNInput {
                 hidden_state: &hidden_state,
                 next_hidden_state: &next_hidden_state,
@@ -258,7 +258,7 @@ impl<'a> RealGDNFixture<'a> {
                 replay_mode: inference_executor_metal::attn::gdn::backend::GDNReplayMode::Exact,
             },
         );
-        let replay = builder.build();
+        let replay = recorder.build();
         let fixture = Self {
             device: device.clone(),
             stream,
@@ -344,7 +344,7 @@ impl<'a> RealGDNFixture<'a> {
             &self.stream,
             qkvabz_to_qkv_a_b_z.invoke(
                 GDNQKVABZSplitShape {
-                    num_tokens: self.num_tokens,
+                    num_total_tokens: self.num_tokens,
                 },
                 GDNQKVABZSplitBuffers {
                     qkvabz: &self.qkvabz,
@@ -356,8 +356,8 @@ impl<'a> RealGDNFixture<'a> {
             ),
         );
         let compute_shape = GDNComputeShape {
-            num_reqs: self.num_reqs,
-            num_tokens: self.num_tokens,
+            num_total_reqs: self.num_reqs,
+            num_total_tokens: self.num_tokens,
         };
         let compute_buffers = GDNComputeBuffers {
             qkv: &self.qkv,

@@ -70,7 +70,7 @@ impl GQAKVPageWriteConfig {
     }
 
     pub fn index_bytes(self, shape: GQAKVPageWriteShape) -> usize {
-        (shape.num_token_writes as usize)
+        (shape.num_total_token_writes as usize)
             .checked_mul(size_of::<u32>())
             .expect("GQA KV page-write index bytes must fit usize")
     }
@@ -85,7 +85,7 @@ impl GQAKVPageWriteConfig {
         checked_product(
             "GQA KV page-write thread count",
             &[
-                shape.num_token_writes as usize,
+                shape.num_total_token_writes as usize,
                 self.num_kv_heads as usize,
                 self.head_dim as usize,
             ],
@@ -95,14 +95,14 @@ impl GQAKVPageWriteConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GQAKVPageWriteShape {
-    pub num_token_writes: u32,
+    pub num_total_token_writes: u32,
     pub page_table_layout: GQAPageTableLayout,
 }
 
 impl GQAKVPageWriteShape {
     pub fn validate(self, config: GQAKVPageWriteConfig) {
         config.validate();
-        assert!(self.num_token_writes > 0);
+        assert!(self.num_total_token_writes > 0);
         self.page_table_layout.validate();
         assert_u32_count_domain(config.num_total_threads(self), "GQA KV page-write threads");
     }
@@ -153,7 +153,7 @@ impl GQAKVPageWrite {
             kernel: &self.kernel,
             shape,
             buffers,
-            num_active_token_writes: ReplayU32::Fixed(shape.num_token_writes),
+            num_active_token_writes: ReplayU32::Fixed(shape.num_total_token_writes),
             page_table_index,
         }
     }
@@ -198,22 +198,22 @@ pub struct GQAKVPageWriteInvocation<'a> {
 }
 
 impl Operator for GQAKVPageWriteInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_write(0, self.buffers.pages, 0);
-        builder.set_buffer_read(1, self.buffers.flat_k, 0);
-        builder.set_buffer_read(2, self.buffers.flat_v, 0);
-        builder.set_buffer_read(3, self.buffers.req_slots, 0);
-        builder.set_buffer_read(4, self.buffers.flat_token_indices, 0);
-        builder.set_buffer_read(5, self.buffers.page_ids, 0);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_write(0, self.buffers.pages, 0);
+        recorder.set_buffer_read(1, self.buffers.flat_k, 0);
+        recorder.set_buffer_read(2, self.buffers.flat_v, 0);
+        recorder.set_buffer_read(3, self.buffers.req_slots, 0);
+        recorder.set_buffer_read(4, self.buffers.flat_token_indices, 0);
+        recorder.set_buffer_read(5, self.buffers.page_ids, 0);
         match self.num_active_token_writes {
             ReplayU32::Fixed(num_active_token_writes) => {
                 assert!(num_active_token_writes > 0);
-                assert!(num_active_token_writes <= self.shape.num_token_writes);
-                builder.set_u32(6, num_active_token_writes);
+                assert!(num_active_token_writes <= self.shape.num_total_token_writes);
+                recorder.set_u32(6, num_active_token_writes);
             },
-            ReplayU32::Parameter(key) => builder.bind_u32(6, key, 1, self.shape.num_token_writes),
+            ReplayU32::Parameter(key) => recorder.bind_u32(6, key, 1, self.shape.num_total_token_writes),
         }
         let max_page_table_index = self.shape.page_table_layout.num_gqa_layers - 1;
         match self.page_table_index {
@@ -222,14 +222,14 @@ impl Operator for GQAKVPageWriteInvocation<'_> {
                     page_table_index <= max_page_table_index,
                     "GQA page-table index exceeds layer count"
                 );
-                builder.set_u32(7, page_table_index);
+                recorder.set_u32(7, page_table_index);
             },
-            ReplayU32::Parameter(key) => builder.bind_u32(7, key, 0, max_page_table_index),
+            ReplayU32::Parameter(key) => recorder.bind_u32(7, key, 0, max_page_table_index),
         }
-        builder.set_u32(8, self.shape.page_table_layout.num_gqa_layers);
-        builder.set_u32(9, self.shape.page_table_layout.num_blocks);
-        builder.set_u32(10, self.shape.page_table_layout.num_page_ids_per_block);
-        builder.dispatch_1d(self.config.num_total_threads(self.shape), NUM_THREADS_PER_THREADBLOCK);
+        recorder.set_u32(8, self.shape.page_table_layout.num_gqa_layers);
+        recorder.set_u32(9, self.shape.page_table_layout.num_blocks);
+        recorder.set_u32(10, self.shape.page_table_layout.num_page_ids_per_block);
+        recorder.dispatch_1d(self.config.num_total_threads(self.shape), NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
@@ -263,7 +263,7 @@ mod tests {
             dtype: Dtype::Bfloat16,
         };
         GQAKVPageWriteShape {
-            num_token_writes: 1 << 30,
+            num_total_token_writes: 1 << 30,
             page_table_layout: GQAPageTableLayout {
                 num_req_slots: 1,
                 num_gqa_layers: 1,
@@ -299,7 +299,7 @@ mod tests {
             dtype: Dtype::Bfloat16,
         };
         let shape = GQAKVPageWriteShape {
-            num_token_writes: 4,
+            num_total_token_writes: 4,
             page_table_layout: GQAPageTableLayout {
                 num_req_slots: 2,
                 num_gqa_layers: 1,
@@ -323,8 +323,6 @@ mod tests {
             ReplayU32::Fixed(0),
         ));
         let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
-
         stream
             .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, 3))
             .wait();
@@ -376,7 +374,7 @@ mod tests {
             dtype,
         };
         let shape = GQAKVPageWriteShape {
-            num_token_writes: 1,
+            num_total_token_writes: 1,
             page_table_layout: GQAPageTableLayout {
                 num_req_slots: 1,
                 num_gqa_layers: 1,

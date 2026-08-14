@@ -168,7 +168,7 @@ impl UngatedDSparkGQAContextAppender {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.k_norm_rope.invoke(
             GQANormRopeShape {
-                num_tokens: input.num_tokens,
+                num_total_tokens: input.num_tokens,
             },
             GQANormRopeBuffers {
                 input: input.scratch.k,
@@ -179,7 +179,7 @@ impl UngatedDSparkGQAContextAppender {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
             GQAKVPageWriteShape {
-                num_token_writes: input.num_tokens,
+                num_total_token_writes: input.num_tokens,
                 page_table_layout: MetalGQAPageTableLayout {
                     num_req_slots: input.page_table_layout.num_req_slots,
                     num_gqa_layers: input.page_table_layout.num_gqa_layers,

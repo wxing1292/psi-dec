@@ -175,11 +175,15 @@ mod tests {
     }
 
     #[test]
-    fn test_selects_single_and_tiled_query_paths() {
-        let compute = GQACompute::new(config(256, 6, 16));
-        assert_eq!(compute.max_query_tokens_per_partial_output(), 8);
+    fn test_compute_path_selection_matrix() {
+        let tiled_256 = GQACompute::new(config(256, 6, 16));
+        let tiled_128 = GQACompute::new(config(128, 8, 8));
+        let unsupported = GQACompute::new(config(256, 8, 8));
+        let single_partial = GQACompute::new_dspark_history(config(128, 8, 8));
+
+        assert_eq!(tiled_256.max_query_tokens_per_partial_output(), 8);
         assert_eq!(
-            compute.select(4, 4),
+            tiled_256.select(4, 4),
             GQAComputePath::SingleQueryToken {
                 kv_token_tile_size: 256,
                 num_threads_per_threadblock: 256,
@@ -187,7 +191,7 @@ mod tests {
             }
         );
         assert_eq!(
-            compute.select(8, 4),
+            tiled_256.select(8, 4),
             GQAComputePath::TiledQueryTokens {
                 q_token_tile_size: 8,
                 kv_token_tile_size: 16,
@@ -195,41 +199,25 @@ mod tests {
             }
         );
         assert_eq!(
-            compute.select(16, 4),
+            tiled_256.select(16, 4),
             GQAComputePath::TiledQueryTokens {
                 q_token_tile_size: 8,
                 kv_token_tile_size: 16,
                 q_head_tile_size: 6,
             }
         );
-    }
-
-    #[test]
-    fn test_full_query_head_group_profile() {
-        let compute = GQACompute::new(config(128, 8, 8));
-        assert_eq!(compute.max_query_tokens_per_partial_output(), 8);
         assert_eq!(
-            compute.select(8, 4),
+            tiled_128.select(8, 4),
             GQAComputePath::TiledQueryTokens {
                 q_token_tile_size: 8,
                 kv_token_tile_size: 16,
                 q_head_tile_size: 8,
             }
         );
-    }
-
-    #[test]
-    fn test_unsupported_profile_uses_single_query_token_path() {
-        let compute = GQACompute::new(config(256, 8, 8));
-        assert_eq!(compute.max_query_tokens_per_partial_output(), 1);
-        assert!(matches!(compute.select(16, 4), GQAComputePath::SingleQueryToken { .. }));
-    }
-
-    #[test]
-    fn test_single_query_token_partial_constraint_disables_tiled_layout() {
-        let compute = GQACompute::new_dspark_history(config(128, 8, 8));
-        assert_eq!(compute.max_query_tokens_per_partial_output(), 1);
-        assert!(matches!(compute.select(16, 4), GQAComputePath::SingleQueryToken { .. }));
+        for compute in [unsupported, single_partial] {
+            assert_eq!(compute.max_query_tokens_per_partial_output(), 1);
+            assert!(matches!(compute.select(16, 4), GQAComputePath::SingleQueryToken { .. }));
+        }
     }
 
     #[test]

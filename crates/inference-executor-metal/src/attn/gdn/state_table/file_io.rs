@@ -4,7 +4,7 @@ use std::ops::Range;
 use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::gdn::request_state_table::GDNRequestSlots;
+use crate::attn::gdn::request_slots::GDNRequestSlots;
 use crate::attn::gdn::state_table::GDNRequestStateTable;
 use crate::model::state_snapshot::FullStateIO;
 use crate::model::state_snapshot::GDNStateSnapshotFiles;
@@ -130,14 +130,12 @@ fn selected_state_entry_ranges(
 ) -> Vec<Range<u32>> {
     let selected_request_count = request_slot_ranges
         .iter()
-        .map(|range| usize::try_from(range.end - range.start).expect("request slot range length must fit host usize"))
+        .map(|range| (range.end - range.start) as usize)
         .sum::<usize>();
     let mut state_slots = request_slot_ranges
         .iter()
         .flat_map(|range| range.clone())
-        .map(|req_slot| {
-            usize::try_from(current_state_slot(request_table, req_slot)).expect("GDN state slot must fit host usize")
-        })
+        .map(|req_slot| current_state_slot(request_table, req_slot) as usize)
         .collect::<Vec<_>>();
     state_slots.sort_unstable();
     state_slots.dedup();

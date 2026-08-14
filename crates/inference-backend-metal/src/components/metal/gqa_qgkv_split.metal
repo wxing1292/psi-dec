@@ -9,13 +9,13 @@ void gqa_qgkv_split_impl(
     device T* g,
     device T* k,
     device T* v,
-    constant uint& total_tokens,
+    constant uint& num_active_tokens,
     uint gid
 ) {
     const uint q_slots = num_q_heads * head_dim;
     const uint kv_slots = num_kv_heads * head_dim;
     const uint token_width = 2 * q_slots + 2 * kv_slots;
-    const uint total = total_tokens * token_width;
+    const uint total = num_active_tokens * token_width;
     if (gid >= total) return;
 
     const uint token = gid / token_width;
@@ -48,11 +48,11 @@ kernel void gqa_qgkv_split_f32(
     device float* g [[buffer(2)]],
     device float* k [[buffer(3)]],
     device float* v [[buffer(4)]],
-    constant uint& total_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     gqa_qgkv_split_impl<float>(
-        qgkv, q, g, k, v, total_tokens, gid);
+        qgkv, q, g, k, v, num_active_tokens, gid);
 }
 
 kernel void gqa_qgkv_split_bf16(
@@ -61,9 +61,9 @@ kernel void gqa_qgkv_split_bf16(
     device bfloat16_t* g [[buffer(2)]],
     device bfloat16_t* k [[buffer(3)]],
     device bfloat16_t* v [[buffer(4)]],
-    constant uint& total_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     gqa_qgkv_split_impl<bfloat16_t>(
-        qgkv, q, g, k, v, total_tokens, gid);
+        qgkv, q, g, k, v, num_active_tokens, gid);
 }

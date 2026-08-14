@@ -56,6 +56,7 @@ crates/inference-executor-metal/src/model/qwen/
 
 crates/inference-backend-metal/src/components/
   gqa_attention.rs          reusable Metal paged SDPA component kernels
+  gqa_attention_test.rs     paged SDPA Metal parity and replay contracts
   gqa_block_attention.rs    reusable dense bidirectional block-SDPA partial kernel
   gqa_compute.rs            backend-owned GQA compute-path selection and geometry
   gqa_qgkv_split.rs         gated QGKV split component
@@ -63,6 +64,8 @@ crates/inference-backend-metal/src/components/
   gqa_norm_rope.rs          reusable Metal q/k fused and single-input norm/RoPE component kernels
   gqa_kv_page_write.rs      reusable Metal KV page-write component
   gqa_tiled_attention.rs    reusable token/Q-head tiled paged SDPA component
+  gqa_tiled_attention_test.rs
+                            tiled SDPA Metal parity and padded replay contracts
   metal/
     gqa_qgkv_split.metal       gated QGKV split source
     gqa_qkv_split.metal        ungated QKV split source
@@ -172,16 +175,22 @@ page_ids[req_slot, gqa_layer_index, block_index, page_id_index] -> runtime KV pa
 
 The runtime still owns physical page allocation and release.
 
+Construction validates the complete flat table capacity. Entry updates and request-slot resets use direct flat-index
+arithmetic after this proof. Debug bounds protect private invocation errors.
+
 `GQAMetadataBuffers` stores the GPU arrays shared by every GQA layer in one model replay:
 
 ```text
 req_slots[num_tokens]
 flat_token_indices[num_tokens]
 q_token_tiles[num_q_token_tiles][flat_token_start/flat_token_end]  // TiledQueryTokens
-sdpa_map_task_templates[total_sdpa_map_task_templates][q_token_tile_index/kv_token_begin/kv_token_end]
+sdpa_map_task_templates[num_total_sdpa_map_task_templates][q_token_tile_index/kv_token_begin/kv_token_end]
 cu_sdpa_partial_outputs[num_tokens + 1]                              // SingleQueryToken
 cu_sdpa_partial_outputs[num_q_token_tiles + 1]                       // TiledQueryTokens
 ```
+
+Metadata preparation validates cumulative-token monotonicity and request context ranges before it builds the token and
+tile arrays. The builders use direct request-local arithmetic after this proof.
 
 Each three-`u32` entry materializes one compact `SDPAMapTaskTemplate`. It contains a Q-token-tile index followed by the
 half-open KV-token segment.
@@ -198,9 +207,9 @@ for one Q-token tile are contiguous.
 For a fixed Q-token/head output coordinate, adjacent `cu_sdpa_partial_outputs` values select the
 `SDPAPartialOutput`s for the reducer.
 
-`total_sdpa_map_task_templates` is the recorded replay capacity. The legacy exact-token metadata path uses its existing
-power-of-two padding. The bucketed Qwen3.5 path uses the shared replay bucket policy. Unused tail TaskTemplates contain
-an invalid Q-token-tile index and do not write a map result.
+`num_total_sdpa_map_task_templates` is the recorded replay capacity. The legacy exact-token metadata path retains its
+existing padded extent. The bucketed Qwen3.5 path uses the shared replay bucket policy. Unused tail TaskTemplates
+contain an invalid Q-token-tile index and do not write a map result.
 
 The `SingleQueryToken` paged map also permits an invalid-Q-token-tile `SDPAMapTaskTemplate` in one token's TaskTemplate
 range. This template does not write a paged partial output for that slot.
@@ -308,8 +317,8 @@ Immutable head, dtype, page, scale, and backend-selected tile choices become sou
 Replay work determines the cached recorded variant. This work includes `num_tokens`, Q-token tiles, the total map
 TaskTemplate extent, and the selected Q-head tile width.
 
-Paged partial-output reduce also generates source for stable Q-head and head-dimension geometry. It keeps `num_tokens`
-as a replay argument.
+Paged partial-output reduce also generates source for stable Q-head and head-dimension geometry. It keeps the active
+token count as a replay argument.
 
 The common kernel source-hash cache reuses identical generated pipelines. This specialization does not introduce
 model-specific backend types or names.
@@ -321,8 +330,8 @@ Paged `SingleQueryToken` SDPA exposes static geometry/tuning separately from dyn
 
 ```text
 GQAPagedSDPAConfig              GQAPagedSDPAShape
-  num_q_heads                     num_tokens
-  num_kv_heads                    total_sdpa_map_task_templates
+  num_q_heads                     num_total_tokens
+  num_kv_heads                    num_total_sdpa_map_task_templates
   head_dim
   scale
   page_bytes
@@ -333,7 +342,7 @@ GQAPagedSDPAConfig              GQAPagedSDPAShape
   io_dtype
 ```
 
-`total_sdpa_map_task_templates` is the padded extent of compact TaskTemplates. It is not the raw number of KV-token
+`num_total_sdpa_map_task_templates` is the padded extent of compact TaskTemplates. It is not the raw number of KV-token
 tiles.
 
 One TaskTemplate can cover several consecutive KV-token tiles. The planner rounds up
@@ -356,6 +365,8 @@ model, quantization, storage, and RoPE facts. The backend derives Metal SDPA tun
 the shared norm/RoPE, KV-update, paged-SDPA, and output-projection components.
 
 The Qwen GQA weight owner loads one bounded `TensorMap` from its exact GQA binding subtree.
+It retains the core and `GQAMetalConfig` values that created the backend.
+Weight reload uses these retained values.
 It removes Q/K/V, norm, and output tensors from that map.
 It then materializes the fused QGKV or QKV buffers required by the selected backend ABI.
 The map must be empty after construction.
@@ -404,11 +415,11 @@ The replay shape separates fixed page-table layout from active work and recorded
 
 ```text
 num_tokens                         active flat Q tokens in the microbatch
-total_tokens                       recorded flat-Q-token capacity
+num_total_tokens                   recorded flat-Q-token capacity
 num_q_token_tiles                  active request-local Q-token tiles
-total_q_token_tiles                recorded Q-token-tile capacity
+num_total_q_token_tiles            recorded Q-token-tile capacity
 num_sdpa_map_task_templates        active SDPA map TaskTemplates
-total_sdpa_map_task_templates      recorded SDPA map TaskTemplate capacity
+num_total_sdpa_map_task_templates  recorded SDPA map TaskTemplate capacity
 reduce_sdpa_partial_outputs        whether the active batch plan semantically requires partial reduction
 ```
 
@@ -430,7 +441,7 @@ to tokens, Q-token tiles, and TaskTemplates. Both methods derive and store the s
 GQA does not apply its token bucket policy again on this path. GQA still selects Q-token-tile and TaskTemplate
 capacities with its private policies.
 
-The caller-owned token capacity must satisfy `num_tokens <= total_tokens <= max_tokens`. It must also preserve the
+The caller-owned token capacity must satisfy `num_tokens <= num_total_tokens <= max_tokens`. It must also preserve the
 QGKV and output affine topologies selected for `num_tokens`. GQA validates these topologies during preparation and
 recording. The recording check prevents a direct metadata update from bypassing the topology contract.
 
@@ -868,6 +879,10 @@ random ragged batch.
 
 Another case uses one TaskTemplate that spans multiple KV-token tiles. The cases validate compact TaskTemplate
 indexing, online-softmax tile merging, request slots, page-table lookup, and causal visibility.
+
+`gqa_tiled_attention_test.rs` compares the BF16 tiled map and reduce path with the same CPU reference. One bucketed replay
+executes `5 -> 8 -> 5` active tokens. The test poisons inactive query, KV, request-slot, and token-index inputs. It checks
+the active output and verifies that inactive partial-output, statistic, and final-output tails remain unchanged.
 
 Metal backend component replay sanity lives in:
 

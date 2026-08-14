@@ -10,7 +10,7 @@ void gqa_norm_rope_impl(
     device const bfloat16_t* norm_weight,
     device const uint* flat_token_indices,
     device T* output,
-    constant uint& num_tokens,
+    constant uint& num_active_tokens,
     threadgroup float* local_inv_mean,
     threadgroup float* local_sums,
     uint gid,
@@ -20,7 +20,7 @@ void gqa_norm_rope_impl(
     uint simd_group_id
 ) {
     const uint row = gid;
-    const uint total_rows = num_tokens * num_heads;
+    const uint total_rows = num_active_tokens * num_heads;
     if (row >= total_rows) return;
 
     const uint token_index = row / num_heads;
@@ -88,7 +88,7 @@ kernel void gqa_norm_rope_f32(
     device const bfloat16_t* norm_weight [[buffer(1)]],
     device const uint* flat_token_indices [[buffer(2)]],
     device float* output [[buffer(3)]],
-    constant uint& num_tokens [[buffer(4)]],
+    constant uint& num_active_tokens [[buffer(4)]],
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint lsize [[threads_per_threadgroup]],
@@ -98,7 +98,7 @@ kernel void gqa_norm_rope_f32(
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
     gqa_norm_rope_impl<float>(
-        input, norm_weight, flat_token_indices, output, num_tokens,
+        input, norm_weight, flat_token_indices, output, num_active_tokens,
         local_inv_mean, local_sums, gid, lid, lsize, simd_lane_id, simd_group_id);
 }
 
@@ -107,7 +107,7 @@ kernel void gqa_norm_rope_bf16(
     device const bfloat16_t* norm_weight [[buffer(1)]],
     device const uint* flat_token_indices [[buffer(2)]],
     device bfloat16_t* output [[buffer(3)]],
-    constant uint& num_tokens [[buffer(4)]],
+    constant uint& num_active_tokens [[buffer(4)]],
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint lsize [[threads_per_threadgroup]],
@@ -117,6 +117,6 @@ kernel void gqa_norm_rope_bf16(
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
     gqa_norm_rope_impl<bfloat16_t>(
-        input, norm_weight, flat_token_indices, output, num_tokens,
+        input, norm_weight, flat_token_indices, output, num_active_tokens,
         local_inv_mean, local_sums, gid, lid, lsize, simd_lane_id, simd_group_id);
 }

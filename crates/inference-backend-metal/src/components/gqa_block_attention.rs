@@ -67,7 +67,10 @@ impl GQABlockSDPAConfig {
     fn partial_output_stat_elements(self, shape: GQABlockSDPAShape) -> usize {
         checked_product(
             "GQA block SDPA partial-output statistic element count",
-            &[shape.total_sdpa_map_task_templates as usize, self.num_q_heads as usize],
+            &[
+                shape.num_total_sdpa_map_task_templates as usize,
+                self.num_q_heads as usize,
+            ],
         )
     }
 
@@ -98,7 +101,7 @@ impl GQABlockSDPAConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GQABlockSDPAShape {
     pub num_tokens: u32,
-    pub total_sdpa_map_task_templates: u32,
+    pub num_total_sdpa_map_task_templates: u32,
 }
 
 impl GQABlockSDPAShape {
@@ -110,7 +113,7 @@ impl GQABlockSDPAShape {
             0,
             "GQA block SDPA tokens must contain complete request blocks"
         );
-        assert!(self.total_sdpa_map_task_templates >= self.num_tokens);
+        assert!(self.num_total_sdpa_map_task_templates >= self.num_tokens);
         assert_u32_count_domain(config.q_elements(self), "GQA block SDPA Q");
         assert_u32_count_domain(config.kv_elements(self), "GQA block SDPA K/V");
         assert_u32_index_domain(
@@ -213,18 +216,18 @@ pub struct GQABlockSDPAInvocation<'a> {
 }
 
 impl Operator for GQABlockSDPAInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.q, 0);
-        builder.set_buffer_read(1, self.buffers.local_k, 0);
-        builder.set_buffer_read(2, self.buffers.local_v, 0);
-        builder.set_buffer_read(3, self.buffers.block_sdpa_map_task_template_indices, 0);
-        builder.set_buffer_write(4, self.buffers.partial_exp_sums, 0);
-        builder.set_buffer_write(5, self.buffers.partial_max_logits, 0);
-        builder.set_buffer_write(6, self.buffers.partial_output, 0);
-        builder.set_u32(7, self.shape.num_tokens);
-        builder.dispatch_1d(
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.q, 0);
+        recorder.set_buffer_read(1, self.buffers.local_k, 0);
+        recorder.set_buffer_read(2, self.buffers.local_v, 0);
+        recorder.set_buffer_read(3, self.buffers.block_sdpa_map_task_template_indices, 0);
+        recorder.set_buffer_write(4, self.buffers.partial_exp_sums, 0);
+        recorder.set_buffer_write(5, self.buffers.partial_max_logits, 0);
+        recorder.set_buffer_write(6, self.buffers.partial_output, 0);
+        recorder.set_u32(7, self.shape.num_tokens);
+        recorder.dispatch_1d(
             self.config.dispatch_threads(self.shape),
             NUM_THREADS_PER_THREADBLOCK as usize,
         );

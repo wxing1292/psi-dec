@@ -26,6 +26,8 @@ mod file_io;
 
 pub struct Qwen3MainGQA {
     model_layer_index: usize,
+    core: UngatedGQACore,
+    metal: GQAMetalConfig,
     weights: Option<Qwen3xUngatedGQAWeightBuffers>,
     backend: Option<Rc<UngatedGQA>>,
     scratch: Option<Rc<UngatedGQAScratch>>,
@@ -45,9 +47,11 @@ pub struct Qwen3MainGQAState {
 }
 
 impl Qwen3MainGQA {
-    pub fn new(core: &UngatedGQACore, state: &Qwen3MainGQAState) -> Self {
+    pub fn new(core: UngatedGQACore, metal: GQAMetalConfig, state: &Qwen3MainGQAState) -> Self {
         Self {
             model_layer_index: core.model_layer_index,
+            core,
+            metal,
             weights: None,
             backend: Some(Rc::clone(state.backend())),
             scratch: Some(Rc::clone(state.scratch())),
@@ -59,13 +63,11 @@ impl Qwen3MainGQA {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        core: &UngatedGQACore,
-        metal: GQAMetalConfig,
         bindings: Qwen3xGQAWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(self.weights.is_none(), "Qwen3 Main GQA weights are already loaded");
         self.weights = Some(Qwen3xUngatedGQAWeightBuffers::load(
-            device, store, &bindings, core, metal,
+            device, store, &bindings, &self.core, self.metal,
         )?);
         Ok(())
     }

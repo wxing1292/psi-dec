@@ -70,16 +70,9 @@ impl GQARequestPageTable {
 
     pub fn reset_req_slot(&self, req_slot: u32) {
         self.assert_req_slot(req_slot);
-        let start = self
-            .page_ids_start_index(req_slot, 0, 0)
-            .checked_mul(size_of::<u32>())
-            .expect("GQA request page-table reset byte offset must fit usize");
-        let len = self
-            .num_layers()
-            .checked_mul(self.num_blocks())
-            .and_then(|count| count.checked_mul(self.num_page_ids_per_block()))
-            .and_then(|count| count.checked_mul(size_of::<u32>()))
-            .expect("GQA request page-table reset byte length must fit usize");
+        let start = self.page_ids_start_index(req_slot, 0, 0) * size_of::<u32>();
+        let len = self.page_ids_per_request() * size_of::<u32>();
+        debug_assert!(start + len <= self.page_ids_buffer().len_bytes());
         self.page_ids_buffer().zero_bytes(start, len);
     }
 
@@ -117,21 +110,14 @@ impl GQARequestPageTable {
     }
 
     fn page_ids_start_index(&self, req_slot: u32, layer_index: usize, block_index: usize) -> usize {
-        usize::try_from(req_slot)
-            .expect("GQA request slot must fit host usize")
-            .checked_mul(self.num_layers())
-            .and_then(|index| index.checked_add(layer_index))
-            .and_then(|index| index.checked_mul(self.num_blocks()))
-            .and_then(|index| index.checked_add(block_index))
-            .and_then(|index| index.checked_mul(self.num_page_ids_per_block()))
-            .expect("GQA request page-table flat index must fit usize")
+        let index = (((req_slot as usize * self.num_layers()) + layer_index) * self.num_blocks() + block_index)
+            * self.num_page_ids_per_block();
+        debug_assert!(index + self.num_page_ids_per_block() <= self.layout.num_page_ids());
+        index
     }
 
     fn page_ids_per_request(&self) -> usize {
-        self.num_layers()
-            .checked_mul(self.num_blocks())
-            .and_then(|count| count.checked_mul(self.num_page_ids_per_block()))
-            .expect("GQA request page-table row length must fit usize")
+        self.num_layers() * self.num_blocks() * self.num_page_ids_per_block()
     }
 }
 
@@ -152,7 +138,7 @@ mod tests {
         GQAStateSnapshotFiles::new(StateSnapshotFile::MainGQARequestPageTable);
 
     #[test]
-    fn test_read_write() {
+    fn test_page_table_lifecycle_resets_selected_requests_and_preserves_neighbors() {
         let device = Device::system_default();
         let page_table = GQARequestPageTable::new(
             &device,
@@ -177,32 +163,14 @@ mod tests {
         assert_eq!(page_table.read_page_ids(1, 0, 0), vec![10, 11]);
         assert_eq!(page_table.read_page_ids(1, 0, 1), vec![12, 13]);
         assert_eq!(page_table.read_page_ids(1, 2, 0), vec![20, 21]);
-    }
 
-    #[test]
-    fn test_reset() {
-        let device = Device::system_default();
-        let page_table = GQARequestPageTable::new(
-            &device,
-            GQAPageTableLayout {
-                num_req_slots: 4,
-                num_gqa_layers: 3,
-                num_blocks: 6,
-                num_page_ids_per_block: 2,
-            },
-        );
+        page_table.reset_req_slot(1);
 
-        page_table.write_page_ids(0, 1, 0, &[100, 101]);
-        page_table.write_page_ids(2, 0, 0, &[200, 201]);
-        page_table.write_page_ids(2, 2, 0, &[220, 221]);
-        page_table.write_page_ids(3, 1, 0, &[300, 301]);
-
-        page_table.reset_req_slot(2);
-
-        assert_eq!(page_table.read_page_ids(0, 1, 0), vec![100, 101]);
-        assert_eq!(page_table.read_page_ids(2, 0, 0), vec![0, 0]);
-        assert_eq!(page_table.read_page_ids(2, 2, 0), vec![0, 0]);
-        assert_eq!(page_table.read_page_ids(3, 1, 0), vec![300, 301]);
+        assert_eq!(page_table.read_page_ids(1, 0, 0), vec![0, 0]);
+        assert_eq!(page_table.read_page_ids(1, 0, 1), vec![0, 0]);
+        assert_eq!(page_table.read_page_ids(1, 2, 0), vec![0, 0]);
+        assert_eq!(page_table.read_page_ids(2, 1, 0), vec![30, 31]);
+        assert_eq!(page_table.read_page_ids(3, 0, 0), vec![40, 41]);
     }
 
     #[test]

@@ -644,9 +644,9 @@ fn build_single_invocation_replay<I>(stream: &Stream, invocation: I) -> ReplayPr
 where
     I: Operator,
 {
-    let mut builder = MetalReplayRuntime::new(stream).create_recorder();
-    builder.record(ReplayOp::opaque(invocation));
-    builder.build()
+    let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
+    recorder.record(ReplayOp::opaque(invocation));
+    recorder.build()
 }
 
 fn gqa_qgkv_affine_config(model: GQAModelProfile) -> AffineQuantizedMatmulConfig {
@@ -693,7 +693,9 @@ fn gqa_norm_rope_config(num_heads: usize, model: GQAModelProfile) -> GQANormRope
 }
 
 fn gqa_norm_rope_shape(num_tokens: u32, _num_heads: usize, _model: GQAModelProfile) -> GQANormRopeShape {
-    GQANormRopeShape { num_tokens }
+    GQANormRopeShape {
+        num_total_tokens: num_tokens,
+    }
 }
 
 fn gqa_kv_page_write_config(model: GQAModelProfile, page_bytes: u32) -> GQAKVPageWriteConfig {
@@ -736,8 +738,8 @@ fn gqa_sdpa_config(
 
 fn gqa_sdpa_shape(replay_shape: GQAReplayShape) -> GQAPagedSDPAShape {
     GQAPagedSDPAShape {
-        num_tokens: replay_shape.num_tokens,
-        total_sdpa_map_task_templates: replay_shape.total_sdpa_map_task_templates,
+        num_total_tokens: replay_shape.num_tokens,
+        num_total_sdpa_map_task_templates: replay_shape.num_total_sdpa_map_task_templates,
     }
 }
 

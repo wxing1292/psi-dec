@@ -76,7 +76,7 @@ impl GDNComputeConfig {
         checked_product(
             "GDN output element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_v_heads as usize,
                 self.v_head_dim as usize,
             ],
@@ -86,7 +86,7 @@ impl GDNComputeConfig {
     pub fn num_qkv_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN convolution element count",
-            &[shape.num_tokens as usize, self.qkv_dim() as usize],
+            &[shape.num_total_tokens as usize, self.qkv_dim() as usize],
         )
     }
 
@@ -94,7 +94,7 @@ impl GDNComputeConfig {
         checked_product(
             "GDN convolution state element count",
             &[
-                shape.num_reqs as usize,
+                shape.num_total_reqs as usize,
                 self.qkv_dim() as usize,
                 self.conv_state_len() as usize,
             ],
@@ -105,7 +105,7 @@ impl GDNComputeConfig {
         checked_product(
             "GDN candidate convolution state element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.qkv_dim() as usize,
                 self.conv_state_len() as usize,
             ],
@@ -123,7 +123,7 @@ impl GDNComputeConfig {
         checked_product(
             "GDN output norm + gate thread count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_v_heads as usize,
                 OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK,
             ],
@@ -181,14 +181,14 @@ impl GDNComputeConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct GDNComputeShape {
-    pub num_reqs: u32,
-    pub num_tokens: u32,
+    pub num_total_reqs: u32,
+    pub num_total_tokens: u32,
 }
 
 impl GDNComputeShape {
     fn validate(self) {
-        assert!(self.num_reqs > 0);
-        assert!(self.num_tokens > 0);
+        assert!(self.num_total_reqs > 0);
+        assert!(self.num_total_tokens > 0);
     }
 }
 
@@ -288,15 +288,15 @@ impl GDNCompute {
 
     pub fn invoke<'a>(&'a self, shape: GDNComputeShape, buffers: GDNComputeBuffers<'a>) -> GDNComputeInvocation<'a> {
         assert!(
-            shape.num_tokens >= shape.num_reqs,
+            shape.num_total_tokens >= shape.num_total_reqs,
             "GDN ragged recurrent requires at least one token per request"
         );
         GDNComputeInvocation {
             compute: self,
             shape,
             buffers,
-            num_active_reqs: ReplayU32::Fixed(shape.num_reqs),
-            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+            num_active_reqs: ReplayU32::Fixed(shape.num_total_reqs),
+            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
         }
     }
 
@@ -322,15 +322,15 @@ impl GDNCompute {
         buffers: GDNComputeBuffers<'a>,
     ) -> GDNComputeWithCandidateStateUpdateInvocation<'a> {
         assert!(
-            shape.num_tokens >= shape.num_reqs,
+            shape.num_total_tokens >= shape.num_total_reqs,
             "GDN ragged recurrent requires at least one token per request"
         );
         GDNComputeWithCandidateStateUpdateInvocation {
             compute: self,
             shape,
             buffers,
-            num_active_reqs: ReplayU32::Fixed(shape.num_reqs),
-            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+            num_active_reqs: ReplayU32::Fixed(shape.num_total_reqs),
+            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
         }
     }
 
@@ -352,53 +352,53 @@ impl GDNCompute {
 
     fn record_short_conv(
         &self,
-        builder: &CommandRecorder,
+        recorder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
         write_final_state: bool,
     ) {
-        builder.set_kernel(&self.short_conv);
-        builder.set_buffer_write(0, buffers.conv_qkv, 0);
-        builder.set_buffer_write(1, buffers.next_conv_state, 0);
-        builder.set_buffer_read(2, buffers.qkv, 0);
-        builder.set_buffer_read(3, buffers.conv_state, 0);
-        builder.set_buffer_read(4, buffers.conv_weight, 0);
-        builder.set_buffer_read(5, buffers.src_conv_state_slots, 0);
-        builder.set_buffer_read(6, buffers.flat_materialized_conv_state_slots, 0);
-        builder.set_buffer_read(7, buffers.cu_tokens, 0);
-        set_batch_args(builder, shape, 8, num_active_reqs, num_active_tokens);
-        builder.set_u64(10, buffers.conv_state_offset_bytes);
-        builder.set_u64(11, buffers.next_conv_state_offset_bytes);
-        builder.set_u32(12, u32::from(write_final_state));
+        recorder.set_kernel(&self.short_conv);
+        recorder.set_buffer_write(0, buffers.conv_qkv, 0);
+        recorder.set_buffer_write(1, buffers.next_conv_state, 0);
+        recorder.set_buffer_read(2, buffers.qkv, 0);
+        recorder.set_buffer_read(3, buffers.conv_state, 0);
+        recorder.set_buffer_read(4, buffers.conv_weight, 0);
+        recorder.set_buffer_read(5, buffers.src_conv_state_slots, 0);
+        recorder.set_buffer_read(6, buffers.flat_materialized_conv_state_slots, 0);
+        recorder.set_buffer_read(7, buffers.cu_tokens, 0);
+        set_batch_args(recorder, shape, 8, num_active_reqs, num_active_tokens);
+        recorder.set_u64(10, buffers.conv_state_offset_bytes);
+        recorder.set_u64(11, buffers.next_conv_state_offset_bytes);
+        recorder.set_u32(12, u32::from(write_final_state));
         let total_short_conv_threads = self
             .config
             .num_qkv_values(shape)
             .max(self.config.num_conv_state_values(shape));
-        builder.dispatch_1d(total_short_conv_threads, SHORT_CONV_NUM_THREADS_PER_THREADBLOCK);
+        recorder.dispatch_1d(total_short_conv_threads, SHORT_CONV_NUM_THREADS_PER_THREADBLOCK);
     }
 
     fn record_forward_conv_candidate_state(
         &self,
-        builder: &CommandRecorder,
+        recorder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) {
-        builder.set_kernel(&self.forward_conv_candidate_state);
-        builder.set_barrier_before();
-        builder.set_buffer_write(0, buffers.next_conv_state, 0);
-        builder.set_buffer_read(1, buffers.qkv, 0);
-        builder.set_buffer_read(2, buffers.conv_state, 0);
-        builder.set_buffer_read(3, buffers.src_conv_state_slots, 0);
-        builder.set_buffer_read(4, buffers.flat_materialized_conv_state_slots, 0);
-        builder.set_buffer_read(5, buffers.cu_tokens, 0);
-        set_batch_args(builder, shape, 6, num_active_reqs, num_active_tokens);
-        builder.set_u64(8, buffers.conv_state_offset_bytes);
-        builder.set_u64(9, buffers.next_conv_state_offset_bytes);
-        builder.dispatch_1d(
+        recorder.set_kernel(&self.forward_conv_candidate_state);
+        recorder.set_barrier_before();
+        recorder.set_buffer_write(0, buffers.next_conv_state, 0);
+        recorder.set_buffer_read(1, buffers.qkv, 0);
+        recorder.set_buffer_read(2, buffers.conv_state, 0);
+        recorder.set_buffer_read(3, buffers.src_conv_state_slots, 0);
+        recorder.set_buffer_read(4, buffers.flat_materialized_conv_state_slots, 0);
+        recorder.set_buffer_read(5, buffers.cu_tokens, 0);
+        set_batch_args(recorder, shape, 6, num_active_reqs, num_active_tokens);
+        recorder.set_u64(8, buffers.conv_state_offset_bytes);
+        recorder.set_u64(9, buffers.next_conv_state_offset_bytes);
+        recorder.dispatch_1d(
             self.config.num_candidate_conv_state_values(shape),
             SHORT_CONV_NUM_THREADS_PER_THREADBLOCK,
         );
@@ -423,32 +423,38 @@ impl GDNCompute {
     /// No Task value, TaskTemplate, or ABI buffer is materialized.
     fn record_ragged_recurrent(
         &self,
-        builder: &CommandRecorder,
+        recorder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
         num_active_reqs: ReplayU32,
     ) {
-        builder.set_kernel(&self.ragged_recurrent);
-        builder.set_barrier_before();
-        builder.set_buffer_write(0, buffers.recurrent_output, 0);
-        builder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
-        builder.set_buffer_read(2, buffers.conv_qkv, 0);
-        builder.set_buffer_read(3, buffers.a, 0);
-        builder.set_buffer_read(4, buffers.b, 0);
-        builder.set_buffer_read(5, buffers.a_log, 0);
-        builder.set_buffer_read(6, buffers.dt_bias, 0);
-        builder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
-        builder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
-        builder.set_buffer_read(9, buffers.cu_tokens, 0);
-        builder.set_f32(10, self.config.q_scale);
-        set_replay_u32(builder, 11, num_active_reqs, shape.num_reqs, "GDN active request count");
-        builder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
+        recorder.set_kernel(&self.ragged_recurrent);
+        recorder.set_barrier_before();
+        recorder.set_buffer_write(0, buffers.recurrent_output, 0);
+        recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
+        recorder.set_buffer_read(2, buffers.conv_qkv, 0);
+        recorder.set_buffer_read(3, buffers.a, 0);
+        recorder.set_buffer_read(4, buffers.b, 0);
+        recorder.set_buffer_read(5, buffers.a_log, 0);
+        recorder.set_buffer_read(6, buffers.dt_bias, 0);
+        recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
+        recorder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
+        recorder.set_buffer_read(9, buffers.cu_tokens, 0);
+        recorder.set_f32(10, self.config.q_scale);
+        set_replay_u32(
+            recorder,
+            11,
+            num_active_reqs,
+            shape.num_total_reqs,
+            "GDN active request count",
+        );
+        recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
         let v_dim_tile_size = self.v_dim_tile_size as usize;
         let num_v_dim_tiles = self.config.v_head_dim as usize / v_dim_tile_size;
-        builder.dispatch_threadblocks(
+        recorder.dispatch_threadblocks(
             (
                 num_v_dim_tiles,
-                shape.num_reqs as usize * self.config.num_v_heads as usize,
+                shape.num_total_reqs as usize * self.config.num_v_heads as usize,
                 1,
             ),
             (RAGGED_RECURRENT_NUM_QK_DIM_THREADS, v_dim_tile_size, 1),
@@ -457,32 +463,38 @@ impl GDNCompute {
 
     fn record_ragged_recurrent_forward_candidate_state(
         &self,
-        builder: &CommandRecorder,
+        recorder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
         num_active_reqs: ReplayU32,
     ) {
-        builder.set_kernel(&self.ragged_recurrent_forward_candidate_state);
-        builder.set_barrier_before();
-        builder.set_buffer_write(0, buffers.recurrent_output, 0);
-        builder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
-        builder.set_buffer_read(2, buffers.conv_qkv, 0);
-        builder.set_buffer_read(3, buffers.a, 0);
-        builder.set_buffer_read(4, buffers.b, 0);
-        builder.set_buffer_read(5, buffers.a_log, 0);
-        builder.set_buffer_read(6, buffers.dt_bias, 0);
-        builder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
-        builder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
-        builder.set_buffer_read(9, buffers.cu_tokens, 0);
-        builder.set_f32(10, self.config.q_scale);
-        set_replay_u32(builder, 11, num_active_reqs, shape.num_reqs, "GDN active request count");
-        builder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
+        recorder.set_kernel(&self.ragged_recurrent_forward_candidate_state);
+        recorder.set_barrier_before();
+        recorder.set_buffer_write(0, buffers.recurrent_output, 0);
+        recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
+        recorder.set_buffer_read(2, buffers.conv_qkv, 0);
+        recorder.set_buffer_read(3, buffers.a, 0);
+        recorder.set_buffer_read(4, buffers.b, 0);
+        recorder.set_buffer_read(5, buffers.a_log, 0);
+        recorder.set_buffer_read(6, buffers.dt_bias, 0);
+        recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
+        recorder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
+        recorder.set_buffer_read(9, buffers.cu_tokens, 0);
+        recorder.set_f32(10, self.config.q_scale);
+        set_replay_u32(
+            recorder,
+            11,
+            num_active_reqs,
+            shape.num_total_reqs,
+            "GDN active request count",
+        );
+        recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
         let num_v_dim_tiles = self.config.v_head_dim as usize / CANDIDATE_V_ROWS_PER_SIMDGROUP;
         debug_assert_eq!(num_v_dim_tiles % CANDIDATE_SIMDGROUPS_PER_THREADBLOCK, 0);
-        builder.dispatch_threadblocks(
+        recorder.dispatch_threadblocks(
             (
                 num_v_dim_tiles / CANDIDATE_SIMDGROUPS_PER_THREADBLOCK,
-                shape.num_reqs as usize * self.config.num_v_heads as usize,
+                shape.num_total_reqs as usize * self.config.num_v_heads as usize,
                 1,
             ),
             (
@@ -507,26 +519,26 @@ impl GDNCompute {
     /// ABI buffer is materialized.
     fn record_output_norm_gate(
         &self,
-        builder: &CommandRecorder,
+        recorder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
         num_active_tokens: ReplayU32,
     ) {
-        builder.set_kernel(&self.output_norm_gate);
-        builder.set_barrier_before();
-        builder.set_buffer_write(0, buffers.norm_gated_output, 0);
-        builder.set_buffer_read(1, buffers.recurrent_output, 0);
-        builder.set_buffer_read(2, buffers.z, 0);
-        builder.set_buffer_read(3, buffers.norm_weight, 0);
-        builder.set_f32(4, self.config.norm_eps);
+        recorder.set_kernel(&self.output_norm_gate);
+        recorder.set_barrier_before();
+        recorder.set_buffer_write(0, buffers.norm_gated_output, 0);
+        recorder.set_buffer_read(1, buffers.recurrent_output, 0);
+        recorder.set_buffer_read(2, buffers.z, 0);
+        recorder.set_buffer_read(3, buffers.norm_weight, 0);
+        recorder.set_f32(4, self.config.norm_eps);
         set_replay_u32(
-            builder,
+            recorder,
             5,
             num_active_tokens,
-            shape.num_tokens,
+            shape.num_total_tokens,
             "GDN active token count",
         );
-        builder.dispatch_1d(
+        recorder.dispatch_1d(
             self.config.total_output_norm_gate_threads(shape),
             OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK,
         );
@@ -542,11 +554,11 @@ pub struct GDNComputeInvocation<'a> {
 }
 
 impl Operator for GDNComputeInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.compute.config.validate_shape(self.shape);
         validate_buffers(self.compute.config, self.shape, &self.buffers);
         self.compute.record_short_conv(
-            builder,
+            recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
@@ -554,9 +566,9 @@ impl Operator for GDNComputeInvocation<'_> {
             true,
         );
         self.compute
-            .record_ragged_recurrent(builder, self.shape, &self.buffers, self.num_active_reqs);
+            .record_ragged_recurrent(recorder, self.shape, &self.buffers, self.num_active_reqs);
         self.compute
-            .record_output_norm_gate(builder, self.shape, &self.buffers, self.num_active_tokens);
+            .record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
 
@@ -569,7 +581,7 @@ pub struct GDNComputeWithCandidateStateUpdateInvocation<'a> {
 }
 
 impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.compute.config.validate_shape(self.shape);
         assert_u32_count_domain(
             self.compute.config.num_candidate_conv_state_values(self.shape),
@@ -577,7 +589,7 @@ impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
         );
         validate_buffers(self.compute.config, self.shape, &self.buffers);
         self.compute.record_short_conv(
-            builder,
+            recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
@@ -585,59 +597,59 @@ impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
             false,
         );
         self.compute.record_forward_conv_candidate_state(
-            builder,
+            recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
             self.num_active_tokens,
         );
         self.compute.record_ragged_recurrent_forward_candidate_state(
-            builder,
+            recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
         );
         self.compute
-            .record_output_norm_gate(builder, self.shape, &self.buffers, self.num_active_tokens);
+            .record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
 }
 
 fn set_batch_args(
-    builder: &CommandRecorder,
+    recorder: &CommandRecorder,
     shape: GDNComputeShape,
     start_index: usize,
     num_active_reqs: ReplayU32,
     num_active_tokens: ReplayU32,
 ) {
     set_replay_u32(
-        builder,
+        recorder,
         start_index,
         num_active_reqs,
-        shape.num_reqs,
+        shape.num_total_reqs,
         "GDN active request count",
     );
     set_replay_u32(
-        builder,
+        recorder,
         start_index + 1,
         num_active_tokens,
-        shape.num_tokens,
+        shape.num_total_tokens,
         "GDN active token count",
     );
 }
 
-fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
     match value {
         ReplayU32::Fixed(value) => {
             assert!(value > 0, "{name} must be positive");
             assert!(value <= max_value, "{name} exceeds recorded capacity");
-            builder.set_u32(index, value);
+            recorder.set_u32(index, value);
         },
-        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
+        ReplayU32::Parameter(key) => recorder.bind_u32(index, key, 1, max_value),
     }
 }
 
 fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &GDNComputeBuffers<'_>) {
-    let f32_bytes = u64::try_from(size_of::<f32>()).expect("f32 item size must fit u64");
+    let f32_bytes = size_of::<f32>() as u64;
     for (name, offset_bytes) in [
         ("conv_state", buffers.conv_state_offset_bytes),
         ("next_conv_state", buffers.next_conv_state_offset_bytes),
@@ -654,11 +666,11 @@ fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &
         "GDN qkv buffer is too small"
     );
     assert!(
-        buffers.a.len_bytes() >= shape.num_tokens as usize * config.num_v_heads as usize * size_of::<f32>(),
+        buffers.a.len_bytes() >= shape.num_total_tokens as usize * config.num_v_heads as usize * size_of::<f32>(),
         "GDN a buffer is too small"
     );
     assert!(
-        buffers.b.len_bytes() >= shape.num_tokens as usize * config.num_v_heads as usize * size_of::<f32>(),
+        buffers.b.len_bytes() >= shape.num_total_tokens as usize * config.num_v_heads as usize * size_of::<f32>(),
         "GDN b buffer is too small"
     );
     assert!(
@@ -683,33 +695,32 @@ fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &
     );
     assert!(
         buffers.cu_tokens.len_bytes_u64()
-            >= (u64::from(shape.num_reqs) + 1)
-                .checked_mul(size_of::<u32>().try_into().expect("u32 item size must fit u64"))
+            >= (shape.num_total_reqs as u64 + 1)
+                .checked_mul(size_of::<u32>() as u64)
                 .expect("GDN cumulative-token byte length must fit u64"),
         "GDN cu_tokens buffer is too small"
     );
     assert!(
-        buffers.src_recurrent_state_slots.len_bytes() >= shape.num_reqs as usize * size_of::<u32>(),
+        buffers.src_recurrent_state_slots.len_bytes() >= shape.num_total_reqs as usize * size_of::<u32>(),
         "GDN src_recurrent_state_slots buffer is too small"
     );
     assert!(
-        buffers.src_conv_state_slots.len_bytes() >= shape.num_reqs as usize * size_of::<u32>(),
+        buffers.src_conv_state_slots.len_bytes() >= shape.num_total_reqs as usize * size_of::<u32>(),
         "GDN src_conv_state_slots buffer is too small"
     );
     assert!(
-        buffers.flat_materialized_recurrent_state_slots.len_bytes() >= shape.num_tokens as usize * size_of::<u32>(),
+        buffers.flat_materialized_recurrent_state_slots.len_bytes()
+            >= shape.num_total_tokens as usize * size_of::<u32>(),
         "GDN flat_materialized_recurrent_state_slots buffer is too small"
     );
     assert!(
-        buffers.flat_materialized_conv_state_slots.len_bytes() >= shape.num_tokens as usize * size_of::<u32>(),
+        buffers.flat_materialized_conv_state_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>(),
         "GDN flat_materialized_conv_state_slots buffer is too small"
     );
-    let conv_state_region_bytes = u64::try_from(config.num_conv_state_values(shape))
-        .expect("GDN convolution state element count must fit u64")
+    let conv_state_region_bytes = (config.num_conv_state_values(shape) as u64)
         .checked_mul(f32_bytes)
         .expect("GDN convolution state region bytes must fit u64");
-    let recurrent_state_region_bytes = u64::try_from(config.recurrent_state_stride())
-        .expect("GDN recurrent state stride must fit u64")
+    let recurrent_state_region_bytes = (config.recurrent_state_stride() as u64)
         .checked_mul(f32_bytes)
         .expect("GDN recurrent state region bytes must fit u64");
     assert!(

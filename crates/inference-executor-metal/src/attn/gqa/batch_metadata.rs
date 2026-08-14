@@ -40,12 +40,12 @@ impl GQAReplayBucketPolicy {
 
     fn capacities_with_token_capacity(
         &self,
-        total_tokens: u32,
+        num_total_tokens: u32,
         num_q_token_tiles: u32,
         num_sdpa_map_task_templates: u32,
     ) -> (u32, u32, u32) {
         (
-            total_tokens,
+            num_total_tokens,
             self.q_token_tiles.capacity(num_q_token_tiles),
             self.sdpa_map_task_templates.capacity(num_sdpa_map_task_templates),
         )
@@ -57,7 +57,7 @@ enum GQAReplayCapacity<'a> {
     Exact,
     ComponentBucketed(&'a GQAReplayBucketPolicy),
     CallerTokenCapacity {
-        total_tokens: u32,
+        num_total_tokens: u32,
         policy: &'a GQAReplayBucketPolicy,
     },
 }
@@ -158,7 +158,7 @@ impl GQAMetadataBuffers {
         cu_tokens: &[u32],
         compute_path: GQAComputePath,
         policy: &GQAReplayBucketPolicy,
-        total_tokens: u32,
+        num_total_tokens: u32,
     ) -> GQAReplayShape {
         self.validate_policy(policy);
         self.update_with_capacity(
@@ -166,7 +166,10 @@ impl GQAMetadataBuffers {
             token_indices,
             cu_tokens,
             compute_path,
-            GQAReplayCapacity::CallerTokenCapacity { total_tokens, policy },
+            GQAReplayCapacity::CallerTokenCapacity {
+                num_total_tokens,
+                policy,
+            },
         )
     }
 
@@ -189,43 +192,48 @@ impl GQAMetadataBuffers {
         let tiled_query_tokens = matches!(compute_path, GQAComputePath::TiledQueryTokens { .. });
         assert_eq!(req_slots.len(), token_indices.len());
         assert_eq!(cu_tokens.len(), req_slots.len() + 1);
-        let num_tokens = cu_tokens.last().copied().unwrap_or_default() as usize;
-        assert!(num_tokens > 0, "GQA batch metadata requires tokens");
-        assert!(num_tokens <= self.req_slots.len_bytes() / size_of::<u32>());
-        let num_tokens_u32 = num_tokens.try_into().expect("GQA batch tokens must fit u32");
-        if let GQAReplayCapacity::CallerTokenCapacity { total_tokens, policy } = replay_capacity {
-            assert!(
-                num_tokens_u32 <= total_tokens,
-                "GQA active token count must not exceed the caller-owned token capacity"
-            );
-            assert!(
-                total_tokens <= policy.max_tokens(),
-                "GQA caller-owned token capacity must not exceed the metadata capacity"
-            );
-        }
-
-        let mut req_slots_by_token = Vec::with_capacity(num_tokens);
-        let mut flat_token_indices = Vec::with_capacity(num_tokens);
+        assert_eq!(cu_tokens[0], 0, "GQA batch cu_tokens must start at zero");
         for req_index in 0..req_slots.len() {
-            let flat_token_begin = cu_tokens[req_index] as usize;
-            let flat_token_end = cu_tokens[req_index + 1] as usize;
+            let flat_token_begin = cu_tokens[req_index];
+            let flat_token_end = cu_tokens[req_index + 1];
             assert!(
                 flat_token_begin <= flat_token_end,
                 "GQA batch cu_tokens must be nondecreasing"
             );
-            for token_index_in_req in 0..(flat_token_end - flat_token_begin) {
-                let token_index = token_indices[req_index]
-                    .checked_add(
-                        token_index_in_req
-                            .try_into()
-                            .expect("GQA request-local token index must fit u32"),
-                    )
-                    .expect("GQA token index overflow");
+            token_indices[req_index]
+                .checked_add(flat_token_end - flat_token_begin)
+                .expect("GQA request context length must fit u32");
+        }
+        let num_tokens = cu_tokens.last().copied().unwrap_or_default();
+        assert!(num_tokens > 0, "GQA batch metadata requires tokens");
+        let num_tokens_usize = num_tokens as usize;
+        assert!(num_tokens_usize <= self.req_slots.len_bytes() / size_of::<u32>());
+        if let GQAReplayCapacity::CallerTokenCapacity {
+            num_total_tokens,
+            policy,
+        } = replay_capacity
+        {
+            assert!(
+                num_tokens <= num_total_tokens,
+                "GQA active token count must not exceed the caller-owned token capacity"
+            );
+            assert!(
+                num_total_tokens <= policy.max_tokens(),
+                "GQA caller-owned token capacity must not exceed the metadata capacity"
+            );
+        }
+
+        let mut req_slots_by_token = Vec::with_capacity(num_tokens_usize);
+        let mut flat_token_indices = Vec::with_capacity(num_tokens_usize);
+        for req_index in 0..req_slots.len() {
+            let num_req_tokens = cu_tokens[req_index + 1] - cu_tokens[req_index];
+            for token_index_in_req in 0..num_req_tokens {
+                let token_index = token_indices[req_index] + token_index_in_req;
                 req_slots_by_token.push(req_slots[req_index]);
                 flat_token_indices.push(token_index);
             }
         }
-        assert_eq!(req_slots_by_token.len(), num_tokens);
+        assert_eq!(req_slots_by_token.len(), num_tokens_usize);
         self.req_slots.write_typed(0, &req_slots_by_token);
         self.flat_token_indices.write_typed(0, &flat_token_indices);
 
@@ -256,38 +264,35 @@ impl GQAMetadataBuffers {
             },
         };
         let num_q_token_tiles = if q_token_tiles.is_empty() {
-            num_tokens
+            num_tokens_usize
         } else {
             q_token_tiles.len() / NUM_Q_TOKEN_TILE_FIELDS
         };
         let num_sdpa_map_task_templates = sdpa_map_task_templates.len() / NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS;
-        let num_q_token_tiles_u32 = num_q_token_tiles.try_into().expect("GQA token tile count must fit u32");
-        let num_sdpa_map_task_templates_u32 = num_sdpa_map_task_templates
-            .try_into()
-            .expect("GQA SDPA map TaskTemplate count must fit u32");
-        let (total_tokens, total_q_token_tiles, total_sdpa_map_task_templates) = match replay_capacity {
+        debug_assert!(num_q_token_tiles <= self.req_slots.len_bytes() / size_of::<u32>());
+        debug_assert!(num_sdpa_map_task_templates <= max_sdpa_map_task_templates);
+        let num_q_token_tiles = num_q_token_tiles as u32;
+        let num_sdpa_map_task_templates = num_sdpa_map_task_templates as u32;
+        let (num_total_tokens, num_total_q_token_tiles, num_total_sdpa_map_task_templates) = match replay_capacity {
             GQAReplayCapacity::Exact => {
-                let total_sdpa_map_task_templates = num_sdpa_map_task_templates
+                let num_total_sdpa_map_task_templates = (num_sdpa_map_task_templates as usize)
                     .checked_next_power_of_two()
                     .unwrap_or(max_sdpa_map_task_templates)
-                    .min(max_sdpa_map_task_templates)
-                    .try_into()
-                    .expect("GQA total SDPA map TaskTemplate count must fit u32");
-                (num_tokens_u32, num_q_token_tiles_u32, total_sdpa_map_task_templates)
+                    .min(max_sdpa_map_task_templates) as u32;
+                (num_tokens, num_q_token_tiles, num_total_sdpa_map_task_templates)
             },
             GQAReplayCapacity::ComponentBucketed(policy) => {
-                policy.capacities(num_tokens_u32, num_q_token_tiles_u32, num_sdpa_map_task_templates_u32)
+                policy.capacities(num_tokens, num_q_token_tiles, num_sdpa_map_task_templates)
             },
-            GQAReplayCapacity::CallerTokenCapacity { total_tokens, policy } => {
-                policy.capacities_with_token_capacity(
-                    total_tokens,
-                    num_q_token_tiles_u32,
-                    num_sdpa_map_task_templates_u32,
-                )
+            GQAReplayCapacity::CallerTokenCapacity {
+                num_total_tokens,
+                policy,
+            } => {
+                policy.capacities_with_token_capacity(num_total_tokens, num_q_token_tiles, num_sdpa_map_task_templates)
             },
         };
-        let total_sdpa_map_task_templates_usize = total_sdpa_map_task_templates as usize;
-        assert!(total_sdpa_map_task_templates_usize >= num_sdpa_map_task_templates);
+        let total_sdpa_map_task_templates_usize = num_total_sdpa_map_task_templates as usize;
+        assert!(total_sdpa_map_task_templates_usize >= num_sdpa_map_task_templates as usize);
         sdpa_map_task_templates.resize(
             total_sdpa_map_task_templates_usize * NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS,
             u32::MAX,
@@ -299,12 +304,12 @@ impl GQAMetadataBuffers {
         self.cu_sdpa_partial_outputs.write_typed(0, &cu_sdpa_partial_outputs);
 
         let replay_shape = GQAReplayShape::new(
-            num_tokens_u32,
-            total_tokens,
-            num_q_token_tiles_u32,
-            total_q_token_tiles,
-            num_sdpa_map_task_templates_u32,
-            total_sdpa_map_task_templates,
+            num_tokens,
+            num_total_tokens,
+            num_q_token_tiles,
+            num_total_q_token_tiles,
+            num_sdpa_map_task_templates,
+            num_total_sdpa_map_task_templates,
             tiled_query_tokens || num_sdpa_map_task_templates > num_tokens,
         );
         self.replay_shape.set(Some(replay_shape));
@@ -355,7 +360,7 @@ fn build_single_q_token_map_task_templates(
 
     let context_lens = flat_token_indices
         .iter()
-        .map(|&token_index| token_index.checked_add(1).expect("GQA context length overflow"))
+        .map(|&token_index| token_index + 1)
         .collect::<Vec<_>>();
     let num_kv_token_tiles = context_lens
         .iter()
@@ -449,13 +454,12 @@ fn build_tiled_q_tokens_map_task_templates(
         let flat_req_end = cu_tokens[req_index + 1];
         let mut flat_token_start = flat_req_start;
         while flat_token_start < flat_req_end {
-            let flat_token_end = flat_token_start.saturating_add(q_token_tile_size).min(flat_req_end);
+            let tile_len = (flat_req_end - flat_token_start).min(q_token_tile_size);
+            let flat_token_end = flat_token_start + tile_len;
             tiles.push(QTokenTile {
                 flat_token_start,
                 flat_token_end,
-                context_len: token_index
-                    .checked_add(flat_token_end - flat_req_start)
-                    .expect("GQA tiled context length overflow"),
+                context_len: token_index + (flat_token_end - flat_req_start),
                 num_sdpa_map_task_templates_for_q_token_tile: 1,
             });
             flat_token_start = flat_token_end;
@@ -541,15 +545,25 @@ mod tests {
     use super::GQAReplayBucketPolicy;
 
     #[test]
-    fn test_single_q_token() {
+    fn test_metadata_api_set_preserves_active_requests_across_compute_paths_and_capacity_policies() {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 8);
-        let compute_path = GQAComputePath::SingleQueryToken {
+        let single_query = GQAComputePath::SingleQueryToken {
             kv_token_tile_size: 8,
             num_threads_per_threadblock: 32,
             q_head_tile_size: 1,
         };
-        let replay_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], compute_path);
+        let tiled_query = GQAComputePath::TiledQueryTokens {
+            q_token_tile_size: 8,
+            kv_token_tile_size: 4,
+            q_head_tile_size: 1,
+        };
+        let policy = GQAReplayBucketPolicy::new(8, &[]);
+        let req_slots = [2, 5];
+        let token_indices = [7, 20];
+        let cu_tokens = [0, 2, 5];
+
+        let single_exact = metadata.update(&req_slots, &token_indices, &cu_tokens, single_query);
 
         assert_eq!(metadata.req_slots().read_typed::<u32>(0, 5), vec![2, 2, 5, 5, 5]);
         assert_eq!(
@@ -567,31 +581,19 @@ mod tests {
             vec![0, 1, 2, 4, 6, 8]
         );
         assert_eq!(
-            replay_shape,
+            single_exact,
             GQAReplayShape {
                 num_tokens: 5,
-                total_tokens: 5,
+                num_total_tokens: 5,
                 num_q_token_tiles: 5,
-                total_q_token_tiles: 5,
+                num_total_q_token_tiles: 5,
                 num_sdpa_map_task_templates: 8,
-                total_sdpa_map_task_templates: 8,
+                num_total_sdpa_map_task_templates: 8,
                 reduce_sdpa_partial_outputs: true,
             }
         );
-        assert_eq!(replay_shape, metadata.replay_shape());
-        assert_eq!(compute_path, metadata.compute_path());
-    }
 
-    #[test]
-    fn test_tiled_q_tokens() {
-        let device = Device::system_default();
-        let metadata = GQAMetadataBuffers::new(&device, 8);
-        let compute_path = GQAComputePath::TiledQueryTokens {
-            q_token_tile_size: 8,
-            kv_token_tile_size: 4,
-            q_head_tile_size: 1,
-        };
-        let replay_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], compute_path);
+        let tiled_exact = metadata.update(&req_slots, &token_indices, &cu_tokens, tiled_query);
 
         assert_eq!(metadata.q_token_tiles().read_typed::<u32>(0, 4), vec![0, 2, 2, 5]);
         assert_eq!(
@@ -603,19 +605,32 @@ mod tests {
             vec![0, 1, 3]
         );
         assert_eq!(
-            replay_shape,
+            tiled_exact,
             GQAReplayShape {
                 num_tokens: 5,
-                total_tokens: 5,
+                num_total_tokens: 5,
                 num_q_token_tiles: 2,
-                total_q_token_tiles: 2,
+                num_total_q_token_tiles: 2,
                 num_sdpa_map_task_templates: 3,
-                total_sdpa_map_task_templates: 4,
+                num_total_sdpa_map_task_templates: 4,
                 reduce_sdpa_partial_outputs: true,
             }
         );
-        assert_eq!(replay_shape, metadata.replay_shape());
-        assert_eq!(compute_path, metadata.compute_path());
+
+        let bucketed = metadata.update_bucketed(&req_slots, &token_indices, &cu_tokens, tiled_query, &policy);
+        assert_eq!(bucketed, GQAReplayShape::new(5, 6, 2, 2, 3, 4, true));
+
+        let caller_sized = metadata.update_bucketed_with_token_capacity(
+            &req_slots,
+            &token_indices,
+            &cu_tokens,
+            tiled_query,
+            &policy,
+            5,
+        );
+        assert_eq!(caller_sized, GQAReplayShape::new(5, 5, 2, 2, 3, 4, true));
+        assert_eq!(caller_sized, metadata.replay_shape());
+        assert_eq!(tiled_query, metadata.compute_path());
     }
 
     #[test]
@@ -642,11 +657,11 @@ mod tests {
             shape,
             GQAReplayShape {
                 num_tokens: 9,
-                total_tokens: 12,
+                num_total_tokens: 12,
                 num_q_token_tiles: 3,
-                total_q_token_tiles: 4,
+                num_total_q_token_tiles: 4,
                 num_sdpa_map_task_templates: 3,
-                total_sdpa_map_task_templates: 4,
+                num_total_sdpa_map_task_templates: 4,
                 reduce_sdpa_partial_outputs: true,
             }
         );
@@ -659,34 +674,6 @@ mod tests {
             metadata.cu_sdpa_partial_outputs().read_typed::<u32>(4, 1),
             [0xC7C7_C7C7_u32]
         );
-    }
-
-    #[test]
-    fn test_caller_token_capacity_keeps_private_domain_buckets() {
-        let device = Device::system_default();
-        let metadata = GQAMetadataBuffers::new(&device, 12);
-        let compute_path = GQAComputePath::TiledQueryTokens {
-            q_token_tile_size: 8,
-            kv_token_tile_size: 4,
-            q_head_tile_size: 1,
-        };
-        let policy = GQAReplayBucketPolicy::new(12, &[]);
-
-        let shape = metadata.update_bucketed_with_token_capacity(
-            &[2, 5, 7],
-            &[0, 0, 0],
-            &[0, 4, 8, 9],
-            compute_path,
-            &policy,
-            10,
-        );
-
-        assert_eq!(shape.num_tokens, 9);
-        assert_eq!(shape.total_tokens, 10);
-        assert_eq!(shape.num_q_token_tiles, 3);
-        assert_eq!(shape.total_q_token_tiles, 4);
-        assert_eq!(shape.num_sdpa_map_task_templates, 3);
-        assert_eq!(shape.total_sdpa_map_task_templates, 4);
     }
 
     #[test]

@@ -67,7 +67,7 @@ impl GQANormRopeConfig {
         checked_product(
             "GQA norm/RoPE element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_heads as usize,
                 self.head_dim as usize,
             ],
@@ -91,14 +91,14 @@ impl GQANormRopeConfig {
     pub fn flat_token_indices_bytes(self, shape: GQANormRopeShape) -> usize {
         checked_product(
             "GQA norm/RoPE token-index byte length",
-            &[shape.num_tokens as usize, size_of::<u32>()],
+            &[shape.num_total_tokens as usize, size_of::<u32>()],
         )
     }
 
     fn num_token_heads(self, shape: GQANormRopeShape) -> usize {
         checked_product(
             "GQA norm/RoPE token-head row count",
-            &[shape.num_tokens as usize, self.num_heads as usize],
+            &[shape.num_total_tokens as usize, self.num_heads as usize],
         )
     }
 
@@ -112,13 +112,13 @@ impl GQANormRopeConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GQANormRopeShape {
-    pub num_tokens: u32,
+    pub num_total_tokens: u32,
 }
 
 impl GQANormRopeShape {
     pub fn validate(self, config: GQANormRopeConfig) {
         config.validate();
-        assert!(self.num_tokens > 0);
+        assert!(self.num_total_tokens > 0);
         assert_u32_count_domain(config.num_token_heads(self), "GQA norm/RoPE token-head rows");
         assert_u32_index_domain(config.num_slots(self), "GQA norm/RoPE elements");
     }
@@ -158,7 +158,7 @@ impl GQANormRopeKernel {
             kernel: &self.kernel,
             shape,
             buffers,
-            num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
+            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
         }
     }
 
@@ -197,33 +197,33 @@ pub struct GQANormRopeInvocation<'a> {
 }
 
 impl Operator for GQANormRopeInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.input, 0);
-        builder.set_buffer_read(1, self.buffers.norm_weight, 0);
-        builder.set_buffer_read(2, self.buffers.flat_token_indices, 0);
-        builder.set_buffer_write(3, self.buffers.output, 0);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.input, 0);
+        recorder.set_buffer_read(1, self.buffers.norm_weight, 0);
+        recorder.set_buffer_read(2, self.buffers.flat_token_indices, 0);
+        recorder.set_buffer_write(3, self.buffers.output, 0);
         set_replay_u32(
-            builder,
+            recorder,
             4,
             self.num_active_tokens,
-            shape.num_tokens,
+            shape.num_total_tokens,
             "GQA norm/RoPE active token count",
         );
-        builder.dispatch_1d(self.config.num_threads(shape), NUM_THREADS_PER_THREADBLOCK as usize);
+        recorder.dispatch_1d(self.config.num_threads(shape), NUM_THREADS_PER_THREADBLOCK as usize);
     }
 }
 
-fn set_replay_u32(builder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
     match value {
         ReplayU32::Fixed(value) => {
             assert!(value > 0, "{name} must be positive");
             assert!(value <= max_value, "{name} exceeds recorded capacity");
-            builder.set_u32(index, value);
+            recorder.set_u32(index, value);
         },
-        ReplayU32::Parameter(key) => builder.bind_u32(index, key, 1, max_value),
+        ReplayU32::Parameter(key) => recorder.bind_u32(index, key, 1, max_value),
     }
 }
 
@@ -262,7 +262,7 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = GQANormRopeConfig::bf16(1, 4, 2, 1e-6, 1_000_000.0, 1.0);
-        let shape = GQANormRopeShape { num_tokens: 1 };
+        let shape = GQANormRopeShape { num_total_tokens: 1 };
         let input = [0.73046875, -1.171875, 0.439_453_13, 2.03125].map(|value| bf16::from_f32(value).to_bits());
         let norm_weight = [1.296875, 0.8984375, 1.1015625, 0.703125].map(|value| bf16::from_f32(value).to_bits());
         let input_buffer = Buffer::from_slice(&device, &input);
@@ -305,6 +305,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "GQA norm/RoPE elements exceeds the shader u32 element-index domain")]
     fn test_shape_rejects_shader_index_overflow() {
-        GQANormRopeShape { num_tokens: 1 << 30 }.validate(GQANormRopeConfig::bf16(2, 4, 4, 1e-6, 1_000_000.0, 1.0));
+        GQANormRopeShape {
+            num_total_tokens: 1 << 30,
+        }
+        .validate(GQANormRopeConfig::bf16(2, 4, 4, 1e-6, 1_000_000.0, 1.0));
     }
 }

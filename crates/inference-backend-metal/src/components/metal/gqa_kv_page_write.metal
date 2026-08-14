@@ -10,7 +10,7 @@ void gqa_kv_page_write_impl(
     device const uint* req_slots,
     device const uint* flat_token_indices,
     device const uint* page_ids,
-    constant uint& num_token_writes,
+    constant uint& num_active_token_writes,
     constant uint& gqa_layer_index,
     constant uint& num_gqa_layers,
     constant uint& num_blocks,
@@ -18,7 +18,7 @@ void gqa_kv_page_write_impl(
     uint gid
 ) {
     const uint slots_per_write = num_kv_heads * head_dim;
-    const uint total = num_token_writes * slots_per_write;
+    const uint total = num_active_token_writes * slots_per_write;
     if (gid >= total) return;
 
     const uint write_index = gid / slots_per_write;
@@ -59,7 +59,7 @@ kernel void gqa_kv_page_write_u16(
     device const uint* req_slots [[buffer(3)]],
     device const uint* flat_token_indices [[buffer(4)]],
     device const uint* page_ids [[buffer(5)]],
-    constant uint& num_token_writes [[buffer(6)]],
+    constant uint& num_active_token_writes [[buffer(6)]],
     constant uint& gqa_layer_index [[buffer(7)]],
     constant uint& num_gqa_layers [[buffer(8)]],
     constant uint& num_blocks [[buffer(9)]],
@@ -73,7 +73,7 @@ kernel void gqa_kv_page_write_u16(
         req_slots,
         flat_token_indices,
         page_ids,
-        num_token_writes,
+        num_active_token_writes,
         gqa_layer_index,
         num_gqa_layers,
         num_blocks,
@@ -89,7 +89,7 @@ kernel void gqa_kv_page_write_f32(
     device const uint* req_slots [[buffer(3)]],
     device const uint* flat_token_indices [[buffer(4)]],
     device const uint* page_ids [[buffer(5)]],
-    constant uint& num_token_writes [[buffer(6)]],
+    constant uint& num_active_token_writes [[buffer(6)]],
     constant uint& gqa_layer_index [[buffer(7)]],
     constant uint& num_gqa_layers [[buffer(8)]],
     constant uint& num_blocks [[buffer(9)]],
@@ -103,7 +103,7 @@ kernel void gqa_kv_page_write_f32(
         req_slots,
         flat_token_indices,
         page_ids,
-        num_token_writes,
+        num_active_token_writes,
         gqa_layer_index,
         num_gqa_layers,
         num_blocks,

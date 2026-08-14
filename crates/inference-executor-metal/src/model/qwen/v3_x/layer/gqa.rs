@@ -32,6 +32,8 @@ use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xGQA {
     gqa_layer_index: ReplayU32,
+    core: GQACore,
+    metal: GQAMetalConfig,
     weights: Option<Qwen3xGQAWeights>,
     backend: Option<Rc<GQA>>,
     scratch: Option<Rc<GQAScratch>>,
@@ -41,12 +43,16 @@ pub struct Qwen3xGQA {
 impl Qwen3xGQA {
     pub fn new(
         gqa_layer_index: ReplayU32,
+        core: GQACore,
+        metal: GQAMetalConfig,
         backend: Rc<GQA>,
         scratch: Rc<GQAScratch>,
         request_page_table: Rc<GQARequestPageTable>,
     ) -> Self {
         Self {
             gqa_layer_index,
+            core,
+            metal,
             weights: None,
             backend: Some(backend),
             scratch: Some(scratch),
@@ -58,12 +64,12 @@ impl Qwen3xGQA {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        core: &GQACore,
-        metal: GQAMetalConfig,
         bindings: Qwen3xGQAWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(self.weights.is_none(), "Qwen3.x GQA weights are already loaded");
-        self.weights = Some(Qwen3xGQAWeights::load(device, store, &bindings, core, metal)?);
+        self.weights = Some(Qwen3xGQAWeights::load(
+            device, store, &bindings, &self.core, self.metal,
+        )?);
         Ok(())
     }
 

@@ -175,16 +175,16 @@ pub struct GQAQKVSplitInvocation<'a> {
 }
 
 impl Operator for GQAQKVSplitInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.qkv, 0);
-        builder.set_buffer_write(1, self.buffers.q, 0);
-        builder.set_buffer_write(2, self.buffers.k, 0);
-        builder.set_buffer_write(3, self.buffers.v, 0);
-        builder.set_u32(4, shape.num_tokens);
-        builder.dispatch_1d(self.config.num_qkv_slots(shape), 256);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.qkv, 0);
+        recorder.set_buffer_write(1, self.buffers.q, 0);
+        recorder.set_buffer_write(2, self.buffers.k, 0);
+        recorder.set_buffer_write(3, self.buffers.v, 0);
+        recorder.set_u32(4, shape.num_tokens);
+        recorder.dispatch_1d(self.config.num_qkv_slots(shape), 256);
     }
 }
 

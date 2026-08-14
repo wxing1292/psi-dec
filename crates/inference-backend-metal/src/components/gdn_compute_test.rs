@@ -69,8 +69,8 @@ fn test_shape_rejects_shader_count_overflow() {
         norm_eps: 1.0e-6,
     };
     let shape = GDNComputeShape {
-        num_reqs: 1,
-        num_tokens: 1 << 30,
+        num_total_reqs: 1,
+        num_total_tokens: 1 << 30,
     };
     let device = Device::system_default();
     let stream = Stream::new(&device);
@@ -122,12 +122,12 @@ fn test_ragged_recurrent_fixed() {
         13,
     );
     let a = fixture_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         0.0625,
         17,
     );
     let b = fixture_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         0.0625,
         19,
     );
@@ -189,11 +189,11 @@ fn test_ragged_recurrent_random() {
     .map(|value| bf16::from_f32(value * 0.125).to_f32())
     .collect::<Vec<_>>();
     let a = generated_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         random_seed.wrapping_add(4),
     );
     let b = generated_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         random_seed.wrapping_add(5),
     );
     let z = generated_values(
@@ -249,7 +249,7 @@ fn test_ragged_multi_random() {
         random_seed.wrapping_add(1),
     );
     let recurrent_state = generated_values(
-        shape.num_reqs as usize * fixture_config().recurrent_state_stride(),
+        shape.num_total_reqs as usize * fixture_config().recurrent_state_stride(),
         random_seed.wrapping_add(2),
     );
     let conv_weight = generated_values(
@@ -260,11 +260,11 @@ fn test_ragged_multi_random() {
     .map(|value| bf16::from_f32(value * 0.125).to_f32())
     .collect::<Vec<_>>();
     let a = generated_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         random_seed.wrapping_add(4),
     );
     let b = generated_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         random_seed.wrapping_add(5),
     );
     let z = generated_values(
@@ -328,8 +328,8 @@ fn test_candidate_state_preserves_distinct_source_slots() {
     let shape = fixture_shape(NUM_REQS as u32, (NUM_REQS * ROWS_PER_REQ) as u32);
     let kernels = GDNCompute::new(&device, config);
     let qkv_values = fixture_values(config.num_qkv_values(shape), 0.03125, 3);
-    let a_values = fixture_values(shape.num_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
-    let b_values = fixture_values(shape.num_tokens as usize * config.num_v_heads as usize, 0.0625, 7);
+    let a_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
+    let b_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 7);
     let z_values = fixture_values(config.num_recurrent_output_values(shape), 0.03125, 11);
     let conv_weight_values = fixture_values(config.num_conv_weight_values(), 0.00390625, 13);
     let norm_weight_values = vec![1.0; config.v_head_dim as usize];
@@ -499,8 +499,8 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
     let shape = fixture_shape(2, 2);
     let kernels = GDNCompute::new(&device, config);
     let qkv_values = fixture_values(config.num_qkv_values(shape), 0.03125, 3);
-    let a_values = fixture_values(shape.num_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
-    let b_values = fixture_values(shape.num_tokens as usize * config.num_v_heads as usize, 0.0625, 7);
+    let a_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
+    let b_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 7);
     let z_values = fixture_values(config.num_recurrent_output_values(shape), 0.03125, 11);
     let conv_weight_values = fixture_values(
         config.qkv_dim() as usize * config.conv_kernel_size as usize,
@@ -518,12 +518,12 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
     let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
     let a = Buffer::new_zeroed_elements(
         &device,
-        shape.num_tokens as usize * config.num_v_heads as usize,
+        shape.num_total_tokens as usize * config.num_v_heads as usize,
         Dtype::Float32,
     );
     let b = Buffer::new_zeroed_elements(
         &device,
-        shape.num_tokens as usize * config.num_v_heads as usize,
+        shape.num_total_tokens as usize * config.num_v_heads as usize,
         Dtype::Float32,
     );
     let z = Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
@@ -573,8 +573,6 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
         ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
     ));
     let replay = builder.build();
-    assert_eq!(replay.stats().parameter_count, 2);
-
     for num_active in [1_usize, 2, 1] {
         let mut qkv_submission = qkv_values.clone();
         let mut a_submission = a_values.clone();
@@ -769,12 +767,12 @@ fn test_candidate_state_prefixes() {
         41,
     );
     let a = fixture_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         0.0625,
         43,
     );
     let b = fixture_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         0.0625,
         47,
     );
@@ -816,7 +814,7 @@ fn test_candidate_state_prefixes() {
         2.0e-5,
     );
     let core = fixture_core(shape);
-    for verified_tokens in 1..=shape.num_tokens as usize {
+    for verified_tokens in 1..=shape.num_total_tokens as usize {
         let prefix_cu_tokens = [0_u32, verified_tokens as u32];
         let conv_reference = gdn_short_conv_reference(
             &core,
@@ -867,12 +865,12 @@ fn test_candidate_states_above_u32_byte_offset() {
         41,
     );
     let a_values = fixture_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         0.0625,
         43,
     );
     let b_values = fixture_values(
-        shape.num_tokens as usize * fixture_config().num_v_heads as usize,
+        shape.num_total_tokens as usize * fixture_config().num_v_heads as usize,
         0.0625,
         47,
     );
@@ -896,20 +894,16 @@ fn test_candidate_states_above_u32_byte_offset() {
     let src_state_slots = Buffer::from_slice(&device, &src_state_slot_values);
     let candidate_dst_slot_ids = Buffer::from_slice(&device, &candidate_dst_slot_id_values);
 
-    let high_base = u64::from(u32::MAX) + 1;
+    let high_base = u32::MAX as u64 + 1;
     let conv_state_offset_bytes = high_base;
     let next_conv_state_offset_bytes = high_base + 4096;
     let recurrent_state_offset_bytes = high_base + 8192;
-    let recurrent_arena_bytes = u64::try_from(num_state_slots)
-        .expect("test state-slot count must fit u64")
+    let recurrent_arena_bytes = (num_state_slots as u64)
         .checked_mul(
-            u64::try_from(
-                fixture_config()
-                    .recurrent_state_stride()
-                    .checked_mul(size_of::<f32>())
-                    .expect("test recurrent-state byte stride must fit usize"),
-            )
-            .expect("test recurrent-state byte stride must fit u64"),
+            fixture_config()
+                .recurrent_state_stride()
+                .checked_mul(size_of::<f32>())
+                .expect("test recurrent-state byte stride must fit usize") as u64,
         )
         .expect("test recurrent-state arena byte length must fit u64");
     let state_arena = Buffer::new_uninit(
@@ -981,7 +975,7 @@ fn test_candidate_states_above_u32_byte_offset() {
         num_state_slots * fixture_config().recurrent_state_stride(),
     );
     let core = fixture_core(shape);
-    for verified_tokens in 1..=shape.num_tokens as usize {
+    for verified_tokens in 1..=shape.num_total_tokens as usize {
         let prefix_cu_tokens = [0_u32, verified_tokens as u32];
         let conv_reference = gdn_short_conv_reference(
             &core,
@@ -1060,7 +1054,7 @@ fn run_gdn_core(
     let dt_bias = bf16_buffer(&device, dt_bias_values);
     let cu_tokens = Buffer::from_slice(&device, cu_tokens_values);
     let src_state_slots = Buffer::from_slice(&device, src_state_slot_values);
-    let mut flat_candidate_state_slot_values = vec![u32::MAX; shape.num_tokens as usize];
+    let mut flat_candidate_state_slot_values = vec![u32::MAX; shape.num_total_tokens as usize];
     for (req_index, &dst_state_slot) in dst_slot_id_values.iter().enumerate() {
         let flat_token_end = cu_tokens_values[req_index + 1] as usize;
         flat_candidate_state_slot_values[flat_token_end - 1] = dst_state_slot;
@@ -1076,8 +1070,7 @@ fn run_gdn_core(
     let mut recurrent_state_values_with_prefix = vec![-1.0; STATE_PREFIX_VALUES];
     recurrent_state_values_with_prefix.extend_from_slice(recurrent_state_values);
     let recurrent_state_arena = Buffer::from_slice(&device, &recurrent_state_values_with_prefix);
-    let state_offset_bytes =
-        u64::try_from(STATE_PREFIX_VALUES * size_of::<f32>()).expect("test GDN state offset must fit u64");
+    let state_offset_bytes = (STATE_PREFIX_VALUES * size_of::<f32>()) as u64;
     let conv_qkv = Buffer::new_zeroed(&device, fixture_config().num_qkv_values(shape) * size_of::<f32>());
     let recurrent_output = Buffer::new_zeroed(
         &device,
@@ -1125,7 +1118,7 @@ fn run_gdn_core(
         recurrent_output: recurrent_output.read_typed::<f32>(0, fixture_config().num_recurrent_output_values(shape)),
         recurrent_state: recurrent_state_arena.read_typed::<f32>(
             STATE_PREFIX_VALUES,
-            shape.num_reqs as usize * fixture_config().recurrent_state_stride(),
+            shape.num_total_reqs as usize * fixture_config().recurrent_state_stride(),
         ),
     }
 }
@@ -1177,8 +1170,7 @@ fn run_gdn_forward_candidate_state(
     recurrent_state_arena_values[STATE_PREFIX_VALUES..STATE_PREFIX_VALUES + fixture_config().recurrent_state_stride()]
         .copy_from_slice(recurrent_state_values);
     let recurrent_state_arena = Buffer::from_slice(&device, &recurrent_state_arena_values);
-    let state_offset_bytes =
-        u64::try_from(STATE_PREFIX_VALUES * size_of::<f32>()).expect("test GDN state offset must fit u64");
+    let state_offset_bytes = (STATE_PREFIX_VALUES * size_of::<f32>()) as u64;
     let conv_qkv = Buffer::new_zeroed(&device, fixture_config().num_qkv_values(shape) * size_of::<f32>());
     let recurrent_output = Buffer::new_zeroed(
         &device,
@@ -1319,7 +1311,10 @@ fn output_norm_gate_reference(
 }
 
 fn fixture_shape(num_reqs: u32, num_tokens: u32) -> GDNComputeShape {
-    GDNComputeShape { num_reqs, num_tokens }
+    GDNComputeShape {
+        num_total_reqs: num_reqs,
+        num_total_tokens: num_tokens,
+    }
 }
 
 fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {

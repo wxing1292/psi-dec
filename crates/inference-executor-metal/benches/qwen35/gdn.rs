@@ -392,9 +392,9 @@ fn build_single_invocation_replay<I>(stream: &Stream, invocation: I) -> ReplayPr
 where
     I: Operator,
 {
-    let mut builder = MetalReplayRuntime::new(stream).create_recorder();
-    builder.record(ReplayOp::opaque(invocation));
-    builder.build()
+    let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
+    recorder.record(ReplayOp::opaque(invocation));
+    recorder.build()
 }
 
 fn gdn_qkvabz_affine_config() -> AffineQuantizedMatmulConfig {

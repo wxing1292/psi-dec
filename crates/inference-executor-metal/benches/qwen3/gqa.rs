@@ -682,8 +682,8 @@ fn single_sdpa_replay(
 ) -> ReplayProgram {
     let shape = metadata.replay_shape();
     let sdpa_shape = GQAPagedSDPAShape {
-        num_tokens: shape.num_tokens,
-        total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+        num_total_tokens: shape.num_tokens,
+        num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
     };
     let sdpa_config = GQAPagedSDPAConfig {
         num_q_heads: core.num_q_heads.try_into().expect("q heads must fit u32"),
@@ -761,9 +761,9 @@ fn tiled_sdpa_replay(
         },
     };
     let tiled_shape = GQATiledSDPAShape {
-        num_tokens: shape.num_tokens,
-        num_q_token_tiles: shape.num_q_token_tiles,
-        total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+        num_total_tokens: shape.num_tokens,
+        num_total_q_token_tiles: shape.num_q_token_tiles,
+        num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
     };
     let kernels = GQATiledSDPAKernels::new(device, tiled_config, tiled_shape);
     let scratch = scratch.bindings();

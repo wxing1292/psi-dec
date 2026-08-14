@@ -128,7 +128,7 @@ impl Fixture {
         let num_tokens = num_requests
             .checked_mul(block_size)
             .expect("GQA block-attention bench token count must fit u32");
-        let total_sdpa_map_task_templates = num_tokens
+        let num_total_sdpa_map_task_templates = num_tokens
             .checked_mul(2)
             .and_then(u32::checked_next_power_of_two)
             .expect("GQA block-attention bench partial-output capacity must fit u32");
@@ -142,13 +142,13 @@ impl Fixture {
         };
         let shape = GQABlockSDPAShape {
             num_tokens,
-            total_sdpa_map_task_templates,
+            num_total_sdpa_map_task_templates,
         };
         shape.validate(config);
 
         let q_elements = checked_product(&[num_tokens, num_q_heads, head_dim]);
         let kv_elements = checked_product(&[num_tokens, num_kv_heads, head_dim]);
-        let partial_stat_elements = checked_product(&[total_sdpa_map_task_templates, num_q_heads]);
+        let partial_stat_elements = checked_product(&[num_total_sdpa_map_task_templates, num_q_heads]);
         let partial_output_elements = partial_stat_elements
             .checked_mul(head_dim as usize)
             .expect("GQA block-attention bench partial-output elements must fit usize");
