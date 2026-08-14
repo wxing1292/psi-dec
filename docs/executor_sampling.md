@@ -13,12 +13,13 @@ crates/inference-executor-core/src/sampling/
   reference.rs       CPU top-k/top-p and rejection correctness oracle
   dspark.rs          CPU reference for sequential Markov correction, confidence, and sampling
   rejection_sampling.rs
-                     backend-neutral sparse rejection shape/request contracts
+                     backend-neutral sparse rejection bounds, shape, request, and microbatch-view contracts
   request_state.rs   executor-owned request-slot seed lifecycle
   top_k_sampling.rs  backend-neutral sampling shape and request parameters
 
 crates/inference-backend-metal/src/components/
   sampling/top_k.rs           generic Metal top-k sampling components
+  sampling/top_k_test.rs      focused Top-K Metal parity and replay contracts
   sampling/rejection.rs       sparse rejection component
   sampling/dspark_markov.rs   fused DSpark Markov, confidence, and tile-Top-K map component
   metal/sampling.metal
@@ -27,7 +28,7 @@ crates/inference-backend-metal/src/components/
 crates/inference-executor-metal/src/sampling/
   top_k_sampling.rs       TopKSampling, parameter/scratch, and TopKSamplingOutputBuffers
   top_k_replay.rs         Sampling and DraftSampling replay components
-  rejection_replay.rs     sparse rejection replay owner, microbatch contract/adapters, and bindings
+  rejection_replay.rs     sparse rejection replay owner, batch preparation, and bindings
   dspark_markov.rs        sequential DSpark Markov, confidence, and sampling composition
   spec_probs.rs           SpecProbsStore sparse draft/target probability workspace
 
@@ -102,6 +103,8 @@ Drafts within one request are ordered because the first rejection ends that requ
 
 `SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
 `max_k` is the maximum sparse Top-K row width, not the vocabulary size.
+Its draft capacity is `max_requests * max_num_spec_tokens`.
+Its target capacity is the executor `max_tokens` value.
 Debug builds also retain `expected_draft_token_ids` for lifecycle validation.
 Release builds do not allocate, reset, or compare this CPU-only metadata.
 
@@ -110,11 +113,15 @@ Their row identity is `req_slot * max_num_spec_tokens + proposal_position`.
 Main verification distributions exist only in the current submission.
 They use compact active-row indices from zero.
 `cu_target_distributions` uses this compact row domain.
+The executor `max_tokens` value is the target-distribution capacity for Qwen3 and Qwen3.5.
+The request-slot by speculative-position product is only the draft-distribution capacity.
 
 ## Replay ownership
 
-Sampling and rejection use capacity replay keys.
-Executor configuration caps power-of-two row and request capacities.
+Sampling and rejection use `u32` capacity replay keys.
+`Sampling`, `DraftSampling`, `RejectionSampler`, and `DSparkMarkovSampling` each own their applicable
+`ReplayBucketPolicy` values. Their prepare APIs convert active counts into recorded capacities. Qwen model callers do
+not select replay buckets.
 Submission-scoped `ReplayArguments` contain exact active thread counts.
 Every padded kernel returns inactive lanes before it reads input, changes RNG state, or writes output.
 A 0/1 capacity uses an immediate constant to preserve the common single-request decode path.
@@ -137,6 +144,11 @@ The Qwen executor owns four distinct graph and cache stages:
 - `Replay<RejectionSampling>` handles target write-distribution generation and sparse rejection.
 
 Main and MTP share one `Rc<TopKSampling>` implementation.
+`Sampling::prepare_shape(...)` selects the Main sampling capacity.
+`DraftSampling::prepare_shape(...)` selects the MTP request capacity.
+`RejectionSampler::prepare_replay_shape(...)` selects request, draft-distribution, and target-distribution capacities.
+It validates public prepared counts before it maps them to the `u32` replay domain.
+`RejectionSampling` validates the target-sampling and rejection shapes before the replay-cache lookup.
 `DSparkMarkovSampling` owns model-neutral Markov runtime parameters, tile candidates, and per-step outputs.
 It accepts borrowed weights at record time.
 `Qwen3xDSparkMarkov` owns Qwen checkpoint buffers and delegates execution to this backend owner.
@@ -304,7 +316,12 @@ The production path must keep the BF16 contract unless broader checkpoint eviden
 CPU references define sampling, rejection, and sequential DSpark Markov math.
 Focused Metal tests compare fixed and random distributions with these references.
 They also compare mixed per-row parameters and deterministic seed/domain behavior.
-Sparse rejection tests cover accepted and rejected MTP and DSpark paths.
+The Top-K tests keep separate parity cases for reduction, bitonic, sample, write-distribution, and fused
+sample-and-write-distribution kernels.
+One mixed reduction scenario covers greedy and stochastic rows, Target and Draft domains, padded capacity, growth,
+and shrink.
+One sparse rejection scenario covers rejection, all-accept, zero-draft, non-contiguous draft-distribution mapping,
+padded requests, growth, and shrink.
 The DSpark Markov parity test covers a padded replay bucket and non-contiguous request slots.
 GPU tests run serially under the repository Metal reservation/lock rules.
 The `qwen3_dspark_sampling` benchmark prints proposal token IDs, exact proposal probability bits, and a stable

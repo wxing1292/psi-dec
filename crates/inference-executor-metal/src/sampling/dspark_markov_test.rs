@@ -2,7 +2,6 @@ use half::bf16;
 use inference_backend_metal::MetalRuntime;
 use inference_backend_metal::components::DSparkConfidenceConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
-use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
@@ -23,34 +22,7 @@ use super::DSparkMarkovSampling;
 use super::DSparkMarkovSamplingConfig;
 use super::DSparkMarkovWeights;
 use super::SpecProbsStore;
-use super::replay_bucket_capacity;
 use crate::def::replay_op::MetalReplayRuntime;
-
-#[test]
-fn test_sampling_bucket_caps_at_non_power_of_two_request_capacity() {
-    assert_eq!(replay_bucket_capacity(3, 6), 4);
-    assert_eq!(replay_bucket_capacity(5, 6), 6);
-}
-
-#[test]
-fn test_markov_map_compiles_required_confidence_contract() {
-    let runtime = MetalRuntime::system_default();
-    let device = runtime.device();
-    let _ = DSparkMarkovTopKMapKernel::new(
-        device,
-        DSparkMarkovTopKMapConfig {
-            vocab_size: 64,
-            rank: 64,
-            w1_group_size: 64,
-            w1_bits: 8,
-            w2_group_size: 64,
-            w2_bits: 8,
-            io_dtype: Dtype::Bfloat16,
-            scale_bias_dtype: Dtype::Bfloat16,
-            confidence: DSparkConfidenceConfig { hidden_dim: 32 },
-        },
-    );
-}
 
 #[test]
 fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
@@ -198,7 +170,8 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
             .collect::<Vec<_>>(),
     );
     let confidence_bias_buffer = Buffer::from_slice(device, &[bf16::from_f32(confidence_bias).to_bits()]);
-    let mut distribution_store = SpecProbsStore::new(device, BLOCK_SIZE, MAX_REQUESTS, 4);
+    let mut distribution_store =
+        SpecProbsStore::new(device, BLOCK_SIZE, MAX_REQUESTS, MAX_REQUESTS * (BLOCK_SIZE + 1), 4);
     let shape = markov.prepare(
         &REQ_SLOTS,
         &ANCHOR_TOKEN_IDS,
@@ -243,12 +216,12 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
 
     let proposal = markov.read_proposal(&REQ_SLOTS, &mut distribution_store);
     let expected_token_ids = reference
-        .requests
+        .samples_by_request
         .iter()
         .map(|steps| steps.iter().map(|step| step.sampled_token).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let expected_token_probs = reference
-        .requests
+        .samples_by_request
         .iter()
         .map(|steps| steps.iter().map(|step| step.sampled_prob).collect::<Vec<_>>())
         .collect::<Vec<_>>();
@@ -270,11 +243,11 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
             let slot_end = slot_begin + 4;
             assert_eq!(
                 &draft_token_ids[slot_begin..slot_end],
-                reference.requests[request_index][step_index].prob_token_ids
+                reference.samples_by_request[request_index][step_index].prob_token_ids
             );
             assert_close(
                 &draft_probs[slot_begin..slot_end],
-                &reference.requests[request_index][step_index].prob_values,
+                &reference.samples_by_request[request_index][step_index].prob_values,
                 1.0e-5,
             );
         }

@@ -1,12 +1,4 @@
 impl Qwen35Executor {
-    fn target_sample_replay_shape(&self, sampler_configs: &[SamplerConfig]) -> TopKSamplingShape {
-        let shape = self.sampler.active_shape(sampler_configs);
-        shape.with_num_total_sampling_inputs(replay_bucket_capacity(
-            shape.num_active_sampling_inputs,
-            self.sampler_bounds.max_sampling_inputs,
-        ))
-    }
-
     fn prepare_sample_replay(
         &mut self,
         sampler_configs: &[SamplerConfig],
@@ -17,7 +9,7 @@ impl Qwen35Executor {
             sample_positions.len(),
             "qwen3.5 sample runtime configs and positions must have equal lengths"
         );
-        let sample_shape = self.target_sample_replay_shape(sampler_configs);
+        let sample_shape = self.sampling.component().prepare_shape(sampler_configs);
         let input = SamplingInput {
             shape: sample_shape,
             logits: &self.unembed_logits,
@@ -42,7 +34,12 @@ impl Qwen35Executor {
             sample_positions.len(),
             "qwen3.5 MTP sample runtime configs and positions must have equal lengths"
         );
-        let sample_shape = mtp_sample_replay_shape(self.sampler_bounds, sampler_configs, self.config.max_requests);
+        let sample_shape = self
+            .speculator
+            .mtp()
+            .sampling
+            .component()
+            .prepare_shape(sampler_configs);
         let mtp = self.speculator.mtp_mut();
         let input = DraftSamplingInput {
             shape: sample_shape,
@@ -52,12 +49,7 @@ impl Qwen35Executor {
                 token_ids: mtp.common.spec_probs.draft_token_ids(),
                 probs: mtp.common.spec_probs.draft_probs(),
                 output_distribution_indices: &mtp.draft_distribution_indices,
-                max_k: mtp
-                    .common
-                    .spec_probs
-                    .max_k()
-                    .try_into()
-                    .expect("qwen3.5 MTP distribution width must fit u32"),
+                max_k: mtp.common.spec_probs.max_k() as u32,
                 num_output_distributions: mtp.common.spec_probs.num_draft_distributions(),
             },
         };
@@ -163,53 +155,22 @@ impl Qwen35Executor {
         );
         let prepared = rejector.prepare_inputs(microbatch, &flat_draft_distribution_indices);
         let num_active_decode_reqs = prepared.num_active_decode_reqs();
-        let num_active_draft_distributions = prepared.num_active_draft_distributions;
         let num_active_target_distributions = prepared.num_active_target_distributions();
-        let num_decode_req_capacity = replay_bucket_capacity_usize(num_active_decode_reqs, self.config.max_requests);
-        let max_draft_distributions = self
-            .config
-            .max_requests
-            .checked_mul(max_spec_tokens)
-            .expect("qwen3.5 rejection draft-distribution capacity overflow");
-        let num_draft_distribution_capacity =
-            replay_bucket_capacity_allow_zero(num_active_draft_distributions, max_draft_distributions);
-        let max_target_distributions = max_draft_distributions
-            .checked_add(self.config.max_requests)
-            .expect("qwen3.5 rejection target-distribution capacity overflow")
-            .min(self.config.max_tokens);
-        let num_target_distribution_capacity =
-            replay_bucket_capacity_usize(num_active_target_distributions, max_target_distributions);
         debug_assert_eq!(
             num_main_output_rows, num_active_target_distributions,
             "qwen3.5 Main output rows must match target distributions"
         );
-        let target_distribution_shape = self
-            .sampler
-            .active_shape(&sampler_configs)
-            .with_num_total_sampling_inputs(
-                num_target_distribution_capacity
-                    .try_into()
-                    .expect("qwen3.5 target-distribution capacity must fit u32"),
-            );
-        let top_k = target_distribution_shape.top_k;
-        let rejection_key = RejectionReplayKey::new(
-            num_decode_req_capacity,
-            num_target_distribution_capacity,
-            num_draft_distribution_capacity,
-            top_k,
-        );
+        let active_target_shape = self.sampler.active_shape(&sampler_configs);
+        let rejection_shape = rejector.prepare_replay_shape(&prepared, active_target_shape.top_k);
+        let target_distribution_shape = active_target_shape
+            .with_num_total_sampling_inputs(rejection_shape.num_total_target_distributions);
         let Qwen35SpeculativeResources {
             rejection_sampling,
             spec_probs,
             target_distribution_indices,
         } = self.speculator.common_mut();
         let rejection_input = RejectionSamplerInput {
-            num_active_decode_reqs,
-            num_decode_req_capacity,
-            num_target_distribution_capacity,
-            num_active_draft_distributions,
-            num_draft_distribution_capacity,
-            top_k,
+            shape: rejection_shape,
             target_token_ids: spec_probs.target_token_ids(),
             target_probs: spec_probs.target_probs(),
             draft_token_ids: spec_probs.draft_token_ids(),
@@ -233,14 +194,11 @@ impl Qwen35Executor {
         {
             let rejection_build_start = Instant::now();
             let runtime = MetalReplayRuntime::new(self.runtime.stream());
-            let (recorded_key, rejection_cache_hit) = rejection_sampling.record(&runtime, &component_input);
-            assert_eq!(
-                recorded_key, rejection_key,
-                "qwen3.5 rejection replay input must match its key"
-            );
+            let (rejection_key, rejection_cache_hit) = rejection_sampling.record(&runtime, &component_input);
             if !rejection_cache_hit {
                 recorder.rejection_build_elapsed += rejection_build_start.elapsed();
             }
+            recorder.rejection_key = Some(rejection_key);
         }
         self.sampler
             .set_configs(&sampler_configs, &sample_positions, SamplingDomain::Target);
@@ -261,14 +219,7 @@ impl Qwen35Executor {
                     .active_top_k(sampler_config)
                     .expect("qwen3.5 rejection sampler config should fit bounds"),
             });
-            target_offset = target_offset
-                .checked_add(
-                    usize::try_from(num_spec_tokens)
-                        .expect("qwen3.5 speculative-token count must fit host usize")
-                        .checked_add(1)
-                        .expect("qwen3.5 target distribution count must fit usize"),
-                )
-                .expect("qwen3.5 cumulative target-distribution offset must fit usize");
+            target_offset += num_spec_tokens as usize + 1;
         }
         assert_eq!(
             target_offset, num_active_target_distributions,
@@ -279,7 +230,6 @@ impl Qwen35Executor {
         self.sampler
             .add_replay_arguments(target_distribution_shape, &mut replay_arguments);
         rejector.add_replay_arguments(rejection_input, &mut replay_arguments);
-        recorder.rejection_key = Some(rejection_key);
         recorder.rejection_arguments = replay_arguments;
         recorder.rejection_prepared = Some(prepared);
     }
@@ -345,20 +295,4 @@ impl Qwen35Executor {
     pub fn num_spec_tokens(&self) -> usize {
         self.speculator.num_spec_tokens()
     }
-}
-
-fn mtp_sample_replay_shape(
-    sampler_bounds: TopKSamplingBounds,
-    sampler_configs: &[SamplerConfig],
-    max_requests: usize,
-) -> TopKSamplingShape {
-    let shape = sampler_bounds
-        .active_shape(sampler_configs)
-        .expect("qwen3.5 MTP sampling config must fit bounds");
-    let max_requests = u32::try_from(max_requests).expect("qwen3.5 MTP request capacity must fit u32");
-    let max_capacity = max_requests.min(sampler_bounds.max_sampling_inputs);
-    shape.with_num_total_sampling_inputs(replay_bucket_capacity(
-        shape.num_active_sampling_inputs,
-        max_capacity,
-    ))
 }

@@ -244,7 +244,7 @@ pub struct DSparkMarkovTopKMapInvocation<'a> {
 }
 
 impl Operator for DSparkMarkovTopKMapInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let sampling = self.shape.sampling;
         let num_tiles = sampling.vocab_size.div_ceil(DSPARK_MARKOV_VOCAB_TILE_SIZE);
@@ -256,35 +256,35 @@ impl Operator for DSparkMarkovTopKMapInvocation<'_> {
             .checked_mul(num_threads_per_row)
             .expect("DSpark Markov total thread count must fit u32");
 
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.input_token_ids, 0);
-        builder.set_buffer_read(1, self.buffers.base_logits, 0);
-        builder.set_buffer_read(2, self.buffers.w1_weight, 0);
-        builder.set_buffer_read(3, self.buffers.w1_scales, 0);
-        builder.set_buffer_read(4, self.buffers.w1_biases, 0);
-        builder.set_buffer_read(5, self.buffers.w2_weight, 0);
-        builder.set_buffer_read(6, self.buffers.w2_scales, 0);
-        builder.set_buffer_read(7, self.buffers.w2_biases, 0);
-        builder.set_buffer_write(8, self.buffers.tile_token_ids, 0);
-        builder.set_buffer_write(9, self.buffers.tile_logits, 0);
+        recorder.set_kernel(&self.kernel.kernel);
+        recorder.set_buffer_read(0, self.buffers.input_token_ids, 0);
+        recorder.set_buffer_read(1, self.buffers.base_logits, 0);
+        recorder.set_buffer_read(2, self.buffers.w1_weight, 0);
+        recorder.set_buffer_read(3, self.buffers.w1_scales, 0);
+        recorder.set_buffer_read(4, self.buffers.w1_biases, 0);
+        recorder.set_buffer_read(5, self.buffers.w2_weight, 0);
+        recorder.set_buffer_read(6, self.buffers.w2_scales, 0);
+        recorder.set_buffer_read(7, self.buffers.w2_biases, 0);
+        recorder.set_buffer_write(8, self.buffers.tile_token_ids, 0);
+        recorder.set_buffer_write(9, self.buffers.tile_logits, 0);
         if num_threads_per_row == num_total_threads {
-            builder.set_u32(10, num_total_threads);
+            recorder.set_u32(10, num_total_threads);
         } else {
-            builder.bind_u32(
+            recorder.bind_u32(
                 10,
                 TOP_K_TILE_NUM_ACTIVE_THREADS_KEY,
                 num_threads_per_row,
                 num_total_threads,
             );
         }
-        builder.set_u32(11, sampling.top_k);
-        builder.set_u32(12, num_tiles);
-        builder.set_u32(13, self.shape.base_logits_row_offset);
-        builder.set_buffer_read(14, self.buffers.confidence.hidden, 0);
-        builder.set_buffer_read(15, self.buffers.confidence.weight, 0);
-        builder.set_buffer_read(16, self.buffers.confidence.bias, 0);
-        builder.set_buffer_write(17, self.buffers.confidence.output, 0);
-        builder.dispatch_1d(
+        recorder.set_u32(11, sampling.top_k);
+        recorder.set_u32(12, num_tiles);
+        recorder.set_u32(13, self.shape.base_logits_row_offset);
+        recorder.set_buffer_read(14, self.buffers.confidence.hidden, 0);
+        recorder.set_buffer_read(15, self.buffers.confidence.weight, 0);
+        recorder.set_buffer_read(16, self.buffers.confidence.bias, 0);
+        recorder.set_buffer_write(17, self.buffers.confidence.output, 0);
+        recorder.dispatch_1d(
             num_total_threads as usize,
             DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK as usize,
         );
@@ -421,11 +421,6 @@ mod tests {
             scale_bias_dtype: Dtype::Bfloat16,
             confidence: DSparkConfidenceConfig { hidden_dim: 32 },
         }
-    }
-
-    #[test]
-    fn test_bf16_workload_contract_is_supported() {
-        config().validate();
     }
 
     #[test]

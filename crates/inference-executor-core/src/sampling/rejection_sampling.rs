@@ -1,3 +1,34 @@
+pub trait SpecMicrobatch {
+    fn num_reqs(&self) -> usize;
+    fn is_decode_req(&self, req_index: usize) -> bool;
+    fn num_spec_tokens(&self, req_index: usize) -> u32;
+    fn cu_tokens(&self) -> &[u32];
+    fn flat_token_ids(&self) -> &[i32];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SparseRejectionSamplingBounds {
+    pub max_reqs: u32,
+    pub max_draft_distributions: u32,
+    pub max_target_distributions: u32,
+    pub max_k: u32,
+}
+
+impl SparseRejectionSamplingBounds {
+    pub fn validate(self) {
+        assert!(self.max_reqs > 0, "sparse rejection sampling requires request capacity");
+        assert!(
+            self.max_draft_distributions > 0,
+            "sparse rejection sampling requires draft-distribution capacity"
+        );
+        assert!(
+            self.max_target_distributions > 0,
+            "sparse rejection sampling requires target-distribution capacity"
+        );
+        assert!(self.max_k > 0, "sparse rejection sampling requires top_k capacity");
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SparseRejectionSamplingShape {
     pub num_active_reqs: u32,

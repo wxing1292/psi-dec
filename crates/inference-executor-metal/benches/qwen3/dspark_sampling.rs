@@ -183,7 +183,13 @@ impl Fixture {
         markov
             .load_weights(device, &mut store, &bindings.markov, &bindings.confidence)
             .expect("unable to load Qwen3 DSpark Markov sampling");
-        let distribution_store = SpecProbsStore::new(device, config.block_size, num_requests, top_k);
+        let distribution_store = SpecProbsStore::new(
+            device,
+            config.block_size,
+            num_requests,
+            num_requests * (config.block_size + 1),
+            top_k,
+        );
         let req_slots = (0..num_requests)
             .map(|req_slot| {
                 req_slot

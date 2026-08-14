@@ -44,6 +44,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::replay::ReplayBucketPolicy;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::TopKSamplingBounds;
@@ -121,6 +122,7 @@ pub struct DSparkMarkovInput<'a> {
 pub struct DSparkMarkovSampling {
     block_size: usize,
     max_requests: usize,
+    bucket_policy: ReplayBucketPolicy,
     confidence_output: Buffer,
     top_k_map: DSparkMarkovTopKMapKernel,
     sample_reduce: TopKMergeKernels,
@@ -157,6 +159,7 @@ impl DSparkMarkovSampling {
         Self {
             block_size: config.block_size,
             max_requests,
+            bucket_policy: ReplayBucketPolicy::new(config.sampling.max_sampling_inputs),
             confidence_output,
             top_k_map,
             sample_reduce: TopKMergeKernels::new(device),
@@ -205,30 +208,21 @@ impl DSparkMarkovSampling {
                 .iter()
                 .map(|&anchor_position| {
                     anchor_position
-                        .checked_add(
-                            u32::try_from(step_index)
-                                .expect("DSpark Markov step index must fit u32")
-                                .checked_add(1)
-                                .expect("DSpark Markov step offset must fit u32"),
-                        )
+                        .checked_add(step_index as u32 + 1)
                         .expect("DSpark proposal sample position must fit u32")
                 })
                 .collect::<Vec<_>>();
             self.step_params[step_index].set_configs(sampler_configs, &sample_positions, SamplingDomain::Draft);
             let active = self.step_params[step_index].active_shape(sampler_configs);
-            let step_shape = active.with_num_total_sampling_inputs(replay_bucket_capacity(
-                active.num_active_sampling_inputs,
-                self.max_requests
-                    .try_into()
-                    .expect("DSpark maximum requests must fit u32"),
-            ));
+            let step_shape =
+                active.with_num_total_sampling_inputs(self.bucket_policy.capacity(active.num_active_sampling_inputs));
             match sampling {
                 Some(expected) => assert_eq!(step_shape, expected),
                 None => sampling = Some(step_shape),
             }
         }
         DSparkMarkovReplayShape {
-            num_requests: req_slots.len().try_into().expect("DSpark request count must fit u32"),
+            num_requests: req_slots.len() as u32,
             sampling: sampling.expect("DSpark Markov requires steps"),
         }
     }
@@ -247,35 +241,30 @@ impl DSparkMarkovSampling {
             } else {
                 &self.step_outputs[step_index - 1].token_ids
             };
-            recorder.record_with_barrier_before(ReplayOp::opaque(
-                self.top_k_map.invoke_replay(
-                    DSparkMarkovTopKMapShape {
-                        sampling,
-                        base_logits_row_offset: u32::try_from(step_index)
-                            .expect("DSpark Markov step index must fit u32")
-                            .checked_mul(shape.num_requests)
-                            .expect("DSpark Markov base-logit row offset must fit u32"),
+            recorder.record_with_barrier_before(ReplayOp::opaque(self.top_k_map.invoke_replay(
+                DSparkMarkovTopKMapShape {
+                    sampling,
+                    base_logits_row_offset: step_index as u32 * shape.num_requests,
+                },
+                DSparkMarkovTopKMapBuffers {
+                    input_token_ids,
+                    base_logits: input.base_logits,
+                    w1_weight: input.weights.w1_weight,
+                    w1_scales: input.weights.w1_scales,
+                    w1_biases: input.weights.w1_biases,
+                    w2_weight: input.weights.w2_weight,
+                    w2_scales: input.weights.w2_scales,
+                    w2_biases: input.weights.w2_biases,
+                    tile_token_ids: &self.tile_token_ids,
+                    tile_logits: &self.tile_logits,
+                    confidence: DSparkConfidenceBuffers {
+                        hidden: input.confidence.hidden,
+                        weight: input.confidence.weights.weight,
+                        bias: input.confidence.weights.bias,
+                        output: &self.confidence_output,
                     },
-                    DSparkMarkovTopKMapBuffers {
-                        input_token_ids,
-                        base_logits: input.base_logits,
-                        w1_weight: input.weights.w1_weight,
-                        w1_scales: input.weights.w1_scales,
-                        w1_biases: input.weights.w1_biases,
-                        w2_weight: input.weights.w2_weight,
-                        w2_scales: input.weights.w2_scales,
-                        w2_biases: input.weights.w2_biases,
-                        tile_token_ids: &self.tile_token_ids,
-                        tile_logits: &self.tile_logits,
-                        confidence: DSparkConfidenceBuffers {
-                            hidden: input.confidence.hidden,
-                            weight: input.confidence.weights.weight,
-                            bias: input.confidence.weights.bias,
-                            output: &self.confidence_output,
-                        },
-                    },
-                ),
-            ));
+                },
+            )));
             recorder.record_with_barrier_before(ReplayOp::opaque(
                 self.sample_reduce
                     .invoke_sample_and_write_distribution_with_vocab_tile_size(
@@ -289,11 +278,7 @@ impl DSparkMarkovSampling {
                             distribution_probs: input.distribution_store.draft_probs(),
                             runtime_params: self.step_params[step_index].buffer(),
                             output_distribution_indices: &self.step_distribution_indices[step_index],
-                            max_k: input
-                                .distribution_store
-                                .max_k()
-                                .try_into()
-                                .expect("DSpark distribution width must fit u32"),
+                            max_k: input.distribution_store.max_k() as u32,
                             num_output_distributions: input.distribution_store.num_draft_distributions(),
                         },
                         self.top_k_map.vocab_tile_size(),
@@ -364,6 +349,14 @@ impl DSparkMarkovSamplingConfig {
             self.vocab_size, self.sampling.vocab_size,
             "DSpark Markov map and sampling vocabularies must match"
         );
+        let max_rows = self
+            .block_size
+            .checked_mul(self.sampling.max_sampling_inputs as usize)
+            .expect("DSpark Markov row capacity must fit usize");
+        assert!(
+            u32::try_from(max_rows).is_ok(),
+            "DSpark Markov row capacity must fit u32"
+        );
     }
 }
 
@@ -381,13 +374,6 @@ fn map_config(config: DSparkMarkovSamplingConfig) -> DSparkMarkovTopKMapConfig {
             hidden_dim: config.confidence.hidden_dim,
         },
     }
-}
-
-fn replay_bucket_capacity(num_active: u32, max_capacity: u32) -> u32 {
-    assert!(num_active > 0 && num_active <= max_capacity);
-    num_active
-        .checked_next_power_of_two()
-        .map_or(max_capacity, |bucket| bucket.min(max_capacity))
 }
 
 fn component_shape(shape: TopKSamplingShape) -> TopKSampleShape {

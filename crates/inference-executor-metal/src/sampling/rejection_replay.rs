@@ -5,10 +5,11 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
-use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
+use inference_executor_core::replay::ReplayBucketPolicy;
+use inference_executor_core::sampling::SparseRejectionSamplingBounds;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::SparseRejectionSamplingShape;
+use inference_executor_core::sampling::SpecMicrobatch;
 use inference_executor_core::sampling::TopKSamplingLogitsDtype;
 use inference_executor_core::sampling::TopKSamplingShape;
 
@@ -22,63 +23,15 @@ use crate::sampling::top_k_sampling::TopKSampling;
 use crate::sampling::top_k_sampling::TopKSamplingInputs;
 use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
-pub trait SpecMicrobatch {
-    fn num_reqs(&self) -> usize;
-    fn is_decode_req(&self, req_index: usize) -> bool;
-    fn num_spec_tokens(&self, req_index: usize) -> u32;
-    fn cu_tokens(&self) -> &[u32];
-    fn flat_token_ids(&self) -> &[i32];
-}
-
-impl SpecMicrobatch for Qwen3Microbatch {
-    fn num_reqs(&self) -> usize {
-        Qwen3Microbatch::num_reqs(self)
-    }
-
-    fn is_decode_req(&self, req_index: usize) -> bool {
-        Qwen3Microbatch::is_decode_req(self, req_index)
-    }
-
-    fn num_spec_tokens(&self, req_index: usize) -> u32 {
-        Qwen3Microbatch::num_spec_tokens(self, req_index)
-    }
-
-    fn cu_tokens(&self) -> &[u32] {
-        Qwen3Microbatch::cu_tokens(self)
-    }
-
-    fn flat_token_ids(&self) -> &[i32] {
-        Qwen3Microbatch::flat_token_ids(self)
-    }
-}
-
-impl SpecMicrobatch for Qwen35Microbatch {
-    fn num_reqs(&self) -> usize {
-        Qwen35Microbatch::num_reqs(self)
-    }
-
-    fn is_decode_req(&self, req_index: usize) -> bool {
-        Qwen35Microbatch::is_decode_req(self, req_index)
-    }
-
-    fn num_spec_tokens(&self, req_index: usize) -> u32 {
-        Qwen35Microbatch::num_spec_tokens(self, req_index)
-    }
-
-    fn cu_tokens(&self) -> &[u32] {
-        Qwen35Microbatch::cu_tokens(self)
-    }
-
-    fn flat_token_ids(&self) -> &[i32] {
-        Qwen35Microbatch::flat_token_ids(self)
-    }
-}
-
 pub struct RejectionSampler {
     sparse_sampler: SparseRejectionSampling,
-    max_requests: usize,
-    max_num_spec_tokens: usize,
+    max_requests: u32,
+    max_num_spec_tokens: u32,
+    max_target_distributions: u32,
     max_k: u32,
+    request_bucket_policy: ReplayBucketPolicy,
+    draft_distribution_bucket_policy: ReplayBucketPolicy,
+    target_distribution_bucket_policy: ReplayBucketPolicy,
     cu_target_distributions: Buffer,
     cu_draft_distributions: Buffer,
     flat_draft_token_ids: Buffer,
@@ -92,12 +45,7 @@ pub struct RejectionSampler {
 
 #[derive(Clone, Copy)]
 pub struct RejectionSamplerInput<'a> {
-    pub num_active_decode_reqs: usize,
-    pub num_decode_req_capacity: usize,
-    pub num_target_distribution_capacity: usize,
-    pub num_active_draft_distributions: usize,
-    pub num_draft_distribution_capacity: usize,
-    pub top_k: u32,
+    pub shape: SparseRejectionSamplingShape,
     pub target_token_ids: &'a Buffer,
     pub target_probs: &'a Buffer,
     pub draft_token_ids: &'a Buffer,
@@ -110,14 +58,6 @@ pub struct PreparedRejection {
     pub num_active_draft_distributions: usize,
 }
 
-impl RejectionSamplerInput<'_> {
-    fn num_active_target_distributions(self) -> usize {
-        self.num_active_draft_distributions
-            .checked_add(self.num_active_decode_reqs)
-            .expect("rejection sampling target-distribution count overflow")
-    }
-}
-
 pub struct RejectionResults {
     flat_accepted_token_ids: Vec<i32>,
     flat_accepted_probs: Vec<f32>,
@@ -128,9 +68,7 @@ pub struct RejectionResults {
 
 impl RejectionResults {
     pub fn num_accepted_tokens(&self, decode_req_index: usize) -> usize {
-        self.num_accepted_tokens[decode_req_index]
-            .try_into()
-            .expect("rejection sampling accepted-token count must fit host usize")
+        self.num_accepted_tokens[decode_req_index] as usize
     }
 
     pub fn accepted_token_ids(&self, flat_draft_index: usize, num_tokens: usize) -> &[i32] {
@@ -156,50 +94,51 @@ impl PreparedRejection {
     }
 
     pub fn num_active_target_distributions(&self) -> usize {
-        self.num_active_draft_distributions
-            .checked_add(self.num_active_decode_reqs())
-            .expect("rejection sampling target-distribution count overflow")
+        self.num_active_draft_distributions + self.num_active_decode_reqs()
     }
 }
 
 impl RejectionSampler {
-    fn validate_input(&self, input: RejectionSamplerInput<'_>) {
-        assert!(input.top_k > 0, "rejection sampling top_k is empty");
+    pub fn new(
+        device: &Device,
+        max_num_spec_tokens: usize,
+        max_requests: usize,
+        max_tokens: usize,
+        max_k: u32,
+    ) -> Self {
         assert!(
-            input.num_active_target_distributions() <= input.num_target_distribution_capacity,
-            "rejection sampling active target distributions exceed replay capacity"
+            max_num_spec_tokens > 0,
+            "rejection sampling requires speculative tokens"
         );
-    }
-
-    pub fn new(device: &Device, max_num_spec_tokens: usize, max_requests: usize, max_k: u32) -> Self {
         assert!(max_requests > 0, "rejection sampling requires requests");
+        assert!(max_tokens > 0, "rejection sampling requires target distributions");
         let max_draft_distributions: u32 = max_requests
-            .checked_mul(max_num_spec_tokens.max(1))
+            .checked_mul(max_num_spec_tokens)
             .expect("rejection sampling draft distributions overflow")
             .try_into()
             .expect("rejection sampling draft-distribution count must fit u32");
         let max_requests_u32: u32 = max_requests
             .try_into()
             .expect("rejection sampling request capacity must fit u32");
-        let max_target_distributions = max_draft_distributions
-            .checked_add(max_requests_u32)
-            .expect("rejection sampling target-distribution count must fit u32");
-        let max_shape = SparseRejectionSamplingShape {
-            num_active_reqs: max_requests_u32,
-            num_total_reqs: max_requests_u32,
-            num_active_draft_distributions: max_draft_distributions,
-            num_total_draft_distributions: max_draft_distributions,
-            num_active_target_distributions: max_target_distributions,
-            num_total_target_distributions: max_target_distributions,
-            top_k: max_k,
-            max_target_k: max_k,
-            max_draft_k: max_k,
+        let max_num_spec_tokens_u32 =
+            u32::try_from(max_num_spec_tokens).expect("rejection sampling spec-token capacity must fit u32");
+        let max_target_distributions =
+            u32::try_from(max_tokens).expect("rejection sampling target-distribution capacity must fit u32");
+        let bounds = SparseRejectionSamplingBounds {
+            max_reqs: max_requests_u32,
+            max_draft_distributions,
+            max_target_distributions,
+            max_k,
         };
         Self {
-            sparse_sampler: SparseRejectionSampling::new(device, max_shape),
-            max_requests,
-            max_num_spec_tokens,
+            sparse_sampler: SparseRejectionSampling::new(device, bounds),
+            max_requests: max_requests_u32,
+            max_num_spec_tokens: max_num_spec_tokens_u32,
+            max_target_distributions,
             max_k,
+            request_bucket_policy: ReplayBucketPolicy::new(max_requests_u32),
+            draft_distribution_bucket_policy: ReplayBucketPolicy::new(max_draft_distributions),
+            target_distribution_bucket_policy: ReplayBucketPolicy::new(max_target_distributions),
             cu_target_distributions: Buffer::new_zeroed_elements(
                 device,
                 max_requests
@@ -242,27 +181,31 @@ impl RejectionSampler {
         let num_decode_reqs = decode_req_indices.len();
         assert!(num_decode_reqs > 0, "rejection sampling requires decode requests");
         assert!(
-            num_decode_reqs <= self.max_requests,
+            num_decode_reqs <= self.max_requests as usize,
             "rejection sampling requests exceed sampler capacity"
         );
         let num_draft_distributions = decode_req_indices
             .iter()
             .map(|&req_index| microbatch.num_spec_tokens(req_index) as usize)
             .sum::<usize>();
+        assert!(
+            num_draft_distributions <= (self.max_requests * self.max_num_spec_tokens) as usize,
+            "rejection sampling draft distributions exceed sampler capacity"
+        );
+        assert!(
+            num_draft_distributions + num_decode_reqs <= self.max_target_distributions as usize,
+            "rejection sampling target distributions exceed max_tokens"
+        );
         assert_eq!(
             flat_draft_distribution_indices.len(),
             num_draft_distributions,
             "rejection sampling draft-distribution indices must match flat drafts"
         );
-        let draft_capacity = self
-            .max_requests
-            .checked_mul(self.max_num_spec_tokens)
-            .expect("rejection sampling draft-distribution capacity overflow");
+        let draft_capacity = (self.max_requests * self.max_num_spec_tokens) as usize;
         assert!(
-            flat_draft_distribution_indices.iter().all(|&index| {
-                usize::try_from(index).expect("rejection sampling draft-distribution index must fit host usize")
-                    < draft_capacity
-            }),
+            flat_draft_distribution_indices
+                .iter()
+                .all(|&index| (index as usize) < draft_capacity),
             "rejection sampling draft-distribution index exceeds sampler capacity"
         );
         let mut cu_target = Vec::with_capacity(num_decode_reqs + 1);
@@ -273,7 +216,7 @@ impl RejectionSampler {
         for &req_index in &decode_req_indices {
             let draft_len = microbatch.num_spec_tokens(req_index) as usize;
             assert!(
-                draft_len <= self.max_num_spec_tokens,
+                draft_len <= self.max_num_spec_tokens as usize,
                 "rejection sampling num_spec_tokens exceeds sampler capacity"
             );
             let q_end = microbatch.cu_tokens()[req_index + 1] as usize;
@@ -281,19 +224,8 @@ impl RejectionSampler {
                 .checked_sub(draft_len)
                 .expect("rejection sampling draft suffix exceeds request flat num_tokens");
             flat_draft_tokens.extend_from_slice(&microbatch.flat_token_ids()[q_start..q_end]);
-            cu_draft.push(
-                flat_draft_tokens
-                    .len()
-                    .try_into()
-                    .expect("rejection sampling cumulative draft count must fit u32"),
-            );
-            cu_target.push(
-                flat_draft_tokens
-                    .len()
-                    .checked_add(cu_target.len())
-                    .and_then(|count| count.try_into().ok())
-                    .expect("rejection sampling cumulative target count must fit u32"),
-            );
+            cu_draft.push(flat_draft_tokens.len() as u32);
+            cu_target.push((flat_draft_tokens.len() + cu_target.len()) as u32);
         }
         self.cu_target_distributions.write_typed(0, &cu_target);
         self.cu_draft_distributions.write_typed(0, &cu_draft);
@@ -306,14 +238,55 @@ impl RejectionSampler {
         }
     }
 
+    pub fn prepare_replay_shape(&self, prepared: &PreparedRejection, top_k: u32) -> SparseRejectionSamplingShape {
+        let num_active_reqs = prepared.num_active_decode_reqs();
+        let num_active_draft_distributions = prepared.num_active_draft_distributions;
+        assert!(
+            num_active_reqs > 0 && num_active_reqs <= self.max_requests as usize,
+            "rejection sampling prepared requests exceed sampler capacity"
+        );
+        assert!(
+            num_active_draft_distributions <= (self.max_requests * self.max_num_spec_tokens) as usize,
+            "rejection sampling prepared draft distributions exceed sampler capacity"
+        );
+        let num_active_target_distributions = num_active_draft_distributions + num_active_reqs;
+        assert!(
+            num_active_target_distributions <= self.max_target_distributions as usize,
+            "rejection sampling prepared target distributions exceed sampler capacity"
+        );
+        assert!(
+            top_k > 0 && top_k <= self.max_k,
+            "rejection sampling top_k exceeds capacity"
+        );
+        let num_active_reqs = num_active_reqs as u32;
+        let num_active_draft_distributions = num_active_draft_distributions as u32;
+        let num_active_target_distributions = num_active_target_distributions as u32;
+        let shape = SparseRejectionSamplingShape {
+            num_active_reqs,
+            num_total_reqs: self.request_bucket_policy.capacity(num_active_reqs),
+            num_active_draft_distributions,
+            num_total_draft_distributions: self
+                .draft_distribution_bucket_policy
+                .capacity_allow_zero(num_active_draft_distributions),
+            num_active_target_distributions,
+            num_total_target_distributions: self
+                .target_distribution_bucket_policy
+                .capacity(num_active_target_distributions),
+            top_k,
+            max_target_k: self.max_k,
+            max_draft_k: self.max_k,
+        };
+        shape.validate();
+        shape
+    }
+
     pub fn record<'a, R>(&'a self, recorder: &mut R, input: RejectionSamplerInput<'a>)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.validate_input(input);
         self.sparse_sampler.record(
             recorder,
-            self.sampling_shape(input),
+            input.shape,
             SparseRejectionSamplingInputs {
                 target_distribution_token_ids: input.target_token_ids,
                 target_distribution_probs: input.target_probs,
@@ -335,41 +308,7 @@ impl RejectionSampler {
     }
 
     pub fn add_replay_arguments(&self, input: RejectionSamplerInput<'_>, arguments: &mut ReplayArguments) {
-        self.validate_input(input);
-        self.sparse_sampler
-            .add_replay_arguments(self.sampling_shape(input), arguments);
-    }
-
-    fn sampling_shape(&self, input: RejectionSamplerInput<'_>) -> SparseRejectionSamplingShape {
-        SparseRejectionSamplingShape {
-            num_active_reqs: input
-                .num_active_decode_reqs
-                .try_into()
-                .expect("rejection sampling active decode request count must fit u32"),
-            num_total_reqs: input
-                .num_decode_req_capacity
-                .try_into()
-                .expect("rejection sampling decode request capacity must fit u32"),
-            num_active_draft_distributions: input
-                .num_active_draft_distributions
-                .try_into()
-                .expect("rejection sampling active draft-distribution count must fit u32"),
-            num_total_draft_distributions: input
-                .num_draft_distribution_capacity
-                .try_into()
-                .expect("rejection sampling draft-distribution capacity must fit u32"),
-            num_active_target_distributions: input
-                .num_active_target_distributions()
-                .try_into()
-                .expect("rejection sampling active target-distribution count must fit u32"),
-            num_total_target_distributions: input
-                .num_target_distribution_capacity
-                .try_into()
-                .expect("rejection sampling target-distribution capacity must fit u32"),
-            top_k: input.top_k,
-            max_target_k: self.max_k,
-            max_draft_k: self.max_k,
-        }
+        self.sparse_sampler.add_replay_arguments(input.shape, arguments);
     }
 
     pub fn set_runtime_params(&self, params: &[SparseRejectionSamplingReqParams]) {
@@ -377,8 +316,8 @@ impl RejectionSampler {
     }
 
     pub fn read_results(&self, num_decode_reqs: usize, num_draft_distributions: usize) -> RejectionResults {
-        debug_assert!(num_decode_reqs <= self.max_requests);
-        debug_assert!(num_draft_distributions <= self.max_requests * self.max_num_spec_tokens);
+        debug_assert!(num_decode_reqs <= self.max_requests as usize);
+        debug_assert!(num_draft_distributions <= (self.max_requests * self.max_num_spec_tokens) as usize);
         RejectionResults {
             flat_accepted_token_ids: self
                 .flat_accepted_token_ids
@@ -393,108 +332,84 @@ impl RejectionSampler {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Device;
+    use inference_backend_metal::metal::Dtype;
+    use inference_backend_metal::metal::Stream;
     use inference_executor_core::attn::gdn::state::GDNStateTxn;
     use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
     use inference_executor_core::sampling::SamplerConfig;
+    use inference_executor_core::sampling::SparseRejectionSamplingShape;
+    use inference_executor_core::sampling::TopKSamplingBounds;
+    use inference_executor_core::sampling::TopKSamplingShape;
 
+    use super::PreparedRejection;
     use super::RejectionSampler;
+    use super::RejectionSamplerInput;
+    use super::RejectionSampling;
+    use super::RejectionSamplingInput;
+    use crate::def::replay_op::MetalReplayRuntime;
+    use crate::replay::Replay;
     use crate::sampling::spec_probs::SpecProbsStore;
+    use crate::sampling::top_k_sampling::TopKSampling;
+    use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
     #[test]
-    fn test_ragged_non_contiguous_request_slots() {
+    fn test_prepare_inputs_handles_mixed_ragged_requests_and_zero_drafts() {
         let device = Device::system_default();
-        let sampler = RejectionSampler::new(&device, 3, 4, 4);
-        let distributions = SpecProbsStore::new(&device, 3, 4, 4);
+        let sampler = RejectionSampler::new(&device, 3, 5, 6, 4);
+        let distributions = SpecProbsStore::new(&device, 3, 5, 6, 4);
         let batch = Qwen35Microbatch::new(
-            vec![0, 2],
-            vec![0, 0],
-            vec![5, 8],
-            vec![10, 11, 12, 20, 21],
-            vec![0, 3, 5],
-            vec![GDNStateTxn::new(5, 3, 2), GDNStateTxn::new(8, 2, 1)],
-            vec![Vec::new(), Vec::new()],
-            vec![SamplerConfig::default(), SamplerConfig::default()],
-            vec![true; 5],
+            vec![4, 0, 3, 1],
+            vec![0, 0, 0, 0],
+            vec![5, 8, 11, 15],
+            vec![10, 11, 20, 30, 31, 32, 40, 41],
+            vec![0, 2, 3, 6, 8],
+            vec![
+                GDNStateTxn::new(5, 2, 0),
+                GDNStateTxn::new(8, 1, 0),
+                GDNStateTxn::new(11, 3, 2),
+                GDNStateTxn::new(15, 2, 1),
+            ],
+            vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            vec![SamplerConfig::default(); 4],
+            vec![false, false, true, true, true, true, true, true],
         );
         let draft_distribution_indices = [
-            distributions.draft_distribution_index(0, 0),
-            distributions.draft_distribution_index(0, 1),
-            distributions.draft_distribution_index(2, 0),
+            distributions.draft_distribution_index(3, 0),
+            distributions.draft_distribution_index(3, 1),
+            distributions.draft_distribution_index(1, 0),
         ];
 
         let prepared = sampler.prepare_inputs(&batch, &draft_distribution_indices);
-        assert_eq!(prepared.decode_req_indices, vec![0, 1]);
+        let shape = sampler.prepare_replay_shape(&prepared, 4);
+        assert_eq!(prepared.decode_req_indices, vec![1, 2, 3]);
         assert_eq!(prepared.num_active_draft_distributions, 3);
-        assert_eq!(prepared.num_active_target_distributions(), 5);
-        assert_eq!(sampler.cu_draft_distributions.read_typed::<u32>(0, 3), vec![0, 2, 3]);
-        assert_eq!(sampler.cu_target_distributions.read_typed::<u32>(0, 3), vec![0, 3, 5]);
-        assert_eq!(sampler.flat_draft_token_ids.read_typed::<i32>(0, 3), vec![11, 12, 21]);
+        assert_eq!(prepared.num_active_target_distributions(), 6);
+        assert_eq!(shape.num_active_reqs, 3);
+        assert_eq!(shape.num_total_reqs, 4);
+        assert_eq!(shape.num_active_draft_distributions, 3);
+        assert_eq!(shape.num_total_draft_distributions, 4);
+        assert_eq!(shape.num_active_target_distributions, 6);
+        assert_eq!(shape.num_total_target_distributions, 6);
+        assert_eq!(sampler.cu_draft_distributions.read_typed::<u32>(0, 4), vec![0, 0, 2, 3]);
+        assert_eq!(
+            sampler.cu_target_distributions.read_typed::<u32>(0, 4),
+            vec![0, 1, 4, 6]
+        );
+        assert_eq!(sampler.flat_draft_token_ids.read_typed::<i32>(0, 3), vec![31, 32, 41]);
         assert_eq!(
             sampler.flat_draft_distribution_indices.read_typed::<u32>(0, 3),
-            vec![0, 1, 6]
+            vec![9, 10, 3]
         );
-    }
-
-    #[test]
-    fn test_mixed_inputs() {
-        let device = Device::system_default();
-        let sampler = RejectionSampler::new(&device, 2, 4, 4);
-        let batch = Qwen35Microbatch::new(
-            vec![0, 1, 2],
-            vec![0, 0, 0],
-            vec![3, 7, 9],
-            vec![10, 11, 20, 30, 31, 32],
-            vec![0, 2, 3, 6],
-            vec![
-                GDNStateTxn::new(3, 2, 0),
-                GDNStateTxn::new(7, 1, 0),
-                GDNStateTxn::new(9, 3, 2),
-            ],
-            vec![Vec::new(), Vec::new(), Vec::new()],
-            vec![SamplerConfig::default(); 3],
-            vec![false, false, true, true, true, true],
-        );
-
-        let prepared = sampler.prepare_inputs(&batch, &[5, 6]);
-
-        assert_eq!(prepared.decode_req_indices, vec![1, 2]);
-        assert_eq!(prepared.num_active_draft_distributions, 2);
-        assert_eq!(prepared.num_active_target_distributions(), 4);
-        assert_eq!(sampler.cu_draft_distributions.read_typed::<u32>(0, 3), vec![0, 0, 2]);
-        assert_eq!(sampler.cu_target_distributions.read_typed::<u32>(0, 3), vec![0, 1, 4]);
-        assert_eq!(sampler.flat_draft_token_ids.read_typed::<i32>(0, 2), vec![31, 32]);
-    }
-
-    #[test]
-    fn test_zero_drafts() {
-        let device = Device::system_default();
-        let sampler = RejectionSampler::new(&device, 2, 4, 4);
-        let batch = Qwen35Microbatch::new(
-            vec![0, 1],
-            vec![0, 0],
-            vec![3, 7],
-            vec![10, 11, 20],
-            vec![0, 2, 3],
-            vec![GDNStateTxn::new(3, 2, 0), GDNStateTxn::new(7, 1, 0)],
-            vec![Vec::new(), Vec::new()],
-            vec![SamplerConfig::default(); 2],
-            vec![false, true, true],
-        );
-
-        let prepared = sampler.prepare_inputs(&batch, &[]);
-
-        assert_eq!(prepared.decode_req_indices, vec![0, 1]);
-        assert_eq!(prepared.num_active_draft_distributions, 0);
-        assert_eq!(prepared.num_active_target_distributions(), 2);
-        assert_eq!(sampler.cu_draft_distributions.read_typed::<u32>(0, 3), vec![0, 0, 0]);
-        assert_eq!(sampler.cu_target_distributions.read_typed::<u32>(0, 3), vec![0, 1, 2]);
     }
 
     #[test]
     fn test_result_prefixes() {
         let device = Device::system_default();
-        let sampler = RejectionSampler::new(&device, 2, 4, 4);
+        let sampler = RejectionSampler::new(&device, 2, 4, 12, 4);
         sampler.flat_accepted_token_ids.write_typed(0, &[11_i32, 12, 21]);
         sampler.flat_accepted_probs.write_typed(0, &[0.1_f32, 0.2, 0.3]);
         sampler.num_accepted_tokens.write_typed(0, &[2_u32, 1]);
@@ -513,6 +428,84 @@ mod tests {
         assert_eq!(results.sampled_prob(0), 0.4);
         assert_eq!(results.sampled_prob(1), 0.5);
     }
+
+    #[test]
+    #[should_panic(expected = "prepared draft distributions exceed sampler capacity")]
+    fn test_prepare_replay_shape_validates_public_prepared_input() {
+        let device = Device::system_default();
+        let sampler = RejectionSampler::new(&device, 2, 2, 6, 4);
+        let prepared = PreparedRejection {
+            decode_req_indices: vec![0],
+            num_active_draft_distributions: 5,
+        };
+
+        let _ = sampler.prepare_replay_shape(&prepared, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "target sampling capacity must match target-distribution capacity")]
+    fn test_replay_cache_validates_cross_component_shape_before_lookup() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let sampler = Rc::new(TopKSampling::new(
+            &device,
+            TopKSamplingBounds {
+                max_sampling_inputs: 8,
+                vocab_size: 16,
+                top_k: 4,
+            },
+        ));
+        let rejector = Rc::new(RejectionSampler::new(&device, 2, 4, 8, 4));
+        let mut replay = Replay::new("test rejection", RejectionSampling::new(sampler, rejector));
+        let runtime = MetalReplayRuntime::new(&stream);
+        let spec_probs = SpecProbsStore::new(&device, 2, 4, 8, 4);
+        let logits = Buffer::new_zeroed_elements(&device, 16, Dtype::Bfloat16);
+        let target_distribution_indices = Buffer::new_zeroed_elements(&device, 8, Dtype::Uint32);
+        let input = RejectionSamplingInput {
+            target_shape: TopKSamplingShape {
+                num_active_sampling_inputs: 1,
+                num_total_sampling_inputs: 1,
+                vocab_size: 16,
+                top_k: 4,
+            },
+            logits: &logits,
+            target_sparse: TopKSamplingWriteDistributionOutput {
+                token_ids: spec_probs.target_token_ids(),
+                probs: spec_probs.target_probs(),
+                output_distribution_indices: &target_distribution_indices,
+                max_k: 4,
+                num_output_distributions: 8,
+            },
+            rejection: RejectionSamplerInput {
+                shape: SparseRejectionSamplingShape {
+                    num_active_reqs: 1,
+                    num_total_reqs: 1,
+                    num_active_draft_distributions: 0,
+                    num_total_draft_distributions: 0,
+                    num_active_target_distributions: 1,
+                    num_total_target_distributions: 1,
+                    top_k: 4,
+                    max_target_k: 4,
+                    max_draft_k: 4,
+                },
+                target_token_ids: spec_probs.target_token_ids(),
+                target_probs: spec_probs.target_probs(),
+                draft_token_ids: spec_probs.draft_token_ids(),
+                draft_probs: spec_probs.draft_probs(),
+            },
+        };
+        let (_, cache_hit) = replay.record(&runtime, &input);
+        assert!(!cache_hit);
+        let mismatched_input = RejectionSamplingInput {
+            target_shape: TopKSamplingShape {
+                num_total_sampling_inputs: 2,
+                ..input.target_shape
+            },
+            ..input
+        };
+
+        let _ = replay.record(&runtime, &mismatched_input);
+    }
 }
 
 pub struct RejectionSampling {
@@ -527,6 +520,21 @@ impl RejectionSampling {
 
     pub fn rejector(&self) -> &Rc<RejectionSampler> {
         &self.rejector
+    }
+
+    fn validate_replay_input(input: &RejectionSamplingInput<'_>) {
+        assert_eq!(
+            input.target_shape.num_active_sampling_inputs, input.rejection.shape.num_active_target_distributions,
+            "rejection target sampling rows must match active target distributions"
+        );
+        assert_eq!(
+            input.target_shape.num_total_sampling_inputs, input.rejection.shape.num_total_target_distributions,
+            "rejection target sampling capacity must match target-distribution capacity"
+        );
+        assert_eq!(
+            input.target_shape.top_k, input.rejection.shape.top_k,
+            "rejection target sampling top_k must match rejection top_k"
+        );
     }
 }
 
@@ -543,11 +551,12 @@ impl ReplayComponent for RejectionSampling {
     type Input<'a> = RejectionSamplingInput<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
+        Self::validate_replay_input(input);
         RejectionReplayKey {
-            num_decode_req_capacity: input.rejection.num_decode_req_capacity,
-            num_target_distribution_capacity: input.rejection.num_target_distribution_capacity,
-            num_draft_distribution_capacity: input.rejection.num_draft_distribution_capacity,
-            top_k: input.rejection.top_k,
+            num_total_reqs: input.rejection.shape.num_total_reqs,
+            num_total_target_distributions: input.rejection.shape.num_total_target_distributions,
+            num_total_draft_distributions: input.rejection.shape.num_total_draft_distributions,
+            top_k: input.rejection.shape.top_k,
         }
     }
 
@@ -568,24 +577,8 @@ impl ReplayComponent for RejectionSampling {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RejectionReplayKey {
-    num_decode_req_capacity: usize,
-    num_target_distribution_capacity: usize,
-    num_draft_distribution_capacity: usize,
+    num_total_reqs: u32,
+    num_total_target_distributions: u32,
+    num_total_draft_distributions: u32,
     top_k: u32,
-}
-
-impl RejectionReplayKey {
-    pub fn new(
-        num_decode_req_capacity: usize,
-        num_target_distribution_capacity: usize,
-        num_draft_distribution_capacity: usize,
-        top_k: u32,
-    ) -> Self {
-        Self {
-            num_decode_req_capacity,
-            num_target_distribution_capacity,
-            num_draft_distribution_capacity,
-            top_k,
-        }
-    }
 }

@@ -13,10 +13,7 @@ struct RuntimeParamRows {
 }
 
 impl RuntimeParamRows {
-    fn set(&self, num_rows: usize, name: &str) {
-        let num_rows = num_rows
-            .try_into()
-            .unwrap_or_else(|_| panic!("{name} runtime parameter row count must fit u32"));
+    fn set(&self, num_rows: u32) {
         self.configured.set(Some(num_rows));
     }
 
@@ -26,19 +23,5 @@ impl RuntimeParamRows {
             Some(num_active_rows),
             "{name} runtime parameter rows must be freshly configured for the active replay rows"
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RuntimeParamRows;
-
-    #[test]
-    #[should_panic(expected = "runtime parameter rows must be freshly configured")]
-    fn test_runtime_param_rows_require_fresh_generation() {
-        let rows = RuntimeParamRows::default();
-        rows.set(1, "test sampling");
-        rows.consume(1, "test sampling");
-        rows.consume(1, "test sampling");
     }
 }

@@ -11,73 +11,62 @@ pub struct ReferenceSampleRow {
     pub prob_values: Vec<f32>,
 }
 
-pub fn dense_unembed_sparse_sample_reference(
-    config: &SamplerConfig,
-    hidden: &[f32],
-    rows: usize,
-    hidden_dim: usize,
-    unembed_weight: &[f32],
-    vocab: usize,
-    distribution_len: usize,
-) -> Vec<ReferenceSampleRow> {
-    assert_eq!(hidden.len(), rows * hidden_dim);
-    assert_eq!(unembed_weight.len(), vocab * hidden_dim);
-    (0..rows)
-        .map(|row| {
-            let mut logits = vec![0.0f32; vocab];
-            for token in 0..vocab {
-                let mut sum = 0.0f32;
-                for dim in 0..hidden_dim {
-                    sum += hidden[row * hidden_dim + dim] * unembed_weight[token * hidden_dim + dim];
-                }
-                logits[token] = sum;
-            }
-            sparse_sample_row_reference(config, &logits, distribution_len, row as u32)
-        })
-        .collect()
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceRejectionDecision {
+    pub accepted_tokens: Vec<u32>,
+    pub accepted_probs: Vec<f32>,
+    pub sampled_token: u32,
+    pub sampled_prob: f32,
 }
 
 pub fn sparse_sample_row_reference(
     config: &SamplerConfig,
     logits: &[f32],
     distribution_len: usize,
-    row: u32,
+    sample_position: u32,
 ) -> ReferenceSampleRow {
-    sparse_sample_row_with_domain_reference(config, logits, distribution_len, row, SamplingDomain::Target)
+    sparse_sample_row_with_domain_reference(
+        config,
+        logits,
+        distribution_len,
+        sample_position,
+        SamplingDomain::Target,
+    )
 }
 
 pub fn sparse_sample_row_with_domain_reference(
     config: &SamplerConfig,
     logits: &[f32],
     distribution_len: usize,
-    row: u32,
+    sample_position: u32,
     domain: SamplingDomain,
 ) -> ReferenceSampleRow {
     assert!(!logits.is_empty());
     assert!(distribution_len > 0);
+    assert!(i32::try_from(logits.len()).is_ok());
     let mut candidates = logits
         .iter()
         .enumerate()
-        .filter_map(|(token, &logit)| logit.is_finite().then_some((token as i32, logit)))
+        .filter_map(|(token_index, &logit)| logit.is_finite().then_some((token_index as i32, logit)))
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap().then_with(|| left.0.cmp(&right.0)));
     candidates.truncate(distribution_len);
     if candidates.is_empty() {
-        return sparse_row_from_kept(0, 1.0, &[(0, 1.0)], distribution_len);
+        return build_sparse_sample_row(0, 1.0, &[(0, 1.0)], distribution_len);
     }
     if config.is_greedy() || candidates.len() == 1 {
-        return sparse_row_from_kept(candidates[0].0 as u32, 1.0, &[(candidates[0].0, 1.0)], distribution_len);
+        return build_sparse_sample_row(candidates[0].0 as u32, 1.0, &[(candidates[0].0, 1.0)], distribution_len);
     }
 
-    let temp = config.temperature.max(1.0e-6);
-    let max_scaled = candidates[0].1 / temp;
+    let temperature = config.temperature.max(1.0e-6);
+    let max_scaled_logit = candidates[0].1 / temperature;
     let weights = candidates
         .iter()
-        .map(|(_, logit)| ((*logit / temp) - max_scaled).exp())
+        .map(|(_, logit)| ((*logit / temperature) - max_scaled_logit).exp())
         .collect::<Vec<_>>();
     let total = weights.iter().sum::<f32>();
     if total <= 0.0 || !total.is_finite() {
-        return sparse_row_from_kept(candidates[0].0 as u32, 1.0, &[(candidates[0].0, 1.0)], distribution_len);
+        return build_sparse_sample_row(candidates[0].0 as u32, 1.0, &[(candidates[0].0, 1.0)], distribution_len);
     }
 
     let mut kept_total = 0.0f32;
@@ -93,49 +82,22 @@ pub fn sparse_sample_row_with_domain_reference(
         .iter()
         .zip(weights.iter())
         .take(kept_count)
-        .map(|((token, _), weight)| (*token, *weight / kept_total))
+        .map(|((token_index, _), weight)| (*token_index, *weight / kept_total))
         .collect::<Vec<_>>();
 
-    let draw = sampling_uniform(config.seed(), row, domain) * kept.iter().map(|(_, prob)| *prob).sum::<f32>();
+    let draw = sampling_uniform(config.seed(), sample_position, domain)
+        * kept.iter().map(|(_, probability)| *probability).sum::<f32>();
     let mut cumulative = 0.0f32;
     let mut selected = kept_count - 1;
-    for (slot, (_, prob)) in kept.iter().enumerate() {
-        cumulative += *prob;
+    for (slot, (_, probability)) in kept.iter().enumerate() {
+        cumulative += *probability;
         if cumulative >= draw {
             selected = slot;
             break;
         }
     }
 
-    sparse_row_from_kept(kept[selected].0 as u32, kept[selected].1, &kept, distribution_len)
-}
-
-fn sparse_row_from_kept(
-    sampled_token: u32,
-    sampled_prob: f32,
-    kept: &[(i32, f32)],
-    distribution_len: usize,
-) -> ReferenceSampleRow {
-    let mut prob_token_ids = vec![-1; distribution_len];
-    let mut prob_values = vec![0.0; distribution_len];
-    for (slot, &(token, prob)) in kept.iter().take(distribution_len).enumerate() {
-        prob_token_ids[slot] = token;
-        prob_values[slot] = prob;
-    }
-    ReferenceSampleRow {
-        sampled_token,
-        sampled_prob,
-        prob_token_ids,
-        prob_values,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReferenceRejectionDecision {
-    pub accepted_tokens: Vec<u32>,
-    pub accepted_probs: Vec<f32>,
-    pub sampled_token: u32,
-    pub sampled_prob: f32,
+    build_sparse_sample_row(kept[selected].0 as u32, kept[selected].1, &kept, distribution_len)
 }
 
 pub fn rejection_sample_reference(
@@ -145,41 +107,41 @@ pub fn rejection_sample_reference(
     seed: u32,
     sample_position: u32,
 ) -> ReferenceRejectionDecision {
+    assert!(u32::try_from(draft_tokens.len()).is_ok());
+    assert!(sample_position <= u32::MAX - draft_tokens.len() as u32);
     assert_eq!(target_prob_rows.len(), draft_tokens.len() + 1);
     assert_eq!(draft_prob_rows.len(), draft_tokens.len());
     let mut accepted_tokens = Vec::new();
     let mut accepted_probs = Vec::new();
     for (spec_offset, &draft_token) in draft_tokens.iter().enumerate() {
-        let target = &target_prob_rows[spec_offset];
-        let draft = &draft_prob_rows[spec_offset];
-        assert_eq!(target.len(), draft.len());
+        let target_probs = &target_prob_rows[spec_offset];
+        let draft_probs = &draft_prob_rows[spec_offset];
+        assert_eq!(target_probs.len(), draft_probs.len());
         let token_index = draft_token as usize;
-        assert!(token_index < target.len());
-        let target_prob = target[token_index].max(0.0);
-        let draft_prob = draft[token_index].max(0.0);
+        assert!(token_index < target_probs.len());
+        let target_prob = target_probs[token_index].max(0.0);
+        let draft_prob = draft_probs[token_index].max(0.0);
         let accept_prob = if draft_prob > 0.0 {
             (target_prob / draft_prob).min(1.0)
         } else {
             0.0
         };
-        let token_position = sample_position
-            .checked_add(spec_offset as u32)
-            .expect("rejection sample position must fit u32");
+        let token_position = sample_position + spec_offset as u32;
         if sampling_uniform(seed, token_position, SamplingDomain::Accept) <= accept_prob {
             accepted_tokens.push(draft_token);
             accepted_probs.push(target_prob);
             continue;
         }
 
-        let residual = target
+        let residual = target_probs
             .iter()
-            .zip(draft.iter())
+            .zip(draft_probs.iter())
             .map(|(&target_prob, &draft_prob)| (target_prob.max(0.0) - draft_prob.max(0.0)).max(0.0))
             .collect::<Vec<_>>();
         let (sampled_token, sampled_prob) = sample_probability_row_reference(
             &residual,
             sampling_uniform(seed, token_position, SamplingDomain::Resample),
-            target,
+            target_probs,
         );
         return ReferenceRejectionDecision {
             accepted_tokens,
@@ -190,9 +152,7 @@ pub fn rejection_sample_reference(
     }
 
     let final_target = target_prob_rows.last().unwrap();
-    let final_position = sample_position
-        .checked_add(draft_tokens.len() as u32)
-        .expect("rejection final sample position must fit u32");
+    let final_position = sample_position + draft_tokens.len() as u32;
     let (sampled_token, sampled_prob) = sample_probability_row_reference(
         final_target,
         sampling_uniform(seed, final_position, SamplingDomain::Target),
@@ -206,26 +166,51 @@ pub fn rejection_sample_reference(
     }
 }
 
-fn sample_probability_row_reference(probs: &[f32], uniform: f32, reported_probs: &[f32]) -> (u32, f32) {
-    assert_eq!(probs.len(), reported_probs.len());
-    let total = probs.iter().copied().filter(|prob| *prob > 0.0).sum::<f32>();
+fn build_sparse_sample_row(
+    sampled_token: u32,
+    sampled_prob: f32,
+    kept: &[(i32, f32)],
+    distribution_len: usize,
+) -> ReferenceSampleRow {
+    let mut prob_token_ids = vec![-1; distribution_len];
+    let mut prob_values = vec![0.0; distribution_len];
+    for (slot, &(token_index, probability)) in kept.iter().take(distribution_len).enumerate() {
+        prob_token_ids[slot] = token_index;
+        prob_values[slot] = probability;
+    }
+    ReferenceSampleRow {
+        sampled_token,
+        sampled_prob,
+        prob_token_ids,
+        prob_values,
+    }
+}
+
+fn sample_probability_row_reference(probabilities: &[f32], uniform: f32, reported_probs: &[f32]) -> (u32, f32) {
+    assert_eq!(probabilities.len(), reported_probs.len());
+    assert!(u32::try_from(probabilities.len()).is_ok());
+    let total = probabilities
+        .iter()
+        .copied()
+        .filter(|probability| *probability > 0.0)
+        .sum::<f32>();
     if total <= 0.0 || !total.is_finite() {
         return (0, 0.0);
     }
     let draw = uniform * total;
     let mut cumulative = 0.0f32;
-    for (token, &prob) in probs.iter().enumerate() {
-        cumulative += prob.max(0.0);
+    for (token_index, &probability) in probabilities.iter().enumerate() {
+        cumulative += probability.max(0.0);
         if cumulative >= draw {
-            return (token as u32, reported_probs[token].max(0.0));
+            return (token_index as u32, reported_probs[token_index].max(0.0));
         }
     }
-    probs
+    probabilities
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, prob)| **prob > 0.0)
-        .map(|(token, _)| (token as u32, reported_probs[token].max(0.0)))
+        .find(|(_, probability)| **probability > 0.0)
+        .map(|(token_index, _)| (token_index as u32, reported_probs[token_index].max(0.0)))
         .unwrap_or((0, 0.0))
 }
 
@@ -253,7 +238,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_distribution() {
+    fn test_sparse_distribution() {
         let config = SamplerConfig {
             temperature: 1.0,
             top_k: 4,
@@ -286,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_accept() {
+    fn test_rejection_all_accepts() {
         let decision = rejection_sample_reference(
             &[1, 2],
             &[one_hot(4, 1), one_hot(4, 2), one_hot(4, 3)],
@@ -301,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resample() {
+    fn test_rejection_resamples() {
         let decision =
             rejection_sample_reference(&[1], &[vec![0.0, 0.0, 1.0, 0.0], one_hot(4, 3)], &[one_hot(4, 1)], 7, 0);
 
@@ -311,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain() {
+    fn test_sampling_domains_are_disjoint() {
         let seed = 7;
         let position = 11;
         let target = sampling_uniform(seed, position, SamplingDomain::Target);
@@ -322,9 +307,9 @@ mod tests {
         assert_ne!(target, sampling_uniform(seed, position, SamplingDomain::Resample));
     }
 
-    fn one_hot(vocab: usize, token: usize) -> Vec<f32> {
-        let mut values = vec![0.0; vocab];
-        values[token] = 1.0;
+    fn one_hot(vocab_size: usize, token_index: usize) -> Vec<f32> {
+        let mut values = vec![0.0; vocab_size];
+        values[token_index] = 1.0;
         values
     }
 }

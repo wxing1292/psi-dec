@@ -13,11 +13,11 @@ use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 
-pub(super) const REJECTION_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
+pub const REJECTION_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("rejection_sampling.num_active_threads");
-pub(super) const REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY: ReplayParameterKey =
+pub const REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("rejection_sampling.num_active_target_distributions");
-pub(super) const REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY: ReplayParameterKey =
+pub const REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("rejection_sampling.num_active_draft_distributions");
 
 #[derive(Clone, Copy, Debug)]
@@ -130,7 +130,7 @@ pub struct SparseRejectionSampleInvocation<'a> {
 }
 
 impl Operator for SparseRejectionSampleInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate();
         let num_target_slots = checked_product(
             "sparse rejection target-distribution slot count",
@@ -270,30 +270,30 @@ impl Operator for SparseRejectionSampleInvocation<'_> {
                 ),
             "sparse rejection runtime parameter buffer is too short"
         );
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.target_distribution_token_ids, 0);
-        builder.set_buffer_read(1, self.buffers.target_distribution_probs, 0);
-        builder.set_buffer_read(2, self.buffers.draft_distribution_token_ids, 0);
-        builder.set_buffer_read(3, self.buffers.draft_distribution_probs, 0);
-        builder.set_buffer_read(4, self.buffers.flat_draft_token_ids, 0);
-        builder.set_buffer_read(5, self.buffers.cu_target_distributions, 0);
-        builder.set_buffer_read(6, self.buffers.cu_draft_distributions, 0);
-        builder.set_buffer_write(7, self.buffers.flat_accepted_token_ids, 0);
-        builder.set_buffer_write(8, self.buffers.flat_accepted_probs, 0);
-        builder.set_buffer_write(9, self.buffers.num_accepted_tokens, 0);
-        builder.set_buffer_write(10, self.buffers.sampled_token_ids, 0);
-        builder.set_buffer_write(11, self.buffers.sampled_token_probs, 0);
-        builder.set_buffer_read(12, self.buffers.runtime_params, 0);
-        builder.set_buffer_read(13, self.buffers.flat_draft_distribution_indices, 0);
-        builder.set_u32(17, self.shape.top_k);
-        builder.set_u32(18, self.shape.max_target_k);
-        builder.set_u32(19, self.shape.max_draft_k);
+        recorder.set_kernel(&self.kernel.kernel);
+        recorder.set_buffer_read(0, self.buffers.target_distribution_token_ids, 0);
+        recorder.set_buffer_read(1, self.buffers.target_distribution_probs, 0);
+        recorder.set_buffer_read(2, self.buffers.draft_distribution_token_ids, 0);
+        recorder.set_buffer_read(3, self.buffers.draft_distribution_probs, 0);
+        recorder.set_buffer_read(4, self.buffers.flat_draft_token_ids, 0);
+        recorder.set_buffer_read(5, self.buffers.cu_target_distributions, 0);
+        recorder.set_buffer_read(6, self.buffers.cu_draft_distributions, 0);
+        recorder.set_buffer_write(7, self.buffers.flat_accepted_token_ids, 0);
+        recorder.set_buffer_write(8, self.buffers.flat_accepted_probs, 0);
+        recorder.set_buffer_write(9, self.buffers.num_accepted_tokens, 0);
+        recorder.set_buffer_write(10, self.buffers.sampled_token_ids, 0);
+        recorder.set_buffer_write(11, self.buffers.sampled_token_probs, 0);
+        recorder.set_buffer_read(12, self.buffers.runtime_params, 0);
+        recorder.set_buffer_read(13, self.buffers.flat_draft_distribution_indices, 0);
+        recorder.set_u32(17, self.shape.top_k);
+        recorder.set_u32(18, self.shape.max_target_k);
+        recorder.set_u32(19, self.shape.max_draft_k);
         let num_threads_per_req = SAMPLING_NUM_THREADS_PER_THREADBLOCK;
         let num_total_threads = checked_num_threads(self.shape.num_total_reqs, num_threads_per_req);
         if num_threads_per_req == num_total_threads {
-            builder.set_u32(14, num_total_threads);
+            recorder.set_u32(14, num_total_threads);
         } else {
-            builder.bind_u32(
+            recorder.bind_u32(
                 14,
                 REJECTION_NUM_ACTIVE_THREADS_KEY,
                 num_threads_per_req,
@@ -301,9 +301,9 @@ impl Operator for SparseRejectionSampleInvocation<'_> {
             );
         }
         if self.shape.num_total_target_distributions == 1 {
-            builder.set_u32(15, 1);
+            recorder.set_u32(15, 1);
         } else {
-            builder.bind_u32(
+            recorder.bind_u32(
                 15,
                 REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY,
                 1,
@@ -311,18 +311,22 @@ impl Operator for SparseRejectionSampleInvocation<'_> {
             );
         }
         if self.shape.num_total_draft_distributions == 0 {
-            builder.set_u32(16, 0);
+            recorder.set_u32(16, 0);
         } else {
-            builder.bind_u32(
+            recorder.bind_u32(
                 16,
                 REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY,
                 0,
                 self.shape.num_total_draft_distributions,
             );
         }
-        builder.dispatch_1d(
+        recorder.dispatch_1d(
             num_total_threads as usize,
             SAMPLING_NUM_THREADS_PER_THREADBLOCK as usize,
         );
     }
 }
+
+#[cfg(test)]
+#[path = "rejection_test.rs"]
+mod tests;

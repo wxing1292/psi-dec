@@ -88,14 +88,13 @@ impl TopKSamplingBounds {
 
     pub fn active_shape(self, configs: &[SamplerConfig]) -> Result<TopKSamplingShape, ModelExecutorError> {
         assert!(!configs.is_empty(), "top-k sampling requires inputs");
-        let num_active_sampling_inputs =
-            u32::try_from(configs.len()).expect("top-k sampling input count should fit u32");
         assert!(
-            num_active_sampling_inputs <= self.max_sampling_inputs,
+            configs.len() <= self.max_sampling_inputs as usize,
             "top-k sampling active inputs={} exceed max={}",
-            num_active_sampling_inputs,
+            configs.len(),
             self.max_sampling_inputs
         );
+        let num_active_sampling_inputs = configs.len() as u32;
         let top_k = configs.iter().try_fold(0, |top_k, config| {
             self.active_top_k(config).map(|value| top_k.max(value))
         })?;

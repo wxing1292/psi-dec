@@ -1,6 +1,8 @@
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
+use inference_executor_core::replay::ReplayBucketPolicy;
+use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::TopKSamplingLogitsDtype;
 use inference_executor_core::sampling::TopKSamplingShape;
 
@@ -13,16 +15,18 @@ use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TopKSamplingReplayKey {
-    pub num_sampling_input_capacity: u32,
+    pub num_total_sampling_inputs: u32,
     pub top_k: u32,
 }
 
 pub struct Sampling {
     pub sampler: Rc<TopKSampling>,
+    bucket_policy: ReplayBucketPolicy,
 }
 
 pub struct DraftSampling {
     pub sampler: Rc<TopKSampling>,
+    bucket_policy: ReplayBucketPolicy,
 }
 
 #[derive(Clone, Copy)]
@@ -42,8 +46,38 @@ pub struct DraftSamplingInput<'a> {
 
 fn sampling_key(shape: TopKSamplingShape) -> TopKSamplingReplayKey {
     TopKSamplingReplayKey {
-        num_sampling_input_capacity: shape.num_total_sampling_inputs,
+        num_total_sampling_inputs: shape.num_total_sampling_inputs,
         top_k: shape.top_k,
+    }
+}
+
+impl Sampling {
+    pub fn new(sampler: Rc<TopKSampling>) -> Self {
+        let bucket_policy = ReplayBucketPolicy::new(sampler.max_sampling_inputs());
+        Self { sampler, bucket_policy }
+    }
+
+    pub fn prepare_shape(&self, configs: &[SamplerConfig]) -> TopKSamplingShape {
+        let active = self.sampler.active_shape(configs);
+        active.with_num_total_sampling_inputs(self.bucket_policy.capacity(active.num_active_sampling_inputs))
+    }
+}
+
+impl DraftSampling {
+    pub fn new(sampler: Rc<TopKSampling>, max_sampling_inputs: u32) -> Self {
+        assert!(
+            max_sampling_inputs <= sampler.max_sampling_inputs(),
+            "draft sampling replay capacity exceeds sampler capacity"
+        );
+        Self {
+            sampler,
+            bucket_policy: ReplayBucketPolicy::new(max_sampling_inputs),
+        }
+    }
+
+    pub fn prepare_shape(&self, configs: &[SamplerConfig]) -> TopKSamplingShape {
+        let active = self.sampler.active_shape(configs);
+        active.with_num_total_sampling_inputs(self.bucket_policy.capacity(active.num_active_sampling_inputs))
     }
 }
 

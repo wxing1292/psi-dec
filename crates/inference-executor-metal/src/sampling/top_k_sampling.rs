@@ -235,13 +235,17 @@ impl TopKSamplingRuntimeParams {
                 ],
             );
         }
-        self.rows.set(configs.len(), "top-k sampling");
+        self.rows.set(configs.len() as u32);
     }
 
     pub fn active_shape(&self, configs: &[SamplerConfig]) -> TopKSamplingShape {
         self.bounds
             .active_shape(configs)
             .expect("top-k sampling config should fit sampler bounds")
+    }
+
+    pub fn max_sampling_inputs(&self) -> u32 {
+        self.bounds.max_sampling_inputs
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -393,6 +397,10 @@ impl TopKSampling {
         self.runtime_params.active_shape(configs)
     }
 
+    pub fn max_sampling_inputs(&self) -> u32 {
+        self.runtime_params.max_sampling_inputs()
+    }
+
     pub fn add_replay_arguments(&self, shape: TopKSamplingShape, arguments: &mut ReplayArguments) {
         self.validate(shape);
         self.runtime_params.consume(shape);
@@ -479,4 +487,94 @@ fn validate_shape(bounds: TopKSamplingBounds, shape: TopKSamplingShape) {
         shape.top_k > 0 && shape.top_k <= bounds.top_k,
         "top-k sampling width exceeds capacity"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::AssertUnwindSafe;
+
+    use inference_backend_metal::metal::Device;
+    use inference_executor_core::sampling::SamplerConfig;
+    use inference_executor_core::sampling::SamplingDomain;
+    use inference_executor_core::sampling::TopKSamplingBounds;
+
+    use super::TopKSamplingRuntimeParams;
+
+    #[test]
+    fn test_runtime_parameter_api_set_handles_mixed_configs_and_domains() {
+        let device = Device::system_default();
+        let bounds = TopKSamplingBounds {
+            max_sampling_inputs: 4,
+            vocab_size: 128,
+            top_k: 16,
+        };
+        let runtime_params = TopKSamplingRuntimeParams::new(&device, bounds);
+        let configs = [
+            SamplerConfig {
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed: 7,
+            },
+            SamplerConfig {
+                temperature: 0.75,
+                top_k: 8,
+                top_p: 0.9,
+                seed: 11,
+            },
+            SamplerConfig {
+                temperature: 1.25,
+                top_k: 16,
+                top_p: 0.5,
+                seed: 13,
+            },
+        ];
+        let sample_positions = [2, 5, 9];
+
+        runtime_params.set_configs(&configs, &sample_positions, SamplingDomain::Target);
+        let target_shape = runtime_params.active_shape(&configs);
+        assert_eq!(target_shape.num_active_sampling_inputs, 3);
+        assert_eq!(target_shape.num_total_sampling_inputs, 3);
+        assert_eq!(target_shape.top_k, 16);
+        assert_eq!(
+            runtime_params.buffer().read_typed::<u32>(0, 18),
+            vec![
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                7,
+                2,
+                1,
+                u32::from(SamplingDomain::Target),
+                0.75_f32.to_bits(),
+                0.9_f32.to_bits(),
+                11,
+                5,
+                8,
+                u32::from(SamplingDomain::Target),
+                1.25_f32.to_bits(),
+                0.5_f32.to_bits(),
+                13,
+                9,
+                16,
+                u32::from(SamplingDomain::Target),
+            ]
+        );
+        runtime_params.consume(target_shape);
+
+        runtime_params.set_configs(&configs[..1], &[12], SamplingDomain::Draft);
+        let draft_shape = runtime_params.active_shape(&configs[..1]);
+        assert_eq!(
+            runtime_params.buffer().read_typed::<u32>(0, 6),
+            vec![
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                7,
+                12,
+                1,
+                u32::from(SamplingDomain::Draft),
+            ]
+        );
+        runtime_params.consume(draft_shape);
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| runtime_params.consume(draft_shape))).is_err());
+    }
 }

@@ -1,12 +1,4 @@
 impl Qwen3Executor {
-    fn sample_replay_shape(&self, sampler_configs: &[SamplerConfig]) -> TopKSamplingShape {
-        let shape = self.sampler.active_shape(sampler_configs);
-        shape.with_num_total_sampling_inputs(replay_bucket_capacity(
-            shape.num_active_sampling_inputs,
-            self.sampler_bounds.max_sampling_inputs,
-        ))
-    }
-
     fn prepare_sample_replay(
         &mut self,
         sampler_configs: &[SamplerConfig],
@@ -17,7 +9,7 @@ impl Qwen3Executor {
             sample_positions.len(),
             "qwen3 sample runtime configs and positions must have equal lengths"
         );
-        let sample_shape = self.sample_replay_shape(sampler_configs);
+        let sample_shape = self.sampling.component().prepare_shape(sampler_configs);
         let input = SamplingInput {
             shape: sample_shape,
             logits: &self.unembed_logits,
@@ -94,36 +86,10 @@ impl Qwen3Executor {
         );
         let prepared = rejector.prepare_inputs(microbatch, &flat_draft_distribution_indices);
         let num_active_decode_reqs = prepared.num_active_decode_reqs();
-        let num_active_draft_distributions = prepared.num_active_draft_distributions;
-        let num_active_target_distributions = prepared.num_active_target_distributions();
-        let num_decode_req_capacity = replay_bucket_capacity_usize(num_active_decode_reqs, self.config.max_requests);
-        let max_draft_distributions = self
-            .config
-            .max_requests
-            .checked_mul(max_spec_tokens)
-            .expect("Qwen3 rejection draft capacity must fit usize");
-        let num_draft_distribution_capacity =
-            replay_bucket_capacity_allow_zero(num_active_draft_distributions, max_draft_distributions);
-        let max_target_distributions = self
-            .config
-            .max_requests
-            .checked_mul(
-                max_spec_tokens
-                    .checked_add(1)
-                    .expect("Qwen3 Main rows per request must fit usize"),
-            )
-            .expect("Qwen3 rejection target capacity must fit usize")
-            .min(self.config.max_tokens);
-        let num_target_distribution_capacity =
-            replay_bucket_capacity_usize(num_active_target_distributions, max_target_distributions);
-        let target_shape = self
-            .sampler
-            .active_shape(&sampler_configs)
-            .with_num_total_sampling_inputs(
-                num_target_distribution_capacity
-                    .try_into()
-                    .expect("Qwen3 target-distribution capacity must fit u32"),
-            );
+        let active_target_shape = self.sampler.active_shape(&sampler_configs);
+        let rejection_shape = rejector.prepare_replay_shape(&prepared, active_target_shape.top_k);
+        let target_shape = active_target_shape
+            .with_num_total_sampling_inputs(rejection_shape.num_total_target_distributions);
         let Qwen3DSparkSpeculator {
             rejection_sampling,
             spec_probs,
@@ -131,12 +97,7 @@ impl Qwen3Executor {
             ..
         } = self.speculator.dspark_mut();
         let rejection_input = RejectionSamplerInput {
-            num_active_decode_reqs,
-            num_decode_req_capacity,
-            num_target_distribution_capacity,
-            num_active_draft_distributions,
-            num_draft_distribution_capacity,
-            top_k: target_shape.top_k,
+            shape: rejection_shape,
             target_token_ids: spec_probs.target_token_ids(),
             target_probs: spec_probs.target_probs(),
             draft_token_ids: spec_probs.draft_token_ids(),
@@ -173,9 +134,7 @@ impl Qwen3Executor {
                     .active_top_k(&config)
                     .expect("Qwen3 rejection sampler config must fit bounds"),
             });
-            sample_offset = sample_offset
-                .checked_add(microbatch.num_spec_tokens(req_index) as usize + 1)
-                .expect("Qwen3 rejection sample offset must fit usize");
+            sample_offset += microbatch.num_spec_tokens(req_index) as usize + 1;
         }
         assert_eq!(
             sample_offset,
@@ -233,9 +192,7 @@ impl Qwen3Executor {
                 ..Qwen3DecodeDecision::default()
             });
             let req_index = prepared.decode_req_indices[decode_req_index];
-            flat_draft_index = flat_draft_index
-                .checked_add(microbatch.num_spec_tokens(req_index) as usize)
-                .expect("Qwen3 rejection draft offset must fit usize");
+            flat_draft_index += microbatch.num_spec_tokens(req_index) as usize;
         }
         assert_eq!(
             flat_draft_index, prepared.num_active_draft_distributions,
@@ -245,36 +202,9 @@ impl Qwen3Executor {
     }
 }
 
-fn replay_bucket_capacity_usize(active: usize, max_capacity: usize) -> usize {
-    assert!(active > 0 && active <= max_capacity);
-    active
-        .checked_next_power_of_two()
-        .map_or(max_capacity, |bucket| bucket.min(max_capacity))
-}
-
-fn replay_bucket_capacity_allow_zero(active: usize, max_capacity: usize) -> usize {
-    if active == 0 {
-        0
-    } else {
-        replay_bucket_capacity_usize(active, max_capacity)
-    }
-}
-
 /// Main verification distributions live only in the current compact batch.
 /// Draft distributions use request-slot identity in `SpecProbsStore`.
 fn compact_target_distribution_indices(capacity: usize) -> Vec<u32> {
     assert!(capacity > 0, "Qwen3 target distribution capacity must be positive");
-    (0..capacity)
-        .map(|index| u32::try_from(index).expect("Qwen3 target distribution index must fit u32"))
-        .collect()
-}
-
-#[cfg(test)]
-mod sampling_tests {
-    use super::compact_target_distribution_indices;
-
-    #[test]
-    fn test_target_distribution_indices_are_compact_and_ignore_request_slots() {
-        assert_eq!(compact_target_distribution_indices(5), [0, 1, 2, 3, 4]);
-    }
+    (0..capacity).map(|index| index as u32).collect()
 }

@@ -6,6 +6,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::sampling::SparseRejectionSamplingBounds;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::SparseRejectionSamplingShape;
 
@@ -23,20 +24,20 @@ pub struct SparseRejectionSamplingOutput<'a> {
 
 pub struct SparseRejectionSampling {
     kernel: SparseRejectionSampleKernel,
-    max_shape: SparseRejectionSamplingShape,
+    bounds: SparseRejectionSamplingBounds,
     runtime_params: Buffer,
     runtime_param_rows: RuntimeParamRows,
 }
 
 impl SparseRejectionSampling {
-    pub fn new(device: &Device, max_shape: SparseRejectionSamplingShape) -> Self {
-        max_shape.validate();
+    pub fn new(device: &Device, bounds: SparseRejectionSamplingBounds) -> Self {
+        bounds.validate();
         Self {
             kernel: SparseRejectionSampleKernel::new(device),
-            max_shape,
+            bounds,
             runtime_params: Buffer::new_zeroed_elements(
                 device,
-                (max_shape.num_total_reqs as usize)
+                (bounds.max_reqs as usize)
                     .checked_mul(4)
                     .expect("sparse rejection runtime parameter capacity must fit usize"),
                 Dtype::Uint32,
@@ -47,12 +48,12 @@ impl SparseRejectionSampling {
 
     pub fn set_runtime_params(&self, params: &[SparseRejectionSamplingReqParams]) {
         assert!(
-            params.len() <= self.max_shape.num_total_reqs as usize,
+            params.len() <= self.bounds.max_reqs as usize,
             "sparse rejection sampling runtime request params exceed total requests"
         );
         for (req_index, params) in params.iter().enumerate() {
             assert!(
-                params.top_k > 0 && params.top_k <= self.max_shape.top_k,
+                params.top_k > 0 && params.top_k <= self.bounds.max_k,
                 "sparse rejection sampling request top_k must fit capacity"
             );
             self.runtime_params.write_typed(
@@ -65,7 +66,7 @@ impl SparseRejectionSampling {
                 ],
             );
         }
-        self.runtime_param_rows.set(params.len(), "sparse rejection sampling");
+        self.runtime_param_rows.set(params.len() as u32);
     }
 
     pub fn record<'a>(
@@ -113,35 +114,35 @@ impl SparseRejectionSampling {
     fn validate_input(&self, shape: SparseRejectionSamplingShape) {
         shape.validate();
         assert!(
-            shape.num_total_reqs <= self.max_shape.num_total_reqs,
+            shape.num_total_reqs <= self.bounds.max_reqs,
             "sparse rejection sampling total requests={} exceeds max={}",
             shape.num_total_reqs,
-            self.max_shape.num_total_reqs
+            self.bounds.max_reqs
         );
         assert!(
-            shape.num_total_draft_distributions <= self.max_shape.num_total_draft_distributions,
+            shape.num_total_draft_distributions <= self.bounds.max_draft_distributions,
             "sparse rejection sampling total draft distributions={} exceeds max={}",
             shape.num_total_draft_distributions,
-            self.max_shape.num_total_draft_distributions
+            self.bounds.max_draft_distributions
         );
         assert!(
-            shape.num_total_target_distributions <= self.max_shape.num_total_target_distributions,
+            shape.num_total_target_distributions <= self.bounds.max_target_distributions,
             "sparse rejection sampling total target distributions={} exceeds max={}",
             shape.num_total_target_distributions,
-            self.max_shape.num_total_target_distributions
+            self.bounds.max_target_distributions
         );
         assert!(
-            shape.top_k <= self.max_shape.top_k,
+            shape.top_k <= self.bounds.max_k,
             "sparse rejection sampling top_k={} exceed capacity={}",
             shape.top_k,
-            self.max_shape.top_k
+            self.bounds.max_k
         );
         assert_eq!(
-            shape.max_target_k, self.max_shape.max_target_k,
+            shape.max_target_k, self.bounds.max_k,
             "sparse rejection target distribution slots must match capacity"
         );
         assert_eq!(
-            shape.max_draft_k, self.max_shape.max_draft_k,
+            shape.max_draft_k, self.bounds.max_k,
             "sparse rejection draft distribution slots must match capacity"
         );
     }
