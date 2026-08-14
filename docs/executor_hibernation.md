@@ -282,14 +282,14 @@ decode
 
 The two semantic snapshot directories must be byte-for-byte equal.
 The final decode verifies the reloaded checkpoint weights and the second state restore.
-The tests run both `ExecutorHibernationPlan::All` and `ExecutorHibernationPlan::Selected` for each loaded model.
+Separate tests run `ExecutorHibernationPlan::All` and `ExecutorHibernationPlan::Selected` for each model configuration.
 The selected plan uses request-slot and page-ID ranges from the synthetic decode.
-The test matrix contains Qwen3.6 27B and 35B with MTP and DSpark.
+The test matrix contains eight cases: Qwen3.6 27B and 35B, MTP and DSpark, and full and selected state.
 Each test requires the matching Main and speculative checkpoint environment variables.
 
 Run the matrix with this command:
 
 ```sh
 cargo test --release -p inference-executor-metal \
-  --test model_state_io -- --ignored --nocapture
+  --test model_state_io -- --ignored --nocapture --test-threads=1
 ```

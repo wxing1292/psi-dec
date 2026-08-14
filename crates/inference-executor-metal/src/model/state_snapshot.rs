@@ -745,7 +745,7 @@ fn selected_buffer_ranges(buffer: &Buffer, entry_ranges: &[Range<u32>], entry_by
         entry_bytes > 0,
         "model state snapshot buffer entry size must be positive"
     );
-    let entry_bytes = u64::try_from(entry_bytes).expect("model state snapshot buffer entry size must fit u64");
+    let entry_bytes = entry_bytes as u64;
     assert!(
         are_canonical_ranges(entry_ranges),
         "model state snapshot buffer entry ranges must be nonempty, sorted, disjoint, and nonadjacent"
@@ -753,10 +753,10 @@ fn selected_buffer_ranges(buffer: &Buffer, entry_ranges: &[Range<u32>], entry_by
     entry_ranges
         .iter()
         .map(|entry_range| {
-            let start = u64::from(entry_range.start)
+            let start = (entry_range.start as u64)
                 .checked_mul(entry_bytes)
                 .expect("model state snapshot buffer entry offset must fit u64");
-            let end = u64::from(entry_range.end)
+            let end = (entry_range.end as u64)
                 .checked_mul(entry_bytes)
                 .expect("model state snapshot buffer entry end must fit u64");
             assert!(
