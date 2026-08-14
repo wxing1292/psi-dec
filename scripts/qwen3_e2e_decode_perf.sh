@@ -7,7 +7,7 @@ TOKENS="256,1024"
 GRPC_PORT=50061
 HTTP_PORT=8000
 BUILD=1
-CASE_COOLDOWN_SECS=30
+CASE_COOLDOWN_SECS=8
 LOGGING=info
 
 PROMPT="你好，北京有什么好玩的景点？香山如何？早上去晚上去？单纯爬山么？还有什么可以在香山玩的？"
@@ -84,7 +84,7 @@ Benchmark options:
   --max-tokens-per-request N
                        Default: 64
   --case-cooldown-secs N
-                       Default: 30
+                       Default: 8
   --logging LEVEL      info or debug. Default: info
   --no-build           Skip cargo build --release
   -h, --help
@@ -471,7 +471,10 @@ if ((NEED_DSPARK)); then
             echo "WARNING: no runnable cases remain after checkpoint discovery; exiting." >&2
             exit 0
         fi
-        CASES="$(IFS=,; printf '%s' "${SELECTED_CASES[*]}")"
+        CASES="$(
+            IFS=,
+            printf '%s' "${SELECTED_CASES[*]}"
+        )"
     fi
 fi
 

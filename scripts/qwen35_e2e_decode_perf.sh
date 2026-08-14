@@ -13,15 +13,15 @@ DSPARK_27B=""
 MODEL_35B=""
 MTP_35B=""
 DSPARK_35B=""
-MODEL_27B_REPO="mlx-community/Qwen3.6-27B-4bit"
-MTP_27B_REPO="mlx-community/Qwen3.6-27B-MTP-4bit"
+MODEL_27B_REPO="mlx-community/Qwen3.8-27B-4bit"
+MTP_27B_REPO="mlx-community/Qwen3.8-27B-MTP-4bit"
 DSPARK_27B_REPO=""
 MODEL_35B_REPO="mlx-community/Qwen3.6-35B-A3B-4bit"
 MTP_35B_REPO="mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
 DSPARK_35B_REPO=""
 CASES="27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark"
 BASELINE=1
-CASE_COOLDOWN_SECS=30
+CASE_COOLDOWN_SECS=8
 LOGGING=info
 SEED=42
 NUM_CACHE_PAGES=393216
@@ -38,7 +38,7 @@ BASELINE_CACHE_BLOCK_TOKENS=2048
 BASELINE_MAX_REQUESTS=4
 BASELINE_MAX_TOKENS=128
 BASELINE_MAX_TOKENS_PER_REQUEST=64
-BASELINE_CASE_COOLDOWN_SECS=30
+BASELINE_CASE_COOLDOWN_SECS=8
 BASELINE_LOGGING="info"
 BASELINE_SEED=42
 BASELINE_MIN_RUNS=3
@@ -67,7 +67,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/qwen35_e2e_decode_perf.sh [options]
 
-Runs Qwen3.5/3.6 replay e2e decode perf one server at a time and reports
+Runs Qwen3.5/3.6/3.8 replay e2e decode perf one server at a time and reports
 decode throughput, TTFT, inter-chunk latency, and speculative acceptance.
 
 Options:
@@ -87,10 +87,10 @@ Options:
   --max-tokens-per-request N
                         Scheduler per-request token capacity. Default: 64
   --model-root DIR      Default checkpoint root. Default: $HOME/Workspace/models
-  --tokenizer DIR       Tokenizer/chat-template directory. Default: selected Main model.
-  --model-27b DIR       27B Main directory. Default: MODEL_ROOT/Qwen3.6-27B-4bit
-  --mtp-27b DIR         27B MTP directory. Default: MODEL_ROOT/Qwen3.6-27B-MTP-4bit
-  --dspark-27b DIR      27B DSpark directory. Default: MODEL_ROOT/Qwen3.6-27B-DSpark-affine
+  --tokenizer DIR       Tokenizer/chat-template override. Default: each case's Main model.
+  --model-27b DIR       27B Main directory. Default: MODEL_ROOT/Qwen3.8-27B-4bit
+  --mtp-27b DIR         27B MTP directory. Default: MODEL_ROOT/Qwen3.8-27B-MTP-4bit
+  --dspark-27b DIR      27B DSpark directory. Default: MODEL_ROOT/Qwen3.8-27B-DSpark-affine
   --model-35b DIR       35B Main directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-4bit
   --mtp-35b DIR         35B MTP directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit
   --dspark-35b DIR      35B DSpark directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine
@@ -105,7 +105,7 @@ Options:
   --no-build            Skip release build.
   --no-baseline         Do not compare summary rows with the checked-in M3 Max baseline.
   --case-cooldown-secs N
-                        Idle time between model cases. Default: 30
+                        Idle time between model cases. Default: 8
                         Pass 0 for an intentional sustained-load run.
   --logging LEVEL       Server logging: info or debug. Default: info.
                         Debug adds request/response and replay-stage details.
@@ -394,9 +394,9 @@ if ((MAX_TOKENS_PER_REQUEST > MAX_TOKENS)); then
     exit 2
 fi
 
-[[ -n "$MODEL_27B" ]] || MODEL_27B="$MODEL_ROOT/Qwen3.6-27B-4bit"
-[[ -n "$MTP_27B" ]] || MTP_27B="$MODEL_ROOT/Qwen3.6-27B-MTP-4bit"
-[[ -n "$DSPARK_27B" ]] || DSPARK_27B="$MODEL_ROOT/Qwen3.6-27B-DSpark-affine"
+[[ -n "$MODEL_27B" ]] || MODEL_27B="$MODEL_ROOT/Qwen3.8-27B-4bit"
+[[ -n "$MTP_27B" ]] || MTP_27B="$MODEL_ROOT/Qwen3.8-27B-MTP-4bit"
+[[ -n "$DSPARK_27B" ]] || DSPARK_27B="$MODEL_ROOT/Qwen3.8-27B-DSpark-affine"
 [[ -n "$MODEL_35B" ]] || MODEL_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-4bit"
 [[ -n "$MTP_35B" ]] || MTP_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit"
 [[ -n "$DSPARK_35B" ]] || DSPARK_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine"
@@ -464,7 +464,10 @@ for case_name in "${selected_cases[@]}"; do
         ;;
     esac
 done
-CASES="$(IFS=,; printf '%s' "${selected_cases[*]}")"
+CASES="$(
+    IFS=,
+    printf '%s' "${selected_cases[*]}"
+)"
 
 if [[ ${#selected_cases[@]} -eq 0 ]]; then
     echo "--cases must include at least one case" >&2
@@ -601,7 +604,10 @@ if ((${#selected_cases[@]} == 0)); then
     echo "WARNING: no runnable cases remain after checkpoint discovery; exiting." >&2
     exit 0
 fi
-CASES="$(IFS=,; printf '%s' "${selected_cases[*]}")"
+CASES="$(
+    IFS=,
+    printf '%s' "${selected_cases[*]}"
+)"
 
 need_27b=0
 need_35b=0
@@ -612,14 +618,6 @@ for case_name in "${selected_cases[@]}"; do
     esac
 done
 
-if [[ -z "$TOKENIZER" ]]; then
-    if ((need_35b)); then
-        TOKENIZER="$MODEL_35B"
-    else
-        TOKENIZER="$MODEL_27B"
-    fi
-fi
-
 if ((need_27b)); then
     ensure_model "$MODEL_27B_REPO" "$MODEL_27B"
 fi
@@ -627,7 +625,9 @@ if ((need_35b)); then
     ensure_model "$MODEL_35B_REPO" "$MODEL_35B"
 fi
 
-require_dir "--tokenizer" "$TOKENIZER"
+if [[ -n "$TOKENIZER" ]]; then
+    require_dir "--tokenizer" "$TOKENIZER"
+fi
 if ((need_27b)); then
     require_dir "--model-27b" "$MODEL_27B"
 fi
@@ -686,7 +686,13 @@ baseline_config_mismatches() {
     [[ "$LOGGING" == "$BASELINE_LOGGING" ]] || mismatches="${mismatches:+$mismatches,}logging"
     [[ "$SEED" == "$BASELINE_SEED" ]] || mismatches="${mismatches:+$mismatches,}seed"
     [[ "$prompt_sha256" == "$BASELINE_PROMPT_SHA256" ]] || mismatches="${mismatches:+$mismatches,}prompt"
-    [[ "$(basename "$TOKENIZER")" == "$BASELINE_TOKENIZER_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
+    if [[ -n "$TOKENIZER" ]]; then
+        [[ "$(basename "$TOKENIZER")" == "$BASELINE_TOKENIZER_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
+    elif ((need_35b)); then
+        [[ "$(basename "$MODEL_35B")" == "$BASELINE_TOKENIZER_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
+    else
+        [[ "$(basename "$MODEL_27B")" == "$BASELINE_TOKENIZER_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
+    fi
     if ((need_27b)); then
         [[ "$(basename "$MODEL_27B")" == "$BASELINE_MODEL_27B_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}model_27b"
     fi
@@ -761,6 +767,7 @@ run_decode() {
     local tokens="$2"
     local run="$3"
     local server_log="$4"
+    local tokenizer="$5"
     local out="/tmp/psi_dec_${label}_${tokens}_${run}.out"
     local server_log_offset
     server_log_offset="$(wc -c <"$server_log")"
@@ -770,7 +777,7 @@ run_decode() {
         --seed "$SEED" \
         --chat-template auto \
         --show-stats \
-        --hf-model-dir "$TOKENIZER" \
+        --hf-model-dir "$tokenizer" \
         --prompt-str "$PROMPT" >"$out" 2>&1; then
         echo "DECODE_FAILED label=$label max_new=$tokens run=$run client_output=$out server_log=$server_log" >&2
         tail -n 80 "$out" >&2 || true
@@ -832,7 +839,8 @@ PY
 run_server_case() {
     local label="$1"
     local token_list="$2"
-    shift 2
+    local tokenizer="$3"
+    shift 3
     local log="/tmp/psi_dec_${label}.log"
 
     local server_command=("$@")
@@ -864,7 +872,7 @@ run_server_case() {
             local parsed tokps chunk sampled input_tokens ttft prompt_rate
             local inter_chunk_p50 inter_chunk_p95 proposed_spec accepted_spec
             local acceptance_rate tokens_per_chunk
-            parsed=$(run_decode "$label" "$tokens" "$run" "$log")
+            parsed=$(run_decode "$label" "$tokens" "$run" "$log" "$tokenizer")
             IFS=, read -r \
                 tokps chunk sampled input_tokens ttft prompt_rate \
                 inter_chunk_p50 inter_chunk_p95 proposed_spec accepted_spec \
@@ -1071,6 +1079,7 @@ run_spec_case_sequence() {
     local server_binary="$4"
     local model_dir="$5"
     local spec_model_dir="$6"
+    local tokenizer="${TOKENIZER:-$model_dir}"
     local spec_model_option
 
     case "$spec_mode" in
@@ -1088,7 +1097,7 @@ run_spec_case_sequence() {
             echo "COOLDOWN before=$label seconds=$CASE_COOLDOWN_SECS"
             sleep "$CASE_COOLDOWN_SECS"
         fi
-        run_server_case "$label" "$token_list" "$server_binary" \
+        run_server_case "$label" "$token_list" "$tokenizer" "$server_binary" \
             --grpc-listen-addr "127.0.0.1:${PORT}" \
             --hf-model-dir "$model_dir" \
             "$spec_model_option" "$spec_model_dir" \
@@ -1103,7 +1112,7 @@ run_spec_case_sequence() {
 run_named_case() {
     case "$1" in
     27b_off)
-        run_server_case 27b_off "256 384" target/release/qwen3_5_dense \
+        run_server_case 27b_off "256 384" "${TOKENIZER:-$MODEL_27B}" target/release/qwen3_5_dense \
             --grpc-listen-addr "127.0.0.1:${PORT}" \
             --hf-model-dir "$MODEL_27B" \
             --num-cache-pages "$NUM_CACHE_PAGES" \
@@ -1118,7 +1127,7 @@ run_named_case() {
         run_spec_case_sequence 27b dspark "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$DSPARK_27B"
         ;;
     35b_off)
-        run_server_case 35b_off "256 1024" target/release/qwen3_5_sparse \
+        run_server_case 35b_off "256 1024" "${TOKENIZER:-$MODEL_35B}" target/release/qwen3_5_sparse \
             --grpc-listen-addr "127.0.0.1:${PORT}" \
             --hf-model-dir "$MODEL_35B" \
             --num-cache-pages "$NUM_CACHE_PAGES" \
@@ -1152,7 +1161,7 @@ OS_VERSION="$(sw_vers -productVersion 2>/dev/null || uname -s)"
 ARCH="$(uname -m)"
 MACHINE="$(current_machine_id)"
 BASELINE_CONFIG_MISMATCHES="$(baseline_config_mismatches "$MACHINE" "$OS_VERSION" "$ARCH")"
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH baseline_machine=$BASELINE_MACHINE baseline_date=$BASELINE_DATE baseline_commit=$BASELINE_COMMIT baseline_os=$BASELINE_OS_VERSION baseline_arch=$BASELINE_ARCH baseline_num_cache_pages=$BASELINE_NUM_CACHE_PAGES baseline_cache_block_tokens=$BASELINE_CACHE_BLOCK_TOKENS baseline_max_requests=$BASELINE_MAX_REQUESTS baseline_max_tokens=$BASELINE_MAX_TOKENS baseline_max_tokens_per_request=$BASELINE_MAX_TOKENS_PER_REQUEST baseline_case_cooldown_secs=$BASELINE_CASE_COOLDOWN_SECS baseline_logging=$BASELINE_LOGGING baseline_seed=$BASELINE_SEED baseline_min_runs=$BASELINE_MIN_RUNS baseline_config_mismatches=${BASELINE_CONFIG_MISMATCHES:-none} num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST num_spec_tokens=1,2 cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_chars=${#PROMPT} tokenizer=$TOKENIZER model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH baseline_machine=$BASELINE_MACHINE baseline_date=$BASELINE_DATE baseline_commit=$BASELINE_COMMIT baseline_os=$BASELINE_OS_VERSION baseline_arch=$BASELINE_ARCH baseline_num_cache_pages=$BASELINE_NUM_CACHE_PAGES baseline_cache_block_tokens=$BASELINE_CACHE_BLOCK_TOKENS baseline_max_requests=$BASELINE_MAX_REQUESTS baseline_max_tokens=$BASELINE_MAX_TOKENS baseline_max_tokens_per_request=$BASELINE_MAX_TOKENS_PER_REQUEST baseline_case_cooldown_secs=$BASELINE_CASE_COOLDOWN_SECS baseline_logging=$BASELINE_LOGGING baseline_seed=$BASELINE_SEED baseline_min_runs=$BASELINE_MIN_RUNS baseline_config_mismatches=${BASELINE_CONFIG_MISMATCHES:-none} num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST num_spec_tokens=1,2 cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_chars=${#PROMPT} tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B"
 for case_index in "${!selected_cases[@]}"; do
     case_name="${selected_cases[$case_index]}"
     if [[ "$case_index" -gt 0 && "$CASE_COOLDOWN_SECS" -gt 0 ]]; then

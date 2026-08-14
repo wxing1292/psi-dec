@@ -155,12 +155,12 @@ The inference server does not own these controls:
 The service provides Qwen3 and Qwen3.5 binaries with optional DSpark.
 DSpark support is experimental.
 Its checkpoint contract, CLI, cache sizing, and proposal policy may change.
-It also provides Qwen3.5 binaries that retain their names for current Qwen3.6 MLX checkpoints:
+It also provides Qwen3.5 binaries that retain their names for compatible Qwen3.6 and Qwen3.8 MLX checkpoints:
 
 | Model                  | Binary           | Main checkpoint                      | Optional Spec checkpoint                  |
 | ---------------------- | ---------------- | ------------------------------------ | ----------------------------------------- |
 | Qwen3 dense 14B        | `qwen3`          | `mlx-community/Qwen3-14B-4bit`       | optional official Qwen3 DSpark checkpoint |
-| Qwen3.6 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.6-27B-4bit`     | matching MTP or official Qwen3x DSpark    |
+| Qwen3.8 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.8-27B-4bit`     | matching MTP or official Qwen3x DSpark    |
 | Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | matching MTP or official Qwen3x DSpark    |
 
 Download with the Hugging Face CLI:
@@ -168,8 +168,8 @@ Download with the Hugging Face CLI:
 ```sh
 hf auth login
 hf download mlx-community/Qwen3-14B-4bit --local-dir models/Qwen3-14B-4bit
-hf download mlx-community/Qwen3.6-27B-4bit --local-dir models/Qwen3.6-27B-4bit
-hf download mlx-community/Qwen3.6-27B-MTP-4bit --local-dir models/Qwen3.6-27B-MTP-4bit
+hf download mlx-community/Qwen3.8-27B-4bit --local-dir models/Qwen3.8-27B-4bit
+hf download mlx-community/Qwen3.8-27B-MTP-4bit --local-dir models/Qwen3.8-27B-MTP-4bit
 ```
 
 Use the corresponding 35B-A3B names for the sparse model. MTP checkpoints contain Spec weights. They must match the
@@ -231,7 +231,7 @@ cargo run --release --bin qwen3_5_dense -- \
 The Qwen3.5 services reject a configuration that specifies both `--hf-mtp-model-dir` and
 `--hf-dspark-model-dir`.
 
-Qwen3.5 startup with MTP enabled:
+Qwen3.5/Qwen3.6/Qwen3.8 startup with MTP enabled:
 
 Dense:
 
@@ -239,8 +239,8 @@ Dense:
 cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
-  --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
+  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
+  --hf-mtp-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
   --num-spec-tokens 4
 ```
 
@@ -476,12 +476,12 @@ curl -sS http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Use this gRPC command for a Qwen3.5/Qwen3.6 dense server:
+Use this gRPC command for a Qwen3.5/Qwen3.6/Qwen3.8 dense server:
 
 ```sh
 cargo run --release --bin decode -- \
   --server-url http://127.0.0.1:50061 \
-  --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
+  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
   --chat-template auto \
   --disable-thinking \
   --prompt-str "Reply with exactly: hello" \
@@ -518,7 +518,7 @@ Omit `stream` or set it to `false` to return one collected response:
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Reply with exactly: hello"}],
     "max_completion_tokens": 16,
     "temperature": 0,
@@ -720,7 +720,7 @@ Each summary label includes the selected value, for example, `14b_dspark1` or `1
 If the DSpark checkpoint is absent and no download repository is configured, the helper prints a warning and skips
 that case. A missing Main checkpoint remains an error.
 
-The Qwen3.5/3.6 helper runs controlled 27B/35B Main-only, MTP, and DSpark comparisons:
+The Qwen3.5/3.6/3.8 helper runs controlled 27B/35B Main-only, MTP, and DSpark comparisons:
 
 ```sh
 scripts/qwen35_e2e_decode_perf.sh \
@@ -736,6 +736,8 @@ scripts/qwen35_e2e_decode_perf.sh \
 
 Each `*_mtp` or `*_dspark` group runs `--num-spec-tokens 1` and then `--num-spec-tokens 2`.
 The default case matrix runs `27b_off`, `27b_mtp`, `27b_dspark`, `35b_off`, `35b_mtp`, and `35b_dspark`.
+The default 27B Main and MTP checkpoints use Qwen3.8. The default 35B Main and MTP checkpoints use Qwen3.6.
+Each case uses its Main checkpoint for tokenization by default. Use `--tokenizer` to override all cases.
 If an MTP or DSpark checkpoint is absent and no download repository is configured, the helper prints a warning and
 skips that case. A missing Main checkpoint remains an error.
 The helper stops the server between speculative-token counts.
@@ -756,7 +758,8 @@ Both helpers also print cooldown and speculative-acceptance fields.
 
 The Qwen3 helper does not contain a checked-in performance baseline.
 
-The Qwen3.5/3.6 helper contains an M3 Max baseline for Main-only and one-step MTP cases.
+The helper contains an M3 Max Qwen3.6 baseline for Main-only and one-step MTP cases.
+The default Qwen3.8 27B checkpoints report a checkpoint configuration mismatch against this baseline.
 Two-step MTP and all DSpark cases report that no hardware baseline exists.
 The baseline was recorded on 2026-07-21 at `132c5073`.
 It used these settings:

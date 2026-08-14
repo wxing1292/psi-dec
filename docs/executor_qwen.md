@@ -1,6 +1,6 @@
 # Qwen Executor
 
-This document describes the current Qwen3 and Qwen3.5/Qwen3.6 Metal executors.
+This document describes the current Qwen3 and Qwen3.5/Qwen3.6/Qwen3.8 Metal executors.
 The document covers checkpoint configuration, top-down loading, state preparation, cached replay, and sampling.
 Qwen3 supports separate Vanilla and fixed-block DSpark modes.
 Qwen3.5 supports separate Vanilla, reusable-layer MTP, and fixed-block DSpark modes.
@@ -244,7 +244,7 @@ Its EOS token IDs provide a Qwen3 fallback when `generation_config.json` supplie
 `Qwen3xDSparkConfig` independently parses the official flat DSpark schema.
 It validates Main compatibility, official `target_layer_ids`, fixed-block geometry, ungated GQA, and the `vanilla`
 Markov head.
-`Qwen35ModelConfig` independently parses and normalizes the Qwen3.5/Qwen3.6 schema.
+`Qwen35ModelConfig` independently parses and normalizes the Qwen3.5/Qwen3.6/Qwen3.8 schema.
 That schema includes layer-kind, MoE, MTP, and partial-RoPE fields.
 `Qwen3ExecutorConfig` and `Qwen35ExecutorConfig` keep runtime capacities model-specific.
 

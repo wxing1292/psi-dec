@@ -30,16 +30,16 @@ You need these items:
 - Xcode command-line tools
 - Hugging Face CLI with access to the model
 
-Download the Qwen3.6 Main and MTP checkpoints:
+Download the Qwen3.8 dense and Qwen3.6 sparse Main and MTP checkpoints:
 
 ```sh
 hf auth login
 
-hf download mlx-community/Qwen3.6-27B-4bit \
-  --local-dir models/Qwen3.6-27B-4bit
+hf download mlx-community/Qwen3.8-27B-4bit \
+  --local-dir models/Qwen3.8-27B-4bit
 
-hf download mlx-community/Qwen3.6-27B-MTP-4bit \
-  --local-dir models/Qwen3.6-27B-MTP-4bit
+hf download mlx-community/Qwen3.8-27B-MTP-4bit \
+  --local-dir models/Qwen3.8-27B-MTP-4bit
 
 hf download mlx-community/Qwen3.6-35B-A3B-4bit \
   --local-dir models/Qwen3.6-35B-A3B-4bit
@@ -48,7 +48,7 @@ hf download mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
   --local-dir models/Qwen3.6-35B-A3B-MTP-4bit
 ```
 
-The `qwen3_5_*` binaries support compatible Qwen3.5 and Qwen3.6 checkpoints.
+The `qwen3_5_*` binaries support compatible Qwen3.5, Qwen3.6, and Qwen3.8 checkpoints.
 
 Start the dense 27B service with MTP:
 
@@ -56,8 +56,8 @@ Start the dense 27B service with MTP:
 cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
-  --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-27B-MTP-4bit" \
+  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
+  --hf-mtp-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
   --num-spec-tokens 1
 ```
 
@@ -81,7 +81,7 @@ Stream an HTTP Chat Completions response:
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Reply with exactly: hello"}],
     "stream": true,
     "stream_options": {"include_usage": true},
