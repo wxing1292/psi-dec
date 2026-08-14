@@ -12,6 +12,39 @@ This document gives repository-wide engineering conventions:
 [`high_level.md`](high_level.md) defines architecture and ownership boundaries. Each component document defines its
 tensor terms, source owners, and execution paths.
 
+## Design decision order
+
+Use production ownership as the first design input. Do not start from a helper, branch, test fixture, or benchmark.
+
+Use this order for a source or test design:
+
+1. Identify the owner, caller-visible inputs, outputs, resources, and lifecycle.
+2. Identify the invariant that the owner must enforce.
+3. Compare peer components that have the same contract.
+4. Apply the same owner boundary, API vocabulary, and structure where the contracts match.
+5. Keep a real contract difference. Do not add a lifecycle operation only to complete a symmetric API.
+6. Add an entity only when it owns a concept, invariant, resource, lifecycle, or reusable operation.
+7. Validate external input and configuration at the owning boundary.
+8. Use direct data flow and ordinary arithmetic in the same owner's private path after validation proves the result.
+9. Select the narrowest test layer that can express the contract.
+
+Transferable symmetry is a goal. Zero duplication is not a goal. Visual identity is not a goal.
+
+Apply strong symmetry to these peer groups when their contracts match:
+
+- GQA and GDN
+- dense MLP, sparse MLP, and MoE
+- Main, MTP, and DSpark model roles at shared role boundaries
+
+Compare public APIs, owner structure, source layout, replay policy, and test classification. Keep component-specific
+state transitions and compute paths when the contracts differ.
+
+Production source may change when the change clarifies a real owner, API, resource, or lifecycle. Production source
+must not change only to reduce test setup or expose an implementation detail.
+
+Runtime core must not own model-specific GQA, GDN, MLP, MoE, sampling, MTP, or DSpark policy. The model executor owns
+these semantics. The Metal backend owns their reusable kernels and dispatch implementation.
+
 ## Naming and coordinate domains
 
 Recommendation: Names show their domain semantics. Use established component abbreviations as type prefixes. Examples
@@ -498,6 +531,21 @@ Delivered history must be self-consistent.
 ## Test style
 
 Each Rust test function starts with `test_`. It protects one behavior, correctness, ownership, or lifecycle contract.
+
+Organize component tests by owner API set and lifecycle scenario. Do not create one test for each internal helper or
+branch. One mixed-request scenario may assign a different case to each request when one owner prepares the full group.
+
+Use the same test classification across peer components. Do not give a stateless component a transaction lifecycle
+only to match a stateful component.
+
+Keep these test responsibilities separate:
+
+- A fixed CPU-reference test proves the reference implementation.
+- A Metal parity test proves kernel math, dispatch, ABI, padding, aliasing, and canaries.
+- An executor component test proves metadata, resource ownership, and component-local lifecycle.
+- An integration test proves model composition, weight residency, and full executor lifecycle.
+
+Do not combine a CPU oracle, Metal parity, and a lifecycle scenario in one test.
 
 Let the test target and module path identify the subject. Use the shortest unambiguous case name.
 

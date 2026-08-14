@@ -33,6 +33,35 @@ The executor consumes runtime decisions. It must not recreate scheduler policy.
 The runtime transports model inputs and outputs. It must not parse model tensor layouts or component-local page
 contents.
 
+The source dependency direction puts model semantics at the top and Metal execution at the bottom:
+
+```text
+runtime core ---------------- batch, page IDs, lifecycle ------------------+
+                                                                          |
+executor core ---------------- Core, ReplayShape, CPU reference ----------+
+                                                                          v
+                                                               Qwen model executor
+                                                               stage order and roles
+                                                                          |
+                                                                          v
+                                                               executor component adapter
+                                                               weights/state/metadata/scratch
+                                                                          |
+                                                                          v
+                                                               backend Metal component
+                                                               reusable compute and tuning
+                                                                          |
+                                                                          v
+                                                               backend Operator / Invocation
+                                                               bindings, barriers, dispatch
+                                                                          |
+                                                                          v
+                                                               Metal runtime
+                                                               buffers, kernels, replay, submit
+```
+
+The arrows show use and lowering. They do not transfer semantic ownership to a lower layer.
+
 ## Shared component model
 
 GQA, GDN, dense MLP, MoE, and sampling use the same ownership pattern:
@@ -64,6 +93,200 @@ lifecycle.
 borrow the record-time tensors and component metadata.
 
 `GQAOutput` and `GDNOutput` name the corresponding component outputs. They do not introduce another allocation owner.
+
+## Common entities
+
+The same entity vocabulary applies across attention, MLP, sampling, and model composition. A component can omit an
+entity when its contract does not need it.
+
+| Layer | Common entity | Primary responsibility |
+| --- | --- | --- |
+| Executor core | `*Core` | Backend-neutral geometry and semantic relationships |
+| Executor core | `*ReplayShape` | One recorded work shape and its submission capacity |
+| Executor core | `ReplayBucketPolicy` | Shared capacity algorithm with executor-supplied topology boundaries |
+| Executor core | `*_reference` | CPU oracle with no Metal dependency |
+| Model executor | `Qwen*`, Main, MTP, DSpark | Model role, stage order, checkpoint bindings, and persistent state |
+| Model executor | `Replay<T>`, `ReplayComponent` | One semantic replay-stage owner and its topology cache |
+| Model executor | `FullStateIO`, `SelectedStateIO` | Full or selected state transfer at the state owner |
+| Executor component | `*Input`, `*Output` | Typed record-time boundary with borrowed resources |
+| Executor component | `*MetadataBuffers`, `*Scratch` | Reusable batch metadata and temporary workspace |
+| Executor component | `*StateTable`, `*RequestSlots` | Component-local persistent state and request-slot interpretation |
+| Executor component | `ReplayLayer` | Typed lowering from one semantic component to `ReplayOp` values |
+| Executor component | `Recorder<ReplayOp>` | Backend-neutral stage composition through Metal replay operations |
+| Backend component | `*Config`, `*Shape` | Static workload facts and one backend invocation shape |
+| Backend component | `*Buffers`, `*Weights`, `*Scratch` | Borrowed backend resource groups for one invocation |
+| Backend component | `*ComputePath`, `*KernelKind` | Selected compute decomposition and low-level specialization |
+| Backend component | `*Invocation` | One recordable backend operation or command sequence |
+| Metal resource | `Device`, `Buffer`, `BufferView`, `Kernel`, `Stream` | Metal resource and submission ownership |
+| Metal resource | `BufferIO` | Direct file and shared-buffer range transfer |
+| Metal runtime | `Operator`, `CommandRecorder` | Kernel, resource, constant, barrier, and dispatch recording |
+| Metal runtime | `ReplayProgramBuilder`, `ReplayProgram` | Recorded command construction and stable resource retention |
+| Metal runtime | `ReplayArguments`, `ReplaySubmission` | Submission-time values and in-flight completion ownership |
+
+`*Buffers`, `*Weights`, and `*Scratch` group borrowed resources. Their names do not imply allocation ownership.
+The containing model or component owns each persistent resource.
+
+Use these source files as concrete examples:
+
+- [`def/layer.rs`](../crates/inference-executor-metal/src/def/layer.rs) defines `ReplayLayer`.
+- [`replay.rs`](../crates/inference-executor-metal/src/replay.rs) defines `Replay<T>` and `ReplayComponent`.
+- [`mlp/dense/backend.rs`](../crates/inference-executor-metal/src/mlp/dense/backend.rs) is an executor component adapter.
+- [`layer/dense_mlp.rs`](../crates/inference-executor-metal/src/model/qwen/v3_x/layer/dense_mlp.rs) is a Qwen model owner.
+- [`quantized_dense_mlp.rs`](../crates/inference-backend-metal/src/components/quantized_dense_mlp.rs) is a backend component.
+- [`operation.rs`](../crates/inference-backend-metal/src/metal/stream/operation.rs) defines `Operator` and `CommandRecorder`.
+- [`stream/replay.rs`](../crates/inference-backend-metal/src/metal/stream/replay.rs) defines the Metal replay program lifecycle.
+
+### Backend operator pattern
+
+This generic pattern shows the lowest component boundary. The names are placeholders.
+
+```rust
+pub struct ComponentInvocation<'a> {
+    kernel: &'a ComponentKernel,
+    shape: ComponentShape,
+    buffers: ComponentBuffers<'a>,
+    num_active_items_key: Option<ReplayParameterKey>,
+}
+
+impl Operator for ComponentInvocation<'_> {
+    fn record(self, recorder: &CommandRecorder<'_>) {
+        self.shape.validate();
+        validate_buffers(self.shape, &self.buffers);
+
+        recorder.set_kernel(&self.kernel.kernel);
+        recorder.set_buffer_read(0, self.buffers.input, 0);
+        recorder.set_buffer_write(1, self.buffers.output, 0);
+
+        match self.num_active_items_key {
+            Some(key) => recorder.bind_u32(2, key, 1, self.shape.num_total_items),
+            None => recorder.set_u32(2, self.shape.num_total_items),
+        }
+
+        recorder.dispatch_threadblocks(self.shape.grid(), self.kernel.threads_per_threadblock());
+    }
+}
+```
+
+The backend operator validates its invocation buffers and shader domain. It selects kernels and dispatch geometry.
+It does not own model stage order, request lifecycle, or checkpoint names.
+
+### Executor component pattern
+
+This generic pattern shows how an executor component lowers typed semantic input to a backend invocation.
+
+```rust
+pub struct Component {
+    compute: BackendComponent,
+}
+
+pub struct ComponentInput<'a> {
+    pub shape: ComponentReplayShape,
+    pub input: &'a Buffer,
+    pub output: &'a Buffer,
+    pub scratch: ComponentScratchBindings<'a>,
+    pub weights: ComponentWeights<'a>,
+}
+
+impl ReplayLayer for Component {
+    type Input<'a> = ComponentInput<'a>;
+    type Output<'a> = &'a Buffer;
+
+    fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
+    where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        input.shape.validate();
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke(
+            backend_shape(input.shape),
+            input.input,
+            input.output,
+            input.scratch,
+            input.weights,
+        )));
+        input.output
+    }
+}
+```
+
+The executor component owns the semantic input and output contract. It also owns component metadata and scratch
+interpretation. The backend invocation stays responsible for Metal binding and dispatch.
+
+### Model owner pattern
+
+This generic pattern shows a model owner with symmetric weight residency and a direct record path.
+
+```rust
+pub struct ModelComponent {
+    core: ComponentCore,
+    backend: Component,
+    weights: Option<ComponentWeightBuffers>,
+    scratch: Rc<ComponentScratch>,
+}
+
+impl ModelComponent {
+    pub fn load_weights(&mut self, store: &mut SafeTensorStore) -> Result<(), ModelExecutorError> {
+        assert!(self.weights.is_none(), "component weights are already loaded");
+        self.weights = Some(ComponentWeightBuffers::load(store, &self.core)?);
+        Ok(())
+    }
+
+    pub fn unload_weights(&mut self) {
+        assert!(self.weights.is_some(), "component weights are not loaded");
+        self.weights.take();
+    }
+
+    fn weights(&self) -> &ComponentWeightBuffers {
+        self.weights
+            .as_ref()
+            .expect("component weights must be loaded before execution")
+    }
+
+    pub fn record<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        shape: ComponentReplayShape,
+        input: &'a Buffer,
+        output: &'a Buffer,
+    )
+    where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        let _ = <Component as ReplayLayer>::record(
+            &self.backend,
+            recorder,
+            ComponentInput {
+                shape,
+                input,
+                output,
+                scratch: self.scratch.bindings(),
+                weights: self.weights().as_borrowed(),
+            },
+        );
+    }
+}
+```
+
+The model owner resolves checkpoint bindings and persistent resources. It invokes its layers in semantic order. It
+does not select a backend kernel or duplicate backend topology thresholds.
+
+### Replay lifecycle pattern
+
+Recording fixes command topology and capacity. Submission supplies dynamic values within that recorded domain.
+
+```rust
+let (key, _cache_hit) = replay.record(&runtime, &input);
+let program = replay.replay(&key);
+
+let arguments = ReplayArguments::new()
+    .with_u32(NUM_ACTIVE_ITEMS, input.num_active_items);
+let submission = runtime.submit_replay_with_arguments(program, &arguments);
+submission.wait();
+```
+
+`_cache_hit` reports whether the replay already existed. It does not change component semantics.
+
+A stateful component can add `prepare`, `commit`, `cancel`, `publish`, or `restore` when its real contract needs those
+operations. A stateless component must not add them for symmetry.
 
 ## Current source areas
 
