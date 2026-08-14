@@ -20,6 +20,8 @@ crates/inference-executor-core/src/mlp/moe/
 crates/inference-executor-metal/src/mlp/moe/
   mod.rs      Metal MoE module root
   backend.rs   GatedMoEMetalConfig + GatedMoE
+  backend_test.rs
+               MoE owner API-set and replay-path tests
   scratch.rs   routing, top-k-expert, and optional shared-expert scratch ownership and bindings
 
 crates/inference-executor-metal/src/model/qwen/
@@ -41,9 +43,13 @@ Reusable Metal MoE / sparse expert kernels live in:
 ```text
 crates/inference-backend-metal/src/components/
   moe_routing.rs
+  moe_routing_test.rs
   moe_expert_major.rs
+  moe_expert_major_test.rs
   moe_combine.rs
+  moe_combine_test.rs
   quantized_sparse_mlp.rs
+  quantized_sparse_mlp_test.rs
 ```
 
 ## Shape model
@@ -124,6 +130,8 @@ The Qwen weight owner groups the shared gate and dense expert under one optional
 Thus, a partially populated shared-expert branch is not representable.
 
 The Qwen MoE weight owner loads one bounded `TensorMap` from the exact MoE binding subtree.
+It retains the core and Metal configuration that created its backend.
+Weight reload uses these retained values.
 It removes router, top-k expert, and optional shared-expert tensors from that map.
 The private sparse-expert owner consumes its gate/up/down subset without creating a second checkpoint owner.
 Each owner validates and materializes the backend-required persistent layout during initialization.
@@ -134,7 +142,8 @@ It exposes token-major and expert-major sparse expert MLP compute.
 It does not own routing, dispatch, combine, shared-expert work, or compute-path selection.
 
 Its token-major shape is `{ num_routes, num_tokens }`.
-Its expert-major shape is `{ num_experts, num_routes }`.
+Its expert-major shape is `{ num_routes }`.
+`QuantizedSparseMLPConfig` owns `num_experts` for both paths.
 Raw gather-matmul operators use semantic gather axes `{ num_routes, num_input_vectors }`.
 Only their true matrix axes retain `n` and `k`.
 
@@ -147,13 +156,13 @@ The sparse expert MLP kernel alone is not that boundary.
 The semantic replay input is:
 
 ```text
-GatedMoEReplayInput
+GatedMoEInput
   shape    GatedMoEReplayShape
   hidden_state      &Buffer
   next_hidden_state &Buffer
   scratch  MoEScratchBindings
   weights  GatedMoEWeights
-  shared_experts optional GatedMoESharedExpertsReplayInput
+  shared_experts optional GatedMoESharedExpertsInput
 ```
 
 Replay returns `next_hidden_state` directly.
@@ -206,14 +215,14 @@ compute path            selected from num_tokens
 The backend also has an additive full-MoE bucketed replay API:
 
 ```text
-GatedMoEBucketedReplayInput
+GatedMoEBucketedInput
   num_total_tokens       fixed recorded token capacity
   num_active_tokens_key  caller-owned ReplayParameterKey
   hidden_state           &Buffer
   next_hidden_state      &Buffer
   scratch                MoEScratchBindings
   weights                GatedMoEWeights
-  shared_experts         optional GatedMoESharedExpertsReplayInput
+  shared_experts         optional GatedMoESharedExpertsInput
 ```
 
 `GatedMoE::record_bucketed(...)` selects the token-major or expert-major path from `num_total_tokens`.
@@ -321,7 +330,8 @@ QuantizedSparseMLP::invoke_expert_major_bucketed(...)
 ```
 
 Both APIs record `num_total_tokens` and fixed `num_experts_per_token` values.
-The host derives `num_total_routes = num_total_tokens * num_experts_per_token` with checked arithmetic.
+The constructor validates `num_total_routes = num_total_tokens * num_experts_per_token` once. The private replay path
+then derives the same value with ordinary arithmetic.
 It uses this total route count for dispatch and for all route, input, output, and SwiGLU scratch buffer validation.
 The caller supplies one `num_active_tokens` replay parameter.
 All four expert affine commands use the same parameter key and the same `[1, num_total_tokens]` domain.
@@ -595,6 +605,11 @@ They use fixed and random inputs.
 The expert-major test records the production subgraph `layout -> pack -> sparse MLP -> scatter`.
 It compares the final token-major output with the same CPU expert and bf16-combine references.
 This comparison covers fixed and random fixtures.
+Bucketed component tests use one reusable replay for an active prefix, full capacity, and a smaller active prefix.
+They poison inactive input and verify output canaries or preserved tails.
+Separate tests cover token-major, token-major fast-down, expert-major, normalized routing, non-normalized routing,
+shared combine, and non-shared combine because these cases use different kernels or data layouts.
+Replay infrastructure tests own generic replay-parameter validation.
 
 ## Tests and benchmarks
 

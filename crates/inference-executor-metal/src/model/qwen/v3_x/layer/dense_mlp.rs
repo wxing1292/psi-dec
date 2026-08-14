@@ -16,9 +16,9 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLP;
-use crate::mlp::dense::backend::DenseMLPBucketedReplayInput;
+use crate::mlp::dense::backend::DenseMLPBucketedInput;
+use crate::mlp::dense::backend::DenseMLPInput;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
-use crate::mlp::dense::backend::DenseMLPReplayInput;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::model::qwen::v3_x::weight::concat_bytes;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
@@ -27,15 +27,19 @@ use crate::model::qwen::v3_x::weight::to_u32;
 use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xDenseMLP {
+    core: DenseMLPCore,
+    metal: DenseMLPMetalConfig,
     backend: DenseMLP,
     weights: Option<DenseMLPWeightBuffers>,
     scratch: Rc<DenseMLPScratch>,
 }
 
 impl Qwen3xDenseMLP {
-    pub fn new(device: &Device, core: &DenseMLPCore, metal: DenseMLPMetalConfig, scratch: Rc<DenseMLPScratch>) -> Self {
+    pub fn new(device: &Device, core: DenseMLPCore, metal: DenseMLPMetalConfig, scratch: Rc<DenseMLPScratch>) -> Self {
         Self {
             backend: DenseMLP::new(device, core.clone(), metal),
+            core,
+            metal,
             weights: None,
             scratch,
         }
@@ -45,12 +49,12 @@ impl Qwen3xDenseMLP {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        core: &DenseMLPCore,
-        metal: DenseMLPMetalConfig,
         bindings: Qwen3xDenseMLPWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(self.weights.is_none(), "Qwen3.x dense MLP weights are already loaded");
-        self.weights = Some(DenseMLPWeightBuffers::load(device, store, &bindings, core, metal)?);
+        self.weights = Some(DenseMLPWeightBuffers::load(
+            device, store, &bindings, &self.core, self.metal,
+        )?);
         Ok(())
     }
 
@@ -80,7 +84,7 @@ impl Qwen3xDenseMLP {
         let _ = <DenseMLP as ReplayLayer>::record(
             &self.backend,
             recorder,
-            DenseMLPReplayInput {
+            DenseMLPInput {
                 shape: DenseMLPReplayShape { num_tokens },
                 hidden_state: input,
                 next_hidden_state: output,
@@ -102,7 +106,7 @@ impl Qwen3xDenseMLP {
     {
         let _ = self.backend.record_bucketed(
             recorder,
-            DenseMLPBucketedReplayInput {
+            DenseMLPBucketedInput {
                 num_total_tokens,
                 num_active_tokens_key,
                 hidden_state: input,

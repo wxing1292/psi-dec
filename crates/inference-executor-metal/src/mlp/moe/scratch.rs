@@ -109,7 +109,7 @@ impl MoEScratch {
             norm_topk_prob: core.norm_topk_prob,
         };
         let routing_shape = MoERoutingShape {
-            num_tokens: max_tokens_u32,
+            num_total_tokens: max_tokens_u32,
         };
         routing_config.validate_shape(routing_shape);
         let router_config = affine_config(core.num_experts, core.hidden_dim, config.router_bits, config);
@@ -121,7 +121,7 @@ impl MoEScratch {
             core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
         );
         let expert_major_shape = MoEExpertMajorShape {
-            num_tokens: max_tokens_u32,
+            num_total_tokens: max_tokens_u32,
         };
         expert_major_config.validate_shape(expert_major_shape);
         MoECombineConfig::bf16(
@@ -129,7 +129,7 @@ impl MoEScratch {
             expert_major_config.hidden_dim,
         )
         .validate_shape(MoECombineShape {
-            num_tokens: expert_major_shape.num_tokens,
+            num_total_tokens: expert_major_shape.num_total_tokens,
         });
         let sparse_config = QuantizedSparseMLPConfig {
             num_experts: core.num_experts.try_into().expect("MoE expert count must fit u32"),
@@ -143,15 +143,15 @@ impl MoEScratch {
             dtype: config.io_dtype,
         };
         let token_major_shape = QuantizedSparseMLPTokenMajorShape {
-            num_routes,
-            num_tokens: max_tokens_u32,
+            num_total_routes: num_routes,
+            num_total_tokens: max_tokens_u32,
         };
         let routed_hidden_bytes =
             sparse_config
                 .token_major_output_bytes(token_major_shape)
                 .max(
                     sparse_config.expert_major_output_bytes(QuantizedSparseMLPExpertMajorShape {
-                        num_routes: expert_major_config.num_routes(expert_major_shape),
+                        num_total_routes: expert_major_config.num_routes(expert_major_shape),
                     }),
                 );
         let topk: u32 = core

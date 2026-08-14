@@ -110,7 +110,9 @@ impl QuantizedDenseMLPFixture {
             bits: profile.bits,
             dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedDenseMLPShape { num_tokens: tokens };
+        let shape = QuantizedDenseMLPShape {
+            num_total_tokens: tokens,
+        };
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();
         let tokens_i32 = tokens.try_into().expect("dense MLP token count must fit i32");

@@ -44,6 +44,7 @@ Reusable Metal dense MLP kernels live in:
 
 ```text
 crates/inference-backend-metal/src/components/quantized_dense_mlp.rs
+crates/inference-backend-metal/src/components/quantized_dense_mlp_test.rs
 crates/inference-backend-metal/src/components/metal/quantized_dense_mlp_swiglu.metal
 ```
 
@@ -80,7 +81,7 @@ Model and layer wiring own barriers on the first consumer command and downstream
 `DenseMLP` records one dense gated MLP forward into a caller-owned `Recorder`.
 It does not submit commands.
 It does not own tensor storage or request lifecycle.
-The semantic layer input is `DenseMLPReplayInput { shape, hidden_state, next_hidden_state, scratch, weights }`.
+The semantic layer input is `DenseMLPInput { shape, hidden_state, next_hidden_state, scratch, weights }`.
 Replay returns the caller-owned `next_hidden_state` buffer directly.
 
 The replay order is:
@@ -94,8 +95,8 @@ hidden_state
 ```
 
 `DenseMLPReplayShape.num_tokens` is the backend-neutral row count for an exact replay.
-Only `crates/inference-executor-metal` maps it to `QuantizedDenseMLPShape`.
-The additive bucketed path uses `DenseMLPBucketedReplayInput.num_total_tokens` as the recorded row capacity.
+Only `crates/inference-executor-metal` maps it to `QuantizedDenseMLPShape.num_total_tokens`.
+The additive bucketed path uses `DenseMLPBucketedInput.num_total_tokens` as the recorded row capacity.
 It accepts a caller-owned `ReplayParameterKey` for `num_active_tokens`.
 Production callers allocate scratch for model capacity.
 An exact invocation validates the exact token count.
@@ -111,6 +112,8 @@ The model stream serializes Main and MTP execution.
 Thus, layers can reuse `gate_up` and swiglu scratch.
 
 The shared `Qwen3xDenseMLP` leaf directly owns immutable weights and per-layer output buffers.
+It retains the core and Metal configuration that created its backend.
+Weight reload uses these retained values.
 `Qwen3MainLayer` and the dense variants of `Qwen35MainLayer` and `Qwen35MTPLayer` compose that leaf.
 Each composition uses a separate role-specific layer and scratch type.
 Their model-specific binding trees contain `Qwen3xDenseMLPWeightBindings` at the leaf boundary.
@@ -263,6 +266,9 @@ The semantic data flow stays the same.
 Focused backend tests compare the current quantized bf16 replay path with the CPU quantized dense-MLP reference.
 The tests use fixed and random inputs.
 They cover gate/up projection, `SiLU(gate) * up`, and down projection as one numerical contract.
+A bucketed replay test crosses the affine topology boundaries.
+It verifies active output, poisoned inactive input, canary tails, capacity growth, and capacity shrink.
+Affine operator tests own kernel selection and topology-boundary contracts.
 
 Current Metal component bench:
 

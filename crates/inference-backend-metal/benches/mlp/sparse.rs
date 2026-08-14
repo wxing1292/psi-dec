@@ -134,8 +134,8 @@ impl QuantizedSparseMLPFixture {
             dtype: Dtype::Bfloat16,
         };
         let shape = QuantizedSparseMLPTokenMajorShape {
-            num_routes: num_tokens * TOPK_EXPERTS,
-            num_tokens,
+            num_total_routes: num_tokens * TOPK_EXPERTS,
+            num_total_tokens: num_tokens,
         };
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();
@@ -152,7 +152,7 @@ impl QuantizedSparseMLPFixture {
             routed_hidden: Buffer::new_zeroed(device, config.token_major_output_bytes(shape)),
         };
         let scratch = QuantizedSparseMLPOwnedScratch {
-            swiglu: Buffer::new_zeroed(device, config.swiglu_bytes(shape.num_routes)),
+            swiglu: Buffer::new_zeroed(device, config.swiglu_bytes(shape.num_total_routes)),
         };
         let weights = QuantizedSparseMLPOwnedWeights {
             gate_weight: quantized_weight_stack(device, gate_up_config.weight_bytes_per_expert()),

@@ -278,7 +278,9 @@ impl ForcedMoEKernels {
                 )));
                 self.record_shared(recorder, num_tokens, input, shared_scratch, weights);
                 recorder.record_with_barrier_before(ReplayOp::opaque(self.combine.invoke_with_shared_experts(
-                    MoECombineShape { num_tokens },
+                    MoECombineShape {
+                        num_total_tokens: num_tokens,
+                    },
                     MoECombineWithSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
@@ -289,7 +291,9 @@ impl ForcedMoEKernels {
                 )));
             },
             MoERealImpl::ExpertMajor => {
-                let shape = MoEExpertMajorShape { num_tokens };
+                let shape = MoEExpertMajorShape {
+                    num_total_tokens: num_tokens,
+                };
                 self.record_shared(recorder, num_tokens, input, shared_scratch, weights);
                 recorder.record(ReplayOp::opaque(self.expert_major.invoke_layout(
                     shape,
@@ -314,7 +318,7 @@ impl ForcedMoEKernels {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
                     self.experts.invoke_expert_major(
                         QuantizedSparseMLPExpertMajorShape {
-                            num_routes: num_tokens
+                            num_total_routes: num_tokens
                                 .checked_mul(TOPK_EXPERTS)
                                 .expect("forced MoE route count must fit u32"),
                         },
@@ -357,7 +361,9 @@ impl ForcedMoEKernels {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         recorder.record(ReplayOp::opaque(self.shared_experts.invoke(
-            QuantizedDenseMLPShape { num_tokens },
+            QuantizedDenseMLPShape {
+                num_total_tokens: num_tokens,
+            },
             QuantizedDenseMLPBuffers {
                 hidden_state: input,
                 next_hidden_state: scratch.hidden,
@@ -421,18 +427,24 @@ impl<'a> RealMoEFixture<'a> {
         let dense_config = dense_config();
         let sparse_shape = sparse_token_major_shape(num_tokens);
         let expert_major_config = expert_major_config();
-        let expert_major_shape = MoEExpertMajorShape { num_tokens };
+        let expert_major_shape = MoEExpertMajorShape {
+            num_total_tokens: num_tokens,
+        };
         let expert_major_sparse_shape = QuantizedSparseMLPTokenMajorShape {
-            num_routes: expert_major_config.num_routes(expert_major_shape),
-            num_tokens: expert_major_config.num_routes(expert_major_shape),
+            num_total_routes: expert_major_config.num_routes(expert_major_shape),
+            num_total_tokens: expert_major_config.num_routes(expert_major_shape),
         };
         let selected_sparse_shape = match implementation {
             MoERealImpl::TokenMajor => sparse_shape,
             MoERealImpl::ExpertMajor => expert_major_sparse_shape,
         };
-        let dense_shape = QuantizedDenseMLPShape { num_tokens };
+        let dense_shape = QuantizedDenseMLPShape {
+            num_total_tokens: num_tokens,
+        };
         let combine_config = MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM);
-        let combine_shape = MoECombineShape { num_tokens };
+        let combine_shape = MoECombineShape {
+            num_total_tokens: num_tokens,
+        };
         let num_routes = num_tokens as usize * TOPK_EXPERTS as usize;
         let input = Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, HIDDEN_DIM as usize));
         let router_logits = Buffer::new_zeroed(device, router_config.output_bytes(num_tokens_i32));
@@ -451,7 +463,10 @@ impl<'a> RealMoEFixture<'a> {
         let experts_by_route = Buffer::new_zeroed(device, expert_major_config.route_indices_bytes(expert_major_shape));
         let packed_input = Buffer::new_zeroed(device, expert_major_config.route_hidden_bytes(expert_major_shape));
         let routed_hidden = Buffer::new_zeroed(device, sparse_config.token_major_output_bytes(selected_sparse_shape));
-        let sparse_swiglu = Buffer::new_zeroed(device, sparse_config.swiglu_bytes(selected_sparse_shape.num_routes));
+        let sparse_swiglu = Buffer::new_zeroed(
+            device,
+            sparse_config.swiglu_bytes(selected_sparse_shape.num_total_routes),
+        );
         let shared_hidden = Buffer::new_zeroed(device, dense_config.down_config().output_bytes(num_tokens_i32));
         let shared_expert_gate_logits =
             Buffer::new_zeroed(device, shared_expert_gate_config.output_bytes(num_tokens_i32));
@@ -464,9 +479,9 @@ impl<'a> RealMoEFixture<'a> {
             swiglu: Buffer::new_zeroed(device, dense_config.swiglu_bytes(dense_shape)),
         };
         let kernels = ForcedMoEKernels::new(device);
-        let mut builder = MetalReplayRuntime::new(&stream).create_recorder();
+        let mut recorder = MetalReplayRuntime::new(&stream).create_recorder();
         kernels.record(
-            &mut builder,
+            &mut recorder,
             implementation,
             num_tokens,
             &input,
@@ -504,7 +519,7 @@ impl<'a> RealMoEFixture<'a> {
                 shared_expert_gate_biases: &weights.shared_expert_gate_biases,
             },
         );
-        let replay = builder.build();
+        let replay = recorder.build();
         Self {
             stream,
             output,
@@ -1000,8 +1015,8 @@ fn validate_weight_sizes(
     );
     let sparse_config = sparse_config();
     let sparse_shape = QuantizedSparseMLPTokenMajorShape {
-        num_routes: TOPK_EXPERTS,
-        num_tokens: 1,
+        num_total_routes: TOPK_EXPERTS,
+        num_total_tokens: 1,
     };
     let gate_up_config = sparse_config.gate_up_config();
     let down_config = sparse_config.down_config();
@@ -1083,7 +1098,9 @@ fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
 }
 
 fn routing_shape(num_tokens: u32) -> MoERoutingShape {
-    MoERoutingShape { num_tokens }
+    MoERoutingShape {
+        num_total_tokens: num_tokens,
+    }
 }
 
 fn routing_config() -> MoERoutingConfig {
@@ -1100,10 +1117,10 @@ fn expert_major_config() -> MoEExpertMajorConfig {
 
 fn sparse_token_major_shape(num_tokens: u32) -> QuantizedSparseMLPTokenMajorShape {
     QuantizedSparseMLPTokenMajorShape {
-        num_routes: num_tokens
+        num_total_routes: num_tokens
             .checked_mul(TOPK_EXPERTS)
             .expect("forced MoE route count must fit u32"),
-        num_tokens,
+        num_total_tokens: num_tokens,
     }
 }
 

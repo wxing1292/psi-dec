@@ -26,8 +26,8 @@ use inference_executor_metal::def::layer::ReplayLayer;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
 use inference_executor_metal::mlp::dense::backend::DenseMLP;
+use inference_executor_metal::mlp::dense::backend::DenseMLPInput;
 use inference_executor_metal::mlp::dense::backend::DenseMLPMetalConfig;
-use inference_executor_metal::mlp::dense::backend::DenseMLPReplayInput;
 use inference_executor_metal::mlp::dense::scratch::DenseMLPScratchBindings;
 use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
@@ -209,7 +209,9 @@ impl<'a> RealDenseMLPFixture<'a> {
                 io_dtype: Dtype::Bfloat16,
             },
         );
-        let shape = QuantizedDenseMLPShape { num_tokens };
+        let shape = QuantizedDenseMLPShape {
+            num_total_tokens: num_tokens,
+        };
         let gate_up_config = gate_up_affine_config();
         let down_config = down_affine_config();
         let m = num_tokens.try_into().expect("dense MLP token count must fit i32");
@@ -313,13 +315,13 @@ impl<'a> RealDenseMLPFixture<'a> {
     }
 
     fn forward_replay(&self) -> ReplayProgram {
-        let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
+        let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
         let _ = <DenseMLP as ReplayLayer>::record(
             &self.backend,
-            &mut builder,
-            DenseMLPReplayInput {
+            &mut recorder,
+            DenseMLPInput {
                 shape: DenseMLPReplayShape {
-                    num_tokens: self.shape.num_tokens,
+                    num_tokens: self.shape.num_total_tokens,
                 },
                 hidden_state: &self.hidden_state,
                 next_hidden_state: &self.output,
@@ -330,7 +332,7 @@ impl<'a> RealDenseMLPFixture<'a> {
                 weights: self.weights.as_borrowed(),
             },
         );
-        builder.build()
+        recorder.build()
     }
 
     fn submit_replay(&self, replay: &ReplayProgram) {
@@ -338,32 +340,32 @@ impl<'a> RealDenseMLPFixture<'a> {
     }
 
     fn forced_full_replay(&self, policy: DenseAffinePolicy) -> ReplayProgram {
-        let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-        self.record_forced_gate_up(&mut builder, policy);
-        builder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_swiglu(
+        let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
+        self.record_forced_gate_up(&mut recorder, policy);
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_swiglu(
             self.shape,
             &self.gate_up,
             &self.swiglu,
         )));
-        self.record_forced_down(&mut builder, policy);
-        builder.build()
+        self.record_forced_down(&mut recorder, policy);
+        recorder.build()
     }
 
     fn forced_gate_up_replay(&self, policy: DenseAffinePolicy) -> ReplayProgram {
-        let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-        self.record_forced_gate_up(&mut builder, policy);
-        builder.build()
+        let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
+        self.record_forced_gate_up(&mut recorder, policy);
+        recorder.build()
     }
 
     fn forced_down_replay(&self, policy: DenseAffinePolicy) -> ReplayProgram {
-        let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
-        self.record_forced_down(&mut builder, policy);
-        builder.build()
+        let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
+        self.record_forced_down(&mut recorder, policy);
+        recorder.build()
     }
 
     fn record_forced_gate_up<'b>(
         &'b self,
-        builder: &mut impl Recorder<'b, Operator = ReplayOp<'b>>,
+        recorder: &mut impl Recorder<'b, Operator = ReplayOp<'b>>,
         policy: DenseAffinePolicy,
     ) {
         let kernel = match policy {
@@ -373,10 +375,10 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseAffinePolicy::QmmBm32Bn32 => &self.gate_up_qmm_bm32_bn32,
         };
         let weights = self.weights.as_borrowed();
-        builder.record_with_barrier_before(ReplayOp::opaque(
+        recorder.record_with_barrier_before(ReplayOp::opaque(
             kernel.invoke(
                 self.shape
-                    .num_tokens
+                    .num_total_tokens
                     .try_into()
                     .expect("dense MLP token count must fit i32"),
                 &self.gate_up,
@@ -395,7 +397,7 @@ impl<'a> RealDenseMLPFixture<'a> {
 
     fn record_forced_down<'b>(
         &'b self,
-        builder: &mut impl Recorder<'b, Operator = ReplayOp<'b>>,
+        recorder: &mut impl Recorder<'b, Operator = ReplayOp<'b>>,
         policy: DenseAffinePolicy,
     ) {
         let kernel = match policy {
@@ -405,10 +407,10 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseAffinePolicy::QmmBm32Bn32 => &self.down_qmm_bm32_bn32,
         };
         let weights = self.weights.as_borrowed();
-        builder.record_with_barrier_before(ReplayOp::opaque(
+        recorder.record_with_barrier_before(ReplayOp::opaque(
             kernel.invoke(
                 self.shape
-                    .num_tokens
+                    .num_total_tokens
                     .try_into()
                     .expect("dense MLP token count must fit i32"),
                 &self.output,
@@ -631,9 +633,9 @@ fn build_single_invocation_replay<I>(stream: &Stream, invocation: I) -> ReplayPr
 where
     I: Operator,
 {
-    let mut builder = MetalReplayRuntime::new(stream).create_recorder();
-    builder.record(ReplayOp::opaque(invocation));
-    builder.build()
+    let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
+    recorder.record(ReplayOp::opaque(invocation));
+    recorder.build()
 }
 
 fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> String {

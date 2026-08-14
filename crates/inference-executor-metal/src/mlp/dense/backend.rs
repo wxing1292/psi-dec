@@ -41,7 +41,7 @@ pub struct DenseMLP {
 }
 
 #[derive(Clone, Copy)]
-pub struct DenseMLPReplayInput<'a> {
+pub struct DenseMLPInput<'a> {
     pub shape: DenseMLPReplayShape,
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
@@ -50,7 +50,7 @@ pub struct DenseMLPReplayInput<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct DenseMLPBucketedReplayInput<'a> {
+pub struct DenseMLPBucketedInput<'a> {
     pub num_total_tokens: u32,
     pub num_active_tokens_key: ReplayParameterKey,
     pub hidden_state: &'a Buffer,
@@ -64,7 +64,7 @@ impl DenseMLP {
         core.validate();
         config.validate();
         Self {
-            compute: QuantizedDenseMLP::new(device, backend_config(&core, config)),
+            compute: QuantizedDenseMLP::new(device, compute_config(&core, config)),
         }
     }
 
@@ -76,7 +76,7 @@ impl DenseMLP {
         self.compute.topology_boundaries()
     }
 
-    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: DenseMLPBucketedReplayInput<'a>) -> &'a Buffer
+    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: DenseMLPBucketedInput<'a>) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -98,7 +98,7 @@ impl DenseMLP {
 }
 
 impl ReplayLayer for DenseMLP {
-    type Input<'a> = DenseMLPReplayInput<'a>;
+    type Input<'a> = DenseMLPInput<'a>;
     type Output<'a> = &'a Buffer;
 
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
@@ -124,11 +124,11 @@ impl ReplayLayer for DenseMLP {
 
 fn backend_shape(shape: DenseMLPReplayShape) -> QuantizedDenseMLPShape {
     QuantizedDenseMLPShape {
-        num_tokens: shape.num_tokens,
+        num_total_tokens: shape.num_tokens,
     }
 }
 
-pub(super) fn backend_config(core: &DenseMLPCore, config: DenseMLPMetalConfig) -> QuantizedDenseMLPConfig {
+fn compute_config(core: &DenseMLPCore, config: DenseMLPMetalConfig) -> QuantizedDenseMLPConfig {
     QuantizedDenseMLPConfig {
         hidden_dim: core.hidden_dim.try_into().expect("dense MLP hidden_dim must fit u32"),
         intermediate_dim: core

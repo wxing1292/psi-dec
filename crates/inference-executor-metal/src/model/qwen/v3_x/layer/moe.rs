@@ -18,11 +18,11 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::moe::backend::GatedMoE;
-use crate::mlp::moe::backend::GatedMoEBucketedReplayInput;
+use crate::mlp::moe::backend::GatedMoEBucketedInput;
+use crate::mlp::moe::backend::GatedMoEInput;
 use crate::mlp::moe::backend::GatedMoEMetalConfig;
-use crate::mlp::moe::backend::GatedMoEReplayInput;
 use crate::mlp::moe::backend::GatedMoEReplayTopology;
-use crate::mlp::moe::backend::GatedMoESharedExpertsReplayInput;
+use crate::mlp::moe::backend::GatedMoESharedExpertsInput;
 use crate::mlp::moe::backend::GatedMoESharedExpertsWeights;
 use crate::mlp::moe::backend::GatedMoEWeights;
 use crate::mlp::moe::scratch::MoEScratch;
@@ -34,15 +34,19 @@ use crate::model::qwen::v3_x::weight::sparse_affine_layout;
 use crate::model::qwen::v3_x::weight::validate_len;
 
 pub struct Qwen3xMoE {
+    core: GatedMoECore,
+    metal: GatedMoEMetalConfig,
     backend: GatedMoE,
     weights: Option<Box<Qwen3xMoEWeights>>,
     scratch: Rc<MoEScratch>,
 }
 
 impl Qwen3xMoE {
-    pub fn new(device: &Device, core: &GatedMoECore, metal: GatedMoEMetalConfig, scratch: Rc<MoEScratch>) -> Self {
+    pub fn new(device: &Device, core: GatedMoECore, metal: GatedMoEMetalConfig, scratch: Rc<MoEScratch>) -> Self {
         Self {
             backend: GatedMoE::new(device, core.clone(), metal),
+            core,
+            metal,
             weights: None,
             scratch,
         }
@@ -52,12 +56,12 @@ impl Qwen3xMoE {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        core: &GatedMoECore,
-        metal: GatedMoEMetalConfig,
         bindings: Qwen3xMoEWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(self.weights.is_none(), "Qwen3.x MoE weights are already loaded");
-        self.weights = Some(Box::new(Qwen3xMoEWeights::load(device, store, &bindings, core, metal)?));
+        self.weights = Some(Box::new(Qwen3xMoEWeights::load(
+            device, store, &bindings, &self.core, self.metal,
+        )?));
         Ok(())
     }
 
@@ -86,7 +90,7 @@ impl Qwen3xMoE {
     {
         let weights = self.weights();
         let shared_experts = weights.shared_experts.as_ref().map(|weights| {
-            GatedMoESharedExpertsReplayInput {
+            GatedMoESharedExpertsInput {
                 scratch: self
                     .scratch
                     .shared_experts_bindings()
@@ -102,7 +106,7 @@ impl Qwen3xMoE {
         let _ = <GatedMoE as ReplayLayer>::record(
             &self.backend,
             recorder,
-            GatedMoEReplayInput {
+            GatedMoEInput {
                 shape: GatedMoEReplayShape { num_tokens },
                 hidden_state: input,
                 next_hidden_state: output,
@@ -130,7 +134,7 @@ impl Qwen3xMoE {
     {
         let weights = self.weights();
         let shared_experts = weights.shared_experts.as_ref().map(|weights| {
-            GatedMoESharedExpertsReplayInput {
+            GatedMoESharedExpertsInput {
                 scratch: self
                     .scratch
                     .shared_experts_bindings()
@@ -145,7 +149,7 @@ impl Qwen3xMoE {
         });
         let _ = self.backend.record_bucketed(
             recorder,
-            GatedMoEBucketedReplayInput {
+            GatedMoEBucketedInput {
                 num_total_tokens,
                 num_active_tokens_key,
                 hidden_state: input,

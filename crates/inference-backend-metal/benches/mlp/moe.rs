@@ -174,7 +174,9 @@ impl RoutingFixture {
             num_experts_per_token: TOPK_EXPERTS,
             norm_topk_prob: true,
         };
-        let shape = MoERoutingShape { num_tokens };
+        let shape = MoERoutingShape {
+            num_total_tokens: num_tokens,
+        };
         let router_probs = bf16_buffer(device, &route_probs_fixture(num_tokens as usize, NUM_EXPERTS as usize));
         let expert_indices = Buffer::new_zeroed(device, config.expert_indices_bytes(shape));
         let expert_probs = Buffer::new_zeroed(device, config.expert_probs_bytes(shape));
@@ -215,7 +217,9 @@ struct CombineFixture {
 impl CombineFixture {
     fn new(device: &Device, num_tokens: u32) -> Self {
         let config = MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM);
-        let shape = MoECombineShape { num_tokens };
+        let shape = MoECombineShape {
+            num_total_tokens: num_tokens,
+        };
         let routed_hidden = bf16_buffer(
             device,
             &hidden_fixture(num_tokens as usize * TOPK_EXPERTS as usize, HIDDEN_DIM as usize),
@@ -385,7 +389,9 @@ impl MoEForwardFixture {
             num_experts_per_token: TOPK_EXPERTS,
             norm_topk_prob: true,
         };
-        let routing_shape = MoERoutingShape { num_tokens };
+        let routing_shape = MoERoutingShape {
+            num_total_tokens: num_tokens,
+        };
         let sparse_config = QuantizedSparseMLPConfig {
             num_experts: NUM_EXPERTS,
             hidden_dim: HIDDEN_DIM,
@@ -395,14 +401,16 @@ impl MoEForwardFixture {
             dtype: Dtype::Bfloat16,
         };
         let sparse_shape = QuantizedSparseMLPTokenMajorShape {
-            num_routes: num_tokens * TOPK_EXPERTS,
-            num_tokens,
+            num_total_routes: num_tokens * TOPK_EXPERTS,
+            num_total_tokens: num_tokens,
         };
         let expert_major_config = MoEExpertMajorConfig::bf16(NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM);
-        let expert_major_shape = MoEExpertMajorShape { num_tokens };
+        let expert_major_shape = MoEExpertMajorShape {
+            num_total_tokens: num_tokens,
+        };
         let expert_major_sparse_shape = QuantizedSparseMLPTokenMajorShape {
-            num_routes: expert_major_config.num_routes(expert_major_shape),
-            num_tokens: expert_major_config.num_routes(expert_major_shape),
+            num_total_routes: expert_major_config.num_routes(expert_major_shape),
+            num_total_tokens: expert_major_config.num_routes(expert_major_shape),
         };
         let dense_config = QuantizedDenseMLPConfig {
             hidden_dim: HIDDEN_DIM,
@@ -411,9 +419,13 @@ impl MoEForwardFixture {
             bits: EXPERT_BITS,
             dtype: Dtype::Bfloat16,
         };
-        let dense_shape = QuantizedDenseMLPShape { num_tokens };
+        let dense_shape = QuantizedDenseMLPShape {
+            num_total_tokens: num_tokens,
+        };
         let combine_config = MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM);
-        let combine_shape = MoECombineShape { num_tokens };
+        let combine_shape = MoECombineShape {
+            num_total_tokens: num_tokens,
+        };
         let sparse_gate_up_config = sparse_config.gate_up_config();
         let sparse_down_config = sparse_config.down_config();
         let dense_gate_up_config = dense_config.gate_up_config();
@@ -439,9 +451,11 @@ impl MoEForwardFixture {
             device,
             sparse_config.token_major_output_bytes(expert_major_sparse_shape),
         );
-        let sparse_swiglu = Buffer::new_zeroed(device, sparse_config.swiglu_bytes(sparse_shape.num_routes));
-        let expert_major_swiglu =
-            Buffer::new_zeroed(device, sparse_config.swiglu_bytes(expert_major_sparse_shape.num_routes));
+        let sparse_swiglu = Buffer::new_zeroed(device, sparse_config.swiglu_bytes(sparse_shape.num_total_routes));
+        let expert_major_swiglu = Buffer::new_zeroed(
+            device,
+            sparse_config.swiglu_bytes(expert_major_sparse_shape.num_total_routes),
+        );
         let shared_hidden = Buffer::new_zeroed(device, dense_down_config.output_bytes(num_tokens_i32));
         let shared_expert_gate_logits =
             Buffer::new_zeroed(device, shared_expert_gate_config.output_bytes(num_tokens_i32));
@@ -743,8 +757,8 @@ impl MoEForwardFixture {
         MoEExpertMajorForwardRecord {
             routing_shape: self.routing_shape,
             sparse_shape: QuantizedSparseMLPTokenMajorShape {
-                num_routes: self.expert_major_config.num_routes(self.expert_major_shape),
-                num_tokens: self.expert_major_config.num_routes(self.expert_major_shape),
+                num_total_routes: self.expert_major_config.num_routes(self.expert_major_shape),
+                num_total_tokens: self.expert_major_config.num_routes(self.expert_major_shape),
             },
             expert_major_config: self.expert_major_config,
             expert_major_shape: self.expert_major_shape,
@@ -899,7 +913,7 @@ where
         record.router.invoke(
             record
                 .routing_shape
-                .num_tokens
+                .num_total_tokens
                 .try_into()
                 .expect("MoE token count must fit i32"),
             record.router_logits,
@@ -916,7 +930,7 @@ where
     );
     builder.record_with_barrier_before(record.router_softmax.invoke(
         SoftmaxShape {
-            num_total_rows: record.routing_shape.num_tokens,
+            num_total_rows: record.routing_shape.num_total_tokens,
         },
         SoftmaxBuffers {
             input: record.router_logits,
@@ -958,7 +972,7 @@ where
         record.shared_expert_gate.invoke(
             record
                 .routing_shape
-                .num_tokens
+                .num_total_tokens
                 .try_into()
                 .expect("MoE token count must fit i32"),
             record.shared_expert_gate_logits,
@@ -993,7 +1007,7 @@ where
         record.router.invoke(
             record
                 .routing_shape
-                .num_tokens
+                .num_total_tokens
                 .try_into()
                 .expect("MoE token count must fit i32"),
             record.router_logits,
@@ -1010,7 +1024,7 @@ where
     );
     builder.record_with_barrier_before(record.router_softmax.invoke(
         SoftmaxShape {
-            num_total_rows: record.routing_shape.num_tokens,
+            num_total_rows: record.routing_shape.num_total_tokens,
         },
         SoftmaxBuffers {
             input: record.router_logits,
@@ -1047,7 +1061,7 @@ where
     ));
     builder.record_with_barrier_before(record.sparse_mlp.invoke_expert_major(
         QuantizedSparseMLPExpertMajorShape {
-            num_routes: record.expert_major_config.num_routes(record.expert_major_shape),
+            num_total_routes: record.expert_major_config.num_routes(record.expert_major_shape),
         },
         QuantizedSparseMLPExpertMajorBuffers {
             packed_input: record.packed_input,
@@ -1072,7 +1086,7 @@ where
         record.shared_expert_gate.invoke(
             record
                 .routing_shape
-                .num_tokens
+                .num_total_tokens
                 .try_into()
                 .expect("MoE token count must fit i32"),
             record.shared_expert_gate_logits,
