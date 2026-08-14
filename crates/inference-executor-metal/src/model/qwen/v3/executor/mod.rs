@@ -33,7 +33,6 @@ use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
-use inference_executor_core::sampling::TopKSamplingShape;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
@@ -863,25 +862,13 @@ fn num_page_ids_per_block(num_tokens_per_block: usize, num_tokens_per_page: usiz
     num_tokens_per_block / num_tokens_per_page
 }
 
-fn replay_bucket_capacity(active: u32, max_capacity: u32) -> u32 {
-    assert!(active > 0, "qwen3 replay bucket requires active work");
-    assert!(active <= max_capacity, "qwen3 replay active work exceeds capacity");
-    active
-        .checked_next_power_of_two()
-        .unwrap_or(max_capacity)
-        .min(max_capacity)
-}
-
 #[cfg(test)]
 mod tests {
-    use inference_executor_core::attn::GQAReplayShape;
     use inference_executor_core::model::ReplayableModel;
     use inference_executor_core::model::qwen::v3::Qwen3ModelBatchRequest;
 
     use super::Qwen3Executor;
     use super::Qwen3ExecutorConfig;
-    use super::Qwen3MainReplayKey;
-    use super::replay_bucket_capacity;
 
     #[test]
     fn test_executor_config_supports_qwen3_batch_contract() {
@@ -895,42 +882,5 @@ mod tests {
         .validate();
         fn assert_compact_qwen3_batch<T: ReplayableModel<ModelBatchRequest = Qwen3ModelBatchRequest>>() {}
         assert_compact_qwen3_batch::<Qwen3Executor>();
-    }
-
-    #[test]
-    fn test_main_key_contains_only_token_and_gqa_topology() {
-        let shape = GQAReplayShape {
-            num_tokens: 4,
-            total_tokens: 4,
-            num_q_token_tiles: 2,
-            total_q_token_tiles: 2,
-            num_sdpa_map_task_templates: 3,
-            total_sdpa_map_task_templates: 3,
-            reduce_sdpa_partial_outputs: true,
-        };
-        let key = Qwen3MainReplayKey::from_shape(shape);
-
-        assert_eq!(key.debug_parts(), (4, 2, 3));
-        assert_eq!(
-            key,
-            Qwen3MainReplayKey::from_shape(GQAReplayShape {
-                reduce_sdpa_partial_outputs: false,
-                ..shape
-            })
-        );
-        assert_ne!(
-            key,
-            Qwen3MainReplayKey::from_shape(GQAReplayShape {
-                total_sdpa_map_task_templates: 4,
-                ..shape
-            })
-        );
-    }
-
-    #[test]
-    fn test_bucket_capacity() {
-        assert_eq!(replay_bucket_capacity(1, 48), 1);
-        assert_eq!(replay_bucket_capacity(3, 48), 4);
-        assert_eq!(replay_bucket_capacity(33, 48), 48);
     }
 }

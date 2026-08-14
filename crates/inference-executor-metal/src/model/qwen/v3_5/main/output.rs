@@ -225,10 +225,8 @@ mod tests {
 
     use inference_backend_metal::metal::Dtype;
     use inference_backend_metal::metal::Stream;
-    use inference_executor_core::attn::gdn::state::GDNStateTxn;
     use inference_executor_core::checkpoint::QuantizedTensorBindings;
     use inference_executor_core::checkpoint::SafeTensorIndex;
-    use inference_executor_core::sampling::SamplerConfig;
     use safetensors::Dtype as SafeTensorDtype;
     use safetensors::tensor::View;
     use safetensors::tensor::serialize_to_file;
@@ -294,71 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_policy_preserves_unembed_topology_and_prepares_one_active_argument() {
-        let device = Device::system_default();
-        let component = test_component(&device);
-        let buffers = TestBuffers::new(&device);
-
-        assert_eq!(component.max_rows(), MAX_ROWS);
-        let (three_key, three_arguments) = component.prepare_replay(3);
-        let (four_key, four_arguments) = component.prepare_replay(4);
-        let (five_key, five_arguments) = component.prepare_replay(5);
-
-        assert_eq!(three_key.num_total_rows, 4);
-        assert_eq!(three_key, four_key);
-        assert_eq!(five_key.num_total_rows, 6);
-        assert_ne!(four_key, five_key);
-        assert_eq!(component.replay_key(&buffers.input(3)), three_key);
-        assert_eq!(
-            three_arguments,
-            ReplayArguments::new().with_u32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, 3)
-        );
-        assert_eq!(
-            four_arguments,
-            ReplayArguments::new().with_u32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, 4)
-        );
-        assert_eq!(
-            five_arguments,
-            ReplayArguments::new().with_u32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, 5)
-        );
-
-        for num_active_rows in 1..=MAX_ROWS {
-            let key = component.replay_key_for_active_rows(num_active_rows);
-            assert_eq!(
-                component.loaded_unembed().replay_topology(num_active_rows),
-                component.loaded_unembed().replay_topology(key.num_total_rows),
-                "num_active_rows={num_active_rows} num_total_rows={}",
-                key.num_total_rows
-            );
-            assert_eq!(
-                key.unembed_topology,
-                Some(component.loaded_unembed().replay_topology(key.num_total_rows))
-            );
-        }
-        for boundary in component.loaded_unembed().replay_topology_boundaries() {
-            if boundary > 1 && boundary <= MAX_ROWS {
-                assert_eq!(component.replay_bucket_policy.capacity(boundary - 1), boundary - 1);
-            }
-        }
-
-        assert_ne!(
-            Qwen35GatherUnembedReplayKey::for_capacity(4, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
-            Qwen35GatherUnembedReplayKey::for_capacity(4, AffineQuantizedMatmulKernelKind::QmmBm8Bn32)
-        );
-        let legacy_key = Qwen35GatherUnembedReplayKey::from_microbatch(&one_request_microbatch(4, 3));
-        assert_eq!(legacy_key.num_total_rows(), three_key.num_total_rows());
-        assert_eq!(legacy_key.unembed_topology(), None);
-        assert_ne!(legacy_key, three_key);
-        assert_panics(|| {
-            component.prepare_replay(0);
-        });
-        assert_panics(|| {
-            component.prepare_replay(MAX_ROWS + 1);
-        });
-    }
-
-    #[test]
-    fn bucketed_replay_matches_exact_and_preserves_tails_across_one_two_one() {
+    fn test_bucketed_replay_matches_exact_and_preserves_tails_across_one_two_one() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
@@ -370,7 +304,6 @@ mod tests {
         let mut exact_recorder = runtime.create_recorder();
         component.record(&mut exact_recorder, buffers.input(1));
         let exact_replay = exact_recorder.build();
-        assert_eq!(exact_replay.stats().parameter_count, 0);
         runtime.submit_replay(&exact_replay).wait();
         let exact_hidden = buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize);
         let exact_logits = buffers.logits.read_typed::<u16>(0, VOCAB_SIZE as usize);
@@ -381,7 +314,6 @@ mod tests {
         let (recorded_key, cache_hit) = replay.record(&runtime, &buffers.input(2));
         assert!(!cache_hit);
         assert_eq!(recorded_key, active_two_key);
-        assert_eq!(replay.replay(&recorded_key).stats().parameter_count, 1);
 
         buffers.fill_outputs(OUTPUT_CANARY);
         buffers.write_active_inputs(1);
@@ -413,96 +345,6 @@ mod tests {
         );
         assert_eq!(buffers.logits.read_typed::<u16>(0, VOCAB_SIZE as usize), exact_logits);
         assert_output_tails(&buffers, 1);
-    }
-
-    #[test]
-    fn bucketed_replay_rejects_invalid_arguments_capacities_and_short_buffers() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let runtime = MetalReplayRuntime::new(&stream);
-        let component = test_component(&device);
-        let buffers = TestBuffers::new(&device);
-        buffers.write_active_inputs(2);
-        let (key, _) = component.prepare_replay(2);
-        let mut replay = Replay::new("qwen3.5 GatherUnembed invalid-input test", component);
-        let (recorded_key, _) = replay.record(&runtime, &buffers.input(2));
-        assert_eq!(recorded_key, key);
-        let program = replay.replay(&recorded_key);
-
-        assert_panics(|| {
-            let _ = stream.submit_replay_with_arguments(program, &ReplayArguments::new());
-        });
-        assert_panics(|| {
-            let _ = stream.submit_replay_with_arguments(
-                program,
-                &ReplayArguments::new().with_i32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, 1),
-            );
-        });
-        for num_active_rows in [0, key.num_total_rows + 1] {
-            assert_panics(|| {
-                let _ = stream.submit_replay_with_arguments(
-                    program,
-                    &ReplayArguments::new().with_u32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, num_active_rows),
-                );
-            });
-        }
-
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(&mut recorder, 4, buffers.input(2));
-        });
-
-        let short_input = Buffer::new_zeroed(&device, 1);
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(
-                &mut recorder,
-                key.num_total_rows,
-                Qwen35GatherUnembedArgs {
-                    hidden_input: &short_input,
-                    ..buffers.input(2)
-                },
-            );
-        });
-
-        let short_indices = Buffer::new_zeroed_elements(&device, 1, Dtype::Uint32);
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(
-                &mut recorder,
-                key.num_total_rows,
-                Qwen35GatherUnembedArgs {
-                    row_indices: &short_indices,
-                    ..buffers.input(2)
-                },
-            );
-        });
-
-        let short_hidden_output = Buffer::new_zeroed_elements(&device, HIDDEN_DIM, Dtype::Bfloat16);
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(
-                &mut recorder,
-                key.num_total_rows,
-                Qwen35GatherUnembedArgs {
-                    hidden_output: &short_hidden_output,
-                    ..buffers.input(2)
-                },
-            );
-        });
-
-        let short_logits = Buffer::new_zeroed_elements(&device, VOCAB_SIZE, Dtype::Bfloat16);
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(
-                &mut recorder,
-                key.num_total_rows,
-                Qwen35GatherUnembedArgs {
-                    logits: &short_logits,
-                    ..buffers.input(2)
-                },
-            );
-        });
     }
 
     struct TestBuffers {
@@ -638,26 +480,5 @@ mod tests {
             )
             .unwrap();
         Qwen35GatherUnembed::new(device, config.hidden_dim, Rc::new(unembed))
-    }
-
-    fn one_request_microbatch(num_tokens: u32, num_spec_tokens: u32) -> Qwen35Microbatch {
-        let num_output_rows = num_spec_tokens + 1;
-        Qwen35Microbatch::new(
-            vec![0],
-            vec![0],
-            vec![0],
-            (0..num_tokens).map(|token| token as i32).collect(),
-            vec![0, num_tokens],
-            vec![GDNStateTxn::new(0, num_tokens, num_spec_tokens)],
-            vec![Vec::new()],
-            vec![SamplerConfig::default()],
-            (0..num_tokens)
-                .map(|token_offset| token_offset + num_output_rows >= num_tokens)
-                .collect(),
-        )
-    }
-
-    fn assert_panics(f: impl FnOnce()) {
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }

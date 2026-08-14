@@ -283,11 +283,11 @@ fn quantize_safetensors(
     let output = File::create(output_path)
         .map_err(|err| error(format!("unable to create quantized checkpoint {output_path:?}: {err}")))?;
     output
-        .set_len(to_u64("quantized safetensors file length", total_len)?)
+        .set_len(total_len as u64)
         .map_err(|err| error(format!("unable to size quantized checkpoint {output_path:?}: {err}")))?;
     let mut output = BufWriter::with_capacity(1024 * 1024, output);
     output
-        .write_all(&to_u64("quantized safetensors header length", metadata_bytes.len())?.to_le_bytes())
+        .write_all(&(metadata_bytes.len() as u64).to_le_bytes())
         .and_then(|_| output.write_all(&metadata_bytes))
         .map_err(|err| {
             error(format!(
@@ -396,7 +396,7 @@ fn read_header(file: &mut File, path: &Path) -> Result<SafetensorsHeader> {
                 )));
             }
             Ok(SafetensorsHeader {
-                data_start: to_u64("safetensors data offset", data_start)?,
+                data_start: data_start as u64,
                 tensors,
             })
         })
@@ -531,7 +531,7 @@ fn read_tensor(
 ) -> Result<Vec<u8>> {
     let start = header
         .data_start
-        .checked_add(to_u64("source tensor offset", info.data_offsets.0)?)
+        .checked_add(info.data_offsets.0 as u64)
         .ok_or_else(|| error(format!("source tensor {name:?} file offset must fit u64")))?;
     let len = info
         .data_offsets
@@ -564,7 +564,7 @@ fn write_output_tensor(
         .checked_add(tensor.offset)
         .ok_or_else(|| error(format!("output tensor {:?} file offset must fit usize", tensor.name)))?;
     output
-        .seek(SeekFrom::Start(to_u64("output tensor file offset", offset)?))
+        .seek(SeekFrom::Start(offset as u64))
         .and_then(|_| output.write_all(data))
         .map_err(|err| {
             error(format!(
@@ -774,12 +774,6 @@ fn checked_product(name: &str, factors: &[usize]) -> Result<usize> {
         .iter()
         .try_fold(1usize, |product, &factor| product.checked_mul(factor))
         .ok_or_else(|| error(format!("{name} must fit usize")))
-}
-
-fn to_u64(name: &str, value: usize) -> Result<u64> {
-    value
-        .try_into()
-        .map_err(|_| error(format!("{name}={value} must fit u64")))
 }
 
 fn error(message: impl Into<String>) -> QuantizeError {

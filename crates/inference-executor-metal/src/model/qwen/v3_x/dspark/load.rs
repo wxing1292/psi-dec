@@ -196,8 +196,6 @@ pub fn load_qwen3x_dspark(
         device,
         &mut store,
         config,
-        num_spec_tokens,
-        load_config.page_size_bytes,
         &main_feature_bindings,
         layer_bindings,
         final_norm_weight,

@@ -21,9 +21,9 @@ use crate::mlp::moe::backend::GatedMoEReplayTopology;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::qwen::v3_5::mtp::QWEN35_MTP_GQA_LAYER_INDEX;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use crate::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
-use crate::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
-use crate::model::qwen::v3_5::plan::qwen35_moe_core_and_metal;
+use crate::model::qwen::v3_5::plan::derive_qwen35_dense_mlp_configs;
+use crate::model::qwen::v3_5::plan::derive_qwen35_gqa_configs;
+use crate::model::qwen::v3_5::plan::derive_qwen35_moe_configs;
 use crate::model::qwen::v3_x::layer::Qwen3xDenseMLP;
 use crate::model::qwen::v3_x::layer::Qwen3xGQA;
 use crate::model::qwen::v3_x::layer::Qwen3xMoE;
@@ -42,7 +42,8 @@ pub struct Qwen35MTPLayer {
 }
 
 pub struct Qwen35MTPLayerScratch {
-    hidden_dim: usize,
+    max_tokens: u32,
+    hidden_dim: u32,
     residual_output: Buffer,
     normalized_hidden: Buffer,
     branch_output: Buffer,
@@ -81,8 +82,12 @@ impl Qwen35MTPLayer {
         dense_scratch: Option<&Rc<DenseMLPScratch>>,
         moe_scratch: Option<&Rc<MoEScratch>>,
     ) -> Result<Self, ModelExecutorError> {
+        let (attention_core, attention_metal) =
+            derive_qwen35_gqa_configs(model_layer_index, &config.text_config, defaults)?;
         let attention = Qwen3xGQA::new(
             inference_backend_metal::metal::ReplayU32::Parameter(QWEN35_MTP_GQA_LAYER_INDEX),
+            attention_core,
+            attention_metal,
             Rc::clone(gqa_state.backend()),
             Rc::clone(gqa_state.scratch()),
             Rc::clone(gqa_state.request_page_table()),
@@ -105,8 +110,6 @@ impl Qwen35MTPLayer {
         device: &Device,
         store: &mut SafeTensorStore,
         config: &Qwen35ModelConfig,
-        defaults: Qwen35MetalDefaults,
-        model_layer_index: usize,
         bindings: Qwen35LayerWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         let Qwen35LayerWeightBindings {
@@ -119,9 +122,8 @@ impl Qwen35MTPLayer {
             Qwen35AttentionWeightBindings::GQA(bindings) => bindings,
             Qwen35AttentionWeightBindings::GDN(_) => panic!("qwen3.5 MTP layer bindings must contain GQA attention"),
         };
-        let (core, metal) = qwen35_gqa_core_and_metal(model_layer_index, &config.text_config, defaults)?;
-        self.attention.load_weights(device, store, &core, metal, attention)?;
-        self.mlp.load_weights(device, store, config, defaults, mlp)?;
+        self.attention.load_weights(device, store, attention)?;
+        self.mlp.load_weights(device, store, mlp)?;
         let hidden_dim = config.text_config.hidden_size;
         let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
         self.input_norm.load_weights(remove_qwen3x_norm_weight(
@@ -186,7 +188,7 @@ impl Qwen35MTPLayer {
             input.num_tokens <= num_total_tokens,
             "qwen3.5 MTP active tokens must not exceed the replay capacity"
         );
-        let hidden_dim = u32::try_from(self.scratch.hidden_dim).expect("hidden dimension must fit u32");
+        let hidden_dim = self.scratch.hidden_dim;
         self.input_norm.record_bucketed_with_barrier(
             recorder,
             num_total_tokens,
@@ -246,7 +248,7 @@ impl ReplayLayer for Qwen35MTPLayer {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_values = residual_values(input.num_tokens, self.scratch.hidden_dim);
+        let num_values = self.scratch.residual_values(input.num_tokens);
         self.input_norm.record_with_barrier(
             recorder,
             input.num_tokens,
@@ -299,18 +301,18 @@ impl Qwen35MTPMLP {
         moe_scratch: Option<&Rc<MoEScratch>>,
     ) -> Result<Self, ModelExecutorError> {
         if config.layer_uses_moe(0) {
-            let (core, metal) = qwen35_moe_core_and_metal("layers.0", 0, config, defaults)?;
+            let (core, metal) = derive_qwen35_moe_configs("layers.0", 0, config, defaults)?;
             Ok(Self::MoE(Qwen3xMoE::new(
                 device,
-                &core,
+                core,
                 metal,
                 Rc::clone(moe_scratch.expect("qwen3.5 MTP MoE layer requires shared MoE scratch")),
             )))
         } else {
-            let (core, metal) = qwen35_dense_mlp_core_and_metal(0, &config.text_config, defaults)?;
+            let (core, metal) = derive_qwen35_dense_mlp_configs(0, &config.text_config, defaults)?;
             Ok(Self::Dense(Qwen3xDenseMLP::new(
                 device,
-                &core,
+                core,
                 metal,
                 Rc::clone(dense_scratch.expect("qwen3.5 MTP dense layer requires shared dense scratch")),
             )))
@@ -321,18 +323,14 @@ impl Qwen35MTPMLP {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        config: &Qwen35ModelConfig,
-        defaults: Qwen35MetalDefaults,
         bindings: Qwen35MLPWeightBindings,
     ) -> Result<(), ModelExecutorError> {
-        match (self, config.layer_uses_moe(0), bindings) {
-            (Self::Dense(component), false, Qwen35MLPWeightBindings::Dense(bindings)) => {
-                let (core, metal) = qwen35_dense_mlp_core_and_metal(0, &config.text_config, defaults)?;
-                component.load_weights(device, store, &core, metal, *bindings)
+        match (self, bindings) {
+            (Self::Dense(component), Qwen35MLPWeightBindings::Dense(bindings)) => {
+                component.load_weights(device, store, *bindings)
             },
-            (Self::MoE(component), true, Qwen35MLPWeightBindings::MoE(bindings)) => {
-                let (core, metal) = qwen35_moe_core_and_metal("layers.0", 0, config, defaults)?;
-                component.load_weights(device, store, &core, metal, *bindings)
+            (Self::MoE(component), Qwen35MLPWeightBindings::MoE(bindings)) => {
+                component.load_weights(device, store, *bindings)
             },
             _ => panic!("qwen3.5 MTP layer MLP config and checkpoint bindings must have the same kind"),
         }
@@ -394,25 +392,24 @@ impl Qwen35MTPLayerScratch {
     pub fn new(device: &Device, max_tokens: usize, hidden_dim: usize) -> Self {
         assert!(max_tokens > 0);
         assert!(hidden_dim > 0);
+        let max_tokens_u32 = u32::try_from(max_tokens).expect("qwen3.5 MTP layer token capacity must fit u32");
+        let hidden_dim_u32 = u32::try_from(hidden_dim).expect("qwen3.5 MTP hidden dimension must fit u32");
         let hidden_elements = max_tokens
             .checked_mul(hidden_dim)
             .expect("qwen3.5 MTP layer scratch element count must fit usize");
+        u32::try_from(hidden_elements).expect("qwen3.5 MTP layer scratch must fit the shader u32 element-count domain");
         Self {
-            hidden_dim,
+            max_tokens: max_tokens_u32,
+            hidden_dim: hidden_dim_u32,
             residual_output: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             normalized_hidden: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             branch_output: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             post_attention_hidden: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
         }
     }
-}
 
-fn residual_values(num_tokens: u32, hidden_dim: usize) -> u32 {
-    num_tokens
-        .checked_mul(
-            hidden_dim
-                .try_into()
-                .expect("qwen3.5 MTP hidden dimension must fit u32"),
-        )
-        .expect("qwen3.5 MTP residual element index must fit u32")
+    fn residual_values(&self, num_tokens: u32) -> u32 {
+        debug_assert!(num_tokens > 0 && num_tokens <= self.max_tokens);
+        num_tokens * self.hidden_dim
+    }
 }

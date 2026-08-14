@@ -195,6 +195,8 @@ Qwen3xDSparkRecording
 ```
 
 Semantic components own weights, static configuration, and `load + record`.
+Each weight-bearing leaf retains the core and Metal configuration that created its backend.
+Weight reload uses this retained contract and does not derive the backend configuration again.
 `Replay<T>` owns the related replay cache.
 Each executor owns its dynamic workspaces, lifecycle order, and submissions.
 Each executor stores one closed speculator enum.
@@ -207,9 +209,14 @@ Embedding, unembedding, row gather, residual add/capture, and RMS normalization 
 These components hide backend kernel and invocation details.
 Concrete Main and MTP compositions own graph order.
 
+`Embed` and `Unembed` use the same weight-bearing owner spine.
+Each owner provides an exact `ReplayLayer` input and a separate bucketed input.
+Each capacity view shares its immutable compute object and loaded weights.
+Only `Unembed` exposes replay topology because its affine operator selects QMV or QMM.
+
 `Qwen3Microbatch` records decode requests and an optional speculative suffix.
 It identifies the Main rows that require unembedding.
-It implements the Metal `SpecMicrobatch` rejection-input contract.
+It implements the backend-neutral executor-core `SpecMicrobatch` rejection-input contract.
 The Qwen3 executor rejects speculative input when DSpark is disabled.
 
 The model role is also a structural boundary.
@@ -863,6 +870,7 @@ DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 
 DSpark input is request-major.
 `DSparkGatherUnembed` converts body output to the step-major order required by sequential Markov sampling.
+It validates the maximum request-by-step row domain at construction.
 The draft probability store uses request-slot identity because these rows cross a batch boundary.
 Main verification distributions use compact active-row identity because they exist only in one submission.
 
@@ -885,12 +893,12 @@ These state buffers remain allocated and reusable while model state is loaded.
 Unit tests cover:
 
 - The strict flat Qwen3 adapter.
-- Model-specific Main batch and replay keys.
+- Model-specific Main batch contracts.
 - Normalized Qwen3.5 configuration and exact bindings.
 - GQA/GDN state and page overwrite/reset.
 - GDN transactions and snapshot I/O.
 - Generic replay idempotence and strict lookup.
-- MTP and DSpark sparse rejection.
+- MTP cache-lane mapping and MTP and DSpark sparse rejection.
 - DSpark configuration, bindings, attention, Markov sampling, and page splitting.
 
 End-to-end tests exercise Qwen3 Main-only and Qwen3 DSpark through server/decode.

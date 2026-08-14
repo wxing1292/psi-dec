@@ -49,11 +49,11 @@ use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
 use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use crate::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
-use crate::model::qwen::v3_5::plan::qwen35_gdn_core_and_metal;
-use crate::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
+use crate::model::qwen::v3_5::plan::derive_qwen35_dense_mlp_configs;
+use crate::model::qwen::v3_5::plan::derive_qwen35_gdn_configs;
+use crate::model::qwen::v3_5::plan::derive_qwen35_gqa_configs;
+use crate::model::qwen::v3_5::plan::derive_qwen35_moe_configs;
 use crate::model::qwen::v3_5::plan::qwen35_layer_counts;
-use crate::model::qwen::v3_5::plan::qwen35_moe_core_and_metal;
 use crate::model::qwen::v3_5::plan::validate_qwen35_mtp_config;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
@@ -144,9 +144,7 @@ impl Qwen35ModelLayout {
             .as_ref()
             .ok_or_else(|| ModelExecutorError::custom("qwen3.5 replay model requires quantization config"))?;
         Ok(Self {
-            max_tokens: max_tokens
-                .try_into()
-                .map_err(|_| ModelExecutorError::custom("qwen3.5 max_tokens must fit u32"))?,
+            max_tokens: max_tokens as u32,
             vocab_size: text
                 .vocab_size
                 .try_into()
@@ -422,7 +420,7 @@ fn init_qwen_3_5_model_inner(
     let sampler_bounds = TopKSamplingBounds {
         max_sampling_inputs: layout.max_tokens,
         vocab_size: layout.vocab_size,
-        top_k: MAX_TOP_K.try_into().expect("qwen3.5 sampler top_k must fit u32"),
+        top_k: MAX_TOP_K as u32,
     };
     sampler_bounds.validate();
     trace::qwen35_state(|| {
@@ -446,14 +444,11 @@ fn init_qwen_3_5_model_inner(
         })
         .expect("qwen3.5 Main requires a GQA layer");
     let (main_gqa_core, main_gqa_metal) =
-        qwen35_gqa_core_and_metal(first_gqa_layer, &model_config.text_config, metal_defaults)?;
+        derive_qwen35_gqa_configs(first_gqa_layer, &model_config.text_config, metal_defaults)?;
     let gqa_tokens_per_page = main_gqa_metal.num_tokens_per_page(&main_gqa_core) as usize;
     let main_page_ids_per_block = num_page_ids_per_block(config.num_tokens_per_block, gqa_tokens_per_page);
     let main_gqa_page_table_layout = GQAPageTableLayout {
-        num_req_slots: config
-            .max_requests
-            .try_into()
-            .expect("qwen3.5 max_requests must fit u32"),
+        num_req_slots: config.max_requests as u32,
         num_blocks: model_config
             .text_config
             .max_position_embeddings
@@ -465,9 +460,7 @@ fn init_qwen_3_5_model_inner(
             .gqa
             .try_into()
             .expect("qwen3.5 GQA layer count must fit u32"),
-        num_page_ids_per_block: main_page_ids_per_block
-            .try_into()
-            .expect("qwen3.5 GQA pages per block must fit u32"),
+        num_page_ids_per_block: main_page_ids_per_block as u32,
     };
     let gqa_page_table_layout = main_gqa_page_table_layout;
     let main_gqa_state = Qwen3xGQAState::new(
@@ -488,16 +481,13 @@ fn init_qwen_3_5_model_inner(
             let mtp_store = SafeTensorStore::from_model_dir(mtp_model_dir)?;
             let mtp_weight_bindings =
                 resolve_qwen35_mtp_weight_bindings(&mtp_model_config, mtp_store.index().tensor_names())?;
-            let (mtp_gqa_core, mtp_gqa_metal) = qwen35_gqa_core_and_metal(
+            let (mtp_gqa_core, mtp_gqa_metal) = derive_qwen35_gqa_configs(
                 model_config.text_config.num_hidden_layers,
                 &mtp_model_config.text_config,
                 Qwen35MetalDefaults::from_quantization(mtp_model_config.quantization.as_ref())?,
             )?;
             let mtp_gqa_page_table_layout = GQAPageTableLayout {
-                num_req_slots: config
-                    .max_requests
-                    .try_into()
-                    .expect("qwen3.5 max requests must fit u32"),
+                num_req_slots: config.max_requests as u32,
                 num_blocks: model_config
                     .text_config
                     .max_position_embeddings
@@ -505,16 +495,11 @@ fn init_qwen_3_5_model_inner(
                     .max(1)
                     .try_into()
                     .expect("qwen3.5 MTP GQA block capacity must fit u32"),
-                num_gqa_layers: num_spec_tokens
-                    .get()
-                    .try_into()
-                    .expect("qwen3.5 MTP GQA layer count must fit u32"),
+                num_gqa_layers: num_spec_tokens.get() as u32,
                 num_page_ids_per_block: num_page_ids_per_block(
                     config.num_tokens_per_block,
                     mtp_gqa_metal.num_tokens_per_page(&mtp_gqa_core) as usize,
-                )
-                .try_into()
-                .expect("qwen3.5 MTP GQA pages per block must fit u32"),
+                ) as u32,
             };
             let mtp_gqa_state = Qwen3xGQAState::new(
                 &device,
@@ -553,9 +538,9 @@ fn init_qwen_3_5_model_inner(
         .collect::<Vec<_>>();
     let gdn_cores = gdn_layers
         .iter()
-        .map(|&index| qwen35_gdn_core_and_metal(index, &model_config.text_config, metal_defaults).map(|pair| pair.0))
+        .map(|&index| derive_qwen35_gdn_configs(index, &model_config.text_config, metal_defaults).map(|pair| pair.0))
         .collect::<Result<Vec<_>, _>>()?;
-    let (_, gdn_metal) = qwen35_gdn_core_and_metal(gdn_layers[0], &model_config.text_config, metal_defaults)?;
+    let (_, gdn_metal) = derive_qwen35_gdn_configs(gdn_layers[0], &model_config.text_config, metal_defaults)?;
     let gdn_state_capacity =
         qwen35_gdn_state_capacity(&spec_source, config.max_tokens_per_request, config.num_tokens_per_block);
     let max_spec_tokens = match &spec_source {
@@ -593,7 +578,7 @@ fn init_qwen_3_5_model_inner(
             })
             .expect("qwen3.5 dense scratch requires a dense layer");
         let defaults = Qwen35MetalDefaults::from_quantization(source.0.quantization.as_ref())?;
-        let (core, metal) = qwen35_dense_mlp_core_and_metal(source.1, &source.0.text_config, defaults)?;
+        let (core, metal) = derive_qwen35_dense_mlp_configs(source.1, &source.0.text_config, defaults)?;
         Some(std::rc::Rc::new(DenseMLPScratch::new(
             &device,
             &core,
@@ -617,7 +602,7 @@ fn init_qwen_3_5_model_inner(
             })
             .expect("qwen3.5 MoE scratch requires an MoE layer");
         let defaults = Qwen35MetalDefaults::from_quantization(source.0.quantization.as_ref())?;
-        let (core, metal) = qwen35_moe_core_and_metal(&format!("layers.{}", source.1), source.1, source.0, defaults)?;
+        let (core, metal) = derive_qwen35_moe_configs(&format!("layers.{}", source.1), source.1, source.0, defaults)?;
         Some(std::rc::Rc::new(MoEScratch::new(
             &device,
             &core,
@@ -695,7 +680,7 @@ fn init_qwen_3_5_model_inner(
         dense_mlp_scratch.as_ref(),
         moe_scratch.as_ref(),
     )?;
-    main.load_weights(&device, &mut store, &model_config, metal_defaults, main_bindings)?;
+    main.load_weights(&device, &mut store, &model_config, main_bindings)?;
     drop(store);
     let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));
     let speculative_resources = || {
@@ -703,6 +688,7 @@ fn init_qwen_3_5_model_inner(
             &device,
             max_spec_tokens,
             config.max_requests,
+            config.max_tokens,
             sampler_bounds.top_k,
         ));
         Qwen35SpeculativeResources {
@@ -714,6 +700,7 @@ fn init_qwen_3_5_model_inner(
                 &device,
                 max_spec_tokens,
                 config.max_requests,
+                config.max_tokens,
                 sampler_bounds.top_k as usize,
             ),
             target_distribution_indices: Buffer::from_slice(&device, &(0..layout.max_tokens).collect::<Vec<_>>()),
@@ -754,15 +741,7 @@ fn init_qwen_3_5_model_inner(
                 dense_mlp_scratch.as_ref(),
                 moe_scratch.as_ref(),
             )?;
-            mtp.load_weights(
-                &device,
-                &mut store,
-                &model_config,
-                &mtp_model_config,
-                mtp_defaults,
-                body,
-                final_norm_weight,
-            )?;
+            mtp.load_weights(&device, &mut store, &mtp_model_config, body, final_norm_weight)?;
             Qwen35Speculator::MTP(Box::new(Qwen35MTPSpeculator {
                 common: speculative_resources(),
                 num_spec_tokens: num_spec_tokens.get(),
@@ -774,9 +753,7 @@ fn init_qwen_3_5_model_inner(
                 body: Replay::new("qwen3.5 MTP", mtp),
                 sampling: Replay::new(
                     "qwen3.5 draft sampling",
-                    DraftSampling {
-                        sampler: Rc::clone(&sampler),
-                    },
+                    DraftSampling::new(Rc::clone(&sampler), config.max_requests as u32),
                 ),
                 gqa_state,
                 execution: Qwen35MTPExecution::new(config.max_requests, num_spec_tokens.get()),
@@ -789,12 +766,8 @@ fn init_qwen_3_5_model_inner(
             }))
         },
     };
-    let num_main_gqa_page_ids_per_block = usize::try_from(gqa_page_table_layout.num_gqa_layers)
-        .expect("qwen3.5 Main GQA layer count must fit usize")
-        .checked_mul(
-            usize::try_from(gqa_page_table_layout.num_page_ids_per_block)
-                .expect("qwen3.5 Main GQA page count must fit usize"),
-        )
+    let num_main_gqa_page_ids_per_block = (gqa_page_table_layout.num_gqa_layers as usize)
+        .checked_mul(gqa_page_table_layout.num_page_ids_per_block as usize)
         .expect("qwen3.5 Main page IDs per block must fit usize");
     let num_dspark_gqa_page_ids_per_block = match &speculator {
         Qwen35Speculator::Vanilla | Qwen35Speculator::MTP(_) => 0,
@@ -822,12 +795,7 @@ fn init_qwen_3_5_model_inner(
         main_embed: Replay::new("qwen3.5 MainEmbed", Qwen35MainEmbed::new(Rc::clone(&embed))),
         main: Replay::new("qwen3.5 Main", main),
         gather_unembed: Replay::new("qwen3.5 GatherUnembed", gather_unembed),
-        sampling: Replay::new(
-            "qwen3.5 sampling",
-            Sampling {
-                sampler: Rc::clone(&sampler),
-            },
-        ),
+        sampling: Replay::new("qwen3.5 sampling", Sampling::new(Rc::clone(&sampler))),
         sampler: Rc::clone(&sampler),
         sampler_bounds,
         sampler_output: TopKSamplingOutputBuffers::new(&device, sampler_bounds),

@@ -17,7 +17,7 @@ use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::model::qwen::v3_x::dspark::attention::Qwen3xDSparkAttention;
-use crate::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_core_and_metal;
+use crate::model::qwen::v3_x::dspark::attention::derive_qwen3x_dspark_gqa_configs;
 use crate::model::qwen::v3_x::layer::Qwen3xDenseMLP;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::resolve_uniform_quantization;
@@ -36,7 +36,8 @@ pub struct Qwen3xDSparkLayer {
 }
 
 pub struct Qwen3xDSparkLayerScratch {
-    hidden_dim: usize,
+    max_tokens: u32,
+    hidden_dim: u32,
     residual_stream: [Buffer; 2],
     normalized_hidden: Buffer,
     branch_output: Buffer,
@@ -72,8 +73,8 @@ impl Qwen3xDSparkLayer {
             mlp,
         } = bindings;
         let (attention_core, attention_metal) =
-            qwen3x_dspark_gqa_core_and_metal(config, num_spec_tokens, dspark_layer_index, gqa, page_bytes)?;
-        let (mlp_core, mlp_metal) = qwen3x_dspark_dense_mlp_core_and_metal(config, dspark_layer_index, mlp)?;
+            derive_qwen3x_dspark_gqa_configs(config, num_spec_tokens, dspark_layer_index, gqa, page_bytes)?;
+        let (mlp_core, mlp_metal) = derive_qwen3x_dspark_dense_mlp_configs(config, dspark_layer_index, mlp)?;
         let hidden_dim = attention_core.attention.hidden_dim;
         assert_eq!(
             hidden_dim, mlp_core.hidden_dim,
@@ -88,14 +89,14 @@ impl Qwen3xDSparkLayer {
             input_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps),
             attention: Qwen3xDSparkAttention::new(
                 device,
-                &attention_core,
+                attention_core,
                 attention_metal,
                 dspark_layer_index,
                 gqa_state,
             ),
             residual_add: ResidualAdd::new(device),
             post_attention_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps),
-            mlp: Qwen3xDenseMLP::new(device, &mlp_core, mlp_metal, dense_scratch),
+            mlp: Qwen3xDenseMLP::new(device, mlp_core, mlp_metal, dense_scratch),
             scratch,
         })
     }
@@ -106,8 +107,6 @@ impl Qwen3xDSparkLayer {
         device: &Device,
         store: &mut SafeTensorStore,
         config: &Qwen3xDSparkConfig,
-        num_spec_tokens: usize,
-        page_bytes: usize,
         bindings: Qwen3xDSparkLayerWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         let Qwen3xDSparkLayerWeightBindings {
@@ -116,13 +115,9 @@ impl Qwen3xDSparkLayer {
             gqa,
             mlp,
         } = bindings;
-        let (attention_core, attention_metal) =
-            qwen3x_dspark_gqa_core_and_metal(config, num_spec_tokens, self.dspark_layer_index, &gqa, page_bytes)?;
-        let (mlp_core, mlp_metal) = qwen3x_dspark_dense_mlp_core_and_metal(config, self.dspark_layer_index, &mlp)?;
-        self.attention
-            .load_weights(device, store, &attention_core, attention_metal, gqa)?;
-        self.mlp.load_weights(device, store, &mlp_core, mlp_metal, mlp)?;
-        let hidden_dim = attention_core.attention.hidden_dim;
+        self.attention.load_weights(device, store, gqa)?;
+        self.mlp.load_weights(device, store, mlp)?;
+        let hidden_dim = config.hidden_size;
         let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
         self.input_norm.load_weights(remove_qwen3x_norm_weight(
             device,
@@ -181,7 +176,7 @@ impl Qwen3xDSparkLayer {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_values = residual_values(input.num_tokens, self.scratch.hidden_dim);
+        let num_values = self.scratch.residual_values(input.num_tokens);
         self.input_norm.record_with_barrier(
             recorder,
             input.num_tokens,
@@ -225,7 +220,7 @@ impl Qwen3xDSparkLayer {
     }
 }
 
-fn qwen3x_dspark_dense_mlp_core_and_metal(
+fn derive_qwen3x_dspark_dense_mlp_configs(
     config: &Qwen3xDSparkConfig,
     dspark_layer_index: usize,
     bindings: &Qwen3xDenseMLPWeightBindings,
@@ -262,11 +257,16 @@ impl Qwen3xDSparkLayerScratch {
     pub fn new(device: &Device, max_tokens: usize, hidden_dim: usize) -> Self {
         assert!(max_tokens > 0, "Qwen3 DSpark layer scratch requires tokens");
         assert!(hidden_dim > 0, "Qwen3 DSpark layer scratch requires hidden values");
+        let max_tokens_u32 = u32::try_from(max_tokens).expect("Qwen3 DSpark layer token capacity must fit u32");
+        let hidden_dim_u32 = u32::try_from(hidden_dim).expect("Qwen3 DSpark hidden dimension must fit u32");
         let hidden_elements = max_tokens
             .checked_mul(hidden_dim)
             .expect("Qwen3 DSpark layer scratch element count must fit usize");
+        u32::try_from(hidden_elements)
+            .expect("Qwen3 DSpark layer scratch must fit the shader u32 element-count domain");
         Self {
-            hidden_dim,
+            max_tokens: max_tokens_u32,
+            hidden_dim: hidden_dim_u32,
             residual_stream: [
                 Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
                 Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
@@ -277,19 +277,14 @@ impl Qwen3xDSparkLayerScratch {
         }
     }
 
+    fn residual_values(&self, num_tokens: u32) -> u32 {
+        debug_assert!(num_tokens > 0 && num_tokens <= self.max_tokens);
+        num_tokens * self.hidden_dim
+    }
+
     fn residual_stream(&self, dspark_layer_index: usize) -> &Buffer {
         &self.residual_stream[dspark_layer_index % self.residual_stream.len()]
     }
-}
-
-fn residual_values(num_tokens: u32, hidden_dim: usize) -> u32 {
-    num_tokens
-        .checked_mul(
-            hidden_dim
-                .try_into()
-                .expect("Qwen3 DSpark hidden dimension must fit u32"),
-        )
-        .expect("Qwen3 DSpark residual element index must fit u32")
 }
 
 #[cfg(test)]
@@ -316,9 +311,9 @@ mod tests {
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
         let (first_core, first_metal) =
-            qwen3x_dspark_dense_mlp_core_and_metal(&config, 0, &bindings.layers[0].mlp).unwrap();
+            derive_qwen3x_dspark_dense_mlp_configs(&config, 0, &bindings.layers[0].mlp).unwrap();
         let (second_core, second_metal) =
-            qwen3x_dspark_dense_mlp_core_and_metal(&config, 1, &bindings.layers[1].mlp).unwrap();
+            derive_qwen3x_dspark_dense_mlp_configs(&config, 1, &bindings.layers[1].mlp).unwrap();
 
         assert_eq!(first_core.model_layer_index, 0);
         assert_eq!(second_core.model_layer_index, 1);
@@ -339,7 +334,7 @@ mod tests {
         );
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
-        let error = qwen3x_dspark_dense_mlp_core_and_metal(&config, 0, &bindings.layers[0].mlp).unwrap_err();
+        let error = derive_qwen3x_dspark_dense_mlp_configs(&config, 0, &bindings.layers[0].mlp).unwrap_err();
 
         assert!(error.to_string().contains("dense MLP requires one affine layout"));
     }

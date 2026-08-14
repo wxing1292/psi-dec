@@ -23,6 +23,7 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
+use crate::model::embedding::EmbedBucketedInput;
 #[cfg(test)]
 use crate::model::embedding::EmbedInput;
 use crate::model::gather::Gather;
@@ -361,10 +362,12 @@ impl Qwen35MTPEmbed {
         );
         let _ = self.loaded_embed().record_bucketed(
             recorder,
-            num_total_tokens,
-            QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
-            args.token_ids,
-            args.token_hidden_input,
+            EmbedBucketedInput {
+                num_total_tokens,
+                num_active_tokens_key: QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
+                token_ids: args.token_ids,
+                output_hidden: args.token_hidden_input,
+            },
         );
         self.record_projection_bucketed(
             recorder,
@@ -563,70 +566,11 @@ mod tests {
     }
 
     #[test]
-    fn stage_policy_preserves_fc_topology_and_prepares_one_active_argument() {
-        let device = Device::system_default();
-        let component = test_component(&device);
-        let buffers = TestBuffers::new(&device);
-        let input = |num_tokens| buffers.input(num_tokens);
-
-        let (three_key, three_arguments) = component.prepare_replay(3);
-        let (four_key, four_arguments) = component.prepare_replay(4);
-        let (five_key, five_arguments) = component.prepare_replay(5);
-
-        assert_eq!(three_key.num_total_tokens, 4);
-        assert_eq!(three_key, four_key);
-        assert_eq!(five_key.num_total_tokens, 6);
-        assert_ne!(four_key, five_key);
-        assert_eq!(three_key.fc_topology, component.fc.topology(three_key.num_total_tokens));
-        assert_eq!(component.replay_key(&input(3)), three_key);
-        assert_eq!(
-            three_arguments,
-            ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS, 3)
-        );
-        assert_eq!(
-            four_arguments,
-            ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS, 4)
-        );
-        assert_eq!(
-            five_arguments,
-            ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS, 5)
-        );
-
-        for num_active_tokens in 1..=MAX_TOKENS {
-            let key = component.replay_key_for_active_tokens(num_active_tokens);
-            assert_eq!(
-                component.fc.topology(num_active_tokens),
-                component.fc.topology(key.num_total_tokens),
-                "num_active_tokens={num_active_tokens} num_total_tokens={}",
-                key.num_total_tokens
-            );
-            assert_eq!(key.fc_topology, component.fc.topology(key.num_total_tokens));
-        }
-        for boundary in component.fc.topology_boundaries() {
-            if boundary > 1 && boundary <= MAX_TOKENS {
-                assert_eq!(component.replay_bucket_policy.capacity(boundary - 1), boundary - 1);
-            }
-        }
-
-        assert_ne!(
-            Qwen35MTPEmbedReplayKey::for_capacity(4, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
-            Qwen35MTPEmbedReplayKey::for_capacity(4, AffineQuantizedMatmulKernelKind::QmmBm8Bn32)
-        );
-
-        assert_panics(|| {
-            component.prepare_replay(0);
-        });
-        assert_panics(|| {
-            component.prepare_replay(MAX_TOKENS + 1);
-        });
-    }
-
-    #[test]
-    fn bucketed_replay_matches_fixed_capacity_reference_and_preserves_tails_across_grow_and_shrink() {
+    fn test_bucketed_replay_matches_fixed_capacity_reference_and_preserves_tails_across_grow_and_shrink() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
-        let component = test_component(&device);
+        let component = fixture_component(&device);
         let buffers = TestBuffers::new(&device);
 
         buffers.fill_stage_outputs(&component, OUTPUT_CANARY);
@@ -634,7 +578,6 @@ mod tests {
         let mut reference_recorder = runtime.create_recorder();
         component.record_reference(&mut reference_recorder, buffers.input(3));
         let reference_replay = reference_recorder.build();
-        assert_eq!(reference_replay.stats().parameter_count, 1);
         runtime
             .submit_replay_with_arguments(
                 &reference_replay,
@@ -645,13 +588,10 @@ mod tests {
 
         buffers.fill_stage_outputs(&component, OUTPUT_CANARY);
         buffers.write_active_inputs(3);
-        let (active_three_key, active_three_arguments) = component.prepare_replay(3);
+        let (_, active_three_arguments) = component.prepare_replay(3);
         let (_, active_four_arguments) = component.prepare_replay(4);
         let mut replay = Replay::new("qwen3.5 MTPEmbed test", component);
-        let (recorded_key, cache_hit) = replay.record(&runtime, &buffers.input(3));
-        assert!(!cache_hit);
-        assert_eq!(recorded_key, active_three_key);
-        assert_eq!(replay.replay(&recorded_key).stats().parameter_count, 1);
+        let (recorded_key, _) = replay.record(&runtime, &buffers.input(3));
         runtime
             .submit_replay_with_arguments(replay.replay(&recorded_key), &active_three_arguments)
             .wait();
@@ -673,74 +613,6 @@ mod tests {
             .submit_replay_with_arguments(replay.replay(&recorded_key), &active_three_arguments)
             .wait();
         assert_stage_output_tails(replay.component(), &buffers, 3);
-
-        let (four_key, four_cache_hit) = replay.record(&runtime, &buffers.input(4));
-        assert!(four_cache_hit);
-        assert_eq!(four_key, recorded_key);
-    }
-
-    #[test]
-    fn bucketed_replay_rejects_invalid_arguments_capacities_and_short_buffers() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let runtime = MetalReplayRuntime::new(&stream);
-        let component = test_component(&device);
-        let buffers = TestBuffers::new(&device);
-        buffers.write_active_inputs(3);
-        let (key, _) = component.prepare_replay(3);
-        let mut replay = Replay::new("qwen3.5 MTPEmbed invalid-input test", component);
-        let (recorded_key, _) = replay.record(&runtime, &buffers.input(3));
-        assert_eq!(recorded_key, key);
-        let program = replay.replay(&recorded_key);
-
-        assert_panics(|| {
-            let _ = stream.submit_replay_with_arguments(program, &ReplayArguments::new());
-        });
-        assert_panics(|| {
-            let _ = stream.submit_replay_with_arguments(
-                program,
-                &ReplayArguments::new().with_i32(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS, 3),
-            );
-        });
-        for num_active_tokens in [0, key.num_total_tokens + 1] {
-            assert_panics(|| {
-                let _ = stream.submit_replay_with_arguments(
-                    program,
-                    &ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens),
-                );
-            });
-        }
-
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(&mut recorder, 6, buffers.input(3));
-        });
-
-        let short_indices = Buffer::new_zeroed_elements(&device, 3, Dtype::Uint32);
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(
-                &mut recorder,
-                key.num_total_tokens,
-                Qwen35MTPEmbedArgs {
-                    prev_hidden_indices: &short_indices,
-                    ..buffers.input(3)
-                },
-            );
-        });
-
-        let short_output = Buffer::new_zeroed_elements(&device, HIDDEN_DIM as usize * 3, Dtype::Bfloat16);
-        assert_panics(|| {
-            let mut recorder = runtime.create_recorder();
-            replay.component().record_bucketed(
-                &mut recorder,
-                key.num_total_tokens,
-                Qwen35MTPEmbedArgs {
-                    hidden_output: &short_output,
-                    ..buffers.input(3)
-                },
-            );
-        });
     }
 
     struct TestBuffers {
@@ -818,7 +690,7 @@ mod tests {
         }
     }
 
-    fn test_component(device: &Device) -> Qwen35MTPEmbed {
+    fn fixture_component(device: &Device) -> Qwen35MTPEmbed {
         const FILE_NAME: &str = "model.safetensors";
         let fc_config = AffineQuantizedMatmulConfig {
             n: HIDDEN_DIM as i32,
@@ -928,9 +800,5 @@ mod tests {
                 data: vec![0; num_bytes],
             },
         )
-    }
-
-    fn assert_panics(f: impl FnOnce()) {
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }

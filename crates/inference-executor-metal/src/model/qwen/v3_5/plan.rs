@@ -73,7 +73,7 @@ pub fn qwen35_layer_counts(config: &Qwen35ModelConfig) -> Result<Qwen35LayerCoun
     Ok(counts)
 }
 
-pub fn qwen35_gdn_core_and_metal(
+pub fn derive_qwen35_gdn_configs(
     model_layer_index: usize,
     text: &Qwen35TextConfig,
     defaults: Qwen35MetalDefaults,
@@ -102,7 +102,7 @@ pub fn qwen35_gdn_core_and_metal(
     Ok((core, metal))
 }
 
-pub fn qwen35_gqa_core_and_metal(
+pub fn derive_qwen35_gqa_configs(
     model_layer_index: usize,
     text: &Qwen35TextConfig,
     defaults: Qwen35MetalDefaults,
@@ -131,7 +131,7 @@ pub fn qwen35_gqa_core_and_metal(
     Ok((core, metal))
 }
 
-pub fn qwen35_dense_mlp_core_and_metal(
+pub fn derive_qwen35_dense_mlp_configs(
     model_layer_index: usize,
     text: &Qwen35TextConfig,
     defaults: Qwen35MetalDefaults,
@@ -156,7 +156,7 @@ pub fn qwen35_dense_mlp_core_and_metal(
     Ok((core, metal))
 }
 
-pub fn qwen35_moe_core_and_metal(
+pub fn derive_qwen35_moe_configs(
     layer_prefix: &str,
     model_layer_index: usize,
     config: &Qwen35ModelConfig,

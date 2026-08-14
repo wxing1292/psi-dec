@@ -10,6 +10,7 @@ use inference_runtime_core::runtime::Token;
 use ordered_float::NotNan;
 
 use crate::sampling::SamplerConfig;
+use crate::sampling::SpecMicrobatch;
 
 /// Qwen3 Main payload for one executor request, independent of its compute sequence.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +32,28 @@ pub struct Qwen3Microbatch {
     sampler_configs: Vec<SamplerConfig>,
     num_spec_tokens: Vec<u32>,
     flat_sample_mask: Vec<bool>,
+}
+
+impl SpecMicrobatch for Qwen3Microbatch {
+    fn num_reqs(&self) -> usize {
+        self.num_reqs()
+    }
+
+    fn is_decode_req(&self, req_index: usize) -> bool {
+        self.is_decode_req(req_index)
+    }
+
+    fn num_spec_tokens(&self, req_index: usize) -> u32 {
+        self.num_spec_tokens(req_index)
+    }
+
+    fn cu_tokens(&self) -> &[u32] {
+        self.cu_tokens()
+    }
+
+    fn flat_token_ids(&self) -> &[i32] {
+        self.flat_token_ids()
+    }
 }
 
 impl Qwen3Microbatch {

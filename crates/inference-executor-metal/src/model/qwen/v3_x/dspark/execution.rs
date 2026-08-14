@@ -161,12 +161,8 @@ impl Qwen3xDSparkExecution {
     }
 
     pub fn num_gqa_page_ids_per_block(&self) -> usize {
-        usize::try_from(self.page_table_layout.num_gqa_layers)
-            .expect("Qwen3x DSpark GQA layer count must fit usize")
-            .checked_mul(
-                usize::try_from(self.page_table_layout.num_page_ids_per_block)
-                    .expect("Qwen3x DSpark GQA page count must fit usize"),
-            )
+        (self.page_table_layout.num_gqa_layers as usize)
+            .checked_mul(self.page_table_layout.num_page_ids_per_block as usize)
             .expect("Qwen3x DSpark page IDs per block must fit usize")
     }
 
@@ -283,16 +279,7 @@ impl Qwen3xDSparkExecution {
         self.unloaded_model
             .as_mut()
             .expect("Qwen3.x DSpark state must remain unloaded during weight loading")
-            .load_weights(
-                device,
-                &mut store,
-                config,
-                self.num_spec_tokens,
-                self.page_bytes,
-                &main_feature,
-                layers,
-                final_norm_weight,
-            )?;
+            .load_weights(device, &mut store, config, &main_feature, layers, final_norm_weight)?;
         self.sampling
             .component_mut()
             .load_weights(device, &mut store, &markov, &confidence)?;

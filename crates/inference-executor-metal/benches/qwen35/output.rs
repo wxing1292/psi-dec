@@ -352,28 +352,28 @@ impl HeadFixture {
     }
 
     fn build_replay(&self, case: Case, microbatch: &Qwen35Microbatch) -> HeadReplay {
-        let mut builder = MetalReplayRuntime::new(&self.stream).create_recorder();
+        let mut recorder = MetalReplayRuntime::new(&self.stream).create_recorder();
         let mut arguments = ReplayArguments::new();
         match case {
             Case::Embed => {
-                self.record_embed(&mut builder, microbatch.total_tokens() as u32);
+                self.record_embed(&mut recorder, microbatch.total_tokens() as u32);
             },
             Case::FinalNormGather => {
-                self.record_final_norm_gather(&mut builder, microbatch);
+                self.record_final_norm_gather(&mut recorder, microbatch);
             },
             Case::Unembed => {
-                self.record_unembed(&mut builder, num_main_output_rows(microbatch) as u32);
+                self.record_unembed(&mut recorder, num_main_output_rows(microbatch) as u32);
             },
             Case::UnembedPath => {
-                self.record_final_norm_gather(&mut builder, microbatch);
-                self.record_unembed(&mut builder, num_main_output_rows(microbatch) as u32);
+                self.record_final_norm_gather(&mut recorder, microbatch);
+                self.record_unembed(&mut recorder, num_main_output_rows(microbatch) as u32);
             },
             Case::Sample | Case::SampleReadback => {
-                self.record_sampling(&mut builder, microbatch, &mut arguments);
+                self.record_sampling(&mut recorder, microbatch, &mut arguments);
             },
         }
         HeadReplay {
-            program: builder.build(),
+            program: recorder.build(),
             arguments,
         }
     }

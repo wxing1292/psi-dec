@@ -473,8 +473,6 @@ impl DSparkFixture {
                 device,
                 &mut store,
                 &config,
-                config.block_size,
-                QWEN3_PAGE_SIZE_BYTES,
                 &main_feature_bindings,
                 layer_bindings,
                 final_norm_weight,

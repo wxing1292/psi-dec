@@ -63,7 +63,7 @@ pub struct Qwen3xDSparkContextReplayKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkBodyReplayKey {
     num_tokens: u32,
-    total_sdpa_map_task_templates: u32,
+    num_total_sdpa_map_task_templates: u32,
 }
 
 impl Qwen3xDSparkModel {
@@ -130,8 +130,6 @@ impl Qwen3xDSparkModel {
         device: &Device,
         store: &mut SafeTensorStore,
         config: &Qwen3xDSparkConfig,
-        num_spec_tokens: usize,
-        page_bytes: usize,
         main_feature_bindings: &Qwen3xDSparkMainFeatureWeightBindings,
         layer_bindings: Vec<Qwen3xDSparkLayerWeightBindings>,
         final_norm_weight: String,
@@ -151,7 +149,7 @@ impl Qwen3xDSparkModel {
             "Qwen3x DSpark component and checkpoint binding layer counts must match"
         );
         for (layer, bindings) in self.layers.iter_mut().zip(layer_bindings) {
-            layer.load_weights(device, store, config, num_spec_tokens, page_bytes, bindings)?;
+            layer.load_weights(device, store, config, bindings)?;
         }
         let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
         self.final_norm.load_weights(remove_qwen3x_norm_weight(
@@ -322,7 +320,7 @@ impl ReplayComponent for Qwen3xDSparkBody {
         let shape = input.metadata.replay_shape();
         Qwen3xDSparkBodyReplayKey {
             num_tokens: shape.num_tokens,
-            total_sdpa_map_task_templates: shape.total_sdpa_map_task_templates,
+            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }
 

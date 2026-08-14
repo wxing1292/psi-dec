@@ -69,8 +69,8 @@ impl Qwen35Executor {
 
     pub fn num_main_gqa_page_ids_per_block(&self) -> usize {
         let layout = self.gqa_page_table_layout;
-        let num_page_ids = u64::from(layout.num_gqa_layers)
-            .checked_mul(u64::from(layout.num_page_ids_per_block))
+        let num_page_ids = (layout.num_gqa_layers as u64)
+            .checked_mul(layout.num_page_ids_per_block as u64)
             .expect("qwen3.5 main GQA page IDs per block overflow");
         usize::try_from(num_page_ids).expect("qwen3.5 main GQA page IDs per block must fit usize")
     }
@@ -115,11 +115,7 @@ impl Qwen35Executor {
             Qwen35Speculator::Vanilla | Qwen35Speculator::DSpark(_) => Vec::new(),
             Qwen35Speculator::MTP(mtp) => {
                 let layout = mtp.gqa_state.request_page_table().layout();
-                vec![
-                    usize::try_from(layout.num_page_ids_per_block)
-                        .expect("qwen3.5 MTP GQA page IDs per block must fit usize");
-                    mtp.num_spec_tokens
-                ]
+                vec![layout.num_page_ids_per_block as usize; mtp.num_spec_tokens]
             },
         }
     }

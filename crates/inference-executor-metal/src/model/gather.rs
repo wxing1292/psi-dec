@@ -11,13 +11,13 @@ use inference_executor_core::backend::recorder::Recorder;
 use crate::def::replay_op::ReplayOp;
 
 pub struct Gather {
-    op: RowGatherKernel,
+    compute: RowGatherKernel,
 }
 
 impl Gather {
     pub fn new(device: &Device, hidden_dim: u32) -> Self {
         Self {
-            op: RowGatherKernel::new(
+            compute: RowGatherKernel::new(
                 device,
                 RowGatherConfig {
                     num_cols: hidden_dim,
@@ -37,7 +37,7 @@ impl Gather {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.op.invoke(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke(
             RowGatherShape {
                 num_total_rows: num_rows,
             },
@@ -60,7 +60,7 @@ impl Gather {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.op.invoke_bucketed(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_bucketed(
             RowGatherShape { num_total_rows },
             num_active_rows_key,
             RowGatherBuffers {

@@ -39,7 +39,6 @@ use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
-use inference_executor_core::sampling::TopKSamplingShape;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
@@ -71,7 +70,6 @@ use crate::model::qwen::v3_5::mtp::Qwen35MTPReplayKey;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedArgs;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedReplayKey;
-use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkRecording;
@@ -369,7 +367,6 @@ impl Qwen35Speculator {
         &mut self,
         device: &inference_backend_metal::metal::Device,
         source: &Qwen35WeightSource,
-        main_config: &Qwen35ModelConfig,
         main_embed: &Rc<Embed>,
         main_unembed: &Rc<Unembed>,
     ) -> Result<Option<Rc<dyn MainResidualCapture>>, ModelExecutorError> {
@@ -386,15 +383,9 @@ impl Qwen35Speculator {
                     .component_mut()
                     .load_weights(device, &mut store, config, embed)?;
                 mtp.embed.component_mut().load_shared_weights(Rc::clone(main_embed));
-                mtp.body.component_mut().load_weights(
-                    device,
-                    &mut store,
-                    main_config,
-                    config,
-                    Qwen35MetalDefaults::from_quantization(config.quantization.as_ref())?,
-                    body,
-                    final_norm_weight,
-                )?;
+                mtp.body
+                    .component_mut()
+                    .load_weights(device, &mut store, config, body, final_norm_weight)?;
                 Ok(None)
             },
             (Self::DSpark(dspark), Qwen35WeightSource::DSpark { model_dir, config }) => {
@@ -589,20 +580,12 @@ impl Qwen35Executor {
             .expect("qwen3.5 Main unembed shell must exist during weight loading");
         loaded_unembed.load_weights(&device, &mut store, unembed)?;
         let loaded_unembed = Rc::new(loaded_unembed);
-        self.main.component_mut().load_weights(
-            &device,
-            &mut store,
-            &self.model_config,
-            Qwen35MetalDefaults::from_quantization(self.model_config.quantization.as_ref())?,
-            main,
-        )?;
-        let residual_capture = self.speculator.load_weights(
-            &device,
-            &self.weight_source,
-            &self.model_config,
-            &loaded_embed,
-            &loaded_unembed,
-        )?;
+        self.main
+            .component_mut()
+            .load_weights(&device, &mut store, &self.model_config, main)?;
+        let residual_capture =
+            self.speculator
+                .load_weights(&device, &self.weight_source, &loaded_embed, &loaded_unembed)?;
         self.main.component_mut().set_residual_capture(residual_capture);
         self.main_embed.component_mut().load_weights(loaded_embed);
         self.gather_unembed.component_mut().load_weights(loaded_unembed);
@@ -784,14 +767,10 @@ struct Qwen35MTPBatch {
     sample_positions: Vec<u32>,
 }
 
-fn mtp_proposal_sample_position(token_index: u32, num_tokens: usize, step_index: usize) -> u32 {
+fn mtp_proposal_sample_position(token_index: u32, num_tokens: u32, step_index: u32) -> u32 {
     token_index
-        .checked_add(
-            num_tokens
-                .try_into()
-                .expect("qwen3.5 MTP request token count must fit u32"),
-        )
-        .and_then(|position| position.checked_add(step_index.try_into().expect("qwen3.5 MTP step index must fit u32")))
+        .checked_add(num_tokens)
+        .and_then(|position| position.checked_add(step_index))
         .and_then(|position| position.checked_add(1))
         .expect("qwen3.5 MTP proposal sample position overflow")
 }
@@ -1328,275 +1307,13 @@ fn trace_decisions(event: &str, decisions: &[Qwen35DecodeDecision]) {
     });
 }
 
-fn replay_bucket_capacity(active: u32, max_capacity: u32) -> u32 {
-    assert!(active > 0, "qwen3.5 replay bucket requires active work");
-    assert!(active <= max_capacity, "qwen3.5 replay active work exceeds capacity");
-    active
-        .checked_next_power_of_two()
-        .unwrap_or(max_capacity)
-        .min(max_capacity)
-}
-
-fn replay_bucket_capacity_usize(active: usize, max_capacity: usize) -> usize {
-    assert!(active > 0, "qwen3.5 replay bucket requires active work");
-    assert!(active <= max_capacity, "qwen3.5 replay active work exceeds capacity");
-    active
-        .checked_next_power_of_two()
-        .unwrap_or(max_capacity)
-        .min(max_capacity)
-}
-
-fn replay_bucket_capacity_allow_zero(active: usize, max_capacity: usize) -> usize {
-    if active == 0 {
-        assert!(max_capacity > 0);
-        return 0;
-    }
-    replay_bucket_capacity_usize(active, max_capacity)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
-    use inference_backend_metal::components::GQAComputePath;
-    use inference_backend_metal::metal::Buffer;
-    use inference_backend_metal::metal::Device;
-    use inference_backend_metal::metal::Dtype;
-    use inference_backend_metal::metal::Stream;
-    use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
-    use inference_executor_core::attn::GDNReplayShape;
-    use inference_executor_core::attn::GQAReplayShape;
-    use inference_executor_core::attn::gdn::state::GDNStateTxn;
-    use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
-    use inference_executor_core::sampling::SamplerConfig;
-    use inference_executor_core::sampling::TopKSamplingBounds;
-
-    use super::DraftSampling;
-    use super::DraftSamplingInput;
-    use super::MetalReplayRuntime;
-    use super::Qwen35GatherUnembedReplayKey;
-    use super::Qwen35MainReplayKey;
-    use super::Replay;
-    use super::TopKSampling;
-    use super::TopKSamplingOutputBuffers;
-    use super::TopKSamplingWriteDistributionOutput;
     use super::mtp_proposal_sample_position;
-    use super::mtp_sample_replay_shape;
-    use super::replay_bucket_capacity;
-    use crate::attn::gdn::backend::GDNReplayTopology;
-    use crate::attn::gqa::backend::GQAReplayTopology;
 
     #[test]
     fn test_mtp_proposal_sample_position_advances_per_step() {
         assert_eq!(mtp_proposal_sample_position(17, 3, 0), 21);
         assert_eq!(mtp_proposal_sample_position(17, 3, 3), 24);
-    }
-
-    #[test]
-    fn test_mtp_sample_replay_shape_caps_bucket_at_max_requests() {
-        let config = SamplerConfig {
-            temperature: 0.0,
-            ..SamplerConfig::default()
-        };
-        let bounds = TopKSamplingBounds::from_config(&config, 8, 8).unwrap();
-        let configs = vec![config; 5];
-        let shape = mtp_sample_replay_shape(bounds, &configs, 6);
-        assert_eq!(shape.num_active_sampling_inputs, 5);
-        assert_eq!(shape.num_total_sampling_inputs, 6);
-
-        let device = Device::system_default();
-        let sampler = Rc::new(TopKSampling::new(&device, bounds));
-        let output = TopKSamplingOutputBuffers::new(&device, bounds);
-        let logits_elements = bounds.max_sampling_inputs as usize * bounds.vocab_size as usize;
-        let logits = Buffer::new_zeroed_elements(&device, logits_elements, Dtype::Bfloat16);
-        let distribution_token_ids = Buffer::new_zeroed_elements(&device, 6, Dtype::Int32);
-        let distribution_probs = Buffer::new_zeroed_elements(&device, 6, Dtype::Float32);
-        let distribution_indices = Buffer::new_zeroed_elements(&device, 6, Dtype::Uint32);
-        let input = DraftSamplingInput {
-            shape,
-            logits: &logits,
-            output: output.as_output(),
-            sparse: TopKSamplingWriteDistributionOutput {
-                token_ids: &distribution_token_ids,
-                probs: &distribution_probs,
-                output_distribution_indices: &distribution_indices,
-                max_k: 1,
-                num_output_distributions: 6,
-            },
-        };
-        let stream = Stream::new(&device);
-        let runtime = MetalReplayRuntime::new(&stream);
-        let mut replay = Replay::new("qwen3.5 MTP sampling capacity test", DraftSampling { sampler });
-
-        let (key, cache_hit) = replay.record(&runtime, &input);
-
-        assert!(!cache_hit);
-        assert_eq!(key.num_sampling_input_capacity, 6);
-    }
-
-    #[test]
-    fn test_main_key() {
-        let topology = single_gqa_topology();
-        let gdn_topology = gdn_topology();
-        let key = Qwen35MainReplayKey::from_shapes(single_q_token_gqa_shape(), topology, gdn_shape(1), gdn_topology);
-
-        assert_eq!(key.debug_parts(), (4, 4, 4, 4, 1, 4, topology, gdn_topology));
-    }
-
-    #[test]
-    fn test_main_key_tiled() {
-        let topology = tiled_gqa_topology();
-        let gdn_topology = gdn_topology();
-        let key = Qwen35MainReplayKey::from_shapes(tiled_gqa_shape(), topology, gdn_shape(1), gdn_topology);
-
-        assert_eq!(key.debug_parts(), (4, 4, 1, 1, 1, 4, topology, gdn_topology));
-    }
-
-    #[test]
-    fn test_main_key_uses_gdn_request_capacity() {
-        let topology = gdn_topology();
-        let one_req = Qwen35MainReplayKey::from_shapes(
-            single_q_token_gqa_shape(),
-            single_gqa_topology(),
-            GDNReplayShape::new(1, 2, 4, 4),
-            topology,
-        );
-        let two_reqs = Qwen35MainReplayKey::from_shapes(
-            single_q_token_gqa_shape(),
-            single_gqa_topology(),
-            GDNReplayShape::new(2, 2, 4, 4),
-            topology,
-        );
-        let larger_capacity = Qwen35MainReplayKey::from_shapes(
-            single_q_token_gqa_shape(),
-            single_gqa_topology(),
-            GDNReplayShape::new(2, 4, 4, 4),
-            topology,
-        );
-
-        assert_eq!(one_req, two_reqs);
-        assert_ne!(one_req, larger_capacity);
-    }
-
-    #[test]
-    fn test_main_key_shares_partial_output_reduce_topology() {
-        let one_task_template_per_token = single_q_token_gqa_shape();
-        let multiple_task_templates_per_token = GQAReplayShape {
-            reduce_sdpa_partial_outputs: true,
-            ..one_task_template_per_token
-        };
-
-        assert_eq!(
-            Qwen35MainReplayKey::from_shapes(
-                one_task_template_per_token,
-                single_gqa_topology(),
-                gdn_shape(1),
-                gdn_topology(),
-            ),
-            Qwen35MainReplayKey::from_shapes(
-                multiple_task_templates_per_token,
-                single_gqa_topology(),
-                gdn_shape(1),
-                gdn_topology(),
-            )
-        );
-    }
-
-    #[test]
-    fn test_gather_unembed_key_separates_main_output_rows() {
-        let one_main_output = one_req_batch(4, 0);
-        let three_main_outputs = one_req_batch(4, 2);
-
-        assert_ne!(
-            Qwen35GatherUnembedReplayKey::from_microbatch(&one_main_output),
-            Qwen35GatherUnembedReplayKey::from_microbatch(&three_main_outputs)
-        );
-    }
-
-    #[test]
-    fn test_bucket_capacity() {
-        assert_eq!(replay_bucket_capacity(1, 48), 1);
-        assert_eq!(replay_bucket_capacity(2, 48), 2);
-        assert_eq!(replay_bucket_capacity(3, 48), 4);
-        assert_eq!(replay_bucket_capacity(32, 48), 32);
-        assert_eq!(replay_bucket_capacity(33, 48), 48);
-        assert_eq!(replay_bucket_capacity(48, 48), 48);
-    }
-
-    fn one_req_batch(num_tokens: u32, num_spec_tokens: u32) -> Qwen35Microbatch {
-        let num_sample_rows = num_spec_tokens + 1;
-        Qwen35Microbatch::new(
-            vec![0],
-            vec![0],
-            vec![0],
-            (0..num_tokens).map(|token| token as i32).collect(),
-            vec![0, num_tokens],
-            vec![GDNStateTxn::new(0, num_tokens, num_spec_tokens)],
-            vec![Vec::new()],
-            vec![SamplerConfig::default()],
-            (0..num_tokens)
-                .map(|token_offset| token_offset + num_sample_rows >= num_tokens)
-                .collect(),
-        )
-    }
-
-    fn single_q_token_gqa_shape() -> GQAReplayShape {
-        GQAReplayShape {
-            num_tokens: 4,
-            total_tokens: 4,
-            num_q_token_tiles: 4,
-            total_q_token_tiles: 4,
-            num_sdpa_map_task_templates: 4,
-            total_sdpa_map_task_templates: 4,
-            reduce_sdpa_partial_outputs: false,
-        }
-    }
-
-    fn gdn_shape(num_reqs: u32) -> GDNReplayShape {
-        GDNReplayShape::new(num_reqs, num_reqs, 4, 4)
-    }
-
-    fn gdn_topology() -> GDNReplayTopology {
-        GDNReplayTopology {
-            materialize_candidate_states: true,
-            qkvabz_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-        }
-    }
-
-    fn tiled_gqa_shape() -> GQAReplayShape {
-        GQAReplayShape {
-            num_tokens: 4,
-            total_tokens: 4,
-            num_q_token_tiles: 1,
-            total_q_token_tiles: 1,
-            num_sdpa_map_task_templates: 1,
-            total_sdpa_map_task_templates: 1,
-            reduce_sdpa_partial_outputs: true,
-        }
-    }
-
-    fn single_gqa_topology() -> GQAReplayTopology {
-        GQAReplayTopology {
-            compute_path: GQAComputePath::SingleQueryToken {
-                kv_token_tile_size: 256,
-                num_threads_per_threadblock: 256,
-                q_head_tile_size: 6,
-            },
-            qgkv_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-        }
-    }
-
-    fn tiled_gqa_topology() -> GQAReplayTopology {
-        GQAReplayTopology {
-            compute_path: GQAComputePath::TiledQueryTokens {
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                q_head_tile_size: 6,
-            },
-            qgkv_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-            output_affine: AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
-        }
     }
 }

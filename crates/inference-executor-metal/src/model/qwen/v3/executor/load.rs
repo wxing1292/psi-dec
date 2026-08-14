@@ -41,8 +41,8 @@ use crate::model::qwen::v3::main::embed::Qwen3MainEmbed;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayerScratch;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembed;
-use crate::model::qwen::v3::main::plan::qwen3_dense_mlp_core_and_metal;
-use crate::model::qwen::v3::main::plan::qwen3_gqa_core_and_metal;
+use crate::model::qwen::v3::main::plan::derive_qwen3_dense_mlp_configs;
+use crate::model::qwen::v3::main::plan::derive_qwen3_gqa_configs;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
@@ -125,9 +125,7 @@ impl Qwen3ModelLayout {
             .as_ref()
             .ok_or_else(|| ModelExecutorError::custom("qwen3 replay model requires quantization config"))?;
         Ok(Self {
-            max_tokens: max_tokens
-                .try_into()
-                .map_err(|_| ModelExecutorError::custom("qwen3 max_tokens must fit u32"))?,
+            max_tokens: max_tokens as u32,
             vocab_size: text
                 .vocab_size
                 .try_into()
@@ -282,11 +280,11 @@ fn init_qwen_3_model_inner(
     layout.validate();
 
     let text = &model_config.text_config;
-    let (main_gqa_core, main_gqa_metal) = qwen3_gqa_core_and_metal(0, &model_config)?;
+    let (main_gqa_core, main_gqa_metal) = derive_qwen3_gqa_configs(0, &model_config)?;
     let gqa_tokens_per_page = main_gqa_metal.num_ungated_tokens_per_page(&main_gqa_core) as usize;
     let main_page_ids_per_block = num_page_ids_per_block(config.num_tokens_per_block, gqa_tokens_per_page);
     let gqa_page_table_layout = GQAPageTableLayout {
-        num_req_slots: config.max_requests.try_into().expect("qwen3 max_requests must fit u32"),
+        num_req_slots: config.max_requests as u32,
         num_blocks: text
             .max_position_embeddings
             .div_ceil(config.num_tokens_per_block)
@@ -297,9 +295,7 @@ fn init_qwen_3_model_inner(
             .num_hidden_layers
             .try_into()
             .expect("qwen3 GQA layer count must fit u32"),
-        num_page_ids_per_block: main_page_ids_per_block
-            .try_into()
-            .expect("qwen3 GQA pages per block must fit u32"),
+        num_page_ids_per_block: main_page_ids_per_block as u32,
     };
     let device = Device::system_default();
     let runtime = MetalRuntime::new(device.clone());
@@ -318,7 +314,7 @@ fn init_qwen_3_model_inner(
         config.max_tokens,
         layout.hidden_dim as usize,
     ));
-    let (dense_core, dense_metal) = qwen3_dense_mlp_core_and_metal(0, &model_config)?;
+    let (dense_core, dense_metal) = derive_qwen3_dense_mlp_configs(0, &model_config)?;
     let dense_scratch = Rc::new(DenseMLPScratch::new(
         &device,
         &dense_core,
@@ -343,7 +339,7 @@ fn init_qwen_3_model_inner(
     let sampler_bounds = TopKSamplingBounds {
         max_sampling_inputs: layout.max_tokens,
         vocab_size: layout.vocab_size,
-        top_k: MAX_TOP_K.try_into().expect("qwen3 sampler top_k must fit u32"),
+        top_k: MAX_TOP_K as u32,
     };
     sampler_bounds.validate();
     let spec_load = match &init_mode {
@@ -397,18 +393,11 @@ fn init_qwen_3_model_inner(
             let execution = Qwen3xDSparkExecution::new(&device, *loaded, config.max_requests, unembed_config);
             let num_spec_tokens = execution.num_spec_tokens();
             let num_gqa_page_ids_per_block = execution.num_gqa_page_ids_per_block();
-            let max_target_distributions = config
-                .max_requests
-                .checked_mul(
-                    num_spec_tokens
-                        .checked_add(1)
-                        .expect("Qwen3 target distributions per request must fit usize"),
-                )
-                .expect("Qwen3 target distribution capacity must fit usize");
             let rejector = Rc::new(RejectionSampler::new(
                 &device,
                 num_spec_tokens,
                 config.max_requests,
+                config.max_tokens,
                 sampler_bounds.top_k,
             ));
             (
@@ -418,22 +407,24 @@ fn init_qwen_3_model_inner(
                         "qwen3 rejection sampling",
                         RejectionSampling::new(Rc::clone(&sampler), rejector),
                     ),
-                    spec_probs: SpecProbsStore::new(&device, num_spec_tokens, config.max_requests, MAX_TOP_K),
+                    spec_probs: SpecProbsStore::new(
+                        &device,
+                        num_spec_tokens,
+                        config.max_requests,
+                        config.max_tokens,
+                        MAX_TOP_K,
+                    ),
                     target_distribution_indices: Buffer::from_slice(
                         &device,
-                        &compact_target_distribution_indices(max_target_distributions),
+                        &compact_target_distribution_indices(config.max_tokens),
                     ),
                 })),
                 num_gqa_page_ids_per_block,
             )
         },
     };
-    let num_main_gqa_page_ids_per_block = usize::try_from(gqa_page_table_layout.num_gqa_layers)
-        .expect("qwen3 Main GQA layer count must fit usize")
-        .checked_mul(
-            usize::try_from(gqa_page_table_layout.num_page_ids_per_block)
-                .expect("qwen3 Main GQA page count must fit usize"),
-        )
+    let num_main_gqa_page_ids_per_block = (gqa_page_table_layout.num_gqa_layers as usize)
+        .checked_mul(gqa_page_table_layout.num_page_ids_per_block as usize)
         .expect("qwen3 Main page IDs per block must fit usize");
     let num_gqa_page_ids_per_main_lane_block = num_main_gqa_page_ids_per_block
         .checked_add(num_dspark_gqa_page_ids_per_block)
@@ -465,12 +456,7 @@ fn init_qwen_3_model_inner(
         main_embed: Replay::new("qwen3 MainEmbed", Qwen3MainEmbed::new(embed)),
         main: Replay::new("qwen3 Main", main),
         gather_unembed: Replay::new("qwen3 GatherUnembed", gather_unembed),
-        sampling: Replay::new(
-            "qwen3 sampling",
-            Sampling {
-                sampler: Rc::clone(&sampler),
-            },
-        ),
+        sampling: Replay::new("qwen3 sampling", Sampling::new(Rc::clone(&sampler))),
         sampler,
         sampler_bounds,
         sampler_output: TopKSamplingOutputBuffers::new(&device, sampler_bounds),

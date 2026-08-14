@@ -113,12 +113,7 @@ impl Qwen35Executor {
                     .expect("qwen3.5 MTP sampled request requires token") = true;
             }
             let input_start = microbatch.cu_tokens()[req_index] as usize;
-            input_gather_flat_indices.extend((0..request.num_tokens).map(|offset| {
-                input_start
-                    .checked_add(offset)
-                    .and_then(|index| u32::try_from(index).ok())
-                    .expect("qwen3.5 MTP gather index must fit u32")
-            }));
+            input_gather_flat_indices.extend((0..request.num_tokens).map(|offset| (input_start + offset) as u32));
             if request.decision_index.is_some() {
                 let req_slot = microbatch.req_slots()[req_index];
                 draft_distribution_indices.push(
@@ -131,16 +126,11 @@ impl Qwen35Executor {
                 sampler_configs.push(microbatch.sampler_configs()[req_index]);
                 sample_positions.push(mtp_proposal_sample_position(
                     microbatch.token_indices()[req_index],
-                    request.num_tokens,
-                    step_index,
+                    request.num_tokens as u32,
+                    step_index as u32,
                 ));
             }
-            cu_tokens.push(
-                flat_token_ids
-                    .len()
-                    .try_into()
-                    .expect("qwen3.5 MTP cumulative token count must fit u32"),
-            );
+            cu_tokens.push(flat_token_ids.len() as u32);
         }
         let gdn_state_txns = requests
             .iter()
@@ -149,10 +139,7 @@ impl Qwen35Executor {
                 let token_index = microbatch.token_indices()[req_index];
                 GDNStateTxn::new(
                     token_index,
-                    request
-                        .num_tokens
-                        .try_into()
-                        .expect("qwen3.5 MTP request token count must fit u32"),
+                    request.num_tokens as u32,
                     0,
                 )
             })
@@ -194,9 +181,8 @@ impl Qwen35Executor {
         let mut requests = self.mtp_requests(microbatch, decisions);
         let module_batch = self.mtp_batch(microbatch, &mut requests, 0);
         let num_tokens = module_batch.microbatch.total_tokens();
-        let num_active_tokens = num_tokens
-            .try_into()
-            .expect("qwen3.5 MTP token count must fit u32");
+        debug_assert!(num_tokens <= self.config.max_tokens);
+        let num_active_tokens = num_tokens as u32;
         let num_total_tokens = self
             .speculator
             .mtp()
@@ -316,10 +302,11 @@ impl Qwen35Executor {
             .as_ref()
             .expect("qwen3.5 MTP recording requires its replay key");
         let num_tokens = microbatch.total_tokens();
+        debug_assert!(num_tokens <= self.config.max_tokens);
         let mtp_build_start = Instant::now();
         let mtp = self.speculator.mtp_mut();
         let input = Qwen35MTPArgs {
-            num_tokens: num_tokens.try_into().expect("qwen3.5 MTP token count must fit u32"),
+            num_tokens: num_tokens as u32,
             hidden_input: &mtp_hidden_input,
             hidden_output: &self.hidden_output,
             gqa: mtp.gqa_state.metadata(),
@@ -388,9 +375,7 @@ impl Qwen35Executor {
         let mtp = self.speculator.mtp();
         let mtp_embed_replay = mtp.embed.replay(mtp_embed_key);
         let mtp_replay = mtp.body.replay(mtp_key);
-        let gqa_layer_index = step_index
-            .try_into()
-            .expect("qwen3.5 MTP GQA layer index must fit u32");
+        let gqa_layer_index = step_index as u32;
         let mtp_arguments = mtp.body.component().replay_arguments(
             recorder
                 .mtp_gqa_shape
@@ -480,7 +465,7 @@ impl Qwen35Executor {
                 .body
                 .component()
                 .replay_token_capacity(mtp_gqa_shape.num_tokens),
-            mtp_gqa_shape.total_tokens,
+            mtp_gqa_shape.num_total_tokens,
             "qwen3.5 MTP steps must preserve the replay token capacity"
         );
         self.write_token_ids(&flat_token_ids);
@@ -504,7 +489,7 @@ impl Qwen35Executor {
             .iter()
             .map(|&position| {
                 position
-                    .checked_add(step_index.try_into().expect("qwen3.5 MTP step index must fit u32"))
+                    .checked_add(step_index as u32)
                     .expect("qwen3.5 MTP sample position must fit u32")
             })
             .collect::<Vec<_>>();

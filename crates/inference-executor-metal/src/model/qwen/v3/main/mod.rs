@@ -169,7 +169,7 @@ impl Qwen3Main {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Qwen3MainGQAReplayKey {
     num_q_token_tiles: u32,
-    total_sdpa_map_task_templates: u32,
+    num_total_sdpa_map_task_templates: u32,
 }
 
 impl Qwen3MainGQAReplayKey {
@@ -177,7 +177,7 @@ impl Qwen3MainGQAReplayKey {
         gqa_shape.validate();
         Self {
             num_q_token_tiles: gqa_shape.num_q_token_tiles,
-            total_sdpa_map_task_templates: gqa_shape.total_sdpa_map_task_templates,
+            num_total_sdpa_map_task_templates: gqa_shape.num_total_sdpa_map_task_templates,
         }
     }
 }
@@ -195,15 +195,6 @@ impl Qwen3MainReplayKey {
             num_tokens: gqa_shape.num_tokens,
             gqa: Qwen3MainGQAReplayKey::from_shape(gqa_shape),
         }
-    }
-
-    #[cfg(test)]
-    pub fn debug_parts(&self) -> (u32, u32, u32) {
-        (
-            self.num_tokens,
-            self.gqa.num_q_token_tiles,
-            self.gqa.total_sdpa_map_task_templates,
-        )
     }
 }
 

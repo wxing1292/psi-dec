@@ -16,8 +16,8 @@ use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQA;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
-use crate::model::qwen::v3::main::plan::qwen3_dense_mlp_core_and_metal;
-use crate::model::qwen::v3::main::plan::qwen3_gqa_core_and_metal;
+use crate::model::qwen::v3::main::plan::derive_qwen3_dense_mlp_configs;
+use crate::model::qwen::v3::main::plan::derive_qwen3_gqa_configs;
 use crate::model::qwen::v3_x::layer::Qwen3xDenseMLP;
 use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
 use crate::model::residual_add::ResidualAdd;
@@ -34,7 +34,8 @@ pub struct Qwen3MainLayer {
 }
 
 pub struct Qwen3MainLayerScratch {
-    hidden_dim: usize,
+    max_tokens: u32,
+    hidden_dim: u32,
     residual_stream: [Buffer; 2],
     normalized_hidden: Buffer,
     branch_output: Buffer,
@@ -63,10 +64,10 @@ impl Qwen3MainLayer {
     ) -> Result<Self, ModelExecutorError> {
         let hidden_dim = config.text_config.hidden_size;
         let eps = config.text_config.rms_norm_eps;
-        let (gqa_core, _) = qwen3_gqa_core_and_metal(layer_index, config)?;
-        let attention = Qwen3MainGQA::new(&gqa_core, gqa_state);
-        let (mlp_core, mlp_metal) = qwen3_dense_mlp_core_and_metal(layer_index, config)?;
-        let mlp = Qwen3xDenseMLP::new(device, &mlp_core, mlp_metal, dense_scratch);
+        let (gqa_core, gqa_metal) = derive_qwen3_gqa_configs(layer_index, config)?;
+        let attention = Qwen3MainGQA::new(gqa_core, gqa_metal, gqa_state);
+        let (mlp_core, mlp_metal) = derive_qwen3_dense_mlp_configs(layer_index, config)?;
+        let mlp = Qwen3xDenseMLP::new(device, mlp_core, mlp_metal, dense_scratch);
         Ok(Self {
             layer_index,
             input_norm: RMSNorm::new(device, hidden_dim, eps),
@@ -92,12 +93,8 @@ impl Qwen3MainLayer {
             mlp: mlp_bindings,
         } = bindings;
         let hidden_dim = config.text_config.hidden_size;
-        let (gqa_core, gqa_metal) = qwen3_gqa_core_and_metal(self.layer_index, config)?;
-        self.attention
-            .load_weights(device, store, &gqa_core, gqa_metal, attention_bindings)?;
-        let (mlp_core, mlp_metal) = qwen3_dense_mlp_core_and_metal(self.layer_index, config)?;
-        self.mlp
-            .load_weights(device, store, &mlp_core, mlp_metal, mlp_bindings)?;
+        self.attention.load_weights(device, store, attention_bindings)?;
+        self.mlp.load_weights(device, store, mlp_bindings)?;
         self.input_norm.load_weights(load_qwen3x_norm_weight(
             device,
             store,
@@ -145,7 +142,7 @@ impl ReplayLayer for Qwen3MainLayer {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_values = residual_values(input.num_tokens, self.scratch.hidden_dim());
+        let num_values = self.scratch.residual_values(input.num_tokens);
         self.input_norm.record_with_barrier(
             recorder,
             input.num_tokens,
@@ -183,7 +180,7 @@ impl ReplayLayer for Qwen3MainLayer {
                 self.residual_add.record_with_capture(
                     recorder,
                     input.num_tokens,
-                    u32::try_from(self.scratch.hidden_dim()).expect("hidden dimension must fit u32"),
+                    self.scratch.hidden_dim(),
                     &self.scratch.post_attention_hidden,
                     &self.scratch.branch_output,
                     input.residual_output,
@@ -208,11 +205,15 @@ impl Qwen3MainLayerScratch {
     pub fn new(device: &Device, max_tokens: usize, hidden_dim: usize) -> Self {
         assert!(max_tokens > 0);
         assert!(hidden_dim > 0);
+        let max_tokens_u32 = u32::try_from(max_tokens).expect("qwen3 layer token capacity must fit u32");
+        let hidden_dim_u32 = u32::try_from(hidden_dim).expect("qwen3 hidden dimension must fit u32");
         let hidden_elements = max_tokens
             .checked_mul(hidden_dim)
             .expect("qwen3 layer scratch element count must fit usize");
+        u32::try_from(hidden_elements).expect("qwen3 layer scratch must fit the shader u32 element-count domain");
         Self {
-            hidden_dim,
+            max_tokens: max_tokens_u32,
+            hidden_dim: hidden_dim_u32,
             residual_stream: [
                 Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
                 Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
@@ -223,17 +224,16 @@ impl Qwen3MainLayerScratch {
         }
     }
 
-    fn hidden_dim(&self) -> usize {
+    fn hidden_dim(&self) -> u32 {
         self.hidden_dim
+    }
+
+    fn residual_values(&self, num_tokens: u32) -> u32 {
+        debug_assert!(num_tokens > 0 && num_tokens <= self.max_tokens);
+        num_tokens * self.hidden_dim
     }
 
     fn residual_stream(&self, model_layer_index: usize) -> &Buffer {
         &self.residual_stream[model_layer_index % self.residual_stream.len()]
     }
-}
-
-fn residual_values(num_tokens: u32, hidden_dim: usize) -> u32 {
-    num_tokens
-        .checked_mul(hidden_dim.try_into().expect("qwen3 hidden dimension must fit u32"))
-        .expect("qwen3 residual element index must fit u32")
 }

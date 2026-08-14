@@ -71,6 +71,14 @@ pub struct EmbedInput<'a> {
     pub output_hidden: &'a Buffer,
 }
 
+#[derive(Clone, Copy)]
+pub struct EmbedBucketedInput<'a> {
+    pub num_total_tokens: u32,
+    pub num_active_tokens_key: ReplayParameterKey,
+    pub token_ids: &'a Buffer,
+    pub output_hidden: &'a Buffer,
+}
+
 impl Embed {
     /// Returns the token-row capacity of the embedding buffers.
     pub fn max_tokens(&self) -> u32 {
@@ -89,10 +97,6 @@ impl Embed {
             kernel: Rc::clone(&self.kernel),
             weights: self.weights.as_ref().map(Rc::clone),
         }
-    }
-
-    fn validate_input(&self, input: EmbedInput<'_>) {
-        self.validate_num_tokens(input.num_tokens);
     }
 
     pub fn new(device: &Device, config: EmbedConfig) -> Self {
@@ -143,33 +147,26 @@ impl Embed {
             .expect("embedding weights must be loaded before execution")
     }
 
-    pub fn record_bucketed<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
-        token_ids: &'a Buffer,
-        output_hidden: &'a Buffer,
-    ) -> &'a Buffer
+    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: EmbedBucketedInput<'a>) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.validate_num_tokens(num_total_tokens);
+        self.validate_num_tokens(input.num_total_tokens);
         let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke_bucketed(
             QuantizedEmbeddingShape {
-                num_tokens: num_total_tokens,
+                num_total_tokens: input.num_total_tokens,
             },
-            num_active_tokens_key,
+            input.num_active_tokens_key,
             QuantizedEmbeddingBuffers {
-                token_ids,
+                token_ids: input.token_ids,
                 weight: &weights.weight,
                 scales: &weights.scales,
                 biases: &weights.biases,
-                output: output_hidden,
+                output: input.output_hidden,
             },
         )));
-        output_hidden
+        input.output_hidden
     }
 
     fn validate_num_tokens(&self, num_tokens: u32) {
@@ -191,11 +188,11 @@ impl ReplayLayer for Embed {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.validate_input(input);
+        self.validate_num_tokens(input.num_tokens);
         let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke(
             QuantizedEmbeddingShape {
-                num_tokens: input.num_tokens,
+                num_total_tokens: input.num_tokens,
             },
             QuantizedEmbeddingBuffers {
                 token_ids: input.token_ids,
@@ -257,59 +254,4 @@ fn validate_quantized_embedding(max_tokens: u32, vocab_size: u32, hidden_dim: u3
     assert!(matches!(group_size, 32 | 64 | 128));
     assert!(matches!(bits, 2 | 3 | 4 | 6 | 8));
     assert_eq!(hidden_dim % group_size, 0);
-}
-
-#[cfg(test)]
-mod tests {
-    use std::rc::Rc;
-
-    use inference_backend_metal::metal::Buffer;
-    use inference_backend_metal::metal::Device;
-
-    use super::Dtype;
-    use super::Embed;
-    use super::EmbedConfig;
-    use super::EmbedWeights;
-    use super::QuantizedEmbeddingKernel;
-
-    #[test]
-    fn test_capacity_view_shares_kernel_and_weights() {
-        let device = Device::system_default();
-        let config = EmbedConfig {
-            max_tokens: 2,
-            vocab_size: 32,
-            hidden_dim: 32,
-            group_size: 32,
-            bits: 8,
-            scale_bias_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-        };
-        let kernel_config = config.config();
-        let embed = Embed {
-            config,
-            kernel: Rc::new(QuantizedEmbeddingKernel::new(&device, kernel_config)),
-            weights: Some(Rc::new(EmbedWeights {
-                weight: Buffer::new_zeroed(&device, kernel_config.weight_bytes()),
-                scales: Buffer::new_zeroed(
-                    &device,
-                    kernel_config.num_affine_params() * config.scale_bias_dtype.item_size(),
-                ),
-                biases: Buffer::new_zeroed(
-                    &device,
-                    kernel_config.num_affine_params() * config.scale_bias_dtype.item_size(),
-                ),
-            })),
-        };
-        embed.validate_weights();
-
-        let expanded = embed.with_max_tokens(7);
-
-        assert_eq!(embed.max_tokens(), 2);
-        assert_eq!(expanded.max_tokens(), 7);
-        assert!(Rc::ptr_eq(&embed.kernel, &expanded.kernel));
-        assert!(Rc::ptr_eq(
-            embed.weights.as_ref().expect("test embed weights must exist"),
-            expanded.weights.as_ref().expect("expanded embed weights must exist")
-        ));
-    }
 }

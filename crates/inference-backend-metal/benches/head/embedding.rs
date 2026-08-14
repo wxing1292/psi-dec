@@ -74,7 +74,9 @@ impl EmbeddingFixture {
             scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedEmbeddingShape { num_tokens: tokens };
+        let shape = QuantizedEmbeddingShape {
+            num_total_tokens: tokens,
+        };
         let kernel = QuantizedEmbeddingKernel::new(device, config);
         let token_ids = Buffer::from_slice(
             device,

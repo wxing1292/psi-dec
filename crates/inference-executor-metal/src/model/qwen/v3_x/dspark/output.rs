@@ -22,7 +22,8 @@ use crate::sampling::dspark_markov::DSparkProposal;
 use crate::sampling::spec_probs::SpecProbsStore;
 
 pub struct Qwen3xDSparkGatherUnembed {
-    block_size: usize,
+    block_size: u32,
+    max_requests: u32,
     gather: Gather,
     unembed: Option<Rc<Unembed>>,
     row_indices: Buffer,
@@ -62,17 +63,16 @@ impl Qwen3xDSparkGatherUnembed {
     pub fn new(device: &Device, block_size: usize, max_requests: usize, hidden_dim: u32, unembed: Rc<Unembed>) -> Self {
         assert!(block_size > 0, "Qwen3 DSpark GatherUnembed requires block rows");
         assert!(max_requests > 0, "Qwen3 DSpark GatherUnembed requires requests");
+        let max_rows = max_requests
+            .checked_mul(block_size)
+            .expect("Qwen3 DSpark gather-index capacity must fit usize");
+        u32::try_from(max_rows).expect("Qwen3 DSpark gather-index capacity must fit u32");
         Self {
-            block_size,
+            block_size: block_size as u32,
+            max_requests: max_requests as u32,
             gather: Gather::new(device, hidden_dim),
             unembed: Some(unembed),
-            row_indices: Buffer::new_zeroed_elements(
-                device,
-                max_requests
-                    .checked_mul(block_size)
-                    .expect("Qwen3 DSpark gather-index capacity must fit usize"),
-                Dtype::Uint32,
-            ),
+            row_indices: Buffer::new_zeroed_elements(device, max_rows, Dtype::Uint32),
         }
     }
 
@@ -98,19 +98,13 @@ impl Qwen3xDSparkGatherUnembed {
 
     pub fn prepare(&self, num_requests: usize) {
         assert!(num_requests > 0, "Qwen3 DSpark GatherUnembed requires requests");
-        let num_rows = num_requests
-            .checked_mul(self.block_size)
-            .expect("Qwen3 DSpark gather row count must fit usize");
+        assert!(num_requests <= self.max_requests as usize);
+        let block_size = self.block_size as usize;
+        let num_rows = num_requests * block_size;
         let mut row_indices = Vec::with_capacity(num_rows);
-        for block_offset in 0..self.block_size {
+        for block_offset in 0..block_size {
             for request_index in 0..num_requests {
-                row_indices.push(
-                    request_index
-                        .checked_mul(self.block_size)
-                        .and_then(|index| index.checked_add(block_offset))
-                        .and_then(|index| u32::try_from(index).ok())
-                        .expect("Qwen3 DSpark gather row index must fit u32"),
-                );
+                row_indices.push((request_index * block_size + block_offset) as u32);
             }
         }
         self.row_indices.write_typed(0, &row_indices);
@@ -128,14 +122,8 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        let num_rows = input
-            .num_requests
-            .checked_mul(
-                self.block_size
-                    .try_into()
-                    .expect("Qwen3 DSpark block size must fit u32"),
-            )
-            .expect("Qwen3 DSpark unembed row count must fit u32");
+        assert!(input.num_requests > 0 && input.num_requests <= self.max_requests);
+        let num_rows = input.num_requests * self.block_size;
         self.gather.record(
             recorder,
             num_rows,

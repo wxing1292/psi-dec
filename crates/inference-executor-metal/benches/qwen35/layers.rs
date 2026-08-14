@@ -26,11 +26,11 @@ use inference_executor_metal::model::qwen::v3_5::main::layer::Qwen35MainLayer;
 use inference_executor_metal::model::qwen::v3_5::main::layer::Qwen35MainLayerInput;
 use inference_executor_metal::model::qwen::v3_5::main::layer::Qwen35MainLayerScratch;
 use inference_executor_metal::model::qwen::v3_5::plan::Qwen35MetalDefaults;
-use inference_executor_metal::model::qwen::v3_5::plan::qwen35_dense_mlp_core_and_metal;
-use inference_executor_metal::model::qwen::v3_5::plan::qwen35_gdn_core_and_metal;
-use inference_executor_metal::model::qwen::v3_5::plan::qwen35_gqa_core_and_metal;
+use inference_executor_metal::model::qwen::v3_5::plan::derive_qwen35_dense_mlp_configs;
+use inference_executor_metal::model::qwen::v3_5::plan::derive_qwen35_gdn_configs;
+use inference_executor_metal::model::qwen::v3_5::plan::derive_qwen35_gqa_configs;
+use inference_executor_metal::model::qwen::v3_5::plan::derive_qwen35_moe_configs;
 use inference_executor_metal::model::qwen::v3_5::plan::qwen35_layer_counts;
-use inference_executor_metal::model::qwen::v3_5::plan::qwen35_moe_core_and_metal;
 use inference_executor_metal::model::qwen::v3_x::state::Qwen3xGDNState;
 use inference_executor_metal::model::qwen::v3_x::state::Qwen3xGQAState;
 
@@ -157,7 +157,7 @@ impl BlockFixture {
                     .is_ok_and(|kind| kind == LayerType::FullAttention)
             })
             .expect("qwen3.5 layer bench requires a GQA layer");
-        let (gqa_core, gqa_metal) = qwen35_gqa_core_and_metal(first_gqa_layer, &config.text_config, defaults)
+        let (gqa_core, gqa_metal) = derive_qwen35_gqa_configs(first_gqa_layer, &config.text_config, defaults)
             .expect("qwen3.5 layer bench requires valid GQA geometry");
         let num_page_ids_per_block = CACHE_BLOCK_TOKENS.div_ceil(gqa_metal.num_tokens_per_page(&gqa_core) as usize);
         let context_end = (shape.context as usize)
@@ -218,12 +218,12 @@ impl BlockFixture {
         let gdn_cores = gdn_layers
             .iter()
             .map(|&index| {
-                qwen35_gdn_core_and_metal(index, &config.text_config, defaults)
+                derive_qwen35_gdn_configs(index, &config.text_config, defaults)
                     .expect("qwen3.5 layer bench requires valid GDN geometry")
                     .0
             })
             .collect::<Vec<_>>();
-        let gdn_metal = qwen35_gdn_core_and_metal(gdn_layers[0], &config.text_config, defaults)
+        let gdn_metal = derive_qwen35_gdn_configs(gdn_layers[0], &config.text_config, defaults)
             .expect("qwen3.5 layer bench requires valid GDN geometry")
             .1;
         let gdn_state = Qwen3xGDNState::new(
@@ -256,7 +256,7 @@ impl BlockFixture {
             let index = (0..config.text_config.num_hidden_layers)
                 .find(|&index| !config.layer_uses_moe(index))
                 .expect("qwen3.5 layer bench dense schedule must contain a dense layer");
-            let (core, metal) = qwen35_dense_mlp_core_and_metal(index, &config.text_config, defaults)
+            let (core, metal) = derive_qwen35_dense_mlp_configs(index, &config.text_config, defaults)
                 .expect("qwen3.5 layer bench requires valid dense MLP geometry");
             Rc::new(DenseMLPScratch::new(device, &core, metal.io_dtype, max_tokens))
         });
@@ -264,7 +264,7 @@ impl BlockFixture {
             let index = (0..config.text_config.num_hidden_layers)
                 .find(|&index| config.layer_uses_moe(index))
                 .expect("qwen3.5 layer bench MoE schedule must contain an MoE layer");
-            let (core, metal) = qwen35_moe_core_and_metal(&format!("layers.{index}"), index, config, defaults)
+            let (core, metal) = derive_qwen35_moe_configs(&format!("layers.{index}"), index, config, defaults)
                 .expect("qwen3.5 layer bench requires valid MoE geometry");
             Rc::new(MoEScratch::new(device, &core, metal, max_tokens))
         });
@@ -375,7 +375,7 @@ fn load_layer(
     )
     .unwrap_or_else(|err| panic!("unable to construct layer {model_layer_index}: {err}"));
     layer
-        .load_weights(device, store, config, defaults, bindings)
+        .load_weights(device, store, config, bindings)
         .unwrap_or_else(|err| panic!("unable to load layer {model_layer_index}: {err}"));
     layer
 }

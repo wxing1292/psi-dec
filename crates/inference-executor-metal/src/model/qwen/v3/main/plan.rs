@@ -9,7 +9,7 @@ use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::model::qwen::v3_x::weight::to_u32;
 
-pub fn qwen3_gqa_core_and_metal(
+pub fn derive_qwen3_gqa_configs(
     model_layer_index: usize,
     config: &Qwen3ModelConfig,
 ) -> Result<(UngatedGQACore, GQAMetalConfig), ModelExecutorError> {
@@ -39,7 +39,7 @@ pub fn qwen3_gqa_core_and_metal(
     Ok((core, metal))
 }
 
-pub fn qwen3_dense_mlp_core_and_metal(
+pub fn derive_qwen3_dense_mlp_configs(
     model_layer_index: usize,
     config: &Qwen3ModelConfig,
 ) -> Result<(DenseMLPCore, DenseMLPMetalConfig), ModelExecutorError> {

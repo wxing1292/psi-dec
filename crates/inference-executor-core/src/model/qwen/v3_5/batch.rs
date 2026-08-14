@@ -12,6 +12,7 @@ use ordered_float::NotNan;
 use crate::attn::gdn::state::GDNStateTxn;
 use crate::attn::gdn::state::to_state_version;
 use crate::sampling::SamplerConfig;
+use crate::sampling::SpecMicrobatch;
 
 /// Model payload for one executor request, independent of its compute sequence.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +36,28 @@ pub struct Qwen35Microbatch {
     gdn_state_page_ids_by_req: Vec<Vec<Vec<u32>>>,
     sampler_configs: Vec<SamplerConfig>,
     flat_sample_mask: Vec<bool>,
+}
+
+impl SpecMicrobatch for Qwen35Microbatch {
+    fn num_reqs(&self) -> usize {
+        self.num_reqs()
+    }
+
+    fn is_decode_req(&self, req_index: usize) -> bool {
+        self.is_decode_req(req_index)
+    }
+
+    fn num_spec_tokens(&self, req_index: usize) -> u32 {
+        self.num_spec_tokens(req_index)
+    }
+
+    fn cu_tokens(&self) -> &[u32] {
+        self.cu_tokens()
+    }
+
+    fn flat_token_ids(&self) -> &[i32] {
+        self.flat_token_ids()
+    }
 }
 
 impl Qwen35Microbatch {
@@ -751,8 +774,7 @@ fn validate_flat_sample_mask(cu_tokens: &[u32], gdn_state_txns: &[GDNStateTxn], 
         if num_req_main_output_rows == 0 {
             continue;
         }
-        let num_candidate_states = usize::try_from(gdn_state_txns[req_index].num_candidate_states())
-            .expect("qwen3.5 GDN candidate-state count must fit host usize");
+        let num_candidate_states = gdn_state_txns[req_index].num_candidate_states() as usize;
         assert_eq!(
             num_req_main_output_rows, num_candidate_states,
             "qwen3.5 decode request requires one sample row per speculative token plus one"
