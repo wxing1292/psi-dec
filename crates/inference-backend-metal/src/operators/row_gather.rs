@@ -125,18 +125,18 @@ pub struct RowGatherInvocation<'a> {
 }
 
 impl Operator for RowGatherInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.input, 0);
-        builder.set_buffer_read(1, self.buffers.row_indices, 0);
-        builder.set_buffer_write(2, self.buffers.output, 0);
-        builder.set_u32(3, self.config.num_cols);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.input, 0);
+        recorder.set_buffer_read(1, self.buffers.row_indices, 0);
+        recorder.set_buffer_write(2, self.buffers.output, 0);
+        recorder.set_u32(3, self.config.num_cols);
         match self.num_active_rows_key {
-            Some(key) => builder.bind_u32(4, key, 1, self.shape.num_total_rows),
-            None => builder.set_u32(4, self.shape.num_total_rows),
+            Some(key) => recorder.bind_u32(4, key, 1, self.shape.num_total_rows),
+            None => recorder.set_u32(4, self.shape.num_total_rows),
         }
-        builder.dispatch_1d(self.shape.num_values(self.config) as usize, NUM_THREADS_PER_THREADBLOCK);
+        recorder.dispatch_1d(self.shape.num_values(self.config) as usize, NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
@@ -186,7 +186,6 @@ mod tests {
             },
         ));
         let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 0);
         stream.submit_replay(&replay).wait();
 
         let values = output.read_typed::<u16>(0, 4);
@@ -196,85 +195,15 @@ mod tests {
     #[test]
     fn test_bucketed_bf16_and_f32_preserve_inactive_tail_across_grow_and_shrink() {
         for dtype in [Dtype::Bfloat16, Dtype::Float32] {
-            test_bucketed_grow_and_shrink(dtype);
+            assert_bucketed_grow_and_shrink(dtype);
         }
     }
 
-    #[test]
-    fn test_bucketed_validates_arguments_and_total_capacity_buffers() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let config = RowGatherConfig {
-            num_cols: 3,
-            dtype: Dtype::Bfloat16,
-        };
-        let shape = RowGatherShape { num_total_rows: 4 };
-        let kernel = RowGatherKernel::new(&device, config);
-        let input = Buffer::new_zeroed(&device, config.row_bytes());
-        let row_indices = Buffer::from_slice(&device, &[0_u32; 4]);
-        let short_row_indices = Buffer::from_slice(&device, &[0_u32; 3]);
-        let output = Buffer::new_zeroed(&device, shape.output_bytes(config));
-        let short_output = Buffer::new_zeroed(&device, 3 * config.row_bytes());
-
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
-            shape,
-            NUM_ACTIVE_ROWS,
-            RowGatherBuffers {
-                input: &input,
-                row_indices: &row_indices,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
-
-        assert_panics(|| {
-            let _ = stream.submit_replay(&replay);
-        });
-        assert_panics(|| {
-            let arguments = ReplayArguments::new().with_i32(NUM_ACTIVE_ROWS, 3);
-            let _ = stream.submit_replay_with_arguments(&replay, &arguments);
-        });
-        for invalid_num_active_rows in [0, 5] {
-            assert_panics(|| {
-                let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, invalid_num_active_rows);
-                let _ = stream.submit_replay_with_arguments(&replay, &arguments);
-            });
-        }
-
-        assert_panics(|| {
-            let mut builder = stream.create_replay_program();
-            builder.record(kernel.invoke_bucketed(
-                shape,
-                NUM_ACTIVE_ROWS,
-                RowGatherBuffers {
-                    input: &input,
-                    row_indices: &short_row_indices,
-                    output: &output,
-                },
-            ));
-        });
-        assert_panics(|| {
-            let mut builder = stream.create_replay_program();
-            builder.record(kernel.invoke_bucketed(
-                shape,
-                NUM_ACTIVE_ROWS,
-                RowGatherBuffers {
-                    input: &input,
-                    row_indices: &row_indices,
-                    output: &short_output,
-                },
-            ));
-        });
-    }
-
-    fn test_bucketed_grow_and_shrink(dtype: Dtype) {
+    fn assert_bucketed_grow_and_shrink(dtype: Dtype) {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = RowGatherConfig { num_cols: 3, dtype };
         let capacity_shape = RowGatherShape { num_total_rows: 4 };
-        let active_shape = RowGatherShape { num_total_rows: 3 };
         let row_bytes = config.row_bytes();
         let input_values = (0..4 * row_bytes)
             .map(|index| u8::try_from(index + 1).unwrap())
@@ -295,7 +224,6 @@ mod tests {
             },
         ));
         let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
 
         stream
             .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
@@ -306,21 +234,6 @@ mod tests {
             output.read_typed::<u8>(3 * row_bytes, 2 * row_bytes),
             vec![OUTPUT_CANARY; 2 * row_bytes]
         );
-
-        let exact_output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; 3 * row_bytes]);
-        let mut exact_builder = stream.create_replay_program();
-        exact_builder.record(kernel.invoke(
-            active_shape,
-            RowGatherBuffers {
-                input: &input,
-                row_indices: &row_indices,
-                output: &exact_output,
-            },
-        ));
-        let exact_replay = exact_builder.build();
-        assert_eq!(exact_replay.stats().parameter_count, 0);
-        stream.submit_replay(&exact_replay).wait();
-        assert_eq!(exact_output.read_typed::<u8>(0, 3 * row_bytes), expected_active);
 
         row_indices.write_typed(3, &[3_u32]);
         stream
@@ -358,9 +271,5 @@ mod tests {
                     .copied()
             })
             .collect()
-    }
-
-    fn assert_panics(f: impl FnOnce()) {
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }

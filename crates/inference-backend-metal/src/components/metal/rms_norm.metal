@@ -9,7 +9,7 @@ void rms_norm_f32_impl(
     device const float* input,
     device const float* weight,
     device float* output,
-    constant uint& num_tokens,
+    constant uint& num_active_tokens,
     constant uint& hidden_dim,
     constant float& eps,
     threadgroup float* local_inv_mean,
@@ -21,7 +21,7 @@ void rms_norm_f32_impl(
     uint simd_group_id
 ) {
     const uint row = gid;
-    if (row >= num_tokens) return;
+    if (row >= num_active_tokens) return;
 
     float acc = 0.0f;
     const device float* row_input = input + row * size_t(hidden_dim) + lid * RMS_NORM_F32_VALUES_PER_THREAD;
@@ -78,7 +78,7 @@ kernel void rms_norm_f32(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
     device float* output [[buffer(2)]],
-    constant uint& num_tokens [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(3)]],
     constant uint& hidden_dim [[buffer(4)]],
     constant float& eps [[buffer(5)]],
     uint gid [[threadgroup_position_in_grid]],
@@ -90,7 +90,7 @@ kernel void rms_norm_f32(
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
     rms_norm_f32_impl(
-        input, weight, output, num_tokens, hidden_dim, eps, local_inv_mean, local_sums, gid, lid, lsize,
+        input, weight, output, num_active_tokens, hidden_dim, eps, local_inv_mean, local_sums, gid, lid, lsize,
         simd_lane_id, simd_group_id);
 }
 
@@ -98,7 +98,7 @@ kernel void rms_norm_bf16_vec4(
     device const bfloat4* input [[buffer(0)]],
     device const bfloat4* weight [[buffer(1)]],
     device bfloat4* output [[buffer(2)]],
-    constant uint& num_tokens [[buffer(3)]],
+    constant uint& num_active_tokens [[buffer(3)]],
     constant uint& hidden_dim [[buffer(4)]],
     constant float& eps [[buffer(5)]],
     uint gid [[threadgroup_position_in_grid]],
@@ -108,7 +108,7 @@ kernel void rms_norm_bf16_vec4(
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
     const uint row = gid;
-    if (row >= num_tokens) return;
+    if (row >= num_active_tokens) return;
 
     // One thread processes one bfloat4 at a time. Adjacent threads process adjacent vectors.
     const uint hidden_dim_vec = hidden_dim / 4;

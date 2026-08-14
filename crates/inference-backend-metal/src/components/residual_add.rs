@@ -211,30 +211,30 @@ pub struct ResidualAddInvocation<'a> {
     num_active_rows_key: Option<ReplayParameterKey>,
 }
 
-pub(super) struct ResidualAddReplayInvocation {
-    pub(super) pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pub(super) config: ResidualAddConfig,
-    pub(super) shape: ResidualAddShape,
-    pub(super) buffers: ResidualAddOwnedBuffers,
-    pub(super) row_shape: Option<ResidualAddRowShape>,
-    pub(super) num_active_rows_key: Option<ReplayParameterKey>,
+pub struct ResidualAddReplayInvocation {
+    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    config: ResidualAddConfig,
+    shape: ResidualAddShape,
+    buffers: ResidualAddOwnedBuffers,
+    row_shape: Option<ResidualAddRowShape>,
+    num_active_rows_key: Option<ReplayParameterKey>,
 }
 
-pub(super) struct ResidualAddReplayOp {
-    pub(super) pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pub(super) config: ResidualAddConfig,
-    pub(super) shape: ResidualAddShape,
-    pub(super) buffers: ResidualAddOwnedBuffers,
-    pub(super) row_shape: Option<ResidualAddRowShape>,
-    pub(super) num_active_rows_key: Option<ReplayParameterKey>,
+pub struct ResidualAddReplayOp {
+    pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub config: ResidualAddConfig,
+    pub shape: ResidualAddShape,
+    pub buffers: ResidualAddOwnedBuffers,
+    pub row_shape: Option<ResidualAddRowShape>,
+    pub num_active_rows_key: Option<ReplayParameterKey>,
 }
 
-pub(super) struct ResidualAddCaptureReplayOp {
-    pub(super) residual: ResidualAddReplayOp,
-    pub(super) capture: OwnedResidualAddCaptureTarget,
+pub struct ResidualAddCaptureReplayOp {
+    pub residual: ResidualAddReplayOp,
+    pub capture: OwnedResidualAddCaptureTarget,
 }
 
-pub(super) struct ResidualAddCaptureReplayInvocation {
+pub struct ResidualAddCaptureReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     residual: ResidualAddReplayOp,
     capture: OwnedResidualAddCaptureTarget,
@@ -261,66 +261,66 @@ pub struct ResidualAddCaptureTarget<'a> {
     column_end: u32,
 }
 
-pub(super) struct OwnedResidualAddCaptureTarget {
-    pub(super) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(super) buffer_len_bytes: usize,
-    pub(super) num_destination_columns: u32,
-    pub(super) column_start: u32,
-    pub(super) column_end: u32,
+pub struct OwnedResidualAddCaptureTarget {
+    pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub buffer_len_bytes: usize,
+    pub num_destination_columns: u32,
+    pub column_start: u32,
+    pub column_end: u32,
 }
 
 #[derive(Clone)]
-pub(super) struct ResidualAddOwnedBuffers {
-    pub(super) lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(super) lhs_len_bytes: usize,
-    pub(super) rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(super) rhs_len_bytes: usize,
-    pub(super) output: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(super) output_len_bytes: usize,
+pub struct ResidualAddOwnedBuffers {
+    pub lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub lhs_len_bytes: usize,
+    pub rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub rhs_len_bytes: usize,
+    pub output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub output_len_bytes: usize,
 }
 
 impl Operator for ResidualAddInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.lhs, 0);
-        builder.set_buffer_read(1, self.buffers.rhs, 0);
-        builder.set_buffer_write(2, self.buffers.output, 0);
-        record_shape(builder, self.shape, self.row_shape, self.num_active_rows_key);
-        dispatch_values(builder, self.shape.num_values);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.lhs, 0);
+        recorder.set_buffer_read(1, self.buffers.rhs, 0);
+        recorder.set_buffer_write(2, self.buffers.output, 0);
+        record_shape(recorder, self.shape, self.row_shape, self.num_active_rows_key);
+        dispatch_values(recorder, self.shape.num_values);
     }
 }
 
 impl Operator for ResidualAddReplayInvocation {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_retained_pipeline_state(&self.pipeline);
-        builder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
-        builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
-        builder.set_retained_buffer_write(2, &self.buffers.output, 0);
-        record_shape(builder, self.shape, self.row_shape, self.num_active_rows_key);
-        dispatch_values(builder, self.shape.num_values);
+        recorder.set_retained_pipeline_state(&self.pipeline);
+        recorder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
+        recorder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
+        recorder.set_retained_buffer_write(2, &self.buffers.output, 0);
+        record_shape(recorder, self.shape, self.row_shape, self.num_active_rows_key);
+        dispatch_values(recorder, self.shape.num_values);
     }
 }
 
 impl Operator for ResidualAddCaptureReplayInvocation {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_retained_pipeline_state(&self.pipeline);
-        builder.set_retained_buffer_read(0, &self.residual.buffers.lhs, 0);
-        builder.set_retained_buffer_read(1, &self.residual.buffers.rhs, 0);
-        builder.set_retained_buffer_write(2, &self.residual.buffers.output, 0);
-        builder.set_retained_buffer_write(3, &self.capture.buffer, 0);
+        recorder.set_retained_pipeline_state(&self.pipeline);
+        recorder.set_retained_buffer_read(0, &self.residual.buffers.lhs, 0);
+        recorder.set_retained_buffer_read(1, &self.residual.buffers.rhs, 0);
+        recorder.set_retained_buffer_write(2, &self.residual.buffers.output, 0);
+        recorder.set_retained_buffer_write(3, &self.capture.buffer, 0);
         let row_shape = self.row_shape();
         match self.residual.num_active_rows_key {
-            Some(key) => builder.bind_u32(4, key, 1, row_shape.num_total_rows),
-            None => builder.set_u32(4, row_shape.num_total_rows),
+            Some(key) => recorder.bind_u32(4, key, 1, row_shape.num_total_rows),
+            None => recorder.set_u32(4, row_shape.num_total_rows),
         }
-        builder.set_u32(5, row_shape.num_columns / 4);
-        builder.set_u32(6, self.capture.num_destination_columns / 4);
-        builder.set_u32(7, self.capture.column_start / 4);
+        recorder.set_u32(5, row_shape.num_columns / 4);
+        recorder.set_u32(6, self.capture.num_destination_columns / 4);
+        recorder.set_u32(7, self.capture.column_start / 4);
         let num_vectors = self.residual.shape.num_values as usize / 4;
-        builder.dispatch_threadblocks(
+        recorder.dispatch_threadblocks(
             (num_vectors.div_ceil(NUM_THREADS_PER_THREADBLOCK), 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
@@ -369,7 +369,7 @@ impl<'a> ResidualAddCaptureTarget<'a> {
 }
 
 impl ResidualAddInvocation<'_> {
-    pub(super) fn into_replay_op(self) -> ResidualAddReplayOp {
+    pub fn into_replay_op(self) -> ResidualAddReplayOp {
         ResidualAddReplayOp {
             pipeline: self.kernel.as_raw_retained(),
             config: self.config,
@@ -387,7 +387,7 @@ impl ResidualAddInvocation<'_> {
         }
     }
 
-    pub(super) fn into_capture_replay_op(self, capture: ResidualAddCaptureTarget<'_>) -> ResidualAddCaptureReplayOp {
+    pub fn into_capture_replay_op(self, capture: ResidualAddCaptureTarget<'_>) -> ResidualAddCaptureReplayOp {
         assert!(
             self.row_shape.is_some(),
             "residual-add capture requires an explicit row shape"
@@ -419,7 +419,7 @@ impl ResidualAddInvocation<'_> {
 }
 
 impl ResidualAddReplayOp {
-    pub(super) fn into_replay(self) -> ResidualAddReplayInvocation {
+    pub fn into_replay(self) -> ResidualAddReplayInvocation {
         ResidualAddReplayInvocation {
             pipeline: self.pipeline,
             config: self.config,
@@ -432,7 +432,7 @@ impl ResidualAddReplayOp {
 }
 
 impl ResidualAddCaptureReplayOp {
-    pub(super) fn into_replay(self) -> ResidualAddCaptureReplayInvocation {
+    pub fn into_replay(self) -> ResidualAddCaptureReplayInvocation {
         let device = Device::from_raw_retained(self.residual.buffers.lhs.device());
         ResidualAddCaptureReplayInvocation {
             pipeline: Kernel::new(&device, RESIDUAL_ADD_SOURCE, "residual_add_capture_bf16_vec4").as_raw_retained(),
@@ -502,30 +502,30 @@ impl ResidualAddCaptureReplayInvocation {
 }
 
 fn record_shape(
-    builder: &CommandRecorder,
+    recorder: &CommandRecorder,
     shape: ResidualAddShape,
     row_shape: Option<ResidualAddRowShape>,
     num_active_rows_key: Option<ReplayParameterKey>,
 ) {
     match (row_shape, num_active_rows_key) {
         (Some(row_shape), Some(key)) => {
-            builder.bind_u32(3, key, 1, row_shape.num_total_rows);
-            builder.set_u32(4, row_shape.num_columns);
+            recorder.bind_u32(3, key, 1, row_shape.num_total_rows);
+            recorder.set_u32(4, row_shape.num_columns);
         },
         (Some(row_shape), None) => {
-            builder.set_u32(3, row_shape.num_total_rows);
-            builder.set_u32(4, row_shape.num_columns);
+            recorder.set_u32(3, row_shape.num_total_rows);
+            recorder.set_u32(4, row_shape.num_columns);
         },
         (None, None) => {
-            builder.set_u32(3, shape.num_values);
-            builder.set_u32(4, 1);
+            recorder.set_u32(3, shape.num_values);
+            recorder.set_u32(4, 1);
         },
         (None, Some(_)) => panic!("residual-add replay parameter requires a row shape"),
     }
 }
 
-fn dispatch_values(builder: &CommandRecorder, num_values: u32) {
-    builder.dispatch_threadblocks(
+fn dispatch_values(recorder: &CommandRecorder, num_values: u32) {
+    recorder.dispatch_threadblocks(
         ((num_values as usize).div_ceil(NUM_THREADS_PER_THREADBLOCK), 1, 1),
         (NUM_THREADS_PER_THREADBLOCK, 1, 1),
     );

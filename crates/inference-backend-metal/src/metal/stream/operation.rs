@@ -118,12 +118,7 @@ impl<'a> CommandRecorder<'a> {
 
     fn set_buffer_with_usage(&self, index: usize, buffer: &Buffer, offset_bytes: usize, usage: MTLResourceUsage) {
         assert!(index < MAX_BUFFER_BINDINGS);
-        assert_icb_buffer_binding(
-            buffer.len_bytes_u64(),
-            offset_bytes
-                .try_into()
-                .expect("Metal buffer binding offset must fit u64"),
-        );
+        assert_icb_buffer_binding(buffer.len_bytes_u64(), offset_bytes as u64);
         let mut active = self.active.borrow_mut();
         let active = active
             .as_mut()
@@ -146,15 +141,7 @@ impl<'a> CommandRecorder<'a> {
         usage: MTLResourceUsage,
     ) {
         assert!(index < MAX_BUFFER_BINDINGS);
-        assert_icb_buffer_binding(
-            buffer
-                .length()
-                .try_into()
-                .expect("retained Metal buffer length must fit u64"),
-            offset_bytes
-                .try_into()
-                .expect("Metal buffer binding offset must fit u64"),
-        );
+        assert_icb_buffer_binding(buffer.length() as u64, offset_bytes as u64);
         let mut active = self.active.borrow_mut();
         let active = active
             .as_mut()
@@ -318,7 +305,7 @@ impl<'a> CommandRecorder<'a> {
 
 fn assert_icb_buffer_binding(buffer_len_bytes: u64, offset_bytes: u64) {
     assert!(
-        offset_bytes <= u64::from(u32::MAX),
+        offset_bytes <= u32::MAX as u64,
         "Metal ICB kernel buffer binding offset exceeds the verified 32-bit range: offset_bytes={offset_bytes}; bind \
          a smaller resource or use a zero-offset resource view"
     );
@@ -494,6 +481,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "Metal ICB kernel buffer binding offset exceeds the verified 32-bit range")]
     fn test_kernel_buffer_binding_offset_domain() {
-        assert_icb_buffer_binding(u64::MAX, u64::from(u32::MAX) + 1);
+        assert_icb_buffer_binding(u64::MAX, u32::MAX as u64 + 1);
     }
 }

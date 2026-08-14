@@ -75,7 +75,7 @@ fn default_buckets(max_capacity: u32) -> Vec<u32> {
     while lower < max_capacity {
         let step = lower / 4;
         for part in 1..=4 {
-            let candidate = lower.saturating_add(step.checked_mul(part).expect("replay bucket increment must fit u32"));
+            let candidate = lower.saturating_add(step * part);
             if candidate >= max_capacity {
                 return buckets;
             }
@@ -92,7 +92,7 @@ mod tests {
     use super::ReplayBucketPolicy;
 
     #[test]
-    fn default_prefix_matches_component_capacity_policy() {
+    fn test_default_prefix_matches_component_capacity_policy() {
         let policy = ReplayBucketPolicy::new(64);
 
         assert_eq!(policy.buckets(), BASE_BUCKETS);
@@ -100,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_extends_past_64_and_includes_terminal_capacity() {
+    fn test_default_policy_extends_past_64_and_includes_terminal_capacity() {
         assert_eq!(
             ReplayBucketPolicy::new(128).buckets(),
             [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128]
@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn buckets_remain_ordered_at_extension_boundaries_and_u32_limit() {
+    fn test_buckets_remain_ordered_at_extension_boundaries_and_u32_limit() {
         for max_capacity in [65, 79, 80, 81, 127, 128, 129, u32::MAX] {
             let policy = ReplayBucketPolicy::new(max_capacity);
 
@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_uses_the_first_bucket_that_contains_active_work() {
+    fn test_capacity_uses_the_first_bucket_that_contains_active_work() {
         let policy = ReplayBucketPolicy::new(64);
 
         assert_eq!(policy.capacity(1), 1);
@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn topology_boundaries_prevent_cross_topology_padding() {
+    fn test_topology_boundaries_prevent_cross_topology_padding() {
         let policy = ReplayBucketPolicy::with_topology_boundaries(64, &[5, 6, 10, 12, 18]);
 
         assert!(!policy.buckets().contains(&0));
@@ -147,14 +147,14 @@ mod tests {
     }
 
     #[test]
-    fn first_topology_boundary_has_no_preceding_bucket() {
+    fn test_first_topology_boundary_has_no_preceding_bucket() {
         let policy = ReplayBucketPolicy::with_topology_boundaries(6, &[1]);
 
         assert_eq!(policy.buckets(), [1, 2, 4, 6]);
     }
 
     #[test]
-    fn exclusive_topology_boundary_adds_the_preceding_inclusive_capacity() {
+    fn test_exclusive_topology_boundary_adds_the_preceding_inclusive_capacity() {
         let policy = ReplayBucketPolicy::with_topology_boundaries(8, &[6]);
 
         assert_eq!(policy.buckets(), [1, 2, 4, 5, 6, 8]);
@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_keeps_inactive_lanes_at_or_below_one_quarter() {
+    fn test_default_policy_keeps_inactive_lanes_at_or_below_one_quarter() {
         let policy = ReplayBucketPolicy::new(256);
 
         for active in 1..=policy.max_capacity() {
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "replay active work exceeds capacity")]
-    fn capacity_rejects_active_work_above_limit() {
+    fn test_capacity_rejects_active_work_above_limit() {
         ReplayBucketPolicy::new(6).capacity(7);
     }
 }

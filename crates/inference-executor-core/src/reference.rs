@@ -1,11 +1,11 @@
 //! Small CPU reference helpers shared by component-specific test oracles.
 
-pub fn silu_reference(value: f32) -> f32 {
-    value / (1.0 + (-value).exp())
-}
-
 pub fn sigmoid_reference(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
+}
+
+pub fn silu_reference(value: f32) -> f32 {
+    value * sigmoid_reference(value)
 }
 
 pub fn softplus_reference(value: f32) -> f32 {
@@ -34,54 +34,54 @@ pub fn rms_norm_reference(
     input: &[f32],
     weight: &[f32],
     bias: Option<&[f32]>,
-    rows: usize,
-    dim: usize,
+    num_rows: usize,
+    hidden_dim: usize,
     eps: f32,
 ) -> Vec<f32> {
-    assert_eq!(input.len(), rows * dim);
-    assert_eq!(weight.len(), dim);
+    assert_eq!(input.len(), num_rows * hidden_dim);
+    assert_eq!(weight.len(), hidden_dim);
     if let Some(bias) = bias {
-        assert_eq!(bias.len(), dim);
+        assert_eq!(bias.len(), hidden_dim);
     }
     let mut output = vec![0.0; input.len()];
-    for row in 0..rows {
-        let row_offset = row * dim;
-        let sum_sq = input[row_offset..row_offset + dim]
+    for row_index in 0..num_rows {
+        let row_offset = row_index * hidden_dim;
+        let sum_squares = input[row_offset..row_offset + hidden_dim]
             .iter()
             .map(|value| value * value)
             .sum::<f32>();
-        let inv_rms = (sum_sq / dim as f32 + eps).sqrt().recip();
-        for dim_index in 0..dim {
-            output[row_offset + dim_index] = input[row_offset + dim_index] * inv_rms * weight[dim_index]
-                + bias.map(|bias| bias[dim_index]).unwrap_or(0.0);
+        let inverse_rms = (sum_squares / hidden_dim as f32 + eps).sqrt().recip();
+        for hidden_index in 0..hidden_dim {
+            output[row_offset + hidden_index] = input[row_offset + hidden_index] * inverse_rms * weight[hidden_index]
+                + bias.map(|bias| bias[hidden_index]).unwrap_or(0.0);
         }
     }
     output
 }
 
 pub fn dense_linear_reference(
-    input: &[f32],  // [m, k] row major
-    weight: &[f32], // [n, k] row major
+    input: &[f32],  // [num_rows, input_dim] row major
+    weight: &[f32], // [output_dim, input_dim] row major
     bias: Option<&[f32]>,
-    m: usize,
-    k: usize,
-    n: usize,
+    num_rows: usize,
+    input_dim: usize,
+    output_dim: usize,
 ) -> Vec<f32> {
-    assert_eq!(input.len(), m * k);
-    assert_eq!(weight.len(), n * k);
+    assert_eq!(input.len(), num_rows * input_dim);
+    assert_eq!(weight.len(), output_dim * input_dim);
     if let Some(bias) = bias {
-        assert_eq!(bias.len(), n);
+        assert_eq!(bias.len(), output_dim);
     }
 
-    let mut output = vec![0.0; m * n];
+    let mut output = vec![0.0; num_rows * output_dim];
 
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = bias.map(|b| b[j]).unwrap_or(0.0);
-            for p in 0..k {
-                acc += input[i * k + p] * weight[j * k + p];
+    for row_index in 0..num_rows {
+        for output_index in 0..output_dim {
+            let mut value = bias.map(|bias| bias[output_index]).unwrap_or(0.0);
+            for input_index in 0..input_dim {
+                value += input[row_index * input_dim + input_index] * weight[output_index * input_dim + input_index];
             }
-            output[i * n + j] = acc;
+            output[row_index * output_dim + output_index] = value;
         }
     }
 
@@ -91,6 +91,21 @@ pub fn dense_linear_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scalar_activations() {
+        assert_eq!(sigmoid_reference(0.0), 0.5);
+        assert_eq!(silu_reference(0.0), 0.0);
+        assert!((softplus_reference(0.0) - 2.0_f32.ln()).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn test_softmax_reference_normalizes_logits() {
+        let output = softmax_reference(&[0.0, 3.0_f32.ln()]);
+
+        assert!((output[0] - 0.25).abs() < 1.0e-6);
+        assert!((output[1] - 0.75).abs() < 1.0e-6);
+    }
 
     #[test]
     fn test_rms_norm_reference_normalizes_rows() {

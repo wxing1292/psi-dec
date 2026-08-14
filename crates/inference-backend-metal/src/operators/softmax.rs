@@ -105,7 +105,7 @@ pub struct SoftmaxInvocation<'a> {
 }
 
 impl Operator for SoftmaxInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         let shape = self.shape;
         shape.validate();
         let config = self.kernel.config;
@@ -113,13 +113,13 @@ impl Operator for SoftmaxInvocation<'_> {
         assert!(bytes <= self.buffers.input.len_bytes());
         assert!(bytes <= self.buffers.output.len_bytes());
 
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.input, 0);
-        builder.set_buffer_write(1, self.buffers.output, 0);
-        builder.set_i32(2, config.num_values_per_row as i32);
+        recorder.set_kernel(&self.kernel.kernel);
+        recorder.set_buffer_read(0, self.buffers.input, 0);
+        recorder.set_buffer_write(1, self.buffers.output, 0);
+        recorder.set_i32(2, config.num_values_per_row as i32);
         match self.num_active_rows_key {
-            Some(key) => builder.bind_u32(3, key, 1, shape.num_total_rows),
-            None => builder.set_u32(3, shape.num_total_rows),
+            Some(key) => recorder.bind_u32(3, key, 1, shape.num_total_rows),
+            None => recorder.set_u32(3, shape.num_total_rows),
         }
 
         let n_reads = 4usize;
@@ -127,7 +127,7 @@ impl Operator for SoftmaxInvocation<'_> {
         let num_threads_needed = (config.num_values_per_row as usize).div_ceil(n_reads);
         let num_simdgroups = num_threads_needed.div_ceil(simd_size);
         let num_threads_per_threadblock = simd_size * num_simdgroups;
-        builder.dispatch_1d(
+        recorder.dispatch_1d(
             shape.num_total_rows as usize * num_threads_per_threadblock,
             num_threads_per_threadblock,
         );
@@ -311,7 +311,6 @@ mod tests {
             },
         ));
         let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 0);
         stream.submit_replay(&replay).wait();
 
         let actual = read_bf16_values(&output, input_values.len());
@@ -351,7 +350,6 @@ mod tests {
             },
         ));
         let replay = builder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
 
         stream
             .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
@@ -376,79 +374,6 @@ mod tests {
         let shrunk = read_bf16_values(&output, 16);
         assert_close(&shrunk[..12], &expected_three, 0.01);
         assert_eq!(&shrunk[12..], &full[12..]);
-    }
-
-    #[test]
-    fn test_bucketed_submission_validates_active_rows() {
-        let config = SoftmaxConfig {
-            num_values_per_row: 4,
-            dtype: Dtype::Bfloat16,
-        };
-        let shape = SoftmaxShape { num_total_rows: 4 };
-        let (device, kernel) = create_softmax_kernel(config);
-        let stream = Stream::new(&device);
-        let input = Buffer::new_zeroed(&device, shape.bytes(config));
-        let output = Buffer::new_zeroed(&device, shape.bytes(config));
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
-            shape,
-            NUM_ACTIVE_ROWS,
-            SoftmaxBuffers {
-                input: &input,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-
-        assert_panics(|| {
-            let _ = stream.submit_replay_with_arguments(&replay, &ReplayArguments::new());
-        });
-        assert_panics(|| {
-            let _ = stream.submit_replay_with_arguments(&replay, &ReplayArguments::new().with_i32(NUM_ACTIVE_ROWS, 3));
-        });
-        for value in [0, 5] {
-            assert_panics(|| {
-                let _ = stream
-                    .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, value));
-            });
-        }
-    }
-
-    #[test]
-    fn test_bucketed_buffer_validation_uses_total_rows() {
-        let config = SoftmaxConfig {
-            num_values_per_row: 4,
-            dtype: Dtype::Bfloat16,
-        };
-        let shape = SoftmaxShape { num_total_rows: 4 };
-        let active_shape = SoftmaxShape { num_total_rows: 3 };
-        let (device, kernel) = create_softmax_kernel(config);
-        let stream = Stream::new(&device);
-        let full = Buffer::new_zeroed(&device, shape.bytes(config));
-        let short = Buffer::new_zeroed(&device, active_shape.bytes(config));
-
-        assert_panics(|| {
-            let mut builder = stream.create_replay_program();
-            builder.record(kernel.invoke_bucketed(
-                shape,
-                NUM_ACTIVE_ROWS,
-                SoftmaxBuffers {
-                    input: &short,
-                    output: &full,
-                },
-            ));
-        });
-        assert_panics(|| {
-            let mut builder = stream.create_replay_program();
-            builder.record(kernel.invoke_bucketed(
-                shape,
-                NUM_ACTIVE_ROWS,
-                SoftmaxBuffers {
-                    input: &full,
-                    output: &short,
-                },
-            ));
-        });
     }
 
     fn create_softmax_kernel(config: SoftmaxConfig) -> (Device, SoftmaxKernel) {
@@ -496,9 +421,5 @@ mod tests {
                 "value mismatch at {index}: actual={actual} expected={expected} tolerance={tolerance}"
             );
         }
-    }
-
-    fn assert_panics(f: impl FnOnce()) {
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
     }
 }

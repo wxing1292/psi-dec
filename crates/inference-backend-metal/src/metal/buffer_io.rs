@@ -279,7 +279,7 @@ fn write_all_at(file: &File, mut bytes: &[u8], mut offset_bytes: u64) -> io::Res
             Ok(written_bytes) => {
                 bytes = &bytes[written_bytes..];
                 offset_bytes = offset_bytes
-                    .checked_add(u64::try_from(written_bytes).expect("completed file write length must fit u64"))
+                    .checked_add(written_bytes as u64)
                     .expect("completed file write offset must fit u64");
             },
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
@@ -336,7 +336,7 @@ mod tests {
         let restored = Buffer::new_zeroed(&device, LEN_BYTES);
         let file_path = test_file_path();
         let file = buffer_io.create(&file_path, BufferIOFileCacheMode::Uncached).unwrap();
-        let len_bytes = u64::try_from(LEN_BYTES).unwrap();
+        let len_bytes = LEN_BYTES as u64;
 
         buffer_io.buffer_to_file(&source, 0, &file, 0, len_bytes).unwrap();
         file.sync_all().unwrap();

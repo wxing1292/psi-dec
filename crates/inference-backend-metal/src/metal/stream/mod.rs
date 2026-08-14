@@ -236,18 +236,18 @@ mod tests {
     }
 
     impl Operator for AddOneInvocation<'_> {
-        fn record(self, builder: &CommandRecorder<'_>) {
-            builder.set_kernel(self.kernel);
-            builder.set_buffer_read_write(0, self.values, 0);
-            builder.set_u32(1, self.len);
-            builder.dispatch_1d(self.len as usize, 2);
+        fn record(self, recorder: &CommandRecorder<'_>) {
+            recorder.set_kernel(self.kernel);
+            recorder.set_buffer_read_write(0, self.values, 0);
+            recorder.set_u32(1, self.len);
+            recorder.dispatch_1d(self.len as usize, 2);
         }
     }
 
     impl Operator for AddOneReplayInvocation<'_> {
-        fn record(self, builder: &CommandRecorder<'_>) {
-            builder.set_kernel(self.kernel);
-            builder.set_buffer_read_write(0, self.values, 0);
+        fn record(self, recorder: &CommandRecorder<'_>) {
+            recorder.set_kernel(self.kernel);
+            recorder.set_buffer_read_write(0, self.values, 0);
             assert!(self.min_num_active_threads <= self.num_total_threads);
             match self.num_active_threads {
                 ReplayU32::Fixed(num_active_threads) => {
@@ -255,13 +255,13 @@ mod tests {
                         num_active_threads >= self.min_num_active_threads
                             && num_active_threads <= self.num_total_threads
                     );
-                    builder.set_u32(1, num_active_threads);
+                    recorder.set_u32(1, num_active_threads);
                 },
                 ReplayU32::Parameter(key) => {
-                    builder.bind_u32(1, key, self.min_num_active_threads, self.num_total_threads);
+                    recorder.bind_u32(1, key, self.min_num_active_threads, self.num_total_threads);
                 },
             }
-            builder.dispatch_1d(
+            recorder.dispatch_1d(
                 self.num_total_threads as usize,
                 self.num_threads_per_threadblock as usize,
             );
@@ -269,17 +269,17 @@ mod tests {
     }
 
     impl Operator for ScalarReplayInvocation<'_> {
-        fn record(self, builder: &CommandRecorder<'_>) {
-            builder.set_kernel(self.kernel);
-            builder.set_buffer_write(0, self.output_u64, 0);
-            builder.set_buffer_write(1, self.output_i32, 0);
-            builder.set_buffer_write(2, self.output_i64, 0);
-            builder.set_buffer_write(3, self.output_f32, 0);
-            builder.bind_u64(4, self.value_u64, 1, 10_000_000_000);
-            builder.bind_i32(5, self.value_i32, -10, 10);
-            builder.bind_i64(6, self.value_i64, -10_000_000_000, 10_000_000_000);
-            builder.bind_f32(7, self.value_f32, -2.0, 2.0);
-            builder.dispatch_1d(1, 1);
+        fn record(self, recorder: &CommandRecorder<'_>) {
+            recorder.set_kernel(self.kernel);
+            recorder.set_buffer_write(0, self.output_u64, 0);
+            recorder.set_buffer_write(1, self.output_i32, 0);
+            recorder.set_buffer_write(2, self.output_i64, 0);
+            recorder.set_buffer_write(3, self.output_f32, 0);
+            recorder.bind_u64(4, self.value_u64, 1, 10_000_000_000);
+            recorder.bind_i32(5, self.value_i32, -10, 10);
+            recorder.bind_i64(6, self.value_i64, -10_000_000_000, 10_000_000_000);
+            recorder.bind_f32(7, self.value_f32, -2.0, 2.0);
+            recorder.dispatch_1d(1, 1);
         }
     }
 

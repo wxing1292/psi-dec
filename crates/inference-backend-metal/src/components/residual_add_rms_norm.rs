@@ -183,7 +183,7 @@ pub struct ResidualAddRMSNormInvocation<'a> {
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub(super) struct ResidualAddRMSNormReplayInvocation {
+pub struct ResidualAddRMSNormReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     config: ResidualAddRMSNormConfig,
     shape: ResidualAddRMSNormShape,
@@ -191,7 +191,7 @@ pub(super) struct ResidualAddRMSNormReplayInvocation {
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub(super) struct ResidualAddCaptureRMSNormReplayInvocation {
+pub struct ResidualAddCaptureRMSNormReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     config: ResidualAddRMSNormConfig,
     shape: ResidualAddRMSNormShape,
@@ -293,18 +293,18 @@ impl ResidualAddCaptureRMSNormOwnedBuffers {
 }
 
 impl Operator for ResidualAddRMSNormInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_kernel(self.kernel);
-        builder.set_buffer_read(0, self.buffers.lhs, 0);
-        builder.set_buffer_read(1, self.buffers.rhs, 0);
-        builder.set_buffer_read(2, self.buffers.weight, 0);
-        builder.set_buffer_write(3, self.buffers.residual_output, 0);
-        builder.set_buffer_write(4, self.buffers.norm_output, 0);
-        record_num_active_tokens(builder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
-        builder.set_u32(6, self.config.hidden_dim);
-        builder.set_f32(7, self.config.eps);
-        builder.dispatch_threadblocks(
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.lhs, 0);
+        recorder.set_buffer_read(1, self.buffers.rhs, 0);
+        recorder.set_buffer_read(2, self.buffers.weight, 0);
+        recorder.set_buffer_write(3, self.buffers.residual_output, 0);
+        recorder.set_buffer_write(4, self.buffers.norm_output, 0);
+        record_num_active_tokens(recorder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
+        recorder.set_u32(6, self.config.hidden_dim);
+        recorder.set_f32(7, self.config.eps);
+        recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
@@ -312,18 +312,18 @@ impl Operator for ResidualAddRMSNormInvocation<'_> {
 }
 
 impl Operator for ResidualAddRMSNormReplayInvocation {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_retained_pipeline_state(&self.pipeline);
-        builder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
-        builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
-        builder.set_retained_buffer_read(2, &self.buffers.weight, 0);
-        builder.set_retained_buffer_write(3, &self.buffers.residual_output, 0);
-        builder.set_retained_buffer_write(4, &self.buffers.norm_output, 0);
-        record_num_active_tokens(builder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
-        builder.set_u32(6, self.config.hidden_dim);
-        builder.set_f32(7, self.config.eps);
-        builder.dispatch_threadblocks(
+        recorder.set_retained_pipeline_state(&self.pipeline);
+        recorder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
+        recorder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
+        recorder.set_retained_buffer_read(2, &self.buffers.weight, 0);
+        recorder.set_retained_buffer_write(3, &self.buffers.residual_output, 0);
+        recorder.set_retained_buffer_write(4, &self.buffers.norm_output, 0);
+        record_num_active_tokens(recorder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
+        recorder.set_u32(6, self.config.hidden_dim);
+        recorder.set_f32(7, self.config.eps);
+        recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
@@ -331,21 +331,21 @@ impl Operator for ResidualAddRMSNormReplayInvocation {
 }
 
 impl Operator for ResidualAddCaptureRMSNormReplayInvocation {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        builder.set_retained_pipeline_state(&self.pipeline);
-        builder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
-        builder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
-        builder.set_retained_buffer_read(2, &self.buffers.weight, 0);
-        builder.set_retained_buffer_write(3, &self.buffers.residual_output, 0);
-        builder.set_retained_buffer_write(4, &self.buffers.capture_output, 0);
-        builder.set_retained_buffer_write(5, &self.buffers.norm_output, 0);
-        record_num_active_tokens(builder, 6, self.shape.num_total_tokens, self.num_active_tokens_key);
-        builder.set_u32(7, self.config.hidden_dim);
-        builder.set_u32(8, self.capture_num_columns / 4);
-        builder.set_u32(9, self.capture_column_start / 4);
-        builder.set_f32(10, self.config.eps);
-        builder.dispatch_threadblocks(
+        recorder.set_retained_pipeline_state(&self.pipeline);
+        recorder.set_retained_buffer_read(0, &self.buffers.lhs, 0);
+        recorder.set_retained_buffer_read(1, &self.buffers.rhs, 0);
+        recorder.set_retained_buffer_read(2, &self.buffers.weight, 0);
+        recorder.set_retained_buffer_write(3, &self.buffers.residual_output, 0);
+        recorder.set_retained_buffer_write(4, &self.buffers.capture_output, 0);
+        recorder.set_retained_buffer_write(5, &self.buffers.norm_output, 0);
+        record_num_active_tokens(recorder, 6, self.shape.num_total_tokens, self.num_active_tokens_key);
+        recorder.set_u32(7, self.config.hidden_dim);
+        recorder.set_u32(8, self.capture_num_columns / 4);
+        recorder.set_u32(9, self.capture_column_start / 4);
+        recorder.set_f32(10, self.config.eps);
+        recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
             (NUM_THREADS_PER_THREADBLOCK, 1, 1),
         );
@@ -365,7 +365,7 @@ impl ResidualAddRMSNormInvocation<'_> {
 }
 
 impl ResidualAddRMSNormReplayInvocation {
-    pub(super) fn is_residual_add_rms_norm_fusion_compatible(
+    pub fn is_residual_add_rms_norm_fusion_compatible(
         residual_add: &ResidualAddReplayOp,
         rms_norm: &RMSNormReplayOp,
     ) -> bool {
@@ -391,7 +391,7 @@ impl ResidualAddRMSNormReplayInvocation {
             )
     }
 
-    pub(super) fn fuse_residual_add_rms_norm(residual_add: ResidualAddReplayOp, rms_norm: RMSNormReplayOp) -> Self {
+    pub fn fuse_residual_add_rms_norm(residual_add: ResidualAddReplayOp, rms_norm: RMSNormReplayOp) -> Self {
         assert!(
             Self::is_residual_add_rms_norm_fusion_compatible(&residual_add, &rms_norm),
             "residual-add output must be the fused RMSNorm input"
@@ -475,7 +475,7 @@ impl ResidualAddRMSNormReplayInvocation {
 }
 
 impl ResidualAddCaptureRMSNormReplayInvocation {
-    pub(super) fn is_residual_add_capture_rms_norm_fusion_compatible(
+    pub fn is_residual_add_capture_rms_norm_fusion_compatible(
         residual_add: &ResidualAddCaptureReplayOp,
         rms_norm: &RMSNormReplayOp,
     ) -> bool {
@@ -489,7 +489,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             )
     }
 
-    pub(super) fn fuse_residual_add_capture_rms_norm(
+    pub fn fuse_residual_add_capture_rms_norm(
         residual_add: ResidualAddCaptureReplayOp,
         rms_norm: RMSNormReplayOp,
     ) -> Self {
@@ -623,14 +623,14 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
 }
 
 fn record_num_active_tokens(
-    builder: &CommandRecorder,
+    recorder: &CommandRecorder,
     binding_index: usize,
-    token_capacity: u32,
+    num_total_tokens: u32,
     key: Option<ReplayParameterKey>,
 ) {
     match key {
-        Some(key) => builder.bind_u32(binding_index, key, 1, token_capacity),
-        None => builder.set_u32(binding_index, token_capacity),
+        Some(key) => recorder.bind_u32(binding_index, key, 1, num_total_tokens),
+        None => recorder.set_u32(binding_index, num_total_tokens),
     }
 }
 

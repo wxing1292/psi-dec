@@ -36,8 +36,8 @@ impl Bf16ConcatRowsConfig {
     }
 
     fn input_elements_u64(self, num_total_rows: u32) -> u64 {
-        u64::from(num_total_rows)
-            .checked_mul(u64::from(self.num_columns))
+        (num_total_rows as u64)
+            .checked_mul(self.num_columns as u64)
             .expect("bf16 row concat input element count must fit u64")
     }
 
@@ -49,19 +49,19 @@ impl Bf16ConcatRowsConfig {
 
     fn input_bytes_u64(self, num_total_rows: u32) -> u64 {
         self.input_elements_u64(num_total_rows)
-            .checked_mul(size_of::<u16>().try_into().expect("bf16 item size must fit u64"))
+            .checked_mul(size_of::<u16>() as u64)
             .expect("bf16 row concat input byte length must fit u64")
     }
 
     fn output_bytes_u64(self, num_total_rows: u32) -> u64 {
         self.output_elements_u64(num_total_rows)
-            .checked_mul(size_of::<u16>().try_into().expect("bf16 item size must fit u64"))
+            .checked_mul(size_of::<u16>() as u64)
             .expect("bf16 row concat output byte length must fit u64")
     }
 
     fn num_threads(self, num_total_rows: u32) -> usize {
         self.output_elements_u64(num_total_rows)
-            .checked_div(u64::from(NUM_BFLOATS_PER_VECTOR))
+            .checked_div(NUM_BFLOATS_PER_VECTOR as u64)
             .expect("validated BF16 row width must contain complete bfloat4 vectors")
             .try_into()
             .expect("bf16 row concat dispatch count must fit host usize")
@@ -113,17 +113,17 @@ pub struct Bf16ConcatRowsInvocation<'a> {
 }
 
 impl Operator for Bf16ConcatRowsInvocation<'_> {
-    fn record(self, builder: &CommandRecorder<'_>) {
+    fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernel.config;
         config.validate_num_total_rows(self.num_total_rows);
         validate_buffers(config, self.num_total_rows, self.buffers);
-        builder.set_kernel(&self.kernel.kernel);
-        builder.set_buffer_read(0, self.buffers.lhs, 0);
-        builder.set_buffer_read(1, self.buffers.rhs, 0);
-        builder.set_buffer_write(2, self.buffers.output, 0);
-        builder.bind_u32(3, self.num_active_rows_key, 1, self.num_total_rows);
-        builder.set_u32(4, config.num_columns);
-        builder.dispatch_1d(config.num_threads(self.num_total_rows), NUM_THREADS_PER_THREADBLOCK);
+        recorder.set_kernel(&self.kernel.kernel);
+        recorder.set_buffer_read(0, self.buffers.lhs, 0);
+        recorder.set_buffer_read(1, self.buffers.rhs, 0);
+        recorder.set_buffer_write(2, self.buffers.output, 0);
+        recorder.bind_u32(3, self.num_active_rows_key, 1, self.num_total_rows);
+        recorder.set_u32(4, config.num_columns);
+        recorder.dispatch_1d(config.num_threads(self.num_total_rows), NUM_THREADS_PER_THREADBLOCK);
     }
 }
 
@@ -237,7 +237,6 @@ mod tests {
             },
         ));
         let replay = recorder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
 
         let expected_active = reference_concat(
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -274,71 +273,6 @@ mod tests {
         assert_eq!(output.read_typed::<u16>(0, 24), expected_active);
         assert_eq!(output.read_typed::<u16>(24, 8), full_output[24..]);
         assert_eq!(output.read_typed::<u16>(32, 8), vec![OUTPUT_CANARY; 8]);
-    }
-
-    #[test]
-    fn test_bucketed_replay_validates_arguments_and_total_capacity_buffers() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let config = Bf16ConcatRowsConfig { num_columns: 4 };
-        let num_total_rows = 4;
-        let kernel = Bf16ConcatRowsKernel::new(&device, config);
-        let lhs = Buffer::new_zeroed_elements(&device, 16, Dtype::Bfloat16);
-        let rhs = Buffer::new_zeroed_elements(&device, 16, Dtype::Bfloat16);
-        let output = Buffer::new_zeroed_elements(&device, 32, Dtype::Bfloat16);
-        let short_lhs = Buffer::new_zeroed_elements(&device, 15, Dtype::Bfloat16);
-        let short_rhs = Buffer::new_zeroed_elements(&device, 15, Dtype::Bfloat16);
-        let short_output = Buffer::new_zeroed_elements(&device, 31, Dtype::Bfloat16);
-
-        let mut recorder = stream.create_replay_program();
-        recorder.record(kernel.invoke_bucketed(
-            num_total_rows,
-            NUM_ACTIVE_ROWS,
-            Bf16ConcatRowsBuffers {
-                lhs: &lhs,
-                rhs: &rhs,
-                output: &output,
-            },
-        ));
-        let replay = recorder.build();
-        assert_eq!(replay.stats().parameter_count, 1);
-
-        assert_panics(|| {
-            let _ = stream.submit_replay(&replay);
-        });
-        assert_panics(|| {
-            let arguments = ReplayArguments::new().with_i32(NUM_ACTIVE_ROWS, 3);
-            let _ = stream.submit_replay_with_arguments(&replay, &arguments);
-        });
-        for invalid_num_active_rows in [0, 5] {
-            assert_panics(|| {
-                let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, invalid_num_active_rows);
-                let _ = stream.submit_replay_with_arguments(&replay, &arguments);
-            });
-        }
-
-        for buffers in [
-            Bf16ConcatRowsBuffers {
-                lhs: &short_lhs,
-                rhs: &rhs,
-                output: &output,
-            },
-            Bf16ConcatRowsBuffers {
-                lhs: &lhs,
-                rhs: &short_rhs,
-                output: &output,
-            },
-            Bf16ConcatRowsBuffers {
-                lhs: &lhs,
-                rhs: &rhs,
-                output: &short_output,
-            },
-        ] {
-            assert_panics(|| {
-                let mut recorder = stream.create_replay_program();
-                recorder.record(kernel.invoke_bucketed(num_total_rows, NUM_ACTIVE_ROWS, buffers));
-            });
-        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ void residual_add_rms_norm_impl(
     device const T* weight,
     device T* residual_output,
     device T* norm_output,
-    constant uint& num_tokens,
+    constant uint& num_active_tokens,
     constant uint& hidden_dim,
     constant float& eps,
     threadgroup float* local_inv_mean,
@@ -24,7 +24,7 @@ void residual_add_rms_norm_impl(
     uint simd_group_id
 ) {
     const uint row = gid;
-    if (row >= num_tokens) return;
+    if (row >= num_active_tokens) return;
 
     float acc = 0.0f;
     const device T* row_lhs = lhs + row * size_t(hidden_dim) + lid * RESIDUAL_ADD_RMS_N_READS;
@@ -92,7 +92,7 @@ kernel void residual_add_rms_norm_f32(
     device const float* weight [[buffer(2)]],
     device float* residual_output [[buffer(3)]],
     device float* norm_output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     constant uint& hidden_dim [[buffer(6)]],
     constant float& eps [[buffer(7)]],
     uint gid [[threadgroup_position_in_grid]],
@@ -104,7 +104,7 @@ kernel void residual_add_rms_norm_f32(
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
     residual_add_rms_norm_impl<float>(
-        lhs, rhs, weight, residual_output, norm_output, num_tokens, hidden_dim, eps, local_inv_mean, local_sums,
+        lhs, rhs, weight, residual_output, norm_output, num_active_tokens, hidden_dim, eps, local_inv_mean, local_sums,
         gid, lid, lsize, simd_lane_id, simd_group_id);
 }
 
@@ -114,7 +114,7 @@ kernel void residual_add_rms_norm_bf16(
     device const bfloat16_t* weight [[buffer(2)]],
     device bfloat16_t* residual_output [[buffer(3)]],
     device bfloat16_t* norm_output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     constant uint& hidden_dim [[buffer(6)]],
     constant float& eps [[buffer(7)]],
     uint gid [[threadgroup_position_in_grid]],
@@ -126,7 +126,7 @@ kernel void residual_add_rms_norm_bf16(
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
     residual_add_rms_norm_impl<bfloat16_t>(
-        lhs, rhs, weight, residual_output, norm_output, num_tokens, hidden_dim, eps, local_inv_mean, local_sums,
+        lhs, rhs, weight, residual_output, norm_output, num_active_tokens, hidden_dim, eps, local_inv_mean, local_sums,
         gid, lid, lsize, simd_lane_id, simd_group_id);
 }
 
@@ -136,7 +136,7 @@ kernel void residual_add_rms_norm_bf16_vec4(
     device const bfloat4* weight [[buffer(2)]],
     device bfloat4* residual_output [[buffer(3)]],
     device bfloat4* norm_output [[buffer(4)]],
-    constant uint& num_tokens [[buffer(5)]],
+    constant uint& num_active_tokens [[buffer(5)]],
     constant uint& hidden_dim [[buffer(6)]],
     constant float& eps [[buffer(7)]],
     uint gid [[threadgroup_position_in_grid]],
@@ -146,7 +146,7 @@ kernel void residual_add_rms_norm_bf16_vec4(
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
     const uint row = gid;
-    if (row >= num_tokens) return;
+    if (row >= num_active_tokens) return;
 
     const uint hidden_dim_vec = hidden_dim / 4;
     float acc = 0.0f;
@@ -198,7 +198,7 @@ kernel void residual_add_capture_rms_norm_bf16_vec4(
     device bfloat4* residual_output [[buffer(3)]],
     device bfloat4* capture_output [[buffer(4)]],
     device bfloat4* norm_output [[buffer(5)]],
-    constant uint& num_tokens [[buffer(6)]],
+    constant uint& num_active_tokens [[buffer(6)]],
     constant uint& hidden_dim [[buffer(7)]],
     constant uint& capture_num_columns_vec [[buffer(8)]],
     constant uint& capture_column_start_vec [[buffer(9)]],
@@ -210,7 +210,7 @@ kernel void residual_add_capture_rms_norm_bf16_vec4(
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
     const uint row = gid;
-    if (row >= num_tokens) return;
+    if (row >= num_active_tokens) return;
 
     const uint hidden_dim_vec = hidden_dim / 4;
     float acc = 0.0f;

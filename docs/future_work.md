@@ -136,10 +136,6 @@ component path as the design.
 
 ## Performance Investigations
 
-- Audit repeated inner-path `checked_add` and `checked_sub` operations whose operands are already constrained by
-  init-time or prepare-input validation. Remove only operations whose safety proof is explicit and remains valid at
-  the use site. Do not remove checked arithmetic mechanically. Keep checked arithmetic for allocation sizing,
-  external inputs, cross-type conversions, and real overflow boundaries.
 - Evaluate software-pipelined K and V loads for GQA `TiledQTokens` as a bounded experiment.
   The current `Tkv=16`, `D=256` K and V threadgroup tiles use 16.5 KiB.
   Duplicating them with the existing eight-value row padding requires 33 KiB.

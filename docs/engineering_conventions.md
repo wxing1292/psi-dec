@@ -260,8 +260,32 @@ They must not derive capacity from the current batch.
 Logical structure has priority. Stable component identity and explicit data-type or tuning choices are not redundant.
 Meaningful resource views are also not redundant because one model uses one value.
 
+Use transferable symmetry across peer components. Use the same owner boundary, API vocabulary, and structure when the
+contracts match. Symmetry does not require identical lifecycle operations or zero duplication. Do not add a type, trait,
+wrapper, field, or operation only to create visual symmetry.
+
 Remove a wrapper only when it forwards one-to-one. The wrapper must own no independent lifetime, slice, resource, or
 semantic branch.
+
+### Validation and arithmetic
+
+Validate external inputs and maximum capacities at the owner boundary. Use ordinary arithmetic in the same owner's
+private path when this validation proves the result at each later use site. Do not repeat the same checked operation at
+each use site.
+
+Keep checked arithmetic at these boundaries:
+
+- Allocation and buffer sizing
+- Runtime-supplied counts, indices, IDs, and capacities
+- File and snapshot offsets or lengths
+- Narrowing or target-width-dependent conversions
+- Shader count and element-index domains
+- Real overflow boundaries
+- State-version conversion and shift semantics
+
+Use direct casts for conversions that are lossless on all supported targets. For example, Apple Metal code can use
+`u32 as u64` and `usize as u64`. Do not remove a checked operation only because a different owner validated a related
+value. Use `debug_assert!` for a repeated private bound after an initialization or prepare boundary proves it.
 
 ## Replay and asynchronous resource safety
 
@@ -276,6 +300,12 @@ Replay keys contain only facts that change these items:
 A reusable leaf component must expose its topology identity and topology boundaries for each bucketed work domain. The
 owner of a composite replay stage must union the boundaries from all participating leaf components before it selects a
 capacity. A component-local policy is not the final policy for a larger replay stage.
+
+The semantic replay-stage owner must construct and apply the final `ReplayBucketPolicy`. Model-specific callers must
+request a prepared replay shape from that owner. They must not duplicate a bucket-selection algorithm.
+
+Validate all invariants that are necessary for safe replay reuse before the cache lookup. Key derivation can perform
+this validation. An assertion that runs only while a program records does not protect a cache hit.
 
 Replay bucket capacities are an explicit exception to the default half-open interval convention. Each stored bucket is
 a positive inclusive upper capacity. A topology boundary `b` is the exclusive upper boundary of the preceding topology.

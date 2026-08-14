@@ -35,9 +35,6 @@ impl Device {
     }
 
     pub fn max_buffer_length(&self) -> u64 {
-        self.as_raw()
-            .maxBufferLength()
-            .try_into()
-            .expect("MTLDevice maxBufferLength must fit u64")
+        self.as_raw().maxBufferLength() as u64
     }
 }

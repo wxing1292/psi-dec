@@ -30,6 +30,12 @@ When changing GQA, Gated DeltaNet, dense MLP, MoE, sampling, or MTP source layou
 - Use `panic!`, `assert!`, and `debug_assert!` for internal invariant or contract violations. Use release `assert!` only at init-time, one-time structural or ownership boundaries, or contracts whose enforcement is absolutely necessary in release. Repeated internal bug checks that would add release hot-path noise belong in `debug_assert!`; cover them with tests and debug builds. Classify by lifecycle and cost instead of converting checks mechanically.
 - Use the shared typed `Error` for recoverable failures, choosing the variant by caller-visible semantics. Internal invariant violations remain assertions or panics.
 - Do not use `pub(crate)` or `pub(super)`. Keep items private unless intentionally exported with `pub`.
+- Prefer transferable symmetry across peer components. Use the same owner boundaries, API vocabulary, and structure when
+  the contracts match. Zero duplication is not a goal. Do not add a type, trait, wrapper, field, or lifecycle operation
+  only to create visual symmetry.
+- Validate external input and configuration limits at the owning boundary. Use ordinary arithmetic and direct lossless
+  casts in the same owner's private path after that boundary proves the result. Keep checked arithmetic at real runtime,
+  allocation, file, snapshot, narrowing, shader-domain, and state-version boundaries.
 - When working with Rust, use rust-analyzer semantic operations whenever applicable: definition/reference lookup, type and diagnostic inspection, rename, and refactoring. Prefer them over textual heuristics for symbol identity and bindings; use `rg` for textual discovery, not as a substitute for semantic analysis. Rename each binding or item independently when the same spelling appears in multiple scopes. Rust-analyzer does not cover Metal, generated source strings, docs, inactive configurations, or host↔shader ABI correspondence, so audit those boundaries separately and still check for shadowing, stale references, and semantic-equivalence regressions.
 - Run Rust formatting as `cargo +nightly fmt`.
 - Do not reshape production `src` only to make benchmarks easier.

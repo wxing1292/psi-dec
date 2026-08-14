@@ -56,7 +56,7 @@ impl Buffer {
     {
         let num_elements = to_u64(num_elements, "buffer element count must fit u64");
         let len_bytes = num_elements
-            .checked_mul(dtype.item_size().try_into().expect("dtype item size must fit u64"))
+            .checked_mul(dtype.item_size() as u64)
             .expect("buffer element byte length must fit u64");
         Self::new_zeroed(device, len_bytes)
     }
@@ -123,9 +123,8 @@ impl Buffer {
     #[track_caller]
     pub fn from_slice<T: MetalBufferElement>(device: &Device, values: &[T]) -> Self {
         assert!(!values.is_empty());
-        let len_bytes = u64::try_from(values.len())
-            .expect("buffer element count must fit u64")
-            .checked_mul(T::DTYPE.item_size().try_into().expect("dtype item size must fit u64"))
+        let len_bytes = (values.len() as u64)
+            .checked_mul(T::DTYPE.item_size() as u64)
             .expect("buffer byte length must fit u64");
         let buffer = Self::new_uninit(device, len_bytes);
         buffer.write_typed(0, values);

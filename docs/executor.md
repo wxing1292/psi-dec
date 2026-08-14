@@ -86,6 +86,7 @@ crates/inference-backend-metal/src/
   metal          reusable Metal device/buffer/kernel/stream/replay runtime
   operators      recordable backend operations without model semantics
   components     reusable GQA, GDN, MLP, sampling, norm, embedding, and page-I/O kernels
+  **/*_test.rs   longer unit-test suites for the adjacent production owner
 ```
 
 For exact files and current paths, use the component documents:
@@ -371,6 +372,27 @@ Recommendation: Use the narrowest production owner that can express the invarian
 - Backend tests prove shader build, dispatch, ABI, and parity.
 - Executor component tests prove real metadata, state, and scratch ownership.
 - Layer and end-to-end tests prove composition and lifecycle.
+
+Component unit tests use the same classification model across attention, MLP, sampling, and model I/O. They do not
+force the same lifecycle on components that have different ownership contracts.
+
+- GDN metadata tests exercise exact, bucketed, and caller-owned token-capacity APIs with one active request set.
+- GDN state tests exercise mixed commit modes, MTP state-version shifts, deferred publish, restore, and selective reset.
+- GQA metadata tests exercise single-query and tiled-query paths with exact, bucketed, and caller-owned capacity APIs.
+- GQA page-table tests exercise selected state I/O and selective reset without reproducing KV-kernel math.
+- MoE component tests protect compute-path selection. Metal execution tests cover the optional shared-expert path.
+- Sampling tests protect mixed request configurations and Target and Draft runtime-parameter domains.
+- Rejection tests protect mixed ragged requests, zero-draft requests, prepared inputs, and result prefixes.
+- Dense MLP and basic Embed have no component test when a lower numerical test or a higher integration test owns the
+  contract.
+- Qwen3.5 MTP Embed keeps one component test for its two input branches, gather indices, and stage-local inactive tails.
+- Unembed tests protect caller-visible format validation. Metal tests protect numerical and inactive-region behavior.
+
+Do not add a component test only for replay keys, replay arguments, replay capacity identities, or record wiring. These
+values are implementation details unless an external owner consumes them as a semantic contract.
+
+Keep CPU-reference tests in `inference-executor-core`. Keep Metal parity, ABI, padding, and canary tests in their Metal
+owner. Keep lifecycle scenarios independent of both layers.
 
 Do not reshape production source for test construction. Do not add naming-only tests. Run Metal tests serially.
 
