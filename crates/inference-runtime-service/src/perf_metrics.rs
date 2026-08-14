@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use inference_executor_core::model::ModelOutputTiming;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
 use inference_runtime_core::compute::QueryTokens;
@@ -9,59 +8,33 @@ use serde_json::json;
 
 #[derive(Clone, Debug)]
 pub struct ExecutorBatchPerfMetrics {
-    pub sampled_rows: usize,
-    pub model_output_timing: Option<ModelOutputTiming>,
-    pub total_elapsed: Duration,
-    pub prepare_batch_elapsed: Duration,
-    pub input_elapsed: Duration,
-    pub model_elapsed: Duration,
-    pub output_elapsed: Duration,
-    pub commit_batch_elapsed: Duration,
+    pub main_elapsed: Duration,
+    pub spec_elapsed: Duration,
+    pub spec_passes: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct BatchRequestSummary {
     pub num_reqs: usize,
-    pub prefill_reqs: usize,
-    pub decode_reqs: usize,
-    pub query_tokens: usize,
-    pub max_query_tokens: usize,
-    pub spec_decode_reqs: usize,
-    pub input_spec_tokens: usize,
+    pub num_input_tokens: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct BatchResponseSummary {
-    pub accepted_spec_tokens: usize,
-    pub sampled_tokens: usize,
-    pub output_spec_tokens: usize,
+    pub num_spec_tokens: usize,
+    pub num_verified_tokens: usize,
+    pub num_spec_token_by_index: Vec<usize>,
+    pub num_verified_token_by_index: Vec<usize>,
 }
 
 pub fn summarize_batch_device_request(batch: &BatchDeviceRequest) -> BatchRequestSummary {
     let mut summary = BatchRequestSummary {
         num_reqs: batch.dev_reqs.len(),
-        prefill_reqs: 0,
-        decode_reqs: 0,
-        query_tokens: 0,
-        max_query_tokens: 0,
-        spec_decode_reqs: 0,
-        input_spec_tokens: 0,
+        num_input_tokens: 0,
     };
 
     for request in &batch.dev_reqs {
-        let tokens = request.decoder_query_tokens.token_consumption();
-        summary.query_tokens += tokens;
-        summary.max_query_tokens = summary.max_query_tokens.max(tokens);
-        match &request.decoder_query_tokens {
-            QueryTokens::Prefill { .. } => summary.prefill_reqs += 1,
-            QueryTokens::Decode { spec_tokens, .. } => {
-                summary.decode_reqs += 1;
-                if !spec_tokens.is_empty() {
-                    summary.spec_decode_reqs += 1;
-                    summary.input_spec_tokens += spec_tokens.len();
-                }
-            },
-        }
+        summary.num_input_tokens += request.decoder_query_tokens.token_consumption();
     }
 
     summary
@@ -69,21 +42,40 @@ pub fn summarize_batch_device_request(batch: &BatchDeviceRequest) -> BatchReques
 
 pub fn summarize_batch_device_response(batch: &BatchDeviceResponse) -> BatchResponseSummary {
     let mut summary = BatchResponseSummary {
-        accepted_spec_tokens: 0,
-        sampled_tokens: 0,
-        output_spec_tokens: 0,
+        num_spec_tokens: 0,
+        num_verified_tokens: 0,
+        num_spec_token_by_index: Vec::new(),
+        num_verified_token_by_index: Vec::new(),
     };
 
     for response in &batch.dev_resps {
-        if let SampledTokens::Decode {
-            validated_tokens,
-            spec_tokens,
-            ..
-        } = &response.sampled_tokens
+        if let (QueryTokens::Decode { spec_tokens, .. }, SampledTokens::Decode { validated_tokens, .. }) =
+            (&response.query_tokens, &response.sampled_tokens)
         {
-            summary.accepted_spec_tokens += validated_tokens.len();
-            summary.sampled_tokens += response.sampled_tokens.num_validated_sampled_tokens();
-            summary.output_spec_tokens += spec_tokens.len();
+            let num_spec_tokens = spec_tokens.len();
+            let num_verified_tokens = validated_tokens.len();
+            debug_assert!(
+                num_verified_tokens <= num_spec_tokens,
+                "executor response cannot verify more speculative tokens than the request provides"
+            );
+
+            summary.num_spec_tokens += num_spec_tokens;
+            summary.num_verified_tokens += num_verified_tokens;
+            summary
+                .num_spec_token_by_index
+                .resize(summary.num_spec_token_by_index.len().max(num_spec_tokens), 0);
+            summary
+                .num_verified_token_by_index
+                .resize(summary.num_verified_token_by_index.len().max(num_spec_tokens), 0);
+            for spec_token_index in 0..num_spec_tokens {
+                if spec_token_index > num_verified_tokens {
+                    break;
+                }
+                summary.num_spec_token_by_index[spec_token_index] += 1;
+                if spec_token_index < num_verified_tokens {
+                    summary.num_verified_token_by_index[spec_token_index] += 1;
+                }
+            }
         }
     }
 
@@ -182,21 +174,17 @@ fn percentile_ms(values: &[Duration], percentile: f64) -> Option<f64> {
 mod tests {
     use std::time::Duration;
 
-    use inference_runtime_core::compute::BatchDeviceRequest;
     use inference_runtime_core::compute::BatchDeviceResponse;
-    use inference_runtime_core::compute::DecoderSyncBlocks;
-    use inference_runtime_core::compute::DeviceRequest;
     use inference_runtime_core::compute::DeviceResponse;
     use inference_runtime_core::compute::QueryTokens;
     use inference_runtime_core::compute::SampledTokens;
-    use inference_runtime_core::config::SamplingConfig;
     use inference_runtime_core::runtime::Token;
     use ordered_float::NotNan;
 
     use super::*;
 
     #[test]
-    fn percentile_uses_nearest_rank_index() {
+    fn test_percentile_uses_nearest_rank_index() {
         let values = [1, 2, 3, 4, 5]
             .into_iter()
             .map(Duration::from_millis)
@@ -207,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn json_contains_core_decode_fields() {
+    fn test_json_contains_core_decode_fields() {
         let metrics = DecodePerfMetrics {
             request_id: 7,
             input_tokens: 3,
@@ -228,52 +216,44 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_spec_acceptance_fields() {
-        let request = BatchDeviceRequest::new(
-            0,
-            [DeviceRequest::new(
-                7,
-                0,
-                QueryTokens::Decode {
-                    epoch: 0,
-                    token_index: 3,
-                    tokens: vec![Token::new(10)],
-                    spec_tokens: vec![Token::new(11), Token::new(12)],
-                },
-                DecoderSyncBlocks::new(0, vec![], vec![]),
-                SamplingConfig::default(),
-            )],
-        );
+    fn test_summarizes_conditional_spec_acceptance_by_index() {
         let response = BatchDeviceResponse::new(
             0,
-            [DeviceResponse {
-                req_id: 7,
-                query_tokens: QueryTokens::Decode {
-                    epoch: 0,
-                    token_index: 3,
-                    tokens: vec![Token::new(10)],
-                    spec_tokens: vec![Token::new(11), Token::new(12)],
-                },
-                sampled_tokens: SampledTokens::Decode {
-                    epoch: 0,
-                    validated_tokens: vec![Token::new(11)],
-                    validated_probs: vec![NotNan::new(0.9).unwrap()],
-                    sampled_token: Token::new(13),
-                    sampled_prob: NotNan::new(0.8).unwrap(),
-                    spec_tokens: vec![Token::new(14), Token::new(15)],
-                    spec_probs: vec![NotNan::new(0.6).unwrap(), NotNan::new(0.7).unwrap()],
-                    spec_confidences: vec![NotNan::new(1.0).unwrap(), NotNan::new(1.0).unwrap()],
-                },
-            }],
+            [
+                new_decode_response(7, &[11, 12, 13], 3),
+                new_decode_response(8, &[21, 22], 1),
+                new_decode_response(9, &[31, 32, 33], 0),
+            ],
         );
-
-        let request_summary = summarize_batch_device_request(&request);
         let response_summary = summarize_batch_device_response(&response);
 
-        assert_eq!(request_summary.spec_decode_reqs, 1);
-        assert_eq!(request_summary.input_spec_tokens, 2);
-        assert_eq!(response_summary.accepted_spec_tokens, 1);
-        assert_eq!(response_summary.sampled_tokens, 2);
-        assert_eq!(response_summary.output_spec_tokens, 2);
+        assert_eq!(response_summary.num_spec_tokens, 8);
+        assert_eq!(response_summary.num_verified_tokens, 4);
+        assert_eq!(response_summary.num_spec_token_by_index, vec![3, 2, 1]);
+        assert_eq!(response_summary.num_verified_token_by_index, vec![2, 1, 1]);
+    }
+
+    fn new_decode_response(req_id: usize, spec_token_ids: &[u32], num_verified_tokens: usize) -> DeviceResponse {
+        assert!(num_verified_tokens <= spec_token_ids.len());
+        let spec_tokens = spec_token_ids.iter().copied().map(Token::new).collect::<Vec<_>>();
+        DeviceResponse {
+            req_id,
+            query_tokens: QueryTokens::Decode {
+                epoch: 0,
+                token_index: 0,
+                tokens: vec![Token::new(10)],
+                spec_tokens: spec_tokens.clone(),
+            },
+            sampled_tokens: SampledTokens::Decode {
+                epoch: 0,
+                validated_tokens: spec_tokens[..num_verified_tokens].to_vec(),
+                validated_probs: vec![NotNan::new(0.9).unwrap(); num_verified_tokens],
+                sampled_token: Token::new(99),
+                sampled_prob: NotNan::new(0.8).unwrap(),
+                spec_tokens: Vec::new(),
+                spec_probs: Vec::new(),
+                spec_confidences: Vec::new(),
+            },
+        }
     }
 }

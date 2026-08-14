@@ -40,6 +40,7 @@ impl TelemetryConfig {
         init_tracing(profiling_requested, self.debug_logging);
 
         tracing::info!(
+            component = "telemetry",
             profile_mode = ?self.profiling.mode,
             profile_enabled = self.profiling.is_requested(),
             profile_summary_every_batches = self.profiling.summary_every,
@@ -98,109 +99,54 @@ fn four_decimal(value: f64) -> impl Display {
     FourDecimal(value)
 }
 
+struct FourDecimalList<'a>(&'a [f64]);
+
+impl Display for FourDecimalList<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "[")?;
+        for (index, value) in self.0.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+            write!(formatter, "{value:.4}")?;
+        }
+        write!(formatter, "]")
+    }
+}
+
 pub fn emit_executor_batch_perf_metrics(
-    debug_logging: bool,
     model_name: &str,
+    model_mode: &str,
     batch_seq: u64,
     batch_summary: BatchRequestSummary,
     response_summary: BatchResponseSummary,
     metrics: ExecutorBatchPerfMetrics,
 ) {
-    if debug_logging {
-        emit_executor_batch_perf_debug(model_name, batch_seq, &batch_summary, &response_summary, &metrics);
-    } else {
-        emit_executor_batch_perf_info(model_name, batch_seq, &batch_summary, &response_summary, &metrics);
-    }
-}
-
-fn emit_executor_batch_perf_info(
-    model_name: &str,
-    batch_seq: u64,
-    batch_summary: &BatchRequestSummary,
-    response_summary: &BatchResponseSummary,
-    metrics: &ExecutorBatchPerfMetrics,
-) {
-    let acceptance_rate = ratio(response_summary.accepted_spec_tokens, batch_summary.input_spec_tokens);
+    let acceptance_rate = ratio(response_summary.num_verified_tokens, response_summary.num_spec_tokens);
+    let acceptance_rate_by_index = response_summary
+        .num_verified_token_by_index
+        .iter()
+        .zip(&response_summary.num_spec_token_by_index)
+        .map(|(&verified, &spec)| ratio(verified, spec))
+        .collect::<Vec<_>>();
     tracing::info!(
         target: "inference-runtime-service::perf",
+        component = "executor",
         phase = "executor.batch.perf",
         model = model_name,
+        model_mode,
         batch_seq,
         num_reqs = batch_summary.num_reqs,
-        num_tokens = batch_summary.query_tokens,
-        num_spec_tokens = batch_summary.input_spec_tokens,
-        num_accepted_tokens = response_summary.accepted_spec_tokens,
-        num_sampled_tokens = response_summary.sampled_tokens,
+        num_input_tokens = batch_summary.num_input_tokens,
+        num_spec_tokens = response_summary.num_spec_tokens,
+        num_verified_tokens = response_summary.num_verified_tokens,
         acceptance_rate = %four_decimal(acceptance_rate),
-        latency_ms = %four_decimal(ms(metrics.total_elapsed)),
-        "executor batch perf"
-    );
-}
-
-fn emit_executor_batch_perf_debug(
-    model_name: &str,
-    batch_seq: u64,
-    batch_summary: &BatchRequestSummary,
-    response_summary: &BatchResponseSummary,
-    metrics: &ExecutorBatchPerfMetrics,
-) {
-    let rejected_spec_tokens = batch_summary
-        .input_spec_tokens
-        .saturating_sub(response_summary.accepted_spec_tokens);
-    let acceptance_rate = ratio(response_summary.accepted_spec_tokens, batch_summary.input_spec_tokens);
-    let rejection_rate = ratio(rejected_spec_tokens, batch_summary.input_spec_tokens);
-
-    tracing::debug!(
-        target: "inference-runtime-service::perf",
-        phase = "executor.batch.perf",
-        model = model_name,
-        batch_seq,
-        num_reqs = batch_summary.num_reqs,
-        num_tokens = batch_summary.query_tokens,
-        num_spec_tokens = batch_summary.input_spec_tokens,
-        num_accepted_tokens = response_summary.accepted_spec_tokens,
-        num_sampled_tokens = response_summary.sampled_tokens,
-        acceptance_rate = %four_decimal(acceptance_rate),
-        latency_ms = %four_decimal(ms(metrics.total_elapsed)),
-        num_prefill_reqs = batch_summary.prefill_reqs,
-        num_decode_reqs = batch_summary.decode_reqs,
-        max_num_tokens = batch_summary.max_query_tokens,
-        num_spec_reqs = batch_summary.spec_decode_reqs,
-        num_rejected_tokens = rejected_spec_tokens,
-        num_output_spec_tokens = response_summary.output_spec_tokens,
-        rejection_rate = %four_decimal(rejection_rate),
-        sampled_rows = metrics.sampled_rows,
-        model_output_main_replay_ms = metrics
-            .model_output_timing
-            .map(|timing| tracing::field::display(four_decimal(ms(timing.main_replay_elapsed)))),
-        model_output_main_sample_replay_ms =
-            metrics.model_output_timing.map(|timing| {
-                tracing::field::display(four_decimal(ms(timing.main_sample_replay_elapsed)))
-            }),
-        model_output_sample_read_ms = metrics
-            .model_output_timing
-            .map(|timing| tracing::field::display(four_decimal(ms(timing.sample_read_elapsed)))),
-        model_output_rejection_build_ms = metrics
-            .model_output_timing
-            .map(|timing| tracing::field::display(four_decimal(ms(timing.rejection_build_elapsed)))),
-        model_output_rejection_read_ms = metrics
-            .model_output_timing
-            .map(|timing| tracing::field::display(four_decimal(ms(timing.rejection_read_elapsed)))),
-        model_output_spec_build_ms = metrics
-            .model_output_timing
-            .map(|timing| tracing::field::display(four_decimal(ms(timing.spec_build_elapsed)))),
-        model_output_spec_replay_ms = metrics
-            .model_output_timing
-            .map(|timing| tracing::field::display(four_decimal(ms(timing.spec_replay_elapsed)))),
-        model_output_spec_read_ms = metrics
-            .model_output_timing
-            .map(|timing| tracing::field::display(four_decimal(ms(timing.spec_read_elapsed)))),
-        model_output_spec_passes = metrics.model_output_timing.map(|timing| timing.spec_passes),
-        prepare_batch_ms = %four_decimal(ms(metrics.prepare_batch_elapsed)),
-        input_ms = %four_decimal(ms(metrics.input_elapsed)),
-        model_ms = %four_decimal(ms(metrics.model_elapsed)),
-        output_ms = %four_decimal(ms(metrics.output_elapsed)),
-        commit_batch_ms = %four_decimal(ms(metrics.commit_batch_elapsed)),
+        num_spec_token_by_index = ?response_summary.num_spec_token_by_index,
+        num_verified_token_by_index = ?response_summary.num_verified_token_by_index,
+        acceptance_rate_by_index = %FourDecimalList(&acceptance_rate_by_index),
+        main_ms = %four_decimal(ms(metrics.main_elapsed)),
+        spec_ms = %four_decimal(ms(metrics.spec_elapsed)),
+        spec_passes = metrics.spec_passes,
         "executor batch perf"
     );
 }
@@ -244,8 +190,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn four_decimal_pads_and_rounds() {
+    fn test_four_decimal_formats_scalars_and_lists() {
         assert_eq!(four_decimal(1.0).to_string(), "1.0000");
         assert_eq!(four_decimal(2.0 / 7.0).to_string(), "0.2857");
+        assert_eq!(FourDecimalList(&[0.75, 2.0 / 3.0]).to_string(), "[0.7500, 0.6667]");
     }
 }

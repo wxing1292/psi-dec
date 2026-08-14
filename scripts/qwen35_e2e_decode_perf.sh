@@ -728,7 +728,7 @@ baseline_metrics() {
 }
 
 baseline_trajectory() {
-    # Fields: input tokens, sampled tokens, chunks, proposed speculative tokens, accepted speculative tokens.
+    # Fields: input tokens, sampled tokens, chunks, proposed speculative tokens, verified speculative tokens.
     case "$1:$2:$3" in
     apple_m3_max_40_gpu_cores:27b_off:256) echo "34,256,256,0,0" ;;
     apple_m3_max_40_gpu_cores:27b_off:384) echo "34,384,384,0,0" ;;
@@ -803,18 +803,40 @@ with open(os.environ["SERVER_LOG"], "rb") as f:
     server_log = f.read().decode("utf-8", errors="replace")
 server_log = re.sub(r"\x1b\[[0-9;]*m", "", server_log)
 proposed = 0
-accepted = 0
+verified = 0
+spec_by_index = []
+verified_by_index = []
+
+def add_counts(total, values):
+    total.extend([0] * (len(values) - len(total)))
+    for index, value in enumerate(values):
+        total[index] += value
+
+def index_counts(line, field):
+    match = re.search(rf"{field}=\[([^]]*)\]", line)
+    if not match or not match.group(1).strip():
+        return []
+    return [int(value.strip()) for value in match.group(1).split(",")]
+
 for line in server_log.splitlines():
     if 'phase="executor.batch.perf"' not in line:
         continue
     proposed_match = re.search(r"num_spec_tokens=(\d+)", line)
-    accepted_match = re.search(r"num_accepted_tokens=(\d+)", line)
-    if proposed_match and accepted_match:
+    verified_match = re.search(r"num_verified_tokens=(\d+)", line)
+    if proposed_match and verified_match:
         proposed += int(proposed_match.group(1))
-        accepted += int(accepted_match.group(1))
-acceptance_rate = accepted / proposed if proposed else 0.0
+        verified += int(verified_match.group(1))
+        add_counts(spec_by_index, index_counts(line, "num_spec_token_by_index"))
+        add_counts(verified_by_index, index_counts(line, "num_verified_token_by_index"))
+acceptance_rate = verified / proposed if proposed else 0.0
+acceptance_rate_by_index = [
+    verified_count / spec_count if spec_count else 0.0
+    for spec_count, verified_count in zip(spec_by_index, verified_by_index)
+]
 tokens_per_chunk = j["sampled_tokens"] / j["chunk_count"]
-print("{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f}".format(
+encode_counts = lambda values: ":".join(str(value) for value in values) or "-"
+encode_rates = lambda values: ":".join(f"{value:.6f}" for value in values) or "-"
+print("{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f},{},{},{}".format(
     j["decode_tokens_per_s"],
     j["chunk_count"],
     j["sampled_tokens"],
@@ -824,9 +846,12 @@ print("{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f}".format(
     j["inter_chunk_p50_ms"],
     j["inter_chunk_p95_ms"],
     proposed,
-    accepted,
+    verified,
     acceptance_rate,
     tokens_per_chunk,
+    encode_counts(spec_by_index),
+    encode_counts(verified_by_index),
+    encode_rates(acceptance_rate_by_index),
 ))
 PY
         echo "DECODE_STATS_INVALID label=$label max_new=$tokens run=$run client_output=$out server_log=$server_log" >&2
@@ -865,18 +890,22 @@ run_server_case() {
         local inter_chunk_p50s=""
         local inter_chunk_p95s=""
         local proposed_specs=""
-        local accepted_specs=""
+        local verified_specs=""
         local acceptance_rates=""
         local tokens_per_chunks=""
+        local spec_by_index=""
+        local verified_by_index=""
         for run in $(seq 1 "$RUNS"); do
             local parsed tokps chunk sampled input_tokens ttft prompt_rate
-            local inter_chunk_p50 inter_chunk_p95 proposed_spec accepted_spec
+            local inter_chunk_p50 inter_chunk_p95 proposed_spec verified_spec
             local acceptance_rate tokens_per_chunk
+            local run_spec_by_index run_verified_by_index acceptance_rate_by_index
             parsed=$(run_decode "$label" "$tokens" "$run" "$log" "$tokenizer")
             IFS=, read -r \
                 tokps chunk sampled input_tokens ttft prompt_rate \
-                inter_chunk_p50 inter_chunk_p95 proposed_spec accepted_spec \
-                acceptance_rate tokens_per_chunk <<<"$parsed"
+                inter_chunk_p50 inter_chunk_p95 proposed_spec verified_spec \
+                acceptance_rate tokens_per_chunk run_spec_by_index \
+                run_verified_by_index acceptance_rate_by_index <<<"$parsed"
             vals="$vals $tokps"
             inputs="$inputs $input_tokens"
             chunks="$chunks $chunk"
@@ -886,13 +915,16 @@ run_server_case() {
             inter_chunk_p50s="$inter_chunk_p50s $inter_chunk_p50"
             inter_chunk_p95s="$inter_chunk_p95s $inter_chunk_p95"
             proposed_specs="$proposed_specs $proposed_spec"
-            accepted_specs="$accepted_specs $accepted_spec"
+            verified_specs="$verified_specs $verified_spec"
             acceptance_rates="$acceptance_rates $acceptance_rate"
             tokens_per_chunks="$tokens_per_chunks $tokens_per_chunk"
+            spec_by_index="$spec_by_index $run_spec_by_index"
+            verified_by_index="$verified_by_index $run_verified_by_index"
             echo "RUN label=$label max_new=$tokens run=$run" \
                 "input_tokens=$input_tokens sampled=$sampled chunks=$chunk" \
-                "proposed_spec=$proposed_spec accepted_spec=$accepted_spec" \
-                "acceptance_rate=$acceptance_rate tokens_per_chunk=$tokens_per_chunk" \
+                "proposed_spec=$proposed_spec verified_spec=$verified_spec" \
+                "acceptance_rate=$acceptance_rate acceptance_rate_by_index=$acceptance_rate_by_index" \
+                "tokens_per_chunk=$tokens_per_chunk" \
                 "decode_tok_s=$tokps ttft_ms=$ttft prompt_tok_s=$prompt_rate" \
                 "inter_chunk_p50_ms=$inter_chunk_p50 inter_chunk_p95_ms=$inter_chunk_p95"
         done
@@ -905,7 +937,7 @@ run_server_case() {
         local baseline_sampled=""
         local baseline_chunks=""
         local baseline_proposed_spec=""
-        local baseline_accepted_spec=""
+        local baseline_verified_spec=""
         local baseline_status="disabled"
         local baseline_mismatch=""
         if [[ "$BASELINE" -eq 1 ]]; then
@@ -914,7 +946,7 @@ run_server_case() {
                 <<<"$(baseline_metrics "$MACHINE" "$label" "$tokens" || true)"
             IFS=, read -r \
                 baseline_input_tokens baseline_sampled baseline_chunks \
-                baseline_proposed_spec baseline_accepted_spec \
+                baseline_proposed_spec baseline_verified_spec \
                 <<<"$(baseline_trajectory "$MACHINE" "$label" "$tokens" || true)"
             if [[ -z "$baseline_decode" ]]; then
                 baseline_status="no-hardware-baseline"
@@ -938,9 +970,11 @@ run_server_case() {
             INTER_CHUNK_P50S="$inter_chunk_p50s" \
             INTER_CHUNK_P95S="$inter_chunk_p95s" \
             PROPOSED_SPECS="$proposed_specs" \
-            ACCEPTED_SPECS="$accepted_specs" \
+            VERIFIED_SPECS="$verified_specs" \
             ACCEPTANCE_RATES="$acceptance_rates" \
             TOKENS_PER_CHUNKS="$tokens_per_chunks" \
+            SPEC_BY_INDEX="$spec_by_index" \
+            VERIFIED_BY_INDEX="$verified_by_index" \
             LABEL="$label" \
             TOKENS="$tokens" \
             BASELINE_DECODE="$baseline_decode" \
@@ -951,7 +985,7 @@ run_server_case() {
             BASELINE_SAMPLED="$baseline_sampled" \
             BASELINE_CHUNKS="$baseline_chunks" \
             BASELINE_PROPOSED_SPEC="$baseline_proposed_spec" \
-            BASELINE_ACCEPTED_SPEC="$baseline_accepted_spec" \
+            BASELINE_VERIFIED_SPEC="$baseline_verified_spec" \
             BASELINE_STATUS="$baseline_status" \
             BASELINE_MISMATCH="$baseline_mismatch" \
             python3 - <<'PY'
@@ -967,9 +1001,28 @@ prompt_rates = [float(x) for x in os.environ["PROMPT_RATES"].split()]
 inter_chunk_p50s = [float(x) for x in os.environ["INTER_CHUNK_P50S"].split()]
 inter_chunk_p95s = [float(x) for x in os.environ["INTER_CHUNK_P95S"].split()]
 proposed_specs = os.environ["PROPOSED_SPECS"].split()
-accepted_specs = os.environ["ACCEPTED_SPECS"].split()
+verified_specs = os.environ["VERIFIED_SPECS"].split()
 acceptance_rates = [float(x) for x in os.environ["ACCEPTANCE_RATES"].split()]
 tokens_per_chunks = [float(x) for x in os.environ["TOKENS_PER_CHUNKS"].split()]
+
+def sum_index_counts(name):
+    totals = []
+    for encoded in os.environ[name].split():
+        values = [] if encoded == "-" else [int(value) for value in encoded.split(":")]
+        totals.extend([0] * (len(values) - len(totals)))
+        for index, value in enumerate(values):
+            totals[index] += value
+    return totals
+
+spec_by_index = sum_index_counts("SPEC_BY_INDEX")
+verified_by_index = sum_index_counts("VERIFIED_BY_INDEX")
+acceptance_rate_by_index = [
+    verified / spec if spec else 0.0
+    for spec, verified in zip(spec_by_index, verified_by_index)
+]
+acceptance_rate_by_index_text = "[{}]".format(
+    ",".join(f"{value:.6f}" for value in acceptance_rate_by_index)
+)
 median_decode = statistics.median(vals)
 median_ttft = statistics.median(ttfts)
 median_prompt_rate = statistics.median(prompt_rates)
@@ -986,7 +1039,7 @@ prefix = (
     "SUMMARY label={} max_new={} median_decode_tok_s={:.3f} median_ttft_ms={:.3f} "
     "median_prompt_tok_s={:.3f} median_inter_chunk_p50_ms={:.3f} "
     "median_inter_chunk_p95_ms={:.3f} median_tokens_per_chunk={:.3f} "
-    "median_acceptance_rate={}"
+    "median_acceptance_rate={} acceptance_rate_by_index={}"
 ).format(
     os.environ["LABEL"],
     os.environ["TOKENS"],
@@ -997,6 +1050,7 @@ prefix = (
     median_inter_chunk_p95,
     median_tokens_per_chunk,
     acceptance_rate_text,
+    acceptance_rate_by_index_text,
 )
 baseline_decode = os.environ.get("BASELINE_DECODE", "")
 baseline_status = os.environ["BASELINE_STATUS"]
@@ -1004,13 +1058,13 @@ baseline_input_tokens = os.environ.get("BASELINE_INPUT_TOKENS", "")
 baseline_sampled = os.environ.get("BASELINE_SAMPLED", "")
 baseline_chunks = os.environ.get("BASELINE_CHUNKS", "")
 baseline_proposed_spec = os.environ.get("BASELINE_PROPOSED_SPEC", "")
-baseline_accepted_spec = os.environ.get("BASELINE_ACCEPTED_SPEC", "")
+baseline_verified_spec = os.environ.get("BASELINE_VERIFIED_SPEC", "")
 if baseline_status == "comparable" and (
     any(input_tokens != baseline_input_tokens for input_tokens in inputs)
     or any(sample != baseline_sampled for sample in samples)
     or any(chunk != baseline_chunks for chunk in chunks)
     or any(proposed != baseline_proposed_spec for proposed in proposed_specs)
-    or any(accepted != baseline_accepted_spec for accepted in accepted_specs)
+    or any(verified != baseline_verified_spec for verified in verified_specs)
 ):
     baseline_status = "trajectory-mismatch"
     baseline_mismatch = "trajectory"
@@ -1054,7 +1108,7 @@ prefix += " baseline_status={}".format(baseline_status)
 if baseline_mismatch:
     prefix += " baseline_mismatch={}".format(baseline_mismatch)
 print(
-    "{} min_decode_tok_s={:.3f} max_decode_tok_s={:.3f} runs={} input_tokens={} samples={} chunks={} proposed_spec={} accepted_spec={}".format(
+    "{} min_decode_tok_s={:.3f} max_decode_tok_s={:.3f} runs={} input_tokens={} samples={} chunks={} proposed_spec={} verified_spec={}".format(
         prefix,
         min(vals),
         max(vals),
@@ -1063,7 +1117,7 @@ print(
         ",".join(samples),
         ",".join(chunks),
         ",".join(proposed_specs),
-        ",".join(accepted_specs),
+        ",".join(verified_specs),
     )
 )
 PY

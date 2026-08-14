@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use crossbeam_channel::Receiver;
@@ -37,7 +38,6 @@ pub struct ReplayableModelEventLoop<M> {
     model: M,
     model_state: ModelExecutorState,
     state_snapshot_path: PathBuf,
-    debug_logging: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,13 +68,7 @@ where
             model,
             model_state: ModelExecutorState::Started,
             state_snapshot_path,
-            debug_logging: false,
         }
-    }
-
-    pub fn with_debug_logging(mut self, enabled: bool) -> Self {
-        self.debug_logging = enabled;
-        self
     }
 
     pub fn event_loop(mut self) {
@@ -302,11 +296,11 @@ where
     }
 
     fn execute(&mut self, batch_req: BatchDeviceRequest) -> BatchDeviceResponse {
-        let total_start = Instant::now();
         let batch_seq = batch_req.seq;
         let batch_summary = summarize_batch_device_request(&batch_req);
         tracing::debug!(
             target: "inference-runtime-service::executor",
+            component = "executor",
             phase = "executor.batch.request",
             model = self.model.model_name(),
             batch_seq,
@@ -326,16 +320,14 @@ where
             return BatchDeviceResponse::new(batch_seq, Vec::new());
         }
 
-        let prepare_batch_start = Instant::now();
         let model_batch_req = {
             let _span = profiling::span("prepare_batch");
             self.model.prepare_batch(&batch_req)
         };
-        let prepare_batch_elapsed = prepare_batch_start.elapsed();
 
         let mut recorder = self.model.begin_ops_recording(&model_batch_req);
 
-        let input_start = Instant::now();
+        let main_start = Instant::now();
         let model_batch_hidden_req = {
             let _span = profiling::span("model.embed_main.record");
             if self.model.first_pp_stage(&model_batch_req) {
@@ -344,19 +336,15 @@ where
                 todo!("pipeline stages after the first must read hidden states from the batch request")
             }
         };
-        let input_elapsed = input_start.elapsed();
 
-        let model_start = Instant::now();
         let model_batch_hidden_resp = {
             let _span = profiling::span("model.forward_main.record");
             self.model
                 .forward_main(&mut recorder, &model_batch_req, model_batch_hidden_req)
         };
-        let model_elapsed = model_start.elapsed();
 
         let last_pp_stage = self.model.last_pp_stage(&model_batch_req);
 
-        let output_start = Instant::now();
         if last_pp_stage {
             let model_batch_resp = {
                 let _span = profiling::span("model.unembed_main.record");
@@ -383,8 +371,11 @@ where
         } else {
             self.model.empty_sampled_output()
         };
+        let main_elapsed = main_start.elapsed();
 
+        let mut spec_elapsed = Duration::ZERO;
         if last_pp_stage && self.model.run_spec(&model_batch_req, &sampled_output) {
+            let spec_start = Instant::now();
             let spec_batch_hidden_req = {
                 let _span = profiling::span("model.embed_spec.record");
                 self.model.embed_spec(
@@ -421,41 +412,37 @@ where
                 self.model
                     .read_spec(&recorder, &model_batch_req, sampled_output, spec_replay_elapsed)
             };
+            spec_elapsed = spec_start.elapsed();
         }
         drop(recorder);
-        let model_output_timing = self.model.sampled_output_timing(&sampled_output);
-        let sampled_rows_count = self.model.sampled_output_len(&sampled_output);
-        let output_elapsed = output_start.elapsed();
+        let spec_passes = self
+            .model
+            .sampled_output_timing(&sampled_output)
+            .map_or(0, |timing| timing.spec_passes);
 
-        let commit_batch_start = Instant::now();
         let batch_resp = {
             let _span = profiling::span("commit_batch");
             self.model.commit_batch(batch_req, sampled_output)
         };
-        let commit_batch_elapsed = commit_batch_start.elapsed();
         let response_summary = summarize_batch_device_response(&batch_resp);
         drop(_executor_batch_span);
 
         profiling::maybe_emit_tree_profile_summary("executor.batch", batch_seq);
         emit_executor_batch_perf_metrics(
-            self.debug_logging,
             self.model.model_name(),
+            self.model.model_mode(),
             batch_seq,
             batch_summary,
             response_summary,
             ExecutorBatchPerfMetrics {
-                sampled_rows: sampled_rows_count,
-                model_output_timing,
-                total_elapsed: total_start.elapsed(),
-                prepare_batch_elapsed,
-                input_elapsed,
-                model_elapsed,
-                output_elapsed,
-                commit_batch_elapsed,
+                main_elapsed,
+                spec_elapsed,
+                spec_passes,
             },
         );
         tracing::debug!(
             target: "inference-runtime-service::executor",
+            component = "executor",
             phase = "executor.batch.response",
             model = self.model.model_name(),
             batch_seq,
@@ -624,6 +611,10 @@ mod tests {
         type Submission = TestSubmission;
 
         fn model_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_mode(&self) -> &'static str {
             "test"
         }
 

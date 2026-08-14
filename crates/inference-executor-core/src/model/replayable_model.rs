@@ -23,6 +23,7 @@ pub trait ReplayableModel {
     type Submission: ExecutionSubmission;
 
     fn model_name(&self) -> &str;
+    fn model_mode(&self) -> &'static str;
 
     fn default_stop_sequences(&self) -> Vec<Vec<Token>> {
         Vec::new()

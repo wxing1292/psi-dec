@@ -177,7 +177,6 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         runtime_config,
         scheduler_config,
         model,
-        telemetry.debug_logging,
     )
 }
 

@@ -337,7 +337,6 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
     model_runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
     model: M,
-    debug_logging: bool,
 ) -> Result<()>
 where
     M: ReplayableModel,
@@ -378,8 +377,7 @@ where
         shutdown,
         model,
         default_model_state_snapshot_path(),
-    )
-    .with_debug_logging(debug_logging);
+    );
     executor.event_loop();
     runtime.shutdown();
 

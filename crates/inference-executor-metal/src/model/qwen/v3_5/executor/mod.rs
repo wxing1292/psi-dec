@@ -796,6 +796,14 @@ impl ReplayableModel for Qwen35Executor {
         &self.model_name
     }
 
+    fn model_mode(&self) -> &'static str {
+        match &self.speculator {
+            Qwen35Speculator::Vanilla => "vanilla",
+            Qwen35Speculator::MTP(_) => "mtp",
+            Qwen35Speculator::DSpark(_) => "dspark",
+        }
+    }
+
     fn default_stop_sequences(&self) -> Vec<Vec<Token>> {
         self.default_stop_sequences.clone()
     }

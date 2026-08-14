@@ -605,24 +605,43 @@ A DSpark proposal uses a separate submission with DSparkEmbed, DSpark, DSparkGat
 The Main submission records DSparkContext before GatherUnembed.
 Main decisions cross the CPU boundary before DSpark constructs the anchor block.
 
-`--logging info` emits one batch event with these fields:
+`--logging info` emits one `phase="executor.batch.perf"` event after each non-empty executor batch. The event uses the
+same schema for Vanilla, MTP, and DSpark. It also uses the same schema for prefill and decode batches:
 
-- Model and batch sequence
-- Request and input counts
-- Speculative input
-- Accepted speculative tokens
-- Committed output tokens
-- Acceptance rate
-- Total latency
+```text
+component="executor"
+phase="executor.batch.perf"
+model="qwen3.5"
+model_mode="vanilla|mtp|dspark"
+batch_seq=42
+num_reqs=4
+num_input_tokens=12
+num_spec_tokens=9
+num_verified_tokens=6
+acceptance_rate=0.6667
+num_spec_token_by_index=[4, 3, 2]
+num_verified_token_by_index=[3, 2, 1]
+acceptance_rate_by_index=[0.7500, 0.6667, 0.5000]
+main_ms=14.2500
+spec_ms=6.5000
+spec_passes=2
+```
 
-`--logging debug` uses the same event model. It adds these fields:
+`num_verified_tokens` is the number of returned `validated_tokens`. It does not include the final `sampled_token`.
+`acceptance_rate` is `num_verified_tokens / num_spec_tokens`.
 
-- Request-kind counts
-- Rejected and next speculative tokens
-- Sampled rows
-- Replay-stage submit and wait timing
+The per-index rate is conditional. Index `i` is eligible only when the request contains speculative token `i` and
+all earlier speculative tokens passed verification. `num_spec_token_by_index[i]` is this eligible count.
+`num_verified_token_by_index[i]` is the verified count at the same index. The helper scripts sum these counts across
+batches before they calculate `acceptance_rate_by_index`.
 
-It does not duplicate an INFO event.
+`main_ms` covers `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
+`spec_ms` covers the complete MTP or DSpark Spec lifecycle. It includes all dependent MTP passes.
+`spec_ms` and `spec_passes` are zero when the batch does not run Spec. These values are host elapsed latencies. They are
+not GPU kernel timings.
+
+`--logging debug` emits the same INFO performance event. It also emits request and response diagnostics. It does not
+emit a second DEBUG performance event.
 
 Internal model `Start` and `Stop` commands emit INFO lifecycle events on the
 `inference-runtime-service::lifecycle` target.
@@ -630,11 +649,6 @@ The events use `model.start.begin`, `model.start.complete`, `model.stop.begin`, 
 Completion events include elapsed milliseconds.
 Failure events include the model name and error, and then trigger global shutdown.
 Runtime core issues these commands after the configured executor hibernation timeout.
-
-The Main timing fields are:
-
-- `model_output_main_replay_ms`: `MainEmbed -> Main` when the batch has no sampling rows
-- `model_output_main_sample_replay_ms`: `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling`
 
 Executor profiling spans use the lifecycle hook names:
 
@@ -644,13 +658,6 @@ submit_main -> read_main
 embed_spec -> forward_spec -> unembed_spec -> sample_spec
 submit_spec -> read_spec
 ```
-
-The model-neutral speculator timing fields are:
-
-- `model_output_spec_build_ms`
-- `model_output_spec_replay_ms`
-- `model_output_spec_read_ms`
-- `model_output_spec_passes`
 
 A pass is one auxiliary speculator forward that runs.
 For Qwen3.5, each logical MTP step or DSpark block forward is one pass.
@@ -791,7 +798,8 @@ Summaries report these metrics:
 - TTFT and prompt throughput
 - RPC inter-chunk p50 and p95
 - Tokens for each chunk
-- Exact accepted/proposed speculative-token rate for the matching server-log interval
+- Exact verified/proposed speculative-token rate for the matching server-log interval
+- Conditional speculative-token acceptance rate at each index
 
 For Main-only decoding, a chunk contains one token. Thus, inter-chunk time is inter-token latency.
 

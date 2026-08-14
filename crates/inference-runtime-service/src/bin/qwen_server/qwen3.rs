@@ -135,7 +135,6 @@ fn run_inner() -> Result<()> {
         runtime_config,
         scheduler_config,
         model,
-        telemetry.debug_logging,
     )
 }
 

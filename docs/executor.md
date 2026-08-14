@@ -544,6 +544,8 @@ results. It does not free globally owned pages or commit scheduler state indepen
 
 `inference-executor-core` owns `ReplayableModel`, executor timing, submission, and page interpretation contracts.
 `ReplayableModel` also defines synchronous model residency operations.
+`model_name()` reports model identity. `model_mode()` reports the executor-owned `vanilla`, `mtp`, or `dspark`
+composition mode for service telemetry.
 All recoverable model operations return `ModelExecutorError`.
 Current Qwen model executors support this order:
 

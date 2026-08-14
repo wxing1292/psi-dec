@@ -589,21 +589,43 @@ with open(os.environ["SERVER_LOG"], "rb") as handle:
 server_log = re.sub(r"\x1b\[[0-9;]*m", "", server_log)
 
 proposed = 0
-accepted = 0
+verified = 0
+spec_by_index = []
+verified_by_index = []
+
+def add_counts(total, values):
+    total.extend([0] * (len(values) - len(total)))
+    for index, value in enumerate(values):
+        total[index] += value
+
+def index_counts(line, field):
+    match = re.search(rf"{field}=\[([^]]*)\]", line)
+    if not match or not match.group(1).strip():
+        return []
+    return [int(value.strip()) for value in match.group(1).split(",")]
+
 for line in server_log.splitlines():
     if 'phase="executor.batch.perf"' not in line:
         continue
     proposed_match = re.search(r"num_spec_tokens=(\d+)", line)
-    accepted_match = re.search(r"num_accepted_tokens=(\d+)", line)
-    if proposed_match and accepted_match:
+    verified_match = re.search(r"num_verified_tokens=(\d+)", line)
+    if proposed_match and verified_match:
         proposed += int(proposed_match.group(1))
-        accepted += int(accepted_match.group(1))
+        verified += int(verified_match.group(1))
+        add_counts(spec_by_index, index_counts(line, "num_spec_token_by_index"))
+        add_counts(verified_by_index, index_counts(line, "num_verified_token_by_index"))
 
-acceptance = accepted / proposed if proposed else 0.0
+acceptance = verified / proposed if proposed else 0.0
+acceptance_rate_by_index = [
+    verified_count / spec_count if spec_count else 0.0
+    for spec_count, verified_count in zip(spec_by_index, verified_by_index)
+]
 sampled = stats["sampled_tokens"]
 chunks = stats["chunk_count"]
+encode_counts = lambda values: ":".join(str(value) for value in values) or "-"
+encode_rates = lambda values: ":".join(f"{value:.6f}" for value in values) or "-"
 print(
-    "{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f}".format(
+    "{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f},{},{},{}".format(
         stats["decode_tokens_per_s"],
         chunks,
         sampled,
@@ -613,9 +635,12 @@ print(
         stats["inter_chunk_p50_ms"],
         stats["inter_chunk_p95_ms"],
         proposed,
-        accepted,
+        verified,
         acceptance,
         sampled / chunks,
+        encode_counts(spec_by_index),
+        encode_counts(verified_by_index),
+        encode_rates(acceptance_rate_by_index),
     )
 )
 PY
@@ -631,11 +656,13 @@ summarize_runs() {
         P50S="$7" \
         P95S="$8" \
         PROPOSED="$9" \
-        ACCEPTED="${10}" \
+        VERIFIED="${10}" \
         ACCEPTANCE="${11}" \
         TOKENS_PER_CHUNK="${12}" \
-        LABEL="${13}" \
-        MAX_NEW="${14}" \
+        SPEC_BY_INDEX="${13}" \
+        VERIFIED_BY_INDEX="${14}" \
+        LABEL="${15}" \
+        MAX_NEW="${16}" \
         python3 - <<'PY'
 import os
 import statistics
@@ -653,12 +680,34 @@ tokens_per_chunk = floats("TOKENS_PER_CHUNK")
 proposed = strings("PROPOSED")
 has_speculation = any(int(value) > 0 for value in proposed)
 
+def sum_index_counts(name):
+    totals = []
+    for encoded in strings(name):
+        values = [] if encoded == "-" else [int(value) for value in encoded.split(":")]
+        totals.extend([0] * (len(values) - len(totals)))
+        for index, value in enumerate(values):
+            totals[index] += value
+    return totals
+
+spec_by_index = sum_index_counts("SPEC_BY_INDEX")
+verified_by_index = sum_index_counts("VERIFIED_BY_INDEX")
+acceptance_rate_by_index = [
+    verified / spec if spec else 0.0
+    for spec, verified in zip(spec_by_index, verified_by_index)
+]
+acceptance_rate_by_index_text = (
+    "[{}]".format(",".join(f"{value:.6f}" for value in acceptance_rate_by_index))
+    if acceptance_rate_by_index
+    else "[]"
+)
+
 print(
     "SUMMARY label={} max_new={} median_decode_tok_s={:.3f} median_ttft_ms={:.3f} "
     "median_prompt_tok_s={:.3f} median_inter_chunk_p50_ms={:.3f} "
     "median_inter_chunk_p95_ms={:.3f} median_tokens_per_chunk={:.3f} "
     "median_acceptance_rate={} min_decode_tok_s={:.3f} max_decode_tok_s={:.3f} "
-    "runs={} input_tokens={} samples={} chunks={} proposed_spec={} accepted_spec={}".format(
+    "acceptance_rate_by_index={} runs={} input_tokens={} samples={} chunks={} "
+    "proposed_spec={} verified_spec={}".format(
         os.environ["LABEL"],
         os.environ["MAX_NEW"],
         statistics.median(rates),
@@ -670,12 +719,13 @@ print(
         "{:.6f}".format(statistics.median(acceptance)) if has_speculation else "na",
         min(rates),
         max(rates),
+        acceptance_rate_by_index_text,
         ",".join(f"{value:.3f}" for value in rates),
         ",".join(strings("INPUTS")),
         ",".join(strings("SAMPLES")),
         ",".join(strings("CHUNKS")),
         ",".join(proposed),
-        ",".join(strings("ACCEPTED")),
+        ",".join(strings("VERIFIED")),
     )
 )
 PY
@@ -705,14 +755,17 @@ run_server_case() {
 
     for token_count in "${TOKEN_COUNTS[@]}"; do
         local vals="" inputs="" chunks="" samples="" ttfts="" prompt_rates=""
-        local p50s="" p95s="" proposed="" accepted="" acceptance="" tokens_per_chunk=""
+        local p50s="" p95s="" proposed="" verified="" acceptance="" tokens_per_chunk=""
+        local spec_by_index="" verified_by_index=""
 
         for run in $(seq 1 "$RUNS"); do
             local parsed rate chunk_count sampled input_count ttft prompt_rate p50 p95
-            local proposed_count accepted_count acceptance_rate tpc
+            local proposed_count verified_count acceptance_rate tpc
+            local run_spec_by_index run_verified_by_index acceptance_rate_by_index
             parsed="$(run_decode "$label" "$token_count" "$run" "$server_log")"
             IFS=, read -r rate chunk_count sampled input_count ttft prompt_rate p50 p95 \
-                proposed_count accepted_count acceptance_rate tpc <<<"$parsed"
+                proposed_count verified_count acceptance_rate tpc \
+                run_spec_by_index run_verified_by_index acceptance_rate_by_index <<<"$parsed"
 
             vals+=" $rate"
             inputs+=" $input_count"
@@ -723,16 +776,19 @@ run_server_case() {
             p50s+=" $p50"
             p95s+=" $p95"
             proposed+=" $proposed_count"
-            accepted+=" $accepted_count"
+            verified+=" $verified_count"
             acceptance+=" $acceptance_rate"
             tokens_per_chunk+=" $tpc"
+            spec_by_index+=" $run_spec_by_index"
+            verified_by_index+=" $run_verified_by_index"
 
-            echo "RUN label=$label max_new=$token_count run=$run input_tokens=$input_count sampled=$sampled chunks=$chunk_count proposed_spec=$proposed_count accepted_spec=$accepted_count acceptance_rate=$acceptance_rate tokens_per_chunk=$tpc decode_tok_s=$rate ttft_ms=$ttft prompt_tok_s=$prompt_rate inter_chunk_p50_ms=$p50 inter_chunk_p95_ms=$p95"
+            echo "RUN label=$label max_new=$token_count run=$run input_tokens=$input_count sampled=$sampled chunks=$chunk_count proposed_spec=$proposed_count verified_spec=$verified_count acceptance_rate=$acceptance_rate acceptance_rate_by_index=$acceptance_rate_by_index tokens_per_chunk=$tpc decode_tok_s=$rate ttft_ms=$ttft prompt_tok_s=$prompt_rate inter_chunk_p50_ms=$p50 inter_chunk_p95_ms=$p95"
         done
 
         summarize_runs "$vals" "$inputs" "$chunks" "$samples" "$ttfts" \
-            "$prompt_rates" "$p50s" "$p95s" "$proposed" "$accepted" \
-            "$acceptance" "$tokens_per_chunk" "$label" "$token_count"
+            "$prompt_rates" "$p50s" "$p95s" "$proposed" "$verified" \
+            "$acceptance" "$tokens_per_chunk" "$spec_by_index" "$verified_by_index" \
+            "$label" "$token_count"
     done
 
     cleanup_server
