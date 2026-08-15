@@ -218,8 +218,8 @@ coordinates.
 
 `SingleQ` uses one-token Q tiles. `TiledQ` first builds request-local Q-token tiles.
 
-The planner assigns additional KV splits to the Q-token tile with the most remaining KV-tile work. KV splits for one
-Q-token tile are contiguous.
+The metadata builder assigns additional KV splits to the Q-token tile with the most remaining KV-tile work. KV splits
+for one Q-token tile are contiguous.
 
 For a fixed Q-token/head output coordinate, adjacent `cu_kv_splits` values select the
 `SDPAPartialOutput`s for the reducer.
@@ -362,8 +362,8 @@ GQASplitKVSingleQConfig              GQASplitKVSingleQShape
 `num_total_sdpa_map_task_templates` is the shared shape field for the padded KV-split extent. It is not the raw number
 of KV-token tiles.
 
-One KV split can cover several consecutive KV-token tiles. The planner rounds up `num_kv_splits` to produce the total
-replay dispatch and scratch extent.
+One KV split can cover several consecutive KV-token tiles. The replay bucket policy rounds up `num_kv_splits` to
+produce the total replay dispatch and scratch extent.
 
 The backend configuration is model-independent.
 `model/qwen/v3/main/plan.rs` builds the Qwen3 Main ungated core.
@@ -586,13 +586,13 @@ visible KV range [0, N)
 `cu_kv_splits` selects the consecutive partials for each Q-token tile. Padded replay KV splits use
 `q_token_tile_index = u32::MAX`. Their threadblocks return without writing.
 
-The selector uses `SingleQ` unless `TiledQ` supports the current shape. The explicit bf16 production
-profiles are `(D=128, 8 KV tokens/page)` and `(D=256, 16 KV tokens/page)`.
+The selector uses `SingleQ` unless `TiledQ` supports the current shape. The explicit bf16 production profiles are
+`(D=128, 8 KV tokens/page)`, `(D=256, 8 KV tokens/page)`, and `(D=256, 16 KV tokens/page)`.
 
-Both profiles support at most 8 Q heads per KV head. The gated backend currently reaches only the `D=256` profile.
+All profiles support at most 8 Q heads per KV head. The gated backend currently reaches only the `D=256` profiles.
 
-For supported shapes, the selector uses the average useful tokens per request-local Q tile. It does not use
-floating-point division:
+For the `(D=128, 8 KV tokens/page)` and `(D=256, 16 KV tokens/page)` profiles, the selector uses the average useful
+tokens per request-local Q tile. It does not use floating-point division:
 
 ```text
 num_tokens < 2 * num_q_token_tiles       -> SingleQ
@@ -601,12 +601,22 @@ D=256 and num_tokens < 4 * tiles         -> TiledQ, roughly half the Q/KV group
 otherwise                                -> TiledQ, full Q/KV group
 ```
 
+The gated `(D=256, 8 KV tokens/page)` profile uses an additional measured policy. This policy applies only after the
+backend capability check. It uses each request's Q-token count and history length. It reproduces the current greedy
+KV-split allocation at the metadata capacity. It does not change that allocation.
+
+The policy derives the scheduled fixed-eight-row `TiledQ` map work, active map work, map block and SIMD-group counts,
+active partial states, and padded replay work. It selects `TiledQ` only when active rows use at least half of the
+scheduled map work. It also requires an absolute complete-plan crossover. This rule keeps `T1`, `T2`, small `T25`
+workloads, and long one-token request tails on `SingleQ`. It selects `TiledQ` for the measured long-context `T4` and
+larger workloads. The variant remains part of the existing replay topology key. The policy does not add a replay key.
+
 The Q-head tile is capped at 256 threads. Current reachable model variants are:
 
 | Model | `Hq / Hkv / D` | KV tokens/page | Production variant |
 | --- | --- | ---: | --- |
 | Qwen3-14B | `40 / 8 / 128` | 8 | selector above, tiled `Hq_tile=5` |
-| Qwen3.6-27B | `24 / 4 / 256` | 8 | `SingleQ` |
+| Qwen3.6/Qwen3.8-27B | `24 / 4 / 256` | 8 | measured selector above |
 | Qwen3.6-35B-A3B | `16 / 2 / 256` | 16 | selector above |
 | Qwen3 DSpark | checkpoint-derived | model-derived | SplitKV SingleQ history + block bidirectional |
 

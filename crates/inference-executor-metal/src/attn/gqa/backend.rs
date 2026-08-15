@@ -43,6 +43,8 @@ use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 
 use super::gqa_split_kv_config;
+use super::select_split_kv_variant;
+use super::uses_d256_page8_selector;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use crate::attn::gqa::scratch::GQAScratch;
@@ -215,6 +217,7 @@ pub struct GQA {
     core: GQACore,
     config: GQAMetalConfig,
     split_kv: GQASplitKV,
+    use_d256_page8_selector: bool,
     qgkv: AffineQuantizedMatmul,
     qgkv_to_q_g_k_v: GQAQGKVSplitKernel,
     q_norm_rope: RMSNormRopeKernel,
@@ -252,16 +255,13 @@ impl GQA {
         validate_config_for_core(&core, config);
         let qgkv = core.qgkv_shape();
         let output = core.output_shape();
+        let split_kv_config = gqa_split_kv_config(config, core.num_q_heads, core.num_kv_heads, core.head_dim);
         Self {
             device: device.clone(),
             core: core.clone(),
             config,
-            split_kv: GQASplitKV::new(gqa_split_kv_config(
-                config,
-                core.num_q_heads,
-                core.num_kv_heads,
-                core.head_dim,
-            )),
+            split_kv: GQASplitKV::new(split_kv_config),
+            use_d256_page8_selector: uses_d256_page8_selector(split_kv_config),
             qgkv: AffineQuantizedMatmul::new(device, affine_config(qgkv.out_dim, qgkv.in_dim, config)),
             qgkv_to_q_g_k_v: GQAQGKVSplitKernel::new(device, qgkv_to_q_g_k_v_config(&core, config)),
             q_norm_rope: RMSNormRopeKernel::new(device, norm_rope_config(&core, config, core.num_q_heads)),
@@ -287,15 +287,14 @@ impl GQA {
         token_indices: &[u32],
         cu_tokens: &[u32],
     ) -> GQAReplayShape {
-        let num_tokens = cu_tokens.last().copied().unwrap_or_default();
-        let num_q_token_tiles = cu_tokens
-            .windows(2)
-            .map(|cu| {
-                assert!(cu[0] <= cu[1], "GQA batch cu_tokens must be nondecreasing");
-                (cu[1] - cu[0]).div_ceil(self.split_kv.tiled_q_token_tile_size())
-            })
-            .sum();
-        let split_kv_variant = self.split_kv.select(num_tokens, num_q_token_tiles);
+        let split_kv_variant = select_split_kv_variant(
+            self.split_kv,
+            self.use_d256_page8_selector,
+            batch_metadata.max_tokens(),
+            None,
+            token_indices,
+            cu_tokens,
+        );
         batch_metadata.update(req_slots, token_indices, cu_tokens, split_kv_variant)
     }
 
@@ -307,15 +306,14 @@ impl GQA {
         cu_tokens: &[u32],
         policy: &GQAReplayBucketPolicy,
     ) -> GQAReplayShape {
-        let num_tokens = cu_tokens.last().copied().unwrap_or_default();
-        let num_q_token_tiles = cu_tokens
-            .windows(2)
-            .map(|cu| {
-                assert!(cu[0] <= cu[1], "GQA batch cu_tokens must be nondecreasing");
-                (cu[1] - cu[0]).div_ceil(self.split_kv.tiled_q_token_tile_size())
-            })
-            .sum();
-        let split_kv_variant = self.split_kv.select(num_tokens, num_q_token_tiles);
+        let split_kv_variant = select_split_kv_variant(
+            self.split_kv,
+            self.use_d256_page8_selector,
+            batch_metadata.max_tokens(),
+            Some(policy),
+            token_indices,
+            cu_tokens,
+        );
         batch_metadata.update_bucketed(req_slots, token_indices, cu_tokens, split_kv_variant, policy)
     }
 
@@ -339,14 +337,14 @@ impl GQA {
             "GQA caller-owned token capacity must not exceed the metadata capacity"
         );
         self.validate_token_capacity_topology(num_tokens, num_total_tokens);
-        let num_q_token_tiles = cu_tokens
-            .windows(2)
-            .map(|cu| {
-                assert!(cu[0] <= cu[1], "GQA batch cu_tokens must be nondecreasing");
-                (cu[1] - cu[0]).div_ceil(self.split_kv.tiled_q_token_tile_size())
-            })
-            .sum();
-        let split_kv_variant = self.split_kv.select(num_tokens, num_q_token_tiles);
+        let split_kv_variant = select_split_kv_variant(
+            self.split_kv,
+            self.use_d256_page8_selector,
+            batch_metadata.max_tokens(),
+            Some(policy),
+            token_indices,
+            cu_tokens,
+        );
         batch_metadata.update_bucketed_with_token_capacity(
             req_slots,
             token_indices,

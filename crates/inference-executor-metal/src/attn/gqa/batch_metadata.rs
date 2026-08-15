@@ -30,6 +30,10 @@ impl GQAReplayBucketPolicy {
         self.tokens.max_capacity()
     }
 
+    pub fn kv_split_capacity(&self, num_kv_splits: u32) -> u32 {
+        self.kv_splits.capacity(num_kv_splits)
+    }
+
     fn capacities(&self, num_tokens: u32, num_q_token_tiles: u32, num_kv_splits: u32) -> (u32, u32, u32) {
         (
             self.tokens.capacity(num_tokens),
@@ -115,6 +119,10 @@ impl GQAMetadataBuffers {
             replay_shape: Cell::new(None),
             split_kv_variant: Cell::new(None),
         }
+    }
+
+    pub fn max_tokens(&self) -> usize {
+        self.req_slots.len_bytes() / size_of::<u32>()
     }
 
     pub fn update(

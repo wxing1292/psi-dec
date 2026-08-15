@@ -87,7 +87,7 @@ impl GQASplitKV {
         config.validate();
         let tiled_q_profile = (config.head_dim, config.num_tokens_per_page());
         let supports_tiled_q = config.io_dtype == Dtype::Bfloat16
-            && matches!(tiled_q_profile, (128, 8) | (256, 16))
+            && matches!(tiled_q_profile, (128, 8) | (256, 8 | 16))
             && config.q_heads_per_kv_head() <= 8;
         Self::with_tiled_q_profile(config, supports_tiled_q, tiled_q_profile == (128, 8))
     }
@@ -177,11 +177,13 @@ mod tests {
     #[test]
     fn test_split_kv_variant_selection_matrix() {
         let tiled_256 = GQASplitKV::new(config(256, 6, 16));
+        let tiled_256_page8 = GQASplitKV::new(config(256, 6, 8));
         let tiled_128 = GQASplitKV::new(config(128, 8, 8));
-        let unsupported = GQASplitKV::new(config(256, 8, 8));
+        let unsupported = GQASplitKV::new(config(256, 8, 4));
         let single_partial = GQASplitKV::new_dspark_history(config(128, 8, 8));
 
         assert_eq!(tiled_256.max_q_tokens_per_partial_output(), 8);
+        assert_eq!(tiled_256_page8.max_q_tokens_per_partial_output(), 8);
         assert_eq!(
             tiled_256.select(4, 4),
             GQASplitKVVariant::SingleQ {
@@ -200,6 +202,14 @@ mod tests {
         );
         assert_eq!(
             tiled_256.select(16, 4),
+            GQASplitKVVariant::TiledQ {
+                q_token_tile_size: 8,
+                kv_token_tile_size: 16,
+                q_head_tile_size: 6,
+            }
+        );
+        assert_eq!(
+            tiled_256_page8.select(16, 4),
             GQASplitKVVariant::TiledQ {
                 q_token_tile_size: 8,
                 kv_token_tile_size: 16,

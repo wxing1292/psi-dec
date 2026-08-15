@@ -30,6 +30,11 @@ fn test_fixed() {
 }
 
 #[test]
+fn test_qwen38_27b_profile() {
+    run_case(&[16], 6, 256, 8, 9);
+}
+
+#[test]
 fn test_ragged() {
     run_case(&[1, 2, 4, 6, 8, 11, 16, 16], 6, 256, 16, 17);
 }

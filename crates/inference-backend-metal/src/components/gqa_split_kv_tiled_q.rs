@@ -65,9 +65,9 @@ impl GQASplitKVTiledQConfig {
         assert!(self.q_head_tile_size <= self.q_heads_per_kv_head());
         let tiled_q_profile = (self.head_dim, self.num_tokens_per_page());
         assert!(
-            matches!(tiled_q_profile, (128, 8) | (256, 16)),
-            "GQA SplitKV TiledQ supports only (head_dim, tokens_per_page) profiles (128, 8) and (256, 16), got \
-             {tiled_q_profile:?}"
+            matches!(tiled_q_profile, (128, 8) | (256, 8 | 16)),
+            "GQA SplitKV TiledQ supports only (head_dim, tokens_per_page) profiles (128, 8), (256, 8), and (256, 16), \
+             got {tiled_q_profile:?}"
         );
         assert!(matches!(self.q_token_tile_size, 8 | 16));
         assert!(matches!(self.kv_token_tile_size, 8 | 16));
