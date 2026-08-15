@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use inference_backend_metal::components::GQAComputeConfig;
+use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -9,6 +10,7 @@ use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkRopeScaling;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
 
 use crate::attn::dspark::backend::UngatedDSparkGQA;
@@ -275,6 +277,29 @@ fn qwen3x_dspark_gqa_metal_config(
         ],
         "Qwen3x DSpark GQA",
     )?;
+    let rope_scaling = match config.rope_scaling {
+        Qwen3xDSparkRopeScaling::Default => RopeScaling::Default,
+        Qwen3xDSparkRopeScaling::Yarn {
+            factor,
+            attention_factor,
+            beta_fast,
+            beta_slow,
+            original_max_position_embeddings,
+            truncate,
+        } => {
+            RopeScaling::Yarn {
+                factor,
+                attention_factor,
+                beta_fast,
+                beta_slow,
+                original_max_position_embeddings: to_u32(
+                    "Qwen3x DSpark Yarn original_max_position_embeddings",
+                    original_max_position_embeddings,
+                )?,
+                truncate,
+            }
+        },
+    };
     let metal = GQAMetalConfig {
         group_size: to_u32("Qwen3x DSpark GQA group_size", resolved.group_size)?,
         bits: to_u32("Qwen3x DSpark GQA bits", resolved.bits)?,
@@ -282,7 +307,7 @@ fn qwen3x_dspark_gqa_metal_config(
         rope_dim: to_u32("Qwen3x DSpark GQA rope_dim", config.head_dim)?,
         norm_eps: config.rms_norm_eps,
         rope_theta: config.rope_theta,
-        rope_scale: 1.0,
+        rope_scaling,
         io_dtype: Dtype::Bfloat16,
     };
     metal.validate();
@@ -408,10 +433,10 @@ mod tests {
             head_dim: 8,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            rope_scaling: Qwen3xDSparkRopeScaling::Default,
             max_position_embeddings: 32,
             vocab_size: 64,
             markov_rank: 8,
-            num_anchors: 8,
             quantization: Some(QuantizationConfig {
                 group_size: 32,
                 bits: 4,

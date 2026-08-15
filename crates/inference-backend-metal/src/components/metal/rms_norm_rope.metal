@@ -5,7 +5,7 @@ typedef bfloat bfloat16_t;
 constant int RMS_N_READS = 4;
 
 template <typename T>
-void gqa_norm_rope_impl(
+void rms_norm_rope_impl(
     device const T* input,
     device const bfloat16_t* norm_weight,
     device const uint* flat_token_indices,
@@ -62,28 +62,26 @@ void gqa_norm_rope_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint rope_half = rope_dim / 2;
-    const float log2_base = log2(rope_theta);
-    const float position = rope_scale * float(flat_token_indices[token_index]);
+    const float position = float(flat_token_indices[token_index]);
 
     for (uint d = lid; d < head_dim; d += lsize) {
         if (d < rope_half) {
             const float x1 = float(T(norm_weight[d]) * T(float(input[row_base + d]) * local_inv_mean[0]));
             const uint d2 = d + rope_half;
             const float x2 = float(T(norm_weight[d2]) * T(float(input[row_base + d2]) * local_inv_mean[0]));
-            const float freq_index = float(d) / float(rope_half);
-            const float inv_freq = exp2(-freq_index * log2_base);
+            const float inv_freq = rope_inverse_frequencies[d];
             const float theta = position * inv_freq;
             const float c = metal::fast::cos(theta);
             const float s = metal::fast::sin(theta);
-            output[row_base + d] = T(x1 * c - x2 * s);
-            output[row_base + d2] = T(x1 * s + x2 * c);
+            output[row_base + d] = T(rope_attention_factor * (x1 * c - x2 * s));
+            output[row_base + d2] = T(rope_attention_factor * (x1 * s + x2 * c));
         } else if (d >= rope_dim) {
             output[row_base + d] = T(norm_weight[d]) * T(float(input[row_base + d]) * local_inv_mean[0]);
         }
     }
 }
 
-kernel void gqa_norm_rope_f32(
+kernel void rms_norm_rope_f32(
     device const float* input [[buffer(0)]],
     device const bfloat16_t* norm_weight [[buffer(1)]],
     device const uint* flat_token_indices [[buffer(2)]],
@@ -97,12 +95,12 @@ kernel void gqa_norm_rope_f32(
 ) {
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
-    gqa_norm_rope_impl<float>(
+    rms_norm_rope_impl<float>(
         input, norm_weight, flat_token_indices, output, num_active_tokens,
         local_inv_mean, local_sums, gid, lid, lsize, simd_lane_id, simd_group_id);
 }
 
-kernel void gqa_norm_rope_bf16(
+kernel void rms_norm_rope_bf16(
     device const bfloat16_t* input [[buffer(0)]],
     device const bfloat16_t* norm_weight [[buffer(1)]],
     device const uint* flat_token_indices [[buffer(2)]],
@@ -116,7 +114,7 @@ kernel void gqa_norm_rope_bf16(
 ) {
     threadgroup float local_inv_mean[1];
     threadgroup float local_sums[32];
-    gqa_norm_rope_impl<bfloat16_t>(
+    rms_norm_rope_impl<bfloat16_t>(
         input, norm_weight, flat_token_indices, output, num_active_tokens,
         local_inv_mean, local_sums, gid, lid, lsize, simd_lane_id, simd_group_id);
 }

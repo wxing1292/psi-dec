@@ -12,13 +12,13 @@ use std::time::Instant;
 use half::bf16;
 use inference_backend_metal::components::GQAActivationGateConfig;
 use inference_backend_metal::components::GQAKVPageWriteConfig;
-use inference_backend_metal::components::GQANormRopeConfig;
-use inference_backend_metal::components::GQANormRopeShape;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
 use inference_backend_metal::components::GQAPagedSDPAConfig;
 use inference_backend_metal::components::GQAPagedSDPAShape;
 use inference_backend_metal::components::GQAQGKVSplitConfig;
 use inference_backend_metal::components::GQATiledSDPAConfig;
+use inference_backend_metal::components::RMSNormRopeConfig;
+use inference_backend_metal::components::RMSNormRopeShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -681,19 +681,18 @@ fn gqa_qgkv_to_q_g_k_v_config(model: GQAModelProfile) -> GQAQGKVSplitConfig {
     )
 }
 
-fn gqa_norm_rope_config(num_heads: usize, model: GQAModelProfile) -> GQANormRopeConfig {
-    GQANormRopeConfig::bf16(
+fn norm_rope_config(num_heads: usize, model: GQAModelProfile) -> RMSNormRopeConfig {
+    RMSNormRopeConfig::bf16(
         num_heads.try_into().expect("GQA norm head count must fit u32"),
         model.head_dim.try_into().expect("GQA norm head_dim must fit u32"),
         GQA_ROPE_DIM,
         GQA_NORM_EPS,
         GQA_ROPE_THETA,
-        1.0,
     )
 }
 
-fn gqa_norm_rope_shape(num_tokens: u32, _num_heads: usize, _model: GQAModelProfile) -> GQANormRopeShape {
-    GQANormRopeShape {
+fn norm_rope_shape(num_tokens: u32, _num_heads: usize, _model: GQAModelProfile) -> RMSNormRopeShape {
+    RMSNormRopeShape {
         num_total_tokens: num_tokens,
     }
 }

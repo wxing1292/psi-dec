@@ -8,10 +8,6 @@ use inference_backend_metal::components::GQAKVPageWrite;
 use inference_backend_metal::components::GQAKVPageWriteBuffers;
 use inference_backend_metal::components::GQAKVPageWriteConfig;
 use inference_backend_metal::components::GQAKVPageWriteShape;
-use inference_backend_metal::components::GQANormRopeBuffers;
-use inference_backend_metal::components::GQANormRopeConfig;
-use inference_backend_metal::components::GQANormRopeKernel;
-use inference_backend_metal::components::GQANormRopeShape;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
 use inference_backend_metal::components::GQAPagedSDPAConfig;
 use inference_backend_metal::components::GQAPagedSDPAKernels;
@@ -27,6 +23,11 @@ use inference_backend_metal::components::GQATiledSDPAKernels;
 use inference_backend_metal::components::GQATiledSDPAMapBuffers;
 use inference_backend_metal::components::GQATiledSDPAReduceBuffers;
 use inference_backend_metal::components::GQATiledSDPAShape;
+use inference_backend_metal::components::RMSNormRopeBuffers;
+use inference_backend_metal::components::RMSNormRopeConfig;
+use inference_backend_metal::components::RMSNormRopeKernel;
+use inference_backend_metal::components::RMSNormRopeShape;
+use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -116,7 +117,7 @@ pub struct GQAMetalConfig {
     pub rope_dim: u32,
     pub norm_eps: f32,
     pub rope_theta: f32,
-    pub rope_scale: f32,
+    pub rope_scaling: RopeScaling,
     pub io_dtype: Dtype,
 }
 
@@ -127,9 +128,13 @@ impl GQAMetalConfig {
         assert!(self.page_bytes > 0);
         assert!(self.rope_dim > 0);
         assert_eq!(self.rope_dim % 2, 0);
-        assert!(self.norm_eps > 0.0);
-        assert!(self.rope_theta > 0.0);
-        assert!(self.rope_scale > 0.0);
+        assert!(self.norm_eps.is_finite() && self.norm_eps > 0.0);
+        assert!(self.rope_theta.is_finite() && self.rope_theta > 0.0);
+        self.rope_scaling.validate();
+        assert!(
+            !matches!(self.rope_scaling, RopeScaling::Yarn { .. }) || self.rope_theta > 1.0,
+            "Yarn rope_theta must be greater than 1"
+        );
         match self.io_dtype {
             Dtype::Bfloat16 => {},
             Dtype::Float32 => todo!("F32 GQA model boundary is not supported"),
@@ -216,8 +221,8 @@ pub struct GQA {
     compute: GQACompute,
     qgkv: AffineQuantizedMatmul,
     qgkv_to_q_g_k_v: GQAQGKVSplitKernel,
-    q_norm_rope: GQANormRopeKernel,
-    k_norm_rope: GQANormRopeKernel,
+    q_norm_rope: RMSNormRopeKernel,
+    k_norm_rope: RMSNormRopeKernel,
     kv_page_write: GQAKVPageWrite,
     gate: GQAActivationGateKernel,
     output: AffineQuantizedMatmul,
@@ -263,8 +268,8 @@ impl GQA {
             )),
             qgkv: AffineQuantizedMatmul::new(device, affine_config(qgkv.out_dim, qgkv.in_dim, config)),
             qgkv_to_q_g_k_v: GQAQGKVSplitKernel::new(device, qgkv_to_q_g_k_v_config(&core, config)),
-            q_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(&core, config, core.num_q_heads)),
-            k_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
+            q_norm_rope: RMSNormRopeKernel::new(device, norm_rope_config(&core, config, core.num_q_heads)),
+            k_norm_rope: RMSNormRopeKernel::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
             kv_page_write: GQAKVPageWrite::new(device, kv_page_write_config(&core, config)),
             gate: GQAActivationGateKernel::new(device, gate_config(&core, config)),
             output: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
@@ -464,7 +469,7 @@ impl ReplayLayer for GQA {
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(qgkv_to_q_g_k_v));
         let q_norm_rope_shape = self.norm_rope_shape(shape);
-        let q_norm_rope_buffers = GQANormRopeBuffers {
+        let q_norm_rope_buffers = RMSNormRopeBuffers {
             input: scratch.q,
             norm_weight: weights.q_norm_weight,
             flat_token_indices: batch_metadata.flat_token_indices(),
@@ -478,7 +483,7 @@ impl ReplayLayer for GQA {
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(q_norm_rope));
         let k_norm_rope_shape = self.norm_rope_shape(shape);
-        let k_norm_rope_buffers = GQANormRopeBuffers {
+        let k_norm_rope_buffers = RMSNormRopeBuffers {
             input: scratch.k,
             norm_weight: weights.k_norm_weight,
             flat_token_indices: batch_metadata.flat_token_indices(),
@@ -665,8 +670,8 @@ impl GQA {
         }
     }
 
-    fn norm_rope_shape(&self, shape: GQAReplayShape) -> GQANormRopeShape {
-        GQANormRopeShape {
+    fn norm_rope_shape(&self, shape: GQAReplayShape) -> RMSNormRopeShape {
+        RMSNormRopeShape {
             num_total_tokens: shape.num_total_tokens,
         }
     }
@@ -768,32 +773,31 @@ fn qgkv_to_q_g_k_v_config(core: &GQACore, config: GQAMetalConfig) -> GQAQGKVSpli
     }
 }
 
-fn norm_rope_config(core: &GQACore, config: GQAMetalConfig, num_heads: usize) -> GQANormRopeConfig {
+fn norm_rope_config(core: &GQACore, config: GQAMetalConfig, num_heads: usize) -> RMSNormRopeConfig {
     let num_heads_u32 = num_heads.try_into().expect("GQA head count must fit u32");
     let head_dim = core.head_dim.try_into().expect("GQA head_dim must fit u32");
-    match config.io_dtype {
+    let norm_rope = match config.io_dtype {
         Dtype::Float32 => {
-            GQANormRopeConfig::f32(
+            RMSNormRopeConfig::f32(
                 num_heads_u32,
                 head_dim,
                 config.rope_dim,
                 config.norm_eps,
                 config.rope_theta,
-                config.rope_scale,
             )
         },
         Dtype::Bfloat16 => {
-            GQANormRopeConfig::bf16(
+            RMSNormRopeConfig::bf16(
                 num_heads_u32,
                 head_dim,
                 config.rope_dim,
                 config.norm_eps,
                 config.rope_theta,
-                config.rope_scale,
             )
         },
         dtype => panic!("unsupported GQA dtype {dtype:?}"),
-    }
+    };
+    norm_rope.with_rope_scaling(config.rope_scaling)
 }
 
 fn kv_page_write_config(core: &GQACore, config: GQAMetalConfig) -> GQAKVPageWriteConfig {
@@ -836,6 +840,7 @@ fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedM
 #[cfg(test)]
 mod tests {
     use half::bf16;
+    use inference_backend_metal::components::RopeScaling;
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Dtype;
     use inference_backend_metal::metal::ReplayArguments;
@@ -849,14 +854,14 @@ mod tests {
     use super::GQAActivationGateKernel;
     use super::GQAActivationGateShape;
     use super::GQAMetalConfig;
-    use super::GQANormRopeBuffers;
-    use super::GQANormRopeConfig;
-    use super::GQANormRopeKernel;
-    use super::GQANormRopeShape;
     use super::GQAQGKVSplitBuffers;
     use super::GQAQGKVSplitConfig;
     use super::GQAQGKVSplitKernel;
     use super::GQAQGKVSplitShape;
+    use super::RMSNormRopeBuffers;
+    use super::RMSNormRopeConfig;
+    use super::RMSNormRopeKernel;
+    use super::RMSNormRopeShape;
 
     #[test]
     #[should_panic(expected = "GQA Q-head count must fit u32")]
@@ -870,7 +875,7 @@ mod tests {
             rope_dim: 64,
             norm_eps: 1.0e-6,
             rope_theta: 10_000_000.0,
-            rope_scale: 1.0,
+            rope_scaling: RopeScaling::Default,
             io_dtype: Dtype::Bfloat16,
         }
         .num_tokens_per_page(&core);
@@ -882,13 +887,13 @@ mod tests {
         let stream = Stream::new(&device);
         let split_config = GQAQGKVSplitConfig::f32(1, 1, 2);
         let split_shape = GQAQGKVSplitShape { num_total_tokens: 2 };
-        let norm_config = GQANormRopeConfig::f32(1, 2, 2, 1.0e-6, 1_000_000.0, 1.0);
-        let norm_shape = GQANormRopeShape { num_total_tokens: 2 };
+        let norm_config = RMSNormRopeConfig::f32(1, 2, 2, 1.0e-6, 1_000_000.0);
+        let norm_shape = RMSNormRopeShape { num_total_tokens: 2 };
         let gate_config = GQAActivationGateConfig::f32(1, 2);
         let gate_shape = GQAActivationGateShape { num_total_tokens: 2 };
         let split = GQAQGKVSplitKernel::new(&device, split_config);
-        let q_norm = GQANormRopeKernel::new(&device, norm_config);
-        let k_norm = GQANormRopeKernel::new(&device, norm_config);
+        let q_norm = RMSNormRopeKernel::new(&device, norm_config);
+        let k_norm = RMSNormRopeKernel::new(&device, norm_config);
         let gate = GQAActivationGateKernel::new(&device, gate_config);
         let input = Buffer::new_zeroed_elements(&device, split_config.num_qgkv_slots(split_shape), Dtype::Float32);
         let q = Buffer::new_zeroed_elements(&device, split_config.num_q_slots(split_shape), Dtype::Float32);
@@ -914,7 +919,7 @@ mod tests {
         ));
         builder.record_with_barrier_before(q_norm.invoke_bucketed(
             norm_shape,
-            GQANormRopeBuffers {
+            RMSNormRopeBuffers {
                 input: &q,
                 norm_weight: &norm_weight,
                 flat_token_indices: &flat_token_indices,
@@ -924,7 +929,7 @@ mod tests {
         ));
         builder.record_with_barrier_before(k_norm.invoke_bucketed(
             norm_shape,
-            GQANormRopeBuffers {
+            RMSNormRopeBuffers {
                 input: &k,
                 norm_weight: &norm_weight,
                 flat_token_indices: &flat_token_indices,

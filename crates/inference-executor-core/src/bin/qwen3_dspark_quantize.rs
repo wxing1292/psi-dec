@@ -950,7 +950,6 @@ mod tests {
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "num_target_layers": 3,
-            "num_anchors": 16,
             "head_dim": 16,
             "rms_norm_eps": 1e-6,
             "rope_theta": 10000000.0,

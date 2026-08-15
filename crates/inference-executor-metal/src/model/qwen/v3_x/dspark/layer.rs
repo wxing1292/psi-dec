@@ -291,6 +291,7 @@ impl Qwen3xDSparkLayerScratch {
 mod tests {
     use inference_executor_core::model::qwen::v3_x::QuantizationConfig;
     use inference_executor_core::model::qwen::v3_x::TensorQuantizationOverride;
+    use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkRopeScaling;
     use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 
     use super::*;
@@ -353,10 +354,10 @@ mod tests {
             head_dim: 8,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            rope_scaling: Qwen3xDSparkRopeScaling::Default,
             max_position_embeddings: 32,
             vocab_size: 64,
             markov_rank: 8,
-            num_anchors: 8,
             quantization: Some(QuantizationConfig {
                 group_size: 32,
                 bits: 4,

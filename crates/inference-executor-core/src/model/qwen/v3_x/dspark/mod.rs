@@ -1,6 +1,7 @@
 mod config;
 pub use config::Qwen3xDSparkConfig;
 pub use config::Qwen3xDSparkMainConfig;
+pub use config::Qwen3xDSparkRopeScaling;
 pub use config::init_qwen3x_dspark_config;
 
 pub mod weight_layout;

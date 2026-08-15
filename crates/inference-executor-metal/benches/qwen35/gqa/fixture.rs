@@ -7,8 +7,6 @@ use inference_backend_metal::components::GQAComputePath;
 use inference_backend_metal::components::GQAKVPageWrite;
 use inference_backend_metal::components::GQAKVPageWriteBuffers;
 use inference_backend_metal::components::GQAKVPageWriteShape;
-use inference_backend_metal::components::GQANormRopeBuffers;
-use inference_backend_metal::components::GQANormRopeKernel;
 use inference_backend_metal::components::GQAPagedSDPAKernels;
 use inference_backend_metal::components::GQAPagedSDPAMapBuffers;
 use inference_backend_metal::components::GQAPagedSDPAReduceBuffers;
@@ -19,6 +17,9 @@ use inference_backend_metal::components::GQATiledSDPAKernels;
 use inference_backend_metal::components::GQATiledSDPAMapBuffers;
 use inference_backend_metal::components::GQATiledSDPAReduceBuffers;
 use inference_backend_metal::components::GQATiledSDPAShape;
+use inference_backend_metal::components::RMSNormRopeBuffers;
+use inference_backend_metal::components::RMSNormRopeKernel;
+use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -59,8 +60,6 @@ use crate::cu_tokens;
 use crate::gqa_attention_reference_at;
 use crate::gqa_gate_config;
 use crate::gqa_kv_page_write_config;
-use crate::gqa_norm_rope_config;
-use crate::gqa_norm_rope_shape;
 use crate::gqa_output_affine_config;
 use crate::gqa_page_table_layout;
 use crate::gqa_qgkv_affine_config;
@@ -71,6 +70,8 @@ use crate::gqa_tiled_sdpa_config;
 use crate::hidden_fixture;
 use crate::max_bf16_diff;
 use crate::measure_runs;
+use crate::norm_rope_config;
+use crate::norm_rope_shape;
 use crate::page_table;
 use crate::print_gqa_kernel_limits;
 use crate::print_named_perf;
@@ -245,7 +246,7 @@ impl<'a> RealGQAFixture<'a> {
             rope_dim: GQA_ROPE_DIM,
             norm_eps: GQA_NORM_EPS,
             rope_theta: GQA_ROPE_THETA,
-            rope_scale: 1.0,
+            rope_scaling: RopeScaling::Default,
             io_dtype: Dtype::Bfloat16,
         };
         let backend = GQA::new(device, core, config);
@@ -427,8 +428,8 @@ impl<'a> RealGQAFixture<'a> {
         let replay = recorder.build();
         let qgkv_matmul = AffineQuantizedMatmul::new(device, gqa_qgkv_affine_config(model));
         let qgkv_to_q_g_k_v = GQAQGKVSplitKernel::new(device, gqa_qgkv_to_q_g_k_v_config(model));
-        let q_norm_rope_kernel = GQANormRopeKernel::new(device, gqa_norm_rope_config(model.num_q_heads, model));
-        let k_norm_rope_kernel = GQANormRopeKernel::new(device, gqa_norm_rope_config(model.num_kv_heads, model));
+        let q_norm_rope_kernel = RMSNormRopeKernel::new(device, norm_rope_config(model.num_q_heads, model));
+        let k_norm_rope_kernel = RMSNormRopeKernel::new(device, norm_rope_config(model.num_kv_heads, model));
         let kv_page_write = GQAKVPageWrite::new(device, gqa_kv_page_write_config(model, config.page_bytes));
         let gate = GQAActivationGateKernel::new(device, gqa_gate_config(model));
         let output = AffineQuantizedMatmul::new(device, gqa_output_affine_config(model));
@@ -467,8 +468,8 @@ impl<'a> RealGQAFixture<'a> {
             },
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(q_norm_rope_kernel.invoke(
-            gqa_norm_rope_shape(num_tokens, model.num_q_heads, model),
-            GQANormRopeBuffers {
+            norm_rope_shape(num_tokens, model.num_q_heads, model),
+            RMSNormRopeBuffers {
                 input: &q,
                 norm_weight: &weights.q_norm_weight,
                 flat_token_indices: batch_metadata.flat_token_indices(),
@@ -476,8 +477,8 @@ impl<'a> RealGQAFixture<'a> {
             },
         )));
         tiled_builder.record(ReplayOp::opaque(k_norm_rope_kernel.invoke(
-            gqa_norm_rope_shape(num_tokens, model.num_kv_heads, model),
-            GQANormRopeBuffers {
+            norm_rope_shape(num_tokens, model.num_kv_heads, model),
+            RMSNormRopeBuffers {
                 input: &k,
                 norm_weight: &weights.k_norm_weight,
                 flat_token_indices: batch_metadata.flat_token_indices(),
@@ -735,10 +736,8 @@ impl<'a> RealGQAFixture<'a> {
     fn measure_subcomponents(&self, selected_subcomponents: &[String], warmup_iters: usize, iters: usize, runs: usize) {
         let qgkv_matmul = AffineQuantizedMatmul::new(&self.device, gqa_qgkv_affine_config(self.model));
         let qgkv_to_q_g_k_v = GQAQGKVSplitKernel::new(&self.device, gqa_qgkv_to_q_g_k_v_config(self.model));
-        let q_norm_rope =
-            GQANormRopeKernel::new(&self.device, gqa_norm_rope_config(self.model.num_q_heads, self.model));
-        let k_norm_rope =
-            GQANormRopeKernel::new(&self.device, gqa_norm_rope_config(self.model.num_kv_heads, self.model));
+        let q_norm_rope = RMSNormRopeKernel::new(&self.device, norm_rope_config(self.model.num_q_heads, self.model));
+        let k_norm_rope = RMSNormRopeKernel::new(&self.device, norm_rope_config(self.model.num_kv_heads, self.model));
         let kv_page_write = GQAKVPageWrite::new(
             &self.device,
             gqa_kv_page_write_config(self.model, self.model.page_bytes()),
@@ -783,8 +782,8 @@ impl<'a> RealGQAFixture<'a> {
         let q_norm_rope_replay = build_single_invocation_replay(
             &self.stream,
             q_norm_rope.invoke(
-                gqa_norm_rope_shape(self.num_tokens, self.model.num_q_heads, self.model),
-                GQANormRopeBuffers {
+                norm_rope_shape(self.num_tokens, self.model.num_q_heads, self.model),
+                RMSNormRopeBuffers {
                     input: &self._q,
                     norm_weight: &self._weights.q_norm_weight,
                     flat_token_indices: self.batch_metadata.flat_token_indices(),
@@ -795,8 +794,8 @@ impl<'a> RealGQAFixture<'a> {
         let k_norm_rope_replay = build_single_invocation_replay(
             &self.stream,
             k_norm_rope.invoke(
-                gqa_norm_rope_shape(self.num_tokens, self.model.num_kv_heads, self.model),
-                GQANormRopeBuffers {
+                norm_rope_shape(self.num_tokens, self.model.num_kv_heads, self.model),
+                RMSNormRopeBuffers {
                     input: &self._k,
                     norm_weight: &self._weights.k_norm_weight,
                     flat_token_indices: self.batch_metadata.flat_token_indices(),

@@ -2,11 +2,11 @@ use inference_backend_metal::components::GQAKVPageWrite;
 use inference_backend_metal::components::GQAKVPageWriteBuffers;
 use inference_backend_metal::components::GQAKVPageWriteConfig;
 use inference_backend_metal::components::GQAKVPageWriteShape;
-use inference_backend_metal::components::GQANormRopeBuffers;
-use inference_backend_metal::components::GQANormRopeConfig;
-use inference_backend_metal::components::GQANormRopeKernel;
-use inference_backend_metal::components::GQANormRopeShape;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
+use inference_backend_metal::components::RMSNormRopeBuffers;
+use inference_backend_metal::components::RMSNormRopeConfig;
+use inference_backend_metal::components::RMSNormRopeKernel;
+use inference_backend_metal::components::RMSNormRopeShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -55,7 +55,7 @@ pub struct UngatedDSparkGQAContextAppender {
     metal: GQAMetalConfig,
     k: AffineQuantizedMatmul,
     v: AffineQuantizedMatmul,
-    k_norm_rope: GQANormRopeKernel,
+    k_norm_rope: RMSNormRopeKernel,
     kv_page_write: GQAKVPageWrite,
 }
 
@@ -99,7 +99,7 @@ impl UngatedDSparkGQAContextAppender {
         Self {
             k: AffineQuantizedMatmul::new(device, kv_config),
             v: AffineQuantizedMatmul::new(device, kv_config),
-            k_norm_rope: GQANormRopeKernel::new(device, k_norm_rope_config(attention, metal)),
+            k_norm_rope: RMSNormRopeKernel::new(device, k_norm_rope_config(attention, metal)),
             kv_page_write: GQAKVPageWrite::new(
                 device,
                 GQAKVPageWriteConfig {
@@ -167,10 +167,10 @@ impl UngatedDSparkGQAContextAppender {
             offsets.v_affine,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.k_norm_rope.invoke(
-            GQANormRopeShape {
+            RMSNormRopeShape {
                 num_total_tokens: input.num_tokens,
             },
-            GQANormRopeBuffers {
+            RMSNormRopeBuffers {
                 input: input.scratch.k,
                 norm_weight: input.weights.k_norm_weight,
                 flat_token_indices: input.flat_token_indices,
@@ -270,39 +270,25 @@ fn attention_kv_config(
 fn k_norm_rope_config(
     core: &inference_executor_core::attn::UngatedGQACore,
     metal: GQAMetalConfig,
-) -> GQANormRopeConfig {
+) -> RMSNormRopeConfig {
     let num_heads = core
         .num_kv_heads
         .try_into()
         .expect("DSpark context KV-head count must fit u32");
     let head_dim = core.head_dim.try_into().expect("DSpark context head_dim must fit u32");
-    match metal.io_dtype {
-        Dtype::Float32 => {
-            GQANormRopeConfig::f32(
-                num_heads,
-                head_dim,
-                metal.rope_dim,
-                metal.norm_eps,
-                metal.rope_theta,
-                metal.rope_scale,
-            )
-        },
+    let norm_rope = match metal.io_dtype {
+        Dtype::Float32 => RMSNormRopeConfig::f32(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta),
         Dtype::Bfloat16 => {
-            GQANormRopeConfig::bf16(
-                num_heads,
-                head_dim,
-                metal.rope_dim,
-                metal.norm_eps,
-                metal.rope_theta,
-                metal.rope_scale,
-            )
+            RMSNormRopeConfig::bf16(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
         },
         dtype => panic!("unsupported DSpark context dtype {dtype:?}"),
-    }
+    };
+    norm_rope.with_rope_scaling(metal.rope_scaling)
 }
 
 #[cfg(test)]
 mod tests {
+    use inference_backend_metal::components::RopeScaling;
     use inference_executor_core::attn::UngatedGQACore;
 
     use super::*;
@@ -317,7 +303,7 @@ mod tests {
             rope_dim: 128,
             norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
-            rope_scale: 1.0,
+            rope_scaling: RopeScaling::Default,
             io_dtype: Dtype::Bfloat16,
         };
 

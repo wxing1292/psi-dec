@@ -113,11 +113,14 @@ This boundary keeps `Qwen3Main` independent from concrete DSpark types.
 `dspark` means the DSpark model body.
 It does not include embedding, unembedding, Markov correction, or sampling.
 
-## Official configuration contract
+## Canonical configuration contract
 
-`Qwen3xDSparkConfig` parses the official flat Hugging Face schema.
-It does not parse `dflash_config`.
-It does not define `DSparkDFlashConfig`.
+The repository defines one flat canonical checkpoint schema.
+`Qwen3xDSparkConfig` parses and validates only that schema.
+The checkpoint boundary selects an adapter from `CHECKPOINT_CONFIG_ADAPTERS` before canonical deserialization.
+The `DSparkDraftModel` adapter maps the published nested `dflash_config` fields to the canonical flat fields.
+It rejects different flat and nested values.
+The canonical parser and executor do not branch on the external architecture name.
 
 The first milestone parses these official fields:
 
@@ -139,7 +142,6 @@ markov_rank
 mask_token_id
 max_position_embeddings
 model_type
-num_anchors
 num_attention_heads
 num_hidden_layers
 num_key_value_heads
@@ -156,10 +158,9 @@ use_sliding_window
 vocab_size
 ```
 
-The first milestone requires these values:
+The canonical semantic validator requires these values:
 
 - `model_type = "qwen3"`
-- `architectures` is empty or contains only `Qwen3DSparkModel`
 - `attention_bias = false`
 - `attention_dropout = 0`
 - `hidden_act = "silu"`
@@ -168,7 +169,7 @@ The first milestone requires these values:
 - `tie_word_embeddings = false`
 - `use_cache = true`
 - Sliding-window attention is disabled.
-- RoPE uses the unscaled `default` form.
+- RoPE uses the unscaled `default` form or Yarn scaling with full-head rotation.
 - The execution dtype is BF16.
 
 `target_layer_ids` selects raw decoder-layer outputs.

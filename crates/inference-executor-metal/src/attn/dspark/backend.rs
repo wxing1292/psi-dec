@@ -3,10 +3,6 @@ use inference_backend_metal::components::GQABlockSDPAConfig;
 use inference_backend_metal::components::GQABlockSDPAKernel;
 use inference_backend_metal::components::GQABlockSDPAShape;
 use inference_backend_metal::components::GQAComputePath;
-use inference_backend_metal::components::GQANormRopeBuffers;
-use inference_backend_metal::components::GQANormRopeConfig;
-use inference_backend_metal::components::GQANormRopeKernel;
-use inference_backend_metal::components::GQANormRopeShape;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
 use inference_backend_metal::components::GQAPagedSDPAConfig;
 use inference_backend_metal::components::GQAPagedSDPAKernels;
@@ -17,6 +13,10 @@ use inference_backend_metal::components::GQAQKVSplitBuffers;
 use inference_backend_metal::components::GQAQKVSplitConfig;
 use inference_backend_metal::components::GQAQKVSplitKernel;
 use inference_backend_metal::components::GQAQKVSplitShape;
+use inference_backend_metal::components::RMSNormRopeBuffers;
+use inference_backend_metal::components::RMSNormRopeConfig;
+use inference_backend_metal::components::RMSNormRopeKernel;
+use inference_backend_metal::components::RMSNormRopeShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -54,8 +54,8 @@ pub struct UngatedDSparkGQA {
     metal: GQAMetalConfig,
     qkv: AffineQuantizedMatmul,
     qkv_to_q_k_v: GQAQKVSplitKernel,
-    q_norm_rope: GQANormRopeKernel,
-    k_norm_rope: GQANormRopeKernel,
+    q_norm_rope: RMSNormRopeKernel,
+    k_norm_rope: RMSNormRopeKernel,
     block_sdpa: GQABlockSDPAKernel,
     output: AffineQuantizedMatmul,
 }
@@ -73,8 +73,8 @@ impl UngatedDSparkGQA {
             device: device.clone(),
             qkv: AffineQuantizedMatmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, metal)),
             qkv_to_q_k_v: GQAQKVSplitKernel::new(device, qkv_to_q_k_v_config(attention, metal)),
-            q_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(attention, metal, attention.num_q_heads)),
-            k_norm_rope: GQANormRopeKernel::new(device, norm_rope_config(attention, metal, attention.num_kv_heads)),
+            q_norm_rope: RMSNormRopeKernel::new(device, norm_rope_config(attention, metal, attention.num_q_heads)),
+            k_norm_rope: RMSNormRopeKernel::new(device, norm_rope_config(attention, metal, attention.num_kv_heads)),
             block_sdpa: GQABlockSDPAKernel::new(
                 device,
                 GQABlockSDPAConfig {
@@ -203,10 +203,10 @@ impl ReplayLayer for UngatedDSparkGQA {
             },
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.q_norm_rope.invoke(
-            GQANormRopeShape {
+            RMSNormRopeShape {
                 num_total_tokens: shape.num_tokens,
             },
-            GQANormRopeBuffers {
+            RMSNormRopeBuffers {
                 input: scratch.q,
                 norm_weight: input.weights.q_norm_weight,
                 flat_token_indices: input.metadata.flat_token_indices(),
@@ -214,10 +214,10 @@ impl ReplayLayer for UngatedDSparkGQA {
             },
         )));
         recorder.record(ReplayOp::opaque(self.k_norm_rope.invoke(
-            GQANormRopeShape {
+            RMSNormRopeShape {
                 num_total_tokens: shape.num_tokens,
             },
-            GQANormRopeBuffers {
+            RMSNormRopeBuffers {
                 input: scratch.k,
                 norm_weight: input.weights.k_norm_weight,
                 flat_token_indices: input.metadata.flat_token_indices(),
@@ -321,32 +321,17 @@ fn norm_rope_config(
     core: &inference_executor_core::attn::UngatedGQACore,
     metal: GQAMetalConfig,
     num_heads: usize,
-) -> GQANormRopeConfig {
+) -> RMSNormRopeConfig {
     let num_heads = num_heads.try_into().expect("DSpark GQA head count must fit u32");
     let head_dim = core.head_dim.try_into().expect("DSpark GQA head_dim must fit u32");
-    match metal.io_dtype {
-        Dtype::Float32 => {
-            GQANormRopeConfig::f32(
-                num_heads,
-                head_dim,
-                metal.rope_dim,
-                metal.norm_eps,
-                metal.rope_theta,
-                metal.rope_scale,
-            )
-        },
+    let norm_rope = match metal.io_dtype {
+        Dtype::Float32 => RMSNormRopeConfig::f32(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta),
         Dtype::Bfloat16 => {
-            GQANormRopeConfig::bf16(
-                num_heads,
-                head_dim,
-                metal.rope_dim,
-                metal.norm_eps,
-                metal.rope_theta,
-                metal.rope_scale,
-            )
+            RMSNormRopeConfig::bf16(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
         },
         dtype => panic!("unsupported DSpark GQA dtype {dtype:?}"),
-    }
+    };
+    norm_rope.with_rope_scaling(metal.rope_scaling)
 }
 
 fn affine_config(n: usize, k: usize, metal: GQAMetalConfig) -> AffineQuantizedMatmulConfig {

@@ -116,6 +116,18 @@ pub struct RopeParameters {
     pub factor: Option<f32>,
     #[serde(default)]
     pub original_max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub attention_factor: Option<f32>,
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub mscale: Option<f32>,
+    #[serde(default)]
+    pub mscale_all_dim: Option<f32>,
+    #[serde(default)]
+    pub truncate: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -61,7 +61,7 @@ crates/inference-backend-metal/src/components/
   gqa_compute.rs            backend-owned GQA compute-path selection and geometry
   gqa_qgkv_split.rs         gated QGKV split component
   gqa_qkv_split.rs          ungated QKV split component
-  gqa_norm_rope.rs          reusable Metal q/k fused and single-input norm/RoPE component kernels
+  rms_norm_rope.rs          reusable Metal head-row RMSNorm/RoPE component
   gqa_kv_page_write.rs      reusable Metal KV page-write component
   gqa_tiled_attention.rs    reusable token/Q-head tiled paged SDPA component
   gqa_tiled_attention_test.rs
@@ -69,7 +69,7 @@ crates/inference-backend-metal/src/components/
   metal/
     gqa_qgkv_split.metal       gated QGKV split source
     gqa_qkv_split.metal        ungated QKV split source
-    gqa_norm_rope.metal         Metal q/k norm and RoPE source
+    rms_norm_rope.metal         Metal head-row RMSNorm/RoPE source
     gqa_kv_page_write.metal     Metal KV page-write source
     gqa_paged_sdpa_map.metal     Metal paged SDPA map source
     gqa_paged_sdpa_reduce.metal  Metal paged SDPA partial-output reduce source
@@ -165,6 +165,14 @@ Its QKV attention graph is independent from Main and MTP.
 
 Init-time component specialization supplies the head dimensions, head counts, RoPE constants, and page geometry. A
 model-specific runtime branch does not supply these values.
+
+The `RMSNormRope*` component operates on token-head rows. It does not own query grouping, KV grouping, or attention state.
+
+`RopeScaling` selects unscaled default RoPE or Yarn RoPE.
+Initialization resolves the correction range and the complete inverse-frequency table.
+Yarn specialization blends extrapolated and interpolated inverse frequencies before Metal library compilation.
+The RMSNorm/RoPE kernel reads the immutable inverse-frequency table for each rotary dimension.
+It applies the configured Yarn attention factor to the rotated Q and K values.
 
 `GQARequestPageTable` stores executor request-slot KV page IDs in a fixed-stride GPU buffer. It retains the IDs between
 runtime reset and update notifications.
@@ -743,6 +751,7 @@ weights                              immutable fused projection, q/k norm, and o
 
 Q and K norm weights keep the checkpoint BF16 storage type. The norm/RoPE kernel reads them directly. It preserves the
 configured activation-type arithmetic and rounding order. RMS reduction and RoPE trigonometry use F32.
+Default and Yarn RoPE use the same component and replay boundary.
 
 The recording marks the KV arena as both a write and read resource. KV update writes the current tokens. Paged SDPA
 reads the request-visible pages.

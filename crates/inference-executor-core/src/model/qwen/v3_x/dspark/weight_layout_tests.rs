@@ -2,6 +2,7 @@ use super::Qwen3xDSparkWeightBindings;
 use super::resolve_qwen3x_dspark_source_weight_bindings;
 use super::resolve_qwen3x_dspark_weight_bindings;
 use crate::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use crate::model::qwen::v3_x::dspark::Qwen3xDSparkRopeScaling;
 
 fn config() -> Qwen3xDSparkConfig {
     Qwen3xDSparkConfig {
@@ -17,10 +18,10 @@ fn config() -> Qwen3xDSparkConfig {
         head_dim: 4,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+        rope_scaling: Qwen3xDSparkRopeScaling::Default,
         max_position_embeddings: 32,
         vocab_size: 16,
         markov_rank: 4,
-        num_anchors: 8,
         quantization: None,
     }
 }

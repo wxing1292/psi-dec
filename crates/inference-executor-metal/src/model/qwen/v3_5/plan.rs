@@ -1,3 +1,4 @@
+use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GQACore;
@@ -123,7 +124,7 @@ pub fn derive_qwen35_gqa_configs(
         rope_dim: to_u32("Qwen3.5 GQA rope_dim", text.rope_dim)?,
         norm_eps: text.rms_norm_eps,
         rope_theta: text.rope_theta,
-        rope_scale: 1.0,
+        rope_scaling: RopeScaling::Default,
         io_dtype: defaults.hidden_dtype,
     };
     metal.validate();

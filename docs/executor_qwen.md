@@ -241,9 +241,11 @@ state-arena addressing.
 `Qwen3ModelConfig` strictly parses the flat Hugging Face Qwen3 schema.
 It rejects unsupported GDN, MoE, MTP, sliding-window, and RoPE-scaling variants.
 Its EOS token IDs provide a Qwen3 fallback when `generation_config.json` supplies none.
-`Qwen3xDSparkConfig` independently parses the official flat DSpark schema.
-It validates Main compatibility, official `target_layer_ids`, fixed-block geometry, ungated GQA, and the `vanilla`
-Markov head.
+`Qwen3xDSparkConfig` independently validates the repository's flat canonical DSpark schema.
+The checkpoint boundary uses an architecture adapter table to convert supported external schemas before canonical
+deserialization.
+It validates Main compatibility, `target_layer_ids`, fixed-block geometry, ungated GQA, default or Yarn RoPE, and the
+`vanilla` Markov head.
 `Qwen35ModelConfig` independently parses and normalizes the Qwen3.5/Qwen3.6/Qwen3.8 schema.
 That schema includes layer-kind, MoE, MTP, and partial-RoPE fields.
 `Qwen3ExecutorConfig` and `Qwen35ExecutorConfig` keep runtime capacities model-specific.
@@ -320,7 +322,7 @@ Initialization is top-down:
 9. Construct `PageArena` and wrap each cached stage in `Replay<T>`.
 
 Qwen3 follows the same ownership order with separate Vanilla and DSpark graphs.
-It parses its flat configuration and resolves its Main binding tree.
+It parses its flat Main configuration and resolves its Main binding tree.
 When configured, it parses the DSpark configuration and passes it to the shared DSpark loader.
 It constructs one QKV GQA state domain and dense scratch.
 It constructs a second ungated GQA state domain and `DSparkBlockScratch` when DSpark is enabled.

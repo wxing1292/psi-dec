@@ -15,6 +15,7 @@ use inference_backend_metal::components::GQATiledSDPAKernels;
 use inference_backend_metal::components::GQATiledSDPAMapBuffers;
 use inference_backend_metal::components::GQATiledSDPAReduceBuffers;
 use inference_backend_metal::components::GQATiledSDPAShape;
+use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -223,7 +224,7 @@ impl Fixture {
             rope_dim: text.head_dim.try_into().expect("RoPE dim must fit u32"),
             norm_eps: text.rms_norm_eps,
             rope_theta: text.rope_theta,
-            rope_scale: 1.0,
+            rope_scaling: RopeScaling::Default,
             io_dtype: Dtype::Bfloat16,
         };
         config.validate();

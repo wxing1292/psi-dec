@@ -23,9 +23,11 @@ None of these names identify model roles.
 ## Current scope
 
 Qwen3 and Qwen3.5 provide separate Vanilla and DSpark initializer paths.
-The implementation follows the official flat `Qwen3xDSparkConfig` schema.
+The repository defines one flat canonical Qwen3x DSpark checkpoint schema.
+The checkpoint adapter table converts supported external schemas to that canonical schema before deserialization.
 It supports an ungated GQA backbone and a `vanilla` Markov head.
 It requires the official Markov-conditioned confidence head.
+It supports unscaled `default` RoPE and Yarn RoPE with full-head rotation.
 Qwen3.5 MTP and DSpark are mutually exclusive.
 
 At startup, `--num-spec-tokens N` selects one fixed proposal length.
@@ -458,6 +460,20 @@ The loader validates the DSpark configuration against the Qwen3 or Qwen3.5 Main 
 It rejects unsupported attention, dtype, RoPE, `target_layer_ids`, and Markov variants.
 It permits the query projection width to differ from `hidden_size` when the head geometry is valid.
 The affine loader requires exact semantic bindings.
+
+The canonical schema stores `mask_token_id` and `target_layer_ids` as required flat fields.
+`Qwen3DSparkModel` selects the identity adapter.
+`DSparkDraftModel` selects an adapter that validates `attention_mode` and `projector_type` and maps the supported
+`dflash_config` fields to the canonical flat fields.
+The adapter rejects different flat and nested values.
+An unknown architecture is unsupported until the checkpoint boundary registers an adapter for it.
+The canonical parser, semantic validator, normalized config, and executor do not branch on external architecture names.
+
+Yarn configuration requires `factor` and `original_max_position_embeddings`.
+It accepts the Transformers `beta_fast`, `beta_slow`, `attention_factor`, `mscale`, `mscale_all_dim`, and `truncate`
+options.
+The executor uses the Transformers defaults when the optional fields are absent.
+It applies the resolved inverse-frequency blend and attention factor to persistent context K and proposal-local Q/K.
 
 Convert an official checkpoint with this command:
 

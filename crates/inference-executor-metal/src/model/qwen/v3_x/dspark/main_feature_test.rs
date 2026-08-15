@@ -1,4 +1,5 @@
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
+use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkRopeScaling;
 
 use super::Qwen3xDSparkMainFeatureLayout;
 use super::Qwen3xDSparkMainResidualBindings;
@@ -33,10 +34,10 @@ fn config() -> Qwen3xDSparkConfig {
         head_dim: 8,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+        rope_scaling: Qwen3xDSparkRopeScaling::Default,
         max_position_embeddings: 32,
         vocab_size: 64,
         markov_rank: 8,
-        num_anchors: 8,
         quantization: None,
     }
 }

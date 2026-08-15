@@ -152,11 +152,12 @@ pub use moe_routing::MoERoutingConfig;
 pub use moe_routing::MoERoutingKernel;
 pub use moe_routing::MoERoutingShape;
 
-mod gqa_norm_rope;
-pub use gqa_norm_rope::GQANormRopeBuffers;
-pub use gqa_norm_rope::GQANormRopeConfig;
-pub use gqa_norm_rope::GQANormRopeKernel;
-pub use gqa_norm_rope::GQANormRopeShape;
+mod rms_norm_rope;
+pub use rms_norm_rope::RMSNormRopeBuffers;
+pub use rms_norm_rope::RMSNormRopeConfig;
+pub use rms_norm_rope::RMSNormRopeKernel;
+pub use rms_norm_rope::RMSNormRopeShape;
+pub use rms_norm_rope::RopeScaling;
 
 mod residual_add;
 pub use residual_add::ResidualAddBuffers;
