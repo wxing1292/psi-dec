@@ -42,7 +42,7 @@ inference-executor-metal
 Backend Criterion targets:
 
 ```text
-dense_mlp  sparse_mlp  moe  gqa_attn  gqa_block_attn  gdn_attn  gdn_state_io
+dense_mlp  sparse_mlp  moe  gqa_split_kv  gqa_block_attn  gdn_attn  gdn_state_io
 embedding  unembedding  norm  buffer_io
 ```
 
@@ -100,11 +100,12 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   The timed buffer-to-file case overwrites the same range with `F_NOCACHE` enabled and calls `sync_all` during each
   iteration.
   File creation, file opening, pattern generation, correctness validation, and cleanup remain outside all timed cases.
-- `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts `single_q_token` or `tiled_q_tokens`. It can run an explicit
-  untimed `--validate-tiled-q-tokens` comparison.
-- `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SDPA-only paths, and exact QKV/output
+- `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts the SplitKV `single_q` or `tiled_q` variant. It can run an
+  explicit untimed `--validate-split-kv-tiled-q` comparison.
+- `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SplitKV-only variants, and exact QKV/output
   projection kernels.
-- `qwen3_gqa` exposes static tile geometry as CLI arguments. It can validate single-Q output against tiled output.
+- `qwen3_gqa` exposes static SplitKV tile geometry as CLI arguments. It can validate SingleQ output against TiledQ
+  output.
   Its projection probes compare QMV, QMM BM8/BN32, and QMM BM16/BN32. These forced paths are benchmark-only.
 - `gqa_block_attn` measures the model-independent dense block-bidirectional SDPA map component.
   It accepts block size, request count, head geometry, and dtype as CLI arguments.
@@ -199,7 +200,7 @@ cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
 
 cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b --tokens 1 \
-  --contexts 0 --num-reqs 1 --gqa-paths single_q_token \
+  --contexts 0 --num-reqs 1 --gqa-split-kv-variants single_q \
   --iters 1 --warmup-iters 0 --runs 1
 
 cargo bench -p inference-executor-metal --bench qwen35_layers -- \

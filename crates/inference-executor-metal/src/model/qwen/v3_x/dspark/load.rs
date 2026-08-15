@@ -16,8 +16,8 @@ use crate::attn::dspark::state::UngatedDSparkGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
-use crate::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_compute_config;
 use crate::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_core;
+use crate::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_split_kv_config;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkModel;
 use crate::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
 use crate::model::qwen::v3_x::weight::to_u32;
@@ -70,8 +70,8 @@ pub fn load_qwen3x_dspark(
         confidence: confidence_bindings,
     } = resolve_qwen3x_dspark_weight_bindings(config, store.index().tensor_names())?;
     let attention_core = qwen3x_dspark_gqa_core(config, num_spec_tokens, 0);
-    let attention_compute_config = qwen3x_dspark_gqa_compute_config(config, load_config.page_size_bytes)?;
-    let tokens_per_page = attention_compute_config.num_tokens_per_page() as usize;
+    let attention_split_kv_config = qwen3x_dspark_gqa_split_kv_config(config, load_config.page_size_bytes)?;
+    let tokens_per_page = attention_split_kv_config.num_tokens_per_page() as usize;
     let page_ids_per_block = num_page_ids_per_block(load_config.num_tokens_per_block, tokens_per_page);
     let page_table_layout = GQAPageTableLayout {
         num_req_slots: load_config
@@ -96,7 +96,7 @@ pub fn load_qwen3x_dspark(
     let gqa_state = UngatedDSparkGQAState::new(
         device,
         attention_core,
-        attention_compute_config,
+        attention_split_kv_config,
         page_table_layout,
         capacity,
         load_config.max_tokens,

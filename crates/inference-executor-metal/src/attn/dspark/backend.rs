@@ -2,17 +2,17 @@ use inference_backend_metal::components::GQABlockSDPABuffers;
 use inference_backend_metal::components::GQABlockSDPAConfig;
 use inference_backend_metal::components::GQABlockSDPAKernel;
 use inference_backend_metal::components::GQABlockSDPAShape;
-use inference_backend_metal::components::GQAComputePath;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
-use inference_backend_metal::components::GQAPagedSDPAConfig;
-use inference_backend_metal::components::GQAPagedSDPAKernels;
-use inference_backend_metal::components::GQAPagedSDPAMapBuffers;
-use inference_backend_metal::components::GQAPagedSDPAReduceBuffers;
-use inference_backend_metal::components::GQAPagedSDPAShape;
 use inference_backend_metal::components::GQAQKVSplitBuffers;
 use inference_backend_metal::components::GQAQKVSplitConfig;
 use inference_backend_metal::components::GQAQKVSplitKernel;
 use inference_backend_metal::components::GQAQKVSplitShape;
+use inference_backend_metal::components::GQASplitKVSingleQConfig;
+use inference_backend_metal::components::GQASplitKVSingleQKernels;
+use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
+use inference_backend_metal::components::GQASplitKVSingleQReduceBuffers;
+use inference_backend_metal::components::GQASplitKVSingleQShape;
+use inference_backend_metal::components::GQASplitKVVariant;
 use inference_backend_metal::components::RMSNormRopeBuffers;
 use inference_backend_metal::components::RMSNormRopeConfig;
 use inference_backend_metal::components::RMSNormRopeKernel;
@@ -98,14 +98,14 @@ impl UngatedDSparkGQA {
         }
     }
 
-    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, GQAComputePath) {
+    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, GQASplitKVVariant) {
         input.page_table_layout.validate();
         assert!(
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
             "DSpark GQA layer index exceeds the page table"
         );
         let shape = input.metadata.replay_shape();
-        let compute_path = input.metadata.compute_path();
+        let split_kv_variant = input.metadata.split_kv_variant();
         shape.validate();
         assert_eq!(
             shape.num_q_token_tiles, shape.num_tokens,
@@ -124,24 +124,24 @@ impl UngatedDSparkGQA {
             input.scratch.capacity.block.block_size, self.core.block_size,
             "DSpark GQA scratch block size must match the backend"
         );
-        (shape, compute_path)
+        (shape, split_kv_variant)
     }
 
-    fn paged_sdpa_config(
+    fn split_kv_single_q_config(
         &self,
-        compute_path: GQAComputePath,
+        split_kv_variant: GQASplitKVVariant,
         page_table_layout: GQAPageTableLayout,
-    ) -> GQAPagedSDPAConfig {
+    ) -> GQASplitKVSingleQConfig {
         let attention = &self.core.attention;
-        let GQAComputePath::SingleQueryToken {
+        let GQASplitKVVariant::SingleQ {
             kv_token_tile_size,
             num_threads_per_threadblock,
             q_head_tile_size,
-        } = compute_path
+        } = split_kv_variant
         else {
-            panic!("DSpark history attention requires the single-query-token compute path")
+            panic!("DSpark history attention requires the SplitKV SingleQ variant")
         };
-        GQAPagedSDPAConfig {
+        GQASplitKVSingleQConfig {
             num_q_heads: attention
                 .num_q_heads
                 .try_into()
@@ -170,7 +170,7 @@ impl ReplayLayer for UngatedDSparkGQA {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let (shape, compute_path) = self.validate_input(&input);
+        let (shape, split_kv_variant) = self.validate_input(&input);
         let attention = &self.core.attention;
         let scratch = input.scratch;
         recorder.record_with_barrier_before(ReplayOp::opaque(
@@ -225,14 +225,14 @@ impl ReplayLayer for UngatedDSparkGQA {
             },
         )));
 
-        let sdpa_config = self.paged_sdpa_config(compute_path, input.page_table_layout);
-        let sdpa_shape = GQAPagedSDPAShape {
+        let sdpa_config = self.split_kv_single_q_config(split_kv_variant, input.page_table_layout);
+        let sdpa_shape = GQASplitKVSingleQShape {
             num_total_tokens: shape.num_tokens,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         };
-        let sdpa = GQAPagedSDPAKernels::new(&self.device, sdpa_config, sdpa_shape);
+        let sdpa = GQASplitKVSingleQKernels::new(&self.device, sdpa_config, sdpa_shape);
         recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
-            GQAPagedSDPAMapBuffers {
+            GQASplitKVSingleQMapBuffers {
                 q: scratch.q_norm_rope,
                 kv_pages: input.kv_cache.kv_pages,
                 req_slots: input.metadata.req_slots(),
@@ -259,7 +259,7 @@ impl ReplayLayer for UngatedDSparkGQA {
                 partial_output: scratch.partial_output,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQAPagedSDPAReduceBuffers {
+        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQASplitKVSingleQReduceBuffers {
             partial_exp_sums: scratch.partial_exp_sums,
             partial_max_logits: scratch.partial_max_logits,
             partial_output: scratch.partial_output,

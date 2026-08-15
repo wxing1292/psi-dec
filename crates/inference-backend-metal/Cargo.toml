@@ -47,8 +47,8 @@ path = "benches/mlp/sparse.rs"
 harness = false
 
 [[bench]]
-name = "gqa_attn"
-path = "benches/gqa/attn.rs"
+name = "gqa_split_kv"
+path = "benches/gqa/split_kv.rs"
 harness = false
 
 [[bench]]

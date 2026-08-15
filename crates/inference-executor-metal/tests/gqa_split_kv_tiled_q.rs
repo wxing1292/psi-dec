@@ -2,11 +2,11 @@ use std::mem::size_of;
 
 use half::bf16;
 use inference_backend_metal::components::GQAPageTableLayout;
-use inference_backend_metal::components::GQATiledSDPAConfig;
-use inference_backend_metal::components::GQATiledSDPAKernels;
-use inference_backend_metal::components::GQATiledSDPAMapBuffers;
-use inference_backend_metal::components::GQATiledSDPAReduceBuffers;
-use inference_backend_metal::components::GQATiledSDPAShape;
+use inference_backend_metal::components::GQASplitKVTiledQConfig;
+use inference_backend_metal::components::GQASplitKVTiledQKernels;
+use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
+use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
+use inference_backend_metal::components::GQASplitKVTiledQShape;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -22,7 +22,7 @@ const Q_TOKEN_TILE_SIZE: u32 = 8;
 const KV_TOKEN_TILE_SIZE: u32 = 16;
 const NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_q_tiles");
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_tokens");
-const NUM_ACTIVE_TASK_TEMPLATES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_task_templates");
+const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_kv_splits");
 
 #[test]
 fn test_fixed() {
@@ -55,7 +55,7 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
     let num_total_tokens = 16usize;
     let num_blocks = 2usize;
     let page_bytes = 2 * num_kv_heads * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size();
-    let config = GQATiledSDPAConfig {
+    let config = GQASplitKVTiledQConfig {
         num_q_heads: num_q_heads as u32,
         num_kv_heads: num_kv_heads as u32,
         head_dim: head_dim as u32,
@@ -72,7 +72,7 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
             num_page_ids_per_block: 1,
         },
     };
-    let shape = GQATiledSDPAShape {
+    let shape = GQASplitKVTiledQShape {
         num_total_tokens: num_total_tokens as u32,
         num_total_q_token_tiles: 2,
         num_total_sdpa_map_task_templates: 2,
@@ -129,10 +129,10 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
     let partial_max_logits = Buffer::new_zeroed(&device, num_partial_tokens * num_q_heads * size_of::<f32>());
     let sentinel = bf16::from_f32(-123.0).to_bits();
     let output = Buffer::from_slice(&device, &vec![sentinel; num_total_tokens * num_q_heads * head_dim]);
-    let kernels = GQATiledSDPAKernels::new(&device, config, shape);
+    let kernels = GQASplitKVTiledQKernels::new(&device, config, shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map_bucketed(
-        GQATiledSDPAMapBuffers {
+        GQASplitKVTiledQMapBuffers {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &req_slots,
@@ -147,10 +147,10 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
         ReplayU32::Fixed(0),
         ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
-        ReplayU32::Parameter(NUM_ACTIVE_TASK_TEMPLATES),
+        ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
     ));
     builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
-        GQATiledSDPAReduceBuffers {
+        GQASplitKVTiledQReduceBuffers {
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
             partial_max_logits: &partial_max_logits,
@@ -196,7 +196,7 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
                 &ReplayArguments::new()
                     .with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32)
                     .with_u32(NUM_ACTIVE_Q_TOKEN_TILES, num_active_tiles as u32)
-                    .with_u32(NUM_ACTIVE_TASK_TEMPLATES, num_active_tiles as u32),
+                    .with_u32(NUM_ACTIVE_KV_SPLITS, num_active_tiles as u32),
             )
             .wait();
 
@@ -316,7 +316,7 @@ fn run_case(
     let num_sdpa_map_task_templates = sdpa_map_task_template_values.len() / 3;
     let num_total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
     sdpa_map_task_template_values.resize(num_total_sdpa_map_task_templates * 3, u32::MAX);
-    let config = GQATiledSDPAConfig {
+    let config = GQASplitKVTiledQConfig {
         num_q_heads: num_q_heads.try_into().unwrap(),
         num_kv_heads: num_kv_heads.try_into().unwrap(),
         head_dim: head_dim.try_into().unwrap(),
@@ -333,7 +333,7 @@ fn run_case(
             num_page_ids_per_block: 1,
         },
     };
-    let shape = GQATiledSDPAShape {
+    let shape = GQASplitKVTiledQShape {
         num_total_tokens: num_tokens.try_into().unwrap(),
         num_total_q_token_tiles: num_q_token_tiles.try_into().unwrap(),
         num_total_sdpa_map_task_templates: num_total_sdpa_map_task_templates.try_into().unwrap(),
@@ -415,10 +415,10 @@ fn run_case(
         &device,
         num_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
     );
-    let kernels = GQATiledSDPAKernels::new(&device, config, shape);
+    let kernels = GQASplitKVTiledQKernels::new(&device, config, shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map(
-        GQATiledSDPAMapBuffers {
+        GQASplitKVTiledQMapBuffers {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &req_slots,
@@ -432,7 +432,7 @@ fn run_case(
         },
         ReplayU32::Fixed(0),
     ));
-    builder.record_with_barrier_before(kernels.invoke_reduce(GQATiledSDPAReduceBuffers {
+    builder.record_with_barrier_before(kernels.invoke_reduce(GQASplitKVTiledQReduceBuffers {
         partial_output: &partial_output,
         partial_exp_sums: &partial_exp_sums,
         partial_max_logits: &partial_max_logits,

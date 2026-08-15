@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use inference_backend_metal::components::GQAComputePath;
+use inference_backend_metal::components::GQASplitKVVariant;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -26,7 +26,7 @@ pub struct DSparkGQAMetadataBuffers {
     cu_sdpa_partial_outputs: Buffer,
     block_sdpa_map_task_template_indices: Buffer,
     replay_shape: Cell<Option<GQAReplayShape>>,
-    compute_path: Cell<Option<GQAComputePath>>,
+    split_kv_variant: Cell<Option<GQASplitKVVariant>>,
 }
 
 impl DSparkGQAMetadataBuffers {
@@ -55,13 +55,13 @@ impl DSparkGQAMetadataBuffers {
                 Dtype::Uint32,
             ),
             replay_shape: Cell::new(None),
-            compute_path: Cell::new(None),
+            split_kv_variant: Cell::new(None),
         }
     }
 
-    pub fn update(&self, block: &DSparkBlockMetadata, compute_path: GQAComputePath) -> GQAReplayShape {
-        let GQAComputePath::SingleQueryToken { kv_token_tile_size, .. } = compute_path else {
-            panic!("DSpark history attention requires the single-query-token compute path")
+    pub fn update(&self, block: &DSparkBlockMetadata, split_kv_variant: GQASplitKVVariant) -> GQAReplayShape {
+        let GQASplitKVVariant::SingleQ { kv_token_tile_size, .. } = split_kv_variant else {
+            panic!("DSpark history attention requires the SplitKV SingleQ variant")
         };
         assert!(
             block.num_requests() <= self.capacity.block.max_requests,
@@ -87,7 +87,7 @@ impl DSparkGQAMetadataBuffers {
         self.block_sdpa_map_task_template_indices
             .write_typed(0, &metadata.block_sdpa_map_task_template_indices);
         self.replay_shape.set(Some(metadata.replay_shape));
-        self.compute_path.set(Some(compute_path));
+        self.split_kv_variant.set(Some(split_kv_variant));
         metadata.replay_shape
     }
 
@@ -117,8 +117,8 @@ impl DSparkGQAMetadataBuffers {
             .expect("DSpark GQA metadata must be updated before recording")
     }
 
-    pub fn compute_path(&self) -> GQAComputePath {
-        self.compute_path
+    pub fn split_kv_variant(&self) -> GQASplitKVVariant {
+        self.split_kv_variant
             .get()
             .expect("DSpark GQA metadata must be updated before recording")
     }
@@ -259,26 +259,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_metadata_retains_backend_selected_compute_path() {
+    fn test_metadata_retains_backend_selected_split_kv_variant() {
         let device = Device::system_default();
         let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(2, 3));
         let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
         let block = DSparkBlockMetadata::new(&[3, 7], &[11, 20], 3);
-        let compute_path = GQAComputePath::SingleQueryToken {
+        let split_kv_variant = GQASplitKVVariant::SingleQ {
             kv_token_tile_size: 4,
             num_threads_per_threadblock: 32,
             q_head_tile_size: 2,
         };
 
-        let shape = buffers.update(&block, compute_path);
+        let shape = buffers.update(&block, split_kv_variant);
 
         assert_eq!(shape.num_tokens, 6);
-        assert_eq!(compute_path, buffers.compute_path());
+        assert_eq!(split_kv_variant, buffers.split_kv_variant());
     }
 
     #[test]
-    #[should_panic(expected = "single-query-token compute path")]
-    fn test_metadata_rejects_tiled_partial_abi() {
+    #[should_panic(expected = "SplitKV SingleQ variant")]
+    fn test_metadata_rejects_tiled_q_partial_abi() {
         let device = Device::system_default();
         let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(1, 3));
         let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
@@ -286,7 +286,7 @@ mod tests {
 
         buffers.update(
             &block,
-            GQAComputePath::TiledQueryTokens {
+            GQASplitKVVariant::TiledQ {
                 q_token_tile_size: 8,
                 kv_token_tile_size: 16,
                 q_head_tile_size: 2,

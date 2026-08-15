@@ -13,10 +13,10 @@ use half::bf16;
 use inference_backend_metal::components::GQAActivationGateConfig;
 use inference_backend_metal::components::GQAKVPageWriteConfig;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
-use inference_backend_metal::components::GQAPagedSDPAConfig;
-use inference_backend_metal::components::GQAPagedSDPAShape;
 use inference_backend_metal::components::GQAQGKVSplitConfig;
-use inference_backend_metal::components::GQATiledSDPAConfig;
+use inference_backend_metal::components::GQASplitKVSingleQConfig;
+use inference_backend_metal::components::GQASplitKVSingleQShape;
+use inference_backend_metal::components::GQASplitKVTiledQConfig;
 use inference_backend_metal::components::RMSNormRopeConfig;
 use inference_backend_metal::components::RMSNormRopeShape;
 use inference_backend_metal::metal::Buffer;
@@ -43,20 +43,20 @@ const GQA_ROPE_THETA: f32 = 10_000_000.0;
 const GQA_NORM_EPS: f32 = 1.0e-6;
 const GQA_MAX_TOKENS: usize = 64;
 const TOKENS_PER_PAGE: u32 = 16;
-const SINGLE_Q_TOKEN_KV_TOKEN_TILE_SIZE: u32 = 256;
-const SINGLE_Q_TOKEN_NUM_THREADS_PER_THREADBLOCK: u32 = 256;
-const SINGLE_Q_TOKEN_Q_HEAD_TILE_SIZE_CAP: u32 = 8;
-const Q_TOKEN_TILE_SIZE: u32 = 8;
-const TILED_KV_TOKEN_TILE_SIZE: u32 = 16;
+const SPLIT_KV_SINGLE_Q_KV_TOKEN_TILE_SIZE: u32 = 256;
+const SPLIT_KV_SINGLE_Q_NUM_THREADS_PER_THREADBLOCK: u32 = 256;
+const SPLIT_KV_SINGLE_Q_Q_HEAD_TILE_SIZE_CAP: u32 = 8;
+const SPLIT_KV_TILED_Q_TOKEN_TILE_SIZE: u32 = 8;
+const SPLIT_KV_TILED_Q_KV_TOKEN_TILE_SIZE: u32 = 16;
 
 #[derive(Clone, Copy)]
 struct GQABenchParams {
-    single_q_token_kv_token_tile_size: u32,
-    single_q_token_num_threads_per_threadblock: u32,
-    single_q_token_max_q_head_tile_size: u32,
-    tiled_q_token_tile_size: u32,
-    tiled_kv_token_tile_size: u32,
-    tiled_q_head_tile_size: u32,
+    split_kv_single_q_kv_token_tile_size: u32,
+    split_kv_single_q_num_threads_per_threadblock: u32,
+    split_kv_single_q_max_q_head_tile_size: u32,
+    split_kv_tiled_q_token_tile_size: u32,
+    split_kv_tiled_q_kv_token_tile_size: u32,
+    split_kv_tiled_q_head_tile_size: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -125,14 +125,14 @@ struct Args {
     contexts: Vec<u32>,
     num_reqs: Vec<u32>,
     tokens_per_req: Option<Vec<u32>>,
-    paths: Vec<GQABenchPath>,
+    split_kv_variants: Vec<GQASplitKVBenchVariant>,
     selected_subcomponents: Vec<String>,
     params: GQABenchParams,
     iters: usize,
     warmup_iters: usize,
     runs: usize,
     subcomponents: bool,
-    validate_tiled_q_tokens: bool,
+    validate_split_kv_tiled_q: bool,
     print_limits: bool,
 }
 
@@ -145,21 +145,21 @@ impl Args {
             contexts: Vec::new(),
             num_reqs: vec![1],
             tokens_per_req: None,
-            paths: vec![GQABenchPath::SingleQToken, GQABenchPath::TiledQTokens],
+            split_kv_variants: vec![GQASplitKVBenchVariant::SingleQ, GQASplitKVBenchVariant::TiledQ],
             selected_subcomponents: default_gqa_subcomponents(),
             params: GQABenchParams {
-                single_q_token_kv_token_tile_size: SINGLE_Q_TOKEN_KV_TOKEN_TILE_SIZE,
-                single_q_token_num_threads_per_threadblock: SINGLE_Q_TOKEN_NUM_THREADS_PER_THREADBLOCK,
-                single_q_token_max_q_head_tile_size: SINGLE_Q_TOKEN_Q_HEAD_TILE_SIZE_CAP,
-                tiled_q_token_tile_size: Q_TOKEN_TILE_SIZE,
-                tiled_kv_token_tile_size: TILED_KV_TOKEN_TILE_SIZE,
-                tiled_q_head_tile_size: 0,
+                split_kv_single_q_kv_token_tile_size: SPLIT_KV_SINGLE_Q_KV_TOKEN_TILE_SIZE,
+                split_kv_single_q_num_threads_per_threadblock: SPLIT_KV_SINGLE_Q_NUM_THREADS_PER_THREADBLOCK,
+                split_kv_single_q_max_q_head_tile_size: SPLIT_KV_SINGLE_Q_Q_HEAD_TILE_SIZE_CAP,
+                split_kv_tiled_q_token_tile_size: SPLIT_KV_TILED_Q_TOKEN_TILE_SIZE,
+                split_kv_tiled_q_kv_token_tile_size: SPLIT_KV_TILED_Q_KV_TOKEN_TILE_SIZE,
+                split_kv_tiled_q_head_tile_size: 0,
             },
             iters: 50,
             warmup_iters: 20,
             runs: 1,
             subcomponents: false,
-            validate_tiled_q_tokens: false,
+            validate_split_kv_tiled_q: false,
             print_limits: false,
         };
         let mut values = std::env::args().skip(1);
@@ -174,34 +174,36 @@ impl Args {
                 "--gqa-tokens-per-req" => {
                     args.tokens_per_req = Some(parse_u32_list(&next_arg(&mut values, &arg), &arg))
                 },
-                "--gqa-paths" => args.paths = parse_gqa_paths(&next_arg(&mut values, &arg)),
+                "--gqa-split-kv-variants" => {
+                    args.split_kv_variants = parse_split_kv_variants(&next_arg(&mut values, &arg))
+                },
                 "--gqa-subcomponents" => {
                     args.selected_subcomponents = parse_string_list(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-single-q-token-kv-token-tile-size" => {
-                    args.params.single_q_token_kv_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-single-q-kv-token-tile-size" => {
+                    args.params.split_kv_single_q_kv_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-single-q-token-num-threads-per-threadblock" => {
-                    args.params.single_q_token_num_threads_per_threadblock =
+                "--gqa-split-kv-single-q-num-threads-per-threadblock" => {
+                    args.params.split_kv_single_q_num_threads_per_threadblock =
                         parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-single-q-token-max-q-head-tile-size" => {
-                    args.params.single_q_token_max_q_head_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-single-q-max-q-head-tile-size" => {
+                    args.params.split_kv_single_q_max_q_head_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-tiled-q-token-tile-size" => {
-                    args.params.tiled_q_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-tiled-q-token-tile-size" => {
+                    args.params.split_kv_tiled_q_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-tiled-kv-token-tile-size" => {
-                    args.params.tiled_kv_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-tiled-q-kv-token-tile-size" => {
+                    args.params.split_kv_tiled_q_kv_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-tiled-q-head-tile-size" => {
-                    args.params.tiled_q_head_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-tiled-q-head-tile-size" => {
+                    args.params.split_kv_tiled_q_head_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
                 "--iters" => args.iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--runs" => args.runs = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--subcomponents" => args.subcomponents = true,
-                "--validate-tiled-q-tokens" => args.validate_tiled_q_tokens = true,
+                "--validate-split-kv-tiled-q" => args.validate_split_kv_tiled_q = true,
                 "--print-limits" => args.print_limits = true,
                 "--bench" => {},
                 other => panic!("unknown argument {other:?}; pass --help for usage"),
@@ -216,7 +218,10 @@ impl Args {
             !args.num_reqs.is_empty(),
             "--num-reqs must include at least one request count"
         );
-        assert!(!args.paths.is_empty(), "--gqa-paths must include at least one path");
+        assert!(
+            !args.split_kv_variants.is_empty(),
+            "--gqa-split-kv-variants must include at least one variant"
+        );
         assert!(
             !args.selected_subcomponents.is_empty(),
             "--gqa-subcomponents must include at least one subcomponent"
@@ -242,9 +247,9 @@ impl Args {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GQABenchPath {
-    SingleQToken,
-    TiledQTokens,
+enum GQASplitKVBenchVariant {
+    SingleQ,
+    TiledQ,
 }
 
 fn next_arg(iter: &mut impl Iterator<Item = String>, name: &str) -> String {
@@ -252,21 +257,24 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} requires a value; pass --help for usage"))
 }
 
-fn parse_gqa_paths(value: &str) -> Vec<GQABenchPath> {
-    let paths = parse_string_list(value, "--gqa-paths")
+fn parse_split_kv_variants(value: &str) -> Vec<GQASplitKVBenchVariant> {
+    let variants = parse_string_list(value, "--gqa-split-kv-variants")
         .into_iter()
         .map(|part| {
             match part.as_str() {
-                "single_q_token" => GQABenchPath::SingleQToken,
-                "tiled_q_tokens" => GQABenchPath::TiledQTokens,
+                "single_q" => GQASplitKVBenchVariant::SingleQ,
+                "tiled_q" => GQASplitKVBenchVariant::TiledQ,
                 _ => {
-                    panic!("invalid --gqa-paths entry {part:?}; expected single_q_token or tiled_q_tokens")
+                    panic!("invalid --gqa-split-kv-variants entry {part:?}; expected single_q or tiled_q")
                 },
             }
         })
         .collect::<Vec<_>>();
-    assert!(!paths.is_empty(), "--gqa-paths must contain at least one path");
-    paths
+    assert!(
+        !variants.is_empty(),
+        "--gqa-split-kv-variants must contain at least one variant"
+    );
+    variants
 }
 
 fn parse_string_list(value: &str, name: &str) -> Vec<String> {
@@ -309,8 +317,8 @@ fn default_gqa_subcomponents() -> Vec<String> {
         "q-norm-rope".to_string(),
         "k-norm-rope".to_string(),
         "kv-page-write".to_string(),
-        "sdpa-single-q-token".to_string(),
-        "sdpa-tiled-q-tokens".to_string(),
+        "split-kv-single-q".to_string(),
+        "split-kv-tiled-q".to_string(),
         "gate".to_string(),
         "output".to_string(),
     ]
@@ -325,16 +333,16 @@ fn print_help_and_exit() -> ! {
 --contexts 0,128
 --num-reqs 1,2,4
 --gqa-tokens-per-req 1,2,4,8
---gqa-paths single_q_token,tiled_q_tokens
+--gqa-split-kv-variants single_q,tiled_q
 --subcomponents
---gqa-subcomponents qgkv,qgkv-to-q-g-k-v,q-norm-rope,k-norm-rope,kv-page-write,sdpa-single-q-token,sdpa-tiled-q-tokens,gate,output
---validate-tiled-q-tokens
---gqa-single-q-token-kv-token-tile-size N
---gqa-single-q-token-num-threads-per-threadblock N
---gqa-single-q-token-max-q-head-tile-size N
---gqa-tiled-q-token-tile-size 8|16
---gqa-tiled-kv-token-tile-size 8|16
---gqa-tiled-q-head-tile-size N
+--gqa-subcomponents qgkv,qgkv-to-q-g-k-v,q-norm-rope,k-norm-rope,kv-page-write,split-kv-single-q,split-kv-tiled-q,gate,output
+--validate-split-kv-tiled-q
+--gqa-split-kv-single-q-kv-token-tile-size N
+--gqa-split-kv-single-q-num-threads-per-threadblock N
+--gqa-split-kv-single-q-max-q-head-tile-size N
+--gqa-split-kv-tiled-q-token-tile-size 8|16
+--gqa-split-kv-tiled-q-kv-token-tile-size 8|16
+--gqa-split-kv-tiled-q-head-tile-size N
 --print-limits
 --iters N
 --warmup-iters N
@@ -343,24 +351,24 @@ fn print_help_and_exit() -> ! {
     std::process::exit(0);
 }
 
-fn gqa_single_q_token_threadblock_memory_bytes(params: GQABenchParams) -> usize {
-    (params.single_q_token_max_q_head_tile_size as usize * params.single_q_token_kv_token_tile_size as usize
-        + params.single_q_token_num_threads_per_threadblock as usize)
+fn split_kv_single_q_threadblock_memory_bytes(params: GQABenchParams) -> usize {
+    (params.split_kv_single_q_max_q_head_tile_size as usize * params.split_kv_single_q_kv_token_tile_size as usize
+        + params.split_kv_single_q_num_threads_per_threadblock as usize)
         * size_of::<f32>()
 }
 
 fn print_gqa_kernel_limits(device: &Device, params: GQABenchParams) {
     let device_max = device.max_threadblock_memory_length();
-    let threadblock_memory = gqa_single_q_token_threadblock_memory_bytes(params);
+    let threadblock_memory = split_kv_single_q_threadblock_memory_bytes(params);
     println!(
-        "metal-limits device={} max_threadblock_memory_bytes={} gqa_path=single_q_token \
-         gqa_single_q_token_kv_token_tile_size={} gqa_single_q_token_num_threads_per_threadblock={} \
-         gqa_single_q_token_max_q_head_tile_size={} gqa_threadblock_memory_bytes={} gqa_valid={}",
+        "metal-limits device={} max_threadblock_memory_bytes={} gqa_split_kv_variant=single_q \
+         gqa_split_kv_single_q_kv_token_tile_size={} gqa_split_kv_single_q_num_threads_per_threadblock={} \
+         gqa_split_kv_single_q_max_q_head_tile_size={} gqa_threadblock_memory_bytes={} gqa_valid={}",
         device.name(),
         device_max,
-        params.single_q_token_kv_token_tile_size,
-        params.single_q_token_num_threads_per_threadblock,
-        params.single_q_token_max_q_head_tile_size,
+        params.split_kv_single_q_kv_token_tile_size,
+        params.split_kv_single_q_num_threads_per_threadblock,
+        params.split_kv_single_q_max_q_head_tile_size,
         threadblock_memory,
         threadblock_memory <= device_max
     );
@@ -587,7 +595,7 @@ fn print_perf(
     num_tokens: u32,
     num_reqs: u32,
     existing_context_len: Option<u32>,
-    path: Option<&str>,
+    split_kv_variant: Option<&str>,
     iters: usize,
     samples: &[f64],
 ) {
@@ -600,20 +608,34 @@ fn print_perf(
     let context_text = existing_context_len
         .map(|value| format!(" ctx={value}"))
         .unwrap_or_default();
-    let path_text = path.map(|value| format!(" path={value}")).unwrap_or_default();
+    let split_kv_variant_text = split_kv_variant
+        .map(|value| format!(" split_kv_variant={value}"))
+        .unwrap_or_default();
     println!(
-        "perf component=gqa impl=full-forward-replay tokens={num_tokens} num_reqs={num_reqs}{context_text}{path_text} \
-         iters={iters} runs={} median_us={median_us:.3} samples_us=[{sample_text}]",
+        "perf component=gqa impl=full-forward-replay tokens={num_tokens} \
+         num_reqs={num_reqs}{context_text}{split_kv_variant_text} iters={iters} runs={} median_us={median_us:.3} \
+         samples_us=[{sample_text}]",
         samples.len()
     );
 }
 
-fn print_skip(num_tokens: u32, num_reqs: u32, existing_context_len: Option<u32>, path: Option<&str>, reason: &str) {
+fn print_skip(
+    num_tokens: u32,
+    num_reqs: u32,
+    existing_context_len: Option<u32>,
+    split_kv_variant: Option<&str>,
+    reason: &str,
+) {
     let context_text = existing_context_len
         .map(|value| format!(" ctx={value}"))
         .unwrap_or_default();
-    let path_text = path.map(|value| format!(" path={value}")).unwrap_or_default();
-    println!("skip component=gqa tokens={num_tokens} num_reqs={num_reqs}{context_text}{path_text} reason={reason}",);
+    let split_kv_variant_text = split_kv_variant
+        .map(|value| format!(" split_kv_variant={value}"))
+        .unwrap_or_default();
+    println!(
+        "skip component=gqa tokens={num_tokens} num_reqs={num_reqs}{context_text}{split_kv_variant_text} \
+         reason={reason}",
+    );
 }
 
 fn print_named_perf(
@@ -718,42 +740,42 @@ fn gqa_sdpa_config(
     end_context_len: u32,
     params: GQABenchParams,
     model: GQAModelProfile,
-) -> GQAPagedSDPAConfig {
-    GQAPagedSDPAConfig {
+) -> GQASplitKVSingleQConfig {
+    GQASplitKVSingleQConfig {
         num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         page_table_layout: gqa_page_table_layout(num_reqs, end_context_len),
-        kv_token_tile_size: params.single_q_token_kv_token_tile_size,
-        num_threads_per_threadblock: params.single_q_token_num_threads_per_threadblock,
+        kv_token_tile_size: params.split_kv_single_q_kv_token_tile_size,
+        num_threads_per_threadblock: params.split_kv_single_q_num_threads_per_threadblock,
         q_head_tile_size: u32::try_from(model.num_q_heads / model.num_kv_heads)
             .expect("GQA q heads per KV head must fit u32")
-            .min(params.single_q_token_max_q_head_tile_size),
+            .min(params.split_kv_single_q_max_q_head_tile_size),
         dtype: Dtype::Bfloat16,
     }
 }
 
-fn gqa_sdpa_shape(replay_shape: GQAReplayShape) -> GQAPagedSDPAShape {
-    GQAPagedSDPAShape {
+fn gqa_sdpa_shape(replay_shape: GQAReplayShape) -> GQASplitKVSingleQShape {
+    GQASplitKVSingleQShape {
         num_total_tokens: replay_shape.num_tokens,
         num_total_sdpa_map_task_templates: replay_shape.num_total_sdpa_map_task_templates,
     }
 }
 
-fn gqa_tiled_sdpa_config(
+fn gqa_split_kv_tiled_q_config(
     page_table_layout: MetalGQAPageTableLayout,
     params: GQABenchParams,
     model: GQAModelProfile,
-) -> GQATiledSDPAConfig {
-    GQATiledSDPAConfig {
+) -> GQASplitKVTiledQConfig {
+    GQASplitKVTiledQConfig {
         num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
-        q_head_tile_size: params.tiled_q_head_tile_size,
-        q_token_tile_size: params.tiled_q_token_tile_size,
-        kv_token_tile_size: params.tiled_kv_token_tile_size,
+        q_head_tile_size: params.split_kv_tiled_q_head_tile_size,
+        q_token_tile_size: params.split_kv_tiled_q_token_tile_size,
+        kv_token_tile_size: params.split_kv_tiled_q_kv_token_tile_size,
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         dtype: Dtype::Bfloat16,

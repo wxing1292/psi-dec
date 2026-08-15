@@ -33,8 +33,8 @@ use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model;
 use inference_executor_metal::model::qwen::v3::executor::init_qwen_3_model_with_dspark;
-use inference_executor_metal::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_compute_config;
 use inference_executor_metal::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_core;
+use inference_executor_metal::model::qwen::v3_x::dspark::attention::qwen3x_dspark_gqa_split_kv_config;
 use inference_executor_metal::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
 use inference_executor_metal::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedArgs;
 use inference_executor_metal::model::qwen::v3_x::dspark::model::Qwen3xDSparkBody;
@@ -241,9 +241,9 @@ impl MainFixture {
         if let Some(dspark_model_dir) = dspark_model_dir {
             let dspark_config =
                 init_qwen3x_dspark_config(dspark_model_dir).expect("unable to load Qwen3 DSpark benchmark config");
-            let compute_config = qwen3x_dspark_gqa_compute_config(&dspark_config, QWEN3_PAGE_SIZE_BYTES)
-                .expect("unable to build Qwen3 DSpark GQA compute config");
-            let tokens_per_page = compute_config.num_tokens_per_page() as usize;
+            let split_kv_config = qwen3x_dspark_gqa_split_kv_config(&dspark_config, QWEN3_PAGE_SIZE_BYTES)
+                .expect("unable to build Qwen3 DSpark GQA SplitKV config");
+            let tokens_per_page = split_kv_config.num_tokens_per_page() as usize;
             num_page_ids_per_block = num_page_ids_per_block
                 .checked_add(
                     dspark_config
@@ -383,11 +383,11 @@ impl DSparkFixture {
         let bindings = resolve_qwen3x_dspark_weight_bindings(&config, store.index().tensor_names())
             .expect("unable to resolve Qwen3 DSpark comparison weights");
         let attention_core = qwen3x_dspark_gqa_core(&config, config.block_size, 0);
-        let attention_compute_config = qwen3x_dspark_gqa_compute_config(&config, QWEN3_PAGE_SIZE_BYTES)
-            .expect("unable to build Qwen3 DSpark GQA compute config");
+        let attention_split_kv_config = qwen3x_dspark_gqa_split_kv_config(&config, QWEN3_PAGE_SIZE_BYTES)
+            .expect("unable to build Qwen3 DSpark GQA SplitKV config");
         let num_layers = config.num_hidden_layers;
         let capacity = DSparkBlockCapacity::new(num_requests, config.block_size);
-        let tokens_per_page = attention_compute_config.num_tokens_per_page() as usize;
+        let tokens_per_page = attention_split_kv_config.num_tokens_per_page() as usize;
         let num_page_ids_per_block = pages_per_cache_block(tokens_per_page);
         let page_table_layout = GQAPageTableLayout {
             num_req_slots: num_requests
@@ -408,7 +408,7 @@ impl DSparkFixture {
         let gqa_state = UngatedDSparkGQAState::new(
             device,
             attention_core,
-            attention_compute_config,
+            attention_split_kv_config,
             page_table_layout,
             capacity,
             capacity.max_tokens,

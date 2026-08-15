@@ -1,4 +1,4 @@
-use inference_backend_metal::components::GQAComputeConfig;
+use inference_backend_metal::components::GQASplitKVConfig;
 
 use self::backend::GQAMetalConfig;
 
@@ -9,13 +9,13 @@ pub mod scratch;
 pub mod ungated_backend;
 pub mod ungated_scratch;
 
-fn gqa_compute_config(
+fn gqa_split_kv_config(
     config: GQAMetalConfig,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-) -> GQAComputeConfig {
-    GQAComputeConfig {
+) -> GQASplitKVConfig {
+    GQASplitKVConfig {
         io_dtype: config.io_dtype,
         page_bytes: config.page_bytes,
         num_q_heads: num_q_heads.try_into().expect("GQA Q-head count must fit u32"),

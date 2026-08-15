@@ -323,9 +323,9 @@ proposal-local K/V      DSparkBlockScratch
 The attention component records this sequence:
 
 ```text
-history_causal_sdpa_map = paged_sdpa.invoke_map(...)
+history_causal_sdpa_map = split_kv_single_q.invoke_map(...)
 block_bidi_sdpa_map = block_sdpa.invoke(...)
-sdpa_reduce = paged_sdpa.invoke_reduce(...)
+sdpa_reduce = split_kv_single_q.invoke_reduce(...)
 ```
 
 The paged map processes accepted history in `[0, anchor_position)`.
@@ -343,7 +343,7 @@ partial exponential sum
 normalized partial output
 ```
 
-The existing `GQAPagedSDPAReduce` combines all partials.
+The existing `GQASplitKVSingleQReduce` combines all partials.
 The block kernel does not accept a configurable mask.
 
 The proposal pass computes local Q/K/V for the current block.
@@ -1455,7 +1455,7 @@ The eight-row Qwen3 GQA benchmark measured:
 | GQA operation        |   Median |
 | -------------------- | -------: |
 | Full tiled GQA       | 0.649 ms |
-| Tiled SDPA only      | 0.319 ms |
+| SplitKV TiledQ only  | 0.319 ms |
 | QKV QMV BN8/BK32     | 0.498 ms |
 | QKV QMM BM8/BN32     | 0.436 ms |
 | QKV QMM BM16/BN32    | 0.485 ms |
@@ -1464,7 +1464,7 @@ The eight-row Qwen3 GQA benchmark measured:
 | Output QMM BM16/BN32 | 0.445 ms |
 
 The existing QMM BM8/BN32 selection is correct for both eight-row GQA projections.
-The existing tiled SDPA `q_head_tile=5` also remained the best tested geometry.
+The existing SplitKV TiledQ `q_head_tile=5` also remained the best tested geometry.
 The eight-row dense-MLP replay measured `1.327 ms` with the existing QMM BM8/BN32 selection.
 
 ```sh

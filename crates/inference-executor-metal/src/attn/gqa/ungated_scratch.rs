@@ -1,4 +1,4 @@
-use inference_backend_metal::components::GQACompute;
+use inference_backend_metal::components::GQASplitKV;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -46,13 +46,13 @@ impl UngatedGQAScratch {
         device: &Device,
         core: &UngatedGQACore,
         config: GQAMetalConfig,
-        compute: GQACompute,
+        split_kv: GQASplitKV,
         max_tokens: usize,
     ) -> Self {
         core.validate();
         config.validate();
         assert!(max_tokens > 0);
-        let max_tokens_per_partial_output = compute.max_query_tokens_per_partial_output() as usize;
+        let max_tokens_per_partial_output = split_kv.max_q_tokens_per_partial_output() as usize;
         let num_sdpa_partial_output_tokens = max_tokens
             .checked_mul(max_tokens_per_partial_output)
             .expect("ungated GQA scratch partial-token capacity must fit usize");

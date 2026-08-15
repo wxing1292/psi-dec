@@ -270,7 +270,7 @@ The Q/K/V/output tensors within one layer must use one layout because the curren
 `GQAMetalConfig`.
 
 `UngatedDSparkGQAState` owns only shared execution state.
-It owns the page table, metadata, shared block/context scratch, and backend-selected single-query history compute contract.
+It owns the page table, metadata, shared block/context scratch, and backend-selected SplitKV SingleQ history contract.
 The shared scratch contract requires equal attention geometry and I/O dtype across layers.
 It does not require equal quantization layout across layers.
 
@@ -279,7 +279,7 @@ One DSpark attention call records this composition:
 ```text
 QKV projection
   -> Q/K norm and RoPE
-  -> history paged-SDPA map
+  -> SplitKV SingleQ history map
   -> block bidirectional-SDPA map
   -> existing GQA partial-output reduce
   -> output projection
@@ -294,9 +294,9 @@ The history metadata supplies a half-open visible range.
 For an anchor at position `p`, that range is `[0, p)`.
 The block kernel supplies the complete local block.
 
-`UngatedDSparkGQAState::prepare_block` gives fixed workload facts to `GQACompute`.
-The backend selects the constrained single-query-token partial ABI once.
-`DSparkGQAMetadataBuffers` stores that exact `GQAComputePath` with the replay shape.
+`UngatedDSparkGQAState::prepare_block` gives fixed workload facts to `GQASplitKV`.
+The backend selects the constrained SplitKV SingleQ partial ABI once.
+`DSparkGQAMetadataBuffers` stores that exact `GQASplitKVVariant` with the replay shape.
 Recording uses the stored path and does not run a second selector.
 
 One block-bidirectional map Task owns one Q token and one Q head.

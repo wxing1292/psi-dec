@@ -2,12 +2,12 @@
 using namespace metal;
 typedef bfloat bfloat16_t;
 
-// For one flat-token/Q-head output coordinate, adjacent
+// SplitKV SingleQ reduce. For one flat-token/Q-head output coordinate, adjacent
 // cu_sdpa_partial_outputs values select the leading partial-output dimension to
 // merge. The cumulative values do not count scalar tensor elements.
 
 template <typename T>
-void gqa_paged_sdpa_reduce_impl(
+void gqa_split_kv_single_q_reduce_impl(
     device const float* partial_exp_sums,
     device const float* partial_max_logits,
     device const T* partial_output,
@@ -48,7 +48,7 @@ void gqa_paged_sdpa_reduce_impl(
     output[gid] = T(global_exp_sum > 0.0f ? output_accumulator / global_exp_sum : 0.0f);
 }
 
-kernel void gqa_paged_sdpa_reduce_f32(
+kernel void gqa_split_kv_single_q_reduce_f32(
     device const float* partial_exp_sums [[buffer(0)]],
     device const float* partial_max_logits [[buffer(1)]],
     device const float* partial_output [[buffer(2)]],
@@ -57,12 +57,12 @@ kernel void gqa_paged_sdpa_reduce_f32(
     constant uint& num_active_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_paged_sdpa_reduce_impl<float>(
+    gqa_split_kv_single_q_reduce_impl<float>(
         partial_exp_sums, partial_max_logits, partial_output, cu_sdpa_partial_outputs, output,
         num_active_tokens, gid);
 }
 
-kernel void gqa_paged_sdpa_reduce_bf16(
+kernel void gqa_split_kv_single_q_reduce_bf16(
     device const float* partial_exp_sums [[buffer(0)]],
     device const float* partial_max_logits [[buffer(1)]],
     device const bfloat16_t* partial_output [[buffer(2)]],
@@ -71,7 +71,7 @@ kernel void gqa_paged_sdpa_reduce_bf16(
     constant uint& num_active_tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    gqa_paged_sdpa_reduce_impl<bfloat16_t>(
+    gqa_split_kv_single_q_reduce_impl<bfloat16_t>(
         partial_exp_sums, partial_max_logits, partial_output, cu_sdpa_partial_outputs, output,
         num_active_tokens, gid);
 }

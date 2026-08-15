@@ -2,23 +2,23 @@
 using namespace metal;
 typedef bfloat bfloat16_t;
 
-// Tiled SDPA map. One logical SDPAMapTask maps 1:1 to one threadblock. Its
+// SplitKV TiledQ SDPA map. One logical SDPAMapTask maps 1:1 to one threadblock. Its
 // fields are sourced as follows:
 //
-// SDPAMapTaskTemplate {  // materialized; three u32 fields
-//   q_token_tile_index,  // sdpa_map_task_templates[sdpa_map_task_template_index, 0]
-//   kv_token_begin,      // sdpa_map_task_templates[sdpa_map_task_template_index, 1]
-//   kv_token_end,        // sdpa_map_task_templates[sdpa_map_task_template_index, 2]
+// KVSplit {              // materialized; three u32 fields
+//   q_token_tile_index,  // kv_splits[kv_split_index, 0]
+//   kv_token_begin,      // kv_splits[kv_split_index, 1]
+//   kv_token_end,        // kv_splits[kv_split_index, 2]
 // }
 // SDPAMapTask {
-//   q_token_tile_index,  // from TaskTemplate
-//   kv_token_begin,      // from TaskTemplate
-//   kv_token_end,        // from TaskTemplate
+//   q_token_tile_index,  // from KVSplit
+//   kv_token_begin,      // from KVSplit
+//   kv_token_end,        // from KVSplit
 //   kv_head_index,       // grid-derived from threadblock_position.x
 //   q_head_tile_index,   // grid-derived from threadblock_position.x
 // }
 //
-// A sentinel TaskTemplate returns without writing any partial output or
+// A sentinel KVSplit returns without writing any partial output or
 // statistics.
 
 template <int NBYTES> struct LoadUnit;
@@ -46,20 +46,20 @@ inline float frag_row_reduce(float v) {
     return v;
 }
 
-kernel void gqa_tiled_sdpa_map(
+kernel void gqa_split_kv_tiled_q_map(
     device const bfloat16_t* q [[buffer(0)]],
     device const bfloat16_t* kv_pages [[buffer(1)]],
     device const uint* req_slots [[buffer(2)]],
     device const uint* page_ids [[buffer(3)]],
     device const uint* flat_token_indices [[buffer(4)]],
     device const uint* q_token_tiles [[buffer(5)]],
-    device const uint* sdpa_map_task_templates [[buffer(6)]],
+    device const uint* kv_splits [[buffer(6)]],
     device bfloat16_t* partial_output [[buffer(7)]],
     device float* partial_exp_sums [[buffer(8)]],
     device float* partial_max_logits [[buffer(9)]],
     constant uint& gqa_layer_index [[buffer(10)]],
     constant uint& num_active_q_token_tiles [[buffer(11)]],
-    constant uint& num_active_sdpa_map_task_templates [[buffer(12)]],
+    constant uint& num_active_kv_splits [[buffer(12)]],
     constant uint& num_active_tokens [[buffer(13)]],
     threadgroup char* shared_mem [[threadgroup(0)]],
     uint3 threadblock_position [[threadgroup_position_in_grid]],
@@ -75,11 +75,11 @@ kernel void gqa_tiled_sdpa_map(
     constexpr int Q_HEADS_PER_KV_HEAD = NUM_Q_HEADS / NUM_KV_HEADS;
     static_assert(NUM_SIMDGROUPS == NUM_SIMDGROUPS_PER_Q_HEAD * Q_HEAD_TILE_SIZE);
 
-    const uint sdpa_map_task_template_index = threadblock_position.y;
-    if (sdpa_map_task_template_index >= num_active_sdpa_map_task_templates) {
+    const uint kv_split_index = threadblock_position.y;
+    if (kv_split_index >= num_active_kv_splits) {
         return;
     }
-    const uint q_token_tile_index = sdpa_map_task_templates[sdpa_map_task_template_index * 3];
+    const uint q_token_tile_index = kv_splits[kv_split_index * 3];
     if (q_token_tile_index >= num_active_q_token_tiles) {
         return;
     }
@@ -89,8 +89,8 @@ kernel void gqa_tiled_sdpa_map(
         return;
     }
     const uint num_tile_tokens = flat_token_end - flat_token_start;
-    const uint kv_token_begin = sdpa_map_task_templates[sdpa_map_task_template_index * 3 + 1];
-    const uint kv_token_end = sdpa_map_task_templates[sdpa_map_task_template_index * 3 + 2];
+    const uint kv_token_begin = kv_splits[kv_split_index * 3 + 1];
+    const uint kv_token_end = kv_splits[kv_split_index * 3 + 2];
     const uint req_slot = req_slots[flat_token_start];
 
     const uint head_group_index = threadblock_position.x;
@@ -299,7 +299,7 @@ kernel void gqa_tiled_sdpa_map(
 
     if (!inactive_token) {
         const ulong partial_output_index =
-            ((ulong)sdpa_map_task_template_index * NUM_Q_HEADS + (ulong)q_head_index) * Q_TOKEN_TILE_SIZE
+            ((ulong)kv_split_index * NUM_Q_HEADS + (ulong)q_head_index) * Q_TOKEN_TILE_SIZE
             + (ulong)token_offset;
         if (fragment_col == 0) {
             partial_exp_sums[partial_output_index] = running_sum;
@@ -321,7 +321,7 @@ kernel void gqa_tiled_sdpa_map(
 // For one Q-token-tile/Q-head output coordinate, adjacent
 // cu_sdpa_partial_outputs values select the leading partial-output dimension to
 // merge. The cumulative values do not count scalar tensor elements.
-kernel void gqa_tiled_sdpa_reduce(
+kernel void gqa_split_kv_tiled_q_reduce(
     device const bfloat16_t* partial_output [[buffer(0)]],
     device const float* partial_exp_sums [[buffer(1)]],
     device const float* partial_max_logits [[buffer(2)]],

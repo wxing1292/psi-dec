@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::GQACompute;
-use inference_backend_metal::components::GQAComputeConfig;
+use inference_backend_metal::components::GQASplitKV;
+use inference_backend_metal::components::GQASplitKVConfig;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::DSparkBlockCapacity;
 use inference_executor_core::attn::DSparkBlockMetadata;
@@ -19,13 +19,13 @@ use crate::attn::gqa::request_page_table::GQARequestPageTable;
 mod file_io;
 
 pub struct UngatedDSparkGQAState {
-    compute: GQACompute,
+    split_kv: GQASplitKV,
     block_scratch: Option<Rc<DSparkBlockScratch>>,
     context_scratch: Option<Rc<DSparkGQAContextScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
     metadata: Option<DSparkGQAMetadataBuffers>,
     core: UngatedDSparkGQACore,
-    compute_config: GQAComputeConfig,
+    split_kv_config: GQASplitKVConfig,
     capacity: DSparkGQACapacity,
     max_context_tokens: usize,
     page_table_layout: GQAPageTableLayout,
@@ -37,7 +37,7 @@ impl UngatedDSparkGQAState {
     pub fn new(
         device: &Device,
         core: UngatedDSparkGQACore,
-        compute_config: GQAComputeConfig,
+        split_kv_config: GQASplitKVConfig,
         page_table_layout: GQAPageTableLayout,
         capacity: DSparkBlockCapacity,
         max_context_tokens: usize,
@@ -50,7 +50,7 @@ impl UngatedDSparkGQAState {
             "DSpark cache page IDs must fit u32"
         );
         core.validate();
-        compute_config.validate();
+        split_kv_config.validate();
         page_table_layout.validate();
         assert_eq!(
             core.block_size, capacity.block_size,
@@ -58,29 +58,29 @@ impl UngatedDSparkGQAState {
         );
         let gqa_capacity = DSparkGQACapacity::new(capacity);
         let attention = &core.attention;
-        assert_eq!(compute_config.num_q_heads as usize, attention.num_q_heads);
-        assert_eq!(compute_config.num_kv_heads as usize, attention.num_kv_heads);
-        assert_eq!(compute_config.head_dim as usize, attention.head_dim);
-        let compute = GQACompute::new_dspark_history(compute_config);
-        let num_tokens_per_page = compute_config.num_tokens_per_page() as usize;
+        assert_eq!(split_kv_config.num_q_heads as usize, attention.num_q_heads);
+        assert_eq!(split_kv_config.num_kv_heads as usize, attention.num_kv_heads);
+        assert_eq!(split_kv_config.head_dim as usize, attention.head_dim);
+        let split_kv = GQASplitKV::new_dspark_history(split_kv_config);
+        let num_tokens_per_page = split_kv_config.num_tokens_per_page() as usize;
         Self {
-            compute,
+            split_kv,
             block_scratch: Some(Rc::new(DSparkBlockScratch::new(
                 device,
                 &core,
-                compute_config.io_dtype,
+                split_kv_config.io_dtype,
                 gqa_capacity,
             ))),
             context_scratch: Some(Rc::new(DSparkGQAContextScratch::new(
                 device,
                 &core,
-                compute_config.io_dtype,
+                split_kv_config.io_dtype,
                 max_context_tokens,
             ))),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
             metadata: Some(DSparkGQAMetadataBuffers::new(device, gqa_capacity)),
             core,
-            compute_config,
+            split_kv_config,
             capacity: gqa_capacity,
             max_context_tokens,
             page_table_layout,
@@ -98,8 +98,8 @@ impl UngatedDSparkGQAState {
             .num_tokens()
             .try_into()
             .expect("DSpark GQA token count must fit u32");
-        let compute_path = self.compute.select(num_tokens, num_tokens);
-        self.metadata().update(block, compute_path)
+        let split_kv_variant = self.split_kv.select(num_tokens, num_tokens);
+        self.metadata().update(block, split_kv_variant)
     }
 
     pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
@@ -196,13 +196,13 @@ impl UngatedDSparkGQAState {
         self.block_scratch = Some(Rc::new(DSparkBlockScratch::new(
             device,
             &self.core,
-            self.compute_config.io_dtype,
+            self.split_kv_config.io_dtype,
             self.capacity,
         )));
         self.context_scratch = Some(Rc::new(DSparkGQAContextScratch::new(
             device,
             &self.core,
-            self.compute_config.io_dtype,
+            self.split_kv_config.io_dtype,
             self.max_context_tokens,
         )));
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
@@ -218,7 +218,7 @@ impl UngatedDSparkGQAState {
 
 #[cfg(test)]
 mod tests {
-    use inference_backend_metal::components::GQAComputeConfig;
+    use inference_backend_metal::components::GQASplitKVConfig;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::DSparkBlockCapacity;
@@ -251,7 +251,7 @@ mod tests {
         UngatedDSparkGQAState::new(
             device,
             UngatedDSparkGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
-            GQAComputeConfig {
+            GQASplitKVConfig {
                 io_dtype: Dtype::Bfloat16,
                 page_bytes: 4096,
                 num_q_heads: 1,

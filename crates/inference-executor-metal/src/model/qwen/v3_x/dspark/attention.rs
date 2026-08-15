@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::GQAComputeConfig;
+use inference_backend_metal::components::GQASplitKVConfig;
 use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -243,19 +243,19 @@ pub fn qwen3x_dspark_gqa_core(
     UngatedDSparkGQACore::new(attention, num_spec_tokens)
 }
 
-pub fn qwen3x_dspark_gqa_compute_config(
+pub fn qwen3x_dspark_gqa_split_kv_config(
     config: &Qwen3xDSparkConfig,
     page_bytes: usize,
-) -> Result<GQAComputeConfig, ModelExecutorError> {
-    let compute_config = GQAComputeConfig {
+) -> Result<GQASplitKVConfig, ModelExecutorError> {
+    let split_kv_config = GQASplitKVConfig {
         io_dtype: Dtype::Bfloat16,
         page_bytes: to_u32("Qwen3x DSpark GQA page_bytes", page_bytes)?,
         num_q_heads: to_u32("Qwen3x DSpark GQA Q-head count", config.num_attention_heads)?,
         num_kv_heads: to_u32("Qwen3x DSpark GQA KV-head count", config.num_key_value_heads)?,
         head_dim: to_u32("Qwen3x DSpark GQA head_dim", config.head_dim)?,
     };
-    compute_config.validate();
-    Ok(compute_config)
+    split_kv_config.validate();
+    Ok(split_kv_config)
 }
 
 fn qwen3x_dspark_gqa_metal_config(
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gqa_compute_config_contains_only_shared_workload_facts() {
+    fn test_gqa_split_kv_config_contains_only_shared_workload_facts() {
         let mut config = config();
         config.quantization.as_mut().unwrap().tensor_overrides.insert(
             "layers.1.self_attn.q_proj.weight".to_string(),
@@ -391,14 +391,14 @@ mod tests {
             },
         );
 
-        let compute = qwen3x_dspark_gqa_compute_config(&config, 32 * 1024).unwrap();
+        let split_kv = qwen3x_dspark_gqa_split_kv_config(&config, 32 * 1024).unwrap();
 
-        assert_eq!(compute.io_dtype, Dtype::Bfloat16);
-        assert_eq!(compute.page_bytes, 32 * 1024);
-        assert_eq!(compute.num_q_heads, 4);
-        assert_eq!(compute.num_kv_heads, 1);
-        assert_eq!(compute.head_dim, 8);
-        assert_eq!(compute.num_tokens_per_page(), 1024);
+        assert_eq!(split_kv.io_dtype, Dtype::Bfloat16);
+        assert_eq!(split_kv.page_bytes, 32 * 1024);
+        assert_eq!(split_kv.num_q_heads, 4);
+        assert_eq!(split_kv.num_kv_heads, 1);
+        assert_eq!(split_kv.head_dim, 8);
+        assert_eq!(split_kv.num_tokens_per_page(), 1024);
     }
 
     #[test]

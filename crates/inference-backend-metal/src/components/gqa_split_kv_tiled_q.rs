@@ -14,9 +14,9 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
-const SOURCE: &str = include_str!("metal/gqa_tiled_attention.metal");
+const SOURCE: &str = include_str!("metal/gqa_split_kv_tiled_q.metal");
 
-/// Tiled SDPA (`T` = tokens, `H` = heads, `D` = head width):
+/// SplitKV TiledQ SDPA (`T` = tokens, `H` = heads, `D` = head width):
 ///
 /// ```text
 /// Q: [Tq, Hq, D]       Q tile: [Tq_tile, Hq_tile, D]
@@ -28,22 +28,22 @@ const SOURCE: &str = include_str!("metal/gqa_tiled_attention.metal");
 ///   -> SDPAPartialOutput [Tq_tile, Hq_tile, D]
 /// SDPAMapTile: (q_token_tile_index, kv_head_index,
 ///               q_head_tile_index, kv_token_tile_index)
-/// SDPAMapTaskTemplate: { q_token_tile_index, kv_token_begin, kv_token_end }
+/// KVSplit: { q_token_tile_index, kv_token_begin, kv_token_end }
 /// SDPAMapTask / threadblock:
-///   { q_token_tile_index, kv_token_begin, kv_token_end } from TaskTemplate
+///   { q_token_tile_index, kv_token_begin, kv_token_end } from KVSplit
 ///   + { kv_head_index, q_head_tile_index } from grid
-/// grid: (Hkv * Q-head tiles, TaskTemplates, 1)
+/// grid: (Hkv * Q-head tiles, KV splits, 1)
 /// threadblock: (Q-token fragments * Q-head tile * 32, 1, 1)
 /// parallel: Q-token tiles, KV heads, Q-head tiles, Q-token fragments
 /// ordered/reduce: consecutive KV tiles merged with online softmax
 /// produces: SDPAPartialOutput + statistics -> final reduce -> SDPAOutput
 /// ```
 ///
-/// Only the TaskTemplate is materialized; the complete Task is comment-only
-/// and does not change the three-`u32` ABI. A Q-token tile never crosses a
-/// request boundary.
+/// Only the KV split is materialized. It uses the shared three-`u32`
+/// TaskTemplate ABI. The complete Task is comment-only. A Q-token tile never
+/// crosses a request boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GQATiledSDPAConfig {
+pub struct GQASplitKVTiledQConfig {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
@@ -56,26 +56,26 @@ pub struct GQATiledSDPAConfig {
     pub page_table_layout: GQAPageTableLayout,
 }
 
-impl GQATiledSDPAConfig {
+impl GQASplitKVTiledQConfig {
     pub fn validate(self) {
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         assert!(self.q_head_tile_size > 0);
         assert!(self.q_head_tile_size <= self.q_heads_per_kv_head());
-        let tiled_profile = (self.head_dim, self.num_tokens_per_page());
+        let tiled_q_profile = (self.head_dim, self.num_tokens_per_page());
         assert!(
-            matches!(tiled_profile, (128, 8) | (256, 16)),
-            "tiled GQA supports only (head_dim, tokens_per_page) profiles (128, 8) and (256, 16), got \
-             {tiled_profile:?}"
+            matches!(tiled_q_profile, (128, 8) | (256, 16)),
+            "GQA SplitKV TiledQ supports only (head_dim, tokens_per_page) profiles (128, 8) and (256, 16), got \
+             {tiled_q_profile:?}"
         );
         assert!(matches!(self.q_token_tile_size, 8 | 16));
         assert!(matches!(self.kv_token_tile_size, 8 | 16));
         assert!(self.num_threads_per_threadblock() <= 256);
         assert!(self.scale > 0.0);
-        assert_eq!(self.dtype, Dtype::Bfloat16, "tiled GQA specializes bf16");
+        assert_eq!(self.dtype, Dtype::Bfloat16, "GQA SplitKV TiledQ specializes bf16");
         self.page_table_layout.validate();
-        assert_u32_count_domain(self.num_head_groups(), "GQA tiled SDPA head groups");
+        assert_u32_count_domain(self.num_head_groups(), "GQA SplitKV TiledQ head groups");
     }
 
     pub fn num_tokens_per_page(self) -> u32 {
@@ -84,7 +84,7 @@ impl GQATiledSDPAConfig {
             .checked_mul(self.head_dim)
             .and_then(|bytes| bytes.checked_mul(2))
             .and_then(|bytes| bytes.checked_mul(self.dtype.item_size().try_into().expect("dtype size must fit u32")))
-            .expect("GQA tiled K/V bytes per token must fit u32");
+            .expect("GQA SplitKV TiledQ K/V bytes per token must fit u32");
         assert!(self.page_bytes.is_multiple_of(kv_bytes_per_token));
         self.page_bytes / kv_bytes_per_token
     }
@@ -99,7 +99,7 @@ impl GQATiledSDPAConfig {
 
     fn num_head_groups(self) -> usize {
         checked_product(
-            "GQA tiled SDPA head-group count",
+            "GQA SplitKV TiledQ head-group count",
             &[self.num_kv_heads as usize, self.num_q_head_tiles_per_kv_head() as usize],
         )
     }
@@ -109,12 +109,12 @@ impl GQATiledSDPAConfig {
             .checked_div(8)
             .and_then(|threads| threads.checked_mul(self.q_head_tile_size))
             .and_then(|threads| threads.checked_mul(32))
-            .expect("GQA tiled threadblock width must fit u32")
+            .expect("GQA SplitKV TiledQ threadblock width must fit u32")
     }
 
-    pub fn q_bytes(self, shape: GQATiledSDPAShape) -> u64 {
+    pub fn q_bytes(self, shape: GQASplitKVTiledQShape) -> u64 {
         checked_product_u64(
-            "GQA tiled query byte length",
+            "GQA SplitKV TiledQ query byte length",
             &[
                 shape.num_total_tokens as u64,
                 self.num_q_heads as u64,
@@ -124,9 +124,9 @@ impl GQATiledSDPAConfig {
         )
     }
 
-    pub fn partial_output_bytes(self, shape: GQATiledSDPAShape) -> u64 {
+    pub fn partial_output_bytes(self, shape: GQASplitKVTiledQShape) -> u64 {
         checked_product_u64(
-            "GQA tiled partial output byte length",
+            "GQA SplitKV TiledQ partial output byte length",
             &[
                 shape.num_total_sdpa_map_task_templates as u64,
                 self.num_q_heads as u64,
@@ -137,9 +137,9 @@ impl GQATiledSDPAConfig {
         )
     }
 
-    pub fn partial_output_stats_bytes(self, shape: GQATiledSDPAShape) -> u64 {
+    pub fn partial_output_stats_bytes(self, shape: GQASplitKVTiledQShape) -> u64 {
         checked_product_u64(
-            "GQA tiled partial statistic byte length",
+            "GQA SplitKV TiledQ partial statistic byte length",
             &[
                 shape.num_total_sdpa_map_task_templates as u64,
                 self.num_q_heads as u64,
@@ -152,7 +152,7 @@ impl GQATiledSDPAConfig {
     pub fn map_threadblock_memory_bytes(self) -> usize {
         let padded_head_dim = self.head_dim as usize + 16 / self.dtype.item_size();
         checked_product(
-            "GQA tiled threadgroup memory byte length",
+            "GQA SplitKV TiledQ threadgroup memory byte length",
             &[
                 2,
                 self.kv_token_tile_size as usize,
@@ -164,35 +164,38 @@ impl GQATiledSDPAConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQATiledSDPAShape {
+pub struct GQASplitKVTiledQShape {
     pub num_total_tokens: u32,
     pub num_total_q_token_tiles: u32,
     pub num_total_sdpa_map_task_templates: u32,
 }
 
-impl GQATiledSDPAShape {
-    pub fn validate(self, config: GQATiledSDPAConfig) {
+impl GQASplitKVTiledQShape {
+    pub fn validate(self, config: GQASplitKVTiledQConfig) {
         config.validate();
         assert!(self.num_total_tokens > 0);
         assert!(self.num_total_q_token_tiles > 0 && self.num_total_q_token_tiles <= self.num_total_tokens);
         assert!(self.num_total_sdpa_map_task_templates >= self.num_total_q_token_tiles);
-        assert_u32_index_domain(self.num_q_token_tile_values(), "GQA tiled SDPA Q-token-tile metadata");
+        assert_u32_index_domain(
+            self.num_q_token_tile_values(),
+            "GQA SplitKV TiledQ Q-token-tile metadata",
+        );
         assert_u32_index_domain(
             self.num_sdpa_map_task_template_values(),
-            "GQA tiled SDPA map TaskTemplate metadata",
+            "GQA SplitKV TiledQ map TaskTemplate metadata",
         );
     }
 
     fn num_q_token_tile_values(self) -> usize {
         checked_product(
-            "GQA tiled SDPA Q-token-tile metadata element count",
+            "GQA SplitKV TiledQ Q-token-tile metadata element count",
             &[self.num_total_q_token_tiles as usize, 2],
         )
     }
 
     fn num_sdpa_map_task_template_values(self) -> usize {
         checked_product(
-            "GQA tiled SDPA map TaskTemplate metadata element count",
+            "GQA SplitKV TiledQ map TaskTemplate metadata element count",
             &[self.num_total_sdpa_map_task_templates as usize, 3],
         )
     }
@@ -210,7 +213,7 @@ fn checked_product_u64(name: &str, factors: &[u64]) -> u64 {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQATiledSDPAMapBuffers<'a> {
+pub struct GQASplitKVTiledQMapBuffers<'a> {
     pub q: &'a Buffer,
     pub kv_pages: &'a Buffer,
     pub req_slots: &'a Buffer,
@@ -224,7 +227,7 @@ pub struct GQATiledSDPAMapBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQATiledSDPAReduceBuffers<'a> {
+pub struct GQASplitKVTiledQReduceBuffers<'a> {
     pub partial_output: &'a Buffer,
     pub partial_exp_sums: &'a Buffer,
     pub partial_max_logits: &'a Buffer,
@@ -233,19 +236,19 @@ pub struct GQATiledSDPAReduceBuffers<'a> {
     pub output: &'a Buffer,
 }
 
-pub struct GQATiledSDPAKernels {
-    config: GQATiledSDPAConfig,
-    shape: GQATiledSDPAShape,
+pub struct GQASplitKVTiledQKernels {
+    config: GQASplitKVTiledQConfig,
+    shape: GQASplitKVTiledQShape,
     map: Kernel,
     reduce: Kernel,
 }
 
-impl GQATiledSDPAKernels {
-    pub fn new(device: &Device, config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> Self {
+impl GQASplitKVTiledQKernels {
+    pub fn new(device: &Device, config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> Self {
         shape.validate(config);
         assert!(
             config.map_threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
-            "GQA tiled SDPA shape needs {} bytes of threadblock memory but device only supports {}",
+            "GQA SplitKV TiledQ shape needs {} bytes of threadblock memory but device only supports {}",
             config.map_threadblock_memory_bytes(),
             device.max_threadblock_memory_length()
         );
@@ -253,17 +256,17 @@ impl GQATiledSDPAKernels {
         Self {
             config,
             shape,
-            map: Kernel::new(device, &source, "gqa_tiled_sdpa_map"),
-            reduce: Kernel::new(device, &source, "gqa_tiled_sdpa_reduce"),
+            map: Kernel::new(device, &source, "gqa_split_kv_tiled_q_map"),
+            reduce: Kernel::new(device, &source, "gqa_split_kv_tiled_q_reduce"),
         }
     }
 
     pub fn invoke_map<'a>(
         &self,
-        buffers: GQATiledSDPAMapBuffers<'a>,
+        buffers: GQASplitKVTiledQMapBuffers<'a>,
         page_table_index: ReplayU32,
-    ) -> GQATiledSDPAMapInvocation<'a> {
-        GQATiledSDPAMapInvocation {
+    ) -> GQASplitKVTiledQMapInvocation<'a> {
+        GQASplitKVTiledQMapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -271,19 +274,19 @@ impl GQATiledSDPAKernels {
             page_table_index,
             num_active_tokens: ReplayU32::Fixed(self.shape.num_total_tokens),
             num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_total_q_token_tiles),
-            num_active_sdpa_map_task_templates: ReplayU32::Fixed(self.shape.num_total_sdpa_map_task_templates),
+            num_active_kv_splits: ReplayU32::Fixed(self.shape.num_total_sdpa_map_task_templates),
         }
     }
 
     pub fn invoke_map_bucketed<'a>(
         &self,
-        buffers: GQATiledSDPAMapBuffers<'a>,
+        buffers: GQASplitKVTiledQMapBuffers<'a>,
         page_table_index: ReplayU32,
         num_active_tokens: ReplayU32,
         num_active_q_token_tiles: ReplayU32,
-        num_active_sdpa_map_task_templates: ReplayU32,
-    ) -> GQATiledSDPAMapInvocation<'a> {
-        GQATiledSDPAMapInvocation {
+        num_active_kv_splits: ReplayU32,
+    ) -> GQASplitKVTiledQMapInvocation<'a> {
+        GQASplitKVTiledQMapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -291,12 +294,15 @@ impl GQATiledSDPAKernels {
             page_table_index,
             num_active_tokens,
             num_active_q_token_tiles,
-            num_active_sdpa_map_task_templates,
+            num_active_kv_splits,
         }
     }
 
-    pub fn invoke_reduce<'a>(&self, buffers: GQATiledSDPAReduceBuffers<'a>) -> GQATiledSDPAReduceInvocation<'a> {
-        GQATiledSDPAReduceInvocation {
+    pub fn invoke_reduce<'a>(
+        &self,
+        buffers: GQASplitKVTiledQReduceBuffers<'a>,
+    ) -> GQASplitKVTiledQReduceInvocation<'a> {
+        GQASplitKVTiledQReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -307,10 +313,10 @@ impl GQATiledSDPAKernels {
 
     pub fn invoke_reduce_bucketed<'a>(
         &self,
-        buffers: GQATiledSDPAReduceBuffers<'a>,
+        buffers: GQASplitKVTiledQReduceBuffers<'a>,
         num_active_q_token_tiles: ReplayU32,
-    ) -> GQATiledSDPAReduceInvocation<'a> {
-        GQATiledSDPAReduceInvocation {
+    ) -> GQASplitKVTiledQReduceInvocation<'a> {
+        GQASplitKVTiledQReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -320,18 +326,18 @@ impl GQATiledSDPAKernels {
     }
 }
 
-pub struct GQATiledSDPAMapInvocation<'a> {
+pub struct GQASplitKVTiledQMapInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: GQATiledSDPAConfig,
-    shape: GQATiledSDPAShape,
-    buffers: GQATiledSDPAMapBuffers<'a>,
+    config: GQASplitKVTiledQConfig,
+    shape: GQASplitKVTiledQShape,
+    buffers: GQASplitKVTiledQMapBuffers<'a>,
     page_table_index: ReplayU32,
     num_active_tokens: ReplayU32,
     num_active_q_token_tiles: ReplayU32,
-    num_active_sdpa_map_task_templates: ReplayU32,
+    num_active_kv_splits: ReplayU32,
 }
 
-impl Operator for GQATiledSDPAMapInvocation<'_> {
+impl Operator for GQASplitKVTiledQMapInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let shape = self.shape;
         let config = self.config;
@@ -376,21 +382,21 @@ impl Operator for GQATiledSDPAMapInvocation<'_> {
             11,
             self.num_active_q_token_tiles,
             shape.num_total_q_token_tiles,
-            "GQA tiled SDPA active Q-token-tile count",
+            "GQA SplitKV TiledQ active Q-token-tile count",
         );
         set_replay_u32(
             recorder,
             12,
-            self.num_active_sdpa_map_task_templates,
+            self.num_active_kv_splits,
             shape.num_total_sdpa_map_task_templates,
-            "GQA tiled SDPA active TaskTemplate count",
+            "GQA SplitKV TiledQ active KV split count",
         );
         set_replay_u32(
             recorder,
             13,
             self.num_active_tokens,
             shape.num_total_tokens,
-            "GQA tiled SDPA active token count",
+            "GQA SplitKV TiledQ active token count",
         );
         recorder.set_threadblock_memory_length(0, config.map_threadblock_memory_bytes());
         recorder.dispatch_threadblocks(
@@ -404,15 +410,15 @@ impl Operator for GQATiledSDPAMapInvocation<'_> {
     }
 }
 
-pub struct GQATiledSDPAReduceInvocation<'a> {
+pub struct GQASplitKVTiledQReduceInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: GQATiledSDPAConfig,
-    shape: GQATiledSDPAShape,
-    buffers: GQATiledSDPAReduceBuffers<'a>,
+    config: GQASplitKVTiledQConfig,
+    shape: GQASplitKVTiledQShape,
+    buffers: GQASplitKVTiledQReduceBuffers<'a>,
     num_active_q_token_tiles: ReplayU32,
 }
 
-impl Operator for GQATiledSDPAReduceInvocation<'_> {
+impl Operator for GQASplitKVTiledQReduceInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let shape = self.shape;
         let config = self.config;
@@ -439,7 +445,7 @@ impl Operator for GQATiledSDPAReduceInvocation<'_> {
             6,
             self.num_active_q_token_tiles,
             shape.num_total_q_token_tiles,
-            "GQA tiled SDPA active Q-token-tile count",
+            "GQA SplitKV TiledQ active Q-token-tile count",
         );
         recorder.dispatch_threadblocks(
             (config.num_q_heads as usize, shape.num_total_q_token_tiles as usize, 1),
@@ -448,7 +454,7 @@ impl Operator for GQATiledSDPAReduceInvocation<'_> {
     }
 }
 
-fn source(config: GQATiledSDPAConfig, shape: GQATiledSDPAShape) -> String {
+fn source(config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> String {
     format!(
         r#"
 #define NUM_TOKENS {num_tokens}
@@ -499,5 +505,5 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 }
 
 #[cfg(test)]
-#[path = "gqa_tiled_attention_test.rs"]
+#[path = "gqa_split_kv_tiled_q_test.rs"]
 mod tests;
