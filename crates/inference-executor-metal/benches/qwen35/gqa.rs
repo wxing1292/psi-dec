@@ -28,6 +28,7 @@ use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
+use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
@@ -41,8 +42,7 @@ const BITS: u32 = 4;
 const GQA_ROPE_DIM: u32 = 64;
 const GQA_ROPE_THETA: f32 = 10_000_000.0;
 const GQA_NORM_EPS: f32 = 1.0e-6;
-const GQA_MAX_TOKENS: usize = 64;
-const TOKENS_PER_PAGE: u32 = 16;
+const DEFAULT_MAX_TOKENS: usize = 128;
 const SPLIT_KV_SINGLE_Q_KV_TOKEN_TILE_SIZE: u32 = 256;
 const SPLIT_KV_SINGLE_Q_NUM_THREADS_PER_THREADBLOCK: u32 = 256;
 const SPLIT_KV_SINGLE_Q_Q_HEAD_TILE_SIZE_CAP: u32 = 8;
@@ -112,9 +112,15 @@ impl GQAModelProfile {
     }
 
     fn page_bytes(self) -> u32 {
-        (2 * self.num_kv_heads * TOKENS_PER_PAGE as usize * self.head_dim * Dtype::Bfloat16.item_size())
+        QWEN35_PAGE_SIZE_BYTES.try_into().expect("GQA page bytes must fit u32")
+    }
+
+    fn num_tokens_per_page(self) -> u32 {
+        let bytes_per_token = 2 * self.num_kv_heads * self.head_dim * Dtype::Bfloat16.item_size();
+        assert!(QWEN35_PAGE_SIZE_BYTES.is_multiple_of(bytes_per_token));
+        (QWEN35_PAGE_SIZE_BYTES / bytes_per_token)
             .try_into()
-            .expect("GQA page bytes must fit u32")
+            .expect("GQA tokens per page must fit u32")
     }
 }
 
@@ -125,6 +131,8 @@ struct Args {
     contexts: Vec<u32>,
     num_reqs: Vec<u32>,
     tokens_per_req: Option<Vec<u32>>,
+    contexts_per_req: Option<Vec<u32>>,
+    max_tokens: usize,
     split_kv_variants: Vec<GQASplitKVBenchVariant>,
     selected_subcomponents: Vec<String>,
     params: GQABenchParams,
@@ -145,6 +153,8 @@ impl Args {
             contexts: Vec::new(),
             num_reqs: vec![1],
             tokens_per_req: None,
+            contexts_per_req: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
             split_kv_variants: vec![GQASplitKVBenchVariant::SingleQ, GQASplitKVBenchVariant::TiledQ],
             selected_subcomponents: default_gqa_subcomponents(),
             params: GQABenchParams {
@@ -174,6 +184,10 @@ impl Args {
                 "--gqa-tokens-per-req" => {
                     args.tokens_per_req = Some(parse_u32_list(&next_arg(&mut values, &arg), &arg))
                 },
+                "--gqa-contexts-per-req" => {
+                    args.contexts_per_req = Some(parse_u32_list(&next_arg(&mut values, &arg), &arg))
+                },
+                "--max-tokens" => args.max_tokens = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--gqa-split-kv-variants" => {
                     args.split_kv_variants = parse_split_kv_variants(&next_arg(&mut values, &arg))
                 },
@@ -228,6 +242,12 @@ impl Args {
         );
         assert!(args.iters > 0, "--iters must be positive");
         assert!(args.runs > 0, "--runs must be positive");
+        assert!(args.max_tokens > 0, "--max-tokens must be positive");
+        assert!(u32::try_from(args.max_tokens).is_ok(), "--max-tokens must fit u32");
+        assert!(
+            args.tokens.iter().all(|&count| count as usize <= args.max_tokens),
+            "--tokens entries must not exceed --max-tokens"
+        );
         for &num_reqs in &args.num_reqs {
             assert!(num_reqs > 0, "--num-reqs entries must be positive");
         }
@@ -237,9 +257,28 @@ impl Args {
                 tokens_per_req.iter().all(|&count| count > 0),
                 "--gqa-tokens-per-req entries must be positive"
             );
+            let total_tokens = tokens_per_req
+                .iter()
+                .try_fold(0u32, |total, &count| total.checked_add(count))
+                .expect("--gqa-tokens-per-req total must fit u32");
             assert!(
-                tokens_per_req.iter().sum::<u32>() as usize <= GQA_MAX_TOKENS,
-                "--gqa-tokens-per-req total exceeds the GQA bench token capacity"
+                total_tokens as usize <= args.max_tokens,
+                "--gqa-tokens-per-req total exceeds --max-tokens"
+            );
+        }
+        if let Some(contexts_per_req) = &args.contexts_per_req {
+            let tokens_per_req = args
+                .tokens_per_req
+                .as_ref()
+                .expect("--gqa-contexts-per-req requires --gqa-tokens-per-req");
+            assert_eq!(
+                contexts_per_req.len(),
+                tokens_per_req.len(),
+                "--gqa-contexts-per-req and --gqa-tokens-per-req must have the same length"
+            );
+            assert!(
+                args.contexts.is_empty(),
+                "--gqa-contexts-per-req cannot be combined with --contexts"
             );
         }
         args
@@ -333,6 +372,8 @@ fn print_help_and_exit() -> ! {
 --contexts 0,128
 --num-reqs 1,2,4
 --gqa-tokens-per-req 1,2,4,8
+--gqa-contexts-per-req 0,128,1024,65536
+--max-tokens 128
 --gqa-split-kv-variants single_q,tiled_q
 --subcomponents
 --gqa-subcomponents qgkv,qgkv-to-q-g-k-v,q-norm-rope,k-norm-rope,kv-page-write,split-kv-single-q,split-kv-tiled-q,gate,output
@@ -459,14 +500,14 @@ fn gqa_attention_reference_at(
     );
     let kv_page_values = kv_pages_buffer.read_typed::<u16>(0, kv_pages_buffer.len_bytes() / size_of::<u16>());
     let page_id_values = page_ids_buffer.read_typed::<u32>(0, page_ids_buffer.len_bytes() / size_of::<u32>());
-    let page_slots = 2 * model.num_kv_heads * TOKENS_PER_PAGE as usize * model.head_dim;
+    let tokens_per_page = model.num_tokens_per_page() as usize;
+    let page_slots = 2 * model.num_kv_heads * tokens_per_page * model.head_dim;
     let mut logits = Vec::with_capacity(token_index + 1);
     for context_token_index in 0..=token_index {
-        let block_index = context_token_index / TOKENS_PER_PAGE as usize;
+        let block_index = context_token_index / tokens_per_page;
         let page_id = page_id_values[req_slot * num_blocks as usize + block_index] as usize;
-        let page_token_index = context_token_index % TOKENS_PER_PAGE as usize;
-        let k_start =
-            page_id * page_slots + (kv_head_index * TOKENS_PER_PAGE as usize + page_token_index) * model.head_dim;
+        let page_token_index = context_token_index % tokens_per_page;
+        let k_start = page_id * page_slots + (kv_head_index * tokens_per_page + page_token_index) * model.head_dim;
         let dot = q_values
             .iter()
             .zip(&kv_page_values[k_start..k_start + model.head_dim])
@@ -480,11 +521,11 @@ fn gqa_attention_reference_at(
         .iter()
         .enumerate()
         .map(|(context_token_index, logit)| {
-            let block_index = context_token_index / TOKENS_PER_PAGE as usize;
+            let block_index = context_token_index / tokens_per_page;
             let page_id = page_id_values[req_slot * num_blocks as usize + block_index] as usize;
-            let page_token_index = context_token_index % TOKENS_PER_PAGE as usize;
+            let page_token_index = context_token_index % tokens_per_page;
             let v_index = page_id * page_slots
-                + ((model.num_kv_heads + kv_head_index) * TOKENS_PER_PAGE as usize + page_token_index) * model.head_dim
+                + ((model.num_kv_heads + kv_head_index) * tokens_per_page + page_token_index) * model.head_dim
                 + dim;
             ((logit - max_logit).exp() / exp_sum) * bf16::from_bits(kv_page_values[v_index]).to_f32()
         })
@@ -747,7 +788,7 @@ fn gqa_sdpa_config(
         head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
-        page_table_layout: gqa_page_table_layout(num_reqs, end_context_len),
+        page_table_layout: gqa_page_table_layout(num_reqs, end_context_len, model),
         kv_token_tile_size: params.split_kv_single_q_kv_token_tile_size,
         num_threads_per_threadblock: params.split_kv_single_q_num_threads_per_threadblock,
         q_head_tile_size: u32::try_from(model.num_q_heads / model.num_kv_heads)
@@ -783,10 +824,10 @@ fn gqa_split_kv_tiled_q_config(
     }
 }
 
-fn gqa_page_table_layout(num_reqs: u32, end_context_len: u32) -> MetalGQAPageTableLayout {
+fn gqa_page_table_layout(num_reqs: u32, end_context_len: u32, model: GQAModelProfile) -> MetalGQAPageTableLayout {
     MetalGQAPageTableLayout {
         num_req_slots: num_reqs,
-        num_blocks: end_context_len.div_ceil(TOKENS_PER_PAGE).max(1),
+        num_blocks: end_context_len.div_ceil(model.num_tokens_per_page()).max(1),
         num_gqa_layers: 1,
         num_page_ids_per_block: 1,
     }

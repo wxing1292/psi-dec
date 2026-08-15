@@ -100,8 +100,11 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   The timed buffer-to-file case overwrites the same range with `F_NOCACHE` enabled and calls `sync_all` during each
   iteration.
   File creation, file opening, pattern generation, correctness validation, and cleanup remain outside all timed cases.
-- `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts the SplitKV `single_q` or `tiled_q` variant. It can run an
-  explicit untimed `--validate-split-kv-tiled-q` comparison.
+- `qwen35_gqa` selects `--gqa-model 27b|35b` and accepts the SplitKV `single_q` or `tiled_q` variant. It derives KV
+  tokens per page from the production 32 KiB page size and the selected model profile. It can run an explicit untimed
+  `--validate-split-kv-tiled-q` comparison. `--max-tokens` fixes the segment-metadata capacity and the current
+  active-partial-state scheduling budget for both candidates. The default is the server default of 128. Each case
+  reports the active KV splits, fixed-TQ reserved partial slots, active partial states, and segment distribution.
 - `qwen3_gqa` loads real Qwen3 ungated-GQA weights. It measures full replay, SplitKV-only variants, and exact QKV/output
   projection kernels.
 - `qwen3_gqa` exposes static SplitKV tile geometry as CLI arguments. It can validate SingleQ output against TiledQ
@@ -149,7 +152,11 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   materializes every current row into a distinct slot and uses the production candidate-state kernels.
   `--subcomponents` reports candidate compute as `gdn.compute_candidate_state`.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
-- `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer4`, `first4`, or `main_all`.
+- `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer3`, `layer4`, `first4`, or `main_all`.
+  For the 27B schedule, `layer3` is the first GQA layer. The bench submits the GQA and GDN replay arguments that the
+  selected layer range declares. `--max-tokens` defaults to 128. It fixes the scratch and metadata capacity and the
+  current active-partial-state scheduling budget. The bench uses the exact active replay extent. GQA cases report the
+  selected variant, padded replay extent, and materialized segment distribution.
 - `qwen35_output` begins at final norm, gather, and unembedding. It can isolate sampling and readback.
 - `qwen35_executor` measures the public executor contract with `e2e_wo_mtp` and `e2e_w_mtp` cases.
 - The `e2e_w_mtp` case accepts `--num-spec-tokens N` and defaults to one speculative token.
@@ -203,8 +210,16 @@ cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
   --contexts 0 --num-reqs 1 --gqa-split-kv-variants single_q \
   --iters 1 --warmup-iters 0 --runs 1
 
+cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
+  --model-dir <27b-model-dir> --gqa-model 27b \
+  --gqa-tokens-per-req 64,1 --gqa-contexts-per-req 1024,65536 \
+  --max-tokens 128 \
+  --gqa-split-kv-variants single_q,tiled_q \
+  --iters 1 --warmup-iters 0 --runs 1
+
 cargo bench -p inference-executor-metal --bench qwen35_layers -- \
   --model-dir <27b-model-dir> --cases layer0 --tokens 1 --contexts 0 \
+  --max-tokens 128 \
   --iters 1 --warmup-iters 0 --runs 1
 
 cargo bench -p inference-executor-metal --bench qwen35_executor -- \

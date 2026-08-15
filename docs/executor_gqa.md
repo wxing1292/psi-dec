@@ -979,6 +979,9 @@ The validation also prints the derived threadgroup/register shape.
 For `qwen35_gqa`, `--gqa-model 27b|35b` selects the real-weight layer profile. Pass the matching model directory with
 `--model-dir`.
 
+The bench uses the production 32 KiB physical page size. It derives the KV tokens per page from the selected model
+profile and the bf16 K/V element size. The 27B profile uses 8 tokens per page. The 35B profile uses 16 tokens per page.
+
 For GQA, `--tokens` is the total current flat-token count. `--num-reqs` is the number of request segments in that
 microbatch. `--contexts` is the existing context length for each request before its measured tokens.
 
@@ -993,6 +996,13 @@ For a prefill/suffix sweep, you may use `--tokens 64 --num-reqs 1 --contexts 0,2
 
 Without an explicit context list, the bench uses existing context length zero. `--gqa-tokens-per-req` supplies explicit
 ragged per-request token counts.
+
+`--gqa-contexts-per-req` supplies the matching existing context length for each ragged request. It requires
+`--gqa-tokens-per-req` and cannot be combined with `--contexts`.
+
+`--max-tokens` fixes the segment-metadata capacity and current active-partial-state scheduling budget for both forced
+SplitKV candidates. The default is 128, which matches the server default. Each case reports the materialized KV-split
+count, fixed-TQ reserved partial slots, active partial states, and segment distribution for both candidates.
 
 The comparison replay reports `split_kv_variant=single_q` or `split_kv_variant=tiled_q`. Model execution uses the
 automatic selector described above.

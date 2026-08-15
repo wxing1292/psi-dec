@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::mem::size_of;
 
 use inference_backend_metal::components::GQAActivationGateBuffers;
@@ -45,7 +46,6 @@ use safetensors::SafeTensors;
 
 use crate::Args;
 use crate::BITS;
-use crate::GQA_MAX_TOKENS;
 use crate::GQA_NORM_EPS;
 use crate::GQA_ROPE_DIM;
 use crate::GQA_ROPE_THETA;
@@ -53,7 +53,6 @@ use crate::GQABenchParams;
 use crate::GQAModelProfile;
 use crate::GQASplitKVBenchVariant;
 use crate::GROUP_SIZE;
-use crate::TOKENS_PER_PAGE;
 use crate::assert_bf16_close;
 use crate::build_single_invocation_replay;
 use crate::cu_tokens;
@@ -110,11 +109,36 @@ pub fn run(args: Args) {
 
     for num_tokens in token_counts {
         if let Some(tokens_per_req) = &args.tokens_per_req {
+            if let Some(contexts_per_req) = &args.contexts_per_req {
+                let fixture = RealGQAFixture::new(
+                    &device,
+                    tokens_per_req.clone(),
+                    contexts_per_req.clone(),
+                    args.max_tokens,
+                    &weights,
+                    args.params,
+                    args.model,
+                );
+                if args.validate_split_kv_tiled_q {
+                    fixture.validate_split_kv_tiled_q_attention();
+                }
+                fixture.measure(&args.split_kv_variants, args.warmup_iters, args.iters, args.runs);
+                if args.subcomponents {
+                    fixture.measure_subcomponents(
+                        &args.selected_subcomponents,
+                        args.warmup_iters,
+                        args.iters,
+                        args.runs,
+                    );
+                }
+                continue;
+            }
             for &existing_context_len in &contexts {
                 let fixture = RealGQAFixture::new(
                     &device,
                     tokens_per_req.clone(),
-                    existing_context_len,
+                    vec![existing_context_len; tokens_per_req.len()],
+                    args.max_tokens,
                     &weights,
                     args.params,
                     args.model,
@@ -144,7 +168,8 @@ pub fn run(args: Args) {
                 let fixture = RealGQAFixture::new(
                     &device,
                     request_token_counts(num_tokens, num_reqs),
-                    existing_context_len,
+                    vec![existing_context_len; num_reqs as usize],
+                    args.max_tokens,
                     &weights,
                     args.params,
                     args.model,
@@ -173,8 +198,10 @@ struct RealGQAFixture<'a> {
     params: GQABenchParams,
     num_tokens: u32,
     num_reqs: u32,
+    max_tokens: usize,
     num_tokens_per_req: Vec<u32>,
-    existing_context_len: u32,
+    existing_context_lens: Vec<u32>,
+    uniform_context_len: Option<u32>,
     end_context_len: u32,
     next_hidden_state: Buffer,
     replay: ReplayProgram,
@@ -208,7 +235,8 @@ impl<'a> RealGQAFixture<'a> {
     fn new(
         device: &Device,
         num_tokens_per_req: Vec<u32>,
-        existing_context_len: u32,
+        existing_context_lens: Vec<u32>,
+        max_tokens: usize,
         weights: &'a RealGQAWeights,
         mut params: GQABenchParams,
         model: GQAModelProfile,
@@ -221,15 +249,17 @@ impl<'a> RealGQAFixture<'a> {
             num_tokens_per_req.iter().all(|&num_req_tokens| num_req_tokens > 0),
             "GQA bench token counts per request must be positive"
         );
+        assert_eq!(
+            existing_context_lens.len(),
+            num_tokens_per_req.len(),
+            "GQA bench context and token count lists must have the same length"
+        );
         let num_tokens = num_tokens_per_req.iter().sum::<u32>();
         let num_reqs = num_tokens_per_req
             .len()
             .try_into()
             .expect("GQA request count must fit u32");
-        assert!(
-            num_tokens as usize <= GQA_MAX_TOKENS,
-            "GQA bench token capacity exceeded"
-        );
+        assert!(num_tokens as usize <= max_tokens, "GQA bench token capacity exceeded");
         let stream = Stream::new(device);
         let core = GQACore::new(
             model.model_layer_index,
@@ -250,9 +280,21 @@ impl<'a> RealGQAFixture<'a> {
             io_dtype: Dtype::Bfloat16,
         };
         let backend = GQA::new(device, core, config);
-        let max_num_req_tokens = num_tokens_per_req.iter().copied().max().unwrap_or(0);
-        let end_context_len = existing_context_len + max_num_req_tokens;
-        let num_blocks = end_context_len.div_ceil(TOKENS_PER_PAGE).max(1);
+        let end_context_len = existing_context_lens
+            .iter()
+            .zip(&num_tokens_per_req)
+            .map(|(&context, &num_req_tokens)| {
+                context
+                    .checked_add(num_req_tokens)
+                    .expect("GQA bench request context length must fit u32")
+            })
+            .max()
+            .unwrap_or(0);
+        let uniform_context_len = existing_context_lens
+            .iter()
+            .all(|&context| context == existing_context_lens[0])
+            .then_some(existing_context_lens[0]);
+        let num_blocks = end_context_len.div_ceil(model.num_tokens_per_page()).max(1);
         let page_table_layout = GQAPageTableLayout {
             num_req_slots: num_reqs,
             num_blocks,
@@ -264,7 +306,7 @@ impl<'a> RealGQAFixture<'a> {
             device,
             num_reqs as usize * num_blocks as usize * config.page_bytes as usize,
         );
-        assert!(num_tokens as usize <= GQA_MAX_TOKENS);
+        assert!(num_tokens as usize <= max_tokens);
         let q_heads_per_kv_head = model.num_q_heads / model.num_kv_heads;
         let single_q_head_tile_size = q_heads_per_kv_head
             .min(params.split_kv_single_q_max_q_head_tile_size as usize)
@@ -286,10 +328,10 @@ impl<'a> RealGQAFixture<'a> {
                 .try_into()
                 .expect("GQA Q-head tile size must fit u32");
         }
-        let batch_metadata = GQAMetadataBuffers::new(device, GQA_MAX_TOKENS);
+        let batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let shape = batch_metadata.update(
             &(0..num_reqs).collect::<Vec<_>>(),
-            &vec![existing_context_len; num_reqs as usize],
+            &existing_context_lens,
             &cu_tokens(&num_tokens_per_req)
                 .into_iter()
                 .map(|value| value as u32)
@@ -301,10 +343,10 @@ impl<'a> RealGQAFixture<'a> {
             },
         );
         let page_ids = Buffer::from_slice(device, &page_table(num_reqs, num_blocks));
-        let tiled_batch_metadata = GQAMetadataBuffers::new(device, GQA_MAX_TOKENS);
+        let tiled_batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let tiled_replay_shape = tiled_batch_metadata.update(
             &(0..num_reqs).collect::<Vec<_>>(),
-            &vec![existing_context_len; num_reqs as usize],
+            &existing_context_lens,
             &cu_tokens(&num_tokens_per_req)
                 .into_iter()
                 .map(|value| value as u32)
@@ -433,7 +475,7 @@ impl<'a> RealGQAFixture<'a> {
         let kv_page_write = GQAKVPageWrite::new(device, gqa_kv_page_write_config(model, config.page_bytes));
         let gate = GQAActivationGateKernel::new(device, gqa_gate_config(model));
         let output = AffineQuantizedMatmul::new(device, gqa_output_affine_config(model));
-        let metal_page_table_layout = gqa_page_table_layout(num_reqs, end_context_len);
+        let metal_page_table_layout = gqa_page_table_layout(num_reqs, end_context_len, model);
         let tiled_config = gqa_split_kv_tiled_q_config(metal_page_table_layout, params, model);
         let tiled_shape = GQASplitKVTiledQShape {
             num_total_tokens: num_tokens,
@@ -556,8 +598,10 @@ impl<'a> RealGQAFixture<'a> {
             params,
             num_tokens,
             num_reqs,
+            max_tokens,
             num_tokens_per_req,
-            existing_context_len,
+            existing_context_lens,
+            uniform_context_len,
             end_context_len,
             next_hidden_state,
             replay,
@@ -627,7 +671,7 @@ impl<'a> RealGQAFixture<'a> {
             recorder.build()
         };
         let tiled_config = gqa_split_kv_tiled_q_config(
-            gqa_page_table_layout(self.num_reqs, self.end_context_len),
+            gqa_page_table_layout(self.num_reqs, self.end_context_len, self.model),
             self.params,
             self.model,
         );
@@ -681,7 +725,7 @@ impl<'a> RealGQAFixture<'a> {
                 &self._kv_pages,
                 &self._page_ids,
                 &self.batch_metadata,
-                self.end_context_len.div_ceil(TOKENS_PER_PAGE).max(1),
+                self.end_context_len.div_ceil(self.model.num_tokens_per_page()).max(1),
                 max_diff_index,
                 self.model,
             );
@@ -699,14 +743,35 @@ impl<'a> RealGQAFixture<'a> {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",");
+        let existing_context_lens = self
+            .existing_context_lens
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
             "case component=gqa model={} num_tokens_per_req=[{num_tokens_per_req}] \
-             split_kv_tiled_q_token_tile_size={} split_kv_tiled_q_kv_token_tile_size={} \
-             split_kv_tiled_q_head_tile_size={}",
+             existing_context_lens=[{existing_context_lens}] max_tokens={} split_kv_tiled_q_token_tile_size={} \
+             split_kv_tiled_q_kv_token_tile_size={} split_kv_tiled_q_head_tile_size={}",
             self.model.k,
+            self.max_tokens,
             self.params.split_kv_tiled_q_token_tile_size,
             self.params.split_kv_tiled_q_kv_token_tile_size,
             self.params.split_kv_tiled_q_head_tile_size,
+        );
+        print_split_plan(
+            "single_q",
+            &self.batch_metadata,
+            1,
+            self.params.split_kv_single_q_kv_token_tile_size,
+            self.max_tokens,
+        );
+        print_split_plan(
+            "tiled_q",
+            &self.tiled_batch_metadata,
+            self.params.split_kv_tiled_q_token_tile_size,
+            self.params.split_kv_tiled_q_kv_token_tile_size,
+            self.max_tokens,
         );
         if variants.contains(&GQASplitKVBenchVariant::SingleQ) {
             let samples = measure_runs(runs, warmup_iters, iters, || self.run_split_kv_single_q());
@@ -714,7 +779,7 @@ impl<'a> RealGQAFixture<'a> {
             print_perf(
                 self.num_tokens,
                 self.num_reqs,
-                Some(self.existing_context_len),
+                self.uniform_context_len,
                 Some("single_q"),
                 iters,
                 &samples,
@@ -726,7 +791,7 @@ impl<'a> RealGQAFixture<'a> {
             print_perf(
                 self.num_tokens,
                 self.num_reqs,
-                Some(self.existing_context_len),
+                self.uniform_context_len,
                 Some("tiled_q"),
                 iters,
                 &tiled_samples,
@@ -804,7 +869,7 @@ impl<'a> RealGQAFixture<'a> {
                 },
             ),
         );
-        let page_table_layout = gqa_page_table_layout(self.num_reqs, self.end_context_len);
+        let page_table_layout = gqa_page_table_layout(self.num_reqs, self.end_context_len, self.model);
         let kv_page_write_replay = build_single_invocation_replay(
             &self.stream,
             kv_page_write.invoke(
@@ -1005,9 +1070,77 @@ impl<'a> RealGQAFixture<'a> {
             &format!("gqa.{name}"),
             self.num_tokens,
             self.num_reqs,
-            Some(self.existing_context_len),
+            self.uniform_context_len,
             iters,
             &samples,
         );
     }
+}
+
+fn print_split_plan(
+    variant: &str,
+    metadata: &GQAMetadataBuffers,
+    scheduled_q_token_tile_size: u32,
+    kv_token_tile_size: u32,
+    max_tokens: usize,
+) {
+    let shape = metadata.replay_shape();
+    let cu_kv_splits = metadata
+        .cu_kv_splits()
+        .read_typed::<u32>(0, shape.num_q_token_tiles as usize + 1);
+    let splits_per_q_tile = cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
+    let active_q_tokens_per_tile = if scheduled_q_token_tile_size == 1 {
+        vec![1; shape.num_q_token_tiles as usize]
+    } else {
+        metadata
+            .q_token_tiles()
+            .read_typed::<u32>(0, shape.num_q_token_tiles as usize * 2)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|tile| tile[1] - tile[0])
+            .collect::<Vec<_>>()
+    };
+    let split_values = metadata
+        .kv_splits()
+        .read_typed::<u32>(0, shape.num_sdpa_map_task_templates as usize * 3);
+    let mut kv_tiles_per_split_histogram = BTreeMap::new();
+    for num_kv_tiles in split_values
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|split| (split[2] - split[1]).div_ceil(kv_token_tile_size))
+    {
+        *kv_tiles_per_split_histogram.entry(num_kv_tiles).or_insert(0usize) += 1;
+    }
+    let kv_tiles_per_split_histogram = kv_tiles_per_split_histogram
+        .into_iter()
+        .map(|(num_kv_tiles, count)| format!("{num_kv_tiles}x{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let active_partial_states = active_q_tokens_per_tile
+        .iter()
+        .zip(&splits_per_q_tile)
+        .map(|(&num_q_tokens, &num_splits)| u64::from(num_q_tokens) * u64::from(num_splits))
+        .sum::<u64>();
+    let reserved_partial_slots = shape
+        .num_sdpa_map_task_templates
+        .checked_mul(scheduled_q_token_tile_size)
+        .expect("GQA reserved partial-slot count must fit u32");
+    let replay_reserved_partial_slots = shape
+        .num_total_sdpa_map_task_templates
+        .checked_mul(scheduled_q_token_tile_size)
+        .expect("GQA replay reserved partial-slot count must fit u32");
+    println!(
+        "split_plan component=gqa variant={variant} max_tokens={max_tokens} active_q_tokens={} q_token_tiles={} \
+         active_q_tokens_per_tile={active_q_tokens_per_tile:?} active_kv_splits={} \
+         metadata_segment_capacity={max_tokens} active_partial_state_budget={max_tokens} \
+         active_partial_states={active_partial_states} reserved_partial_slots={reserved_partial_slots} \
+         replay_kv_split_capacity={} replay_reserved_partial_slots={replay_reserved_partial_slots} \
+         splits_per_q_tile={splits_per_q_tile:?} kv_tiles_per_split_histogram=[{kv_tiles_per_split_histogram}]",
+        shape.num_tokens,
+        shape.num_q_token_tiles,
+        shape.num_sdpa_map_task_templates,
+        shape.num_total_sdpa_map_task_templates,
+    );
 }

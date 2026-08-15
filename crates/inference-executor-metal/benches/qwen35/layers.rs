@@ -1,11 +1,14 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
+use inference_backend_metal::components::GQASplitKVVariant;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::attn::GQAPageTableLayout;
@@ -36,6 +39,7 @@ use inference_executor_metal::model::qwen::v3_x::state::Qwen3xGQAState;
 
 const DEFAULT_TOKENS: u32 = 1;
 const DEFAULT_CONTEXT: u32 = 32;
+const DEFAULT_MAX_TOKENS: usize = 128;
 const CACHE_BLOCK_TOKENS: usize = 2048;
 
 #[derive(Clone, Copy, Debug)]
@@ -73,6 +77,7 @@ struct BenchArgs {
     model_dir: PathBuf,
     cases: Vec<Case>,
     shapes: Vec<BenchShape>,
+    max_tokens: usize,
     iters: usize,
     warmup_iters: usize,
     runs: usize,
@@ -87,6 +92,7 @@ impl BenchArgs {
                 num_tokens: DEFAULT_TOKENS,
                 context: DEFAULT_CONTEXT,
             }],
+            max_tokens: DEFAULT_MAX_TOKENS,
             iters: 200,
             warmup_iters: 50,
             runs: 3,
@@ -101,6 +107,7 @@ impl BenchArgs {
                 "--cases" => args.cases = parse_cases(&next_arg(&mut iter, &arg)),
                 "--tokens" => num_tokens = Some(parse_u32_list(&next_arg(&mut iter, &arg), &arg)),
                 "--contexts" => contexts = Some(parse_u32_list(&next_arg(&mut iter, &arg), &arg)),
+                "--max-tokens" => args.max_tokens = parse_usize_arg(&next_arg(&mut iter, &arg), &arg),
                 "--iters" => args.iters = parse_usize_arg(&next_arg(&mut iter, &arg), &arg),
                 "--warmup-iters" => args.warmup_iters = parse_usize_arg(&next_arg(&mut iter, &arg), &arg),
                 "--runs" => args.runs = parse_usize_arg(&next_arg(&mut iter, &arg), &arg),
@@ -113,10 +120,16 @@ impl BenchArgs {
         assert!(!num_tokens.is_empty(), "--tokens must include at least one value");
         assert!(!contexts.is_empty(), "--contexts must include at least one value");
         assert!(!args.model_dir.as_os_str().is_empty(), "--model-dir is required");
+        assert!(args.max_tokens > 0, "--max-tokens must be positive");
+        assert!(u32::try_from(args.max_tokens).is_ok(), "--max-tokens must fit u32");
         args.shapes = num_tokens
             .iter()
             .flat_map(|&num_tokens| {
                 assert!(num_tokens > 0, "--tokens entries must be positive");
+                assert!(
+                    num_tokens as usize <= args.max_tokens,
+                    "--tokens entries must not exceed --max-tokens"
+                );
                 contexts.iter().map(move |&context| BenchShape { num_tokens, context })
             })
             .collect();
@@ -131,6 +144,9 @@ struct BlockFixture {
     gqa_state: Qwen3xGQAState,
     gdn_state: Qwen3xGDNState,
     pages: PageArena,
+    replay_arguments: ReplayArguments,
+    has_gqa: bool,
+    max_tokens: usize,
     shape: BenchShape,
 }
 
@@ -142,14 +158,13 @@ impl BlockFixture {
         weight_bindings: &Qwen35ModelWeightBindings,
         case: Case,
         shape: BenchShape,
+        max_tokens: usize,
     ) -> Self {
         let defaults = Qwen35MetalDefaults::from_quantization(config.quantization.as_ref())
             .expect("qwen3.5 layer bench requires supported quantization");
         let counts = qwen35_layer_counts(config).expect("qwen3.5 layer bench requires a valid layer schedule");
         assert!(counts.gqa > 0, "qwen3.5 layer bench requires GQA layers");
         assert!(counts.gdn > 0, "qwen3.5 layer bench requires GDN layers");
-        let max_tokens = shape.num_tokens as usize;
-
         let first_gqa_layer = (0..config.text_config.num_hidden_layers)
             .find(|&index| {
                 config
@@ -161,7 +176,7 @@ impl BlockFixture {
             .expect("qwen3.5 layer bench requires valid GQA geometry");
         let num_page_ids_per_block = CACHE_BLOCK_TOKENS.div_ceil(gqa_metal.num_tokens_per_page(&gqa_core) as usize);
         let context_end = (shape.context as usize)
-            .checked_add(max_tokens)
+            .checked_add(shape.num_tokens as usize)
             .expect("qwen3.5 layer bench context length must fit usize");
         let num_blocks = context_end.div_ceil(CACHE_BLOCK_TOKENS).max(1);
         let num_cache_pages = counts
@@ -237,7 +252,7 @@ impl BlockFixture {
             num_cache_pages,
             QWEN35_PAGE_SIZE_BYTES,
         );
-        let mut flat_materialized_state_slots = vec![u32::MAX; max_tokens];
+        let mut flat_materialized_state_slots = vec![u32::MAX; shape.num_tokens as usize];
         flat_materialized_state_slots[shape.num_tokens as usize - 1] = 1;
         gdn_state.metadata().update(
             &[0, shape.num_tokens],
@@ -271,6 +286,14 @@ impl BlockFixture {
 
         let layer_indices = case.layer_indices(config.text_config.num_hidden_layers);
         assert!(!layer_indices.is_empty(), "qwen3.5 layer bench requires layers");
+        let has_gqa = layer_indices.iter().any(|&index| {
+            config
+                .layer_type_at(index)
+                .is_ok_and(|kind| kind == LayerType::FullAttention)
+        });
+        let has_gdn = layer_indices
+            .iter()
+            .any(|&index| config.layer_type_at(index).is_ok_and(|kind| kind == LayerType::GDN));
         let mut layers = Vec::with_capacity(layer_indices.len());
         for model_layer_index in layer_indices {
             let bindings = weight_bindings
@@ -295,6 +318,13 @@ impl BlockFixture {
             store.unload_all();
         }
 
+        let mut replay_arguments = ReplayArguments::new();
+        if has_gqa {
+            gqa_state.add_replay_arguments(&mut replay_arguments);
+        }
+        if has_gdn {
+            gdn_state.add_replay_arguments(&mut replay_arguments);
+        }
         Self {
             stream: Stream::new(device),
             input: Buffer::from_slice(device, &hidden_fixture(max_tokens, config.text_config.hidden_size)),
@@ -302,6 +332,9 @@ impl BlockFixture {
             gqa_state,
             gdn_state,
             pages: PageArena::new(device, num_cache_pages, QWEN35_PAGE_SIZE_BYTES),
+            replay_arguments,
+            has_gqa,
+            max_tokens,
             shape,
         }
     }
@@ -328,7 +361,82 @@ impl BlockFixture {
     }
 
     fn run(&self, replay: &ReplayProgram) {
-        MetalReplayRuntime::new(&self.stream).submit_replay(replay).wait();
+        MetalReplayRuntime::new(&self.stream)
+            .submit_replay_with_arguments(replay, &self.replay_arguments)
+            .wait();
+    }
+
+    fn print_gqa_split_plan(&self) {
+        if !self.has_gqa {
+            return;
+        }
+        let metadata = self.gqa_state.metadata();
+        let shape = metadata.replay_shape();
+        let variant = metadata.split_kv_variant();
+        let (variant_name, scheduled_q_token_tile_size, kv_token_tile_size) = match variant {
+            GQASplitKVVariant::SingleQ { kv_token_tile_size, .. } => ("single_q", 1, kv_token_tile_size),
+            GQASplitKVVariant::TiledQ {
+                q_token_tile_size,
+                kv_token_tile_size,
+                ..
+            } => ("tiled_q", q_token_tile_size, kv_token_tile_size),
+        };
+        let cu_kv_splits = metadata
+            .cu_kv_splits()
+            .read_typed::<u32>(0, shape.num_q_token_tiles as usize + 1);
+        let splits_per_q_tile = cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
+        let active_q_tokens_per_tile = if scheduled_q_token_tile_size == 1 {
+            vec![1; shape.num_q_token_tiles as usize]
+        } else {
+            metadata
+                .q_token_tiles()
+                .read_typed::<u32>(0, shape.num_q_token_tiles as usize * 2)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|tile| tile[1] - tile[0])
+                .collect::<Vec<_>>()
+        };
+        let active_partial_states = active_q_tokens_per_tile
+            .iter()
+            .zip(&splits_per_q_tile)
+            .map(|(&num_q_tokens, &num_splits)| u64::from(num_q_tokens) * u64::from(num_splits))
+            .sum::<u64>();
+        let split_values = metadata
+            .kv_splits()
+            .read_typed::<u32>(0, shape.num_sdpa_map_task_templates as usize * 3);
+        let mut kv_tiles_per_split_histogram = BTreeMap::new();
+        for num_kv_tiles in split_values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|split| (split[2] - split[1]).div_ceil(kv_token_tile_size))
+        {
+            *kv_tiles_per_split_histogram.entry(num_kv_tiles).or_insert(0usize) += 1;
+        }
+        let reserved_partial_slots = shape
+            .num_sdpa_map_task_templates
+            .checked_mul(scheduled_q_token_tile_size)
+            .expect("GQA reserved partial-slot count must fit u32");
+        let replay_reserved_partial_slots = shape
+            .num_total_sdpa_map_task_templates
+            .checked_mul(scheduled_q_token_tile_size)
+            .expect("GQA replay reserved partial-slot count must fit u32");
+        println!(
+            "split_plan component=qwen35-layer variant={variant_name} max_tokens={} active_q_tokens={} \
+             q_token_tiles={} active_q_tokens_per_tile={active_q_tokens_per_tile:?} active_kv_splits={} \
+             metadata_segment_capacity={} active_partial_state_budget={} \
+             active_partial_states={active_partial_states} reserved_partial_slots={reserved_partial_slots} \
+             replay_kv_split_capacity={} replay_reserved_partial_slots={replay_reserved_partial_slots} \
+             splits_per_q_tile={splits_per_q_tile:?} kv_tiles_per_split_histogram={kv_tiles_per_split_histogram:?}",
+            self.max_tokens,
+            shape.num_tokens,
+            shape.num_q_token_tiles,
+            shape.num_sdpa_map_task_templates,
+            self.max_tokens,
+            self.max_tokens,
+            shape.num_total_sdpa_map_task_templates,
+        );
     }
 }
 
@@ -402,12 +510,29 @@ fn main() {
         });
     for shape in args.shapes {
         for &case in &args.cases {
-            let fixture = BlockFixture::new(&device, &mut store, &model_config, &weight_bindings, case, shape);
+            let fixture = BlockFixture::new(
+                &device,
+                &mut store,
+                &model_config,
+                &weight_bindings,
+                case,
+                shape,
+                args.max_tokens,
+            );
             store.unload_all();
             let replay = fixture.build_replay();
+            fixture.print_gqa_split_plan();
             fixture.run(&replay);
             let samples = measure_runs(args.runs, args.warmup_iters, args.iters, || fixture.run(&replay));
-            print_perf(&args.model_dir, case, shape, args.iters, &replay, &samples);
+            print_perf(
+                &args.model_dir,
+                case,
+                shape,
+                args.max_tokens,
+                args.iters,
+                &replay,
+                &samples,
+            );
         }
     }
 }
@@ -423,10 +548,11 @@ fn parse_cases(value: &str) -> Vec<Case> {
         .map(|part| {
             match part {
                 "layer0" => Case::Layer(0),
+                "layer3" => Case::Layer(3),
                 "layer4" => Case::Layer(4),
                 "first4" => Case::FirstLayers(4),
                 "main_all" => Case::MainAll,
-                _ => panic!("invalid case {part:?}; expected layer0, layer4, first4, or main_all"),
+                _ => panic!("invalid case {part:?}; expected layer0, layer3, layer4, first4, or main_all"),
             }
         })
         .collect::<Vec<_>>();
@@ -472,9 +598,10 @@ fn print_help_and_exit() -> ! {
     println!();
     println!("Options:");
     println!("--model-dir PATH");
-    println!("--cases layer0,layer4,first4,main_all");
+    println!("--cases layer0,layer3,layer4,first4,main_all");
     println!("--tokens 1,2,4");
     println!("--contexts 0,32,128");
+    println!("--max-tokens N");
     println!("--iters N");
     println!("--warmup-iters N");
     println!("--runs N");
@@ -502,6 +629,7 @@ fn print_perf(
     model_dir: &std::path::Path,
     case: Case,
     shape: BenchShape,
+    max_tokens: usize,
     iters: usize,
     replay: &ReplayProgram,
     samples: &[f64],
@@ -514,9 +642,9 @@ fn print_perf(
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "perf component=qwen35-layer impl=layer-forward-replay model_dir={} case={} num_tokens={} ctx={} commands={} \
-         retained_buffers={} retained_pipelines={} constant_bytes={} iters={iters} runs={} median_us={median_us:.3} \
-         samples_us=[{sample_text}]",
+        "perf component=qwen35-layer impl=layer-forward-replay model_dir={} case={} num_tokens={} ctx={} \
+         max_tokens={max_tokens} commands={} retained_buffers={} retained_pipelines={} constant_bytes={} \
+         iters={iters} runs={} median_us={median_us:.3} samples_us=[{sample_text}]",
         model_dir.display(),
         case.key(),
         shape.num_tokens,
