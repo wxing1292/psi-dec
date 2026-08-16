@@ -834,7 +834,7 @@ mod tests {
         let mut sticky_req_1 = mock_user_req(1);
         sticky_req_1.expect_prepare().once().with(eq(3)).return_once(|_| {
             let mut dev_req = MockDevReq::new();
-            dev_req.expect_id().once().return_const(1usize);
+            dev_req.expect_id().return_const(1usize);
             dev_req.expect_req_cost().once().return_const(1usize);
             dev_req.expect_token_cost().once().return_const(3usize);
             PrepareResult::Continue {
@@ -849,7 +849,7 @@ mod tests {
         let mut sticky_req_2 = mock_user_req(2);
         sticky_req_2.expect_prepare().once().with(eq(2)).return_once(|_| {
             let mut dev_req = MockDevReq::new();
-            dev_req.expect_id().once().return_const(2usize);
+            dev_req.expect_id().return_const(2usize);
             dev_req.expect_req_cost().once().return_const(1usize);
             dev_req.expect_token_cost().once().return_const(2usize);
             PrepareResult::Continue {
@@ -886,7 +886,7 @@ mod tests {
             .returning(|| ReqTokenInventory::new::<1>(1, 3, 0, 0, &[]));
         req_1.expect_prepare().once().with(eq(3)).return_once(|_| {
             let mut dev_req = MockDevReq::new();
-            dev_req.expect_id().once().return_const(1usize);
+            dev_req.expect_id().return_const(1usize);
             dev_req.expect_req_cost().once().return_const(1usize);
             dev_req.expect_token_cost().once().return_const(3usize);
             PrepareResult::Continue {
@@ -905,7 +905,7 @@ mod tests {
             .returning(|| ReqTokenInventory::new::<1>(2, 2, 0, 0, &[]));
         req_2.expect_prepare().once().with(eq(2)).return_once(|_| {
             let mut dev_req = MockDevReq::new();
-            dev_req.expect_id().once().return_const(2usize);
+            dev_req.expect_id().return_const(2usize);
             dev_req.expect_req_cost().once().return_const(1usize);
             dev_req.expect_token_cost().once().return_const(2usize);
             PrepareResult::Continue {

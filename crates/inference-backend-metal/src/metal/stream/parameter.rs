@@ -101,11 +101,8 @@ impl ReplayArguments {
     }
 
     fn insert(&mut self, key: ReplayParameterKey, value: ReplayArgumentValue) {
-        assert!(
-            self.values.insert(key, value).is_none(),
-            "Metal replay argument {:?} was set twice",
-            key
-        );
+        let collision = self.values.insert(key, value);
+        assert!(collision.is_none(), "Metal replay argument {:?} was set twice", key);
     }
 }
 

@@ -303,7 +303,7 @@ mod tests {
             )
             .return_once(|_, _, _, _, _| {
                 let mut dev_req = MockDevReq::new();
-                dev_req.expect_id().times(2).return_const(1usize);
+                dev_req.expect_id().return_const(1usize);
                 vec![dev_req]
             });
         batcher.expect_cancel().once().return_once(|_, _| {});

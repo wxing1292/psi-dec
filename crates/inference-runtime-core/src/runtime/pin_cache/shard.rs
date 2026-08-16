@@ -186,7 +186,8 @@ where
         unsafe {
             let node_ref = node_nn.as_ref();
             debug_assert_eq!(0, node_ref.pin_count());
-            debug_assert_eq!(node_nn.as_ptr(), self.map.remove(node_ref.key()).unwrap().as_ptr());
+            let removed_node_nn = self.map.remove(node_ref.key()).unwrap();
+            debug_assert_eq!(node_nn.as_ptr(), removed_node_nn.as_ptr());
 
             let entry = Box::from_raw(node_nn.as_ptr()).into_inner();
             let weight = entry.weight();

@@ -84,7 +84,7 @@ impl DSparkBlockMetadata {
             u32::try_from(block_size).is_ok(),
             "DSpark block metadata block_size must fit u32"
         );
-        debug_assert!(
+        assert!(
             req_slots
                 .iter()
                 .enumerate()
