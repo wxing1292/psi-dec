@@ -196,8 +196,9 @@ where
 
     pub fn reject_candidate(&mut self, key: K) {
         let entry = self.entry(key).expect("reject_candidate: entry must exist");
+        let is_candidate = entry.is_candidate.replace(false);
         debug_assert!(
-            entry.is_candidate.replace(false),
+            is_candidate,
             "reject_candidate: entry must be the outstanding candidate"
         );
         self.re_evaluate(key);

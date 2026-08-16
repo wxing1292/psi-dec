@@ -41,15 +41,14 @@ where
     }
 
     pub fn pin(&self) {
-        debug_assert!(
-            !self.pinned.swap(true, Ordering::AcqRel),
-            "pin: entry must not already be pinned"
-        );
+        let pinned = self.pinned.swap(true, Ordering::AcqRel);
+        debug_assert!(!pinned, "pin: entry must not already be pinned");
         self.signal();
     }
 
     pub fn unpin(&self) {
-        debug_assert!(self.pinned.swap(false, Ordering::AcqRel), "unpin: entry must be pinned");
+        let pinned = self.pinned.swap(false, Ordering::AcqRel);
+        debug_assert!(pinned, "unpin: entry must be pinned");
         self.signal();
     }
 
@@ -58,7 +57,8 @@ where
     }
 
     pub fn untouch(&self) {
-        debug_assert!(self.dec_count(), "untouch: count must be greater than one");
+        let decremented = self.dec_count();
+        debug_assert!(decremented, "untouch: count must be greater than one");
     }
 
     pub fn inc_count(&self) {
