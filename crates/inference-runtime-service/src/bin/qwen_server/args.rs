@@ -51,7 +51,7 @@ pub struct Qwen3Args {
 
     #[arg(
         long,
-        default_value = "262144",
+        default_value = "393216",
         help = "Total shared cache pages used by GQA KV cache and GDN state cache"
     )]
     pub num_cache_pages: NonZeroUsize,
@@ -129,7 +129,7 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        default_value = "262144",
+        default_value = "393216",
         help = "Total shared cache pages used by GQA KV cache and GDN state cache"
     )]
     pub num_cache_pages: NonZeroUsize,
