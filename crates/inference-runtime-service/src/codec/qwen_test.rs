@@ -32,7 +32,9 @@ fn test_encode_request() {
     let template = ChatTemplate::from_str(source).unwrap();
     let codec = QwenCodec::new(template, Arc::new(fixture_tokenizer(&[expected]))).unwrap();
 
-    let tokens = codec.encode(vec![Message::user("hello")], &[], false, true).unwrap();
+    let tokens = codec
+        .encode(vec![Message::user("hello")], &[], false, None, true)
+        .unwrap();
 
     assert_eq!(tokens, vec![Token::new(1), Token::new(2)]);
 }
@@ -48,7 +50,9 @@ fn test_encode_tools() {
         ToolInputSchema::new(json!({"type": "object"})).unwrap(),
     )];
 
-    let tokens = codec.encode(vec![Message::user("hello")], &tools, true, true).unwrap();
+    let tokens = codec
+        .encode(vec![Message::user("hello")], &tools, true, None, true)
+        .unwrap();
 
     assert_eq!(tokens, vec![Token::new(1)]);
 }
@@ -65,7 +69,7 @@ fn test_encode_rejects_tool_id_delimiters() {
             ToolInputSchema::new(json!({"type": "object"})).unwrap(),
         )];
         assert!(matches!(
-            codec.encode(vec![Message::user("hello")], &tools, true, true),
+            codec.encode(vec![Message::user("hello")], &tools, true, None, true),
             Err(Error::InvalidArgument(message)) if message.contains("reserved delimiter")
         ));
     }
@@ -77,7 +81,7 @@ fn test_encode_rejects_invalid_messages() {
     let codec = QwenCodec::new(template, Arc::new(fixture_tokenizer(&["unused"]))).unwrap();
 
     assert!(matches!(
-        codec.encode(Vec::new(), &[], true, true),
+        codec.encode(Vec::new(), &[], true, None, true),
         Err(Error::InvalidArgument(message)) if message.contains("messages required")
     ));
 }

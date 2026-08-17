@@ -189,8 +189,7 @@ where
 
         self.shutdown.shutdown();
         tracing::info!(
-            stats = %format_args!("\n{}", self.scheduler.stats_table()),
-            "scheduler stats"
+            scheduler_stats = %format_args!("\n{}", self.scheduler.stats_table()),
         );
         tracing::info!("stopped");
         Ok(())

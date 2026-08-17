@@ -85,10 +85,17 @@ impl QwenCodec {
         messages: Vec<Message>,
         tools: &[ToolDefinition],
         enable_thinking: bool,
+        reasoning_effort: Option<&str>,
         preserve_thinking: bool,
     ) -> Result<Vec<Token>> {
         let mut extra = Map::new();
         extra.insert("enable_thinking".to_string(), Value::Bool(enable_thinking));
+        if let Some(reasoning_effort) = reasoning_effort {
+            extra.insert(
+                "reasoning_effort".to_string(),
+                Value::String(reasoning_effort.to_string()),
+            );
+        }
         extra.insert("preserve_thinking".to_string(), Value::Bool(preserve_thinking));
         extra.insert("add_vision_id".to_string(), Value::Bool(false));
         let input = RenderInput {

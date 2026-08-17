@@ -148,7 +148,14 @@ pub fn preprocess(
     if request.store == Some(true) {
         return Err(invalid_request("store true is not supported"));
     }
-    let enable_thinking = match (request.enable_thinking, request.reasoning_effort) {
+    let reasoning_effort = request.reasoning_effort.as_ref().map(|effort| {
+        match effort {
+            ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High | ReasoningEffort::Xhigh => "xhigh",
+        }
+    });
+    let enable_thinking = match (request.enable_thinking, reasoning_effort) {
         (Some(false), Some(_)) => {
             return Err(invalid_request("reasoning_effort conflicts with enable_thinking false"));
         },
@@ -167,7 +174,7 @@ pub fn preprocess(
     };
     let rendered_tools = if enable_tools { tools.as_slice() } else { &[] };
     let tokens = qwen_codec
-        .encode(messages, rendered_tools, enable_thinking, false)
+        .encode(messages, rendered_tools, enable_thinking, reasoning_effort, false)
         .map_err(map_error)?;
     let prompt_tokens = tokens.len();
     let max_sampled_tokens = request

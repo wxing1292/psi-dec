@@ -54,6 +54,7 @@ impl InferenceClient {
                     messages,
                     &[],
                     self.config.chat_template().enable_thinking(),
+                    None,
                     self.config.chat_template().preserve_thinking(),
                 )?
             },
