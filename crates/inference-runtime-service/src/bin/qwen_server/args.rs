@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(args.max_requests.get(), 4);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-        assert_eq!(args.num_cache_pages.get(), 262_144);
+        assert_eq!(args.num_cache_pages.get(), 384 * 1024);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
         assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }
@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(args.max_requests.get(), 4);
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
-        assert_eq!(args.num_cache_pages.get(), 262_144);
+        assert_eq!(args.num_cache_pages.get(), 384 * 1024);
         assert_eq!(args.hf_dspark_model_dir, None);
         assert_eq!(args.num_spec_tokens, None);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);

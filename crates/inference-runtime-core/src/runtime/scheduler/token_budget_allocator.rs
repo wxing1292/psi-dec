@@ -13,7 +13,7 @@ pub struct ReqTokenInventory<'a> {
     num_queued_tokens: usize,
     num_spec_tokens: usize,
     spec_confidences: &'a [NotNan<f32>],
-    max_partial_token_consumption: usize,
+    prefill_decode_threshold: usize,
 }
 
 impl<'a> ReqTokenInventory<'a> {
@@ -29,15 +29,10 @@ impl<'a> ReqTokenInventory<'a> {
             L == 1 || num_spec_tokens < L,
             "speculative token count must fit the configured cache lanes"
         );
-        // MTP binds each speculative position to an additional cache lane.
-        // DSpark keeps one cache lane and stores its proposals separately.
-        if 1 < L {
-            if num_ready_tokens == 0 {
-                debug_assert!(0 < num_queued_tokens);
-            } else {
-                debug_assert!(L - 1 <= num_queued_tokens);
-            }
-        }
+        debug_assert!(
+            num_ready_tokens + num_queued_tokens > 0 || num_spec_tokens == 0,
+            "ready and queued token sum must be > 0 || ready, queued and spec token sum must be == 0"
+        );
         debug_assert_eq!(
             num_spec_tokens,
             spec_confidences.len(),
@@ -57,7 +52,7 @@ impl<'a> ReqTokenInventory<'a> {
             num_queued_tokens,
             num_spec_tokens,
             spec_confidences,
-            max_partial_token_consumption: num_validated_tokens.saturating_sub(L - 1),
+            prefill_decode_threshold: num_validated_tokens.saturating_sub(L - 1),
         }
     }
 
@@ -65,25 +60,9 @@ impl<'a> ReqTokenInventory<'a> {
         self.req_id
     }
 
-    /// Evaluate an absolute request token budget without changing request state.
-    pub fn token_consumption(&self, token_budget: usize) -> usize {
-        let num_validated_tokens = self.max_validated_token_consumption();
-        if token_budget == 0 || num_validated_tokens == 0 {
-            0
-        } else if token_budget >= num_validated_tokens {
-            min(token_budget, num_validated_tokens + self.num_spec_tokens)
-        } else {
-            min(token_budget, self.max_partial_token_consumption)
-        }
-    }
-
     pub fn min_validated_token_consumption(&self) -> usize {
         let max_validated_token_consumption = self.max_validated_token_consumption();
-        debug_assert!(
-            max_validated_token_consumption != 0,
-            "runnable request must have a progress budget"
-        );
-        if self.max_partial_token_consumption == 0 {
+        if self.prefill_decode_threshold == 0 {
             max_validated_token_consumption
         } else {
             1
@@ -92,6 +71,17 @@ impl<'a> ReqTokenInventory<'a> {
 
     pub fn max_validated_token_consumption(&self) -> usize {
         self.num_ready_tokens + self.num_queued_tokens
+    }
+
+    pub fn token_consumption(&self, token_budget: usize) -> usize {
+        let max_validated_token_consumption = self.max_validated_token_consumption();
+        if token_budget == 0 || max_validated_token_consumption == 0 {
+            0
+        } else if token_budget >= max_validated_token_consumption {
+            min(token_budget, max_validated_token_consumption + self.num_spec_tokens)
+        } else {
+            min(token_budget, self.prefill_decode_threshold)
+        }
     }
 }
 
@@ -154,11 +144,13 @@ pub fn allocate_sticky_token_budgets(
     // Phase 2: allocate each sticky request's maximum validated token budget.
     for (request_index, request) in sticky_token_inventories.iter().enumerate() {
         let current_token_budget = token_budgets[request_index];
-        let token_budget_limit = min(
-            request.max_validated_token_consumption(),
-            min(batch_budget.max_token_per_req, current_token_budget + remaining_tokens),
-        );
-        let token_budget = request.token_consumption(token_budget_limit);
+        let token_budget = request.token_consumption(min(
+            batch_budget.max_token_per_req,
+            min(
+                request.max_validated_token_consumption(),
+                current_token_budget + remaining_tokens,
+            ),
+        ));
         debug_assert!(
             current_token_budget <= token_budget,
             "validated token consumption must not remove minimum progress"
@@ -181,7 +173,6 @@ pub fn allocate_sticky_token_budgets(
             batch_budget.max_token_per_req,
         );
     }
-
     while remaining_tokens != 0 {
         let Some(candidate) = spec_token_candidates.pop() else {
             break;
@@ -218,8 +209,8 @@ impl Ord for SpecTokenCandidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.cumulative_confidence
             .cmp(&other.cumulative_confidence)
-            .then_with(|| other.request_index.cmp(&self.request_index))
             .then_with(|| other.spec_position.cmp(&self.spec_position))
+            .then_with(|| other.request_index.cmp(&self.request_index))
     }
 }
 
@@ -276,10 +267,43 @@ mod tests {
     }
 
     #[test]
-    fn test_token_consumption_w_single_cache_lane() {
+    fn test_min_max_validated_token_consumption_l1() {
+        let inventory = ReqTokenInventory::new::<1>(1, 0, 1, 0, &[]);
+        assert_eq!(1, inventory.min_validated_token_consumption());
+        assert_eq!(1, inventory.max_validated_token_consumption());
+
+        let inventory = ReqTokenInventory::new::<1>(1, 1, 0, 0, &[]);
+        assert_eq!(1, inventory.min_validated_token_consumption());
+        assert_eq!(1, inventory.max_validated_token_consumption());
+    }
+
+    #[test]
+    fn test_min_max_validated_token_consumption_l2() {
+        let inventory = ReqTokenInventory::new::<2>(1, 0, 1, 0, &[]);
+        assert_eq!(1, inventory.min_validated_token_consumption());
+        assert_eq!(1, inventory.max_validated_token_consumption());
+
+        let inventory = ReqTokenInventory::new::<2>(1, 1, 0, 0, &[]);
+        assert_eq!(1, inventory.min_validated_token_consumption());
+        assert_eq!(1, inventory.max_validated_token_consumption());
+
+        let inventory = ReqTokenInventory::new::<2>(1, 0, 2, 0, &[]);
+        assert_eq!(1, inventory.min_validated_token_consumption());
+        assert_eq!(2, inventory.max_validated_token_consumption());
+
+        let inventory = ReqTokenInventory::new::<2>(1, 2, 0, 0, &[]);
+        assert_eq!(1, inventory.min_validated_token_consumption());
+        assert_eq!(2, inventory.max_validated_token_consumption());
+
+        let inventory = ReqTokenInventory::new::<2>(1, 1, 1, 0, &[]);
+        assert_eq!(1, inventory.min_validated_token_consumption());
+        assert_eq!(2, inventory.max_validated_token_consumption());
+    }
+
+    #[test]
+    fn test_token_consumption_l1() {
         let confidences = [NotNan::new(0.9).unwrap(), NotNan::new(0.8).unwrap()];
         let inventory = ReqTokenInventory::new::<1>(1, 0, 1, 2, &confidences);
-
         assert_eq!(inventory.min_validated_token_consumption(), 1);
         assert_eq!(inventory.max_validated_token_consumption(), 1);
         assert_eq!(
@@ -291,10 +315,31 @@ mod tests {
     }
 
     #[test]
-    fn test_token_consumption_w_multiple_cache_lanes() {
+    fn test_token_consumption_l4() {
+        let confidences = [NotNan::new(1.0).unwrap(); 3];
+        let inventory = ReqTokenInventory::new::<4>(1, 0, 2, 3, &confidences);
+        assert_eq!(inventory.min_validated_token_consumption(), 2);
+        assert_eq!(inventory.max_validated_token_consumption(), 2);
+        assert_eq!(
+            (0..=5)
+                .map(|token_budget| inventory.token_consumption(token_budget))
+                .collect::<Vec<_>>(),
+            vec![0, 0, 2, 3, 4, 5]
+        );
+
+        let confidences = [NotNan::new(1.0).unwrap(); 3];
+        let inventory = ReqTokenInventory::new::<4>(1, 0, 3, 3, &confidences);
+        assert_eq!(inventory.min_validated_token_consumption(), 3);
+        assert_eq!(inventory.max_validated_token_consumption(), 3);
+        assert_eq!(
+            (0..=6)
+                .map(|token_budget| inventory.token_consumption(token_budget))
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, 3, 4, 5, 6]
+        );
+
         let confidences = [NotNan::new(1.0).unwrap(); 3];
         let inventory = ReqTokenInventory::new::<4>(1, 1, 3, 3, &confidences);
-
         assert_eq!(inventory.min_validated_token_consumption(), 1);
         assert_eq!(inventory.max_validated_token_consumption(), 4);
         assert_eq!(
@@ -306,22 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_token_consumption_w_atomic_validated_budget() {
-        let confidences = [NotNan::new(1.0).unwrap(); 3];
-        let inventory = ReqTokenInventory::new::<4>(1, 0, 2, 3, &confidences);
-
-        assert_eq!(inventory.min_validated_token_consumption(), 2);
-        assert_eq!(inventory.max_validated_token_consumption(), 2);
-        assert_eq!(
-            (0..=6)
-                .map(|token_budget| inventory.token_consumption(token_budget))
-                .collect::<Vec<_>>(),
-            vec![0, 0, 2, 3, 4, 5, 5]
-        );
-    }
-
-    #[test]
-    fn test_allocate_sticky_token_budgets_wo_validated_budget_transition() {
+    fn test_allocate_sticky_token_budgets_wo_prefill_decode_jump() {
         let sticky_token_inventories = [
             ReqTokenInventory::new::<4>(1, 5, 3, 0, &[]),
             ReqTokenInventory::new::<4>(2, 5, 3, 0, &[]),
@@ -341,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_sticky_token_budgets_w_validated_budget_transition() {
+    fn test_allocate_sticky_token_budgets_w_prefill_decode_jump() {
         let sticky_token_inventories = [
             ReqTokenInventory::new::<4>(1, 5, 3, 0, &[]),
             ReqTokenInventory::new::<4>(2, 5, 3, 0, &[]),
@@ -361,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_sticky_token_budgets_w_confidence_order() {
+    fn test_allocate_sticky_token_budgets_w_confidence() {
         let request_1_confidences = [NotNan::new(0.90).unwrap(), NotNan::new(0.10).unwrap()];
         let request_2_confidences = [NotNan::new(0.80).unwrap(), NotNan::new(0.80).unwrap()];
         let sticky_token_inventories = [
@@ -400,7 +430,7 @@ mod tests {
                 },
                 &sticky_token_inventories,
             ),
-            AHashMap::from([(1, 6), (2, 4)])
+            AHashMap::from([(1, 5), (2, 5)])
         );
     }
 }
