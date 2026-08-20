@@ -13,6 +13,17 @@ const U32_CANARY: u32 = 0xA5A5_5A5A;
 const BF16_CANARY: u16 = 0x42B6;
 
 #[test]
+fn test_specializations_have_phase_scoped_thread_blocks() {
+    let specializations = MoEExpertMajorKernelSpecializations::current();
+    assert_eq!(specializations.layout_clear.required_threads, 256);
+    assert_eq!(specializations.layout_count.required_threads, 256);
+    assert_eq!(specializations.layout_prefix.required_threads, 1);
+    assert_eq!(specializations.layout_scatter.required_threads, 256);
+    assert_eq!(specializations.pack_input.required_threads, 256);
+    assert_eq!(specializations.scatter_output.required_threads, 256);
+}
+
+#[test]
 #[should_panic(expected = "MoE expert-major routed-hidden elements exceeds the shader u32 count domain")]
 fn test_shape_rejects_shader_count_overflow() {
     MoEExpertMajorConfig::bf16(1, 1, 4).validate_shape(MoEExpertMajorShape {

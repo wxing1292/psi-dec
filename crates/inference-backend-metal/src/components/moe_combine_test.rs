@@ -12,6 +12,12 @@ use crate::metal::Stream;
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.moe.combine.num_active_tokens");
 
 #[test]
+fn test_specialization_has_explicit_thread_block_scope() {
+    let specialization = MoECombineKernelSpecialization::current();
+    assert_eq!(specialization.thread_block.required_threads, 256);
+}
+
+#[test]
 #[should_panic(expected = "MoE combine output elements exceeds the shader u32 count domain")]
 fn test_shape_rejects_shader_count_overflow() {
     MoECombineConfig::bf16(1, 4).validate_shape(MoECombineShape {

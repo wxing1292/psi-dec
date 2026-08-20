@@ -11,6 +11,35 @@ use crate::metal::ReplayParameterKey;
 
 const MOE_EXPERT_MAJOR_SOURCE: &str = include_str!("metal/moe_expert_major.metal");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MoEExpertMajorThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MoEExpertMajorKernelSpecializations {
+    layout_clear: MoEExpertMajorThreadBlockSpecialization,
+    layout_count: MoEExpertMajorThreadBlockSpecialization,
+    layout_prefix: MoEExpertMajorThreadBlockSpecialization,
+    layout_scatter: MoEExpertMajorThreadBlockSpecialization,
+    pack_input: MoEExpertMajorThreadBlockSpecialization,
+    scatter_output: MoEExpertMajorThreadBlockSpecialization,
+}
+
+impl MoEExpertMajorKernelSpecializations {
+    fn current() -> Self {
+        let elementwise = MoEExpertMajorThreadBlockSpecialization { required_threads: 256 };
+        Self {
+            layout_clear: elementwise,
+            layout_count: elementwise,
+            layout_prefix: MoEExpertMajorThreadBlockSpecialization { required_threads: 1 },
+            layout_scatter: elementwise,
+            pack_input: elementwise,
+            scatter_output: elementwise,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MoEExpertMajorConfig {
     pub num_experts: u32,
@@ -169,6 +198,7 @@ pub struct MoEExpertMajorScatterWithSharedExpertsBuffers<'a> {
 
 pub struct MoEExpertMajorKernels {
     config: MoEExpertMajorConfig,
+    specializations: MoEExpertMajorKernelSpecializations,
     layout_clear: Kernel,
     layout_count: Kernel,
     layout_prefix: Kernel,
@@ -183,6 +213,7 @@ impl MoEExpertMajorKernels {
         config.validate();
         Self {
             config,
+            specializations: MoEExpertMajorKernelSpecializations::current(),
             layout_clear: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_clear"),
             layout_count: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_count"),
             layout_prefix: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_prefix"),
@@ -330,7 +361,10 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         recorder.set_buffer_write(0, self.buffers.expert_counts, 0);
         recorder.set_buffer_write(1, self.buffers.expert_cursors, 0);
         recorder.set_u32(2, config.num_experts);
-        recorder.dispatch_1d(config.num_experts as usize, 256);
+        recorder.dispatch_1d(
+            config.num_experts as usize,
+            self.kernels.specializations.layout_clear.required_threads as usize,
+        );
 
         recorder.set_kernel(&self.kernels.layout_count);
         recorder.set_barrier_before();
@@ -339,7 +373,10 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         record_num_active_tokens(recorder, 2, self.shape.num_total_tokens, self.num_active_tokens_key);
         recorder.set_u32(3, config.num_experts_per_token);
         recorder.set_u32(4, config.num_experts);
-        recorder.dispatch_1d(config.num_routes(self.shape) as usize, 256);
+        recorder.dispatch_1d(
+            config.num_routes(self.shape) as usize,
+            self.kernels.specializations.layout_count.required_threads as usize,
+        );
 
         recorder.set_kernel(&self.kernels.layout_prefix);
         recorder.set_barrier_before();
@@ -347,7 +384,7 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         recorder.set_buffer_write(1, self.buffers.expert_offsets, 0);
         recorder.set_buffer_write(2, self.buffers.expert_cursors, 0);
         recorder.set_u32(3, config.num_experts);
-        recorder.dispatch_1d(1, 1);
+        recorder.dispatch_1d(1, self.kernels.specializations.layout_prefix.required_threads as usize);
 
         recorder.set_kernel(&self.kernels.layout_scatter);
         recorder.set_barrier_before();
@@ -359,7 +396,10 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         record_num_active_tokens(recorder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
         recorder.set_u32(6, config.num_experts_per_token);
         recorder.set_u32(7, config.num_experts);
-        recorder.dispatch_1d(config.num_routes(self.shape) as usize, 256);
+        recorder.dispatch_1d(
+            config.num_routes(self.shape) as usize,
+            self.kernels.specializations.layout_scatter.required_threads as usize,
+        );
     }
 }
 
@@ -382,7 +422,10 @@ impl Operator for MoEExpertMajorPackInputInvocation<'_> {
         record_num_active_tokens(recorder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
         recorder.set_u32(4, config.num_experts_per_token);
         recorder.set_u32(5, config.hidden_dim);
-        recorder.dispatch_1d(config.num_route_hidden_elements(self.shape), 256);
+        recorder.dispatch_1d(
+            config.num_route_hidden_elements(self.shape),
+            self.kernels.specializations.pack_input.required_threads as usize,
+        );
     }
 }
 
@@ -406,7 +449,10 @@ impl Operator for MoEExpertMajorScatterWithoutSharedExpertsInvocation<'_> {
         record_num_active_tokens(recorder, 4, self.shape.num_total_tokens, self.num_active_tokens_key);
         recorder.set_u32(5, config.num_experts_per_token);
         recorder.set_u32(6, config.hidden_dim);
-        recorder.dispatch_1d(config.num_token_hidden_elements(self.shape), 256);
+        recorder.dispatch_1d(
+            config.num_token_hidden_elements(self.shape),
+            self.kernels.specializations.scatter_output.required_threads as usize,
+        );
     }
 }
 
@@ -432,7 +478,10 @@ impl Operator for MoEExpertMajorScatterWithSharedExpertsInvocation<'_> {
         record_num_active_tokens(recorder, 6, self.shape.num_total_tokens, self.num_active_tokens_key);
         recorder.set_u32(7, config.num_experts_per_token);
         recorder.set_u32(8, config.hidden_dim);
-        recorder.dispatch_1d(config.num_token_hidden_elements(self.shape), 256);
+        recorder.dispatch_1d(
+            config.num_token_hidden_elements(self.shape),
+            self.kernels.specializations.scatter_output.required_threads as usize,
+        );
     }
 }
 

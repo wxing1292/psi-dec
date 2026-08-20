@@ -200,6 +200,7 @@ pub struct GatedMoEBucketedInput<'a> {
 /// ```
 pub struct GatedMoE {
     core: GatedMoECore,
+    execution_planner: GatedMoEExecutionPlanner,
     router: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
     routing: MoERoutingKernel,
@@ -220,12 +221,23 @@ pub enum GatedMoEComputePath {
     ExpertMajor,
 }
 
-impl GatedMoEComputePath {
-    fn select(shape: GatedMoEReplayShape) -> Self {
-        if shape.num_tokens <= TOKEN_MAJOR_MAX_TOKENS {
-            Self::TokenMajor
+struct GatedMoEExecutionPlanner {
+    token_major_max_tokens: u32,
+}
+
+impl GatedMoEExecutionPlanner {
+    fn new() -> Self {
+        Self {
+            token_major_max_tokens: TOKEN_MAJOR_MAX_TOKENS,
+        }
+    }
+
+    fn select(&self, shape: GatedMoEReplayShape) -> GatedMoEComputePath {
+        shape.validate();
+        if shape.num_tokens <= self.token_major_max_tokens {
+            GatedMoEComputePath::TokenMajor
         } else {
-            Self::ExpertMajor
+            GatedMoEComputePath::ExpertMajor
         }
     }
 }
@@ -255,6 +267,7 @@ impl GatedMoE {
         config.validate();
         let router_shape = core.router_shape();
         Self {
+            execution_planner: GatedMoEExecutionPlanner::new(),
             router: AffineQuantizedMatmul::new(
                 device,
                 affine_config_with_bits(router_shape.out_dim, router_shape.in_dim, config.router_bits, config),
@@ -330,7 +343,7 @@ impl GatedMoE {
         };
         shape.validate();
         GatedMoEReplayTopology {
-            compute_path: GatedMoEComputePath::select(shape),
+            compute_path: self.execution_planner.select(shape),
             router_affine: self.router.topology(num_total_tokens),
             shared_expert_gate_affine: self
                 .shared_experts
@@ -413,7 +426,7 @@ impl GatedMoE {
             num_tokens: input.num_total_tokens,
         };
         let next_hidden_state = input.next_hidden_state;
-        match GatedMoEComputePath::select(shape) {
+        match self.execution_planner.select(shape) {
             GatedMoEComputePath::TokenMajor => self.record_token_major_bucketed(recorder, input),
             GatedMoEComputePath::ExpertMajor => self.record_expert_major_bucketed(recorder, input),
         }
@@ -954,7 +967,7 @@ impl ReplayLayer for GatedMoE {
         self.validate_input(&input);
         let shape = input.shape;
         let next_hidden_state = input.next_hidden_state;
-        match GatedMoEComputePath::select(shape) {
+        match self.execution_planner.select(shape) {
             GatedMoEComputePath::TokenMajor => {
                 self.record_token_major_replay(recorder, input);
             },

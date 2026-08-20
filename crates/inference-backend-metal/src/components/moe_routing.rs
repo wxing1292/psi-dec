@@ -10,6 +10,24 @@ use crate::metal::ReplayParameterKey;
 
 const MOE_ROUTING_SOURCE: &str = include_str!("metal/moe_routing.metal");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MoERoutingThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MoERoutingKernelSpecialization {
+    thread_block: MoERoutingThreadBlockSpecialization,
+}
+
+impl MoERoutingKernelSpecialization {
+    fn current() -> Self {
+        Self {
+            thread_block: MoERoutingThreadBlockSpecialization { required_threads: 256 },
+        }
+    }
+}
+
 /// Routes each token to its top-k experts from router probabilities.
 ///
 /// The caller owns the preceding softmax stage. This kernel selects top-k
@@ -100,6 +118,7 @@ pub struct MoERoutingBuffers<'a> {
 
 pub struct MoERoutingKernel {
     config: MoERoutingConfig,
+    specialization: MoERoutingKernelSpecialization,
     kernel: Kernel,
 }
 
@@ -108,6 +127,7 @@ impl MoERoutingKernel {
         config.validate();
         Self {
             config,
+            specialization: MoERoutingKernelSpecialization::current(),
             kernel: Kernel::new(device, MOE_ROUTING_SOURCE, "moe_route_topk"),
         }
     }
@@ -159,7 +179,10 @@ impl Operator for MoERoutingInvocation<'_> {
         recorder.set_u32(4, self.kernel.config.num_experts);
         recorder.set_u32(5, self.kernel.config.num_experts_per_token);
         recorder.set_u32(6, u32::from(self.kernel.config.norm_topk_prob));
-        recorder.dispatch_threadblocks((self.shape.num_total_tokens as usize, 1, 1), (256, 1, 1));
+        recorder.dispatch_threadblocks(
+            (self.shape.num_total_tokens as usize, 1, 1),
+            (self.kernel.specialization.thread_block.required_threads as usize, 1, 1),
+        );
     }
 }
 

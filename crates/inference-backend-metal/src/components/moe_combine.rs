@@ -12,6 +12,24 @@ use crate::metal::ReplayParameterKey;
 
 const MOE_COMBINE_SOURCE: &str = include_str!("metal/moe_combine.metal");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MoECombineThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MoECombineKernelSpecialization {
+    thread_block: MoECombineThreadBlockSpecialization,
+}
+
+impl MoECombineKernelSpecialization {
+    fn current() -> Self {
+        Self {
+            thread_block: MoECombineThreadBlockSpecialization { required_threads: 256 },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MoECombineConfig {
     pub num_experts_per_token: u32,
@@ -118,6 +136,7 @@ pub struct MoECombineWithSharedExpertsBuffers<'a> {
 
 pub struct MoECombineKernels {
     config: MoECombineConfig,
+    specialization: MoECombineKernelSpecialization,
     without_shared_experts: Kernel,
     with_shared_experts: Kernel,
 }
@@ -127,6 +146,7 @@ impl MoECombineKernels {
         config.validate();
         Self {
             config,
+            specialization: MoECombineKernelSpecialization::current(),
             without_shared_experts: Kernel::new(device, MOE_COMBINE_SOURCE, "moe_combine_without_shared_experts"),
             with_shared_experts: Kernel::new(device, MOE_COMBINE_SOURCE, "moe_combine_with_shared_experts"),
         }
@@ -139,6 +159,7 @@ impl MoECombineKernels {
     ) -> MoECombineWithoutSharedExpertsInvocation<'a> {
         MoECombineWithoutSharedExpertsInvocation {
             config: self.config,
+            specialization: self.specialization,
             kernel: &self.without_shared_experts,
             shape,
             buffers,
@@ -155,6 +176,7 @@ impl MoECombineKernels {
     ) -> MoECombineWithoutSharedExpertsInvocation<'a> {
         MoECombineWithoutSharedExpertsInvocation {
             config: self.config,
+            specialization: self.specialization,
             kernel: &self.without_shared_experts,
             shape,
             buffers,
@@ -169,6 +191,7 @@ impl MoECombineKernels {
     ) -> MoECombineWithSharedExpertsInvocation<'a> {
         MoECombineWithSharedExpertsInvocation {
             config: self.config,
+            specialization: self.specialization,
             kernel: &self.with_shared_experts,
             shape,
             buffers,
@@ -185,6 +208,7 @@ impl MoECombineKernels {
     ) -> MoECombineWithSharedExpertsInvocation<'a> {
         MoECombineWithSharedExpertsInvocation {
             config: self.config,
+            specialization: self.specialization,
             kernel: &self.with_shared_experts,
             shape,
             buffers,
@@ -195,6 +219,7 @@ impl MoECombineKernels {
 
 pub struct MoECombineWithoutSharedExpertsInvocation<'a> {
     config: MoECombineConfig,
+    specialization: MoECombineKernelSpecialization,
     kernel: &'a Kernel,
     shape: MoECombineShape,
     buffers: MoECombineWithoutSharedExpertsBuffers<'a>,
@@ -213,12 +238,16 @@ impl Operator for MoECombineWithoutSharedExpertsInvocation<'_> {
         record_num_active_tokens(recorder, 3, self.shape.num_total_tokens, self.num_active_tokens_key);
         recorder.set_u32(4, config.num_experts_per_token);
         recorder.set_u32(5, config.hidden_dim);
-        recorder.dispatch_1d(config.num_output_elements(self.shape), 256);
+        recorder.dispatch_1d(
+            config.num_output_elements(self.shape),
+            self.specialization.thread_block.required_threads as usize,
+        );
     }
 }
 
 pub struct MoECombineWithSharedExpertsInvocation<'a> {
     config: MoECombineConfig,
+    specialization: MoECombineKernelSpecialization,
     kernel: &'a Kernel,
     shape: MoECombineShape,
     buffers: MoECombineWithSharedExpertsBuffers<'a>,
@@ -239,7 +268,10 @@ impl Operator for MoECombineWithSharedExpertsInvocation<'_> {
         record_num_active_tokens(recorder, 5, self.shape.num_total_tokens, self.num_active_tokens_key);
         recorder.set_u32(6, config.num_experts_per_token);
         recorder.set_u32(7, config.hidden_dim);
-        recorder.dispatch_1d(config.num_output_elements(self.shape), 256);
+        recorder.dispatch_1d(
+            config.num_output_elements(self.shape),
+            self.specialization.thread_block.required_threads as usize,
+        );
     }
 }
 

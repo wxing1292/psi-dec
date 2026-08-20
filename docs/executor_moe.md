@@ -377,7 +377,7 @@ The current routing kernel supports at most 256 experts and at most 16 selected 
 `MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
 
 Production callers may allocate scratch with the executor's maximum token capacity.
-An exact replay selects `GatedMoEComputePath` from the current `num_tokens`.
+A private `GatedMoEExecutionPlanner` selects `GatedMoEComputePath` from the current `num_tokens`.
 A bucketed replay selects it from `num_total_tokens`.
 Each path validates that buffers cover its recorded total route, input, scratch, and output shapes.
 The token-major path consumes `token_indices` and `route_indices` directly.
@@ -582,9 +582,47 @@ Recommendation: Add replay barriers only at these actual dependencies:
 - Routing/layout before sparse expert compute.
 - Expert output and shared branch before final combine or scatter.
 
+### Execution hierarchy
+
+MoE has one semantic owner and two complete command-graph decompositions:
+
+```text
+GatedMoEExecutionPlanner
+    -> GatedMoEComputePath::TokenMajor
+    |      routing -> token-major sparse expert MLP -> combine
+    |
+    -> GatedMoEComputePath::ExpertMajor
+           routing -> layout -> pack -> expert-major sparse MLP -> scatter
+```
+
+`GatedMoEComputePath` remains the replay-topology identity because it names a different command graph. The private
+planner is the only owner of the token-count threshold. Topology reporting, exact recording, and bucketed recording
+call the same planner. They do not duplicate the threshold.
+
+Each non-persistent leaf kernel defines its own task:
+
+| Kernel phase | One thread-block task |
+| --- | --- |
+| Routing Top-K | One token and its complete expert-probability row. |
+| Expert-major layout clear | A bounded expert-index range. |
+| Expert-major layout count | A bounded token-route range. |
+| Expert-major layout prefix | The complete expert-count array. |
+| Expert-major layout scatter | A bounded token-route range. |
+| Expert-major pack | A bounded `(expert route, hidden)` value range. |
+| Token-major combine | A bounded `(token, hidden)` output range. |
+| Expert-major scatter | A bounded `(token, hidden)` output range. |
+
+The current routing specialization requires 256 threads. The expert-major clear, count, scatter, pack, and output
+phases also require 256 threads. The current prefix phase requires one thread. These values belong to phase-scoped
+thread-block specializations. They are not dynamic workload fields.
+
+`QuantizedSparseMLP` exposes token-major and expert-major entry points. These entry points are explicit layouts chosen
+by the MoE owner. The sparse MLP leaf does not run another path selector. Its gather-affine and ragged expert-major
+affine kernels own their matrix tiles and thread ownership.
+
 ### Backend selection boundary
 
-`GatedMoE` owns compute-path selection.
+`GatedMoE` owns `GatedMoEExecutionPlanner` and compute-path selection.
 `QuantizedSparseMLP` owns only expert inner compute.
 The current production selector is:
 

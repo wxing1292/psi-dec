@@ -13,16 +13,17 @@ const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gate
 
 #[test]
 fn test_compute_path_selection_boundary() {
+    let planner = GatedMoEExecutionPlanner::new();
     assert_eq!(
-        GatedMoEComputePath::select(GatedMoEReplayShape { num_tokens: 1 }),
+        planner.select(GatedMoEReplayShape { num_tokens: 1 }),
         GatedMoEComputePath::TokenMajor
     );
     assert_eq!(
-        GatedMoEComputePath::select(GatedMoEReplayShape { num_tokens: 4 }),
+        planner.select(GatedMoEReplayShape { num_tokens: 4 }),
         GatedMoEComputePath::TokenMajor
     );
     assert_eq!(
-        GatedMoEComputePath::select(GatedMoEReplayShape { num_tokens: 5 }),
+        planner.select(GatedMoEReplayShape { num_tokens: 5 }),
         GatedMoEComputePath::ExpertMajor
     );
 }

@@ -11,6 +11,12 @@ use crate::metal::Stream;
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.moe.routing.num_active_tokens");
 
 #[test]
+fn test_specialization_has_explicit_thread_block_scope() {
+    let specialization = MoERoutingKernelSpecialization::current();
+    assert_eq!(specialization.thread_block.required_threads, 256);
+}
+
+#[test]
 #[should_panic(expected = "MoE routing supports at most 256 experts")]
 fn test_config_rejects_more_than_256_experts() {
     MoERoutingConfig {
