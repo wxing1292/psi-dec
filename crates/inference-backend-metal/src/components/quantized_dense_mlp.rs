@@ -11,7 +11,32 @@ use crate::operators::AffineQuantizedMatmulKernelKind;
 
 const DENSE_MLP_SWIGLU_SOURCE: &str = include_str!("metal/quantized_dense_mlp_swiglu.metal");
 
-const ELEMENTWISE_NUM_THREADS_PER_THREADBLOCK: usize = 256;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DenseMLPSwiGLUThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DenseMLPSwiGLUKernelSpecialization {
+    io_dtype: Dtype,
+    thread_block: DenseMLPSwiGLUThreadBlockSpecialization,
+}
+
+impl DenseMLPSwiGLUKernelSpecialization {
+    fn new(io_dtype: Dtype) -> Self {
+        let specialization = Self {
+            io_dtype,
+            thread_block: DenseMLPSwiGLUThreadBlockSpecialization { required_threads: 256 },
+        };
+        specialization.validate();
+        specialization
+    }
+
+    fn validate(self) {
+        assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(self.thread_block.required_threads > 0);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedDenseMLPConfig {
@@ -517,17 +542,20 @@ impl Operator for QuantizedDenseMLPDownInvocation<'_> {
 }
 
 struct QuantizedDenseMLPSwiGLUKernel {
+    specialization: DenseMLPSwiGLUKernelSpecialization,
     kernel: Kernel,
 }
 
 impl QuantizedDenseMLPSwiGLUKernel {
     fn new(device: &Device, dtype: Dtype) -> Self {
-        let function_name = match dtype {
+        let specialization = DenseMLPSwiGLUKernelSpecialization::new(dtype);
+        let function_name = match specialization.io_dtype {
             Dtype::Float32 => "dense_mlp_swiglu_f32",
             Dtype::Bfloat16 => "dense_mlp_swiglu_bf16",
             dtype => panic!("unsupported dense MLP swiglu dtype {dtype:?}"),
         };
         Self {
+            specialization,
             kernel: Kernel::new(device, DENSE_MLP_SWIGLU_SOURCE, function_name),
         }
     }
@@ -541,7 +569,7 @@ impl QuantizedDenseMLPSwiGLUKernel {
         num_active_tokens_key: Option<ReplayParameterKey>,
     ) -> QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
         QuantizedDenseMLPSwiGLURowMajorInvocation {
-            kernel: &self.kernel,
+            kernel: self,
             config,
             shape,
             gate_up,
@@ -552,7 +580,7 @@ impl QuantizedDenseMLPSwiGLUKernel {
 }
 
 struct QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a QuantizedDenseMLPSwiGLUKernel,
     config: QuantizedDenseMLPConfig,
     shape: QuantizedDenseMLPShape,
     gate_up: &'a Buffer,
@@ -563,7 +591,7 @@ struct QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
 impl Operator for QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        recorder.set_kernel(self.kernel);
+        recorder.set_kernel(&self.kernel.kernel);
         recorder.set_buffer_read(0, self.gate_up, 0);
         recorder.set_buffer_write(1, self.swiglu, 0);
         match self.num_active_tokens_key {
@@ -572,7 +600,10 @@ impl Operator for QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
         }
         recorder.set_u32(3, self.config.intermediate_dim);
         let num_values = self.config.swiglu_num_values_unchecked(self.shape) as usize;
-        recorder.dispatch_1d(num_values, ELEMENTWISE_NUM_THREADS_PER_THREADBLOCK);
+        recorder.dispatch_1d(
+            num_values,
+            self.kernel.specialization.thread_block.required_threads as usize,
+        );
     }
 }
 

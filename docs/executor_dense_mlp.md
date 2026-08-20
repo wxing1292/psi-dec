@@ -228,6 +228,37 @@ The bucketed path uses recorded `num_total_tokens` and submission-time `num_acti
 Capacity buffers can be larger.
 Each replay invocation uses the current active prefix.
 
+## Execution hierarchy
+
+Dense MLP is a semantic command graph. It is not one kernel launch:
+
+```text
+DenseMLPExecution
+├── gate_up AffineQuantizedMatmul
+├── SwiGLU KernelLaunch
+└── down AffineQuantizedMatmul
+```
+
+Each affine owner defines its QMV or QMM thread-block task, tile geometry, and layout. The dense MLP owner supplies the
+projection geometry and runtime row count. It does not select the affine kernel again.
+
+The current SwiGLU kernel uses this specialization hierarchy:
+
+```text
+DenseMLPSwiGLUKernelSpecialization
+├── io_dtype
+└── thread_block
+    └── required_threads = 256
+```
+
+One non-persistent SwiGLU thread block processes a bounded flat range of `(token, intermediate)` output coordinates.
+One thread processes one coordinate at a time. It reads the matching gate and up values and writes one SwiGLU value.
+The tensor is row-major. The flat dispatch does not make a thread block the owner of one complete token row.
+
+Dense MLP does not use a component-level planner. The command graph does not change with the runtime row count. The
+two affine owners make independent row-dependent kernel choices. `QuantizedDenseMLPReplayTopology` records both affine
+choices so that a replay bucket cannot cross either topology boundary.
+
 ## Backend selection
 
 `QuantizedDenseMLP` owns one adaptive `AffineQuantizedMatmul` for gate/up and one for down.

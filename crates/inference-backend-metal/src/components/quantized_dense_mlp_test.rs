@@ -18,6 +18,13 @@ const SWIGLU_CANARY: u16 = 0x3aaa;
 const OUTPUT_CANARY: u16 = 0x3c00;
 
 #[test]
+fn test_swiglu_specialization_has_explicit_thread_block_scope() {
+    let specialization = DenseMLPSwiGLUKernelSpecialization::new(Dtype::Bfloat16);
+    assert_eq!(specialization.io_dtype, Dtype::Bfloat16);
+    assert_eq!(specialization.thread_block.required_threads, 256);
+}
+
+#[test]
 fn test_fixed() {
     let config = QuantizedDenseMLPConfig {
         hidden_dim: 64,
