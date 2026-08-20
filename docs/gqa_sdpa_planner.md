@@ -260,6 +260,15 @@ identity and the concrete-kernel recording input.
 `GQAMetadataBuffers::update(...)` uploads the selected plan. It does not select another specialization or recompute KV
 partitioning.
 
+The materialized plan is necessary because the selected specialization, Q-token ranges, Map task templates,
+partial-state offsets, replay shape, and metrics are one coupled result. A kernel-kind enum or threshold helper cannot
+represent this result. Moving candidate construction into `GQAMetadataBuffers` would mix selection with GPU ABI upload.
+Returning unrelated parallel values would weaken the boundary and permit mismatched specialization and task metadata.
+
+`GQASDPAPlanner` is also not a stateless wrapper. It owns the legal specialization registry and the allocation limits.
+For each dynamic workload, it materializes every complete candidate before it compares them. This work allocates and
+fills request-local vectors. Callers must not repeat it only to recover one field.
+
 ### Metrics and selection
 
 `GQASDPAPlanMetrics` names each counted unit:

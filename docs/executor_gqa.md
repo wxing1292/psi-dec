@@ -565,6 +565,10 @@ current greedy KV-segment allocation separately to each candidate specialization
 metrics and applies the current measured selection policy. The selected `GQASDPAPlan` contains the execution identity,
 the materialized Q-token ranges and Map task templates, cumulative partial-output offsets, replay shape, and metrics.
 
+GQA retains this planner and plan because these values form one coupled dynamic decision. A pure selector can return an
+execution specialization, but it cannot also preserve the exact request-local work partition and replay extents that
+were priced for that specialization. The plan is the atomic boundary between dynamic selection and metadata upload.
+
 `GQAMetadataBuffers::update(...)` uploads the selected plan. Recording executes the stored specialization and does not
 select again. Both current concrete kernel families partition a long visible KV range into independent KV segments.
 

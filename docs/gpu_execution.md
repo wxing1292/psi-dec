@@ -128,6 +128,14 @@ Add a runtime planner only when all of these conditions apply:
 2. The best choice depends on the dynamic workload.
 3. A complete candidate plan can express dispatch, metadata, scratch, and reduction cost.
 
+A runtime choice does not by itself require a planner object. Use one pure selector when the result is only a kernel
+kind, specialization, or command-graph enum. Multiple callers may repeat the same inexpensive, deterministic selector.
+
+Add a materialized plan object only when one selected candidate contains multiple coupled dynamic results that a later
+owner must consume as one unit. Examples include a selected specialization together with task metadata, partial-state
+offsets, replay extents, and candidate metrics. Do not replace such a boundary with parallel return values or duplicate
+materialization.
+
 Use this ownership model when a planner is necessary:
 
 ```text
@@ -174,6 +182,26 @@ must not add a planner only to match another component.
 | Top-K sampling | Map vocabulary partitions to partial candidates, then reduce the partial candidates for each sampling row. | Map: one `(sampling row, vocabulary partition)`. Reduce: one sampling row. | The pure Map-specialization helper selects the kernel family from the output contract and Top-K width. The component does not materialize a planner or plan object. Replay capacity selection remains a separate owner concern. |
 | Sparse rejection sampling | Walk one request's ordered draft sequence and sample its fallback or continuation token. | One request. | No kernel planner. Replay bucket policies select only capacities. |
 | DSpark Markov sampling | Produce partial Top-K candidates with a Markov correction, then use the common Top-K reduce phase. | Map: one `(sampling row, vocabulary partition)`. Reduce: one sampling row. | The Markov Map kernel has one current specialization. Its partial-candidate layout is an explicit producer/consumer contract. |
+
+### Planner and plan audit
+
+GQA SDPA is the only current component in this table that retains a runtime planner and a materialized plan. Each legal
+Map/Reduce specialization produces different Q-token ranges, KV ranges, partial-state offsets, replay extents, and
+candidate metrics. `GQASDPAPlan` keeps these coupled results with the selected execution specialization.
+`GQAMetadataBuffers::update(...)` consumes this result as one unit. It does not rebuild work partitioning or select a
+second specialization.
+
+The other components do not retain planner or plan objects:
+
+- GDN, embedding, row gather, RMSNorm, residual operations, and DSpark Markov Map derive one static specialization.
+- Dense MLP and unembedding delegate row-dependent QMV/QMM selection to `AffineQuantizedMatmul`.
+- MoE repeats the pure `GatedMoEComputePath::select(...)` helper where it needs the command-graph identity.
+- Top-K sampling uses the pure `TopKMapKernelSpecialization::select(...)` helper.
+- Sparse MLP implements expert inner compute. MoE owns the outer command-graph choice.
+- Sparse rejection sampling has one current execution specialization.
+
+`ExecutorHibernationPlan` and `StateSnapshotPlan` describe requested model-state persistence. They are not GPU kernel or
+execution planners, and this execution rule does not apply to them.
 
 ### Planning and replay identity
 
