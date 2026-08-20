@@ -1,245 +1,324 @@
 use crate::metal::Dtype;
 
-/// A backend-selected SplitKV variant and its complete SDPA geometry.
-///
-/// Production callers provide workload facts to [`GQASplitKV`]. They do not
-/// select a variant, kernel family, or tile.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum GQASplitKVVariant {
-    SingleQ {
-        kv_token_tile_size: u32,
-        num_threads_per_threadblock: u32,
-        q_head_tile_size: u32,
-    },
-    TiledQ {
-        q_token_tile_size: u32,
-        kv_token_tile_size: u32,
-        q_head_tile_size: u32,
-    },
+pub struct GQASDPAMapThreadBlockSpecialization {
+    pub max_q_tokens: u32,
+    pub max_q_heads: u32,
+    pub kv_tokens_per_iteration: u32,
+    pub required_threads: u32,
 }
 
-/// Fixed workload facts used to select a GQA SplitKV variant.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GQASDPAKVCacheSpecialization {
+    pub tokens_per_page: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GQASDPAMapKernelSpecialization {
+    pub thread_block: GQASDPAMapThreadBlockSpecialization,
+    pub kv_cache: GQASDPAKVCacheSpecialization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GQASDPAReduceThreadBlockSpecialization {
+    pub max_q_tokens: u32,
+    pub max_q_heads: u32,
+    pub required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GQASDPAReduceKernelSpecialization {
+    pub thread_block: GQASDPAReduceThreadBlockSpecialization,
+}
+
+/// One compatible GQA SDPA Map and Reduce kernel specialization pair.
+///
+/// `map.thread_block.max_q_tokens == 1` describes the current SingleQ geometry. A larger value
+/// describes a current TiledQ geometry. The planner does not expose a
+/// SingleQ/TiledQ execution enum.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GQASDPAExecutionSpecialization {
+    pub map: GQASDPAMapKernelSpecialization,
+    pub reduce: GQASDPAReduceKernelSpecialization,
+}
+
+impl GQASDPAExecutionSpecialization {
+    pub fn single_q(
+        config: GQASDPAConfig,
+        kv_tokens_per_iteration: u32,
+        required_threads: u32,
+        max_q_heads: u32,
+    ) -> Self {
+        config.validate();
+        let reduce_output_coordinates = 256 / config.head_dim.min(256);
+        let reduce_max_q_heads = config.num_q_heads.min(reduce_output_coordinates).max(1);
+        let reduce_max_q_tokens = (reduce_output_coordinates / reduce_max_q_heads).max(1);
+        let execution = Self {
+            map: GQASDPAMapKernelSpecialization {
+                thread_block: GQASDPAMapThreadBlockSpecialization {
+                    max_q_tokens: 1,
+                    max_q_heads,
+                    kv_tokens_per_iteration,
+                    required_threads,
+                },
+                kv_cache: GQASDPAKVCacheSpecialization {
+                    tokens_per_page: config.tokens_per_page,
+                },
+            },
+            reduce: GQASDPAReduceKernelSpecialization {
+                thread_block: GQASDPAReduceThreadBlockSpecialization {
+                    max_q_tokens: reduce_max_q_tokens,
+                    max_q_heads: reduce_max_q_heads,
+                    required_threads: 256,
+                },
+            },
+        };
+        assert!(execution.supports(config));
+        execution
+    }
+
+    pub fn tiled_q(config: GQASDPAConfig, max_q_tokens: u32, kv_tokens_per_iteration: u32, max_q_heads: u32) -> Self {
+        config.validate();
+        let required_threads = max_q_tokens / 8 * max_q_heads * 32;
+        let execution = Self {
+            map: GQASDPAMapKernelSpecialization {
+                thread_block: GQASDPAMapThreadBlockSpecialization {
+                    max_q_tokens,
+                    max_q_heads,
+                    kv_tokens_per_iteration,
+                    required_threads,
+                },
+                kv_cache: GQASDPAKVCacheSpecialization {
+                    tokens_per_page: config.tokens_per_page,
+                },
+            },
+            reduce: GQASDPAReduceKernelSpecialization {
+                thread_block: GQASDPAReduceThreadBlockSpecialization {
+                    max_q_tokens,
+                    max_q_heads: 1,
+                    required_threads,
+                },
+            },
+        };
+        assert!(execution.supports(config));
+        execution
+    }
+
+    pub fn supports(self, config: GQASDPAConfig) -> bool {
+        let map = self.map.thread_block;
+        let reduce = self.reduce.thread_block;
+        if self.map.kv_cache.tokens_per_page != config.tokens_per_page
+            || map.max_q_tokens == 0
+            || map.max_q_heads == 0
+            || map.max_q_heads > config.q_heads_per_kv_head()
+            || map.kv_tokens_per_iteration == 0
+            || map.required_threads == 0
+            || reduce.max_q_tokens == 0
+            || reduce.max_q_heads == 0
+            || reduce.required_threads == 0
+        {
+            return false;
+        }
+
+        if map.max_q_tokens == 1 {
+            let reduce_output_coordinates = 256 / config.head_dim.min(256);
+            let expected_reduce_max_q_heads = config.num_q_heads.min(reduce_output_coordinates).max(1);
+            let expected_reduce_max_q_tokens = (reduce_output_coordinates / expected_reduce_max_q_heads).max(1);
+            return map.max_q_heads <= 8
+                && map.kv_tokens_per_iteration <= 1024
+                && map.required_threads.is_power_of_two()
+                && map.required_threads <= 256
+                && reduce.max_q_tokens == expected_reduce_max_q_tokens
+                && reduce.max_q_heads == expected_reduce_max_q_heads
+                && reduce.required_threads == 256;
+        }
+
+        let profile = (config.head_dim, config.tokens_per_page);
+        config.io_dtype == Dtype::Bfloat16
+            && matches!(profile, (128, 8) | (256, 8 | 16))
+            && config.q_heads_per_kv_head() <= 8
+            && matches!(map.max_q_tokens, 8 | 16)
+            && matches!(map.kv_tokens_per_iteration, 8 | 16)
+            && map.required_threads == map.max_q_tokens / 8 * map.max_q_heads * 32
+            && map.required_threads <= 256
+            && reduce.max_q_tokens == map.max_q_tokens
+            && reduce.max_q_heads == 1
+            && reduce.required_threads == map.required_threads
+    }
+}
+
+/// Static GQA SDPA workload facts used for capability filtering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASplitKVConfig {
+pub struct GQASDPAConfig {
     pub io_dtype: Dtype,
-    pub page_bytes: u32,
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    pub tokens_per_page: u32,
 }
 
-impl GQASplitKVConfig {
+impl GQASDPAConfig {
     pub fn validate(self) {
         assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
-        assert!(self.page_bytes > 0);
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         assert!(self.head_dim > 0);
-        let _ = self.num_tokens_per_page();
+        assert!(self.tokens_per_page > 0);
     }
 
     pub fn q_heads_per_kv_head(self) -> u32 {
         self.num_q_heads / self.num_kv_heads
     }
-
-    pub fn num_tokens_per_page(self) -> u32 {
-        let kv_bytes_per_token = self
-            .num_kv_heads
-            .checked_mul(self.head_dim)
-            .and_then(|elements| elements.checked_mul(2))
-            .and_then(|elements| {
-                elements.checked_mul(
-                    self.io_dtype
-                        .item_size()
-                        .try_into()
-                        .expect("io_dtype size must fit u32"),
-                )
-            })
-            .expect("GQA K/V bytes per token must fit u32");
-        assert!(
-            self.page_bytes.is_multiple_of(kv_bytes_per_token),
-            "GQA page_bytes must be divisible by the K/V bytes per token"
-        );
-        self.page_bytes / kv_bytes_per_token
-    }
 }
 
-/// Backend-owned GQA SplitKV variant selector.
+/// Backend-owned registry of legal GQA SDPA kernel specializations.
 ///
-/// `SingleQ` and `TiledQ` use different metadata and
-/// kernels. This selector also returns the complete SDPA geometry that the
-/// selected metadata builder and kernel implementation share.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASplitKV {
-    q_heads_per_kv_head: u32,
-    supports_tiled_q: bool,
-    full_q_head_group_for_tiled_q: bool,
-    single_q_kv_token_tile_size: u32,
-    single_q_num_threads_per_threadblock: u32,
-    tiled_q_token_tile_size: u32,
-    tiled_kv_token_tile_size: u32,
-    max_q_head_tile_size: u32,
+/// The registry performs only static capability filtering. The executor
+/// planner owns dynamic workload selection and complete-plan comparison.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GQASDPASpecializationRegistry {
+    config: GQASDPAConfig,
+    executions: Box<[GQASDPAExecutionSpecialization]>,
 }
 
-impl GQASplitKV {
-    pub fn new(config: GQASplitKVConfig) -> Self {
+impl GQASDPASpecializationRegistry {
+    pub fn new(config: GQASDPAConfig) -> Self {
         config.validate();
-        let tiled_q_profile = (config.head_dim, config.num_tokens_per_page());
-        let supports_tiled_q = config.io_dtype == Dtype::Bfloat16
-            && matches!(tiled_q_profile, (128, 8) | (256, 8 | 16))
-            && config.q_heads_per_kv_head() <= 8;
-        Self::with_tiled_q_profile(config, supports_tiled_q, tiled_q_profile == (128, 8))
+        let mut executions = vec![single_q_execution(config)];
+        if supports_tiled_q(config) {
+            let full_q_heads = config.q_heads_per_kv_head().min(max_tiled_q_heads(8));
+            if (config.head_dim, config.tokens_per_page) != (128, 8) {
+                let half_q_heads = config.q_heads_per_kv_head().div_ceil(2).min(max_tiled_q_heads(8));
+                if half_q_heads != full_q_heads {
+                    executions.push(tiled_q_execution(config, half_q_heads));
+                }
+            }
+            executions.push(tiled_q_execution(config, full_q_heads));
+        }
+        Self::from_execution_specializations(config, executions)
     }
 
-    /// Selects the SplitKV SingleQ partial ABI required by a larger
-    /// DSpark history composition. The SplitKV history and block-bidirectional
-    /// maps must produce the same partial layout for one shared reduce.
-    pub fn new_dspark_history(config: GQASplitKVConfig) -> Self {
+    /// Creates a registry that contains only the current SingleQ execution.
+    /// Composite operators can use this registry when all of their Map kernels
+    /// must share the SingleQ partial-state ABI and one Reduce kernel.
+    pub fn new_single_q_only(config: GQASDPAConfig) -> Self {
         config.validate();
-        Self::with_tiled_q_profile(config, false, false)
+        Self::from_execution_specializations(config, vec![single_q_execution(config)])
     }
 
-    fn with_tiled_q_profile(
-        config: GQASplitKVConfig,
-        supports_tiled_q: bool,
-        full_q_head_group_for_tiled_q: bool,
+    /// Creates a registry from explicit backend specializations.
+    ///
+    /// Backend benchmarks can use this constructor to force one legal
+    /// specialization. Production model plans use [`Self::new`] or
+    /// [`Self::new_single_q_only`].
+    pub fn from_execution_specializations(
+        config: GQASDPAConfig,
+        executions: Vec<GQASDPAExecutionSpecialization>,
     ) -> Self {
-        let bounded_head_dim = config.head_dim.min(256);
-        let single_q_num_threads_per_threadblock = bounded_head_dim.max(32).next_power_of_two();
-        let tiled_q_token_tile_size = 8;
+        config.validate();
+        assert!(!executions.is_empty(), "GQA SDPA registry requires an execution");
+        assert!(
+            executions.iter().all(|execution| execution.supports(config)),
+            "GQA SDPA registry contains an unsupported execution specialization"
+        );
         Self {
-            q_heads_per_kv_head: config.q_heads_per_kv_head(),
-            supports_tiled_q,
-            full_q_head_group_for_tiled_q,
-            single_q_kv_token_tile_size: single_q_num_threads_per_threadblock,
-            single_q_num_threads_per_threadblock,
-            tiled_q_token_tile_size,
-            tiled_kv_token_tile_size: 16,
-            max_q_head_tile_size: 256 / (tiled_q_token_tile_size / 8 * 32),
+            config,
+            executions: executions.into_boxed_slice(),
         }
     }
 
-    pub fn tiled_q_token_tile_size(self) -> u32 {
-        self.tiled_q_token_tile_size
+    pub fn config(&self) -> GQASDPAConfig {
+        self.config
     }
 
-    pub fn max_q_tokens_per_partial_output(self) -> u32 {
-        if self.supports_tiled_q {
-            self.tiled_q_token_tile_size
-        } else {
-            1
-        }
+    pub fn execution_specializations(&self) -> &[GQASDPAExecutionSpecialization] {
+        &self.executions
     }
 
-    pub fn select(self, num_tokens: u32, num_q_token_tiles: u32) -> GQASplitKVVariant {
-        assert!(num_tokens > 0);
-        assert!(num_q_token_tiles > 0 && num_q_token_tiles <= num_tokens);
-        if !self.supports_tiled_q || (num_tokens as u64) < 2 * num_q_token_tiles as u64 {
-            return GQASplitKVVariant::SingleQ {
-                kv_token_tile_size: self.single_q_kv_token_tile_size,
-                num_threads_per_threadblock: self.single_q_num_threads_per_threadblock,
-                q_head_tile_size: self.q_heads_per_kv_head.min(self.max_q_head_tile_size),
-            };
-        }
-        let desired_q_head_tile_size =
-            if !self.full_q_head_group_for_tiled_q && (num_tokens as u64) < 4 * num_q_token_tiles as u64 {
-                self.q_heads_per_kv_head.div_ceil(2)
-            } else {
-                self.q_heads_per_kv_head
-            };
-        GQASplitKVVariant::TiledQ {
-            q_token_tile_size: self.tiled_q_token_tile_size,
-            kv_token_tile_size: self.tiled_kv_token_tile_size,
-            q_head_tile_size: desired_q_head_tile_size.min(self.max_q_head_tile_size),
-        }
+    pub fn max_q_tokens_per_map_task(&self) -> u32 {
+        self.executions
+            .iter()
+            .map(|execution| execution.map.thread_block.max_q_tokens)
+            .max()
+            .expect("GQA SDPA registry requires an execution")
     }
+}
+
+fn supports_tiled_q(config: GQASDPAConfig) -> bool {
+    let profile = (config.head_dim, config.tokens_per_page);
+    config.io_dtype == Dtype::Bfloat16
+        && matches!(profile, (128, 8) | (256, 8 | 16))
+        && config.q_heads_per_kv_head() <= 8
+}
+
+fn single_q_execution(config: GQASDPAConfig) -> GQASDPAExecutionSpecialization {
+    let required_threads = config.head_dim.clamp(32, 256).next_power_of_two();
+    let max_q_heads = config.q_heads_per_kv_head().min(8);
+    GQASDPAExecutionSpecialization::single_q(config, required_threads, required_threads, max_q_heads)
+}
+
+fn tiled_q_execution(config: GQASDPAConfig, max_q_heads: u32) -> GQASDPAExecutionSpecialization {
+    let max_q_tokens = 8;
+    GQASDPAExecutionSpecialization::tiled_q(config, max_q_tokens, 16, max_q_heads)
+}
+
+fn max_tiled_q_heads(max_q_tokens: u32) -> u32 {
+    256 / (max_q_tokens / 8 * 32)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::GQASplitKV;
-    use super::GQASplitKVConfig;
-    use super::GQASplitKVVariant;
+    use super::GQASDPAConfig;
+    use super::GQASDPASpecializationRegistry;
     use crate::metal::Dtype;
 
-    fn config(head_dim: u32, q_heads_per_kv_head: u32, num_tokens_per_page: u32) -> GQASplitKVConfig {
+    fn config(head_dim: u32, q_heads_per_kv_head: u32, tokens_per_page: u32) -> GQASDPAConfig {
         let num_kv_heads = 2;
-        GQASplitKVConfig {
+        GQASDPAConfig {
             io_dtype: Dtype::Bfloat16,
-            page_bytes: 2 * num_kv_heads * head_dim * num_tokens_per_page * Dtype::Bfloat16.item_size() as u32,
             num_q_heads: num_kv_heads * q_heads_per_kv_head,
             num_kv_heads,
             head_dim,
+            tokens_per_page,
         }
     }
 
     #[test]
-    fn test_split_kv_variant_selection_matrix() {
-        let tiled_256 = GQASplitKV::new(config(256, 6, 16));
-        let tiled_256_page8 = GQASplitKV::new(config(256, 6, 8));
-        let tiled_128 = GQASplitKV::new(config(128, 8, 8));
-        let unsupported = GQASplitKV::new(config(256, 8, 4));
-        let single_partial = GQASplitKV::new_dspark_history(config(128, 8, 8));
+    fn test_registry_filters_static_execution_capabilities() {
+        let d256_page16 = GQASDPASpecializationRegistry::new(config(256, 6, 16));
+        let d256_page8 = GQASDPASpecializationRegistry::new(config(256, 6, 8));
+        let d128_page8 = GQASDPASpecializationRegistry::new(config(128, 8, 8));
+        let unsupported = GQASDPASpecializationRegistry::new(config(256, 8, 4));
+        let dspark = GQASDPASpecializationRegistry::new_single_q_only(config(128, 8, 8));
 
-        assert_eq!(tiled_256.max_q_tokens_per_partial_output(), 8);
-        assert_eq!(tiled_256_page8.max_q_tokens_per_partial_output(), 8);
-        assert_eq!(
-            tiled_256.select(4, 4),
-            GQASplitKVVariant::SingleQ {
-                kv_token_tile_size: 256,
-                num_threads_per_threadblock: 256,
-                q_head_tile_size: 6,
-            }
-        );
-        assert_eq!(
-            tiled_256.select(8, 4),
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                q_head_tile_size: 3,
-            }
-        );
-        assert_eq!(
-            tiled_256.select(16, 4),
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                q_head_tile_size: 6,
-            }
-        );
-        assert_eq!(
-            tiled_256_page8.select(16, 4),
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                q_head_tile_size: 6,
-            }
-        );
-        assert_eq!(
-            tiled_128.select(8, 4),
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                q_head_tile_size: 8,
-            }
-        );
-        for split_kv in [unsupported, single_partial] {
-            assert_eq!(split_kv.max_q_tokens_per_partial_output(), 1);
-            assert!(matches!(split_kv.select(16, 4), GQASplitKVVariant::SingleQ { .. }));
+        assert_eq!(d256_page16.execution_specializations().len(), 3);
+        assert_eq!(d256_page8.execution_specializations().len(), 3);
+        assert_eq!(d128_page8.execution_specializations().len(), 2);
+        assert_eq!(unsupported.execution_specializations().len(), 1);
+        assert_eq!(dspark.execution_specializations().len(), 1);
+        for registry in [d256_page16, d256_page8, d128_page8, unsupported, dspark] {
+            assert!(
+                registry
+                    .execution_specializations()
+                    .iter()
+                    .all(|execution| execution.supports(registry.config()))
+            );
         }
     }
 
     #[test]
-    #[should_panic(expected = "GQA K/V bytes per token must fit u32")]
-    fn test_config_rejects_kv_byte_overflow() {
-        GQASplitKVConfig {
-            io_dtype: Dtype::Float32,
-            page_bytes: 65536,
-            num_q_heads: u32::MAX,
-            num_kv_heads: u32::MAX,
-            head_dim: 2,
-        }
-        .validate();
+    fn test_registry_uses_specialization_geometry_without_a_path_enum() {
+        let registry = GQASDPASpecializationRegistry::new(config(256, 6, 8));
+        let executions = registry.execution_specializations();
+
+        assert_eq!(executions[0].map.thread_block.max_q_tokens, 1);
+        assert_eq!(executions[0].map.thread_block.max_q_heads, 6);
+        assert_eq!(executions[0].map.thread_block.kv_tokens_per_iteration, 256);
+        assert_eq!(executions[0].map.thread_block.required_threads, 256);
+        assert_eq!(executions[1].map.thread_block.max_q_tokens, 8);
+        assert_eq!(executions[1].map.thread_block.max_q_heads, 3);
+        assert_eq!(executions[2].map.thread_block.max_q_heads, 6);
+        assert_eq!(registry.max_q_tokens_per_map_task(), 8);
     }
 }

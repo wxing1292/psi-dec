@@ -1,28 +1,28 @@
-// HND SplitKV SingleQ SDPA map. One logical SDPAMapTask maps 1:1 to one
+// HND SplitKV SingleQ SDPA map. One MapThreadBlockTask maps 1:1 to one
 // threadblock. Its fields are sourced as follows:
 //
-// KVSplit {              // materialized; three u32 fields
-//   q_token_tile_index,  // kv_splits[kv_split_index, 0]
-//   kv_token_begin,      // kv_splits[kv_split_index, 1]
-//   kv_token_end,        // kv_splits[kv_split_index, 2]
+// Map task template {     // materialized; three u32 fields
+//   q_token_range_index,  // sdpa_map_task_templates[map_task_template_index, 0]
+//   kv_token_begin,       // sdpa_map_task_templates[map_task_template_index, 1]
+//   kv_token_end,         // sdpa_map_task_templates[map_task_template_index, 2]
 // }
-// SDPAMapTask {
-//   q_token_tile_index,  // from KVSplit
-//   kv_token_begin,      // from KVSplit
-//   kv_token_end,        // from KVSplit
-//   kv_head_index,       // grid-derived
-//   q_head_tile_index,   // grid-derived
+// MapThreadBlockTask {
+//   q_token_range_index,  // from the Map task template
+//   kv_token_begin,       // from the Map task template
+//   kv_token_end,         // from the Map task template
+//   kv_head_index,        // grid-derived
+//   q_head_tile_index,    // grid-derived
 // }
 //
-// The Task walks consecutive SDPAMapTiles along Tkv and writes one
-// SDPAPartialOutput per active Q head. A sentinel KVSplit returns without
-// writing any partial output or statistics.
+// The task walks consecutive KV iterations and writes one SDPAPartialOutput
+// per active Q head. A sentinel Map task template returns without writing any
+// partial output or statistics.
 //
 // q              : [num_tokens, num_q_heads, kv_head_dim]
 // kv_pages       : [num_pages, K/V, num_kv_heads, num_tokens, kv_head_dim]
 // req_slots      : [num_tokens]
 // page_ids       : [num_req_slots, num_gqa_layers, num_blocks, num_page_ids_per_block]
-// kv_splits             : [num_total_kv_splits, q_token_tile_index/kv_token_begin/kv_token_end]
+// sdpa_map_task_templates: [num_total_kv_splits, q_token_range_index/kv_token_begin/kv_token_end]
 //
 // partial_exp_sums       : [num_total_kv_splits, num_q_heads]
 // partial_max_logits     : [num_total_kv_splits, num_q_heads]
@@ -38,22 +38,22 @@ if (threadblock_linear_index >=
     return;
 }
 
-uint kv_split_index = threadblock_linear_index % (uint)TOTAL_KV_SPLITS;
-if (kv_split_index >= num_active_kv_splits) {
+uint map_task_template_index = threadblock_linear_index % (uint)TOTAL_KV_SPLITS;
+if (map_task_template_index >= num_active_kv_splits) {
     return;
 }
 uint head_group_index = threadblock_linear_index / (uint)TOTAL_KV_SPLITS;
 uint q_head_tile_index = head_group_index % (uint)NUM_Q_HEAD_TILES_PER_KV_HEAD;
 uint kv_head_index = head_group_index / (uint)NUM_Q_HEAD_TILES_PER_KV_HEAD;
-uint q_token_tile_index = kv_splits[kv_split_index * 3];
-// Invalid KV splits are either replay padding or slots intentionally
+uint q_token_range_index = sdpa_map_task_templates[map_task_template_index * 3];
+// Invalid Map task templates are replay padding or slots intentionally
 // populated by another attention task before the shared partial-output reduce.
-if (q_token_tile_index >= num_active_tokens) {
+if (q_token_range_index >= num_active_tokens) {
     return;
 }
 
-uint kv_token_begin = kv_splits[kv_split_index * 3 + 1];
-uint kv_token_end = kv_splits[kv_split_index * 3 + 2];
+uint kv_token_begin = sdpa_map_task_templates[map_task_template_index * 3 + 1];
+uint kv_token_end = sdpa_map_task_templates[map_task_template_index * 3 + 2];
 uint q_head_tile_base = q_head_tile_index * uint(Q_HEAD_TILE_SIZE);
 uint num_active_q_heads = metal::min(
     uint(Q_HEAD_TILE_SIZE), uint(Q_HEADS_PER_KV_HEAD) - q_head_tile_base);
@@ -63,9 +63,9 @@ threadgroup float logits[Q_HEAD_TILE_SIZE * KV_TOKEN_TILE_SIZE];
 threadgroup float reduce_scratch[NUM_THREADS_PER_THREADBLOCK];
 
 const ulong q_tile_offset =
-    ((ulong)q_token_tile_index * (ulong)num_q_heads + (ulong)q_head_base) * (ulong)KV_HEAD_DIM;
+    ((ulong)q_token_range_index * (ulong)num_q_heads + (ulong)q_head_base) * (ulong)KV_HEAD_DIM;
 const device T* q_tile_ptr = q + q_tile_offset;
-uint req_slot = req_slots[q_token_tile_index];
+uint req_slot = req_slots[q_token_range_index];
 
 float running_max[Q_HEAD_TILE_SIZE];
 float running_exp_sum[Q_HEAD_TILE_SIZE];
@@ -231,7 +231,7 @@ for (uint kv_token_tile_begin = kv_token_begin; kv_token_tile_begin < kv_token_e
 if (thread_index_in_threadblock == 0) {
     for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
         uint q_head_index = q_head_base + local_q_head;
-        ulong partial_output_index = (ulong)kv_split_index * (ulong)num_q_heads + (ulong)q_head_index;
+        ulong partial_output_index = (ulong)map_task_template_index * (ulong)num_q_heads + (ulong)q_head_index;
         partial_exp_sums[partial_output_index] = running_exp_sum[local_q_head];
         partial_max_logits[partial_output_index] = running_max[local_q_head];
     }
@@ -243,7 +243,7 @@ for (uint dim_slot = 0; dim_slot < uint(NUM_DIMS_PER_THREAD); ++dim_slot) {
     }
     for (uint local_q_head = 0; local_q_head < num_active_q_heads; ++local_q_head) {
         uint q_head_index = q_head_base + local_q_head;
-        ulong partial_output_index = (ulong)kv_split_index * (ulong)num_q_heads + (ulong)q_head_index;
+        ulong partial_output_index = (ulong)map_task_template_index * (ulong)num_q_heads + (ulong)q_head_index;
         float inv_exp_sum = running_exp_sum[local_q_head] > 0.0f
             ? 1.0f / running_exp_sum[local_q_head]
             : 0.0f;

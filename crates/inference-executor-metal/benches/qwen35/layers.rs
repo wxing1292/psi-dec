@@ -5,7 +5,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
-use inference_backend_metal::components::GQASplitKVVariant;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayArguments;
@@ -372,24 +371,19 @@ impl BlockFixture {
         }
         let metadata = self.gqa_state.metadata();
         let shape = metadata.replay_shape();
-        let variant = metadata.split_kv_variant();
-        let (variant_name, scheduled_q_token_tile_size, kv_token_tile_size) = match variant {
-            GQASplitKVVariant::SingleQ { kv_token_tile_size, .. } => ("single_q", 1, kv_token_tile_size),
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size,
-                kv_token_tile_size,
-                ..
-            } => ("tiled_q", q_token_tile_size, kv_token_tile_size),
-        };
+        let map = metadata.execution_specialization().map.thread_block;
+        let variant_name = if map.max_q_tokens == 1 { "single_q" } else { "tiled_q" };
+        let scheduled_q_token_tile_size = map.max_q_tokens;
+        let kv_tokens_per_iteration = map.kv_tokens_per_iteration;
         let cu_kv_splits = metadata
-            .cu_kv_splits()
+            .cu_sdpa_partial_outputs()
             .read_typed::<u32>(0, shape.num_q_token_tiles as usize + 1);
         let splits_per_q_tile = cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
         let active_q_tokens_per_tile = if scheduled_q_token_tile_size == 1 {
             vec![1; shape.num_q_token_tiles as usize]
         } else {
             metadata
-                .q_token_tiles()
+                .q_token_ranges()
                 .read_typed::<u32>(0, shape.num_q_token_tiles as usize * 2)
                 .as_chunks::<2>()
                 .0
@@ -403,14 +397,14 @@ impl BlockFixture {
             .map(|(&num_q_tokens, &num_splits)| u64::from(num_q_tokens) * u64::from(num_splits))
             .sum::<u64>();
         let split_values = metadata
-            .kv_splits()
+            .sdpa_map_task_templates()
             .read_typed::<u32>(0, shape.num_sdpa_map_task_templates as usize * 3);
         let mut kv_tiles_per_split_histogram = BTreeMap::new();
         for num_kv_tiles in split_values
             .as_chunks::<3>()
             .0
             .iter()
-            .map(|split| (split[2] - split[1]).div_ceil(kv_token_tile_size))
+            .map(|split| (split[2] - split[1]).div_ceil(kv_tokens_per_iteration))
         {
             *kv_tiles_per_split_histogram.entry(num_kv_tiles).or_insert(0usize) += 1;
         }

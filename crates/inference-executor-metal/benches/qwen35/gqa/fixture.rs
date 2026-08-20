@@ -10,6 +10,9 @@ use inference_backend_metal::components::GQAKVPageWriteShape;
 use inference_backend_metal::components::GQAQGKVSplitBuffers;
 use inference_backend_metal::components::GQAQGKVSplitKernel;
 use inference_backend_metal::components::GQAQGKVSplitShape;
+use inference_backend_metal::components::GQASDPAConfig;
+use inference_backend_metal::components::GQASDPAExecutionSpecialization;
+use inference_backend_metal::components::GQASDPASpecializationRegistry;
 use inference_backend_metal::components::GQASplitKVSingleQKernels;
 use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
 use inference_backend_metal::components::GQASplitKVSingleQReduceBuffers;
@@ -17,7 +20,6 @@ use inference_backend_metal::components::GQASplitKVTiledQKernels;
 use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQShape;
-use inference_backend_metal::components::GQASplitKVVariant;
 use inference_backend_metal::components::RMSNormRopeBuffers;
 use inference_backend_metal::components::RMSNormRopeKernel;
 use inference_backend_metal::components::RopeScaling;
@@ -39,6 +41,8 @@ use inference_executor_metal::attn::gqa::backend::GQAReplayMode;
 use inference_executor_metal::attn::gqa::backend::GQAWeights;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use inference_executor_metal::attn::gqa::scratch::GQAScratchBindings;
+use inference_executor_metal::attn::gqa::sdpa::GQASDPAPlanner;
+use inference_executor_metal::attn::gqa::sdpa::GQASDPARequestShape;
 use inference_executor_metal::def::layer::ReplayLayer;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
@@ -279,7 +283,7 @@ impl<'a> RealGQAFixture<'a> {
             rope_scaling: RopeScaling::Default,
             io_dtype: Dtype::Bfloat16,
         };
-        let backend = GQA::new(device, core, config);
+        let backend = GQA::new(device, core, config, max_tokens);
         let end_context_len = existing_context_lens
             .iter()
             .zip(&num_tokens_per_req)
@@ -328,34 +332,55 @@ impl<'a> RealGQAFixture<'a> {
                 .try_into()
                 .expect("GQA Q-head tile size must fit u32");
         }
+        let req_slots = (0..num_reqs).collect::<Vec<_>>();
+        let materialized_cu_tokens = cu_tokens(&num_tokens_per_req)
+            .into_iter()
+            .map(|value| value as u32)
+            .collect::<Vec<_>>();
+        let request_shapes = GQASDPARequestShape::from_batch(&existing_context_lens, &materialized_cu_tokens);
+        let sdpa_config = GQASDPAConfig {
+            io_dtype: config.io_dtype,
+            num_q_heads: model.num_q_heads.try_into().expect("GQA Q-head count must fit u32"),
+            num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV-head count must fit u32"),
+            head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
+            tokens_per_page: model.num_tokens_per_page(),
+        };
+        let single_q_execution = GQASDPAExecutionSpecialization::single_q(
+            sdpa_config,
+            params.split_kv_single_q_kv_token_tile_size,
+            params.split_kv_single_q_num_threads_per_threadblock,
+            single_q_head_tile_size,
+        );
+        let single_q_plan = GQASDPAPlanner::new(
+            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![single_q_execution]),
+            max_tokens,
+        )
+        .plan_exact(&request_shapes);
         let batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let shape = batch_metadata.update(
-            &(0..num_reqs).collect::<Vec<_>>(),
+            &req_slots,
             &existing_context_lens,
-            &cu_tokens(&num_tokens_per_req)
-                .into_iter()
-                .map(|value| value as u32)
-                .collect::<Vec<_>>(),
-            GQASplitKVVariant::SingleQ {
-                kv_token_tile_size: params.split_kv_single_q_kv_token_tile_size,
-                num_threads_per_threadblock: params.split_kv_single_q_num_threads_per_threadblock,
-                q_head_tile_size: single_q_head_tile_size,
-            },
+            &materialized_cu_tokens,
+            &single_q_plan,
         );
         let page_ids = Buffer::from_slice(device, &page_table(num_reqs, num_blocks));
+        let tiled_q_execution = GQASDPAExecutionSpecialization::tiled_q(
+            sdpa_config,
+            params.split_kv_tiled_q_token_tile_size,
+            params.split_kv_tiled_q_kv_token_tile_size,
+            params.split_kv_tiled_q_head_tile_size,
+        );
+        let tiled_q_plan = GQASDPAPlanner::new(
+            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![tiled_q_execution]),
+            max_tokens,
+        )
+        .plan_exact(&request_shapes);
         let tiled_batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let tiled_replay_shape = tiled_batch_metadata.update(
-            &(0..num_reqs).collect::<Vec<_>>(),
+            &req_slots,
             &existing_context_lens,
-            &cu_tokens(&num_tokens_per_req)
-                .into_iter()
-                .map(|value| value as u32)
-                .collect::<Vec<_>>(),
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size: params.split_kv_tiled_q_token_tile_size,
-                kv_token_tile_size: params.split_kv_tiled_q_kv_token_tile_size,
-                q_head_tile_size: params.split_kv_tiled_q_head_tile_size,
-            },
+            &materialized_cu_tokens,
+            &tiled_q_plan,
         );
         let qgkv = Buffer::new_zeroed(
             device,
@@ -549,8 +574,8 @@ impl<'a> RealGQAFixture<'a> {
                 req_slots: batch_metadata.req_slots(),
                 page_ids: &page_ids,
                 flat_token_indices: tiled_batch_metadata.flat_token_indices(),
-                q_token_tiles: tiled_batch_metadata.q_token_tiles(),
-                sdpa_map_task_templates: tiled_batch_metadata.kv_splits(),
+                q_token_ranges: tiled_batch_metadata.q_token_ranges(),
+                sdpa_map_task_templates: tiled_batch_metadata.sdpa_map_task_templates(),
                 partial_output: &tiled_partial_output,
                 partial_exp_sums: &tiled_partial_exp_sums,
                 partial_max_logits: &tiled_partial_max_logits,
@@ -562,8 +587,8 @@ impl<'a> RealGQAFixture<'a> {
                 partial_output: &tiled_partial_output,
                 partial_exp_sums: &tiled_partial_exp_sums,
                 partial_max_logits: &tiled_partial_max_logits,
-                q_token_tiles: tiled_batch_metadata.q_token_tiles(),
-                cu_sdpa_partial_outputs: tiled_batch_metadata.cu_kv_splits(),
+                q_token_ranges: tiled_batch_metadata.q_token_ranges(),
+                cu_sdpa_partial_outputs: tiled_batch_metadata.cu_sdpa_partial_outputs(),
                 output: &tiled_attention_output,
             },
         )));
@@ -654,7 +679,7 @@ impl<'a> RealGQAFixture<'a> {
                     kv_pages: &self._kv_pages,
                     req_slots: self.batch_metadata.req_slots(),
                     page_ids: &self._page_ids,
-                    sdpa_map_task_templates: self.batch_metadata.kv_splits(),
+                    sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
                     partial_exp_sums: &self._sdpa_partial_exp_sums,
                     partial_max_logits: &self._sdpa_partial_max_logits,
                     partial_output: &self._sdpa_partial_output,
@@ -665,7 +690,7 @@ impl<'a> RealGQAFixture<'a> {
                 partial_exp_sums: &self._sdpa_partial_exp_sums,
                 partial_max_logits: &self._sdpa_partial_max_logits,
                 partial_output: &self._sdpa_partial_output,
-                cu_sdpa_partial_outputs: self.batch_metadata.cu_kv_splits(),
+                cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
                 output: &self._attention_output,
             })));
             recorder.build()
@@ -693,8 +718,8 @@ impl<'a> RealGQAFixture<'a> {
                     req_slots: self.tiled_batch_metadata.req_slots(),
                     page_ids: &self._page_ids,
                     flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
-                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                    sdpa_map_task_templates: self.tiled_batch_metadata.kv_splits(),
+                    q_token_ranges: self.tiled_batch_metadata.q_token_ranges(),
+                    sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
                     partial_output: &self._tiled_partial_output,
                     partial_exp_sums: &self._tiled_partial_exp_sums,
                     partial_max_logits: &self._tiled_partial_max_logits,
@@ -705,8 +730,8 @@ impl<'a> RealGQAFixture<'a> {
                 partial_output: &self._tiled_partial_output,
                 partial_exp_sums: &self._tiled_partial_exp_sums,
                 partial_max_logits: &self._tiled_partial_max_logits,
-                q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_kv_splits(),
+                q_token_ranges: self.tiled_batch_metadata.q_token_ranges(),
+                cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_sdpa_partial_outputs(),
                 output: &self._tiled_attention_output,
             })));
             recorder.build()
@@ -896,7 +921,7 @@ impl<'a> RealGQAFixture<'a> {
                     kv_pages: &self._kv_pages,
                     req_slots: self.batch_metadata.req_slots(),
                     page_ids: &self._page_ids,
-                    sdpa_map_task_templates: self.batch_metadata.kv_splits(),
+                    sdpa_map_task_templates: self.batch_metadata.sdpa_map_task_templates(),
                     partial_exp_sums: &self._sdpa_partial_exp_sums,
                     partial_max_logits: &self._sdpa_partial_max_logits,
                     partial_output: &self._sdpa_partial_output,
@@ -907,7 +932,7 @@ impl<'a> RealGQAFixture<'a> {
                 partial_exp_sums: &self._sdpa_partial_exp_sums,
                 partial_max_logits: &self._sdpa_partial_max_logits,
                 partial_output: &self._sdpa_partial_output,
-                cu_sdpa_partial_outputs: self.batch_metadata.cu_kv_splits(),
+                cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
                 output: &self._attention_output,
             })));
             recorder.build()
@@ -931,8 +956,8 @@ impl<'a> RealGQAFixture<'a> {
                     req_slots: self.tiled_batch_metadata.req_slots(),
                     page_ids: &self._page_ids,
                     flat_token_indices: self.tiled_batch_metadata.flat_token_indices(),
-                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                    sdpa_map_task_templates: self.tiled_batch_metadata.kv_splits(),
+                    q_token_ranges: self.tiled_batch_metadata.q_token_ranges(),
+                    sdpa_map_task_templates: self.tiled_batch_metadata.sdpa_map_task_templates(),
                     partial_output: &self._tiled_partial_output,
                     partial_exp_sums: &self._tiled_partial_exp_sums,
                     partial_max_logits: &self._tiled_partial_max_logits,
@@ -944,8 +969,8 @@ impl<'a> RealGQAFixture<'a> {
                     partial_output: &self._tiled_partial_output,
                     partial_exp_sums: &self._tiled_partial_exp_sums,
                     partial_max_logits: &self._tiled_partial_max_logits,
-                    q_token_tiles: self.tiled_batch_metadata.q_token_tiles(),
-                    cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_kv_splits(),
+                    q_token_ranges: self.tiled_batch_metadata.q_token_ranges(),
+                    cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_sdpa_partial_outputs(),
                     output: &self._tiled_attention_output,
                 },
             )));
@@ -1081,19 +1106,19 @@ fn print_split_plan(
     variant: &str,
     metadata: &GQAMetadataBuffers,
     scheduled_q_token_tile_size: u32,
-    kv_token_tile_size: u32,
+    kv_tokens_per_iteration: u32,
     max_tokens: usize,
 ) {
     let shape = metadata.replay_shape();
     let cu_kv_splits = metadata
-        .cu_kv_splits()
+        .cu_sdpa_partial_outputs()
         .read_typed::<u32>(0, shape.num_q_token_tiles as usize + 1);
     let splits_per_q_tile = cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
     let active_q_tokens_per_tile = if scheduled_q_token_tile_size == 1 {
         vec![1; shape.num_q_token_tiles as usize]
     } else {
         metadata
-            .q_token_tiles()
+            .q_token_ranges()
             .read_typed::<u32>(0, shape.num_q_token_tiles as usize * 2)
             .as_chunks::<2>()
             .0
@@ -1102,14 +1127,14 @@ fn print_split_plan(
             .collect::<Vec<_>>()
     };
     let split_values = metadata
-        .kv_splits()
+        .sdpa_map_task_templates()
         .read_typed::<u32>(0, shape.num_sdpa_map_task_templates as usize * 3);
     let mut kv_tiles_per_split_histogram = BTreeMap::new();
     for num_kv_tiles in split_values
         .as_chunks::<3>()
         .0
         .iter()
-        .map(|split| (split[2] - split[1]).div_ceil(kv_token_tile_size))
+        .map(|split| (split[2] - split[1]).div_ceil(kv_tokens_per_iteration))
     {
         *kv_tiles_per_split_histogram.entry(num_kv_tiles).or_insert(0usize) += 1;
     }

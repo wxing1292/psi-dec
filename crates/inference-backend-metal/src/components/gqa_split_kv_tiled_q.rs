@@ -26,30 +26,29 @@ const SOURCE: &str = include_str!("metal/gqa_split_kv_tiled_q.metal");
 /// Q tile [Tq_tile, Hq_tile, D] x K tile^T [D, Tkv_tile]
 ///   -> scores -> x V tile [Tkv_tile, D]
 ///   -> SDPAPartialOutput [Tq_tile, Hq_tile, D]
-/// SDPAMapTile: (q_token_tile_index, kv_head_index,
-///               q_head_tile_index, kv_token_tile_index)
-/// KVSplit: { q_token_tile_index, kv_token_begin, kv_token_end }
-/// SDPAMapTask / threadblock:
-///   { q_token_tile_index, kv_token_begin, kv_token_end } from KVSplit
-///   + { kv_head_index, q_head_tile_index } from grid
-/// grid: (Hkv * Q-head tiles, KV splits, 1)
-/// threadblock: (Q-token fragments * Q-head tile * 32, 1, 1)
-/// parallel: Q-token tiles, KV heads, Q-head tiles, Q-token fragments
-/// ordered/reduce: consecutive KV tiles merged with online softmax
+/// Map task template: { q_token_range_index, kv_token_begin, kv_token_end }
+/// MapThreadBlockTask:
+///   { q_token_range_index, kv_token_begin, kv_token_end } from the template
+///   + { kv_head_index, q_head_range_index } from the grid
+/// grid: (Hkv * Q-head ranges, Map task templates, 1)
+/// threadblock: (Q-token fragments * Q-head range * 32, 1, 1)
+/// parallel: Q-token ranges, KV heads, Q-head ranges, Q-token fragments
+/// ordered/reduce: consecutive KV iterations merged with online softmax
 /// produces: SDPAPartialOutput + statistics -> final reduce -> SDPAOutput
 /// ```
 ///
-/// Only the KV split is materialized. It uses the shared three-`u32`
-/// TaskTemplate ABI. The complete Task is comment-only. A Q-token tile never
-/// crosses a request boundary.
+/// Only the Map task template is materialized. It uses the shared three-`u32`
+/// TaskTemplate ABI. The complete task is derived from the template, grid
+/// coordinates, and specialization. A Q-token range never crosses a request
+/// boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GQASplitKVTiledQConfig {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
-    pub q_head_tile_size: u32,
-    pub q_token_tile_size: u32,
-    pub kv_token_tile_size: u32,
+    pub max_q_heads: u32,
+    pub max_q_tokens: u32,
+    pub kv_tokens_per_iteration: u32,
     pub scale: f32,
     pub page_bytes: u32,
     pub dtype: Dtype,
@@ -61,17 +60,17 @@ impl GQASplitKVTiledQConfig {
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
-        assert!(self.q_head_tile_size > 0);
-        assert!(self.q_head_tile_size <= self.q_heads_per_kv_head());
+        assert!(self.max_q_heads > 0);
+        assert!(self.max_q_heads <= self.q_heads_per_kv_head());
         let tiled_q_profile = (self.head_dim, self.num_tokens_per_page());
         assert!(
             matches!(tiled_q_profile, (128, 8) | (256, 8 | 16)),
             "GQA SplitKV TiledQ supports only (head_dim, tokens_per_page) profiles (128, 8), (256, 8), and (256, 16), \
              got {tiled_q_profile:?}"
         );
-        assert!(matches!(self.q_token_tile_size, 8 | 16));
-        assert!(matches!(self.kv_token_tile_size, 8 | 16));
-        assert!(self.num_threads_per_threadblock() <= 256);
+        assert!(matches!(self.max_q_tokens, 8 | 16));
+        assert!(matches!(self.kv_tokens_per_iteration, 8 | 16));
+        assert!(self.required_threads() <= 256);
         assert!(self.scale > 0.0);
         assert_eq!(self.dtype, Dtype::Bfloat16, "GQA SplitKV TiledQ specializes bf16");
         self.page_table_layout.validate();
@@ -94,7 +93,7 @@ impl GQASplitKVTiledQConfig {
     }
 
     pub fn num_q_head_tiles_per_kv_head(self) -> u32 {
-        self.q_heads_per_kv_head().div_ceil(self.q_head_tile_size)
+        self.q_heads_per_kv_head().div_ceil(self.max_q_heads)
     }
 
     fn num_head_groups(self) -> usize {
@@ -104,10 +103,10 @@ impl GQASplitKVTiledQConfig {
         )
     }
 
-    pub fn num_threads_per_threadblock(self) -> u32 {
-        self.q_token_tile_size
+    pub fn required_threads(self) -> u32 {
+        self.max_q_tokens
             .checked_div(8)
-            .and_then(|threads| threads.checked_mul(self.q_head_tile_size))
+            .and_then(|threads| threads.checked_mul(self.max_q_heads))
             .and_then(|threads| threads.checked_mul(32))
             .expect("GQA SplitKV TiledQ threadblock width must fit u32")
     }
@@ -130,7 +129,7 @@ impl GQASplitKVTiledQConfig {
             &[
                 shape.num_total_sdpa_map_task_templates as u64,
                 self.num_q_heads as u64,
-                self.q_token_tile_size as u64,
+                self.max_q_tokens as u64,
                 self.head_dim as u64,
                 self.dtype.item_size() as u64,
             ],
@@ -143,7 +142,7 @@ impl GQASplitKVTiledQConfig {
             &[
                 shape.num_total_sdpa_map_task_templates as u64,
                 self.num_q_heads as u64,
-                self.q_token_tile_size as u64,
+                self.max_q_tokens as u64,
                 size_of::<f32>() as u64,
             ],
         )
@@ -155,7 +154,7 @@ impl GQASplitKVTiledQConfig {
             "GQA SplitKV TiledQ threadgroup memory byte length",
             &[
                 2,
-                self.kv_token_tile_size as usize,
+                self.kv_tokens_per_iteration as usize,
                 padded_head_dim,
                 self.dtype.item_size(),
             ],
@@ -219,7 +218,7 @@ pub struct GQASplitKVTiledQMapBuffers<'a> {
     pub req_slots: &'a Buffer,
     pub page_ids: &'a Buffer,
     pub flat_token_indices: &'a Buffer,
-    pub q_token_tiles: &'a Buffer,
+    pub q_token_ranges: &'a Buffer,
     pub sdpa_map_task_templates: &'a Buffer,
     pub partial_output: &'a Buffer,
     pub partial_exp_sums: &'a Buffer,
@@ -231,7 +230,7 @@ pub struct GQASplitKVTiledQReduceBuffers<'a> {
     pub partial_output: &'a Buffer,
     pub partial_exp_sums: &'a Buffer,
     pub partial_max_logits: &'a Buffer,
-    pub q_token_tiles: &'a Buffer,
+    pub q_token_ranges: &'a Buffer,
     pub cu_sdpa_partial_outputs: &'a Buffer,
     pub output: &'a Buffer,
 }
@@ -347,7 +346,7 @@ impl Operator for GQASplitKVTiledQMapInvocation<'_> {
         assert!(self.buffers.req_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
         assert!(self.buffers.page_ids.len_bytes() >= config.page_table_layout.bytes());
         assert!(self.buffers.flat_token_indices.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
-        assert!(self.buffers.q_token_tiles.len_bytes() >= shape.num_q_token_tile_values() * size_of::<u32>());
+        assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_tile_values() * size_of::<u32>());
         assert!(
             self.buffers.sdpa_map_task_templates.len_bytes()
                 >= shape.num_sdpa_map_task_template_values() * size_of::<u32>()
@@ -361,7 +360,7 @@ impl Operator for GQASplitKVTiledQMapInvocation<'_> {
         recorder.set_buffer_read(2, self.buffers.req_slots, 0);
         recorder.set_buffer_read(3, self.buffers.page_ids, 0);
         recorder.set_buffer_read(4, self.buffers.flat_token_indices, 0);
-        recorder.set_buffer_read(5, self.buffers.q_token_tiles, 0);
+        recorder.set_buffer_read(5, self.buffers.q_token_ranges, 0);
         recorder.set_buffer_read(6, self.buffers.sdpa_map_task_templates, 0);
         recorder.set_buffer_write(7, self.buffers.partial_output, 0);
         recorder.set_buffer_write(8, self.buffers.partial_exp_sums, 0);
@@ -405,7 +404,7 @@ impl Operator for GQASplitKVTiledQMapInvocation<'_> {
                 shape.num_total_sdpa_map_task_templates as usize,
                 1,
             ),
-            (config.num_threads_per_threadblock() as usize, 1, 1),
+            (config.required_threads() as usize, 1, 1),
         );
     }
 }
@@ -426,7 +425,7 @@ impl Operator for GQASplitKVTiledQReduceInvocation<'_> {
         assert!(self.buffers.partial_output.len_bytes_u64() >= config.partial_output_bytes(shape));
         assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
         assert!(self.buffers.partial_max_logits.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
-        assert!(self.buffers.q_token_tiles.len_bytes() >= shape.num_q_token_tile_values() * size_of::<u32>());
+        assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_tile_values() * size_of::<u32>());
         assert!(
             self.buffers.cu_sdpa_partial_outputs.len_bytes()
                 >= shape.num_cu_sdpa_partial_output_values() * size_of::<u32>()
@@ -437,7 +436,7 @@ impl Operator for GQASplitKVTiledQReduceInvocation<'_> {
         recorder.set_buffer_read(0, self.buffers.partial_output, 0);
         recorder.set_buffer_read(1, self.buffers.partial_exp_sums, 0);
         recorder.set_buffer_read(2, self.buffers.partial_max_logits, 0);
-        recorder.set_buffer_read(3, self.buffers.q_token_tiles, 0);
+        recorder.set_buffer_read(3, self.buffers.q_token_ranges, 0);
         recorder.set_buffer_read(4, self.buffers.cu_sdpa_partial_outputs, 0);
         recorder.set_buffer_write(5, self.buffers.output, 0);
         set_replay_u32(
@@ -449,7 +448,7 @@ impl Operator for GQASplitKVTiledQReduceInvocation<'_> {
         );
         recorder.dispatch_threadblocks(
             (config.num_q_heads as usize, shape.num_total_q_token_tiles as usize, 1),
-            (config.num_threads_per_threadblock() as usize, 1, 1),
+            (config.required_threads() as usize, 1, 1),
         );
     }
 }
@@ -460,7 +459,7 @@ fn source(config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> Strin
 #define NUM_TOKENS {num_tokens}
 #define NUM_Q_HEADS {num_q_heads}
 #define NUM_KV_HEADS {num_kv_heads}
-#define Q_HEAD_TILE_SIZE {q_head_tile_size}
+#define Q_HEAD_TILE_SIZE {max_q_heads}
 #define NUM_Q_HEAD_TILES_PER_KV_HEAD {num_q_head_tiles_per_kv_head}
 #define HEAD_DIM {head_dim}
 #define ATTENTION_SCALE {scale}
@@ -469,15 +468,15 @@ fn source(config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> Strin
 #define NUM_GQA_LAYERS {num_gqa_layers}
 #define NUM_BLOCKS {num_blocks}
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
-#define Q_TOKEN_TILE_SIZE {q_token_tile_size}
-#define KV_TOKEN_TILE_SIZE {kv_token_tile_size}
-#define NUM_THREADS_PER_THREADBLOCK {num_threads_per_threadblock}
+#define Q_TOKEN_TILE_SIZE {max_q_tokens}
+#define KV_TOKEN_TILE_SIZE {kv_tokens_per_iteration}
+#define NUM_THREADS_PER_THREADBLOCK {required_threads}
 {body}
 "#,
         num_tokens = shape.num_total_tokens,
         num_q_heads = config.num_q_heads,
         num_kv_heads = config.num_kv_heads,
-        q_head_tile_size = config.q_head_tile_size,
+        max_q_heads = config.max_q_heads,
         num_q_head_tiles_per_kv_head = config.num_q_head_tiles_per_kv_head(),
         head_dim = config.head_dim,
         scale = config.scale,
@@ -486,9 +485,9 @@ fn source(config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> Strin
         num_gqa_layers = config.page_table_layout.num_gqa_layers,
         num_blocks = config.page_table_layout.num_blocks,
         num_page_ids_per_block = config.page_table_layout.num_page_ids_per_block,
-        q_token_tile_size = config.q_token_tile_size,
-        kv_token_tile_size = config.kv_token_tile_size,
-        num_threads_per_threadblock = config.num_threads_per_threadblock(),
+        max_q_tokens = config.max_q_tokens,
+        kv_tokens_per_iteration = config.kv_tokens_per_iteration,
+        required_threads = config.required_threads(),
         body = SOURCE,
     )
 }

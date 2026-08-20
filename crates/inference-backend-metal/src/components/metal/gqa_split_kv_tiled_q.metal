@@ -2,23 +2,23 @@
 using namespace metal;
 typedef bfloat bfloat16_t;
 
-// SplitKV TiledQ SDPA map. One logical SDPAMapTask maps 1:1 to one threadblock. Its
+// SplitKV TiledQ SDPA map. One MapThreadBlockTask maps 1:1 to one threadblock. Its
 // fields are sourced as follows:
 //
-// KVSplit {              // materialized; three u32 fields
-//   q_token_tile_index,  // kv_splits[kv_split_index, 0]
-//   kv_token_begin,      // kv_splits[kv_split_index, 1]
-//   kv_token_end,        // kv_splits[kv_split_index, 2]
+// Map task template {     // materialized; three u32 fields
+//   q_token_range_index,  // sdpa_map_task_templates[map_task_template_index, 0]
+//   kv_token_begin,       // sdpa_map_task_templates[map_task_template_index, 1]
+//   kv_token_end,         // sdpa_map_task_templates[map_task_template_index, 2]
 // }
-// SDPAMapTask {
-//   q_token_tile_index,  // from KVSplit
-//   kv_token_begin,      // from KVSplit
-//   kv_token_end,        // from KVSplit
-//   kv_head_index,       // grid-derived from threadblock_position.x
-//   q_head_tile_index,   // grid-derived from threadblock_position.x
+// MapThreadBlockTask {
+//   q_token_range_index,  // from the Map task template
+//   kv_token_begin,       // from the Map task template
+//   kv_token_end,         // from the Map task template
+//   kv_head_index,        // grid-derived from threadblock_position.x
+//   q_head_tile_index,    // grid-derived from threadblock_position.x
 // }
 //
-// A sentinel KVSplit returns without writing any partial output or
+// A sentinel Map task template returns without writing any partial output or
 // statistics.
 
 template <int NBYTES> struct LoadUnit;
@@ -52,8 +52,8 @@ kernel void gqa_split_kv_tiled_q_map(
     device const uint* req_slots [[buffer(2)]],
     device const uint* page_ids [[buffer(3)]],
     device const uint* flat_token_indices [[buffer(4)]],
-    device const uint* q_token_tiles [[buffer(5)]],
-    device const uint* kv_splits [[buffer(6)]],
+    device const uint* q_token_ranges [[buffer(5)]],
+    device const uint* sdpa_map_task_templates [[buffer(6)]],
     device bfloat16_t* partial_output [[buffer(7)]],
     device float* partial_exp_sums [[buffer(8)]],
     device float* partial_max_logits [[buffer(9)]],
@@ -75,22 +75,22 @@ kernel void gqa_split_kv_tiled_q_map(
     constexpr int Q_HEADS_PER_KV_HEAD = NUM_Q_HEADS / NUM_KV_HEADS;
     static_assert(NUM_SIMDGROUPS == NUM_SIMDGROUPS_PER_Q_HEAD * Q_HEAD_TILE_SIZE);
 
-    const uint kv_split_index = threadblock_position.y;
-    if (kv_split_index >= num_active_kv_splits) {
+    const uint map_task_template_index = threadblock_position.y;
+    if (map_task_template_index >= num_active_kv_splits) {
         return;
     }
-    const uint q_token_tile_index = kv_splits[kv_split_index * 3];
-    if (q_token_tile_index >= num_active_q_token_tiles) {
+    const uint q_token_range_index = sdpa_map_task_templates[map_task_template_index * 3];
+    if (q_token_range_index >= num_active_q_token_tiles) {
         return;
     }
-    const uint flat_token_start = q_token_tiles[q_token_tile_index * 2];
-    const uint flat_token_end = q_token_tiles[q_token_tile_index * 2 + 1];
+    const uint flat_token_start = q_token_ranges[q_token_range_index * 2];
+    const uint flat_token_end = q_token_ranges[q_token_range_index * 2 + 1];
     if (flat_token_start >= num_active_tokens || flat_token_end > num_active_tokens) {
         return;
     }
     const uint num_tile_tokens = flat_token_end - flat_token_start;
-    const uint kv_token_begin = kv_splits[kv_split_index * 3 + 1];
-    const uint kv_token_end = kv_splits[kv_split_index * 3 + 2];
+    const uint kv_token_begin = sdpa_map_task_templates[map_task_template_index * 3 + 1];
+    const uint kv_token_end = sdpa_map_task_templates[map_task_template_index * 3 + 2];
     const uint req_slot = req_slots[flat_token_start];
 
     const uint head_group_index = threadblock_position.x;
@@ -299,7 +299,7 @@ kernel void gqa_split_kv_tiled_q_map(
 
     if (!inactive_token) {
         const ulong partial_output_index =
-            ((ulong)kv_split_index * NUM_Q_HEADS + (ulong)q_head_index) * Q_TOKEN_TILE_SIZE
+            ((ulong)map_task_template_index * NUM_Q_HEADS + (ulong)q_head_index) * Q_TOKEN_TILE_SIZE
             + (ulong)token_offset;
         if (fragment_col == 0) {
             partial_exp_sums[partial_output_index] = running_sum;
@@ -325,7 +325,7 @@ kernel void gqa_split_kv_tiled_q_reduce(
     device const bfloat16_t* partial_output [[buffer(0)]],
     device const float* partial_exp_sums [[buffer(1)]],
     device const float* partial_max_logits [[buffer(2)]],
-    device const uint* q_token_tiles [[buffer(3)]],
+    device const uint* q_token_ranges [[buffer(3)]],
     device const uint* cu_sdpa_partial_outputs [[buffer(4)]],
     device bfloat16_t* output [[buffer(5)]],
     constant uint& num_active_q_token_tiles [[buffer(6)]],
@@ -333,15 +333,15 @@ kernel void gqa_split_kv_tiled_q_reduce(
     uint thread_index [[thread_index_in_threadgroup]])
 {
     const uint q_head_index = threadblock_position.x;
-    const uint q_token_tile_index = threadblock_position.y;
-    if (q_token_tile_index >= num_active_q_token_tiles) {
+    const uint q_token_range_index = threadblock_position.y;
+    if (q_token_range_index >= num_active_q_token_tiles) {
         return;
     }
-    const uint flat_token_start = q_token_tiles[q_token_tile_index * 2];
-    const uint flat_token_end = q_token_tiles[q_token_tile_index * 2 + 1];
+    const uint flat_token_start = q_token_ranges[q_token_range_index * 2];
+    const uint flat_token_end = q_token_ranges[q_token_range_index * 2 + 1];
     const uint num_tile_tokens = flat_token_end - flat_token_start;
-    const uint partial_output_begin = cu_sdpa_partial_outputs[q_token_tile_index];
-    const uint partial_output_end = cu_sdpa_partial_outputs[q_token_tile_index + 1];
+    const uint partial_output_begin = cu_sdpa_partial_outputs[q_token_range_index];
+    const uint partial_output_end = cu_sdpa_partial_outputs[q_token_range_index + 1];
 
     for (uint local_index = thread_index; local_index < num_tile_tokens * uint(HEAD_DIM);
          local_index += uint(NUM_THREADS_PER_THREADBLOCK)) {

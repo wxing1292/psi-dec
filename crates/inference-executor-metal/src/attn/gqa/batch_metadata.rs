@@ -1,14 +1,16 @@
 use std::cell::Cell;
 
-use inference_backend_metal::components::GQASplitKVVariant;
+use inference_backend_metal::components::GQASDPAExecutionSpecialization;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::replay::ReplayBucketPolicy;
 
-const NUM_KV_SPLIT_FIELDS: usize = 3;
-const NUM_Q_TOKEN_TILE_FIELDS: usize = 2;
+use super::sdpa::GQASDPAPlan;
+
+const NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS: usize = 3;
+const NUM_Q_TOKEN_RANGE_FIELDS: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GQAReplayBucketPolicy {
@@ -34,7 +36,7 @@ impl GQAReplayBucketPolicy {
         self.kv_splits.capacity(num_kv_splits)
     }
 
-    fn capacities(&self, num_tokens: u32, num_q_token_tiles: u32, num_kv_splits: u32) -> (u32, u32, u32) {
+    pub fn capacities(&self, num_tokens: u32, num_q_token_tiles: u32, num_kv_splits: u32) -> (u32, u32, u32) {
         (
             self.tokens.capacity(num_tokens),
             self.q_token_tiles.capacity(num_q_token_tiles),
@@ -42,7 +44,7 @@ impl GQAReplayBucketPolicy {
         )
     }
 
-    fn capacities_with_token_capacity(
+    pub fn capacities_with_token_capacity(
         &self,
         num_total_tokens: u32,
         num_q_token_tiles: u32,
@@ -56,36 +58,19 @@ impl GQAReplayBucketPolicy {
     }
 }
 
-#[derive(Clone, Copy)]
-enum GQAReplayCapacity<'a> {
-    Exact,
-    ComponentBucketed(&'a GQAReplayBucketPolicy),
-    CallerTokenCapacity {
-        num_total_tokens: u32,
-        policy: &'a GQAReplayBucketPolicy,
-    },
-}
-
-/// Capacity-sized GPU metadata and replay shape refreshed from each model
-/// microbatch and shared by all GQA layers.
+/// Capacity-sized GPU metadata refreshed from one complete executor-owned SDPA
+/// plan. This type does not select a kernel specialization or divide KV work.
 pub struct GQAMetadataBuffers {
     req_slots: Buffer,
-    // Indexed by flat token order; each index is request-absolute, not a
-    // batch-flat gather index. For request starts [10, 20] and cu_tokens
-    // [0, 3, 6], this is [10, 11, 12, 20, 21, 22].
+    // Indexed by flat token order. Each value is request-absolute.
     flat_token_indices: Buffer,
-    // Compact Q-token tile `[flat_token_start, flat_token_end]` entries. A tile never
-    // crosses a request boundary.
-    q_token_tiles: Buffer,
-    // Compact `KVSplit` entries with the materialized ABI
-    // `[q_token_tile_index, kv_token_begin, kv_token_end]`. `kv_head_index` and
-    // `q_head_tile_index` are derived from the regular dispatch grid. KV splits
-    // for one Q-token tile are contiguous; adjacent `cu_kv_splits`
-    // values select that tile's partial outputs.
-    kv_splits: Buffer,
-    cu_kv_splits: Buffer,
+    // Materialized ABI: [flat_q_token_begin, flat_q_token_end].
+    q_token_ranges: Buffer,
+    // Materialized ABI: [q_token_range_index, request_local_kv_token_begin, request_local_kv_token_end].
+    sdpa_map_task_templates: Buffer,
+    cu_sdpa_partial_outputs: Buffer,
     replay_shape: Cell<Option<GQAReplayShape>>,
-    split_kv_variant: Cell<Option<GQASplitKVVariant>>,
+    execution_specialization: Cell<Option<GQASDPAExecutionSpecialization>>,
 }
 
 impl GQAMetadataBuffers {
@@ -95,21 +80,21 @@ impl GQAMetadataBuffers {
         Self {
             req_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
             flat_token_indices: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
-            q_token_tiles: Buffer::new_zeroed_elements(
+            q_token_ranges: Buffer::new_zeroed_elements(
                 device,
                 max_tokens
-                    .checked_mul(NUM_Q_TOKEN_TILE_FIELDS)
-                    .expect("GQA token-tile metadata capacity must fit usize"),
+                    .checked_mul(NUM_Q_TOKEN_RANGE_FIELDS)
+                    .expect("GQA token-range metadata capacity must fit usize"),
                 Dtype::Uint32,
             ),
-            kv_splits: Buffer::new_zeroed_elements(
+            sdpa_map_task_templates: Buffer::new_zeroed_elements(
                 device,
                 max_tokens
-                    .checked_mul(NUM_KV_SPLIT_FIELDS)
-                    .expect("GQA SDPA map KV split metadata capacity must fit usize"),
+                    .checked_mul(NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS)
+                    .expect("GQA SDPA Map task-template metadata capacity must fit usize"),
                 Dtype::Uint32,
             ),
-            cu_kv_splits: Buffer::new_zeroed_elements(
+            cu_sdpa_partial_outputs: Buffer::new_zeroed_elements(
                 device,
                 max_tokens
                     .checked_add(1)
@@ -117,7 +102,7 @@ impl GQAMetadataBuffers {
                 Dtype::Uint32,
             ),
             replay_shape: Cell::new(None),
-            split_kv_variant: Cell::new(None),
+            execution_specialization: Cell::new(None),
         }
     }
 
@@ -130,189 +115,77 @@ impl GQAMetadataBuffers {
         req_slots: &[u32],
         token_indices: &[u32],
         cu_tokens: &[u32],
-        split_kv_variant: GQASplitKVVariant,
+        plan: &GQASDPAPlan,
     ) -> GQAReplayShape {
-        self.update_with_capacity(
-            req_slots,
-            token_indices,
-            cu_tokens,
-            split_kv_variant,
-            GQAReplayCapacity::Exact,
-        )
-    }
-
-    pub fn update_bucketed(
-        &self,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-        split_kv_variant: GQASplitKVVariant,
-        policy: &GQAReplayBucketPolicy,
-    ) -> GQAReplayShape {
-        self.validate_policy(policy);
-        self.update_with_capacity(
-            req_slots,
-            token_indices,
-            cu_tokens,
-            split_kv_variant,
-            GQAReplayCapacity::ComponentBucketed(policy),
-        )
-    }
-
-    pub fn update_bucketed_with_token_capacity(
-        &self,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-        split_kv_variant: GQASplitKVVariant,
-        policy: &GQAReplayBucketPolicy,
-        num_total_tokens: u32,
-    ) -> GQAReplayShape {
-        self.validate_policy(policy);
-        self.update_with_capacity(
-            req_slots,
-            token_indices,
-            cu_tokens,
-            split_kv_variant,
-            GQAReplayCapacity::CallerTokenCapacity {
-                num_total_tokens,
-                policy,
-            },
-        )
-    }
-
-    fn validate_policy(&self, policy: &GQAReplayBucketPolicy) {
-        assert_eq!(
-            policy.max_tokens() as usize,
-            self.req_slots.len_bytes() / size_of::<u32>(),
-            "GQA replay bucket policy must match metadata token capacity"
-        );
-    }
-
-    fn update_with_capacity(
-        &self,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-        split_kv_variant: GQASplitKVVariant,
-        replay_capacity: GQAReplayCapacity<'_>,
-    ) -> GQAReplayShape {
-        let tiled_q = matches!(split_kv_variant, GQASplitKVVariant::TiledQ { .. });
         assert_eq!(req_slots.len(), token_indices.len());
         assert_eq!(cu_tokens.len(), req_slots.len() + 1);
-        assert_eq!(cu_tokens[0], 0, "GQA batch cu_tokens must start at zero");
-        for req_index in 0..req_slots.len() {
-            let flat_token_begin = cu_tokens[req_index];
-            let flat_token_end = cu_tokens[req_index + 1];
-            assert!(
-                flat_token_begin <= flat_token_end,
-                "GQA batch cu_tokens must be nondecreasing"
-            );
-            token_indices[req_index]
-                .checked_add(flat_token_end - flat_token_begin)
-                .expect("GQA request context length must fit u32");
-        }
-        let num_tokens = cu_tokens.last().copied().unwrap_or_default();
-        assert!(num_tokens > 0, "GQA batch metadata requires tokens");
-        let num_tokens_usize = num_tokens as usize;
-        assert!(num_tokens_usize <= self.req_slots.len_bytes() / size_of::<u32>());
-        if let GQAReplayCapacity::CallerTokenCapacity {
-            num_total_tokens,
-            policy,
-        } = replay_capacity
-        {
-            assert!(
-                num_tokens <= num_total_tokens,
-                "GQA active token count must not exceed the caller-owned token capacity"
-            );
-            assert!(
-                num_total_tokens <= policy.max_tokens(),
-                "GQA caller-owned token capacity must not exceed the metadata capacity"
-            );
-        }
+        assert_eq!(cu_tokens.first().copied(), Some(0));
+        let replay_shape = plan.replay_shape();
+        assert_eq!(cu_tokens.last().copied(), Some(replay_shape.num_tokens));
+        assert!(replay_shape.num_total_tokens as usize <= self.max_tokens());
+        assert!(replay_shape.num_total_q_token_tiles as usize <= self.max_tokens());
+        assert!(replay_shape.num_total_sdpa_map_task_templates as usize <= self.max_tokens());
 
-        let mut req_slots_by_token = Vec::with_capacity(num_tokens_usize);
-        let mut flat_token_indices = Vec::with_capacity(num_tokens_usize);
-        for req_index in 0..req_slots.len() {
-            let num_req_tokens = cu_tokens[req_index + 1] - cu_tokens[req_index];
-            for token_index_in_req in 0..num_req_tokens {
-                let token_index = token_indices[req_index] + token_index_in_req;
-                req_slots_by_token.push(req_slots[req_index]);
-                flat_token_indices.push(token_index);
+        let mut req_slots_by_token = Vec::with_capacity(replay_shape.num_tokens as usize);
+        let mut flat_token_indices = Vec::with_capacity(replay_shape.num_tokens as usize);
+        for request_index in 0..req_slots.len() {
+            let flat_q_token_begin = cu_tokens[request_index];
+            let flat_q_token_end = cu_tokens[request_index + 1];
+            assert!(flat_q_token_begin <= flat_q_token_end);
+            token_indices[request_index]
+                .checked_add(flat_q_token_end - flat_q_token_begin)
+                .expect("GQA request context length must fit u32");
+            for q_token_index_in_request in 0..flat_q_token_end - flat_q_token_begin {
+                req_slots_by_token.push(req_slots[request_index]);
+                flat_token_indices.push(token_indices[request_index] + q_token_index_in_request);
             }
         }
-        assert_eq!(req_slots_by_token.len(), num_tokens_usize);
+        assert_eq!(req_slots_by_token.len(), replay_shape.num_tokens as usize);
+
+        let q_token_ranges = plan
+            .q_token_ranges()
+            .iter()
+            .flat_map(|range| [range.flat_q_token_indices.start, range.flat_q_token_indices.end])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            q_token_ranges.len() / NUM_Q_TOKEN_RANGE_FIELDS,
+            replay_shape.num_q_token_tiles as usize
+        );
+
+        let mut sdpa_map_task_templates = plan
+            .map_task_templates()
+            .iter()
+            .flat_map(|template| {
+                [
+                    template.q_token_range_index,
+                    template.request_local_kv_token_indices.start,
+                    template.request_local_kv_token_indices.end,
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sdpa_map_task_templates.len() / NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS,
+            replay_shape.num_sdpa_map_task_templates as usize
+        );
+        sdpa_map_task_templates.resize(
+            replay_shape.num_total_sdpa_map_task_templates as usize * NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS,
+            u32::MAX,
+        );
+        assert_eq!(
+            plan.cu_partial_outputs_by_q_token_range().len(),
+            replay_shape.num_q_token_tiles as usize + 1
+        );
+
         self.req_slots.write_typed(0, &req_slots_by_token);
         self.flat_token_indices.write_typed(0, &flat_token_indices);
-
-        let max_kv_splits = self.kv_splits.len_bytes() / (NUM_KV_SPLIT_FIELDS * size_of::<u32>());
-        let (q_token_tiles, mut kv_splits, cu_kv_splits) = match split_kv_variant {
-            GQASplitKVVariant::SingleQ { kv_token_tile_size, .. } => {
-                assert!(kv_token_tile_size > 0, "GQA KV-token tile size must be positive");
-                let (kv_splits, cu_kv_splits) =
-                    build_single_q_kv_splits(&flat_token_indices, kv_token_tile_size, max_kv_splits);
-                (Vec::new(), kv_splits, cu_kv_splits)
-            },
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size,
-                kv_token_tile_size,
-                ..
-            } => {
-                build_tiled_q_kv_splits(
-                    token_indices,
-                    cu_tokens,
-                    q_token_tile_size,
-                    kv_token_tile_size,
-                    self.req_slots.len_bytes() / size_of::<u32>(),
-                )
-            },
-        };
-        let num_q_token_tiles = if q_token_tiles.is_empty() {
-            num_tokens_usize
-        } else {
-            q_token_tiles.len() / NUM_Q_TOKEN_TILE_FIELDS
-        };
-        let num_kv_splits = kv_splits.len() / NUM_KV_SPLIT_FIELDS;
-        debug_assert!(num_q_token_tiles <= self.req_slots.len_bytes() / size_of::<u32>());
-        debug_assert!(num_kv_splits <= max_kv_splits);
-        let num_q_token_tiles = num_q_token_tiles as u32;
-        let num_kv_splits = num_kv_splits as u32;
-        let (num_total_tokens, num_total_q_token_tiles, num_total_kv_splits) = match replay_capacity {
-            GQAReplayCapacity::Exact => {
-                let num_total_kv_splits = (num_kv_splits as usize)
-                    .checked_next_power_of_two()
-                    .unwrap_or(max_kv_splits)
-                    .min(max_kv_splits) as u32;
-                (num_tokens, num_q_token_tiles, num_total_kv_splits)
-            },
-            GQAReplayCapacity::ComponentBucketed(policy) => {
-                policy.capacities(num_tokens, num_q_token_tiles, num_kv_splits)
-            },
-            GQAReplayCapacity::CallerTokenCapacity {
-                num_total_tokens,
-                policy,
-            } => policy.capacities_with_token_capacity(num_total_tokens, num_q_token_tiles, num_kv_splits),
-        };
-        let total_kv_splits_usize = num_total_kv_splits as usize;
-        assert!(total_kv_splits_usize >= num_kv_splits as usize);
-        kv_splits.resize(total_kv_splits_usize * NUM_KV_SPLIT_FIELDS, u32::MAX);
-        if !q_token_tiles.is_empty() {
-            self.q_token_tiles.write_typed(0, &q_token_tiles);
+        if plan.execution_specialization().map.thread_block.max_q_tokens > 1 {
+            self.q_token_ranges.write_typed(0, &q_token_ranges);
         }
-        self.kv_splits.write_typed(0, &kv_splits);
-        self.cu_kv_splits.write_typed(0, &cu_kv_splits);
-
-        let replay_shape = GQAReplayShape::new(
-            num_tokens,
-            num_total_tokens,
-            num_q_token_tiles,
-            num_total_q_token_tiles,
-            num_kv_splits,
-            num_total_kv_splits,
-            tiled_q || num_kv_splits > num_tokens,
-        );
+        self.sdpa_map_task_templates.write_typed(0, &sdpa_map_task_templates);
+        self.cu_sdpa_partial_outputs
+            .write_typed(0, plan.cu_partial_outputs_by_q_token_range());
         self.replay_shape.set(Some(replay_shape));
-        self.split_kv_variant.set(Some(split_kv_variant));
+        self.execution_specialization.set(Some(plan.execution_specialization()));
         replay_shape
     }
 
@@ -324,16 +197,16 @@ impl GQAMetadataBuffers {
         &self.flat_token_indices
     }
 
-    pub fn q_token_tiles(&self) -> &Buffer {
-        &self.q_token_tiles
+    pub fn q_token_ranges(&self) -> &Buffer {
+        &self.q_token_ranges
     }
 
-    pub fn kv_splits(&self) -> &Buffer {
-        &self.kv_splits
+    pub fn sdpa_map_task_templates(&self) -> &Buffer {
+        &self.sdpa_map_task_templates
     }
 
-    pub fn cu_kv_splits(&self) -> &Buffer {
-        &self.cu_kv_splits
+    pub fn cu_sdpa_partial_outputs(&self) -> &Buffer {
+        &self.cu_sdpa_partial_outputs
     }
 
     pub fn replay_shape(&self) -> GQAReplayShape {
@@ -342,338 +215,112 @@ impl GQAMetadataBuffers {
             .expect("GQA batch metadata must be updated before recording")
     }
 
-    pub fn split_kv_variant(&self) -> GQASplitKVVariant {
-        self.split_kv_variant
+    pub fn execution_specialization(&self) -> GQASDPAExecutionSpecialization {
+        self.execution_specialization
             .get()
             .expect("GQA batch metadata must be updated before recording")
     }
 }
 
-fn build_single_q_kv_splits(
-    flat_token_indices: &[u32],
-    kv_token_tile_size: u32,
-    max_kv_splits: usize,
-) -> (Vec<u32>, Vec<u32>) {
-    assert!(!flat_token_indices.is_empty());
-    assert!(max_kv_splits >= flat_token_indices.len());
-
-    let context_lens = flat_token_indices
-        .iter()
-        .map(|&token_index| token_index + 1)
-        .collect::<Vec<_>>();
-    let num_kv_token_tiles = context_lens
-        .iter()
-        .map(|&context_len| context_len.div_ceil(kv_token_tile_size) as usize)
-        .collect::<Vec<_>>();
-    let mut num_kv_splits_by_q_token_tile = vec![1_usize; flat_token_indices.len()];
-    let mut num_kv_splits = num_kv_splits_by_q_token_tile.len();
-    while num_kv_splits < max_kv_splits {
-        let mut split_candidate = None;
-        for q_token_tile_index in 0..num_kv_token_tiles.len() {
-            if num_kv_splits_by_q_token_tile[q_token_tile_index] < num_kv_token_tiles[q_token_tile_index] {
-                let num_kv_token_tiles_per_split =
-                    num_kv_token_tiles[q_token_tile_index].div_ceil(num_kv_splits_by_q_token_tile[q_token_tile_index]);
-                if split_candidate.is_none_or(|(_, best_tile_count)| num_kv_token_tiles_per_split > best_tile_count) {
-                    split_candidate = Some((q_token_tile_index, num_kv_token_tiles_per_split));
-                }
-            }
-        }
-        let Some((q_token_tile_index, _)) = split_candidate else {
-            break;
-        };
-        num_kv_splits_by_q_token_tile[q_token_tile_index] += 1;
-        num_kv_splits += 1;
-    }
-
-    let mut kv_splits = Vec::with_capacity(num_kv_splits * NUM_KV_SPLIT_FIELDS);
-    let mut cu_kv_splits = Vec::with_capacity(flat_token_indices.len() + 1);
-    cu_kv_splits.push(0);
-    for (q_token_tile_index, ((&context_len, &num_q_tile_kv_token_tiles), &num_kv_splits_for_q_token_tile)) in
-        context_lens
-            .iter()
-            .zip(&num_kv_token_tiles)
-            .zip(&num_kv_splits_by_q_token_tile)
-            .enumerate()
-    {
-        for kv_split_index in 0..num_kv_splits_for_q_token_tile {
-            let kv_token_tile_begin = num_q_tile_kv_token_tiles * kv_split_index / num_kv_splits_for_q_token_tile;
-            let kv_token_tile_end = num_q_tile_kv_token_tiles * (kv_split_index + 1) / num_kv_splits_for_q_token_tile;
-            let kv_token_begin = (kv_token_tile_begin as u64 * kv_token_tile_size as u64)
-                .try_into()
-                .expect("GQA map KV split KV-token begin must fit u32");
-            let kv_token_end = context_len.min(
-                (kv_token_tile_end as u64 * kv_token_tile_size as u64)
-                    .try_into()
-                    .expect("GQA map KV split KV-token end must fit u32"),
-            );
-            kv_splits.extend_from_slice(&[
-                q_token_tile_index
-                    .try_into()
-                    .expect("GQA Q-token tile index must fit u32"),
-                kv_token_begin,
-                kv_token_end,
-            ]);
-        }
-        cu_kv_splits.push(
-            (kv_splits.len() / NUM_KV_SPLIT_FIELDS)
-                .try_into()
-                .expect("GQA map KV split count must fit u32"),
-        );
-    }
-    (kv_splits, cu_kv_splits)
-}
-
-struct QTokenTile {
-    flat_token_start: u32,
-    flat_token_end: u32,
-    context_len: u32,
-    num_kv_splits_for_q_token_tile: usize,
-}
-
-fn build_tiled_q_kv_splits(
-    token_indices: &[u32],
-    cu_tokens: &[u32],
-    q_token_tile_size: u32,
-    kv_token_tile_size: u32,
-    max_sdpa_partial_output_tokens: usize,
-) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    assert!(q_token_tile_size > 0, "GQA Q-token tile size must be positive");
-    assert!(kv_token_tile_size > 0, "GQA KV-token tile size must be positive");
-    let mut tiles = Vec::new();
-    for (req_index, &token_index) in token_indices.iter().enumerate() {
-        let flat_req_start = cu_tokens[req_index];
-        let flat_req_end = cu_tokens[req_index + 1];
-        let mut flat_token_start = flat_req_start;
-        while flat_token_start < flat_req_end {
-            let tile_len = (flat_req_end - flat_token_start).min(q_token_tile_size);
-            let flat_token_end = flat_token_start + tile_len;
-            tiles.push(QTokenTile {
-                flat_token_start,
-                flat_token_end,
-                context_len: token_index + (flat_token_end - flat_req_start),
-                num_kv_splits_for_q_token_tile: 1,
-            });
-            flat_token_start = flat_token_end;
-        }
-    }
-    assert!(!tiles.is_empty());
-
-    let mut num_sdpa_partial_output_tokens = tiles
-        .iter()
-        .map(|tile| (tile.flat_token_end - tile.flat_token_start) as usize)
-        .sum::<usize>();
-    assert!(num_sdpa_partial_output_tokens <= max_sdpa_partial_output_tokens);
-    while num_sdpa_partial_output_tokens < max_sdpa_partial_output_tokens {
-        let mut split_candidate = None;
-        for (q_token_tile_index, tile) in tiles.iter().enumerate() {
-            let num_tile_tokens = (tile.flat_token_end - tile.flat_token_start) as usize;
-            if num_sdpa_partial_output_tokens + num_tile_tokens > max_sdpa_partial_output_tokens {
-                continue;
-            }
-            let num_kv_token_tiles = tile.context_len.div_ceil(kv_token_tile_size) as usize;
-            if tile.num_kv_splits_for_q_token_tile >= num_kv_token_tiles {
-                continue;
-            }
-            let num_kv_token_tiles_per_split = num_kv_token_tiles.div_ceil(tile.num_kv_splits_for_q_token_tile);
-            if split_candidate.is_none_or(|(_, best_tile_count)| num_kv_token_tiles_per_split > best_tile_count) {
-                split_candidate = Some((q_token_tile_index, num_kv_token_tiles_per_split));
-            }
-        }
-        let Some((q_token_tile_index, _)) = split_candidate else {
-            break;
-        };
-        num_sdpa_partial_output_tokens +=
-            (tiles[q_token_tile_index].flat_token_end - tiles[q_token_tile_index].flat_token_start) as usize;
-        tiles[q_token_tile_index].num_kv_splits_for_q_token_tile += 1;
-    }
-
-    let mut q_token_tiles = Vec::with_capacity(tiles.len() * NUM_Q_TOKEN_TILE_FIELDS);
-    let mut kv_splits = Vec::new();
-    let mut cu_kv_splits = Vec::with_capacity(tiles.len() + 1);
-    cu_kv_splits.push(0);
-    for (q_token_tile_index, tile) in tiles.iter().enumerate() {
-        q_token_tiles.extend_from_slice(&[tile.flat_token_start, tile.flat_token_end]);
-        let num_kv_token_tiles = tile.context_len.div_ceil(kv_token_tile_size) as usize;
-        for kv_split_index in 0..tile.num_kv_splits_for_q_token_tile {
-            let kv_token_tile_begin = num_kv_token_tiles * kv_split_index / tile.num_kv_splits_for_q_token_tile;
-            let kv_token_tile_end = num_kv_token_tiles * (kv_split_index + 1) / tile.num_kv_splits_for_q_token_tile;
-            let kv_token_begin = (kv_token_tile_begin as u64 * kv_token_tile_size as u64)
-                .try_into()
-                .expect("GQA tiled map KV split KV-token begin must fit u32");
-            let kv_token_end = tile.context_len.min(
-                (kv_token_tile_end as u64 * kv_token_tile_size as u64)
-                    .try_into()
-                    .expect("GQA tiled map KV split KV-token end must fit u32"),
-            );
-            kv_splits.extend_from_slice(&[
-                q_token_tile_index
-                    .try_into()
-                    .expect("GQA Q-token tile index must fit u32"),
-                kv_token_begin,
-                kv_token_end,
-            ]);
-        }
-        cu_kv_splits.push(
-            (kv_splits.len() / NUM_KV_SPLIT_FIELDS)
-                .try_into()
-                .expect("GQA tiled map KV split count must fit u32"),
-        );
-    }
-    (q_token_tiles, kv_splits, cu_kv_splits)
-}
-
 #[cfg(test)]
 mod tests {
-    use inference_backend_metal::components::GQASplitKVVariant;
+    use inference_backend_metal::components::GQASDPAConfig;
+    use inference_backend_metal::components::GQASDPAExecutionSpecialization;
+    use inference_backend_metal::components::GQASDPASpecializationRegistry;
     use inference_backend_metal::metal::Device;
+    use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::GQAReplayShape;
 
     use super::GQAMetadataBuffers;
     use super::GQAReplayBucketPolicy;
+    use crate::attn::gqa::sdpa::GQASDPAPlanner;
+    use crate::attn::gqa::sdpa::GQASDPARequestShape;
+
+    fn config() -> GQASDPAConfig {
+        GQASDPAConfig {
+            io_dtype: Dtype::Bfloat16,
+            num_q_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 128,
+            tokens_per_page: 8,
+        }
+    }
+
+    fn planner(max_tokens: usize, execution: GQASDPAExecutionSpecialization) -> GQASDPAPlanner {
+        GQASDPAPlanner::new(
+            GQASDPASpecializationRegistry::from_execution_specializations(config(), vec![execution]),
+            max_tokens,
+        )
+    }
 
     #[test]
-    fn test_metadata_api_set_preserves_active_requests_across_split_kv_variants_and_capacity_policies() {
+    fn test_metadata_upload_preserves_current_abi_for_complete_plans() {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 8);
-        let single_query = GQASplitKVVariant::SingleQ {
-            kv_token_tile_size: 8,
-            num_threads_per_threadblock: 32,
-            q_head_tile_size: 1,
-        };
-        let tiled_query = GQASplitKVVariant::TiledQ {
-            q_token_tile_size: 8,
-            kv_token_tile_size: 4,
-            q_head_tile_size: 1,
-        };
-        let policy = GQAReplayBucketPolicy::new(8, &[]);
-        let req_slots = [2, 5];
-        let token_indices = [7, 20];
-        let cu_tokens = [0, 2, 5];
+        let shapes = GQASDPARequestShape::from_batch(&[7, 20], &[0, 2, 5]);
+        let single = GQASDPAExecutionSpecialization::single_q(config(), 8, 32, 1);
+        let single_plan = planner(8, single).plan_exact(&shapes);
 
-        let single_exact = metadata.update(&req_slots, &token_indices, &cu_tokens, single_query);
-
+        let single_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], &single_plan);
         assert_eq!(metadata.req_slots().read_typed::<u32>(0, 5), vec![2, 2, 5, 5, 5]);
         assert_eq!(
             metadata.flat_token_indices().read_typed::<u32>(0, 5),
             vec![7, 8, 20, 21, 22]
         );
         assert_eq!(
-            metadata.kv_splits().read_typed::<u32>(0, 24),
+            metadata.sdpa_map_task_templates().read_typed::<u32>(0, 24),
             vec![
-                0, 0, 8, 1, 0, 9, 2, 0, 8, 2, 8, 21, 3, 0, 8, 3, 8, 22, 4, 0, 8, 4, 8, 23,
+                0, 0, 8, 1, 0, 9, 2, 0, 8, 2, 8, 21, 3, 0, 8, 3, 8, 22, 4, 0, 8, 4, 8, 23
             ]
         );
-        assert_eq!(metadata.cu_kv_splits().read_typed::<u32>(0, 6), vec![0, 1, 2, 4, 6, 8]);
         assert_eq!(
-            single_exact,
-            GQAReplayShape {
-                num_tokens: 5,
-                num_total_tokens: 5,
-                num_q_token_tiles: 5,
-                num_total_q_token_tiles: 5,
-                num_sdpa_map_task_templates: 8,
-                num_total_sdpa_map_task_templates: 8,
-                reduce_sdpa_partial_outputs: true,
-            }
+            metadata.cu_sdpa_partial_outputs().read_typed::<u32>(0, 6),
+            vec![0, 1, 2, 4, 6, 8]
         );
+        assert_eq!(single_shape, GQAReplayShape::new(5, 5, 5, 5, 8, 8, true));
 
-        let tiled_exact = metadata.update(&req_slots, &token_indices, &cu_tokens, tiled_query);
-
-        assert_eq!(metadata.q_token_tiles().read_typed::<u32>(0, 4), vec![0, 2, 2, 5]);
+        let tiled = GQASDPAExecutionSpecialization::tiled_q(config(), 8, 8, 1);
+        let tiled_plan = planner(8, tiled).plan_exact(&shapes);
+        let tiled_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], &tiled_plan);
+        assert_eq!(metadata.q_token_ranges().read_typed::<u32>(0, 4), vec![0, 2, 2, 5]);
         assert_eq!(
-            metadata.kv_splits().read_typed::<u32>(0, 12),
-            vec![0, 0, 9, 1, 0, 12, 1, 12, 23, u32::MAX, u32::MAX, u32::MAX]
+            metadata.sdpa_map_task_templates().read_typed::<u32>(0, 12),
+            vec![0, 0, 9, 1, 0, 8, 1, 8, 23, u32::MAX, u32::MAX, u32::MAX]
         );
-        assert_eq!(metadata.cu_kv_splits().read_typed::<u32>(0, 3), vec![0, 1, 3]);
         assert_eq!(
-            tiled_exact,
-            GQAReplayShape {
-                num_tokens: 5,
-                num_total_tokens: 5,
-                num_q_token_tiles: 2,
-                num_total_q_token_tiles: 2,
-                num_sdpa_map_task_templates: 3,
-                num_total_sdpa_map_task_templates: 4,
-                reduce_sdpa_partial_outputs: true,
-            }
+            metadata.cu_sdpa_partial_outputs().read_typed::<u32>(0, 3),
+            vec![0, 1, 3]
         );
-
-        let bucketed = metadata.update_bucketed(&req_slots, &token_indices, &cu_tokens, tiled_query, &policy);
-        assert_eq!(bucketed, GQAReplayShape::new(5, 6, 2, 2, 3, 4, true));
-
-        let caller_sized = metadata.update_bucketed_with_token_capacity(
-            &req_slots,
-            &token_indices,
-            &cu_tokens,
-            tiled_query,
-            &policy,
-            5,
-        );
-        assert_eq!(caller_sized, GQAReplayShape::new(5, 5, 2, 2, 3, 4, true));
-        assert_eq!(caller_sized, metadata.replay_shape());
-        assert_eq!(tiled_query, metadata.split_kv_variant());
+        assert_eq!(tiled_shape, GQAReplayShape::new(5, 5, 2, 2, 3, 4, true));
+        assert_eq!(metadata.execution_specialization(), tiled);
     }
 
     #[test]
-    fn test_bucketed_domains_preserve_poisoned_non_kv_split_tail() {
+    fn test_bucketed_plan_preserves_non_kv_metadata_tail() {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 12);
-        metadata.q_token_tiles().write_typed(0, &[0xA5A5_A5A5_u32; 24]);
-        metadata.kv_splits().write_typed(0, &[0xB6B6_B6B6_u32; 36]);
-        metadata.cu_kv_splits().write_typed(0, &[0xC7C7_C7C7_u32; 13]);
-        let split_kv_variant = GQASplitKVVariant::TiledQ {
-            q_token_tile_size: 8,
-            kv_token_tile_size: 4,
-            q_head_tile_size: 1,
-        };
+        metadata.q_token_ranges().write_typed(0, &[0xA5A5_A5A5_u32; 24]);
+        metadata
+            .sdpa_map_task_templates()
+            .write_typed(0, &[0xB6B6_B6B6_u32; 36]);
+        metadata
+            .cu_sdpa_partial_outputs()
+            .write_typed(0, &[0xC7C7_C7C7_u32; 13]);
+        let execution = GQASDPAExecutionSpecialization::tiled_q(config(), 8, 8, 1);
+        let planner = planner(12, execution);
         let policy = GQAReplayBucketPolicy::new(12, &[]);
+        let plan = planner.plan_bucketed(&GQASDPARequestShape::from_batch(&[0, 0, 0], &[0, 4, 8, 9]), &policy);
 
-        let shape = metadata.update_bucketed(&[2, 5, 7], &[0, 0, 0], &[0, 4, 8, 9], split_kv_variant, &policy);
-
+        let shape = metadata.update(&[2, 5, 7], &[0, 0, 0], &[0, 4, 8, 9], &plan);
+        assert_eq!(shape, GQAReplayShape::new(9, 12, 3, 4, 3, 4, true));
+        assert_eq!(metadata.q_token_ranges().read_typed::<u32>(6, 2), [0xA5A5_A5A5_u32; 2]);
         assert_eq!(
-            shape,
-            GQAReplayShape {
-                num_tokens: 9,
-                num_total_tokens: 12,
-                num_q_token_tiles: 3,
-                num_total_q_token_tiles: 4,
-                num_sdpa_map_task_templates: 3,
-                num_total_sdpa_map_task_templates: 4,
-                reduce_sdpa_partial_outputs: true,
-            }
+            metadata.sdpa_map_task_templates().read_typed::<u32>(9, 3),
+            [u32::MAX; 3]
         );
-        assert_eq!(metadata.q_token_tiles().read_typed::<u32>(6, 2), [0xA5A5_A5A5_u32; 2]);
-        assert_eq!(metadata.kv_splits().read_typed::<u32>(9, 3), [u32::MAX; 3]);
-        assert_eq!(metadata.cu_kv_splits().read_typed::<u32>(4, 1), [0xC7C7_C7C7_u32]);
-    }
-
-    #[test]
-    #[should_panic(expected = "GQA active token count must not exceed the caller-owned token capacity")]
-    fn test_caller_token_capacity_rejects_active_overflow() {
-        let device = Device::system_default();
-        let metadata = GQAMetadataBuffers::new(&device, 12);
-        let split_kv_variant = GQASplitKVVariant::SingleQ {
-            kv_token_tile_size: 8,
-            num_threads_per_threadblock: 32,
-            q_head_tile_size: 1,
-        };
-        let policy = GQAReplayBucketPolicy::new(12, &[]);
-
-        metadata.update_bucketed_with_token_capacity(&[0], &[0], &[0, 5], split_kv_variant, &policy, 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "GQA caller-owned token capacity must not exceed the metadata capacity")]
-    fn test_caller_token_capacity_rejects_metadata_overflow() {
-        let device = Device::system_default();
-        let metadata = GQAMetadataBuffers::new(&device, 12);
-        let split_kv_variant = GQASplitKVVariant::SingleQ {
-            kv_token_tile_size: 8,
-            num_threads_per_threadblock: 32,
-            q_head_tile_size: 1,
-        };
-        let policy = GQAReplayBucketPolicy::new(12, &[]);
-
-        metadata.update_bucketed_with_token_capacity(&[0], &[0], &[0, 5], split_kv_variant, &policy, 13);
+        assert_eq!(
+            metadata.cu_sdpa_partial_outputs().read_typed::<u32>(4, 1),
+            [0xC7C7_C7C7_u32]
+        );
     }
 }

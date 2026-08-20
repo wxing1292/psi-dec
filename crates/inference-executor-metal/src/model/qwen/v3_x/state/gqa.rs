@@ -47,8 +47,8 @@ impl Qwen3xGQAState {
             "qwen3.x cache page IDs must fit u32"
         );
         page_table_layout.validate();
-        let backend = Rc::new(GQA::new(device, core.clone(), metal));
-        let scratch = Rc::new(backend.new_scratch(max_tokens));
+        let backend = Rc::new(GQA::new(device, core.clone(), metal, max_tokens));
+        let scratch = Rc::new(backend.new_scratch());
         let max_tokens_u32 = max_tokens.try_into().expect("qwen3.x GQA token capacity must fit u32");
         let replay_bucket_policy = backend.replay_bucket_policy(max_tokens_u32);
         Self {
@@ -196,8 +196,8 @@ impl Qwen3xGQAState {
                 && self.metadata.is_none(),
             "Qwen3.x GQA state resources are already loaded"
         );
-        let backend = Rc::new(GQA::new(device, self.core.clone(), self.metal));
-        let scratch = Rc::new(backend.new_scratch(self.max_tokens));
+        let backend = Rc::new(GQA::new(device, self.core.clone(), self.metal, self.max_tokens));
+        let scratch = Rc::new(backend.new_scratch());
         self.backend = Some(backend);
         self.scratch = Some(scratch);
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));

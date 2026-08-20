@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::GQASplitKVConfig;
+use inference_backend_metal::components::GQASDPAConfig;
 use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -243,19 +243,32 @@ pub fn qwen3x_dspark_gqa_core(
     UngatedDSparkGQACore::new(attention, num_spec_tokens)
 }
 
-pub fn qwen3x_dspark_gqa_split_kv_config(
+pub fn qwen3x_dspark_gqa_sdpa_config(
     config: &Qwen3xDSparkConfig,
     page_bytes: usize,
-) -> Result<GQASplitKVConfig, ModelExecutorError> {
-    let split_kv_config = GQASplitKVConfig {
+) -> Result<GQASDPAConfig, ModelExecutorError> {
+    let num_q_heads = to_u32("Qwen3x DSpark GQA Q-head count", config.num_attention_heads)?;
+    let num_kv_heads = to_u32("Qwen3x DSpark GQA KV-head count", config.num_key_value_heads)?;
+    let head_dim = to_u32("Qwen3x DSpark GQA head_dim", config.head_dim)?;
+    let page_bytes = to_u32("Qwen3x DSpark GQA page_bytes", page_bytes)?;
+    let kv_bytes_per_token = num_kv_heads
+        .checked_mul(head_dim)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark GQA KV bytes per token must fit u32"))?;
+    if !page_bytes.is_multiple_of(kv_bytes_per_token) {
+        return Err(ModelExecutorError::custom(
+            "Qwen3x DSpark GQA page bytes must contain whole KV tokens",
+        ));
+    }
+    let sdpa_config = GQASDPAConfig {
         io_dtype: Dtype::Bfloat16,
-        page_bytes: to_u32("Qwen3x DSpark GQA page_bytes", page_bytes)?,
-        num_q_heads: to_u32("Qwen3x DSpark GQA Q-head count", config.num_attention_heads)?,
-        num_kv_heads: to_u32("Qwen3x DSpark GQA KV-head count", config.num_key_value_heads)?,
-        head_dim: to_u32("Qwen3x DSpark GQA head_dim", config.head_dim)?,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        tokens_per_page: page_bytes / kv_bytes_per_token,
     };
-    split_kv_config.validate();
-    Ok(split_kv_config)
+    sdpa_config.validate();
+    Ok(sdpa_config)
 }
 
 fn qwen3x_dspark_gqa_metal_config(
@@ -380,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gqa_split_kv_config_contains_only_shared_workload_facts() {
+    fn test_gqa_sdpa_config_contains_only_shared_workload_facts() {
         let mut config = config();
         config.quantization.as_mut().unwrap().tensor_overrides.insert(
             "layers.1.self_attn.q_proj.weight".to_string(),
@@ -391,14 +404,13 @@ mod tests {
             },
         );
 
-        let split_kv = qwen3x_dspark_gqa_split_kv_config(&config, 32 * 1024).unwrap();
+        let sdpa = qwen3x_dspark_gqa_sdpa_config(&config, 32 * 1024).unwrap();
 
-        assert_eq!(split_kv.io_dtype, Dtype::Bfloat16);
-        assert_eq!(split_kv.page_bytes, 32 * 1024);
-        assert_eq!(split_kv.num_q_heads, 4);
-        assert_eq!(split_kv.num_kv_heads, 1);
-        assert_eq!(split_kv.head_dim, 8);
-        assert_eq!(split_kv.num_tokens_per_page(), 1024);
+        assert_eq!(sdpa.io_dtype, Dtype::Bfloat16);
+        assert_eq!(sdpa.num_q_heads, 4);
+        assert_eq!(sdpa.num_kv_heads, 1);
+        assert_eq!(sdpa.head_dim, 8);
+        assert_eq!(sdpa.tokens_per_page, 1024);
     }
 
     #[test]

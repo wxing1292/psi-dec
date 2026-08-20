@@ -4,6 +4,9 @@ use std::time::Instant;
 
 use half::bf16;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
+use inference_backend_metal::components::GQASDPAConfig;
+use inference_backend_metal::components::GQASDPAExecutionSpecialization;
+use inference_backend_metal::components::GQASDPASpecializationRegistry;
 use inference_backend_metal::components::GQASplitKVSingleQConfig;
 use inference_backend_metal::components::GQASplitKVSingleQKernels;
 use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
@@ -14,7 +17,6 @@ use inference_backend_metal::components::GQASplitKVTiledQKernels;
 use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQShape;
-use inference_backend_metal::components::GQASplitKVVariant;
 use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -38,6 +40,8 @@ use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBi
 use inference_executor_metal::attn::gqa::backend::GQAKVCacheBindings;
 use inference_executor_metal::attn::gqa::backend::GQAMetalConfig;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
+use inference_executor_metal::attn::gqa::sdpa::GQASDPAPlanner;
+use inference_executor_metal::attn::gqa::sdpa::GQASDPARequestShape;
 use inference_executor_metal::attn::gqa::ungated_backend::UngatedGQA;
 use inference_executor_metal::attn::gqa::ungated_backend::UngatedGQAInput;
 use inference_executor_metal::attn::gqa::ungated_backend::UngatedGQAWeights;
@@ -266,32 +270,44 @@ impl Fixture {
         };
         assert!(split_kv_tiled_q_head_tile > 0 && split_kv_tiled_q_head_tile <= q_heads_per_kv_head as u32);
         assert!(split_kv_tiled_q_head_tile <= tiled_max_q_head_tile);
+        let sdpa_config = GQASDPAConfig {
+            io_dtype: config.io_dtype,
+            num_q_heads: core.num_q_heads.try_into().expect("GQA Q-head count must fit u32"),
+            num_kv_heads: core.num_kv_heads.try_into().expect("GQA KV-head count must fit u32"),
+            head_dim: core.head_dim.try_into().expect("GQA head_dim must fit u32"),
+            tokens_per_page,
+        };
+        let request_shapes = GQASDPARequestShape::from_batch(&token_indices, &cu_tokens);
+        let single_q_execution = GQASDPAExecutionSpecialization::single_q(
+            sdpa_config,
+            params.split_kv_single_q_kv_tile,
+            params.split_kv_single_q_threads,
+            split_kv_single_q_head_tile,
+        );
+        let single_q_plan = GQASDPAPlanner::new(
+            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![single_q_execution]),
+            MAX_TOKENS,
+        )
+        .plan_exact(&request_shapes);
         let split_kv_single_q_metadata = GQAMetadataBuffers::new(device, MAX_TOKENS);
-        split_kv_single_q_metadata.update(
-            &req_slots,
-            &token_indices,
-            &cu_tokens,
-            GQASplitKVVariant::SingleQ {
-                kv_token_tile_size: params.split_kv_single_q_kv_tile,
-                num_threads_per_threadblock: params.split_kv_single_q_threads,
-                q_head_tile_size: split_kv_single_q_head_tile,
-            },
+        split_kv_single_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &single_q_plan);
+        let tiled_q_execution = GQASDPAExecutionSpecialization::tiled_q(
+            sdpa_config,
+            params.split_kv_tiled_q_token_tile,
+            params.split_kv_tiled_q_kv_tile,
+            split_kv_tiled_q_head_tile,
         );
+        let tiled_q_plan = GQASDPAPlanner::new(
+            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![tiled_q_execution]),
+            MAX_TOKENS,
+        )
+        .plan_exact(&request_shapes);
         let split_kv_tiled_q_metadata = GQAMetadataBuffers::new(device, MAX_TOKENS);
-        let tiled_shape = split_kv_tiled_q_metadata.update(
-            &req_slots,
-            &token_indices,
-            &cu_tokens,
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size: params.split_kv_tiled_q_token_tile,
-                kv_token_tile_size: params.split_kv_tiled_q_kv_tile,
-                q_head_tile_size: split_kv_tiled_q_head_tile,
-            },
-        );
+        let tiled_shape = split_kv_tiled_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &tiled_q_plan);
 
         let stream = Stream::new(device);
-        let backend = UngatedGQA::new(device, core.clone(), config);
-        let scratch = backend.new_scratch(MAX_TOKENS);
+        let backend = UngatedGQA::new(device, core.clone(), config, MAX_TOKENS);
+        let scratch = backend.new_scratch();
         let hidden = Buffer::from_slice(
             device,
             &(0..num_tokens as usize * core.hidden_dim)
@@ -459,7 +475,7 @@ impl Fixture {
             single_q_output_accumulators,
             self.production_tiled_q_head_tile,
             self.split_kv_tiled_q_head_tile,
-            tiled_config.num_threads_per_threadblock(),
+            tiled_config.required_threads(),
             self.params.split_kv_tiled_q_token_tile,
             self.params.split_kv_tiled_q_kv_tile,
             tiled_config.map_threadblock_memory_bytes(),
@@ -516,9 +532,9 @@ impl Fixture {
             num_q_heads: self.core.num_q_heads.try_into().expect("q heads must fit u32"),
             num_kv_heads: self.core.num_kv_heads.try_into().expect("KV heads must fit u32"),
             head_dim: self.core.head_dim.try_into().expect("head dim must fit u32"),
-            q_head_tile_size: self.split_kv_tiled_q_head_tile,
-            q_token_tile_size: self.params.split_kv_tiled_q_token_tile,
-            kv_token_tile_size: self.params.split_kv_tiled_q_kv_tile,
+            max_q_heads: self.split_kv_tiled_q_head_tile,
+            max_q_tokens: self.params.split_kv_tiled_q_token_tile,
+            kv_tokens_per_iteration: self.params.split_kv_tiled_q_kv_tile,
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             dtype: self.config.io_dtype,
@@ -722,9 +738,9 @@ fn split_kv_single_q_replay(
             num_gqa_layers: page_table_layout.num_gqa_layers,
             num_page_ids_per_block: page_table_layout.num_page_ids_per_block,
         },
-        kv_token_tile_size: params.split_kv_single_q_kv_tile,
-        num_threads_per_threadblock: params.split_kv_single_q_threads,
-        q_head_tile_size: q_head_tile,
+        kv_tokens_per_iteration: params.split_kv_single_q_kv_tile,
+        required_threads: params.split_kv_single_q_threads,
+        max_q_heads: q_head_tile,
         dtype: config.io_dtype,
     };
     let kernels = GQASplitKVSingleQKernels::new(device, sdpa_config, sdpa_shape);
@@ -736,7 +752,7 @@ fn split_kv_single_q_replay(
             kv_pages: pages,
             req_slots: metadata.req_slots(),
             page_ids,
-            sdpa_map_task_templates: metadata.kv_splits(),
+            sdpa_map_task_templates: metadata.sdpa_map_task_templates(),
             partial_exp_sums: scratch.sdpa_partial_exp_sums,
             partial_max_logits: scratch.sdpa_partial_max_logits,
             partial_output: scratch.sdpa_partial_output,
@@ -748,7 +764,7 @@ fn split_kv_single_q_replay(
             partial_exp_sums: scratch.sdpa_partial_exp_sums,
             partial_max_logits: scratch.sdpa_partial_max_logits,
             partial_output: scratch.sdpa_partial_output,
-            cu_sdpa_partial_outputs: metadata.cu_kv_splits(),
+            cu_sdpa_partial_outputs: metadata.cu_sdpa_partial_outputs(),
             output: scratch.attention_output,
         },
     )));
@@ -774,9 +790,9 @@ fn split_kv_tiled_q_replay(
         num_q_heads: core.num_q_heads.try_into().expect("q heads must fit u32"),
         num_kv_heads: core.num_kv_heads.try_into().expect("KV heads must fit u32"),
         head_dim: core.head_dim.try_into().expect("head dim must fit u32"),
-        q_head_tile_size: q_head_tile,
-        q_token_tile_size: params.split_kv_tiled_q_token_tile,
-        kv_token_tile_size: params.split_kv_tiled_q_kv_tile,
+        max_q_heads: q_head_tile,
+        max_q_tokens: params.split_kv_tiled_q_token_tile,
+        kv_tokens_per_iteration: params.split_kv_tiled_q_kv_tile,
         scale: core.scale,
         page_bytes: config.page_bytes,
         dtype: config.io_dtype,
@@ -802,8 +818,8 @@ fn split_kv_tiled_q_replay(
             req_slots: metadata.req_slots(),
             page_ids,
             flat_token_indices: metadata.flat_token_indices(),
-            q_token_tiles: metadata.q_token_tiles(),
-            sdpa_map_task_templates: metadata.kv_splits(),
+            q_token_ranges: metadata.q_token_ranges(),
+            sdpa_map_task_templates: metadata.sdpa_map_task_templates(),
             partial_output: scratch.sdpa_partial_output,
             partial_exp_sums: scratch.sdpa_partial_exp_sums,
             partial_max_logits: scratch.sdpa_partial_max_logits,
@@ -814,8 +830,8 @@ fn split_kv_tiled_q_replay(
         partial_output: scratch.sdpa_partial_output,
         partial_exp_sums: scratch.sdpa_partial_exp_sums,
         partial_max_logits: scratch.sdpa_partial_max_logits,
-        q_token_tiles: metadata.q_token_tiles(),
-        cu_sdpa_partial_outputs: metadata.cu_kv_splits(),
+        q_token_ranges: metadata.q_token_ranges(),
+        cu_sdpa_partial_outputs: metadata.cu_sdpa_partial_outputs(),
         output: scratch.attention_output,
     })));
     recorder.build()

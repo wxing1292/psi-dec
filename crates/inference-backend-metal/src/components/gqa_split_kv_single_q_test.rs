@@ -25,9 +25,9 @@ fn test_sdpa_shape_rejects_shader_count_overflow() {
             num_blocks: 1,
             num_page_ids_per_block: 1,
         },
-        kv_token_tile_size: 1,
-        num_threads_per_threadblock: 32,
-        q_head_tile_size: 1,
+        kv_tokens_per_iteration: 1,
+        required_threads: 32,
+        max_q_heads: 1,
         dtype: Dtype::Bfloat16,
     };
     GQASplitKVSingleQShape {
@@ -280,9 +280,9 @@ fn fixture_config() -> GQASplitKVSingleQConfig {
             num_gqa_layers: 1,
             num_page_ids_per_block: 1,
         },
-        kv_token_tile_size: 4,
-        num_threads_per_threadblock: 64,
-        q_head_tile_size: 2,
+        kv_tokens_per_iteration: 4,
+        required_threads: 64,
+        max_q_heads: 2,
         dtype: Dtype::Float32,
     }
 }
@@ -352,7 +352,7 @@ fn sdpa_map_task_template_buffers(
 ) -> (Vec<u32>, Vec<u32>) {
     let num_kv_token_tiles = flat_token_indices
         .iter()
-        .map(|&token_index| (token_index + 1).div_ceil(config.kv_token_tile_size) as usize)
+        .map(|&token_index| (token_index + 1).div_ceil(config.kv_tokens_per_iteration) as usize)
         .collect::<Vec<_>>();
     let mut num_sdpa_map_task_templates_by_q_token_tile = vec![1_usize; flat_token_indices.len()];
     let mut num_sdpa_map_task_templates = num_sdpa_map_task_templates_by_q_token_tile.len();
@@ -380,11 +380,11 @@ fn sdpa_map_task_template_buffers(
                 / num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index];
             let kv_token_tile_end = num_kv_token_tiles[q_token_tile_index] * (sdpa_map_task_template_index + 1)
                 / num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index];
-            let kv_token_begin = kv_token_tile_begin as u32 * config.kv_token_tile_size;
+            let kv_token_begin = kv_token_tile_begin as u32 * config.kv_tokens_per_iteration;
             sdpa_map_task_templates.extend_from_slice(&[
                 q_token_tile_index as u32,
                 kv_token_begin,
-                context_len.min(kv_token_tile_end as u32 * config.kv_token_tile_size),
+                context_len.min(kv_token_tile_end as u32 * config.kv_tokens_per_iteration),
             ]);
         }
         cu_sdpa_partial_outputs.push((sdpa_map_task_templates.len() / 3) as u32);

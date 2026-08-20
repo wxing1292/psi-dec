@@ -789,9 +789,9 @@ fn gqa_sdpa_config(
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         page_table_layout: gqa_page_table_layout(num_reqs, end_context_len, model),
-        kv_token_tile_size: params.split_kv_single_q_kv_token_tile_size,
-        num_threads_per_threadblock: params.split_kv_single_q_num_threads_per_threadblock,
-        q_head_tile_size: u32::try_from(model.num_q_heads / model.num_kv_heads)
+        kv_tokens_per_iteration: params.split_kv_single_q_kv_token_tile_size,
+        required_threads: params.split_kv_single_q_num_threads_per_threadblock,
+        max_q_heads: u32::try_from(model.num_q_heads / model.num_kv_heads)
             .expect("GQA q heads per KV head must fit u32")
             .min(params.split_kv_single_q_max_q_head_tile_size),
         dtype: Dtype::Bfloat16,
@@ -814,9 +814,9 @@ fn gqa_split_kv_tiled_q_config(
         num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
-        q_head_tile_size: params.split_kv_tiled_q_head_tile_size,
-        q_token_tile_size: params.split_kv_tiled_q_token_tile_size,
-        kv_token_tile_size: params.split_kv_tiled_q_kv_token_tile_size,
+        max_q_heads: params.split_kv_tiled_q_head_tile_size,
+        max_q_tokens: params.split_kv_tiled_q_token_tile_size,
+        kv_tokens_per_iteration: params.split_kv_tiled_q_kv_token_tile_size,
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         dtype: Dtype::Bfloat16,

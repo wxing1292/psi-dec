@@ -288,16 +288,17 @@ QKV projection
 The history path reads persistent paged K/V.
 The block path reads dense local K/V from `DSparkBlockScratch`.
 Both map paths write `SDPAPartialOutput` records with the existing ABI.
-The existing `GQASDPAReduceKernel` combines both sets.
+The existing `GQASplitKVSingleQKernels` Reduce launch combines both sets.
 
 The history metadata supplies a half-open visible range.
 For an anchor at position `p`, that range is `[0, p)`.
 The block kernel supplies the complete local block.
 
-`UngatedDSparkGQAState::prepare_block` gives fixed workload facts to `GQASplitKV`.
-The backend selects the constrained SplitKV SingleQ partial ABI once.
-`DSparkGQAMetadataBuffers` stores that exact `GQASplitKVVariant` with the replay shape.
-Recording uses the stored path and does not run a second selector.
+`UngatedDSparkGQAState` gives its static attention and KV-cache facts to
+`GQASDPASpecializationRegistry::new_single_q_only(...)`. The registry provides one constrained history specialization with the
+existing one-Q partial ABI. `UngatedDSparkGQAState::prepare_block` gives that specialization to the DSpark-specific
+metadata builder. `DSparkGQAMetadataBuffers` stores the exact `GQASDPAExecutionSpecialization` with the replay shape.
+Recording uses the stored specialization and does not run a second selector.
 
 One block-bidirectional map Task owns one Q token and one Q head.
 The backend fixes this Task to one 32-thread SIMDgroup.

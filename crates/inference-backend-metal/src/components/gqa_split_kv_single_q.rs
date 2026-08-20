@@ -28,21 +28,20 @@ const GQA_ACTIVATION_GATE_SOURCE: &str = include_str!("metal/gqa_activation_gate
 /// Q tile [Tq_tile, Hq_tile, D] x K tile^T [D, Tkv_tile]
 ///   -> scores -> x V tile [Tkv_tile, D]
 ///   -> SDPAPartialOutput [Tq_tile, Hq_tile, D]
-/// SDPAMapTile: (q_token_tile_index, kv_head_index,
-///               q_head_tile_index, kv_token_tile_index)
-/// KVSplit: { q_token_tile_index, kv_token_begin, kv_token_end }
-/// SDPAMapTask / threadblock:
-///   { q_token_tile_index, kv_token_begin, kv_token_end } from KVSplit
-///   + { kv_head_index, q_head_tile_index } from grid
-/// grid: (total KV splits * Hkv * Q-head tiles, 1, 1), flattened
+/// Map task template: { q_token_range_index, kv_token_begin, kv_token_end }
+/// MapThreadBlockTask:
+///   { q_token_range_index, kv_token_begin, kv_token_end } from the template
+///   + { kv_head_index, q_head_range_index } from the grid
+/// grid: (total Map task templates * Hkv * Q-head ranges, 1, 1), flattened
 /// threadblock: (configured width, 1, 1)
-/// parallel: KV splits, KV heads, Q-head tiles
-/// ordered/reduce: consecutive KV tiles merged with online softmax
+/// parallel: Map tasks, KV heads, Q-head ranges
+/// ordered/reduce: consecutive KV iterations merged with online softmax
 /// produces: SDPAPartialOutput + statistics -> final reduce -> SDPAOutput
 /// ```
 ///
-/// This variant uses `Tq_tile = 1`. Only the KV split is materialized. It uses
-/// the shared three-`u32` TaskTemplate ABI. The complete Task is comment-only.
+/// This variant uses `Tq_tile = 1`. Only the Map task template is materialized.
+/// It uses the shared three-`u32` TaskTemplate ABI. The complete task is
+/// derived from the template, grid coordinates, and specialization.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GQASplitKVSingleQConfig {
     pub num_q_heads: u32,
@@ -51,9 +50,9 @@ pub struct GQASplitKVSingleQConfig {
     pub scale: f32,
     pub page_bytes: u32,
     pub page_table_layout: GQAPageTableLayout,
-    pub kv_token_tile_size: u32,
-    pub num_threads_per_threadblock: u32,
-    pub q_head_tile_size: u32,
+    pub kv_tokens_per_iteration: u32,
+    pub required_threads: u32,
+    pub max_q_heads: u32,
     pub dtype: Dtype,
 }
 
@@ -66,10 +65,10 @@ impl GQASplitKVSingleQConfig {
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         assert!(self.num_tokens_per_page() > 0);
         self.page_table_layout.validate();
-        assert!(self.kv_token_tile_size > 0 && self.kv_token_tile_size <= 1024);
-        assert!(self.num_threads_per_threadblock.is_power_of_two() && self.num_threads_per_threadblock <= 256);
-        assert!(self.q_head_tile_size > 0 && self.q_head_tile_size <= 8);
-        assert!(self.q_head_tile_size <= self.q_heads_per_kv_head());
+        assert!(self.kv_tokens_per_iteration > 0 && self.kv_tokens_per_iteration <= 1024);
+        assert!(self.required_threads.is_power_of_two() && self.required_threads <= 256);
+        assert!(self.max_q_heads > 0 && self.max_q_heads <= 8);
+        assert!(self.max_q_heads <= self.q_heads_per_kv_head());
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
@@ -91,17 +90,13 @@ impl GQASplitKVSingleQConfig {
         self.num_q_heads / self.num_kv_heads
     }
 
-    pub fn q_head_tile_size(self) -> u32 {
-        self.q_head_tile_size
-    }
-
     pub fn threadblock_memory_bytes(self) -> usize {
-        (self.q_head_tile_size as usize * self.kv_token_tile_size as usize + self.num_threads_per_threadblock as usize)
+        (self.max_q_heads as usize * self.kv_tokens_per_iteration as usize + self.required_threads as usize)
             * size_of::<f32>()
     }
 
     pub fn num_q_head_tiles_per_kv_head(self) -> u32 {
-        self.q_heads_per_kv_head().div_ceil(self.q_head_tile_size())
+        self.q_heads_per_kv_head().div_ceil(self.max_q_heads)
     }
 
     pub fn map_threads(self, shape: GQASplitKVSingleQShape) -> usize {
@@ -111,7 +106,7 @@ impl GQASplitKVSingleQConfig {
                 shape.num_total_sdpa_map_task_templates as usize,
                 self.num_kv_heads as usize,
                 self.num_q_head_tiles_per_kv_head() as usize,
-                self.num_threads_per_threadblock as usize,
+                self.required_threads as usize,
             ],
         )
     }
@@ -567,13 +562,13 @@ typedef bfloat bfloat16_t;
 #define KV_HEAD_DIM {head_dim}
 #define ATTENTION_SCALE {scale}
 #define Q_HEADS_PER_KV_HEAD {q_heads_per_kv_head}
-#define Q_HEAD_TILE_SIZE {q_head_tile_size}
+#define Q_HEAD_TILE_SIZE {max_q_heads}
 #define NUM_Q_HEAD_TILES_PER_KV_HEAD {num_q_head_tiles_per_kv_head}
 #define NUM_TOKENS {num_tokens}
 #define PAGE_BYTES {page_bytes}
-#define KV_TOKEN_TILE_SIZE {kv_token_tile_size}
+#define KV_TOKEN_TILE_SIZE {kv_tokens_per_iteration}
 #define TOTAL_KV_SPLITS {num_total_kv_splits}
-#define NUM_THREADS_PER_THREADBLOCK {num_threads_per_threadblock}
+#define NUM_THREADS_PER_THREADBLOCK {required_threads}
 #define NUM_GQA_LAYERS {num_gqa_layers}
 #define NUM_BLOCKS {num_blocks}
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
@@ -583,7 +578,7 @@ kernel void gqa_split_kv_single_q_map(
     device const KV_T* kv_pages [[buffer(1)]],
     device const uint* req_slots [[buffer(2)]],
     device const uint* page_ids [[buffer(3)]],
-    device const uint* kv_splits [[buffer(4)]],
+    device const uint* sdpa_map_task_templates [[buffer(4)]],
     device float* partial_exp_sums [[buffer(5)]],
     device float* partial_max_logits [[buffer(6)]],
     device T* partial_output [[buffer(7)]],
@@ -599,15 +594,15 @@ kernel void gqa_split_kv_single_q_map(
         head_dim = config.head_dim,
         scale = config.scale,
         q_heads_per_kv_head = config.q_heads_per_kv_head(),
-        q_head_tile_size = config.q_head_tile_size(),
+        max_q_heads = config.max_q_heads,
         num_q_head_tiles_per_kv_head = config.num_q_head_tiles_per_kv_head(),
         num_kv_heads = config.num_kv_heads,
         num_tokens = config.num_tokens_per_page(),
         num_q_heads = config.num_q_heads,
         page_bytes = config.page_bytes,
-        kv_token_tile_size = config.kv_token_tile_size,
+        kv_tokens_per_iteration = config.kv_tokens_per_iteration,
         num_total_kv_splits = shape.num_total_sdpa_map_task_templates,
-        num_threads_per_threadblock = config.num_threads_per_threadblock,
+        required_threads = config.required_threads,
         num_gqa_layers = config.page_table_layout.num_gqa_layers,
         num_blocks = config.page_table_layout.num_blocks,
         num_page_ids_per_block = config.page_table_layout.num_page_ids_per_block,
@@ -671,10 +666,7 @@ impl Operator for GQASplitKVSingleQMapInvocation<'_> {
             shape.num_total_sdpa_map_task_templates,
             "GQA SplitKV SingleQ active KV split count",
         );
-        recorder.dispatch_1d(
-            self.config.map_threads(shape),
-            self.config.num_threads_per_threadblock as usize,
-        );
+        recorder.dispatch_1d(self.config.map_threads(shape), self.config.required_threads as usize);
     }
 }
 

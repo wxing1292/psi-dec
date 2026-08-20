@@ -169,8 +169,8 @@ impl Qwen3MainGQAState {
             "qwen3 Main cache page IDs must fit u32"
         );
         page_table_layout.validate();
-        let backend = Rc::new(UngatedGQA::new(device, core.clone(), metal));
-        let scratch = Rc::new(backend.new_scratch(max_tokens));
+        let backend = Rc::new(UngatedGQA::new(device, core.clone(), metal, max_tokens));
+        let scratch = Rc::new(backend.new_scratch());
         Self {
             backend: Some(backend),
             scratch: Some(scratch),
@@ -282,8 +282,8 @@ impl Qwen3MainGQAState {
                 && self.metadata.is_none(),
             "qwen3 Main GQA state resources are already loaded"
         );
-        let backend = Rc::new(UngatedGQA::new(device, self.core.clone(), self.metal));
-        let scratch = Rc::new(backend.new_scratch(self.max_tokens));
+        let backend = Rc::new(UngatedGQA::new(device, self.core.clone(), self.metal, self.max_tokens));
+        let scratch = Rc::new(backend.new_scratch());
         self.backend = Some(backend);
         self.scratch = Some(scratch);
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));

@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use inference_backend_metal::components::GQASplitKVVariant;
+use inference_backend_metal::components::GQASDPAExecutionSpecialization;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -26,7 +26,7 @@ pub struct DSparkGQAMetadataBuffers {
     cu_sdpa_partial_outputs: Buffer,
     block_sdpa_map_task_template_indices: Buffer,
     replay_shape: Cell<Option<GQAReplayShape>>,
-    split_kv_variant: Cell<Option<GQASplitKVVariant>>,
+    sdpa_execution: Cell<Option<GQASDPAExecutionSpecialization>>,
 }
 
 impl DSparkGQAMetadataBuffers {
@@ -55,14 +55,16 @@ impl DSparkGQAMetadataBuffers {
                 Dtype::Uint32,
             ),
             replay_shape: Cell::new(None),
-            split_kv_variant: Cell::new(None),
+            sdpa_execution: Cell::new(None),
         }
     }
 
-    pub fn update(&self, block: &DSparkBlockMetadata, split_kv_variant: GQASplitKVVariant) -> GQAReplayShape {
-        let GQASplitKVVariant::SingleQ { kv_token_tile_size, .. } = split_kv_variant else {
-            panic!("DSpark history attention requires the SplitKV SingleQ variant")
-        };
+    pub fn update(&self, block: &DSparkBlockMetadata, execution: GQASDPAExecutionSpecialization) -> GQAReplayShape {
+        let map = execution.map.thread_block;
+        assert_eq!(
+            map.max_q_tokens, 1,
+            "DSpark history attention requires a single-Q SDPA specialization"
+        );
         assert!(
             block.num_requests() <= self.capacity.block.max_requests,
             "DSpark GQA request count exceeds capacity"
@@ -79,7 +81,11 @@ impl DSparkGQAMetadataBuffers {
         self.req_slots.write_typed(0, block.req_slots());
         self.flat_token_indices.write_typed(0, block.flat_token_indices());
 
-        let metadata = build_metal_metadata(block, kv_token_tile_size, self.capacity.max_sdpa_partial_outputs);
+        let metadata = build_metal_metadata(
+            block,
+            map.kv_tokens_per_iteration,
+            self.capacity.max_sdpa_partial_outputs,
+        );
         self.sdpa_map_task_templates
             .write_typed(0, &metadata.sdpa_map_task_templates);
         self.cu_sdpa_partial_outputs
@@ -87,7 +93,7 @@ impl DSparkGQAMetadataBuffers {
         self.block_sdpa_map_task_template_indices
             .write_typed(0, &metadata.block_sdpa_map_task_template_indices);
         self.replay_shape.set(Some(metadata.replay_shape));
-        self.split_kv_variant.set(Some(split_kv_variant));
+        self.sdpa_execution.set(Some(execution));
         metadata.replay_shape
     }
 
@@ -117,8 +123,8 @@ impl DSparkGQAMetadataBuffers {
             .expect("DSpark GQA metadata must be updated before recording")
     }
 
-    pub fn split_kv_variant(&self) -> GQASplitKVVariant {
-        self.split_kv_variant
+    pub fn sdpa_execution(&self) -> GQASDPAExecutionSpecialization {
+        self.sdpa_execution
             .get()
             .expect("DSpark GQA metadata must be updated before recording")
     }
@@ -126,10 +132,13 @@ impl DSparkGQAMetadataBuffers {
 
 fn build_metal_metadata(
     block: &DSparkBlockMetadata,
-    kv_token_tile_size: u32,
+    kv_tokens_per_iteration: u32,
     max_sdpa_map_task_templates: usize,
 ) -> DSparkGQAMetadata {
-    assert!(kv_token_tile_size > 0, "DSpark GQA KV-token tile size must be positive");
+    assert!(
+        kv_tokens_per_iteration > 0,
+        "DSpark GQA KV-token iteration size must be positive"
+    );
     let num_tokens = block.num_tokens();
     assert!(
         max_sdpa_map_task_templates
@@ -142,25 +151,25 @@ fn build_metal_metadata(
         "DSpark GQA TaskTemplate capacity must be a power of two"
     );
 
-    let num_kv_token_tiles = block
+    let num_kv_iterations = block
         .history_token_begins()
         .iter()
         .zip(block.history_token_ends())
         .map(|(&begin, &end)| {
             assert!(begin < end, "DSpark GQA history range must not be empty");
-            (end - begin).div_ceil(kv_token_tile_size) as usize
+            (end - begin).div_ceil(kv_tokens_per_iteration) as usize
         })
         .collect::<Vec<_>>();
     let max_history_task_templates = max_sdpa_map_task_templates - num_tokens;
     let mut num_history_task_templates = vec![1usize; num_tokens];
     let mut total_history_task_templates = num_tokens;
     while total_history_task_templates < max_history_task_templates {
-        let candidate = num_kv_token_tiles
+        let candidate = num_kv_iterations
             .iter()
             .zip(&num_history_task_templates)
             .enumerate()
-            .filter(|&(_, (&tiles, &task_templates))| task_templates < tiles)
-            .max_by_key(|&(_, (&tiles, &task_templates))| tiles.div_ceil(task_templates))
+            .filter(|&(_, (&iterations, &task_templates))| task_templates < iterations)
+            .max_by_key(|&(_, (&iterations, &task_templates))| iterations.div_ceil(task_templates))
             .map(|(token_index, _)| token_index);
         let Some(token_index) = candidate else {
             break;
@@ -176,24 +185,24 @@ fn build_metal_metadata(
     for q_token_index in 0..num_tokens {
         let history_begin = block.history_token_begins()[q_token_index];
         let history_end = block.history_token_ends()[q_token_index];
-        let num_tiles = num_kv_token_tiles[q_token_index];
+        let num_iterations = num_kv_iterations[q_token_index];
         let num_tasks = num_history_task_templates[q_token_index];
         for task_index in 0..num_tasks {
-            let tile_begin = num_tiles * task_index / num_tasks;
-            let tile_end = num_tiles * (task_index + 1) / num_tasks;
+            let iteration_begin = num_iterations * task_index / num_tasks;
+            let iteration_end = num_iterations * (task_index + 1) / num_tasks;
             let kv_token_begin = history_begin
                 .checked_add(
-                    (tile_begin as u64 * kv_token_tile_size as u64)
+                    (iteration_begin as u64 * kv_tokens_per_iteration as u64)
                         .try_into()
-                        .expect("DSpark GQA history tile begin must fit u32"),
+                        .expect("DSpark GQA history iteration begin must fit u32"),
                 )
                 .expect("DSpark GQA history token begin must fit u32");
             let kv_token_end = history_end.min(
                 history_begin
                     .checked_add(
-                        (tile_end as u64 * kv_token_tile_size as u64)
+                        (iteration_end as u64 * kv_tokens_per_iteration as u64)
                             .try_into()
-                            .expect("DSpark GQA history tile end must fit u32"),
+                            .expect("DSpark GQA history iteration end must fit u32"),
                     )
                     .expect("DSpark GQA history token end must fit u32"),
             );
@@ -254,44 +263,50 @@ fn build_metal_metadata(
 
 #[cfg(test)]
 mod tests {
+    use inference_backend_metal::components::GQASDPAConfig;
+    use inference_backend_metal::components::GQASDPAExecutionSpecialization;
+    use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::DSparkBlockCapacity;
 
     use super::*;
 
     #[test]
-    fn test_metadata_retains_backend_selected_split_kv_variant() {
+    fn test_metadata_retains_backend_selected_sdpa_execution() {
         let device = Device::system_default();
         let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(2, 3));
         let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
         let block = DSparkBlockMetadata::new(&[3, 7], &[11, 20], 3);
-        let split_kv_variant = GQASplitKVVariant::SingleQ {
-            kv_token_tile_size: 4,
-            num_threads_per_threadblock: 32,
-            q_head_tile_size: 2,
+        let config = GQASDPAConfig {
+            io_dtype: Dtype::Bfloat16,
+            num_q_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 128,
+            tokens_per_page: 8,
         };
+        let execution = GQASDPAExecutionSpecialization::single_q(config, 4, 32, 2);
 
-        let shape = buffers.update(&block, split_kv_variant);
+        let shape = buffers.update(&block, execution);
 
         assert_eq!(shape.num_tokens, 6);
-        assert_eq!(split_kv_variant, buffers.split_kv_variant());
+        assert_eq!(execution, buffers.sdpa_execution());
     }
 
     #[test]
-    #[should_panic(expected = "SplitKV SingleQ variant")]
+    #[should_panic(expected = "single-Q SDPA specialization")]
     fn test_metadata_rejects_tiled_q_partial_abi() {
         let device = Device::system_default();
         let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(1, 3));
         let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
         let block = DSparkBlockMetadata::new(&[3], &[11], 3);
 
-        buffers.update(
-            &block,
-            GQASplitKVVariant::TiledQ {
-                q_token_tile_size: 8,
-                kv_token_tile_size: 16,
-                q_head_tile_size: 2,
-            },
-        );
+        let config = GQASDPAConfig {
+            io_dtype: Dtype::Bfloat16,
+            num_q_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 128,
+            tokens_per_page: 8,
+        };
+        buffers.update(&block, GQASDPAExecutionSpecialization::tiled_q(config, 8, 16, 2));
     }
 
     #[test]

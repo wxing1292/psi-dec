@@ -30,7 +30,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let req_slots = Buffer::new_zeroed_elements(&device, shape.num_total_tokens as usize, Dtype::Uint32);
     let page_ids = Buffer::from_slice(&device, &[0_u32]);
     let flat_token_indices = Buffer::new_zeroed_elements(&device, shape.num_total_tokens as usize, Dtype::Uint32);
-    let q_token_tiles = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
+    let q_token_ranges = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
     let sdpa_map_task_templates = Buffer::new_zeroed_elements(&device, 3, Dtype::Uint32);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1]);
     let partial_output = Buffer::new_zeroed(&device, config.partial_output_bytes(shape));
@@ -46,7 +46,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
             req_slots: &req_slots,
             page_ids: &page_ids,
             flat_token_indices: &flat_token_indices,
-            q_token_tiles: &q_token_tiles,
+            q_token_ranges: &q_token_ranges,
             sdpa_map_task_templates: &sdpa_map_task_templates,
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
@@ -62,7 +62,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
             partial_max_logits: &partial_max_logits,
-            q_token_tiles: &q_token_tiles,
+            q_token_ranges: &q_token_ranges,
             cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
             output: &output,
         },
@@ -71,8 +71,8 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let replay = builder.build();
     let q_values_per_token = config.num_q_heads as usize * config.head_dim as usize;
     let kv_values_per_token = config.num_kv_heads as usize * config.head_dim as usize;
-    let partial_values_per_head = config.q_token_tile_size as usize * config.head_dim as usize;
-    let partial_stats_per_head = config.q_token_tile_size as usize;
+    let partial_values_per_head = config.max_q_tokens as usize * config.head_dim as usize;
+    let partial_stats_per_head = config.max_q_tokens as usize;
     let mut full_partial_output = None;
     let mut full_partial_exp_sums = None;
     let mut full_partial_max_logits = None;
@@ -92,7 +92,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
             0,
             &active_u32_values(&(0..shape.num_total_tokens).collect::<Vec<_>>(), num_active_tokens),
         );
-        q_token_tiles.write_typed(0, &[0_u32, num_active_tokens as u32]);
+        q_token_ranges.write_typed(0, &[0_u32, num_active_tokens as u32]);
         sdpa_map_task_templates.write_typed(0, &[0_u32, 0, num_active_tokens as u32]);
         if case_index == 0 {
             partial_output.write_typed(0, &vec![BF16_CANARY; config.partial_output_bytes(shape) as usize / 2]);
@@ -223,9 +223,9 @@ fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (GQASplitKVTiledQC
             num_q_heads: 5,
             num_kv_heads: 1,
             head_dim,
-            q_head_tile_size: 5,
-            q_token_tile_size: 8,
-            kv_token_tile_size: 16,
+            max_q_heads: 5,
+            max_q_tokens: 8,
+            kv_tokens_per_iteration: 16,
             scale: (head_dim as f32).sqrt().recip(),
             page_bytes: 2 * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size() as u32,
             dtype: Dtype::Bfloat16,

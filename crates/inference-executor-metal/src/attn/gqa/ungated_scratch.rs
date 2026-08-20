@@ -1,10 +1,10 @@
-use inference_backend_metal::components::GQASplitKV;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::UngatedGQACore;
 
 use crate::attn::gqa::backend::GQAMetalConfig;
+use crate::attn::gqa::sdpa::GQASDPAPlanner;
 
 fn assert_u32_element_index_domain(num_elements: usize, name: &str) {
     assert!(num_elements > 0, "{name} must contain elements");
@@ -42,21 +42,12 @@ pub struct UngatedGQAScratchBindings<'a> {
 }
 
 impl UngatedGQAScratch {
-    pub fn new(
-        device: &Device,
-        core: &UngatedGQACore,
-        config: GQAMetalConfig,
-        split_kv: GQASplitKV,
-        max_tokens: usize,
-    ) -> Self {
+    pub fn new(device: &Device, core: &UngatedGQACore, config: GQAMetalConfig, sdpa_planner: &GQASDPAPlanner) -> Self {
         core.validate();
         config.validate();
-        assert!(max_tokens > 0);
-        let max_tokens_per_partial_output = split_kv.max_q_tokens_per_partial_output() as usize;
-        let num_sdpa_partial_output_tokens = max_tokens
-            .checked_mul(max_tokens_per_partial_output)
-            .expect("ungated GQA scratch partial-token capacity must fit usize");
-        let num_sdpa_partial_output_stats = num_sdpa_partial_output_tokens
+        let max_tokens = sdpa_planner.limits().max_map_task_templates as usize;
+        let num_sdpa_partial_state_groups = sdpa_planner.limits().partial_state_group_capacity;
+        let num_sdpa_partial_states = num_sdpa_partial_state_groups
             .checked_mul(core.num_q_heads)
             .expect("ungated GQA scratch partial-output statistic count must fit usize");
         let tensor_elements = |dim: usize| {
@@ -67,11 +58,8 @@ impl UngatedGQAScratch {
                 .expect("ungated GQA scratch tensor element count must fit the shader u32 count domain");
             elements
         };
-        assert_u32_element_index_domain(
-            num_sdpa_partial_output_stats,
-            "ungated GQA SDPA partial-output statistics",
-        );
-        let num_sdpa_partial_output_values = num_sdpa_partial_output_stats
+        assert_u32_element_index_domain(num_sdpa_partial_states, "ungated GQA SDPA partial-output statistics");
+        let num_sdpa_partial_output_values = num_sdpa_partial_states
             .checked_mul(core.head_dim)
             .expect("ungated GQA SDPA partial output element count must fit usize");
         assert_u32_element_index_domain(num_sdpa_partial_output_values, "ungated GQA SDPA partial output");
@@ -82,8 +70,8 @@ impl UngatedGQAScratch {
             v: Buffer::new_zeroed_elements(device, tensor_elements(core.v_dim()), config.io_dtype),
             q_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
             k_norm_rope: Buffer::new_zeroed_elements(device, tensor_elements(core.k_dim()), config.io_dtype),
-            sdpa_partial_exp_sums: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_stats, Dtype::Float32),
-            sdpa_partial_max_logits: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_stats, Dtype::Float32),
+            sdpa_partial_exp_sums: Buffer::new_zeroed_elements(device, num_sdpa_partial_states, Dtype::Float32),
+            sdpa_partial_max_logits: Buffer::new_zeroed_elements(device, num_sdpa_partial_states, Dtype::Float32),
             sdpa_partial_output: Buffer::new_zeroed_elements(device, num_sdpa_partial_output_values, config.io_dtype),
             attention_output: Buffer::new_zeroed_elements(device, tensor_elements(core.q_dim()), config.io_dtype),
         }

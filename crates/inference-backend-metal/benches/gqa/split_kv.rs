@@ -85,9 +85,9 @@ impl GQAFixture {
             scale: 1.0 / (GQA_HEAD_DIM as f32).sqrt(),
             page_bytes: 2 * GQA_NUM_KV_HEADS * GQA_TOKENS_PER_PAGE * GQA_HEAD_DIM * Dtype::Bfloat16.item_size() as u32,
             page_table_layout,
-            kv_token_tile_size: GQA_KV_TOKEN_TILE_SIZE,
-            num_threads_per_threadblock: GQA_NUM_THREADS_PER_THREADBLOCK,
-            q_head_tile_size: (GQA_NUM_Q_HEADS / GQA_NUM_KV_HEADS).min(GQA_Q_HEAD_TILE_SIZE_CAP),
+            kv_tokens_per_iteration: GQA_KV_TOKEN_TILE_SIZE,
+            required_threads: GQA_NUM_THREADS_PER_THREADBLOCK,
+            max_q_heads: (GQA_NUM_Q_HEADS / GQA_NUM_KV_HEADS).min(GQA_Q_HEAD_TILE_SIZE_CAP),
             dtype: Dtype::Bfloat16,
         };
         let shape = GQASplitKVSingleQShape {

@@ -7,12 +7,12 @@ use inference_backend_metal::components::GQAQKVSplitBuffers;
 use inference_backend_metal::components::GQAQKVSplitConfig;
 use inference_backend_metal::components::GQAQKVSplitKernel;
 use inference_backend_metal::components::GQAQKVSplitShape;
+use inference_backend_metal::components::GQASDPAExecutionSpecialization;
 use inference_backend_metal::components::GQASplitKVSingleQConfig;
 use inference_backend_metal::components::GQASplitKVSingleQKernels;
 use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
 use inference_backend_metal::components::GQASplitKVSingleQReduceBuffers;
 use inference_backend_metal::components::GQASplitKVSingleQShape;
-use inference_backend_metal::components::GQASplitKVVariant;
 use inference_backend_metal::components::RMSNormRopeBuffers;
 use inference_backend_metal::components::RMSNormRopeConfig;
 use inference_backend_metal::components::RMSNormRopeKernel;
@@ -98,14 +98,14 @@ impl UngatedDSparkGQA {
         }
     }
 
-    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, GQASplitKVVariant) {
+    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, GQASDPAExecutionSpecialization) {
         input.page_table_layout.validate();
         assert!(
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
             "DSpark GQA layer index exceeds the page table"
         );
         let shape = input.metadata.replay_shape();
-        let split_kv_variant = input.metadata.split_kv_variant();
+        let sdpa_execution = input.metadata.sdpa_execution();
         shape.validate();
         assert_eq!(
             shape.num_q_token_tiles, shape.num_tokens,
@@ -124,23 +124,21 @@ impl UngatedDSparkGQA {
             input.scratch.capacity.block.block_size, self.core.block_size,
             "DSpark GQA scratch block size must match the backend"
         );
-        (shape, split_kv_variant)
+        assert_eq!(
+            sdpa_execution.map.thread_block.max_q_tokens, 1,
+            "DSpark history attention requires a single-Q SDPA specialization"
+        );
+        (shape, sdpa_execution)
     }
 
     fn split_kv_single_q_config(
         &self,
-        split_kv_variant: GQASplitKVVariant,
+        sdpa_execution: GQASDPAExecutionSpecialization,
         page_table_layout: GQAPageTableLayout,
     ) -> GQASplitKVSingleQConfig {
         let attention = &self.core.attention;
-        let GQASplitKVVariant::SingleQ {
-            kv_token_tile_size,
-            num_threads_per_threadblock,
-            q_head_tile_size,
-        } = split_kv_variant
-        else {
-            panic!("DSpark history attention requires the SplitKV SingleQ variant")
-        };
+        let map = sdpa_execution.map.thread_block;
+        assert_eq!(map.max_q_tokens, 1);
         GQASplitKVSingleQConfig {
             num_q_heads: attention
                 .num_q_heads
@@ -154,9 +152,9 @@ impl UngatedDSparkGQA {
             scale: attention.scale,
             page_bytes: self.metal.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            kv_token_tile_size,
-            num_threads_per_threadblock,
-            q_head_tile_size,
+            kv_tokens_per_iteration: map.kv_tokens_per_iteration,
+            required_threads: map.required_threads,
+            max_q_heads: map.max_q_heads,
             dtype: self.metal.io_dtype,
         }
     }
@@ -170,7 +168,7 @@ impl ReplayLayer for UngatedDSparkGQA {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let (shape, split_kv_variant) = self.validate_input(&input);
+        let (shape, sdpa_execution) = self.validate_input(&input);
         let attention = &self.core.attention;
         let scratch = input.scratch;
         recorder.record_with_barrier_before(ReplayOp::opaque(
@@ -225,7 +223,7 @@ impl ReplayLayer for UngatedDSparkGQA {
             },
         )));
 
-        let sdpa_config = self.split_kv_single_q_config(split_kv_variant, input.page_table_layout);
+        let sdpa_config = self.split_kv_single_q_config(sdpa_execution, input.page_table_layout);
         let sdpa_shape = GQASplitKVSingleQShape {
             num_total_tokens: shape.num_tokens,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
