@@ -878,7 +878,7 @@ fn test_candidate_state_prefixes() {
     let a_log = vec![-0.25_f32; fixture_config().num_v_heads as usize];
     let dt_bias = vec![0.125_f32; fixture_config().num_v_heads as usize];
 
-    let actual = run_gdn_forward_candidate_state(
+    let actual = run_gdn_core_with_candidate_state_update(
         shape,
         &qkv,
         &conv_state,
@@ -1114,7 +1114,7 @@ struct GDNCoreOutputs {
     recurrent_state: Vec<f32>,
 }
 
-struct GDNForwardCandidateStateOutputs {
+struct GDNCoreWithCandidateStateOutputs {
     full: GDNCoreOutputs,
     next_conv_state_arena: Vec<f32>,
     recurrent_state_arena: Vec<f32>,
@@ -1221,7 +1221,7 @@ fn run_gdn_core(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_gdn_forward_candidate_state(
+fn run_gdn_core_with_candidate_state_update(
     shape: GDNComputeShape,
     qkv_values: &[f32],
     conv_state_values: &[f32],
@@ -1237,7 +1237,7 @@ fn run_gdn_forward_candidate_state(
     src_state_slot_values: &[u32],
     candidate_dst_slot_id_values: &[u32],
     num_state_slots: usize,
-) -> GDNForwardCandidateStateOutputs {
+) -> GDNCoreWithCandidateStateOutputs {
     const STATE_PREFIX_VALUES: usize = 7;
     let device = Device::system_default();
     let stream = Stream::new(&device);
@@ -1307,7 +1307,7 @@ fn run_gdn_forward_candidate_state(
     let replay = builder.build();
     stream.submit_replay(&replay).wait();
 
-    GDNForwardCandidateStateOutputs {
+    GDNCoreWithCandidateStateOutputs {
         full: GDNCoreOutputs {
             conv_qkv: conv_qkv.read_typed::<f32>(0, fixture_config().num_qkv_values(shape)),
             next_conv_state: next_conv_state.read_typed::<f32>(

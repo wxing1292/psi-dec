@@ -18,8 +18,8 @@ use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::gqa::reference::GQAReferenceInput;
 use inference_executor_core::attn::gqa::reference::projected_gqa_reference;
 
-const Q_TOKEN_TILE_SIZE: u32 = 8;
-const KV_TOKEN_TILE_SIZE: u32 = 16;
+const MAX_Q_TOKENS: u32 = 8;
+const KV_TOKENS_PER_ITERATION: u32 = 16;
 const NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_q_tiles");
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_tokens");
 const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.active_kv_splits");
@@ -40,7 +40,7 @@ fn test_ragged() {
 }
 
 #[test]
-fn test_multiple_tiles() {
+fn test_multiple_q_token_ranges() {
     run_case(&[32, 8], 8, 256, 16, 17);
 }
 
@@ -50,7 +50,7 @@ fn test_qwen3_profile() {
 }
 
 #[test]
-fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
+fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let num_q_heads = 4usize;
@@ -65,8 +65,8 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
         num_kv_heads: num_kv_heads as u32,
         head_dim: head_dim as u32,
         max_q_heads: num_q_heads as u32,
-        max_q_tokens: Q_TOKEN_TILE_SIZE,
-        kv_tokens_per_iteration: KV_TOKEN_TILE_SIZE,
+        max_q_tokens: MAX_Q_TOKENS,
+        kv_tokens_per_iteration: KV_TOKENS_PER_ITERATION,
         scale: (head_dim as f32).sqrt().recip(),
         page_bytes: page_bytes as u32,
         dtype: Dtype::Bfloat16,
@@ -122,16 +122,22 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
     let req_slots = Buffer::from_slice(&device, &[0_u32; 16]);
     let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
     let flat_token_indices = Buffer::from_slice(&device, &(0_u32..16).collect::<Vec<_>>());
-    let q_token_tiles = Buffer::from_slice(&device, &[0_u32, 5, u32::MAX, u32::MAX]);
+    let q_token_ranges = Buffer::from_slice(&device, &[0_u32, 5, u32::MAX, u32::MAX]);
     let task_templates = Buffer::from_slice(&device, &[0_u32, 0, 5, u32::MAX, u32::MAX, u32::MAX]);
     let cu_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1, u32::MAX]);
-    let num_partial_tokens = 2 * Q_TOKEN_TILE_SIZE as usize;
+    let num_reserved_partial_state_groups = 2 * MAX_Q_TOKENS as usize;
     let partial_output = Buffer::new_zeroed(
         &device,
-        num_partial_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
+        num_reserved_partial_state_groups * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
     );
-    let partial_exp_sums = Buffer::new_zeroed(&device, num_partial_tokens * num_q_heads * size_of::<f32>());
-    let partial_max_logits = Buffer::new_zeroed(&device, num_partial_tokens * num_q_heads * size_of::<f32>());
+    let partial_exp_sums = Buffer::new_zeroed(
+        &device,
+        num_reserved_partial_state_groups * num_q_heads * size_of::<f32>(),
+    );
+    let partial_max_logits = Buffer::new_zeroed(
+        &device,
+        num_reserved_partial_state_groups * num_q_heads * size_of::<f32>(),
+    );
     let sentinel = bf16::from_f32(-123.0).to_bits();
     let output = Buffer::from_slice(&device, &vec![sentinel; num_total_tokens * num_q_heads * head_dim]);
     let kernels = GQASplitKVTiledQKernels::new(&device, config, shape);
@@ -143,7 +149,7 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
             req_slots: &req_slots,
             page_ids: &page_ids,
             flat_token_indices: &flat_token_indices,
-            q_token_ranges: &q_token_tiles,
+            q_token_ranges: &q_token_ranges,
             sdpa_map_task_templates: &task_templates,
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
@@ -159,7 +165,7 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
             partial_max_logits: &partial_max_logits,
-            q_token_ranges: &q_token_tiles,
+            q_token_ranges: &q_token_ranges,
             cu_sdpa_partial_outputs: &cu_partial_outputs,
             output: &output,
         },
@@ -169,10 +175,10 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
     assert_eq!(replay.stats().parameter_count, 3);
 
     for num_active_tokens in [5_usize, 16] {
-        let num_active_tiles = num_active_tokens.div_ceil(Q_TOKEN_TILE_SIZE as usize);
-        q_token_tiles.write_typed(
+        let num_active_q_token_ranges = num_active_tokens.div_ceil(MAX_Q_TOKENS as usize);
+        q_token_ranges.write_typed(
             0,
-            if num_active_tiles == 1 {
+            if num_active_q_token_ranges == 1 {
                 &[0_u32, 5, u32::MAX, u32::MAX]
             } else {
                 &[0_u32, 8, 8, 16]
@@ -180,7 +186,7 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
         );
         task_templates.write_typed(
             0,
-            if num_active_tiles == 1 {
+            if num_active_q_token_ranges == 1 {
                 &[0_u32, 0, 5, u32::MAX, u32::MAX, u32::MAX]
             } else {
                 &[0_u32, 0, 8, 1, 0, 16]
@@ -188,7 +194,7 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
         );
         cu_partial_outputs.write_typed(
             0,
-            if num_active_tiles == 1 {
+            if num_active_q_token_ranges == 1 {
                 &[0_u32, 1, u32::MAX]
             } else {
                 &[0_u32, 1, 2]
@@ -200,8 +206,8 @@ fn test_bucketed_replay_ignores_poisoned_q_tile_tail() {
                 &replay,
                 &ReplayArguments::new()
                     .with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32)
-                    .with_u32(NUM_ACTIVE_Q_TOKEN_TILES, num_active_tiles as u32)
-                    .with_u32(NUM_ACTIVE_KV_SPLITS, num_active_tiles as u32),
+                    .with_u32(NUM_ACTIVE_Q_TOKEN_TILES, num_active_q_token_ranges as u32)
+                    .with_u32(NUM_ACTIVE_KV_SPLITS, num_active_q_token_ranges as u32),
             )
             .wait();
 
@@ -286,7 +292,7 @@ fn run_case(
 
     let mut req_slot_values = Vec::new();
     let mut flat_token_index_values = Vec::new();
-    let mut q_token_tile_values = Vec::new();
+    let mut q_token_range_values = Vec::new();
     let mut sdpa_map_task_template_values = Vec::new();
     let mut cu_sdpa_partial_output_values = vec![0u32];
     let mut cu_tokens = vec![0u32];
@@ -297,15 +303,15 @@ fn run_case(
         let flat_token_end = flat_token_start + num_req_tokens as u32;
         let mut q_token_begin = flat_token_start;
         while q_token_begin < flat_token_end {
-            let q_token_end = (q_token_begin + Q_TOKEN_TILE_SIZE).min(flat_token_end);
-            q_token_tile_values.extend_from_slice(&[q_token_begin, q_token_end]);
-            let q_token_tile_index = q_token_tile_values.len() / 2 - 1;
+            let q_token_end = (q_token_begin + MAX_Q_TOKENS).min(flat_token_end);
+            q_token_range_values.extend_from_slice(&[q_token_begin, q_token_end]);
+            let q_token_range_index = q_token_range_values.len() / 2 - 1;
             let context_len = start_token_index as u32 + q_token_end - flat_token_start;
             let mut kv_token_begin = 0;
             while kv_token_begin < context_len {
-                let kv_token_end = (kv_token_begin + KV_TOKEN_TILE_SIZE).min(context_len);
+                let kv_token_end = (kv_token_begin + KV_TOKENS_PER_ITERATION).min(context_len);
                 sdpa_map_task_template_values.extend_from_slice(&[
-                    q_token_tile_index as u32,
+                    q_token_range_index as u32,
                     kv_token_begin,
                     kv_token_end,
                 ]);
@@ -317,7 +323,7 @@ fn run_case(
         cu_tokens.push(flat_token_end);
         flat_token_start = flat_token_end;
     }
-    let num_q_token_tiles = q_token_tile_values.len() / 2;
+    let num_q_token_ranges = q_token_range_values.len() / 2;
     let num_sdpa_map_task_templates = sdpa_map_task_template_values.len() / 3;
     let num_total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
     sdpa_map_task_template_values.resize(num_total_sdpa_map_task_templates * 3, u32::MAX);
@@ -326,8 +332,8 @@ fn run_case(
         num_kv_heads: num_kv_heads.try_into().unwrap(),
         head_dim: head_dim.try_into().unwrap(),
         max_q_heads: num_q_heads.try_into().unwrap(),
-        max_q_tokens: Q_TOKEN_TILE_SIZE,
-        kv_tokens_per_iteration: KV_TOKEN_TILE_SIZE,
+        max_q_tokens: MAX_Q_TOKENS,
+        kv_tokens_per_iteration: KV_TOKENS_PER_ITERATION,
         scale: (head_dim as f32).sqrt().recip(),
         page_bytes: page_bytes.try_into().unwrap(),
         dtype: Dtype::Bfloat16,
@@ -340,7 +346,7 @@ fn run_case(
     };
     let shape = GQASplitKVTiledQShape {
         num_total_tokens: num_tokens.try_into().unwrap(),
-        num_total_q_token_tiles: num_q_token_tiles.try_into().unwrap(),
+        num_total_q_token_tiles: num_q_token_ranges.try_into().unwrap(),
         num_total_sdpa_map_task_templates: num_total_sdpa_map_task_templates.try_into().unwrap(),
     };
 
@@ -405,17 +411,22 @@ fn run_case(
         &(0..(num_tokens_per_req.len() * num_blocks) as u32).collect::<Vec<_>>(),
     );
     let flat_token_indices = Buffer::from_slice(&device, &flat_token_index_values);
-    let q_token_tiles = Buffer::from_slice(&device, &q_token_tile_values);
+    let q_token_ranges = Buffer::from_slice(&device, &q_token_range_values);
     let sdpa_map_task_templates = Buffer::from_slice(&device, &sdpa_map_task_template_values);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &cu_sdpa_partial_output_values);
-    let num_sdpa_partial_output_tokens = num_total_sdpa_map_task_templates * Q_TOKEN_TILE_SIZE as usize;
+    let num_reserved_partial_state_groups = num_total_sdpa_map_task_templates * MAX_Q_TOKENS as usize;
     let partial_output = Buffer::new_zeroed(
         &device,
-        num_sdpa_partial_output_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
+        num_reserved_partial_state_groups * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
     );
-    let partial_exp_sums = Buffer::new_zeroed(&device, num_sdpa_partial_output_tokens * num_q_heads * size_of::<f32>());
-    let partial_max_logits =
-        Buffer::new_zeroed(&device, num_sdpa_partial_output_tokens * num_q_heads * size_of::<f32>());
+    let partial_exp_sums = Buffer::new_zeroed(
+        &device,
+        num_reserved_partial_state_groups * num_q_heads * size_of::<f32>(),
+    );
+    let partial_max_logits = Buffer::new_zeroed(
+        &device,
+        num_reserved_partial_state_groups * num_q_heads * size_of::<f32>(),
+    );
     let output = Buffer::new_zeroed(
         &device,
         num_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
@@ -429,7 +440,7 @@ fn run_case(
             req_slots: &req_slots,
             page_ids: &page_ids,
             flat_token_indices: &flat_token_indices,
-            q_token_ranges: &q_token_tiles,
+            q_token_ranges: &q_token_ranges,
             sdpa_map_task_templates: &sdpa_map_task_templates,
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
@@ -441,7 +452,7 @@ fn run_case(
         partial_output: &partial_output,
         partial_exp_sums: &partial_exp_sums,
         partial_max_logits: &partial_max_logits,
-        q_token_ranges: &q_token_tiles,
+        q_token_ranges: &q_token_ranges,
         cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
         output: &output,
     }));
