@@ -17,7 +17,7 @@
 //! base_logits[i] + correction                 confidence projection + sigmoid
 //!          |                                             |
 //!          v                                             v
-//! tile-local Top-K                              spec_confidences[i]
+//! vocabulary-partition Top-K                    spec_confidences[i]
 //!          |
 //!          v
 //! Top-K merge and sampling
@@ -36,7 +36,7 @@ use inference_backend_metal::components::DSparkMarkovTopKMapBuffers;
 use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
 use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
 use inference_backend_metal::components::DSparkMarkovTopKMapShape;
-use inference_backend_metal::components::TopKMergeKernels;
+use inference_backend_metal::components::TopKReduceKernels;
 use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
 use inference_backend_metal::components::TopKSampleShape;
 use inference_backend_metal::metal::Buffer;
@@ -125,10 +125,10 @@ pub struct DSparkMarkovSampling {
     bucket_policy: ReplayBucketPolicy,
     confidence_output: Buffer,
     top_k_map: DSparkMarkovTopKMapKernel,
-    sample_reduce: TopKMergeKernels,
+    top_k_reduce: TopKReduceKernels,
     anchor_token_ids: Buffer,
-    tile_token_ids: Buffer,
-    tile_logits: Buffer,
+    partial_token_ids: Buffer,
+    partial_logits: Buffer,
     step_params: Vec<TopKSamplingRuntimeParams>,
     step_outputs: Vec<TopKSamplingOutputBuffers>,
     step_distribution_indices: Vec<Buffer>,
@@ -162,10 +162,10 @@ impl DSparkMarkovSampling {
             bucket_policy: ReplayBucketPolicy::new(config.sampling.max_sampling_inputs),
             confidence_output,
             top_k_map,
-            sample_reduce: TopKMergeKernels::new(device),
+            top_k_reduce: TopKReduceKernels::new(device),
             anchor_token_ids: Buffer::new_zeroed_elements(device, max_requests, Dtype::Int32),
-            tile_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
-            tile_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
+            partial_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
+            partial_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
             step_params,
             step_outputs,
             step_distribution_indices,
@@ -255,8 +255,8 @@ impl DSparkMarkovSampling {
                     w2_weight: input.weights.w2_weight,
                     w2_scales: input.weights.w2_scales,
                     w2_biases: input.weights.w2_biases,
-                    tile_token_ids: &self.tile_token_ids,
-                    tile_logits: &self.tile_logits,
+                    tile_token_ids: &self.partial_token_ids,
+                    tile_logits: &self.partial_logits,
                     confidence: DSparkConfidenceBuffers {
                         hidden: input.confidence.hidden,
                         weight: input.confidence.weights.weight,
@@ -266,23 +266,22 @@ impl DSparkMarkovSampling {
                 },
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(
-                self.sample_reduce
-                    .invoke_sample_and_write_distribution_with_vocab_tile_size(
-                        sampling,
-                        TopKSampleAndWriteDistributionBuffers {
-                            tile_token_ids: &self.tile_token_ids,
-                            tile_logits: &self.tile_logits,
-                            sampled_token_ids: &self.step_outputs[step_index].token_ids,
-                            sampled_token_probs: &self.step_outputs[step_index].token_probs,
-                            distribution_token_ids: input.distribution_store.draft_token_ids(),
-                            distribution_probs: input.distribution_store.draft_probs(),
-                            runtime_params: self.step_params[step_index].buffer(),
-                            output_distribution_indices: &self.step_distribution_indices[step_index],
-                            max_k: input.distribution_store.max_k() as u32,
-                            num_output_distributions: input.distribution_store.num_draft_distributions(),
-                        },
-                        self.top_k_map.vocab_tile_size(),
-                    ),
+                self.top_k_reduce.invoke_sample_and_write_distribution_with_layout(
+                    sampling,
+                    TopKSampleAndWriteDistributionBuffers {
+                        tile_token_ids: &self.partial_token_ids,
+                        tile_logits: &self.partial_logits,
+                        sampled_token_ids: &self.step_outputs[step_index].token_ids,
+                        sampled_token_probs: &self.step_outputs[step_index].token_probs,
+                        distribution_token_ids: input.distribution_store.draft_token_ids(),
+                        distribution_probs: input.distribution_store.draft_probs(),
+                        runtime_params: self.step_params[step_index].buffer(),
+                        output_distribution_indices: &self.step_distribution_indices[step_index],
+                        max_k: input.distribution_store.max_k() as u32,
+                        num_output_distributions: input.distribution_store.num_draft_distributions(),
+                    },
+                    self.top_k_map.partial_candidate_layout(),
+                ),
             ));
         }
     }
@@ -296,7 +295,7 @@ impl DSparkMarkovSampling {
             shape.sampling.num_active_sampling_inputs,
             arguments,
         );
-        self.sample_reduce.add_replay_arguments(
+        self.top_k_reduce.add_replay_arguments(
             component_shape(shape.sampling),
             shape.sampling.num_active_sampling_inputs,
             arguments,

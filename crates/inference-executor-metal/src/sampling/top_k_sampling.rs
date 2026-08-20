@@ -1,12 +1,12 @@
 use std::mem::size_of;
 
-use inference_backend_metal::components::TopKMergeKernels;
+use inference_backend_metal::components::TopKMapBuffers;
+use inference_backend_metal::components::TopKMapKernels;
+use inference_backend_metal::components::TopKReduceKernels;
 use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
 use inference_backend_metal::components::TopKSampleBuffers;
 use inference_backend_metal::components::TopKSampleShape;
 use inference_backend_metal::components::TopKSamplingOperation;
-use inference_backend_metal::components::TopKTileBuffers;
-use inference_backend_metal::components::TopKTileKernels;
 use inference_backend_metal::components::TopKWriteDistributionBuffers;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -24,15 +24,15 @@ use crate::def::replay_op::ReplayOp;
 use crate::sampling::RuntimeParamRows;
 
 struct TopKSamplingCompute {
-    tile: TopKTileKernels,
-    merge: TopKMergeKernels,
+    map: TopKMapKernels,
+    reduce: TopKReduceKernels,
 }
 
 impl TopKSamplingCompute {
     fn new(device: &Device) -> Self {
         Self {
-            tile: TopKTileKernels::new(device),
-            merge: TopKMergeKernels::new(device),
+            map: TopKMapKernels::new(device),
+            reduce: TopKReduceKernels::new(device),
         }
     }
 
@@ -45,19 +45,19 @@ impl TopKSamplingCompute {
         output: TopKSamplingOutput<'a>,
     ) {
         let shape = component_shape(shape);
-        let tile_buffers = TopKTileBuffers {
+        let map_buffers = TopKMapBuffers {
             logits: buffers.logits,
             logits_offset_bytes: buffers.logits_offset_bytes,
-            tile_token_ids: buffers.tile_token_ids,
-            tile_logits: buffers.tile_logits,
+            tile_token_ids: buffers.partial_token_ids,
+            tile_logits: buffers.partial_logits,
         };
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.tile.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.map.invoke_replay(
             shape,
             logits_dtype,
             TopKSamplingOperation::Sample,
-            tile_buffers,
+            map_buffers,
         )));
-        self.record_sample_from_topk(recorder, shape, buffers, output);
+        self.record_reduce_sample(recorder, shape, buffers, output);
     }
 
     fn record_write_distribution<'a>(
@@ -69,18 +69,18 @@ impl TopKSamplingCompute {
         output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
         let shape = component_shape(shape);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.tile.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.map.invoke_replay(
             shape,
             logits_dtype,
             TopKSamplingOperation::WriteDistribution,
-            TopKTileBuffers {
+            TopKMapBuffers {
                 logits: buffers.logits,
                 logits_offset_bytes: buffers.logits_offset_bytes,
-                tile_token_ids: buffers.tile_token_ids,
-                tile_logits: buffers.tile_logits,
+                tile_token_ids: buffers.partial_token_ids,
+                tile_logits: buffers.partial_logits,
             },
         )));
-        self.record_write_distribution_from_topk(recorder, shape, buffers, output);
+        self.record_reduce_write_distribution(recorder, shape, buffers, output);
     }
 
     fn record_sample_and_write_distribution<'a>(
@@ -93,65 +93,69 @@ impl TopKSamplingCompute {
         sparse_output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
         let shape = component_shape(shape);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.tile.invoke_replay(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.map.invoke_replay(
             shape,
             logits_dtype,
             TopKSamplingOperation::SampleAndWriteDistribution,
-            TopKTileBuffers {
+            TopKMapBuffers {
                 logits: buffers.logits,
                 logits_offset_bytes: buffers.logits_offset_bytes,
-                tile_token_ids: buffers.tile_token_ids,
-                tile_logits: buffers.tile_logits,
+                tile_token_ids: buffers.partial_token_ids,
+                tile_logits: buffers.partial_logits,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.merge.invoke_sample_and_write_distribution(
-            shape,
-            TopKSampleAndWriteDistributionBuffers {
-                tile_token_ids: buffers.tile_token_ids,
-                tile_logits: buffers.tile_logits,
-                sampled_token_ids: sample_output.sampled_token_ids,
-                sampled_token_probs: sample_output.sampled_token_probs,
-                distribution_token_ids: sparse_output.token_ids,
-                distribution_probs: sparse_output.probs,
-                runtime_params: buffers.runtime_params,
-                output_distribution_indices: sparse_output.output_distribution_indices,
-                max_k: sparse_output.max_k,
-                num_output_distributions: sparse_output.num_output_distributions,
-            },
-        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(
+            self.reduce.invoke_sample_and_write_distribution_with_layout(
+                shape,
+                TopKSampleAndWriteDistributionBuffers {
+                    tile_token_ids: buffers.partial_token_ids,
+                    tile_logits: buffers.partial_logits,
+                    sampled_token_ids: sample_output.sampled_token_ids,
+                    sampled_token_probs: sample_output.sampled_token_probs,
+                    distribution_token_ids: sparse_output.token_ids,
+                    distribution_probs: sparse_output.probs,
+                    runtime_params: buffers.runtime_params,
+                    output_distribution_indices: sparse_output.output_distribution_indices,
+                    max_k: sparse_output.max_k,
+                    num_output_distributions: sparse_output.num_output_distributions,
+                },
+                self.map.partial_candidate_layout(),
+            ),
+        ));
     }
 
-    fn record_sample_from_topk<'a>(
+    fn record_reduce_sample<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSampleShape,
         buffers: TopKSamplingComputeBuffers<'a>,
         output: TopKSamplingOutput<'a>,
     ) {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.merge.invoke_sample(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.reduce.invoke_sample_with_layout(
             shape,
             TopKSampleBuffers {
-                tile_token_ids: buffers.tile_token_ids,
-                tile_logits: buffers.tile_logits,
+                tile_token_ids: buffers.partial_token_ids,
+                tile_logits: buffers.partial_logits,
                 token_ids: output.sampled_token_ids,
                 token_probs: output.sampled_token_probs,
                 runtime_params: buffers.runtime_params,
             },
+            self.map.partial_candidate_layout(),
         )));
     }
 
-    fn record_write_distribution_from_topk<'a>(
+    fn record_reduce_write_distribution<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         shape: TopKSampleShape,
         buffers: TopKSamplingComputeBuffers<'a>,
         output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.merge.invoke_write_distribution(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.reduce.invoke_write_distribution_with_layout(
             shape,
             TopKWriteDistributionBuffers {
-                tile_token_ids: buffers.tile_token_ids,
-                tile_logits: buffers.tile_logits,
+                tile_token_ids: buffers.partial_token_ids,
+                tile_logits: buffers.partial_logits,
                 distribution_token_ids: output.token_ids,
                 distribution_probs: output.probs,
                 runtime_params: buffers.runtime_params,
@@ -159,6 +163,7 @@ impl TopKSamplingCompute {
                 max_k: output.max_k,
                 num_output_distributions: output.num_output_distributions,
             },
+            self.map.partial_candidate_layout(),
         )));
     }
 }
@@ -167,23 +172,23 @@ impl TopKSamplingCompute {
 struct TopKSamplingComputeBuffers<'a> {
     logits: &'a Buffer,
     logits_offset_bytes: usize,
-    tile_token_ids: &'a Buffer,
-    tile_logits: &'a Buffer,
+    partial_token_ids: &'a Buffer,
+    partial_logits: &'a Buffer,
     runtime_params: &'a Buffer,
 }
 
 struct TopKSamplingScratch {
-    tile_token_ids: Buffer,
-    tile_logits: Buffer,
+    partial_token_ids: Buffer,
+    partial_logits: Buffer,
 }
 
 impl TopKSamplingScratch {
-    fn new(device: &Device, bounds: TopKSamplingBounds, tile: &TopKTileKernels) -> Self {
+    fn new(device: &Device, bounds: TopKSamplingBounds, map: &TopKMapKernels) -> Self {
         let max_shape = bounds.max_shape();
-        let candidate_count = tile.candidate_count(component_shape(max_shape));
+        let candidate_count = map.candidate_count(component_shape(max_shape));
         Self {
-            tile_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
-            tile_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
+            partial_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
+            partial_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
         }
     }
 }
@@ -307,7 +312,7 @@ impl TopKSampling {
     pub fn new(device: &Device, bounds: TopKSamplingBounds) -> Self {
         bounds.validate();
         let compute = TopKSamplingCompute::new(device);
-        let scratch = TopKSamplingScratch::new(device, bounds, &compute.tile);
+        let scratch = TopKSamplingScratch::new(device, bounds, &compute.map);
         Self {
             compute,
             runtime_params: TopKSamplingRuntimeParams::new(device, bounds),
@@ -335,8 +340,8 @@ impl TopKSampling {
             TopKSamplingComputeBuffers {
                 logits: inputs.logits,
                 logits_offset_bytes: inputs.logits_offset_bytes,
-                tile_token_ids: &self.scratch.tile_token_ids,
-                tile_logits: &self.scratch.tile_logits,
+                partial_token_ids: &self.scratch.partial_token_ids,
+                partial_logits: &self.scratch.partial_logits,
                 runtime_params: self.runtime_params.buffer(),
             },
             output,
@@ -359,8 +364,8 @@ impl TopKSampling {
             TopKSamplingComputeBuffers {
                 logits: inputs.logits,
                 logits_offset_bytes: inputs.logits_offset_bytes,
-                tile_token_ids: &self.scratch.tile_token_ids,
-                tile_logits: &self.scratch.tile_logits,
+                partial_token_ids: &self.scratch.partial_token_ids,
+                partial_logits: &self.scratch.partial_logits,
                 runtime_params: self.runtime_params.buffer(),
             },
             output,
@@ -384,8 +389,8 @@ impl TopKSampling {
             TopKSamplingComputeBuffers {
                 logits: inputs.logits,
                 logits_offset_bytes: inputs.logits_offset_bytes,
-                tile_token_ids: &self.scratch.tile_token_ids,
-                tile_logits: &self.scratch.tile_logits,
+                partial_token_ids: &self.scratch.partial_token_ids,
+                partial_logits: &self.scratch.partial_logits,
                 runtime_params: self.runtime_params.buffer(),
             },
             sample_output,
@@ -406,10 +411,10 @@ impl TopKSampling {
         self.runtime_params.consume(shape);
         let component_shape = component_shape(shape);
         self.compute
-            .tile
+            .map
             .add_replay_arguments(component_shape, shape.num_active_sampling_inputs, arguments);
         self.compute
-            .merge
+            .reduce
             .add_replay_arguments(component_shape, shape.num_active_sampling_inputs, arguments);
     }
 

@@ -21,7 +21,7 @@ crates/inference-backend-metal/src/components/
   sampling/top_k.rs           generic Metal top-k sampling components
   sampling/top_k_test.rs      focused Top-K Metal parity and replay contracts
   sampling/rejection.rs       sparse rejection component
-  sampling/dspark_markov.rs   fused DSpark Markov, confidence, and tile-Top-K map component
+  sampling/dspark_markov.rs   fused DSpark Markov, confidence, and Top-K Map component
   metal/sampling.metal
   metal/dspark_markov_sampling.metal
 
@@ -50,24 +50,24 @@ Greedy decoding uses the same contract with top-k 1 and temperature 0.
 
 ```text
 logits [num_rows, vocab_size]
-  -> top_k_logits_tiles
-       one 256-token vocabulary tile per threadblock
-       write sorted/reduced tile candidates
-  -> top_k_sample_tiles
-       merge tile candidates
+  -> TopKMap
+       one sampling row and one 256-token vocabulary partition per thread block
+       write partial candidates
+  -> TopKReduce
+       merge partial candidates for one sampling row
        apply temperature and top-p
        draw from (request seed, logical position, domain)
   -> sampled token IDs + probabilities
 ```
 
-The backend selects the tile kernel from the logits dtype, top-k, and required output.
-The small-k path uses repeated maximum reduction for sample-only top-k <= 32.
-Larger top-k and write-distribution generation use the bitonic tile path.
+The private `TopKMapPlanner` selects a complete Map kernel specialization from the logits dtype, top-k, and required
+output. The small-k path uses repeated maximum reduction for sample-only top-k <= 32. Larger top-k and
+write-distribution generation use the bitonic Map path.
 These operations remain separate pipeline entry points.
 Unused static threadblock storage can reduce occupancy.
 
 Sampling returns only token IDs and probabilities.
-Tile candidates and merged rows are private scratch, not model-level API state.
+Partial candidates and reduced rows are private scratch, not model-level API state.
 The current input contract does not include repetition, frequency, or presence penalties.
 `TopKSamplingOutputBuffers` owns the concrete sampled token and probability buffers.
 `OutputBuffers` denotes GPU buffers, not a model lifecycle state machine.
@@ -154,7 +154,7 @@ Main and MTP share one `Rc<TopKSampling>` implementation.
 `RejectionSampler::prepare_replay_shape(...)` selects request, draft-distribution, and target-distribution capacities.
 It validates public prepared counts before it maps them to the `u32` replay domain.
 `RejectionSampling` validates the target-sampling and rejection shapes before the replay-cache lookup.
-`DSparkMarkovSampling` owns model-neutral Markov runtime parameters, tile candidates, and per-step outputs.
+`DSparkMarkovSampling` owns model-neutral Markov runtime parameters, partial candidates, and per-step outputs.
 It accepts borrowed weights at record time.
 `Qwen3xDSparkMarkov` owns Qwen checkpoint buffers and delegates execution to this backend owner.
 It loads one bounded `TensorMap` for W1, W2, and the required Markov-conditioned confidence head.
@@ -181,7 +181,7 @@ DSparkMarkovTopKMap
   -> affine W1 row
   -> affine W2 projection
   -> add one base-logit row
-  -> 64-token tile-local Top-K
+  -> 64-token vocabulary-partition Top-K
   -> confidence projection and sigmoid
   -> spec_confidence[i]
 
@@ -206,8 +206,41 @@ The runtime does not apply a confidence threshold or proposal-length policy yet.
 The current fused map preserves the earlier BF16 storage boundaries.
 It dequantizes W1 to F32 and stores the latent row as BF16.
 It accumulates W2 in F32.
-It rounds the correction and corrected logit to BF16 before tile Top-K.
+It rounds the correction and corrected logit to BF16 before the vocabulary-partition Top-K operation.
 Sampling probabilities use F32.
+
+### Top-K execution hierarchy
+
+Top-K sampling has a true Map/Reduce dependency:
+
+```text
+TopKMapKernels
+    -> one TopKMapThreadBlockTask
+       = one sampling row x one vocabulary partition
+    -> TopKPartialCandidateLayout
+       = vocabulary partition size
+    -> partial token IDs + partial logits
+
+TopKReduceKernels
+    -> one TopKReduceThreadBlockTask
+       = one sampling row x all partial-candidate partitions
+    -> sampled token/probability and optional sparse distribution
+```
+
+The standard Map specialization has `thread_block.max_vocab_tokens = 256` and
+`thread_block.required_threads = 256`. The DSpark fused Map specialization has
+`thread_block.max_vocab_tokens = 64` and `thread_block.required_threads = 128`. Both producers return an explicit
+`TopKPartialCandidateLayout`. The Reduce invocation consumes that layout. The executor does not pass an untyped
+`vocab_tile_size` between the components.
+
+`TopKSampleShape.top_k` defines the number of candidates in each partial row. The layout does not duplicate this
+dynamic shape value.
+
+The Reduce specialization requires 256 threads. The Map and Reduce replay arguments retain their current capacity
+and active-thread semantics. The compatibility aliases `TopKTileKernels` and `TopKMergeKernels` preserve the existing
+public component API. `TopKMapBuffers` is the canonical alias for the existing `TopKTileBuffers` ABI. The old
+`vocab_tile_size` compatibility entry points remain available, but repository code does not use them. New repository
+code uses `TopKMapKernels`, `TopKReduceKernels`, and `TopKPartialCandidateLayout`.
 
 ### DSpark Markov numerical contract
 

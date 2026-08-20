@@ -1,6 +1,7 @@
 use std::mem::size_of;
 
-use super::top_k::TOP_K_TILE_NUM_ACTIVE_THREADS_KEY;
+use super::top_k::TOP_K_MAP_NUM_ACTIVE_THREADS_KEY;
+use super::top_k::TopKPartialCandidateLayout;
 use super::top_k::TopKSampleShape;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
@@ -11,17 +12,58 @@ use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 
 const DSPARK_MARKOV_SAMPLING_SOURCE: &str = include_str!("../metal/dspark_markov_sampling.metal");
-const DSPARK_MARKOV_SIMD_WIDTH: u32 = 32;
-const DSPARK_MARKOV_RESULTS_PER_SIMDGROUP: u32 = 4;
-const DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK: u32 = 128;
-const DSPARK_MARKOV_VOCAB_TILE_SIZE: u32 = 64;
-const DSPARK_MARKOV_NUM_SIMDGROUPS: u32 = DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK / DSPARK_MARKOV_SIMD_WIDTH;
-const DSPARK_MARKOV_RESULTS_PER_WAVE: u32 = DSPARK_MARKOV_NUM_SIMDGROUPS * DSPARK_MARKOV_RESULTS_PER_SIMDGROUP;
-const _: () = {
-    assert!(DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK >= DSPARK_MARKOV_VOCAB_TILE_SIZE);
-    assert!(DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK.is_multiple_of(DSPARK_MARKOV_SIMD_WIDTH));
-    assert!(DSPARK_MARKOV_VOCAB_TILE_SIZE.is_multiple_of(DSPARK_MARKOV_RESULTS_PER_WAVE));
-};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DSparkMarkovTopKMapThreadBlockSpecialization {
+    max_vocab_tokens: u32,
+    required_threads: u32,
+    simdgroup_width: u32,
+    results_per_simdgroup: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DSparkMarkovTopKMapKernelSpecialization {
+    thread_block: DSparkMarkovTopKMapThreadBlockSpecialization,
+}
+
+impl DSparkMarkovTopKMapKernelSpecialization {
+    fn current() -> Self {
+        Self {
+            thread_block: DSparkMarkovTopKMapThreadBlockSpecialization {
+                max_vocab_tokens: 64,
+                required_threads: 128,
+                simdgroup_width: 32,
+                results_per_simdgroup: 4,
+            },
+        }
+    }
+
+    fn validate(self) {
+        let thread_block = self.thread_block;
+        assert!(thread_block.required_threads >= thread_block.max_vocab_tokens);
+        assert!(
+            thread_block
+                .required_threads
+                .is_multiple_of(thread_block.simdgroup_width)
+        );
+        assert!(
+            thread_block
+                .max_vocab_tokens
+                .is_multiple_of(self.results_per_thread_block_iteration())
+        );
+    }
+
+    fn num_simdgroups(self) -> u32 {
+        self.thread_block.required_threads / self.thread_block.simdgroup_width
+    }
+
+    fn results_per_thread_block_iteration(self) -> u32 {
+        self.num_simdgroups() * self.thread_block.results_per_simdgroup
+    }
+
+    fn partial_candidate_layout(self) -> TopKPartialCandidateLayout {
+        TopKPartialCandidateLayout::new(self.thread_block.max_vocab_tokens)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DSparkMarkovTopKMapConfig {
@@ -50,14 +92,18 @@ impl DSparkMarkovTopKMapConfig {
         validate_boundary_dtype("I/O", self.io_dtype);
         validate_boundary_dtype("scale/bias", self.scale_bias_dtype);
         self.confidence.validate(self.rank);
-        let _ = self.threadblock_memory_bytes();
+        let specialization = DSparkMarkovTopKMapKernelSpecialization::current();
+        specialization.validate();
+        let _ = self.threadblock_memory_bytes(specialization);
     }
 
-    fn threadblock_memory_bytes(self) -> usize {
+    fn threadblock_memory_bytes(self, specialization: DSparkMarkovTopKMapKernelSpecialization) -> usize {
         (self.rank as usize)
             .checked_mul(self.io_dtype.item_size())
             .and_then(|bytes| {
-                bytes.checked_add(DSPARK_MARKOV_VOCAB_TILE_SIZE as usize * (size_of::<f32>() + size_of::<i32>()))
+                bytes.checked_add(
+                    specialization.thread_block.max_vocab_tokens as usize * (size_of::<f32>() + size_of::<i32>()),
+                )
             })
             .expect("DSpark Markov threadblock memory size must fit usize")
     }
@@ -137,33 +183,37 @@ pub struct DSparkConfidenceBuffers<'a> {
 
 pub struct DSparkMarkovTopKMapKernel {
     config: DSparkMarkovTopKMapConfig,
+    specialization: DSparkMarkovTopKMapKernelSpecialization,
     kernel: Kernel,
 }
 
 impl DSparkMarkovTopKMapKernel {
     pub fn new(device: &Device, config: DSparkMarkovTopKMapConfig) -> Self {
         config.validate();
-        let required_threadblock_memory_bytes = config.threadblock_memory_bytes();
+        let specialization = DSparkMarkovTopKMapKernelSpecialization::current();
+        specialization.validate();
+        let required_threadblock_memory_bytes = config.threadblock_memory_bytes(specialization);
         let max_threadblock_memory_bytes = device.max_threadblock_memory_length();
         assert!(
             required_threadblock_memory_bytes <= max_threadblock_memory_bytes,
             "DSpark Markov requires {required_threadblock_memory_bytes} bytes of threadblock memory, but the device \
              supports {max_threadblock_memory_bytes}"
         );
-        let kernel = Kernel::new(device, &source(config), "dspark_markov_top_k_map");
+        let kernel = Kernel::new(device, &source(config, specialization), "dspark_markov_top_k_map");
         let max_total_threads = kernel.max_total_threads_per_threadblock();
+        let required_threads = specialization.thread_block.required_threads;
         assert!(
-            DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK as usize <= max_total_threads,
-            "DSpark Markov requires {DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK} threads per threadblock, but the \
-             pipeline supports {max_total_threads}"
+            required_threads as usize <= max_total_threads,
+            "DSpark Markov requires {required_threads} threads per threadblock, but the pipeline supports \
+             {max_total_threads}"
         );
         let thread_execution_width = kernel.thread_execution_width();
         assert_eq!(
-            thread_execution_width, DSPARK_MARKOV_SIMD_WIDTH as usize,
+            thread_execution_width, specialization.thread_block.simdgroup_width as usize,
             "DSpark Markov pipeline must use the configured SIMD width"
         );
         assert!(
-            (DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK as usize).is_multiple_of(thread_execution_width),
+            (required_threads as usize).is_multiple_of(thread_execution_width),
             "DSpark Markov threadblock size must contain complete SIMDgroups"
         );
         let static_threadblock_memory_bytes = kernel.static_threadblock_memory_length();
@@ -172,7 +222,11 @@ impl DSparkMarkovTopKMapKernel {
             "DSpark Markov pipeline uses {static_threadblock_memory_bytes} bytes of threadblock memory, but the \
              device supports {max_threadblock_memory_bytes}"
         );
-        Self { config, kernel }
+        Self {
+            config,
+            specialization,
+            kernel,
+        }
     }
 
     pub fn invoke_replay<'a>(
@@ -187,8 +241,13 @@ impl DSparkMarkovTopKMapKernel {
         }
     }
 
+    #[deprecated(note = "use partial_candidate_layout().vocab_partition_size()")]
     pub fn vocab_tile_size(&self) -> u32 {
-        DSPARK_MARKOV_VOCAB_TILE_SIZE
+        self.partial_candidate_layout().vocab_partition_size()
+    }
+
+    pub fn partial_candidate_layout(&self) -> TopKPartialCandidateLayout {
+        self.specialization.partial_candidate_layout()
     }
 
     pub fn candidate_count(&self, shape: TopKSampleShape) -> usize {
@@ -197,10 +256,11 @@ impl DSparkMarkovTopKMapKernel {
             shape.vocab_size, self.config.vocab_size,
             "DSpark Markov sampling vocabulary must match the kernel config"
         );
+        let layout = self.partial_candidate_layout();
         (shape.num_total_sampling_inputs as usize)
-            .checked_mul(shape.vocab_size.div_ceil(DSPARK_MARKOV_VOCAB_TILE_SIZE) as usize)
+            .checked_mul(shape.vocab_size.div_ceil(layout.vocab_partition_size()) as usize)
             .and_then(|count| count.checked_mul(shape.top_k as usize))
-            .expect("DSpark Markov tile candidate count must fit usize")
+            .expect("DSpark Markov partial candidate count must fit usize")
     }
 
     pub fn add_replay_arguments(
@@ -221,9 +281,12 @@ impl DSparkMarkovTopKMapKernel {
         if shape.num_total_sampling_inputs <= 1 {
             return;
         }
-        let num_tiles = shape.vocab_size.div_ceil(DSPARK_MARKOV_VOCAB_TILE_SIZE);
-        let num_threads_per_row = num_tiles
-            .checked_mul(DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK)
+        let num_partitions = shape
+            .vocab_size
+            .div_ceil(self.partial_candidate_layout().vocab_partition_size());
+        let required_threads = self.specialization.thread_block.required_threads;
+        let num_threads_per_row = num_partitions
+            .checked_mul(required_threads)
             .expect("DSpark Markov threads per request must fit u32");
         let num_active_threads = num_active_sampling_inputs
             .checked_mul(num_threads_per_row)
@@ -233,7 +296,7 @@ impl DSparkMarkovTopKMapKernel {
             .checked_mul(num_threads_per_row)
             .expect("DSpark Markov total thread count must fit u32");
         assert!(num_active_threads <= num_total_threads);
-        arguments.set_u32(TOP_K_TILE_NUM_ACTIVE_THREADS_KEY, num_active_threads);
+        arguments.set_u32(TOP_K_MAP_NUM_ACTIVE_THREADS_KEY, num_active_threads);
     }
 }
 
@@ -247,9 +310,11 @@ impl Operator for DSparkMarkovTopKMapInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let sampling = self.shape.sampling;
-        let num_tiles = sampling.vocab_size.div_ceil(DSPARK_MARKOV_VOCAB_TILE_SIZE);
-        let num_threads_per_row = num_tiles
-            .checked_mul(DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK)
+        let layout = self.kernel.partial_candidate_layout();
+        let num_partitions = sampling.vocab_size.div_ceil(layout.vocab_partition_size());
+        let required_threads = self.kernel.specialization.thread_block.required_threads;
+        let num_threads_per_row = num_partitions
+            .checked_mul(required_threads)
             .expect("DSpark Markov threads per request must fit u32");
         let num_total_threads = sampling
             .num_total_sampling_inputs
@@ -272,22 +337,19 @@ impl Operator for DSparkMarkovTopKMapInvocation<'_> {
         } else {
             recorder.bind_u32(
                 10,
-                TOP_K_TILE_NUM_ACTIVE_THREADS_KEY,
+                TOP_K_MAP_NUM_ACTIVE_THREADS_KEY,
                 num_threads_per_row,
                 num_total_threads,
             );
         }
         recorder.set_u32(11, sampling.top_k);
-        recorder.set_u32(12, num_tiles);
+        recorder.set_u32(12, num_partitions);
         recorder.set_u32(13, self.shape.base_logits_row_offset);
         recorder.set_buffer_read(14, self.buffers.confidence.hidden, 0);
         recorder.set_buffer_read(15, self.buffers.confidence.weight, 0);
         recorder.set_buffer_read(16, self.buffers.confidence.bias, 0);
         recorder.set_buffer_write(17, self.buffers.confidence.output, 0);
-        recorder.dispatch_1d(
-            num_total_threads as usize,
-            DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK as usize,
-        );
+        recorder.dispatch_1d(num_total_threads as usize, required_threads as usize);
     }
 }
 
@@ -379,9 +441,10 @@ fn validate_boundary_dtype(name: &str, dtype: Dtype) {
     }
 }
 
-fn source(config: DSparkMarkovTopKMapConfig) -> String {
-    let values_per_simd_lane = config.rank.div_ceil(DSPARK_MARKOV_SIMD_WIDTH);
-    let w2_lane_group_aligned = config.rank.is_multiple_of(DSPARK_MARKOV_SIMD_WIDTH)
+fn source(config: DSparkMarkovTopKMapConfig, specialization: DSparkMarkovTopKMapKernelSpecialization) -> String {
+    let thread_block = specialization.thread_block;
+    let values_per_simd_lane = config.rank.div_ceil(thread_block.simdgroup_width);
+    let w2_lane_group_aligned = config.rank.is_multiple_of(thread_block.simdgroup_width)
         && config.w2_group_size.is_multiple_of(values_per_simd_lane);
     format!(
         "#define DSPARK_MARKOV_THREADBLOCK_SIZE {}u\n#define DSPARK_MARKOV_SIMD_WIDTH {}u\n#define \
@@ -390,9 +453,9 @@ fn source(config: DSparkMarkovTopKMapConfig) -> String {
          DSPARK_MARKOV_W2_GROUP_SIZE {}u\n#define DSPARK_MARKOV_W2_BITS {}u\n#define \
          DSPARK_MARKOV_W2_LANE_GROUP_ALIGNED {}\n#define DSPARK_MARKOV_VOCAB_TILE_SIZE {}u\n#define \
          DSPARK_CONFIDENCE_HIDDEN_DIM {}u\n{DSPARK_MARKOV_SAMPLING_SOURCE}",
-        DSPARK_MARKOV_NUM_THREADS_PER_THREADBLOCK,
-        DSPARK_MARKOV_SIMD_WIDTH,
-        DSPARK_MARKOV_RESULTS_PER_SIMDGROUP,
+        thread_block.required_threads,
+        thread_block.simdgroup_width,
+        thread_block.results_per_simdgroup,
         config.vocab_size,
         config.rank,
         config.w1_group_size,
@@ -400,7 +463,7 @@ fn source(config: DSparkMarkovTopKMapConfig) -> String {
         config.w2_group_size,
         config.w2_bits,
         u8::from(w2_lane_group_aligned),
-        DSPARK_MARKOV_VOCAB_TILE_SIZE,
+        thread_block.max_vocab_tokens,
         config.confidence.hidden_dim,
     )
 }
@@ -421,6 +484,16 @@ mod tests {
             scale_bias_dtype: Dtype::Bfloat16,
             confidence: DSparkConfidenceConfig { hidden_dim: 32 },
         }
+    }
+
+    #[test]
+    fn test_specialization_defines_map_task_and_partial_candidate_layout() {
+        let specialization = DSparkMarkovTopKMapKernelSpecialization::current();
+        assert_eq!(specialization.thread_block.max_vocab_tokens, 64);
+        assert_eq!(specialization.thread_block.required_threads, 128);
+        assert_eq!(specialization.thread_block.simdgroup_width, 32);
+        assert_eq!(specialization.thread_block.results_per_simdgroup, 4);
+        assert_eq!(specialization.partial_candidate_layout().vocab_partition_size(), 64);
     }
 
     #[test]

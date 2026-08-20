@@ -7,13 +7,13 @@
 //! logits
 //!   |
 //!   v
-//! TopKTileKernels
+//! TopKMapKernels
 //!   |
-//!   +--> tile token IDs
-//!   +--> tile logits
+//!   +--> partial token IDs
+//!   +--> partial logits
 //!            |
 //!            v
-//!      TopKMergeKernels
+//!      TopKReduceKernels
 //!            |
 //!            +--> sampled token and probability
 //!            +--> sparse distribution
@@ -32,7 +32,7 @@
 //! DSparkMarkovTopKMapKernel
 //!            |
 //!            v
-//!      TopKMergeKernels
+//!      TopKReduceKernels
 //! ```
 
 const SAMPLING_SOURCE: &str = include_str!("../metal/sampling.metal");
@@ -72,7 +72,11 @@ pub use rejection::SparseRejectionSampleKernel;
 pub use rejection::SparseRejectionSampleShape;
 
 mod top_k;
+pub use top_k::TopKMapBuffers;
+pub use top_k::TopKMapKernels;
 pub use top_k::TopKMergeKernels;
+pub use top_k::TopKPartialCandidateLayout;
+pub use top_k::TopKReduceKernels;
 pub use top_k::TopKSampleAndWriteDistributionBuffers;
 pub use top_k::TopKSampleBuffers;
 pub use top_k::TopKSampleShape;

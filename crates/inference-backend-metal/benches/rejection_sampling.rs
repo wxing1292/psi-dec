@@ -13,13 +13,13 @@ use inference_backend_metal::components::DSparkMarkovTopKMapShape;
 use inference_backend_metal::components::SparseRejectionSampleBuffers;
 use inference_backend_metal::components::SparseRejectionSampleKernel;
 use inference_backend_metal::components::SparseRejectionSampleShape;
-use inference_backend_metal::components::TopKMergeKernels;
+use inference_backend_metal::components::TopKMapBuffers;
+use inference_backend_metal::components::TopKMapKernels;
+use inference_backend_metal::components::TopKReduceKernels;
 use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
 use inference_backend_metal::components::TopKSampleBuffers;
 use inference_backend_metal::components::TopKSampleShape;
 use inference_backend_metal::components::TopKSamplingOperation;
-use inference_backend_metal::components::TopKTileBuffers;
-use inference_backend_metal::components::TopKTileKernels;
 use inference_backend_metal::components::TopKWriteDistributionBuffers;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -85,7 +85,14 @@ fn main() {
             for rows in args.rows {
                 let fixture = DSparkMarkovFixture::new(&device, rows, args.top_k, config);
                 let samples = measure_runs(args.runs, args.warmup_iters, args.iters, || fixture.run());
-                print_dspark_markov_perf(rows, args.top_k, config, fixture.vocab_tile_size, args.iters, &samples);
+                print_dspark_markov_perf(
+                    rows,
+                    args.top_k,
+                    config,
+                    fixture.vocab_partition_size,
+                    args.iters,
+                    &samples,
+                );
             }
         },
     }
@@ -226,7 +233,7 @@ impl RejectionFixture {
 
 struct DSparkMarkovFixture {
     replay: ReplayFixture,
-    vocab_tile_size: u32,
+    vocab_partition_size: u32,
 }
 
 impl DSparkMarkovFixture {
@@ -310,7 +317,7 @@ impl DSparkMarkovFixture {
         replay.run();
         Self {
             replay,
-            vocab_tile_size: kernel.vocab_tile_size(),
+            vocab_partition_size: kernel.partial_candidate_layout().vocab_partition_size(),
         }
     }
 
@@ -367,20 +374,20 @@ impl ReplayFixture {
         let token_ids = Buffer::new_zeroed(device, rows as usize * size_of::<i32>());
         let token_probs = Buffer::new_zeroed(device, rows as usize * size_of::<f32>());
         let runtime_params = sampling_runtime_params(device, rows, top_k);
-        let merge = TopKMergeKernels::new(device);
+        let reduce = TopKReduceKernels::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
             Dtype::Float32,
             TopKSamplingOperation::Sample,
-            TopKTileBuffers {
+            TopKMapBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(merge.invoke_sample(
+        builder.record_with_barrier_before(reduce.invoke_sample_with_layout(
             shape,
             TopKSampleBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -389,9 +396,10 @@ impl ReplayFixture {
                 token_probs: &token_probs,
                 runtime_params: &runtime_params,
             },
+            topk.partial_candidate_layout(),
         ));
         let replay = builder.build();
-        let arguments = top_k_replay_arguments(&topk, &merge, shape, rows);
+        let arguments = top_k_replay_arguments(&topk, &reduce, shape, rows);
         let fixture = Self {
             stream,
             replay,
@@ -407,20 +415,20 @@ impl ReplayFixture {
         let distribution_probs = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<f32>());
         let runtime_params = sampling_runtime_params(device, rows, top_k);
         let output_distribution_indices = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
-        let merge = TopKMergeKernels::new(device);
+        let reduce = TopKReduceKernels::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
             Dtype::Float32,
             TopKSamplingOperation::WriteDistribution,
-            TopKTileBuffers {
+            TopKMapBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(merge.invoke_write_distribution(
+        builder.record_with_barrier_before(reduce.invoke_write_distribution_with_layout(
             shape,
             TopKWriteDistributionBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -432,9 +440,10 @@ impl ReplayFixture {
                 max_k: top_k,
                 num_output_distributions: rows,
             },
+            topk.partial_candidate_layout(),
         ));
         let replay = builder.build();
-        let arguments = top_k_replay_arguments(&topk, &merge, shape, rows);
+        let arguments = top_k_replay_arguments(&topk, &reduce, shape, rows);
         let fixture = Self {
             stream,
             replay,
@@ -452,20 +461,20 @@ impl ReplayFixture {
         let distribution_probs = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<f32>());
         let runtime_params = sampling_runtime_params(device, rows, top_k);
         let output_distribution_indices = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
-        let merge = TopKMergeKernels::new(device);
+        let reduce = TopKReduceKernels::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
             Dtype::Float32,
             TopKSamplingOperation::SampleAndWriteDistribution,
-            TopKTileBuffers {
+            TopKMapBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
             },
         ));
-        builder.record_with_barrier_before(merge.invoke_sample_and_write_distribution(
+        builder.record_with_barrier_before(reduce.invoke_sample_and_write_distribution_with_layout(
             shape,
             TopKSampleAndWriteDistributionBuffers {
                 tile_token_ids: &tile_token_ids,
@@ -479,9 +488,10 @@ impl ReplayFixture {
                 max_k: top_k,
                 num_output_distributions: rows,
             },
+            topk.partial_candidate_layout(),
         ));
         let replay = builder.build();
-        let arguments = top_k_replay_arguments(&topk, &merge, shape, rows);
+        let arguments = top_k_replay_arguments(&topk, &reduce, shape, rows);
         let fixture = Self {
             stream,
             replay,
@@ -578,14 +588,14 @@ impl ReplayFixture {
 }
 
 fn top_k_replay_arguments(
-    topk: &TopKTileKernels,
-    merge: &TopKMergeKernels,
+    topk: &TopKMapKernels,
+    reduce: &TopKReduceKernels,
     shape: TopKSampleShape,
     num_active_sampling_inputs: u32,
 ) -> ReplayArguments {
     let mut arguments = ReplayArguments::new();
     topk.add_replay_arguments(shape, num_active_sampling_inputs, &mut arguments);
-    merge.add_replay_arguments(shape, num_active_sampling_inputs, &mut arguments);
+    reduce.add_replay_arguments(shape, num_active_sampling_inputs, &mut arguments);
     arguments
 }
 
@@ -616,7 +626,7 @@ fn top_k_base(
     rows: u32,
     top_k: u32,
     vocab: u32,
-) -> (Stream, TopKSampleShape, Buffer, Buffer, Buffer, TopKTileKernels) {
+) -> (Stream, TopKSampleShape, Buffer, Buffer, Buffer, TopKMapKernels) {
     assert!(rows > 0);
     let shape = TopKSampleShape {
         num_total_sampling_inputs: rows,
@@ -624,7 +634,7 @@ fn top_k_base(
         top_k,
     };
     let logits = Buffer::from_slice(device, &logits(rows, vocab));
-    let topk = TopKTileKernels::new(device);
+    let topk = TopKMapKernels::new(device);
     let candidate_count = topk.candidate_count(shape);
     let tile_token_ids = Buffer::new_zeroed(device, candidate_count * size_of::<i32>());
     let tile_logits = Buffer::new_zeroed(device, candidate_count * size_of::<f32>());
@@ -774,7 +784,7 @@ fn print_dspark_markov_perf(
     rows: u32,
     top_k: u32,
     config: DSparkMarkovTopKMapConfig,
-    vocab_tile_size: u32,
+    vocab_partition_size: u32,
     iters: usize,
     samples: &[Duration],
 ) {
@@ -782,7 +792,7 @@ fn print_dspark_markov_perf(
     println!(
         "perf component=sampling case=dspark-markov-top-k-map rows={} top_k={} vocab={} markov_rank={} \
          confidence_hidden_dim={} markov_w1_group_size={} markov_w1_bits={} markov_w2_group_size={} markov_w2_bits={} \
-         vocab_tile={} iters={} runs={} median_us={:.3} min_us={:.3} max_us={:.3}",
+         vocab_partition_size={} iters={} runs={} median_us={:.3} min_us={:.3} max_us={:.3}",
         rows,
         top_k,
         config.vocab_size,
@@ -792,7 +802,7 @@ fn print_dspark_markov_perf(
         config.w1_bits,
         config.w2_group_size,
         config.w2_bits,
-        vocab_tile_size,
+        vocab_partition_size,
         iters,
         samples.len(),
         median_of_sorted(&per_iter_us),
