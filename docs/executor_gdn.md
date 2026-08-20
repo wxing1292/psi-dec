@@ -315,6 +315,10 @@ GDNStatePageReadThreadBlockTask / GDNStatePageWriteThreadBlockTask
     page_index_in_state
 ```
 
+The read and write kernels use the same `GDNStatePageKernelSpecialization`. Its thread-block specialization requires
+256 threads. This shared specialization is valid because both kernels use the same page-byte partition and inverse
+read/write task geometry. The batch shape and state-page counts remain dynamic invocation data.
+
 The grid derives all task coordinates. `page_id`, `recurrent_state_slot`, and `conv_state_slot` are data inputs.
 `state_kind` selects the applicable physical slot. One thread block copies one page with `float4` lanes.
 

@@ -9,7 +9,23 @@ use crate::metal::Operator;
 const GDN_STATE_PAGE_WRITE_SOURCE: &str = include_str!("metal/gdn_state_page_write.metal");
 const GDN_STATE_PAGE_READ_SOURCE: &str = include_str!("metal/gdn_state_page_read.metal");
 
-const NUM_THREADS_PER_THREADBLOCK: usize = 256;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNStatePageThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNStatePageKernelSpecialization {
+    thread_block: GDNStatePageThreadBlockSpecialization,
+}
+
+impl GDNStatePageKernelSpecialization {
+    fn current() -> Self {
+        Self {
+            thread_block: GDNStatePageThreadBlockSpecialization { required_threads: 256 },
+        }
+    }
+}
 
 /// Static batch geometry for GDN state-page I/O.
 ///
@@ -109,6 +125,7 @@ pub struct GDNStatePageBatchWriteBuffers<'a> {
 
 pub struct GDNStatePageBatchWrite {
     config: GDNStatePageBatchConfig,
+    specialization: GDNStatePageKernelSpecialization,
     kernel: Kernel,
 }
 
@@ -117,6 +134,7 @@ impl GDNStatePageBatchWrite {
         config.validate();
         Self {
             config,
+            specialization: GDNStatePageKernelSpecialization::current(),
             kernel: Kernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_batch_write_f32"),
         }
     }
@@ -161,7 +179,7 @@ impl Operator for GDNStatePageBatchWriteInvocation<'_> {
         recorder.set_u32(13, config.page_bytes);
         recorder.dispatch_threadblocks(
             (config.num_total_pages(self.shape), 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+            (self.kernel.specialization.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -190,6 +208,7 @@ pub struct GDNStatePageBatchReadBuffers<'a> {
 
 pub struct GDNStatePageBatchRead {
     config: GDNStatePageBatchConfig,
+    specialization: GDNStatePageKernelSpecialization,
     kernel: Kernel,
 }
 
@@ -198,6 +217,7 @@ impl GDNStatePageBatchRead {
         config.validate();
         Self {
             config,
+            specialization: GDNStatePageKernelSpecialization::current(),
             kernel: Kernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_batch_read_f32"),
         }
     }
@@ -242,7 +262,7 @@ impl Operator for GDNStatePageBatchReadInvocation<'_> {
         recorder.set_u32(13, config.page_bytes);
         recorder.dispatch_threadblocks(
             (config.num_total_pages(self.shape), 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+            (self.kernel.specialization.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -270,6 +290,12 @@ mod tests {
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Stream;
+
+    #[test]
+    fn test_read_and_write_share_the_state_page_specialization() {
+        let specialization = super::GDNStatePageKernelSpecialization::current();
+        assert_eq!(specialization.thread_block.required_threads, 256);
+    }
 
     #[test]
     #[should_panic(expected = "GDN state-page batch pages exceeds the shader u32 count domain")]

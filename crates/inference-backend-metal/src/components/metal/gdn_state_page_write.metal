@@ -32,7 +32,7 @@ kernel void gdn_state_page_batch_write_f32(
     constant uint& page_bytes [[buffer(13)]],
     uint state_page_threadblock_index [[threadgroup_position_in_grid]],
     uint thread_index_in_threadblock [[thread_position_in_threadgroup]],
-    uint num_threads_per_threadblock [[threads_per_threadgroup]]
+    uint num_threads [[threads_per_threadgroup]]
 ) {
     const uint pages_per_layer = num_recurrent_pages_per_state_slot + num_conv_pages_per_state_slot;
     const uint pages_per_state_io_request = num_gdn_layers * pages_per_layer;
@@ -58,7 +58,7 @@ kernel void gdn_state_page_batch_write_f32(
 
     for (uint byte_offset_in_page = thread_index_in_threadblock * sizeof(float4);
          byte_offset_in_page < page_bytes;
-         byte_offset_in_page += num_threads_per_threadblock * sizeof(float4)) {
+         byte_offset_in_page += num_threads * sizeof(float4)) {
         const ulong state_byte_offset =
             (ulong)page_index_in_state * (ulong)page_bytes + (ulong)byte_offset_in_page;
         const float4 value = state_byte_offset < (ulong)state_bytes
