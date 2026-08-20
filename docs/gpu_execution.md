@@ -157,5 +157,54 @@ GDN has one mathematical recurrent algorithm. Its final-state and candidate-stat
 materialization contracts. They are not cost candidates. GDN derives one `GDNComputeSpecialization` during
 initialization and does not use a runtime planner. See [GDN Executor](executor_gdn.md).
 
-Dense MLP and MoE can reuse this hierarchy only where their contracts match. Each component must define its own tasks,
-specializations, layouts, and selection policy.
+The following table defines the cross-component execution model. It also records intentional differences. A component
+must not add a planner only to match another component.
+
+| Component | Semantic execution | Non-persistent thread-block task | Dynamic selection owner |
+| --- | --- | --- | --- |
+| Quantized embedding | Dequantize selected vocabulary rows into hidden rows. | A bounded flat range of `(token, hidden)` output values. | No planner. The backend derives one fixed kernel specialization at initialization. |
+| Unembedding | Apply one affine quantized projection from hidden rows to vocabulary logits. | The selected affine QMV or QMM kernel defines the task. | `AffineQuantizedMatmul` owns the row-dependent QMV/QMM choice. `Unembed` does not select it again. |
+| RMSNorm | Normalize one hidden row and apply its weight row. | One token row. | No planner. Dtype selects one static kernel at initialization. |
+| Residual add | Add two flat tensors or two row-major active prefixes. | A bounded flat range of output values. | No planner. Dtypes select one static kernel at initialization. |
+| Residual-add RMSNorm | Add two hidden rows, preserve the residual row, and normalize it. | One token row. | The backend selects the scalar or BF16-vectorized kernel at initialization. The runtime shape does not change this choice. |
+| RMSNorm/RoPE | Normalize and rotate one attention-head row. | One `(flat Q token, Q head)` row. | No planner. Model geometry and RoPE constants define one compiled specialization. |
+| Dense MLP | Record `gate_up affine -> SwiGLU -> down affine`. | Each leaf kernel defines its own task. SwiGLU uses a bounded flat range of `(token, intermediate)` output values. | Each affine owner selects QMV or QMM independently. Dense MLP does not add a second planner. |
+| MoE | Record routing and either token-major or expert-major expert execution. | Each routing, layout, pack, expert, combine, or scatter phase defines its own task. | The MoE execution planner selects the complete token-major or expert-major command graph. Sparse expert kernels do not select this graph. |
+| Top-K sampling | Map vocabulary partitions to partial candidates, then reduce the partial candidates for each sampling row. | Map: one `(sampling row, vocabulary partition)`. Reduce: one sampling row. | The sampling backend selects the Map kernel family from the output contract and Top-K width. Replay capacity selection remains a separate owner concern. |
+| Sparse rejection sampling | Walk one request's ordered draft sequence and sample its fallback or continuation token. | One request. | No kernel planner. Replay bucket policies select only capacities. |
+| DSpark Markov sampling | Produce partial Top-K candidates with a Markov correction, then use the common Top-K reduce phase. | Map: one `(sampling row, vocabulary partition)`. Reduce: one sampling row. | The Markov Map kernel has one current specialization. Its partial-candidate layout is an explicit producer/consumer contract. |
+
+### Planning and replay identity
+
+Kernel planning and replay capacity selection are different operations:
+
+```text
+dynamic semantic shape
+    -> kernel or execution planning, when required
+    -> recorded command topology
+
+active item count
+    -> replay bucket policy
+    -> recorded capacity that must preserve the planned topology
+```
+
+A replay key must identify every dynamic choice that changes the recorded command graph or compiled kernel. An active
+count must not enter the key when a replay parameter can supply that count without changing topology.
+
+Dense MLP and unembedding use the topology boundaries from their adaptive affine owners. MoE adds the boundary where
+its complete execution plan changes. Top-K sampling keeps the active Top-K width in its replay shape because that width
+changes candidate geometry and can change the Map kernel family. Rejection sampling keeps request and distribution
+capacities separate because they have different semantic domains.
+
+### Intentional asymmetries
+
+Embedding and unembedding are not symmetric GPU algorithms. Embedding is a quantized row lookup. Unembedding is an
+adaptive quantized matrix multiplication. They can share weight-lifecycle and replay-capacity conventions, but they
+must not share a kernel planner.
+
+Dense MLP and sparse expert MLP are not two layouts of one kernel. Dense MLP applies the same weights to every token.
+Sparse expert MLP applies expert-indexed weights to routed rows. The MoE owner selects token-major or expert-major
+execution before it invokes the sparse expert leaf.
+
+Top-K sampling and rejection sampling share runtime-parameter and replay-preparation rules. They do not share one
+thread-block task. Top-K sampling partitions a vocabulary row. Rejection sampling processes one ordered request.
