@@ -10,6 +10,36 @@ use crate::metal::ReplayParameterKey;
 
 const QUANTIZED_EMBEDDING_SOURCE: &str = include_str!("metal/quantized_embedding.metal");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QuantizedEmbeddingThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QuantizedEmbeddingKernelSpecialization {
+    scale_bias_dtype: Dtype,
+    output_dtype: Dtype,
+    thread_block: QuantizedEmbeddingThreadBlockSpecialization,
+}
+
+impl QuantizedEmbeddingKernelSpecialization {
+    fn new(config: QuantizedEmbeddingConfig) -> Self {
+        let specialization = Self {
+            scale_bias_dtype: config.scale_bias_dtype,
+            output_dtype: config.output_dtype,
+            thread_block: QuantizedEmbeddingThreadBlockSpecialization { required_threads: 256 },
+        };
+        specialization.validate();
+        specialization
+    }
+
+    fn validate(self) {
+        assert!(matches!(self.scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert_eq!(self.output_dtype, Dtype::Bfloat16);
+        assert!(self.thread_block.required_threads > 0);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedEmbeddingConfig {
     pub vocab_size: u32,
@@ -97,19 +127,22 @@ pub struct QuantizedEmbeddingBuffers<'a> {
 
 pub struct QuantizedEmbeddingKernel {
     config: QuantizedEmbeddingConfig,
+    specialization: QuantizedEmbeddingKernelSpecialization,
     kernel: Kernel,
 }
 
 impl QuantizedEmbeddingKernel {
     pub fn new(device: &Device, config: QuantizedEmbeddingConfig) -> Self {
         config.validate();
-        let function_name = match config.scale_bias_dtype {
+        let specialization = QuantizedEmbeddingKernelSpecialization::new(config);
+        let function_name = match specialization.scale_bias_dtype {
             Dtype::Float32 => "quantized_embedding_f32_to_bf16",
             Dtype::Bfloat16 => "quantized_embedding_bf16_to_bf16",
             _ => unreachable!("validated quantized embedding scale/bias dtype"),
         };
         Self {
             config,
+            specialization,
             kernel: Kernel::new(device, QUANTIZED_EMBEDDING_SOURCE, function_name),
         }
     }
@@ -169,7 +202,11 @@ impl Operator for QuantizedEmbeddingInvocation<'_> {
         recorder.set_u32(7, config.hidden_dim);
         recorder.set_u32(8, config.group_size);
         recorder.set_u32(9, config.bits);
-        recorder.dispatch_threadblocks((self.shape.num_output_values(config).div_ceil(256), 1, 1), (256, 1, 1));
+        let required_threads = self.kernel.specialization.thread_block.required_threads as usize;
+        recorder.dispatch_threadblocks(
+            (self.shape.num_output_values(config).div_ceil(required_threads), 1, 1),
+            (required_threads, 1, 1),
+        );
     }
 }
 
@@ -201,6 +238,7 @@ mod tests {
     use super::QuantizedEmbeddingBuffers;
     use super::QuantizedEmbeddingConfig;
     use super::QuantizedEmbeddingKernel;
+    use super::QuantizedEmbeddingKernelSpecialization;
     use super::QuantizedEmbeddingShape;
     use crate::metal::Buffer;
     use crate::metal::Device;
@@ -215,6 +253,21 @@ mod tests {
     const BITS: u32 = 4;
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.quantized_embedding.num_active_tokens");
     const OUTPUT_CANARY: u16 = 0x7fc1;
+
+    #[test]
+    fn test_specialization_has_explicit_thread_block_scope() {
+        let specialization = QuantizedEmbeddingKernelSpecialization::new(QuantizedEmbeddingConfig {
+            vocab_size: VOCAB_SIZE,
+            hidden_dim: HIDDEN_DIM,
+            group_size: GROUP_SIZE,
+            bits: BITS,
+            scale_bias_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+        });
+        assert_eq!(specialization.scale_bias_dtype, Dtype::Bfloat16);
+        assert_eq!(specialization.output_dtype, Dtype::Bfloat16);
+        assert_eq!(specialization.thread_block.required_threads, 256);
+    }
 
     #[test]
     #[should_panic(expected = "F32 quantized embedding output is not implemented")]

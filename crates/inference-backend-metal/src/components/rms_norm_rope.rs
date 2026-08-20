@@ -11,7 +11,36 @@ use crate::metal::ReplayU32;
 
 const RMS_NORM_ROPE_SOURCE: &str = include_str!("metal/rms_norm_rope.metal");
 
-const NUM_THREADS_PER_THREADBLOCK: u32 = 128;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RMSNormRopeThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RMSNormRopeKernelSpecialization {
+    config: RMSNormRopeConfig,
+    thread_block: RMSNormRopeThreadBlockSpecialization,
+}
+
+impl RMSNormRopeKernelSpecialization {
+    fn new(config: RMSNormRopeConfig) -> Self {
+        config.validate();
+        Self {
+            config,
+            thread_block: RMSNormRopeThreadBlockSpecialization { required_threads: 128 },
+        }
+    }
+
+    fn num_threads(self, shape: RMSNormRopeShape) -> usize {
+        checked_product(
+            "RMSNorm/RoPE thread count",
+            &[
+                self.config.num_token_heads(shape),
+                self.thread_block.required_threads as usize,
+            ],
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RopeScaling {
@@ -133,13 +162,6 @@ impl RMSNormRopeConfig {
             &[shape.num_total_tokens as usize, self.num_heads as usize],
         )
     }
-
-    fn num_threads(self, shape: RMSNormRopeShape) -> usize {
-        checked_product(
-            "RMSNorm/RoPE thread count",
-            &[self.num_token_heads(shape), NUM_THREADS_PER_THREADBLOCK as usize],
-        )
-    }
 }
 
 impl RopeScaling {
@@ -251,28 +273,28 @@ pub struct RMSNormRopeBuffers<'a> {
 }
 
 pub struct RMSNormRopeKernel {
-    config: RMSNormRopeConfig,
+    specialization: RMSNormRopeKernelSpecialization,
     kernel: Kernel,
 }
 
 impl RMSNormRopeKernel {
     pub fn new(device: &Device, config: RMSNormRopeConfig) -> Self {
-        config.validate();
-        let source = rms_norm_rope_source(config);
-        let function_name = match config.dtype {
+        let specialization = RMSNormRopeKernelSpecialization::new(config);
+        let source = rms_norm_rope_source(specialization);
+        let function_name = match specialization.config.dtype {
             Dtype::Float32 => "rms_norm_rope_f32",
             Dtype::Bfloat16 => "rms_norm_rope_bf16",
             dtype => panic!("unsupported RMSNorm/RoPE dtype {dtype:?}"),
         };
         Self {
-            config,
+            specialization,
             kernel: Kernel::new(device, &source, function_name),
         }
     }
 
     pub fn invoke<'a>(&'a self, shape: RMSNormRopeShape, buffers: RMSNormRopeBuffers<'a>) -> RMSNormRopeInvocation<'a> {
         RMSNormRopeInvocation {
-            config: self.config,
+            specialization: self.specialization,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -287,7 +309,7 @@ impl RMSNormRopeKernel {
         num_active_tokens: ReplayU32,
     ) -> RMSNormRopeInvocation<'a> {
         RMSNormRopeInvocation {
-            config: self.config,
+            specialization: self.specialization,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -296,7 +318,8 @@ impl RMSNormRopeKernel {
     }
 }
 
-fn rms_norm_rope_source(config: RMSNormRopeConfig) -> String {
+fn rms_norm_rope_source(specialization: RMSNormRopeKernelSpecialization) -> String {
+    let config = specialization.config;
     let parameters = config
         .rope_scaling
         .kernel_parameters(config.rope_dim, config.rope_theta);
@@ -322,7 +345,7 @@ fn rms_norm_rope_source(config: RMSNormRopeConfig) -> String {
 }
 
 pub struct RMSNormRopeInvocation<'a> {
-    config: RMSNormRopeConfig,
+    specialization: RMSNormRopeKernelSpecialization,
     kernel: &'a Kernel,
     shape: RMSNormRopeShape,
     buffers: RMSNormRopeBuffers<'a>,
@@ -332,6 +355,7 @@ pub struct RMSNormRopeInvocation<'a> {
 impl Operator for RMSNormRopeInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
+        let specialization = self.specialization;
         let shape = self.shape;
         recorder.set_kernel(self.kernel);
         recorder.set_buffer_read(0, self.buffers.input, 0);
@@ -345,7 +369,10 @@ impl Operator for RMSNormRopeInvocation<'_> {
             shape.num_total_tokens,
             "RMSNorm/RoPE active token count",
         );
-        recorder.dispatch_1d(self.config.num_threads(shape), NUM_THREADS_PER_THREADBLOCK as usize);
+        recorder.dispatch_1d(
+            specialization.num_threads(shape),
+            specialization.thread_block.required_threads as usize,
+        );
     }
 }
 
@@ -362,11 +389,12 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 
 impl RMSNormRopeInvocation<'_> {
     fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.input.len_bytes() >= self.config.bytes(self.shape));
-        assert!(self.buffers.norm_weight.len_bytes() >= self.config.norm_weight_bytes());
-        assert!(self.buffers.flat_token_indices.len_bytes() >= self.config.flat_token_indices_bytes(self.shape));
-        assert!(self.buffers.output.len_bytes() >= self.config.bytes(self.shape));
+        let config = self.specialization.config;
+        self.shape.validate(config);
+        assert!(self.buffers.input.len_bytes() >= config.bytes(self.shape));
+        assert!(self.buffers.norm_weight.len_bytes() >= config.norm_weight_bytes());
+        assert!(self.buffers.flat_token_indices.len_bytes() >= config.flat_token_indices_bytes(self.shape));
+        assert!(self.buffers.output.len_bytes() >= config.bytes(self.shape));
     }
 }
 
@@ -377,12 +405,21 @@ mod tests {
     use super::RMSNormRopeBuffers;
     use super::RMSNormRopeConfig;
     use super::RMSNormRopeKernel;
+    use super::RMSNormRopeKernelSpecialization;
     use super::RMSNormRopeShape;
     use super::RopeScaling;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
     use crate::metal::Stream;
+
+    #[test]
+    fn test_specialization_has_explicit_thread_block_scope() {
+        let specialization =
+            RMSNormRopeKernelSpecialization::new(RMSNormRopeConfig::bf16(4, 128, 128, 1e-6, 1_000_000.0));
+        assert_eq!(specialization.config.num_heads, 4);
+        assert_eq!(specialization.thread_block.required_threads, 128);
+    }
 
     #[test]
     fn test_norm_weight_uses_bf16_storage() {

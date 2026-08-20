@@ -16,7 +16,7 @@ use crate::metal::ReplayParameterKey;
 
 const RESIDUAL_ADD_SOURCE: &str = include_str!("metal/residual_add.metal");
 
-const NUM_THREADS_PER_THREADBLOCK: usize = 256;
+const REQUIRED_THREADS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResidualAddConfig {
@@ -320,10 +320,7 @@ impl Operator for ResidualAddCaptureReplayInvocation {
         recorder.set_u32(6, self.capture.num_destination_columns / 4);
         recorder.set_u32(7, self.capture.column_start / 4);
         let num_vectors = self.residual.shape.num_values as usize / 4;
-        recorder.dispatch_threadblocks(
-            (num_vectors.div_ceil(NUM_THREADS_PER_THREADBLOCK), 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
-        );
+        recorder.dispatch_threadblocks((num_vectors.div_ceil(REQUIRED_THREADS), 1, 1), (REQUIRED_THREADS, 1, 1));
     }
 }
 
@@ -526,8 +523,8 @@ fn record_shape(
 
 fn dispatch_values(recorder: &CommandRecorder, num_values: u32) {
     recorder.dispatch_threadblocks(
-        ((num_values as usize).div_ceil(NUM_THREADS_PER_THREADBLOCK), 1, 1),
-        (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+        ((num_values as usize).div_ceil(REQUIRED_THREADS), 1, 1),
+        (REQUIRED_THREADS, 1, 1),
     );
 }
 

@@ -18,8 +18,6 @@ use crate::metal::ReplayParameterKey;
 
 const RESIDUAL_ADD_RMS_NORM_SOURCE: &str = include_str!("metal/residual_add_rms_norm.metal");
 
-const NUM_THREADS_PER_THREADBLOCK: usize = 1024;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResidualAddRMSNormConfig {
     pub hidden_dim: u32,
@@ -110,6 +108,7 @@ pub struct ResidualAddRMSNormBuffers<'a> {
 /// columns in `capture_output`.
 pub struct ResidualAddRMSNormKernel {
     config: ResidualAddRMSNormConfig,
+    specialization: ResidualAddRMSNormKernelSpecialization,
     kernel: Kernel,
 }
 
@@ -117,6 +116,27 @@ pub struct ResidualAddRMSNormKernel {
 pub enum ResidualAddRMSNormKernelKind {
     Scalar,
     Bf16Vectorized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidualAddRMSNormThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidualAddRMSNormKernelSpecialization {
+    kind: ResidualAddRMSNormKernelKind,
+    thread_block: ResidualAddRMSNormThreadBlockSpecialization,
+}
+
+impl ResidualAddRMSNormKernelSpecialization {
+    fn new(config: ResidualAddRMSNormConfig, kind: ResidualAddRMSNormKernelKind) -> Self {
+        validate_kernel_kind(config, kind);
+        Self {
+            kind,
+            thread_block: ResidualAddRMSNormThreadBlockSpecialization { required_threads: 1024 },
+        }
+    }
 }
 
 impl ResidualAddRMSNormKernel {
@@ -133,13 +153,14 @@ impl ResidualAddRMSNormKernel {
         kind: ResidualAddRMSNormKernelKind,
     ) -> Self {
         config.validate();
-        validate_kernel_kind(config, kind);
+        let specialization = ResidualAddRMSNormKernelSpecialization::new(config, kind);
         Self {
             config,
+            specialization,
             kernel: Kernel::new(
                 device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_rms_norm_function_name(config, kind),
+                residual_add_rms_norm_function_name(config, specialization.kind),
             ),
         }
     }
@@ -152,6 +173,7 @@ impl ResidualAddRMSNormKernel {
         ResidualAddRMSNormInvocation {
             kernel: &self.kernel,
             config: self.config,
+            specialization: self.specialization,
             shape,
             buffers,
             num_active_tokens_key: None,
@@ -168,6 +190,7 @@ impl ResidualAddRMSNormKernel {
         ResidualAddRMSNormInvocation {
             kernel: &self.kernel,
             config: self.config,
+            specialization: self.specialization,
             shape: capacity_shape,
             buffers,
             num_active_tokens_key: Some(num_active_tokens_key),
@@ -178,6 +201,7 @@ impl ResidualAddRMSNormKernel {
 pub struct ResidualAddRMSNormInvocation<'a> {
     kernel: &'a Kernel,
     config: ResidualAddRMSNormConfig,
+    specialization: ResidualAddRMSNormKernelSpecialization,
     shape: ResidualAddRMSNormShape,
     buffers: ResidualAddRMSNormBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
@@ -186,6 +210,7 @@ pub struct ResidualAddRMSNormInvocation<'a> {
 pub struct ResidualAddRMSNormReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     config: ResidualAddRMSNormConfig,
+    specialization: ResidualAddRMSNormKernelSpecialization,
     shape: ResidualAddRMSNormShape,
     buffers: ResidualAddRMSNormOwnedBuffers,
     num_active_tokens_key: Option<ReplayParameterKey>,
@@ -194,6 +219,7 @@ pub struct ResidualAddRMSNormReplayInvocation {
 pub struct ResidualAddCaptureRMSNormReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     config: ResidualAddRMSNormConfig,
+    specialization: ResidualAddRMSNormKernelSpecialization,
     shape: ResidualAddRMSNormShape,
     buffers: ResidualAddCaptureRMSNormOwnedBuffers,
     capture_num_columns: u32,
@@ -306,7 +332,7 @@ impl Operator for ResidualAddRMSNormInvocation<'_> {
         recorder.set_f32(7, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+            (self.specialization.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -325,7 +351,7 @@ impl Operator for ResidualAddRMSNormReplayInvocation {
         recorder.set_f32(7, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+            (self.specialization.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -347,7 +373,7 @@ impl Operator for ResidualAddCaptureRMSNormReplayInvocation {
         recorder.set_f32(10, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+            (self.specialization.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -428,14 +454,16 @@ impl ResidualAddRMSNormReplayInvocation {
         buffers: ResidualAddRMSNormOwnedBuffers,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
+        let specialization = ResidualAddRMSNormKernelSpecialization::new(config, selected_kernel_kind(config));
         Self {
             pipeline: Kernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_rms_norm_function_name(config, selected_kernel_kind(config)),
+                residual_add_rms_norm_function_name(config, specialization.kind),
             )
             .as_raw_retained(),
             config,
+            specialization,
             shape,
             buffers,
             num_active_tokens_key: None,
@@ -449,14 +477,16 @@ impl ResidualAddRMSNormReplayInvocation {
         buffers: ResidualAddRMSNormOwnedBuffers,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
+        let specialization = ResidualAddRMSNormKernelSpecialization::new(config, selected_kernel_kind(config));
         Self {
             pipeline: Kernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_rms_norm_function_name(config, selected_kernel_kind(config)),
+                residual_add_rms_norm_function_name(config, specialization.kind),
             )
             .as_raw_retained(),
             config,
+            specialization,
             shape: capacity_shape,
             buffers,
             num_active_tokens_key: Some(num_active_tokens_key),
@@ -536,6 +566,8 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         capture_column_start: u32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
+        let specialization =
+            ResidualAddRMSNormKernelSpecialization::new(config, ResidualAddRMSNormKernelKind::Bf16Vectorized);
         Self {
             pipeline: Kernel::new(
                 &device,
@@ -544,6 +576,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             )
             .as_raw_retained(),
             config,
+            specialization,
             shape,
             buffers,
             capture_num_columns,
@@ -561,6 +594,8 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
         capture_column_start: u32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
+        let specialization =
+            ResidualAddRMSNormKernelSpecialization::new(config, ResidualAddRMSNormKernelKind::Bf16Vectorized);
         Self {
             pipeline: Kernel::new(
                 &device,
@@ -569,6 +604,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             )
             .as_raw_retained(),
             config,
+            specialization,
             shape: capacity_shape,
             buffers,
             capture_num_columns,
@@ -687,6 +723,16 @@ mod tests {
     use crate::components::ResidualAddKernel;
     use crate::components::ResidualAddShape;
     use crate::metal::Stream;
+
+    #[test]
+    fn test_specialization_has_explicit_thread_block_scope() {
+        let specialization = ResidualAddRMSNormKernelSpecialization::new(
+            ResidualAddRMSNormConfig::bf16(128, 1.0e-6),
+            ResidualAddRMSNormKernelKind::Bf16Vectorized,
+        );
+        assert_eq!(specialization.kind, ResidualAddRMSNormKernelKind::Bf16Vectorized);
+        assert_eq!(specialization.thread_block.required_threads, 1024);
+    }
 
     #[test]
     #[should_panic(expected = "BF16 residual-add RMSNorm hidden_dim must be divisible by 4")]

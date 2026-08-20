@@ -14,7 +14,37 @@ use crate::metal::ReplayParameterKey;
 const RMS_NORM_SOURCE: &str = include_str!("metal/rms_norm.metal");
 
 const BF16_VECTOR_WIDTH: u32 = 4;
-const NUM_THREADS_PER_THREADBLOCK: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RMSNormKernelKind {
+    F32,
+    Bf16Vectorized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RMSNormThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RMSNormKernelSpecialization {
+    kind: RMSNormKernelKind,
+    thread_block: RMSNormThreadBlockSpecialization,
+}
+
+impl RMSNormKernelSpecialization {
+    fn new(config: RMSNormConfig) -> Self {
+        config.validate();
+        Self {
+            kind: match config.io_dtype {
+                Dtype::Float32 => RMSNormKernelKind::F32,
+                Dtype::Bfloat16 => RMSNormKernelKind::Bf16Vectorized,
+                dtype => panic!("unsupported RMSNorm dtype {dtype:?}"),
+            },
+            thread_block: RMSNormThreadBlockSpecialization { required_threads: 1024 },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RMSNormConfig {
@@ -100,15 +130,18 @@ pub struct RMSNormBuffers<'a> {
 /// ```
 pub struct RMSNormKernel {
     config: RMSNormConfig,
+    specialization: RMSNormKernelSpecialization,
     kernel: Kernel,
 }
 
 impl RMSNormKernel {
     pub fn new(device: &Device, config: RMSNormConfig) -> Self {
         config.validate();
+        let specialization = RMSNormKernelSpecialization::new(config);
         Self {
             config,
-            kernel: Kernel::new(device, RMS_NORM_SOURCE, rms_norm_function_name(config)),
+            specialization,
+            kernel: Kernel::new(device, RMS_NORM_SOURCE, rms_norm_function_name(specialization)),
         }
     }
 
@@ -116,6 +149,7 @@ impl RMSNormKernel {
         RMSNormInvocation {
             kernel: &self.kernel,
             config: self.config,
+            specialization: self.specialization,
             shape,
             buffers,
             num_active_tokens_key: None,
@@ -132,6 +166,7 @@ impl RMSNormKernel {
         RMSNormInvocation {
             kernel: &self.kernel,
             config: self.config,
+            specialization: self.specialization,
             shape: capacity_shape,
             buffers,
             num_active_tokens_key: Some(num_active_tokens_key),
@@ -142,6 +177,7 @@ impl RMSNormKernel {
 pub struct RMSNormInvocation<'a> {
     kernel: &'a Kernel,
     config: RMSNormConfig,
+    specialization: RMSNormKernelSpecialization,
     shape: RMSNormShape,
     buffers: RMSNormBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
@@ -150,6 +186,7 @@ pub struct RMSNormInvocation<'a> {
 pub struct RMSNormReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     config: RMSNormConfig,
+    specialization: RMSNormKernelSpecialization,
     shape: RMSNormShape,
     buffers: RMSNormOwnedBuffers,
     num_active_tokens_key: Option<ReplayParameterKey>,
@@ -158,6 +195,7 @@ pub struct RMSNormReplayInvocation {
 pub struct RMSNormReplayOp {
     pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub config: RMSNormConfig,
+    specialization: RMSNormKernelSpecialization,
     pub shape: RMSNormShape,
     pub buffers: RMSNormOwnedBuffers,
     pub num_active_tokens_key: Option<ReplayParameterKey>,
@@ -185,7 +223,7 @@ impl Operator for RMSNormInvocation<'_> {
         recorder.set_f32(5, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+            (self.specialization.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -202,7 +240,7 @@ impl Operator for RMSNormReplayInvocation {
         recorder.set_f32(5, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (NUM_THREADS_PER_THREADBLOCK, 1, 1),
+            (self.specialization.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -212,6 +250,7 @@ impl RMSNormInvocation<'_> {
         RMSNormReplayOp {
             pipeline: self.kernel.as_raw_retained(),
             config: self.config,
+            specialization: self.specialization,
             shape: self.shape,
             buffers: RMSNormOwnedBuffers {
                 input: self.buffers.input.as_raw_retained(),
@@ -249,6 +288,7 @@ impl RMSNormReplayOp {
         RMSNormReplayInvocation {
             pipeline: self.pipeline,
             config: self.config,
+            specialization: self.specialization,
             shape: self.shape,
             buffers: self.buffers,
             num_active_tokens_key: self.num_active_tokens_key,
@@ -268,11 +308,10 @@ fn record_num_active_tokens(
     }
 }
 
-fn rms_norm_function_name(config: RMSNormConfig) -> &'static str {
-    match config.io_dtype {
-        Dtype::Float32 => "rms_norm_f32",
-        Dtype::Bfloat16 => "rms_norm_bf16_vec4",
-        dtype => panic!("unsupported RMSNorm dtype {dtype:?}"),
+fn rms_norm_function_name(specialization: RMSNormKernelSpecialization) -> &'static str {
+    match specialization.kind {
+        RMSNormKernelKind::F32 => "rms_norm_f32",
+        RMSNormKernelKind::Bf16Vectorized => "rms_norm_bf16_vec4",
     }
 }
 
@@ -286,6 +325,17 @@ mod tests {
     use crate::metal::Stream;
 
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.rms_norm.num_active_tokens");
+
+    #[test]
+    fn test_specialization_has_explicit_thread_block_scope() {
+        let f32 = RMSNormKernelSpecialization::new(RMSNormConfig::f32(64, 1.0e-6));
+        assert_eq!(f32.kind, RMSNormKernelKind::F32);
+        assert_eq!(f32.thread_block.required_threads, 1024);
+
+        let bf16 = RMSNormKernelSpecialization::new(RMSNormConfig::bf16(64, 1.0e-6));
+        assert_eq!(bf16.kind, RMSNormKernelKind::Bf16Vectorized);
+        assert_eq!(bf16.thread_block.required_threads, 1024);
+    }
 
     #[test]
     fn test_bucketed_fixed() {

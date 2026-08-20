@@ -320,6 +320,8 @@ For exact files and current paths, use the component documents:
 - [`executor_dense_mlp.md`](executor_dense_mlp.md): dense gated MLP.
 - [`executor_moe.md`](executor_moe.md): routing and sparse expert execution.
 - [`executor_sampling.md`](executor_sampling.md): ordinary sampling and sparse rejection.
+- [`executor_model_primitives.md`](executor_model_primitives.md): embedding, unembedding, normalization, residual, and
+  fused RoPE components.
 
 ## Model composition
 
