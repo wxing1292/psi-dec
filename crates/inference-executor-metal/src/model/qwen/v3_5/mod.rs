@@ -4,7 +4,7 @@ use crate::attn::gqa::backend::GQAReplayTopology;
 
 pub mod executor;
 pub mod main;
-pub mod plan;
+pub mod component_config;
 
 mod mtp;
 

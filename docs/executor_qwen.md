@@ -355,8 +355,8 @@ Qwen3 has one runtime cache lane and allocates no GDN state domain.
 The executor splits each runtime block between Main K/V and persistent DSpark context K/V.
 
 There is no Main/MTP plan object tree or aggregate component-weight owner.
-Qwen3 Main owns QKV GQA and dense-MLP geometry conversion in `qwen/v3/main/plan.rs`.
-Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, and MTP validation in `qwen/v3_5/plan.rs`.
+Qwen3 Main owns QKV GQA and dense-MLP geometry conversion in `qwen/v3/main/component_config.rs`.
+Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, and MTP validation in `qwen/v3_5/component_config.rs`.
 Qwen3x DSpark has no plan object or plan source file.
 Each DSpark semantic owner derives its model geometry from `Qwen3xDSparkConfig`, uses the selected
 `num_spec_tokens` for proposal geometry, and resolves its affine layout from the exact binding subtree that it consumes.

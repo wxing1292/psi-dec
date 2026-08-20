@@ -25,7 +25,7 @@ pub mod embed;
 pub mod gqa;
 pub mod layer;
 pub mod output;
-pub mod plan;
+pub mod component_config;
 
 pub struct Qwen3Main {
     layers: Vec<Qwen3MainLayer>,

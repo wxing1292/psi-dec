@@ -23,11 +23,11 @@ use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::qwen::v3_5::Qwen35GQAReplayKey;
+use crate::model::qwen::v3_5::component_config::Qwen35MetalDefaults;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayer;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerInput;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPMLPReplayTopology;
-use crate::model::qwen::v3_5::plan::Qwen35MetalDefaults;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::rms_norm::RMSNorm;
@@ -433,8 +433,8 @@ mod tests {
     use inference_runtime_core::runtime::Token;
 
     use super::*;
-    use crate::model::qwen::v3_5::plan::derive_qwen35_dense_mlp_configs;
-    use crate::model::qwen::v3_5::plan::derive_qwen35_gqa_configs;
+    use crate::model::qwen::v3_5::component_config::derive_qwen35_dense_mlp_configs;
+    use crate::model::qwen::v3_5::component_config::derive_qwen35_gqa_configs;
 
     #[test]
     fn test_prepare_pages_maps_cache_lanes_to_gqa_layers() {

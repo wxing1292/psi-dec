@@ -1,3 +1,5 @@
+//! Derives Metal component configuration from a Qwen3.5 checkpoint configuration.
+
 use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GDNCore;

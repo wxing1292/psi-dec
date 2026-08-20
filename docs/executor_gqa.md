@@ -372,10 +372,10 @@ One KV split can cover several consecutive KV iterations. The replay bucket poli
 produce the total replay dispatch and scratch extent. The replay field retains its established name.
 
 The backend configuration is model-independent.
-`model/qwen/v3/main/plan.rs` builds the Qwen3 Main ungated core.
+`model/qwen/v3/main/component_config.rs` builds the Qwen3 Main ungated core.
 Each `model/qwen/v3_x/dspark/attention.rs` layer derives its ungated core and Metal configuration from the normalized
 DSpark config and its exact attention binding subtree.
-`model/qwen/v3_5/plan.rs` builds gated Main and MTP cores.
+`model/qwen/v3_5/component_config.rs` builds gated Main and MTP cores.
 
 Each DSpark layer owns its weight-dependent `UngatedDSparkGQA` and `UngatedDSparkGQAContextAppender`.
 `UngatedDSparkGQAState` owns the shared page table, metadata, scratch, and SplitKV SingleQ history contract.
