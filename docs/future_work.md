@@ -20,8 +20,6 @@ document that owns the component.
 
 ## Runtime Lifecycle
 
-- Drain the user and reservation-completion channels before flushing when both channels are ready.
-  This behavior prevents queue priority from depending on crossbeam select order.
 - Redesign host-pinned segment ownership before enabling offload.
   An allocation must have unique ownership for mutation and free operations.
   The new design permits only read-only shared views.
@@ -29,8 +27,8 @@ document that owns the component.
   Then implement KV and state onload and offload as a separate lifecycle.
   This lifecycle must remain distinct from the existing reservation-wait task.
   Follow the ownership and lifecycle design in [`model_state_io.md`](model_state_io.md).
-- Rename the current reservation-wait `SwapOutTask` before per-request swap is implemented.
-  Keep the request status `Running` while it waits for a reservation.
+- Implement per-request `SwapOutTask` and swap-in work only for real model-state movement.
+  Keep `AwaitReservation` in the scheduler-owned wait collection.
   Reserve `Swapped` for a request whose model state is not device-resident.
 - Measure and optimize full and selected model-state snapshot I/O.
   Keep weight handling outside this path.

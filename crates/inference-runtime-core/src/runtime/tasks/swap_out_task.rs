@@ -31,7 +31,7 @@ where
 
     async fn run(self) -> Self::Output {
         match self {
-            Self::AwaitReservation(task) => task.run().await,
+            Self::AwaitReservation(task) => task.await,
         }
     }
 }

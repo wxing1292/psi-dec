@@ -1,4 +1,8 @@
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 
 use futures_lite::future::Boxed;
 
@@ -7,8 +11,7 @@ use crate::compute::DevResp;
 use crate::runtime::scheduler::UserRequest;
 
 pub struct AwaitReservation<UserReq, DeviceReq, DeviceResp> {
-    user_req: UserReq,
-    wait: Boxed<()>,
+    future: Boxed<UserReq>,
     phantom_data: PhantomData<fn() -> (DeviceReq, DeviceResp)>,
 }
 
@@ -19,30 +22,30 @@ where
     DeviceResp: DevResp,
 {
     pub fn new(user_req: UserReq, wait: Boxed<()>) -> Self {
+        let future = Box::pin(async move {
+            if user_req.is_terminal() {
+                return user_req;
+            }
+            wait.await;
+            user_req
+        });
         Self {
-            user_req,
-            wait,
+            future,
             phantom_data: PhantomData,
         }
     }
+}
 
-    pub async fn run(self) -> UserReq {
-        let Self { user_req, wait, .. } = self;
-        if !user_req.store_swapped() {
-            assert!(
-                user_req.is_terminal(),
-                "swap-out task requires a running or terminal request"
-            );
-            return user_req;
-        }
-        wait.await;
-        if !user_req.store_running() {
-            assert!(
-                user_req.is_terminal(),
-                "completed swap-out task requires a swapped or terminal request"
-            );
-        }
-        user_req
+impl<UserReq, DeviceReq, DeviceResp> Future for AwaitReservation<UserReq, DeviceReq, DeviceResp>
+where
+    UserReq: UserRequest<DeviceReq, DeviceResp>,
+    DeviceReq: DevReq,
+    DeviceResp: DevResp,
+{
+    type Output = UserReq;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
     }
 }
 
@@ -63,10 +66,9 @@ mod tests {
     #[tokio::test]
     async fn test_complete() {
         let mut user_req = TestUserReq::new();
-        user_req.expect_store_swapped().once().return_const(true);
-        user_req.expect_store_running().once().return_const(true);
+        user_req.expect_is_terminal().once().return_const(false);
 
-        let _user_req = TestAwaitReservation::new(user_req, Box::pin(async {})).run().await;
+        let _user_req = TestAwaitReservation::new(user_req, Box::pin(async {})).await;
     }
 
     #[tokio::test]
@@ -74,7 +76,6 @@ mod tests {
         let waited = Arc::new(AtomicBool::new(false));
         let waited_by_task = waited.clone();
         let mut user_req = TestUserReq::new();
-        user_req.expect_store_swapped().once().return_const(false);
         user_req.expect_is_terminal().once().return_const(true);
 
         let _user_req = TestAwaitReservation::new(
@@ -83,20 +84,17 @@ mod tests {
                 waited_by_task.store(true, Ordering::Release);
             }),
         )
-        .run()
         .await;
 
         assert!(!waited.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn test_terminal_after_wait() {
+    async fn test_wait() {
         let waited = Arc::new(AtomicBool::new(false));
         let waited_by_task = waited.clone();
         let mut user_req = TestUserReq::new();
-        user_req.expect_store_swapped().once().return_const(true);
-        user_req.expect_store_running().once().return_const(false);
-        user_req.expect_is_terminal().once().return_const(true);
+        user_req.expect_is_terminal().once().return_const(false);
 
         let _user_req = TestAwaitReservation::new(
             user_req,
@@ -104,7 +102,6 @@ mod tests {
                 waited_by_task.store(true, Ordering::Release);
             }),
         )
-        .run()
         .await;
 
         assert!(waited.load(Ordering::Acquire));

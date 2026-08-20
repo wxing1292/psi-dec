@@ -84,6 +84,10 @@ where
         self.num_swap_in += 1;
     }
 
+    fn pop_ready_reqs(&mut self) -> Option<UserReq> {
+        self.scheduler.pop_ready_reqs()
+    }
+
     fn can_flush(&self) -> bool {
         self.scheduler.can_flush()
     }
@@ -179,6 +183,7 @@ mod tests {
             MockScheduler::<TestUserReq, MockDevReq, MockDevResp, TestBatchDeviceReq, TestBatchDeviceResp>::new();
         inner.expect_enqueue().once().return_once(drop);
         inner.expect_swap_in().once().return_once(drop);
+        inner.expect_pop_ready_reqs().once().return_once(|| None);
         inner.expect_can_flush().once().return_const(true);
         inner.expect_prepare().once().return_once(TestBatchDeviceReq::new);
         inner.expect_cancel().once().return_once(drop);
@@ -187,6 +192,7 @@ mod tests {
         let mut scheduler = InstrumentedScheduler::new(inner);
         scheduler.enqueue(TestUserReq::new());
         scheduler.swap_in(TestUserReq::new());
+        assert!(scheduler.pop_ready_reqs().is_none());
         assert!(scheduler.can_flush());
         let batch_dev_req = scheduler.prepare();
         scheduler.cancel(batch_dev_req);

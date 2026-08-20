@@ -13,7 +13,6 @@ use crate::runtime::scheduler::ComputePhase;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::ScheduleQueue;
 use crate::runtime::scheduler::UserRequest;
-use crate::runtime::tasks::SwapOutTask;
 
 pub struct FIFOBatcher<UserReq, DeviceReq, DeviceResp> {
     running_reqs: Vec<UserReq>,
@@ -114,16 +113,7 @@ where
                 },
                 PrepareResult::Await { wait } => {
                     sticky_token_budgets.remove(&req_id);
-                    let swap_out_task = SwapOutTask::await_reservation(user_req, wait);
-                    match schedule_queue.push_swap_out(swap_out_task) {
-                        Ok(()) => {},
-                        Err(async_channel::TrySendError::Full(_)) => {
-                            panic!("swap-out task channel is full")
-                        },
-                        Err(async_channel::TrySendError::Closed(_)) => {
-                            panic!("swap-out task channel is closed")
-                        },
-                    }
+                    schedule_queue.push_waiting_reqs(user_req, wait);
                     continue 'prepare_loop;
                 },
                 PrepareResult::Skip => {
@@ -955,7 +945,6 @@ mod tests {
                     wait: Box::pin(async {}),
                 }
             });
-
         let (swap_out_task_tx, swap_out_task_rx) = async_bounded(1);
         let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
         schedule_queue.push_back(user_req);
@@ -970,9 +959,8 @@ mod tests {
         );
         assert!(dev_reqs.is_empty());
 
-        let _swap_out_task = swap_out_task_rx
-            .try_recv()
-            .expect("awaiting request should enqueue swap-out task");
+        assert_eq!(schedule_queue.pop_ready_reqs().map(|req| req.id()), Some(req_id));
+        assert!(swap_out_task_rx.try_recv().is_err());
     }
 
     #[test]

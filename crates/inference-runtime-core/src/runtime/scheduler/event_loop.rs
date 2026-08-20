@@ -136,6 +136,9 @@ where
                     match model_executor_resp {
                         ReplayableModelExecutorResponse::Batch(batch_dev_resp) => {
                             self.scheduler.commit(batch_dev_resp);
+                            while let Some(user_req) = self.scheduler.pop_ready_reqs() {
+                                self.swap_in(user_req);
+                            }
                             self.idle_heartbeat = Instant::now();
                         },
                         ReplayableModelExecutorResponse::Started | ReplayableModelExecutorResponse::Stopped => {},
@@ -145,17 +148,7 @@ where
                     let user_req = op
                         .recv(&self.swap_in_task_rx)
                         .map_err(|error| log_err_internal!("swap-in request channel closed, stopping: {error}"))?;
-                    if user_req.is_terminal() {
-                        tracing::debug!(
-                            target: "inference-runtime-core::scheduler",
-                            phase = "request.reservation_wait_terminal",
-                            request_id = user_req.id(),
-                            "terminal reservation-wait request dropped"
-                        );
-                        drop(user_req);
-                    } else {
-                        self.scheduler.swap_in(user_req);
-                    }
+                    self.swap_in(user_req);
                 },
                 _ if Some(op_index) == op_recv_req => {
                     let queued_req = op
@@ -193,6 +186,20 @@ where
         );
         tracing::info!("stopped");
         Ok(())
+    }
+
+    fn swap_in(&mut self, user_req: UserReq) {
+        if user_req.is_terminal() {
+            tracing::debug!(
+                target: "inference-runtime-core::scheduler",
+                phase = "request.reservation_wait_terminal",
+                request_id = user_req.id(),
+                "terminal reservation-wait request dropped"
+            );
+            drop(user_req);
+        } else {
+            self.scheduler.swap_in(user_req);
+        }
     }
 
     fn do_flush(&mut self) -> Result<()> {

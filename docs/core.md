@@ -72,7 +72,8 @@ then use that block as a non-terminal prefix.
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ ScheduleQueue                                                              │
-│ new_queue | unique run_queue | ID -> request map | swap-out task sender    │
+│ new_queue | unique run_queue | ID -> request map                           │
+│ unordered AwaitReservation futures | swap-out task sender                  │
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -99,8 +100,8 @@ then use that block as a non-terminal prefix.
            │ Continue      │ Pending        │ Await            │ resource/term
            v               v                v                  v
 ┌──────────────────┐  ┌───────────────┐  ┌────────────────┐  ┌───────────────┐
-│ BatchDeviceReq   │  │ ID map only   │  │ swap-out task  │  │ preempt/drop  │
-│ Prefill: requeue │  │ await response│  │ async wait     │  │ or terminal   │
+│ BatchDeviceReq   │  │ ID map only   │  │ waiting_reqs   │  │ preempt/drop  │
+│ Prefill: requeue │  │ await response│  │ wait future    │  │ or terminal   │
 │ Decode: map only │  └───────────────┘  └────────────────┘  └───────────────┘
 └────────┬─────────┘
          │ executor submission
@@ -146,7 +147,7 @@ request-ID-to-token-budget map. `FIFOBatcher` consumes this map before it uses t
 budgets for the normal FIFO queue.
 
 Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_queued_requests` bounds the
-user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and both reservation-task
+user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and both swap-task
 channels.
 
 `SchedulerConfig::max_requests`, `max_tokens`, and `max_tokens_per_request` remain per-batch limits.
@@ -169,13 +170,16 @@ request-slot allocator reports free capacity.
 After the event loop receives a request, it allocates one slot. It then constructs the `InternalRequest` that the
 scheduler consumes.
 
-The same slot follows the request until request drop. It passes through run queues, device-pending work,
-reservation-task queues, and asynchronous runners.
+The same slot follows the request until request drop. It passes through run queues, device-pending work, and the
+scheduler-owned reservation-wait collection.
 
 Request-slot allocator usage is therefore the single admission count. No separate running-request counter exists.
 
-`PrepareResult::Await` transfers the request into a bounded asynchronous task queue. It does not produce a device
-request for that request.
+`PrepareResult::Await` transfers the request into the `ScheduleQueue` reservation-wait collection. The collection is a
+`FuturesUnordered<AwaitReservation<...>>`. It does not produce a device request for that request.
+
+`AwaitReservation` is not a general asynchronous task. Its wait future must retain completion until the scheduler
+polls it. It must not require an independent timer or I/O wake to make the synchronous event loop poll the collection.
 
 After preparation starts, the scheduler still allocates a compute slot and submits the resulting batch. It does this
 even when the batch contains zero device requests.
@@ -183,26 +187,30 @@ even when the batch contains zero device requests.
 Empty batches preserve executor participation for backends such as distributed expert parallelism. The empty response
 releases the compute slot in normal sequence order.
 
-A task runner transitions `Running -> Swapped` immediately before it awaits the reservation. After completion, it
-transitions `Swapped -> Running`.
+The request remains `Running` while it waits for the reservation. A reservation wait does not change model-state
+residency.
 
-The task runner publishes the request through a bounded synchronous completion channel. The synchronous event loop owns
-the receiver and appends the request to the run queue.
+`SimpleScheduler::commit` commits the device response first. After `commit` returns, the event loop calls
+`Scheduler::pop_ready_reqs` until the method returns `None`. `SimpleScheduler` delegates each call to
+`ScheduleQueue::pop_ready_reqs`. This method synchronously polls the unordered wait collection and returns at most one
+ready request.
 
-A request can become terminal before or during the wait. The request then stays terminal. The event loop logs and
-releases it instead of re-enqueuing it.
+A request can become terminal before or during the wait. The request then stays terminal. The event loop applies the
+same terminal check that it applies to an asynchronous swap-in completion. It releases a terminal request. Otherwise,
+it calls `Scheduler::swap_in`, which appends the request to the back of `run_queue`.
 
-Shutdown cancels the wait by dropping task and request ownership. The task pool runs on the service's Tokio runtime.
-The scheduler event loop remains a synchronous thread.
+Shutdown cancels reservation waits when it drops the scheduler and its wait collection. The scheduler event loop
+remains a synchronous thread.
 
-This is the complete lifecycle for asynchronous cache-reservation waits. This lifecycle is not KV and state offload.
+This is the complete lifecycle for cache-reservation waits. This lifecycle is not KV and state offload.
 Backing storage remains unchanged. Future onload and offload require an additional explicit ownership design.
 
-The event loop can submit after three events:
+The event loop can submit after two request-work events:
 
 - It receives a user request.
-- It receives a completed reservation wait.
 - It commits a device response.
+
+A device-response commit also discovers completed reservation waits before the event loop prepares the next batch.
 
 The event loop submits immediately when the scheduler has runnable token work and a free compute slot.
 
@@ -481,7 +489,7 @@ Request status tracks lifecycle ownership, not scheduler placement:
 ```text
 Initialized -> queued request exists but has not entered runtime admission
 Running     -> request owns a request slot in the normal runtime path
-Swapped     -> request ownership is held by an async reservation task and may later be re-enqueued
+Swapped     -> reserved for a request whose model state is not device-resident
 terminal    -> Cancelled, TimedOut, Aborted, or Completed(CompletionReason)
 ```
 
@@ -511,21 +519,18 @@ An out-of-order response is an internal contract violation.
 
 Recommendation: Fail fast on this response until a real transport reorder contract exists.
 
-Reservation waits use bounded swap-out and swap-in channels. Their capacities
-equal `RuntimeConfig::max_running_requests`, which is also the hard
-request-slot limit and the executor request-state domain. Every admitted
-request owns exactly one slot and can occupy either channel once.
+Reservation waits do not use the swap-out and swap-in channels. `ScheduleQueue` owns them in `waiting_reqs`.
+`RuntimeConfig::max_running_requests` bounds this collection through the request-slot limit. Every admitted request
+owns exactly one slot while it waits.
 
-The runtime fails fast when either channel is full. A full channel indicates an ownership or accounting bug.
+The existing swap-task channels remain separate from reservation waits. Their capacities equal
+`RuntimeConfig::max_running_requests`.
 
 The run queue has priority over the new queue:
 
 - A continued request goes to the front.
 - A completed reservation wait goes to the back.
 - A new request enters the new queue.
-
-Crossbeam selection can still receive a new request immediately before an already-ready swap-in completion. Draining
-both ready input channels before flushing remains future work.
 
 Actual KV and state onload and offload also remain future work. This work must not use the reservation-wait name as if
 data movement already existed.

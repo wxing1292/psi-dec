@@ -110,6 +110,10 @@ where
         self.schedule_queue.push_back(user_req);
     }
 
+    fn pop_ready_reqs(&mut self) -> Option<UserReq> {
+        self.schedule_queue.pop_ready_reqs()
+    }
+
     fn can_flush(&self) -> bool {
         let token_budget = self.max_token_budget.min(self.max_token_per_req);
         !self.free_compute_slots.is_empty() && self.schedule_queue.token_estimate(token_budget) > 0

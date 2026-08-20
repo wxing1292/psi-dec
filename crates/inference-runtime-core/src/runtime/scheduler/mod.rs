@@ -45,6 +45,7 @@ where
 {
     fn enqueue(&mut self, user_req: UserReq);
     fn swap_in(&mut self, user_req: UserReq);
+    fn pop_ready_reqs(&mut self) -> Option<UserReq>;
     fn can_flush(&self) -> bool;
 
     fn prepare(&mut self) -> BatchDeviceReq;
