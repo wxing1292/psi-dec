@@ -94,10 +94,10 @@ impl DSparkMarkovTopKMapConfig {
         self.confidence.validate(self.rank);
         let specialization = DSparkMarkovTopKMapKernelSpecialization::current();
         specialization.validate();
-        let _ = self.threadblock_memory_bytes(specialization);
+        let _ = self.thread_block_memory_bytes(specialization);
     }
 
-    fn threadblock_memory_bytes(self, specialization: DSparkMarkovTopKMapKernelSpecialization) -> usize {
+    fn thread_block_memory_bytes(self, specialization: DSparkMarkovTopKMapKernelSpecialization) -> usize {
         (self.rank as usize)
             .checked_mul(self.io_dtype.item_size())
             .and_then(|bytes| {
@@ -192,12 +192,12 @@ impl DSparkMarkovTopKMapKernel {
         config.validate();
         let specialization = DSparkMarkovTopKMapKernelSpecialization::current();
         specialization.validate();
-        let required_threadblock_memory_bytes = config.threadblock_memory_bytes(specialization);
-        let max_threadblock_memory_bytes = device.max_threadblock_memory_length();
+        let required_thread_block_memory_bytes = config.thread_block_memory_bytes(specialization);
+        let max_thread_block_memory_bytes = device.max_threadblock_memory_length();
         assert!(
-            required_threadblock_memory_bytes <= max_threadblock_memory_bytes,
-            "DSpark Markov requires {required_threadblock_memory_bytes} bytes of threadblock memory, but the device \
-             supports {max_threadblock_memory_bytes}"
+            required_thread_block_memory_bytes <= max_thread_block_memory_bytes,
+            "DSpark Markov requires {required_thread_block_memory_bytes} bytes of thread-block memory, but the device \
+             supports {max_thread_block_memory_bytes}"
         );
         let kernel = Kernel::new(device, &source(config, specialization), "dspark_markov_top_k_map");
         let max_total_threads = kernel.max_total_threads_per_threadblock();
@@ -216,11 +216,11 @@ impl DSparkMarkovTopKMapKernel {
             (required_threads as usize).is_multiple_of(thread_execution_width),
             "DSpark Markov threadblock size must contain complete SIMDgroups"
         );
-        let static_threadblock_memory_bytes = kernel.static_threadblock_memory_length();
+        let static_thread_block_memory_bytes = kernel.static_threadblock_memory_length();
         assert!(
-            static_threadblock_memory_bytes <= max_threadblock_memory_bytes,
-            "DSpark Markov pipeline uses {static_threadblock_memory_bytes} bytes of threadblock memory, but the \
-             device supports {max_threadblock_memory_bytes}"
+            static_thread_block_memory_bytes <= max_thread_block_memory_bytes,
+            "DSpark Markov pipeline uses {static_thread_block_memory_bytes} bytes of thread-block memory, but the \
+             device supports {max_thread_block_memory_bytes}"
         );
         Self {
             config,
