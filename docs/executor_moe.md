@@ -377,7 +377,7 @@ The current routing kernel supports at most 256 experts and at most 16 selected 
 `MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
 
 Production callers may allocate scratch with the executor's maximum token capacity.
-A private `GatedMoEExecutionPlanner` selects `GatedMoEComputePath` from the current `num_tokens`.
+The pure `GatedMoEComputePath::select(...)` helper selects the path from the current `num_tokens`.
 A bucketed replay selects it from `num_total_tokens`.
 Each path validates that buffers cover its recorded total route, input, scratch, and output shapes.
 The token-major path consumes `token_indices` and `route_indices` directly.
@@ -587,7 +587,7 @@ Recommendation: Add replay barriers only at these actual dependencies:
 MoE has one semantic owner and two complete command-graph decompositions:
 
 ```text
-GatedMoEExecutionPlanner
+GatedMoEComputePath::select
     -> GatedMoEComputePath::TokenMajor
     |      routing -> token-major sparse expert MLP -> combine
     |
@@ -595,9 +595,10 @@ GatedMoEExecutionPlanner
            routing -> layout -> pack -> expert-major sparse MLP -> scatter
 ```
 
-`GatedMoEComputePath` remains the replay-topology identity because it names a different command graph. The private
-planner is the only owner of the token-count threshold. Topology reporting, exact recording, and bucketed recording
-call the same planner. They do not duplicate the threshold.
+`GatedMoEComputePath` remains the replay-topology identity because it names a different command graph. Its pure
+`select(...)` helper is the only owner of the token-count threshold. Topology reporting, exact recording, and bucketed
+recording call the same helper. Repeating this inexpensive calculation is intentional. The component does not
+materialize a plan object.
 
 Each non-persistent leaf kernel defines its own task:
 
@@ -622,7 +623,7 @@ affine kernels own their matrix tiles and thread ownership.
 
 ### Backend selection boundary
 
-`GatedMoE` owns `GatedMoEExecutionPlanner` and compute-path selection.
+`GatedMoE` owns compute-path selection through `GatedMoEComputePath::select(...)`.
 `QuantizedSparseMLP` owns only expert inner compute.
 The current production selector is:
 
