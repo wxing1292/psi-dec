@@ -1,4 +1,4 @@
-use inference_backend_metal::components::GQASDPAConfig;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 
 use self::backend::GQAMetalConfig;
 
@@ -10,7 +10,12 @@ pub mod sdpa;
 pub mod ungated_backend;
 pub mod ungated_scratch;
 
-fn gqa_sdpa_config(config: GQAMetalConfig, num_q_heads: usize, num_kv_heads: usize, head_dim: usize) -> GQASDPAConfig {
+fn gqa_sdpa_config(
+    config: GQAMetalConfig,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> backend_sdpa::Config {
     let num_q_heads = num_q_heads.try_into().expect("GQA Q-head count must fit u32");
     let num_kv_heads = num_kv_heads.try_into().expect("GQA KV-head count must fit u32");
     let head_dim: u32 = head_dim.try_into().expect("GQA head_dim must fit u32");
@@ -27,7 +32,7 @@ fn gqa_sdpa_config(config: GQAMetalConfig, num_q_heads: usize, num_kv_heads: usi
     let tokens_per_page = (u64::from(config.page_bytes) / io_bytes_per_token)
         .try_into()
         .expect("GQA tokens per page must fit u32");
-    GQASDPAConfig {
+    backend_sdpa::Config {
         io_dtype: config.io_dtype,
         num_q_heads,
         num_kv_heads,

@@ -7,7 +7,6 @@ use inference_backend_metal::components::GQAQKVSplitBuffers;
 use inference_backend_metal::components::GQAQKVSplitConfig;
 use inference_backend_metal::components::GQAQKVSplitKernel;
 use inference_backend_metal::components::GQAQKVSplitShape;
-use inference_backend_metal::components::GQASDPASpecializationRegistry;
 use inference_backend_metal::components::GQASplitKVSingleQConfig;
 use inference_backend_metal::components::GQASplitKVSingleQKernels;
 use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
@@ -22,6 +21,7 @@ use inference_backend_metal::components::RMSNormRopeBuffers;
 use inference_backend_metal::components::RMSNormRopeConfig;
 use inference_backend_metal::components::RMSNormRopeKernel;
 use inference_backend_metal::components::RMSNormRopeShape;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -37,8 +37,8 @@ use super::gqa_sdpa_config;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
-use crate::attn::gqa::sdpa::GQASDPAPlanner;
-use crate::attn::gqa::sdpa::GQASDPARequestShape;
+use crate::attn::gqa::sdpa::RequestShape;
+use crate::attn::gqa::sdpa::Selector;
 use crate::attn::gqa::ungated_scratch::UngatedGQAScratch;
 use crate::attn::gqa::ungated_scratch::UngatedGQAScratchBindings;
 use crate::def::layer::ReplayLayer;
@@ -106,7 +106,7 @@ pub struct UngatedGQA {
     device: Device,
     core: UngatedGQACore,
     config: GQAMetalConfig,
-    sdpa_planner: GQASDPAPlanner,
+    sdpa_selector: Selector,
     qkv: AffineQuantizedMatmul,
     qkv_to_q_k_v: GQAQKVSplitKernel,
     q_norm_rope: RMSNormRopeKernel,
@@ -137,8 +137,8 @@ impl UngatedGQA {
             device: device.clone(),
             core: core.clone(),
             config,
-            sdpa_planner: GQASDPAPlanner::new(
-                GQASDPASpecializationRegistry::new(gqa_sdpa_config(
+            sdpa_selector: Selector::new(
+                backend_sdpa::Registry::new(gqa_sdpa_config(
                     config,
                     core.num_q_heads,
                     core.num_kv_heads,
@@ -160,7 +160,7 @@ impl UngatedGQA {
     }
 
     pub fn new_scratch(&self) -> UngatedGQAScratch {
-        UngatedGQAScratch::new(&self.device, &self.core, self.config, &self.sdpa_planner)
+        UngatedGQAScratch::new(&self.device, &self.core, self.config, &self.sdpa_selector)
     }
 
     pub fn prepare(
@@ -172,11 +172,11 @@ impl UngatedGQA {
     ) -> GQAReplayShape {
         assert_eq!(
             batch_metadata.max_tokens(),
-            self.sdpa_planner.limits().max_map_task_templates as usize
+            self.sdpa_selector.limits().max_map_task_templates as usize
         );
-        let request_shapes = GQASDPARequestShape::from_batch(token_indices, cu_tokens);
-        let plan = self.sdpa_planner.plan_exact(&request_shapes);
-        batch_metadata.update(req_slots, token_indices, cu_tokens, &plan)
+        let request_shapes = RequestShape::from_batch(token_indices, cu_tokens);
+        let selection = self.sdpa_selector.select_exact(&request_shapes);
+        batch_metadata.update(req_slots, token_indices, cu_tokens, &selection)
     }
 }
 
@@ -289,13 +289,13 @@ impl UngatedGQA {
         let batch_metadata = input.batch_metadata;
         let kv_cache = input.kv_cache;
         let scratch = input.scratch;
-        let map_specialization = batch_metadata.execution_specialization().map.thread_block;
-        if map_specialization.max_q_tokens == 1 {
+        let map_constants = batch_metadata.variant().map.thread_block;
+        if map_constants.max_q_tokens == 1 {
             let sdpa_config = self.split_kv_single_q_config(
                 page_table_layout,
-                map_specialization.kv_tokens_per_iteration,
-                map_specialization.required_threads,
-                map_specialization.max_q_heads,
+                map_constants.kv_tokens_per_iteration,
+                map_constants.required_threads,
+                map_constants.max_q_heads,
             );
             let sdpa = GQASplitKVSingleQKernels::new(&self.device, sdpa_config, self.split_kv_single_q_shape(shape));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
@@ -321,9 +321,9 @@ impl UngatedGQA {
         } else {
             let sdpa_config = self.split_kv_tiled_q_config(
                 page_table_layout,
-                map_specialization.max_q_tokens,
-                map_specialization.kv_tokens_per_iteration,
-                map_specialization.max_q_heads,
+                map_constants.max_q_tokens,
+                map_constants.kv_tokens_per_iteration,
+                map_constants.max_q_heads,
             );
             let sdpa = GQASplitKVTiledQKernels::new(&self.device, sdpa_config, self.split_kv_tiled_q_shape(shape));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(

@@ -4,9 +4,6 @@ use std::time::Instant;
 
 use half::bf16;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
-use inference_backend_metal::components::GQASDPAConfig;
-use inference_backend_metal::components::GQASDPAExecutionSpecialization;
-use inference_backend_metal::components::GQASDPASpecializationRegistry;
 use inference_backend_metal::components::GQASplitKVSingleQConfig;
 use inference_backend_metal::components::GQASplitKVSingleQKernels;
 use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
@@ -18,6 +15,7 @@ use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQShape;
 use inference_backend_metal::components::RopeScaling;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -40,8 +38,8 @@ use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBi
 use inference_executor_metal::attn::gqa::backend::GQAKVCacheBindings;
 use inference_executor_metal::attn::gqa::backend::GQAMetalConfig;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
-use inference_executor_metal::attn::gqa::sdpa::GQASDPAPlanner;
-use inference_executor_metal::attn::gqa::sdpa::GQASDPARequestShape;
+use inference_executor_metal::attn::gqa::sdpa::RequestShape;
+use inference_executor_metal::attn::gqa::sdpa::Selector;
 use inference_executor_metal::attn::gqa::ungated_backend::UngatedGQA;
 use inference_executor_metal::attn::gqa::ungated_backend::UngatedGQAInput;
 use inference_executor_metal::attn::gqa::ungated_backend::UngatedGQAWeights;
@@ -272,40 +270,40 @@ impl Fixture {
         };
         assert!(split_kv_tiled_q_max_q_heads > 0 && split_kv_tiled_q_max_q_heads <= q_heads_per_kv_head as u32);
         assert!(split_kv_tiled_q_max_q_heads <= tiled_max_supported_q_heads);
-        let sdpa_config = GQASDPAConfig {
+        let sdpa_config = backend_sdpa::Config {
             io_dtype: config.io_dtype,
             num_q_heads: core.num_q_heads.try_into().expect("GQA Q-head count must fit u32"),
             num_kv_heads: core.num_kv_heads.try_into().expect("GQA KV-head count must fit u32"),
             head_dim: core.head_dim.try_into().expect("GQA head_dim must fit u32"),
             tokens_per_page,
         };
-        let request_shapes = GQASDPARequestShape::from_batch(&token_indices, &cu_tokens);
-        let single_q_execution = GQASDPAExecutionSpecialization::single_q(
+        let request_shapes = RequestShape::from_batch(&token_indices, &cu_tokens);
+        let single_q_variant = backend_sdpa::ExecutionVariant::single_q(
             sdpa_config,
             params.split_kv_single_q_kv_tokens_per_iteration,
             params.split_kv_single_q_required_threads,
             split_kv_single_q_max_q_heads,
         );
-        let single_q_plan = GQASDPAPlanner::new(
-            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![single_q_execution]),
+        let single_q_selection = Selector::new(
+            backend_sdpa::Registry::from_variants(sdpa_config, vec![single_q_variant]),
             MAX_TOKENS,
         )
-        .plan_exact(&request_shapes);
+        .select_exact(&request_shapes);
         let split_kv_single_q_metadata = GQAMetadataBuffers::new(device, MAX_TOKENS);
-        split_kv_single_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &single_q_plan);
-        let tiled_q_execution = GQASDPAExecutionSpecialization::tiled_q(
+        split_kv_single_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &single_q_selection);
+        let tiled_q_variant = backend_sdpa::ExecutionVariant::tiled_q(
             sdpa_config,
             params.split_kv_tiled_q_max_q_tokens,
             params.split_kv_tiled_q_kv_tokens_per_iteration,
             split_kv_tiled_q_max_q_heads,
         );
-        let tiled_q_plan = GQASDPAPlanner::new(
-            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![tiled_q_execution]),
+        let tiled_q_selection = Selector::new(
+            backend_sdpa::Registry::from_variants(sdpa_config, vec![tiled_q_variant]),
             MAX_TOKENS,
         )
-        .plan_exact(&request_shapes);
+        .select_exact(&request_shapes);
         let split_kv_tiled_q_metadata = GQAMetadataBuffers::new(device, MAX_TOKENS);
-        let tiled_shape = split_kv_tiled_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &tiled_q_plan);
+        let tiled_shape = split_kv_tiled_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &tiled_q_selection);
 
         let stream = Stream::new(device);
         let backend = UngatedGQA::new(device, core.clone(), config, MAX_TOKENS);

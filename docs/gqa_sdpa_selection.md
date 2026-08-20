@@ -1,19 +1,19 @@
-# GQA SDPA Planning
+# GQA SDPA Selection
 
-This document defines the GQA SDPA planning model. It separates reference vocabulary from current implementation
+This document defines the GQA SDPA selection model. It separates reference vocabulary from current implementation
 facts. It also records the scope of the current design change.
 
 ## Reference vocabulary
 
-Use [GPU execution vocabulary](gpu_execution.md) for the shared launch, specialization, task, tile, layout, and planner
-terms. This section defines the SDPA-specific mapping.
+Use [GPU execution vocabulary](gpu_execution.md) for the shared launch, constant, variant, task, tile, layout, and
+selection terms. This section defines the SDPA-specific mapping.
 
-### SDPA kernel specialization
+### SDPA kernel constants
 
-The Map specialization uses this hierarchy:
+The Map constants use this hierarchy:
 
 ```text
-MapKernelSpecialization
+MapKernelConstants
 ├── thread_block
 │   ├── max_q_tokens
 │   ├── max_q_heads
@@ -23,10 +23,10 @@ MapKernelSpecialization
     └── tokens_per_page
 ```
 
-The Reduce specialization does not read the KV cache:
+The Reduce constants do not describe the KV cache because Reduce does not read it:
 
 ```text
-ReduceKernelSpecialization
+ReduceKernelConstants
 └── thread_block
     ├── max_q_tokens
     ├── max_q_heads
@@ -61,14 +61,14 @@ MapThreadBlockTask
     = derive(
         MapKernelArguments,
         thread_block_index,
-        MapKernelSpecialization,
+        MapKernelConstants,
       )
 
 MapThreadTask
     = derive(
         MapThreadBlockTask,
         thread_index,
-        MapKernelSpecialization,
+        MapKernelConstants,
       )
 ```
 
@@ -121,7 +121,7 @@ ReduceThreadTask
     = derive(
         ReduceThreadBlockTask,
         thread_index,
-        ReduceKernelSpecialization,
+        ReduceKernelConstants,
       )
 ```
 
@@ -150,37 +150,37 @@ denominator buffers.
 
 ### Ownership
 
-The GQA component supplies semantic request facts. The Metal backend supplies legal kernel specializations. The Metal
-executor planner owns dynamic work partitioning and complete-plan comparison.
+The GQA component supplies semantic request facts. The Metal backend supplies legal execution variants. The Metal
+executor selector owns dynamic work partitioning and complete-candidate comparison.
 
 ```text
-GQASDPAConfig
-    -> GQASDPASpecializationRegistry
-    -> GQASDPAPlanner
+backend_sdpa::Config
+    -> backend_sdpa::Registry
+    -> gqa::sdpa::Selector
 
-GQASDPARequestShape[]
-    -> one candidate GQASDPAPlan per legal specialization
+gqa::sdpa::RequestShape[]
+    -> one candidate gqa::sdpa::Selection per legal variant
     -> selection policy
-    -> selected GQASDPAPlan
+    -> selected gqa::sdpa::Selection
     -> GQAMetadataBuffers::update(...)
     -> Map kernel
     -> Reduce kernel
 ```
 
-The runtime core does not select a kernel specialization. It continues to own request scheduling, page allocation,
+The runtime core does not select an execution variant. It continues to own request scheduling, page allocation,
 and cache lifecycle.
 
-### Static specializations
+### Static variants
 
-`GQASDPAConfig` contains `io_dtype`, `num_q_heads`, `num_kv_heads`, `head_dim`, and `tokens_per_page`.
+`backend_sdpa::Config` contains `io_dtype`, `num_q_heads`, `num_kv_heads`, `head_dim`, and `tokens_per_page`.
 
-`GQASDPASpecializationRegistry` performs static capability filtering. It does not use batch lengths or performance
-thresholds. Each legal `GQASDPAExecutionSpecialization` contains one compatible Map and Reduce pair.
+`backend_sdpa::Registry` performs static capability filtering. It does not use batch lengths or performance
+thresholds. Each legal `backend_sdpa::ExecutionVariant` contains one compatible Map and Reduce pair.
 
-The current Rust specialization fields follow the reference hierarchy:
+The current Rust constant fields follow the reference hierarchy:
 
 ```text
-GQASDPAExecutionSpecialization
+backend_sdpa::ExecutionVariant
 ├── map
 │   ├── thread_block
 │   │   ├── max_q_tokens
@@ -197,22 +197,22 @@ GQASDPAExecutionSpecialization
 ```
 
 `map.thread_block.max_q_tokens == 1` identifies the current SingleQ kernel geometry. A larger value identifies the
-current TiledQ kernel geometry. The selected plan does not use a SingleQ/TiledQ selector enum. The concrete low-level
+current TiledQ kernel geometry. The selection does not use a SingleQ/TiledQ selector enum. The concrete low-level
 kernel types keep these names because they use different Metal sources and launch geometry.
 
-### Dynamic planning
+### Dynamic selection
 
-`GQASDPARequestShape` contains `num_history_tokens` and `num_q_tokens` for one request. For a causal Q-token offset:
+`gqa::sdpa::RequestShape` contains `num_history_tokens` and `num_q_tokens` for one request. For a causal Q-token offset:
 
 ```text
 num_visible_kv_tokens = num_history_tokens + q_token_offset + 1
 ```
 
-The planner creates request-local `GQASDPAQTokenRange` values. A range contains `request_index`,
-`flat_q_token_indices`, and `max_visible_kv_tokens`. A `GQASDPAQTokenRange` is dynamic task metadata. It is not a kernel
+The selector creates request-local `gqa::sdpa::QTokenRange` values. A range contains `request_index`,
+`flat_q_token_indices`, and `max_visible_kv_tokens`. A `QTokenRange` is dynamic task metadata. It is not a kernel
 tile or a complete Map task.
 
-The planner calculates the number of KV iterations:
+The selector calculates the number of KV iterations:
 
 ```text
 num_kv_iterations
@@ -222,7 +222,7 @@ num_kv_iterations
 It then distributes consecutive KV iterations across Map tasks. A tail task can contain fewer KV iterations. Adjacent
 task ranges do not overlap and do not leave gaps.
 
-`GQASDPAMapTaskTemplate` stores only the fields that the regular grid cannot derive:
+`gqa::sdpa::MapTaskTemplate` stores only the fields that the regular grid cannot derive:
 
 ```text
 q_token_range_index
@@ -241,12 +241,12 @@ The grid derives the Q-head range and KV-head index. The template and grid coord
 `cu_sdpa_partial_outputs` selects the partial-state groups that Reduce merges for each Q-token range. Reduce metadata
 names the partial states. It does not name the Map template that produced them.
 
-### Selected plan
+### Selection
 
-`GQASDPAPlan` contains one complete dynamic decision:
+`gqa::sdpa::Selection` contains one complete dynamic decision:
 
 ```text
-execution_specialization
+variant
 q_token_ranges
 map_task_templates
 cu_partial_outputs_by_q_token_range
@@ -254,24 +254,27 @@ replay_shape
 metrics
 ```
 
-The plan does not store a duplicate registry index. The complete execution specialization is the replay-topology
-identity and the concrete-kernel recording input.
+The selection does not store a duplicate registry index. The complete execution variant is the replay-topology identity
+and the concrete-kernel recording input.
 
-`GQAMetadataBuffers::update(...)` uploads the selected plan. It does not select another specialization or recompute KV
+`GQAMetadataBuffers::update(...)` uploads the selection. It does not select another variant or recompute KV
 partitioning.
 
-The materialized plan is necessary because the selected specialization, Q-token ranges, Map task templates,
+The materialized selection is necessary because the selected variant, Q-token ranges, Map task templates,
 partial-state offsets, replay shape, and metrics are one coupled result. A kernel-kind enum or threshold helper cannot
 represent this result. Moving candidate construction into `GQAMetadataBuffers` would mix selection with GPU ABI upload.
-Returning unrelated parallel values would weaken the boundary and permit mismatched specialization and task metadata.
+Returning unrelated parallel values would weaken the boundary and permit mismatched variant and task metadata.
 
-`GQASDPAPlanner` is also not a stateless wrapper. It owns the legal specialization registry and the allocation limits.
+`gqa::sdpa::Selector` is not a stateless wrapper. It owns the legal variant registry and the allocation limits.
 For each dynamic workload, it materializes every complete candidate before it compares them. This work allocates and
 fills request-local vectors. Callers must not repeat it only to recover one field.
 
+The selector includes candidate materialization. GQA does not have a separate `Planner` type or a `Plan` type. The
+`Selection` name describes the returned value and does not introduce a second decision layer.
+
 ### Metrics and selection
 
-`GQASDPAPlanMetrics` names each counted unit:
+`gqa::sdpa::SelectionMetrics` names each counted unit:
 
 ```text
 num_scheduled_qk_token_pairs
@@ -286,11 +289,11 @@ max_kv_iterations_per_map_task
 num_logical_qk_token_pairs
 ```
 
-The D=256, eight-token-page policy keeps the measured crossover threshold. It rejects a TiledQ plan when active QK
+The D=256, eight-token-page policy keeps the measured crossover threshold. It rejects a TiledQ candidate when active QK
 token pairs use less than half of its scheduled QK token pairs. It then applies the existing selection score. The score
 is a tuning heuristic. It is not a FLOP, byte, token, or elapsed-time unit.
 
-The planner evaluates request-local Q-token ranges. It does not use only aggregate token and context counts. This rule
+The selector evaluates request-local Q-token ranges. It does not use only aggregate token and context counts. This rule
 keeps one-token ragged tails and batches of independent one-token requests on SingleQ.
 
 ### Current partial-state ABI
@@ -322,20 +325,20 @@ This refactor does not change these contracts:
 - Map-before-Reduce dependency.
 - SingleQ and TiledQ numerical kernels.
 
-Replay padding can change the recorded Map grid. Therefore, the planner includes the selected replay capacity when it
-materializes and compares candidate plans.
+Replay padding can change the recorded Map grid. Therefore, the selector includes the selected replay capacity when it
+materializes and compares candidates.
 
 ## Proposed design scope
 
-This change moves dynamic selection and complete-plan construction into `GQASDPAPlanner`. It replaces the old path
-enum and duplicate plan identity with one `GQASDPAExecutionSpecialization`. It also separates Q-token ranges, Map task
-templates, and kernel specialization fields.
+This change moves dynamic selection and complete-candidate construction into `gqa::sdpa::Selector`. It replaces the
+old path enum and duplicate identity with one `backend_sdpa::ExecutionVariant`. It also separates Q-token ranges, Map
+task templates, and kernel constant fields.
 
 This change does not propose a new partial-state ABI, replay key, resource contract, KV-segment allocation policy, or
 Metal numerical kernel.
 
 ## Validation
 
-The implementation must keep registry capability tests, planner crossover tests, ragged-tail tests, metadata ABI
+The implementation must keep registry capability tests, selector crossover tests, ragged-tail tests, metadata ABI
 tests, SingleQ and TiledQ Metal parity tests, the Qwen3.8 D=256 page-eight parity test, and representative one-layer
 production performance checks.

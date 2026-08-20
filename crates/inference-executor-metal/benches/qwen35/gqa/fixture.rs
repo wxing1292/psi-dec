@@ -10,9 +10,6 @@ use inference_backend_metal::components::GQAKVPageWriteShape;
 use inference_backend_metal::components::GQAQGKVSplitBuffers;
 use inference_backend_metal::components::GQAQGKVSplitKernel;
 use inference_backend_metal::components::GQAQGKVSplitShape;
-use inference_backend_metal::components::GQASDPAConfig;
-use inference_backend_metal::components::GQASDPAExecutionSpecialization;
-use inference_backend_metal::components::GQASDPASpecializationRegistry;
 use inference_backend_metal::components::GQASplitKVSingleQKernels;
 use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
 use inference_backend_metal::components::GQASplitKVSingleQReduceBuffers;
@@ -23,6 +20,7 @@ use inference_backend_metal::components::GQASplitKVTiledQShape;
 use inference_backend_metal::components::RMSNormRopeBuffers;
 use inference_backend_metal::components::RMSNormRopeKernel;
 use inference_backend_metal::components::RopeScaling;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -41,8 +39,8 @@ use inference_executor_metal::attn::gqa::backend::GQAReplayMode;
 use inference_executor_metal::attn::gqa::backend::GQAWeights;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use inference_executor_metal::attn::gqa::scratch::GQAScratchBindings;
-use inference_executor_metal::attn::gqa::sdpa::GQASDPAPlanner;
-use inference_executor_metal::attn::gqa::sdpa::GQASDPARequestShape;
+use inference_executor_metal::attn::gqa::sdpa::RequestShape;
+use inference_executor_metal::attn::gqa::sdpa::Selector;
 use inference_executor_metal::def::layer::ReplayLayer;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
@@ -337,50 +335,50 @@ impl<'a> RealGQAFixture<'a> {
             .into_iter()
             .map(|value| value as u32)
             .collect::<Vec<_>>();
-        let request_shapes = GQASDPARequestShape::from_batch(&existing_context_lens, &materialized_cu_tokens);
-        let sdpa_config = GQASDPAConfig {
+        let request_shapes = RequestShape::from_batch(&existing_context_lens, &materialized_cu_tokens);
+        let sdpa_config = backend_sdpa::Config {
             io_dtype: config.io_dtype,
             num_q_heads: model.num_q_heads.try_into().expect("GQA Q-head count must fit u32"),
             num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV-head count must fit u32"),
             head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
             tokens_per_page: model.num_tokens_per_page(),
         };
-        let single_q_execution = GQASDPAExecutionSpecialization::single_q(
+        let single_q_variant = backend_sdpa::ExecutionVariant::single_q(
             sdpa_config,
             params.split_kv_single_q_kv_tokens_per_iteration,
             params.split_kv_single_q_required_threads,
             single_q_max_q_heads,
         );
-        let single_q_plan = GQASDPAPlanner::new(
-            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![single_q_execution]),
+        let single_q_selection = Selector::new(
+            backend_sdpa::Registry::from_variants(sdpa_config, vec![single_q_variant]),
             max_tokens,
         )
-        .plan_exact(&request_shapes);
+        .select_exact(&request_shapes);
         let batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let shape = batch_metadata.update(
             &req_slots,
             &existing_context_lens,
             &materialized_cu_tokens,
-            &single_q_plan,
+            &single_q_selection,
         );
         let page_ids = Buffer::from_slice(device, &page_table(num_reqs, num_blocks));
-        let tiled_q_execution = GQASDPAExecutionSpecialization::tiled_q(
+        let tiled_q_variant = backend_sdpa::ExecutionVariant::tiled_q(
             sdpa_config,
             params.split_kv_tiled_q_max_q_tokens,
             params.split_kv_tiled_q_kv_tokens_per_iteration,
             params.split_kv_tiled_q_max_q_heads,
         );
-        let tiled_q_plan = GQASDPAPlanner::new(
-            GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![tiled_q_execution]),
+        let tiled_q_selection = Selector::new(
+            backend_sdpa::Registry::from_variants(sdpa_config, vec![tiled_q_variant]),
             max_tokens,
         )
-        .plan_exact(&request_shapes);
+        .select_exact(&request_shapes);
         let tiled_batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let tiled_replay_shape = tiled_batch_metadata.update(
             &req_slots,
             &existing_context_lens,
             &materialized_cu_tokens,
-            &tiled_q_plan,
+            &tiled_q_selection,
         );
         let qgkv = Buffer::new_zeroed(
             device,
@@ -784,14 +782,14 @@ impl<'a> RealGQAFixture<'a> {
             self.params.split_kv_tiled_q_kv_tokens_per_iteration,
             self.params.split_kv_tiled_q_max_q_heads,
         );
-        print_split_plan(
+        print_split_selection(
             "single_q",
             &self.batch_metadata,
             1,
             self.params.split_kv_single_q_kv_tokens_per_iteration,
             self.max_tokens,
         );
-        print_split_plan(
+        print_split_selection(
             "tiled_q",
             &self.tiled_batch_metadata,
             self.params.split_kv_tiled_q_max_q_tokens,
@@ -1102,7 +1100,7 @@ impl<'a> RealGQAFixture<'a> {
     }
 }
 
-fn print_split_plan(
+fn print_split_selection(
     variant: &str,
     metadata: &GQAMetadataBuffers,
     max_q_tokens: u32,
@@ -1159,7 +1157,7 @@ fn print_split_plan(
         .checked_mul(max_q_tokens)
         .expect("GQA replay reserved partial-state-group count must fit u32");
     println!(
-        "split_plan component=gqa variant={variant} max_tokens={max_tokens} num_active_q_tokens={} \
+        "split_selection component=gqa variant={variant} max_tokens={max_tokens} num_active_q_tokens={} \
          num_q_token_ranges={} num_active_q_tokens_per_q_token_range={num_active_q_tokens_per_q_token_range:?} \
          num_map_task_templates={} max_map_task_templates={max_tokens} max_active_partial_state_groups={max_tokens} \
          num_active_partial_state_groups={num_active_partial_state_groups} \

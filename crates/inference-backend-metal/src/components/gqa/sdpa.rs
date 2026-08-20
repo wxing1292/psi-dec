@@ -1,7 +1,7 @@
 use crate::metal::Dtype;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GQASDPAMapThreadBlockSpecialization {
+pub struct MapThreadBlockConstants {
     pub max_q_tokens: u32,
     pub max_q_heads: u32,
     pub kv_tokens_per_iteration: u32,
@@ -9,64 +9,59 @@ pub struct GQASDPAMapThreadBlockSpecialization {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GQASDPAKVCacheSpecialization {
+pub struct KVCacheConstants {
     pub tokens_per_page: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GQASDPAMapKernelSpecialization {
-    pub thread_block: GQASDPAMapThreadBlockSpecialization,
-    pub kv_cache: GQASDPAKVCacheSpecialization,
+pub struct MapKernelConstants {
+    pub thread_block: MapThreadBlockConstants,
+    pub kv_cache: KVCacheConstants,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GQASDPAReduceThreadBlockSpecialization {
+pub struct ReduceThreadBlockConstants {
     pub max_q_tokens: u32,
     pub max_q_heads: u32,
     pub required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GQASDPAReduceKernelSpecialization {
-    pub thread_block: GQASDPAReduceThreadBlockSpecialization,
+pub struct ReduceKernelConstants {
+    pub thread_block: ReduceThreadBlockConstants,
 }
 
-/// One compatible GQA SDPA Map and Reduce kernel specialization pair.
+/// One compatible GQA SDPA Map and Reduce execution variant.
 ///
 /// `map.thread_block.max_q_tokens == 1` describes the current SingleQ geometry. A larger value
-/// describes a current TiledQ geometry. The planner does not expose a
+/// describes a current TiledQ geometry. The selector does not expose a
 /// SingleQ/TiledQ execution enum.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GQASDPAExecutionSpecialization {
-    pub map: GQASDPAMapKernelSpecialization,
-    pub reduce: GQASDPAReduceKernelSpecialization,
+pub struct ExecutionVariant {
+    pub map: MapKernelConstants,
+    pub reduce: ReduceKernelConstants,
 }
 
-impl GQASDPAExecutionSpecialization {
-    pub fn single_q(
-        config: GQASDPAConfig,
-        kv_tokens_per_iteration: u32,
-        required_threads: u32,
-        max_q_heads: u32,
-    ) -> Self {
+impl ExecutionVariant {
+    pub fn single_q(config: Config, kv_tokens_per_iteration: u32, required_threads: u32, max_q_heads: u32) -> Self {
         config.validate();
         let reduce_output_coordinates = 256 / config.head_dim.min(256);
         let reduce_max_q_heads = config.num_q_heads.min(reduce_output_coordinates).max(1);
         let reduce_max_q_tokens = (reduce_output_coordinates / reduce_max_q_heads).max(1);
         let execution = Self {
-            map: GQASDPAMapKernelSpecialization {
-                thread_block: GQASDPAMapThreadBlockSpecialization {
+            map: MapKernelConstants {
+                thread_block: MapThreadBlockConstants {
                     max_q_tokens: 1,
                     max_q_heads,
                     kv_tokens_per_iteration,
                     required_threads,
                 },
-                kv_cache: GQASDPAKVCacheSpecialization {
+                kv_cache: KVCacheConstants {
                     tokens_per_page: config.tokens_per_page,
                 },
             },
-            reduce: GQASDPAReduceKernelSpecialization {
-                thread_block: GQASDPAReduceThreadBlockSpecialization {
+            reduce: ReduceKernelConstants {
+                thread_block: ReduceThreadBlockConstants {
                     max_q_tokens: reduce_max_q_tokens,
                     max_q_heads: reduce_max_q_heads,
                     required_threads: 256,
@@ -77,23 +72,23 @@ impl GQASDPAExecutionSpecialization {
         execution
     }
 
-    pub fn tiled_q(config: GQASDPAConfig, max_q_tokens: u32, kv_tokens_per_iteration: u32, max_q_heads: u32) -> Self {
+    pub fn tiled_q(config: Config, max_q_tokens: u32, kv_tokens_per_iteration: u32, max_q_heads: u32) -> Self {
         config.validate();
         let required_threads = max_q_tokens / 8 * max_q_heads * 32;
         let execution = Self {
-            map: GQASDPAMapKernelSpecialization {
-                thread_block: GQASDPAMapThreadBlockSpecialization {
+            map: MapKernelConstants {
+                thread_block: MapThreadBlockConstants {
                     max_q_tokens,
                     max_q_heads,
                     kv_tokens_per_iteration,
                     required_threads,
                 },
-                kv_cache: GQASDPAKVCacheSpecialization {
+                kv_cache: KVCacheConstants {
                     tokens_per_page: config.tokens_per_page,
                 },
             },
-            reduce: GQASDPAReduceKernelSpecialization {
-                thread_block: GQASDPAReduceThreadBlockSpecialization {
+            reduce: ReduceKernelConstants {
+                thread_block: ReduceThreadBlockConstants {
                     max_q_tokens,
                     max_q_heads: 1,
                     required_threads,
@@ -104,7 +99,7 @@ impl GQASDPAExecutionSpecialization {
         execution
     }
 
-    pub fn supports(self, config: GQASDPAConfig) -> bool {
+    pub fn supports(self, config: Config) -> bool {
         let map = self.map.thread_block;
         let reduce = self.reduce.thread_block;
         if self.map.kv_cache.tokens_per_page != config.tokens_per_page
@@ -149,7 +144,7 @@ impl GQASDPAExecutionSpecialization {
 
 /// Static GQA SDPA workload facts used for capability filtering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASDPAConfig {
+pub struct Config {
     pub io_dtype: Dtype,
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
@@ -157,7 +152,7 @@ pub struct GQASDPAConfig {
     pub tokens_per_page: u32,
 }
 
-impl GQASDPAConfig {
+impl Config {
     pub fn validate(self) {
         assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
         assert!(self.num_q_heads > 0);
@@ -172,95 +167,89 @@ impl GQASDPAConfig {
     }
 }
 
-/// Backend-owned registry of legal GQA SDPA kernel specializations.
+/// Backend-owned registry of legal GQA SDPA execution variants.
 ///
 /// The registry performs only static capability filtering. The executor
-/// planner owns dynamic workload selection and complete-plan comparison.
+/// selector owns dynamic workload selection and complete-candidate comparison.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GQASDPASpecializationRegistry {
-    config: GQASDPAConfig,
-    executions: Box<[GQASDPAExecutionSpecialization]>,
+pub struct Registry {
+    config: Config,
+    variants: Vec<ExecutionVariant>,
 }
 
-impl GQASDPASpecializationRegistry {
-    pub fn new(config: GQASDPAConfig) -> Self {
+impl Registry {
+    pub fn new(config: Config) -> Self {
         config.validate();
-        let mut executions = vec![single_q_execution(config)];
+        let mut variants = vec![single_q_variant(config)];
         if supports_tiled_q(config) {
             let full_q_heads = config.q_heads_per_kv_head().min(max_tiled_q_heads(8));
             if (config.head_dim, config.tokens_per_page) != (128, 8) {
                 let half_q_heads = config.q_heads_per_kv_head().div_ceil(2).min(max_tiled_q_heads(8));
                 if half_q_heads != full_q_heads {
-                    executions.push(tiled_q_execution(config, half_q_heads));
+                    variants.push(tiled_q_variant(config, half_q_heads));
                 }
             }
-            executions.push(tiled_q_execution(config, full_q_heads));
+            variants.push(tiled_q_variant(config, full_q_heads));
         }
-        Self::from_execution_specializations(config, executions)
+        Self::from_variants(config, variants)
     }
 
     /// Creates a registry that contains only the current SingleQ execution.
     /// Composite operators can use this registry when all of their Map kernels
     /// must share the SingleQ partial-state ABI and one Reduce kernel.
-    pub fn new_single_q_only(config: GQASDPAConfig) -> Self {
+    pub fn new_single_q_only(config: Config) -> Self {
         config.validate();
-        Self::from_execution_specializations(config, vec![single_q_execution(config)])
+        Self::from_variants(config, vec![single_q_variant(config)])
     }
 
-    /// Creates a registry from explicit backend specializations.
+    /// Creates a registry from explicit backend variants.
     ///
     /// Backend benchmarks can use this constructor to force one legal
-    /// specialization. Production model plans use [`Self::new`] or
+    /// variant. Production model components use [`Self::new`] or
     /// [`Self::new_single_q_only`].
-    pub fn from_execution_specializations(
-        config: GQASDPAConfig,
-        executions: Vec<GQASDPAExecutionSpecialization>,
-    ) -> Self {
+    pub fn from_variants(config: Config, variants: Vec<ExecutionVariant>) -> Self {
         config.validate();
-        assert!(!executions.is_empty(), "GQA SDPA registry requires an execution");
+        assert!(!variants.is_empty(), "GQA SDPA registry requires an execution variant");
         assert!(
-            executions.iter().all(|execution| execution.supports(config)),
-            "GQA SDPA registry contains an unsupported execution specialization"
+            variants.iter().all(|variant| variant.supports(config)),
+            "GQA SDPA registry contains an unsupported execution variant"
         );
-        Self {
-            config,
-            executions: executions.into_boxed_slice(),
-        }
+        Self { config, variants }
     }
 
-    pub fn config(&self) -> GQASDPAConfig {
+    pub fn config(&self) -> Config {
         self.config
     }
 
-    pub fn execution_specializations(&self) -> &[GQASDPAExecutionSpecialization] {
-        &self.executions
+    pub fn variants(&self) -> &[ExecutionVariant] {
+        &self.variants
     }
 
     pub fn max_q_tokens_per_map_task(&self) -> u32 {
-        self.executions
+        self.variants
             .iter()
-            .map(|execution| execution.map.thread_block.max_q_tokens)
+            .map(|variant| variant.map.thread_block.max_q_tokens)
             .max()
-            .expect("GQA SDPA registry requires an execution")
+            .expect("GQA SDPA registry requires an execution variant")
     }
 }
 
-fn supports_tiled_q(config: GQASDPAConfig) -> bool {
+fn supports_tiled_q(config: Config) -> bool {
     let profile = (config.head_dim, config.tokens_per_page);
     config.io_dtype == Dtype::Bfloat16
         && matches!(profile, (128, 8) | (256, 8 | 16))
         && config.q_heads_per_kv_head() <= 8
 }
 
-fn single_q_execution(config: GQASDPAConfig) -> GQASDPAExecutionSpecialization {
+fn single_q_variant(config: Config) -> ExecutionVariant {
     let required_threads = config.head_dim.clamp(32, 256).next_power_of_two();
     let max_q_heads = config.q_heads_per_kv_head().min(8);
-    GQASDPAExecutionSpecialization::single_q(config, required_threads, required_threads, max_q_heads)
+    ExecutionVariant::single_q(config, required_threads, required_threads, max_q_heads)
 }
 
-fn tiled_q_execution(config: GQASDPAConfig, max_q_heads: u32) -> GQASDPAExecutionSpecialization {
+fn tiled_q_variant(config: Config, max_q_heads: u32) -> ExecutionVariant {
     let max_q_tokens = 8;
-    GQASDPAExecutionSpecialization::tiled_q(config, max_q_tokens, 16, max_q_heads)
+    ExecutionVariant::tiled_q(config, max_q_tokens, 16, max_q_heads)
 }
 
 fn max_tiled_q_heads(max_q_tokens: u32) -> u32 {
@@ -269,13 +258,13 @@ fn max_tiled_q_heads(max_q_tokens: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::GQASDPAConfig;
-    use super::GQASDPASpecializationRegistry;
+    use super::Config;
+    use super::Registry;
     use crate::metal::Dtype;
 
-    fn config(head_dim: u32, q_heads_per_kv_head: u32, tokens_per_page: u32) -> GQASDPAConfig {
+    fn config(head_dim: u32, q_heads_per_kv_head: u32, tokens_per_page: u32) -> Config {
         let num_kv_heads = 2;
-        GQASDPAConfig {
+        Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: num_kv_heads * q_heads_per_kv_head,
             num_kv_heads,
@@ -286,21 +275,21 @@ mod tests {
 
     #[test]
     fn test_registry_filters_static_execution_capabilities() {
-        let d256_page16 = GQASDPASpecializationRegistry::new(config(256, 6, 16));
-        let d256_page8 = GQASDPASpecializationRegistry::new(config(256, 6, 8));
-        let d128_page8 = GQASDPASpecializationRegistry::new(config(128, 8, 8));
-        let unsupported = GQASDPASpecializationRegistry::new(config(256, 8, 4));
-        let dspark = GQASDPASpecializationRegistry::new_single_q_only(config(128, 8, 8));
+        let d256_page16 = Registry::new(config(256, 6, 16));
+        let d256_page8 = Registry::new(config(256, 6, 8));
+        let d128_page8 = Registry::new(config(128, 8, 8));
+        let unsupported = Registry::new(config(256, 8, 4));
+        let dspark = Registry::new_single_q_only(config(128, 8, 8));
 
-        assert_eq!(d256_page16.execution_specializations().len(), 3);
-        assert_eq!(d256_page8.execution_specializations().len(), 3);
-        assert_eq!(d128_page8.execution_specializations().len(), 2);
-        assert_eq!(unsupported.execution_specializations().len(), 1);
-        assert_eq!(dspark.execution_specializations().len(), 1);
+        assert_eq!(d256_page16.variants().len(), 3);
+        assert_eq!(d256_page8.variants().len(), 3);
+        assert_eq!(d128_page8.variants().len(), 2);
+        assert_eq!(unsupported.variants().len(), 1);
+        assert_eq!(dspark.variants().len(), 1);
         for registry in [d256_page16, d256_page8, d128_page8, unsupported, dspark] {
             assert!(
                 registry
-                    .execution_specializations()
+                    .variants()
                     .iter()
                     .all(|execution| execution.supports(registry.config()))
             );
@@ -308,17 +297,17 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_uses_specialization_geometry_without_a_path_enum() {
-        let registry = GQASDPASpecializationRegistry::new(config(256, 6, 8));
-        let executions = registry.execution_specializations();
+    fn test_registry_uses_kernel_constants_without_a_path_enum() {
+        let registry = Registry::new(config(256, 6, 8));
+        let variants = registry.variants();
 
-        assert_eq!(executions[0].map.thread_block.max_q_tokens, 1);
-        assert_eq!(executions[0].map.thread_block.max_q_heads, 6);
-        assert_eq!(executions[0].map.thread_block.kv_tokens_per_iteration, 256);
-        assert_eq!(executions[0].map.thread_block.required_threads, 256);
-        assert_eq!(executions[1].map.thread_block.max_q_tokens, 8);
-        assert_eq!(executions[1].map.thread_block.max_q_heads, 3);
-        assert_eq!(executions[2].map.thread_block.max_q_heads, 6);
+        assert_eq!(variants[0].map.thread_block.max_q_tokens, 1);
+        assert_eq!(variants[0].map.thread_block.max_q_heads, 6);
+        assert_eq!(variants[0].map.thread_block.kv_tokens_per_iteration, 256);
+        assert_eq!(variants[0].map.thread_block.required_threads, 256);
+        assert_eq!(variants[1].map.thread_block.max_q_tokens, 8);
+        assert_eq!(variants[1].map.thread_block.max_q_heads, 3);
+        assert_eq!(variants[2].map.thread_block.max_q_heads, 6);
         assert_eq!(registry.max_q_tokens_per_map_task(), 8);
     }
 }

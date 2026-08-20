@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use inference_backend_metal::components::GQASDPAExecutionSpecialization;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -26,7 +26,7 @@ pub struct DSparkGQAMetadataBuffers {
     cu_sdpa_partial_outputs: Buffer,
     block_sdpa_map_task_template_indices: Buffer,
     replay_shape: Cell<Option<GQAReplayShape>>,
-    sdpa_execution: Cell<Option<GQASDPAExecutionSpecialization>>,
+    sdpa_execution: Cell<Option<backend_sdpa::ExecutionVariant>>,
 }
 
 impl DSparkGQAMetadataBuffers {
@@ -59,11 +59,11 @@ impl DSparkGQAMetadataBuffers {
         }
     }
 
-    pub fn update(&self, block: &DSparkBlockMetadata, execution: GQASDPAExecutionSpecialization) -> GQAReplayShape {
-        let map = execution.map.thread_block;
+    pub fn update(&self, block: &DSparkBlockMetadata, variant: backend_sdpa::ExecutionVariant) -> GQAReplayShape {
+        let map = variant.map.thread_block;
         assert_eq!(
             map.max_q_tokens, 1,
-            "DSpark history attention requires a single-Q SDPA specialization"
+            "DSpark history attention requires a single-Q SDPA variant"
         );
         assert!(
             block.num_requests() <= self.capacity.block.max_requests,
@@ -93,7 +93,7 @@ impl DSparkGQAMetadataBuffers {
         self.block_sdpa_map_task_template_indices
             .write_typed(0, &metadata.block_sdpa_map_task_template_indices);
         self.replay_shape.set(Some(metadata.replay_shape));
-        self.sdpa_execution.set(Some(execution));
+        self.sdpa_execution.set(Some(variant));
         metadata.replay_shape
     }
 
@@ -123,7 +123,7 @@ impl DSparkGQAMetadataBuffers {
             .expect("DSpark GQA metadata must be updated before recording")
     }
 
-    pub fn sdpa_execution(&self) -> GQASDPAExecutionSpecialization {
+    pub fn sdpa_execution(&self) -> backend_sdpa::ExecutionVariant {
         self.sdpa_execution
             .get()
             .expect("DSpark GQA metadata must be updated before recording")
@@ -263,8 +263,7 @@ fn build_metal_metadata(
 
 #[cfg(test)]
 mod tests {
-    use inference_backend_metal::components::GQASDPAConfig;
-    use inference_backend_metal::components::GQASDPAExecutionSpecialization;
+    use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
     use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::DSparkBlockCapacity;
 
@@ -276,37 +275,37 @@ mod tests {
         let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(2, 3));
         let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
         let block = DSparkBlockMetadata::new(&[3, 7], &[11, 20], 3);
-        let config = GQASDPAConfig {
+        let config = backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 2,
             num_kv_heads: 1,
             head_dim: 128,
             tokens_per_page: 8,
         };
-        let execution = GQASDPAExecutionSpecialization::single_q(config, 4, 32, 2);
+        let variant = backend_sdpa::ExecutionVariant::single_q(config, 4, 32, 2);
 
-        let shape = buffers.update(&block, execution);
+        let shape = buffers.update(&block, variant);
 
         assert_eq!(shape.num_tokens, 6);
-        assert_eq!(execution, buffers.sdpa_execution());
+        assert_eq!(variant, buffers.sdpa_execution());
     }
 
     #[test]
-    #[should_panic(expected = "single-Q SDPA specialization")]
+    #[should_panic(expected = "single-Q SDPA variant")]
     fn test_metadata_rejects_tiled_q_partial_abi() {
         let device = Device::system_default();
         let capacity = DSparkGQACapacity::new(DSparkBlockCapacity::new(1, 3));
         let buffers = DSparkGQAMetadataBuffers::new(&device, capacity);
         let block = DSparkBlockMetadata::new(&[3], &[11], 3);
 
-        let config = GQASDPAConfig {
+        let config = backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 2,
             num_kv_heads: 1,
             head_dim: 128,
             tokens_per_page: 8,
         };
-        buffers.update(&block, GQASDPAExecutionSpecialization::tiled_q(config, 8, 16, 2));
+        buffers.update(&block, backend_sdpa::ExecutionVariant::tiled_q(config, 8, 16, 2));
     }
 
     #[test]

@@ -100,15 +100,7 @@ pub use gqa_split_kv_tiled_q::GQASplitKVTiledQMapBuffers;
 pub use gqa_split_kv_tiled_q::GQASplitKVTiledQReduceBuffers;
 pub use gqa_split_kv_tiled_q::GQASplitKVTiledQShape;
 
-mod gqa_split_kv;
-pub use gqa_split_kv::GQASDPAConfig;
-pub use gqa_split_kv::GQASDPAExecutionSpecialization;
-pub use gqa_split_kv::GQASDPAKVCacheSpecialization;
-pub use gqa_split_kv::GQASDPAMapKernelSpecialization;
-pub use gqa_split_kv::GQASDPAMapThreadBlockSpecialization;
-pub use gqa_split_kv::GQASDPAReduceKernelSpecialization;
-pub use gqa_split_kv::GQASDPAReduceThreadBlockSpecialization;
-pub use gqa_split_kv::GQASDPASpecializationRegistry;
+pub mod gqa;
 
 mod gqa_qgkv_split;
 pub use gqa_qgkv_split::GQAQGKVSplitBuffers;

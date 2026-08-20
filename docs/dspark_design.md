@@ -295,10 +295,10 @@ For an anchor at position `p`, that range is `[0, p)`.
 The block kernel supplies the complete local block.
 
 `UngatedDSparkGQAState` gives its static attention and KV-cache facts to
-`GQASDPASpecializationRegistry::new_single_q_only(...)`. The registry provides one constrained history specialization with the
-existing one-Q partial ABI. `UngatedDSparkGQAState::prepare_block` gives that specialization to the DSpark-specific
-metadata builder. `DSparkGQAMetadataBuffers` stores the exact `GQASDPAExecutionSpecialization` with the replay shape.
-Recording uses the stored specialization and does not run a second selector.
+`backend_sdpa::Registry::new_single_q_only(...)`. The registry provides one constrained history variant with the
+existing one-Q partial ABI. `UngatedDSparkGQAState::prepare_block` gives that variant to the DSpark-specific metadata
+builder. `DSparkGQAMetadataBuffers` stores the exact `backend_sdpa::ExecutionVariant` with the replay shape. Recording
+uses the stored variant and does not run a second selector.
 
 One block-bidirectional map Task owns one Q token and one Q head.
 The backend fixes this Task to one 32-thread SIMDgroup.

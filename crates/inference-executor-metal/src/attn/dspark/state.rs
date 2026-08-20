@@ -1,7 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::GQASDPAConfig;
-use inference_backend_metal::components::GQASDPASpecializationRegistry;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::DSparkBlockCapacity;
 use inference_executor_core::attn::DSparkBlockMetadata;
@@ -19,13 +18,13 @@ use crate::attn::gqa::request_page_table::GQARequestPageTable;
 mod file_io;
 
 pub struct UngatedDSparkGQAState {
-    sdpa_registry: GQASDPASpecializationRegistry,
+    sdpa_registry: backend_sdpa::Registry,
     block_scratch: Option<Rc<DSparkBlockScratch>>,
     context_scratch: Option<Rc<DSparkGQAContextScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
     metadata: Option<DSparkGQAMetadataBuffers>,
     core: UngatedDSparkGQACore,
-    sdpa_config: GQASDPAConfig,
+    sdpa_config: backend_sdpa::Config,
     capacity: DSparkGQACapacity,
     max_context_tokens: usize,
     page_table_layout: GQAPageTableLayout,
@@ -37,7 +36,7 @@ impl UngatedDSparkGQAState {
     pub fn new(
         device: &Device,
         core: UngatedDSparkGQACore,
-        sdpa_config: GQASDPAConfig,
+        sdpa_config: backend_sdpa::Config,
         page_table_layout: GQAPageTableLayout,
         capacity: DSparkBlockCapacity,
         max_context_tokens: usize,
@@ -61,7 +60,7 @@ impl UngatedDSparkGQAState {
         assert_eq!(sdpa_config.num_q_heads as usize, attention.num_q_heads);
         assert_eq!(sdpa_config.num_kv_heads as usize, attention.num_kv_heads);
         assert_eq!(sdpa_config.head_dim as usize, attention.head_dim);
-        let sdpa_registry = GQASDPASpecializationRegistry::new_single_q_only(sdpa_config);
+        let sdpa_registry = backend_sdpa::Registry::new_single_q_only(sdpa_config);
         let num_tokens_per_page = sdpa_config.tokens_per_page as usize;
         Self {
             sdpa_registry,
@@ -94,7 +93,7 @@ impl UngatedDSparkGQAState {
     }
 
     pub fn prepare_block(&self, block: &DSparkBlockMetadata) -> GQAReplayShape {
-        let execution = self.sdpa_registry.execution_specializations()[0];
+        let execution = self.sdpa_registry.variants()[0];
         self.metadata().update(block, execution)
     }
 
@@ -214,7 +213,7 @@ impl UngatedDSparkGQAState {
 
 #[cfg(test)]
 mod tests {
-    use inference_backend_metal::components::GQASDPAConfig;
+    use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::DSparkBlockCapacity;
@@ -247,7 +246,7 @@ mod tests {
         UngatedDSparkGQAState::new(
             device,
             UngatedDSparkGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
-            GQASDPAConfig {
+            backend_sdpa::Config {
                 io_dtype: Dtype::Bfloat16,
                 num_q_heads: 1,
                 num_kv_heads: 1,

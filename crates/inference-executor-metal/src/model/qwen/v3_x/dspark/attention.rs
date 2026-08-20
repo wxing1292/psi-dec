@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::GQASDPAConfig;
 use inference_backend_metal::components::RopeScaling;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -246,7 +246,7 @@ pub fn qwen3x_dspark_gqa_core(
 pub fn qwen3x_dspark_gqa_sdpa_config(
     config: &Qwen3xDSparkConfig,
     page_bytes: usize,
-) -> Result<GQASDPAConfig, ModelExecutorError> {
+) -> Result<backend_sdpa::Config, ModelExecutorError> {
     let num_q_heads = to_u32("Qwen3x DSpark GQA Q-head count", config.num_attention_heads)?;
     let num_kv_heads = to_u32("Qwen3x DSpark GQA KV-head count", config.num_key_value_heads)?;
     let head_dim = to_u32("Qwen3x DSpark GQA head_dim", config.head_dim)?;
@@ -260,7 +260,7 @@ pub fn qwen3x_dspark_gqa_sdpa_config(
             "Qwen3x DSpark GQA page bytes must contain whole KV tokens",
         ));
     }
-    let sdpa_config = GQASDPAConfig {
+    let sdpa_config = backend_sdpa::Config {
         io_dtype: Dtype::Bfloat16,
         num_q_heads,
         num_kv_heads,

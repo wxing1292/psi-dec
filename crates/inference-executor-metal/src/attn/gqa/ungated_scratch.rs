@@ -4,7 +4,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::UngatedGQACore;
 
 use crate::attn::gqa::backend::GQAMetalConfig;
-use crate::attn::gqa::sdpa::GQASDPAPlanner;
+use crate::attn::gqa::sdpa::Selector;
 
 fn assert_u32_element_index_domain(num_elements: usize, name: &str) {
     assert!(num_elements > 0, "{name} must contain elements");
@@ -42,11 +42,11 @@ pub struct UngatedGQAScratchBindings<'a> {
 }
 
 impl UngatedGQAScratch {
-    pub fn new(device: &Device, core: &UngatedGQACore, config: GQAMetalConfig, sdpa_planner: &GQASDPAPlanner) -> Self {
+    pub fn new(device: &Device, core: &UngatedGQACore, config: GQAMetalConfig, sdpa_selector: &Selector) -> Self {
         core.validate();
         config.validate();
-        let max_tokens = sdpa_planner.limits().max_map_task_templates as usize;
-        let num_sdpa_partial_state_groups = sdpa_planner.limits().partial_state_group_capacity;
+        let max_tokens = sdpa_selector.limits().max_map_task_templates as usize;
+        let num_sdpa_partial_state_groups = sdpa_selector.limits().partial_state_group_capacity;
         let num_sdpa_partial_states = num_sdpa_partial_state_groups
             .checked_mul(core.num_q_heads)
             .expect("ungated GQA scratch partial-output statistic count must fit usize");

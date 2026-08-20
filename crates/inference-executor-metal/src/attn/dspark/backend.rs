@@ -7,7 +7,6 @@ use inference_backend_metal::components::GQAQKVSplitBuffers;
 use inference_backend_metal::components::GQAQKVSplitConfig;
 use inference_backend_metal::components::GQAQKVSplitKernel;
 use inference_backend_metal::components::GQAQKVSplitShape;
-use inference_backend_metal::components::GQASDPAExecutionSpecialization;
 use inference_backend_metal::components::GQASplitKVSingleQConfig;
 use inference_backend_metal::components::GQASplitKVSingleQKernels;
 use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
@@ -17,6 +16,7 @@ use inference_backend_metal::components::RMSNormRopeBuffers;
 use inference_backend_metal::components::RMSNormRopeConfig;
 use inference_backend_metal::components::RMSNormRopeKernel;
 use inference_backend_metal::components::RMSNormRopeShape;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -98,7 +98,7 @@ impl UngatedDSparkGQA {
         }
     }
 
-    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, GQASDPAExecutionSpecialization) {
+    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, backend_sdpa::ExecutionVariant) {
         input.page_table_layout.validate();
         assert!(
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
@@ -126,14 +126,14 @@ impl UngatedDSparkGQA {
         );
         assert_eq!(
             sdpa_execution.map.thread_block.max_q_tokens, 1,
-            "DSpark history attention requires a single-Q SDPA specialization"
+            "DSpark history attention requires a single-Q SDPA variant"
         );
         (shape, sdpa_execution)
     }
 
     fn split_kv_single_q_config(
         &self,
-        sdpa_execution: GQASDPAExecutionSpecialization,
+        sdpa_execution: backend_sdpa::ExecutionVariant,
         page_table_layout: GQAPageTableLayout,
     ) -> GQASplitKVSingleQConfig {
         let attention = &self.core.attention;

@@ -371,7 +371,7 @@ impl BlockFixture {
         }
         let metadata = self.gqa_state.metadata();
         let shape = metadata.replay_shape();
-        let map = metadata.execution_specialization().map.thread_block;
+        let map = metadata.variant().map.thread_block;
         let variant_name = if map.max_q_tokens == 1 { "single_q" } else { "tiled_q" };
         let max_q_tokens = map.max_q_tokens;
         let kv_tokens_per_iteration = map.kv_tokens_per_iteration;

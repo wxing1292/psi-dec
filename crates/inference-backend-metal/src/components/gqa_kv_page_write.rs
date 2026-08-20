@@ -11,21 +11,21 @@ use crate::metal::ReplayU32;
 const GQA_KV_PAGE_WRITE_SOURCE: &str = include_str!("metal/gqa_kv_page_write.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GQAKVPageWriteThreadBlockSpecialization {
+struct GQAKVPageWriteThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GQAKVPageWriteKernelSpecialization {
+struct GQAKVPageWriteKernelConstants {
     config: GQAKVPageWriteConfig,
-    thread_block: GQAKVPageWriteThreadBlockSpecialization,
+    thread_block: GQAKVPageWriteThreadBlockConstants,
 }
 
-impl GQAKVPageWriteKernelSpecialization {
+impl GQAKVPageWriteKernelConstants {
     fn current(config: GQAKVPageWriteConfig) -> Self {
         Self {
             config,
-            thread_block: GQAKVPageWriteThreadBlockSpecialization { required_threads: 256 },
+            thread_block: GQAKVPageWriteThreadBlockConstants { required_threads: 256 },
         }
     }
 }
@@ -141,22 +141,22 @@ pub struct GQAKVPageWriteBuffers<'a> {
 }
 
 pub struct GQAKVPageWrite {
-    specialization: GQAKVPageWriteKernelSpecialization,
+    constants: GQAKVPageWriteKernelConstants,
     kernel: Kernel,
 }
 
 impl GQAKVPageWrite {
     pub fn new(device: &Device, config: GQAKVPageWriteConfig) -> Self {
         config.validate();
-        let specialization = GQAKVPageWriteKernelSpecialization::current(config);
-        let source = kv_page_write_source(specialization);
+        let constants = GQAKVPageWriteKernelConstants::current(config);
+        let source = kv_page_write_source(constants);
         let function_name = match config.dtype {
             Dtype::Float32 => "gqa_kv_page_write_f32",
             Dtype::Bfloat16 => "gqa_kv_page_write_u16",
             dtype => panic!("unsupported GQA KV page write dtype {dtype:?}"),
         };
         Self {
-            specialization,
+            constants,
             kernel: Kernel::new(device, &source, function_name),
         }
     }
@@ -168,7 +168,7 @@ impl GQAKVPageWrite {
         page_table_index: ReplayU32,
     ) -> GQAKVPageWriteInvocation<'a> {
         GQAKVPageWriteInvocation {
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -185,7 +185,7 @@ impl GQAKVPageWrite {
         page_table_index: ReplayU32,
     ) -> GQAKVPageWriteInvocation<'a> {
         GQAKVPageWriteInvocation {
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -195,9 +195,9 @@ impl GQAKVPageWrite {
     }
 }
 
-fn kv_page_write_source(specialization: GQAKVPageWriteKernelSpecialization) -> String {
-    let config = specialization.config;
-    let constants = format!(
+fn kv_page_write_source(kernel_constants: GQAKVPageWriteKernelConstants) -> String {
+    let config = kernel_constants.config;
+    let source_constants = format!(
         "using namespace metal;\n\nconstant uint num_kv_heads = {}u;\nconstant uint head_dim = {}u;\nconstant uint \
          num_tokens_per_page = {}u;\nconstant uint page_bytes = {}u;",
         config.num_kv_heads,
@@ -205,11 +205,11 @@ fn kv_page_write_source(specialization: GQAKVPageWriteKernelSpecialization) -> S
         config.num_tokens_per_page(),
         config.page_bytes,
     );
-    GQA_KV_PAGE_WRITE_SOURCE.replacen("using namespace metal;", &constants, 1)
+    GQA_KV_PAGE_WRITE_SOURCE.replacen("using namespace metal;", &source_constants, 1)
 }
 
 pub struct GQAKVPageWriteInvocation<'a> {
-    specialization: GQAKVPageWriteKernelSpecialization,
+    constants: GQAKVPageWriteKernelConstants,
     kernel: &'a Kernel,
     shape: GQAKVPageWriteShape,
     buffers: GQAKVPageWriteBuffers<'a>,
@@ -220,7 +220,7 @@ pub struct GQAKVPageWriteInvocation<'a> {
 impl Operator for GQAKVPageWriteInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        let config = self.specialization.config;
+        let config = self.constants.config;
         recorder.set_kernel(self.kernel);
         recorder.set_buffer_write(0, self.buffers.pages, 0);
         recorder.set_buffer_read(1, self.buffers.flat_k, 0);
@@ -252,14 +252,14 @@ impl Operator for GQAKVPageWriteInvocation<'_> {
         recorder.set_u32(10, self.shape.page_table_layout.num_page_ids_per_block);
         recorder.dispatch_1d(
             config.num_total_threads(self.shape),
-            self.specialization.thread_block.required_threads as usize,
+            self.constants.thread_block.required_threads as usize,
         );
     }
 }
 
 impl GQAKVPageWriteInvocation<'_> {
     fn validate(&self) {
-        let config = self.specialization.config;
+        let config = self.constants.config;
         self.shape.validate(config);
         assert!(self.buffers.flat_k.len_bytes() >= config.flat_kv_bytes(self.shape));
         assert!(self.buffers.flat_v.len_bytes() >= config.flat_kv_bytes(self.shape));
@@ -279,16 +279,16 @@ mod tests {
     const NUM_ACTIVE_WRITES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.kv.active_writes");
 
     #[test]
-    fn test_specialization_has_explicit_thread_block_scope() {
+    fn test_constants_have_explicit_thread_block_scope() {
         let config = GQAKVPageWriteConfig {
             num_kv_heads: 2,
             head_dim: 2,
             page_bytes: 16,
             dtype: Dtype::Bfloat16,
         };
-        let specialization = GQAKVPageWriteKernelSpecialization::current(config);
-        assert_eq!(specialization.config, config);
-        assert_eq!(specialization.thread_block.required_threads, 256);
+        let constants = GQAKVPageWriteKernelConstants::current(config);
+        assert_eq!(constants.config, config);
+        assert_eq!(constants.thread_block.required_threads, 256);
     }
 
     #[test]

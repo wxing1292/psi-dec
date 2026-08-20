@@ -1,9 +1,7 @@
 use std::cmp::Reverse;
 use std::ops::Range;
 
-use inference_backend_metal::components::GQASDPAConfig;
-use inference_backend_metal::components::GQASDPAExecutionSpecialization;
-use inference_backend_metal::components::GQASDPASpecializationRegistry;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_executor_core::attn::GQAReplayShape;
 
 use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
@@ -11,12 +9,12 @@ use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 const D256_PAGE8_MIN_SELECTION_SCORE: u64 = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASDPARequestShape {
+pub struct RequestShape {
     pub num_history_tokens: u32,
     pub num_q_tokens: u32,
 }
 
-impl GQASDPARequestShape {
+impl RequestShape {
     pub fn from_batch(token_indices: &[u32], cu_tokens: &[u32]) -> Vec<Self> {
         assert_eq!(cu_tokens.len(), token_indices.len() + 1);
         assert_eq!(cu_tokens.first().copied(), Some(0));
@@ -40,27 +38,27 @@ impl GQASDPARequestShape {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASDPAPlannerLimits {
+pub struct SelectorLimits {
     pub max_map_task_templates: u32,
     pub partial_state_group_capacity: usize,
     pub max_active_partial_state_groups: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GQASDPAQTokenRange {
+pub struct QTokenRange {
     pub request_index: u32,
     pub flat_q_token_indices: Range<u32>,
     pub max_visible_kv_tokens: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GQASDPAMapTaskTemplate {
+pub struct MapTaskTemplate {
     pub q_token_range_index: u32,
     pub request_local_kv_token_indices: Range<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASDPAPlanMetrics {
+pub struct SelectionMetrics {
     pub num_scheduled_qk_token_pairs: u64,
     pub num_active_qk_token_pairs: u64,
     pub num_map_threadblocks_per_kv_head: u64,
@@ -73,7 +71,7 @@ pub struct GQASDPAPlanMetrics {
     pub num_logical_qk_token_pairs: u64,
 }
 
-impl GQASDPAPlanMetrics {
+impl SelectionMetrics {
     fn selection_overhead_score(self) -> u64 {
         self.num_map_threadblocks_per_kv_head
             .checked_add(self.num_map_simdgroup_waves_per_kv_head)
@@ -84,25 +82,25 @@ impl GQASDPAPlanMetrics {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GQASDPAPlan {
-    execution_specialization: GQASDPAExecutionSpecialization,
-    q_token_ranges: Vec<GQASDPAQTokenRange>,
-    map_task_templates: Vec<GQASDPAMapTaskTemplate>,
+pub struct Selection {
+    variant: backend_sdpa::ExecutionVariant,
+    q_token_ranges: Vec<QTokenRange>,
+    map_task_templates: Vec<MapTaskTemplate>,
     cu_partial_outputs_by_q_token_range: Vec<u32>,
     replay_shape: GQAReplayShape,
-    metrics: GQASDPAPlanMetrics,
+    metrics: SelectionMetrics,
 }
 
-impl GQASDPAPlan {
-    pub fn execution_specialization(&self) -> GQASDPAExecutionSpecialization {
-        self.execution_specialization
+impl Selection {
+    pub fn variant(&self) -> backend_sdpa::ExecutionVariant {
+        self.variant
     }
 
-    pub fn q_token_ranges(&self) -> &[GQASDPAQTokenRange] {
+    pub fn q_token_ranges(&self) -> &[QTokenRange] {
         &self.q_token_ranges
     }
 
-    pub fn map_task_templates(&self) -> &[GQASDPAMapTaskTemplate] {
+    pub fn map_task_templates(&self) -> &[MapTaskTemplate] {
         &self.map_task_templates
     }
 
@@ -114,13 +112,13 @@ impl GQASDPAPlan {
         self.replay_shape
     }
 
-    pub fn metrics(&self) -> GQASDPAPlanMetrics {
+    pub fn metrics(&self) -> SelectionMetrics {
         self.metrics
     }
 }
 
 #[derive(Clone, Copy)]
-enum GQASDPAReplayCapacity<'a> {
+enum ReplayCapacity<'a> {
     Exact,
     ComponentBucketed(&'a GQAReplayBucketPolicy),
     CallerTokenCapacity {
@@ -130,14 +128,14 @@ enum GQASDPAReplayCapacity<'a> {
 }
 
 #[derive(Clone, Debug)]
-pub struct GQASDPAPlanner {
-    registry: GQASDPASpecializationRegistry,
-    limits: GQASDPAPlannerLimits,
+pub struct Selector {
+    registry: backend_sdpa::Registry,
+    limits: SelectorLimits,
 }
 
-impl GQASDPAPlanner {
-    pub fn new(registry: GQASDPASpecializationRegistry, max_tokens: usize) -> Self {
-        assert!(max_tokens > 0, "GQA SDPA planner requires tokens");
+impl Selector {
+    pub fn new(registry: backend_sdpa::Registry, max_tokens: usize) -> Self {
+        assert!(max_tokens > 0, "GQA SDPA selector requires tokens");
         let max_map_task_templates = max_tokens
             .try_into()
             .expect("GQA SDPA Map task-template capacity must fit u32");
@@ -146,7 +144,7 @@ impl GQASDPAPlanner {
             .expect("GQA SDPA partial-state-group capacity must fit usize");
         Self {
             registry,
-            limits: GQASDPAPlannerLimits {
+            limits: SelectorLimits {
                 max_map_task_templates,
                 partial_state_group_capacity,
                 max_active_partial_state_groups: max_map_task_templates,
@@ -154,29 +152,29 @@ impl GQASDPAPlanner {
         }
     }
 
-    pub fn limits(&self) -> GQASDPAPlannerLimits {
+    pub fn limits(&self) -> SelectorLimits {
         self.limits
     }
 
-    pub fn plan_exact(&self, request_shapes: &[GQASDPARequestShape]) -> GQASDPAPlan {
-        self.plan(request_shapes, GQASDPAReplayCapacity::Exact)
+    pub fn select_exact(&self, request_shapes: &[RequestShape]) -> Selection {
+        self.select(request_shapes, ReplayCapacity::Exact)
     }
 
-    pub fn plan_bucketed(&self, request_shapes: &[GQASDPARequestShape], policy: &GQAReplayBucketPolicy) -> GQASDPAPlan {
+    pub fn select_bucketed(&self, request_shapes: &[RequestShape], policy: &GQAReplayBucketPolicy) -> Selection {
         self.validate_policy(policy);
-        self.plan(request_shapes, GQASDPAReplayCapacity::ComponentBucketed(policy))
+        self.select(request_shapes, ReplayCapacity::ComponentBucketed(policy))
     }
 
-    pub fn plan_bucketed_with_token_capacity(
+    pub fn select_bucketed_with_token_capacity(
         &self,
-        request_shapes: &[GQASDPARequestShape],
+        request_shapes: &[RequestShape],
         policy: &GQAReplayBucketPolicy,
         num_total_tokens: u32,
-    ) -> GQASDPAPlan {
+    ) -> Selection {
         self.validate_policy(policy);
-        self.plan(
+        self.select(
             request_shapes,
-            GQASDPAReplayCapacity::CallerTokenCapacity {
+            ReplayCapacity::CallerTokenCapacity {
                 num_total_tokens,
                 policy,
             },
@@ -187,19 +185,19 @@ impl GQASDPAPlanner {
         assert_eq!(
             policy.max_tokens(),
             self.limits.max_map_task_templates,
-            "GQA replay bucket policy must match the SDPA planning capacity"
+            "GQA replay bucket policy must match the SDPA selection capacity"
         );
     }
 
-    fn plan(&self, request_shapes: &[GQASDPARequestShape], replay_capacity: GQASDPAReplayCapacity<'_>) -> GQASDPAPlan {
-        assert!(!request_shapes.is_empty(), "GQA SDPA planner requires requests");
+    fn select(&self, request_shapes: &[RequestShape], replay_capacity: ReplayCapacity<'_>) -> Selection {
+        assert!(!request_shapes.is_empty(), "GQA SDPA selector requires requests");
         let num_tokens = request_shapes
             .iter()
             .try_fold(0u32, |total, shape| total.checked_add(shape.num_q_tokens))
             .expect("GQA SDPA token count must fit u32");
         assert!(num_tokens > 0);
         assert!(num_tokens <= self.limits.max_map_task_templates);
-        if let GQASDPAReplayCapacity::CallerTokenCapacity {
+        if let ReplayCapacity::CallerTokenCapacity {
             num_total_tokens,
             policy,
         } = replay_capacity
@@ -216,11 +214,11 @@ impl GQASDPAPlanner {
 
         let candidates = self
             .registry
-            .execution_specializations()
+            .variants()
             .iter()
-            .map(|&execution_specialization| {
-                materialize_candidate_plan(
-                    execution_specialization,
+            .map(|&variant| {
+                materialize_candidate(
+                    variant,
                     self.registry.config(),
                     request_shapes,
                     self.limits,
@@ -228,26 +226,26 @@ impl GQASDPAPlanner {
                 )
             })
             .collect::<Vec<_>>();
-        select_plan(self.registry.config(), candidates)
+        select_candidate(self.registry.config(), candidates)
     }
 }
 
 #[derive(Clone)]
 struct QTokenRangeWork {
-    q_token_range: GQASDPAQTokenRange,
+    q_token_range: QTokenRange,
     num_kv_iterations: u32,
     num_map_tasks: u32,
 }
 
-fn materialize_candidate_plan(
-    execution_specialization: GQASDPAExecutionSpecialization,
-    config: GQASDPAConfig,
-    request_shapes: &[GQASDPARequestShape],
-    limits: GQASDPAPlannerLimits,
-    replay_capacity: GQASDPAReplayCapacity<'_>,
-) -> GQASDPAPlan {
-    assert!(execution_specialization.supports(config));
-    let map = execution_specialization.map.thread_block;
+fn materialize_candidate(
+    variant: backend_sdpa::ExecutionVariant,
+    config: backend_sdpa::Config,
+    request_shapes: &[RequestShape],
+    limits: SelectorLimits,
+    replay_capacity: ReplayCapacity<'_>,
+) -> Selection {
+    assert!(variant.supports(config));
+    let map = variant.map.thread_block;
     let mut ranges = build_q_token_ranges(request_shapes, map.max_q_tokens, map.kv_tokens_per_iteration);
     allocate_map_tasks(&mut ranges, limits);
 
@@ -277,7 +275,7 @@ fn materialize_candidate_plan(
                     .and_then(|value| value.try_into().ok())
                     .expect("GQA SDPA KV-token end must fit u32"),
             );
-            map_task_templates.push(GQASDPAMapTaskTemplate {
+            map_task_templates.push(MapTaskTemplate {
                 q_token_range_index: q_token_range_index
                     .try_into()
                     .expect("GQA SDPA Q-token-range index must fit u32"),
@@ -331,7 +329,7 @@ fn materialize_candidate_plan(
         u64::from(num_total_map_task_templates) * u64::from(map.max_q_tokens);
     assert!(
         num_reserved_partial_state_groups as usize <= limits.partial_state_group_capacity,
-        "GQA SDPA plan exceeds its partial-state-group capacity"
+        "GQA SDPA selection exceeds its partial-state-group capacity"
     );
     let num_scheduled_qk_token_pairs = ranges
         .iter()
@@ -366,7 +364,7 @@ fn materialize_candidate_plan(
                 .expect("GQA logical query-key pair count must fit u64")
         })
         .sum();
-    let metrics = GQASDPAPlanMetrics {
+    let metrics = SelectionMetrics {
         num_scheduled_qk_token_pairs,
         num_active_qk_token_pairs,
         num_map_threadblocks_per_kv_head,
@@ -381,8 +379,8 @@ fn materialize_candidate_plan(
         num_logical_qk_token_pairs,
     };
 
-    GQASDPAPlan {
-        execution_specialization,
+    Selection {
+        variant,
         q_token_ranges,
         map_task_templates,
         cu_partial_outputs_by_q_token_range,
@@ -392,7 +390,7 @@ fn materialize_candidate_plan(
 }
 
 fn build_q_token_ranges(
-    request_shapes: &[GQASDPARequestShape],
+    request_shapes: &[RequestShape],
     max_q_tokens: u32,
     kv_tokens_per_iteration: u32,
 ) -> Vec<QTokenRangeWork> {
@@ -410,7 +408,7 @@ fn build_q_token_ranges(
                 .checked_add(flat_q_token_end - flat_request_begin)
                 .expect("GQA visible KV-token count must fit u32");
             ranges.push(QTokenRangeWork {
-                q_token_range: GQASDPAQTokenRange {
+                q_token_range: QTokenRange {
                     request_index: request_index.try_into().expect("GQA request index must fit u32"),
                     flat_q_token_indices: flat_q_token_begin..flat_q_token_end,
                     max_visible_kv_tokens,
@@ -426,7 +424,7 @@ fn build_q_token_ranges(
     ranges
 }
 
-fn allocate_map_tasks(ranges: &mut [QTokenRangeWork], limits: GQASDPAPlannerLimits) {
+fn allocate_map_tasks(ranges: &mut [QTokenRangeWork], limits: SelectorLimits) {
     let mut num_map_tasks = ranges.len();
     let mut num_active_partial_state_groups = ranges
         .iter()
@@ -468,27 +466,27 @@ fn replay_extents(
     num_q_token_ranges: u32,
     num_map_task_templates: u32,
     max_map_task_templates: u32,
-    replay_capacity: GQASDPAReplayCapacity<'_>,
+    replay_capacity: ReplayCapacity<'_>,
 ) -> (u32, u32, u32) {
     match replay_capacity {
-        GQASDPAReplayCapacity::Exact => {
+        ReplayCapacity::Exact => {
             let num_total_map_task_templates = num_map_task_templates
                 .checked_next_power_of_two()
                 .unwrap_or(max_map_task_templates)
                 .min(max_map_task_templates);
             (num_tokens, num_q_token_ranges, num_total_map_task_templates)
         },
-        GQASDPAReplayCapacity::ComponentBucketed(policy) => {
+        ReplayCapacity::ComponentBucketed(policy) => {
             policy.capacities(num_tokens, num_q_token_ranges, num_map_task_templates)
         },
-        GQASDPAReplayCapacity::CallerTokenCapacity {
+        ReplayCapacity::CallerTokenCapacity {
             num_total_tokens,
             policy,
         } => policy.capacities_with_token_capacity(num_total_tokens, num_q_token_ranges, num_map_task_templates),
     }
 }
 
-fn select_plan(config: GQASDPAConfig, mut candidates: Vec<GQASDPAPlan>) -> GQASDPAPlan {
+fn select_candidate(config: backend_sdpa::Config, mut candidates: Vec<Selection>) -> Selection {
     assert!(!candidates.is_empty());
     if candidates.len() == 1 {
         return candidates.pop().unwrap();
@@ -496,11 +494,11 @@ fn select_plan(config: GQASDPAConfig, mut candidates: Vec<GQASDPAPlan>) -> GQASD
 
     let single_q_index = candidates
         .iter()
-        .position(|plan| plan.execution_specialization.map.thread_block.max_q_tokens == 1);
+        .position(|selection| selection.variant.map.thread_block.max_q_tokens == 1);
     let tiled_indices = candidates
         .iter()
         .enumerate()
-        .filter(|(_, plan)| plan.execution_specialization.map.thread_block.max_q_tokens > 1)
+        .filter(|(_, selection)| selection.variant.map.thread_block.max_q_tokens > 1)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let Some(&first_tiled_index) = tiled_indices.first() else {
@@ -518,7 +516,7 @@ fn select_plan(config: GQASDPAConfig, mut candidates: Vec<GQASDPAPlan>) -> GQASD
 
     let full_q_heads = tiled_indices
         .iter()
-        .map(|&index| candidates[index].execution_specialization.map.thread_block.max_q_heads)
+        .map(|&index| candidates[index].variant.map.thread_block.max_q_heads)
         .max()
         .unwrap();
     let desired_q_heads = if (config.head_dim, config.tokens_per_page) != (128, 8)
@@ -531,7 +529,7 @@ fn select_plan(config: GQASDPAConfig, mut candidates: Vec<GQASDPAPlan>) -> GQASD
     let tiled_q_index = tiled_indices
         .iter()
         .copied()
-        .find(|&index| candidates[index].execution_specialization.map.thread_block.max_q_heads == desired_q_heads)
+        .find(|&index| candidates[index].variant.map.thread_block.max_q_heads == desired_q_heads)
         .unwrap_or(first_tiled_index);
 
     if (config.head_dim, config.tokens_per_page) == (256, 8)
@@ -542,7 +540,7 @@ fn select_plan(config: GQASDPAConfig, mut candidates: Vec<GQASDPAPlan>) -> GQASD
     candidates.remove(tiled_q_index)
 }
 
-fn prefer_d256_page8_tiled_q(single_q: &GQASDPAPlan, tiled_q: &GQASDPAPlan) -> bool {
+fn prefer_d256_page8_tiled_q(single_q: &Selection, tiled_q: &Selection) -> bool {
     let selection_score = single_q
         .metrics
         .num_logical_qk_token_pairs
@@ -563,17 +561,16 @@ fn prefer_d256_page8_tiled_q(single_q: &GQASDPAPlan, tiled_q: &GQASDPAPlan) -> b
 
 #[cfg(test)]
 mod tests {
-    use inference_backend_metal::components::GQASDPAConfig;
-    use inference_backend_metal::components::GQASDPASpecializationRegistry;
+    use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
     use inference_backend_metal::metal::Dtype;
 
-    use super::GQASDPAPlan;
-    use super::GQASDPAPlanner;
-    use super::GQASDPARequestShape;
+    use super::RequestShape;
+    use super::Selection;
+    use super::Selector;
     use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 
-    fn planner() -> GQASDPAPlanner {
-        planner_for(GQASDPAConfig {
+    fn selector() -> Selector {
+        selector_for(backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 24,
             num_kv_heads: 4,
@@ -582,106 +579,106 @@ mod tests {
         })
     }
 
-    fn planner_for(config: GQASDPAConfig) -> GQASDPAPlanner {
-        GQASDPAPlanner::new(GQASDPASpecializationRegistry::new(config), 128)
+    fn selector_for(config: backend_sdpa::Config) -> Selector {
+        Selector::new(backend_sdpa::Registry::new(config), 128)
     }
 
-    fn plan(token_indices: &[u32], request_tokens: &[u32], bucketed: bool) -> GQASDPAPlan {
+    fn selection(token_indices: &[u32], request_tokens: &[u32], bucketed: bool) -> Selection {
         let mut cu_tokens = vec![0];
         for &num_tokens in request_tokens {
             cu_tokens.push(cu_tokens.last().copied().unwrap() + num_tokens);
         }
-        let request_shapes = GQASDPARequestShape::from_batch(token_indices, &cu_tokens);
+        let request_shapes = RequestShape::from_batch(token_indices, &cu_tokens);
         if bucketed {
-            planner().plan_bucketed(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]))
+            selector().select_bucketed(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]))
         } else {
-            planner().plan_exact(&request_shapes)
+            selector().select_exact(&request_shapes)
         }
     }
 
-    fn is_single_q(plan: &GQASDPAPlan) -> bool {
-        plan.execution_specialization().map.thread_block.max_q_tokens == 1
+    fn is_single_q(selection: &Selection) -> bool {
+        selection.variant().map.thread_block.max_q_tokens == 1
     }
 
     #[test]
-    fn test_planner_preserves_measured_d256_page8_crossovers() {
+    fn test_selector_preserves_measured_d256_page8_crossovers() {
         for (tokens, context) in [(1, 65536), (2, 65536), (4, 128), (8, 128), (25, 32)] {
-            assert!(is_single_q(&plan(&[context], &[tokens], false)));
-            assert!(is_single_q(&plan(&[context], &[tokens], true)));
+            assert!(is_single_q(&selection(&[context], &[tokens], false)));
+            assert!(is_single_q(&selection(&[context], &[tokens], true)));
         }
         for (tokens, context) in [(4, 512), (8, 512), (16, 128), (25, 128), (64, 0)] {
-            assert!(!is_single_q(&plan(&[context], &[tokens], false)));
-            assert!(!is_single_q(&plan(&[context], &[tokens], true)));
+            assert!(!is_single_q(&selection(&[context], &[tokens], false)));
+            assert!(!is_single_q(&selection(&[context], &[tokens], true)));
         }
     }
 
     #[test]
-    fn test_planner_preserves_non_page8_profile_selection() {
-        let request_shapes = GQASDPARequestShape::from_batch(&[0; 4], &[0, 2, 4, 6, 8]);
-        let d256_page16 = planner_for(GQASDPAConfig {
+    fn test_selector_preserves_non_page8_profile_selection() {
+        let request_shapes = RequestShape::from_batch(&[0; 4], &[0, 2, 4, 6, 8]);
+        let d256_page16 = selector_for(backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 24,
             num_kv_heads: 4,
             head_dim: 256,
             tokens_per_page: 16,
         })
-        .plan_exact(&request_shapes);
-        assert_eq!(d256_page16.execution_specialization().map.thread_block.max_q_tokens, 8);
-        assert_eq!(d256_page16.execution_specialization().map.thread_block.max_q_heads, 3);
+        .select_exact(&request_shapes);
+        assert_eq!(d256_page16.variant().map.thread_block.max_q_tokens, 8);
+        assert_eq!(d256_page16.variant().map.thread_block.max_q_heads, 3);
 
-        let d128_page8 = planner_for(GQASDPAConfig {
+        let d128_page8 = selector_for(backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 32,
             num_kv_heads: 4,
             head_dim: 128,
             tokens_per_page: 8,
         })
-        .plan_exact(&request_shapes);
-        assert_eq!(d128_page8.execution_specialization().map.thread_block.max_q_tokens, 8);
-        assert_eq!(d128_page8.execution_specialization().map.thread_block.max_q_heads, 8);
+        .select_exact(&request_shapes);
+        assert_eq!(d128_page8.variant().map.thread_block.max_q_tokens, 8);
+        assert_eq!(d128_page8.variant().map.thread_block.max_q_heads, 8);
 
-        let unsupported = planner_for(GQASDPAConfig {
+        let unsupported = selector_for(backend_sdpa::Config {
             io_dtype: Dtype::Bfloat16,
             num_q_heads: 32,
             num_kv_heads: 4,
             head_dim: 256,
             tokens_per_page: 4,
         })
-        .plan_exact(&request_shapes);
-        assert_eq!(unsupported.execution_specialization().map.thread_block.max_q_tokens, 1);
+        .select_exact(&request_shapes);
+        assert_eq!(unsupported.variant().map.thread_block.max_q_tokens, 1);
     }
 
     #[test]
-    fn test_planner_prices_request_local_tail_ranges() {
-        assert!(is_single_q(&plan(&[65536; 8], &[1; 8], false)));
-        assert!(is_single_q(&plan(&[1024, 65536], &[64, 1], false)));
-        assert!(is_single_q(&plan(&[65536, 1024], &[1, 8], false)));
-        assert!(!is_single_q(&plan(&[65536, 65536], &[8, 1], false)));
+    fn test_selector_prices_request_local_tail_ranges() {
+        assert!(is_single_q(&selection(&[65536; 8], &[1; 8], false)));
+        assert!(is_single_q(&selection(&[1024, 65536], &[64, 1], false)));
+        assert!(is_single_q(&selection(&[65536, 1024], &[1, 8], false)));
+        assert!(!is_single_q(&selection(&[65536, 65536], &[8, 1], false)));
     }
 
     #[test]
-    fn test_plan_materializes_current_tiled_q_capacity_and_metrics() {
-        let tail_plan = plan(&[1024, 65536], &[64, 1], false);
-        assert!(is_single_q(&tail_plan));
+    fn test_selection_materializes_current_tiled_q_capacity_and_metrics() {
+        let tail_selection = selection(&[1024, 65536], &[64, 1], false);
+        assert!(is_single_q(&tail_selection));
 
-        let plan = plan(&[65536], &[25], true);
-        assert!(!is_single_q(&plan));
-        assert_eq!(plan.q_token_ranges().len(), 4);
-        assert_eq!(plan.map_task_templates().len(), 23);
-        assert_eq!(plan.replay_shape().num_total_sdpa_map_task_templates, 24);
-        assert_eq!(plan.metrics().num_active_partial_state_groups, 128);
-        assert_eq!(plan.metrics().num_active_partial_states, 128 * 24);
-        assert_eq!(plan.metrics().num_reserved_partial_state_groups, 184);
-        assert_eq!(plan.metrics().num_replay_reserved_partial_state_groups, 192);
+        let selection = selection(&[65536], &[25], true);
+        assert!(!is_single_q(&selection));
+        assert_eq!(selection.q_token_ranges().len(), 4);
+        assert_eq!(selection.map_task_templates().len(), 23);
+        assert_eq!(selection.replay_shape().num_total_sdpa_map_task_templates, 24);
+        assert_eq!(selection.metrics().num_active_partial_state_groups, 128);
+        assert_eq!(selection.metrics().num_active_partial_states, 128 * 24);
+        assert_eq!(selection.metrics().num_reserved_partial_state_groups, 184);
+        assert_eq!(selection.metrics().num_replay_reserved_partial_state_groups, 192);
     }
 
     #[test]
-    fn test_plan_map_tasks_cover_each_visible_kv_range_once() {
-        let plan = plan(&[1024], &[25], false);
-        for (range_index, range) in plan.q_token_ranges().iter().enumerate() {
-            let offsets = plan.cu_partial_outputs_by_q_token_range();
+    fn test_selection_map_tasks_cover_each_visible_kv_range_once() {
+        let selection = selection(&[1024], &[25], false);
+        for (range_index, range) in selection.q_token_ranges().iter().enumerate() {
+            let offsets = selection.cu_partial_outputs_by_q_token_range();
             let templates =
-                &plan.map_task_templates()[offsets[range_index] as usize..offsets[range_index + 1] as usize];
+                &selection.map_task_templates()[offsets[range_index] as usize..offsets[range_index + 1] as usize];
             assert_eq!(templates.first().unwrap().request_local_kv_token_indices.start, 0);
             assert_eq!(
                 templates.last().unwrap().request_local_kv_token_indices.end,
@@ -699,14 +696,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "GQA active token count must not exceed the caller-owned token capacity")]
     fn test_caller_token_capacity_rejects_active_overflow() {
-        let request_shapes = GQASDPARequestShape::from_batch(&[0], &[0, 5]);
-        planner().plan_bucketed_with_token_capacity(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 4);
+        let request_shapes = RequestShape::from_batch(&[0], &[0, 5]);
+        selector().select_bucketed_with_token_capacity(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 4);
     }
 
     #[test]
     #[should_panic(expected = "GQA caller-owned token capacity must not exceed the metadata capacity")]
     fn test_caller_token_capacity_rejects_metadata_overflow() {
-        let request_shapes = GQASDPARequestShape::from_batch(&[0], &[0, 5]);
-        planner().plan_bucketed_with_token_capacity(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 129);
+        let request_shapes = RequestShape::from_batch(&[0], &[0, 5]);
+        selector().select_bucketed_with_token_capacity(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 129);
     }
 }
