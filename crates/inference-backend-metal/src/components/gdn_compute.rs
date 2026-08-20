@@ -9,13 +9,80 @@ use crate::metal::ReplayU32;
 
 const GDN_COMPUTE_SOURCE: &str = include_str!("metal/gdn_compute.metal");
 
-const SHORT_CONV_NUM_THREADS_PER_THREADBLOCK: usize = 256;
-const RAGGED_RECURRENT_NUM_QK_DIM_THREADS: usize = 32;
-const CANDIDATE_V_ROWS_PER_SIMDGROUP: usize = 2;
-const CANDIDATE_SIMDGROUPS_PER_THREADBLOCK: usize = 2;
-const OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK: usize = 128;
+const SHORT_CONV_REQUIRED_THREADS: u32 = 256;
+const FINAL_STATE_RECURRENT_NUM_QK_DIM_THREADS: u32 = 32;
+const CANDIDATE_STATE_RECURRENT_NUM_QK_DIM_THREADS: u32 = 32;
+const CANDIDATE_STATE_RECURRENT_NUM_V_ROWS_PER_SIMDGROUP: u32 = 2;
+const CANDIDATE_STATE_RECURRENT_NUM_SIMDGROUPS: u32 = 2;
+const OUTPUT_NORM_GATE_REQUIRED_THREADS: u32 = 128;
 
-/// Static geometry for the generic GDN compute graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelSpecialization<T> {
+    thread_block: T,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNFinalStateRecurrentThreadBlockSpecialization {
+    num_qk_dim_threads: u32,
+    num_v_rows: u32,
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNCandidateStateRecurrentSimdgroupSpecialization {
+    num_v_rows: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNCandidateStateRecurrentThreadBlockSpecialization {
+    num_qk_dim_threads: u32,
+    num_simdgroups: u32,
+    simdgroup: GDNCandidateStateRecurrentSimdgroupSpecialization,
+    required_threads: u32,
+}
+
+impl GDNCandidateStateRecurrentThreadBlockSpecialization {
+    fn num_v_rows(self) -> u32 {
+        self.num_simdgroups * self.simdgroup.num_v_rows
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNModelGeometry {
+    num_qk_heads: u32,
+    qk_head_dim: u32,
+    num_v_heads: u32,
+    v_head_dim: u32,
+    conv_kernel_size: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNKernelSpecializations {
+    short_conv: KernelSpecialization<ThreadBlockSpecialization>,
+    candidate_conv_state: KernelSpecialization<ThreadBlockSpecialization>,
+    final_state_recurrent: KernelSpecialization<GDNFinalStateRecurrentThreadBlockSpecialization>,
+    candidate_state_recurrent: KernelSpecialization<GDNCandidateStateRecurrentThreadBlockSpecialization>,
+    output_norm_gate: KernelSpecialization<ThreadBlockSpecialization>,
+}
+
+/// Compile-time model geometry and thread-block geometry for the GDN compute
+/// kernel set.
+///
+/// GDN has one recurrent algorithm. The final-state and candidate-state
+/// kernels implement different state-materialization contracts. They are not
+/// runtime cost candidates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GDNComputeSpecialization {
+    model: GDNModelGeometry,
+    kernels: GDNKernelSpecializations,
+}
+
+/// Construction input for the generic GDN compute graph.
 ///
 /// The core consumes projected `qkv`, `a`, `b`, and `z` tensors over flat token
 /// axis `T`. Q/K use `[T, Hqk, Dqk]`; V and recurrent output use
@@ -32,7 +99,8 @@ const OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK: usize = 128;
 ///
 /// `conv_qkv` is the post-SiLU recurrent-core input, not the raw convolution
 /// accumulation. `next_conv_state` contains the final `Ks = Kc - 1` inputs for
-/// the next invocation.
+/// the next invocation. Model geometry selects `GDNComputeSpecialization` at
+/// initialization. `q_scale` and `norm_eps` remain kernel arguments.
 #[derive(Clone, Copy, Debug)]
 pub struct GDNComputeConfig {
     pub num_qk_heads: u32,
@@ -45,7 +113,152 @@ pub struct GDNComputeConfig {
 }
 
 impl GDNComputeConfig {
+    fn model_geometry(self) -> GDNModelGeometry {
+        GDNModelGeometry {
+            num_qk_heads: self.num_qk_heads,
+            qk_head_dim: self.qk_head_dim,
+            num_v_heads: self.num_v_heads,
+            v_head_dim: self.v_head_dim,
+            conv_kernel_size: self.conv_kernel_size,
+        }
+    }
+
     pub fn qkv_dim(self) -> u32 {
+        self.model_geometry().qkv_dim()
+    }
+
+    pub fn conv_state_len(self) -> u32 {
+        self.model_geometry().conv_state_len()
+    }
+
+    pub fn recurrent_state_stride(self) -> usize {
+        self.model_geometry().recurrent_state_stride()
+    }
+
+    pub fn num_recurrent_output_values(self, shape: GDNComputeShape) -> usize {
+        self.model_geometry().num_recurrent_output_values(shape)
+    }
+
+    pub fn num_qkv_values(self, shape: GDNComputeShape) -> usize {
+        self.model_geometry().num_qkv_values(shape)
+    }
+
+    pub fn num_conv_state_values(self, shape: GDNComputeShape) -> usize {
+        self.model_geometry().num_conv_state_values(shape)
+    }
+
+    fn num_conv_weight_values(self) -> usize {
+        self.model_geometry().num_conv_weight_values()
+    }
+
+    fn validate(self) {
+        assert!(self.num_qk_heads > 0);
+        assert!(self.qk_head_dim > 0);
+        assert!(self.num_v_heads > 0);
+        assert!(self.v_head_dim > 0);
+        assert_eq!(self.num_v_heads % self.num_qk_heads, 0);
+        assert!(self.conv_kernel_size > 1);
+        assert!(self.q_scale.is_finite() && self.q_scale > 0.0);
+        assert!(self.norm_eps.is_finite() && self.norm_eps > 0.0);
+        assert_eq!(
+            self.qk_head_dim % CANDIDATE_STATE_RECURRENT_NUM_QK_DIM_THREADS,
+            0,
+            "GDN candidate register-V requires Dqk divisible by the SIMDgroup width"
+        );
+        assert_eq!(
+            self.v_head_dim % CANDIDATE_STATE_RECURRENT_NUM_V_ROWS_PER_SIMDGROUP,
+            0,
+            "GDN candidate recurrent specialization requires Dv divisible by its SIMDgroup V-row count"
+        );
+        assert_eq!(
+            (self.v_head_dim / CANDIDATE_STATE_RECURRENT_NUM_V_ROWS_PER_SIMDGROUP)
+                % CANDIDATE_STATE_RECURRENT_NUM_SIMDGROUPS,
+            0,
+            "GDN candidate recurrent thread-block V-row count must divide Dv"
+        );
+        let _ = self.qkv_dim();
+        let _ = self.recurrent_state_stride();
+        let _ = self.num_conv_weight_values();
+    }
+}
+
+impl GDNComputeSpecialization {
+    fn from_config(config: GDNComputeConfig) -> Self {
+        config.validate();
+        let final_state_recurrent_num_v_rows = [8, 4]
+            .into_iter()
+            .find(|num_v_rows| {
+                config.v_head_dim.is_multiple_of(*num_v_rows)
+                    && *num_v_rows * FINAL_STATE_RECURRENT_NUM_QK_DIM_THREADS <= 1024
+            })
+            .expect("GDN recurrent V-dimension specialization requires Dv divisible by four");
+        let candidate_state_recurrent_thread_block = GDNCandidateStateRecurrentThreadBlockSpecialization {
+            num_qk_dim_threads: CANDIDATE_STATE_RECURRENT_NUM_QK_DIM_THREADS,
+            num_simdgroups: CANDIDATE_STATE_RECURRENT_NUM_SIMDGROUPS,
+            simdgroup: GDNCandidateStateRecurrentSimdgroupSpecialization {
+                num_v_rows: CANDIDATE_STATE_RECURRENT_NUM_V_ROWS_PER_SIMDGROUP,
+            },
+            required_threads: CANDIDATE_STATE_RECURRENT_NUM_QK_DIM_THREADS * CANDIDATE_STATE_RECURRENT_NUM_SIMDGROUPS,
+        };
+        let specialization = Self {
+            model: config.model_geometry(),
+            kernels: GDNKernelSpecializations {
+                short_conv: KernelSpecialization {
+                    thread_block: ThreadBlockSpecialization {
+                        required_threads: SHORT_CONV_REQUIRED_THREADS,
+                    },
+                },
+                candidate_conv_state: KernelSpecialization {
+                    thread_block: ThreadBlockSpecialization {
+                        required_threads: SHORT_CONV_REQUIRED_THREADS,
+                    },
+                },
+                final_state_recurrent: KernelSpecialization {
+                    thread_block: GDNFinalStateRecurrentThreadBlockSpecialization {
+                        num_qk_dim_threads: FINAL_STATE_RECURRENT_NUM_QK_DIM_THREADS,
+                        num_v_rows: final_state_recurrent_num_v_rows,
+                        required_threads: FINAL_STATE_RECURRENT_NUM_QK_DIM_THREADS * final_state_recurrent_num_v_rows,
+                    },
+                },
+                candidate_state_recurrent: KernelSpecialization {
+                    thread_block: candidate_state_recurrent_thread_block,
+                },
+                output_norm_gate: KernelSpecialization {
+                    thread_block: ThreadBlockSpecialization {
+                        required_threads: OUTPUT_NORM_GATE_REQUIRED_THREADS,
+                    },
+                },
+            },
+        };
+        specialization.validate();
+        specialization
+    }
+
+    fn validate(self) {
+        assert!(self.kernels.short_conv.thread_block.required_threads > 0);
+        assert!(self.kernels.candidate_conv_state.thread_block.required_threads > 0);
+        let final_state_recurrent = self.kernels.final_state_recurrent.thread_block;
+        assert_eq!(
+            final_state_recurrent.required_threads,
+            final_state_recurrent.num_qk_dim_threads * final_state_recurrent.num_v_rows
+        );
+        assert_eq!(self.model.v_head_dim % final_state_recurrent.num_v_rows, 0);
+        let candidate_state_recurrent = self.kernels.candidate_state_recurrent.thread_block;
+        assert_eq!(
+            candidate_state_recurrent.required_threads,
+            candidate_state_recurrent.num_qk_dim_threads * candidate_state_recurrent.num_simdgroups
+        );
+        assert_eq!(
+            candidate_state_recurrent.num_qk_dim_threads, final_state_recurrent.num_qk_dim_threads,
+            "GDN recurrent kernels share one generated Q/K-dimension thread count"
+        );
+        assert_eq!(self.model.v_head_dim % candidate_state_recurrent.num_v_rows(), 0);
+        assert!(self.kernels.output_norm_gate.thread_block.required_threads > 0);
+    }
+}
+
+impl GDNModelGeometry {
+    fn qkv_dim(self) -> u32 {
         self.num_qk_heads
             .checked_mul(self.qk_head_dim)
             .and_then(|dim| dim.checked_mul(2))
@@ -57,11 +270,11 @@ impl GDNComputeConfig {
             .expect("GDN concatenated Q/K/V dimension must fit u32")
     }
 
-    pub fn conv_state_len(self) -> u32 {
+    fn conv_state_len(self) -> u32 {
         self.conv_kernel_size - 1
     }
 
-    pub fn recurrent_state_stride(self) -> usize {
+    fn recurrent_state_stride(self) -> usize {
         checked_product(
             "GDN recurrent state stride",
             &[
@@ -72,7 +285,7 @@ impl GDNComputeConfig {
         )
     }
 
-    pub fn num_recurrent_output_values(self, shape: GDNComputeShape) -> usize {
+    fn num_recurrent_output_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN output element count",
             &[
@@ -83,14 +296,14 @@ impl GDNComputeConfig {
         )
     }
 
-    pub fn num_qkv_values(self, shape: GDNComputeShape) -> usize {
+    fn num_qkv_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN convolution element count",
             &[shape.num_total_tokens as usize, self.qkv_dim() as usize],
         )
     }
 
-    pub fn num_conv_state_values(self, shape: GDNComputeShape) -> usize {
+    fn num_conv_state_values(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN convolution state element count",
             &[
@@ -118,61 +331,32 @@ impl GDNComputeConfig {
             &[self.qkv_dim() as usize, self.conv_kernel_size as usize],
         )
     }
+}
 
+impl GDNComputeSpecialization {
     fn total_output_norm_gate_threads(self, shape: GDNComputeShape) -> usize {
         checked_product(
             "GDN output norm + gate thread count",
             &[
                 shape.num_total_tokens as usize,
-                self.num_v_heads as usize,
-                OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK,
+                self.model.num_v_heads as usize,
+                self.kernels.output_norm_gate.thread_block.required_threads as usize,
             ],
         )
     }
 
-    fn validate(self) {
-        assert!(self.num_qk_heads > 0);
-        assert!(self.qk_head_dim > 0);
-        assert!(self.num_v_heads > 0);
-        assert!(self.v_head_dim > 0);
-        assert_eq!(self.num_v_heads % self.num_qk_heads, 0);
-        assert!(self.conv_kernel_size > 1);
-        assert!(self.q_scale.is_finite() && self.q_scale > 0.0);
-        assert!(self.norm_eps.is_finite() && self.norm_eps > 0.0);
-        assert_eq!(
-            self.qk_head_dim % RAGGED_RECURRENT_NUM_QK_DIM_THREADS as u32,
-            0,
-            "GDN candidate register-V requires Dqk divisible by the SIMDgroup width"
-        );
-        assert_eq!(
-            self.v_head_dim % CANDIDATE_V_ROWS_PER_SIMDGROUP as u32,
-            0,
-            "GDN candidate register-V requires Dv divisible by the selected tile"
-        );
-        assert_eq!(
-            (self.v_head_dim / CANDIDATE_V_ROWS_PER_SIMDGROUP as u32) % CANDIDATE_SIMDGROUPS_PER_THREADBLOCK as u32,
-            0,
-            "GDN candidate register-V tiles must divide the grouped launch"
-        );
-        let _ = self.qkv_dim();
-        let _ = self.recurrent_state_stride();
-        let _ = self.num_conv_weight_values();
-        let _ = selected_v_dim_tile_size(self);
-    }
-
     fn validate_shape(self, shape: GDNComputeShape) {
-        self.validate();
         shape.validate();
         for (name, num_elements) in [
-            ("GDN convolution", self.num_qkv_values(shape)),
-            ("GDN output", self.num_recurrent_output_values(shape)),
-            ("GDN convolution state", self.num_conv_state_values(shape)),
-            ("GDN convolution weights", self.num_conv_weight_values()),
+            ("GDN convolution", self.model.num_qkv_values(shape)),
+            ("GDN output", self.model.num_recurrent_output_values(shape)),
+            ("GDN convolution state", self.model.num_conv_state_values(shape)),
+            ("GDN convolution weights", self.model.num_conv_weight_values()),
             (
                 "GDN output norm + gate threads",
                 self.total_output_norm_gate_threads(shape),
             ),
-            ("GDN recurrent state stride", self.recurrent_state_stride()),
+            ("GDN recurrent state stride", self.model.recurrent_state_stride()),
         ] {
             assert_u32_count_domain(num_elements, name);
         }
@@ -192,34 +376,35 @@ impl GDNComputeShape {
     }
 }
 
-fn selected_v_dim_tile_size(config: GDNComputeConfig) -> u32 {
-    [8, 4]
-        .into_iter()
-        .find(|tile_size| {
-            config.v_head_dim.is_multiple_of(*tile_size)
-                && *tile_size as usize * RAGGED_RECURRENT_NUM_QK_DIM_THREADS <= 1024
-        })
-        .expect("GDN recurrent V-dimension tile selection requires Dv divisible by four")
-}
-
-fn gdn_compute_source(config: GDNComputeConfig, v_dim_tile_size: u32) -> String {
+fn gdn_compute_source(specialization: GDNComputeSpecialization) -> String {
+    let model = specialization.model;
+    let final_state_recurrent = specialization.kernels.final_state_recurrent.thread_block;
+    let candidate_state_recurrent = specialization.kernels.candidate_state_recurrent.thread_block;
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_qk_heads = {num_qk_heads}u;\nconstant uint qk_head_dim = \
          {qk_head_dim}u;\nconstant uint num_v_heads = {num_v_heads}u;\nconstant uint v_head_dim = \
          {v_head_dim}u;\nconstant uint conv_kernel_size = {conv_kernel_size}u;\nconstant uint qkv_dim = \
-         {qkv_dim}u;\nconstant uint conv_state_len = {conv_state_len}u;\nconstant uint v_dim_tile_size = \
-         {v_dim_tile_size}u;\nconstant uint candidate_v_dim_tile_size = {candidate_v_rows_per_simdgroup}u;\nconstant \
-         uint candidate_simdgroups_per_threadgroup = {candidate_simdgroups_per_threadgroup}u;",
-        num_qk_heads = config.num_qk_heads,
-        qk_head_dim = config.qk_head_dim,
-        num_v_heads = config.num_v_heads,
-        v_head_dim = config.v_head_dim,
-        conv_kernel_size = config.conv_kernel_size,
-        qkv_dim = config.qkv_dim(),
-        conv_state_len = config.conv_state_len(),
-        v_dim_tile_size = v_dim_tile_size,
-        candidate_v_rows_per_simdgroup = CANDIDATE_V_ROWS_PER_SIMDGROUP,
-        candidate_simdgroups_per_threadgroup = CANDIDATE_SIMDGROUPS_PER_THREADBLOCK,
+         {qkv_dim}u;\nconstant uint conv_state_len = {conv_state_len}u;\nconstant uint \
+         final_state_recurrent_num_v_rows = {final_state_recurrent_num_v_rows}u;\nconstant uint \
+         final_state_recurrent_num_qk_dim_threads = {final_state_recurrent_num_qk_dim_threads}u;\nconstant uint \
+         candidate_state_recurrent_num_qk_dim_threads = {candidate_state_recurrent_num_qk_dim_threads}u;\nconstant \
+         uint candidate_state_recurrent_num_v_rows_per_simdgroup = \
+         {candidate_state_recurrent_num_v_rows_per_simdgroup}u;\nconstant uint \
+         candidate_state_recurrent_num_simdgroups = {candidate_state_recurrent_num_simdgroups}u;\nconstant uint \
+         output_norm_gate_required_threads = {output_norm_gate_required_threads}u;",
+        num_qk_heads = model.num_qk_heads,
+        qk_head_dim = model.qk_head_dim,
+        num_v_heads = model.num_v_heads,
+        v_head_dim = model.v_head_dim,
+        conv_kernel_size = model.conv_kernel_size,
+        qkv_dim = model.qkv_dim(),
+        conv_state_len = model.conv_state_len(),
+        final_state_recurrent_num_v_rows = final_state_recurrent.num_v_rows,
+        final_state_recurrent_num_qk_dim_threads = final_state_recurrent.num_qk_dim_threads,
+        candidate_state_recurrent_num_qk_dim_threads = candidate_state_recurrent.num_qk_dim_threads,
+        candidate_state_recurrent_num_v_rows_per_simdgroup = candidate_state_recurrent.simdgroup.num_v_rows,
+        candidate_state_recurrent_num_simdgroups = candidate_state_recurrent.num_simdgroups,
+        output_norm_gate_required_threads = specialization.kernels.output_norm_gate.thread_block.required_threads,
     );
     GDN_COMPUTE_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
@@ -257,31 +442,28 @@ pub struct GDNComputeBuffers<'a> {
 }
 
 pub struct GDNCompute {
-    config: GDNComputeConfig,
-    v_dim_tile_size: u32,
+    specialization: GDNComputeSpecialization,
+    q_scale: f32,
+    norm_eps: f32,
     short_conv: Kernel,
-    forward_conv_candidate_state: Kernel,
-    ragged_recurrent: Kernel,
-    ragged_recurrent_forward_candidate_state: Kernel,
+    candidate_conv_state: Kernel,
+    final_state_recurrent: Kernel,
+    candidate_state_recurrent: Kernel,
     output_norm_gate: Kernel,
 }
 
 impl GDNCompute {
     pub fn new(device: &Device, config: GDNComputeConfig) -> Self {
-        config.validate();
-        let v_dim_tile_size = selected_v_dim_tile_size(config);
-        let source = gdn_compute_source(config, v_dim_tile_size);
+        let specialization = GDNComputeSpecialization::from_config(config);
+        let source = gdn_compute_source(specialization);
         Self {
-            config,
-            v_dim_tile_size,
+            specialization,
+            q_scale: config.q_scale,
+            norm_eps: config.norm_eps,
             short_conv: Kernel::new(device, &source, "gdn_compute_short_conv_f32"),
-            forward_conv_candidate_state: Kernel::new(device, &source, "gdn_compute_forward_conv_candidate_state_f32"),
-            ragged_recurrent: Kernel::new(device, &source, "gdn_compute_ragged_recurrent_f32"),
-            ragged_recurrent_forward_candidate_state: Kernel::new(
-                device,
-                &source,
-                "gdn_compute_ragged_recurrent_forward_candidate_state_f32",
-            ),
+            candidate_conv_state: Kernel::new(device, &source, "gdn_compute_candidate_conv_state_f32"),
+            final_state_recurrent: Kernel::new(device, &source, "gdn_compute_final_state_recurrent_f32"),
+            candidate_state_recurrent: Kernel::new(device, &source, "gdn_compute_candidate_state_recurrent_f32"),
             output_norm_gate: Kernel::new(device, &source, "gdn_compute_output_norm_gate_f32"),
         }
     }
@@ -373,13 +555,17 @@ impl GDNCompute {
         recorder.set_u64(11, buffers.next_conv_state_offset_bytes);
         recorder.set_u32(12, u32::from(write_final_state));
         let total_short_conv_threads = self
-            .config
+            .specialization
+            .model
             .num_qkv_values(shape)
-            .max(self.config.num_conv_state_values(shape));
-        recorder.dispatch_1d(total_short_conv_threads, SHORT_CONV_NUM_THREADS_PER_THREADBLOCK);
+            .max(self.specialization.model.num_conv_state_values(shape));
+        recorder.dispatch_1d(
+            total_short_conv_threads,
+            self.specialization.kernels.short_conv.thread_block.required_threads as usize,
+        );
     }
 
-    fn record_forward_conv_candidate_state(
+    fn record_candidate_conv_state(
         &self,
         recorder: &CommandRecorder,
         shape: GDNComputeShape,
@@ -387,7 +573,7 @@ impl GDNCompute {
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) {
-        recorder.set_kernel(&self.forward_conv_candidate_state);
+        recorder.set_kernel(&self.candidate_conv_state);
         recorder.set_barrier_before();
         recorder.set_buffer_write(0, buffers.next_conv_state, 0);
         recorder.set_buffer_read(1, buffers.qkv, 0);
@@ -399,36 +585,41 @@ impl GDNCompute {
         recorder.set_u64(8, buffers.conv_state_offset_bytes);
         recorder.set_u64(9, buffers.next_conv_state_offset_bytes);
         recorder.dispatch_1d(
-            self.config.num_candidate_conv_state_values(shape),
-            SHORT_CONV_NUM_THREADS_PER_THREADBLOCK,
+            self.specialization.model.num_candidate_conv_state_values(shape),
+            self.specialization
+                .kernels
+                .candidate_conv_state
+                .thread_block
+                .required_threads as usize,
         );
     }
 
-    /// Current ragged recurrent execution path (`R = num_reqs`):
+    /// Current final-state recurrent execution (`R = num_reqs`):
     ///
     /// ```text
     /// recurrent_state: [S, Hv, Dv, Dqk]  (Dqk contiguous)
-    /// grid:             (Dv / Dv_tile, R * Hv, 1)
-    /// threadblock:      (32, Dv_tile, 1)
-    /// GDNRaggedRecurrentTask / threadblock
-    ///   -> owns one GDNRecurrentStateTile [Dv_tile, Dqk]
-    ///   -> advances it over cu_tokens[req_index]..cu_tokens[req_index + 1]
-    /// task from grid: req_index, v_head_index, v_dim_tile_index
-    /// task from metadata: flat_token_begin, flat_token_end
-    /// parallel: requests, V heads, V-dimension tiles, Dqk lanes
+    /// grid:             (Dv / num_v_rows, R * Hv, 1)
+    /// threadblock:      (num_qk_dim_threads, num_v_rows, 1)
+    /// GDNFinalStateRecurrentThreadBlockTask / threadblock
+    ///   -> owns recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk]
+    ///   -> advances it over flat_token_indices in order
+    /// task from grid: request_index, v_head_index, v_dim_indices
+    /// task from metadata: flat_token_indices
+    /// parallel: requests, V heads, V-row ranges, Dqk lanes
     /// ordered:  tokens within one request
-    /// produces: recurrent_output; updates: destination recurrent_state tile
+    /// produces: recurrent_output; updates: destination recurrent_state slice
     /// ```
     ///
-    /// No Task value, TaskTemplate, or ABI buffer is materialized.
-    fn record_ragged_recurrent(
+    /// The kernel derives the task from its arguments, thread-block index, and
+    /// specialization. It does not require a materialized task buffer.
+    fn record_final_state_recurrent(
         &self,
         recorder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
         num_active_reqs: ReplayU32,
     ) {
-        recorder.set_kernel(&self.ragged_recurrent);
+        recorder.set_kernel(&self.final_state_recurrent);
         recorder.set_barrier_before();
         recorder.set_buffer_write(0, buffers.recurrent_output, 0);
         recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
@@ -440,7 +631,7 @@ impl GDNCompute {
         recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
         recorder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
         recorder.set_buffer_read(9, buffers.cu_tokens, 0);
-        recorder.set_f32(10, self.config.q_scale);
+        recorder.set_f32(10, self.q_scale);
         set_replay_u32(
             recorder,
             11,
@@ -449,26 +640,44 @@ impl GDNCompute {
             "GDN active request count",
         );
         recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
-        let v_dim_tile_size = self.v_dim_tile_size as usize;
-        let num_v_dim_tiles = self.config.v_head_dim as usize / v_dim_tile_size;
+        let thread_block = self.specialization.kernels.final_state_recurrent.thread_block;
+        let num_v_row_ranges = self.specialization.model.v_head_dim / thread_block.num_v_rows;
         recorder.dispatch_threadblocks(
             (
-                num_v_dim_tiles,
-                shape.num_total_reqs as usize * self.config.num_v_heads as usize,
+                num_v_row_ranges as usize,
+                shape.num_total_reqs as usize * self.specialization.model.num_v_heads as usize,
                 1,
             ),
-            (RAGGED_RECURRENT_NUM_QK_DIM_THREADS, v_dim_tile_size, 1),
+            (
+                thread_block.num_qk_dim_threads as usize,
+                thread_block.num_v_rows as usize,
+                1,
+            ),
         );
     }
 
-    fn record_ragged_recurrent_forward_candidate_state(
+    /// Current candidate-state recurrent execution:
+    ///
+    /// ```text
+    /// grid:        (Dv / num_v_rows, R * Hv, 1)
+    /// threadblock: (num_qk_dim_threads, num_simdgroups, 1)
+    /// GDNCandidateStateRecurrentThreadBlockTask / threadblock
+    ///   -> owns recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk]
+    ///   -> advances flat_token_indices in order
+    ///   -> can materialize the state after each token
+    /// ```
+    ///
+    /// Each SIMDgroup owns `simdgroup.num_v_rows` rows. The full thread block
+    /// owns `thread_block.num_v_rows()` rows. The kernel derives the task from
+    /// its arguments, thread-block index, and specialization.
+    fn record_candidate_state_recurrent(
         &self,
         recorder: &CommandRecorder,
         shape: GDNComputeShape,
         buffers: &GDNComputeBuffers<'_>,
         num_active_reqs: ReplayU32,
     ) {
-        recorder.set_kernel(&self.ragged_recurrent_forward_candidate_state);
+        recorder.set_kernel(&self.candidate_state_recurrent);
         recorder.set_barrier_before();
         recorder.set_buffer_write(0, buffers.recurrent_output, 0);
         recorder.set_buffer_read_write(1, buffers.recurrent_state_arena, 0);
@@ -480,7 +689,7 @@ impl GDNCompute {
         recorder.set_buffer_read(7, buffers.src_recurrent_state_slots, 0);
         recorder.set_buffer_read(8, buffers.flat_materialized_recurrent_state_slots, 0);
         recorder.set_buffer_read(9, buffers.cu_tokens, 0);
-        recorder.set_f32(10, self.config.q_scale);
+        recorder.set_f32(10, self.q_scale);
         set_replay_u32(
             recorder,
             11,
@@ -489,17 +698,17 @@ impl GDNCompute {
             "GDN active request count",
         );
         recorder.set_u64(12, buffers.recurrent_state_arena_offset_bytes);
-        let num_v_dim_tiles = self.config.v_head_dim as usize / CANDIDATE_V_ROWS_PER_SIMDGROUP;
-        debug_assert_eq!(num_v_dim_tiles % CANDIDATE_SIMDGROUPS_PER_THREADBLOCK, 0);
+        let thread_block = self.specialization.kernels.candidate_state_recurrent.thread_block;
+        let num_threadblocks = self.specialization.model.v_head_dim / thread_block.num_v_rows();
         recorder.dispatch_threadblocks(
             (
-                num_v_dim_tiles / CANDIDATE_SIMDGROUPS_PER_THREADBLOCK,
-                shape.num_total_reqs as usize * self.config.num_v_heads as usize,
+                num_threadblocks as usize,
+                shape.num_total_reqs as usize * self.specialization.model.num_v_heads as usize,
                 1,
             ),
             (
-                RAGGED_RECURRENT_NUM_QK_DIM_THREADS,
-                CANDIDATE_SIMDGROUPS_PER_THREADBLOCK,
+                thread_block.num_qk_dim_threads as usize,
+                thread_block.num_simdgroups as usize,
                 1,
             ),
         );
@@ -510,13 +719,14 @@ impl GDNCompute {
     /// ```text
     /// recurrent_output [T, Hv, Dv] -> RMS norm * SiLU(z)
     ///   -> norm_gated_output [T, Hv, Dv]
-    /// GDNOutputNormGateTask / threadblock: { flat_token_index, v_head_index }
+    /// GDNOutputNormGateThreadBlockTask / threadblock:
+    ///   { flat_token_index, v_head_index }
     /// grid: (T * Hv, 1, 1); threadblock: (128, 1, 1)
     /// reduce: Dv; produces: one normalized/gated [Dv] vector
     /// ```
     ///
-    /// Both Task fields are grid-derived, so no Task value, TaskTemplate, or
-    /// ABI buffer is materialized.
+    /// Both task fields are grid-derived. The kernel does not require a
+    /// materialized task buffer.
     fn record_output_norm_gate(
         &self,
         recorder: &CommandRecorder,
@@ -530,7 +740,7 @@ impl GDNCompute {
         recorder.set_buffer_read(1, buffers.recurrent_output, 0);
         recorder.set_buffer_read(2, buffers.z, 0);
         recorder.set_buffer_read(3, buffers.norm_weight, 0);
-        recorder.set_f32(4, self.config.norm_eps);
+        recorder.set_f32(4, self.norm_eps);
         set_replay_u32(
             recorder,
             5,
@@ -539,8 +749,12 @@ impl GDNCompute {
             "GDN active token count",
         );
         recorder.dispatch_1d(
-            self.config.total_output_norm_gate_threads(shape),
-            OUTPUT_NORM_GATE_NUM_THREADS_PER_THREADBLOCK,
+            self.specialization.total_output_norm_gate_threads(shape),
+            self.specialization
+                .kernels
+                .output_norm_gate
+                .thread_block
+                .required_threads as usize,
         );
     }
 }
@@ -555,8 +769,8 @@ pub struct GDNComputeInvocation<'a> {
 
 impl Operator for GDNComputeInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        self.compute.config.validate_shape(self.shape);
-        validate_buffers(self.compute.config, self.shape, &self.buffers);
+        self.compute.specialization.validate_shape(self.shape);
+        validate_buffers(self.compute.specialization, self.shape, &self.buffers);
         self.compute.record_short_conv(
             recorder,
             self.shape,
@@ -566,7 +780,7 @@ impl Operator for GDNComputeInvocation<'_> {
             true,
         );
         self.compute
-            .record_ragged_recurrent(recorder, self.shape, &self.buffers, self.num_active_reqs);
+            .record_final_state_recurrent(recorder, self.shape, &self.buffers, self.num_active_reqs);
         self.compute
             .record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
@@ -582,12 +796,15 @@ pub struct GDNComputeWithCandidateStateUpdateInvocation<'a> {
 
 impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        self.compute.config.validate_shape(self.shape);
+        self.compute.specialization.validate_shape(self.shape);
         assert_u32_count_domain(
-            self.compute.config.num_candidate_conv_state_values(self.shape),
+            self.compute
+                .specialization
+                .model
+                .num_candidate_conv_state_values(self.shape),
             "GDN candidate convolution state",
         );
-        validate_buffers(self.compute.config, self.shape, &self.buffers);
+        validate_buffers(self.compute.specialization, self.shape, &self.buffers);
         self.compute.record_short_conv(
             recorder,
             self.shape,
@@ -596,19 +813,15 @@ impl Operator for GDNComputeWithCandidateStateUpdateInvocation<'_> {
             self.num_active_tokens,
             false,
         );
-        self.compute.record_forward_conv_candidate_state(
+        self.compute.record_candidate_conv_state(
             recorder,
             self.shape,
             &self.buffers,
             self.num_active_reqs,
             self.num_active_tokens,
         );
-        self.compute.record_ragged_recurrent_forward_candidate_state(
-            recorder,
-            self.shape,
-            &self.buffers,
-            self.num_active_reqs,
-        );
+        self.compute
+            .record_candidate_state_recurrent(recorder, self.shape, &self.buffers, self.num_active_reqs);
         self.compute
             .record_output_norm_gate(recorder, self.shape, &self.buffers, self.num_active_tokens);
     }
@@ -648,7 +861,8 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
     }
 }
 
-fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &GDNComputeBuffers<'_>) {
+fn validate_buffers(specialization: GDNComputeSpecialization, shape: GDNComputeShape, buffers: &GDNComputeBuffers<'_>) {
+    let model = specialization.model;
     let f32_bytes = size_of::<f32>() as u64;
     for (name, offset_bytes) in [
         ("conv_state", buffers.conv_state_offset_bytes),
@@ -662,36 +876,33 @@ fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &
         );
     }
     assert!(
-        buffers.qkv.len_bytes() >= config.num_qkv_values(shape) * size_of::<f32>(),
+        buffers.qkv.len_bytes() >= model.num_qkv_values(shape) * size_of::<f32>(),
         "GDN qkv buffer is too small"
     );
     assert!(
-        buffers.a.len_bytes() >= shape.num_total_tokens as usize * config.num_v_heads as usize * size_of::<f32>(),
+        buffers.a.len_bytes() >= shape.num_total_tokens as usize * model.num_v_heads as usize * size_of::<f32>(),
         "GDN a buffer is too small"
     );
     assert!(
-        buffers.b.len_bytes() >= shape.num_total_tokens as usize * config.num_v_heads as usize * size_of::<f32>(),
+        buffers.b.len_bytes() >= shape.num_total_tokens as usize * model.num_v_heads as usize * size_of::<f32>(),
         "GDN b buffer is too small"
     );
     assert!(
-        buffers.z.len_bytes() >= config.num_recurrent_output_values(shape) * size_of::<f32>(),
+        buffers.z.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<f32>(),
         "GDN z buffer is too small"
     );
     assert_eq!(
         buffers.conv_weight.len_bytes(),
-        config.num_conv_weight_values() * size_of::<u16>()
+        model.num_conv_weight_values() * size_of::<u16>()
     );
     assert_eq!(
         buffers.norm_weight.len_bytes(),
-        config.v_head_dim as usize * size_of::<u16>()
+        model.v_head_dim as usize * size_of::<u16>()
     );
-    assert_eq!(
-        buffers.a_log.len_bytes(),
-        config.num_v_heads as usize * size_of::<u16>()
-    );
+    assert_eq!(buffers.a_log.len_bytes(), model.num_v_heads as usize * size_of::<u16>());
     assert_eq!(
         buffers.dt_bias.len_bytes(),
-        config.num_v_heads as usize * size_of::<u16>()
+        model.num_v_heads as usize * size_of::<u16>()
     );
     assert!(
         buffers.cu_tokens.len_bytes_u64()
@@ -717,10 +928,10 @@ fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &
         buffers.flat_materialized_conv_state_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>(),
         "GDN flat_materialized_conv_state_slots buffer is too small"
     );
-    let conv_state_region_bytes = (config.num_conv_state_values(shape) as u64)
+    let conv_state_region_bytes = (model.num_conv_state_values(shape) as u64)
         .checked_mul(f32_bytes)
         .expect("GDN convolution state region bytes must fit u64");
-    let recurrent_state_region_bytes = (config.recurrent_state_stride() as u64)
+    let recurrent_state_region_bytes = (model.recurrent_state_stride() as u64)
         .checked_mul(f32_bytes)
         .expect("GDN recurrent state region bytes must fit u64");
     assert!(
@@ -747,15 +958,15 @@ fn validate_buffers(config: GDNComputeConfig, shape: GDNComputeShape, buffers: &
                 .expect("GDN recurrent state region size overflow")
     );
     assert!(
-        buffers.conv_qkv.len_bytes() >= config.num_qkv_values(shape) * size_of::<f32>(),
+        buffers.conv_qkv.len_bytes() >= model.num_qkv_values(shape) * size_of::<f32>(),
         "GDN conv_qkv buffer is too small"
     );
     assert!(
-        buffers.recurrent_output.len_bytes() >= config.num_recurrent_output_values(shape) * size_of::<f32>(),
+        buffers.recurrent_output.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<f32>(),
         "GDN recurrent_output buffer is too small"
     );
     assert!(
-        buffers.norm_gated_output.len_bytes() >= config.num_recurrent_output_values(shape) * size_of::<f32>(),
+        buffers.norm_gated_output.len_bytes() >= model.num_recurrent_output_values(shape) * size_of::<f32>(),
         "GDN norm_gated_output buffer is too small"
     );
 }

@@ -10,7 +10,7 @@ use super::GDNCompute;
 use super::GDNComputeBuffers;
 use super::GDNComputeConfig;
 use super::GDNComputeShape;
-use super::selected_v_dim_tile_size;
+use super::GDNComputeSpecialization;
 use crate::metal::Buffer;
 use crate::metal::Device;
 use crate::metal::Dtype;
@@ -23,17 +23,114 @@ const NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("test.gd
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_tokens");
 
 #[test]
-fn test_recurrent_v_dim_tile_selection() {
+fn test_final_state_recurrent_specialization_selection() {
     let mut config = fixture_config();
-    assert_eq!(selected_v_dim_tile_size(config), 8);
+    assert_eq!(
+        GDNComputeSpecialization::from_config(config)
+            .kernels
+            .final_state_recurrent
+            .thread_block
+            .num_v_rows,
+        8
+    );
     config.v_head_dim = 12;
-    assert_eq!(selected_v_dim_tile_size(config), 4);
+    assert_eq!(
+        GDNComputeSpecialization::from_config(config)
+            .kernels
+            .final_state_recurrent
+            .thread_block
+            .num_v_rows,
+        4
+    );
     config.v_head_dim = 4;
-    assert_eq!(selected_v_dim_tile_size(config), 4);
+    assert_eq!(
+        GDNComputeSpecialization::from_config(config)
+            .kernels
+            .final_state_recurrent
+            .thread_block
+            .num_v_rows,
+        4
+    );
 }
 
 #[test]
-#[should_panic(expected = "GDN candidate register-V requires Dv divisible by the selected tile")]
+fn test_compute_specialization_defines_each_kernel_thread_block() {
+    let specialization = GDNComputeSpecialization::from_config(fixture_config());
+    assert_eq!(specialization.kernels.short_conv.thread_block.required_threads, 256);
+    assert_eq!(
+        specialization
+            .kernels
+            .candidate_conv_state
+            .thread_block
+            .required_threads,
+        256
+    );
+    assert_eq!(
+        specialization
+            .kernels
+            .final_state_recurrent
+            .thread_block
+            .num_qk_dim_threads,
+        32
+    );
+    assert_eq!(specialization.kernels.final_state_recurrent.thread_block.num_v_rows, 8);
+    assert_eq!(
+        specialization
+            .kernels
+            .final_state_recurrent
+            .thread_block
+            .required_threads,
+        256
+    );
+    assert_eq!(
+        specialization
+            .kernels
+            .candidate_state_recurrent
+            .thread_block
+            .num_qk_dim_threads,
+        32
+    );
+    assert_eq!(
+        specialization
+            .kernels
+            .candidate_state_recurrent
+            .thread_block
+            .num_simdgroups,
+        2
+    );
+    assert_eq!(
+        specialization
+            .kernels
+            .candidate_state_recurrent
+            .thread_block
+            .simdgroup
+            .num_v_rows,
+        2
+    );
+    assert_eq!(
+        specialization
+            .kernels
+            .candidate_state_recurrent
+            .thread_block
+            .num_v_rows(),
+        4
+    );
+    assert_eq!(
+        specialization
+            .kernels
+            .candidate_state_recurrent
+            .thread_block
+            .required_threads,
+        64
+    );
+    assert_eq!(
+        specialization.kernels.output_norm_gate.thread_block.required_threads,
+        128
+    );
+}
+
+#[test]
+#[should_panic(expected = "GDN candidate recurrent specialization requires Dv divisible by its SIMDgroup V-row count")]
 fn test_candidate_register_v_rejects_v_dim_tail() {
     let mut config = fixture_config();
     config.v_head_dim = 5;
@@ -49,7 +146,7 @@ fn test_candidate_register_v_rejects_qk_dim_tail_at_init() {
 }
 
 #[test]
-#[should_panic(expected = "GDN candidate register-V tiles must divide the grouped launch")]
+#[should_panic(expected = "GDN candidate recurrent thread-block V-row count must divide Dv")]
 fn test_candidate_register_v_rejects_incomplete_grouped_launch_at_init() {
     let mut config = fixture_config();
     config.v_head_dim = 6;
@@ -108,7 +205,7 @@ fn test_shape_rejects_shader_count_overflow() {
 }
 
 #[test]
-fn test_ragged_recurrent_fixed() {
+fn test_final_state_recurrent_fixed() {
     let shape = fixture_shape(1, 1);
     let cu_tokens = vec![0_u32, 1];
     let src_state_slots = vec![0_u32];
@@ -169,7 +266,7 @@ fn test_ragged_recurrent_fixed() {
 }
 
 #[test]
-fn test_ragged_recurrent_random() {
+fn test_final_state_recurrent_random() {
     let random_seed = 0x729B_40D6;
     let shape = fixture_shape(1, 3);
     let cu_tokens = vec![0_u32, 3];

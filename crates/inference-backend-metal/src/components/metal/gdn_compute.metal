@@ -94,7 +94,7 @@ kernel void gdn_compute_short_conv_f32(
     }
 }
 
-kernel void gdn_compute_forward_conv_candidate_state_f32(
+kernel void gdn_compute_candidate_conv_state_f32(
     device float* next_conv_state [[buffer(0)]],
     device const float* qkv [[buffer(1)]],
     device const float* conv_state [[buffer(2)]],
@@ -147,18 +147,20 @@ kernel void gdn_compute_forward_conv_candidate_state_f32(
     next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
 }
 
-// One logical GDNRaggedRecurrentTask maps 1:1 to one threadblock, owns one
-// GDNRecurrentStateTile [Dv_tile, Dqk], and advances it once per request token.
-// No Task value, TaskTemplate, or ABI buffer is materialized:
+// One logical GDNFinalStateRecurrentThreadBlockTask maps 1:1 to one
+// threadblock.
+// It owns recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk] and
+// advances that state over flat_token_indices in order. The kernel derives the
+// task from its arguments, thread-block index, and specialization. It does not
+// require a materialized task buffer:
 //
-// GDNRaggedRecurrentTask {
-//   req_index,          // grid-derived from threadblock_position.y / Hv
+// GDNFinalStateRecurrentThreadBlockTask {
+//   request_index,      // grid-derived from threadblock_position.y / Hv
 //   v_head_index,       // grid-derived from threadblock_position.y % Hv
-//   v_dim_tile_index,   // grid-derived from threadblock_position.x
-//   flat_token_begin,   // derived from cu_tokens[req_index]
-//   flat_token_end,     // derived from cu_tokens[req_index + 1]
+//   v_dim_indices,      // grid-derived half-open range
+//   flat_token_indices, // cu_tokens[request_index]..cu_tokens[request_index + 1]
 // }
-kernel void gdn_compute_ragged_recurrent_f32(
+kernel void gdn_compute_final_state_recurrent_f32(
     device float* recurrent_output [[buffer(0)]],
     device float* recurrent_state_arena [[buffer(1)]],
     device const float* conv_qkv [[buffer(2)]],
@@ -177,14 +179,15 @@ kernel void gdn_compute_ragged_recurrent_f32(
 ) {
     const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(float);
     const uint qk_dim_thread_index = thread_position_in_threadblock.x;
-    const uint v_dim_index_in_tile = thread_position_in_threadblock.y;
-    const uint num_qk_dim_threads = 32;
+    const uint v_row_index_in_range = thread_position_in_threadblock.y;
+    const uint num_qk_dim_threads = final_state_recurrent_num_qk_dim_threads;
     const uint num_state_fragments = (qk_head_dim + num_qk_dim_threads - 1) / num_qk_dim_threads;
-    const uint v_dim_tile_index = threadblock_position.x;
+    const uint v_row_range_index = threadblock_position.x;
     const uint req_v_head_linear_index = threadblock_position.y;
     const uint v_head_index = req_v_head_linear_index % num_v_heads;
     const uint req_index = req_v_head_linear_index / num_v_heads;
-    const uint v_dim_index = v_dim_tile_index * v_dim_tile_size + v_dim_index_in_tile;
+    const uint v_dim_index =
+        v_row_range_index * final_state_recurrent_num_v_rows + v_row_index_in_range;
     if (req_index >= num_active_reqs) {
         return;
     }
@@ -211,7 +214,7 @@ kernel void gdn_compute_ragged_recurrent_f32(
     }
 
     // Each thread owns one strided Dqk fragment. Keep it thread-local across
-    // the request's ordered token loop and publish the final tile only once.
+    // the request's ordered token loop and publish the final state slice once.
     const uint state_row_offset = (v_head_index * v_head_dim + v_dim_index) * qk_head_dim;
     thread float state_fragments[num_state_fragments];
     for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments; ++state_fragment_index) {
@@ -225,7 +228,7 @@ kernel void gdn_compute_ragged_recurrent_f32(
     }
 
     for (uint flat_token_index = flat_token_begin; flat_token_index < flat_token_end; ++flat_token_index) {
-        if (v_dim_index_in_tile == 0) {
+        if (v_row_index_in_range == 0) {
             float q_square_sum_partial = 0.0f;
             float k_square_sum_partial = 0.0f;
             for (uint qk_dim_index = qk_dim_thread_index; qk_dim_index < qk_head_dim; qk_dim_index += num_qk_dim_threads) {
@@ -302,15 +305,17 @@ kernel void gdn_compute_ragged_recurrent_f32(
     }
 }
 
-// Candidate recurrent Task/grid contract:
-// - grid.x selects one threadblock V tile;
-// - grid.y derives req_index and v_head_index;
-// - one threadblock owns
-//   [candidate_v_dim_tile_size * candidate_simdgroups_per_threadgroup, Dqk];
-// - local SIMDgroup y selects its [candidate_v_dim_tile_size, Dqk] register subtile;
-// - cu_tokens[req_index..req_index + 1] selects the ordered token segment.
-// The grid and metadata derive these values. No Task value or TaskTemplate is materialized.
-kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
+// One logical GDNCandidateStateRecurrentThreadBlockTask maps 1:1 to one
+// threadblock. It owns
+// recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk], advances
+// flat_token_indices in order, and can materialize state after each token.
+// Grid x derives v_dim_indices. Grid y derives request_index and v_head_index.
+// Each local SIMDgroup owns
+// candidate_state_recurrent_num_v_rows_per_simdgroup V
+// rows. The kernel derives the task from its arguments, thread-block index,
+// and specialization.
+// It does not require a materialized task buffer.
+kernel void gdn_compute_candidate_state_recurrent_f32(
     device float* recurrent_output [[buffer(0)]],
     device float* recurrent_state_arena [[buffer(1)]],
     device const float* conv_qkv [[buffer(2)]],
@@ -333,17 +338,19 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
 
     const uint qk_dim_thread_index = thread_position_in_threadblock.x;
     const uint local_simdgroup_index = thread_position_in_threadblock.y;
-    const uint v_dim_tile_index =
-        threadblock_position.x * candidate_simdgroups_per_threadgroup + local_simdgroup_index;
+    const uint v_row_range_index =
+        threadblock_position.x * candidate_state_recurrent_num_simdgroups + local_simdgroup_index;
     const uint req_v_head_linear_index = threadblock_position.y;
     const uint v_head_index = req_v_head_linear_index % num_v_heads;
     const uint req_index = req_v_head_linear_index / num_v_heads;
-    const uint v_dim_base = v_dim_tile_index * candidate_v_dim_tile_size;
-    if (req_index >= num_active_reqs || v_dim_base + candidate_v_dim_tile_size > v_head_dim) {
+    const uint v_dim_base =
+        v_row_range_index * candidate_state_recurrent_num_v_rows_per_simdgroup;
+    if (req_index >= num_active_reqs
+        || v_dim_base + candidate_state_recurrent_num_v_rows_per_simdgroup > v_head_dim) {
         return;
     }
 
-    const uint num_qk_dim_threads = 32;
+    const uint num_qk_dim_threads = candidate_state_recurrent_num_qk_dim_threads;
     const uint num_state_fragments = (qk_head_dim + num_qk_dim_threads - 1) / num_qk_dim_threads;
     const uint num_v_heads_per_qk_head = num_v_heads / num_qk_heads;
     const uint qk_head_index = v_head_index / num_v_heads_per_qk_head;
@@ -356,17 +363,19 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     const uint src_state_slot = src_recurrent_state_slots[req_index];
     const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(float);
 
-    thread float state_fragments[candidate_v_dim_tile_size * num_state_fragments];
-    for (uint v_dim_index_in_tile = 0; v_dim_index_in_tile < candidate_v_dim_tile_size;
-         ++v_dim_index_in_tile) {
-        const uint v_dim_index = v_dim_base + v_dim_index_in_tile;
+    thread float state_fragments[
+        candidate_state_recurrent_num_v_rows_per_simdgroup * num_state_fragments];
+    for (uint v_row_index_in_range = 0;
+         v_row_index_in_range < candidate_state_recurrent_num_v_rows_per_simdgroup;
+         ++v_row_index_in_range) {
+        const uint v_dim_index = v_dim_base + v_row_index_in_range;
         const ulong state_row_offset = ((ulong)v_head_index * v_head_dim + v_dim_index) * qk_head_dim;
         const ulong source_state_base =
             recurrent_state_base + (ulong)src_state_slot * recurrent_state_stride + state_row_offset;
         for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments;
              ++state_fragment_index) {
             const uint qk_dim_index = qk_dim_thread_index + state_fragment_index * num_qk_dim_threads;
-            state_fragments[v_dim_index_in_tile * num_state_fragments + state_fragment_index] =
+            state_fragments[v_row_index_in_range * num_state_fragments + state_fragment_index] =
                 qk_dim_index < qk_head_dim ? recurrent_state_arena[source_state_base + qk_dim_index] : 0.0f;
         }
     }
@@ -432,24 +441,25 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
         const float decay = shared_gate[1];
 
         float v_lane = 0.0f;
-        if (qk_dim_thread_index < candidate_v_dim_tile_size) {
+        if (qk_dim_thread_index < candidate_state_recurrent_num_v_rows_per_simdgroup) {
             const uint v_dim_index = v_dim_base + qk_dim_thread_index;
             v_lane = conv_qkv[(ulong)flat_token_index * qkv_dim + v_base
                 + (ulong)v_head_index * v_head_dim + v_dim_index];
         }
         const uint candidate_state_slot = flat_materialized_recurrent_state_slots[flat_token_index];
-        for (uint v_dim_index_in_tile = 0; v_dim_index_in_tile < candidate_v_dim_tile_size;
-             ++v_dim_index_in_tile) {
-            const uint v_dim_index = v_dim_base + v_dim_index_in_tile;
+        for (uint v_row_index_in_range = 0;
+             v_row_index_in_range < candidate_state_recurrent_num_v_rows_per_simdgroup;
+             ++v_row_index_in_range) {
+            const uint v_dim_index = v_dim_base + v_row_index_in_range;
             float state_k_partial = 0.0f;
             for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments;
                  ++state_fragment_index) {
-                const uint fragment_offset = v_dim_index_in_tile * num_state_fragments + state_fragment_index;
+                const uint fragment_offset = v_row_index_in_range * num_state_fragments + state_fragment_index;
                 const float decayed_state = state_fragments[fragment_offset] * decay;
                 state_fragments[fragment_offset] = decayed_state;
                 state_k_partial += decayed_state * k_fragments[state_fragment_index];
             }
-            const float v_value = simd_broadcast(v_lane, v_dim_index_in_tile);
+            const float v_value = simd_broadcast(v_lane, v_row_index_in_range);
             const float state_k_dot = simd_broadcast(simd_sum(state_k_partial), 0);
             const float delta = (v_value - state_k_dot) * beta;
 
@@ -458,7 +468,7 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
             for (uint state_fragment_index = 0; state_fragment_index < num_state_fragments;
                  ++state_fragment_index) {
                 const uint qk_dim_index = qk_dim_thread_index + state_fragment_index * num_qk_dim_threads;
-                const uint fragment_offset = v_dim_index_in_tile * num_state_fragments + state_fragment_index;
+                const uint fragment_offset = v_row_index_in_range * num_state_fragments + state_fragment_index;
                 const float updated_state =
                     state_fragments[fragment_offset] + k_fragments[state_fragment_index] * delta;
                 state_fragments[fragment_offset] = updated_state;
@@ -470,7 +480,7 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
                 state_q_partial += updated_state * q_fragments[state_fragment_index];
             }
             const float recurrent_output_value = simd_broadcast(simd_sum(state_q_partial), 0);
-            if (qk_dim_thread_index == v_dim_index_in_tile) {
+            if (qk_dim_thread_index == v_row_index_in_range) {
                 recurrent_output[
                     ((ulong)flat_token_index * num_v_heads + v_head_index) * v_head_dim + v_dim_index] =
                     recurrent_output_value;
@@ -480,11 +490,12 @@ kernel void gdn_compute_ragged_recurrent_forward_candidate_state_f32(
     }
 }
 
-// One logical GDNOutputNormGateTask maps 1:1 to one 128-thread threadblock. It
-// RMS-normalizes and gates one [Dv] recurrent-output vector. No Task value,
-// TaskTemplate, or ABI buffer is materialized:
+// One logical GDNOutputNormGateThreadBlockTask maps 1:1 to one 128-thread
+// threadblock. It RMS-normalizes and gates one [Dv] recurrent-output vector.
+// The kernel derives the task from its arguments, thread-block index, and
+// specialization. It does not require a materialized task buffer:
 //
-// GDNOutputNormGateTask {
+// GDNOutputNormGateThreadBlockTask {
 //   flat_token_index,  // grid-derived from threadblock linear index / Hv
 //   v_head_index,      // grid-derived from threadblock linear index % Hv
 // }
@@ -497,8 +508,10 @@ kernel void gdn_compute_output_norm_gate_f32(
     constant uint& num_active_tokens [[buffer(5)]],
     uint global_thread_index [[thread_position_in_grid]]
 ) {
-    const uint reduction_thread_index = global_thread_index % 128;
-    const uint token_head_index = global_thread_index / 128;
+    const uint reduction_thread_index =
+        global_thread_index % output_norm_gate_required_threads;
+    const uint token_head_index =
+        global_thread_index / output_norm_gate_required_threads;
     const uint num_token_heads = num_active_tokens * num_v_heads;
     if (token_head_index >= num_token_heads) {
         return;
@@ -506,17 +519,19 @@ kernel void gdn_compute_output_norm_gate_f32(
     const uint flat_token_index = token_head_index / num_v_heads;
     const uint v_head_index = token_head_index % num_v_heads;
     const uint token_head_base = flat_token_index * num_v_heads * v_head_dim + v_head_index * v_head_dim;
-    threadgroup float square_sum_partials[128];
+    threadgroup float square_sum_partials[output_norm_gate_required_threads];
 
     float square_sum_partial = 0.0f;
-    for (uint v_dim_index = reduction_thread_index; v_dim_index < v_head_dim; v_dim_index += 128) {
+    for (uint v_dim_index = reduction_thread_index;
+         v_dim_index < v_head_dim;
+         v_dim_index += output_norm_gate_required_threads) {
         const float x = recurrent_output[token_head_base + v_dim_index];
         square_sum_partial += x * x;
     }
     square_sum_partials[reduction_thread_index] = square_sum_partial;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = 64; stride > 0; stride >>= 1) {
+    for (uint stride = output_norm_gate_required_threads / 2; stride > 0; stride >>= 1) {
         if (reduction_thread_index < stride) {
             square_sum_partials[reduction_thread_index] += square_sum_partials[reduction_thread_index + stride];
         }
@@ -524,7 +539,9 @@ kernel void gdn_compute_output_norm_gate_f32(
     }
 
     const float inv_rms = metal::rsqrt(square_sum_partials[0] / float(v_head_dim) + eps);
-    for (uint v_dim_index = reduction_thread_index; v_dim_index < v_head_dim; v_dim_index += 128) {
+    for (uint v_dim_index = reduction_thread_index;
+         v_dim_index < v_head_dim;
+         v_dim_index += output_norm_gate_required_threads) {
         const uint output_index = token_head_base + v_dim_index;
         const float z_value = z[output_index];
         const float silu_z = z_value / (1.0f + metal::exp(-z_value));

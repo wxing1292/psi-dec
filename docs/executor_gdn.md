@@ -39,7 +39,7 @@ crates/inference-executor-metal/src/model/qwen/
     plan.rs                 Qwen3.5 GDN geometry/config builder
 
 crates/inference-backend-metal/src/components/
-  gdn_compute.rs        reusable Metal GDN compute graph
+  gdn_compute.rs        reusable Metal GDN compute graph and kernel specializations
   gdn_compute_test.rs   GDN compute reference tests
   gdn_qkvabz_split.rs  reusable QKVABZ split component
   gdn_state_pages.rs    reusable GDN state-page read/write helpers
@@ -122,55 +122,111 @@ Request segments use `flat_token_begin`, `flat_token_end`, `num_req_tokens`, and
 `cu_tokens` has `R + 1` cumulative flat-token counts. Adjacent entries select the half-open flat-token segment that one
 request owns.
 
-## Tiles, Tasks, threadblocks, and grids
+## Kernel specialization and thread-block tasks
 
-`GDNRecurrentStateTile` is the smallest matmul-like logical GDN compute tile. It is one `[Dv_tile, Dqk]` slice of
-`recurrent_state` for a fixed state slot and V head.
+`GDNCompute::new` derives one `GDNComputeSpecialization` from `GDNComputeConfig`. This is an initialization-time static
+operation. GDN does not use a runtime registry or planner because the current compute graph has no
+workload-dependent implementation choice.
 
-The configuration names `Dv_tile` as `v_dim_tile_size`. The full recurrent state head is `[Dv, Dqk]`.
+The specialization has this hierarchy:
+
+```text
+GDNComputeSpecialization
+├── model
+│   ├── num_qk_heads
+│   ├── qk_head_dim
+│   ├── num_v_heads
+│   ├── v_head_dim
+│   └── conv_kernel_size
+└── kernels
+    ├── short_conv
+    │   └── thread_block.required_threads
+    ├── candidate_conv_state
+    │   └── thread_block.required_threads
+    ├── final_state_recurrent
+    │   └── thread_block
+    │       ├── num_qk_dim_threads
+    │       ├── num_v_rows
+    │       └── required_threads
+    ├── candidate_state_recurrent
+    │   └── thread_block
+    │       ├── num_qk_dim_threads
+    │       ├── num_simdgroups
+    │       ├── simdgroup.num_v_rows
+    │       └── required_threads
+    └── output_norm_gate
+        └── thread_block.required_threads
+```
+
+`GDNComputeConfig` also contains `q_scale` and `norm_eps`. The host passes these values as kernel arguments. They are
+not compile-time specialization values.
+
+At recording time, `GDNComputeShape` and `GDNComputeSpecialization` derive each kernel execution configuration.
+`GDNComputeShape` supplies recorded request and token extents. The specialization supplies required thread-block
+geometry. The `dispatch_1d` and `dispatch_threadblocks` calls pass the actual grid and thread-block dimensions. For each
+kernel, the actual thread count must equal `thread_block.required_threads`.
+
+The final-state recurrent and candidate-state recurrent kernels implement one recurrent algorithm. They have different
+state-materialization contracts. The final-state recurrent kernel can write the state after the last request token. The
+candidate-state recurrent kernel can write a distinct state after each request token. The two kernels are not cost
+candidates.
+
+The current final-state recurrent kernel uses this task relation:
+
+```text
+one ThreadBlock
+    → one GDNFinalStateRecurrentThreadBlockTask
+
+GDNFinalStateRecurrentThreadBlockTask
+    request_index
+    v_head_index
+    v_dim_indices: Range<u32>
+    flat_token_indices: Range<u32>
+```
+
+`v_dim_indices` selects a half-open V-row range for one V head. `flat_token_indices` selects one request's half-open
+token range. The thread block owns
+`recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk]`. It advances this state over `flat_token_indices` in
+order.
+
+The kernel derives `GDNFinalStateRecurrentThreadBlockTask` from kernel arguments, the thread-block index, and
+`GDNComputeSpecialization.kernels.final_state_recurrent`. The CPU does not construct or pass a task object.
+
+The shader derives the per-thread work:
+
+```text
+GDNFinalStateRecurrentThreadTask
+    = derive(
+        GDNFinalStateRecurrentThreadBlockTask,
+        thread_index,
+        GDNComputeSpecialization.kernels.final_state_recurrent,
+      )
+```
+
+One final-state recurrent thread owns one V row and a strided Dqk fragment. It keeps that fragment thread-local while it
+advances the request's token range. The CPU does not construct or pass a thread-task object.
 
 For Qwen's current geometry:
 
 ```text
 recurrent_state[slot, Hv=32, Dv=128, Dqk=128]
 
-grid:        (Dv / Dv_tile, num_reqs * Hv, 1)
-           = (16,           num_reqs * 32, 1)
+final_state_recurrent.thread_block
+  num_qk_dim_threads = 32
+  num_v_rows = 8
+  required_threads = 256
 
-threadblock: (32, Dv_tile, 1)
-           = (32, 8,       1)
-           = 256 threads
+grid_dimensions = (Dv / num_v_rows, num_total_reqs * Hv, 1)
+                = (16,              num_total_reqs * 32, 1)
 
-threadblock(req, v_head, v_dim_tile)
-  owns recurrent_state[slot, v_head, 8 * v_dim_tile .. 8 * (v_dim_tile + 1), 0..128]
-  owns one [Dv_tile=8, Dqk=128] tile
-  owns 8 * 128 * sizeof(f32) = 4 KiB of logical state
+thread_block_dimensions = (num_qk_dim_threads, num_v_rows, 1)
+                        = (32,                     8, 1)
 ```
 
-One logical `GDNRaggedRecurrentTask` maps 1:1 to one ragged recurrent threadblock. It owns one state tile and advances
-that tile once per request token:
+One final-state recurrent thread block owns an `[8, 128]` state slice. This slice contains
+`8 * 128 * sizeof(f32) = 4 KiB` of logical state.
 
-```text
-GDNRaggedRecurrentTask {  // logical; one per threadblock
-  req_index          grid-derived from threadblock_position.y / Hv
-  v_head_index       grid-derived from threadblock_position.y % Hv
-  v_dim_tile_index   grid-derived from threadblock_position.x
-  flat_token_begin   derived from cu_tokens[req_index]
-  flat_token_end     derived from cu_tokens[req_index + 1]
-}
-```
-
-The grid is `(Dv / Dv_tile, R * Hv, 1)`. The threadblock shape is `(32, Dv_tile, 1)`.
-
-The grid and `cu_tokens` derive every Task coordinate. Therefore, the implementation does not materialize a Task value,
-TaskTemplate, or ABI buffer.
-
-Thread position `x = 0..31` selects a Dqk lane. Position `y = 0..7` selects a V row in the tile.
-
-The normal final-state path uses this configured tile. The following diagram shows the normal final-state
-`Dv_tile=8` partition.
-
-For Qwen `Dqk=128`, one thread owns four strided state values:
+For `Dqk=128`, one thread owns four strided state values:
 
 ```text
                               Dqk = 128
@@ -186,68 +242,78 @@ thread(x, y).state_fragments = [
   state[y, x + 64],
   state[y, x + 96],
 ]
-
-32 x-lanes collectively hold one 128D state row.
-Each y-row maps to one SIMD group; 8 SIMD groups collectively hold the complete [8, 128] tile.
 ```
 
-MSL declares the fragment as `thread float state_fragments[4]`. The compiler normally keeps these thread-local values
-in registers when possible.
-
-Physical register placement remains a compiler decision. Source loads and final destination stores use four fragment
-rounds.
+The 32 x-lanes collectively hold one 128D state row. Eight y-rows collectively hold the complete `[8, 128]` state
+slice. MSL declares `thread float state_fragments[4]`. Physical register placement remains a compiler decision.
 
 In each round, the 32 x-lanes access one contiguous 128-byte span (`32 * sizeof(f32)`). Four rounds cover one 512-byte
-row.
+row. This pattern describes memory access. It does not guarantee one 512-byte hardware transaction.
 
-This pattern describes memory access. It does not guarantee one 512-byte hardware transaction.
-
-The candidate-state path uses the independently tuned register-V partition. One SIMDgroup owns a `[2, 128]` state
-tile. Each lane owns `2 * 4 = 8` F32 state values. Two SIMDgroups form one 64-thread threadgroup and collectively own a
-`[4, 128]` state tile. They share normalized Q/K and gate scalars. The candidate-state threadgroup does not use the
-eight-SIMDgroup partition from the normal final-state diagram.
-
-The threadblock loads its source tile into distributed thread-local fragments. It advances them across the request's
-flat-token segment.
-
-The threadblock writes `recurrent_output [T, Hv, Dv]`. It materializes registered prefix candidates when requested.
-It writes the final fragments only when the final state version is registered. Otherwise, it discards the final state
-after it produces the row output.
+The candidate-state recurrent kernel uses this task relation:
 
 ```text
-parallel: requests, V heads, V-dimension tiles, Dqk lanes
-ordered:  tokens within one request
+one ThreadBlock
+    → one GDNCandidateStateRecurrentThreadBlockTask
+
+GDNCandidateStateRecurrentThreadBlockTask
+    request_index
+    v_head_index
+    v_dim_indices: Range<u32>
+    flat_token_indices: Range<u32>
 ```
 
-State-page I/O is a copy operation, not matmul-like math. Therefore, it has no required `*Tile`.
+The candidate-state recurrent specialization has `num_qk_dim_threads=32`, `num_simdgroups=2`, and
+`simdgroup.num_v_rows=2`. One 64-thread block owns a `[4, 128]` state slice. Each SIMDgroup owns two V rows. The two
+SIMDgroups share normalized Q/K values and gate scalars.
 
-Each state-I/O request selects one logical state version, one recurrent physical slot, one convolution physical slot,
-and its page IDs across every GDN layer. The owning Metal kernels map one logical `GDNStatePageReadTask` or
-`GDNStatePageWriteTask` 1:1 to one threadblock:
+The shader derives `GDNCandidateStateRecurrentThreadTask` from the thread-block task, thread index, and the
+candidate-state recurrent specialization. One candidate-state recurrent thread owns strided Dqk fragments for two V
+rows in its SIMDgroup. It can write those fragments to a row-specific candidate state slot after each token.
+
+The recurrent kernels write `recurrent_output [T, Hv, Dv]`. They preserve token order within one request. Requests,
+V heads, V-row ranges, and Dqk lanes remain parallel.
+
+Output norm + gate uses this task relation:
 
 ```text
-GDNStatePageReadTask / GDNStatePageWriteTask {  // logical; one per threadblock
-  state_io_request_index  grid-derived
-  gdn_layer_index         grid-derived
-  state_kind              grid-derived: recurrent or convolution
-  page_index_in_state     grid-derived
-}
+one ThreadBlock
+    → one GDNOutputNormGateThreadBlockTask
+
+GDNOutputNormGateThreadBlockTask
+    flat_token_index
+    v_head_index
 ```
 
-The implementation does not materialize a Task value, TaskTemplate, or ABI buffer. `page_id`,
-`recurrent_state_slot`, and `conv_state_slot` are data inputs, not Task coordinates. `state_kind` selects which
-physical slot applies to the task.
+The grid derives both task fields. One 128-thread block RMS-normalizes and gates one `[Dv]` recurrent-output vector.
+The CPU does not construct or pass a task object.
 
-One threadblock copies one page with `float4` lanes. The grid launches all requested state-page copies.
+The shader derives `GDNOutputNormGateThreadTask` from the thread-block task, thread index, and output-norm specialization.
+One thread owns strided Dv elements and one square-sum partial. The thread block reduces these partials before each
+thread writes its normalized and gated output elements.
 
-Output norm + gate is a cooperative reduction/map, not a matmul-like Tile. One comment-only
-`GDNOutputNormGateTask` maps 1:1 to one 128-thread threadblock.
+Short convolution, candidate convolution materialization, and QKVABZ split use flat element dispatches. Their
+thread-block grouping is launch geometry. The implementation does not add semantic thread-block task types for these
+kernels.
 
-The task owns `{ flat_token_index, v_head_index }`. The grid derives both coordinates. The task RMS-normalizes and
-gates one `[Dv]` recurrent-output vector.
+State-page I/O is a separate copy component. Each state-I/O request selects one logical state version, one recurrent
+physical slot, one convolution physical slot, and its page IDs across every GDN layer. The read and write kernels use
+this task relation:
 
-Short convolution and QKVABZ split use flat map dispatches. Their threadblock grouping is incidental launch
-tuning. Thus, their documentation describes tensors and grids without new `*Task` or `*Tile` nouns.
+```text
+one ThreadBlock
+    → one GDNStatePageReadThreadBlockTask
+      or one GDNStatePageWriteThreadBlockTask
+
+GDNStatePageReadThreadBlockTask / GDNStatePageWriteThreadBlockTask
+    state_io_request_index
+    gdn_layer_index
+    state_kind
+    page_index_in_state
+```
+
+The grid derives all task coordinates. `page_id`, `recurrent_state_slot`, and `conv_state_slot` are data inputs.
+`state_kind` selects the applicable physical slot. One thread block copies one page with `float4` lanes.
 
 ## Canonical metadata and host/Metal ABI
 
@@ -266,6 +332,10 @@ GDNComputeConfig
   num_v_heads, v_head_dim,
   conv_kernel_size, q_scale, norm_eps
 
+GDNComputeSpecialization
+  compile-time model geometry,
+  per-kernel thread-block geometry
+
 GDNCore
   model_layer_index, hidden_dim,
   num_qk_heads, qk_head_dim,
@@ -279,9 +349,14 @@ GDNQKVABZSplitShape
   num_total_tokens
 ```
 
-Generic `GDNComputeConfig` owns static geometry. `GDNCompute` derives its low-level V-dimension tile from that geometry.
+Generic `GDNComputeConfig` is the public construction input. `GDNCompute::new` validates the config and derives one
+private `GDNComputeSpecialization`. The specialization contains all generated Metal constants and each kernel's required
+thread-block geometry. `GDNCompute` stores `q_scale` and `norm_eps` separately because the host passes them as kernel
+arguments.
+
 For a bucketed invocation, `GDNComputeShape` contains recorded capacities. Submission arguments contain active counts.
-For an exact invocation, the shape counts are both active counts and dispatch extents.
+For an exact invocation, the shape counts are both active counts and dispatch extents. Neither shape causes runtime
+kernel selection.
 
 The Qwen adapter supplies dimensions and weights. Generic Rust and Metal contain no Qwen name or config type.
 
@@ -301,14 +376,23 @@ short convolution
                  next_conv_state_offset_bytes, write_final_state
   dispatch: max(num_total_tokens * Cqkv, num_total_reqs * Cqkv * Ks), 256 threads/threadblock
 
-ragged recurrent
+final-state recurrent
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
                 a_log, dt_bias, src_recurrent_state_slots,
                 flat_materialized_recurrent_state_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
   scalars 10..12: q_scale, num_active_reqs, recurrent_state_offset_bytes
-  grid: (Dv / Dv_tile, num_total_reqs * Hv, 1)
-  threads: (32, Dv_tile, 1)
+  grid: (Dv / kernels.final_state_recurrent.thread_block.num_v_rows,
+         num_total_reqs * Hv, 1)
+  threads: (kernels.final_state_recurrent.thread_block.num_qk_dim_threads,
+            kernels.final_state_recurrent.thread_block.num_v_rows, 1)
+
+candidate-state recurrent
+  buffers and scalars: same binding domains as final-state recurrent
+  grid: (Dv / kernels.candidate_state_recurrent.thread_block.num_v_rows(),
+         num_total_reqs * Hv, 1)
+  threads: (kernels.candidate_state_recurrent.thread_block.num_qk_dim_threads,
+            kernels.candidate_state_recurrent.thread_block.num_simdgroups, 1)
 
 output_norm_gate
   buffers 0..3: norm_gated_output, recurrent_output, z, norm_weight
@@ -331,9 +415,10 @@ Candidate convolution materialization uses buffers 0..5 for `next_conv_state`, `
 
 Candidate recurrent materialization uses `src_recurrent_state_slots` at buffer 7,
 `flat_materialized_recurrent_state_slots` at buffer 8, and `cu_tokens` at buffer 9. It uses scalars 10..12. One SIMDgroup
-owns one `[2, Dqk]` register tile. Two SIMDgroups share normalized Q/K and gate scalars through threadgroup memory. The
-grid is `(Dv / 4, num_total_reqs * Hv, 1)`. The threadgroup shape is `(32, 2, 1)`. The candidate path requires `Dqk % 32 ==
-0`, `Dv % 2 == 0`, and an even `Dv / 2` tile count. These requirements are initialization-time geometry contracts.
+owns one `[2, Dqk]` register-resident state slice. Two SIMDgroups share normalized Q/K and gate scalars through
+threadgroup memory. The grid is `(Dv / 4, num_total_reqs * Hv, 1)`. The thread-block dimensions are `(32, 2, 1)`.
+The candidate-state path requires `Dqk % 32 == 0` and `Dv % 4 == 0`. These requirements are initialization-time
+geometry contracts.
 
 The invalid state-slot sentinel is `u32::MAX`. All compute variants use the same row-level contract. A row always
 produces its normal output. A kernel writes the row's convolution or recurrent state only when the corresponding domain
@@ -365,7 +450,7 @@ GDN compute, and persistent recurrent state. `GDNCore` remains backend-neutral a
 
 `GDNMetalConfig` owns numeric and storage configuration. It includes norm epsilon, `input_dtype`, `output_dtype`,
 `qkvabz_scale_bias_dtype`, and `output_scale_bias_dtype`. The current implementation accepts only BF16 model boundaries.
-F32 model boundaries remain explicit future work. The config does not expose kernel tile configuration.
+F32 model boundaries remain explicit future work. The config does not expose GDN kernel specialization controls.
 
 `GDN` owns one adaptive `AffineQuantizedMatmul` for the qkvabz projection and one for the output projection.
 Each operator owns its QMV and QMM candidates.
@@ -374,13 +459,15 @@ The GDN token bucket policy unions both affine topology boundaries. Thus, one bu
 boundary.
 `GDN` does not select or name an affine kernel.
 
-`GDN` translates immutable `GDNCore` geometry into `GDNComputeConfig`. `GDNCompute::new` selects the normal recurrent
-`Dv_tile` from that config. It uses the measured 8-lane tile when `v_head_dim` permits it. It falls back to 4 for other
-valid dimensions. The production candidate-state kernel uses the independently tuned two-row register-V tile and two
-SIMDgroups per threadgroup. These selected tiles specialize the generated Metal source together with
-`num_qk_heads/qk_head_dim`, `num_v_heads/v_head_dim`, `conv_kernel_size`, and derived `qkv_dim`.
-The model adapter does not select this kernel configuration. `GDNComputeShape` contains only recorded request and token
-extents.
+`GDN` translates immutable `GDNCore` geometry into `GDNComputeConfig`. `GDNCompute::new` derives one
+`GDNComputeSpecialization`. The final-state recurrent specialization uses eight V rows per thread block when
+`v_head_dim` permits it. It falls back to four V rows for other valid dimensions. The candidate-state recurrent
+specialization uses two V rows per SIMDgroup and two SIMDgroups per thread block. The specialization also records the
+required thread count for short convolution, candidate convolution materialization, and output norm + gate.
+
+The selected model and thread-block geometry specializes the generated Metal source. The model adapter does not select
+this geometry. `GDNComputeShape` contains only recorded request and token extents. It does not cause runtime kernel
+selection.
 
 Kernel source-hash caching shares compiled pipelines for identical component configs across layers and models. The backend
 API does not contain model names or model config types. Batch metadata objects and scratch bindings do not copy static
@@ -589,14 +676,14 @@ qkvabz affine                         active tokens
 QKVABZ split                          active tokens
 short convolution                     active requests and active tokens
 candidate convolution materialization active requests and active tokens
-ragged recurrent                      active requests
+final-state or candidate-state recurrent active requests
 output norm + gate                    active tokens
 output affine                         active tokens
 ```
 
 One bucketed GDN program therefore has two deduplicated `u32` parameters. Every padded command returns before an
-inactive lane reads input or metadata, mutates state, reaches a threadblock barrier, or writes output. The ragged
-recurrent request guard is uniform for the complete threadblock.
+inactive lane reads input or metadata, mutates state, reaches a threadblock barrier, or writes output. Each recurrent
+request guard is uniform for the complete thread block.
 
 `GDNReplayBucketPolicy` owns independent request and token policies. The token policy includes the topology boundaries
 from both affine operators. `GDNReplayTopology` contains `materialize_candidate_states`, `qkvabz_affine`, and
@@ -669,7 +756,7 @@ hidden_state (BF16)
           |
           v
        GDNCompute (F32)
-     short_conv -> ragged_recurrent -> output_norm_gate
+     short_conv -> final_state_recurrent -> output_norm_gate
           |
           v
        norm_gated_output (F32)
@@ -685,41 +772,41 @@ Stage nouns identify the operation. They do not overload one generic “attentio
 
 ```text
 qkvabz_to_qkv_a_b_z   elementwise map from qkvabz to qkv/a/b/z
-short_conv         temporal convolution map from qkv to conv_qkv plus next_conv_state
-ragged_recurrent   ordered recurrent state transition and recurrent_output production
-output_norm_gate  per-(token,V-head) RMS reduction, norm, and z-gate map
+short_conv              temporal convolution from qkv to conv_qkv plus next_conv_state
+final_state_recurrent   ordered recurrent state transition and recurrent_output production
+output_norm_gate        per-(token,V-head) RMS reduction, norm, and z-gate operation
 ```
 
-In ragged recurrent, each Q/K lane produces `q_square_sum_partial`, `k_square_sum_partial`, `state_k_partial`, and
+In recurrent execution, each Q/K lane produces `q_square_sum_partial`, `k_square_sum_partial`, `state_k_partial`, and
 `state_q_partial`. SIMD reductions produce `q_square_sum`, `k_square_sum`, `state_k_dot`, and one
 `recurrent_output_value`. These values are local reduction values. They are not extra global tensors or Task fields.
 
 Output norm + gate uses `square_sum_partial` and threadgroup `square_sum_partials` before it computes the inverse RMS.
 No partial changes the existing dispatch, scratch, or ABI.
 
-`GDNCompute` owns one mathematical compute path: ragged recurrent execution. It has a final-state kernel and a
-candidate-state kernel for the two materialization contracts. It handles one or more flat tokens per request with
-`cu_tokens`. Each recurrent kernel computes Q/K inverse norms, decay, and beta. It advances each request's tokens in order.
-It parallelizes across requests, V heads, V-dimension tiles, and Q/K-dimension lanes.
+`GDNCompute` owns one mathematical recurrent algorithm. It has a final-state kernel and a candidate-state kernel for
+the two materialization contracts. It handles one or more flat tokens per request with
+`cu_tokens`. Each recurrent kernel computes Q/K inverse norms, decay, and beta. It advances each request's tokens in
+order. It parallelizes across requests, V heads, V-row ranges, and Q/K-dimension lanes.
 
 ### Execution strategy
 
-`ragged_recurrent` is the current GDN compute path. It does not define GDN itself. The final-state and candidate-state
-kernels use the same operation order and row segmentation. They use independently tuned state-tile partitions for their
-different write contracts. Do not add `GDNComputePath` until a second mathematical production implementation exists. The
-current path is:
+The final-state recurrent and candidate-state recurrent kernels use the same operation order and request segmentation.
+They use independently tuned V-row partitions for their
+different write contracts. Do not add `GDNComputePath`, a registry, or a runtime planner until a second mathematical
+production implementation exists with a workload-dependent crossover. The current path is:
 
 ```text
 shape: num_tokens >= num_reqs, segmented by cu_tokens
-parallelism: request x v_head x v_dim_tile, with Q/K-dimension lanes inside the threadblock
+parallelism: request x v_head x V-row range, with Q/K-dimension lanes inside the threadblock
 input: one or more contiguous rows per request
 state: load source-state fragments once, advance them in MSL thread-local storage, then optionally write the final state
 ```
 
-The final-state kernel uses 32 Q/K-dimension threads and the configured `Dv_tile`. Qwen's measured default tile of 8
-produces a 256-thread threadblock. The candidate-state kernel uses two 32-thread SIMDgroups and a two-row tile per
-SIMDgroup. `v_head_dim` and the selected tile derive the number of V-dimension tiles. The backend does not store this
-number. The final-state dataflow is:
+The final-state kernel uses 32 Q/K-dimension threads and eight V rows for Qwen's current geometry. This geometry produces
+a 256-thread block. The candidate-state kernel uses two 32-thread SIMDgroups and two V rows per SIMDgroup.
+`v_head_dim` and the selected V-row count derive the number of thread blocks. The backend does not store this dynamic
+count. The final-state dataflow is:
 
 ```text
 recurrent_state_arena[src slot, v_head, 8 V rows, 128 Dqk values]
@@ -753,11 +840,11 @@ For each token, Q and K stream from global memory/cache. Lane-local scalar parti
 reductions.
 
 The recurrent kernel's threadgroup storage contains only four scalars: `q_inv_norm_shared`, `k_inv_norm_shared`,
-`decay_shared`, and `beta_shared`. It has no threadgroup state tile or threadgroup Q/K tile. This design uses
-register-oriented state residency, not double buffering.
+`decay_shared`, and `beta_shared`. It has no threadgroup-resident state or Q/K buffer. This design uses register-oriented
+state residency, not double buffering.
 
 The threadblock walks a request segment in token order. Token `t + 1` depends on token `t`'s updated recurrent state.
-Separate requests, V heads, and V-dimension tiles remain parallel. The current backend has no alternative recurrent
+Separate requests, V heads, and V-row ranges remain parallel. The current backend has no alternative recurrent
 execution mode.
 
 GDN bench fixtures distinguish fresh state from state-present execution. `ctx=0` leaves source conv/recurrent state
@@ -967,9 +1054,9 @@ The recurrent core reads `conv_qkv`, raw F32 `a`/`b`, and raw BF16 `a_log`/`dt_b
 and derives normalized q/k, beta, decay, and output values in F32. It then advances the recurrent state in token order
 for each request segment.
 
-For candidate materialization, one SIMDgroup loads a `[2, Dqk]` source-state tile into registers. It keeps the tile local
-across the segment. Two SIMDgroups share one normalized Q/K vector and gate pair. Each SIMDgroup writes its tile to
-persistent state only when the row's recurrent state slot is valid. The operation order remains
+For candidate materialization, one SIMDgroup loads a `[2, Dqk]` source-state slice into registers. It keeps the slice
+local across the segment. Two SIMDgroups share one normalized Q/K vector and gate pair. Each SIMDgroup writes its slice
+to persistent state only when the row's recurrent state slot is valid. The operation order remains
 `decayed_state = state * decay`, `delta = (v - decayed_state * k) * beta`, and
 `state = decayed_state + k * delta`.
 
@@ -993,8 +1080,8 @@ publish writes only committed/verified versions
 rejected speculative rows leave their candidate slots uncommitted
 ```
 
-`ragged_recurrent` handles every current row shape. This includes decode and MTP verification batches with one or more
-rows per request, segmented by `cu_tokens`. One threadblock selects a request, V head, and V-dimension tile. Its
+The recurrent algorithm handles every current row shape. This includes decode and MTP verification batches with one or more
+rows per request, segmented by `cu_tokens`. One thread block selects a request, V head, and V-row range. Its
 Q/K-dimension lanes load distributed source-state fragments. They then scan the request segment in order.
 
 For `num_tokens=1,num_reqs=1`, this operation is still a one-step state update. For
