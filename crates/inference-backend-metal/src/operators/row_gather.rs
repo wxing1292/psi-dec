@@ -10,7 +10,26 @@ use crate::metal::ReplayParameterKey;
 
 const ROW_GATHER_SOURCE: &str = include_str!("metal/row_gather.metal");
 
-const NUM_THREADS_PER_THREADBLOCK: usize = 256;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RowGatherThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RowGatherKernelSpecialization {
+    dtype: Dtype,
+    thread_block: RowGatherThreadBlockSpecialization,
+}
+
+impl RowGatherKernelSpecialization {
+    fn new(config: RowGatherConfig) -> Self {
+        config.validate();
+        Self {
+            dtype: config.dtype,
+            thread_block: RowGatherThreadBlockSpecialization { required_threads: 256 },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RowGatherConfig {
@@ -72,19 +91,22 @@ pub struct RowGatherBuffers<'a> {
 
 pub struct RowGatherKernel {
     config: RowGatherConfig,
+    specialization: RowGatherKernelSpecialization,
     kernel: Kernel,
 }
 
 impl RowGatherKernel {
     pub fn new(device: &Device, config: RowGatherConfig) -> Self {
         config.validate();
-        let function_name = match config.dtype {
+        let specialization = RowGatherKernelSpecialization::new(config);
+        let function_name = match specialization.dtype {
             Dtype::Bfloat16 => "row_gather_bf16",
             Dtype::Float32 => "row_gather_f32",
             _ => unreachable!("validated row gather dtype"),
         };
         Self {
             config,
+            specialization,
             kernel: Kernel::new(device, ROW_GATHER_SOURCE, function_name),
         }
     }
@@ -92,6 +114,7 @@ impl RowGatherKernel {
     pub fn invoke<'a>(&'a self, shape: RowGatherShape, buffers: RowGatherBuffers<'a>) -> RowGatherInvocation<'a> {
         RowGatherInvocation {
             config: self.config,
+            specialization: self.specialization,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -108,6 +131,7 @@ impl RowGatherKernel {
     ) -> RowGatherInvocation<'a> {
         RowGatherInvocation {
             config: self.config,
+            specialization: self.specialization,
             kernel: &self.kernel,
             shape: capacity_shape,
             buffers,
@@ -118,6 +142,7 @@ impl RowGatherKernel {
 
 pub struct RowGatherInvocation<'a> {
     config: RowGatherConfig,
+    specialization: RowGatherKernelSpecialization,
     kernel: &'a Kernel,
     shape: RowGatherShape,
     buffers: RowGatherBuffers<'a>,
@@ -136,7 +161,10 @@ impl Operator for RowGatherInvocation<'_> {
             Some(key) => recorder.bind_u32(4, key, 1, self.shape.num_total_rows),
             None => recorder.set_u32(4, self.shape.num_total_rows),
         }
-        recorder.dispatch_1d(self.shape.num_values(self.config) as usize, NUM_THREADS_PER_THREADBLOCK);
+        recorder.dispatch_1d(
+            self.shape.num_values(self.config) as usize,
+            self.specialization.thread_block.required_threads as usize,
+        );
     }
 }
 

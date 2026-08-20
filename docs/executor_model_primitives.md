@@ -1,7 +1,7 @@
 # Model Primitive Executor Components
 
-This document describes the current embedding, unembedding, normalization, residual, and fused RoPE components. It
-defines their component-specific GPU tasks and selection owners.
+This document describes the current embedding, unembedding, row-gather, normalization, residual, and fused RoPE
+components. It defines their component-specific GPU tasks and selection owners.
 
 ## Source layout
 
@@ -24,6 +24,9 @@ crates/inference-backend-metal/src/components/
   residual_add.rs
   residual_add_rms_norm.rs
   rms_norm_rope.rs
+
+crates/inference-backend-metal/src/operators/
+  row_gather.rs
 ```
 
 These components use the execution vocabulary in [GPU Execution Vocabulary](gpu_execution.md).
@@ -73,6 +76,20 @@ boundaries. `Unembed` supplies model geometry, weights, buffers, and row counts.
 
 Embedding and unembedding share weight lifecycle and replay-capacity conventions. They do not share one GPU planner.
 Embedding is a row lookup. Unembedding is a matrix multiplication.
+
+## Row gather
+
+`Gather` owns one `RowGatherKernel`. It copies indexed input rows to a dense output:
+
+```text
+input[row_indices[output_row], column]
+    -> output[output_row, column]
+```
+
+The compiled specialization contains the dtype and `thread_block.required_threads = 256`. One non-persistent thread
+block processes a bounded flat range of `(output row, column)` coordinates. Exact and bucketed recording use the same
+kernel. The runtime row count changes only the grid and the active-row guard. Row gather has one current specialization
+for each supported dtype and does not need a registry, planner, or plan object.
 
 ## RMSNorm
 

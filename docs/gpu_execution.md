@@ -164,6 +164,7 @@ must not add a planner only to match another component.
 | --- | --- | --- | --- |
 | Quantized embedding | Dequantize selected vocabulary rows into hidden rows. | A bounded flat range of `(token, hidden)` output values. | No planner. The backend derives one fixed kernel specialization at initialization. |
 | Unembedding | Apply one affine quantized projection from hidden rows to vocabulary logits. | The selected affine QMV or QMM kernel defines the task. | `AffineQuantizedMatmul` owns the row-dependent QMV/QMM choice. `Unembed` does not select it again. |
+| Row gather | Copy indexed input rows to a dense output. | A bounded flat range of `(output row, column)` values. | No planner. Dtype selects one static specialization at initialization. |
 | RMSNorm | Normalize one hidden row and apply its weight row. | One token row. | No planner. Dtype selects one static kernel at initialization. |
 | Residual add | Add two flat tensors or two row-major active prefixes. | A bounded flat range of output values. | No planner. Dtypes select one static kernel at initialization. |
 | Residual-add RMSNorm | Add two hidden rows, preserve the residual row, and normalize it. | One token row. | The backend selects the scalar or BF16-vectorized kernel at initialization. The runtime shape does not change this choice. |
