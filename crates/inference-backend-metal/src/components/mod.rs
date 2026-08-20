@@ -61,25 +61,13 @@ pub use quantized_embedding::QuantizedEmbeddingConfig;
 pub use quantized_embedding::QuantizedEmbeddingKernel;
 pub use quantized_embedding::QuantizedEmbeddingShape;
 
-mod gdn_compute;
-pub use gdn_compute::GDNCompute;
-pub use gdn_compute::GDNComputeBuffers;
-pub use gdn_compute::GDNComputeConfig;
-pub use gdn_compute::GDNComputeShape;
+pub mod gdn;
 
 mod gdn_qkvabz_split;
 pub use gdn_qkvabz_split::GDNQKVABZSplitBuffers;
 pub use gdn_qkvabz_split::GDNQKVABZSplitConfig;
 pub use gdn_qkvabz_split::GDNQKVABZSplitKernel;
 pub use gdn_qkvabz_split::GDNQKVABZSplitShape;
-
-mod gdn_state_pages;
-pub use gdn_state_pages::GDNStatePageBatchConfig;
-pub use gdn_state_pages::GDNStatePageBatchRead;
-pub use gdn_state_pages::GDNStatePageBatchReadBuffers;
-pub use gdn_state_pages::GDNStatePageBatchShape;
-pub use gdn_state_pages::GDNStatePageBatchWrite;
-pub use gdn_state_pages::GDNStatePageBatchWriteBuffers;
 
 mod gqa_split_kv_single_q;
 pub use gqa_split_kv_single_q::GQAActivationGateBuffers;

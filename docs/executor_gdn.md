@@ -39,10 +39,12 @@ crates/inference-executor-metal/src/model/qwen/
     plan.rs                 Qwen3.5 GDN geometry/config builder
 
 crates/inference-backend-metal/src/components/
-  gdn_compute.rs        reusable Metal GDN compute graph and kernel specializations
-  gdn_compute_test.rs   GDN compute reference tests
+  gdn/
+    mod.rs              backend GDN component module root
+    compute.rs          recurrent variant registry, selector, constants, and compute graph
+    compute_test.rs     GDN compute reference and selection tests
+    state_pages.rs      reusable GDN state-page read/write helpers
   gdn_qkvabz_split.rs  reusable QKVABZ split component
-  gdn_state_pages.rs    reusable GDN state-page read/write helpers
   metal/
     gdn_compute.metal        short-convolution, ragged recurrent, and output-norm/gate source
     gdn_qkvabz_split.metal  QKVABZ split source
@@ -122,19 +124,38 @@ Request segments use `flat_token_begin`, `flat_token_end`, `num_req_tokens`, and
 `cu_tokens` has `R + 1` cumulative flat-token counts. Adjacent entries select the half-open flat-token segment that one
 request owns.
 
-## Kernel specialization and thread-block tasks
+## Execution variants, kernel constants, and tasks
 
-Use [GPU execution vocabulary](gpu_execution.md) for the shared launch, specialization, task, tile, layout, and planner
+Use [GPU execution vocabulary](gpu_execution.md) for the shared launch, constants, variant, task, tile, layout, and
+selector
 terms. This section defines the GDN-specific mapping.
 
-`GDNCompute::new` derives one `GDNComputeSpecialization` from `GDNComputeConfig`. This is an initialization-time static
-operation. GDN does not use a runtime registry or planner because the current compute graph has no
-workload-dependent implementation choice.
-
-The specialization has this hierarchy:
+`backend_compute::Compute::new` constructs a private `Registry`. The registry uses this entry representation:
 
 ```text
-GDNComputeSpecialization
+Vec<(VariantKey, Variant)>
+
+VariantKey::Recurrent
+    -> current recurrent algorithm
+    -> VariantConstants
+    -> compiled short-convolution, recurrent, and output kernels
+```
+
+The private `Selector::select(...)` returns `(VariantKey, &Variant)` for one `backend_compute::Shape`. The current
+registry has one entry. The selector therefore returns `Recurrent` for all legal shapes. GDN does not have a `Planner`,
+`Plan`, or rich selection object.
+
+This structure keeps one selection level. A future chunkwise implementation must be another complete registry entry.
+It must not add an outer algorithm selector and an inner kernel selector.
+
+The current inputs pack ragged request segments on one flat token axis and use `cu_tokens` to recover each segment.
+The project calls the algorithm `Recurrent`. It does not call the variant `PackedDecode` because the implementation
+also processes multi-token request segments.
+
+The current variant constants have this hierarchy:
+
+```text
+VariantConstants
 ├── model
 │   ├── num_qk_heads
 │   ├── qk_head_dim
@@ -146,12 +167,12 @@ GDNComputeSpecialization
     │   └── thread_block.required_threads
     ├── candidate_conv_state
     │   └── thread_block.required_threads
-    ├── final_state_recurrent
+    ├── final_recurrent_state
     │   └── thread_block
     │       ├── num_qk_dim_threads
     │       ├── num_v_rows
     │       └── required_threads
-    ├── candidate_state_recurrent
+    ├── candidate_recurrent_state
     │   └── thread_block
     │       ├── num_qk_dim_threads
     │       ├── num_simdgroups
@@ -161,26 +182,30 @@ GDNComputeSpecialization
         └── thread_block.required_threads
 ```
 
-`GDNComputeConfig` also contains `q_scale` and `norm_eps`. The host passes these values as kernel arguments. They are
-not compile-time specialization values.
+`backend_compute::Config` also contains `q_scale` and `norm_eps`. The host passes these values as kernel arguments. They
+are not compile-time constants.
 
-At recording time, `GDNComputeShape` and `GDNComputeSpecialization` derive each kernel execution configuration.
-`GDNComputeShape` supplies recorded request and token extents. The specialization supplies required thread-block
+At recording time, `backend_compute::Shape` and `VariantConstants` derive each kernel execution configuration.
+`backend_compute::Shape` supplies recorded request and token extents. The constants supply required thread-block
 geometry. The `dispatch_1d` and `dispatch_threadblocks` calls pass the actual grid and thread-block dimensions. For each
 kernel, the actual thread count must equal `thread_block.required_threads`.
 
-The final-state recurrent and candidate-state recurrent kernels implement one recurrent algorithm. They have different
-state-materialization contracts. The final-state recurrent kernel can write the state after the last request token. The
-candidate-state recurrent kernel can write a distinct state after each request token. The two kernels are not cost
+The `final_recurrent_state` and `candidate_recurrent_state` kernels implement one recurrent algorithm. They have
+different state-materialization contracts. The first kernel can write the state after the last request token. The
+second kernel can write a distinct state after each request token. The two kernels are not cost
 candidates.
 
-The current final-state recurrent kernel uses this task relation:
+The short-convolution kernel always produces `conv_qkv`. Its existing `write_final_conv_state` argument controls final
+convolution-state materialization. The candidate-state invocation also records `candidate_conv_state` to materialize
+per-token convolution states. There is no separate `final_conv_state` kernel.
+
+The current final recurrent-state kernel uses this task relation:
 
 ```text
 one ThreadBlock
-    → one GDNFinalStateRecurrentThreadBlockTask
+    → one FinalRecurrentStateThreadBlockTask
 
-GDNFinalStateRecurrentThreadBlockTask
+FinalRecurrentStateThreadBlockTask
     request_index
     v_head_index
     v_dim_indices: Range<u32>
@@ -192,21 +217,21 @@ token range. The thread block owns
 `recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk]`. It advances this state over `flat_token_indices` in
 order.
 
-The kernel derives `GDNFinalStateRecurrentThreadBlockTask` from kernel arguments, the thread-block index, and
-`GDNComputeSpecialization.kernels.final_state_recurrent`. The CPU does not construct or pass a task object.
+The kernel derives `FinalRecurrentStateThreadBlockTask` from kernel arguments, the thread-block index, and
+`VariantConstants.kernels.final_recurrent_state`. The CPU does not construct or pass a task object.
 
 The shader derives the per-thread work:
 
 ```text
-GDNFinalStateRecurrentThreadTask
+FinalRecurrentStateThreadTask
     = derive(
-        GDNFinalStateRecurrentThreadBlockTask,
+        FinalRecurrentStateThreadBlockTask,
         thread_index,
-        GDNComputeSpecialization.kernels.final_state_recurrent,
+        VariantConstants.kernels.final_recurrent_state,
       )
 ```
 
-One final-state recurrent thread owns one V row and a strided Dqk fragment. It keeps that fragment thread-local while it
+One final recurrent-state thread owns one V row and a strided Dqk fragment. It keeps that fragment thread-local while it
 advances the request's token range. The CPU does not construct or pass a thread-task object.
 
 For Qwen's current geometry:
@@ -214,7 +239,7 @@ For Qwen's current geometry:
 ```text
 recurrent_state[slot, Hv=32, Dv=128, Dqk=128]
 
-final_state_recurrent.thread_block
+final_recurrent_state.thread_block
   num_qk_dim_threads = 32
   num_v_rows = 8
   required_threads = 256
@@ -226,7 +251,7 @@ thread_block_dimensions = (num_qk_dim_threads, num_v_rows, 1)
                         = (32,                     8, 1)
 ```
 
-One final-state recurrent thread block owns an `[8, 128]` state slice. This slice contains
+One final recurrent-state thread block owns an `[8, 128]` state slice. This slice contains
 `8 * 128 * sizeof(f32) = 4 KiB` of logical state.
 
 For `Dqk=128`, one thread owns four strided state values:
@@ -253,25 +278,25 @@ slice. MSL declares `thread float state_fragments[4]`. Physical register placeme
 In each round, the 32 x-lanes access one contiguous 128-byte span (`32 * sizeof(f32)`). Four rounds cover one 512-byte
 row. This pattern describes memory access. It does not guarantee one 512-byte hardware transaction.
 
-The candidate-state recurrent kernel uses this task relation:
+The candidate recurrent-state kernel uses this task relation:
 
 ```text
 one ThreadBlock
-    → one GDNCandidateStateRecurrentThreadBlockTask
+    → one CandidateRecurrentStateThreadBlockTask
 
-GDNCandidateStateRecurrentThreadBlockTask
+CandidateRecurrentStateThreadBlockTask
     request_index
     v_head_index
     v_dim_indices: Range<u32>
     flat_token_indices: Range<u32>
 ```
 
-The candidate-state recurrent specialization has `num_qk_dim_threads=32`, `num_simdgroups=2`, and
+The candidate recurrent-state constants have `num_qk_dim_threads=32`, `num_simdgroups=2`, and
 `simdgroup.num_v_rows=2`. One 64-thread block owns a `[4, 128]` state slice. Each SIMDgroup owns two V rows. The two
 SIMDgroups share normalized Q/K values and gate scalars.
 
-The shader derives `GDNCandidateStateRecurrentThreadTask` from the thread-block task, thread index, and the
-candidate-state recurrent specialization. One candidate-state recurrent thread owns strided Dqk fragments for two V
+The shader derives `CandidateRecurrentStateThreadTask` from the thread-block task, thread index, and the
+candidate recurrent-state constants. One candidate recurrent-state thread owns strided Dqk fragments for two V
 rows in its SIMDgroup. It can write those fragments to a row-specific candidate state slot after each token.
 
 The recurrent kernels write `recurrent_output [T, Hv, Dv]`. They preserve token order within one request. Requests,
@@ -281,9 +306,9 @@ Output norm + gate uses this task relation:
 
 ```text
 one ThreadBlock
-    → one GDNOutputNormGateThreadBlockTask
+    → one OutputNormGateThreadBlockTask
 
-GDNOutputNormGateThreadBlockTask
+OutputNormGateThreadBlockTask
     flat_token_index
     v_head_index
 ```
@@ -291,7 +316,7 @@ GDNOutputNormGateThreadBlockTask
 The grid derives both task fields. One 128-thread block RMS-normalizes and gates one `[Dv]` recurrent-output vector.
 The CPU does not construct or pass a task object.
 
-The shader derives `GDNOutputNormGateThreadTask` from the thread-block task, thread index, and output-norm specialization.
+The shader derives `OutputNormGateThreadTask` from the thread-block task, thread index, and output-norm constants.
 One thread owns strided Dv elements and one square-sum partial. The thread block reduces these partials before each
 thread writes its normalized and gated output elements.
 
@@ -305,18 +330,18 @@ this task relation:
 
 ```text
 one ThreadBlock
-    → one GDNStatePageReadThreadBlockTask
-      or one GDNStatePageWriteThreadBlockTask
+    → one state_pages::ReadThreadBlockTask
+      or one state_pages::WriteThreadBlockTask
 
-GDNStatePageReadThreadBlockTask / GDNStatePageWriteThreadBlockTask
+state_pages::ReadThreadBlockTask / state_pages::WriteThreadBlockTask
     state_io_request_index
     gdn_layer_index
     state_kind
     page_index_in_state
 ```
 
-The read and write kernels use the same `GDNStatePageKernelSpecialization`. Its thread-block specialization requires
-256 threads. This shared specialization is valid because both kernels use the same page-byte partition and inverse
+The read and write kernels use the same private `state_pages::KernelConstants`. Its thread-block constants require
+256 threads. This shared constant set is valid because both kernels use the same page-byte partition and inverse
 read/write task geometry. The batch shape and state-page counts remain dynamic invocation data.
 
 The grid derives all task coordinates. `page_id`, `recurrent_state_slot`, and `conv_state_slot` are data inputs.
@@ -331,17 +356,23 @@ GDNReplayShape
   num_reqs, num_total_reqs,
   num_tokens, num_total_tokens
 
-GDNComputeShape
+backend_compute::Shape
   num_total_reqs, num_total_tokens
 
-GDNComputeConfig
+backend_compute::Config
   num_qk_heads, qk_head_dim,
   num_v_heads, v_head_dim,
   conv_kernel_size, q_scale, norm_eps
 
-GDNComputeSpecialization
+VariantConstants
   compile-time model geometry,
   per-kernel thread-block geometry
+
+Registry
+  Vec<(VariantKey, Variant)>
+
+Selector::select(Shape)
+  -> (VariantKey, &Variant)
 
 GDNCore
   model_layer_index, hidden_dim,
@@ -356,14 +387,14 @@ GDNQKVABZSplitShape
   num_total_tokens
 ```
 
-Generic `GDNComputeConfig` is the public construction input. `GDNCompute::new` validates the config and derives one
-private `GDNComputeSpecialization`. The specialization contains all generated Metal constants and each kernel's required
-thread-block geometry. `GDNCompute` stores `q_scale` and `norm_eps` separately because the host passes them as kernel
-arguments.
+Generic `backend_compute::Config` is the public construction input. `backend_compute::Compute::new` validates the config
+and constructs one private recurrent variant. Its `VariantConstants` contain all generated Metal constants and each
+kernel's required thread-block geometry. The variant stores `q_scale` and `norm_eps` separately because the host passes
+them as kernel arguments.
 
-For a bucketed invocation, `GDNComputeShape` contains recorded capacities. Submission arguments contain active counts.
-For an exact invocation, the shape counts are both active counts and dispatch extents. Neither shape causes runtime
-kernel selection.
+For a bucketed invocation, `backend_compute::Shape` contains recorded capacities. Submission arguments contain active
+counts. For an exact invocation, the shape counts are both active counts and dispatch extents. The selector reads the
+shape. The current one-entry registry always returns `VariantKey::Recurrent`.
 
 The Qwen adapter supplies dimensions and weights. Generic Rust and Metal contain no Qwen name or config type.
 
@@ -380,26 +411,26 @@ short convolution
                 conv_weight, src_conv_state_slots, flat_materialized_conv_state_slots, cu_tokens
   parameter dtype: conv_weight bf16
   scalars 8..12: num_active_reqs, num_active_tokens, conv_state_offset_bytes,
-                 next_conv_state_offset_bytes, write_final_state
+                 next_conv_state_offset_bytes, write_final_conv_state
   dispatch: max(num_total_tokens * Cqkv, num_total_reqs * Cqkv * Ks), 256 threads/threadblock
 
-final-state recurrent
+final recurrent state
   buffers 0..9: recurrent_output, recurrent_state_arena, conv_qkv, a, b,
                 a_log, dt_bias, src_recurrent_state_slots,
                 flat_materialized_recurrent_state_slots, cu_tokens
   parameter dtype: a_log and dt_bias bf16
   scalars 10..12: q_scale, num_active_reqs, recurrent_state_offset_bytes
-  grid: (Dv / kernels.final_state_recurrent.thread_block.num_v_rows,
+  grid: (Dv / kernels.final_recurrent_state.thread_block.num_v_rows,
          num_total_reqs * Hv, 1)
-  threads: (kernels.final_state_recurrent.thread_block.num_qk_dim_threads,
-            kernels.final_state_recurrent.thread_block.num_v_rows, 1)
+  threads: (kernels.final_recurrent_state.thread_block.num_qk_dim_threads,
+            kernels.final_recurrent_state.thread_block.num_v_rows, 1)
 
-candidate-state recurrent
-  buffers and scalars: same binding domains as final-state recurrent
-  grid: (Dv / kernels.candidate_state_recurrent.thread_block.num_v_rows(),
+candidate recurrent state
+  buffers and scalars: same binding domains as final recurrent state
+  grid: (Dv / kernels.candidate_recurrent_state.thread_block.num_v_rows(),
          num_total_reqs * Hv, 1)
-  threads: (kernels.candidate_state_recurrent.thread_block.num_qk_dim_threads,
-            kernels.candidate_state_recurrent.thread_block.num_simdgroups, 1)
+  threads: (kernels.candidate_recurrent_state.thread_block.num_qk_dim_threads,
+            kernels.candidate_recurrent_state.thread_block.num_simdgroups, 1)
 
 output_norm_gate
   buffers 0..3: norm_gated_output, recurrent_output, z, norm_weight
@@ -457,7 +488,7 @@ GDN compute, and persistent recurrent state. `GDNCore` remains backend-neutral a
 
 `GDNMetalConfig` owns numeric and storage configuration. It includes norm epsilon, `input_dtype`, `output_dtype`,
 `qkvabz_scale_bias_dtype`, and `output_scale_bias_dtype`. The current implementation accepts only BF16 model boundaries.
-F32 model boundaries remain explicit future work. The config does not expose GDN kernel specialization controls.
+F32 model boundaries remain explicit future work. The config does not expose GDN kernel-variant controls.
 
 `GDN` owns one adaptive `AffineQuantizedMatmul` for the qkvabz projection and one for the output projection.
 Each operator owns its QMV and QMM candidates.
@@ -466,15 +497,15 @@ The GDN token bucket policy unions both affine topology boundaries. Thus, one bu
 boundary.
 `GDN` does not select or name an affine kernel.
 
-`GDN` translates immutable `GDNCore` geometry into `GDNComputeConfig`. `GDNCompute::new` derives one
-`GDNComputeSpecialization`. The final-state recurrent specialization uses eight V rows per thread block when
-`v_head_dim` permits it. It falls back to four V rows for other valid dimensions. The candidate-state recurrent
-specialization uses two V rows per SIMDgroup and two SIMDgroups per thread block. The specialization also records the
+`GDN` translates immutable `GDNCore` geometry into `backend_compute::Config`. `backend_compute::Compute::new` constructs
+one recurrent variant. Its final recurrent-state constants use eight V rows per thread block when `v_head_dim` permits
+it. They fall back to four V rows for other valid dimensions. The candidate recurrent-state constants use two V rows
+per SIMDgroup and two SIMDgroups per thread block. The variant constants also record the
 required thread count for short convolution, candidate convolution materialization, and output norm + gate.
 
-The selected model and thread-block geometry specializes the generated Metal source. The model adapter does not select
-this geometry. `GDNComputeShape` contains only recorded request and token extents. It does not cause runtime kernel
-selection.
+The selected model and thread-block geometry specialize the generated Metal source. The model adapter does not select
+this geometry. `backend_compute::Shape` contains recorded request and token extents. The private selector uses this
+shape and returns the current recurrent variant.
 
 Kernel source-hash caching shares compiled pipelines for identical component configs across layers and models. The backend
 API does not contain model names or model config types. Batch metadata objects and scratch bindings do not copy static
@@ -683,7 +714,7 @@ qkvabz affine                         active tokens
 QKVABZ split                          active tokens
 short convolution                     active requests and active tokens
 candidate convolution materialization active requests and active tokens
-final-state or candidate-state recurrent active requests
+final or candidate recurrent-state active requests
 output norm + gate                    active tokens
 output affine                         active tokens
 ```
@@ -762,8 +793,8 @@ hidden_state (BF16)
      `- z (F32)
           |
           v
-       GDNCompute (F32)
-     short_conv -> final_state_recurrent -> output_norm_gate
+       backend_compute::Compute (F32)
+     short_conv -> final_recurrent_state -> output_norm_gate
           |
           v
        norm_gated_output (F32)
@@ -780,7 +811,7 @@ Stage nouns identify the operation. They do not overload one generic “attentio
 ```text
 qkvabz_to_qkv_a_b_z   elementwise map from qkvabz to qkv/a/b/z
 short_conv              temporal convolution from qkv to conv_qkv plus next_conv_state
-final_state_recurrent   ordered recurrent state transition and recurrent_output production
+final_recurrent_state   ordered recurrent state transition and recurrent_output production
 output_norm_gate        per-(token,V-head) RMS reduction, norm, and z-gate operation
 ```
 
@@ -791,17 +822,16 @@ In recurrent execution, each Q/K lane produces `q_square_sum_partial`, `k_square
 Output norm + gate uses `square_sum_partial` and threadgroup `square_sum_partials` before it computes the inverse RMS.
 No partial changes the existing dispatch, scratch, or ABI.
 
-`GDNCompute` owns one mathematical recurrent algorithm. It has a final-state kernel and a candidate-state kernel for
-the two materialization contracts. It handles one or more flat tokens per request with
+The current `backend_compute::Compute` registry owns one recurrent algorithm variant. That variant has final-state and
+candidate-state kernels for the two materialization contracts. It handles one or more flat tokens per request with
 `cu_tokens`. Each recurrent kernel computes Q/K inverse norms, decay, and beta. It advances each request's tokens in
 order. It parallelizes across requests, V heads, V-row ranges, and Q/K-dimension lanes.
 
 ### Execution strategy
 
-The final-state recurrent and candidate-state recurrent kernels use the same operation order and request segmentation.
-They use independently tuned V-row partitions for their
-different write contracts. Do not add `GDNComputePath`, a registry, or a runtime planner until a second mathematical
-production implementation exists with a workload-dependent crossover. The current path is:
+The final and candidate recurrent-state kernels use the same operation order and request segmentation. They use
+independently tuned V-row partitions for their different write contracts. The selector treats them as phases of one
+variant. It does not select between them. The current variant is:
 
 ```text
 shape: num_tokens >= num_reqs, segmented by cu_tokens
@@ -1138,14 +1168,14 @@ Do not add dynamic values to profile paths.
 
 ## GDN kernel family
 
-The current forward replay path uses `GDNCompute` in `crates/inference-backend-metal/src/components/`. It records QKVABZ
+The current forward replay path uses `backend_compute::Compute` in `crates/inference-backend-metal/src/components/`. It records QKVABZ
 split, short convolution, ragged recurrent, and `output_norm_gate` through explicit replay invocations. State page read and
 write helpers belong to the separate exact restore/publish lifecycle stages.
 
 Focused backend tests, component benches with parity checks, and Qwen real-weight wrapper/layer tests provide correctness
 coverage. Slow/reference implementations are test oracles. They are not runtime fallbacks.
 
-`gdn_compute_test.rs` compares Metal execution with the CPU short-convolution and recurrent references. It covers fixed
+`compute_test.rs` compares Metal execution with the CPU short-convolution and recurrent references. It covers fixed
 one-request ragged decode, random ragged input, and a random multi-request ragged batch. Candidate-state tests compare each
 speculative prefix state with an independently evaluated CPU prefix reference. The bucketed candidate test reuses one
 program for `1 -> 2 -> 1` active requests and tokens. It poisons inactive token and metadata tails. It verifies active
@@ -1182,7 +1212,7 @@ cargo bench -p inference-executor-metal --bench qwen35_gdn -- \
 
 Append `-- --profile-time 1 --noplot` to either backend Criterion target for a representative full-target smoke run.
 
-`gdn_attn` records `GDNCompute` with state and candidate-state-update building blocks into Metal replay/ICB paths.
+`gdn_attn` records `backend_compute::Compute` with state and candidate-state-update building blocks into Metal replay/ICB paths.
 `gdn_state_io` covers the reusable GDN state-page read/write component. Neither bench exposes direct-submit component or
 forward wiring.
 
@@ -1206,7 +1236,7 @@ declared buffer usage. It does not add a conservative every-command fallback.
 
 This bench loads real Qwen3.6 GDN weights. It adapts separate checkpoint qkv/a/b/z projections into the executor qkvabz
 replay layout without changing their checkpoint dtype. It measures the full replay path: qkvabz projection, projection
-split, `GDNCompute`, and output projection. Do not compare component-only `GDNCompute` or candidate-state-update timings
+split, `backend_compute::Compute`, and output projection. Do not compare component-only `backend_compute::Compute` or candidate-state-update timings
 with full-forward numbers.
 
 Recommendation: GDN replay debugging separates transient scratch from persistent state. Layers execute serially.

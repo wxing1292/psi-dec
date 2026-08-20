@@ -24,7 +24,7 @@ kernel void gdn_compute_short_conv_f32(
     constant uint& num_active_tokens [[buffer(9)]],
     constant ulong& conv_state_offset_bytes [[buffer(10)]],
     constant ulong& next_conv_state_offset_bytes [[buffer(11)]],
-    constant uint& write_final_state [[buffer(12)]],
+    constant uint& write_final_conv_state [[buffer(12)]],
     uint global_linear_index [[thread_position_in_grid]]
 ) {
     const ulong conv_state_base = conv_state_offset_bytes / sizeof(float);
@@ -87,7 +87,7 @@ kernel void gdn_compute_short_conv_f32(
             const uint input_offset = (flat_token_begin + uint(sequence_index)) * qkv_dim + channel_index;
             x = qkv[input_offset];
         }
-        if (write_final_state != 0 && state_slot != GDN_INVALID_STATE_SLOT_ID) {
+        if (write_final_conv_state != 0 && state_slot != GDN_INVALID_STATE_SLOT_ID) {
             const uint dst_offset = (state_slot * qkv_dim + channel_index) * conv_state_len + state_index;
             next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
         }
@@ -147,20 +147,20 @@ kernel void gdn_compute_candidate_conv_state_f32(
     next_conv_state[next_conv_state_base + (ulong)dst_offset] = x;
 }
 
-// One logical GDNFinalStateRecurrentThreadBlockTask maps 1:1 to one
+// One logical FinalRecurrentStateThreadBlockTask maps 1:1 to one
 // threadblock.
 // It owns recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk] and
 // advances that state over flat_token_indices in order. The kernel derives the
-// task from its arguments, thread-block index, and specialization. It does not
+// task from its arguments, thread-block index, and constants. It does not
 // require a materialized task buffer:
 //
-// GDNFinalStateRecurrentThreadBlockTask {
+// FinalRecurrentStateThreadBlockTask {
 //   request_index,      // grid-derived from threadblock_position.y / Hv
 //   v_head_index,       // grid-derived from threadblock_position.y % Hv
 //   v_dim_indices,      // grid-derived half-open range
 //   flat_token_indices, // cu_tokens[request_index]..cu_tokens[request_index + 1]
 // }
-kernel void gdn_compute_final_state_recurrent_f32(
+kernel void gdn_compute_final_recurrent_state_f32(
     device float* recurrent_output [[buffer(0)]],
     device float* recurrent_state_arena [[buffer(1)]],
     device const float* conv_qkv [[buffer(2)]],
@@ -180,14 +180,14 @@ kernel void gdn_compute_final_state_recurrent_f32(
     const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(float);
     const uint qk_dim_thread_index = thread_position_in_threadblock.x;
     const uint v_row_index_in_range = thread_position_in_threadblock.y;
-    const uint num_qk_dim_threads = final_state_recurrent_num_qk_dim_threads;
+    const uint num_qk_dim_threads = final_recurrent_state_num_qk_dim_threads;
     const uint num_state_fragments = (qk_head_dim + num_qk_dim_threads - 1) / num_qk_dim_threads;
     const uint v_row_range_index = threadblock_position.x;
     const uint req_v_head_linear_index = threadblock_position.y;
     const uint v_head_index = req_v_head_linear_index % num_v_heads;
     const uint req_index = req_v_head_linear_index / num_v_heads;
     const uint v_dim_index =
-        v_row_range_index * final_state_recurrent_num_v_rows + v_row_index_in_range;
+        v_row_range_index * final_recurrent_state_num_v_rows + v_row_index_in_range;
     if (req_index >= num_active_reqs) {
         return;
     }
@@ -305,17 +305,17 @@ kernel void gdn_compute_final_state_recurrent_f32(
     }
 }
 
-// One logical GDNCandidateStateRecurrentThreadBlockTask maps 1:1 to one
+// One logical CandidateRecurrentStateThreadBlockTask maps 1:1 to one
 // threadblock. It owns
 // recurrent_state[slot, v_head_index, v_dim_indices, 0..Dqk], advances
 // flat_token_indices in order, and can materialize state after each token.
 // Grid x derives v_dim_indices. Grid y derives request_index and v_head_index.
 // Each local SIMDgroup owns
-// candidate_state_recurrent_num_v_rows_per_simdgroup V
+// candidate_recurrent_state_num_v_rows_per_simdgroup V
 // rows. The kernel derives the task from its arguments, thread-block index,
-// and specialization.
+// and constants.
 // It does not require a materialized task buffer.
-kernel void gdn_compute_candidate_state_recurrent_f32(
+kernel void gdn_compute_candidate_recurrent_state_f32(
     device float* recurrent_output [[buffer(0)]],
     device float* recurrent_state_arena [[buffer(1)]],
     device const float* conv_qkv [[buffer(2)]],
@@ -339,18 +339,18 @@ kernel void gdn_compute_candidate_state_recurrent_f32(
     const uint qk_dim_thread_index = thread_position_in_threadblock.x;
     const uint local_simdgroup_index = thread_position_in_threadblock.y;
     const uint v_row_range_index =
-        threadblock_position.x * candidate_state_recurrent_num_simdgroups + local_simdgroup_index;
+        threadblock_position.x * candidate_recurrent_state_num_simdgroups + local_simdgroup_index;
     const uint req_v_head_linear_index = threadblock_position.y;
     const uint v_head_index = req_v_head_linear_index % num_v_heads;
     const uint req_index = req_v_head_linear_index / num_v_heads;
     const uint v_dim_base =
-        v_row_range_index * candidate_state_recurrent_num_v_rows_per_simdgroup;
+        v_row_range_index * candidate_recurrent_state_num_v_rows_per_simdgroup;
     if (req_index >= num_active_reqs
-        || v_dim_base + candidate_state_recurrent_num_v_rows_per_simdgroup > v_head_dim) {
+        || v_dim_base + candidate_recurrent_state_num_v_rows_per_simdgroup > v_head_dim) {
         return;
     }
 
-    const uint num_qk_dim_threads = candidate_state_recurrent_num_qk_dim_threads;
+    const uint num_qk_dim_threads = candidate_recurrent_state_num_qk_dim_threads;
     const uint num_state_fragments = (qk_head_dim + num_qk_dim_threads - 1) / num_qk_dim_threads;
     const uint num_v_heads_per_qk_head = num_v_heads / num_qk_heads;
     const uint qk_head_index = v_head_index / num_v_heads_per_qk_head;
@@ -364,9 +364,9 @@ kernel void gdn_compute_candidate_state_recurrent_f32(
     const ulong recurrent_state_base = recurrent_state_offset_bytes / sizeof(float);
 
     thread float state_fragments[
-        candidate_state_recurrent_num_v_rows_per_simdgroup * num_state_fragments];
+        candidate_recurrent_state_num_v_rows_per_simdgroup * num_state_fragments];
     for (uint v_row_index_in_range = 0;
-         v_row_index_in_range < candidate_state_recurrent_num_v_rows_per_simdgroup;
+         v_row_index_in_range < candidate_recurrent_state_num_v_rows_per_simdgroup;
          ++v_row_index_in_range) {
         const uint v_dim_index = v_dim_base + v_row_index_in_range;
         const ulong state_row_offset = ((ulong)v_head_index * v_head_dim + v_dim_index) * qk_head_dim;
@@ -441,14 +441,14 @@ kernel void gdn_compute_candidate_state_recurrent_f32(
         const float decay = shared_gate[1];
 
         float v_lane = 0.0f;
-        if (qk_dim_thread_index < candidate_state_recurrent_num_v_rows_per_simdgroup) {
+        if (qk_dim_thread_index < candidate_recurrent_state_num_v_rows_per_simdgroup) {
             const uint v_dim_index = v_dim_base + qk_dim_thread_index;
             v_lane = conv_qkv[(ulong)flat_token_index * qkv_dim + v_base
                 + (ulong)v_head_index * v_head_dim + v_dim_index];
         }
         const uint candidate_state_slot = flat_materialized_recurrent_state_slots[flat_token_index];
         for (uint v_row_index_in_range = 0;
-             v_row_index_in_range < candidate_state_recurrent_num_v_rows_per_simdgroup;
+             v_row_index_in_range < candidate_recurrent_state_num_v_rows_per_simdgroup;
              ++v_row_index_in_range) {
             const uint v_dim_index = v_dim_base + v_row_index_in_range;
             float state_k_partial = 0.0f;
@@ -490,12 +490,12 @@ kernel void gdn_compute_candidate_state_recurrent_f32(
     }
 }
 
-// One logical GDNOutputNormGateThreadBlockTask maps 1:1 to one 128-thread
+// One logical OutputNormGateThreadBlockTask maps 1:1 to one 128-thread
 // threadblock. It RMS-normalizes and gates one [Dv] recurrent-output vector.
 // The kernel derives the task from its arguments, thread-block index, and
-// specialization. It does not require a materialized task buffer:
+// constants. It does not require a materialized task buffer:
 //
-// GDNOutputNormGateThreadBlockTask {
+// OutputNormGateThreadBlockTask {
 //   flat_token_index,  // grid-derived from threadblock linear index / Hv
 //   v_head_index,      // grid-derived from threadblock linear index % Hv
 // }

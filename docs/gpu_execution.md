@@ -181,9 +181,10 @@ variant appears. Do not add an empty framework only for visual symmetry.
 GQA SDPA has multiple legal Map/Reduce execution variants and a workload-dependent crossover. It uses a component-local
 `Registry`, `Selector`, and `Selection`. See [GQA SDPA selection](gqa_sdpa_selection.md).
 
-GDN currently has one recurrent algorithm. Its final-state and candidate-state kernels implement different state
-materialization contracts. They are phases of one current execution variant, not independent candidates. A future
-chunkwise algorithm must be a separate complete variant. See [GDN Executor](executor_gdn.md).
+GDN currently registers one recurrent algorithm. Its final-state and candidate-state kernels implement different state
+materialization contracts. They are phases of one current execution variant, not independent candidates. Its private
+selector returns `(VariantKey, &Variant)`. A future chunkwise algorithm must be a separate complete variant. See
+[GDN Executor](executor_gdn.md).
 
 The following table defines the cross-component execution model. It also records intentional differences. A component
 must not add a selector only to match another component.
@@ -214,8 +215,9 @@ second variant.
 
 The other current components do not need a rich selection value:
 
-- GDN, embedding, row gather, RMSNorm, residual operations, rejection sampling, and DSpark Markov Map currently derive
-  one fixed variant.
+- GDN uses a small `(VariantKey, &Variant)` selection. The current registry contains only `Recurrent`.
+- Embedding, row gather, RMSNorm, residual operations, rejection sampling, and DSpark Markov Map currently derive one
+  fixed variant.
 - Dense MLP and unembedding delegate row-dependent QMV/QMM selection to `AffineQuantizedMatmul`.
 - MoE can repeat its pure selector where it needs the command-graph identity.
 - Top-K sampling uses a small selection value for its Map kernel family.

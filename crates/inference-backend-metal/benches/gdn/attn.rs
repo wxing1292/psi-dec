@@ -5,10 +5,7 @@ use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
 use half::bf16;
-use inference_backend_metal::components::GDNCompute;
-use inference_backend_metal::components::GDNComputeBuffers;
-use inference_backend_metal::components::GDNComputeConfig;
-use inference_backend_metal::components::GDNComputeShape;
+use inference_backend_metal::components::gdn::compute as backend_compute;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
@@ -67,11 +64,11 @@ struct GDNFixture {
 
 impl GDNFixture {
     fn new(device: &Device, batch: u32, tokens: u32) -> Self {
-        let shape = GDNComputeShape {
+        let shape = backend_compute::Shape {
             num_total_reqs: batch,
             num_total_tokens: batch * tokens,
         };
-        let config = GDNComputeConfig {
+        let config = backend_compute::Config {
             num_qk_heads: GDN_QK_HEADS,
             qk_head_dim: GDN_QK_HEAD_DIM,
             num_v_heads: GDN_V_HEADS,
@@ -95,7 +92,7 @@ impl GDNFixture {
         let state_slot_count = shape.num_total_reqs * 2 + shape.num_total_tokens;
 
         let stream = Stream::new(device);
-        let kernels = GDNCompute::new(device, config);
+        let kernels = backend_compute::Compute::new(device, config);
         let qkv = f32_pattern_buffer(device, config.num_qkv_values(shape), 0.001);
         let a = f32_pattern_buffer(
             device,
@@ -134,7 +131,7 @@ impl GDNFixture {
         let recurrent_output = Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<f32>());
         let norm_gated_output =
             Buffer::new_zeroed(device, config.num_recurrent_output_values(shape) * size_of::<f32>());
-        let buffers = GDNComputeBuffers {
+        let buffers = backend_compute::Buffers {
             qkv: &qkv,
             a: &a,
             b: &b,
@@ -163,7 +160,7 @@ impl GDNFixture {
             &stream,
             &kernels,
             shape,
-            GDNComputeBuffers {
+            backend_compute::Buffers {
                 flat_materialized_recurrent_state_slots: &candidate_dst_slot_ids,
                 flat_materialized_conv_state_slots: &candidate_dst_slot_ids,
                 ..buffers
@@ -195,9 +192,9 @@ impl GDNFixture {
 
 fn build_gdn_with_state_replay(
     stream: &Stream,
-    kernels: &GDNCompute,
-    shape: GDNComputeShape,
-    buffers: GDNComputeBuffers<'_>,
+    kernels: &backend_compute::Compute,
+    shape: backend_compute::Shape,
+    buffers: backend_compute::Buffers<'_>,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke(shape, buffers));
@@ -206,9 +203,9 @@ fn build_gdn_with_state_replay(
 
 fn build_gdn_forward_candidate_state_update_replay(
     stream: &Stream,
-    kernels: &GDNCompute,
-    shape: GDNComputeShape,
-    buffers: GDNComputeBuffers<'_>,
+    kernels: &backend_compute::Compute,
+    shape: backend_compute::Shape,
+    buffers: backend_compute::Buffers<'_>,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_with_candidate_state_update(shape, buffers));

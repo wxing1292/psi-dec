@@ -3,14 +3,11 @@ use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use inference_backend_metal::components::GDNCompute;
-use inference_backend_metal::components::GDNComputeBuffers;
-use inference_backend_metal::components::GDNComputeConfig;
-use inference_backend_metal::components::GDNComputeShape;
 use inference_backend_metal::components::GDNQKVABZSplitBuffers;
 use inference_backend_metal::components::GDNQKVABZSplitConfig;
 use inference_backend_metal::components::GDNQKVABZSplitKernel;
 use inference_backend_metal::components::GDNQKVABZSplitShape;
+use inference_backend_metal::components::gdn::compute as backend_compute;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -320,7 +317,7 @@ impl<'a> RealGDNFixture<'a> {
                 GDN_V_DIM.try_into().expect("GDN V dim must fit u32"),
             ),
         );
-        let compute = GDNCompute::new(device, gdn_compute_config());
+        let compute = backend_compute::Compute::new(device, gdn_compute_config());
         let output_config = gdn_output_affine_config();
         let output = AffineQuantizedMatmul::new(device, output_config);
 
@@ -355,11 +352,11 @@ impl<'a> RealGDNFixture<'a> {
                 },
             ),
         );
-        let compute_shape = GDNComputeShape {
+        let compute_shape = backend_compute::Shape {
             num_total_reqs: self.num_reqs,
             num_total_tokens: self.num_tokens,
         };
-        let compute_buffers = GDNComputeBuffers {
+        let compute_buffers = backend_compute::Buffers {
             qkv: &self.qkv,
             a: &self.a,
             b: &self.b,
@@ -439,8 +436,8 @@ impl<'a> RealGDNFixture<'a> {
     }
 }
 
-fn gdn_compute_config() -> GDNComputeConfig {
-    GDNComputeConfig {
+fn gdn_compute_config() -> backend_compute::Config {
+    backend_compute::Config {
         num_qk_heads: GDN_QK_HEADS.try_into().expect("GDN qk heads must fit u32"),
         qk_head_dim: GDN_QK_HEAD_DIM.try_into().expect("GDN qk head dim must fit u32"),
         num_v_heads: GDN_V_HEADS.try_into().expect("GDN V heads must fit u32"),

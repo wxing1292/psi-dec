@@ -4,12 +4,7 @@ use std::mem::size_of;
 use std::mem::take;
 use std::rc::Rc;
 
-use inference_backend_metal::components::GDNStatePageBatchConfig;
-use inference_backend_metal::components::GDNStatePageBatchRead;
-use inference_backend_metal::components::GDNStatePageBatchReadBuffers;
-use inference_backend_metal::components::GDNStatePageBatchShape;
-use inference_backend_metal::components::GDNStatePageBatchWrite;
-use inference_backend_metal::components::GDNStatePageBatchWriteBuffers;
+use inference_backend_metal::components::gdn::state_pages as backend_state_pages;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::GDNCore;
@@ -99,8 +94,8 @@ pub struct GDNStatePageIO {
     page_ids: Buffer,
     recurrent_state_slots: Buffer,
     conv_state_slots: Buffer,
-    read: GDNStatePageBatchRead,
-    write: GDNStatePageBatchWrite,
+    read: backend_state_pages::Read,
+    write: backend_state_pages::Write,
 }
 
 pub struct GDNPreparedRequestState {
@@ -657,8 +652,8 @@ impl GDNStatePageIO {
                 layout.max_state_io_requests,
                 inference_backend_metal::metal::Dtype::Uint32,
             ),
-            read: GDNStatePageBatchRead::new(device, config),
-            write: GDNStatePageBatchWrite::new(device, config),
+            read: backend_state_pages::Read::new(device, config),
+            write: backend_state_pages::Write::new(device, config),
         }
     }
 
@@ -725,7 +720,7 @@ impl GDNStatePageIO {
         assert!(num_state_io_requests > 0, "GDN restore recording requires I/O requests");
         recorder.record(ReplayOp::opaque(self.read.invoke(
             Self::shape(num_state_io_requests),
-            GDNStatePageBatchReadBuffers {
+            backend_state_pages::ReadBuffers {
                 pages,
                 recurrent_states,
                 conv_states,
@@ -759,7 +754,7 @@ impl GDNStatePageIO {
         assert!(num_state_io_requests > 0, "GDN publish recording requires I/O requests");
         recorder.record(ReplayOp::opaque(self.write.invoke(
             Self::shape(num_state_io_requests),
-            GDNStatePageBatchWriteBuffers {
+            backend_state_pages::WriteBuffers {
                 pages,
                 recurrent_states,
                 conv_states,
@@ -770,12 +765,12 @@ impl GDNStatePageIO {
         )));
     }
 
-    fn shape(num_state_io_requests: u32) -> GDNStatePageBatchShape {
-        GDNStatePageBatchShape { num_state_io_requests }
+    fn shape(num_state_io_requests: u32) -> backend_state_pages::Shape {
+        backend_state_pages::Shape { num_state_io_requests }
     }
 
-    fn config(layout: GDNStateLayout) -> GDNStatePageBatchConfig {
-        GDNStatePageBatchConfig {
+    fn config(layout: GDNStateLayout) -> backend_state_pages::Config {
+        backend_state_pages::Config {
             num_gdn_layers: layout.num_gdn_layers.try_into().expect("GDN layer count must fit u32"),
             num_state_slots: layout
                 .num_state_slots

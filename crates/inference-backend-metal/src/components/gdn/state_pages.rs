@@ -6,23 +6,23 @@ use crate::metal::Device;
 use crate::metal::Kernel;
 use crate::metal::Operator;
 
-const GDN_STATE_PAGE_WRITE_SOURCE: &str = include_str!("metal/gdn_state_page_write.metal");
-const GDN_STATE_PAGE_READ_SOURCE: &str = include_str!("metal/gdn_state_page_read.metal");
+const GDN_STATE_PAGE_WRITE_SOURCE: &str = include_str!("../metal/gdn_state_page_write.metal");
+const GDN_STATE_PAGE_READ_SOURCE: &str = include_str!("../metal/gdn_state_page_read.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GDNStatePageThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GDNStatePageKernelSpecialization {
-    thread_block: GDNStatePageThreadBlockSpecialization,
+struct KernelConstants {
+    thread_block: ThreadBlockConstants,
 }
 
-impl GDNStatePageKernelSpecialization {
+impl KernelConstants {
     fn current() -> Self {
         Self {
-            thread_block: GDNStatePageThreadBlockSpecialization { required_threads: 256 },
+            thread_block: ThreadBlockConstants { required_threads: 256 },
         }
     }
 }
@@ -31,7 +31,7 @@ impl GDNStatePageKernelSpecialization {
 ///
 /// Each state-I/O request selects one logical state version, one recurrent physical
 /// slot, one convolution physical slot, and its page IDs across every GDN layer.
-/// One `GDNStatePageReadTask` or `GDNStatePageWriteTask` maps 1:1 to one
+/// One `ReadThreadBlockTask` or `WriteThreadBlockTask` maps 1:1 to one
 /// threadblock and has the complete logical coordinates
 /// `{ state_io_request_index, gdn_layer_index, state_kind, page_index_in_state }`.
 /// The grid and shape values derive every coordinate, so no Task value,
@@ -39,7 +39,7 @@ impl GDNStatePageKernelSpecialization {
 /// `recurrent_state_slot`, and `conv_state_slot` remain data inputs rather than
 /// Task coordinates. `state_kind` selects the applicable physical slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GDNStatePageBatchConfig {
+pub struct Config {
     pub num_gdn_layers: u32,
     pub num_state_slots: u32,
     pub recurrent_state_bytes: u32,
@@ -47,7 +47,7 @@ pub struct GDNStatePageBatchConfig {
     pub page_bytes: u32,
 }
 
-impl GDNStatePageBatchConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.num_gdn_layers > 0);
         assert!(self.num_state_slots > 0);
@@ -59,13 +59,13 @@ impl GDNStatePageBatchConfig {
         assert_eq!(self.page_bytes % (4 * size_of::<f32>() as u32), 0);
     }
 
-    pub fn validate_shape(self, shape: GDNStatePageBatchShape) {
+    pub fn validate_shape(self, shape: Shape) {
         self.validate();
         shape.validate();
         self.num_total_pages(shape);
     }
 
-    pub fn state_slots_bytes(self, shape: GDNStatePageBatchShape) -> usize {
+    pub fn state_slots_bytes(self, shape: Shape) -> usize {
         checked_product(
             "GDN state-slot metadata byte length",
             &[shape.num_state_io_requests as usize, size_of::<u32>()],
@@ -83,7 +83,7 @@ impl GDNStatePageBatchConfig {
         )
     }
 
-    fn num_total_pages(self, shape: GDNStatePageBatchShape) -> usize {
+    fn num_total_pages(self, shape: Shape) -> usize {
         let pages_per_layer = self
             .recurrent_state_bytes
             .div_ceil(self.page_bytes)
@@ -103,18 +103,18 @@ impl GDNStatePageBatchConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GDNStatePageBatchShape {
+pub struct Shape {
     pub num_state_io_requests: u32,
 }
 
-impl GDNStatePageBatchShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_state_io_requests > 0);
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct GDNStatePageBatchWriteBuffers<'a> {
+pub struct WriteBuffers<'a> {
     pub pages: &'a Buffer,
     pub recurrent_states: &'a Buffer,
     pub conv_states: &'a Buffer,
@@ -123,28 +123,24 @@ pub struct GDNStatePageBatchWriteBuffers<'a> {
     pub conv_state_slots: &'a Buffer,
 }
 
-pub struct GDNStatePageBatchWrite {
-    config: GDNStatePageBatchConfig,
-    specialization: GDNStatePageKernelSpecialization,
+pub struct Write {
+    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl GDNStatePageBatchWrite {
-    pub fn new(device: &Device, config: GDNStatePageBatchConfig) -> Self {
+impl Write {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
-            specialization: GDNStatePageKernelSpecialization::current(),
+            constants: KernelConstants::current(),
             kernel: Kernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_batch_write_f32"),
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GDNStatePageBatchShape,
-        buffers: GDNStatePageBatchWriteBuffers<'a>,
-    ) -> GDNStatePageBatchWriteInvocation<'a> {
-        GDNStatePageBatchWriteInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: WriteBuffers<'a>) -> WriteInvocation<'a> {
+        WriteInvocation {
             kernel: self,
             shape,
             buffers,
@@ -152,13 +148,13 @@ impl GDNStatePageBatchWrite {
     }
 }
 
-pub struct GDNStatePageBatchWriteInvocation<'a> {
-    kernel: &'a GDNStatePageBatchWrite,
-    shape: GDNStatePageBatchShape,
-    buffers: GDNStatePageBatchWriteBuffers<'a>,
+pub struct WriteInvocation<'a> {
+    kernel: &'a Write,
+    shape: Shape,
+    buffers: WriteBuffers<'a>,
 }
 
-impl Operator for GDNStatePageBatchWriteInvocation<'_> {
+impl Operator for WriteInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let config = self.kernel.config;
@@ -179,12 +175,12 @@ impl Operator for GDNStatePageBatchWriteInvocation<'_> {
         recorder.set_u32(13, config.page_bytes);
         recorder.dispatch_threadblocks(
             (config.num_total_pages(self.shape), 1, 1),
-            (self.kernel.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.kernel.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-impl GDNStatePageBatchWriteInvocation<'_> {
+impl WriteInvocation<'_> {
     fn validate(&self) {
         let config = self.kernel.config;
         config.validate_shape(self.shape);
@@ -197,7 +193,7 @@ impl GDNStatePageBatchWriteInvocation<'_> {
 }
 
 #[derive(Clone, Copy)]
-pub struct GDNStatePageBatchReadBuffers<'a> {
+pub struct ReadBuffers<'a> {
     pub pages: &'a Buffer,
     pub recurrent_states: &'a Buffer,
     pub conv_states: &'a Buffer,
@@ -206,28 +202,24 @@ pub struct GDNStatePageBatchReadBuffers<'a> {
     pub conv_state_slots: &'a Buffer,
 }
 
-pub struct GDNStatePageBatchRead {
-    config: GDNStatePageBatchConfig,
-    specialization: GDNStatePageKernelSpecialization,
+pub struct Read {
+    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl GDNStatePageBatchRead {
-    pub fn new(device: &Device, config: GDNStatePageBatchConfig) -> Self {
+impl Read {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
-            specialization: GDNStatePageKernelSpecialization::current(),
+            constants: KernelConstants::current(),
             kernel: Kernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_batch_read_f32"),
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GDNStatePageBatchShape,
-        buffers: GDNStatePageBatchReadBuffers<'a>,
-    ) -> GDNStatePageBatchReadInvocation<'a> {
-        GDNStatePageBatchReadInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: ReadBuffers<'a>) -> ReadInvocation<'a> {
+        ReadInvocation {
             kernel: self,
             shape,
             buffers,
@@ -235,13 +227,13 @@ impl GDNStatePageBatchRead {
     }
 }
 
-pub struct GDNStatePageBatchReadInvocation<'a> {
-    kernel: &'a GDNStatePageBatchRead,
-    shape: GDNStatePageBatchShape,
-    buffers: GDNStatePageBatchReadBuffers<'a>,
+pub struct ReadInvocation<'a> {
+    kernel: &'a Read,
+    shape: Shape,
+    buffers: ReadBuffers<'a>,
 }
 
-impl Operator for GDNStatePageBatchReadInvocation<'_> {
+impl Operator for ReadInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let config = self.kernel.config;
@@ -262,12 +254,12 @@ impl Operator for GDNStatePageBatchReadInvocation<'_> {
         recorder.set_u32(13, config.page_bytes);
         recorder.dispatch_threadblocks(
             (config.num_total_pages(self.shape), 1, 1),
-            (self.kernel.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.kernel.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-impl GDNStatePageBatchReadInvocation<'_> {
+impl ReadInvocation<'_> {
     fn validate(&self) {
         let config = self.kernel.config;
         config.validate_shape(self.shape);
@@ -281,33 +273,33 @@ impl GDNStatePageBatchReadInvocation<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::GDNStatePageBatchConfig;
-    use super::GDNStatePageBatchRead;
-    use super::GDNStatePageBatchReadBuffers;
-    use super::GDNStatePageBatchShape;
-    use super::GDNStatePageBatchWrite;
-    use super::GDNStatePageBatchWriteBuffers;
+    use super::Config;
+    use super::Read;
+    use super::ReadBuffers;
+    use super::Shape;
+    use super::Write;
+    use super::WriteBuffers;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Stream;
 
     #[test]
-    fn test_read_and_write_share_the_state_page_specialization() {
-        let specialization = super::GDNStatePageKernelSpecialization::current();
-        assert_eq!(specialization.thread_block.required_threads, 256);
+    fn test_read_and_write_share_the_state_page_constants() {
+        let constants = super::KernelConstants::current();
+        assert_eq!(constants.thread_block.required_threads, 256);
     }
 
     #[test]
     #[should_panic(expected = "GDN state-page batch pages exceeds the shader u32 count domain")]
     fn test_batch_shape_rejects_shader_count_overflow() {
-        GDNStatePageBatchConfig {
+        Config {
             num_gdn_layers: 1 << 30,
             num_state_slots: 1,
             recurrent_state_bytes: 16,
             conv_state_bytes: 48,
             page_bytes: 16,
         }
-        .num_total_pages(GDNStatePageBatchShape {
+        .num_total_pages(Shape {
             num_state_io_requests: 1,
         });
     }
@@ -316,16 +308,16 @@ mod tests {
     fn test_multi_layer_write_read_preserves_page_layout_and_unselected_slots() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = GDNStatePageBatchConfig {
+        let config = Config {
             num_gdn_layers: 2,
             num_state_slots: 3,
             recurrent_state_bytes: 8 * size_of::<f32>() as u32,
             conv_state_bytes: 4 * size_of::<f32>() as u32,
             page_bytes: 32,
         };
-        let page_read = GDNStatePageBatchRead::new(&device, config);
-        let page_write = GDNStatePageBatchWrite::new(&device, config);
-        let shape = GDNStatePageBatchShape {
+        let page_read = Read::new(&device, config);
+        let page_write = Write::new(&device, config);
+        let shape = Shape {
             num_state_io_requests: 2,
         };
         let recurrent_values = (0..48).map(|value| value as f32 + 10.0).collect::<Vec<_>>();
@@ -344,7 +336,7 @@ mod tests {
         let mut write = stream.create_replay_program();
         write.record(page_write.invoke(
             shape,
-            GDNStatePageBatchWriteBuffers {
+            WriteBuffers {
                 pages: &pages,
                 recurrent_states: &recurrent_source,
                 conv_states: &conv_source,
@@ -372,7 +364,7 @@ mod tests {
         let mut read = stream.create_replay_program();
         read.record(page_read.invoke(
             shape,
-            GDNStatePageBatchReadBuffers {
+            ReadBuffers {
                 pages: &pages,
                 recurrent_states: &recurrent_target,
                 conv_states: &conv_target,

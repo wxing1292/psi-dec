@@ -6,11 +6,14 @@ use inference_executor_core::attn::gdn::reference::GDNRecurrentReferenceInput;
 use inference_executor_core::attn::gdn::reference::gdn_recurrent_reference;
 use inference_executor_core::attn::gdn::reference::gdn_short_conv_reference;
 
-use super::GDNCompute;
-use super::GDNComputeBuffers;
-use super::GDNComputeConfig;
-use super::GDNComputeShape;
-use super::GDNComputeSpecialization;
+use super::Buffers;
+use super::Compute;
+use super::Config;
+use super::Registry;
+use super::Selector;
+use super::Shape;
+use super::VariantConstants;
+use super::VariantKey;
 use crate::metal::Buffer;
 use crate::metal::Device;
 use crate::metal::Dtype;
@@ -23,30 +26,30 @@ const NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("test.gd
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_tokens");
 
 #[test]
-fn test_final_state_recurrent_specialization_selection() {
+fn test_final_recurrent_state_constants_selection() {
     let mut config = fixture_config();
     assert_eq!(
-        GDNComputeSpecialization::from_config(config)
+        VariantConstants::from_config(config)
             .kernels
-            .final_state_recurrent
+            .final_recurrent_state
             .thread_block
             .num_v_rows,
         8
     );
     config.v_head_dim = 12;
     assert_eq!(
-        GDNComputeSpecialization::from_config(config)
+        VariantConstants::from_config(config)
             .kernels
-            .final_state_recurrent
+            .final_recurrent_state
             .thread_block
             .num_v_rows,
         4
     );
     config.v_head_dim = 4;
     assert_eq!(
-        GDNComputeSpecialization::from_config(config)
+        VariantConstants::from_config(config)
             .kernels
-            .final_state_recurrent
+            .final_recurrent_state
             .thread_block
             .num_v_rows,
         4
@@ -54,83 +57,75 @@ fn test_final_state_recurrent_specialization_selection() {
 }
 
 #[test]
-fn test_compute_specialization_defines_each_kernel_thread_block() {
-    let specialization = GDNComputeSpecialization::from_config(fixture_config());
-    assert_eq!(specialization.kernels.short_conv.thread_block.required_threads, 256);
+fn test_compute_constants_defines_each_kernel_thread_block() {
+    let constants = VariantConstants::from_config(fixture_config());
+    assert_eq!(constants.kernels.short_conv.thread_block.required_threads, 256);
     assert_eq!(
-        specialization
-            .kernels
-            .candidate_conv_state
-            .thread_block
-            .required_threads,
+        constants.kernels.candidate_conv_state.thread_block.required_threads,
         256
     );
     assert_eq!(
-        specialization
-            .kernels
-            .final_state_recurrent
-            .thread_block
-            .num_qk_dim_threads,
+        constants.kernels.final_recurrent_state.thread_block.num_qk_dim_threads,
         32
     );
-    assert_eq!(specialization.kernels.final_state_recurrent.thread_block.num_v_rows, 8);
+    assert_eq!(constants.kernels.final_recurrent_state.thread_block.num_v_rows, 8);
     assert_eq!(
-        specialization
-            .kernels
-            .final_state_recurrent
-            .thread_block
-            .required_threads,
+        constants.kernels.final_recurrent_state.thread_block.required_threads,
         256
     );
     assert_eq!(
-        specialization
+        constants
             .kernels
-            .candidate_state_recurrent
+            .candidate_recurrent_state
             .thread_block
             .num_qk_dim_threads,
         32
     );
     assert_eq!(
-        specialization
-            .kernels
-            .candidate_state_recurrent
-            .thread_block
-            .num_simdgroups,
+        constants.kernels.candidate_recurrent_state.thread_block.num_simdgroups,
         2
     );
     assert_eq!(
-        specialization
+        constants
             .kernels
-            .candidate_state_recurrent
+            .candidate_recurrent_state
             .thread_block
             .simdgroup
             .num_v_rows,
         2
     );
+    assert_eq!(constants.kernels.candidate_recurrent_state.thread_block.num_v_rows(), 4);
     assert_eq!(
-        specialization
+        constants
             .kernels
-            .candidate_state_recurrent
-            .thread_block
-            .num_v_rows(),
-        4
-    );
-    assert_eq!(
-        specialization
-            .kernels
-            .candidate_state_recurrent
+            .candidate_recurrent_state
             .thread_block
             .required_threads,
         64
     );
-    assert_eq!(
-        specialization.kernels.output_norm_gate.thread_block.required_threads,
-        128
-    );
+    assert_eq!(constants.kernels.output_norm_gate.thread_block.required_threads, 128);
 }
 
 #[test]
-#[should_panic(expected = "GDN candidate recurrent specialization requires Dv divisible by its SIMDgroup V-row count")]
+fn test_selector_returns_registered_recurrent_variant() {
+    let device = Device::system_default();
+    let registry = Registry::new(&device, fixture_config());
+    let selector = Selector;
+
+    let (key, variant) = selector.select(
+        &registry,
+        Shape {
+            num_total_reqs: 2,
+            num_total_tokens: 5,
+        },
+    );
+
+    assert_eq!(key, VariantKey::Recurrent);
+    assert_eq!(variant.constants, VariantConstants::from_config(fixture_config()));
+}
+
+#[test]
+#[should_panic(expected = "GDN candidate recurrent-state constants require Dv divisible by the SIMDgroup V-row count")]
 fn test_candidate_register_v_rejects_v_dim_tail() {
     let mut config = fixture_config();
     config.v_head_dim = 5;
@@ -156,7 +151,7 @@ fn test_candidate_register_v_rejects_incomplete_grouped_launch_at_init() {
 #[test]
 #[should_panic(expected = "GDN convolution exceeds the shader u32 count domain")]
 fn test_shape_rejects_shader_count_overflow() {
-    let config = GDNComputeConfig {
+    let config = Config {
         num_qk_heads: 1,
         qk_head_dim: 32,
         num_v_heads: 1,
@@ -165,19 +160,19 @@ fn test_shape_rejects_shader_count_overflow() {
         q_scale: 1.0,
         norm_eps: 1.0e-6,
     };
-    let shape = GDNComputeShape {
+    let shape = Shape {
         num_total_reqs: 1,
         num_total_tokens: 1 << 30,
     };
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let kernels = GDNCompute::new(&device, config);
+    let kernels = Compute::new(&device, config);
     let buffer = Buffer::new_zeroed(&device, size_of::<f32>());
     let mut builder = stream.create_replay_program();
 
     builder.record(kernels.invoke(
         shape,
-        GDNComputeBuffers {
+        Buffers {
             qkv: &buffer,
             a: &buffer,
             b: &buffer,
@@ -205,7 +200,7 @@ fn test_shape_rejects_shader_count_overflow() {
 }
 
 #[test]
-fn test_final_state_recurrent_fixed() {
+fn test_final_recurrent_state_fixed() {
     let shape = fixture_shape(1, 1);
     let cu_tokens = vec![0_u32, 1];
     let src_state_slots = vec![0_u32];
@@ -266,7 +261,7 @@ fn test_final_state_recurrent_fixed() {
 }
 
 #[test]
-fn test_final_state_recurrent_random() {
+fn test_final_recurrent_state_random() {
     let random_seed = 0x729B_40D6;
     let shape = fixture_shape(1, 3);
     let cu_tokens = vec![0_u32, 3];
@@ -413,7 +408,7 @@ fn test_candidate_state_preserves_distinct_source_slots() {
 
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = GDNComputeConfig {
+    let config = Config {
         num_qk_heads: 2,
         qk_head_dim: 128,
         num_v_heads: 4,
@@ -423,7 +418,7 @@ fn test_candidate_state_preserves_distinct_source_slots() {
         norm_eps: 1.0e-6,
     };
     let shape = fixture_shape(NUM_REQS as u32, (NUM_REQS * ROWS_PER_REQ) as u32);
-    let kernels = GDNCompute::new(&device, config);
+    let kernels = Compute::new(&device, config);
     let qkv_values = fixture_values(config.num_qkv_values(shape), 0.03125, 3);
     let a_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
     let b_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 7);
@@ -476,7 +471,7 @@ fn test_candidate_state_preserves_distinct_source_slots() {
         Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
     let norm_gated_output =
         Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
-    let buffers = GDNComputeBuffers {
+    let buffers = Buffers {
         qkv: &qkv,
         a: &a,
         b: &b,
@@ -594,7 +589,7 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
     let stream = Stream::new(&device);
     let config = fixture_config();
     let shape = fixture_shape(2, 2);
-    let kernels = GDNCompute::new(&device, config);
+    let kernels = Compute::new(&device, config);
     let qkv_values = fixture_values(config.num_qkv_values(shape), 0.03125, 3);
     let a_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
     let b_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 7);
@@ -642,7 +637,7 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_with_candidate_state_update_bucketed(
         shape,
-        GDNComputeBuffers {
+        Buffers {
             qkv: &qkv,
             a: &a,
             b: &b,
@@ -978,7 +973,7 @@ fn test_candidate_states_above_u32_byte_offset() {
 
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let kernels = GDNCompute::new(&device, fixture_config());
+    let kernels = Compute::new(&device, fixture_config());
     let qkv = Buffer::from_slice(&device, &qkv_values);
     let a = Buffer::from_slice(&device, &a_values);
     let b = Buffer::from_slice(&device, &b_values);
@@ -1034,7 +1029,7 @@ fn test_candidate_states_above_u32_byte_offset() {
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_with_candidate_state_update(
         shape,
-        GDNComputeBuffers {
+        Buffers {
             qkv: &qkv,
             a: &a,
             b: &b,
@@ -1122,7 +1117,7 @@ struct GDNCoreWithCandidateStateOutputs {
 
 #[allow(clippy::too_many_arguments)]
 fn run_gdn_core(
-    shape: GDNComputeShape,
+    shape: Shape,
     qkv_values: &[f32],
     conv_state_values: &[f32],
     recurrent_state_values: &[f32],
@@ -1140,7 +1135,7 @@ fn run_gdn_core(
     const STATE_PREFIX_VALUES: usize = 7;
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let kernels = GDNCompute::new(&device, fixture_config());
+    let kernels = Compute::new(&device, fixture_config());
     let qkv = Buffer::from_slice(&device, qkv_values);
     let a = Buffer::from_slice(&device, a_values);
     let b = Buffer::from_slice(&device, b_values);
@@ -1180,7 +1175,7 @@ fn run_gdn_core(
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke(
         shape,
-        GDNComputeBuffers {
+        Buffers {
             qkv: &qkv,
             a: &a,
             b: &b,
@@ -1222,7 +1217,7 @@ fn run_gdn_core(
 
 #[allow(clippy::too_many_arguments)]
 fn run_gdn_core_with_candidate_state_update(
-    shape: GDNComputeShape,
+    shape: Shape,
     qkv_values: &[f32],
     conv_state_values: &[f32],
     recurrent_state_values: &[f32],
@@ -1241,7 +1236,7 @@ fn run_gdn_core_with_candidate_state_update(
     const STATE_PREFIX_VALUES: usize = 7;
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let kernels = GDNCompute::new(&device, fixture_config());
+    let kernels = Compute::new(&device, fixture_config());
     let qkv = Buffer::from_slice(&device, qkv_values);
     let a = Buffer::from_slice(&device, a_values);
     let b = Buffer::from_slice(&device, b_values);
@@ -1279,7 +1274,7 @@ fn run_gdn_core_with_candidate_state_update(
     );
 
     let mut builder = stream.create_replay_program();
-    let core = GDNComputeBuffers {
+    let core = Buffers {
         qkv: &qkv,
         a: &a,
         b: &b,
@@ -1339,7 +1334,7 @@ fn run_gdn_core_with_candidate_state_update(
 
 #[allow(clippy::too_many_arguments)]
 fn assert_gdn_reference_matches(
-    shape: GDNComputeShape,
+    shape: Shape,
     cu_tokens: &[u32],
     qkv: &[f32],
     conv_state: &[f32],
@@ -1381,12 +1376,7 @@ fn assert_gdn_reference_matches(
     );
 }
 
-fn output_norm_gate_reference(
-    recurrent_output: &[f32],
-    z: &[f32],
-    norm_weight: &[f32],
-    config: GDNComputeConfig,
-) -> Vec<f32> {
+fn output_norm_gate_reference(recurrent_output: &[f32], z: &[f32], norm_weight: &[f32], config: Config) -> Vec<f32> {
     let mut output = Vec::with_capacity(recurrent_output.len());
     for (recurrent_row, z_row) in recurrent_output
         .chunks_exact(config.v_head_dim as usize)
@@ -1407,8 +1397,8 @@ fn output_norm_gate_reference(
     output
 }
 
-fn fixture_shape(num_reqs: u32, num_tokens: u32) -> GDNComputeShape {
-    GDNComputeShape {
+fn fixture_shape(num_reqs: u32, num_tokens: u32) -> Shape {
+    Shape {
         num_total_reqs: num_reqs,
         num_total_tokens: num_tokens,
     }
@@ -1424,8 +1414,8 @@ fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
     )
 }
 
-fn fixture_config() -> GDNComputeConfig {
-    GDNComputeConfig {
+fn fixture_config() -> Config {
+    Config {
         num_qk_heads: 1,
         qk_head_dim: 32,
         num_v_heads: 1,
@@ -1436,7 +1426,7 @@ fn fixture_config() -> GDNComputeConfig {
     }
 }
 
-fn fixture_core(_shape: GDNComputeShape) -> GDNCore {
+fn fixture_core(_shape: Shape) -> GDNCore {
     GDNCore {
         model_layer_index: 0,
         hidden_dim: fixture_config().num_v_heads as usize * fixture_config().v_head_dim as usize,
@@ -1449,12 +1439,12 @@ fn fixture_core(_shape: GDNComputeShape) -> GDNCore {
     }
 }
 
-fn conv_state_slot(arena: &[f32], _shape: GDNComputeShape, state_slot: usize) -> &[f32] {
+fn conv_state_slot(arena: &[f32], _shape: Shape, state_slot: usize) -> &[f32] {
     let conv_state_stride = fixture_config().qkv_dim() as usize * fixture_config().conv_state_len() as usize;
     &arena[state_slot * conv_state_stride..(state_slot + 1) * conv_state_stride]
 }
 
-fn recurrent_state_slot(arena: &[f32], _shape: GDNComputeShape, state_slot: usize) -> &[f32] {
+fn recurrent_state_slot(arena: &[f32], _shape: Shape, state_slot: usize) -> &[f32] {
     let recurrent_state_stride = fixture_config().recurrent_state_stride();
     &arena[state_slot * recurrent_state_stride..(state_slot + 1) * recurrent_state_stride]
 }

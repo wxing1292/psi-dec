@@ -5,12 +5,7 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use inference_backend_metal::components::GDNStatePageBatchConfig;
-use inference_backend_metal::components::GDNStatePageBatchRead;
-use inference_backend_metal::components::GDNStatePageBatchReadBuffers;
-use inference_backend_metal::components::GDNStatePageBatchShape;
-use inference_backend_metal::components::GDNStatePageBatchWrite;
-use inference_backend_metal::components::GDNStatePageBatchWriteBuffers;
+use inference_backend_metal::components::gdn::state_pages;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
@@ -130,15 +125,15 @@ struct StateIOBindings<'a> {
 fn build_restore_replay(
     stream: &Stream,
     num_state_io_requests: u32,
-    config: GDNStatePageBatchConfig,
+    config: state_pages::Config,
     bindings: StateIOBindings<'_>,
     device: &Device,
 ) -> ReplayProgram {
-    let read = GDNStatePageBatchRead::new(device, config);
+    let read = state_pages::Read::new(device, config);
     let mut builder = stream.create_replay_program();
     builder.record(read.invoke(
-        GDNStatePageBatchShape { num_state_io_requests },
-        GDNStatePageBatchReadBuffers {
+        state_pages::Shape { num_state_io_requests },
+        state_pages::ReadBuffers {
             pages: bindings.pages,
             recurrent_states: bindings.recurrent_states,
             conv_states: bindings.conv_states,
@@ -153,15 +148,15 @@ fn build_restore_replay(
 fn build_publish_replay(
     stream: &Stream,
     num_state_io_requests: u32,
-    config: GDNStatePageBatchConfig,
+    config: state_pages::Config,
     bindings: StateIOBindings<'_>,
     device: &Device,
 ) -> ReplayProgram {
-    let write = GDNStatePageBatchWrite::new(device, config);
+    let write = state_pages::Write::new(device, config);
     let mut builder = stream.create_replay_program();
     builder.record(write.invoke(
-        GDNStatePageBatchShape { num_state_io_requests },
-        GDNStatePageBatchWriteBuffers {
+        state_pages::Shape { num_state_io_requests },
+        state_pages::WriteBuffers {
             pages: bindings.pages,
             recurrent_states: bindings.recurrent_states,
             conv_states: bindings.conv_states,
@@ -173,8 +168,8 @@ fn build_publish_replay(
     builder.build()
 }
 
-fn state_io_config(num_state_slots: u32) -> GDNStatePageBatchConfig {
-    GDNStatePageBatchConfig {
+fn state_io_config(num_state_slots: u32) -> state_pages::Config {
+    state_pages::Config {
         num_gdn_layers: 1,
         num_state_slots,
         recurrent_state_bytes: (V_HEADS * V_HEAD_DIM * QK_HEAD_DIM * size_of::<f32>()) as u32,

@@ -1,11 +1,8 @@
-use inference_backend_metal::components::GDNCompute;
-use inference_backend_metal::components::GDNComputeBuffers;
-use inference_backend_metal::components::GDNComputeConfig;
-use inference_backend_metal::components::GDNComputeShape;
 use inference_backend_metal::components::GDNQKVABZSplitBuffers;
 use inference_backend_metal::components::GDNQKVABZSplitConfig;
 use inference_backend_metal::components::GDNQKVABZSplitKernel;
 use inference_backend_metal::components::GDNQKVABZSplitShape;
+use inference_backend_metal::components::gdn::compute as backend_compute;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -172,7 +169,7 @@ pub struct GDN {
     core: GDNCore,
     qkvabz: AffineQuantizedMatmul,
     qkvabz_to_qkv_a_b_z: GDNQKVABZSplitKernel,
-    compute: GDNCompute,
+    compute: backend_compute::Compute,
     output: AffineQuantizedMatmul,
 }
 
@@ -196,7 +193,7 @@ impl GDN {
                 ),
             ),
             qkvabz_to_qkv_a_b_z: GDNQKVABZSplitKernel::new(device, qkvabz_split_config(&core)),
-            compute: GDNCompute::new(device, compute_config(&core, config)),
+            compute: backend_compute::Compute::new(device, compute_config(&core, config)),
             output: AffineQuantizedMatmul::new(
                 device,
                 affine_config(
@@ -404,7 +401,7 @@ impl ReplayLayer for GDN {
             self.qkvabz_to_qkv_a_b_z.invoke(split_shape, split_buffers)
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(split));
-        let compute_buffers = GDNComputeBuffers {
+        let compute_buffers = backend_compute::Buffers {
             qkv: scratch.qkv,
             a: scratch.a,
             b: scratch.b,
@@ -486,8 +483,8 @@ impl ReplayLayer for GDN {
     }
 }
 
-fn compute_config(core: &GDNCore, config: GDNMetalConfig) -> GDNComputeConfig {
-    GDNComputeConfig {
+fn compute_config(core: &GDNCore, config: GDNMetalConfig) -> backend_compute::Config {
+    backend_compute::Config {
         num_qk_heads: core.num_qk_heads.try_into().expect("GDN query/key heads must fit u32"),
         qk_head_dim: core.qk_head_dim.try_into().expect("GDN qk_head_dim must fit u32"),
         num_v_heads: core.num_v_heads.try_into().expect("GDN num_v_heads must fit u32"),
@@ -501,8 +498,8 @@ fn compute_config(core: &GDNCore, config: GDNMetalConfig) -> GDNComputeConfig {
     }
 }
 
-fn compute_shape(shape: GDNReplayShape) -> GDNComputeShape {
-    GDNComputeShape {
+fn compute_shape(shape: GDNReplayShape) -> backend_compute::Shape {
+    backend_compute::Shape {
         num_total_reqs: shape.num_total_reqs,
         num_total_tokens: shape.num_total_tokens,
     }
