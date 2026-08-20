@@ -1,7 +1,6 @@
 use std::mem::size_of;
 
 use super::MAX_TOP_K;
-use super::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
 use super::SAMPLING_SOURCE;
 use super::checked_bytes;
 use super::checked_num_threads;
@@ -26,9 +25,7 @@ struct SparseRejectionSampleKernelSpecialization {
 impl SparseRejectionSampleKernelSpecialization {
     fn current() -> Self {
         Self {
-            thread_block: SparseRejectionSampleThreadBlockSpecialization {
-                required_threads: SAMPLING_NUM_THREADS_PER_THREADBLOCK,
-            },
+            thread_block: SparseRejectionSampleThreadBlockSpecialization { required_threads: 256 },
         }
     }
 }

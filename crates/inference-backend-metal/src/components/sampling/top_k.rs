@@ -1,5 +1,4 @@
 use super::MAX_TOP_K;
-use super::SAMPLING_NUM_THREADS_PER_THREADBLOCK;
 use super::SAMPLING_SOURCE;
 use super::checked_bytes;
 use super::checked_num_threads;
@@ -72,7 +71,7 @@ impl TopKMapPlanner {
             reduction_limit: TOP_K_REDUCTION_LIMIT,
             thread_block: TopKMapThreadBlockSpecialization {
                 max_vocab_tokens: TOP_K_VOCAB_TILE_SIZE,
-                required_threads: SAMPLING_NUM_THREADS_PER_THREADBLOCK,
+                required_threads: 256,
             },
         }
     }
@@ -115,9 +114,7 @@ struct TopKReduceKernelSpecialization {
 impl TopKReduceKernelSpecialization {
     fn current() -> Self {
         Self {
-            thread_block: TopKReduceThreadBlockSpecialization {
-                required_threads: SAMPLING_NUM_THREADS_PER_THREADBLOCK,
-            },
+            thread_block: TopKReduceThreadBlockSpecialization { required_threads: 256 },
         }
     }
 }
