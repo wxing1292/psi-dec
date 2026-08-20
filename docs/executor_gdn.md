@@ -124,6 +124,9 @@ request owns.
 
 ## Kernel specialization and thread-block tasks
 
+Use [GPU execution vocabulary](gpu_execution.md) for the shared launch, specialization, task, tile, layout, and planner
+terms. This section defines the GDN-specific mapping.
+
 `GDNCompute::new` derives one `GDNComputeSpecialization` from `GDNComputeConfig`. This is an initialization-time static
 operation. GDN does not use a runtime registry or planner because the current compute graph has no
 workload-dependent implementation choice.

@@ -5,41 +5,10 @@ facts. It also records the scope of the current design change.
 
 ## Reference vocabulary
 
-The execution hierarchy follows the concepts in
-[Modern GPU Programming for MLSys](https://mlc.ai/modern-gpu-programming-for-mlsys/). The project uses `threadblock`
-for backend-independent code. Metal source uses `threadgroup` and `simdgroup` at the backend boundary.
+Use [GPU execution vocabulary](gpu_execution.md) for the shared launch, specialization, task, tile, layout, and planner
+terms. This section defines the SDPA-specific mapping.
 
-Use the MLC material as a conceptual reference. Do not copy Blackwell-specific CTA, warpgroup, TMA, TMEM, or tile-size
-names into the project API.
-
-### Kernel execution
-
-Use these project relations:
-
-```text
-KernelLaunch
-    = CompiledKernel
-    + KernelArguments
-    + KernelExecutionConfiguration
-
-CompiledKernel
-    = compile(KernelSource, KernelSpecialization)
-```
-
-`KernelExecutionConfiguration` contains `grid_dimensions` and `thread_block_dimensions`. It does not contain a Grid
-object. A launch creates this execution hierarchy:
-
-```text
-KernelLaunch
-    -> one Grid
-    -> many ThreadBlocks
-    -> many Threads per ThreadBlock
-```
-
-All threads execute the same `CompiledKernel`. All threads can read the same `KernelArguments`. Each thread has a
-different `thread_block_index` and `thread_index`.
-
-### Kernel specialization
+### SDPA kernel specialization
 
 The Map specialization uses this hierarchy:
 
@@ -176,9 +145,6 @@ output has only one partial state.
 
 The generic `PartialAttentionState` boundary is representation-independent. It does not require separate numerator or
 denominator buffers.
-
-GDN, dense MLP, and MoE can reuse the execution hierarchy. Each component must define its own task relation. They must
-not copy SDPA Map/Reduce or `PartialAttentionState` concepts unless their mathematics has the same contract.
 
 ## Current implementation facts
 

@@ -1,0 +1,161 @@
+# GPU Execution Vocabulary
+
+This document defines the shared GPU execution vocabulary for the repository. Component documents define the
+component-specific operation, task, specialization, and data layout.
+
+The vocabulary follows the execution hierarchy and scope concepts in
+[Modern GPU Programming for MLSys](https://mlc.ai/modern-gpu-programming-for-mlsys/). Use that material as a conceptual
+reference. Do not copy Blackwell-specific CTA, warpgroup, TMA, TMEM, or tile-size names into a backend-independent API.
+
+The project uses `threadblock` in backend-independent identifiers. Metal source uses `threadgroup` and `simdgroup` at
+the backend boundary.
+
+## Execution hierarchy
+
+Use these project relations:
+
+```text
+KernelLaunch
+    = CompiledKernel
+    + KernelArguments
+    + KernelExecutionConfiguration
+
+CompiledKernel
+    = compile(KernelSource, KernelSpecialization)
+```
+
+`KernelExecutionConfiguration` contains `grid_dimensions` and `thread_block_dimensions`. It does not contain an
+executed Grid object. A launch creates this execution hierarchy:
+
+```text
+KernelLaunch
+    -> one Grid
+    -> many ThreadBlocks
+    -> many Threads per ThreadBlock
+```
+
+All threads execute the same `CompiledKernel`. All threads can read the same `KernelArguments`. Each thread has a
+different `thread_block_index` and `thread_index`.
+
+The hardware hierarchy and the semantic work hierarchy are related but distinct:
+
+```text
+KernelLaunch
+├── CompiledKernel
+│   ├── KernelSource
+│   └── KernelSpecialization
+├── KernelArguments
+└── KernelExecutionConfiguration
+    ├── grid_dimensions
+    └── thread_block_dimensions
+
+one ThreadBlock
+└── component-defined ThreadBlockTask
+    └── component-defined ThreadTask per Thread
+```
+
+A non-persistent kernel can define a `1:1` relation between `ThreadBlock` and `ThreadBlockTask`. This relation is a
+kernel contract. It is not a global GPU programming rule. Each component must state its relation.
+
+## Static specialization and dynamic execution
+
+`KernelSpecialization` contains compile-time choices. Group fields by the scope that owns them:
+
+```text
+ComponentSpecialization
+├── model or storage geometry
+└── kernels
+    └── one semantic kernel phase
+        ├── thread_block
+        │   └── collective thread-block properties
+        └── optional lower scope
+            └── simdgroup properties
+```
+
+Use nesting to show scope. Do not repeat the scope in each nested field name.
+
+- `max_*` is a compile-time upper bound.
+- `num_*` is an exact count in its stated scope.
+- `required_threads` is a compile-time launch requirement.
+- `KernelExecutionConfiguration.thread_block_dimensions` contains the actual launch dimensions.
+
+The required and actual thread counts must match.
+
+`KernelArguments` contains launch data. It can contain buffers, metadata, and scalar values. Do not copy a static
+specialization value into `KernelArguments` only because the shader uses that value.
+
+Dynamic workload shapes can derive tasks and an execution configuration. They do not select a kernel unless the
+component has multiple legal implementations with a workload-dependent choice.
+
+## Tasks, tiles, and layouts
+
+A task describes semantic work. For a component-specific non-persistent kernel, use this model:
+
+```text
+ThreadBlockTask
+    = derive(
+        KernelArguments,
+        thread_block_index,
+        KernelSpecialization,
+      )
+
+ThreadTask
+    = derive(
+        ThreadBlockTask,
+        thread_index,
+        KernelSpecialization,
+      )
+```
+
+These are semantic definitions. The CPU does not have to construct or upload task objects. A kernel can derive task
+coordinates from grid indices and compact metadata.
+
+A tile is a bounded subregion of tensor coordinates used by an implementation. A tile is not a launch, an execution
+configuration, or a generic task object.
+
+For GEMM, `BM`, `BN`, and `BK` describe operand and output subregions. `BK` is an implementation loop extent. For SDPA
+or recurrence, use component coordinates such as Q-token ranges, KV-token ranges, head ranges, or V-row ranges. Do not
+force these coordinates into GEMM names when the mathematical domains differ.
+
+A layout maps logical coordinates to storage locations or thread ownership. State the coordinate domains and owning
+scope. Do not use `Tile`, `Task`, or `Layout` as an unqualified substitute for this information.
+
+## Registration and planning
+
+Add a runtime planner only when all of these conditions apply:
+
+1. The component has more than one legal implementation or specialization.
+2. The best choice depends on the dynamic workload.
+3. A complete candidate plan can express dispatch, metadata, scratch, and reduction cost.
+
+Use this ownership model when a planner is necessary:
+
+```text
+StaticProblem
+    -> SpecializationRegistry.supports(...)
+    -> legal KernelSpecializations
+
+DynamicWorkload + each legal specialization
+    -> complete candidate plan
+    -> compare complete-plan cost
+    -> selected plan
+    -> metadata, KernelArguments, and KernelExecutionConfiguration
+```
+
+`supports(...)` must contain correctness and static capability checks. It must not contain workload performance
+thresholds. The planner owns dynamic selection. Recording must not select a second implementation.
+
+Do not add a registry or planner when one static specialization implements the current algorithm. Derive that
+specialization during initialization. Derive each execution configuration from the dynamic shape at recording time.
+
+## Current component mappings
+
+GQA SDPA has multiple legal Map/Reduce specializations and a workload-dependent crossover. It uses a specialization
+registry and a dynamic planner. See [GQA SDPA planning](gqa_sdpa_planner.md).
+
+GDN has one mathematical recurrent algorithm. Its final-state and candidate-state kernels implement different state
+materialization contracts. They are not cost candidates. GDN derives one `GDNComputeSpecialization` during
+initialization and does not use a runtime planner. See [GDN Executor](executor_gdn.md).
+
+Dense MLP and MoE can reuse this hierarchy only where their contracts match. Each component must define its own tasks,
+specializations, layouts, and selection policy.

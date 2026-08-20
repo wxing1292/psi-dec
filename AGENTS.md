@@ -8,6 +8,7 @@ Focused docs:
 - `docs/engineering_conventions.md`: repository-wide naming, layouts, replay/resource safety, optimization, API, and test rules.
 - `docs/core.md`: runtime scheduling, lifecycle, page/cache ownership, executor notifications.
 - `docs/executor.md`: model executor architecture, symmetry, weights, and replay composition.
+- `docs/gpu_execution.md`: shared GPU launch, specialization, task, tile, layout, and planner vocabulary.
 - `docs/executor_sampling.md`: current sampling and sparse rejection source/contracts.
 - `docs/executor_benchmarks.md`: verification, benchmarks, profiling, and performance evidence.
 - `docs/service.md`: model download, server/client operation, logging, and end-to-end checks.

@@ -9,7 +9,7 @@ This guide identifies the document that owns each type of information.
 | Kind | Answers | Documents |
 | --- | --- | --- |
 | Project orientation | What is `psi-dec`, and how do I run or read it? | [README](../README.md) |
-| Architecture | Who owns lifecycle, data, and execution order? | [`core.md`](core.md), [`executor.md`](executor.md), Metal backend [README](../crates/inference-backend-metal/README.md) |
+| Architecture | Who owns lifecycle, data, and execution order? | [`core.md`](core.md), [`executor.md`](executor.md), [`gpu_execution.md`](gpu_execution.md), Metal backend [README](../crates/inference-backend-metal/README.md) |
 | Current components | What source implements this model component today? | [`executor_qwen.md`](executor_qwen.md), [`executor_gqa.md`](executor_gqa.md), [`executor_gdn.md`](executor_gdn.md), [`executor_dense_mlp.md`](executor_dense_mlp.md), [`executor_moe.md`](executor_moe.md), [`executor_sampling.md`](executor_sampling.md) |
 | Qwen3 DSpark | How does the current fixed-block Qwen3 DSpark path work? | [`dspark_design.md`](dspark_design.md) |
 | Workflows | How do I run, verify, benchmark, or profile it? | [`service.md`](service.md), [`executor_benchmarks.md`](executor_benchmarks.md) |
@@ -64,6 +64,7 @@ Sampling uses `sampling`.
 ```text
 high_level.md
 executor.md
+gpu_execution.md
 ../crates/inference-backend-metal/README.md
 the matching component doc
 ```

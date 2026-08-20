@@ -10,7 +10,8 @@ This document gives repository-wide engineering conventions:
 - Test style
 
 [`high_level.md`](high_level.md) defines architecture and ownership boundaries. Each component document defines its
-tensor terms, source owners, and execution paths.
+tensor terms, source owners, and execution paths. [`gpu_execution.md`](gpu_execution.md) defines the shared GPU launch,
+specialization, task, tile, layout, and planner vocabulary.
 
 ## Design decision order
 
