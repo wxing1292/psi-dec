@@ -14,21 +14,8 @@ use inference_backend_metal::components::MoERoutingBuffers;
 use inference_backend_metal::components::MoERoutingConfig;
 use inference_backend_metal::components::MoERoutingKernel;
 use inference_backend_metal::components::MoERoutingShape;
-use inference_backend_metal::components::QuantizedDenseMLP;
-use inference_backend_metal::components::QuantizedDenseMLPBuffers;
-use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
-use inference_backend_metal::components::QuantizedDenseMLPScratch;
-use inference_backend_metal::components::QuantizedDenseMLPShape;
-use inference_backend_metal::components::QuantizedDenseMLPWeights;
-use inference_backend_metal::components::QuantizedSparseMLP;
-use inference_backend_metal::components::QuantizedSparseMLPConfig;
-use inference_backend_metal::components::QuantizedSparseMLPExpertMajorBuffers;
-use inference_backend_metal::components::QuantizedSparseMLPExpertMajorShape;
-use inference_backend_metal::components::QuantizedSparseMLPScratch;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorBuffers;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
-use inference_backend_metal::components::QuantizedSparseMLPWeights;
+use inference_backend_metal::components::dense_mlp;
+use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -82,7 +69,7 @@ pub struct GatedMoEWeights<'a> {
     pub router_weight: &'a Buffer,
     pub router_scales: &'a Buffer,
     pub router_biases: &'a Buffer,
-    pub topk_experts: QuantizedSparseMLPWeights<'a>,
+    pub topk_experts: sparse_mlp::Weights<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -111,7 +98,7 @@ pub struct GatedMoEReplayTopology {
     pub compute_path: GatedMoEComputePath,
     pub router_affine: AffineQuantizedMatmulKernelKind,
     pub shared_expert_gate_affine: Option<AffineQuantizedMatmulKernelKind>,
-    pub shared_experts_dense: Option<QuantizedDenseMLPReplayTopology>,
+    pub shared_experts_dense: Option<dense_mlp::ReplayTopology>,
 }
 
 impl<'a> GatedMoEWeights<'a> {
@@ -129,7 +116,7 @@ pub struct GatedMoESharedExpertsWeights<'a> {
     pub shared_expert_gate_weight: &'a Buffer,
     pub shared_expert_gate_scales: &'a Buffer,
     pub shared_expert_gate_biases: &'a Buffer,
-    pub shared_experts: QuantizedDenseMLPWeights<'a>,
+    pub shared_experts: dense_mlp::Weights<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -204,14 +191,14 @@ pub struct GatedMoE {
     router_softmax: SoftmaxKernel,
     routing: MoERoutingKernel,
     expert_major: MoEExpertMajorKernels,
-    topk_experts: QuantizedSparseMLP,
+    topk_experts: sparse_mlp::Compute,
     shared_experts: Option<GatedMoESharedExperts>,
     combine: MoECombineKernels,
 }
 
 struct GatedMoESharedExperts {
     shared_expert_gate: AffineQuantizedMatmul,
-    mlp: QuantizedDenseMLP,
+    mlp: dense_mlp::Compute,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -283,7 +270,7 @@ impl GatedMoE {
                     core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
                 ),
             ),
-            topk_experts: QuantizedSparseMLP::new(device, topk_experts_config(&core, config)),
+            topk_experts: sparse_mlp::Compute::new(device, topk_experts_config(&core, config)),
             shared_experts: core.shared_experts_core().map(|shared_core| {
                 let gate_shape = core
                     .shared_expert_gate_shape()
@@ -298,7 +285,7 @@ impl GatedMoE {
                             config,
                         ),
                     ),
-                    mlp: QuantizedDenseMLP::new(device, shared_experts_config(&shared_core, config)),
+                    mlp: dense_mlp::Compute::new(device, shared_experts_config(&shared_core, config)),
                 }
             }),
             combine: MoECombineKernels::new(
@@ -450,14 +437,14 @@ impl GatedMoE {
             num_total_tokens,
             self.num_experts_per_token(),
             num_active_tokens_key,
-            QuantizedSparseMLPTokenMajorBuffers {
+            sparse_mlp::TokenMajorBuffers {
                 input: hidden_state,
                 token_indices: scratch.topk_experts.token_indices,
                 expert_indices: scratch.routing.expert_indices,
                 route_indices: scratch.topk_experts.route_indices,
                 routed_hidden: scratch.topk_experts.routed_hidden,
             },
-            QuantizedSparseMLPScratch {
+            sparse_mlp::Scratch {
                 swiglu: scratch.topk_experts.sparse_swiglu,
             },
             weights.topk_experts,
@@ -569,12 +556,12 @@ impl GatedMoE {
             num_total_tokens,
             self.num_experts_per_token(),
             num_active_tokens_key,
-            QuantizedSparseMLPExpertMajorBuffers {
+            sparse_mlp::ExpertMajorBuffers {
                 packed_input: scratch.topk_experts.packed_input,
                 experts_by_route: scratch.topk_experts.experts_by_route,
                 packed_output: scratch.topk_experts.routed_hidden,
             },
-            QuantizedSparseMLPScratch {
+            sparse_mlp::Scratch {
                 swiglu: scratch.topk_experts.sparse_swiglu,
             },
             weights.topk_experts,
@@ -627,14 +614,14 @@ impl GatedMoE {
         self.record_router(recorder, shape, hidden_state, scratch.routing, weights.routing());
         recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_experts.invoke_token_major(
             self.token_major_shape(shape),
-            QuantizedSparseMLPTokenMajorBuffers {
+            sparse_mlp::TokenMajorBuffers {
                 input: hidden_state,
                 token_indices: scratch.topk_experts.token_indices,
                 expert_indices: scratch.routing.expert_indices,
                 route_indices: scratch.topk_experts.route_indices,
                 routed_hidden: scratch.topk_experts.routed_hidden,
             },
-            QuantizedSparseMLPScratch {
+            sparse_mlp::Scratch {
                 swiglu: scratch.topk_experts.sparse_swiglu,
             },
             weights.topk_experts,
@@ -720,15 +707,15 @@ impl GatedMoE {
             },
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_experts.invoke_expert_major(
-            QuantizedSparseMLPExpertMajorShape {
+            sparse_mlp::ExpertMajorShape {
                 num_total_routes: self.num_routes(shape),
             },
-            QuantizedSparseMLPExpertMajorBuffers {
+            sparse_mlp::ExpertMajorBuffers {
                 packed_input: scratch.topk_experts.packed_input,
                 experts_by_route: scratch.topk_experts.experts_by_route,
                 packed_output: scratch.topk_experts.routed_hidden,
             },
-            QuantizedSparseMLPScratch {
+            sparse_mlp::Scratch {
                 swiglu: scratch.topk_experts.sparse_swiglu,
             },
             weights.topk_experts,
@@ -821,11 +808,11 @@ impl GatedMoE {
             .expect("gated MoE shared replay requires a configured shared expert");
         recorder.record(ReplayOp::opaque(shared_experts.mlp.invoke(
             self.shared_experts_dense_shape(shape),
-            QuantizedDenseMLPBuffers {
+            dense_mlp::Buffers {
                 hidden_state: input,
                 next_hidden_state: scratch.hidden,
             },
-            QuantizedDenseMLPScratch {
+            dense_mlp::Scratch {
                 gate_up: scratch.dense_mlp.gate_up,
                 swiglu: scratch.dense_mlp.swiglu,
             },
@@ -864,11 +851,11 @@ impl GatedMoE {
         recorder.record(ReplayOp::opaque(shared_experts.mlp.invoke_bucketed(
             num_total_tokens,
             num_active_tokens_key,
-            QuantizedDenseMLPBuffers {
+            dense_mlp::Buffers {
                 hidden_state: input,
                 next_hidden_state: scratch.hidden,
             },
-            QuantizedDenseMLPScratch {
+            dense_mlp::Scratch {
                 gate_up: scratch.dense_mlp.gate_up,
                 swiglu: scratch.dense_mlp.swiglu,
             },
@@ -890,12 +877,12 @@ impl GatedMoE {
         )));
     }
 
-    fn shared_experts_dense_shape(&self, shape: GatedMoEReplayShape) -> QuantizedDenseMLPShape {
+    fn shared_experts_dense_shape(&self, shape: GatedMoEReplayShape) -> dense_mlp::Shape {
         assert!(
             self.core.has_shared_experts(),
             "gated MoE shared shape requires a configured shared expert"
         );
-        QuantizedDenseMLPShape {
+        dense_mlp::Shape {
             num_total_tokens: shape.num_tokens,
         }
     }
@@ -912,8 +899,8 @@ impl GatedMoE {
         }
     }
 
-    fn token_major_shape(&self, shape: GatedMoEReplayShape) -> QuantizedSparseMLPTokenMajorShape {
-        QuantizedSparseMLPTokenMajorShape {
+    fn token_major_shape(&self, shape: GatedMoEReplayShape) -> sparse_mlp::TokenMajorShape {
+        sparse_mlp::TokenMajorShape {
             num_total_routes: self.num_routes(shape),
             num_total_tokens: shape.num_tokens,
         }
@@ -967,8 +954,8 @@ impl ReplayLayer for GatedMoE {
     }
 }
 
-fn topk_experts_config(core: &GatedMoECore, config: GatedMoEMetalConfig) -> QuantizedSparseMLPConfig {
-    QuantizedSparseMLPConfig {
+fn topk_experts_config(core: &GatedMoECore, config: GatedMoEMetalConfig) -> sparse_mlp::Config {
+    sparse_mlp::Config {
         num_experts: core
             .num_experts
             .try_into()
@@ -987,8 +974,8 @@ fn topk_experts_config(core: &GatedMoECore, config: GatedMoEMetalConfig) -> Quan
     }
 }
 
-fn shared_experts_config(core: &DenseMLPCore, config: GatedMoEMetalConfig) -> QuantizedDenseMLPConfig {
-    QuantizedDenseMLPConfig {
+fn shared_experts_config(core: &DenseMLPCore, config: GatedMoEMetalConfig) -> dense_mlp::Config {
+    dense_mlp::Config {
         hidden_dim: core
             .hidden_dim
             .try_into()

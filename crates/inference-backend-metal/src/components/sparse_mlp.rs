@@ -28,7 +28,7 @@ fn checked_bytes(name: &str, dimensions: &[usize], dtype: Dtype) -> usize {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct QuantizedSparseMLPConfig {
+pub struct Config {
     pub num_experts: u32,
     pub hidden_dim: u32,
     pub intermediate_dim: u32,
@@ -37,7 +37,7 @@ pub struct QuantizedSparseMLPConfig {
     pub dtype: Dtype,
 }
 
-impl QuantizedSparseMLPConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.num_experts > 0);
         assert!(self.hidden_dim > 0);
@@ -86,7 +86,7 @@ impl QuantizedSparseMLPConfig {
         }
     }
 
-    fn token_major_gate_up_shape(self, shape: QuantizedSparseMLPTokenMajorShape) -> GatherAffineQuantizedShape {
+    fn token_major_gate_up_shape(self, shape: TokenMajorShape) -> GatherAffineQuantizedShape {
         shape.validate();
         GatherAffineQuantizedShape {
             num_routes: to_i32(shape.num_total_routes, "sparse MLP route count"),
@@ -94,7 +94,7 @@ impl QuantizedSparseMLPConfig {
         }
     }
 
-    fn token_major_down_shape(self, shape: QuantizedSparseMLPTokenMajorShape) -> GatherAffineQuantizedShape {
+    fn token_major_down_shape(self, shape: TokenMajorShape) -> GatherAffineQuantizedShape {
         shape.validate();
         GatherAffineQuantizedShape {
             num_routes: to_i32(shape.num_total_routes, "sparse MLP route count"),
@@ -102,23 +102,20 @@ impl QuantizedSparseMLPConfig {
         }
     }
 
-    fn expert_major_affine_shape(
-        self,
-        shape: QuantizedSparseMLPExpertMajorShape,
-    ) -> RaggedExpertMajorAffineQuantizedShape {
+    fn expert_major_affine_shape(self, shape: ExpertMajorShape) -> RaggedExpertMajorAffineQuantizedShape {
         shape.validate();
         RaggedExpertMajorAffineQuantizedShape {
             num_routes: to_i32(shape.num_total_routes, "sparse MLP route count"),
         }
     }
 
-    pub fn token_major_input_bytes(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
+    pub fn token_major_input_bytes(self, shape: TokenMajorShape) -> usize {
         self.validate();
         shape.validate();
         self.token_major_input_bytes_unchecked(shape)
     }
 
-    fn token_major_input_bytes_unchecked(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
+    fn token_major_input_bytes_unchecked(self, shape: TokenMajorShape) -> usize {
         checked_bytes(
             "sparse MLP token-major input",
             &[shape.num_total_tokens as usize, self.hidden_dim as usize],
@@ -126,12 +123,12 @@ impl QuantizedSparseMLPConfig {
         )
     }
 
-    pub fn token_major_route_indices_bytes(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
+    pub fn token_major_route_indices_bytes(self, shape: TokenMajorShape) -> usize {
         shape.validate();
         self.token_major_route_indices_bytes_unchecked(shape)
     }
 
-    fn token_major_route_indices_bytes_unchecked(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
+    fn token_major_route_indices_bytes_unchecked(self, shape: TokenMajorShape) -> usize {
         (shape.num_total_routes as usize)
             .checked_mul(size_of::<u32>())
             .expect("sparse MLP route-index byte length must fit usize")
@@ -151,13 +148,13 @@ impl QuantizedSparseMLPConfig {
         )
     }
 
-    pub fn token_major_output_bytes(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
+    pub fn token_major_output_bytes(self, shape: TokenMajorShape) -> usize {
         self.validate();
         shape.validate();
         self.token_major_output_bytes_unchecked(shape)
     }
 
-    pub fn expert_major_input_bytes(self, shape: QuantizedSparseMLPExpertMajorShape) -> usize {
+    pub fn expert_major_input_bytes(self, shape: ExpertMajorShape) -> usize {
         self.validate();
         shape.validate();
         checked_bytes(
@@ -167,7 +164,7 @@ impl QuantizedSparseMLPConfig {
         )
     }
 
-    pub fn expert_major_output_bytes(self, shape: QuantizedSparseMLPExpertMajorShape) -> usize {
+    pub fn expert_major_output_bytes(self, shape: ExpertMajorShape) -> usize {
         self.validate();
         shape.validate();
         checked_bytes(
@@ -177,14 +174,14 @@ impl QuantizedSparseMLPConfig {
         )
     }
 
-    pub fn expert_major_route_indices_bytes(self, shape: QuantizedSparseMLPExpertMajorShape) -> usize {
+    pub fn expert_major_route_indices_bytes(self, shape: ExpertMajorShape) -> usize {
         shape.validate();
         (shape.num_total_routes as usize)
             .checked_mul(size_of::<u32>())
             .expect("sparse MLP expert-major route-index byte length must fit usize")
     }
 
-    fn token_major_output_bytes_unchecked(self, shape: QuantizedSparseMLPTokenMajorShape) -> usize {
+    fn token_major_output_bytes_unchecked(self, shape: TokenMajorShape) -> usize {
         checked_bytes(
             "sparse MLP token-major output",
             &[shape.num_total_routes as usize, self.hidden_dim as usize],
@@ -200,12 +197,12 @@ impl QuantizedSparseMLPConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct QuantizedSparseMLPTokenMajorShape {
+pub struct TokenMajorShape {
     pub num_total_routes: u32,
     pub num_total_tokens: u32,
 }
 
-impl QuantizedSparseMLPTokenMajorShape {
+impl TokenMajorShape {
     pub fn validate(self) {
         assert!(self.num_total_routes > 0);
         assert!(self.num_total_tokens > 0);
@@ -215,11 +212,11 @@ impl QuantizedSparseMLPTokenMajorShape {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct QuantizedSparseMLPExpertMajorShape {
+pub struct ExpertMajorShape {
     pub num_total_routes: u32,
 }
 
-impl QuantizedSparseMLPExpertMajorShape {
+impl ExpertMajorShape {
     pub fn validate(self) {
         to_i32(self.num_total_routes, "sparse MLP route count");
         assert!(self.num_total_routes > 0);
@@ -227,15 +224,15 @@ impl QuantizedSparseMLPExpertMajorShape {
 }
 
 #[derive(Clone, Copy)]
-struct QuantizedSparseMLPBucketedReplay {
+struct BucketedReplay {
     num_total_tokens: u32,
     num_experts_per_token: u32,
     num_active_tokens_key: ReplayParameterKey,
 }
 
-impl QuantizedSparseMLPBucketedReplay {
+impl BucketedReplay {
     fn new(
-        config: QuantizedSparseMLPConfig,
+        config: Config,
         num_total_tokens: u32,
         num_experts_per_token: u32,
         num_active_tokens_key: ReplayParameterKey,
@@ -263,22 +260,22 @@ impl QuantizedSparseMLPBucketedReplay {
         self.num_total_tokens * self.num_experts_per_token
     }
 
-    fn token_major_shape(self) -> QuantizedSparseMLPTokenMajorShape {
-        QuantizedSparseMLPTokenMajorShape {
+    fn token_major_shape(self) -> TokenMajorShape {
+        TokenMajorShape {
             num_total_routes: self.num_total_routes(),
             num_total_tokens: self.num_total_tokens,
         }
     }
 
-    fn expert_major_shape(self) -> QuantizedSparseMLPExpertMajorShape {
-        QuantizedSparseMLPExpertMajorShape {
+    fn expert_major_shape(self) -> ExpertMajorShape {
+        ExpertMajorShape {
             num_total_routes: self.num_total_routes(),
         }
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedSparseMLPTokenMajorBuffers<'a> {
+pub struct TokenMajorBuffers<'a> {
     pub input: &'a Buffer,
     pub token_indices: &'a Buffer,
     pub expert_indices: &'a Buffer,
@@ -287,14 +284,14 @@ pub struct QuantizedSparseMLPTokenMajorBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedSparseMLPExpertMajorBuffers<'a> {
+pub struct ExpertMajorBuffers<'a> {
     pub packed_input: &'a Buffer,
     pub experts_by_route: &'a Buffer,
     pub packed_output: &'a Buffer,
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedSparseMLPWeights<'a> {
+pub struct Weights<'a> {
     pub gate_weight: &'a Buffer,
     pub gate_scales: &'a Buffer,
     pub gate_biases: &'a Buffer,
@@ -307,7 +304,7 @@ pub struct QuantizedSparseMLPWeights<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedSparseMLPScratch<'a> {
+pub struct Scratch<'a> {
     pub swiglu: &'a Buffer,
 }
 
@@ -338,26 +335,26 @@ pub struct QuantizedSparseMLPScratch<'a> {
 ///                                                   v
 ///                                         packed_output [R, H]
 /// ```
-pub struct QuantizedSparseMLP {
-    token_major: QuantizedSparseMLPTokenMajorKernels,
-    expert_major: QuantizedSparseMLPExpertMajorKernels,
+pub struct Compute {
+    token_major: TokenMajorKernels,
+    expert_major: ExpertMajorKernels,
 }
 
-impl QuantizedSparseMLP {
-    pub fn new(device: &Device, config: QuantizedSparseMLPConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         Self {
-            token_major: QuantizedSparseMLPTokenMajorKernels::new(device, config),
-            expert_major: QuantizedSparseMLPExpertMajorKernels::new(device, config),
+            token_major: TokenMajorKernels::new(device, config),
+            expert_major: ExpertMajorKernels::new(device, config),
         }
     }
 
     pub fn invoke_token_major<'a>(
         &'a self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorInvocation<'a> {
+        shape: TokenMajorShape,
+        buffers: TokenMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> TokenMajorInvocation<'a> {
         self.token_major.invoke(shape, buffers, scratch, weights)
     }
 
@@ -368,11 +365,11 @@ impl QuantizedSparseMLP {
         num_total_tokens: u32,
         num_experts_per_token: u32,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorInvocation<'a> {
-        let bucketed_replay = QuantizedSparseMLPBucketedReplay::new(
+        buffers: TokenMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> TokenMajorInvocation<'a> {
+        let bucketed_replay = BucketedReplay::new(
             self.token_major.config,
             num_total_tokens,
             num_experts_per_token,
@@ -384,11 +381,11 @@ impl QuantizedSparseMLP {
 
     pub fn invoke_expert_major<'a>(
         &'a self,
-        shape: QuantizedSparseMLPExpertMajorShape,
-        buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPExpertMajorInvocation<'a> {
+        shape: ExpertMajorShape,
+        buffers: ExpertMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> ExpertMajorInvocation<'a> {
         self.expert_major.invoke(shape, buffers, scratch, weights)
     }
 
@@ -399,11 +396,11 @@ impl QuantizedSparseMLP {
         num_total_tokens: u32,
         num_experts_per_token: u32,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPExpertMajorInvocation<'a> {
-        let bucketed_replay = QuantizedSparseMLPBucketedReplay::new(
+        buffers: ExpertMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> ExpertMajorInvocation<'a> {
+        let bucketed_replay = BucketedReplay::new(
             self.expert_major.config,
             num_total_tokens,
             num_experts_per_token,
@@ -414,20 +411,20 @@ impl QuantizedSparseMLP {
     }
 }
 
-pub struct QuantizedSparseMLPTokenMajorKernels {
-    config: QuantizedSparseMLPConfig,
+pub struct TokenMajorKernels {
+    config: Config,
     gate_up_swiglu: GatherAffineQuantizedGateUpSwiGLUKernel,
     down: GatherAffineQuantizedMatmulKernel,
 }
 
-pub struct QuantizedSparseMLPExpertMajorKernels {
-    config: QuantizedSparseMLPConfig,
+pub struct ExpertMajorKernels {
+    config: Config,
     gate_up_swiglu: RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel,
     down: RaggedExpertMajorAffineQuantizedMatmulKernel,
 }
 
-impl QuantizedSparseMLPTokenMajorKernels {
-    pub fn new(device: &Device, config: QuantizedSparseMLPConfig) -> Self {
+impl TokenMajorKernels {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
@@ -438,12 +435,12 @@ impl QuantizedSparseMLPTokenMajorKernels {
 
     pub fn invoke<'a>(
         &'a self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorInvocation<'a> {
-        QuantizedSparseMLPTokenMajorInvocation {
+        shape: TokenMajorShape,
+        buffers: TokenMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> TokenMajorInvocation<'a> {
+        TokenMajorInvocation {
             kernels: self,
             shape,
             buffers,
@@ -455,12 +452,12 @@ impl QuantizedSparseMLPTokenMajorKernels {
 
     fn invoke_bucketed<'a>(
         &'a self,
-        bucketed_replay: QuantizedSparseMLPBucketedReplay,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorInvocation<'a> {
-        QuantizedSparseMLPTokenMajorInvocation {
+        bucketed_replay: BucketedReplay,
+        buffers: TokenMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> TokenMajorInvocation<'a> {
+        TokenMajorInvocation {
             kernels: self,
             shape: bucketed_replay.token_major_shape(),
             buffers,
@@ -472,12 +469,12 @@ impl QuantizedSparseMLPTokenMajorKernels {
 
     pub fn invoke_gate_up_swiglu<'a>(
         &'a self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation<'a> {
-        QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation {
+        shape: TokenMajorShape,
+        buffers: TokenMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> TokenMajorGateUpSwiGLUInvocation<'a> {
+        TokenMajorGateUpSwiGLUInvocation {
             kernels: self,
             shape,
             buffers,
@@ -489,12 +486,12 @@ impl QuantizedSparseMLPTokenMajorKernels {
 
     pub fn invoke_down<'a>(
         &'a self,
-        shape: QuantizedSparseMLPTokenMajorShape,
-        buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPTokenMajorDownInvocation<'a> {
-        QuantizedSparseMLPTokenMajorDownInvocation {
+        shape: TokenMajorShape,
+        buffers: TokenMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> TokenMajorDownInvocation<'a> {
+        TokenMajorDownInvocation {
             kernels: self,
             shape,
             buffers,
@@ -505,8 +502,8 @@ impl QuantizedSparseMLPTokenMajorKernels {
     }
 }
 
-impl QuantizedSparseMLPExpertMajorKernels {
-    pub fn new(device: &Device, config: QuantizedSparseMLPConfig) -> Self {
+impl ExpertMajorKernels {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
@@ -517,12 +514,12 @@ impl QuantizedSparseMLPExpertMajorKernels {
 
     pub fn invoke<'a>(
         &'a self,
-        shape: QuantizedSparseMLPExpertMajorShape,
-        buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPExpertMajorInvocation<'a> {
-        QuantizedSparseMLPExpertMajorInvocation {
+        shape: ExpertMajorShape,
+        buffers: ExpertMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> ExpertMajorInvocation<'a> {
+        ExpertMajorInvocation {
             kernels: self,
             shape,
             buffers,
@@ -534,12 +531,12 @@ impl QuantizedSparseMLPExpertMajorKernels {
 
     fn invoke_bucketed<'a>(
         &'a self,
-        bucketed_replay: QuantizedSparseMLPBucketedReplay,
-        buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-        scratch: QuantizedSparseMLPScratch<'a>,
-        weights: QuantizedSparseMLPWeights<'a>,
-    ) -> QuantizedSparseMLPExpertMajorInvocation<'a> {
-        QuantizedSparseMLPExpertMajorInvocation {
+        bucketed_replay: BucketedReplay,
+        buffers: ExpertMajorBuffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> ExpertMajorInvocation<'a> {
+        ExpertMajorInvocation {
             kernels: self,
             shape: bucketed_replay.expert_major_shape(),
             buffers,
@@ -550,18 +547,18 @@ impl QuantizedSparseMLPExpertMajorKernels {
     }
 }
 
-pub struct QuantizedSparseMLPTokenMajorInvocation<'a> {
-    kernels: &'a QuantizedSparseMLPTokenMajorKernels,
-    shape: QuantizedSparseMLPTokenMajorShape,
-    buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPScratch<'a>,
-    weights: QuantizedSparseMLPWeights<'a>,
-    bucketed_replay: Option<QuantizedSparseMLPBucketedReplay>,
+pub struct TokenMajorInvocation<'a> {
+    kernels: &'a TokenMajorKernels,
+    shape: TokenMajorShape,
+    buffers: TokenMajorBuffers<'a>,
+    scratch: Scratch<'a>,
+    weights: Weights<'a>,
+    bucketed_replay: Option<BucketedReplay>,
 }
 
-impl Operator for QuantizedSparseMLPTokenMajorInvocation<'_> {
+impl Operator for TokenMajorInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation {
+        TokenMajorGateUpSwiGLUInvocation {
             kernels: self.kernels,
             shape: self.shape,
             buffers: self.buffers,
@@ -570,7 +567,7 @@ impl Operator for QuantizedSparseMLPTokenMajorInvocation<'_> {
             bucketed_replay: self.bucketed_replay,
         }
         .record(recorder);
-        recorder.record_with_barrier_before(QuantizedSparseMLPTokenMajorDownInvocation {
+        recorder.record_with_barrier_before(TokenMajorDownInvocation {
             kernels: self.kernels,
             shape: self.shape,
             buffers: self.buffers,
@@ -581,16 +578,16 @@ impl Operator for QuantizedSparseMLPTokenMajorInvocation<'_> {
     }
 }
 
-pub struct QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation<'a> {
-    kernels: &'a QuantizedSparseMLPTokenMajorKernels,
-    shape: QuantizedSparseMLPTokenMajorShape,
-    buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPScratch<'a>,
-    weights: QuantizedSparseMLPWeights<'a>,
-    bucketed_replay: Option<QuantizedSparseMLPBucketedReplay>,
+pub struct TokenMajorGateUpSwiGLUInvocation<'a> {
+    kernels: &'a TokenMajorKernels,
+    shape: TokenMajorShape,
+    buffers: TokenMajorBuffers<'a>,
+    scratch: Scratch<'a>,
+    weights: Weights<'a>,
+    bucketed_replay: Option<BucketedReplay>,
 }
 
-impl Operator for QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation<'_> {
+impl Operator for TokenMajorGateUpSwiGLUInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         debug_validate_token_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
         let invocation = match self.bucketed_replay {
@@ -632,16 +629,16 @@ impl Operator for QuantizedSparseMLPTokenMajorGateUpSwiGLUInvocation<'_> {
     }
 }
 
-pub struct QuantizedSparseMLPTokenMajorDownInvocation<'a> {
-    kernels: &'a QuantizedSparseMLPTokenMajorKernels,
-    shape: QuantizedSparseMLPTokenMajorShape,
-    buffers: QuantizedSparseMLPTokenMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPScratch<'a>,
-    weights: QuantizedSparseMLPWeights<'a>,
-    bucketed_replay: Option<QuantizedSparseMLPBucketedReplay>,
+pub struct TokenMajorDownInvocation<'a> {
+    kernels: &'a TokenMajorKernels,
+    shape: TokenMajorShape,
+    buffers: TokenMajorBuffers<'a>,
+    scratch: Scratch<'a>,
+    weights: Weights<'a>,
+    bucketed_replay: Option<BucketedReplay>,
 }
 
-impl Operator for QuantizedSparseMLPTokenMajorDownInvocation<'_> {
+impl Operator for TokenMajorDownInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         debug_validate_token_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
         let invocation = match self.bucketed_replay {
@@ -677,16 +674,16 @@ impl Operator for QuantizedSparseMLPTokenMajorDownInvocation<'_> {
     }
 }
 
-pub struct QuantizedSparseMLPExpertMajorInvocation<'a> {
-    kernels: &'a QuantizedSparseMLPExpertMajorKernels,
-    shape: QuantizedSparseMLPExpertMajorShape,
-    buffers: QuantizedSparseMLPExpertMajorBuffers<'a>,
-    scratch: QuantizedSparseMLPScratch<'a>,
-    weights: QuantizedSparseMLPWeights<'a>,
-    bucketed_replay: Option<QuantizedSparseMLPBucketedReplay>,
+pub struct ExpertMajorInvocation<'a> {
+    kernels: &'a ExpertMajorKernels,
+    shape: ExpertMajorShape,
+    buffers: ExpertMajorBuffers<'a>,
+    scratch: Scratch<'a>,
+    weights: Weights<'a>,
+    bucketed_replay: Option<BucketedReplay>,
 }
 
-impl Operator for QuantizedSparseMLPExpertMajorInvocation<'_> {
+impl Operator for ExpertMajorInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         debug_validate_expert_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
         let gate_up_swiglu = match self.bucketed_replay {
@@ -755,30 +752,30 @@ impl Operator for QuantizedSparseMLPExpertMajorInvocation<'_> {
 }
 
 fn debug_validate_expert_major_buffers(
-    config: QuantizedSparseMLPConfig,
-    shape: QuantizedSparseMLPExpertMajorShape,
-    buffers: &QuantizedSparseMLPExpertMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPScratch<'_>,
+    config: Config,
+    shape: ExpertMajorShape,
+    buffers: &ExpertMajorBuffers<'_>,
+    scratch: &Scratch<'_>,
 ) {
     #[cfg(debug_assertions)]
     validate_expert_major_buffers(config, shape, buffers, scratch);
 }
 
 fn debug_validate_token_major_buffers(
-    config: QuantizedSparseMLPConfig,
-    shape: QuantizedSparseMLPTokenMajorShape,
-    buffers: &QuantizedSparseMLPTokenMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPScratch<'_>,
+    config: Config,
+    shape: TokenMajorShape,
+    buffers: &TokenMajorBuffers<'_>,
+    scratch: &Scratch<'_>,
 ) {
     #[cfg(debug_assertions)]
     validate_token_major_buffers(config, shape, buffers, scratch);
 }
 
 fn validate_expert_major_buffers(
-    config: QuantizedSparseMLPConfig,
-    shape: QuantizedSparseMLPExpertMajorShape,
-    buffers: &QuantizedSparseMLPExpertMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPScratch<'_>,
+    config: Config,
+    shape: ExpertMajorShape,
+    buffers: &ExpertMajorBuffers<'_>,
+    scratch: &Scratch<'_>,
 ) {
     shape.validate();
     let input_bytes = config.expert_major_input_bytes(shape);
@@ -812,10 +809,10 @@ fn validate_expert_major_buffers(
 }
 
 fn validate_token_major_buffers(
-    config: QuantizedSparseMLPConfig,
-    shape: QuantizedSparseMLPTokenMajorShape,
-    buffers: &QuantizedSparseMLPTokenMajorBuffers<'_>,
-    scratch: &QuantizedSparseMLPScratch<'_>,
+    config: Config,
+    shape: TokenMajorShape,
+    buffers: &TokenMajorBuffers<'_>,
+    scratch: &Scratch<'_>,
 ) {
     shape.validate();
     let input_bytes = config.token_major_input_bytes_unchecked(shape);
@@ -854,11 +851,7 @@ fn validate_token_major_buffers(
     validate_token_major_scratch(config, shape, scratch);
 }
 
-fn validate_token_major_scratch(
-    config: QuantizedSparseMLPConfig,
-    shape: QuantizedSparseMLPTokenMajorShape,
-    scratch: &QuantizedSparseMLPScratch<'_>,
-) {
+fn validate_token_major_scratch(config: Config, shape: TokenMajorShape, scratch: &Scratch<'_>) {
     let swiglu_bytes = config.swiglu_bytes_unchecked(shape.num_total_routes);
     assert!(
         scratch.swiglu.len_bytes() >= swiglu_bytes,
@@ -869,5 +862,5 @@ fn validate_token_major_scratch(
 }
 
 #[cfg(test)]
-#[path = "quantized_sparse_mlp_test.rs"]
+#[path = "sparse_mlp_test.rs"]
 mod tests;

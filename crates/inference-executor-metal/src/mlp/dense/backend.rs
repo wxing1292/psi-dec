@@ -1,10 +1,4 @@
-use inference_backend_metal::components::QuantizedDenseMLP;
-use inference_backend_metal::components::QuantizedDenseMLPBuffers;
-use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
-use inference_backend_metal::components::QuantizedDenseMLPScratch;
-use inference_backend_metal::components::QuantizedDenseMLPShape;
-use inference_backend_metal::components::QuantizedDenseMLPWeights;
+use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -37,7 +31,7 @@ impl DenseMLPMetalConfig {
 }
 
 pub struct DenseMLP {
-    compute: QuantizedDenseMLP,
+    compute: dense_mlp::Compute,
 }
 
 #[derive(Clone, Copy)]
@@ -46,7 +40,7 @@ pub struct DenseMLPInput<'a> {
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
     pub scratch: DenseMLPScratchBindings<'a>,
-    pub weights: QuantizedDenseMLPWeights<'a>,
+    pub weights: dense_mlp::Weights<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -56,7 +50,7 @@ pub struct DenseMLPBucketedInput<'a> {
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
     pub scratch: DenseMLPScratchBindings<'a>,
-    pub weights: QuantizedDenseMLPWeights<'a>,
+    pub weights: dense_mlp::Weights<'a>,
 }
 
 impl DenseMLP {
@@ -64,11 +58,11 @@ impl DenseMLP {
         core.validate();
         config.validate();
         Self {
-            compute: QuantizedDenseMLP::new(device, compute_config(&core, config)),
+            compute: dense_mlp::Compute::new(device, compute_config(&core, config)),
         }
     }
 
-    pub fn replay_topology(&self, num_total_tokens: u32) -> QuantizedDenseMLPReplayTopology {
+    pub fn replay_topology(&self, num_total_tokens: u32) -> dense_mlp::ReplayTopology {
         self.compute.topology(num_total_tokens)
     }
 
@@ -83,11 +77,11 @@ impl DenseMLP {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_bucketed(
             input.num_total_tokens,
             input.num_active_tokens_key,
-            QuantizedDenseMLPBuffers {
+            dense_mlp::Buffers {
                 hidden_state: input.hidden_state,
                 next_hidden_state: input.next_hidden_state,
             },
-            QuantizedDenseMLPScratch {
+            dense_mlp::Scratch {
                 gate_up: input.scratch.gate_up,
                 swiglu: input.scratch.swiglu,
             },
@@ -108,11 +102,11 @@ impl ReplayLayer for DenseMLP {
         input.shape.validate();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke(
             backend_shape(input.shape),
-            QuantizedDenseMLPBuffers {
+            dense_mlp::Buffers {
                 hidden_state: input.hidden_state,
                 next_hidden_state: input.next_hidden_state,
             },
-            QuantizedDenseMLPScratch {
+            dense_mlp::Scratch {
                 gate_up: input.scratch.gate_up,
                 swiglu: input.scratch.swiglu,
             },
@@ -122,14 +116,14 @@ impl ReplayLayer for DenseMLP {
     }
 }
 
-fn backend_shape(shape: DenseMLPReplayShape) -> QuantizedDenseMLPShape {
-    QuantizedDenseMLPShape {
+fn backend_shape(shape: DenseMLPReplayShape) -> dense_mlp::Shape {
+    dense_mlp::Shape {
         num_total_tokens: shape.num_tokens,
     }
 }
 
-fn compute_config(core: &DenseMLPCore, config: DenseMLPMetalConfig) -> QuantizedDenseMLPConfig {
-    QuantizedDenseMLPConfig {
+fn compute_config(core: &DenseMLPCore, config: DenseMLPMetalConfig) -> dense_mlp::Config {
+    dense_mlp::Config {
         hidden_dim: core.hidden_dim.try_into().expect("dense MLP hidden_dim must fit u32"),
         intermediate_dim: core
             .intermediate_dim

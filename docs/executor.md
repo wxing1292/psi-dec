@@ -132,7 +132,7 @@ Use these source files as concrete examples:
 - [`replay.rs`](../crates/inference-executor-metal/src/replay.rs) defines `Replay<T>` and `ReplayComponent`.
 - [`mlp/dense/backend.rs`](../crates/inference-executor-metal/src/mlp/dense/backend.rs) is an executor component adapter.
 - [`layer/dense_mlp.rs`](../crates/inference-executor-metal/src/model/qwen/v3_x/layer/dense_mlp.rs) is a Qwen model owner.
-- [`quantized_dense_mlp.rs`](../crates/inference-backend-metal/src/components/quantized_dense_mlp.rs) is a backend component.
+- [`dense_mlp.rs`](../crates/inference-backend-metal/src/components/dense_mlp.rs) is a backend component.
 - [`operation.rs`](../crates/inference-backend-metal/src/metal/stream/operation.rs) defines `Operator` and `CommandRecorder`.
 - [`stream/replay.rs`](../crates/inference-backend-metal/src/metal/stream/replay.rs) defines the Metal replay program lifecycle.
 

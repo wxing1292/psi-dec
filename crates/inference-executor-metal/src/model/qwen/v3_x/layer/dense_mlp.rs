@@ -1,7 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
-use inference_backend_metal::components::QuantizedDenseMLPWeights;
+use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayParameterKey;
@@ -69,7 +68,7 @@ impl Qwen3xDenseMLP {
             .expect("Qwen3.x dense MLP weights must be loaded before execution")
     }
 
-    pub fn replay_topology(&self, num_total_tokens: u32) -> QuantizedDenseMLPReplayTopology {
+    pub fn replay_topology(&self, num_total_tokens: u32) -> dense_mlp::ReplayTopology {
         self.backend.replay_topology(num_total_tokens)
     }
 
@@ -164,7 +163,7 @@ impl DenseMLPWeightBuffers {
         let down_scales = remove_typed_tensor(tensors, &bindings.down.scales, safetensors::Dtype::BF16)?.into_data();
         let down_biases = remove_typed_tensor(tensors, &bindings.down.biases, safetensors::Dtype::BF16)?.into_data();
 
-        let config = inference_backend_metal::components::QuantizedDenseMLPConfig {
+        let config = inference_backend_metal::components::dense_mlp::Config {
             hidden_dim: to_u32("dense hidden_dim", core.hidden_dim)?,
             intermediate_dim: to_u32("dense intermediate_dim", core.intermediate_dim)?,
             group_size: metal.group_size,
@@ -212,8 +211,8 @@ impl DenseMLPWeightBuffers {
         })
     }
 
-    pub fn as_borrowed(&self) -> QuantizedDenseMLPWeights<'_> {
-        QuantizedDenseMLPWeights {
+    pub fn as_borrowed(&self) -> dense_mlp::Weights<'_> {
+        dense_mlp::Weights {
             gate_up_weight: &self.gate_up_weight,
             gate_up_scales: &self.gate_up_scales,
             gate_up_biases: &self.gate_up_biases,

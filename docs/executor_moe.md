@@ -48,8 +48,8 @@ crates/inference-backend-metal/src/components/
   moe_expert_major_test.rs
   moe_combine.rs
   moe_combine_test.rs
-  quantized_sparse_mlp.rs
-  quantized_sparse_mlp_test.rs
+  sparse_mlp.rs
+  sparse_mlp_test.rs
 ```
 
 ## Shape model
@@ -137,13 +137,13 @@ The private sparse-expert owner consumes its gate/up/down subset without creatin
 Each owner validates and materializes the backend-required persistent layout during initialization.
 The map must be empty after the complete MoE owner is constructed.
 
-`QuantizedSparseMLP` remains a lower-level expert compute component.
+`components::sparse_mlp::Compute` remains a lower-level expert compute component.
 It exposes token-major and expert-major sparse expert MLP compute.
 It does not own routing, dispatch, combine, shared-expert work, or compute-path selection.
 
 Its token-major shape is `{ num_routes, num_tokens }`.
 Its expert-major shape is `{ num_routes }`.
-`QuantizedSparseMLPConfig` owns `num_experts` for both paths.
+`components::sparse_mlp::Config` owns `num_experts` for both paths.
 Raw gather-matmul operators use semantic gather axes `{ num_routes, num_input_vectors }`.
 Only their true matrix axes retain `n` and `k`.
 
@@ -325,8 +325,8 @@ The full bucketed `GatedMoE` replay composes these leaf APIs on the expert-major
 The backend sparse MLP leaf also has additive bucket-readiness APIs:
 
 ```text
-QuantizedSparseMLP::invoke_token_major_bucketed(...)
-QuantizedSparseMLP::invoke_expert_major_bucketed(...)
+sparse_mlp::Compute::invoke_token_major_bucketed(...)
+sparse_mlp::Compute::invoke_expert_major_bucketed(...)
 ```
 
 Both APIs record `num_total_tokens` and fixed `num_experts_per_token` values.
@@ -617,14 +617,14 @@ The current routing specialization requires 256 threads. The expert-major clear,
 phases also require 256 threads. The current prefix phase requires one thread. These values belong to phase-scoped
 thread-block specializations. They are not dynamic workload fields.
 
-`QuantizedSparseMLP` exposes token-major and expert-major entry points. These entry points are explicit layouts chosen
+`sparse_mlp::Compute` exposes token-major and expert-major entry points. These entry points are explicit layouts chosen
 by the MoE owner. The sparse MLP leaf does not run another path selector. Its gather-affine and ragged expert-major
 affine kernels own their matrix tiles and thread ownership.
 
 ### Backend selection boundary
 
 `GatedMoE` owns compute-path selection through `GatedMoEComputePath::select(...)`.
-`QuantizedSparseMLP` owns only expert inner compute.
+`sparse_mlp::Compute` owns only expert inner compute.
 The current production selector is:
 
 ```text
@@ -715,7 +715,7 @@ Recommendation: Bisect MoE performance by contract boundary in this order:
 5. Full MoE wrapper.
 
 Routing and combine belong to MoE.
-`QuantizedSparseMLP` owns only expert inner compute.
+`sparse_mlp::Compute` owns only expert inner compute.
 Top-k ordering differences alone are not a performance target.
 Route probability semantics must identify logits or already-softmaxed probabilities.
 They must also identify whether routing renormalizes selected top-k probabilities.

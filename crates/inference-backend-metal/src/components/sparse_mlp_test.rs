@@ -25,7 +25,7 @@ const OUTPUT_CANARY: u16 = 0x3aaa;
 fn test_token_major_fixed() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = QuantizedSparseMLPConfig {
+    let config = Config {
         num_experts: 4,
         hidden_dim: 64,
         intermediate_dim: 64,
@@ -33,7 +33,7 @@ fn test_token_major_fixed() {
         bits: 4,
         dtype: Dtype::Bfloat16,
     };
-    let shape = QuantizedSparseMLPTokenMajorShape {
+    let shape = TokenMajorShape {
         num_total_routes: 4,
         num_total_tokens: 2,
     };
@@ -73,19 +73,19 @@ fn test_token_major_fixed() {
 
     let actual_output = Buffer::new_zeroed(&device, config.token_major_output_bytes(shape));
     let actual_swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(shape.num_total_routes));
-    let sparse_mlp = QuantizedSparseMLPTokenMajorKernels::new(&device, config);
+    let sparse_mlp = TokenMajorKernels::new(&device, config);
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke(
         shape,
-        QuantizedSparseMLPTokenMajorBuffers {
+        TokenMajorBuffers {
             input: &input,
             token_indices: &token_indices,
             expert_indices: &expert_indices,
             route_indices: &route_indices,
             routed_hidden: &actual_output,
         },
-        QuantizedSparseMLPScratch { swiglu: &actual_swiglu },
-        QuantizedSparseMLPWeights {
+        Scratch { swiglu: &actual_swiglu },
+        Weights {
             gate_weight: &gate_weight,
             gate_scales: &gate_scales,
             gate_biases: &gate_biases,
@@ -139,7 +139,7 @@ fn test_token_major_random() {
     let random_seed = 0x3A7D_C921;
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = QuantizedSparseMLPConfig {
+    let config = Config {
         num_experts: 5,
         hidden_dim: 64,
         intermediate_dim: 64,
@@ -147,7 +147,7 @@ fn test_token_major_random() {
         bits: 4,
         dtype: Dtype::Bfloat16,
     };
-    let shape = QuantizedSparseMLPTokenMajorShape {
+    let shape = TokenMajorShape {
         num_total_routes: 6,
         num_total_tokens: 3,
     };
@@ -221,19 +221,19 @@ fn test_token_major_random() {
 
     let actual_output = Buffer::new_zeroed(&device, config.token_major_output_bytes(shape));
     let actual_swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(shape.num_total_routes));
-    let sparse_mlp = QuantizedSparseMLPTokenMajorKernels::new(&device, config);
+    let sparse_mlp = TokenMajorKernels::new(&device, config);
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke(
         shape,
-        QuantizedSparseMLPTokenMajorBuffers {
+        TokenMajorBuffers {
             input: &input,
             token_indices: &token_indices,
             expert_indices: &expert_indices,
             route_indices: &route_indices,
             routed_hidden: &actual_output,
         },
-        QuantizedSparseMLPScratch { swiglu: &actual_swiglu },
-        QuantizedSparseMLPWeights {
+        Scratch { swiglu: &actual_swiglu },
+        Weights {
             gate_weight: &gate_weight,
             gate_scales: &gate_scales,
             gate_biases: &gate_biases,
@@ -302,7 +302,7 @@ fn test_bucketed_shape_rejects_invalid_route_domain() {
             0,
             NUM_ACTIVE_TOKENS,
             token_major.token_major_buffers(),
-            QuantizedSparseMLPScratch {
+            Scratch {
                 swiglu: &token_major.token_major_swiglu,
             },
             token_major.weights.as_borrowed(),
@@ -314,7 +314,7 @@ fn test_bucketed_shape_rejects_invalid_route_domain() {
             token_major.config.num_experts + 1,
             NUM_ACTIVE_TOKENS,
             token_major.token_major_buffers(),
-            QuantizedSparseMLPScratch {
+            Scratch {
                 swiglu: &token_major.token_major_swiglu,
             },
             token_major.weights.as_borrowed(),
@@ -326,7 +326,7 @@ fn test_bucketed_shape_rejects_invalid_route_domain() {
             2,
             NUM_ACTIVE_TOKENS,
             token_major.token_major_buffers(),
-            QuantizedSparseMLPScratch {
+            Scratch {
                 swiglu: &token_major.token_major_swiglu,
             },
             token_major.weights.as_borrowed(),
@@ -405,7 +405,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let num_experts = 5_u32;
-    let config = QuantizedSparseMLPConfig {
+    let config = Config {
         num_experts,
         hidden_dim: 64,
         intermediate_dim: 64,
@@ -420,7 +420,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     let layout_shape = MoEExpertMajorShape {
         num_total_tokens: num_tokens,
     };
-    let sparse_shape = QuantizedSparseMLPExpertMajorShape {
+    let sparse_shape = ExpertMajorShape {
         num_total_routes: num_routes,
     };
     let gate_up_config = config.gate_up_config();
@@ -498,8 +498,8 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     let down_biases = bf16_buffer(&device, &down_bias_values);
 
     let layout = MoEExpertMajorKernels::new(&device, layout_config);
-    let sparse_mlp = QuantizedSparseMLP::new(&device, config);
-    let weights = QuantizedSparseMLPWeights {
+    let sparse_mlp = Compute::new(&device, config);
+    let weights = Weights {
         gate_weight: &gate_weight,
         gate_scales: &gate_scales,
         gate_biases: &gate_biases,
@@ -533,12 +533,12 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     ));
     builder.record_with_barrier_before(sparse_mlp.invoke_expert_major(
         sparse_shape,
-        QuantizedSparseMLPExpertMajorBuffers {
+        ExpertMajorBuffers {
             packed_input: &packed_input,
             experts_by_route: &experts_by_route,
             packed_output: &packed_output,
         },
-        QuantizedSparseMLPScratch { swiglu: &swiglu },
+        Scratch { swiglu: &swiglu },
         weights,
     ));
     builder.record_with_barrier_before(layout.invoke_scatter_without_shared_experts(
@@ -600,8 +600,8 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
 
 struct BucketedSparseMLPFixture {
     stream: Stream,
-    config: QuantizedSparseMLPConfig,
-    compute: QuantizedSparseMLP,
+    config: Config,
+    compute: Compute,
     num_total_tokens: u32,
     num_experts_per_token: u32,
     token_major_input: Buffer,
@@ -625,7 +625,7 @@ impl BucketedSparseMLPFixture {
     fn new_with_intermediate_dim(num_total_tokens: u32, num_experts_per_token: u32, intermediate_dim: u32) -> Self {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = QuantizedSparseMLPConfig {
+        let config = Config {
             num_experts: 5,
             hidden_dim: 64,
             intermediate_dim,
@@ -634,13 +634,13 @@ impl BucketedSparseMLPFixture {
             dtype: Dtype::Bfloat16,
         };
         let num_total_routes = num_total_tokens.checked_mul(num_experts_per_token).unwrap();
-        let token_shape = QuantizedSparseMLPTokenMajorShape {
+        let token_shape = TokenMajorShape {
             num_total_routes,
             num_total_tokens,
         };
-        let expert_shape = QuantizedSparseMLPExpertMajorShape { num_total_routes };
+        let expert_shape = ExpertMajorShape { num_total_routes };
         let route_index_bytes = num_total_routes as usize * size_of::<u32>();
-        let compute = QuantizedSparseMLP::new(&device, config);
+        let compute = Compute::new(&device, config);
         let weights = BucketedSparseMLPWeights::new(&device, config);
         Self {
             token_major_input: Buffer::new_zeroed(&device, config.token_major_input_bytes(token_shape)),
@@ -671,21 +671,21 @@ impl BucketedSparseMLPFixture {
         num_active_tokens.checked_mul(self.num_experts_per_token).unwrap()
     }
 
-    fn token_major_shape(&self) -> QuantizedSparseMLPTokenMajorShape {
-        QuantizedSparseMLPTokenMajorShape {
+    fn token_major_shape(&self) -> TokenMajorShape {
+        TokenMajorShape {
             num_total_routes: self.num_total_routes(),
             num_total_tokens: self.num_total_tokens,
         }
     }
 
-    fn expert_major_shape(&self) -> QuantizedSparseMLPExpertMajorShape {
-        QuantizedSparseMLPExpertMajorShape {
+    fn expert_major_shape(&self) -> ExpertMajorShape {
+        ExpertMajorShape {
             num_total_routes: self.num_total_routes(),
         }
     }
 
-    fn token_major_buffers(&self) -> QuantizedSparseMLPTokenMajorBuffers<'_> {
-        QuantizedSparseMLPTokenMajorBuffers {
+    fn token_major_buffers(&self) -> TokenMajorBuffers<'_> {
+        TokenMajorBuffers {
             input: &self.token_major_input,
             token_indices: &self.token_indices,
             expert_indices: &self.expert_indices,
@@ -694,8 +694,8 @@ impl BucketedSparseMLPFixture {
         }
     }
 
-    fn expert_major_buffers(&self) -> QuantizedSparseMLPExpertMajorBuffers<'_> {
-        QuantizedSparseMLPExpertMajorBuffers {
+    fn expert_major_buffers(&self) -> ExpertMajorBuffers<'_> {
+        ExpertMajorBuffers {
             packed_input: &self.expert_major_input,
             experts_by_route: &self.experts_by_route,
             packed_output: &self.expert_major_output,
@@ -709,7 +709,7 @@ impl BucketedSparseMLPFixture {
             self.num_experts_per_token,
             NUM_ACTIVE_TOKENS,
             self.token_major_buffers(),
-            QuantizedSparseMLPScratch {
+            Scratch {
                 swiglu: &self.token_major_swiglu,
             },
             self.weights.as_borrowed(),
@@ -724,7 +724,7 @@ impl BucketedSparseMLPFixture {
             self.num_experts_per_token,
             NUM_ACTIVE_TOKENS,
             self.expert_major_buffers(),
-            QuantizedSparseMLPScratch {
+            Scratch {
                 swiglu: &self.expert_major_swiglu,
             },
             self.weights.as_borrowed(),
@@ -904,7 +904,7 @@ struct BucketedSparseMLPWeights {
 }
 
 impl BucketedSparseMLPWeights {
-    fn new(device: &Device, config: QuantizedSparseMLPConfig) -> Self {
+    fn new(device: &Device, config: Config) -> Self {
         let num_experts = config.num_experts as usize;
         let gate_up = config.gate_up_config();
         let down = config.down_config();
@@ -957,8 +957,8 @@ impl BucketedSparseMLPWeights {
         }
     }
 
-    fn as_borrowed(&self) -> QuantizedSparseMLPWeights<'_> {
-        QuantizedSparseMLPWeights {
+    fn as_borrowed(&self) -> Weights<'_> {
+        Weights {
             gate_weight: &self.gate_weight,
             gate_scales: &self.gate_scales,
             gate_biases: &self.gate_biases,

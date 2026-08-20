@@ -5,12 +5,7 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use inference_backend_metal::components::QuantizedSparseMLPConfig;
-use inference_backend_metal::components::QuantizedSparseMLPScratch;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorBuffers;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorKernels;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
-use inference_backend_metal::components::QuantizedSparseMLPWeights;
+use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -94,8 +89,8 @@ fn bench_sparse_mlp(c: &mut Criterion) {
 
 struct QuantizedSparseMLPFixture {
     stream: Stream,
-    shape: QuantizedSparseMLPTokenMajorShape,
-    sparse_mlp: QuantizedSparseMLPTokenMajorKernels,
+    shape: sparse_mlp::TokenMajorShape,
+    sparse_mlp: sparse_mlp::TokenMajorKernels,
     buffers: QuantizedSparseMLPOwnedBuffers,
     scratch: QuantizedSparseMLPOwnedScratch,
     weights: QuantizedSparseMLPOwnedWeights,
@@ -125,7 +120,7 @@ impl QuantizedSparseMLPFixture {
     }
 
     fn new_with_expert_indices(device: &Device, num_tokens: u32, expert_indices_values: Vec<u32>) -> Self {
-        let config = QuantizedSparseMLPConfig {
+        let config = sparse_mlp::Config {
             num_experts: SPARSE_MLP_NUM_EXPERTS,
             hidden_dim: SPARSE_MLP_HIDDEN_DIM,
             intermediate_dim: SPARSE_MLP_INTERMEDIATE_DIM,
@@ -133,14 +128,14 @@ impl QuantizedSparseMLPFixture {
             bits: SPARSE_MLP_BITS,
             dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedSparseMLPTokenMajorShape {
+        let shape = sparse_mlp::TokenMajorShape {
             num_total_routes: num_tokens * TOPK_EXPERTS,
             num_total_tokens: num_tokens,
         };
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();
         let stream = Stream::new(device);
-        let sparse_mlp = QuantizedSparseMLPTokenMajorKernels::new(device, config);
+        let sparse_mlp = sparse_mlp::TokenMajorKernels::new(device, config);
         let buffers = QuantizedSparseMLPOwnedBuffers {
             input: bf16_buffer(
                 device,
@@ -251,8 +246,8 @@ fn quantized_weight_stack(device: &Device, bytes_per_expert: usize) -> Buffer {
 
 fn build_gate_up_swiglu_replay(
     stream: &Stream,
-    sparse_mlp: &QuantizedSparseMLPTokenMajorKernels,
-    shape: QuantizedSparseMLPTokenMajorShape,
+    sparse_mlp: &sparse_mlp::TokenMajorKernels,
+    shape: sparse_mlp::TokenMajorShape,
     buffers: &QuantizedSparseMLPOwnedBuffers,
     scratch: &QuantizedSparseMLPOwnedScratch,
     weights: &QuantizedSparseMLPOwnedWeights,
@@ -260,14 +255,14 @@ fn build_gate_up_swiglu_replay(
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke_gate_up_swiglu(
         shape,
-        QuantizedSparseMLPTokenMajorBuffers {
+        sparse_mlp::TokenMajorBuffers {
             input: &buffers.input,
             token_indices: &buffers.token_indices,
             expert_indices: &buffers.expert_indices,
             route_indices: &buffers.route_indices,
             routed_hidden: &buffers.routed_hidden,
         },
-        QuantizedSparseMLPScratch {
+        sparse_mlp::Scratch {
             swiglu: &scratch.swiglu,
         },
         owned_weights(weights),
@@ -277,8 +272,8 @@ fn build_gate_up_swiglu_replay(
 
 fn build_token_major_replay(
     stream: &Stream,
-    sparse_mlp: &QuantizedSparseMLPTokenMajorKernels,
-    shape: QuantizedSparseMLPTokenMajorShape,
+    sparse_mlp: &sparse_mlp::TokenMajorKernels,
+    shape: sparse_mlp::TokenMajorShape,
     buffers: &QuantizedSparseMLPOwnedBuffers,
     scratch: &QuantizedSparseMLPOwnedScratch,
     weights: &QuantizedSparseMLPOwnedWeights,
@@ -286,14 +281,14 @@ fn build_token_major_replay(
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke(
         shape,
-        QuantizedSparseMLPTokenMajorBuffers {
+        sparse_mlp::TokenMajorBuffers {
             input: &buffers.input,
             token_indices: &buffers.token_indices,
             expert_indices: &buffers.expert_indices,
             route_indices: &buffers.route_indices,
             routed_hidden: &buffers.routed_hidden,
         },
-        QuantizedSparseMLPScratch {
+        sparse_mlp::Scratch {
             swiglu: &scratch.swiglu,
         },
         owned_weights(weights),
@@ -301,8 +296,8 @@ fn build_token_major_replay(
     builder.build()
 }
 
-fn owned_weights(weights: &QuantizedSparseMLPOwnedWeights) -> QuantizedSparseMLPWeights<'_> {
-    QuantizedSparseMLPWeights {
+fn owned_weights(weights: &QuantizedSparseMLPOwnedWeights) -> sparse_mlp::Weights<'_> {
+    sparse_mlp::Weights {
         gate_weight: &weights.gate_weight,
         gate_scales: &weights.gate_scales,
         gate_biases: &weights.gate_biases,

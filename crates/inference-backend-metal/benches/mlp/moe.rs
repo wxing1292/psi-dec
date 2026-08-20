@@ -20,20 +20,8 @@ use inference_backend_metal::components::MoERoutingBuffers;
 use inference_backend_metal::components::MoERoutingConfig;
 use inference_backend_metal::components::MoERoutingKernel;
 use inference_backend_metal::components::MoERoutingShape;
-use inference_backend_metal::components::QuantizedDenseMLP;
-use inference_backend_metal::components::QuantizedDenseMLPBuffers;
-use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPScratch;
-use inference_backend_metal::components::QuantizedDenseMLPShape;
-use inference_backend_metal::components::QuantizedDenseMLPWeights;
-use inference_backend_metal::components::QuantizedSparseMLP;
-use inference_backend_metal::components::QuantizedSparseMLPConfig;
-use inference_backend_metal::components::QuantizedSparseMLPExpertMajorBuffers;
-use inference_backend_metal::components::QuantizedSparseMLPExpertMajorShape;
-use inference_backend_metal::components::QuantizedSparseMLPScratch;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorBuffers;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
-use inference_backend_metal::components::QuantizedSparseMLPWeights;
+use inference_backend_metal::components::dense_mlp;
+use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -330,18 +318,18 @@ fn build_combine_with_shared_experts_replay(
 struct MoEForwardFixture {
     stream: Stream,
     routing_shape: MoERoutingShape,
-    sparse_shape: QuantizedSparseMLPTokenMajorShape,
+    sparse_shape: sparse_mlp::TokenMajorShape,
     expert_major_config: MoEExpertMajorConfig,
     expert_major_shape: MoEExpertMajorShape,
-    dense_shape: QuantizedDenseMLPShape,
+    dense_shape: dense_mlp::Shape,
     combine_shape: MoECombineShape,
     router: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
     shared_expert_gate: AffineQuantizedMatmul,
     routing: MoERoutingKernel,
     expert_major: MoEExpertMajorKernels,
-    sparse_mlp: QuantizedSparseMLP,
-    shared_experts: QuantizedDenseMLP,
+    sparse_mlp: sparse_mlp::Compute,
+    shared_experts: dense_mlp::Compute,
     combine: MoECombineKernels,
     input: Buffer,
     router_logits: Buffer,
@@ -392,7 +380,7 @@ impl MoEForwardFixture {
         let routing_shape = MoERoutingShape {
             num_total_tokens: num_tokens,
         };
-        let sparse_config = QuantizedSparseMLPConfig {
+        let sparse_config = sparse_mlp::Config {
             num_experts: NUM_EXPERTS,
             hidden_dim: HIDDEN_DIM,
             intermediate_dim: INTERMEDIATE_DIM,
@@ -400,7 +388,7 @@ impl MoEForwardFixture {
             bits: EXPERT_BITS,
             dtype: Dtype::Bfloat16,
         };
-        let sparse_shape = QuantizedSparseMLPTokenMajorShape {
+        let sparse_shape = sparse_mlp::TokenMajorShape {
             num_total_routes: num_tokens * TOPK_EXPERTS,
             num_total_tokens: num_tokens,
         };
@@ -408,18 +396,18 @@ impl MoEForwardFixture {
         let expert_major_shape = MoEExpertMajorShape {
             num_total_tokens: num_tokens,
         };
-        let expert_major_sparse_shape = QuantizedSparseMLPTokenMajorShape {
+        let expert_major_sparse_shape = sparse_mlp::TokenMajorShape {
             num_total_routes: expert_major_config.num_routes(expert_major_shape),
             num_total_tokens: expert_major_config.num_routes(expert_major_shape),
         };
-        let dense_config = QuantizedDenseMLPConfig {
+        let dense_config = dense_mlp::Config {
             hidden_dim: HIDDEN_DIM,
             intermediate_dim: INTERMEDIATE_DIM,
             group_size: GROUP_SIZE,
             bits: EXPERT_BITS,
             dtype: Dtype::Bfloat16,
         };
-        let dense_shape = QuantizedDenseMLPShape {
+        let dense_shape = dense_mlp::Shape {
             num_total_tokens: num_tokens,
         };
         let combine_config = MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM);
@@ -472,8 +460,8 @@ impl MoEForwardFixture {
         let shared_expert_gate = AffineQuantizedMatmul::new(device, shared_expert_gate_config);
         let routing = MoERoutingKernel::new(device, routing_config);
         let expert_major = MoEExpertMajorKernels::new(device, expert_major_config);
-        let sparse_mlp = QuantizedSparseMLP::new(device, sparse_config);
-        let shared_experts = QuantizedDenseMLP::new(device, dense_config);
+        let sparse_mlp = sparse_mlp::Compute::new(device, sparse_config);
+        let shared_experts = dense_mlp::Compute::new(device, dense_config);
         let combine = MoECombineKernels::new(device, combine_config);
         let router_weight = quantized_weight(device, router_config.weight_bytes());
         let router_scales = bf16_buffer(
@@ -756,7 +744,7 @@ impl MoEForwardFixture {
     fn expert_major_record<'a>(&'a self, output: &'a Buffer) -> MoEExpertMajorForwardRecord<'a> {
         MoEExpertMajorForwardRecord {
             routing_shape: self.routing_shape,
-            sparse_shape: QuantizedSparseMLPTokenMajorShape {
+            sparse_shape: sparse_mlp::TokenMajorShape {
                 num_total_routes: self.expert_major_config.num_routes(self.expert_major_shape),
                 num_total_tokens: self.expert_major_config.num_routes(self.expert_major_shape),
             },
@@ -818,15 +806,15 @@ impl MoEForwardFixture {
 
 struct MoEForwardRecord<'a> {
     routing_shape: MoERoutingShape,
-    sparse_shape: QuantizedSparseMLPTokenMajorShape,
-    dense_shape: QuantizedDenseMLPShape,
+    sparse_shape: sparse_mlp::TokenMajorShape,
+    dense_shape: dense_mlp::Shape,
     combine_shape: MoECombineShape,
     router: &'a AffineQuantizedMatmul,
     router_softmax: &'a SoftmaxKernel,
     shared_expert_gate: &'a AffineQuantizedMatmul,
     routing: &'a MoERoutingKernel,
-    sparse_mlp: &'a QuantizedSparseMLP,
-    shared_experts: &'a QuantizedDenseMLP,
+    sparse_mlp: &'a sparse_mlp::Compute,
+    shared_experts: &'a dense_mlp::Compute,
     combine: &'a MoECombineKernels,
     input: &'a Buffer,
     router_logits: &'a Buffer,
@@ -846,9 +834,9 @@ struct MoEForwardRecord<'a> {
     shared_expert_gate_weight: &'a Buffer,
     shared_expert_gate_scales: &'a Buffer,
     shared_expert_gate_biases: &'a Buffer,
-    sparse_weights: QuantizedSparseMLPWeights<'a>,
-    shared_weights: QuantizedDenseMLPWeights<'a>,
-    shared_scratch: QuantizedDenseMLPScratch<'a>,
+    sparse_weights: sparse_mlp::Weights<'a>,
+    shared_weights: dense_mlp::Weights<'a>,
+    shared_scratch: dense_mlp::Scratch<'a>,
 }
 
 fn build_moe_forward_replay(stream: &Stream, record: MoEForwardRecord<'_>) -> ReplayProgram {
@@ -859,17 +847,17 @@ fn build_moe_forward_replay(stream: &Stream, record: MoEForwardRecord<'_>) -> Re
 
 struct MoEExpertMajorForwardRecord<'a> {
     routing_shape: MoERoutingShape,
-    sparse_shape: QuantizedSparseMLPTokenMajorShape,
+    sparse_shape: sparse_mlp::TokenMajorShape,
     expert_major_config: MoEExpertMajorConfig,
     expert_major_shape: MoEExpertMajorShape,
-    dense_shape: QuantizedDenseMLPShape,
+    dense_shape: dense_mlp::Shape,
     router: &'a AffineQuantizedMatmul,
     router_softmax: &'a SoftmaxKernel,
     shared_expert_gate: &'a AffineQuantizedMatmul,
     routing: &'a MoERoutingKernel,
     expert_major: &'a MoEExpertMajorKernels,
-    sparse_mlp: &'a QuantizedSparseMLP,
-    shared_experts: &'a QuantizedDenseMLP,
+    sparse_mlp: &'a sparse_mlp::Compute,
+    shared_experts: &'a dense_mlp::Compute,
     input: &'a Buffer,
     router_logits: &'a Buffer,
     router_probs: &'a Buffer,
@@ -894,9 +882,9 @@ struct MoEExpertMajorForwardRecord<'a> {
     shared_expert_gate_weight: &'a Buffer,
     shared_expert_gate_scales: &'a Buffer,
     shared_expert_gate_biases: &'a Buffer,
-    sparse_weights: QuantizedSparseMLPWeights<'a>,
-    shared_weights: QuantizedDenseMLPWeights<'a>,
-    shared_scratch: QuantizedDenseMLPScratch<'a>,
+    sparse_weights: sparse_mlp::Weights<'a>,
+    shared_weights: dense_mlp::Weights<'a>,
+    shared_scratch: dense_mlp::Scratch<'a>,
 }
 
 fn build_moe_expert_major_forward_replay(stream: &Stream, record: MoEExpertMajorForwardRecord<'_>) -> ReplayProgram {
@@ -947,21 +935,21 @@ where
     ));
     builder.record_with_barrier_before(record.sparse_mlp.invoke_token_major(
         record.sparse_shape,
-        QuantizedSparseMLPTokenMajorBuffers {
+        sparse_mlp::TokenMajorBuffers {
             input: record.input,
             token_indices: record.token_indices,
             expert_indices: record.expert_indices,
             route_indices: record.route_indices,
             routed_hidden: record.routed_hidden,
         },
-        QuantizedSparseMLPScratch {
+        sparse_mlp::Scratch {
             swiglu: record.sparse_swiglu,
         },
         record.sparse_weights,
     ));
     builder.record(record.shared_experts.invoke(
         record.dense_shape,
-        QuantizedDenseMLPBuffers {
+        dense_mlp::Buffers {
             hidden_state: record.input,
             next_hidden_state: record.shared_hidden,
         },
@@ -1060,22 +1048,22 @@ where
         },
     ));
     builder.record_with_barrier_before(record.sparse_mlp.invoke_expert_major(
-        QuantizedSparseMLPExpertMajorShape {
+        sparse_mlp::ExpertMajorShape {
             num_total_routes: record.expert_major_config.num_routes(record.expert_major_shape),
         },
-        QuantizedSparseMLPExpertMajorBuffers {
+        sparse_mlp::ExpertMajorBuffers {
             packed_input: record.packed_input,
             experts_by_route: record.experts_by_route,
             packed_output: record.routed_hidden,
         },
-        QuantizedSparseMLPScratch {
+        sparse_mlp::Scratch {
             swiglu: record.sparse_swiglu,
         },
         record.sparse_weights,
     ));
     builder.record(record.shared_experts.invoke(
         record.dense_shape,
-        QuantizedDenseMLPBuffers {
+        dense_mlp::Buffers {
             hidden_state: record.input,
             next_hidden_state: record.shared_hidden,
         },
@@ -1142,8 +1130,8 @@ struct SparseMLPWeights {
 }
 
 impl SparseMLPWeights {
-    fn as_borrowed(&self) -> QuantizedSparseMLPWeights<'_> {
-        QuantizedSparseMLPWeights {
+    fn as_borrowed(&self) -> sparse_mlp::Weights<'_> {
+        sparse_mlp::Weights {
             gate_weight: &self.gate_weight,
             gate_scales: &self.gate_scales,
             gate_biases: &self.gate_biases,
@@ -1167,8 +1155,8 @@ struct DenseMLPWeights {
 }
 
 impl DenseMLPWeights {
-    fn as_borrowed(&self) -> QuantizedDenseMLPWeights<'_> {
-        QuantizedDenseMLPWeights {
+    fn as_borrowed(&self) -> dense_mlp::Weights<'_> {
+        dense_mlp::Weights {
             gate_up_weight: &self.gate_up_weight,
             gate_up_scales: &self.gate_up_scales,
             gate_up_biases: &self.gate_up_biases,
@@ -1185,8 +1173,8 @@ struct DenseMLPScratch {
 }
 
 impl DenseMLPScratch {
-    fn as_borrowed(&self) -> QuantizedDenseMLPScratch<'_> {
-        QuantizedDenseMLPScratch {
+    fn as_borrowed(&self) -> dense_mlp::Scratch<'_> {
+        dense_mlp::Scratch {
             gate_up: &self.gate_up,
             swiglu: &self.swiglu,
         }

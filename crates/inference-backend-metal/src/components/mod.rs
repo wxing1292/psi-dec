@@ -35,25 +35,8 @@ fn assert_u32_index_domain(num_elements: usize, name: &str) {
     );
 }
 
-mod quantized_dense_mlp;
-pub use quantized_dense_mlp::QuantizedDenseMLP;
-pub use quantized_dense_mlp::QuantizedDenseMLPBuffers;
-pub use quantized_dense_mlp::QuantizedDenseMLPConfig;
-pub use quantized_dense_mlp::QuantizedDenseMLPReplayTopology;
-pub use quantized_dense_mlp::QuantizedDenseMLPScratch;
-pub use quantized_dense_mlp::QuantizedDenseMLPShape;
-pub use quantized_dense_mlp::QuantizedDenseMLPWeights;
-
-mod quantized_sparse_mlp;
-pub use quantized_sparse_mlp::QuantizedSparseMLP;
-pub use quantized_sparse_mlp::QuantizedSparseMLPConfig;
-pub use quantized_sparse_mlp::QuantizedSparseMLPExpertMajorBuffers;
-pub use quantized_sparse_mlp::QuantizedSparseMLPExpertMajorShape;
-pub use quantized_sparse_mlp::QuantizedSparseMLPScratch;
-pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorBuffers;
-pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorKernels;
-pub use quantized_sparse_mlp::QuantizedSparseMLPTokenMajorShape;
-pub use quantized_sparse_mlp::QuantizedSparseMLPWeights;
+pub mod dense_mlp;
+pub mod sparse_mlp;
 
 mod quantized_embedding;
 pub use quantized_embedding::QuantizedEmbeddingBuffers;

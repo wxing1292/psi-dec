@@ -6,10 +6,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
-use inference_backend_metal::components::QuantizedDenseMLP;
-use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPShape;
-use inference_backend_metal::components::QuantizedDenseMLPWeights;
+use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -175,9 +172,9 @@ impl DenseMLPBenchCase {
 
 struct RealDenseMLPFixture<'a> {
     stream: Stream,
-    shape: QuantizedDenseMLPShape,
+    shape: dense_mlp::Shape,
     backend: DenseMLP,
-    compute: QuantizedDenseMLP,
+    compute: dense_mlp::Compute,
     hidden_state: Buffer,
     output: Buffer,
     gate_up: Buffer,
@@ -209,7 +206,7 @@ impl<'a> RealDenseMLPFixture<'a> {
                 io_dtype: Dtype::Bfloat16,
             },
         );
-        let shape = QuantizedDenseMLPShape {
+        let shape = dense_mlp::Shape {
             num_total_tokens: num_tokens,
         };
         let gate_up_config = gate_up_affine_config();
@@ -220,7 +217,7 @@ impl<'a> RealDenseMLPFixture<'a> {
             stream: Stream::new(device),
             shape,
             backend,
-            compute: QuantizedDenseMLP::new(device, config),
+            compute: dense_mlp::Compute::new(device, config),
             hidden_state,
             output: Buffer::new_zeroed(device, down_config.output_bytes(m)),
             gate_up: Buffer::from_slice(
@@ -489,8 +486,8 @@ impl RealDenseMLPWeights {
         }
     }
 
-    fn as_borrowed(&self) -> QuantizedDenseMLPWeights<'_> {
-        QuantizedDenseMLPWeights {
+    fn as_borrowed(&self) -> dense_mlp::Weights<'_> {
+        dense_mlp::Weights {
             gate_up_weight: &self.gate_up_weight,
             gate_up_scales: &self.gate_up_scales,
             gate_up_biases: &self.gate_up_biases,
@@ -585,8 +582,8 @@ fn concat_bytes(left: &[u8], right: &[u8]) -> Vec<u8> {
     out
 }
 
-fn dense_config() -> QuantizedDenseMLPConfig {
-    QuantizedDenseMLPConfig {
+fn dense_config() -> dense_mlp::Config {
+    dense_mlp::Config {
         hidden_dim: HIDDEN_DIM,
         intermediate_dim: INTERMEDIATE_DIM,
         group_size: GROUP_SIZE,

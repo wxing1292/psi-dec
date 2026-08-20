@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::QuantizedSparseMLPWeights;
+use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayParameterKey;
@@ -404,8 +404,8 @@ impl Qwen3xSparseExpertWeights {
         })
     }
 
-    fn as_borrowed(&self) -> QuantizedSparseMLPWeights<'_> {
-        QuantizedSparseMLPWeights {
+    fn as_borrowed(&self) -> sparse_mlp::Weights<'_> {
+        sparse_mlp::Weights {
             gate_weight: &self.gate_weight,
             gate_scales: &self.gate_scales,
             gate_biases: &self.gate_biases,

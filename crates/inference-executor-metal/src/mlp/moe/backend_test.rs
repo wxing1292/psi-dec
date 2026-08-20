@@ -1,6 +1,8 @@
 use std::mem::size_of;
 
 use half::bf16;
+use inference_backend_metal::components::dense_mlp;
+use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_executor_core::mlp::moe::reference::moe_routing_from_bf16_probs_reference;
@@ -453,7 +455,7 @@ struct FullMoESparseTestWeights {
 }
 
 impl FullMoESparseTestWeights {
-    fn new(device: &Device, config: QuantizedSparseMLPConfig) -> Self {
+    fn new(device: &Device, config: sparse_mlp::Config) -> Self {
         let num_experts = config.num_experts as usize;
         let gate_up = config.gate_up_config();
         let down = config.down_config();
@@ -482,8 +484,8 @@ impl FullMoESparseTestWeights {
         }
     }
 
-    fn as_borrowed(&self) -> QuantizedSparseMLPWeights<'_> {
-        QuantizedSparseMLPWeights {
+    fn as_borrowed(&self) -> sparse_mlp::Weights<'_> {
+        sparse_mlp::Weights {
             gate_weight: &self.gate_weight,
             gate_scales: &self.gate_scales,
             gate_biases: &self.gate_biases,
@@ -543,7 +545,7 @@ struct FullMoEDenseTestWeights {
 }
 
 impl FullMoEDenseTestWeights {
-    fn new(device: &Device, config: QuantizedDenseMLPConfig) -> Self {
+    fn new(device: &Device, config: dense_mlp::Config) -> Self {
         let gate_up = config.gate_up_config();
         let down = config.down_config();
         Self {
@@ -556,8 +558,8 @@ impl FullMoEDenseTestWeights {
         }
     }
 
-    fn as_borrowed(&self) -> QuantizedDenseMLPWeights<'_> {
-        QuantizedDenseMLPWeights {
+    fn as_borrowed(&self) -> dense_mlp::Weights<'_> {
+        dense_mlp::Weights {
             gate_up_weight: &self.gate_up_weight,
             gate_up_scales: &self.gate_up_scales,
             gate_up_biases: &self.gate_up_biases,

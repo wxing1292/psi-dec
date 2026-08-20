@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::QuantizedDenseMLPReplayTopology;
 use inference_backend_metal::components::ResidualAddCaptureTarget;
+use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -69,7 +69,7 @@ enum Qwen35MainMLP {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Qwen35MainMLPReplayTopology {
-    Dense(QuantizedDenseMLPReplayTopology),
+    Dense(dense_mlp::ReplayTopology),
     MoE(GatedMoEReplayTopology),
 }
 

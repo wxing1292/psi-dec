@@ -18,22 +18,22 @@ const SWIGLU_CANARY: u16 = 0x3aaa;
 const OUTPUT_CANARY: u16 = 0x3c00;
 
 #[test]
-fn test_swiglu_specialization_has_explicit_thread_block_scope() {
-    let specialization = DenseMLPSwiGLUKernelSpecialization::new(Dtype::Bfloat16);
-    assert_eq!(specialization.io_dtype, Dtype::Bfloat16);
-    assert_eq!(specialization.thread_block.required_threads, 256);
+fn test_swiglu_constants_have_explicit_thread_block_scope() {
+    let constants = SwiGLUKernelConstants::new(Dtype::Bfloat16);
+    assert_eq!(constants.io_dtype, Dtype::Bfloat16);
+    assert_eq!(constants.thread_block.required_threads, 256);
 }
 
 #[test]
 fn test_fixed() {
-    let config = QuantizedDenseMLPConfig {
+    let config = Config {
         hidden_dim: 64,
         intermediate_dim: 64,
         group_size: 32,
         bits: 4,
         dtype: Dtype::Bfloat16,
     };
-    let shape = QuantizedDenseMLPShape { num_total_tokens: 4 };
+    let shape = Shape { num_total_tokens: 4 };
     let (device, compute) = create_dense_mlp_compute(config);
     let stream = Stream::new(&device);
     let gate_up_config = config.gate_up_config();
@@ -52,7 +52,7 @@ fn test_fixed() {
     let down_scales = bf16_buffer(&device, &down_scale_values);
     let down_bias_values = zero_fixture(down_config.scale_or_bias_bytes() / size_of::<u16>());
     let down_biases = bf16_buffer(&device, &down_bias_values);
-    let weights = QuantizedDenseMLPWeights {
+    let weights = Weights {
         gate_up_weight: &gate_up_weight,
         gate_up_scales: &gate_up_scales,
         gate_up_biases: &gate_up_biases,
@@ -67,11 +67,11 @@ fn test_fixed() {
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke(
         shape,
-        QuantizedDenseMLPBuffers {
+        Buffers {
             hidden_state: &hidden_state,
             next_hidden_state: &replay_output,
         },
-        QuantizedDenseMLPScratch {
+        Scratch {
             gate_up: &replay_gate_up,
             swiglu: &replay_swiglu,
         },
@@ -117,14 +117,14 @@ fn test_fixed() {
 #[test]
 fn test_random() {
     let random_seed = 0x5D2A_91C7;
-    let config = QuantizedDenseMLPConfig {
+    let config = Config {
         hidden_dim: 64,
         intermediate_dim: 4160,
         group_size: 32,
         bits: 4,
         dtype: Dtype::Bfloat16,
     };
-    let shape = QuantizedDenseMLPShape { num_total_tokens: 7 };
+    let shape = Shape { num_total_tokens: 7 };
     let (device, compute) = create_dense_mlp_compute(config);
     let stream = Stream::new(&device);
     let gate_up_config = config.gate_up_config();
@@ -165,15 +165,15 @@ fn test_random() {
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke(
         shape,
-        QuantizedDenseMLPBuffers {
+        Buffers {
             hidden_state: &hidden_state,
             next_hidden_state: &replay_output,
         },
-        QuantizedDenseMLPScratch {
+        Scratch {
             gate_up: &replay_gate_up,
             swiglu: &replay_swiglu,
         },
-        QuantizedDenseMLPWeights {
+        Weights {
             gate_up_weight: &gate_up_weight,
             gate_up_scales: &gate_up_scales,
             gate_up_biases: &gate_up_biases,
@@ -255,8 +255,8 @@ fn test_bucketed_replay_preserves_poisoned_tails_across_topologies_and_shrink() 
 
 struct BucketedDenseMLPFixture {
     stream: Stream,
-    config: QuantizedDenseMLPConfig,
-    compute: QuantizedDenseMLP,
+    config: Config,
+    compute: Compute,
     num_allocated_tokens: u32,
     hidden_state: Buffer,
     next_hidden_state: Buffer,
@@ -268,12 +268,12 @@ struct BucketedDenseMLPFixture {
 impl BucketedDenseMLPFixture {
     fn new(num_allocated_tokens: u32) -> Self {
         let config = bucket_test_config();
-        let shape = QuantizedDenseMLPShape {
+        let shape = Shape {
             num_total_tokens: num_allocated_tokens,
         };
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let compute = QuantizedDenseMLP::new(&device, config);
+        let compute = Compute::new(&device, config);
         let weights = BucketedDenseMLPWeights::new(&device, config);
         Self {
             hidden_state: Buffer::new_zeroed(&device, config.input_bytes(shape)),
@@ -300,15 +300,15 @@ impl BucketedDenseMLPFixture {
         builder.build()
     }
 
-    fn buffers(&self) -> QuantizedDenseMLPBuffers<'_> {
-        QuantizedDenseMLPBuffers {
+    fn buffers(&self) -> Buffers<'_> {
+        Buffers {
             hidden_state: &self.hidden_state,
             next_hidden_state: &self.next_hidden_state,
         }
     }
 
-    fn scratch(&self) -> QuantizedDenseMLPScratch<'_> {
-        QuantizedDenseMLPScratch {
+    fn scratch(&self) -> Scratch<'_> {
+        Scratch {
             gate_up: &self.gate_up,
             swiglu: &self.swiglu,
         }
@@ -444,7 +444,7 @@ struct BucketedDenseMLPWeights {
 }
 
 impl BucketedDenseMLPWeights {
-    fn new(device: &Device, config: QuantizedDenseMLPConfig) -> Self {
+    fn new(device: &Device, config: Config) -> Self {
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();
         let gate_up_weight_values = generated_bytes(gate_up_config.weight_bytes(), 0x3000_0001);
@@ -481,8 +481,8 @@ impl BucketedDenseMLPWeights {
         }
     }
 
-    fn as_borrowed(&self) -> QuantizedDenseMLPWeights<'_> {
-        QuantizedDenseMLPWeights {
+    fn as_borrowed(&self) -> Weights<'_> {
+        Weights {
             gate_up_weight: &self.gate_up_weight,
             gate_up_scales: &self.gate_up_scales,
             gate_up_biases: &self.gate_up_biases,
@@ -504,8 +504,8 @@ impl BucketedDenseMLPWeights {
     }
 }
 
-fn bucket_test_config() -> QuantizedDenseMLPConfig {
-    QuantizedDenseMLPConfig {
+fn bucket_test_config() -> Config {
+    Config {
         hidden_dim: 64,
         intermediate_dim: 4160,
         group_size: 32,
@@ -514,9 +514,9 @@ fn bucket_test_config() -> QuantizedDenseMLPConfig {
     }
 }
 
-fn create_dense_mlp_compute(config: QuantizedDenseMLPConfig) -> (Device, QuantizedDenseMLP) {
+fn create_dense_mlp_compute(config: Config) -> (Device, Compute) {
     let device = Device::system_default();
-    let compute = QuantizedDenseMLP::new(&device, config);
+    let compute = Compute::new(&device, config);
     (device, compute)
 }
 

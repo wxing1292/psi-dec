@@ -4,9 +4,7 @@ use inference_backend_metal::components::MoEExpertMajorConfig;
 use inference_backend_metal::components::MoEExpertMajorShape;
 use inference_backend_metal::components::MoERoutingConfig;
 use inference_backend_metal::components::MoERoutingShape;
-use inference_backend_metal::components::QuantizedSparseMLPConfig;
-use inference_backend_metal::components::QuantizedSparseMLPExpertMajorShape;
-use inference_backend_metal::components::QuantizedSparseMLPTokenMajorShape;
+use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
@@ -131,7 +129,7 @@ impl MoEScratch {
         .validate_shape(MoECombineShape {
             num_total_tokens: expert_major_shape.num_total_tokens,
         });
-        let sparse_config = QuantizedSparseMLPConfig {
+        let sparse_config = sparse_mlp::Config {
             num_experts: core.num_experts.try_into().expect("MoE expert count must fit u32"),
             hidden_dim: core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
             intermediate_dim: core
@@ -142,18 +140,16 @@ impl MoEScratch {
             bits: config.bits,
             dtype: config.io_dtype,
         };
-        let token_major_shape = QuantizedSparseMLPTokenMajorShape {
+        let token_major_shape = sparse_mlp::TokenMajorShape {
             num_total_routes: num_routes,
             num_total_tokens: max_tokens_u32,
         };
         let routed_hidden_bytes =
             sparse_config
                 .token_major_output_bytes(token_major_shape)
-                .max(
-                    sparse_config.expert_major_output_bytes(QuantizedSparseMLPExpertMajorShape {
-                        num_total_routes: expert_major_config.num_routes(expert_major_shape),
-                    }),
-                );
+                .max(sparse_config.expert_major_output_bytes(sparse_mlp::ExpertMajorShape {
+                    num_total_routes: expert_major_config.num_routes(expert_major_shape),
+                }));
         let topk: u32 = core
             .num_experts_per_token
             .try_into()

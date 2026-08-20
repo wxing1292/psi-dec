@@ -43,8 +43,8 @@ The current runtime path is the Metal replay path in
 Reusable Metal dense MLP kernels live in:
 
 ```text
-crates/inference-backend-metal/src/components/quantized_dense_mlp.rs
-crates/inference-backend-metal/src/components/quantized_dense_mlp_test.rs
+crates/inference-backend-metal/src/components/dense_mlp.rs
+crates/inference-backend-metal/src/components/dense_mlp_test.rs
 crates/inference-backend-metal/src/components/metal/quantized_dense_mlp_swiglu.metal
 ```
 
@@ -95,7 +95,7 @@ hidden_state
 ```
 
 `DenseMLPReplayShape.num_tokens` is the backend-neutral row count for an exact replay.
-Only `crates/inference-executor-metal` maps it to `QuantizedDenseMLPShape.num_total_tokens`.
+Only `crates/inference-executor-metal` maps it to `dense_mlp::Shape.num_total_tokens`.
 The additive bucketed path uses `DenseMLPBucketedInput.num_total_tokens` as the recorded row capacity.
 It accepts a caller-owned `ReplayParameterKey` for `num_active_tokens`.
 Production callers allocate scratch for model capacity.
@@ -126,10 +126,10 @@ If only one graph uses dense MLP, the loader derives the scratch geometry from t
 
 ### Bucketed replay
 
-`QuantizedDenseMLP` exposes one composite topology identity:
+`dense_mlp::Compute` exposes one composite topology identity:
 
 ```text
-QuantizedDenseMLPReplayTopology
+dense_mlp::ReplayTopology
   gate_up_affine
   down_affine
 ```
@@ -191,7 +191,7 @@ gate_up[row, 0..intermediate_dim)                  gate projection
 gate_up[row, intermediate_dim..2*intermediate_dim) up projection
 ```
 
-The `QuantizedDenseMLPSwiGLUKernel` reads both halves.
+The `SwiGLUKernel` reads both halves.
 It writes one `swiglu[num_tokens, intermediate_dim]` scratch buffer.
 The down projection reads that scratch and immutable down weights.
 It then writes the component output.
@@ -242,10 +242,10 @@ DenseMLPExecution
 Each affine owner defines its QMV or QMM thread-block task, tile geometry, and layout. The dense MLP owner supplies the
 projection geometry and runtime row count. It does not select the affine kernel again.
 
-The current SwiGLU kernel uses this specialization hierarchy:
+The current SwiGLU kernel uses this compile-time constant hierarchy:
 
 ```text
-DenseMLPSwiGLUKernelSpecialization
+SwiGLUKernelConstants
 ├── io_dtype
 └── thread_block
     └── required_threads = 256
@@ -255,13 +255,14 @@ One non-persistent SwiGLU thread block processes a bounded flat range of `(token
 One thread processes one coordinate at a time. It reads the matching gate and up values and writes one SwiGLU value.
 The tensor is row-major. The flat dispatch does not make a thread block the owner of one complete token row.
 
-Dense MLP does not use a component-level planner. The command graph does not change with the runtime row count. The
-two affine owners make independent row-dependent kernel choices. `QuantizedDenseMLPReplayTopology` records both affine
+Dense MLP does not use a component-level registry, selector, or planner. The command graph does not change with the
+runtime row count. The
+two affine owners make independent row-dependent kernel choices. `dense_mlp::ReplayTopology` records both affine
 choices so that a replay bucket cannot cross either topology boundary.
 
 ## Backend selection
 
-`QuantizedDenseMLP` owns one adaptive `AffineQuantizedMatmul` for gate/up and one for down.
+`dense_mlp::Compute` owns one adaptive `AffineQuantizedMatmul` for gate/up and one for down.
 Each `AffineQuantizedMatmul` owns the QMV/QMM candidates and selects its kernel.
 The model and executor provide the complete dense-MLP dimensions and active row count.
 They do not select a kernel or tile.

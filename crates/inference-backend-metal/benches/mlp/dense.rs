@@ -5,12 +5,7 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use inference_backend_metal::components::QuantizedDenseMLP;
-use inference_backend_metal::components::QuantizedDenseMLPBuffers;
-use inference_backend_metal::components::QuantizedDenseMLPConfig;
-use inference_backend_metal::components::QuantizedDenseMLPScratch;
-use inference_backend_metal::components::QuantizedDenseMLPShape;
-use inference_backend_metal::components::QuantizedDenseMLPWeights;
+use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -92,8 +87,8 @@ fn bench_dense_mlp(c: &mut Criterion) {
 
 struct QuantizedDenseMLPFixture {
     stream: Stream,
-    shape: QuantizedDenseMLPShape,
-    compute: QuantizedDenseMLP,
+    shape: dense_mlp::Shape,
+    compute: dense_mlp::Compute,
     buffers: QuantizedDenseMLPOwnedBuffers,
     scratch: QuantizedDenseMLPOwnedScratch,
     weights: QuantizedDenseMLPOwnedWeights,
@@ -103,21 +98,21 @@ struct QuantizedDenseMLPFixture {
 
 impl QuantizedDenseMLPFixture {
     fn new(device: &Device, profile: DenseMLPProfile, tokens: u32) -> Self {
-        let config = QuantizedDenseMLPConfig {
+        let config = dense_mlp::Config {
             hidden_dim: profile.hidden_dim,
             intermediate_dim: profile.intermediate_dim,
             group_size: profile.group_size,
             bits: profile.bits,
             dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedDenseMLPShape {
+        let shape = dense_mlp::Shape {
             num_total_tokens: tokens,
         };
         let gate_up_config = config.gate_up_config();
         let down_config = config.down_config();
         let tokens_i32 = tokens.try_into().expect("dense MLP token count must fit i32");
         let stream = Stream::new(device);
-        let compute = QuantizedDenseMLP::new(device, config);
+        let compute = dense_mlp::Compute::new(device, config);
         let buffers = QuantizedDenseMLPOwnedBuffers {
             hidden_state: bf16_buffer(device, &hidden_fixture(tokens as usize, profile.hidden_dim as usize)),
             replay_next_hidden_state: Buffer::new_zeroed(device, down_config.output_bytes(tokens_i32)),
@@ -171,8 +166,8 @@ impl QuantizedDenseMLPFixture {
         self.stream.submit_replay(&self.forward_replay).wait();
     }
 
-    fn weights(&self) -> QuantizedDenseMLPWeights<'_> {
-        QuantizedDenseMLPWeights {
+    fn weights(&self) -> dense_mlp::Weights<'_> {
+        dense_mlp::Weights {
             gate_up_weight: &self.weights.gate_up_weight,
             gate_up_scales: &self.weights.gate_up_scales,
             gate_up_biases: &self.weights.gate_up_biases,
@@ -185,8 +180,8 @@ impl QuantizedDenseMLPFixture {
 
 fn build_gate_up_swiglu_replay(
     stream: &Stream,
-    compute: &QuantizedDenseMLP,
-    shape: QuantizedDenseMLPShape,
+    compute: &dense_mlp::Compute,
+    shape: dense_mlp::Shape,
     buffers: &QuantizedDenseMLPOwnedBuffers,
     scratch: &QuantizedDenseMLPOwnedScratch,
     weights: &QuantizedDenseMLPOwnedWeights,
@@ -196,7 +191,7 @@ fn build_gate_up_swiglu_replay(
         shape,
         &buffers.hidden_state,
         &scratch.gate_up,
-        QuantizedDenseMLPWeights {
+        dense_mlp::Weights {
             gate_up_weight: &weights.gate_up_weight,
             gate_up_scales: &weights.gate_up_scales,
             gate_up_biases: &weights.gate_up_biases,
@@ -211,8 +206,8 @@ fn build_gate_up_swiglu_replay(
 
 fn build_forward_replay(
     stream: &Stream,
-    compute: &QuantizedDenseMLP,
-    shape: QuantizedDenseMLPShape,
+    compute: &dense_mlp::Compute,
+    shape: dense_mlp::Shape,
     buffers: &QuantizedDenseMLPOwnedBuffers,
     scratch: &QuantizedDenseMLPOwnedScratch,
     weights: &QuantizedDenseMLPOwnedWeights,
@@ -220,15 +215,15 @@ fn build_forward_replay(
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke(
         shape,
-        QuantizedDenseMLPBuffers {
+        dense_mlp::Buffers {
             hidden_state: &buffers.hidden_state,
             next_hidden_state: &buffers.replay_next_hidden_state,
         },
-        QuantizedDenseMLPScratch {
+        dense_mlp::Scratch {
             gate_up: &scratch.gate_up,
             swiglu: &scratch.replay_swiglu,
         },
-        QuantizedDenseMLPWeights {
+        dense_mlp::Weights {
             gate_up_weight: &weights.gate_up_weight,
             gate_up_scales: &weights.gate_up_scales,
             gate_up_biases: &weights.gate_up_biases,

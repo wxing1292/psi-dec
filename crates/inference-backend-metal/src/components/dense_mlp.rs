@@ -12,24 +12,24 @@ use crate::operators::AffineQuantizedMatmulKernelKind;
 const DENSE_MLP_SWIGLU_SOURCE: &str = include_str!("metal/quantized_dense_mlp_swiglu.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DenseMLPSwiGLUThreadBlockSpecialization {
+struct SwiGLUThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DenseMLPSwiGLUKernelSpecialization {
+struct SwiGLUKernelConstants {
     io_dtype: Dtype,
-    thread_block: DenseMLPSwiGLUThreadBlockSpecialization,
+    thread_block: SwiGLUThreadBlockConstants,
 }
 
-impl DenseMLPSwiGLUKernelSpecialization {
+impl SwiGLUKernelConstants {
     fn new(io_dtype: Dtype) -> Self {
-        let specialization = Self {
+        let constants = Self {
             io_dtype,
-            thread_block: DenseMLPSwiGLUThreadBlockSpecialization { required_threads: 256 },
+            thread_block: SwiGLUThreadBlockConstants { required_threads: 256 },
         };
-        specialization.validate();
-        specialization
+        constants.validate();
+        constants
     }
 
     fn validate(self) {
@@ -39,7 +39,7 @@ impl DenseMLPSwiGLUKernelSpecialization {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct QuantizedDenseMLPConfig {
+pub struct Config {
     pub hidden_dim: u32,
     pub intermediate_dim: u32,
     pub group_size: u32,
@@ -47,7 +47,7 @@ pub struct QuantizedDenseMLPConfig {
     pub dtype: Dtype,
 }
 
-impl QuantizedDenseMLPConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.hidden_dim > 0);
         assert!(self.intermediate_dim > 0);
@@ -72,7 +72,7 @@ impl QuantizedDenseMLPConfig {
         self.affine_config_unchecked(self.hidden_dim, self.intermediate_dim)
     }
 
-    pub fn swiglu_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
+    pub fn swiglu_bytes(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         (self.swiglu_num_values_unchecked(shape) as usize)
@@ -80,26 +80,26 @@ impl QuantizedDenseMLPConfig {
             .expect("dense MLP swiglu byte length must fit usize")
     }
 
-    fn swiglu_num_values_unchecked(self, shape: QuantizedDenseMLPShape) -> u32 {
+    fn swiglu_num_values_unchecked(self, shape: Shape) -> u32 {
         self.intermediate_dim
             .checked_mul(shape.num_total_tokens)
             .expect("dense MLP swiglu num_values must fit u32")
     }
 
-    pub fn input_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
+    pub fn input_bytes(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         self.input_bytes_unchecked(shape)
     }
 
-    fn input_bytes_unchecked(self, shape: QuantizedDenseMLPShape) -> usize {
+    fn input_bytes_unchecked(self, shape: Shape) -> usize {
         (shape.num_total_tokens as usize)
             .checked_mul(self.hidden_dim as usize)
             .and_then(|count| count.checked_mul(self.dtype.item_size()))
             .expect("dense MLP input byte length must fit usize")
     }
 
-    fn gate_up_output_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
+    fn gate_up_output_bytes(self, shape: Shape) -> usize {
         self.gate_up_config().output_bytes(
             shape
                 .num_total_tokens
@@ -108,7 +108,7 @@ impl QuantizedDenseMLPConfig {
         )
     }
 
-    fn output_bytes(self, shape: QuantizedDenseMLPShape) -> usize {
+    fn output_bytes(self, shape: Shape) -> usize {
         self.down_config().output_bytes(
             shape
                 .num_total_tokens
@@ -137,11 +137,11 @@ impl QuantizedDenseMLPConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct QuantizedDenseMLPShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl QuantizedDenseMLPShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_tokens > 0);
         i32::try_from(self.num_total_tokens).expect("dense MLP token count must fit i32");
@@ -149,19 +149,19 @@ impl QuantizedDenseMLPShape {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct QuantizedDenseMLPReplayTopology {
+pub struct ReplayTopology {
     pub gate_up_affine: AffineQuantizedMatmulKernelKind,
     pub down_affine: AffineQuantizedMatmulKernelKind,
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedDenseMLPBuffers<'a> {
+pub struct Buffers<'a> {
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedDenseMLPWeights<'a> {
+pub struct Weights<'a> {
     pub gate_up_weight: &'a Buffer,
     pub gate_up_scales: &'a Buffer,
     pub gate_up_biases: &'a Buffer,
@@ -171,7 +171,7 @@ pub struct QuantizedDenseMLPWeights<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedDenseMLPScratch<'a> {
+pub struct Scratch<'a> {
     pub gate_up: &'a Buffer,
     pub swiglu: &'a Buffer,
 }
@@ -199,32 +199,32 @@ pub struct QuantizedDenseMLPScratch<'a> {
 ///        v
 /// next_hidden_state [T, H]
 /// ```
-pub struct QuantizedDenseMLP {
-    config: QuantizedDenseMLPConfig,
+pub struct Compute {
+    config: Config,
     gate_up: AffineQuantizedMatmul,
     down: AffineQuantizedMatmul,
-    swiglu: QuantizedDenseMLPSwiGLUKernel,
+    swiglu: SwiGLUKernel,
 }
 
-impl QuantizedDenseMLP {
-    pub fn new(device: &Device, config: QuantizedDenseMLPConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
             gate_up: AffineQuantizedMatmul::new(device, config.gate_up_config()),
             down: AffineQuantizedMatmul::new(device, config.down_config()),
-            swiglu: QuantizedDenseMLPSwiGLUKernel::new(device, config.dtype),
+            swiglu: SwiGLUKernel::new(device, config.dtype),
         }
     }
 
     pub fn invoke<'a>(
         &'a self,
-        shape: QuantizedDenseMLPShape,
-        buffers: QuantizedDenseMLPBuffers<'a>,
-        scratch: QuantizedDenseMLPScratch<'a>,
-        weights: QuantizedDenseMLPWeights<'a>,
-    ) -> QuantizedDenseMLPInvocation<'a> {
-        QuantizedDenseMLPInvocation {
+        shape: Shape,
+        buffers: Buffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             compute: self,
             shape,
             buffers,
@@ -239,12 +239,12 @@ impl QuantizedDenseMLP {
         &'a self,
         num_total_tokens: u32,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: QuantizedDenseMLPBuffers<'a>,
-        scratch: QuantizedDenseMLPScratch<'a>,
-        weights: QuantizedDenseMLPWeights<'a>,
-    ) -> QuantizedDenseMLPInvocation<'a> {
+        buffers: Buffers<'a>,
+        scratch: Scratch<'a>,
+        weights: Weights<'a>,
+    ) -> Invocation<'a> {
         let shape = capacity_shape(num_total_tokens);
-        QuantizedDenseMLPInvocation {
+        Invocation {
             compute: self,
             shape,
             buffers,
@@ -254,9 +254,9 @@ impl QuantizedDenseMLP {
         }
     }
 
-    pub fn topology(&self, num_total_tokens: u32) -> QuantizedDenseMLPReplayTopology {
+    pub fn topology(&self, num_total_tokens: u32) -> ReplayTopology {
         let shape = capacity_shape(num_total_tokens);
-        QuantizedDenseMLPReplayTopology {
+        ReplayTopology {
             gate_up_affine: self.gate_up.topology(shape.num_total_tokens),
             down_affine: self.down.topology(shape.num_total_tokens),
         }
@@ -272,12 +272,12 @@ impl QuantizedDenseMLP {
 
     pub fn invoke_gate_up<'a>(
         &'a self,
-        shape: QuantizedDenseMLPShape,
+        shape: Shape,
         hidden_state: &'a Buffer,
         gate_up: &'a Buffer,
-        weights: QuantizedDenseMLPWeights<'a>,
-    ) -> QuantizedDenseMLPGateUpInvocation<'a> {
-        QuantizedDenseMLPGateUpInvocation {
+        weights: Weights<'a>,
+    ) -> GateUpInvocation<'a> {
+        GateUpInvocation {
             compute: self,
             shape,
             hidden_state,
@@ -293,9 +293,9 @@ impl QuantizedDenseMLP {
         num_active_tokens_key: ReplayParameterKey,
         hidden_state: &'a Buffer,
         gate_up: &'a Buffer,
-        weights: QuantizedDenseMLPWeights<'a>,
-    ) -> QuantizedDenseMLPGateUpInvocation<'a> {
-        QuantizedDenseMLPGateUpInvocation {
+        weights: Weights<'a>,
+    ) -> GateUpInvocation<'a> {
+        GateUpInvocation {
             compute: self,
             shape: capacity_shape(num_total_tokens),
             hidden_state,
@@ -305,13 +305,8 @@ impl QuantizedDenseMLP {
         }
     }
 
-    pub fn invoke_swiglu<'a>(
-        &'a self,
-        shape: QuantizedDenseMLPShape,
-        gate_up: &'a Buffer,
-        swiglu: &'a Buffer,
-    ) -> QuantizedDenseMLPSwiGLUInvocation<'a> {
-        QuantizedDenseMLPSwiGLUInvocation {
+    pub fn invoke_swiglu<'a>(&'a self, shape: Shape, gate_up: &'a Buffer, swiglu: &'a Buffer) -> SwiGLUInvocation<'a> {
+        SwiGLUInvocation {
             compute: self,
             shape,
             gate_up,
@@ -326,8 +321,8 @@ impl QuantizedDenseMLP {
         num_active_tokens_key: ReplayParameterKey,
         gate_up: &'a Buffer,
         swiglu: &'a Buffer,
-    ) -> QuantizedDenseMLPSwiGLUInvocation<'a> {
-        QuantizedDenseMLPSwiGLUInvocation {
+    ) -> SwiGLUInvocation<'a> {
+        SwiGLUInvocation {
             compute: self,
             shape: capacity_shape(num_total_tokens),
             gate_up,
@@ -338,12 +333,12 @@ impl QuantizedDenseMLP {
 
     pub fn invoke_down<'a>(
         &'a self,
-        shape: QuantizedDenseMLPShape,
+        shape: Shape,
         swiglu: &'a Buffer,
         next_hidden_state: &'a Buffer,
-        weights: QuantizedDenseMLPWeights<'a>,
-    ) -> QuantizedDenseMLPDownInvocation<'a> {
-        QuantizedDenseMLPDownInvocation {
+        weights: Weights<'a>,
+    ) -> DownInvocation<'a> {
+        DownInvocation {
             compute: self,
             shape,
             swiglu,
@@ -359,9 +354,9 @@ impl QuantizedDenseMLP {
         num_active_tokens_key: ReplayParameterKey,
         swiglu: &'a Buffer,
         next_hidden_state: &'a Buffer,
-        weights: QuantizedDenseMLPWeights<'a>,
-    ) -> QuantizedDenseMLPDownInvocation<'a> {
-        QuantizedDenseMLPDownInvocation {
+        weights: Weights<'a>,
+    ) -> DownInvocation<'a> {
+        DownInvocation {
             compute: self,
             shape: capacity_shape(num_total_tokens),
             swiglu,
@@ -372,24 +367,24 @@ impl QuantizedDenseMLP {
     }
 }
 
-fn capacity_shape(num_total_tokens: u32) -> QuantizedDenseMLPShape {
-    let shape = QuantizedDenseMLPShape { num_total_tokens };
+fn capacity_shape(num_total_tokens: u32) -> Shape {
+    let shape = Shape { num_total_tokens };
     shape.validate();
     shape
 }
 
-pub struct QuantizedDenseMLPInvocation<'a> {
-    compute: &'a QuantizedDenseMLP,
-    shape: QuantizedDenseMLPShape,
-    buffers: QuantizedDenseMLPBuffers<'a>,
-    scratch: QuantizedDenseMLPScratch<'a>,
-    weights: QuantizedDenseMLPWeights<'a>,
+pub struct Invocation<'a> {
+    compute: &'a Compute,
+    shape: Shape,
+    buffers: Buffers<'a>,
+    scratch: Scratch<'a>,
+    weights: Weights<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for QuantizedDenseMLPInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        QuantizedDenseMLPGateUpInvocation {
+        GateUpInvocation {
             compute: self.compute,
             shape: self.shape,
             hidden_state: self.buffers.hidden_state,
@@ -398,14 +393,14 @@ impl Operator for QuantizedDenseMLPInvocation<'_> {
             num_active_tokens_key: self.num_active_tokens_key,
         }
         .record(recorder);
-        recorder.record_with_barrier_before(QuantizedDenseMLPSwiGLUInvocation {
+        recorder.record_with_barrier_before(SwiGLUInvocation {
             compute: self.compute,
             shape: self.shape,
             gate_up: self.scratch.gate_up,
             swiglu: self.scratch.swiglu,
             num_active_tokens_key: self.num_active_tokens_key,
         });
-        recorder.record_with_barrier_before(QuantizedDenseMLPDownInvocation {
+        recorder.record_with_barrier_before(DownInvocation {
             compute: self.compute,
             shape: self.shape,
             swiglu: self.scratch.swiglu,
@@ -416,16 +411,16 @@ impl Operator for QuantizedDenseMLPInvocation<'_> {
     }
 }
 
-pub struct QuantizedDenseMLPGateUpInvocation<'a> {
-    compute: &'a QuantizedDenseMLP,
-    shape: QuantizedDenseMLPShape,
+pub struct GateUpInvocation<'a> {
+    compute: &'a Compute,
+    shape: Shape,
     hidden_state: &'a Buffer,
     gate_up: &'a Buffer,
-    weights: QuantizedDenseMLPWeights<'a>,
+    weights: Weights<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for QuantizedDenseMLPGateUpInvocation<'_> {
+impl Operator for GateUpInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let invocation = match self.num_active_tokens_key {
             Some(key) => {
@@ -467,15 +462,15 @@ impl Operator for QuantizedDenseMLPGateUpInvocation<'_> {
     }
 }
 
-pub struct QuantizedDenseMLPSwiGLUInvocation<'a> {
-    compute: &'a QuantizedDenseMLP,
-    shape: QuantizedDenseMLPShape,
+pub struct SwiGLUInvocation<'a> {
+    compute: &'a Compute,
+    shape: Shape,
     gate_up: &'a Buffer,
     swiglu: &'a Buffer,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for QuantizedDenseMLPSwiGLUInvocation<'_> {
+impl Operator for SwiGLUInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.compute
             .swiglu
@@ -490,16 +485,16 @@ impl Operator for QuantizedDenseMLPSwiGLUInvocation<'_> {
     }
 }
 
-pub struct QuantizedDenseMLPDownInvocation<'a> {
-    compute: &'a QuantizedDenseMLP,
-    shape: QuantizedDenseMLPShape,
+pub struct DownInvocation<'a> {
+    compute: &'a Compute,
+    shape: Shape,
     swiglu: &'a Buffer,
     next_hidden_state: &'a Buffer,
-    weights: QuantizedDenseMLPWeights<'a>,
+    weights: Weights<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for QuantizedDenseMLPDownInvocation<'_> {
+impl Operator for DownInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let invocation = match self.num_active_tokens_key {
             Some(key) => {
@@ -541,34 +536,34 @@ impl Operator for QuantizedDenseMLPDownInvocation<'_> {
     }
 }
 
-struct QuantizedDenseMLPSwiGLUKernel {
-    specialization: DenseMLPSwiGLUKernelSpecialization,
+struct SwiGLUKernel {
+    constants: SwiGLUKernelConstants,
     kernel: Kernel,
 }
 
-impl QuantizedDenseMLPSwiGLUKernel {
+impl SwiGLUKernel {
     fn new(device: &Device, dtype: Dtype) -> Self {
-        let specialization = DenseMLPSwiGLUKernelSpecialization::new(dtype);
-        let function_name = match specialization.io_dtype {
+        let constants = SwiGLUKernelConstants::new(dtype);
+        let function_name = match constants.io_dtype {
             Dtype::Float32 => "dense_mlp_swiglu_f32",
             Dtype::Bfloat16 => "dense_mlp_swiglu_bf16",
             dtype => panic!("unsupported dense MLP swiglu dtype {dtype:?}"),
         };
         Self {
-            specialization,
+            constants,
             kernel: Kernel::new(device, DENSE_MLP_SWIGLU_SOURCE, function_name),
         }
     }
 
     fn invoke<'a>(
         &'a self,
-        config: QuantizedDenseMLPConfig,
-        shape: QuantizedDenseMLPShape,
+        config: Config,
+        shape: Shape,
         gate_up: &'a Buffer,
         swiglu: &'a Buffer,
         num_active_tokens_key: Option<ReplayParameterKey>,
-    ) -> QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
-        QuantizedDenseMLPSwiGLURowMajorInvocation {
+    ) -> SwiGLURowMajorInvocation<'a> {
+        SwiGLURowMajorInvocation {
             kernel: self,
             config,
             shape,
@@ -579,16 +574,16 @@ impl QuantizedDenseMLPSwiGLUKernel {
     }
 }
 
-struct QuantizedDenseMLPSwiGLURowMajorInvocation<'a> {
-    kernel: &'a QuantizedDenseMLPSwiGLUKernel,
-    config: QuantizedDenseMLPConfig,
-    shape: QuantizedDenseMLPShape,
+struct SwiGLURowMajorInvocation<'a> {
+    kernel: &'a SwiGLUKernel,
+    config: Config,
+    shape: Shape,
     gate_up: &'a Buffer,
     swiglu: &'a Buffer,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
+impl Operator for SwiGLURowMajorInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_kernel(&self.kernel.kernel);
@@ -600,14 +595,11 @@ impl Operator for QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
         }
         recorder.set_u32(3, self.config.intermediate_dim);
         let num_values = self.config.swiglu_num_values_unchecked(self.shape) as usize;
-        recorder.dispatch_1d(
-            num_values,
-            self.kernel.specialization.thread_block.required_threads as usize,
-        );
+        recorder.dispatch_1d(num_values, self.kernel.constants.thread_block.required_threads as usize);
     }
 }
 
-impl QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
+impl SwiGLURowMajorInvocation<'_> {
     fn validate(&self) {
         self.shape.validate();
         let gate_up_output_bytes = self.config.gate_up_output_bytes(self.shape);
@@ -624,5 +616,5 @@ impl QuantizedDenseMLPSwiGLURowMajorInvocation<'_> {
 }
 
 #[cfg(test)]
-#[path = "quantized_dense_mlp_test.rs"]
+#[path = "dense_mlp_test.rs"]
 mod tests;
