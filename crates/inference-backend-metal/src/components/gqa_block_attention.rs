@@ -9,11 +9,39 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 
 const GQA_BLOCK_SDPA_SOURCE: &str = include_str!("metal/gqa_block_sdpa.metal");
-const SIMD_WIDTH: u32 = 32;
-const NUM_THREADS_PER_THREADBLOCK: u32 = SIMD_WIDTH;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GQABlockSDPAThreadBlockSpecialization {
+    required_threads: u32,
+    simdgroup_width: u32,
+}
+
+impl GQABlockSDPAThreadBlockSpecialization {
+    fn current() -> Self {
+        Self {
+            required_threads: 32,
+            simdgroup_width: 32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GQABlockSDPAKernelSpecialization {
+    config: GQABlockSDPAConfig,
+    thread_block: GQABlockSDPAThreadBlockSpecialization,
+}
+
+impl GQABlockSDPAKernelSpecialization {
+    fn current(config: GQABlockSDPAConfig) -> Self {
+        Self {
+            config,
+            thread_block: GQABlockSDPAThreadBlockSpecialization::current(),
+        }
+    }
+}
 
 /// Dense request-block SDPA that writes one `SDPAPartialOutput` into the
-/// `SDPAMapTaskTemplate` slot selected for each Q token. One threadblock owns
+/// `SDPAMapTaskTemplate` slot selected for each Q token. One thread block owns
 /// one Q-token/Q-head block-SDPA task. The shared paged reducer later combines
 /// the bidirectional block and persistent-history partial outputs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,6 +56,7 @@ pub struct GQABlockSDPAConfig {
 
 impl GQABlockSDPAConfig {
     pub fn validate(self) {
+        let thread_block = GQABlockSDPAThreadBlockSpecialization::current();
         assert!(self.block_size > 0);
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
@@ -35,7 +64,7 @@ impl GQABlockSDPAConfig {
         assert!(self.head_dim > 0);
         assert!(self.scale.is_finite() && self.scale > 0.0);
         assert_eq!(
-            self.head_dim % SIMD_WIDTH,
+            self.head_dim % thread_block.simdgroup_width,
             0,
             "GQA block SDPA head_dim must be divisible by the SIMD width"
         );
@@ -80,21 +109,21 @@ impl GQABlockSDPAConfig {
             .expect("GQA block SDPA partial-output element count must fit usize")
     }
 
-    fn dispatch_threads(self, shape: GQABlockSDPAShape) -> usize {
+    fn dispatch_threads(self, shape: GQABlockSDPAShape, thread_block: GQABlockSDPAThreadBlockSpecialization) -> usize {
         checked_product(
             "GQA block SDPA thread count",
             &[
                 shape.num_tokens as usize,
                 self.num_q_heads as usize,
-                NUM_THREADS_PER_THREADBLOCK as usize,
+                thread_block.required_threads as usize,
             ],
         )
     }
 
-    fn threadblock_memory_bytes(self) -> usize {
+    fn thread_block_memory_bytes(self) -> usize {
         (self.block_size as usize)
             .checked_mul(size_of::<f32>())
-            .expect("GQA block SDPA threadblock memory must fit usize")
+            .expect("GQA block SDPA thread-block memory must fit usize")
     }
 }
 
@@ -121,7 +150,10 @@ impl GQABlockSDPAShape {
             "GQA block SDPA partial-output statistics",
         );
         assert_u32_index_domain(config.partial_output_values(self), "GQA block SDPA partial output");
-        assert_u32_count_domain(config.dispatch_threads(self), "GQA block SDPA threads");
+        assert_u32_count_domain(
+            config.dispatch_threads(self, GQABlockSDPAThreadBlockSpecialization::current()),
+            "GQA block SDPA threads",
+        );
     }
 }
 
@@ -137,44 +169,45 @@ pub struct GQABlockSDPABuffers<'a> {
 }
 
 pub struct GQABlockSDPAKernel {
-    config: GQABlockSDPAConfig,
+    specialization: GQABlockSDPAKernelSpecialization,
     kernel: Kernel,
 }
 
 impl GQABlockSDPAKernel {
     pub fn new(device: &Device, config: GQABlockSDPAConfig) -> Self {
         config.validate();
+        let specialization = GQABlockSDPAKernelSpecialization::current(config);
         let function_name = match config.dtype {
             Dtype::Float32 => "gqa_block_sdpa_f32",
             Dtype::Bfloat16 => "gqa_block_sdpa_bf16",
             dtype => panic!("unsupported GQA block SDPA dtype {dtype:?}"),
         };
-        let kernel = Kernel::new(device, &block_sdpa_source(config), function_name);
+        let kernel = Kernel::new(device, &block_sdpa_source(specialization), function_name);
         assert_eq!(
             kernel.thread_execution_width(),
-            SIMD_WIDTH as usize,
+            specialization.thread_block.simdgroup_width as usize,
             "GQA block SDPA requires a 32-thread SIMDgroup"
         );
         assert!(
-            NUM_THREADS_PER_THREADBLOCK as usize <= kernel.max_total_threads_per_threadblock(),
-            "GQA block SDPA requires {} threads per threadblock but the pipeline supports {}",
-            NUM_THREADS_PER_THREADBLOCK,
+            specialization.thread_block.required_threads as usize <= kernel.max_total_threads_per_threadblock(),
+            "GQA block SDPA requires {} threads per thread block but the pipeline supports {}",
+            specialization.thread_block.required_threads,
             kernel.max_total_threads_per_threadblock()
         );
-        let max_threadblock_memory_length = device.max_threadblock_memory_length();
+        let max_thread_block_memory_length = device.max_threadblock_memory_length();
         assert!(
-            config.threadblock_memory_bytes() <= max_threadblock_memory_length,
-            "GQA block SDPA requires {} bytes of threadblock memory but the device supports {}",
-            config.threadblock_memory_bytes(),
-            max_threadblock_memory_length
+            config.thread_block_memory_bytes() <= max_thread_block_memory_length,
+            "GQA block SDPA requires {} bytes of thread-block memory but the device supports {}",
+            config.thread_block_memory_bytes(),
+            max_thread_block_memory_length
         );
         assert!(
-            kernel.static_threadblock_memory_length() <= max_threadblock_memory_length,
-            "GQA block SDPA pipeline uses {} bytes of static threadblock memory but the device supports {}",
+            kernel.static_threadblock_memory_length() <= max_thread_block_memory_length,
+            "GQA block SDPA pipeline uses {} bytes of static thread-block memory but the device supports {}",
             kernel.static_threadblock_memory_length(),
-            max_threadblock_memory_length
+            max_thread_block_memory_length
         );
-        Self { config, kernel }
+        Self { specialization, kernel }
     }
 
     pub fn invoke<'a>(
@@ -183,7 +216,7 @@ impl GQABlockSDPAKernel {
         buffers: GQABlockSDPABuffers<'a>,
     ) -> GQABlockSDPAInvocation<'a> {
         GQABlockSDPAInvocation {
-            config: self.config,
+            specialization: self.specialization,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -191,25 +224,24 @@ impl GQABlockSDPAKernel {
     }
 }
 
-fn block_sdpa_source(config: GQABlockSDPAConfig) -> String {
+fn block_sdpa_source(specialization: GQABlockSDPAKernelSpecialization) -> String {
+    let config = specialization.config;
     let constants = format!(
         "using namespace metal;\n\nconstant uint block_size = {}u;\nconstant uint num_q_heads = {}u;\nconstant uint \
          num_kv_heads = {}u;\nconstant uint head_dim = {}u;\nconstant float attention_scale = {:.9e}f;\nconstant uint \
-         num_threads_per_threadblock = {}u;\nconstant uint simd_width = {}u;\nconstant uint q_values_per_thread = \
-         head_dim / simd_width;",
+         simd_width = {}u;\nconstant uint q_values_per_thread = head_dim / simd_width;",
         config.block_size,
         config.num_q_heads,
         config.num_kv_heads,
         config.head_dim,
         config.scale,
-        NUM_THREADS_PER_THREADBLOCK,
-        SIMD_WIDTH,
+        specialization.thread_block.simdgroup_width,
     );
     GQA_BLOCK_SDPA_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
 
 pub struct GQABlockSDPAInvocation<'a> {
-    config: GQABlockSDPAConfig,
+    specialization: GQABlockSDPAKernelSpecialization,
     kernel: &'a Kernel,
     shape: GQABlockSDPAShape,
     buffers: GQABlockSDPABuffers<'a>,
@@ -218,6 +250,7 @@ pub struct GQABlockSDPAInvocation<'a> {
 impl Operator for GQABlockSDPAInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
+        let config = self.specialization.config;
         recorder.set_kernel(self.kernel);
         recorder.set_buffer_read(0, self.buffers.q, 0);
         recorder.set_buffer_read(1, self.buffers.local_k, 0);
@@ -228,18 +261,19 @@ impl Operator for GQABlockSDPAInvocation<'_> {
         recorder.set_buffer_write(6, self.buffers.partial_output, 0);
         recorder.set_u32(7, self.shape.num_tokens);
         recorder.dispatch_1d(
-            self.config.dispatch_threads(self.shape),
-            NUM_THREADS_PER_THREADBLOCK as usize,
+            config.dispatch_threads(self.shape, self.specialization.thread_block),
+            self.specialization.thread_block.required_threads as usize,
         );
     }
 }
 
 impl GQABlockSDPAInvocation<'_> {
     fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.q.len_bytes() >= bytes(self.config.q_elements(self.shape), self.config.dtype));
-        assert!(self.buffers.local_k.len_bytes() >= bytes(self.config.kv_elements(self.shape), self.config.dtype));
-        assert!(self.buffers.local_v.len_bytes() >= bytes(self.config.kv_elements(self.shape), self.config.dtype));
+        let config = self.specialization.config;
+        self.shape.validate(config);
+        assert!(self.buffers.q.len_bytes() >= bytes(config.q_elements(self.shape), config.dtype));
+        assert!(self.buffers.local_k.len_bytes() >= bytes(config.kv_elements(self.shape), config.dtype));
+        assert!(self.buffers.local_v.len_bytes() >= bytes(config.kv_elements(self.shape), config.dtype));
         assert!(
             self.buffers.block_sdpa_map_task_template_indices.len_bytes()
                 >= (self.shape.num_tokens as usize)
@@ -247,6 +281,7 @@ impl GQABlockSDPAInvocation<'_> {
                     .expect("GQA block SDPA map TaskTemplate index bytes must fit usize")
         );
         let partial_output_stat_bytes = self
+            .specialization
             .config
             .partial_output_stat_elements(self.shape)
             .checked_mul(size_of::<f32>())
@@ -254,8 +289,7 @@ impl GQABlockSDPAInvocation<'_> {
         assert!(self.buffers.partial_exp_sums.len_bytes() >= partial_output_stat_bytes);
         assert!(self.buffers.partial_max_logits.len_bytes() >= partial_output_stat_bytes);
         assert!(
-            self.buffers.partial_output.len_bytes()
-                >= bytes(self.config.partial_output_values(self.shape), self.config.dtype,)
+            self.buffers.partial_output.len_bytes() >= bytes(config.partial_output_values(self.shape), config.dtype,)
         );
     }
 }

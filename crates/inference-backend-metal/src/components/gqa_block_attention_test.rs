@@ -4,6 +4,22 @@ use super::*;
 use crate::metal::Stream;
 
 #[test]
+fn test_specialization_has_explicit_thread_block_scope() {
+    let config = GQABlockSDPAConfig {
+        block_size: 3,
+        num_q_heads: 5,
+        num_kv_heads: 1,
+        head_dim: 32,
+        scale: 32.0_f32.sqrt().recip(),
+        dtype: Dtype::Bfloat16,
+    };
+    let specialization = GQABlockSDPAKernelSpecialization::current(config);
+    assert_eq!(specialization.config, config);
+    assert_eq!(specialization.thread_block.required_threads, 32);
+    assert_eq!(specialization.thread_block.simdgroup_width, 32);
+}
+
+#[test]
 #[should_panic(expected = "complete request blocks")]
 fn test_block_shape_rejects_partial_request_block() {
     GQABlockSDPAShape {

@@ -429,6 +429,10 @@ and `num_tokens_per_page` with that dtype.
 The Metal component selects the matching bf16/f32 update kernel. `GQAKVPageWriteConfig` owns the stable
 `num_kv_heads`, `head_dim`, `page_bytes`, dtype, and derived tokens-per-page.
 
+`GQAKVPageWriteKernelSpecialization` contains this compile-time config and a thread-block specialization that requires
+256 threads. One thread owns one flattened `(token write, KV head, head-dimension)` value. The dispatch grid and active
+token-write count remain invocation data.
+
 `num_token_writes`, `gqa_layer_index`, and page-table coordinates remain invocation data.
 The Metal replay core provides symmetric fixed-or-parameter scalar sources for `u32`, `u64`, `i32`, `i64`, and `f32`.
 `ReplayArguments`, `CommandParameterLayoutBuilder`, and `CommandRecorder` support the same scalar set. GQA uses
@@ -956,6 +960,9 @@ It does not measure history attention, partial reduction, projections, or a DSpa
 
 One block-SDPA Task owns one Q token and one Q head.
 The backend uses one 32-thread SIMDgroup for the Task.
+`GQABlockSDPAKernelSpecialization` contains the stable SDPA config and its thread-block specialization. The
+specialization requires 32 threads and a 32-thread SIMDgroup. The generated source no longer declares an unused
+`num_threads_per_threadblock` constant.
 For `head_dim=128`, each thread keeps four F32 Q values and one dot-product accumulator.
 The logical Q register payload is 16 bytes per thread.
 The SIMDgroup computes each Q/K dot product across the head dimension.
