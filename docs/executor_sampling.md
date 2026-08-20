@@ -101,6 +101,11 @@ The draft table contains one distribution for each draft token.
 Requests are independent.
 Drafts within one request are ordered because the first rejection ends that request's acceptance walk.
 
+The sparse rejection kernel has no implementation planner. One thread block owns one request. The threads cooperate
+on the sparse-distribution operations for that request. The block processes the draft sequence in order. The current
+kernel specialization requires 256 threads. The recorded grid contains one thread block for each request capacity
+slot. Replay arguments limit execution to the active request count.
+
 `SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
 `max_k` is the maximum sparse Top-K row width, not the vocabulary size.
 Its draft capacity is `max_requests * max_num_spec_tokens`.

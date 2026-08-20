@@ -13,6 +13,26 @@ use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SparseRejectionSampleThreadBlockSpecialization {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SparseRejectionSampleKernelSpecialization {
+    thread_block: SparseRejectionSampleThreadBlockSpecialization,
+}
+
+impl SparseRejectionSampleKernelSpecialization {
+    fn current() -> Self {
+        Self {
+            thread_block: SparseRejectionSampleThreadBlockSpecialization {
+                required_threads: SAMPLING_NUM_THREADS_PER_THREADBLOCK,
+            },
+        }
+    }
+}
+
 pub const REJECTION_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("rejection_sampling.num_active_threads");
 pub const REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY: ReplayParameterKey =
@@ -64,12 +84,14 @@ pub struct SparseRejectionSampleBuffers<'a> {
 }
 
 pub struct SparseRejectionSampleKernel {
+    specialization: SparseRejectionSampleKernelSpecialization,
     kernel: Kernel,
 }
 
 impl SparseRejectionSampleKernel {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
+            specialization: SparseRejectionSampleKernelSpecialization::current(),
             kernel: Kernel::new(device, SAMPLING_SOURCE, "rejection_sparse_sample"),
         }
     }
@@ -111,7 +133,7 @@ impl SparseRejectionSampleKernel {
         if shape.num_total_reqs > 1 {
             arguments.set_u32(
                 REJECTION_NUM_ACTIVE_THREADS_KEY,
-                checked_num_threads(num_active_reqs, SAMPLING_NUM_THREADS_PER_THREADBLOCK),
+                checked_num_threads(num_active_reqs, self.specialization.thread_block.required_threads),
             );
         }
         if shape.num_total_target_distributions > 1 {
@@ -288,7 +310,7 @@ impl Operator for SparseRejectionSampleInvocation<'_> {
         recorder.set_u32(17, self.shape.top_k);
         recorder.set_u32(18, self.shape.max_target_k);
         recorder.set_u32(19, self.shape.max_draft_k);
-        let num_threads_per_req = SAMPLING_NUM_THREADS_PER_THREADBLOCK;
+        let num_threads_per_req = self.kernel.specialization.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_reqs, num_threads_per_req);
         if num_threads_per_req == num_total_threads {
             recorder.set_u32(14, num_total_threads);
@@ -320,10 +342,7 @@ impl Operator for SparseRejectionSampleInvocation<'_> {
                 self.shape.num_total_draft_distributions,
             );
         }
-        recorder.dispatch_1d(
-            num_total_threads as usize,
-            SAMPLING_NUM_THREADS_PER_THREADBLOCK as usize,
-        );
+        recorder.dispatch_1d(num_total_threads as usize, num_threads_per_req as usize);
     }
 }
 

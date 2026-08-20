@@ -14,6 +14,12 @@ const OUTPUT_TOKEN_CANARY: i32 = -77;
 const OUTPUT_PROB_CANARY: f32 = -77.0;
 
 #[test]
+fn test_specialization_has_explicit_thread_block_scope() {
+    let specialization = super::SparseRejectionSampleKernelSpecialization::current();
+    assert_eq!(specialization.thread_block.required_threads, 256);
+}
+
+#[test]
 fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
