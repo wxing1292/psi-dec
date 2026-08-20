@@ -312,25 +312,25 @@ impl<'a> RealGQAFixture<'a> {
         );
         assert!(num_tokens as usize <= max_tokens);
         let q_heads_per_kv_head = model.num_q_heads / model.num_kv_heads;
-        let single_q_head_tile_size = q_heads_per_kv_head
-            .min(params.split_kv_single_q_max_q_head_tile_size as usize)
+        let single_q_max_q_heads = q_heads_per_kv_head
+            .min(params.split_kv_single_q_max_q_heads as usize)
             .try_into()
-            .expect("GQA Q-head tile size must fit u32");
-        let num_q_token_tiles = num_tokens_per_req
+            .expect("GQA max Q-head count must fit u32");
+        let num_q_token_ranges = num_tokens_per_req
             .iter()
-            .map(|&count| count.div_ceil(params.split_kv_tiled_q_token_tile_size))
+            .map(|&count| count.div_ceil(params.split_kv_tiled_q_max_q_tokens))
             .sum::<u32>();
-        if params.split_kv_tiled_q_head_tile_size == 0 {
-            let desired_q_head_tile_size = if (num_tokens as u64) < 4 * num_q_token_tiles as u64 {
+        if params.split_kv_tiled_q_max_q_heads == 0 {
+            let desired_max_q_heads = if (num_tokens as u64) < 4 * num_q_token_ranges as u64 {
                 q_heads_per_kv_head.div_ceil(2)
             } else {
                 q_heads_per_kv_head
             };
-            let max_q_head_tile_size = 256 / (params.split_kv_tiled_q_token_tile_size / 8 * 32);
-            params.split_kv_tiled_q_head_tile_size = desired_q_head_tile_size
-                .min(max_q_head_tile_size as usize)
+            let max_supported_q_heads = 256 / (params.split_kv_tiled_q_max_q_tokens / 8 * 32);
+            params.split_kv_tiled_q_max_q_heads = desired_max_q_heads
+                .min(max_supported_q_heads as usize)
                 .try_into()
-                .expect("GQA Q-head tile size must fit u32");
+                .expect("GQA max Q-head count must fit u32");
         }
         let req_slots = (0..num_reqs).collect::<Vec<_>>();
         let materialized_cu_tokens = cu_tokens(&num_tokens_per_req)
@@ -347,9 +347,9 @@ impl<'a> RealGQAFixture<'a> {
         };
         let single_q_execution = GQASDPAExecutionSpecialization::single_q(
             sdpa_config,
-            params.split_kv_single_q_kv_token_tile_size,
-            params.split_kv_single_q_num_threads_per_threadblock,
-            single_q_head_tile_size,
+            params.split_kv_single_q_kv_tokens_per_iteration,
+            params.split_kv_single_q_required_threads,
+            single_q_max_q_heads,
         );
         let single_q_plan = GQASDPAPlanner::new(
             GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![single_q_execution]),
@@ -366,9 +366,9 @@ impl<'a> RealGQAFixture<'a> {
         let page_ids = Buffer::from_slice(device, &page_table(num_reqs, num_blocks));
         let tiled_q_execution = GQASDPAExecutionSpecialization::tiled_q(
             sdpa_config,
-            params.split_kv_tiled_q_token_tile_size,
-            params.split_kv_tiled_q_kv_token_tile_size,
-            params.split_kv_tiled_q_head_tile_size,
+            params.split_kv_tiled_q_max_q_tokens,
+            params.split_kv_tiled_q_kv_tokens_per_iteration,
+            params.split_kv_tiled_q_max_q_heads,
         );
         let tiled_q_plan = GQASDPAPlanner::new(
             GQASDPASpecializationRegistry::from_execution_specializations(sdpa_config, vec![tiled_q_execution]),
@@ -425,19 +425,19 @@ impl<'a> RealGQAFixture<'a> {
             device,
             num_tokens as usize * model.q_dim() * Dtype::Bfloat16.item_size(),
         );
-        let num_sdpa_partial_output_tokens = tiled_replay_shape.num_total_sdpa_map_task_templates as usize
-            * params.split_kv_tiled_q_token_tile_size as usize;
+        let num_reserved_sdpa_partial_output_tokens = tiled_replay_shape.num_total_sdpa_map_task_templates as usize
+            * params.split_kv_tiled_q_max_q_tokens as usize;
         let tiled_partial_output = Buffer::new_zeroed(
             device,
-            num_sdpa_partial_output_tokens * model.q_dim() * Dtype::Bfloat16.item_size(),
+            num_reserved_sdpa_partial_output_tokens * model.q_dim() * Dtype::Bfloat16.item_size(),
         );
         let tiled_partial_exp_sums = Buffer::new_zeroed(
             device,
-            num_sdpa_partial_output_tokens * model.num_q_heads * size_of::<f32>(),
+            num_reserved_sdpa_partial_output_tokens * model.num_q_heads * size_of::<f32>(),
         );
         let tiled_partial_max_logits = Buffer::new_zeroed(
             device,
-            num_sdpa_partial_output_tokens * model.num_q_heads * size_of::<f32>(),
+            num_reserved_sdpa_partial_output_tokens * model.num_q_heads * size_of::<f32>(),
         );
         let gated_attention_output = Buffer::new_zeroed(
             device,
@@ -776,26 +776,26 @@ impl<'a> RealGQAFixture<'a> {
             .join(",");
         println!(
             "case component=gqa model={} num_tokens_per_req=[{num_tokens_per_req}] \
-             existing_context_lens=[{existing_context_lens}] max_tokens={} split_kv_tiled_q_token_tile_size={} \
-             split_kv_tiled_q_kv_token_tile_size={} split_kv_tiled_q_head_tile_size={}",
+             existing_context_lens=[{existing_context_lens}] max_tokens={} split_kv_tiled_q_max_q_tokens={} \
+             split_kv_tiled_q_kv_tokens_per_iteration={} split_kv_tiled_q_max_q_heads={}",
             self.model.k,
             self.max_tokens,
-            self.params.split_kv_tiled_q_token_tile_size,
-            self.params.split_kv_tiled_q_kv_token_tile_size,
-            self.params.split_kv_tiled_q_head_tile_size,
+            self.params.split_kv_tiled_q_max_q_tokens,
+            self.params.split_kv_tiled_q_kv_tokens_per_iteration,
+            self.params.split_kv_tiled_q_max_q_heads,
         );
         print_split_plan(
             "single_q",
             &self.batch_metadata,
             1,
-            self.params.split_kv_single_q_kv_token_tile_size,
+            self.params.split_kv_single_q_kv_tokens_per_iteration,
             self.max_tokens,
         );
         print_split_plan(
             "tiled_q",
             &self.tiled_batch_metadata,
-            self.params.split_kv_tiled_q_token_tile_size,
-            self.params.split_kv_tiled_q_kv_token_tile_size,
+            self.params.split_kv_tiled_q_max_q_tokens,
+            self.params.split_kv_tiled_q_kv_tokens_per_iteration,
             self.max_tokens,
         );
         if variants.contains(&GQASplitKVBenchVariant::SingleQ) {
@@ -1105,7 +1105,7 @@ impl<'a> RealGQAFixture<'a> {
 fn print_split_plan(
     variant: &str,
     metadata: &GQAMetadataBuffers,
-    scheduled_q_token_tile_size: u32,
+    max_q_tokens: u32,
     kv_tokens_per_iteration: u32,
     max_tokens: usize,
 ) {
@@ -1113,8 +1113,8 @@ fn print_split_plan(
     let cu_kv_splits = metadata
         .cu_sdpa_partial_outputs()
         .read_typed::<u32>(0, shape.num_q_token_tiles as usize + 1);
-    let splits_per_q_tile = cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
-    let active_q_tokens_per_tile = if scheduled_q_token_tile_size == 1 {
+    let num_map_task_templates_per_q_token_range = cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
+    let num_active_q_tokens_per_q_token_range = if max_q_tokens == 1 {
         vec![1; shape.num_q_token_tiles as usize]
     } else {
         metadata
@@ -1123,46 +1123,50 @@ fn print_split_plan(
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|tile| tile[1] - tile[0])
+            .map(|range| range[1] - range[0])
             .collect::<Vec<_>>()
     };
-    let split_values = metadata
+    let map_task_template_values = metadata
         .sdpa_map_task_templates()
         .read_typed::<u32>(0, shape.num_sdpa_map_task_templates as usize * 3);
-    let mut kv_tiles_per_split_histogram = BTreeMap::new();
-    for num_kv_tiles in split_values
+    let mut kv_iterations_per_map_task_template_histogram = BTreeMap::new();
+    for num_kv_iterations in map_task_template_values
         .as_chunks::<3>()
         .0
         .iter()
-        .map(|split| (split[2] - split[1]).div_ceil(kv_tokens_per_iteration))
+        .map(|task| (task[2] - task[1]).div_ceil(kv_tokens_per_iteration))
     {
-        *kv_tiles_per_split_histogram.entry(num_kv_tiles).or_insert(0usize) += 1;
+        *kv_iterations_per_map_task_template_histogram
+            .entry(num_kv_iterations)
+            .or_insert(0usize) += 1;
     }
-    let kv_tiles_per_split_histogram = kv_tiles_per_split_histogram
+    let kv_iterations_per_map_task_template_histogram = kv_iterations_per_map_task_template_histogram
         .into_iter()
-        .map(|(num_kv_tiles, count)| format!("{num_kv_tiles}x{count}"))
+        .map(|(num_kv_iterations, count)| format!("{num_kv_iterations}x{count}"))
         .collect::<Vec<_>>()
         .join(",");
-    let active_partial_states = active_q_tokens_per_tile
+    let num_active_partial_state_groups = num_active_q_tokens_per_q_token_range
         .iter()
-        .zip(&splits_per_q_tile)
-        .map(|(&num_q_tokens, &num_splits)| u64::from(num_q_tokens) * u64::from(num_splits))
+        .zip(&num_map_task_templates_per_q_token_range)
+        .map(|(&num_q_tokens, &num_templates)| u64::from(num_q_tokens) * u64::from(num_templates))
         .sum::<u64>();
-    let reserved_partial_slots = shape
+    let reserved_partial_state_groups = shape
         .num_sdpa_map_task_templates
-        .checked_mul(scheduled_q_token_tile_size)
-        .expect("GQA reserved partial-slot count must fit u32");
-    let replay_reserved_partial_slots = shape
+        .checked_mul(max_q_tokens)
+        .expect("GQA reserved partial-state-group count must fit u32");
+    let replay_reserved_partial_state_groups = shape
         .num_total_sdpa_map_task_templates
-        .checked_mul(scheduled_q_token_tile_size)
-        .expect("GQA replay reserved partial-slot count must fit u32");
+        .checked_mul(max_q_tokens)
+        .expect("GQA replay reserved partial-state-group count must fit u32");
     println!(
-        "split_plan component=gqa variant={variant} max_tokens={max_tokens} active_q_tokens={} q_token_tiles={} \
-         active_q_tokens_per_tile={active_q_tokens_per_tile:?} active_kv_splits={} \
-         metadata_segment_capacity={max_tokens} active_partial_state_budget={max_tokens} \
-         active_partial_states={active_partial_states} reserved_partial_slots={reserved_partial_slots} \
-         replay_kv_split_capacity={} replay_reserved_partial_slots={replay_reserved_partial_slots} \
-         splits_per_q_tile={splits_per_q_tile:?} kv_tiles_per_split_histogram=[{kv_tiles_per_split_histogram}]",
+        "split_plan component=gqa variant={variant} max_tokens={max_tokens} num_active_q_tokens={} \
+         num_q_token_ranges={} num_active_q_tokens_per_q_token_range={num_active_q_tokens_per_q_token_range:?} \
+         num_map_task_templates={} max_map_task_templates={max_tokens} max_active_partial_state_groups={max_tokens} \
+         num_active_partial_state_groups={num_active_partial_state_groups} \
+         num_reserved_partial_state_groups={reserved_partial_state_groups} num_replay_map_task_template_slots={} \
+         num_replay_reserved_partial_state_groups={replay_reserved_partial_state_groups} \
+         num_map_task_templates_per_q_token_range={num_map_task_templates_per_q_token_range:?} \
+         num_kv_iterations_per_map_task_template_histogram=[{kv_iterations_per_map_task_template_histogram}]",
         shape.num_tokens,
         shape.num_q_token_tiles,
         shape.num_sdpa_map_task_templates,

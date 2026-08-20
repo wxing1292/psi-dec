@@ -350,41 +350,42 @@ fn sdpa_map_task_template_buffers(
     shape: GQASplitKVSingleQShape,
     flat_token_indices: &[u32],
 ) -> (Vec<u32>, Vec<u32>) {
-    let num_kv_token_tiles = flat_token_indices
+    let num_kv_iterations = flat_token_indices
         .iter()
         .map(|&token_index| (token_index + 1).div_ceil(config.kv_tokens_per_iteration) as usize)
         .collect::<Vec<_>>();
-    let mut num_sdpa_map_task_templates_by_q_token_tile = vec![1_usize; flat_token_indices.len()];
-    let mut num_sdpa_map_task_templates = num_sdpa_map_task_templates_by_q_token_tile.len();
+    let mut num_sdpa_map_task_templates_by_q_token_range = vec![1_usize; flat_token_indices.len()];
+    let mut num_sdpa_map_task_templates = num_sdpa_map_task_templates_by_q_token_range.len();
     while num_sdpa_map_task_templates < shape.num_total_sdpa_map_task_templates as usize {
-        let Some(q_token_tile_index) = (0..num_kv_token_tiles.len())
-            .filter(|&q_token_tile_index| {
-                num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index] < num_kv_token_tiles[q_token_tile_index]
+        let Some(q_token_range_index) = (0..num_kv_iterations.len())
+            .filter(|&q_token_range_index| {
+                num_sdpa_map_task_templates_by_q_token_range[q_token_range_index]
+                    < num_kv_iterations[q_token_range_index]
             })
-            .max_by_key(|&q_token_tile_index| {
-                num_kv_token_tiles[q_token_tile_index]
-                    .div_ceil(num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index])
+            .max_by_key(|&q_token_range_index| {
+                num_kv_iterations[q_token_range_index]
+                    .div_ceil(num_sdpa_map_task_templates_by_q_token_range[q_token_range_index])
             })
         else {
             break;
         };
-        num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index] += 1;
+        num_sdpa_map_task_templates_by_q_token_range[q_token_range_index] += 1;
         num_sdpa_map_task_templates += 1;
     }
     let mut sdpa_map_task_templates = Vec::new();
     let mut cu_sdpa_partial_outputs = vec![0];
-    for (q_token_tile_index, &token_index) in flat_token_indices.iter().enumerate() {
+    for (q_token_range_index, &token_index) in flat_token_indices.iter().enumerate() {
         let context_len = token_index + 1;
-        for sdpa_map_task_template_index in 0..num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index] {
-            let kv_token_tile_begin = num_kv_token_tiles[q_token_tile_index] * sdpa_map_task_template_index
-                / num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index];
-            let kv_token_tile_end = num_kv_token_tiles[q_token_tile_index] * (sdpa_map_task_template_index + 1)
-                / num_sdpa_map_task_templates_by_q_token_tile[q_token_tile_index];
-            let kv_token_begin = kv_token_tile_begin as u32 * config.kv_tokens_per_iteration;
+        for sdpa_map_task_template_index in 0..num_sdpa_map_task_templates_by_q_token_range[q_token_range_index] {
+            let kv_iteration_begin = num_kv_iterations[q_token_range_index] * sdpa_map_task_template_index
+                / num_sdpa_map_task_templates_by_q_token_range[q_token_range_index];
+            let kv_iteration_end = num_kv_iterations[q_token_range_index] * (sdpa_map_task_template_index + 1)
+                / num_sdpa_map_task_templates_by_q_token_range[q_token_range_index];
+            let kv_token_begin = kv_iteration_begin as u32 * config.kv_tokens_per_iteration;
             sdpa_map_task_templates.extend_from_slice(&[
-                q_token_tile_index as u32,
+                q_token_range_index as u32,
                 kv_token_begin,
-                context_len.min(kv_token_tile_end as u32 * config.kv_tokens_per_iteration),
+                context_len.min(kv_iteration_end as u32 * config.kv_tokens_per_iteration),
             ]);
         }
         cu_sdpa_partial_outputs.push((sdpa_map_task_templates.len() / 3) as u32);

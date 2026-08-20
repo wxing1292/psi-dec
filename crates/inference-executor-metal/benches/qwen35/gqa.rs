@@ -43,20 +43,20 @@ const GQA_ROPE_DIM: u32 = 64;
 const GQA_ROPE_THETA: f32 = 10_000_000.0;
 const GQA_NORM_EPS: f32 = 1.0e-6;
 const DEFAULT_MAX_TOKENS: usize = 128;
-const SPLIT_KV_SINGLE_Q_KV_TOKEN_TILE_SIZE: u32 = 256;
-const SPLIT_KV_SINGLE_Q_NUM_THREADS_PER_THREADBLOCK: u32 = 256;
-const SPLIT_KV_SINGLE_Q_Q_HEAD_TILE_SIZE_CAP: u32 = 8;
-const SPLIT_KV_TILED_Q_TOKEN_TILE_SIZE: u32 = 8;
-const SPLIT_KV_TILED_Q_KV_TOKEN_TILE_SIZE: u32 = 16;
+const SPLIT_KV_SINGLE_Q_KV_TOKENS_PER_ITERATION: u32 = 256;
+const SPLIT_KV_SINGLE_Q_REQUIRED_THREADS: u32 = 256;
+const SPLIT_KV_SINGLE_Q_MAX_Q_HEADS: u32 = 8;
+const SPLIT_KV_TILED_Q_MAX_Q_TOKENS: u32 = 8;
+const SPLIT_KV_TILED_Q_KV_TOKENS_PER_ITERATION: u32 = 16;
 
 #[derive(Clone, Copy)]
 struct GQABenchParams {
-    split_kv_single_q_kv_token_tile_size: u32,
-    split_kv_single_q_num_threads_per_threadblock: u32,
-    split_kv_single_q_max_q_head_tile_size: u32,
-    split_kv_tiled_q_token_tile_size: u32,
-    split_kv_tiled_q_kv_token_tile_size: u32,
-    split_kv_tiled_q_head_tile_size: u32,
+    split_kv_single_q_kv_tokens_per_iteration: u32,
+    split_kv_single_q_required_threads: u32,
+    split_kv_single_q_max_q_heads: u32,
+    split_kv_tiled_q_max_q_tokens: u32,
+    split_kv_tiled_q_kv_tokens_per_iteration: u32,
+    split_kv_tiled_q_max_q_heads: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -158,12 +158,12 @@ impl Args {
             split_kv_variants: vec![GQASplitKVBenchVariant::SingleQ, GQASplitKVBenchVariant::TiledQ],
             selected_subcomponents: default_gqa_subcomponents(),
             params: GQABenchParams {
-                split_kv_single_q_kv_token_tile_size: SPLIT_KV_SINGLE_Q_KV_TOKEN_TILE_SIZE,
-                split_kv_single_q_num_threads_per_threadblock: SPLIT_KV_SINGLE_Q_NUM_THREADS_PER_THREADBLOCK,
-                split_kv_single_q_max_q_head_tile_size: SPLIT_KV_SINGLE_Q_Q_HEAD_TILE_SIZE_CAP,
-                split_kv_tiled_q_token_tile_size: SPLIT_KV_TILED_Q_TOKEN_TILE_SIZE,
-                split_kv_tiled_q_kv_token_tile_size: SPLIT_KV_TILED_Q_KV_TOKEN_TILE_SIZE,
-                split_kv_tiled_q_head_tile_size: 0,
+                split_kv_single_q_kv_tokens_per_iteration: SPLIT_KV_SINGLE_Q_KV_TOKENS_PER_ITERATION,
+                split_kv_single_q_required_threads: SPLIT_KV_SINGLE_Q_REQUIRED_THREADS,
+                split_kv_single_q_max_q_heads: SPLIT_KV_SINGLE_Q_MAX_Q_HEADS,
+                split_kv_tiled_q_max_q_tokens: SPLIT_KV_TILED_Q_MAX_Q_TOKENS,
+                split_kv_tiled_q_kv_tokens_per_iteration: SPLIT_KV_TILED_Q_KV_TOKENS_PER_ITERATION,
+                split_kv_tiled_q_max_q_heads: 0,
             },
             iters: 50,
             warmup_iters: 20,
@@ -194,24 +194,24 @@ impl Args {
                 "--gqa-subcomponents" => {
                     args.selected_subcomponents = parse_string_list(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-split-kv-single-q-kv-token-tile-size" => {
-                    args.params.split_kv_single_q_kv_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
-                },
-                "--gqa-split-kv-single-q-num-threads-per-threadblock" => {
-                    args.params.split_kv_single_q_num_threads_per_threadblock =
+                "--gqa-split-kv-single-q-kv-tokens-per-iteration" => {
+                    args.params.split_kv_single_q_kv_tokens_per_iteration =
                         parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-split-kv-single-q-max-q-head-tile-size" => {
-                    args.params.split_kv_single_q_max_q_head_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-single-q-required-threads" => {
+                    args.params.split_kv_single_q_required_threads = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-split-kv-tiled-q-token-tile-size" => {
-                    args.params.split_kv_tiled_q_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-single-q-max-q-heads" => {
+                    args.params.split_kv_single_q_max_q_heads = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-split-kv-tiled-q-kv-token-tile-size" => {
-                    args.params.split_kv_tiled_q_kv_token_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-tiled-q-max-q-tokens" => {
+                    args.params.split_kv_tiled_q_max_q_tokens = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
-                "--gqa-split-kv-tiled-q-head-tile-size" => {
-                    args.params.split_kv_tiled_q_head_tile_size = parse_u32(&next_arg(&mut values, &arg), &arg)
+                "--gqa-split-kv-tiled-q-kv-tokens-per-iteration" => {
+                    args.params.split_kv_tiled_q_kv_tokens_per_iteration = parse_u32(&next_arg(&mut values, &arg), &arg)
+                },
+                "--gqa-split-kv-tiled-q-max-q-heads" => {
+                    args.params.split_kv_tiled_q_max_q_heads = parse_u32(&next_arg(&mut values, &arg), &arg)
                 },
                 "--iters" => args.iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
@@ -378,12 +378,12 @@ fn print_help_and_exit() -> ! {
 --subcomponents
 --gqa-subcomponents qgkv,qgkv-to-q-g-k-v,q-norm-rope,k-norm-rope,kv-page-write,split-kv-single-q,split-kv-tiled-q,gate,output
 --validate-split-kv-tiled-q
---gqa-split-kv-single-q-kv-token-tile-size N
---gqa-split-kv-single-q-num-threads-per-threadblock N
---gqa-split-kv-single-q-max-q-head-tile-size N
---gqa-split-kv-tiled-q-token-tile-size 8|16
---gqa-split-kv-tiled-q-kv-token-tile-size 8|16
---gqa-split-kv-tiled-q-head-tile-size N
+--gqa-split-kv-single-q-kv-tokens-per-iteration N
+--gqa-split-kv-single-q-required-threads N
+--gqa-split-kv-single-q-max-q-heads N
+--gqa-split-kv-tiled-q-max-q-tokens 8|16
+--gqa-split-kv-tiled-q-kv-tokens-per-iteration 8|16
+--gqa-split-kv-tiled-q-max-q-heads N
 --print-limits
 --iters N
 --warmup-iters N
@@ -393,8 +393,8 @@ fn print_help_and_exit() -> ! {
 }
 
 fn split_kv_single_q_threadblock_memory_bytes(params: GQABenchParams) -> usize {
-    (params.split_kv_single_q_max_q_head_tile_size as usize * params.split_kv_single_q_kv_token_tile_size as usize
-        + params.split_kv_single_q_num_threads_per_threadblock as usize)
+    (params.split_kv_single_q_max_q_heads as usize * params.split_kv_single_q_kv_tokens_per_iteration as usize
+        + params.split_kv_single_q_required_threads as usize)
         * size_of::<f32>()
 }
 
@@ -403,13 +403,13 @@ fn print_gqa_kernel_limits(device: &Device, params: GQABenchParams) {
     let threadblock_memory = split_kv_single_q_threadblock_memory_bytes(params);
     println!(
         "metal-limits device={} max_threadblock_memory_bytes={} gqa_split_kv_variant=single_q \
-         gqa_split_kv_single_q_kv_token_tile_size={} gqa_split_kv_single_q_num_threads_per_threadblock={} \
-         gqa_split_kv_single_q_max_q_head_tile_size={} gqa_threadblock_memory_bytes={} gqa_valid={}",
+         gqa_split_kv_single_q_kv_tokens_per_iteration={} gqa_split_kv_single_q_required_threads={} \
+         gqa_split_kv_single_q_max_q_heads={} gqa_threadblock_memory_bytes={} gqa_valid={}",
         device.name(),
         device_max,
-        params.split_kv_single_q_kv_token_tile_size,
-        params.split_kv_single_q_num_threads_per_threadblock,
-        params.split_kv_single_q_max_q_head_tile_size,
+        params.split_kv_single_q_kv_tokens_per_iteration,
+        params.split_kv_single_q_required_threads,
+        params.split_kv_single_q_max_q_heads,
         threadblock_memory,
         threadblock_memory <= device_max
     );
@@ -789,11 +789,11 @@ fn gqa_sdpa_config(
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         page_table_layout: gqa_page_table_layout(num_reqs, end_context_len, model),
-        kv_tokens_per_iteration: params.split_kv_single_q_kv_token_tile_size,
-        required_threads: params.split_kv_single_q_num_threads_per_threadblock,
+        kv_tokens_per_iteration: params.split_kv_single_q_kv_tokens_per_iteration,
+        required_threads: params.split_kv_single_q_required_threads,
         max_q_heads: u32::try_from(model.num_q_heads / model.num_kv_heads)
             .expect("GQA q heads per KV head must fit u32")
-            .min(params.split_kv_single_q_max_q_head_tile_size),
+            .min(params.split_kv_single_q_max_q_heads),
         dtype: Dtype::Bfloat16,
     }
 }
@@ -814,9 +814,9 @@ fn gqa_split_kv_tiled_q_config(
         num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
-        max_q_heads: params.split_kv_tiled_q_head_tile_size,
-        max_q_tokens: params.split_kv_tiled_q_token_tile_size,
-        kv_tokens_per_iteration: params.split_kv_tiled_q_kv_token_tile_size,
+        max_q_heads: params.split_kv_tiled_q_max_q_heads,
+        max_q_tokens: params.split_kv_tiled_q_max_q_tokens,
+        kv_tokens_per_iteration: params.split_kv_tiled_q_kv_tokens_per_iteration,
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         dtype: Dtype::Bfloat16,

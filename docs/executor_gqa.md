@@ -217,7 +217,7 @@ Each three-`u32` `sdpa_map_task_templates` entry materializes one compact `SDPAM
 Q-token-range index followed by the half-open request-local KV-token range. The shared replay shape retains the generic
 TaskTemplate names because the DSpark composite contract can also reserve a block-bidirectional partial-output slot.
 
-The grid supplies `kv_head_index` and `q_head_tile_index`. These coordinates combine with the template to produce one
+The grid supplies `kv_head_index` and `q_head_range_index`. These coordinates combine with the template to produce one
 logical `MapThreadBlockTask`. One threadblock owns each task in a `1:1` relation. The buffer does not duplicate the
 grid-derived coordinates.
 
@@ -571,12 +571,12 @@ The current concrete kernel families differ in the number of Q tokens and Q head
 
 ```text
 shape: num_tokens grouped into request-local Q-token ranges
-parallelism: KV split x KV head x Q-head tile
+parallelism: KV split x KV head x Q-head range
 input: normalized Q plus paged K/V selected through the request page table
-output: KV-segment partials, followed by one numerically stable reduce
+output: partial attention states for one KV range, followed by one numerically stable reduce
 
-SingleQ    one Q token per Q-token tile; scalar dot/reduction work
-TiledQ    several Q tokens/Q heads per tile; SIMD-group matrix work
+SingleQ    one Q token per Q-token range; scalar dot/reduction work
+TiledQ    several Q tokens/Q heads per range; SIMD-group matrix work
 ```
 
 Both variants use GQA head sharing. If `G = Hq / Hkv`, KV head `k` supplies K/V to Q heads
@@ -587,7 +587,7 @@ supplies the regular head coordinates:
 
 ```text
 Map task template                                grid coordinates
-[q_token_range, kv_begin, kv_end)           +   [kv_head, q_head_tile]
+[q_token_range, kv_begin, kv_end)           +   [kv_head, q_head_range]
                     \                                /
                      +------ one Map threadblock
 
@@ -1024,22 +1024,23 @@ ragged per-request token counts.
 `--gqa-contexts-per-req` supplies the matching existing context length for each ragged request. It requires
 `--gqa-tokens-per-req` and cannot be combined with `--contexts`.
 
-`--max-tokens` fixes the segment-metadata capacity and current active-partial-state scheduling budget for both forced
-SplitKV candidates. The default is 128, which matches the server default. Each case reports the materialized KV-split
-count, fixed-TQ reserved partial slots, active partial states, and segment distribution for both candidates.
+`--max-tokens` fixes the token capacity, Map task-template capacity, and maximum active partial-state-group count for
+both forced SplitKV candidates. The default is 128, which matches the server default. Each case reports Q-token
+ranges, Map task templates, active and reserved partial-state groups, replay slots, and KV iterations per Map
+task template.
 
 The comparison replay reports `split_kv_variant=single_q` or `split_kv_variant=tiled_q`. Model execution uses the
 automatic planner policy described above.
 
-`--gqa-split-kv-single-q-kv-token-tile-size`, `--gqa-split-kv-single-q-num-threads-per-threadblock`, and
-`--gqa-split-kv-single-q-max-q-head-tile-size` override the `SingleQ` defaults.
+`--gqa-split-kv-single-q-kv-tokens-per-iteration`, `--gqa-split-kv-single-q-required-threads`, and
+`--gqa-split-kv-single-q-max-q-heads` override the `SingleQ` defaults.
 
-`--gqa-split-kv-tiled-q-token-tile-size`, `--gqa-split-kv-tiled-q-kv-token-tile-size`, and
-`--gqa-split-kv-tiled-q-head-tile-size` configure the `TiledQ` comparison variant.
+`--gqa-split-kv-tiled-q-max-q-tokens`, `--gqa-split-kv-tiled-q-kv-tokens-per-iteration`, and
+`--gqa-split-kv-tiled-q-max-q-heads` configure the `TiledQ` comparison variant.
 
 When the Q-head override is absent, the bench uses the production half/full Q/KV-group rule. The benchmark CLI and
-output retain their established `q_token_tile_size`, `kv_token_tile_size`, and `q_head_tile_size` tuning names. The
-production specialization uses `max_q_tokens`, `kv_tokens_per_iteration`, and `max_q_heads`.
+output use the production specialization terms `max_q_tokens`, `kv_tokens_per_iteration`, `max_q_heads`, and
+`required_threads`.
 
 `--print-limits` prints the device threadblock-memory limit. It also prints the derived `SingleQ`
 threadblock-memory footprint.

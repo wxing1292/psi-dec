@@ -373,13 +373,14 @@ impl BlockFixture {
         let shape = metadata.replay_shape();
         let map = metadata.execution_specialization().map.thread_block;
         let variant_name = if map.max_q_tokens == 1 { "single_q" } else { "tiled_q" };
-        let scheduled_q_token_tile_size = map.max_q_tokens;
+        let max_q_tokens = map.max_q_tokens;
         let kv_tokens_per_iteration = map.kv_tokens_per_iteration;
         let cu_kv_splits = metadata
             .cu_sdpa_partial_outputs()
             .read_typed::<u32>(0, shape.num_q_token_tiles as usize + 1);
-        let splits_per_q_tile = cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
-        let active_q_tokens_per_tile = if scheduled_q_token_tile_size == 1 {
+        let num_map_task_templates_per_q_token_range =
+            cu_kv_splits.windows(2).map(|cu| cu[1] - cu[0]).collect::<Vec<_>>();
+        let num_active_q_tokens_per_q_token_range = if max_q_tokens == 1 {
             vec![1; shape.num_q_token_tiles as usize]
         } else {
             metadata
@@ -388,41 +389,45 @@ impl BlockFixture {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|tile| tile[1] - tile[0])
+                .map(|range| range[1] - range[0])
                 .collect::<Vec<_>>()
         };
-        let active_partial_states = active_q_tokens_per_tile
+        let num_active_partial_state_groups = num_active_q_tokens_per_q_token_range
             .iter()
-            .zip(&splits_per_q_tile)
-            .map(|(&num_q_tokens, &num_splits)| u64::from(num_q_tokens) * u64::from(num_splits))
+            .zip(&num_map_task_templates_per_q_token_range)
+            .map(|(&num_q_tokens, &num_templates)| u64::from(num_q_tokens) * u64::from(num_templates))
             .sum::<u64>();
-        let split_values = metadata
+        let map_task_template_values = metadata
             .sdpa_map_task_templates()
             .read_typed::<u32>(0, shape.num_sdpa_map_task_templates as usize * 3);
-        let mut kv_tiles_per_split_histogram = BTreeMap::new();
-        for num_kv_tiles in split_values
+        let mut kv_iterations_per_map_task_template_histogram = BTreeMap::new();
+        for num_kv_iterations in map_task_template_values
             .as_chunks::<3>()
             .0
             .iter()
-            .map(|split| (split[2] - split[1]).div_ceil(kv_tokens_per_iteration))
+            .map(|task| (task[2] - task[1]).div_ceil(kv_tokens_per_iteration))
         {
-            *kv_tiles_per_split_histogram.entry(num_kv_tiles).or_insert(0usize) += 1;
+            *kv_iterations_per_map_task_template_histogram
+                .entry(num_kv_iterations)
+                .or_insert(0usize) += 1;
         }
-        let reserved_partial_slots = shape
+        let reserved_partial_state_groups = shape
             .num_sdpa_map_task_templates
-            .checked_mul(scheduled_q_token_tile_size)
-            .expect("GQA reserved partial-slot count must fit u32");
-        let replay_reserved_partial_slots = shape
+            .checked_mul(max_q_tokens)
+            .expect("GQA reserved partial-state-group count must fit u32");
+        let replay_reserved_partial_state_groups = shape
             .num_total_sdpa_map_task_templates
-            .checked_mul(scheduled_q_token_tile_size)
-            .expect("GQA replay reserved partial-slot count must fit u32");
+            .checked_mul(max_q_tokens)
+            .expect("GQA replay reserved partial-state-group count must fit u32");
         println!(
-            "split_plan component=qwen35-layer variant={variant_name} max_tokens={} active_q_tokens={} \
-             q_token_tiles={} active_q_tokens_per_tile={active_q_tokens_per_tile:?} active_kv_splits={} \
-             metadata_segment_capacity={} active_partial_state_budget={} \
-             active_partial_states={active_partial_states} reserved_partial_slots={reserved_partial_slots} \
-             replay_kv_split_capacity={} replay_reserved_partial_slots={replay_reserved_partial_slots} \
-             splits_per_q_tile={splits_per_q_tile:?} kv_tiles_per_split_histogram={kv_tiles_per_split_histogram:?}",
+            "split_plan component=qwen35-layer variant={variant_name} max_tokens={} num_active_q_tokens={} \
+             num_q_token_ranges={} num_active_q_tokens_per_q_token_range={num_active_q_tokens_per_q_token_range:?} \
+             num_map_task_templates={} max_map_task_templates={} max_active_partial_state_groups={} \
+             num_active_partial_state_groups={num_active_partial_state_groups} \
+             num_reserved_partial_state_groups={reserved_partial_state_groups} num_replay_map_task_template_slots={} \
+             num_replay_reserved_partial_state_groups={replay_reserved_partial_state_groups} \
+             num_map_task_templates_per_q_token_range={num_map_task_templates_per_q_token_range:?} \
+             num_kv_iterations_per_map_task_template_histogram={kv_iterations_per_map_task_template_histogram:?}",
             self.max_tokens,
             shape.num_tokens,
             shape.num_q_token_tiles,

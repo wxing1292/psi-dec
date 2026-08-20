@@ -206,7 +206,7 @@ fn test_shape_rejects_unsupported_profile() {
 }
 
 #[test]
-#[should_panic(expected = "GQA SplitKV TiledQ Q-token-tile metadata exceeds the shader u32 element-index domain")]
+#[should_panic(expected = "GQA SplitKV TiledQ Q-token-range metadata exceeds the shader u32 element-index domain")]
 fn test_shape_rejects_shader_index_overflow() {
     let shape = GQASplitKVTiledQShape {
         num_total_tokens: u32::MAX,

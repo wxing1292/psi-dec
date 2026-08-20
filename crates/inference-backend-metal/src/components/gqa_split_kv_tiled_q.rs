@@ -92,14 +92,17 @@ impl GQASplitKVTiledQConfig {
         self.num_q_heads / self.num_kv_heads
     }
 
-    pub fn num_q_head_tiles_per_kv_head(self) -> u32 {
+    pub fn num_q_head_ranges_per_kv_head(self) -> u32 {
         self.q_heads_per_kv_head().div_ceil(self.max_q_heads)
     }
 
     fn num_head_groups(self) -> usize {
         checked_product(
             "GQA SplitKV TiledQ head-group count",
-            &[self.num_kv_heads as usize, self.num_q_head_tiles_per_kv_head() as usize],
+            &[
+                self.num_kv_heads as usize,
+                self.num_q_head_ranges_per_kv_head() as usize,
+            ],
         )
     }
 
@@ -176,8 +179,8 @@ impl GQASplitKVTiledQShape {
         assert!(self.num_total_q_token_tiles > 0 && self.num_total_q_token_tiles <= self.num_total_tokens);
         assert!(self.num_total_sdpa_map_task_templates >= self.num_total_q_token_tiles);
         assert_u32_index_domain(
-            self.num_q_token_tile_values(),
-            "GQA SplitKV TiledQ Q-token-tile metadata",
+            self.num_q_token_range_values(),
+            "GQA SplitKV TiledQ Q-token-range metadata",
         );
         assert_u32_index_domain(
             self.num_sdpa_map_task_template_values(),
@@ -185,9 +188,9 @@ impl GQASplitKVTiledQShape {
         );
     }
 
-    fn num_q_token_tile_values(self) -> usize {
+    fn num_q_token_range_values(self) -> usize {
         checked_product(
-            "GQA SplitKV TiledQ Q-token-tile metadata element count",
+            "GQA SplitKV TiledQ Q-token-range metadata element count",
             &[self.num_total_q_token_tiles as usize, 2],
         )
     }
@@ -346,7 +349,7 @@ impl Operator for GQASplitKVTiledQMapInvocation<'_> {
         assert!(self.buffers.req_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
         assert!(self.buffers.page_ids.len_bytes() >= config.page_table_layout.bytes());
         assert!(self.buffers.flat_token_indices.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
-        assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_tile_values() * size_of::<u32>());
+        assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_range_values() * size_of::<u32>());
         assert!(
             self.buffers.sdpa_map_task_templates.len_bytes()
                 >= shape.num_sdpa_map_task_template_values() * size_of::<u32>()
@@ -425,7 +428,7 @@ impl Operator for GQASplitKVTiledQReduceInvocation<'_> {
         assert!(self.buffers.partial_output.len_bytes_u64() >= config.partial_output_bytes(shape));
         assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
         assert!(self.buffers.partial_max_logits.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
-        assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_tile_values() * size_of::<u32>());
+        assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_range_values() * size_of::<u32>());
         assert!(
             self.buffers.cu_sdpa_partial_outputs.len_bytes()
                 >= shape.num_cu_sdpa_partial_output_values() * size_of::<u32>()
@@ -459,8 +462,8 @@ fn source(config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> Strin
 #define NUM_TOKENS {num_tokens}
 #define NUM_Q_HEADS {num_q_heads}
 #define NUM_KV_HEADS {num_kv_heads}
-#define Q_HEAD_TILE_SIZE {max_q_heads}
-#define NUM_Q_HEAD_TILES_PER_KV_HEAD {num_q_head_tiles_per_kv_head}
+#define MAX_Q_HEADS {max_q_heads}
+#define NUM_Q_HEAD_RANGES_PER_KV_HEAD {num_q_head_ranges_per_kv_head}
 #define HEAD_DIM {head_dim}
 #define ATTENTION_SCALE {scale}
 #define PAGE_BYTES {page_bytes}
@@ -468,16 +471,16 @@ fn source(config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> Strin
 #define NUM_GQA_LAYERS {num_gqa_layers}
 #define NUM_BLOCKS {num_blocks}
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
-#define Q_TOKEN_TILE_SIZE {max_q_tokens}
-#define KV_TOKEN_TILE_SIZE {kv_tokens_per_iteration}
-#define NUM_THREADS_PER_THREADBLOCK {required_threads}
+#define MAX_Q_TOKENS {max_q_tokens}
+#define KV_TOKENS_PER_ITERATION {kv_tokens_per_iteration}
+#define REQUIRED_THREADS {required_threads}
 {body}
 "#,
         num_tokens = shape.num_total_tokens,
         num_q_heads = config.num_q_heads,
         num_kv_heads = config.num_kv_heads,
         max_q_heads = config.max_q_heads,
-        num_q_head_tiles_per_kv_head = config.num_q_head_tiles_per_kv_head(),
+        num_q_head_ranges_per_kv_head = config.num_q_head_ranges_per_kv_head(),
         head_dim = config.head_dim,
         scale = config.scale,
         page_bytes = config.page_bytes,

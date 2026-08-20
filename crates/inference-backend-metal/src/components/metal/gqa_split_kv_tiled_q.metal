@@ -15,7 +15,7 @@ typedef bfloat bfloat16_t;
 //   kv_token_begin,       // from the Map task template
 //   kv_token_end,         // from the Map task template
 //   kv_head_index,        // grid-derived from threadblock_position.x
-//   q_head_tile_index,    // grid-derived from threadblock_position.x
+//   q_head_range_index,   // grid-derived from threadblock_position.x
 // }
 //
 // A sentinel Map task template returns without writing any partial output or
@@ -68,12 +68,12 @@ kernel void gqa_split_kv_tiled_q_map(
     uint lane [[thread_index_in_simdgroup]])
 {
     constexpr int NUM_SIMD_LANES = 32;
-    constexpr int NUM_SIMDGROUPS = NUM_THREADS_PER_THREADBLOCK / NUM_SIMD_LANES;
-    constexpr int NUM_SIMDGROUPS_PER_Q_HEAD = Q_TOKEN_TILE_SIZE / 8;
+    constexpr int NUM_SIMDGROUPS = REQUIRED_THREADS / NUM_SIMD_LANES;
+    constexpr int NUM_SIMDGROUPS_PER_Q_HEAD = MAX_Q_TOKENS / 8;
     constexpr int NUM_HEAD_FRAGMENTS = HEAD_DIM / 8;
-    constexpr int NUM_KV_TOKEN_FRAGMENTS = KV_TOKEN_TILE_SIZE / 8;
+    constexpr int NUM_KV_TOKEN_FRAGMENTS = KV_TOKENS_PER_ITERATION / 8;
     constexpr int Q_HEADS_PER_KV_HEAD = NUM_Q_HEADS / NUM_KV_HEADS;
-    static_assert(NUM_SIMDGROUPS == NUM_SIMDGROUPS_PER_Q_HEAD * Q_HEAD_TILE_SIZE);
+    static_assert(NUM_SIMDGROUPS == NUM_SIMDGROUPS_PER_Q_HEAD * MAX_Q_HEADS);
 
     const uint map_task_template_index = threadblock_position.y;
     if (map_task_template_index >= num_active_kv_splits) {
@@ -88,27 +88,27 @@ kernel void gqa_split_kv_tiled_q_map(
     if (flat_token_start >= num_active_tokens || flat_token_end > num_active_tokens) {
         return;
     }
-    const uint num_tile_tokens = flat_token_end - flat_token_start;
+    const uint num_q_tokens_in_range = flat_token_end - flat_token_start;
     const uint kv_token_begin = sdpa_map_task_templates[map_task_template_index * 3 + 1];
     const uint kv_token_end = sdpa_map_task_templates[map_task_template_index * 3 + 2];
     const uint req_slot = req_slots[flat_token_start];
 
     const uint head_group_index = threadblock_position.x;
-    const uint q_head_tile_index = head_group_index % uint(NUM_Q_HEAD_TILES_PER_KV_HEAD);
-    const uint kv_head_index = head_group_index / uint(NUM_Q_HEAD_TILES_PER_KV_HEAD);
-    const uint q_head_tile_base = q_head_tile_index * uint(Q_HEAD_TILE_SIZE);
+    const uint q_head_range_index = head_group_index % uint(NUM_Q_HEAD_RANGES_PER_KV_HEAD);
+    const uint kv_head_index = head_group_index / uint(NUM_Q_HEAD_RANGES_PER_KV_HEAD);
+    const uint q_head_range_begin = q_head_range_index * uint(MAX_Q_HEADS);
     const uint num_active_q_heads = min(
-        uint(Q_HEAD_TILE_SIZE), uint(Q_HEADS_PER_KV_HEAD) - q_head_tile_base);
+        uint(MAX_Q_HEADS), uint(Q_HEADS_PER_KV_HEAD) - q_head_range_begin);
     const uint local_q_head_index = simdgroup_index / uint(NUM_SIMDGROUPS_PER_Q_HEAD);
     const uint token_fragment_index = simdgroup_index % uint(NUM_SIMDGROUPS_PER_Q_HEAD);
     const bool active_q_head = local_q_head_index < num_active_q_heads;
     const uint q_head_index = min(
-        kv_head_index * uint(Q_HEADS_PER_KV_HEAD) + q_head_tile_base + local_q_head_index,
+        kv_head_index * uint(Q_HEADS_PER_KV_HEAD) + q_head_range_begin + local_q_head_index,
         uint(NUM_Q_HEADS - 1));
 
     constexpr int PAD = 16 / int(sizeof(bfloat16_t));
     constexpr int LEADING_DIM = HEAD_DIM + PAD;
-    constexpr int KV_TOKEN_VALUES = KV_TOKEN_TILE_SIZE * LEADING_DIM;
+    constexpr int KV_TOKEN_VALUES = KV_TOKENS_PER_ITERATION * LEADING_DIM;
     threadgroup bfloat16_t* k_shared = reinterpret_cast<threadgroup bfloat16_t*>(shared_mem);
     threadgroup bfloat16_t* v_shared = k_shared + KV_TOKEN_VALUES;
 
@@ -116,8 +116,8 @@ kernel void gqa_split_kv_tiled_q_map(
     const ushort token_fragment_offset = coordinate.y;
     const ushort fragment_col = coordinate.x;
     const uint token_offset = token_fragment_index * 8 + uint(token_fragment_offset);
-    const bool inactive_token = !active_q_head || token_offset >= num_tile_tokens;
-    const bool full_token_fragment = token_fragment_index * 8 + 8 <= num_tile_tokens;
+    const bool inactive_token = !active_q_head || token_offset >= num_q_tokens_in_range;
+    const bool full_token_fragment = token_fragment_index * 8 + 8 <= num_q_tokens_in_range;
     const uint causal_token_index = inactive_token ? 0 : flat_token_indices[flat_token_start + token_offset];
 
     using Vec2BF16 = vec<bfloat16_t, 2>;
@@ -156,17 +156,17 @@ kernel void gqa_split_kv_tiled_q_map(
     }
 
     const float scale_log2 = ATTENTION_SCALE * M_LOG2E_F;
-    const uint num_kv_token_tiles =
-        (kv_token_end - kv_token_begin + uint(KV_TOKEN_TILE_SIZE - 1)) / uint(KV_TOKEN_TILE_SIZE);
-    for (uint kv_token_tile_index = 0; kv_token_tile_index < num_kv_token_tiles; ++kv_token_tile_index) {
-        const uint kv_token_tile_begin = kv_token_begin + kv_token_tile_index * uint(KV_TOKEN_TILE_SIZE);
+    const uint num_kv_iterations =
+        (kv_token_end - kv_token_begin + uint(KV_TOKENS_PER_ITERATION - 1)) / uint(KV_TOKENS_PER_ITERATION);
+    for (uint kv_iteration_index = 0; kv_iteration_index < num_kv_iterations; ++kv_iteration_index) {
+        const uint kv_iteration_begin = kv_token_begin + kv_iteration_index * uint(KV_TOKENS_PER_ITERATION);
         constexpr int LOAD_BYTES = 16;
         constexpr int LOAD_VALUES = LOAD_BYTES / int(sizeof(bfloat16_t));
         using Load = typename LoadUnit<LOAD_BYTES>::type;
         static_assert(LEADING_DIM % LOAD_VALUES == 0);
-        for (uint kv_token_offset = simdgroup_index; kv_token_offset < uint(KV_TOKEN_TILE_SIZE);
+        for (uint kv_token_offset = simdgroup_index; kv_token_offset < uint(KV_TOKENS_PER_ITERATION);
              kv_token_offset += uint(NUM_SIMDGROUPS)) {
-            const uint kv_token_index = kv_token_tile_begin + kv_token_offset;
+            const uint kv_token_index = kv_iteration_begin + kv_token_offset;
             if (kv_token_index < kv_token_end) {
                 const uint block_index = kv_token_index / uint(NUM_TOKENS_PER_PAGE * NUM_PAGE_IDS_PER_BLOCK);
                 const uint page_id_index =
@@ -233,7 +233,7 @@ kernel void gqa_split_kv_tiled_q_map(
         for (int kv_token_fragment = 0; kv_token_fragment < NUM_KV_TOKEN_FRAGMENTS; ++kv_token_fragment) {
             #pragma unroll
             for (int fragment_slot = 0; fragment_slot < 2; ++fragment_slot) {
-                const uint kv_token_index = kv_token_tile_begin + uint(kv_token_fragment * 8)
+                const uint kv_token_index = kv_iteration_begin + uint(kv_token_fragment * 8)
                     + uint(fragment_col) + uint(fragment_slot);
                 const float score = score_fragments[kv_token_fragment][fragment_slot] * scale_log2;
                 score_fragments[kv_token_fragment][fragment_slot] =
@@ -248,8 +248,8 @@ kernel void gqa_split_kv_tiled_q_map(
         for (int kv_token_fragment = 0; kv_token_fragment < NUM_KV_TOKEN_FRAGMENTS; ++kv_token_fragment) {
             local_max = max(local_max, max(score_fragments[kv_token_fragment][0], score_fragments[kv_token_fragment][1]));
         }
-        const float tile_max = frag_row_reduce<FragMax>(local_max);
-        float next_max = max(running_max, tile_max);
+        const float iteration_max = frag_row_reduce<FragMax>(local_max);
+        float next_max = max(running_max, iteration_max);
         const float running_scale = running_max == -INFINITY ? 0.0f : fast::exp2(running_max - next_max);
         if (running_max == -INFINITY && next_max == -INFINITY) {
             next_max = 0.0f;
@@ -299,7 +299,7 @@ kernel void gqa_split_kv_tiled_q_map(
 
     if (!inactive_token) {
         const ulong partial_output_index =
-            ((ulong)map_task_template_index * NUM_Q_HEADS + (ulong)q_head_index) * Q_TOKEN_TILE_SIZE
+            ((ulong)map_task_template_index * NUM_Q_HEADS + (ulong)q_head_index) * MAX_Q_TOKENS
             + (ulong)token_offset;
         if (fragment_col == 0) {
             partial_exp_sums[partial_output_index] = running_sum;
@@ -318,7 +318,7 @@ kernel void gqa_split_kv_tiled_q_map(
     }
 }
 
-// For one Q-token-tile/Q-head output coordinate, adjacent
+// For one Q-token-range/Q-head output coordinate, adjacent
 // cu_sdpa_partial_outputs values select the leading partial-output dimension to
 // merge. The cumulative values do not count scalar tensor elements.
 kernel void gqa_split_kv_tiled_q_reduce(
@@ -339,12 +339,12 @@ kernel void gqa_split_kv_tiled_q_reduce(
     }
     const uint flat_token_start = q_token_ranges[q_token_range_index * 2];
     const uint flat_token_end = q_token_ranges[q_token_range_index * 2 + 1];
-    const uint num_tile_tokens = flat_token_end - flat_token_start;
+    const uint num_q_tokens_in_range = flat_token_end - flat_token_start;
     const uint partial_output_begin = cu_sdpa_partial_outputs[q_token_range_index];
     const uint partial_output_end = cu_sdpa_partial_outputs[q_token_range_index + 1];
 
-    for (uint local_index = thread_index; local_index < num_tile_tokens * uint(HEAD_DIM);
-         local_index += uint(NUM_THREADS_PER_THREADBLOCK)) {
+    for (uint local_index = thread_index; local_index < num_q_tokens_in_range * uint(HEAD_DIM);
+         local_index += uint(REQUIRED_THREADS)) {
         const uint local_token_index = local_index / uint(HEAD_DIM);
         const uint dim = local_index % uint(HEAD_DIM);
         float global_max = -INFINITY;
@@ -352,7 +352,7 @@ kernel void gqa_split_kv_tiled_q_reduce(
              partial_output_index < partial_output_end;
              ++partial_output_index) {
             const ulong partial_output_stats_index =
-                ((ulong)partial_output_index * NUM_Q_HEADS + (ulong)q_head_index) * Q_TOKEN_TILE_SIZE
+                ((ulong)partial_output_index * NUM_Q_HEADS + (ulong)q_head_index) * MAX_Q_TOKENS
                 + (ulong)local_token_index;
             global_max = max(global_max, partial_max_logits[partial_output_stats_index]);
         }
@@ -362,7 +362,7 @@ kernel void gqa_split_kv_tiled_q_reduce(
              partial_output_index < partial_output_end;
              ++partial_output_index) {
             const ulong partial_output_stats_index =
-                ((ulong)partial_output_index * NUM_Q_HEADS + (ulong)q_head_index) * Q_TOKEN_TILE_SIZE
+                ((ulong)partial_output_index * NUM_Q_HEADS + (ulong)q_head_index) * MAX_Q_TOKENS
                 + (ulong)local_token_index;
             const float weight = exp2(partial_max_logits[partial_output_stats_index] - global_max)
                 * partial_exp_sums[partial_output_stats_index];

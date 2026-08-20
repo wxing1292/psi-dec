@@ -95,7 +95,7 @@ impl GQASplitKVSingleQConfig {
             * size_of::<f32>()
     }
 
-    pub fn num_q_head_tiles_per_kv_head(self) -> u32 {
+    pub fn num_q_head_ranges_per_kv_head(self) -> u32 {
         self.q_heads_per_kv_head().div_ceil(self.max_q_heads)
     }
 
@@ -105,7 +105,7 @@ impl GQASplitKVSingleQConfig {
             &[
                 shape.num_total_sdpa_map_task_templates as usize,
                 self.num_kv_heads as usize,
-                self.num_q_head_tiles_per_kv_head() as usize,
+                self.num_q_head_ranges_per_kv_head() as usize,
                 self.required_threads as usize,
             ],
         )
@@ -562,13 +562,13 @@ typedef bfloat bfloat16_t;
 #define KV_HEAD_DIM {head_dim}
 #define ATTENTION_SCALE {scale}
 #define Q_HEADS_PER_KV_HEAD {q_heads_per_kv_head}
-#define Q_HEAD_TILE_SIZE {max_q_heads}
-#define NUM_Q_HEAD_TILES_PER_KV_HEAD {num_q_head_tiles_per_kv_head}
+#define MAX_Q_HEADS {max_q_heads}
+#define NUM_Q_HEAD_RANGES_PER_KV_HEAD {num_q_head_ranges_per_kv_head}
 #define NUM_TOKENS {num_tokens}
 #define PAGE_BYTES {page_bytes}
-#define KV_TOKEN_TILE_SIZE {kv_tokens_per_iteration}
+#define KV_TOKENS_PER_ITERATION {kv_tokens_per_iteration}
 #define TOTAL_KV_SPLITS {num_total_kv_splits}
-#define NUM_THREADS_PER_THREADBLOCK {required_threads}
+#define REQUIRED_THREADS {required_threads}
 #define NUM_GQA_LAYERS {num_gqa_layers}
 #define NUM_BLOCKS {num_blocks}
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
@@ -595,7 +595,7 @@ kernel void gqa_split_kv_single_q_map(
         scale = config.scale,
         q_heads_per_kv_head = config.q_heads_per_kv_head(),
         max_q_heads = config.max_q_heads,
-        num_q_head_tiles_per_kv_head = config.num_q_head_tiles_per_kv_head(),
+        num_q_head_ranges_per_kv_head = config.num_q_head_ranges_per_kv_head(),
         num_kv_heads = config.num_kv_heads,
         num_tokens = config.num_tokens_per_page(),
         num_q_heads = config.num_q_heads,
