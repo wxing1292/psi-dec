@@ -47,11 +47,11 @@ fn write_sampling_runtime_params(
 }
 
 #[test]
-fn test_map_kernel_selection() {
-    let planner = super::TopKMapPlanner::new();
-    assert_eq!(planner.thread_block.max_vocab_tokens, 256);
-    assert_eq!(planner.thread_block.required_threads, 256);
-    assert_eq!(planner.partial_candidate_layout().vocab_partition_size(), 256);
+fn test_map_kernel_specialization_selection() {
+    let thread_block = super::TopKMapThreadBlockSpecialization::current();
+    assert_eq!(thread_block.max_vocab_tokens, 256);
+    assert_eq!(thread_block.required_threads, 256);
+    assert_eq!(super::standard_partial_candidate_layout().vocab_partition_size(), 256);
     let reduction_shape = TopKSampleShape {
         num_total_sampling_inputs: 1,
         vocab_size: 256,
@@ -62,43 +62,39 @@ fn test_map_kernel_selection() {
         ..reduction_shape
     };
     assert_eq!(
-        planner
-            .select(
-                reduction_shape,
-                crate::metal::Dtype::Float32,
-                TopKSamplingOperation::Sample
-            )
-            .algorithm,
+        super::TopKMapKernelSpecialization::select(
+            reduction_shape,
+            crate::metal::Dtype::Float32,
+            TopKSamplingOperation::Sample,
+        )
+        .algorithm,
         super::TopKMapAlgorithm::Reduction
     );
     assert_eq!(
-        planner
-            .select(
-                bitonic_shape,
-                crate::metal::Dtype::Float32,
-                TopKSamplingOperation::Sample
-            )
-            .algorithm,
+        super::TopKMapKernelSpecialization::select(
+            bitonic_shape,
+            crate::metal::Dtype::Float32,
+            TopKSamplingOperation::Sample,
+        )
+        .algorithm,
         super::TopKMapAlgorithm::Bitonic
     );
     assert_eq!(
-        planner
-            .select(
-                reduction_shape,
-                crate::metal::Dtype::Float32,
-                TopKSamplingOperation::WriteDistribution,
-            )
-            .algorithm,
+        super::TopKMapKernelSpecialization::select(
+            reduction_shape,
+            crate::metal::Dtype::Float32,
+            TopKSamplingOperation::WriteDistribution,
+        )
+        .algorithm,
         super::TopKMapAlgorithm::Bitonic
     );
     assert_eq!(
-        planner
-            .select(
-                reduction_shape,
-                crate::metal::Dtype::Float32,
-                TopKSamplingOperation::SampleAndWriteDistribution,
-            )
-            .algorithm,
+        super::TopKMapKernelSpecialization::select(
+            reduction_shape,
+            crate::metal::Dtype::Float32,
+            TopKSamplingOperation::SampleAndWriteDistribution,
+        )
+        .algorithm,
         super::TopKMapAlgorithm::Bitonic
     );
 }

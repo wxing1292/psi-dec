@@ -55,49 +55,32 @@ struct TopKMapKernelSpecialization {
 }
 
 impl TopKMapKernelSpecialization {
+    fn select(shape: TopKSampleShape, logits_dtype: Dtype, operation: TopKSamplingOperation) -> Self {
+        shape.validate();
+        let algorithm = match operation {
+            TopKSamplingOperation::Sample if shape.top_k <= TOP_K_REDUCTION_LIMIT => TopKMapAlgorithm::Reduction,
+            TopKSamplingOperation::Sample
+            | TopKSamplingOperation::WriteDistribution
+            | TopKSamplingOperation::SampleAndWriteDistribution => TopKMapAlgorithm::Bitonic,
+        };
+        Self {
+            logits_dtype,
+            algorithm,
+            thread_block: TopKMapThreadBlockSpecialization::current(),
+        }
+    }
+
     fn partial_candidate_layout(self) -> TopKPartialCandidateLayout {
         TopKPartialCandidateLayout::new(self.thread_block.max_vocab_tokens)
     }
 }
 
-struct TopKMapPlanner {
-    reduction_limit: u32,
-    thread_block: TopKMapThreadBlockSpecialization,
-}
-
-impl TopKMapPlanner {
-    fn new() -> Self {
+impl TopKMapThreadBlockSpecialization {
+    fn current() -> Self {
         Self {
-            reduction_limit: TOP_K_REDUCTION_LIMIT,
-            thread_block: TopKMapThreadBlockSpecialization {
-                max_vocab_tokens: TOP_K_VOCAB_TILE_SIZE,
-                required_threads: 256,
-            },
+            max_vocab_tokens: TOP_K_VOCAB_TILE_SIZE,
+            required_threads: 256,
         }
-    }
-
-    fn select(
-        &self,
-        shape: TopKSampleShape,
-        logits_dtype: Dtype,
-        operation: TopKSamplingOperation,
-    ) -> TopKMapKernelSpecialization {
-        shape.validate();
-        let algorithm = match operation {
-            TopKSamplingOperation::Sample if shape.top_k <= self.reduction_limit => TopKMapAlgorithm::Reduction,
-            TopKSamplingOperation::Sample
-            | TopKSamplingOperation::WriteDistribution
-            | TopKSamplingOperation::SampleAndWriteDistribution => TopKMapAlgorithm::Bitonic,
-        };
-        TopKMapKernelSpecialization {
-            logits_dtype,
-            algorithm,
-            thread_block: self.thread_block,
-        }
-    }
-
-    fn partial_candidate_layout(&self) -> TopKPartialCandidateLayout {
-        TopKPartialCandidateLayout::new(self.thread_block.max_vocab_tokens)
     }
 }
 
@@ -161,7 +144,7 @@ impl TopKSampleShape {
 }
 
 fn standard_partial_candidate_layout() -> TopKPartialCandidateLayout {
-    TopKMapPlanner::new().partial_candidate_layout()
+    TopKPartialCandidateLayout::new(TopKMapThreadBlockSpecialization::current().max_vocab_tokens)
 }
 
 fn num_vocab_partitions(shape: TopKSampleShape, layout: TopKPartialCandidateLayout) -> u32 {
@@ -290,7 +273,6 @@ fn assert_reduce_inputs_fit(
 }
 
 pub struct TopKMapKernels {
-    planner: TopKMapPlanner,
     f32_reduction: Kernel,
     f32_bitonic: Kernel,
     bf16_reduction: Kernel,
@@ -300,7 +282,6 @@ pub struct TopKMapKernels {
 impl TopKMapKernels {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
-            planner: TopKMapPlanner::new(),
             f32_reduction: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles"),
             f32_bitonic: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bitonic"),
             bf16_reduction: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16"),
@@ -315,7 +296,7 @@ impl TopKMapKernels {
         operation: TopKSamplingOperation,
         buffers: TopKMapBuffers<'a>,
     ) -> TopKMapInvocation<'a> {
-        let specialization = self.planner.select(shape, logits_dtype, operation);
+        let specialization = TopKMapKernelSpecialization::select(shape, logits_dtype, operation);
         let (kernel, logits_item_size) = match (specialization.logits_dtype, specialization.algorithm) {
             (Dtype::Float32, TopKMapAlgorithm::Reduction) => (&self.f32_reduction, size_of::<f32>()),
             (Dtype::Float32, TopKMapAlgorithm::Bitonic) => (&self.f32_bitonic, size_of::<f32>()),
@@ -337,7 +318,7 @@ impl TopKMapKernels {
     }
 
     pub fn partial_candidate_layout(&self) -> TopKPartialCandidateLayout {
-        self.planner.partial_candidate_layout()
+        standard_partial_candidate_layout()
     }
 
     pub fn add_replay_arguments(
@@ -355,7 +336,8 @@ impl TopKMapKernels {
             return;
         }
         let num_partitions = num_vocab_partitions(shape, self.partial_candidate_layout());
-        let num_threads_per_row = checked_num_threads(num_partitions, self.planner.thread_block.required_threads);
+        let required_threads = TopKMapThreadBlockSpecialization::current().required_threads;
+        let num_threads_per_row = checked_num_threads(num_partitions, required_threads);
         let num_active_threads = checked_num_threads(num_active_sampling_inputs, num_threads_per_row);
         let num_total_threads = checked_num_threads(shape.num_total_sampling_inputs, num_threads_per_row);
         assert!(num_active_threads <= num_total_threads);

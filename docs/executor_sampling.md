@@ -60,9 +60,9 @@ logits [num_rows, vocab_size]
   -> sampled token IDs + probabilities
 ```
 
-The private `TopKMapPlanner` selects a complete Map kernel specialization from the logits dtype, top-k, and required
-output. The small-k path uses repeated maximum reduction for sample-only top-k <= 32. Larger top-k and
-write-distribution generation use the bitonic Map path.
+The pure `TopKMapKernelSpecialization::select(...)` helper selects the Map kernel specialization from the logits dtype,
+top-k, and required output. The small-k path uses repeated maximum reduction for sample-only top-k <= 32. Larger top-k
+and write-distribution generation use the bitonic Map path. The component does not materialize a planner or plan object.
 These operations remain separate pipeline entry points.
 Unused static threadblock storage can reduce occupancy.
 
