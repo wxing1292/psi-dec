@@ -6,6 +6,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::LayerType;
@@ -448,7 +449,14 @@ impl Qwen35MainAttention {
     {
         match (self, metadata) {
             (Self::GQA(component), Qwen35MainAttentionInput::GQA { metadata, pages }) => {
-                component.record(recorder, input, output, pages, metadata)
+                component.record(
+                    recorder,
+                    input,
+                    output,
+                    pages,
+                    metadata,
+                    ReplayU32::Fixed(metadata.replay_shape().num_tokens),
+                )
             },
             (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
                 component.record(recorder, input, output, metadata)
@@ -469,7 +477,14 @@ impl Qwen35MainAttention {
     {
         match (self, metadata) {
             (Self::GQA(component), Qwen35MainAttentionInput::GQA { metadata, pages }) => {
-                component.record_bucketed(recorder, input, output, pages, metadata, num_active_tokens_key)
+                component.record(
+                    recorder,
+                    input,
+                    output,
+                    pages,
+                    metadata,
+                    ReplayU32::Parameter(num_active_tokens_key),
+                )
             },
             (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
                 component.record_bucketed(recorder, input, output, metadata, num_active_tokens_key)

@@ -18,6 +18,7 @@ use super::gqa_sdpa_config;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
+use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use crate::attn::gqa::sdpa::RequestShape;
 use crate::attn::gqa::sdpa::Selector;
 use crate::attn::gqa::ungated_scratch::UngatedGQAScratch;
@@ -150,14 +151,28 @@ impl UngatedGQA {
         req_slots: &[u32],
         token_indices: &[u32],
         cu_tokens: &[u32],
+        policy: &GQAReplayBucketPolicy,
+        num_total_tokens: u32,
     ) -> GQAReplayShape {
         assert_eq!(
             batch_metadata.max_tokens(),
             self.sdpa_selector.limits().max_map_task_templates as usize
         );
         let request_shapes = RequestShape::from_batch(token_indices, cu_tokens);
-        let selection = self.sdpa_selector.select_exact(&request_shapes);
+        let selection = self.sdpa_selector.select(&request_shapes, policy, num_total_tokens);
         batch_metadata.update(req_slots, token_indices, cu_tokens, &selection)
+    }
+
+    pub fn replay_bucket_policy(&self, max_tokens: u32) -> GQAReplayBucketPolicy {
+        GQAReplayBucketPolicy::new(max_tokens, &self.replay_token_topology_boundaries())
+    }
+
+    fn replay_token_topology_boundaries(&self) -> Box<[u32]> {
+        let mut boundaries = self.qkv.topology_boundaries().into_vec();
+        boundaries.extend(self.output.topology_boundaries());
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries.into_boxed_slice()
     }
 }
 

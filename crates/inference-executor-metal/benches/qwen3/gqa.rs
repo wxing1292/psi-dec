@@ -28,6 +28,7 @@ use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBi
 use inference_executor_metal::attn::gqa::backend::GQAKVCacheBindings;
 use inference_executor_metal::attn::gqa::backend::GQAMetalConfig;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
+use inference_executor_metal::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use inference_executor_metal::attn::gqa::sdpa::RequestShape;
 use inference_executor_metal::attn::gqa::sdpa::Selector;
 use inference_executor_metal::attn::gqa::ungated_backend::UngatedGQA;
@@ -268,6 +269,7 @@ impl Fixture {
             tokens_per_page,
         };
         let request_shapes = RequestShape::from_batch(&token_indices, &cu_tokens);
+        let replay_bucket_policy = GQAReplayBucketPolicy::new(MAX_TOKENS as u32, &[]);
         let single_q_variant = backend_sdpa::ExecutionVariant::single_q(
             sdpa_config,
             params.split_kv_single_q_kv_tokens_per_iteration,
@@ -278,7 +280,7 @@ impl Fixture {
             backend_sdpa::Registry::from_variants(sdpa_config, vec![single_q_variant]),
             MAX_TOKENS,
         )
-        .select_exact(&request_shapes);
+        .select(&request_shapes, &replay_bucket_policy, num_tokens);
         let split_kv_single_q_metadata = GQAMetadataBuffers::new(device, MAX_TOKENS);
         split_kv_single_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &single_q_selection);
         let tiled_q_variant = backend_sdpa::ExecutionVariant::tiled_q(
@@ -291,7 +293,7 @@ impl Fixture {
             backend_sdpa::Registry::from_variants(sdpa_config, vec![tiled_q_variant]),
             MAX_TOKENS,
         )
-        .select_exact(&request_shapes);
+        .select(&request_shapes, &replay_bucket_policy, num_tokens);
         let split_kv_tiled_q_metadata = GQAMetadataBuffers::new(device, MAX_TOKENS);
         let tiled_shape = split_kv_tiled_q_metadata.update(&req_slots, &token_indices, &cu_tokens, &tiled_q_selection);
 

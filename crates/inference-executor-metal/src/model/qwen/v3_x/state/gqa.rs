@@ -115,34 +115,14 @@ impl Qwen3xGQAState {
         page_ids
     }
 
-    pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
-        self.backend()
-            .prepare(self.metadata(), req_slots, token_indices, cu_tokens)
-    }
-
-    pub fn prepare_metadata_bucketed(
-        &self,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-    ) -> GQAReplayShape {
-        self.backend().prepare_bucketed(
-            self.metadata(),
-            req_slots,
-            token_indices,
-            cu_tokens,
-            &self.replay_bucket_policy,
-        )
-    }
-
-    pub fn prepare_metadata_bucketed_with_token_capacity(
+    pub fn prepare_metadata(
         &self,
         req_slots: &[u32],
         token_indices: &[u32],
         cu_tokens: &[u32],
         num_total_tokens: u32,
     ) -> GQAReplayShape {
-        self.backend().prepare_bucketed_with_token_capacity(
+        self.backend().prepare(
             self.metadata(),
             req_slots,
             token_indices,

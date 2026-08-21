@@ -235,9 +235,8 @@ one Q-token range are contiguous. This is the existing greedy allocation policy.
 For a fixed Q-token/head output coordinate, adjacent `cu_sdpa_partial_outputs` values select the
 `SDPAPartialOutput`s for the reducer.
 
-`num_total_sdpa_map_task_templates` is the recorded replay capacity in the shared shape. The legacy exact-token
-exact-selection path retains its existing padded extent. The bucketed Qwen3.5 path uses the shared replay bucket policy.
-Unused tail Map task templates contain an invalid Q-token-range index and do not write a map result.
+`num_total_sdpa_map_task_templates` is the recorded replay capacity in the shared shape. The selector uses the shared
+capacity policy. Unused tail Map task templates contain an invalid Q-token-range index and do not write a map result.
 
 The SplitKV `SingleQ` map also permits an invalid-Q-token-range `SDPAMapTaskTemplate` in one token's generic composite
 range. This template does not write a history partial output for that slot.
@@ -477,15 +476,9 @@ KV split.
 This rule lets both SplitKV variants share one recorded program for the same Q-token-range and KV-split geometry. The
 flag remains batch-selection metadata and does not enter the replay key.
 
-`gqa::sdpa::Selector::select_exact(...)` keeps the legacy exact token and Q-token-range extents. It retains the existing
-padded KV-split extent. `gqa::sdpa::Selector::select_bucketed(...)` applies the shared capacity policy independently to tokens,
-Q-token ranges, and KV splits. `GQAMetadataBuffers::update(...)` stores the selected execution and replay shape from the
-complete selection.
-
-`gqa::sdpa::Selector::select_bucketed_with_token_capacity(...)` accepts a token capacity from a composite replay stage.
-GQA
-does not apply its token bucket policy again on this path. GQA still selects Q-token-range and KV-split capacities with
-its private policies.
+`gqa::sdpa::Selector::select(...)` accepts request shapes, one capacity policy, and `num_total_tokens`. It selects the
+execution variant and derives the complete active and recorded SDPA extents. `GQAMetadataBuffers::update(...)` stores the
+selected execution and replay shape from this selection. GQA does not apply a second token-capacity policy.
 
 The caller-owned token capacity must satisfy `num_tokens <= num_total_tokens <= max_tokens`. It must also preserve the
 QGKV and output affine topologies selected for `num_tokens`. GQA validates these topologies during preparation and
@@ -508,9 +501,9 @@ token reads input or metadata, mutates a page, or writes output. SplitKV SingleQ
 KV splits or Q-token ranges read their metadata. All token-domain commands use the same active-token parameter key
 and range.
 
-The default bucketed API uses `gqa.num_active_tokens`. A composite stage can supply a stage-owned
-`ReplayParameterKey` through `GQAReplayMode::BucketedWithTokenKey(...)` and `Qwen3xGQA::record_bucketed(...)`.
-The supplied key must differ from the private Q-token-range and KV-split keys.
+`GQAInput::num_active_tokens` accepts `ReplayU32::Fixed(value)` or `ReplayU32::Parameter(key)`. A fixed value records
+active work without replay padding. A parameter key records a fixed total capacity and supplies the active count at
+submission. The supplied key must differ from the private Q-token-range and KV-split keys.
 
 `add_gqa_replay_arguments(...)` supplies all default GQA arguments. A composite stage supplies its active-token
 argument once. It then calls `add_gqa_private_replay_arguments(...)` for the Q-token-range and KV-split arguments.

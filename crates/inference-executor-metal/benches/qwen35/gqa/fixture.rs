@@ -23,9 +23,9 @@ use inference_executor_metal::attn::gqa::backend::GQA;
 use inference_executor_metal::attn::gqa::backend::GQAInput;
 use inference_executor_metal::attn::gqa::backend::GQAKVCacheBindings;
 use inference_executor_metal::attn::gqa::backend::GQAMetalConfig;
-use inference_executor_metal::attn::gqa::backend::GQAReplayMode;
 use inference_executor_metal::attn::gqa::backend::GQAWeights;
 use inference_executor_metal::attn::gqa::batch_metadata::GQAMetadataBuffers;
+use inference_executor_metal::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use inference_executor_metal::attn::gqa::scratch::GQAScratchBindings;
 use inference_executor_metal::attn::gqa::sdpa::RequestShape;
 use inference_executor_metal::attn::gqa::sdpa::Selector;
@@ -324,6 +324,8 @@ impl<'a> RealGQAFixture<'a> {
             .map(|value| value as u32)
             .collect::<Vec<_>>();
         let request_shapes = RequestShape::from_batch(&existing_context_lens, &materialized_cu_tokens);
+        let replay_bucket_policy =
+            GQAReplayBucketPolicy::new(max_tokens.try_into().expect("GQA max token count must fit u32"), &[]);
         let sdpa_config = backend_sdpa::Config {
             io_dtype: config.io_dtype,
             num_q_heads: model.num_q_heads.try_into().expect("GQA Q-head count must fit u32"),
@@ -341,7 +343,7 @@ impl<'a> RealGQAFixture<'a> {
             backend_sdpa::Registry::from_variants(sdpa_config, vec![single_q_variant]),
             max_tokens,
         )
-        .select_exact(&request_shapes);
+        .select(&request_shapes, &replay_bucket_policy, num_tokens);
         let batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let shape = batch_metadata.update(
             &req_slots,
@@ -360,7 +362,7 @@ impl<'a> RealGQAFixture<'a> {
             backend_sdpa::Registry::from_variants(sdpa_config, vec![tiled_q_variant]),
             max_tokens,
         )
-        .select_exact(&request_shapes);
+        .select(&request_shapes, &replay_bucket_policy, num_tokens);
         let tiled_batch_metadata = GQAMetadataBuffers::new(device, max_tokens);
         let tiled_replay_shape = tiled_batch_metadata.update(
             &req_slots,
@@ -475,7 +477,7 @@ impl<'a> RealGQAFixture<'a> {
                     attention_output: &attention_output,
                     gated_attention_output: &gated_attention_output,
                 },
-                replay_mode: GQAReplayMode::Exact,
+                num_active_tokens: ReplayU32::Fixed(shape.num_tokens),
             },
         );
         let replay = recorder.build();

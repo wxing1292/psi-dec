@@ -2,7 +2,6 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
-use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::backend::recorder::Recorder;
@@ -14,7 +13,6 @@ use crate::attn::gqa::backend::GQA;
 use crate::attn::gqa::backend::GQAInput;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::backend::GQAMetalConfig;
-use crate::attn::gqa::backend::GQAReplayMode;
 use crate::attn::gqa::backend::GQAWeights;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
@@ -111,41 +109,7 @@ impl Qwen3xGQA {
         output: &'a Buffer,
         pages: &'a Buffer,
         metadata: &'a GQAMetadataBuffers,
-    ) where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.record_with_mode(recorder, input, output, pages, metadata, GQAReplayMode::Bucketed);
-    }
-
-    pub fn record_bucketed<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        input: &'a Buffer,
-        output: &'a Buffer,
-        pages: &'a Buffer,
-        metadata: &'a GQAMetadataBuffers,
-        num_active_tokens_key: ReplayParameterKey,
-    ) where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.record_with_mode(
-            recorder,
-            input,
-            output,
-            pages,
-            metadata,
-            GQAReplayMode::BucketedWithTokenKey(num_active_tokens_key),
-        );
-    }
-
-    fn record_with_mode<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        input: &'a Buffer,
-        output: &'a Buffer,
-        pages: &'a Buffer,
-        metadata: &'a GQAMetadataBuffers,
-        replay_mode: GQAReplayMode,
+        num_active_tokens: ReplayU32,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -164,7 +128,7 @@ impl Qwen3xGQA {
                 },
                 weights: self.weights().as_borrowed(),
                 scratch: self.scratch().bindings(),
-                replay_mode,
+                num_active_tokens,
             },
         );
     }

@@ -13,6 +13,7 @@ use inference_runtime_core::runtime::RawRequestSlot;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
+use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::attn::gqa::ungated_backend::UngatedGQA;
 use crate::attn::gqa::ungated_backend::UngatedGQAInput;
@@ -39,6 +40,7 @@ pub struct Qwen3MainGQAState {
     scratch: Option<Rc<UngatedGQAScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
     metadata: Option<GQAMetadataBuffers>,
+    replay_bucket_policy: GQAReplayBucketPolicy,
     core: UngatedGQACore,
     metal: GQAMetalConfig,
     page_table_layout: GQAPageTableLayout,
@@ -171,11 +173,17 @@ impl Qwen3MainGQAState {
         page_table_layout.validate();
         let backend = Rc::new(UngatedGQA::new(device, core.clone(), metal, max_tokens));
         let scratch = Rc::new(backend.new_scratch());
+        let replay_bucket_policy = backend.replay_bucket_policy(
+            max_tokens
+                .try_into()
+                .expect("qwen3 Main GQA token capacity must fit u32"),
+        );
         Self {
             backend: Some(backend),
             scratch: Some(scratch),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
             metadata: Some(GQAMetadataBuffers::new(device, max_tokens)),
+            replay_bucket_policy,
             core,
             metal,
             page_table_layout,
@@ -250,8 +258,15 @@ impl Qwen3MainGQAState {
     }
 
     pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
-        self.backend()
-            .prepare(self.metadata(), req_slots, token_indices, cu_tokens)
+        let num_total_tokens = cu_tokens.last().copied().unwrap_or_default();
+        self.backend().prepare(
+            self.metadata(),
+            req_slots,
+            token_indices,
+            cu_tokens,
+            &self.replay_bucket_policy,
+            num_total_tokens,
+        )
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {

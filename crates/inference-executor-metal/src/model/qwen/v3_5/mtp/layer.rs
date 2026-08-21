@@ -5,6 +5,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
@@ -196,13 +197,13 @@ impl Qwen35MTPLayer {
             input.residual_input,
             &self.scratch.normalized_hidden,
         );
-        self.attention.record_bucketed(
+        self.attention.record(
             recorder,
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             input.pages,
             input.gqa,
-            num_active_tokens_key,
+            ReplayU32::Parameter(num_active_tokens_key),
         );
         self.residual_add.record_bucketed(
             recorder,
@@ -261,6 +262,7 @@ impl ReplayLayer for Qwen35MTPLayer {
             &self.scratch.branch_output,
             input.pages,
             input.gqa,
+            ReplayU32::Fixed(input.gqa.replay_shape().num_tokens),
         );
         self.residual_add.record(
             recorder,

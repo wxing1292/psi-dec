@@ -117,16 +117,6 @@ impl Selection {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ReplayCapacity<'a> {
-    Exact,
-    ComponentBucketed(&'a GQAReplayBucketPolicy),
-    CallerTokenCapacity {
-        num_total_tokens: u32,
-        policy: &'a GQAReplayBucketPolicy,
-    },
-}
-
 #[derive(Clone, Debug)]
 pub struct Selector {
     registry: backend_sdpa::Registry,
@@ -156,40 +146,13 @@ impl Selector {
         self.limits
     }
 
-    pub fn select_exact(&self, request_shapes: &[RequestShape]) -> Selection {
-        self.select(request_shapes, ReplayCapacity::Exact)
-    }
-
-    pub fn select_bucketed(&self, request_shapes: &[RequestShape], policy: &GQAReplayBucketPolicy) -> Selection {
-        self.validate_policy(policy);
-        self.select(request_shapes, ReplayCapacity::ComponentBucketed(policy))
-    }
-
-    pub fn select_bucketed_with_token_capacity(
+    pub fn select(
         &self,
         request_shapes: &[RequestShape],
         policy: &GQAReplayBucketPolicy,
         num_total_tokens: u32,
     ) -> Selection {
         self.validate_policy(policy);
-        self.select(
-            request_shapes,
-            ReplayCapacity::CallerTokenCapacity {
-                num_total_tokens,
-                policy,
-            },
-        )
-    }
-
-    fn validate_policy(&self, policy: &GQAReplayBucketPolicy) {
-        assert_eq!(
-            policy.max_tokens(),
-            self.limits.max_map_task_templates,
-            "GQA replay bucket policy must match the SDPA selection capacity"
-        );
-    }
-
-    fn select(&self, request_shapes: &[RequestShape], replay_capacity: ReplayCapacity<'_>) -> Selection {
         assert!(!request_shapes.is_empty(), "GQA SDPA selector requires requests");
         let num_tokens = request_shapes
             .iter()
@@ -197,20 +160,14 @@ impl Selector {
             .expect("GQA SDPA token count must fit u32");
         assert!(num_tokens > 0);
         assert!(num_tokens <= self.limits.max_map_task_templates);
-        if let ReplayCapacity::CallerTokenCapacity {
-            num_total_tokens,
-            policy,
-        } = replay_capacity
-        {
-            assert!(
-                num_tokens <= num_total_tokens,
-                "GQA active token count must not exceed the caller-owned token capacity"
-            );
-            assert!(
-                num_total_tokens <= policy.max_tokens(),
-                "GQA caller-owned token capacity must not exceed the metadata capacity"
-            );
-        }
+        assert!(
+            num_tokens <= num_total_tokens,
+            "GQA active token count must not exceed the total token count"
+        );
+        assert!(
+            num_total_tokens <= policy.max_tokens(),
+            "GQA total token count must not exceed the metadata capacity"
+        );
 
         let candidates = self
             .registry
@@ -222,11 +179,20 @@ impl Selector {
                     self.registry.config(),
                     request_shapes,
                     self.limits,
-                    replay_capacity,
+                    policy,
+                    num_total_tokens,
                 )
             })
             .collect::<Vec<_>>();
         select_candidate(self.registry.config(), candidates)
+    }
+
+    fn validate_policy(&self, policy: &GQAReplayBucketPolicy) {
+        assert_eq!(
+            policy.max_tokens(),
+            self.limits.max_map_task_templates,
+            "GQA replay bucket policy must match the SDPA selection capacity"
+        );
     }
 }
 
@@ -242,7 +208,8 @@ fn materialize_candidate(
     config: backend_sdpa::Config,
     request_shapes: &[RequestShape],
     limits: SelectorLimits,
-    replay_capacity: ReplayCapacity<'_>,
+    policy: &GQAReplayBucketPolicy,
+    num_total_tokens: u32,
 ) -> Selection {
     assert!(variant.supports(config));
     let map = variant.map.thread_block;
@@ -300,13 +267,8 @@ fn materialize_candidate(
         .expect("GQA SDPA Map task-template count must fit u32");
     assert!(num_map_task_templates <= limits.max_map_task_templates);
     let num_tokens = request_shapes.iter().map(|shape| shape.num_q_tokens).sum();
-    let (num_total_tokens, num_total_q_token_ranges, num_total_map_task_templates) = replay_extents(
-        num_tokens,
-        num_q_token_ranges,
-        num_map_task_templates,
-        limits.max_map_task_templates,
-        replay_capacity,
-    );
+    let (num_total_tokens, num_total_q_token_ranges, num_total_map_task_templates) =
+        policy.capacities(num_total_tokens, num_q_token_ranges, num_map_task_templates);
     let replay_shape = GQAReplayShape::new(
         num_tokens,
         num_total_tokens,
@@ -461,31 +423,6 @@ fn allocate_map_tasks(ranges: &mut [QTokenRangeWork], limits: SelectorLimits) {
     }
 }
 
-fn replay_extents(
-    num_tokens: u32,
-    num_q_token_ranges: u32,
-    num_map_task_templates: u32,
-    max_map_task_templates: u32,
-    replay_capacity: ReplayCapacity<'_>,
-) -> (u32, u32, u32) {
-    match replay_capacity {
-        ReplayCapacity::Exact => {
-            let num_total_map_task_templates = num_map_task_templates
-                .checked_next_power_of_two()
-                .unwrap_or(max_map_task_templates)
-                .min(max_map_task_templates);
-            (num_tokens, num_q_token_ranges, num_total_map_task_templates)
-        },
-        ReplayCapacity::ComponentBucketed(policy) => {
-            policy.capacities(num_tokens, num_q_token_ranges, num_map_task_templates)
-        },
-        ReplayCapacity::CallerTokenCapacity {
-            num_total_tokens,
-            policy,
-        } => policy.capacities_with_token_capacity(num_total_tokens, num_q_token_ranges, num_map_task_templates),
-    }
-}
-
 fn select_candidate(config: backend_sdpa::Config, mut candidates: Vec<Selection>) -> Selection {
     assert!(!candidates.is_empty());
     if candidates.len() == 1 {
@@ -583,17 +520,14 @@ mod tests {
         Selector::new(backend_sdpa::Registry::new(config), 128)
     }
 
-    fn selection(token_indices: &[u32], request_tokens: &[u32], bucketed: bool) -> Selection {
+    fn selection(token_indices: &[u32], request_tokens: &[u32]) -> Selection {
         let mut cu_tokens = vec![0];
         for &num_tokens in request_tokens {
             cu_tokens.push(cu_tokens.last().copied().unwrap() + num_tokens);
         }
         let request_shapes = RequestShape::from_batch(token_indices, &cu_tokens);
-        if bucketed {
-            selector().select_bucketed(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]))
-        } else {
-            selector().select_exact(&request_shapes)
-        }
+        let num_total_tokens = cu_tokens.last().copied().unwrap();
+        selector().select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), num_total_tokens)
     }
 
     fn is_single_q(selection: &Selection) -> bool {
@@ -603,12 +537,10 @@ mod tests {
     #[test]
     fn test_selector_preserves_measured_d256_page8_crossovers() {
         for (tokens, context) in [(1, 65536), (2, 65536), (4, 128), (8, 128), (25, 32)] {
-            assert!(is_single_q(&selection(&[context], &[tokens], false)));
-            assert!(is_single_q(&selection(&[context], &[tokens], true)));
+            assert!(is_single_q(&selection(&[context], &[tokens])));
         }
         for (tokens, context) in [(4, 512), (8, 512), (16, 128), (25, 128), (64, 0)] {
-            assert!(!is_single_q(&selection(&[context], &[tokens], false)));
-            assert!(!is_single_q(&selection(&[context], &[tokens], true)));
+            assert!(!is_single_q(&selection(&[context], &[tokens])));
         }
     }
 
@@ -622,7 +554,7 @@ mod tests {
             head_dim: 256,
             tokens_per_page: 16,
         })
-        .select_exact(&request_shapes);
+        .select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 8);
         assert_eq!(d256_page16.variant().map.thread_block.max_q_tokens, 8);
         assert_eq!(d256_page16.variant().map.thread_block.max_q_heads, 3);
 
@@ -633,7 +565,7 @@ mod tests {
             head_dim: 128,
             tokens_per_page: 8,
         })
-        .select_exact(&request_shapes);
+        .select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 8);
         assert_eq!(d128_page8.variant().map.thread_block.max_q_tokens, 8);
         assert_eq!(d128_page8.variant().map.thread_block.max_q_heads, 8);
 
@@ -644,24 +576,24 @@ mod tests {
             head_dim: 256,
             tokens_per_page: 4,
         })
-        .select_exact(&request_shapes);
+        .select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 8);
         assert_eq!(unsupported.variant().map.thread_block.max_q_tokens, 1);
     }
 
     #[test]
     fn test_selector_prices_request_local_tail_ranges() {
-        assert!(is_single_q(&selection(&[65536; 8], &[1; 8], false)));
-        assert!(is_single_q(&selection(&[1024, 65536], &[64, 1], false)));
-        assert!(is_single_q(&selection(&[65536, 1024], &[1, 8], false)));
-        assert!(!is_single_q(&selection(&[65536, 65536], &[8, 1], false)));
+        assert!(is_single_q(&selection(&[65536; 8], &[1; 8])));
+        assert!(is_single_q(&selection(&[1024, 65536], &[64, 1])));
+        assert!(is_single_q(&selection(&[65536, 1024], &[1, 8])));
+        assert!(!is_single_q(&selection(&[65536, 65536], &[8, 1])));
     }
 
     #[test]
     fn test_selection_materializes_current_tiled_q_capacity_and_metrics() {
-        let tail_selection = selection(&[1024, 65536], &[64, 1], false);
+        let tail_selection = selection(&[1024, 65536], &[64, 1]);
         assert!(is_single_q(&tail_selection));
 
-        let selection = selection(&[65536], &[25], true);
+        let selection = selection(&[65536], &[25]);
         assert!(!is_single_q(&selection));
         assert_eq!(selection.q_token_ranges().len(), 4);
         assert_eq!(selection.map_task_templates().len(), 23);
@@ -674,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_selection_map_tasks_cover_each_visible_kv_range_once() {
-        let selection = selection(&[1024], &[25], false);
+        let selection = selection(&[1024], &[25]);
         for (range_index, range) in selection.q_token_ranges().iter().enumerate() {
             let offsets = selection.cu_partial_outputs_by_q_token_range();
             let templates =
@@ -694,16 +626,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "GQA active token count must not exceed the caller-owned token capacity")]
-    fn test_caller_token_capacity_rejects_active_overflow() {
+    #[should_panic(expected = "GQA active token count must not exceed the total token count")]
+    fn test_total_token_count_rejects_active_overflow() {
         let request_shapes = RequestShape::from_batch(&[0], &[0, 5]);
-        selector().select_bucketed_with_token_capacity(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 4);
+        selector().select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 4);
     }
 
     #[test]
-    #[should_panic(expected = "GQA caller-owned token capacity must not exceed the metadata capacity")]
-    fn test_caller_token_capacity_rejects_metadata_overflow() {
+    #[should_panic(expected = "GQA total token count must not exceed the metadata capacity")]
+    fn test_total_token_count_rejects_metadata_overflow() {
         let request_shapes = RequestShape::from_batch(&[0], &[0, 5]);
-        selector().select_bucketed_with_token_capacity(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 129);
+        selector().select(&request_shapes, &GQAReplayBucketPolicy::new(128, &[]), 129);
     }
 }

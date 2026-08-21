@@ -36,20 +36,7 @@ impl GQAReplayBucketPolicy {
         self.kv_splits.capacity(num_kv_splits)
     }
 
-    pub fn capacities(&self, num_tokens: u32, num_q_token_tiles: u32, num_kv_splits: u32) -> (u32, u32, u32) {
-        (
-            self.tokens.capacity(num_tokens),
-            self.q_token_tiles.capacity(num_q_token_tiles),
-            self.kv_splits.capacity(num_kv_splits),
-        )
-    }
-
-    pub fn capacities_with_token_capacity(
-        &self,
-        num_total_tokens: u32,
-        num_q_token_tiles: u32,
-        num_kv_splits: u32,
-    ) -> (u32, u32, u32) {
+    pub fn capacities(&self, num_total_tokens: u32, num_q_token_tiles: u32, num_kv_splits: u32) -> (u32, u32, u32) {
         (
             num_total_tokens,
             self.q_token_tiles.capacity(num_q_token_tiles),
@@ -256,8 +243,9 @@ mod tests {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 8);
         let shapes = RequestShape::from_batch(&[7, 20], &[0, 2, 5]);
+        let policy = GQAReplayBucketPolicy::new(8, &[]);
         let single = backend_sdpa::ExecutionVariant::single_q(config(), 8, 32, 1);
-        let single_selection = selector(8, single).select_exact(&shapes);
+        let single_selection = selector(8, single).select(&shapes, &policy, 5);
 
         let single_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], &single_selection);
         assert_eq!(metadata.req_slots().read_typed::<u32>(0, 5), vec![2, 2, 5, 5, 5]);
@@ -275,10 +263,10 @@ mod tests {
             metadata.cu_sdpa_partial_outputs().read_typed::<u32>(0, 6),
             vec![0, 1, 2, 4, 6, 8]
         );
-        assert_eq!(single_shape, GQAReplayShape::new(5, 5, 5, 5, 8, 8, true));
+        assert_eq!(single_shape, GQAReplayShape::new(5, 5, 5, 6, 8, 8, true));
 
         let tiled = backend_sdpa::ExecutionVariant::tiled_q(config(), 8, 8, 1);
-        let tiled_selection = selector(8, tiled).select_exact(&shapes);
+        let tiled_selection = selector(8, tiled).select(&shapes, &policy, 5);
         let tiled_shape = metadata.update(&[2, 5], &[7, 20], &[0, 2, 5], &tiled_selection);
         assert_eq!(metadata.q_token_ranges().read_typed::<u32>(0, 4), vec![0, 2, 2, 5]);
         assert_eq!(
@@ -294,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bucketed_selection_preserves_non_kv_metadata_tail() {
+    fn test_selection_preserves_non_kv_metadata_tail() {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 12);
         metadata.q_token_ranges().write_typed(0, &[0xA5A5_A5A5_u32; 24]);
@@ -307,7 +295,7 @@ mod tests {
         let variant = backend_sdpa::ExecutionVariant::tiled_q(config(), 8, 8, 1);
         let selector = selector(12, variant);
         let policy = GQAReplayBucketPolicy::new(12, &[]);
-        let selection = selector.select_bucketed(&RequestShape::from_batch(&[0, 0, 0], &[0, 4, 8, 9]), &policy);
+        let selection = selector.select(&RequestShape::from_batch(&[0, 0, 0], &[0, 4, 8, 9]), &policy, 12);
 
         let shape = metadata.update(&[2, 5, 7], &[0, 0, 0], &[0, 4, 8, 9], &selection);
         assert_eq!(shape, GQAReplayShape::new(9, 12, 3, 4, 3, 4, true));

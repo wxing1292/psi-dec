@@ -188,14 +188,14 @@ impl Qwen35Executor {
             .mtp()
             .body
             .component()
-            .replay_token_capacity(num_active_tokens);
+            .num_total_tokens(num_active_tokens);
         let num_mtp_sample_rows = module_batch.sampler_configs.len();
         self.write_token_ids(module_batch.microbatch.flat_token_ids());
         let mtp_gqa_shape = self
             .speculator
             .mtp()
             .gqa_state
-            .prepare_metadata_bucketed_with_token_capacity(
+            .prepare_metadata(
                 module_batch.microbatch.req_slots(),
                 module_batch.microbatch.token_indices(),
                 module_batch.microbatch.cu_tokens(),
@@ -464,7 +464,7 @@ impl Qwen35Executor {
                 .mtp()
                 .body
                 .component()
-                .replay_token_capacity(mtp_gqa_shape.num_tokens),
+                .num_total_tokens(mtp_gqa_shape.num_tokens),
             mtp_gqa_shape.num_total_tokens,
             "qwen3.5 MTP steps must preserve the replay token capacity"
         );

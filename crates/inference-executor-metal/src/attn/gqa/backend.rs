@@ -32,33 +32,6 @@ pub const GQA_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("g
 pub const GQA_NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey = ReplayParameterKey::new("gqa.num_active_q_token_tiles");
 pub const GQA_NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("gqa.num_active_kv_splits");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GQAReplayMode {
-    Exact,
-    Bucketed,
-    BucketedWithTokenKey(ReplayParameterKey),
-}
-
-impl GQAReplayMode {
-    fn active_tokens_key(self) -> Option<ReplayParameterKey> {
-        match self {
-            Self::Exact => None,
-            Self::Bucketed => Some(GQA_NUM_ACTIVE_TOKENS),
-            Self::BucketedWithTokenKey(key) => {
-                assert_ne!(
-                    key, GQA_NUM_ACTIVE_Q_TOKEN_TILES,
-                    "GQA active-token key must differ from the private Q-token-tile key"
-                );
-                assert_ne!(
-                    key, GQA_NUM_ACTIVE_KV_SPLITS,
-                    "GQA active-token key must differ from the private SDPA map TaskTemplate key"
-                );
-                Some(key)
-            },
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GQAReplayTopology {
     pub sdpa_execution: backend_sdpa::ExecutionVariant,
@@ -151,7 +124,7 @@ pub struct GQAInput<'a> {
     pub kv_cache: GQAKVCacheBindings<'a>,
     pub weights: GQAWeights<'a>,
     pub scratch: GQAScratchBindings<'a>,
-    pub replay_mode: GQAReplayMode,
+    pub num_active_tokens: ReplayU32,
 }
 
 /// The caller-owned next-hidden-state buffer returned by one GQA recording.
@@ -206,16 +179,21 @@ impl GQA {
     fn validate_input(&self, input: &GQAInput<'_>) {
         let shape = input.batch_metadata.replay_shape();
         shape.validate();
-        match input.replay_mode {
-            GQAReplayMode::Exact => {
+        match input.num_active_tokens {
+            ReplayU32::Fixed(num_active_tokens) => {
+                assert_eq!(num_active_tokens, shape.num_tokens);
                 assert_eq!(shape.num_tokens, shape.num_total_tokens);
                 assert_eq!(shape.num_q_token_tiles, shape.num_total_q_token_tiles);
             },
-            GQAReplayMode::Bucketed => {
-                self.validate_token_capacity_topology(shape.num_tokens, shape.num_total_tokens);
-            },
-            GQAReplayMode::BucketedWithTokenKey(_) => {
-                let _ = input.replay_mode.active_tokens_key();
+            ReplayU32::Parameter(key) => {
+                assert_ne!(
+                    key, GQA_NUM_ACTIVE_Q_TOKEN_TILES,
+                    "GQA active-token key must differ from the private Q-token-range key"
+                );
+                assert_ne!(
+                    key, GQA_NUM_ACTIVE_KV_SPLITS,
+                    "GQA active-token key must differ from the private SDPA map TaskTemplate key"
+                );
                 self.validate_token_capacity_topology(shape.num_tokens, shape.num_total_tokens);
             },
         }
@@ -260,39 +238,6 @@ impl GQA {
         req_slots: &[u32],
         token_indices: &[u32],
         cu_tokens: &[u32],
-    ) -> GQAReplayShape {
-        assert_eq!(
-            batch_metadata.max_tokens(),
-            self.sdpa_selector.limits().max_map_task_templates as usize
-        );
-        let request_shapes = RequestShape::from_batch(token_indices, cu_tokens);
-        let selection = self.sdpa_selector.select_exact(&request_shapes);
-        batch_metadata.update(req_slots, token_indices, cu_tokens, &selection)
-    }
-
-    pub fn prepare_bucketed(
-        &self,
-        batch_metadata: &GQAMetadataBuffers,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
-        policy: &GQAReplayBucketPolicy,
-    ) -> GQAReplayShape {
-        assert_eq!(
-            batch_metadata.max_tokens(),
-            self.sdpa_selector.limits().max_map_task_templates as usize
-        );
-        let request_shapes = RequestShape::from_batch(token_indices, cu_tokens);
-        let selection = self.sdpa_selector.select_bucketed(&request_shapes, policy);
-        batch_metadata.update(req_slots, token_indices, cu_tokens, &selection)
-    }
-
-    pub fn prepare_bucketed_with_token_capacity(
-        &self,
-        batch_metadata: &GQAMetadataBuffers,
-        req_slots: &[u32],
-        token_indices: &[u32],
-        cu_tokens: &[u32],
         policy: &GQAReplayBucketPolicy,
         num_total_tokens: u32,
     ) -> GQAReplayShape {
@@ -300,11 +245,11 @@ impl GQA {
         assert!(num_tokens > 0, "GQA replay requires active tokens");
         assert!(
             num_tokens <= num_total_tokens,
-            "GQA active token count must not exceed the caller-owned token capacity"
+            "GQA active token count must not exceed the total token count"
         );
         assert!(
             num_total_tokens <= policy.max_tokens(),
-            "GQA caller-owned token capacity must not exceed the metadata capacity"
+            "GQA total token count must not exceed the metadata capacity"
         );
         self.validate_token_capacity_topology(num_tokens, num_total_tokens);
         assert_eq!(
@@ -312,9 +257,7 @@ impl GQA {
             self.sdpa_selector.limits().max_map_task_templates as usize
         );
         let request_shapes = RequestShape::from_batch(token_indices, cu_tokens);
-        let selection =
-            self.sdpa_selector
-                .select_bucketed_with_token_capacity(&request_shapes, policy, num_total_tokens);
+        let selection = self.sdpa_selector.select(&request_shapes, policy, num_total_tokens);
         batch_metadata.update(req_slots, token_indices, cu_tokens, &selection)
     }
 
@@ -372,14 +315,16 @@ impl ReplayLayer for GQA {
         let weights = input.weights;
         let batch_metadata = input.batch_metadata;
         let scratch = input.scratch;
-        let active_tokens_key = input.replay_mode.active_tokens_key();
+        let active_tokens = input.num_active_tokens;
+        let active_tokens_key = match active_tokens {
+            ReplayU32::Parameter(key) => Some(key),
+            ReplayU32::Fixed(_) => None,
+        };
         let bucketed = active_tokens_key.is_some();
-        let active_tokens_key = active_tokens_key.unwrap_or(GQA_NUM_ACTIVE_TOKENS);
-        let active_tokens = ReplayU32::Parameter(active_tokens_key);
         let qgkv = if bucketed {
             self.qgkv.invoke_bucketed(
                 shape.num_total_tokens,
-                active_tokens_key,
+                active_tokens_key.unwrap(),
                 scratch.qgkv,
                 0,
                 hidden_state,
@@ -485,10 +430,10 @@ impl ReplayLayer for GQA {
             self.gate.invoke(gate_shape, gate_buffers)
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(gate));
-        let output = if bucketed {
+        let output = if active_tokens_key.is_some() {
             self.output.invoke_bucketed(
                 shape.num_total_tokens,
-                active_tokens_key,
+                active_tokens_key.unwrap(),
                 next_hidden_state,
                 0,
                 scratch.gated_attention_output,
@@ -531,9 +476,8 @@ impl GQA {
         let batch_metadata = input.batch_metadata;
         let kv_cache = input.kv_cache;
         let scratch = input.scratch;
-        let bucketed = input.replay_mode.active_tokens_key().is_some();
-        let active_tokens_key = input.replay_mode.active_tokens_key().unwrap_or(GQA_NUM_ACTIVE_TOKENS);
-        let active_tokens = ReplayU32::Parameter(active_tokens_key);
+        let active_tokens = input.num_active_tokens;
+        let bucketed = matches!(active_tokens, ReplayU32::Parameter(_));
         let active_q_token_tiles = ReplayU32::Parameter(GQA_NUM_ACTIVE_Q_TOKEN_TILES);
         let active_kv_splits = ReplayU32::Parameter(GQA_NUM_ACTIVE_KV_SPLITS);
         let execution = batch_metadata.variant();

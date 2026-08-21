@@ -884,11 +884,11 @@ impl ReplayableModel for Qwen35Executor {
             .total_tokens()
             .try_into()
             .expect("qwen3.5 Main token count must fit u32");
-        let num_main_total_tokens = self.main.component().replay_token_capacity(num_main_active_tokens);
+        let num_main_total_tokens = self.main.component().num_total_tokens(num_main_active_tokens);
         let prepare_start = Instant::now();
         let gqa_start = Instant::now();
         self.prepare_gqa_page_ids(core_batch_req);
-        let gqa_shape = self.main_gqa_state.prepare_metadata_bucketed_with_token_capacity(
+        let gqa_shape = self.main_gqa_state.prepare_metadata(
             microbatch.req_slots(),
             microbatch.token_indices(),
             microbatch.cu_tokens(),

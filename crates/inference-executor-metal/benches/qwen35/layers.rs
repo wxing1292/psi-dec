@@ -224,7 +224,7 @@ impl BlockFixture {
             next_page_id as usize, num_cache_pages,
             "qwen3.5 layer bench must initialize every cache page ID"
         );
-        gqa_state.prepare_metadata(&[0], &[shape.context], &[0, shape.num_tokens]);
+        gqa_state.prepare_metadata(&[0], &[shape.context], &[0, shape.num_tokens], shape.num_tokens);
 
         let gdn_layers = (0..config.text_config.num_hidden_layers)
             .filter(|&index| config.layer_type_at(index).is_ok_and(|kind| kind == LayerType::GDN))
