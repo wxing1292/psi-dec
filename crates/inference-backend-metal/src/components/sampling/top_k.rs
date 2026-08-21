@@ -1,3 +1,4 @@
+use super::MAP_NUM_ACTIVE_THREADS_KEY;
 use super::MAX_TOP_K;
 use super::SAMPLING_SOURCE;
 use super::checked_bytes;
@@ -13,8 +14,6 @@ use crate::metal::ReplayParameterKey;
 
 const TOP_K_REDUCTION_LIMIT: u32 = 32;
 const TOP_K_VOCAB_TILE_SIZE: u32 = 256;
-pub(super) const MAP_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
-    ReplayParameterKey::new("top_k_sampling.tile_num_active_threads");
 const REDUCE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("top_k_sampling.merge_num_active_threads");
 
