@@ -207,20 +207,12 @@ This contract aligns replay resource dependencies with the data flow.
 The routing kernel renormalizes selected probabilities only when `norm_topk_prob=true`.
 `expert_indices` and `expert_probs` are route-major with `num_tokens * num_experts_per_token` entries.
 
-`ReplayLayer::record(...)` keeps the exact `GatedMoE` replay shape contract for the current microbatch:
+`ReplayLayer::record(...)` uses one `GatedMoEInput` contract:
 
 ```text
-num_tokens              current microbatch token count
-num_routes              num_tokens * num_experts_per_token
-execution variant       selected from num_tokens
-```
-
-The backend also has an additive full-MoE bucketed replay API:
-
-```text
-GatedMoEBucketedInput
-  num_total_tokens       fixed recorded token capacity
-  num_active_tokens_key  caller-owned ReplayParameterKey
+GatedMoEInput
+  num_total_tokens       recorded token capacity
+  num_active_tokens      ReplayU32
   hidden_state           &Buffer
   next_hidden_state      &Buffer
   scratch                MoEScratchBindings
@@ -228,10 +220,10 @@ GatedMoEBucketedInput
   shared_experts         optional GatedMoESharedExpertsInput
 ```
 
-`GatedMoE::record_bucketed(...)` selects the token-major or expert-major path from `num_total_tokens`.
+`GatedMoE::record(...)` selects the token-major or expert-major path from `num_total_tokens`.
 It records all dispatch grids and validates all buffers at this total capacity.
-The caller supplies `num_active_tokens` at submission.
-The value must be in `[1, num_total_tokens]`.
+`ReplayU32::Fixed(value)` requires `value == num_total_tokens`. `ReplayU32::Parameter(key)` supplies active work at
+submission. The submitted value must be in `[1, num_total_tokens]`.
 
 The routing, sparse MLP, expert-major, combine, optional shared dense MLP, and optional shared-gate commands use
 one caller-owned replay parameter key.
@@ -257,11 +249,10 @@ The policy must not pad an active token count across a topology boundary.
 Sparse MLP, expert-major layout/pack/scatter, and combine keep one topology inside their selected path and add no
 token-count boundary.
 
-The exact `ReplayLayer::record(...)` path remains unchanged and declares zero replay parameters.
-The additive `record_bucketed(...)` path returns `next_hidden_state` and declares one replay parameter.
-Qwen3.5 Main calls this full bucketed API through `Qwen3xMoE` with the Main stage-owned token capacity and active-token
-key.
-Qwen3.5 MTP calls the same full bucketed API with its separate body stage-owned token capacity and active-token key
+One `ReplayLayer::record(...)` path returns `next_hidden_state`. A fixed active value declares no replay parameter. A
+parameter active value declares one replay parameter. Qwen3.5 Main calls this API through `Qwen3xMoE` with the Main
+stage-owned token capacity and active-token key. Qwen3.5 MTP calls the same API with its separate body stage-owned token
+capacity and active-token key
 when the physical MTP layer uses MoE.
 
 The backend retains a routing-only bucket-readiness API.
@@ -271,8 +262,7 @@ This API records this chain:
 router affine -> router softmax -> top-k routing
 ```
 
-`GatedMoE::record_routing_bucketed(...)` records a fixed `num_total_tokens` capacity.
-The caller supplies `num_active_tokens` at submission through one `ReplayParameterKey`.
+`GatedMoE::record_routing(...)` accepts the same total-token and `ReplayU32` active-token representation as full MoE.
 The router affine, softmax, and top-k routing commands use the same key and the same domain.
 The exact routing chain has zero replay parameters.
 The bucketed routing chain has one replay parameter.
@@ -374,7 +364,7 @@ The exact combine APIs remain unchanged and declare zero replay parameters.
 Each bucketed combine replay declares one replay parameter.
 The combine kernels do not change topology with token count, so they add no token-count boundary to a composite
 policy.
-The full bucketed `GatedMoE` replay composes these leaf APIs on the token-major path.
+The parameterized `GatedMoE` replay composes these leaf APIs on the token-major path.
 
 The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
 `moe::routing::Shape::validate()` treats other shapes as internal contract violations and panics.
@@ -382,7 +372,7 @@ The current routing kernel supports at most 256 experts and at most 16 selected 
 Production callers may allocate scratch with the executor's maximum token capacity.
 The private `Selector::select(&Registry, ...)` operation selects a registered execution variant from the current
 `num_tokens`.
-A bucketed replay selects it from `num_total_tokens`.
+Capacity-recorded replay selects it from `num_total_tokens`.
 Each path validates that buffers cover its recorded total route, input, scratch, and output shapes.
 The token-major path consumes `token_indices` and `route_indices` directly.
 

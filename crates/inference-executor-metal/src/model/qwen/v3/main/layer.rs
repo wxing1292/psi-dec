@@ -4,6 +4,7 @@ use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3::Qwen3ModelConfig;
@@ -174,6 +175,7 @@ impl ReplayLayer for Qwen3MainLayer {
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             input.num_tokens,
+            ReplayU32::Fixed(input.num_tokens),
         );
         match input.residual_capture_dest {
             Some(capture) => {

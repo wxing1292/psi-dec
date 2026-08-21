@@ -7,6 +7,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_backend_metal::operators::softmax;
 use inference_executor_core::backend::recorder::Recorder;
@@ -62,9 +63,9 @@ pub struct GatedMoERoutingWeights<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct GatedMoERoutingBucketedInput<'a> {
+pub struct GatedMoERoutingInput<'a> {
     pub num_total_tokens: u32,
-    pub num_active_tokens_key: ReplayParameterKey,
+    pub num_active_tokens: ReplayU32,
     pub hidden_state: &'a Buffer,
     pub scratch: MoERoutingScratchBindings<'a>,
     pub weights: GatedMoERoutingWeights<'a>,
@@ -109,18 +110,8 @@ pub struct GatedMoESharedExpertsInput<'a> {
 
 #[derive(Clone, Copy)]
 pub struct GatedMoEInput<'a> {
-    pub shape: GatedMoEReplayShape,
-    pub hidden_state: &'a Buffer,
-    pub next_hidden_state: &'a Buffer,
-    pub scratch: MoEScratchBindings<'a>,
-    pub weights: GatedMoEWeights<'a>,
-    pub shared_experts: Option<GatedMoESharedExpertsInput<'a>>,
-}
-
-#[derive(Clone, Copy)]
-pub struct GatedMoEBucketedInput<'a> {
     pub num_total_tokens: u32,
-    pub num_active_tokens_key: ReplayParameterKey,
+    pub num_active_tokens: ReplayU32,
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
     pub scratch: MoEScratchBindings<'a>,
@@ -248,18 +239,13 @@ impl Selector {
 
 impl GatedMoE {
     fn validate_input(&self, input: &GatedMoEInput<'_>) {
-        input.shape.validate();
-        assert!(
-            shared_experts_input_matches_core(&self.core, input.shared_experts.is_some()),
-            "gated MoE replay shared expert must match core configuration"
-        );
-    }
-
-    fn validate_bucketed_input(&self, input: &GatedMoEBucketedInput<'_>) {
         GatedMoEReplayShape {
             num_tokens: input.num_total_tokens,
         }
         .validate();
+        if let ReplayU32::Fixed(num_active_tokens) = input.num_active_tokens {
+            assert_eq!(num_active_tokens, input.num_total_tokens);
+        }
         assert!(
             shared_experts_input_matches_core(&self.core, input.shared_experts.is_some()),
             "gated MoE replay shared expert must match core configuration"
@@ -360,17 +346,30 @@ impl GatedMoE {
         boundaries.into_boxed_slice()
     }
 
-    /// Records only `router affine -> softmax -> top-k routing` at a fixed token capacity.
-    ///
-    /// The full bucketed composition uses this chain with its caller-owned active-token key.
-    pub fn record_routing_bucketed<'a, R>(&'a self, recorder: &mut R, input: GatedMoERoutingBucketedInput<'a>)
+    /// Records only `router affine -> softmax -> top-k routing`.
+    pub fn record_routing<'a, R>(&'a self, recorder: &mut R, input: GatedMoERoutingInput<'a>)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let num_total_tokens = input.num_total_tokens;
-        let num_active_tokens_key = input.num_active_tokens_key;
         let scratch = input.scratch;
         let weights = input.weights;
+        let ReplayU32::Parameter(num_active_tokens_key) = input.num_active_tokens else {
+            let ReplayU32::Fixed(num_active_tokens) = input.num_active_tokens else {
+                unreachable!()
+            };
+            assert_eq!(num_active_tokens, num_total_tokens);
+            self.record_router(
+                recorder,
+                GatedMoEReplayShape {
+                    num_tokens: num_total_tokens,
+                },
+                input.hidden_state,
+                scratch,
+                weights,
+            );
+            return;
+        };
         recorder.record_with_barrier_before(ReplayOp::opaque(self.router.invoke_bucketed(
             num_total_tokens,
             num_active_tokens_key,
@@ -404,37 +403,16 @@ impl GatedMoE {
         )));
     }
 
-    /// Records one full gated MoE replay at a fixed token capacity.
-    ///
-    /// Every command binds `num_active_tokens_key` over `[1, num_total_tokens]`.
-    /// The total token count selects the recorded compute path and affine topologies.
-    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: GatedMoEBucketedInput<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.validate_bucketed_input(&input);
-        let shape = GatedMoEReplayShape {
-            num_tokens: input.num_total_tokens,
-        };
-        let next_hidden_state = input.next_hidden_state;
-        let (_, variant) = Selector::select(&self.registry, shape);
-        match variant {
-            Variant::TokenMajor { combine } => self.record_token_major_bucketed(combine, recorder, input),
-            Variant::ExpertMajor { expert_major } => {
-                self.record_expert_major_bucketed(expert_major, recorder, input);
-            },
-        }
-        next_hidden_state
-    }
-
     fn record_token_major_bucketed<'a>(
         &'a self,
         combine: &'a combine::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        input: GatedMoEBucketedInput<'a>,
+        input: GatedMoEInput<'a>,
     ) {
         let num_total_tokens = input.num_total_tokens;
-        let num_active_tokens_key = input.num_active_tokens_key;
+        let ReplayU32::Parameter(num_active_tokens_key) = input.num_active_tokens else {
+            panic!("MoE capacity-recorded token-major execution requires an active-token parameter")
+        };
         let shape = GatedMoEReplayShape {
             num_tokens: num_total_tokens,
         };
@@ -443,11 +421,11 @@ impl GatedMoE {
         let scratch = input.scratch;
         let weights = input.weights;
         let shared_experts = input.shared_experts;
-        self.record_routing_bucketed(
+        self.record_routing(
             recorder,
-            GatedMoERoutingBucketedInput {
+            GatedMoERoutingInput {
                 num_total_tokens,
-                num_active_tokens_key,
+                num_active_tokens: input.num_active_tokens,
                 hidden_state,
                 scratch: scratch.routing,
                 weights: weights.routing(),
@@ -509,10 +487,12 @@ impl GatedMoE {
         &'a self,
         expert_major: &'a expert_major::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        input: GatedMoEBucketedInput<'a>,
+        input: GatedMoEInput<'a>,
     ) {
         let num_total_tokens = input.num_total_tokens;
-        let num_active_tokens_key = input.num_active_tokens_key;
+        let ReplayU32::Parameter(num_active_tokens_key) = input.num_active_tokens else {
+            panic!("MoE capacity-recorded expert-major execution requires an active-token parameter")
+        };
         let shape = GatedMoEReplayShape {
             num_tokens: num_total_tokens,
         };
@@ -522,11 +502,11 @@ impl GatedMoE {
         let weights = input.weights;
         let shared_experts = input.shared_experts;
         let expert_major_shape = self.expert_major_shape(shape);
-        self.record_routing_bucketed(
+        self.record_routing(
             recorder,
-            GatedMoERoutingBucketedInput {
+            GatedMoERoutingInput {
                 num_total_tokens,
-                num_active_tokens_key,
+                num_active_tokens: input.num_active_tokens,
                 hidden_state,
                 scratch: scratch.routing,
                 weights: weights.routing(),
@@ -623,7 +603,9 @@ impl GatedMoE {
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEInput<'a>,
     ) {
-        let shape = input.shape;
+        let shape = GatedMoEReplayShape {
+            num_tokens: input.num_total_tokens,
+        };
         let hidden_state = input.hidden_state;
         let next_hidden_state = input.next_hidden_state;
         let scratch = input.scratch;
@@ -683,7 +665,9 @@ impl GatedMoE {
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEInput<'a>,
     ) {
-        let shape = input.shape;
+        let shape = GatedMoEReplayShape {
+            num_tokens: input.num_total_tokens,
+        };
         let hidden_state = input.hidden_state;
         let next_hidden_state = input.next_hidden_state;
         let scratch = input.scratch;
@@ -957,15 +941,23 @@ impl ReplayLayer for GatedMoE {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.validate_input(&input);
-        let shape = input.shape;
+        let shape = GatedMoEReplayShape {
+            num_tokens: input.num_total_tokens,
+        };
         let next_hidden_state = input.next_hidden_state;
         let (_, variant) = Selector::select(&self.registry, shape);
-        match variant {
-            Variant::TokenMajor { combine } => {
-                self.record_token_major_replay(combine, recorder, input);
+        match (input.num_active_tokens, variant) {
+            (ReplayU32::Fixed(_), Variant::TokenMajor { combine }) => {
+                self.record_token_major_replay(combine, recorder, input)
             },
-            Variant::ExpertMajor { expert_major } => {
-                self.record_expert_major_replay(expert_major, recorder, input);
+            (ReplayU32::Fixed(_), Variant::ExpertMajor { expert_major }) => {
+                self.record_expert_major_replay(expert_major, recorder, input)
+            },
+            (ReplayU32::Parameter(_), Variant::TokenMajor { combine }) => {
+                self.record_token_major_bucketed(combine, recorder, input)
+            },
+            (ReplayU32::Parameter(_), Variant::ExpertMajor { expert_major }) => {
+                self.record_expert_major_bucketed(expert_major, recorder, input)
             },
         }
         next_hidden_state

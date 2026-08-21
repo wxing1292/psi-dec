@@ -2,10 +2,9 @@ use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::mlp::dense::DenseMLPCore;
-use inference_executor_core::mlp::dense::DenseMLPReplayShape;
 
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
@@ -36,17 +35,8 @@ pub struct DenseMLP {
 
 #[derive(Clone, Copy)]
 pub struct DenseMLPInput<'a> {
-    pub shape: DenseMLPReplayShape,
-    pub hidden_state: &'a Buffer,
-    pub next_hidden_state: &'a Buffer,
-    pub scratch: DenseMLPScratchBindings<'a>,
-    pub weights: dense_mlp::Weights<'a>,
-}
-
-#[derive(Clone, Copy)]
-pub struct DenseMLPBucketedInput<'a> {
     pub num_total_tokens: u32,
-    pub num_active_tokens_key: ReplayParameterKey,
+    pub num_active_tokens: ReplayU32,
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
     pub scratch: DenseMLPScratchBindings<'a>,
@@ -69,26 +59,6 @@ impl DenseMLP {
     pub fn replay_topology_boundaries(&self) -> Box<[u32]> {
         self.compute.topology_boundaries()
     }
-
-    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: DenseMLPBucketedInput<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_bucketed(
-            input.num_total_tokens,
-            input.num_active_tokens_key,
-            dense_mlp::Buffers {
-                hidden_state: input.hidden_state,
-                next_hidden_state: input.next_hidden_state,
-            },
-            dense_mlp::Scratch {
-                gate_up: input.scratch.gate_up,
-                swiglu: input.scratch.swiglu,
-            },
-            input.weights,
-        )));
-        input.next_hidden_state
-    }
 }
 
 impl ReplayLayer for DenseMLP {
@@ -99,26 +69,34 @@ impl ReplayLayer for DenseMLP {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        input.shape.validate();
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke(
-            backend_shape(input.shape),
-            dense_mlp::Buffers {
-                hidden_state: input.hidden_state,
-                next_hidden_state: input.next_hidden_state,
+        assert!(input.num_total_tokens > 0);
+        let buffers = dense_mlp::Buffers {
+            hidden_state: input.hidden_state,
+            next_hidden_state: input.next_hidden_state,
+        };
+        let scratch = dense_mlp::Scratch {
+            gate_up: input.scratch.gate_up,
+            swiglu: input.scratch.swiglu,
+        };
+        let invocation = match input.num_active_tokens {
+            ReplayU32::Fixed(num_active_tokens) => {
+                assert_eq!(num_active_tokens, input.num_total_tokens);
+                self.compute.invoke(
+                    dense_mlp::Shape {
+                        num_total_tokens: input.num_total_tokens,
+                    },
+                    buffers,
+                    scratch,
+                    input.weights,
+                )
             },
-            dense_mlp::Scratch {
-                gate_up: input.scratch.gate_up,
-                swiglu: input.scratch.swiglu,
+            ReplayU32::Parameter(key) => {
+                self.compute
+                    .invoke_bucketed(input.num_total_tokens, key, buffers, scratch, input.weights)
             },
-            input.weights,
-        )));
+        };
+        recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         input.next_hidden_state
-    }
-}
-
-fn backend_shape(shape: DenseMLPReplayShape) -> dense_mlp::Shape {
-    dense_mlp::Shape {
-        num_total_tokens: shape.num_tokens,
     }
 }
 

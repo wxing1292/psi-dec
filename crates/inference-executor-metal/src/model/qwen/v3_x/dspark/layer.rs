@@ -3,6 +3,7 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
@@ -208,6 +209,7 @@ impl Qwen3xDSparkLayer {
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             input.num_tokens,
+            ReplayU32::Fixed(input.num_tokens),
         );
         self.residual_add.record(
             recorder,

@@ -12,11 +12,11 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::mlp::dense::DenseMLPCore;
-use inference_executor_core::mlp::dense::DenseMLPReplayShape;
 use inference_executor_metal::def::layer::ReplayLayer;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
@@ -315,9 +315,8 @@ impl<'a> RealDenseMLPFixture<'a> {
             &self.backend,
             &mut recorder,
             DenseMLPInput {
-                shape: DenseMLPReplayShape {
-                    num_tokens: self.shape.num_total_tokens,
-                },
+                num_total_tokens: self.shape.num_total_tokens,
+                num_active_tokens: ReplayU32::Fixed(self.shape.num_total_tokens),
                 hidden_state: &self.hidden_state,
                 next_hidden_state: &self.output,
                 scratch: DenseMLPScratchBindings {

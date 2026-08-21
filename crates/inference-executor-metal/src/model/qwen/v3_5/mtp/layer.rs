@@ -221,12 +221,12 @@ impl Qwen35MTPLayer {
             &self.scratch.post_attention_hidden,
             &self.scratch.normalized_hidden,
         );
-        self.mlp.record_bucketed(
+        self.mlp.record(
             recorder,
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             num_total_tokens,
-            num_active_tokens_key,
+            ReplayU32::Parameter(num_active_tokens_key),
         );
         self.residual_add.record_bucketed(
             recorder,
@@ -282,6 +282,7 @@ impl ReplayLayer for Qwen35MTPLayer {
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             input.num_tokens,
+            ReplayU32::Fixed(input.num_tokens),
         );
         self.residual_add.record(
             recorder,
@@ -345,13 +346,19 @@ impl Qwen35MTPMLP {
         }
     }
 
-    fn record<'a, R>(&'a self, recorder: &mut R, input: &'a Buffer, output: &'a Buffer, num_tokens: u32)
-    where
+    fn record<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        input: &'a Buffer,
+        output: &'a Buffer,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
+    ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         match self {
-            Self::Dense(component) => component.record(recorder, input, output, num_tokens),
-            Self::MoE(component) => component.record(recorder, input, output, num_tokens),
+            Self::Dense(component) => component.record(recorder, input, output, num_total_tokens, num_active_tokens),
+            Self::MoE(component) => component.record(recorder, input, output, num_total_tokens, num_active_tokens),
         }
     }
 
@@ -366,26 +373,6 @@ impl Qwen35MTPMLP {
         match self {
             Self::Dense(component) => component.replay_topology_boundaries(),
             Self::MoE(component) => component.replay_topology_boundaries(),
-        }
-    }
-
-    fn record_bucketed<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        input: &'a Buffer,
-        output: &'a Buffer,
-        num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
-    ) where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        match self {
-            Self::Dense(component) => {
-                component.record_bucketed(recorder, input, output, num_total_tokens, num_active_tokens_key)
-            },
-            Self::MoE(component) => {
-                component.record_bucketed(recorder, input, output, num_total_tokens, num_active_tokens_key)
-            },
         }
     }
 }

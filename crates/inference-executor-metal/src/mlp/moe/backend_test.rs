@@ -33,7 +33,7 @@ fn test_selector_returns_registered_variant_at_crossover() {
 }
 
 #[test]
-fn test_routing_bucketed_chain_preserves_inactive_rows_across_reuse() {
+fn test_routing_active_total_chain_preserves_inactive_rows_across_reuse() {
     let device = Device::system_default();
     let stream = inference_backend_metal::metal::Stream::new(&device);
     let (core, metal) = routing_test_config(true);
@@ -108,14 +108,15 @@ fn test_routing_bucketed_chain_preserves_inactive_rows_across_reuse() {
 
     let runtime = MetalReplayRuntime::new(&stream);
     let mut exact_recorder = runtime.create_recorder();
-    moe.record_router(
+    moe.record_routing(
         &mut exact_recorder,
-        GatedMoEReplayShape {
-            num_tokens: num_active_tokens,
+        GatedMoERoutingInput {
+            num_total_tokens: num_active_tokens,
+            num_active_tokens: ReplayU32::Fixed(num_active_tokens),
+            hidden_state: &hidden_state,
+            scratch,
+            weights,
         },
-        &hidden_state,
-        scratch,
-        weights,
     );
     let exact_replay = exact_recorder.build();
     runtime.submit_replay(&exact_replay).wait();
@@ -160,11 +161,11 @@ fn test_routing_bucketed_chain_preserves_inactive_rows_across_reuse() {
         index_sentinel,
     );
     let mut bucketed_recorder = runtime.create_recorder();
-    moe.record_routing_bucketed(
+    moe.record_routing(
         &mut bucketed_recorder,
-        GatedMoERoutingBucketedInput {
+        GatedMoERoutingInput {
             num_total_tokens,
-            num_active_tokens_key: NUM_ACTIVE_TOKENS,
+            num_active_tokens: ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             hidden_state: &hidden_state,
             scratch,
             weights,
@@ -261,7 +262,7 @@ fn test_routing_bucketed_chain_preserves_inactive_rows_across_reuse() {
 }
 
 #[test]
-fn test_full_bucketed_replay_matches_exact_and_preserves_inactive_rows() {
+fn test_full_active_total_record_matches_fixed_and_preserves_inactive_rows() {
     let device = Device::system_default();
     let stream = inference_backend_metal::metal::Stream::new(&device);
     let runtime = MetalReplayRuntime::new(&stream);
@@ -294,7 +295,13 @@ fn test_full_bucketed_replay_matches_exact_and_preserves_inactive_rows() {
             let _ = <GatedMoE as ReplayLayer>::record(
                 &moe,
                 &mut exact_active_recorder,
-                weights.exact_input(&scratch, &hidden_state, &exact_output, num_active_tokens),
+                weights.input(
+                    &scratch,
+                    &hidden_state,
+                    &exact_output,
+                    num_active_tokens,
+                    ReplayU32::Fixed(num_active_tokens),
+                ),
             );
             let exact_active_replay = exact_active_recorder.build();
 
@@ -302,14 +309,27 @@ fn test_full_bucketed_replay_matches_exact_and_preserves_inactive_rows() {
             let _ = <GatedMoE as ReplayLayer>::record(
                 &moe,
                 &mut exact_total_recorder,
-                weights.exact_input(&scratch, &hidden_state, &exact_output, num_total_tokens),
+                weights.input(
+                    &scratch,
+                    &hidden_state,
+                    &exact_output,
+                    num_total_tokens,
+                    ReplayU32::Fixed(num_total_tokens),
+                ),
             );
             let exact_total_replay = exact_total_recorder.build();
 
             let mut bucketed_recorder = runtime.create_recorder();
-            let _ = moe.record_bucketed(
+            let _ = <GatedMoE as ReplayLayer>::record(
+                &moe,
                 &mut bucketed_recorder,
-                weights.bucketed_input(&scratch, &hidden_state, &bucketed_output, num_total_tokens),
+                weights.input(
+                    &scratch,
+                    &hidden_state,
+                    &bucketed_output,
+                    num_total_tokens,
+                    ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+                ),
             );
             let bucketed_replay = bucketed_recorder.build();
 
@@ -389,33 +409,17 @@ impl FullMoETestWeights {
         }
     }
 
-    fn exact_input<'a>(
-        &'a self,
-        scratch: &'a MoEScratch,
-        hidden_state: &'a Buffer,
-        next_hidden_state: &'a Buffer,
-        num_tokens: u32,
-    ) -> GatedMoEInput<'a> {
-        GatedMoEInput {
-            shape: GatedMoEReplayShape { num_tokens },
-            hidden_state,
-            next_hidden_state,
-            scratch: scratch.bindings(),
-            weights: self.as_borrowed(),
-            shared_experts: self.shared_experts_input(scratch),
-        }
-    }
-
-    fn bucketed_input<'a>(
+    fn input<'a>(
         &'a self,
         scratch: &'a MoEScratch,
         hidden_state: &'a Buffer,
         next_hidden_state: &'a Buffer,
         num_total_tokens: u32,
-    ) -> GatedMoEBucketedInput<'a> {
-        GatedMoEBucketedInput {
+        num_active_tokens: ReplayU32,
+    ) -> GatedMoEInput<'a> {
+        GatedMoEInput {
             num_total_tokens,
-            num_active_tokens_key: NUM_ACTIVE_TOKENS,
+            num_active_tokens,
             hidden_state,
             next_hidden_state,
             scratch: scratch.bindings(),
