@@ -56,9 +56,10 @@ pub struct Qwen35MainLayerScratch {
     post_attention_hidden: Buffer,
 }
 
+#[allow(clippy::upper_case_acronyms)]
 enum Qwen35MainAttention {
-    Gqa(Qwen3xGQA),
-    Gdn(Qwen3xGDN),
+    GQA(Qwen3xGQA),
+    GDN(Qwen3xGDN),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -84,12 +85,13 @@ pub struct Qwen35MainLayerInput<'a> {
     pub residual_capture_dest: Option<residual_add::CaptureTarget<'a>>,
 }
 
+#[allow(clippy::upper_case_acronyms)]
 enum Qwen35MainAttentionInput<'a> {
-    Gqa {
+    GQA {
         metadata: &'a GQAMetadataBuffers,
         pages: &'a Buffer,
     },
-    Gdn {
+    GDN {
         metadata: &'a GDNMetadataBuffers,
     },
 }
@@ -209,13 +211,13 @@ impl Qwen35MainLayer {
         );
         let hidden_dim = self.scratch.hidden_dim();
         let attention_input = match &self.attention {
-            Qwen35MainAttention::Gqa(_) => {
-                Qwen35MainAttentionInput::Gqa {
+            Qwen35MainAttention::GQA(_) => {
+                Qwen35MainAttentionInput::GQA {
                     metadata: input.gqa,
                     pages: input.pages,
                 }
             },
-            Qwen35MainAttention::Gdn(_) => Qwen35MainAttentionInput::Gdn { metadata: input.gdn },
+            Qwen35MainAttention::GDN(_) => Qwen35MainAttentionInput::GDN { metadata: input.gdn },
         };
         self.input_norm.record_bucketed_with_barrier(
             recorder,
@@ -293,13 +295,13 @@ impl ReplayLayer for Qwen35MainLayer {
     {
         let num_values = self.scratch.residual_values(input.num_tokens);
         let attention_input = match &self.attention {
-            Qwen35MainAttention::Gqa(_) => {
-                Qwen35MainAttentionInput::Gqa {
+            Qwen35MainAttention::GQA(_) => {
+                Qwen35MainAttentionInput::GQA {
                     metadata: input.gqa,
                     pages: input.pages,
                 }
             },
-            Qwen35MainAttention::Gdn(_) => Qwen35MainAttentionInput::Gdn { metadata: input.gdn },
+            Qwen35MainAttention::GDN(_) => Qwen35MainAttentionInput::GDN { metadata: input.gdn },
         };
         self.input_norm.record_with_barrier(
             recorder,
@@ -370,7 +372,7 @@ impl Qwen35MainAttention {
         match config.layer_type_at(model_layer_index)? {
             LayerType::FullAttention => {
                 let (core, metal) = derive_qwen35_gqa_configs(model_layer_index, &config.text_config, defaults)?;
-                Ok(Self::Gqa(Qwen3xGQA::new(
+                Ok(Self::GQA(Qwen3xGQA::new(
                     inference_backend_metal::metal::ReplayU32::Fixed(
                         attn_layer_index
                             .try_into()
@@ -385,7 +387,7 @@ impl Qwen35MainAttention {
             },
             LayerType::GDN => {
                 let (core, metal) = derive_qwen35_gdn_configs(model_layer_index, &config.text_config, defaults)?;
-                Ok(Self::Gdn(Qwen3xGDN::new(
+                Ok(Self::GDN(Qwen3xGDN::new(
                     attn_layer_index,
                     core,
                     metal,
@@ -404,10 +406,10 @@ impl Qwen35MainAttention {
         bindings: Qwen35AttentionWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         match (self, bindings) {
-            (Self::Gqa(component), Qwen35AttentionWeightBindings::GQA(bindings)) => {
+            (Self::GQA(component), Qwen35AttentionWeightBindings::GQA(bindings)) => {
                 component.load_weights(device, store, bindings)
             },
-            (Self::Gdn(component), Qwen35AttentionWeightBindings::GDN(bindings)) => {
+            (Self::GDN(component), Qwen35AttentionWeightBindings::GDN(bindings)) => {
                 component.load_weights(device, store, bindings)
             },
             _ => panic!("qwen3.5 Main layer attention config and checkpoint bindings must have the same kind"),
@@ -416,22 +418,22 @@ impl Qwen35MainAttention {
 
     fn unload_weights(&mut self) {
         match self {
-            Self::Gqa(component) => component.unload_weights(),
-            Self::Gdn(component) => component.unload_weights(),
+            Self::GQA(component) => component.unload_weights(),
+            Self::GDN(component) => component.unload_weights(),
         }
     }
 
     fn unload_state(&mut self) {
         match self {
-            Self::Gqa(component) => component.unload_state(),
-            Self::Gdn(component) => component.unload_state(),
+            Self::GQA(component) => component.unload_state(),
+            Self::GDN(component) => component.unload_state(),
         }
     }
 
     fn load_state(&mut self, gqa_state: &Qwen3xGQAState, gdn_state: &Qwen3xGDNState) {
         match self {
-            Self::Gqa(component) => component.load_state(gqa_state),
-            Self::Gdn(component) => component.load_state(gdn_state),
+            Self::GQA(component) => component.load_state(gqa_state),
+            Self::GDN(component) => component.load_state(gdn_state),
         }
     }
 
@@ -445,10 +447,10 @@ impl Qwen35MainAttention {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         match (self, metadata) {
-            (Self::Gqa(component), Qwen35MainAttentionInput::Gqa { metadata, pages }) => {
+            (Self::GQA(component), Qwen35MainAttentionInput::GQA { metadata, pages }) => {
                 component.record(recorder, input, output, pages, metadata)
             },
-            (Self::Gdn(component), Qwen35MainAttentionInput::Gdn { metadata }) => {
+            (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
                 component.record(recorder, input, output, metadata)
             },
             _ => panic!("qwen3.5 attention component and metadata must have the same kind"),
@@ -466,10 +468,10 @@ impl Qwen35MainAttention {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         match (self, metadata) {
-            (Self::Gqa(component), Qwen35MainAttentionInput::Gqa { metadata, pages }) => {
+            (Self::GQA(component), Qwen35MainAttentionInput::GQA { metadata, pages }) => {
                 component.record_bucketed(recorder, input, output, pages, metadata, num_active_tokens_key)
             },
-            (Self::Gdn(component), Qwen35MainAttentionInput::Gdn { metadata }) => {
+            (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
                 component.record_bucketed(recorder, input, output, metadata, num_active_tokens_key)
             },
             _ => panic!("qwen3.5 attention component and metadata must have the same kind"),

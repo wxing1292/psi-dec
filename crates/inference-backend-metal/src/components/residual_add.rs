@@ -16,7 +16,19 @@ use crate::metal::ReplayParameterKey;
 
 const RESIDUAL_ADD_SOURCE: &str = include_str!("metal/residual_add.metal");
 
-const REQUIRED_THREADS: usize = 256;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThreadBlockConstants {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelConstants {
+    thread_block: ThreadBlockConstants,
+}
+
+const KERNEL_CONSTANTS: KernelConstants = KernelConstants {
+    thread_block: ThreadBlockConstants { required_threads: 256 },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -316,7 +328,8 @@ impl Operator for CaptureReplayInvocation {
         recorder.set_u32(6, self.capture.num_destination_columns / 4);
         recorder.set_u32(7, self.capture.column_start / 4);
         let num_vectors = self.residual.shape.num_values as usize / 4;
-        recorder.dispatch_threadblocks((num_vectors.div_ceil(REQUIRED_THREADS), 1, 1), (REQUIRED_THREADS, 1, 1));
+        let required_threads = KERNEL_CONSTANTS.thread_block.required_threads as usize;
+        recorder.dispatch_threadblocks((num_vectors.div_ceil(required_threads), 1, 1), (required_threads, 1, 1));
     }
 }
 
@@ -518,9 +531,10 @@ fn record_shape(
 }
 
 fn dispatch_values(recorder: &CommandRecorder, num_values: u32) {
+    let required_threads = KERNEL_CONSTANTS.thread_block.required_threads as usize;
     recorder.dispatch_threadblocks(
-        ((num_values as usize).div_ceil(REQUIRED_THREADS), 1, 1),
-        (REQUIRED_THREADS, 1, 1),
+        ((num_values as usize).div_ceil(required_threads), 1, 1),
+        (required_threads, 1, 1),
     );
 }
 
@@ -535,5 +549,15 @@ fn residual_add_function_name(config: Config) -> &'static str {
                  output={output_dtype:?}"
             )
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KERNEL_CONSTANTS;
+
+    #[test]
+    fn test_constants_have_explicit_thread_block_scope() {
+        assert_eq!(KERNEL_CONSTANTS.thread_block.required_threads, 256);
     }
 }

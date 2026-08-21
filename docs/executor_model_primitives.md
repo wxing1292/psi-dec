@@ -117,6 +117,9 @@ The plain residual-add kernel processes a bounded flat range of output values. I
 complete row boundaries for active-count guards. The capture form also copies selected output columns to a separate
 buffer.
 
+The private compile-time constants use `KernelConstants.thread_block.required_threads = 256`. Exact, row-prefix, and
+capture recording use the same requirement.
+
 Dtypes select one static kernel at initialization. The runtime shape changes only the grid and active-prefix guard.
 Residual add does not use a registry or selector.
 
