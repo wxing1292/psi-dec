@@ -4,8 +4,8 @@ use crate::components::assert_u32_count_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
@@ -199,13 +199,13 @@ pub struct ScatterWithSharedExpertsBuffers<'a> {
 pub struct Compute {
     config: Config,
     constants: KernelConstants,
-    layout_clear: Kernel,
-    layout_count: Kernel,
-    layout_prefix: Kernel,
-    layout_scatter: Kernel,
-    pack_input: Kernel,
-    scatter_without_shared_experts: Kernel,
-    scatter_with_shared_experts: Kernel,
+    layout_clear: CompiledKernel,
+    layout_count: CompiledKernel,
+    layout_prefix: CompiledKernel,
+    layout_scatter: CompiledKernel,
+    pack_input: CompiledKernel,
+    scatter_without_shared_experts: CompiledKernel,
+    scatter_with_shared_experts: CompiledKernel,
 }
 
 impl Compute {
@@ -214,17 +214,17 @@ impl Compute {
         Self {
             config,
             constants: KernelConstants::current(),
-            layout_clear: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_clear"),
-            layout_count: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_count"),
-            layout_prefix: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_prefix"),
-            layout_scatter: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_scatter"),
-            pack_input: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_pack_input"),
-            scatter_without_shared_experts: Kernel::new(
+            layout_clear: CompiledKernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_clear"),
+            layout_count: CompiledKernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_count"),
+            layout_prefix: CompiledKernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_prefix"),
+            layout_scatter: CompiledKernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_scatter"),
+            pack_input: CompiledKernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_pack_input"),
+            scatter_without_shared_experts: CompiledKernel::new(
                 device,
                 MOE_EXPERT_MAJOR_SOURCE,
                 "moe_expert_major_scatter_without_shared_experts",
             ),
-            scatter_with_shared_experts: Kernel::new(
+            scatter_with_shared_experts: CompiledKernel::new(
                 device,
                 MOE_EXPERT_MAJOR_SOURCE,
                 "moe_expert_major_scatter_with_shared_experts",

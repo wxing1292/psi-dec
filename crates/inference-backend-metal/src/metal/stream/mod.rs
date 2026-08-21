@@ -163,8 +163,8 @@ impl Drop for TrackedGpuAllocation {
 mod tests {
     use crate::metal::Buffer;
     use crate::metal::CommandRecorder;
+    use crate::metal::CompiledKernel;
     use crate::metal::Device;
-    use crate::metal::Kernel;
     use crate::metal::Operator;
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayExecution;
@@ -209,13 +209,13 @@ mod tests {
     "#;
 
     struct AddOneInvocation<'a> {
-        kernel: &'a Kernel,
+        kernel: &'a CompiledKernel,
         values: &'a Buffer,
         len: u32,
     }
 
     struct AddOneReplayInvocation<'a> {
-        kernel: &'a Kernel,
+        kernel: &'a CompiledKernel,
         values: &'a Buffer,
         num_active_threads: ReplayU32,
         min_num_active_threads: u32,
@@ -224,7 +224,7 @@ mod tests {
     }
 
     struct ScalarReplayInvocation<'a> {
-        kernel: &'a Kernel,
+        kernel: &'a CompiledKernel,
         output_u64: &'a Buffer,
         output_i32: &'a Buffer,
         output_i64: &'a Buffer,
@@ -290,7 +290,7 @@ mod tests {
 
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[1.0_f32, 2.0, 3.0, 4.0]);
 
         let mut builder = stream.create_replay_program();
@@ -315,7 +315,7 @@ mod tests {
     fn test_consumer_barriers() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let replay_values = Buffer::from_slice(&device, &[1.0_f32, 2.0, 3.0]);
 
         let mut replay = stream.create_replay_program();
@@ -338,7 +338,7 @@ mod tests {
     fn test_submission_resources() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[1.0_f32, 2.0, 3.0]);
 
         let mut builder = stream.create_replay_program();
@@ -362,7 +362,7 @@ mod tests {
 
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[1.0_f32, 2.0, 3.0]);
 
         let mut first_builder = stream.create_replay_program();
@@ -401,7 +401,7 @@ mod tests {
     fn test_sequence_repeat() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[1.0_f32]);
         let mut builder = stream.create_replay_program();
         builder.record(AddOneInvocation {
@@ -426,7 +426,7 @@ mod tests {
     fn test_buffer_dependency() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[1.0_f32, 2.0, 3.0]);
 
         let mut builder = stream.create_replay_program();
@@ -454,7 +454,7 @@ mod tests {
 
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[0.0_f32; 4]);
 
         let mut builder = stream.create_replay_program();
@@ -485,7 +485,7 @@ mod tests {
 
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[0.0_f32; 4]);
 
         let mut builder = stream.create_replay_program();
@@ -510,7 +510,7 @@ mod tests {
     fn test_fixed_replay_u32() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[0.0_f32; 4]);
 
         let mut builder = stream.create_replay_program();
@@ -536,7 +536,7 @@ mod tests {
 
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, SCALAR_REPLAY_SOURCE, "write_scalars");
+        let kernel = CompiledKernel::new(&device, SCALAR_REPLAY_SOURCE, "write_scalars");
         let output_u64 = Buffer::from_slice(&device, &[0_u64]);
         let output_i32 = Buffer::from_slice(&device, &[0_i32]);
         let output_i64 = Buffer::from_slice(&device, &[0_i64]);
@@ -575,7 +575,7 @@ mod tests {
 
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
         let values = Buffer::from_slice(&device, &[0.0_f32]);
 
         let programs = (0..NUM_REPLAY_PROGRAMS)

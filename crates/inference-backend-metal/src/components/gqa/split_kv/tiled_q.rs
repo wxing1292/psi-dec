@@ -9,9 +9,9 @@ use crate::components::gqa::kv_page_write::PageTableLayout;
 use crate::components::gqa::sdpa;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
@@ -271,8 +271,8 @@ pub struct ReduceBuffers<'a> {
 pub struct Compute {
     constants: KernelConstants,
     shape: Shape,
-    map: Kernel,
-    reduce: Kernel,
+    map: CompiledKernel,
+    reduce: CompiledKernel,
 }
 
 impl Compute {
@@ -289,8 +289,8 @@ impl Compute {
         Self {
             constants,
             shape,
-            map: Kernel::new(device, &source, "gqa_split_kv_tiled_q_map"),
-            reduce: Kernel::new(device, &source, "gqa_split_kv_tiled_q_reduce"),
+            map: CompiledKernel::new(device, &source, "gqa_split_kv_tiled_q_map"),
+            reduce: CompiledKernel::new(device, &source, "gqa_split_kv_tiled_q_reduce"),
         }
     }
 

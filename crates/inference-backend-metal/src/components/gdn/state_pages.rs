@@ -2,8 +2,8 @@ use crate::components::assert_u32_count_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 
 const GDN_STATE_PAGE_WRITE_SOURCE: &str = include_str!("../metal/gdn_state_page_write.metal");
@@ -126,7 +126,7 @@ pub struct WriteBuffers<'a> {
 pub struct Write {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Write {
@@ -135,7 +135,7 @@ impl Write {
         Self {
             config,
             constants: KernelConstants::current(),
-            kernel: Kernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_batch_write_f32"),
+            kernel: CompiledKernel::new(device, GDN_STATE_PAGE_WRITE_SOURCE, "gdn_state_page_batch_write_f32"),
         }
     }
 
@@ -205,7 +205,7 @@ pub struct ReadBuffers<'a> {
 pub struct Read {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Read {
@@ -214,7 +214,7 @@ impl Read {
         Self {
             config,
             constants: KernelConstants::current(),
-            kernel: Kernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_batch_read_f32"),
+            kernel: CompiledKernel::new(device, GDN_STATE_PAGE_READ_SOURCE, "gdn_state_page_batch_read_f32"),
         }
     }
 

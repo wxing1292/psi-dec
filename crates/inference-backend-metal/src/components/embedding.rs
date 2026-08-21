@@ -2,9 +2,9 @@ use std::mem::size_of;
 
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
@@ -128,7 +128,7 @@ pub struct Buffers<'a> {
 pub struct Compute {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
@@ -143,7 +143,7 @@ impl Compute {
         Self {
             config,
             constants,
-            kernel: Kernel::new(device, QUANTIZED_EMBEDDING_SOURCE, function_name),
+            kernel: CompiledKernel::new(device, QUANTIZED_EMBEDDING_SOURCE, function_name),
         }
     }
 

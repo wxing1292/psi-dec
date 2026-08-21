@@ -24,6 +24,9 @@ CompiledKernel
     = compile(KernelSource, KernelConstants)
 ```
 
+The concrete Metal backend type is `metal::CompiledKernel`. It owns one compiled compute pipeline. Component-specific
+types such as `affine_quantized::Kernel` can wrap a `CompiledKernel` with operation constants and variant identity.
+
 `KernelExecutionConfiguration` contains `grid_dimensions` and `thread_block_dimensions`. It does not contain an
 executed Grid object. A launch creates this execution hierarchy:
 

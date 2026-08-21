@@ -17,7 +17,7 @@ use objc2_metal::MTLPipelineOption;
 use crate::metal::Device;
 
 #[derive(Debug)]
-pub struct Kernel {
+pub struct CompiledKernel {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
@@ -33,7 +33,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-impl Kernel {
+impl CompiledKernel {
     pub fn new(device: &Device, source: &str, function_name: &str) -> Self {
         let key = KernelCacheKey {
             device: device.as_raw() as *const _ as *const () as usize,

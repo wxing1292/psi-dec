@@ -4,8 +4,8 @@ use crate::components::assert_u32_count_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
@@ -128,7 +128,7 @@ pub struct Buffers<'a> {
 pub struct Compute {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
@@ -137,7 +137,7 @@ impl Compute {
         Self {
             config,
             constants: KernelConstants::current(),
-            kernel: Kernel::new(device, SOURCE, "gdn_qkvabz_split_f32"),
+            kernel: CompiledKernel::new(device, SOURCE, "gdn_qkvabz_split_f32"),
         }
     }
 
@@ -172,7 +172,7 @@ impl Compute {
 pub struct Invocation<'a> {
     config: Config,
     constants: KernelConstants,
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_tokens: ReplayU32,

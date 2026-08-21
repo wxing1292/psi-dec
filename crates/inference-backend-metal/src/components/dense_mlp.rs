@@ -1,8 +1,8 @@
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 use crate::operators::affine_quantized;
@@ -536,7 +536,7 @@ impl Operator for DownInvocation<'_> {
 
 struct SwiGLUKernel {
     constants: SwiGLUKernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl SwiGLUKernel {
@@ -549,7 +549,7 @@ impl SwiGLUKernel {
         };
         Self {
             constants,
-            kernel: Kernel::new(device, DENSE_MLP_SWIGLU_SOURCE, function_name),
+            kernel: CompiledKernel::new(device, DENSE_MLP_SWIGLU_SOURCE, function_name),
         }
     }
 

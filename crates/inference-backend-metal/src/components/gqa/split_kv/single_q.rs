@@ -9,9 +9,9 @@ use crate::components::gqa::kv_page_write::PageTableLayout;
 use crate::components::gqa::sdpa;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
@@ -302,8 +302,8 @@ impl Scratch {
 pub struct Compute {
     constants: KernelConstants,
     shape: Shape,
-    map: Kernel,
-    reduce: Kernel,
+    map: CompiledKernel,
+    reduce: CompiledKernel,
 }
 
 impl Compute {
@@ -325,12 +325,12 @@ impl Compute {
         Self {
             constants,
             shape,
-            map: Kernel::new(
+            map: CompiledKernel::new(
                 device,
                 &gqa_split_kv_single_q_map_source(constants, shape),
                 "gqa_split_kv_single_q_map",
             ),
-            reduce: Kernel::new(
+            reduce: CompiledKernel::new(
                 device,
                 &gqa_split_kv_single_q_reduce_source(constants),
                 reduce_function_name,

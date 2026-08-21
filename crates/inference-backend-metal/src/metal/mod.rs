@@ -22,7 +22,7 @@ pub use buffer_io::BufferIOFileCacheMode;
 pub use device::Device;
 pub use dtype::Dtype;
 pub use dtype::MetalBufferElement;
-pub use kernel::Kernel;
+pub use kernel::CompiledKernel;
 pub use stream::CommandRecorder;
 pub use stream::Operator;
 pub use stream::ReplayArguments;

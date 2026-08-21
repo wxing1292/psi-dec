@@ -4,7 +4,7 @@ use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
-use crate::metal::Kernel;
+use crate::metal::CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
@@ -119,7 +119,7 @@ pub struct Buffers<'a> {
 pub struct Compute {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
@@ -128,7 +128,7 @@ impl Compute {
         Self {
             config,
             constants: KernelConstants::current(),
-            kernel: Kernel::new(device, MOE_ROUTING_SOURCE, "moe_route_topk"),
+            kernel: CompiledKernel::new(device, MOE_ROUTING_SOURCE, "moe_route_topk"),
         }
     }
 

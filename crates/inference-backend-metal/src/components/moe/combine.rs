@@ -5,8 +5,8 @@ use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
@@ -137,8 +137,8 @@ pub struct WithSharedExpertsBuffers<'a> {
 pub struct Compute {
     config: Config,
     constants: KernelConstants,
-    without_shared_experts: Kernel,
-    with_shared_experts: Kernel,
+    without_shared_experts: CompiledKernel,
+    with_shared_experts: CompiledKernel,
 }
 
 impl Compute {
@@ -147,8 +147,12 @@ impl Compute {
         Self {
             config,
             constants: KernelConstants::current(),
-            without_shared_experts: Kernel::new(device, MOE_COMBINE_SOURCE, "moe_combine_without_shared_experts"),
-            with_shared_experts: Kernel::new(device, MOE_COMBINE_SOURCE, "moe_combine_with_shared_experts"),
+            without_shared_experts: CompiledKernel::new(
+                device,
+                MOE_COMBINE_SOURCE,
+                "moe_combine_without_shared_experts",
+            ),
+            with_shared_experts: CompiledKernel::new(device, MOE_COMBINE_SOURCE, "moe_combine_with_shared_experts"),
         }
     }
 
@@ -220,7 +224,7 @@ impl Compute {
 pub struct WithoutSharedExpertsInvocation<'a> {
     config: Config,
     constants: KernelConstants,
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: WithoutSharedExpertsBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
@@ -248,7 +252,7 @@ impl Operator for WithoutSharedExpertsInvocation<'_> {
 pub struct WithSharedExpertsInvocation<'a> {
     config: Config,
     constants: KernelConstants,
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: WithSharedExpertsBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,

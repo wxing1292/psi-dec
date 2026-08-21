@@ -3,9 +3,9 @@ use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 
 const SOURCE: &str = include_str!("../metal/gqa_block_sdpa.metal");
@@ -170,7 +170,7 @@ pub struct Buffers<'a> {
 
 pub struct Compute {
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
@@ -182,7 +182,7 @@ impl Compute {
             Dtype::Bfloat16 => "gqa_block_sdpa_bf16",
             dtype => panic!("unsupported GQA block SDPA dtype {dtype:?}"),
         };
-        let kernel = Kernel::new(device, &block_sdpa_source(constants), function_name);
+        let kernel = CompiledKernel::new(device, &block_sdpa_source(constants), function_name);
         assert_eq!(
             kernel.thread_execution_width(),
             constants.thread_block.simdgroup_width as usize,
@@ -238,7 +238,7 @@ fn block_sdpa_source(kernel_constants: KernelConstants) -> String {
 
 pub struct Invocation<'a> {
     constants: KernelConstants,
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: Buffers<'a>,
 }

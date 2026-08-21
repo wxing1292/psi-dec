@@ -2,9 +2,9 @@
 
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel as CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 

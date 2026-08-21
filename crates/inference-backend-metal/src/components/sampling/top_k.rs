@@ -5,8 +5,8 @@ use super::checked_num_threads;
 use super::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
@@ -274,7 +274,7 @@ enum VariantKey {
 struct Variant {
     constants: MapKernelConstants,
     logits_item_size: usize,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 struct Registry {
@@ -292,7 +292,7 @@ impl Registry {
                     Variant {
                         constants: MapKernelConstants::new(Dtype::Float32, MapAlgorithm::Reduction),
                         logits_item_size: size_of::<f32>(),
-                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles"),
+                        kernel: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles"),
                     },
                 ),
                 (
@@ -300,7 +300,7 @@ impl Registry {
                     Variant {
                         constants: MapKernelConstants::new(Dtype::Float32, MapAlgorithm::Bitonic),
                         logits_item_size: size_of::<f32>(),
-                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bitonic"),
+                        kernel: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bitonic"),
                     },
                 ),
                 (
@@ -308,7 +308,7 @@ impl Registry {
                     Variant {
                         constants: MapKernelConstants::new(Dtype::Bfloat16, MapAlgorithm::Reduction),
                         logits_item_size: size_of::<u16>(),
-                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16"),
+                        kernel: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16"),
                     },
                 ),
                 (
@@ -316,7 +316,7 @@ impl Registry {
                     Variant {
                         constants: MapKernelConstants::new(Dtype::Bfloat16, MapAlgorithm::Bitonic),
                         logits_item_size: size_of::<u16>(),
-                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16_bitonic"),
+                        kernel: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16_bitonic"),
                     },
                 ),
             ],
@@ -443,18 +443,18 @@ impl Operator for MapInvocation<'_> {
 
 pub struct ReduceCompute {
     constants: ReduceKernelConstants,
-    sample: Kernel,
-    write_distribution: Kernel,
-    sample_and_write_distribution: Kernel,
+    sample: CompiledKernel,
+    write_distribution: CompiledKernel,
+    sample_and_write_distribution: CompiledKernel,
 }
 
 impl ReduceCompute {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
             constants: ReduceKernelConstants::current(),
-            sample: Kernel::new(device, SAMPLING_SOURCE, "top_k_sample_tiles"),
-            write_distribution: Kernel::new(device, SAMPLING_SOURCE, "top_k_write_distribution_tiles"),
-            sample_and_write_distribution: Kernel::new(
+            sample: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_sample_tiles"),
+            write_distribution: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_write_distribution_tiles"),
+            sample_and_write_distribution: CompiledKernel::new(
                 device,
                 SAMPLING_SOURCE,
                 "top_k_sample_and_write_distribution_tiles",
@@ -538,7 +538,7 @@ impl ReduceCompute {
 }
 
 pub struct SampleInvocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     constants: ReduceKernelConstants,
     partial_candidate_layout: PartialCandidateLayout,
     shape: Shape,
@@ -597,7 +597,7 @@ impl Operator for SampleInvocation<'_> {
 }
 
 pub struct WriteDistributionInvocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     constants: ReduceKernelConstants,
     partial_candidate_layout: PartialCandidateLayout,
     shape: Shape,
@@ -679,7 +679,7 @@ impl Operator for WriteDistributionInvocation<'_> {
 }
 
 pub struct SampleAndWriteDistributionInvocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     constants: ReduceKernelConstants,
     partial_candidate_layout: PartialCandidateLayout,
     shape: Shape,

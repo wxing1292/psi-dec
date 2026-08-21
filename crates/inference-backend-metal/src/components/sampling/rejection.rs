@@ -7,7 +7,7 @@ use super::checked_num_threads;
 use super::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
-use crate::metal::Kernel;
+use crate::metal::CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
@@ -81,14 +81,14 @@ pub struct Buffers<'a> {
 
 pub struct Compute {
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
             constants: KernelConstants::current(),
-            kernel: Kernel::new(device, SAMPLING_SOURCE, "rejection_sparse_sample"),
+            kernel: CompiledKernel::new(device, SAMPLING_SOURCE, "rejection_sparse_sample"),
         }
     }
 

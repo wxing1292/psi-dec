@@ -8,9 +8,9 @@ use objc2_metal::MTLResource;
 
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
@@ -153,7 +153,7 @@ pub struct Buffers<'a> {
 /// ```
 pub struct Compute {
     config: Config,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
@@ -161,7 +161,7 @@ impl Compute {
         config.validate();
         Self {
             config,
-            kernel: Kernel::new(device, RESIDUAL_ADD_SOURCE, residual_add_function_name(config)),
+            kernel: CompiledKernel::new(device, RESIDUAL_ADD_SOURCE, residual_add_function_name(config)),
         }
     }
 
@@ -211,7 +211,7 @@ impl Compute {
 }
 
 pub struct Invocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     config: Config,
     shape: Shape,
     buffers: Buffers<'a>,
@@ -441,7 +441,8 @@ impl CaptureReplayOp {
     pub fn into_replay(self) -> CaptureReplayInvocation {
         let device = Device::from_raw_retained(self.residual.buffers.lhs.device());
         CaptureReplayInvocation {
-            pipeline: Kernel::new(&device, RESIDUAL_ADD_SOURCE, "residual_add_capture_bf16_vec4").as_raw_retained(),
+            pipeline: CompiledKernel::new(&device, RESIDUAL_ADD_SOURCE, "residual_add_capture_bf16_vec4")
+                .as_raw_retained(),
             residual: self.residual,
             capture: self.capture,
         }

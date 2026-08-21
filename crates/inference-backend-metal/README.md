@@ -148,7 +148,7 @@ times. Each submission uses a different active workload. The example then reads 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::CommandRecorder;
 use inference_backend_metal::metal::Device;
-use inference_backend_metal::metal::Kernel;
+use inference_backend_metal::metal::CompiledKernel;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
@@ -175,7 +175,7 @@ const NUM_ACTIVE_THREADS: ReplayParameterKey =
     ReplayParameterKey::new("add_one.num_active_threads");
 
 struct AddOne<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     values: &'a Buffer,
     num_total_threads: u32,
     num_threads_per_threadblock: u32,
@@ -200,7 +200,7 @@ impl Operator for AddOne<'_> {
 fn main() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let kernel = Kernel::new(&device, ADD_ONE_SOURCE, "add_one");
+    let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
     let values = Buffer::from_slice(&device, &vec![1.0_f32; 128]);
 
     let mut builder = stream.create_replay_program();
@@ -507,7 +507,7 @@ Persistent objects are created first:
 ```text
 Device::system_default()                    // MTLDevice
   |
-  |-- Kernel::new(add_one)
+  |-- CompiledKernel::new(add_one)
   |     `-- compile -> MTLComputePipelineState
   |
   |-- Buffer::from_slice(values)

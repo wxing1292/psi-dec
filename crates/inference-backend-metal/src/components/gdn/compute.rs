@@ -2,8 +2,8 @@ use crate::components::assert_u32_count_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
@@ -445,11 +445,11 @@ struct Variant {
     constants: VariantConstants,
     q_scale: f32,
     norm_eps: f32,
-    short_conv: Kernel,
-    candidate_conv_state: Kernel,
-    final_recurrent_state: Kernel,
-    candidate_recurrent_state: Kernel,
-    output_norm_gate: Kernel,
+    short_conv: CompiledKernel,
+    candidate_conv_state: CompiledKernel,
+    final_recurrent_state: CompiledKernel,
+    candidate_recurrent_state: CompiledKernel,
+    output_norm_gate: CompiledKernel,
 }
 
 struct Registry {
@@ -464,11 +464,15 @@ impl Registry {
             constants,
             q_scale: config.q_scale,
             norm_eps: config.norm_eps,
-            short_conv: Kernel::new(device, &source, "gdn_compute_short_conv_f32"),
-            candidate_conv_state: Kernel::new(device, &source, "gdn_compute_candidate_conv_state_f32"),
-            final_recurrent_state: Kernel::new(device, &source, "gdn_compute_final_recurrent_state_f32"),
-            candidate_recurrent_state: Kernel::new(device, &source, "gdn_compute_candidate_recurrent_state_f32"),
-            output_norm_gate: Kernel::new(device, &source, "gdn_compute_output_norm_gate_f32"),
+            short_conv: CompiledKernel::new(device, &source, "gdn_compute_short_conv_f32"),
+            candidate_conv_state: CompiledKernel::new(device, &source, "gdn_compute_candidate_conv_state_f32"),
+            final_recurrent_state: CompiledKernel::new(device, &source, "gdn_compute_final_recurrent_state_f32"),
+            candidate_recurrent_state: CompiledKernel::new(
+                device,
+                &source,
+                "gdn_compute_candidate_recurrent_state_f32",
+            ),
+            output_norm_gate: CompiledKernel::new(device, &source, "gdn_compute_output_norm_gate_f32"),
         };
         Self {
             entries: vec![(VariantKey::Recurrent, recurrent)],

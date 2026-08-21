@@ -8,7 +8,7 @@ use objc2_metal::MTLComputePipelineState;
 use objc2_metal::MTLResourceUsage;
 
 use crate::metal::Buffer;
-use crate::metal::Kernel;
+use crate::metal::CompiledKernel;
 use crate::metal::stream::MAX_BUFFER_BINDINGS;
 use crate::metal::stream::parameter::CommandParameterLayoutBuilder;
 use crate::metal::stream::parameter::ReplayParameterKey;
@@ -40,7 +40,7 @@ impl<'a> CommandRecorder<'a> {
         }
     }
 
-    pub fn set_kernel(&self, kernel: &Kernel) {
+    pub fn set_kernel(&self, kernel: &CompiledKernel) {
         assert!(
             self.active.borrow().is_none(),
             "previous Metal command must dispatch before setting another kernel"
@@ -420,8 +420,8 @@ mod tests {
     use super::Operator;
     use super::assert_icb_buffer_binding;
     use crate::metal::Buffer;
+    use crate::metal::CompiledKernel;
     use crate::metal::Device;
-    use crate::metal::Kernel;
 
     const NOOP_SOURCE: &str = r#"
         #include <metal_stdlib>
@@ -433,7 +433,7 @@ mod tests {
     "#;
 
     struct NoopInvocation<'a> {
-        kernel: &'a Kernel,
+        kernel: &'a CompiledKernel,
         values: &'a Buffer,
     }
 
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn test_consumer_barrier() {
         let device = Device::system_default();
-        let kernel = Kernel::new(&device, NOOP_SOURCE, "noop");
+        let kernel = CompiledKernel::new(&device, NOOP_SOURCE, "noop");
         let values = Buffer::new_zeroed(&device, size_of::<u32>());
 
         let sequence_layout = CommandParameterLayoutBuilder::default();

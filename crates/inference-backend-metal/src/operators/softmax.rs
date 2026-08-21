@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel as CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 use crate::operators::mlx_headers::find_mlx_metal_header_root;

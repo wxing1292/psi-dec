@@ -3,9 +3,9 @@ use std::mem::size_of;
 use super::top_k;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayArguments;
 
@@ -182,7 +182,7 @@ pub struct ConfidenceBuffers<'a> {
 pub struct MapCompute {
     config: MapConfig,
     constants: MapKernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl MapCompute {
@@ -197,7 +197,7 @@ impl MapCompute {
             "DSpark Markov requires {required_thread_block_memory_bytes} bytes of thread-block memory, but the device \
              supports {max_thread_block_memory_bytes}"
         );
-        let kernel = Kernel::new(device, &source(config, constants), "dspark_markov_top_k_map");
+        let kernel = CompiledKernel::new(device, &source(config, constants), "dspark_markov_top_k_map");
         let max_total_threads = kernel.max_total_threads_per_threadblock();
         let required_threads = constants.thread_block.required_threads;
         assert!(

@@ -5,9 +5,9 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
@@ -131,7 +131,7 @@ pub struct Buffers<'a> {
 pub struct Compute {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
@@ -141,7 +141,7 @@ impl Compute {
         Self {
             config,
             constants,
-            kernel: Kernel::new(device, RMS_NORM_SOURCE, rms_norm_function_name(constants)),
+            kernel: CompiledKernel::new(device, RMS_NORM_SOURCE, rms_norm_function_name(constants)),
         }
     }
 
@@ -175,7 +175,7 @@ impl Compute {
 }
 
 pub struct Invocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     config: Config,
     constants: KernelConstants,
     shape: Shape,

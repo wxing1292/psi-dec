@@ -3,9 +3,9 @@ use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
@@ -274,7 +274,7 @@ pub struct Buffers<'a> {
 
 pub struct Compute {
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 impl Compute {
@@ -288,7 +288,7 @@ impl Compute {
         };
         Self {
             constants,
-            kernel: Kernel::new(device, &source, function_name),
+            kernel: CompiledKernel::new(device, &source, function_name),
         }
     }
 
@@ -346,7 +346,7 @@ fn rms_norm_rope_source(constants: KernelConstants) -> String {
 
 pub struct Invocation<'a> {
     constants: KernelConstants,
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_tokens: ReplayU32,

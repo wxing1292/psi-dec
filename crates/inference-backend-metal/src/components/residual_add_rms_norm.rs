@@ -8,9 +8,9 @@ use crate::components::residual_add;
 use crate::components::rms_norm;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
+use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
@@ -107,7 +107,7 @@ pub struct Buffers<'a> {
 pub struct Compute {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,7 +151,7 @@ impl Compute {
         Self {
             config,
             constants,
-            kernel: Kernel::new(
+            kernel: CompiledKernel::new(
                 device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
                 residual_add_rms_norm_function_name(config, constants.kind),
@@ -189,7 +189,7 @@ impl Compute {
 }
 
 pub struct Invocation<'a> {
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     config: Config,
     constants: KernelConstants,
     shape: Shape,
@@ -442,7 +442,7 @@ impl ReplayInvocation {
         let device = Device::from_raw_retained(buffers.lhs.device());
         let constants = KernelConstants::new(config, selected_kernel_kind(config));
         Self {
-            pipeline: Kernel::new(
+            pipeline: CompiledKernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
                 residual_add_rms_norm_function_name(config, constants.kind),
@@ -465,7 +465,7 @@ impl ReplayInvocation {
         let device = Device::from_raw_retained(buffers.lhs.device());
         let constants = KernelConstants::new(config, selected_kernel_kind(config));
         Self {
-            pipeline: Kernel::new(
+            pipeline: CompiledKernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
                 residual_add_rms_norm_function_name(config, constants.kind),
@@ -551,7 +551,7 @@ impl CaptureReplayInvocation {
         let device = Device::from_raw_retained(buffers.lhs.device());
         let constants = KernelConstants::new(config, KernelKind::Bf16Vectorized);
         Self {
-            pipeline: Kernel::new(
+            pipeline: CompiledKernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
                 residual_add_capture_rms_norm_function_name(config),
@@ -578,7 +578,7 @@ impl CaptureReplayInvocation {
         let device = Device::from_raw_retained(buffers.lhs.device());
         let constants = KernelConstants::new(config, KernelKind::Bf16Vectorized);
         Self {
-            pipeline: Kernel::new(
+            pipeline: CompiledKernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
                 residual_add_capture_rms_norm_function_name(config),
