@@ -509,8 +509,9 @@ impl Compute {
             shape.num_total_tokens >= shape.num_total_reqs,
             "GDN ragged recurrent requires at least one token per request"
         );
+        let (_, variant) = self.select(shape);
         Invocation {
-            compute: self,
+            variant,
             shape,
             buffers,
             num_active_reqs: ReplayU32::Fixed(shape.num_total_reqs),
@@ -525,8 +526,9 @@ impl Compute {
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) -> Invocation<'a> {
+        let (_, variant) = self.select(shape);
         Invocation {
-            compute: self,
+            variant,
             shape,
             buffers,
             num_active_reqs,
@@ -543,8 +545,9 @@ impl Compute {
             shape.num_total_tokens >= shape.num_total_reqs,
             "GDN ragged recurrent requires at least one token per request"
         );
+        let (_, variant) = self.select(shape);
         CandidateStateUpdateInvocation {
-            compute: self,
+            variant,
             shape,
             buffers,
             num_active_reqs: ReplayU32::Fixed(shape.num_total_reqs),
@@ -559,8 +562,9 @@ impl Compute {
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) -> CandidateStateUpdateInvocation<'a> {
+        let (_, variant) = self.select(shape);
         CandidateStateUpdateInvocation {
-            compute: self,
+            variant,
             shape,
             buffers,
             num_active_reqs,
@@ -798,7 +802,7 @@ impl Variant {
 }
 
 pub struct Invocation<'a> {
-    compute: &'a Compute,
+    variant: &'a Variant,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_reqs: ReplayU32,
@@ -807,7 +811,7 @@ pub struct Invocation<'a> {
 
 impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let (_, variant) = self.compute.select(self.shape);
+        let variant = self.variant;
         variant.constants.validate_shape(self.shape);
         validate_buffers(variant.constants, self.shape, &self.buffers);
         variant.record_short_conv(
@@ -824,7 +828,7 @@ impl Operator for Invocation<'_> {
 }
 
 pub struct CandidateStateUpdateInvocation<'a> {
-    compute: &'a Compute,
+    variant: &'a Variant,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_reqs: ReplayU32,
@@ -833,7 +837,7 @@ pub struct CandidateStateUpdateInvocation<'a> {
 
 impl Operator for CandidateStateUpdateInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let (_, variant) = self.compute.select(self.shape);
+        let variant = self.variant;
         variant.constants.validate_shape(self.shape);
         assert_u32_count_domain(
             variant.constants.model.num_candidate_conv_state_values(self.shape),

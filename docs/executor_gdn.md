@@ -145,6 +145,9 @@ The private `Selector::select(...)` returns `(VariantKey, &Variant)` for one `ba
 registry has one entry. The selector therefore returns `Recurrent` for all legal shapes. GDN does not have a `Planner`,
 `Plan`, or rich selection object.
 
+Each `backend_compute::Compute::invoke*` method runs the selector and stores the selected `&Variant` in the returned
+invocation. `Operator::record(...)` consumes this frozen variant. It does not select an execution variant.
+
 This structure keeps one selection level. A future chunkwise implementation must be another complete registry entry.
 It must not add an outer algorithm selector and an inner kernel selector.
 
@@ -374,6 +377,12 @@ Registry
 Selector::select(Shape)
   -> (VariantKey, &Variant)
 
+Compute::invoke*(Shape, ...)
+  -> Invocation { selected &Variant, Shape, buffers, active counts }
+
+Operator::record(Invocation)
+  -> records only the selected variant
+
 GDNCore
   model_layer_index, hidden_dim,
   num_qk_heads, qk_head_dim,
@@ -394,7 +403,8 @@ them as kernel arguments.
 
 For a bucketed invocation, `backend_compute::Shape` contains recorded capacities. Submission arguments contain active
 counts. For an exact invocation, the shape counts are both active counts and dispatch extents. The selector reads the
-shape. The current one-entry registry always returns `VariantKey::Recurrent`.
+shape when `Compute::invoke*` constructs an invocation. The current one-entry registry always returns
+`VariantKey::Recurrent`. Recording uses the variant stored in the invocation.
 
 The Qwen adapter supplies dimensions and weights. Generic Rust and Metal contain no Qwen name or config type.
 
