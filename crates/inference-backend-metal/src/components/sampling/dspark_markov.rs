@@ -285,7 +285,7 @@ impl MapCompute {
             .checked_mul(num_threads_per_row)
             .expect("DSpark Markov total thread count must fit u32");
         assert!(num_active_threads <= num_total_threads);
-        arguments.set_u32(super::MAP_NUM_ACTIVE_THREADS_KEY, num_active_threads);
+        arguments.set_u32(top_k::MAP_NUM_ACTIVE_THREADS_KEY, num_active_threads);
     }
 }
 
@@ -326,7 +326,7 @@ impl Operator for MapInvocation<'_> {
         } else {
             recorder.bind_u32(
                 10,
-                super::MAP_NUM_ACTIVE_THREADS_KEY,
+                top_k::MAP_NUM_ACTIVE_THREADS_KEY,
                 num_threads_per_row,
                 num_total_threads,
             );
