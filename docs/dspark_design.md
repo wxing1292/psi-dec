@@ -144,7 +144,7 @@ Qwen3xDSparkConfig + exact Qwen3x checkpoint bindings
             |
             | record(DSparkMarkovInput + borrowed weights)
             v
-       DSparkMarkovTopKMapKernel -> TopKMergeKernels
+       sampling::dspark_markov::MapCompute -> sampling::top_k::ReduceCompute
 ```
 
 This owner pattern matches Qwen3x GQA, GDN, and MLP.
@@ -201,7 +201,7 @@ spec_confidence[i] = sigmoid(confidence_raw[i])
 ```
 
 The current executor uses the official default sigmoid temperature of `1.0`.
-`DSparkMarkovTopKMapConfig` states the BF16 I/O and scale/bias workload facts.
+`sampling::dspark_markov::MapConfig` states the BF16 I/O and scale/bias workload facts.
 The confidence weight, bias, hidden state, and Markov latent use BF16 storage.
 The dot product and sigmoid use F32.
 `DSparkMarkovTopKMap` computes the confidence branch from the existing W1 latent.

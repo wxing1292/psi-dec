@@ -1,8 +1,8 @@
 use inference_executor_core::sampling::reference::rejection_sample_reference;
 
-use super::SparseRejectionSampleBuffers;
-use super::SparseRejectionSampleKernel;
-use super::SparseRejectionSampleShape;
+use super::Buffers;
+use super::Compute;
+use super::Shape;
 use crate::metal::Buffer;
 use crate::metal::Device;
 use crate::metal::ReplayArguments;
@@ -14,16 +14,16 @@ const OUTPUT_TOKEN_CANARY: i32 = -77;
 const OUTPUT_PROB_CANARY: f32 = -77.0;
 
 #[test]
-fn test_specialization_has_explicit_thread_block_scope() {
-    let specialization = super::SparseRejectionSampleKernelSpecialization::current();
-    assert_eq!(specialization.thread_block.required_threads, 256);
+fn test_constants_have_explicit_thread_block_scope() {
+    let constants = super::KernelConstants::current();
+    assert_eq!(constants.thread_block.required_threads, 256);
 }
 
 #[test]
 fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = SparseRejectionSampleShape {
+    let shape = Shape {
         num_total_reqs: 4,
         num_total_target_distributions: 8,
         num_total_draft_distributions: 5,
@@ -84,11 +84,11 @@ fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
         17, 31, 1, 0, // padded request
     ];
     let runtime_params = Buffer::from_slice(&device, &runtime_params_values);
-    let kernel = SparseRejectionSampleKernel::new(&device);
+    let kernel = Compute::new(&device);
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke_replay(
         shape,
-        SparseRejectionSampleBuffers {
+        Buffers {
             target_distribution_token_ids: &target_distribution_token_ids,
             target_distribution_probs: &target_distribution_probs,
             draft_distribution_token_ids: &draft_distribution_token_ids,

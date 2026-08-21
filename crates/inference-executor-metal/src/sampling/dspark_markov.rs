@@ -27,18 +27,11 @@
 //!          +--> sparse draft distribution
 //! ```
 //!
-//! `DSparkMarkovTopKMapKernel` computes both branches. The confidence branch
+//! `sampling::dspark_markov::MapCompute` computes both branches. The confidence branch
 //! reuses the current step's W1 embedding. It does not add a replay command.
 
-use inference_backend_metal::components::DSparkConfidenceBuffers;
-use inference_backend_metal::components::DSparkConfidenceConfig as DSparkBackendConfidenceConfig;
-use inference_backend_metal::components::DSparkMarkovTopKMapBuffers;
-use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
-use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
-use inference_backend_metal::components::DSparkMarkovTopKMapShape;
-use inference_backend_metal::components::TopKReduceKernels;
-use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
-use inference_backend_metal::components::TopKSampleShape;
+use inference_backend_metal::components::sampling::dspark_markov as backend_dspark_markov;
+use inference_backend_metal::components::sampling::top_k as backend_top_k;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -124,8 +117,8 @@ pub struct DSparkMarkovSampling {
     max_requests: usize,
     bucket_policy: ReplayBucketPolicy,
     confidence_output: Buffer,
-    top_k_map: DSparkMarkovTopKMapKernel,
-    top_k_reduce: TopKReduceKernels,
+    top_k_map: backend_dspark_markov::MapCompute,
+    top_k_reduce: backend_top_k::ReduceCompute,
     anchor_token_ids: Buffer,
     partial_token_ids: Buffer,
     partial_logits: Buffer,
@@ -146,7 +139,7 @@ impl DSparkMarkovSampling {
                 .expect("DSpark confidence output capacity must fit usize"),
             Dtype::Float32,
         );
-        let top_k_map = DSparkMarkovTopKMapKernel::new(device, map_config(config));
+        let top_k_map = backend_dspark_markov::MapCompute::new(device, map_config(config));
         let candidate_count = top_k_map.candidate_count(component_shape(config.sampling.max_shape()));
         let mut step_params = Vec::with_capacity(config.block_size);
         let mut step_outputs = Vec::with_capacity(config.block_size);
@@ -162,7 +155,7 @@ impl DSparkMarkovSampling {
             bucket_policy: ReplayBucketPolicy::new(config.sampling.max_sampling_inputs),
             confidence_output,
             top_k_map,
-            top_k_reduce: TopKReduceKernels::new(device),
+            top_k_reduce: backend_top_k::ReduceCompute::new(device),
             anchor_token_ids: Buffer::new_zeroed_elements(device, max_requests, Dtype::Int32),
             partial_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
             partial_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
@@ -242,11 +235,11 @@ impl DSparkMarkovSampling {
                 &self.step_outputs[step_index - 1].token_ids
             };
             recorder.record_with_barrier_before(ReplayOp::opaque(self.top_k_map.invoke_replay(
-                DSparkMarkovTopKMapShape {
+                backend_dspark_markov::MapShape {
                     sampling,
                     base_logits_row_offset: step_index as u32 * shape.num_requests,
                 },
-                DSparkMarkovTopKMapBuffers {
+                backend_dspark_markov::MapBuffers {
                     input_token_ids,
                     base_logits: input.base_logits,
                     w1_weight: input.weights.w1_weight,
@@ -257,7 +250,7 @@ impl DSparkMarkovSampling {
                     w2_biases: input.weights.w2_biases,
                     tile_token_ids: &self.partial_token_ids,
                     tile_logits: &self.partial_logits,
-                    confidence: DSparkConfidenceBuffers {
+                    confidence: backend_dspark_markov::ConfidenceBuffers {
                         hidden: input.confidence.hidden,
                         weight: input.confidence.weights.weight,
                         bias: input.confidence.weights.bias,
@@ -268,7 +261,7 @@ impl DSparkMarkovSampling {
             recorder.record_with_barrier_before(ReplayOp::opaque(
                 self.top_k_reduce.invoke_sample_and_write_distribution_with_layout(
                     sampling,
-                    TopKSampleAndWriteDistributionBuffers {
+                    backend_top_k::SampleAndWriteDistributionBuffers {
                         tile_token_ids: &self.partial_token_ids,
                         tile_logits: &self.partial_logits,
                         sampled_token_ids: &self.step_outputs[step_index].token_ids,
@@ -359,8 +352,8 @@ impl DSparkMarkovSamplingConfig {
     }
 }
 
-fn map_config(config: DSparkMarkovSamplingConfig) -> DSparkMarkovTopKMapConfig {
-    DSparkMarkovTopKMapConfig {
+fn map_config(config: DSparkMarkovSamplingConfig) -> backend_dspark_markov::MapConfig {
+    backend_dspark_markov::MapConfig {
         vocab_size: config.vocab_size,
         rank: config.rank,
         w1_group_size: config.w1_group_size,
@@ -369,14 +362,14 @@ fn map_config(config: DSparkMarkovSamplingConfig) -> DSparkMarkovTopKMapConfig {
         w2_bits: config.w2_bits,
         io_dtype: config.io_dtype,
         scale_bias_dtype: config.scale_bias_dtype,
-        confidence: DSparkBackendConfidenceConfig {
+        confidence: backend_dspark_markov::ConfidenceConfig {
             hidden_dim: config.confidence.hidden_dim,
         },
     }
 }
 
-fn component_shape(shape: TopKSamplingShape) -> TopKSampleShape {
-    TopKSampleShape {
+fn component_shape(shape: TopKSamplingShape) -> backend_top_k::Shape {
+    backend_top_k::Shape {
         num_total_sampling_inputs: shape.num_total_sampling_inputs,
         vocab_size: shape.vocab_size,
         top_k: shape.top_k,

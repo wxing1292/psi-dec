@@ -7,13 +7,13 @@
 //! logits
 //!   |
 //!   v
-//! TopKMapKernels
+//! top_k::MapCompute
 //!   |
 //!   +--> partial token IDs
 //!   +--> partial logits
 //!            |
 //!            v
-//!      TopKReduceKernels
+//!      top_k::ReduceCompute
 //!            |
 //!            +--> sampled token and probability
 //!            +--> sparse distribution
@@ -21,7 +21,7 @@
 //! target sparse distributions + draft sparse distributions
 //!            |
 //!            v
-//! SparseRejectionSampleKernel
+//! rejection::Compute
 //!            |
 //!            +--> accepted draft tokens
 //!            +--> sampled bonus token
@@ -29,10 +29,10 @@
 //! base logits + indexed Markov input token
 //!            |
 //!            v
-//! DSparkMarkovTopKMapKernel
+//! dspark_markov::MapCompute
 //!            |
 //!            v
-//!      TopKReduceKernels
+//!      top_k::ReduceCompute
 //! ```
 
 const SAMPLING_SOURCE: &str = include_str!("../metal/sampling.metal");
@@ -57,29 +57,6 @@ fn checked_bytes(name: &str, num_elements: usize, item_size: usize) -> usize {
         .unwrap_or_else(|| panic!("{name} byte length must fit usize"))
 }
 
-mod dspark_markov;
-pub use dspark_markov::DSparkConfidenceBuffers;
-pub use dspark_markov::DSparkConfidenceConfig;
-pub use dspark_markov::DSparkMarkovTopKMapBuffers;
-pub use dspark_markov::DSparkMarkovTopKMapConfig;
-pub use dspark_markov::DSparkMarkovTopKMapKernel;
-pub use dspark_markov::DSparkMarkovTopKMapShape;
-
-mod rejection;
-pub use rejection::SparseRejectionSampleBuffers;
-pub use rejection::SparseRejectionSampleKernel;
-pub use rejection::SparseRejectionSampleShape;
-
-mod top_k;
-pub use top_k::TopKMapBuffers;
-pub use top_k::TopKMapKernels;
-pub use top_k::TopKMergeKernels;
-pub use top_k::TopKPartialCandidateLayout;
-pub use top_k::TopKReduceKernels;
-pub use top_k::TopKSampleAndWriteDistributionBuffers;
-pub use top_k::TopKSampleBuffers;
-pub use top_k::TopKSampleShape;
-pub use top_k::TopKSamplingOperation;
-pub use top_k::TopKTileBuffers;
-pub use top_k::TopKTileKernels;
-pub use top_k::TopKWriteDistributionBuffers;
+pub mod dspark_markov;
+pub mod rejection;
+pub mod top_k;

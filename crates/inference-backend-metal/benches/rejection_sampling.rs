@@ -4,23 +4,9 @@ use std::mem::size_of;
 use std::time::Duration;
 use std::time::Instant;
 
-use inference_backend_metal::components::DSparkConfidenceBuffers;
-use inference_backend_metal::components::DSparkConfidenceConfig;
-use inference_backend_metal::components::DSparkMarkovTopKMapBuffers;
-use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
-use inference_backend_metal::components::DSparkMarkovTopKMapKernel;
-use inference_backend_metal::components::DSparkMarkovTopKMapShape;
-use inference_backend_metal::components::SparseRejectionSampleBuffers;
-use inference_backend_metal::components::SparseRejectionSampleKernel;
-use inference_backend_metal::components::SparseRejectionSampleShape;
-use inference_backend_metal::components::TopKMapBuffers;
-use inference_backend_metal::components::TopKMapKernels;
-use inference_backend_metal::components::TopKReduceKernels;
-use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
-use inference_backend_metal::components::TopKSampleBuffers;
-use inference_backend_metal::components::TopKSampleShape;
-use inference_backend_metal::components::TopKSamplingOperation;
-use inference_backend_metal::components::TopKWriteDistributionBuffers;
+use inference_backend_metal::components::sampling::dspark_markov;
+use inference_backend_metal::components::sampling::rejection;
+use inference_backend_metal::components::sampling::top_k;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -69,7 +55,7 @@ fn main() {
             }
         },
         BenchMode::DSparkMarkovTopKMap => {
-            let config = DSparkMarkovTopKMapConfig {
+            let config = dspark_markov::MapConfig {
                 vocab_size: args.vocab,
                 rank: args.markov_rank,
                 w1_group_size: args.markov_w1_group_size,
@@ -78,7 +64,7 @@ fn main() {
                 w2_bits: args.markov_w2_bits,
                 io_dtype: Dtype::Bfloat16,
                 scale_bias_dtype: Dtype::Bfloat16,
-                confidence: DSparkConfidenceConfig {
+                confidence: dspark_markov::ConfidenceConfig {
                     hidden_dim: args.markov_confidence_hidden_dim,
                 },
             };
@@ -237,10 +223,10 @@ struct DSparkMarkovFixture {
 }
 
 impl DSparkMarkovFixture {
-    fn new(device: &Device, rows: u32, top_k: u32, config: DSparkMarkovTopKMapConfig) -> Self {
+    fn new(device: &Device, rows: u32, top_k: u32, config: dspark_markov::MapConfig) -> Self {
         assert!(rows > 0);
         config.validate();
-        let shape = TopKSampleShape {
+        let shape = top_k::Shape {
             num_total_sampling_inputs: rows,
             vocab_size: config.vocab_size,
             top_k,
@@ -260,7 +246,7 @@ impl DSparkMarkovFixture {
         );
         let w2_scales = affine_param_buffer(device, config.vocab_size, config.rank, config.w2_group_size, 1.0);
         let w2_biases = affine_param_buffer(device, config.vocab_size, config.rank, config.w2_group_size, 0.0);
-        let kernel = DSparkMarkovTopKMapKernel::new(device, config);
+        let kernel = dspark_markov::MapCompute::new(device, config);
         let candidate_count = kernel.candidate_count(shape);
         let tile_token_ids = Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32);
         let tile_logits = Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32);
@@ -283,11 +269,11 @@ impl DSparkMarkovFixture {
         let stream = Stream::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_replay(
-            DSparkMarkovTopKMapShape {
+            dspark_markov::MapShape {
                 sampling: shape,
                 base_logits_row_offset: 0,
             },
-            DSparkMarkovTopKMapBuffers {
+            dspark_markov::MapBuffers {
                 input_token_ids: &input_token_ids,
                 base_logits: &base_logits,
                 w1_weight: &w1_weight,
@@ -298,7 +284,7 @@ impl DSparkMarkovFixture {
                 w2_biases: &w2_biases,
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
-                confidence: DSparkConfidenceBuffers {
+                confidence: dspark_markov::ConfidenceBuffers {
                     hidden: &confidence_hidden,
                     weight: &confidence_weight,
                     bias: &confidence_bias,
@@ -374,13 +360,13 @@ impl ReplayFixture {
         let token_ids = Buffer::new_zeroed(device, rows as usize * size_of::<i32>());
         let token_probs = Buffer::new_zeroed(device, rows as usize * size_of::<f32>());
         let runtime_params = sampling_runtime_params(device, rows, top_k);
-        let reduce = TopKReduceKernels::new(device);
+        let reduce = top_k::ReduceCompute::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
             Dtype::Float32,
-            TopKSamplingOperation::Sample,
-            TopKMapBuffers {
+            top_k::Operation::Sample,
+            top_k::MapBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
                 tile_token_ids: &tile_token_ids,
@@ -389,7 +375,7 @@ impl ReplayFixture {
         ));
         builder.record_with_barrier_before(reduce.invoke_sample_with_layout(
             shape,
-            TopKSampleBuffers {
+            top_k::SampleBuffers {
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
                 token_ids: &token_ids,
@@ -415,13 +401,13 @@ impl ReplayFixture {
         let distribution_probs = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<f32>());
         let runtime_params = sampling_runtime_params(device, rows, top_k);
         let output_distribution_indices = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
-        let reduce = TopKReduceKernels::new(device);
+        let reduce = top_k::ReduceCompute::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
             Dtype::Float32,
-            TopKSamplingOperation::WriteDistribution,
-            TopKMapBuffers {
+            top_k::Operation::WriteDistribution,
+            top_k::MapBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
                 tile_token_ids: &tile_token_ids,
@@ -430,7 +416,7 @@ impl ReplayFixture {
         ));
         builder.record_with_barrier_before(reduce.invoke_write_distribution_with_layout(
             shape,
-            TopKWriteDistributionBuffers {
+            top_k::WriteDistributionBuffers {
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
                 distribution_token_ids: &distribution_token_ids,
@@ -461,13 +447,13 @@ impl ReplayFixture {
         let distribution_probs = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<f32>());
         let runtime_params = sampling_runtime_params(device, rows, top_k);
         let output_distribution_indices = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
-        let reduce = TopKReduceKernels::new(device);
+        let reduce = top_k::ReduceCompute::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
             shape,
             Dtype::Float32,
-            TopKSamplingOperation::SampleAndWriteDistribution,
-            TopKMapBuffers {
+            top_k::Operation::SampleAndWriteDistribution,
+            top_k::MapBuffers {
                 logits: &logits,
                 logits_offset_bytes: 0,
                 tile_token_ids: &tile_token_ids,
@@ -476,7 +462,7 @@ impl ReplayFixture {
         ));
         builder.record_with_barrier_before(reduce.invoke_sample_and_write_distribution_with_layout(
             shape,
-            TopKSampleAndWriteDistributionBuffers {
+            top_k::SampleAndWriteDistributionBuffers {
                 tile_token_ids: &tile_token_ids,
                 tile_logits: &tile_logits,
                 sampled_token_ids: &sampled_token_ids,
@@ -535,12 +521,12 @@ impl ReplayFixture {
         let sampled_token_ids = Buffer::new_zeroed(device, reqs as usize * size_of::<i32>());
         let sampled_probs = Buffer::new_zeroed(device, reqs as usize * size_of::<f32>());
         let stream = Stream::new(device);
-        let kernel = SparseRejectionSampleKernel::new(device);
+        let kernel = rejection::Compute::new(device);
         let runtime_params = Buffer::from_slice(
             device,
             &(0..reqs).flat_map(|req| [12345_u32, req, top_k, 0]).collect::<Vec<_>>(),
         );
-        let shape = SparseRejectionSampleShape {
+        let shape = rejection::Shape {
             num_total_reqs: reqs,
             num_total_target_distributions: target_rows,
             num_total_draft_distributions: draft_rows,
@@ -552,7 +538,7 @@ impl ReplayFixture {
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_replay(
             shape,
-            SparseRejectionSampleBuffers {
+            rejection::Buffers {
                 target_distribution_token_ids: &target_token_ids,
                 target_distribution_probs: &target_probs,
                 draft_distribution_token_ids: &draft_distribution_token_ids,
@@ -588,9 +574,9 @@ impl ReplayFixture {
 }
 
 fn top_k_replay_arguments(
-    topk: &TopKMapKernels,
-    reduce: &TopKReduceKernels,
-    shape: TopKSampleShape,
+    topk: &top_k::MapCompute,
+    reduce: &top_k::ReduceCompute,
+    shape: top_k::Shape,
     num_active_sampling_inputs: u32,
 ) -> ReplayArguments {
     let mut arguments = ReplayArguments::new();
@@ -600,8 +586,8 @@ fn top_k_replay_arguments(
 }
 
 fn rejection_replay_arguments(
-    kernel: &SparseRejectionSampleKernel,
-    shape: SparseRejectionSampleShape,
+    kernel: &rejection::Compute,
+    shape: rejection::Shape,
     num_active_reqs: u32,
     num_active_target_distributions: u32,
     num_active_draft_distributions: u32,
@@ -626,15 +612,15 @@ fn top_k_base(
     rows: u32,
     top_k: u32,
     vocab: u32,
-) -> (Stream, TopKSampleShape, Buffer, Buffer, Buffer, TopKMapKernels) {
+) -> (Stream, top_k::Shape, Buffer, Buffer, Buffer, top_k::MapCompute) {
     assert!(rows > 0);
-    let shape = TopKSampleShape {
+    let shape = top_k::Shape {
         num_total_sampling_inputs: rows,
         vocab_size: vocab,
         top_k,
     };
     let logits = Buffer::from_slice(device, &logits(rows, vocab));
-    let topk = TopKMapKernels::new(device);
+    let topk = top_k::MapCompute::new(device);
     let candidate_count = topk.candidate_count(shape);
     let tile_token_ids = Buffer::new_zeroed(device, candidate_count * size_of::<i32>());
     let tile_logits = Buffer::new_zeroed(device, candidate_count * size_of::<f32>());
@@ -783,7 +769,7 @@ fn print_rejection_perf(
 fn print_dspark_markov_perf(
     rows: u32,
     top_k: u32,
-    config: DSparkMarkovTopKMapConfig,
+    config: dspark_markov::MapConfig,
     vocab_partition_size: u32,
     iters: usize,
     samples: &[Duration],

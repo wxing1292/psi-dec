@@ -60,10 +60,11 @@ logits [num_rows, vocab_size]
   -> sampled token IDs + probabilities
 ```
 
-The pure `TopKMapKernelSpecialization::select(...)` helper selects the Map kernel specialization from the logits dtype,
-top-k, and required output. The small-k path uses repeated maximum reduction for sample-only top-k <= 32. Larger top-k
-and write-distribution generation use the bitonic Map path. The component does not materialize a planner or plan object.
-These operations remain separate pipeline entry points.
+`top_k::MapCompute` owns a private `Registry` and `Selector`. The registry stores four complete execution variants:
+F32 reduction, F32 bitonic, BF16 reduction, and BF16 bitonic. `Selector::select(...)` returns
+`(VariantKey, &Variant)` from the logits dtype, top-k, and required output. The small-k path uses repeated maximum
+reduction for sample-only top-k <= 32. Larger top-k and write-distribution generation use the bitonic Map path. The
+selector performs the complete choice. The component does not have a separate planner or plan object.
 Unused static threadblock storage can reduce occupancy.
 
 Sampling returns only token IDs and probabilities.
@@ -101,9 +102,10 @@ The draft table contains one distribution for each draft token.
 Requests are independent.
 Drafts within one request are ordered because the first rejection ends that request's acceptance walk.
 
-The sparse rejection kernel has no implementation planner. One thread block owns one request. The threads cooperate
+The sparse rejection component has one fixed `rejection::Compute`. It has no registry or selector. One thread block
+owns one request. The threads cooperate
 on the sparse-distribution operations for that request. The block processes the draft sequence in order. The current
-kernel specialization requires 256 threads. The recorded grid contains one thread block for each request capacity
+compile-time constants require 256 threads. The recorded grid contains one thread block for each request capacity
 slot. Replay arguments limit execution to the active request count.
 
 `SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
@@ -174,7 +176,7 @@ Sparse Main distributions and rejection form one Main-stage replay.
 One DSpark Markov step records two commands:
 
 ```text
-DSparkMarkovTopKMap
+dspark_markov::MapCompute
   input_token_ids[i]
     i = 0: sampled_token / anchor_token
     i > 0: spec_tokens[i - 1]
@@ -185,7 +187,7 @@ DSparkMarkovTopKMap
   -> confidence projection and sigmoid
   -> spec_confidence[i]
 
-TopKSampleAndWriteDistribution
+top_k::ReduceCompute::invoke_sample_and_write_distribution_with_layout
   -> global Top-K merge
   -> top-p sampling
   -> spec_token[i], spec_prob[i], and sparse draft distribution
@@ -214,33 +216,31 @@ Sampling probabilities use F32.
 Top-K sampling has a true Map/Reduce dependency:
 
 ```text
-TopKMapKernels
-    -> one TopKMapThreadBlockTask
+top_k::MapCompute
+    -> one MapThreadBlockTask
        = one sampling row x one vocabulary partition
-    -> TopKPartialCandidateLayout
+    -> top_k::PartialCandidateLayout
        = vocabulary partition size
     -> partial token IDs + partial logits
 
-TopKReduceKernels
-    -> one TopKReduceThreadBlockTask
+top_k::ReduceCompute
+    -> one ReduceThreadBlockTask
        = one sampling row x all partial-candidate partitions
     -> sampled token/probability and optional sparse distribution
 ```
 
-The standard Map specialization has `thread_block.max_vocab_tokens = 256` and
-`thread_block.required_threads = 256`. The DSpark fused Map specialization has
-`thread_block.max_vocab_tokens = 64` and `thread_block.required_threads = 128`. Both producers return an explicit
-`TopKPartialCandidateLayout`. The Reduce invocation consumes that layout. The executor does not pass an untyped
-`vocab_tile_size` between the components.
+The standard Map compile-time constants have `thread_block.max_vocab_tokens = 256` and
+`thread_block.required_threads = 256`. The DSpark fused Map constants have `thread_block.max_vocab_tokens = 64` and
+`thread_block.required_threads = 128`. Both producers return an explicit `top_k::PartialCandidateLayout`. The Reduce
+invocation consumes that layout. The executor does not pass an untyped `vocab_tile_size` between the components.
 
-`TopKSampleShape.top_k` defines the number of candidates in each partial row. The layout does not duplicate this
+`top_k::Shape::top_k` defines the number of candidates in each partial row. The layout does not duplicate this
 dynamic shape value.
 
-The Reduce specialization requires 256 threads. The Map and Reduce replay arguments retain their current capacity
-and active-thread semantics. The compatibility aliases `TopKTileKernels` and `TopKMergeKernels` preserve the existing
-public component API. `TopKMapBuffers` is the canonical alias for the existing `TopKTileBuffers` ABI. The old
-`vocab_tile_size` compatibility entry points remain available, but repository code does not use them. New repository
-code uses `TopKMapKernels`, `TopKReduceKernels`, and `TopKPartialCandidateLayout`.
+The Reduce constants require 256 threads. The Map and Reduce replay arguments retain their current capacity and
+active-thread semantics. The backend exposes component-scoped APIs through `sampling::top_k`,
+`sampling::dspark_markov`, and `sampling::rejection`. It does not expose compatibility aliases from
+`components` or `sampling`.
 
 ### DSpark Markov numerical contract
 

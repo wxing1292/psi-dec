@@ -13,18 +13,17 @@ use crate::metal::ReplayParameterKey;
 
 const TOP_K_REDUCTION_LIMIT: u32 = 32;
 const TOP_K_VOCAB_TILE_SIZE: u32 = 256;
-pub const TOP_K_MAP_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
+pub(super) const MAP_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("top_k_sampling.tile_num_active_threads");
-pub const TOP_K_TILE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey = TOP_K_MAP_NUM_ACTIVE_THREADS_KEY;
-const TOP_K_REDUCE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
+const REDUCE_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("top_k_sampling.merge_num_active_threads");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TopKPartialCandidateLayout {
+pub struct PartialCandidateLayout {
     vocab_partition_size: u32,
 }
 
-impl TopKPartialCandidateLayout {
+impl PartialCandidateLayout {
     pub fn new(vocab_partition_size: u32) -> Self {
         assert!(vocab_partition_size > 0);
         Self { vocab_partition_size }
@@ -36,46 +35,40 @@ impl TopKPartialCandidateLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TopKMapThreadBlockSpecialization {
+struct MapThreadBlockConstants {
     max_vocab_tokens: u32,
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TopKMapAlgorithm {
+enum MapAlgorithm {
     Reduction,
     Bitonic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TopKMapKernelSpecialization {
+struct MapKernelConstants {
     logits_dtype: Dtype,
-    algorithm: TopKMapAlgorithm,
-    thread_block: TopKMapThreadBlockSpecialization,
+    algorithm: MapAlgorithm,
+    thread_block: MapThreadBlockConstants,
 }
 
-impl TopKMapKernelSpecialization {
-    fn select(shape: TopKSampleShape, logits_dtype: Dtype, operation: TopKSamplingOperation) -> Self {
-        shape.validate();
-        let algorithm = match operation {
-            TopKSamplingOperation::Sample if shape.top_k <= TOP_K_REDUCTION_LIMIT => TopKMapAlgorithm::Reduction,
-            TopKSamplingOperation::Sample
-            | TopKSamplingOperation::WriteDistribution
-            | TopKSamplingOperation::SampleAndWriteDistribution => TopKMapAlgorithm::Bitonic,
-        };
+impl MapKernelConstants {
+    fn new(logits_dtype: Dtype, algorithm: MapAlgorithm) -> Self {
+        assert!(matches!(logits_dtype, Dtype::Float32 | Dtype::Bfloat16));
         Self {
             logits_dtype,
             algorithm,
-            thread_block: TopKMapThreadBlockSpecialization::current(),
+            thread_block: MapThreadBlockConstants::current(),
         }
     }
 
-    fn partial_candidate_layout(self) -> TopKPartialCandidateLayout {
-        TopKPartialCandidateLayout::new(self.thread_block.max_vocab_tokens)
+    fn partial_candidate_layout(self) -> PartialCandidateLayout {
+        PartialCandidateLayout::new(self.thread_block.max_vocab_tokens)
     }
 }
 
-impl TopKMapThreadBlockSpecialization {
+impl MapThreadBlockConstants {
     fn current() -> Self {
         Self {
             max_vocab_tokens: TOP_K_VOCAB_TILE_SIZE,
@@ -85,38 +78,38 @@ impl TopKMapThreadBlockSpecialization {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TopKReduceThreadBlockSpecialization {
+struct ReduceThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TopKReduceKernelSpecialization {
-    thread_block: TopKReduceThreadBlockSpecialization,
+struct ReduceKernelConstants {
+    thread_block: ReduceThreadBlockConstants,
 }
 
-impl TopKReduceKernelSpecialization {
+impl ReduceKernelConstants {
     fn current() -> Self {
         Self {
-            thread_block: TopKReduceThreadBlockSpecialization { required_threads: 256 },
+            thread_block: ReduceThreadBlockConstants { required_threads: 256 },
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TopKSampleShape {
+pub struct Shape {
     pub num_total_sampling_inputs: u32,
     pub vocab_size: u32,
     pub top_k: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TopKSamplingOperation {
+pub enum Operation {
     Sample,
     WriteDistribution,
     SampleAndWriteDistribution,
 }
 
-impl TopKSampleShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_sampling_inputs > 0);
         assert!(self.vocab_size > 0);
@@ -143,21 +136,21 @@ impl TopKSampleShape {
     }
 }
 
-fn standard_partial_candidate_layout() -> TopKPartialCandidateLayout {
-    TopKPartialCandidateLayout::new(TopKMapThreadBlockSpecialization::current().max_vocab_tokens)
+fn standard_partial_candidate_layout() -> PartialCandidateLayout {
+    PartialCandidateLayout::new(MapThreadBlockConstants::current().max_vocab_tokens)
 }
 
-fn num_vocab_partitions(shape: TopKSampleShape, layout: TopKPartialCandidateLayout) -> u32 {
+fn num_vocab_partitions(shape: Shape, layout: PartialCandidateLayout) -> u32 {
     shape.validate();
     shape.vocab_size.div_ceil(layout.vocab_partition_size())
 }
 
-fn num_candidates_per_partition(shape: TopKSampleShape) -> u32 {
+fn num_candidates_per_partition(shape: Shape) -> u32 {
     shape.validate();
     shape.top_k
 }
 
-fn partial_candidate_count(shape: TopKSampleShape, layout: TopKPartialCandidateLayout) -> usize {
+fn partial_candidate_count(shape: Shape, layout: PartialCandidateLayout) -> usize {
     checked_product(
         "Metal top-k partial candidate count",
         &[
@@ -169,17 +162,15 @@ fn partial_candidate_count(shape: TopKSampleShape, layout: TopKPartialCandidateL
 }
 
 #[derive(Clone, Copy)]
-pub struct TopKTileBuffers<'a> {
+pub struct MapBuffers<'a> {
     pub logits: &'a Buffer,
     pub logits_offset_bytes: usize,
     pub tile_token_ids: &'a Buffer,
     pub tile_logits: &'a Buffer,
 }
 
-pub type TopKMapBuffers<'a> = TopKTileBuffers<'a>;
-
 #[derive(Clone, Copy)]
-pub struct TopKSampleBuffers<'a> {
+pub struct SampleBuffers<'a> {
     pub tile_token_ids: &'a Buffer,
     pub tile_logits: &'a Buffer,
     pub token_ids: &'a Buffer,
@@ -188,7 +179,7 @@ pub struct TopKSampleBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct TopKWriteDistributionBuffers<'a> {
+pub struct WriteDistributionBuffers<'a> {
     pub tile_token_ids: &'a Buffer,
     pub tile_logits: &'a Buffer,
     pub distribution_token_ids: &'a Buffer,
@@ -200,7 +191,7 @@ pub struct TopKWriteDistributionBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct TopKSampleAndWriteDistributionBuffers<'a> {
+pub struct SampleAndWriteDistributionBuffers<'a> {
     pub tile_token_ids: &'a Buffer,
     pub tile_logits: &'a Buffer,
     pub sampled_token_ids: &'a Buffer,
@@ -214,9 +205,9 @@ pub struct TopKSampleAndWriteDistributionBuffers<'a> {
 }
 
 fn assert_map_buffers_fit(
-    shape: TopKSampleShape,
-    layout: TopKPartialCandidateLayout,
-    buffers: TopKMapBuffers<'_>,
+    shape: Shape,
+    layout: PartialCandidateLayout,
+    buffers: MapBuffers<'_>,
     logits_item_size: usize,
 ) {
     let logits_bytes = checked_product(
@@ -247,11 +238,11 @@ fn assert_map_buffers_fit(
 }
 
 fn assert_reduce_inputs_fit(
-    shape: TopKSampleShape,
+    shape: Shape,
     tile_token_ids: &Buffer,
     tile_logits: &Buffer,
     runtime_params: &Buffer,
-    layout: TopKPartialCandidateLayout,
+    layout: PartialCandidateLayout,
 ) {
     let candidates = partial_candidate_count(shape, layout);
     assert!(
@@ -272,61 +263,133 @@ fn assert_reduce_inputs_fit(
     );
 }
 
-pub struct TopKMapKernels {
-    f32_reduction: Kernel,
-    f32_bitonic: Kernel,
-    bf16_reduction: Kernel,
-    bf16_bitonic: Kernel,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VariantKey {
+    F32Reduction,
+    F32Bitonic,
+    Bf16Reduction,
+    Bf16Bitonic,
 }
 
-impl TopKMapKernels {
+struct Variant {
+    constants: MapKernelConstants,
+    logits_item_size: usize,
+    kernel: Kernel,
+}
+
+struct Registry {
+    entries: Vec<(VariantKey, Variant)>,
+}
+
+struct Selector;
+
+impl Registry {
+    fn new(device: &crate::metal::Device) -> Self {
+        Self {
+            entries: vec![
+                (
+                    VariantKey::F32Reduction,
+                    Variant {
+                        constants: MapKernelConstants::new(Dtype::Float32, MapAlgorithm::Reduction),
+                        logits_item_size: size_of::<f32>(),
+                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles"),
+                    },
+                ),
+                (
+                    VariantKey::F32Bitonic,
+                    Variant {
+                        constants: MapKernelConstants::new(Dtype::Float32, MapAlgorithm::Bitonic),
+                        logits_item_size: size_of::<f32>(),
+                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bitonic"),
+                    },
+                ),
+                (
+                    VariantKey::Bf16Reduction,
+                    Variant {
+                        constants: MapKernelConstants::new(Dtype::Bfloat16, MapAlgorithm::Reduction),
+                        logits_item_size: size_of::<u16>(),
+                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16"),
+                    },
+                ),
+                (
+                    VariantKey::Bf16Bitonic,
+                    Variant {
+                        constants: MapKernelConstants::new(Dtype::Bfloat16, MapAlgorithm::Bitonic),
+                        logits_item_size: size_of::<u16>(),
+                        kernel: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16_bitonic"),
+                    },
+                ),
+            ],
+        }
+    }
+
+    fn get(&self, key: VariantKey) -> &Variant {
+        self.entries
+            .iter()
+            .find_map(|(candidate_key, variant)| (*candidate_key == key).then_some(variant))
+            .unwrap_or_else(|| panic!("missing top-k Map execution variant {key:?}"))
+    }
+}
+
+impl Selector {
+    fn select(registry: &Registry, shape: Shape, logits_dtype: Dtype, operation: Operation) -> (VariantKey, &Variant) {
+        let key = Self::key(shape, logits_dtype, operation);
+        (key, registry.get(key))
+    }
+
+    fn key(shape: Shape, logits_dtype: Dtype, operation: Operation) -> VariantKey {
+        shape.validate();
+        let algorithm = match operation {
+            Operation::Sample if shape.top_k <= TOP_K_REDUCTION_LIMIT => MapAlgorithm::Reduction,
+            Operation::Sample | Operation::WriteDistribution | Operation::SampleAndWriteDistribution => {
+                MapAlgorithm::Bitonic
+            },
+        };
+        match (logits_dtype, algorithm) {
+            (Dtype::Float32, MapAlgorithm::Reduction) => VariantKey::F32Reduction,
+            (Dtype::Float32, MapAlgorithm::Bitonic) => VariantKey::F32Bitonic,
+            (Dtype::Bfloat16, MapAlgorithm::Reduction) => VariantKey::Bf16Reduction,
+            (Dtype::Bfloat16, MapAlgorithm::Bitonic) => VariantKey::Bf16Bitonic,
+            (dtype, _) => panic!("unsupported top-k logits dtype {dtype:?}"),
+        }
+    }
+}
+
+pub struct MapCompute {
+    registry: Registry,
+}
+
+impl MapCompute {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
-            f32_reduction: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles"),
-            f32_bitonic: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bitonic"),
-            bf16_reduction: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16"),
-            bf16_bitonic: Kernel::new(device, SAMPLING_SOURCE, "top_k_logits_tiles_bf16_bitonic"),
+            registry: Registry::new(device),
         }
     }
 
     pub fn invoke_replay<'a>(
         &'a self,
-        shape: TopKSampleShape,
+        shape: Shape,
         logits_dtype: Dtype,
-        operation: TopKSamplingOperation,
-        buffers: TopKMapBuffers<'a>,
-    ) -> TopKMapInvocation<'a> {
-        let specialization = TopKMapKernelSpecialization::select(shape, logits_dtype, operation);
-        let (kernel, logits_item_size) = match (specialization.logits_dtype, specialization.algorithm) {
-            (Dtype::Float32, TopKMapAlgorithm::Reduction) => (&self.f32_reduction, size_of::<f32>()),
-            (Dtype::Float32, TopKMapAlgorithm::Bitonic) => (&self.f32_bitonic, size_of::<f32>()),
-            (Dtype::Bfloat16, TopKMapAlgorithm::Reduction) => (&self.bf16_reduction, size_of::<u16>()),
-            (Dtype::Bfloat16, TopKMapAlgorithm::Bitonic) => (&self.bf16_bitonic, size_of::<u16>()),
-            (dtype, _) => panic!("unsupported top-k logits dtype {dtype:?}"),
-        };
-        TopKMapInvocation {
-            kernel,
-            logits_item_size,
-            specialization,
+        operation: Operation,
+        buffers: MapBuffers<'a>,
+    ) -> MapInvocation<'a> {
+        let (_, variant) = Selector::select(&self.registry, shape, logits_dtype, operation);
+        MapInvocation {
+            variant,
             shape,
             buffers,
         }
     }
 
-    pub fn candidate_count(&self, shape: TopKSampleShape) -> usize {
+    pub fn candidate_count(&self, shape: Shape) -> usize {
         partial_candidate_count(shape, self.partial_candidate_layout())
     }
 
-    pub fn partial_candidate_layout(&self) -> TopKPartialCandidateLayout {
+    pub fn partial_candidate_layout(&self) -> PartialCandidateLayout {
         standard_partial_candidate_layout()
     }
 
-    pub fn add_replay_arguments(
-        &self,
-        shape: TopKSampleShape,
-        num_active_sampling_inputs: u32,
-        arguments: &mut ReplayArguments,
-    ) {
+    pub fn add_replay_arguments(&self, shape: Shape, num_active_sampling_inputs: u32, arguments: &mut ReplayArguments) {
         shape.validate();
         assert!(
             num_active_sampling_inputs > 0 && num_active_sampling_inputs <= shape.num_total_sampling_inputs,
@@ -336,34 +399,29 @@ impl TopKMapKernels {
             return;
         }
         let num_partitions = num_vocab_partitions(shape, self.partial_candidate_layout());
-        let required_threads = TopKMapThreadBlockSpecialization::current().required_threads;
+        let required_threads = MapThreadBlockConstants::current().required_threads;
         let num_threads_per_row = checked_num_threads(num_partitions, required_threads);
         let num_active_threads = checked_num_threads(num_active_sampling_inputs, num_threads_per_row);
         let num_total_threads = checked_num_threads(shape.num_total_sampling_inputs, num_threads_per_row);
         assert!(num_active_threads <= num_total_threads);
-        arguments.set_u32(TOP_K_MAP_NUM_ACTIVE_THREADS_KEY, num_active_threads);
+        arguments.set_u32(MAP_NUM_ACTIVE_THREADS_KEY, num_active_threads);
     }
 }
 
-pub type TopKTileKernels = TopKMapKernels;
-
-pub struct TopKMapInvocation<'a> {
-    kernel: &'a Kernel,
-    logits_item_size: usize,
-    specialization: TopKMapKernelSpecialization,
-    shape: TopKSampleShape,
-    buffers: TopKMapBuffers<'a>,
+pub struct MapInvocation<'a> {
+    variant: &'a Variant,
+    shape: Shape,
+    buffers: MapBuffers<'a>,
 }
 
-pub type TopKTileInvocation<'a> = TopKMapInvocation<'a>;
-
-impl Operator for TopKMapInvocation<'_> {
+impl Operator for MapInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate();
-        let layout = self.specialization.partial_candidate_layout();
-        assert_map_buffers_fit(self.shape, layout, self.buffers, self.logits_item_size);
+        let constants = self.variant.constants;
+        let layout = constants.partial_candidate_layout();
+        assert_map_buffers_fit(self.shape, layout, self.buffers, self.variant.logits_item_size);
         let num_partitions = num_vocab_partitions(self.shape, layout);
-        recorder.set_kernel(self.kernel);
+        recorder.set_kernel(&self.variant.kernel);
         recorder.set_buffer_read(0, self.buffers.logits, self.buffers.logits_offset_bytes);
         recorder.set_buffer_write(1, self.buffers.tile_token_ids, 0);
         recorder.set_buffer_write(2, self.buffers.tile_logits, 0);
@@ -371,34 +429,29 @@ impl Operator for TopKMapInvocation<'_> {
         recorder.set_u32(5, self.shape.top_k);
         recorder.set_u32(6, layout.vocab_partition_size());
         recorder.set_u32(7, num_partitions);
-        let required_threads = self.specialization.thread_block.required_threads;
+        let required_threads = constants.thread_block.required_threads;
         let num_threads_per_row = checked_num_threads(num_partitions, required_threads);
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
         if num_threads_per_row == num_total_threads {
             recorder.set_u32(3, num_total_threads);
         } else {
-            recorder.bind_u32(
-                3,
-                TOP_K_MAP_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
+            recorder.bind_u32(3, MAP_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         }
         recorder.dispatch_1d(num_total_threads as usize, required_threads as usize);
     }
 }
 
-pub struct TopKReduceKernels {
-    specialization: TopKReduceKernelSpecialization,
+pub struct ReduceCompute {
+    constants: ReduceKernelConstants,
     sample: Kernel,
     write_distribution: Kernel,
     sample_and_write_distribution: Kernel,
 }
 
-impl TopKReduceKernels {
+impl ReduceCompute {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
-            specialization: TopKReduceKernelSpecialization::current(),
+            constants: ReduceKernelConstants::current(),
             sample: Kernel::new(device, SAMPLING_SOURCE, "top_k_sample_tiles"),
             write_distribution: Kernel::new(device, SAMPLING_SOURCE, "top_k_write_distribution_tiles"),
             sample_and_write_distribution: Kernel::new(
@@ -409,23 +462,19 @@ impl TopKReduceKernels {
         }
     }
 
-    pub fn invoke_sample<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSampleBuffers<'a>,
-    ) -> TopKSampleInvocation<'a> {
+    pub fn invoke_sample<'a>(&'a self, shape: Shape, buffers: SampleBuffers<'a>) -> SampleInvocation<'a> {
         self.invoke_sample_with_layout(shape, buffers, standard_partial_candidate_layout())
     }
 
     pub fn invoke_sample_with_layout<'a>(
         &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSampleBuffers<'a>,
-        partial_candidate_layout: TopKPartialCandidateLayout,
-    ) -> TopKSampleInvocation<'a> {
-        TopKSampleInvocation {
+        shape: Shape,
+        buffers: SampleBuffers<'a>,
+        partial_candidate_layout: PartialCandidateLayout,
+    ) -> SampleInvocation<'a> {
+        SampleInvocation {
             kernel: &self.sample,
-            specialization: self.specialization,
+            constants: self.constants,
             partial_candidate_layout,
             shape,
             buffers,
@@ -434,21 +483,21 @@ impl TopKReduceKernels {
 
     pub fn invoke_write_distribution<'a>(
         &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKWriteDistributionBuffers<'a>,
-    ) -> TopKWriteDistributionInvocation<'a> {
+        shape: Shape,
+        buffers: WriteDistributionBuffers<'a>,
+    ) -> WriteDistributionInvocation<'a> {
         self.invoke_write_distribution_with_layout(shape, buffers, standard_partial_candidate_layout())
     }
 
     pub fn invoke_write_distribution_with_layout<'a>(
         &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKWriteDistributionBuffers<'a>,
-        partial_candidate_layout: TopKPartialCandidateLayout,
-    ) -> TopKWriteDistributionInvocation<'a> {
-        TopKWriteDistributionInvocation {
+        shape: Shape,
+        buffers: WriteDistributionBuffers<'a>,
+        partial_candidate_layout: PartialCandidateLayout,
+    ) -> WriteDistributionInvocation<'a> {
+        WriteDistributionInvocation {
             kernel: &self.write_distribution,
-            specialization: self.specialization,
+            constants: self.constants,
             partial_candidate_layout,
             shape,
             buffers,
@@ -457,67 +506,46 @@ impl TopKReduceKernels {
 
     pub fn invoke_sample_and_write_distribution<'a>(
         &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSampleAndWriteDistributionBuffers<'a>,
-    ) -> TopKSampleAndWriteDistributionInvocation<'a> {
+        shape: Shape,
+        buffers: SampleAndWriteDistributionBuffers<'a>,
+    ) -> SampleAndWriteDistributionInvocation<'a> {
         self.invoke_sample_and_write_distribution_with_layout(shape, buffers, standard_partial_candidate_layout())
     }
 
     pub fn invoke_sample_and_write_distribution_with_layout<'a>(
         &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSampleAndWriteDistributionBuffers<'a>,
-        partial_candidate_layout: TopKPartialCandidateLayout,
-    ) -> TopKSampleAndWriteDistributionInvocation<'a> {
-        TopKSampleAndWriteDistributionInvocation {
+        shape: Shape,
+        buffers: SampleAndWriteDistributionBuffers<'a>,
+        partial_candidate_layout: PartialCandidateLayout,
+    ) -> SampleAndWriteDistributionInvocation<'a> {
+        SampleAndWriteDistributionInvocation {
             kernel: &self.sample_and_write_distribution,
-            specialization: self.specialization,
+            constants: self.constants,
             partial_candidate_layout,
             shape,
             buffers,
         }
     }
 
-    #[deprecated(note = "use invoke_sample_and_write_distribution_with_layout")]
-    pub fn invoke_sample_and_write_distribution_with_vocab_tile_size<'a>(
-        &'a self,
-        shape: TopKSampleShape,
-        buffers: TopKSampleAndWriteDistributionBuffers<'a>,
-        vocab_tile_size: u32,
-    ) -> TopKSampleAndWriteDistributionInvocation<'a> {
-        self.invoke_sample_and_write_distribution_with_layout(
-            shape,
-            buffers,
-            TopKPartialCandidateLayout::new(vocab_tile_size),
-        )
-    }
-
-    pub fn add_replay_arguments(
-        &self,
-        shape: TopKSampleShape,
-        num_active_sampling_inputs: u32,
-        arguments: &mut ReplayArguments,
-    ) {
+    pub fn add_replay_arguments(&self, shape: Shape, num_active_sampling_inputs: u32, arguments: &mut ReplayArguments) {
         add_top_k_reduce_replay_argument(
             shape,
             num_active_sampling_inputs,
-            self.specialization.thread_block.required_threads,
+            self.constants.thread_block.required_threads,
             arguments,
         );
     }
 }
 
-pub type TopKMergeKernels = TopKReduceKernels;
-
-pub struct TopKSampleInvocation<'a> {
+pub struct SampleInvocation<'a> {
     kernel: &'a Kernel,
-    specialization: TopKReduceKernelSpecialization,
-    partial_candidate_layout: TopKPartialCandidateLayout,
-    shape: TopKSampleShape,
-    buffers: TopKSampleBuffers<'a>,
+    constants: ReduceKernelConstants,
+    partial_candidate_layout: PartialCandidateLayout,
+    shape: Shape,
+    buffers: SampleBuffers<'a>,
 }
 
-impl Operator for TopKSampleInvocation<'_> {
+impl Operator for SampleInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate();
         assert_reduce_inputs_fit(
@@ -557,31 +585,26 @@ impl Operator for TopKSampleInvocation<'_> {
         recorder.set_u32(7, num_partitions);
         recorder.set_u32(8, num_candidates_per_partition);
         recorder.set_u32(9, self.partial_candidate_layout.vocab_partition_size());
-        let num_threads_per_row = self.specialization.thread_block.required_threads;
+        let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
         if num_threads_per_row == num_total_threads {
             recorder.set_u32(5, num_total_threads);
         } else {
-            recorder.bind_u32(
-                5,
-                TOP_K_REDUCE_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
+            recorder.bind_u32(5, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         }
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
 
-pub struct TopKWriteDistributionInvocation<'a> {
+pub struct WriteDistributionInvocation<'a> {
     kernel: &'a Kernel,
-    specialization: TopKReduceKernelSpecialization,
-    partial_candidate_layout: TopKPartialCandidateLayout,
-    shape: TopKSampleShape,
-    buffers: TopKWriteDistributionBuffers<'a>,
+    constants: ReduceKernelConstants,
+    partial_candidate_layout: PartialCandidateLayout,
+    shape: Shape,
+    buffers: WriteDistributionBuffers<'a>,
 }
 
-impl Operator for TopKWriteDistributionInvocation<'_> {
+impl Operator for WriteDistributionInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate();
         assert_reduce_inputs_fit(
@@ -644,31 +667,26 @@ impl Operator for TopKWriteDistributionInvocation<'_> {
         recorder.set_u32(10, self.partial_candidate_layout.vocab_partition_size());
         recorder.set_u32(11, self.buffers.max_k);
         recorder.set_u32(12, self.buffers.num_output_distributions);
-        let num_threads_per_row = self.specialization.thread_block.required_threads;
+        let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
         if num_threads_per_row == num_total_threads {
             recorder.set_u32(6, num_total_threads);
         } else {
-            recorder.bind_u32(
-                6,
-                TOP_K_REDUCE_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
+            recorder.bind_u32(6, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         }
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
 
-pub struct TopKSampleAndWriteDistributionInvocation<'a> {
+pub struct SampleAndWriteDistributionInvocation<'a> {
     kernel: &'a Kernel,
-    specialization: TopKReduceKernelSpecialization,
-    partial_candidate_layout: TopKPartialCandidateLayout,
-    shape: TopKSampleShape,
-    buffers: TopKSampleAndWriteDistributionBuffers<'a>,
+    constants: ReduceKernelConstants,
+    partial_candidate_layout: PartialCandidateLayout,
+    shape: Shape,
+    buffers: SampleAndWriteDistributionBuffers<'a>,
 }
 
-impl Operator for TopKSampleAndWriteDistributionInvocation<'_> {
+impl Operator for SampleAndWriteDistributionInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate();
         assert_reduce_inputs_fit(
@@ -751,24 +769,19 @@ impl Operator for TopKSampleAndWriteDistributionInvocation<'_> {
         recorder.set_u32(12, self.partial_candidate_layout.vocab_partition_size());
         recorder.set_u32(13, self.buffers.max_k);
         recorder.set_u32(14, self.buffers.num_output_distributions);
-        let num_threads_per_row = self.specialization.thread_block.required_threads;
+        let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
         if num_threads_per_row == num_total_threads {
             recorder.set_u32(8, num_total_threads);
         } else {
-            recorder.bind_u32(
-                8,
-                TOP_K_REDUCE_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
+            recorder.bind_u32(8, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         }
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
 
 fn add_top_k_reduce_replay_argument(
-    shape: TopKSampleShape,
+    shape: Shape,
     num_active_sampling_inputs: u32,
     required_threads: u32,
     arguments: &mut ReplayArguments,
@@ -784,7 +797,7 @@ fn add_top_k_reduce_replay_argument(
     let num_active_threads = checked_num_threads(num_active_sampling_inputs, required_threads);
     let num_total_threads = checked_num_threads(shape.num_total_sampling_inputs, required_threads);
     assert!(num_active_threads <= num_total_threads);
-    arguments.set_u32(TOP_K_REDUCE_NUM_ACTIVE_THREADS_KEY, num_active_threads);
+    arguments.set_u32(REDUCE_NUM_ACTIVE_THREADS_KEY, num_active_threads);
 }
 
 #[cfg(test)]

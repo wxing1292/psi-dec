@@ -1,13 +1,6 @@
 use std::mem::size_of;
 
-use inference_backend_metal::components::TopKMapBuffers;
-use inference_backend_metal::components::TopKMapKernels;
-use inference_backend_metal::components::TopKReduceKernels;
-use inference_backend_metal::components::TopKSampleAndWriteDistributionBuffers;
-use inference_backend_metal::components::TopKSampleBuffers;
-use inference_backend_metal::components::TopKSampleShape;
-use inference_backend_metal::components::TopKSamplingOperation;
-use inference_backend_metal::components::TopKWriteDistributionBuffers;
+use inference_backend_metal::components::sampling::top_k;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -24,15 +17,15 @@ use crate::def::replay_op::ReplayOp;
 use crate::sampling::RuntimeParamRows;
 
 struct TopKSamplingCompute {
-    map: TopKMapKernels,
-    reduce: TopKReduceKernels,
+    map: top_k::MapCompute,
+    reduce: top_k::ReduceCompute,
 }
 
 impl TopKSamplingCompute {
     fn new(device: &Device) -> Self {
         Self {
-            map: TopKMapKernels::new(device),
-            reduce: TopKReduceKernels::new(device),
+            map: top_k::MapCompute::new(device),
+            reduce: top_k::ReduceCompute::new(device),
         }
     }
 
@@ -45,7 +38,7 @@ impl TopKSamplingCompute {
         output: TopKSamplingOutput<'a>,
     ) {
         let shape = component_shape(shape);
-        let map_buffers = TopKMapBuffers {
+        let map_buffers = top_k::MapBuffers {
             logits: buffers.logits,
             logits_offset_bytes: buffers.logits_offset_bytes,
             tile_token_ids: buffers.partial_token_ids,
@@ -54,7 +47,7 @@ impl TopKSamplingCompute {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.map.invoke_replay(
             shape,
             logits_dtype,
-            TopKSamplingOperation::Sample,
+            top_k::Operation::Sample,
             map_buffers,
         )));
         self.record_reduce_sample(recorder, shape, buffers, output);
@@ -72,8 +65,8 @@ impl TopKSamplingCompute {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.map.invoke_replay(
             shape,
             logits_dtype,
-            TopKSamplingOperation::WriteDistribution,
-            TopKMapBuffers {
+            top_k::Operation::WriteDistribution,
+            top_k::MapBuffers {
                 logits: buffers.logits,
                 logits_offset_bytes: buffers.logits_offset_bytes,
                 tile_token_ids: buffers.partial_token_ids,
@@ -96,8 +89,8 @@ impl TopKSamplingCompute {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.map.invoke_replay(
             shape,
             logits_dtype,
-            TopKSamplingOperation::SampleAndWriteDistribution,
-            TopKMapBuffers {
+            top_k::Operation::SampleAndWriteDistribution,
+            top_k::MapBuffers {
                 logits: buffers.logits,
                 logits_offset_bytes: buffers.logits_offset_bytes,
                 tile_token_ids: buffers.partial_token_ids,
@@ -107,7 +100,7 @@ impl TopKSamplingCompute {
         recorder.record_with_barrier_before(ReplayOp::opaque(
             self.reduce.invoke_sample_and_write_distribution_with_layout(
                 shape,
-                TopKSampleAndWriteDistributionBuffers {
+                top_k::SampleAndWriteDistributionBuffers {
                     tile_token_ids: buffers.partial_token_ids,
                     tile_logits: buffers.partial_logits,
                     sampled_token_ids: sample_output.sampled_token_ids,
@@ -127,13 +120,13 @@ impl TopKSamplingCompute {
     fn record_reduce_sample<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        shape: TopKSampleShape,
+        shape: top_k::Shape,
         buffers: TopKSamplingComputeBuffers<'a>,
         output: TopKSamplingOutput<'a>,
     ) {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.reduce.invoke_sample_with_layout(
             shape,
-            TopKSampleBuffers {
+            top_k::SampleBuffers {
                 tile_token_ids: buffers.partial_token_ids,
                 tile_logits: buffers.partial_logits,
                 token_ids: output.sampled_token_ids,
@@ -147,13 +140,13 @@ impl TopKSamplingCompute {
     fn record_reduce_write_distribution<'a>(
         &'a self,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        shape: TopKSampleShape,
+        shape: top_k::Shape,
         buffers: TopKSamplingComputeBuffers<'a>,
         output: TopKSamplingWriteDistributionOutput<'a>,
     ) {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.reduce.invoke_write_distribution_with_layout(
             shape,
-            TopKWriteDistributionBuffers {
+            top_k::WriteDistributionBuffers {
                 tile_token_ids: buffers.partial_token_ids,
                 tile_logits: buffers.partial_logits,
                 distribution_token_ids: output.token_ids,
@@ -183,7 +176,7 @@ struct TopKSamplingScratch {
 }
 
 impl TopKSamplingScratch {
-    fn new(device: &Device, bounds: TopKSamplingBounds, map: &TopKMapKernels) -> Self {
+    fn new(device: &Device, bounds: TopKSamplingBounds, map: &top_k::MapCompute) -> Self {
         let max_shape = bounds.max_shape();
         let candidate_count = map.candidate_count(component_shape(max_shape));
         Self {
@@ -463,8 +456,8 @@ pub struct TopKSamplingOutput<'a> {
     pub sampled_token_probs: &'a Buffer,
 }
 
-fn component_shape(shape: TopKSamplingShape) -> TopKSampleShape {
-    TopKSampleShape {
+fn component_shape(shape: TopKSamplingShape) -> top_k::Shape {
+    top_k::Shape {
         num_total_sampling_inputs: shape.num_total_sampling_inputs,
         vocab_size: shape.vocab_size,
         top_k: shape.top_k,

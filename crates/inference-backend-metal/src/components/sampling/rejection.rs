@@ -13,32 +13,31 @@ use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SparseRejectionSampleThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SparseRejectionSampleKernelSpecialization {
-    thread_block: SparseRejectionSampleThreadBlockSpecialization,
+struct KernelConstants {
+    thread_block: ThreadBlockConstants,
 }
 
-impl SparseRejectionSampleKernelSpecialization {
+impl KernelConstants {
     fn current() -> Self {
         Self {
-            thread_block: SparseRejectionSampleThreadBlockSpecialization { required_threads: 256 },
+            thread_block: ThreadBlockConstants { required_threads: 256 },
         }
     }
 }
 
-pub const REJECTION_NUM_ACTIVE_THREADS_KEY: ReplayParameterKey =
-    ReplayParameterKey::new("rejection_sampling.num_active_threads");
-pub const REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY: ReplayParameterKey =
+const NUM_ACTIVE_THREADS_KEY: ReplayParameterKey = ReplayParameterKey::new("rejection_sampling.num_active_threads");
+const NUM_TARGET_DISTRIBUTIONS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("rejection_sampling.num_active_target_distributions");
-pub const REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY: ReplayParameterKey =
+const NUM_DRAFT_DISTRIBUTIONS_KEY: ReplayParameterKey =
     ReplayParameterKey::new("rejection_sampling.num_active_draft_distributions");
 
 #[derive(Clone, Copy, Debug)]
-pub struct SparseRejectionSampleShape {
+pub struct Shape {
     pub num_total_reqs: u32,
     pub num_total_draft_distributions: u32,
     pub num_total_target_distributions: u32,
@@ -47,7 +46,7 @@ pub struct SparseRejectionSampleShape {
     pub max_draft_k: u32,
 }
 
-impl SparseRejectionSampleShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_reqs > 0);
         assert!(self.num_total_target_distributions > 0);
@@ -63,7 +62,7 @@ impl SparseRejectionSampleShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct SparseRejectionSampleBuffers<'a> {
+pub struct Buffers<'a> {
     pub target_distribution_token_ids: &'a Buffer,
     pub target_distribution_probs: &'a Buffer,
     pub draft_distribution_token_ids: &'a Buffer,
@@ -80,25 +79,21 @@ pub struct SparseRejectionSampleBuffers<'a> {
     pub runtime_params: &'a Buffer,
 }
 
-pub struct SparseRejectionSampleKernel {
-    specialization: SparseRejectionSampleKernelSpecialization,
+pub struct Compute {
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl SparseRejectionSampleKernel {
+impl Compute {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
-            specialization: SparseRejectionSampleKernelSpecialization::current(),
+            constants: KernelConstants::current(),
             kernel: Kernel::new(device, SAMPLING_SOURCE, "rejection_sparse_sample"),
         }
     }
 
-    pub fn invoke_replay<'a>(
-        &'a self,
-        shape: SparseRejectionSampleShape,
-        buffers: SparseRejectionSampleBuffers<'a>,
-    ) -> SparseRejectionSampleInvocation<'a> {
-        SparseRejectionSampleInvocation {
+    pub fn invoke_replay<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             kernel: self,
             shape,
             buffers,
@@ -107,7 +102,7 @@ impl SparseRejectionSampleKernel {
 
     pub fn add_replay_arguments(
         &self,
-        shape: SparseRejectionSampleShape,
+        shape: Shape,
         num_active_reqs: u32,
         num_active_target_distributions: u32,
         num_active_draft_distributions: u32,
@@ -129,26 +124,26 @@ impl SparseRejectionSampleKernel {
         );
         if shape.num_total_reqs > 1 {
             arguments.set_u32(
-                REJECTION_NUM_ACTIVE_THREADS_KEY,
-                checked_num_threads(num_active_reqs, self.specialization.thread_block.required_threads),
+                NUM_ACTIVE_THREADS_KEY,
+                checked_num_threads(num_active_reqs, self.constants.thread_block.required_threads),
             );
         }
         if shape.num_total_target_distributions > 1 {
-            arguments.set_u32(REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY, num_active_target_distributions);
+            arguments.set_u32(NUM_TARGET_DISTRIBUTIONS_KEY, num_active_target_distributions);
         }
         if shape.num_total_draft_distributions > 0 {
-            arguments.set_u32(REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY, num_active_draft_distributions);
+            arguments.set_u32(NUM_DRAFT_DISTRIBUTIONS_KEY, num_active_draft_distributions);
         }
     }
 }
 
-pub struct SparseRejectionSampleInvocation<'a> {
-    kernel: &'a SparseRejectionSampleKernel,
-    shape: SparseRejectionSampleShape,
-    buffers: SparseRejectionSampleBuffers<'a>,
+pub struct Invocation<'a> {
+    kernel: &'a Compute,
+    shape: Shape,
+    buffers: Buffers<'a>,
 }
 
-impl Operator for SparseRejectionSampleInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate();
         let num_target_slots = checked_product(
@@ -307,24 +302,19 @@ impl Operator for SparseRejectionSampleInvocation<'_> {
         recorder.set_u32(17, self.shape.top_k);
         recorder.set_u32(18, self.shape.max_target_k);
         recorder.set_u32(19, self.shape.max_draft_k);
-        let num_threads_per_req = self.kernel.specialization.thread_block.required_threads;
+        let num_threads_per_req = self.kernel.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_reqs, num_threads_per_req);
         if num_threads_per_req == num_total_threads {
             recorder.set_u32(14, num_total_threads);
         } else {
-            recorder.bind_u32(
-                14,
-                REJECTION_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_req,
-                num_total_threads,
-            );
+            recorder.bind_u32(14, NUM_ACTIVE_THREADS_KEY, num_threads_per_req, num_total_threads);
         }
         if self.shape.num_total_target_distributions == 1 {
             recorder.set_u32(15, 1);
         } else {
             recorder.bind_u32(
                 15,
-                REJECTION_NUM_TARGET_DISTRIBUTIONS_KEY,
+                NUM_TARGET_DISTRIBUTIONS_KEY,
                 1,
                 self.shape.num_total_target_distributions,
             );
@@ -334,7 +324,7 @@ impl Operator for SparseRejectionSampleInvocation<'_> {
         } else {
             recorder.bind_u32(
                 16,
-                REJECTION_NUM_DRAFT_DISTRIBUTIONS_KEY,
+                NUM_DRAFT_DISTRIBUTIONS_KEY,
                 0,
                 self.shape.num_total_draft_distributions,
             );

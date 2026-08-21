@@ -1,7 +1,6 @@
 use half::bf16;
 use inference_backend_metal::MetalRuntime;
-use inference_backend_metal::components::DSparkConfidenceConfig;
-use inference_backend_metal::components::DSparkMarkovTopKMapConfig;
+use inference_backend_metal::components::sampling::dspark_markov as backend_dspark_markov;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
@@ -43,7 +42,7 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         vocab_size: VOCAB_SIZE as u32,
         top_k: 4,
     };
-    let map_config = DSparkMarkovTopKMapConfig {
+    let map_config = backend_dspark_markov::MapConfig {
         vocab_size: VOCAB_SIZE as u32,
         rank: RANK as u32,
         w1_group_size: RANK as u32,
@@ -52,7 +51,7 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         w2_bits: 8,
         io_dtype: Dtype::Bfloat16,
         scale_bias_dtype: Dtype::Bfloat16,
-        confidence: DSparkConfidenceConfig {
+        confidence: backend_dspark_markov::ConfidenceConfig {
             hidden_dim: HIDDEN_DIM as u32,
         },
     };

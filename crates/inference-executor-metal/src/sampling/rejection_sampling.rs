@@ -1,6 +1,4 @@
-use inference_backend_metal::components::SparseRejectionSampleBuffers;
-use inference_backend_metal::components::SparseRejectionSampleKernel;
-use inference_backend_metal::components::SparseRejectionSampleShape;
+use inference_backend_metal::components::sampling::rejection;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -23,7 +21,7 @@ pub struct SparseRejectionSamplingOutput<'a> {
 }
 
 pub struct SparseRejectionSampling {
-    kernel: SparseRejectionSampleKernel,
+    kernel: rejection::Compute,
     bounds: SparseRejectionSamplingBounds,
     runtime_params: Buffer,
     runtime_param_rows: RuntimeParamRows,
@@ -33,7 +31,7 @@ impl SparseRejectionSampling {
     pub fn new(device: &Device, bounds: SparseRejectionSamplingBounds) -> Self {
         bounds.validate();
         Self {
-            kernel: SparseRejectionSampleKernel::new(device),
+            kernel: rejection::Compute::new(device),
             bounds,
             runtime_params: Buffer::new_zeroed_elements(
                 device,
@@ -79,7 +77,7 @@ impl SparseRejectionSampling {
         self.validate_input(shape);
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke_replay(
             component_shape(shape),
-            SparseRejectionSampleBuffers {
+            rejection::Buffers {
                 target_distribution_token_ids: inputs.target_distribution_token_ids,
                 target_distribution_probs: inputs.target_distribution_probs,
                 draft_distribution_token_ids: inputs.draft_distribution_token_ids,
@@ -148,8 +146,8 @@ impl SparseRejectionSampling {
     }
 }
 
-fn component_shape(shape: SparseRejectionSamplingShape) -> SparseRejectionSampleShape {
-    SparseRejectionSampleShape {
+fn component_shape(shape: SparseRejectionSamplingShape) -> rejection::Shape {
+    rejection::Shape {
         num_total_reqs: shape.num_total_reqs,
         num_total_draft_distributions: shape.num_total_draft_distributions,
         num_total_target_distributions: shape.num_total_target_distributions,

@@ -4,14 +4,14 @@ use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::reference::sparse_sample_row_reference;
 use inference_executor_core::sampling::reference::sparse_sample_row_with_domain_reference;
 
-use crate::components::TopKMapBuffers;
-use crate::components::TopKMapKernels;
-use crate::components::TopKReduceKernels;
-use crate::components::TopKSampleAndWriteDistributionBuffers;
-use crate::components::TopKSampleBuffers;
-use crate::components::TopKSampleShape;
-use crate::components::TopKSamplingOperation;
-use crate::components::TopKWriteDistributionBuffers;
+use super::MapBuffers;
+use super::MapCompute;
+use super::Operation;
+use super::ReduceCompute;
+use super::SampleAndWriteDistributionBuffers;
+use super::SampleBuffers;
+use super::Shape;
+use super::WriteDistributionBuffers;
 use crate::metal::Buffer;
 use crate::metal::Device;
 use crate::metal::ReplayArguments;
@@ -47,59 +47,47 @@ fn write_sampling_runtime_params(
 }
 
 #[test]
-fn test_map_kernel_specialization_selection() {
-    let thread_block = super::TopKMapThreadBlockSpecialization::current();
+fn test_map_variant_selection() {
+    let thread_block = super::MapThreadBlockConstants::current();
     assert_eq!(thread_block.max_vocab_tokens, 256);
     assert_eq!(thread_block.required_threads, 256);
     assert_eq!(super::standard_partial_candidate_layout().vocab_partition_size(), 256);
-    let reduction_shape = TopKSampleShape {
+    let reduction_shape = Shape {
         num_total_sampling_inputs: 1,
         vocab_size: 256,
         top_k: 20,
     };
-    let bitonic_shape = TopKSampleShape {
+    let bitonic_shape = Shape {
         top_k: 64,
         ..reduction_shape
     };
     assert_eq!(
-        super::TopKMapKernelSpecialization::select(
-            reduction_shape,
-            crate::metal::Dtype::Float32,
-            TopKSamplingOperation::Sample,
-        )
-        .algorithm,
-        super::TopKMapAlgorithm::Reduction
+        super::Selector::key(reduction_shape, crate::metal::Dtype::Float32, Operation::Sample),
+        super::VariantKey::F32Reduction
     );
     assert_eq!(
-        super::TopKMapKernelSpecialization::select(
-            bitonic_shape,
-            crate::metal::Dtype::Float32,
-            TopKSamplingOperation::Sample,
-        )
-        .algorithm,
-        super::TopKMapAlgorithm::Bitonic
+        super::Selector::key(bitonic_shape, crate::metal::Dtype::Float32, Operation::Sample),
+        super::VariantKey::F32Bitonic
     );
     assert_eq!(
-        super::TopKMapKernelSpecialization::select(
+        super::Selector::key(
             reduction_shape,
             crate::metal::Dtype::Float32,
-            TopKSamplingOperation::WriteDistribution,
-        )
-        .algorithm,
-        super::TopKMapAlgorithm::Bitonic
+            Operation::WriteDistribution,
+        ),
+        super::VariantKey::F32Bitonic
     );
     assert_eq!(
-        super::TopKMapKernelSpecialization::select(
+        super::Selector::key(
             reduction_shape,
             crate::metal::Dtype::Float32,
-            TopKSamplingOperation::SampleAndWriteDistribution,
-        )
-        .algorithm,
-        super::TopKMapAlgorithm::Bitonic
+            Operation::SampleAndWriteDistribution,
+        ),
+        super::VariantKey::F32Bitonic
     );
 }
 
-fn partial_candidate_count(shape: TopKSampleShape) -> usize {
+fn partial_candidate_count(shape: Shape) -> usize {
     super::partial_candidate_count(shape, super::standard_partial_candidate_layout())
 }
 
@@ -107,7 +95,7 @@ fn partial_candidate_count(shape: TopKSampleShape) -> usize {
 fn test_sample_mixed_runtime_params_and_bucket_reuse() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = TopKSampleShape {
+    let shape = Shape {
         num_total_sampling_inputs: 3,
         vocab_size: 17,
         top_k: 5,
@@ -127,9 +115,9 @@ fn test_sample_mixed_runtime_params_and_bucket_reuse() {
     let tile_logits = Buffer::from_slice(&device, &vec![tile_logit_canary; num_tile_candidates]);
     let token_ids = Buffer::from_slice(&device, &[output_token_canary; 3]);
     let token_probs = Buffer::from_slice(&device, &[output_prob_canary; 3]);
-    let topk = TopKMapKernels::new(&device);
+    let topk = MapCompute::new(&device);
     let logits_dtype = crate::metal::Dtype::Float32;
-    let sample = TopKReduceKernels::new(&device);
+    let sample = ReduceCompute::new(&device);
     let runtime_params = Buffer::new_zeroed(&device, 3 * 6 * size_of::<u32>());
     let configs = [
         SamplerConfig {
@@ -161,8 +149,8 @@ fn test_sample_mixed_runtime_params_and_bucket_reuse() {
     builder.record(topk.invoke_replay(
         shape,
         logits_dtype,
-        TopKSamplingOperation::Sample,
-        TopKMapBuffers {
+        Operation::Sample,
+        MapBuffers {
             logits: &logits,
             logits_offset_bytes: 0,
             tile_token_ids: &tile_token_ids,
@@ -171,7 +159,7 @@ fn test_sample_mixed_runtime_params_and_bucket_reuse() {
     ));
     builder.record_with_barrier_before(sample.invoke_sample(
         shape,
-        TopKSampleBuffers {
+        SampleBuffers {
             tile_token_ids: &tile_token_ids,
             tile_logits: &tile_logits,
             token_ids: &token_ids,
@@ -243,7 +231,7 @@ fn test_sample_mixed_runtime_params_and_bucket_reuse() {
 fn test_row_offset() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = TopKSampleShape {
+    let shape = Shape {
         num_total_sampling_inputs: 1,
         vocab_size: 4,
         top_k: 1,
@@ -257,14 +245,14 @@ fn test_row_offset() {
     );
     let tile_token_ids = Buffer::new_zeroed(&device, partial_candidate_count(shape) * size_of::<i32>());
     let tile_logits = Buffer::new_zeroed(&device, partial_candidate_count(shape) * size_of::<f32>());
-    let topk = TopKMapKernels::new(&device);
+    let topk = MapCompute::new(&device);
     let logits_dtype = crate::metal::Dtype::Float32;
     let mut builder = stream.create_replay_program();
     builder.record(topk.invoke_replay(
         shape,
         logits_dtype,
-        TopKSamplingOperation::Sample,
-        TopKMapBuffers {
+        Operation::Sample,
+        MapBuffers {
             logits: &logits,
             logits_offset_bytes: shape.vocab_size as usize * size_of::<f32>(),
             tile_token_ids: &tile_token_ids,
@@ -283,7 +271,7 @@ fn test_row_offset() {
 fn test_fused_distribution() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = TopKSampleShape {
+    let shape = Shape {
         num_total_sampling_inputs: 2,
         vocab_size: 8,
         top_k: 4,
@@ -318,15 +306,15 @@ fn test_fused_distribution() {
     write_sampling_runtime_params(&runtime_params, 0, &configs[0], 11, SamplingDomain::Target);
     write_sampling_runtime_params(&runtime_params, 1, &configs[1], 29, SamplingDomain::Draft);
 
-    let topk = TopKMapKernels::new(&device);
+    let topk = MapCompute::new(&device);
     let logits_dtype = crate::metal::Dtype::Float32;
-    let sample_and_write_distribution = TopKReduceKernels::new(&device);
+    let sample_and_write_distribution = ReduceCompute::new(&device);
     let mut builder = stream.create_replay_program();
     builder.record(topk.invoke_replay(
         shape,
         logits_dtype,
-        TopKSamplingOperation::SampleAndWriteDistribution,
-        TopKMapBuffers {
+        Operation::SampleAndWriteDistribution,
+        MapBuffers {
             logits: &logits,
             logits_offset_bytes: 0,
             tile_token_ids: &tile_token_ids,
@@ -335,7 +323,7 @@ fn test_fused_distribution() {
     ));
     builder.record_with_barrier_before(sample_and_write_distribution.invoke_sample_and_write_distribution(
         shape,
-        TopKSampleAndWriteDistributionBuffers {
+        SampleAndWriteDistributionBuffers {
             tile_token_ids: &tile_token_ids,
             tile_logits: &tile_logits,
             sampled_token_ids: &sampled_token_ids,
@@ -388,7 +376,7 @@ fn test_fused_distribution() {
 fn test_distribution_slots() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = TopKSampleShape {
+    let shape = Shape {
         num_total_sampling_inputs: 3,
         vocab_size: 17,
         top_k: 5,
@@ -418,9 +406,9 @@ fn test_distribution_slots() {
         &device,
         num_output_distributions as usize * max_k as usize * size_of::<f32>(),
     );
-    let topk = TopKMapKernels::new(&device);
+    let topk = MapCompute::new(&device);
     let logits_dtype = crate::metal::Dtype::Float32;
-    let write_distribution = TopKReduceKernels::new(&device);
+    let write_distribution = ReduceCompute::new(&device);
     let temperature = 0.9;
     let top_p = 0.82;
     let runtime_params = sampling_runtime_params(
@@ -436,8 +424,8 @@ fn test_distribution_slots() {
     builder.record(topk.invoke_replay(
         shape,
         logits_dtype,
-        TopKSamplingOperation::WriteDistribution,
-        TopKMapBuffers {
+        Operation::WriteDistribution,
+        MapBuffers {
             logits: &logits,
             logits_offset_bytes: 0,
             tile_token_ids: &tile_token_ids,
@@ -446,7 +434,7 @@ fn test_distribution_slots() {
     ));
     builder.record_with_barrier_before(write_distribution.invoke_write_distribution(
         shape,
-        TopKWriteDistributionBuffers {
+        WriteDistributionBuffers {
             tile_token_ids: &tile_token_ids,
             tile_logits: &tile_logits,
             distribution_token_ids: &distribution_token_ids,
@@ -495,7 +483,7 @@ fn test_distribution_slots() {
 fn test_bf16_reduction() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = TopKSampleShape {
+    let shape = Shape {
         num_total_sampling_inputs: 2,
         vocab_size: 257,
         top_k: 20,
@@ -511,9 +499,9 @@ fn test_bf16_reduction() {
     let tile_logits = Buffer::new_zeroed(&device, partial_candidate_count(shape) * size_of::<f32>());
     let token_ids = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<i32>());
     let token_probs = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<f32>());
-    let topk = TopKMapKernels::new(&device);
+    let topk = MapCompute::new(&device);
     let logits_dtype = crate::metal::Dtype::Bfloat16;
-    let sample = TopKReduceKernels::new(&device);
+    let sample = ReduceCompute::new(&device);
     let temperature = 0.7;
     let top_p = 0.8;
     let runtime_params = sampling_runtime_params(
@@ -529,8 +517,8 @@ fn test_bf16_reduction() {
     builder.record(topk.invoke_replay(
         shape,
         logits_dtype,
-        TopKSamplingOperation::Sample,
-        TopKMapBuffers {
+        Operation::Sample,
+        MapBuffers {
             logits: &logits,
             logits_offset_bytes: 0,
             tile_token_ids: &tile_token_ids,
@@ -539,7 +527,7 @@ fn test_bf16_reduction() {
     ));
     builder.record_with_barrier_before(sample.invoke_sample(
         shape,
-        TopKSampleBuffers {
+        SampleBuffers {
             tile_token_ids: &tile_token_ids,
             tile_logits: &tile_logits,
             token_ids: &token_ids,
@@ -571,7 +559,7 @@ fn test_bf16_reduction() {
 fn test_f32_bitonic() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = TopKSampleShape {
+    let shape = Shape {
         num_total_sampling_inputs: 2,
         vocab_size: 257,
         top_k: 64,
@@ -587,9 +575,9 @@ fn test_f32_bitonic() {
     let tile_logits = Buffer::new_zeroed(&device, partial_candidate_count(shape) * size_of::<f32>());
     let token_ids = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<i32>());
     let token_probs = Buffer::new_zeroed(&device, shape.num_total_sampling_inputs as usize * size_of::<f32>());
-    let topk = TopKMapKernels::new(&device);
+    let topk = MapCompute::new(&device);
     let logits_dtype = crate::metal::Dtype::Float32;
-    let sample = TopKReduceKernels::new(&device);
+    let sample = ReduceCompute::new(&device);
     let temperature = 0.7;
     let top_p = 0.8;
     let runtime_params = sampling_runtime_params(
@@ -605,8 +593,8 @@ fn test_f32_bitonic() {
     builder.record(topk.invoke_replay(
         shape,
         logits_dtype,
-        TopKSamplingOperation::Sample,
-        TopKMapBuffers {
+        Operation::Sample,
+        MapBuffers {
             logits: &logits,
             logits_offset_bytes: 0,
             tile_token_ids: &tile_token_ids,
@@ -615,7 +603,7 @@ fn test_f32_bitonic() {
     ));
     builder.record_with_barrier_before(sample.invoke_sample(
         shape,
-        TopKSampleBuffers {
+        SampleBuffers {
             tile_token_ids: &tile_token_ids,
             tile_logits: &tile_logits,
             token_ids: &token_ids,
@@ -658,7 +646,7 @@ fn test_f32_bitonic() {
 fn test_bf16_bitonic_distribution() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let shape = TopKSampleShape {
+    let shape = Shape {
         num_total_sampling_inputs: 2,
         vocab_size: 257,
         top_k: 64,
@@ -681,9 +669,9 @@ fn test_bf16_bitonic_distribution() {
     );
     let output_distribution_indices =
         Buffer::from_slice(&device, &(0..shape.num_total_sampling_inputs).collect::<Vec<_>>());
-    let topk = TopKMapKernels::new(&device);
+    let topk = MapCompute::new(&device);
     let logits_dtype = crate::metal::Dtype::Bfloat16;
-    let write_distribution = TopKReduceKernels::new(&device);
+    let write_distribution = ReduceCompute::new(&device);
     let temperature = 0.7;
     let top_p = 0.8;
     let runtime_params = sampling_runtime_params(
@@ -699,8 +687,8 @@ fn test_bf16_bitonic_distribution() {
     builder.record(topk.invoke_replay(
         shape,
         logits_dtype,
-        TopKSamplingOperation::WriteDistribution,
-        TopKMapBuffers {
+        Operation::WriteDistribution,
+        MapBuffers {
             logits: &logits,
             logits_offset_bytes: 0,
             tile_token_ids: &tile_token_ids,
@@ -709,7 +697,7 @@ fn test_bf16_bitonic_distribution() {
     ));
     builder.record_with_barrier_before(write_distribution.invoke_write_distribution(
         shape,
-        TopKWriteDistributionBuffers {
+        WriteDistributionBuffers {
             tile_token_ids: &tile_token_ids,
             tile_logits: &tile_logits,
             distribution_token_ids: &distribution_token_ids,
@@ -769,7 +757,7 @@ fn bf16_rounded_logits(values: &[f32]) -> Vec<f32> {
 }
 
 fn assert_sample_matches_bf16_reference(
-    shape: TopKSampleShape,
+    shape: Shape,
     logits_values: &[f32],
     actual_tokens: &[i32],
     actual_probs: &[f32],
