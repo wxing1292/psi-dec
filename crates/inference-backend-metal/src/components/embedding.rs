@@ -11,26 +11,26 @@ use crate::metal::ReplayParameterKey;
 const QUANTIZED_EMBEDDING_SOURCE: &str = include_str!("metal/quantized_embedding.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QuantizedEmbeddingThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QuantizedEmbeddingKernelSpecialization {
+struct KernelConstants {
     scale_bias_dtype: Dtype,
     output_dtype: Dtype,
-    thread_block: QuantizedEmbeddingThreadBlockSpecialization,
+    thread_block: ThreadBlockConstants,
 }
 
-impl QuantizedEmbeddingKernelSpecialization {
-    fn new(config: QuantizedEmbeddingConfig) -> Self {
-        let specialization = Self {
+impl KernelConstants {
+    fn new(config: Config) -> Self {
+        let constants = Self {
             scale_bias_dtype: config.scale_bias_dtype,
             output_dtype: config.output_dtype,
-            thread_block: QuantizedEmbeddingThreadBlockSpecialization { required_threads: 256 },
+            thread_block: ThreadBlockConstants { required_threads: 256 },
         };
-        specialization.validate();
-        specialization
+        constants.validate();
+        constants
     }
 
     fn validate(self) {
@@ -41,7 +41,7 @@ impl QuantizedEmbeddingKernelSpecialization {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct QuantizedEmbeddingConfig {
+pub struct Config {
     pub vocab_size: u32,
     pub hidden_dim: u32,
     pub group_size: u32,
@@ -50,7 +50,7 @@ pub struct QuantizedEmbeddingConfig {
     pub output_dtype: Dtype,
 }
 
-impl QuantizedEmbeddingConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.vocab_size > 0);
         assert!(self.hidden_dim > 0);
@@ -99,16 +99,16 @@ impl QuantizedEmbeddingConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QuantizedEmbeddingShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl QuantizedEmbeddingShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_tokens > 0);
     }
 
-    pub fn num_output_values(self, config: QuantizedEmbeddingConfig) -> usize {
+    pub fn num_output_values(self, config: Config) -> usize {
         self.validate();
         self.num_total_tokens
             .checked_mul(config.hidden_dim)
@@ -117,7 +117,7 @@ impl QuantizedEmbeddingShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct QuantizedEmbeddingBuffers<'a> {
+pub struct Buffers<'a> {
     pub token_ids: &'a Buffer,
     pub weight: &'a Buffer,
     pub scales: &'a Buffer,
@@ -125,34 +125,30 @@ pub struct QuantizedEmbeddingBuffers<'a> {
     pub output: &'a Buffer,
 }
 
-pub struct QuantizedEmbeddingKernel {
-    config: QuantizedEmbeddingConfig,
-    specialization: QuantizedEmbeddingKernelSpecialization,
+pub struct Compute {
+    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl QuantizedEmbeddingKernel {
-    pub fn new(device: &Device, config: QuantizedEmbeddingConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
-        let specialization = QuantizedEmbeddingKernelSpecialization::new(config);
-        let function_name = match specialization.scale_bias_dtype {
+        let constants = KernelConstants::new(config);
+        let function_name = match constants.scale_bias_dtype {
             Dtype::Float32 => "quantized_embedding_f32_to_bf16",
             Dtype::Bfloat16 => "quantized_embedding_bf16_to_bf16",
             _ => unreachable!("validated quantized embedding scale/bias dtype"),
         };
         Self {
             config,
-            specialization,
+            constants,
             kernel: Kernel::new(device, QUANTIZED_EMBEDDING_SOURCE, function_name),
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: QuantizedEmbeddingShape,
-        buffers: QuantizedEmbeddingBuffers<'a>,
-    ) -> QuantizedEmbeddingInvocation<'a> {
-        QuantizedEmbeddingInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             kernel: self,
             shape,
             buffers,
@@ -163,11 +159,11 @@ impl QuantizedEmbeddingKernel {
     /// Records a fixed-capacity grid whose active token count is supplied at submission.
     pub fn invoke_bucketed<'a>(
         &'a self,
-        capacity_shape: QuantizedEmbeddingShape,
+        capacity_shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: QuantizedEmbeddingBuffers<'a>,
-    ) -> QuantizedEmbeddingInvocation<'a> {
-        QuantizedEmbeddingInvocation {
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             kernel: self,
             shape: capacity_shape,
             buffers,
@@ -176,14 +172,14 @@ impl QuantizedEmbeddingKernel {
     }
 }
 
-pub struct QuantizedEmbeddingInvocation<'a> {
-    kernel: &'a QuantizedEmbeddingKernel,
-    shape: QuantizedEmbeddingShape,
-    buffers: QuantizedEmbeddingBuffers<'a>,
+pub struct Invocation<'a> {
+    kernel: &'a Compute,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for QuantizedEmbeddingInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate();
         validate_buffers(self.kernel.config, self.shape, &self.buffers);
@@ -202,7 +198,7 @@ impl Operator for QuantizedEmbeddingInvocation<'_> {
         recorder.set_u32(7, config.hidden_dim);
         recorder.set_u32(8, config.group_size);
         recorder.set_u32(9, config.bits);
-        let required_threads = self.kernel.specialization.thread_block.required_threads as usize;
+        let required_threads = self.kernel.constants.thread_block.required_threads as usize;
         recorder.dispatch_threadblocks(
             (self.shape.num_output_values(config).div_ceil(required_threads), 1, 1),
             (required_threads, 1, 1),
@@ -210,11 +206,7 @@ impl Operator for QuantizedEmbeddingInvocation<'_> {
     }
 }
 
-fn validate_buffers(
-    config: QuantizedEmbeddingConfig,
-    shape: QuantizedEmbeddingShape,
-    buffers: &QuantizedEmbeddingBuffers<'_>,
-) {
+fn validate_buffers(config: Config, shape: Shape, buffers: &Buffers<'_>) {
     shape.validate();
     let affine_param_bytes = config
         .num_affine_params_unchecked()
@@ -235,11 +227,11 @@ fn validate_buffers(
 mod tests {
     use half::bf16;
 
-    use super::QuantizedEmbeddingBuffers;
-    use super::QuantizedEmbeddingConfig;
-    use super::QuantizedEmbeddingKernel;
-    use super::QuantizedEmbeddingKernelSpecialization;
-    use super::QuantizedEmbeddingShape;
+    use super::Buffers;
+    use super::Compute;
+    use super::Config;
+    use super::KernelConstants;
+    use super::Shape;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
@@ -255,8 +247,8 @@ mod tests {
     const OUTPUT_CANARY: u16 = 0x7fc1;
 
     #[test]
-    fn test_specialization_has_explicit_thread_block_scope() {
-        let specialization = QuantizedEmbeddingKernelSpecialization::new(QuantizedEmbeddingConfig {
+    fn test_constants_have_explicit_thread_block_scope() {
+        let constants = KernelConstants::new(Config {
             vocab_size: VOCAB_SIZE,
             hidden_dim: HIDDEN_DIM,
             group_size: GROUP_SIZE,
@@ -264,15 +256,15 @@ mod tests {
             scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         });
-        assert_eq!(specialization.scale_bias_dtype, Dtype::Bfloat16);
-        assert_eq!(specialization.output_dtype, Dtype::Bfloat16);
-        assert_eq!(specialization.thread_block.required_threads, 256);
+        assert_eq!(constants.scale_bias_dtype, Dtype::Bfloat16);
+        assert_eq!(constants.output_dtype, Dtype::Bfloat16);
+        assert_eq!(constants.thread_block.required_threads, 256);
     }
 
     #[test]
     #[should_panic(expected = "F32 quantized embedding output is not implemented")]
     fn test_f32_output_is_explicit_future_work() {
-        QuantizedEmbeddingConfig {
+        Config {
             vocab_size: VOCAB_SIZE,
             hidden_dim: HIDDEN_DIM,
             group_size: GROUP_SIZE,
@@ -315,7 +307,7 @@ mod tests {
         let stream = Stream::new(&device);
         let scales = [0.5f32, 0.25];
         let biases = [-1.0f32, 2.0];
-        let config = QuantizedEmbeddingConfig {
+        let config = Config {
             vocab_size: VOCAB_SIZE,
             hidden_dim: HIDDEN_DIM,
             group_size: GROUP_SIZE,
@@ -323,19 +315,19 @@ mod tests {
             scale_bias_dtype: Dtype::Float32,
             output_dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedEmbeddingShape { num_total_tokens: 4 };
+        let shape = Shape { num_total_tokens: 4 };
         let token_ids = Buffer::from_slice(&device, &[0_u32, 1, 0, u32::MAX]);
         let weight = Buffer::from_slice(&device, &packed_q4_rows());
         let scales_buffer = Buffer::from_slice(&device, &f32_bytes(&scales));
         let biases_buffer = Buffer::from_slice(&device, &f32_bytes(&biases));
         let output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; shape.num_output_values(config)]);
-        let kernel = QuantizedEmbeddingKernel::new(&device, config);
+        let kernel = Compute::new(&device, config);
 
         let mut recorder = stream.create_replay_program();
         recorder.record(kernel.invoke_bucketed(
             shape,
             NUM_ACTIVE_TOKENS,
-            QuantizedEmbeddingBuffers {
+            Buffers {
                 token_ids: &token_ids,
                 weight: &weight,
                 scales: &scales_buffer,
@@ -384,7 +376,7 @@ mod tests {
     ) {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = QuantizedEmbeddingConfig {
+        let config = Config {
             vocab_size: VOCAB_SIZE,
             hidden_dim: HIDDEN_DIM,
             group_size: GROUP_SIZE,
@@ -392,7 +384,7 @@ mod tests {
             scale_bias_dtype,
             output_dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedEmbeddingShape { num_total_tokens: 4 };
+        let shape = Shape { num_total_tokens: 4 };
         let token_ids = [-1i32, 0, 1, 2];
         let packed_weights = packed_q4_rows();
         let token_ids = Buffer::from_slice(&device, &token_ids);
@@ -400,11 +392,11 @@ mod tests {
         let scales_buffer = Buffer::from_slice(&device, scale_bytes);
         let biases_buffer = Buffer::from_slice(&device, bias_bytes);
         let output = Buffer::new_zeroed_elements(&device, shape.num_output_values(config), Dtype::Bfloat16);
-        let kernel = QuantizedEmbeddingKernel::new(&device, config);
+        let kernel = Compute::new(&device, config);
         let mut recorder = stream.create_replay_program();
         recorder.record(kernel.invoke(
             shape,
-            QuantizedEmbeddingBuffers {
+            Buffers {
                 token_ids: &token_ids,
                 weight: &weight,
                 scales: &scales_buffer,

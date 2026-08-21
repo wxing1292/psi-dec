@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::ResidualAddCaptureTarget;
 use inference_backend_metal::components::dense_mlp;
+use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -81,7 +81,7 @@ pub struct Qwen35MainLayerInput<'a> {
     pub pages: &'a Buffer,
     pub residual_input: &'a Buffer,
     pub residual_output: &'a Buffer,
-    pub residual_capture_dest: Option<ResidualAddCaptureTarget<'a>>,
+    pub residual_capture_dest: Option<residual_add::CaptureTarget<'a>>,
 }
 
 enum Qwen35MainAttentionInput<'a> {

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::ResidualAddCaptureTarget;
+use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -49,7 +49,7 @@ pub struct Qwen3MainLayerInput<'a> {
     pub pages: &'a Buffer,
     pub residual_input: &'a Buffer,
     pub residual_output: &'a Buffer,
-    pub residual_capture_dest: Option<ResidualAddCaptureTarget<'a>>,
+    pub residual_capture_dest: Option<residual_add::CaptureTarget<'a>>,
 }
 
 impl Qwen3MainLayer {

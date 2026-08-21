@@ -12,26 +12,26 @@ use crate::metal::ReplayU32;
 const RMS_NORM_ROPE_SOURCE: &str = include_str!("metal/rms_norm_rope.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RMSNormRopeThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct RMSNormRopeKernelSpecialization {
-    config: RMSNormRopeConfig,
-    thread_block: RMSNormRopeThreadBlockSpecialization,
+struct KernelConstants {
+    config: Config,
+    thread_block: ThreadBlockConstants,
 }
 
-impl RMSNormRopeKernelSpecialization {
-    fn new(config: RMSNormRopeConfig) -> Self {
+impl KernelConstants {
+    fn new(config: Config) -> Self {
         config.validate();
         Self {
             config,
-            thread_block: RMSNormRopeThreadBlockSpecialization { required_threads: 128 },
+            thread_block: ThreadBlockConstants { required_threads: 128 },
         }
     }
 
-    fn num_threads(self, shape: RMSNormRopeShape) -> usize {
+    fn num_threads(self, shape: Shape) -> usize {
         checked_product(
             "RMSNorm/RoPE thread count",
             &[
@@ -68,7 +68,7 @@ struct RopeKernelParameters {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RMSNormRopeConfig {
+pub struct Config {
     pub num_heads: u32,
     pub head_dim: u32,
     pub rope_dim: u32,
@@ -78,7 +78,7 @@ pub struct RMSNormRopeConfig {
     pub dtype: Dtype,
 }
 
-impl RMSNormRopeConfig {
+impl Config {
     pub fn f32(num_heads: u32, head_dim: u32, rope_dim: u32, eps: f32, rope_theta: f32) -> Self {
         Self {
             num_heads,
@@ -124,7 +124,7 @@ impl RMSNormRopeConfig {
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
-    pub fn num_slots(self, shape: RMSNormRopeShape) -> usize {
+    pub fn num_slots(self, shape: Shape) -> usize {
         checked_product(
             "RMSNorm/RoPE element count",
             &[
@@ -135,7 +135,7 @@ impl RMSNormRopeConfig {
         )
     }
 
-    pub fn bytes(self, shape: RMSNormRopeShape) -> usize {
+    pub fn bytes(self, shape: Shape) -> usize {
         checked_product(
             "RMSNorm/RoPE byte length",
             &[self.num_slots(shape), self.dtype.item_size()],
@@ -149,14 +149,14 @@ impl RMSNormRopeConfig {
         )
     }
 
-    pub fn flat_token_indices_bytes(self, shape: RMSNormRopeShape) -> usize {
+    pub fn flat_token_indices_bytes(self, shape: Shape) -> usize {
         checked_product(
             "RMSNorm/RoPE token-index byte length",
             &[shape.num_total_tokens as usize, size_of::<u32>()],
         )
     }
 
-    fn num_token_heads(self, shape: RMSNormRopeShape) -> usize {
+    fn num_token_heads(self, shape: Shape) -> usize {
         checked_product(
             "RMSNorm/RoPE token-head row count",
             &[shape.num_total_tokens as usize, self.num_heads as usize],
@@ -252,12 +252,12 @@ impl RopeScaling {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RMSNormRopeShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl RMSNormRopeShape {
-    pub fn validate(self, config: RMSNormRopeConfig) {
+impl Shape {
+    pub fn validate(self, config: Config) {
         assert!(self.num_total_tokens > 0);
         assert_u32_count_domain(config.num_token_heads(self), "RMSNorm/RoPE token-head rows");
         assert_u32_index_domain(config.num_slots(self), "RMSNorm/RoPE elements");
@@ -265,36 +265,36 @@ impl RMSNormRopeShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct RMSNormRopeBuffers<'a> {
+pub struct Buffers<'a> {
     pub input: &'a Buffer,
     pub norm_weight: &'a Buffer,
     pub flat_token_indices: &'a Buffer,
     pub output: &'a Buffer,
 }
 
-pub struct RMSNormRopeKernel {
-    specialization: RMSNormRopeKernelSpecialization,
+pub struct Compute {
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl RMSNormRopeKernel {
-    pub fn new(device: &Device, config: RMSNormRopeConfig) -> Self {
-        let specialization = RMSNormRopeKernelSpecialization::new(config);
-        let source = rms_norm_rope_source(specialization);
-        let function_name = match specialization.config.dtype {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
+        let constants = KernelConstants::new(config);
+        let source = rms_norm_rope_source(constants);
+        let function_name = match constants.config.dtype {
             Dtype::Float32 => "rms_norm_rope_f32",
             Dtype::Bfloat16 => "rms_norm_rope_bf16",
             dtype => panic!("unsupported RMSNorm/RoPE dtype {dtype:?}"),
         };
         Self {
-            specialization,
+            constants,
             kernel: Kernel::new(device, &source, function_name),
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: RMSNormRopeShape, buffers: RMSNormRopeBuffers<'a>) -> RMSNormRopeInvocation<'a> {
-        RMSNormRopeInvocation {
-            specialization: self.specialization,
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -304,12 +304,12 @@ impl RMSNormRopeKernel {
 
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: RMSNormRopeShape,
-        buffers: RMSNormRopeBuffers<'a>,
+        shape: Shape,
+        buffers: Buffers<'a>,
         num_active_tokens: ReplayU32,
-    ) -> RMSNormRopeInvocation<'a> {
-        RMSNormRopeInvocation {
-            specialization: self.specialization,
+    ) -> Invocation<'a> {
+        Invocation {
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -318,8 +318,8 @@ impl RMSNormRopeKernel {
     }
 }
 
-fn rms_norm_rope_source(specialization: RMSNormRopeKernelSpecialization) -> String {
-    let config = specialization.config;
+fn rms_norm_rope_source(constants: KernelConstants) -> String {
+    let config = constants.config;
     let parameters = config
         .rope_scaling
         .kernel_parameters(config.rope_dim, config.rope_theta);
@@ -344,18 +344,18 @@ fn rms_norm_rope_source(specialization: RMSNormRopeKernelSpecialization) -> Stri
     RMS_NORM_ROPE_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
 
-pub struct RMSNormRopeInvocation<'a> {
-    specialization: RMSNormRopeKernelSpecialization,
+pub struct Invocation<'a> {
+    constants: KernelConstants,
     kernel: &'a Kernel,
-    shape: RMSNormRopeShape,
-    buffers: RMSNormRopeBuffers<'a>,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_tokens: ReplayU32,
 }
 
-impl Operator for RMSNormRopeInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
-        let specialization = self.specialization;
+        let constants = self.constants;
         let shape = self.shape;
         recorder.set_kernel(self.kernel);
         recorder.set_buffer_read(0, self.buffers.input, 0);
@@ -370,8 +370,8 @@ impl Operator for RMSNormRopeInvocation<'_> {
             "RMSNorm/RoPE active token count",
         );
         recorder.dispatch_1d(
-            specialization.num_threads(shape),
-            specialization.thread_block.required_threads as usize,
+            constants.num_threads(shape),
+            constants.thread_block.required_threads as usize,
         );
     }
 }
@@ -387,9 +387,9 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
     }
 }
 
-impl RMSNormRopeInvocation<'_> {
+impl Invocation<'_> {
     fn validate(&self) {
-        let config = self.specialization.config;
+        let config = self.constants.config;
         self.shape.validate(config);
         assert!(self.buffers.input.len_bytes() >= config.bytes(self.shape));
         assert!(self.buffers.norm_weight.len_bytes() >= config.norm_weight_bytes());
@@ -402,28 +402,27 @@ impl RMSNormRopeInvocation<'_> {
 mod tests {
     use half::bf16;
 
-    use super::RMSNormRopeBuffers;
-    use super::RMSNormRopeConfig;
-    use super::RMSNormRopeKernel;
-    use super::RMSNormRopeKernelSpecialization;
-    use super::RMSNormRopeShape;
+    use super::Buffers;
+    use super::Compute;
+    use super::Config;
+    use super::KernelConstants;
     use super::RopeScaling;
+    use super::Shape;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
     use crate::metal::Stream;
 
     #[test]
-    fn test_specialization_has_explicit_thread_block_scope() {
-        let specialization =
-            RMSNormRopeKernelSpecialization::new(RMSNormRopeConfig::bf16(4, 128, 128, 1e-6, 1_000_000.0));
-        assert_eq!(specialization.config.num_heads, 4);
-        assert_eq!(specialization.thread_block.required_threads, 128);
+    fn test_constants_have_explicit_thread_block_scope() {
+        let constants = KernelConstants::new(Config::bf16(4, 128, 128, 1e-6, 1_000_000.0));
+        assert_eq!(constants.config.num_heads, 4);
+        assert_eq!(constants.thread_block.required_threads, 128);
     }
 
     #[test]
     fn test_norm_weight_uses_bf16_storage() {
-        let config = RMSNormRopeConfig::f32(2, 128, 128, 1e-6, 1_000_000.0);
+        let config = Config::f32(2, 128, 128, 1e-6, 1_000_000.0);
 
         assert_eq!(config.norm_weight_bytes(), 128 * Dtype::Bfloat16.item_size());
     }
@@ -459,8 +458,8 @@ mod tests {
             original_max_position_embeddings: 8192,
             truncate: true,
         };
-        let config = RMSNormRopeConfig::f32(1, 128, 128, 1e-6, 10_000_000.0).with_rope_scaling(scaling);
-        let shape = RMSNormRopeShape { num_total_tokens: 1 };
+        let config = Config::f32(1, 128, 128, 1e-6, 10_000_000.0).with_rope_scaling(scaling);
+        let shape = Shape { num_total_tokens: 1 };
         let input = std::array::from_fn::<_, 128, _>(|index| ((index * 37 % 29) as f32 - 14.0) / 8.0);
         let norm_weight =
             std::array::from_fn::<_, 128, _>(|index| bf16::from_f32(0.75 + (index % 11) as f32 / 20.0).to_bits());
@@ -469,11 +468,11 @@ mod tests {
         let norm_weight_buffer = Buffer::from_slice(&device, &norm_weight);
         let flat_token_indices = Buffer::from_slice(&device, &[position]);
         let output = Buffer::new_zeroed_elements(&device, input.len(), Dtype::Float32);
-        let kernel = RMSNormRopeKernel::new(&device, config);
+        let kernel = Compute::new(&device, config);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            RMSNormRopeBuffers {
+            Buffers {
                 input: &input_buffer,
                 norm_weight: &norm_weight_buffer,
                 flat_token_indices: &flat_token_indices,
@@ -513,19 +512,19 @@ mod tests {
     fn test_bf16_preserves_norm_rounding_order() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = RMSNormRopeConfig::bf16(1, 4, 2, 1e-6, 1_000_000.0);
-        let shape = RMSNormRopeShape { num_total_tokens: 1 };
+        let config = Config::bf16(1, 4, 2, 1e-6, 1_000_000.0);
+        let shape = Shape { num_total_tokens: 1 };
         let input = [0.73046875, -1.171875, 0.439_453_13, 2.03125].map(|value| bf16::from_f32(value).to_bits());
         let norm_weight = [1.296875, 0.8984375, 1.1015625, 0.703125].map(|value| bf16::from_f32(value).to_bits());
         let input_buffer = Buffer::from_slice(&device, &input);
         let norm_weight_buffer = Buffer::from_slice(&device, &norm_weight);
         let flat_token_indices = Buffer::from_slice(&device, &[0_u32]);
         let output = Buffer::new_zeroed_elements(&device, input.len(), Dtype::Bfloat16);
-        let kernel = RMSNormRopeKernel::new(&device, config);
+        let kernel = Compute::new(&device, config);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            RMSNormRopeBuffers {
+            Buffers {
                 input: &input_buffer,
                 norm_weight: &norm_weight_buffer,
                 flat_token_indices: &flat_token_indices,
@@ -557,9 +556,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "RMSNorm/RoPE elements exceeds the shader u32 element-index domain")]
     fn test_shape_rejects_shader_index_overflow() {
-        RMSNormRopeShape {
+        Shape {
             num_total_tokens: 1 << 30,
         }
-        .validate(RMSNormRopeConfig::bf16(2, 4, 4, 1e-6, 1_000_000.0));
+        .validate(Config::bf16(2, 4, 4, 1e-6, 1_000_000.0));
     }
 }

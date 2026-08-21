@@ -447,7 +447,7 @@ impl ReplayComponent for Qwen35Main {
 
 #[cfg(test)]
 mod tests {
-    use inference_backend_metal::components::ResidualAddCaptureTarget;
+    use inference_backend_metal::components::residual_add;
     use inference_backend_metal::metal::Dtype;
 
     use super::*;
@@ -458,9 +458,9 @@ mod tests {
     }
 
     impl MainResidualCapture for SelectedLayerCapture {
-        fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
+        fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<residual_add::CaptureTarget<'_>> {
             (model_layer_index == self.model_layer_index)
-                .then(|| ResidualAddCaptureTarget::columns(&self.capture_output, 16, 4..12))
+                .then(|| residual_add::CaptureTarget::columns(&self.capture_output, 16, 4..12))
         }
     }
 

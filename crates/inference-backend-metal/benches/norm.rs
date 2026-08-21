@@ -4,19 +4,9 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use inference_backend_metal::components::RMSNormBuffers;
-use inference_backend_metal::components::RMSNormConfig;
-use inference_backend_metal::components::RMSNormKernel;
-use inference_backend_metal::components::RMSNormShape;
-use inference_backend_metal::components::ResidualAddBuffers;
-use inference_backend_metal::components::ResidualAddConfig;
-use inference_backend_metal::components::ResidualAddKernel;
-use inference_backend_metal::components::ResidualAddRMSNormBuffers;
-use inference_backend_metal::components::ResidualAddRMSNormConfig;
-use inference_backend_metal::components::ResidualAddRMSNormKernel;
-use inference_backend_metal::components::ResidualAddRMSNormKernelKind;
-use inference_backend_metal::components::ResidualAddRMSNormShape;
-use inference_backend_metal::components::ResidualAddShape;
+use inference_backend_metal::components::residual_add;
+use inference_backend_metal::components::residual_add_rms_norm;
+use inference_backend_metal::components::rms_norm;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
@@ -92,14 +82,20 @@ struct ResidualAddRMSNormFixture {
 impl ResidualAddRMSNormFixture {
     fn new(device: &Device, tokens: u32, hidden_dim: u32) -> Self {
         let stream = Stream::new(device);
-        let rms_norm = RMSNormKernel::new(device, RMSNormConfig::bf16(hidden_dim, EPS));
-        let residual_add = ResidualAddKernel::new(device, ResidualAddConfig::bf16());
-        let fused_config = ResidualAddRMSNormConfig::bf16(hidden_dim, EPS);
-        let fused_scalar =
-            ResidualAddRMSNormKernel::new_with_kind(device, fused_config, ResidualAddRMSNormKernelKind::Scalar);
-        let fused_vec4 =
-            ResidualAddRMSNormKernel::new_with_kind(device, fused_config, ResidualAddRMSNormKernelKind::Bf16Vectorized);
-        let shape = ResidualAddRMSNormShape {
+        let rms_norm = rms_norm::Compute::new(device, rms_norm::Config::bf16(hidden_dim, EPS));
+        let residual_add = residual_add::Compute::new(device, residual_add::Config::bf16());
+        let fused_config = residual_add_rms_norm::Config::bf16(hidden_dim, EPS);
+        let fused_scalar = residual_add_rms_norm::Compute::new_with_kind(
+            device,
+            fused_config,
+            residual_add_rms_norm::KernelKind::Scalar,
+        );
+        let fused_vec4 = residual_add_rms_norm::Compute::new_with_kind(
+            device,
+            fused_config,
+            residual_add_rms_norm::KernelKind::Bf16Vectorized,
+        );
+        let shape = residual_add_rms_norm::Shape {
             num_total_tokens: tokens,
         };
         let num_values = tokens as usize * hidden_dim as usize;
@@ -124,10 +120,10 @@ impl ResidualAddRMSNormFixture {
                     (&rms_only_b, &rms_only_a)
                 };
                 builder.record_with_barrier_before(rms_norm.invoke(
-                    RMSNormShape {
+                    rms_norm::Shape {
                         num_total_tokens: tokens,
                     },
-                    RMSNormBuffers {
+                    rms_norm::Buffers {
                         input,
                         weight: &weight,
                         output,
@@ -140,20 +136,20 @@ impl ResidualAddRMSNormFixture {
         let unfused_replay = {
             let mut builder = stream.create_replay_program();
             builder.record(residual_add.invoke(
-                ResidualAddShape {
+                residual_add::Shape {
                     num_values: num_values as u32,
                 },
-                ResidualAddBuffers {
+                residual_add::Buffers {
                     lhs: &lhs,
                     rhs: &rhs,
                     output: &unfused_residual_output,
                 },
             ));
             builder.record_with_barrier_before(rms_norm.invoke(
-                RMSNormShape {
+                rms_norm::Shape {
                     num_total_tokens: tokens,
                 },
-                RMSNormBuffers {
+                rms_norm::Buffers {
                     input: &unfused_residual_output,
                     weight: &weight,
                     output: &unfused_norm_output,
@@ -165,7 +161,7 @@ impl ResidualAddRMSNormFixture {
             let mut builder = stream.create_replay_program();
             builder.record(fused_scalar.invoke(
                 shape,
-                ResidualAddRMSNormBuffers {
+                residual_add_rms_norm::Buffers {
                     lhs: &lhs,
                     rhs: &rhs,
                     weight: &weight,
@@ -179,7 +175,7 @@ impl ResidualAddRMSNormFixture {
             let mut builder = stream.create_replay_program();
             builder.record(fused_vec4.invoke(
                 shape,
-                ResidualAddRMSNormBuffers {
+                residual_add_rms_norm::Buffers {
                     lhs: &lhs,
                     rhs: &rhs,
                     weight: &weight,

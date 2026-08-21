@@ -341,7 +341,7 @@ computation level.
 Rust directory names do not define this architectural classification. The backend `components` module contains reusable
 Metal building blocks.
 
-For example, `ResidualAddInvocation` is an operator. The executor GQA implementation is a component that composes
+For example, `residual_add::Invocation` is an operator. The executor GQA implementation is a component that composes
 operators.
 
 ```text

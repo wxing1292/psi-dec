@@ -404,8 +404,8 @@ Replay<Rc<GDNRequestStateTable>>
 MainEmbed and MTPEmbed are separate replay boundaries with their own keys.
 
 The shared quantized embedding leaf supports exact and bucketed recording.
-Exact recording fixes the active token count to `QuantizedEmbeddingShape::num_tokens` and declares no replay parameter.
-Bucketed recording interprets `QuantizedEmbeddingShape::num_tokens` as the recorded capacity.
+Exact recording fixes the active token count to `embedding::Shape::num_total_tokens` and declares no replay parameter.
+Bucketed recording interprets `embedding::Shape::num_total_tokens` as the recorded capacity.
 It validates buffers and dispatches the grid for that capacity.
 It binds the caller-provided active-token key with the range `1..=capacity`.
 The kernel checks the active token count before it reads `token_ids` or writes the output row.
@@ -418,7 +418,7 @@ Qwen3 MainEmbed still selects exact recording.
 Qwen3.5 MTPEmbed selects bucketed embedding recording as part of its composed replay.
 
 The shared row-gather leaf supports exact and bucketed recording.
-`RowGatherShape::num_total_rows` is the recorded grid extent for both paths.
+`row_gather::Shape::num_total_rows` is the recorded grid extent for both paths.
 Exact recording fixes the active row count to this extent and declares no replay parameter.
 Bucketed recording supplies the active row count at submission.
 It validates the row-index and output buffers and dispatches the grid for that capacity.
@@ -466,9 +466,9 @@ domains match.
 An intervening operation or an incompatible RMS normalization disables fusion and does not fail replay construction.
 Each dependent RMS normalization records its own consumer barrier.
 Fusion preserves a barrier requested by either source operation.
-Exact residual recording uses `ResidualAddShape::num_values`.
+Exact residual recording uses `residual_add::Shape::num_values`.
 Exact capture and bucketed residual recording use
-`ResidualAddRowShape { num_total_rows, num_columns }`.
+`residual_add::RowShape { num_total_rows, num_columns }`.
 Both fields count tensor elements, not bytes.
 Bucketed recording also uses the caller-provided active-token key.
 The fused command uses the shared active-token key and token capacity.
@@ -612,7 +612,7 @@ Similar workspace roles do not imply shared structural ownership.
 
 `Qwen3Main` and `Qwen35Main` accept the shared `MainResidualCapture` boundary.
 Main queries the capture owner immediately before each layer's final post-MLP residual add.
-The capture owner returns an optional opaque `ResidualAddCaptureTarget`.
+The capture owner returns an optional opaque `residual_add::CaptureTarget`.
 The destination selects a stable BF16 column range that the capture owner owns.
 `None` records the ordinary residual add.
 

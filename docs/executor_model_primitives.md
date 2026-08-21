@@ -19,7 +19,7 @@ Reusable backend components live in:
 
 ```text
 crates/inference-backend-metal/src/components/
-  quantized_embedding.rs
+  embedding.rs
   rms_norm.rs
   residual_add.rs
   residual_add_rms_norm.rs
@@ -33,8 +33,8 @@ These components use the execution vocabulary in [GPU Execution Vocabulary](gpu_
 
 ## Embedding
 
-`Embed` owns the model-level quantized embedding weights and one `QuantizedEmbeddingKernel`. It records an exact token
-count or a fixed replay capacity with a submission-time active-token count.
+`Embed` owns the model-level quantized embedding weights and one `embedding::Compute`. It records an exact token count
+or a fixed replay capacity with a submission-time active-token count.
 
 The kernel computes this mapping:
 
@@ -45,10 +45,10 @@ token_ids[token]
     -> output_hidden[token, hidden]
 ```
 
-The current kernel specialization is:
+The current private compile-time constants are:
 
 ```text
-QuantizedEmbeddingKernelSpecialization
+embedding::KernelConstants
 ├── scale_bias_dtype
 ├── output_dtype
 └── thread_block
@@ -59,7 +59,7 @@ One non-persistent thread block processes a bounded flat range of `(token, hidde
 processes one coordinate at a time. The kernel derives the token and hidden indices from the flat coordinate.
 
 Embedding has one current kernel implementation for each supported scale/bias dtype. Dtype selection occurs at
-initialization. The runtime token count changes only the grid. Embedding does not need a registry or runtime planner.
+initialization. The runtime token count changes only the grid. Embedding does not need a registry or selector.
 
 ## Unembedding
 
@@ -74,22 +74,22 @@ hidden[num_rows, hidden_dim]
 `AffineQuantizedMatmul` owns QMV/QMM registration, row-dependent selection, kernel tile geometry, and topology
 boundaries. `Unembed` supplies model geometry, weights, buffers, and row counts. It must not select a second kernel.
 
-Embedding and unembedding share weight lifecycle and replay-capacity conventions. They do not share one GPU planner.
+Embedding and unembedding share weight lifecycle and replay-capacity conventions. They do not share one GPU selector.
 Embedding is a row lookup. Unembedding is a matrix multiplication.
 
 ## Row gather
 
-`Gather` owns one `RowGatherKernel`. It copies indexed input rows to a dense output:
+`Gather` owns one `row_gather::Compute`. It copies indexed input rows to a dense output:
 
 ```text
 input[row_indices[output_row], column]
     -> output[output_row, column]
 ```
 
-The compiled specialization contains the dtype and `thread_block.required_threads = 256`. One non-persistent thread
+The private compile-time constants contain the dtype and `thread_block.required_threads = 256`. One non-persistent thread
 block processes a bounded flat range of `(output row, column)` coordinates. Exact and bucketed recording use the same
-kernel. The runtime row count changes only the grid and the active-row guard. Row gather has one current specialization
-for each supported dtype and does not need a registry, planner, or plan object.
+kernel. The runtime row count changes only the grid and the active-row guard. Row gather has one current kernel for each
+supported dtype and does not need a registry or selector.
 
 ## RMSNorm
 
@@ -104,7 +104,7 @@ one ThreadBlock
 ```
 
 The dtype selects the F32 or BF16-vectorized kernel at initialization. The current kernel requires 1024 threads. The
-runtime token count determines the grid dimensions. RMSNorm does not use a runtime planner.
+runtime token count determines the grid dimensions. RMSNorm does not use a registry or selector.
 
 ## Residual add
 
@@ -113,7 +113,7 @@ complete row boundaries for active-count guards. The capture form also copies se
 buffer.
 
 Dtypes select one static kernel at initialization. The runtime shape changes only the grid and active-prefix guard.
-Residual add does not use a runtime planner.
+Residual add does not use a registry or selector.
 
 ## Residual-add RMSNorm
 
@@ -135,9 +135,9 @@ a dynamic execution plan.
 The fused RMSNorm/RoPE component maps one thread block to one `(flat Q token, Q head)` row. It normalizes one head row,
 reads the request position from `flat_token_indices`, applies RoPE to `rope_dim`, and writes the complete head row.
 
-The compiled specialization contains the attention-head geometry, RoPE geometry, epsilon, scaling constants, dtype,
+The private compile-time constants contain the attention-head geometry, RoPE geometry, epsilon, scaling constants, dtype,
 and fixed thread-block requirement. The runtime token count changes only the grid and the active-token guard. The
-component has one current specialization for one model configuration and does not need a runtime planner.
+component has one current kernel for one model configuration and does not need a registry or selector.
 
 ## Replay and ownership
 

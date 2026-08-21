@@ -1,9 +1,4 @@
-use inference_backend_metal::components::ResidualAddBuffers;
-use inference_backend_metal::components::ResidualAddCaptureTarget;
-use inference_backend_metal::components::ResidualAddConfig;
-use inference_backend_metal::components::ResidualAddKernel;
-use inference_backend_metal::components::ResidualAddRowShape;
-use inference_backend_metal::components::ResidualAddShape;
+use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayParameterKey;
@@ -12,13 +7,13 @@ use inference_executor_core::backend::recorder::Recorder;
 use crate::def::replay_op::ReplayOp;
 
 pub struct ResidualAdd {
-    compute: ResidualAddKernel,
+    compute: residual_add::Compute,
 }
 
 impl ResidualAdd {
     pub fn new(device: &Device) -> Self {
         Self {
-            compute: ResidualAddKernel::new(device, ResidualAddConfig::bf16()),
+            compute: residual_add::Compute::new(device, residual_add::Config::bf16()),
         }
     }
 
@@ -33,8 +28,8 @@ impl ResidualAdd {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let invocation = self.compute.invoke(
-            ResidualAddShape { num_values },
-            ResidualAddBuffers {
+            residual_add::Shape { num_values },
+            residual_add::Buffers {
                 lhs,
                 rhs,
                 output: residual_output,
@@ -58,12 +53,12 @@ impl ResidualAdd {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let invocation = self.compute.invoke_bucketed(
-            ResidualAddRowShape {
+            residual_add::RowShape {
                 num_total_rows: num_total_tokens,
                 num_columns: hidden_dim,
             },
             num_active_tokens_key,
-            ResidualAddBuffers {
+            residual_add::Buffers {
                 lhs,
                 rhs,
                 output: residual_output,
@@ -81,16 +76,16 @@ impl ResidualAdd {
         lhs: &'a Buffer,
         rhs: &'a Buffer,
         residual_output: &'a Buffer,
-        capture: ResidualAddCaptureTarget<'a>,
+        capture: residual_add::CaptureTarget<'a>,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let invocation = self.compute.invoke_rows(
-            ResidualAddRowShape {
+            residual_add::RowShape {
                 num_total_rows: num_rows,
                 num_columns,
             },
-            ResidualAddBuffers {
+            residual_add::Buffers {
                 lhs,
                 rhs,
                 output: residual_output,
@@ -109,17 +104,17 @@ impl ResidualAdd {
         lhs: &'a Buffer,
         rhs: &'a Buffer,
         residual_output: &'a Buffer,
-        capture: ResidualAddCaptureTarget<'a>,
+        capture: residual_add::CaptureTarget<'a>,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let invocation = self.compute.invoke_bucketed(
-            ResidualAddRowShape {
+            residual_add::RowShape {
                 num_total_rows: num_total_tokens,
                 num_columns: hidden_dim,
             },
             num_active_tokens_key,
-            ResidualAddBuffers {
+            residual_add::Buffers {
                 lhs,
                 rhs,
                 output: residual_output,

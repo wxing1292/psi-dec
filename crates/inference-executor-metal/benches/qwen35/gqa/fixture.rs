@@ -17,10 +17,9 @@ use inference_backend_metal::components::GQASplitKVTiledQKernels;
 use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQShape;
-use inference_backend_metal::components::RMSNormRopeBuffers;
-use inference_backend_metal::components::RMSNormRopeKernel;
-use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::rms_norm_rope;
+use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -493,8 +492,8 @@ impl<'a> RealGQAFixture<'a> {
         let replay = recorder.build();
         let qgkv_matmul = AffineQuantizedMatmul::new(device, gqa_qgkv_affine_config(model));
         let qgkv_to_q_g_k_v = GQAQGKVSplitKernel::new(device, gqa_qgkv_to_q_g_k_v_config(model));
-        let q_norm_rope_kernel = RMSNormRopeKernel::new(device, norm_rope_config(model.num_q_heads, model));
-        let k_norm_rope_kernel = RMSNormRopeKernel::new(device, norm_rope_config(model.num_kv_heads, model));
+        let q_norm_rope_kernel = rms_norm_rope::Compute::new(device, norm_rope_config(model.num_q_heads, model));
+        let k_norm_rope_kernel = rms_norm_rope::Compute::new(device, norm_rope_config(model.num_kv_heads, model));
         let kv_page_write = GQAKVPageWrite::new(device, gqa_kv_page_write_config(model, config.page_bytes));
         let gate = GQAActivationGateKernel::new(device, gqa_gate_config(model));
         let output = AffineQuantizedMatmul::new(device, gqa_output_affine_config(model));
@@ -534,7 +533,7 @@ impl<'a> RealGQAFixture<'a> {
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(q_norm_rope_kernel.invoke(
             norm_rope_shape(num_tokens, model.num_q_heads, model),
-            RMSNormRopeBuffers {
+            rms_norm_rope::Buffers {
                 input: &q,
                 norm_weight: &weights.q_norm_weight,
                 flat_token_indices: batch_metadata.flat_token_indices(),
@@ -543,7 +542,7 @@ impl<'a> RealGQAFixture<'a> {
         )));
         tiled_builder.record(ReplayOp::opaque(k_norm_rope_kernel.invoke(
             norm_rope_shape(num_tokens, model.num_kv_heads, model),
-            RMSNormRopeBuffers {
+            rms_norm_rope::Buffers {
                 input: &k,
                 norm_weight: &weights.k_norm_weight,
                 flat_token_indices: batch_metadata.flat_token_indices(),
@@ -825,8 +824,10 @@ impl<'a> RealGQAFixture<'a> {
     fn measure_subcomponents(&self, selected_subcomponents: &[String], warmup_iters: usize, iters: usize, runs: usize) {
         let qgkv_matmul = AffineQuantizedMatmul::new(&self.device, gqa_qgkv_affine_config(self.model));
         let qgkv_to_q_g_k_v = GQAQGKVSplitKernel::new(&self.device, gqa_qgkv_to_q_g_k_v_config(self.model));
-        let q_norm_rope = RMSNormRopeKernel::new(&self.device, norm_rope_config(self.model.num_q_heads, self.model));
-        let k_norm_rope = RMSNormRopeKernel::new(&self.device, norm_rope_config(self.model.num_kv_heads, self.model));
+        let q_norm_rope =
+            rms_norm_rope::Compute::new(&self.device, norm_rope_config(self.model.num_q_heads, self.model));
+        let k_norm_rope =
+            rms_norm_rope::Compute::new(&self.device, norm_rope_config(self.model.num_kv_heads, self.model));
         let kv_page_write = GQAKVPageWrite::new(
             &self.device,
             gqa_kv_page_write_config(self.model, self.model.page_bytes()),
@@ -872,7 +873,7 @@ impl<'a> RealGQAFixture<'a> {
             &self.stream,
             q_norm_rope.invoke(
                 norm_rope_shape(self.num_tokens, self.model.num_q_heads, self.model),
-                RMSNormRopeBuffers {
+                rms_norm_rope::Buffers {
                     input: &self._q,
                     norm_weight: &self._weights.q_norm_weight,
                     flat_token_indices: self.batch_metadata.flat_token_indices(),
@@ -884,7 +885,7 @@ impl<'a> RealGQAFixture<'a> {
             &self.stream,
             k_norm_rope.invoke(
                 norm_rope_shape(self.num_tokens, self.model.num_kv_heads, self.model),
-                RMSNormRopeBuffers {
+                rms_norm_rope::Buffers {
                     input: &self._k,
                     norm_weight: &self._weights.k_norm_weight,
                     flat_token_indices: self.batch_metadata.flat_token_indices(),

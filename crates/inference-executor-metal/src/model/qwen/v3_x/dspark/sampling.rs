@@ -1,4 +1,4 @@
-use inference_backend_metal::components::QuantizedEmbeddingConfig;
+use inference_backend_metal::components::embedding;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -208,7 +208,7 @@ impl Qwen3xDSparkMarkovWeights {
         config: DSparkMarkovSamplingConfig,
         bindings: &Qwen3xDSparkMarkovWeightBindings,
     ) -> Result<Self, ModelExecutorError> {
-        let w1_config = QuantizedEmbeddingConfig {
+        let w1_config = embedding::Config {
             vocab_size: config.vocab_size,
             hidden_dim: config.rank,
             group_size: config.w1_group_size,

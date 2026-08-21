@@ -1,11 +1,6 @@
-use crate::components::RMSNormInvocation;
-use crate::components::ResidualAddInvocation;
-use crate::components::residual_add::ResidualAddCaptureReplayOp;
-use crate::components::residual_add::ResidualAddCaptureTarget;
-use crate::components::residual_add::ResidualAddReplayOp;
-use crate::components::residual_add_rms_norm::ResidualAddCaptureRMSNormReplayInvocation;
-use crate::components::residual_add_rms_norm::ResidualAddRMSNormReplayInvocation;
-use crate::components::rms_norm::RMSNormReplayOp;
+use crate::components::residual_add;
+use crate::components::residual_add_rms_norm;
+use crate::components::rms_norm;
 use crate::metal::Operator;
 use crate::metal::ReplayProgram;
 use crate::metal::ReplayProgramBuilder;
@@ -44,14 +39,16 @@ impl ReplayRecorder {
             ReplayOpKind::RMSNorm(op) => {
                 if let Some((previous, residual_barrier_before)) = self.pop_residual_add_with_capture(&op) {
                     self.push_pending(PendingReplayOp::ResidualAddCaptureRMSNorm {
-                        op: ResidualAddCaptureRMSNormReplayInvocation::fuse_residual_add_capture_rms_norm(previous, op),
+                        op: residual_add_rms_norm::CaptureReplayInvocation::fuse_residual_add_capture_rms_norm(
+                            previous, op,
+                        ),
                         barrier_before: residual_barrier_before || barrier_before,
                     });
                     return;
                 }
                 if let Some((previous, residual_barrier_before)) = self.pop_residual_add(&op) {
                     self.push_pending(PendingReplayOp::ResidualAddRMSNorm {
-                        op: ResidualAddRMSNormReplayInvocation::fuse_residual_add_rms_norm(previous, op),
+                        op: residual_add_rms_norm::ReplayInvocation::fuse_residual_add_rms_norm(previous, op),
                         barrier_before: residual_barrier_before || barrier_before,
                     });
                     return;
@@ -74,11 +71,11 @@ impl ReplayRecorder {
         self.pending.pop()
     }
 
-    fn pop_residual_add(&mut self, rms_norm: &RMSNormReplayOp) -> Option<(ResidualAddReplayOp, bool)> {
+    fn pop_residual_add(&mut self, rms_norm: &rms_norm::ReplayOp) -> Option<(residual_add::ReplayOp, bool)> {
         let Some(PendingReplayOp::ResidualAdd { op, .. }) = self.pending.last() else {
             return None;
         };
-        if !ResidualAddRMSNormReplayInvocation::is_residual_add_rms_norm_fusion_compatible(op, rms_norm) {
+        if !residual_add_rms_norm::ReplayInvocation::is_residual_add_rms_norm_fusion_compatible(op, rms_norm) {
             return None;
         }
         let Some(PendingReplayOp::ResidualAdd { op, barrier_before }) = self.pop() else {
@@ -89,13 +86,14 @@ impl ReplayRecorder {
 
     fn pop_residual_add_with_capture(
         &mut self,
-        rms_norm: &RMSNormReplayOp,
-    ) -> Option<(ResidualAddCaptureReplayOp, bool)> {
+        rms_norm: &rms_norm::ReplayOp,
+    ) -> Option<(residual_add::CaptureReplayOp, bool)> {
         let Some(PendingReplayOp::ResidualAddWithCapture { op, .. }) = self.pending.last() else {
             return None;
         };
-        if !ResidualAddCaptureRMSNormReplayInvocation::is_residual_add_capture_rms_norm_fusion_compatible(op, rms_norm)
-        {
+        if !residual_add_rms_norm::CaptureReplayInvocation::is_residual_add_capture_rms_norm_fusion_compatible(
+            op, rms_norm,
+        ) {
             return None;
         }
         let Some(PendingReplayOp::ResidualAddWithCapture { op, barrier_before }) = self.pop() else {
@@ -141,9 +139,9 @@ pub struct ReplayOp<'a> {
 
 enum ReplayOpKind<'a> {
     Opaque(OpaqueReplayOp<'a>),
-    ResidualAdd(ResidualAddReplayOp),
-    ResidualAddWithCapture(ResidualAddCaptureReplayOp),
-    RMSNorm(RMSNormReplayOp),
+    ResidualAdd(residual_add::ReplayOp),
+    ResidualAddWithCapture(residual_add::CaptureReplayOp),
+    RMSNorm(rms_norm::ReplayOp),
 }
 
 impl<'a> ReplayOp<'a> {
@@ -156,7 +154,7 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
-    pub fn residual_add(invocation: ResidualAddInvocation<'a>) -> Self {
+    pub fn residual_add(invocation: residual_add::Invocation<'a>) -> Self {
         Self {
             kind: ReplayOpKind::ResidualAdd(invocation.into_replay_op()),
         }
@@ -167,15 +165,15 @@ impl<'a> ReplayOp<'a> {
     /// An adjacent compatible RMSNorm is fused opportunistically. Otherwise,
     /// replay records the capture as an independent padding-safe operation.
     pub fn residual_add_with_capture(
-        invocation: ResidualAddInvocation<'a>,
-        capture: ResidualAddCaptureTarget<'a>,
+        invocation: residual_add::Invocation<'a>,
+        capture: residual_add::CaptureTarget<'a>,
     ) -> Self {
         Self {
             kind: ReplayOpKind::ResidualAddWithCapture(invocation.into_capture_replay_op(capture)),
         }
     }
 
-    pub fn rms_norm(invocation: RMSNormInvocation<'a>) -> Self {
+    pub fn rms_norm(invocation: rms_norm::Invocation<'a>) -> Self {
         Self {
             kind: ReplayOpKind::RMSNorm(invocation.into_replay_op()),
         }
@@ -184,23 +182,23 @@ impl<'a> ReplayOp<'a> {
 
 enum PendingReplayOp {
     ResidualAdd {
-        op: ResidualAddReplayOp,
+        op: residual_add::ReplayOp,
         barrier_before: bool,
     },
     ResidualAddWithCapture {
-        op: ResidualAddCaptureReplayOp,
+        op: residual_add::CaptureReplayOp,
         barrier_before: bool,
     },
     RMSNorm {
-        op: RMSNormReplayOp,
+        op: rms_norm::ReplayOp,
         barrier_before: bool,
     },
     ResidualAddRMSNorm {
-        op: ResidualAddRMSNormReplayInvocation,
+        op: residual_add_rms_norm::ReplayInvocation,
         barrier_before: bool,
     },
     ResidualAddCaptureRMSNorm {
-        op: ResidualAddCaptureRMSNormReplayInvocation,
+        op: residual_add_rms_norm::CaptureReplayInvocation,
         barrier_before: bool,
     },
 }

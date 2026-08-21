@@ -4,10 +4,8 @@ use objc2_metal::MTLBuffer;
 use objc2_metal::MTLComputePipelineState;
 use objc2_metal::MTLResource;
 
-use crate::components::residual_add::ResidualAddCaptureReplayOp;
-use crate::components::residual_add::ResidualAddConfig;
-use crate::components::residual_add::ResidualAddReplayOp;
-use crate::components::rms_norm::RMSNormReplayOp;
+use crate::components::residual_add;
+use crate::components::rms_norm;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -19,13 +17,13 @@ use crate::metal::ReplayParameterKey;
 const RESIDUAL_ADD_RMS_NORM_SOURCE: &str = include_str!("metal/residual_add_rms_norm.metal");
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ResidualAddRMSNormConfig {
+pub struct Config {
     pub hidden_dim: u32,
     pub eps: f32,
     pub io_dtype: Dtype,
 }
 
-impl ResidualAddRMSNormConfig {
+impl Config {
     pub fn f32(hidden_dim: u32, eps: f32) -> Self {
         Self {
             hidden_dim,
@@ -53,7 +51,7 @@ impl ResidualAddRMSNormConfig {
         );
     }
 
-    pub fn num_values(self, shape: ResidualAddRMSNormShape) -> usize {
+    pub fn num_values(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         (shape.num_total_tokens as usize)
@@ -61,7 +59,7 @@ impl ResidualAddRMSNormConfig {
             .expect("residual-add RMSNorm value count must fit usize")
     }
 
-    pub fn bytes(self, shape: ResidualAddRMSNormShape) -> usize {
+    pub fn bytes(self, shape: Shape) -> usize {
         self.num_values(shape)
             .checked_mul(self.io_dtype.item_size())
             .expect("residual-add RMSNorm byte length must fit usize")
@@ -76,18 +74,18 @@ impl ResidualAddRMSNormConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResidualAddRMSNormShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl ResidualAddRMSNormShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_tokens > 0);
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct ResidualAddRMSNormBuffers<'a> {
+pub struct Buffers<'a> {
     pub lhs: &'a Buffer,
     pub rhs: &'a Buffer,
     pub weight: &'a Buffer,
@@ -106,74 +104,66 @@ pub struct ResidualAddRMSNormBuffers<'a> {
 ///
 /// The capture variant also writes the residual-add result to the selected
 /// columns in `capture_output`.
-pub struct ResidualAddRMSNormKernel {
-    config: ResidualAddRMSNormConfig,
-    specialization: ResidualAddRMSNormKernelSpecialization,
+pub struct Compute {
+    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResidualAddRMSNormKernelKind {
+pub enum KernelKind {
     Scalar,
     Bf16Vectorized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ResidualAddRMSNormThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ResidualAddRMSNormKernelSpecialization {
-    kind: ResidualAddRMSNormKernelKind,
-    thread_block: ResidualAddRMSNormThreadBlockSpecialization,
+struct KernelConstants {
+    kind: KernelKind,
+    thread_block: ThreadBlockConstants,
 }
 
-impl ResidualAddRMSNormKernelSpecialization {
-    fn new(config: ResidualAddRMSNormConfig, kind: ResidualAddRMSNormKernelKind) -> Self {
+impl KernelConstants {
+    fn new(config: Config, kind: KernelKind) -> Self {
         validate_kernel_kind(config, kind);
         Self {
             kind,
-            thread_block: ResidualAddRMSNormThreadBlockSpecialization { required_threads: 1024 },
+            thread_block: ThreadBlockConstants { required_threads: 1024 },
         }
     }
 }
 
-impl ResidualAddRMSNormKernel {
-    pub fn new(device: &Device, config: ResidualAddRMSNormConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         Self::new_with_kind(device, config, selected_kernel_kind(config))
     }
 
     /// Creates one exact backend path for backend tests and benchmarks.
     ///
     /// Model and executor code must use [`Self::new`].
-    pub fn new_with_kind(
-        device: &Device,
-        config: ResidualAddRMSNormConfig,
-        kind: ResidualAddRMSNormKernelKind,
-    ) -> Self {
+    pub fn new_with_kind(device: &Device, config: Config, kind: KernelKind) -> Self {
         config.validate();
-        let specialization = ResidualAddRMSNormKernelSpecialization::new(config, kind);
+        let constants = KernelConstants::new(config, kind);
         Self {
             config,
-            specialization,
+            constants,
             kernel: Kernel::new(
                 device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_rms_norm_function_name(config, specialization.kind),
+                residual_add_rms_norm_function_name(config, constants.kind),
             ),
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: ResidualAddRMSNormShape,
-        buffers: ResidualAddRMSNormBuffers<'a>,
-    ) -> ResidualAddRMSNormInvocation<'a> {
-        ResidualAddRMSNormInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             kernel: &self.kernel,
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             shape,
             buffers,
             num_active_tokens_key: None,
@@ -183,14 +173,14 @@ impl ResidualAddRMSNormKernel {
     /// Records a fixed-capacity grid whose active token count is supplied at submission.
     pub fn invoke_bucketed<'a>(
         &'a self,
-        capacity_shape: ResidualAddRMSNormShape,
+        capacity_shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: ResidualAddRMSNormBuffers<'a>,
-    ) -> ResidualAddRMSNormInvocation<'a> {
-        ResidualAddRMSNormInvocation {
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             kernel: &self.kernel,
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             shape: capacity_shape,
             buffers,
             num_active_tokens_key: Some(num_active_tokens_key),
@@ -198,37 +188,37 @@ impl ResidualAddRMSNormKernel {
     }
 }
 
-pub struct ResidualAddRMSNormInvocation<'a> {
+pub struct Invocation<'a> {
     kernel: &'a Kernel,
-    config: ResidualAddRMSNormConfig,
-    specialization: ResidualAddRMSNormKernelSpecialization,
-    shape: ResidualAddRMSNormShape,
-    buffers: ResidualAddRMSNormBuffers<'a>,
+    config: Config,
+    constants: KernelConstants,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub struct ResidualAddRMSNormReplayInvocation {
+pub struct ReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: ResidualAddRMSNormConfig,
-    specialization: ResidualAddRMSNormKernelSpecialization,
-    shape: ResidualAddRMSNormShape,
-    buffers: ResidualAddRMSNormOwnedBuffers,
+    config: Config,
+    constants: KernelConstants,
+    shape: Shape,
+    buffers: OwnedBuffers,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub struct ResidualAddCaptureRMSNormReplayInvocation {
+pub struct CaptureReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: ResidualAddRMSNormConfig,
-    specialization: ResidualAddRMSNormKernelSpecialization,
-    shape: ResidualAddRMSNormShape,
-    buffers: ResidualAddCaptureRMSNormOwnedBuffers,
+    config: Config,
+    constants: KernelConstants,
+    shape: Shape,
+    buffers: CaptureOwnedBuffers,
     capture_num_columns: u32,
     capture_column_start: u32,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 #[derive(Clone)]
-struct ResidualAddRMSNormOwnedBuffers {
+struct OwnedBuffers {
     lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
     lhs_len_bytes: usize,
     rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -241,7 +231,7 @@ struct ResidualAddRMSNormOwnedBuffers {
     norm_output_len_bytes: usize,
 }
 
-struct ResidualAddCaptureRMSNormOwnedBuffers {
+struct CaptureOwnedBuffers {
     lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
     lhs_len_bytes: usize,
     rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -256,7 +246,7 @@ struct ResidualAddCaptureRMSNormOwnedBuffers {
     norm_output_len_bytes: usize,
 }
 
-impl ResidualAddRMSNormOwnedBuffers {
+impl OwnedBuffers {
     #[allow(clippy::too_many_arguments)]
     fn new(
         lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -285,7 +275,7 @@ impl ResidualAddRMSNormOwnedBuffers {
     }
 }
 
-impl ResidualAddCaptureRMSNormOwnedBuffers {
+impl CaptureOwnedBuffers {
     #[allow(clippy::too_many_arguments)]
     fn new(
         lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -318,7 +308,7 @@ impl ResidualAddCaptureRMSNormOwnedBuffers {
     }
 }
 
-impl Operator for ResidualAddRMSNormInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_kernel(self.kernel);
@@ -332,12 +322,12 @@ impl Operator for ResidualAddRMSNormInvocation<'_> {
         recorder.set_f32(7, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (self.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-impl Operator for ResidualAddRMSNormReplayInvocation {
+impl Operator for ReplayInvocation {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_retained_pipeline_state(&self.pipeline);
@@ -351,12 +341,12 @@ impl Operator for ResidualAddRMSNormReplayInvocation {
         recorder.set_f32(7, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (self.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-impl Operator for ResidualAddCaptureRMSNormReplayInvocation {
+impl Operator for CaptureReplayInvocation {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_retained_pipeline_state(&self.pipeline);
@@ -373,12 +363,12 @@ impl Operator for ResidualAddCaptureRMSNormReplayInvocation {
         recorder.set_f32(10, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (self.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-impl ResidualAddRMSNormInvocation<'_> {
+impl Invocation<'_> {
     fn validate(&self) {
         self.config.validate();
         self.shape.validate();
@@ -390,10 +380,10 @@ impl ResidualAddRMSNormInvocation<'_> {
     }
 }
 
-impl ResidualAddRMSNormReplayInvocation {
+impl ReplayInvocation {
     pub fn is_residual_add_rms_norm_fusion_compatible(
-        residual_add: &ResidualAddReplayOp,
-        rms_norm: &RMSNormReplayOp,
+        residual_add: &residual_add::ReplayOp,
+        rms_norm: &rms_norm::ReplayOp,
     ) -> bool {
         let Some(residual_values) = rms_norm.shape.num_total_tokens.checked_mul(rms_norm.config.hidden_dim) else {
             return false;
@@ -417,20 +407,20 @@ impl ResidualAddRMSNormReplayInvocation {
             )
     }
 
-    pub fn fuse_residual_add_rms_norm(residual_add: ResidualAddReplayOp, rms_norm: RMSNormReplayOp) -> Self {
+    pub fn fuse_residual_add_rms_norm(residual_add: residual_add::ReplayOp, rms_norm: rms_norm::ReplayOp) -> Self {
         assert!(
             Self::is_residual_add_rms_norm_fusion_compatible(&residual_add, &rms_norm),
             "residual-add output must be the fused RMSNorm input"
         );
-        let config = ResidualAddRMSNormConfig {
+        let config = Config {
             hidden_dim: rms_norm.config.hidden_dim,
             eps: rms_norm.config.eps,
             io_dtype: rms_norm.config.io_dtype,
         };
-        let shape = ResidualAddRMSNormShape {
+        let shape = Shape {
             num_total_tokens: rms_norm.shape.num_total_tokens,
         };
-        let buffers = ResidualAddRMSNormOwnedBuffers::new(
+        let buffers = OwnedBuffers::new(
             residual_add.buffers.lhs,
             residual_add.buffers.lhs_len_bytes,
             residual_add.buffers.rhs,
@@ -448,22 +438,18 @@ impl ResidualAddRMSNormReplayInvocation {
         }
     }
 
-    fn new(
-        config: ResidualAddRMSNormConfig,
-        shape: ResidualAddRMSNormShape,
-        buffers: ResidualAddRMSNormOwnedBuffers,
-    ) -> Self {
+    fn new(config: Config, shape: Shape, buffers: OwnedBuffers) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
-        let specialization = ResidualAddRMSNormKernelSpecialization::new(config, selected_kernel_kind(config));
+        let constants = KernelConstants::new(config, selected_kernel_kind(config));
         Self {
             pipeline: Kernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_rms_norm_function_name(config, specialization.kind),
+                residual_add_rms_norm_function_name(config, constants.kind),
             )
             .as_raw_retained(),
             config,
-            specialization,
+            constants,
             shape,
             buffers,
             num_active_tokens_key: None,
@@ -471,22 +457,22 @@ impl ResidualAddRMSNormReplayInvocation {
     }
 
     fn new_bucketed(
-        config: ResidualAddRMSNormConfig,
-        capacity_shape: ResidualAddRMSNormShape,
+        config: Config,
+        capacity_shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: ResidualAddRMSNormOwnedBuffers,
+        buffers: OwnedBuffers,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
-        let specialization = ResidualAddRMSNormKernelSpecialization::new(config, selected_kernel_kind(config));
+        let constants = KernelConstants::new(config, selected_kernel_kind(config));
         Self {
             pipeline: Kernel::new(
                 &device,
                 RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_rms_norm_function_name(config, specialization.kind),
+                residual_add_rms_norm_function_name(config, constants.kind),
             )
             .as_raw_retained(),
             config,
-            specialization,
+            constants,
             shape: capacity_shape,
             buffers,
             num_active_tokens_key: Some(num_active_tokens_key),
@@ -504,41 +490,38 @@ impl ResidualAddRMSNormReplayInvocation {
     }
 }
 
-impl ResidualAddCaptureRMSNormReplayInvocation {
+impl CaptureReplayInvocation {
     pub fn is_residual_add_capture_rms_norm_fusion_compatible(
-        residual_add: &ResidualAddCaptureReplayOp,
-        rms_norm: &RMSNormReplayOp,
+        residual_add: &residual_add::CaptureReplayOp,
+        rms_norm: &rms_norm::ReplayOp,
     ) -> bool {
-        residual_add.residual.config == ResidualAddConfig::bf16()
+        residual_add.residual.config == residual_add::Config::bf16()
             && rms_norm.config.io_dtype == Dtype::Bfloat16
             && residual_add.residual.row_shape.is_some()
             && residual_add.capture.column_end - residual_add.capture.column_start == rms_norm.config.hidden_dim
-            && ResidualAddRMSNormReplayInvocation::is_residual_add_rms_norm_fusion_compatible(
-                &residual_add.residual,
-                rms_norm,
-            )
+            && ReplayInvocation::is_residual_add_rms_norm_fusion_compatible(&residual_add.residual, rms_norm)
     }
 
     pub fn fuse_residual_add_capture_rms_norm(
-        residual_add: ResidualAddCaptureReplayOp,
-        rms_norm: RMSNormReplayOp,
+        residual_add: residual_add::CaptureReplayOp,
+        rms_norm: rms_norm::ReplayOp,
     ) -> Self {
         assert!(
             Self::is_residual_add_capture_rms_norm_fusion_compatible(&residual_add, &rms_norm),
             "residual-add capture and RMSNorm must have compatible buffers, shapes, dtypes, and replay domains"
         );
 
-        let config = ResidualAddRMSNormConfig {
+        let config = Config {
             hidden_dim: rms_norm.config.hidden_dim,
             eps: rms_norm.config.eps,
             io_dtype: rms_norm.config.io_dtype,
         };
-        let shape = ResidualAddRMSNormShape {
+        let shape = Shape {
             num_total_tokens: rms_norm.shape.num_total_tokens,
         };
         let capture_num_columns = residual_add.capture.num_destination_columns;
         let capture_column_start = residual_add.capture.column_start;
-        let buffers = ResidualAddCaptureRMSNormOwnedBuffers::new(
+        let buffers = CaptureOwnedBuffers::new(
             residual_add.residual.buffers.lhs,
             residual_add.residual.buffers.lhs_len_bytes,
             residual_add.residual.buffers.rhs,
@@ -559,15 +542,14 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
     }
 
     fn new(
-        config: ResidualAddRMSNormConfig,
-        shape: ResidualAddRMSNormShape,
-        buffers: ResidualAddCaptureRMSNormOwnedBuffers,
+        config: Config,
+        shape: Shape,
+        buffers: CaptureOwnedBuffers,
         capture_num_columns: u32,
         capture_column_start: u32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
-        let specialization =
-            ResidualAddRMSNormKernelSpecialization::new(config, ResidualAddRMSNormKernelKind::Bf16Vectorized);
+        let constants = KernelConstants::new(config, KernelKind::Bf16Vectorized);
         Self {
             pipeline: Kernel::new(
                 &device,
@@ -576,7 +558,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             )
             .as_raw_retained(),
             config,
-            specialization,
+            constants,
             shape,
             buffers,
             capture_num_columns,
@@ -586,16 +568,15 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
     }
 
     fn new_bucketed(
-        config: ResidualAddRMSNormConfig,
-        capacity_shape: ResidualAddRMSNormShape,
+        config: Config,
+        capacity_shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: ResidualAddCaptureRMSNormOwnedBuffers,
+        buffers: CaptureOwnedBuffers,
         capture_num_columns: u32,
         capture_column_start: u32,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
-        let specialization =
-            ResidualAddRMSNormKernelSpecialization::new(config, ResidualAddRMSNormKernelKind::Bf16Vectorized);
+        let constants = KernelConstants::new(config, KernelKind::Bf16Vectorized);
         Self {
             pipeline: Kernel::new(
                 &device,
@@ -604,7 +585,7 @@ impl ResidualAddCaptureRMSNormReplayInvocation {
             )
             .as_raw_retained(),
             config,
-            specialization,
+            constants,
             shape: capacity_shape,
             buffers,
             capture_num_columns,
@@ -670,16 +651,16 @@ fn record_num_active_tokens(
     }
 }
 
-fn selected_kernel_kind(config: ResidualAddRMSNormConfig) -> ResidualAddRMSNormKernelKind {
+fn selected_kernel_kind(config: Config) -> KernelKind {
     match config.io_dtype {
-        Dtype::Float32 => ResidualAddRMSNormKernelKind::Scalar,
-        Dtype::Bfloat16 => ResidualAddRMSNormKernelKind::Bf16Vectorized,
+        Dtype::Float32 => KernelKind::Scalar,
+        Dtype::Bfloat16 => KernelKind::Bf16Vectorized,
         dtype => panic!("unsupported residual-add RMSNorm dtype {dtype:?}"),
     }
 }
 
-fn validate_kernel_kind(config: ResidualAddRMSNormConfig, kind: ResidualAddRMSNormKernelKind) {
-    if kind == ResidualAddRMSNormKernelKind::Bf16Vectorized {
+fn validate_kernel_kind(config: Config, kind: KernelKind) {
+    if kind == KernelKind::Bf16Vectorized {
         assert_eq!(config.io_dtype, Dtype::Bfloat16);
         assert!(
             config.hidden_dim.is_multiple_of(4),
@@ -688,19 +669,16 @@ fn validate_kernel_kind(config: ResidualAddRMSNormConfig, kind: ResidualAddRMSNo
     }
 }
 
-fn residual_add_rms_norm_function_name(
-    config: ResidualAddRMSNormConfig,
-    kind: ResidualAddRMSNormKernelKind,
-) -> &'static str {
+fn residual_add_rms_norm_function_name(config: Config, kind: KernelKind) -> &'static str {
     match (config.io_dtype, kind) {
-        (Dtype::Float32, ResidualAddRMSNormKernelKind::Scalar) => "residual_add_rms_norm_f32",
-        (Dtype::Bfloat16, ResidualAddRMSNormKernelKind::Scalar) => "residual_add_rms_norm_bf16",
-        (Dtype::Bfloat16, ResidualAddRMSNormKernelKind::Bf16Vectorized) => "residual_add_rms_norm_bf16_vec4",
+        (Dtype::Float32, KernelKind::Scalar) => "residual_add_rms_norm_f32",
+        (Dtype::Bfloat16, KernelKind::Scalar) => "residual_add_rms_norm_bf16",
+        (Dtype::Bfloat16, KernelKind::Bf16Vectorized) => "residual_add_rms_norm_bf16_vec4",
         (dtype, kind) => panic!("unsupported residual-add RMSNorm kernel: dtype={dtype:?} kind={kind:?}"),
     }
 }
 
-fn residual_add_capture_rms_norm_function_name(config: ResidualAddRMSNormConfig) -> &'static str {
+fn residual_add_capture_rms_norm_function_name(config: Config) -> &'static str {
     match config.io_dtype {
         Dtype::Bfloat16 => "residual_add_capture_rms_norm_bf16_vec4",
         dtype => panic!("unsupported residual-add capture RMSNorm dtype {dtype:?}"),
@@ -714,30 +692,19 @@ mod tests {
     use half::bf16;
 
     use super::*;
-    use crate::components::RMSNormBuffers;
-    use crate::components::RMSNormConfig;
-    use crate::components::RMSNormKernel;
-    use crate::components::RMSNormShape;
-    use crate::components::ResidualAddBuffers;
-    use crate::components::ResidualAddConfig;
-    use crate::components::ResidualAddKernel;
-    use crate::components::ResidualAddShape;
     use crate::metal::Stream;
 
     #[test]
-    fn test_specialization_has_explicit_thread_block_scope() {
-        let specialization = ResidualAddRMSNormKernelSpecialization::new(
-            ResidualAddRMSNormConfig::bf16(128, 1.0e-6),
-            ResidualAddRMSNormKernelKind::Bf16Vectorized,
-        );
-        assert_eq!(specialization.kind, ResidualAddRMSNormKernelKind::Bf16Vectorized);
-        assert_eq!(specialization.thread_block.required_threads, 1024);
+    fn test_constants_have_explicit_thread_block_scope() {
+        let constants = KernelConstants::new(Config::bf16(128, 1.0e-6), KernelKind::Bf16Vectorized);
+        assert_eq!(constants.kind, KernelKind::Bf16Vectorized);
+        assert_eq!(constants.thread_block.required_threads, 1024);
     }
 
     #[test]
     #[should_panic(expected = "BF16 residual-add RMSNorm hidden_dim must be divisible by 4")]
     fn test_bf16_rejects_non_vector_width() {
-        ResidualAddRMSNormConfig::bf16(6, 1.0e-6).validate();
+        Config::bf16(6, 1.0e-6).validate();
     }
 
     #[test]
@@ -746,13 +713,12 @@ mod tests {
         let stream = Stream::new(&device);
         let tokens = 3;
         let hidden_dim = 128;
-        let residual_add = ResidualAddKernel::new(&device, ResidualAddConfig::bf16());
-        let rms_norm = RMSNormKernel::new(&device, RMSNormConfig::bf16(hidden_dim as u32, 1.0e-6));
-        let config = ResidualAddRMSNormConfig::bf16(hidden_dim as u32, 1.0e-6);
-        let fused_scalar =
-            ResidualAddRMSNormKernel::new_with_kind(&device, config, ResidualAddRMSNormKernelKind::Scalar);
-        let fused = ResidualAddRMSNormKernel::new(&device, config);
-        let shape = ResidualAddRMSNormShape {
+        let residual_add = residual_add::Compute::new(&device, residual_add::Config::bf16());
+        let rms_norm = rms_norm::Compute::new(&device, rms_norm::Config::bf16(hidden_dim as u32, 1.0e-6));
+        let config = Config::bf16(hidden_dim as u32, 1.0e-6);
+        let fused_scalar = Compute::new_with_kind(&device, config, KernelKind::Scalar);
+        let fused = Compute::new(&device, config);
+        let shape = Shape {
             num_total_tokens: tokens as u32,
         };
         let num_values = tokens * hidden_dim;
@@ -768,20 +734,20 @@ mod tests {
 
         let mut builder = stream.create_replay_program();
         builder.record(residual_add.invoke(
-            ResidualAddShape {
+            residual_add::Shape {
                 num_values: num_values as u32,
             },
-            ResidualAddBuffers {
+            residual_add::Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
                 output: &unfused_residual,
             },
         ));
         builder.record_with_barrier_before(rms_norm.invoke(
-            RMSNormShape {
+            rms_norm::Shape {
                 num_total_tokens: tokens as u32,
             },
-            RMSNormBuffers {
+            rms_norm::Buffers {
                 input: &unfused_residual,
                 weight: &weight,
                 output: &unfused_norm,
@@ -792,7 +758,7 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(fused_scalar.invoke(
             shape,
-            ResidualAddRMSNormBuffers {
+            Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
                 weight: &weight,
@@ -814,7 +780,7 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(fused.invoke(
             shape,
-            ResidualAddRMSNormBuffers {
+            Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
                 weight: &weight,

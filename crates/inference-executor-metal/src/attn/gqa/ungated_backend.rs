@@ -17,11 +17,8 @@ use inference_backend_metal::components::GQASplitKVTiledQKernels;
 use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
 use inference_backend_metal::components::GQASplitKVTiledQShape;
-use inference_backend_metal::components::RMSNormRopeBuffers;
-use inference_backend_metal::components::RMSNormRopeConfig;
-use inference_backend_metal::components::RMSNormRopeKernel;
-use inference_backend_metal::components::RMSNormRopeShape;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -109,8 +106,8 @@ pub struct UngatedGQA {
     sdpa_selector: Selector,
     qkv: AffineQuantizedMatmul,
     qkv_to_q_k_v: GQAQKVSplitKernel,
-    q_norm_rope: RMSNormRopeKernel,
-    k_norm_rope: RMSNormRopeKernel,
+    q_norm_rope: rms_norm_rope::Compute,
+    k_norm_rope: rms_norm_rope::Compute,
     kv_page_write: GQAKVPageWrite,
     output: AffineQuantizedMatmul,
 }
@@ -148,8 +145,8 @@ impl UngatedGQA {
             ),
             qkv: AffineQuantizedMatmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, config)),
             qkv_to_q_k_v: GQAQKVSplitKernel::new(device, qkv_to_q_k_v_config(&core, config)),
-            q_norm_rope: RMSNormRopeKernel::new(device, norm_rope_config(&core, config, core.num_q_heads)),
-            k_norm_rope: RMSNormRopeKernel::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
+            q_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_q_heads)),
+            k_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
             kv_page_write: GQAKVPageWrite::new(device, kv_page_write_config(&core, config)),
             output: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
         }
@@ -227,7 +224,7 @@ impl ReplayLayer for UngatedGQA {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.q_norm_rope.invoke(
             self.norm_rope_shape(shape),
-            RMSNormRopeBuffers {
+            rms_norm_rope::Buffers {
                 input: scratch.q,
                 norm_weight: weights.q_norm_weight,
                 flat_token_indices: batch_metadata.flat_token_indices(),
@@ -236,7 +233,7 @@ impl ReplayLayer for UngatedGQA {
         )));
         recorder.record(ReplayOp::opaque(self.k_norm_rope.invoke(
             self.norm_rope_shape(shape),
-            RMSNormRopeBuffers {
+            rms_norm_rope::Buffers {
                 input: scratch.k,
                 norm_weight: weights.k_norm_weight,
                 flat_token_indices: batch_metadata.flat_token_indices(),
@@ -359,8 +356,8 @@ impl UngatedGQA {
         }
     }
 
-    fn norm_rope_shape(&self, shape: GQAReplayShape) -> RMSNormRopeShape {
-        RMSNormRopeShape {
+    fn norm_rope_shape(&self, shape: GQAReplayShape) -> rms_norm_rope::Shape {
+        rms_norm_rope::Shape {
             num_total_tokens: shape.num_tokens,
         }
     }
@@ -474,12 +471,12 @@ fn qkv_to_q_k_v_config(core: &UngatedGQACore, config: GQAMetalConfig) -> GQAQKVS
     }
 }
 
-fn norm_rope_config(core: &UngatedGQACore, config: GQAMetalConfig, num_heads: usize) -> RMSNormRopeConfig {
+fn norm_rope_config(core: &UngatedGQACore, config: GQAMetalConfig, num_heads: usize) -> rms_norm_rope::Config {
     let num_heads_u32 = num_heads.try_into().expect("ungated GQA head count must fit u32");
     let head_dim = core.head_dim.try_into().expect("ungated GQA head_dim must fit u32");
     let norm_rope = match config.io_dtype {
         Dtype::Float32 => {
-            RMSNormRopeConfig::f32(
+            rms_norm_rope::Config::f32(
                 num_heads_u32,
                 head_dim,
                 config.rope_dim,
@@ -488,7 +485,7 @@ fn norm_rope_config(core: &UngatedGQACore, config: GQAMetalConfig, num_heads: us
             )
         },
         Dtype::Bfloat16 => {
-            RMSNormRopeConfig::bf16(
+            rms_norm_rope::Config::bf16(
                 num_heads_u32,
                 head_dim,
                 config.rope_dim,

@@ -19,13 +19,13 @@ const RESIDUAL_ADD_SOURCE: &str = include_str!("metal/residual_add.metal");
 const REQUIRED_THREADS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResidualAddConfig {
+pub struct Config {
     pub lhs_dtype: Dtype,
     pub rhs_dtype: Dtype,
     pub output_dtype: Dtype,
 }
 
-impl ResidualAddConfig {
+impl Config {
     pub fn f32() -> Self {
         Self {
             lhs_dtype: Dtype::Float32,
@@ -65,7 +65,7 @@ impl ResidualAddConfig {
         );
     }
 
-    pub fn lhs_bytes(self, shape: ResidualAddShape) -> usize {
+    pub fn lhs_bytes(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         (shape.num_values as usize)
@@ -73,7 +73,7 @@ impl ResidualAddConfig {
             .expect("residual-add lhs byte length must fit usize")
     }
 
-    pub fn rhs_bytes(self, shape: ResidualAddShape) -> usize {
+    pub fn rhs_bytes(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         (shape.num_values as usize)
@@ -81,7 +81,7 @@ impl ResidualAddConfig {
             .expect("residual-add rhs byte length must fit usize")
     }
 
-    pub fn output_bytes(self, shape: ResidualAddShape) -> usize {
+    pub fn output_bytes(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         (shape.num_values as usize)
@@ -91,11 +91,11 @@ impl ResidualAddConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResidualAddShape {
+pub struct Shape {
     pub num_values: u32,
 }
 
-impl ResidualAddShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_values > 0);
     }
@@ -105,12 +105,12 @@ impl ResidualAddShape {
 ///
 /// Both fields count elements. They do not count bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResidualAddRowShape {
+pub struct RowShape {
     pub num_total_rows: u32,
     pub num_columns: u32,
 }
 
-impl ResidualAddRowShape {
+impl RowShape {
     pub fn validate(self) {
         assert!(self.num_total_rows > 0);
         assert!(self.num_columns > 0);
@@ -126,7 +126,7 @@ impl ResidualAddRowShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct ResidualAddBuffers<'a> {
+pub struct Buffers<'a> {
     pub lhs: &'a Buffer,
     pub rhs: &'a Buffer,
     pub output: &'a Buffer,
@@ -139,13 +139,13 @@ pub struct ResidualAddBuffers<'a> {
 ///                  +--> output = lhs + rhs --> buffers.output
 /// buffers.rhs ----/
 /// ```
-pub struct ResidualAddKernel {
-    config: ResidualAddConfig,
+pub struct Compute {
+    config: Config,
     kernel: Kernel,
 }
 
-impl ResidualAddKernel {
-    pub fn new(device: &Device, config: ResidualAddConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
@@ -153,8 +153,8 @@ impl ResidualAddKernel {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: ResidualAddShape, buffers: ResidualAddBuffers<'a>) -> ResidualAddInvocation<'a> {
-        ResidualAddInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             kernel: &self.kernel,
             config: self.config,
             shape,
@@ -165,15 +165,11 @@ impl ResidualAddKernel {
     }
 
     /// Records an exact number of complete rows.
-    pub fn invoke_rows<'a>(
-        &'a self,
-        shape: ResidualAddRowShape,
-        buffers: ResidualAddBuffers<'a>,
-    ) -> ResidualAddInvocation<'a> {
-        ResidualAddInvocation {
+    pub fn invoke_rows<'a>(&'a self, shape: RowShape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             kernel: &self.kernel,
             config: self.config,
-            shape: ResidualAddShape {
+            shape: Shape {
                 num_values: shape.num_values(),
             },
             buffers,
@@ -185,14 +181,14 @@ impl ResidualAddKernel {
     /// Records a fixed-capacity grid whose active row count is supplied at submission.
     pub fn invoke_bucketed<'a>(
         &'a self,
-        capacity_shape: ResidualAddRowShape,
+        capacity_shape: RowShape,
         num_active_rows_key: ReplayParameterKey,
-        buffers: ResidualAddBuffers<'a>,
-    ) -> ResidualAddInvocation<'a> {
-        ResidualAddInvocation {
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             kernel: &self.kernel,
             config: self.config,
-            shape: ResidualAddShape {
+            shape: Shape {
                 num_values: capacity_shape.num_values(),
             },
             buffers,
@@ -202,42 +198,42 @@ impl ResidualAddKernel {
     }
 }
 
-pub struct ResidualAddInvocation<'a> {
+pub struct Invocation<'a> {
     kernel: &'a Kernel,
-    config: ResidualAddConfig,
-    shape: ResidualAddShape,
-    buffers: ResidualAddBuffers<'a>,
-    row_shape: Option<ResidualAddRowShape>,
+    config: Config,
+    shape: Shape,
+    buffers: Buffers<'a>,
+    row_shape: Option<RowShape>,
     num_active_rows_key: Option<ReplayParameterKey>,
 }
 
-pub struct ResidualAddReplayInvocation {
+pub struct ReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: ResidualAddConfig,
-    shape: ResidualAddShape,
-    buffers: ResidualAddOwnedBuffers,
-    row_shape: Option<ResidualAddRowShape>,
+    config: Config,
+    shape: Shape,
+    buffers: OwnedBuffers,
+    row_shape: Option<RowShape>,
     num_active_rows_key: Option<ReplayParameterKey>,
 }
 
-pub struct ResidualAddReplayOp {
+pub struct ReplayOp {
     pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pub config: ResidualAddConfig,
-    pub shape: ResidualAddShape,
-    pub buffers: ResidualAddOwnedBuffers,
-    pub row_shape: Option<ResidualAddRowShape>,
+    pub config: Config,
+    pub shape: Shape,
+    pub buffers: OwnedBuffers,
+    pub row_shape: Option<RowShape>,
     pub num_active_rows_key: Option<ReplayParameterKey>,
 }
 
-pub struct ResidualAddCaptureReplayOp {
-    pub residual: ResidualAddReplayOp,
-    pub capture: OwnedResidualAddCaptureTarget,
+pub struct CaptureReplayOp {
+    pub residual: ReplayOp,
+    pub capture: OwnedCaptureTarget,
 }
 
-pub struct ResidualAddCaptureReplayInvocation {
+pub struct CaptureReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    residual: ResidualAddReplayOp,
-    capture: OwnedResidualAddCaptureTarget,
+    residual: ReplayOp,
+    capture: OwnedCaptureTarget,
 }
 
 /// Destination for capturing every complete row produced by a residual add.
@@ -250,18 +246,18 @@ pub struct ResidualAddCaptureReplayInvocation {
 /// destination range width, destination column count, and destination column
 /// start must therefore be divisible by four.
 ///
-/// The residual invocation must carry an explicit `ResidualAddRowShape`.
+/// The residual invocation must carry an explicit `RowShape`.
 /// Recording checks that its column count equals the selected column count.
 /// Recording also checks destination capacity and buffer aliasing.
 #[derive(Clone, Copy)]
-pub struct ResidualAddCaptureTarget<'a> {
+pub struct CaptureTarget<'a> {
     buffer: &'a Buffer,
     num_destination_columns: u32,
     column_start: u32,
     column_end: u32,
 }
 
-pub struct OwnedResidualAddCaptureTarget {
+pub struct OwnedCaptureTarget {
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub buffer_len_bytes: usize,
     pub num_destination_columns: u32,
@@ -270,7 +266,7 @@ pub struct OwnedResidualAddCaptureTarget {
 }
 
 #[derive(Clone)]
-pub struct ResidualAddOwnedBuffers {
+pub struct OwnedBuffers {
     pub lhs: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub lhs_len_bytes: usize,
     pub rhs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -279,7 +275,7 @@ pub struct ResidualAddOwnedBuffers {
     pub output_len_bytes: usize,
 }
 
-impl Operator for ResidualAddInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_kernel(self.kernel);
@@ -291,7 +287,7 @@ impl Operator for ResidualAddInvocation<'_> {
     }
 }
 
-impl Operator for ResidualAddReplayInvocation {
+impl Operator for ReplayInvocation {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_retained_pipeline_state(&self.pipeline);
@@ -303,7 +299,7 @@ impl Operator for ResidualAddReplayInvocation {
     }
 }
 
-impl Operator for ResidualAddCaptureReplayInvocation {
+impl Operator for CaptureReplayInvocation {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_retained_pipeline_state(&self.pipeline);
@@ -324,7 +320,7 @@ impl Operator for ResidualAddCaptureReplayInvocation {
     }
 }
 
-impl<'a> ResidualAddCaptureTarget<'a> {
+impl<'a> CaptureTarget<'a> {
     /// Selects the destination columns for every complete residual row.
     ///
     /// `num_destination_columns` and `columns` are element counts and tensor
@@ -365,13 +361,13 @@ impl<'a> ResidualAddCaptureTarget<'a> {
     }
 }
 
-impl ResidualAddInvocation<'_> {
-    pub fn into_replay_op(self) -> ResidualAddReplayOp {
-        ResidualAddReplayOp {
+impl Invocation<'_> {
+    pub fn into_replay_op(self) -> ReplayOp {
+        ReplayOp {
             pipeline: self.kernel.as_raw_retained(),
             config: self.config,
             shape: self.shape,
-            buffers: ResidualAddOwnedBuffers {
+            buffers: OwnedBuffers {
                 lhs: self.buffers.lhs.as_raw_retained(),
                 lhs_len_bytes: self.buffers.lhs.len_bytes(),
                 rhs: self.buffers.rhs.as_raw_retained(),
@@ -384,14 +380,14 @@ impl ResidualAddInvocation<'_> {
         }
     }
 
-    pub fn into_capture_replay_op(self, capture: ResidualAddCaptureTarget<'_>) -> ResidualAddCaptureReplayOp {
+    pub fn into_capture_replay_op(self, capture: CaptureTarget<'_>) -> CaptureReplayOp {
         assert!(
             self.row_shape.is_some(),
             "residual-add capture requires an explicit row shape"
         );
-        ResidualAddCaptureReplayOp {
+        CaptureReplayOp {
             residual: self.into_replay_op(),
-            capture: OwnedResidualAddCaptureTarget {
+            capture: OwnedCaptureTarget {
                 buffer: capture.buffer.as_raw_retained(),
                 buffer_len_bytes: capture.buffer.len_bytes(),
                 num_destination_columns: capture.num_destination_columns,
@@ -415,9 +411,9 @@ impl ResidualAddInvocation<'_> {
     }
 }
 
-impl ResidualAddReplayOp {
-    pub fn into_replay(self) -> ResidualAddReplayInvocation {
-        ResidualAddReplayInvocation {
+impl ReplayOp {
+    pub fn into_replay(self) -> ReplayInvocation {
+        ReplayInvocation {
             pipeline: self.pipeline,
             config: self.config,
             shape: self.shape,
@@ -428,10 +424,10 @@ impl ResidualAddReplayOp {
     }
 }
 
-impl ResidualAddCaptureReplayOp {
-    pub fn into_replay(self) -> ResidualAddCaptureReplayInvocation {
+impl CaptureReplayOp {
+    pub fn into_replay(self) -> CaptureReplayInvocation {
         let device = Device::from_raw_retained(self.residual.buffers.lhs.device());
-        ResidualAddCaptureReplayInvocation {
+        CaptureReplayInvocation {
             pipeline: Kernel::new(&device, RESIDUAL_ADD_SOURCE, "residual_add_capture_bf16_vec4").as_raw_retained(),
             residual: self.residual,
             capture: self.capture,
@@ -439,7 +435,7 @@ impl ResidualAddCaptureReplayOp {
     }
 }
 
-impl ResidualAddReplayInvocation {
+impl ReplayInvocation {
     fn validate(&self) {
         self.config.validate();
         self.shape.validate();
@@ -454,8 +450,8 @@ impl ResidualAddReplayInvocation {
     }
 }
 
-impl ResidualAddCaptureReplayInvocation {
-    fn row_shape(&self) -> ResidualAddRowShape {
+impl CaptureReplayInvocation {
+    fn row_shape(&self) -> RowShape {
         self.residual
             .row_shape
             .expect("residual-add capture requires an explicit row shape")
@@ -467,7 +463,7 @@ impl ResidualAddCaptureReplayInvocation {
         let row_shape = self.row_shape();
         row_shape.validate();
         assert_eq!(self.residual.shape.num_values, row_shape.num_values());
-        assert_eq!(self.residual.config, ResidualAddConfig::bf16());
+        assert_eq!(self.residual.config, Config::bf16());
         assert_eq!(
             self.capture.column_end - self.capture.column_start,
             row_shape.num_columns,
@@ -500,8 +496,8 @@ impl ResidualAddCaptureReplayInvocation {
 
 fn record_shape(
     recorder: &CommandRecorder,
-    shape: ResidualAddShape,
-    row_shape: Option<ResidualAddRowShape>,
+    shape: Shape,
+    row_shape: Option<RowShape>,
     num_active_rows_key: Option<ReplayParameterKey>,
 ) {
     match (row_shape, num_active_rows_key) {
@@ -528,7 +524,7 @@ fn dispatch_values(recorder: &CommandRecorder, num_values: u32) {
     );
 }
 
-fn residual_add_function_name(config: ResidualAddConfig) -> &'static str {
+fn residual_add_function_name(config: Config) -> &'static str {
     match (config.lhs_dtype, config.rhs_dtype, config.output_dtype) {
         (Dtype::Float32, Dtype::Float32, Dtype::Float32) => "residual_add_f32",
         (Dtype::Bfloat16, Dtype::Bfloat16, Dtype::Bfloat16) => "residual_add_bf16",

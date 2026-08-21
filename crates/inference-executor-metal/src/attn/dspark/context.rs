@@ -3,10 +3,7 @@ use inference_backend_metal::components::GQAKVPageWriteBuffers;
 use inference_backend_metal::components::GQAKVPageWriteConfig;
 use inference_backend_metal::components::GQAKVPageWriteShape;
 use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
-use inference_backend_metal::components::RMSNormRopeBuffers;
-use inference_backend_metal::components::RMSNormRopeConfig;
-use inference_backend_metal::components::RMSNormRopeKernel;
-use inference_backend_metal::components::RMSNormRopeShape;
+use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -55,7 +52,7 @@ pub struct UngatedDSparkGQAContextAppender {
     metal: GQAMetalConfig,
     k: AffineQuantizedMatmul,
     v: AffineQuantizedMatmul,
-    k_norm_rope: RMSNormRopeKernel,
+    k_norm_rope: rms_norm_rope::Compute,
     kv_page_write: GQAKVPageWrite,
 }
 
@@ -99,7 +96,7 @@ impl UngatedDSparkGQAContextAppender {
         Self {
             k: AffineQuantizedMatmul::new(device, kv_config),
             v: AffineQuantizedMatmul::new(device, kv_config),
-            k_norm_rope: RMSNormRopeKernel::new(device, k_norm_rope_config(attention, metal)),
+            k_norm_rope: rms_norm_rope::Compute::new(device, k_norm_rope_config(attention, metal)),
             kv_page_write: GQAKVPageWrite::new(
                 device,
                 GQAKVPageWriteConfig {
@@ -167,10 +164,10 @@ impl UngatedDSparkGQAContextAppender {
             offsets.v_affine,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.k_norm_rope.invoke(
-            RMSNormRopeShape {
+            rms_norm_rope::Shape {
                 num_total_tokens: input.num_tokens,
             },
-            RMSNormRopeBuffers {
+            rms_norm_rope::Buffers {
                 input: input.scratch.k,
                 norm_weight: input.weights.k_norm_weight,
                 flat_token_indices: input.flat_token_indices,
@@ -270,16 +267,18 @@ fn attention_kv_config(
 fn k_norm_rope_config(
     core: &inference_executor_core::attn::UngatedGQACore,
     metal: GQAMetalConfig,
-) -> RMSNormRopeConfig {
+) -> rms_norm_rope::Config {
     let num_heads = core
         .num_kv_heads
         .try_into()
         .expect("DSpark context KV-head count must fit u32");
     let head_dim = core.head_dim.try_into().expect("DSpark context head_dim must fit u32");
     let norm_rope = match metal.io_dtype {
-        Dtype::Float32 => RMSNormRopeConfig::f32(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta),
+        Dtype::Float32 => {
+            rms_norm_rope::Config::f32(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
+        },
         Dtype::Bfloat16 => {
-            RMSNormRopeConfig::bf16(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
+            rms_norm_rope::Config::bf16(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
         },
         dtype => panic!("unsupported DSpark context dtype {dtype:?}"),
     };
@@ -288,7 +287,7 @@ fn k_norm_rope_config(
 
 #[cfg(test)]
 mod tests {
-    use inference_backend_metal::components::RopeScaling;
+    use inference_backend_metal::components::rms_norm_rope::RopeScaling;
     use inference_executor_core::attn::UngatedGQACore;
 
     use super::*;

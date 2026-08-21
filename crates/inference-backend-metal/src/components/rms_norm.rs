@@ -16,44 +16,44 @@ const RMS_NORM_SOURCE: &str = include_str!("metal/rms_norm.metal");
 const BF16_VECTOR_WIDTH: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RMSNormKernelKind {
+enum KernelKind {
     F32,
     Bf16Vectorized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RMSNormThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RMSNormKernelSpecialization {
-    kind: RMSNormKernelKind,
-    thread_block: RMSNormThreadBlockSpecialization,
+struct KernelConstants {
+    kind: KernelKind,
+    thread_block: ThreadBlockConstants,
 }
 
-impl RMSNormKernelSpecialization {
-    fn new(config: RMSNormConfig) -> Self {
+impl KernelConstants {
+    fn new(config: Config) -> Self {
         config.validate();
         Self {
             kind: match config.io_dtype {
-                Dtype::Float32 => RMSNormKernelKind::F32,
-                Dtype::Bfloat16 => RMSNormKernelKind::Bf16Vectorized,
+                Dtype::Float32 => KernelKind::F32,
+                Dtype::Bfloat16 => KernelKind::Bf16Vectorized,
                 dtype => panic!("unsupported RMSNorm dtype {dtype:?}"),
             },
-            thread_block: RMSNormThreadBlockSpecialization { required_threads: 1024 },
+            thread_block: ThreadBlockConstants { required_threads: 1024 },
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RMSNormConfig {
+pub struct Config {
     pub hidden_dim: u32,
     pub eps: f32,
     pub io_dtype: Dtype,
 }
 
-impl RMSNormConfig {
+impl Config {
     pub fn f32(hidden_dim: u32, eps: f32) -> Self {
         Self {
             hidden_dim,
@@ -81,7 +81,7 @@ impl RMSNormConfig {
         );
     }
 
-    pub fn num_values(self, shape: RMSNormShape) -> usize {
+    pub fn num_values(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         (shape.num_total_tokens as usize)
@@ -89,7 +89,7 @@ impl RMSNormConfig {
             .expect("RMSNorm value count must fit usize")
     }
 
-    pub fn bytes(self, shape: RMSNormShape) -> usize {
+    pub fn bytes(self, shape: Shape) -> usize {
         self.num_values(shape)
             .checked_mul(self.io_dtype.item_size())
             .expect("RMSNorm byte length must fit usize")
@@ -104,18 +104,18 @@ impl RMSNormConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RMSNormShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl RMSNormShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_tokens > 0);
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct RMSNormBuffers<'a> {
+pub struct Buffers<'a> {
     pub input: &'a Buffer,
     pub weight: &'a Buffer,
     pub output: &'a Buffer,
@@ -128,28 +128,28 @@ pub struct RMSNormBuffers<'a> {
 ///                    +--> RMSNorm --> buffers.output
 /// buffers.weight ---/
 /// ```
-pub struct RMSNormKernel {
-    config: RMSNormConfig,
-    specialization: RMSNormKernelSpecialization,
+pub struct Compute {
+    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl RMSNormKernel {
-    pub fn new(device: &Device, config: RMSNormConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
-        let specialization = RMSNormKernelSpecialization::new(config);
+        let constants = KernelConstants::new(config);
         Self {
             config,
-            specialization,
-            kernel: Kernel::new(device, RMS_NORM_SOURCE, rms_norm_function_name(specialization)),
+            constants,
+            kernel: Kernel::new(device, RMS_NORM_SOURCE, rms_norm_function_name(constants)),
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: RMSNormShape, buffers: RMSNormBuffers<'a>) -> RMSNormInvocation<'a> {
-        RMSNormInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             kernel: &self.kernel,
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             shape,
             buffers,
             num_active_tokens_key: None,
@@ -159,14 +159,14 @@ impl RMSNormKernel {
     /// Records a fixed-capacity grid whose active token count is supplied at submission.
     pub fn invoke_bucketed<'a>(
         &'a self,
-        capacity_shape: RMSNormShape,
+        capacity_shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: RMSNormBuffers<'a>,
-    ) -> RMSNormInvocation<'a> {
-        RMSNormInvocation {
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             kernel: &self.kernel,
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             shape: capacity_shape,
             buffers,
             num_active_tokens_key: Some(num_active_tokens_key),
@@ -174,35 +174,35 @@ impl RMSNormKernel {
     }
 }
 
-pub struct RMSNormInvocation<'a> {
+pub struct Invocation<'a> {
     kernel: &'a Kernel,
-    config: RMSNormConfig,
-    specialization: RMSNormKernelSpecialization,
-    shape: RMSNormShape,
-    buffers: RMSNormBuffers<'a>,
+    config: Config,
+    constants: KernelConstants,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub struct RMSNormReplayInvocation {
+pub struct ReplayInvocation {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: RMSNormConfig,
-    specialization: RMSNormKernelSpecialization,
-    shape: RMSNormShape,
-    buffers: RMSNormOwnedBuffers,
+    config: Config,
+    constants: KernelConstants,
+    shape: Shape,
+    buffers: OwnedBuffers,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-pub struct RMSNormReplayOp {
+pub struct ReplayOp {
     pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pub config: RMSNormConfig,
-    specialization: RMSNormKernelSpecialization,
-    pub shape: RMSNormShape,
-    pub buffers: RMSNormOwnedBuffers,
+    pub config: Config,
+    constants: KernelConstants,
+    pub shape: Shape,
+    pub buffers: OwnedBuffers,
     pub num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
 #[derive(Clone)]
-pub struct RMSNormOwnedBuffers {
+pub struct OwnedBuffers {
     pub input: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub input_len_bytes: usize,
     pub weight: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -211,7 +211,7 @@ pub struct RMSNormOwnedBuffers {
     pub output_len_bytes: usize,
 }
 
-impl Operator for RMSNormInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_kernel(self.kernel);
@@ -223,12 +223,12 @@ impl Operator for RMSNormInvocation<'_> {
         recorder.set_f32(5, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (self.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-impl Operator for RMSNormReplayInvocation {
+impl Operator for ReplayInvocation {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_retained_pipeline_state(&self.pipeline);
@@ -240,19 +240,19 @@ impl Operator for RMSNormReplayInvocation {
         recorder.set_f32(5, self.config.eps);
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (self.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-impl RMSNormInvocation<'_> {
-    pub fn into_replay_op(self) -> RMSNormReplayOp {
-        RMSNormReplayOp {
+impl Invocation<'_> {
+    pub fn into_replay_op(self) -> ReplayOp {
+        ReplayOp {
             pipeline: self.kernel.as_raw_retained(),
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             shape: self.shape,
-            buffers: RMSNormOwnedBuffers {
+            buffers: OwnedBuffers {
                 input: self.buffers.input.as_raw_retained(),
                 input_len_bytes: self.buffers.input.len_bytes(),
                 weight: self.buffers.weight.as_raw_retained(),
@@ -273,7 +273,7 @@ impl RMSNormInvocation<'_> {
     }
 }
 
-impl RMSNormReplayInvocation {
+impl ReplayInvocation {
     fn validate(&self) {
         self.config.validate();
         self.shape.validate();
@@ -283,12 +283,12 @@ impl RMSNormReplayInvocation {
     }
 }
 
-impl RMSNormReplayOp {
-    pub fn into_replay(self) -> RMSNormReplayInvocation {
-        RMSNormReplayInvocation {
+impl ReplayOp {
+    pub fn into_replay(self) -> ReplayInvocation {
+        ReplayInvocation {
             pipeline: self.pipeline,
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             shape: self.shape,
             buffers: self.buffers,
             num_active_tokens_key: self.num_active_tokens_key,
@@ -308,10 +308,10 @@ fn record_num_active_tokens(
     }
 }
 
-fn rms_norm_function_name(specialization: RMSNormKernelSpecialization) -> &'static str {
-    match specialization.kind {
-        RMSNormKernelKind::F32 => "rms_norm_f32",
-        RMSNormKernelKind::Bf16Vectorized => "rms_norm_bf16_vec4",
+fn rms_norm_function_name(constants: KernelConstants) -> &'static str {
+    match constants.kind {
+        KernelKind::F32 => "rms_norm_f32",
+        KernelKind::Bf16Vectorized => "rms_norm_bf16_vec4",
     }
 }
 
@@ -327,13 +327,13 @@ mod tests {
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.rms_norm.num_active_tokens");
 
     #[test]
-    fn test_specialization_has_explicit_thread_block_scope() {
-        let f32 = RMSNormKernelSpecialization::new(RMSNormConfig::f32(64, 1.0e-6));
-        assert_eq!(f32.kind, RMSNormKernelKind::F32);
+    fn test_constants_have_explicit_thread_block_scope() {
+        let f32 = KernelConstants::new(Config::f32(64, 1.0e-6));
+        assert_eq!(f32.kind, KernelKind::F32);
         assert_eq!(f32.thread_block.required_threads, 1024);
 
-        let bf16 = RMSNormKernelSpecialization::new(RMSNormConfig::bf16(64, 1.0e-6));
-        assert_eq!(bf16.kind, RMSNormKernelKind::Bf16Vectorized);
+        let bf16 = KernelConstants::new(Config::bf16(64, 1.0e-6));
+        assert_eq!(bf16.kind, KernelKind::Bf16Vectorized);
         assert_eq!(bf16.thread_block.required_threads, 1024);
     }
 
@@ -344,9 +344,9 @@ mod tests {
         let num_active_tokens = 2_u32;
         let num_total_tokens = 4_u32;
         let hidden_dim = 8_u32;
-        let config = RMSNormConfig::f32(hidden_dim, 1.0e-6);
-        let shape = RMSNormShape { num_total_tokens };
-        let kernel = RMSNormKernel::new(&device, config);
+        let config = Config::f32(hidden_dim, 1.0e-6);
+        let shape = Shape { num_total_tokens };
+        let kernel = Compute::new(&device, config);
         let input_values = (0..config.num_values(shape))
             .map(|index| index as f32 * 0.03125 - 0.5)
             .collect::<Vec<_>>();
@@ -362,7 +362,7 @@ mod tests {
         builder.record(kernel.invoke_bucketed(
             shape,
             NUM_ACTIVE_TOKENS,
-            RMSNormBuffers {
+            Buffers {
                 input: &input,
                 weight: &weight,
                 output: &output,
@@ -398,9 +398,9 @@ mod tests {
         let stream = Stream::new(&device);
         let num_total_tokens = 2_u32;
         let hidden_dim = 5120_u32;
-        let config = RMSNormConfig::bf16(hidden_dim, 1.0e-6);
-        let shape = RMSNormShape { num_total_tokens };
-        let kernel = RMSNormKernel::new(&device, config);
+        let config = Config::bf16(hidden_dim, 1.0e-6);
+        let shape = Shape { num_total_tokens };
+        let kernel = Compute::new(&device, config);
         let input_values = (0..config.num_values(shape))
             .map(|index| ((index * 37) % 251) as f32 * 0.03125 - 3.5)
             .collect::<Vec<_>>();
@@ -432,7 +432,7 @@ mod tests {
         builder.record(kernel.invoke_bucketed(
             shape,
             NUM_ACTIVE_TOKENS,
-            RMSNormBuffers {
+            Buffers {
                 input: &input,
                 weight: &weight,
                 output: &output,
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "BF16 RMSNorm hidden_dim must be divisible by 4")]
     fn test_bf16_rejects_non_vector_width() {
-        RMSNormConfig::bf16(3, 1.0e-6).validate();
+        Config::bf16(3, 1.0e-6).validate();
     }
 
     #[allow(clippy::too_many_arguments)]

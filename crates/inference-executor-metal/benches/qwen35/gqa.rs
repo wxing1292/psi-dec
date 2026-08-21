@@ -17,8 +17,7 @@ use inference_backend_metal::components::GQAQGKVSplitConfig;
 use inference_backend_metal::components::GQASplitKVSingleQConfig;
 use inference_backend_metal::components::GQASplitKVSingleQShape;
 use inference_backend_metal::components::GQASplitKVTiledQConfig;
-use inference_backend_metal::components::RMSNormRopeConfig;
-use inference_backend_metal::components::RMSNormRopeShape;
+use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -744,8 +743,8 @@ fn gqa_qgkv_to_q_g_k_v_config(model: GQAModelProfile) -> GQAQGKVSplitConfig {
     )
 }
 
-fn norm_rope_config(num_heads: usize, model: GQAModelProfile) -> RMSNormRopeConfig {
-    RMSNormRopeConfig::bf16(
+fn norm_rope_config(num_heads: usize, model: GQAModelProfile) -> rms_norm_rope::Config {
+    rms_norm_rope::Config::bf16(
         num_heads.try_into().expect("GQA norm head count must fit u32"),
         model.head_dim.try_into().expect("GQA norm head_dim must fit u32"),
         GQA_ROPE_DIM,
@@ -754,8 +753,8 @@ fn norm_rope_config(num_heads: usize, model: GQAModelProfile) -> RMSNormRopeConf
     )
 }
 
-fn norm_rope_shape(num_tokens: u32, _num_heads: usize, _model: GQAModelProfile) -> RMSNormRopeShape {
-    RMSNormRopeShape {
+fn norm_rope_shape(num_tokens: u32, _num_heads: usize, _model: GQAModelProfile) -> rms_norm_rope::Shape {
+    rms_norm_rope::Shape {
         num_total_tokens: num_tokens,
     }
 }

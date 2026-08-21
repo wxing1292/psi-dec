@@ -1,4 +1,4 @@
-use inference_backend_metal::components::ResidualAddCaptureTarget;
+use inference_backend_metal::components::residual_add;
 
 /// Selects stable capture destinations for Main layer residual outputs.
 ///
@@ -6,5 +6,5 @@ use inference_backend_metal::components::ResidualAddCaptureTarget;
 /// must keep returned buffers and column ranges stable for the lifetime of
 /// Main. Capture destinations must not alias Main workspaces.
 pub trait MainResidualCapture {
-    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>>;
+    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<residual_add::CaptureTarget<'_>>;
 }

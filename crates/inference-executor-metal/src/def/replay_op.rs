@@ -1,6 +1,5 @@
-use inference_backend_metal::components::RMSNormInvocation;
-use inference_backend_metal::components::ResidualAddCaptureTarget;
-use inference_backend_metal::components::ResidualAddInvocation;
+use inference_backend_metal::components::residual_add;
+use inference_backend_metal::components::rms_norm;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
@@ -125,7 +124,7 @@ impl<'a> ReplayOp<'a> {
         }
     }
 
-    pub fn residual_add(invocation: ResidualAddInvocation<'a>) -> Self {
+    pub fn residual_add(invocation: residual_add::Invocation<'a>) -> Self {
         Self {
             inner: inference_backend_metal::components::ReplayOp::residual_add(invocation),
         }
@@ -136,15 +135,15 @@ impl<'a> ReplayOp<'a> {
     /// An adjacent compatible RMSNorm fuses opportunistically. Otherwise, the
     /// backend records an independent padding-safe capture operation.
     pub fn residual_add_with_capture(
-        invocation: ResidualAddInvocation<'a>,
-        capture: ResidualAddCaptureTarget<'a>,
+        invocation: residual_add::Invocation<'a>,
+        capture: residual_add::CaptureTarget<'a>,
     ) -> Self {
         Self {
             inner: inference_backend_metal::components::ReplayOp::residual_add_with_capture(invocation, capture),
         }
     }
 
-    pub fn rms_norm(invocation: RMSNormInvocation<'a>) -> Self {
+    pub fn rms_norm(invocation: rms_norm::Invocation<'a>) -> Self {
         Self {
             inner: inference_backend_metal::components::ReplayOp::rms_norm(invocation),
         }

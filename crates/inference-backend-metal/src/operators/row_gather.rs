@@ -11,33 +11,33 @@ use crate::metal::ReplayParameterKey;
 const ROW_GATHER_SOURCE: &str = include_str!("metal/row_gather.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RowGatherThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RowGatherKernelSpecialization {
+struct KernelConstants {
     dtype: Dtype,
-    thread_block: RowGatherThreadBlockSpecialization,
+    thread_block: ThreadBlockConstants,
 }
 
-impl RowGatherKernelSpecialization {
-    fn new(config: RowGatherConfig) -> Self {
+impl KernelConstants {
+    fn new(config: Config) -> Self {
         config.validate();
         Self {
             dtype: config.dtype,
-            thread_block: RowGatherThreadBlockSpecialization { required_threads: 256 },
+            thread_block: ThreadBlockConstants { required_threads: 256 },
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RowGatherConfig {
+pub struct Config {
     pub num_cols: u32,
     pub dtype: Dtype,
 }
 
-impl RowGatherConfig {
+impl Config {
     fn validate(self) {
         assert!(self.num_cols > 0);
         assert!(matches!(self.dtype, Dtype::Bfloat16 | Dtype::Float32));
@@ -51,12 +51,12 @@ impl RowGatherConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RowGatherShape {
+pub struct Shape {
     pub num_total_rows: u32,
 }
 
-impl RowGatherShape {
-    fn validate(self, config: RowGatherConfig) {
+impl Shape {
+    fn validate(self, config: Config) {
         config.validate();
         assert!(self.num_total_rows > 0);
         self.num_values(config);
@@ -68,13 +68,13 @@ impl RowGatherShape {
             .expect("row gather index byte length must fit usize")
     }
 
-    fn output_bytes(self, config: RowGatherConfig) -> usize {
+    fn output_bytes(self, config: Config) -> usize {
         (self.num_values(config) as usize)
             .checked_mul(config.dtype.item_size())
             .expect("row gather output byte length must fit usize")
     }
 
-    fn num_values(self, config: RowGatherConfig) -> u32 {
+    fn num_values(self, config: Config) -> u32 {
         self.num_total_rows
             .checked_mul(config.num_cols)
             .expect("row gather value count must fit the shader u32 index domain")
@@ -82,39 +82,39 @@ impl RowGatherShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct RowGatherBuffers<'a> {
+pub struct Buffers<'a> {
     pub input: &'a Buffer,
     /// Each active index must select a complete row from `input`.
     pub row_indices: &'a Buffer,
     pub output: &'a Buffer,
 }
 
-pub struct RowGatherKernel {
-    config: RowGatherConfig,
-    specialization: RowGatherKernelSpecialization,
+pub struct Compute {
+    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl RowGatherKernel {
-    pub fn new(device: &Device, config: RowGatherConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
-        let specialization = RowGatherKernelSpecialization::new(config);
-        let function_name = match specialization.dtype {
+        let constants = KernelConstants::new(config);
+        let function_name = match constants.dtype {
             Dtype::Bfloat16 => "row_gather_bf16",
             Dtype::Float32 => "row_gather_f32",
             _ => unreachable!("validated row gather dtype"),
         };
         Self {
             config,
-            specialization,
+            constants,
             kernel: Kernel::new(device, ROW_GATHER_SOURCE, function_name),
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: RowGatherShape, buffers: RowGatherBuffers<'a>) -> RowGatherInvocation<'a> {
-        RowGatherInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -125,13 +125,13 @@ impl RowGatherKernel {
     /// Records a fixed-capacity grid whose active row count is supplied at submission.
     pub fn invoke_bucketed<'a>(
         &'a self,
-        capacity_shape: RowGatherShape,
+        capacity_shape: Shape,
         num_active_rows_key: ReplayParameterKey,
-        buffers: RowGatherBuffers<'a>,
-    ) -> RowGatherInvocation<'a> {
-        RowGatherInvocation {
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.kernel,
             shape: capacity_shape,
             buffers,
@@ -140,16 +140,16 @@ impl RowGatherKernel {
     }
 }
 
-pub struct RowGatherInvocation<'a> {
-    config: RowGatherConfig,
-    specialization: RowGatherKernelSpecialization,
+pub struct Invocation<'a> {
+    config: Config,
+    constants: KernelConstants,
     kernel: &'a Kernel,
-    shape: RowGatherShape,
-    buffers: RowGatherBuffers<'a>,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_rows_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for RowGatherInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         recorder.set_kernel(self.kernel);
@@ -163,12 +163,12 @@ impl Operator for RowGatherInvocation<'_> {
         }
         recorder.dispatch_1d(
             self.shape.num_values(self.config) as usize,
-            self.specialization.thread_block.required_threads as usize,
+            self.constants.thread_block.required_threads as usize,
         );
     }
 }
 
-impl RowGatherInvocation<'_> {
+impl Invocation<'_> {
     fn validate(&self) {
         self.shape.validate(self.config);
         assert!(self.buffers.input.len_bytes() >= self.config.row_bytes());
@@ -190,9 +190,9 @@ mod tests {
     fn test_bf16() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = RowGatherKernel::new(
+        let kernel = Compute::new(
             &device,
-            RowGatherConfig {
+            Config {
                 num_cols: 2,
                 dtype: Dtype::Bfloat16,
             },
@@ -206,8 +206,8 @@ mod tests {
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
-            RowGatherShape { num_total_rows: 2 },
-            RowGatherBuffers {
+            Shape { num_total_rows: 2 },
+            Buffers {
                 input: &input,
                 row_indices: &row_indices,
                 output: &output,
@@ -230,8 +230,8 @@ mod tests {
     fn assert_bucketed_grow_and_shrink(dtype: Dtype) {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = RowGatherConfig { num_cols: 3, dtype };
-        let capacity_shape = RowGatherShape { num_total_rows: 4 };
+        let config = Config { num_cols: 3, dtype };
+        let capacity_shape = Shape { num_total_rows: 4 };
         let row_bytes = config.row_bytes();
         let input_values = (0..4 * row_bytes)
             .map(|index| u8::try_from(index + 1).unwrap())
@@ -239,13 +239,13 @@ mod tests {
         let input = Buffer::from_slice(&device, &input_values);
         let row_indices = Buffer::from_slice(&device, &[2_u32, 0, 1, u32::MAX]);
         let output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; 5 * row_bytes]);
-        let kernel = RowGatherKernel::new(&device, config);
+        let kernel = Compute::new(&device, config);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_bucketed(
             capacity_shape,
             NUM_ACTIVE_ROWS,
-            RowGatherBuffers {
+            Buffers {
                 input: &input,
                 row_indices: &row_indices,
                 output: &output,

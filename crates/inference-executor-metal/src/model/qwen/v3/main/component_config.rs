@@ -1,6 +1,6 @@
 //! Derives Metal component configuration from a Qwen3 checkpoint configuration.
 
-use inference_backend_metal::components::RopeScaling;
+use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::def::ModelExecutorError;

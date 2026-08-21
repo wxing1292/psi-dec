@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use inference_backend_metal::components::ResidualAddCaptureTarget;
+use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -132,7 +132,7 @@ pub struct Qwen3xDSparkMainFeatureProjector {
 }
 
 impl MainResidualCapture for Qwen3xDSparkMainFeatureProjector {
-    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
+    fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<residual_add::CaptureTarget<'_>> {
         Qwen3xDSparkMainFeatureProjector::capture_for_model_layer(self, model_layer_index)
     }
 }
@@ -259,11 +259,11 @@ impl Qwen3xDSparkMainFeatureProjector {
         self.hidden_norm.unload_weights();
     }
 
-    pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<ResidualAddCaptureTarget<'_>> {
+    pub fn capture_for_model_layer(&self, model_layer_index: usize) -> Option<residual_add::CaptureTarget<'_>> {
         self.residual_bindings
             .get(model_layer_index)
             .map(|residual_slice_index| {
-                ResidualAddCaptureTarget::columns(
+                residual_add::CaptureTarget::columns(
                     &self.main_residuals,
                     self.layout.selected_hidden_dim,
                     self.layout.capture_columns(residual_slice_index),

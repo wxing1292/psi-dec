@@ -4,10 +4,7 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use inference_backend_metal::components::QuantizedEmbeddingBuffers;
-use inference_backend_metal::components::QuantizedEmbeddingConfig;
-use inference_backend_metal::components::QuantizedEmbeddingKernel;
-use inference_backend_metal::components::QuantizedEmbeddingShape;
+use inference_backend_metal::components::embedding;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -66,7 +63,7 @@ struct EmbeddingFixture {
 
 impl EmbeddingFixture {
     fn new(device: &Device, profile: Profile, tokens: u32) -> Self {
-        let config = QuantizedEmbeddingConfig {
+        let config = embedding::Config {
             vocab_size: VOCAB_SIZE,
             hidden_dim: profile.hidden_dim(),
             group_size: 64,
@@ -74,10 +71,10 @@ impl EmbeddingFixture {
             scale_bias_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
         };
-        let shape = QuantizedEmbeddingShape {
+        let shape = embedding::Shape {
             num_total_tokens: tokens,
         };
-        let kernel = QuantizedEmbeddingKernel::new(device, config);
+        let kernel = embedding::Compute::new(device, config);
         let token_ids = Buffer::from_slice(
             device,
             &(0..tokens).map(|index| (index % VOCAB_SIZE) as i32).collect::<Vec<_>>(),
@@ -90,7 +87,7 @@ impl EmbeddingFixture {
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            QuantizedEmbeddingBuffers {
+            embedding::Buffers {
                 token_ids: &token_ids,
                 weight: &weight,
                 scales: &scales,

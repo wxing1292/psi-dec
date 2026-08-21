@@ -5,12 +5,13 @@
 //! They should not own model layer order, scheduler policy, or runtime page
 //! allocation.
 //!
-//! `FooConfig` owns fixed workload facts. These facts include dtype,
-//! specialization constants, model dimensions, and fixed scalar parameters.
-//! `FooShape` owns invocation-time extents and runtime metadata.
-//! `FooBuffers` / `FooWeights` / `FooScratch` bind storage. `FooKernel` /
-//! `FooKernels` owns reusable compiled Metal execution state. `FooInvocation`
-//! records one execution into a stream batch.
+//! Each public component module uses short, scoped names. `Config` owns fixed
+//! workload facts. These facts include dtype, model dimensions, and fixed
+//! scalar parameters. `Shape` owns invocation-time extents and runtime
+//! metadata. `Buffers`, `Weights`, and `Scratch` bind storage. `Compute` owns
+//! reusable compiled Metal execution state. `Invocation` records one
+//! execution into a stream batch. Private `KernelConstants` values describe
+//! compile-time kernel constants.
 
 fn checked_product(name: &str, factors: &[usize]) -> usize {
     factors
@@ -38,11 +39,7 @@ fn assert_u32_index_domain(num_elements: usize, name: &str) {
 pub mod dense_mlp;
 pub mod sparse_mlp;
 
-mod quantized_embedding;
-pub use quantized_embedding::QuantizedEmbeddingBuffers;
-pub use quantized_embedding::QuantizedEmbeddingConfig;
-pub use quantized_embedding::QuantizedEmbeddingKernel;
-pub use quantized_embedding::QuantizedEmbeddingShape;
+pub mod embedding;
 
 pub mod gdn;
 
@@ -100,40 +97,15 @@ pub use gqa_block_attention::GQABlockSDPAShape;
 
 pub mod moe;
 
-mod rms_norm_rope;
-pub use rms_norm_rope::RMSNormRopeBuffers;
-pub use rms_norm_rope::RMSNormRopeConfig;
-pub use rms_norm_rope::RMSNormRopeKernel;
-pub use rms_norm_rope::RMSNormRopeShape;
-pub use rms_norm_rope::RopeScaling;
-
-mod residual_add;
-pub use residual_add::ResidualAddBuffers;
-pub use residual_add::ResidualAddCaptureTarget;
-pub use residual_add::ResidualAddConfig;
-pub use residual_add::ResidualAddInvocation;
-pub use residual_add::ResidualAddKernel;
-pub use residual_add::ResidualAddRowShape;
-pub use residual_add::ResidualAddShape;
-
-mod residual_add_rms_norm;
-pub use residual_add_rms_norm::ResidualAddRMSNormBuffers;
-pub use residual_add_rms_norm::ResidualAddRMSNormConfig;
-pub use residual_add_rms_norm::ResidualAddRMSNormInvocation;
-pub use residual_add_rms_norm::ResidualAddRMSNormKernel;
-pub use residual_add_rms_norm::ResidualAddRMSNormKernelKind;
-pub use residual_add_rms_norm::ResidualAddRMSNormShape;
+pub mod residual_add;
+pub mod residual_add_rms_norm;
 
 mod replay;
 pub use replay::ReplayOp;
 pub use replay::ReplayRecorder;
 
-mod rms_norm;
-pub use rms_norm::RMSNormBuffers;
-pub use rms_norm::RMSNormConfig;
-pub use rms_norm::RMSNormInvocation;
-pub use rms_norm::RMSNormKernel;
-pub use rms_norm::RMSNormShape;
+pub mod rms_norm;
+pub mod rms_norm_rope;
 
 mod sampling;
 pub use sampling::DSparkConfidenceBuffers;

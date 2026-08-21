@@ -1,9 +1,6 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::QuantizedEmbeddingBuffers;
-use inference_backend_metal::components::QuantizedEmbeddingConfig;
-use inference_backend_metal::components::QuantizedEmbeddingKernel;
-use inference_backend_metal::components::QuantizedEmbeddingShape;
+use inference_backend_metal::components::embedding;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -40,8 +37,8 @@ impl EmbedConfig {
         self.config().validate();
     }
 
-    fn config(self) -> QuantizedEmbeddingConfig {
-        QuantizedEmbeddingConfig {
+    fn config(self) -> embedding::Config {
+        embedding::Config {
             vocab_size: self.vocab_size,
             hidden_dim: self.hidden_dim,
             group_size: self.group_size,
@@ -54,7 +51,7 @@ impl EmbedConfig {
 
 pub struct Embed {
     config: EmbedConfig,
-    kernel: Rc<QuantizedEmbeddingKernel>,
+    kernel: Rc<embedding::Compute>,
     weights: Option<Rc<EmbedWeights>>,
 }
 
@@ -103,7 +100,7 @@ impl Embed {
         config.validate();
         Self {
             config,
-            kernel: Rc::new(QuantizedEmbeddingKernel::new(device, config.config())),
+            kernel: Rc::new(embedding::Compute::new(device, config.config())),
             weights: None,
         }
     }
@@ -154,11 +151,11 @@ impl Embed {
         self.validate_num_tokens(input.num_total_tokens);
         let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke_bucketed(
-            QuantizedEmbeddingShape {
+            embedding::Shape {
                 num_total_tokens: input.num_total_tokens,
             },
             input.num_active_tokens_key,
-            QuantizedEmbeddingBuffers {
+            embedding::Buffers {
                 token_ids: input.token_ids,
                 weight: &weights.weight,
                 scales: &weights.scales,
@@ -191,10 +188,10 @@ impl ReplayLayer for Embed {
         self.validate_num_tokens(input.num_tokens);
         let weights = self.weights();
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke(
-            QuantizedEmbeddingShape {
+            embedding::Shape {
                 num_total_tokens: input.num_tokens,
             },
-            QuantizedEmbeddingBuffers {
+            embedding::Buffers {
                 token_ids: input.token_ids,
                 weight: &weights.weight,
                 scales: &weights.scales,
@@ -210,7 +207,7 @@ impl EmbedWeights {
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        config: QuantizedEmbeddingConfig,
+        config: embedding::Config,
         bindings: QuantizedTensorBindings,
     ) -> Result<Self, ModelExecutorError> {
         let mut tensors = store.load_tensors([

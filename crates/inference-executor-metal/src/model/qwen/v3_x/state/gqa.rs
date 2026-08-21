@@ -209,7 +209,7 @@ impl Qwen3xGQAState {
 mod tests {
     use std::path::PathBuf;
 
-    use inference_backend_metal::components::RopeScaling;
+    use inference_backend_metal::components::rms_norm_rope::RopeScaling;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::GQACore;

@@ -9,7 +9,7 @@ They do not use `Target` or `Draft`.
 The official checkpoint keys `target_layer_ids` and `num_target_layers` keep their upstream names.
 The generic rejection-sampling API keeps `target_*` and `draft_*`.
 In that API, these names identify probability distributions.
-The Metal replay `ResidualAddCaptureTarget` uses `Target` to mean a write destination.
+The Metal replay `residual_add::CaptureTarget` uses `Target` to mean a write destination.
 The tracing `target:` field identifies a log category.
 None of these names identify model roles.
 
@@ -261,7 +261,7 @@ MainEmbed
        per-layer context K/V append
 ```
 
-The capture interface returns only an opaque `ResidualAddCaptureTarget`.
+The capture interface returns only an opaque `residual_add::CaptureTarget`.
 It does not expose `ReplayRecorder`.
 `Qwen3Main` does not reference `Qwen3xDSparkModel`.
 

@@ -1,8 +1,4 @@
-use inference_backend_metal::components::RMSNormBuffers;
-use inference_backend_metal::components::RMSNormConfig;
-use inference_backend_metal::components::RMSNormInvocation;
-use inference_backend_metal::components::RMSNormKernel;
-use inference_backend_metal::components::RMSNormShape;
+use inference_backend_metal::components::rms_norm;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayParameterKey;
@@ -12,7 +8,7 @@ use crate::def::replay_op::ReplayOp;
 
 pub struct RMSNorm {
     weight: Option<Buffer>,
-    compute: RMSNormKernel,
+    compute: rms_norm::Compute,
 }
 
 impl RMSNorm {
@@ -22,7 +18,7 @@ impl RMSNorm {
         let hidden_dim = hidden_dim.try_into().expect("RMS norm hidden dimension must fit u32");
         Self {
             weight: None,
-            compute: RMSNormKernel::new(device, RMSNormConfig::bf16(hidden_dim, eps)),
+            compute: rms_norm::Compute::new(device, rms_norm::Config::bf16(hidden_dim, eps)),
         }
     }
 
@@ -42,12 +38,12 @@ impl RMSNorm {
             .expect("RMS norm weights must be loaded before execution")
     }
 
-    fn invocation<'a>(&'a self, num_tokens: u32, input: &'a Buffer, output: &'a Buffer) -> RMSNormInvocation<'a> {
+    fn invocation<'a>(&'a self, num_tokens: u32, input: &'a Buffer, output: &'a Buffer) -> rms_norm::Invocation<'a> {
         self.compute.invoke(
-            RMSNormShape {
+            rms_norm::Shape {
                 num_total_tokens: num_tokens,
             },
-            RMSNormBuffers {
+            rms_norm::Buffers {
                 input,
                 weight: self.weight(),
                 output,
@@ -61,11 +57,11 @@ impl RMSNorm {
         num_active_tokens_key: ReplayParameterKey,
         input: &'a Buffer,
         output: &'a Buffer,
-    ) -> RMSNormInvocation<'a> {
+    ) -> rms_norm::Invocation<'a> {
         self.compute.invoke_bucketed(
-            RMSNormShape { num_total_tokens },
+            rms_norm::Shape { num_total_tokens },
             num_active_tokens_key,
-            RMSNormBuffers {
+            rms_norm::Buffers {
                 input,
                 weight: self.weight(),
                 output,

@@ -178,7 +178,7 @@ Its QKV attention graph is independent from Main and MTP.
 Init-time component constants supply the head dimensions, head counts, RoPE constants, and page geometry. A
 model-specific runtime branch does not supply these values.
 
-The `RMSNormRope*` component operates on token-head rows. It does not own query grouping, KV grouping, or attention state.
+The `rms_norm_rope` component operates on token-head rows. It does not own query grouping, KV grouping, or attention state.
 
 `RopeScaling` selects unscaled default RoPE or Yarn RoPE.
 Initialization resolves the correction range and the complete inverse-frequency table.

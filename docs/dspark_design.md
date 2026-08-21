@@ -16,7 +16,7 @@ The official checkpoint fields keep their upstream names.
 These fields include `target_layer_ids` and `num_target_layers`.
 The generic rejection-sampling API also keeps `target_*` and `draft_*`.
 In that API, the terms identify two probability distributions.
-The Metal replay `ResidualAddCaptureTarget` uses `Target` to mean a write destination.
+The Metal replay `residual_add::CaptureTarget` uses `Target` to mean a write destination.
 The tracing `target:` field identifies a log category.
 None of these names identify model roles.
 

@@ -2,24 +2,21 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayParameterKey;
-use inference_backend_metal::operators::RowGatherBuffers;
-use inference_backend_metal::operators::RowGatherConfig;
-use inference_backend_metal::operators::RowGatherKernel;
-use inference_backend_metal::operators::RowGatherShape;
+use inference_backend_metal::operators::row_gather;
 use inference_executor_core::backend::recorder::Recorder;
 
 use crate::def::replay_op::ReplayOp;
 
 pub struct Gather {
-    compute: RowGatherKernel,
+    compute: row_gather::Compute,
 }
 
 impl Gather {
     pub fn new(device: &Device, hidden_dim: u32) -> Self {
         Self {
-            compute: RowGatherKernel::new(
+            compute: row_gather::Compute::new(
                 device,
-                RowGatherConfig {
+                row_gather::Config {
                     num_cols: hidden_dim,
                     dtype: Dtype::Bfloat16,
                 },
@@ -38,10 +35,10 @@ impl Gather {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke(
-            RowGatherShape {
+            row_gather::Shape {
                 num_total_rows: num_rows,
             },
-            RowGatherBuffers {
+            row_gather::Buffers {
                 input,
                 row_indices,
                 output,
@@ -61,9 +58,9 @@ impl Gather {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_bucketed(
-            RowGatherShape { num_total_rows },
+            row_gather::Shape { num_total_rows },
             num_active_rows_key,
-            RowGatherBuffers {
+            row_gather::Buffers {
                 input,
                 row_indices,
                 output,

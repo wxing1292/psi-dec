@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use inference_backend_metal::components::RopeScaling;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;

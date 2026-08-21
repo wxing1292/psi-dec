@@ -18,7 +18,7 @@
 mod affine_quantized;
 mod bf16_concat_rows;
 mod mlx_headers;
-mod row_gather;
+pub mod row_gather;
 mod softmax;
 
 pub use affine_quantized::AffineQuantizedMatmul;
@@ -35,10 +35,6 @@ pub use affine_quantized::RaggedExpertMajorAffineQuantizedShape;
 pub use bf16_concat_rows::Bf16ConcatRowsBuffers;
 pub use bf16_concat_rows::Bf16ConcatRowsConfig;
 pub use bf16_concat_rows::Bf16ConcatRowsKernel;
-pub use row_gather::RowGatherBuffers;
-pub use row_gather::RowGatherConfig;
-pub use row_gather::RowGatherKernel;
-pub use row_gather::RowGatherShape;
 pub use softmax::SoftmaxBuffers;
 pub use softmax::SoftmaxConfig;
 pub use softmax::SoftmaxKernel;
