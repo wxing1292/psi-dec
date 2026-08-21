@@ -459,7 +459,13 @@ impl Qwen35MainAttention {
                 )
             },
             (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
-                component.record(recorder, input, output, metadata)
+                component.record(
+                    recorder,
+                    input,
+                    output,
+                    metadata,
+                    ReplayU32::Fixed(metadata.replay_shape().num_tokens),
+                )
             },
             _ => panic!("qwen3.5 attention component and metadata must have the same kind"),
         }
@@ -487,7 +493,13 @@ impl Qwen35MainAttention {
                 )
             },
             (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
-                component.record_bucketed(recorder, input, output, metadata, num_active_tokens_key)
+                component.record(
+                    recorder,
+                    input,
+                    output,
+                    metadata,
+                    ReplayU32::Parameter(num_active_tokens_key),
+                )
             },
             _ => panic!("qwen3.5 attention component and metadata must have the same kind"),
         }

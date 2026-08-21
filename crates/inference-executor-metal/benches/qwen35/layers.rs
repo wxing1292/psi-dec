@@ -259,6 +259,8 @@ impl BlockFixture {
             &[0],
             &flat_materialized_state_slots,
             &flat_materialized_state_slots,
+            1,
+            shape.num_tokens,
         );
 
         let layer_scratch = Rc::new(Qwen35MainLayerScratch::new(

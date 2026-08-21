@@ -907,11 +907,9 @@ impl ReplayableModel for Qwen35Executor {
         );
         let gdn_states_elapsed = gdn_states_start.elapsed();
         let gdn_metadata_start = Instant::now();
-        let gdn_shape = self.main_gdn_state.prepare_metadata_bucketed_with_token_capacity(
-            microbatch.cu_tokens(),
-            &gdn_prepared,
-            num_main_total_tokens,
-        );
+        let gdn_shape =
+            self.main_gdn_state
+                .prepare_metadata(microbatch.cu_tokens(), &gdn_prepared, num_main_total_tokens);
         let gdn_metadata_elapsed = gdn_metadata_start.elapsed();
         debug_assert_eq!(gdn_shape.num_tokens as usize, microbatch.total_tokens());
         debug_assert_eq!(gdn_shape.num_reqs as usize, microbatch.num_reqs());

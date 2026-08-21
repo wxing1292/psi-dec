@@ -22,29 +22,6 @@ use crate::def::replay_op::ReplayOp;
 pub const GDN_NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("gdn.num_active_requests");
 pub const GDN_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("gdn.num_active_tokens");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GDNReplayMode {
-    Exact,
-    Bucketed,
-    BucketedWithTokenKey(ReplayParameterKey),
-}
-
-impl GDNReplayMode {
-    fn active_tokens_key(self) -> Option<ReplayParameterKey> {
-        match self {
-            Self::Exact => None,
-            Self::Bucketed => Some(GDN_NUM_ACTIVE_TOKENS),
-            Self::BucketedWithTokenKey(key) => {
-                assert_ne!(
-                    key, GDN_NUM_ACTIVE_REQUESTS,
-                    "GDN active-token key must differ from the private active-request key"
-                );
-                Some(key)
-            },
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GDNReplayTopology {
     pub materialize_candidate_states: bool,
@@ -128,7 +105,7 @@ pub struct GDNInput<'a> {
     pub state: GDNLayerStateBindings<'a>,
     pub materialize_candidate_states: bool,
     pub weights: GDNWeights<'a>,
-    pub replay_mode: GDNReplayMode,
+    pub num_active_tokens: ReplayU32,
 }
 
 /// The caller-owned next-hidden-state buffer returned by one GDN recording.
@@ -212,54 +189,26 @@ impl GDN {
         metadata: &GDNMetadataBuffers,
         cu_tokens: &[u32],
         state: &GDNPreparedRequestState,
+        policy: &GDNReplayBucketPolicy,
+        num_total_tokens: u32,
     ) -> GDNReplayShape {
+        let num_tokens = cu_tokens.last().copied().unwrap_or_default();
+        assert_eq!(metadata.max_requests(), policy.max_requests() as usize);
+        assert_eq!(metadata.max_tokens(), policy.max_tokens() as usize);
+        assert!(
+            num_total_tokens <= policy.max_tokens(),
+            "GDN total token count must not exceed the metadata capacity"
+        );
+        self.validate_token_capacity(num_tokens, num_total_tokens);
+        let num_active_requests =
+            u32::try_from(state.src_recurrent_state_slots.len()).expect("GDN active request count must fit u32");
         metadata.update(
             cu_tokens,
             &state.src_recurrent_state_slots,
             &state.src_conv_state_slots,
             &state.flat_materialized_recurrent_state_slots,
             &state.flat_materialized_conv_state_slots,
-        )
-    }
-
-    pub fn prepare_bucketed(
-        &self,
-        metadata: &GDNMetadataBuffers,
-        cu_tokens: &[u32],
-        state: &GDNPreparedRequestState,
-        policy: &GDNReplayBucketPolicy,
-    ) -> GDNReplayShape {
-        metadata.update_bucketed(
-            cu_tokens,
-            &state.src_recurrent_state_slots,
-            &state.src_conv_state_slots,
-            &state.flat_materialized_recurrent_state_slots,
-            &state.flat_materialized_conv_state_slots,
-            policy,
-        )
-    }
-
-    pub fn prepare_bucketed_with_token_capacity(
-        &self,
-        metadata: &GDNMetadataBuffers,
-        cu_tokens: &[u32],
-        state: &GDNPreparedRequestState,
-        policy: &GDNReplayBucketPolicy,
-        num_total_tokens: u32,
-    ) -> GDNReplayShape {
-        let num_tokens = cu_tokens.last().copied().unwrap_or_default();
-        assert!(
-            num_total_tokens <= policy.max_tokens(),
-            "GDN caller-owned token capacity must not exceed the metadata capacity"
-        );
-        self.validate_token_capacity(num_tokens, num_total_tokens);
-        metadata.update_bucketed_with_token_capacity(
-            cu_tokens,
-            &state.src_recurrent_state_slots,
-            &state.src_conv_state_slots,
-            &state.flat_materialized_recurrent_state_slots,
-            &state.flat_materialized_conv_state_slots,
-            policy,
+            policy.num_total_requests(num_active_requests),
             num_total_tokens,
         )
     }
@@ -304,17 +253,17 @@ impl GDN {
         assert!(num_tokens > 0, "GDN replay requires active tokens");
         assert!(
             num_tokens <= num_total_tokens,
-            "GDN caller-owned token capacity must contain all active tokens"
+            "GDN active token count must not exceed the total token count"
         );
         let active_topology = self.replay_topology_for_token_capacity(num_tokens, true);
         let selected_topology = self.replay_topology_for_token_capacity(num_total_tokens, true);
         assert_eq!(
             active_topology.qkvabz_affine, selected_topology.qkvabz_affine,
-            "GDN caller-owned token capacity must preserve the QKVABZ affine topology"
+            "GDN total token count must preserve the QKVABZ affine topology"
         );
         assert_eq!(
             active_topology.output_affine, selected_topology.output_affine,
-            "GDN caller-owned token capacity must preserve the output affine topology"
+            "GDN total token count must preserve the output affine topology"
         );
     }
 }
@@ -329,16 +278,24 @@ impl ReplayLayer for GDN {
     {
         let shape = input.batch_metadata.replay_shape();
         shape.validate();
-        match input.replay_mode {
-            GDNReplayMode::Exact => {
+        match input.num_active_tokens {
+            ReplayU32::Fixed(num_active_tokens) => {
+                assert_eq!(num_active_tokens, shape.num_tokens);
                 assert_eq!(shape.num_reqs, shape.num_total_reqs);
                 assert_eq!(shape.num_tokens, shape.num_total_tokens);
             },
-            GDNReplayMode::Bucketed | GDNReplayMode::BucketedWithTokenKey(_) => {
+            ReplayU32::Parameter(key) => {
+                assert_ne!(
+                    key, GDN_NUM_ACTIVE_REQUESTS,
+                    "GDN active-token key must differ from the private active-request key"
+                );
                 self.validate_token_capacity(shape.num_tokens, shape.num_total_tokens);
             },
         }
-        let num_active_tokens_key = input.replay_mode.active_tokens_key();
+        let num_active_tokens_key = match input.num_active_tokens {
+            ReplayU32::Parameter(key) => Some(key),
+            ReplayU32::Fixed(_) => None,
+        };
         let hidden_state = input.hidden_state;
         let next_hidden_state = input.next_hidden_state;
         let scratch = input.scratch;
@@ -346,8 +303,12 @@ impl ReplayLayer for GDN {
         let state = input.state;
         let weights = input.weights;
         let bucketed = num_active_tokens_key.is_some();
-        let active_reqs = ReplayU32::Parameter(GDN_NUM_ACTIVE_REQUESTS);
-        let active_tokens = ReplayU32::Parameter(num_active_tokens_key.unwrap_or(GDN_NUM_ACTIVE_TOKENS));
+        let active_reqs = if bucketed {
+            ReplayU32::Parameter(GDN_NUM_ACTIVE_REQUESTS)
+        } else {
+            ReplayU32::Fixed(shape.num_reqs)
+        };
+        let active_tokens = input.num_active_tokens;
         let qkvabz = if bucketed {
             self.qkvabz.invoke_bucketed(
                 shape.num_total_tokens,

@@ -164,22 +164,13 @@ impl Qwen3xGDNState {
         )
     }
 
-    pub fn prepare_metadata(&self, cu_tokens: &[u32], prepared: &GDNPreparedRequestState) -> GDNReplayShape {
-        self.backend().prepare(self.metadata(), cu_tokens, prepared)
-    }
-
-    pub fn prepare_metadata_bucketed(&self, cu_tokens: &[u32], prepared: &GDNPreparedRequestState) -> GDNReplayShape {
-        self.backend()
-            .prepare_bucketed(self.metadata(), cu_tokens, prepared, &self.replay_bucket_policy)
-    }
-
-    pub fn prepare_metadata_bucketed_with_token_capacity(
+    pub fn prepare_metadata(
         &self,
         cu_tokens: &[u32],
         prepared: &GDNPreparedRequestState,
         num_total_tokens: u32,
     ) -> GDNReplayShape {
-        self.backend().prepare_bucketed_with_token_capacity(
+        self.backend().prepare(
             self.metadata(),
             cu_tokens,
             prepared,

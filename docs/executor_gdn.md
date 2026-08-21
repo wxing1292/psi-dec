@@ -401,10 +401,10 @@ and constructs one private recurrent variant. Its `VariantConstants` contain all
 kernel's required thread-block geometry. The variant stores `q_scale` and `norm_eps` separately because the host passes
 them as kernel arguments.
 
-For a bucketed invocation, `backend_compute::Shape` contains recorded capacities. Submission arguments contain active
-counts. For an exact invocation, the shape counts are both active counts and dispatch extents. The selector reads the
-shape when `Compute::invoke*` constructs an invocation. The current one-entry registry always returns
-`VariantKey::Recurrent`. Recording uses the variant stored in the invocation.
+`backend_compute::Shape` contains recorded capacities. `ReplayU32` values contain active counts. A caller without
+capacity padding sets each active count equal to its total count. The selector reads the shape when `Compute::invoke*`
+constructs an invocation. The current one-entry registry always returns `VariantKey::Recurrent`. Recording uses the
+variant stored in the invocation.
 
 The Qwen adapter supplies dimensions and weights. Generic Rust and Metal contain no Qwen name or config type.
 
@@ -538,11 +538,9 @@ caller’s `Recorder`.
 
 State preparation also keeps the leaf boundary model-neutral. `Qwen3xGDNState::prepare_states` receives the request-slot,
 block-index, token-index, cumulative-token, state-transaction, and state-page slices that `GDNRequestStateTable`
-consumes. `prepare_metadata_bucketed` receives cumulative tokens and the prepared state. It selects independent request
-and token capacities with the component-local policy. `prepare_metadata_bucketed_with_token_capacity` accepts a token
-capacity that a composite replay stage already selected. This path buckets only the private request capacity. It does not
-bucket the token capacity again. The Qwen3.5 executor extracts these slices from its own microbatch before it calls the
-shared leaf.
+consumes. `prepare_metadata(...)` receives cumulative tokens, prepared state, and `num_total_tokens`. It derives the
+private total request count from the component policy. It uses the caller-selected total token count without applying a
+second token bucket. The Qwen3.5 executor extracts these slices from its own microbatch before it calls the shared leaf.
 
 `GDNRequestStateTable` owns all GDN layers at model level. It owns two contiguous aggregate arenas: one recurrent arena
 and one convolution arena.
@@ -699,24 +697,23 @@ GDNInput
   scratch        GDNScratchBindings
   materialize_candidate_states
   weights        GDNWeights
-  replay_mode    GDNReplayMode
+  num_active_tokens ReplayU32
 ```
 
 `GDNOutput<'a>` is the named alias for the returned `&'a Buffer`. It is the caller-owned `next_hidden_state` buffer.
 It does not allocate or add a wrapper.
 
-`GDNReplayMode::Exact` preserves the fixed-scalar leaf APIs. An exact GDN program has no replay parameters.
-`GDNReplayMode::Bucketed` records request and token capacities and uses these submission parameters:
+`GDNInput::num_active_tokens` accepts `ReplayU32::Fixed(value)` or `ReplayU32::Parameter(key)`. A fixed value requires
+active and total request/token counts to match. A parameter key records request and token capacities and uses these
+submission parameters:
 
 ```text
 gdn.num_active_requests  u32 [1, num_total_reqs]
 gdn.num_active_tokens    u32 [1, num_total_tokens]
 ```
 
-`GDNReplayMode::BucketedWithTokenKey` replaces `gdn.num_active_tokens` with one caller-owned
-`ReplayParameterKey`. A composite stage uses this mode so all token consumers share one active-token parameter. The stage
-sets that parameter once. GDN adds only its private `gdn.num_active_requests` argument. The default bucketed API and
-`add_gdn_replay_arguments` retain both GDN-owned keys for standalone users.
+A composite stage can supply its own token key so all token consumers share one active-token parameter. The stage sets
+that parameter once. GDN adds only its private `gdn.num_active_requests` argument.
 
 Each command binds only the domains that it consumes:
 
@@ -738,7 +735,7 @@ request guard is uniform for the complete thread block.
 from both affine operators. `GDNReplayTopology` contains `materialize_candidate_states`, `qkvabz_affine`, and
 `output_affine`. The GDN replay subkey contains `num_total_reqs`, `num_total_tokens`, and this topology. Active counts do
 not enter the GDN subkey. `replay_token_topology_boundaries` exposes the affine boundaries to a composite-stage policy.
-A caller-owned token capacity must contain all active tokens and must not exceed the initialized token capacity. It must
+The total token count must contain all active tokens and must not exceed the initialized token capacity. It must
 also select the same QKVABZ and output affine topologies as the active token count. GDN validates these conditions before
 it updates metadata. Qwen3.5 Main selects one composite token capacity before it updates GQA or GDN metadata. It forces
 GDN metadata to use this capacity. The outer Main key records the composite token capacity and the GDN capacity and

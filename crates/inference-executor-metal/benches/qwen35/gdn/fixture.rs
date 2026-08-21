@@ -9,6 +9,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GDNCore;
@@ -183,6 +184,8 @@ impl<'a> RealGDNFixture<'a> {
             &(0..num_reqs).collect::<Vec<_>>(),
             &flat_materialized_state_slots,
             &flat_materialized_state_slots,
+            num_reqs,
+            num_tokens,
         );
         let num_state_slots = if materialize_candidate_states {
             num_reqs
@@ -249,7 +252,7 @@ impl<'a> RealGDNFixture<'a> {
                 },
                 materialize_candidate_states,
                 weights: weights.as_borrowed(),
-                replay_mode: inference_executor_metal::attn::gdn::backend::GDNReplayMode::Exact,
+                num_active_tokens: ReplayU32::Fixed(num_tokens),
             },
         );
         let replay = recorder.build();

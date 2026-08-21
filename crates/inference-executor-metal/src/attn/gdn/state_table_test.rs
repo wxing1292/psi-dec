@@ -696,6 +696,8 @@ fn prepare_state(
         &prepared.src_conv_state_slots,
         &prepared.flat_materialized_recurrent_state_slots,
         &prepared.flat_materialized_conv_state_slots,
+        prepared.src_recurrent_state_slots.len() as u32,
+        cu_tokens.last().copied().unwrap(),
     )
 }
 
