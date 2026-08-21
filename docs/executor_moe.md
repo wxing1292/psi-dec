@@ -255,7 +255,7 @@ stage-owned token capacity and active-token key. Qwen3.5 MTP calls the same API 
 capacity and active-token key
 when the physical MTP layer uses MoE.
 
-The backend retains a routing-only bucket-readiness API.
+The backend retains a routing-only API.
 This API records this chain:
 
 ```text
@@ -264,8 +264,8 @@ router affine -> router softmax -> top-k routing
 
 `GatedMoE::record_routing(...)` accepts the same total-token and `ReplayU32` active-token representation as full MoE.
 The router affine, softmax, and top-k routing commands use the same key and the same domain.
-The exact routing chain has zero replay parameters.
-The bucketed routing chain has one replay parameter.
+A fixed active value declares no replay parameter.
+A parameter active value declares one replay parameter.
 
 The fixed total token count determines the recorded affine kernel and all dispatch grids.
 The active token count does not determine topology or replay identity.
@@ -280,21 +280,20 @@ reaches a threadgroup barrier.
 It does not add the full MoE token-major/expert-major boundary at token count `5`.
 An affine topology change can independently occur at token count `5`.
 
-The routing-only API does not change the exact `ReplayLayer` contract.
-The full bucketed composition also uses this routing chain with the same active-token key.
+The routing-only API does not change the `ReplayLayer` contract.
+The full composition uses this routing chain with the same active-token value.
 
-The ragged expert-major layout, pack, and scatter leaf also has additive bucket-readiness APIs:
+The ragged expert-major leaf uses these APIs:
 
 ```text
-moe::expert_major::Compute::invoke_layout_bucketed(...)
-moe::expert_major::Compute::invoke_pack_input_bucketed(...)
-moe::expert_major::Compute::invoke_scatter_without_shared_experts_bucketed(...)
-moe::expert_major::Compute::invoke_scatter_with_shared_experts_bucketed(...)
+moe::expert_major::Compute::invoke_layout(...)
+moe::expert_major::Compute::invoke_pack_input(...)
+moe::expert_major::Compute::invoke_scatter_without_shared_experts(...)
+moe::expert_major::Compute::invoke_scatter_with_shared_experts(...)
 ```
 
-Each API records a fixed `num_total_tokens` capacity and a fixed `num_experts_per_token` value.
-The caller supplies one `num_active_tokens` replay parameter.
-The layout, pack, and scatter commands use the same key and the same `[1, num_total_tokens]` domain.
+Each API accepts one `Shape { num_total_tokens }` and one `ReplayU32` active-token value.
+The layout, pack, and scatter commands use the same active-token source and domain.
 The Metal layout-count, layout-scatter, and pack commands derive
 `num_active_routes = num_active_tokens * num_experts_per_token`.
 The leaf does not declare an active-route parameter.
@@ -308,26 +307,24 @@ Both scatter variants return before they read inactive route maps, probabilities
 shared-gate logits.
 They also return before they write the inactive output tail.
 
-The exact layout, pack, and scatter APIs remain unchanged and declare zero replay parameters.
-One composite bucketed expert-major replay declares one replay parameter.
+A fixed active value requires `num_active_tokens == num_total_tokens` and declares no replay parameter.
+A parameter active value declares one replay parameter for the composite expert-major execution.
 These kernels do not change topology with token count.
 They add no token-count boundary to a composite policy.
 The full MoE owner must still keep the token-major/expert-major path boundary at token count `5`.
-The full bucketed `GatedMoE` replay composes these leaf APIs on the expert-major path.
+The full `GatedMoE` execution composes these leaf APIs on the expert-major path.
 
-The backend sparse MLP leaf also has additive bucket-readiness APIs:
+The backend sparse MLP leaf uses these algorithm-specific APIs:
 
 ```text
-sparse_mlp::Compute::invoke_token_major_bucketed(...)
-sparse_mlp::Compute::invoke_expert_major_bucketed(...)
+sparse_mlp::Compute::invoke_token_major(...)
+sparse_mlp::Compute::invoke_expert_major(...)
 ```
 
-Both APIs record `num_total_tokens` and fixed `num_experts_per_token` values.
-The constructor validates `num_total_routes = num_total_tokens * num_experts_per_token` once. The private replay path
-then derives the same value with ordinary arithmetic.
+Both APIs accept `num_total_tokens`, fixed `num_experts_per_token`, and one `ReplayU32` active-token value.
+The component validates `num_total_routes = num_total_tokens * num_experts_per_token`.
 It uses this total route count for dispatch and for all route, input, output, and SwiGLU scratch buffer validation.
-The caller supplies one `num_active_tokens` replay parameter.
-All four expert affine commands use the same parameter key and the same `[1, num_total_tokens]` domain.
+All four expert affine commands use the same active-token source and domain.
 Each Metal command derives `num_active_routes = num_active_tokens * num_experts_per_token`.
 The leaf does not declare a second active-route parameter.
 
@@ -336,23 +333,22 @@ The token-major down command returns before the gather code reads `route_indices
 The expert-major gate/up and down commands return before they read `experts_by_route`.
 Inactive commands do not read route inputs or write SwiGLU and output tails.
 
-The exact token-major and expert-major APIs remain unchanged and declare zero replay parameters.
-Each bucketed sparse MLP replay declares one replay parameter.
+A fixed active value declares no replay parameter.
+A parameter active value declares one replay parameter.
 Route count does not select a different sparse MLP kernel in either explicit path.
 The two explicit paths have different command topology.
 The full MoE owner must keep the token-major/expert-major path boundary at token count `5` in its composite policy.
 The sparse leaf does not select the path.
-The full bucketed `GatedMoE` replay composes the selected leaf path.
+The full `GatedMoE` execution composes the selected leaf path.
 
-The token-major combine leaf also has additive bucket-readiness APIs:
+The token-major combine leaf uses these APIs:
 
 ```text
-moe::combine::Compute::invoke_without_shared_experts_bucketed(...)
-moe::combine::Compute::invoke_with_shared_experts_bucketed(...)
+moe::combine::Compute::invoke_without_shared_experts(...)
+moe::combine::Compute::invoke_with_shared_experts(...)
 ```
 
-Both APIs record a fixed `num_total_tokens` capacity in `moe::combine::Shape`.
-The caller supplies `num_active_tokens` through one `ReplayParameterKey`.
+Both APIs accept a fixed `num_total_tokens` capacity in `moe::combine::Shape` and one `ReplayU32` active-token value.
 The total token count determines the dispatch grid and the required routed, probability, shared-branch, and output
 buffer capacities.
 The active token count does not change command topology.
@@ -360,8 +356,8 @@ The active token count does not change command topology.
 Each combine kernel returns for an inactive output element before it reads routed data, route probabilities, shared
 hidden state, or shared-gate logits.
 It also returns before it writes the output tail.
-The exact combine APIs remain unchanged and declare zero replay parameters.
-Each bucketed combine replay declares one replay parameter.
+A fixed active value declares no replay parameter.
+A parameter active value declares one replay parameter.
 The combine kernels do not change topology with token count, so they add no token-count boundary to a composite
 policy.
 The parameterized `GatedMoE` replay composes these leaf APIs on the token-major path.
@@ -597,7 +593,7 @@ Selector::select(&Registry, GatedMoEReplayShape)
 
 `VariantKey` is the replay-topology identity because it names a different command graph. `Variant` owns the
 compiled resources that are unique to that graph. The private `Selector` is the only owner of the token-count
-threshold. Topology reporting, exact recording, and bucketed recording call the same selector. Repeating this
+threshold. Topology reporting and recording call the same selector with the total token count. Repeating this
 inexpensive calculation is intentional. The component does not materialize a plan object.
 
 Each non-persistent leaf kernel defines its own task:

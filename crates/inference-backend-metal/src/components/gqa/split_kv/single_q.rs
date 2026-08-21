@@ -338,19 +338,7 @@ impl Compute {
         }
     }
 
-    pub fn invoke_map<'a>(&self, buffers: MapBuffers<'a>, page_table_index: ReplayU32) -> MapInvocation<'a> {
-        MapInvocation {
-            pipeline: self.map.as_raw_retained(),
-            constants: self.constants,
-            shape: self.shape,
-            buffers,
-            page_table_index,
-            num_active_tokens: ReplayU32::Fixed(self.shape.num_total_tokens),
-            num_active_kv_splits: ReplayU32::Fixed(self.shape.num_total_sdpa_map_task_templates),
-        }
-    }
-
-    pub fn invoke_map_bucketed<'a>(
+    pub fn invoke_map<'a>(
         &self,
         buffers: MapBuffers<'a>,
         page_table_index: ReplayU32,
@@ -368,21 +356,7 @@ impl Compute {
         }
     }
 
-    pub fn invoke_reduce<'a>(&self, buffers: ReduceBuffers<'a>) -> ReduceInvocation<'a> {
-        ReduceInvocation {
-            pipeline: self.reduce.as_raw_retained(),
-            constants: self.constants,
-            shape: self.shape,
-            buffers,
-            num_active_tokens: ReplayU32::Fixed(self.shape.num_total_tokens),
-        }
-    }
-
-    pub fn invoke_reduce_bucketed<'a>(
-        &self,
-        buffers: ReduceBuffers<'a>,
-        num_active_tokens: ReplayU32,
-    ) -> ReduceInvocation<'a> {
+    pub fn invoke_reduce<'a>(&self, buffers: ReduceBuffers<'a>, num_active_tokens: ReplayU32) -> ReduceInvocation<'a> {
         ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
             constants: self.constants,

@@ -122,11 +122,37 @@ impl MatmulFixture {
         match bench_kernel {
             BenchKernel::Auto => {
                 let matmul = affine_quantized::Matmul::new(device, config);
-                recorder.record(matmul.invoke(rows, &output, 0, &input, 0, &weight, 0, &scales, 0, &biases, 0));
+                recorder.record(matmul.invoke(
+                    rows as u32,
+                    inference_backend_metal::metal::ReplayU32::Fixed(rows as u32),
+                    &output,
+                    0,
+                    &input,
+                    0,
+                    &weight,
+                    0,
+                    &scales,
+                    0,
+                    &biases,
+                    0,
+                ));
             },
             BenchKernel::Exact(kind) => {
                 let kernel = affine_quantized::Kernel::new(device, config, kind);
-                recorder.record(kernel.invoke(rows, &output, 0, &input, 0, &weight, 0, &scales, 0, &biases, 0));
+                recorder.record(kernel.invoke(
+                    rows as u32,
+                    inference_backend_metal::metal::ReplayU32::Fixed(rows as u32),
+                    &output,
+                    0,
+                    &input,
+                    0,
+                    &weight,
+                    0,
+                    &scales,
+                    0,
+                    &biases,
+                    0,
+                ));
             },
         }
         let replay = recorder.build();

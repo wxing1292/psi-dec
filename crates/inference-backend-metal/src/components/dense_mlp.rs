@@ -5,6 +5,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 use crate::operators::affine_quantized;
 
 const DENSE_MLP_SWIGLU_SOURCE: &str = include_str!("metal/quantized_dense_mlp_swiglu.metal");
@@ -218,37 +219,19 @@ impl Compute {
     pub fn invoke<'a>(
         &'a self,
         shape: Shape,
+        num_active_tokens: ReplayU32,
         buffers: Buffers<'a>,
         scratch: Scratch<'a>,
         weights: Weights<'a>,
     ) -> Invocation<'a> {
+        shape.validate();
         Invocation {
             compute: self,
             shape,
             buffers,
             scratch,
             weights,
-            num_active_tokens_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity dense MLP whose active token count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-        scratch: Scratch<'a>,
-        weights: Weights<'a>,
-    ) -> Invocation<'a> {
-        let shape = capacity_shape(num_total_tokens);
-        Invocation {
-            compute: self,
-            shape,
-            buffers,
-            scratch,
-            weights,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 
@@ -271,96 +254,55 @@ impl Compute {
     pub fn invoke_gate_up<'a>(
         &'a self,
         shape: Shape,
+        num_active_tokens: ReplayU32,
         hidden_state: &'a Buffer,
         gate_up: &'a Buffer,
         weights: Weights<'a>,
     ) -> GateUpInvocation<'a> {
+        shape.validate();
         GateUpInvocation {
             compute: self,
             shape,
             hidden_state,
             gate_up,
             weights,
-            num_active_tokens_key: None,
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 
-    pub fn invoke_gate_up_bucketed<'a>(
+    pub fn invoke_swiglu<'a>(
         &'a self,
-        num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
-        hidden_state: &'a Buffer,
-        gate_up: &'a Buffer,
-        weights: Weights<'a>,
-    ) -> GateUpInvocation<'a> {
-        GateUpInvocation {
-            compute: self,
-            shape: capacity_shape(num_total_tokens),
-            hidden_state,
-            gate_up,
-            weights,
-            num_active_tokens_key: Some(num_active_tokens_key),
-        }
-    }
-
-    pub fn invoke_swiglu<'a>(&'a self, shape: Shape, gate_up: &'a Buffer, swiglu: &'a Buffer) -> SwiGLUInvocation<'a> {
-        SwiGLUInvocation {
-            compute: self,
-            shape,
-            gate_up,
-            swiglu,
-            num_active_tokens_key: None,
-        }
-    }
-
-    pub fn invoke_swiglu_bucketed<'a>(
-        &'a self,
-        num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
+        shape: Shape,
+        num_active_tokens: ReplayU32,
         gate_up: &'a Buffer,
         swiglu: &'a Buffer,
     ) -> SwiGLUInvocation<'a> {
+        shape.validate();
         SwiGLUInvocation {
             compute: self,
-            shape: capacity_shape(num_total_tokens),
+            shape,
             gate_up,
             swiglu,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 
     pub fn invoke_down<'a>(
         &'a self,
         shape: Shape,
+        num_active_tokens: ReplayU32,
         swiglu: &'a Buffer,
         next_hidden_state: &'a Buffer,
         weights: Weights<'a>,
     ) -> DownInvocation<'a> {
+        shape.validate();
         DownInvocation {
             compute: self,
             shape,
             swiglu,
             next_hidden_state,
             weights,
-            num_active_tokens_key: None,
-        }
-    }
-
-    pub fn invoke_down_bucketed<'a>(
-        &'a self,
-        num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
-        swiglu: &'a Buffer,
-        next_hidden_state: &'a Buffer,
-        weights: Weights<'a>,
-    ) -> DownInvocation<'a> {
-        DownInvocation {
-            compute: self,
-            shape: capacity_shape(num_total_tokens),
-            swiglu,
-            next_hidden_state,
-            weights,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 }
@@ -369,6 +311,16 @@ fn capacity_shape(num_total_tokens: u32) -> Shape {
     let shape = Shape { num_total_tokens };
     shape.validate();
     shape
+}
+
+fn active_key(num_total_tokens: u32, num_active_tokens: ReplayU32) -> Option<ReplayParameterKey> {
+    match num_active_tokens {
+        ReplayU32::Fixed(num_active_tokens) => {
+            assert_eq!(num_active_tokens, num_total_tokens);
+            None
+        },
+        ReplayU32::Parameter(key) => Some(key),
+    }
 }
 
 pub struct Invocation<'a> {
@@ -420,42 +372,24 @@ pub struct GateUpInvocation<'a> {
 
 impl Operator for GateUpInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let invocation = match self.num_active_tokens_key {
-            Some(key) => {
-                self.compute.gate_up.invoke_bucketed(
-                    self.shape.num_total_tokens,
-                    key,
-                    self.gate_up,
-                    0,
-                    self.hidden_state,
-                    0,
-                    self.weights.gate_up_weight,
-                    0,
-                    self.weights.gate_up_scales,
-                    0,
-                    self.weights.gate_up_biases,
-                    0,
-                )
-            },
-            None => {
-                self.compute.gate_up.invoke(
-                    self.shape
-                        .num_total_tokens
-                        .try_into()
-                        .expect("dense MLP token count must fit i32"),
-                    self.gate_up,
-                    0,
-                    self.hidden_state,
-                    0,
-                    self.weights.gate_up_weight,
-                    0,
-                    self.weights.gate_up_scales,
-                    0,
-                    self.weights.gate_up_biases,
-                    0,
-                )
-            },
+        let num_active_tokens = match self.num_active_tokens_key {
+            Some(key) => ReplayU32::Parameter(key),
+            None => ReplayU32::Fixed(self.shape.num_total_tokens),
         };
+        let invocation = self.compute.gate_up.invoke(
+            self.shape.num_total_tokens,
+            num_active_tokens,
+            self.gate_up,
+            0,
+            self.hidden_state,
+            0,
+            self.weights.gate_up_weight,
+            0,
+            self.weights.gate_up_scales,
+            0,
+            self.weights.gate_up_biases,
+            0,
+        );
         invocation.record(recorder);
     }
 }
@@ -494,42 +428,24 @@ pub struct DownInvocation<'a> {
 
 impl Operator for DownInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let invocation = match self.num_active_tokens_key {
-            Some(key) => {
-                self.compute.down.invoke_bucketed(
-                    self.shape.num_total_tokens,
-                    key,
-                    self.next_hidden_state,
-                    0,
-                    self.swiglu,
-                    0,
-                    self.weights.down_weight,
-                    0,
-                    self.weights.down_scales,
-                    0,
-                    self.weights.down_biases,
-                    0,
-                )
-            },
-            None => {
-                self.compute.down.invoke(
-                    self.shape
-                        .num_total_tokens
-                        .try_into()
-                        .expect("dense MLP token count must fit i32"),
-                    self.next_hidden_state,
-                    0,
-                    self.swiglu,
-                    0,
-                    self.weights.down_weight,
-                    0,
-                    self.weights.down_scales,
-                    0,
-                    self.weights.down_biases,
-                    0,
-                )
-            },
+        let num_active_tokens = match self.num_active_tokens_key {
+            Some(key) => ReplayU32::Parameter(key),
+            None => ReplayU32::Fixed(self.shape.num_total_tokens),
         };
+        let invocation = self.compute.down.invoke(
+            self.shape.num_total_tokens,
+            num_active_tokens,
+            self.next_hidden_state,
+            0,
+            self.swiglu,
+            0,
+            self.weights.down_weight,
+            0,
+            self.weights.down_scales,
+            0,
+            self.weights.down_biases,
+            0,
+        );
         invocation.record(recorder);
     }
 }

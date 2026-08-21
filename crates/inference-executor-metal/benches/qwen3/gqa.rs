@@ -626,7 +626,8 @@ fn affine_replay(
     let kernel = affine_quantized::Kernel::new(device, config, kind);
     let mut recorder = stream.create_replay_program();
     recorder.record(kernel.invoke(
-        num_tokens.try_into().expect("GQA affine row count must fit i32"),
+        num_tokens,
+        ReplayU32::Fixed(num_tokens),
         output,
         0,
         input,
@@ -740,6 +741,8 @@ fn split_kv_single_q_replay(
             partial_output: scratch.sdpa_partial_output,
         },
         ReplayU32::Fixed(0),
+        ReplayU32::Fixed(sdpa_shape.num_total_tokens),
+        ReplayU32::Fixed(sdpa_shape.num_total_sdpa_map_task_templates),
     )));
     recorder.record_with_barrier_before(ReplayOp::opaque(kernels.invoke_reduce(
         backend_single_q::ReduceBuffers {
@@ -749,6 +752,7 @@ fn split_kv_single_q_replay(
             cu_sdpa_partial_outputs: metadata.cu_sdpa_partial_outputs(),
             output: scratch.attention_output,
         },
+        ReplayU32::Fixed(sdpa_shape.num_total_tokens),
     )));
     recorder.build()
 }
@@ -802,6 +806,9 @@ fn split_kv_tiled_q_replay(
             partial_max_logits: scratch.sdpa_partial_max_logits,
         },
         ReplayU32::Fixed(0),
+        ReplayU32::Fixed(tiled_shape.num_total_tokens),
+        ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
+        ReplayU32::Fixed(tiled_shape.num_total_sdpa_map_task_templates),
     )));
     recorder.record_with_barrier_before(ReplayOp::opaque(kernels.invoke_reduce(
         backend_tiled_q::ReduceBuffers {
@@ -812,6 +819,7 @@ fn split_kv_tiled_q_replay(
             cu_sdpa_partial_outputs: metadata.cu_sdpa_partial_outputs(),
             output: scratch.attention_output,
         },
+        ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
     )));
     recorder.build()
 }

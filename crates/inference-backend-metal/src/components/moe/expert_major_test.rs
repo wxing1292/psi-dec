@@ -75,6 +75,7 @@ fn test_layout_pack_scatter() {
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_layout(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         LayoutBuffers {
             expert_indices: &expert_indices,
             expert_counts: &expert_counts,
@@ -87,6 +88,7 @@ fn test_layout_pack_scatter() {
     ));
     builder.record_with_barrier_before(kernels.invoke_pack_input(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         PackInputBuffers {
             input: &input,
             routes_by_expert: &routes_by_expert,
@@ -95,6 +97,7 @@ fn test_layout_pack_scatter() {
     ));
     builder.record_with_barrier_before(kernels.invoke_scatter_without_shared_experts(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         ScatterWithoutSharedExpertsBuffers {
             packed_output: &packed_input,
             routes_by_token: &routes_by_token,
@@ -104,6 +107,7 @@ fn test_layout_pack_scatter() {
     ));
     builder.record_with_barrier_before(kernels.invoke_scatter_with_shared_experts(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         ScatterWithSharedExpertsBuffers {
             packed_output: &packed_input,
             routes_by_token: &routes_by_token,
@@ -256,23 +260,24 @@ impl BucketedFixture {
 
     fn bucketed_replay(&self) -> ReplayProgram {
         let mut builder = self.stream.create_replay_program();
-        builder.record(
-            self.kernels
-                .invoke_layout_bucketed(self.shape, NUM_ACTIVE_TOKENS, self.layout_buffers()),
-        );
-        builder.record_with_barrier_before(self.kernels.invoke_pack_input_bucketed(
+        builder.record(self.kernels.invoke_layout(
             self.shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            self.layout_buffers(),
+        ));
+        builder.record_with_barrier_before(self.kernels.invoke_pack_input(
+            self.shape,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             self.pack_input_buffers(),
         ));
-        builder.record_with_barrier_before(self.kernels.invoke_scatter_without_shared_experts_bucketed(
+        builder.record_with_barrier_before(self.kernels.invoke_scatter_without_shared_experts(
             self.shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             self.scatter_without_shared_experts_buffers(),
         ));
-        builder.record_with_barrier_before(self.kernels.invoke_scatter_with_shared_experts_bucketed(
+        builder.record_with_barrier_before(self.kernels.invoke_scatter_with_shared_experts(
             self.shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             self.scatter_with_shared_experts_buffers(),
         ));
         builder.build()

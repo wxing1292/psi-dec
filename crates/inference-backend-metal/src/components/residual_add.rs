@@ -13,6 +13,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const RESIDUAL_ADD_SOURCE: &str = include_str!("metal/residual_add.metal");
 
@@ -165,7 +166,7 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke_values<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
         Invocation {
             kernel: &self.kernel,
             config: self.config,
@@ -176,8 +177,12 @@ impl Compute {
         }
     }
 
-    /// Records an exact number of complete rows.
-    pub fn invoke_rows<'a>(&'a self, shape: RowShape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke_rows<'a>(
+        &'a self,
+        shape: RowShape,
+        num_active_rows: ReplayU32,
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
         Invocation {
             kernel: &self.kernel,
             config: self.config,
@@ -186,26 +191,13 @@ impl Compute {
             },
             buffers,
             row_shape: Some(shape),
-            num_active_rows_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity grid whose active row count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        capacity_shape: RowShape,
-        num_active_rows_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-    ) -> Invocation<'a> {
-        Invocation {
-            kernel: &self.kernel,
-            config: self.config,
-            shape: Shape {
-                num_values: capacity_shape.num_values(),
+            num_active_rows_key: match num_active_rows {
+                ReplayU32::Fixed(value) => {
+                    assert_eq!(value, shape.num_total_rows);
+                    None
+                },
+                ReplayU32::Parameter(key) => Some(key),
             },
-            buffers,
-            row_shape: Some(capacity_shape),
-            num_active_rows_key: Some(num_active_rows_key),
         }
     }
 }

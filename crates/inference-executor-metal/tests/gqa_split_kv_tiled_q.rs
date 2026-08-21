@@ -137,7 +137,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
     let output = Buffer::from_slice(&device, &vec![sentinel; num_total_tokens * num_q_heads * head_dim]);
     let kernels = backend_tiled_q::Compute::new(&device, config, execution, shape);
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map_bucketed(
+    builder.record(kernels.invoke_map(
         backend_tiled_q::MapBuffers {
             q: &q,
             kv_pages: &kv_pages,
@@ -155,7 +155,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
         ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
         ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
     ));
-    builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
+    builder.record_with_barrier_before(kernels.invoke_reduce(
         backend_tiled_q::ReduceBuffers {
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
@@ -440,15 +440,21 @@ fn run_case(
             partial_max_logits: &partial_max_logits,
         },
         ReplayU32::Fixed(0),
+        ReplayU32::Fixed(shape.num_total_tokens),
+        ReplayU32::Fixed(shape.num_total_q_token_tiles),
+        ReplayU32::Fixed(shape.num_total_sdpa_map_task_templates),
     ));
-    builder.record_with_barrier_before(kernels.invoke_reduce(backend_tiled_q::ReduceBuffers {
-        partial_output: &partial_output,
-        partial_exp_sums: &partial_exp_sums,
-        partial_max_logits: &partial_max_logits,
-        q_token_ranges: &q_token_ranges,
-        cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
-        output: &output,
-    }));
+    builder.record_with_barrier_before(kernels.invoke_reduce(
+        backend_tiled_q::ReduceBuffers {
+            partial_output: &partial_output,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+            q_token_ranges: &q_token_ranges,
+            cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
+            output: &output,
+        },
+        ReplayU32::Fixed(shape.num_total_q_token_tiles),
+    ));
     let replay = builder.build();
     stream.submit_replay(&replay).wait();
     let actual = output

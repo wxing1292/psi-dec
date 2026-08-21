@@ -41,13 +41,7 @@ impl Gather {
             row_indices,
             output,
         };
-        let invocation = match num_active_rows {
-            ReplayU32::Fixed(num_active_rows) => {
-                assert_eq!(num_active_rows, num_total_rows);
-                self.compute.invoke(shape, buffers)
-            },
-            ReplayU32::Parameter(key) => self.compute.invoke_bucketed(shape, key, buffers),
-        };
+        let invocation = self.compute.invoke(shape, num_active_rows, buffers);
         recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
     }
 }

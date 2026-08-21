@@ -40,7 +40,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let output = Buffer::new_zeroed(&device, config.q_bytes(shape));
 
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map_bucketed(
+    builder.record(kernels.invoke_map(
         MapBuffers {
             q: &q,
             kv_pages: &kv_pages,
@@ -58,7 +58,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
         ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
         ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
     ));
-    builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
+    builder.record_with_barrier_before(kernels.invoke_reduce(
         ReduceBuffers {
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,

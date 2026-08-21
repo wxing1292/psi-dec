@@ -8,6 +8,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::affine_quantized;
 
@@ -119,19 +120,71 @@ impl UnembeddingFixture {
         match path {
             MatmulPath::Auto => {
                 let matmul = affine_quantized::Matmul::new(device, config);
-                builder.record(matmul.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
+                builder.record(matmul.invoke(
+                    tokens as u32,
+                    ReplayU32::Fixed(tokens as u32),
+                    &logits,
+                    0,
+                    &hidden,
+                    0,
+                    &weight,
+                    0,
+                    &scales,
+                    0,
+                    &biases,
+                    0,
+                ));
             },
             MatmulPath::QmvBn8Bk32 => {
                 let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmvBn8Bk32);
-                builder.record(kernel.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
+                builder.record(kernel.invoke(
+                    tokens as u32,
+                    ReplayU32::Fixed(tokens as u32),
+                    &logits,
+                    0,
+                    &hidden,
+                    0,
+                    &weight,
+                    0,
+                    &scales,
+                    0,
+                    &biases,
+                    0,
+                ));
             },
             MatmulPath::QmmBm16Bn32 => {
                 let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmmBm16Bn32);
-                builder.record(kernel.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
+                builder.record(kernel.invoke(
+                    tokens as u32,
+                    ReplayU32::Fixed(tokens as u32),
+                    &logits,
+                    0,
+                    &hidden,
+                    0,
+                    &weight,
+                    0,
+                    &scales,
+                    0,
+                    &biases,
+                    0,
+                ));
             },
             MatmulPath::QmmBm32Bn32 => {
                 let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmmBm32Bn32);
-                builder.record(kernel.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
+                builder.record(kernel.invoke(
+                    tokens as u32,
+                    ReplayU32::Fixed(tokens as u32),
+                    &logits,
+                    0,
+                    &hidden,
+                    0,
+                    &weight,
+                    0,
+                    &scales,
+                    0,
+                    &biases,
+                    0,
+                ));
             },
         }
         let replay = builder.build();

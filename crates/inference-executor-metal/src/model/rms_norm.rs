@@ -51,13 +51,7 @@ impl RMSNorm {
             weight: self.weight(),
             output,
         };
-        match num_active_tokens {
-            ReplayU32::Fixed(num_active_tokens) => {
-                assert_eq!(num_active_tokens, num_total_tokens);
-                self.compute.invoke(shape, buffers)
-            },
-            ReplayU32::Parameter(key) => self.compute.invoke_bucketed(shape, key, buffers),
-        }
+        self.compute.invoke(shape, num_active_tokens, buffers)
     }
 
     pub fn record<'a, R>(

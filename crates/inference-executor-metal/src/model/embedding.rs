@@ -168,13 +168,7 @@ impl ReplayLayer for Embed {
             biases: &weights.biases,
             output: input.output_hidden,
         };
-        let invocation = match input.num_active_tokens {
-            ReplayU32::Fixed(num_active_tokens) => {
-                assert_eq!(num_active_tokens, input.num_total_tokens);
-                self.kernel.invoke(shape, buffers)
-            },
-            ReplayU32::Parameter(key) => self.kernel.invoke_bucketed(shape, key, buffers),
-        };
+        let invocation = self.kernel.invoke(shape, input.num_active_tokens, buffers);
         recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         input.output_hidden
     }

@@ -504,28 +504,17 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
-        assert!(
-            shape.num_total_tokens >= shape.num_total_reqs,
-            "GDN ragged recurrent requires at least one token per request"
-        );
-        let (_, variant) = self.select(shape);
-        Invocation {
-            variant,
-            shape,
-            buffers,
-            num_active_reqs: ReplayU32::Fixed(shape.num_total_reqs),
-            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
-        }
-    }
-
-    pub fn invoke_bucketed<'a>(
+    pub fn invoke<'a>(
         &'a self,
         shape: Shape,
         buffers: Buffers<'a>,
         num_active_reqs: ReplayU32,
         num_active_tokens: ReplayU32,
     ) -> Invocation<'a> {
+        assert!(
+            shape.num_total_tokens >= shape.num_total_reqs,
+            "GDN ragged recurrent requires at least one token per request"
+        );
         let (_, variant) = self.select(shape);
         Invocation {
             variant,
@@ -540,28 +529,13 @@ impl Compute {
         &'a self,
         shape: Shape,
         buffers: Buffers<'a>,
+        num_active_reqs: ReplayU32,
+        num_active_tokens: ReplayU32,
     ) -> CandidateStateUpdateInvocation<'a> {
         assert!(
             shape.num_total_tokens >= shape.num_total_reqs,
             "GDN ragged recurrent requires at least one token per request"
         );
-        let (_, variant) = self.select(shape);
-        CandidateStateUpdateInvocation {
-            variant,
-            shape,
-            buffers,
-            num_active_reqs: ReplayU32::Fixed(shape.num_total_reqs),
-            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
-        }
-    }
-
-    pub fn invoke_with_candidate_state_update_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        buffers: Buffers<'a>,
-        num_active_reqs: ReplayU32,
-        num_active_tokens: ReplayU32,
-    ) -> CandidateStateUpdateInvocation<'a> {
         let (_, variant) = self.select(shape);
         CandidateStateUpdateInvocation {
             variant,

@@ -151,24 +151,20 @@ impl ReplayLayer for UngatedDSparkGQA {
         let (shape, sdpa_execution) = self.validate_input(&input);
         let attention = &self.core.attention;
         let scratch = input.scratch;
-        recorder.record_with_barrier_before(ReplayOp::opaque(
-            self.qkv.invoke(
-                shape
-                    .num_tokens
-                    .try_into()
-                    .expect("DSpark GQA token count must fit i32"),
-                scratch.qkv,
-                0,
-                input.hidden_state,
-                0,
-                input.weights.qkv_weight,
-                0,
-                input.weights.qkv_scales,
-                0,
-                input.weights.qkv_biases,
-                0,
-            ),
-        ));
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv.invoke(
+            shape.num_tokens,
+            ReplayU32::Fixed(shape.num_tokens),
+            scratch.qkv,
+            0,
+            input.hidden_state,
+            0,
+            input.weights.qkv_weight,
+            0,
+            input.weights.qkv_scales,
+            0,
+            input.weights.qkv_biases,
+            0,
+        )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv_to_q_k_v.invoke(
             backend_qkv_split::Shape {
                 num_tokens: shape.num_tokens,
@@ -190,6 +186,7 @@ impl ReplayLayer for UngatedDSparkGQA {
                 flat_token_indices: input.metadata.flat_token_indices(),
                 output: scratch.q_norm_rope,
             },
+            ReplayU32::Fixed(shape.num_tokens),
         )));
         recorder.record(ReplayOp::opaque(self.k_norm_rope.invoke(
             rms_norm_rope::Shape {
@@ -201,6 +198,7 @@ impl ReplayLayer for UngatedDSparkGQA {
                 flat_token_indices: input.metadata.flat_token_indices(),
                 output: scratch.k_norm_rope,
             },
+            ReplayU32::Fixed(shape.num_tokens),
         )));
 
         let sdpa_config = self.split_kv_single_q_config(input.page_table_layout);
@@ -221,6 +219,8 @@ impl ReplayLayer for UngatedDSparkGQA {
                 partial_output: scratch.partial_output,
             },
             ReplayU32::Fixed(input.gqa_layer_index),
+            ReplayU32::Fixed(shape.num_tokens),
+            ReplayU32::Fixed(shape.num_total_sdpa_map_task_templates),
         )));
         recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
             backend_block_sdpa::Shape {
@@ -237,31 +237,30 @@ impl ReplayLayer for UngatedDSparkGQA {
                 partial_output: scratch.partial_output,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(backend_single_q::ReduceBuffers {
-            partial_exp_sums: scratch.partial_exp_sums,
-            partial_max_logits: scratch.partial_max_logits,
-            partial_output: scratch.partial_output,
-            cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
-            output: scratch.attention_output,
-        })));
-        recorder.record_with_barrier_before(ReplayOp::opaque(
-            self.output.invoke(
-                shape
-                    .num_tokens
-                    .try_into()
-                    .expect("DSpark GQA token count must fit i32"),
-                input.next_hidden_state,
-                0,
-                scratch.attention_output,
-                0,
-                input.weights.output_weight,
-                0,
-                input.weights.output_scales,
-                0,
-                input.weights.output_biases,
-                0,
-            ),
-        ));
+        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
+            backend_single_q::ReduceBuffers {
+                partial_exp_sums: scratch.partial_exp_sums,
+                partial_max_logits: scratch.partial_max_logits,
+                partial_output: scratch.partial_output,
+                cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
+                output: scratch.attention_output,
+            },
+            ReplayU32::Fixed(shape.num_tokens),
+        )));
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.output.invoke(
+            shape.num_tokens,
+            ReplayU32::Fixed(shape.num_tokens),
+            input.next_hidden_state,
+            0,
+            scratch.attention_output,
+            0,
+            input.weights.output_weight,
+            0,
+            input.weights.output_scales,
+            0,
+            input.weights.output_biases,
+            0,
+        )));
         input.next_hidden_state
     }
 }

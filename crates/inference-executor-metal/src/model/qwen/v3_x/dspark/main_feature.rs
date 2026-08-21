@@ -288,23 +288,20 @@ impl Qwen3xDSparkMainFeatureProjector {
             .weights
             .as_ref()
             .expect("Qwen3.x DSpark Main-feature weights must be loaded before execution");
-        recorder.record_with_barrier_before(ReplayOp::opaque(
-            self.fc.invoke(
-                num_tokens
-                    .try_into()
-                    .expect("Qwen3 DSpark Main token count must fit i32"),
-                &self.main_feature,
-                0,
-                &self.main_residuals,
-                0,
-                &weights.fc_weight,
-                0,
-                &weights.fc_scales,
-                0,
-                &weights.fc_biases,
-                0,
-            ),
-        ));
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke(
+            num_tokens,
+            ReplayU32::Fixed(num_tokens),
+            &self.main_feature,
+            0,
+            &self.main_residuals,
+            0,
+            &weights.fc_weight,
+            0,
+            &weights.fc_scales,
+            0,
+            &weights.fc_biases,
+            0,
+        )));
         self.hidden_norm.record_with_barrier(
             recorder,
             num_tokens,

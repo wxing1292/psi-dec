@@ -13,6 +13,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const RESIDUAL_ADD_RMS_NORM_SOURCE: &str = include_str!("metal/residual_add_rms_norm.metal");
 
@@ -159,32 +160,26 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, num_active_tokens: ReplayU32, buffers: Buffers<'a>) -> Invocation<'a> {
+        shape.validate();
         Invocation {
             kernel: &self.kernel,
             config: self.config,
             constants: self.constants,
             shape,
             buffers,
-            num_active_tokens_key: None,
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
+}
 
-    /// Records a fixed-capacity grid whose active token count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        capacity_shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-    ) -> Invocation<'a> {
-        Invocation {
-            kernel: &self.kernel,
-            config: self.config,
-            constants: self.constants,
-            shape: capacity_shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
-        }
+fn active_key(num_total_tokens: u32, num_active_tokens: ReplayU32) -> Option<ReplayParameterKey> {
+    match num_active_tokens {
+        ReplayU32::Fixed(num_active_tokens) => {
+            assert_eq!(num_active_tokens, num_total_tokens);
+            None
+        },
+        ReplayU32::Parameter(key) => Some(key),
     }
 }
 
@@ -432,13 +427,15 @@ impl ReplayInvocation {
             rms_norm.buffers.output,
             rms_norm.buffers.output_len_bytes,
         );
-        match rms_norm.num_active_tokens_key {
-            Some(key) => Self::new_bucketed(config, shape, key, buffers),
-            None => Self::new(config, shape, buffers),
-        }
+        Self::new(config, shape, buffers, rms_norm.num_active_tokens_key)
     }
 
-    fn new(config: Config, shape: Shape, buffers: OwnedBuffers) -> Self {
+    fn new(
+        config: Config,
+        shape: Shape,
+        buffers: OwnedBuffers,
+        num_active_tokens_key: Option<ReplayParameterKey>,
+    ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
         let constants = KernelConstants::new(config, selected_kernel_kind(config));
         Self {
@@ -452,30 +449,7 @@ impl ReplayInvocation {
             constants,
             shape,
             buffers,
-            num_active_tokens_key: None,
-        }
-    }
-
-    fn new_bucketed(
-        config: Config,
-        capacity_shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: OwnedBuffers,
-    ) -> Self {
-        let device = Device::from_raw_retained(buffers.lhs.device());
-        let constants = KernelConstants::new(config, selected_kernel_kind(config));
-        Self {
-            pipeline: CompiledKernel::new(
-                &device,
-                RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_rms_norm_function_name(config, constants.kind),
-            )
-            .as_raw_retained(),
-            config,
-            constants,
-            shape: capacity_shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key,
         }
     }
 
@@ -535,10 +509,14 @@ impl CaptureReplayInvocation {
             rms_norm.buffers.output,
             rms_norm.buffers.output_len_bytes,
         );
-        match rms_norm.num_active_tokens_key {
-            Some(key) => Self::new_bucketed(config, shape, key, buffers, capture_num_columns, capture_column_start),
-            None => Self::new(config, shape, buffers, capture_num_columns, capture_column_start),
-        }
+        Self::new(
+            config,
+            shape,
+            buffers,
+            capture_num_columns,
+            capture_column_start,
+            rms_norm.num_active_tokens_key,
+        )
     }
 
     fn new(
@@ -547,6 +525,7 @@ impl CaptureReplayInvocation {
         buffers: CaptureOwnedBuffers,
         capture_num_columns: u32,
         capture_column_start: u32,
+        num_active_tokens_key: Option<ReplayParameterKey>,
     ) -> Self {
         let device = Device::from_raw_retained(buffers.lhs.device());
         let constants = KernelConstants::new(config, KernelKind::Bf16Vectorized);
@@ -563,34 +542,7 @@ impl CaptureReplayInvocation {
             buffers,
             capture_num_columns,
             capture_column_start,
-            num_active_tokens_key: None,
-        }
-    }
-
-    fn new_bucketed(
-        config: Config,
-        capacity_shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: CaptureOwnedBuffers,
-        capture_num_columns: u32,
-        capture_column_start: u32,
-    ) -> Self {
-        let device = Device::from_raw_retained(buffers.lhs.device());
-        let constants = KernelConstants::new(config, KernelKind::Bf16Vectorized);
-        Self {
-            pipeline: CompiledKernel::new(
-                &device,
-                RESIDUAL_ADD_RMS_NORM_SOURCE,
-                residual_add_capture_rms_norm_function_name(config),
-            )
-            .as_raw_retained(),
-            config,
-            constants,
-            shape: capacity_shape,
-            buffers,
-            capture_num_columns,
-            capture_column_start,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key,
         }
     }
 
@@ -692,6 +644,7 @@ mod tests {
     use half::bf16;
 
     use super::*;
+    use crate::metal::ReplayU32;
     use crate::metal::Stream;
 
     #[test]
@@ -733,7 +686,7 @@ mod tests {
         let fused_vec4_norm = Buffer::new_zeroed(&device, num_values * size_of::<u16>());
 
         let mut builder = stream.create_replay_program();
-        builder.record(residual_add.invoke(
+        builder.record(residual_add.invoke_values(
             residual_add::Shape {
                 num_values: num_values as u32,
             },
@@ -747,6 +700,7 @@ mod tests {
             rms_norm::Shape {
                 num_total_tokens: tokens as u32,
             },
+            ReplayU32::Fixed(tokens as u32),
             rms_norm::Buffers {
                 input: &unfused_residual,
                 weight: &weight,
@@ -758,6 +712,7 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(fused_scalar.invoke(
             shape,
+            ReplayU32::Fixed(shape.num_total_tokens),
             Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
@@ -780,6 +735,7 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(fused.invoke(
             shape,
+            ReplayU32::Fixed(shape.num_total_tokens),
             Buffers {
                 lhs: &lhs,
                 rhs: &rhs,

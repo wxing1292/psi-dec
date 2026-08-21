@@ -5,7 +5,7 @@ use crate::metal::CommandRecorder;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
-use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 use crate::operators::affine_quantized;
 
 fn to_i32(value: u32, name: &str) -> i32 {
@@ -207,29 +207,34 @@ impl TokenMajorShape {
 #[derive(Clone, Copy, Debug)]
 pub struct ExpertMajorShape {
     pub num_total_routes: u32,
+    pub num_total_tokens: u32,
+    pub num_experts_per_token: u32,
 }
 
 impl ExpertMajorShape {
     pub fn validate(self) {
         to_i32(self.num_total_routes, "sparse MLP route count");
         assert!(self.num_total_routes > 0);
+        assert!(self.num_total_tokens > 0);
+        assert!(self.num_experts_per_token > 0);
+        assert_eq!(
+            self.num_total_routes,
+            self.num_total_tokens
+                .checked_mul(self.num_experts_per_token)
+                .expect("sparse MLP total route count must fit u32")
+        );
     }
 }
 
 #[derive(Clone, Copy)]
-struct BucketedReplay {
+struct RouteActivity {
     num_total_tokens: u32,
     num_experts_per_token: u32,
-    num_active_tokens_key: ReplayParameterKey,
+    num_active_tokens: ReplayU32,
 }
 
-impl BucketedReplay {
-    fn new(
-        config: Config,
-        num_total_tokens: u32,
-        num_experts_per_token: u32,
-        num_active_tokens_key: ReplayParameterKey,
-    ) -> Self {
+impl RouteActivity {
+    fn new(config: Config, num_total_tokens: u32, num_experts_per_token: u32, num_active_tokens: ReplayU32) -> Self {
         config.validate();
         assert!(num_total_tokens > 0);
         assert!(num_experts_per_token > 0);
@@ -241,29 +246,19 @@ impl BucketedReplay {
             .checked_mul(num_experts_per_token)
             .expect("sparse MLP total route count must fit u32");
         i32::try_from(num_total_routes).expect("sparse MLP total route count must fit i32");
+        if let ReplayU32::Fixed(num_active_tokens) = num_active_tokens {
+            assert_eq!(num_active_tokens, num_total_tokens);
+        }
         Self {
             num_total_tokens,
             num_experts_per_token,
-            num_active_tokens_key,
+            num_active_tokens,
         }
     }
 
     fn num_total_routes(self) -> u32 {
         debug_assert!(self.num_total_tokens.checked_mul(self.num_experts_per_token).is_some());
         self.num_total_tokens * self.num_experts_per_token
-    }
-
-    fn token_major_shape(self) -> TokenMajorShape {
-        TokenMajorShape {
-            num_total_routes: self.num_total_routes(),
-            num_total_tokens: self.num_total_tokens,
-        }
-    }
-
-    fn expert_major_shape(self) -> ExpertMajorShape {
-        ExpertMajorShape {
-            num_total_routes: self.num_total_routes(),
-        }
     }
 }
 
@@ -344,63 +339,39 @@ impl Compute {
     pub fn invoke_token_major<'a>(
         &'a self,
         shape: TokenMajorShape,
-        buffers: TokenMajorBuffers<'a>,
-        scratch: Scratch<'a>,
-        weights: Weights<'a>,
-    ) -> TokenMajorInvocation<'a> {
-        self.token_major.invoke(shape, buffers, scratch, weights)
-    }
-
-    /// Records a fixed token-major capacity whose active route count derives from active tokens.
-    #[allow(clippy::too_many_arguments)]
-    pub fn invoke_token_major_bucketed<'a>(
-        &'a self,
-        num_total_tokens: u32,
         num_experts_per_token: u32,
-        num_active_tokens_key: ReplayParameterKey,
+        num_active_tokens: ReplayU32,
         buffers: TokenMajorBuffers<'a>,
         scratch: Scratch<'a>,
         weights: Weights<'a>,
     ) -> TokenMajorInvocation<'a> {
-        let bucketed_replay = BucketedReplay::new(
-            self.token_major.config,
-            num_total_tokens,
+        self.token_major.invoke(
+            shape,
             num_experts_per_token,
-            num_active_tokens_key,
-        );
-        self.token_major
-            .invoke_bucketed(bucketed_replay, buffers, scratch, weights)
+            num_active_tokens,
+            buffers,
+            scratch,
+            weights,
+        )
     }
 
     pub fn invoke_expert_major<'a>(
         &'a self,
         shape: ExpertMajorShape,
+        num_active_tokens: ReplayU32,
         buffers: ExpertMajorBuffers<'a>,
         scratch: Scratch<'a>,
         weights: Weights<'a>,
     ) -> ExpertMajorInvocation<'a> {
-        self.expert_major.invoke(shape, buffers, scratch, weights)
-    }
-
-    /// Records a fixed expert-major capacity whose active route count derives from active tokens.
-    #[allow(clippy::too_many_arguments)]
-    pub fn invoke_expert_major_bucketed<'a>(
-        &'a self,
-        num_total_tokens: u32,
-        num_experts_per_token: u32,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: ExpertMajorBuffers<'a>,
-        scratch: Scratch<'a>,
-        weights: Weights<'a>,
-    ) -> ExpertMajorInvocation<'a> {
-        let bucketed_replay = BucketedReplay::new(
+        let route_activity = RouteActivity::new(
             self.expert_major.config,
-            num_total_tokens,
-            num_experts_per_token,
-            num_active_tokens_key,
+            shape.num_total_tokens,
+            shape.num_experts_per_token,
+            num_active_tokens,
         );
+        assert_eq!(shape.num_total_routes, route_activity.num_total_routes());
         self.expert_major
-            .invoke_bucketed(bucketed_replay, buffers, scratch, weights)
+            .invoke(shape, route_activity, buffers, scratch, weights)
     }
 }
 
@@ -429,68 +400,76 @@ impl TokenMajorKernels {
     pub fn invoke<'a>(
         &'a self,
         shape: TokenMajorShape,
+        num_experts_per_token: u32,
+        num_active_tokens: ReplayU32,
         buffers: TokenMajorBuffers<'a>,
         scratch: Scratch<'a>,
         weights: Weights<'a>,
     ) -> TokenMajorInvocation<'a> {
+        let route_activity = RouteActivity::new(
+            self.config,
+            shape.num_total_tokens,
+            num_experts_per_token,
+            num_active_tokens,
+        );
+        assert_eq!(shape.num_total_routes, route_activity.num_total_routes());
         TokenMajorInvocation {
             kernels: self,
             shape,
             buffers,
             scratch,
             weights,
-            bucketed_replay: None,
-        }
-    }
-
-    fn invoke_bucketed<'a>(
-        &'a self,
-        bucketed_replay: BucketedReplay,
-        buffers: TokenMajorBuffers<'a>,
-        scratch: Scratch<'a>,
-        weights: Weights<'a>,
-    ) -> TokenMajorInvocation<'a> {
-        TokenMajorInvocation {
-            kernels: self,
-            shape: bucketed_replay.token_major_shape(),
-            buffers,
-            scratch,
-            weights,
-            bucketed_replay: Some(bucketed_replay),
+            route_activity,
         }
     }
 
     pub fn invoke_gate_up_swiglu<'a>(
         &'a self,
         shape: TokenMajorShape,
+        num_active_tokens: ReplayU32,
         buffers: TokenMajorBuffers<'a>,
         scratch: Scratch<'a>,
         weights: Weights<'a>,
     ) -> TokenMajorGateUpSwiGLUInvocation<'a> {
+        assert_eq!(shape.num_total_routes % shape.num_total_tokens, 0);
+        let route_activity = RouteActivity::new(
+            self.config,
+            shape.num_total_tokens,
+            shape.num_total_routes / shape.num_total_tokens,
+            num_active_tokens,
+        );
         TokenMajorGateUpSwiGLUInvocation {
             kernels: self,
             shape,
             buffers,
             scratch,
             weights,
-            bucketed_replay: None,
+            route_activity,
         }
     }
 
     pub fn invoke_down<'a>(
         &'a self,
         shape: TokenMajorShape,
+        num_active_tokens: ReplayU32,
         buffers: TokenMajorBuffers<'a>,
         scratch: Scratch<'a>,
         weights: Weights<'a>,
     ) -> TokenMajorDownInvocation<'a> {
+        assert_eq!(shape.num_total_routes % shape.num_total_tokens, 0);
+        let route_activity = RouteActivity::new(
+            self.config,
+            shape.num_total_tokens,
+            shape.num_total_routes / shape.num_total_tokens,
+            num_active_tokens,
+        );
         TokenMajorDownInvocation {
             kernels: self,
             shape,
             buffers,
             scratch,
             weights,
-            bucketed_replay: None,
+            route_activity,
         }
     }
 }
@@ -505,9 +484,10 @@ impl ExpertMajorKernels {
         }
     }
 
-    pub fn invoke<'a>(
+    fn invoke<'a>(
         &'a self,
         shape: ExpertMajorShape,
+        route_activity: RouteActivity,
         buffers: ExpertMajorBuffers<'a>,
         scratch: Scratch<'a>,
         weights: Weights<'a>,
@@ -518,24 +498,7 @@ impl ExpertMajorKernels {
             buffers,
             scratch,
             weights,
-            bucketed_replay: None,
-        }
-    }
-
-    fn invoke_bucketed<'a>(
-        &'a self,
-        bucketed_replay: BucketedReplay,
-        buffers: ExpertMajorBuffers<'a>,
-        scratch: Scratch<'a>,
-        weights: Weights<'a>,
-    ) -> ExpertMajorInvocation<'a> {
-        ExpertMajorInvocation {
-            kernels: self,
-            shape: bucketed_replay.expert_major_shape(),
-            buffers,
-            scratch,
-            weights,
-            bucketed_replay: Some(bucketed_replay),
+            route_activity,
         }
     }
 }
@@ -546,7 +509,7 @@ pub struct TokenMajorInvocation<'a> {
     buffers: TokenMajorBuffers<'a>,
     scratch: Scratch<'a>,
     weights: Weights<'a>,
-    bucketed_replay: Option<BucketedReplay>,
+    route_activity: RouteActivity,
 }
 
 impl Operator for TokenMajorInvocation<'_> {
@@ -557,7 +520,7 @@ impl Operator for TokenMajorInvocation<'_> {
             buffers: self.buffers,
             scratch: self.scratch,
             weights: self.weights,
-            bucketed_replay: self.bucketed_replay,
+            route_activity: self.route_activity,
         }
         .record(recorder);
         recorder.record_with_barrier_before(TokenMajorDownInvocation {
@@ -566,7 +529,7 @@ impl Operator for TokenMajorInvocation<'_> {
             buffers: self.buffers,
             scratch: self.scratch,
             weights: self.weights,
-            bucketed_replay: self.bucketed_replay,
+            route_activity: self.route_activity,
         });
     }
 }
@@ -577,47 +540,28 @@ pub struct TokenMajorGateUpSwiGLUInvocation<'a> {
     buffers: TokenMajorBuffers<'a>,
     scratch: Scratch<'a>,
     weights: Weights<'a>,
-    bucketed_replay: Option<BucketedReplay>,
+    route_activity: RouteActivity,
 }
 
 impl Operator for TokenMajorGateUpSwiGLUInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         debug_validate_token_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
-        let invocation = match self.bucketed_replay {
-            Some(bucketed_replay) => {
-                self.kernels.gate_up_swiglu.invoke_bucketed(
-                    self.kernels.config.token_major_gate_up_shape(self.shape),
-                    bucketed_replay.num_total_tokens,
-                    bucketed_replay.num_experts_per_token,
-                    bucketed_replay.num_active_tokens_key,
-                    self.scratch.swiglu,
-                    self.buffers.input,
-                    self.weights.gate_weight,
-                    self.weights.gate_scales,
-                    self.weights.gate_biases,
-                    self.weights.up_weight,
-                    self.weights.up_scales,
-                    self.weights.up_biases,
-                    self.buffers.token_indices,
-                    self.buffers.expert_indices,
-                )
-            },
-            None => {
-                self.kernels.gate_up_swiglu.invoke(
-                    self.kernels.config.token_major_gate_up_shape(self.shape),
-                    self.scratch.swiglu,
-                    self.buffers.input,
-                    self.weights.gate_weight,
-                    self.weights.gate_scales,
-                    self.weights.gate_biases,
-                    self.weights.up_weight,
-                    self.weights.up_scales,
-                    self.weights.up_biases,
-                    self.buffers.token_indices,
-                    self.buffers.expert_indices,
-                )
-            },
-        };
+        let invocation = self.kernels.gate_up_swiglu.invoke(
+            self.kernels.config.token_major_gate_up_shape(self.shape),
+            self.route_activity.num_total_tokens,
+            self.route_activity.num_experts_per_token,
+            self.route_activity.num_active_tokens,
+            self.scratch.swiglu,
+            self.buffers.input,
+            self.weights.gate_weight,
+            self.weights.gate_scales,
+            self.weights.gate_biases,
+            self.weights.up_weight,
+            self.weights.up_scales,
+            self.weights.up_biases,
+            self.buffers.token_indices,
+            self.buffers.expert_indices,
+        );
         invocation.record(recorder);
     }
 }
@@ -628,41 +572,25 @@ pub struct TokenMajorDownInvocation<'a> {
     buffers: TokenMajorBuffers<'a>,
     scratch: Scratch<'a>,
     weights: Weights<'a>,
-    bucketed_replay: Option<BucketedReplay>,
+    route_activity: RouteActivity,
 }
 
 impl Operator for TokenMajorDownInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         debug_validate_token_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
-        let invocation = match self.bucketed_replay {
-            Some(bucketed_replay) => {
-                self.kernels.down.invoke_bucketed(
-                    self.kernels.config.token_major_down_shape(self.shape),
-                    bucketed_replay.num_total_tokens,
-                    bucketed_replay.num_experts_per_token,
-                    bucketed_replay.num_active_tokens_key,
-                    self.buffers.routed_hidden,
-                    self.scratch.swiglu,
-                    self.weights.down_weight,
-                    self.weights.down_scales,
-                    self.weights.down_biases,
-                    self.buffers.route_indices,
-                    self.buffers.expert_indices,
-                )
-            },
-            None => {
-                self.kernels.down.invoke(
-                    self.kernels.config.token_major_down_shape(self.shape),
-                    self.buffers.routed_hidden,
-                    self.scratch.swiglu,
-                    self.weights.down_weight,
-                    self.weights.down_scales,
-                    self.weights.down_biases,
-                    self.buffers.route_indices,
-                    self.buffers.expert_indices,
-                )
-            },
-        };
+        let invocation = self.kernels.down.invoke(
+            self.kernels.config.token_major_down_shape(self.shape),
+            self.route_activity.num_total_tokens,
+            self.route_activity.num_experts_per_token,
+            self.route_activity.num_active_tokens,
+            self.buffers.routed_hidden,
+            self.scratch.swiglu,
+            self.weights.down_weight,
+            self.weights.down_scales,
+            self.weights.down_biases,
+            self.buffers.route_indices,
+            self.buffers.expert_indices,
+        );
         invocation.record(recorder);
     }
 }
@@ -673,73 +601,40 @@ pub struct ExpertMajorInvocation<'a> {
     buffers: ExpertMajorBuffers<'a>,
     scratch: Scratch<'a>,
     weights: Weights<'a>,
-    bucketed_replay: Option<BucketedReplay>,
+    route_activity: RouteActivity,
 }
 
 impl Operator for ExpertMajorInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         debug_validate_expert_major_buffers(self.kernels.config, self.shape, &self.buffers, &self.scratch);
-        let gate_up_swiglu = match self.bucketed_replay {
-            Some(bucketed_replay) => {
-                self.kernels.gate_up_swiglu.invoke_bucketed(
-                    self.kernels.config.expert_major_affine_shape(self.shape),
-                    bucketed_replay.num_total_tokens,
-                    bucketed_replay.num_experts_per_token,
-                    bucketed_replay.num_active_tokens_key,
-                    self.scratch.swiglu,
-                    self.buffers.packed_input,
-                    self.weights.gate_weight,
-                    self.weights.gate_scales,
-                    self.weights.gate_biases,
-                    self.weights.up_weight,
-                    self.weights.up_scales,
-                    self.weights.up_biases,
-                    self.buffers.experts_by_route,
-                )
-            },
-            None => {
-                self.kernels.gate_up_swiglu.invoke(
-                    self.kernels.config.expert_major_affine_shape(self.shape),
-                    self.scratch.swiglu,
-                    self.buffers.packed_input,
-                    self.weights.gate_weight,
-                    self.weights.gate_scales,
-                    self.weights.gate_biases,
-                    self.weights.up_weight,
-                    self.weights.up_scales,
-                    self.weights.up_biases,
-                    self.buffers.experts_by_route,
-                )
-            },
-        };
+        let gate_up_swiglu = self.kernels.gate_up_swiglu.invoke(
+            self.kernels.config.expert_major_affine_shape(self.shape),
+            self.route_activity.num_total_tokens,
+            self.route_activity.num_experts_per_token,
+            self.route_activity.num_active_tokens,
+            self.scratch.swiglu,
+            self.buffers.packed_input,
+            self.weights.gate_weight,
+            self.weights.gate_scales,
+            self.weights.gate_biases,
+            self.weights.up_weight,
+            self.weights.up_scales,
+            self.weights.up_biases,
+            self.buffers.experts_by_route,
+        );
         gate_up_swiglu.record(recorder);
-        let down = match self.bucketed_replay {
-            Some(bucketed_replay) => {
-                self.kernels.down.invoke_bucketed(
-                    self.kernels.config.expert_major_affine_shape(self.shape),
-                    bucketed_replay.num_total_tokens,
-                    bucketed_replay.num_experts_per_token,
-                    bucketed_replay.num_active_tokens_key,
-                    self.buffers.packed_output,
-                    self.scratch.swiglu,
-                    self.weights.down_weight,
-                    self.weights.down_scales,
-                    self.weights.down_biases,
-                    self.buffers.experts_by_route,
-                )
-            },
-            None => {
-                self.kernels.down.invoke(
-                    self.kernels.config.expert_major_affine_shape(self.shape),
-                    self.buffers.packed_output,
-                    self.scratch.swiglu,
-                    self.weights.down_weight,
-                    self.weights.down_scales,
-                    self.weights.down_biases,
-                    self.buffers.experts_by_route,
-                )
-            },
-        };
+        let down = self.kernels.down.invoke(
+            self.kernels.config.expert_major_affine_shape(self.shape),
+            self.route_activity.num_total_tokens,
+            self.route_activity.num_experts_per_token,
+            self.route_activity.num_active_tokens,
+            self.buffers.packed_output,
+            self.scratch.swiglu,
+            self.weights.down_weight,
+            self.weights.down_scales,
+            self.weights.down_biases,
+            self.buffers.experts_by_route,
+        );
         recorder.record_with_barrier_before(down);
     }
 }

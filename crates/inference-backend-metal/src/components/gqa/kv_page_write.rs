@@ -161,18 +161,7 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>, page_table_index: ReplayU32) -> Invocation<'a> {
-        Invocation {
-            constants: self.constants,
-            kernel: &self.kernel,
-            shape,
-            buffers,
-            num_active_token_writes: ReplayU32::Fixed(shape.num_total_token_writes),
-            page_table_index,
-        }
-    }
-
-    pub fn invoke_bucketed<'a>(
+    pub fn invoke<'a>(
         &'a self,
         shape: Shape,
         buffers: Buffers<'a>,
@@ -342,7 +331,7 @@ mod tests {
         };
         let kernel = Compute::new(&device, config);
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
+        builder.record(kernel.invoke(
             shape,
             Buffers {
                 pages: &pages,
@@ -427,6 +416,7 @@ mod tests {
                 flat_token_indices: &flat_token_indices,
                 page_ids: &page_ids,
             },
+            ReplayU32::Fixed(shape.num_total_token_writes),
             ReplayU32::Fixed(0),
         ));
         stream.submit_replay(&builder.build()).wait();

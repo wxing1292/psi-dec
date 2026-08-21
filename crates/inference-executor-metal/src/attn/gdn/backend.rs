@@ -292,53 +292,32 @@ impl ReplayLayer for GDN {
                 self.validate_token_capacity(shape.num_tokens, shape.num_total_tokens);
             },
         }
-        let num_active_tokens_key = match input.num_active_tokens {
-            ReplayU32::Parameter(key) => Some(key),
-            ReplayU32::Fixed(_) => None,
-        };
         let hidden_state = input.hidden_state;
         let next_hidden_state = input.next_hidden_state;
         let scratch = input.scratch;
         let batch_metadata = input.batch_metadata;
         let state = input.state;
         let weights = input.weights;
-        let bucketed = num_active_tokens_key.is_some();
-        let active_reqs = if bucketed {
+        let active_reqs = if matches!(input.num_active_tokens, ReplayU32::Parameter(_)) {
             ReplayU32::Parameter(GDN_NUM_ACTIVE_REQUESTS)
         } else {
             ReplayU32::Fixed(shape.num_reqs)
         };
         let active_tokens = input.num_active_tokens;
-        let qkvabz = if bucketed {
-            self.qkvabz.invoke_bucketed(
-                shape.num_total_tokens,
-                num_active_tokens_key.expect("bucketed GDN replay must have an active-token parameter"),
-                scratch.qkvabz,
-                0,
-                hidden_state,
-                0,
-                weights.qkvabz_weight,
-                0,
-                weights.qkvabz_scales,
-                0,
-                weights.qkvabz_biases,
-                0,
-            )
-        } else {
-            self.qkvabz.invoke(
-                shape.num_total_tokens.try_into().expect("GDN token count must fit i32"),
-                scratch.qkvabz,
-                0,
-                hidden_state,
-                0,
-                weights.qkvabz_weight,
-                0,
-                weights.qkvabz_scales,
-                0,
-                weights.qkvabz_biases,
-                0,
-            )
-        };
+        let qkvabz = self.qkvabz.invoke(
+            shape.num_total_tokens,
+            active_tokens,
+            scratch.qkvabz,
+            0,
+            hidden_state,
+            0,
+            weights.qkvabz_weight,
+            0,
+            weights.qkvabz_scales,
+            0,
+            weights.qkvabz_biases,
+            0,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(qkvabz));
         let split_shape = backend_qkvabz_split::Shape {
             num_total_tokens: shape.num_total_tokens,
@@ -350,12 +329,9 @@ impl ReplayLayer for GDN {
             b: scratch.b,
             z: scratch.z,
         };
-        let split = if bucketed {
-            self.qkvabz_to_qkv_a_b_z
-                .invoke_bucketed(split_shape, split_buffers, active_tokens)
-        } else {
-            self.qkvabz_to_qkv_a_b_z.invoke(split_shape, split_buffers)
-        };
+        let split = self
+            .qkvabz_to_qkv_a_b_z
+            .invoke(split_shape, split_buffers, active_tokens);
         recorder.record_with_barrier_before(ReplayOp::opaque(split));
         let compute_buffers = backend_compute::Buffers {
             qkv: scratch.qkv,
@@ -383,57 +359,33 @@ impl ReplayLayer for GDN {
         };
         let compute_shape = compute_shape(shape);
         if input.materialize_candidate_states {
-            let compute = if bucketed {
-                self.compute.invoke_with_candidate_state_update_bucketed(
-                    compute_shape,
-                    compute_buffers,
-                    active_reqs,
-                    active_tokens,
-                )
-            } else {
-                self.compute
-                    .invoke_with_candidate_state_update(compute_shape, compute_buffers)
-            };
+            let compute = self.compute.invoke_with_candidate_state_update(
+                compute_shape,
+                compute_buffers,
+                active_reqs,
+                active_tokens,
+            );
             recorder.record_with_barrier_before(ReplayOp::opaque(compute));
         } else {
-            let compute = if bucketed {
-                self.compute
-                    .invoke_bucketed(compute_shape, compute_buffers, active_reqs, active_tokens)
-            } else {
-                self.compute.invoke(compute_shape, compute_buffers)
-            };
+            let compute = self
+                .compute
+                .invoke(compute_shape, compute_buffers, active_reqs, active_tokens);
             recorder.record_with_barrier_before(ReplayOp::opaque(compute));
         }
-        let output = if bucketed {
-            self.output.invoke_bucketed(
-                shape.num_total_tokens,
-                num_active_tokens_key.expect("bucketed GDN replay must have an active-token parameter"),
-                next_hidden_state,
-                0,
-                scratch.norm_gated_output,
-                0,
-                weights.output_weight,
-                0,
-                weights.output_scales,
-                0,
-                weights.output_biases,
-                0,
-            )
-        } else {
-            self.output.invoke(
-                shape.num_total_tokens.try_into().expect("GDN token count must fit i32"),
-                next_hidden_state,
-                0,
-                scratch.norm_gated_output,
-                0,
-                weights.output_weight,
-                0,
-                weights.output_scales,
-                0,
-                weights.output_biases,
-                0,
-            )
-        };
+        let output = self.output.invoke(
+            shape.num_total_tokens,
+            active_tokens,
+            next_hidden_state,
+            0,
+            scratch.norm_gated_output,
+            0,
+            weights.output_weight,
+            0,
+            weights.output_scales,
+            0,
+            weights.output_biases,
+            0,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(output));
         next_hidden_state
     }

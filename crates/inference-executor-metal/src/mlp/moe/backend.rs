@@ -6,7 +6,6 @@ use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_backend_metal::operators::softmax;
@@ -354,25 +353,10 @@ impl GatedMoE {
         let num_total_tokens = input.num_total_tokens;
         let scratch = input.scratch;
         let weights = input.weights;
-        let ReplayU32::Parameter(num_active_tokens_key) = input.num_active_tokens else {
-            let ReplayU32::Fixed(num_active_tokens) = input.num_active_tokens else {
-                unreachable!()
-            };
-            assert_eq!(num_active_tokens, num_total_tokens);
-            self.record_router(
-                recorder,
-                GatedMoEReplayShape {
-                    num_tokens: num_total_tokens,
-                },
-                input.hidden_state,
-                scratch,
-                weights,
-            );
-            return;
-        };
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.router.invoke_bucketed(
+        let num_active_tokens = input.num_active_tokens;
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.router.invoke(
             num_total_tokens,
-            num_active_tokens_key,
+            num_active_tokens,
             scratch.router_logits,
             0,
             input.hidden_state,
@@ -384,17 +368,17 @@ impl GatedMoE {
             weights.router_biases,
             0,
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke_bucketed(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke(
             self.router_softmax_shape(num_total_tokens),
-            num_active_tokens_key,
+            num_active_tokens,
             softmax::Buffers {
                 input: scratch.router_logits,
                 output: scratch.router_probs,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke_bucketed(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke(
             self.routing_shape(num_total_tokens),
-            num_active_tokens_key,
+            num_active_tokens,
             routing::Buffers {
                 router_probs: scratch.router_probs,
                 expert_indices: scratch.expert_indices,
@@ -403,16 +387,14 @@ impl GatedMoE {
         )));
     }
 
-    fn record_token_major_bucketed<'a>(
+    fn record_token_major<'a>(
         &'a self,
         combine: &'a combine::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEInput<'a>,
     ) {
         let num_total_tokens = input.num_total_tokens;
-        let ReplayU32::Parameter(num_active_tokens_key) = input.num_active_tokens else {
-            panic!("MoE capacity-recorded token-major execution requires an active-token parameter")
-        };
+        let num_active_tokens = input.num_active_tokens;
         let shape = GatedMoEReplayShape {
             num_tokens: num_total_tokens,
         };
@@ -431,189 +413,10 @@ impl GatedMoE {
                 weights: weights.routing(),
             },
         );
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_experts.invoke_token_major_bucketed(
-            num_total_tokens,
-            self.num_experts_per_token(),
-            num_active_tokens_key,
-            sparse_mlp::TokenMajorBuffers {
-                input: hidden_state,
-                token_indices: scratch.topk_experts.token_indices,
-                expert_indices: scratch.routing.expert_indices,
-                route_indices: scratch.topk_experts.route_indices,
-                routed_hidden: scratch.topk_experts.routed_hidden,
-            },
-            sparse_mlp::Scratch {
-                swiglu: scratch.topk_experts.sparse_swiglu,
-            },
-            weights.topk_experts,
-        )));
-        match shared_experts {
-            None => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_without_shared_experts_bucketed(
-                    self.combine_shape(shape),
-                    num_active_tokens_key,
-                    combine::WithoutSharedExpertsBuffers {
-                        routed_hidden: scratch.topk_experts.routed_hidden,
-                        routed_probs: scratch.routing.expert_probs,
-                        output: next_hidden_state,
-                    },
-                )));
-            },
-            Some(shared_experts) => {
-                self.record_shared_experts_bucketed(
-                    recorder,
-                    num_total_tokens,
-                    num_active_tokens_key,
-                    hidden_state,
-                    shared_experts.scratch,
-                    shared_experts.weights,
-                );
-                recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_with_shared_experts_bucketed(
-                    self.combine_shape(shape),
-                    num_active_tokens_key,
-                    combine::WithSharedExpertsBuffers {
-                        routed_hidden: scratch.topk_experts.routed_hidden,
-                        routed_probs: scratch.routing.expert_probs,
-                        shared_hidden: shared_experts.scratch.hidden,
-                        shared_expert_gate_logits: shared_experts.scratch.gate_logits,
-                        output: next_hidden_state,
-                    },
-                )));
-            },
-        }
-    }
-
-    fn record_expert_major_bucketed<'a>(
-        &'a self,
-        expert_major: &'a expert_major::Compute,
-        recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        input: GatedMoEInput<'a>,
-    ) {
-        let num_total_tokens = input.num_total_tokens;
-        let ReplayU32::Parameter(num_active_tokens_key) = input.num_active_tokens else {
-            panic!("MoE capacity-recorded expert-major execution requires an active-token parameter")
-        };
-        let shape = GatedMoEReplayShape {
-            num_tokens: num_total_tokens,
-        };
-        let hidden_state = input.hidden_state;
-        let next_hidden_state = input.next_hidden_state;
-        let scratch = input.scratch;
-        let weights = input.weights;
-        let shared_experts = input.shared_experts;
-        let expert_major_shape = self.expert_major_shape(shape);
-        self.record_routing(
-            recorder,
-            GatedMoERoutingInput {
-                num_total_tokens,
-                num_active_tokens: input.num_active_tokens,
-                hidden_state,
-                scratch: scratch.routing,
-                weights: weights.routing(),
-            },
-        );
-        if let Some(shared_experts) = shared_experts {
-            self.record_shared_experts_bucketed(
-                recorder,
-                num_total_tokens,
-                num_active_tokens_key,
-                hidden_state,
-                shared_experts.scratch,
-                shared_experts.weights,
-            );
-        }
-        let layout = ReplayOp::opaque(expert_major.invoke_layout_bucketed(
-            expert_major_shape,
-            num_active_tokens_key,
-            expert_major::LayoutBuffers {
-                expert_indices: scratch.routing.expert_indices,
-                expert_counts: scratch.topk_experts.expert_counts,
-                expert_offsets: scratch.topk_experts.expert_offsets,
-                expert_cursors: scratch.topk_experts.expert_cursors,
-                routes_by_expert: scratch.topk_experts.routes_by_expert,
-                routes_by_token: scratch.topk_experts.routes_by_token,
-                experts_by_route: scratch.topk_experts.experts_by_route,
-            },
-        ));
-        if shared_experts.is_some() {
-            recorder.record(layout);
-        } else {
-            recorder.record_with_barrier_before(layout);
-        }
-        recorder.record_with_barrier_before(ReplayOp::opaque(expert_major.invoke_pack_input_bucketed(
-            expert_major_shape,
-            num_active_tokens_key,
-            expert_major::PackInputBuffers {
-                input: hidden_state,
-                routes_by_expert: scratch.topk_experts.routes_by_expert,
-                packed_input: scratch.topk_experts.packed_input,
-            },
-        )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_experts.invoke_expert_major_bucketed(
-            num_total_tokens,
-            self.num_experts_per_token(),
-            num_active_tokens_key,
-            sparse_mlp::ExpertMajorBuffers {
-                packed_input: scratch.topk_experts.packed_input,
-                experts_by_route: scratch.topk_experts.experts_by_route,
-                packed_output: scratch.topk_experts.routed_hidden,
-            },
-            sparse_mlp::Scratch {
-                swiglu: scratch.topk_experts.sparse_swiglu,
-            },
-            weights.topk_experts,
-        )));
-        match shared_experts {
-            None => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(
-                    expert_major.invoke_scatter_without_shared_experts_bucketed(
-                        expert_major_shape,
-                        num_active_tokens_key,
-                        expert_major::ScatterWithoutSharedExpertsBuffers {
-                            packed_output: scratch.topk_experts.routed_hidden,
-                            routes_by_token: scratch.topk_experts.routes_by_token,
-                            routed_probs: scratch.routing.expert_probs,
-                            output: next_hidden_state,
-                        },
-                    ),
-                ));
-            },
-            Some(shared_experts) => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(
-                    expert_major.invoke_scatter_with_shared_experts_bucketed(
-                        expert_major_shape,
-                        num_active_tokens_key,
-                        expert_major::ScatterWithSharedExpertsBuffers {
-                            packed_output: scratch.topk_experts.routed_hidden,
-                            routes_by_token: scratch.topk_experts.routes_by_token,
-                            routed_probs: scratch.routing.expert_probs,
-                            shared_hidden: shared_experts.scratch.hidden,
-                            shared_expert_gate_logits: shared_experts.scratch.gate_logits,
-                            output: next_hidden_state,
-                        },
-                    ),
-                ));
-            },
-        }
-    }
-
-    fn record_token_major_replay<'a>(
-        &'a self,
-        combine: &'a combine::Compute,
-        recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
-        input: GatedMoEInput<'a>,
-    ) {
-        let shape = GatedMoEReplayShape {
-            num_tokens: input.num_total_tokens,
-        };
-        let hidden_state = input.hidden_state;
-        let next_hidden_state = input.next_hidden_state;
-        let scratch = input.scratch;
-        let weights = input.weights;
-        let shared_experts = input.shared_experts;
-        self.record_router(recorder, shape, hidden_state, scratch.routing, weights.routing());
         recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_experts.invoke_token_major(
             self.token_major_shape(shape),
+            self.num_experts_per_token(),
+            num_active_tokens,
             sparse_mlp::TokenMajorBuffers {
                 input: hidden_state,
                 token_indices: scratch.topk_experts.token_indices,
@@ -630,6 +433,7 @@ impl GatedMoE {
             None => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_without_shared_experts(
                     self.combine_shape(shape),
+                    num_active_tokens,
                     combine::WithoutSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
@@ -640,13 +444,15 @@ impl GatedMoE {
             Some(shared_experts) => {
                 self.record_shared_experts(
                     recorder,
-                    shape,
+                    num_total_tokens,
+                    num_active_tokens,
                     hidden_state,
                     shared_experts.scratch,
                     shared_experts.weights,
                 );
                 recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_with_shared_experts(
                     self.combine_shape(shape),
+                    num_active_tokens,
                     combine::WithSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
@@ -659,14 +465,16 @@ impl GatedMoE {
         }
     }
 
-    fn record_expert_major_replay<'a>(
+    fn record_expert_major<'a>(
         &'a self,
         expert_major: &'a expert_major::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEInput<'a>,
     ) {
+        let num_total_tokens = input.num_total_tokens;
+        let num_active_tokens = input.num_active_tokens;
         let shape = GatedMoEReplayShape {
-            num_tokens: input.num_total_tokens,
+            num_tokens: num_total_tokens,
         };
         let hidden_state = input.hidden_state;
         let next_hidden_state = input.next_hidden_state;
@@ -674,11 +482,21 @@ impl GatedMoE {
         let weights = input.weights;
         let shared_experts = input.shared_experts;
         let expert_major_shape = self.expert_major_shape(shape);
-        self.record_router(recorder, shape, hidden_state, scratch.routing, weights.routing());
+        self.record_routing(
+            recorder,
+            GatedMoERoutingInput {
+                num_total_tokens,
+                num_active_tokens: input.num_active_tokens,
+                hidden_state,
+                scratch: scratch.routing,
+                weights: weights.routing(),
+            },
+        );
         if let Some(shared_experts) = shared_experts {
             self.record_shared_experts(
                 recorder,
-                shape,
+                num_total_tokens,
+                num_active_tokens,
                 hidden_state,
                 shared_experts.scratch,
                 shared_experts.weights,
@@ -686,6 +504,7 @@ impl GatedMoE {
         }
         let layout = ReplayOp::opaque(expert_major.invoke_layout(
             expert_major_shape,
+            num_active_tokens,
             expert_major::LayoutBuffers {
                 expert_indices: scratch.routing.expert_indices,
                 expert_counts: scratch.topk_experts.expert_counts,
@@ -703,6 +522,7 @@ impl GatedMoE {
         }
         recorder.record_with_barrier_before(ReplayOp::opaque(expert_major.invoke_pack_input(
             expert_major_shape,
+            num_active_tokens,
             expert_major::PackInputBuffers {
                 input: hidden_state,
                 routes_by_expert: scratch.topk_experts.routes_by_expert,
@@ -712,7 +532,10 @@ impl GatedMoE {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.topk_experts.invoke_expert_major(
             sparse_mlp::ExpertMajorShape {
                 num_total_routes: self.num_routes(shape),
+                num_total_tokens,
+                num_experts_per_token: self.num_experts_per_token(),
             },
+            num_active_tokens,
             sparse_mlp::ExpertMajorBuffers {
                 packed_input: scratch.topk_experts.packed_input,
                 experts_by_route: scratch.topk_experts.experts_by_route,
@@ -728,6 +551,7 @@ impl GatedMoE {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
                     expert_major.invoke_scatter_without_shared_experts(
                         expert_major_shape,
+                        num_active_tokens,
                         expert_major::ScatterWithoutSharedExpertsBuffers {
                             packed_output: scratch.topk_experts.routed_hidden,
                             routes_by_token: scratch.topk_experts.routes_by_token,
@@ -740,6 +564,7 @@ impl GatedMoE {
             Some(shared_experts) => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(expert_major.invoke_scatter_with_shared_experts(
                     expert_major_shape,
+                    num_active_tokens,
                     expert_major::ScatterWithSharedExpertsBuffers {
                         packed_output: scratch.topk_experts.routed_hidden,
                         routes_by_token: scratch.topk_experts.routes_by_token,
@@ -753,50 +578,11 @@ impl GatedMoE {
         }
     }
 
-    fn record_router<'a, I>(
-        &'a self,
-        recorder: &mut I,
-        shape: GatedMoEReplayShape,
-        input: &'a Buffer,
-        scratch: MoERoutingScratchBindings<'a>,
-        weights: GatedMoERoutingWeights<'a>,
-    ) where
-        I: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.router.invoke(
-            shape.num_tokens.try_into().expect("MoE token count must fit i32"),
-            scratch.router_logits,
-            0,
-            input,
-            0,
-            weights.router_weight,
-            0,
-            weights.router_scales,
-            0,
-            weights.router_biases,
-            0,
-        )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke(
-            self.router_softmax_shape(shape.num_tokens),
-            softmax::Buffers {
-                input: scratch.router_logits,
-                output: scratch.router_probs,
-            },
-        )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke(
-            self.routing_shape(shape.num_tokens),
-            routing::Buffers {
-                router_probs: scratch.router_probs,
-                expert_indices: scratch.expert_indices,
-                expert_probs: scratch.expert_probs,
-            },
-        )));
-    }
-
     fn record_shared_experts<'a, I>(
         &'a self,
         recorder: &mut I,
-        shape: GatedMoEReplayShape,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
         input: &'a Buffer,
         scratch: SharedExpertsScratchBindings<'a>,
         weights: GatedMoESharedExpertsWeights<'a>,
@@ -807,8 +593,12 @@ impl GatedMoE {
             .shared_experts
             .as_ref()
             .expect("gated MoE shared replay requires a configured shared expert");
+        let shape = GatedMoEReplayShape {
+            num_tokens: num_total_tokens,
+        };
         recorder.record(ReplayOp::opaque(shared_experts.mlp.invoke(
             self.shared_experts_dense_shape(shape),
+            num_active_tokens,
             dense_mlp::Buffers {
                 hidden_state: input,
                 next_hidden_state: scratch.hidden,
@@ -820,51 +610,8 @@ impl GatedMoE {
             weights.shared_experts,
         )));
         recorder.record(ReplayOp::opaque(shared_experts.shared_expert_gate.invoke(
-            shape.num_tokens.try_into().expect("MoE token count must fit i32"),
-            scratch.gate_logits,
-            0,
-            input,
-            0,
-            weights.shared_expert_gate_weight,
-            0,
-            weights.shared_expert_gate_scales,
-            0,
-            weights.shared_expert_gate_biases,
-            0,
-        )));
-    }
-
-    fn record_shared_experts_bucketed<'a, I>(
-        &'a self,
-        recorder: &mut I,
-        num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
-        input: &'a Buffer,
-        scratch: SharedExpertsScratchBindings<'a>,
-        weights: GatedMoESharedExpertsWeights<'a>,
-    ) where
-        I: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        let shared_experts = self
-            .shared_experts
-            .as_ref()
-            .expect("gated MoE shared replay requires a configured shared expert");
-        recorder.record(ReplayOp::opaque(shared_experts.mlp.invoke_bucketed(
             num_total_tokens,
-            num_active_tokens_key,
-            dense_mlp::Buffers {
-                hidden_state: input,
-                next_hidden_state: scratch.hidden,
-            },
-            dense_mlp::Scratch {
-                gate_up: scratch.dense_mlp.gate_up,
-                swiglu: scratch.dense_mlp.swiglu,
-            },
-            weights.shared_experts,
-        )));
-        recorder.record(ReplayOp::opaque(shared_experts.shared_expert_gate.invoke_bucketed(
-            num_total_tokens,
-            num_active_tokens_key,
+            num_active_tokens,
             scratch.gate_logits,
             0,
             input,
@@ -946,19 +693,9 @@ impl ReplayLayer for GatedMoE {
         };
         let next_hidden_state = input.next_hidden_state;
         let (_, variant) = Selector::select(&self.registry, shape);
-        match (input.num_active_tokens, variant) {
-            (ReplayU32::Fixed(_), Variant::TokenMajor { combine }) => {
-                self.record_token_major_replay(combine, recorder, input)
-            },
-            (ReplayU32::Fixed(_), Variant::ExpertMajor { expert_major }) => {
-                self.record_expert_major_replay(expert_major, recorder, input)
-            },
-            (ReplayU32::Parameter(_), Variant::TokenMajor { combine }) => {
-                self.record_token_major_bucketed(combine, recorder, input)
-            },
-            (ReplayU32::Parameter(_), Variant::ExpertMajor { expert_major }) => {
-                self.record_expert_major_bucketed(expert_major, recorder, input)
-            },
+        match variant {
+            Variant::TokenMajor { combine } => self.record_token_major(combine, recorder, input),
+            Variant::ExpertMajor { expert_major } => self.record_expert_major(expert_major, recorder, input),
         }
         next_hidden_state
     }

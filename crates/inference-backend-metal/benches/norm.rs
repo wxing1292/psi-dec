@@ -10,6 +10,7 @@ use inference_backend_metal::components::rms_norm;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 
 #[path = "support.rs"]
@@ -123,6 +124,7 @@ impl ResidualAddRMSNormFixture {
                     rms_norm::Shape {
                         num_total_tokens: tokens,
                     },
+                    ReplayU32::Fixed(tokens),
                     rms_norm::Buffers {
                         input,
                         weight: &weight,
@@ -135,7 +137,7 @@ impl ResidualAddRMSNormFixture {
 
         let unfused_replay = {
             let mut builder = stream.create_replay_program();
-            builder.record(residual_add.invoke(
+            builder.record(residual_add.invoke_values(
                 residual_add::Shape {
                     num_values: num_values as u32,
                 },
@@ -149,6 +151,7 @@ impl ResidualAddRMSNormFixture {
                 rms_norm::Shape {
                     num_total_tokens: tokens,
                 },
+                ReplayU32::Fixed(tokens),
                 rms_norm::Buffers {
                     input: &unfused_residual_output,
                     weight: &weight,
@@ -161,6 +164,7 @@ impl ResidualAddRMSNormFixture {
             let mut builder = stream.create_replay_program();
             builder.record(fused_scalar.invoke(
                 shape,
+                ReplayU32::Fixed(tokens),
                 residual_add_rms_norm::Buffers {
                     lhs: &lhs,
                     rhs: &rhs,
@@ -175,6 +179,7 @@ impl ResidualAddRMSNormFixture {
             let mut builder = stream.create_replay_program();
             builder.record(fused_vec4.invoke(
                 shape,
+                ReplayU32::Fixed(tokens),
                 residual_add_rms_norm::Buffers {
                     lhs: &lhs,
                     rhs: &rhs,

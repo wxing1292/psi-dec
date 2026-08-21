@@ -10,6 +10,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const RMS_NORM_SOURCE: &str = include_str!("metal/rms_norm.metal");
 
@@ -145,31 +146,20 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, num_active_tokens: ReplayU32, buffers: Buffers<'a>) -> Invocation<'a> {
         Invocation {
             kernel: &self.kernel,
             config: self.config,
             constants: self.constants,
             shape,
             buffers,
-            num_active_tokens_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity grid whose active token count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        capacity_shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-    ) -> Invocation<'a> {
-        Invocation {
-            kernel: &self.kernel,
-            config: self.config,
-            constants: self.constants,
-            shape: capacity_shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: match num_active_tokens {
+                ReplayU32::Fixed(value) => {
+                    assert_eq!(value, shape.num_total_tokens);
+                    None
+                },
+                ReplayU32::Parameter(key) => Some(key),
+            },
         }
     }
 }
@@ -359,9 +349,9 @@ mod tests {
         let output = Buffer::from_slice(&device, &vec![sentinel; config.num_values(shape)]);
 
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
+        builder.record(kernel.invoke(
             shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             Buffers {
                 input: &input,
                 weight: &weight,
@@ -429,9 +419,9 @@ mod tests {
         let output = Buffer::from_slice(&device, &vec![sentinel; config.num_values(shape)]);
 
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
+        builder.record(kernel.invoke(
             shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             Buffers {
                 input: &input,
                 weight: &weight,

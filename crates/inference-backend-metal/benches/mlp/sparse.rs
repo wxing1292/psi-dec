@@ -255,6 +255,7 @@ fn build_gate_up_swiglu_replay(
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke_gate_up_swiglu(
         shape,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
         sparse_mlp::TokenMajorBuffers {
             input: &buffers.input,
             token_indices: &buffers.token_indices,
@@ -281,6 +282,8 @@ fn build_token_major_replay(
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke(
         shape,
+        shape.num_total_routes / shape.num_total_tokens,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
         sparse_mlp::TokenMajorBuffers {
             input: &buffers.input,
             token_indices: &buffers.token_indices,

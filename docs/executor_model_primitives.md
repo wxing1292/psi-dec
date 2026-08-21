@@ -92,8 +92,8 @@ input[row_indices[output_row], column]
 ```
 
 The private compile-time constants contain the dtype and `thread_block.required_threads = 256`. One non-persistent thread
-block processes a bounded flat range of `(output row, column)` coordinates. Exact and bucketed recording use the same
-kernel. The runtime row count changes only the grid and the active-row guard. Row gather has one current kernel for each
+block processes a bounded flat range of `(output row, column)` coordinates. Fixed and parameterized active-row values
+use the same API and kernel. The total row count changes the grid. The active-row value controls the guard. Row gather has one current kernel for each
 supported dtype and does not need a registry or selector.
 
 ## RMSNorm

@@ -164,8 +164,9 @@ It removes all tensors and requires the map to be empty before initialization co
 It reuses the generic sample-and-write-distribution reducer.
 The stages retain separate replay keys and programs.
 
-Qwen3.5 Main and MTP body replays use separate capacity-bucketed token domains.
-Qwen3 and DSpark body token counts remain exact.
+Qwen3.5 Main and MTP body replays use separate total-token domains.
+Qwen3 and DSpark currently set `num_total_tokens == num_active_tokens`.
+All body components use the same active/total API.
 Sampling and rejection keep their own replay domains, keys, active counts, and bucket policies.
 MTP draft sampling is a distinct replay after MTP GatherUnembed.
 For K MTP steps, each pass writes one request-local draft-distribution row at `step_index`.

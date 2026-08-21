@@ -8,6 +8,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 use crate::operators::mlx_headers::find_mlx_metal_header_root;
 use crate::operators::mlx_headers::read_mlx_metal_header;
 
@@ -93,30 +94,24 @@ impl Kernel {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, num_active_rows: ReplayU32, buffers: Buffers<'a>) -> Invocation<'a> {
         shape.validate();
         Invocation {
             kernel: self,
             shape,
             buffers,
-            num_active_rows_key: None,
+            num_active_rows_key: active_key(shape.num_total_rows, num_active_rows),
         }
     }
+}
 
-    /// Records a fixed-capacity grid whose active row count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        capacity_shape: Shape,
-        num_active_rows_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-    ) -> Invocation<'a> {
-        capacity_shape.validate();
-        Invocation {
-            kernel: self,
-            shape: capacity_shape,
-            buffers,
-            num_active_rows_key: Some(num_active_rows_key),
-        }
+fn active_key(num_total_rows: u32, num_active_rows: ReplayU32) -> Option<ReplayParameterKey> {
+    match num_active_rows {
+        ReplayU32::Fixed(num_active_rows) => {
+            assert_eq!(num_active_rows, num_total_rows);
+            None
+        },
+        ReplayU32::Parameter(key) => Some(key),
     }
 }
 
@@ -173,14 +168,14 @@ fn softmax_source() -> String {
         "mlx/backend/metal/kernels/softmax.h",
         &mut included,
     ));
-    source.push_str(BUCKETED_SOFTMAX_SOURCE);
+    source.push_str(PARAMETERIZED_SOFTMAX_SOURCE);
     source
 }
 
 // This kernel is the MLX single-row softmax with one fixed-capacity replay guard.
 // The guard is uniform across the whole threadgroup and occurs before all input
 // reads and threadgroup barriers.
-const BUCKETED_SOFTMAX_SOURCE: &str = r#"
+const PARAMETERIZED_SOFTMAX_SOURCE: &str = r#"
 template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
 [[kernel]] void softmax_single_row_bucketed(
     const device T* in,
@@ -294,6 +289,7 @@ mod tests {
     use crate::metal::Dtype;
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayParameterKey;
+    use crate::metal::ReplayU32;
     use crate::metal::Stream;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.softmax.num_active_rows");
@@ -341,6 +337,7 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
+            ReplayU32::Fixed(shape.num_total_rows),
             Buffers {
                 input: &input,
                 output: &output,
@@ -377,9 +374,9 @@ mod tests {
         let output = bf16_buffer(&device, &[sentinel; 16]);
 
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
+        builder.record(kernel.invoke(
             shape,
-            NUM_ACTIVE_ROWS,
+            ReplayU32::Parameter(NUM_ACTIVE_ROWS),
             Buffers {
                 input: &input,
                 output: &output,

@@ -727,7 +727,7 @@ output norm + gate                    active tokens
 output affine                         active tokens
 ```
 
-One bucketed GDN program therefore has two deduplicated `u32` parameters. Every padded command returns before an
+One parameterized GDN program therefore has two deduplicated `u32` parameters. Every inactive command returns before an
 inactive lane reads input or metadata, mutates state, reaches a threadblock barrier, or writes output. Each recurrent
 request guard is uniform for the complete thread block.
 

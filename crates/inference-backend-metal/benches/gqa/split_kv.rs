@@ -130,6 +130,8 @@ impl GQAFixture {
             &page_ids,
             &kv_splits,
             &cu_kv_splits,
+            num_tokens,
+            num_kv_splits,
             &scratch,
             &output,
         );
@@ -195,6 +197,8 @@ fn build_gqa_replay(
     page_ids: &Buffer,
     kv_splits: &Buffer,
     cu_kv_splits: &Buffer,
+    num_tokens: u32,
+    num_kv_splits: u32,
     scratch: &backend_single_q::Scratch,
     output: &Buffer,
 ) -> ReplayProgram {
@@ -202,8 +206,13 @@ fn build_gqa_replay(
     builder.record(kernels.invoke_map(
         scratch.map_buffers(q, kv_pages, req_slots, page_ids, kv_splits),
         inference_backend_metal::metal::ReplayU32::Fixed(0),
+        inference_backend_metal::metal::ReplayU32::Fixed(num_tokens),
+        inference_backend_metal::metal::ReplayU32::Fixed(num_kv_splits),
     ));
-    builder.record(kernels.invoke_reduce(scratch.reduce_buffers(cu_kv_splits, output)));
+    builder.record(kernels.invoke_reduce(
+        scratch.reduce_buffers(cu_kv_splits, output),
+        inference_backend_metal::metal::ReplayU32::Fixed(num_tokens),
+    ));
     builder.build()
 }
 

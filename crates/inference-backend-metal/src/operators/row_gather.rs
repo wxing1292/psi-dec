@@ -6,7 +6,7 @@ use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
-use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("metal/row_gather.metal");
 
@@ -111,31 +111,14 @@ impl Kernel {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, num_active_rows: ReplayU32, buffers: Buffers<'a>) -> Invocation<'a> {
         Invocation {
             config: self.config,
             constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
-            num_active_rows_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity grid whose active row count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        capacity_shape: Shape,
-        num_active_rows_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-    ) -> Invocation<'a> {
-        Invocation {
-            config: self.config,
-            constants: self.constants,
-            kernel: &self.kernel,
-            shape: capacity_shape,
-            buffers,
-            num_active_rows_key: Some(num_active_rows_key),
+            num_active_rows,
         }
     }
 }
@@ -146,7 +129,7 @@ pub struct Invocation<'a> {
     kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: Buffers<'a>,
-    num_active_rows_key: Option<ReplayParameterKey>,
+    num_active_rows: ReplayU32,
 }
 
 impl Operator for Invocation<'_> {
@@ -157,9 +140,12 @@ impl Operator for Invocation<'_> {
         recorder.set_buffer_read(1, self.buffers.row_indices, 0);
         recorder.set_buffer_write(2, self.buffers.output, 0);
         recorder.set_u32(3, self.config.num_cols);
-        match self.num_active_rows_key {
-            Some(key) => recorder.bind_u32(4, key, 1, self.shape.num_total_rows),
-            None => recorder.set_u32(4, self.shape.num_total_rows),
+        match self.num_active_rows {
+            ReplayU32::Fixed(value) => {
+                assert_eq!(value, self.shape.num_total_rows);
+                recorder.set_u32(4, value);
+            },
+            ReplayU32::Parameter(key) => recorder.bind_u32(4, key, 1, self.shape.num_total_rows),
         }
         recorder.dispatch_1d(
             self.shape.num_values(self.config) as usize,
@@ -181,6 +167,7 @@ impl Invocation<'_> {
 mod tests {
     use super::*;
     use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.row_gather.num_active_rows");
@@ -222,6 +209,7 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             Shape { num_total_rows: 2 },
+            ReplayU32::Fixed(2),
             Buffers {
                 input: &input,
                 row_indices: &row_indices,
@@ -257,9 +245,9 @@ mod tests {
         let kernel = Kernel::new(&device, config);
 
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
+        builder.record(kernel.invoke(
             capacity_shape,
-            NUM_ACTIVE_ROWS,
+            ReplayU32::Parameter(NUM_ACTIVE_ROWS),
             Buffers {
                 input: &input,
                 row_indices: &row_indices,

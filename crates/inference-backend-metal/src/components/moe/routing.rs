@@ -7,6 +7,7 @@ use crate::metal::CommandRecorder;
 use crate::metal::CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const MOE_ROUTING_SOURCE: &str = include_str!("../metal/moe_routing.metal");
 
@@ -132,28 +133,24 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, num_active_tokens: ReplayU32, buffers: Buffers<'a>) -> Invocation<'a> {
+        shape.validate();
         Invocation {
             kernel: self,
             shape,
             buffers,
-            num_active_tokens_key: None,
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
+}
 
-    /// Records a fixed-capacity grid whose active token count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-    ) -> Invocation<'a> {
-        Invocation {
-            kernel: self,
-            shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
-        }
+fn active_key(num_total_tokens: u32, num_active_tokens: ReplayU32) -> Option<ReplayParameterKey> {
+    match num_active_tokens {
+        ReplayU32::Fixed(num_active_tokens) => {
+            assert_eq!(num_active_tokens, num_total_tokens);
+            None
+        },
+        ReplayU32::Parameter(key) => Some(key),
     }
 }
 

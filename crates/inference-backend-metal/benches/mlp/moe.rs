@@ -259,6 +259,7 @@ fn build_routing_replay(
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
         routing::Buffers {
             router_probs,
             expert_indices,
@@ -279,6 +280,7 @@ fn build_combine_without_shared_experts_replay(
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke_without_shared_experts(
         shape,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
         combine::WithoutSharedExpertsBuffers {
             routed_hidden,
             routed_probs,
@@ -295,7 +297,11 @@ fn build_combine_with_shared_experts_replay(
     buffers: combine::WithSharedExpertsBuffers<'_>,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernel.invoke_with_shared_experts(shape, buffers));
+    builder.record(kernel.invoke_with_shared_experts(
+        shape,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
+        buffers,
+    ));
     builder.build()
 }
 
@@ -881,29 +887,27 @@ fn record_moe_forward<I>(builder: &mut I, record: MoEForwardRecord<'_>)
 where
     I: MoEForwardBuilder,
 {
-    builder.record(
-        record.router.invoke(
-            record
-                .routing_shape
-                .num_total_tokens
-                .try_into()
-                .expect("MoE token count must fit i32"),
-            record.router_logits,
-            0,
-            record.input,
-            0,
-            record.router_weight,
-            0,
-            record.router_scales,
-            0,
-            record.router_biases,
-            0,
-        ),
-    );
+    let num_total_tokens = record.routing_shape.num_total_tokens;
+    let num_active_tokens = inference_backend_metal::metal::ReplayU32::Fixed(num_total_tokens);
+    builder.record(record.router.invoke(
+        num_total_tokens,
+        num_active_tokens,
+        record.router_logits,
+        0,
+        record.input,
+        0,
+        record.router_weight,
+        0,
+        record.router_scales,
+        0,
+        record.router_biases,
+        0,
+    ));
     builder.record_with_barrier_before(record.router_softmax.invoke(
         softmax::Shape {
-            num_total_rows: record.routing_shape.num_total_tokens,
+            num_total_rows: num_total_tokens,
         },
+        num_active_tokens,
         softmax::Buffers {
             input: record.router_logits,
             output: record.router_probs,
@@ -911,6 +915,7 @@ where
     ));
     builder.record_with_barrier_before(record.routing.invoke(
         record.routing_shape,
+        num_active_tokens,
         routing::Buffers {
             router_probs: record.router_probs,
             expert_indices: record.expert_indices,
@@ -919,6 +924,8 @@ where
     ));
     builder.record_with_barrier_before(record.sparse_mlp.invoke_token_major(
         record.sparse_shape,
+        record.sparse_shape.num_total_routes / num_total_tokens,
+        num_active_tokens,
         sparse_mlp::TokenMajorBuffers {
             input: record.input,
             token_indices: record.token_indices,
@@ -933,6 +940,7 @@ where
     ));
     builder.record(record.shared_experts.invoke(
         record.dense_shape,
+        num_active_tokens,
         dense_mlp::Buffers {
             hidden_state: record.input,
             next_hidden_state: record.shared_hidden,
@@ -940,27 +948,23 @@ where
         record.shared_scratch,
         record.shared_weights,
     ));
-    builder.record(
-        record.shared_expert_gate.invoke(
-            record
-                .routing_shape
-                .num_total_tokens
-                .try_into()
-                .expect("MoE token count must fit i32"),
-            record.shared_expert_gate_logits,
-            0,
-            record.input,
-            0,
-            record.shared_expert_gate_weight,
-            0,
-            record.shared_expert_gate_scales,
-            0,
-            record.shared_expert_gate_biases,
-            0,
-        ),
-    );
+    builder.record(record.shared_expert_gate.invoke(
+        num_total_tokens,
+        num_active_tokens,
+        record.shared_expert_gate_logits,
+        0,
+        record.input,
+        0,
+        record.shared_expert_gate_weight,
+        0,
+        record.shared_expert_gate_scales,
+        0,
+        record.shared_expert_gate_biases,
+        0,
+    ));
     builder.record_with_barrier_before(record.combine.invoke_with_shared_experts(
         record.combine_shape,
+        num_active_tokens,
         combine::WithSharedExpertsBuffers {
             routed_hidden: record.routed_hidden,
             routed_probs: record.expert_probs,
@@ -975,29 +979,27 @@ fn record_moe_expert_major_forward<I>(builder: &mut I, record: MoEExpertMajorFor
 where
     I: MoEForwardBuilder,
 {
-    builder.record(
-        record.router.invoke(
-            record
-                .routing_shape
-                .num_total_tokens
-                .try_into()
-                .expect("MoE token count must fit i32"),
-            record.router_logits,
-            0,
-            record.input,
-            0,
-            record.router_weight,
-            0,
-            record.router_scales,
-            0,
-            record.router_biases,
-            0,
-        ),
-    );
+    let num_total_tokens = record.routing_shape.num_total_tokens;
+    let num_active_tokens = inference_backend_metal::metal::ReplayU32::Fixed(num_total_tokens);
+    builder.record(record.router.invoke(
+        num_total_tokens,
+        num_active_tokens,
+        record.router_logits,
+        0,
+        record.input,
+        0,
+        record.router_weight,
+        0,
+        record.router_scales,
+        0,
+        record.router_biases,
+        0,
+    ));
     builder.record_with_barrier_before(record.router_softmax.invoke(
         softmax::Shape {
-            num_total_rows: record.routing_shape.num_total_tokens,
+            num_total_rows: num_total_tokens,
         },
+        num_active_tokens,
         softmax::Buffers {
             input: record.router_logits,
             output: record.router_probs,
@@ -1005,6 +1007,7 @@ where
     ));
     builder.record_with_barrier_before(record.routing.invoke(
         record.routing_shape,
+        num_active_tokens,
         routing::Buffers {
             router_probs: record.router_probs,
             expert_indices: record.expert_indices,
@@ -1013,6 +1016,7 @@ where
     ));
     builder.record_with_barrier_before(record.expert_major.invoke_layout(
         record.expert_major_shape,
+        num_active_tokens,
         expert_major::LayoutBuffers {
             expert_indices: record.expert_indices,
             expert_counts: record.expert_counts,
@@ -1025,6 +1029,7 @@ where
     ));
     builder.record_with_barrier_before(record.expert_major.invoke_pack_input(
         record.expert_major_shape,
+        num_active_tokens,
         expert_major::PackInputBuffers {
             input: record.input,
             routes_by_expert: record.routes_by_expert,
@@ -1034,7 +1039,10 @@ where
     builder.record_with_barrier_before(record.sparse_mlp.invoke_expert_major(
         sparse_mlp::ExpertMajorShape {
             num_total_routes: record.expert_major_config.num_routes(record.expert_major_shape),
+            num_total_tokens,
+            num_experts_per_token: record.expert_major_config.num_experts_per_token,
         },
+        num_active_tokens,
         sparse_mlp::ExpertMajorBuffers {
             packed_input: record.packed_input,
             experts_by_route: record.experts_by_route,
@@ -1047,6 +1055,7 @@ where
     ));
     builder.record(record.shared_experts.invoke(
         record.dense_shape,
+        num_active_tokens,
         dense_mlp::Buffers {
             hidden_state: record.input,
             next_hidden_state: record.shared_hidden,
@@ -1054,27 +1063,23 @@ where
         record.shared_scratch,
         record.shared_weights,
     ));
-    builder.record(
-        record.shared_expert_gate.invoke(
-            record
-                .routing_shape
-                .num_total_tokens
-                .try_into()
-                .expect("MoE token count must fit i32"),
-            record.shared_expert_gate_logits,
-            0,
-            record.input,
-            0,
-            record.shared_expert_gate_weight,
-            0,
-            record.shared_expert_gate_scales,
-            0,
-            record.shared_expert_gate_biases,
-            0,
-        ),
-    );
+    builder.record(record.shared_expert_gate.invoke(
+        num_total_tokens,
+        num_active_tokens,
+        record.shared_expert_gate_logits,
+        0,
+        record.input,
+        0,
+        record.shared_expert_gate_weight,
+        0,
+        record.shared_expert_gate_scales,
+        0,
+        record.shared_expert_gate_biases,
+        0,
+    ));
     builder.record_with_barrier_before(record.expert_major.invoke_scatter_with_shared_experts(
         record.expert_major_shape,
+        num_active_tokens,
         expert_major::ScatterWithSharedExpertsBuffers {
             packed_output: record.routed_hidden,
             routes_by_token: record.routes_by_token,

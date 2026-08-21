@@ -189,6 +189,7 @@ fn build_gate_up_swiglu_replay(
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke_gate_up(
         shape,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
         &buffers.hidden_state,
         &scratch.gate_up,
         dense_mlp::Weights {
@@ -200,7 +201,12 @@ fn build_gate_up_swiglu_replay(
             down_biases: &weights.down_biases,
         },
     ));
-    builder.record_with_barrier_before(compute.invoke_swiglu(shape, &scratch.gate_up, &scratch.swiglu));
+    builder.record_with_barrier_before(compute.invoke_swiglu(
+        shape,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
+        &scratch.gate_up,
+        &scratch.swiglu,
+    ));
     builder.build()
 }
 
@@ -215,6 +221,7 @@ fn build_forward_replay(
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke(
         shape,
+        inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
         dense_mlp::Buffers {
             hidden_state: &buffers.hidden_state,
             next_hidden_state: &buffers.replay_next_hidden_state,

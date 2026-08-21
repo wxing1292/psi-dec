@@ -67,6 +67,7 @@ fn test_fixed() {
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         Buffers {
             hidden_state: &hidden_state,
             next_hidden_state: &replay_output,
@@ -165,6 +166,7 @@ fn test_random() {
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         Buffers {
             hidden_state: &hidden_state,
             next_hidden_state: &replay_output,
@@ -290,9 +292,9 @@ impl BucketedDenseMLPFixture {
 
     fn bucketed_replay(&self, num_total_tokens: u32) -> ReplayProgram {
         let mut builder = self.stream.create_replay_program();
-        builder.record(self.compute.invoke_bucketed(
-            num_total_tokens,
-            NUM_ACTIVE_TOKENS,
+        builder.record(self.compute.invoke(
+            Shape { num_total_tokens },
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             self.buffers(),
             self.scratch(),
             self.weights.as_borrowed(),

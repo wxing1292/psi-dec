@@ -87,6 +87,7 @@ impl EmbeddingFixture {
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
+            inference_backend_metal::metal::ReplayU32::Fixed(shape.num_total_tokens),
             embedding::Buffers {
                 token_ids: &token_ids,
                 weight: &weight,

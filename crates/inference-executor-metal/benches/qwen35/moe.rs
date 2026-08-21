@@ -16,6 +16,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::affine_quantized;
 use inference_backend_metal::operators::softmax;
@@ -202,8 +203,10 @@ impl ForcedMoEKernels {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let routing_shape = routing_shape(num_tokens);
+        let num_active_tokens = ReplayU32::Fixed(num_tokens);
         recorder.record_with_barrier_before(ReplayOp::opaque(self.router.invoke(
-            num_tokens.try_into().expect("forced MoE token count must fit i32"),
+            num_tokens,
+            num_active_tokens,
             scratch.routing.router_logits,
             0,
             input,
@@ -219,6 +222,7 @@ impl ForcedMoEKernels {
             softmax::Shape {
                 num_total_rows: num_tokens,
             },
+            num_active_tokens,
             softmax::Buffers {
                 input: scratch.routing.router_logits,
                 output: scratch.routing.router_probs,
@@ -226,6 +230,7 @@ impl ForcedMoEKernels {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke(
             routing_shape,
+            num_active_tokens,
             routing::Buffers {
                 router_probs: scratch.routing.router_probs,
                 expert_indices: scratch.routing.expert_indices,
@@ -237,6 +242,8 @@ impl ForcedMoEKernels {
             MoERealImpl::TokenMajor => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(self.experts.invoke_token_major(
                     sparse_token_major_shape(num_tokens),
+                    TOPK_EXPERTS,
+                    num_active_tokens,
                     sparse_mlp::TokenMajorBuffers {
                         input,
                         token_indices: scratch.topk_experts.token_indices,
@@ -254,6 +261,7 @@ impl ForcedMoEKernels {
                     combine::Shape {
                         num_total_tokens: num_tokens,
                     },
+                    num_active_tokens,
                     combine::WithSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
@@ -270,6 +278,7 @@ impl ForcedMoEKernels {
                 self.record_shared(recorder, num_tokens, input, shared_scratch, weights);
                 recorder.record(ReplayOp::opaque(self.expert_major.invoke_layout(
                     shape,
+                    num_active_tokens,
                     expert_major::LayoutBuffers {
                         expert_indices: scratch.routing.expert_indices,
                         expert_counts: scratch.topk_experts.expert_counts,
@@ -282,6 +291,7 @@ impl ForcedMoEKernels {
                 )));
                 recorder.record_with_barrier_before(ReplayOp::opaque(self.expert_major.invoke_pack_input(
                     shape,
+                    num_active_tokens,
                     expert_major::PackInputBuffers {
                         input,
                         routes_by_expert: scratch.topk_experts.routes_by_expert,
@@ -294,7 +304,10 @@ impl ForcedMoEKernels {
                             num_total_routes: num_tokens
                                 .checked_mul(TOPK_EXPERTS)
                                 .expect("forced MoE route count must fit u32"),
+                            num_total_tokens: num_tokens,
+                            num_experts_per_token: TOPK_EXPERTS,
                         },
+                        num_active_tokens,
                         sparse_mlp::ExpertMajorBuffers {
                             packed_input: scratch.topk_experts.packed_input,
                             experts_by_route: scratch.topk_experts.experts_by_route,
@@ -309,6 +322,7 @@ impl ForcedMoEKernels {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
                     self.expert_major.invoke_scatter_with_shared_experts(
                         shape,
+                        num_active_tokens,
                         expert_major::ScatterWithSharedExpertsBuffers {
                             packed_output: scratch.topk_experts.routed_hidden,
                             routes_by_token: scratch.topk_experts.routes_by_token,
@@ -337,6 +351,7 @@ impl ForcedMoEKernels {
             dense_mlp::Shape {
                 num_total_tokens: num_tokens,
             },
+            ReplayU32::Fixed(num_tokens),
             dense_mlp::Buffers {
                 hidden_state: input,
                 next_hidden_state: scratch.hidden,
@@ -348,7 +363,8 @@ impl ForcedMoEKernels {
             weights.shared_experts,
         )));
         recorder.record(ReplayOp::opaque(self.shared_expert_gate.invoke(
-            num_tokens.try_into().expect("forced MoE token count must fit i32"),
+            num_tokens,
+            ReplayU32::Fixed(num_tokens),
             scratch.gate_logits,
             0,
             input,

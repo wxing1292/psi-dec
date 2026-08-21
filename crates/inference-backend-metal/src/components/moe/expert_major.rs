@@ -8,6 +8,7 @@ use crate::metal::CompiledKernel;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const MOE_EXPERT_MAJOR_SOURCE: &str = include_str!("../metal/moe_expert_major.metal");
 
@@ -232,108 +233,70 @@ impl Compute {
         }
     }
 
-    pub fn invoke_layout<'a>(&'a self, shape: Shape, buffers: LayoutBuffers<'a>) -> LayoutInvocation<'a> {
-        LayoutInvocation {
-            kernels: self,
-            shape,
-            buffers,
-            num_active_tokens_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity expert layout whose active route count derives from active tokens.
-    pub fn invoke_layout_bucketed<'a>(
+    pub fn invoke_layout<'a>(
         &'a self,
         shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
+        num_active_tokens: ReplayU32,
         buffers: LayoutBuffers<'a>,
     ) -> LayoutInvocation<'a> {
         LayoutInvocation {
             kernels: self,
             shape,
             buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 
-    pub fn invoke_pack_input<'a>(&'a self, shape: Shape, buffers: PackInputBuffers<'a>) -> PackInputInvocation<'a> {
-        PackInputInvocation {
-            kernels: self,
-            shape,
-            buffers,
-            num_active_tokens_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity input pack whose active route count derives from active tokens.
-    pub fn invoke_pack_input_bucketed<'a>(
+    pub fn invoke_pack_input<'a>(
         &'a self,
         shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
+        num_active_tokens: ReplayU32,
         buffers: PackInputBuffers<'a>,
     ) -> PackInputInvocation<'a> {
         PackInputInvocation {
             kernels: self,
             shape,
             buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 
     pub fn invoke_scatter_without_shared_experts<'a>(
         &'a self,
         shape: Shape,
+        num_active_tokens: ReplayU32,
         buffers: ScatterWithoutSharedExpertsBuffers<'a>,
     ) -> ScatterWithoutSharedExpertsInvocation<'a> {
         ScatterWithoutSharedExpertsInvocation {
             kernels: self,
             shape,
             buffers,
-            num_active_tokens_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity scatter whose active token count is supplied at submission.
-    pub fn invoke_scatter_without_shared_experts_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: ScatterWithoutSharedExpertsBuffers<'a>,
-    ) -> ScatterWithoutSharedExpertsInvocation<'a> {
-        ScatterWithoutSharedExpertsInvocation {
-            kernels: self,
-            shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 
     pub fn invoke_scatter_with_shared_experts<'a>(
         &'a self,
         shape: Shape,
+        num_active_tokens: ReplayU32,
         buffers: ScatterWithSharedExpertsBuffers<'a>,
     ) -> ScatterWithSharedExpertsInvocation<'a> {
         ScatterWithSharedExpertsInvocation {
             kernels: self,
             shape,
             buffers,
-            num_active_tokens_key: None,
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
+}
 
-    /// Records a fixed-capacity scatter whose active token count is supplied at submission.
-    pub fn invoke_scatter_with_shared_experts_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: ScatterWithSharedExpertsBuffers<'a>,
-    ) -> ScatterWithSharedExpertsInvocation<'a> {
-        ScatterWithSharedExpertsInvocation {
-            kernels: self,
-            shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
-        }
+fn active_key(num_total_tokens: u32, num_active_tokens: ReplayU32) -> Option<ReplayParameterKey> {
+    match num_active_tokens {
+        ReplayU32::Fixed(num_active_tokens) => {
+            assert_eq!(num_active_tokens, num_total_tokens);
+            None
+        },
+        ReplayU32::Parameter(key) => Some(key),
     }
 }
 

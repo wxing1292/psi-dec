@@ -9,6 +9,7 @@ use crate::metal::CompiledKernel;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const MOE_COMBINE_SOURCE: &str = include_str!("../metal/moe_combine.metal");
 
@@ -159,6 +160,7 @@ impl Compute {
     pub fn invoke_without_shared_experts<'a>(
         &'a self,
         shape: Shape,
+        num_active_tokens: ReplayU32,
         buffers: WithoutSharedExpertsBuffers<'a>,
     ) -> WithoutSharedExpertsInvocation<'a> {
         WithoutSharedExpertsInvocation {
@@ -167,30 +169,14 @@ impl Compute {
             kernel: &self.without_shared_experts,
             shape,
             buffers,
-            num_active_tokens_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity combine whose active token count is supplied at submission.
-    pub fn invoke_without_shared_experts_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: WithoutSharedExpertsBuffers<'a>,
-    ) -> WithoutSharedExpertsInvocation<'a> {
-        WithoutSharedExpertsInvocation {
-            config: self.config,
-            constants: self.constants,
-            kernel: &self.without_shared_experts,
-            shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
 
     pub fn invoke_with_shared_experts<'a>(
         &'a self,
         shape: Shape,
+        num_active_tokens: ReplayU32,
         buffers: WithSharedExpertsBuffers<'a>,
     ) -> WithSharedExpertsInvocation<'a> {
         WithSharedExpertsInvocation {
@@ -199,25 +185,18 @@ impl Compute {
             kernel: &self.with_shared_experts,
             shape,
             buffers,
-            num_active_tokens_key: None,
+            num_active_tokens_key: active_key(shape.num_total_tokens, num_active_tokens),
         }
     }
+}
 
-    /// Records a fixed-capacity combine whose active token count is supplied at submission.
-    pub fn invoke_with_shared_experts_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: WithSharedExpertsBuffers<'a>,
-    ) -> WithSharedExpertsInvocation<'a> {
-        WithSharedExpertsInvocation {
-            config: self.config,
-            constants: self.constants,
-            kernel: &self.with_shared_experts,
-            shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
-        }
+fn active_key(num_total_tokens: u32, num_active_tokens: ReplayU32) -> Option<ReplayParameterKey> {
+    match num_active_tokens {
+        ReplayU32::Fixed(num_active_tokens) => {
+            assert_eq!(num_active_tokens, num_total_tokens);
+            None
+        },
+        ReplayU32::Parameter(key) => Some(key),
     }
 }
 

@@ -6,7 +6,7 @@ use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
-use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const QUANTIZED_EMBEDDING_SOURCE: &str = include_str!("metal/quantized_embedding.metal");
 
@@ -147,27 +147,12 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, num_active_tokens: ReplayU32, buffers: Buffers<'a>) -> Invocation<'a> {
         Invocation {
             kernel: self,
             shape,
             buffers,
-            num_active_tokens_key: None,
-        }
-    }
-
-    /// Records a fixed-capacity grid whose active token count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        capacity_shape: Shape,
-        num_active_tokens_key: ReplayParameterKey,
-        buffers: Buffers<'a>,
-    ) -> Invocation<'a> {
-        Invocation {
-            kernel: self,
-            shape: capacity_shape,
-            buffers,
-            num_active_tokens_key: Some(num_active_tokens_key),
+            num_active_tokens,
         }
     }
 }
@@ -176,7 +161,7 @@ pub struct Invocation<'a> {
     kernel: &'a Compute,
     shape: Shape,
     buffers: Buffers<'a>,
-    num_active_tokens_key: Option<ReplayParameterKey>,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for Invocation<'_> {
@@ -190,9 +175,12 @@ impl Operator for Invocation<'_> {
         recorder.set_buffer_read(2, self.buffers.scales, 0);
         recorder.set_buffer_read(3, self.buffers.biases, 0);
         recorder.set_buffer_write(4, self.buffers.output, 0);
-        match self.num_active_tokens_key {
-            Some(key) => recorder.bind_u32(5, key, 1, self.shape.num_total_tokens),
-            None => recorder.set_u32(5, self.shape.num_total_tokens),
+        match self.num_active_tokens {
+            ReplayU32::Fixed(value) => {
+                assert_eq!(value, self.shape.num_total_tokens);
+                recorder.set_u32(5, value);
+            },
+            ReplayU32::Parameter(key) => recorder.bind_u32(5, key, 1, self.shape.num_total_tokens),
         }
         recorder.set_u32(6, config.vocab_size);
         recorder.set_u32(7, config.hidden_dim);
@@ -237,6 +225,7 @@ mod tests {
     use crate::metal::Dtype;
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayParameterKey;
+    use crate::metal::ReplayU32;
     use crate::metal::Stream;
 
     const VOCAB_SIZE: u32 = 2;
@@ -324,9 +313,9 @@ mod tests {
         let kernel = Compute::new(&device, config);
 
         let mut recorder = stream.create_replay_program();
-        recorder.record(kernel.invoke_bucketed(
+        recorder.record(kernel.invoke(
             shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             Buffers {
                 token_ids: &token_ids,
                 weight: &weight,
@@ -396,6 +385,7 @@ mod tests {
         let mut recorder = stream.create_replay_program();
         recorder.record(kernel.invoke(
             shape,
+            ReplayU32::Fixed(shape.num_total_tokens),
             Buffers {
                 token_ids: &token_ids,
                 weight: &weight,

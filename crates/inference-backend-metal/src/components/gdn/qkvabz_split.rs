@@ -141,23 +141,7 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
-        Invocation {
-            config: self.config,
-            constants: self.constants,
-            kernel: &self.kernel,
-            shape,
-            buffers,
-            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
-        }
-    }
-
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        buffers: Buffers<'a>,
-        num_active_tokens: ReplayU32,
-    ) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>, num_active_tokens: ReplayU32) -> Invocation<'a> {
         Invocation {
             config: self.config,
             constants: self.constants,
@@ -279,6 +263,7 @@ mod tests {
                 b: &b,
                 z: &z,
             },
+            ReplayU32::Fixed(shape.num_total_tokens),
         ));
         stream.submit_replay(&builder.build()).wait();
 
@@ -313,7 +298,7 @@ mod tests {
         let z = Buffer::new_zeroed_elements(&device, config.num_z_values(shape), Dtype::Float32);
         let kernel = Compute::new(&device, config);
         let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke_bucketed(
+        builder.record(kernel.invoke(
             shape,
             Buffers {
                 qkvabz: &qkvabz,

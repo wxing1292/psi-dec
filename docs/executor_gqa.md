@@ -488,7 +488,7 @@ The GQA token policy includes topology boundaries from both affine projections. 
 policies use the shared default buckets. `GQA::replay_token_topology_boundaries()` exposes the union to composite
 stage policies. `backend_sdpa::ExecutionVariant` remains an explicit topology identity in the replay key.
 
-The bucketed kernels consume these submission values:
+Parameterized GQA execution consumes these submission values:
 
 ```text
 gqa.num_active_tokens                    qgkv/output affine, KV write, and attention token guards

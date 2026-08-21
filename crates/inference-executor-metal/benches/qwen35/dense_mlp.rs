@@ -279,6 +279,7 @@ impl<'a> RealDenseMLPFixture<'a> {
                     &self.stream,
                     self.compute.invoke_gate_up(
                         self.shape,
+                        ReplayU32::Fixed(self.shape.num_total_tokens),
                         &self.hidden_state,
                         &self.gate_up,
                         self.weights.as_borrowed(),
@@ -292,14 +293,24 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseMLPBenchCase::SwiGLU => {
                 build_single_invocation_replay(
                     &self.stream,
-                    self.compute.invoke_swiglu(self.shape, &self.gate_up, &self.swiglu),
+                    self.compute.invoke_swiglu(
+                        self.shape,
+                        ReplayU32::Fixed(self.shape.num_total_tokens),
+                        &self.gate_up,
+                        &self.swiglu,
+                    ),
                 )
             },
             DenseMLPBenchCase::DownAuto => {
                 build_single_invocation_replay(
                     &self.stream,
-                    self.compute
-                        .invoke_down(self.shape, &self.swiglu, &self.output, self.weights.as_borrowed()),
+                    self.compute.invoke_down(
+                        self.shape,
+                        ReplayU32::Fixed(self.shape.num_total_tokens),
+                        &self.swiglu,
+                        &self.output,
+                        self.weights.as_borrowed(),
+                    ),
                 )
             },
             DenseMLPBenchCase::DownQmmBm8Bn32 => self.forced_down_replay(DenseAffinePolicy::QmmBm8Bn32),
@@ -338,6 +349,7 @@ impl<'a> RealDenseMLPFixture<'a> {
         self.record_forced_gate_up(&mut recorder, policy);
         recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_swiglu(
             self.shape,
+            ReplayU32::Fixed(self.shape.num_total_tokens),
             &self.gate_up,
             &self.swiglu,
         )));
@@ -369,24 +381,20 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseAffinePolicy::QmmBm32Bn32 => &self.gate_up_qmm_bm32_bn32,
         };
         let weights = self.weights.as_borrowed();
-        recorder.record_with_barrier_before(ReplayOp::opaque(
-            kernel.invoke(
-                self.shape
-                    .num_total_tokens
-                    .try_into()
-                    .expect("dense MLP token count must fit i32"),
-                &self.gate_up,
-                0,
-                &self.hidden_state,
-                0,
-                weights.gate_up_weight,
-                0,
-                weights.gate_up_scales,
-                0,
-                weights.gate_up_biases,
-                0,
-            ),
-        ));
+        recorder.record_with_barrier_before(ReplayOp::opaque(kernel.invoke(
+            self.shape.num_total_tokens,
+            ReplayU32::Fixed(self.shape.num_total_tokens),
+            &self.gate_up,
+            0,
+            &self.hidden_state,
+            0,
+            weights.gate_up_weight,
+            0,
+            weights.gate_up_scales,
+            0,
+            weights.gate_up_biases,
+            0,
+        )));
     }
 
     fn record_forced_down<'b>(
@@ -401,24 +409,20 @@ impl<'a> RealDenseMLPFixture<'a> {
             DenseAffinePolicy::QmmBm32Bn32 => &self.down_qmm_bm32_bn32,
         };
         let weights = self.weights.as_borrowed();
-        recorder.record_with_barrier_before(ReplayOp::opaque(
-            kernel.invoke(
-                self.shape
-                    .num_total_tokens
-                    .try_into()
-                    .expect("dense MLP token count must fit i32"),
-                &self.output,
-                0,
-                &self.swiglu,
-                0,
-                weights.down_weight,
-                0,
-                weights.down_scales,
-                0,
-                weights.down_biases,
-                0,
-            ),
-        ));
+        recorder.record_with_barrier_before(ReplayOp::opaque(kernel.invoke(
+            self.shape.num_total_tokens,
+            ReplayU32::Fixed(self.shape.num_total_tokens),
+            &self.output,
+            0,
+            &self.swiglu,
+            0,
+            weights.down_weight,
+            0,
+            weights.down_scales,
+            0,
+            weights.down_biases,
+            0,
+        )));
     }
 }
 

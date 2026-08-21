@@ -8,7 +8,9 @@ use super::*;
 use crate::components::moe::expert_major;
 use crate::metal::Buffer;
 use crate::metal::ReplayArguments;
+use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayProgram;
+use crate::metal::ReplayU32;
 use crate::metal::Stream;
 
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.sparse_mlp.num_active_tokens");
@@ -72,6 +74,8 @@ fn test_token_major_fixed() {
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke(
         shape,
+        shape.num_total_routes / shape.num_total_tokens,
+        ReplayU32::Fixed(shape.num_total_tokens),
         TokenMajorBuffers {
             input: &input,
             token_indices: &token_indices,
@@ -220,6 +224,8 @@ fn test_token_major_random() {
     let mut builder = stream.create_replay_program();
     builder.record(sparse_mlp.invoke(
         shape,
+        shape.num_total_routes / shape.num_total_tokens,
+        ReplayU32::Fixed(shape.num_total_tokens),
         TokenMajorBuffers {
             input: &input,
             token_indices: &token_indices,
@@ -292,10 +298,13 @@ fn test_expert_major_random() {
 fn test_bucketed_shape_rejects_invalid_route_domain() {
     let token_major = BucketedSparseMLPFixture::new(4, 2);
     assert_panics(|| {
-        let _ = token_major.compute.invoke_token_major_bucketed(
-            token_major.num_total_tokens,
+        let _ = token_major.compute.invoke_token_major(
+            TokenMajorShape {
+                num_total_routes: 1,
+                num_total_tokens: token_major.num_total_tokens,
+            },
             0,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             token_major.token_major_buffers(),
             Scratch {
                 swiglu: &token_major.token_major_swiglu,
@@ -304,10 +313,13 @@ fn test_bucketed_shape_rejects_invalid_route_domain() {
         );
     });
     assert_panics(|| {
-        let _ = token_major.compute.invoke_token_major_bucketed(
-            token_major.num_total_tokens,
+        let _ = token_major.compute.invoke_token_major(
+            TokenMajorShape {
+                num_total_routes: 1,
+                num_total_tokens: token_major.num_total_tokens,
+            },
             token_major.config.num_experts + 1,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             token_major.token_major_buffers(),
             Scratch {
                 swiglu: &token_major.token_major_swiglu,
@@ -316,10 +328,13 @@ fn test_bucketed_shape_rejects_invalid_route_domain() {
         );
     });
     assert_panics(|| {
-        let _ = token_major.compute.invoke_token_major_bucketed(
-            u32::MAX,
+        let _ = token_major.compute.invoke_token_major(
+            TokenMajorShape {
+                num_total_routes: 1,
+                num_total_tokens: u32::MAX,
+            },
             2,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             token_major.token_major_buffers(),
             Scratch {
                 swiglu: &token_major.token_major_swiglu,
@@ -417,6 +432,8 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     };
     let sparse_shape = ExpertMajorShape {
         num_total_routes: num_routes,
+        num_total_tokens: num_tokens,
+        num_experts_per_token,
     };
     let gate_up_config = config.gate_up_config();
     let down_config = config.down_config();
@@ -508,6 +525,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     let mut builder = stream.create_replay_program();
     builder.record(layout.invoke_layout(
         layout_shape,
+        ReplayU32::Fixed(num_tokens),
         expert_major::LayoutBuffers {
             expert_indices: &expert_indices,
             expert_counts: &expert_counts,
@@ -520,6 +538,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     ));
     builder.record_with_barrier_before(layout.invoke_pack_input(
         layout_shape,
+        ReplayU32::Fixed(num_tokens),
         expert_major::PackInputBuffers {
             input: &input,
             routes_by_expert: &routes_by_expert,
@@ -528,6 +547,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     ));
     builder.record_with_barrier_before(sparse_mlp.invoke_expert_major(
         sparse_shape,
+        ReplayU32::Fixed(num_tokens),
         ExpertMajorBuffers {
             packed_input: &packed_input,
             experts_by_route: &experts_by_route,
@@ -538,6 +558,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     ));
     builder.record_with_barrier_before(layout.invoke_scatter_without_shared_experts(
         layout_shape,
+        ReplayU32::Fixed(num_tokens),
         expert_major::ScatterWithoutSharedExpertsBuffers {
             packed_output: &packed_output,
             routes_by_token: &routes_by_token,
@@ -633,7 +654,11 @@ impl BucketedSparseMLPFixture {
             num_total_routes,
             num_total_tokens,
         };
-        let expert_shape = ExpertMajorShape { num_total_routes };
+        let expert_shape = ExpertMajorShape {
+            num_total_routes,
+            num_total_tokens,
+            num_experts_per_token,
+        };
         let route_index_bytes = num_total_routes as usize * size_of::<u32>();
         let compute = Compute::new(&device, config);
         let weights = BucketedSparseMLPWeights::new(&device, config);
@@ -676,6 +701,8 @@ impl BucketedSparseMLPFixture {
     fn expert_major_shape(&self) -> ExpertMajorShape {
         ExpertMajorShape {
             num_total_routes: self.num_total_routes(),
+            num_total_tokens: self.num_total_tokens,
+            num_experts_per_token: self.num_experts_per_token,
         }
     }
 
@@ -699,10 +726,10 @@ impl BucketedSparseMLPFixture {
 
     fn bucketed_token_major_replay(&self) -> ReplayProgram {
         let mut builder = self.stream.create_replay_program();
-        builder.record(self.compute.invoke_token_major_bucketed(
-            self.num_total_tokens,
+        builder.record(self.compute.invoke_token_major(
+            self.token_major_shape(),
             self.num_experts_per_token,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             self.token_major_buffers(),
             Scratch {
                 swiglu: &self.token_major_swiglu,
@@ -714,10 +741,9 @@ impl BucketedSparseMLPFixture {
 
     fn bucketed_expert_major_replay(&self) -> ReplayProgram {
         let mut builder = self.stream.create_replay_program();
-        builder.record(self.compute.invoke_expert_major_bucketed(
-            self.num_total_tokens,
-            self.num_experts_per_token,
-            NUM_ACTIVE_TOKENS,
+        builder.record(self.compute.invoke_expert_major(
+            self.expert_major_shape(),
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             self.expert_major_buffers(),
             Scratch {
                 swiglu: &self.expert_major_swiglu,

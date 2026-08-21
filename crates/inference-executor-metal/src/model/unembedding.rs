@@ -178,40 +178,20 @@ impl ReplayLayer for Unembed {
     {
         self.validate_num_rows(input.num_total_rows);
         let weights = self.weights();
-        let invocation = match input.num_active_rows {
-            ReplayU32::Fixed(num_active_rows) => {
-                assert_eq!(num_active_rows, input.num_total_rows);
-                self.matmul.invoke(
-                    input.num_total_rows.try_into().expect("unembed row count must fit i32"),
-                    input.logits,
-                    0,
-                    input.hidden,
-                    0,
-                    &weights.weight,
-                    0,
-                    &weights.scales,
-                    0,
-                    &weights.biases,
-                    0,
-                )
-            },
-            ReplayU32::Parameter(key) => {
-                self.matmul.invoke_bucketed(
-                    input.num_total_rows,
-                    key,
-                    input.logits,
-                    0,
-                    input.hidden,
-                    0,
-                    &weights.weight,
-                    0,
-                    &weights.scales,
-                    0,
-                    &weights.biases,
-                    0,
-                )
-            },
-        };
+        let invocation = self.matmul.invoke(
+            input.num_total_rows,
+            input.num_active_rows,
+            input.logits,
+            0,
+            input.hidden,
+            0,
+            &weights.weight,
+            0,
+            &weights.scales,
+            0,
+            &weights.biases,
+            0,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         input.logits
     }

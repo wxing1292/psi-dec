@@ -128,12 +128,10 @@ impl UngatedDSparkGQAContextAppender {
         );
         let attention = &self.core.attention;
         let offsets = QKVOffsets::new(attention, self.metal);
-        let num_tokens = input
-            .num_tokens
-            .try_into()
-            .expect("DSpark context token count must fit i32");
+        let num_tokens = input.num_tokens;
         recorder.record_with_barrier_before(ReplayOp::opaque(self.k.invoke(
             num_tokens,
+            ReplayU32::Fixed(num_tokens),
             input.scratch.k,
             0,
             input.main_feature,
@@ -147,6 +145,7 @@ impl UngatedDSparkGQAContextAppender {
         )));
         recorder.record(ReplayOp::opaque(self.v.invoke(
             num_tokens,
+            ReplayU32::Fixed(num_tokens),
             input.scratch.v,
             0,
             input.main_feature,
@@ -168,6 +167,7 @@ impl UngatedDSparkGQAContextAppender {
                 flat_token_indices: input.flat_token_indices,
                 output: input.scratch.k_norm_rope,
             },
+            ReplayU32::Fixed(input.num_tokens),
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
             backend_kv_page_write::Shape {
@@ -187,6 +187,7 @@ impl UngatedDSparkGQAContextAppender {
                 flat_token_indices: input.flat_token_indices,
                 page_ids: input.kv_cache.page_ids,
             },
+            ReplayU32::Fixed(input.num_tokens),
             ReplayU32::Fixed(input.gqa_layer_index),
         )));
     }

@@ -46,6 +46,7 @@ fn test_without_shared_experts_fixed() {
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_without_shared_experts(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         WithoutSharedExpertsBuffers {
             routed_hidden: &routed_hidden,
             routed_probs: &routed_probs,
@@ -87,6 +88,7 @@ fn test_with_shared_experts_fixed() {
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_with_shared_experts(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         WithSharedExpertsBuffers {
             routed_hidden: &routed_hidden,
             routed_probs: &routed_probs,
@@ -144,6 +146,7 @@ fn test_with_shared_experts_random() {
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_with_shared_experts(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         WithSharedExpertsBuffers {
             routed_hidden: &routed_hidden,
             routed_probs: &routed_probs,
@@ -214,9 +217,9 @@ fn run_bucketed_capacity_case(with_shared_experts: bool) {
     let kernels = Compute::new(&device, config);
     let mut builder = stream.create_replay_program();
     if with_shared_experts {
-        builder.record(kernels.invoke_with_shared_experts_bucketed(
+        builder.record(kernels.invoke_with_shared_experts(
             shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             WithSharedExpertsBuffers {
                 routed_hidden: &routed_hidden,
                 routed_probs: &routed_probs,
@@ -226,9 +229,9 @@ fn run_bucketed_capacity_case(with_shared_experts: bool) {
             },
         ));
     } else {
-        builder.record(kernels.invoke_without_shared_experts_bucketed(
+        builder.record(kernels.invoke_without_shared_experts(
             shape,
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             WithoutSharedExpertsBuffers {
                 routed_hidden: &routed_hidden,
                 routed_probs: &routed_probs,

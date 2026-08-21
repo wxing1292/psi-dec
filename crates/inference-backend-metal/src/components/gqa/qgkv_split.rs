@@ -204,22 +204,7 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
-        Invocation {
-            constants: self.constants,
-            kernel: &self.kernel,
-            shape,
-            buffers,
-            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
-        }
-    }
-
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        buffers: Buffers<'a>,
-        num_active_tokens: ReplayU32,
-    ) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>, num_active_tokens: ReplayU32) -> Invocation<'a> {
         Invocation {
             constants: self.constants,
             kernel: &self.kernel,

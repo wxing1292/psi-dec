@@ -500,7 +500,8 @@ impl<'a> RealGQAFixture<'a> {
             backend_tiled_q::Compute::new(device, tiled_config, tiled_batch_metadata.variant(), tiled_shape);
         let mut tiled_builder = MetalReplayRuntime::new(&stream).create_recorder();
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(qgkv_matmul.invoke(
-            num_tokens.try_into().expect("GQA token count must fit i32"),
+            num_tokens,
+            ReplayU32::Fixed(num_tokens),
             &qgkv,
             0,
             &hidden_state,
@@ -523,6 +524,7 @@ impl<'a> RealGQAFixture<'a> {
                 k: &k,
                 v: &v,
             },
+            ReplayU32::Fixed(num_tokens),
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(q_norm_rope_kernel.invoke(
             norm_rope_shape(num_tokens, model.num_q_heads, model),
@@ -532,6 +534,7 @@ impl<'a> RealGQAFixture<'a> {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 output: &q_norm_rope,
             },
+            ReplayU32::Fixed(num_tokens),
         )));
         tiled_builder.record(ReplayOp::opaque(k_norm_rope_kernel.invoke(
             norm_rope_shape(num_tokens, model.num_kv_heads, model),
@@ -541,6 +544,7 @@ impl<'a> RealGQAFixture<'a> {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 output: &k_norm_rope,
             },
+            ReplayU32::Fixed(num_tokens),
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(kv_page_write.invoke(
             backend_kv_page_write::Shape {
@@ -555,6 +559,7 @@ impl<'a> RealGQAFixture<'a> {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 page_ids: &page_ids,
             },
+            ReplayU32::Fixed(num_tokens),
             ReplayU32::Fixed(0),
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_map(
@@ -571,6 +576,9 @@ impl<'a> RealGQAFixture<'a> {
                 partial_max_logits: &tiled_partial_max_logits,
             },
             ReplayU32::Fixed(0),
+            ReplayU32::Fixed(num_tokens),
+            ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
+            ReplayU32::Fixed(tiled_shape.num_total_sdpa_map_task_templates),
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
             backend_tiled_q::ReduceBuffers {
@@ -581,6 +589,7 @@ impl<'a> RealGQAFixture<'a> {
                 cu_sdpa_partial_outputs: tiled_batch_metadata.cu_sdpa_partial_outputs(),
                 output: &tiled_attention_output,
             },
+            ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(gate.invoke(
             backend_activation_gate::Shape {
@@ -591,9 +600,11 @@ impl<'a> RealGQAFixture<'a> {
                 g: &g,
                 output: &gated_attention_output,
             },
+            ReplayU32::Fixed(num_tokens),
         )));
         tiled_builder.record_with_barrier_before(ReplayOp::opaque(output.invoke(
-            num_tokens.try_into().expect("GQA token count must fit i32"),
+            num_tokens,
+            ReplayU32::Fixed(num_tokens),
             &tiled_next_hidden_state,
             0,
             &gated_attention_output,
@@ -675,6 +686,8 @@ impl<'a> RealGQAFixture<'a> {
                     partial_output: &self._sdpa_partial_output,
                 },
                 ReplayU32::Fixed(0),
+                ReplayU32::Fixed(sdpa_shape.num_total_tokens),
+                ReplayU32::Fixed(sdpa_shape.num_total_sdpa_map_task_templates),
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
                 backend_single_q::ReduceBuffers {
@@ -684,6 +697,7 @@ impl<'a> RealGQAFixture<'a> {
                     cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
                     output: &self._attention_output,
                 },
+                ReplayU32::Fixed(sdpa_shape.num_total_tokens),
             )));
             recorder.build()
         };
@@ -721,6 +735,9 @@ impl<'a> RealGQAFixture<'a> {
                     partial_max_logits: &self._tiled_partial_max_logits,
                 },
                 ReplayU32::Fixed(0),
+                ReplayU32::Fixed(tiled_shape.num_total_tokens),
+                ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
+                ReplayU32::Fixed(tiled_shape.num_total_sdpa_map_task_templates),
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(tiled.invoke_reduce(
                 backend_tiled_q::ReduceBuffers {
@@ -731,6 +748,7 @@ impl<'a> RealGQAFixture<'a> {
                     cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_sdpa_partial_outputs(),
                     output: &self._tiled_attention_output,
                 },
+                ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
             )));
             recorder.build()
         };
@@ -842,7 +860,8 @@ impl<'a> RealGQAFixture<'a> {
         let qgkv_replay = build_single_invocation_replay(
             &self.stream,
             qgkv_matmul.invoke(
-                self.num_tokens.try_into().expect("GQA token count must fit i32"),
+                self.num_tokens,
+                ReplayU32::Fixed(self.num_tokens),
                 &self._qgkv,
                 0,
                 &self._hidden_state,
@@ -868,6 +887,7 @@ impl<'a> RealGQAFixture<'a> {
                     k: &self._k,
                     v: &self._v,
                 },
+                ReplayU32::Fixed(self.num_tokens),
             ),
         );
         let q_norm_rope_replay = build_single_invocation_replay(
@@ -880,6 +900,7 @@ impl<'a> RealGQAFixture<'a> {
                     flat_token_indices: self.batch_metadata.flat_token_indices(),
                     output: &self._q_norm_rope,
                 },
+                ReplayU32::Fixed(self.num_tokens),
             ),
         );
         let k_norm_rope_replay = build_single_invocation_replay(
@@ -892,6 +913,7 @@ impl<'a> RealGQAFixture<'a> {
                     flat_token_indices: self.batch_metadata.flat_token_indices(),
                     output: &self._k_norm_rope,
                 },
+                ReplayU32::Fixed(self.num_tokens),
             ),
         );
         let page_table_layout = gqa_page_table_layout(self.num_reqs, self.end_context_len, self.model);
@@ -910,6 +932,7 @@ impl<'a> RealGQAFixture<'a> {
                     flat_token_indices: self.batch_metadata.flat_token_indices(),
                     page_ids: &self._page_ids,
                 },
+                ReplayU32::Fixed(self.num_tokens),
                 ReplayU32::Fixed(0),
             ),
         );
@@ -927,6 +950,8 @@ impl<'a> RealGQAFixture<'a> {
                     partial_output: &self._sdpa_partial_output,
                 },
                 ReplayU32::Fixed(0),
+                ReplayU32::Fixed(self.num_tokens),
+                ReplayU32::Fixed(sdpa_shape.num_total_sdpa_map_task_templates),
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
                 backend_single_q::ReduceBuffers {
@@ -936,6 +961,7 @@ impl<'a> RealGQAFixture<'a> {
                     cu_sdpa_partial_outputs: self.batch_metadata.cu_sdpa_partial_outputs(),
                     output: &self._attention_output,
                 },
+                ReplayU32::Fixed(self.num_tokens),
             )));
             recorder.build()
         };
@@ -970,6 +996,9 @@ impl<'a> RealGQAFixture<'a> {
                     partial_max_logits: &self._tiled_partial_max_logits,
                 },
                 ReplayU32::Fixed(0),
+                ReplayU32::Fixed(self.num_tokens),
+                ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
+                ReplayU32::Fixed(tiled_shape.num_total_sdpa_map_task_templates),
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(tiled_kernel.invoke_reduce(
                 backend_tiled_q::ReduceBuffers {
@@ -980,6 +1009,7 @@ impl<'a> RealGQAFixture<'a> {
                     cu_sdpa_partial_outputs: self.tiled_batch_metadata.cu_sdpa_partial_outputs(),
                     output: &self._tiled_attention_output,
                 },
+                ReplayU32::Fixed(tiled_shape.num_total_q_token_tiles),
             )));
             recorder.build()
         };
@@ -1004,12 +1034,14 @@ impl<'a> RealGQAFixture<'a> {
                     g: &self._g,
                     output: &self._gated_attention_output,
                 },
+                ReplayU32::Fixed(self.num_tokens),
             ),
         );
         let output_replay = build_single_invocation_replay(
             &self.stream,
             output.invoke(
-                self.num_tokens.try_into().expect("GQA token count must fit i32"),
+                self.num_tokens,
+                ReplayU32::Fixed(self.num_tokens),
                 &self.next_hidden_state,
                 0,
                 &self._gated_attention_output,

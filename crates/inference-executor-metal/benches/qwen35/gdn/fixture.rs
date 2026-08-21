@@ -324,7 +324,8 @@ impl<'a> RealGDNFixture<'a> {
         let qkvabz_replay = build_single_invocation_replay(
             &self.stream,
             qkvabz.invoke(
-                self.num_tokens.try_into().expect("GDN token count must fit i32"),
+                self.num_tokens,
+                ReplayU32::Fixed(self.num_tokens),
                 &self.qkvabz,
                 0,
                 &self.hidden_state,
@@ -350,6 +351,7 @@ impl<'a> RealGDNFixture<'a> {
                     b: &self.b,
                     z: &self.z,
                 },
+                ReplayU32::Fixed(self.num_tokens),
             ),
         );
         let compute_shape = backend_compute::Shape {
@@ -383,15 +385,29 @@ impl<'a> RealGDNFixture<'a> {
         let compute_replay = if self.materialize_candidate_states {
             build_single_invocation_replay(
                 &self.stream,
-                compute.invoke_with_candidate_state_update(compute_shape, compute_buffers),
+                compute.invoke_with_candidate_state_update(
+                    compute_shape,
+                    compute_buffers,
+                    ReplayU32::Fixed(self.num_reqs),
+                    ReplayU32::Fixed(self.num_tokens),
+                ),
             )
         } else {
-            build_single_invocation_replay(&self.stream, compute.invoke(compute_shape, compute_buffers))
+            build_single_invocation_replay(
+                &self.stream,
+                compute.invoke(
+                    compute_shape,
+                    compute_buffers,
+                    ReplayU32::Fixed(self.num_reqs),
+                    ReplayU32::Fixed(self.num_tokens),
+                ),
+            )
         };
         let output_replay = build_single_invocation_replay(
             &self.stream,
             output.invoke(
-                self.num_tokens.try_into().expect("GDN token count must fit i32"),
+                self.num_tokens,
+                ReplayU32::Fixed(self.num_tokens),
                 &self.next_hidden_state,
                 0,
                 &self.norm_gated_output,

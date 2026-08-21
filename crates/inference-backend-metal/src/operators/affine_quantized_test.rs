@@ -203,7 +203,8 @@ fn assert_bucketed_parity_and_canary(config: Config, kind: KernelKind, num_total
 
     let mut exact_builder = stream.create_replay_program();
     exact_builder.record(kernel.invoke(
-        num_active_rows,
+        num_active_rows as u32,
+        ReplayU32::Fixed(num_active_rows as u32),
         &exact_output,
         0,
         &input,
@@ -219,9 +220,9 @@ fn assert_bucketed_parity_and_canary(config: Config, kind: KernelKind, num_total
     stream.submit_replay(&exact_replay).wait();
 
     let mut bucketed_builder = stream.create_replay_program();
-    bucketed_builder.record(kernel.invoke_bucketed(
+    bucketed_builder.record(kernel.invoke(
         num_total_rows as u32,
-        NUM_ACTIVE_ROWS,
+        ReplayU32::Parameter(NUM_ACTIVE_ROWS),
         &bucketed_output,
         0,
         &input,
@@ -342,7 +343,8 @@ fn test_adaptive_matmul_supports_all_float_dtype_combinations() {
                     execute_matmul(
                         &stream,
                         kernel.invoke(
-                            m,
+                            m as u32,
+                            ReplayU32::Fixed(m as u32),
                             &output,
                             0,
                             &input,
@@ -410,7 +412,8 @@ fn test_qmv_fast_supports_all_float_dtype_combinations() {
                 execute_matmul(
                     &stream,
                     kernel.invoke(
-                        m,
+                        m as u32,
+                        ReplayU32::Fixed(m as u32),
                         &output,
                         0,
                         &input,
@@ -472,7 +475,8 @@ fn test_qmv_reference() {
     execute_matmul(
         &stream,
         Kernel::new(&device, config, Selector::key(config, m)).invoke(
-            m,
+            m as u32,
+            ReplayU32::Fixed(m as u32),
             &output,
             0,
             &input,
@@ -535,7 +539,8 @@ fn test_qmv_fast_reference() {
     execute_matmul(
         &stream,
         Kernel::new(&device, config, Selector::key(config, m)).invoke(
-            m,
+            m as u32,
+            ReplayU32::Fixed(m as u32),
             &output,
             0,
             &input,
@@ -595,7 +600,8 @@ fn test_qmm_reference() {
     execute_matmul(
         &stream,
         Kernel::new(&device, config, Selector::key(config, m)).invoke(
-            m,
+            m as u32,
+            ReplayU32::Fixed(m as u32),
             &output,
             0,
             &input,
@@ -678,7 +684,8 @@ fn assert_qmm_bm8_bm16_bn32_q4_bf16_reference(bm: usize) {
     execute_matmul(
         &stream,
         kernel.invoke(
-            m,
+            m as u32,
+            ReplayU32::Fixed(m as u32),
             &output,
             0,
             &input,
@@ -755,7 +762,8 @@ fn test_qmv_bf16() {
     execute_matmul(
         &stream,
         Kernel::new(&device, config, Selector::key(config, m)).invoke(
-            m,
+            m as u32,
+            ReplayU32::Fixed(m as u32),
             &output,
             0,
             &input_buffer,
@@ -832,7 +840,8 @@ fn test_qmv_fast_bf16() {
     execute_matmul(
         &stream,
         Kernel::new(&device, config, Selector::key(config, m)).invoke(
-            m,
+            m as u32,
+            ReplayU32::Fixed(m as u32),
             &output,
             0,
             &input_buffer,
@@ -906,7 +915,8 @@ fn test_qmm_bf16() {
     execute_matmul(
         &stream,
         Kernel::new(&device, config, Selector::key(config, m)).invoke(
-            m,
+            m as u32,
+            ReplayU32::Fixed(m as u32),
             &output,
             0,
             &input_buffer,

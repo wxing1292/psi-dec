@@ -210,8 +210,9 @@ These components hide backend kernel and invocation details.
 Concrete Main and MTP compositions own graph order.
 
 `Embed` and `Unembed` use the same weight-bearing owner spine.
-Each owner provides an exact `ReplayLayer` input and a separate bucketed input.
-Each capacity view shares its immutable compute object and loaded weights.
+Each owner provides one `ReplayLayer` input with `num_total_*` and `ReplayU32` `num_active_*` fields.
+Fixed active values equal the total capacity.
+Parameterized active values use the same immutable compute object and loaded weights.
 Only `Unembed` exposes replay topology because its affine operator selects QMV or QMM.
 
 `Qwen3Microbatch` records decode requests and an optional speculative suffix.

@@ -146,6 +146,8 @@ impl MoEScratch {
                 .token_major_output_bytes(token_major_shape)
                 .max(sparse_config.expert_major_output_bytes(sparse_mlp::ExpertMajorShape {
                     num_total_routes: expert_major_config.num_routes(expert_major_shape),
+                    num_total_tokens: max_tokens_u32,
+                    num_experts_per_token: expert_major_config.num_experts_per_token,
                 }));
         let topk: u32 = core
             .num_experts_per_token

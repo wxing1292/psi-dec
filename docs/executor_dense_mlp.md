@@ -221,10 +221,11 @@ It does not put these barriers inside the dense MLP component.
 
 Dense MLP has no expert-major policy.
 Every active token row runs the same dense expert.
-The exact path uses `num_tokens`.
-The bucketed path uses recorded `num_total_tokens` and submission-time `num_active_tokens`.
-Capacity buffers can be larger.
-Each replay invocation uses the current active prefix.
+The backend exposes one `invoke(...)` API.
+It accepts `Shape { num_total_tokens }` and one `ReplayU32` active-token value.
+`ReplayU32::Fixed(value)` requires `value == num_total_tokens`.
+`ReplayU32::Parameter(key)` supplies the active prefix at submission.
+Capacity buffers can be larger than the active prefix.
 
 ## Execution hierarchy
 

@@ -316,41 +316,20 @@ impl ReplayLayer for GQA {
         let batch_metadata = input.batch_metadata;
         let scratch = input.scratch;
         let active_tokens = input.num_active_tokens;
-        let active_tokens_key = match active_tokens {
-            ReplayU32::Parameter(key) => Some(key),
-            ReplayU32::Fixed(_) => None,
-        };
-        let bucketed = active_tokens_key.is_some();
-        let qgkv = if let Some(active_tokens_key) = active_tokens_key {
-            self.qgkv.invoke_bucketed(
-                shape.num_total_tokens,
-                active_tokens_key,
-                scratch.qgkv,
-                0,
-                hidden_state,
-                0,
-                weights.qgkv_weight,
-                0,
-                weights.qgkv_scales,
-                0,
-                weights.qgkv_biases,
-                0,
-            )
-        } else {
-            self.qgkv.invoke(
-                shape.num_total_tokens.try_into().expect("GQA token count must fit i32"),
-                scratch.qgkv,
-                0,
-                hidden_state,
-                0,
-                weights.qgkv_weight,
-                0,
-                weights.qgkv_scales,
-                0,
-                weights.qgkv_biases,
-                0,
-            )
-        };
+        let qgkv = self.qgkv.invoke(
+            shape.num_total_tokens,
+            active_tokens,
+            scratch.qgkv,
+            0,
+            hidden_state,
+            0,
+            weights.qgkv_weight,
+            0,
+            weights.qgkv_scales,
+            0,
+            weights.qgkv_biases,
+            0,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(qgkv));
         let qgkv_to_q_g_k_v_shape = self.qgkv_to_q_g_k_v_shape(shape);
         let qgkv_to_q_g_k_v_buffers = backend_qgkv_split::Buffers {
@@ -360,13 +339,9 @@ impl ReplayLayer for GQA {
             k: scratch.k,
             v: scratch.v,
         };
-        let qgkv_to_q_g_k_v = if bucketed {
+        let qgkv_to_q_g_k_v =
             self.qgkv_to_q_g_k_v
-                .invoke_bucketed(qgkv_to_q_g_k_v_shape, qgkv_to_q_g_k_v_buffers, active_tokens)
-        } else {
-            self.qgkv_to_q_g_k_v
-                .invoke(qgkv_to_q_g_k_v_shape, qgkv_to_q_g_k_v_buffers)
-        };
+                .invoke(qgkv_to_q_g_k_v_shape, qgkv_to_q_g_k_v_buffers, active_tokens);
         recorder.record_with_barrier_before(ReplayOp::opaque(qgkv_to_q_g_k_v));
         let q_norm_rope_shape = self.norm_rope_shape(shape);
         let q_norm_rope_buffers = rms_norm_rope::Buffers {
@@ -375,12 +350,9 @@ impl ReplayLayer for GQA {
             flat_token_indices: batch_metadata.flat_token_indices(),
             output: scratch.q_norm_rope,
         };
-        let q_norm_rope = if bucketed {
-            self.q_norm_rope
-                .invoke_bucketed(q_norm_rope_shape, q_norm_rope_buffers, active_tokens)
-        } else {
-            self.q_norm_rope.invoke(q_norm_rope_shape, q_norm_rope_buffers)
-        };
+        let q_norm_rope = self
+            .q_norm_rope
+            .invoke(q_norm_rope_shape, q_norm_rope_buffers, active_tokens);
         recorder.record_with_barrier_before(ReplayOp::opaque(q_norm_rope));
         let k_norm_rope_shape = self.norm_rope_shape(shape);
         let k_norm_rope_buffers = rms_norm_rope::Buffers {
@@ -389,12 +361,9 @@ impl ReplayLayer for GQA {
             flat_token_indices: batch_metadata.flat_token_indices(),
             output: scratch.k_norm_rope,
         };
-        let k_norm_rope = if bucketed {
-            self.k_norm_rope
-                .invoke_bucketed(k_norm_rope_shape, k_norm_rope_buffers, active_tokens)
-        } else {
-            self.k_norm_rope.invoke(k_norm_rope_shape, k_norm_rope_buffers)
-        };
+        let k_norm_rope = self
+            .k_norm_rope
+            .invoke(k_norm_rope_shape, k_norm_rope_buffers, active_tokens);
         recorder.record(ReplayOp::opaque(k_norm_rope));
         let kv_page_write_shape = self.kv_page_write_shape(shape, page_table_layout);
         let kv_page_write_buffers = backend_kv_page_write::Buffers {
@@ -405,17 +374,12 @@ impl ReplayLayer for GQA {
             flat_token_indices: batch_metadata.flat_token_indices(),
             page_ids: kv_cache.page_ids,
         };
-        let kv_page_write = if bucketed {
-            self.kv_page_write.invoke_bucketed(
-                kv_page_write_shape,
-                kv_page_write_buffers,
-                active_tokens,
-                page_table_index,
-            )
-        } else {
-            self.kv_page_write
-                .invoke(kv_page_write_shape, kv_page_write_buffers, page_table_index)
-        };
+        let kv_page_write = self.kv_page_write.invoke(
+            kv_page_write_shape,
+            kv_page_write_buffers,
+            active_tokens,
+            page_table_index,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(kv_page_write));
         let attention_output = self.record_sdpa(recorder, input);
         let gate_shape = self.gate_shape(shape);
@@ -424,42 +388,22 @@ impl ReplayLayer for GQA {
             g: scratch.g,
             output: scratch.gated_attention_output,
         };
-        let gate = if bucketed {
-            self.gate.invoke_bucketed(gate_shape, gate_buffers, active_tokens)
-        } else {
-            self.gate.invoke(gate_shape, gate_buffers)
-        };
+        let gate = self.gate.invoke(gate_shape, gate_buffers, active_tokens);
         recorder.record_with_barrier_before(ReplayOp::opaque(gate));
-        let output = if let Some(active_tokens_key) = active_tokens_key {
-            self.output.invoke_bucketed(
-                shape.num_total_tokens,
-                active_tokens_key,
-                next_hidden_state,
-                0,
-                scratch.gated_attention_output,
-                0,
-                weights.output_weight,
-                0,
-                weights.output_scales,
-                0,
-                weights.output_biases,
-                0,
-            )
-        } else {
-            self.output.invoke(
-                shape.num_total_tokens.try_into().expect("GQA token count must fit i32"),
-                next_hidden_state,
-                0,
-                scratch.gated_attention_output,
-                0,
-                weights.output_weight,
-                0,
-                weights.output_scales,
-                0,
-                weights.output_biases,
-                0,
-            )
-        };
+        let output = self.output.invoke(
+            shape.num_total_tokens,
+            active_tokens,
+            next_hidden_state,
+            0,
+            scratch.gated_attention_output,
+            0,
+            weights.output_weight,
+            0,
+            weights.output_scales,
+            0,
+            weights.output_biases,
+            0,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(output));
         next_hidden_state
     }
@@ -477,9 +421,17 @@ impl GQA {
         let kv_cache = input.kv_cache;
         let scratch = input.scratch;
         let active_tokens = input.num_active_tokens;
-        let bucketed = matches!(active_tokens, ReplayU32::Parameter(_));
-        let active_q_token_tiles = ReplayU32::Parameter(GQA_NUM_ACTIVE_Q_TOKEN_TILES);
-        let active_kv_splits = ReplayU32::Parameter(GQA_NUM_ACTIVE_KV_SPLITS);
+        let has_active_parameter = matches!(active_tokens, ReplayU32::Parameter(_));
+        let active_q_token_tiles = if has_active_parameter {
+            ReplayU32::Parameter(GQA_NUM_ACTIVE_Q_TOKEN_TILES)
+        } else {
+            ReplayU32::Fixed(shape.num_q_token_tiles)
+        };
+        let active_kv_splits = if has_active_parameter {
+            ReplayU32::Parameter(GQA_NUM_ACTIVE_KV_SPLITS)
+        } else {
+            ReplayU32::Fixed(shape.num_sdpa_map_task_templates)
+        };
         let execution = batch_metadata.variant();
         let map_constants = execution.map.thread_block;
         if map_constants.max_q_tokens == 1 {
@@ -500,11 +452,7 @@ impl GQA {
                 partial_max_logits: scratch.sdpa_partial_max_logits,
                 partial_output: scratch.sdpa_partial_output,
             };
-            let map = if bucketed {
-                sdpa.invoke_map_bucketed(map_buffers, page_table_index, active_tokens, active_kv_splits)
-            } else {
-                sdpa.invoke_map(map_buffers, page_table_index)
-            };
+            let map = sdpa.invoke_map(map_buffers, page_table_index, active_tokens, active_kv_splits);
             recorder.record_with_barrier_before(ReplayOp::opaque(map));
             let reduce_buffers = backend_single_q::ReduceBuffers {
                 partial_exp_sums: scratch.sdpa_partial_exp_sums,
@@ -513,11 +461,7 @@ impl GQA {
                 cu_sdpa_partial_outputs: batch_metadata.cu_sdpa_partial_outputs(),
                 output: scratch.attention_output,
             };
-            let reduce = if bucketed {
-                sdpa.invoke_reduce_bucketed(reduce_buffers, active_tokens)
-            } else {
-                sdpa.invoke_reduce(reduce_buffers)
-            };
+            let reduce = sdpa.invoke_reduce(reduce_buffers, active_tokens);
             recorder.record_with_barrier_before(ReplayOp::opaque(reduce));
         } else {
             let sdpa_config = self.split_kv_tiled_q_config(page_table_layout);
@@ -535,17 +479,13 @@ impl GQA {
                 partial_exp_sums: scratch.sdpa_partial_exp_sums,
                 partial_max_logits: scratch.sdpa_partial_max_logits,
             };
-            let map = if bucketed {
-                sdpa.invoke_map_bucketed(
-                    map_buffers,
-                    page_table_index,
-                    active_tokens,
-                    active_q_token_tiles,
-                    active_kv_splits,
-                )
-            } else {
-                sdpa.invoke_map(map_buffers, page_table_index)
-            };
+            let map = sdpa.invoke_map(
+                map_buffers,
+                page_table_index,
+                active_tokens,
+                active_q_token_tiles,
+                active_kv_splits,
+            );
             recorder.record_with_barrier_before(ReplayOp::opaque(map));
             let reduce_buffers = backend_tiled_q::ReduceBuffers {
                 partial_output: scratch.sdpa_partial_output,
@@ -555,11 +495,7 @@ impl GQA {
                 cu_sdpa_partial_outputs: batch_metadata.cu_sdpa_partial_outputs(),
                 output: scratch.attention_output,
             };
-            let reduce = if bucketed {
-                sdpa.invoke_reduce_bucketed(reduce_buffers, active_q_token_tiles)
-            } else {
-                sdpa.invoke_reduce(reduce_buffers)
-            };
+            let reduce = sdpa.invoke_reduce(reduce_buffers, active_q_token_tiles);
             recorder.record_with_barrier_before(ReplayOp::opaque(reduce));
         }
         scratch.attention_output
@@ -784,7 +720,7 @@ mod tests {
         let k_norm_output = Buffer::new_zeroed_elements(&device, norm_config.num_slots(norm_shape), Dtype::Float32);
         let gated = Buffer::new_zeroed_elements(&device, gate_config.num_values(gate_shape), Dtype::Float32);
         let mut builder = stream.create_replay_program();
-        builder.record(split.invoke_bucketed(
+        builder.record(split.invoke(
             split_shape,
             backend_qgkv_split::Buffers {
                 qgkv: &input,
@@ -795,7 +731,7 @@ mod tests {
             },
             ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
         ));
-        builder.record_with_barrier_before(q_norm.invoke_bucketed(
+        builder.record_with_barrier_before(q_norm.invoke(
             norm_shape,
             rms_norm_rope::Buffers {
                 input: &q,
@@ -805,7 +741,7 @@ mod tests {
             },
             ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
         ));
-        builder.record_with_barrier_before(k_norm.invoke_bucketed(
+        builder.record_with_barrier_before(k_norm.invoke(
             norm_shape,
             rms_norm_rope::Buffers {
                 input: &k,
@@ -815,7 +751,7 @@ mod tests {
             },
             ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
         ));
-        builder.record_with_barrier_before(gate.invoke_bucketed(
+        builder.record_with_barrier_before(gate.invoke(
             gate_shape,
             backend_activation_gate::Buffers {
                 attention_output: &q_norm_output,

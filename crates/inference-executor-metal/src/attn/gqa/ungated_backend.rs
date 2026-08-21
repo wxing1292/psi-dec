@@ -194,24 +194,20 @@ impl ReplayLayer for UngatedGQA {
         let weights = input.weights;
         let batch_metadata = input.batch_metadata;
         let scratch = input.scratch;
-        recorder.record_with_barrier_before(ReplayOp::opaque(
-            self.qkv.invoke(
-                shape
-                    .num_tokens
-                    .try_into()
-                    .expect("ungated GQA token count must fit i32"),
-                scratch.qkv,
-                0,
-                hidden_state,
-                0,
-                weights.qkv_weight,
-                0,
-                weights.qkv_scales,
-                0,
-                weights.qkv_biases,
-                0,
-            ),
-        ));
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv.invoke(
+            shape.num_tokens,
+            ReplayU32::Fixed(shape.num_tokens),
+            scratch.qkv,
+            0,
+            hidden_state,
+            0,
+            weights.qkv_weight,
+            0,
+            weights.qkv_scales,
+            0,
+            weights.qkv_biases,
+            0,
+        )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv_to_q_k_v.invoke(
             self.qkv_to_q_k_v_shape(shape),
             backend_qkv_split::Buffers {
@@ -229,6 +225,7 @@ impl ReplayLayer for UngatedGQA {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 output: scratch.q_norm_rope,
             },
+            ReplayU32::Fixed(shape.num_tokens),
         )));
         recorder.record(ReplayOp::opaque(self.k_norm_rope.invoke(
             self.norm_rope_shape(shape),
@@ -238,6 +235,7 @@ impl ReplayLayer for UngatedGQA {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 output: scratch.k_norm_rope,
             },
+            ReplayU32::Fixed(shape.num_tokens),
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
             self.kv_page_write_shape(shape, page_table_layout),
@@ -249,27 +247,24 @@ impl ReplayLayer for UngatedGQA {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 page_ids: kv_cache.page_ids,
             },
+            ReplayU32::Fixed(shape.num_tokens),
             ReplayU32::Fixed(gqa_layer_index),
         )));
         let attention_output = self.record_sdpa(recorder, input);
-        recorder.record_with_barrier_before(ReplayOp::opaque(
-            self.output.invoke(
-                shape
-                    .num_tokens
-                    .try_into()
-                    .expect("ungated GQA token count must fit i32"),
-                next_hidden_state,
-                0,
-                attention_output,
-                0,
-                weights.output_weight,
-                0,
-                weights.output_scales,
-                0,
-                weights.output_biases,
-                0,
-            ),
-        ));
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.output.invoke(
+            shape.num_tokens,
+            ReplayU32::Fixed(shape.num_tokens),
+            next_hidden_state,
+            0,
+            attention_output,
+            0,
+            weights.output_weight,
+            0,
+            weights.output_scales,
+            0,
+            weights.output_biases,
+            0,
+        )));
         next_hidden_state
     }
 }
@@ -307,6 +302,8 @@ impl UngatedGQA {
                     partial_output: scratch.sdpa_partial_output,
                 },
                 ReplayU32::Fixed(gqa_layer_index),
+                ReplayU32::Fixed(shape.num_tokens),
+                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
                 backend_single_q::ReduceBuffers {
@@ -316,6 +313,7 @@ impl UngatedGQA {
                     cu_sdpa_partial_outputs: batch_metadata.cu_sdpa_partial_outputs(),
                     output: scratch.attention_output,
                 },
+                ReplayU32::Fixed(shape.num_tokens),
             )));
         } else {
             let sdpa_config = self.split_kv_tiled_q_config(page_table_layout);
@@ -335,15 +333,21 @@ impl UngatedGQA {
                     partial_max_logits: scratch.sdpa_partial_max_logits,
                 },
                 ReplayU32::Fixed(gqa_layer_index),
+                ReplayU32::Fixed(shape.num_tokens),
+                ReplayU32::Fixed(shape.num_q_token_tiles),
+                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
             )));
-            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(backend_tiled_q::ReduceBuffers {
-                partial_output: scratch.sdpa_partial_output,
-                partial_exp_sums: scratch.sdpa_partial_exp_sums,
-                partial_max_logits: scratch.sdpa_partial_max_logits,
-                q_token_ranges: batch_metadata.q_token_ranges(),
-                cu_sdpa_partial_outputs: batch_metadata.cu_sdpa_partial_outputs(),
-                output: scratch.attention_output,
-            })));
+            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
+                backend_tiled_q::ReduceBuffers {
+                    partial_output: scratch.sdpa_partial_output,
+                    partial_exp_sums: scratch.sdpa_partial_exp_sums,
+                    partial_max_logits: scratch.sdpa_partial_max_logits,
+                    q_token_ranges: batch_metadata.q_token_ranges(),
+                    cu_sdpa_partial_outputs: batch_metadata.cu_sdpa_partial_outputs(),
+                    output: scratch.attention_output,
+                },
+                ReplayU32::Fixed(shape.num_q_token_tiles),
+            )));
         }
         scratch.attention_output
     }

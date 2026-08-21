@@ -79,6 +79,7 @@ fn test_topk_renorm() {
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,
@@ -119,6 +120,7 @@ fn test_no_topk_renorm() {
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,
@@ -166,6 +168,7 @@ fn test_random() {
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
         Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,
@@ -235,9 +238,9 @@ fn run_bucketed_replay_case(norm_topk_prob: bool) {
     let kernel = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
-    builder.record(kernel.invoke_bucketed(
+    builder.record(kernel.invoke(
         shape,
-        NUM_ACTIVE_TOKENS,
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,

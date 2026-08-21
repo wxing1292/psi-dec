@@ -10,6 +10,7 @@ use crate::metal::Buffer;
 use crate::metal::Device;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 use crate::metal::Stream;
 
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.fused.num_active_tokens");
@@ -32,7 +33,7 @@ fn test_fusion() {
     let weight = Buffer::new_zeroed(&device, hidden_dim * size_of::<u16>());
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
-    recorder.record(ReplayOp::residual_add(residual_add.invoke(
+    recorder.record(ReplayOp::residual_add(residual_add.invoke_values(
         residual_add::Shape {
             num_values: num_values as u32,
         },
@@ -46,6 +47,7 @@ fn test_fusion() {
         rms_norm::Shape {
             num_total_tokens: tokens as u32,
         },
+        ReplayU32::Fixed(tokens as u32),
         rms_norm::Buffers {
             input: &residual_output,
             weight: &weight,
@@ -78,7 +80,7 @@ fn test_unrelated_residual_add_and_rms_norm_are_not_fused() {
     let weight = Buffer::new_zeroed(&device, hidden_dim * size_of::<u16>());
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
-    recorder.record(ReplayOp::residual_add(residual_add.invoke(
+    recorder.record(ReplayOp::residual_add(residual_add.invoke_values(
         residual_add::Shape {
             num_values: num_values as u32,
         },
@@ -92,6 +94,7 @@ fn test_unrelated_residual_add_and_rms_norm_are_not_fused() {
         rms_norm::Shape {
             num_total_tokens: tokens as u32,
         },
+        ReplayU32::Fixed(tokens as u32),
         rms_norm::Buffers {
             input: &unrelated_norm_input,
             weight: &weight,
@@ -135,23 +138,23 @@ fn test_bucketed_fusion_preserves_tails_across_grow_and_shrink() {
     let norm_output = Buffer::from_slice(&device, &vec![sentinel; capacity_values]);
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
-    recorder.record(ReplayOp::residual_add(residual_add.invoke_bucketed(
+    recorder.record(ReplayOp::residual_add(residual_add.invoke_rows(
         residual_add::RowShape {
             num_total_rows: token_capacity,
             num_columns: hidden_dim,
         },
-        NUM_ACTIVE_TOKENS,
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         residual_add::Buffers {
             lhs: &lhs,
             rhs: &rhs,
             output: &residual_output,
         },
     )));
-    recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke_bucketed(
+    recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke(
         rms_norm::Shape {
             num_total_tokens: token_capacity,
         },
-        NUM_ACTIVE_TOKENS,
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         rms_norm::Buffers {
             input: &residual_output,
             weight: &weight,
@@ -236,12 +239,12 @@ fn test_bucketed_residual_capture_fusion() {
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
 
     recorder.record(ReplayOp::residual_add_with_capture(
-        residual_add.invoke_bucketed(
+        residual_add.invoke_rows(
             residual_add::RowShape {
                 num_total_rows: token_capacity,
                 num_columns: hidden_dim,
             },
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             residual_add::Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
@@ -254,11 +257,11 @@ fn test_bucketed_residual_capture_fusion() {
             capture_column_start..capture_column_end,
         ),
     ));
-    recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke_bucketed(
+    recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke(
         rms_norm::Shape {
             num_total_tokens: token_capacity,
         },
-        NUM_ACTIVE_TOKENS,
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         rms_norm::Buffers {
             input: &residual_output,
             weight: &weight,
@@ -363,6 +366,7 @@ fn test_residual_capture_records_without_rms_norm() {
                 num_total_rows: 1,
                 num_columns: 8,
             },
+            ReplayU32::Fixed(1),
             residual_add::Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
@@ -398,6 +402,7 @@ fn test_residual_capture_rejects_mismatched_source_column_count() {
                 num_total_rows: 1,
                 num_columns: 8,
             },
+            ReplayU32::Fixed(1),
             residual_add::Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
@@ -425,12 +430,12 @@ fn test_bucketed_residual_records_without_rms_norm() {
     let rhs = Buffer::from_slice(&device, &vec![poison; capacity_values]);
     let output = Buffer::from_slice(&device, &vec![sentinel; capacity_values]);
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
-    recorder.record(ReplayOp::residual_add(residual_add.invoke_bucketed(
+    recorder.record(ReplayOp::residual_add(residual_add.invoke_rows(
         residual_add::RowShape {
             num_total_rows: token_capacity,
             num_columns: hidden_dim,
         },
-        NUM_ACTIVE_TOKENS,
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         residual_add::Buffers {
             lhs: &lhs,
             rhs: &rhs,
@@ -486,12 +491,12 @@ fn test_bucketed_residual_capture_records_without_rms_norm() {
     let capture_output = Buffer::from_slice(&device, &vec![sentinel; capture_capacity_values]);
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
     recorder.record(ReplayOp::residual_add_with_capture(
-        residual_add.invoke_bucketed(
+        residual_add.invoke_rows(
             residual_add::RowShape {
                 num_total_rows: token_capacity,
                 num_columns: hidden_dim,
             },
-            NUM_ACTIVE_TOKENS,
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             residual_add::Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
@@ -563,23 +568,23 @@ fn test_mismatched_replay_parameter_disables_fusion() {
     let norm_output = Buffer::new_zeroed(&device, bytes);
     let weight = Buffer::new_zeroed(&device, hidden_dim as usize * size_of::<u16>());
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
-    recorder.record(ReplayOp::residual_add(residual_add.invoke_bucketed(
+    recorder.record(ReplayOp::residual_add(residual_add.invoke_rows(
         residual_add::RowShape {
             num_total_rows: token_capacity,
             num_columns: hidden_dim,
         },
-        NUM_ACTIVE_TOKENS,
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         residual_add::Buffers {
             lhs: &lhs,
             rhs: &rhs,
             output: &residual_output,
         },
     )));
-    recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke_bucketed(
+    recorder.record_with_barrier_before(ReplayOp::rms_norm(rms_norm.invoke(
         rms_norm::Shape {
             num_total_tokens: token_capacity,
         },
-        OTHER_NUM_ACTIVE_TOKENS,
+        ReplayU32::Parameter(OTHER_NUM_ACTIVE_TOKENS),
         rms_norm::Buffers {
             input: &residual_output,
             weight: &weight,
@@ -605,7 +610,7 @@ fn test_intervening_opaque_op_disables_fusion() {
     let norm_output = Buffer::new_zeroed(&device, 16);
     let weight = Buffer::new_zeroed(&device, 16);
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
-    recorder.record(ReplayOp::residual_add(residual_add.invoke(
+    recorder.record(ReplayOp::residual_add(residual_add.invoke_values(
         residual_add::Shape { num_values: hidden_dim },
         residual_add::Buffers {
             lhs: &lhs,
@@ -616,6 +621,7 @@ fn test_intervening_opaque_op_disables_fusion() {
 
     recorder.record(ReplayOp::opaque(rms_norm.invoke(
         rms_norm::Shape { num_total_tokens: 1 },
+        ReplayU32::Fixed(1),
         rms_norm::Buffers {
             input: &residual_output,
             weight: &weight,
@@ -639,7 +645,7 @@ fn test_unrelated_rms_norm_input_disables_fusion() {
     let norm_output = Buffer::new_zeroed(&device, 16);
     let weight = Buffer::new_zeroed(&device, 16);
     let mut recorder = ReplayRecorder::new(stream.create_replay_program());
-    recorder.record(ReplayOp::residual_add(residual_add.invoke(
+    recorder.record(ReplayOp::residual_add(residual_add.invoke_values(
         residual_add::Shape { num_values: hidden_dim },
         residual_add::Buffers {
             lhs: &lhs,
@@ -650,6 +656,7 @@ fn test_unrelated_rms_norm_input_disables_fusion() {
 
     recorder.record(ReplayOp::rms_norm(rms_norm.invoke(
         rms_norm::Shape { num_total_tokens: 1 },
+        ReplayU32::Fixed(1),
         rms_norm::Buffers {
             input: &unrelated_norm_input,
             weight: &weight,
@@ -678,6 +685,7 @@ fn test_pending_non_residual() {
         rms_norm::Shape {
             num_total_tokens: tokens as u32,
         },
+        ReplayU32::Fixed(tokens as u32),
         rms_norm::Buffers {
             input: &first_input,
             weight: &weight,
@@ -688,6 +696,7 @@ fn test_pending_non_residual() {
         rms_norm::Shape {
             num_total_tokens: tokens as u32,
         },
+        ReplayU32::Fixed(tokens as u32),
         rms_norm::Buffers {
             input: &second_input,
             weight: &weight,

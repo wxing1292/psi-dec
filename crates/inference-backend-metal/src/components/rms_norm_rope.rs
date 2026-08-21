@@ -292,22 +292,7 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
-        Invocation {
-            constants: self.constants,
-            kernel: &self.kernel,
-            shape,
-            buffers,
-            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
-        }
-    }
-
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        shape: Shape,
-        buffers: Buffers<'a>,
-        num_active_tokens: ReplayU32,
-    ) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>, num_active_tokens: ReplayU32) -> Invocation<'a> {
         Invocation {
             constants: self.constants,
             kernel: &self.kernel,
@@ -411,6 +396,7 @@ mod tests {
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
+    use crate::metal::ReplayU32;
     use crate::metal::Stream;
 
     #[test]
@@ -478,6 +464,7 @@ mod tests {
                 flat_token_indices: &flat_token_indices,
                 output: &output,
             },
+            ReplayU32::Fixed(shape.num_total_tokens),
         ));
         stream.submit_replay(&builder.build()).wait();
 
@@ -530,6 +517,7 @@ mod tests {
                 flat_token_indices: &flat_token_indices,
                 output: &output,
             },
+            ReplayU32::Fixed(shape.num_total_tokens),
         ));
         stream.submit_replay(&builder.build()).wait();
 

@@ -9,6 +9,7 @@ use inference_backend_metal::components::gdn::compute as backend_compute;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 
 const GDN_CASES: [(u32, u32); 4] = [(1, 1), (4, 1), (1, 16), (4, 4)];
@@ -197,7 +198,12 @@ fn build_gdn_with_state_replay(
     buffers: backend_compute::Buffers<'_>,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke(shape, buffers));
+    builder.record(kernels.invoke(
+        shape,
+        buffers,
+        ReplayU32::Fixed(shape.num_total_reqs),
+        ReplayU32::Fixed(shape.num_total_tokens),
+    ));
     builder.build()
 }
 
@@ -208,7 +214,12 @@ fn build_gdn_forward_candidate_state_update_replay(
     buffers: backend_compute::Buffers<'_>,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_with_candidate_state_update(shape, buffers));
+    builder.record(kernels.invoke_with_candidate_state_update(
+        shape,
+        buffers,
+        ReplayU32::Fixed(shape.num_total_reqs),
+        ReplayU32::Fixed(shape.num_total_tokens),
+    ));
     builder.build()
 }
 

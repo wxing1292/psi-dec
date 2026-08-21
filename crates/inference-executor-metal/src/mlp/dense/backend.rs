@@ -78,23 +78,15 @@ impl ReplayLayer for DenseMLP {
             gate_up: input.scratch.gate_up,
             swiglu: input.scratch.swiglu,
         };
-        let invocation = match input.num_active_tokens {
-            ReplayU32::Fixed(num_active_tokens) => {
-                assert_eq!(num_active_tokens, input.num_total_tokens);
-                self.compute.invoke(
-                    dense_mlp::Shape {
-                        num_total_tokens: input.num_total_tokens,
-                    },
-                    buffers,
-                    scratch,
-                    input.weights,
-                )
+        let invocation = self.compute.invoke(
+            dense_mlp::Shape {
+                num_total_tokens: input.num_total_tokens,
             },
-            ReplayU32::Parameter(key) => {
-                self.compute
-                    .invoke_bucketed(input.num_total_tokens, key, buffers, scratch, input.weights)
-            },
-        };
+            input.num_active_tokens,
+            buffers,
+            scratch,
+            input.weights,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         input.next_hidden_state
     }

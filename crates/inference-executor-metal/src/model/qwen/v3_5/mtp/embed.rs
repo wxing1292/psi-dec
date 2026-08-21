@@ -229,39 +229,20 @@ impl Qwen35MTPEmbed {
             },
         )));
         let projection_weights = self.projection_weights();
-        let invocation = match num_active_tokens {
-            ReplayU32::Fixed(value) => {
-                self.fc.invoke(
-                    value.try_into().expect("qwen3.5 MTP token count must fit i32"),
-                    output,
-                    0,
-                    &self.fused_input,
-                    0,
-                    &projection_weights.weight,
-                    0,
-                    &projection_weights.scales,
-                    0,
-                    &projection_weights.biases,
-                    0,
-                )
-            },
-            ReplayU32::Parameter(key) => {
-                self.fc.invoke_bucketed(
-                    num_total_tokens,
-                    key,
-                    output,
-                    0,
-                    &self.fused_input,
-                    0,
-                    &projection_weights.weight,
-                    0,
-                    &projection_weights.scales,
-                    0,
-                    &projection_weights.biases,
-                    0,
-                )
-            },
-        };
+        let invocation = self.fc.invoke(
+            num_total_tokens,
+            num_active_tokens,
+            output,
+            0,
+            &self.fused_input,
+            0,
+            &projection_weights.weight,
+            0,
+            &projection_weights.scales,
+            0,
+            &projection_weights.biases,
+            0,
+        );
         recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         output
     }

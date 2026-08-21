@@ -91,13 +91,13 @@ fn test_bucketed_replay_matches_active_prefix_and_preserves_output_tail() {
     let scratch = Scratch::new(&device, config, shape);
     let kernels = Compute::new(&device, config, fixture_execution(config), shape);
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map_bucketed(
+    builder.record(kernels.invoke_map(
         scratch.map_buffers(&q_buffer, &kv_pages_buffer, &req_slots, &page_ids, &task_templates),
         ReplayU32::Fixed(0),
         ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
         ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
     ));
-    builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
+    builder.record_with_barrier_before(kernels.invoke_reduce(
         scratch.reduce_buffers(&cu_partial_outputs, &output),
         ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
     ));
@@ -323,9 +323,13 @@ fn run_gqa_split_kv_single_q(config: Config, shape: Shape, input: TestInput<'_>)
     builder.record(kernels.invoke_map(
         scratch.map_buffers(&q, &kv_pages, &req_slots, &page_ids, &sdpa_map_task_templates),
         ReplayU32::Fixed(0),
+        ReplayU32::Fixed(shape.num_total_tokens),
+        ReplayU32::Fixed(shape.num_total_sdpa_map_task_templates),
     ));
-    builder
-        .record_with_barrier_before(kernels.invoke_reduce(scratch.reduce_buffers(&cu_sdpa_partial_outputs, &output)));
+    builder.record_with_barrier_before(kernels.invoke_reduce(
+        scratch.reduce_buffers(&cu_sdpa_partial_outputs, &output),
+        ReplayU32::Fixed(shape.num_total_tokens),
+    ));
     let replay = builder.build();
     stream.submit_replay(&replay).wait();
     output.read_typed::<f32>(0, config.num_output_values(shape))

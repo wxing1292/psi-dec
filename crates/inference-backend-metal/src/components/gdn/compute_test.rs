@@ -195,6 +195,8 @@ fn test_shape_rejects_shader_count_overflow() {
             recurrent_output: &buffer,
             norm_gated_output: &buffer,
         },
+        ReplayU32::Fixed(shape.num_total_reqs),
+        ReplayU32::Fixed(shape.num_total_tokens),
     ));
 }
 
@@ -495,7 +497,12 @@ fn test_candidate_state_preserves_distinct_source_slots() {
         norm_gated_output: &norm_gated_output,
     };
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_with_candidate_state_update(shape, buffers));
+    builder.record(kernels.invoke_with_candidate_state_update(
+        shape,
+        buffers,
+        ReplayU32::Fixed(shape.num_total_reqs),
+        ReplayU32::Fixed(shape.num_total_tokens),
+    ));
     stream.submit_replay(&builder.build()).wait();
 
     let actual_conv_qkv = conv_qkv.read_typed::<f32>(0, config.num_qkv_values(shape));
@@ -634,7 +641,7 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
     let norm_gated_output =
         Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
     let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_with_candidate_state_update_bucketed(
+    builder.record(kernels.invoke_with_candidate_state_update(
         shape,
         Buffers {
             qkv: &qkv,
@@ -1052,6 +1059,8 @@ fn test_candidate_states_above_u32_byte_offset() {
             recurrent_output: &recurrent_output,
             norm_gated_output: &norm_gated_output,
         },
+        ReplayU32::Fixed(shape.num_total_reqs),
+        ReplayU32::Fixed(shape.num_total_tokens),
     ));
     stream.submit_replay(&builder.build()).wait();
 
@@ -1198,6 +1207,8 @@ fn run_gdn_core(
             recurrent_output: &recurrent_output,
             norm_gated_output: &norm_gated_output,
         },
+        ReplayU32::Fixed(shape.num_total_reqs),
+        ReplayU32::Fixed(shape.num_total_tokens),
     ));
     let replay = builder.build();
     stream.submit_replay(&replay).wait();
@@ -1297,7 +1308,12 @@ fn run_gdn_core_with_candidate_state_update(
         recurrent_output: &recurrent_output,
         norm_gated_output: &norm_gated_output,
     };
-    builder.record(kernels.invoke_with_candidate_state_update(shape, core));
+    builder.record(kernels.invoke_with_candidate_state_update(
+        shape,
+        core,
+        ReplayU32::Fixed(shape.num_total_reqs),
+        ReplayU32::Fixed(shape.num_total_tokens),
+    ));
     let replay = builder.build();
     stream.submit_replay(&replay).wait();
 
