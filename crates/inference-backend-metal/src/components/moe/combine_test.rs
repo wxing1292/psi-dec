@@ -12,15 +12,15 @@ use crate::metal::Stream;
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.moe.combine.num_active_tokens");
 
 #[test]
-fn test_specialization_has_explicit_thread_block_scope() {
-    let specialization = MoECombineKernelSpecialization::current();
-    assert_eq!(specialization.thread_block.required_threads, 256);
+fn test_constants_have_explicit_thread_block_scope() {
+    let constants = KernelConstants::current();
+    assert_eq!(constants.thread_block.required_threads, 256);
 }
 
 #[test]
 #[should_panic(expected = "MoE combine output elements exceeds the shader u32 count domain")]
 fn test_shape_rejects_shader_count_overflow() {
-    MoECombineConfig::bf16(1, 4).validate_shape(MoECombineShape {
+    Config::bf16(1, 4).validate_shape(Shape {
         num_total_tokens: 1 << 30,
     });
 }
@@ -29,8 +29,8 @@ fn test_shape_rejects_shader_count_overflow() {
 fn test_without_shared_experts_fixed() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoECombineConfig::bf16(2, 3);
-    let shape = MoECombineShape { num_total_tokens: 2 };
+    let config = Config::bf16(2, 3);
+    let shape = Shape { num_total_tokens: 2 };
     let routed_hidden_values = [
         1.0, 2.0, 3.0, //
         4.0, 5.0, 6.0, //
@@ -41,12 +41,12 @@ fn test_without_shared_experts_fixed() {
     let routed_hidden = bf16_buffer(&device, &routed_hidden_values);
     let routed_probs = Buffer::from_slice(&device, &routed_probs_values);
     let output = Buffer::new_zeroed(&device, config.output_bytes(shape));
-    let kernels = MoECombineKernels::new(&device, config);
+    let kernels = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_without_shared_experts(
         shape,
-        MoECombineWithoutSharedExpertsBuffers {
+        WithoutSharedExpertsBuffers {
             routed_hidden: &routed_hidden,
             routed_probs: &routed_probs,
             output: &output,
@@ -66,8 +66,8 @@ fn test_without_shared_experts_fixed() {
 fn test_with_shared_experts_fixed() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoECombineConfig::bf16(2, 3);
-    let shape = MoECombineShape { num_total_tokens: 2 };
+    let config = Config::bf16(2, 3);
+    let shape = Shape { num_total_tokens: 2 };
     let routed_hidden_values = [
         1.0, 2.0, 3.0, //
         4.0, 5.0, 6.0, //
@@ -82,12 +82,12 @@ fn test_with_shared_experts_fixed() {
     let shared_hidden = bf16_buffer(&device, &shared_hidden_values);
     let shared_expert_gate_logits = bf16_buffer(&device, &shared_expert_gate_logits_values);
     let output = Buffer::new_zeroed(&device, config.output_bytes(shape));
-    let kernels = MoECombineKernels::new(&device, config);
+    let kernels = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_with_shared_experts(
         shape,
-        MoECombineWithSharedExpertsBuffers {
+        WithSharedExpertsBuffers {
             routed_hidden: &routed_hidden,
             routed_probs: &routed_probs,
             shared_hidden: &shared_hidden,
@@ -116,8 +116,8 @@ fn test_with_shared_experts_fixed() {
 fn test_with_shared_experts_random() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoECombineConfig::bf16(3, 5);
-    let shape = MoECombineShape { num_total_tokens: 3 };
+    let config = Config::bf16(3, 5);
+    let shape = Shape { num_total_tokens: 3 };
     let random_seed = 0xC461_8E2B;
     let routed_hidden_values = generated_values(
         shape.num_total_tokens as usize * config.num_experts_per_token as usize * config.hidden_dim as usize,
@@ -139,12 +139,12 @@ fn test_with_shared_experts_random() {
     let shared_hidden = bf16_buffer(&device, &shared_hidden_values);
     let shared_expert_gate_logits = bf16_buffer(&device, &shared_expert_gate_logits_values);
     let output = Buffer::new_zeroed(&device, config.output_bytes(shape));
-    let kernels = MoECombineKernels::new(&device, config);
+    let kernels = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_with_shared_experts(
         shape,
-        MoECombineWithSharedExpertsBuffers {
+        WithSharedExpertsBuffers {
             routed_hidden: &routed_hidden,
             routed_probs: &routed_probs,
             shared_hidden: &shared_hidden,
@@ -183,8 +183,8 @@ fn test_bucketed_capacity_is_reusable_with_and_without_shared_experts() {
 fn run_bucketed_capacity_case(with_shared_experts: bool) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoECombineConfig::bf16(2, 3);
-    let shape = MoECombineShape { num_total_tokens: 4 };
+    let config = Config::bf16(2, 3);
+    let shape = Shape { num_total_tokens: 4 };
     let num_total_tokens = shape.num_total_tokens as usize;
     let num_active_tokens = 3_usize;
     let topk = config.num_experts_per_token as usize;
@@ -211,13 +211,13 @@ fn run_bucketed_capacity_case(with_shared_experts: bool) {
     let gate_logits = bf16_buffer(&device, &active_gate_logits);
     let output_sentinel = bf16::from_f32(91.0).to_bits();
     let output = Buffer::from_slice(&device, &vec![output_sentinel; num_total_tokens * hidden_dim]);
-    let kernels = MoECombineKernels::new(&device, config);
+    let kernels = Compute::new(&device, config);
     let mut builder = stream.create_replay_program();
     if with_shared_experts {
         builder.record(kernels.invoke_with_shared_experts_bucketed(
             shape,
             NUM_ACTIVE_TOKENS,
-            MoECombineWithSharedExpertsBuffers {
+            WithSharedExpertsBuffers {
                 routed_hidden: &routed_hidden,
                 routed_probs: &routed_probs,
                 shared_hidden: &shared_hidden,
@@ -229,7 +229,7 @@ fn run_bucketed_capacity_case(with_shared_experts: bool) {
         builder.record(kernels.invoke_without_shared_experts_bucketed(
             shape,
             NUM_ACTIVE_TOKENS,
-            MoECombineWithoutSharedExpertsBuffers {
+            WithoutSharedExpertsBuffers {
                 routed_hidden: &routed_hidden,
                 routed_probs: &routed_probs,
                 output: &output,

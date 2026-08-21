@@ -5,12 +5,7 @@ use inference_executor_core::mlp::moe::reference::moe_combine_without_shared_exp
 use inference_executor_core::mlp::moe::reference::quantized_sparse_mlp_reference;
 
 use super::*;
-use crate::components::MoEExpertMajorConfig;
-use crate::components::MoEExpertMajorKernels;
-use crate::components::MoEExpertMajorLayoutBuffers;
-use crate::components::MoEExpertMajorPackInputBuffers;
-use crate::components::MoEExpertMajorScatterWithoutSharedExpertsBuffers;
-use crate::components::MoEExpertMajorShape;
+use crate::components::moe::expert_major;
 use crate::metal::Buffer;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayProgram;
@@ -416,8 +411,8 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     let num_tokens = 3_u32;
     let num_experts_per_token = 2_u32;
     let num_routes = num_tokens * num_experts_per_token;
-    let layout_config = MoEExpertMajorConfig::bf16(num_experts, num_experts_per_token, config.hidden_dim);
-    let layout_shape = MoEExpertMajorShape {
+    let layout_config = expert_major::Config::bf16(num_experts, num_experts_per_token, config.hidden_dim);
+    let layout_shape = expert_major::Shape {
         num_total_tokens: num_tokens,
     };
     let sparse_shape = ExpertMajorShape {
@@ -497,7 +492,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     let down_scales = bf16_buffer(&device, &down_scale_values);
     let down_biases = bf16_buffer(&device, &down_bias_values);
 
-    let layout = MoEExpertMajorKernels::new(&device, layout_config);
+    let layout = expert_major::Compute::new(&device, layout_config);
     let sparse_mlp = Compute::new(&device, config);
     let weights = Weights {
         gate_weight: &gate_weight,
@@ -513,7 +508,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     let mut builder = stream.create_replay_program();
     builder.record(layout.invoke_layout(
         layout_shape,
-        MoEExpertMajorLayoutBuffers {
+        expert_major::LayoutBuffers {
             expert_indices: &expert_indices,
             expert_counts: &expert_counts,
             expert_offsets: &expert_offsets,
@@ -525,7 +520,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     ));
     builder.record_with_barrier_before(layout.invoke_pack_input(
         layout_shape,
-        MoEExpertMajorPackInputBuffers {
+        expert_major::PackInputBuffers {
             input: &input,
             routes_by_expert: &routes_by_expert,
             packed_input: &packed_input,
@@ -543,7 +538,7 @@ fn assert_expert_major_pipeline_matches_reference(random_seed: u32) {
     ));
     builder.record_with_barrier_before(layout.invoke_scatter_without_shared_experts(
         layout_shape,
-        MoEExpertMajorScatterWithoutSharedExpertsBuffers {
+        expert_major::ScatterWithoutSharedExpertsBuffers {
             packed_output: &packed_output,
             routes_by_token: &routes_by_token,
             routed_probs: &routed_probs,

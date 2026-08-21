@@ -1,7 +1,7 @@
 # MoE Executor
 
 This document describes the current MoE implementation.
-It covers routing, compute-path selection, expert execution, shared-expert composition, tests, and production
+It covers routing, execution-variant selection, expert execution, shared-expert composition, tests, and production
 benchmarks.
 
 ## Source layout
@@ -42,12 +42,14 @@ Reusable Metal MoE / sparse expert kernels live in:
 
 ```text
 crates/inference-backend-metal/src/components/
-  moe_routing.rs
-  moe_routing_test.rs
-  moe_expert_major.rs
-  moe_expert_major_test.rs
-  moe_combine.rs
-  moe_combine_test.rs
+  moe/
+    mod.rs
+    routing.rs
+    routing_test.rs
+    expert_major.rs
+    expert_major_test.rs
+    combine.rs
+    combine_test.rs
   sparse_mlp.rs
   sparse_mlp_test.rs
 ```
@@ -94,7 +96,7 @@ shared expert + shared gate
 combine/scatter with shared contribution
 ```
 
-Current MoE replay records dispatch/layout as part of the selected token-major or expert-major compute path.
+Current MoE replay records dispatch/layout as part of the selected token-major or expert-major execution variant.
 The scheduler does not own a separate dispatch phase.
 Model and layer wiring treat the full MoE MLP as one component boundary in a larger layer/model ICB.
 The MoE backend records internal barriers where commands have RAW dependencies.
@@ -139,7 +141,7 @@ The map must be empty after the complete MoE owner is constructed.
 
 `components::sparse_mlp::Compute` remains a lower-level expert compute component.
 It exposes token-major and expert-major sparse expert MLP compute.
-It does not own routing, dispatch, combine, shared-expert work, or compute-path selection.
+It does not own routing, dispatch, combine, shared-expert work, or execution-variant selection.
 
 Its token-major shape is `{ num_routes, num_tokens }`.
 Its expert-major shape is `{ num_routes }`.
@@ -196,7 +198,7 @@ hidden_state
 MoE routing is a two-stage contract.
 The router projection writes bf16 logits.
 The softmax operator writes a bf16 `router_probs` buffer over all experts.
-`MoERoutingKernel` selects top-k experts from `router_probs`.
+`moe::routing::Compute` selects top-k experts from `router_probs`.
 The routing kernel does not read router logits.
 Only the softmax operator reads the logits.
 
@@ -209,7 +211,7 @@ The routing kernel renormalizes selected probabilities only when `norm_topk_prob
 ```text
 num_tokens              current microbatch token count
 num_routes              num_tokens * num_experts_per_token
-compute path            selected from num_tokens
+execution variant       selected from num_tokens
 ```
 
 The backend also has an additive full-MoE bucketed replay API:
@@ -239,8 +241,8 @@ Each route-based command derives
 `num_active_routes = num_active_tokens * num_experts_per_token` from the active token count and fixed top-k value.
 
 The fixed total token count determines the full command topology.
-The active token count does not select a compute path or affine kernel.
-`GatedMoEReplayTopology` identifies the selected compute path, router affine topology, optional shared-gate affine
+The active token count does not select an execution variant or affine kernel.
+`GatedMoEReplayTopology` identifies the selected variant key, router affine topology, optional shared-gate affine
 topology, and optional shared dense MLP gate-up/down topology.
 `GatedMoE::replay_topology_boundaries()` returns the union of:
 
@@ -293,10 +295,10 @@ The full bucketed composition also uses this routing chain with the same active-
 The ragged expert-major layout, pack, and scatter leaf also has additive bucket-readiness APIs:
 
 ```text
-MoEExpertMajorKernels::invoke_layout_bucketed(...)
-MoEExpertMajorKernels::invoke_pack_input_bucketed(...)
-MoEExpertMajorKernels::invoke_scatter_without_shared_experts_bucketed(...)
-MoEExpertMajorKernels::invoke_scatter_with_shared_experts_bucketed(...)
+moe::expert_major::Compute::invoke_layout_bucketed(...)
+moe::expert_major::Compute::invoke_pack_input_bucketed(...)
+moe::expert_major::Compute::invoke_scatter_without_shared_experts_bucketed(...)
+moe::expert_major::Compute::invoke_scatter_with_shared_experts_bucketed(...)
 ```
 
 Each API records a fixed `num_total_tokens` capacity and a fixed `num_experts_per_token` value.
@@ -354,11 +356,11 @@ The full bucketed `GatedMoE` replay composes the selected leaf path.
 The token-major combine leaf also has additive bucket-readiness APIs:
 
 ```text
-MoECombineKernels::invoke_without_shared_experts_bucketed(...)
-MoECombineKernels::invoke_with_shared_experts_bucketed(...)
+moe::combine::Compute::invoke_without_shared_experts_bucketed(...)
+moe::combine::Compute::invoke_with_shared_experts_bucketed(...)
 ```
 
-Both APIs record a fixed `num_total_tokens` capacity in `MoECombineShape`.
+Both APIs record a fixed `num_total_tokens` capacity in `moe::combine::Shape`.
 The caller supplies `num_active_tokens` through one `ReplayParameterKey`.
 The total token count determines the dispatch grid and the required routed, probability, shared-branch, and output
 buffer capacities.
@@ -374,10 +376,11 @@ policy.
 The full bucketed `GatedMoE` replay composes these leaf APIs on the token-major path.
 
 The current routing kernel supports at most 256 experts and at most 16 selected experts per token.
-`MoERoutingShape::validate()` treats other shapes as internal contract violations and panics.
+`moe::routing::Shape::validate()` treats other shapes as internal contract violations and panics.
 
 Production callers may allocate scratch with the executor's maximum token capacity.
-The pure `GatedMoEComputePath::select(...)` helper selects the path from the current `num_tokens`.
+The private `Selector::select(&Registry, ...)` operation selects a registered execution variant from the current
+`num_tokens`.
 A bucketed replay selects it from `num_total_tokens`.
 Each path validates that buffers cover its recorded total route, input, scratch, and output shapes.
 The token-major path consumes `token_indices` and `route_indices` directly.
@@ -420,7 +423,7 @@ Both branches read the same normalized hidden input.
 They write disjoint scratch buffers and join only at final combine/scatter.
 Recommendation: Do not insert a barrier between these branches unless they share a buffer.
 
-`MoEExpertMajorKernels` represents ragged expert-major MoE dispatch.
+`moe::expert_major::Compute` represents ragged expert-major MoE dispatch.
 It groups routes by expert in a compact route buffer.
 It packs token hidden states and runs route-major sparse expert compute.
 It then inverse-scatters the results to token-major output.
@@ -587,18 +590,23 @@ Recommendation: Add replay barriers only at these actual dependencies:
 MoE has one semantic owner and two complete command-graph decompositions:
 
 ```text
-GatedMoEComputePath::select
-    -> GatedMoEComputePath::TokenMajor
+Registry
+  Vec<(VariantKey, Variant)>
+    TokenMajor  -> owns moe::combine::Compute
+    ExpertMajor -> owns moe::expert_major::Compute
+
+Selector::select(&Registry, GatedMoEReplayShape)
+    -> (VariantKey::TokenMajor, &Variant::TokenMajor)
     |      routing -> token-major sparse expert MLP -> combine
     |
-    -> GatedMoEComputePath::ExpertMajor
+    -> (VariantKey::ExpertMajor, &Variant::ExpertMajor)
            routing -> layout -> pack -> expert-major sparse MLP -> scatter
 ```
 
-`GatedMoEComputePath` remains the replay-topology identity because it names a different command graph. Its pure
-`select(...)` helper is the only owner of the token-count threshold. Topology reporting, exact recording, and bucketed
-recording call the same helper. Repeating this inexpensive calculation is intentional. The component does not
-materialize a plan object.
+`VariantKey` is the replay-topology identity because it names a different command graph. `Variant` owns the
+compiled resources that are unique to that graph. The private `Selector` is the only owner of the token-count
+threshold. Topology reporting, exact recording, and bucketed recording call the same selector. Repeating this
+inexpensive calculation is intentional. The component does not materialize a plan object.
 
 Each non-persistent leaf kernel defines its own task:
 
@@ -613,9 +621,9 @@ Each non-persistent leaf kernel defines its own task:
 | Token-major combine | A bounded `(token, hidden)` output range. |
 | Expert-major scatter | A bounded `(token, hidden)` output range. |
 
-The current routing specialization requires 256 threads. The expert-major clear, count, scatter, pack, and output
+The current routing kernel constants require 256 threads. The expert-major clear, count, scatter, pack, and output
 phases also require 256 threads. The current prefix phase requires one thread. These values belong to phase-scoped
-thread-block specializations. They are not dynamic workload fields.
+thread-block constants. They are not dynamic workload fields.
 
 `sparse_mlp::Compute` exposes token-major and expert-major entry points. These entry points are explicit layouts chosen
 by the MoE owner. The sparse MLP leaf does not run another path selector. Its gather-affine and ragged expert-major
@@ -623,7 +631,7 @@ affine kernels own their matrix tiles and thread ownership.
 
 ### Backend selection boundary
 
-`GatedMoE` owns compute-path selection through `GatedMoEComputePath::select(...)`.
+`GatedMoE` owns execution-variant selection through its private `Registry` and `Selector`.
 `sparse_mlp::Compute` owns only expert inner compute.
 The current production selector is:
 

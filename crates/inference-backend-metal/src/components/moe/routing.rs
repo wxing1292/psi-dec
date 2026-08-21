@@ -8,22 +8,22 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
-const MOE_ROUTING_SOURCE: &str = include_str!("metal/moe_routing.metal");
+const MOE_ROUTING_SOURCE: &str = include_str!("../metal/moe_routing.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MoERoutingThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MoERoutingKernelSpecialization {
-    thread_block: MoERoutingThreadBlockSpecialization,
+struct KernelConstants {
+    thread_block: ThreadBlockConstants,
 }
 
-impl MoERoutingKernelSpecialization {
+impl KernelConstants {
     fn current() -> Self {
         Self {
-            thread_block: MoERoutingThreadBlockSpecialization { required_threads: 256 },
+            thread_block: ThreadBlockConstants { required_threads: 256 },
         }
     }
 }
@@ -34,13 +34,13 @@ impl MoERoutingKernelSpecialization {
 /// experts by the bf16 softmax probabilities and optionally renormalizes the
 /// selected probabilities across the top-k set.
 #[derive(Clone, Copy, Debug)]
-pub struct MoERoutingConfig {
+pub struct Config {
     pub num_experts: u32,
     pub num_experts_per_token: u32,
     pub norm_topk_prob: bool,
 }
 
-impl MoERoutingConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.num_experts > 0);
         assert!(self.num_experts <= 256, "MoE routing supports at most 256 experts");
@@ -52,7 +52,7 @@ impl MoERoutingConfig {
         );
     }
 
-    pub fn num_routes(self, shape: MoERoutingShape) -> usize {
+    pub fn num_routes(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         checked_product(
@@ -61,7 +61,7 @@ impl MoERoutingConfig {
         )
     }
 
-    fn num_router_prob_elements(self, shape: MoERoutingShape) -> usize {
+    fn num_router_prob_elements(self, shape: Shape) -> usize {
         self.validate();
         shape.validate();
         checked_product(
@@ -70,28 +70,28 @@ impl MoERoutingConfig {
         )
     }
 
-    pub fn validate_shape(self, shape: MoERoutingShape) {
+    pub fn validate_shape(self, shape: Shape) {
         self.validate();
         shape.validate();
         assert_u32_index_domain(self.num_router_prob_elements(shape), "MoE routing probability elements");
         assert_u32_index_domain(self.num_routes(shape), "MoE routing routes");
     }
 
-    pub fn router_probs_bytes(self, shape: MoERoutingShape) -> usize {
+    pub fn router_probs_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE routing probability byte length",
             &[self.num_router_prob_elements(shape), size_of::<u16>()],
         )
     }
 
-    pub fn expert_indices_bytes(self, shape: MoERoutingShape) -> usize {
+    pub fn expert_indices_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE routing expert-index byte length",
             &[self.num_routes(shape), size_of::<u32>()],
         )
     }
 
-    pub fn expert_probs_bytes(self, shape: MoERoutingShape) -> usize {
+    pub fn expert_probs_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE routing expert-probability byte length",
             &[self.num_routes(shape), size_of::<f32>()],
@@ -100,40 +100,40 @@ impl MoERoutingConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MoERoutingShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl MoERoutingShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_tokens > 0);
     }
 }
 
-pub struct MoERoutingBuffers<'a> {
+pub struct Buffers<'a> {
     pub router_probs: &'a Buffer,
     pub expert_indices: &'a Buffer,
     pub expert_probs: &'a Buffer,
 }
 
-pub struct MoERoutingKernel {
-    config: MoERoutingConfig,
-    specialization: MoERoutingKernelSpecialization,
+pub struct Compute {
+    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl MoERoutingKernel {
-    pub fn new(device: &crate::metal::Device, config: MoERoutingConfig) -> Self {
+impl Compute {
+    pub fn new(device: &crate::metal::Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
-            specialization: MoERoutingKernelSpecialization::current(),
+            constants: KernelConstants::current(),
             kernel: Kernel::new(device, MOE_ROUTING_SOURCE, "moe_route_topk"),
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: MoERoutingShape, buffers: MoERoutingBuffers<'a>) -> MoERoutingInvocation<'a> {
-        MoERoutingInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             kernel: self,
             shape,
             buffers,
@@ -144,11 +144,11 @@ impl MoERoutingKernel {
     /// Records a fixed-capacity grid whose active token count is supplied at submission.
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: MoERoutingShape,
+        shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: MoERoutingBuffers<'a>,
-    ) -> MoERoutingInvocation<'a> {
-        MoERoutingInvocation {
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             kernel: self,
             shape,
             buffers,
@@ -157,14 +157,14 @@ impl MoERoutingKernel {
     }
 }
 
-pub struct MoERoutingInvocation<'a> {
-    kernel: &'a MoERoutingKernel,
-    shape: MoERoutingShape,
-    buffers: MoERoutingBuffers<'a>,
+pub struct Invocation<'a> {
+    kernel: &'a Compute,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for MoERoutingInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.kernel.config.validate_shape(self.shape);
         debug_validate_buffers(self.kernel.config, self.shape, &self.buffers);
@@ -181,17 +181,17 @@ impl Operator for MoERoutingInvocation<'_> {
         recorder.set_u32(6, u32::from(self.kernel.config.norm_topk_prob));
         recorder.dispatch_threadblocks(
             (self.shape.num_total_tokens as usize, 1, 1),
-            (self.kernel.specialization.thread_block.required_threads as usize, 1, 1),
+            (self.kernel.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-fn debug_validate_buffers(config: MoERoutingConfig, shape: MoERoutingShape, buffers: &MoERoutingBuffers<'_>) {
+fn debug_validate_buffers(config: Config, shape: Shape, buffers: &Buffers<'_>) {
     #[cfg(debug_assertions)]
     validate_buffers(config, shape, buffers);
 }
 
-fn validate_buffers(config: MoERoutingConfig, shape: MoERoutingShape, buffers: &MoERoutingBuffers<'_>) {
+fn validate_buffers(config: Config, shape: Shape, buffers: &Buffers<'_>) {
     let router_probs_bytes = config.router_probs_bytes(shape);
     let expert_indices_bytes = config.expert_indices_bytes(shape);
     let expert_probs_bytes = config.expert_probs_bytes(shape);
@@ -216,5 +216,5 @@ fn validate_buffers(config: MoERoutingConfig, shape: MoERoutingShape, buffers: &
 }
 
 #[cfg(test)]
-#[path = "moe_routing_test.rs"]
+#[path = "routing_test.rs"]
 mod tests;

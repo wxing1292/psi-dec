@@ -13,20 +13,20 @@ const U32_CANARY: u32 = 0xA5A5_5A5A;
 const BF16_CANARY: u16 = 0x42B6;
 
 #[test]
-fn test_specializations_have_phase_scoped_thread_blocks() {
-    let specializations = MoEExpertMajorKernelSpecializations::current();
-    assert_eq!(specializations.layout_clear.required_threads, 256);
-    assert_eq!(specializations.layout_count.required_threads, 256);
-    assert_eq!(specializations.layout_prefix.required_threads, 1);
-    assert_eq!(specializations.layout_scatter.required_threads, 256);
-    assert_eq!(specializations.pack_input.required_threads, 256);
-    assert_eq!(specializations.scatter_output.required_threads, 256);
+fn test_constants_have_phase_scoped_thread_blocks() {
+    let constants = KernelConstants::current();
+    assert_eq!(constants.layout_clear.required_threads, 256);
+    assert_eq!(constants.layout_count.required_threads, 256);
+    assert_eq!(constants.layout_prefix.required_threads, 1);
+    assert_eq!(constants.layout_scatter.required_threads, 256);
+    assert_eq!(constants.pack_input.required_threads, 256);
+    assert_eq!(constants.scatter_output.required_threads, 256);
 }
 
 #[test]
 #[should_panic(expected = "MoE expert-major routed-hidden elements exceeds the shader u32 count domain")]
 fn test_shape_rejects_shader_count_overflow() {
-    MoEExpertMajorConfig::bf16(1, 1, 4).validate_shape(MoEExpertMajorShape {
+    Config::bf16(1, 1, 4).validate_shape(Shape {
         num_total_tokens: 1 << 30,
     });
 }
@@ -35,8 +35,8 @@ fn test_shape_rejects_shader_count_overflow() {
 fn test_layout_pack_scatter() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoEExpertMajorConfig::bf16(6, 3, 3);
-    let shape = MoEExpertMajorShape { num_total_tokens: 4 };
+    let config = Config::bf16(6, 3, 3);
+    let shape = Shape { num_total_tokens: 4 };
     let input_values = [
         1.0, 2.0, 3.0, //
         4.0, 5.0, 6.0, //
@@ -70,12 +70,12 @@ fn test_layout_pack_scatter() {
     let packed_input = Buffer::new_zeroed(&device, config.route_hidden_bytes(shape));
     let output = Buffer::new_zeroed(&device, config.token_hidden_bytes(shape));
     let output_with_shared_experts = Buffer::new_zeroed(&device, config.token_hidden_bytes(shape));
-    let kernels = MoEExpertMajorKernels::new(&device, config);
+    let kernels = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_layout(
         shape,
-        MoEExpertMajorLayoutBuffers {
+        LayoutBuffers {
             expert_indices: &expert_indices,
             expert_counts: &expert_counts,
             expert_offsets: &expert_offsets,
@@ -87,7 +87,7 @@ fn test_layout_pack_scatter() {
     ));
     builder.record_with_barrier_before(kernels.invoke_pack_input(
         shape,
-        MoEExpertMajorPackInputBuffers {
+        PackInputBuffers {
             input: &input,
             routes_by_expert: &routes_by_expert,
             packed_input: &packed_input,
@@ -95,7 +95,7 @@ fn test_layout_pack_scatter() {
     ));
     builder.record_with_barrier_before(kernels.invoke_scatter_without_shared_experts(
         shape,
-        MoEExpertMajorScatterWithoutSharedExpertsBuffers {
+        ScatterWithoutSharedExpertsBuffers {
             packed_output: &packed_input,
             routes_by_token: &routes_by_token,
             routed_probs: &routed_probs,
@@ -104,7 +104,7 @@ fn test_layout_pack_scatter() {
     ));
     builder.record_with_barrier_before(kernels.invoke_scatter_with_shared_experts(
         shape,
-        MoEExpertMajorScatterWithSharedExpertsBuffers {
+        ScatterWithSharedExpertsBuffers {
             packed_output: &packed_input,
             routes_by_token: &routes_by_token,
             routed_probs: &routed_probs,
@@ -203,9 +203,9 @@ struct BucketedWork {
 
 struct BucketedFixture {
     stream: Stream,
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    kernels: MoEExpertMajorKernels,
+    config: Config,
+    shape: Shape,
+    kernels: Compute,
     input: Buffer,
     expert_indices: Buffer,
     routed_probs: Buffer,
@@ -226,12 +226,12 @@ impl BucketedFixture {
     fn new() -> Self {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = MoEExpertMajorConfig::bf16(6, 3, 3);
-        let shape = MoEExpertMajorShape { num_total_tokens: 6 };
+        let config = Config::bf16(6, 3, 3);
+        let shape = Shape { num_total_tokens: 6 };
         let num_total_routes = config.num_routes(shape) as usize;
         let num_total_tokens = shape.num_total_tokens as usize;
         let hidden_dim = config.hidden_dim as usize;
-        let kernels = MoEExpertMajorKernels::new(&device, config);
+        let kernels = Compute::new(&device, config);
         Self {
             input: Buffer::new_zeroed(&device, config.token_hidden_bytes(shape)),
             expert_indices: Buffer::new_zeroed(&device, config.route_indices_bytes(shape)),
@@ -459,8 +459,8 @@ impl BucketedFixture {
         );
     }
 
-    fn layout_buffers(&self) -> MoEExpertMajorLayoutBuffers<'_> {
-        MoEExpertMajorLayoutBuffers {
+    fn layout_buffers(&self) -> LayoutBuffers<'_> {
+        LayoutBuffers {
             expert_indices: &self.expert_indices,
             expert_counts: &self.expert_counts,
             expert_offsets: &self.expert_offsets,
@@ -471,16 +471,16 @@ impl BucketedFixture {
         }
     }
 
-    fn pack_input_buffers(&self) -> MoEExpertMajorPackInputBuffers<'_> {
-        MoEExpertMajorPackInputBuffers {
+    fn pack_input_buffers(&self) -> PackInputBuffers<'_> {
+        PackInputBuffers {
             input: &self.input,
             routes_by_expert: &self.routes_by_expert,
             packed_input: &self.packed_input,
         }
     }
 
-    fn scatter_without_shared_experts_buffers(&self) -> MoEExpertMajorScatterWithoutSharedExpertsBuffers<'_> {
-        MoEExpertMajorScatterWithoutSharedExpertsBuffers {
+    fn scatter_without_shared_experts_buffers(&self) -> ScatterWithoutSharedExpertsBuffers<'_> {
+        ScatterWithoutSharedExpertsBuffers {
             packed_output: &self.packed_input,
             routes_by_token: &self.routes_by_token,
             routed_probs: &self.routed_probs,
@@ -488,8 +488,8 @@ impl BucketedFixture {
         }
     }
 
-    fn scatter_with_shared_experts_buffers(&self) -> MoEExpertMajorScatterWithSharedExpertsBuffers<'_> {
-        MoEExpertMajorScatterWithSharedExpertsBuffers {
+    fn scatter_with_shared_experts_buffers(&self) -> ScatterWithSharedExpertsBuffers<'_> {
+        ScatterWithSharedExpertsBuffers {
             packed_output: &self.packed_input,
             routes_by_token: &self.routes_by_token,
             routed_probs: &self.routed_probs,

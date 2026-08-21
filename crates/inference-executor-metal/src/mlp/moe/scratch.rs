@@ -1,9 +1,6 @@
-use inference_backend_metal::components::MoECombineConfig;
-use inference_backend_metal::components::MoECombineShape;
-use inference_backend_metal::components::MoEExpertMajorConfig;
-use inference_backend_metal::components::MoEExpertMajorShape;
-use inference_backend_metal::components::MoERoutingConfig;
-use inference_backend_metal::components::MoERoutingShape;
+use inference_backend_metal::components::moe::combine;
+use inference_backend_metal::components::moe::expert_major;
+use inference_backend_metal::components::moe::routing;
 use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -98,7 +95,7 @@ impl MoEScratch {
                     .expect("MoE top-k expert count must fit u32"),
             )
             .expect("MoE scratch route capacity must fit u32");
-        let routing_config = MoERoutingConfig {
+        let routing_config = routing::Config {
             num_experts: core.num_experts.try_into().expect("MoE expert count must fit u32"),
             num_experts_per_token: core
                 .num_experts_per_token
@@ -106,27 +103,27 @@ impl MoEScratch {
                 .expect("MoE top-k expert count must fit u32"),
             norm_topk_prob: core.norm_topk_prob,
         };
-        let routing_shape = MoERoutingShape {
+        let routing_shape = routing::Shape {
             num_total_tokens: max_tokens_u32,
         };
         routing_config.validate_shape(routing_shape);
         let router_config = affine_config(core.num_experts, core.hidden_dim, config.router_bits, config);
-        let expert_major_config = MoEExpertMajorConfig::bf16(
+        let expert_major_config = expert_major::Config::bf16(
             core.num_experts.try_into().expect("MoE expert count must fit u32"),
             core.num_experts_per_token
                 .try_into()
                 .expect("MoE top-k expert count must fit u32"),
             core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
         );
-        let expert_major_shape = MoEExpertMajorShape {
+        let expert_major_shape = expert_major::Shape {
             num_total_tokens: max_tokens_u32,
         };
         expert_major_config.validate_shape(expert_major_shape);
-        MoECombineConfig::bf16(
+        combine::Config::bf16(
             expert_major_config.num_experts_per_token,
             expert_major_config.hidden_dim,
         )
-        .validate_shape(MoECombineShape {
+        .validate_shape(combine::Shape {
             num_total_tokens: expert_major_shape.num_total_tokens,
         });
         let sparse_config = sparse_mlp::Config {

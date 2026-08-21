@@ -9,30 +9,30 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
-const MOE_EXPERT_MAJOR_SOURCE: &str = include_str!("metal/moe_expert_major.metal");
+const MOE_EXPERT_MAJOR_SOURCE: &str = include_str!("../metal/moe_expert_major.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MoEExpertMajorThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MoEExpertMajorKernelSpecializations {
-    layout_clear: MoEExpertMajorThreadBlockSpecialization,
-    layout_count: MoEExpertMajorThreadBlockSpecialization,
-    layout_prefix: MoEExpertMajorThreadBlockSpecialization,
-    layout_scatter: MoEExpertMajorThreadBlockSpecialization,
-    pack_input: MoEExpertMajorThreadBlockSpecialization,
-    scatter_output: MoEExpertMajorThreadBlockSpecialization,
+struct KernelConstants {
+    layout_clear: ThreadBlockConstants,
+    layout_count: ThreadBlockConstants,
+    layout_prefix: ThreadBlockConstants,
+    layout_scatter: ThreadBlockConstants,
+    pack_input: ThreadBlockConstants,
+    scatter_output: ThreadBlockConstants,
 }
 
-impl MoEExpertMajorKernelSpecializations {
+impl KernelConstants {
     fn current() -> Self {
-        let elementwise = MoEExpertMajorThreadBlockSpecialization { required_threads: 256 };
+        let elementwise = ThreadBlockConstants { required_threads: 256 };
         Self {
             layout_clear: elementwise,
             layout_count: elementwise,
-            layout_prefix: MoEExpertMajorThreadBlockSpecialization { required_threads: 1 },
+            layout_prefix: ThreadBlockConstants { required_threads: 1 },
             layout_scatter: elementwise,
             pack_input: elementwise,
             scatter_output: elementwise,
@@ -41,14 +41,14 @@ impl MoEExpertMajorKernelSpecializations {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MoEExpertMajorConfig {
+pub struct Config {
     pub num_experts: u32,
     pub num_experts_per_token: u32,
     pub hidden_dim: u32,
     pub dtype: Dtype,
 }
 
-impl MoEExpertMajorConfig {
+impl Config {
     pub fn bf16(num_experts: u32, num_experts_per_token: u32, hidden_dim: u32) -> Self {
         Self {
             num_experts,
@@ -66,7 +66,7 @@ impl MoEExpertMajorConfig {
         assert_eq!(self.dtype, Dtype::Bfloat16);
     }
 
-    pub fn validate_shape(self, shape: MoEExpertMajorShape) {
+    pub fn validate_shape(self, shape: Shape) {
         self.validate();
         shape.validate();
         self.num_routes(shape);
@@ -80,7 +80,7 @@ impl MoEExpertMajorConfig {
         );
     }
 
-    pub fn num_routes(self, shape: MoEExpertMajorShape) -> u32 {
+    pub fn num_routes(self, shape: Shape) -> u32 {
         self.validate();
         shape.validate();
         shape
@@ -89,21 +89,21 @@ impl MoEExpertMajorConfig {
             .expect("MoE expert-major route count must fit u32")
     }
 
-    fn num_route_hidden_elements(self, shape: MoEExpertMajorShape) -> usize {
+    fn num_route_hidden_elements(self, shape: Shape) -> usize {
         checked_product(
             "MoE expert-major routed-hidden element count",
             &[self.num_routes(shape) as usize, self.hidden_dim as usize],
         )
     }
 
-    fn num_token_hidden_elements(self, shape: MoEExpertMajorShape) -> usize {
+    fn num_token_hidden_elements(self, shape: Shape) -> usize {
         checked_product(
             "MoE expert-major token-hidden element count",
             &[shape.num_total_tokens as usize, self.hidden_dim as usize],
         )
     }
 
-    pub fn route_indices_bytes(self, shape: MoEExpertMajorShape) -> usize {
+    pub fn route_indices_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE expert-major route-index byte length",
             &[self.num_routes(shape) as usize, size_of::<u32>()],
@@ -124,28 +124,28 @@ impl MoEExpertMajorConfig {
         )
     }
 
-    pub fn route_probs_bytes(self, shape: MoEExpertMajorShape) -> usize {
+    pub fn route_probs_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE expert-major route-probability byte length",
             &[self.num_routes(shape) as usize, size_of::<f32>()],
         )
     }
 
-    pub fn route_hidden_bytes(self, shape: MoEExpertMajorShape) -> usize {
+    pub fn route_hidden_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE expert-major routed-hidden byte length",
             &[self.num_route_hidden_elements(shape), self.dtype.item_size()],
         )
     }
 
-    pub fn token_hidden_bytes(self, shape: MoEExpertMajorShape) -> usize {
+    pub fn token_hidden_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE expert-major token-hidden byte length",
             &[self.num_token_hidden_elements(shape), self.dtype.item_size()],
         )
     }
 
-    pub fn shared_expert_gate_logits_bytes(self, shape: MoEExpertMajorShape) -> usize {
+    pub fn shared_expert_gate_logits_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE expert-major shared-gate byte length",
             &[shape.num_total_tokens as usize, self.dtype.item_size()],
@@ -154,17 +154,17 @@ impl MoEExpertMajorConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MoEExpertMajorShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl MoEExpertMajorShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_tokens > 0);
     }
 }
 
-pub struct MoEExpertMajorLayoutBuffers<'a> {
+pub struct LayoutBuffers<'a> {
     pub expert_indices: &'a Buffer,
     pub expert_counts: &'a Buffer,
     pub expert_offsets: &'a Buffer,
@@ -174,20 +174,20 @@ pub struct MoEExpertMajorLayoutBuffers<'a> {
     pub experts_by_route: &'a Buffer,
 }
 
-pub struct MoEExpertMajorPackInputBuffers<'a> {
+pub struct PackInputBuffers<'a> {
     pub input: &'a Buffer,
     pub routes_by_expert: &'a Buffer,
     pub packed_input: &'a Buffer,
 }
 
-pub struct MoEExpertMajorScatterWithoutSharedExpertsBuffers<'a> {
+pub struct ScatterWithoutSharedExpertsBuffers<'a> {
     pub packed_output: &'a Buffer,
     pub routes_by_token: &'a Buffer,
     pub routed_probs: &'a Buffer,
     pub output: &'a Buffer,
 }
 
-pub struct MoEExpertMajorScatterWithSharedExpertsBuffers<'a> {
+pub struct ScatterWithSharedExpertsBuffers<'a> {
     pub packed_output: &'a Buffer,
     pub routes_by_token: &'a Buffer,
     pub routed_probs: &'a Buffer,
@@ -196,9 +196,9 @@ pub struct MoEExpertMajorScatterWithSharedExpertsBuffers<'a> {
     pub output: &'a Buffer,
 }
 
-pub struct MoEExpertMajorKernels {
-    config: MoEExpertMajorConfig,
-    specializations: MoEExpertMajorKernelSpecializations,
+pub struct Compute {
+    config: Config,
+    constants: KernelConstants,
     layout_clear: Kernel,
     layout_count: Kernel,
     layout_prefix: Kernel,
@@ -208,12 +208,12 @@ pub struct MoEExpertMajorKernels {
     scatter_with_shared_experts: Kernel,
 }
 
-impl MoEExpertMajorKernels {
-    pub fn new(device: &crate::metal::Device, config: MoEExpertMajorConfig) -> Self {
+impl Compute {
+    pub fn new(device: &crate::metal::Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
-            specializations: MoEExpertMajorKernelSpecializations::current(),
+            constants: KernelConstants::current(),
             layout_clear: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_clear"),
             layout_count: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_count"),
             layout_prefix: Kernel::new(device, MOE_EXPERT_MAJOR_SOURCE, "moe_expert_major_layout_prefix"),
@@ -232,12 +232,8 @@ impl MoEExpertMajorKernels {
         }
     }
 
-    pub fn invoke_layout<'a>(
-        &'a self,
-        shape: MoEExpertMajorShape,
-        buffers: MoEExpertMajorLayoutBuffers<'a>,
-    ) -> MoEExpertMajorLayoutInvocation<'a> {
-        MoEExpertMajorLayoutInvocation {
+    pub fn invoke_layout<'a>(&'a self, shape: Shape, buffers: LayoutBuffers<'a>) -> LayoutInvocation<'a> {
+        LayoutInvocation {
             kernels: self,
             shape,
             buffers,
@@ -248,11 +244,11 @@ impl MoEExpertMajorKernels {
     /// Records a fixed-capacity expert layout whose active route count derives from active tokens.
     pub fn invoke_layout_bucketed<'a>(
         &'a self,
-        shape: MoEExpertMajorShape,
+        shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: MoEExpertMajorLayoutBuffers<'a>,
-    ) -> MoEExpertMajorLayoutInvocation<'a> {
-        MoEExpertMajorLayoutInvocation {
+        buffers: LayoutBuffers<'a>,
+    ) -> LayoutInvocation<'a> {
+        LayoutInvocation {
             kernels: self,
             shape,
             buffers,
@@ -260,12 +256,8 @@ impl MoEExpertMajorKernels {
         }
     }
 
-    pub fn invoke_pack_input<'a>(
-        &'a self,
-        shape: MoEExpertMajorShape,
-        buffers: MoEExpertMajorPackInputBuffers<'a>,
-    ) -> MoEExpertMajorPackInputInvocation<'a> {
-        MoEExpertMajorPackInputInvocation {
+    pub fn invoke_pack_input<'a>(&'a self, shape: Shape, buffers: PackInputBuffers<'a>) -> PackInputInvocation<'a> {
+        PackInputInvocation {
             kernels: self,
             shape,
             buffers,
@@ -276,11 +268,11 @@ impl MoEExpertMajorKernels {
     /// Records a fixed-capacity input pack whose active route count derives from active tokens.
     pub fn invoke_pack_input_bucketed<'a>(
         &'a self,
-        shape: MoEExpertMajorShape,
+        shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: MoEExpertMajorPackInputBuffers<'a>,
-    ) -> MoEExpertMajorPackInputInvocation<'a> {
-        MoEExpertMajorPackInputInvocation {
+        buffers: PackInputBuffers<'a>,
+    ) -> PackInputInvocation<'a> {
+        PackInputInvocation {
             kernels: self,
             shape,
             buffers,
@@ -290,10 +282,10 @@ impl MoEExpertMajorKernels {
 
     pub fn invoke_scatter_without_shared_experts<'a>(
         &'a self,
-        shape: MoEExpertMajorShape,
-        buffers: MoEExpertMajorScatterWithoutSharedExpertsBuffers<'a>,
-    ) -> MoEExpertMajorScatterWithoutSharedExpertsInvocation<'a> {
-        MoEExpertMajorScatterWithoutSharedExpertsInvocation {
+        shape: Shape,
+        buffers: ScatterWithoutSharedExpertsBuffers<'a>,
+    ) -> ScatterWithoutSharedExpertsInvocation<'a> {
+        ScatterWithoutSharedExpertsInvocation {
             kernels: self,
             shape,
             buffers,
@@ -304,11 +296,11 @@ impl MoEExpertMajorKernels {
     /// Records a fixed-capacity scatter whose active token count is supplied at submission.
     pub fn invoke_scatter_without_shared_experts_bucketed<'a>(
         &'a self,
-        shape: MoEExpertMajorShape,
+        shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: MoEExpertMajorScatterWithoutSharedExpertsBuffers<'a>,
-    ) -> MoEExpertMajorScatterWithoutSharedExpertsInvocation<'a> {
-        MoEExpertMajorScatterWithoutSharedExpertsInvocation {
+        buffers: ScatterWithoutSharedExpertsBuffers<'a>,
+    ) -> ScatterWithoutSharedExpertsInvocation<'a> {
+        ScatterWithoutSharedExpertsInvocation {
             kernels: self,
             shape,
             buffers,
@@ -318,10 +310,10 @@ impl MoEExpertMajorKernels {
 
     pub fn invoke_scatter_with_shared_experts<'a>(
         &'a self,
-        shape: MoEExpertMajorShape,
-        buffers: MoEExpertMajorScatterWithSharedExpertsBuffers<'a>,
-    ) -> MoEExpertMajorScatterWithSharedExpertsInvocation<'a> {
-        MoEExpertMajorScatterWithSharedExpertsInvocation {
+        shape: Shape,
+        buffers: ScatterWithSharedExpertsBuffers<'a>,
+    ) -> ScatterWithSharedExpertsInvocation<'a> {
+        ScatterWithSharedExpertsInvocation {
             kernels: self,
             shape,
             buffers,
@@ -332,11 +324,11 @@ impl MoEExpertMajorKernels {
     /// Records a fixed-capacity scatter whose active token count is supplied at submission.
     pub fn invoke_scatter_with_shared_experts_bucketed<'a>(
         &'a self,
-        shape: MoEExpertMajorShape,
+        shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: MoEExpertMajorScatterWithSharedExpertsBuffers<'a>,
-    ) -> MoEExpertMajorScatterWithSharedExpertsInvocation<'a> {
-        MoEExpertMajorScatterWithSharedExpertsInvocation {
+        buffers: ScatterWithSharedExpertsBuffers<'a>,
+    ) -> ScatterWithSharedExpertsInvocation<'a> {
+        ScatterWithSharedExpertsInvocation {
             kernels: self,
             shape,
             buffers,
@@ -345,14 +337,14 @@ impl MoEExpertMajorKernels {
     }
 }
 
-pub struct MoEExpertMajorLayoutInvocation<'a> {
-    kernels: &'a MoEExpertMajorKernels,
-    shape: MoEExpertMajorShape,
-    buffers: MoEExpertMajorLayoutBuffers<'a>,
+pub struct LayoutInvocation<'a> {
+    kernels: &'a Compute,
+    shape: Shape,
+    buffers: LayoutBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for MoEExpertMajorLayoutInvocation<'_> {
+impl Operator for LayoutInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernels.config;
         config.validate_shape(self.shape);
@@ -363,7 +355,7 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         recorder.set_u32(2, config.num_experts);
         recorder.dispatch_1d(
             config.num_experts as usize,
-            self.kernels.specializations.layout_clear.required_threads as usize,
+            self.kernels.constants.layout_clear.required_threads as usize,
         );
 
         recorder.set_kernel(&self.kernels.layout_count);
@@ -375,7 +367,7 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         recorder.set_u32(4, config.num_experts);
         recorder.dispatch_1d(
             config.num_routes(self.shape) as usize,
-            self.kernels.specializations.layout_count.required_threads as usize,
+            self.kernels.constants.layout_count.required_threads as usize,
         );
 
         recorder.set_kernel(&self.kernels.layout_prefix);
@@ -384,7 +376,7 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         recorder.set_buffer_write(1, self.buffers.expert_offsets, 0);
         recorder.set_buffer_write(2, self.buffers.expert_cursors, 0);
         recorder.set_u32(3, config.num_experts);
-        recorder.dispatch_1d(1, self.kernels.specializations.layout_prefix.required_threads as usize);
+        recorder.dispatch_1d(1, self.kernels.constants.layout_prefix.required_threads as usize);
 
         recorder.set_kernel(&self.kernels.layout_scatter);
         recorder.set_barrier_before();
@@ -398,19 +390,19 @@ impl Operator for MoEExpertMajorLayoutInvocation<'_> {
         recorder.set_u32(7, config.num_experts);
         recorder.dispatch_1d(
             config.num_routes(self.shape) as usize,
-            self.kernels.specializations.layout_scatter.required_threads as usize,
+            self.kernels.constants.layout_scatter.required_threads as usize,
         );
     }
 }
 
-pub struct MoEExpertMajorPackInputInvocation<'a> {
-    kernels: &'a MoEExpertMajorKernels,
-    shape: MoEExpertMajorShape,
-    buffers: MoEExpertMajorPackInputBuffers<'a>,
+pub struct PackInputInvocation<'a> {
+    kernels: &'a Compute,
+    shape: Shape,
+    buffers: PackInputBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for MoEExpertMajorPackInputInvocation<'_> {
+impl Operator for PackInputInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernels.config;
         config.validate_shape(self.shape);
@@ -424,19 +416,19 @@ impl Operator for MoEExpertMajorPackInputInvocation<'_> {
         recorder.set_u32(5, config.hidden_dim);
         recorder.dispatch_1d(
             config.num_route_hidden_elements(self.shape),
-            self.kernels.specializations.pack_input.required_threads as usize,
+            self.kernels.constants.pack_input.required_threads as usize,
         );
     }
 }
 
-pub struct MoEExpertMajorScatterWithoutSharedExpertsInvocation<'a> {
-    kernels: &'a MoEExpertMajorKernels,
-    shape: MoEExpertMajorShape,
-    buffers: MoEExpertMajorScatterWithoutSharedExpertsBuffers<'a>,
+pub struct ScatterWithoutSharedExpertsInvocation<'a> {
+    kernels: &'a Compute,
+    shape: Shape,
+    buffers: ScatterWithoutSharedExpertsBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for MoEExpertMajorScatterWithoutSharedExpertsInvocation<'_> {
+impl Operator for ScatterWithoutSharedExpertsInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernels.config;
         config.validate_shape(self.shape);
@@ -451,19 +443,19 @@ impl Operator for MoEExpertMajorScatterWithoutSharedExpertsInvocation<'_> {
         recorder.set_u32(6, config.hidden_dim);
         recorder.dispatch_1d(
             config.num_token_hidden_elements(self.shape),
-            self.kernels.specializations.scatter_output.required_threads as usize,
+            self.kernels.constants.scatter_output.required_threads as usize,
         );
     }
 }
 
-pub struct MoEExpertMajorScatterWithSharedExpertsInvocation<'a> {
-    kernels: &'a MoEExpertMajorKernels,
-    shape: MoEExpertMajorShape,
-    buffers: MoEExpertMajorScatterWithSharedExpertsBuffers<'a>,
+pub struct ScatterWithSharedExpertsInvocation<'a> {
+    kernels: &'a Compute,
+    shape: Shape,
+    buffers: ScatterWithSharedExpertsBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for MoEExpertMajorScatterWithSharedExpertsInvocation<'_> {
+impl Operator for ScatterWithSharedExpertsInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernels.config;
         config.validate_shape(self.shape);
@@ -480,7 +472,7 @@ impl Operator for MoEExpertMajorScatterWithSharedExpertsInvocation<'_> {
         recorder.set_u32(8, config.hidden_dim);
         recorder.dispatch_1d(
             config.num_token_hidden_elements(self.shape),
-            self.kernels.specializations.scatter_output.required_threads as usize,
+            self.kernels.constants.scatter_output.required_threads as usize,
         );
     }
 }
@@ -497,47 +489,35 @@ fn record_num_active_tokens(
     }
 }
 
-fn debug_validate_layout_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorLayoutBuffers<'_>,
-) {
+fn debug_validate_layout_buffers(config: Config, shape: Shape, buffers: &LayoutBuffers<'_>) {
     #[cfg(debug_assertions)]
     validate_layout_buffers(config, shape, buffers);
 }
 
-fn debug_validate_pack_input_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorPackInputBuffers<'_>,
-) {
+fn debug_validate_pack_input_buffers(config: Config, shape: Shape, buffers: &PackInputBuffers<'_>) {
     #[cfg(debug_assertions)]
     validate_pack_input_buffers(config, shape, buffers);
 }
 
 fn debug_validate_scatter_without_shared_experts_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorScatterWithoutSharedExpertsBuffers<'_>,
+    config: Config,
+    shape: Shape,
+    buffers: &ScatterWithoutSharedExpertsBuffers<'_>,
 ) {
     #[cfg(debug_assertions)]
     validate_scatter_without_shared_experts_buffers(config, shape, buffers);
 }
 
 fn debug_validate_scatter_with_shared_experts_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorScatterWithSharedExpertsBuffers<'_>,
+    config: Config,
+    shape: Shape,
+    buffers: &ScatterWithSharedExpertsBuffers<'_>,
 ) {
     #[cfg(debug_assertions)]
     validate_scatter_with_shared_experts_buffers(config, shape, buffers);
 }
 
-fn validate_layout_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorLayoutBuffers<'_>,
-) {
+fn validate_layout_buffers(config: Config, shape: Shape, buffers: &LayoutBuffers<'_>) {
     let bytes = config.route_indices_bytes(shape);
     assert!(buffers.expert_indices.len_bytes() >= bytes);
     assert!(buffers.expert_counts.len_bytes() >= config.expert_counts_bytes());
@@ -548,20 +528,16 @@ fn validate_layout_buffers(
     assert!(buffers.experts_by_route.len_bytes() >= bytes);
 }
 
-fn validate_pack_input_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorPackInputBuffers<'_>,
-) {
+fn validate_pack_input_buffers(config: Config, shape: Shape, buffers: &PackInputBuffers<'_>) {
     assert!(buffers.input.len_bytes() >= config.token_hidden_bytes(shape));
     assert!(buffers.routes_by_expert.len_bytes() >= config.route_indices_bytes(shape));
     assert!(buffers.packed_input.len_bytes() >= config.route_hidden_bytes(shape));
 }
 
 fn validate_scatter_without_shared_experts_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorScatterWithoutSharedExpertsBuffers<'_>,
+    config: Config,
+    shape: Shape,
+    buffers: &ScatterWithoutSharedExpertsBuffers<'_>,
 ) {
     assert!(buffers.packed_output.len_bytes() >= config.route_hidden_bytes(shape));
     assert!(buffers.routes_by_token.len_bytes() >= config.route_indices_bytes(shape));
@@ -570,9 +546,9 @@ fn validate_scatter_without_shared_experts_buffers(
 }
 
 fn validate_scatter_with_shared_experts_buffers(
-    config: MoEExpertMajorConfig,
-    shape: MoEExpertMajorShape,
-    buffers: &MoEExpertMajorScatterWithSharedExpertsBuffers<'_>,
+    config: Config,
+    shape: Shape,
+    buffers: &ScatterWithSharedExpertsBuffers<'_>,
 ) {
     assert!(buffers.packed_output.len_bytes() >= config.route_hidden_bytes(shape));
     assert!(buffers.routes_by_token.len_bytes() >= config.route_indices_bytes(shape));
@@ -583,5 +559,5 @@ fn validate_scatter_with_shared_experts_buffers(
 }
 
 #[cfg(test)]
-#[path = "moe_expert_major_test.rs"]
+#[path = "expert_major_test.rs"]
 mod tests;

@@ -11,15 +11,15 @@ use crate::metal::Stream;
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.moe.routing.num_active_tokens");
 
 #[test]
-fn test_specialization_has_explicit_thread_block_scope() {
-    let specialization = MoERoutingKernelSpecialization::current();
-    assert_eq!(specialization.thread_block.required_threads, 256);
+fn test_constants_have_explicit_thread_block_scope() {
+    let constants = KernelConstants::current();
+    assert_eq!(constants.thread_block.required_threads, 256);
 }
 
 #[test]
 #[should_panic(expected = "MoE routing supports at most 256 experts")]
 fn test_config_rejects_more_than_256_experts() {
-    MoERoutingConfig {
+    Config {
         num_experts: 257,
         num_experts_per_token: 1,
         norm_topk_prob: false,
@@ -30,7 +30,7 @@ fn test_config_rejects_more_than_256_experts() {
 #[test]
 #[should_panic(expected = "MoE routing supports at most 16 experts per token")]
 fn test_config_rejects_more_than_16_experts_per_token() {
-    MoERoutingConfig {
+    Config {
         num_experts: 256,
         num_experts_per_token: 17,
         norm_topk_prob: false,
@@ -41,12 +41,12 @@ fn test_config_rejects_more_than_16_experts_per_token() {
 #[test]
 #[should_panic(expected = "MoE routing probability elements exceeds the shader u32 element-index domain")]
 fn test_shape_rejects_shader_index_overflow() {
-    let config = MoERoutingConfig {
+    let config = Config {
         num_experts: 256,
         num_experts_per_token: 1,
         norm_topk_prob: false,
     };
-    config.validate_shape(MoERoutingShape {
+    config.validate_shape(Shape {
         num_total_tokens: (u32::MAX / 256) + 2,
     });
 }
@@ -55,12 +55,12 @@ fn test_shape_rejects_shader_index_overflow() {
 fn test_topk_renorm() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoERoutingConfig {
+    let config = Config {
         num_experts: 4,
         num_experts_per_token: 2,
         norm_topk_prob: true,
     };
-    let shape = MoERoutingShape { num_total_tokens: 2 };
+    let shape = Shape { num_total_tokens: 2 };
     let router_probs_values = [
         softmax_prob(0.25, &[0.25, 2.0, -1.0, 1.0]),
         softmax_prob(2.0, &[0.25, 2.0, -1.0, 1.0]),
@@ -74,12 +74,12 @@ fn test_topk_renorm() {
     let router_probs = bf16_buffer(&device, &router_probs_values);
     let expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(shape));
     let expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(shape));
-    let kernel = MoERoutingKernel::new(&device, config);
+    let kernel = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
-        MoERoutingBuffers {
+        Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,
             expert_probs: &expert_probs,
@@ -99,12 +99,12 @@ fn test_topk_renorm() {
 fn test_no_topk_renorm() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoERoutingConfig {
+    let config = Config {
         num_experts: 4,
         num_experts_per_token: 2,
         norm_topk_prob: false,
     };
-    let shape = MoERoutingShape { num_total_tokens: 1 };
+    let shape = Shape { num_total_tokens: 1 };
     let router_probs_values = [
         softmax_prob(0.25, &[0.25, 2.0, -1.0, 1.0]),
         softmax_prob(2.0, &[0.25, 2.0, -1.0, 1.0]),
@@ -114,12 +114,12 @@ fn test_no_topk_renorm() {
     let router_probs = bf16_buffer(&device, &router_probs_values);
     let expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(shape));
     let expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(shape));
-    let kernel = MoERoutingKernel::new(&device, config);
+    let kernel = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
-        MoERoutingBuffers {
+        Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,
             expert_probs: &expert_probs,
@@ -146,12 +146,12 @@ fn test_bucketed_replay_reuses_capacity_with_both_norm_modes() {
 fn test_random() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoERoutingConfig {
+    let config = Config {
         num_experts: 8,
         num_experts_per_token: 3,
         norm_topk_prob: true,
     };
-    let shape = MoERoutingShape { num_total_tokens: 5 };
+    let shape = Shape { num_total_tokens: 5 };
     let random_seed = 0x91E4_63BA;
     let router_probs_values = generated_probs(
         shape.num_total_tokens as usize,
@@ -161,12 +161,12 @@ fn test_random() {
     let router_probs = bf16_buffer(&device, &router_probs_values);
     let expert_indices = Buffer::new_zeroed(&device, config.expert_indices_bytes(shape));
     let expert_probs = Buffer::new_zeroed(&device, config.expert_probs_bytes(shape));
-    let kernel = MoERoutingKernel::new(&device, config);
+    let kernel = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
-        MoERoutingBuffers {
+        Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,
             expert_probs: &expert_probs,
@@ -217,12 +217,12 @@ fn generated_probs(num_tokens: usize, num_experts: usize, random_seed: u32) -> V
 fn run_bucketed_replay_case(norm_topk_prob: bool) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = MoERoutingConfig {
+    let config = Config {
         num_experts: 8,
         num_experts_per_token: 3,
         norm_topk_prob,
     };
-    let shape = MoERoutingShape { num_total_tokens: 4 };
+    let shape = Shape { num_total_tokens: 4 };
     let all_probs = generated_probs(4, config.num_experts as usize, 0x5A17_920B);
     let mut three_token_probs = all_probs.clone();
     three_token_probs[3 * config.num_experts as usize..].fill(f32::NAN);
@@ -232,13 +232,13 @@ fn run_bucketed_replay_case(norm_topk_prob: bool) {
     let prob_sentinel = -777.0_f32;
     let expert_indices = Buffer::from_slice(&device, &vec![index_sentinel; num_routes]);
     let expert_probs = Buffer::from_slice(&device, &vec![prob_sentinel; num_routes]);
-    let kernel = MoERoutingKernel::new(&device, config);
+    let kernel = Compute::new(&device, config);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke_bucketed(
         shape,
         NUM_ACTIVE_TOKENS,
-        MoERoutingBuffers {
+        Buffers {
             router_probs: &router_probs,
             expert_indices: &expert_indices,
             expert_probs: &expert_probs,

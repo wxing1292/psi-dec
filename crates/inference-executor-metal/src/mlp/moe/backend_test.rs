@@ -14,18 +14,22 @@ use crate::mlp::moe::scratch::MoEScratch;
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gated_moe.num_active_tokens");
 
 #[test]
-fn test_compute_path_selection_boundary() {
+fn test_selector_returns_registered_variant_at_crossover() {
+    let device = Device::system_default();
+    let (core, _) = routing_test_config(true);
+    let registry = Registry::new(&device, &core);
+    let selector = Selector;
     assert_eq!(
-        GatedMoEComputePath::select(GatedMoEReplayShape { num_tokens: 1 }),
-        GatedMoEComputePath::TokenMajor
+        selector.select(&registry, GatedMoEReplayShape { num_tokens: 1 }).0,
+        VariantKey::TokenMajor
     );
     assert_eq!(
-        GatedMoEComputePath::select(GatedMoEReplayShape { num_tokens: 4 }),
-        GatedMoEComputePath::TokenMajor
+        selector.select(&registry, GatedMoEReplayShape { num_tokens: 4 }).0,
+        VariantKey::TokenMajor
     );
     assert_eq!(
-        GatedMoEComputePath::select(GatedMoEReplayShape { num_tokens: 5 }),
-        GatedMoEComputePath::ExpertMajor
+        selector.select(&registry, GatedMoEReplayShape { num_tokens: 5 }).0,
+        VariantKey::ExpertMajor
     );
 }
 

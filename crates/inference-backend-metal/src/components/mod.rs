@@ -98,27 +98,7 @@ pub use gqa_block_attention::GQABlockSDPAConfig;
 pub use gqa_block_attention::GQABlockSDPAKernel;
 pub use gqa_block_attention::GQABlockSDPAShape;
 
-mod moe_combine;
-pub use moe_combine::MoECombineConfig;
-pub use moe_combine::MoECombineKernels;
-pub use moe_combine::MoECombineShape;
-pub use moe_combine::MoECombineWithSharedExpertsBuffers;
-pub use moe_combine::MoECombineWithoutSharedExpertsBuffers;
-
-mod moe_expert_major;
-pub use moe_expert_major::MoEExpertMajorConfig;
-pub use moe_expert_major::MoEExpertMajorKernels;
-pub use moe_expert_major::MoEExpertMajorLayoutBuffers;
-pub use moe_expert_major::MoEExpertMajorPackInputBuffers;
-pub use moe_expert_major::MoEExpertMajorScatterWithSharedExpertsBuffers;
-pub use moe_expert_major::MoEExpertMajorScatterWithoutSharedExpertsBuffers;
-pub use moe_expert_major::MoEExpertMajorShape;
-
-mod moe_routing;
-pub use moe_routing::MoERoutingBuffers;
-pub use moe_routing::MoERoutingConfig;
-pub use moe_routing::MoERoutingKernel;
-pub use moe_routing::MoERoutingShape;
+pub mod moe;
 
 mod rms_norm_rope;
 pub use rms_norm_rope::RMSNormRopeBuffers;

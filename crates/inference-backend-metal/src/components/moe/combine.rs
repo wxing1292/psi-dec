@@ -10,34 +10,34 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
-const MOE_COMBINE_SOURCE: &str = include_str!("metal/moe_combine.metal");
+const MOE_COMBINE_SOURCE: &str = include_str!("../metal/moe_combine.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MoECombineThreadBlockSpecialization {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MoECombineKernelSpecialization {
-    thread_block: MoECombineThreadBlockSpecialization,
+struct KernelConstants {
+    thread_block: ThreadBlockConstants,
 }
 
-impl MoECombineKernelSpecialization {
+impl KernelConstants {
     fn current() -> Self {
         Self {
-            thread_block: MoECombineThreadBlockSpecialization { required_threads: 256 },
+            thread_block: ThreadBlockConstants { required_threads: 256 },
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MoECombineConfig {
+pub struct Config {
     pub num_experts_per_token: u32,
     pub hidden_dim: u32,
     pub dtype: Dtype,
 }
 
-impl MoECombineConfig {
+impl Config {
     pub fn bf16(num_experts_per_token: u32, hidden_dim: u32) -> Self {
         Self {
             num_experts_per_token,
@@ -52,56 +52,56 @@ impl MoECombineConfig {
         assert_eq!(self.dtype, Dtype::Bfloat16);
     }
 
-    pub fn validate_shape(self, shape: MoECombineShape) {
+    pub fn validate_shape(self, shape: Shape) {
         self.validate();
         shape.validate();
         assert_u32_index_domain(self.num_routed_elements(shape), "MoE combine routed elements");
         assert_u32_count_domain(self.num_output_elements(shape), "MoE combine output elements");
     }
 
-    fn num_routes(self, shape: MoECombineShape) -> usize {
+    fn num_routes(self, shape: Shape) -> usize {
         checked_product(
             "MoE combine route count",
             &[shape.num_total_tokens as usize, self.num_experts_per_token as usize],
         )
     }
 
-    fn num_routed_elements(self, shape: MoECombineShape) -> usize {
+    fn num_routed_elements(self, shape: Shape) -> usize {
         checked_product(
             "MoE combine routed element count",
             &[self.num_routes(shape), self.hidden_dim as usize],
         )
     }
 
-    fn num_output_elements(self, shape: MoECombineShape) -> usize {
+    fn num_output_elements(self, shape: Shape) -> usize {
         checked_product(
             "MoE combine output element count",
             &[shape.num_total_tokens as usize, self.hidden_dim as usize],
         )
     }
 
-    pub fn routed_output_bytes(self, shape: MoECombineShape) -> usize {
+    pub fn routed_output_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE combine routed-output byte length",
             &[self.num_routed_elements(shape), self.dtype.item_size()],
         )
     }
 
-    pub fn routed_probs_bytes(self, shape: MoECombineShape) -> usize {
+    pub fn routed_probs_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE combine routed-probability byte length",
             &[self.num_routes(shape), size_of::<f32>()],
         )
     }
 
-    pub fn output_bytes(self, shape: MoECombineShape) -> usize {
+    pub fn output_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE combine output byte length",
             &[self.num_output_elements(shape), self.dtype.item_size()],
         )
     }
 
-    pub fn shared_expert_gate_logits_bytes(self, shape: MoECombineShape) -> usize {
+    pub fn shared_expert_gate_logits_bytes(self, shape: Shape) -> usize {
         checked_product(
             "MoE combine shared-gate byte length",
             &[shape.num_total_tokens as usize, self.dtype.item_size()],
@@ -110,23 +110,23 @@ impl MoECombineConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MoECombineShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl MoECombineShape {
+impl Shape {
     pub fn validate(self) {
         assert!(self.num_total_tokens > 0);
     }
 }
 
-pub struct MoECombineWithoutSharedExpertsBuffers<'a> {
+pub struct WithoutSharedExpertsBuffers<'a> {
     pub routed_hidden: &'a Buffer,
     pub routed_probs: &'a Buffer,
     pub output: &'a Buffer,
 }
 
-pub struct MoECombineWithSharedExpertsBuffers<'a> {
+pub struct WithSharedExpertsBuffers<'a> {
     pub routed_hidden: &'a Buffer,
     pub routed_probs: &'a Buffer,
     pub shared_hidden: &'a Buffer,
@@ -134,19 +134,19 @@ pub struct MoECombineWithSharedExpertsBuffers<'a> {
     pub output: &'a Buffer,
 }
 
-pub struct MoECombineKernels {
-    config: MoECombineConfig,
-    specialization: MoECombineKernelSpecialization,
+pub struct Compute {
+    config: Config,
+    constants: KernelConstants,
     without_shared_experts: Kernel,
     with_shared_experts: Kernel,
 }
 
-impl MoECombineKernels {
-    pub fn new(device: &crate::metal::Device, config: MoECombineConfig) -> Self {
+impl Compute {
+    pub fn new(device: &crate::metal::Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
-            specialization: MoECombineKernelSpecialization::current(),
+            constants: KernelConstants::current(),
             without_shared_experts: Kernel::new(device, MOE_COMBINE_SOURCE, "moe_combine_without_shared_experts"),
             with_shared_experts: Kernel::new(device, MOE_COMBINE_SOURCE, "moe_combine_with_shared_experts"),
         }
@@ -154,12 +154,12 @@ impl MoECombineKernels {
 
     pub fn invoke_without_shared_experts<'a>(
         &'a self,
-        shape: MoECombineShape,
-        buffers: MoECombineWithoutSharedExpertsBuffers<'a>,
-    ) -> MoECombineWithoutSharedExpertsInvocation<'a> {
-        MoECombineWithoutSharedExpertsInvocation {
+        shape: Shape,
+        buffers: WithoutSharedExpertsBuffers<'a>,
+    ) -> WithoutSharedExpertsInvocation<'a> {
+        WithoutSharedExpertsInvocation {
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.without_shared_experts,
             shape,
             buffers,
@@ -170,13 +170,13 @@ impl MoECombineKernels {
     /// Records a fixed-capacity combine whose active token count is supplied at submission.
     pub fn invoke_without_shared_experts_bucketed<'a>(
         &'a self,
-        shape: MoECombineShape,
+        shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: MoECombineWithoutSharedExpertsBuffers<'a>,
-    ) -> MoECombineWithoutSharedExpertsInvocation<'a> {
-        MoECombineWithoutSharedExpertsInvocation {
+        buffers: WithoutSharedExpertsBuffers<'a>,
+    ) -> WithoutSharedExpertsInvocation<'a> {
+        WithoutSharedExpertsInvocation {
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.without_shared_experts,
             shape,
             buffers,
@@ -186,12 +186,12 @@ impl MoECombineKernels {
 
     pub fn invoke_with_shared_experts<'a>(
         &'a self,
-        shape: MoECombineShape,
-        buffers: MoECombineWithSharedExpertsBuffers<'a>,
-    ) -> MoECombineWithSharedExpertsInvocation<'a> {
-        MoECombineWithSharedExpertsInvocation {
+        shape: Shape,
+        buffers: WithSharedExpertsBuffers<'a>,
+    ) -> WithSharedExpertsInvocation<'a> {
+        WithSharedExpertsInvocation {
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.with_shared_experts,
             shape,
             buffers,
@@ -202,13 +202,13 @@ impl MoECombineKernels {
     /// Records a fixed-capacity combine whose active token count is supplied at submission.
     pub fn invoke_with_shared_experts_bucketed<'a>(
         &'a self,
-        shape: MoECombineShape,
+        shape: Shape,
         num_active_tokens_key: ReplayParameterKey,
-        buffers: MoECombineWithSharedExpertsBuffers<'a>,
-    ) -> MoECombineWithSharedExpertsInvocation<'a> {
-        MoECombineWithSharedExpertsInvocation {
+        buffers: WithSharedExpertsBuffers<'a>,
+    ) -> WithSharedExpertsInvocation<'a> {
+        WithSharedExpertsInvocation {
             config: self.config,
-            specialization: self.specialization,
+            constants: self.constants,
             kernel: &self.with_shared_experts,
             shape,
             buffers,
@@ -217,16 +217,16 @@ impl MoECombineKernels {
     }
 }
 
-pub struct MoECombineWithoutSharedExpertsInvocation<'a> {
-    config: MoECombineConfig,
-    specialization: MoECombineKernelSpecialization,
+pub struct WithoutSharedExpertsInvocation<'a> {
+    config: Config,
+    constants: KernelConstants,
     kernel: &'a Kernel,
-    shape: MoECombineShape,
-    buffers: MoECombineWithoutSharedExpertsBuffers<'a>,
+    shape: Shape,
+    buffers: WithoutSharedExpertsBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for MoECombineWithoutSharedExpertsInvocation<'_> {
+impl Operator for WithoutSharedExpertsInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.config;
         config.validate_shape(self.shape);
@@ -240,21 +240,21 @@ impl Operator for MoECombineWithoutSharedExpertsInvocation<'_> {
         recorder.set_u32(5, config.hidden_dim);
         recorder.dispatch_1d(
             config.num_output_elements(self.shape),
-            self.specialization.thread_block.required_threads as usize,
+            self.constants.thread_block.required_threads as usize,
         );
     }
 }
 
-pub struct MoECombineWithSharedExpertsInvocation<'a> {
-    config: MoECombineConfig,
-    specialization: MoECombineKernelSpecialization,
+pub struct WithSharedExpertsInvocation<'a> {
+    config: Config,
+    constants: KernelConstants,
     kernel: &'a Kernel,
-    shape: MoECombineShape,
-    buffers: MoECombineWithSharedExpertsBuffers<'a>,
+    shape: Shape,
+    buffers: WithSharedExpertsBuffers<'a>,
     num_active_tokens_key: Option<ReplayParameterKey>,
 }
 
-impl Operator for MoECombineWithSharedExpertsInvocation<'_> {
+impl Operator for WithSharedExpertsInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.config;
         config.validate_shape(self.shape);
@@ -270,7 +270,7 @@ impl Operator for MoECombineWithSharedExpertsInvocation<'_> {
         recorder.set_u32(7, config.hidden_dim);
         recorder.dispatch_1d(
             config.num_output_elements(self.shape),
-            self.specialization.thread_block.required_threads as usize,
+            self.constants.thread_block.required_threads as usize,
         );
     }
 }
@@ -288,28 +288,20 @@ fn record_num_active_tokens(
 }
 
 fn debug_validate_without_shared_experts_buffers(
-    config: MoECombineConfig,
-    shape: MoECombineShape,
-    buffers: &MoECombineWithoutSharedExpertsBuffers<'_>,
+    config: Config,
+    shape: Shape,
+    buffers: &WithoutSharedExpertsBuffers<'_>,
 ) {
     #[cfg(debug_assertions)]
     validate_without_shared_experts_buffers(config, shape, buffers);
 }
 
-fn debug_validate_with_shared_experts_buffers(
-    config: MoECombineConfig,
-    shape: MoECombineShape,
-    buffers: &MoECombineWithSharedExpertsBuffers<'_>,
-) {
+fn debug_validate_with_shared_experts_buffers(config: Config, shape: Shape, buffers: &WithSharedExpertsBuffers<'_>) {
     #[cfg(debug_assertions)]
     validate_with_shared_experts_buffers(config, shape, buffers);
 }
 
-fn validate_without_shared_experts_buffers(
-    config: MoECombineConfig,
-    shape: MoECombineShape,
-    buffers: &MoECombineWithoutSharedExpertsBuffers<'_>,
-) {
+fn validate_without_shared_experts_buffers(config: Config, shape: Shape, buffers: &WithoutSharedExpertsBuffers<'_>) {
     let routed_output_bytes = config.routed_output_bytes(shape);
     let routed_probs_bytes = config.routed_probs_bytes(shape);
     let output_bytes = config.output_bytes(shape);
@@ -333,11 +325,7 @@ fn validate_without_shared_experts_buffers(
     );
 }
 
-fn validate_with_shared_experts_buffers(
-    config: MoECombineConfig,
-    shape: MoECombineShape,
-    buffers: &MoECombineWithSharedExpertsBuffers<'_>,
-) {
+fn validate_with_shared_experts_buffers(config: Config, shape: Shape, buffers: &WithSharedExpertsBuffers<'_>) {
     let routed_output_bytes = config.routed_output_bytes(shape);
     let routed_probs_bytes = config.routed_probs_bytes(shape);
     let output_bytes = config.output_bytes(shape);
@@ -376,5 +364,5 @@ fn validate_with_shared_experts_buffers(
 }
 
 #[cfg(test)]
-#[path = "moe_combine_test.rs"]
+#[path = "combine_test.rs"]
 mod tests;

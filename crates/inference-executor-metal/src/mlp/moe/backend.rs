@@ -1,20 +1,7 @@
-use inference_backend_metal::components::MoECombineConfig;
-use inference_backend_metal::components::MoECombineKernels;
-use inference_backend_metal::components::MoECombineShape;
-use inference_backend_metal::components::MoECombineWithSharedExpertsBuffers;
-use inference_backend_metal::components::MoECombineWithoutSharedExpertsBuffers;
-use inference_backend_metal::components::MoEExpertMajorConfig;
-use inference_backend_metal::components::MoEExpertMajorKernels;
-use inference_backend_metal::components::MoEExpertMajorLayoutBuffers;
-use inference_backend_metal::components::MoEExpertMajorPackInputBuffers;
-use inference_backend_metal::components::MoEExpertMajorScatterWithSharedExpertsBuffers;
-use inference_backend_metal::components::MoEExpertMajorScatterWithoutSharedExpertsBuffers;
-use inference_backend_metal::components::MoEExpertMajorShape;
-use inference_backend_metal::components::MoERoutingBuffers;
-use inference_backend_metal::components::MoERoutingConfig;
-use inference_backend_metal::components::MoERoutingKernel;
-use inference_backend_metal::components::MoERoutingShape;
 use inference_backend_metal::components::dense_mlp;
+use inference_backend_metal::components::moe::combine;
+use inference_backend_metal::components::moe::expert_major;
+use inference_backend_metal::components::moe::routing;
 use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -95,7 +82,7 @@ pub struct GatedMoERoutingReplayTopology {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GatedMoEReplayTopology {
-    pub compute_path: GatedMoEComputePath,
+    variant_key: VariantKey,
     pub router_affine: AffineQuantizedMatmulKernelKind,
     pub shared_expert_gate_affine: Option<AffineQuantizedMatmulKernelKind>,
     pub shared_experts_dense: Option<dense_mlp::ReplayTopology>,
@@ -187,13 +174,13 @@ pub struct GatedMoEBucketedInput<'a> {
 /// ```
 pub struct GatedMoE {
     core: GatedMoECore,
+    registry: Registry,
+    selector: Selector,
     router: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
-    routing: MoERoutingKernel,
-    expert_major: MoEExpertMajorKernels,
+    routing: routing::Compute,
     topk_experts: sparse_mlp::Compute,
     shared_experts: Option<GatedMoESharedExperts>,
-    combine: MoECombineKernels,
 }
 
 struct GatedMoESharedExperts {
@@ -202,19 +189,67 @@ struct GatedMoESharedExperts {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum GatedMoEComputePath {
+enum VariantKey {
     TokenMajor,
     ExpertMajor,
 }
 
-impl GatedMoEComputePath {
-    fn select(shape: GatedMoEReplayShape) -> Self {
-        shape.validate();
-        if shape.num_tokens <= TOKEN_MAJOR_MAX_TOKENS {
-            Self::TokenMajor
-        } else {
-            Self::ExpertMajor
+enum Variant {
+    TokenMajor { combine: combine::Compute },
+    ExpertMajor { expert_major: expert_major::Compute },
+}
+
+struct Registry {
+    entries: Vec<(VariantKey, Variant)>,
+}
+
+impl Registry {
+    fn new(device: &Device, core: &GatedMoECore) -> Self {
+        let combine = combine::Compute::new(
+            device,
+            combine::Config::bf16(
+                core.num_experts_per_token.try_into().expect("MoE top-k must fit u32"),
+                core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
+            ),
+        );
+        let expert_major = expert_major::Compute::new(
+            device,
+            expert_major::Config::bf16(
+                core.num_experts.try_into().expect("MoE expert count must fit u32"),
+                core.num_experts_per_token.try_into().expect("MoE top-k must fit u32"),
+                core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
+            ),
+        );
+        Self {
+            entries: vec![
+                (VariantKey::TokenMajor, Variant::TokenMajor { combine }),
+                (VariantKey::ExpertMajor, Variant::ExpertMajor { expert_major }),
+            ],
         }
+    }
+
+    fn get(&self, key: VariantKey) -> (VariantKey, &Variant) {
+        let (key, variant) = self
+            .entries
+            .iter()
+            .find(|(candidate_key, _)| *candidate_key == key)
+            .expect("MoE registry requires each selectable execution variant");
+        (*key, variant)
+    }
+}
+
+#[derive(Default)]
+struct Selector;
+
+impl Selector {
+    fn select<'a>(&self, registry: &'a Registry, shape: GatedMoEReplayShape) -> (VariantKey, &'a Variant) {
+        shape.validate();
+        let key = if shape.num_tokens <= TOKEN_MAJOR_MAX_TOKENS {
+            VariantKey::TokenMajor
+        } else {
+            VariantKey::ExpertMajor
+        };
+        registry.get(key)
     }
 }
 
@@ -242,7 +277,10 @@ impl GatedMoE {
         core.validate();
         config.validate();
         let router_shape = core.router_shape();
+        let registry = Registry::new(device, &core);
         Self {
+            registry,
+            selector: Selector,
             router: AffineQuantizedMatmul::new(
                 device,
                 affine_config_with_bits(router_shape.out_dim, router_shape.in_dim, config.router_bits, config),
@@ -254,21 +292,13 @@ impl GatedMoE {
                     dtype: config.io_dtype,
                 },
             ),
-            routing: MoERoutingKernel::new(
+            routing: routing::Compute::new(
                 device,
-                MoERoutingConfig {
+                routing::Config {
                     num_experts: core.num_experts.try_into().expect("MoE expert count must fit u32"),
                     num_experts_per_token: core.num_experts_per_token.try_into().expect("MoE top-k must fit u32"),
                     norm_topk_prob: core.norm_topk_prob,
                 },
-            ),
-            expert_major: MoEExpertMajorKernels::new(
-                device,
-                MoEExpertMajorConfig::bf16(
-                    core.num_experts.try_into().expect("MoE expert count must fit u32"),
-                    core.num_experts_per_token.try_into().expect("MoE top-k must fit u32"),
-                    core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
-                ),
             ),
             topk_experts: sparse_mlp::Compute::new(device, topk_experts_config(&core, config)),
             shared_experts: core.shared_experts_core().map(|shared_core| {
@@ -288,13 +318,6 @@ impl GatedMoE {
                     mlp: dense_mlp::Compute::new(device, shared_experts_config(&shared_core, config)),
                 }
             }),
-            combine: MoECombineKernels::new(
-                device,
-                MoECombineConfig::bf16(
-                    core.num_experts_per_token.try_into().expect("MoE top-k must fit u32"),
-                    core.hidden_dim.try_into().expect("MoE hidden_dim must fit u32"),
-                ),
-            ),
             core,
         }
     }
@@ -317,8 +340,9 @@ impl GatedMoE {
             num_tokens: num_total_tokens,
         };
         shape.validate();
+        let (variant_key, _) = self.selector.select(&self.registry, shape);
         GatedMoEReplayTopology {
-            compute_path: GatedMoEComputePath::select(shape),
+            variant_key,
             router_affine: self.router.topology(num_total_tokens),
             shared_expert_gate_affine: self
                 .shared_experts
@@ -380,7 +404,7 @@ impl GatedMoE {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke_bucketed(
             self.routing_shape(num_total_tokens),
             num_active_tokens_key,
-            MoERoutingBuffers {
+            routing::Buffers {
                 router_probs: scratch.router_probs,
                 expert_indices: scratch.expert_indices,
                 expert_probs: scratch.expert_probs,
@@ -401,15 +425,19 @@ impl GatedMoE {
             num_tokens: input.num_total_tokens,
         };
         let next_hidden_state = input.next_hidden_state;
-        match GatedMoEComputePath::select(shape) {
-            GatedMoEComputePath::TokenMajor => self.record_token_major_bucketed(recorder, input),
-            GatedMoEComputePath::ExpertMajor => self.record_expert_major_bucketed(recorder, input),
+        let (_, variant) = self.selector.select(&self.registry, shape);
+        match variant {
+            Variant::TokenMajor { combine } => self.record_token_major_bucketed(combine, recorder, input),
+            Variant::ExpertMajor { expert_major } => {
+                self.record_expert_major_bucketed(expert_major, recorder, input);
+            },
         }
         next_hidden_state
     }
 
     fn record_token_major_bucketed<'a>(
         &'a self,
+        combine: &'a combine::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEBucketedInput<'a>,
     ) {
@@ -451,17 +479,15 @@ impl GatedMoE {
         )));
         match shared_experts {
             None => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.combine.invoke_without_shared_experts_bucketed(
-                        self.combine_shape(shape),
-                        num_active_tokens_key,
-                        MoECombineWithoutSharedExpertsBuffers {
-                            routed_hidden: scratch.topk_experts.routed_hidden,
-                            routed_probs: scratch.routing.expert_probs,
-                            output: next_hidden_state,
-                        },
-                    ),
-                ));
+                recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_without_shared_experts_bucketed(
+                    self.combine_shape(shape),
+                    num_active_tokens_key,
+                    combine::WithoutSharedExpertsBuffers {
+                        routed_hidden: scratch.topk_experts.routed_hidden,
+                        routed_probs: scratch.routing.expert_probs,
+                        output: next_hidden_state,
+                    },
+                )));
             },
             Some(shared_experts) => {
                 self.record_shared_experts_bucketed(
@@ -472,25 +498,24 @@ impl GatedMoE {
                     shared_experts.scratch,
                     shared_experts.weights,
                 );
-                recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.combine.invoke_with_shared_experts_bucketed(
-                        self.combine_shape(shape),
-                        num_active_tokens_key,
-                        MoECombineWithSharedExpertsBuffers {
-                            routed_hidden: scratch.topk_experts.routed_hidden,
-                            routed_probs: scratch.routing.expert_probs,
-                            shared_hidden: shared_experts.scratch.hidden,
-                            shared_expert_gate_logits: shared_experts.scratch.gate_logits,
-                            output: next_hidden_state,
-                        },
-                    ),
-                ));
+                recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_with_shared_experts_bucketed(
+                    self.combine_shape(shape),
+                    num_active_tokens_key,
+                    combine::WithSharedExpertsBuffers {
+                        routed_hidden: scratch.topk_experts.routed_hidden,
+                        routed_probs: scratch.routing.expert_probs,
+                        shared_hidden: shared_experts.scratch.hidden,
+                        shared_expert_gate_logits: shared_experts.scratch.gate_logits,
+                        output: next_hidden_state,
+                    },
+                )));
             },
         }
     }
 
     fn record_expert_major_bucketed<'a>(
         &'a self,
+        expert_major: &'a expert_major::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEBucketedInput<'a>,
     ) {
@@ -525,10 +550,10 @@ impl GatedMoE {
                 shared_experts.weights,
             );
         }
-        let layout = ReplayOp::opaque(self.expert_major.invoke_layout_bucketed(
+        let layout = ReplayOp::opaque(expert_major.invoke_layout_bucketed(
             expert_major_shape,
             num_active_tokens_key,
-            MoEExpertMajorLayoutBuffers {
+            expert_major::LayoutBuffers {
                 expert_indices: scratch.routing.expert_indices,
                 expert_counts: scratch.topk_experts.expert_counts,
                 expert_offsets: scratch.topk_experts.expert_offsets,
@@ -543,10 +568,10 @@ impl GatedMoE {
         } else {
             recorder.record_with_barrier_before(layout);
         }
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.expert_major.invoke_pack_input_bucketed(
+        recorder.record_with_barrier_before(ReplayOp::opaque(expert_major.invoke_pack_input_bucketed(
             expert_major_shape,
             num_active_tokens_key,
-            MoEExpertMajorPackInputBuffers {
+            expert_major::PackInputBuffers {
                 input: hidden_state,
                 routes_by_expert: scratch.topk_experts.routes_by_expert,
                 packed_input: scratch.topk_experts.packed_input,
@@ -569,10 +594,10 @@ impl GatedMoE {
         match shared_experts {
             None => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.expert_major.invoke_scatter_without_shared_experts_bucketed(
+                    expert_major.invoke_scatter_without_shared_experts_bucketed(
                         expert_major_shape,
                         num_active_tokens_key,
-                        MoEExpertMajorScatterWithoutSharedExpertsBuffers {
+                        expert_major::ScatterWithoutSharedExpertsBuffers {
                             packed_output: scratch.topk_experts.routed_hidden,
                             routes_by_token: scratch.topk_experts.routes_by_token,
                             routed_probs: scratch.routing.expert_probs,
@@ -583,10 +608,10 @@ impl GatedMoE {
             },
             Some(shared_experts) => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.expert_major.invoke_scatter_with_shared_experts_bucketed(
+                    expert_major.invoke_scatter_with_shared_experts_bucketed(
                         expert_major_shape,
                         num_active_tokens_key,
-                        MoEExpertMajorScatterWithSharedExpertsBuffers {
+                        expert_major::ScatterWithSharedExpertsBuffers {
                             packed_output: scratch.topk_experts.routed_hidden,
                             routes_by_token: scratch.topk_experts.routes_by_token,
                             routed_probs: scratch.routing.expert_probs,
@@ -602,6 +627,7 @@ impl GatedMoE {
 
     fn record_token_major_replay<'a>(
         &'a self,
+        combine: &'a combine::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEInput<'a>,
     ) {
@@ -628,9 +654,9 @@ impl GatedMoE {
         )));
         match shared_experts {
             None => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(self.combine.invoke_without_shared_experts(
+                recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_without_shared_experts(
                     self.combine_shape(shape),
-                    MoECombineWithoutSharedExpertsBuffers {
+                    combine::WithoutSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
                         output: next_hidden_state,
@@ -645,9 +671,9 @@ impl GatedMoE {
                     shared_experts.scratch,
                     shared_experts.weights,
                 );
-                recorder.record_with_barrier_before(ReplayOp::opaque(self.combine.invoke_with_shared_experts(
+                recorder.record_with_barrier_before(ReplayOp::opaque(combine.invoke_with_shared_experts(
                     self.combine_shape(shape),
-                    MoECombineWithSharedExpertsBuffers {
+                    combine::WithSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
                         shared_hidden: shared_experts.scratch.hidden,
@@ -661,6 +687,7 @@ impl GatedMoE {
 
     fn record_expert_major_replay<'a>(
         &'a self,
+        expert_major: &'a expert_major::Compute,
         recorder: &mut impl Recorder<'a, Operator = ReplayOp<'a>>,
         input: GatedMoEInput<'a>,
     ) {
@@ -681,9 +708,9 @@ impl GatedMoE {
                 shared_experts.weights,
             );
         }
-        let layout = ReplayOp::opaque(self.expert_major.invoke_layout(
+        let layout = ReplayOp::opaque(expert_major.invoke_layout(
             expert_major_shape,
-            MoEExpertMajorLayoutBuffers {
+            expert_major::LayoutBuffers {
                 expert_indices: scratch.routing.expert_indices,
                 expert_counts: scratch.topk_experts.expert_counts,
                 expert_offsets: scratch.topk_experts.expert_offsets,
@@ -698,9 +725,9 @@ impl GatedMoE {
         } else {
             recorder.record_with_barrier_before(layout);
         }
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.expert_major.invoke_pack_input(
+        recorder.record_with_barrier_before(ReplayOp::opaque(expert_major.invoke_pack_input(
             expert_major_shape,
-            MoEExpertMajorPackInputBuffers {
+            expert_major::PackInputBuffers {
                 input: hidden_state,
                 routes_by_expert: scratch.topk_experts.routes_by_expert,
                 packed_input: scratch.topk_experts.packed_input,
@@ -723,9 +750,9 @@ impl GatedMoE {
         match shared_experts {
             None => {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.expert_major.invoke_scatter_without_shared_experts(
+                    expert_major.invoke_scatter_without_shared_experts(
                         expert_major_shape,
-                        MoEExpertMajorScatterWithoutSharedExpertsBuffers {
+                        expert_major::ScatterWithoutSharedExpertsBuffers {
                             packed_output: scratch.topk_experts.routed_hidden,
                             routes_by_token: scratch.topk_experts.routes_by_token,
                             routed_probs: scratch.routing.expert_probs,
@@ -735,19 +762,17 @@ impl GatedMoE {
                 ));
             },
             Some(shared_experts) => {
-                recorder.record_with_barrier_before(ReplayOp::opaque(
-                    self.expert_major.invoke_scatter_with_shared_experts(
-                        expert_major_shape,
-                        MoEExpertMajorScatterWithSharedExpertsBuffers {
-                            packed_output: scratch.topk_experts.routed_hidden,
-                            routes_by_token: scratch.topk_experts.routes_by_token,
-                            routed_probs: scratch.routing.expert_probs,
-                            shared_hidden: shared_experts.scratch.hidden,
-                            shared_expert_gate_logits: shared_experts.scratch.gate_logits,
-                            output: next_hidden_state,
-                        },
-                    ),
-                ));
+                recorder.record_with_barrier_before(ReplayOp::opaque(expert_major.invoke_scatter_with_shared_experts(
+                    expert_major_shape,
+                    expert_major::ScatterWithSharedExpertsBuffers {
+                        packed_output: scratch.topk_experts.routed_hidden,
+                        routes_by_token: scratch.topk_experts.routes_by_token,
+                        routed_probs: scratch.routing.expert_probs,
+                        shared_hidden: shared_experts.scratch.hidden,
+                        shared_expert_gate_logits: shared_experts.scratch.gate_logits,
+                        output: next_hidden_state,
+                    },
+                )));
             },
         }
     }
@@ -784,7 +809,7 @@ impl GatedMoE {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke(
             self.routing_shape(shape.num_tokens),
-            MoERoutingBuffers {
+            routing::Buffers {
                 router_probs: scratch.router_probs,
                 expert_indices: scratch.expert_indices,
                 expert_probs: scratch.expert_probs,
@@ -887,8 +912,8 @@ impl GatedMoE {
         }
     }
 
-    fn routing_shape(&self, num_tokens: u32) -> MoERoutingShape {
-        MoERoutingShape {
+    fn routing_shape(&self, num_tokens: u32) -> routing::Shape {
+        routing::Shape {
             num_total_tokens: num_tokens,
         }
     }
@@ -906,14 +931,14 @@ impl GatedMoE {
         }
     }
 
-    fn expert_major_shape(&self, shape: GatedMoEReplayShape) -> MoEExpertMajorShape {
-        MoEExpertMajorShape {
+    fn expert_major_shape(&self, shape: GatedMoEReplayShape) -> expert_major::Shape {
+        expert_major::Shape {
             num_total_tokens: shape.num_tokens,
         }
     }
 
-    fn combine_shape(&self, shape: GatedMoEReplayShape) -> MoECombineShape {
-        MoECombineShape {
+    fn combine_shape(&self, shape: GatedMoEReplayShape) -> combine::Shape {
+        combine::Shape {
             num_total_tokens: shape.num_tokens,
         }
     }
@@ -942,12 +967,13 @@ impl ReplayLayer for GatedMoE {
         self.validate_input(&input);
         let shape = input.shape;
         let next_hidden_state = input.next_hidden_state;
-        match GatedMoEComputePath::select(shape) {
-            GatedMoEComputePath::TokenMajor => {
-                self.record_token_major_replay(recorder, input);
+        let (_, variant) = self.selector.select(&self.registry, shape);
+        match variant {
+            Variant::TokenMajor { combine } => {
+                self.record_token_major_replay(combine, recorder, input);
             },
-            GatedMoEComputePath::ExpertMajor => {
-                self.record_expert_major_replay(recorder, input);
+            Variant::ExpertMajor { expert_major } => {
+                self.record_expert_major_replay(expert_major, recorder, input);
             },
         }
         next_hidden_state

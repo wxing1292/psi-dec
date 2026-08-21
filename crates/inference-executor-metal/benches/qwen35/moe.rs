@@ -7,21 +7,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
-use inference_backend_metal::components::MoECombineConfig;
-use inference_backend_metal::components::MoECombineKernels;
-use inference_backend_metal::components::MoECombineShape;
-use inference_backend_metal::components::MoECombineWithSharedExpertsBuffers;
-use inference_backend_metal::components::MoEExpertMajorConfig;
-use inference_backend_metal::components::MoEExpertMajorKernels;
-use inference_backend_metal::components::MoEExpertMajorLayoutBuffers;
-use inference_backend_metal::components::MoEExpertMajorPackInputBuffers;
-use inference_backend_metal::components::MoEExpertMajorScatterWithSharedExpertsBuffers;
-use inference_backend_metal::components::MoEExpertMajorShape;
-use inference_backend_metal::components::MoERoutingBuffers;
-use inference_backend_metal::components::MoERoutingConfig;
-use inference_backend_metal::components::MoERoutingKernel;
-use inference_backend_metal::components::MoERoutingShape;
 use inference_backend_metal::components::dense_mlp;
+use inference_backend_metal::components::moe::combine;
+use inference_backend_metal::components::moe::expert_major;
+use inference_backend_metal::components::moe::routing;
 use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -162,12 +151,12 @@ impl MoERealImpl {
 struct ForcedMoEKernels {
     router: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
-    routing: MoERoutingKernel,
-    expert_major: MoEExpertMajorKernels,
+    routing: routing::Compute,
+    expert_major: expert_major::Compute,
     experts: sparse_mlp::Compute,
     shared_experts: dense_mlp::Compute,
     shared_expert_gate: AffineQuantizedMatmul,
-    combine: MoECombineKernels,
+    combine: combine::Compute,
 }
 
 #[derive(Clone, Copy)]
@@ -193,12 +182,12 @@ impl ForcedMoEKernels {
                     dtype: Dtype::Bfloat16,
                 },
             ),
-            routing: MoERoutingKernel::new(device, routing_config()),
-            expert_major: MoEExpertMajorKernels::new(device, expert_major_config()),
+            routing: routing::Compute::new(device, routing_config()),
+            expert_major: expert_major::Compute::new(device, expert_major_config()),
             experts: sparse_mlp::Compute::new(device, sparse_config()),
             shared_experts: dense_mlp::Compute::new(device, dense_config()),
             shared_expert_gate: AffineQuantizedMatmul::new(device, affine_config(1, HIDDEN_DIM, ROUTER_BITS)),
-            combine: MoECombineKernels::new(device, MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM)),
+            combine: combine::Compute::new(device, combine::Config::bf16(TOPK_EXPERTS, HIDDEN_DIM)),
         }
     }
 
@@ -241,7 +230,7 @@ impl ForcedMoEKernels {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.routing.invoke(
             routing_shape,
-            MoERoutingBuffers {
+            routing::Buffers {
                 router_probs: scratch.routing.router_probs,
                 expert_indices: scratch.routing.expert_indices,
                 expert_probs: scratch.routing.expert_probs,
@@ -266,10 +255,10 @@ impl ForcedMoEKernels {
                 )));
                 self.record_shared(recorder, num_tokens, input, shared_scratch, weights);
                 recorder.record_with_barrier_before(ReplayOp::opaque(self.combine.invoke_with_shared_experts(
-                    MoECombineShape {
+                    combine::Shape {
                         num_total_tokens: num_tokens,
                     },
-                    MoECombineWithSharedExpertsBuffers {
+                    combine::WithSharedExpertsBuffers {
                         routed_hidden: scratch.topk_experts.routed_hidden,
                         routed_probs: scratch.routing.expert_probs,
                         shared_hidden: shared_scratch.hidden,
@@ -279,13 +268,13 @@ impl ForcedMoEKernels {
                 )));
             },
             MoERealImpl::ExpertMajor => {
-                let shape = MoEExpertMajorShape {
+                let shape = expert_major::Shape {
                     num_total_tokens: num_tokens,
                 };
                 self.record_shared(recorder, num_tokens, input, shared_scratch, weights);
                 recorder.record(ReplayOp::opaque(self.expert_major.invoke_layout(
                     shape,
-                    MoEExpertMajorLayoutBuffers {
+                    expert_major::LayoutBuffers {
                         expert_indices: scratch.routing.expert_indices,
                         expert_counts: scratch.topk_experts.expert_counts,
                         expert_offsets: scratch.topk_experts.expert_offsets,
@@ -297,7 +286,7 @@ impl ForcedMoEKernels {
                 )));
                 recorder.record_with_barrier_before(ReplayOp::opaque(self.expert_major.invoke_pack_input(
                     shape,
-                    MoEExpertMajorPackInputBuffers {
+                    expert_major::PackInputBuffers {
                         input,
                         routes_by_expert: scratch.topk_experts.routes_by_expert,
                         packed_input: scratch.topk_experts.packed_input,
@@ -324,7 +313,7 @@ impl ForcedMoEKernels {
                 recorder.record_with_barrier_before(ReplayOp::opaque(
                     self.expert_major.invoke_scatter_with_shared_experts(
                         shape,
-                        MoEExpertMajorScatterWithSharedExpertsBuffers {
+                        expert_major::ScatterWithSharedExpertsBuffers {
                             packed_output: scratch.topk_experts.routed_hidden,
                             routes_by_token: scratch.topk_experts.routes_by_token,
                             routed_probs: scratch.routing.expert_probs,
@@ -415,7 +404,7 @@ impl<'a> RealMoEFixture<'a> {
         let dense_config = dense_config();
         let sparse_shape = sparse_token_major_shape(num_tokens);
         let expert_major_config = expert_major_config();
-        let expert_major_shape = MoEExpertMajorShape {
+        let expert_major_shape = expert_major::Shape {
             num_total_tokens: num_tokens,
         };
         let expert_major_sparse_shape = sparse_mlp::TokenMajorShape {
@@ -429,8 +418,8 @@ impl<'a> RealMoEFixture<'a> {
         let dense_shape = dense_mlp::Shape {
             num_total_tokens: num_tokens,
         };
-        let combine_config = MoECombineConfig::bf16(TOPK_EXPERTS, HIDDEN_DIM);
-        let combine_shape = MoECombineShape {
+        let combine_config = combine::Config::bf16(TOPK_EXPERTS, HIDDEN_DIM);
+        let combine_shape = combine::Shape {
             num_total_tokens: num_tokens,
         };
         let num_routes = num_tokens as usize * TOPK_EXPERTS as usize;
@@ -1085,22 +1074,22 @@ fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
     }
 }
 
-fn routing_shape(num_tokens: u32) -> MoERoutingShape {
-    MoERoutingShape {
+fn routing_shape(num_tokens: u32) -> routing::Shape {
+    routing::Shape {
         num_total_tokens: num_tokens,
     }
 }
 
-fn routing_config() -> MoERoutingConfig {
-    MoERoutingConfig {
+fn routing_config() -> routing::Config {
+    routing::Config {
         num_experts: NUM_EXPERTS,
         num_experts_per_token: TOPK_EXPERTS,
         norm_topk_prob: true,
     }
 }
 
-fn expert_major_config() -> MoEExpertMajorConfig {
-    MoEExpertMajorConfig::bf16(NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM)
+fn expert_major_config() -> expert_major::Config {
+    expert_major::Config::bf16(NUM_EXPERTS, TOPK_EXPERTS, HIDDEN_DIM)
 }
 
 fn sparse_token_major_shape(num_tokens: u32) -> sparse_mlp::TokenMajorShape {

@@ -115,7 +115,7 @@ entity when its contract does not need it.
 | Executor component | `Recorder<ReplayOp>` | Backend-neutral stage composition through Metal replay operations |
 | Backend component | `*Config`, `*Shape` | Static workload facts and one backend invocation shape |
 | Backend component | `*Buffers`, `*Weights`, `*Scratch` | Borrowed backend resource groups for one invocation |
-| Backend component | `*ComputePath`, `*KernelKind` | Selected compute decomposition and low-level specialization |
+| Backend component | `ExecutionVariant`, `VariantKey`, `KernelConstants`, `*KernelKind` | Selectable execution, replay identity, compile-time constants, and low-level kernel identity |
 | Backend component | `*Invocation` | One recordable backend operation or command sequence |
 | Metal resource | `Device`, `Buffer`, `BufferView`, `Kernel`, `Stream` | Metal resource and submission ownership |
 | Metal resource | `BufferIO` | Direct file and shared-buffer range transfer |
@@ -607,7 +607,7 @@ force the same lifecycle on components that have different ownership contracts.
 - GDN state tests exercise mixed commit modes, MTP state-version shifts, deferred publish, restore, and selective reset.
 - GQA metadata tests exercise single-query and tiled-query paths with exact, bucketed, and caller-owned capacity APIs.
 - GQA page-table tests exercise selected state I/O and selective reset without reproducing KV-kernel math.
-- MoE component tests protect compute-path selection. Metal execution tests cover the optional shared-expert path.
+- MoE component tests protect execution-variant selection. Metal execution tests cover the optional shared-expert path.
 - Sampling tests protect mixed request configurations and Target and Draft runtime-parameter domains.
 - Rejection tests protect mixed ragged requests, zero-draft requests, prepared inputs, and result prefixes.
 - Dense MLP and basic Embed have no component test when a lower numerical test or a higher integration test owns the
