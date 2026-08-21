@@ -270,15 +270,16 @@ impl UngatedGQA {
         let batch_metadata = input.batch_metadata;
         let kv_cache = input.kv_cache;
         let scratch = input.scratch;
-        let map_constants = batch_metadata.variant().map.thread_block;
+        let execution = batch_metadata.variant();
+        let map_constants = execution.map.thread_block;
         if map_constants.max_q_tokens == 1 {
-            let sdpa_config = self.split_kv_single_q_config(
-                page_table_layout,
-                map_constants.kv_tokens_per_iteration,
-                map_constants.required_threads,
-                map_constants.max_q_heads,
+            let sdpa_config = self.split_kv_single_q_config(page_table_layout);
+            let sdpa = backend_single_q::Compute::new(
+                &self.device,
+                sdpa_config,
+                execution,
+                self.split_kv_single_q_shape(shape),
             );
-            let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, self.split_kv_single_q_shape(shape));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
                 backend_single_q::MapBuffers {
                     q: scratch.q_norm_rope,
@@ -302,13 +303,9 @@ impl UngatedGQA {
                 },
             )));
         } else {
-            let sdpa_config = self.split_kv_tiled_q_config(
-                page_table_layout,
-                map_constants.max_q_tokens,
-                map_constants.kv_tokens_per_iteration,
-                map_constants.max_q_heads,
-            );
-            let sdpa = backend_tiled_q::Compute::new(&self.device, sdpa_config, self.split_kv_tiled_q_shape(shape));
+            let sdpa_config = self.split_kv_tiled_q_config(page_table_layout);
+            let sdpa =
+                backend_tiled_q::Compute::new(&self.device, sdpa_config, execution, self.split_kv_tiled_q_shape(shape));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
                 backend_tiled_q::MapBuffers {
                     q: scratch.q_norm_rope,
@@ -359,13 +356,7 @@ impl UngatedGQA {
         }
     }
 
-    fn split_kv_single_q_config(
-        &self,
-        page_table_layout: GQAPageTableLayout,
-        kv_tokens_per_iteration: u32,
-        required_threads: u32,
-        max_q_heads: u32,
-    ) -> backend_single_q::Config {
+    fn split_kv_single_q_config(&self, page_table_layout: GQAPageTableLayout) -> backend_single_q::Config {
         backend_single_q::Config {
             num_q_heads: self
                 .core
@@ -385,9 +376,6 @@ impl UngatedGQA {
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            kv_tokens_per_iteration,
-            required_threads,
-            max_q_heads,
             dtype: self.config.io_dtype,
         }
     }
@@ -399,13 +387,7 @@ impl UngatedGQA {
         }
     }
 
-    fn split_kv_tiled_q_config(
-        &self,
-        page_table_layout: GQAPageTableLayout,
-        max_q_tokens: u32,
-        kv_tokens_per_iteration: u32,
-        max_q_heads: u32,
-    ) -> backend_tiled_q::Config {
+    fn split_kv_tiled_q_config(&self, page_table_layout: GQAPageTableLayout) -> backend_tiled_q::Config {
         backend_tiled_q::Config {
             num_q_heads: self
                 .core
@@ -422,9 +404,6 @@ impl UngatedGQA {
                 .head_dim
                 .try_into()
                 .expect("ungated GQA head_dim must fit u32"),
-            max_q_heads,
-            max_q_tokens,
-            kv_tokens_per_iteration,
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             dtype: self.config.io_dtype,

@@ -355,21 +355,27 @@ Recording materializes the replay-specific `gqa::split_kv::single_q::Compute` or
 `gqa::split_kv::tiled_q::Compute`. The recorded invocation retains its Metal pipelines. The GQA owner must not add a
 second pipeline cache.
 
-SplitKV `SingleQ` exposes static geometry and tuning separately from dynamic replay work:
+SplitKV `SingleQ` and `TiledQ` separate model and storage facts from selected kernel constants and dynamic replay work:
 
 ```text
-gqa::split_kv::single_q::Config      gqa::split_kv::single_q::Shape
-  num_q_heads                     num_total_tokens
-  num_kv_heads                    num_total_sdpa_map_task_templates
+single_q::Config or tiled_q::Config    backend_sdpa::ExecutionVariant
+  num_q_heads                           map KernelConstants
+  num_kv_heads                          reduce KernelConstants
   head_dim
-  scale
-  page_bytes
+  scale                                single_q::Shape or tiled_q::Shape
+  page_bytes                            replay capacities
   page_table_layout
-  kv_tokens_per_iteration
-  required_threads
-  max_q_heads
   dtype
 ```
+
+The selected `backend_sdpa::ExecutionVariant` is the only source for `max_q_tokens`, `max_q_heads`,
+`kv_tokens_per_iteration`, and Map and Reduce `required_threads`. `GQAMetadataBuffers` retains this exact value.
+Recording passes it to `single_q::Compute::new(...)` or `tiled_q::Compute::new(...)` without copying its fields into
+`Config`.
+
+Each low-level SplitKV module binds `Config` and the selected variant in one private `KernelConstants` value. Source
+generation, scratch validation, and Map and Reduce dispatch use that value. The Map and Reduce thread requirements
+remain distinct fields even when a current variant gives them the same value.
 
 `num_total_sdpa_map_task_templates` is the shared shape field for the padded KV-split extent. It is not the number of
 KV iterations.

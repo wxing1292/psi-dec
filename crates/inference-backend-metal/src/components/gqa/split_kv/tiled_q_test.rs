@@ -19,7 +19,8 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let (config, shape) = tiled_workload(128, 8);
-    let kernels = Compute::new(&device, config, shape);
+    let execution = tiled_execution(config);
+    let kernels = Compute::new(&device, config, execution, shape);
     let q_values = generated_bf16_values(config.q_bytes(shape) as usize / size_of::<u16>(), 0x4751_4154);
     let kv_values_per_kind =
         config.num_tokens_per_page() as usize * config.num_kv_heads as usize * config.head_dim as usize;
@@ -33,9 +34,9 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let q_token_ranges = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
     let sdpa_map_task_templates = Buffer::new_zeroed_elements(&device, 3, Dtype::Uint32);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1]);
-    let partial_output = Buffer::new_zeroed(&device, config.partial_output_bytes(shape));
-    let partial_exp_sums = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(shape));
-    let partial_max_logits = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(shape));
+    let partial_output = Buffer::new_zeroed(&device, config.partial_output_bytes(execution, shape));
+    let partial_exp_sums = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(execution, shape));
+    let partial_max_logits = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(execution, shape));
     let output = Buffer::new_zeroed(&device, config.q_bytes(shape));
 
     let mut builder = stream.create_replay_program();
@@ -71,8 +72,9 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let replay = builder.build();
     let q_values_per_token = config.num_q_heads as usize * config.head_dim as usize;
     let kv_values_per_token = config.num_kv_heads as usize * config.head_dim as usize;
-    let partial_values_per_head = config.max_q_tokens as usize * config.head_dim as usize;
-    let partial_stats_per_head = config.max_q_tokens as usize;
+    let max_q_tokens = execution.map.thread_block.max_q_tokens;
+    let partial_values_per_head = max_q_tokens as usize * config.head_dim as usize;
+    let partial_stats_per_head = max_q_tokens as usize;
     let mut full_partial_output = None;
     let mut full_partial_exp_sums = None;
     let mut full_partial_max_logits = None;
@@ -95,14 +97,17 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
         q_token_ranges.write_typed(0, &[0_u32, num_active_tokens as u32]);
         sdpa_map_task_templates.write_typed(0, &[0_u32, 0, num_active_tokens as u32]);
         if case_index == 0 {
-            partial_output.write_typed(0, &vec![BF16_CANARY; config.partial_output_bytes(shape) as usize / 2]);
+            partial_output.write_typed(
+                0,
+                &vec![BF16_CANARY; config.partial_output_bytes(execution, shape) as usize / 2],
+            );
             partial_exp_sums.write_typed(
                 0,
-                &vec![F32_CANARY; config.partial_output_stats_bytes(shape) as usize / 4],
+                &vec![F32_CANARY; config.partial_output_stats_bytes(execution, shape) as usize / 4],
             );
             partial_max_logits.write_typed(
                 0,
-                &vec![F32_CANARY; config.partial_output_stats_bytes(shape) as usize / 4],
+                &vec![F32_CANARY; config.partial_output_stats_bytes(execution, shape) as usize / 4],
             );
             output.write_typed(0, &vec![BF16_CANARY; config.q_bytes(shape) as usize / 2]);
         }
@@ -130,12 +135,18 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
         let actual = read_bf16_values(&output, num_active_tokens * q_values_per_token);
         assert_close(&actual, &expected, 2.0e-2);
 
-        let partial_output_values =
-            partial_output.read_typed::<u16>(0, config.partial_output_bytes(shape) as usize / size_of::<u16>());
-        let partial_exp_sum_values =
-            partial_exp_sums.read_typed::<f32>(0, config.partial_output_stats_bytes(shape) as usize / size_of::<f32>());
-        let partial_max_logit_values = partial_max_logits
-            .read_typed::<f32>(0, config.partial_output_stats_bytes(shape) as usize / size_of::<f32>());
+        let partial_output_values = partial_output.read_typed::<u16>(
+            0,
+            config.partial_output_bytes(execution, shape) as usize / size_of::<u16>(),
+        );
+        let partial_exp_sum_values = partial_exp_sums.read_typed::<f32>(
+            0,
+            config.partial_output_stats_bytes(execution, shape) as usize / size_of::<f32>(),
+        );
+        let partial_max_logit_values = partial_max_logits.read_typed::<f32>(
+            0,
+            config.partial_output_stats_bytes(execution, shape) as usize / size_of::<f32>(),
+        );
         let output_values = output.read_typed::<u16>(0, config.q_bytes(shape) as usize / size_of::<u16>());
         if case_index == 0 {
             assert_head_tails(
@@ -223,9 +234,6 @@ fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (Config, Shape) {
             num_q_heads: 5,
             num_kv_heads: 1,
             head_dim,
-            max_q_heads: 5,
-            max_q_tokens: 8,
-            kv_tokens_per_iteration: 16,
             scale: (head_dim as f32).sqrt().recip(),
             page_bytes: 2 * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size() as u32,
             dtype: Dtype::Bfloat16,
@@ -242,6 +250,10 @@ fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (Config, Shape) {
             num_total_sdpa_map_task_templates: 1,
         },
     )
+}
+
+fn tiled_execution(config: Config) -> sdpa::ExecutionVariant {
+    sdpa::ExecutionVariant::tiled_q(config.sdpa_config(), 8, 16, 5)
 }
 
 fn fixture_core(config: Config) -> GQACore {

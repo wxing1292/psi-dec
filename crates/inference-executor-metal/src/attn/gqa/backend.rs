@@ -536,15 +536,16 @@ impl GQA {
         let active_tokens = ReplayU32::Parameter(active_tokens_key);
         let active_q_token_tiles = ReplayU32::Parameter(GQA_NUM_ACTIVE_Q_TOKEN_TILES);
         let active_kv_splits = ReplayU32::Parameter(GQA_NUM_ACTIVE_KV_SPLITS);
-        let map_constants = batch_metadata.variant().map.thread_block;
+        let execution = batch_metadata.variant();
+        let map_constants = execution.map.thread_block;
         if map_constants.max_q_tokens == 1 {
-            let sdpa_config = self.split_kv_single_q_config(
-                page_table_layout,
-                map_constants.kv_tokens_per_iteration,
-                map_constants.required_threads,
-                map_constants.max_q_heads,
+            let sdpa_config = self.split_kv_single_q_config(page_table_layout);
+            let sdpa = backend_single_q::Compute::new(
+                &self.device,
+                sdpa_config,
+                execution,
+                self.split_kv_single_q_shape(shape),
             );
-            let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, self.split_kv_single_q_shape(shape));
             let map_buffers = backend_single_q::MapBuffers {
                 q: scratch.q_norm_rope,
                 kv_pages: kv_cache.kv_pages,
@@ -575,13 +576,9 @@ impl GQA {
             };
             recorder.record_with_barrier_before(ReplayOp::opaque(reduce));
         } else {
-            let sdpa_config = self.split_kv_tiled_q_config(
-                page_table_layout,
-                map_constants.max_q_tokens,
-                map_constants.kv_tokens_per_iteration,
-                map_constants.max_q_heads,
-            );
-            let sdpa = backend_tiled_q::Compute::new(&self.device, sdpa_config, self.split_kv_tiled_q_shape(shape));
+            let sdpa_config = self.split_kv_tiled_q_config(page_table_layout);
+            let sdpa =
+                backend_tiled_q::Compute::new(&self.device, sdpa_config, execution, self.split_kv_tiled_q_shape(shape));
             let map_buffers = backend_tiled_q::MapBuffers {
                 q: scratch.q_norm_rope,
                 kv_pages: kv_cache.kv_pages,
@@ -647,13 +644,7 @@ impl GQA {
         }
     }
 
-    fn split_kv_single_q_config(
-        &self,
-        page_table_layout: GQAPageTableLayout,
-        kv_tokens_per_iteration: u32,
-        required_threads: u32,
-        max_q_heads: u32,
-    ) -> backend_single_q::Config {
+    fn split_kv_single_q_config(&self, page_table_layout: GQAPageTableLayout) -> backend_single_q::Config {
         debug_assert!(u32::try_from(self.core.num_q_heads).is_ok());
         debug_assert!(u32::try_from(self.core.num_kv_heads).is_ok());
         debug_assert!(u32::try_from(self.core.head_dim).is_ok());
@@ -664,9 +655,6 @@ impl GQA {
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            kv_tokens_per_iteration,
-            required_threads,
-            max_q_heads,
             dtype: self.config.io_dtype,
         }
     }
@@ -678,13 +666,7 @@ impl GQA {
         }
     }
 
-    fn split_kv_tiled_q_config(
-        &self,
-        page_table_layout: GQAPageTableLayout,
-        max_q_tokens: u32,
-        kv_tokens_per_iteration: u32,
-        max_q_heads: u32,
-    ) -> backend_tiled_q::Config {
+    fn split_kv_tiled_q_config(&self, page_table_layout: GQAPageTableLayout) -> backend_tiled_q::Config {
         debug_assert!(u32::try_from(self.core.num_q_heads).is_ok());
         debug_assert!(u32::try_from(self.core.num_kv_heads).is_ok());
         debug_assert!(u32::try_from(self.core.head_dim).is_ok());
@@ -692,9 +674,6 @@ impl GQA {
             num_q_heads: self.core.num_q_heads as u32,
             num_kv_heads: self.core.num_kv_heads as u32,
             head_dim: self.core.head_dim as u32,
-            max_q_heads,
-            max_q_tokens,
-            kv_tokens_per_iteration,
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             dtype: self.config.io_dtype,

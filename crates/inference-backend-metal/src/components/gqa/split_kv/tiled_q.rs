@@ -6,6 +6,7 @@ use crate::components::assert_u32_count_domain;
 use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
 use crate::components::gqa::kv_page_write::PageTableLayout;
+use crate::components::gqa::sdpa;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -15,6 +16,82 @@ use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("../../metal/gqa_split_kv_tiled_q.metal");
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KernelConstants {
+    config: Config,
+    map: sdpa::MapKernelConstants,
+    reduce: sdpa::ReduceKernelConstants,
+}
+
+impl KernelConstants {
+    fn new(config: Config, execution: sdpa::ExecutionVariant) -> Self {
+        config.validate();
+        assert!(execution.supports(config.sdpa_config()));
+        assert!(execution.map.thread_block.max_q_tokens > 1);
+        let constants = Self {
+            config,
+            map: execution.map,
+            reduce: execution.reduce,
+        };
+        assert_u32_count_domain(constants.num_head_groups(), "GQA SplitKV TiledQ head groups");
+        constants
+    }
+
+    fn num_q_head_ranges_per_kv_head(self) -> u32 {
+        self.config
+            .q_heads_per_kv_head()
+            .div_ceil(self.map.thread_block.max_q_heads)
+    }
+
+    fn num_head_groups(self) -> usize {
+        checked_product(
+            "GQA SplitKV TiledQ head-group count",
+            &[
+                self.config.num_kv_heads as usize,
+                self.num_q_head_ranges_per_kv_head() as usize,
+            ],
+        )
+    }
+
+    fn partial_output_bytes(self, shape: Shape) -> u64 {
+        checked_product_u64(
+            "GQA SplitKV TiledQ partial output byte length",
+            &[
+                shape.num_total_sdpa_map_task_templates as u64,
+                self.config.num_q_heads as u64,
+                self.map.thread_block.max_q_tokens as u64,
+                self.config.head_dim as u64,
+                self.config.dtype.item_size() as u64,
+            ],
+        )
+    }
+
+    fn partial_output_stats_bytes(self, shape: Shape) -> u64 {
+        checked_product_u64(
+            "GQA SplitKV TiledQ partial statistic byte length",
+            &[
+                shape.num_total_sdpa_map_task_templates as u64,
+                self.config.num_q_heads as u64,
+                self.map.thread_block.max_q_tokens as u64,
+                size_of::<f32>() as u64,
+            ],
+        )
+    }
+
+    fn map_threadblock_memory_bytes(self) -> usize {
+        let padded_head_dim = self.config.head_dim as usize + 16 / self.config.dtype.item_size();
+        checked_product(
+            "GQA SplitKV TiledQ threadgroup memory byte length",
+            &[
+                2,
+                self.map.thread_block.kv_tokens_per_iteration as usize,
+                padded_head_dim,
+                self.config.dtype.item_size(),
+            ],
+        )
+    }
+}
 
 /// SplitKV TiledQ SDPA (`T` = tokens, `H` = heads, `D` = head width):
 ///
@@ -46,9 +123,6 @@ pub struct Config {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
-    pub max_q_heads: u32,
-    pub max_q_tokens: u32,
-    pub kv_tokens_per_iteration: u32,
     pub scale: f32,
     pub page_bytes: u32,
     pub dtype: Dtype,
@@ -60,21 +134,15 @@ impl Config {
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
-        assert!(self.max_q_heads > 0);
-        assert!(self.max_q_heads <= self.q_heads_per_kv_head());
         let tiled_q_profile = (self.head_dim, self.num_tokens_per_page());
         assert!(
             matches!(tiled_q_profile, (128, 8) | (256, 8 | 16)),
             "GQA SplitKV TiledQ supports only (head_dim, tokens_per_page) profiles (128, 8), (256, 8), and (256, 16), \
              got {tiled_q_profile:?}"
         );
-        assert!(matches!(self.max_q_tokens, 8 | 16));
-        assert!(matches!(self.kv_tokens_per_iteration, 8 | 16));
-        assert!(self.required_threads() <= 256);
         assert!(self.scale > 0.0);
         assert_eq!(self.dtype, Dtype::Bfloat16, "GQA SplitKV TiledQ specializes bf16");
         self.page_table_layout.validate();
-        assert_u32_count_domain(self.num_head_groups(), "GQA SplitKV TiledQ head groups");
     }
 
     pub fn num_tokens_per_page(self) -> u32 {
@@ -92,26 +160,14 @@ impl Config {
         self.num_q_heads / self.num_kv_heads
     }
 
-    pub fn num_q_head_ranges_per_kv_head(self) -> u32 {
-        self.q_heads_per_kv_head().div_ceil(self.max_q_heads)
-    }
-
-    fn num_head_groups(self) -> usize {
-        checked_product(
-            "GQA SplitKV TiledQ head-group count",
-            &[
-                self.num_kv_heads as usize,
-                self.num_q_head_ranges_per_kv_head() as usize,
-            ],
-        )
-    }
-
-    pub fn required_threads(self) -> u32 {
-        self.max_q_tokens
-            .checked_div(8)
-            .and_then(|threads| threads.checked_mul(self.max_q_heads))
-            .and_then(|threads| threads.checked_mul(32))
-            .expect("GQA SplitKV TiledQ threadblock width must fit u32")
+    fn sdpa_config(self) -> sdpa::Config {
+        sdpa::Config {
+            io_dtype: self.dtype,
+            num_q_heads: self.num_q_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            tokens_per_page: self.num_tokens_per_page(),
+        }
     }
 
     pub fn q_bytes(self, shape: Shape) -> u64 {
@@ -126,42 +182,16 @@ impl Config {
         )
     }
 
-    pub fn partial_output_bytes(self, shape: Shape) -> u64 {
-        checked_product_u64(
-            "GQA SplitKV TiledQ partial output byte length",
-            &[
-                shape.num_total_sdpa_map_task_templates as u64,
-                self.num_q_heads as u64,
-                self.max_q_tokens as u64,
-                self.head_dim as u64,
-                self.dtype.item_size() as u64,
-            ],
-        )
+    pub fn partial_output_bytes(self, execution: sdpa::ExecutionVariant, shape: Shape) -> u64 {
+        KernelConstants::new(self, execution).partial_output_bytes(shape)
     }
 
-    pub fn partial_output_stats_bytes(self, shape: Shape) -> u64 {
-        checked_product_u64(
-            "GQA SplitKV TiledQ partial statistic byte length",
-            &[
-                shape.num_total_sdpa_map_task_templates as u64,
-                self.num_q_heads as u64,
-                self.max_q_tokens as u64,
-                size_of::<f32>() as u64,
-            ],
-        )
+    pub fn partial_output_stats_bytes(self, execution: sdpa::ExecutionVariant, shape: Shape) -> u64 {
+        KernelConstants::new(self, execution).partial_output_stats_bytes(shape)
     }
 
-    pub fn map_threadblock_memory_bytes(self) -> usize {
-        let padded_head_dim = self.head_dim as usize + 16 / self.dtype.item_size();
-        checked_product(
-            "GQA SplitKV TiledQ threadgroup memory byte length",
-            &[
-                2,
-                self.kv_tokens_per_iteration as usize,
-                padded_head_dim,
-                self.dtype.item_size(),
-            ],
-        )
+    pub fn map_threadblock_memory_bytes(self, execution: sdpa::ExecutionVariant) -> usize {
+        KernelConstants::new(self, execution).map_threadblock_memory_bytes()
     }
 }
 
@@ -239,24 +269,25 @@ pub struct ReduceBuffers<'a> {
 }
 
 pub struct Compute {
-    config: Config,
+    constants: KernelConstants,
     shape: Shape,
     map: Kernel,
     reduce: Kernel,
 }
 
 impl Compute {
-    pub fn new(device: &Device, config: Config, shape: Shape) -> Self {
+    pub fn new(device: &Device, config: Config, execution: sdpa::ExecutionVariant, shape: Shape) -> Self {
+        let constants = KernelConstants::new(config, execution);
         shape.validate(config);
         assert!(
-            config.map_threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
+            constants.map_threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
             "GQA SplitKV TiledQ shape needs {} bytes of threadblock memory but device only supports {}",
-            config.map_threadblock_memory_bytes(),
+            constants.map_threadblock_memory_bytes(),
             device.max_threadblock_memory_length()
         );
-        let source = source(config, shape);
+        let source = source(constants, shape);
         Self {
-            config,
+            constants,
             shape,
             map: Kernel::new(device, &source, "gqa_split_kv_tiled_q_map"),
             reduce: Kernel::new(device, &source, "gqa_split_kv_tiled_q_reduce"),
@@ -266,7 +297,7 @@ impl Compute {
     pub fn invoke_map<'a>(&self, buffers: MapBuffers<'a>, page_table_index: ReplayU32) -> MapInvocation<'a> {
         MapInvocation {
             pipeline: self.map.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             page_table_index,
@@ -286,7 +317,7 @@ impl Compute {
     ) -> MapInvocation<'a> {
         MapInvocation {
             pipeline: self.map.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             page_table_index,
@@ -299,7 +330,7 @@ impl Compute {
     pub fn invoke_reduce<'a>(&self, buffers: ReduceBuffers<'a>) -> ReduceInvocation<'a> {
         ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             num_active_q_token_tiles: ReplayU32::Fixed(self.shape.num_total_q_token_tiles),
@@ -313,7 +344,7 @@ impl Compute {
     ) -> ReduceInvocation<'a> {
         ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             num_active_q_token_tiles,
@@ -323,7 +354,7 @@ impl Compute {
 
 pub struct MapInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: Config,
+    constants: KernelConstants,
     shape: Shape,
     buffers: MapBuffers<'a>,
     page_table_index: ReplayU32,
@@ -335,7 +366,8 @@ pub struct MapInvocation<'a> {
 impl Operator for MapInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let shape = self.shape;
-        let config = self.config;
+        let constants = self.constants;
+        let config = constants.config;
         shape.validate(config);
         assert!(self.buffers.q.len_bytes_u64() >= config.q_bytes(shape));
         assert!(self.buffers.kv_pages.len_bytes() >= config.page_bytes as usize);
@@ -347,9 +379,9 @@ impl Operator for MapInvocation<'_> {
             self.buffers.sdpa_map_task_templates.len_bytes()
                 >= shape.num_sdpa_map_task_template_values() * size_of::<u32>()
         );
-        assert!(self.buffers.partial_output.len_bytes_u64() >= config.partial_output_bytes(shape));
-        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
-        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
+        assert!(self.buffers.partial_output.len_bytes_u64() >= constants.partial_output_bytes(shape));
+        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= constants.partial_output_stats_bytes(shape));
+        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= constants.partial_output_stats_bytes(shape));
         recorder.set_retained_pipeline_state(&self.pipeline);
         recorder.set_buffer_read(0, self.buffers.q, 0);
         recorder.set_buffer_read(1, self.buffers.kv_pages, 0);
@@ -393,21 +425,21 @@ impl Operator for MapInvocation<'_> {
             shape.num_total_tokens,
             "GQA SplitKV TiledQ active token count",
         );
-        recorder.set_threadblock_memory_length(0, config.map_threadblock_memory_bytes());
+        recorder.set_threadblock_memory_length(0, constants.map_threadblock_memory_bytes());
         recorder.dispatch_threadblocks(
             (
-                config.num_head_groups(),
+                constants.num_head_groups(),
                 shape.num_total_sdpa_map_task_templates as usize,
                 1,
             ),
-            (config.required_threads() as usize, 1, 1),
+            (constants.map.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
 pub struct ReduceInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: Config,
+    constants: KernelConstants,
     shape: Shape,
     buffers: ReduceBuffers<'a>,
     num_active_q_token_tiles: ReplayU32,
@@ -416,11 +448,12 @@ pub struct ReduceInvocation<'a> {
 impl Operator for ReduceInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let shape = self.shape;
-        let config = self.config;
+        let constants = self.constants;
+        let config = constants.config;
         shape.validate(config);
-        assert!(self.buffers.partial_output.len_bytes_u64() >= config.partial_output_bytes(shape));
-        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
-        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= config.partial_output_stats_bytes(shape));
+        assert!(self.buffers.partial_output.len_bytes_u64() >= constants.partial_output_bytes(shape));
+        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= constants.partial_output_stats_bytes(shape));
+        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= constants.partial_output_stats_bytes(shape));
         assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_range_values() * size_of::<u32>());
         assert!(
             self.buffers.cu_sdpa_partial_outputs.len_bytes()
@@ -444,12 +477,15 @@ impl Operator for ReduceInvocation<'_> {
         );
         recorder.dispatch_threadblocks(
             (config.num_q_heads as usize, shape.num_total_q_token_tiles as usize, 1),
-            (config.required_threads() as usize, 1, 1),
+            (constants.reduce.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
 
-fn source(config: Config, shape: Shape) -> String {
+fn source(constants: KernelConstants, shape: Shape) -> String {
+    let config = constants.config;
+    let map = constants.map.thread_block;
+    let reduce = constants.reduce.thread_block;
     format!(
         r#"
 #define NUM_TOKENS {num_tokens}
@@ -466,14 +502,15 @@ fn source(config: Config, shape: Shape) -> String {
 #define NUM_PAGE_IDS_PER_BLOCK {num_page_ids_per_block}
 #define MAX_Q_TOKENS {max_q_tokens}
 #define KV_TOKENS_PER_ITERATION {kv_tokens_per_iteration}
-#define REQUIRED_THREADS {required_threads}
+#define MAP_REQUIRED_THREADS {map_required_threads}
+#define REDUCE_REQUIRED_THREADS {reduce_required_threads}
 {body}
 "#,
         num_tokens = shape.num_total_tokens,
         num_q_heads = config.num_q_heads,
         num_kv_heads = config.num_kv_heads,
-        max_q_heads = config.max_q_heads,
-        num_q_head_ranges_per_kv_head = config.num_q_head_ranges_per_kv_head(),
+        max_q_heads = map.max_q_heads,
+        num_q_head_ranges_per_kv_head = constants.num_q_head_ranges_per_kv_head(),
         head_dim = config.head_dim,
         scale = config.scale,
         page_bytes = config.page_bytes,
@@ -481,9 +518,10 @@ fn source(config: Config, shape: Shape) -> String {
         num_gqa_layers = config.page_table_layout.num_gqa_layers,
         num_blocks = config.page_table_layout.num_blocks,
         num_page_ids_per_block = config.page_table_layout.num_page_ids_per_block,
-        max_q_tokens = config.max_q_tokens,
-        kv_tokens_per_iteration = config.kv_tokens_per_iteration,
-        required_threads = config.required_threads(),
+        max_q_tokens = map.max_q_tokens,
+        kv_tokens_per_iteration = map.kv_tokens_per_iteration,
+        map_required_threads = map.required_threads,
+        reduce_required_threads = reduce.required_threads,
         body = SOURCE,
     )
 }

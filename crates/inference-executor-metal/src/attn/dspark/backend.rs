@@ -120,14 +120,8 @@ impl UngatedDSparkGQA {
         (shape, sdpa_execution)
     }
 
-    fn split_kv_single_q_config(
-        &self,
-        sdpa_execution: backend_sdpa::ExecutionVariant,
-        page_table_layout: GQAPageTableLayout,
-    ) -> backend_single_q::Config {
+    fn split_kv_single_q_config(&self, page_table_layout: GQAPageTableLayout) -> backend_single_q::Config {
         let attention = &self.core.attention;
-        let map = sdpa_execution.map.thread_block;
-        assert_eq!(map.max_q_tokens, 1);
         backend_single_q::Config {
             num_q_heads: attention
                 .num_q_heads
@@ -141,9 +135,6 @@ impl UngatedDSparkGQA {
             scale: attention.scale,
             page_bytes: self.metal.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
-            kv_tokens_per_iteration: map.kv_tokens_per_iteration,
-            required_threads: map.required_threads,
-            max_q_heads: map.max_q_heads,
             dtype: self.metal.io_dtype,
         }
     }
@@ -212,12 +203,12 @@ impl ReplayLayer for UngatedDSparkGQA {
             },
         )));
 
-        let sdpa_config = self.split_kv_single_q_config(sdpa_execution, input.page_table_layout);
+        let sdpa_config = self.split_kv_single_q_config(input.page_table_layout);
         let sdpa_shape = backend_single_q::Shape {
             num_total_tokens: shape.num_tokens,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         };
-        let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, sdpa_shape);
+        let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, sdpa_execution, sdpa_shape);
         recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
             backend_single_q::MapBuffers {
                 q: scratch.q_norm_rope,

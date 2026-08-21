@@ -355,8 +355,6 @@ impl Fixture {
             &pages,
             &page_ids,
             &scratch,
-            split_kv_single_q_max_q_heads,
-            params,
         );
         let split_kv_tiled_q = split_kv_tiled_q_replay(
             device,
@@ -368,8 +366,6 @@ impl Fixture {
             &pages,
             &page_ids,
             &scratch,
-            split_kv_tiled_q_max_q_heads,
-            params,
         );
         let affine_replays = affine_replays(
             device,
@@ -444,6 +440,7 @@ impl Fixture {
             + self.params.split_kv_single_q_required_threads as usize)
             * size_of::<f32>();
         let tiled_config = self.tiled_config();
+        let tiled_execution = self.split_kv_tiled_q_metadata.variant();
         let single_q_output_accumulators = self.split_kv_single_q_max_q_heads as usize
             * (self.core.head_dim as u32).div_ceil(self.params.split_kv_single_q_required_threads) as usize;
         println!(
@@ -466,10 +463,10 @@ impl Fixture {
             single_q_output_accumulators,
             self.production_tiled_q_max_q_heads,
             self.split_kv_tiled_q_max_q_heads,
-            tiled_config.required_threads(),
+            tiled_execution.map.thread_block.required_threads,
             self.params.split_kv_tiled_q_max_q_tokens,
             self.params.split_kv_tiled_q_kv_tokens_per_iteration,
-            tiled_config.map_threadblock_memory_bytes(),
+            tiled_config.map_threadblock_memory_bytes(tiled_execution),
             self.core.head_dim / 8,
         );
     }
@@ -523,9 +520,6 @@ impl Fixture {
             num_q_heads: self.core.num_q_heads.try_into().expect("q heads must fit u32"),
             num_kv_heads: self.core.num_kv_heads.try_into().expect("KV heads must fit u32"),
             head_dim: self.core.head_dim.try_into().expect("head dim must fit u32"),
-            max_q_heads: self.split_kv_tiled_q_max_q_heads,
-            max_q_tokens: self.params.split_kv_tiled_q_max_q_tokens,
-            kv_tokens_per_iteration: self.params.split_kv_tiled_q_kv_tokens_per_iteration,
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             dtype: self.config.io_dtype,
@@ -709,8 +703,6 @@ fn split_kv_single_q_replay(
     pages: &Buffer,
     page_ids: &Buffer,
     scratch: &UngatedGQAScratch,
-    max_q_heads: u32,
-    params: BenchParams,
 ) -> ReplayProgram {
     let shape = metadata.replay_shape();
     let sdpa_shape = backend_single_q::Shape {
@@ -729,12 +721,9 @@ fn split_kv_single_q_replay(
             num_gqa_layers: page_table_layout.num_gqa_layers,
             num_page_ids_per_block: page_table_layout.num_page_ids_per_block,
         },
-        kv_tokens_per_iteration: params.split_kv_single_q_kv_tokens_per_iteration,
-        required_threads: params.split_kv_single_q_required_threads,
-        max_q_heads,
         dtype: config.io_dtype,
     };
-    let kernels = backend_single_q::Compute::new(device, sdpa_config, sdpa_shape);
+    let kernels = backend_single_q::Compute::new(device, sdpa_config, metadata.variant(), sdpa_shape);
     let scratch = scratch.bindings();
     let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
     recorder.record(ReplayOp::opaque(kernels.invoke_map(
@@ -773,17 +762,12 @@ fn split_kv_tiled_q_replay(
     pages: &Buffer,
     page_ids: &Buffer,
     scratch: &UngatedGQAScratch,
-    max_q_heads: u32,
-    params: BenchParams,
 ) -> ReplayProgram {
     let shape = metadata.replay_shape();
     let tiled_config = backend_tiled_q::Config {
         num_q_heads: core.num_q_heads.try_into().expect("q heads must fit u32"),
         num_kv_heads: core.num_kv_heads.try_into().expect("KV heads must fit u32"),
         head_dim: core.head_dim.try_into().expect("head dim must fit u32"),
-        max_q_heads,
-        max_q_tokens: params.split_kv_tiled_q_max_q_tokens,
-        kv_tokens_per_iteration: params.split_kv_tiled_q_kv_tokens_per_iteration,
         scale: core.scale,
         page_bytes: config.page_bytes,
         dtype: config.io_dtype,
@@ -799,7 +783,7 @@ fn split_kv_tiled_q_replay(
         num_total_q_token_tiles: shape.num_q_token_tiles,
         num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
     };
-    let kernels = backend_tiled_q::Compute::new(device, tiled_config, tiled_shape);
+    let kernels = backend_tiled_q::Compute::new(device, tiled_config, metadata.variant(), tiled_shape);
     let scratch = scratch.bindings();
     let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
     recorder.record(ReplayOp::opaque(kernels.invoke_map(

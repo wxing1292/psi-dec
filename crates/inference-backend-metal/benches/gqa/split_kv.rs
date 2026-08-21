@@ -6,6 +6,7 @@ use criterion::criterion_group;
 use criterion::criterion_main;
 use half::bf16;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -82,11 +83,20 @@ impl GQAFixture {
             scale: 1.0 / (GQA_HEAD_DIM as f32).sqrt(),
             page_bytes: 2 * GQA_NUM_KV_HEADS * GQA_TOKENS_PER_PAGE * GQA_HEAD_DIM * Dtype::Bfloat16.item_size() as u32,
             page_table_layout,
-            kv_tokens_per_iteration: GQA_KV_TOKEN_TILE_SIZE,
-            required_threads: GQA_NUM_THREADS_PER_THREADBLOCK,
-            max_q_heads: (GQA_NUM_Q_HEADS / GQA_NUM_KV_HEADS).min(GQA_Q_HEAD_TILE_SIZE_CAP),
             dtype: Dtype::Bfloat16,
         };
+        let execution = backend_sdpa::ExecutionVariant::single_q(
+            backend_sdpa::Config {
+                io_dtype: config.dtype,
+                num_q_heads: config.num_q_heads,
+                num_kv_heads: config.num_kv_heads,
+                head_dim: config.head_dim,
+                tokens_per_page: config.num_tokens_per_page(),
+            },
+            GQA_KV_TOKEN_TILE_SIZE,
+            GQA_NUM_THREADS_PER_THREADBLOCK,
+            (GQA_NUM_Q_HEADS / GQA_NUM_KV_HEADS).min(GQA_Q_HEAD_TILE_SIZE_CAP),
+        );
         let shape = backend_single_q::Shape {
             num_total_tokens: num_tokens,
             num_total_sdpa_map_task_templates: num_total_kv_splits,
@@ -110,7 +120,7 @@ impl GQAFixture {
         let scratch = backend_single_q::Scratch::new(device, config, shape);
         let output = Buffer::new_zeroed(device, config.q_bytes(shape));
         let stream = Stream::new(device);
-        let kernels = backend_single_q::Compute::new(device, config, shape);
+        let kernels = backend_single_q::Compute::new(device, config, execution, shape);
         let replay = build_gqa_replay(
             &stream,
             &kernels,

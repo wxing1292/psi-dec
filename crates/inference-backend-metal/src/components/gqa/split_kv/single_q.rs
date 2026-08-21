@@ -6,6 +6,7 @@ use crate::components::assert_u32_count_domain;
 use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
 use crate::components::gqa::kv_page_write::PageTableLayout;
+use crate::components::gqa::sdpa;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -16,6 +17,50 @@ use crate::metal::ReplayU32;
 
 const MAP_SOURCE: &str = include_str!("../../metal/gqa_split_kv_single_q_map.metal");
 const REDUCE_SOURCE: &str = include_str!("../../metal/gqa_split_kv_single_q_reduce.metal");
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KernelConstants {
+    config: Config,
+    map: sdpa::MapKernelConstants,
+    reduce: sdpa::ReduceKernelConstants,
+}
+
+impl KernelConstants {
+    fn new(config: Config, execution: sdpa::ExecutionVariant) -> Self {
+        config.validate();
+        assert!(execution.supports(config.sdpa_config()));
+        assert_eq!(execution.map.thread_block.max_q_tokens, 1);
+        Self {
+            config,
+            map: execution.map,
+            reduce: execution.reduce,
+        }
+    }
+
+    fn map_threadblock_memory_bytes(self) -> usize {
+        let map = self.map.thread_block;
+        (map.max_q_heads as usize * map.kv_tokens_per_iteration as usize + map.required_threads as usize)
+            * size_of::<f32>()
+    }
+
+    fn num_q_head_ranges_per_kv_head(self) -> u32 {
+        self.config
+            .q_heads_per_kv_head()
+            .div_ceil(self.map.thread_block.max_q_heads)
+    }
+
+    fn map_threads(self, shape: Shape) -> usize {
+        checked_product(
+            "GQA SDPA map thread count",
+            &[
+                shape.num_total_sdpa_map_task_templates as usize,
+                self.config.num_kv_heads as usize,
+                self.num_q_head_ranges_per_kv_head() as usize,
+                self.map.thread_block.required_threads as usize,
+            ],
+        )
+    }
+}
 
 /// SplitKV SingleQ SDPA (`T` = tokens, `H` = heads, `D` = head width):
 ///
@@ -49,9 +94,6 @@ pub struct Config {
     pub scale: f32,
     pub page_bytes: u32,
     pub page_table_layout: PageTableLayout,
-    pub kv_tokens_per_iteration: u32,
-    pub required_threads: u32,
-    pub max_q_heads: u32,
     pub dtype: Dtype,
 }
 
@@ -64,10 +106,6 @@ impl Config {
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
         assert!(self.num_tokens_per_page() > 0);
         self.page_table_layout.validate();
-        assert!(self.kv_tokens_per_iteration > 0 && self.kv_tokens_per_iteration <= 1024);
-        assert!(self.required_threads.is_power_of_two() && self.required_threads <= 256);
-        assert!(self.max_q_heads > 0 && self.max_q_heads <= 8);
-        assert!(self.max_q_heads <= self.q_heads_per_kv_head());
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
@@ -89,25 +127,14 @@ impl Config {
         self.num_q_heads / self.num_kv_heads
     }
 
-    pub fn threadblock_memory_bytes(self) -> usize {
-        (self.max_q_heads as usize * self.kv_tokens_per_iteration as usize + self.required_threads as usize)
-            * size_of::<f32>()
-    }
-
-    pub fn num_q_head_ranges_per_kv_head(self) -> u32 {
-        self.q_heads_per_kv_head().div_ceil(self.max_q_heads)
-    }
-
-    pub fn map_threads(self, shape: Shape) -> usize {
-        checked_product(
-            "GQA SDPA map thread count",
-            &[
-                shape.num_total_sdpa_map_task_templates as usize,
-                self.num_kv_heads as usize,
-                self.num_q_head_ranges_per_kv_head() as usize,
-                self.required_threads as usize,
-            ],
-        )
+    fn sdpa_config(self) -> sdpa::Config {
+        sdpa::Config {
+            io_dtype: self.dtype,
+            num_q_heads: self.num_q_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            tokens_per_page: self.num_tokens_per_page(),
+        }
     }
 
     pub fn num_output_values(self, shape: Shape) -> usize {
@@ -201,7 +228,6 @@ impl Shape {
             "GQA SDPA partial-output stats",
         );
         assert_u32_index_domain(config.num_partial_output_values(self), "GQA SDPA partial output");
-        assert_u32_count_domain(config.map_threads(self), "GQA SDPA map threads");
     }
 }
 
@@ -274,19 +300,21 @@ impl Scratch {
 }
 
 pub struct Compute {
-    config: Config,
+    constants: KernelConstants,
     shape: Shape,
     map: Kernel,
     reduce: Kernel,
 }
 
 impl Compute {
-    pub fn new(device: &Device, config: Config, shape: Shape) -> Self {
+    pub fn new(device: &Device, config: Config, execution: sdpa::ExecutionVariant, shape: Shape) -> Self {
+        let constants = KernelConstants::new(config, execution);
         shape.validate(config);
+        assert_u32_count_domain(constants.map_threads(shape), "GQA SDPA map threads");
         assert!(
-            config.threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
+            constants.map_threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
             "GQA SplitKV SingleQ shape needs {} bytes of threadblock memory but device only supports {}",
-            config.threadblock_memory_bytes(),
+            constants.map_threadblock_memory_bytes(),
             device.max_threadblock_memory_length()
         );
         let reduce_function_name = match config.dtype {
@@ -295,16 +323,16 @@ impl Compute {
             dtype => panic!("unsupported GQA SplitKV SingleQ reduce dtype {dtype:?}"),
         };
         Self {
-            config,
+            constants,
             shape,
             map: Kernel::new(
                 device,
-                &gqa_split_kv_single_q_map_source(config, shape),
+                &gqa_split_kv_single_q_map_source(constants, shape),
                 "gqa_split_kv_single_q_map",
             ),
             reduce: Kernel::new(
                 device,
-                &gqa_split_kv_single_q_reduce_source(config),
+                &gqa_split_kv_single_q_reduce_source(constants),
                 reduce_function_name,
             ),
         }
@@ -313,7 +341,7 @@ impl Compute {
     pub fn invoke_map<'a>(&self, buffers: MapBuffers<'a>, page_table_index: ReplayU32) -> MapInvocation<'a> {
         MapInvocation {
             pipeline: self.map.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             page_table_index,
@@ -331,7 +359,7 @@ impl Compute {
     ) -> MapInvocation<'a> {
         MapInvocation {
             pipeline: self.map.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             page_table_index,
@@ -343,7 +371,7 @@ impl Compute {
     pub fn invoke_reduce<'a>(&self, buffers: ReduceBuffers<'a>) -> ReduceInvocation<'a> {
         ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             num_active_tokens: ReplayU32::Fixed(self.shape.num_total_tokens),
@@ -357,7 +385,7 @@ impl Compute {
     ) -> ReduceInvocation<'a> {
         ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
-            config: self.config,
+            constants: self.constants,
             shape: self.shape,
             buffers,
             num_active_tokens,
@@ -365,7 +393,9 @@ impl Compute {
     }
 }
 
-fn gqa_split_kv_single_q_map_source(config: Config, shape: Shape) -> String {
+fn gqa_split_kv_single_q_map_source(constants: KernelConstants, shape: Shape) -> String {
+    let config = constants.config;
+    let map = constants.map.thread_block;
     let dtype = metal_dtype_name(config.dtype);
     let body = MAP_SOURCE
         .replace("uint global_thread_index = thread_position_in_grid.x;\n", "")
@@ -420,15 +450,15 @@ kernel void gqa_split_kv_single_q_map(
         head_dim = config.head_dim,
         scale = config.scale,
         q_heads_per_kv_head = config.q_heads_per_kv_head(),
-        max_q_heads = config.max_q_heads,
-        num_q_head_ranges_per_kv_head = config.num_q_head_ranges_per_kv_head(),
+        max_q_heads = map.max_q_heads,
+        num_q_head_ranges_per_kv_head = constants.num_q_head_ranges_per_kv_head(),
         num_kv_heads = config.num_kv_heads,
         num_tokens = config.num_tokens_per_page(),
         num_q_heads = config.num_q_heads,
         page_bytes = config.page_bytes,
-        kv_tokens_per_iteration = config.kv_tokens_per_iteration,
+        kv_tokens_per_iteration = map.kv_tokens_per_iteration,
         num_total_kv_splits = shape.num_total_sdpa_map_task_templates,
-        required_threads = config.required_threads,
+        required_threads = map.required_threads,
         num_gqa_layers = config.page_table_layout.num_gqa_layers,
         num_blocks = config.page_table_layout.num_blocks,
         num_page_ids_per_block = config.page_table_layout.num_page_ids_per_block,
@@ -446,7 +476,7 @@ fn metal_dtype_name(dtype: Dtype) -> &'static str {
 
 pub struct MapInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: Config,
+    constants: KernelConstants,
     shape: Shape,
     buffers: MapBuffers<'a>,
     page_table_index: ReplayU32,
@@ -467,7 +497,7 @@ impl Operator for MapInvocation<'_> {
         recorder.set_buffer_write(5, self.buffers.partial_exp_sums, 0);
         recorder.set_buffer_write(6, self.buffers.partial_max_logits, 0);
         recorder.set_buffer_write(7, self.buffers.partial_output, 0);
-        let max_page_table_index = self.config.page_table_layout.num_gqa_layers - 1;
+        let max_page_table_index = self.constants.config.page_table_layout.num_gqa_layers - 1;
         match self.page_table_index {
             ReplayU32::Fixed(page_table_index) => {
                 assert!(
@@ -492,30 +522,33 @@ impl Operator for MapInvocation<'_> {
             shape.num_total_sdpa_map_task_templates,
             "GQA SplitKV SingleQ active KV split count",
         );
-        recorder.dispatch_1d(self.config.map_threads(shape), self.config.required_threads as usize);
+        recorder.dispatch_1d(
+            self.constants.map_threads(shape),
+            self.constants.map.thread_block.required_threads as usize,
+        );
     }
 }
 
 impl MapInvocation<'_> {
     fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.q.len_bytes_u64() >= self.config.q_bytes(self.shape));
-        assert!(self.buffers.kv_pages.len_bytes_u64() >= self.config.page_bytes as u64);
-        assert!(self.buffers.req_slots.len_bytes_u64() >= self.config.req_slots_bytes(self.shape));
-        assert!(self.buffers.page_ids.len_bytes_u64() >= self.config.page_ids_bytes());
+        let config = self.constants.config;
+        self.shape.validate(config);
+        assert!(self.buffers.q.len_bytes_u64() >= config.q_bytes(self.shape));
+        assert!(self.buffers.kv_pages.len_bytes_u64() >= config.page_bytes as u64);
+        assert!(self.buffers.req_slots.len_bytes_u64() >= config.req_slots_bytes(self.shape));
+        assert!(self.buffers.page_ids.len_bytes_u64() >= config.page_ids_bytes());
         assert!(
-            self.buffers.sdpa_map_task_templates.len_bytes_u64()
-                >= self.config.sdpa_map_task_templates_bytes(self.shape)
+            self.buffers.sdpa_map_task_templates.len_bytes_u64() >= config.sdpa_map_task_templates_bytes(self.shape)
         );
-        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
-        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
-        assert!(self.buffers.partial_output.len_bytes_u64() >= self.config.partial_output_bytes(self.shape));
+        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= config.partial_output_stats_bytes(self.shape));
+        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= config.partial_output_stats_bytes(self.shape));
+        assert!(self.buffers.partial_output.len_bytes_u64() >= config.partial_output_bytes(self.shape));
     }
 }
 
 pub struct ReduceInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: Config,
+    constants: KernelConstants,
     shape: Shape,
     buffers: ReduceBuffers<'a>,
     num_active_tokens: ReplayU32,
@@ -538,7 +571,10 @@ impl Operator for ReduceInvocation<'_> {
             shape.num_total_tokens,
             "GQA SplitKV SingleQ active token count",
         );
-        recorder.dispatch_1d(self.config.num_output_values(shape), 256);
+        recorder.dispatch_1d(
+            self.constants.config.num_output_values(shape),
+            self.constants.reduce.thread_block.required_threads as usize,
+        );
     }
 }
 
@@ -555,19 +591,20 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 
 impl ReduceInvocation<'_> {
     fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
-        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
-        assert!(self.buffers.partial_output.len_bytes_u64() >= self.config.partial_output_bytes(self.shape));
+        let config = self.constants.config;
+        self.shape.validate(config);
+        assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= config.partial_output_stats_bytes(self.shape));
+        assert!(self.buffers.partial_max_logits.len_bytes_u64() >= config.partial_output_stats_bytes(self.shape));
+        assert!(self.buffers.partial_output.len_bytes_u64() >= config.partial_output_bytes(self.shape));
         assert!(
-            self.buffers.cu_sdpa_partial_outputs.len_bytes_u64()
-                >= self.config.cu_sdpa_partial_outputs_bytes(self.shape)
+            self.buffers.cu_sdpa_partial_outputs.len_bytes_u64() >= config.cu_sdpa_partial_outputs_bytes(self.shape)
         );
-        assert!(self.buffers.output.len_bytes_u64() >= self.config.q_bytes(self.shape));
+        assert!(self.buffers.output.len_bytes_u64() >= config.q_bytes(self.shape));
     }
 }
 
-fn gqa_split_kv_single_q_reduce_source(config: Config) -> String {
+fn gqa_split_kv_single_q_reduce_source(constants: KernelConstants) -> String {
+    let config = constants.config;
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_q_heads = {}u;\nconstant uint head_dim = {}u;",
         config.num_q_heads, config.head_dim,

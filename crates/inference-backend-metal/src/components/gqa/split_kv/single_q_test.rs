@@ -25,9 +25,6 @@ fn test_sdpa_shape_rejects_shader_count_overflow() {
             num_blocks: 1,
             num_page_ids_per_block: 1,
         },
-        kv_tokens_per_iteration: 1,
-        required_threads: 32,
-        max_q_heads: 1,
         dtype: Dtype::Bfloat16,
     };
     Shape {
@@ -92,7 +89,7 @@ fn test_bucketed_replay_matches_active_prefix_and_preserves_output_tail() {
     let sentinel = -321.0_f32;
     let output = Buffer::from_slice(&device, &vec![sentinel; config.num_output_values(shape)]);
     let scratch = Scratch::new(&device, config, shape);
-    let kernels = Compute::new(&device, config, shape);
+    let kernels = Compute::new(&device, config, fixture_execution(config), shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map_bucketed(
         scratch.map_buffers(&q_buffer, &kv_pages_buffer, &req_slots, &page_ids, &task_templates),
@@ -271,11 +268,12 @@ fn fixture_config() -> Config {
             num_gqa_layers: 1,
             num_page_ids_per_block: 1,
         },
-        kv_tokens_per_iteration: 4,
-        required_threads: 64,
-        max_q_heads: 2,
         dtype: Dtype::Float32,
     }
+}
+
+fn fixture_execution(config: Config) -> sdpa::ExecutionVariant {
+    sdpa::ExecutionVariant::single_q(config.sdpa_config(), 4, 64, 2)
 }
 
 fn fixture_shape() -> Shape {
@@ -308,13 +306,14 @@ struct TestInput<'a> {
 fn run_gqa_split_kv_single_q(config: Config, shape: Shape, input: TestInput<'_>) -> Vec<f32> {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let kernels = Compute::new(&device, config, shape);
+    let execution = fixture_execution(config);
+    let kernels = Compute::new(&device, config, execution, shape);
     let q = Buffer::from_slice(&device, input.q);
     let kv_pages = Buffer::from_slice(&device, input.kv_pages);
     let req_slots = Buffer::from_slice(&device, input.req_slots);
     let page_ids = Buffer::from_slice(&device, input.page_ids);
     let (sdpa_map_task_template_values, cu_sdpa_partial_output_values) =
-        sdpa_map_task_template_buffers(config, shape, input.flat_token_indices);
+        sdpa_map_task_template_buffers(execution, shape, input.flat_token_indices);
     let sdpa_map_task_templates = Buffer::from_slice(&device, &sdpa_map_task_template_values);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &cu_sdpa_partial_output_values);
     let output = Buffer::new_zeroed(&device, config.q_bytes(shape));
@@ -332,10 +331,15 @@ fn run_gqa_split_kv_single_q(config: Config, shape: Shape, input: TestInput<'_>)
     output.read_typed::<f32>(0, config.num_output_values(shape))
 }
 
-fn sdpa_map_task_template_buffers(config: Config, shape: Shape, flat_token_indices: &[u32]) -> (Vec<u32>, Vec<u32>) {
+fn sdpa_map_task_template_buffers(
+    execution: sdpa::ExecutionVariant,
+    shape: Shape,
+    flat_token_indices: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let kv_tokens_per_iteration = execution.map.thread_block.kv_tokens_per_iteration;
     let num_kv_iterations = flat_token_indices
         .iter()
-        .map(|&token_index| (token_index + 1).div_ceil(config.kv_tokens_per_iteration) as usize)
+        .map(|&token_index| (token_index + 1).div_ceil(kv_tokens_per_iteration) as usize)
         .collect::<Vec<_>>();
     let mut num_sdpa_map_task_templates_by_q_token_range = vec![1_usize; flat_token_indices.len()];
     let mut num_sdpa_map_task_templates = num_sdpa_map_task_templates_by_q_token_range.len();
@@ -364,11 +368,11 @@ fn sdpa_map_task_template_buffers(config: Config, shape: Shape, flat_token_indic
                 / num_sdpa_map_task_templates_by_q_token_range[q_token_range_index];
             let kv_iteration_end = num_kv_iterations[q_token_range_index] * (sdpa_map_task_template_index + 1)
                 / num_sdpa_map_task_templates_by_q_token_range[q_token_range_index];
-            let kv_token_begin = kv_iteration_begin as u32 * config.kv_tokens_per_iteration;
+            let kv_token_begin = kv_iteration_begin as u32 * kv_tokens_per_iteration;
             sdpa_map_task_templates.extend_from_slice(&[
                 q_token_range_index as u32,
                 kv_token_begin,
-                context_len.min(kv_iteration_end as u32 * config.kv_tokens_per_iteration),
+                context_len.min(kv_iteration_end as u32 * kv_tokens_per_iteration),
             ]);
         }
         cu_sdpa_partial_outputs.push((sdpa_map_task_templates.len() / 3) as u32);

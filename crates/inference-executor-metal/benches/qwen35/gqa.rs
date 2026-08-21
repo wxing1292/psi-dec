@@ -773,12 +773,7 @@ fn gqa_gate_config(model: GQAModelProfile) -> backend_activation_gate::Config {
     )
 }
 
-fn gqa_sdpa_config(
-    num_reqs: u32,
-    end_context_len: u32,
-    params: GQABenchParams,
-    model: GQAModelProfile,
-) -> backend_single_q::Config {
+fn gqa_sdpa_config(num_reqs: u32, end_context_len: u32, model: GQAModelProfile) -> backend_single_q::Config {
     backend_single_q::Config {
         num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
@@ -786,11 +781,6 @@ fn gqa_sdpa_config(
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         page_table_layout: gqa_page_table_layout(num_reqs, end_context_len, model),
-        kv_tokens_per_iteration: params.split_kv_single_q_kv_tokens_per_iteration,
-        required_threads: params.split_kv_single_q_required_threads,
-        max_q_heads: u32::try_from(model.num_q_heads / model.num_kv_heads)
-            .expect("GQA q heads per KV head must fit u32")
-            .min(params.split_kv_single_q_max_q_heads),
         dtype: Dtype::Bfloat16,
     }
 }
@@ -804,16 +794,12 @@ fn gqa_sdpa_shape(replay_shape: GQAReplayShape) -> backend_single_q::Shape {
 
 fn gqa_split_kv_tiled_q_config(
     page_table_layout: backend_kv_page_write::PageTableLayout,
-    params: GQABenchParams,
     model: GQAModelProfile,
 ) -> backend_tiled_q::Config {
     backend_tiled_q::Config {
         num_q_heads: model.num_q_heads.try_into().expect("GQA q heads must fit u32"),
         num_kv_heads: model.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         head_dim: model.head_dim.try_into().expect("GQA head_dim must fit u32"),
-        max_q_heads: params.split_kv_tiled_q_max_q_heads,
-        max_q_tokens: params.split_kv_tiled_q_max_q_tokens,
-        kv_tokens_per_iteration: params.split_kv_tiled_q_kv_tokens_per_iteration,
         scale: (model.head_dim as f32).sqrt().recip(),
         page_bytes: model.page_bytes(),
         dtype: Dtype::Bfloat16,

@@ -2,6 +2,7 @@ use std::mem::size_of;
 
 use half::bf16;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
+use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::components::gqa::split_kv::tiled_q as backend_tiled_q;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -60,9 +61,6 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
         num_q_heads: num_q_heads as u32,
         num_kv_heads: num_kv_heads as u32,
         head_dim: head_dim as u32,
-        max_q_heads: num_q_heads as u32,
-        max_q_tokens: MAX_Q_TOKENS,
-        kv_tokens_per_iteration: KV_TOKENS_PER_ITERATION,
         scale: (head_dim as f32).sqrt().recip(),
         page_bytes: page_bytes as u32,
         dtype: Dtype::Bfloat16,
@@ -73,6 +71,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
             num_page_ids_per_block: 1,
         },
     };
+    let execution = tiled_execution(config, num_q_heads as u32);
     let shape = backend_tiled_q::Shape {
         num_total_tokens: num_total_tokens as u32,
         num_total_q_token_tiles: 2,
@@ -136,7 +135,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
     );
     let sentinel = bf16::from_f32(-123.0).to_bits();
     let output = Buffer::from_slice(&device, &vec![sentinel; num_total_tokens * num_q_heads * head_dim]);
-    let kernels = backend_tiled_q::Compute::new(&device, config, shape);
+    let kernels = backend_tiled_q::Compute::new(&device, config, execution, shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map_bucketed(
         backend_tiled_q::MapBuffers {
@@ -327,9 +326,6 @@ fn run_case(
         num_q_heads: num_q_heads.try_into().unwrap(),
         num_kv_heads: num_kv_heads.try_into().unwrap(),
         head_dim: head_dim.try_into().unwrap(),
-        max_q_heads: num_q_heads.try_into().unwrap(),
-        max_q_tokens: MAX_Q_TOKENS,
-        kv_tokens_per_iteration: KV_TOKENS_PER_ITERATION,
         scale: (head_dim as f32).sqrt().recip(),
         page_bytes: page_bytes.try_into().unwrap(),
         dtype: Dtype::Bfloat16,
@@ -340,6 +336,7 @@ fn run_case(
             num_page_ids_per_block: 1,
         },
     };
+    let execution = tiled_execution(config, num_q_heads.try_into().unwrap());
     let shape = backend_tiled_q::Shape {
         num_total_tokens: num_tokens.try_into().unwrap(),
         num_total_q_token_tiles: num_q_token_ranges.try_into().unwrap(),
@@ -427,7 +424,7 @@ fn run_case(
         &device,
         num_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
     );
-    let kernels = backend_tiled_q::Compute::new(&device, config, shape);
+    let kernels = backend_tiled_q::Compute::new(&device, config, execution, shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map(
         backend_tiled_q::MapBuffers {
@@ -466,6 +463,21 @@ fn run_case(
         .map(|(actual_value, expected_value)| (actual_value - expected_value).abs())
         .fold(0.0f32, f32::max);
     assert!(max_abs_diff <= 0.02, "max_abs_diff={max_abs_diff}");
+}
+
+fn tiled_execution(config: backend_tiled_q::Config, max_q_heads: u32) -> backend_sdpa::ExecutionVariant {
+    backend_sdpa::ExecutionVariant::tiled_q(
+        backend_sdpa::Config {
+            io_dtype: config.dtype,
+            num_q_heads: config.num_q_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            tokens_per_page: config.num_tokens_per_page(),
+        },
+        MAX_Q_TOKENS,
+        KV_TOKENS_PER_ITERATION,
+        max_q_heads,
+    )
 }
 
 fn pattern(len: usize, modulus: usize, scale: f32) -> Vec<f32> {

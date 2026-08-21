@@ -200,6 +200,11 @@ backend_sdpa::ExecutionVariant
 current TiledQ kernel geometry. The selection does not use a SingleQ/TiledQ selector enum. The concrete low-level
 kernel types keep these names because they use different Metal sources and launch geometry.
 
+`GQAMetadataBuffers` retains the selected `backend_sdpa::ExecutionVariant`. The recording path passes this exact value
+to the low-level SplitKV `Compute` constructor. It does not reconstruct a variant or copy Map fields into the low-level
+model and storage `Config`. Each SplitKV module uses a private `KernelConstants` value to bind that `Config` to the
+selected Map and Reduce constants.
+
 ### Dynamic selection
 
 `gqa::sdpa::RequestShape` contains `num_history_tokens` and `num_q_tokens` for one request. For a causal Q-token offset:

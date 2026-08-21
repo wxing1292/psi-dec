@@ -68,7 +68,7 @@ kernel void gqa_split_kv_tiled_q_map(
     uint lane [[thread_index_in_simdgroup]])
 {
     constexpr int NUM_SIMD_LANES = 32;
-    constexpr int NUM_SIMDGROUPS = REQUIRED_THREADS / NUM_SIMD_LANES;
+    constexpr int NUM_SIMDGROUPS = MAP_REQUIRED_THREADS / NUM_SIMD_LANES;
     constexpr int NUM_SIMDGROUPS_PER_Q_HEAD = MAX_Q_TOKENS / 8;
     constexpr int NUM_HEAD_FRAGMENTS = HEAD_DIM / 8;
     constexpr int NUM_KV_TOKEN_FRAGMENTS = KV_TOKENS_PER_ITERATION / 8;
@@ -344,7 +344,7 @@ kernel void gqa_split_kv_tiled_q_reduce(
     const uint partial_output_end = cu_sdpa_partial_outputs[q_token_range_index + 1];
 
     for (uint local_index = thread_index; local_index < num_q_tokens_in_range * uint(HEAD_DIM);
-         local_index += uint(REQUIRED_THREADS)) {
+         local_index += uint(REDUCE_REQUIRED_THREADS)) {
         const uint local_token_index = local_index / uint(HEAD_DIM);
         const uint dim = local_index % uint(HEAD_DIM);
         float global_max = -INFINITY;
