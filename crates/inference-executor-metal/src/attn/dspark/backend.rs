@@ -2,16 +2,18 @@ use inference_backend_metal::components::gqa::block_sdpa as backend_block_sdpa;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::qkv_split as backend_qkv_split;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::gqa::sdpa::ExecutionVariant;
 use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
+use inference_backend_metal::components::gqa::split_kv::tiled_q as backend_tiled_q;
 use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
+use inference_executor_core::attn::DSparkGQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
-use inference_executor_core::attn::UngatedDSparkGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 
 use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
@@ -23,7 +25,7 @@ use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 
 #[derive(Clone, Copy)]
-pub struct UngatedDSparkGQAInput<'a> {
+pub struct DSparkGQAInput<'a> {
     pub page_table_layout: GQAPageTableLayout,
     pub gqa_layer_index: u32,
     pub metadata: &'a DSparkGQAMetadataBuffers,
@@ -34,25 +36,43 @@ pub struct UngatedDSparkGQAInput<'a> {
     pub scratch: DSparkBlockScratchBindings<'a>,
 }
 
-pub struct UngatedDSparkGQA {
+pub struct DSparkGQA {
     device: Device,
-    core: UngatedDSparkGQACore,
+    core: DSparkGQACore,
     metal: GQAMetalConfig,
     qkv: affine_quantized::Matmul,
     qkv_to_q_k_v: backend_qkv_split::Compute,
     q_norm_rope: rms_norm_rope::Compute,
     k_norm_rope: rms_norm_rope::Compute,
+    sdpa_execution: ExecutionVariant,
     block_sdpa: backend_block_sdpa::Compute,
     output: affine_quantized::Matmul,
 }
 
-impl UngatedDSparkGQA {
-    pub fn new(device: &Device, core: UngatedDSparkGQACore, metal: GQAMetalConfig) -> Self {
+impl DSparkGQA {
+    pub fn new(device: &Device, core: DSparkGQACore, metal: GQAMetalConfig, sdpa_execution: ExecutionVariant) -> Self {
         core.validate();
         metal.validate();
         let attention = &core.attention;
         assert!(metal.rope_dim as usize <= attention.head_dim);
         assert!(metal.num_ungated_tokens_per_page(attention) > 0);
+        let sdpa_config = backend_sdpa::Config {
+            io_dtype: metal.io_dtype,
+            num_q_heads: attention
+                .num_q_heads
+                .try_into()
+                .expect("DSpark GQA Q-head count must fit u32"),
+            num_kv_heads: attention
+                .num_kv_heads
+                .try_into()
+                .expect("DSpark GQA KV-head count must fit u32"),
+            head_dim: attention.head_dim.try_into().expect("DSpark GQA head_dim must fit u32"),
+            tokens_per_page: metal.num_ungated_tokens_per_page(attention),
+        };
+        assert!(
+            sdpa_execution.supports(sdpa_config),
+            "DSpark history attention execution must support the layer geometry"
+        );
         let qkv = attention.qkv_shape();
         let output = attention.output_shape();
         Self {
@@ -64,10 +84,12 @@ impl UngatedDSparkGQA {
                 device,
                 norm_rope_config(attention, metal, attention.num_kv_heads),
             ),
+            sdpa_execution,
             block_sdpa: backend_block_sdpa::Compute::new(
                 device,
                 backend_block_sdpa::Config {
                     block_size: core.block_size.try_into().expect("DSpark GQA block size must fit u32"),
+                    max_q_tokens: sdpa_execution.map.thread_block.max_q_tokens,
                     num_q_heads: attention
                         .num_q_heads
                         .try_into()
@@ -87,7 +109,7 @@ impl UngatedDSparkGQA {
         }
     }
 
-    fn validate_input(&self, input: &UngatedDSparkGQAInput<'_>) -> (GQAReplayShape, backend_sdpa::ExecutionVariant) {
+    fn validate_input(&self, input: &DSparkGQAInput<'_>) -> GQAReplayShape {
         input.page_table_layout.validate();
         assert!(
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
@@ -96,17 +118,13 @@ impl UngatedDSparkGQA {
         let shape = input.metadata.replay_shape();
         let sdpa_execution = input.metadata.sdpa_execution();
         shape.validate();
-        assert_eq!(
-            shape.num_q_token_tiles, shape.num_tokens,
-            "DSpark first milestone requires single-Q history attention"
-        );
         assert!(shape.reduce_sdpa_partial_outputs);
         assert!(
             shape.num_tokens as usize <= input.scratch.capacity.block.max_tokens,
             "DSpark GQA replay token count exceeds scratch"
         );
         assert!(
-            shape.num_total_sdpa_map_task_templates as usize <= input.scratch.capacity.max_sdpa_partial_outputs,
+            shape.num_total_sdpa_map_task_templates as usize <= input.scratch.capacity.max_sdpa_map_task_templates,
             "DSpark GQA replay partial count exceeds scratch"
         );
         assert_eq!(
@@ -114,10 +132,14 @@ impl UngatedDSparkGQA {
             "DSpark GQA scratch block size must match the backend"
         );
         assert_eq!(
-            sdpa_execution.map.thread_block.max_q_tokens, 1,
-            "DSpark history attention requires a single-Q SDPA variant"
+            sdpa_execution, self.sdpa_execution,
+            "DSpark history attention metadata must match the frozen backend execution"
         );
-        (shape, sdpa_execution)
+        assert_eq!(
+            self.sdpa_execution.map.thread_block.max_q_tokens as usize, input.scratch.capacity.max_q_tokens,
+            "DSpark history attention execution must match scratch capacity"
+        );
+        shape
     }
 
     fn split_kv_single_q_config(&self, page_table_layout: GQAPageTableLayout) -> backend_single_q::Config {
@@ -138,17 +160,65 @@ impl UngatedDSparkGQA {
             dtype: self.metal.io_dtype,
         }
     }
+
+    fn split_kv_tiled_q_config(&self, page_table_layout: GQAPageTableLayout) -> backend_tiled_q::Config {
+        let attention = &self.core.attention;
+        backend_tiled_q::Config {
+            num_q_heads: attention
+                .num_q_heads
+                .try_into()
+                .expect("DSpark GQA Q-head count must fit u32"),
+            num_kv_heads: attention
+                .num_kv_heads
+                .try_into()
+                .expect("DSpark GQA KV-head count must fit u32"),
+            head_dim: attention.head_dim.try_into().expect("DSpark GQA head_dim must fit u32"),
+            scale: attention.scale,
+            page_bytes: self.metal.page_bytes,
+            dtype: self.metal.io_dtype,
+            page_table_layout: backend_page_table_layout(page_table_layout),
+        }
+    }
+
+    fn record_block_sdpa<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        shape: GQAReplayShape,
+        metadata: &'a DSparkGQAMetadataBuffers,
+        scratch: DSparkBlockScratchBindings<'a>,
+    ) where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
+            backend_block_sdpa::Shape {
+                num_tokens: shape.num_tokens,
+                num_q_token_ranges: shape.num_q_token_tiles,
+                num_total_partial_output_slots: shape.num_total_sdpa_map_task_templates,
+            },
+            backend_block_sdpa::Buffers {
+                q: scratch.q_norm_rope,
+                local_k: scratch.k_norm_rope,
+                local_v: scratch.v,
+                q_token_ranges: metadata.q_token_ranges(),
+                cu_sdpa_partial_outputs: metadata.cu_sdpa_partial_outputs(),
+                partial_exp_sums: scratch.partial_exp_sums,
+                partial_max_logits: scratch.partial_max_logits,
+                partial_output: scratch.partial_output,
+            },
+        )));
+    }
 }
 
-impl ReplayLayer for UngatedDSparkGQA {
-    type Input<'a> = UngatedDSparkGQAInput<'a>;
+impl ReplayLayer for DSparkGQA {
+    type Input<'a> = DSparkGQAInput<'a>;
     type Output<'a> = &'a Buffer;
 
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let (shape, sdpa_execution) = self.validate_input(&input);
+        let shape = self.validate_input(&input);
+        let sdpa_execution = self.sdpa_execution;
         let attention = &self.core.attention;
         let scratch = input.scratch;
         recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv.invoke(
@@ -201,52 +271,78 @@ impl ReplayLayer for UngatedDSparkGQA {
             ReplayU32::Fixed(shape.num_tokens),
         )));
 
-        let sdpa_config = self.split_kv_single_q_config(input.page_table_layout);
-        let sdpa_shape = backend_single_q::Shape {
-            num_total_tokens: shape.num_tokens,
-            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
-        };
-        let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, sdpa_execution, sdpa_shape);
-        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
-            backend_single_q::MapBuffers {
-                q: scratch.q_norm_rope,
-                kv_pages: input.kv_cache.kv_pages,
-                req_slots: input.metadata.req_slots(),
-                page_ids: input.kv_cache.page_ids,
-                sdpa_map_task_templates: input.metadata.sdpa_map_task_templates(),
-                partial_exp_sums: scratch.partial_exp_sums,
-                partial_max_logits: scratch.partial_max_logits,
-                partial_output: scratch.partial_output,
-            },
-            ReplayU32::Fixed(input.gqa_layer_index),
-            ReplayU32::Fixed(shape.num_tokens),
-            ReplayU32::Fixed(shape.num_total_sdpa_map_task_templates),
-        )));
-        recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
-            backend_block_sdpa::Shape {
-                num_tokens: shape.num_tokens,
+        if sdpa_execution.map.thread_block.max_q_tokens == 1 {
+            let sdpa_config = self.split_kv_single_q_config(input.page_table_layout);
+            let sdpa_shape = backend_single_q::Shape {
+                num_total_tokens: shape.num_tokens,
                 num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
-            },
-            backend_block_sdpa::Buffers {
-                q: scratch.q_norm_rope,
-                local_k: scratch.k_norm_rope,
-                local_v: scratch.v,
-                block_sdpa_map_task_template_indices: input.metadata.block_sdpa_map_task_template_indices(),
-                partial_exp_sums: scratch.partial_exp_sums,
-                partial_max_logits: scratch.partial_max_logits,
-                partial_output: scratch.partial_output,
-            },
-        )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
-            backend_single_q::ReduceBuffers {
-                partial_exp_sums: scratch.partial_exp_sums,
-                partial_max_logits: scratch.partial_max_logits,
-                partial_output: scratch.partial_output,
-                cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
-                output: scratch.attention_output,
-            },
-            ReplayU32::Fixed(shape.num_tokens),
-        )));
+            };
+            let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, sdpa_execution, sdpa_shape);
+            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
+                backend_single_q::MapBuffers {
+                    q: scratch.q_norm_rope,
+                    kv_pages: input.kv_cache.kv_pages,
+                    req_slots: input.metadata.req_slots(),
+                    page_ids: input.kv_cache.page_ids,
+                    sdpa_map_task_templates: input.metadata.sdpa_map_task_templates(),
+                    partial_exp_sums: scratch.partial_exp_sums,
+                    partial_max_logits: scratch.partial_max_logits,
+                    partial_output: scratch.partial_output,
+                },
+                ReplayU32::Fixed(input.gqa_layer_index),
+                ReplayU32::Fixed(shape.num_tokens),
+                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
+            )));
+            self.record_block_sdpa(recorder, shape, input.metadata, scratch);
+            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
+                backend_single_q::ReduceBuffers {
+                    partial_exp_sums: scratch.partial_exp_sums,
+                    partial_max_logits: scratch.partial_max_logits,
+                    partial_output: scratch.partial_output,
+                    cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
+                    output: scratch.attention_output,
+                },
+                ReplayU32::Fixed(shape.num_tokens),
+            )));
+        } else {
+            let sdpa_config = self.split_kv_tiled_q_config(input.page_table_layout);
+            let sdpa_shape = backend_tiled_q::Shape {
+                num_total_tokens: shape.num_tokens,
+                num_total_q_token_tiles: shape.num_total_q_token_tiles,
+                num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
+            };
+            let sdpa = backend_tiled_q::Compute::new(&self.device, sdpa_config, sdpa_execution, sdpa_shape);
+            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
+                backend_tiled_q::MapBuffers {
+                    q: scratch.q_norm_rope,
+                    kv_pages: input.kv_cache.kv_pages,
+                    req_slots: input.metadata.req_slots(),
+                    page_ids: input.kv_cache.page_ids,
+                    visible_kv_token_ranges: input.metadata.visible_kv_token_ranges(),
+                    q_token_ranges: input.metadata.q_token_ranges(),
+                    sdpa_map_task_templates: input.metadata.sdpa_map_task_templates(),
+                    partial_output: scratch.partial_output,
+                    partial_exp_sums: scratch.partial_exp_sums,
+                    partial_max_logits: scratch.partial_max_logits,
+                },
+                ReplayU32::Fixed(input.gqa_layer_index),
+                ReplayU32::Fixed(shape.num_tokens),
+                ReplayU32::Fixed(shape.num_q_token_tiles),
+                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
+            )));
+            self.record_block_sdpa(recorder, shape, input.metadata, scratch);
+            recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
+                backend_tiled_q::ReduceBuffers {
+                    partial_output: scratch.partial_output,
+                    partial_exp_sums: scratch.partial_exp_sums,
+                    partial_max_logits: scratch.partial_max_logits,
+                    q_token_ranges: input.metadata.q_token_ranges(),
+                    cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
+                    output: scratch.attention_output,
+                },
+                ReplayU32::Fixed(shape.num_q_token_tiles),
+            )));
+        }
         recorder.record_with_barrier_before(ReplayOp::opaque(self.output.invoke(
             shape.num_tokens,
             ReplayU32::Fixed(shape.num_tokens),

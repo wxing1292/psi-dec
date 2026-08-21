@@ -4,26 +4,30 @@ use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Device;
 use inference_executor_core::attn::DSparkBlockCapacity;
 use inference_executor_core::attn::DSparkBlockMetadata;
+use inference_executor_core::attn::DSparkGQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
-use inference_executor_core::attn::UngatedDSparkGQACore;
 use inference_runtime_core::runtime::RawRequestSlot;
 
+use crate::attn::dspark::backend::DSparkGQA;
 use crate::attn::dspark::capacity::DSparkGQACapacity;
 use crate::attn::dspark::context::DSparkGQAContextScratch;
 use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
 use crate::attn::dspark::scratch::DSparkBlockScratch;
+use crate::attn::dspark::sdpa::Selection as SDPASelection;
+use crate::attn::dspark::sdpa::Selector as SDPASelector;
+use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 
 mod file_io;
 
-pub struct UngatedDSparkGQAState {
-    sdpa_registry: backend_sdpa::Registry,
+pub struct DSparkGQAState {
+    sdpa_selection: SDPASelection,
     block_scratch: Option<Rc<DSparkBlockScratch>>,
     context_scratch: Option<Rc<DSparkGQAContextScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
     metadata: Option<DSparkGQAMetadataBuffers>,
-    core: UngatedDSparkGQACore,
+    core: DSparkGQACore,
     sdpa_config: backend_sdpa::Config,
     capacity: DSparkGQACapacity,
     max_context_tokens: usize,
@@ -32,10 +36,10 @@ pub struct UngatedDSparkGQAState {
     num_cache_pages: usize,
 }
 
-impl UngatedDSparkGQAState {
+impl DSparkGQAState {
     pub fn new(
         device: &Device,
-        core: UngatedDSparkGQACore,
+        core: DSparkGQACore,
         sdpa_config: backend_sdpa::Config,
         page_table_layout: GQAPageTableLayout,
         capacity: DSparkBlockCapacity,
@@ -55,15 +59,16 @@ impl UngatedDSparkGQAState {
             core.block_size, capacity.block_size,
             "DSpark GQA state core and capacity block sizes must match"
         );
-        let gqa_capacity = DSparkGQACapacity::new(capacity);
         let attention = &core.attention;
         assert_eq!(sdpa_config.num_q_heads as usize, attention.num_q_heads);
         assert_eq!(sdpa_config.num_kv_heads as usize, attention.num_kv_heads);
         assert_eq!(sdpa_config.head_dim as usize, attention.head_dim);
-        let sdpa_registry = backend_sdpa::Registry::new_single_q_only(sdpa_config);
+        let sdpa_selection = SDPASelector::new(backend_sdpa::Registry::new(sdpa_config), capacity).select();
+        let sdpa_execution = sdpa_selection.execution();
+        let gqa_capacity = sdpa_selection.capacity();
         let num_tokens_per_page = sdpa_config.tokens_per_page as usize;
         Self {
-            sdpa_registry,
+            sdpa_selection,
             block_scratch: Some(Rc::new(DSparkBlockScratch::new(
                 device,
                 &core,
@@ -77,7 +82,7 @@ impl UngatedDSparkGQAState {
                 max_context_tokens,
             ))),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
-            metadata: Some(DSparkGQAMetadataBuffers::new(device, gqa_capacity)),
+            metadata: Some(DSparkGQAMetadataBuffers::new(device, gqa_capacity, sdpa_execution)),
             core,
             sdpa_config,
             capacity: gqa_capacity,
@@ -93,8 +98,20 @@ impl UngatedDSparkGQAState {
     }
 
     pub fn prepare_block(&self, block: &DSparkBlockMetadata) -> GQAReplayShape {
-        let execution = self.sdpa_registry.variants()[0];
-        self.metadata().update(block, execution)
+        self.metadata().update(block)
+    }
+
+    pub fn new_gqa(&self, device: &Device, core: DSparkGQACore, metal: GQAMetalConfig) -> DSparkGQA {
+        let shared = &self.core.attention;
+        let attention = &core.attention;
+        assert_eq!(core.block_size, self.core.block_size);
+        assert_eq!(attention.hidden_dim, shared.hidden_dim);
+        assert_eq!(attention.head_dim, shared.head_dim);
+        assert_eq!(attention.num_q_heads, shared.num_q_heads);
+        assert_eq!(attention.num_kv_heads, shared.num_kv_heads);
+        assert_eq!(attention.scale, shared.scale);
+        assert_eq!(metal.io_dtype, self.sdpa_config.io_dtype);
+        DSparkGQA::new(device, core, metal, self.sdpa_selection.execution())
     }
 
     pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
@@ -201,7 +218,11 @@ impl UngatedDSparkGQAState {
             self.max_context_tokens,
         )));
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
-        self.metadata = Some(DSparkGQAMetadataBuffers::new(device, self.capacity));
+        self.metadata = Some(DSparkGQAMetadataBuffers::new(
+            device,
+            self.capacity,
+            self.sdpa_selection.execution(),
+        ));
     }
 
     fn request_page_table_ref(&self) -> &Rc<GQARequestPageTable> {
@@ -217,11 +238,11 @@ mod tests {
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
     use inference_executor_core::attn::DSparkBlockCapacity;
+    use inference_executor_core::attn::DSparkGQACore;
     use inference_executor_core::attn::GQAPageTableLayout;
-    use inference_executor_core::attn::UngatedDSparkGQACore;
     use inference_executor_core::attn::UngatedGQACore;
 
-    use super::UngatedDSparkGQAState;
+    use super::DSparkGQAState;
 
     #[test]
     fn test_write_read_page_ids_uses_complete_dspark_block() {
@@ -242,10 +263,10 @@ mod tests {
         state.write_page_ids(1, 1, &[30, 31, 40, 64]);
     }
 
-    fn new_state(device: &Device) -> UngatedDSparkGQAState {
-        UngatedDSparkGQAState::new(
+    fn new_state(device: &Device) -> DSparkGQAState {
+        DSparkGQAState::new(
             device,
-            UngatedDSparkGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
+            DSparkGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
             backend_sdpa::Config {
                 io_dtype: Dtype::Bfloat16,
                 num_q_heads: 1,

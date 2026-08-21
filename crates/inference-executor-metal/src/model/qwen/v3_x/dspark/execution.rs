@@ -16,7 +16,7 @@ use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_we
 use inference_executor_core::sampling::SamplerConfig;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::dspark::state::UngatedDSparkGQAState;
+use crate::attn::dspark::state::DSparkGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
@@ -50,7 +50,7 @@ mod file_io;
 
 pub struct Qwen3xDSparkExecution {
     context: Replay<Qwen3xDSparkContext>,
-    gqa_state: UngatedDSparkGQAState,
+    gqa_state: DSparkGQAState,
     embed: Replay<Qwen3xDSparkEmbed>,
     body: Replay<Qwen3xDSparkBody>,
     gather_unembed: Replay<Qwen3xDSparkGatherUnembed>,
@@ -402,7 +402,12 @@ impl Qwen3xDSparkExecution {
         distribution_store: &SpecProbsStore,
         recording: &mut Qwen3xDSparkRecording,
     ) -> Rc<Buffer> {
-        let block = DSparkBlockMetadata::new(&proposal.req_slots, proposal.anchor_positions, self.num_spec_tokens);
+        let visible_history_token_ranges = proposal
+            .anchor_positions
+            .iter()
+            .map(|&anchor_position| 0..anchor_position)
+            .collect::<Vec<_>>();
+        let block = DSparkBlockMetadata::new(&proposal.req_slots, &visible_history_token_ranges, self.num_spec_tokens);
         self.gqa_state.prepare_block(&block);
         let mut block_token_ids = Vec::with_capacity(block.num_tokens());
         for &anchor_token_id in proposal.anchor_token_ids {

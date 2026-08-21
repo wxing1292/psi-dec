@@ -2,27 +2,36 @@
 using namespace metal;
 typedef bfloat bfloat16_t;
 
+// One BlockSDPAThreadBlockTask maps 1:1 to one threadblock. The grid supplies
+// q_head_index, q_token_range_index, and q_token_offset through x, y, and z.
+// q_token_ranges derives q_token_index. block_size derives the local K/V block.
+// cu_sdpa_partial_outputs derives the selected block partial-output slot.
+
 template <typename T>
 void gqa_block_sdpa_impl(
     device const T* q,
     device const T* local_k,
     device const T* local_v,
-    device const uint* block_sdpa_map_task_template_indices,
+    device const uint* q_token_ranges,
+    device const uint* cu_sdpa_partial_outputs,
     device float* partial_exp_sums,
     device float* partial_max_logits,
     device T* partial_output,
-    constant uint& num_tokens,
     threadgroup float* logits,
-    uint group_index,
+    uint3 group_index,
     uint simd_lane
 ) {
-    const uint q_token_index = group_index % num_tokens;
-    const uint q_head_index = group_index / num_tokens;
-    if (q_head_index >= num_q_heads) return;
+    const uint q_head_index = group_index.x;
+    const uint q_token_range_index = group_index.y;
+    const uint q_token_offset = group_index.z;
+    const uint flat_q_token_begin = q_token_ranges[q_token_range_index * 2];
+    const uint flat_q_token_end = q_token_ranges[q_token_range_index * 2 + 1];
+    if (q_token_offset >= flat_q_token_end - flat_q_token_begin) return;
+    const uint q_token_index = flat_q_token_begin + q_token_offset;
     const uint q_heads_per_kv_head = num_q_heads / num_kv_heads;
     const uint kv_head_index = q_head_index / q_heads_per_kv_head;
     const uint local_kv_token_begin = (q_token_index / block_size) * block_size;
-    const uint sdpa_map_task_template_index = block_sdpa_map_task_template_indices[q_token_index];
+    const uint partial_output_slot = cu_sdpa_partial_outputs[q_token_range_index + 1] - 1;
     const ulong q_offset = ((ulong)q_token_index * num_q_heads + q_head_index) * head_dim;
     const device T* q_ptr = q + q_offset;
     thread float q_values[q_values_per_thread];
@@ -55,7 +64,7 @@ void gqa_block_sdpa_impl(
             block_exp_sum += weight;
         }
         const ulong partial_output_index =
-            (ulong)sdpa_map_task_template_index * num_q_heads + q_head_index;
+            ((ulong)partial_output_slot * num_q_heads + q_head_index) * max_q_tokens + q_token_offset;
         partial_exp_sums[partial_output_index] = block_exp_sum;
         partial_max_logits[partial_output_index] = block_max;
     }
@@ -63,7 +72,7 @@ void gqa_block_sdpa_impl(
     simdgroup_barrier(mem_flags::mem_threadgroup);
 
     const ulong partial_output_index =
-        (ulong)sdpa_map_task_template_index * num_q_heads + q_head_index;
+        ((ulong)partial_output_slot * num_q_heads + q_head_index) * max_q_tokens + q_token_offset;
     for (uint dim = simd_lane; dim < head_dim; dim += simd_width) {
         float output = 0.0f;
         for (uint local_kv_offset = 0; local_kv_offset < block_size; ++local_kv_offset) {
@@ -80,34 +89,34 @@ kernel void gqa_block_sdpa_f32(
     device const float* q [[buffer(0)]],
     device const float* local_k [[buffer(1)]],
     device const float* local_v [[buffer(2)]],
-    device const uint* block_sdpa_map_task_template_indices [[buffer(3)]],
-    device float* partial_exp_sums [[buffer(4)]],
-    device float* partial_max_logits [[buffer(5)]],
-    device float* partial_output [[buffer(6)]],
-    constant uint& num_tokens [[buffer(7)]],
-    uint group_index [[threadgroup_position_in_grid]],
+    device const uint* q_token_ranges [[buffer(3)]],
+    device const uint* cu_sdpa_partial_outputs [[buffer(4)]],
+    device float* partial_exp_sums [[buffer(5)]],
+    device float* partial_max_logits [[buffer(6)]],
+    device float* partial_output [[buffer(7)]],
+    uint3 group_index [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     threadgroup float logits[block_size];
     gqa_block_sdpa_impl<float>(
-        q, local_k, local_v, block_sdpa_map_task_template_indices, partial_exp_sums, partial_max_logits, partial_output,
-        num_tokens, logits, group_index, simd_lane);
+        q, local_k, local_v, q_token_ranges, cu_sdpa_partial_outputs, partial_exp_sums, partial_max_logits,
+        partial_output, logits, group_index, simd_lane);
 }
 
 kernel void gqa_block_sdpa_bf16(
     device const bfloat16_t* q [[buffer(0)]],
     device const bfloat16_t* local_k [[buffer(1)]],
     device const bfloat16_t* local_v [[buffer(2)]],
-    device const uint* block_sdpa_map_task_template_indices [[buffer(3)]],
-    device float* partial_exp_sums [[buffer(4)]],
-    device float* partial_max_logits [[buffer(5)]],
-    device bfloat16_t* partial_output [[buffer(6)]],
-    constant uint& num_tokens [[buffer(7)]],
-    uint group_index [[threadgroup_position_in_grid]],
+    device const uint* q_token_ranges [[buffer(3)]],
+    device const uint* cu_sdpa_partial_outputs [[buffer(4)]],
+    device float* partial_exp_sums [[buffer(5)]],
+    device float* partial_max_logits [[buffer(6)]],
+    device bfloat16_t* partial_output [[buffer(7)]],
+    uint3 group_index [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     threadgroup float logits[block_size];
     gqa_block_sdpa_impl<bfloat16_t>(
-        q, local_k, local_v, block_sdpa_map_task_template_indices, partial_exp_sums, partial_max_logits, partial_output,
-        num_tokens, logits, group_index, simd_lane);
+        q, local_k, local_v, q_token_ranges, cu_sdpa_partial_outputs, partial_exp_sums, partial_max_logits,
+        partial_output, logits, group_index, simd_lane);
 }

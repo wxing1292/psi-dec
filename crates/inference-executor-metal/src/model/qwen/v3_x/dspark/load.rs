@@ -12,7 +12,7 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindin
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
 use inference_executor_core::sampling::TopKSamplingBounds;
 
-use crate::attn::dspark::state::UngatedDSparkGQAState;
+use crate::attn::dspark::state::DSparkGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
@@ -37,7 +37,7 @@ pub struct Qwen3xDSparkLoadConfig {
 
 pub struct Qwen3xDSparkLoaded {
     pub page_table_layout: GQAPageTableLayout,
-    pub gqa_state: UngatedDSparkGQAState,
+    pub gqa_state: DSparkGQAState,
     pub model: Rc<Qwen3xDSparkModel>,
     pub embed: Rc<Embed>,
     pub unembed: Rc<Unembed>,
@@ -93,7 +93,7 @@ pub fn load_qwen3x_dspark(
             .expect("Qwen3x DSpark pages per block must fit u32"),
     };
     let capacity = DSparkBlockCapacity::new(load_config.max_requests, num_spec_tokens);
-    let gqa_state = UngatedDSparkGQAState::new(
+    let gqa_state = DSparkGQAState::new(
         device,
         attention_core,
         attention_split_kv_config,

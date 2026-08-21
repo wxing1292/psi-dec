@@ -34,6 +34,7 @@ crates/inference-executor-metal/src/attn/
     capacity.rs             Metal DSpark GQA partial-output capacity
     context.rs              persistent DSpark context K/V append
     metadata.rs             proposal history and block metadata
+    sdpa.rs                 fixed-proposal history execution selection
     scratch.rs              fixed-capacity local Q/K/V and attention partials
     state.rs                DSpark page-table and proposal metadata lifecycle
     state/
@@ -175,7 +176,7 @@ the ungated QKV path.
 
 Qwen3 Main constructs `UngatedGQACore` and `UngatedGQA`.
 Qwen3.5 Main and MTP construct `GQACore` and gated `GQA`.
-Qwen3x DSpark constructs `UngatedDSparkGQACore` and `UngatedDSparkGQA`.
+Qwen3x DSpark constructs `DSparkGQACore` and `DSparkGQA`.
 Its QKV attention graph is independent from Main and MTP.
 
 Init-time component constants supply the head dimensions, head counts, RoPE constants, and page geometry. A
@@ -206,6 +207,7 @@ arithmetic after this proof. Debug bounds protect private invocation errors.
 ```text
 req_slots[num_tokens]
 flat_token_indices[num_tokens]
+visible_kv_token_ranges[num_tokens][request_local_kv_token_begin, request_local_kv_token_end]
 q_token_ranges[num_q_token_tiles][flat_q_token_begin/flat_q_token_end]  // TiledQ
 sdpa_map_task_templates[num_total_sdpa_map_task_templates]
     [q_token_range_index/request_local_kv_token_begin/request_local_kv_token_end]
@@ -388,12 +390,16 @@ Each `model/qwen/v3_x/dspark/attention.rs` layer derives its ungated core and Me
 DSpark config and its exact attention binding subtree.
 `model/qwen/v3_5/component_config.rs` builds gated Main and MTP cores.
 
-Each DSpark layer owns its weight-dependent `UngatedDSparkGQA` and `UngatedDSparkGQAContextAppender`.
-`UngatedDSparkGQAState` owns the shared page table, metadata, scratch, and SplitKV SingleQ history contract.
+Each DSpark layer owns its weight-dependent `DSparkGQA` and `DSparkGQAContextAppender`.
+`DSparkGQAState` owns the shared page table, metadata, scratch, and frozen SplitKV history selection.
 Quantization layout is not part of the shared-state compatibility contract.
 The state receives static attention and KV-cache facts through `backend_sdpa::Config`.
-`backend_sdpa::Registry::new_single_q_only(...)` provides the one legal history variant. The DSpark metadata builder
-keeps its component-specific history and block-partial composition.
+`backend_sdpa::Registry::new(...)` provides the legal history variants. `dspark::sdpa::Selector` derives the maximum
+Q-token-range extent, scratch extent, replay extent, and launch-cost metrics for each candidate. Its `Selection`
+contains the execution variant and `DSparkGQACapacity`. The selector first minimizes how many times one history K/V
+token must be loaded for the fixed proposal. It then compares the kernel KV-iteration width, padded Q rows, scratch
+extent, and Q-head coverage. The state freezes this result at initialization. The runtime metadata builder then
+materializes the current history and block-partial composition.
 
 Each concrete backend converts its core and `GQAMetalConfig` into a projection split. `GQAMetalConfig` contains only
 model, quantization, storage, and RoPE facts. The backend derives Metal SDPA tuning from `head_dim`. It then constructs
@@ -582,9 +588,26 @@ is the atomic boundary between dynamic choice and metadata upload.
 `GQAMetadataBuffers::update(...)` uploads the selection. Recording executes the stored variant and does not
 select again. Both current concrete kernel families partition a long visible KV range into independent KV segments.
 
-DSpark uses `backend_sdpa::Registry::new_single_q_only(...)`. Its SplitKV history map and block-bidirectional map
-must produce the same one-Q partial ABI for one shared Reduce. DSpark keeps its component-specific metadata and
-segmentation logic. It does not use the general GQA request selector.
+DSpark selects one variant from `backend_sdpa::Registry::new(...)` at initialization. `dspark::sdpa::Selector` compares
+the complete fixed-proposal candidates. Its primary cost is the K/V load multiplicity for one history token. It then
+compares the kernel KV-iteration width, padded Q rows, reserved partial-state groups, and Q-head coverage. Its
+`Selection` freezes the variant and the coupled capacity. The SplitKV history map and block-bidirectional map produce
+that physical partial layout for one shared Reduce. DSpark keeps its component-specific metadata and segmentation
+logic. It does not use the general GQA request selector.
+
+TiledQ requires one half-open `visible_kv_token_ranges` entry for each flat Q token. The Map kernel computes the
+intersection of this row range and the Map TaskTemplate K/V range. It does not infer a missing lower bound or causal
+upper bound. If the intersection is empty, TiledQ writes the empty partial state `exp_sum = 0` and
+`max_logit = -infinity`. Reduce ignores that partial.
+
+Ordinary causal GQA uploads `[0, q_position + 1)` for each Q row. DSpark uploads `[0, anchor)` for every anchor and mask
+row in one proposal block. Therefore, every DSpark row sees the same complete persistent history.
+
+The same backend TiledQ component can represent row-relative sliding history. For a window of `W` tokens and a separate
+local block, row position `q` uploads `[q.saturating_sub(W - 1), anchor)` for persistent history. The composite parity
+test covers different explicit row bounds, a fully masked history segment, and one full local block. A future DFlash2
+model executor must derive and validate its exact window and block sizes. It must own a separate `DFlashGQA`; it must
+not add a DFlash mode to `DSparkGQA`. The repository does not yet contain that model executor.
 
 The current concrete kernel families differ in the number of Q tokens and Q heads that one Map threadblock computes:
 
@@ -656,7 +679,7 @@ reachable model variants are:
 | Qwen3-14B | `40 / 8 / 128` | 8 | selector policy above, tiled `max_q_heads=5` |
 | Qwen3.6/Qwen3.8-27B | `24 / 4 / 256` | 8 | measured selector policy above |
 | Qwen3.6-35B-A3B | `16 / 2 / 256` | 16 | selector policy above |
-| Qwen3 DSpark | checkpoint-derived | model-derived | SplitKV SingleQ history + block bidirectional |
+| Qwen3 DSpark | checkpoint-derived | model-derived | selected SplitKV history + block bidirectional |
 
 For 35B, `TiledQ` uses `max_q_heads=4` below four useful tokens per Q-token range. It uses `max_q_heads=8` otherwise.
 
@@ -736,7 +759,7 @@ paged K/V -- 32 lanes x 16 B per row
                               v
 threadgroup K[16, D+8] + V[16, D+8] bf16
                               |
-                 Q x K^T, causal mask
+            Q x K^T, explicit visible-range mask
                  online-softmax update
                  probability x V
                               |
@@ -784,12 +807,21 @@ Therefore, submissions reuse their buffers without per-layer allocation.
 
 Qwen3 DSpark owns `DSparkBlockScratch`.
 This scratch contains proposal-local Q/K/V, SplitKV history partials, and block-bidirectional partials.
-Its partial capacity is `next_power_of_two(2 * max_requests * num_spec_tokens)`.
+Define these capacities:
+
+```text
+T_capacity = max_requests * num_spec_tokens
+Q_capacity = max_requests * ceil(num_spec_tokens / selected_max_q_tokens)
+P_capacity = next_power_of_two(max(T_capacity, 2 * Q_capacity))
+```
+
+`P_capacity` is the Map task-template capacity. It retains enough history task parallelism without multiplying the
+legacy SingleQ capacity by the selected Q-tile width.
 It does not depend on `max_position_embeddings`.
 `DSparkGQACapacity` owns this Metal resource rule.
 The backend-neutral `DSparkBlockCapacity` contains only request and block geometry.
 
-The bound for SDPA partial scratch is `max_tokens * maximum registered max_q_tokens * num_q_heads`.
+The bound for SDPA partial scratch is `Map task-template capacity * selected max_q_tokens * num_q_heads`.
 It is independent of `max_position_embeddings`.
 
 `GQAMetadataBuffers` owns the matching submission metadata. The owner receives its capacity once and updates its data
@@ -800,7 +832,8 @@ The buffer contract is:
 ```text
 hidden_state / next_hidden_state     bf16 model boundary buffers shaped [num_tokens, hidden_dim]
 req_slots                            request slot repeated per flat token
-flat_token_indices                   request-absolute token index per flat token; used for RoPE, KV write address, and causal context length
+flat_token_indices                   request-absolute token index per flat token; used for RoPE and KV-page writes
+visible_kv_token_ranges              request-local [begin, end) visible K/V range per flat Q token
 q_token_ranges                      request-local flat-Q-token ranges consumed by SplitKV TiledQ
 sdpa_map_task_templates             materialized Q-token-range index and request-local KV-token range for Map tasks
 cu_sdpa_partial_outputs             cumulative partial-output counts selected per Q-token range by SplitKV Reduce
@@ -951,9 +984,9 @@ Another case uses one KV split that spans multiple KV iterations. The cases vali
 online-softmax iteration merging, request slots, page-table lookup, and causal visibility.
 
 `gqa/split_kv/tiled_q_test.rs` compares the BF16 SplitKV TiledQ map and reduce variant with the same CPU reference. One
-bucketed replay
-executes `5 -> 8 -> 5` active tokens. The test poisons inactive query, KV, request-slot, and token-index inputs. It checks
-the active output and verifies that inactive partial-output, statistic, and final-output tails remain unchanged.
+bucketed replay executes `5 -> 8 -> 5` active tokens. The test refreshes the explicit visible ranges for each submission.
+It poisons inactive query, KV, and request-slot inputs. It checks the active output and verifies that inactive
+partial-output, statistic, and final-output tails remain unchanged.
 
 Metal backend component replay sanity lives in:
 
@@ -962,6 +995,7 @@ cargo bench -p inference-backend-metal --bench gqa_split_kv -- --profile-time 1 
 
 cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1,4 \
+  --max-q-tokens 8 \
   --iters 1 --warmup-iters 0 --runs 1
 ```
 
@@ -971,8 +1005,12 @@ benchmark or expose direct-submit component or forward wiring.
 `gqa_block_attn` records only `gqa::block_sdpa::Compute`.
 It measures the dense block-bidirectional map contribution used by DSpark.
 It does not measure history attention, partial reduction, projections, or a DSpark layer.
+Its default `max_q_tokens = 8` uses the production TiledQ partial-state layout. The option can select a different legal
+partial-state width for an exact comparison.
 
-One block-SDPA Task owns one Q token and one Q head.
+One block-SDPA Task owns one Q token and one Q head. The grid supplies the Q-head index, Q-token-range index, and
+range-local Q-token offset. `q_token_ranges` derives the flat Q-token index. The end of the matching
+`cu_sdpa_partial_outputs` range derives the block partial-output slot.
 The backend uses one 32-thread SIMDgroup for the Task.
 The private `gqa::block_sdpa::KernelConstants` contains the stable SDPA config and its thread-block constants. The
 constants require 32
@@ -1039,8 +1077,8 @@ profile and the bf16 K/V element size. The 27B profile uses 8 tokens per page. T
 For GQA, `--tokens` is the total current flat-token count. `--num-reqs` is the number of request segments in that
 microbatch. `--contexts` is the existing context length for each request before its measured tokens.
 
-The bench distributes tokens as evenly as possible across requests. It builds `req_slots`, `flat_token_indices`, and a
-fixed-stride request page table from these options.
+The bench distributes tokens as evenly as possible across requests. It builds `req_slots`, `flat_token_indices`,
+`visible_kv_token_ranges`, and a fixed-stride request page table from these options.
 
 Recommendation: For a single-request decode-style context sweep, use `--tokens 1 --num-reqs 1` and vary `--contexts`.
 

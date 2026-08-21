@@ -4,14 +4,14 @@ use std::rc::Rc;
 use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::dspark::state::UngatedDSparkGQAState;
+use crate::attn::dspark::state::DSparkGQAState;
 use crate::model::state_snapshot::FullStateIO;
 use crate::model::state_snapshot::GQAStateSnapshotFiles;
 use crate::model::state_snapshot::SelectedStateIO;
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
 
-impl FullStateIO for UngatedDSparkGQAState {
+impl FullStateIO for DSparkGQAState {
     type Files = GQAStateSnapshotFiles;
 
     fn write_full_state(&self, writer: &mut StateSnapshotWriter, files: Self::Files) -> Result<(), ModelExecutorError> {
@@ -33,7 +33,7 @@ impl FullStateIO for UngatedDSparkGQAState {
     }
 }
 
-impl SelectedStateIO for UngatedDSparkGQAState {
+impl SelectedStateIO for DSparkGQAState {
     type ID = RawRequestSlot;
 
     fn write_selected_state(

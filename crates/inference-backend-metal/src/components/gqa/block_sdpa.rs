@@ -40,13 +40,19 @@ impl KernelConstants {
     }
 }
 
-/// Dense request-block SDPA that writes one `SDPAPartialOutput` into the
-/// `SDPAMapTaskTemplate` slot selected for each Q token. One thread block owns
-/// one Q-token/Q-head block-SDPA task. The shared paged reducer later combines
-/// the bidirectional block and persistent-history partial outputs.
+/// Dense request-block SDPA that writes into a selected SplitKV partial-output
+/// layout.
+///
+/// The grid supplies one Q-head index, Q-token-range index, and range-local
+/// Q-token offset for each threadblock. `q_token_ranges` derives the flat Q-token
+/// index. The end of the matching cumulative partial-output range identifies
+/// the block partial. One active threadblock owns one Q-token/Q-head block-SDPA
+/// task. The selected SplitKV reducer later combines the bidirectional block
+/// and persistent-history partial outputs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Config {
     pub block_size: u32,
+    pub max_q_tokens: u32,
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
@@ -58,6 +64,7 @@ impl Config {
     pub fn validate(self) {
         let thread_block = ThreadBlockConstants::current();
         assert!(self.block_size > 0);
+        assert!(self.max_q_tokens > 0);
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
         assert_eq!(self.num_q_heads % self.num_kv_heads, 0);
@@ -97,8 +104,9 @@ impl Config {
         checked_product(
             "GQA block SDPA partial-output statistic element count",
             &[
-                shape.num_total_sdpa_map_task_templates as usize,
+                shape.num_total_partial_output_slots as usize,
                 self.num_q_heads as usize,
+                self.max_q_tokens as usize,
             ],
         )
     }
@@ -113,8 +121,9 @@ impl Config {
         checked_product(
             "GQA block SDPA thread count",
             &[
-                shape.num_tokens as usize,
+                shape.num_q_token_ranges as usize,
                 self.num_q_heads as usize,
+                self.max_q_tokens as usize,
                 thread_block.required_threads as usize,
             ],
         )
@@ -130,19 +139,21 @@ impl Config {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Shape {
     pub num_tokens: u32,
-    pub num_total_sdpa_map_task_templates: u32,
+    pub num_q_token_ranges: u32,
+    pub num_total_partial_output_slots: u32,
 }
 
 impl Shape {
     pub fn validate(self, config: Config) {
         config.validate();
         assert!(self.num_tokens > 0);
+        assert!(self.num_q_token_ranges > 0 && self.num_q_token_ranges <= self.num_tokens);
+        assert!(self.num_total_partial_output_slots >= self.num_q_token_ranges);
         assert_eq!(
             self.num_tokens % config.block_size,
             0,
             "GQA block SDPA tokens must contain complete request blocks"
         );
-        assert!(self.num_total_sdpa_map_task_templates >= self.num_tokens);
         assert_u32_count_domain(config.q_elements(self), "GQA block SDPA Q");
         assert_u32_count_domain(config.kv_elements(self), "GQA block SDPA K/V");
         assert_u32_index_domain(
@@ -162,7 +173,8 @@ pub struct Buffers<'a> {
     pub q: &'a Buffer,
     pub local_k: &'a Buffer,
     pub local_v: &'a Buffer,
-    pub block_sdpa_map_task_template_indices: &'a Buffer,
+    pub q_token_ranges: &'a Buffer,
+    pub cu_sdpa_partial_outputs: &'a Buffer,
     pub partial_exp_sums: &'a Buffer,
     pub partial_max_logits: &'a Buffer,
     pub partial_output: &'a Buffer,
@@ -224,12 +236,14 @@ fn block_sdpa_source(kernel_constants: KernelConstants) -> String {
     let config = kernel_constants.config;
     let source_constants = format!(
         "using namespace metal;\n\nconstant uint block_size = {}u;\nconstant uint num_q_heads = {}u;\nconstant uint \
-         num_kv_heads = {}u;\nconstant uint head_dim = {}u;\nconstant float attention_scale = {:.9e}f;\nconstant uint \
-         simd_width = {}u;\nconstant uint q_values_per_thread = head_dim / simd_width;",
+         num_kv_heads = {}u;\nconstant uint head_dim = {}u;\nconstant uint max_q_tokens = {}u;\nconstant float \
+         attention_scale = {:.9e}f;\nconstant uint simd_width = {}u;\nconstant uint q_values_per_thread = head_dim / \
+         simd_width;",
         config.block_size,
         config.num_q_heads,
         config.num_kv_heads,
         config.head_dim,
+        config.max_q_tokens,
         config.scale,
         kernel_constants.thread_block.simdgroup_width,
     );
@@ -251,14 +265,18 @@ impl Operator for Invocation<'_> {
         recorder.set_buffer_read(0, self.buffers.q, 0);
         recorder.set_buffer_read(1, self.buffers.local_k, 0);
         recorder.set_buffer_read(2, self.buffers.local_v, 0);
-        recorder.set_buffer_read(3, self.buffers.block_sdpa_map_task_template_indices, 0);
-        recorder.set_buffer_write(4, self.buffers.partial_exp_sums, 0);
-        recorder.set_buffer_write(5, self.buffers.partial_max_logits, 0);
-        recorder.set_buffer_write(6, self.buffers.partial_output, 0);
-        recorder.set_u32(7, self.shape.num_tokens);
-        recorder.dispatch_1d(
-            config.dispatch_threads(self.shape, self.constants.thread_block),
-            self.constants.thread_block.required_threads as usize,
+        recorder.set_buffer_read(3, self.buffers.q_token_ranges, 0);
+        recorder.set_buffer_read(4, self.buffers.cu_sdpa_partial_outputs, 0);
+        recorder.set_buffer_write(5, self.buffers.partial_exp_sums, 0);
+        recorder.set_buffer_write(6, self.buffers.partial_max_logits, 0);
+        recorder.set_buffer_write(7, self.buffers.partial_output, 0);
+        recorder.dispatch_threadblocks(
+            (
+                config.num_q_heads as usize,
+                self.shape.num_q_token_ranges as usize,
+                config.max_q_tokens as usize,
+            ),
+            (self.constants.thread_block.required_threads as usize, 1, 1),
         );
     }
 }
@@ -271,10 +289,17 @@ impl Invocation<'_> {
         assert!(self.buffers.local_k.len_bytes() >= bytes(config.kv_elements(self.shape), config.dtype));
         assert!(self.buffers.local_v.len_bytes() >= bytes(config.kv_elements(self.shape), config.dtype));
         assert!(
-            self.buffers.block_sdpa_map_task_template_indices.len_bytes()
-                >= (self.shape.num_tokens as usize)
-                    .checked_mul(size_of::<u32>())
-                    .expect("GQA block SDPA map TaskTemplate index bytes must fit usize")
+            self.buffers.q_token_ranges.len_bytes()
+                >= (self.shape.num_q_token_ranges as usize)
+                    .checked_mul(2 * size_of::<u32>())
+                    .expect("GQA block SDPA Q-token-range bytes must fit usize")
+        );
+        assert!(
+            self.buffers.cu_sdpa_partial_outputs.len_bytes()
+                >= (self.shape.num_q_token_ranges as usize)
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(size_of::<u32>()))
+                    .expect("GQA block SDPA cumulative partial-output bytes must fit usize")
         );
         let partial_output_stat_bytes = self
             .constants

@@ -1,12 +1,17 @@
 use half::bf16;
 
 use super::*;
+use crate::components::gqa::kv_page_write::PageTableLayout;
+use crate::components::gqa::sdpa;
+use crate::components::gqa::split_kv::tiled_q;
+use crate::metal::ReplayU32;
 use crate::metal::Stream;
 
 #[test]
 fn test_constants_have_explicit_thread_block_scope() {
     let config = Config {
         block_size: 3,
+        max_q_tokens: 8,
         num_q_heads: 5,
         num_kv_heads: 1,
         head_dim: 32,
@@ -24,10 +29,12 @@ fn test_constants_have_explicit_thread_block_scope() {
 fn test_block_shape_rejects_partial_request_block() {
     Shape {
         num_tokens: 10,
-        num_total_sdpa_map_task_templates: 16,
+        num_q_token_ranges: 2,
+        num_total_partial_output_slots: 16,
     }
     .validate(Config {
         block_size: 9,
+        max_q_tokens: 8,
         num_q_heads: 40,
         num_kv_heads: 8,
         head_dim: 128,
@@ -46,11 +53,199 @@ fn test_bf16_kernel_matches_request_block_bidirectional_reference() {
     assert_kernel_matches_request_block_bidirectional_reference(Dtype::Bfloat16, 1.0e-2);
 }
 
+#[test]
+fn test_full_history_composite() {
+    assert_composite_matches_reference(&[0; 7]);
+}
+
+#[test]
+fn test_windowed_history_composite() {
+    // Use a scaled-down left window to exercise a different lower bound for
+    // each Q row while the local block remains inside the window.
+    assert_composite_matches_reference(&[4, 5, 6, 7, 8, 9, 10, 11]);
+}
+
+fn assert_composite_matches_reference(visible_kv_token_begins: &[u32]) {
+    let num_q_tokens = visible_kv_token_begins.len();
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let num_history_tokens = 16usize;
+    let num_q_heads = 5usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 128usize;
+    let tokens_per_page = 8usize;
+    let page_bytes = 2 * num_kv_heads * tokens_per_page * head_dim * Dtype::Bfloat16.item_size();
+    let scale = (head_dim as f32).sqrt().recip();
+    let tiled_config = tiled_q::Config {
+        num_q_heads: num_q_heads as u32,
+        num_kv_heads: num_kv_heads as u32,
+        head_dim: head_dim as u32,
+        scale,
+        page_bytes: page_bytes as u32,
+        dtype: Dtype::Bfloat16,
+        page_table_layout: PageTableLayout {
+            num_req_slots: 1,
+            num_gqa_layers: 1,
+            num_blocks: 2,
+            num_page_ids_per_block: 1,
+        },
+    };
+    let sdpa_config = sdpa::Config {
+        io_dtype: Dtype::Bfloat16,
+        num_q_heads: num_q_heads as u32,
+        num_kv_heads: num_kv_heads as u32,
+        head_dim: head_dim as u32,
+        tokens_per_page: tokens_per_page as u32,
+    };
+    let execution = sdpa::ExecutionVariant::tiled_q(sdpa_config, 8, 16, 5);
+    let tiled_shape = tiled_q::Shape {
+        num_total_tokens: num_q_tokens as u32,
+        num_total_q_token_tiles: 1,
+        num_total_sdpa_map_task_templates: 3,
+    };
+    let block_config = Config {
+        block_size: num_q_tokens as u32,
+        max_q_tokens: 8,
+        num_q_heads: num_q_heads as u32,
+        num_kv_heads: num_kv_heads as u32,
+        head_dim: head_dim as u32,
+        scale,
+        dtype: Dtype::Bfloat16,
+    };
+    let block_shape = Shape {
+        num_tokens: num_q_tokens as u32,
+        num_q_token_ranges: 1,
+        num_total_partial_output_slots: 3,
+    };
+
+    let q_values = bf16_pattern(num_q_tokens * num_q_heads * head_dim, 0.0013, -0.035);
+    let history_k = bf16_pattern(num_history_tokens * head_dim, -0.0009, 0.02);
+    let history_v = bf16_pattern(num_history_tokens * head_dim, 0.003, -0.1);
+    let local_k_values = bf16_pattern(num_q_tokens * head_dim, 0.0011, -0.025);
+    let local_v_values = bf16_pattern(num_q_tokens * head_dim, -0.002, 0.1);
+    let q = buffer(&device, &q_values, Dtype::Bfloat16);
+    let local_k = buffer(&device, &local_k_values, Dtype::Bfloat16);
+    let local_v = buffer(&device, &local_v_values, Dtype::Bfloat16);
+    let mut page_values = Vec::new();
+    for page_index in 0..2 {
+        let begin = page_index * tokens_per_page * head_dim;
+        let end = begin + tokens_per_page * head_dim;
+        page_values.extend_from_slice(&history_k[begin..end]);
+        page_values.extend_from_slice(&history_v[begin..end]);
+    }
+    let kv_pages = buffer(&device, &page_values, Dtype::Bfloat16);
+    let req_slots = Buffer::from_slice(&device, &vec![0_u32; num_q_tokens]);
+    let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
+    let visible_kv_token_ranges = Buffer::from_slice(
+        &device,
+        &visible_kv_token_begins
+            .iter()
+            .flat_map(|&begin| [begin, 12])
+            .collect::<Vec<_>>(),
+    );
+    let q_token_ranges = Buffer::from_slice(&device, &[0_u32, num_q_tokens as u32]);
+    let map_task_templates = Buffer::from_slice(&device, &[0_u32, 0, 4, 0, 4, 12, u32::MAX, u32::MAX, u32::MAX]);
+    let cu_partial_outputs = Buffer::from_slice(&device, &[0_u32, 3]);
+    let partial_state_groups = 3 * 8 * num_q_heads;
+    let partial_exp_sums = Buffer::new_zeroed_elements(&device, partial_state_groups, Dtype::Float32);
+    let partial_max_logits = Buffer::new_zeroed_elements(&device, partial_state_groups, Dtype::Float32);
+    let partial_output = Buffer::new_zeroed_elements(&device, partial_state_groups * head_dim, Dtype::Bfloat16);
+    let output = Buffer::new_zeroed_elements(&device, num_q_tokens * num_q_heads * head_dim, Dtype::Bfloat16);
+
+    let tiled = tiled_q::Compute::new(&device, tiled_config, execution, tiled_shape);
+    let block = Compute::new(&device, block_config);
+    let mut builder = stream.create_replay_program();
+    builder.record(tiled.invoke_map(
+        tiled_q::MapBuffers {
+            q: &q,
+            kv_pages: &kv_pages,
+            req_slots: &req_slots,
+            page_ids: &page_ids,
+            visible_kv_token_ranges: &visible_kv_token_ranges,
+            q_token_ranges: &q_token_ranges,
+            sdpa_map_task_templates: &map_task_templates,
+            partial_output: &partial_output,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+        },
+        ReplayU32::Fixed(0),
+        ReplayU32::Fixed(num_q_tokens as u32),
+        ReplayU32::Fixed(1),
+        ReplayU32::Fixed(3),
+    ));
+    builder.record(block.invoke(
+        block_shape,
+        Buffers {
+            q: &q,
+            local_k: &local_k,
+            local_v: &local_v,
+            q_token_ranges: &q_token_ranges,
+            cu_sdpa_partial_outputs: &cu_partial_outputs,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+            partial_output: &partial_output,
+        },
+    ));
+    builder.record_with_barrier_before(tiled.invoke_reduce(
+        tiled_q::ReduceBuffers {
+            partial_output: &partial_output,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+            q_token_ranges: &q_token_ranges,
+            cu_sdpa_partial_outputs: &cu_partial_outputs,
+            output: &output,
+        },
+        ReplayU32::Fixed(1),
+    ));
+    stream.submit_replay(&builder.build()).wait();
+
+    let actual = read_values(&output, num_q_tokens * num_q_heads * head_dim, Dtype::Bfloat16);
+    for (q_token_index, &visible_kv_token_begin) in visible_kv_token_begins.iter().enumerate() {
+        let history_begin = visible_kv_token_begin as usize;
+        for q_head_index in 0..num_q_heads {
+            let q_begin = (q_token_index * num_q_heads + q_head_index) * head_dim;
+            let query = &q_values[q_begin..q_begin + head_dim];
+            let mut scores = Vec::new();
+            let mut values = Vec::new();
+            for history_token_index in history_begin..12 {
+                let begin = history_token_index * head_dim;
+                scores.push(dot(query, &history_k[begin..begin + head_dim]) * scale);
+                values.push(&history_v[begin..begin + head_dim]);
+            }
+            for local_token_index in 0..num_q_tokens {
+                let begin = local_token_index * head_dim;
+                scores.push(dot(query, &local_k_values[begin..begin + head_dim]) * scale);
+                values.push(&local_v_values[begin..begin + head_dim]);
+            }
+            let max_logit = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights = scores
+                .iter()
+                .map(|score| (*score - max_logit).exp())
+                .collect::<Vec<_>>();
+            let weight_sum = weights.iter().sum::<f32>();
+            for dim in 0..head_dim {
+                let expected = weights
+                    .iter()
+                    .zip(&values)
+                    .map(|(&weight, value)| weight * value[dim])
+                    .sum::<f32>()
+                    / weight_sum;
+                let actual_value = actual[q_begin + dim];
+                assert!(
+                    (actual_value - expected).abs() < 3.0e-2,
+                    "q_token={q_token_index} q_head={q_head_index} dim={dim} actual={actual_value} expected={expected}"
+                );
+            }
+        }
+    }
+}
+
 fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, output_tolerance: f32) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let config = Config {
         block_size: 3,
+        max_q_tokens: 8,
         num_q_heads: 5,
         num_kv_heads: 1,
         head_dim: 32,
@@ -59,7 +254,8 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
     };
     let shape = Shape {
         num_tokens: 6,
-        num_total_sdpa_map_task_templates: 8,
+        num_q_token_ranges: 2,
+        num_total_partial_output_slots: 8,
     };
     let q_values = round_for_dtype(
         (0..config.q_elements(shape))
@@ -82,7 +278,8 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
     let q = buffer(&device, &q_values, dtype);
     let local_k = buffer(&device, &k_values, dtype);
     let local_v = buffer(&device, &v_values, dtype);
-    let block_sdpa_map_task_template_indices = Buffer::from_slice(&device, &[0_u32, 1, 2, 3, 4, 5]);
+    let q_token_ranges = Buffer::from_slice(&device, &[0_u32, 3, 3, 6]);
+    let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1, 2]);
     let partial_exp_sums =
         Buffer::new_zeroed_elements(&device, config.partial_output_stat_elements(shape), Dtype::Float32);
     let partial_max_logits =
@@ -96,7 +293,8 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
             q: &q,
             local_k: &local_k,
             local_v: &local_v,
-            block_sdpa_map_task_template_indices: &block_sdpa_map_task_template_indices,
+            q_token_ranges: &q_token_ranges,
+            cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
             partial_exp_sums: &partial_exp_sums,
             partial_max_logits: &partial_max_logits,
             partial_output: &partial_output,
@@ -125,7 +323,10 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
                 .map(|&score| (score - max_logit).exp())
                 .collect::<Vec<_>>();
             let exp_sum = weights.iter().sum::<f32>();
-            let partial_output_index = q_token_index * config.num_q_heads as usize + q_head;
+            let partial_output_index = ((q_token_index / config.block_size as usize * config.num_q_heads as usize
+                + q_head)
+                * config.max_q_tokens as usize)
+                + q_token_index % config.block_size as usize;
             assert!(
                 (actual_partial_max_logits[partial_output_index] - max_logit).abs() < 1.0e-4,
                 "actual={} expected={max_logit}",
@@ -163,6 +364,16 @@ fn round_for_dtype(values: Vec<f32>, dtype: Dtype) -> Vec<f32> {
         Dtype::Bfloat16 => values.into_iter().map(|value| bf16::from_f32(value).to_f32()).collect(),
         dtype => panic!("unsupported test dtype {dtype:?}"),
     }
+}
+
+fn bf16_pattern(count: usize, step: f32, bias: f32) -> Vec<f32> {
+    (0..count)
+        .map(|index| bf16::from_f32((index % 97) as f32 * step + bias).to_f32())
+        .collect()
+}
+
+fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter().zip(rhs).map(|(&lhs, &rhs)| lhs * rhs).sum()
 }
 
 fn buffer(device: &Device, values: &[f32], dtype: Dtype) -> Buffer {

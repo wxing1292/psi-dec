@@ -12,7 +12,7 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkLayerWeightB
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xDenseMLPWeightBindings;
 
 use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
-use crate::attn::dspark::state::UngatedDSparkGQAState;
+use crate::attn::dspark::state::DSparkGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
@@ -63,7 +63,7 @@ impl Qwen3xDSparkLayer {
         dspark_layer_index: usize,
         page_bytes: usize,
         bindings: &Qwen3xDSparkLayerWeightBindings,
-        gqa_state: &UngatedDSparkGQAState,
+        gqa_state: &DSparkGQAState,
         scratch: Rc<Qwen3xDSparkLayerScratch>,
         dense_scratch: Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
@@ -150,7 +150,7 @@ impl Qwen3xDSparkLayer {
         self.attention.unload_state();
     }
 
-    pub fn load_state(&mut self, state: &UngatedDSparkGQAState) {
+    pub fn load_state(&mut self, state: &DSparkGQAState) {
         self.attention.load_state(state);
     }
 

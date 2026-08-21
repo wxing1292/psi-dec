@@ -1,7 +1,7 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::UngatedDSparkGQACore;
+use inference_executor_core::attn::DSparkGQACore;
 
 use crate::attn::dspark::capacity::DSparkGQACapacity;
 
@@ -35,7 +35,7 @@ pub struct DSparkBlockScratchBindings<'a> {
 }
 
 impl DSparkBlockScratch {
-    pub fn new(device: &Device, core: &UngatedDSparkGQACore, io_dtype: Dtype, capacity: DSparkGQACapacity) -> Self {
+    pub fn new(device: &Device, core: &DSparkGQACore, io_dtype: Dtype, capacity: DSparkGQACapacity) -> Self {
         core.validate();
         match io_dtype {
             Dtype::Bfloat16 => {},
@@ -55,7 +55,7 @@ impl DSparkBlockScratch {
                 .expect("DSpark block scratch tensor element count must fit usize")
         };
         let partial_stats = capacity
-            .max_sdpa_partial_outputs
+            .max_sdpa_partial_state_groups
             .checked_mul(attention.num_q_heads)
             .expect("DSpark block scratch partial statistic count must fit usize");
         let partial_values = partial_stats

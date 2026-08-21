@@ -194,19 +194,10 @@ impl Registry {
         Self::from_variants(config, variants)
     }
 
-    /// Creates a registry that contains only the current SingleQ execution.
-    /// Composite operators can use this registry when all of their Map kernels
-    /// must share the SingleQ partial-state ABI and one Reduce kernel.
-    pub fn new_single_q_only(config: Config) -> Self {
-        config.validate();
-        Self::from_variants(config, vec![single_q_variant(config)])
-    }
-
     /// Creates a registry from explicit backend variants.
     ///
     /// Backend benchmarks can use this constructor to force one legal
-    /// variant. Production model components use [`Self::new`] or
-    /// [`Self::new_single_q_only`].
+    /// variant. Production model components use [`Self::new`].
     pub fn from_variants(config: Config, variants: Vec<ExecutionVariant>) -> Self {
         config.validate();
         assert!(!variants.is_empty(), "GQA SDPA registry requires an execution variant");
@@ -279,14 +270,12 @@ mod tests {
         let d256_page8 = Registry::new(config(256, 6, 8));
         let d128_page8 = Registry::new(config(128, 8, 8));
         let unsupported = Registry::new(config(256, 8, 4));
-        let dspark = Registry::new_single_q_only(config(128, 8, 8));
 
         assert_eq!(d256_page16.variants().len(), 3);
         assert_eq!(d256_page8.variants().len(), 3);
         assert_eq!(d128_page8.variants().len(), 2);
         assert_eq!(unsupported.variants().len(), 1);
-        assert_eq!(dspark.variants().len(), 1);
-        for registry in [d256_page16, d256_page8, d128_page8, unsupported, dspark] {
+        for registry in [d256_page16, d256_page8, d128_page8, unsupported] {
             assert!(
                 registry
                     .variants()

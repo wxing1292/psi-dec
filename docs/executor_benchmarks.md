@@ -111,7 +111,8 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   output.
   Its projection probes compare QMV, QMM BM8/BN32, and QMM BM16/BN32. These forced paths are benchmark-only.
 - `gqa_block_attn` measures the model-independent dense block-bidirectional SDPA map component.
-  It accepts block size, request count, head geometry, and dtype as CLI arguments.
+  It accepts block size, request count, head geometry, partial-state Q width, and dtype as CLI arguments.
+  The default `max_q_tokens = 8` matches the current production TiledQ partial-state layout.
   The backend owns its one-SIMDgroup threadblock geometry.
 - `qwen3_dspark` loads real Main and DSpark checkpoints.
   It runs the public executor lifecycle for `main` or `dspark`.
@@ -171,6 +172,7 @@ Representative smoke commands:
 ```text
 cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1 \
+  --max-q-tokens 8 \
   --iters 1 --warmup-iters 0 --runs 1
 
 PSI_DEC_BUFFER_IO_BENCH_DIR=<storage-directory> \

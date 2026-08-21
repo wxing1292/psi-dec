@@ -24,7 +24,7 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
-use inference_executor_metal::attn::dspark::state::UngatedDSparkGQAState;
+use inference_executor_metal::attn::dspark::state::DSparkGQAState;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::model::embedding::Embed;
 use inference_executor_metal::model::embedding::EmbedConfig;
@@ -367,7 +367,7 @@ struct DSparkFixture {
     _embed: Qwen3xDSparkEmbed,
     _body: Qwen3xDSparkBody,
     _model: Rc<Qwen3xDSparkModel>,
-    _gqa_state: UngatedDSparkGQAState,
+    _gqa_state: DSparkGQAState,
     _token_ids: Buffer,
     hidden_input: Buffer,
     _pages: PageArena,
@@ -405,7 +405,7 @@ impl DSparkFixture {
             .checked_mul(num_layers)
             .and_then(|pages| pages.checked_mul(num_page_ids_per_block))
             .expect("DSpark comparison page count must fit usize");
-        let gqa_state = UngatedDSparkGQAState::new(
+        let gqa_state = DSparkGQAState::new(
             device,
             attention_core,
             attention_split_kv_config,
@@ -416,7 +416,7 @@ impl DSparkFixture {
         );
         let block = DSparkBlockMetadata::new(
             &request_slots(num_requests),
-            &vec![context; num_requests],
+            &vec![0..context; num_requests],
             config.block_size,
         );
         gqa_state.prepare_block(&block);

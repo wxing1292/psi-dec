@@ -25,6 +25,7 @@ fn main() {
                     args.num_q_heads,
                     args.num_kv_heads,
                     args.head_dim,
+                    args.max_q_tokens,
                     dtype,
                 );
                 let setup_elapsed = setup_start.elapsed();
@@ -45,6 +46,7 @@ struct Args {
     num_q_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    max_q_tokens: u32,
     dtypes: Vec<Dtype>,
     warmup_iters: usize,
     iters: usize,
@@ -59,6 +61,7 @@ impl Args {
             num_q_heads: 40,
             num_kv_heads: 8,
             head_dim: 128,
+            max_q_tokens: 8,
             dtypes: vec![Dtype::Bfloat16],
             warmup_iters: 20,
             iters: 100,
@@ -73,6 +76,7 @@ impl Args {
                 "--num-q-heads" => args.num_q_heads = parse_u32(&next_arg(&mut values, &arg), &arg),
                 "--num-kv-heads" => args.num_kv_heads = parse_u32(&next_arg(&mut values, &arg), &arg),
                 "--head-dim" => args.head_dim = parse_u32(&next_arg(&mut values, &arg), &arg),
+                "--max-q-tokens" => args.max_q_tokens = parse_u32(&next_arg(&mut values, &arg), &arg),
                 "--dtypes" => args.dtypes = parse_dtypes(&next_arg(&mut values, &arg)),
                 "--warmup-iters" => args.warmup_iters = parse_usize(&next_arg(&mut values, &arg), &arg),
                 "--iters" => args.iters = parse_usize(&next_arg(&mut values, &arg), &arg),
@@ -86,6 +90,7 @@ impl Args {
         assert!(!args.num_requests.is_empty(), "--num-requests must not be empty");
         assert!(args.num_requests.iter().all(|&value| value > 0));
         assert!(!args.dtypes.is_empty(), "--dtypes must not be empty");
+        assert!(args.max_q_tokens > 0, "--max-q-tokens must be positive");
         assert!(args.iters > 0, "--iters must be positive");
         assert!(args.runs > 0, "--runs must be positive");
         args
@@ -98,7 +103,8 @@ struct Fixture {
     _q: Buffer,
     _local_k: Buffer,
     _local_v: Buffer,
-    _block_sdpa_map_task_template_indices: Buffer,
+    _q_token_ranges: Buffer,
+    _cu_sdpa_partial_outputs: Buffer,
     _partial_exp_sums: Buffer,
     _partial_max_logits: Buffer,
     partial_output: Buffer,
@@ -108,6 +114,7 @@ struct Fixture {
     num_q_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    max_q_tokens: u32,
     dtype: Dtype,
 }
 
@@ -120,17 +127,27 @@ impl Fixture {
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        max_q_tokens: u32,
         dtype: Dtype,
     ) -> Self {
         let num_tokens = num_requests
             .checked_mul(block_size)
             .expect("GQA block-attention bench token count must fit u32");
-        let num_total_sdpa_map_task_templates = num_tokens
-            .checked_mul(2)
-            .and_then(u32::checked_next_power_of_two)
+        let num_q_token_ranges_per_request = block_size.div_ceil(max_q_tokens);
+        let num_q_token_ranges = num_requests
+            .checked_mul(num_q_token_ranges_per_request)
+            .expect("GQA block-attention bench Q-token-range count must fit u32");
+        let num_total_partial_output_slots = num_tokens
+            .max(
+                num_q_token_ranges
+                    .checked_mul(2)
+                    .expect("GQA block-attention bench composite partial count must fit u32"),
+            )
+            .checked_next_power_of_two()
             .expect("GQA block-attention bench partial-output capacity must fit u32");
         let config = backend_block_sdpa::Config {
             block_size,
+            max_q_tokens,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -139,28 +156,36 @@ impl Fixture {
         };
         let shape = backend_block_sdpa::Shape {
             num_tokens,
-            num_total_sdpa_map_task_templates,
+            num_q_token_ranges,
+            num_total_partial_output_slots,
         };
         shape.validate(config);
 
         let q_elements = checked_product(&[num_tokens, num_q_heads, head_dim]);
         let kv_elements = checked_product(&[num_tokens, num_kv_heads, head_dim]);
-        let partial_stat_elements = checked_product(&[num_total_sdpa_map_task_templates, num_q_heads]);
+        let partial_stat_elements = checked_product(&[num_total_partial_output_slots, num_q_heads, max_q_tokens]);
         let partial_output_elements = partial_stat_elements
             .checked_mul(head_dim as usize)
             .expect("GQA block-attention bench partial-output elements must fit usize");
         let q = pattern_buffer(device, q_elements, dtype, 0.003);
         let local_k = pattern_buffer(device, kv_elements, dtype, -0.002);
         let local_v = pattern_buffer(device, kv_elements, dtype, 0.004);
-        let block_sdpa_map_task_template_indices = Buffer::from_slice(
+        let mut q_token_range_values = Vec::with_capacity(num_q_token_ranges as usize * 2);
+        for request_index in 0..num_requests {
+            let request_begin = request_index * block_size;
+            let request_end = request_begin + block_size;
+            let mut range_begin = request_begin;
+            while range_begin < request_end {
+                let range_end = (range_begin + max_q_tokens).min(request_end);
+                q_token_range_values.extend_from_slice(&[range_begin, range_end]);
+                range_begin = range_end;
+            }
+        }
+        let q_token_ranges = Buffer::from_slice(device, &q_token_range_values);
+        let cu_sdpa_partial_outputs = Buffer::from_slice(
             device,
-            &(0..num_tokens)
-                .map(|token_index| {
-                    token_index
-                        .checked_mul(2)
-                        .and_then(|value| value.checked_add(1))
-                        .expect("GQA block-attention bench TaskTemplate index must fit u32")
-                })
+            &(0..=num_q_token_ranges)
+                .map(|range_index| range_index * 2)
                 .collect::<Vec<_>>(),
         );
         let partial_exp_sums = Buffer::new_zeroed_elements(device, partial_stat_elements, Dtype::Float32);
@@ -175,7 +200,8 @@ impl Fixture {
                 q: &q,
                 local_k: &local_k,
                 local_v: &local_v,
-                block_sdpa_map_task_template_indices: &block_sdpa_map_task_template_indices,
+                q_token_ranges: &q_token_ranges,
+                cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
                 partial_exp_sums: &partial_exp_sums,
                 partial_max_logits: &partial_max_logits,
                 partial_output: &partial_output,
@@ -188,7 +214,8 @@ impl Fixture {
             _q: q,
             _local_k: local_k,
             _local_v: local_v,
-            _block_sdpa_map_task_template_indices: block_sdpa_map_task_template_indices,
+            _q_token_ranges: q_token_ranges,
+            _cu_sdpa_partial_outputs: cu_sdpa_partial_outputs,
             _partial_exp_sums: partial_exp_sums,
             _partial_max_logits: partial_max_logits,
             partial_output,
@@ -198,6 +225,7 @@ impl Fixture {
             num_q_heads,
             num_kv_heads,
             head_dim,
+            max_q_tokens,
             dtype,
         }
     }
@@ -240,8 +268,8 @@ fn print_result(
     per_iteration_us.sort_by(f64::total_cmp);
     println!(
         "perf component=gqa-block-sdpa backend=metal operation=block-bidi-map dtype={} num_requests={} block_size={} \
-         num_tokens={} num_q_heads={} num_kv_heads={} head_dim={} setup_us={:.3} cache_miss_us={:.3} iters={} runs={} \
-         median_us={:.3} samples_us={:?}",
+         num_tokens={} num_q_heads={} num_kv_heads={} head_dim={} max_q_tokens={} setup_us={:.3} cache_miss_us={:.3} \
+         iters={} runs={} median_us={:.3} samples_us={:?}",
         dtype_name(fixture.dtype),
         fixture.num_requests,
         fixture.block_size,
@@ -249,6 +277,7 @@ fn print_result(
         fixture.num_q_heads,
         fixture.num_kv_heads,
         fixture.head_dim,
+        fixture.max_q_tokens,
         setup_elapsed.as_secs_f64() * 1.0e6,
         cache_miss_elapsed.as_secs_f64() * 1.0e6,
         iters,
@@ -333,8 +362,8 @@ fn next_arg(values: &mut impl Iterator<Item = String>, flag: &str) -> String {
 fn print_help_and_exit() -> ! {
     let executable = PathBuf::from(std::env::args().next().unwrap_or_else(|| "gqa_block_attn".to_string()));
     println!(
-        "{}\n--block-sizes 7\n--num-requests 1,4\n--num-q-heads 40\n--num-kv-heads 8\n--head-dim 128\n--dtypes \
-         bf16,f32\n--warmup-iters N\n--iters N\n--runs N",
+        "{}\n--block-sizes 7\n--num-requests 1,4\n--num-q-heads 40\n--num-kv-heads 8\n--head-dim 128\n--max-q-tokens \
+         8\n--dtypes bf16,f32\n--warmup-iters N\n--iters N\n--runs N",
         executable.display()
     );
     std::process::exit(0);

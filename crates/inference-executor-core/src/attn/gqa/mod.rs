@@ -6,7 +6,7 @@ pub use core::GQAReplayShape;
 mod dspark_core;
 pub use dspark_core::DSparkBlockCapacity;
 pub use dspark_core::DSparkBlockMetadata;
-pub use dspark_core::UngatedDSparkGQACore;
+pub use dspark_core::DSparkGQACore;
 
 mod ungated_core;
 pub use ungated_core::UngatedGQACore;

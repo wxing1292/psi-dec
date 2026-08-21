@@ -5,7 +5,7 @@ use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::UngatedDSparkGQACore;
+use inference_executor_core::attn::DSparkGQACore;
 use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
@@ -13,14 +13,14 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkRopeScaling;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
 
-use crate::attn::dspark::backend::UngatedDSparkGQA;
-use crate::attn::dspark::backend::UngatedDSparkGQAInput;
+use crate::attn::dspark::backend::DSparkGQA;
+use crate::attn::dspark::backend::DSparkGQAInput;
+use crate::attn::dspark::context::DSparkGQAContextAppender;
+use crate::attn::dspark::context::DSparkGQAContextInput;
 use crate::attn::dspark::context::DSparkGQAContextScratch;
-use crate::attn::dspark::context::UngatedDSparkGQAContextAppender;
-use crate::attn::dspark::context::UngatedDSparkGQAContextInput;
 use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
 use crate::attn::dspark::scratch::DSparkBlockScratch;
-use crate::attn::dspark::state::UngatedDSparkGQAState;
+use crate::attn::dspark::state::DSparkGQAState;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
@@ -33,11 +33,11 @@ use crate::model::qwen::v3_x::weight::to_u32;
 
 pub struct Qwen3xDSparkAttention {
     dspark_layer_index: u32,
-    core: UngatedDSparkGQACore,
+    core: DSparkGQACore,
     metal: GQAMetalConfig,
     weights: Option<Qwen3xUngatedGQAWeightBuffers>,
-    backend: UngatedDSparkGQA,
-    context_appender: UngatedDSparkGQAContextAppender,
+    backend: DSparkGQA,
+    context_appender: DSparkGQAContextAppender,
     block_scratch: Option<Rc<DSparkBlockScratch>>,
     context_scratch: Option<Rc<DSparkGQAContextScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
@@ -46,10 +46,10 @@ pub struct Qwen3xDSparkAttention {
 impl Qwen3xDSparkAttention {
     pub fn new(
         device: &Device,
-        core: UngatedDSparkGQACore,
+        core: DSparkGQACore,
         metal: GQAMetalConfig,
         dspark_layer_index: usize,
-        state: &UngatedDSparkGQAState,
+        state: &DSparkGQAState,
     ) -> Self {
         Self {
             dspark_layer_index: dspark_layer_index
@@ -58,8 +58,8 @@ impl Qwen3xDSparkAttention {
             core: core.clone(),
             metal,
             weights: None,
-            backend: UngatedDSparkGQA::new(device, core.clone(), metal),
-            context_appender: UngatedDSparkGQAContextAppender::new(device, core, metal),
+            backend: state.new_gqa(device, core.clone(), metal),
+            context_appender: DSparkGQAContextAppender::new(device, core, metal),
             block_scratch: Some(state.block_scratch()),
             context_scratch: Some(state.context_scratch()),
             request_page_table: Some(state.request_page_table()),
@@ -104,7 +104,7 @@ impl Qwen3xDSparkAttention {
         self.block_scratch.take();
     }
 
-    pub fn load_state(&mut self, state: &UngatedDSparkGQAState) {
+    pub fn load_state(&mut self, state: &DSparkGQAState) {
         assert!(
             self.block_scratch.is_none() && self.context_scratch.is_none() && self.request_page_table.is_none(),
             "Qwen3.x DSpark attention state is already loaded"
@@ -133,7 +133,7 @@ impl Qwen3xDSparkAttention {
     {
         self.context_appender.record(
             recorder,
-            UngatedDSparkGQAContextInput {
+            DSparkGQAContextInput {
                 num_tokens,
                 page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dspark_layer_index,
@@ -160,10 +160,10 @@ impl Qwen3xDSparkAttention {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let _ = <UngatedDSparkGQA as ReplayLayer>::record(
+        let _ = <DSparkGQA as ReplayLayer>::record(
             &self.backend,
             recorder,
-            UngatedDSparkGQAInput {
+            DSparkGQAInput {
                 page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dspark_layer_index,
                 metadata,
@@ -204,7 +204,7 @@ pub fn derive_qwen3x_dspark_gqa_configs(
     dspark_layer_index: usize,
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
-) -> Result<(UngatedDSparkGQACore, GQAMetalConfig), ModelExecutorError> {
+) -> Result<(DSparkGQACore, GQAMetalConfig), ModelExecutorError> {
     let core = qwen3x_dspark_gqa_core(config, num_spec_tokens, dspark_layer_index);
     let metal = qwen3x_dspark_gqa_metal_config(config, bindings, page_bytes)?;
     assert!(
@@ -218,7 +218,7 @@ pub fn qwen3x_dspark_gqa_core(
     config: &Qwen3xDSparkConfig,
     num_spec_tokens: usize,
     dspark_layer_index: usize,
-) -> UngatedDSparkGQACore {
+) -> DSparkGQACore {
     assert!(
         num_spec_tokens > 0,
         "Qwen3x DSpark attention requires speculative tokens"
@@ -240,7 +240,7 @@ pub fn qwen3x_dspark_gqa_core(
         (config.head_dim as f32).sqrt().recip(),
     );
     attention.validate();
-    UngatedDSparkGQACore::new(attention, num_spec_tokens)
+    DSparkGQACore::new(attention, num_spec_tokens)
 }
 
 pub fn qwen3x_dspark_gqa_sdpa_config(

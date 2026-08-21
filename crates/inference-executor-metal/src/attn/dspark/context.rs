@@ -5,8 +5,8 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
+use inference_executor_core::attn::DSparkGQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
-use inference_executor_core::attn::UngatedDSparkGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 
 use crate::attn::gqa::backend::GQAKVCacheBindings;
@@ -30,7 +30,7 @@ pub struct DSparkGQAContextScratchBindings<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct UngatedDSparkGQAContextInput<'a> {
+pub struct DSparkGQAContextInput<'a> {
     pub num_tokens: u32,
     pub page_table_layout: GQAPageTableLayout,
     pub gqa_layer_index: u32,
@@ -42,8 +42,8 @@ pub struct UngatedDSparkGQAContextInput<'a> {
     pub scratch: DSparkGQAContextScratchBindings<'a>,
 }
 
-pub struct UngatedDSparkGQAContextAppender {
-    core: UngatedDSparkGQACore,
+pub struct DSparkGQAContextAppender {
+    core: DSparkGQACore,
     metal: GQAMetalConfig,
     k: affine_quantized::Matmul,
     v: affine_quantized::Matmul,
@@ -52,7 +52,7 @@ pub struct UngatedDSparkGQAContextAppender {
 }
 
 impl DSparkGQAContextScratch {
-    pub fn new(device: &Device, core: &UngatedDSparkGQACore, io_dtype: Dtype, max_tokens: usize) -> Self {
+    pub fn new(device: &Device, core: &DSparkGQACore, io_dtype: Dtype, max_tokens: usize) -> Self {
         core.validate();
         match io_dtype {
             Dtype::Bfloat16 => {},
@@ -81,8 +81,8 @@ impl DSparkGQAContextScratch {
     }
 }
 
-impl UngatedDSparkGQAContextAppender {
-    pub fn new(device: &Device, core: UngatedDSparkGQACore, metal: GQAMetalConfig) -> Self {
+impl DSparkGQAContextAppender {
+    pub fn new(device: &Device, core: DSparkGQACore, metal: GQAMetalConfig) -> Self {
         core.validate();
         metal.validate();
         let attention = &core.attention;
@@ -112,7 +112,7 @@ impl UngatedDSparkGQAContextAppender {
         }
     }
 
-    pub fn record<'a, R>(&'a self, recorder: &mut R, input: UngatedDSparkGQAContextInput<'a>)
+    pub fn record<'a, R>(&'a self, recorder: &mut R, input: DSparkGQAContextInput<'a>)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
