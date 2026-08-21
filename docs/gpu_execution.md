@@ -1,69 +1,85 @@
-# GPU Execution Vocabulary
+# GPU Execution
 
-This document defines the shared GPU execution vocabulary for the repository. Component documents define the
-component-specific operation, task, constants, variant, selection, and data layout.
+This document defines the shared GPU execution model for the repository. It defines names, ownership, and lifecycle.
+Component documents define component-specific algorithms, tasks, tiles, arguments, and layouts.
 
-The vocabulary follows the execution hierarchy and scope concepts in
-[Modern GPU Programming for MLSys](https://mlc.ai/modern-gpu-programming-for-mlsys/). Use that material as a conceptual
-reference. Do not copy Blackwell-specific CTA, warpgroup, TMA, TMEM, or tile-size names into a backend-independent API.
+The model follows the hierarchy and scope concepts in
+[Modern GPU Programming for MLSys](https://mlc.ai/modern-gpu-programming-for-mlsys/). That material is a conceptual
+reference. It uses NVIDIA Blackwell as its main target. Do not copy Blackwell-specific CTA, warpgroup, TMA, TMEM, or
+tile-size names into a backend-independent API without a matching project contract.
 
-The project uses `threadblock` in backend-independent identifiers. Metal source uses `threadgroup` and `simdgroup` at
-the backend boundary.
+The project uses `threadblock` in backend-independent identifiers. CUDA calls this object a thread block. Metal calls
+it a threadgroup. Metal source must use Metal terms at the backend boundary.
 
-## Execution hierarchy
+## Mental model
+
+Keep compilation, launch, semantic work, and runtime selection separate:
+
+```text
+Compilation
+    KernelSource + KernelConstants
+        -> CompiledKernel
+
+Launch
+    CompiledKernel
+    + KernelArguments
+    + KernelExecutionConfiguration
+        -> KernelLaunch
+
+Hardware execution
+    KernelLaunch
+        -> Grid
+            -> ThreadBlocks
+                -> Threads
+
+Semantic work
+    one current non-persistent ThreadBlock
+        -> zero or one component-defined ThreadBlockTask
+            -> component-defined ThreadTask per Thread
+
+Runtime implementation choice
+    StaticConfig
+        -> Registry of legal Variants
+    DynamicWorkload + Registry
+        -> Selector::select(...)
+            -> Selection
+                -> Invocation
+                    -> record(...)
+```
+
+These relations define project vocabulary. They do not require one generic Rust type for each box.
+
+## Compilation and launch
 
 Use these project relations:
 
 ```text
+CompiledKernel
+    = compile(KernelSource, KernelConstants)
+
 KernelLaunch
     = CompiledKernel
     + KernelArguments
     + KernelExecutionConfiguration
-
-CompiledKernel
-    = compile(KernelSource, KernelConstants)
 ```
 
-The concrete Metal backend type is `metal::CompiledKernel`. It owns one compiled compute pipeline. Component-specific
-types such as `affine_quantized::Kernel` can wrap a `CompiledKernel` with operation constants and variant identity.
+The concrete Metal backend type is `metal::CompiledKernel`. It owns one compiled compute pipeline. A
+component-specific type can wrap a `CompiledKernel` with operation constants or variant identity.
 
-`KernelExecutionConfiguration` contains `grid_dimensions` and `thread_block_dimensions`. It does not contain an
-executed Grid object. A launch creates this execution hierarchy:
+`KernelConstants` contains values that are fixed when the project compiles or looks up a `CompiledKernel`.
+`KernelArguments` contains launch data such as buffers, metadata, and scalar values.
+`KernelExecutionConfiguration` contains `grid_dimensions` and `thread_block_dimensions`.
 
-```text
-KernelLaunch
-    -> one Grid
-    -> many ThreadBlocks
-    -> many Threads per ThreadBlock
-```
+Do not put an executed Grid object in `KernelExecutionConfiguration`. A launch creates the Grid.
 
-All threads execute the same `CompiledKernel`. All threads can read the same `KernelArguments`. Each thread has a
-different `thread_block_index` and `thread_index`.
+All threads in one launch execute the same `CompiledKernel`. All threads can read the same `KernelArguments`. Each
+thread has a different `thread_block_index` and `thread_index`.
 
-The hardware hierarchy and the semantic work hierarchy are related but distinct:
+Do not copy a compile-time constant into `KernelArguments` only because the shader uses the value.
 
-```text
-KernelLaunch
-├── CompiledKernel
-│   ├── KernelSource
-│   └── KernelConstants
-├── KernelArguments
-└── KernelExecutionConfiguration
-    ├── grid_dimensions
-    └── thread_block_dimensions
+## Constants and specialization
 
-one ThreadBlock
-└── component-defined ThreadBlockTask
-    └── component-defined ThreadTask per Thread
-```
-
-A non-persistent kernel can define a `1:1` relation between `ThreadBlock` and `ThreadBlockTask`. This relation is a
-kernel contract. It is not a global GPU programming rule. Each component must state its relation.
-
-## Compile-time constants and execution variants
-
-`KernelConstants` contains values that are fixed when the project compiles or looks up one `CompiledKernel`. Group
-fields by the scope that owns them:
+Group compile-time constants by the scope that owns them:
 
 ```text
 ComponentKernelConstants
@@ -85,36 +101,16 @@ Use nesting to show scope. Do not repeat the scope in each nested field name.
 
 The required and actual thread counts must match.
 
-`KernelArguments` contains launch data. It can contain buffers, metadata, and scalar values. Do not copy a compile-time
-constant into `KernelArguments` only because the shader uses that value.
+Use `specialization` for the act or result of compiling an implementation for fixed constants. Use
+`KernelConstants` for the value that contains those constants. Do not name that value `KernelSpecialization`.
 
-Dynamic workload shapes can derive tasks and an execution configuration. They do not select a kernel unless the
-component has multiple legal implementations with a workload-dependent choice.
-
-Use `specialization` for the act or result of compiling an implementation for fixed constants. Do not use
-`KernelSpecialization` as the name of the constant value. The MLC reference uses compile-time constants such as
-`BLK_M` and describes kernels as specialized for fixed tile shapes. This project uses the same distinction.
-
-An `ExecutionVariant` is the complete unit that a runtime selector can choose:
-
-```text
-ExecutionVariant
-├── algorithm or execution-path identity
-├── one or more kernel-family identities
-└── matching KernelConstants
-```
-
-An algorithm and a shape-specific kernel implementation are not separate selector levels. One registry entry contains
-the complete combination. For example, a future GDN registry can contain recurrent and chunkwise variants. Each entry
-can also identify the constants and kernels for one shape family.
-
-An `ExecutionVariant` does not have to own pipeline objects. A registry can exist before device-specific pipeline
-construction. In that case, the variant is a stable description that a later owner uses to compile or look up the
-matching `CompiledKernel` values.
+The MLC reference uses compile-time constants such as `BLK_M`. It describes the resulting kernels as specialized for
+fixed tile shapes. This project uses the same distinction.
 
 ## Tasks, tiles, and layouts
 
-A task describes semantic work. For a component-specific non-persistent kernel, use this model:
+A task describes semantic work. For a current non-persistent kernel that has threadblock-level semantic work, use this
+model:
 
 ```text
 ThreadBlockTask
@@ -132,134 +128,262 @@ ThreadTask
       )
 ```
 
-These are semantic definitions. The CPU does not have to construct or upload task objects. A kernel can derive task
-coordinates from grid indices and compact metadata.
+The `1:1` relation between a ThreadBlock and a ThreadBlockTask is a kernel contract. It is not a global GPU hardware
+rule. Each component must state its relation.
 
-A tile is a bounded subregion of tensor coordinates used by an implementation. A tile is not a launch, an execution
-configuration, or a generic task object.
+`ThreadBlockTask` and `ThreadTask` are semantic definitions. The CPU does not have to construct or upload task
+objects. A kernel can derive task coordinates from grid indices and compact metadata.
+
+Do not add a Task name to a flat elementwise dispatch only for symmetry. Describe its tensor map and Grid when a
+threadblock does not own a distinct semantic work unit.
+
+A tile is a bounded tensor subregion that an implementation reuses or computes as one unit. A tile is not a launch,
+an execution configuration, or a generic task object.
 
 For GEMM, `BM`, `BN`, and `BK` describe operand and output subregions. `BK` is an implementation loop extent. For SDPA
-or recurrence, use component coordinates such as Q-token ranges, KV-token ranges, head ranges, or V-row ranges. Do not
-force these coordinates into GEMM names when the mathematical domains differ.
+or recurrence, use the real coordinate domains, such as Q tokens, KV tokens, heads, or state rows. Do not force these
+domains into GEMM names.
 
-A layout maps logical coordinates to storage locations or thread ownership. State the coordinate domains and owning
+A layout maps logical coordinates to storage locations or thread ownership. State its coordinate domains and owning
 scope. Do not use `Tile`, `Task`, or `Layout` as an unqualified substitute for this information.
 
-## Registration and selection
+## Execution variants
 
-Use this component-local model when a component has runtime-selectable execution variants:
+A `Variant` is the complete unit that a runtime selector can choose:
 
 ```text
-StaticConfig
-    -> Registry.supports(...)
-    -> legal ExecutionVariants
-
-DynamicWorkload + legal ExecutionVariants
-    -> Selector::select(...)
-    -> selected execution
-    -> metadata, KernelArguments, and KernelExecutionConfiguration
+Variant
+├── algorithm or execution-path identity
+├── one or more kernel-family identities
+└── matching KernelConstants
 ```
 
-`Registry` and `Selector` are short internal names because their module path supplies the component scope. Do not add a
-cross-component registry or selector trait.
+Do not create separate selector layers for algorithm choice and shape-specific kernel choice. One registry entry must
+identify the complete selectable combination. For example, a future GDN registry can contain recurrent and chunkwise
+variants. Each entry can identify the constants and kernels for one supported shape family.
 
-`Registry::supports(...)` must contain correctness and static capability checks. It must not contain dynamic workload
-performance thresholds. `Selector` owns the dynamic choice. Recording must not select a second variant.
+`Variant` can own ready `CompiledKernel` values. It can also contain stable descriptions that another owner uses to
+compile or look up those kernels. The component contract determines this ownership.
 
-The selector must compare complete candidate cost. If one candidate needs dynamic task partitioning, scratch extents,
-or replay extents, the selector must materialize those values before it compares candidates. Do not add a separate
-`Planner` layer for this work.
+Use `VariantKey` only when the key has a real consumer. Valid consumers include replay identity, logging, cache lookup,
+and deterministic test assertions.
 
-Use a small selection value when the result is small. A simple selector can return `(VariantKey, &ExecutionVariant)`.
-The key must have a real use, such as replay identity, logging, or cache lookup. A complex component can return a
-component-local `Selection` struct when metadata upload, replay, and recording must consume multiple coupled values.
-Do not add a generic `Plan` type.
+## Registry and selector ownership
 
-A component with one fixed implementation can omit `Registry`, `Selector`, and `Selection`. It must still use clear
-`KernelConstants`, task, argument, and execution-configuration names. Add the selection structure when a second real
-variant appears. Do not add an empty framework only for visual symmetry.
+Use this component-local owner structure when the component has runtime-selectable variants:
 
-## Current component mappings
+```text
+Compute
+└── Selector
+    └── Registry
+        └── Vec<(VariantKey, Variant)>
+```
 
-GQA SDPA has multiple legal Map/Reduce execution variants and a workload-dependent crossover. It uses a component-local
-`Registry`, `Selector`, and `Selection`. See [GQA SDPA selection](gqa_sdpa_selection.md).
+`Compute` represents the component execution owner in this diagram. Keep a more precise existing owner name such as
+`Matmul` or `GatedMoE` when that name describes the operation better.
 
-GDN currently registers one recurrent algorithm. Its final-state and candidate-state kernels implement different state
-materialization contracts. They are phases of one current execution variant, not independent candidates. Its private
-selector returns `(VariantKey, &Variant)`. A future chunkwise algorithm must be a separate complete variant. See
-[GDN Executor](executor_gdn.md).
+This structure is the target convention for new and refactored source. The current component table records selection
+semantics. It does not claim that each current owner already has this exact field structure.
 
-The following table defines the cross-component execution model. It also records intentional differences. A component
-must not add a selector only to match another component.
+The module path supplies the component scope. Use the short private names `Registry`, `Selector`, `VariantKey`,
+`Variant`, `Workload`, and `Selection`. Do not repeat the component name in each private item. A public cross-module API
+can use a longer name such as `ExecutionVariant` when `Variant` is not clear at the caller.
 
-| Component | Semantic execution | Non-persistent thread-block task | Dynamic selection owner |
-| --- | --- | --- | --- |
-| Quantized embedding | Dequantize selected vocabulary rows into hidden rows. | A bounded flat range of `(token, hidden)` output values. | One current fixed variant. No registry or selector. |
-| Unembedding | Apply one affine quantized projection from hidden rows to vocabulary logits. | The selected affine QMV or QMM kernel defines the task. | The private `affine_quantized::Matmul` registry and selector own the row-dependent QMV/QMM choice. `Unembed` does not select it again. |
-| Row gather | Copy indexed input rows to a dense output. | A bounded flat range of `(output row, column)` values. | Dtype fixes one variant during initialization. No dynamic selector. |
-| RMSNorm | Normalize one hidden row and apply its weight row. | One token row. | Dtype fixes one variant during initialization. No dynamic selector. |
-| Residual add | Add two flat tensors or two row-major active prefixes. | A bounded flat range of output values. | Dtypes fix one variant during initialization. No dynamic selector. |
-| Residual-add RMSNorm | Add two hidden rows, preserve the residual row, and normalize it. | One token row. | The backend selects the scalar or BF16-vectorized kernel at initialization. The runtime shape does not change this choice. |
-| RMSNorm/RoPE | Normalize and rotate one attention-head row. | One `(flat Q token, Q head)` row. | Model geometry and RoPE constants fix one variant. No dynamic selector. |
-| Dense MLP | Record `gate_up affine -> SwiGLU -> down affine`. | Each leaf kernel defines its own task. SwiGLU uses a bounded flat range of `(token, intermediate)` output values. | Each affine owner selects QMV or QMM independently. Dense MLP does not select the same decision again. |
-| Sparse expert MLP | Apply expert-indexed MLP weights to routed rows. | The selected expert kernel defines its task over routed rows and expert weights. | The MoE owner selects the complete token-major or expert-major command graph. The sparse leaf does not select the outer graph again. |
-| MoE | Record routing and either token-major or expert-major expert execution. | Each routing, layout, pack, expert, combine, or scatter phase defines its own task. | A component-local `Registry` and `Selector` select the complete command-graph variant. The deterministic selector can be called again when the same identity is needed. |
-| Top-K sampling | Map vocabulary partitions to partial candidates, then reduce the partial candidates for each sampling row. | Map: one `(sampling row, vocabulary partition)`. Reduce: one sampling row. | A component-local registry and selector choose the Map variant from the output contract and Top-K width. Replay capacity remains a separate owner concern. |
-| Sparse rejection sampling | Walk one request's ordered draft sequence and sample its fallback or continuation token. | One request. | One current fixed variant. Replay bucket policies select capacities, not kernels. |
-| DSpark Markov sampling | Produce partial Top-K candidates with a Markov correction, then use the common Top-K reduce phase. | Map: one `(sampling row, vocabulary partition)`. Reduce: one sampling row. | The Markov Map kernel has one current variant. Its partial-candidate layout is an explicit producer/consumer contract. |
+`Registry` owns the legal variants for one static component configuration. `Selector` owns the `Registry` and any
+static limits or tuning data that selection needs. The component execution owner owns the `Selector`.
 
-### Registry and selector audit
+Use a `Vec<(VariantKey, Variant)>` by default. Current registries are small, selectors scan candidates, and deterministic
+order is useful. Use another data structure only when measured scale or lookup behavior requires it.
 
-GQA SDPA is the current component in this table with a rich materialized `Selection`. Each legal Map/Reduce variant
-produces different Q-token ranges, KV ranges, partial-state offsets, replay extents, and candidate metrics. The
-component-local `Selection` keeps these coupled results with the selected execution variant.
-`GQAMetadataBuffers::update(...)` consumes this result as one unit. It does not rebuild work partitioning or select a
-second variant.
+## Registry lifecycle
 
-The other current components do not need a rich selection value:
+Use this local API vocabulary:
 
-- GDN uses a small `(VariantKey, &Variant)` selection. The current registry contains only `Recurrent`.
-- Embedding, row gather, RMSNorm, residual operations, rejection sampling, and DSpark Markov Map currently derive one
-  fixed variant.
-- Dense MLP and unembedding delegate row-dependent QMV/QMM selection to `affine_quantized::Matmul`.
-- MoE can repeat its pure selector where it needs the command-graph identity.
-- Top-K sampling uses a small selection value for its Map kernel family.
-- Sparse MLP implements expert inner compute. MoE owns the outer command-graph choice.
+```rust
+struct Registry {
+    variants: Vec<(VariantKey, Variant)>,
+}
 
-`ExecutorHibernationPlan` and `StateSnapshotPlan` describe requested model-state persistence. They are not GPU kernel or
-execution selections, and this execution rule does not apply to them.
+impl Registry {
+    fn new(/* static inputs */) -> Self;
+    fn get(&self, key: VariantKey) -> &Variant;
 
-### Selection and replay identity
+    // Optional private construction helper.
+    fn insert(&mut self, key: VariantKey, variant: Variant);
+}
+```
 
-Kernel-variant selection and replay capacity selection are different operations:
+The snippet defines names and ownership. It is not a generic Rust interface.
+
+`Registry::new(...)` must construct the complete legal variant set. Static capability checks determine which variants
+are legal. These checks can use dtype, model geometry, storage geometry, GPU capability, and required feature support.
+They must not use dynamic workload performance thresholds.
+
+A private `Registry::insert(...)` can build the Registry incrementally. It must reject a duplicate `VariantKey` at
+initialization. The Registry must be immutable when `Registry::new(...)` returns.
+
+Do not add `Registry::set(...)`. A `set` operation would imply that invocation or recording code can replace a
+registered variant. Runtime mutation would invalidate selection, replay identity, and compiled-kernel ownership.
+
+Do not expose `insert(...)` to invocation or recording code.
+
+## Selection lifecycle
+
+Use this local API vocabulary:
+
+```rust
+struct Selector {
+    registry: Registry,
+    // Optional static limits or tuning data.
+}
+
+impl Selector {
+    fn new(registry: Registry /* optional selector inputs */) -> Self;
+    fn select(&self, workload: Workload<'_>) -> Selection;
+}
+
+impl Compute {
+    fn invoke(&self, /* dynamic inputs */) -> Invocation<'_>;
+}
+
+impl Invocation<'_> {
+    fn record(&self, /* recorder inputs */);
+}
+```
+
+Use the same method names where these contracts match:
+
+- `Registry::new(...)`
+- `Registry::get(...)`
+- `Registry::insert(...)` for optional private construction
+- `Selector::new(...)`
+- `Selector::select(...)`
+- `Compute::invoke(...)`
+- `Invocation::record(...)`
+
+`Selector::select(...)` is the component's dynamic selection operation. It must evaluate only legal variants. It must
+use the dynamic workload, candidate costs, and selector-owned tuning data.
+
+The selector must compare the complete candidate cost. If a candidate needs task partitioning, scratch extents, replay
+extents, or metadata extents, the selector must derive these coupled values before it compares candidates. Do not add a
+separate generic Planner layer.
+
+`Compute::invoke(...)` must select before it creates an Invocation. The Invocation must retain the selected Variant or
+all identity and derived values that recording needs. `Invocation::record(...)` must use this frozen result. It must
+not make a different choice.
+
+A component can call the same pure selector again at a separate topology boundary when it cannot carry the original
+selection across that boundary. Both calls must use equivalent inputs. Do not copy the decision logic into another
+helper.
+
+## Selection results
+
+Use the smallest result that preserves one decision:
+
+```text
+Simple result
+    (VariantKey, &Variant)
+
+Coupled result
+    component-local Selection
+    ├── VariantKey or Variant
+    ├── derived task partitioning
+    ├── scratch and metadata extents
+    └── replay-topology identity
+```
+
+The key is optional when no consumer needs it.
+
+Use a component-local `Selection` when metadata, replay, and recording must consume multiple coupled values. GQA uses
+this form because the chosen SDPA variant changes Q ranges, KV ranges, partial-state groups, and replay extents.
+
+Do not add a generic `Plan` type. `ExecutorHibernationPlan` and `StateSnapshotPlan` describe state-persistence requests.
+They are not GPU execution selections.
+
+Do not add a cross-component `Registry`, `Selector`, `Variant`, or `Selection` trait. The repository has no generic
+caller that can use such a trait. A trait would enforce method spelling, but it would not enforce component capability,
+cost, metadata, replay, or recording invariants. Use the same local structure and audit each component at its owner.
+
+## Active work and recorded capacity
+
+Kernel-variant selection and replay-capacity selection are different concepts:
 
 ```text
 dynamic semantic shape
-    -> kernel or execution-variant selection, when required
+    -> Variant selection
     -> recorded command topology
 
-active item count
+active work count
     -> replay bucket policy
-    -> recorded capacity that must preserve the selected topology
+    -> recorded capacity
 ```
 
-A replay key must identify every dynamic choice that changes the recorded command graph or compiled kernel. An active
-count must not enter the key when a replay parameter can supply that count without changing topology.
+A replay key must identify each choice that changes a compiled kernel or recorded command graph. Do not add an active
+count to the key when a replay parameter can provide that count without changing topology.
 
-Dense MLP and unembedding use the topology boundaries from their adaptive affine owners. MoE adds the boundary where
-its complete execution variant changes. Top-K sampling keeps the active Top-K width in its replay shape because that width
-changes candidate geometry and can change the Map kernel family. Rejection sampling keeps request and distribution
-capacities separate because they have different semantic domains.
+A component must use one operation name for both cases. The API must carry `num_active_*` and `num_total_*` values when
+the distinction is relevant. A caller without capacity padding sets `num_active_* == num_total_*`. Do not encode the
+capacity policy in names such as `select_exact(...)`, `select_bucketed(...)`, or `*_with_token_capacity(...)`.
 
-### Intentional asymmetries
+## Fixed components and delegated selection
 
-Embedding and unembedding are not symmetric GPU algorithms. Embedding is a quantized row lookup. Unembedding is an
-adaptive quantized matrix multiplication. They can share weight-lifecycle and replay-capacity conventions, but they
-must not share a kernel selector.
+A component with one fixed implementation can omit `Registry`, `Selector`, and `Selection`. It must still use clear
+`KernelConstants`, task, argument, and execution-configuration names. Add selection objects when a second real runtime
+variant appears. Do not add an empty framework only for visual symmetry.
 
-Dense MLP and sparse expert MLP are not two layouts of one kernel. Dense MLP applies the same weights to every token.
-Sparse expert MLP applies expert-indexed weights to routed rows. The MoE owner selects token-major or expert-major
-execution before it invokes the sparse expert leaf.
+A compound component can delegate a leaf decision to the leaf owner. It must not select the same leaf variant again.
+For example, dense MLP and unembedding delegate the row-dependent QMV/QMM choice to `affine_quantized::Matmul`.
 
-Top-K sampling and rejection sampling share runtime-parameter and replay-preparation rules. They do not share one
-thread-block task. Top-K sampling partitions a vocabulary row. Rejection sampling processes one ordered request.
+## Current component mapping
+
+This table identifies the current selection owner. Component documents contain the detailed source and task contracts.
+
+| Component | Selectable unit | Selection owner and result |
+| --- | --- | --- |
+| GQA SDPA | Complete SplitKV Map/Reduce execution variant. | `gqa::sdpa::Selector` returns a rich component-local `Selection`. |
+| GDN | Complete recurrent execution variant. A future chunkwise algorithm must be another complete Variant. | `gdn::compute::Selector` returns `(VariantKey, &Variant)`. |
+| Quantized affine | QMV or QMM kernel for the runtime row count. | `affine_quantized::Selector` returns the selected kernel entry. |
+| Dense MLP | No independent outer variant. | Each affine owner selects QMV or QMM. |
+| Unembedding | No independent outer variant. | Its affine owner selects QMV or QMM. |
+| MoE | Complete token-major or expert-major command graph. | The MoE `Selector` returns `(VariantKey, &Variant)`. |
+| Sparse expert MLP | No independent outer command-graph variant. | MoE selects the outer graph. The sparse leaf records expert compute. |
+| Top-K sampling | Map implementation for dtype, output contract, and Top-K width. | The Top-K `Selector` returns the selected Map Variant. |
+| Embedding, row gather, normalization, and residual operations | One current fixed implementation per initialized configuration. | No runtime Registry or Selector. |
+| Sparse rejection sampling | One current fixed request kernel. | Replay buckets select capacities, not kernels. |
+| DSpark Markov sampling Map | One current fixed Map implementation. | No runtime Registry or Selector. |
+
+Keep these intentional differences:
+
+- Embedding is a quantized row lookup. Unembedding is an adaptive quantized matrix multiplication. They do not share a
+  selector.
+- Dense MLP applies shared weights to all rows. Sparse expert MLP applies expert-indexed weights to routed rows. MoE
+  owns the outer routing and command-graph choice.
+- Top-K sampling partitions a vocabulary row. Rejection sampling processes one ordered request. They do not share a
+  ThreadBlockTask.
+- GQA selection materializes coupled SplitKV work. GDN currently needs only a small Variant selection. Do not add GQA
+  partial-state or SplitKV concepts to GDN.
+
+See these component documents:
+
+- [GQA Executor](executor_gqa.md)
+- [GQA SDPA selection](gqa_sdpa_selection.md)
+- [GDN Executor](executor_gdn.md)
+- [Dense MLP Executor](executor_dense_mlp.md)
+- [MoE Executor](executor_moe.md)
+- [Sampling Executor](executor_sampling.md)
+- [Model primitives](executor_model_primitives.md)
+
+## Review checklist
+
+For each new runtime-selectable component, document and review these items:
+
+1. Name the static configuration and legal capability checks.
+2. Name the complete Variant that the selector chooses.
+3. Name the dynamic Workload fields and their coordinate domains.
+4. Put all dynamic choice logic in `Selector::select(...)`.
+5. State whether the result is a tuple or a component-local `Selection`.
+6. Freeze the choice before recording, or repeat the same pure selector with equivalent inputs.
+7. Include each topology-changing choice in the replay identity.
+8. State the ThreadBlock-to-ThreadBlockTask relation for each kernel that has semantic tasks.
+9. Keep the Registry immutable after initialization.
+10. Update the matching component document with the source change.
