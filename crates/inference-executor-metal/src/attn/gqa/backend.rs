@@ -321,10 +321,10 @@ impl ReplayLayer for GQA {
             ReplayU32::Fixed(_) => None,
         };
         let bucketed = active_tokens_key.is_some();
-        let qgkv = if bucketed {
+        let qgkv = if let Some(active_tokens_key) = active_tokens_key {
             self.qgkv.invoke_bucketed(
                 shape.num_total_tokens,
-                active_tokens_key.unwrap(),
+                active_tokens_key,
                 scratch.qgkv,
                 0,
                 hidden_state,
@@ -430,10 +430,10 @@ impl ReplayLayer for GQA {
             self.gate.invoke(gate_shape, gate_buffers)
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(gate));
-        let output = if active_tokens_key.is_some() {
+        let output = if let Some(active_tokens_key) = active_tokens_key {
             self.output.invoke_bucketed(
                 shape.num_total_tokens,
-                active_tokens_key.unwrap(),
+                active_tokens_key,
                 next_hidden_state,
                 0,
                 scratch.gated_attention_output,
