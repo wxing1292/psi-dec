@@ -1,27 +1,9 @@
-use inference_backend_metal::components::GQAActivationGateBuffers;
-use inference_backend_metal::components::GQAActivationGateConfig;
-use inference_backend_metal::components::GQAActivationGateKernel;
-use inference_backend_metal::components::GQAActivationGateShape;
-use inference_backend_metal::components::GQAKVPageWrite;
-use inference_backend_metal::components::GQAKVPageWriteBuffers;
-use inference_backend_metal::components::GQAKVPageWriteConfig;
-use inference_backend_metal::components::GQAKVPageWriteShape;
-use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
-use inference_backend_metal::components::GQAQGKVSplitBuffers;
-use inference_backend_metal::components::GQAQGKVSplitConfig;
-use inference_backend_metal::components::GQAQGKVSplitKernel;
-use inference_backend_metal::components::GQAQGKVSplitShape;
-use inference_backend_metal::components::GQASplitKVSingleQConfig;
-use inference_backend_metal::components::GQASplitKVSingleQKernels;
-use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
-use inference_backend_metal::components::GQASplitKVSingleQReduceBuffers;
-use inference_backend_metal::components::GQASplitKVSingleQShape;
-use inference_backend_metal::components::GQASplitKVTiledQConfig;
-use inference_backend_metal::components::GQASplitKVTiledQKernels;
-use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
-use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
-use inference_backend_metal::components::GQASplitKVTiledQShape;
+use inference_backend_metal::components::gqa::activation_gate as backend_activation_gate;
+use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
+use inference_backend_metal::components::gqa::qgkv_split as backend_qgkv_split;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
+use inference_backend_metal::components::gqa::split_kv::tiled_q as backend_tiled_q;
 use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
@@ -198,7 +180,7 @@ pub type GQAOutput<'a> = &'a Buffer;
 ///                                                           +--------+
 ///                                                                    |
 ///                                                                    v
-///                              GQASplitKVSingleQKernels or GQASplitKVTiledQKernels
+///                              backend_single_q::Compute or backend_tiled_q::Compute
 ///                                -> scratch.sdpa_partial_exp_sums
 ///                                -> scratch.sdpa_partial_max_logits
 ///                                -> scratch.sdpa_partial_output
@@ -214,11 +196,11 @@ pub struct GQA {
     config: GQAMetalConfig,
     sdpa_selector: Selector,
     qgkv: AffineQuantizedMatmul,
-    qgkv_to_q_g_k_v: GQAQGKVSplitKernel,
+    qgkv_to_q_g_k_v: backend_qgkv_split::Compute,
     q_norm_rope: rms_norm_rope::Compute,
     k_norm_rope: rms_norm_rope::Compute,
-    kv_page_write: GQAKVPageWrite,
-    gate: GQAActivationGateKernel,
+    kv_page_write: backend_kv_page_write::Compute,
+    gate: backend_activation_gate::Compute,
     output: AffineQuantizedMatmul,
 }
 
@@ -257,11 +239,11 @@ impl GQA {
             config,
             sdpa_selector: Selector::new(backend_sdpa::Registry::new(sdpa_config), max_tokens),
             qgkv: AffineQuantizedMatmul::new(device, affine_config(qgkv.out_dim, qgkv.in_dim, config)),
-            qgkv_to_q_g_k_v: GQAQGKVSplitKernel::new(device, qgkv_to_q_g_k_v_config(&core, config)),
+            qgkv_to_q_g_k_v: backend_qgkv_split::Compute::new(device, qgkv_to_q_g_k_v_config(&core, config)),
             q_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_q_heads)),
             k_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
-            kv_page_write: GQAKVPageWrite::new(device, kv_page_write_config(&core, config)),
-            gate: GQAActivationGateKernel::new(device, gate_config(&core, config)),
+            kv_page_write: backend_kv_page_write::Compute::new(device, kv_page_write_config(&core, config)),
+            gate: backend_activation_gate::Compute::new(device, gate_config(&core, config)),
             output: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
         }
     }
@@ -428,7 +410,7 @@ impl ReplayLayer for GQA {
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(qgkv));
         let qgkv_to_q_g_k_v_shape = self.qgkv_to_q_g_k_v_shape(shape);
-        let qgkv_to_q_g_k_v_buffers = GQAQGKVSplitBuffers {
+        let qgkv_to_q_g_k_v_buffers = backend_qgkv_split::Buffers {
             qgkv: scratch.qgkv,
             q: scratch.q,
             g: scratch.g,
@@ -472,7 +454,7 @@ impl ReplayLayer for GQA {
         };
         recorder.record(ReplayOp::opaque(k_norm_rope));
         let kv_page_write_shape = self.kv_page_write_shape(shape, page_table_layout);
-        let kv_page_write_buffers = GQAKVPageWriteBuffers {
+        let kv_page_write_buffers = backend_kv_page_write::Buffers {
             pages: kv_cache.kv_pages,
             flat_k: scratch.k_norm_rope,
             flat_v: scratch.v,
@@ -494,7 +476,7 @@ impl ReplayLayer for GQA {
         recorder.record_with_barrier_before(ReplayOp::opaque(kv_page_write));
         let attention_output = self.record_sdpa(recorder, input);
         let gate_shape = self.gate_shape(shape);
-        let gate_buffers = GQAActivationGateBuffers {
+        let gate_buffers = backend_activation_gate::Buffers {
             attention_output,
             g: scratch.g,
             output: scratch.gated_attention_output,
@@ -564,8 +546,8 @@ impl GQA {
                 map_constants.required_threads,
                 map_constants.max_q_heads,
             );
-            let sdpa = GQASplitKVSingleQKernels::new(&self.device, sdpa_config, self.split_kv_single_q_shape(shape));
-            let map_buffers = GQASplitKVSingleQMapBuffers {
+            let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, self.split_kv_single_q_shape(shape));
+            let map_buffers = backend_single_q::MapBuffers {
                 q: scratch.q_norm_rope,
                 kv_pages: kv_cache.kv_pages,
                 req_slots: batch_metadata.req_slots(),
@@ -581,7 +563,7 @@ impl GQA {
                 sdpa.invoke_map(map_buffers, page_table_index)
             };
             recorder.record_with_barrier_before(ReplayOp::opaque(map));
-            let reduce_buffers = GQASplitKVSingleQReduceBuffers {
+            let reduce_buffers = backend_single_q::ReduceBuffers {
                 partial_exp_sums: scratch.sdpa_partial_exp_sums,
                 partial_max_logits: scratch.sdpa_partial_max_logits,
                 partial_output: scratch.sdpa_partial_output,
@@ -601,8 +583,8 @@ impl GQA {
                 map_constants.kv_tokens_per_iteration,
                 map_constants.max_q_heads,
             );
-            let sdpa = GQASplitKVTiledQKernels::new(&self.device, sdpa_config, self.split_kv_tiled_q_shape(shape));
-            let map_buffers = GQASplitKVTiledQMapBuffers {
+            let sdpa = backend_tiled_q::Compute::new(&self.device, sdpa_config, self.split_kv_tiled_q_shape(shape));
+            let map_buffers = backend_tiled_q::MapBuffers {
                 q: scratch.q_norm_rope,
                 kv_pages: kv_cache.kv_pages,
                 req_slots: batch_metadata.req_slots(),
@@ -626,7 +608,7 @@ impl GQA {
                 sdpa.invoke_map(map_buffers, page_table_index)
             };
             recorder.record_with_barrier_before(ReplayOp::opaque(map));
-            let reduce_buffers = GQASplitKVTiledQReduceBuffers {
+            let reduce_buffers = backend_tiled_q::ReduceBuffers {
                 partial_output: scratch.sdpa_partial_output,
                 partial_exp_sums: scratch.sdpa_partial_exp_sums,
                 partial_max_logits: scratch.sdpa_partial_max_logits,
@@ -644,8 +626,8 @@ impl GQA {
         scratch.attention_output
     }
 
-    fn qgkv_to_q_g_k_v_shape(&self, shape: GQAReplayShape) -> GQAQGKVSplitShape {
-        GQAQGKVSplitShape {
+    fn qgkv_to_q_g_k_v_shape(&self, shape: GQAReplayShape) -> backend_qgkv_split::Shape {
+        backend_qgkv_split::Shape {
             num_total_tokens: shape.num_total_tokens,
         }
     }
@@ -656,8 +638,12 @@ impl GQA {
         }
     }
 
-    fn kv_page_write_shape(&self, shape: GQAReplayShape, page_table_layout: GQAPageTableLayout) -> GQAKVPageWriteShape {
-        GQAKVPageWriteShape {
+    fn kv_page_write_shape(
+        &self,
+        shape: GQAReplayShape,
+        page_table_layout: GQAPageTableLayout,
+    ) -> backend_kv_page_write::Shape {
+        backend_kv_page_write::Shape {
             num_total_token_writes: shape.num_total_tokens,
             page_table_layout: backend_page_table_layout(page_table_layout),
         }
@@ -669,11 +655,11 @@ impl GQA {
         kv_tokens_per_iteration: u32,
         required_threads: u32,
         max_q_heads: u32,
-    ) -> GQASplitKVSingleQConfig {
+    ) -> backend_single_q::Config {
         debug_assert!(u32::try_from(self.core.num_q_heads).is_ok());
         debug_assert!(u32::try_from(self.core.num_kv_heads).is_ok());
         debug_assert!(u32::try_from(self.core.head_dim).is_ok());
-        GQASplitKVSingleQConfig {
+        backend_single_q::Config {
             num_q_heads: self.core.num_q_heads as u32,
             num_kv_heads: self.core.num_kv_heads as u32,
             head_dim: self.core.head_dim as u32,
@@ -687,8 +673,8 @@ impl GQA {
         }
     }
 
-    fn split_kv_single_q_shape(&self, shape: GQAReplayShape) -> GQASplitKVSingleQShape {
-        GQASplitKVSingleQShape {
+    fn split_kv_single_q_shape(&self, shape: GQAReplayShape) -> backend_single_q::Shape {
+        backend_single_q::Shape {
             num_total_tokens: shape.num_total_tokens,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
@@ -700,11 +686,11 @@ impl GQA {
         max_q_tokens: u32,
         kv_tokens_per_iteration: u32,
         max_q_heads: u32,
-    ) -> GQASplitKVTiledQConfig {
+    ) -> backend_tiled_q::Config {
         debug_assert!(u32::try_from(self.core.num_q_heads).is_ok());
         debug_assert!(u32::try_from(self.core.num_kv_heads).is_ok());
         debug_assert!(u32::try_from(self.core.head_dim).is_ok());
-        GQASplitKVTiledQConfig {
+        backend_tiled_q::Config {
             num_q_heads: self.core.num_q_heads as u32,
             num_kv_heads: self.core.num_kv_heads as u32,
             head_dim: self.core.head_dim as u32,
@@ -718,23 +704,23 @@ impl GQA {
         }
     }
 
-    fn split_kv_tiled_q_shape(&self, shape: GQAReplayShape) -> GQASplitKVTiledQShape {
-        GQASplitKVTiledQShape {
+    fn split_kv_tiled_q_shape(&self, shape: GQAReplayShape) -> backend_tiled_q::Shape {
+        backend_tiled_q::Shape {
             num_total_tokens: shape.num_total_tokens,
             num_total_q_token_tiles: shape.num_total_q_token_tiles,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }
 
-    fn gate_shape(&self, shape: GQAReplayShape) -> GQAActivationGateShape {
-        GQAActivationGateShape {
+    fn gate_shape(&self, shape: GQAReplayShape) -> backend_activation_gate::Shape {
+        backend_activation_gate::Shape {
             num_total_tokens: shape.num_total_tokens,
         }
     }
 }
 
-fn backend_page_table_layout(shape: GQAPageTableLayout) -> MetalGQAPageTableLayout {
-    MetalGQAPageTableLayout {
+fn backend_page_table_layout(shape: GQAPageTableLayout) -> backend_kv_page_write::PageTableLayout {
+    backend_kv_page_write::PageTableLayout {
         num_req_slots: shape.num_req_slots,
         num_blocks: shape.num_blocks,
         num_gqa_layers: shape.num_gqa_layers,
@@ -742,13 +728,13 @@ fn backend_page_table_layout(shape: GQAPageTableLayout) -> MetalGQAPageTableLayo
     }
 }
 
-fn qgkv_to_q_g_k_v_config(core: &GQACore, config: GQAMetalConfig) -> GQAQGKVSplitConfig {
+fn qgkv_to_q_g_k_v_config(core: &GQACore, config: GQAMetalConfig) -> backend_qgkv_split::Config {
     let num_q_heads = core.num_q_heads.try_into().expect("GQA q heads must fit u32");
     let num_kv_heads = core.num_kv_heads.try_into().expect("GQA KV heads must fit u32");
     let head_dim = core.head_dim.try_into().expect("GQA head_dim must fit u32");
     match config.io_dtype {
-        Dtype::Float32 => GQAQGKVSplitConfig::f32(num_q_heads, num_kv_heads, head_dim),
-        Dtype::Bfloat16 => GQAQGKVSplitConfig::bf16(num_q_heads, num_kv_heads, head_dim),
+        Dtype::Float32 => backend_qgkv_split::Config::f32(num_q_heads, num_kv_heads, head_dim),
+        Dtype::Bfloat16 => backend_qgkv_split::Config::bf16(num_q_heads, num_kv_heads, head_dim),
         dtype => panic!("unsupported GQA dtype {dtype:?}"),
     }
 }
@@ -780,8 +766,8 @@ fn norm_rope_config(core: &GQACore, config: GQAMetalConfig, num_heads: usize) ->
     norm_rope.with_rope_scaling(config.rope_scaling)
 }
 
-fn kv_page_write_config(core: &GQACore, config: GQAMetalConfig) -> GQAKVPageWriteConfig {
-    GQAKVPageWriteConfig {
+fn kv_page_write_config(core: &GQACore, config: GQAMetalConfig) -> backend_kv_page_write::Config {
+    backend_kv_page_write::Config {
         num_kv_heads: core.num_kv_heads.try_into().expect("GQA KV heads must fit u32"),
         head_dim: core.head_dim.try_into().expect("GQA head_dim must fit u32"),
         page_bytes: config.page_bytes,
@@ -789,12 +775,12 @@ fn kv_page_write_config(core: &GQACore, config: GQAMetalConfig) -> GQAKVPageWrit
     }
 }
 
-fn gate_config(core: &GQACore, config: GQAMetalConfig) -> GQAActivationGateConfig {
+fn gate_config(core: &GQACore, config: GQAMetalConfig) -> backend_activation_gate::Config {
     let num_q_heads = core.num_q_heads.try_into().expect("GQA q heads must fit u32");
     let head_dim = core.head_dim.try_into().expect("GQA head_dim must fit u32");
     match config.io_dtype {
-        Dtype::Float32 => GQAActivationGateConfig::f32(num_q_heads, head_dim),
-        Dtype::Bfloat16 => GQAActivationGateConfig::bf16(num_q_heads, head_dim),
+        Dtype::Float32 => backend_activation_gate::Config::f32(num_q_heads, head_dim),
+        Dtype::Bfloat16 => backend_activation_gate::Config::bf16(num_q_heads, head_dim),
         dtype => panic!("unsupported GQA dtype {dtype:?}"),
     }
 }
@@ -829,15 +815,9 @@ mod tests {
     use inference_executor_core::attn::GQACore;
 
     use super::GQA_NUM_ACTIVE_TOKENS;
-    use super::GQAActivationGateBuffers;
-    use super::GQAActivationGateConfig;
-    use super::GQAActivationGateKernel;
-    use super::GQAActivationGateShape;
     use super::GQAMetalConfig;
-    use super::GQAQGKVSplitBuffers;
-    use super::GQAQGKVSplitConfig;
-    use super::GQAQGKVSplitKernel;
-    use super::GQAQGKVSplitShape;
+    use super::backend_activation_gate;
+    use super::backend_qgkv_split;
     use super::rms_norm_rope;
 
     #[test]
@@ -862,16 +842,16 @@ mod tests {
     fn test_bucketed_scratch_leaves_shrink_expand_and_guard_poisoned_tail() {
         let device = inference_backend_metal::metal::Device::system_default();
         let stream = Stream::new(&device);
-        let split_config = GQAQGKVSplitConfig::f32(1, 1, 2);
-        let split_shape = GQAQGKVSplitShape { num_total_tokens: 2 };
+        let split_config = backend_qgkv_split::Config::f32(1, 1, 2);
+        let split_shape = backend_qgkv_split::Shape { num_total_tokens: 2 };
         let norm_config = rms_norm_rope::Config::f32(1, 2, 2, 1.0e-6, 1_000_000.0);
         let norm_shape = rms_norm_rope::Shape { num_total_tokens: 2 };
-        let gate_config = GQAActivationGateConfig::f32(1, 2);
-        let gate_shape = GQAActivationGateShape { num_total_tokens: 2 };
-        let split = GQAQGKVSplitKernel::new(&device, split_config);
+        let gate_config = backend_activation_gate::Config::f32(1, 2);
+        let gate_shape = backend_activation_gate::Shape { num_total_tokens: 2 };
+        let split = backend_qgkv_split::Compute::new(&device, split_config);
         let q_norm = rms_norm_rope::Compute::new(&device, norm_config);
         let k_norm = rms_norm_rope::Compute::new(&device, norm_config);
-        let gate = GQAActivationGateKernel::new(&device, gate_config);
+        let gate = backend_activation_gate::Compute::new(&device, gate_config);
         let input = Buffer::new_zeroed_elements(&device, split_config.num_qgkv_slots(split_shape), Dtype::Float32);
         let q = Buffer::new_zeroed_elements(&device, split_config.num_q_slots(split_shape), Dtype::Float32);
         let g = Buffer::new_zeroed_elements(&device, split_config.num_q_slots(split_shape), Dtype::Float32);
@@ -885,7 +865,7 @@ mod tests {
         let mut builder = stream.create_replay_program();
         builder.record(split.invoke_bucketed(
             split_shape,
-            GQAQGKVSplitBuffers {
+            backend_qgkv_split::Buffers {
                 qgkv: &input,
                 q: &q,
                 g: &g,
@@ -916,7 +896,7 @@ mod tests {
         ));
         builder.record_with_barrier_before(gate.invoke_bucketed(
             gate_shape,
-            GQAActivationGateBuffers {
+            backend_activation_gate::Buffers {
                 attention_output: &q_norm_output,
                 g: &g,
                 output: &gated,

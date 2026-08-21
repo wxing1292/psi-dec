@@ -1,18 +1,8 @@
-use inference_backend_metal::components::GQABlockSDPABuffers;
-use inference_backend_metal::components::GQABlockSDPAConfig;
-use inference_backend_metal::components::GQABlockSDPAKernel;
-use inference_backend_metal::components::GQABlockSDPAShape;
-use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
-use inference_backend_metal::components::GQAQKVSplitBuffers;
-use inference_backend_metal::components::GQAQKVSplitConfig;
-use inference_backend_metal::components::GQAQKVSplitKernel;
-use inference_backend_metal::components::GQAQKVSplitShape;
-use inference_backend_metal::components::GQASplitKVSingleQConfig;
-use inference_backend_metal::components::GQASplitKVSingleQKernels;
-use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
-use inference_backend_metal::components::GQASplitKVSingleQReduceBuffers;
-use inference_backend_metal::components::GQASplitKVSingleQShape;
+use inference_backend_metal::components::gqa::block_sdpa as backend_block_sdpa;
+use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
+use inference_backend_metal::components::gqa::qkv_split as backend_qkv_split;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
 use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -50,10 +40,10 @@ pub struct UngatedDSparkGQA {
     core: UngatedDSparkGQACore,
     metal: GQAMetalConfig,
     qkv: AffineQuantizedMatmul,
-    qkv_to_q_k_v: GQAQKVSplitKernel,
+    qkv_to_q_k_v: backend_qkv_split::Compute,
     q_norm_rope: rms_norm_rope::Compute,
     k_norm_rope: rms_norm_rope::Compute,
-    block_sdpa: GQABlockSDPAKernel,
+    block_sdpa: backend_block_sdpa::Compute,
     output: AffineQuantizedMatmul,
 }
 
@@ -69,15 +59,15 @@ impl UngatedDSparkGQA {
         Self {
             device: device.clone(),
             qkv: AffineQuantizedMatmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, metal)),
-            qkv_to_q_k_v: GQAQKVSplitKernel::new(device, qkv_to_q_k_v_config(attention, metal)),
+            qkv_to_q_k_v: backend_qkv_split::Compute::new(device, qkv_to_q_k_v_config(attention, metal)),
             q_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(attention, metal, attention.num_q_heads)),
             k_norm_rope: rms_norm_rope::Compute::new(
                 device,
                 norm_rope_config(attention, metal, attention.num_kv_heads),
             ),
-            block_sdpa: GQABlockSDPAKernel::new(
+            block_sdpa: backend_block_sdpa::Compute::new(
                 device,
-                GQABlockSDPAConfig {
+                backend_block_sdpa::Config {
                     block_size: core.block_size.try_into().expect("DSpark GQA block size must fit u32"),
                     num_q_heads: attention
                         .num_q_heads
@@ -135,11 +125,11 @@ impl UngatedDSparkGQA {
         &self,
         sdpa_execution: backend_sdpa::ExecutionVariant,
         page_table_layout: GQAPageTableLayout,
-    ) -> GQASplitKVSingleQConfig {
+    ) -> backend_single_q::Config {
         let attention = &self.core.attention;
         let map = sdpa_execution.map.thread_block;
         assert_eq!(map.max_q_tokens, 1);
-        GQASplitKVSingleQConfig {
+        backend_single_q::Config {
             num_q_heads: attention
                 .num_q_heads
                 .try_into()
@@ -190,10 +180,10 @@ impl ReplayLayer for UngatedDSparkGQA {
             ),
         ));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv_to_q_k_v.invoke(
-            GQAQKVSplitShape {
+            backend_qkv_split::Shape {
                 num_tokens: shape.num_tokens,
             },
-            GQAQKVSplitBuffers {
+            backend_qkv_split::Buffers {
                 qkv: scratch.qkv,
                 q: scratch.q,
                 k: scratch.k,
@@ -224,13 +214,13 @@ impl ReplayLayer for UngatedDSparkGQA {
         )));
 
         let sdpa_config = self.split_kv_single_q_config(sdpa_execution, input.page_table_layout);
-        let sdpa_shape = GQASplitKVSingleQShape {
+        let sdpa_shape = backend_single_q::Shape {
             num_total_tokens: shape.num_tokens,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         };
-        let sdpa = GQASplitKVSingleQKernels::new(&self.device, sdpa_config, sdpa_shape);
+        let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, sdpa_shape);
         recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_map(
-            GQASplitKVSingleQMapBuffers {
+            backend_single_q::MapBuffers {
                 q: scratch.q_norm_rope,
                 kv_pages: input.kv_cache.kv_pages,
                 req_slots: input.metadata.req_slots(),
@@ -243,11 +233,11 @@ impl ReplayLayer for UngatedDSparkGQA {
             ReplayU32::Fixed(input.gqa_layer_index),
         )));
         recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
-            GQABlockSDPAShape {
+            backend_block_sdpa::Shape {
                 num_tokens: shape.num_tokens,
                 num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
             },
-            GQABlockSDPABuffers {
+            backend_block_sdpa::Buffers {
                 q: scratch.q_norm_rope,
                 local_k: scratch.k_norm_rope,
                 local_v: scratch.v,
@@ -257,7 +247,7 @@ impl ReplayLayer for UngatedDSparkGQA {
                 partial_output: scratch.partial_output,
             },
         )));
-        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(GQASplitKVSingleQReduceBuffers {
+        recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(backend_single_q::ReduceBuffers {
             partial_exp_sums: scratch.partial_exp_sums,
             partial_max_logits: scratch.partial_max_logits,
             partial_output: scratch.partial_output,
@@ -286,8 +276,8 @@ impl ReplayLayer for UngatedDSparkGQA {
     }
 }
 
-fn backend_page_table_layout(layout: GQAPageTableLayout) -> MetalGQAPageTableLayout {
-    MetalGQAPageTableLayout {
+fn backend_page_table_layout(layout: GQAPageTableLayout) -> backend_kv_page_write::PageTableLayout {
+    backend_kv_page_write::PageTableLayout {
         num_req_slots: layout.num_req_slots,
         num_blocks: layout.num_blocks,
         num_gqa_layers: layout.num_gqa_layers,
@@ -298,7 +288,7 @@ fn backend_page_table_layout(layout: GQAPageTableLayout) -> MetalGQAPageTableLay
 fn qkv_to_q_k_v_config(
     core: &inference_executor_core::attn::UngatedGQACore,
     metal: GQAMetalConfig,
-) -> GQAQKVSplitConfig {
+) -> backend_qkv_split::Config {
     let num_q_heads = core
         .num_q_heads
         .try_into()
@@ -309,8 +299,8 @@ fn qkv_to_q_k_v_config(
         .expect("DSpark GQA KV-head count must fit u32");
     let head_dim = core.head_dim.try_into().expect("DSpark GQA head_dim must fit u32");
     match metal.io_dtype {
-        Dtype::Float32 => GQAQKVSplitConfig::f32(num_q_heads, num_kv_heads, head_dim),
-        Dtype::Bfloat16 => GQAQKVSplitConfig::bf16(num_q_heads, num_kv_heads, head_dim),
+        Dtype::Float32 => backend_qkv_split::Config::f32(num_q_heads, num_kv_heads, head_dim),
+        Dtype::Bfloat16 => backend_qkv_split::Config::bf16(num_q_heads, num_kv_heads, head_dim),
         dtype => panic!("unsupported DSpark GQA dtype {dtype:?}"),
     }
 }

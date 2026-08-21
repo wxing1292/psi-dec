@@ -8,15 +8,15 @@ use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
 
-const GQA_BLOCK_SDPA_SOURCE: &str = include_str!("metal/gqa_block_sdpa.metal");
+const SOURCE: &str = include_str!("../metal/gqa_block_sdpa.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GQABlockSDPAThreadBlockConstants {
+struct ThreadBlockConstants {
     required_threads: u32,
     simdgroup_width: u32,
 }
 
-impl GQABlockSDPAThreadBlockConstants {
+impl ThreadBlockConstants {
     fn current() -> Self {
         Self {
             required_threads: 32,
@@ -26,16 +26,16 @@ impl GQABlockSDPAThreadBlockConstants {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct GQABlockSDPAKernelConstants {
-    config: GQABlockSDPAConfig,
-    thread_block: GQABlockSDPAThreadBlockConstants,
+struct KernelConstants {
+    config: Config,
+    thread_block: ThreadBlockConstants,
 }
 
-impl GQABlockSDPAKernelConstants {
-    fn current(config: GQABlockSDPAConfig) -> Self {
+impl KernelConstants {
+    fn current(config: Config) -> Self {
         Self {
             config,
-            thread_block: GQABlockSDPAThreadBlockConstants::current(),
+            thread_block: ThreadBlockConstants::current(),
         }
     }
 }
@@ -45,7 +45,7 @@ impl GQABlockSDPAKernelConstants {
 /// one Q-token/Q-head block-SDPA task. The shared paged reducer later combines
 /// the bidirectional block and persistent-history partial outputs.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GQABlockSDPAConfig {
+pub struct Config {
     pub block_size: u32,
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
@@ -54,9 +54,9 @@ pub struct GQABlockSDPAConfig {
     pub dtype: Dtype,
 }
 
-impl GQABlockSDPAConfig {
+impl Config {
     pub fn validate(self) {
-        let thread_block = GQABlockSDPAThreadBlockConstants::current();
+        let thread_block = ThreadBlockConstants::current();
         assert!(self.block_size > 0);
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
@@ -71,7 +71,7 @@ impl GQABlockSDPAConfig {
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
-    fn q_elements(self, shape: GQABlockSDPAShape) -> usize {
+    fn q_elements(self, shape: Shape) -> usize {
         checked_product(
             "GQA block SDPA Q element count",
             &[
@@ -82,7 +82,7 @@ impl GQABlockSDPAConfig {
         )
     }
 
-    fn kv_elements(self, shape: GQABlockSDPAShape) -> usize {
+    fn kv_elements(self, shape: Shape) -> usize {
         checked_product(
             "GQA block SDPA K/V element count",
             &[
@@ -93,7 +93,7 @@ impl GQABlockSDPAConfig {
         )
     }
 
-    fn partial_output_stat_elements(self, shape: GQABlockSDPAShape) -> usize {
+    fn partial_output_stat_elements(self, shape: Shape) -> usize {
         checked_product(
             "GQA block SDPA partial-output statistic element count",
             &[
@@ -103,13 +103,13 @@ impl GQABlockSDPAConfig {
         )
     }
 
-    fn partial_output_values(self, shape: GQABlockSDPAShape) -> usize {
+    fn partial_output_values(self, shape: Shape) -> usize {
         self.partial_output_stat_elements(shape)
             .checked_mul(self.head_dim as usize)
             .expect("GQA block SDPA partial-output element count must fit usize")
     }
 
-    fn dispatch_threads(self, shape: GQABlockSDPAShape, thread_block: GQABlockSDPAThreadBlockConstants) -> usize {
+    fn dispatch_threads(self, shape: Shape, thread_block: ThreadBlockConstants) -> usize {
         checked_product(
             "GQA block SDPA thread count",
             &[
@@ -128,13 +128,13 @@ impl GQABlockSDPAConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQABlockSDPAShape {
+pub struct Shape {
     pub num_tokens: u32,
     pub num_total_sdpa_map_task_templates: u32,
 }
 
-impl GQABlockSDPAShape {
-    pub fn validate(self, config: GQABlockSDPAConfig) {
+impl Shape {
+    pub fn validate(self, config: Config) {
         config.validate();
         assert!(self.num_tokens > 0);
         assert_eq!(
@@ -151,14 +151,14 @@ impl GQABlockSDPAShape {
         );
         assert_u32_index_domain(config.partial_output_values(self), "GQA block SDPA partial output");
         assert_u32_count_domain(
-            config.dispatch_threads(self, GQABlockSDPAThreadBlockConstants::current()),
+            config.dispatch_threads(self, ThreadBlockConstants::current()),
             "GQA block SDPA threads",
         );
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct GQABlockSDPABuffers<'a> {
+pub struct Buffers<'a> {
     pub q: &'a Buffer,
     pub local_k: &'a Buffer,
     pub local_v: &'a Buffer,
@@ -168,15 +168,15 @@ pub struct GQABlockSDPABuffers<'a> {
     pub partial_output: &'a Buffer,
 }
 
-pub struct GQABlockSDPAKernel {
-    constants: GQABlockSDPAKernelConstants,
+pub struct Compute {
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl GQABlockSDPAKernel {
-    pub fn new(device: &Device, config: GQABlockSDPAConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
-        let constants = GQABlockSDPAKernelConstants::current(config);
+        let constants = KernelConstants::current(config);
         let function_name = match config.dtype {
             Dtype::Float32 => "gqa_block_sdpa_f32",
             Dtype::Bfloat16 => "gqa_block_sdpa_bf16",
@@ -210,12 +210,8 @@ impl GQABlockSDPAKernel {
         Self { constants, kernel }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GQABlockSDPAShape,
-        buffers: GQABlockSDPABuffers<'a>,
-    ) -> GQABlockSDPAInvocation<'a> {
-        GQABlockSDPAInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             constants: self.constants,
             kernel: &self.kernel,
             shape,
@@ -224,7 +220,7 @@ impl GQABlockSDPAKernel {
     }
 }
 
-fn block_sdpa_source(kernel_constants: GQABlockSDPAKernelConstants) -> String {
+fn block_sdpa_source(kernel_constants: KernelConstants) -> String {
     let config = kernel_constants.config;
     let source_constants = format!(
         "using namespace metal;\n\nconstant uint block_size = {}u;\nconstant uint num_q_heads = {}u;\nconstant uint \
@@ -237,17 +233,17 @@ fn block_sdpa_source(kernel_constants: GQABlockSDPAKernelConstants) -> String {
         config.scale,
         kernel_constants.thread_block.simdgroup_width,
     );
-    GQA_BLOCK_SDPA_SOURCE.replacen("using namespace metal;", &source_constants, 1)
+    SOURCE.replacen("using namespace metal;", &source_constants, 1)
 }
 
-pub struct GQABlockSDPAInvocation<'a> {
-    constants: GQABlockSDPAKernelConstants,
+pub struct Invocation<'a> {
+    constants: KernelConstants,
     kernel: &'a Kernel,
-    shape: GQABlockSDPAShape,
-    buffers: GQABlockSDPABuffers<'a>,
+    shape: Shape,
+    buffers: Buffers<'a>,
 }
 
-impl Operator for GQABlockSDPAInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let config = self.constants.config;
@@ -267,7 +263,7 @@ impl Operator for GQABlockSDPAInvocation<'_> {
     }
 }
 
-impl GQABlockSDPAInvocation<'_> {
+impl Invocation<'_> {
     fn validate(&self) {
         let config = self.constants.config;
         self.shape.validate(config);
@@ -301,5 +297,5 @@ fn bytes(num_elements: usize, dtype: Dtype) -> usize {
 }
 
 #[cfg(test)]
-#[path = "gqa_block_attention_test.rs"]
+#[path = "block_sdpa_test.rs"]
 mod tests;

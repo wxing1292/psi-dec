@@ -1,8 +1,4 @@
-use inference_backend_metal::components::GQAKVPageWrite;
-use inference_backend_metal::components::GQAKVPageWriteBuffers;
-use inference_backend_metal::components::GQAKVPageWriteConfig;
-use inference_backend_metal::components::GQAKVPageWriteShape;
-use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
+use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -53,7 +49,7 @@ pub struct UngatedDSparkGQAContextAppender {
     k: AffineQuantizedMatmul,
     v: AffineQuantizedMatmul,
     k_norm_rope: rms_norm_rope::Compute,
-    kv_page_write: GQAKVPageWrite,
+    kv_page_write: backend_kv_page_write::Compute,
 }
 
 impl DSparkGQAContextScratch {
@@ -97,9 +93,9 @@ impl UngatedDSparkGQAContextAppender {
             k: AffineQuantizedMatmul::new(device, kv_config),
             v: AffineQuantizedMatmul::new(device, kv_config),
             k_norm_rope: rms_norm_rope::Compute::new(device, k_norm_rope_config(attention, metal)),
-            kv_page_write: GQAKVPageWrite::new(
+            kv_page_write: backend_kv_page_write::Compute::new(
                 device,
-                GQAKVPageWriteConfig {
+                backend_kv_page_write::Config {
                     num_kv_heads: attention
                         .num_kv_heads
                         .try_into()
@@ -175,16 +171,16 @@ impl UngatedDSparkGQAContextAppender {
             },
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
-            GQAKVPageWriteShape {
+            backend_kv_page_write::Shape {
                 num_total_token_writes: input.num_tokens,
-                page_table_layout: MetalGQAPageTableLayout {
+                page_table_layout: backend_kv_page_write::PageTableLayout {
                     num_req_slots: input.page_table_layout.num_req_slots,
                     num_gqa_layers: input.page_table_layout.num_gqa_layers,
                     num_blocks: input.page_table_layout.num_blocks,
                     num_page_ids_per_block: input.page_table_layout.num_page_ids_per_block,
                 },
             },
-            GQAKVPageWriteBuffers {
+            backend_kv_page_write::Buffers {
                 pages: input.kv_cache.kv_pages,
                 flat_k: input.scratch.k_norm_rope,
                 flat_v: input.scratch.v,

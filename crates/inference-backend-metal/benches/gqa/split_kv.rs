@@ -5,11 +5,8 @@ use criterion::Throughput;
 use criterion::criterion_group;
 use criterion::criterion_main;
 use half::bf16;
-use inference_backend_metal::components::GQAPageTableLayout;
-use inference_backend_metal::components::GQASplitKVSingleQConfig;
-use inference_backend_metal::components::GQASplitKVSingleQKernels;
-use inference_backend_metal::components::GQASplitKVSingleQScratch;
-use inference_backend_metal::components::GQASplitKVSingleQShape;
+use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
+use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -72,13 +69,13 @@ impl GQAFixture {
         let num_kv_splits = kv_split_values.len() as u32 / 3;
         let num_total_kv_splits = num_kv_splits.next_power_of_two();
         kv_split_values.resize(num_total_kv_splits as usize * 3, u32::MAX);
-        let page_table_layout = GQAPageTableLayout {
+        let page_table_layout = backend_kv_page_write::PageTableLayout {
             num_req_slots: num_tokens,
             num_blocks,
             num_gqa_layers: 1,
             num_page_ids_per_block: 1,
         };
-        let config = GQASplitKVSingleQConfig {
+        let config = backend_single_q::Config {
             num_q_heads: GQA_NUM_Q_HEADS,
             num_kv_heads: GQA_NUM_KV_HEADS,
             head_dim: GQA_HEAD_DIM,
@@ -90,7 +87,7 @@ impl GQAFixture {
             max_q_heads: (GQA_NUM_Q_HEADS / GQA_NUM_KV_HEADS).min(GQA_Q_HEAD_TILE_SIZE_CAP),
             dtype: Dtype::Bfloat16,
         };
-        let shape = GQASplitKVSingleQShape {
+        let shape = backend_single_q::Shape {
             num_total_tokens: num_tokens,
             num_total_sdpa_map_task_templates: num_total_kv_splits,
         };
@@ -110,10 +107,10 @@ impl GQAFixture {
         let page_ids = Buffer::from_slice(device, &(0..num_page_ids).collect::<Vec<_>>());
         let kv_splits = Buffer::from_slice(device, &kv_split_values);
         let cu_kv_splits = Buffer::from_slice(device, &cu_kv_split_values);
-        let scratch = GQASplitKVSingleQScratch::new(device, config, shape);
+        let scratch = backend_single_q::Scratch::new(device, config, shape);
         let output = Buffer::new_zeroed(device, config.q_bytes(shape));
         let stream = Stream::new(device);
-        let kernels = GQASplitKVSingleQKernels::new(device, config, shape);
+        let kernels = backend_single_q::Compute::new(device, config, shape);
         let replay = build_gqa_replay(
             &stream,
             &kernels,
@@ -181,14 +178,14 @@ fn split_kv_plan(context_lens: &[u32]) -> (Vec<u32>, Vec<u32>) {
 #[allow(clippy::too_many_arguments)]
 fn build_gqa_replay(
     stream: &Stream,
-    kernels: &GQASplitKVSingleQKernels,
+    kernels: &backend_single_q::Compute,
     q: &Buffer,
     kv_pages: &Buffer,
     req_slots: &Buffer,
     page_ids: &Buffer,
     kv_splits: &Buffer,
     cu_kv_splits: &Buffer,
-    scratch: &GQASplitKVSingleQScratch,
+    scratch: &backend_single_q::Scratch,
     output: &Buffer,
 ) -> ReplayProgram {
     let mut builder = stream.create_replay_program();

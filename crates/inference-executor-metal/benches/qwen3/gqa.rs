@@ -3,18 +3,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use half::bf16;
-use inference_backend_metal::components::GQAPageTableLayout as MetalGQAPageTableLayout;
-use inference_backend_metal::components::GQASplitKVSingleQConfig;
-use inference_backend_metal::components::GQASplitKVSingleQKernels;
-use inference_backend_metal::components::GQASplitKVSingleQMapBuffers;
-use inference_backend_metal::components::GQASplitKVSingleQReduceBuffers;
-use inference_backend_metal::components::GQASplitKVSingleQShape;
-use inference_backend_metal::components::GQASplitKVTiledQConfig;
-use inference_backend_metal::components::GQASplitKVTiledQKernels;
-use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
-use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
-use inference_backend_metal::components::GQASplitKVTiledQShape;
+use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
+use inference_backend_metal::components::gqa::split_kv::tiled_q as backend_tiled_q;
 use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -528,8 +520,8 @@ impl Fixture {
         }
     }
 
-    fn tiled_config(&self) -> GQASplitKVTiledQConfig {
-        GQASplitKVTiledQConfig {
+    fn tiled_config(&self) -> backend_tiled_q::Config {
+        backend_tiled_q::Config {
             num_q_heads: self.core.num_q_heads.try_into().expect("q heads must fit u32"),
             num_kv_heads: self.core.num_kv_heads.try_into().expect("KV heads must fit u32"),
             head_dim: self.core.head_dim.try_into().expect("head dim must fit u32"),
@@ -539,7 +531,7 @@ impl Fixture {
             scale: self.core.scale,
             page_bytes: self.config.page_bytes,
             dtype: self.config.io_dtype,
-            page_table_layout: MetalGQAPageTableLayout {
+            page_table_layout: backend_kv_page_write::PageTableLayout {
                 num_req_slots: self.page_table_layout.num_req_slots,
                 num_blocks: self.page_table_layout.num_blocks,
                 num_gqa_layers: self.page_table_layout.num_gqa_layers,
@@ -723,17 +715,17 @@ fn split_kv_single_q_replay(
     params: BenchParams,
 ) -> ReplayProgram {
     let shape = metadata.replay_shape();
-    let sdpa_shape = GQASplitKVSingleQShape {
+    let sdpa_shape = backend_single_q::Shape {
         num_total_tokens: shape.num_tokens,
         num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
     };
-    let sdpa_config = GQASplitKVSingleQConfig {
+    let sdpa_config = backend_single_q::Config {
         num_q_heads: core.num_q_heads.try_into().expect("q heads must fit u32"),
         num_kv_heads: core.num_kv_heads.try_into().expect("KV heads must fit u32"),
         head_dim: core.head_dim.try_into().expect("head dim must fit u32"),
         scale: core.scale,
         page_bytes: config.page_bytes,
-        page_table_layout: MetalGQAPageTableLayout {
+        page_table_layout: backend_kv_page_write::PageTableLayout {
             num_req_slots: page_table_layout.num_req_slots,
             num_blocks: page_table_layout.num_blocks,
             num_gqa_layers: page_table_layout.num_gqa_layers,
@@ -744,11 +736,11 @@ fn split_kv_single_q_replay(
         max_q_heads,
         dtype: config.io_dtype,
     };
-    let kernels = GQASplitKVSingleQKernels::new(device, sdpa_config, sdpa_shape);
+    let kernels = backend_single_q::Compute::new(device, sdpa_config, sdpa_shape);
     let scratch = scratch.bindings();
     let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
     recorder.record(ReplayOp::opaque(kernels.invoke_map(
-        GQASplitKVSingleQMapBuffers {
+        backend_single_q::MapBuffers {
             q: scratch.q_norm_rope,
             kv_pages: pages,
             req_slots: metadata.req_slots(),
@@ -761,7 +753,7 @@ fn split_kv_single_q_replay(
         ReplayU32::Fixed(0),
     )));
     recorder.record_with_barrier_before(ReplayOp::opaque(kernels.invoke_reduce(
-        GQASplitKVSingleQReduceBuffers {
+        backend_single_q::ReduceBuffers {
             partial_exp_sums: scratch.sdpa_partial_exp_sums,
             partial_max_logits: scratch.sdpa_partial_max_logits,
             partial_output: scratch.sdpa_partial_output,
@@ -787,7 +779,7 @@ fn split_kv_tiled_q_replay(
     params: BenchParams,
 ) -> ReplayProgram {
     let shape = metadata.replay_shape();
-    let tiled_config = GQASplitKVTiledQConfig {
+    let tiled_config = backend_tiled_q::Config {
         num_q_heads: core.num_q_heads.try_into().expect("q heads must fit u32"),
         num_kv_heads: core.num_kv_heads.try_into().expect("KV heads must fit u32"),
         head_dim: core.head_dim.try_into().expect("head dim must fit u32"),
@@ -797,23 +789,23 @@ fn split_kv_tiled_q_replay(
         scale: core.scale,
         page_bytes: config.page_bytes,
         dtype: config.io_dtype,
-        page_table_layout: MetalGQAPageTableLayout {
+        page_table_layout: backend_kv_page_write::PageTableLayout {
             num_req_slots: page_table_layout.num_req_slots,
             num_blocks: page_table_layout.num_blocks,
             num_gqa_layers: page_table_layout.num_gqa_layers,
             num_page_ids_per_block: page_table_layout.num_page_ids_per_block,
         },
     };
-    let tiled_shape = GQASplitKVTiledQShape {
+    let tiled_shape = backend_tiled_q::Shape {
         num_total_tokens: shape.num_tokens,
         num_total_q_token_tiles: shape.num_q_token_tiles,
         num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
     };
-    let kernels = GQASplitKVTiledQKernels::new(device, tiled_config, tiled_shape);
+    let kernels = backend_tiled_q::Compute::new(device, tiled_config, tiled_shape);
     let scratch = scratch.bindings();
     let mut recorder = MetalReplayRuntime::new(stream).create_recorder();
     recorder.record(ReplayOp::opaque(kernels.invoke_map(
-        GQASplitKVTiledQMapBuffers {
+        backend_tiled_q::MapBuffers {
             q: scratch.q_norm_rope,
             kv_pages: pages,
             req_slots: metadata.req_slots(),
@@ -827,14 +819,16 @@ fn split_kv_tiled_q_replay(
         },
         ReplayU32::Fixed(0),
     )));
-    recorder.record_with_barrier_before(ReplayOp::opaque(kernels.invoke_reduce(GQASplitKVTiledQReduceBuffers {
-        partial_output: scratch.sdpa_partial_output,
-        partial_exp_sums: scratch.sdpa_partial_exp_sums,
-        partial_max_logits: scratch.sdpa_partial_max_logits,
-        q_token_ranges: metadata.q_token_ranges(),
-        cu_sdpa_partial_outputs: metadata.cu_sdpa_partial_outputs(),
-        output: scratch.attention_output,
-    })));
+    recorder.record_with_barrier_before(ReplayOp::opaque(kernels.invoke_reduce(
+        backend_tiled_q::ReduceBuffers {
+            partial_output: scratch.sdpa_partial_output,
+            partial_exp_sums: scratch.sdpa_partial_exp_sums,
+            partial_max_logits: scratch.sdpa_partial_max_logits,
+            q_token_ranges: metadata.q_token_ranges(),
+            cu_sdpa_partial_outputs: metadata.cu_sdpa_partial_outputs(),
+            output: scratch.attention_output,
+        },
+    )));
     recorder.build()
 }
 

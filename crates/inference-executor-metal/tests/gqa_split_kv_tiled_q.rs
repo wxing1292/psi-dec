@@ -1,12 +1,8 @@
 use std::mem::size_of;
 
 use half::bf16;
-use inference_backend_metal::components::GQAPageTableLayout;
-use inference_backend_metal::components::GQASplitKVTiledQConfig;
-use inference_backend_metal::components::GQASplitKVTiledQKernels;
-use inference_backend_metal::components::GQASplitKVTiledQMapBuffers;
-use inference_backend_metal::components::GQASplitKVTiledQReduceBuffers;
-use inference_backend_metal::components::GQASplitKVTiledQShape;
+use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
+use inference_backend_metal::components::gqa::split_kv::tiled_q as backend_tiled_q;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -60,7 +56,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
     let num_total_tokens = 16usize;
     let num_blocks = 2usize;
     let page_bytes = 2 * num_kv_heads * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size();
-    let config = GQASplitKVTiledQConfig {
+    let config = backend_tiled_q::Config {
         num_q_heads: num_q_heads as u32,
         num_kv_heads: num_kv_heads as u32,
         head_dim: head_dim as u32,
@@ -70,14 +66,14 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
         scale: (head_dim as f32).sqrt().recip(),
         page_bytes: page_bytes as u32,
         dtype: Dtype::Bfloat16,
-        page_table_layout: GQAPageTableLayout {
+        page_table_layout: backend_kv_page_write::PageTableLayout {
             num_req_slots: 1,
             num_blocks: num_blocks as u32,
             num_gqa_layers: 1,
             num_page_ids_per_block: 1,
         },
     };
-    let shape = GQASplitKVTiledQShape {
+    let shape = backend_tiled_q::Shape {
         num_total_tokens: num_total_tokens as u32,
         num_total_q_token_tiles: 2,
         num_total_sdpa_map_task_templates: 2,
@@ -140,10 +136,10 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
     );
     let sentinel = bf16::from_f32(-123.0).to_bits();
     let output = Buffer::from_slice(&device, &vec![sentinel; num_total_tokens * num_q_heads * head_dim]);
-    let kernels = GQASplitKVTiledQKernels::new(&device, config, shape);
+    let kernels = backend_tiled_q::Compute::new(&device, config, shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map_bucketed(
-        GQASplitKVTiledQMapBuffers {
+        backend_tiled_q::MapBuffers {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &req_slots,
@@ -161,7 +157,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
         ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
     ));
     builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
-        GQASplitKVTiledQReduceBuffers {
+        backend_tiled_q::ReduceBuffers {
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
             partial_max_logits: &partial_max_logits,
@@ -327,7 +323,7 @@ fn run_case(
     let num_sdpa_map_task_templates = sdpa_map_task_template_values.len() / 3;
     let num_total_sdpa_map_task_templates = num_sdpa_map_task_templates.next_power_of_two();
     sdpa_map_task_template_values.resize(num_total_sdpa_map_task_templates * 3, u32::MAX);
-    let config = GQASplitKVTiledQConfig {
+    let config = backend_tiled_q::Config {
         num_q_heads: num_q_heads.try_into().unwrap(),
         num_kv_heads: num_kv_heads.try_into().unwrap(),
         head_dim: head_dim.try_into().unwrap(),
@@ -337,14 +333,14 @@ fn run_case(
         scale: (head_dim as f32).sqrt().recip(),
         page_bytes: page_bytes.try_into().unwrap(),
         dtype: Dtype::Bfloat16,
-        page_table_layout: GQAPageTableLayout {
+        page_table_layout: backend_kv_page_write::PageTableLayout {
             num_req_slots: num_tokens_per_req.len().try_into().unwrap(),
             num_blocks: num_blocks.try_into().unwrap(),
             num_gqa_layers: 1,
             num_page_ids_per_block: 1,
         },
     };
-    let shape = GQASplitKVTiledQShape {
+    let shape = backend_tiled_q::Shape {
         num_total_tokens: num_tokens.try_into().unwrap(),
         num_total_q_token_tiles: num_q_token_ranges.try_into().unwrap(),
         num_total_sdpa_map_task_templates: num_total_sdpa_map_task_templates.try_into().unwrap(),
@@ -431,10 +427,10 @@ fn run_case(
         &device,
         num_tokens * num_q_heads * head_dim * Dtype::Bfloat16.item_size(),
     );
-    let kernels = GQASplitKVTiledQKernels::new(&device, config, shape);
+    let kernels = backend_tiled_q::Compute::new(&device, config, shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map(
-        GQASplitKVTiledQMapBuffers {
+        backend_tiled_q::MapBuffers {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &req_slots,
@@ -448,7 +444,7 @@ fn run_case(
         },
         ReplayU32::Fixed(0),
     ));
-    builder.record_with_barrier_before(kernels.invoke_reduce(GQASplitKVTiledQReduceBuffers {
+    builder.record_with_barrier_before(kernels.invoke_reduce(backend_tiled_q::ReduceBuffers {
         partial_output: &partial_output,
         partial_exp_sums: &partial_exp_sums,
         partial_max_logits: &partial_max_logits,

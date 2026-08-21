@@ -59,7 +59,7 @@ crates/inference-executor-core/src/
 
 crates/inference-backend-metal/src/components/
   sampling/dspark_markov.rs      fused Markov, confidence, and tile-Top-K map component
-  gqa_block_attention.rs         dense block-SDPA component
+  gqa/block_sdpa.rs              dense block-SDPA component
   metal/dspark_markov_sampling.metal
   metal/gqa_block_sdpa.metal     dense bidirectional block kernel
 
@@ -288,7 +288,7 @@ QKV projection
 The history path reads persistent paged K/V.
 The block path reads dense local K/V from `DSparkBlockScratch`.
 Both map paths write `SDPAPartialOutput` records with the existing ABI.
-The existing `GQASplitKVSingleQKernels` Reduce launch combines both sets.
+The existing `gqa::split_kv::single_q::Compute` Reduce launch combines both sets.
 
 The history metadata supplies a half-open visible range.
 For an anchor at position `p`, that range is `[0, p)`.

@@ -43,8 +43,8 @@ crates/inference-backend-metal/src/components/
     mod.rs              backend GDN component module root
     compute.rs          recurrent variant registry, selector, constants, and compute graph
     compute_test.rs     GDN compute reference and selection tests
+    qkvabz_split.rs     reusable QKVABZ split component
     state_pages.rs      reusable GDN state-page read/write helpers
-  gdn_qkvabz_split.rs  reusable QKVABZ split component
   metal/
     gdn_compute.metal        short-convolution, ragged recurrent, and output-norm/gate source
     gdn_qkvabz_split.metal  QKVABZ split source
@@ -380,10 +380,10 @@ GDNCore
   num_v_heads, v_head_dim,
   conv_kernel_size, q_scale
 
-GDNQKVABZSplitConfig
+gdn::qkvabz_split::Config
   qkv_dim, num_v_heads, v_dim
 
-GDNQKVABZSplitShape
+gdn::qkvabz_split::Shape
   num_total_tokens
 ```
 
@@ -646,7 +646,7 @@ duplicate shape. Backend recording and replay-key construction both read the sto
 the aggregate arena lengths and layer strides. Record-time layer selection uses direct arithmetic and debug bounds.
 Production binds each arena at Metal offset zero. It passes the bases as Metal `ulong` kernel arguments.
 
-`GDNQKVABZSplitBuffers` carries `qkv`, `a`, `b`, and `z`. In qkvabz naming, `a` is the raw gate/dt
+`gdn::qkvabz_split::Buffers` carries `qkv`, `a`, `b`, and `z`. In qkvabz naming, `a` is the raw gate/dt
 projection. `b` is the raw beta projection. `z` is the output gate projection.
 
 `g` is not projected. Gate preparation derives it as part of `beta = sigmoid(b)`,

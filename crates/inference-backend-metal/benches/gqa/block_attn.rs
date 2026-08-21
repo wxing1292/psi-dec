@@ -4,10 +4,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
-use inference_backend_metal::components::GQABlockSDPABuffers;
-use inference_backend_metal::components::GQABlockSDPAConfig;
-use inference_backend_metal::components::GQABlockSDPAKernel;
-use inference_backend_metal::components::GQABlockSDPAShape;
+use inference_backend_metal::components::gqa::block_sdpa as backend_block_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -132,7 +129,7 @@ impl Fixture {
             .checked_mul(2)
             .and_then(u32::checked_next_power_of_two)
             .expect("GQA block-attention bench partial-output capacity must fit u32");
-        let config = GQABlockSDPAConfig {
+        let config = backend_block_sdpa::Config {
             block_size,
             num_q_heads,
             num_kv_heads,
@@ -140,7 +137,7 @@ impl Fixture {
             scale: (head_dim as f32).sqrt().recip(),
             dtype,
         };
-        let shape = GQABlockSDPAShape {
+        let shape = backend_block_sdpa::Shape {
             num_tokens,
             num_total_sdpa_map_task_templates,
         };
@@ -169,12 +166,12 @@ impl Fixture {
         let partial_exp_sums = Buffer::new_zeroed_elements(device, partial_stat_elements, Dtype::Float32);
         let partial_max_logits = Buffer::new_zeroed_elements(device, partial_stat_elements, Dtype::Float32);
         let partial_output = Buffer::new_zeroed_elements(device, partial_output_elements, dtype);
-        let kernel = GQABlockSDPAKernel::new(device, config);
+        let kernel = backend_block_sdpa::Compute::new(device, config);
         let stream = Stream::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            GQABlockSDPABuffers {
+            backend_block_sdpa::Buffers {
                 q: &q,
                 local_k: &local_k,
                 local_v: &local_v,

@@ -8,37 +8,37 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
-const GQA_KV_PAGE_WRITE_SOURCE: &str = include_str!("metal/gqa_kv_page_write.metal");
+const SOURCE: &str = include_str!("../metal/gqa_kv_page_write.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GQAKVPageWriteThreadBlockConstants {
+struct ThreadBlockConstants {
     required_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GQAKVPageWriteKernelConstants {
-    config: GQAKVPageWriteConfig,
-    thread_block: GQAKVPageWriteThreadBlockConstants,
+struct KernelConstants {
+    config: Config,
+    thread_block: ThreadBlockConstants,
 }
 
-impl GQAKVPageWriteKernelConstants {
-    fn current(config: GQAKVPageWriteConfig) -> Self {
+impl KernelConstants {
+    fn current(config: Config) -> Self {
         Self {
             config,
-            thread_block: GQAKVPageWriteThreadBlockConstants { required_threads: 256 },
+            thread_block: ThreadBlockConstants { required_threads: 256 },
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQAPageTableLayout {
+pub struct PageTableLayout {
     pub num_req_slots: u32,
     pub num_gqa_layers: u32,
     pub num_blocks: u32,
     pub num_page_ids_per_block: u32,
 }
 
-impl GQAPageTableLayout {
+impl PageTableLayout {
     pub fn validate(self) {
         assert!(self.num_req_slots > 0);
         assert!(self.num_blocks > 0);
@@ -57,14 +57,14 @@ impl GQAPageTableLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQAKVPageWriteConfig {
+pub struct Config {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub page_bytes: u32,
     pub dtype: Dtype,
 }
 
-impl GQAKVPageWriteConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.num_kv_heads > 0);
         assert!(self.num_tokens_per_page() > 0);
@@ -87,19 +87,19 @@ impl GQAKVPageWriteConfig {
         self.page_bytes / kv_bytes_per_token
     }
 
-    pub fn index_bytes(self, shape: GQAKVPageWriteShape) -> usize {
+    pub fn index_bytes(self, shape: Shape) -> usize {
         (shape.num_total_token_writes as usize)
             .checked_mul(size_of::<u32>())
             .expect("GQA KV page-write index bytes must fit usize")
     }
 
-    pub fn flat_kv_bytes(self, shape: GQAKVPageWriteShape) -> usize {
+    pub fn flat_kv_bytes(self, shape: Shape) -> usize {
         self.num_total_threads(shape)
             .checked_mul(self.dtype.item_size())
             .expect("GQA flattened K/V byte length must fit usize")
     }
 
-    pub fn num_total_threads(self, shape: GQAKVPageWriteShape) -> usize {
+    pub fn num_total_threads(self, shape: Shape) -> usize {
         checked_product(
             "GQA KV page-write thread count",
             &[
@@ -112,13 +112,13 @@ impl GQAKVPageWriteConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQAKVPageWriteShape {
+pub struct Shape {
     pub num_total_token_writes: u32,
-    pub page_table_layout: GQAPageTableLayout,
+    pub page_table_layout: PageTableLayout,
 }
 
-impl GQAKVPageWriteShape {
-    pub fn validate(self, config: GQAKVPageWriteConfig) {
+impl Shape {
+    pub fn validate(self, config: Config) {
         config.validate();
         assert!(self.num_total_token_writes > 0);
         self.page_table_layout.validate();
@@ -131,7 +131,7 @@ impl GQAKVPageWriteShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQAKVPageWriteBuffers<'a> {
+pub struct Buffers<'a> {
     pub pages: &'a Buffer,
     pub flat_k: &'a Buffer,
     pub flat_v: &'a Buffer,
@@ -140,15 +140,15 @@ pub struct GQAKVPageWriteBuffers<'a> {
     pub page_ids: &'a Buffer,
 }
 
-pub struct GQAKVPageWrite {
-    constants: GQAKVPageWriteKernelConstants,
+pub struct Compute {
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
-impl GQAKVPageWrite {
-    pub fn new(device: &Device, config: GQAKVPageWriteConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
-        let constants = GQAKVPageWriteKernelConstants::current(config);
+        let constants = KernelConstants::current(config);
         let source = kv_page_write_source(constants);
         let function_name = match config.dtype {
             Dtype::Float32 => "gqa_kv_page_write_f32",
@@ -161,13 +161,8 @@ impl GQAKVPageWrite {
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GQAKVPageWriteShape,
-        buffers: GQAKVPageWriteBuffers<'a>,
-        page_table_index: ReplayU32,
-    ) -> GQAKVPageWriteInvocation<'a> {
-        GQAKVPageWriteInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>, page_table_index: ReplayU32) -> Invocation<'a> {
+        Invocation {
             constants: self.constants,
             kernel: &self.kernel,
             shape,
@@ -179,12 +174,12 @@ impl GQAKVPageWrite {
 
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: GQAKVPageWriteShape,
-        buffers: GQAKVPageWriteBuffers<'a>,
+        shape: Shape,
+        buffers: Buffers<'a>,
         num_active_token_writes: ReplayU32,
         page_table_index: ReplayU32,
-    ) -> GQAKVPageWriteInvocation<'a> {
-        GQAKVPageWriteInvocation {
+    ) -> Invocation<'a> {
+        Invocation {
             constants: self.constants,
             kernel: &self.kernel,
             shape,
@@ -195,7 +190,7 @@ impl GQAKVPageWrite {
     }
 }
 
-fn kv_page_write_source(kernel_constants: GQAKVPageWriteKernelConstants) -> String {
+fn kv_page_write_source(kernel_constants: KernelConstants) -> String {
     let config = kernel_constants.config;
     let source_constants = format!(
         "using namespace metal;\n\nconstant uint num_kv_heads = {}u;\nconstant uint head_dim = {}u;\nconstant uint \
@@ -205,19 +200,19 @@ fn kv_page_write_source(kernel_constants: GQAKVPageWriteKernelConstants) -> Stri
         config.num_tokens_per_page(),
         config.page_bytes,
     );
-    GQA_KV_PAGE_WRITE_SOURCE.replacen("using namespace metal;", &source_constants, 1)
+    SOURCE.replacen("using namespace metal;", &source_constants, 1)
 }
 
-pub struct GQAKVPageWriteInvocation<'a> {
-    constants: GQAKVPageWriteKernelConstants,
+pub struct Invocation<'a> {
+    constants: KernelConstants,
     kernel: &'a Kernel,
-    shape: GQAKVPageWriteShape,
-    buffers: GQAKVPageWriteBuffers<'a>,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_token_writes: ReplayU32,
     page_table_index: ReplayU32,
 }
 
-impl Operator for GQAKVPageWriteInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let config = self.constants.config;
@@ -257,7 +252,7 @@ impl Operator for GQAKVPageWriteInvocation<'_> {
     }
 }
 
-impl GQAKVPageWriteInvocation<'_> {
+impl Invocation<'_> {
     fn validate(&self) {
         let config = self.constants.config;
         self.shape.validate(config);
@@ -280,13 +275,13 @@ mod tests {
 
     #[test]
     fn test_constants_have_explicit_thread_block_scope() {
-        let config = GQAKVPageWriteConfig {
+        let config = Config {
             num_kv_heads: 2,
             head_dim: 2,
             page_bytes: 16,
             dtype: Dtype::Bfloat16,
         };
-        let constants = GQAKVPageWriteKernelConstants::current(config);
+        let constants = KernelConstants::current(config);
         assert_eq!(constants.config, config);
         assert_eq!(constants.thread_block.required_threads, 256);
     }
@@ -294,15 +289,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "GQA KV page-write threads exceeds the shader u32 count domain")]
     fn test_shape_rejects_shader_count_overflow() {
-        let config = GQAKVPageWriteConfig {
+        let config = Config {
             num_kv_heads: 2,
             head_dim: 2,
             page_bytes: 16,
             dtype: Dtype::Bfloat16,
         };
-        GQAKVPageWriteShape {
+        Shape {
             num_total_token_writes: 1 << 30,
-            page_table_layout: GQAPageTableLayout {
+            page_table_layout: PageTableLayout {
                 num_req_slots: 1,
                 num_gqa_layers: 1,
                 num_blocks: 1,
@@ -330,26 +325,26 @@ mod tests {
         let req_slots = Buffer::from_slice(&device, &[0_u32, 0, 0, 1]);
         let flat_token_indices = Buffer::from_slice(&device, &[0_u32, 1, 2, 0]);
         let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
-        let config = GQAKVPageWriteConfig {
+        let config = Config {
             num_kv_heads: 1,
             head_dim: 2,
             page_bytes: (page_values * size_of::<u16>()) as u32,
             dtype: Dtype::Bfloat16,
         };
-        let shape = GQAKVPageWriteShape {
+        let shape = Shape {
             num_total_token_writes: 4,
-            page_table_layout: GQAPageTableLayout {
+            page_table_layout: PageTableLayout {
                 num_req_slots: 2,
                 num_gqa_layers: 1,
                 num_blocks: 1,
                 num_page_ids_per_block: 1,
             },
         };
-        let kernel = GQAKVPageWrite::new(&device, config);
+        let kernel = Compute::new(&device, config);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_bucketed(
             shape,
-            GQAKVPageWriteBuffers {
+            Buffers {
                 pages: &pages,
                 flat_k: &flat_k,
                 flat_v: &flat_v,
@@ -405,26 +400,26 @@ mod tests {
         let req_slots = Buffer::from_slice(device, &[0u32]);
         let flat_token_indices = Buffer::from_slice(device, &[1u32]);
         let page_ids = Buffer::from_slice(device, &[0u32]);
-        let config = GQAKVPageWriteConfig {
+        let config = Config {
             num_kv_heads: 1,
             head_dim: 2,
             page_bytes: pages.len_bytes() as u32,
             dtype,
         };
-        let shape = GQAKVPageWriteShape {
+        let shape = Shape {
             num_total_token_writes: 1,
-            page_table_layout: GQAPageTableLayout {
+            page_table_layout: PageTableLayout {
                 num_req_slots: 1,
                 num_gqa_layers: 1,
                 num_blocks: 1,
                 num_page_ids_per_block: 1,
             },
         };
-        let kernel = GQAKVPageWrite::new(device, config);
+        let kernel = Compute::new(device, config);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            GQAKVPageWriteBuffers {
+            Buffers {
                 pages,
                 flat_k: k,
                 flat_v: v,

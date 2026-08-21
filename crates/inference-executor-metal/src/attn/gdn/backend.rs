@@ -1,8 +1,5 @@
-use inference_backend_metal::components::GDNQKVABZSplitBuffers;
-use inference_backend_metal::components::GDNQKVABZSplitConfig;
-use inference_backend_metal::components::GDNQKVABZSplitKernel;
-use inference_backend_metal::components::GDNQKVABZSplitShape;
 use inference_backend_metal::components::gdn::compute as backend_compute;
+use inference_backend_metal::components::gdn::qkvabz_split as backend_qkvabz_split;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -168,7 +165,7 @@ pub struct GDN {
     device: Device,
     core: GDNCore,
     qkvabz: AffineQuantizedMatmul,
-    qkvabz_to_qkv_a_b_z: GDNQKVABZSplitKernel,
+    qkvabz_to_qkv_a_b_z: backend_qkvabz_split::Compute,
     compute: backend_compute::Compute,
     output: AffineQuantizedMatmul,
 }
@@ -192,7 +189,7 @@ impl GDN {
                     config,
                 ),
             ),
-            qkvabz_to_qkv_a_b_z: GDNQKVABZSplitKernel::new(device, qkvabz_split_config(&core)),
+            qkvabz_to_qkv_a_b_z: backend_qkvabz_split::Compute::new(device, qkvabz_split_config(&core)),
             compute: backend_compute::Compute::new(device, compute_config(&core, config)),
             output: AffineQuantizedMatmul::new(
                 device,
@@ -384,10 +381,10 @@ impl ReplayLayer for GDN {
             )
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(qkvabz));
-        let split_shape = GDNQKVABZSplitShape {
+        let split_shape = backend_qkvabz_split::Shape {
             num_total_tokens: shape.num_total_tokens,
         };
-        let split_buffers = GDNQKVABZSplitBuffers {
+        let split_buffers = backend_qkvabz_split::Buffers {
             qkvabz: scratch.qkvabz,
             qkv: scratch.qkv,
             a: scratch.a,
@@ -505,11 +502,11 @@ fn compute_shape(shape: GDNReplayShape) -> backend_compute::Shape {
     }
 }
 
-fn qkvabz_split_config(core: &GDNCore) -> GDNQKVABZSplitConfig {
+fn qkvabz_split_config(core: &GDNCore) -> backend_qkvabz_split::Config {
     let qkv_dim = core.qkv_dim().try_into().expect("GDN qkv_dim must fit u32");
     let num_v_heads = core.num_v_heads.try_into().expect("GDN num_v_heads must fit u32");
     let v_dim = core.v_dim().try_into().expect("GDN v_dim must fit u32");
-    GDNQKVABZSplitConfig::new(qkv_dim, num_v_heads, v_dim)
+    backend_qkvabz_split::Config::new(qkv_dim, num_v_heads, v_dim)
 }
 
 fn affine_config(

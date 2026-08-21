@@ -19,7 +19,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let (config, shape) = tiled_workload(128, 8);
-    let kernels = GQASplitKVTiledQKernels::new(&device, config, shape);
+    let kernels = Compute::new(&device, config, shape);
     let q_values = generated_bf16_values(config.q_bytes(shape) as usize / size_of::<u16>(), 0x4751_4154);
     let kv_values_per_kind =
         config.num_tokens_per_page() as usize * config.num_kv_heads as usize * config.head_dim as usize;
@@ -40,7 +40,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
 
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map_bucketed(
-        GQASplitKVTiledQMapBuffers {
+        MapBuffers {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &req_slots,
@@ -58,7 +58,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
         ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
     ));
     builder.record_with_barrier_before(kernels.invoke_reduce_bucketed(
-        GQASplitKVTiledQReduceBuffers {
+        ReduceBuffers {
             partial_output: &partial_output,
             partial_exp_sums: &partial_exp_sums,
             partial_max_logits: &partial_max_logits,
@@ -208,7 +208,7 @@ fn test_shape_rejects_unsupported_profile() {
 #[test]
 #[should_panic(expected = "GQA SplitKV TiledQ Q-token-range metadata exceeds the shader u32 element-index domain")]
 fn test_shape_rejects_shader_index_overflow() {
-    let shape = GQASplitKVTiledQShape {
+    let shape = Shape {
         num_total_tokens: u32::MAX,
         num_total_q_token_tiles: u32::MAX,
         num_total_sdpa_map_task_templates: u32::MAX,
@@ -217,9 +217,9 @@ fn test_shape_rejects_shader_index_overflow() {
     shape.validate(config);
 }
 
-fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (GQASplitKVTiledQConfig, GQASplitKVTiledQShape) {
+fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (Config, Shape) {
     (
-        GQASplitKVTiledQConfig {
+        Config {
             num_q_heads: 5,
             num_kv_heads: 1,
             head_dim,
@@ -229,14 +229,14 @@ fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (GQASplitKVTiledQC
             scale: (head_dim as f32).sqrt().recip(),
             page_bytes: 2 * num_tokens_per_page * head_dim * Dtype::Bfloat16.item_size() as u32,
             dtype: Dtype::Bfloat16,
-            page_table_layout: GQAPageTableLayout {
+            page_table_layout: PageTableLayout {
                 num_req_slots: 1,
                 num_gqa_layers: 1,
                 num_blocks: 1,
                 num_page_ids_per_block: 1,
             },
         },
-        GQASplitKVTiledQShape {
+        Shape {
             num_total_tokens: 8,
             num_total_q_token_tiles: 1,
             num_total_sdpa_map_task_templates: 1,
@@ -244,7 +244,7 @@ fn tiled_workload(head_dim: u32, num_tokens_per_page: u32) -> (GQASplitKVTiledQC
     )
 }
 
-fn fixture_core(config: GQASplitKVTiledQConfig) -> GQACore {
+fn fixture_core(config: Config) -> GQACore {
     GQACore::new(
         0,
         config.num_q_heads as usize * config.head_dim as usize,
@@ -255,7 +255,7 @@ fn fixture_core(config: GQASplitKVTiledQConfig) -> GQACore {
     )
 }
 
-fn kv_page_values(config: GQASplitKVTiledQConfig, k: &[f32], v: &[f32]) -> Vec<f32> {
+fn kv_page_values(config: Config, k: &[f32], v: &[f32]) -> Vec<f32> {
     assert_eq!(k.len(), v.len());
     let values_per_token = config.num_kv_heads as usize * config.head_dim as usize;
     let num_tokens_per_page = config.num_tokens_per_page() as usize;

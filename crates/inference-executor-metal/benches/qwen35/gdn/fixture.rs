@@ -3,11 +3,8 @@ use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use inference_backend_metal::components::GDNQKVABZSplitBuffers;
-use inference_backend_metal::components::GDNQKVABZSplitConfig;
-use inference_backend_metal::components::GDNQKVABZSplitKernel;
-use inference_backend_metal::components::GDNQKVABZSplitShape;
 use inference_backend_metal::components::gdn::compute as backend_compute;
+use inference_backend_metal::components::gdn::qkvabz_split as backend_qkvabz_split;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -309,9 +306,9 @@ impl<'a> RealGDNFixture<'a> {
         let device = &self.device;
         let qkvabz_config = gdn_qkvabz_affine_config();
         let qkvabz = AffineQuantizedMatmul::new(device, qkvabz_config);
-        let qkvabz_to_qkv_a_b_z = GDNQKVABZSplitKernel::new(
+        let qkvabz_to_qkv_a_b_z = backend_qkvabz_split::Compute::new(
             device,
-            GDNQKVABZSplitConfig::new(
+            backend_qkvabz_split::Config::new(
                 GDN_CONV_DIM.try_into().expect("GDN qkv_dim must fit u32"),
                 GDN_V_HEADS.try_into().expect("GDN V heads must fit u32"),
                 GDN_V_DIM.try_into().expect("GDN V dim must fit u32"),
@@ -340,10 +337,10 @@ impl<'a> RealGDNFixture<'a> {
         let split_replay = build_single_invocation_replay(
             &self.stream,
             qkvabz_to_qkv_a_b_z.invoke(
-                GDNQKVABZSplitShape {
+                backend_qkvabz_split::Shape {
                     num_total_tokens: self.num_tokens,
                 },
-                GDNQKVABZSplitBuffers {
+                backend_qkvabz_split::Buffers {
                     qkvabz: &self.qkvabz,
                     qkv: &self.qkv,
                     a: &self.a,

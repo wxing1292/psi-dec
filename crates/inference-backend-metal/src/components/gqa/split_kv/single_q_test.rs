@@ -13,13 +13,13 @@ const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.g
 #[test]
 #[should_panic(expected = "GQA SDPA query/output exceeds the shader u32 count domain")]
 fn test_sdpa_shape_rejects_shader_count_overflow() {
-    let config = GQASplitKVSingleQConfig {
+    let config = Config {
         num_q_heads: 2,
         num_kv_heads: 1,
         head_dim: 2,
         scale: 1.0,
         page_bytes: 8,
-        page_table_layout: GQAPageTableLayout {
+        page_table_layout: PageTableLayout {
             num_req_slots: 1,
             num_gqa_layers: 1,
             num_blocks: 1,
@@ -30,20 +30,11 @@ fn test_sdpa_shape_rejects_shader_count_overflow() {
         max_q_heads: 1,
         dtype: Dtype::Bfloat16,
     };
-    GQASplitKVSingleQShape {
+    Shape {
         num_total_tokens: 1 << 30,
         num_total_sdpa_map_task_templates: 1,
     }
     .validate(config);
-}
-
-#[test]
-#[should_panic(expected = "GQA activation/gate exceeds the shader u32 count domain")]
-fn test_activation_gate_shape_rejects_shader_count_overflow() {
-    GQAActivationGateShape {
-        num_total_tokens: 1 << 30,
-    }
-    .validate(GQAActivationGateConfig::bf16(2, 2));
 }
 
 #[test]
@@ -57,7 +48,7 @@ fn test_fixed() {
     let actual = run_gqa_split_kv_single_q(
         config,
         shape,
-        GQASplitKVSingleQTestInput {
+        TestInput {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &[0, 0],
@@ -83,7 +74,7 @@ fn test_bucketed_replay_matches_active_prefix_and_preserves_output_tail() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let config = fixture_config();
-    let shape = GQASplitKVSingleQShape {
+    let shape = Shape {
         num_total_tokens: 4,
         num_total_sdpa_map_task_templates: 4,
     };
@@ -100,8 +91,8 @@ fn test_bucketed_replay_matches_active_prefix_and_preserves_output_tail() {
     let cu_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1, 2, 3, 4]);
     let sentinel = -321.0_f32;
     let output = Buffer::from_slice(&device, &vec![sentinel; config.num_output_values(shape)]);
-    let scratch = GQASplitKVSingleQScratch::new(&device, config, shape);
-    let kernels = GQASplitKVSingleQKernels::new(&device, config, shape);
+    let scratch = Scratch::new(&device, config, shape);
+    let kernels = Compute::new(&device, config, shape);
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map_bucketed(
         scratch.map_buffers(&q_buffer, &kv_pages_buffer, &req_slots, &page_ids, &task_templates),
@@ -162,7 +153,7 @@ fn test_random() {
     let actual = run_gqa_split_kv_single_q(
         config,
         shape,
-        GQASplitKVSingleQTestInput {
+        TestInput {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &[0, 0],
@@ -201,7 +192,7 @@ fn test_ragged_random() {
     let actual = run_gqa_split_kv_single_q(
         config,
         shape,
-        GQASplitKVSingleQTestInput {
+        TestInput {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &[0, 1, 1],
@@ -243,7 +234,7 @@ fn test_multiple_page_ids_per_block() {
     let actual = run_gqa_split_kv_single_q(
         config,
         shape,
-        GQASplitKVSingleQTestInput {
+        TestInput {
             q: &q,
             kv_pages: &kv_pages,
             req_slots: &[0],
@@ -264,17 +255,17 @@ fn test_multiple_page_ids_per_block() {
     assert_close(&actual, &expected, 2.0e-5);
 }
 
-fn fixture_config() -> GQASplitKVSingleQConfig {
+fn fixture_config() -> Config {
     let num_kv_heads = 2;
     let num_tokens_per_page = 4;
     let head_dim = 2;
-    GQASplitKVSingleQConfig {
+    Config {
         num_q_heads: 4,
         num_kv_heads,
         head_dim,
         scale: 0.5,
         page_bytes: 2 * num_kv_heads * num_tokens_per_page * head_dim * Dtype::Float32.item_size() as u32,
-        page_table_layout: GQAPageTableLayout {
+        page_table_layout: PageTableLayout {
             num_req_slots: 1,
             num_blocks: 1,
             num_gqa_layers: 1,
@@ -287,14 +278,14 @@ fn fixture_config() -> GQASplitKVSingleQConfig {
     }
 }
 
-fn fixture_shape() -> GQASplitKVSingleQShape {
-    GQASplitKVSingleQShape {
+fn fixture_shape() -> Shape {
+    Shape {
         num_total_tokens: 2,
         num_total_sdpa_map_task_templates: 2,
     }
 }
 
-fn fixture_core(config: GQASplitKVSingleQConfig) -> GQACore {
+fn fixture_core(config: Config) -> GQACore {
     let q_dim = config.num_q_heads as usize * config.head_dim as usize;
     GQACore::new(
         0,
@@ -306,7 +297,7 @@ fn fixture_core(config: GQASplitKVSingleQConfig) -> GQACore {
     )
 }
 
-struct GQASplitKVSingleQTestInput<'a> {
+struct TestInput<'a> {
     q: &'a [f32],
     kv_pages: &'a [f32],
     req_slots: &'a [u32],
@@ -314,14 +305,10 @@ struct GQASplitKVSingleQTestInput<'a> {
     flat_token_indices: &'a [u32],
 }
 
-fn run_gqa_split_kv_single_q(
-    config: GQASplitKVSingleQConfig,
-    shape: GQASplitKVSingleQShape,
-    input: GQASplitKVSingleQTestInput<'_>,
-) -> Vec<f32> {
+fn run_gqa_split_kv_single_q(config: Config, shape: Shape, input: TestInput<'_>) -> Vec<f32> {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let kernels = GQASplitKVSingleQKernels::new(&device, config, shape);
+    let kernels = Compute::new(&device, config, shape);
     let q = Buffer::from_slice(&device, input.q);
     let kv_pages = Buffer::from_slice(&device, input.kv_pages);
     let req_slots = Buffer::from_slice(&device, input.req_slots);
@@ -331,7 +318,7 @@ fn run_gqa_split_kv_single_q(
     let sdpa_map_task_templates = Buffer::from_slice(&device, &sdpa_map_task_template_values);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &cu_sdpa_partial_output_values);
     let output = Buffer::new_zeroed(&device, config.q_bytes(shape));
-    let scratch = GQASplitKVSingleQScratch::new(&device, config, shape);
+    let scratch = Scratch::new(&device, config, shape);
 
     let mut builder = stream.create_replay_program();
     builder.record(kernels.invoke_map(
@@ -345,11 +332,7 @@ fn run_gqa_split_kv_single_q(
     output.read_typed::<f32>(0, config.num_output_values(shape))
 }
 
-fn sdpa_map_task_template_buffers(
-    config: GQASplitKVSingleQConfig,
-    shape: GQASplitKVSingleQShape,
-    flat_token_indices: &[u32],
-) -> (Vec<u32>, Vec<u32>) {
+fn sdpa_map_task_template_buffers(config: Config, shape: Shape, flat_token_indices: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let num_kv_iterations = flat_token_indices
         .iter()
         .map(|&token_index| (token_index + 1).div_ceil(config.kv_tokens_per_iteration) as usize)
@@ -395,7 +378,7 @@ fn sdpa_map_task_template_buffers(
     (sdpa_map_task_templates, cu_sdpa_partial_outputs)
 }
 
-fn kv_page_values(config: GQASplitKVSingleQConfig, pages: &[(&[f32], &[f32])]) -> Vec<f32> {
+fn kv_page_values(config: Config, pages: &[(&[f32], &[f32])]) -> Vec<f32> {
     let kv_stride = config.num_kv_heads as usize * config.head_dim as usize;
     let page_f32_values = config.page_bytes as usize / size_of::<f32>();
     let mut v = vec![0.0_f32; pages.len() * page_f32_values];

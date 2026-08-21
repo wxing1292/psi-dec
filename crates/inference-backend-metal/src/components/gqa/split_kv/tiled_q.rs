@@ -2,10 +2,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
 
-use crate::components::GQAPageTableLayout;
 use crate::components::assert_u32_count_domain;
 use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
+use crate::components::gqa::kv_page_write::PageTableLayout;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -14,7 +14,7 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
-const SOURCE: &str = include_str!("metal/gqa_split_kv_tiled_q.metal");
+const SOURCE: &str = include_str!("../../metal/gqa_split_kv_tiled_q.metal");
 
 /// SplitKV TiledQ SDPA (`T` = tokens, `H` = heads, `D` = head width):
 ///
@@ -42,7 +42,7 @@ const SOURCE: &str = include_str!("metal/gqa_split_kv_tiled_q.metal");
 /// coordinates, and specialization. A Q-token range never crosses a request
 /// boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GQASplitKVTiledQConfig {
+pub struct Config {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
@@ -52,10 +52,10 @@ pub struct GQASplitKVTiledQConfig {
     pub scale: f32,
     pub page_bytes: u32,
     pub dtype: Dtype,
-    pub page_table_layout: GQAPageTableLayout,
+    pub page_table_layout: PageTableLayout,
 }
 
-impl GQASplitKVTiledQConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
@@ -114,7 +114,7 @@ impl GQASplitKVTiledQConfig {
             .expect("GQA SplitKV TiledQ threadblock width must fit u32")
     }
 
-    pub fn q_bytes(self, shape: GQASplitKVTiledQShape) -> u64 {
+    pub fn q_bytes(self, shape: Shape) -> u64 {
         checked_product_u64(
             "GQA SplitKV TiledQ query byte length",
             &[
@@ -126,7 +126,7 @@ impl GQASplitKVTiledQConfig {
         )
     }
 
-    pub fn partial_output_bytes(self, shape: GQASplitKVTiledQShape) -> u64 {
+    pub fn partial_output_bytes(self, shape: Shape) -> u64 {
         checked_product_u64(
             "GQA SplitKV TiledQ partial output byte length",
             &[
@@ -139,7 +139,7 @@ impl GQASplitKVTiledQConfig {
         )
     }
 
-    pub fn partial_output_stats_bytes(self, shape: GQASplitKVTiledQShape) -> u64 {
+    pub fn partial_output_stats_bytes(self, shape: Shape) -> u64 {
         checked_product_u64(
             "GQA SplitKV TiledQ partial statistic byte length",
             &[
@@ -166,14 +166,14 @@ impl GQASplitKVTiledQConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASplitKVTiledQShape {
+pub struct Shape {
     pub num_total_tokens: u32,
     pub num_total_q_token_tiles: u32,
     pub num_total_sdpa_map_task_templates: u32,
 }
 
-impl GQASplitKVTiledQShape {
-    pub fn validate(self, config: GQASplitKVTiledQConfig) {
+impl Shape {
+    pub fn validate(self, config: Config) {
         config.validate();
         assert!(self.num_total_tokens > 0);
         assert!(self.num_total_q_token_tiles > 0 && self.num_total_q_token_tiles <= self.num_total_tokens);
@@ -215,7 +215,7 @@ fn checked_product_u64(name: &str, factors: &[u64]) -> u64 {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQASplitKVTiledQMapBuffers<'a> {
+pub struct MapBuffers<'a> {
     pub q: &'a Buffer,
     pub kv_pages: &'a Buffer,
     pub req_slots: &'a Buffer,
@@ -229,7 +229,7 @@ pub struct GQASplitKVTiledQMapBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQASplitKVTiledQReduceBuffers<'a> {
+pub struct ReduceBuffers<'a> {
     pub partial_output: &'a Buffer,
     pub partial_exp_sums: &'a Buffer,
     pub partial_max_logits: &'a Buffer,
@@ -238,15 +238,15 @@ pub struct GQASplitKVTiledQReduceBuffers<'a> {
     pub output: &'a Buffer,
 }
 
-pub struct GQASplitKVTiledQKernels {
-    config: GQASplitKVTiledQConfig,
-    shape: GQASplitKVTiledQShape,
+pub struct Compute {
+    config: Config,
+    shape: Shape,
     map: Kernel,
     reduce: Kernel,
 }
 
-impl GQASplitKVTiledQKernels {
-    pub fn new(device: &Device, config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config, shape: Shape) -> Self {
         shape.validate(config);
         assert!(
             config.map_threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
@@ -263,12 +263,8 @@ impl GQASplitKVTiledQKernels {
         }
     }
 
-    pub fn invoke_map<'a>(
-        &self,
-        buffers: GQASplitKVTiledQMapBuffers<'a>,
-        page_table_index: ReplayU32,
-    ) -> GQASplitKVTiledQMapInvocation<'a> {
-        GQASplitKVTiledQMapInvocation {
+    pub fn invoke_map<'a>(&self, buffers: MapBuffers<'a>, page_table_index: ReplayU32) -> MapInvocation<'a> {
+        MapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -282,13 +278,13 @@ impl GQASplitKVTiledQKernels {
 
     pub fn invoke_map_bucketed<'a>(
         &self,
-        buffers: GQASplitKVTiledQMapBuffers<'a>,
+        buffers: MapBuffers<'a>,
         page_table_index: ReplayU32,
         num_active_tokens: ReplayU32,
         num_active_q_token_tiles: ReplayU32,
         num_active_kv_splits: ReplayU32,
-    ) -> GQASplitKVTiledQMapInvocation<'a> {
-        GQASplitKVTiledQMapInvocation {
+    ) -> MapInvocation<'a> {
+        MapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -300,11 +296,8 @@ impl GQASplitKVTiledQKernels {
         }
     }
 
-    pub fn invoke_reduce<'a>(
-        &self,
-        buffers: GQASplitKVTiledQReduceBuffers<'a>,
-    ) -> GQASplitKVTiledQReduceInvocation<'a> {
-        GQASplitKVTiledQReduceInvocation {
+    pub fn invoke_reduce<'a>(&self, buffers: ReduceBuffers<'a>) -> ReduceInvocation<'a> {
+        ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -315,10 +308,10 @@ impl GQASplitKVTiledQKernels {
 
     pub fn invoke_reduce_bucketed<'a>(
         &self,
-        buffers: GQASplitKVTiledQReduceBuffers<'a>,
+        buffers: ReduceBuffers<'a>,
         num_active_q_token_tiles: ReplayU32,
-    ) -> GQASplitKVTiledQReduceInvocation<'a> {
-        GQASplitKVTiledQReduceInvocation {
+    ) -> ReduceInvocation<'a> {
+        ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -328,18 +321,18 @@ impl GQASplitKVTiledQKernels {
     }
 }
 
-pub struct GQASplitKVTiledQMapInvocation<'a> {
+pub struct MapInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: GQASplitKVTiledQConfig,
-    shape: GQASplitKVTiledQShape,
-    buffers: GQASplitKVTiledQMapBuffers<'a>,
+    config: Config,
+    shape: Shape,
+    buffers: MapBuffers<'a>,
     page_table_index: ReplayU32,
     num_active_tokens: ReplayU32,
     num_active_q_token_tiles: ReplayU32,
     num_active_kv_splits: ReplayU32,
 }
 
-impl Operator for GQASplitKVTiledQMapInvocation<'_> {
+impl Operator for MapInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let shape = self.shape;
         let config = self.config;
@@ -412,15 +405,15 @@ impl Operator for GQASplitKVTiledQMapInvocation<'_> {
     }
 }
 
-pub struct GQASplitKVTiledQReduceInvocation<'a> {
+pub struct ReduceInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: GQASplitKVTiledQConfig,
-    shape: GQASplitKVTiledQShape,
-    buffers: GQASplitKVTiledQReduceBuffers<'a>,
+    config: Config,
+    shape: Shape,
+    buffers: ReduceBuffers<'a>,
     num_active_q_token_tiles: ReplayU32,
 }
 
-impl Operator for GQASplitKVTiledQReduceInvocation<'_> {
+impl Operator for ReduceInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let shape = self.shape;
         let config = self.config;
@@ -456,7 +449,7 @@ impl Operator for GQASplitKVTiledQReduceInvocation<'_> {
     }
 }
 
-fn source(config: GQASplitKVTiledQConfig, shape: GQASplitKVTiledQShape) -> String {
+fn source(config: Config, shape: Shape) -> String {
     format!(
         r#"
 #define NUM_TOKENS {num_tokens}
@@ -507,5 +500,5 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 }
 
 #[cfg(test)]
-#[path = "gqa_split_kv_tiled_q_test.rs"]
+#[path = "tiled_q_test.rs"]
 mod tests;

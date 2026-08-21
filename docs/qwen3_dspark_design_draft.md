@@ -32,7 +32,7 @@ crates/inference-executor-core/src/
 
 crates/inference-backend-metal/src/components/
   dspark_markov_sampling.rs
-  gqa_block_attention.rs
+  gqa/block_sdpa.rs
   metal/dspark_markov_sampling.metal
   metal/gqa_block_sdpa.metal
 
@@ -331,7 +331,7 @@ sdpa_reduce = split_kv_single_q.invoke_reduce(...)
 The paged map processes accepted history in `[0, anchor_position)`.
 CPU metadata defines this causal extent for every local query.
 
-`GQABlockSDPAKernel` processes one request-local block.
+`gqa::block_sdpa::Compute` processes one request-local block.
 Every local query sees the anchor and all MASK positions in the same block.
 It cannot see another request's block.
 
@@ -343,7 +343,7 @@ partial exponential sum
 normalized partial output
 ```
 
-The existing `GQASplitKVSingleQReduce` combines all partials.
+The existing `gqa::split_kv::single_q::ReduceInvocation` combines all partials.
 The block kernel does not accept a configurable mask.
 
 The proposal pass computes local Q/K/V for the current block.
@@ -582,7 +582,7 @@ The current synchronous terminal-failure model does not require a second rollbac
 `inference-backend-metal` owns reusable Metal kernels:
 
 - Paged GQA map and reduce
-- `GQABlockSDPAKernel`
+- `gqa::block_sdpa::Compute`
 - Kernel validation
 - Metal resource binding
 - Dispatch
@@ -653,7 +653,7 @@ Reason: Both persistent values follow accepted Main history.
 
 ### Dedicated block attention
 
-Decision: Use the paged map for history and `GQABlockSDPAKernel` for local bidirectional attention.
+Decision: Use the paged map for history and `gqa::block_sdpa::Compute` for local bidirectional attention.
 
 Rejected direction: Add a configurable mask to the paged kernel.
 

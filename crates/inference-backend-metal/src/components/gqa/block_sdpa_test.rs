@@ -5,7 +5,7 @@ use crate::metal::Stream;
 
 #[test]
 fn test_constants_have_explicit_thread_block_scope() {
-    let config = GQABlockSDPAConfig {
+    let config = Config {
         block_size: 3,
         num_q_heads: 5,
         num_kv_heads: 1,
@@ -13,7 +13,7 @@ fn test_constants_have_explicit_thread_block_scope() {
         scale: 32.0_f32.sqrt().recip(),
         dtype: Dtype::Bfloat16,
     };
-    let constants = GQABlockSDPAKernelConstants::current(config);
+    let constants = KernelConstants::current(config);
     assert_eq!(constants.config, config);
     assert_eq!(constants.thread_block.required_threads, 32);
     assert_eq!(constants.thread_block.simdgroup_width, 32);
@@ -22,11 +22,11 @@ fn test_constants_have_explicit_thread_block_scope() {
 #[test]
 #[should_panic(expected = "complete request blocks")]
 fn test_block_shape_rejects_partial_request_block() {
-    GQABlockSDPAShape {
+    Shape {
         num_tokens: 10,
         num_total_sdpa_map_task_templates: 16,
     }
-    .validate(GQABlockSDPAConfig {
+    .validate(Config {
         block_size: 9,
         num_q_heads: 40,
         num_kv_heads: 8,
@@ -49,7 +49,7 @@ fn test_bf16_kernel_matches_request_block_bidirectional_reference() {
 fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, output_tolerance: f32) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = GQABlockSDPAConfig {
+    let config = Config {
         block_size: 3,
         num_q_heads: 5,
         num_kv_heads: 1,
@@ -57,7 +57,7 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
         scale: 32.0_f32.sqrt().recip(),
         dtype,
     };
-    let shape = GQABlockSDPAShape {
+    let shape = Shape {
         num_tokens: 6,
         num_total_sdpa_map_task_templates: 8,
     };
@@ -88,11 +88,11 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
     let partial_max_logits =
         Buffer::new_zeroed_elements(&device, config.partial_output_stat_elements(shape), Dtype::Float32);
     let partial_output = Buffer::new_zeroed_elements(&device, config.partial_output_values(shape), dtype);
-    let kernel = GQABlockSDPAKernel::new(&device, config);
+    let kernel = Compute::new(&device, config);
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
-        GQABlockSDPABuffers {
+        Buffers {
             q: &q,
             local_k: &local_k,
             local_v: &local_v,

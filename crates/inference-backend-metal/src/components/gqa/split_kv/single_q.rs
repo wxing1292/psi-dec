@@ -5,7 +5,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::components::assert_u32_count_domain;
 use crate::components::assert_u32_index_domain;
 use crate::components::checked_product;
-use crate::components::gqa_kv_page_write::GQAPageTableLayout;
+use crate::components::gqa::kv_page_write::PageTableLayout;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
@@ -14,9 +14,8 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
-const GQA_SPLIT_KV_SINGLE_Q_MAP_BODY: &str = include_str!("metal/gqa_split_kv_single_q_map.metal");
-const GQA_SPLIT_KV_SINGLE_Q_REDUCE_SOURCE: &str = include_str!("metal/gqa_split_kv_single_q_reduce.metal");
-const GQA_ACTIVATION_GATE_SOURCE: &str = include_str!("metal/gqa_activation_gate.metal");
+const MAP_SOURCE: &str = include_str!("../../metal/gqa_split_kv_single_q_map.metal");
+const REDUCE_SOURCE: &str = include_str!("../../metal/gqa_split_kv_single_q_reduce.metal");
 
 /// SplitKV SingleQ SDPA (`T` = tokens, `H` = heads, `D` = head width):
 ///
@@ -43,20 +42,20 @@ const GQA_ACTIVATION_GATE_SOURCE: &str = include_str!("metal/gqa_activation_gate
 /// It uses the shared three-`u32` TaskTemplate ABI. The complete task is
 /// derived from the template, grid coordinates, and specialization.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GQASplitKVSingleQConfig {
+pub struct Config {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub scale: f32,
     pub page_bytes: u32,
-    pub page_table_layout: GQAPageTableLayout,
+    pub page_table_layout: PageTableLayout,
     pub kv_tokens_per_iteration: u32,
     pub required_threads: u32,
     pub max_q_heads: u32,
     pub dtype: Dtype,
 }
 
-impl GQASplitKVSingleQConfig {
+impl Config {
     pub fn validate(self) {
         assert!(self.num_q_heads > 0);
         assert!(self.num_kv_heads > 0);
@@ -99,7 +98,7 @@ impl GQASplitKVSingleQConfig {
         self.q_heads_per_kv_head().div_ceil(self.max_q_heads)
     }
 
-    pub fn map_threads(self, shape: GQASplitKVSingleQShape) -> usize {
+    pub fn map_threads(self, shape: Shape) -> usize {
         checked_product(
             "GQA SDPA map thread count",
             &[
@@ -111,7 +110,7 @@ impl GQASplitKVSingleQConfig {
         )
     }
 
-    pub fn num_output_values(self, shape: GQASplitKVSingleQShape) -> usize {
+    pub fn num_output_values(self, shape: Shape) -> usize {
         checked_product(
             "GQA SDPA output element count",
             &[
@@ -122,7 +121,7 @@ impl GQASplitKVSingleQConfig {
         )
     }
 
-    pub fn num_sdpa_partial_output_stats(self, shape: GQASplitKVSingleQShape) -> usize {
+    pub fn num_sdpa_partial_output_stats(self, shape: Shape) -> usize {
         checked_product(
             "GQA SDPA partial-output statistic count",
             &[
@@ -132,13 +131,13 @@ impl GQASplitKVSingleQConfig {
         )
     }
 
-    pub fn num_partial_output_values(self, shape: GQASplitKVSingleQShape) -> usize {
+    pub fn num_partial_output_values(self, shape: Shape) -> usize {
         self.num_sdpa_partial_output_stats(shape)
             .checked_mul(self.head_dim as usize)
             .expect("GQA SDPA partial output element count must fit usize")
     }
 
-    pub fn q_bytes(self, shape: GQASplitKVSingleQShape) -> u64 {
+    pub fn q_bytes(self, shape: Shape) -> u64 {
         (self.num_output_values(shape) as u64)
             .checked_mul(self.dtype.item_size() as u64)
             .expect("GQA SDPA query byte length must fit u64")
@@ -148,7 +147,7 @@ impl GQASplitKVSingleQConfig {
         self.page_bytes as usize
     }
 
-    pub fn req_slots_bytes(self, shape: GQASplitKVSingleQShape) -> u64 {
+    pub fn req_slots_bytes(self, shape: Shape) -> u64 {
         (shape.num_total_tokens as u64)
             .checked_mul(size_of::<u32>() as u64)
             .expect("GQA SDPA request-slot byte length must fit u64")
@@ -158,27 +157,27 @@ impl GQASplitKVSingleQConfig {
         self.page_table_layout.bytes() as u64
     }
 
-    pub fn sdpa_map_task_templates_bytes(self, shape: GQASplitKVSingleQShape) -> u64 {
+    pub fn sdpa_map_task_templates_bytes(self, shape: Shape) -> u64 {
         (shape.num_total_sdpa_map_task_templates as u64)
             .checked_mul(3)
             .and_then(|count| count.checked_mul(size_of::<u32>() as u64))
             .expect("GQA SDPA map TaskTemplate byte length must fit u64")
     }
 
-    pub fn cu_sdpa_partial_outputs_bytes(self, shape: GQASplitKVSingleQShape) -> u64 {
+    pub fn cu_sdpa_partial_outputs_bytes(self, shape: Shape) -> u64 {
         (shape.num_total_tokens as u64)
             .checked_add(1)
             .and_then(|count| count.checked_mul(size_of::<u32>() as u64))
             .expect("GQA SDPA partial-output cumulative-count byte length must fit u64")
     }
 
-    pub fn partial_output_stats_bytes(self, shape: GQASplitKVSingleQShape) -> u64 {
+    pub fn partial_output_stats_bytes(self, shape: Shape) -> u64 {
         (self.num_sdpa_partial_output_stats(shape) as u64)
             .checked_mul(size_of::<f32>() as u64)
             .expect("GQA SDPA statistic byte length must fit u64")
     }
 
-    pub fn partial_output_bytes(self, shape: GQASplitKVSingleQShape) -> u64 {
+    pub fn partial_output_bytes(self, shape: Shape) -> u64 {
         (self.num_partial_output_values(shape) as u64)
             .checked_mul(self.dtype.item_size() as u64)
             .expect("GQA SDPA partial output byte length must fit u64")
@@ -186,13 +185,13 @@ impl GQASplitKVSingleQConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GQASplitKVSingleQShape {
+pub struct Shape {
     pub num_total_tokens: u32,
     pub num_total_sdpa_map_task_templates: u32,
 }
 
-impl GQASplitKVSingleQShape {
-    pub fn validate(self, config: GQASplitKVSingleQConfig) {
+impl Shape {
+    pub fn validate(self, config: Config) {
         config.validate();
         assert!(self.num_total_tokens > 0);
         assert!(self.num_total_sdpa_map_task_templates > 0);
@@ -207,7 +206,7 @@ impl GQASplitKVSingleQShape {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQASplitKVSingleQMapBuffers<'a> {
+pub struct MapBuffers<'a> {
     pub q: &'a Buffer,
     pub kv_pages: &'a Buffer,
     pub req_slots: &'a Buffer,
@@ -219,7 +218,7 @@ pub struct GQASplitKVSingleQMapBuffers<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct GQASplitKVSingleQReduceBuffers<'a> {
+pub struct ReduceBuffers<'a> {
     pub partial_exp_sums: &'a Buffer,
     pub partial_max_logits: &'a Buffer,
     pub partial_output: &'a Buffer,
@@ -227,14 +226,14 @@ pub struct GQASplitKVSingleQReduceBuffers<'a> {
     pub output: &'a Buffer,
 }
 
-pub struct GQASplitKVSingleQScratch {
+pub struct Scratch {
     pub partial_exp_sums: Buffer,
     pub partial_max_logits: Buffer,
     pub partial_output: Buffer,
 }
 
-impl GQASplitKVSingleQScratch {
-    pub fn new(device: &Device, config: GQASplitKVSingleQConfig, shape: GQASplitKVSingleQShape) -> Self {
+impl Scratch {
+    pub fn new(device: &Device, config: Config, shape: Shape) -> Self {
         shape.validate(config);
         Self {
             partial_exp_sums: Buffer::new_zeroed(device, config.partial_output_stats_bytes(shape)),
@@ -250,8 +249,8 @@ impl GQASplitKVSingleQScratch {
         req_slots: &'a Buffer,
         page_ids: &'a Buffer,
         sdpa_map_task_templates: &'a Buffer,
-    ) -> GQASplitKVSingleQMapBuffers<'a> {
-        GQASplitKVSingleQMapBuffers {
+    ) -> MapBuffers<'a> {
+        MapBuffers {
             q,
             kv_pages,
             req_slots,
@@ -263,12 +262,8 @@ impl GQASplitKVSingleQScratch {
         }
     }
 
-    pub fn reduce_buffers<'a>(
-        &'a self,
-        cu_sdpa_partial_outputs: &'a Buffer,
-        output: &'a Buffer,
-    ) -> GQASplitKVSingleQReduceBuffers<'a> {
-        GQASplitKVSingleQReduceBuffers {
+    pub fn reduce_buffers<'a>(&'a self, cu_sdpa_partial_outputs: &'a Buffer, output: &'a Buffer) -> ReduceBuffers<'a> {
+        ReduceBuffers {
             partial_exp_sums: &self.partial_exp_sums,
             partial_max_logits: &self.partial_max_logits,
             partial_output: &self.partial_output,
@@ -278,15 +273,15 @@ impl GQASplitKVSingleQScratch {
     }
 }
 
-pub struct GQASplitKVSingleQKernels {
-    config: GQASplitKVSingleQConfig,
-    shape: GQASplitKVSingleQShape,
+pub struct Compute {
+    config: Config,
+    shape: Shape,
     map: Kernel,
     reduce: Kernel,
 }
 
-impl GQASplitKVSingleQKernels {
-    pub fn new(device: &Device, config: GQASplitKVSingleQConfig, shape: GQASplitKVSingleQShape) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config, shape: Shape) -> Self {
         shape.validate(config);
         assert!(
             config.threadblock_memory_bytes() <= device.max_threadblock_memory_length(),
@@ -315,12 +310,8 @@ impl GQASplitKVSingleQKernels {
         }
     }
 
-    pub fn invoke_map<'a>(
-        &self,
-        buffers: GQASplitKVSingleQMapBuffers<'a>,
-        page_table_index: ReplayU32,
-    ) -> GQASplitKVSingleQMapInvocation<'a> {
-        GQASplitKVSingleQMapInvocation {
+    pub fn invoke_map<'a>(&self, buffers: MapBuffers<'a>, page_table_index: ReplayU32) -> MapInvocation<'a> {
+        MapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -333,12 +324,12 @@ impl GQASplitKVSingleQKernels {
 
     pub fn invoke_map_bucketed<'a>(
         &self,
-        buffers: GQASplitKVSingleQMapBuffers<'a>,
+        buffers: MapBuffers<'a>,
         page_table_index: ReplayU32,
         num_active_tokens: ReplayU32,
         num_active_kv_splits: ReplayU32,
-    ) -> GQASplitKVSingleQMapInvocation<'a> {
-        GQASplitKVSingleQMapInvocation {
+    ) -> MapInvocation<'a> {
+        MapInvocation {
             pipeline: self.map.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -349,11 +340,8 @@ impl GQASplitKVSingleQKernels {
         }
     }
 
-    pub fn invoke_reduce<'a>(
-        &self,
-        buffers: GQASplitKVSingleQReduceBuffers<'a>,
-    ) -> GQASplitKVSingleQReduceInvocation<'a> {
-        GQASplitKVSingleQReduceInvocation {
+    pub fn invoke_reduce<'a>(&self, buffers: ReduceBuffers<'a>) -> ReduceInvocation<'a> {
+        ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -364,10 +352,10 @@ impl GQASplitKVSingleQKernels {
 
     pub fn invoke_reduce_bucketed<'a>(
         &self,
-        buffers: GQASplitKVSingleQReduceBuffers<'a>,
+        buffers: ReduceBuffers<'a>,
         num_active_tokens: ReplayU32,
-    ) -> GQASplitKVSingleQReduceInvocation<'a> {
-        GQASplitKVSingleQReduceInvocation {
+    ) -> ReduceInvocation<'a> {
+        ReduceInvocation {
             pipeline: self.reduce.as_raw_retained(),
             config: self.config,
             shape: self.shape,
@@ -377,171 +365,9 @@ impl GQASplitKVSingleQKernels {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GQAActivationGateConfig {
-    pub num_q_heads: u32,
-    pub head_dim: u32,
-    pub dtype: Dtype,
-}
-
-impl GQAActivationGateConfig {
-    pub fn f32(num_q_heads: u32, head_dim: u32) -> Self {
-        Self {
-            num_q_heads,
-            head_dim,
-            dtype: Dtype::Float32,
-        }
-    }
-
-    pub fn bf16(num_q_heads: u32, head_dim: u32) -> Self {
-        Self {
-            num_q_heads,
-            head_dim,
-            dtype: Dtype::Bfloat16,
-        }
-    }
-
-    pub fn validate(self) {
-        assert!(self.num_q_heads > 0);
-        assert!(self.head_dim > 0);
-        assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
-    }
-
-    pub fn num_values(self, shape: GQAActivationGateShape) -> usize {
-        checked_product(
-            "GQA activation/gate element count",
-            &[
-                shape.num_total_tokens as usize,
-                self.num_q_heads as usize,
-                self.head_dim as usize,
-            ],
-        )
-    }
-
-    pub fn bytes(self, shape: GQAActivationGateShape) -> usize {
-        self.num_values(shape)
-            .checked_mul(self.dtype.item_size())
-            .expect("GQA activation/gate byte length must fit usize")
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GQAActivationGateShape {
-    pub num_total_tokens: u32,
-}
-
-impl GQAActivationGateShape {
-    pub fn validate(self, config: GQAActivationGateConfig) {
-        config.validate();
-        assert!(self.num_total_tokens > 0);
-        assert_u32_count_domain(config.num_values(self), "GQA activation/gate");
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct GQAActivationGateBuffers<'a> {
-    pub attention_output: &'a Buffer,
-    pub g: &'a Buffer,
-    pub output: &'a Buffer,
-}
-
-pub struct GQAActivationGateKernel {
-    config: GQAActivationGateConfig,
-    kernel: Kernel,
-}
-
-impl GQAActivationGateKernel {
-    pub fn new(device: &Device, config: GQAActivationGateConfig) -> Self {
-        config.validate();
-        let source = activation_gate_source(config);
-        let function_name = match config.dtype {
-            Dtype::Float32 => "gqa_activation_gate_f32",
-            Dtype::Bfloat16 => "gqa_activation_gate_bf16",
-            dtype => panic!("unsupported GQA activation gate dtype {dtype:?}"),
-        };
-        Self {
-            config,
-            kernel: Kernel::new(device, &source, function_name),
-        }
-    }
-
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GQAActivationGateShape,
-        buffers: GQAActivationGateBuffers<'a>,
-    ) -> GQAActivationGateInvocation<'a> {
-        GQAActivationGateInvocation {
-            config: self.config,
-            kernel: &self.kernel,
-            shape,
-            buffers,
-            num_active_tokens: ReplayU32::Fixed(shape.num_total_tokens),
-        }
-    }
-
-    pub fn invoke_bucketed<'a>(
-        &'a self,
-        shape: GQAActivationGateShape,
-        buffers: GQAActivationGateBuffers<'a>,
-        num_active_tokens: ReplayU32,
-    ) -> GQAActivationGateInvocation<'a> {
-        GQAActivationGateInvocation {
-            config: self.config,
-            kernel: &self.kernel,
-            shape,
-            buffers,
-            num_active_tokens,
-        }
-    }
-}
-
-fn activation_gate_source(config: GQAActivationGateConfig) -> String {
-    let constants = format!(
-        "using namespace metal;\n\nconstant uint num_q_heads = {}u;\nconstant uint head_dim = {}u;",
-        config.num_q_heads, config.head_dim,
-    );
-    GQA_ACTIVATION_GATE_SOURCE.replacen("using namespace metal;", &constants, 1)
-}
-
-pub struct GQAActivationGateInvocation<'a> {
-    config: GQAActivationGateConfig,
-    kernel: &'a Kernel,
-    shape: GQAActivationGateShape,
-    buffers: GQAActivationGateBuffers<'a>,
-    num_active_tokens: ReplayU32,
-}
-
-impl Operator for GQAActivationGateInvocation<'_> {
-    fn record(self, recorder: &CommandRecorder<'_>) {
-        self.validate();
-        let shape = self.shape;
-        recorder.set_kernel(self.kernel);
-        recorder.set_buffer_read(0, self.buffers.attention_output, 0);
-        recorder.set_buffer_read(1, self.buffers.g, 0);
-        recorder.set_buffer_write(2, self.buffers.output, 0);
-        set_replay_u32(
-            recorder,
-            3,
-            self.num_active_tokens,
-            shape.num_total_tokens,
-            "GQA activation-gate active token count",
-        );
-        recorder.dispatch_1d(self.config.num_values(shape), 256);
-    }
-}
-
-impl GQAActivationGateInvocation<'_> {
-    fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.attention_output.len_bytes() >= self.config.bytes(self.shape));
-        assert!(self.buffers.g.len_bytes() >= self.config.bytes(self.shape));
-        assert!(self.buffers.output.len_bytes() >= self.config.bytes(self.shape));
-    }
-}
-
-fn gqa_split_kv_single_q_map_source(config: GQASplitKVSingleQConfig, shape: GQASplitKVSingleQShape) -> String {
+fn gqa_split_kv_single_q_map_source(config: Config, shape: Shape) -> String {
     let dtype = metal_dtype_name(config.dtype);
-    let body = GQA_SPLIT_KV_SINGLE_Q_MAP_BODY
+    let body = MAP_SOURCE
         .replace("uint global_thread_index = thread_position_in_grid.x;\n", "")
         .replace(
             "int num_blocks = page_table_layout[2];",
@@ -618,17 +444,17 @@ fn metal_dtype_name(dtype: Dtype) -> &'static str {
     }
 }
 
-pub struct GQASplitKVSingleQMapInvocation<'a> {
+pub struct MapInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: GQASplitKVSingleQConfig,
-    shape: GQASplitKVSingleQShape,
-    buffers: GQASplitKVSingleQMapBuffers<'a>,
+    config: Config,
+    shape: Shape,
+    buffers: MapBuffers<'a>,
     page_table_index: ReplayU32,
     num_active_tokens: ReplayU32,
     num_active_kv_splits: ReplayU32,
 }
 
-impl Operator for GQASplitKVSingleQMapInvocation<'_> {
+impl Operator for MapInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
@@ -670,7 +496,7 @@ impl Operator for GQASplitKVSingleQMapInvocation<'_> {
     }
 }
 
-impl GQASplitKVSingleQMapInvocation<'_> {
+impl MapInvocation<'_> {
     fn validate(&self) {
         self.shape.validate(self.config);
         assert!(self.buffers.q.len_bytes_u64() >= self.config.q_bytes(self.shape));
@@ -687,15 +513,15 @@ impl GQASplitKVSingleQMapInvocation<'_> {
     }
 }
 
-pub struct GQASplitKVSingleQReduceInvocation<'a> {
+pub struct ReduceInvocation<'a> {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    config: GQASplitKVSingleQConfig,
-    shape: GQASplitKVSingleQShape,
-    buffers: GQASplitKVSingleQReduceBuffers<'a>,
+    config: Config,
+    shape: Shape,
+    buffers: ReduceBuffers<'a>,
     num_active_tokens: ReplayU32,
 }
 
-impl Operator for GQASplitKVSingleQReduceInvocation<'_> {
+impl Operator for ReduceInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.validate();
         let shape = self.shape;
@@ -727,7 +553,7 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
     }
 }
 
-impl GQASplitKVSingleQReduceInvocation<'_> {
+impl ReduceInvocation<'_> {
     fn validate(&self) {
         self.shape.validate(self.config);
         assert!(self.buffers.partial_exp_sums.len_bytes_u64() >= self.config.partial_output_stats_bytes(self.shape));
@@ -741,14 +567,14 @@ impl GQASplitKVSingleQReduceInvocation<'_> {
     }
 }
 
-fn gqa_split_kv_single_q_reduce_source(config: GQASplitKVSingleQConfig) -> String {
+fn gqa_split_kv_single_q_reduce_source(config: Config) -> String {
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_q_heads = {}u;\nconstant uint head_dim = {}u;",
         config.num_q_heads, config.head_dim,
     );
-    GQA_SPLIT_KV_SINGLE_Q_REDUCE_SOURCE.replacen("using namespace metal;", &constants, 1)
+    REDUCE_SOURCE.replacen("using namespace metal;", &constants, 1)
 }
 
 #[cfg(test)]
-#[path = "gqa_split_kv_single_q_test.rs"]
+#[path = "single_q_test.rs"]
 mod tests;

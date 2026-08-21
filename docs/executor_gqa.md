@@ -59,18 +59,20 @@ crates/inference-executor-metal/src/model/qwen/
 crates/inference-backend-metal/src/components/
   gqa/
     mod.rs                  backend GQA component module root
+    activation_gate.rs      attention-output gate component
+    block_sdpa.rs           dense bidirectional block-SDPA partial component
+    block_sdpa_test.rs      block-SDPA Metal parity contracts
+    kv_page_write.rs        KV page-write component
+    qgkv_split.rs           gated QGKV split component
+    qkv_split.rs            ungated QKV split component
     sdpa.rs                 backend-owned SDPA variant registry, constants, and capability checks
-  gqa_split_kv_single_q.rs  reusable Metal SplitKV SingleQ and activation-gate kernels
-  gqa_split_kv_single_q_test.rs
-                            SplitKV SingleQ Metal parity and replay contracts
-  gqa_split_kv_tiled_q.rs   reusable Metal SplitKV TiledQ component kernels
-  gqa_split_kv_tiled_q_test.rs
-                            SplitKV TiledQ Metal parity and padded replay contracts
-  gqa_block_attention.rs    reusable dense bidirectional block-SDPA partial kernel
-  gqa_qgkv_split.rs         gated QGKV split component
-  gqa_qkv_split.rs          ungated QKV split component
+    split_kv/
+      mod.rs                SplitKV component module root
+      single_q.rs           SplitKV SingleQ Map/Reduce component
+      single_q_test.rs      SplitKV SingleQ Metal parity and replay contracts
+      tiled_q.rs            SplitKV TiledQ Map/Reduce component
+      tiled_q_test.rs       SplitKV TiledQ Metal parity and padded replay contracts
   rms_norm_rope.rs          reusable Metal head-row RMSNorm/RoPE component
-  gqa_kv_page_write.rs      reusable Metal KV page-write component
   metal/
     gqa_qgkv_split.metal       gated QGKV split source
     gqa_qkv_split.metal        ungated QKV split source
@@ -241,7 +243,7 @@ The SplitKV `SingleQ` map also permits an invalid-Q-token-range `SDPAMapTaskTemp
 range. This template does not write a history partial output for that slot.
 
 A caller may populate the reserved max-logit, exp-sum, and normalized `SDPAPartialOutput` through
-`GQABlockSDPAKernel`. It does this before it invokes the unchanged partial-output reducer.
+`gqa::block_sdpa::Compute`. It does this before it invokes the unchanged partial-output reducer.
 
 This generic composition supports an attention connection that combines SplitKV history with a dense bidirectional
 local block. The backend component does not own model-specific proposal or cache semantics.
@@ -349,13 +351,14 @@ token count as a replay argument.
 The common kernel source-hash cache reuses identical generated pipelines. This compilation does not introduce
 model-specific backend types or names.
 
-Recording materializes the replay-specific `GQASplitKVSingleQKernels` or `GQASplitKVTiledQKernels`. The recorded invocation
-retains its Metal pipelines. The GQA owner must not add a second pipeline cache.
+Recording materializes the replay-specific `gqa::split_kv::single_q::Compute` or
+`gqa::split_kv::tiled_q::Compute`. The recorded invocation retains its Metal pipelines. The GQA owner must not add a
+second pipeline cache.
 
 SplitKV `SingleQ` exposes static geometry and tuning separately from dynamic replay work:
 
 ```text
-GQASplitKVSingleQConfig              GQASplitKVSingleQShape
+gqa::split_kv::single_q::Config      gqa::split_kv::single_q::Shape
   num_q_heads                     num_total_tokens
   num_kv_heads                    num_total_sdpa_map_task_templates
   head_dim
@@ -429,10 +432,10 @@ defines the stage order and buffer dependencies.
 KV page write uses the same model KV dtype as projection scratch and SplitKV. The component derives its page stride
 and `num_tokens_per_page` with that dtype.
 
-The Metal component selects the matching bf16/f32 update kernel. `GQAKVPageWriteConfig` owns the stable
+The Metal component selects the matching bf16/f32 update kernel. `gqa::kv_page_write::Config` owns the stable
 `num_kv_heads`, `head_dim`, `page_bytes`, dtype, and derived tokens-per-page.
 
-`GQAKVPageWriteKernelConstants` contains this compile-time config and thread-block constants that require
+The private `gqa::kv_page_write::KernelConstants` contains this compile-time config and thread-block constants that require
 256 threads. One thread owns one flattened `(token write, KV head, head-dimension)` value. The dispatch grid and active
 token-write count remain invocation data.
 
@@ -937,14 +940,14 @@ Explicit component barriers and backend-inferred buffer hazards provide the requ
 Focused backend and component tests provide part of the correctness coverage. Qwen wiring and model tests provide the
 remaining coverage.
 
-`gqa_split_kv_single_q_test.rs` compares SplitKV SingleQ with the CPU projected-GQA reference. It uses fixed input,
+`gqa/split_kv/single_q_test.rs` compares SplitKV SingleQ with the CPU projected-GQA reference. It uses fixed input,
 random input, and a
 random ragged batch.
 
 Another case uses one KV split that spans multiple KV iterations. The cases validate compact KV-split indexing,
 online-softmax iteration merging, request slots, page-table lookup, and causal visibility.
 
-`gqa_split_kv_tiled_q_test.rs` compares the BF16 SplitKV TiledQ map and reduce variant with the same CPU reference. One
+`gqa/split_kv/tiled_q_test.rs` compares the BF16 SplitKV TiledQ map and reduce variant with the same CPU reference. One
 bucketed replay
 executes `5 -> 8 -> 5` active tokens. The test poisons inactive query, KV, request-slot, and token-index inputs. It checks
 the active output and verifies that inactive partial-output, statistic, and final-output tails remain unchanged.
@@ -962,13 +965,14 @@ cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
 The GQA backend bench records SplitKV SingleQ building blocks only in Metal replay/ICB paths. GQA Metal code does not
 benchmark or expose direct-submit component or forward wiring.
 
-`gqa_block_attn` records only `GQABlockSDPAKernel`.
+`gqa_block_attn` records only `gqa::block_sdpa::Compute`.
 It measures the dense block-bidirectional map contribution used by DSpark.
 It does not measure history attention, partial reduction, projections, or a DSpark layer.
 
 One block-SDPA Task owns one Q token and one Q head.
 The backend uses one 32-thread SIMDgroup for the Task.
-`GQABlockSDPAKernelConstants` contains the stable SDPA config and its thread-block constants. The constants require 32
+The private `gqa::block_sdpa::KernelConstants` contains the stable SDPA config and its thread-block constants. The
+constants require 32
 threads and a 32-thread SIMDgroup. The generated source no longer declares an unused
 `num_threads_per_threadblock` constant.
 For `head_dim=128`, each thread keeps four F32 Q values and one dot-product accumulator.
@@ -1077,7 +1081,8 @@ norm+RoPE, KV page write, SplitKV, activation gate, and output projection.
 Do not compare component-only SplitKV timings with full-forward numbers.
 
 Subcomponent probes use the same request-slot/page-table capacity contract as full-forward replay. Multi-request
-`kv-page-write` probes must pass the true `num_req_slots` through the page-table layout in `GQAKVPageWriteShape`.
+`kv-page-write` probes must pass the true `num_req_slots` through the page-table layout in
+`gqa::kv_page_write::Shape`.
 
 Do not hard-code one request slot. That value under-validates the page-table contract, even if the kernel reads the
 larger backing buffer.

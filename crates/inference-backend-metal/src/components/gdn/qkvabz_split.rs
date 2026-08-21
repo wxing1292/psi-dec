@@ -9,7 +9,7 @@ use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
-const GDN_QKVABZ_SPLIT_SOURCE: &str = include_str!("metal/gdn_qkvabz_split.metal");
+const SOURCE: &str = include_str!("../metal/gdn_qkvabz_split.metal");
 
 /// Projection-split tensor contract:
 ///
@@ -27,13 +27,13 @@ const GDN_QKVABZ_SPLIT_SOURCE: &str = include_str!("metal/gdn_qkvabz_split.metal
 /// `C` names only this concatenated channel axis, not a head axis or a
 /// convolution-kernel extent.
 #[derive(Clone, Copy, Debug)]
-pub struct GDNQKVABZSplitConfig {
+pub struct Config {
     pub qkv_dim: u32,
     pub num_v_heads: u32,
     pub v_dim: u32,
 }
 
-impl GDNQKVABZSplitConfig {
+impl Config {
     pub fn new(qkv_dim: u32, num_v_heads: u32, v_dim: u32) -> Self {
         Self {
             qkv_dim,
@@ -49,28 +49,28 @@ impl GDNQKVABZSplitConfig {
         self.qkvabz_row_stride();
     }
 
-    pub fn num_qkvabz_values(self, shape: GDNQKVABZSplitShape) -> usize {
+    pub fn num_qkvabz_values(self, shape: Shape) -> usize {
         checked_product(
             "GDN projection element count",
             &[shape.num_total_tokens as usize, self.qkvabz_row_stride() as usize],
         )
     }
 
-    pub fn num_qkv_values(self, shape: GDNQKVABZSplitShape) -> usize {
+    pub fn num_qkv_values(self, shape: Shape) -> usize {
         checked_product(
             "GDN QKV element count",
             &[shape.num_total_tokens as usize, self.qkv_dim as usize],
         )
     }
 
-    pub fn num_gate_values(self, shape: GDNQKVABZSplitShape) -> usize {
+    pub fn num_gate_values(self, shape: Shape) -> usize {
         checked_product(
             "GDN gate element count",
             &[shape.num_total_tokens as usize, self.num_v_heads as usize],
         )
     }
 
-    pub fn num_z_values(self, shape: GDNQKVABZSplitShape) -> usize {
+    pub fn num_z_values(self, shape: Shape) -> usize {
         checked_product(
             "GDN Z element count",
             &[shape.num_total_tokens as usize, self.v_dim as usize],
@@ -87,19 +87,19 @@ impl GDNQKVABZSplitConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct GDNQKVABZSplitShape {
+pub struct Shape {
     pub num_total_tokens: u32,
 }
 
-impl GDNQKVABZSplitShape {
-    pub fn validate(self, config: GDNQKVABZSplitConfig) {
+impl Shape {
+    pub fn validate(self, config: Config) {
         config.validate();
         assert!(self.num_total_tokens > 0);
         assert_u32_count_domain(config.num_qkvabz_values(self), "GDN projection elements");
     }
 }
 
-pub struct GDNQKVABZSplitBuffers<'a> {
+pub struct Buffers<'a> {
     pub qkvabz: &'a Buffer,
     pub qkv: &'a Buffer,
     pub a: &'a Buffer,
@@ -107,26 +107,22 @@ pub struct GDNQKVABZSplitBuffers<'a> {
     pub z: &'a Buffer,
 }
 
-pub struct GDNQKVABZSplitKernel {
-    config: GDNQKVABZSplitConfig,
+pub struct Compute {
+    config: Config,
     kernel: Kernel,
 }
 
-impl GDNQKVABZSplitKernel {
-    pub fn new(device: &Device, config: GDNQKVABZSplitConfig) -> Self {
+impl Compute {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
-            kernel: Kernel::new(device, GDN_QKVABZ_SPLIT_SOURCE, "gdn_qkvabz_split_f32"),
+            kernel: Kernel::new(device, SOURCE, "gdn_qkvabz_split_f32"),
         }
     }
 
-    pub fn invoke<'a>(
-        &'a self,
-        shape: GDNQKVABZSplitShape,
-        buffers: GDNQKVABZSplitBuffers<'a>,
-    ) -> GDNQKVABZSplitInvocation<'a> {
-        GDNQKVABZSplitInvocation {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+        Invocation {
             config: self.config,
             kernel: &self.kernel,
             shape,
@@ -137,11 +133,11 @@ impl GDNQKVABZSplitKernel {
 
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: GDNQKVABZSplitShape,
-        buffers: GDNQKVABZSplitBuffers<'a>,
+        shape: Shape,
+        buffers: Buffers<'a>,
         num_active_tokens: ReplayU32,
-    ) -> GDNQKVABZSplitInvocation<'a> {
-        GDNQKVABZSplitInvocation {
+    ) -> Invocation<'a> {
+        Invocation {
             config: self.config,
             kernel: &self.kernel,
             shape,
@@ -151,15 +147,15 @@ impl GDNQKVABZSplitKernel {
     }
 }
 
-pub struct GDNQKVABZSplitInvocation<'a> {
-    config: GDNQKVABZSplitConfig,
+pub struct Invocation<'a> {
+    config: Config,
     kernel: &'a Kernel,
-    shape: GDNQKVABZSplitShape,
-    buffers: GDNQKVABZSplitBuffers<'a>,
+    shape: Shape,
+    buffers: Buffers<'a>,
     num_active_tokens: ReplayU32,
 }
 
-impl Operator for GDNQKVABZSplitInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         self.shape.validate(self.config);
         validate_qkvabz_split_buffers(self.config, self.shape, &self.buffers);
@@ -194,11 +190,7 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
     }
 }
 
-fn validate_qkvabz_split_buffers(
-    config: GDNQKVABZSplitConfig,
-    shape: GDNQKVABZSplitShape,
-    buffers: &GDNQKVABZSplitBuffers<'_>,
-) {
+fn validate_qkvabz_split_buffers(config: Config, shape: Shape, buffers: &Buffers<'_>) {
     assert!(
         buffers.qkvabz.len_bytes()
             >= checked_product("GDN qkvabz input", &[config.num_qkvabz_values(shape), size_of::<f32>()])
@@ -231,20 +223,20 @@ mod tests {
     fn test_fixed() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = GDNQKVABZSplitConfig::new(6, 2, 4);
-        let shape = GDNQKVABZSplitShape { num_total_tokens: 2 };
+        let config = Config::new(6, 2, 4);
+        let shape = Shape { num_total_tokens: 2 };
         let qkvabz_values = (0..28).map(|value| value as f32).collect::<Vec<_>>();
         let qkvabz = Buffer::from_slice(&device, &qkvabz_values);
         let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
         let a = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
         let b = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
         let z = Buffer::new_zeroed_elements(&device, config.num_z_values(shape), Dtype::Float32);
-        let kernel = GDNQKVABZSplitKernel::new(&device, config);
+        let kernel = Compute::new(&device, config);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
-            GDNQKVABZSplitBuffers {
+            Buffers {
                 qkvabz: &qkvabz,
                 qkv: &qkv,
                 a: &a,
@@ -276,18 +268,18 @@ mod tests {
     fn test_bucketed_replay_preserves_inactive_output_tail() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = GDNQKVABZSplitConfig::new(2, 1, 2);
-        let shape = GDNQKVABZSplitShape { num_total_tokens: 2 };
+        let config = Config::new(2, 1, 2);
+        let shape = Shape { num_total_tokens: 2 };
         let qkvabz = Buffer::new_zeroed_elements(&device, config.num_qkvabz_values(shape), Dtype::Float32);
         let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
         let a = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
         let b = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
         let z = Buffer::new_zeroed_elements(&device, config.num_z_values(shape), Dtype::Float32);
-        let kernel = GDNQKVABZSplitKernel::new(&device, config);
+        let kernel = Compute::new(&device, config);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_bucketed(
             shape,
-            GDNQKVABZSplitBuffers {
+            Buffers {
                 qkvabz: &qkvabz,
                 qkv: &qkv,
                 a: &a,
@@ -358,9 +350,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "GDN projection elements exceeds the shader u32 count domain")]
     fn test_shape_rejects_shader_count_overflow() {
-        GDNQKVABZSplitShape {
+        Shape {
             num_total_tokens: 1 << 30,
         }
-        .validate(GDNQKVABZSplitConfig::new(1, 1, 1));
+        .validate(Config::new(1, 1, 1));
     }
 }
