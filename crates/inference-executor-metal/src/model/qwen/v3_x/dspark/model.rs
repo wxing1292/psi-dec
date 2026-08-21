@@ -3,6 +3,7 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
@@ -239,8 +240,13 @@ impl Qwen3xDSparkModel {
                 },
             );
         }
-        self.final_norm
-            .record_with_barrier(recorder, args.num_tokens, hidden, args.hidden_output);
+        self.final_norm.record_with_barrier(
+            recorder,
+            args.num_tokens,
+            ReplayU32::Fixed(args.num_tokens),
+            hidden,
+            args.hidden_output,
+        );
         args.hidden_output
     }
 }

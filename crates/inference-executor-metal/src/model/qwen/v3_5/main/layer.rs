@@ -5,7 +5,6 @@ use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
@@ -195,11 +194,11 @@ impl Qwen35MainLayer {
         self.mlp.replay_topology_boundaries()
     }
 
-    pub fn record_bucketed<'a, R>(
+    pub fn record<'a, R>(
         &'a self,
         recorder: &mut R,
         num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
+        num_active_tokens: ReplayU32,
         input: Qwen35MainLayerInput<'a>,
     ) -> &'a Buffer
     where
@@ -220,33 +219,33 @@ impl Qwen35MainLayer {
             },
             Qwen35MainAttention::GDN(_) => Qwen35MainAttentionInput::GDN { metadata: input.gdn },
         };
-        self.input_norm.record_bucketed_with_barrier(
+        self.input_norm.record_with_barrier(
             recorder,
             num_total_tokens,
-            num_active_tokens_key,
+            num_active_tokens,
             input.residual_input,
             &self.scratch.normalized_hidden,
         );
-        self.attention.record_bucketed(
+        self.attention.record(
             recorder,
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             attention_input,
-            num_active_tokens_key,
+            num_active_tokens,
         );
-        self.residual_add.record_bucketed(
+        self.residual_add.record(
             recorder,
             num_total_tokens,
             hidden_dim,
-            num_active_tokens_key,
+            num_active_tokens,
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record_bucketed_with_barrier(
+        self.post_attention_norm.record_with_barrier(
             recorder,
             num_total_tokens,
-            num_active_tokens_key,
+            num_active_tokens,
             &self.scratch.post_attention_hidden,
             &self.scratch.normalized_hidden,
         );
@@ -255,15 +254,15 @@ impl Qwen35MainLayer {
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             num_total_tokens,
-            ReplayU32::Parameter(num_active_tokens_key),
+            num_active_tokens,
         );
         match input.residual_capture_dest {
             Some(capture) => {
-                self.residual_add.record_bucketed_with_capture(
+                self.residual_add.record_with_capture(
                     recorder,
                     num_total_tokens,
                     hidden_dim,
-                    num_active_tokens_key,
+                    num_active_tokens,
                     &self.scratch.post_attention_hidden,
                     &self.scratch.branch_output,
                     input.residual_output,
@@ -271,11 +270,11 @@ impl Qwen35MainLayer {
                 )
             },
             None => {
-                self.residual_add.record_bucketed(
+                self.residual_add.record(
                     recorder,
                     num_total_tokens,
                     hidden_dim,
-                    num_active_tokens_key,
+                    num_active_tokens,
                     &self.scratch.post_attention_hidden,
                     &self.scratch.branch_output,
                     input.residual_output,
@@ -294,71 +293,13 @@ impl ReplayLayer for Qwen35MainLayer {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_values = self.scratch.residual_values(input.num_tokens);
-        let attention_input = match &self.attention {
-            Qwen35MainAttention::GQA(_) => {
-                Qwen35MainAttentionInput::GQA {
-                    metadata: input.gqa,
-                    pages: input.pages,
-                }
-            },
-            Qwen35MainAttention::GDN(_) => Qwen35MainAttentionInput::GDN { metadata: input.gdn },
-        };
-        self.input_norm.record_with_barrier(
+        Qwen35MainLayer::record(
+            self,
             recorder,
-            input.num_tokens,
-            input.residual_input,
-            &self.scratch.normalized_hidden,
-        );
-        self.attention.record(
-            recorder,
-            &self.scratch.normalized_hidden,
-            &self.scratch.branch_output,
-            attention_input,
-        );
-        self.residual_add.record(
-            recorder,
-            num_values,
-            input.residual_input,
-            &self.scratch.branch_output,
-            &self.scratch.post_attention_hidden,
-        );
-        self.post_attention_norm.record_with_barrier(
-            recorder,
-            input.num_tokens,
-            &self.scratch.post_attention_hidden,
-            &self.scratch.normalized_hidden,
-        );
-        self.mlp.record(
-            recorder,
-            &self.scratch.normalized_hidden,
-            &self.scratch.branch_output,
             input.num_tokens,
             ReplayU32::Fixed(input.num_tokens),
-        );
-        match input.residual_capture_dest {
-            Some(capture) => {
-                self.residual_add.record_with_capture(
-                    recorder,
-                    input.num_tokens,
-                    self.scratch.hidden_dim(),
-                    &self.scratch.post_attention_hidden,
-                    &self.scratch.branch_output,
-                    input.residual_output,
-                    capture,
-                )
-            },
-            None => {
-                self.residual_add.record(
-                    recorder,
-                    num_values,
-                    &self.scratch.post_attention_hidden,
-                    &self.scratch.branch_output,
-                    input.residual_output,
-                )
-            },
-        }
-        input.residual_output
+            input,
+        )
     }
 }
 
@@ -445,62 +386,16 @@ impl Qwen35MainAttention {
         input: &'a Buffer,
         output: &'a Buffer,
         metadata: Qwen35MainAttentionInput<'a>,
+        num_active_tokens: ReplayU32,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         match (self, metadata) {
             (Self::GQA(component), Qwen35MainAttentionInput::GQA { metadata, pages }) => {
-                component.record(
-                    recorder,
-                    input,
-                    output,
-                    pages,
-                    metadata,
-                    ReplayU32::Fixed(metadata.replay_shape().num_tokens),
-                )
+                component.record(recorder, input, output, pages, metadata, num_active_tokens)
             },
             (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
-                component.record(
-                    recorder,
-                    input,
-                    output,
-                    metadata,
-                    ReplayU32::Fixed(metadata.replay_shape().num_tokens),
-                )
-            },
-            _ => panic!("qwen3.5 attention component and metadata must have the same kind"),
-        }
-    }
-
-    fn record_bucketed<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        input: &'a Buffer,
-        output: &'a Buffer,
-        metadata: Qwen35MainAttentionInput<'a>,
-        num_active_tokens_key: ReplayParameterKey,
-    ) where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        match (self, metadata) {
-            (Self::GQA(component), Qwen35MainAttentionInput::GQA { metadata, pages }) => {
-                component.record(
-                    recorder,
-                    input,
-                    output,
-                    pages,
-                    metadata,
-                    ReplayU32::Parameter(num_active_tokens_key),
-                )
-            },
-            (Self::GDN(component), Qwen35MainAttentionInput::GDN { metadata }) => {
-                component.record(
-                    recorder,
-                    input,
-                    output,
-                    metadata,
-                    ReplayU32::Parameter(num_active_tokens_key),
-                )
+                component.record(recorder, input, output, metadata, num_active_tokens)
             },
             _ => panic!("qwen3.5 attention component and metadata must have the same kind"),
         }

@@ -177,10 +177,10 @@ impl Qwen3xDSparkLayer {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_values = self.scratch.residual_values(input.num_tokens);
         self.input_norm.record_with_barrier(
             recorder,
             input.num_tokens,
+            ReplayU32::Fixed(input.num_tokens),
             input.residual_input,
             &self.scratch.normalized_hidden,
         );
@@ -193,7 +193,9 @@ impl Qwen3xDSparkLayer {
         );
         self.residual_add.record(
             recorder,
-            num_values,
+            input.num_tokens,
+            self.scratch.hidden_dim,
+            ReplayU32::Fixed(input.num_tokens),
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
@@ -201,6 +203,7 @@ impl Qwen3xDSparkLayer {
         self.post_attention_norm.record_with_barrier(
             recorder,
             input.num_tokens,
+            ReplayU32::Fixed(input.num_tokens),
             &self.scratch.post_attention_hidden,
             &self.scratch.normalized_hidden,
         );
@@ -213,7 +216,9 @@ impl Qwen3xDSparkLayer {
         );
         self.residual_add.record(
             recorder,
-            num_values,
+            input.num_tokens,
+            self.scratch.hidden_dim,
+            ReplayU32::Fixed(input.num_tokens),
             &self.scratch.post_attention_hidden,
             &self.scratch.branch_output,
             input.residual_output,

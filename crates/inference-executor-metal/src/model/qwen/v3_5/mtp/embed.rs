@@ -5,6 +5,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_backend_metal::operators::bf16_concat_rows;
 use inference_executor_core::backend::recorder::Recorder;
@@ -14,13 +15,10 @@ use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MTPEmbedWei
 use inference_executor_core::replay::ReplayBucketPolicy;
 
 use crate::checkpoint::SafeTensorStore;
-#[cfg(test)]
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
-use crate::model::embedding::EmbedBucketedInput;
-#[cfg(test)]
 use crate::model::embedding::EmbedInput;
 use crate::model::gather::Gather;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
@@ -32,9 +30,6 @@ use crate::replay::ReplayComponent;
 
 const QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
     ReplayParameterKey::new("qwen3.5.mtp_embed.num_active_tokens");
-#[cfg(test)]
-const QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS: ReplayParameterKey =
-    ReplayParameterKey::new("test.qwen3.5.mtp_embed.reference_num_active_tokens");
 
 pub struct Qwen35MTPEmbed {
     embed: Option<Rc<Embed>>,
@@ -198,52 +193,11 @@ impl Qwen35MTPEmbed {
             .expect("qwen3.5 MTP shared embed weights must be loaded before execution")
     }
 
-    #[cfg(test)]
-    fn record_projection_reference<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        num_tokens: u32,
-        previous_hidden: &'a Buffer,
-        shifted_embeddings: &'a Buffer,
-        output: &'a Buffer,
-    ) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.hidden_norm
-            .record_with_barrier(recorder, num_tokens, previous_hidden, &self.normed_hidden);
-        self.embedding_norm
-            .record(recorder, num_tokens, shifted_embeddings, &self.normed_embedding);
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke_bucketed(
-            num_tokens,
-            QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS,
-            bf16_concat_rows::Buffers {
-                lhs: &self.normed_embedding,
-                rhs: &self.normed_hidden,
-                output: &self.fused_input,
-            },
-        )));
-        let projection_weights = self.projection_weights();
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke(
-            num_tokens.try_into().expect("qwen3.5 MTP token count must fit i32"),
-            output,
-            0,
-            &self.fused_input,
-            0,
-            &projection_weights.weight,
-            0,
-            &projection_weights.scales,
-            0,
-            &projection_weights.biases,
-            0,
-        )));
-        output
-    }
-
-    fn record_projection_bucketed<'a, R>(
+    fn record_projection<'a, R>(
         &'a self,
         recorder: &mut R,
         num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
         previous_hidden: &'a Buffer,
         shifted_embeddings: &'a Buffer,
         output: &'a Buffer,
@@ -251,23 +205,23 @@ impl Qwen35MTPEmbed {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.hidden_norm.record_bucketed_with_barrier(
+        self.hidden_norm.record_with_barrier(
             recorder,
             num_total_tokens,
-            QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
+            num_active_tokens,
             previous_hidden,
             &self.normed_hidden,
         );
-        self.embedding_norm.record_bucketed(
+        self.embedding_norm.record(
             recorder,
             num_total_tokens,
-            QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
+            num_active_tokens,
             shifted_embeddings,
             &self.normed_embedding,
         );
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke_bucketed(
+        recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke(
             num_total_tokens,
-            QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
+            num_active_tokens,
             bf16_concat_rows::Buffers {
                 lhs: &self.normed_embedding,
                 rhs: &self.normed_hidden,
@@ -275,20 +229,40 @@ impl Qwen35MTPEmbed {
             },
         )));
         let projection_weights = self.projection_weights();
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke_bucketed(
-            num_total_tokens,
-            QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
-            output,
-            0,
-            &self.fused_input,
-            0,
-            &projection_weights.weight,
-            0,
-            &projection_weights.scales,
-            0,
-            &projection_weights.biases,
-            0,
-        )));
+        let invocation = match num_active_tokens {
+            ReplayU32::Fixed(value) => {
+                self.fc.invoke(
+                    value.try_into().expect("qwen3.5 MTP token count must fit i32"),
+                    output,
+                    0,
+                    &self.fused_input,
+                    0,
+                    &projection_weights.weight,
+                    0,
+                    &projection_weights.scales,
+                    0,
+                    &projection_weights.biases,
+                    0,
+                )
+            },
+            ReplayU32::Parameter(key) => {
+                self.fc.invoke_bucketed(
+                    num_total_tokens,
+                    key,
+                    output,
+                    0,
+                    &self.fused_input,
+                    0,
+                    &projection_weights.weight,
+                    0,
+                    &projection_weights.scales,
+                    0,
+                    &projection_weights.biases,
+                    0,
+                )
+            },
+        };
+        recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         output
     }
 
@@ -297,30 +271,7 @@ impl Qwen35MTPEmbed {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_tokens = args.num_tokens;
-        self.input_gather.record(
-            recorder,
-            num_tokens,
-            args.prev_hidden_source,
-            args.prev_hidden_indices,
-            args.prev_hidden_input,
-        );
-        let _ = <Embed as ReplayLayer>::record(
-            self.loaded_embed(),
-            recorder,
-            EmbedInput {
-                num_tokens,
-                token_ids: args.token_ids,
-                output_hidden: args.token_hidden_input,
-            },
-        );
-        self.record_projection_reference(
-            recorder,
-            num_tokens,
-            args.prev_hidden_input,
-            args.token_hidden_input,
-            args.hidden_output,
-        )
+        self.record(recorder, args.num_tokens, ReplayU32::Fixed(args.num_tokens), args)
     }
 
     pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen35MTPEmbedReplayKey, ReplayArguments) {
@@ -329,45 +280,56 @@ impl Qwen35MTPEmbed {
         (key, arguments)
     }
 
-    pub fn record_bucketed<'a, R>(
+    pub fn record<'a, R>(
         &'a self,
         recorder: &mut R,
         num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
         args: Qwen35MTPEmbedArgs<'a>,
     ) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        assert_eq!(
-            self.replay_bucket_policy.capacity(args.num_tokens),
-            num_total_tokens,
-            "qwen3.5 MTPEmbed replay total token count must match its selected bucket"
-        );
-        assert_eq!(
-            self.fc.topology(args.num_tokens),
-            self.fc.topology(num_total_tokens),
-            "qwen3.5 MTPEmbed replay bucket must preserve FC topology"
-        );
-        self.input_gather.record_bucketed(
+        match num_active_tokens {
+            ReplayU32::Fixed(value) => {
+                assert_eq!(value, args.num_tokens);
+                assert_eq!(value, num_total_tokens);
+            },
+            ReplayU32::Parameter(_) => {
+                assert_eq!(
+                    self.replay_bucket_policy.capacity(args.num_tokens),
+                    num_total_tokens,
+                    "qwen3.5 MTPEmbed total token count must match its selected capacity"
+                );
+                assert_eq!(
+                    self.fc.topology(args.num_tokens),
+                    self.fc.topology(num_total_tokens),
+                    "qwen3.5 MTPEmbed capacity must preserve FC topology"
+                );
+            },
+        }
+        self.input_gather.record(
             recorder,
             num_total_tokens,
-            QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
+            num_active_tokens,
             args.prev_hidden_source,
             args.prev_hidden_indices,
             args.prev_hidden_input,
         );
-        let _ = self.loaded_embed().record_bucketed(
+        let _ = <Embed as ReplayLayer>::record(
+            self.loaded_embed(),
             recorder,
-            EmbedBucketedInput {
+            EmbedInput {
                 num_total_tokens,
-                num_active_tokens_key: QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
+                num_active_tokens,
                 token_ids: args.token_ids,
                 output_hidden: args.token_hidden_input,
             },
         );
-        self.record_projection_bucketed(
+        self.record_projection(
             recorder,
             num_total_tokens,
+            num_active_tokens,
             args.prev_hidden_input,
             args.token_hidden_input,
             args.hidden_output,
@@ -481,7 +443,13 @@ impl ReplayComponent for Qwen35MTPEmbed {
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         let key = self.replay_key(input);
-        self.record_bucketed(recorder, key.num_total_tokens, *input);
+        Qwen35MTPEmbed::record(
+            self,
+            recorder,
+            key.num_total_tokens,
+            ReplayU32::Parameter(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS),
+            *input,
+        );
     }
 }
 
@@ -494,7 +462,6 @@ mod tests {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
-    use inference_backend_metal::metal::ReplayArguments;
     use inference_backend_metal::metal::Stream;
     use inference_executor_core::checkpoint::QuantizedTensorBindings;
     use inference_executor_core::checkpoint::SafeTensorIndex;
@@ -574,12 +541,7 @@ mod tests {
         let mut reference_recorder = runtime.create_recorder();
         component.record_reference(&mut reference_recorder, buffers.input(3));
         let reference_replay = reference_recorder.build();
-        runtime
-            .submit_replay_with_arguments(
-                &reference_replay,
-                &ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS, 3),
-            )
-            .wait();
+        runtime.submit_replay(&reference_replay).wait();
         let reference_output = buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize * 3);
 
         buffers.fill_stage_outputs(&component, OUTPUT_CANARY);

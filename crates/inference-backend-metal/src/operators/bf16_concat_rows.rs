@@ -1,4 +1,4 @@
-//! Bucketed row-wise concatenation for two BF16 matrices.
+//! Row-wise concatenation for two BF16 matrices.
 
 use std::mem::size_of;
 
@@ -7,7 +7,7 @@ use crate::metal::CommandRecorder;
 use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Operator;
-use crate::metal::ReplayParameterKey;
+use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("metal/bf16_concat_rows.metal");
 const NUM_BFLOATS_PER_VECTOR: u32 = 4;
@@ -109,18 +109,17 @@ impl Kernel {
         }
     }
 
-    /// Records a fixed-capacity grid whose active row count is supplied at submission.
-    pub fn invoke_bucketed<'a>(
+    pub fn invoke<'a>(
         &'a self,
         num_total_rows: u32,
-        num_active_rows_key: ReplayParameterKey,
+        num_active_rows: ReplayU32,
         buffers: Buffers<'a>,
     ) -> Invocation<'a> {
         Invocation {
             kernel: self,
             num_total_rows,
             buffers,
-            num_active_rows_key,
+            num_active_rows,
         }
     }
 }
@@ -129,7 +128,7 @@ pub struct Invocation<'a> {
     kernel: &'a Kernel,
     num_total_rows: u32,
     buffers: Buffers<'a>,
-    num_active_rows_key: ReplayParameterKey,
+    num_active_rows: ReplayU32,
 }
 
 impl Operator for Invocation<'_> {
@@ -142,7 +141,13 @@ impl Operator for Invocation<'_> {
         recorder.set_buffer_read(0, self.buffers.lhs, 0);
         recorder.set_buffer_read(1, self.buffers.rhs, 0);
         recorder.set_buffer_write(2, self.buffers.output, 0);
-        recorder.bind_u32(3, self.num_active_rows_key, 1, self.num_total_rows);
+        match self.num_active_rows {
+            ReplayU32::Fixed(value) => {
+                assert_eq!(value, self.num_total_rows);
+                recorder.set_u32(3, value);
+            },
+            ReplayU32::Parameter(key) => recorder.bind_u32(3, key, 1, self.num_total_rows),
+        }
         recorder.set_u32(4, config.num_columns);
         recorder.dispatch_1d(
             config.num_threads(self.num_total_rows),
@@ -193,6 +198,7 @@ mod tests {
     use super::*;
     use crate::metal::Dtype;
     use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.bf16_concat_rows.num_active_rows");
@@ -263,9 +269,9 @@ mod tests {
         let kernel = Kernel::new(&device, config);
 
         let mut recorder = stream.create_replay_program();
-        recorder.record(kernel.invoke_bucketed(
+        recorder.record(kernel.invoke(
             num_total_rows,
-            NUM_ACTIVE_ROWS,
+            ReplayU32::Parameter(NUM_ACTIVE_ROWS),
             Buffers {
                 lhs: &lhs,
                 rhs: &rhs,

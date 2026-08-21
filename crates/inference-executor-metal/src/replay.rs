@@ -136,9 +136,9 @@ mod tests {
 
         fn record<'a>(&'a self, recorder: &mut ReplayRecorder, _input: &Self::Input<'a>) {
             self.records.set(self.records.get() + 1);
-            recorder.record(ReplayOp::opaque(self.kernel.invoke_bucketed(
+            recorder.record(ReplayOp::opaque(self.kernel.invoke(
                 1,
-                NUM_ACTIVE_ROWS,
+                inference_backend_metal::metal::ReplayU32::Parameter(NUM_ACTIVE_ROWS),
                 bf16_concat_rows::Buffers {
                     lhs: &self.lhs,
                     rhs: &self.rhs,

@@ -1,7 +1,7 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::row_gather;
 use inference_executor_core::backend::recorder::Recorder;
 
@@ -27,44 +27,27 @@ impl Gather {
     pub fn record<'a, R>(
         &'a self,
         recorder: &mut R,
-        num_rows: u32,
-        input: &'a Buffer,
-        row_indices: &'a Buffer,
-        output: &'a Buffer,
-    ) where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke(
-            row_gather::Shape {
-                num_total_rows: num_rows,
-            },
-            row_gather::Buffers {
-                input,
-                row_indices,
-                output,
-            },
-        )));
-    }
-
-    pub fn record_bucketed<'a, R>(
-        &'a self,
-        recorder: &mut R,
         num_total_rows: u32,
-        num_active_rows_key: ReplayParameterKey,
+        num_active_rows: ReplayU32,
         input: &'a Buffer,
         row_indices: &'a Buffer,
         output: &'a Buffer,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.compute.invoke_bucketed(
-            row_gather::Shape { num_total_rows },
-            num_active_rows_key,
-            row_gather::Buffers {
-                input,
-                row_indices,
-                output,
+        let shape = row_gather::Shape { num_total_rows };
+        let buffers = row_gather::Buffers {
+            input,
+            row_indices,
+            output,
+        };
+        let invocation = match num_active_rows {
+            ReplayU32::Fixed(num_active_rows) => {
+                assert_eq!(num_active_rows, num_total_rows);
+                self.compute.invoke(shape, buffers)
             },
-        )));
+            ReplayU32::Parameter(key) => self.compute.invoke_bucketed(shape, key, buffers),
+        };
+        recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
     }
 }

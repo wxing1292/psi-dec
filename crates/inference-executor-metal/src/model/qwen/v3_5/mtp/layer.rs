@@ -4,7 +4,6 @@ use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
@@ -174,11 +173,11 @@ impl Qwen35MTPLayer {
     ///
     /// An adjacent compatible RMS normalization can fuse with the final
     /// residual add. The residual add remains valid when fusion is unavailable.
-    pub fn record_bucketed<'a, R>(
+    pub fn record<'a, R>(
         &'a self,
         recorder: &mut R,
         num_total_tokens: u32,
-        num_active_tokens_key: ReplayParameterKey,
+        num_active_tokens: ReplayU32,
         input: Qwen35MTPLayerInput<'a>,
     ) -> &'a Buffer
     where
@@ -190,10 +189,10 @@ impl Qwen35MTPLayer {
             "qwen3.5 MTP active tokens must not exceed the replay capacity"
         );
         let hidden_dim = self.scratch.hidden_dim;
-        self.input_norm.record_bucketed_with_barrier(
+        self.input_norm.record_with_barrier(
             recorder,
             num_total_tokens,
-            num_active_tokens_key,
+            num_active_tokens,
             input.residual_input,
             &self.scratch.normalized_hidden,
         );
@@ -203,21 +202,21 @@ impl Qwen35MTPLayer {
             &self.scratch.branch_output,
             input.pages,
             input.gqa,
-            ReplayU32::Parameter(num_active_tokens_key),
+            num_active_tokens,
         );
-        self.residual_add.record_bucketed(
+        self.residual_add.record(
             recorder,
             num_total_tokens,
             hidden_dim,
-            num_active_tokens_key,
+            num_active_tokens,
             input.residual_input,
             &self.scratch.branch_output,
             &self.scratch.post_attention_hidden,
         );
-        self.post_attention_norm.record_bucketed_with_barrier(
+        self.post_attention_norm.record_with_barrier(
             recorder,
             num_total_tokens,
-            num_active_tokens_key,
+            num_active_tokens,
             &self.scratch.post_attention_hidden,
             &self.scratch.normalized_hidden,
         );
@@ -226,13 +225,13 @@ impl Qwen35MTPLayer {
             &self.scratch.normalized_hidden,
             &self.scratch.branch_output,
             num_total_tokens,
-            ReplayU32::Parameter(num_active_tokens_key),
+            num_active_tokens,
         );
-        self.residual_add.record_bucketed(
+        self.residual_add.record(
             recorder,
             num_total_tokens,
             hidden_dim,
-            num_active_tokens_key,
+            num_active_tokens,
             &self.scratch.post_attention_hidden,
             &self.scratch.branch_output,
             &self.scratch.residual_output,
@@ -249,49 +248,13 @@ impl ReplayLayer for Qwen35MTPLayer {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let num_values = self.scratch.residual_values(input.num_tokens);
-        self.input_norm.record_with_barrier(
+        Qwen35MTPLayer::record(
+            self,
             recorder,
-            input.num_tokens,
-            input.residual_input,
-            &self.scratch.normalized_hidden,
-        );
-        self.attention.record(
-            recorder,
-            &self.scratch.normalized_hidden,
-            &self.scratch.branch_output,
-            input.pages,
-            input.gqa,
-            ReplayU32::Fixed(input.gqa.replay_shape().num_tokens),
-        );
-        self.residual_add.record(
-            recorder,
-            num_values,
-            input.residual_input,
-            &self.scratch.branch_output,
-            &self.scratch.post_attention_hidden,
-        );
-        self.post_attention_norm.record_with_barrier(
-            recorder,
-            input.num_tokens,
-            &self.scratch.post_attention_hidden,
-            &self.scratch.normalized_hidden,
-        );
-        self.mlp.record(
-            recorder,
-            &self.scratch.normalized_hidden,
-            &self.scratch.branch_output,
             input.num_tokens,
             ReplayU32::Fixed(input.num_tokens),
-        );
-        self.residual_add.record(
-            recorder,
-            num_values,
-            &self.scratch.post_attention_hidden,
-            &self.scratch.branch_output,
-            &self.scratch.residual_output,
-        );
-        &self.scratch.residual_output
+            input,
+        )
     }
 }
 

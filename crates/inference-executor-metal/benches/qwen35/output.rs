@@ -7,6 +7,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::backend::recorder::Recorder;
@@ -395,7 +396,8 @@ impl HeadFixture {
             &self.embedding,
             recorder,
             EmbedInput {
-                num_tokens,
+                num_total_tokens: num_tokens,
+                num_active_tokens: ReplayU32::Fixed(num_tokens),
                 token_ids: &self.token_ids,
                 output_hidden: &self.input_hidden,
             },
@@ -410,12 +412,14 @@ impl HeadFixture {
         self.final_norm.record(
             recorder,
             microbatch.total_tokens() as u32,
+            ReplayU32::Fixed(microbatch.total_tokens() as u32),
             &self.input_hidden,
             &self.final_norm_hidden,
         );
         self.gather.record(
             recorder,
             num_rows,
+            ReplayU32::Fixed(num_rows),
             &self.final_norm_hidden,
             &self.gather_flat_indices,
             &self.unembed_hidden,
@@ -430,7 +434,8 @@ impl HeadFixture {
             &self.unembedder,
             recorder,
             UnembedInput {
-                num_rows,
+                num_total_rows: num_rows,
+                num_active_rows: ReplayU32::Fixed(num_rows),
                 hidden: &self.unembed_hidden,
                 logits: &self.unembed_logits,
             },

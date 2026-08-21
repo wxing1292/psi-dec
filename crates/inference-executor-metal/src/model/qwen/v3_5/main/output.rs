@@ -4,10 +4,9 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
-use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
-use inference_executor_core::model::qwen::v3_5::num_main_output_rows;
 use inference_executor_core::replay::ReplayBucketPolicy;
 
 use crate::def::layer::ReplayLayer;
@@ -15,7 +14,6 @@ use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::gather::Gather;
 use crate::model::unembedding::Unembed;
-use crate::model::unembedding::UnembedBucketedInput;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
 
@@ -80,13 +78,38 @@ impl Qwen35GatherUnembed {
         self.replay_bucket_policy.max_capacity()
     }
 
-    pub fn record<'a, R>(&'a self, recorder: &mut R, args: Qwen35GatherUnembedArgs<'a>) -> &'a Buffer
+    pub fn record<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_rows: u32,
+        num_active_rows: ReplayU32,
+        args: Qwen35GatherUnembedArgs<'a>,
+    ) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
+        match num_active_rows {
+            ReplayU32::Fixed(value) => {
+                assert_eq!(value, args.num_rows);
+                assert_eq!(value, num_total_rows);
+            },
+            ReplayU32::Parameter(_) => {
+                assert_eq!(
+                    self.replay_bucket_policy.capacity(args.num_rows),
+                    num_total_rows,
+                    "qwen3.5 GatherUnembed total row count must match its selected capacity"
+                );
+                assert_eq!(
+                    self.loaded_unembed().replay_topology(args.num_rows),
+                    self.loaded_unembed().replay_topology(num_total_rows),
+                    "qwen3.5 GatherUnembed capacity must preserve unembed topology"
+                );
+            },
+        }
         self.gather.record(
             recorder,
-            args.num_rows,
+            num_total_rows,
+            num_active_rows,
             args.hidden_input,
             args.row_indices,
             args.hidden_output,
@@ -95,7 +118,8 @@ impl Qwen35GatherUnembed {
             self.loaded_unembed(),
             recorder,
             UnembedInput {
-                num_rows: args.num_rows,
+                num_total_rows,
+                num_active_rows,
                 hidden: args.hidden_output,
                 logits: args.logits,
             },
@@ -106,44 +130,6 @@ impl Qwen35GatherUnembed {
         let key = self.replay_key_for_active_rows(num_active_rows);
         let arguments = ReplayArguments::new().with_u32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, num_active_rows);
         (key, arguments)
-    }
-
-    pub fn record_bucketed<'a, R>(
-        &'a self,
-        recorder: &mut R,
-        num_total_rows: u32,
-        args: Qwen35GatherUnembedArgs<'a>,
-    ) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        assert_eq!(
-            self.replay_bucket_policy.capacity(args.num_rows),
-            num_total_rows,
-            "qwen3.5 GatherUnembed replay total row count must match its selected bucket"
-        );
-        assert_eq!(
-            self.loaded_unembed().replay_topology(args.num_rows),
-            self.loaded_unembed().replay_topology(num_total_rows),
-            "qwen3.5 GatherUnembed replay bucket must preserve unembed topology"
-        );
-        self.gather.record_bucketed(
-            recorder,
-            num_total_rows,
-            QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS,
-            args.hidden_input,
-            args.row_indices,
-            args.hidden_output,
-        );
-        self.loaded_unembed().record_bucketed(
-            recorder,
-            UnembedBucketedInput {
-                num_total_rows,
-                num_active_rows_key: QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS,
-                hidden: args.hidden_output,
-                logits: args.logits,
-            },
-        )
     }
 
     fn replay_key_for_active_rows(&self, num_active_rows: u32) -> Qwen35GatherUnembedReplayKey {
@@ -162,29 +148,6 @@ pub struct Qwen35GatherUnembedReplayKey {
 }
 
 impl Qwen35GatherUnembedReplayKey {
-    /// Creates a source-compatible legacy exact/manual identity.
-    ///
-    /// Production bucketed replay uses the component-owned row-capacity policy
-    /// and records the selected unembed topology through
-    /// [`Qwen35GatherUnembed::prepare_replay`].
-    pub fn from_microbatch(microbatch: &Qwen35Microbatch) -> Self {
-        let num_main_output_rows = num_main_output_rows(microbatch)
-            .try_into()
-            .expect("qwen3.5 Main output row count must fit u32");
-        assert!(
-            num_main_output_rows > 0,
-            "qwen3.5 GatherUnembed replay requires Main output rows"
-        );
-        Self {
-            num_total_rows: num_main_output_rows,
-            unembed_topology: None,
-        }
-    }
-
-    pub fn num_main_output_rows(&self) -> u32 {
-        self.num_total_rows
-    }
-
     pub fn num_total_rows(&self) -> u32 {
         self.num_total_rows
     }
@@ -211,7 +174,13 @@ impl ReplayComponent for Qwen35GatherUnembed {
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         let key = self.replay_key(input);
-        self.record_bucketed(recorder, key.num_total_rows, *input);
+        Qwen35GatherUnembed::record(
+            self,
+            recorder,
+            key.num_total_rows,
+            ReplayU32::Parameter(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS),
+            *input,
+        );
     }
 }
 
@@ -302,7 +271,7 @@ mod tests {
         buffers.fill_outputs(OUTPUT_CANARY);
         buffers.write_active_inputs(1);
         let mut exact_recorder = runtime.create_recorder();
-        component.record(&mut exact_recorder, buffers.input(1));
+        component.record(&mut exact_recorder, 1, ReplayU32::Fixed(1), buffers.input(1));
         let exact_replay = exact_recorder.build();
         runtime.submit_replay(&exact_replay).wait();
         let exact_hidden = buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize);

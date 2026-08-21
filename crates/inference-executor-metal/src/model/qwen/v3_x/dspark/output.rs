@@ -4,6 +4,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfidenceWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMarkovWeightBindings;
@@ -127,6 +128,7 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
         self.gather.record(
             recorder,
             num_rows,
+            ReplayU32::Fixed(num_rows),
             input.hidden_input,
             &self.row_indices,
             input.hidden_output,
@@ -135,7 +137,8 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
             self.unembed(),
             recorder,
             UnembedInput {
-                num_rows,
+                num_total_rows: num_rows,
+                num_active_rows: ReplayU32::Fixed(num_rows),
                 hidden: input.hidden_output,
                 logits: input.logits,
             },

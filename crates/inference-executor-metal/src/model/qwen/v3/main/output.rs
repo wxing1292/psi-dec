@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
 use inference_executor_core::model::qwen::v3::num_main_output_rows;
@@ -66,6 +67,7 @@ impl Qwen3GatherUnembed {
         self.gather.record(
             recorder,
             args.num_rows,
+            ReplayU32::Fixed(args.num_rows),
             args.hidden_input,
             args.row_indices,
             args.hidden_output,
@@ -74,7 +76,8 @@ impl Qwen3GatherUnembed {
             self.loaded_unembed(),
             recorder,
             UnembedInput {
-                num_rows: args.num_rows,
+                num_total_rows: args.num_rows,
+                num_active_rows: ReplayU32::Fixed(args.num_rows),
                 hidden: args.hidden_output,
                 logits: args.logits,
             },

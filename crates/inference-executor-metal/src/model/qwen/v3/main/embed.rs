@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 
 use crate::def::layer::ReplayLayer;
@@ -49,7 +50,8 @@ impl Qwen3MainEmbed {
             self.embed(),
             recorder,
             EmbedInput {
-                num_tokens: args.num_tokens,
+                num_total_tokens: args.num_tokens,
+                num_active_tokens: ReplayU32::Fixed(args.num_tokens),
                 token_ids: args.token_ids,
                 output_hidden: args.hidden_output,
             },

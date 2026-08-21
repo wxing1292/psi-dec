@@ -4,7 +4,7 @@ use inference_backend_metal::components::embedding;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::checkpoint::remove_tensor;
@@ -63,15 +63,8 @@ struct EmbedWeights {
 
 #[derive(Clone, Copy)]
 pub struct EmbedInput<'a> {
-    pub num_tokens: u32,
-    pub token_ids: &'a Buffer,
-    pub output_hidden: &'a Buffer,
-}
-
-#[derive(Clone, Copy)]
-pub struct EmbedBucketedInput<'a> {
     pub num_total_tokens: u32,
-    pub num_active_tokens_key: ReplayParameterKey,
+    pub num_active_tokens: ReplayU32,
     pub token_ids: &'a Buffer,
     pub output_hidden: &'a Buffer,
 }
@@ -144,28 +137,6 @@ impl Embed {
             .expect("embedding weights must be loaded before execution")
     }
 
-    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: EmbedBucketedInput<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.validate_num_tokens(input.num_total_tokens);
-        let weights = self.weights();
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke_bucketed(
-            embedding::Shape {
-                num_total_tokens: input.num_total_tokens,
-            },
-            input.num_active_tokens_key,
-            embedding::Buffers {
-                token_ids: input.token_ids,
-                weight: &weights.weight,
-                scales: &weights.scales,
-                biases: &weights.biases,
-                output: input.output_hidden,
-            },
-        )));
-        input.output_hidden
-    }
-
     fn validate_num_tokens(&self, num_tokens: u32) {
         assert!(num_tokens > 0, "embedding requires at least one token");
         assert!(
@@ -185,20 +156,26 @@ impl ReplayLayer for Embed {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.validate_num_tokens(input.num_tokens);
+        self.validate_num_tokens(input.num_total_tokens);
         let weights = self.weights();
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.kernel.invoke(
-            embedding::Shape {
-                num_total_tokens: input.num_tokens,
+        let shape = embedding::Shape {
+            num_total_tokens: input.num_total_tokens,
+        };
+        let buffers = embedding::Buffers {
+            token_ids: input.token_ids,
+            weight: &weights.weight,
+            scales: &weights.scales,
+            biases: &weights.biases,
+            output: input.output_hidden,
+        };
+        let invocation = match input.num_active_tokens {
+            ReplayU32::Fixed(num_active_tokens) => {
+                assert_eq!(num_active_tokens, input.num_total_tokens);
+                self.kernel.invoke(shape, buffers)
             },
-            embedding::Buffers {
-                token_ids: input.token_ids,
-                weight: &weights.weight,
-                scales: &weights.scales,
-                biases: &weights.biases,
-                output: input.output_hidden,
-            },
-        )));
+            ReplayU32::Parameter(key) => self.kernel.invoke_bucketed(shape, key, buffers),
+        };
+        recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         input.output_hidden
     }
 }

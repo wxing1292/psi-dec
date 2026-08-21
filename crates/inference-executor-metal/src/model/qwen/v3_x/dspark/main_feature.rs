@@ -4,6 +4,7 @@ use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
@@ -304,8 +305,13 @@ impl Qwen3xDSparkMainFeatureProjector {
                 0,
             ),
         ));
-        self.hidden_norm
-            .record_with_barrier(recorder, num_tokens, &self.main_feature, &self.main_feature);
+        self.hidden_norm.record_with_barrier(
+            recorder,
+            num_tokens,
+            ReplayU32::Fixed(num_tokens),
+            &self.main_feature,
+            &self.main_feature,
+        );
         &self.main_feature
     }
 }

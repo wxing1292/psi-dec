@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
+use inference_backend_metal::metal::ReplayU32;
 
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayRecorder;
@@ -60,7 +61,8 @@ impl ReplayComponent for Qwen3xDSparkEmbed {
             self.embed(),
             recorder,
             EmbedInput {
-                num_tokens: input.num_tokens,
+                num_total_tokens: input.num_tokens,
+                num_active_tokens: ReplayU32::Fixed(input.num_tokens),
                 token_ids: input.token_ids,
                 output_hidden: input.hidden_output,
             },

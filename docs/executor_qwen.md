@@ -403,46 +403,42 @@ Replay<Rc<GDNRequestStateTable>>
 
 MainEmbed and MTPEmbed are separate replay boundaries with their own keys.
 
-The shared quantized embedding leaf supports exact and bucketed recording.
-Exact recording fixes the active token count to `embedding::Shape::num_total_tokens` and declares no replay parameter.
-Bucketed recording interprets `embedding::Shape::num_total_tokens` as the recorded capacity.
-It validates buffers and dispatches the grid for that capacity.
-It binds the caller-provided active-token key with the range `1..=capacity`.
+The shared quantized embedding leaf has one active/total recording API.
+`num_total_tokens` defines the recorded grid and buffer extent.
+`num_active_tokens` is `ReplayU32::Fixed(num_total_tokens)` or a caller-provided replay parameter.
+A replay parameter has the range `1..=num_total_tokens`.
 The kernel checks the active token count before it reads `token_ids` or writes the output row.
 Qwen3.5 MainEmbed reads the configured token-row capacity from `Embed::max_tokens()`.
 It owns a base `ReplayBucketPolicy` capped by this capacity.
 It records the bucket capacity in `Qwen35MainEmbedReplayKey` and never records the active token count in the key.
 It uses the stage-owned `qwen3.5.main_embed.num_active_tokens` replay parameter for submission.
 The executor stores this argument with the prepared key and submits both to the same replay program.
-Qwen3 MainEmbed still selects exact recording.
-Qwen3.5 MTPEmbed selects bucketed embedding recording as part of its composed replay.
+Qwen3 MainEmbed uses a fixed active count.
+Qwen3.5 MTPEmbed uses a parameter active count as part of its composed replay.
 
-The shared row-gather leaf supports exact and bucketed recording.
-`row_gather::Shape::num_total_rows` is the recorded grid extent for both paths.
-Exact recording fixes the active row count to this extent and declares no replay parameter.
-Bucketed recording supplies the active row count at submission.
+The shared row-gather leaf has one active/total recording API.
+`row_gather::Shape::num_total_rows` is the recorded grid extent.
+`num_active_rows` is fixed to this extent or supplied at submission.
 It validates the row-index and output buffers and dispatches the grid for that capacity.
 It binds the caller-provided active-row key with the range `1..=capacity`.
 The kernel checks the active row count before it reads an inactive row index or input value and before it writes an
 inactive output value.
-Qwen3.5 MTPEmbed selects bucketed row-gather recording.
-Qwen3.5 GatherUnembed also selects bucketed row-gather recording.
-Qwen3 and DSpark GatherUnembed still select exact row-gather recording.
+Qwen3.5 MTPEmbed and GatherUnembed use a parameter active count.
+Qwen3 and DSpark GatherUnembed use a fixed active count.
 
-The shared unembedding leaf supports exact and bucketed recording.
-Exact recording fixes the active row count and declares no replay parameter.
-Bucketed recording uses the caller-provided total row capacity and active-row key.
+The shared unembedding leaf has one active/total recording API.
+It uses the caller-provided total row count and `ReplayU32` active row count.
 It validates that the total row capacity is in `1..=UnembedConfig::max_tokens`.
 It validates the hidden input and logits output ranges against this total row capacity.
 The affine replay parameter validates the submitted active row count in `1..=capacity`.
 The leaf exposes the affine kernel topology for a row capacity and every row count that changes this topology.
 The stage bucket policy must include these topology boundaries.
 This rule lets Gather and Unembed use one active-row key without padding across an affine kernel change.
-Qwen3.5 GatherUnembed selects bucketed unembedding recording.
-Qwen3 and DSpark GatherUnembed still select exact unembedding recording.
+Qwen3.5 GatherUnembed uses a parameter active count.
+Qwen3 and DSpark GatherUnembed use a fixed active count.
 
-The shared BF16 row-concat leaf supports bucketed recording.
-The API names the recorded row capacity `num_total_rows` and the submission parameter `num_active_rows`.
+The shared BF16 row-concat leaf has one active/total recording API.
+The API names the recorded row count `num_total_rows` and the active row count `num_active_rows`.
 The configuration names the logical input row width `num_columns`.
 `num_columns` must be divisible by four.
 The three buffer base addresses must be 8-byte aligned.
@@ -451,12 +447,10 @@ It validates both input buffers and the output buffer against `num_total_rows`.
 It binds the caller-provided active-row key with the range `1..=capacity`.
 The kernel checks the active row count before it reads an input value or writes an output value.
 The row-concat leaf has one fixed topology and adds no replay bucket boundary.
-Qwen3.5 MTPEmbed selects bucketed row-concat recording.
+Qwen3.5 MTPEmbed uses a parameter active count.
 
-The shared RMS-normalization leaf supports exact and bucketed recording.
-Exact recording fixes the token count and declares no replay parameter.
-Bucketed recording dispatches the recorded token capacity and binds the caller-provided active-token key with the
-range `1..=capacity`.
+The shared RMS-normalization leaf has one active/total recording API.
+It dispatches `num_total_tokens` and uses a fixed or parameter active token count.
 The RMS-normalization kernel checks the active token count before it reads or writes a row.
 
 Replay recording can fuse a residual add with the immediately following RMS normalization.
@@ -466,14 +460,12 @@ domains match.
 An intervening operation or an incompatible RMS normalization disables fusion and does not fail replay construction.
 Each dependent RMS normalization records its own consumer barrier.
 Fusion preserves a barrier requested by either source operation.
-Exact residual recording uses `residual_add::Shape::num_values`.
-Exact capture and bucketed residual recording use
-`residual_add::RowShape { num_total_rows, num_columns }`.
+Residual recording and residual capture use `residual_add::RowShape { num_total_rows, num_columns }`.
 Both fields count tensor elements, not bytes.
-Bucketed recording also uses the caller-provided active-token key.
+The active row count is fixed or supplied by the caller.
 The fused command uses the shared active-token key and token capacity.
 It does not declare a separate active-value parameter.
-The standalone bucketed residual kernel and both fused kernels check the active token count before they read or
+The standalone residual kernel and both fused kernels check the active token count before they read or
 write a value or row.
 Residual capture is also independently recordable.
 Its BF16 vec4 kernel writes the residual output and the selected capture columns only for active rows.
@@ -481,8 +473,7 @@ An adjacent compatible RMS normalization can replace it with the fused capture k
 Both paths validate the capture destination for the recorded capacity.
 RMS normalization and residual/RMS-normalization fusion have fixed token-count topology and add no replay bucket
 boundary.
-Qwen3.5 MTPEmbed selects bucketed normalization recording.
-Qwen3.5 Main and MTP select bucketed residual and normalization recording.
+Qwen3.5 MTPEmbed, Main, and MTP use parameter active counts for normalization and residual recording.
 
 Qwen3.5 Main owns one token-capacity replay domain.
 The executor selects this capacity before it prepares Main attention metadata.
@@ -505,11 +496,8 @@ A tiled-query Main replay also declares the GQA Q-token-tile count.
 The production Main replay key records the selected token capacity, all GQA and GDN capacities and categorical
 topologies, and the ordered MLP topology for every model layer.
 The active token count does not enter this key.
-`Qwen35MainReplayKey::from_shapes(...)` remains a source-compatible legacy identity.
-An explicit key-mode discriminator prevents a legacy identity from aliasing a production bucketed identity.
-The public `Qwen35Main::record(...)` path remains available for legacy/manual composition with the existing
-component-local GQA and GDN replay behavior.
-Production `Replay<Qwen35Main>` recording uses the bucketed path.
+`Qwen35Main::record(...)` receives `num_total_tokens` and `ReplayU32`.
+Production `Replay<Qwen35Main>` supplies the stage active-token parameter.
 
 The recorder normally fuses each Main attention residual with the following post-attention RMS normalization.
 It also normally fuses each Main MLP residual with the next layer input normalization or the final normalization.
@@ -550,14 +538,12 @@ A tiled-query MTP replay also declares the GQA Q-token-tile count.
 The production MTP replay key records the selected token capacity, all GQA capacities and categorical topology, and
 the categorical dense-MLP or full-MoE topology.
 The active token count and logical MTP step index do not enter this key.
-`Qwen35MTPReplayKey::new(...)` remains a source-compatible legacy identity.
-An explicit key-mode discriminator prevents a legacy identity from aliasing a production bucketed identity.
-The public `Qwen35MTP::record(...)` path remains available for legacy/manual composition.
-Production `Replay<Qwen35MTP>` recording uses the bucketed path.
+`Qwen35MTP::record(...)` receives `num_total_tokens` and `ReplayU32`.
+Production `Replay<Qwen35MTP>` supplies the stage active-token parameter.
 
 The recorder normally fuses the attention residual with the post-attention normalization.
 It also normally fuses the final MLP residual with the output normalization.
-The bucketed residual kernels remain correct if either fusion opportunity is unavailable.
+The residual kernels remain correct if either fusion opportunity is unavailable.
 Every logical MTP step uses the same active token count, selected capacity, metadata shape, and recorded program.
 MTPEmbed, MTP body, and GatherUnembed retain separate replay parameter domains.
 
@@ -570,8 +556,6 @@ One speculative request can produce more than one output row.
 `Qwen35GatherUnembed::prepare_replay(...)` maps each nonzero active row count to one recorded capacity.
 The production replay key records `num_total_rows` and the categorical unembed topology.
 The active row count does not enter this key.
-The source-compatible `Qwen35GatherUnembedReplayKey::from_microbatch(...)` constructor creates only a legacy
-exact/manual identity.
 The composed Gather and Unembed commands use the same `qwen3.5.gather_unembed.num_active_rows` parameter.
 The composed replay declares exactly one parameter.
 Main and MTP use the same replay cache because they bind the same stable buffers.

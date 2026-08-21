@@ -3,7 +3,7 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
@@ -77,15 +77,8 @@ struct UnembedWeights {
 
 #[derive(Clone, Copy)]
 pub struct UnembedInput<'a> {
-    pub num_rows: u32,
-    pub hidden: &'a Buffer,
-    pub logits: &'a Buffer,
-}
-
-#[derive(Clone, Copy)]
-pub struct UnembedBucketedInput<'a> {
     pub num_total_rows: u32,
-    pub num_active_rows_key: ReplayParameterKey,
+    pub num_active_rows: ReplayU32,
     pub hidden: &'a Buffer,
     pub logits: &'a Buffer,
 }
@@ -164,29 +157,6 @@ impl Unembed {
         self.matmul.topology_boundaries()
     }
 
-    pub fn record_bucketed<'a, R>(&'a self, recorder: &mut R, input: UnembedBucketedInput<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.validate_num_rows(input.num_total_rows);
-        let weights = self.weights();
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.matmul.invoke_bucketed(
-            input.num_total_rows,
-            input.num_active_rows_key,
-            input.logits,
-            0,
-            input.hidden,
-            0,
-            &weights.weight,
-            0,
-            &weights.scales,
-            0,
-            &weights.biases,
-            0,
-        )));
-        input.logits
-    }
-
     fn validate_num_rows(&self, num_rows: u32) {
         assert!(num_rows > 0, "unembed requires at least one row");
         assert!(
@@ -206,21 +176,43 @@ impl ReplayLayer for Unembed {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.validate_num_rows(input.num_rows);
+        self.validate_num_rows(input.num_total_rows);
         let weights = self.weights();
-        recorder.record_with_barrier_before(ReplayOp::opaque(self.matmul.invoke(
-            input.num_rows.try_into().expect("unembed row count must fit i32"),
-            input.logits,
-            0,
-            input.hidden,
-            0,
-            &weights.weight,
-            0,
-            &weights.scales,
-            0,
-            &weights.biases,
-            0,
-        )));
+        let invocation = match input.num_active_rows {
+            ReplayU32::Fixed(num_active_rows) => {
+                assert_eq!(num_active_rows, input.num_total_rows);
+                self.matmul.invoke(
+                    input.num_total_rows.try_into().expect("unembed row count must fit i32"),
+                    input.logits,
+                    0,
+                    input.hidden,
+                    0,
+                    &weights.weight,
+                    0,
+                    &weights.scales,
+                    0,
+                    &weights.biases,
+                    0,
+                )
+            },
+            ReplayU32::Parameter(key) => {
+                self.matmul.invoke_bucketed(
+                    input.num_total_rows,
+                    key,
+                    input.logits,
+                    0,
+                    input.hidden,
+                    0,
+                    &weights.weight,
+                    0,
+                    &weights.scales,
+                    0,
+                    &weights.biases,
+                    0,
+                )
+            },
+        };
+        recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
         input.logits
     }
 }
@@ -280,13 +272,15 @@ mod tests {
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::ReplayArguments;
     use inference_backend_metal::metal::ReplayParameterKey;
+    use inference_backend_metal::metal::ReplayU32;
     use inference_backend_metal::metal::Stream;
 
     use super::Dtype;
     use super::Unembed;
-    use super::UnembedBucketedInput;
     use super::UnembedConfig;
+    use super::UnembedInput;
     use super::UnembedWeights;
+    use crate::def::layer::ReplayLayer;
     use crate::def::replay_op::MetalReplayRuntime;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.unembed.num_active_rows");
@@ -322,11 +316,12 @@ mod tests {
         let hidden = bf16_buffer(&device, &vec![0.0; num_total_hidden_values]);
         let logits = bf16_buffer(&device, &vec![sentinel; num_total_logits_values]);
         let mut bucketed_recorder = runtime.create_recorder();
-        unembed.record_bucketed(
+        <Unembed as ReplayLayer>::record(
+            &unembed,
             &mut bucketed_recorder,
-            UnembedBucketedInput {
+            UnembedInput {
                 num_total_rows: config.max_tokens,
-                num_active_rows_key: NUM_ACTIVE_ROWS,
+                num_active_rows: ReplayU32::Parameter(NUM_ACTIVE_ROWS),
                 hidden: &hidden,
                 logits: &logits,
             },
