@@ -26,7 +26,7 @@ use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 pub struct RejectionSampler {
     sparse_sampler: SparseRejectionSampling,
     max_requests: u32,
-    max_num_spec_tokens: u32,
+    max_spec_tokens: u32,
     max_target_distributions: u32,
     max_k: u32,
     request_bucket_policy: ReplayBucketPolicy,
@@ -99,29 +99,20 @@ impl PreparedRejection {
 }
 
 impl RejectionSampler {
-    pub fn new(
-        device: &Device,
-        max_num_spec_tokens: usize,
-        max_requests: usize,
-        max_tokens: usize,
-        max_k: u32,
-    ) -> Self {
-        assert!(
-            max_num_spec_tokens > 0,
-            "rejection sampling requires speculative tokens"
-        );
+    pub fn new(device: &Device, max_spec_tokens: usize, max_requests: usize, max_tokens: usize, max_k: u32) -> Self {
+        assert!(max_spec_tokens > 0, "rejection sampling requires speculative tokens");
         assert!(max_requests > 0, "rejection sampling requires requests");
         assert!(max_tokens > 0, "rejection sampling requires target distributions");
         let max_draft_distributions: u32 = max_requests
-            .checked_mul(max_num_spec_tokens)
+            .checked_mul(max_spec_tokens)
             .expect("rejection sampling draft distributions overflow")
             .try_into()
             .expect("rejection sampling draft-distribution count must fit u32");
         let max_requests_u32: u32 = max_requests
             .try_into()
             .expect("rejection sampling request capacity must fit u32");
-        let max_num_spec_tokens_u32 =
-            u32::try_from(max_num_spec_tokens).expect("rejection sampling spec-token capacity must fit u32");
+        let max_spec_tokens_u32 =
+            u32::try_from(max_spec_tokens).expect("rejection sampling spec-token capacity must fit u32");
         let max_target_distributions =
             u32::try_from(max_tokens).expect("rejection sampling target-distribution capacity must fit u32");
         let bounds = SparseRejectionSamplingBounds {
@@ -133,7 +124,7 @@ impl RejectionSampler {
         Self {
             sparse_sampler: SparseRejectionSampling::new(device, bounds),
             max_requests: max_requests_u32,
-            max_num_spec_tokens: max_num_spec_tokens_u32,
+            max_spec_tokens: max_spec_tokens_u32,
             max_target_distributions,
             max_k,
             request_bucket_policy: ReplayBucketPolicy::new(max_requests_u32),
@@ -189,7 +180,7 @@ impl RejectionSampler {
             .map(|&req_index| microbatch.num_spec_tokens(req_index) as usize)
             .sum::<usize>();
         assert!(
-            num_draft_distributions <= (self.max_requests * self.max_num_spec_tokens) as usize,
+            num_draft_distributions <= (self.max_requests * self.max_spec_tokens) as usize,
             "rejection sampling draft distributions exceed sampler capacity"
         );
         assert!(
@@ -201,7 +192,7 @@ impl RejectionSampler {
             num_draft_distributions,
             "rejection sampling draft-distribution indices must match flat drafts"
         );
-        let draft_capacity = (self.max_requests * self.max_num_spec_tokens) as usize;
+        let draft_capacity = (self.max_requests * self.max_spec_tokens) as usize;
         assert!(
             flat_draft_distribution_indices
                 .iter()
@@ -216,7 +207,7 @@ impl RejectionSampler {
         for &req_index in &decode_req_indices {
             let draft_len = microbatch.num_spec_tokens(req_index) as usize;
             assert!(
-                draft_len <= self.max_num_spec_tokens as usize,
+                draft_len <= self.max_spec_tokens as usize,
                 "rejection sampling num_spec_tokens exceeds sampler capacity"
             );
             let q_end = microbatch.cu_tokens()[req_index + 1] as usize;
@@ -246,7 +237,7 @@ impl RejectionSampler {
             "rejection sampling prepared requests exceed sampler capacity"
         );
         assert!(
-            num_active_draft_distributions <= (self.max_requests * self.max_num_spec_tokens) as usize,
+            num_active_draft_distributions <= (self.max_requests * self.max_spec_tokens) as usize,
             "rejection sampling prepared draft distributions exceed sampler capacity"
         );
         let num_active_target_distributions = num_active_draft_distributions + num_active_reqs;
@@ -317,7 +308,7 @@ impl RejectionSampler {
 
     pub fn read_results(&self, num_decode_reqs: usize, num_draft_distributions: usize) -> RejectionResults {
         debug_assert!(num_decode_reqs <= self.max_requests as usize);
-        debug_assert!(num_draft_distributions <= (self.max_requests * self.max_num_spec_tokens) as usize);
+        debug_assert!(num_draft_distributions <= (self.max_requests * self.max_spec_tokens) as usize);
         RejectionResults {
             flat_accepted_token_ids: self
                 .flat_accepted_token_ids

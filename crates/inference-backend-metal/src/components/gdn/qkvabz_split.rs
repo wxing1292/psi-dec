@@ -11,6 +11,24 @@ use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("../metal/gdn_qkvabz_split.metal");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThreadBlockConstants {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelConstants {
+    thread_block: ThreadBlockConstants,
+}
+
+impl KernelConstants {
+    fn current() -> Self {
+        Self {
+            thread_block: ThreadBlockConstants { required_threads: 256 },
+        }
+    }
+}
+
 /// Projection-split tensor contract:
 ///
 /// ```text
@@ -109,6 +127,7 @@ pub struct Buffers<'a> {
 
 pub struct Compute {
     config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
@@ -117,6 +136,7 @@ impl Compute {
         config.validate();
         Self {
             config,
+            constants: KernelConstants::current(),
             kernel: Kernel::new(device, SOURCE, "gdn_qkvabz_split_f32"),
         }
     }
@@ -124,6 +144,7 @@ impl Compute {
     pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
         Invocation {
             config: self.config,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -139,6 +160,7 @@ impl Compute {
     ) -> Invocation<'a> {
         Invocation {
             config: self.config,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -149,6 +171,7 @@ impl Compute {
 
 pub struct Invocation<'a> {
     config: Config,
+    constants: KernelConstants,
     kernel: &'a Kernel,
     shape: Shape,
     buffers: Buffers<'a>,
@@ -175,7 +198,10 @@ impl Operator for Invocation<'_> {
         recorder.set_u32(6, self.config.qkv_dim);
         recorder.set_u32(7, self.config.num_v_heads);
         recorder.set_u32(8, self.config.v_dim);
-        recorder.dispatch_1d(self.config.num_qkvabz_values(self.shape), 256);
+        recorder.dispatch_1d(
+            self.config.num_qkvabz_values(self.shape),
+            self.constants.thread_block.required_threads as usize,
+        );
     }
 }
 
@@ -218,6 +244,16 @@ mod tests {
     use crate::metal::Stream;
 
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_split.num_active_tokens");
+
+    #[test]
+    fn test_constants_have_explicit_thread_block_scope() {
+        assert_eq!(
+            KernelConstants::current(),
+            KernelConstants {
+                thread_block: ThreadBlockConstants { required_threads: 256 },
+            }
+        );
+    }
 
     #[test]
     fn test_fixed() {

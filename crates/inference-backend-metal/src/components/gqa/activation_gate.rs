@@ -10,7 +10,28 @@ use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("../metal/gqa_activation_gate.metal");
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ThreadBlockConstants {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KernelConstants {
+    config: Config,
+    thread_block: ThreadBlockConstants,
+}
+
+impl KernelConstants {
+    fn current(config: Config) -> Self {
+        config.validate();
+        Self {
+            config,
+            thread_block: ThreadBlockConstants { required_threads: 256 },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     pub num_q_heads: u32,
     pub head_dim: u32,
@@ -79,28 +100,28 @@ pub struct Buffers<'a> {
 }
 
 pub struct Compute {
-    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
 impl Compute {
     pub fn new(device: &Device, config: Config) -> Self {
-        config.validate();
-        let source = source(config);
+        let constants = KernelConstants::current(config);
+        let source = source(constants);
         let function_name = match config.dtype {
             Dtype::Float32 => "gqa_activation_gate_f32",
             Dtype::Bfloat16 => "gqa_activation_gate_bf16",
             dtype => panic!("unsupported GQA activation gate dtype {dtype:?}"),
         };
         Self {
-            config,
+            constants,
             kernel: Kernel::new(device, &source, function_name),
         }
     }
 
     pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
         Invocation {
-            config: self.config,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -115,7 +136,7 @@ impl Compute {
         num_active_tokens: ReplayU32,
     ) -> Invocation<'a> {
         Invocation {
-            config: self.config,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -124,7 +145,8 @@ impl Compute {
     }
 }
 
-fn source(config: Config) -> String {
+fn source(constants: KernelConstants) -> String {
+    let config = constants.config;
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_q_heads = {}u;\nconstant uint head_dim = {}u;",
         config.num_q_heads, config.head_dim,
@@ -133,7 +155,7 @@ fn source(config: Config) -> String {
 }
 
 pub struct Invocation<'a> {
-    config: Config,
+    constants: KernelConstants,
     kernel: &'a Kernel,
     shape: Shape,
     buffers: Buffers<'a>,
@@ -155,16 +177,20 @@ impl Operator for Invocation<'_> {
             shape.num_total_tokens,
             "GQA activation-gate active token count",
         );
-        recorder.dispatch_1d(self.config.num_values(shape), 256);
+        recorder.dispatch_1d(
+            self.constants.config.num_values(shape),
+            self.constants.thread_block.required_threads as usize,
+        );
     }
 }
 
 impl Invocation<'_> {
     fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.attention_output.len_bytes() >= self.config.bytes(self.shape));
-        assert!(self.buffers.g.len_bytes() >= self.config.bytes(self.shape));
-        assert!(self.buffers.output.len_bytes() >= self.config.bytes(self.shape));
+        let config = self.constants.config;
+        self.shape.validate(config);
+        assert!(self.buffers.attention_output.len_bytes() >= config.bytes(self.shape));
+        assert!(self.buffers.g.len_bytes() >= config.bytes(self.shape));
+        assert!(self.buffers.output.len_bytes() >= config.bytes(self.shape));
     }
 }
 
@@ -182,7 +208,21 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use super::KernelConstants;
     use super::Shape;
+    use super::ThreadBlockConstants;
+
+    #[test]
+    fn test_constants_have_explicit_thread_block_scope() {
+        let config = Config::bf16(2, 128);
+        assert_eq!(
+            KernelConstants::current(config),
+            KernelConstants {
+                config,
+                thread_block: ThreadBlockConstants { required_threads: 256 },
+            }
+        );
+    }
 
     #[test]
     #[should_panic(expected = "GQA activation/gate exceeds the shader u32 count domain")]

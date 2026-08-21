@@ -404,7 +404,8 @@ The canonical binding order and dispatch topology are:
 QKVABZ split
   buffers 0..4: qkvabz, qkv, a, b, z
   scalars 5..8: num_active_tokens, qkv_dim, num_v_heads, v_dim
-  dispatch: num_total_tokens * (Cqkv + 2 * Hv + Hv * Dv), 256 threads/threadblock
+  dispatch: num_total_tokens * (Cqkv + 2 * Hv + Hv * Dv)
+  KernelConstants.thread_block.required_threads: 256
 
 short convolution
   buffers 0..7: conv_qkv, next_conv_state, qkv, conv_state,

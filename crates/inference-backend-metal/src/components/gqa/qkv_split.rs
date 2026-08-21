@@ -9,7 +9,28 @@ use crate::metal::Operator;
 
 const SOURCE: &str = include_str!("../metal/gqa_qkv_split.metal");
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ThreadBlockConstants {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KernelConstants {
+    config: Config,
+    thread_block: ThreadBlockConstants,
+}
+
+impl KernelConstants {
+    fn current(config: Config) -> Self {
+        config.validate();
+        Self {
+            config,
+            thread_block: ThreadBlockConstants { required_threads: 256 },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
@@ -129,28 +150,28 @@ pub struct Buffers<'a> {
 }
 
 pub struct Compute {
-    config: Config,
+    constants: KernelConstants,
     kernel: Kernel,
 }
 
 impl Compute {
     pub fn new(device: &Device, config: Config) -> Self {
-        config.validate();
-        let source = qkv_split_source(config);
+        let constants = KernelConstants::current(config);
+        let source = qkv_split_source(constants);
         let function_name = match config.dtype {
             Dtype::Float32 => "gqa_qkv_split_f32",
             Dtype::Bfloat16 => "gqa_qkv_split_bf16",
             dtype => panic!("unsupported ungated GQA projection split dtype {dtype:?}"),
         };
         Self {
-            config,
+            constants,
             kernel: Kernel::new(device, &source, function_name),
         }
     }
 
     pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
         Invocation {
-            config: self.config,
+            constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
@@ -158,7 +179,8 @@ impl Compute {
     }
 }
 
-fn qkv_split_source(config: Config) -> String {
+fn qkv_split_source(constants: KernelConstants) -> String {
+    let config = constants.config;
     let constants = format!(
         "using namespace metal;\n\nconstant uint num_q_heads = {}u;\nconstant uint num_kv_heads = {}u;\nconstant uint \
          head_dim = {}u;",
@@ -168,7 +190,7 @@ fn qkv_split_source(config: Config) -> String {
 }
 
 pub struct Invocation<'a> {
-    config: Config,
+    constants: KernelConstants,
     kernel: &'a Kernel,
     shape: Shape,
     buffers: Buffers<'a>,
@@ -184,17 +206,21 @@ impl Operator for Invocation<'_> {
         recorder.set_buffer_write(2, self.buffers.k, 0);
         recorder.set_buffer_write(3, self.buffers.v, 0);
         recorder.set_u32(4, shape.num_tokens);
-        recorder.dispatch_1d(self.config.num_qkv_slots(shape), 256);
+        recorder.dispatch_1d(
+            self.constants.config.num_qkv_slots(shape),
+            self.constants.thread_block.required_threads as usize,
+        );
     }
 }
 
 impl Invocation<'_> {
     fn validate(&self) {
-        self.shape.validate(self.config);
-        assert!(self.buffers.qkv.len_bytes() >= self.config.qkv_bytes(self.shape));
-        assert!(self.buffers.q.len_bytes() >= self.config.q_bytes(self.shape));
-        assert!(self.buffers.k.len_bytes() >= self.config.kv_bytes(self.shape));
-        assert!(self.buffers.v.len_bytes() >= self.config.kv_bytes(self.shape));
+        let config = self.constants.config;
+        self.shape.validate(config);
+        assert!(self.buffers.qkv.len_bytes() >= config.qkv_bytes(self.shape));
+        assert!(self.buffers.q.len_bytes() >= config.q_bytes(self.shape));
+        assert!(self.buffers.k.len_bytes() >= config.kv_bytes(self.shape));
+        assert!(self.buffers.v.len_bytes() >= config.kv_bytes(self.shape));
     }
 }
 
@@ -203,11 +229,25 @@ mod tests {
     use super::Buffers;
     use super::Compute;
     use super::Config;
+    use super::KernelConstants;
     use super::Shape;
+    use super::ThreadBlockConstants;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
     use crate::metal::Stream;
+
+    #[test]
+    fn test_constants_have_explicit_thread_block_scope() {
+        let config = Config::bf16(2, 1, 128);
+        assert_eq!(
+            KernelConstants::current(config),
+            KernelConstants {
+                config,
+                thread_block: ThreadBlockConstants { required_threads: 256 },
+            }
+        );
+    }
 
     #[test]
     fn test_fixed() {

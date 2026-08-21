@@ -5,7 +5,7 @@ use inference_runtime_core::runtime::RawRequestSlot;
 
 #[derive(Default)]
 pub struct SpecProbsStore {
-    max_num_spec_tokens: usize,
+    max_spec_tokens: usize,
     max_requests: usize,
     max_target_distributions: usize,
     max_k: usize,
@@ -20,12 +20,12 @@ pub struct SpecProbsStore {
 impl SpecProbsStore {
     pub fn new(
         device: &Device,
-        max_num_spec_tokens: usize,
+        max_spec_tokens: usize,
         max_requests: usize,
         max_target_distributions: usize,
         max_k: usize,
     ) -> Self {
-        if max_num_spec_tokens == 0 {
+        if max_spec_tokens == 0 {
             return Self::default();
         }
         assert!(max_requests > 0, "draft store requires requests");
@@ -36,7 +36,7 @@ impl SpecProbsStore {
         assert!(max_k > 0, "draft store requires slots");
         assert!(u32::try_from(max_k).is_ok(), "draft distribution width must fit u32");
         let num_draft_distributions = max_requests
-            .checked_mul(max_num_spec_tokens)
+            .checked_mul(max_spec_tokens)
             .expect("draft-distribution count overflow");
         u32::try_from(num_draft_distributions).expect("draft-distribution count must fit u32");
         u32::try_from(max_target_distributions).expect("target-distribution count must fit u32");
@@ -47,7 +47,7 @@ impl SpecProbsStore {
             .checked_mul(max_k)
             .expect("target-distribution slot count overflow");
         Self {
-            max_num_spec_tokens,
+            max_spec_tokens,
             max_requests,
             max_target_distributions,
             max_k,
@@ -72,7 +72,7 @@ impl SpecProbsStore {
                     req_slot_index < self.max_requests,
                     "speculative-probability request slot exceeds capacity"
                 );
-                for spec_token_index in 0..self.max_num_spec_tokens {
+                for spec_token_index in 0..self.max_spec_tokens {
                     let distribution_index = self.distribution_index(req_slot, spec_token_index);
                     self.expected_draft_token_ids[distribution_index] = None;
                 }
@@ -85,7 +85,7 @@ impl SpecProbsStore {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.max_num_spec_tokens > 0
+        self.max_spec_tokens > 0
     }
 
     pub fn max_k(&self) -> usize {
@@ -93,7 +93,7 @@ impl SpecProbsStore {
     }
 
     pub fn num_draft_distributions(&self) -> u32 {
-        (self.max_requests * self.max_num_spec_tokens) as u32
+        (self.max_requests * self.max_spec_tokens) as u32
     }
 
     pub fn num_target_distributions(&self) -> u32 {
@@ -154,7 +154,7 @@ impl SpecProbsStore {
 
     fn distribution_index(&self, req_slot: u32, spec_token_index: usize) -> usize {
         assert!(self.is_enabled(), "draft store is disabled");
-        request_major_distribution_index(req_slot, spec_token_index, self.max_requests, self.max_num_spec_tokens)
+        request_major_distribution_index(req_slot, spec_token_index, self.max_requests, self.max_spec_tokens)
     }
 }
 
@@ -162,13 +162,10 @@ fn request_major_distribution_index(
     req_slot: u32,
     spec_token_index: usize,
     max_requests: usize,
-    max_num_spec_tokens: usize,
+    max_spec_tokens: usize,
 ) -> usize {
     let req_slot = req_slot as usize;
     assert!(req_slot < max_requests, "draft request slot exceeds capacity");
-    assert!(
-        spec_token_index < max_num_spec_tokens,
-        "draft token index exceeds capacity"
-    );
-    req_slot * max_num_spec_tokens + spec_token_index
+    assert!(spec_token_index < max_spec_tokens, "draft token index exceeds capacity");
+    req_slot * max_spec_tokens + spec_token_index
 }

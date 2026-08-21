@@ -404,6 +404,10 @@ The map must be empty after construction.
 Only gated `GQA` constructs the activation-gate component. Backend source and APIs contain no Qwen model names or Qwen
 configuration types.
 
+`gqa::qgkv_split`, `gqa::qkv_split`, and `gqa::activation_gate` each own private `KernelConstants`. Their
+`thread_block.required_threads` value is 256. The Q/K/V head geometry is also a compile-time source constant for the
+projection-split and activation-gate kernels. Runtime token counts remain invocation data.
+
 ## Replay contract
 
 `GQA` records one GQA layer forward through `ReplayLayer::record(...)` and a caller-owned `Recorder`. It does not

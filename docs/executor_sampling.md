@@ -110,13 +110,13 @@ slot. Replay arguments limit execution to the active request count.
 
 `SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
 `max_k` is the maximum sparse Top-K row width, not the vocabulary size.
-Its draft capacity is `max_requests * max_num_spec_tokens`.
+Its draft capacity is `max_requests * max_spec_tokens`.
 Its target capacity is the executor `max_tokens` value.
 Debug builds also retain `expected_draft_token_ids` for lifecycle validation.
 Release builds do not allocate, reset, or compare this CPU-only metadata.
 
 Draft distributions cross a batch boundary.
-Their row identity is `req_slot * max_num_spec_tokens + proposal_position`.
+Their row identity is `req_slot * max_spec_tokens + proposal_position`.
 Main verification distributions exist only in the current submission.
 They use compact active-row indices from zero.
 `cu_target_distributions` uses this compact row domain.
