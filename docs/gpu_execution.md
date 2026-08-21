@@ -192,7 +192,7 @@ must not add a selector only to match another component.
 | Component | Semantic execution | Non-persistent thread-block task | Dynamic selection owner |
 | --- | --- | --- | --- |
 | Quantized embedding | Dequantize selected vocabulary rows into hidden rows. | A bounded flat range of `(token, hidden)` output values. | One current fixed variant. No registry or selector. |
-| Unembedding | Apply one affine quantized projection from hidden rows to vocabulary logits. | The selected affine QMV or QMM kernel defines the task. | `AffineQuantizedMatmul` owns the row-dependent QMV/QMM selection. `Unembed` does not select it again. |
+| Unembedding | Apply one affine quantized projection from hidden rows to vocabulary logits. | The selected affine QMV or QMM kernel defines the task. | The private `AffineQuantizedMatmul` registry and selector own the row-dependent QMV/QMM choice. `Unembed` does not select it again. |
 | Row gather | Copy indexed input rows to a dense output. | A bounded flat range of `(output row, column)` values. | Dtype fixes one variant during initialization. No dynamic selector. |
 | RMSNorm | Normalize one hidden row and apply its weight row. | One token row. | Dtype fixes one variant during initialization. No dynamic selector. |
 | Residual add | Add two flat tensors or two row-major active prefixes. | A bounded flat range of output values. | Dtypes fix one variant during initialization. No dynamic selector. |

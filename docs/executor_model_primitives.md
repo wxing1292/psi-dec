@@ -71,8 +71,10 @@ hidden[num_rows, hidden_dim]
     -> logits[num_rows, vocab_size]
 ```
 
-`AffineQuantizedMatmul` owns QMV/QMM registration, row-dependent selection, kernel tile geometry, and topology
-boundaries. `Unembed` supplies model geometry, weights, buffers, and row counts. It must not select a second kernel.
+`AffineQuantizedMatmul` owns a private `Registry` and `Selector`. The registry stores the legal QMV and QMM execution
+variants. `Selector::select(...)` returns `(AffineQuantizedMatmulKernelKind, &AffineQuantizedMatmulKernel)` from the
+validated matrix configuration and row count. The same selection owns kernel tile geometry and topology boundaries.
+`Unembed` supplies model geometry, weights, buffers, and row counts. It must not select a second kernel.
 
 Embedding and unembedding share weight lifecycle and replay-capacity conventions. They do not share one GPU selector.
 Embedding is a row lookup. Unembedding is a matrix multiplication.

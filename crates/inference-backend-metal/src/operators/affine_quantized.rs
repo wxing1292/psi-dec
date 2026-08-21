@@ -130,11 +130,14 @@ pub struct AffineQuantizedMatmulKernel {
 
 pub struct AffineQuantizedMatmul {
     config: AffineQuantizedMatmulConfig,
-    qmv: AffineQuantizedMatmulKernel,
-    qmm_bm8_bn32: AffineQuantizedMatmulKernel,
-    qmm_bm16_bn32: AffineQuantizedMatmulKernel,
-    qmm_bm32_bn32: AffineQuantizedMatmulKernel,
+    registry: Registry,
 }
+
+struct Registry {
+    entries: Vec<(AffineQuantizedMatmulKernelKind, AffineQuantizedMatmulKernel)>,
+}
+
+struct Selector;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExpertAffineQuantizedConfig {
@@ -1300,21 +1303,9 @@ impl AffineQuantizedMatmulKernel {
 impl AffineQuantizedMatmul {
     pub fn new(device: &Device, config: AffineQuantizedMatmulConfig) -> Self {
         config.validate();
-        let qmv_kind = select_qmv_kernel_kind(config);
         Self {
             config,
-            qmv: AffineQuantizedMatmulKernel::new(device, config, qmv_kind),
-            qmm_bm8_bn32: AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm8Bn32),
-            qmm_bm16_bn32: AffineQuantizedMatmulKernel::new(
-                device,
-                config,
-                AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
-            ),
-            qmm_bm32_bn32: AffineQuantizedMatmulKernel::new(
-                device,
-                config,
-                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
-            ),
+            registry: Registry::new(device, config),
         }
     }
 
@@ -1368,7 +1359,12 @@ impl AffineQuantizedMatmul {
         biases: &'a Buffer,
         biases_offset_bytes: usize,
     ) -> AffineQuantizedMatmulInvocation<'a> {
-        self.kernel_for_topology(self.topology(num_total_rows)).invoke_bucketed(
+        let (_, kernel) = Selector::select(
+            &self.registry,
+            self.config,
+            i32::try_from(num_total_rows).expect("affine total row count must fit i32"),
+        );
+        kernel.invoke_bucketed(
             num_total_rows,
             num_active_rows_key,
             output,
@@ -1387,10 +1383,12 @@ impl AffineQuantizedMatmul {
     /// Returns the recorded kernel topology for one total row count.
     pub fn topology(&self, num_total_rows: u32) -> AffineQuantizedMatmulKernelKind {
         validate_num_total_rows(num_total_rows);
-        select_kernel_kind(
+        Selector::select(
+            &self.registry,
             self.config,
             i32::try_from(num_total_rows).expect("affine total row count must fit i32"),
         )
+        .0
     }
 
     /// Returns the first row count for each change in recorded kernel topology.
@@ -1400,15 +1398,69 @@ impl AffineQuantizedMatmul {
 
     pub fn selected_kernel(&self, m: i32) -> &AffineQuantizedMatmulKernel {
         assert!(m > 0);
-        self.kernel_for_topology(select_kernel_kind(self.config, m))
+        Selector::select(&self.registry, self.config, m).1
+    }
+}
+
+impl Registry {
+    fn new(device: &Device, config: AffineQuantizedMatmulConfig) -> Self {
+        let qmv_key = Selector::qmv_key(config);
+        Self {
+            entries: vec![
+                (qmv_key, AffineQuantizedMatmulKernel::new(device, config, qmv_key)),
+                (
+                    AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm8Bn32),
+                ),
+                (
+                    AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
+                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm16Bn32),
+                ),
+                (
+                    AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
+                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm32Bn32),
+                ),
+            ],
+        }
     }
 
-    fn kernel_for_topology(&self, topology: AffineQuantizedMatmulKernelKind) -> &AffineQuantizedMatmulKernel {
-        match topology {
-            AffineQuantizedMatmulKernelKind::QmvBn8Bk32 | AffineQuantizedMatmulKernelKind::QmvQuadBn64 => &self.qmv,
-            AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => &self.qmm_bm8_bn32,
-            AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => &self.qmm_bm16_bn32,
-            AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => &self.qmm_bm32_bn32,
+    fn get(&self, key: AffineQuantizedMatmulKernelKind) -> &AffineQuantizedMatmulKernel {
+        self.entries
+            .iter()
+            .find_map(|(candidate_key, kernel)| (*candidate_key == key).then_some(kernel))
+            .unwrap_or_else(|| panic!("missing affine quantized matmul execution variant {key:?}"))
+    }
+}
+
+impl Selector {
+    fn select(
+        registry: &Registry,
+        config: AffineQuantizedMatmulConfig,
+        num_rows: i32,
+    ) -> (AffineQuantizedMatmulKernelKind, &AffineQuantizedMatmulKernel) {
+        let key = Self::key(config, num_rows);
+        (key, registry.get(key))
+    }
+
+    fn key(config: AffineQuantizedMatmulConfig, num_rows: i32) -> AffineQuantizedMatmulKernelKind {
+        config.validate();
+        assert!(num_rows > 0);
+        if num_rows < adaptive_qmv_batch_limit(config) {
+            Self::qmv_key(config)
+        } else if config.n < 65_536 && (config.n > 4096 || config.k > 4096) && num_rows <= QMM_BM8_MAX_ROWS {
+            AffineQuantizedMatmulKernelKind::QmmBm8Bn32
+        } else if num_rows <= QMM_BM16_MAX_ROWS {
+            AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        } else {
+            AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+        }
+    }
+
+    fn qmv_key(config: AffineQuantizedMatmulConfig) -> AffineQuantizedMatmulKernelKind {
+        if config.uses_same_dtype() && matches!(config.k, 64 | 128) && is_power_of_two(config.bits) {
+            AffineQuantizedMatmulKernelKind::QmvQuadBn64
+        } else {
+            AffineQuantizedMatmulKernelKind::QmvBn8Bk32
         }
     }
 }
@@ -1804,7 +1856,7 @@ fn adaptive_topology_boundaries(config: AffineQuantizedMatmulConfig) -> Box<[u32
     candidates.sort_unstable();
     let mut boundaries = Vec::with_capacity(candidates.len());
     for boundary in candidates {
-        if boundary > 1 && select_kernel_kind(config, boundary - 1) != select_kernel_kind(config, boundary) {
+        if boundary > 1 && Selector::key(config, boundary - 1) != Selector::key(config, boundary) {
             let boundary = u32::try_from(boundary).expect("affine topology boundary must fit u32");
             if boundaries.last() != Some(&boundary) {
                 boundaries.push(boundary);
@@ -1812,28 +1864,6 @@ fn adaptive_topology_boundaries(config: AffineQuantizedMatmulConfig) -> Box<[u32
         }
     }
     boundaries.into_boxed_slice()
-}
-
-fn select_kernel_kind(config: AffineQuantizedMatmulConfig, m: i32) -> AffineQuantizedMatmulKernelKind {
-    config.validate();
-    assert!(m > 0);
-    if m < adaptive_qmv_batch_limit(config) {
-        select_qmv_kernel_kind(config)
-    } else if config.n < 65_536 && (config.n > 4096 || config.k > 4096) && m <= QMM_BM8_MAX_ROWS {
-        AffineQuantizedMatmulKernelKind::QmmBm8Bn32
-    } else if m <= QMM_BM16_MAX_ROWS {
-        AffineQuantizedMatmulKernelKind::QmmBm16Bn32
-    } else {
-        AffineQuantizedMatmulKernelKind::QmmBm32Bn32
-    }
-}
-
-fn select_qmv_kernel_kind(config: AffineQuantizedMatmulConfig) -> AffineQuantizedMatmulKernelKind {
-    if config.uses_same_dtype() && matches!(config.k, 64 | 128) && is_power_of_two(config.bits) {
-        AffineQuantizedMatmulKernelKind::QmvQuadBn64
-    } else {
-        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
-    }
 }
 
 fn validate_kernel_kind(config: AffineQuantizedMatmulConfig, kind: AffineQuantizedMatmulKernelKind) {

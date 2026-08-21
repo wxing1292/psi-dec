@@ -33,19 +33,19 @@ fn test_expert_config_rejects_unimplemented_mixed_dtype_template() {
 #[test]
 fn test_adaptive_large_vocabulary_qmm_crossover() {
     assert_eq!(
-        select_kernel_kind(adaptive_config(151_936, 2048, Dtype::Bfloat16), 4),
+        Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 4),
         AffineQuantizedMatmulKernelKind::QmvBn8Bk32
     );
     assert_eq!(
-        select_kernel_kind(adaptive_config(151_936, 2048, Dtype::Bfloat16), 5),
+        Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 5),
         AffineQuantizedMatmulKernelKind::QmmBm16Bn32
     );
     assert_eq!(
-        select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 5),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 5),
         AffineQuantizedMatmulKernelKind::QmvBn8Bk32
     );
     assert_eq!(
-        select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 6),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 6),
         AffineQuantizedMatmulKernelKind::QmmBm16Bn32
     );
 }
@@ -53,11 +53,11 @@ fn test_adaptive_large_vocabulary_qmm_crossover() {
 #[test]
 fn test_adaptive_qmm_tile_crossover() {
     assert_eq!(
-        select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 16),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 16),
         AffineQuantizedMatmulKernelKind::QmmBm16Bn32
     );
     assert_eq!(
-        select_kernel_kind(adaptive_config(151_936, 5120, Dtype::Bfloat16), 17),
+        Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 17),
         AffineQuantizedMatmulKernelKind::QmmBm32Bn32
     );
 }
@@ -66,29 +66,29 @@ fn test_adaptive_qmm_tile_crossover() {
 fn test_adaptive_dense_projection_crossover() {
     let large_projection = adaptive_config(34_816, 5120, Dtype::Bfloat16);
     assert_eq!(
-        select_kernel_kind(large_projection, 5),
+        Selector::key(large_projection, 5),
         AffineQuantizedMatmulKernelKind::QmvBn8Bk32
     );
     assert_eq!(
-        select_kernel_kind(large_projection, 6),
+        Selector::key(large_projection, 6),
         AffineQuantizedMatmulKernelKind::QmmBm8Bn32
     );
     assert_eq!(
-        select_kernel_kind(large_projection, 8),
+        Selector::key(large_projection, 8),
         AffineQuantizedMatmulKernelKind::QmmBm8Bn32
     );
     assert_eq!(
-        select_kernel_kind(large_projection, 9),
+        Selector::key(large_projection, 9),
         AffineQuantizedMatmulKernelKind::QmmBm16Bn32
     );
 
     let common_projection = adaptive_config(1024, 2048, Dtype::Bfloat16);
     assert_eq!(
-        select_kernel_kind(common_projection, 8),
+        Selector::key(common_projection, 8),
         AffineQuantizedMatmulKernelKind::QmvBn8Bk32
     );
     assert_eq!(
-        select_kernel_kind(common_projection, 18),
+        Selector::key(common_projection, 18),
         AffineQuantizedMatmulKernelKind::QmmBm32Bn32
     );
 }
@@ -111,8 +111,8 @@ fn test_adaptive_topology_boundaries_follow_selector() {
         for num_active_rows in 1..=64 {
             let num_total_rows = policy.capacity(num_active_rows);
             assert_eq!(
-                select_kernel_kind(config, num_active_rows as i32),
-                select_kernel_kind(config, num_total_rows as i32),
+                Selector::key(config, num_active_rows as i32),
+                Selector::key(config, num_total_rows as i32),
                 "config={config:?} num_active_rows={num_active_rows} num_total_rows={num_total_rows}"
             );
         }
@@ -355,10 +355,10 @@ fn test_adaptive_matmul_supports_all_float_dtype_combinations() {
                 let matmul = AffineQuantizedMatmul::new(&device, config);
 
                 let cases = [
-                    (&matmul.qmv, 2),
-                    (&matmul.qmm_bm8_bn32, 7),
-                    (&matmul.qmm_bm16_bn32, 15),
-                    (&matmul.qmm_bm32_bn32, 31),
+                    (matmul.registry.get(Selector::qmv_key(config)), 2),
+                    (matmul.registry.get(AffineQuantizedMatmulKernelKind::QmmBm8Bn32), 7),
+                    (matmul.registry.get(AffineQuantizedMatmulKernelKind::QmmBm16Bn32), 15),
+                    (matmul.registry.get(AffineQuantizedMatmulKernelKind::QmmBm32Bn32), 31),
                 ];
                 for (kernel, m) in cases {
                     let output = Buffer::new_zeroed(&device, config.output_bytes(m));
@@ -495,7 +495,7 @@ fn test_qmv_reference() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -558,7 +558,7 @@ fn test_qmv_fast_reference() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -618,7 +618,7 @@ fn test_qmm_reference() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -778,7 +778,7 @@ fn test_qmv_bf16() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -855,7 +855,7 @@ fn test_qmv_fast_bf16() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -929,7 +929,7 @@ fn test_qmm_bf16() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, select_kernel_kind(config, m)).invoke(
+        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
