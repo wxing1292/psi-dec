@@ -58,10 +58,11 @@ use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembed;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembedArgs;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembedReplayKey;
+use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkDecodeRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
+use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkPrefillRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
-use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkRecording;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
+use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkPrefillArgs;
 use crate::model::state_snapshot::FullStateIO;
 use crate::model::state_snapshot::GQAStateSnapshotFiles;
 use crate::model::state_snapshot::PageArenaStateSnapshotFiles;
@@ -474,7 +475,8 @@ pub struct Qwen3ModelOpsRecorder {
     rejection_key: Option<RejectionReplayKey>,
     rejection_arguments: ReplayArguments,
     rejection_prepared: Option<PreparedRejection>,
-    dspark: Qwen3xDSparkRecording,
+    dspark_prefill: Option<Qwen3xDSparkPrefillRecording>,
+    dspark_decode: Option<Qwen3xDSparkDecodeRecording>,
     num_main_sample_rows: usize,
 }
 
@@ -619,7 +621,8 @@ impl ReplayableModel for Qwen3Executor {
         Qwen3ModelOpsRecorder {
             main_embed_key,
             main_key,
-            dspark: Qwen3xDSparkRecording::new(),
+            dspark_prefill: None,
+            dspark_decode: None,
             gather_unembed_key: None,
             sampling_key: None,
             sampling_arguments: ReplayArguments::new(),
@@ -680,21 +683,6 @@ impl ReplayableModel for Qwen3Executor {
             recorded_key, recorder.main_key,
             "qwen3 Main replay input must match the prepared replay key"
         );
-        if self.speculator.is_dspark() {
-            let context_input = Qwen3xDSparkContextArgs {
-                num_tokens: microbatch
-                    .total_tokens()
-                    .try_into()
-                    .expect("Qwen3 DSpark context token count must fit u32"),
-                req_slots: self.main_gqa_state.metadata().req_slots(),
-                flat_token_indices: self.main_gqa_state.metadata().flat_token_indices(),
-                pages: self.pages.buffer(),
-            };
-            self.speculator
-                .dspark_mut()
-                .execution
-                .record_context(&runtime, &context_input, &mut recorder.dspark);
-        }
         self.pending_transactions.push(model_batch_req.compute_seq());
         Rc::clone(&self.hidden_output)
     }
@@ -779,55 +767,58 @@ impl ReplayableModel for Qwen3Executor {
         Qwen3SampledOutput { decisions, timing }
     }
 
-    fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, sampled_output: &Self::SampledOutput) -> bool {
+    fn run_spec_prefill(&self, model_batch_req: &Self::ModelBatchRequest) -> bool {
+        self.speculator.is_dspark() && model_batch_req.microbatch().total_tokens() > 0
+    }
+
+    fn prefill_spec(&mut self, recorder: &mut Self::ModelOpsRecorder, model_batch_req: &Self::ModelBatchRequest) {
+        let microbatch = model_batch_req.microbatch();
+        let input = Qwen3xDSparkPrefillArgs {
+            num_tokens: microbatch
+                .total_tokens()
+                .try_into()
+                .expect("Qwen3 DSpark Prefill token count must fit u32"),
+            req_slots: self.main_gqa_state.metadata().req_slots(),
+            flat_token_indices: self.main_gqa_state.metadata().flat_token_indices(),
+            pages: self.pages.buffer(),
+        };
+        let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        assert!(
+            recorder.dspark_prefill.is_none(),
+            "Qwen3 DSpark Prefill is already recorded"
+        );
+        recorder.dspark_prefill = Some(self.speculator.dspark_mut().execution.record_prefill(&runtime, &input));
+    }
+
+    fn run_spec_decode(
+        &self,
+        _model_batch_req: &Self::ModelBatchRequest,
+        sampled_output: &Self::SampledOutput,
+    ) -> bool {
         self.speculator.is_dspark() && !sampled_output.decisions.is_empty()
     }
 
-    fn embed_spec(
+    fn decode_spec(
         &mut self,
         recorder: &mut Self::ModelOpsRecorder,
         model_batch_req: &Self::ModelBatchRequest,
-        model_batch_hidden: &Self::ModelBatchHidden,
         sampled_output: &Self::SampledOutput,
-    ) -> Self::ModelBatchHidden {
-        assert!(
-            Rc::ptr_eq(model_batch_hidden, &self.hidden_output),
-            "Qwen3 DSpark must follow the Main hidden workspace"
-        );
-        self.record_dspark_embed(recorder, model_batch_req.microbatch(), &sampled_output.decisions)
-    }
-
-    fn forward_spec(
-        &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        _model_batch_req: &Self::ModelBatchRequest,
-        model_batch_hidden: Self::ModelBatchHidden,
-    ) -> Self::ModelBatchHidden {
-        self.record_dspark(recorder, model_batch_hidden)
-    }
-
-    fn unembed_spec(
-        &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        _model_batch_req: &Self::ModelBatchRequest,
-        model_batch_hidden: &Self::ModelBatchHidden,
-    ) -> Self::ModelBatchResponse {
-        self.record_dspark_gather_unembed(recorder, model_batch_hidden);
-        Qwen3ModelBatchResponse
-    }
-
-    fn sample_spec(
-        &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        _model_batch_req: &Self::ModelBatchRequest,
-        _model_batch_resp: &Self::ModelBatchResponse,
     ) {
-        self.record_dspark_sampling(recorder);
+        assert!(
+            recorder.dspark_decode.is_none(),
+            "Qwen3 DSpark Decode is already recorded"
+        );
+        recorder.dspark_decode =
+            Some(self.record_dspark_decode(model_batch_req.microbatch(), &sampled_output.decisions));
     }
 
     fn submit_spec(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission {
         let runtime = self.replay_runtime();
-        self.speculator.dspark().execution.submit(&runtime, &recorder.dspark)
+        self.speculator.dspark().execution.submit(
+            &runtime,
+            recorder.dspark_prefill.as_ref(),
+            recorder.dspark_decode.as_ref(),
+        )
     }
 
     fn read_spec(

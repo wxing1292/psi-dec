@@ -176,9 +176,6 @@ component path as the design.
   If a checkpoint permits per-layer layouts, resolve each semantic layer from its exact binding subtree.
   Keep page tables, metadata, and compatible scratch shared.
   Do not share a weight-dependent backend across incompatible affine layouts.
-- Wire the reusable Qwen3x DSpark model into Qwen3.5 only when a supported checkpoint defines the Main compatibility
-  and executor lifecycle. Reuse `MainResidualCapture`, `Qwen3xDSparkModel`, `Qwen3xDSparkMarkov`, and the generic
-  DSpark attention/state owners. Do not create a parallel `qwen/v3_5/dspark` implementation.
 - Allow an MTP request to start with fewer than `num_spec_tokens` input tokens.
   The runtime currently returns `InvalidArgument` because Trie initialization requires one input token for each MTP
   cache lane. Add a Main-only warm-up phase that creates enough verified history before it enables MTP. The runtime
@@ -192,7 +189,7 @@ component path as the design.
   Compare the Main GQA, dense MLP, and unembed outputs before changing production kernels.
   Treat exact batch-shape reproducibility as a separate requirement from DSpark rejection correctness.
 - Add a separate gated DSpark GQA implementation when a supported checkpoint requires it.
-  Do not add a runtime gate flag to `UngatedDSparkGQA`.
+  Do not add a runtime gate flag to `DSparkGQA`.
   Keep the history map, block map, reducer, page layout, and scratch contracts gate-neutral.
 - Add Qwen3 DSpark checkpoint variants only from real checkpoint contracts.
   This work can include a final-layer entry in the official `target_layer_ids` field, additional Markov heads, or a

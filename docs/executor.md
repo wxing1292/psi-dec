@@ -522,13 +522,26 @@ The generic executor lifecycle uses role-qualified Main and Spec hooks:
 embed_main -> forward_main -> unembed_main -> sample_main
 submit_main -> wait -> read_main
 
+run_spec
 embed_spec -> forward_spec -> unembed_spec -> sample_spec
+submit_spec -> wait -> read_spec
+
+run_spec_prefill -> prefill_spec                  when Spec Prefill work exists
+run_spec_decode -> decode_spec                    when Spec Decode work exists
 submit_spec -> wait -> read_spec
 ```
 
-Each record hook owns one semantic stage.
-`forward_spec` must not also record Spec embedding, unembedding, or sampling.
-Main and Spec may have different data contracts, but they must preserve this lifecycle shape.
+The first Spec form is one combined invocation.
+Qwen3.5 MTP uses this form and keeps its existing `embed_spec`, `forward_spec`, `unembed_spec`, and `sample_spec` order.
+
+The second Spec form contains independent Prefill and Decode invocations.
+DSpark uses this form.
+The DSpark outer execution owner can record one or both invocations before one Spec submission.
+The service calls `read_spec` only when DSpark Decode produces a host-visible result.
+One model mode must not select both forms for the same batch.
+
+One model-specific Spec Decode owner can compose embedding, model layers, output, and sampling.
+This composition keeps the complete Spec Decode lifecycle at the model role boundary.
 
 Detailed keys, stage order, and request lifecycle are in [`executor_qwen.md`](executor_qwen.md). Sampling and rejection RNG
 and write-distribution contracts are in [`executor_sampling.md`](executor_sampling.md).

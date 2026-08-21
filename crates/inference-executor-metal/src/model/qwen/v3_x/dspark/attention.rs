@@ -120,7 +120,7 @@ impl Qwen3xDSparkAttention {
             .expect("Qwen3.x DSpark attention weights must be loaded before execution")
     }
 
-    pub fn record_context<'a, R>(
+    pub fn record_prefill<'a, R>(
         &'a self,
         recorder: &mut R,
         num_tokens: u32,

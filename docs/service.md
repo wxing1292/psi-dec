@@ -596,14 +596,15 @@ Normal sampling submits these replay programs in one ordered Metal command buffe
 Speculative Main verification replaces Sampling with RejectionSampling.
 
 An MTP proposal uses K ordered passes of MTPEmbed, MTP, GatherUnembed, and DraftSampling.
-The public Spec lifecycle remains one `submit_spec -> wait -> read_spec` transaction.
+The public MTP lifecycle remains one `submit_spec -> wait -> read_spec` transaction.
 The current implementation submits each dependent pass separately and reads its sampled token on the CPU before it
 prepares the next pass.
 All passes reuse the same recorded replay programs, weights, scratch, and bound workspaces.
 
-A DSpark proposal uses a separate submission with DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
-The Main submission records DSparkContext before GatherUnembed.
-Main decisions cross the CPU boundary before DSpark constructs the anchor block.
+A DSpark-enabled batch records DSpark Prefill after the Main CPU read.
+DSpark Prefill creates persistent DSpark history K/V from the completed Main capture.
+A decode-ready batch then records DSpark Decode in the same Spec submission.
+DSpark Decode contains DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
 
 `--logging info` emits one `phase="executor.batch.perf"` event after each non-empty executor batch. The event uses the
 same schema for Vanilla, MTP, and DSpark. It also uses the same schema for prefill and decode batches:
@@ -636,9 +637,10 @@ all earlier speculative tokens passed verification. `num_spec_token_by_index[i]`
 batches before they calculate `acceptance_rate_by_index`.
 
 `main_ms` covers `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
-`spec_ms` covers the complete MTP or DSpark Spec lifecycle. It includes all dependent MTP passes.
-`spec_ms` and `spec_passes` are zero when the batch does not run Spec. These values are host elapsed latencies. They are
-not GPU kernel timings.
+`spec_ms` covers the complete MTP or DSpark Spec lifecycle.
+It includes all dependent MTP passes and any recorded DSpark Prefill and Decode work.
+DSpark prefill-only batches can have nonzero `spec_ms` and zero `spec_passes`.
+`spec_passes` counts Spec Decode forwards. These values are host elapsed latencies. They are not GPU kernel timings.
 
 `--logging debug` emits the same INFO performance event. It also emits request and response diagnostics. It does not
 emit a second DEBUG performance event.
@@ -655,14 +657,18 @@ Executor profiling spans use the lifecycle hook names:
 ```text
 embed_main -> forward_main -> unembed_main -> sample_main
 submit_main -> read_main
-embed_spec -> forward_spec -> unembed_spec -> sample_spec
+
+embed_spec -> forward_spec -> unembed_spec -> sample_spec    MTP
+
+prefill_spec -> decode_spec                                      DSpark
 submit_spec -> read_spec
 ```
 
-A pass is one auxiliary speculator forward that runs.
-For Qwen3.5, each logical MTP step or DSpark block forward is one pass.
+A pass is one proposal forward that runs.
+For Qwen3.5, each logical MTP step or DSpark Decode block is one pass.
 For Qwen3, each DSpark block forward is one pass.
-Qwen3 does not run DSpark Spec for a prefill-only batch because no sampled anchor exists.
+Qwen3 runs DSpark Prefill for a prefill-only batch.
+It does not run DSpark Decode because no sampled anchor exists.
 
 Runtime shutdown emits a scheduler table. The table contains call counts and latency percentiles for the runtime
 lifetime.

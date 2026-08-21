@@ -378,32 +378,49 @@ where
         };
         let main_elapsed = main_start.elapsed();
 
+        let run_spec = last_pp_stage && self.model.run_spec(&model_batch_req, &sampled_output);
+        let run_spec_prefill = last_pp_stage && self.model.run_spec_prefill(&model_batch_req);
+        let run_spec_decode = last_pp_stage && self.model.run_spec_decode(&model_batch_req, &sampled_output);
+        debug_assert!(
+            !run_spec || (!run_spec_prefill && !run_spec_decode),
+            "model executor must not mix the combined Spec invocation with Spec Prefill or Spec Decode"
+        );
         let mut spec_elapsed = Duration::ZERO;
-        if last_pp_stage && self.model.run_spec(&model_batch_req, &sampled_output) {
+        if run_spec || run_spec_prefill || run_spec_decode {
             let spec_start = Instant::now();
-            let spec_batch_hidden_req = {
-                let _span = profiling::span("model.embed_spec.record");
-                self.model.embed_spec(
-                    &mut recorder,
-                    &model_batch_req,
-                    &model_batch_hidden_resp,
-                    &sampled_output,
-                )
-            };
-            let spec_batch_hidden_resp = {
-                let _span = profiling::span("model.forward_spec.record");
-                self.model
-                    .forward_spec(&mut recorder, &model_batch_req, spec_batch_hidden_req)
-            };
-            let spec_batch_resp = {
-                let _span = profiling::span("model.unembed_spec.record");
-                self.model
-                    .unembed_spec(&mut recorder, &model_batch_req, &spec_batch_hidden_resp)
-            };
-            {
-                let _span = profiling::span("model.sample_spec.record");
-                self.model
-                    .sample_spec(&mut recorder, &model_batch_req, &spec_batch_resp);
+            if run_spec_prefill {
+                let _span = profiling::span("model.prefill_spec.record");
+                self.model.prefill_spec(&mut recorder, &model_batch_req);
+            }
+            if run_spec_decode {
+                let _span = profiling::span("model.decode_spec.record");
+                self.model.decode_spec(&mut recorder, &model_batch_req, &sampled_output);
+            }
+            if run_spec {
+                let spec_batch_hidden_req = {
+                    let _span = profiling::span("model.embed_spec.record");
+                    self.model.embed_spec(
+                        &mut recorder,
+                        &model_batch_req,
+                        &model_batch_hidden_resp,
+                        &sampled_output,
+                    )
+                };
+                let spec_batch_hidden_resp = {
+                    let _span = profiling::span("model.forward_spec.record");
+                    self.model
+                        .forward_spec(&mut recorder, &model_batch_req, spec_batch_hidden_req)
+                };
+                let spec_batch_resp = {
+                    let _span = profiling::span("model.unembed_spec.record");
+                    self.model
+                        .unembed_spec(&mut recorder, &model_batch_req, &spec_batch_hidden_resp)
+                };
+                {
+                    let _span = profiling::span("model.sample_spec.record");
+                    self.model
+                        .sample_spec(&mut recorder, &model_batch_req, &spec_batch_resp);
+                }
             }
             let spec_replay_start = Instant::now();
             {
@@ -412,11 +429,12 @@ where
                 submission.wait();
             }
             let spec_replay_elapsed = spec_replay_start.elapsed();
-            sampled_output = {
+            if run_spec || run_spec_decode {
                 let _span = profiling::span("model.read_spec");
-                self.model
-                    .read_spec(&recorder, &model_batch_req, sampled_output, spec_replay_elapsed)
-            };
+                sampled_output = self
+                    .model
+                    .read_spec(&recorder, &model_batch_req, sampled_output, spec_replay_elapsed);
+            }
             spec_elapsed = spec_start.elapsed();
         }
         drop(recorder);
@@ -573,13 +591,16 @@ fn summarize_f32_slice(values: &[f32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::Path;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
     use crossbeam_channel::unbounded;
     use inference_executor_core::def::ModelExecutorError;
+    use inference_runtime_core::compute::DecoderSyncBlocks;
 
     use super::*;
 
@@ -746,6 +767,268 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SpecLifecycleEvent {
+        PrepareBatch,
+        BeginRecording,
+        EmbedMain,
+        ForwardMain,
+        UnembedMain,
+        SampleMain,
+        SubmitMain,
+        WaitMain,
+        ReadMain,
+        RunSpec,
+        RunSpecPrefill,
+        RunSpecDecode,
+        EmbedSpec,
+        ForwardSpec,
+        UnembedSpec,
+        SampleSpec,
+        PrefillSpec,
+        DecodeSpec,
+        SubmitSpec,
+        WaitSpec,
+        ReadSpec,
+        CommitBatch,
+    }
+
+    struct SpecLifecycleSubmission {
+        events: Rc<RefCell<Vec<SpecLifecycleEvent>>>,
+        wait_event: SpecLifecycleEvent,
+    }
+
+    impl ExecutionSubmission for SpecLifecycleSubmission {
+        fn wait(&self) {
+            self.events.borrow_mut().push(self.wait_event);
+        }
+    }
+
+    struct SpecLifecycleModel {
+        events: Rc<RefCell<Vec<SpecLifecycleEvent>>>,
+        run_spec: bool,
+        run_prefill: bool,
+        run_decode: bool,
+    }
+
+    impl SpecLifecycleModel {
+        fn push(&self, event: SpecLifecycleEvent) {
+            self.events.borrow_mut().push(event);
+        }
+    }
+
+    impl ReplayableModel for SpecLifecycleModel {
+        type ModelBatchRequest = ();
+        type ModelBatchHidden = ();
+        type ModelBatchResponse = ();
+        type SampledOutput = ();
+        type ModelOpsRecorder = ();
+        type Submission = SpecLifecycleSubmission;
+
+        fn model_name(&self) -> &str {
+            "spec-lifecycle-test"
+        }
+
+        fn model_mode(&self) -> &'static str {
+            "test"
+        }
+
+        fn reset_req_slots(&mut self, _request_slots: &[RawRequestSlot]) {
+            unreachable!()
+        }
+
+        fn clear_replay_cache(&mut self) {
+            unreachable!()
+        }
+
+        fn unload_state(
+            &mut self,
+            _snapshot_path: &Path,
+            _plan: &ExecutorHibernationPlan,
+        ) -> Result<(), ModelExecutorError> {
+            unreachable!()
+        }
+
+        fn unload_weights(&mut self) {
+            unreachable!()
+        }
+
+        fn load_weights(&mut self) -> Result<(), ModelExecutorError> {
+            unreachable!()
+        }
+
+        fn load_state(
+            &mut self,
+            _snapshot_path: &Path,
+            _plan: &ExecutorHibernationPlan,
+        ) -> Result<(), ModelExecutorError> {
+            unreachable!()
+        }
+
+        fn prepare_batch(&mut self, _core_batch_req: &BatchDeviceRequest) -> Self::ModelBatchRequest {
+            self.push(SpecLifecycleEvent::PrepareBatch);
+        }
+
+        fn commit_batch(
+            &mut self,
+            core_batch_req: BatchDeviceRequest,
+            _sampled_output: Self::SampledOutput,
+        ) -> BatchDeviceResponse {
+            self.push(SpecLifecycleEvent::CommitBatch);
+            BatchDeviceResponse::new(core_batch_req.seq, Vec::new())
+        }
+
+        fn begin_ops_recording(&mut self, _batch_req: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {
+            self.push(SpecLifecycleEvent::BeginRecording);
+        }
+
+        fn embed_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _batch_req: &Self::ModelBatchRequest,
+        ) -> Self::ModelBatchHidden {
+            self.push(SpecLifecycleEvent::EmbedMain);
+        }
+
+        fn forward_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: Self::ModelBatchHidden,
+        ) -> Self::ModelBatchHidden {
+            self.push(SpecLifecycleEvent::ForwardMain);
+        }
+
+        fn unembed_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: &Self::ModelBatchHidden,
+        ) -> Self::ModelBatchResponse {
+            self.push(SpecLifecycleEvent::UnembedMain);
+        }
+
+        fn sample_main(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_resp: &Self::ModelBatchResponse,
+        ) {
+            self.push(SpecLifecycleEvent::SampleMain);
+        }
+
+        fn submit_main(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+            self.push(SpecLifecycleEvent::SubmitMain);
+            SpecLifecycleSubmission {
+                events: Rc::clone(&self.events),
+                wait_event: SpecLifecycleEvent::WaitMain,
+            }
+        }
+
+        fn read_main(
+            &mut self,
+            _recorder: &Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _replay_elapsed: Duration,
+        ) -> Self::SampledOutput {
+            self.push(SpecLifecycleEvent::ReadMain);
+        }
+
+        fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, _sampled_output: &Self::SampledOutput) -> bool {
+            self.push(SpecLifecycleEvent::RunSpec);
+            self.run_spec
+        }
+
+        fn embed_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: &Self::ModelBatchHidden,
+            _sampled_output: &Self::SampledOutput,
+        ) -> Self::ModelBatchHidden {
+            self.push(SpecLifecycleEvent::EmbedSpec);
+        }
+
+        fn forward_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: Self::ModelBatchHidden,
+        ) -> Self::ModelBatchHidden {
+            self.push(SpecLifecycleEvent::ForwardSpec);
+        }
+
+        fn unembed_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_hidden: &Self::ModelBatchHidden,
+        ) -> Self::ModelBatchResponse {
+            self.push(SpecLifecycleEvent::UnembedSpec);
+        }
+
+        fn sample_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _model_batch_resp: &Self::ModelBatchResponse,
+        ) {
+            self.push(SpecLifecycleEvent::SampleSpec);
+        }
+
+        fn run_spec_prefill(&self, _model_batch_req: &Self::ModelBatchRequest) -> bool {
+            self.push(SpecLifecycleEvent::RunSpecPrefill);
+            self.run_prefill
+        }
+
+        fn prefill_spec(&mut self, _recorder: &mut Self::ModelOpsRecorder, _model_batch_req: &Self::ModelBatchRequest) {
+            self.push(SpecLifecycleEvent::PrefillSpec);
+        }
+
+        fn run_spec_decode(
+            &self,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _sampled_output: &Self::SampledOutput,
+        ) -> bool {
+            self.push(SpecLifecycleEvent::RunSpecDecode);
+            self.run_decode
+        }
+
+        fn decode_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _sampled_output: &Self::SampledOutput,
+        ) {
+            self.push(SpecLifecycleEvent::DecodeSpec);
+        }
+
+        fn submit_spec(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+            self.push(SpecLifecycleEvent::SubmitSpec);
+            SpecLifecycleSubmission {
+                events: Rc::clone(&self.events),
+                wait_event: SpecLifecycleEvent::WaitSpec,
+            }
+        }
+
+        fn read_spec(
+            &mut self,
+            _recorder: &Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            sampled_output: Self::SampledOutput,
+            _replay_elapsed: Duration,
+        ) -> Self::SampledOutput {
+            self.push(SpecLifecycleEvent::ReadSpec);
+            sampled_output
+        }
+
+        fn empty_sampled_output(&self) -> Self::SampledOutput {}
+
+        fn sampled_output_len(&self, _sampled_output: &Self::SampledOutput) -> usize {
+            0
+        }
+    }
+
     fn test_snapshot_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "psi-dec-{test_name}-{}-{:?}.state",
@@ -756,6 +1039,87 @@ mod tests {
 
     fn test_executor_hibernation_plan() -> ExecutorHibernationPlan {
         ExecutorHibernationPlan::selected(vec![2..3, 5..6], vec![7..9, 12..13])
+    }
+
+    #[test]
+    fn test_spec_prefill_runs_without_decode() {
+        assert_eq!(
+            execute_spec_lifecycle(false, true, false),
+            vec![
+                SpecLifecycleEvent::PrepareBatch,
+                SpecLifecycleEvent::BeginRecording,
+                SpecLifecycleEvent::EmbedMain,
+                SpecLifecycleEvent::ForwardMain,
+                SpecLifecycleEvent::UnembedMain,
+                SpecLifecycleEvent::SampleMain,
+                SpecLifecycleEvent::SubmitMain,
+                SpecLifecycleEvent::WaitMain,
+                SpecLifecycleEvent::ReadMain,
+                SpecLifecycleEvent::RunSpec,
+                SpecLifecycleEvent::RunSpecPrefill,
+                SpecLifecycleEvent::RunSpecDecode,
+                SpecLifecycleEvent::PrefillSpec,
+                SpecLifecycleEvent::SubmitSpec,
+                SpecLifecycleEvent::WaitSpec,
+                SpecLifecycleEvent::CommitBatch,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_spec_prefill_precedes_decode() {
+        assert_eq!(
+            execute_spec_lifecycle(false, true, true),
+            vec![
+                SpecLifecycleEvent::PrepareBatch,
+                SpecLifecycleEvent::BeginRecording,
+                SpecLifecycleEvent::EmbedMain,
+                SpecLifecycleEvent::ForwardMain,
+                SpecLifecycleEvent::UnembedMain,
+                SpecLifecycleEvent::SampleMain,
+                SpecLifecycleEvent::SubmitMain,
+                SpecLifecycleEvent::WaitMain,
+                SpecLifecycleEvent::ReadMain,
+                SpecLifecycleEvent::RunSpec,
+                SpecLifecycleEvent::RunSpecPrefill,
+                SpecLifecycleEvent::RunSpecDecode,
+                SpecLifecycleEvent::PrefillSpec,
+                SpecLifecycleEvent::DecodeSpec,
+                SpecLifecycleEvent::SubmitSpec,
+                SpecLifecycleEvent::WaitSpec,
+                SpecLifecycleEvent::ReadSpec,
+                SpecLifecycleEvent::CommitBatch,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_combined_spec_invocation_stays_combined() {
+        assert_eq!(
+            execute_spec_lifecycle(true, false, false),
+            vec![
+                SpecLifecycleEvent::PrepareBatch,
+                SpecLifecycleEvent::BeginRecording,
+                SpecLifecycleEvent::EmbedMain,
+                SpecLifecycleEvent::ForwardMain,
+                SpecLifecycleEvent::UnembedMain,
+                SpecLifecycleEvent::SampleMain,
+                SpecLifecycleEvent::SubmitMain,
+                SpecLifecycleEvent::WaitMain,
+                SpecLifecycleEvent::ReadMain,
+                SpecLifecycleEvent::RunSpec,
+                SpecLifecycleEvent::RunSpecPrefill,
+                SpecLifecycleEvent::RunSpecDecode,
+                SpecLifecycleEvent::EmbedSpec,
+                SpecLifecycleEvent::ForwardSpec,
+                SpecLifecycleEvent::UnembedSpec,
+                SpecLifecycleEvent::SampleSpec,
+                SpecLifecycleEvent::SubmitSpec,
+                SpecLifecycleEvent::WaitSpec,
+                SpecLifecycleEvent::ReadSpec,
+                SpecLifecycleEvent::CommitBatch,
+            ]
+        );
     }
 
     #[test]
@@ -879,5 +1243,44 @@ mod tests {
 
         shutdown.shutdown();
         executor_thread.join().unwrap();
+    }
+
+    fn execute_spec_lifecycle(run_spec: bool, run_prefill: bool, run_decode: bool) -> Vec<SpecLifecycleEvent> {
+        let (_model_executor_req_tx, model_executor_req_rx) = bounded(1);
+        let (model_executor_resp_tx, _model_executor_resp_rx) = bounded(1);
+        let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut executor = ReplayableModelEventLoop::new(
+            model_executor_req_rx,
+            model_executor_resp_tx,
+            req_slot_reset_notifier,
+            req_slot_reset_rx,
+            Shutdown::new(),
+            SpecLifecycleModel {
+                events: Rc::clone(&events),
+                run_spec,
+                run_prefill,
+                run_decode,
+            },
+            std::env::temp_dir().join("psi-dec-spec-lifecycle-test.state"),
+        );
+        executor.execute(BatchDeviceRequest::new(
+            1,
+            [DeviceRequest::new(
+                1,
+                0,
+                QueryTokens::Prefill {
+                    epoch: 0,
+                    token_index: 0,
+                    tokens: vec![Token::new(1)],
+                    window: 1,
+                },
+                DecoderSyncBlocks::new(0, Vec::new(), Vec::new()),
+                Default::default(),
+            )],
+        ));
+        let recorded = events.borrow().clone();
+        drop(executor);
+        recorded
     }
 }

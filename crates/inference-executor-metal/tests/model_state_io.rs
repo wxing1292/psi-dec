@@ -317,13 +317,27 @@ fn run_one_decode(model: &mut inference_executor_metal::model::qwen::v3_5::execu
     model.sample_main(&mut recorder, &model_batch, &output);
     model.submit_main(&recorder).wait();
     let mut sampled = model.read_main(&recorder, &model_batch, Duration::ZERO);
-    if model.run_spec(&model_batch, &sampled) {
-        let hidden = model.embed_spec(&mut recorder, &model_batch, &hidden, &sampled);
-        let hidden = model.forward_spec(&mut recorder, &model_batch, hidden);
-        let output = model.unembed_spec(&mut recorder, &model_batch, &hidden);
-        model.sample_spec(&mut recorder, &model_batch, &output);
+    let run_spec = model.run_spec(&model_batch, &sampled);
+    let run_spec_prefill = model.run_spec_prefill(&model_batch);
+    let run_spec_decode = model.run_spec_decode(&model_batch, &sampled);
+    debug_assert!(!run_spec || (!run_spec_prefill && !run_spec_decode));
+    if run_spec || run_spec_prefill || run_spec_decode {
+        if run_spec_prefill {
+            model.prefill_spec(&mut recorder, &model_batch);
+        }
+        if run_spec_decode {
+            model.decode_spec(&mut recorder, &model_batch, &sampled);
+        }
+        if run_spec {
+            let spec_hidden = model.embed_spec(&mut recorder, &model_batch, &hidden, &sampled);
+            let spec_hidden = model.forward_spec(&mut recorder, &model_batch, spec_hidden);
+            let spec_output = model.unembed_spec(&mut recorder, &model_batch, &spec_hidden);
+            model.sample_spec(&mut recorder, &model_batch, &spec_output);
+        }
         model.submit_spec(&recorder).wait();
-        sampled = model.read_spec(&recorder, &model_batch, sampled, Duration::ZERO);
+        if run_spec || run_spec_decode {
+            sampled = model.read_spec(&recorder, &model_batch, sampled, Duration::ZERO);
+        }
     }
     drop(recorder);
     model.commit_batch(core_batch, sampled);

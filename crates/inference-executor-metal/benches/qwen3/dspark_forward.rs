@@ -95,7 +95,7 @@ fn main() {
                 num_requests: args.num_requests,
                 context: args.context,
             },
-            "embed-forward-context",
+            "embed-forward-prefill",
             measurement,
             || main_verification.run(),
         );
@@ -301,13 +301,21 @@ impl MainFixture {
         let replay_elapsed = replay_start.elapsed();
         let sampled = self.model.read_main(&recorder, &prepared, replay_elapsed);
         assert_eq!(self.model.sampled_output_len(&sampled), 0);
+        let spec_replay_elapsed = if self.model.run_spec_prefill(&prepared) {
+            self.model.prefill_spec(&mut recorder, &prepared);
+            let replay_start = Instant::now();
+            self.model.submit_spec(&recorder).wait();
+            replay_start.elapsed()
+        } else {
+            Duration::ZERO
+        };
         drop(recorder);
         black_box(self.model.commit_batch(batch, sampled));
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .expect("Main comparison sequence must fit u64");
-        replay_elapsed
+        replay_elapsed + spec_replay_elapsed
     }
 
     fn batch_request(&self) -> BatchDeviceRequest {

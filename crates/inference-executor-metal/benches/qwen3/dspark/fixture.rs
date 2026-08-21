@@ -212,29 +212,29 @@ impl Fixture {
         let mut spec_record = Duration::ZERO;
         let mut spec_submit = Duration::ZERO;
         let mut spec_read = Duration::ZERO;
-        if self.model.run_spec(&model_batch_request, &sampled_output) {
+        let run_spec_prefill = self.model.run_spec_prefill(&model_batch_request);
+        let run_spec_decode = self.model.run_spec_decode(&model_batch_request, &sampled_output);
+        if run_spec_prefill || run_spec_decode {
             let spec_record_start = Instant::now();
-            let spec_hidden = self
-                .model
-                .embed_spec(&mut recorder, &model_batch_request, &main_hidden, &sampled_output);
-            let spec_hidden = self
-                .model
-                .forward_spec(&mut recorder, &model_batch_request, spec_hidden);
-            let spec_output = self
-                .model
-                .unembed_spec(&mut recorder, &model_batch_request, &spec_hidden);
-            self.model
-                .sample_spec(&mut recorder, &model_batch_request, &spec_output);
+            if run_spec_prefill {
+                self.model.prefill_spec(&mut recorder, &model_batch_request);
+            }
+            if run_spec_decode {
+                self.model
+                    .decode_spec(&mut recorder, &model_batch_request, &sampled_output);
+            }
             spec_record = spec_record_start.elapsed();
 
             let spec_submit_start = Instant::now();
             self.model.submit_spec(&recorder).wait();
             spec_submit = spec_submit_start.elapsed();
-            let spec_read_start = Instant::now();
-            sampled_output = self
-                .model
-                .read_spec(&recorder, &model_batch_request, sampled_output, spec_submit);
-            spec_read = spec_read_start.elapsed();
+            if run_spec_decode {
+                let spec_read_start = Instant::now();
+                sampled_output = self
+                    .model
+                    .read_spec(&recorder, &model_batch_request, sampled_output, spec_submit);
+                spec_read = spec_read_start.elapsed();
+            }
         }
         drop(recorder);
 

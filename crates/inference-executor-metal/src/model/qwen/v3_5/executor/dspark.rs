@@ -1,10 +1,9 @@
 impl Qwen35Executor {
-    fn record_dspark_embed(
+    fn record_dspark_decode(
         &mut self,
-        recorder: &mut Qwen35ModelOpsRecorder,
         microbatch: &Qwen35Microbatch,
         decisions: &[Qwen35DecodeDecision],
-    ) -> Rc<Buffer> {
+    ) -> Qwen3xDSparkDecodeRecording {
         let mut req_slots = Vec::new();
         let mut anchor_token_ids = Vec::new();
         let mut anchor_positions = Vec::new();
@@ -70,7 +69,7 @@ impl Qwen35Executor {
 
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         let dspark = self.speculator.dspark_mut();
-        dspark.execution.record_embed(
+        dspark.execution.record_decode(
             &runtime,
             &self.token_ids,
             Qwen3xDSparkProposalInput::new(
@@ -79,42 +78,9 @@ impl Qwen35Executor {
                 &anchor_positions,
                 &sampler_configs,
             ),
+            self.pages.buffer(),
             &dspark.common.spec_probs,
-            &mut recorder.dspark,
         )
-    }
-
-    fn record_dspark(
-        &mut self,
-        recorder: &mut Qwen35ModelOpsRecorder,
-        hidden_input: Rc<Buffer>,
-    ) -> Rc<Buffer> {
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let pages = self.pages.buffer();
-        self.speculator
-            .dspark_mut()
-            .execution
-            .record_body(&runtime, pages, &mut recorder.dspark, hidden_input)
-    }
-
-    fn record_dspark_gather_unembed(
-        &mut self,
-        recorder: &mut Qwen35ModelOpsRecorder,
-        hidden_input: &Rc<Buffer>,
-    ) {
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        self.speculator
-            .dspark_mut()
-            .execution
-            .record_gather_unembed(&runtime, &mut recorder.dspark, hidden_input);
-    }
-
-    fn record_dspark_sampling(&mut self, recorder: &mut Qwen35ModelOpsRecorder) {
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let dspark = self.speculator.dspark_mut();
-        dspark
-            .execution
-            .record_sampling(&runtime, &dspark.common.spec_probs, &mut recorder.dspark);
     }
 
     fn read_dspark_proposal(
@@ -125,7 +91,13 @@ impl Qwen35Executor {
         let dspark = self.speculator.dspark_mut();
         let proposal = dspark
             .execution
-            .read_proposal(&recorder.dspark, &mut dspark.common.spec_probs);
+            .read_proposal(
+                recorder
+                    .dspark_decode
+                    .as_ref()
+                    .expect("qwen3.5 DSpark proposal requires a Decode recording"),
+                &mut dspark.common.spec_probs,
+            );
         assert_eq!(
             proposal.token_ids.len(),
             decisions.len(),

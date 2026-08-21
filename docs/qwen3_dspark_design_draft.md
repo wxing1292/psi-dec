@@ -83,12 +83,14 @@ Qwen3Executor
   Main
     main_embed
     main
-    dspark_context
     gather_unembed
     sampling
     rejection_sampling
 
-  DSpark Spec
+  DSpark Prefill
+    dspark_prefill
+
+  DSpark Decode
     dspark_embed
     dspark
     dspark_gather_unembed
@@ -105,8 +107,8 @@ Qwen3Executor
     pending Main transactions
 ```
 
-`dspark_context` is a normal `Replay<Qwen3xDSparkContext>` component.
-It runs in the Main submission.
+`dspark_prefill` is a normal `Replay<Qwen3xDSparkPrefill>` component.
+It runs in the Spec submission after the Main CPU read.
 This component projects selected Main residuals and appends persistent DSpark context K/V.
 This boundary keeps `Qwen3Main` independent from concrete DSpark types.
 
@@ -234,13 +236,13 @@ It must reject extra affine tensors.
 
 Qwen3 Main captures the raw output of each selected decoder layer.
 The capture owner preserves `target_layer_ids` order.
-It concatenates the selected outputs on the hidden dimension.
+Each selected layer writes directly into its assigned hidden-dimension columns.
+The implementation does not use a concatenate kernel or copy.
 
 The DSpark Main-feature stage applies this computation:
 
 ```text
 selected Main residuals
-  -> concatenate
   -> fc
   -> hidden_norm
   -> projected Main feature
@@ -256,9 +258,14 @@ The Main submission contains this order:
 MainEmbed
   -> Main
        selected residual capture
-  -> DSparkContext
-       Main-feature projection
-       per-layer context K/V append
+```
+
+The Spec Prefill invocation contains this order:
+
+```text
+DSparkPrefill
+  -> Main-feature projection
+  -> per-layer context K/V append
 ```
 
 The capture interface returns only an opaque `residual_add::CaptureTarget`.
@@ -313,7 +320,7 @@ Q heads per KV head  = 5
 
 The executor derives all values from the checkpoint.
 
-`UngatedDSparkGQA` owns two K/V domains:
+`DSparkGQA` owns two K/V domains:
 
 ```text
 persistent history K/V  runtime pages
@@ -508,14 +515,14 @@ main_submission = submit_main(recorder)
 main_submission.wait()
 sampled_output = read_main(recorder, model_batch_req)
 
-if run_spec(model_batch_req, sampled_output):
-    spec_hidden = embed_spec(recorder, model_batch_req, main_hidden, sampled_output)
-    spec_hidden = forward_spec(recorder, model_batch_req, spec_hidden)
-    spec_response = unembed_spec(recorder, model_batch_req, spec_hidden)
-    sample_spec(recorder, model_batch_req, spec_response)
-
+if run_spec_prefill(model_batch_req):
+    prefill_spec(recorder, model_batch_req)
+if run_spec_decode(model_batch_req, sampled_output):
+    decode_spec(recorder, model_batch_req, sampled_output)
+if Spec Prefill or Spec Decode was recorded:
     spec_submission = submit_spec(recorder)
     spec_submission.wait()
+if Spec Decode was recorded:
     sampled_output = read_spec(recorder, model_batch_req, sampled_output)
 
 response = commit_batch(batch, sampled_output)
@@ -526,15 +533,21 @@ The Main submission is:
 ```text
 MainEmbed
   -> Main
-  -> DSparkContext                         when DSpark is enabled
   -> GatherUnembed                         when sample rows exist
   -> Sampling or RejectionSampling         when sample rows exist
 ```
 
-The DSpark Spec submission is:
+The prefill-only DSpark Spec submission is:
 
 ```text
-DSparkEmbed
+DSparkPrefill
+```
+
+The decode-ready DSpark Spec submission is:
+
+```text
+DSparkPrefill
+  -> DSparkEmbed
   -> DSpark
   -> DSparkGatherUnembed
   -> DSparkSampling
@@ -547,17 +560,17 @@ There is no submit boundary inside Main or inside DSpark Spec.
 Prefill, decode, and mixed batches use the same Main hook order.
 An empty unembed or sampling stage records no component.
 
-`run_spec` is true only when both conditions are true:
+`run_spec_prefill` is true when both conditions are true:
 
 ```text
 the executor has DSpark
-Main produced at least one decode result
+Main produced at least one capture row
 ```
 
-A prefill-only batch produces no anchor token.
-It therefore records no Spec proposal.
-This condition is a semantic data-availability gate.
-It is not an execution-state flag.
+`run_spec_decode` also requires at least one Main decode result.
+A prefill-only batch therefore records Spec Prefill and omits Spec Decode.
+These conditions are semantic data-availability gates.
+They are not execution-state flags.
 
 The lifecycle does not use `main_stage_submitted`.
 It does not use `read_sampling_output`.
@@ -590,7 +603,7 @@ The current synchronous terminal-failure model does not require a second rollbac
 `inference-executor-metal` owns the model realization:
 
 - Weight buffers and tensor views
-- `UngatedDSparkGQA`
+- `DSparkGQA`
 - Persistent DSpark page interpretation
 - `DSparkBlockScratch`
 - `Qwen3xDSparkLayer`
@@ -627,7 +640,7 @@ The first-principles audit used these questions:
 | Can sparse rejection read compact Main rows correctly?     | Yes. Main verification distributions use compact identity indices.    |
 | Does context length increase static attention scratch?     | No. Metadata divides history across a fixed task capacity.            |
 | Does replay caching include all command-topology inputs?   | Yes. Keys include active row counts and SDPA task capacity.           |
-| Does a prefill-only batch need a dummy Spec submission?    | No. It has no sampled anchor and records no Spec work.                |
+| Does a prefill-only batch run DSpark Decode?               | No. It records Spec Prefill without a sampled anchor.                 |
 | Does the design require a backend-neutral replay redesign? | No. Existing lifecycle and Metal replay composition are sufficient.   |
 
 No unresolved design item blocks the fixed-block milestone.
@@ -825,7 +838,7 @@ The executor must not become the global scheduler.
 
 Future work: Add a separate `GatedDSparkGQA` when a supported checkpoint requires it.
 
-The implementation must not add a `gated` runtime flag to `UngatedDSparkGQA`.
+The implementation must not add a `gated` runtime flag to `DSparkGQA`.
 The history map, block map, reducer, page layout, and scratch contracts must remain gate-neutral.
 
 ### Backend-neutral replay boundary
@@ -1120,6 +1133,7 @@ A later operability run used this command:
 cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1 \
   --num-q-heads 40 --num-kv-heads 8 --head-dim 128 --dtypes bf16 \
+  --max-q-tokens 1 \
   --warmup-iters 20 --iters 100 --runs 7
 ```
 

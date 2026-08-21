@@ -69,6 +69,7 @@ crates/inference-executor-metal/src/
     capacity.rs                  Metal partial-output resource capacity
     context.rs                   persistent Main-context append
     metadata.rs                  history and block attention metadata
+    sdpa.rs                      fixed-proposal history execution selection
     scratch.rs                   fixed-capacity proposal scratch
     state.rs                     page-table and metadata lifecycle
   model/
@@ -79,7 +80,7 @@ crates/inference-executor-metal/src/
       execution.rs               shared execution resources and per-batch recording
       layer.rs                   independent Qwen3xDSparkLayer
       load.rs                    shared checkpoint and resource load
-      model.rs                   context and body replay owners
+      model.rs                   Prefill and body replay owners
       output.rs                  gather, unembed, and Markov sampling
       main_feature.rs            selected Main residual projection
       sampling.rs                Qwen3x Markov checkpoint weights and generic backend adapter
@@ -157,7 +158,10 @@ It removes every tensor before it creates Metal buffers, performs any required f
 It owns the DSpark replay caches, request state, page layout, and reusable workspaces.
 `Replay<Qwen3xDSparkSampling>` is the single Markov owner and access path.
 The executor uses `Replay::component()` for Markov prepare, replay arguments, and proposal reads.
-`Qwen3xDSparkRecording` owns only keys, replay arguments, replay shape, and request slots for one batch.
+`Qwen3xDSparkPrefillRecording` and `Qwen3xDSparkDecodeRecording` are independent per-batch recordings.
+The model recorder can contain either recording or both recordings.
+The Prefill recording owns its replay key.
+The Decode recording owns its required replay keys, sampling arguments, and request slots.
 The executor speculator enums prevent partially initialized DSpark field combinations.
 It also keeps replay programs and workspaces reusable across submissions.
 
@@ -233,25 +237,31 @@ The number of results per wave must divide the vocabulary tile.
 Metal does not expose register allocation through `MTLComputePipelineState`.
 The tile decision therefore also uses the source-level live-value count and a real-weight tile sweep.
 
-## Main context
+## Spec Prefill
 
 `Qwen3Main` and `Qwen35Main` accept the shared `MainResidualCapture` contract.
 The contract does not depend on a DSpark model or a Metal recorder.
+The outer DSpark execution owner supplies and retains this capture.
+Vanilla and MTP execution owners do not use the DSpark capture or the DSpark Prefill/Decode lifecycle.
 
 `Qwen3xDSparkMainFeatureProjector` selects the configured Main residual outputs.
+Main writes those outputs directly into the projector's prearranged column ranges.
+The path does not use a concatenate kernel or copy.
 It projects those outputs into one Main feature for each Main token.
 Each DSpark layer projects that feature to its persistent context K/V.
 
-`Qwen3xDSparkContext` records this work after the model-specific Main graph in the same Main submission:
+`Qwen3xDSparkPrefill` records this work after the Main CPU read:
 
 ```text
-MainEmbed
-  -> Main
-  -> DSparkContext
+selected Main residual capture
+  -> Main-feature projection
+  -> per-layer context K/V append
 ```
 
+The Main submission does not contain DSpark Prefill or Decode work.
 Persistent DSpark context follows accepted Main history.
-Proposal-local K/V never enters this context.
+Unpublished verification rows can exist in the physical pages, but the visible range excludes them.
+Proposal-local K/V never enters persistent context.
 
 The reusable Qwen3x DSpark model, checkpoint-weight owners, and Main capture contract do not depend on one Main model
 version.
@@ -260,17 +270,17 @@ Both executors compose these owners with their model-specific lifecycle.
 ## Attention composition
 
 The supported official Qwen3x DSpark checkpoints use ungated GQA.
-`UngatedDSparkGQA` owns a model-neutral QKV attention graph.
+`DSparkGQA` owns the DSpark QKV attention graph.
 It does not add a mode to `UngatedGQA`.
 
 Each `Qwen3xDSparkLayer` resolves its exact Q/K/V/output affine layout from its weight bindings.
-It owns one `UngatedDSparkGQA` and one `UngatedDSparkGQAContextAppender`.
+It owns one `DSparkGQA` and one `DSparkGQAContextAppender`.
 Different layers can use different affine layouts.
 The Q/K/V/output tensors within one layer must use one layout because the current fused QKV ABI uses one
 `GQAMetalConfig`.
 
-`UngatedDSparkGQAState` owns only shared execution state.
-It owns the page table, metadata, shared block/context scratch, and backend-selected SplitKV SingleQ history contract.
+`DSparkGQAState` owns only shared execution state.
+It owns the page table, metadata, shared block/context scratch, and backend-selected SplitKV history contract.
 The shared scratch contract requires equal attention geometry and I/O dtype across layers.
 It does not require equal quantization layout across layers.
 
@@ -279,7 +289,7 @@ One DSpark attention call records this composition:
 ```text
 QKV projection
   -> Q/K norm and RoPE
-  -> SplitKV SingleQ history map
+  -> selected SplitKV history map
   -> block bidirectional-SDPA map
   -> existing GQA partial-output reduce
   -> output projection
@@ -287,18 +297,31 @@ QKV projection
 
 The history path reads persistent paged K/V.
 The block path reads dense local K/V from `DSparkBlockScratch`.
-Both map paths write `SDPAPartialOutput` records with the existing ABI.
-The existing `gqa::split_kv::single_q::Compute` Reduce launch combines both sets.
+Both map paths write `SDPAPartialOutput` records with the selected physical layout.
+The selected SplitKV Reduce launch combines both sets.
 
-The history metadata supplies a half-open visible range.
-For an anchor at position `p`, that range is `[0, p)`.
+The history metadata accepts one explicit half-open visible range for each request.
+For an anchor at position `p`, DSpark supplies `[0, p)`.
+The metadata does not infer the lower bound from the upper bound.
 The block kernel supplies the complete local block.
 
-`UngatedDSparkGQAState` gives its static attention and KV-cache facts to
-`backend_sdpa::Registry::new_single_q_only(...)`. The registry provides one constrained history variant with the
-existing one-Q partial ABI. `UngatedDSparkGQAState::prepare_block` gives that variant to the DSpark-specific metadata
-builder. `DSparkGQAMetadataBuffers` stores the exact `backend_sdpa::ExecutionVariant` with the replay shape. Recording
-uses the stored variant and does not run a second selector.
+`DSparkGQAState` gives its static attention and KV-cache facts to `backend_sdpa::Registry::new(...)`.
+`dspark::sdpa::Selector` derives each legal candidate's maximum Q-token-range extent, scratch extent, replay extent,
+and launch-cost metrics. Its `Selection` contains the exact `backend_sdpa::ExecutionVariant` and
+`DSparkGQACapacity`. The state freezes this selection at initialization. `DSparkGQAMetadataBuffers` retains the exact
+execution variant. Recording does not run a second selector.
+
+The selector first minimizes how many times one history K/V token must be loaded for the fixed proposal. It then
+compares the kernel KV-iteration width, padded Q rows, scratch extent, and Q-head coverage. This cost model expresses
+the Q-tile reuse directly. It does not assume that different layers or KV heads contain equal K/V data.
+
+For TiledQ, one request-local Q-token range contains at most `map.thread_block.max_q_tokens` queries. One history Map
+task reads a KV tile once for that Q-token range. `DSparkBlockMetadata` expands the request range across every Q row.
+The Map kernel intersects each row range with its Map TaskTemplate range.
+The block map writes one partial slot per Q-token range. Its grid supplies the Q-head index, Q-token-range index, and
+range-local Q-token offset. `q_token_ranges` derives the flat Q-token index. The end of the matching
+`cu_sdpa_partial_outputs` range derives the block partial-output slot. The executor does not upload a second coordinate
+buffer.
 
 One block-bidirectional map Task owns one Q token and one Q head.
 The backend fixes this Task to one 32-thread SIMDgroup.
@@ -356,25 +379,27 @@ Define:
 
 ```text
 T_capacity = max_requests * num_spec_tokens
-P_capacity = next_power_of_two(2 * T_capacity)
+Q_capacity = max_requests * ceil(num_spec_tokens / selected_max_q_tokens)
+P_capacity = next_power_of_two(max(T_capacity, 2 * Q_capacity))
+G_capacity = P_capacity * selected_max_q_tokens
 ```
 
 `DSparkBlockCapacity` is backend-neutral.
 It contains `max_requests`, the selected proposal length as `block_size`, and `max_tokens`.
 `DSparkGQACapacity` is Metal-specific.
-It derives `P_capacity` for metadata and partial scratch.
+It derives `Q_capacity`, `P_capacity`, and `G_capacity` for metadata and partial scratch.
 The runtime core and executor core do not contain Metal `TaskTemplate` capacity.
 
-Each local query needs at least one history partial and one block partial.
+Each Q-token range needs at least one history Map task and one block partial slot.
 The metadata builder can divide long history across available history tasks.
 It cannot exceed `P_capacity`.
 
 The partial buffers use this capacity:
 
 ```text
-partial_max_logits[P_capacity, num_q_heads]       f32
-partial_exp_sums[P_capacity, num_q_heads]         f32
-partial_output[P_capacity, num_q_heads, head_dim] model dtype
+partial_max_logits[P_capacity, num_q_heads, selected_max_q_tokens]       f32
+partial_exp_sums[P_capacity, num_q_heads, selected_max_q_tokens]         f32
+partial_output[P_capacity, num_q_heads, selected_max_q_tokens, head_dim] model dtype
 ```
 
 Context length does not set this capacity.
@@ -429,27 +454,35 @@ The Main submission is:
 ```text
 MainEmbed
   -> Main
-  -> DSparkContext                         when DSpark is enabled
   -> GatherUnembed                         when sample rows exist
   -> Sampling or RejectionSampling         when sample rows exist
 ```
 
-The Spec submission is:
+The prefill-only Spec submission is:
 
 ```text
-DSparkEmbed
+DSparkPrefill
+```
+
+The decode-ready Spec submission is:
+
+```text
+DSparkPrefill
+  -> DSparkEmbed
   -> DSpark
   -> DSparkGatherUnembed
   -> DSparkSampling
 ```
 
 The CPU reads Main results before it creates the anchor block.
-This dependency requires two submissions.
+It also completes Main before it records DSpark Prefill.
+This dependency keeps Main and Spec in separate submissions.
 No component submits or waits internally.
 
-Prefill, decode, and mixed batches use the same Main hook order.
+`prefill_spec` records persistent history for prompt, decode, and verification Main rows.
+`decode_spec` records the anchor-and-MASK proposal block only when Main produces a decode result.
+Prefill-only batches run DSpark Prefill without DSpark Decode.
 An empty unembed or sampling input records no component.
-The service runs Spec only when Main returns at least one decode result.
 
 The lifecycle does not use `main_stage_submitted`.
 It does not use `read_sampling_output`.
@@ -536,6 +569,7 @@ Run the component benchmark with:
 ```sh
 cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1 \
+  --max-q-tokens 8 \
   --iters 1 --warmup-iters 0 --runs 1
 
 cargo bench -p inference-backend-metal --bench rejection_sampling -- \
@@ -559,6 +593,24 @@ The final one-request deterministic comparison measured a `36.565 tok/s` Main-on
 DSpark median.
 DSpark was `17.0%` faster for that workload.
 The full optimization history is in [`qwen3_dspark_design_draft.md`](qwen3_dspark_design_draft.md).
+
+### Qwen3.8 lifecycle verification
+
+The 2026-08-21 verification used base commit `8cbd20dee490c49e7089fa10034cbd53d2598680` with the active DSpark
+Prefill/Decode working-tree changes. It used `Qwen3.8-27B-4bit` and the official `Qwen3.8-27B-DSpark` checkpoint.
+The converter used `group_size=64`, 4-bit affine weights, and an 8-bit `markov_head.markov_w2` override.
+
+The release service passed these cases:
+
+- A two-token DSpark proposal produced the same eight greedy output tokens as Main-only execution.
+- The checkpoint-native seven-token proposal completed four verification rounds.
+- Two concurrent requests shared batches with `num_reqs=2` and 14 proposal tokens without request-slot crossover.
+- A 231-token prompt used three Prefill-only batches before a final Prefill and Decode batch.
+- The verification rounds covered full acceptance, partial acceptance, and zero accepted proposal tokens.
+
+The service stopped cleanly after each run.
+This verification records correctness and lifecycle coverage.
+It does not provide a performance verdict.
 
 ### Acceptance correctness
 
@@ -620,7 +672,7 @@ That investigation is separate from DSpark acceptance correctness.
 
 [`future_work.md`](future_work.md) owns these items:
 
-- Confidence-head execution and global proposal scheduling
+- Global confidence-guided proposal scheduling
 - Gated DSpark GQA
 - Strict one-row and multi-row Main numerical parity
 - Backend-neutral replay-boundary review

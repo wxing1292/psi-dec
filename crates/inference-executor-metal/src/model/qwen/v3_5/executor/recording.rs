@@ -24,12 +24,6 @@ impl Qwen35Executor {
             ReplayExecution::new(main_embed_replay, &recorder.main_embed_arguments),
             ReplayExecution::new(main_replay, &recorder.main_arguments),
         ];
-        if self.speculator.is_dspark() {
-            sequence.push(ReplayExecution::new(
-                self.speculator.dspark().execution.context_replay(&recorder.dspark),
-                &empty_arguments,
-            ));
-        }
         if let Some(gather_unembed_key) = &recorder.main_gather_unembed_key {
             assert!(
                 recorder.num_main_sample_rows > 0,

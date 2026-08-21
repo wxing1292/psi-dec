@@ -31,7 +31,7 @@ pub struct Qwen3xDSparkModel {
     final_norm: RMSNorm,
 }
 
-pub struct Qwen3xDSparkContext {
+pub struct Qwen3xDSparkPrefill {
     model: Option<Rc<Qwen3xDSparkModel>>,
 }
 
@@ -40,7 +40,7 @@ pub struct Qwen3xDSparkBody {
 }
 
 #[derive(Clone, Copy)]
-pub struct Qwen3xDSparkContextArgs<'a> {
+pub struct Qwen3xDSparkPrefillArgs<'a> {
     pub num_tokens: u32,
     pub req_slots: &'a Buffer,
     pub flat_token_indices: &'a Buffer,
@@ -57,7 +57,7 @@ pub struct Qwen3xDSparkBodyArgs<'a> {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen3xDSparkContextReplayKey {
+pub struct Qwen3xDSparkPrefillReplayKey {
     num_tokens: u32,
 }
 
@@ -201,7 +201,7 @@ impl Qwen3xDSparkModel {
         )
     }
 
-    fn record_context<'a, R>(&'a self, recorder: &mut R, args: Qwen3xDSparkContextArgs<'a>)
+    fn record_prefill<'a, R>(&'a self, recorder: &mut R, args: Qwen3xDSparkPrefillArgs<'a>)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -211,7 +211,7 @@ impl Qwen3xDSparkModel {
             .expect("DSpark Main-feature projector shell must exist")
             .record(recorder, args.num_tokens);
         for layer in &self.layers {
-            layer.record_context(
+            layer.record_prefill(
                 recorder,
                 args.num_tokens,
                 main_feature,
@@ -251,7 +251,7 @@ impl Qwen3xDSparkModel {
     }
 }
 
-impl Qwen3xDSparkContext {
+impl Qwen3xDSparkPrefill {
     pub fn new(model: Rc<Qwen3xDSparkModel>) -> Self {
         Self { model: Some(model) }
     }
@@ -259,13 +259,13 @@ impl Qwen3xDSparkContext {
     pub fn take_model(&mut self) -> Rc<Qwen3xDSparkModel> {
         self.model
             .take()
-            .expect("Qwen3.x DSpark context model state must be loaded")
+            .expect("Qwen3.x DSpark Prefill model state must be loaded")
     }
 
     pub fn set_model(&mut self, model: Rc<Qwen3xDSparkModel>) {
         assert!(
             self.model.is_none(),
-            "Qwen3.x DSpark context model state is already loaded"
+            "Qwen3.x DSpark Prefill model state is already loaded"
         );
         self.model = Some(model);
     }
@@ -273,22 +273,22 @@ impl Qwen3xDSparkContext {
     fn model(&self) -> &Qwen3xDSparkModel {
         self.model
             .as_deref()
-            .expect("Qwen3.x DSpark context model state must be loaded before execution")
+            .expect("Qwen3.x DSpark Prefill model state must be loaded before execution")
     }
 }
 
-impl ReplayComponent for Qwen3xDSparkContext {
-    type Key = Qwen3xDSparkContextReplayKey;
-    type Input<'a> = Qwen3xDSparkContextArgs<'a>;
+impl ReplayComponent for Qwen3xDSparkPrefill {
+    type Key = Qwen3xDSparkPrefillReplayKey;
+    type Input<'a> = Qwen3xDSparkPrefillArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Qwen3xDSparkContextReplayKey {
+        Qwen3xDSparkPrefillReplayKey {
             num_tokens: input.num_tokens,
         }
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.model().record_context(recorder, *input);
+        self.model().record_prefill(recorder, *input);
     }
 }
 

@@ -47,7 +47,7 @@ crates/inference-executor-metal/src/
         main_feature.rs     selected Main residual projection
         attention.rs        paged-history plus block-bidirectional attention
         layer.rs            independent Qwen3xDSparkLayer
-        model.rs            context and body replay owners
+        model.rs            Prefill and body replay owners
         output.rs           gather/unembed and Markov sampling
         sampling.rs         Qwen3x Markov checkpoint weights and generic backend adapter
       layer/
@@ -175,8 +175,8 @@ Qwen35SpeculativeResources
   spec_probs: SpecProbsStore
 
 Qwen3xDSparkExecution
-  context: Replay<Qwen3xDSparkContext>
-  gqa_state: UngatedDSparkGQAState
+  prefill: Replay<Qwen3xDSparkPrefill>
+  gqa_state: DSparkGQAState
   embed: Replay<Qwen3xDSparkEmbed>
   body: Replay<Qwen3xDSparkBody>
   gather_unembed: Replay<Qwen3xDSparkGatherUnembed>
@@ -186,11 +186,15 @@ Qwen3xDSparkExecution
   page layout and block geometry
 
 Qwen3ModelOpsRecorder / Qwen35ModelOpsRecorder
-  dspark: Qwen3xDSparkRecording
+  dspark_prefill: Option<Qwen3xDSparkPrefillRecording>
+  dspark_decode: Option<Qwen3xDSparkDecodeRecording>
 
-Qwen3xDSparkRecording
-  context/embed/body/gather/sampling replay keys
-  sampling arguments and Markov replay shape
+Qwen3xDSparkPrefillRecording
+  Prefill replay key
+
+Qwen3xDSparkDecodeRecording
+  embed/body/gather/sampling replay keys
+  sampling arguments
   request slots
 ```
 
@@ -202,6 +206,9 @@ Each executor owns its dynamic workspaces, lifecycle order, and submissions.
 Each executor stores one closed speculator enum.
 The enum cannot represent a partial resource set or simultaneous MTP and DSpark resources.
 Vanilla executors do not allocate rejection or speculative-probability resources.
+Each initialized executor is one outer model composition: Vanilla, MTP, or DSpark.
+The selected composition owns its lifecycle contract.
+The common Main implementation does not make MTP and DSpark one high-level model role.
 Per-batch recorders retain optional replay keys because a batch can omit output or Spec stages.
 These lifecycle keys do not own initialized model resources.
 
@@ -379,7 +386,7 @@ The independent cached graphs are:
 ```text
 Replay<Qwen3MainEmbed>       Qwen3 token embedding
 Replay<Qwen3Main>            Qwen3 dense full-attention layers -> final norm
-Replay<Qwen3xDSparkContext>   selected Main residuals -> persistent DSpark context K/V
+Replay<Qwen3xDSparkPrefill>   selected Main residuals -> persistent DSpark context K/V
 Replay<Qwen3GatherUnembed>   Qwen3 gather -> unembed
 Replay<Sampling>             ordinary Main sampling
 Replay<RejectionSampling>    Main sparse distributions -> speculative rejection
@@ -599,6 +606,8 @@ Similar workspace roles do not imply shared structural ownership.
 Main queries the capture owner immediately before each layer's final post-MLP residual add.
 The capture owner returns an optional opaque `residual_add::CaptureTarget`.
 The destination selects a stable BF16 column range that the capture owner owns.
+Each selected Main layer writes directly into its assigned range in one prearranged buffer.
+DSpark Prefill does not run a concatenate kernel or copy.
 `None` records the ordinary residual add.
 
 The object-safe capture contract returns only this descriptor.
@@ -607,7 +616,7 @@ Both Main record methods remain generic over `Recorder<Operator = ReplayOp>`.
 
 The Qwen3 and Qwen3.5 loaders supply no capture owner when DSpark is disabled.
 When DSpark is enabled for Qwen3 or Qwen3.5, `Qwen3xDSparkMainFeatureProjector` owns the capture destinations.
-`Qwen3xDSparkContext` records Main-feature projection and context append after Main.
+`Qwen3xDSparkPrefill` records Main-feature projection and context append after the Main CPU read.
 Main does not depend on a concrete DSpark type.
 
 `Qwen35GatherUnembedArgs` has a flat structure.
@@ -619,14 +628,14 @@ Gathered hidden and logits remain executor workspaces.
 The service calls the model hooks in a fixed order.
 The service records the Main components first.
 The service then owns the Main `submit`, `wait`, and CPU read boundaries.
-When `run_spec` returns true, the service records the MTP or DSpark components after the Main CPU read.
-The service then owns the Spec `submit`, `wait`, and CPU read boundaries.
+It evaluates the combined Spec gate and the DSpark Prefill and Decode gates after the Main CPU read.
+One outer model mode selects only its applicable lifecycle.
+The service records the selected Spec work and owns the Spec `submit`, `wait`, and CPU read boundaries.
 An empty component input omits that component from its model sequence.
 The executor does not store a separate submitted-state flag.
 
 `embed_main` materializes MainEmbed.
 `forward_main` materializes Main.
-For Qwen3 or Qwen3.5 DSpark, it also materializes `Qwen3xDSparkContext`.
 It registers the pending model transaction.
 It does not submit backend work.
 
@@ -644,8 +653,6 @@ For a batch with no sampled rows, the sequence is:
 MainEmbed -> Main
 ```
 
-When DSpark is enabled, the same sequence appends `DSparkContext` after Main.
-
 For ordinary sampling, the sequence is:
 
 ```text
@@ -660,28 +667,28 @@ For MTP, `submit_main` submits this sequence:
 MainEmbed -> Main -> GatherUnembed -> RejectionSampling
 ```
 
-For DSpark, it submits this sequence:
+For DSpark, it submits the same Main sequence:
 
 ```text
-MainEmbed -> Main -> DSparkContext -> GatherUnembed -> RejectionSampling
+MainEmbed -> Main -> GatherUnembed -> RejectionSampling
 ```
 
 The service waits for the Main submission.
 It then calls `read_main`.
 `read_main` reads the sampled or rejection results on the CPU.
 
-The service calls `run_spec` after `read_main`.
-Qwen3 requires a configured DSpark model and at least one Main decode result.
-Qwen3.5 uses its configured MTP or DSpark capability.
-Qwen3.5 also records MTP during prefill because MTP owns a persistent KV lane.
-Qwen3 and Qwen3.5 record DSpark context in the Main submission.
-They record DSpark Spec only after Main returns a sampled anchor.
-The lifecycle does not use a per-batch submitted-state flag.
-When the gate is true, the service calls `embed_spec`.
-`embed_spec` consumes the completed Main output and sampled results.
+Qwen3.5 MTP uses the existing combined `run_spec` lifecycle.
+Its `embed_spec`, `forward_spec`, `unembed_spec`, and `sample_spec` hooks materialize MTPEmbed, MTP, GatherUnembed, and
+DraftSampling.
+MTP does not use the DSpark Prefill or Decode hooks.
 
-For MTP, these hooks materialize MTPEmbed, MTP, GatherUnembed, and DraftSampling once.
-For DSpark, they materialize DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
+The service calls `run_spec_prefill` and `run_spec_decode` for a DSpark mode after `read_main`.
+DSpark Prefill runs whenever a DSpark-enabled Main invocation produces capture rows.
+DSpark Decode runs only when Main returns a sampled anchor.
+The lifecycle does not use a per-batch submitted-state flag.
+
+`prefill_spec` materializes `Qwen3xDSparkPrefill`.
+`decode_spec` materializes DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
 These hooks do not submit backend work or read backend output.
 
 `submit_spec` starts one model-specific Spec transaction.
@@ -703,14 +710,20 @@ The current implementation waits and reads after each non-final MTP pass.
 `submit_spec` returns the final submission, and the service performs the final wait and `read_spec` call.
 This preserves one external Spec lifecycle while the MTP owner controls K internal passes.
 
-The Qwen3x DSpark sequence is:
+The Qwen3x DSpark prefill-only sequence is:
 
 ```text
-DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
+DSparkPrefill
+```
+
+The Qwen3x DSpark decode-ready sequence is:
+
+```text
+DSparkPrefill -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 ```
 
 The service waits for the Spec submission.
-It then calls `read_spec`.
+It calls `read_spec` only after Spec Decode.
 `read_spec` reads draft tokens and probabilities on the CPU.
 
 The complete service order is:
@@ -718,11 +731,23 @@ The complete service order is:
 ```text
 embed_main -> forward_main -> unembed_main -> sample_main
 submit_main -> wait -> read_main
+
 if run_spec(model_batch_req, sampled_output):
     embed_spec -> forward_spec -> unembed_spec -> sample_spec
     submit_spec -> wait -> read_spec
+
+if run_spec_prefill(model_batch_req):
+    prefill_spec
+if run_spec_decode(model_batch_req, sampled_output):
+    decode_spec
+if Spec Prefill or Spec Decode was recorded:
+    submit_spec -> wait
+if Spec Decode was recorded:
+    read_spec
 commit
 ```
+
+The combined branch and the DSpark branches are mutually exclusive.
 
 ## GQA/GDN lifecycle
 
@@ -730,7 +755,7 @@ commit
 It accepts only complete Qwen3 Main page-ID blocks. It does not interpret runtime cache lanes.
 Qwen3 has zero state pages.
 It does not construct, restore, publish, commit, or reset a GDN state table.
-`UngatedDSparkGQAState` owns a separate DSpark page table, metadata buffers, backend, and block scratch.
+`DSparkGQAState` owns a separate DSpark page table, metadata buffers, backend, and block scratch.
 In DSpark mode, runtime cache lane 0 stores `[Main page IDs | DSpark page IDs]` for each logical block.
 `prepare_batch` validates the exact combined length and splits this list once.
 It sends each complete role-local list to the applicable state owner.
@@ -842,17 +867,18 @@ K must not exceed the checkpoint `block_size`.
 Without the option, K equals the checkpoint `block_size`.
 Qwen3.5 MTP and DSpark are mutually exclusive.
 
-Each DSpark-enabled executor records persistent context updates in the Main submission:
+Each DSpark-enabled executor keeps the Main submission free of DSpark work:
 
 ```text
-MainEmbed -> Main -> DSparkContext -> GatherUnembed -> RejectionSampling
+MainEmbed -> Main -> GatherUnembed -> RejectionSampling
 ```
 
 The CPU reads the Main result before it constructs the anchor block.
-The executor then records one Spec submission:
+The executor records DSpark Prefill after this read.
+A decode-ready batch records DSpark Decode after DSpark Prefill:
 
 ```text
-DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
+DSparkPrefill -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 ```
 
 DSpark input is request-major.

@@ -255,19 +255,33 @@ impl ExecutorFixture {
         let mut sampled = self
             .model
             .read_main(&recorder, &model_batch_req, main_replay_start.elapsed());
-        if self.model.run_spec(&model_batch_req, &sampled) {
-            let spec_hidden = self
-                .model
-                .embed_spec(&mut recorder, &model_batch_req, &hidden, &sampled);
-            let spec_hidden = self.model.forward_spec(&mut recorder, &model_batch_req, spec_hidden);
-            let spec_output = self.model.unembed_spec(&mut recorder, &model_batch_req, &spec_hidden);
-            self.model.sample_spec(&mut recorder, &model_batch_req, &spec_output);
+        let run_spec = self.model.run_spec(&model_batch_req, &sampled);
+        let run_spec_prefill = self.model.run_spec_prefill(&model_batch_req);
+        let run_spec_decode = self.model.run_spec_decode(&model_batch_req, &sampled);
+        debug_assert!(!run_spec || (!run_spec_prefill && !run_spec_decode));
+        if run_spec || run_spec_prefill || run_spec_decode {
+            if run_spec_prefill {
+                self.model.prefill_spec(&mut recorder, &model_batch_req);
+            }
+            if run_spec_decode {
+                self.model.decode_spec(&mut recorder, &model_batch_req, &sampled);
+            }
+            if run_spec {
+                let spec_hidden = self
+                    .model
+                    .embed_spec(&mut recorder, &model_batch_req, &hidden, &sampled);
+                let spec_hidden = self.model.forward_spec(&mut recorder, &model_batch_req, spec_hidden);
+                let spec_output = self.model.unembed_spec(&mut recorder, &model_batch_req, &spec_hidden);
+                self.model.sample_spec(&mut recorder, &model_batch_req, &spec_output);
+            }
             let spec_replay_start = Instant::now();
             let submission = self.model.submit_spec(&recorder);
             submission.wait();
-            sampled = self
-                .model
-                .read_spec(&recorder, &model_batch_req, sampled, spec_replay_start.elapsed());
+            if run_spec || run_spec_decode {
+                sampled = self
+                    .model
+                    .read_spec(&recorder, &model_batch_req, sampled, spec_replay_start.elapsed());
+            }
         }
         drop(recorder);
         let finish = finish_start.elapsed();

@@ -6,7 +6,6 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
-use inference_backend_metal::metal::ReplayProgram;
 use inference_executor_core::attn::DSparkBlockMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
@@ -29,10 +28,10 @@ use crate::model::qwen::v3_x::dspark::main_feature::Qwen3xDSparkMainFeatureProje
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBody;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyArgs;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkBodyReplayKey;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContext;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextArgs;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkContextReplayKey;
 use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkModel;
+use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkPrefill;
+use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkPrefillArgs;
+use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkPrefillReplayKey;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembed;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedArgs;
 use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkGatherUnembedReplayKey;
@@ -42,14 +41,13 @@ use crate::model::qwen::v3_x::dspark::output::Qwen3xDSparkSamplingReplayKey;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
-use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
 use crate::sampling::dspark_markov::DSparkProposal;
 use crate::sampling::spec_probs::SpecProbsStore;
 
 mod file_io;
 
 pub struct Qwen3xDSparkExecution {
-    context: Replay<Qwen3xDSparkContext>,
+    prefill: Replay<Qwen3xDSparkPrefill>,
     gqa_state: DSparkGQAState,
     embed: Replay<Qwen3xDSparkEmbed>,
     body: Replay<Qwen3xDSparkBody>,
@@ -122,9 +120,9 @@ impl Qwen3xDSparkExecution {
             ..unembed_config
         };
         Self {
-            context: Replay::new(
-                "Qwen3x DSparkContext",
-                Qwen3xDSparkContext::new(Rc::clone(&loaded.model)),
+            prefill: Replay::new(
+                "Qwen3x DSpark Prefill",
+                Qwen3xDSparkPrefill::new(Rc::clone(&loaded.model)),
             ),
             gqa_state: loaded.gqa_state,
             embed: Replay::new("Qwen3x DSparkEmbed", Qwen3xDSparkEmbed::new(loaded.embed)),
@@ -179,7 +177,7 @@ impl Qwen3xDSparkExecution {
     }
 
     pub fn clear_replay_cache(&mut self) {
-        self.context.clear();
+        self.prefill.clear();
         self.embed.clear();
         self.body.clear();
         self.gather_unembed.clear();
@@ -300,14 +298,14 @@ impl Qwen3xDSparkExecution {
             self.unloaded_model.is_none(),
             "Qwen3.x DSpark model state is already unloaded"
         );
-        let context_model = self.context.component_mut().take_model();
+        let prefill_model = self.prefill.component_mut().take_model();
         let body_model = self.body.component_mut().take_model();
         assert!(
-            Rc::ptr_eq(&context_model, &body_model),
-            "Qwen3.x DSpark context and body must share one model"
+            Rc::ptr_eq(&prefill_model, &body_model),
+            "Qwen3.x DSpark Prefill and body must share one model"
         );
         drop(body_model);
-        let mut model = Rc::try_unwrap(context_model)
+        let mut model = Rc::try_unwrap(prefill_model)
             .unwrap_or_else(|_| panic!("Qwen3.x DSpark model must be uniquely owned during state unloading"));
         model.unload_state();
         self.unloaded_model = Some(model);
@@ -329,7 +327,7 @@ impl Qwen3xDSparkExecution {
             .expect("Qwen3.x DSpark model state is not unloaded");
         model.load_state(&self.gqa_state);
         let model = Rc::new(model);
-        self.context.component_mut().set_model(Rc::clone(&model));
+        self.prefill.component_mut().set_model(Rc::clone(&model));
         self.body.component_mut().set_model(model);
     }
 
@@ -341,67 +339,59 @@ impl Qwen3xDSparkExecution {
         self.gqa_state.read_page_ids(req_slot, block_index)
     }
 
-    pub fn record_context(
+    pub fn record_prefill(
         &mut self,
         runtime: &MetalReplayRuntime<'_>,
-        input: &Qwen3xDSparkContextArgs<'_>,
-        recording: &mut Qwen3xDSparkRecording,
-    ) {
-        let (key, _) = self.context.record(runtime, input);
-        recording.context_key = Some(key);
+        input: &Qwen3xDSparkPrefillArgs<'_>,
+    ) -> Qwen3xDSparkPrefillRecording {
+        let (key, _) = self.prefill.record(runtime, input);
+        Qwen3xDSparkPrefillRecording { key }
     }
 
-    pub fn context_replay<'a>(&'a self, recording: &'a Qwen3xDSparkRecording) -> &'a ReplayProgram {
-        self.context.replay(
-            recording
-                .context_key
-                .as_ref()
-                .expect("Qwen3x DSpark Main submission requires a context key"),
-        )
-    }
-
-    pub fn submit(&self, runtime: &MetalReplayRuntime<'_>, recording: &Qwen3xDSparkRecording) -> MetalReplaySubmission {
+    pub fn submit(
+        &self,
+        runtime: &MetalReplayRuntime<'_>,
+        prefill: Option<&Qwen3xDSparkPrefillRecording>,
+        decode: Option<&Qwen3xDSparkDecodeRecording>,
+    ) -> MetalReplaySubmission {
         let empty_arguments = ReplayArguments::new();
-        let embed = self.embed.replay(
-            recording
-                .embed_key
-                .as_ref()
-                .expect("Qwen3x DSpark submission requires an embed key"),
-        );
-        let body = self.body.replay(
-            recording
-                .body_key
-                .as_ref()
-                .expect("Qwen3x DSpark submission requires a body key"),
-        );
-        let gather_unembed = self.gather_unembed.replay(
-            recording
-                .gather_unembed_key
-                .as_ref()
-                .expect("Qwen3x DSpark submission requires a GatherUnembed key"),
-        );
-        let sampling = self.sampling.replay(
-            recording
-                .sampling_key
-                .as_ref()
-                .expect("Qwen3x DSpark submission requires a Sampling key"),
-        );
-        runtime.submit_replay_sequence(&[
-            ReplayExecution::new(embed, &empty_arguments),
-            ReplayExecution::new(body, &empty_arguments),
-            ReplayExecution::new(gather_unembed, &empty_arguments),
-            ReplayExecution::new(sampling, &recording.sampling_arguments),
-        ])
+        let mut sequence = Vec::with_capacity(5);
+        if let Some(prefill) = prefill {
+            sequence.push(ReplayExecution::new(
+                self.prefill.replay(&prefill.key),
+                &empty_arguments,
+            ));
+        }
+        if let Some(decode) = decode {
+            sequence.push(ReplayExecution::new(
+                self.embed.replay(&decode.embed_key),
+                &empty_arguments,
+            ));
+            sequence.push(ReplayExecution::new(
+                self.body.replay(&decode.body_key),
+                &empty_arguments,
+            ));
+            sequence.push(ReplayExecution::new(
+                self.gather_unembed.replay(&decode.gather_unembed_key),
+                &empty_arguments,
+            ));
+            sequence.push(ReplayExecution::new(
+                self.sampling.replay(&decode.sampling_key),
+                &decode.sampling_arguments,
+            ));
+        }
+        assert!(!sequence.is_empty(), "Qwen3x DSpark submission requires Spec work");
+        runtime.submit_replay_sequence(&sequence)
     }
 
-    pub fn record_embed(
+    pub fn record_decode(
         &mut self,
         runtime: &MetalReplayRuntime<'_>,
         token_ids: &Buffer,
         proposal: Qwen3xDSparkProposalInput<'_>,
+        pages: &Buffer,
         distribution_store: &SpecProbsStore,
-        recording: &mut Qwen3xDSparkRecording,
-    ) -> Rc<Buffer> {
+    ) -> Qwen3xDSparkDecodeRecording {
         let visible_history_token_ranges = proposal
             .anchor_positions
             .iter()
@@ -427,96 +417,59 @@ impl Qwen3xDSparkExecution {
             distribution_store,
         );
         self.gather_unembed.component().prepare(proposal.req_slots.len());
-        let hidden = Rc::clone(&self.hidden_input);
-        let input = Qwen3xDSparkEmbedArgs {
+        let embed_input = Qwen3xDSparkEmbedArgs {
             num_tokens: block
                 .num_tokens()
                 .try_into()
                 .expect("Qwen3x DSpark block token count must fit u32"),
             token_ids,
-            hidden_output: &hidden,
+            hidden_output: &self.hidden_input,
         };
-        let (key, _) = self.embed.record(runtime, &input);
-        recording.embed_key = Some(key);
-        recording.markov_replay_shape = Some(markov_replay_shape);
-        recording.req_slots = proposal.req_slots;
-        hidden
-    }
-
-    pub fn record_body(
-        &mut self,
-        runtime: &MetalReplayRuntime<'_>,
-        pages: &Buffer,
-        recording: &mut Qwen3xDSparkRecording,
-        hidden_input: Rc<Buffer>,
-    ) -> Rc<Buffer> {
-        assert!(
-            Rc::ptr_eq(&hidden_input, &self.hidden_input),
-            "Qwen3x DSpark must consume the DSparkEmbed workspace"
-        );
-        let hidden_output = Rc::clone(&self.hidden_output);
+        let (embed_key, _) = self.embed.record(runtime, &embed_input);
         let metadata = self.gqa_state.metadata();
-        let input = Qwen3xDSparkBodyArgs {
+        let body_input = Qwen3xDSparkBodyArgs {
             num_tokens: metadata.replay_shape().num_tokens,
             metadata,
-            hidden_input: &hidden_input,
-            hidden_output: &hidden_output,
+            hidden_input: &self.hidden_input,
+            hidden_output: &self.hidden_output,
             pages,
         };
-        let (key, _) = self.body.record(runtime, &input);
-        recording.body_key = Some(key);
-        hidden_output
-    }
-
-    pub fn record_gather_unembed(
-        &mut self,
-        runtime: &MetalReplayRuntime<'_>,
-        recording: &mut Qwen3xDSparkRecording,
-        hidden_input: &Rc<Buffer>,
-    ) {
-        assert!(
-            Rc::ptr_eq(hidden_input, &self.hidden_output),
-            "Qwen3x DSpark GatherUnembed must consume the body output"
-        );
-        let input = Qwen3xDSparkGatherUnembedArgs {
-            num_requests: recording
+        let (body_key, _) = self.body.record(runtime, &body_input);
+        let gather_unembed_input = Qwen3xDSparkGatherUnembedArgs {
+            num_requests: proposal
                 .req_slots
                 .len()
                 .try_into()
                 .expect("Qwen3x DSpark request count must fit u32"),
-            hidden_input,
+            hidden_input: &self.hidden_output,
             hidden_output: &self.unembed_hidden,
             logits: &self.logits,
         };
-        let (key, _) = self.gather_unembed.record(runtime, &input);
-        recording.gather_unembed_key = Some(key);
-    }
-
-    pub fn record_sampling(
-        &mut self,
-        runtime: &MetalReplayRuntime<'_>,
-        distribution_store: &SpecProbsStore,
-        recording: &mut Qwen3xDSparkRecording,
-    ) {
-        let shape = recording
-            .markov_replay_shape
-            .expect("Qwen3x DSpark sampling requires a prepared Markov shape");
-        let input = Qwen3xDSparkSamplingArgs {
-            shape,
+        let (gather_unembed_key, _) = self.gather_unembed.record(runtime, &gather_unembed_input);
+        let sampling_input = Qwen3xDSparkSamplingArgs {
+            shape: markov_replay_shape,
             logits: &self.logits,
             hidden: &self.unembed_hidden,
             distribution_store,
         };
-        let (key, _) = self.sampling.record(runtime, &input);
-        let mut arguments = ReplayArguments::new();
-        self.sampling.component().add_replay_arguments(shape, &mut arguments);
-        recording.sampling_key = Some(key);
-        recording.sampling_arguments = arguments;
+        let (sampling_key, _) = self.sampling.record(runtime, &sampling_input);
+        let mut sampling_arguments = ReplayArguments::new();
+        self.sampling
+            .component()
+            .add_replay_arguments(markov_replay_shape, &mut sampling_arguments);
+        Qwen3xDSparkDecodeRecording {
+            embed_key,
+            body_key,
+            gather_unembed_key,
+            sampling_key,
+            sampling_arguments,
+            req_slots: proposal.req_slots,
+        }
     }
 
     pub fn read_proposal(
         &self,
-        recording: &Qwen3xDSparkRecording,
+        recording: &Qwen3xDSparkDecodeRecording,
         distribution_store: &mut SpecProbsStore,
     ) -> DSparkProposal {
         self.sampling
@@ -525,28 +478,15 @@ impl Qwen3xDSparkExecution {
     }
 }
 
-pub struct Qwen3xDSparkRecording {
-    context_key: Option<Qwen3xDSparkContextReplayKey>,
-    embed_key: Option<Qwen3xDSparkEmbedReplayKey>,
-    body_key: Option<Qwen3xDSparkBodyReplayKey>,
-    gather_unembed_key: Option<Qwen3xDSparkGatherUnembedReplayKey>,
-    sampling_key: Option<Qwen3xDSparkSamplingReplayKey>,
-    sampling_arguments: ReplayArguments,
-    markov_replay_shape: Option<DSparkMarkovReplayShape>,
-    req_slots: Vec<u32>,
+pub struct Qwen3xDSparkPrefillRecording {
+    key: Qwen3xDSparkPrefillReplayKey,
 }
 
-impl Qwen3xDSparkRecording {
-    pub fn new() -> Self {
-        Self {
-            context_key: None,
-            embed_key: None,
-            body_key: None,
-            gather_unembed_key: None,
-            sampling_key: None,
-            sampling_arguments: ReplayArguments::new(),
-            markov_replay_shape: None,
-            req_slots: Vec::new(),
-        }
-    }
+pub struct Qwen3xDSparkDecodeRecording {
+    embed_key: Qwen3xDSparkEmbedReplayKey,
+    body_key: Qwen3xDSparkBodyReplayKey,
+    gather_unembed_key: Qwen3xDSparkGatherUnembedReplayKey,
+    sampling_key: Qwen3xDSparkSamplingReplayKey,
+    sampling_arguments: ReplayArguments,
+    req_slots: Vec<u32>,
 }

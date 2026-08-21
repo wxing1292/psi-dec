@@ -158,7 +158,7 @@ impl Qwen3xDSparkLayer {
         self.scratch.residual_stream(self.dspark_layer_index)
     }
 
-    pub fn record_context<'a, R>(
+    pub fn record_prefill<'a, R>(
         &'a self,
         recorder: &mut R,
         num_tokens: u32,
@@ -170,7 +170,7 @@ impl Qwen3xDSparkLayer {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.attention
-            .record_context(recorder, num_tokens, main_feature, req_slots, flat_token_indices, pages);
+            .record_prefill(recorder, num_tokens, main_feature, req_slots, flat_token_indices, pages);
     }
 
     pub fn record_block<'a, R>(&'a self, recorder: &mut R, input: Qwen3xDSparkLayerInput<'a>) -> &'a Buffer

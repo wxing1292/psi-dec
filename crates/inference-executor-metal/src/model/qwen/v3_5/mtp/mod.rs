@@ -1,3 +1,46 @@
+//! Qwen3.5 MTP combined Spec invocation.
+//!
+//! MTP consumes the Main final hidden state. It does not use the DSpark selected-residual capture or the independent
+//! Spec Prefill and Decode lifecycle. One outer invocation performs sequential proposal steps because each sampled
+//! draft token is an input to the next step.
+//!
+//! ```text
+//! Main final hidden + Main decision
+//!                    |
+//!                    v
+//!           prepare MTP requests
+//!                    |
+//!                    v
+//! +---------- for proposal step i = 0..P-1 ----------+
+//! |                                                    |
+//! | gathered previous hidden + token embedding         |
+//! |                    |                               |
+//! |                    v                               |
+//! |                 MTP Embed                          |
+//! |                    |                               |
+//! |                    v                               |
+//! |                 MTP Body                           |
+//! |                    |                               |
+//! |                    v                               |
+//! |            Gather + Unembed                        |
+//! |                    |                               |
+//! |                    v                               |
+//! |          sample one draft token                    |
+//! |                    |                               |
+//! |                    +----------> input for step i+1  |
+//! |                                                    |
+//! +----------------------------------------------------+
+//!                    |
+//!                    v
+//!       proposal tokens/probabilities
+//!                    |
+//!                    v
+//!              SpecProbsStore
+//! ```
+//!
+//! The outer lifecycle is combined even when the data dependency requires an internal submit, wait, and read between
+//! proposal steps.
+
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;

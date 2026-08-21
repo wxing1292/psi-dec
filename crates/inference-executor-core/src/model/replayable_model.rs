@@ -1,3 +1,48 @@
+//! Shared Main and Spec replay lifecycle.
+//!
+//! The model executor records the Main invocation first. Main sampling or rejection produces the decision that can
+//! enable Spec work. A model uses either the combined Spec hooks or the independent Spec Prefill and Decode hooks.
+//!
+//! ```text
+//! previous Spec proposal
+//!   {draft tokens, draft probabilities}
+//!                 |
+//!                 v
+//! request microbatch
+//!   {committed tokens + previous speculative suffix}
+//!                 |
+//!                 v
+//! +------------------------------ Main module --------------------------------+
+//! |                                                                            |
+//! | token IDs -> Main Embed -> Main Body -> Gather + Unembed -> target logits   |
+//! |                              |                                |             |
+//! |                              +-> optional model-owned capture |             |
+//! |                                                               v             |
+//! |                                      normal sampling or rejection sampling  |
+//! |                                                               |             |
+//! |                                                               v             |
+//! |                                      validated prefix + sampled anchor       |
+//! +---------------------------------------------------------------+-------------+
+//!                                                                 |
+//!                                                   submit + wait + read
+//!                                                                 |
+//!                         +-------------------+--------------------+
+//!                         |                   |                    |
+//!                         v                   v                    v
+//!                      Vanilla       independent Spec       combined Spec
+//!                        return       Prefill -> Decode        invocation
+//!                                           |                    |
+//!                                           +---------+----------+
+//!                                                     |
+//!                                                     v
+//!                                           next Spec proposal
+//!                                                     |
+//!                                                     +----> next Main invocation
+//! ```
+//!
+//! Independent Prefill and Decode recordings can share one ordered submission. Independence does not require one
+//! submission and wait for each recording.
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -118,6 +163,31 @@ pub trait ReplayableModel {
         _model_batch_resp: &Self::ModelBatchResponse,
     ) {
         panic!("model executor does not have a speculator")
+    }
+
+    fn run_spec_prefill(&self, _model_batch_req: &Self::ModelBatchRequest) -> bool {
+        false
+    }
+
+    fn prefill_spec(&mut self, _recorder: &mut Self::ModelOpsRecorder, _model_batch_req: &Self::ModelBatchRequest) {
+        panic!("model executor does not support Spec Prefill")
+    }
+
+    fn run_spec_decode(
+        &self,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _sampled_output: &Self::SampledOutput,
+    ) -> bool {
+        false
+    }
+
+    fn decode_spec(
+        &mut self,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _sampled_output: &Self::SampledOutput,
+    ) {
+        panic!("model executor does not support Spec Decode")
     }
 
     fn submit_spec(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
