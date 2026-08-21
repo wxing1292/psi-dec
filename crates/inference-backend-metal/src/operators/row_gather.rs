@@ -4,11 +4,11 @@ use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
+use crate::metal::Kernel as CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
-const ROW_GATHER_SOURCE: &str = include_str!("metal/row_gather.metal");
+const SOURCE: &str = include_str!("metal/row_gather.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ThreadBlockConstants {
@@ -89,13 +89,13 @@ pub struct Buffers<'a> {
     pub output: &'a Buffer,
 }
 
-pub struct Compute {
+pub struct Kernel {
     config: Config,
     constants: KernelConstants,
-    kernel: Kernel,
+    kernel: CompiledKernel,
 }
 
-impl Compute {
+impl Kernel {
     pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         let constants = KernelConstants::new(config);
@@ -107,7 +107,7 @@ impl Compute {
         Self {
             config,
             constants,
-            kernel: Kernel::new(device, ROW_GATHER_SOURCE, function_name),
+            kernel: CompiledKernel::new(device, SOURCE, function_name),
         }
     }
 
@@ -143,7 +143,7 @@ impl Compute {
 pub struct Invocation<'a> {
     config: Config,
     constants: KernelConstants,
-    kernel: &'a Kernel,
+    kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: Buffers<'a>,
     num_active_rows_key: Option<ReplayParameterKey>,
@@ -187,10 +187,25 @@ mod tests {
     const OUTPUT_CANARY: u8 = 0xa5;
 
     #[test]
+    fn test_constants_have_explicit_thread_block_scope() {
+        let config = Config {
+            num_cols: 4,
+            dtype: Dtype::Float32,
+        };
+        assert_eq!(
+            KernelConstants::new(config),
+            KernelConstants {
+                dtype: Dtype::Float32,
+                thread_block: ThreadBlockConstants { required_threads: 256 },
+            }
+        );
+    }
+
+    #[test]
     fn test_bf16() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let kernel = Compute::new(
+        let kernel = Kernel::new(
             &device,
             Config {
                 num_cols: 2,
@@ -239,7 +254,7 @@ mod tests {
         let input = Buffer::from_slice(&device, &input_values);
         let row_indices = Buffer::from_slice(&device, &[2_u32, 0, 1, u32::MAX]);
         let output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; 5 * row_bytes]);
-        let kernel = Compute::new(&device, config);
+        let kernel = Kernel::new(&device, config);
 
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke_bucketed(

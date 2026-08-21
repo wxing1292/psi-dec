@@ -8,13 +8,13 @@ use inference_executor_core::backend::recorder::Recorder;
 use crate::def::replay_op::ReplayOp;
 
 pub struct Gather {
-    compute: row_gather::Compute,
+    compute: row_gather::Kernel,
 }
 
 impl Gather {
     pub fn new(device: &Device, hidden_dim: u32) -> Self {
         Self {
-            compute: row_gather::Compute::new(
+            compute: row_gather::Kernel::new(
                 device,
                 row_gather::Config {
                     num_cols: hidden_dim,

@@ -22,7 +22,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
@@ -709,8 +709,8 @@ where
     recorder.build()
 }
 
-fn gqa_qgkv_affine_config(model: GQAModelProfile) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn gqa_qgkv_affine_config(model: GQAModelProfile) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: model.qgkv_dim().try_into().expect("GQA qgkv n must fit i32"),
         k: model.hidden_dim.try_into().expect("GQA qgkv k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GQA group size must fit i32"),
@@ -721,8 +721,8 @@ fn gqa_qgkv_affine_config(model: GQAModelProfile) -> AffineQuantizedMatmulConfig
     }
 }
 
-fn gqa_output_affine_config(model: GQAModelProfile) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn gqa_output_affine_config(model: GQAModelProfile) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: model.hidden_dim.try_into().expect("GQA output n must fit i32"),
         k: model.q_dim().try_into().expect("GQA output k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GQA group size must fit i32"),

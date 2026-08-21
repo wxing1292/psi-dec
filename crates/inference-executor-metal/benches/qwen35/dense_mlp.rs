@@ -13,9 +13,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::dense::DenseMLPReplayShape;
@@ -179,14 +177,14 @@ struct RealDenseMLPFixture<'a> {
     output: Buffer,
     gate_up: Buffer,
     swiglu: Buffer,
-    gate_up_qmv_bn8_bk32: AffineQuantizedMatmulKernel,
-    gate_up_qmm_bm8_bn32: AffineQuantizedMatmulKernel,
-    gate_up_qmm_bm16_bn32: AffineQuantizedMatmulKernel,
-    gate_up_qmm_bm32_bn32: AffineQuantizedMatmulKernel,
-    down_qmv_bn8_bk32: AffineQuantizedMatmulKernel,
-    down_qmm_bm8_bn32: AffineQuantizedMatmulKernel,
-    down_qmm_bm16_bn32: AffineQuantizedMatmulKernel,
-    down_qmm_bm32_bn32: AffineQuantizedMatmulKernel,
+    gate_up_qmv_bn8_bk32: affine_quantized::Kernel,
+    gate_up_qmm_bm8_bn32: affine_quantized::Kernel,
+    gate_up_qmm_bm16_bn32: affine_quantized::Kernel,
+    gate_up_qmm_bm32_bn32: affine_quantized::Kernel,
+    down_qmv_bn8_bk32: affine_quantized::Kernel,
+    down_qmm_bm8_bn32: affine_quantized::Kernel,
+    down_qmm_bm16_bn32: affine_quantized::Kernel,
+    down_qmm_bm32_bn32: affine_quantized::Kernel,
     weights: &'a RealDenseMLPWeights,
 }
 
@@ -225,45 +223,45 @@ impl<'a> RealDenseMLPFixture<'a> {
                 &hidden_fixture(num_tokens as usize, (INTERMEDIATE_DIM * 2) as usize),
             ),
             swiglu: Buffer::from_slice(device, &hidden_fixture(num_tokens as usize, INTERMEDIATE_DIM as usize)),
-            gate_up_qmv_bn8_bk32: AffineQuantizedMatmulKernel::new(
+            gate_up_qmv_bn8_bk32: affine_quantized::Kernel::new(
                 device,
                 gate_up_config,
-                AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+                affine_quantized::KernelKind::QmvBn8Bk32,
             ),
-            gate_up_qmm_bm8_bn32: AffineQuantizedMatmulKernel::new(
+            gate_up_qmm_bm8_bn32: affine_quantized::Kernel::new(
                 device,
                 gate_up_config,
-                AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+                affine_quantized::KernelKind::QmmBm8Bn32,
             ),
-            gate_up_qmm_bm16_bn32: AffineQuantizedMatmulKernel::new(
+            gate_up_qmm_bm16_bn32: affine_quantized::Kernel::new(
                 device,
                 gate_up_config,
-                AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
+                affine_quantized::KernelKind::QmmBm16Bn32,
             ),
-            gate_up_qmm_bm32_bn32: AffineQuantizedMatmulKernel::new(
+            gate_up_qmm_bm32_bn32: affine_quantized::Kernel::new(
                 device,
                 gate_up_config,
-                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
+                affine_quantized::KernelKind::QmmBm32Bn32,
             ),
-            down_qmv_bn8_bk32: AffineQuantizedMatmulKernel::new(
+            down_qmv_bn8_bk32: affine_quantized::Kernel::new(
                 device,
                 down_config,
-                AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+                affine_quantized::KernelKind::QmvBn8Bk32,
             ),
-            down_qmm_bm8_bn32: AffineQuantizedMatmulKernel::new(
+            down_qmm_bm8_bn32: affine_quantized::Kernel::new(
                 device,
                 down_config,
-                AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+                affine_quantized::KernelKind::QmmBm8Bn32,
             ),
-            down_qmm_bm16_bn32: AffineQuantizedMatmulKernel::new(
+            down_qmm_bm16_bn32: affine_quantized::Kernel::new(
                 device,
                 down_config,
-                AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
+                affine_quantized::KernelKind::QmmBm16Bn32,
             ),
-            down_qmm_bm32_bn32: AffineQuantizedMatmulKernel::new(
+            down_qmm_bm32_bn32: affine_quantized::Kernel::new(
                 device,
                 down_config,
-                AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
+                affine_quantized::KernelKind::QmmBm32Bn32,
             ),
             weights,
         }
@@ -592,16 +590,16 @@ fn dense_config() -> dense_mlp::Config {
     }
 }
 
-fn gate_up_affine_config() -> AffineQuantizedMatmulConfig {
+fn gate_up_affine_config() -> affine_quantized::Config {
     dense_affine_config(INTERMEDIATE_DIM * 2, HIDDEN_DIM)
 }
 
-fn down_affine_config() -> AffineQuantizedMatmulConfig {
+fn down_affine_config() -> affine_quantized::Config {
     dense_affine_config(HIDDEN_DIM, INTERMEDIATE_DIM)
 }
 
-fn dense_affine_config(n: u32, k: u32) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn dense_affine_config(n: u32, k: u32) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("dense MLP affine n must fit i32"),
         k: k.try_into().expect("dense MLP affine k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("dense MLP group size must fit i32"),

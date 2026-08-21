@@ -4,9 +4,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayParameterKey;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::checkpoint::remove_tensor;
@@ -52,8 +50,8 @@ impl UnembedConfig {
             .output_bytes(self.max_tokens.try_into().expect("unembed max_tokens must fit i32"))
     }
 
-    fn affine_config(self) -> AffineQuantizedMatmulConfig {
-        AffineQuantizedMatmulConfig {
+    fn affine_config(self) -> affine_quantized::Config {
+        affine_quantized::Config {
             n: self.vocab_size.try_into().expect("unembed vocab_size must fit i32"),
             k: self.hidden_dim.try_into().expect("unembed hidden_dim must fit i32"),
             group_size: self.group_size.try_into().expect("unembed group_size must fit i32"),
@@ -67,7 +65,7 @@ impl UnembedConfig {
 
 pub struct Unembed {
     config: UnembedConfig,
-    matmul: Rc<AffineQuantizedMatmul>,
+    matmul: Rc<affine_quantized::Matmul>,
     weights: Option<Rc<UnembedWeights>>,
 }
 
@@ -98,7 +96,7 @@ impl Unembed {
         let affine_config = config.affine_config();
         Self {
             config,
-            matmul: Rc::new(AffineQuantizedMatmul::new(device, affine_config)),
+            matmul: Rc::new(affine_quantized::Matmul::new(device, affine_config)),
             weights: None,
         }
     }
@@ -157,7 +155,7 @@ impl Unembed {
         }
     }
 
-    pub fn replay_topology(&self, num_total_rows: u32) -> AffineQuantizedMatmulKernelKind {
+    pub fn replay_topology(&self, num_total_rows: u32) -> affine_quantized::KernelKind {
         self.validate_num_rows(num_total_rows);
         self.matmul.topology(num_total_rows)
     }
@@ -231,7 +229,7 @@ impl UnembedWeights {
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
-        config: AffineQuantizedMatmulConfig,
+        config: affine_quantized::Config,
         bindings: QuantizedTensorBindings,
     ) -> Result<Self, ModelExecutorError> {
         let mut tensors = store.load_tensors([
@@ -402,7 +400,7 @@ mod tests {
         let affine_config = config.affine_config();
         let unembed = Unembed {
             config,
-            matmul: Rc::new(super::AffineQuantizedMatmul::new(device, affine_config)),
+            matmul: Rc::new(super::affine_quantized::Matmul::new(device, affine_config)),
             weights: Some(Rc::new(UnembedWeights {
                 weight: Buffer::new_zeroed(device, affine_config.weight_bytes()),
                 scales: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),

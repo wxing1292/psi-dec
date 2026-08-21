@@ -3,7 +3,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
@@ -232,7 +232,7 @@ impl Qwen3xDSparkMarkovWeights {
         validate_len("Qwen3x DSpark Markov W1 scales", w1_scales.len(), w1_affine_bytes)?;
         validate_len("Qwen3x DSpark Markov W1 biases", w1_biases.len(), w1_affine_bytes)?;
 
-        let w2_config = AffineQuantizedMatmulConfig {
+        let w2_config = affine_quantized::Config {
             n: config
                 .vocab_size
                 .try_into()

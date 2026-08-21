@@ -17,12 +17,8 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::SoftmaxBuffers;
-use inference_backend_metal::operators::SoftmaxConfig;
-use inference_backend_metal::operators::SoftmaxKernel;
-use inference_backend_metal::operators::SoftmaxShape;
+use inference_backend_metal::operators::affine_quantized;
+use inference_backend_metal::operators::softmax;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
@@ -149,13 +145,13 @@ impl MoERealImpl {
 }
 
 struct ForcedMoEKernels {
-    router: AffineQuantizedMatmul,
-    router_softmax: SoftmaxKernel,
+    router: affine_quantized::Matmul,
+    router_softmax: softmax::Kernel,
     routing: routing::Compute,
     expert_major: expert_major::Compute,
     experts: sparse_mlp::Compute,
     shared_experts: dense_mlp::Compute,
-    shared_expert_gate: AffineQuantizedMatmul,
+    shared_expert_gate: affine_quantized::Matmul,
     combine: combine::Compute,
 }
 
@@ -174,10 +170,10 @@ struct ForcedMoEWeights<'a> {
 impl ForcedMoEKernels {
     fn new(device: &Device) -> Self {
         Self {
-            router: AffineQuantizedMatmul::new(device, affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS)),
-            router_softmax: SoftmaxKernel::new(
+            router: affine_quantized::Matmul::new(device, affine_config(NUM_EXPERTS, HIDDEN_DIM, ROUTER_BITS)),
+            router_softmax: softmax::Kernel::new(
                 device,
-                SoftmaxConfig {
+                softmax::Config {
                     num_values_per_row: NUM_EXPERTS,
                     dtype: Dtype::Bfloat16,
                 },
@@ -186,7 +182,7 @@ impl ForcedMoEKernels {
             expert_major: expert_major::Compute::new(device, expert_major_config()),
             experts: sparse_mlp::Compute::new(device, sparse_config()),
             shared_experts: dense_mlp::Compute::new(device, dense_config()),
-            shared_expert_gate: AffineQuantizedMatmul::new(device, affine_config(1, HIDDEN_DIM, ROUTER_BITS)),
+            shared_expert_gate: affine_quantized::Matmul::new(device, affine_config(1, HIDDEN_DIM, ROUTER_BITS)),
             combine: combine::Compute::new(device, combine::Config::bf16(TOPK_EXPERTS, HIDDEN_DIM)),
         }
     }
@@ -220,10 +216,10 @@ impl ForcedMoEKernels {
             0,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke(
-            SoftmaxShape {
+            softmax::Shape {
                 num_total_rows: num_tokens,
             },
-            SoftmaxBuffers {
+            softmax::Buffers {
                 input: scratch.routing.router_logits,
                 output: scratch.routing.router_probs,
             },
@@ -1062,8 +1058,8 @@ fn dense_config() -> dense_mlp::Config {
     }
 }
 
-fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn affine_config(n: u32, k: u32, bits: u32) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("MoE affine output dimension must fit i32"),
         k: k.try_into().expect("MoE affine input dimension must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("MoE affine group size must fit i32"),

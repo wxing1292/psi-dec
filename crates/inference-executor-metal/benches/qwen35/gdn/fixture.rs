@@ -10,7 +10,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_metal::attn::gdn::backend::GDN;
 use inference_executor_metal::attn::gdn::backend::GDNInput;
@@ -305,7 +305,7 @@ impl<'a> RealGDNFixture<'a> {
     fn measure_subcomponents(&self, warmup_iters: usize, iters: usize, runs: usize) {
         let device = &self.device;
         let qkvabz_config = gdn_qkvabz_affine_config();
-        let qkvabz = AffineQuantizedMatmul::new(device, qkvabz_config);
+        let qkvabz = affine_quantized::Matmul::new(device, qkvabz_config);
         let qkvabz_to_qkv_a_b_z = backend_qkvabz_split::Compute::new(
             device,
             backend_qkvabz_split::Config::new(
@@ -316,7 +316,7 @@ impl<'a> RealGDNFixture<'a> {
         );
         let compute = backend_compute::Compute::new(device, gdn_compute_config());
         let output_config = gdn_output_affine_config();
-        let output = AffineQuantizedMatmul::new(device, output_config);
+        let output = affine_quantized::Matmul::new(device, output_config);
 
         let qkvabz_replay = build_single_invocation_replay(
             &self.stream,

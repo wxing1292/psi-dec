@@ -8,8 +8,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedDSparkGQACore;
@@ -39,12 +38,12 @@ pub struct UngatedDSparkGQA {
     device: Device,
     core: UngatedDSparkGQACore,
     metal: GQAMetalConfig,
-    qkv: AffineQuantizedMatmul,
+    qkv: affine_quantized::Matmul,
     qkv_to_q_k_v: backend_qkv_split::Compute,
     q_norm_rope: rms_norm_rope::Compute,
     k_norm_rope: rms_norm_rope::Compute,
     block_sdpa: backend_block_sdpa::Compute,
-    output: AffineQuantizedMatmul,
+    output: affine_quantized::Matmul,
 }
 
 impl UngatedDSparkGQA {
@@ -58,7 +57,7 @@ impl UngatedDSparkGQA {
         let output = attention.output_shape();
         Self {
             device: device.clone(),
-            qkv: AffineQuantizedMatmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, metal)),
+            qkv: affine_quantized::Matmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, metal)),
             qkv_to_q_k_v: backend_qkv_split::Compute::new(device, qkv_to_q_k_v_config(attention, metal)),
             q_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(attention, metal, attention.num_q_heads)),
             k_norm_rope: rms_norm_rope::Compute::new(
@@ -82,7 +81,7 @@ impl UngatedDSparkGQA {
                     dtype: metal.io_dtype,
                 },
             ),
-            output: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, metal)),
+            output: affine_quantized::Matmul::new(device, affine_config(output.out_dim, output.in_dim, metal)),
             core,
             metal,
         }
@@ -324,8 +323,8 @@ fn norm_rope_config(
     norm_rope.with_rope_scaling(metal.rope_scaling)
 }
 
-fn affine_config(n: usize, k: usize, metal: GQAMetalConfig) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn affine_config(n: usize, k: usize, metal: GQAMetalConfig) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("DSpark GQA affine n must fit i32"),
         k: k.try_into().expect("DSpark GQA affine k must fit i32"),
         group_size: metal.group_size.try_into().expect("DSpark GQA group_size must fit i32"),

@@ -6,9 +6,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
@@ -50,8 +48,8 @@ impl GDNReplayMode {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GDNReplayTopology {
     pub materialize_candidate_states: bool,
-    pub qkvabz_affine: AffineQuantizedMatmulKernelKind,
-    pub output_affine: AffineQuantizedMatmulKernelKind,
+    pub qkvabz_affine: affine_quantized::KernelKind,
+    pub output_affine: affine_quantized::KernelKind,
 }
 
 pub fn add_gdn_replay_arguments(shape: GDNReplayShape, arguments: &mut ReplayArguments) {
@@ -164,10 +162,10 @@ pub type GDNOutput<'a> = &'a Buffer;
 pub struct GDN {
     device: Device,
     core: GDNCore,
-    qkvabz: AffineQuantizedMatmul,
+    qkvabz: affine_quantized::Matmul,
     qkvabz_to_qkv_a_b_z: backend_qkvabz_split::Compute,
     compute: backend_compute::Compute,
-    output: AffineQuantizedMatmul,
+    output: affine_quantized::Matmul,
 }
 
 impl GDN {
@@ -178,7 +176,7 @@ impl GDN {
         Self {
             device: device.clone(),
             core: core.clone(),
-            qkvabz: AffineQuantizedMatmul::new(
+            qkvabz: affine_quantized::Matmul::new(
                 device,
                 affine_config(
                     qkvabz_dim,
@@ -191,7 +189,7 @@ impl GDN {
             ),
             qkvabz_to_qkv_a_b_z: backend_qkvabz_split::Compute::new(device, qkvabz_split_config(&core)),
             compute: backend_compute::Compute::new(device, compute_config(&core, config)),
-            output: AffineQuantizedMatmul::new(
+            output: affine_quantized::Matmul::new(
                 device,
                 affine_config(
                     core.hidden_dim,
@@ -516,8 +514,8 @@ fn affine_config(
     output_dtype: Dtype,
     scale_bias_dtype: Dtype,
     config: GDNMetalConfig,
-) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("GDN affine n must fit i32"),
         k: k.try_into().expect("GDN affine k must fit i32"),
         group_size: config.group_size.try_into().expect("GDN group size must fit i32"),

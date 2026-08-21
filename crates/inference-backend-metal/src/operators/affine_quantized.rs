@@ -7,7 +7,7 @@ use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
 use crate::metal::Dtype;
-use crate::metal::Kernel;
+use crate::metal::Kernel as CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 use crate::operators::mlx_headers::find_mlx_metal_header_root;
@@ -33,7 +33,7 @@ fn checked_range_end(name: &str, offset_bytes: usize, required_bytes: usize) -> 
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct AffineQuantizedMatmulConfig {
+pub struct Config {
     pub n: i32,
     pub k: i32,
     pub group_size: i32,
@@ -43,7 +43,7 @@ pub struct AffineQuantizedMatmulConfig {
     pub scale_bias_dtype: Dtype,
 }
 
-impl AffineQuantizedMatmulConfig {
+impl Config {
     pub fn same_dtype(n: i32, k: i32, group_size: i32, bits: i32, dtype: Dtype) -> Self {
         Self {
             n,
@@ -122,30 +122,30 @@ impl AffineQuantizedMatmulConfig {
     }
 }
 
-pub struct AffineQuantizedMatmulKernel {
-    config: AffineQuantizedMatmulConfig,
-    kind: AffineQuantizedMatmulKernelKind,
-    kernel: Kernel,
+pub struct Kernel {
+    config: Config,
+    kind: KernelKind,
+    kernel: CompiledKernel,
 }
 
-pub struct AffineQuantizedMatmul {
-    config: AffineQuantizedMatmulConfig,
+pub struct Matmul {
+    config: Config,
     registry: Registry,
 }
 
 struct Registry {
-    entries: Vec<(AffineQuantizedMatmulKernelKind, AffineQuantizedMatmulKernel)>,
+    entries: Vec<(KernelKind, Kernel)>,
 }
 
 struct Selector;
 
 #[derive(Clone, Copy, Debug)]
-pub struct ExpertAffineQuantizedConfig {
+pub struct ExpertConfig {
     pub num_experts: i32,
-    pub matmul: AffineQuantizedMatmulConfig,
+    pub matmul: Config,
 }
 
-impl ExpertAffineQuantizedConfig {
+impl ExpertConfig {
     pub fn validate(self) {
         assert!(self.num_experts > 0);
         self.matmul.validate();
@@ -193,12 +193,12 @@ impl ExpertAffineQuantizedConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct GatherAffineQuantizedShape {
+pub struct GatherShape {
     pub num_routes: i32,
     pub num_input_vectors: i32,
 }
 
-impl GatherAffineQuantizedShape {
+impl GatherShape {
     pub fn validate(self) {
         assert!(self.num_routes > 0);
         assert!(self.num_input_vectors > 0);
@@ -206,26 +206,26 @@ impl GatherAffineQuantizedShape {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RaggedExpertMajorAffineQuantizedShape {
+pub struct RaggedExpertMajorShape {
     pub num_routes: i32,
 }
 
-impl RaggedExpertMajorAffineQuantizedShape {
+impl RaggedExpertMajorShape {
     pub fn validate(self) {
         assert!(self.num_routes > 0);
     }
 }
 
 #[derive(Clone, Copy)]
-struct ExpertAffineBucketedRoutes {
+struct ExpertBucketedRoutes {
     num_total_tokens: u32,
     num_experts_per_token: u32,
     num_active_tokens_key: ReplayParameterKey,
 }
 
-impl ExpertAffineBucketedRoutes {
+impl ExpertBucketedRoutes {
     fn new(
-        config: ExpertAffineQuantizedConfig,
+        config: ExpertConfig,
         num_total_routes: i32,
         num_total_tokens: u32,
         num_experts_per_token: u32,
@@ -265,32 +265,32 @@ impl ExpertAffineBucketedRoutes {
     }
 }
 
-pub struct GatherAffineQuantizedMatmulKernel {
-    config: ExpertAffineQuantizedConfig,
-    kernel: Kernel,
-    bucketed_kernel: Kernel,
+pub struct GatherMatmulKernel {
+    config: ExpertConfig,
+    kernel: CompiledKernel,
+    bucketed_kernel: CompiledKernel,
 }
 
-pub struct GatherAffineQuantizedGateUpSwiGLUKernel {
-    config: ExpertAffineQuantizedConfig,
-    kernel: Kernel,
-    bucketed_kernel: Kernel,
+pub struct GatherGateUpSwiGLUKernel {
+    config: ExpertConfig,
+    kernel: CompiledKernel,
+    bucketed_kernel: CompiledKernel,
 }
 
-pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
-    config: ExpertAffineQuantizedConfig,
-    kernel: Kernel,
-    bucketed_kernel: Kernel,
+pub struct RaggedExpertMajorGateUpSwiGLUKernel {
+    config: ExpertConfig,
+    kernel: CompiledKernel,
+    bucketed_kernel: CompiledKernel,
 }
 
-pub struct RaggedExpertMajorAffineQuantizedMatmulKernel {
-    config: ExpertAffineQuantizedConfig,
-    kernel: Kernel,
-    bucketed_kernel: Kernel,
+pub struct RaggedExpertMajorMatmulKernel {
+    config: ExpertConfig,
+    kernel: CompiledKernel,
+    bucketed_kernel: CompiledKernel,
 }
 
-impl GatherAffineQuantizedMatmulKernel {
-    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+impl GatherMatmulKernel {
+    pub fn new(device: &Device, config: ExpertConfig) -> Self {
         config.validate();
         let matmul = config.matmul;
         let type_string = metal_type_string(matmul.input_dtype);
@@ -308,7 +308,7 @@ impl GatherAffineQuantizedMatmulKernel {
             ],
         );
         let source = affine_quantized_source(&exact_template_definition);
-        let kernel = Kernel::new(device, &source, &kernel_name);
+        let kernel = CompiledKernel::new(device, &source, &kernel_name);
         let bucketed_kernel_name = format!(
             "token_major_down_matmul_bucketed_{type_string}_gs_{}_b_{}",
             matmul.group_size, matmul.bits
@@ -325,7 +325,7 @@ impl GatherAffineQuantizedMatmulKernel {
         );
         let bucketed_source =
             affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
-        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        let bucketed_kernel = CompiledKernel::new(device, &bucketed_source, &bucketed_kernel_name);
         Self {
             config,
             kernel,
@@ -336,7 +336,7 @@ impl GatherAffineQuantizedMatmulKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
-        shape: GatherAffineQuantizedShape,
+        shape: GatherShape,
         output: &'a Buffer,
         input: &'a Buffer,
         weight: &'a Buffer,
@@ -344,8 +344,8 @@ impl GatherAffineQuantizedMatmulKernel {
         biases: &'a Buffer,
         lhs_indices: &'a Buffer,
         rhs_indices: &'a Buffer,
-    ) -> GatherAffineQuantizedMatmulInvocation<'a> {
-        GatherAffineQuantizedMatmulInvocation {
+    ) -> GatherMatmulInvocation<'a> {
+        GatherMatmulInvocation {
             kernel: self,
             shape,
             output,
@@ -363,7 +363,7 @@ impl GatherAffineQuantizedMatmulKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: GatherAffineQuantizedShape,
+        shape: GatherShape,
         num_total_tokens: u32,
         num_experts_per_token: u32,
         num_active_tokens_key: ReplayParameterKey,
@@ -374,15 +374,15 @@ impl GatherAffineQuantizedMatmulKernel {
         biases: &'a Buffer,
         lhs_indices: &'a Buffer,
         rhs_indices: &'a Buffer,
-    ) -> GatherAffineQuantizedMatmulInvocation<'a> {
-        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+    ) -> GatherMatmulInvocation<'a> {
+        let bucketed_routes = ExpertBucketedRoutes::new(
             self.config,
             shape.num_routes,
             num_total_tokens,
             num_experts_per_token,
             num_active_tokens_key,
         );
-        GatherAffineQuantizedMatmulInvocation {
+        GatherMatmulInvocation {
             kernel: self,
             shape,
             output,
@@ -397,8 +397,8 @@ impl GatherAffineQuantizedMatmulKernel {
     }
 }
 
-impl GatherAffineQuantizedGateUpSwiGLUKernel {
-    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+impl GatherGateUpSwiGLUKernel {
+    pub fn new(device: &Device, config: ExpertConfig) -> Self {
         config.validate();
         let matmul = config.matmul;
         let type_string = metal_type_string(matmul.input_dtype);
@@ -416,7 +416,7 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
             ],
         );
         let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
-        let kernel = Kernel::new(device, &source, &kernel_name);
+        let kernel = CompiledKernel::new(device, &source, &kernel_name);
         let bucketed_kernel_name = format!(
             "token_major_gate_up_swiglu_bucketed_{type_string}_gs_{}_b_{}",
             matmul.group_size, matmul.bits
@@ -432,7 +432,7 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
         );
         let bucketed_source =
             affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
-        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        let bucketed_kernel = CompiledKernel::new(device, &bucketed_source, &bucketed_kernel_name);
         Self {
             config,
             kernel,
@@ -443,7 +443,7 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
-        shape: GatherAffineQuantizedShape,
+        shape: GatherShape,
         output: &'a Buffer,
         input: &'a Buffer,
         gate_weight: &'a Buffer,
@@ -454,8 +454,8 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
         up_biases: &'a Buffer,
         lhs_indices: &'a Buffer,
         rhs_indices: &'a Buffer,
-    ) -> GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
-        GatherAffineQuantizedGateUpSwiGLUInvocation {
+    ) -> GatherGateUpSwiGLUInvocation<'a> {
+        GatherGateUpSwiGLUInvocation {
             kernel: self,
             shape,
             output,
@@ -476,7 +476,7 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: GatherAffineQuantizedShape,
+        shape: GatherShape,
         num_total_tokens: u32,
         num_experts_per_token: u32,
         num_active_tokens_key: ReplayParameterKey,
@@ -490,15 +490,15 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
         up_biases: &'a Buffer,
         lhs_indices: &'a Buffer,
         rhs_indices: &'a Buffer,
-    ) -> GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
-        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+    ) -> GatherGateUpSwiGLUInvocation<'a> {
+        let bucketed_routes = ExpertBucketedRoutes::new(
             self.config,
             shape.num_routes,
             num_total_tokens,
             num_experts_per_token,
             num_active_tokens_key,
         );
-        GatherAffineQuantizedGateUpSwiGLUInvocation {
+        GatherGateUpSwiGLUInvocation {
             kernel: self,
             shape,
             output,
@@ -516,8 +516,8 @@ impl GatherAffineQuantizedGateUpSwiGLUKernel {
     }
 }
 
-impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
-    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+impl RaggedExpertMajorGateUpSwiGLUKernel {
+    pub fn new(device: &Device, config: ExpertConfig) -> Self {
         config.validate();
         let matmul = config.matmul;
         let type_string = metal_type_string(matmul.input_dtype);
@@ -535,7 +535,7 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
             ],
         );
         let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
-        let kernel = Kernel::new(device, &source, &kernel_name);
+        let kernel = CompiledKernel::new(device, &source, &kernel_name);
         let bucketed_kernel_name = format!(
             "expert_major_gate_up_swiglu_bucketed_{type_string}_gs_{}_b_{}",
             matmul.group_size, matmul.bits
@@ -551,7 +551,7 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
         );
         let bucketed_source =
             affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
-        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        let bucketed_kernel = CompiledKernel::new(device, &bucketed_source, &bucketed_kernel_name);
         Self {
             config,
             kernel,
@@ -562,7 +562,7 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
-        shape: RaggedExpertMajorAffineQuantizedShape,
+        shape: RaggedExpertMajorShape,
         output: &'a Buffer,
         input: &'a Buffer,
         gate_weight: &'a Buffer,
@@ -572,8 +572,8 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
         up_scales: &'a Buffer,
         up_biases: &'a Buffer,
         experts_by_route: &'a Buffer,
-    ) -> RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
-        RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation {
+    ) -> RaggedExpertMajorGateUpSwiGLUInvocation<'a> {
+        RaggedExpertMajorGateUpSwiGLUInvocation {
             kernel: self,
             shape,
             output,
@@ -593,7 +593,7 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: RaggedExpertMajorAffineQuantizedShape,
+        shape: RaggedExpertMajorShape,
         num_total_tokens: u32,
         num_experts_per_token: u32,
         num_active_tokens_key: ReplayParameterKey,
@@ -606,15 +606,15 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
         up_scales: &'a Buffer,
         up_biases: &'a Buffer,
         experts_by_route: &'a Buffer,
-    ) -> RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
-        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+    ) -> RaggedExpertMajorGateUpSwiGLUInvocation<'a> {
+        let bucketed_routes = ExpertBucketedRoutes::new(
             self.config,
             shape.num_routes,
             num_total_tokens,
             num_experts_per_token,
             num_active_tokens_key,
         );
-        RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation {
+        RaggedExpertMajorGateUpSwiGLUInvocation {
             kernel: self,
             shape,
             output,
@@ -631,8 +631,8 @@ impl RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel {
     }
 }
 
-impl RaggedExpertMajorAffineQuantizedMatmulKernel {
-    pub fn new(device: &Device, config: ExpertAffineQuantizedConfig) -> Self {
+impl RaggedExpertMajorMatmulKernel {
+    pub fn new(device: &Device, config: ExpertConfig) -> Self {
         config.validate();
         let matmul = config.matmul;
         let type_string = metal_type_string(matmul.input_dtype);
@@ -650,7 +650,7 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
             ],
         );
         let source = affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{exact_template_definition}"));
-        let kernel = Kernel::new(device, &source, &kernel_name);
+        let kernel = CompiledKernel::new(device, &source, &kernel_name);
         let bucketed_kernel_name = format!(
             "expert_major_down_matmul_bucketed_{type_string}_gs_{}_b_{}",
             matmul.group_size, matmul.bits
@@ -666,7 +666,7 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
         );
         let bucketed_source =
             affine_quantized_source(&format!("{GATE_UP_SWIGLU_SOURCE}\n{bucketed_template_definition}"));
-        let bucketed_kernel = Kernel::new(device, &bucketed_source, &bucketed_kernel_name);
+        let bucketed_kernel = CompiledKernel::new(device, &bucketed_source, &bucketed_kernel_name);
         Self {
             config,
             kernel,
@@ -677,15 +677,15 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke<'a>(
         &'a self,
-        shape: RaggedExpertMajorAffineQuantizedShape,
+        shape: RaggedExpertMajorShape,
         output: &'a Buffer,
         input: &'a Buffer,
         weight: &'a Buffer,
         scales: &'a Buffer,
         biases: &'a Buffer,
         experts_by_route: &'a Buffer,
-    ) -> RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
-        RaggedExpertMajorAffineQuantizedMatmulInvocation {
+    ) -> RaggedExpertMajorMatmulInvocation<'a> {
+        RaggedExpertMajorMatmulInvocation {
             kernel: self,
             shape,
             output,
@@ -702,7 +702,7 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn invoke_bucketed<'a>(
         &'a self,
-        shape: RaggedExpertMajorAffineQuantizedShape,
+        shape: RaggedExpertMajorShape,
         num_total_tokens: u32,
         num_experts_per_token: u32,
         num_active_tokens_key: ReplayParameterKey,
@@ -712,15 +712,15 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
         scales: &'a Buffer,
         biases: &'a Buffer,
         experts_by_route: &'a Buffer,
-    ) -> RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
-        let bucketed_routes = ExpertAffineBucketedRoutes::new(
+    ) -> RaggedExpertMajorMatmulInvocation<'a> {
+        let bucketed_routes = ExpertBucketedRoutes::new(
             self.config,
             shape.num_routes,
             num_total_tokens,
             num_experts_per_token,
             num_active_tokens_key,
         );
-        RaggedExpertMajorAffineQuantizedMatmulInvocation {
+        RaggedExpertMajorMatmulInvocation {
             kernel: self,
             shape,
             output,
@@ -734,9 +734,9 @@ impl RaggedExpertMajorAffineQuantizedMatmulKernel {
     }
 }
 
-pub struct GatherAffineQuantizedMatmulInvocation<'a> {
-    kernel: &'a GatherAffineQuantizedMatmulKernel,
-    shape: GatherAffineQuantizedShape,
+pub struct GatherMatmulInvocation<'a> {
+    kernel: &'a GatherMatmulKernel,
+    shape: GatherShape,
     output: &'a Buffer,
     input: &'a Buffer,
     weight: &'a Buffer,
@@ -744,12 +744,12 @@ pub struct GatherAffineQuantizedMatmulInvocation<'a> {
     biases: &'a Buffer,
     lhs_indices: &'a Buffer,
     rhs_indices: &'a Buffer,
-    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
+    bucketed_routes: Option<ExpertBucketedRoutes>,
 }
 
-pub struct GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
-    kernel: &'a GatherAffineQuantizedGateUpSwiGLUKernel,
-    shape: GatherAffineQuantizedShape,
+pub struct GatherGateUpSwiGLUInvocation<'a> {
+    kernel: &'a GatherGateUpSwiGLUKernel,
+    shape: GatherShape,
     output: &'a Buffer,
     input: &'a Buffer,
     gate_weight: &'a Buffer,
@@ -760,12 +760,12 @@ pub struct GatherAffineQuantizedGateUpSwiGLUInvocation<'a> {
     up_biases: &'a Buffer,
     lhs_indices: &'a Buffer,
     rhs_indices: &'a Buffer,
-    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
+    bucketed_routes: Option<ExpertBucketedRoutes>,
 }
 
-pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
-    kernel: &'a RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel,
-    shape: RaggedExpertMajorAffineQuantizedShape,
+pub struct RaggedExpertMajorGateUpSwiGLUInvocation<'a> {
+    kernel: &'a RaggedExpertMajorGateUpSwiGLUKernel,
+    shape: RaggedExpertMajorShape,
     output: &'a Buffer,
     input: &'a Buffer,
     gate_weight: &'a Buffer,
@@ -775,22 +775,22 @@ pub struct RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'a> {
     up_scales: &'a Buffer,
     up_biases: &'a Buffer,
     experts_by_route: &'a Buffer,
-    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
+    bucketed_routes: Option<ExpertBucketedRoutes>,
 }
 
-pub struct RaggedExpertMajorAffineQuantizedMatmulInvocation<'a> {
-    kernel: &'a RaggedExpertMajorAffineQuantizedMatmulKernel,
-    shape: RaggedExpertMajorAffineQuantizedShape,
+pub struct RaggedExpertMajorMatmulInvocation<'a> {
+    kernel: &'a RaggedExpertMajorMatmulKernel,
+    shape: RaggedExpertMajorShape,
     output: &'a Buffer,
     input: &'a Buffer,
     weight: &'a Buffer,
     scales: &'a Buffer,
     biases: &'a Buffer,
     experts_by_route: &'a Buffer,
-    bucketed_routes: Option<ExpertAffineBucketedRoutes>,
+    bucketed_routes: Option<ExpertBucketedRoutes>,
 }
 
-impl Operator for RaggedExpertMajorAffineQuantizedMatmulInvocation<'_> {
+impl Operator for RaggedExpertMajorMatmulInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernel.config;
         let matmul = config.matmul;
@@ -830,7 +830,7 @@ impl Operator for RaggedExpertMajorAffineQuantizedMatmulInvocation<'_> {
     }
 }
 
-impl Operator for RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'_> {
+impl Operator for RaggedExpertMajorGateUpSwiGLUInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernel.config;
         let matmul = config.matmul;
@@ -876,7 +876,7 @@ impl Operator for RaggedExpertMajorAffineQuantizedGateUpSwiGLUInvocation<'_> {
     }
 }
 
-impl Operator for GatherAffineQuantizedGateUpSwiGLUInvocation<'_> {
+impl Operator for GatherGateUpSwiGLUInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernel.config;
         let matmul = config.matmul;
@@ -923,7 +923,7 @@ impl Operator for GatherAffineQuantizedGateUpSwiGLUInvocation<'_> {
     }
 }
 
-impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
+impl Operator for GatherMatmulInvocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let config = self.kernel.config;
         let matmul = config.matmul;
@@ -998,8 +998,8 @@ impl Operator for GatherAffineQuantizedMatmulInvocation<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn validate_gather_buffer_ranges(
-    config: ExpertAffineQuantizedConfig,
-    shape: GatherAffineQuantizedShape,
+    config: ExpertConfig,
+    shape: GatherShape,
     output: &Buffer,
     input: &Buffer,
     weight: &Buffer,
@@ -1061,8 +1061,8 @@ fn validate_gather_buffer_ranges(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_gather_gate_up_swiglu_buffer_ranges(
-    config: ExpertAffineQuantizedConfig,
-    shape: GatherAffineQuantizedShape,
+    config: ExpertConfig,
+    shape: GatherShape,
     output: &Buffer,
     input: &Buffer,
     gate_weight: &Buffer,
@@ -1110,8 +1110,8 @@ fn validate_gather_gate_up_swiglu_buffer_ranges(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_ragged_expert_major_gate_up_swiglu_buffer_ranges(
-    config: ExpertAffineQuantizedConfig,
-    shape: RaggedExpertMajorAffineQuantizedShape,
+    config: ExpertConfig,
+    shape: RaggedExpertMajorShape,
     output: &Buffer,
     input: &Buffer,
     gate_weight: &Buffer,
@@ -1155,8 +1155,8 @@ fn validate_ragged_expert_major_gate_up_swiglu_buffer_ranges(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_ragged_expert_major_down_matmul_buffer_ranges(
-    config: ExpertAffineQuantizedConfig,
-    shape: RaggedExpertMajorAffineQuantizedShape,
+    config: ExpertConfig,
+    shape: RaggedExpertMajorShape,
     output: &Buffer,
     input: &Buffer,
     weight: &Buffer,
@@ -1202,7 +1202,7 @@ fn packed_dim(k: i32, bits: i32) -> i32 {
 
 /// Stable identity for the kernel topology recorded by one affine invocation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum AffineQuantizedMatmulKernelKind {
+pub enum KernelKind {
     QmvBn8Bk32,
     QmvQuadBn64,
     QmmBm8Bn32,
@@ -1210,24 +1210,22 @@ pub enum AffineQuantizedMatmulKernelKind {
     QmmBm32Bn32,
 }
 
-impl AffineQuantizedMatmulKernel {
-    pub fn new(device: &Device, config: AffineQuantizedMatmulConfig, kind: AffineQuantizedMatmulKernelKind) -> Self {
+impl Kernel {
+    pub fn new(device: &Device, config: Config, kind: KernelKind) -> Self {
         config.validate();
         validate_kernel_kind(config, kind);
         let (kernel_name, source) = affine_kernel_source(config, kind);
-        let kernel = Kernel::new(device, &source, &kernel_name);
+        let kernel = CompiledKernel::new(device, &source, &kernel_name);
         if matches!(
             kind,
-            AffineQuantizedMatmulKernelKind::QmmBm8Bn32
-                | AffineQuantizedMatmulKernelKind::QmmBm16Bn32
-                | AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+            KernelKind::QmmBm8Bn32 | KernelKind::QmmBm16Bn32 | KernelKind::QmmBm32Bn32
         ) {
             validate_qmm_pipeline(device, config, kind, &kernel);
         }
         Self { config, kind, kernel }
     }
 
-    pub fn kind(&self) -> AffineQuantizedMatmulKernelKind {
+    pub fn kind(&self) -> KernelKind {
         self.kind
     }
 
@@ -1245,9 +1243,9 @@ impl AffineQuantizedMatmulKernel {
         scales_offset_bytes: usize,
         biases: &'a Buffer,
         biases_offset_bytes: usize,
-    ) -> AffineQuantizedMatmulInvocation<'a> {
+    ) -> Invocation<'a> {
         assert!(m > 0);
-        AffineQuantizedMatmulInvocation {
+        Invocation {
             kernel: self,
             num_total_rows: m as u32,
             num_active_rows_key: None,
@@ -1280,9 +1278,9 @@ impl AffineQuantizedMatmulKernel {
         scales_offset_bytes: usize,
         biases: &'a Buffer,
         biases_offset_bytes: usize,
-    ) -> AffineQuantizedMatmulInvocation<'a> {
+    ) -> Invocation<'a> {
         validate_num_total_rows(num_total_rows);
-        AffineQuantizedMatmulInvocation {
+        Invocation {
             kernel: self,
             num_total_rows,
             num_active_rows_key: Some(num_active_rows_key),
@@ -1300,8 +1298,8 @@ impl AffineQuantizedMatmulKernel {
     }
 }
 
-impl AffineQuantizedMatmul {
-    pub fn new(device: &Device, config: AffineQuantizedMatmulConfig) -> Self {
+impl Matmul {
+    pub fn new(device: &Device, config: Config) -> Self {
         config.validate();
         Self {
             config,
@@ -1323,7 +1321,7 @@ impl AffineQuantizedMatmul {
         scales_offset_bytes: usize,
         biases: &'a Buffer,
         biases_offset_bytes: usize,
-    ) -> AffineQuantizedMatmulInvocation<'a> {
+    ) -> Invocation<'a> {
         self.selected_kernel(m).invoke(
             m,
             output,
@@ -1358,7 +1356,7 @@ impl AffineQuantizedMatmul {
         scales_offset_bytes: usize,
         biases: &'a Buffer,
         biases_offset_bytes: usize,
-    ) -> AffineQuantizedMatmulInvocation<'a> {
+    ) -> Invocation<'a> {
         let (_, kernel) = Selector::select(
             &self.registry,
             self.config,
@@ -1381,7 +1379,7 @@ impl AffineQuantizedMatmul {
     }
 
     /// Returns the recorded kernel topology for one total row count.
-    pub fn topology(&self, num_total_rows: u32) -> AffineQuantizedMatmulKernelKind {
+    pub fn topology(&self, num_total_rows: u32) -> KernelKind {
         validate_num_total_rows(num_total_rows);
         Selector::select(
             &self.registry,
@@ -1396,35 +1394,35 @@ impl AffineQuantizedMatmul {
         adaptive_topology_boundaries(self.config)
     }
 
-    pub fn selected_kernel(&self, m: i32) -> &AffineQuantizedMatmulKernel {
+    pub fn selected_kernel(&self, m: i32) -> &Kernel {
         assert!(m > 0);
         Selector::select(&self.registry, self.config, m).1
     }
 }
 
 impl Registry {
-    fn new(device: &Device, config: AffineQuantizedMatmulConfig) -> Self {
+    fn new(device: &Device, config: Config) -> Self {
         let qmv_key = Selector::qmv_key(config);
         Self {
             entries: vec![
-                (qmv_key, AffineQuantizedMatmulKernel::new(device, config, qmv_key)),
+                (qmv_key, Kernel::new(device, config, qmv_key)),
                 (
-                    AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
-                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm8Bn32),
+                    KernelKind::QmmBm8Bn32,
+                    Kernel::new(device, config, KernelKind::QmmBm8Bn32),
                 ),
                 (
-                    AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
-                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm16Bn32),
+                    KernelKind::QmmBm16Bn32,
+                    Kernel::new(device, config, KernelKind::QmmBm16Bn32),
                 ),
                 (
-                    AffineQuantizedMatmulKernelKind::QmmBm32Bn32,
-                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm32Bn32),
+                    KernelKind::QmmBm32Bn32,
+                    Kernel::new(device, config, KernelKind::QmmBm32Bn32),
                 ),
             ],
         }
     }
 
-    fn get(&self, key: AffineQuantizedMatmulKernelKind) -> &AffineQuantizedMatmulKernel {
+    fn get(&self, key: KernelKind) -> &Kernel {
         self.entries
             .iter()
             .find_map(|(candidate_key, kernel)| (*candidate_key == key).then_some(kernel))
@@ -1433,40 +1431,36 @@ impl Registry {
 }
 
 impl Selector {
-    fn select(
-        registry: &Registry,
-        config: AffineQuantizedMatmulConfig,
-        num_rows: i32,
-    ) -> (AffineQuantizedMatmulKernelKind, &AffineQuantizedMatmulKernel) {
+    fn select(registry: &Registry, config: Config, num_rows: i32) -> (KernelKind, &Kernel) {
         let key = Self::key(config, num_rows);
         (key, registry.get(key))
     }
 
-    fn key(config: AffineQuantizedMatmulConfig, num_rows: i32) -> AffineQuantizedMatmulKernelKind {
+    fn key(config: Config, num_rows: i32) -> KernelKind {
         config.validate();
         assert!(num_rows > 0);
         if num_rows < adaptive_qmv_batch_limit(config) {
             Self::qmv_key(config)
         } else if config.n < 65_536 && (config.n > 4096 || config.k > 4096) && num_rows <= QMM_BM8_MAX_ROWS {
-            AffineQuantizedMatmulKernelKind::QmmBm8Bn32
+            KernelKind::QmmBm8Bn32
         } else if num_rows <= QMM_BM16_MAX_ROWS {
-            AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+            KernelKind::QmmBm16Bn32
         } else {
-            AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+            KernelKind::QmmBm32Bn32
         }
     }
 
-    fn qmv_key(config: AffineQuantizedMatmulConfig) -> AffineQuantizedMatmulKernelKind {
+    fn qmv_key(config: Config) -> KernelKind {
         if config.uses_same_dtype() && matches!(config.k, 64 | 128) && is_power_of_two(config.bits) {
-            AffineQuantizedMatmulKernelKind::QmvQuadBn64
+            KernelKind::QmvQuadBn64
         } else {
-            AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+            KernelKind::QmvBn8Bk32
         }
     }
 }
 
-pub struct AffineQuantizedMatmulInvocation<'a> {
-    kernel: &'a AffineQuantizedMatmulKernel,
+pub struct Invocation<'a> {
+    kernel: &'a Kernel,
     num_total_rows: u32,
     num_active_rows_key: Option<ReplayParameterKey>,
     output: &'a Buffer,
@@ -1481,7 +1475,7 @@ pub struct AffineQuantizedMatmulInvocation<'a> {
     biases_offset_bytes: usize,
 }
 
-impl Operator for AffineQuantizedMatmulInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
         let kernel = self.kernel;
         let output = self.output;
@@ -1523,7 +1517,7 @@ impl Operator for AffineQuantizedMatmulInvocation<'_> {
         record_num_active_rows(recorder, 7, num_total_rows, self.num_active_rows_key);
 
         match kernel.kind {
-            AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => {
+            KernelKind::QmmBm8Bn32 => {
                 recorder.dispatch_threadblocks(
                     (
                         ceil_div_i32(config.n, 32) as usize,
@@ -1533,7 +1527,7 @@ impl Operator for AffineQuantizedMatmulInvocation<'_> {
                     (32, 2, 1),
                 );
             },
-            AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => {
+            KernelKind::QmmBm16Bn32 => {
                 recorder.dispatch_threadblocks(
                     (
                         ceil_div_i32(config.n, 32) as usize,
@@ -1543,7 +1537,7 @@ impl Operator for AffineQuantizedMatmulInvocation<'_> {
                     (32, 2, 1),
                 );
             },
-            AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => {
+            KernelKind::QmmBm32Bn32 => {
                 recorder.dispatch_threadblocks(
                     (
                         ceil_div_i32(config.n, 32) as usize,
@@ -1553,13 +1547,13 @@ impl Operator for AffineQuantizedMatmulInvocation<'_> {
                     (32, 2, 2),
                 );
             },
-            AffineQuantizedMatmulKernelKind::QmvQuadBn64 => {
+            KernelKind::QmvQuadBn64 => {
                 recorder.dispatch_threadblocks(
                     (num_total_rows as usize, ceil_div_i32(config.n, 64) as usize, 1),
                     (32, 1, 1),
                 );
             },
-            AffineQuantizedMatmulKernelKind::QmvBn8Bk32 => {
+            KernelKind::QmvBn8Bk32 => {
                 recorder.dispatch_threadblocks(
                     (num_total_rows as usize, ceil_div_i32(config.n, 8) as usize, 1),
                     (32, 2, 1),
@@ -1591,7 +1585,7 @@ fn validate_num_total_rows(num_total_rows: u32) {
 
 #[allow(clippy::too_many_arguments)]
 fn validate_buffer_ranges(
-    config: AffineQuantizedMatmulConfig,
+    config: Config,
     m: i32,
     output: &Buffer,
     output_offset_bytes: usize,
@@ -1650,20 +1644,17 @@ fn validate_buffer_ranges(
     );
 }
 
-fn affine_kernel_source(
-    config: AffineQuantizedMatmulConfig,
-    kind: AffineQuantizedMatmulKernelKind,
-) -> (String, String) {
+fn affine_kernel_source(config: Config, kind: KernelKind) -> (String, String) {
     match kind {
-        AffineQuantizedMatmulKernelKind::QmvBn8Bk32 => affine_qmv_bn8_bk32_source(config),
-        AffineQuantizedMatmulKernelKind::QmvQuadBn64 => affine_qmv_quad_bn64_source(config),
-        AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => affine_qmm_bn32_source(config, 8),
-        AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => affine_qmm_bn32_source(config, 16),
-        AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => affine_qmm_bn32_source(config, 32),
+        KernelKind::QmvBn8Bk32 => affine_qmv_bn8_bk32_source(config),
+        KernelKind::QmvQuadBn64 => affine_qmv_quad_bn64_source(config),
+        KernelKind::QmmBm8Bn32 => affine_qmm_bn32_source(config, 8),
+        KernelKind::QmmBm16Bn32 => affine_qmm_bn32_source(config, 16),
+        KernelKind::QmmBm32Bn32 => affine_qmm_bn32_source(config, 32),
     }
 }
 
-fn affine_qmm_bn32_source(config: AffineQuantizedMatmulConfig, bm: usize) -> (String, String) {
+fn affine_qmm_bn32_source(config: Config, bm: usize) -> (String, String) {
     assert!(matches!(bm, 8 | 16 | 32));
     if !config.uses_same_dtype() {
         let input_type = metal_type_string(config.input_dtype);
@@ -1740,7 +1731,7 @@ fn affine_qmm_bn32_source(config: AffineQuantizedMatmulConfig, bm: usize) -> (St
     )
 }
 
-fn affine_qmv_bn8_bk32_source(config: AffineQuantizedMatmulConfig) -> (String, String) {
+fn affine_qmv_bn8_bk32_source(config: Config) -> (String, String) {
     if !config.uses_same_dtype() {
         let input_type = metal_type_string(config.input_dtype);
         let output_type = metal_type_string(config.output_dtype);
@@ -1791,7 +1782,7 @@ fn affine_qmv_bn8_bk32_source(config: AffineQuantizedMatmulConfig) -> (String, S
     )
 }
 
-fn affine_qmv_quad_bn64_source(config: AffineQuantizedMatmulConfig) -> (String, String) {
+fn affine_qmv_quad_bn64_source(config: Config) -> (String, String) {
     let type_string = metal_type_string(config.input_dtype);
     let kernel_name = format!(
         "psi_dec_qmv_quad_{type_string}_gs_{}_b_{}_d_{}_batch_0",
@@ -1834,7 +1825,7 @@ fn qmv_batch_limit(input_dim: i32, output_dim: i32) -> i32 {
     }
 }
 
-fn adaptive_qmv_batch_limit(config: AffineQuantizedMatmulConfig) -> i32 {
+fn adaptive_qmv_batch_limit(config: Config) -> i32 {
     if config.input_dtype == Dtype::Bfloat16 && config.n >= 65_536 {
         if config.k <= 2048 { 5 } else { 6 }
     } else if config.n > 4096 || config.k > 4096 {
@@ -1847,7 +1838,7 @@ fn adaptive_qmv_batch_limit(config: AffineQuantizedMatmulConfig) -> i32 {
 const QMM_BM8_MAX_ROWS: i32 = 8;
 const QMM_BM16_MAX_ROWS: i32 = 16;
 
-fn adaptive_topology_boundaries(config: AffineQuantizedMatmulConfig) -> Box<[u32]> {
+fn adaptive_topology_boundaries(config: Config) -> Box<[u32]> {
     let mut candidates = [
         adaptive_qmv_batch_limit(config),
         QMM_BM8_MAX_ROWS + 1,
@@ -1866,13 +1857,10 @@ fn adaptive_topology_boundaries(config: AffineQuantizedMatmulConfig) -> Box<[u32
     boundaries.into_boxed_slice()
 }
 
-fn validate_kernel_kind(config: AffineQuantizedMatmulConfig, kind: AffineQuantizedMatmulKernelKind) {
+fn validate_kernel_kind(config: Config, kind: KernelKind) {
     match kind {
-        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
-        | AffineQuantizedMatmulKernelKind::QmmBm8Bn32
-        | AffineQuantizedMatmulKernelKind::QmmBm16Bn32
-        | AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => {},
-        AffineQuantizedMatmulKernelKind::QmvQuadBn64 => {
+        KernelKind::QmvBn8Bk32 | KernelKind::QmmBm8Bn32 | KernelKind::QmmBm16Bn32 | KernelKind::QmmBm32Bn32 => {},
+        KernelKind::QmvQuadBn64 => {
             assert!(
                 config.uses_same_dtype(),
                 "QMV quad BN=64 affine matmul requires one dtype"
@@ -1885,16 +1873,11 @@ fn validate_kernel_kind(config: AffineQuantizedMatmulConfig, kind: AffineQuantiz
     }
 }
 
-fn validate_qmm_pipeline(
-    device: &Device,
-    config: AffineQuantizedMatmulConfig,
-    kind: AffineQuantizedMatmulKernelKind,
-    kernel: &Kernel,
-) {
+fn validate_qmm_pipeline(device: &Device, config: Config, kind: KernelKind, kernel: &CompiledKernel) {
     let (bm, num_simdgroups): (usize, usize) = match kind {
-        AffineQuantizedMatmulKernelKind::QmmBm8Bn32 => (8, 2),
-        AffineQuantizedMatmulKernelKind::QmmBm16Bn32 => (16, 2),
-        AffineQuantizedMatmulKernelKind::QmmBm32Bn32 => (32, 4),
+        KernelKind::QmmBm8Bn32 => (8, 2),
+        KernelKind::QmmBm16Bn32 => (16, 2),
+        KernelKind::QmmBm32Bn32 => (32, 4),
         _ => panic!("QMM pipeline validation requires a QMM kernel kind"),
     };
     let num_threads = num_simdgroups * kernel.thread_execution_width();

@@ -8,7 +8,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::Operator;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
@@ -21,7 +21,6 @@ const BITS: u32 = 4;
 
 const TOKENS_PER_PAGE: u32 = 16;
 const KV_TOKEN_TILE_SIZE: u32 = 256;
-const NUM_THREADS_PER_THREADBLOCK: u32 = 256;
 const Q_HEAD_TILE_SIZE_CAP: u32 = 8;
 const Q_TOKEN_TILE_SIZE: u32 = 8;
 const TILED_KV_TOKEN_TILE_SIZE: u32 = 16;
@@ -397,8 +396,8 @@ where
     recorder.build()
 }
 
-fn gdn_qkvabz_affine_config() -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn gdn_qkvabz_affine_config() -> affine_quantized::Config {
+    affine_quantized::Config {
         n: GDN_QKVABZ_DIM.try_into().expect("GDN qkvabz n must fit i32"),
         k: HIDDEN_DIM.try_into().expect("GDN qkvabz k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GDN group size must fit i32"),
@@ -409,8 +408,8 @@ fn gdn_qkvabz_affine_config() -> AffineQuantizedMatmulConfig {
     }
 }
 
-fn gdn_output_affine_config() -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn gdn_output_affine_config() -> affine_quantized::Config {
+    affine_quantized::Config {
         n: HIDDEN_DIM.try_into().expect("GDN output n must fit i32"),
         k: GDN_V_DIM.try_into().expect("GDN output k must fit i32"),
         group_size: GROUP_SIZE.try_into().expect("GDN group size must fit i32"),

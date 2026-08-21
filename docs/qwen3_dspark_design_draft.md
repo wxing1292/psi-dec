@@ -717,10 +717,10 @@ Completed: GDN uses the adaptive affine owner for both projections.
 
 The GDN `qkvabz` projection uses BF16 input, BF16 affine parameters, and F32 output.
 The GDN output projection uses F32 input, BF16 affine parameters, and BF16 output.
-Both projections perform the boundary conversion within `AffineQuantizedMatmul`. GDN does not record a separate buffer
-cast.
+Both projections perform the boundary conversion within `affine_quantized::Matmul`. GDN does not record a separate
+buffer cast.
 
-`AffineQuantizedMatmulConfig` must provide these fixed workload facts:
+`affine_quantized::Config` must provide these fixed workload facts:
 
 ```text
 n
@@ -732,7 +732,7 @@ scale_bias_dtype
 output_dtype
 ```
 
-`AffineQuantizedMatmulInvocation` must provide `m`, buffers, and byte offsets.
+`affine_quantized::Invocation` must provide `m`, buffers, and byte offsets.
 Metal buffers do not carry a tensor dtype.
 The model executor must provide each dtype.
 It must not provide a QMV/QMM family or tile selection.

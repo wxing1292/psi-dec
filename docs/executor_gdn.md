@@ -490,7 +490,7 @@ GDN compute, and persistent recurrent state. `GDNCore` remains backend-neutral a
 `qkvabz_scale_bias_dtype`, and `output_scale_bias_dtype`. The current implementation accepts only BF16 model boundaries.
 F32 model boundaries remain explicit future work. The config does not expose GDN kernel-variant controls.
 
-`GDN` owns one adaptive `AffineQuantizedMatmul` for the qkvabz projection and one for the output projection.
+`GDN` owns one adaptive `affine_quantized::Matmul` for the qkvabz projection and one for the output projection.
 Each operator owns its QMV and QMM candidates.
 The backend selects the kernel family and tile from the fixed affine config and the recorded row capacity.
 The GDN token bucket policy unions both affine topology boundaries. Thus, one bucket cannot cross a kernel-selection
@@ -784,7 +784,7 @@ The replay order is:
 
 ```text
 hidden_state (BF16)
-  -> qkvabz: AffineQuantizedMatmul (BF16 -> F32)
+  -> qkvabz: affine_quantized::Matmul (BF16 -> F32)
   -> qkvabz (F32)
   -> qkvabz_to_qkv_a_b_z
      |- qkv (F32)
@@ -800,7 +800,7 @@ hidden_state (BF16)
        norm_gated_output (F32)
           |
           v
-       output: AffineQuantizedMatmul (F32 -> BF16)
+       output: affine_quantized::Matmul (F32 -> BF16)
           |
           v
        next_hidden_state (BF16)

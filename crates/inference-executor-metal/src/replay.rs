@@ -106,9 +106,7 @@ mod tests {
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Stream;
-    use inference_backend_metal::operators::Bf16ConcatRowsBuffers;
-    use inference_backend_metal::operators::Bf16ConcatRowsConfig;
-    use inference_backend_metal::operators::Bf16ConcatRowsKernel;
+    use inference_backend_metal::operators::bf16_concat_rows;
     use inference_executor_core::backend::recorder::Recorder;
 
     use super::Replay;
@@ -122,7 +120,7 @@ mod tests {
 
     struct CountedComponent {
         records: Cell<usize>,
-        kernel: Bf16ConcatRowsKernel,
+        kernel: bf16_concat_rows::Kernel,
         lhs: Buffer,
         rhs: Buffer,
         output: Buffer,
@@ -141,7 +139,7 @@ mod tests {
             recorder.record(ReplayOp::opaque(self.kernel.invoke_bucketed(
                 1,
                 NUM_ACTIVE_ROWS,
-                Bf16ConcatRowsBuffers {
+                bf16_concat_rows::Buffers {
                     lhs: &self.lhs,
                     rhs: &self.rhs,
                     output: &self.output,
@@ -153,7 +151,7 @@ mod tests {
     fn component(device: &Device) -> CountedComponent {
         CountedComponent {
             records: Cell::new(0),
-            kernel: Bf16ConcatRowsKernel::new(device, Bf16ConcatRowsConfig { num_columns: 4 }),
+            kernel: bf16_concat_rows::Kernel::new(device, bf16_concat_rows::Config { num_columns: 4 }),
             lhs: Buffer::new_zeroed_elements(device, 4, inference_backend_metal::metal::Dtype::Bfloat16),
             rhs: Buffer::new_zeroed_elements(device, 4, inference_backend_metal::metal::Dtype::Bfloat16),
             output: Buffer::new_zeroed_elements(device, 8, inference_backend_metal::metal::Dtype::Bfloat16),

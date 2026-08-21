@@ -5,12 +5,8 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
-use inference_backend_metal::operators::Bf16ConcatRowsBuffers;
-use inference_backend_metal::operators::Bf16ConcatRowsConfig;
-use inference_backend_metal::operators::Bf16ConcatRowsKernel;
+use inference_backend_metal::operators::affine_quantized;
+use inference_backend_metal::operators::bf16_concat_rows;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
@@ -45,8 +41,8 @@ pub struct Qwen35MTPEmbed {
     input_gather: Gather,
     hidden_norm: RMSNorm,
     embedding_norm: RMSNorm,
-    concat: Bf16ConcatRowsKernel,
-    fc: AffineQuantizedMatmul,
+    concat: bf16_concat_rows::Kernel,
+    fc: affine_quantized::Matmul,
     projection_weights: Option<Qwen35MTPProjectionWeights>,
     normed_hidden: Buffer,
     normed_embedding: Buffer,
@@ -80,7 +76,7 @@ impl Qwen35MTPEmbed {
         let fused_hidden_dim = hidden_dim
             .checked_mul(2)
             .expect("qwen3.5 MTP fused hidden dimension must fit usize");
-        let fc_config = AffineQuantizedMatmulConfig {
+        let fc_config = affine_quantized::Config {
             n: hidden_dim
                 .try_into()
                 .expect("qwen3.5 MTP hidden dimension must fit i32"),
@@ -110,7 +106,7 @@ impl Qwen35MTPEmbed {
             max_tokens_u32,
             "qwen3.5 MTPEmbed and shared embedding token capacities must match"
         );
-        let fc = AffineQuantizedMatmul::new(device, fc_config);
+        let fc = affine_quantized::Matmul::new(device, fc_config);
         let replay_bucket_policy =
             ReplayBucketPolicy::with_topology_boundaries(max_tokens_u32, &fc.topology_boundaries());
         Ok(Self {
@@ -123,9 +119,9 @@ impl Qwen35MTPEmbed {
             ),
             hidden_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
             embedding_norm: RMSNorm::new(device, hidden_dim, config.text_config.rms_norm_eps),
-            concat: Bf16ConcatRowsKernel::new(
+            concat: bf16_concat_rows::Kernel::new(
                 device,
-                Bf16ConcatRowsConfig {
+                bf16_concat_rows::Config {
                     num_columns: hidden_dim
                         .try_into()
                         .expect("qwen3.5 MTP hidden dimension must fit u32"),
@@ -221,7 +217,7 @@ impl Qwen35MTPEmbed {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke_bucketed(
             num_tokens,
             QWEN35_MTP_EMBED_REFERENCE_NUM_ACTIVE_TOKENS,
-            Bf16ConcatRowsBuffers {
+            bf16_concat_rows::Buffers {
                 lhs: &self.normed_embedding,
                 rhs: &self.normed_hidden,
                 output: &self.fused_input,
@@ -272,7 +268,7 @@ impl Qwen35MTPEmbed {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.concat.invoke_bucketed(
             num_total_tokens,
             QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS,
-            Bf16ConcatRowsBuffers {
+            bf16_concat_rows::Buffers {
                 lhs: &self.normed_embedding,
                 rhs: &self.normed_hidden,
                 output: &self.fused_input,
@@ -413,7 +409,7 @@ impl Qwen35MTPEmbedWeights {
         let fused_hidden_dim = hidden_dim
             .checked_mul(2)
             .ok_or_else(|| ModelExecutorError::custom("qwen3.5 MTP fused hidden dimension overflow"))?;
-        let fc_config = AffineQuantizedMatmulConfig {
+        let fc_config = affine_quantized::Config {
             n: hidden_dim
                 .try_into()
                 .map_err(|_| ModelExecutorError::custom("qwen3.5 MTP hidden_dim must fit i32"))?,
@@ -463,11 +459,11 @@ impl Qwen35MTPEmbedWeights {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35MTPEmbedReplayKey {
     num_total_tokens: u32,
-    fc_topology: AffineQuantizedMatmulKernelKind,
+    fc_topology: affine_quantized::KernelKind,
 }
 
 impl Qwen35MTPEmbedReplayKey {
-    fn for_capacity(num_total_tokens: u32, fc_topology: AffineQuantizedMatmulKernelKind) -> Self {
+    fn for_capacity(num_total_tokens: u32, fc_topology: affine_quantized::KernelKind) -> Self {
         Self {
             num_total_tokens,
             fc_topology,
@@ -692,7 +688,7 @@ mod tests {
 
     fn fixture_component(device: &Device) -> Qwen35MTPEmbed {
         const FILE_NAME: &str = "model.safetensors";
-        let fc_config = AffineQuantizedMatmulConfig {
+        let fc_config = affine_quantized::Config {
             n: HIDDEN_DIM as i32,
             k: (HIDDEN_DIM * 2) as i32,
             group_size: GROUP_SIZE as i32,
@@ -755,7 +751,7 @@ mod tests {
             )
             .unwrap();
         let embed = Rc::new(embed);
-        let fc = AffineQuantizedMatmul::new(device, fc_config);
+        let fc = affine_quantized::Matmul::new(device, fc_config);
         let replay_bucket_policy = ReplayBucketPolicy::with_topology_boundaries(MAX_TOKENS, &fc.topology_boundaries());
         let hidden_elements = MAX_TOKENS as usize * HIDDEN_DIM as usize;
         let mut hidden_norm = RMSNorm::new(device, HIDDEN_DIM as usize, 1e-6);
@@ -767,9 +763,9 @@ mod tests {
             input_gather: Gather::new(device, HIDDEN_DIM),
             hidden_norm,
             embedding_norm,
-            concat: Bf16ConcatRowsKernel::new(
+            concat: bf16_concat_rows::Kernel::new(
                 device,
-                Bf16ConcatRowsConfig {
+                bf16_concat_rows::Config {
                     num_columns: HIDDEN_DIM,
                 },
             ),

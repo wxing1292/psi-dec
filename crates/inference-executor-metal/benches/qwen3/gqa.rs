@@ -14,9 +14,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
@@ -544,7 +542,7 @@ impl Fixture {
 struct AffineReplay {
     name: &'static str,
     replay: ReplayProgram,
-    _affine: AffineQuantizedMatmulKernel,
+    _affine: affine_quantized::Kernel,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -568,17 +566,17 @@ fn affine_replays(
         (
             "gqa.qkv.qmv_bn8_bk32",
             "gqa.output.qmv_bn8_bk32",
-            AffineQuantizedMatmulKernelKind::QmvBn8Bk32,
+            affine_quantized::KernelKind::QmvBn8Bk32,
         ),
         (
             "gqa.qkv.qmm_bm8_bn32",
             "gqa.output.qmm_bm8_bn32",
-            AffineQuantizedMatmulKernelKind::QmmBm8Bn32,
+            affine_quantized::KernelKind::QmmBm8Bn32,
         ),
         (
             "gqa.qkv.qmm_bm16_bn32",
             "gqa.output.qmm_bm16_bn32",
-            AffineQuantizedMatmulKernelKind::QmmBm16Bn32,
+            affine_quantized::KernelKind::QmmBm16Bn32,
         ),
     ];
     let mut replays = Vec::with_capacity(kernels.len() * 2);
@@ -620,8 +618,8 @@ fn affine_replay(
     device: &Device,
     stream: &Stream,
     name: &'static str,
-    config: AffineQuantizedMatmulConfig,
-    kind: AffineQuantizedMatmulKernelKind,
+    config: affine_quantized::Config,
+    kind: affine_quantized::KernelKind,
     num_tokens: u32,
     output: &Buffer,
     input: &Buffer,
@@ -629,7 +627,7 @@ fn affine_replay(
     scales: &Buffer,
     biases: &Buffer,
 ) -> AffineReplay {
-    let kernel = AffineQuantizedMatmulKernel::new(device, config, kind);
+    let kernel = affine_quantized::Kernel::new(device, config, kind);
     let mut recorder = stream.create_replay_program();
     recorder.record(kernel.invoke(
         num_tokens.try_into().expect("GQA affine row count must fit i32"),
@@ -651,8 +649,8 @@ fn affine_replay(
     }
 }
 
-fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("GQA affine n must fit i32"),
         k: k.try_into().expect("GQA affine k must fit i32"),
         group_size: config

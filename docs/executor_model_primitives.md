@@ -26,7 +26,10 @@ crates/inference-backend-metal/src/components/
   rms_norm_rope.rs
 
 crates/inference-backend-metal/src/operators/
+  affine_quantized.rs
+  bf16_concat_rows.rs
   row_gather.rs
+  softmax.rs
 ```
 
 These components use the execution vocabulary in [GPU Execution Vocabulary](gpu_execution.md).
@@ -63,7 +66,7 @@ initialization. The runtime token count changes only the grid. Embedding does no
 
 ## Unembedding
 
-`Unembed` owns one adaptive `AffineQuantizedMatmul`. It maps hidden rows to vocabulary-logit rows:
+`Unembed` owns one adaptive `affine_quantized::Matmul`. It maps hidden rows to vocabulary-logit rows:
 
 ```text
 hidden[num_rows, hidden_dim]
@@ -71,8 +74,8 @@ hidden[num_rows, hidden_dim]
     -> logits[num_rows, vocab_size]
 ```
 
-`AffineQuantizedMatmul` owns a private `Registry` and `Selector`. The registry stores the legal QMV and QMM execution
-variants. `Selector::select(...)` returns `(AffineQuantizedMatmulKernelKind, &AffineQuantizedMatmulKernel)` from the
+`affine_quantized::Matmul` owns a private `Registry` and `Selector`. The registry stores the legal QMV and QMM execution
+variants. `Selector::select(...)` returns `(affine_quantized::KernelKind, &affine_quantized::Kernel)` from the
 validated matrix configuration and row count. The same selection owns kernel tile geometry and topology boundaries.
 `Unembed` supplies model geometry, weights, buffers, and row counts. It must not select a second kernel.
 
@@ -81,7 +84,7 @@ Embedding is a row lookup. Unembedding is a matrix multiplication.
 
 ## Row gather
 
-`Gather` owns one `row_gather::Compute`. It copies indexed input rows to a dense output:
+`Gather` owns one `row_gather::Kernel`. It copies indexed input rows to a dense output:
 
 ```text
 input[row_indices[output_row], column]

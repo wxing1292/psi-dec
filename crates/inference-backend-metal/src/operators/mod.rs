@@ -1,6 +1,9 @@
 //! Reusable Metal-backed operators without model component semantics.
 //!
-//! Each operator separates fixed workload facts from invocation-time extents:
+//! Each public operator has a scoped module. The module path identifies the
+//! operation. Short leaf names identify API roles.
+//!
+//! A fixed operator separates fixed workload facts from invocation-time extents:
 //!
 //! ```text
 //! Config + Shape + Buffers
@@ -14,28 +17,13 @@
 //!            v
 //!     CommandRecorder
 //! ```
+//!
+//! `affine_quantized::Matmul` is an adaptive owner. It selects one
+//! `affine_quantized::Kernel` from its private registry for the runtime row
+//! count.
 
-mod affine_quantized;
-mod bf16_concat_rows;
+pub mod affine_quantized;
+pub mod bf16_concat_rows;
 mod mlx_headers;
 pub mod row_gather;
-mod softmax;
-
-pub use affine_quantized::AffineQuantizedMatmul;
-pub use affine_quantized::AffineQuantizedMatmulConfig;
-pub use affine_quantized::AffineQuantizedMatmulKernel;
-pub use affine_quantized::AffineQuantizedMatmulKernelKind;
-pub use affine_quantized::ExpertAffineQuantizedConfig;
-pub use affine_quantized::GatherAffineQuantizedGateUpSwiGLUKernel;
-pub use affine_quantized::GatherAffineQuantizedMatmulKernel;
-pub use affine_quantized::GatherAffineQuantizedShape;
-pub use affine_quantized::RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel;
-pub use affine_quantized::RaggedExpertMajorAffineQuantizedMatmulKernel;
-pub use affine_quantized::RaggedExpertMajorAffineQuantizedShape;
-pub use bf16_concat_rows::Bf16ConcatRowsBuffers;
-pub use bf16_concat_rows::Bf16ConcatRowsConfig;
-pub use bf16_concat_rows::Bf16ConcatRowsKernel;
-pub use softmax::SoftmaxBuffers;
-pub use softmax::SoftmaxConfig;
-pub use softmax::SoftmaxKernel;
-pub use softmax::SoftmaxShape;
+pub mod softmax;

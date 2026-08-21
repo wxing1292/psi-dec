@@ -235,9 +235,9 @@ Dense MLP is a semantic command graph. It is not one kernel launch:
 
 ```text
 DenseMLPExecution
-├── gate_up AffineQuantizedMatmul
+├── gate_up affine_quantized::Matmul
 ├── SwiGLU KernelLaunch
-└── down AffineQuantizedMatmul
+└── down affine_quantized::Matmul
 ```
 
 Each affine owner defines its QMV or QMM thread-block task, tile geometry, and layout. The dense MLP owner supplies the
@@ -263,8 +263,8 @@ choices so that a replay bucket cannot cross either topology boundary.
 
 ## Backend selection
 
-`dense_mlp::Compute` owns one adaptive `AffineQuantizedMatmul` for gate/up and one for down.
-Each `AffineQuantizedMatmul` owns the QMV/QMM candidates and selects its kernel.
+`dense_mlp::Compute` owns one adaptive `affine_quantized::Matmul` for gate/up and one for down.
+Each `affine_quantized::Matmul` owns the QMV/QMM candidates and selects its kernel.
 The model and executor provide the complete dense-MLP dimensions and active row count.
 They do not select a kernel or tile.
 

@@ -12,9 +12,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
@@ -64,8 +62,8 @@ impl GQAReplayMode {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GQAReplayTopology {
     pub sdpa_execution: backend_sdpa::ExecutionVariant,
-    pub qgkv_affine: AffineQuantizedMatmulKernelKind,
-    pub output_affine: AffineQuantizedMatmulKernelKind,
+    pub qgkv_affine: affine_quantized::KernelKind,
+    pub output_affine: affine_quantized::KernelKind,
 }
 
 pub fn add_gqa_replay_arguments(shape: GQAReplayShape, topology: GQAReplayTopology, arguments: &mut ReplayArguments) {
@@ -195,13 +193,13 @@ pub struct GQA {
     core: GQACore,
     config: GQAMetalConfig,
     sdpa_selector: Selector,
-    qgkv: AffineQuantizedMatmul,
+    qgkv: affine_quantized::Matmul,
     qgkv_to_q_g_k_v: backend_qgkv_split::Compute,
     q_norm_rope: rms_norm_rope::Compute,
     k_norm_rope: rms_norm_rope::Compute,
     kv_page_write: backend_kv_page_write::Compute,
     gate: backend_activation_gate::Compute,
-    output: AffineQuantizedMatmul,
+    output: affine_quantized::Matmul,
 }
 
 impl GQA {
@@ -238,13 +236,13 @@ impl GQA {
             core: core.clone(),
             config,
             sdpa_selector: Selector::new(backend_sdpa::Registry::new(sdpa_config), max_tokens),
-            qgkv: AffineQuantizedMatmul::new(device, affine_config(qgkv.out_dim, qgkv.in_dim, config)),
+            qgkv: affine_quantized::Matmul::new(device, affine_config(qgkv.out_dim, qgkv.in_dim, config)),
             qgkv_to_q_g_k_v: backend_qgkv_split::Compute::new(device, qgkv_to_q_g_k_v_config(&core, config)),
             q_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_q_heads)),
             k_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
             kv_page_write: backend_kv_page_write::Compute::new(device, kv_page_write_config(&core, config)),
             gate: backend_activation_gate::Compute::new(device, gate_config(&core, config)),
-            output: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
+            output: affine_quantized::Matmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
         }
     }
 
@@ -791,8 +789,8 @@ fn validate_config_for_core(core: &GQACore, config: GQAMetalConfig) {
     assert!(config.num_tokens_per_page(core) > 0);
 }
 
-fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("GQA affine n must fit i32"),
         k: k.try_into().expect("GQA affine k must fit i32"),
         group_size: config.group_size.try_into().expect("GQA group_size must fit i32"),

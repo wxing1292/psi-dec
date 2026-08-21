@@ -9,10 +9,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 
 const VOCAB_SIZE: i32 = 151_936;
 const TOKENS: [i32; 8] = [1, 5, 6, 7, 14, 16, 21, 28];
@@ -103,7 +100,7 @@ struct UnembeddingFixture {
 
 impl UnembeddingFixture {
     fn new(device: &Device, profile: Profile, tokens: i32, path: MatmulPath) -> Self {
-        let config = AffineQuantizedMatmulConfig {
+        let config = affine_quantized::Config {
             n: VOCAB_SIZE,
             k: profile.hidden_dim(),
             group_size: 64,
@@ -121,22 +118,19 @@ impl UnembeddingFixture {
         let mut builder = stream.create_replay_program();
         match path {
             MatmulPath::Auto => {
-                let matmul = AffineQuantizedMatmul::new(device, config);
+                let matmul = affine_quantized::Matmul::new(device, config);
                 builder.record(matmul.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
             },
             MatmulPath::QmvBn8Bk32 => {
-                let kernel =
-                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmvBn8Bk32);
+                let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmvBn8Bk32);
                 builder.record(kernel.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
             },
             MatmulPath::QmmBm16Bn32 => {
-                let kernel =
-                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm16Bn32);
+                let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmmBm16Bn32);
                 builder.record(kernel.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
             },
             MatmulPath::QmmBm32Bn32 => {
-                let kernel =
-                    AffineQuantizedMatmulKernel::new(device, config, AffineQuantizedMatmulKernelKind::QmmBm32Bn32);
+                let kernel = affine_quantized::Kernel::new(device, config, affine_quantized::KernelKind::QmmBm32Bn32);
                 builder.record(kernel.invoke(tokens, &logits, 0, &hidden, 0, &weight, 0, &scales, 0, &biases, 0));
             },
         }

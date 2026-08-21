@@ -9,10 +9,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernel;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 
 const ROWS: [i32; 5] = [1, 6, 8, 16, 32];
 const PROFILES: [Profile; 2] = [
@@ -35,10 +32,10 @@ const PROFILES: [Profile; 2] = [
 ];
 const KERNELS: [BenchKernel; 5] = [
     BenchKernel::Auto,
-    BenchKernel::Exact(AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
-    BenchKernel::Exact(AffineQuantizedMatmulKernelKind::QmmBm8Bn32),
-    BenchKernel::Exact(AffineQuantizedMatmulKernelKind::QmmBm16Bn32),
-    BenchKernel::Exact(AffineQuantizedMatmulKernelKind::QmmBm32Bn32),
+    BenchKernel::Exact(affine_quantized::KernelKind::QmvBn8Bk32),
+    BenchKernel::Exact(affine_quantized::KernelKind::QmmBm8Bn32),
+    BenchKernel::Exact(affine_quantized::KernelKind::QmmBm16Bn32),
+    BenchKernel::Exact(affine_quantized::KernelKind::QmmBm32Bn32),
 ];
 
 fn bench_affine_quantized_matmul(c: &mut Criterion) {
@@ -48,7 +45,7 @@ fn bench_affine_quantized_matmul(c: &mut Criterion) {
     for profile in PROFILES {
         for rows in ROWS {
             for kernel in KERNELS {
-                let fixture = AffineQuantizedMatmulFixture::new(&device, profile, rows, kernel);
+                let fixture = MatmulFixture::new(&device, profile, rows, kernel);
                 group.throughput(Throughput::Elements(rows as u64 * profile.n as u64));
                 group.bench_function(format!("{}/rows{rows}/{}", profile.name, kernel.name()), |b| {
                     b.iter(|| {
@@ -74,8 +71,8 @@ struct Profile {
 }
 
 impl Profile {
-    fn config(self) -> AffineQuantizedMatmulConfig {
-        AffineQuantizedMatmulConfig {
+    fn config(self) -> affine_quantized::Config {
+        affine_quantized::Config {
             n: self.n,
             k: self.k,
             group_size: 64,
@@ -90,29 +87,29 @@ impl Profile {
 #[derive(Clone, Copy)]
 enum BenchKernel {
     Auto,
-    Exact(AffineQuantizedMatmulKernelKind),
+    Exact(affine_quantized::KernelKind),
 }
 
 impl BenchKernel {
     fn name(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Exact(AffineQuantizedMatmulKernelKind::QmvBn8Bk32) => "qmv-bn8-bk32",
-            Self::Exact(AffineQuantizedMatmulKernelKind::QmvQuadBn64) => "qmv-quad-bn64",
-            Self::Exact(AffineQuantizedMatmulKernelKind::QmmBm8Bn32) => "qmm-bm8-bn32",
-            Self::Exact(AffineQuantizedMatmulKernelKind::QmmBm16Bn32) => "qmm-bm16-bn32",
-            Self::Exact(AffineQuantizedMatmulKernelKind::QmmBm32Bn32) => "qmm-bm32-bn32",
+            Self::Exact(affine_quantized::KernelKind::QmvBn8Bk32) => "qmv-bn8-bk32",
+            Self::Exact(affine_quantized::KernelKind::QmvQuadBn64) => "qmv-quad-bn64",
+            Self::Exact(affine_quantized::KernelKind::QmmBm8Bn32) => "qmm-bm8-bn32",
+            Self::Exact(affine_quantized::KernelKind::QmmBm16Bn32) => "qmm-bm16-bn32",
+            Self::Exact(affine_quantized::KernelKind::QmmBm32Bn32) => "qmm-bm32-bn32",
         }
     }
 }
 
-struct AffineQuantizedMatmulFixture {
+struct MatmulFixture {
     stream: Stream,
     replay: ReplayProgram,
     output: Buffer,
 }
 
-impl AffineQuantizedMatmulFixture {
+impl MatmulFixture {
     fn new(device: &Device, profile: Profile, rows: i32, bench_kernel: BenchKernel) -> Self {
         let config = profile.config();
         let input = Buffer::new_zeroed(device, config.input_bytes(rows));
@@ -124,11 +121,11 @@ impl AffineQuantizedMatmulFixture {
         let mut recorder = stream.create_replay_program();
         match bench_kernel {
             BenchKernel::Auto => {
-                let matmul = AffineQuantizedMatmul::new(device, config);
+                let matmul = affine_quantized::Matmul::new(device, config);
                 recorder.record(matmul.invoke(rows, &output, 0, &input, 0, &weight, 0, &scales, 0, &biases, 0));
             },
             BenchKernel::Exact(kind) => {
-                let kernel = AffineQuantizedMatmulKernel::new(device, config, kind);
+                let kernel = affine_quantized::Kernel::new(device, config, kind);
                 recorder.record(kernel.invoke(rows, &output, 0, &input, 0, &weight, 0, &scales, 0, &biases, 0));
             },
         }

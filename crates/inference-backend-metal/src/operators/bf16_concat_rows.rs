@@ -5,21 +5,41 @@ use std::mem::size_of;
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
 use crate::metal::Device;
-use crate::metal::Kernel;
+use crate::metal::Kernel as CompiledKernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 
-const BF16_CONCAT_ROWS_SOURCE: &str = include_str!("metal/bf16_concat_rows.metal");
-const NUM_THREADS_PER_THREADBLOCK: usize = 256;
+const SOURCE: &str = include_str!("metal/bf16_concat_rows.metal");
 const NUM_BFLOATS_PER_VECTOR: u32 = 4;
 const BFLOAT4_ALIGNMENT_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Bf16ConcatRowsConfig {
+struct ThreadBlockConstants {
+    required_threads: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelConstants {
+    config: Config,
+    thread_block: ThreadBlockConstants,
+}
+
+impl KernelConstants {
+    fn current(config: Config) -> Self {
+        config.validate();
+        Self {
+            config,
+            thread_block: ThreadBlockConstants { required_threads: 256 },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Config {
     pub num_columns: u32,
 }
 
-impl Bf16ConcatRowsConfig {
+impl Config {
     fn validate(self) {
         assert!(self.num_columns > 0, "bf16 row concat requires num_columns > 0");
         assert!(
@@ -69,23 +89,23 @@ impl Bf16ConcatRowsConfig {
 }
 
 #[derive(Clone, Copy)]
-pub struct Bf16ConcatRowsBuffers<'a> {
+pub struct Buffers<'a> {
     pub lhs: &'a Buffer,
     pub rhs: &'a Buffer,
     pub output: &'a Buffer,
 }
 
-pub struct Bf16ConcatRowsKernel {
-    config: Bf16ConcatRowsConfig,
-    kernel: Kernel,
+pub struct Kernel {
+    constants: KernelConstants,
+    kernel: CompiledKernel,
 }
 
-impl Bf16ConcatRowsKernel {
-    pub fn new(device: &Device, config: Bf16ConcatRowsConfig) -> Self {
-        config.validate();
+impl Kernel {
+    pub fn new(device: &Device, config: Config) -> Self {
+        let constants = KernelConstants::current(config);
         Self {
-            config,
-            kernel: Kernel::new(device, BF16_CONCAT_ROWS_SOURCE, "bf16_concat_rows_bfloat4"),
+            constants,
+            kernel: CompiledKernel::new(device, SOURCE, "bf16_concat_rows_bfloat4"),
         }
     }
 
@@ -94,9 +114,9 @@ impl Bf16ConcatRowsKernel {
         &'a self,
         num_total_rows: u32,
         num_active_rows_key: ReplayParameterKey,
-        buffers: Bf16ConcatRowsBuffers<'a>,
-    ) -> Bf16ConcatRowsInvocation<'a> {
-        Bf16ConcatRowsInvocation {
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
+        Invocation {
             kernel: self,
             num_total_rows,
             buffers,
@@ -105,16 +125,17 @@ impl Bf16ConcatRowsKernel {
     }
 }
 
-pub struct Bf16ConcatRowsInvocation<'a> {
-    kernel: &'a Bf16ConcatRowsKernel,
+pub struct Invocation<'a> {
+    kernel: &'a Kernel,
     num_total_rows: u32,
-    buffers: Bf16ConcatRowsBuffers<'a>,
+    buffers: Buffers<'a>,
     num_active_rows_key: ReplayParameterKey,
 }
 
-impl Operator for Bf16ConcatRowsInvocation<'_> {
+impl Operator for Invocation<'_> {
     fn record(self, recorder: &CommandRecorder<'_>) {
-        let config = self.kernel.config;
+        let constants = self.kernel.constants;
+        let config = constants.config;
         config.validate_num_total_rows(self.num_total_rows);
         validate_buffers(config, self.num_total_rows, self.buffers);
         recorder.set_kernel(&self.kernel.kernel);
@@ -123,11 +144,14 @@ impl Operator for Bf16ConcatRowsInvocation<'_> {
         recorder.set_buffer_write(2, self.buffers.output, 0);
         recorder.bind_u32(3, self.num_active_rows_key, 1, self.num_total_rows);
         recorder.set_u32(4, config.num_columns);
-        recorder.dispatch_1d(config.num_threads(self.num_total_rows), NUM_THREADS_PER_THREADBLOCK);
+        recorder.dispatch_1d(
+            config.num_threads(self.num_total_rows),
+            constants.thread_block.required_threads as usize,
+        );
     }
 }
 
-fn validate_buffers(config: Bf16ConcatRowsConfig, num_total_rows: u32, buffers: Bf16ConcatRowsBuffers<'_>) {
+fn validate_buffers(config: Config, num_total_rows: u32, buffers: Buffers<'_>) {
     assert!(
         buffers.lhs.len_bytes_u64() >= config.input_bytes_u64(num_total_rows),
         "bf16 row concat lhs buffer is too small"
@@ -176,10 +200,22 @@ mod tests {
     const OUTPUT_CANARY: u16 = 0x7fc1;
 
     #[test]
+    fn test_constants_have_explicit_thread_block_scope() {
+        let config = Config { num_columns: 4 };
+        assert_eq!(
+            KernelConstants::current(config),
+            KernelConstants {
+                config,
+                thread_block: ThreadBlockConstants { required_threads: 256 },
+            }
+        );
+    }
+
+    #[test]
     fn test_bucketed_replay_preserves_inactive_tail_across_grow_and_shrink() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = Bf16ConcatRowsConfig { num_columns: 4 };
+        let config = Config { num_columns: 4 };
         let num_total_rows = 4;
         let lhs = Buffer::from_slice(
             &device,
@@ -224,13 +260,13 @@ mod tests {
             ],
         );
         let output = Buffer::from_slice(&device, &[OUTPUT_CANARY; 40]);
-        let kernel = Bf16ConcatRowsKernel::new(&device, config);
+        let kernel = Kernel::new(&device, config);
 
         let mut recorder = stream.create_replay_program();
         recorder.record(kernel.invoke_bucketed(
             num_total_rows,
             NUM_ACTIVE_ROWS,
-            Bf16ConcatRowsBuffers {
+            Buffers {
                 lhs: &lhs,
                 rhs: &rhs,
                 output: &output,
@@ -280,16 +316,16 @@ mod tests {
         let device = Device::system_default();
         for num_columns in [0, 1, 2, 3, 5, 6, 7] {
             assert_panics(|| {
-                let _ = Bf16ConcatRowsKernel::new(&device, Bf16ConcatRowsConfig { num_columns });
+                let _ = Kernel::new(&device, Config { num_columns });
             });
         }
-        let _ = Bf16ConcatRowsKernel::new(&device, Bf16ConcatRowsConfig { num_columns: 4 });
+        let _ = Kernel::new(&device, Config { num_columns: 4 });
     }
 
     #[test]
     #[should_panic(expected = "bf16 row concat output elements exceeds the shader u32 count domain")]
     fn test_num_total_rows_rejects_doubled_output_count_overflow() {
-        Bf16ConcatRowsConfig { num_columns: 4 }.validate_num_total_rows(u32::MAX);
+        Config { num_columns: 4 }.validate_num_total_rows(u32::MAX);
     }
 
     #[test]
@@ -299,9 +335,9 @@ mod tests {
         let shared = Buffer::new_zeroed_elements(&device, 8, Dtype::Bfloat16);
         let rhs = Buffer::new_zeroed_elements(&device, 4, Dtype::Bfloat16);
         validate_buffers(
-            Bf16ConcatRowsConfig { num_columns: 4 },
+            Config { num_columns: 4 },
             1,
-            Bf16ConcatRowsBuffers {
+            Buffers {
                 lhs: &shared,
                 rhs: &rhs,
                 output: &shared,
@@ -316,9 +352,9 @@ mod tests {
         let lhs = Buffer::new_zeroed_elements(&device, 4, Dtype::Bfloat16);
         let shared = Buffer::new_zeroed_elements(&device, 8, Dtype::Bfloat16);
         validate_buffers(
-            Bf16ConcatRowsConfig { num_columns: 4 },
+            Config { num_columns: 4 },
             1,
-            Bf16ConcatRowsBuffers {
+            Buffers {
                 lhs: &lhs,
                 rhs: &shared,
                 output: &shared,

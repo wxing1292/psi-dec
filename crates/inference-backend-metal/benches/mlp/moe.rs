@@ -16,12 +16,8 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::ReplayProgramBuilder;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::SoftmaxBuffers;
-use inference_backend_metal::operators::SoftmaxConfig;
-use inference_backend_metal::operators::SoftmaxKernel;
-use inference_backend_metal::operators::SoftmaxShape;
+use inference_backend_metal::operators::affine_quantized;
+use inference_backend_metal::operators::softmax;
 
 #[path = "../support.rs"]
 mod support;
@@ -46,8 +42,8 @@ const ROUTER_BITS: u32 = 8;
 const MOE_PROFILE: &str = "qwen36-35b-a3b";
 const BENCH_TOKENS: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
 
-fn affine_config(n: u32, k: u32, bits: u32) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig::same_dtype(
+fn affine_config(n: u32, k: u32, bits: u32) -> affine_quantized::Config {
+    affine_quantized::Config::same_dtype(
         n.try_into().expect("MoE affine output dimension must fit i32"),
         k.try_into().expect("MoE affine input dimension must fit i32"),
         GROUP_SIZE.try_into().expect("MoE affine group size must fit i32"),
@@ -311,9 +307,9 @@ struct MoEForwardFixture {
     expert_major_shape: expert_major::Shape,
     dense_shape: dense_mlp::Shape,
     combine_shape: combine::Shape,
-    router: AffineQuantizedMatmul,
-    router_softmax: SoftmaxKernel,
-    shared_expert_gate: AffineQuantizedMatmul,
+    router: affine_quantized::Matmul,
+    router_softmax: softmax::Kernel,
+    shared_expert_gate: affine_quantized::Matmul,
     routing: routing::Compute,
     expert_major: expert_major::Compute,
     sparse_mlp: sparse_mlp::Compute,
@@ -437,15 +433,15 @@ impl MoEForwardFixture {
             Buffer::new_zeroed(device, shared_expert_gate_config.output_bytes(num_tokens_i32));
         let replay_output = Buffer::new_zeroed(device, combine_config.output_bytes(combine_shape));
         let expert_major_output = Buffer::new_zeroed(device, combine_config.output_bytes(combine_shape));
-        let router = AffineQuantizedMatmul::new(device, router_config);
-        let router_softmax = SoftmaxKernel::new(
+        let router = affine_quantized::Matmul::new(device, router_config);
+        let router_softmax = softmax::Kernel::new(
             device,
-            SoftmaxConfig {
+            softmax::Config {
                 num_values_per_row: NUM_EXPERTS,
                 dtype: Dtype::Bfloat16,
             },
         );
-        let shared_expert_gate = AffineQuantizedMatmul::new(device, shared_expert_gate_config);
+        let shared_expert_gate = affine_quantized::Matmul::new(device, shared_expert_gate_config);
         let routing = routing::Compute::new(device, routing_config);
         let expert_major = expert_major::Compute::new(device, expert_major_config);
         let sparse_mlp = sparse_mlp::Compute::new(device, sparse_config);
@@ -797,9 +793,9 @@ struct MoEForwardRecord<'a> {
     sparse_shape: sparse_mlp::TokenMajorShape,
     dense_shape: dense_mlp::Shape,
     combine_shape: combine::Shape,
-    router: &'a AffineQuantizedMatmul,
-    router_softmax: &'a SoftmaxKernel,
-    shared_expert_gate: &'a AffineQuantizedMatmul,
+    router: &'a affine_quantized::Matmul,
+    router_softmax: &'a softmax::Kernel,
+    shared_expert_gate: &'a affine_quantized::Matmul,
     routing: &'a routing::Compute,
     sparse_mlp: &'a sparse_mlp::Compute,
     shared_experts: &'a dense_mlp::Compute,
@@ -839,9 +835,9 @@ struct MoEExpertMajorForwardRecord<'a> {
     expert_major_config: expert_major::Config,
     expert_major_shape: expert_major::Shape,
     dense_shape: dense_mlp::Shape,
-    router: &'a AffineQuantizedMatmul,
-    router_softmax: &'a SoftmaxKernel,
-    shared_expert_gate: &'a AffineQuantizedMatmul,
+    router: &'a affine_quantized::Matmul,
+    router_softmax: &'a softmax::Kernel,
+    shared_expert_gate: &'a affine_quantized::Matmul,
     routing: &'a routing::Compute,
     expert_major: &'a expert_major::Compute,
     sparse_mlp: &'a sparse_mlp::Compute,
@@ -905,10 +901,10 @@ where
         ),
     );
     builder.record_with_barrier_before(record.router_softmax.invoke(
-        SoftmaxShape {
+        softmax::Shape {
             num_total_rows: record.routing_shape.num_total_tokens,
         },
-        SoftmaxBuffers {
+        softmax::Buffers {
             input: record.router_logits,
             output: record.router_probs,
         },
@@ -999,10 +995,10 @@ where
         ),
     );
     builder.record_with_barrier_before(record.router_softmax.invoke(
-        SoftmaxShape {
+        softmax::Shape {
             num_total_rows: record.routing_shape.num_total_tokens,
         },
-        SoftmaxBuffers {
+        softmax::Buffers {
             input: record.router_logits,
             output: record.router_probs,
         },

@@ -6,14 +6,7 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
-use crate::operators::AffineQuantizedMatmulConfig;
-use crate::operators::ExpertAffineQuantizedConfig;
-use crate::operators::GatherAffineQuantizedGateUpSwiGLUKernel;
-use crate::operators::GatherAffineQuantizedMatmulKernel;
-use crate::operators::GatherAffineQuantizedShape;
-use crate::operators::RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel;
-use crate::operators::RaggedExpertMajorAffineQuantizedMatmulKernel;
-use crate::operators::RaggedExpertMajorAffineQuantizedShape;
+use crate::operators::affine_quantized;
 
 fn to_i32(value: u32, name: &str) -> i32 {
     value.try_into().unwrap_or_else(|_| panic!("{name} must fit i32"))
@@ -64,19 +57,19 @@ impl Config {
         i32::try_from(self.bits).expect("sparse MLP bits must fit i32");
     }
 
-    pub fn gate_up_config(self) -> ExpertAffineQuantizedConfig {
+    pub fn gate_up_config(self) -> affine_quantized::ExpertConfig {
         self.expert_affine_config(self.intermediate_dim, self.hidden_dim)
     }
 
-    pub fn down_config(self) -> ExpertAffineQuantizedConfig {
+    pub fn down_config(self) -> affine_quantized::ExpertConfig {
         self.expert_affine_config(self.hidden_dim, self.intermediate_dim)
     }
 
-    fn expert_affine_config(self, n: u32, k: u32) -> ExpertAffineQuantizedConfig {
+    fn expert_affine_config(self, n: u32, k: u32) -> affine_quantized::ExpertConfig {
         self.validate();
-        ExpertAffineQuantizedConfig {
+        affine_quantized::ExpertConfig {
             num_experts: to_i32(self.num_experts, "sparse MLP expert count"),
-            matmul: AffineQuantizedMatmulConfig::same_dtype(
+            matmul: affine_quantized::Config::same_dtype(
                 to_i32(n, "sparse MLP output dimension"),
                 to_i32(k, "sparse MLP input dimension"),
                 to_i32(self.group_size, "sparse MLP group size"),
@@ -86,25 +79,25 @@ impl Config {
         }
     }
 
-    fn token_major_gate_up_shape(self, shape: TokenMajorShape) -> GatherAffineQuantizedShape {
+    fn token_major_gate_up_shape(self, shape: TokenMajorShape) -> affine_quantized::GatherShape {
         shape.validate();
-        GatherAffineQuantizedShape {
+        affine_quantized::GatherShape {
             num_routes: to_i32(shape.num_total_routes, "sparse MLP route count"),
             num_input_vectors: to_i32(shape.num_total_tokens, "sparse MLP token count"),
         }
     }
 
-    fn token_major_down_shape(self, shape: TokenMajorShape) -> GatherAffineQuantizedShape {
+    fn token_major_down_shape(self, shape: TokenMajorShape) -> affine_quantized::GatherShape {
         shape.validate();
-        GatherAffineQuantizedShape {
+        affine_quantized::GatherShape {
             num_routes: to_i32(shape.num_total_routes, "sparse MLP route count"),
             num_input_vectors: to_i32(shape.num_total_routes, "sparse MLP route count"),
         }
     }
 
-    fn expert_major_affine_shape(self, shape: ExpertMajorShape) -> RaggedExpertMajorAffineQuantizedShape {
+    fn expert_major_affine_shape(self, shape: ExpertMajorShape) -> affine_quantized::RaggedExpertMajorShape {
         shape.validate();
-        RaggedExpertMajorAffineQuantizedShape {
+        affine_quantized::RaggedExpertMajorShape {
             num_routes: to_i32(shape.num_total_routes, "sparse MLP route count"),
         }
     }
@@ -413,14 +406,14 @@ impl Compute {
 
 pub struct TokenMajorKernels {
     config: Config,
-    gate_up_swiglu: GatherAffineQuantizedGateUpSwiGLUKernel,
-    down: GatherAffineQuantizedMatmulKernel,
+    gate_up_swiglu: affine_quantized::GatherGateUpSwiGLUKernel,
+    down: affine_quantized::GatherMatmulKernel,
 }
 
 pub struct ExpertMajorKernels {
     config: Config,
-    gate_up_swiglu: RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel,
-    down: RaggedExpertMajorAffineQuantizedMatmulKernel,
+    gate_up_swiglu: affine_quantized::RaggedExpertMajorGateUpSwiGLUKernel,
+    down: affine_quantized::RaggedExpertMajorMatmulKernel,
 }
 
 impl TokenMajorKernels {
@@ -428,8 +421,8 @@ impl TokenMajorKernels {
         config.validate();
         Self {
             config,
-            gate_up_swiglu: GatherAffineQuantizedGateUpSwiGLUKernel::new(device, config.gate_up_config()),
-            down: GatherAffineQuantizedMatmulKernel::new(device, config.down_config()),
+            gate_up_swiglu: affine_quantized::GatherGateUpSwiGLUKernel::new(device, config.gate_up_config()),
+            down: affine_quantized::GatherMatmulKernel::new(device, config.down_config()),
         }
     }
 
@@ -507,8 +500,8 @@ impl ExpertMajorKernels {
         config.validate();
         Self {
             config,
-            gate_up_swiglu: RaggedExpertMajorAffineQuantizedGateUpSwiGLUKernel::new(device, config.gate_up_config()),
-            down: RaggedExpertMajorAffineQuantizedMatmulKernel::new(device, config.down_config()),
+            gate_up_swiglu: affine_quantized::RaggedExpertMajorGateUpSwiGLUKernel::new(device, config.gate_up_config()),
+            down: affine_quantized::RaggedExpertMajorMatmulKernel::new(device, config.down_config()),
         }
     }
 

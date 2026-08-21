@@ -473,25 +473,27 @@ executor components must not select or name backend kernels or tile configuratio
 A backend benchmark may force an exact backend path to measure a crossover. This benchmark control must remain at the
 backend boundary. It must not enter a model configuration or executor API.
 
-Use `*ComputePath` for alternatives that use different metadata, command graphs, or compute decompositions. Use
-`*KernelKind` for a selected low-level kernel family and tile. Do not use an unqualified `Path`, `Kind`, or
+Use a component-scoped `ExecutionVariant` for a complete selectable combination of algorithm, command graph, kernel
+families, and compile-time constants. Use a component-scoped `KernelKind` only when a lower-level kernel identity has a
+real consumer, such as replay topology, logging, or a backend benchmark. Do not use an unqualified `Path`, `Kind`, or
 `Algorithm` for these concepts.
 
-Production code must select a compute path and a kernel from complete workload facts. A benchmark may force a concrete
-implementation at the owning backend boundary. Do not add a compute-path enum when only one implementation exists.
+Production code must select one complete execution variant from complete workload facts. A benchmark may force a
+concrete implementation at the owning backend boundary. Do not add an execution-variant enum when only one
+implementation exists. Do not add separate algorithm and kernel selector layers for one decision.
 
 An adaptive affine quantized matmul uses these ownership boundaries:
 
-- `AffineQuantizedMatmulConfig` contains fixed workload facts. These facts are `N`, `K`, quantization parameters, and
+- `affine_quantized::Config` contains fixed workload facts. These facts are `N`, `K`, quantization parameters, and
   data types. It does not contain `M`.
-- `AffineQuantizedMatmul` owns the candidate kernels. It selects one kernel from the runtime `M` and the fixed config.
-- `AffineQuantizedMatmul` exposes the selected `AffineQuantizedMatmulKernelKind` as a stable topology identity. It also
+- `affine_quantized::Matmul` owns the candidate kernels. It selects one kernel from the runtime `M` and the fixed config.
+- `affine_quantized::Matmul` exposes the selected `affine_quantized::KernelKind` as a stable topology identity. It also
   exposes the first `M` for each topology change. A replay bucket policy must use these boundaries. Model code must not
   duplicate the selector thresholds.
-- `AffineQuantizedMatmulKernel` owns one compiled specialization. Its `AffineQuantizedMatmulKernelKind` fixes the
+- `affine_quantized::Kernel` owns one compiled specialization. Its `affine_quantized::KernelKind` fixes the
   QMV or QMM family and its tile dimensions.
-- An exact `AffineQuantizedMatmulInvocation` contains one fixed `M`, buffers, and byte offsets.
-- A bucketed `AffineQuantizedMatmulInvocation` contains `num_total_rows` and a `u32` replay parameter key for
+- An exact `affine_quantized::Invocation` contains one fixed `M`, buffers, and byte offsets.
+- A bucketed `affine_quantized::Invocation` contains `num_total_rows` and a `u32` replay parameter key for
   `num_active_rows`. Kernel selection, dispatch, and buffer validation use `num_total_rows`.
 
 An inactive QMV row must return before it reads the input or writes the output. An inactive QMM row threadgroup must
@@ -499,13 +501,13 @@ return before it derives input pointers or reaches a threadgroup barrier. The Me
 table use `u32` for the active row count. The backend rejects total row counts above the positive `i32` range because
 the internal MLX matrix dimensions use `int`.
 
-`AffineQuantizedMatmul` must support each combination of F32, F16, and BF16 input, scale/bias, and output data types.
+`affine_quantized::Matmul` must support each combination of F32, F16, and BF16 input, scale/bias, and output data types.
 QMV BN8/BK32 and QMM BM8/BN32, BM16/BN32, and BM32/BN32 provide this complete capability set.
 QMV Quad BN64 is an optional specialization for its supported same-dtype shapes.
 The adaptive owner must select QMV BN8/BK32 when QMV Quad BN64 does not support the workload.
 
-Production model and executor components must use `AffineQuantizedMatmul`. They must not select an
-`AffineQuantizedMatmulKernelKind`.
+Production model and executor components must use `affine_quantized::Matmul`. They must not select an
+`affine_quantized::KernelKind`.
 
 ## Commits
 

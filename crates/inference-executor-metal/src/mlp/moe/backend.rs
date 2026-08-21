@@ -7,13 +7,8 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayParameterKey;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
-use inference_backend_metal::operators::SoftmaxBuffers;
-use inference_backend_metal::operators::SoftmaxConfig;
-use inference_backend_metal::operators::SoftmaxKernel;
-use inference_backend_metal::operators::SoftmaxShape;
+use inference_backend_metal::operators::affine_quantized;
+use inference_backend_metal::operators::softmax;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_core::mlp::moe::GatedMoECore;
@@ -77,14 +72,14 @@ pub struct GatedMoERoutingBucketedInput<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GatedMoERoutingReplayTopology {
-    pub router_affine: AffineQuantizedMatmulKernelKind,
+    pub router_affine: affine_quantized::KernelKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GatedMoEReplayTopology {
     variant_key: VariantKey,
-    pub router_affine: AffineQuantizedMatmulKernelKind,
-    pub shared_expert_gate_affine: Option<AffineQuantizedMatmulKernelKind>,
+    pub router_affine: affine_quantized::KernelKind,
+    pub shared_expert_gate_affine: Option<affine_quantized::KernelKind>,
     pub shared_experts_dense: Option<dense_mlp::ReplayTopology>,
 }
 
@@ -175,15 +170,15 @@ pub struct GatedMoEBucketedInput<'a> {
 pub struct GatedMoE {
     core: GatedMoECore,
     registry: Registry,
-    router: AffineQuantizedMatmul,
-    router_softmax: SoftmaxKernel,
+    router: affine_quantized::Matmul,
+    router_softmax: softmax::Kernel,
     routing: routing::Compute,
     topk_experts: sparse_mlp::Compute,
     shared_experts: Option<GatedMoESharedExperts>,
 }
 
 struct GatedMoESharedExperts {
-    shared_expert_gate: AffineQuantizedMatmul,
+    shared_expert_gate: affine_quantized::Matmul,
     mlp: dense_mlp::Compute,
 }
 
@@ -278,13 +273,13 @@ impl GatedMoE {
         let registry = Registry::new(device, &core);
         Self {
             registry,
-            router: AffineQuantizedMatmul::new(
+            router: affine_quantized::Matmul::new(
                 device,
                 affine_config_with_bits(router_shape.out_dim, router_shape.in_dim, config.router_bits, config),
             ),
-            router_softmax: SoftmaxKernel::new(
+            router_softmax: softmax::Kernel::new(
                 device,
-                SoftmaxConfig {
+                softmax::Config {
                     num_values_per_row: core.num_experts.try_into().expect("MoE expert count must fit u32"),
                     dtype: config.io_dtype,
                 },
@@ -303,7 +298,7 @@ impl GatedMoE {
                     .shared_expert_gate_shape()
                     .expect("shared-expert MLP requires a shared-expert gate shape");
                 GatedMoESharedExperts {
-                    shared_expert_gate: AffineQuantizedMatmul::new(
+                    shared_expert_gate: affine_quantized::Matmul::new(
                         device,
                         affine_config_with_bits(
                             gate_shape.out_dim,
@@ -393,7 +388,7 @@ impl GatedMoE {
         recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke_bucketed(
             self.router_softmax_shape(num_total_tokens),
             num_active_tokens_key,
-            SoftmaxBuffers {
+            softmax::Buffers {
                 input: scratch.router_logits,
                 output: scratch.router_probs,
             },
@@ -799,7 +794,7 @@ impl GatedMoE {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.router_softmax.invoke(
             self.router_softmax_shape(shape.num_tokens),
-            SoftmaxBuffers {
+            softmax::Buffers {
                 input: scratch.router_logits,
                 output: scratch.router_probs,
             },
@@ -915,8 +910,8 @@ impl GatedMoE {
         }
     }
 
-    fn router_softmax_shape(&self, num_total_tokens: u32) -> SoftmaxShape {
-        SoftmaxShape {
+    fn router_softmax_shape(&self, num_total_tokens: u32) -> softmax::Shape {
+        softmax::Shape {
             num_total_rows: num_total_tokens,
         }
     }
@@ -1013,8 +1008,8 @@ fn shared_experts_config(core: &DenseMLPCore, config: GatedMoEMetalConfig) -> de
     }
 }
 
-fn affine_config_with_bits(n: usize, k: usize, bits: u32, config: GatedMoEMetalConfig) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn affine_config_with_bits(n: usize, k: usize, bits: u32, config: GatedMoEMetalConfig) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("MoE affine n must fit i32"),
         k: k.try_into().expect("MoE affine k must fit i32"),
         group_size: config.group_size.try_into().expect("MoE group size must fit i32"),

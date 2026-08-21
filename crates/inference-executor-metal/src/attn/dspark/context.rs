@@ -4,8 +4,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::UngatedDSparkGQACore;
 use inference_executor_core::backend::recorder::Recorder;
@@ -46,8 +45,8 @@ pub struct UngatedDSparkGQAContextInput<'a> {
 pub struct UngatedDSparkGQAContextAppender {
     core: UngatedDSparkGQACore,
     metal: GQAMetalConfig,
-    k: AffineQuantizedMatmul,
-    v: AffineQuantizedMatmul,
+    k: affine_quantized::Matmul,
+    v: affine_quantized::Matmul,
     k_norm_rope: rms_norm_rope::Compute,
     kv_page_write: backend_kv_page_write::Compute,
 }
@@ -90,8 +89,8 @@ impl UngatedDSparkGQAContextAppender {
         assert!(metal.rope_dim as usize <= attention.head_dim);
         let kv_config = attention_kv_config(attention, metal);
         Self {
-            k: AffineQuantizedMatmul::new(device, kv_config),
-            v: AffineQuantizedMatmul::new(device, kv_config),
+            k: affine_quantized::Matmul::new(device, kv_config),
+            v: affine_quantized::Matmul::new(device, kv_config),
             k_norm_rope: rms_norm_rope::Compute::new(device, k_norm_rope_config(attention, metal)),
             kv_page_write: backend_kv_page_write::Compute::new(
                 device,
@@ -202,7 +201,7 @@ struct QKVOffsets {
 
 impl QKVOffsets {
     fn new(core: &inference_executor_core::attn::UngatedGQACore, metal: GQAMetalConfig) -> Self {
-        let q_config = AffineQuantizedMatmulConfig {
+        let q_config = affine_quantized::Config {
             n: core.q_dim().try_into().expect("DSpark Q dimension must fit i32"),
             k: core
                 .hidden_dim
@@ -217,7 +216,7 @@ impl QKVOffsets {
             output_dtype: metal.io_dtype,
             scale_bias_dtype: metal.io_dtype,
         };
-        let k_config = AffineQuantizedMatmulConfig {
+        let k_config = affine_quantized::Config {
             n: core.k_dim().try_into().expect("DSpark K dimension must fit i32"),
             ..q_config
         };
@@ -239,8 +238,8 @@ impl QKVOffsets {
 fn attention_kv_config(
     core: &inference_executor_core::attn::UngatedGQACore,
     metal: GQAMetalConfig,
-) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: core
             .k_dim()
             .try_into()

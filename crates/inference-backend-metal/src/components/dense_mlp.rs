@@ -5,9 +5,7 @@ use crate::metal::Dtype;
 use crate::metal::Kernel;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
-use crate::operators::AffineQuantizedMatmul;
-use crate::operators::AffineQuantizedMatmulConfig;
-use crate::operators::AffineQuantizedMatmulKernelKind;
+use crate::operators::affine_quantized;
 
 const DENSE_MLP_SWIGLU_SOURCE: &str = include_str!("metal/quantized_dense_mlp_swiglu.metal");
 
@@ -62,12 +60,12 @@ impl Config {
         i32::try_from(self.bits).expect("dense MLP bits must fit i32");
     }
 
-    pub fn gate_up_config(self) -> AffineQuantizedMatmulConfig {
+    pub fn gate_up_config(self) -> affine_quantized::Config {
         self.validate();
         self.affine_config_unchecked(self.stacked_intermediate_dim(), self.hidden_dim)
     }
 
-    pub fn down_config(self) -> AffineQuantizedMatmulConfig {
+    pub fn down_config(self) -> affine_quantized::Config {
         self.validate();
         self.affine_config_unchecked(self.hidden_dim, self.intermediate_dim)
     }
@@ -117,8 +115,8 @@ impl Config {
         )
     }
 
-    fn affine_config_unchecked(self, n: u32, k: u32) -> AffineQuantizedMatmulConfig {
-        AffineQuantizedMatmulConfig {
+    fn affine_config_unchecked(self, n: u32, k: u32) -> affine_quantized::Config {
+        affine_quantized::Config {
             n: n.try_into().expect("dense MLP output dimension must fit i32"),
             k: k.try_into().expect("dense MLP input dimension must fit i32"),
             group_size: self.group_size.try_into().expect("dense MLP group_size must fit i32"),
@@ -150,8 +148,8 @@ impl Shape {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ReplayTopology {
-    pub gate_up_affine: AffineQuantizedMatmulKernelKind,
-    pub down_affine: AffineQuantizedMatmulKernelKind,
+    pub gate_up_affine: affine_quantized::KernelKind,
+    pub down_affine: affine_quantized::KernelKind,
 }
 
 #[derive(Clone, Copy)]
@@ -201,8 +199,8 @@ pub struct Scratch<'a> {
 /// ```
 pub struct Compute {
     config: Config,
-    gate_up: AffineQuantizedMatmul,
-    down: AffineQuantizedMatmul,
+    gate_up: affine_quantized::Matmul,
+    down: affine_quantized::Matmul,
     swiglu: SwiGLUKernel,
 }
 
@@ -211,8 +209,8 @@ impl Compute {
         config.validate();
         Self {
             config,
-            gate_up: AffineQuantizedMatmul::new(device, config.gate_up_config()),
-            down: AffineQuantizedMatmul::new(device, config.down_config()),
+            gate_up: affine_quantized::Matmul::new(device, config.gate_up_config()),
+            down: affine_quantized::Matmul::new(device, config.down_config()),
             swiglu: SwiGLUKernel::new(device, config.dtype),
         }
     }

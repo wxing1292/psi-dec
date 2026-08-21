@@ -4,8 +4,7 @@ use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
@@ -124,7 +123,7 @@ struct Qwen3xDSparkMainFeatureWeights {
 pub struct Qwen3xDSparkMainFeatureProjector {
     layout: Qwen3xDSparkMainFeatureLayout,
     residual_bindings: Qwen3xDSparkMainResidualBindings,
-    fc: AffineQuantizedMatmul,
+    fc: affine_quantized::Matmul,
     hidden_norm: RMSNorm,
     weights: Option<Qwen3xDSparkMainFeatureWeights>,
     main_residuals: Buffer,
@@ -150,7 +149,7 @@ impl Qwen3xDSparkMainFeatureProjector {
             .as_ref()
             .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark Main feature requires quantization config"))?
             .resolve_for_tensor(&bindings.fc.weight);
-        let fc_config = AffineQuantizedMatmulConfig::same_dtype(
+        let fc_config = affine_quantized::Config::same_dtype(
             layout
                 .hidden_dim
                 .try_into()
@@ -172,7 +171,7 @@ impl Qwen3xDSparkMainFeatureProjector {
         Ok(Self {
             layout,
             residual_bindings: Qwen3xDSparkMainResidualBindings::new(&config.target_layer_ids),
-            fc: AffineQuantizedMatmul::new(device, fc_config),
+            fc: affine_quantized::Matmul::new(device, fc_config),
             hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, config.rms_norm_eps),
             weights: None,
             main_residuals: Buffer::new_zeroed_elements(device, layout.main_residual_elements(), Dtype::Bfloat16),
@@ -199,7 +198,7 @@ impl Qwen3xDSparkMainFeatureProjector {
             .as_ref()
             .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark Main feature requires quantization config"))?
             .resolve_for_tensor(&bindings.fc.weight);
-        let fc_config = AffineQuantizedMatmulConfig::same_dtype(
+        let fc_config = affine_quantized::Config::same_dtype(
             self.layout
                 .hidden_dim
                 .try_into()

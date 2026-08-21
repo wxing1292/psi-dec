@@ -8,8 +8,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedGQACore;
@@ -89,12 +88,12 @@ pub struct UngatedGQA {
     core: UngatedGQACore,
     config: GQAMetalConfig,
     sdpa_selector: Selector,
-    qkv: AffineQuantizedMatmul,
+    qkv: affine_quantized::Matmul,
     qkv_to_q_k_v: backend_qkv_split::Compute,
     q_norm_rope: rms_norm_rope::Compute,
     k_norm_rope: rms_norm_rope::Compute,
     kv_page_write: backend_kv_page_write::Compute,
-    output: AffineQuantizedMatmul,
+    output: affine_quantized::Matmul,
 }
 
 impl GQAMetalConfig {
@@ -128,12 +127,12 @@ impl UngatedGQA {
                 )),
                 max_tokens,
             ),
-            qkv: AffineQuantizedMatmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, config)),
+            qkv: affine_quantized::Matmul::new(device, affine_config(qkv.out_dim, qkv.in_dim, config)),
             qkv_to_q_k_v: backend_qkv_split::Compute::new(device, qkv_to_q_k_v_config(&core, config)),
             q_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_q_heads)),
             k_norm_rope: rms_norm_rope::Compute::new(device, norm_rope_config(&core, config, core.num_kv_heads)),
             kv_page_write: backend_kv_page_write::Compute::new(device, kv_page_write_config(&core, config)),
-            output: AffineQuantizedMatmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
+            output: affine_quantized::Matmul::new(device, affine_config(output.out_dim, output.in_dim, config)),
         }
     }
 
@@ -504,8 +503,8 @@ fn validate_config_for_core(core: &UngatedGQACore, config: GQAMetalConfig) {
     assert!(config.num_ungated_tokens_per_page(core) > 0);
 }
 
-fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("ungated GQA affine n must fit i32"),
         k: k.try_into().expect("ungated GQA affine k must fit i32"),
         group_size: config

@@ -616,7 +616,7 @@ fn routing_test_config(norm_topk_prob: bool) -> (GatedMoECore, GatedMoEMetalConf
 }
 
 fn cpu_router_logits(
-    config: AffineQuantizedMatmulConfig,
+    config: affine_quantized::Config,
     num_tokens: usize,
     hidden: &[f32],
     weights: &[u8],

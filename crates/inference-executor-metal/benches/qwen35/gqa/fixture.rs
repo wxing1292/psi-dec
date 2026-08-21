@@ -15,7 +15,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
-use inference_backend_metal::operators::AffineQuantizedMatmul;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::backend::recorder::Recorder;
@@ -479,14 +479,14 @@ impl<'a> RealGQAFixture<'a> {
             },
         );
         let replay = recorder.build();
-        let qgkv_matmul = AffineQuantizedMatmul::new(device, gqa_qgkv_affine_config(model));
+        let qgkv_matmul = affine_quantized::Matmul::new(device, gqa_qgkv_affine_config(model));
         let qgkv_to_q_g_k_v = backend_qgkv_split::Compute::new(device, gqa_qgkv_to_q_g_k_v_config(model));
         let q_norm_rope_kernel = rms_norm_rope::Compute::new(device, norm_rope_config(model.num_q_heads, model));
         let k_norm_rope_kernel = rms_norm_rope::Compute::new(device, norm_rope_config(model.num_kv_heads, model));
         let kv_page_write =
             backend_kv_page_write::Compute::new(device, gqa_kv_page_write_config(model, config.page_bytes));
         let gate = backend_activation_gate::Compute::new(device, gqa_gate_config(model));
-        let output = AffineQuantizedMatmul::new(device, gqa_output_affine_config(model));
+        let output = affine_quantized::Matmul::new(device, gqa_output_affine_config(model));
         let metal_page_table_layout = gqa_page_table_layout(num_reqs, end_context_len, model);
         let tiled_config = gqa_split_kv_tiled_q_config(metal_page_table_layout, params, model);
         let tiled_shape = backend_tiled_q::Shape {
@@ -816,7 +816,7 @@ impl<'a> RealGQAFixture<'a> {
     }
 
     fn measure_subcomponents(&self, selected_subcomponents: &[String], warmup_iters: usize, iters: usize, runs: usize) {
-        let qgkv_matmul = AffineQuantizedMatmul::new(&self.device, gqa_qgkv_affine_config(self.model));
+        let qgkv_matmul = affine_quantized::Matmul::new(&self.device, gqa_qgkv_affine_config(self.model));
         let qgkv_to_q_g_k_v = backend_qgkv_split::Compute::new(&self.device, gqa_qgkv_to_q_g_k_v_config(self.model));
         let q_norm_rope =
             rms_norm_rope::Compute::new(&self.device, norm_rope_config(self.model.num_q_heads, self.model));
@@ -827,7 +827,7 @@ impl<'a> RealGQAFixture<'a> {
             gqa_kv_page_write_config(self.model, self.model.page_bytes()),
         );
         let gate = backend_activation_gate::Compute::new(&self.device, gqa_gate_config(self.model));
-        let output = AffineQuantizedMatmul::new(&self.device, gqa_output_affine_config(self.model));
+        let output = affine_quantized::Matmul::new(&self.device, gqa_output_affine_config(self.model));
         let sdpa_config = gqa_sdpa_config(self.num_reqs, self.end_context_len, self.params, self.model);
         let sdpa_shape = gqa_sdpa_shape(self.batch_metadata.replay_shape());
         let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, sdpa_shape);

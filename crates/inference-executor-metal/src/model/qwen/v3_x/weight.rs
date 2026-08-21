@@ -1,7 +1,7 @@
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::checkpoint::remove_tensor;
 use inference_executor_core::def::ModelExecutorError;
@@ -97,8 +97,8 @@ pub fn affine_config(
     input_dtype: Dtype,
     output_dtype: Dtype,
     scale_bias_dtype: Dtype,
-) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("affine n must fit i32"),
         k: k.try_into().expect("affine k must fit i32"),
         group_size: group_size.try_into().expect("affine group_size must fit i32"),

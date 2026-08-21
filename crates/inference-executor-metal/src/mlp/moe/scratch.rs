@@ -4,7 +4,7 @@ use inference_backend_metal::components::moe::routing;
 use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
-use inference_backend_metal::operators::AffineQuantizedMatmulConfig;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::mlp::moe::GatedMoECore;
 
 use crate::mlp::dense::scratch::DenseMLPScratch;
@@ -230,8 +230,8 @@ impl MoEScratch {
     }
 }
 
-fn affine_config(n: usize, k: usize, bits: u32, config: GatedMoEMetalConfig) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig {
+fn affine_config(n: usize, k: usize, bits: u32, config: GatedMoEMetalConfig) -> affine_quantized::Config {
+    affine_quantized::Config {
         n: n.try_into().expect("MoE affine n must fit i32"),
         k: k.try_into().expect("MoE affine k must fit i32"),
         group_size: config.group_size.try_into().expect("MoE group size must fit i32"),

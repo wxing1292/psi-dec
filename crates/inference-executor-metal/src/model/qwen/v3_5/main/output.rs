@@ -4,7 +4,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
-use inference_backend_metal::operators::AffineQuantizedMatmulKernelKind;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::num_main_output_rows;
@@ -158,7 +158,7 @@ impl Qwen35GatherUnembed {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen35GatherUnembedReplayKey {
     num_total_rows: u32,
-    unembed_topology: Option<AffineQuantizedMatmulKernelKind>,
+    unembed_topology: Option<affine_quantized::KernelKind>,
 }
 
 impl Qwen35GatherUnembedReplayKey {
@@ -189,11 +189,11 @@ impl Qwen35GatherUnembedReplayKey {
         self.num_total_rows
     }
 
-    pub fn unembed_topology(&self) -> Option<AffineQuantizedMatmulKernelKind> {
+    pub fn unembed_topology(&self) -> Option<affine_quantized::KernelKind> {
         self.unembed_topology
     }
 
-    fn for_capacity(num_total_rows: u32, unembed_topology: AffineQuantizedMatmulKernelKind) -> Self {
+    fn for_capacity(num_total_rows: u32, unembed_topology: affine_quantized::KernelKind) -> Self {
         Self {
             num_total_rows,
             unembed_topology: Some(unembed_topology),

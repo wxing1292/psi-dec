@@ -8,16 +8,16 @@ use crate::metal::Stream;
 
 const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.affine.num_active_rows");
 
-fn adaptive_config(n: i32, k: i32, dtype: Dtype) -> AffineQuantizedMatmulConfig {
-    AffineQuantizedMatmulConfig::same_dtype(n, k, 64, 4, dtype)
+fn adaptive_config(n: i32, k: i32, dtype: Dtype) -> Config {
+    Config::same_dtype(n, k, 64, 4, dtype)
 }
 
 #[test]
 #[should_panic(expected = "expert affine quantized kernels do not yet support mixed dtypes")]
 fn test_expert_config_rejects_unimplemented_mixed_dtype_template() {
-    ExpertAffineQuantizedConfig {
+    ExpertConfig {
         num_experts: 2,
-        matmul: AffineQuantizedMatmulConfig {
+        matmul: Config {
             n: 32,
             k: 32,
             group_size: 32,
@@ -34,19 +34,19 @@ fn test_expert_config_rejects_unimplemented_mixed_dtype_template() {
 fn test_adaptive_large_vocabulary_qmm_crossover() {
     assert_eq!(
         Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 4),
-        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+        KernelKind::QmvBn8Bk32
     );
     assert_eq!(
         Selector::key(adaptive_config(151_936, 2048, Dtype::Bfloat16), 5),
-        AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        KernelKind::QmmBm16Bn32
     );
     assert_eq!(
         Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 5),
-        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
+        KernelKind::QmvBn8Bk32
     );
     assert_eq!(
         Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 6),
-        AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        KernelKind::QmmBm16Bn32
     );
 }
 
@@ -54,43 +54,25 @@ fn test_adaptive_large_vocabulary_qmm_crossover() {
 fn test_adaptive_qmm_tile_crossover() {
     assert_eq!(
         Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 16),
-        AffineQuantizedMatmulKernelKind::QmmBm16Bn32
+        KernelKind::QmmBm16Bn32
     );
     assert_eq!(
         Selector::key(adaptive_config(151_936, 5120, Dtype::Bfloat16), 17),
-        AffineQuantizedMatmulKernelKind::QmmBm32Bn32
+        KernelKind::QmmBm32Bn32
     );
 }
 
 #[test]
 fn test_adaptive_dense_projection_crossover() {
     let large_projection = adaptive_config(34_816, 5120, Dtype::Bfloat16);
-    assert_eq!(
-        Selector::key(large_projection, 5),
-        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
-    );
-    assert_eq!(
-        Selector::key(large_projection, 6),
-        AffineQuantizedMatmulKernelKind::QmmBm8Bn32
-    );
-    assert_eq!(
-        Selector::key(large_projection, 8),
-        AffineQuantizedMatmulKernelKind::QmmBm8Bn32
-    );
-    assert_eq!(
-        Selector::key(large_projection, 9),
-        AffineQuantizedMatmulKernelKind::QmmBm16Bn32
-    );
+    assert_eq!(Selector::key(large_projection, 5), KernelKind::QmvBn8Bk32);
+    assert_eq!(Selector::key(large_projection, 6), KernelKind::QmmBm8Bn32);
+    assert_eq!(Selector::key(large_projection, 8), KernelKind::QmmBm8Bn32);
+    assert_eq!(Selector::key(large_projection, 9), KernelKind::QmmBm16Bn32);
 
     let common_projection = adaptive_config(1024, 2048, Dtype::Bfloat16);
-    assert_eq!(
-        Selector::key(common_projection, 8),
-        AffineQuantizedMatmulKernelKind::QmvBn8Bk32
-    );
-    assert_eq!(
-        Selector::key(common_projection, 18),
-        AffineQuantizedMatmulKernelKind::QmmBm32Bn32
-    );
+    assert_eq!(Selector::key(common_projection, 8), KernelKind::QmvBn8Bk32);
+    assert_eq!(Selector::key(common_projection, 18), KernelKind::QmmBm32Bn32);
 }
 
 #[test]
@@ -121,10 +103,10 @@ fn test_adaptive_topology_boundaries_follow_selector() {
 
 #[test]
 fn test_bucketed_qmv_variants_match_exact_and_preserve_tail() {
-    let same_qmv = AffineQuantizedMatmulConfig::same_dtype(4, 32, 32, 8, Dtype::Float32);
-    let same_qmv_fast = AffineQuantizedMatmulConfig::same_dtype(8, 512, 64, 8, Dtype::Float32);
-    let same_qmv_quad = AffineQuantizedMatmulConfig::same_dtype(9, 64, 64, 8, Dtype::Float32);
-    let mixed_qmv = AffineQuantizedMatmulConfig {
+    let same_qmv = Config::same_dtype(4, 32, 32, 8, Dtype::Float32);
+    let same_qmv_fast = Config::same_dtype(8, 512, 64, 8, Dtype::Float32);
+    let same_qmv_quad = Config::same_dtype(9, 64, 64, 8, Dtype::Float32);
+    let mixed_qmv = Config {
         n: 4,
         k: 32,
         group_size: 32,
@@ -133,7 +115,7 @@ fn test_bucketed_qmv_variants_match_exact_and_preserve_tail() {
         output_dtype: Dtype::Float32,
         scale_bias_dtype: Dtype::Float32,
     };
-    let mixed_qmv_fast = AffineQuantizedMatmulConfig {
+    let mixed_qmv_fast = Config {
         n: 8,
         k: 512,
         group_size: 64,
@@ -144,11 +126,11 @@ fn test_bucketed_qmv_variants_match_exact_and_preserve_tail() {
     };
 
     for (config, kind) in [
-        (same_qmv, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
-        (same_qmv_fast, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
-        (same_qmv_quad, AffineQuantizedMatmulKernelKind::QmvQuadBn64),
-        (mixed_qmv, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
-        (mixed_qmv_fast, AffineQuantizedMatmulKernelKind::QmvBn8Bk32),
+        (same_qmv, KernelKind::QmvBn8Bk32),
+        (same_qmv_fast, KernelKind::QmvBn8Bk32),
+        (same_qmv_quad, KernelKind::QmvQuadBn64),
+        (mixed_qmv, KernelKind::QmvBn8Bk32),
+        (mixed_qmv_fast, KernelKind::QmvBn8Bk32),
     ] {
         assert_bucketed_parity_and_canary(config, kind, 4, 3);
     }
@@ -156,10 +138,10 @@ fn test_bucketed_qmv_variants_match_exact_and_preserve_tail() {
 
 #[test]
 fn test_bucketed_qmm_variants_match_exact_and_preserve_tail() {
-    let same = AffineQuantizedMatmulConfig::same_dtype(32, 32, 32, 8, Dtype::Float32);
-    let same_unaligned = AffineQuantizedMatmulConfig::same_dtype(1, 32, 32, 8, Dtype::Float32);
-    let same_q4_bf16 = AffineQuantizedMatmulConfig::same_dtype(32, 64, 64, 4, Dtype::Bfloat16);
-    let mixed_unaligned = AffineQuantizedMatmulConfig {
+    let same = Config::same_dtype(32, 32, 32, 8, Dtype::Float32);
+    let same_unaligned = Config::same_dtype(1, 32, 32, 8, Dtype::Float32);
+    let same_q4_bf16 = Config::same_dtype(32, 64, 64, 4, Dtype::Bfloat16);
+    let mixed_unaligned = Config {
         n: 3,
         k: 32,
         group_size: 32,
@@ -170,25 +152,20 @@ fn test_bucketed_qmm_variants_match_exact_and_preserve_tail() {
     };
 
     for (config, kind, num_total_rows, num_active_rows) in [
-        (same, AffineQuantizedMatmulKernelKind::QmmBm8Bn32, 16, 5),
-        (same, AffineQuantizedMatmulKernelKind::QmmBm16Bn32, 32, 9),
-        (same, AffineQuantizedMatmulKernelKind::QmmBm32Bn32, 64, 17),
-        (same_q4_bf16, AffineQuantizedMatmulKernelKind::QmmBm16Bn32, 32, 9),
-        (same_unaligned, AffineQuantizedMatmulKernelKind::QmmBm32Bn32, 64, 17),
-        (mixed_unaligned, AffineQuantizedMatmulKernelKind::QmmBm8Bn32, 16, 5),
-        (mixed_unaligned, AffineQuantizedMatmulKernelKind::QmmBm16Bn32, 32, 9),
-        (mixed_unaligned, AffineQuantizedMatmulKernelKind::QmmBm32Bn32, 64, 17),
+        (same, KernelKind::QmmBm8Bn32, 16, 5),
+        (same, KernelKind::QmmBm16Bn32, 32, 9),
+        (same, KernelKind::QmmBm32Bn32, 64, 17),
+        (same_q4_bf16, KernelKind::QmmBm16Bn32, 32, 9),
+        (same_unaligned, KernelKind::QmmBm32Bn32, 64, 17),
+        (mixed_unaligned, KernelKind::QmmBm8Bn32, 16, 5),
+        (mixed_unaligned, KernelKind::QmmBm16Bn32, 32, 9),
+        (mixed_unaligned, KernelKind::QmmBm32Bn32, 64, 17),
     ] {
         assert_bucketed_parity_and_canary(config, kind, num_total_rows, num_active_rows);
     }
 }
 
-fn assert_bucketed_parity_and_canary(
-    config: AffineQuantizedMatmulConfig,
-    kind: AffineQuantizedMatmulKernelKind,
-    num_total_rows: i32,
-    num_active_rows: i32,
-) {
+fn assert_bucketed_parity_and_canary(config: Config, kind: KernelKind, num_total_rows: i32, num_active_rows: i32) {
     assert!(matches!(config.bits, 4 | 8));
     assert!(num_active_rows < num_total_rows);
     let device = Device::system_default();
@@ -222,7 +199,7 @@ fn assert_bucketed_parity_and_canary(
         config.output_dtype,
     );
     let exact_output = Buffer::new_zeroed(&device, config.output_bytes(num_active_rows));
-    let kernel = AffineQuantizedMatmulKernel::new(&device, config, kind);
+    let kernel = Kernel::new(&device, config, kind);
 
     let mut exact_builder = stream.create_replay_program();
     exact_builder.record(kernel.invoke(
@@ -314,7 +291,7 @@ fn output_tolerance(dtype: Dtype) -> f32 {
     }
 }
 
-fn execute_matmul(stream: &Stream, invocation: AffineQuantizedMatmulInvocation<'_>) {
+fn execute_matmul(stream: &Stream, invocation: Invocation<'_>) {
     let mut builder = stream.create_replay_program();
     builder.record(invocation);
     let replay = builder.build();
@@ -337,7 +314,7 @@ fn test_adaptive_matmul_supports_all_float_dtype_combinations() {
     for input_dtype in DTYPES {
         for scale_bias_dtype in DTYPES {
             for output_dtype in DTYPES {
-                let config = AffineQuantizedMatmulConfig {
+                let config = Config {
                     n: 8,
                     k: 32,
                     group_size: 32,
@@ -352,13 +329,13 @@ fn test_adaptive_matmul_supports_all_float_dtype_combinations() {
                 let input = buffer_from_f32(&device, &input_values, input_dtype);
                 let scales_buffer = buffer_from_f32(&device, &scales, scale_bias_dtype);
                 let biases_buffer = buffer_from_f32(&device, &biases, scale_bias_dtype);
-                let matmul = AffineQuantizedMatmul::new(&device, config);
+                let matmul = Matmul::new(&device, config);
 
                 let cases = [
                     (matmul.registry.get(Selector::qmv_key(config)), 2),
-                    (matmul.registry.get(AffineQuantizedMatmulKernelKind::QmmBm8Bn32), 7),
-                    (matmul.registry.get(AffineQuantizedMatmulKernelKind::QmmBm16Bn32), 15),
-                    (matmul.registry.get(AffineQuantizedMatmulKernelKind::QmmBm32Bn32), 31),
+                    (matmul.registry.get(KernelKind::QmmBm8Bn32), 7),
+                    (matmul.registry.get(KernelKind::QmmBm16Bn32), 15),
+                    (matmul.registry.get(KernelKind::QmmBm32Bn32), 31),
                 ];
                 for (kernel, m) in cases {
                     let output = Buffer::new_zeroed(&device, config.output_bytes(m));
@@ -413,7 +390,7 @@ fn test_qmv_fast_supports_all_float_dtype_combinations() {
     for input_dtype in DTYPES {
         for scale_bias_dtype in DTYPES {
             for output_dtype in DTYPES {
-                let config = AffineQuantizedMatmulConfig {
+                let config = Config {
                     n: 8,
                     k: 512,
                     group_size: 64,
@@ -429,8 +406,7 @@ fn test_qmv_fast_supports_all_float_dtype_combinations() {
                 let scales_buffer = buffer_from_f32(&device, &scales, scale_bias_dtype);
                 let biases_buffer = buffer_from_f32(&device, &biases, scale_bias_dtype);
                 let output = Buffer::new_zeroed(&device, config.output_bytes(m));
-                let kernel =
-                    AffineQuantizedMatmulKernel::new(&device, config, AffineQuantizedMatmulKernelKind::QmvBn8Bk32);
+                let kernel = Kernel::new(&device, config, KernelKind::QmvBn8Bk32);
                 execute_matmul(
                     &stream,
                     kernel.invoke(
@@ -470,7 +446,7 @@ fn test_qmv_reference() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 2;
-    let config = AffineQuantizedMatmulConfig {
+    let config = Config {
         n: 4,
         k: 32,
         group_size: 32,
@@ -495,7 +471,7 @@ fn test_qmv_reference() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -530,7 +506,7 @@ fn test_qmv_fast_reference() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 2;
-    let config = AffineQuantizedMatmulConfig {
+    let config = Config {
         n: 8,
         k: 512,
         group_size: 64,
@@ -558,7 +534,7 @@ fn test_qmv_fast_reference() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -593,7 +569,7 @@ fn test_qmm_reference() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 18;
-    let config = AffineQuantizedMatmulConfig {
+    let config = Config {
         n: 4,
         k: 32,
         group_size: 32,
@@ -618,7 +594,7 @@ fn test_qmm_reference() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -662,7 +638,7 @@ fn assert_qmm_bm8_bm16_bn32_q4_bf16_reference(bm: usize) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 7;
-    let config = AffineQuantizedMatmulConfig {
+    let config = Config {
         n: 32,
         k: 64,
         group_size: 64,
@@ -695,8 +671,8 @@ fn assert_qmm_bm8_bm16_bn32_q4_bf16_reference(bm: usize) {
     let biases_buffer = Buffer::from_slice(&device, &biases_bf16);
 
     let kernel = match bm {
-        8 => AffineQuantizedMatmulKernel::new(&device, config, AffineQuantizedMatmulKernelKind::QmmBm8Bn32),
-        16 => AffineQuantizedMatmulKernel::new(&device, config, AffineQuantizedMatmulKernelKind::QmmBm16Bn32),
+        8 => Kernel::new(&device, config, KernelKind::QmmBm8Bn32),
+        16 => Kernel::new(&device, config, KernelKind::QmmBm16Bn32),
         _ => panic!("QMM BM=8/16 BN=32 reference requires BM=8 or BM=16"),
     };
     execute_matmul(
@@ -749,7 +725,7 @@ fn test_qmv_bf16() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 1;
-    let config = AffineQuantizedMatmulConfig {
+    let config = Config {
         n: 4,
         k: 32,
         group_size: 32,
@@ -778,7 +754,7 @@ fn test_qmv_bf16() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -823,7 +799,7 @@ fn test_qmv_fast_bf16() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 2;
-    let config = AffineQuantizedMatmulConfig {
+    let config = Config {
         n: 8,
         k: 512,
         group_size: 64,
@@ -855,7 +831,7 @@ fn test_qmv_fast_bf16() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -900,7 +876,7 @@ fn test_qmm_bf16() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let m = 18;
-    let config = AffineQuantizedMatmulConfig {
+    let config = Config {
         n: 4,
         k: 32,
         group_size: 32,
@@ -929,7 +905,7 @@ fn test_qmm_bf16() {
 
     execute_matmul(
         &stream,
-        AffineQuantizedMatmulKernel::new(&device, config, Selector::key(config, m)).invoke(
+        Kernel::new(&device, config, Selector::key(config, m)).invoke(
             m,
             &output,
             0,
@@ -970,7 +946,7 @@ fn test_qmm_bf16() {
 }
 
 fn cpu_affine_reference(
-    config: AffineQuantizedMatmulConfig,
+    config: Config,
     m: i32,
     input: &[f32],
     weight: &[u8],
@@ -1099,13 +1075,7 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     }
 }
 
-fn assert_close_case(
-    actual: &[f32],
-    expected: &[f32],
-    tolerance: f32,
-    config: AffineQuantizedMatmulConfig,
-    kind: AffineQuantizedMatmulKernelKind,
-) {
+fn assert_close_case(actual: &[f32], expected: &[f32], tolerance: f32, config: Config, kind: KernelKind) {
     assert_eq!(actual.len(), expected.len());
     for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
         let diff = (actual - expected).abs();

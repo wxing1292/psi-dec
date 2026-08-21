@@ -1016,7 +1016,7 @@ Do not compare its timing directly with `gqa_block_attn`.
 and context lengths. It reports full-replay and SplitKV-only measurements.
 It also reports exact QKV and output-projection measurements for QMV, QMM BM8/BN32, and QMM BM16/BN32.
 These forced projection paths are benchmark-only.
-Production GQA continues to use `AffineQuantizedMatmul` selection from the complete shape and dtype.
+Production GQA continues to use `affine_quantized::Matmul` selection from the complete shape and dtype.
 
 Its SplitKV SingleQ and TiledQ constant arguments are configurable. `--validate` compares full SingleQ and
 TiledQ outputs for a workload where production selects the TiledQ variant.
