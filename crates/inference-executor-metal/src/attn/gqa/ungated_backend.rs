@@ -325,7 +325,7 @@ impl UngatedGQA {
                     kv_pages: kv_cache.kv_pages,
                     req_slots: batch_metadata.req_slots(),
                     page_ids: kv_cache.page_ids,
-                    flat_token_indices: batch_metadata.flat_token_indices(),
+                    visible_kv_token_ranges: batch_metadata.visible_kv_token_ranges(),
                     q_token_ranges: batch_metadata.q_token_ranges(),
                     sdpa_map_task_templates: batch_metadata.sdpa_map_task_templates(),
                     partial_output: scratch.sdpa_partial_output,

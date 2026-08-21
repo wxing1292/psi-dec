@@ -2,6 +2,7 @@ use inference_backend_metal::components::gqa::activation_gate as backend_activat
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::qgkv_split as backend_qgkv_split;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
+use inference_backend_metal::components::gqa::sdpa::ExecutionVariant;
 use inference_backend_metal::components::gqa::split_kv::single_q as backend_single_q;
 use inference_backend_metal::components::gqa::split_kv::tiled_q as backend_tiled_q;
 use inference_backend_metal::components::rms_norm_rope;
@@ -34,7 +35,7 @@ pub const GQA_NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GQAReplayTopology {
-    pub sdpa_execution: backend_sdpa::ExecutionVariant,
+    pub sdpa_execution: ExecutionVariant,
     pub qgkv_affine: affine_quantized::KernelKind,
     pub output_affine: affine_quantized::KernelKind,
 }
@@ -472,7 +473,7 @@ impl GQA {
                 kv_pages: kv_cache.kv_pages,
                 req_slots: batch_metadata.req_slots(),
                 page_ids: kv_cache.page_ids,
-                flat_token_indices: batch_metadata.flat_token_indices(),
+                visible_kv_token_ranges: batch_metadata.visible_kv_token_ranges(),
                 q_token_ranges: batch_metadata.q_token_ranges(),
                 sdpa_map_task_templates: batch_metadata.sdpa_map_task_templates(),
                 partial_output: scratch.sdpa_partial_output,

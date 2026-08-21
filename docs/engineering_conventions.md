@@ -78,6 +78,10 @@ Use half-open intervals `[start, end)` by default. Rust source must use `start..
 contract may use a different interval representation when that representation is necessary. In that case, document
 the endpoint semantics at the owning type or function. Do not infer inclusive or exclusive endpoints from context.
 
+An API that accepts a valid or visible interval must expose both bounds. Do not expose only an exclusive upper bound
+and assume that the inclusive lower bound is `0`. Pass `[start, end)` explicitly, including when `start == 0`. Do not
+use `Option` for one bound when the interval itself is required.
+
 Use checked `u64` values for host byte offsets and address arithmetic. Use `ulong` for flattened Metal addresses.
 Convert to `usize` only at a Rust slice, pointer, or Objective-C API boundary.
 
@@ -629,7 +633,8 @@ shorthand unless it is a stable module contract.
 A callback can keep, transform, or remove an item. For this behavior, use an explicit action enum. Do not encode the
 control flow in `Option<T>`.
 
-Use `Option<T>` only for an optional value.
+Use `Option<T>` only when absence is a valid domain state. Do not use it to select an implicit default value. For a
+required bounded interval, pass both bounds without `Option`.
 
 Comments explain ownership, ordering, units, or backend constraints that are not obvious. They do not describe
 mechanics that the code shows.

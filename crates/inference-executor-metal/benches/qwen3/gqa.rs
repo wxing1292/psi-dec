@@ -798,7 +798,7 @@ fn split_kv_tiled_q_replay(
             kv_pages: pages,
             req_slots: metadata.req_slots(),
             page_ids,
-            flat_token_indices: metadata.flat_token_indices(),
+            visible_kv_token_ranges: metadata.visible_kv_token_ranges(),
             q_token_ranges: metadata.q_token_ranges(),
             sdpa_map_task_templates: metadata.sdpa_map_task_templates(),
             partial_output: scratch.sdpa_partial_output,

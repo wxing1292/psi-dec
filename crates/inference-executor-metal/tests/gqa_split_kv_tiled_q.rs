@@ -116,7 +116,12 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
     let kv_pages = Buffer::from_slice(&device, &kv_page_values);
     let req_slots = Buffer::from_slice(&device, &[0_u32; 16]);
     let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
-    let flat_token_indices = Buffer::from_slice(&device, &(0_u32..16).collect::<Vec<_>>());
+    let visible_kv_token_ranges = Buffer::from_slice(
+        &device,
+        &(0_u32..16)
+            .flat_map(|q_token_index| [0, q_token_index + 1])
+            .collect::<Vec<_>>(),
+    );
     let q_token_ranges = Buffer::from_slice(&device, &[0_u32, 5, u32::MAX, u32::MAX]);
     let task_templates = Buffer::from_slice(&device, &[0_u32, 0, 5, u32::MAX, u32::MAX, u32::MAX]);
     let cu_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1, u32::MAX]);
@@ -143,7 +148,7 @@ fn test_bucketed_replay_ignores_poisoned_q_token_range_tail() {
             kv_pages: &kv_pages,
             req_slots: &req_slots,
             page_ids: &page_ids,
-            flat_token_indices: &flat_token_indices,
+            visible_kv_token_ranges: &visible_kv_token_ranges,
             q_token_ranges: &q_token_ranges,
             sdpa_map_task_templates: &task_templates,
             partial_output: &partial_output,
@@ -403,7 +408,13 @@ fn run_case(
         &device,
         &(0..(num_tokens_per_req.len() * num_blocks) as u32).collect::<Vec<_>>(),
     );
-    let flat_token_indices = Buffer::from_slice(&device, &flat_token_index_values);
+    let visible_kv_token_ranges = Buffer::from_slice(
+        &device,
+        &flat_token_index_values
+            .iter()
+            .flat_map(|&q_token_index| [0, q_token_index + 1])
+            .collect::<Vec<_>>(),
+    );
     let q_token_ranges = Buffer::from_slice(&device, &q_token_range_values);
     let sdpa_map_task_templates = Buffer::from_slice(&device, &sdpa_map_task_template_values);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &cu_sdpa_partial_output_values);
@@ -432,7 +443,7 @@ fn run_case(
             kv_pages: &kv_pages,
             req_slots: &req_slots,
             page_ids: &page_ids,
-            flat_token_indices: &flat_token_indices,
+            visible_kv_token_ranges: &visible_kv_token_ranges,
             q_token_ranges: &q_token_ranges,
             sdpa_map_task_templates: &sdpa_map_task_templates,
             partial_output: &partial_output,

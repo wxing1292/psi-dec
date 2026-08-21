@@ -213,6 +213,12 @@ selected Map and Reduce constants.
 num_visible_kv_tokens = num_history_tokens + q_token_offset + 1
 ```
 
+The selector materializes a Map task range that reaches the maximum visible KV token in the Q-token range. Metadata
+also uploads one required half-open `visible_kv_token_ranges` entry per flat Q token. TiledQ computes the intersection
+of the row range and the Map TaskTemplate range. It does not assume `begin = 0` or infer an endpoint from
+`flat_token_indices`. A fully masked segment produces `exp_sum = 0` and `max_logit = -infinity`; Reduce gives that
+partial zero weight.
+
 The selector creates request-local `gqa::sdpa::QTokenRange` values. A range contains `request_index`,
 `flat_q_token_indices`, and `max_visible_kv_tokens`. A `QTokenRange` is dynamic task metadata. It is not a kernel
 tile or a complete Map task.

@@ -18,6 +18,10 @@ typedef bfloat bfloat16_t;
 //   q_head_range_index,   // grid-derived from threadblock_position.x
 // }
 //
+// visible_kv_token_ranges stores one request-local half-open
+// [kv_token_begin, kv_token_end) range for each flat Q token. Each row computes
+// the intersection of this range and its Map task-template range.
+//
 // A sentinel Map task template returns without writing any partial output or
 // statistics.
 
@@ -51,7 +55,7 @@ kernel void gqa_split_kv_tiled_q_map(
     device const bfloat16_t* kv_pages [[buffer(1)]],
     device const uint* req_slots [[buffer(2)]],
     device const uint* page_ids [[buffer(3)]],
-    device const uint* flat_token_indices [[buffer(4)]],
+    device const uint* visible_kv_token_ranges [[buffer(4)]],
     device const uint* q_token_ranges [[buffer(5)]],
     device const uint* sdpa_map_task_templates [[buffer(6)]],
     device bfloat16_t* partial_output [[buffer(7)]],
@@ -118,7 +122,9 @@ kernel void gqa_split_kv_tiled_q_map(
     const uint token_offset = token_fragment_index * 8 + uint(token_fragment_offset);
     const bool inactive_token = !active_q_head || token_offset >= num_q_tokens_in_range;
     const bool full_token_fragment = token_fragment_index * 8 + 8 <= num_q_tokens_in_range;
-    const uint causal_token_index = inactive_token ? 0 : flat_token_indices[flat_token_start + token_offset];
+    const uint flat_q_token_index = flat_token_start + token_offset;
+    const uint visible_kv_token_begin = inactive_token ? 0 : visible_kv_token_ranges[flat_q_token_index * 2];
+    const uint visible_kv_token_end = inactive_token ? 0 : visible_kv_token_ranges[flat_q_token_index * 2 + 1];
 
     using Vec2BF16 = vec<bfloat16_t, 2>;
     using Vec2F32 = vec<float, 2>;
@@ -237,7 +243,8 @@ kernel void gqa_split_kv_tiled_q_map(
                     + uint(fragment_col) + uint(fragment_slot);
                 const float score = score_fragments[kv_token_fragment][fragment_slot] * scale_log2;
                 score_fragments[kv_token_fragment][fragment_slot] =
-                    inactive_token || kv_token_index > causal_token_index || kv_token_index >= kv_token_end
+                    inactive_token || kv_token_index < visible_kv_token_begin
+                        || kv_token_index >= visible_kv_token_end || kv_token_index >= kv_token_end
                     ? -INFINITY
                     : score;
             }
@@ -303,7 +310,7 @@ kernel void gqa_split_kv_tiled_q_map(
             + (ulong)token_offset;
         if (fragment_col == 0) {
             partial_exp_sums[partial_output_index] = running_sum;
-            partial_max_logits[partial_output_index] = running_max;
+            partial_max_logits[partial_output_index] = running_sum == 0.0f ? -INFINITY : running_max;
         }
         const float inverse_sum = 1.0f / (running_sum + 1.0e-6f);
         #pragma unroll
@@ -364,8 +371,10 @@ kernel void gqa_split_kv_tiled_q_reduce(
             const ulong partial_output_stats_index =
                 ((ulong)partial_output_index * NUM_Q_HEADS + (ulong)q_head_index) * MAX_Q_TOKENS
                 + (ulong)local_token_index;
-            const float weight = exp2(partial_max_logits[partial_output_stats_index] - global_max)
-                * partial_exp_sums[partial_output_stats_index];
+            const float partial_exp_sum = partial_exp_sums[partial_output_stats_index];
+            const float weight = partial_exp_sum == 0.0f
+                ? 0.0f
+                : exp2(partial_max_logits[partial_output_stats_index] - global_max) * partial_exp_sum;
             const ulong partial_output_value_index = partial_output_stats_index * HEAD_DIM + (ulong)dim;
             global_sum += weight;
             v += weight * float(partial_output[partial_output_value_index]);

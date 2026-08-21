@@ -30,7 +30,8 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let kv_pages = bf16_buffer(&device, &kv_page_values(config, &k_values, &v_values));
     let req_slots = Buffer::new_zeroed_elements(&device, shape.num_total_tokens as usize, Dtype::Uint32);
     let page_ids = Buffer::from_slice(&device, &[0_u32]);
-    let flat_token_indices = Buffer::new_zeroed_elements(&device, shape.num_total_tokens as usize, Dtype::Uint32);
+    let visible_kv_token_ranges =
+        Buffer::new_zeroed_elements(&device, shape.num_total_tokens as usize * 2, Dtype::Uint32);
     let q_token_ranges = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
     let sdpa_map_task_templates = Buffer::new_zeroed_elements(&device, 3, Dtype::Uint32);
     let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1]);
@@ -46,7 +47,7 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
             kv_pages: &kv_pages,
             req_slots: &req_slots,
             page_ids: &page_ids,
-            flat_token_indices: &flat_token_indices,
+            visible_kv_token_ranges: &visible_kv_token_ranges,
             q_token_ranges: &q_token_ranges,
             sdpa_map_task_templates: &sdpa_map_task_templates,
             partial_output: &partial_output,
@@ -90,9 +91,11 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
             0,
             &active_u32_values(&vec![0; shape.num_total_tokens as usize], num_active_tokens),
         );
-        flat_token_indices.write_typed(
+        visible_kv_token_ranges.write_typed(
             0,
-            &active_u32_values(&(0..shape.num_total_tokens).collect::<Vec<_>>(), num_active_tokens),
+            &(0..num_active_tokens as u32)
+                .flat_map(|q_token_index| [0, q_token_index + 1])
+                .collect::<Vec<_>>(),
         );
         q_token_ranges.write_typed(0, &[0_u32, num_active_tokens as u32]);
         sdpa_map_task_templates.write_typed(0, &[0_u32, 0, num_active_tokens as u32]);
@@ -223,6 +226,20 @@ fn test_shape_rejects_shader_index_overflow() {
         num_total_tokens: u32::MAX,
         num_total_q_token_tiles: u32::MAX,
         num_total_sdpa_map_task_templates: u32::MAX,
+    };
+    let (config, _) = tiled_workload(256, 16);
+    shape.validate(config);
+}
+
+#[test]
+#[should_panic(
+    expected = "GQA SplitKV TiledQ visible K/V-token-range metadata exceeds the shader u32 element-index domain"
+)]
+fn test_shape_rejects_visible_range_index_overflow() {
+    let shape = Shape {
+        num_total_tokens: u32::MAX,
+        num_total_q_token_tiles: 1,
+        num_total_sdpa_map_task_templates: 1,
     };
     let (config, _) = tiled_workload(256, 16);
     shape.validate(config);

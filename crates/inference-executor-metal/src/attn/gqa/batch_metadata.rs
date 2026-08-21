@@ -11,6 +11,7 @@ use super::sdpa::Selection;
 
 const NUM_SDPA_MAP_TASK_TEMPLATE_FIELDS: usize = 3;
 const NUM_Q_TOKEN_RANGE_FIELDS: usize = 2;
+const NUM_VISIBLE_KV_TOKEN_RANGE_FIELDS: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GQAReplayBucketPolicy {
@@ -51,6 +52,8 @@ pub struct GQAMetadataBuffers {
     req_slots: Buffer,
     // Indexed by flat token order. Each value is request-absolute.
     flat_token_indices: Buffer,
+    // Materialized ABI: one request-local [visible_kv_token_begin, visible_kv_token_end) per flat Q token.
+    visible_kv_token_ranges: Buffer,
     // Materialized ABI: [flat_q_token_begin, flat_q_token_end].
     q_token_ranges: Buffer,
     // Materialized ABI: [q_token_range_index, request_local_kv_token_begin, request_local_kv_token_end].
@@ -67,6 +70,13 @@ impl GQAMetadataBuffers {
         Self {
             req_slots: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
             flat_token_indices: Buffer::new_zeroed_elements(device, max_tokens, Dtype::Uint32),
+            visible_kv_token_ranges: Buffer::new_zeroed_elements(
+                device,
+                max_tokens
+                    .checked_mul(NUM_VISIBLE_KV_TOKEN_RANGE_FIELDS)
+                    .expect("GQA visible K/V-token-range metadata capacity must fit usize"),
+                Dtype::Uint32,
+            ),
             q_token_ranges: Buffer::new_zeroed_elements(
                 device,
                 max_tokens
@@ -115,6 +125,8 @@ impl GQAMetadataBuffers {
 
         let mut req_slots_by_token = Vec::with_capacity(replay_shape.num_tokens as usize);
         let mut flat_token_indices = Vec::with_capacity(replay_shape.num_tokens as usize);
+        let mut visible_kv_token_ranges =
+            Vec::with_capacity(replay_shape.num_tokens as usize * NUM_VISIBLE_KV_TOKEN_RANGE_FIELDS);
         for request_index in 0..req_slots.len() {
             let flat_q_token_begin = cu_tokens[request_index];
             let flat_q_token_end = cu_tokens[request_index + 1];
@@ -123,8 +135,15 @@ impl GQAMetadataBuffers {
                 .checked_add(flat_q_token_end - flat_q_token_begin)
                 .expect("GQA request context length must fit u32");
             for q_token_index_in_request in 0..flat_q_token_end - flat_q_token_begin {
+                let flat_token_index = token_indices[request_index] + q_token_index_in_request;
                 req_slots_by_token.push(req_slots[request_index]);
-                flat_token_indices.push(token_indices[request_index] + q_token_index_in_request);
+                flat_token_indices.push(flat_token_index);
+                visible_kv_token_ranges.extend_from_slice(&[
+                    0,
+                    flat_token_index
+                        .checked_add(1)
+                        .expect("GQA visible K/V-token-range end must fit u32"),
+                ]);
             }
         }
         assert_eq!(req_slots_by_token.len(), replay_shape.num_tokens as usize);
@@ -165,6 +184,7 @@ impl GQAMetadataBuffers {
 
         self.req_slots.write_typed(0, &req_slots_by_token);
         self.flat_token_indices.write_typed(0, &flat_token_indices);
+        self.visible_kv_token_ranges.write_typed(0, &visible_kv_token_ranges);
         if selection.variant().map.thread_block.max_q_tokens > 1 {
             self.q_token_ranges.write_typed(0, &q_token_ranges);
         }
@@ -182,6 +202,10 @@ impl GQAMetadataBuffers {
 
     pub fn flat_token_indices(&self) -> &Buffer {
         &self.flat_token_indices
+    }
+
+    pub fn visible_kv_token_ranges(&self) -> &Buffer {
+        &self.visible_kv_token_ranges
     }
 
     pub fn q_token_ranges(&self) -> &Buffer {
@@ -254,6 +278,10 @@ mod tests {
             vec![7, 8, 20, 21, 22]
         );
         assert_eq!(
+            metadata.visible_kv_token_ranges().read_typed::<u32>(0, 10),
+            vec![0, 8, 0, 9, 0, 21, 0, 22, 0, 23]
+        );
+        assert_eq!(
             metadata.sdpa_map_task_templates().read_typed::<u32>(0, 24),
             vec![
                 0, 0, 8, 1, 0, 9, 2, 0, 8, 2, 8, 21, 3, 0, 8, 3, 8, 22, 4, 0, 8, 4, 8, 23
@@ -285,6 +313,9 @@ mod tests {
     fn test_selection_preserves_non_kv_metadata_tail() {
         let device = Device::system_default();
         let metadata = GQAMetadataBuffers::new(&device, 12);
+        metadata
+            .visible_kv_token_ranges()
+            .write_typed(0, &[0x9494_9494_u32; 24]);
         metadata.q_token_ranges().write_typed(0, &[0xA5A5_A5A5_u32; 24]);
         metadata
             .sdpa_map_task_templates()
@@ -299,6 +330,10 @@ mod tests {
 
         let shape = metadata.update(&[2, 5, 7], &[0, 0, 0], &[0, 4, 8, 9], &selection);
         assert_eq!(shape, GQAReplayShape::new(9, 12, 3, 4, 3, 4, true));
+        assert_eq!(
+            metadata.visible_kv_token_ranges().read_typed::<u32>(18, 2),
+            [0x9494_9494_u32; 2]
+        );
         assert_eq!(metadata.q_token_ranges().read_typed::<u32>(6, 2), [0xA5A5_A5A5_u32; 2]);
         assert_eq!(
             metadata.sdpa_map_task_templates().read_typed::<u32>(9, 3),

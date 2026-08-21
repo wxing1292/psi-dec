@@ -213,6 +213,10 @@ impl Shape {
             "GQA SplitKV TiledQ Q-token-range metadata",
         );
         assert_u32_index_domain(
+            self.num_visible_kv_token_range_values(),
+            "GQA SplitKV TiledQ visible K/V-token-range metadata",
+        );
+        assert_u32_index_domain(
             self.num_sdpa_map_task_template_values(),
             "GQA SplitKV TiledQ map TaskTemplate metadata",
         );
@@ -222,6 +226,13 @@ impl Shape {
         checked_product(
             "GQA SplitKV TiledQ Q-token-range metadata element count",
             &[self.num_total_q_token_tiles as usize, 2],
+        )
+    }
+
+    fn num_visible_kv_token_range_values(self) -> usize {
+        checked_product(
+            "GQA SplitKV TiledQ visible K/V-token-range metadata element count",
+            &[self.num_total_tokens as usize, 2],
         )
     }
 
@@ -250,7 +261,8 @@ pub struct MapBuffers<'a> {
     pub kv_pages: &'a Buffer,
     pub req_slots: &'a Buffer,
     pub page_ids: &'a Buffer,
-    pub flat_token_indices: &'a Buffer,
+    /// Per-flat-Q-token half-open request-local visible K/V ranges.
+    pub visible_kv_token_ranges: &'a Buffer,
     pub q_token_ranges: &'a Buffer,
     pub sdpa_map_task_templates: &'a Buffer,
     pub partial_output: &'a Buffer,
@@ -350,7 +362,10 @@ impl Operator for MapInvocation<'_> {
         assert!(self.buffers.kv_pages.len_bytes() >= config.page_bytes as usize);
         assert!(self.buffers.req_slots.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
         assert!(self.buffers.page_ids.len_bytes() >= config.page_table_layout.bytes());
-        assert!(self.buffers.flat_token_indices.len_bytes() >= shape.num_total_tokens as usize * size_of::<u32>());
+        assert!(
+            self.buffers.visible_kv_token_ranges.len_bytes()
+                >= shape.num_visible_kv_token_range_values() * size_of::<u32>()
+        );
         assert!(self.buffers.q_token_ranges.len_bytes() >= shape.num_q_token_range_values() * size_of::<u32>());
         assert!(
             self.buffers.sdpa_map_task_templates.len_bytes()
@@ -364,7 +379,7 @@ impl Operator for MapInvocation<'_> {
         recorder.set_buffer_read(1, self.buffers.kv_pages, 0);
         recorder.set_buffer_read(2, self.buffers.req_slots, 0);
         recorder.set_buffer_read(3, self.buffers.page_ids, 0);
-        recorder.set_buffer_read(4, self.buffers.flat_token_indices, 0);
+        recorder.set_buffer_read(4, self.buffers.visible_kv_token_ranges, 0);
         recorder.set_buffer_read(5, self.buffers.q_token_ranges, 0);
         recorder.set_buffer_read(6, self.buffers.sdpa_map_task_templates, 0);
         recorder.set_buffer_write(7, self.buffers.partial_output, 0);
