@@ -153,7 +153,7 @@ StaticConfig
 
 DynamicWorkload + legal ExecutionVariants
     -> Selector::select(...)
-    -> Selection
+    -> selected execution
     -> metadata, KernelArguments, and KernelExecutionConfiguration
 ```
 

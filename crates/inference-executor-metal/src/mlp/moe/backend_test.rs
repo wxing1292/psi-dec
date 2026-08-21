@@ -18,17 +18,16 @@ fn test_selector_returns_registered_variant_at_crossover() {
     let device = Device::system_default();
     let (core, _) = routing_test_config(true);
     let registry = Registry::new(&device, &core);
-    let selector = Selector;
     assert_eq!(
-        selector.select(&registry, GatedMoEReplayShape { num_tokens: 1 }).0,
+        Selector::select(&registry, GatedMoEReplayShape { num_tokens: 1 }).0,
         VariantKey::TokenMajor
     );
     assert_eq!(
-        selector.select(&registry, GatedMoEReplayShape { num_tokens: 4 }).0,
+        Selector::select(&registry, GatedMoEReplayShape { num_tokens: 4 }).0,
         VariantKey::TokenMajor
     );
     assert_eq!(
-        selector.select(&registry, GatedMoEReplayShape { num_tokens: 5 }).0,
+        Selector::select(&registry, GatedMoEReplayShape { num_tokens: 5 }).0,
         VariantKey::ExpertMajor
     );
 }

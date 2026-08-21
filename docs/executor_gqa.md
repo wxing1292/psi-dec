@@ -49,11 +49,12 @@ crates/inference-executor-metal/src/model/qwen/
     main/gqa.rs             Qwen3 Main ungated GQA weights, state, load, and record
     main/gqa/file_io.rs     Qwen3 Main GQA full and selected state file I/O
     main/layer.rs           fixed QKV Qwen3MainLayer composition
-    main/plan.rs            Qwen3 Main QKV GQA geometry/config builder
+    main/component_config.rs
+                            Qwen3 Main QKV GQA geometry/config builder
   v3_5/
     main/layer.rs           Qwen3.5 Main QGKV-GQA/GDN layer variants
     mtp/layer.rs            Qwen3.5 MTP GQA layer composition
-    plan.rs                 Qwen3.5 QGKV GQA geometry/config builder
+    component_config.rs     Qwen3.5 QGKV GQA geometry/config builder
 
 crates/inference-backend-metal/src/components/
   gqa/

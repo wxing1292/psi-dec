@@ -110,9 +110,8 @@ fn test_compute_constants_defines_each_kernel_thread_block() {
 fn test_selector_returns_registered_recurrent_variant() {
     let device = Device::system_default();
     let registry = Registry::new(&device, fixture_config());
-    let selector = Selector;
 
-    let (key, variant) = selector.select(
+    let (key, variant) = Selector::select(
         &registry,
         Shape {
             num_total_reqs: 2,

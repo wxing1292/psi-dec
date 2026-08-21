@@ -11,7 +11,7 @@ This document gives repository-wide engineering conventions:
 
 [`high_level.md`](high_level.md) defines architecture and ownership boundaries. Each component document defines its
 tensor terms, source owners, and execution paths. [`gpu_execution.md`](gpu_execution.md) defines the shared GPU launch,
-specialization, task, tile, layout, and planner vocabulary.
+specialization, task, tile, layout, registry, and selection vocabulary.
 
 ## Design decision order
 

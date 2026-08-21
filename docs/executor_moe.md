@@ -28,7 +28,8 @@ crates/inference-executor-metal/src/model/qwen/
   v3_x/layer/moe.rs  Qwen3xMoE, private checkpoint weights, load, and record
   v3_5/main/layer.rs Qwen3.5 Main dense-MLP/MoE layer variants
   v3_5/mtp/layer.rs  Qwen3.5 MTP dense-MLP/MoE layer variants
-  v3_5/plan.rs       Qwen3.5 MoE geometry/config builder
+  v3_5/component_config.rs
+                      Qwen3.5 MoE geometry/config builder
 
 crates/inference-executor-core/src/def/
   DenseLinearShape
@@ -405,7 +406,8 @@ The shared geometry requires the same hidden dimension, expert count, selected e
 intermediate dimension, and optional shared-expert intermediate dimension.
 A zero shared-expert intermediate dimension means that the branch is absent.
 Both models must have the same shared-expert presence, and a present branch must have the same dimension.
-The executor provides one maximum token capacity and the current Qwen3.5 plan fixes the scratch dtype to BF16.
+The executor provides one maximum token capacity. The current Qwen3.5 component config fixes the scratch dtype to
+BF16.
 `norm_topk_prob` changes routing semantics but does not change scratch geometry.
 If only Main or only MTP uses MoE, the scratch derives from that one consumer.
 

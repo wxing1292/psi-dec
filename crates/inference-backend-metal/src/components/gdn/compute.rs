@@ -476,11 +476,10 @@ impl Registry {
     }
 }
 
-#[derive(Default)]
 struct Selector;
 
 impl Selector {
-    fn select<'a>(&self, registry: &'a Registry, shape: Shape) -> (VariantKey, &'a Variant) {
+    fn select(registry: &Registry, shape: Shape) -> (VariantKey, &Variant) {
         shape.validate();
         let (key, variant) = registry
             .entries
@@ -492,14 +491,12 @@ impl Selector {
 
 pub struct Compute {
     registry: Registry,
-    selector: Selector,
 }
 
 impl Compute {
     pub fn new(device: &Device, config: Config) -> Self {
         Self {
             registry: Registry::new(device, config),
-            selector: Selector,
         }
     }
 
@@ -568,7 +565,7 @@ impl Compute {
     }
 
     fn select(&self, shape: Shape) -> (VariantKey, &Variant) {
-        self.selector.select(&self.registry, shape)
+        Selector::select(&self.registry, shape)
     }
 }
 

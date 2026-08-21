@@ -22,10 +22,11 @@ crates/inference-executor-metal/src/mlp/dense/
 crates/inference-executor-metal/src/model/qwen/
   v3_x/layer/dense_mlp.rs  Qwen3xDenseMLP, private checkpoint weights, load, and record
   v3/main/layer.rs         fixed Qwen3 Main GQA + dense-MLP layer composition
-  v3/main/plan.rs          Qwen3 Main dense-MLP geometry/config builder
+  v3/main/component_config.rs
+                           Qwen3 Main dense-MLP geometry/config builder
   v3_5/main/layer.rs       Qwen3.5 Main dense-MLP/MoE layer variants
   v3_5/mtp/layer.rs        Qwen3.5 MTP dense-MLP/MoE layer variants
-  v3_5/plan.rs             Qwen3.5 dense-MLP geometry/config builder
+  v3_5/component_config.rs Qwen3.5 dense-MLP geometry/config builder
 
 crates/inference-executor-core/src/def/
   DenseLinearShape

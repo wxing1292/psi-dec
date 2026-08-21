@@ -36,7 +36,7 @@ crates/inference-executor-metal/src/model/qwen/
     state/gdn/file_io.rs    Qwen3xGDNState full and selected state file I/O
   v3_5/
     main/layer.rs           Qwen3.5 QGKV-GQA/GDN layer variants
-    plan.rs                 Qwen3.5 GDN geometry/config builder
+    component_config.rs     Qwen3.5 GDN geometry/config builder
 
 crates/inference-backend-metal/src/components/
   gdn/

@@ -175,7 +175,6 @@ pub struct GatedMoEBucketedInput<'a> {
 pub struct GatedMoE {
     core: GatedMoECore,
     registry: Registry,
-    selector: Selector,
     router: AffineQuantizedMatmul,
     router_softmax: SoftmaxKernel,
     routing: routing::Compute,
@@ -238,11 +237,10 @@ impl Registry {
     }
 }
 
-#[derive(Default)]
 struct Selector;
 
 impl Selector {
-    fn select<'a>(&self, registry: &'a Registry, shape: GatedMoEReplayShape) -> (VariantKey, &'a Variant) {
+    fn select(registry: &Registry, shape: GatedMoEReplayShape) -> (VariantKey, &Variant) {
         shape.validate();
         let key = if shape.num_tokens <= TOKEN_MAJOR_MAX_TOKENS {
             VariantKey::TokenMajor
@@ -280,7 +278,6 @@ impl GatedMoE {
         let registry = Registry::new(device, &core);
         Self {
             registry,
-            selector: Selector,
             router: AffineQuantizedMatmul::new(
                 device,
                 affine_config_with_bits(router_shape.out_dim, router_shape.in_dim, config.router_bits, config),
@@ -340,7 +337,7 @@ impl GatedMoE {
             num_tokens: num_total_tokens,
         };
         shape.validate();
-        let (variant_key, _) = self.selector.select(&self.registry, shape);
+        let (variant_key, _) = Selector::select(&self.registry, shape);
         GatedMoEReplayTopology {
             variant_key,
             router_affine: self.router.topology(num_total_tokens),
@@ -425,7 +422,7 @@ impl GatedMoE {
             num_tokens: input.num_total_tokens,
         };
         let next_hidden_state = input.next_hidden_state;
-        let (_, variant) = self.selector.select(&self.registry, shape);
+        let (_, variant) = Selector::select(&self.registry, shape);
         match variant {
             Variant::TokenMajor { combine } => self.record_token_major_bucketed(combine, recorder, input),
             Variant::ExpertMajor { expert_major } => {
@@ -967,7 +964,7 @@ impl ReplayLayer for GatedMoE {
         self.validate_input(&input);
         let shape = input.shape;
         let next_hidden_state = input.next_hidden_state;
-        let (_, variant) = self.selector.select(&self.registry, shape);
+        let (_, variant) = Selector::select(&self.registry, shape);
         match variant {
             Variant::TokenMajor { combine } => {
                 self.record_token_major_replay(combine, recorder, input);
