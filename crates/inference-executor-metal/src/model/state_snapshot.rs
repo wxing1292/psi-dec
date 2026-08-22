@@ -56,6 +56,7 @@ pub enum StateSnapshotFile {
     MainGDNConvState,
     MTPGQARequestPageTable,
     DSparkGQARequestPageTable,
+    DFlash2GQARequestPageTable,
 }
 
 impl StateSnapshotFile {
@@ -68,6 +69,7 @@ impl StateSnapshotFile {
             Self::MainGDNConvState => "main-gdn-conv-state",
             Self::MTPGQARequestPageTable => "mtp-gqa-request-page-table",
             Self::DSparkGQARequestPageTable => "dspark-gqa-request-page-table",
+            Self::DFlash2GQARequestPageTable => "dflash2-gqa-request-page-table",
         }
     }
 
@@ -79,7 +81,8 @@ impl StateSnapshotFile {
             | Self::MainGDNRecurrentState
             | Self::MainGDNConvState
             | Self::MTPGQARequestPageTable
-            | Self::DSparkGQARequestPageTable => StateSnapshotFileKind::Buffer,
+            | Self::DSparkGQARequestPageTable
+            | Self::DFlash2GQARequestPageTable => StateSnapshotFileKind::Buffer,
         }
     }
 }

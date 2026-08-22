@@ -34,6 +34,7 @@ impl GQAStateSnapshotFiles {
             StateSnapshotFile::MainGQARequestPageTable
                 | StateSnapshotFile::MTPGQARequestPageTable
                 | StateSnapshotFile::DSparkGQARequestPageTable
+                | StateSnapshotFile::DFlash2GQARequestPageTable
         ));
         Self { request_page_table }
     }

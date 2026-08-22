@@ -16,6 +16,9 @@ use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_core::model::qwen::v3_5::weight_layout::Qwen35MTPWeightBindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_model_weight_bindings;
 use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_mtp_weight_bindings;
+use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
+use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2MainConfig;
+use inference_executor_core::model::qwen::v3_x::dflash2::init_qwen3x_dflash2_config;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
@@ -40,6 +43,7 @@ use crate::model::qwen::v3_5::component_config::derive_qwen35_gqa_configs;
 use crate::model::qwen::v3_5::component_config::derive_qwen35_moe_configs;
 use crate::model::qwen::v3_5::component_config::qwen35_layer_counts;
 use crate::model::qwen::v3_5::component_config::validate_qwen35_mtp_config;
+use crate::model::qwen::v3_5::executor::Qwen35DFlash2Speculator;
 use crate::model::qwen::v3_5::executor::Qwen35DSparkSpeculator;
 use crate::model::qwen::v3_5::executor::Qwen35Executor;
 use crate::model::qwen::v3_5::executor::Qwen35MTPExecution;
@@ -55,6 +59,10 @@ use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembed;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
+use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2Execution;
+use crate::model::qwen::v3_x::dflash2::load::Qwen3xDFlash2LoadConfig;
+use crate::model::qwen::v3_x::dflash2::load::Qwen3xDFlash2Loaded;
+use crate::model::qwen::v3_x::dflash2::load::load_qwen3x_dflash2;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
@@ -238,6 +246,11 @@ enum Qwen35InitMode<'a> {
         config: Box<Qwen3xDSparkConfig>,
         num_spec_tokens: NonZeroUsize,
     },
+    DFlash2 {
+        model_dir: &'a Path,
+        config: Box<Qwen3xDFlash2Config>,
+        num_spec_tokens: NonZeroUsize,
+    },
 }
 
 struct Qwen35MTPLoad {
@@ -257,6 +270,11 @@ enum Qwen35SpecSource<'a> {
         config: Box<Qwen3xDSparkConfig>,
         num_spec_tokens: NonZeroUsize,
     },
+    DFlash2 {
+        model_dir: &'a Path,
+        config: Box<Qwen3xDFlash2Config>,
+        num_spec_tokens: NonZeroUsize,
+    },
 }
 
 #[allow(clippy::upper_case_acronyms)]
@@ -264,6 +282,7 @@ enum Qwen35SpecLoad {
     Vanilla,
     MTP(Box<Qwen35MTPLoad>),
     DSpark(Box<Qwen3xDSparkLoaded>),
+    DFlash2(Box<Qwen3xDFlash2Loaded>),
 }
 
 fn qwen35_gdn_state_capacity(
@@ -275,6 +294,7 @@ fn qwen35_gdn_state_capacity(
         Qwen35SpecSource::Vanilla => 0,
         Qwen35SpecSource::MTP(mtp) => mtp.num_spec_tokens.get(),
         Qwen35SpecSource::DSpark { num_spec_tokens, .. } => num_spec_tokens.get(),
+        Qwen35SpecSource::DFlash2 { num_spec_tokens, .. } => num_spec_tokens.get(),
     };
     qwen35_gdn_state_capacity_for_num_spec_tokens(num_spec_tokens, max_tokens_per_request, num_tokens_per_block)
 }
@@ -356,6 +376,26 @@ pub fn init_qwen_3_5_model_with_dspark(
     )
 }
 
+pub fn init_qwen_3_5_model_with_dflash2(
+    model_dir: impl AsRef<Path>,
+    dflash2_model_dir: impl AsRef<Path>,
+    requested_num_spec_tokens: Option<NonZeroUsize>,
+    config: Qwen35ExecutorConfig,
+) -> Result<Qwen35Executor, ModelExecutorError> {
+    let dflash2_model_dir = dflash2_model_dir.as_ref();
+    let dflash2_config = init_qwen3x_dflash2_config(dflash2_model_dir)?;
+    let num_spec_tokens = dflash2_config.resolve_num_spec_tokens(requested_num_spec_tokens)?;
+    init_qwen_3_5_model_inner(
+        model_dir.as_ref(),
+        Qwen35InitMode::DFlash2 {
+            model_dir: dflash2_model_dir,
+            config: Box::new(dflash2_config),
+            num_spec_tokens,
+        },
+        config,
+    )
+}
+
 fn init_qwen_3_5_model_inner(
     model_dir: &Path,
     init_mode: Qwen35InitMode<'_>,
@@ -376,6 +416,12 @@ fn init_qwen_3_5_model_inner(
                 config: config.clone(),
             }
         },
+        Qwen35InitMode::DFlash2 { model_dir, config, .. } => {
+            Qwen35WeightSource::DFlash2 {
+                model_dir: model_dir.to_path_buf(),
+                config: config.clone(),
+            }
+        },
     };
     if let Qwen35InitMode::MTP { num_spec_tokens, .. } = &init_mode {
         assert!(
@@ -392,6 +438,18 @@ fn init_qwen_3_5_model_inner(
         } => {
             let text = &model_config.text_config;
             dspark_config.validate_main(Qwen3xDSparkMainConfig {
+                hidden_size: text.hidden_size,
+                num_hidden_layers: text.num_hidden_layers,
+                vocab_size: text.vocab_size,
+                max_position_embeddings: text.max_position_embeddings,
+                rope_theta: text.rope_theta,
+            })?;
+        },
+        Qwen35InitMode::DFlash2 {
+            config: dflash2_config, ..
+        } => {
+            let text = &model_config.text_config;
+            dflash2_config.validate_main(Qwen3xDFlash2MainConfig {
                 hidden_size: text.hidden_size,
                 num_hidden_layers: text.num_hidden_layers,
                 vocab_size: text.vocab_size,
@@ -528,6 +586,17 @@ fn init_qwen_3_5_model_inner(
                 num_spec_tokens,
             }
         },
+        Qwen35InitMode::DFlash2 {
+            model_dir: dflash2_model_dir,
+            config: dflash2_config,
+            num_spec_tokens,
+        } => {
+            Qwen35SpecSource::DFlash2 {
+                model_dir: dflash2_model_dir,
+                config: dflash2_config,
+                num_spec_tokens,
+            }
+        },
     };
     let gdn_layers = (0..model_config.text_config.num_hidden_layers)
         .filter(|&index| {
@@ -547,6 +616,7 @@ fn init_qwen_3_5_model_inner(
         Qwen35SpecSource::Vanilla => 0,
         Qwen35SpecSource::MTP(mtp) => mtp.num_spec_tokens.get(),
         Qwen35SpecSource::DSpark { num_spec_tokens, .. } => num_spec_tokens.get(),
+        Qwen35SpecSource::DFlash2 { num_spec_tokens, .. } => num_spec_tokens.get(),
     };
     let main_gdn_state = Qwen3xGDNState::new(
         &device,
@@ -574,7 +644,7 @@ fn init_qwen_3_5_model_inner(
             .map(|index| (&model_config, index))
             .or(match &spec_source {
                 Qwen35SpecSource::MTP(mtp) => Some((&mtp.config, 0)),
-                Qwen35SpecSource::Vanilla | Qwen35SpecSource::DSpark { .. } => None,
+                Qwen35SpecSource::Vanilla | Qwen35SpecSource::DSpark { .. } | Qwen35SpecSource::DFlash2 { .. } => None,
             })
             .expect("qwen3.5 dense scratch requires a dense layer");
         let defaults = Qwen35MetalDefaults::from_quantization(source.0.quantization.as_ref())?;
@@ -598,7 +668,7 @@ fn init_qwen_3_5_model_inner(
             .map(|index| (&model_config, index))
             .or(match &spec_source {
                 Qwen35SpecSource::MTP(mtp) => Some((&mtp.config, 0)),
-                Qwen35SpecSource::Vanilla | Qwen35SpecSource::DSpark { .. } => None,
+                Qwen35SpecSource::Vanilla | Qwen35SpecSource::DSpark { .. } | Qwen35SpecSource::DFlash2 { .. } => None,
             })
             .expect("qwen3.5 MoE scratch requires an MoE layer");
         let defaults = Qwen35MetalDefaults::from_quantization(source.0.quantization.as_ref())?;
@@ -660,10 +730,37 @@ fn init_qwen_3_5_model_inner(
                 sampler_bounds,
             )?))
         },
+        Qwen35SpecSource::DFlash2 {
+            model_dir: dflash2_model_dir,
+            config: dflash2_config,
+            num_spec_tokens,
+        } => {
+            Qwen35SpecLoad::DFlash2(Box::new(load_qwen3x_dflash2(
+                &device,
+                dflash2_model_dir,
+                &dflash2_config,
+                Qwen3xDFlash2LoadConfig {
+                    num_spec_tokens,
+                    page_size_bytes: QWEN35_PAGE_SIZE_BYTES,
+                    max_position_embeddings: model_config.text_config.max_position_embeddings,
+                    max_requests: config.max_requests,
+                    max_tokens: config.max_tokens,
+                    num_cache_pages: config.num_cache_pages,
+                    num_tokens_per_block: config.num_tokens_per_block,
+                },
+                Rc::clone(&embed),
+                gather_unembed.unembed(),
+                sampler_bounds,
+            )?))
+        },
     };
     let residual_capture = match &spec_load {
         Qwen35SpecLoad::Vanilla | Qwen35SpecLoad::MTP(_) => None,
         Qwen35SpecLoad::DSpark(loaded) => {
+            let capture: Rc<dyn MainResidualCapture> = loaded.model.main_feature_projector();
+            Some(capture)
+        },
+        Qwen35SpecLoad::DFlash2(loaded) => {
             let capture: Rc<dyn MainResidualCapture> = loaded.model.main_feature_projector();
             Some(capture)
         },
@@ -765,16 +862,23 @@ fn init_qwen_3_5_model_inner(
                 execution: Qwen3xDSparkExecution::new(&device, *loaded, config.max_requests, unembed_config),
             }))
         },
+        Qwen35SpecLoad::DFlash2(loaded) => {
+            Qwen35Speculator::DFlash2(Box::new(Qwen35DFlash2Speculator {
+                common: speculative_resources(),
+                execution: Qwen3xDFlash2Execution::new(&device, *loaded),
+            }))
+        },
     };
     let num_main_gqa_page_ids_per_block = (gqa_page_table_layout.num_gqa_layers as usize)
         .checked_mul(gqa_page_table_layout.num_page_ids_per_block as usize)
         .expect("qwen3.5 Main page IDs per block must fit usize");
-    let num_dspark_gqa_page_ids_per_block = match &speculator {
+    let num_speculator_gqa_page_ids_per_block = match &speculator {
         Qwen35Speculator::Vanilla | Qwen35Speculator::MTP(_) => 0,
         Qwen35Speculator::DSpark(dspark) => dspark.execution.num_gqa_page_ids_per_block(),
+        Qwen35Speculator::DFlash2(dflash2) => dflash2.execution.num_gqa_page_ids_per_block(),
     };
     let num_gqa_page_ids_per_main_lane_block = num_main_gqa_page_ids_per_block
-        .checked_add(num_dspark_gqa_page_ids_per_block)
+        .checked_add(num_speculator_gqa_page_ids_per_block)
         .expect("qwen3.5 Main cache-lane page IDs per block must fit usize");
     let pages = PageArena::new(&device, config.num_cache_pages, QWEN35_PAGE_SIZE_BYTES);
     let model = Qwen35Executor {

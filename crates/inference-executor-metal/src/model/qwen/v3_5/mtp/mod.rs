@@ -1,8 +1,8 @@
 //! Qwen3.5 MTP combined Spec invocation.
 //!
-//! MTP consumes the Main final hidden state. It does not use the DSpark selected-residual capture or the independent
-//! Spec Prefill and Decode lifecycle. One outer invocation performs sequential proposal steps because each sampled
-//! draft token is an input to the next step.
+//! MTP consumes the Main final hidden state. It does not use the DSpark or DFlash2 selected-residual capture or the
+//! independent Spec Prefill and Decode lifecycle. One outer invocation performs sequential proposal steps because
+//! each sampled draft token is an input to the next step.
 //!
 //! ```text
 //! Main final hidden + Main decision

@@ -64,6 +64,16 @@ impl Qwen35Executor {
                 num_dspark_pages,
                 dspark_page_capacity
             );
+        } else if self.speculator.is_dflash2() {
+            let dflash2 = &self.speculator.dflash2().execution;
+            let num_dflash2_pages = max_context_tokens.div_ceil(dflash2.num_tokens_per_page());
+            let dflash2_page_capacity = dflash2.num_physical_pages_per_request();
+            assert!(
+                num_dflash2_pages <= dflash2_page_capacity,
+                "qwen3.5 DFlash2 request context needs {} physical pages but capacity is {}",
+                num_dflash2_pages,
+                dflash2_page_capacity
+            );
         }
     }
 
@@ -112,7 +122,7 @@ impl Qwen35Executor {
 
     pub fn num_mtp_gqa_page_ids_per_block(&self) -> Vec<usize> {
         match &self.speculator {
-            Qwen35Speculator::Vanilla | Qwen35Speculator::DSpark(_) => Vec::new(),
+            Qwen35Speculator::Vanilla | Qwen35Speculator::DSpark(_) | Qwen35Speculator::DFlash2(_) => Vec::new(),
             Qwen35Speculator::MTP(mtp) => {
                 let layout = mtp.gqa_state.request_page_table().layout();
                 vec![layout.num_page_ids_per_block as usize; mtp.num_spec_tokens]
