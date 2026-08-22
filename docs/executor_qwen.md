@@ -18,6 +18,9 @@ crates/inference-executor-core/src/model/qwen/v3/
 crates/inference-executor-core/src/model/qwen/v3_x/
   config.rs                 shared quantization, RoPE, and tensor-path value utilities
   weight_layout.rs          shared GQA/GDN/dense-MLP/MoE leaf binding types and helpers
+  dflash2/
+    config.rs               official DFlash2 schema adapter and canonical configuration contract
+    weight_layout.rs        exact source and affine DFlash2 binding trees
   dspark/
     config.rs               official Qwen3 DSpark configuration contract
     weight_layout.rs        exact source and affine DSpark binding trees
@@ -124,7 +127,8 @@ Qwen3 and Qwen3.5 each own these model-level objects:
 
 Structural APIs stay in their model directories.
 
-`qwen/v3_x` contains shared leaf components, values, and the reusable Qwen3x DSpark model.
+`qwen/v3_x` contains shared leaf components, values, the reusable Qwen3x DSpark model, and DFlash2 checkpoint
+contracts.
 These leaves include quantization, RoPE, tensor-path values, weight bindings, checkpoint helpers, and GQA/GDN state
 owners.
 They also include `Qwen3xGQA`, `Qwen3xGDN`, `Qwen3xDenseMLP`, and `Qwen3xMoE`.
@@ -254,6 +258,12 @@ The checkpoint boundary uses an architecture adapter table to convert supported 
 deserialization.
 It validates Main compatibility, `target_layer_ids`, fixed-block geometry, ungated GQA, default or Yarn RoPE, and the
 `vanilla` Markov head.
+`Qwen3xDFlash2Config` independently adapts `DFlash2DraftModel` configuration to the repository's flat canonical
+schema.
+It validates Main compatibility, sliding-window attention, query-block geometry, dynamic-convolution geometry, and
+candidate-selector geometry.
+`Qwen3xDFlash2WeightBindings` requires the exact published source manifest or the exact affine manifest.
+It does not add optional embedding or unembedding tensors because DFlash2 reuses the Main owners.
 `Qwen35ModelConfig` independently parses and normalizes the Qwen3.5/Qwen3.6/Qwen3.8 schema.
 That schema includes layer-kind, MoE, MTP, and partial-RoPE fields.
 `Qwen3ExecutorConfig` and `Qwen35ExecutorConfig` keep runtime capacities model-specific.
