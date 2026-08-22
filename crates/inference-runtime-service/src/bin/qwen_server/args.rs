@@ -21,13 +21,6 @@ pub struct Qwen3Args {
     #[arg(long, value_name = "DIR", help = "Optional official Qwen3 DSpark model directory")]
     pub hf_dspark_model_dir: Option<PathBuf>,
 
-    #[arg(
-        long,
-        help = "Number of speculative tokens per DSpark proposal; defaults to the checkpoint block_size and must not \
-                exceed it"
-    )]
-    pub num_spec_tokens: Option<NonZeroUsize>,
-
     #[arg(long, value_enum)]
     pub profile: Option<QwenProfileMode>,
 
@@ -99,6 +92,13 @@ pub struct Qwen35Args {
     )]
     pub hf_dspark_model_dir: Option<PathBuf>,
 
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Optional matching Qwen3x DFlash2 checkpoint directory"
+    )]
+    pub hf_dflash2_model_dir: Option<PathBuf>,
+
     #[arg(long, value_enum)]
     pub profile: Option<QwenProfileMode>,
 
@@ -122,8 +122,7 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        help = "Number of speculative tokens per proposal; defaults to 1 for MTP or the checkpoint block_size for \
-                DSpark; a DSpark value must not exceed that block_size"
+        help = "Number of speculative tokens per MTP proposal; defaults to 1 and requires --hf-mtp-model-dir"
     )]
     pub num_spec_tokens: Option<NonZeroUsize>,
 
@@ -195,7 +194,6 @@ mod tests {
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages.get(), 384 * 1024);
         assert_eq!(args.hf_dspark_model_dir, None);
-        assert_eq!(args.num_spec_tokens, None);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
         assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }
@@ -219,94 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen3_accepts_dspark_checkpoint() {
-        let args =
-            Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", "--hf-dspark-model-dir", "dspark"]).unwrap();
-
-        assert_eq!(args.hf_dspark_model_dir, Some("dspark".into()));
-    }
-
-    #[test]
-    fn test_qwen35_accepts_dspark_checkpoint() {
-        let args =
-            Qwen35Args::try_parse_from(["qwen3.5", "--hf-model-dir", "model", "--hf-dspark-model-dir", "dspark"])
-                .unwrap();
-
-        assert_eq!(args.hf_dspark_model_dir, Some("dspark".into()));
-    }
-
-    #[test]
-    fn test_spec_token_flag_is_shared_by_mtp_and_dspark() {
-        let qwen3_dspark = Qwen3Args::try_parse_from([
-            "qwen3",
-            "--hf-model-dir",
-            "model",
-            "--hf-dspark-model-dir",
-            "dspark",
-            "--num-spec-tokens",
-            "3",
-        ])
-        .unwrap();
-        let qwen35_mtp = Qwen35Args::try_parse_from([
-            "qwen3.5",
-            "--hf-model-dir",
-            "model",
-            "--hf-mtp-model-dir",
-            "mtp",
-            "--num-spec-tokens",
-            "3",
-        ])
-        .unwrap();
-        let qwen35_dspark = Qwen35Args::try_parse_from([
-            "qwen3.5",
-            "--hf-model-dir",
-            "model",
-            "--hf-dspark-model-dir",
-            "dspark",
-            "--num-spec-tokens",
-            "3",
-        ])
-        .unwrap();
-
-        assert_eq!(qwen3_dspark.num_spec_tokens.unwrap().get(), 3);
-        assert_eq!(qwen35_mtp.num_spec_tokens.unwrap().get(), 3);
-        assert_eq!(qwen35_dspark.num_spec_tokens.unwrap().get(), 3);
-    }
-
-    #[test]
-    fn test_qwen35_mtp_and_dspark_commands_share_common_capacity_args() {
-        let common = [
-            "--hf-model-dir",
-            "main",
-            "--max-requests",
-            "3",
-            "--max-tokens",
-            "96",
-            "--max-tokens-per-request",
-            "48",
-        ];
-        let mut mtp_argv = vec!["qwen3.5"];
-        mtp_argv.extend(common);
-        mtp_argv.extend(["--hf-mtp-model-dir", "mtp"]);
-        let mut dspark_argv = vec!["qwen3.5"];
-        dspark_argv.extend(common);
-        dspark_argv.extend(["--hf-dspark-model-dir", "dspark"]);
-
-        let mtp = Qwen35Args::try_parse_from(mtp_argv).unwrap();
-        let dspark = Qwen35Args::try_parse_from(dspark_argv).unwrap();
-
-        assert_eq!(mtp.max_requests, dspark.max_requests);
-        assert_eq!(mtp.max_tokens, dspark.max_tokens);
-        assert_eq!(mtp.max_tokens_per_request, dspark.max_tokens_per_request);
-        assert_eq!(mtp.hf_mtp_model_dir, Some("mtp".into()));
-        assert_eq!(mtp.hf_dspark_model_dir, None);
-        assert_eq!(dspark.hf_mtp_model_dir, None);
-        assert_eq!(dspark.hf_dspark_model_dir, Some("dspark".into()));
-        assert_eq!(mtp.num_spec_tokens, None);
-        assert_eq!(dspark.num_spec_tokens, None);
-    }
-
-    #[test]
     fn test_positive_capacities_reject_zero() {
         for flag in [
             "--executor-hibernation-timeout-secs",
@@ -324,7 +234,6 @@ mod tests {
                 "{flag} must reject zero for Qwen3"
             );
         }
-        assert!(Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", "--num-spec-tokens", "0"]).is_err());
         assert!(Qwen35Args::try_parse_from(["qwen3.5", "--hf-model-dir", "model", "--num-spec-tokens", "0"]).is_err());
     }
 }

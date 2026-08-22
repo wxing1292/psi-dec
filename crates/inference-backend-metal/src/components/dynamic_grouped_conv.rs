@@ -30,7 +30,7 @@ impl Config {
         assert!(self.kernel_size > 0);
         assert!(self.hidden_dim.is_multiple_of(self.group_size));
         assert_eq!(self.io_dtype, Dtype::Bfloat16);
-        assert_eq!(self.base_dtype, Dtype::Float32);
+        assert_eq!(self.base_dtype, Dtype::Bfloat16);
         let _ = self.num_groups();
         let _ = self.projection_dim();
         let _ = self.base_bytes();
@@ -151,7 +151,7 @@ impl Compute {
         config.validate();
         Self {
             config,
-            kernel: CompiledKernel::new(device, SOURCE, "dynamic_grouped_conv_bf16_f32"),
+            kernel: CompiledKernel::new(device, SOURCE, "dynamic_grouped_conv_bf16"),
         }
     }
 
@@ -262,7 +262,7 @@ mod tests {
             group_size: 4,
             kernel_size: 3,
             io_dtype: Dtype::Bfloat16,
-            base_dtype: Dtype::Float32,
+            base_dtype: Dtype::Bfloat16,
         };
         let shape = Shape {
             num_total_query_blocks: 3,
@@ -276,7 +276,7 @@ mod tests {
             .map(|index| bf16::from_f32((index as f32 % 13.0 - 6.0) / 23.0).to_bits())
             .collect::<Vec<_>>();
         let base = (0..2 * config.kernel_size as usize * config.hidden_dim as usize)
-            .map(|index| (index as f32 % 7.0 - 3.0) / 19.0)
+            .map(|index| bf16::from_f32((index as f32 % 7.0 - 3.0) / 19.0).to_bits())
             .collect::<Vec<_>>();
         let hidden_buffer = Buffer::from_slice(&device, &hidden);
         let coefficient_buffer = Buffer::from_slice(&device, &coefficients);
@@ -316,7 +316,7 @@ mod tests {
         side: Side,
         hidden: &[u16],
         coefficients: &[u16],
-        base: &[f32],
+        base: &[u16],
     ) -> Vec<u16> {
         let hidden_dim = config.hidden_dim as usize;
         let group_size = config.group_size as usize;
@@ -334,7 +334,8 @@ mod tests {
                         let source_token = token - tap;
                         let coefficient_index = (((token * 2 + side.index() as usize) * taps + tap) * groups) + group;
                         let base_index = (side.index() as usize * taps + tap) * hidden_dim + hidden_index;
-                        value += (base[base_index] + bf16::from_bits(coefficients[coefficient_index]).to_f32())
+                        value += (bf16::from_bits(base[base_index]).to_f32()
+                            + bf16::from_bits(coefficients[coefficient_index]).to_f32())
                             * bf16::from_bits(hidden[source_token * hidden_dim + hidden_index]).to_f32();
                     }
                     output[token * hidden_dim + hidden_index] = bf16::from_f32(value).to_bits();

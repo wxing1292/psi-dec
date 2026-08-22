@@ -43,24 +43,9 @@ pub struct Qwen3xDFlash2MainConfig {
 }
 
 impl Qwen3xDFlash2Config {
-    pub fn resolve_num_spec_tokens(&self, requested: Option<NonZeroUsize>) -> Result<NonZeroUsize, ModelExecutorError> {
-        let max_spec_tokens = self.block_size - 1;
-        let num_spec_tokens = requested.unwrap_or_else(|| {
-            NonZeroUsize::new(max_spec_tokens)
-                .expect("validated Qwen3x DFlash2 block_size must contain an anchor and proposal token")
-        });
-        if num_spec_tokens.get() > max_spec_tokens {
-            let query_rows = num_spec_tokens
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| ModelExecutorError::custom("requested DFlash2 query row count must fit usize"))?;
-            return Err(ModelExecutorError::custom(format!(
-                "requested num_spec_tokens={num_spec_tokens} requires {query_rows} DFlash2 query rows, but checkpoint \
-                 block_size={}",
-                self.block_size
-            )));
-        }
-        Ok(num_spec_tokens)
+    pub fn num_spec_tokens(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.block_size - 1)
+            .expect("validated Qwen3x DFlash2 block_size must contain an anchor and proposal token")
     }
 
     pub fn validate_main(&self, main: Qwen3xDFlash2MainConfig) -> Result<(), ModelExecutorError> {
@@ -578,7 +563,7 @@ mod tests {
         assert_eq!(config.selector_top_k, 16);
         assert_eq!(config.target_layer_ids, [5, 19, 33, 47, 61]);
         assert_eq!(config.sliding_window, 2048);
-        assert_eq!(config.resolve_num_spec_tokens(NonZeroUsize::new(2)).unwrap().get(), 2);
+        assert_eq!(config.num_spec_tokens().get(), 7);
     }
 
     #[test]

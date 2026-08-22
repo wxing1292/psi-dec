@@ -94,6 +94,13 @@ fn test_request_capacity_follows_max_requests() {
             "9",
         ]))
         .unwrap(),
+        Qwen35Config::from_args(parse_qwen35(&[
+            "--hf-dflash2-model-dir",
+            "dflash2-model",
+            "--max-requests",
+            "9",
+        ]))
+        .unwrap(),
     ];
     for config in qwen35_configs {
         assert_eq!(config.scheduler_config().max_requests, 9);
@@ -142,7 +149,6 @@ fn test_dspark_inputs_normalize_model_mode_and_cache_lanes() {
         qwen3.model_mode(),
         &Qwen3ModelMode::DSpark {
             model_dir: "qwen3-dspark".into(),
-            num_spec_tokens: None,
         }
     );
 
@@ -151,7 +157,18 @@ fn test_dspark_inputs_normalize_model_mode_and_cache_lanes() {
         qwen35.model_mode(),
         &Qwen35ModelMode::DSpark {
             model_dir: "qwen35-dspark".into(),
-            num_spec_tokens: None,
+        }
+    );
+    assert_eq!(qwen35.num_cache_lanes(), 1);
+}
+
+#[test]
+fn test_dflash2_inputs_normalize_model_mode_and_cache_lanes() {
+    let qwen35 = Qwen35Config::from_args(parse_qwen35(&["--hf-dflash2-model-dir", "qwen35-dflash2"])).unwrap();
+    assert_eq!(
+        qwen35.model_mode(),
+        &Qwen35ModelMode::DFlash2 {
+            model_dir: "qwen35-dflash2".into(),
         }
     );
     assert_eq!(qwen35.num_cache_lanes(), 1);
@@ -160,12 +177,8 @@ fn test_dspark_inputs_normalize_model_mode_and_cache_lanes() {
 #[test]
 fn test_spec_tokens_require_a_speculator() {
     assert!(matches!(
-        Qwen3Config::from_args(parse_qwen3(&["--num-spec-tokens", "1"])),
-        Err(Error::InvalidArgument(message)) if message.contains("--hf-dspark-model-dir")
-    ));
-    assert!(matches!(
         Qwen35Config::from_args(parse_qwen35(&["--num-spec-tokens", "1"])),
-        Err(Error::InvalidArgument(message)) if message.contains("--hf-mtp-model-dir or --hf-dspark-model-dir")
+        Err(Error::InvalidArgument(message)) if message.contains("requires --hf-mtp-model-dir")
     ));
 }
 
@@ -194,53 +207,45 @@ fn test_mtp_spec_tokens_fit_per_request_budget() {
 }
 
 #[test]
-fn test_dspark_spec_tokens_do_not_use_main_request_budget() {
-    let configured = Some(NonZeroUsize::new(7).unwrap());
-    let qwen3 = Qwen3Config::from_args(parse_qwen3(&[
-        "--hf-dspark-model-dir",
-        "qwen3-dspark",
-        "--num-spec-tokens",
-        "7",
-        "--max-tokens-per-request",
-        "2",
-    ]))
-    .unwrap();
-    let qwen35 = Qwen35Config::from_args(parse_qwen35(&[
-        "--hf-dspark-model-dir",
-        "qwen35-dspark",
-        "--num-spec-tokens",
-        "7",
-        "--max-tokens-per-request",
-        "2",
-    ]))
-    .unwrap();
-
-    assert_eq!(
-        qwen3.model_mode(),
-        &Qwen3ModelMode::DSpark {
-            model_dir: "qwen3-dspark".into(),
-            num_spec_tokens: configured,
-        }
-    );
-    assert_eq!(
-        qwen35.model_mode(),
-        &Qwen35ModelMode::DSpark {
-            model_dir: "qwen35-dspark".into(),
-            num_spec_tokens: configured,
-        }
-    );
-    assert_eq!(qwen35.num_cache_lanes(), 1);
+fn test_num_spec_tokens_rejects_checkpoint_defined_block_spec_modes() {
+    for checkpoint_flag in ["--hf-dspark-model-dir", "--hf-dflash2-model-dir"] {
+        assert!(matches!(
+            Qwen35Config::from_args(parse_qwen35(&[
+                checkpoint_flag,
+                "spec-model",
+                "--num-spec-tokens",
+                "7",
+            ])),
+            Err(Error::InvalidArgument(message)) if message.contains("controls MTP proposal length")
+        ));
+    }
 }
 
 #[test]
-fn test_qwen35_rejects_mtp_with_dspark() {
-    assert!(matches!(
-        Qwen35Config::from_args(parse_qwen35(&[
+fn test_qwen35_rejects_multiple_speculator_checkpoints() {
+    for conflicting_flags in [
+        [
             "--hf-mtp-model-dir",
             "mtp-model",
             "--hf-dspark-model-dir",
             "dspark-model",
-        ])),
-        Err(Error::InvalidArgument(message)) if message.contains("mutually exclusive")
-    ));
+        ],
+        [
+            "--hf-mtp-model-dir",
+            "mtp-model",
+            "--hf-dflash2-model-dir",
+            "dflash2-model",
+        ],
+        [
+            "--hf-dspark-model-dir",
+            "dspark-model",
+            "--hf-dflash2-model-dir",
+            "dflash2-model",
+        ],
+    ] {
+        assert!(matches!(
+            Qwen35Config::from_args(parse_qwen35(&conflicting_flags)),
+            Err(Error::InvalidArgument(message)) if message.contains("mutually exclusive")
+        ));
+    }
 }

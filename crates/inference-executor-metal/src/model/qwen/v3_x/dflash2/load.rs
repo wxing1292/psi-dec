@@ -1,4 +1,3 @@
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -22,7 +21,6 @@ use crate::model::unembedding::Unembed;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3xDFlash2LoadConfig {
-    pub num_spec_tokens: NonZeroUsize,
     pub page_size_bytes: usize,
     pub max_position_embeddings: usize,
     pub max_requests: usize,
@@ -41,6 +39,7 @@ pub struct Qwen3xDFlash2Loaded {
     pub mask_token_id: i32,
     pub sliding_window: usize,
     pub page_bytes: usize,
+    pub max_main_tokens: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,10 +52,8 @@ pub fn load_qwen3x_dflash2(
     main_unembed: Rc<Unembed>,
     sampler_bounds: TopKSamplingBounds,
 ) -> Result<Qwen3xDFlash2Loaded, ModelExecutorError> {
-    let num_spec_tokens = config.resolve_num_spec_tokens(Some(load_config.num_spec_tokens))?.get();
-    let query_block_size = num_spec_tokens
-        .checked_add(1)
-        .expect("Qwen3x DFlash2 query block size must fit usize");
+    let num_spec_tokens = config.num_spec_tokens().get();
+    let query_block_size = config.block_size;
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
     let Qwen3xDFlash2WeightBindings {
         main_feature,
@@ -152,6 +149,7 @@ pub fn load_qwen3x_dflash2(
             .map_err(|_| ModelExecutorError::custom("Qwen3x DFlash2 MASK token ID must fit i32"))?,
         sliding_window: config.sliding_window,
         page_bytes: load_config.page_size_bytes,
+        max_main_tokens: load_config.max_tokens,
     })
 }
 

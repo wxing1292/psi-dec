@@ -42,10 +42,8 @@ impl Qwen3xDFlash2Conv {
         max_requests: usize,
         bindings: &Qwen3xDFlash2ConvWeightBindings,
     ) -> Result<Self, ModelExecutorError> {
-        let query_block_size = num_spec_tokens
-            .checked_add(1)
-            .expect("Qwen3x DFlash2 convolution query block size must fit usize");
-        assert!(query_block_size <= config.block_size);
+        assert_eq!(num_spec_tokens, config.num_spec_tokens().get());
+        let query_block_size = config.block_size;
         let quantization = config
             .quantization
             .as_ref()
@@ -62,7 +60,7 @@ impl Qwen3xDFlash2Conv {
             group_size: to_u32("Qwen3x DFlash2 convolution group size", config.conv_group_size)?,
             kernel_size: to_u32("Qwen3x DFlash2 convolution kernel size", config.conv_kernel_size)?,
             io_dtype: Dtype::Bfloat16,
-            base_dtype: Dtype::Float32,
+            base_dtype: Dtype::Bfloat16,
         };
         conv_config.validate();
         let projection_config = affine_quantized::Config {
@@ -121,7 +119,7 @@ impl Qwen3xDFlash2Conv {
         let mut names = Vec::new();
         bindings.push_tensor_names(&mut names);
         let mut tensors = store.load_tensors(names)?;
-        let base = remove_typed_tensor(&mut tensors, &bindings.base_kernel, safetensors::Dtype::F32)?.into_data();
+        let base = remove_typed_tensor(&mut tensors, &bindings.base_kernel, safetensors::Dtype::BF16)?.into_data();
         let projection_weight = remove_quant_weight(&mut tensors, &bindings.kernel_projection.weight)?;
         let projection_scales = remove_typed_tensor(
             &mut tensors,

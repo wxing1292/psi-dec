@@ -335,12 +335,11 @@ fn quantize_safetensors(
                 output_path,
             )?;
         } else {
-            let values = bf16_to_f32_bytes(&source)?;
             write_output_tensor(
                 &mut output,
                 data_start,
                 output_by_name[output_name.as_str()],
-                &values,
+                &source,
                 output_path,
             )?;
         }
@@ -359,9 +358,13 @@ fn quantize_safetensors(
             output_tensors.len()
         )));
     }
-    if let Some((name, info)) = output_header.tensors.iter().find(|(_, info)| info.dtype == Dtype::BF16) {
+    if let Some((name, info)) = output_header
+        .tensors
+        .iter()
+        .find(|(_, info)| info.dtype == Dtype::BF16 && info.shape.len() == 2)
+    {
         return Err(error(format!(
-            "quantized DFlash2 checkpoint must not contain BF16 tensors; tensor {name:?} is {:?}",
+            "quantized DFlash2 checkpoint must not contain BF16 matrices; tensor {name:?} is {:?}",
             info.dtype
         )));
     }
@@ -510,7 +513,7 @@ fn build_output_tensors(header: &SafetensorsHeader, options: QuantizeOptions) ->
             )?);
             tensors.push(output_tensor(format!("{base}.biases"), Dtype::F32, affine_shape)?);
         } else {
-            tensors.push(output_tensor(output_name, Dtype::F32, info.shape.clone())?);
+            tensors.push(output_tensor(output_name, Dtype::BF16, info.shape.clone())?);
         }
     }
     tensors.sort_by(|left, right| right.dtype.cmp(&left.dtype).then(left.name.cmp(&right.name)));
@@ -738,24 +741,6 @@ fn read_f32(data: &[u8], index: usize) -> f32 {
     )
 }
 
-fn bf16_to_f32_bytes(source: &[u8]) -> Result<Vec<u8>> {
-    if !source.len().is_multiple_of(2) {
-        return Err(error(format!(
-            "BF16 tensor byte length={} must be divisible by 2",
-            source.len()
-        )));
-    }
-    let mut output = vec![0u8; source.len() * 2];
-    for index in 0..source.len() / 2 {
-        let value = read_bf16(source, index);
-        if !value.is_finite() {
-            return Err(error(format!("BF16 tensor contains non-finite value at index={index}")));
-        }
-        write_f32(&mut output, index, value);
-    }
-    Ok(output)
-}
-
 fn bits_for_tensor(name: &str, options: QuantizeOptions) -> usize {
     if HIGH_BIT_TENSORS.contains(&name) {
         options.high_bits
@@ -978,12 +963,10 @@ mod tests {
                 .all(|file_name| file_name == "model.safetensors")
         );
         assert_eq!(checkpoint.names().len(), 179);
-        assert!(
-            checkpoint
-                .names()
-                .iter()
-                .all(|name| checkpoint.tensor(name).unwrap().dtype() != Dtype::BF16)
-        );
+        assert!(checkpoint.names().iter().all(|name| {
+            let tensor = checkpoint.tensor(name).unwrap();
+            tensor.dtype() != Dtype::BF16 || tensor.shape().len() != 2
+        }));
         assert_eq!(checkpoint.tensor("fc.weight").unwrap().dtype(), Dtype::U32);
         assert_eq!(checkpoint.tensor("fc.weight").unwrap().shape(), [64, 40]);
         assert_eq!(checkpoint.tensor("fc.scales").unwrap().shape(), [64, 5]);
@@ -1000,13 +983,13 @@ mod tests {
             checkpoint.tensor("layers.0.self_attn.v_proj.weight").unwrap().shape(),
             [32, 8]
         );
-        assert_eq!(checkpoint.tensor("norm.weight").unwrap().dtype(), Dtype::F32);
+        assert_eq!(checkpoint.tensor("norm.weight").unwrap().dtype(), Dtype::BF16);
         assert_eq!(
             checkpoint
                 .tensor("layers.0.attention_conv.base_kernel")
                 .unwrap()
                 .dtype(),
-            Dtype::F32
+            Dtype::BF16
         );
         let output_config =
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(output_dir.join("config.json")).unwrap())

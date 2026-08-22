@@ -13,7 +13,9 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainFeatureW
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
+use crate::model::gather::Gather;
 use crate::model::main_residual_capture::MainResidualCapture;
+use crate::model::main_residual_capture::MainResidualRows;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
@@ -67,9 +69,7 @@ impl Qwen3xDSparkMainFeatureLayout {
             .checked_mul(self.hidden_dim as usize)
             .and_then(|offset| offset.try_into().ok())
             .expect("Qwen3 DSpark Main residual column start must fit u32");
-        let end = start
-            .checked_add(self.hidden_dim)
-            .expect("Qwen3 DSpark Main residual column end must fit u32");
+        let end = start + self.hidden_dim;
         start..end
     }
 
@@ -96,8 +96,8 @@ impl Qwen3xDSparkMainResidualBindings {
             .iter()
             .copied()
             .max()
-            .and_then(|last_layer| last_layer.checked_add(1))
-            .expect("Qwen3 DSpark Main residual bindings require layers");
+            .expect("Qwen3 DSpark Main residual bindings require layers")
+            + 1;
         let mut by_model_layer = vec![None; num_main_layers];
         for (residual_slice_index, &model_layer_index) in target_layer_ids.iter().enumerate() {
             let slot = &mut by_model_layer[model_layer_index];
@@ -124,10 +124,12 @@ struct Qwen3xDSparkMainFeatureWeights {
 pub struct Qwen3xDSparkMainFeatureProjector {
     layout: Qwen3xDSparkMainFeatureLayout,
     residual_bindings: Qwen3xDSparkMainResidualBindings,
+    gather: Gather,
     fc: affine_quantized::Matmul,
     hidden_norm: RMSNorm,
     weights: Option<Qwen3xDSparkMainFeatureWeights>,
     main_residuals: Buffer,
+    compact_main_residuals: Buffer,
     main_feature: Buffer,
 }
 
@@ -172,10 +174,16 @@ impl Qwen3xDSparkMainFeatureProjector {
         Ok(Self {
             layout,
             residual_bindings: Qwen3xDSparkMainResidualBindings::new(&config.target_layer_ids),
+            gather: Gather::new(device, layout.selected_hidden_dim),
             fc: affine_quantized::Matmul::new(device, fc_config),
             hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, config.rms_norm_eps),
             weights: None,
             main_residuals: Buffer::new_zeroed_elements(device, layout.main_residual_elements(), Dtype::Bfloat16),
+            compact_main_residuals: Buffer::new_zeroed_elements(
+                device,
+                layout.main_residual_elements(),
+                Dtype::Bfloat16,
+            ),
             main_feature: Buffer::new_zeroed_elements(device, layout.main_feature_elements(), Dtype::Bfloat16),
         })
     }
@@ -275,7 +283,7 @@ impl Qwen3xDSparkMainFeatureProjector {
         &self.main_feature
     }
 
-    pub fn record<'a, R>(&'a self, recorder: &mut R, num_tokens: u32) -> &'a Buffer
+    pub fn record<'a, R>(&'a self, recorder: &mut R, num_tokens: u32, main_rows: MainResidualRows<'a>) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -288,12 +296,26 @@ impl Qwen3xDSparkMainFeatureProjector {
             .weights
             .as_ref()
             .expect("Qwen3.x DSpark Main-feature weights must be loaded before execution");
+        let main_residuals = match main_rows {
+            MainResidualRows::Indices(row_indices) => {
+                self.gather.record(
+                    recorder,
+                    num_tokens,
+                    ReplayU32::Fixed(num_tokens),
+                    &self.main_residuals,
+                    row_indices,
+                    &self.compact_main_residuals,
+                );
+                &self.compact_main_residuals
+            },
+            MainResidualRows::Prefix => &self.main_residuals,
+        };
         recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke(
             num_tokens,
             ReplayU32::Fixed(num_tokens),
             &self.main_feature,
             0,
-            &self.main_residuals,
+            main_residuals,
             0,
             &weights.fc_weight,
             0,

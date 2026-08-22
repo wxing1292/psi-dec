@@ -22,7 +22,7 @@ use crate::model::qwen::v3_x::dflash2::attention::Qwen3xDFlash2Attention;
 use crate::model::qwen::v3_x::dflash2::attention::derive_qwen3x_dflash2_gqa_configs;
 use crate::model::qwen::v3_x::dflash2::conv::Qwen3xDFlash2Conv;
 use crate::model::qwen::v3_x::layer::Qwen3xDenseMLP;
-use crate::model::qwen::v3_x::weight::remove_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::resolve_uniform_quantization;
 use crate::model::qwen::v3_x::weight::to_u32;
 use crate::model::residual_add::ResidualAdd;
@@ -125,19 +125,17 @@ impl Qwen3xDFlash2Layer {
         self.mlp_conv.load_weights(device, store, mlp_conv)?;
         self.mlp.load_weights(device, store, mlp)?;
         let mut tensors = store.load_tensors([input_norm_weight.as_str(), post_attention_norm_weight.as_str()])?;
-        self.input_norm.load_weights(remove_norm_weight(
+        self.input_norm.load_weights(remove_qwen3x_norm_weight(
             device,
             &mut tensors,
             &input_norm_weight,
             &[config.hidden_size],
-            Dtype::Float32,
         )?);
-        self.post_attention_norm.load_weights(remove_norm_weight(
+        self.post_attention_norm.load_weights(remove_qwen3x_norm_weight(
             device,
             &mut tensors,
             &post_attention_norm_weight,
             &[config.hidden_size],
-            Dtype::Float32,
         )?);
         assert!(
             tensors.is_empty(),

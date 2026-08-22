@@ -228,12 +228,11 @@ pub fn init_qwen_3_model(
 pub fn init_qwen_3_model_with_dspark(
     model_dir: impl AsRef<Path>,
     dspark_model_dir: impl AsRef<Path>,
-    requested_num_spec_tokens: Option<NonZeroUsize>,
     config: Qwen3ExecutorConfig,
 ) -> Result<Qwen3Executor, ModelExecutorError> {
     let dspark_model_dir = dspark_model_dir.as_ref();
     let dspark_config = init_qwen3x_dspark_config(dspark_model_dir)?;
-    let num_spec_tokens = dspark_config.resolve_num_spec_tokens(requested_num_spec_tokens)?;
+    let num_spec_tokens = dspark_config.num_spec_tokens();
     init_qwen_3_model_inner(
         model_dir.as_ref(),
         Qwen3InitMode::DSpark {
@@ -354,7 +353,6 @@ fn init_qwen_3_model_inner(
                 dspark_model_dir,
                 dspark_config,
                 Qwen3xDSparkLoadConfig {
-                    num_spec_tokens: *num_spec_tokens,
                     page_size_bytes: QWEN3_PAGE_SIZE_BYTES,
                     max_position_embeddings: text.max_position_embeddings,
                     max_requests: config.max_requests,

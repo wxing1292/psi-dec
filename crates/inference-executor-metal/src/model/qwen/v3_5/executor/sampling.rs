@@ -208,9 +208,10 @@ impl Qwen35Executor {
             let sampler_config = &microbatch.sampler_configs()[req_index];
             let sample_position = sample_positions[target_offset];
             let num_spec_tokens = microbatch.num_spec_tokens(req_index);
-            sample_position
-                .checked_add(num_spec_tokens)
-                .expect("qwen3.5 rejection sampling position must fit u32");
+            assert!(
+                sample_position <= u32::MAX - num_spec_tokens,
+                "qwen3.5 rejection sampling positions must fit u32"
+            );
             rejection_runtime_params.push(SparseRejectionSamplingReqParams {
                 seed: microbatch.sampler_configs()[req_index].seed(),
                 sample_position,

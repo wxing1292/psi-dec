@@ -17,11 +17,12 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
+use crate::model::main_residual_capture::MainResidualRows;
 use crate::model::qwen::v3_x::dflash2::layer::Qwen3xDFlash2Layer;
 use crate::model::qwen::v3_x::dflash2::layer::Qwen3xDFlash2LayerInput;
 use crate::model::qwen::v3_x::dflash2::layer::Qwen3xDFlash2LayerScratch;
 use crate::model::qwen::v3_x::dflash2::main_feature::Qwen3xDFlash2MainFeatureProjector;
-use crate::model::qwen::v3_x::weight::remove_norm_weight;
+use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
@@ -42,6 +43,7 @@ pub struct Qwen3xDFlash2Body {
 #[derive(Clone, Copy)]
 pub struct Qwen3xDFlash2PrefillArgs<'a> {
     pub num_tokens: u32,
+    pub main_rows: MainResidualRows<'a>,
     pub req_slots: &'a Buffer,
     pub flat_token_indices: &'a Buffer,
     pub pages: &'a Buffer,
@@ -59,6 +61,7 @@ pub struct Qwen3xDFlash2BodyArgs<'a> {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDFlash2PrefillReplayKey {
     num_tokens: u32,
+    gathers_main_residual_rows: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -155,12 +158,11 @@ impl Qwen3xDFlash2Model {
             layer.load_weights(device, store, config, bindings)?;
         }
         let mut tensors = store.load_tensors([final_norm_weight.as_str()])?;
-        self.final_norm.load_weights(remove_norm_weight(
+        self.final_norm.load_weights(remove_qwen3x_norm_weight(
             device,
             &mut tensors,
             &final_norm_weight,
             &[config.hidden_size],
-            Dtype::Float32,
         )?);
         assert!(
             tensors.is_empty(),
@@ -213,7 +215,7 @@ impl Qwen3xDFlash2Model {
             .main_feature_projector
             .as_ref()
             .expect("DFlash2 Main-feature projector shell must exist")
-            .record(recorder, args.num_tokens);
+            .record(recorder, args.num_tokens, args.main_rows);
         for layer in &self.layers {
             layer.record_prefill(
                 recorder,
@@ -288,6 +290,7 @@ impl ReplayComponent for Qwen3xDFlash2Prefill {
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         Qwen3xDFlash2PrefillReplayKey {
             num_tokens: input.num_tokens,
+            gathers_main_residual_rows: input.main_rows.gathers(),
         }
     }
 

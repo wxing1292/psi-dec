@@ -78,6 +78,7 @@ use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
+use inference_executor_core::sampling::build_spec_prefill_selection;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
@@ -113,12 +114,10 @@ use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2DecodeRecording;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2Execution;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2PrefillRecording;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2ProposalInput;
-use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2PrefillArgs;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkDecodeRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkPrefillRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkPrefillArgs;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::state_snapshot::FullStateIO;
@@ -1342,38 +1341,41 @@ impl ReplayableModel for Qwen35Executor {
         (self.speculator.is_dspark() || self.speculator.is_dflash2()) && model_batch_req.microbatch().total_tokens() > 0
     }
 
-    fn prefill_spec(&mut self, recorder: &mut Self::ModelOpsRecorder, model_batch_req: &Self::ModelBatchRequest) {
+    fn prefill_spec(
+        &mut self,
+        recorder: &mut Self::ModelOpsRecorder,
+        model_batch_req: &Self::ModelBatchRequest,
+        sampled_output: &Self::SampledOutput,
+    ) {
         let microbatch = model_batch_req.microbatch();
-        let num_tokens = microbatch
-            .total_tokens()
-            .try_into()
-            .expect("qwen3.5 Spec Prefill token count must fit u32");
+        let accepted_prefix_lengths = sampled_output
+            .decisions
+            .iter()
+            .map(|decision| decision.validated_tokens.len())
+            .collect::<Vec<_>>();
+        let selection = build_spec_prefill_selection(microbatch, &accepted_prefix_lengths);
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         if self.speculator.is_dspark() {
             assert!(
                 recorder.dspark_prefill.is_none(),
                 "qwen3.5 DSpark Prefill is already recorded"
             );
-            let input = Qwen3xDSparkPrefillArgs {
-                num_tokens,
-                req_slots: self.main_gqa_state.metadata().req_slots(),
-                flat_token_indices: self.main_gqa_state.metadata().flat_token_indices(),
-                pages: self.pages.buffer(),
-            };
-            recorder.dspark_prefill = Some(self.speculator.dspark_mut().execution.record_prefill(&runtime, &input));
+            recorder.dspark_prefill = Some(self.speculator.dspark_mut().execution.record_prefill(
+                &runtime,
+                &selection,
+                self.pages.buffer(),
+            ));
         } else {
             assert!(self.speculator.is_dflash2());
             assert!(
                 recorder.dflash2_prefill.is_none(),
                 "qwen3.5 DFlash2 Prefill is already recorded"
             );
-            let input = Qwen3xDFlash2PrefillArgs {
-                num_tokens,
-                req_slots: self.main_gqa_state.metadata().req_slots(),
-                flat_token_indices: self.main_gqa_state.metadata().flat_token_indices(),
-                pages: self.pages.buffer(),
-            };
-            recorder.dflash2_prefill = Some(self.speculator.dflash2_mut().execution.record_prefill(&runtime, &input));
+            recorder.dflash2_prefill = Some(self.speculator.dflash2_mut().execution.record_prefill(
+                &runtime,
+                &selection,
+                self.pages.buffer(),
+            ));
         }
     }
 

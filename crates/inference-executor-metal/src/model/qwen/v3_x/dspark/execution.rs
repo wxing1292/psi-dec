@@ -13,6 +13,7 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
 use inference_executor_core::sampling::SamplerConfig;
+use inference_executor_core::sampling::SpecPrefillSelection;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::block_spec::state::BlockSpecGQAState;
@@ -20,6 +21,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::embedding::Embed;
+use crate::model::main_residual_capture::MainResidualRows;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedArgs;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedReplayKey;
@@ -56,6 +58,9 @@ pub struct Qwen3xDSparkExecution {
     unloaded_model: Option<Qwen3xDSparkModel>,
     unloaded_embed: Option<Embed>,
     unloaded_unembed: Option<Unembed>,
+    prefill_main_row_indices: Buffer,
+    prefill_req_slots: Buffer,
+    prefill_flat_token_indices: Buffer,
     embed_uses_main: bool,
     unembed_uses_main: bool,
     hidden_input: Rc<Buffer>,
@@ -138,6 +143,9 @@ impl Qwen3xDSparkExecution {
                 ),
             ),
             sampling: Replay::new("Qwen3x DSpark Sampling", Qwen3xDSparkSampling::new(loaded.markov)),
+            prefill_main_row_indices: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
+            prefill_req_slots: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
+            prefill_flat_token_indices: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
             unloaded_model: None,
             unloaded_embed: None,
             unloaded_unembed: None,
@@ -342,9 +350,34 @@ impl Qwen3xDSparkExecution {
     pub fn record_prefill(
         &mut self,
         runtime: &MetalReplayRuntime<'_>,
-        input: &Qwen3xDSparkPrefillArgs<'_>,
+        selection: &SpecPrefillSelection,
+        pages: &Buffer,
     ) -> Qwen3xDSparkPrefillRecording {
-        let (key, _) = self.prefill.record(runtime, input);
+        let num_tokens: u32 = selection
+            .main_row_indices
+            .len()
+            .try_into()
+            .expect("Qwen3x DSpark Prefill token count must fit u32");
+        assert_eq!(selection.req_slots.len(), selection.main_row_indices.len());
+        assert_eq!(selection.flat_token_indices.len(), selection.main_row_indices.len());
+        self.prefill_main_row_indices
+            .write_typed(0, &selection.main_row_indices);
+        self.prefill_req_slots.write_typed(0, &selection.req_slots);
+        self.prefill_flat_token_indices
+            .write_typed(0, &selection.flat_token_indices);
+        let main_rows = if selection.main_rows_are_prefix() {
+            MainResidualRows::Prefix
+        } else {
+            MainResidualRows::Indices(&self.prefill_main_row_indices)
+        };
+        let input = Qwen3xDSparkPrefillArgs {
+            num_tokens,
+            main_rows,
+            req_slots: &self.prefill_req_slots,
+            flat_token_indices: &self.prefill_flat_token_indices,
+            pages,
+        };
+        let (key, _) = self.prefill.record(runtime, &input);
         Qwen3xDSparkPrefillRecording { key }
     }
 
@@ -392,15 +425,27 @@ impl Qwen3xDSparkExecution {
         pages: &Buffer,
         distribution_store: &SpecProbsStore,
     ) -> Qwen3xDSparkDecodeRecording {
+        let max_position_increment =
+            u32::try_from(self.num_spec_tokens).expect("Qwen3x DSpark proposal count must fit u32");
+        assert!(
+            proposal
+                .anchor_positions
+                .iter()
+                .all(|&anchor_position| anchor_position > 0),
+            "Qwen3x DSpark Decode requires a nonempty history"
+        );
+        assert!(
+            proposal
+                .anchor_positions
+                .iter()
+                .all(|&anchor_position| anchor_position <= u32::MAX - max_position_increment),
+            "Qwen3x DSpark proposal positions must fit u32"
+        );
         let mut flat_query_token_indices = Vec::with_capacity(proposal.req_slots.len() * self.num_spec_tokens);
         let mut visible_history_token_ranges = Vec::with_capacity(flat_query_token_indices.capacity());
         for &anchor_position in proposal.anchor_positions {
             for block_offset in 0..self.num_spec_tokens {
-                flat_query_token_indices.push(
-                    anchor_position
-                        .checked_add(block_offset as u32)
-                        .expect("Qwen3x DSpark block token position must fit u32"),
-                );
+                flat_query_token_indices.push(anchor_position + block_offset as u32);
                 visible_history_token_ranges.push(0..anchor_position);
             }
         }

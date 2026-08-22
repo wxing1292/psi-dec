@@ -88,8 +88,12 @@ Spec Decode
 ```
 
 Main writes each selected residual directly into its assigned column range in one capture buffer.
-DFlash2 Prefill does not run a concatenate or copy kernel.
-The Main-feature projection runs once for the captured token rows.
+The capture path does not run a concatenate kernel.
+After Main rejection sampling, Prefill selects the fixed Main rows and the accepted speculative prefix.
+It excludes the rejected suffix and the newly sampled anchor.
+`MainResidualRows::Prefix` uses the capture buffer directly.
+`MainResidualRows::Indices` gathers noncontiguous committed rows before the Main-feature projection.
+The Main-feature projection runs once for these committed rows.
 All DFlash2 layers read that projected feature.
 Each layer independently applies its Wk and Wv projection and writes its persistent K/V.
 
@@ -100,11 +104,11 @@ It does not aggregate layer weights or add an output scatter.
 
 ## Decode attention
 
-`--num-spec-tokens K` creates K proposal rows.
-The complete query block has `K + 1` rows:
+The checkpoint `block_size` creates `block_size - 1` proposal rows.
+The complete query block has `block_size` rows:
 
 ```text
-[anchor, MASK_0, ..., MASK_(K-1)]
+[anchor, MASK_0, ..., MASK_(block_size-2)]
 ```
 
 The anchor and MASK rows form one Q tile or part of one Q tile.
@@ -137,7 +141,7 @@ The shared GQA backend does not infer a zero lower bound or own DFlash2 window p
 ## Dynamic grouped convolution
 
 Each layer applies DFlash2 dynamic grouped convolution around both the attention branch and the MLP branch.
-The checkpoint supplies one affine kernel projection and one F32 base kernel for each branch.
+The checkpoint supplies one affine kernel projection and one BF16 base kernel for each branch.
 
 ```text
 normalized hidden
@@ -216,8 +220,8 @@ DFlash2 reuses Main embedding and unembedding, so the DFlash2 manifest must not 
 unembedding tensors.
 
 The converter writes affine matrix payloads as `U32` and affine parameters as F32.
-It keeps norms and dynamic-convolution base kernels as F32.
-The produced checkpoint must contain no BF16 tensor.
+It preserves RMSNorm weights and dynamic-convolution base kernels as BF16.
+The produced checkpoint must contain no BF16 matrix.
 The default conversion uses group size 64 and 4-bit affine matrices.
 It uses 6-bit affine matrices for layer 2 and layer 4 `v_proj` and `down_proj` weights.
 

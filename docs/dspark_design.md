@@ -30,9 +30,8 @@ It requires the official Markov-conditioned confidence head.
 It supports unscaled `default` RoPE and Yarn RoPE with full-head rotation.
 Qwen3.5 MTP and DSpark are mutually exclusive.
 
-At startup, `--num-spec-tokens N` selects one fixed proposal length.
-`N` must not exceed the checkpoint `block_size`.
-When the option is absent, the executor uses the checkpoint `block_size`.
+At startup, the checkpoint `block_size` defines one fixed proposal length.
+The service does not expose a DSpark proposal-length override.
 
 The current implementation has these limits:
 
@@ -246,7 +245,7 @@ Vanilla and MTP execution owners do not use the DSpark capture or the DSpark Pre
 
 `Qwen3xDSparkMainFeatureProjector` selects the configured Main residual outputs.
 Main writes those outputs directly into the projector's prearranged column ranges.
-The path does not use a concatenate kernel or copy.
+The capture path does not use a concatenate kernel.
 It projects those outputs into one Main feature for each Main token.
 Each DSpark layer projects that feature to its persistent context K/V.
 
@@ -258,9 +257,16 @@ selected Main residual capture
   -> per-layer context K/V append
 ```
 
+The Main verification input can contain fixed rows followed by a speculative suffix.
+After rejection sampling, the executor selects the fixed rows and the accepted speculative prefix.
+It excludes the rejected suffix.
+It also excludes the newly sampled anchor because that token has no Main residual in the current invocation.
+`MainResidualRows::Prefix` uses the capture buffer directly.
+`MainResidualRows::Indices` gathers noncontiguous committed rows before the Main-feature projection.
+
 The Main submission does not contain DSpark Prefill or Decode work.
 Persistent DSpark context follows accepted Main history.
-Unpublished verification rows can exist in the physical pages, but the visible range excludes them.
+Stale physical page values can exist outside the committed history, but the visible range excludes them.
 Proposal-local K/V never enters persistent context.
 
 The reusable Qwen3x DSpark model, checkpoint-weight owners, and Main capture contract do not depend on one Main model
@@ -411,13 +417,13 @@ Qwen3.5 GDN also allocates candidate recurrent states for every possible accepte
 The service passes the same capacity to the executor, runtime, and scheduler.
 This rule bounds the persistent GDN arena without changing buffer, scratch, replay, or residency reuse.
 
-The shared DSpark loader validates these limits:
+The shared DSpark loader derives this invariant:
 
 ```text
-1 <= num_spec_tokens <= checkpoint block_size
+num_spec_tokens = checkpoint block_size >= 1
 ```
 
-`num_spec_tokens` controls the DSpark proposal width. It does not set the Main
+The derived `num_spec_tokens` controls the DSpark proposal width. It does not set the Main
 per-request verification budget. The scheduler may send only a proposal prefix
 to Main. DSpark derives its own `max_requests * num_spec_tokens` row capacity.
 When DSpark reuses Main embedding or unembedding weights, it creates a

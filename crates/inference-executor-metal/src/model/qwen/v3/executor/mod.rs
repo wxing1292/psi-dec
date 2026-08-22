@@ -33,6 +33,7 @@ use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
+use inference_executor_core::sampling::build_spec_prefill_selection;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
@@ -62,7 +63,6 @@ use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkDecodeRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkPrefillRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
-use crate::model::qwen::v3_x::dspark::model::Qwen3xDSparkPrefillArgs;
 use crate::model::state_snapshot::FullStateIO;
 use crate::model::state_snapshot::GQAStateSnapshotFiles;
 use crate::model::state_snapshot::PageArenaStateSnapshotFiles;
@@ -771,23 +771,29 @@ impl ReplayableModel for Qwen3Executor {
         self.speculator.is_dspark() && model_batch_req.microbatch().total_tokens() > 0
     }
 
-    fn prefill_spec(&mut self, recorder: &mut Self::ModelOpsRecorder, model_batch_req: &Self::ModelBatchRequest) {
+    fn prefill_spec(
+        &mut self,
+        recorder: &mut Self::ModelOpsRecorder,
+        model_batch_req: &Self::ModelBatchRequest,
+        sampled_output: &Self::SampledOutput,
+    ) {
         let microbatch = model_batch_req.microbatch();
-        let input = Qwen3xDSparkPrefillArgs {
-            num_tokens: microbatch
-                .total_tokens()
-                .try_into()
-                .expect("Qwen3 DSpark Prefill token count must fit u32"),
-            req_slots: self.main_gqa_state.metadata().req_slots(),
-            flat_token_indices: self.main_gqa_state.metadata().flat_token_indices(),
-            pages: self.pages.buffer(),
-        };
+        let accepted_prefix_lengths = sampled_output
+            .decisions
+            .iter()
+            .map(|decision| decision.validated_tokens.len())
+            .collect::<Vec<_>>();
+        let selection = build_spec_prefill_selection(microbatch, &accepted_prefix_lengths);
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         assert!(
             recorder.dspark_prefill.is_none(),
             "Qwen3 DSpark Prefill is already recorded"
         );
-        recorder.dspark_prefill = Some(self.speculator.dspark_mut().execution.record_prefill(&runtime, &input));
+        recorder.dspark_prefill = Some(self.speculator.dspark_mut().execution.record_prefill(
+            &runtime,
+            &selection,
+            self.pages.buffer(),
+        ));
     }
 
     fn run_spec_decode(

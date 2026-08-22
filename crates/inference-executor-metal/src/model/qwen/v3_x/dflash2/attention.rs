@@ -218,13 +218,12 @@ pub fn qwen3x_dflash2_gqa_core(
         num_spec_tokens > 0,
         "Qwen3x DFlash2 attention requires speculative tokens"
     );
-    let num_query_rows = num_spec_tokens
-        .checked_add(1)
-        .expect("Qwen3x DFlash2 query row count must fit usize");
-    assert!(
-        num_query_rows <= config.block_size,
-        "Qwen3x DFlash2 query row count must not exceed the checkpoint block_size"
+    assert_eq!(
+        num_spec_tokens,
+        config.num_spec_tokens().get(),
+        "Qwen3x DFlash2 proposal count must match the checkpoint"
     );
+    let num_query_rows = config.block_size;
     assert!(
         dflash2_layer_index < config.num_hidden_layers,
         "Qwen3x DFlash2 attention layer index must be within the model"
@@ -303,7 +302,7 @@ fn qwen3x_dflash2_gqa_metal_config(
         rope_theta: config.rope_theta,
         rope_scaling: RopeScaling::Default,
         io_dtype: Dtype::Bfloat16,
-        norm_weight_dtype: Dtype::Float32,
+        norm_weight_dtype: Dtype::Bfloat16,
     };
     metal.validate();
     Ok(metal)
@@ -332,22 +331,6 @@ mod tests {
         assert_eq!(core.attention.num_kv_heads, 1);
         assert_eq!(metal.q.group_size, 32);
         assert_eq!(metal.q.bits, 4);
-    }
-
-    #[test]
-    fn test_gqa_uses_configured_spec_tokens_below_checkpoint_limit() {
-        let config = config();
-        let core = qwen3x_dflash2_gqa_core(&config, 3, 0);
-
-        assert_eq!(config.block_size, 8);
-        assert_eq!(core.block_size, 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "must not exceed the checkpoint block_size")]
-    fn test_gqa_rejects_configured_spec_tokens_above_checkpoint_limit() {
-        let config = config();
-        let _ = qwen3x_dflash2_gqa_core(&config, 8, 0);
     }
 
     #[test]

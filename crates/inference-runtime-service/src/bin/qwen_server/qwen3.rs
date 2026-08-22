@@ -60,21 +60,16 @@ fn run_inner() -> Result<()> {
     let model = match config.model_mode() {
         Qwen3ModelMode::DSpark {
             model_dir: dspark_model_dir,
-            num_spec_tokens,
         } => {
-            init_qwen_3_model_with_dspark(
-                config.hf_model_dir(),
-                dspark_model_dir,
-                *num_spec_tokens,
-                executor_config,
-            )
-            .map_err(|error| {
-                log_err_internal!(
-                    "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
-                    config.hf_model_dir(),
-                    dspark_model_dir,
-                )
-            })?
+            init_qwen_3_model_with_dspark(config.hf_model_dir(), dspark_model_dir, executor_config).map_err(
+                |error| {
+                    log_err_internal!(
+                        "unable to initialize qwen3 Main model from {:?} with DSpark model from {:?}: {error}",
+                        config.hf_model_dir(),
+                        dspark_model_dir,
+                    )
+                },
+            )?
         },
         Qwen3ModelMode::Vanilla => {
             init_qwen_3_model(config.hf_model_dir(), executor_config).map_err(|error| {

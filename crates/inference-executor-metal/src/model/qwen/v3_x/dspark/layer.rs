@@ -38,7 +38,6 @@ pub struct Qwen3xDSparkLayer {
 }
 
 pub struct Qwen3xDSparkLayerScratch {
-    max_tokens: u32,
     hidden_dim: u32,
     residual_stream: [Buffer; 2],
     normalized_hidden: Buffer,
@@ -270,7 +269,6 @@ impl Qwen3xDSparkLayerScratch {
     pub fn new(device: &Device, max_tokens: usize, hidden_dim: usize) -> Self {
         assert!(max_tokens > 0, "Qwen3 DSpark layer scratch requires tokens");
         assert!(hidden_dim > 0, "Qwen3 DSpark layer scratch requires hidden values");
-        let max_tokens_u32 = u32::try_from(max_tokens).expect("Qwen3 DSpark layer token capacity must fit u32");
         let hidden_dim_u32 = u32::try_from(hidden_dim).expect("Qwen3 DSpark hidden dimension must fit u32");
         let hidden_elements = max_tokens
             .checked_mul(hidden_dim)
@@ -278,7 +276,6 @@ impl Qwen3xDSparkLayerScratch {
         u32::try_from(hidden_elements)
             .expect("Qwen3 DSpark layer scratch must fit the shader u32 element-count domain");
         Self {
-            max_tokens: max_tokens_u32,
             hidden_dim: hidden_dim_u32,
             residual_stream: [
                 Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
@@ -288,11 +285,6 @@ impl Qwen3xDSparkLayerScratch {
             branch_output: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             post_attention_hidden: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
         }
-    }
-
-    fn residual_values(&self, num_tokens: u32) -> u32 {
-        debug_assert!(num_tokens > 0 && num_tokens <= self.max_tokens);
-        num_tokens * self.hidden_dim
     }
 
     fn residual_stream(&self, dspark_layer_index: usize) -> &Buffer {

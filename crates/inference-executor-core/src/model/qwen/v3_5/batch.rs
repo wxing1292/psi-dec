@@ -51,6 +51,14 @@ impl SpecMicrobatch for Qwen35Microbatch {
         self.num_spec_tokens(req_index)
     }
 
+    fn req_slots(&self) -> &[u32] {
+        self.req_slots()
+    }
+
+    fn token_indices(&self) -> &[u32] {
+        self.token_indices()
+    }
+
     fn cu_tokens(&self) -> &[u32] {
         self.cu_tokens()
     }

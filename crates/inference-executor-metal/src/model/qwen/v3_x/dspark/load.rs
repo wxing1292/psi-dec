@@ -1,4 +1,3 @@
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -26,7 +25,6 @@ use crate::model::unembedding::UnembedConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3xDSparkLoadConfig {
-    pub num_spec_tokens: NonZeroUsize,
     pub page_size_bytes: usize,
     pub max_position_embeddings: usize,
     pub max_requests: usize,
@@ -45,6 +43,7 @@ pub struct Qwen3xDSparkLoaded {
     pub num_spec_tokens: usize,
     pub mask_token_id: i32,
     pub page_bytes: usize,
+    pub max_main_tokens: usize,
     pub embed_uses_main: bool,
     pub unembed_uses_main: bool,
 }
@@ -58,7 +57,7 @@ pub fn load_qwen3x_dspark(
     main_unembed: Rc<Unembed>,
     sampler_bounds: TopKSamplingBounds,
 ) -> Result<Qwen3xDSparkLoaded, ModelExecutorError> {
-    let num_spec_tokens = config.resolve_num_spec_tokens(Some(load_config.num_spec_tokens))?.get();
+    let num_spec_tokens = config.num_spec_tokens().get();
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
     let Qwen3xDSparkWeightBindings {
         embed: embed_bindings,
@@ -214,6 +213,7 @@ pub fn load_qwen3x_dspark(
             .try_into()
             .map_err(|_| ModelExecutorError::custom("Qwen3x DSpark MASK token ID must fit i32"))?,
         page_bytes: load_config.page_size_bytes,
+        max_main_tokens: load_config.max_tokens,
         embed_uses_main,
         unembed_uses_main,
     })

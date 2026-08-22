@@ -111,10 +111,13 @@ impl Qwen3xDFlash2Output {
         bindings: &Qwen3xDFlash2SelectorWeightBindings,
         sampler_bounds: TopKSamplingBounds,
     ) -> Result<Self, ModelExecutorError> {
+        assert_eq!(
+            num_spec_tokens,
+            config.num_spec_tokens().get(),
+            "Qwen3x DFlash2 proposal count must match the checkpoint"
+        );
         let num_spec_tokens = to_u32("Qwen3x DFlash2 proposal count", num_spec_tokens)?;
-        let query_block_size = num_spec_tokens
-            .checked_add(1)
-            .expect("Qwen3x DFlash2 query block size must fit u32");
+        let query_block_size = to_u32("Qwen3x DFlash2 query block size", config.block_size)?;
         let max_requests = to_u32("Qwen3x DFlash2 request capacity", max_requests)?;
         let hidden_dim = to_u32("Qwen3x DFlash2 hidden dimension", config.hidden_size)?;
         let vocab_size = to_u32("Qwen3x DFlash2 vocabulary", config.vocab_size)?;
@@ -313,13 +316,25 @@ impl Qwen3xDFlash2Output {
         assert_eq!(input.anchor_token_ids.len(), num_requests);
         assert_eq!(input.anchor_positions.len(), num_requests);
         assert_eq!(input.sampler_configs.len(), num_requests);
+        assert!(
+            input
+                .anchor_positions
+                .iter()
+                .all(|&anchor_position| anchor_position <= u32::MAX - self.num_spec_tokens),
+            "Qwen3x DFlash2 proposal sample positions must fit u32"
+        );
         let proposal_rows = num_requests * self.num_spec_tokens as usize;
         let mut row_indices = Vec::with_capacity(proposal_rows);
         let mut distribution_indices = Vec::with_capacity(proposal_rows);
         for (request_index, &req_slot) in input.req_slots.iter().enumerate() {
             for step_index in 0..self.num_spec_tokens as usize {
                 row_indices.push((request_index * self.query_block_size as usize + step_index + 1) as u32);
-                distribution_indices.push(input.distribution_store.draft_distribution_index(req_slot, step_index));
+                let distribution_index = input.distribution_store.draft_distribution_index(req_slot, step_index);
+                assert!(
+                    distribution_index < input.distribution_store.num_draft_distributions(),
+                    "Qwen3x DFlash2 draft distribution index exceeds the distribution store"
+                );
+                distribution_indices.push(distribution_index);
             }
         }
         self.row_indices.write_typed(0, &row_indices);
@@ -335,9 +350,7 @@ impl Qwen3xDFlash2Output {
         for (request_index, (config, &anchor_position)) in
             input.sampler_configs.iter().zip(input.anchor_positions).enumerate()
         {
-            let sample_position = anchor_position
-                .checked_add(1)
-                .expect("Qwen3x DFlash2 proposal sample position must fit u32");
+            let sample_position = anchor_position + 1;
             self.sampler_bounds
                 .active_top_k(config)
                 .expect("Qwen3x DFlash2 sampler config must fit executor bounds");

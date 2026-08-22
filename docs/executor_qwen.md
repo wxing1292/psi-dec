@@ -365,8 +365,8 @@ Qwen3xDFlash2WeightBindings
     mlp: independent gate/up/down affine bindings
     input_layernorm_weight
     post_attention_layernorm_weight
-    attention_conv: projection plus F32 base kernel
-    mlp_conv: projection plus F32 base kernel
+    attention_conv: projection plus BF16 base kernel
+    mlp_conv: projection plus BF16 base kernel
   final_norm_weight
   selector:
     hidden_projection
@@ -423,21 +423,21 @@ If only Main or only MTP uses MoE, the unused model-side MoE geometry does not c
 An incompatible shared geometry returns a recoverable model initialization error.
 For DSpark, the loader validates Main hidden width, layer count, vocabulary, position limit, and RoPE values.
 It permits the DSpark query projection width to differ from the Main hidden width.
-The checkpoint `block_size` is the maximum supported DSpark proposal length.
-`--num-spec-tokens` selects the fixed execution length and defaults to that checkpoint maximum.
-The shared loader requires `num_spec_tokens <= block_size` for both Main versions.
+The checkpoint `block_size` is the DSpark proposal count.
+The loader does not accept a separate proposal-length override.
 The DSpark proposal length is independent of the Main per-request verification budget.
 The scheduler may verify only a proposal prefix.
-DSpark derives its row capacity as `max_requests * num_spec_tokens`.
+DSpark derives its row capacity as `max_requests * block_size`.
 If the checkpoint omits embedding or unembedding weights, DSpark creates a
 caller-capacity view that shares the immutable Main kernel and weights.
 It adds DSpark context K/V pages to the Main cache lane and retains the Main GDN state domain.
 
 For DFlash2, the loader validates the Main hidden width, selected residual layers, vocabulary, position limit, RoPE,
 query-block limit, sliding window, convolution geometry, and selector geometry.
-`--num-spec-tokens` selects the number of MASK proposal rows and must not exceed `block_size - 1`.
-The complete Decode query block has `num_spec_tokens + 1` rows because it includes the anchor.
-DFlash2 derives its row capacity as `max_requests * (num_spec_tokens + 1)`.
+The checkpoint `block_size` is the complete Decode query-block size.
+The block has one anchor row and `block_size - 1` MASK proposal rows.
+The loader does not accept a separate proposal-length override.
+DFlash2 derives its row capacity as `max_requests * block_size`.
 It reuses the immutable Main embedding and unembedding owners.
 It adds persistent DFlash2 history K/V pages to the Main cache lane.
 It retains the Main GDN state domain.
@@ -449,8 +449,8 @@ There is no Main/MTP plan object tree or aggregate component-weight owner.
 Qwen3 Main owns QKV GQA and dense-MLP geometry conversion in `qwen/v3/main/component_config.rs`.
 Qwen3.5 owns QGKV GQA, GDN, dense-MLP, MoE, and MTP validation in `qwen/v3_5/component_config.rs`.
 Qwen3x DSpark has no plan object or plan source file.
-Each DSpark semantic owner derives its model geometry from `Qwen3xDSparkConfig`, uses the selected
-`num_spec_tokens` for proposal geometry, and resolves its affine layout from the exact binding subtree that it consumes.
+Each DSpark semantic owner derives its proposal geometry from `Qwen3xDSparkConfig::block_size` and resolves its affine
+layout from the exact binding subtree that it consumes.
 Each owner loads a bounded `TensorMap`, removes its tensors, performs its required fusion, and requires an empty map.
 Each DSpark layer owns its weight-dependent GQA and dense-MLP backend.
 The DSpark state domain shares only page tables, metadata, scratch, and geometry-dependent compute selection.
@@ -701,7 +701,8 @@ Main queries the capture owner immediately before each layer's final post-MLP re
 The capture owner returns an optional opaque `residual_add::CaptureTarget`.
 The destination selects a stable BF16 column range that the capture owner owns.
 Each selected Main layer writes directly into its assigned range in one prearranged buffer.
-DSpark and DFlash2 Prefill do not run a concatenate kernel or copy.
+The capture path does not run a concatenate kernel.
+An indexed committed-row selection runs one gather before Main-feature projection.
 `None` records the ordinary residual add.
 
 The object-safe capture contract returns only this descriptor.
@@ -784,6 +785,10 @@ Spec Decode runs only when Main returns a sampled anchor.
 The lifecycle does not use a per-batch submitted-state flag.
 
 `prefill_spec` materializes the selected DSpark or DFlash2 Prefill stage.
+It builds the persistent-history row selection after Main rejection sampling.
+For a decode request, the selection contains the fixed Main rows and the accepted speculative prefix.
+It excludes the rejected suffix and the newly sampled anchor.
+An explicit `MainResidualRows` variant selects direct prefix use or an indexed gather.
 `decode_spec` materializes the selected model's independent Decode stage.
 These hooks do not submit backend work or read backend output.
 
@@ -970,9 +975,8 @@ Main batch submission:
 
 DSpark support is experimental.
 The Qwen3 and Qwen3.5 DSpark modes support one fixed-block DSpark checkpoint.
-`--num-spec-tokens K` selects a fixed proposal length at startup.
-K must not exceed the checkpoint `block_size`.
-Without the option, K equals the checkpoint `block_size`.
+The checkpoint `block_size` defines the fixed proposal count.
+`--num-spec-tokens` is an MTP-only service option.
 Qwen3.5 MTP, DSpark, and DFlash2 are mutually exclusive.
 
 Each DSpark-enabled executor keeps the Main submission free of DSpark work:
@@ -1000,6 +1004,8 @@ The executor owns separate page tables and splits each runtime page span.
 Proposal-local Q/K/V and attention partials remain in executor-owned `BlockSpecScratch`.
 
 Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidates for each DSpark request slot.
+For DSpark, `num_spec_tokens` is the checkpoint `block_size`.
+For DFlash2, `num_spec_tokens` is the checkpoint `block_size - 1`.
 MTP uses the same decision-candidate count and shifts their physical state versions by `num_spec_tokens - 1`.
 Both modes also reserve cache-block boundary candidates.
 The Qwen3.5 service sets the running-slot capacity from `--max-requests` for Main, MTP, DSpark, and DFlash2.
@@ -1016,9 +1022,9 @@ Qwen3.5-family executors support the affine Qwen3x DFlash2 checkpoint contract.
 The DFlash2 owner is a peer of the DSpark owner.
 It is not a mode flag inside DSpark.
 
-`--num-spec-tokens K` selects K MASK proposal rows.
-K must be less than the checkpoint `block_size`.
-The Decode block contains one anchor row followed by K MASK rows.
+The checkpoint `block_size` defines the complete Decode query block.
+The Decode block contains one anchor row followed by `block_size - 1` MASK rows.
+`--num-spec-tokens` is an MTP-only service option.
 Prefill and Decode are independent replay recordings:
 
 ```text
@@ -1031,7 +1037,9 @@ Spec Decode, when an anchor exists:
     DFlash2Embed -> DFlash2 -> DFlash2Output
 ```
 
-Prefill projects the selected Main residual capture once.
+Prefill projects the committed Main residual rows once.
+The committed rows contain the fixed Main rows and the accepted speculative prefix.
+They do not contain the rejected suffix or the newly sampled anchor.
 Each DFlash2 layer derives persistent K/V from that projected Main feature and writes its own paged history cache.
 The persistent cache stores all history tokens.
 Decode limits reads, not writes, with one explicit half-open history range for each query row:

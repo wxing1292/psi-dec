@@ -18,6 +18,10 @@ pub use rejection_sampling::SparseRejectionSamplingReqParams;
 pub use rejection_sampling::SparseRejectionSamplingShape;
 pub use rejection_sampling::SpecMicrobatch;
 
+mod spec_prefill;
+pub use spec_prefill::SpecPrefillSelection;
+pub use spec_prefill::build_spec_prefill_selection;
+
 mod top_k_sampling;
 pub use top_k_sampling::MAX_TOP_K;
 pub use top_k_sampling::TopKSamplingBounds;

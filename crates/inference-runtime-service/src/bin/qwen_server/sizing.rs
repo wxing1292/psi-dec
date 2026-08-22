@@ -11,14 +11,14 @@ pub fn kv_dtype_bytes(dtype: Option<&str>) -> Result<usize> {
     }
 }
 
-pub fn context_window(model_context_window: usize, dspark_num_spec_tokens: usize) -> Result<usize> {
-    if model_context_window <= dspark_num_spec_tokens {
+pub fn context_window(model_context_window: usize, block_spec_num_spec_tokens: usize) -> Result<usize> {
+    if model_context_window <= block_spec_num_spec_tokens {
         return Err(log_info_invalid_argument!(
-            "model context window={model_context_window} must exceed DSpark proposal token \
-             count={dspark_num_spec_tokens}"
+            "model context window={model_context_window} must exceed block-spec proposal token \
+             count={block_spec_num_spec_tokens}"
         ));
     }
-    Ok(model_context_window - dspark_num_spec_tokens)
+    Ok(model_context_window - block_spec_num_spec_tokens)
 }
 
 pub fn block_cache_capacity(

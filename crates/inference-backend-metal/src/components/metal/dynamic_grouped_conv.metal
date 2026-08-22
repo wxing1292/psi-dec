@@ -1,10 +1,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void dynamic_grouped_conv_bf16_f32(
+kernel void dynamic_grouped_conv_bf16(
     device const bfloat* hidden [[buffer(0)]],
     device const bfloat* projected_coefficients [[buffer(1)]],
-    device const float* base [[buffer(2)]],
+    device const bfloat* base [[buffer(2)]],
     device bfloat* output [[buffer(3)]],
     constant uint& num_active_query_blocks [[buffer(4)]],
     constant uint& query_block_size [[buffer(5)]],

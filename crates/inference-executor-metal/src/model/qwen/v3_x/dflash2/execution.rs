@@ -14,6 +14,7 @@ use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2WeightBindings;
 use inference_executor_core::model::qwen::v3_x::dflash2::resolve_qwen3x_dflash2_weight_bindings;
 use inference_executor_core::sampling::SamplerConfig;
+use inference_executor_core::sampling::SpecPrefillSelection;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::block_spec::state::BlockSpecGQAState;
@@ -21,6 +22,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::embedding::Embed;
+use crate::model::main_residual_capture::MainResidualRows;
 use crate::model::qwen::v3_x::dflash2::embed::Qwen3xDFlash2Embed;
 use crate::model::qwen::v3_x::dflash2::embed::Qwen3xDFlash2EmbedArgs;
 use crate::model::qwen::v3_x::dflash2::embed::Qwen3xDFlash2EmbedReplayKey;
@@ -51,6 +53,9 @@ pub struct Qwen3xDFlash2Execution {
     body: Replay<Qwen3xDFlash2Body>,
     output: Replay<Qwen3xDFlash2Output>,
     unloaded_model: Option<Qwen3xDFlash2Model>,
+    prefill_main_row_indices: Buffer,
+    prefill_req_slots: Buffer,
+    prefill_flat_token_indices: Buffer,
     hidden_input: Rc<Buffer>,
     hidden_output: Rc<Buffer>,
     page_table_layout: GQAPageTableLayout,
@@ -89,10 +94,7 @@ impl<'a> Qwen3xDFlash2ProposalInput<'a> {
 impl Qwen3xDFlash2Execution {
     pub fn new(device: &Device, loaded: Qwen3xDFlash2Loaded) -> Self {
         assert!(loaded.num_spec_tokens > 0);
-        let query_block_size = loaded
-            .num_spec_tokens
-            .checked_add(1)
-            .expect("Qwen3x DFlash2 query block size must fit usize");
+        let query_block_size = loaded.num_spec_tokens + 1;
         let max_query_tokens = (loaded.page_table_layout.num_req_slots as usize)
             .checked_mul(query_block_size)
             .expect("Qwen3x DFlash2 query token capacity must fit usize");
@@ -109,6 +111,9 @@ impl Qwen3xDFlash2Execution {
             embed: Replay::new("Qwen3x DFlash2 Embed", Qwen3xDFlash2Embed::new(loaded.embed)),
             body: Replay::new("Qwen3x DFlash2 Body", Qwen3xDFlash2Body::new(Rc::clone(&loaded.model))),
             output: Replay::new("Qwen3x DFlash2 Output", loaded.output),
+            prefill_main_row_indices: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
+            prefill_req_slots: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
+            prefill_flat_token_indices: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
             unloaded_model: None,
             hidden_input: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
             hidden_output: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
@@ -261,9 +266,34 @@ impl Qwen3xDFlash2Execution {
     pub fn record_prefill(
         &mut self,
         runtime: &MetalReplayRuntime<'_>,
-        input: &Qwen3xDFlash2PrefillArgs<'_>,
+        selection: &SpecPrefillSelection,
+        pages: &Buffer,
     ) -> Qwen3xDFlash2PrefillRecording {
-        let (key, _) = self.prefill.record(runtime, input);
+        let num_tokens: u32 = selection
+            .main_row_indices
+            .len()
+            .try_into()
+            .expect("Qwen3x DFlash2 Prefill token count must fit u32");
+        assert_eq!(selection.req_slots.len(), selection.main_row_indices.len());
+        assert_eq!(selection.flat_token_indices.len(), selection.main_row_indices.len());
+        self.prefill_main_row_indices
+            .write_typed(0, &selection.main_row_indices);
+        self.prefill_req_slots.write_typed(0, &selection.req_slots);
+        self.prefill_flat_token_indices
+            .write_typed(0, &selection.flat_token_indices);
+        let main_rows = if selection.main_rows_are_prefix() {
+            MainResidualRows::Prefix
+        } else {
+            MainResidualRows::Indices(&self.prefill_main_row_indices)
+        };
+        let input = Qwen3xDFlash2PrefillArgs {
+            num_tokens,
+            main_rows,
+            req_slots: &self.prefill_req_slots,
+            flat_token_indices: &self.prefill_flat_token_indices,
+            pages,
+        };
+        let (key, _) = self.prefill.record(runtime, &input);
         Qwen3xDFlash2PrefillRecording { key }
     }
 
@@ -385,6 +415,7 @@ fn dflash2_query_layout(
 ) -> (Vec<u32>, Vec<Range<u32>>) {
     assert!(query_block_size > 0, "Qwen3x DFlash2 query block must contain rows");
     assert!(sliding_window > 0, "Qwen3x DFlash2 sliding window must contain tokens");
+    let query_block_size_u32 = u32::try_from(query_block_size).expect("Qwen3x DFlash2 query block size must fit u32");
     let capacity = anchor_positions
         .len()
         .checked_mul(query_block_size)
@@ -393,14 +424,13 @@ fn dflash2_query_layout(
     let mut visible_history_token_ranges = Vec::with_capacity(capacity);
     for &anchor_position in anchor_positions {
         assert!(anchor_position > 0, "Qwen3x DFlash2 Decode requires a nonempty history");
+        assert!(
+            anchor_position <= u32::MAX - query_block_size_u32,
+            "Qwen3x DFlash2 query positions must fit u32"
+        );
         for block_offset in 0..query_block_size {
-            let query_position = anchor_position
-                .checked_add(block_offset as u32)
-                .expect("Qwen3x DFlash2 query token position must fit u32");
-            let history_begin = query_position
-                .checked_add(1)
-                .expect("Qwen3x DFlash2 visible position bound must fit u32")
-                .saturating_sub(sliding_window);
+            let query_position = anchor_position + block_offset as u32;
+            let history_begin = (query_position + 1).saturating_sub(sliding_window);
             assert!(
                 history_begin < anchor_position,
                 "Qwen3x DFlash2 sliding history must contain a token for every query row"

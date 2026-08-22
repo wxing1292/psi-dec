@@ -60,7 +60,6 @@ fn model_state_io_27b_dspark_full_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(DSPARK_27B_DIR_ENV),
-        Some(num_spec_tokens()),
         executor_config(),
     )
     .expect("Qwen3.6 27B with DSpark must initialize");
@@ -73,7 +72,6 @@ fn model_state_io_27b_dspark_selected_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_27B_DIR_ENV),
         model_dir(DSPARK_27B_DIR_ENV),
-        Some(num_spec_tokens()),
         executor_config(),
     )
     .expect("Qwen3.6 27B with DSpark must initialize");
@@ -112,7 +110,6 @@ fn model_state_io_35b_dspark_full_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(DSPARK_35B_DIR_ENV),
-        Some(num_spec_tokens()),
         executor_config(),
     )
     .expect("Qwen3.6 35B with DSpark must initialize");
@@ -125,7 +122,6 @@ fn model_state_io_35b_dspark_selected_state_unload_load() {
     let model = init_qwen_3_5_model_with_dspark(
         model_dir(MODEL_35B_DIR_ENV),
         model_dir(DSPARK_35B_DIR_ENV),
-        Some(num_spec_tokens()),
         executor_config(),
     )
     .expect("Qwen3.6 35B with DSpark must initialize");
@@ -323,7 +319,7 @@ fn run_one_decode(model: &mut inference_executor_metal::model::qwen::v3_5::execu
     debug_assert!(!run_spec || (!run_spec_prefill && !run_spec_decode));
     if run_spec || run_spec_prefill || run_spec_decode {
         if run_spec_prefill {
-            model.prefill_spec(&mut recorder, &model_batch);
+            model.prefill_spec(&mut recorder, &model_batch, &sampled);
         }
         if run_spec_decode {
             model.decode_spec(&mut recorder, &model_batch, &sampled);

@@ -169,7 +169,12 @@ pub trait ReplayableModel {
         false
     }
 
-    fn prefill_spec(&mut self, _recorder: &mut Self::ModelOpsRecorder, _model_batch_req: &Self::ModelBatchRequest) {
+    fn prefill_spec(
+        &mut self,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _sampled_output: &Self::SampledOutput,
+    ) {
         panic!("model executor does not support Spec Prefill")
     }
 

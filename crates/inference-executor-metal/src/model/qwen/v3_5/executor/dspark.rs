@@ -16,15 +16,13 @@ impl Qwen35Executor {
             let decision = decisions
                 .get(decision_index)
                 .expect("qwen3.5 DSpark requires one Main decision per decode request");
-            let num_spec_tokens = microbatch.num_spec_tokens(req_index) as usize;
+            let num_spec_tokens = microbatch.num_spec_tokens(req_index);
             assert!(
-                decision.validated_tokens.len() <= num_spec_tokens,
+                decision.validated_tokens.len() <= num_spec_tokens as usize,
                 "qwen3.5 DSpark accepted-token count exceeds the speculative suffix"
             );
             let q_end = microbatch.cu_tokens()[req_index + 1] as usize;
-            let spec_start = q_end
-                .checked_sub(num_spec_tokens)
-                .expect("qwen3.5 speculative suffix must fit the request");
+            let spec_start = q_end - num_spec_tokens as usize;
             assert!(
                 microbatch.flat_token_ids()[spec_start..spec_start + decision.validated_tokens.len()]
                     .iter()
@@ -34,26 +32,9 @@ impl Qwen35Executor {
                     })),
                 "qwen3.5 accepted tokens must match the speculative input prefix"
             );
-            let num_fixed_tokens = microbatch
-                .q_len(req_index)
-                .checked_sub(
-                    num_spec_tokens
-                        .try_into()
-                        .expect("qwen3.5 speculative-token count must fit u32"),
-                )
-                .expect("qwen3.5 speculative suffix must fit q_len");
-            let anchor_position = microbatch.token_indices()[req_index]
-                .checked_add(num_fixed_tokens)
-                .and_then(|position| {
-                    position.checked_add(
-                        decision
-                            .validated_tokens
-                            .len()
-                            .try_into()
-                            .expect("qwen3.5 accepted-token count must fit u32"),
-                    )
-                })
-                .expect("qwen3.5 DSpark anchor position must fit u32");
+            let num_fixed_tokens = microbatch.q_len(req_index) - num_spec_tokens;
+            let anchor_position =
+                microbatch.token_indices()[req_index] + num_fixed_tokens + decision.validated_tokens.len() as u32;
             req_slots.push(microbatch.req_slots()[req_index]);
             anchor_token_ids.push(decision.sampled_token);
             anchor_positions.push(anchor_position);

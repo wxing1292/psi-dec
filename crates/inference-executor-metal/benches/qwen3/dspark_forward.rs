@@ -264,7 +264,7 @@ impl MainFixture {
             num_tokens_per_block: 1024,
         };
         let model = match dspark_model_dir {
-            Some(dspark_model_dir) => init_qwen_3_model_with_dspark(model_dir, dspark_model_dir, None, executor_config),
+            Some(dspark_model_dir) => init_qwen_3_model_with_dspark(model_dir, dspark_model_dir, executor_config),
             None => init_qwen_3_model(model_dir, executor_config),
         }
         .expect("unable to initialize Main comparison executor");
@@ -302,7 +302,7 @@ impl MainFixture {
         let sampled = self.model.read_main(&recorder, &prepared, replay_elapsed);
         assert_eq!(self.model.sampled_output_len(&sampled), 0);
         let spec_replay_elapsed = if self.model.run_spec_prefill(&prepared) {
-            self.model.prefill_spec(&mut recorder, &prepared);
+            self.model.prefill_spec(&mut recorder, &prepared, &sampled);
             let replay_start = Instant::now();
             self.model.submit_spec(&recorder).wait();
             replay_start.elapsed()

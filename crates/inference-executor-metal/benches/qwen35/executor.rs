@@ -261,7 +261,7 @@ impl ExecutorFixture {
         debug_assert!(!run_spec || (!run_spec_prefill && !run_spec_decode));
         if run_spec || run_spec_prefill || run_spec_decode {
             if run_spec_prefill {
-                self.model.prefill_spec(&mut recorder, &model_batch_req);
+                self.model.prefill_spec(&mut recorder, &model_batch_req, &sampled);
             }
             if run_spec_decode {
                 self.model.decode_spec(&mut recorder, &model_batch_req, &sampled);

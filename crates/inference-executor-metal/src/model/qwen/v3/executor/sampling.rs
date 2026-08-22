@@ -126,15 +126,21 @@ impl Qwen3Executor {
         let mut sample_offset = 0usize;
         for &req_index in &prepared.decode_req_indices {
             let config = microbatch.sampler_configs()[req_index];
+            let sample_position = sample_positions[sample_offset];
+            let num_spec_tokens = microbatch.num_spec_tokens(req_index);
+            assert!(
+                sample_position <= u32::MAX - num_spec_tokens,
+                "Qwen3 rejection sampling positions must fit u32"
+            );
             runtime_params.push(SparseRejectionSamplingReqParams {
                 seed: config.seed(),
-                sample_position: sample_positions[sample_offset],
+                sample_position,
                 top_k: self
                     .sampler_bounds
                     .active_top_k(&config)
                     .expect("Qwen3 rejection sampler config must fit bounds"),
             });
-            sample_offset += microbatch.num_spec_tokens(req_index) as usize + 1;
+            sample_offset += num_spec_tokens as usize + 1;
         }
         assert_eq!(
             sample_offset,

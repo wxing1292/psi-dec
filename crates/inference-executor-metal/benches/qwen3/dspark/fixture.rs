@@ -1,4 +1,3 @@
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
@@ -92,7 +91,6 @@ impl Fixture {
         num_requests: usize,
         start_context: usize,
         num_cache_pages: usize,
-        requested_num_spec_tokens: Option<NonZeroUsize>,
     ) -> Self {
         let num_spec_tokens = match case {
             Case::Main => 0,
@@ -101,10 +99,7 @@ impl Fixture {
                     dspark_model_dir.expect("Qwen3 DSpark benchmark case requires a DSpark model directory"),
                 )
                 .expect("unable to load Qwen3 DSpark benchmark config");
-                config
-                    .resolve_num_spec_tokens(requested_num_spec_tokens)
-                    .expect("invalid Qwen3 DSpark benchmark num_spec_tokens")
-                    .get()
+                config.num_spec_tokens().get()
             },
         };
         let max_tokens = num_requests
@@ -127,7 +122,6 @@ impl Fixture {
                 init_qwen_3_model_with_dspark(
                     model_dir,
                     dspark_model_dir.expect("Qwen3 DSpark benchmark requires a DSpark model directory"),
-                    requested_num_spec_tokens,
                     config,
                 )
             },
@@ -217,7 +211,8 @@ impl Fixture {
         if run_spec_prefill || run_spec_decode {
             let spec_record_start = Instant::now();
             if run_spec_prefill {
-                self.model.prefill_spec(&mut recorder, &model_batch_request);
+                self.model
+                    .prefill_spec(&mut recorder, &model_batch_request, &sampled_output);
             }
             if run_spec_decode {
                 self.model

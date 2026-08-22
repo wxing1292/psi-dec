@@ -390,7 +390,8 @@ where
             let spec_start = Instant::now();
             if run_spec_prefill {
                 let _span = profiling::span("model.prefill_spec.record");
-                self.model.prefill_spec(&mut recorder, &model_batch_req);
+                self.model
+                    .prefill_spec(&mut recorder, &model_batch_req, &sampled_output);
             }
             if run_spec_decode {
                 let _span = profiling::span("model.decode_spec.record");
@@ -981,7 +982,12 @@ mod tests {
             self.run_prefill
         }
 
-        fn prefill_spec(&mut self, _recorder: &mut Self::ModelOpsRecorder, _model_batch_req: &Self::ModelBatchRequest) {
+        fn prefill_spec(
+            &mut self,
+            _recorder: &mut Self::ModelOpsRecorder,
+            _model_batch_req: &Self::ModelBatchRequest,
+            _sampled_output: &Self::SampledOutput,
+        ) {
             self.push(SpecLifecycleEvent::PrefillSpec);
         }
 

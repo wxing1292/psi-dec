@@ -215,13 +215,10 @@ pub fn qwen3x_dspark_gqa_core(
     num_spec_tokens: usize,
     dspark_layer_index: usize,
 ) -> BlockSpecGQACore {
-    assert!(
-        num_spec_tokens > 0,
-        "Qwen3x DSpark attention requires speculative tokens"
-    );
-    assert!(
-        num_spec_tokens <= config.block_size,
-        "Qwen3x DSpark attention proposal length must not exceed the checkpoint block_size"
+    assert_eq!(
+        num_spec_tokens,
+        config.num_spec_tokens().get(),
+        "Qwen3x DSpark proposal count must match the checkpoint"
     );
     assert!(
         dspark_layer_index < config.num_hidden_layers,
@@ -353,22 +350,6 @@ mod tests {
         assert_eq!(core.attention.num_kv_heads, 1);
         assert_eq!(metal.q.group_size, 32);
         assert_eq!(metal.q.bits, 4);
-    }
-
-    #[test]
-    fn test_gqa_uses_configured_spec_tokens_below_checkpoint_limit() {
-        let config = config();
-        let core = qwen3x_dspark_gqa_core(&config, 3, 0);
-
-        assert_eq!(config.block_size, 7);
-        assert_eq!(core.block_size, 3);
-    }
-
-    #[test]
-    #[should_panic(expected = "must not exceed the checkpoint block_size")]
-    fn test_gqa_rejects_configured_spec_tokens_above_checkpoint_limit() {
-        let config = config();
-        let _ = qwen3x_dspark_gqa_core(&config, 8, 0);
     }
 
     #[test]

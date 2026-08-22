@@ -17,6 +17,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
+use crate::model::main_residual_capture::MainResidualRows;
 use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayer;
 use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerInput;
 use crate::model::qwen::v3_x::dspark::layer::Qwen3xDSparkLayerScratch;
@@ -42,6 +43,7 @@ pub struct Qwen3xDSparkBody {
 #[derive(Clone, Copy)]
 pub struct Qwen3xDSparkPrefillArgs<'a> {
     pub num_tokens: u32,
+    pub main_rows: MainResidualRows<'a>,
     pub req_slots: &'a Buffer,
     pub flat_token_indices: &'a Buffer,
     pub pages: &'a Buffer,
@@ -59,6 +61,7 @@ pub struct Qwen3xDSparkBodyArgs<'a> {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkPrefillReplayKey {
     num_tokens: u32,
+    gathers_main_residual_rows: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -209,7 +212,7 @@ impl Qwen3xDSparkModel {
             .main_feature_projector
             .as_ref()
             .expect("DSpark Main-feature projector shell must exist")
-            .record(recorder, args.num_tokens);
+            .record(recorder, args.num_tokens, args.main_rows);
         for layer in &self.layers {
             layer.record_prefill(
                 recorder,
@@ -284,6 +287,7 @@ impl ReplayComponent for Qwen3xDSparkPrefill {
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         Qwen3xDSparkPrefillReplayKey {
             num_tokens: input.num_tokens,
+            gathers_main_residual_rows: input.main_rows.gathers(),
         }
     }
 

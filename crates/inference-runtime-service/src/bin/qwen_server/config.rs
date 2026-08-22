@@ -22,10 +22,7 @@ const MAX_QUEUED_REQUESTS: usize = 32;
 #[derive(Debug, Eq, PartialEq)]
 pub enum Qwen3ModelMode {
     Vanilla,
-    DSpark {
-        model_dir: PathBuf,
-        num_spec_tokens: Option<NonZeroUsize>,
-    },
+    DSpark { model_dir: PathBuf },
 }
 
 #[derive(Debug)]
@@ -44,11 +41,6 @@ pub struct Qwen3Config {
 
 impl Qwen3Config {
     pub fn from_args(args: Qwen3Args) -> Result<Self> {
-        if args.num_spec_tokens.is_some() && args.hf_dspark_model_dir.is_none() {
-            return Err(log_info_invalid_argument!(
-                "--hf-dspark-model-dir is required when --num-spec-tokens is set"
-            ));
-        }
         validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
@@ -68,12 +60,7 @@ impl Qwen3Config {
         }
 
         let model_mode = match args.hf_dspark_model_dir {
-            Some(model_dir) => {
-                Qwen3ModelMode::DSpark {
-                    model_dir,
-                    num_spec_tokens: args.num_spec_tokens,
-                }
-            },
+            Some(model_dir) => Qwen3ModelMode::DSpark { model_dir },
             None => Qwen3ModelMode::Vanilla,
         };
         Ok(Self {
@@ -156,7 +143,9 @@ pub enum Qwen35ModelMode {
     },
     DSpark {
         model_dir: PathBuf,
-        num_spec_tokens: Option<NonZeroUsize>,
+    },
+    DFlash2 {
+        model_dir: PathBuf,
     },
 }
 
@@ -169,7 +158,7 @@ impl Qwen35ModelMode {
                     .checked_add(1)
                     .expect("validated Qwen3.5 MTP cache-lane count must fit usize")
             },
-            Self::Vanilla | Self::DSpark { .. } => 1,
+            Self::Vanilla | Self::DSpark { .. } | Self::DFlash2 { .. } => 1,
         }
     }
 }
@@ -190,14 +179,22 @@ pub struct Qwen35Config {
 
 impl Qwen35Config {
     pub fn from_args(args: Qwen35Args) -> Result<Self> {
-        if args.hf_dspark_model_dir.is_some() && args.hf_mtp_model_dir.is_some() {
+        let num_speculator_checkpoints = [
+            args.hf_mtp_model_dir.is_some(),
+            args.hf_dspark_model_dir.is_some(),
+            args.hf_dflash2_model_dir.is_some(),
+        ]
+        .into_iter()
+        .filter(|configured| *configured)
+        .count();
+        if num_speculator_checkpoints > 1 {
             return Err(log_info_invalid_argument!(
-                "--hf-dspark-model-dir is mutually exclusive with Qwen3.5 MTP"
+                "--hf-mtp-model-dir, --hf-dspark-model-dir, and --hf-dflash2-model-dir are mutually exclusive"
             ));
         }
-        if args.num_spec_tokens.is_some() && args.hf_mtp_model_dir.is_none() && args.hf_dspark_model_dir.is_none() {
+        if args.num_spec_tokens.is_some() && args.hf_mtp_model_dir.is_none() {
             return Err(log_info_invalid_argument!(
-                "--hf-mtp-model-dir or --hf-dspark-model-dir is required when --num-spec-tokens is set"
+                "--num-spec-tokens controls MTP proposal length and requires --hf-mtp-model-dir"
             ));
         }
         let num_mtp_tokens = args
@@ -223,21 +220,17 @@ impl Qwen35Config {
             ));
         }
 
-        let model_mode = match (args.hf_mtp_model_dir, args.hf_dspark_model_dir, num_mtp_tokens) {
-            (None, Some(model_dir), None) => {
-                Qwen35ModelMode::DSpark {
-                    model_dir,
-                    num_spec_tokens: args.num_spec_tokens,
-                }
-            },
-            (Some(model_dir), None, Some(num_spec_tokens)) => {
-                Qwen35ModelMode::MTP {
-                    model_dir,
-                    num_spec_tokens,
-                }
-            },
-            (None, None, None) => Qwen35ModelMode::Vanilla,
-            _ => unreachable!("validated Qwen3.5 model mode must be complete and exclusive"),
+        let model_mode = if let Some(model_dir) = args.hf_mtp_model_dir {
+            Qwen35ModelMode::MTP {
+                model_dir,
+                num_spec_tokens: num_mtp_tokens.expect("configured Qwen3.5 MTP must have a proposal length"),
+            }
+        } else if let Some(model_dir) = args.hf_dspark_model_dir {
+            Qwen35ModelMode::DSpark { model_dir }
+        } else if let Some(model_dir) = args.hf_dflash2_model_dir {
+            Qwen35ModelMode::DFlash2 { model_dir }
+        } else {
+            Qwen35ModelMode::Vanilla
         };
         Ok(Self {
             grpc_listen_addr: args.grpc_listen_addr,

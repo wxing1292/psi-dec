@@ -1,5 +1,3 @@
-use std::num::NonZeroUsize;
-
 use serde_json::Value;
 
 use super::Qwen3xDSparkCheckpointConfig;
@@ -130,23 +128,6 @@ fn test_adapts_qwen38_draft_config() {
             original_max_position_embeddings: 8192,
             truncate: true,
         }
-    );
-}
-
-#[test]
-fn test_resolves_configured_spec_tokens_within_checkpoint_limit() {
-    let config = parse(canonical_config()).unwrap();
-
-    assert_eq!(config.resolve_num_spec_tokens(None).unwrap().get(), 7);
-    assert_eq!(config.resolve_num_spec_tokens(NonZeroUsize::new(1)).unwrap().get(), 1);
-    assert_eq!(config.resolve_num_spec_tokens(NonZeroUsize::new(4)).unwrap().get(), 4);
-    assert_eq!(config.resolve_num_spec_tokens(NonZeroUsize::new(7)).unwrap().get(), 7);
-    assert!(
-        config
-            .resolve_num_spec_tokens(NonZeroUsize::new(8))
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds Qwen3 DSpark checkpoint block_size=7")
     );
 }
 
