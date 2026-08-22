@@ -195,6 +195,24 @@ The converter and loader derive the query width from `num_attention_heads * head
 An affine checkpoint that was generated before confidence support does not contain these tensors.
 Regenerate that checkpoint into a new output directory.
 
+### Qwen3x DFlash2 conversion
+
+Convert the official BF16 Qwen3.8 DFlash2 checkpoint to the affine executor format:
+
+```sh
+cargo run -p inference-executor-core --bin qwen3_dflash2_quantize -- \
+  --input-dir /path/to/Qwen3.8-27B-DFlash2 \
+  --output-dir /path/to/Qwen3.8-27B-DFlash2-affine
+```
+
+The output directory must not exist before you run the converter.
+The default policy uses group size 64 and 4-bit affine matrices.
+It uses 6-bit affine matrices for layer 2 and layer 4 `v_proj` and `down_proj` weights.
+This policy matches the tensor-level Q4_K_M choices in `z-lab/Qwen3.8-27B-DFlash2-GGUF`.
+The converter writes matrix payloads as `U32` and writes affine parameters, norms, and dynamic-convolution base kernels
+as `F32`.
+The output checkpoint contains no BF16 tensor.
+
 Qwen3 Main-only startup:
 
 ```sh

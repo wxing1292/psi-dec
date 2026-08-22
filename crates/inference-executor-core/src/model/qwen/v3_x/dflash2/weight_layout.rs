@@ -107,8 +107,8 @@ impl Qwen3xDFlash2WeightBindings {
         names.push(&self.final_norm_weight);
         names.extend([
             self.selector.hidden_projection.weight.as_str(),
-            self.selector.predecessor_codebook.weight.as_str(),
-            self.selector.successor_codebook.weight.as_str(),
+            "candidate_selector.predecessor_codebook",
+            "candidate_selector.successor_codebook",
         ]);
         names
     }
@@ -189,7 +189,7 @@ fn resolve_exact_layout<'a>(
     let actual = tensor_names.into_iter().collect::<HashSet<_>>();
     if actual.is_empty() {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 checkpoint layout resolution requires a nonempty tensor manifest",
+            "Qwen3x DFlash2 checkpoint layout resolution requires a nonempty tensor manifest",
         ));
     }
     let bindings = Qwen3xDFlash2WeightBindings::from_config(config);
@@ -202,7 +202,7 @@ fn resolve_exact_layout<'a>(
     assert_eq!(
         expected.len(),
         expected_names.len(),
-        "Qwen3 DFlash2 binding tree must not contain duplicate tensor names"
+        "Qwen3x DFlash2 binding tree must not contain duplicate tensor names"
     );
     let mut missing = expected.difference(&actual).copied().collect::<Vec<_>>();
     let mut unexpected = actual.difference(&expected).copied().collect::<Vec<_>>();
@@ -211,7 +211,7 @@ fn resolve_exact_layout<'a>(
     if !missing.is_empty() || !unexpected.is_empty() {
         let kind = if source { "source" } else { "affine" };
         return Err(ModelExecutorError::custom(format!(
-            "Qwen3 DFlash2 {kind} checkpoint must match the exact tensor layout; missing={missing:?}, \
+            "Qwen3x DFlash2 {kind} checkpoint must match the exact tensor layout; missing={missing:?}, \
              unexpected={unexpected:?}"
         )));
     }

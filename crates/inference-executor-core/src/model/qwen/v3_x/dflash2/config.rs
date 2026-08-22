@@ -47,7 +47,7 @@ impl Qwen3xDFlash2Config {
         let max_spec_tokens = self.block_size - 1;
         let num_spec_tokens = requested.unwrap_or_else(|| {
             NonZeroUsize::new(max_spec_tokens)
-                .expect("validated Qwen3 DFlash2 block_size must contain an anchor and proposal token")
+                .expect("validated Qwen3x DFlash2 block_size must contain an anchor and proposal token")
         });
         if num_spec_tokens.get() > max_spec_tokens {
             let query_rows = num_spec_tokens
@@ -89,7 +89,7 @@ impl Qwen3xDFlash2Config {
         .collect::<Vec<_>>();
         if !mismatches.is_empty() {
             return Err(ModelExecutorError::custom(format!(
-                "Qwen3 DFlash2 config is incompatible with the Main model: {}",
+                "Qwen3x DFlash2 config is incompatible with the Main model: {}",
                 mismatches.join(", ")
             )));
         }
@@ -159,27 +159,27 @@ pub fn init_qwen3x_dflash2_config(model_dir: impl AsRef<Path>) -> Result<Qwen3xD
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(&config_path).map_err(|error| {
         ModelExecutorError::custom(format!(
-            "unable to open Qwen3 DFlash2 config file {config_path:?}, error: {error:?}"
+            "unable to open Qwen3x DFlash2 config file {config_path:?}, error: {error:?}"
         ))
     })?;
     let value = serde_json::from_reader::<_, Value>(file).map_err(|error| {
         ModelExecutorError::custom(format!(
-            "unable to parse Qwen3 DFlash2 config file {config_path:?}, error: {error:?}"
+            "unable to parse Qwen3x DFlash2 config file {config_path:?}, error: {error:?}"
         ))
     })?;
     let value = adapt_checkpoint_config(value).map_err(|error| {
         ModelExecutorError::custom(format!(
-            "unable to adapt Qwen3 DFlash2 config file {config_path:?}, error: {error}"
+            "unable to adapt Qwen3x DFlash2 config file {config_path:?}, error: {error}"
         ))
     })?;
     let checkpoint = serde_json::from_value::<CheckpointConfig>(value).map_err(|error| {
         ModelExecutorError::custom(format!(
-            "unable to parse canonical Qwen3 DFlash2 config from {config_path:?}, error: {error:?}"
+            "unable to parse canonical Qwen3x DFlash2 config from {config_path:?}, error: {error:?}"
         ))
     })?;
     normalize(checkpoint).map_err(|error| {
         ModelExecutorError::custom(format!(
-            "unable to normalize Qwen3 DFlash2 config from {config_path:?}, error: {error}"
+            "unable to normalize Qwen3x DFlash2 config from {config_path:?}, error: {error}"
         ))
     })
 }
@@ -187,20 +187,20 @@ pub fn init_qwen3x_dflash2_config(model_dir: impl AsRef<Path>) -> Result<Qwen3xD
 fn adapt_checkpoint_config(mut value: Value) -> Result<Value, ModelExecutorError> {
     let config = value
         .as_object_mut()
-        .ok_or_else(|| ModelExecutorError::custom("Qwen3 DFlash2 config must be a JSON object"))?;
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 config must be a JSON object"))?;
     let architecture = checkpoint_architecture(config)?.unwrap_or(CANONICAL_ARCHITECTURE);
     match architecture {
         CANONICAL_ARCHITECTURE => {
             if config.contains_key("dflash_config") {
                 return Err(ModelExecutorError::custom(
-                    "canonical Qwen3 DFlash2 checkpoint config must use flat fields",
+                    "canonical Qwen3x DFlash2 checkpoint config must use flat fields",
                 ));
             }
         },
         SOURCE_ARCHITECTURE => adapt_source_config(config)?,
         architecture => {
             return Err(ModelExecutorError::custom(format!(
-                "unsupported Qwen3 DFlash2 checkpoint architecture {architecture:?}; no config adapter is registered"
+                "unsupported Qwen3x DFlash2 checkpoint architecture {architecture:?}; no config adapter is registered"
             )));
         },
     }
@@ -214,18 +214,18 @@ fn checkpoint_architecture(config: &Map<String, Value>) -> Result<Option<&str>, 
     };
     let architectures = architectures
         .as_array()
-        .ok_or_else(|| ModelExecutorError::custom("Qwen3 DFlash2 architectures must be a JSON array"))?;
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 architectures must be a JSON array"))?;
     match architectures.as_slice() {
         [] => Ok(None),
         [architecture] => {
             architecture
                 .as_str()
                 .map(Some)
-                .ok_or_else(|| ModelExecutorError::custom("Qwen3 DFlash2 architecture must be a string"))
+                .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 architecture must be a string"))
         },
         _ => {
             Err(ModelExecutorError::custom(
-                "Qwen3 DFlash2 architectures must contain at most one entry",
+                "Qwen3x DFlash2 architectures must contain at most one entry",
             ))
         },
     }
@@ -304,27 +304,27 @@ fn normalize(mut config: CheckpointConfig) -> Result<Qwen3xDFlash2Config, ModelE
 fn validate_semantics(config: &CheckpointConfig) -> Result<(), ModelExecutorError> {
     if config.model_type != "qwen3" {
         return Err(ModelExecutorError::custom(format!(
-            "unsupported Qwen3 DFlash2 model_type {:?}; expected \"qwen3\"",
+            "unsupported Qwen3x DFlash2 model_type {:?}; expected \"qwen3\"",
             config.model_type
         )));
     }
     if config.attention_bias || config.attention_dropout != 0.0 || !config.attention_dropout.is_finite() {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 requires attention_bias=false and attention_dropout=0",
+            "Qwen3x DFlash2 requires attention_bias=false and attention_dropout=0",
         ));
     }
     if config.is_causal {
-        return Err(ModelExecutorError::custom("Qwen3 DFlash2 requires is_causal=false"));
+        return Err(ModelExecutorError::custom("Qwen3x DFlash2 requires is_causal=false"));
     }
     if config.hidden_act != "silu" {
         return Err(ModelExecutorError::custom(format!(
-            "unsupported Qwen3 DFlash2 hidden_act {:?}; expected \"silu\"",
+            "unsupported Qwen3x DFlash2 hidden_act {:?}; expected \"silu\"",
             config.hidden_act
         )));
     }
     if config.tie_word_embeddings || !config.use_cache || !config.use_sliding_window {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 requires tie_word_embeddings=false, use_cache=true, and use_sliding_window=true",
+            "Qwen3x DFlash2 requires tie_word_embeddings=false, use_cache=true, and use_sliding_window=true",
         ));
     }
     let dimensions = [
@@ -346,22 +346,22 @@ fn validate_semantics(config: &CheckpointConfig) -> Result<(), ModelExecutorErro
     ];
     if let Some((name, _)) = dimensions.into_iter().find(|&(_, value)| value == 0) {
         return Err(ModelExecutorError::custom(format!(
-            "Qwen3 DFlash2 {name} must be positive"
+            "Qwen3x DFlash2 {name} must be positive"
         )));
     }
     if config.block_size < 2 {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 block_size must contain an anchor and at least one proposal token",
+            "Qwen3x DFlash2 block_size must contain an anchor and at least one proposal token",
         ));
     }
     if config.num_target_layers < 2 {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 num_target_layers must contain a captured layer and the unsupported final Main layer",
+            "Qwen3x DFlash2 num_target_layers must contain a captured layer and the unsupported final Main layer",
         ));
     }
     if !config.hidden_size.is_multiple_of(config.conv_group_size) {
         return Err(ModelExecutorError::custom(format!(
-            "Qwen3 DFlash2 conv_group_size={} must divide hidden_size={}",
+            "Qwen3x DFlash2 conv_group_size={} must divide hidden_size={}",
             config.conv_group_size, config.hidden_size
         )));
     }
@@ -369,23 +369,23 @@ fn validate_semantics(config: &CheckpointConfig) -> Result<(), ModelExecutorErro
     let _conv_projection_dim = num_conv_groups
         .checked_mul(config.conv_kernel_size)
         .and_then(|value| value.checked_mul(2))
-        .ok_or_else(|| ModelExecutorError::custom("Qwen3 DFlash2 convolution projection width must fit usize"))?;
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 convolution projection width must fit usize"))?;
     if config.head_dim < 2 || !config.head_dim.is_multiple_of(2) {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 head_dim must be positive and even",
+            "Qwen3x DFlash2 head_dim must be positive and even",
         ));
     }
     let _q_dim = config
         .num_attention_heads
         .checked_mul(config.head_dim)
-        .ok_or_else(|| ModelExecutorError::custom("Qwen3 DFlash2 query dimension must fit usize"))?;
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 query dimension must fit usize"))?;
     let _kv_dim = config
         .num_key_value_heads
         .checked_mul(config.head_dim)
-        .ok_or_else(|| ModelExecutorError::custom("Qwen3 DFlash2 key/value dimension must fit usize"))?;
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 key/value dimension must fit usize"))?;
     if !config.num_attention_heads.is_multiple_of(config.num_key_value_heads) {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 num_attention_heads must be divisible by num_key_value_heads",
+            "Qwen3x DFlash2 num_attention_heads must be divisible by num_key_value_heads",
         ));
     }
     if config.layer_types.len() != config.num_hidden_layers
@@ -395,7 +395,7 @@ fn validate_semantics(config: &CheckpointConfig) -> Result<(), ModelExecutorErro
             .any(|layer_type| layer_type != "sliding_attention")
     {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 layer_types must contain one sliding_attention entry per layer",
+            "Qwen3x DFlash2 layer_types must contain one sliding_attention entry per layer",
         ));
     }
     if config
@@ -403,33 +403,33 @@ fn validate_semantics(config: &CheckpointConfig) -> Result<(), ModelExecutorErro
         .is_some_and(|layers| layers != config.num_hidden_layers)
     {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 max_window_layers must equal num_hidden_layers when present",
+            "Qwen3x DFlash2 max_window_layers must equal num_hidden_layers when present",
         ));
     }
     if config.target_layer_ids.len() != config.num_hidden_layers {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 target_layer_ids length must equal num_hidden_layers",
+            "Qwen3x DFlash2 target_layer_ids length must equal num_hidden_layers",
         ));
     }
     if config.target_layer_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 target_layer_ids must be strictly increasing",
+            "Qwen3x DFlash2 target_layer_ids must be strictly increasing",
         ));
     }
     let final_main_layer = config.num_target_layers - 1;
     if config.target_layer_ids.iter().any(|&layer| layer >= final_main_layer) {
         return Err(ModelExecutorError::custom(format!(
-            "Qwen3 DFlash2 target_layer_ids must be below unsupported final Main layer {final_main_layer}"
+            "Qwen3x DFlash2 target_layer_ids must be below unsupported final Main layer {final_main_layer}"
         )));
     }
     if config.mask_token_id >= config.vocab_size || config.selector_top_k > config.vocab_size {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 mask_token_id and selector_top_k must fit the vocabulary",
+            "Qwen3x DFlash2 mask_token_id and selector_top_k must fit the vocabulary",
         ));
     }
     if !config.rms_norm_eps.is_finite() || config.rms_norm_eps <= 0.0 {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 rms_norm_eps must be finite and positive",
+            "Qwen3x DFlash2 rms_norm_eps must be finite and positive",
         ));
     }
     Ok(())
@@ -439,10 +439,10 @@ fn normalize_rope(config: &CheckpointConfig) -> Result<f32, ModelExecutorError> 
     let rope_theta = config
         .rope_parameters
         .rope_theta
-        .ok_or_else(|| ModelExecutorError::custom("Qwen3 DFlash2 rope_parameters.rope_theta must be present"))?;
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 rope_parameters.rope_theta must be present"))?;
     if !rope_theta.is_finite() || rope_theta <= 0.0 {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 rope_theta must be finite and positive",
+            "Qwen3x DFlash2 rope_theta must be finite and positive",
         ));
     }
     if config.rope_parameters.rope_type.as_deref() != Some("default")
@@ -457,7 +457,7 @@ fn normalize_rope(config: &CheckpointConfig) -> Result<f32, ModelExecutorError> 
         || config.rope_parameters.truncate.is_some()
     {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 requires full-dimension default RoPE without scaling parameters",
+            "Qwen3x DFlash2 requires full-dimension default RoPE without scaling parameters",
         ));
     }
     Ok(rope_theta)
@@ -468,7 +468,7 @@ fn validate_dtype(dtype: &str) -> Result<(), ModelExecutorError> {
         "bf16" | "bfloat16" => Ok(()),
         _ => {
             Err(ModelExecutorError::custom(format!(
-                "unsupported Qwen3 DFlash2 model IO dtype {dtype:?}; expected bfloat16"
+                "unsupported Qwen3x DFlash2 model IO dtype {dtype:?}; expected bfloat16"
             )))
         },
     }
@@ -477,12 +477,12 @@ fn validate_dtype(dtype: &str) -> Result<(), ModelExecutorError> {
 fn validate_quantization(config: &QuantizationConfig) -> Result<(), ModelExecutorError> {
     if !matches!(config.group_size, 32 | 64 | 128) || !matches!(config.bits, 2 | 3 | 4 | 6 | 8) {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 affine quantization requires group_size 32, 64, or 128 and bits 2, 3, 4, 6, or 8",
+            "Qwen3x DFlash2 affine quantization requires group_size 32, 64, or 128 and bits 2, 3, 4, 6, or 8",
         ));
     }
     if !matches!(config.mode.as_deref(), None | Some("affine")) {
         return Err(ModelExecutorError::custom(
-            "Qwen3 DFlash2 quantization mode must be affine",
+            "Qwen3x DFlash2 quantization mode must be affine",
         ));
     }
     for (name, tensor) in &config.tensor_overrides {
@@ -493,7 +493,7 @@ fn validate_quantization(config: &QuantizationConfig) -> Result<(), ModelExecuto
             || tensor.mode.as_deref().is_some_and(|mode| mode != "affine")
         {
             return Err(ModelExecutorError::custom(format!(
-                "Qwen3 DFlash2 quantization override {name:?} is not a supported affine layout"
+                "Qwen3x DFlash2 quantization override {name:?} is not a supported affine layout"
             )));
         }
     }
