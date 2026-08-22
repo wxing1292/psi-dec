@@ -134,6 +134,11 @@ component path as the design.
 
 ## Performance Investigations
 
+- Compare a complete base-2 GQA softmax family with the current natural-log family.
+  The experiment must migrate SplitKV SingleQ, SplitKV TiledQ, block SDPA, and their reducers as one compatible
+  partial-state ABI. It must not mix base-2 and natural-log partial statistics or add a per-partial log-base flag.
+  Compare focused Metal component performance and representative one-layer production GQA performance.
+  Change the default only if the complete base-2 family preserves parity and gives a measured gain.
 - Evaluate software-pipelined K and V loads for GQA `TiledQTokens` as a bounded experiment.
   The current `Tkv=16`, `D=256` K and V threadgroup tiles use 16.5 KiB.
   Duplicating them with the existing eight-value row padding requires 33 KiB.

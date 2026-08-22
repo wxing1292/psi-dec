@@ -118,11 +118,13 @@ fn assert_composite_matches_reference(visible_kv_token_begins: &[u32]) {
         num_total_partial_output_slots: 3,
     };
 
-    let q_values = bf16_pattern(num_q_tokens * num_q_heads * head_dim, 0.0013, -0.035);
-    let history_k = bf16_pattern(num_history_tokens * head_dim, -0.0009, 0.02);
-    let history_v = bf16_pattern(num_history_tokens * head_dim, 0.003, -0.1);
-    let local_k_values = bf16_pattern(num_q_tokens * head_dim, 0.0011, -0.025);
-    let local_v_values = bf16_pattern(num_q_tokens * head_dim, -0.002, 0.1);
+    // Keep the history and block maxima close but distinct. This makes the
+    // test sensitive to the log base in the shared partial-state ABI.
+    let q_values = vec![1.0; num_q_tokens * num_q_heads * head_dim];
+    let history_k = vec![0.176_776_69; num_history_tokens * head_dim];
+    let history_v = vec![1.0; num_history_tokens * head_dim];
+    let local_k_values = vec![0.220_970_87; num_q_tokens * head_dim];
+    let local_v_values = vec![-1.0; num_q_tokens * head_dim];
     let q = buffer(&device, &q_values, Dtype::Bfloat16);
     let local_k = buffer(&device, &local_k_values, Dtype::Bfloat16);
     let local_v = buffer(&device, &local_v_values, Dtype::Bfloat16);

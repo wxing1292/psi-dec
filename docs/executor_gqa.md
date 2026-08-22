@@ -581,6 +581,9 @@ Qwen3 uses its separate ungated GQA implementation.
 DSpark and DFlash2 keep separate model-level replay keys and submission ABIs.
 Both use the block-Spec replay shape with equal active and total token/range values and shared TaskTemplate padding.
 The generic composite map includes one block partial-output slot.
+All SplitKV and block-SDPA partial producers store `partial_max_logits` as natural logits.
+SingleQ, TiledQ, and block-SDPA use the natural exponential for online softmax and partial reduction.
+This rule keeps one log domain across every producer and consumer of the shared partial-state ABI.
 
 ### Execution strategy
 

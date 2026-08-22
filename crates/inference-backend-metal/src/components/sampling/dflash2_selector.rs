@@ -289,7 +289,6 @@ impl Operator for WalkInvocation<'_> {
         recorder.set_u32(9, self.shape.num_steps);
         recorder.set_u32(10, self.compute.config.top_k);
         recorder.set_u32(11, self.buffers.max_distribution_k);
-        recorder.set_u32(12, self.buffers.num_output_distributions);
         recorder.dispatch_threadblocks((self.shape.num_total_requests as usize, 1, 1), (1, 1, 1));
     }
 }

@@ -275,6 +275,8 @@ edge scores + sampler runtime parameters
 The first step uses the anchor token as every predecessor.
 Each later step uses the prior step's unary candidates as predecessors.
 The walk reads only the score row that the previous step selects.
+The score producer must write finite F32 values.
+The walk does not replace invalid scores with a fallback distribution.
 It applies temperature to the fixed candidate set.
 It does not apply top-p because the DFlash2 reference selector does not apply top-p after candidate construction.
 Each sparse distribution contains the exact probabilities that the walk uses.

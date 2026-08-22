@@ -178,6 +178,14 @@ impl DSparkMarkovSampling {
         assert_eq!(req_slots.len(), anchor_positions.len());
         assert_eq!(req_slots.len(), sampler_configs.len());
         assert!(req_slots.len() <= self.max_requests);
+        let max_position_increment =
+            u32::try_from(self.block_size).expect("DSpark proposal count must fit the sampling position domain");
+        assert!(
+            anchor_positions
+                .iter()
+                .all(|&anchor_position| anchor_position <= u32::MAX - max_position_increment),
+            "DSpark proposal sample positions must fit u32"
+        );
         self.anchor_token_ids.write_typed(
             0,
             &anchor_token_ids
@@ -199,11 +207,7 @@ impl DSparkMarkovSampling {
             );
             let sample_positions = anchor_positions
                 .iter()
-                .map(|&anchor_position| {
-                    anchor_position
-                        .checked_add(step_index as u32 + 1)
-                        .expect("DSpark proposal sample position must fit u32")
-                })
+                .map(|&anchor_position| anchor_position + step_index as u32 + 1)
                 .collect::<Vec<_>>();
             self.step_params[step_index].set_configs(sampler_configs, &sample_positions, SamplingDomain::Draft);
             let active = self.step_params[step_index].active_shape(sampler_configs);

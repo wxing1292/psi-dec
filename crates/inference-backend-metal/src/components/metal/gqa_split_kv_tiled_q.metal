@@ -161,7 +161,6 @@ kernel void gqa_split_kv_tiled_q_map(
         output_fragments[dim_fragment] = Vec2F32(0.0f);
     }
 
-    const float scale_log2 = ATTENTION_SCALE * M_LOG2E_F;
     const uint num_kv_iterations =
         (kv_token_end - kv_token_begin + uint(KV_TOKENS_PER_ITERATION - 1)) / uint(KV_TOKENS_PER_ITERATION);
     for (uint kv_iteration_index = 0; kv_iteration_index < num_kv_iterations; ++kv_iteration_index) {
@@ -241,7 +240,7 @@ kernel void gqa_split_kv_tiled_q_map(
             for (int fragment_slot = 0; fragment_slot < 2; ++fragment_slot) {
                 const uint kv_token_index = kv_iteration_begin + uint(kv_token_fragment * 8)
                     + uint(fragment_col) + uint(fragment_slot);
-                const float score = score_fragments[kv_token_fragment][fragment_slot] * scale_log2;
+                const float score = score_fragments[kv_token_fragment][fragment_slot] * ATTENTION_SCALE;
                 score_fragments[kv_token_fragment][fragment_slot] =
                     inactive_token || kv_token_index < visible_kv_token_begin
                         || kv_token_index >= visible_kv_token_end || kv_token_index >= kv_token_end
@@ -257,7 +256,7 @@ kernel void gqa_split_kv_tiled_q_map(
         }
         const float iteration_max = frag_row_reduce<FragMax>(local_max);
         float next_max = max(running_max, iteration_max);
-        const float running_scale = running_max == -INFINITY ? 0.0f : fast::exp2(running_max - next_max);
+        const float running_scale = running_max == -INFINITY ? 0.0f : metal::exp(running_max - next_max);
         if (running_max == -INFINITY && next_max == -INFINITY) {
             next_max = 0.0f;
         }
@@ -270,7 +269,7 @@ kernel void gqa_split_kv_tiled_q_map(
             for (int fragment_slot = 0; fragment_slot < 2; ++fragment_slot) {
                 const float probability = score_fragments[kv_token_fragment][fragment_slot] == -INFINITY
                     ? 0.0f
-                    : fast::exp2(score_fragments[kv_token_fragment][fragment_slot] - next_max);
+                    : metal::exp(score_fragments[kv_token_fragment][fragment_slot] - next_max);
                 score_fragments[kv_token_fragment][fragment_slot] = probability;
                 local_sum += probability;
             }
@@ -310,9 +309,10 @@ kernel void gqa_split_kv_tiled_q_map(
             + (ulong)token_offset;
         if (fragment_col == 0) {
             partial_exp_sums[partial_output_index] = running_sum;
-            partial_max_logits[partial_output_index] = running_sum == 0.0f ? -INFINITY : running_max;
+            partial_max_logits[partial_output_index] =
+                running_sum == 0.0f ? -INFINITY : running_max;
         }
-        const float inverse_sum = 1.0f / (running_sum + 1.0e-6f);
+        const float inverse_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
         #pragma unroll
         for (int dim_fragment = 0; dim_fragment < NUM_HEAD_FRAGMENTS; ++dim_fragment) {
             #pragma unroll
@@ -374,7 +374,7 @@ kernel void gqa_split_kv_tiled_q_reduce(
             const float partial_exp_sum = partial_exp_sums[partial_output_stats_index];
             const float weight = partial_exp_sum == 0.0f
                 ? 0.0f
-                : exp2(partial_max_logits[partial_output_stats_index] - global_max) * partial_exp_sum;
+                : metal::exp(partial_max_logits[partial_output_stats_index] - global_max) * partial_exp_sum;
             const ulong partial_output_value_index = partial_output_stats_index * HEAD_DIM + (ulong)dim;
             global_sum += weight;
             v += weight * float(partial_output[partial_output_value_index]);
@@ -382,6 +382,6 @@ kernel void gqa_split_kv_tiled_q_reduce(
         const ulong output_index =
             ((ulong)(flat_token_start + local_token_index) * NUM_Q_HEADS + (ulong)q_head_index) * HEAD_DIM
             + (ulong)dim;
-        output[output_index] = bfloat16_t(v / (global_sum + 1.0e-6f));
+        output[output_index] = bfloat16_t(global_sum > 0.0f ? v / global_sum : 0.0f);
     }
 }

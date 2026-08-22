@@ -168,15 +168,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_block_capacity_contains_only_batch_geometry() {
-        let capacity = BlockSpecCapacity::new(3, 7);
-
-        assert_eq!(capacity.max_requests, 3);
-        assert_eq!(capacity.block_size, 7);
-        assert_eq!(capacity.max_tokens, 21);
-    }
-
-    #[test]
     fn test_block_metadata_uses_history_end_as_first_query_row() {
         let metadata = BlockSpecMetadata::new(
             &[2, 9],

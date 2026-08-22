@@ -96,7 +96,6 @@ kernel void dflash2_selector_walk(
     constant uint& num_steps [[buffer(9)]],
     constant uint& top_k [[buffer(10)]],
     constant uint& max_distribution_k [[buffer(11)]],
-    constant uint& num_output_distributions [[buffer(12)]],
     uint request [[thread_position_in_grid]]
 ) {
     if (request >= num_active_requests) {
@@ -112,25 +111,22 @@ kernel void dflash2_selector_walk(
         uint maximum_index = 0u;
         for (uint candidate = 0u; candidate < top_k; ++candidate) {
             const float score = scores[score_base + (ulong)candidate];
-            if (metal::isfinite(score) && (score > maximum || (score == maximum && candidate < maximum_index))) {
+            if (score > maximum || (score == maximum && candidate < maximum_index)) {
                 maximum = score;
                 maximum_index = candidate;
             }
         }
         const uint distribution = output_distribution_indices[proposal];
-        if (distribution >= num_output_distributions) {
-            return;
-        }
         const ulong distribution_base = (ulong)distribution * (ulong)max_distribution_k;
-        const bool greedy = params.temperature == 0.0f || top_k == 1u;
+        const bool greedy = params.temperature == 0.0f;
         float total = 0.0f;
-        const float inverse_temperature = greedy ? 0.0f : 1.0f / metal::max(params.temperature, 1.0e-6f);
+        const float inverse_temperature = greedy ? 0.0f : 1.0f / params.temperature;
         for (uint candidate = 0u; candidate < top_k; ++candidate) {
             const int token = candidate_token_ids[candidate_base + (ulong)candidate];
             const float score = scores[score_base + (ulong)candidate];
             const float probability = greedy
                 ? (candidate == maximum_index ? 1.0f : 0.0f)
-                : ((token >= 0 && metal::isfinite(score)) ? metal::exp((score - maximum) * inverse_temperature) : 0.0f);
+                : metal::exp((score - maximum) * inverse_temperature);
             distribution_token_ids[distribution_base + (ulong)candidate] = token;
             distribution_probs[distribution_base + (ulong)candidate] = probability;
             total += probability;
@@ -139,8 +135,8 @@ kernel void dflash2_selector_walk(
             distribution_token_ids[distribution_base + (ulong)candidate] = -1;
             distribution_probs[distribution_base + (ulong)candidate] = 0.0f;
         }
-        uint selected = maximum_index;
-        if (!greedy && total > 0.0f && metal::isfinite(total)) {
+        uint selected = greedy ? maximum_index : top_k - 1u;
+        if (!greedy) {
             const uint random = psi_sampling_random(
                 params.seed, params.sample_position + step, params.sampling_domain);
             const float draw = psi_uniform01(random);

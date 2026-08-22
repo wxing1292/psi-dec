@@ -220,8 +220,8 @@ kernel void dspark_markov_top_k_map(
                         + (ulong)token_id;
                     const bfloat corrected = bfloat(float(base_logits[base_index]) + float(correction));
                     const float logit = float(corrected);
-                    values[tile_index] = metal::isfinite(logit) ? logit : NEG_INF;
-                    tokens[tile_index] = metal::isfinite(logit) ? int(token_id) : -1;
+                    values[tile_index] = logit;
+                    tokens[tile_index] = int(token_id);
                 } else {
                     values[tile_index] = NEG_INF;
                     tokens[tile_index] = -1;
