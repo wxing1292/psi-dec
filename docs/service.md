@@ -152,16 +152,16 @@ The inference server does not own these controls:
 
 ## Binaries and checkpoints
 
-The service provides Qwen3 and Qwen3.5 binaries with optional DSpark.
-DSpark support is experimental.
-Its checkpoint contract, CLI, cache sizing, and proposal policy may change.
+The service provides Qwen3 and Qwen3.5 binaries with optional speculative models.
+DSpark and DFlash2 support is experimental.
+Their checkpoint contracts, CLI, cache sizing, and proposal policies may change.
 It also provides Qwen3.5 binaries that retain their names for compatible Qwen3.6 and Qwen3.8 MLX checkpoints:
 
 | Model                  | Binary           | Main checkpoint                      | Optional Spec checkpoint                  |
 | ---------------------- | ---------------- | ------------------------------------ | ----------------------------------------- |
 | Qwen3 dense 14B        | `qwen3`          | `mlx-community/Qwen3-14B-4bit`       | optional official Qwen3 DSpark checkpoint |
-| Qwen3.8 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.8-27B-4bit`     | matching MTP or official Qwen3x DSpark    |
-| Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | matching MTP or official Qwen3x DSpark    |
+| Qwen3.8 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.8-27B-4bit`     | matching MTP, Qwen3x DSpark, or Qwen3x DFlash2 |
+| Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | matching MTP, Qwen3x DSpark, or Qwen3x DFlash2 |
 
 Download with the Hugging Face CLI:
 
@@ -246,8 +246,19 @@ cargo run --release --bin qwen3_5_dense -- \
   --num-spec-tokens 4
 ```
 
-The Qwen3.5 services reject a configuration that specifies both `--hf-mtp-model-dir` and
-`--hf-dspark-model-dir`.
+Qwen3.8 dense startup with DFlash2:
+
+```sh
+cargo run --release --bin qwen3_5_dense -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
+  --hf-dflash2-model-dir "$PWD/models/Qwen3.8-27B-DFlash2-affine" \
+  --num-spec-tokens 2
+```
+
+The Qwen3.5 services reject a configuration that specifies more than one of `--hf-mtp-model-dir`,
+`--hf-dspark-model-dir`, and `--hf-dflash2-model-dir`.
 
 Qwen3.5/Qwen3.6/Qwen3.8 startup with MTP enabled:
 
@@ -272,16 +283,17 @@ cargo run --release --bin qwen3_5_sparse -- \
   --hf-mtp-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit"
 ```
 
-The normal MTP and DSpark commands use the same service and scheduler arguments.
+The normal MTP, DSpark, and DFlash2 commands use the same service and scheduler arguments.
 Only the Spec checkpoint argument changes:
 
 ```text
 --hf-mtp-model-dir DIR
 --hf-dspark-model-dir DIR
+--hf-dflash2-model-dir DIR
 ```
 
 An MTP checkpoint enables one speculative MTP step by default.
-`--num-spec-tokens K` takes a positive `usize` value for MTP or DSpark.
+`--num-spec-tokens K` takes a positive `usize` value for MTP, DSpark, or DFlash2.
 The executor reuses the checkpoint's one physical MTP layer for K dependent logical steps.
 For MTP, omit `--num-spec-tokens` to use one step.
 `--max-tokens-per-request` must not exceed `--max-tokens`.
@@ -292,6 +304,10 @@ An explicit DSpark value must not exceed the checkpoint `block_size`.
 The DSpark value controls proposal generation. It is independent of
 `--max-tokens-per-request`, which limits the Main verification batch.
 The scheduler may verify only a proposal prefix.
+For DFlash2, omit `--num-spec-tokens` to use `block_size - 1`.
+An explicit DFlash2 value must not exceed `block_size - 1`.
+The complete DFlash2 query block contains the anchor and K MASK rows.
+The DFlash2 value is independent of the Main per-request verification budget.
 
 The service specialization module provides the model-independent worker build and process lifecycle.
 `SpecializedWorker` uses `escargot` to build an executable for the active profile and target.
@@ -300,7 +316,7 @@ A model launcher supplies its worker manifest, binary name, specialization targe
 
 `qwen3_5_dense` and `qwen3_5_sparse` are thin model-specific launchers.
 Each launcher validates the normal CLI. For MTP with K speculative tokens, it calculates `L = K + 1`.
-For Vanilla and DSpark, it uses `L = 1`.
+For Vanilla, DSpark, and DFlash2, it uses `L = 1`.
 It configures `SpecializedWorker` to build a const-specialized copy of the same `qwen3_5_dense` or `qwen3_5_sparse` binary.
 The `inference-runtime-service` `build.rs` generates compile-time const `L`.
 An internal environment marker makes the specialized binary run the model instead of starting another build.
@@ -327,9 +343,9 @@ One lifecycle owner stops both listeners in these conditions:
 - A listener fails.
 - The process receives SIGINT or SIGTERM.
 
-`--num-spec-tokens` requires `--hf-mtp-model-dir` or `--hf-dspark-model-dir`.
-The service rejects zero, a missing Spec directory, or simultaneous MTP and DSpark directories.
-For a Main-only run, omit both Spec checkpoint arguments and `--num-spec-tokens`.
+`--num-spec-tokens` requires `--hf-mtp-model-dir`, `--hf-dspark-model-dir`, or `--hf-dflash2-model-dir`.
+The service rejects zero, a missing Spec directory, or more than one Spec checkpoint directory.
+For a Main-only run, omit all Spec checkpoint arguments and `--num-spec-tokens`.
 
 Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 256K pages. The Qwen3-14B geometry stores eight
 tokens in one physical page.
@@ -337,8 +353,8 @@ tokens in one physical page.
 Its 16-token logical cache block uses 80 pages across 40 layers. Thus, the default holds 3,276 complete blocks. These
 blocks contain 52,416 resident tokens in aggregate.
 
-When DSpark is enabled, the executor adds persistent DSpark context pages to the same logical block.
-The page count depends on the DSpark layer and KV geometry.
+When DSpark or DFlash2 is enabled, the executor adds persistent Spec history pages to the same logical block.
+The page count depends on the selected Spec layer and KV geometry.
 
 Qwen3.5 keeps 2,048-token logical blocks to amortize its GDN snapshots. It defaults to 256K shared pages.
 MTP step K adds K logical KV cache lanes to the Main lane.
@@ -349,8 +365,9 @@ At startup, each service derives the page count for one block from the initializ
 The service classifies a model-executor initialization failure as an internal startup error.
 
 The service also derives the runtime `context_window` from the Main model's `max_position_embeddings`. Vanilla and MTP
-use the Main value. DSpark subtracts its actual `num_spec_tokens` because the DSpark GQA block applies RoPE to the Main
-sampled anchor and the complete proposal block. Startup configuration logs include the effective `context_window`.
+use the Main value. DSpark and DFlash2 subtract their actual `num_spec_tokens` because the block-Spec model applies
+RoPE to the Main sampled anchor and the complete proposal block. Startup configuration logs include the effective
+`context_window`.
 
 The rejection reports this dynamic minimum.
 
@@ -359,8 +376,8 @@ pressure.
 
 `Qwen3Config` and `Qwen35Config` resolve the queued-request, running-request, and per-batch capacities.
 CLI checkpoint arguments remain optional parser inputs.
-Configuration validation converts them to one `Vanilla`, `MTP`, or `DSpark` model mode.
-The validated configuration does not store independent MTP and DSpark options.
+Configuration validation converts them to one `Vanilla`, `MTP`, `DSpark`, or `DFlash2` model mode.
+The validated configuration does not store independent speculative-model options.
 `--max-requests` defines both the running request-slot capacity and the per-batch request capacity.
 The model service passes this value to the executor, `RuntimeConfig`, and `SchedulerConfig`.
 The services default to 32 queued requests and 4 running request slots. Queued requests do not consume executor
@@ -368,7 +385,8 @@ request-slot state.
 
 Admission assigns a slot before a request enters the scheduler.
 GQA page tables, GDN request state, sampling state, and request-indexed workspaces use the same slot domain.
-For Qwen3.5 DSpark, GDN retains one candidate state for every possible accepted proposal prefix in each slot.
+For Qwen3.5 DSpark or DFlash2, GDN retains one candidate state for every possible accepted proposal prefix in each
+slot.
 Thus, `--max-requests` also bounds the persistent GDN candidate-state arena.
 Buffers, scratch allocations, replay resources, and resident model resources remain reusable.
 
@@ -377,7 +395,7 @@ Qwen3.5 wiring derives this request-local GDN slot count:
 ```text
 decision_candidate_states = match mode {
   Vanilla => 1,
-  MTP { num_spec_tokens } | DSpark { num_spec_tokens } => num_spec_tokens + 1,
+  MTP { num_spec_tokens } | DSpark { num_spec_tokens } | DFlash2 { num_spec_tokens } => num_spec_tokens + 1,
 }
 block_boundary_candidates = ceil(max_tokens_per_request / num_tokens_per_block)
 candidate_states = decision_candidate_states + block_boundary_candidates
@@ -624,14 +642,22 @@ DSpark Prefill creates persistent DSpark history K/V from the completed Main cap
 A decode-ready batch then records DSpark Decode in the same Spec submission.
 DSpark Decode contains DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
 
+A DFlash2-enabled batch uses the same outer two-stage lifecycle through its separate owner.
+DFlash2 Prefill creates persistent DFlash2 history K/V from the completed Main capture.
+A decode-ready batch records DFlash2 Decode after Prefill.
+DFlash2 Decode contains DFlash2Embed, the DFlash2 body, and DFlash2Output.
+The body combines per-row sliding-history attention with bidirectional local-block attention and applies dynamic
+grouped convolution.
+DFlash2Output builds and samples the candidate lattice and writes sparse draft distributions.
+
 `--logging info` emits one `phase="executor.batch.perf"` event after each non-empty executor batch. The event uses the
-same schema for Vanilla, MTP, and DSpark. It also uses the same schema for prefill and decode batches:
+same schema for Vanilla, MTP, DSpark, and DFlash2. It also uses the same schema for prefill and decode batches:
 
 ```text
 component="executor"
 phase="executor.batch.perf"
 model="qwen3.5"
-model_mode="vanilla|mtp|dspark"
+model_mode="vanilla|mtp|dspark|dflash2"
 batch_seq=42
 num_reqs=4
 num_input_tokens=12
@@ -655,9 +681,9 @@ all earlier speculative tokens passed verification. `num_spec_token_by_index[i]`
 batches before they calculate `acceptance_rate_by_index`.
 
 `main_ms` covers `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
-`spec_ms` covers the complete MTP or DSpark Spec lifecycle.
-It includes all dependent MTP passes and any recorded DSpark Prefill and Decode work.
-DSpark prefill-only batches can have nonzero `spec_ms` and zero `spec_passes`.
+`spec_ms` covers the complete MTP, DSpark, or DFlash2 Spec lifecycle.
+It includes all dependent MTP passes and any recorded block-Spec Prefill and Decode work.
+DSpark or DFlash2 prefill-only batches can have nonzero `spec_ms` and zero `spec_passes`.
 `spec_passes` counts Spec Decode forwards. These values are host elapsed latencies. They are not GPU kernel timings.
 
 `--logging debug` emits the same INFO performance event. It also emits request and response diagnostics. It does not
@@ -678,12 +704,12 @@ submit_main -> read_main
 
 embed_spec -> forward_spec -> unembed_spec -> sample_spec    MTP
 
-prefill_spec -> decode_spec                                      DSpark
+prefill_spec -> decode_spec                                DSpark or DFlash2
 submit_spec -> read_spec
 ```
 
 A pass is one proposal forward that runs.
-For Qwen3.5, each logical MTP step or DSpark Decode block is one pass.
+For Qwen3.5, each logical MTP step, DSpark Decode block, or DFlash2 Decode block is one pass.
 For Qwen3, each DSpark block forward is one pass.
 Qwen3 runs DSpark Prefill for a prefill-only batch.
 It does not run DSpark Decode because no sampled anchor exists.
@@ -766,7 +792,7 @@ Each summary label includes the selected value, for example, `14b_dspark1` or `1
 If the DSpark checkpoint is absent and no download repository is configured, the helper prints a warning and skips
 that case. A missing Main checkpoint remains an error.
 
-The Qwen3.5/3.6/3.8 helper runs controlled 27B/35B Main-only, MTP, and DSpark comparisons:
+The Qwen3.5/3.6/3.8 helper runs controlled 27B/35B Main-only, MTP, DSpark, and DFlash2 comparisons:
 
 ```sh
 scripts/qwen35_e2e_decode_perf.sh \
@@ -774,20 +800,42 @@ scripts/qwen35_e2e_decode_perf.sh \
   --model-27b <27b-model-dir> \
   --mtp-27b <27b-mtp-model-dir> \
   --dspark-27b <27b-affine-dspark-model-dir> \
+  --dflash2-27b <27b-affine-dflash2-model-dir> \
   --model-35b <35b-model-dir> \
   --mtp-35b <35b-mtp-model-dir> \
   --dspark-35b <35b-affine-dspark-model-dir> \
+  --dflash2-35b <35b-affine-dflash2-model-dir> \
   --runs 7
 ```
 
-Each `*_mtp` or `*_dspark` group runs `--num-spec-tokens 1` and then `--num-spec-tokens 2`.
-The default case matrix runs `27b_off`, `27b_mtp`, `27b_dspark`, `35b_off`, `35b_mtp`, and `35b_dspark`.
+Use explicit case names to select a speculative-token count. For example, `27b_mtp1` sets
+`--num-spec-tokens 1`, and `27b_dspark2` sets `--num-spec-tokens 2`.
+The `*_mtp`, `*_dspark`, and `*_dflash2` aliases run token counts 1 and 2.
+The default case matrix uses this order:
+
+1. `27b_off`
+2. `35b_off`
+3. `27b_mtp1`
+4. `35b_mtp1`
+5. `27b_dspark1`
+6. `35b_dspark1`
+7. `27b_dflash2_1`
+8. `35b_dflash2_1`
+9. `27b_mtp2`
+10. `35b_mtp2`
+11. `27b_dspark2`
+12. `35b_dspark2`
+13. `27b_dflash2_2`
+14. `35b_dflash2_2`
+
 The default 27B Main and MTP checkpoints use Qwen3.8. The default 35B Main and MTP checkpoints use Qwen3.6.
 Each case uses its Main checkpoint for tokenization by default. Use `--tokenizer` to override all cases.
-If an MTP or DSpark checkpoint is absent and no download repository is configured, the helper prints a warning and
-skips that case. A missing Main checkpoint remains an error.
-The helper stops the server between speculative-token counts.
-It applies the configured cooldown before the second count.
+If an MTP, DSpark, or DFlash2 checkpoint is absent and no download repository is configured, the helper prints a
+warning and skips that case. A missing Main checkpoint remains an error.
+Before it starts a DFlash2 case, the helper validates the affine config and safetensors headers.
+It rejects a checkpoint that contains a BF16 tensor.
+The helper stops the server after each explicit case.
+It applies the configured cooldown between runnable cases.
 Each summary label includes the speculative mode and token count, for example, `27b_mtp2` or `27b_dspark2`.
 
 Both helpers print these facts:
@@ -806,7 +854,7 @@ The Qwen3 helper does not contain a checked-in performance baseline.
 
 The helper contains an M3 Max Qwen3.6 baseline for Main-only and one-step MTP cases.
 The default Qwen3.8 27B checkpoints report a checkpoint configuration mismatch against this baseline.
-Two-step MTP and all DSpark cases report that no hardware baseline exists.
+Two-step MTP and all DSpark and DFlash2 cases report that no hardware baseline exists.
 The baseline was recorded on 2026-07-21 at `132c5073`.
 It used these settings:
 

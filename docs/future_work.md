@@ -197,6 +197,17 @@ component path as the design.
   Do not add speculative compatibility fields without a supported checkpoint.
 - Permit overlapping Qwen3 DSpark batches only after all proposal scratch, outputs, replay arguments, and probability
   stores have bounded in-flight ownership.
+- Evaluate a DFlash2 ring cache as an owner-local alternative to the current persistent paged history cache.
+  A likely candidate is a short-lived or ephemeral request that does not use prefix sharing or request forks.
+  Compare this case with long-lived requests that exceed the attention window, prefix reuse, request forks, page
+  eviction, and fragmentation.
+  Measure retained bytes, page-table work, copy traffic, and end-to-end latency.
+  Keep persistent paged history KV as the default until a ring cache improves a real workload.
+  Keep the policy in the DFlash2 owner. Do not put it in the shared GQA backend.
+- Evaluate grouped DSpark and DFlash2 Prefill projections only with a real model-level bottleneck measurement.
+  Group Wk projections by compatible affine layout and group Wv projections separately.
+  Do not assume that Wk and Wv have the same dtype or quantization layout.
+  Preserve direct paged-K/V output and avoid an aggregation copy, transpose, or scatter.
 - Design backend-agnostic immutable `Weight` / `Tensor` / `Storage` ownership.
   Recommendation: Assign file and mapped-storage lifetime to checkpoint readers.
   Assign tensor identity and semantic layout to model planning.

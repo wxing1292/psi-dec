@@ -42,6 +42,7 @@ crates/inference-executor-metal/src/attn/
 
 crates/inference-executor-metal/src/model/qwen/
   v3_x/
+    dflash2/                Qwen3x DFlash2 attention, layer, and model
     dspark/                 Qwen3x DSpark attention, layer, and model
     layer/block_spec_gqa_weights.rs
                             independent Q/K/V/output affine layouts and borrowed offsets
@@ -185,6 +186,8 @@ Qwen3.5 Main and MTP construct `GQACore` and gated `GQA`.
 Qwen3x DSpark constructs `BlockSpecGQACore` and `BlockSpecGQA`.
 Its QKV attention graph is independent from Main and MTP.
 The shared block-spec owner also supports per-query half-open history ranges.
+Qwen3x DFlash2 constructs its own `Qwen3xDFlash2Attention` owner around the same low-level `BlockSpecGQA` contract.
+It supplies row-relative sliding-history ranges and its own layer composition.
 
 Init-time component constants supply the head dimensions, head counts, RoPE constants, and page geometry. A
 model-specific runtime branch does not supply these values.
@@ -268,7 +271,7 @@ pages[num_cache_pages][page_bytes]
 
 main_page_ids[num_req_slots][num_gqa_layers][num_blocks][num_page_ids_per_block]
 optional_mtp_page_ids[num_req_slots][1][num_blocks][num_page_ids_per_block]
-optional_dspark_page_ids[num_req_slots][num_dspark_layers][num_blocks][num_page_ids_per_block]
+optional_block_spec_page_ids[num_req_slots][num_spec_layers][num_blocks][num_page_ids_per_block]
 
 one KV page, viewed with the model KV dtype:
   [K/V][num_kv_heads][num_tokens_per_page][head_dim]
@@ -288,10 +291,11 @@ The optional MTP has an independent table with `K` GQA layer rows.
 Runtime cache lane `step_index + 1` supplies the page IDs for MTP table row `step_index`.
 `Qwen35MTP` performs this model-specific lane-to-row conversion through the generic page-table write API.
 
-Qwen3 DSpark has a separate page table.
-Runtime cache lane 0 contains one flat page-ID list for each block: `[Main IDs | DSpark IDs]` in DSpark mode.
+Qwen3 DSpark and Qwen3x DFlash2 have separate role-local page tables.
+Runtime cache lane 0 contains one flat page-ID list for each block: `[Main IDs | Spec IDs]` in a persistent block-Spec
+mode.
 The Qwen executor validates the exact combined length and splits this list once at the model prepare boundary.
-Vanilla mode requires an empty DSpark remainder.
+Vanilla and MTP modes require an empty Spec remainder.
 Both page tables keep their own layer and page-stride geometry.
 The executor sends the same runtime request-slot reset notification to both tables before it reuses a slot.
 Both tables use `GQARequestPageTable::reset_req_slots`.
@@ -304,15 +308,16 @@ write_page_ids(req_slot, layer_index, block_index, page_ids)
 read_page_ids(req_slot, layer_index, block_index)
 ```
 
-Main and DSpark state owners accept one complete role-local block. They validate the exact role-local length and the
-cache-page ID domain. They then write one table entry for each GQA layer.
+Main and the selected block-Spec state owner accept one complete role-local block.
+They validate the exact role-local length and the cache-page ID domain.
+They then write one table entry for each GQA layer.
 
 The layout type uses generic `num_gqa_layers` for both tables. Each table instance owns its capacity and can use a
 different GQA configuration.
 
 The Qwen executor updates Main state once for each Main batch.
 It updates optional MTP metadata once for the MTP stage.
-It updates DSpark proposal metadata once for the DSpark Spec stage.
+It updates DSpark or DFlash2 proposal metadata once for the selected block-Spec stage.
 
 Main GQA layers borrow the Main state domain. The optional MTP owns its backend, scratch, and logical-lane page-ID table.
 
@@ -395,9 +400,11 @@ The backend configuration is model-independent.
 `model/qwen/v3/main/component_config.rs` builds the Qwen3 Main ungated core.
 Each `model/qwen/v3_x/dspark/attention.rs` layer derives its ungated core and Metal configuration from the normalized
 DSpark config and its exact attention binding subtree.
+Each `model/qwen/v3_x/dflash2/attention.rs` layer derives its independent core and Metal configuration from the
+normalized DFlash2 config and its exact attention binding subtree.
 `model/qwen/v3_5/component_config.rs` builds gated Main and MTP cores.
 
-Each DSpark layer owns its weight-dependent `BlockSpecGQA` and `BlockSpecGQAContextAppender`.
+Each DSpark or DFlash2 layer owns its weight-dependent `BlockSpecGQA` and `BlockSpecGQAContextAppender`.
 `BlockSpecGQAState` owns the shared page table, metadata, scratch, and frozen SplitKV history selection.
 Quantization layout is not part of the shared-state compatibility contract.
 The state receives static attention and KV-cache facts through `backend_sdpa::Config`.
@@ -545,8 +552,9 @@ each 32 KiB physical page.
 
 One logical block therefore owns two pages per GQA layer. It owns 80 pages across all 40 layers.
 
-For Qwen3.5 model replay, the Qwen executor validates runtime cache lane 0 and writes the Main page table. DSpark mode
-also writes the independent DSpark page table. `Qwen35MTP` separately maps runtime cache lane `step_index + 1` to MTP
+For Qwen3.5 model replay, the Qwen executor validates runtime cache lane 0 and writes the Main page table. DSpark or
+DFlash2 mode also writes its independent role-local page table. `Qwen35MTP` separately maps runtime cache lane
+`step_index + 1` to MTP
 GQA layer row `step_index`. `GQA::prepare(...)` selects the SDPA execution and builds the complete batch selection once.
 Every GQA layer reuses this selection.
 
@@ -569,10 +577,10 @@ All MTP steps in one batch have the same token and attention shape, so they reus
 The replay argument selects the logical MTP GQA layer at execution time.
 Main recording supplies each physical layer's fixed index through the same kernel ABI.
 
-Qwen3 uses its separate ungated GQA implementation. DSpark keeps its existing exact replay key and submission ABI.
-DSpark only uses the expanded shared replay-shape fields with equal active and total token/range values and its existing
-TaskTemplate padding. DSpark retains this generic name because its composite map includes one block partial-output
-slot.
+Qwen3 uses its separate ungated GQA implementation.
+DSpark and DFlash2 keep separate model-level replay keys and submission ABIs.
+Both use the block-Spec replay shape with equal active and total token/range values and shared TaskTemplate padding.
+The generic composite map includes one block partial-output slot.
 
 ### Execution strategy
 
@@ -595,12 +603,14 @@ is the atomic boundary between dynamic choice and metadata upload.
 `GQAMetadataBuffers::update(...)` uploads the selection. Recording executes the stored variant and does not
 select again. Both current concrete kernel families partition a long visible KV range into independent KV segments.
 
-DSpark selects one variant from `backend_sdpa::Registry::new(...)` at initialization. `block_spec::sdpa::Selector` compares
+Each block-Spec owner selects one variant from `backend_sdpa::Registry::new(...)` at initialization.
+`block_spec::sdpa::Selector` compares
 the complete fixed-proposal candidates. Its primary cost is the K/V load multiplicity for one history token. It then
 compares the kernel KV-iteration width, padded Q rows, reserved partial-state groups, and Q-head coverage. Its
 `Selection` freezes the variant and the coupled capacity. The SplitKV history map and block-bidirectional map produce
-that physical partial layout for one shared Reduce. DSpark keeps its component-specific metadata and segmentation
-logic. It does not use the general GQA request selector.
+that physical partial layout for one shared Reduce.
+DSpark and DFlash2 keep model-specific metadata construction.
+They do not use the general GQA request selector.
 
 TiledQ requires one half-open `visible_kv_token_ranges` entry for each flat Q token. The Map kernel computes the
 intersection of this row range and the Map TaskTemplate K/V range. It does not infer a missing lower bound or causal
@@ -612,11 +622,13 @@ row in one proposal block. Therefore, every DSpark row sees the same complete pe
 The shared block-spec metadata also accepts a distinct half-open history range for each Q row.
 A tiled task covers the union of its rows' ranges. The TiledQ kernel applies each row's exact range mask.
 
-The same backend TiledQ component can represent row-relative sliding history. For a window of `W` tokens and a separate
-local block, row position `q` uploads `[q.saturating_sub(W - 1), anchor)` for persistent history. The composite parity
-test covers different explicit row bounds, a fully masked history segment, and one full local block. A future DFlash2
-model executor must derive and validate its exact window and block sizes. It must own a separate `DFlashGQA`; it must
-not add a DFlash mode to `BlockSpecGQA`. The repository does not yet contain that model executor.
+The same backend TiledQ component represents DFlash2 row-relative sliding history.
+For a window of `W` tokens and a separate local block, row position `q` uploads
+`[max(0, q + 1 - W), anchor)` for persistent history.
+The composite parity test covers different explicit row bounds, a fully masked history segment, and one full local
+block.
+The DFlash2 owner derives and validates the exact window and query-block sizes.
+It does not add a DFlash mode flag to `BlockSpecGQA`.
 
 The current concrete kernel families differ in the number of Q tokens and Q heads that one Map threadblock computes:
 
@@ -689,6 +701,7 @@ reachable model variants are:
 | Qwen3.6/Qwen3.8-27B | `24 / 4 / 256` | 8 | measured selector policy above |
 | Qwen3.6-35B-A3B | `16 / 2 / 256` | 16 | selector policy above |
 | Qwen3 DSpark | checkpoint-derived | model-derived | selected SplitKV history + block bidirectional |
+| Qwen3x DFlash2 | checkpoint-derived | model-derived | selected sliding SplitKV history + block bidirectional |
 
 For 35B, `TiledQ` uses `max_q_heads=4` below four useful tokens per Q-token range. It uses `max_q_heads=8` otherwise.
 
@@ -814,13 +827,13 @@ scratch contains the QKV projection, norm/RoPE, and SDPA buffers for the fixed u
 Both scratch types expose matching borrowed replay bindings. The model stream serializes Main and MTP execution.
 Therefore, submissions reuse their buffers without per-layer allocation.
 
-Qwen3 DSpark owns `BlockSpecScratch`.
+Qwen3 DSpark and Qwen3x DFlash2 each own a role-local `BlockSpecScratch`.
 This scratch contains proposal-local Q/K/V, SplitKV history partials, and block-bidirectional partials.
 Define these capacities:
 
 ```text
-T_capacity = max_requests * num_spec_tokens
-Q_capacity = max_requests * ceil(num_spec_tokens / selected_max_q_tokens)
+T_capacity = max_requests * block_size
+Q_capacity = max_requests * ceil(block_size / selected_max_q_tokens)
 P_capacity = next_power_of_two(max(T_capacity, 2 * Q_capacity))
 ```
 

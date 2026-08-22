@@ -37,6 +37,9 @@ crates/inference-executor-metal/src/sampling/
 
 crates/inference-executor-metal/src/model/qwen/v3_x/dspark/
   sampling.rs             Qwen3x Markov checkpoint weights and generic backend adapter
+
+crates/inference-executor-metal/src/model/qwen/v3_x/dflash2/
+  output.rs               raw Top-K, selector checkpoint weights, path walk, and sparse draft storage
 ```
 
 Runtime core transports sampler configuration and sampled decisions.
@@ -149,11 +152,12 @@ It then clears the armed state.
 Replay without a fresh write is an invariant violation.
 It does not permit reuse of stale parameter rows.
 
-The Qwen executor owns four distinct graph and cache stages:
+The Qwen executor owns these distinct graph and cache stages:
 
 - `Replay<Sampling>` handles ordinary Main output.
 - `Replay<DraftSampling>` handles MTP draft sampling and sparse draft-distribution storage.
 - `Replay<Qwen3xDSparkSampling>` handles DSpark Markov correction, confidence, sampling, and sparse draft storage.
+- `Replay<Qwen3xDFlash2Output>` handles DFlash2 raw Top-K, candidate selection, sampling, and sparse draft storage.
 - `Replay<RejectionSampling>` handles target write-distribution generation and sparse rejection.
 
 Main and MTP share one `Rc<TopKSampling>` implementation.
@@ -171,7 +175,7 @@ It reuses the generic sample-and-write-distribution reducer.
 The stages retain separate replay keys and programs.
 
 Qwen3.5 Main and MTP body replays use separate total-token domains.
-Qwen3 and DSpark currently set `num_total_tokens == num_active_tokens`.
+Qwen3, DSpark, and DFlash2 currently set `num_total_tokens == num_active_tokens` in their fixed-capacity stages.
 All body components use the same active/total API.
 Sampling and rejection keep their own replay domains, keys, active counts, and bucket policies.
 MTP draft sampling is a distinct replay after MTP GatherUnembed.

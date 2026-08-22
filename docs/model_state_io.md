@@ -43,8 +43,8 @@ pub trait FullStateIO {
 ```
 
 `PageArenaStateSnapshotFiles`, `GQAStateSnapshotFiles`, and `GDNStateSnapshotFiles` identify the files for each
-component. The same GQA implementation can serve Main, MTP, or DSpark. The executor therefore supplies the semantic
-file set at the model-role boundary.
+component. The same GQA implementation can serve Main, MTP, DSpark, or DFlash2. The executor therefore supplies the
+semantic file set at the model-role boundary.
 
 Each component keeps its `FullStateIO` implementation in an adjacent `file_io.rs` file. This layout keeps storage logic
 separate from forward execution and resource allocation.
@@ -284,7 +284,7 @@ The selected resource mapping is:
 | --- | --- | --- |
 | `PageArena` | Allocated page-ID ranges | Increasing page ID |
 | Main GQA request page table | Allocated request-slot ranges | Increasing request slot |
-| MTP or DSpark GQA request page table | Allocated request-slot ranges | Increasing request slot |
+| MTP, DSpark, or DFlash2 GQA request page table | Allocated request-slot ranges | Increasing request slot |
 | GDN recurrent state | Current recurrent slot for each allocated request slot | Layer, then increasing recurrent slot |
 | GDN convolution state | Current convolution slot for each allocated request slot | Layer, then increasing convolution slot |
 | GDN request state table | Complete durable table | Native `GDNRequestSlots` order |
@@ -329,6 +329,7 @@ snapshot/
   main-gdn-conv-state
   mtp-gqa-request-page-table
   dspark-gqa-request-page-table
+  dflash2-gqa-request-page-table
 ```
 
 `manifest` uses `wincode` with native byte order, fixed-width integers, `u32` sequence lengths, and `u8` enum tags.
@@ -346,7 +347,7 @@ These paths do not allocate a second full encoded byte buffer.
 
 Each Metal buffer has one semantic file name.
 The writer opens these files with `BufferIOFileCacheMode::Uncached`.
-The MTP and DSpark GQA files are topology-dependent.
+The MTP, DSpark, and DFlash2 GQA files are topology-dependent.
 A snapshot contains at most one of them.
 
 The writer and reader validate the same topology-specific expected file set.
