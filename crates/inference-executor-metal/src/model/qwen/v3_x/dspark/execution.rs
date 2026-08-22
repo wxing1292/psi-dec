@@ -125,8 +125,8 @@ impl Qwen3xDSparkExecution {
                 Qwen3xDSparkPrefill::new(Rc::clone(&loaded.model)),
             ),
             gqa_state: loaded.gqa_state,
-            embed: Replay::new("Qwen3x DSparkEmbed", Qwen3xDSparkEmbed::new(loaded.embed)),
-            body: Replay::new("Qwen3x DSpark", Qwen3xDSparkBody::new(Rc::clone(&loaded.model))),
+            embed: Replay::new("Qwen3x DSpark Embed", Qwen3xDSparkEmbed::new(loaded.embed)),
+            body: Replay::new("Qwen3x DSpark Body", Qwen3xDSparkBody::new(Rc::clone(&loaded.model))),
             gather_unembed: Replay::new(
                 "Qwen3x DSpark GatherUnembed",
                 Qwen3xDSparkGatherUnembed::new(

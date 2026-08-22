@@ -1,4 +1,4 @@
-//! Qwen3.x DSpark Spec Prefill and Decode execution.
+//! Qwen3x DSpark Spec Prefill and Decode execution.
 //!
 //! `Qwen3xDSparkExecution` owns two independent recordings. Prefill creates persistent history K/V. Decode consumes
 //! that history and creates one proposal block. When both recordings exist, the execution owner submits Prefill first,

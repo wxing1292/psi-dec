@@ -33,7 +33,7 @@ use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
 use crate::sampling::spec_probs::SpecProbsStore;
 
-pub struct DFlash2Proposal {
+pub struct Qwen3xDFlash2Proposal {
     pub token_ids: Vec<Vec<u32>>,
     pub token_probs: Vec<Vec<f32>>,
 }
@@ -366,7 +366,7 @@ impl Qwen3xDFlash2Output {
             .add_replay_arguments(top_k_shape, top_k_shape.num_total_sampling_inputs, arguments);
     }
 
-    pub fn read_proposal(&self, req_slots: &[u32], distribution_store: &mut SpecProbsStore) -> DFlash2Proposal {
+    pub fn read_proposal(&self, req_slots: &[u32], distribution_store: &mut SpecProbsStore) -> Qwen3xDFlash2Proposal {
         let count = req_slots.len() * self.num_spec_tokens as usize;
         let flat_token_ids = self.proposal_token_ids.read_typed::<i32>(0, count);
         let flat_probs = self.proposal_probs.read_typed::<f32>(0, count);
@@ -388,7 +388,7 @@ impl Qwen3xDFlash2Output {
             token_ids.push(ids);
             token_probs.push(flat_probs[begin..end].to_vec());
         }
-        DFlash2Proposal { token_ids, token_probs }
+        Qwen3xDFlash2Proposal { token_ids, token_probs }
     }
 
     fn top_k_shape(&self, num_requests: u32) -> top_k::Shape {

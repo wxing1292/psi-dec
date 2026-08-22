@@ -33,11 +33,11 @@ use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2Model;
 use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2Prefill;
 use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2PrefillArgs;
 use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2PrefillReplayKey;
-use crate::model::qwen::v3_x::dflash2::output::DFlash2Proposal;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2Output;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2OutputArgs;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2OutputPrepare;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2OutputReplayKey;
+use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2Proposal;
 use crate::model::unembedding::Unembed;
 use crate::replay::Replay;
 use crate::sampling::spec_probs::SpecProbsStore;
@@ -93,7 +93,9 @@ impl Qwen3xDFlash2Execution {
             .num_spec_tokens
             .checked_add(1)
             .expect("Qwen3x DFlash2 query block size must fit usize");
-        let max_query_tokens = loaded.page_table_layout.num_req_slots as usize * query_block_size;
+        let max_query_tokens = (loaded.page_table_layout.num_req_slots as usize)
+            .checked_mul(query_block_size)
+            .expect("Qwen3x DFlash2 query token capacity must fit usize");
         let hidden_bytes = max_query_tokens
             .checked_mul(loaded.output.hidden_dim() as usize)
             .and_then(|elements| elements.checked_mul(Dtype::Bfloat16.item_size()))
@@ -105,7 +107,7 @@ impl Qwen3xDFlash2Execution {
             ),
             gqa_state: loaded.gqa_state,
             embed: Replay::new("Qwen3x DFlash2 Embed", Qwen3xDFlash2Embed::new(loaded.embed)),
-            body: Replay::new("Qwen3x DFlash2", Qwen3xDFlash2Body::new(Rc::clone(&loaded.model))),
+            body: Replay::new("Qwen3x DFlash2 Body", Qwen3xDFlash2Body::new(Rc::clone(&loaded.model))),
             output: Replay::new("Qwen3x DFlash2 Output", loaded.output),
             unloaded_model: None,
             hidden_input: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
@@ -126,7 +128,9 @@ impl Qwen3xDFlash2Execution {
     }
 
     pub fn num_gqa_page_ids_per_block(&self) -> usize {
-        self.page_table_layout.num_gqa_layers as usize * self.page_table_layout.num_page_ids_per_block as usize
+        (self.page_table_layout.num_gqa_layers as usize)
+            .checked_mul(self.page_table_layout.num_page_ids_per_block as usize)
+            .expect("Qwen3x DFlash2 page IDs per block must fit usize")
     }
 
     pub fn num_tokens_per_page(&self) -> usize {
@@ -174,16 +178,22 @@ impl Qwen3xDFlash2Execution {
         } = resolve_qwen3x_dflash2_weight_bindings(config, store.index().tensor_names())?;
         let query_block_size = self.num_spec_tokens + 1;
         let max_requests = self.page_table_layout.num_req_slots as usize;
+        let max_query_tokens = max_requests
+            .checked_mul(query_block_size)
+            .expect("Qwen3x DFlash2 query token capacity must fit usize");
+        let max_proposal_tokens = max_requests
+            .checked_mul(self.num_spec_tokens)
+            .expect("Qwen3x DFlash2 proposal token capacity must fit usize");
         let embed = Rc::new(
             main_embed.with_max_tokens(
-                (max_requests * query_block_size)
+                max_query_tokens
                     .try_into()
                     .expect("Qwen3x DFlash2 embed row capacity must fit u32"),
             ),
         );
         let unembed = Rc::new(
             main_unembed.with_max_tokens(
-                (max_requests * self.num_spec_tokens)
+                max_proposal_tokens
                     .try_into()
                     .expect("Qwen3x DFlash2 unembed row capacity must fit u32"),
             ),
@@ -361,7 +371,7 @@ impl Qwen3xDFlash2Execution {
         &self,
         recording: &Qwen3xDFlash2DecodeRecording,
         distribution_store: &mut SpecProbsStore,
-    ) -> DFlash2Proposal {
+    ) -> Qwen3xDFlash2Proposal {
         self.output
             .component()
             .read_proposal(&recording.req_slots, distribution_store)

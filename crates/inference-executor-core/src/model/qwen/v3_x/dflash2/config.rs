@@ -143,9 +143,23 @@ struct CheckpointConfig {
     vocab_size: usize,
 }
 
-const CANONICAL_ARCHITECTURE: &str = "Qwen3DFlash2Model";
-const SOURCE_ARCHITECTURE: &str = "DFlash2DraftModel";
-const NESTED_FIELDS: &[&str] = &[
+struct CheckpointConfigAdapter {
+    architecture: &'static str,
+    adapt: fn(&mut Map<String, Value>) -> Result<(), ModelExecutorError>,
+}
+
+const CANONICAL_CHECKPOINT_ARCHITECTURE: &str = "Qwen3DFlash2Model";
+const CHECKPOINT_CONFIG_ADAPTERS: &[CheckpointConfigAdapter] = &[
+    CheckpointConfigAdapter {
+        architecture: CANONICAL_CHECKPOINT_ARCHITECTURE,
+        adapt: adapt_canonical_checkpoint_config,
+    },
+    CheckpointConfigAdapter {
+        architecture: "DFlash2DraftModel",
+        adapt: adapt_dflash2_draft_checkpoint_config,
+    },
+];
+const DFLASH2_DRAFT_CANONICAL_FIELDS: &[&str] = &[
     "block_size",
     "conv_group_size",
     "conv_kernel_size",
@@ -188,22 +202,18 @@ fn adapt_checkpoint_config(mut value: Value) -> Result<Value, ModelExecutorError
     let config = value
         .as_object_mut()
         .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 config must be a JSON object"))?;
-    let architecture = checkpoint_architecture(config)?.unwrap_or(CANONICAL_ARCHITECTURE);
-    match architecture {
-        CANONICAL_ARCHITECTURE => {
-            if config.contains_key("dflash_config") {
-                return Err(ModelExecutorError::custom(
-                    "canonical Qwen3x DFlash2 checkpoint config must use flat fields",
-                ));
-            }
-        },
-        SOURCE_ARCHITECTURE => adapt_source_config(config)?,
-        architecture => {
-            return Err(ModelExecutorError::custom(format!(
+    let architecture = checkpoint_architecture(config)?
+        .unwrap_or(CANONICAL_CHECKPOINT_ARCHITECTURE)
+        .to_owned();
+    let adapter = CHECKPOINT_CONFIG_ADAPTERS
+        .iter()
+        .find(|adapter| adapter.architecture == architecture)
+        .ok_or_else(|| {
+            ModelExecutorError::custom(format!(
                 "unsupported Qwen3x DFlash2 checkpoint architecture {architecture:?}; no config adapter is registered"
-            )));
-        },
-    }
+            ))
+        })?;
+    (adapter.adapt)(config)?;
     config.remove("architectures");
     Ok(value)
 }
@@ -231,7 +241,16 @@ fn checkpoint_architecture(config: &Map<String, Value>) -> Result<Option<&str>, 
     }
 }
 
-fn adapt_source_config(config: &mut Map<String, Value>) -> Result<(), ModelExecutorError> {
+fn adapt_canonical_checkpoint_config(config: &mut Map<String, Value>) -> Result<(), ModelExecutorError> {
+    if config.contains_key("dflash_config") {
+        return Err(ModelExecutorError::custom(
+            "canonical Qwen3x DFlash2 checkpoint config must use flat fields",
+        ));
+    }
+    Ok(())
+}
+
+fn adapt_dflash2_draft_checkpoint_config(config: &mut Map<String, Value>) -> Result<(), ModelExecutorError> {
     let nested = config
         .remove("dflash_config")
         .ok_or_else(|| ModelExecutorError::custom("DFlash2DraftModel config requires dflash_config"))?;
@@ -240,14 +259,14 @@ fn adapt_source_config(config: &mut Map<String, Value>) -> Result<(), ModelExecu
         .ok_or_else(|| ModelExecutorError::custom("DFlash2DraftModel dflash_config must be a JSON object"))?;
     let unexpected = nested
         .keys()
-        .filter(|name| !NESTED_FIELDS.contains(&name.as_str()))
+        .filter(|name| !DFLASH2_DRAFT_CANONICAL_FIELDS.contains(&name.as_str()))
         .collect::<Vec<_>>();
     if !unexpected.is_empty() {
         return Err(ModelExecutorError::custom(format!(
             "DFlash2DraftModel dflash_config contains unsupported fields {unexpected:?}"
         )));
     }
-    for &name in NESTED_FIELDS {
+    for &name in DFLASH2_DRAFT_CANONICAL_FIELDS {
         let nested_value = nested.get(name).ok_or_else(|| {
             ModelExecutorError::custom(format!("DFlash2DraftModel dflash_config.{name} must be present"))
         })?;

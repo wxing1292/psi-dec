@@ -24,6 +24,8 @@ use safetensors::tensor::TensorInfo;
 
 const SAFETENSORS_HEADER_LEN_BYTES: usize = 8;
 const MAX_SAFETENSORS_HEADER_BYTES: usize = 100_000_000;
+// The reference Q4_K_M checkpoint uses Q6_K only for these four matrices.
+// The affine converter preserves that tensor selection with its own group-64 layout.
 const HIGH_BIT_TENSORS: [&str; 4] = [
     "layers.2.self_attn.v_proj.weight",
     "layers.2.mlp.down_proj.weight",
