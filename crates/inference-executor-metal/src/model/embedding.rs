@@ -187,8 +187,9 @@ impl EmbedWeights {
             bindings.biases.as_str(),
         ])?;
         let weight = remove_tensor(&mut tensors, &bindings.weight, safetensors::Dtype::U32)?.into_data();
-        let scales = remove_tensor(&mut tensors, &bindings.scales, safetensors::Dtype::BF16)?.into_data();
-        let biases = remove_tensor(&mut tensors, &bindings.biases, safetensors::Dtype::BF16)?.into_data();
+        let scale_bias_dtype = safetensors_dtype(config.scale_bias_dtype);
+        let scales = remove_tensor(&mut tensors, &bindings.scales, scale_bias_dtype)?.into_data();
+        let biases = remove_tensor(&mut tensors, &bindings.biases, scale_bias_dtype)?.into_data();
         validate_len("embed weight", weight.len(), config.weight_bytes())?;
         validate_len(
             "embed scales",
@@ -203,6 +204,14 @@ impl EmbedWeights {
         };
         assert!(tensors.is_empty(), "embed must consume its tensor map");
         Ok(weights)
+    }
+}
+
+fn safetensors_dtype(dtype: Dtype) -> safetensors::Dtype {
+    match dtype {
+        Dtype::Bfloat16 => safetensors::Dtype::BF16,
+        Dtype::Float32 => safetensors::Dtype::F32,
+        dtype => panic!("unsupported quantized embedding scale/bias dtype {dtype:?}"),
     }
 }
 

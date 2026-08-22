@@ -496,6 +496,41 @@ static inline void sample_merged_distribution(
     sampled_token_probs[row] = weights[kept_count - 1];
 }
 
+kernel void top_k_merge_tiles(
+    device const int* tile_token_ids [[buffer(0)]],
+    device const float* tile_logits [[buffer(1)]],
+    device int* token_ids [[buffer(2)]],
+    device float* logits [[buffer(3)]],
+    constant uint& num_active_threads [[buffer(4)]],
+    constant uint& top_k [[buffer(5)]],
+    constant uint& num_tiles [[buffer(6)]],
+    constant uint& tile_top_k [[buffer(7)]],
+    constant uint& vocab_tile_size [[buffer(8)]],
+    uint global_thread_id [[thread_position_in_grid]]
+) {
+    if (global_thread_id >= num_active_threads || top_k == 0u || top_k > TOP_K_MAX) {
+        return;
+    }
+    const uint lane = global_thread_id % THREADGROUP_SIZE;
+    const uint row = global_thread_id / THREADGROUP_SIZE;
+    threadgroup float top_logits[TOP_K_MAX];
+    threadgroup int top_tokens[TOP_K_MAX];
+    threadgroup float weights[TOP_K_MAX];
+    threadgroup float reduce_values[THREADGROUP_SIZE];
+    threadgroup int reduce_tokens[THREADGROUP_SIZE];
+    threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
+    merge_distribution(
+        lane, row, top_k, num_tiles, tile_top_k, vocab_tile_size, 1.0f, 1.0f,
+        tile_token_ids, tile_logits, top_logits, top_tokens, weights,
+        reduce_values, reduce_tokens, tile_cursors);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const ulong output_base = (ulong)row * (ulong)top_k;
+    for (uint slot = lane; slot < top_k; slot += THREADGROUP_SIZE) {
+        token_ids[output_base + (ulong)slot] = top_tokens[slot];
+        logits[output_base + (ulong)slot] = top_logits[slot];
+    }
+}
+
 kernel void top_k_sample_tiles(
     device const int* tile_token_ids [[buffer(0)]],
     device const float* tile_logits [[buffer(1)]],

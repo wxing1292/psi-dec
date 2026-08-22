@@ -6,6 +6,7 @@ use inference_executor_core::sampling::reference::sparse_sample_row_with_domain_
 
 use super::MapBuffers;
 use super::MapCompute;
+use super::MergeBuffers;
 use super::Operation;
 use super::ReduceCompute;
 use super::SampleAndWriteDistributionBuffers;
@@ -89,6 +90,68 @@ fn test_map_variant_selection() {
 
 fn partial_candidate_count(shape: Shape) -> usize {
     super::partial_candidate_count(shape, super::standard_partial_candidate_layout())
+}
+
+#[test]
+fn test_raw_merge_preserves_top_k_logits() {
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let shape = Shape {
+        num_total_sampling_inputs: 2,
+        vocab_size: 300,
+        top_k: 4,
+    };
+    let logits_values = generated_logits(600, 0x62D0_14A9);
+    let logits = Buffer::from_slice(&device, &logits_values);
+    let top_k_map = MapCompute::new(&device);
+    let top_k_reduce = ReduceCompute::new(&device);
+    let candidate_count = top_k_map.candidate_count(shape);
+    let tile_token_ids = Buffer::new_zeroed_elements(&device, candidate_count, crate::metal::Dtype::Int32);
+    let tile_logits = Buffer::new_zeroed_elements(&device, candidate_count, crate::metal::Dtype::Float32);
+    let token_ids = Buffer::new_zeroed_elements(&device, 8, crate::metal::Dtype::Int32);
+    let merged_logits = Buffer::new_zeroed_elements(&device, 8, crate::metal::Dtype::Float32);
+    let mut builder = stream.create_replay_program();
+    builder.record(top_k_map.invoke_replay(
+        shape,
+        crate::metal::Dtype::Float32,
+        Operation::Merge,
+        MapBuffers {
+            logits: &logits,
+            logits_offset_bytes: 0,
+            tile_token_ids: &tile_token_ids,
+            tile_logits: &tile_logits,
+        },
+    ));
+    builder.record_with_barrier_before(top_k_reduce.invoke_merge(
+        shape,
+        MergeBuffers {
+            tile_token_ids: &tile_token_ids,
+            tile_logits: &tile_logits,
+            token_ids: &token_ids,
+            logits: &merged_logits,
+        },
+    ));
+    let replay = builder.build();
+    let mut arguments = ReplayArguments::new();
+    top_k_map.add_replay_arguments(shape, 2, &mut arguments);
+    top_k_reduce.add_replay_arguments(shape, 2, &mut arguments);
+    stream.submit_replay_with_arguments(&replay, &arguments).wait();
+
+    let actual_ids = token_ids.read_typed::<i32>(0, 8);
+    let actual_logits = merged_logits.read_typed::<f32>(0, 8);
+    for row in 0..2 {
+        let mut expected = logits_values[row * 300..(row + 1) * 300]
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>();
+        expected
+            .sort_by(|(left_id, left), (right_id, right)| right.total_cmp(left).then_with(|| left_id.cmp(right_id)));
+        for slot in 0..4 {
+            assert_eq!(actual_ids[row * 4 + slot], expected[slot].0 as i32);
+            assert_eq!(actual_logits[row * 4 + slot], expected[slot].1);
+        }
+    }
 }
 
 #[test]

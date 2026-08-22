@@ -105,6 +105,10 @@ crates/inference-executor-metal/src/sampling/
   rejection_replay.rs       generic sparse rejection replay owner
   dspark_markov.rs          DSpark Markov correction and sequential sampling
   spec_probs.rs             SpecProbsStore sparse Spec/Main probability workspace
+
+crates/inference-backend-metal/src/components/
+  dynamic_grouped_conv.rs   request-local DFlash2 prepare/finish convolution leaf
+  metal/dynamic_grouped_conv.metal
 ```
 
 Runtime core owns scheduling, request lifecycle, physical page allocation/free, and page IDs.

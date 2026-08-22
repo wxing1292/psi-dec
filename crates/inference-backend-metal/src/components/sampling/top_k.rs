@@ -104,6 +104,7 @@ pub struct Shape {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
+    Merge,
     Sample,
     WriteDistribution,
     SampleAndWriteDistribution,
@@ -176,6 +177,14 @@ pub struct SampleBuffers<'a> {
     pub token_ids: &'a Buffer,
     pub token_probs: &'a Buffer,
     pub runtime_params: &'a Buffer,
+}
+
+#[derive(Clone, Copy)]
+pub struct MergeBuffers<'a> {
+    pub tile_token_ids: &'a Buffer,
+    pub tile_logits: &'a Buffer,
+    pub token_ids: &'a Buffer,
+    pub logits: &'a Buffer,
 }
 
 #[derive(Clone, Copy)]
@@ -340,10 +349,11 @@ impl Selector {
     fn key(shape: Shape, logits_dtype: Dtype, operation: Operation) -> VariantKey {
         shape.validate();
         let algorithm = match operation {
-            Operation::Sample if shape.top_k <= TOP_K_REDUCTION_LIMIT => MapAlgorithm::Reduction,
-            Operation::Sample | Operation::WriteDistribution | Operation::SampleAndWriteDistribution => {
-                MapAlgorithm::Bitonic
-            },
+            Operation::Merge | Operation::Sample if shape.top_k <= TOP_K_REDUCTION_LIMIT => MapAlgorithm::Reduction,
+            Operation::Merge
+            | Operation::Sample
+            | Operation::WriteDistribution
+            | Operation::SampleAndWriteDistribution => MapAlgorithm::Bitonic,
         };
         match (logits_dtype, algorithm) {
             (Dtype::Float32, MapAlgorithm::Reduction) => VariantKey::F32Reduction,
@@ -443,6 +453,7 @@ impl Operator for MapInvocation<'_> {
 
 pub struct ReduceCompute {
     constants: ReduceKernelConstants,
+    merge: CompiledKernel,
     sample: CompiledKernel,
     write_distribution: CompiledKernel,
     sample_and_write_distribution: CompiledKernel,
@@ -452,6 +463,7 @@ impl ReduceCompute {
     pub fn new(device: &crate::metal::Device) -> Self {
         Self {
             constants: ReduceKernelConstants::current(),
+            merge: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_merge_tiles"),
             sample: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_sample_tiles"),
             write_distribution: CompiledKernel::new(device, SAMPLING_SOURCE, "top_k_write_distribution_tiles"),
             sample_and_write_distribution: CompiledKernel::new(
@@ -459,6 +471,16 @@ impl ReduceCompute {
                 SAMPLING_SOURCE,
                 "top_k_sample_and_write_distribution_tiles",
             ),
+        }
+    }
+
+    pub fn invoke_merge<'a>(&'a self, shape: Shape, buffers: MergeBuffers<'a>) -> MergeInvocation<'a> {
+        MergeInvocation {
+            kernel: &self.merge,
+            constants: self.constants,
+            partial_candidate_layout: standard_partial_candidate_layout(),
+            shape,
+            buffers,
         }
     }
 
@@ -534,6 +556,55 @@ impl ReduceCompute {
             self.constants.thread_block.required_threads,
             arguments,
         );
+    }
+}
+
+pub struct MergeInvocation<'a> {
+    kernel: &'a CompiledKernel,
+    constants: ReduceKernelConstants,
+    partial_candidate_layout: PartialCandidateLayout,
+    shape: Shape,
+    buffers: MergeBuffers<'a>,
+}
+
+impl Operator for MergeInvocation<'_> {
+    fn record(self, recorder: &CommandRecorder<'_>) {
+        self.shape.validate();
+        let candidates = partial_candidate_count(self.shape, self.partial_candidate_layout);
+        assert!(
+            self.buffers.tile_token_ids.len_bytes()
+                >= checked_bytes("Metal top-k merge partial token", candidates, size_of::<i32>())
+        );
+        assert!(
+            self.buffers.tile_logits.len_bytes()
+                >= checked_bytes("Metal top-k merge partial logit", candidates, size_of::<f32>())
+        );
+        let outputs = checked_product(
+            "Metal top-k merge output count",
+            &[self.shape.num_total_sampling_inputs as usize, self.shape.top_k as usize],
+        );
+        assert!(
+            self.buffers.token_ids.len_bytes() >= checked_bytes("Metal top-k merge token", outputs, size_of::<i32>())
+        );
+        assert!(self.buffers.logits.len_bytes() >= checked_bytes("Metal top-k merge logit", outputs, size_of::<f32>()));
+        let num_partitions = num_vocab_partitions(self.shape, self.partial_candidate_layout);
+        recorder.set_kernel(self.kernel);
+        recorder.set_buffer_read(0, self.buffers.tile_token_ids, 0);
+        recorder.set_buffer_read(1, self.buffers.tile_logits, 0);
+        recorder.set_buffer_write(2, self.buffers.token_ids, 0);
+        recorder.set_buffer_write(3, self.buffers.logits, 0);
+        let required_threads = self.constants.thread_block.required_threads;
+        let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, required_threads);
+        if self.shape.num_total_sampling_inputs == 1 {
+            recorder.set_u32(4, num_total_threads);
+        } else {
+            recorder.bind_u32(4, REDUCE_NUM_ACTIVE_THREADS_KEY, required_threads, num_total_threads);
+        }
+        recorder.set_u32(5, self.shape.top_k);
+        recorder.set_u32(6, num_partitions);
+        recorder.set_u32(7, num_candidates_per_partition(self.shape));
+        recorder.set_u32(8, self.partial_candidate_layout.vocab_partition_size());
+        recorder.dispatch_1d(num_total_threads as usize, required_threads as usize);
     }
 }
 

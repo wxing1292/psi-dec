@@ -39,6 +39,8 @@ fn assert_u32_index_domain(num_elements: usize, name: &str) {
 pub mod dense_mlp;
 pub mod sparse_mlp;
 
+pub mod dynamic_grouped_conv;
+
 pub mod embedding;
 
 pub mod gdn;

@@ -58,5 +58,6 @@ fn checked_bytes(name: &str, num_elements: usize, item_size: usize) -> usize {
 }
 
 pub mod dspark_markov;
+pub mod dflash2_selector;
 pub mod rejection;
 pub mod top_k;

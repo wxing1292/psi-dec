@@ -349,7 +349,8 @@ This table identifies the current selection owner. Component documents contain t
 | MoE | Complete token-major or expert-major command graph. | The MoE `Selector` returns `(VariantKey, &Variant)`. |
 | Sparse expert MLP | No independent outer command-graph variant. | MoE selects the outer graph. The sparse leaf records expert compute. |
 | Top-K sampling | Map implementation for dtype, output contract, and Top-K width. | The Top-K `Selector` returns the selected Map Variant. |
-| Embedding, row gather, normalization, and residual operations | One current fixed implementation per initialized configuration. | No runtime Registry or Selector. |
+| DFlash2 candidate selector | One fixed predecessor-map, edge-score, and path-walk graph. | No runtime Registry or Selector. |
+| Dynamic grouped convolution, embedding, row gather, normalization, and residual operations | One current fixed implementation per initialized configuration. | No runtime Registry or Selector. |
 | Sparse rejection sampling | One current fixed request kernel. | Replay buckets select capacities, not kernels. |
 | DSpark Markov sampling Map | One current fixed Map implementation. | No runtime Registry or Selector. |
 

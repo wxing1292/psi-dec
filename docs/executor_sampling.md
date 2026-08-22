@@ -20,9 +20,12 @@ crates/inference-executor-core/src/sampling/
 crates/inference-backend-metal/src/components/
   sampling/top_k.rs           generic Metal top-k sampling components
   sampling/top_k_test.rs      focused Top-K Metal parity and replay contracts
+  sampling/dflash2_selector.rs
+                              DFlash2 edge scoring and sequential path walk
   sampling/rejection.rs       sparse rejection component
   sampling/dspark_markov.rs   fused DSpark Markov, confidence, and Top-K Map component
   metal/sampling.metal
+  metal/dflash2_selector.metal
   metal/dspark_markov_sampling.metal
 
 crates/inference-executor-metal/src/sampling/
@@ -69,6 +72,9 @@ Unused static threadblock storage can reduce occupancy.
 
 Sampling returns only token IDs and probabilities.
 Partial candidates and reduced rows are private scratch, not model-level API state.
+`top_k::ReduceCompute::invoke_merge(...)` exposes raw merged token IDs and logits to model-specific consumers such as
+the DFlash2 candidate selector.
+It does not apply temperature, top-p, or sampling.
 The current input contract does not include repetition, frequency, or presence penalties.
 `TopKSamplingOutputBuffers` owns the concrete sampled token and probability buffers.
 `OutputBuffers` denotes GPU buffers, not a model lifecycle state machine.
@@ -240,8 +246,34 @@ dynamic shape value.
 
 The Reduce constants require 256 threads. The Map and Reduce replay arguments retain their current capacity and
 active-thread semantics. The backend exposes component-scoped APIs through `sampling::top_k`,
-`sampling::dspark_markov`, and `sampling::rejection`. It does not expose compatibility aliases from
+`sampling::dflash2_selector`, `sampling::dspark_markov`, and `sampling::rejection`. It does not expose compatibility aliases from
 `components` or `sampling`.
+
+### DFlash2 candidate selection
+
+DFlash2 uses the raw Top-K merge to select `selector_top_k` unary candidates for each proposal position.
+The selector then uses three fixed kernels:
+
+```text
+anchor token IDs + unary candidate IDs
+  -> predecessor-token IDs
+  -> quantized predecessor/successor embedding owners
+
+projected hidden + predecessor embeddings + successor embeddings + unary logits
+  -> edge scores [request, step, predecessor, successor]
+
+edge scores + sampler runtime parameters
+  -> sequential request-local path walk
+  -> proposal token/probability rows
+  -> sparse draft distributions
+```
+
+The first step uses the anchor token as every predecessor.
+Each later step uses the prior step's unary candidates as predecessors.
+The walk reads only the score row that the previous step selects.
+It applies temperature to the fixed candidate set.
+It does not apply top-p because the DFlash2 reference selector does not apply top-p after candidate construction.
+Each sparse distribution contains the exact probabilities that the walk uses.
 
 ### DSpark Markov numerical contract
 
