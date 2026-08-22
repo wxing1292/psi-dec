@@ -306,7 +306,7 @@ impl WalkInvocation<'_> {
         assert!(self.buffers.candidate_token_ids.len_bytes() >= candidates * size_of::<i32>());
         assert!(self.buffers.scores.len_bytes() >= config.score_count(self.shape) * size_of::<f32>());
         assert!(
-            self.buffers.runtime_params.len_bytes() >= self.shape.num_total_requests as usize * 6 * size_of::<u32>()
+            self.buffers.runtime_params.len_bytes() >= self.shape.num_total_requests as usize * 4 * size_of::<u32>()
         );
         assert!(self.buffers.output_distribution_indices.len_bytes() >= proposals * size_of::<u32>());
         assert!(self.buffers.proposal_token_ids.len_bytes() >= proposals * size_of::<i32>());

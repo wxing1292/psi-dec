@@ -354,6 +354,12 @@ fn validate_semantics(config: &CheckpointConfig) -> Result<(), ModelExecutorErro
             "Qwen3x DFlash2 block_size must contain an anchor and at least one proposal token",
         ));
     }
+    if config.sliding_window <= config.block_size {
+        return Err(ModelExecutorError::custom(format!(
+            "Qwen3x DFlash2 sliding_window={} must exceed block_size={} so every query row has persistent history",
+            config.sliding_window, config.block_size
+        )));
+    }
     if config.num_target_layers < 2 {
         return Err(ModelExecutorError::custom(
             "Qwen3x DFlash2 num_target_layers must contain a captured layer and the unsupported final Main layer",

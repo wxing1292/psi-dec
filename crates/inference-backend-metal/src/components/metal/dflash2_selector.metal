@@ -3,10 +3,8 @@ using namespace metal;
 
 struct sampling_runtime_params {
     float temperature;
-    float top_p;
     uint seed;
     uint sample_position;
-    uint top_k;
     uint sampling_domain;
 };
 

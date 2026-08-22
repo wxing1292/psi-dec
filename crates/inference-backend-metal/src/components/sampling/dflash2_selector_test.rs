@@ -37,10 +37,10 @@ fn test_scores_and_probabilistic_walk_match_reference_and_preserve_inactive_rows
     let logit_buffer = Buffer::from_slice(&device, &candidate_logits);
     let score_canary = -777.0f32;
     let score_buffer = Buffer::from_slice(&device, &vec![score_canary; config.score_count(shape)]);
-    let runtime_params = Buffer::new_zeroed(&device, shape.num_total_requests as usize * 6 * size_of::<u32>());
+    let runtime_params = Buffer::new_zeroed(&device, shape.num_total_requests as usize * 4 * size_of::<u32>());
     for request in 0..shape.num_total_requests as usize {
-        runtime_params.write_typed(request * 6, &[0.8f32, 1.0]);
-        runtime_params.write_typed(request * 6 + 2, &[17u32, 29, config.top_k, 0xD1A5_0001]);
+        runtime_params.write_typed(request * 4, &[0.8f32]);
+        runtime_params.write_typed(request * 4 + 1, &[17u32, 29, 0xD1A5_0001]);
     }
     let distribution_indices = Buffer::from_slice(&device, &[2u32, 3, 4, 5]);
     let proposal_token_ids = Buffer::from_slice(&device, &[i32::MIN; 4]);
