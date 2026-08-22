@@ -1,10 +1,12 @@
+//! History-attention execution selection for a fixed query-block width.
+
 use std::cmp::Reverse;
 
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::components::gqa::sdpa::ExecutionVariant;
-use inference_executor_core::attn::DSparkBlockCapacity;
+use inference_executor_core::attn::BlockSpecCapacity;
 
-use crate::attn::dspark::capacity::DSparkGQACapacity;
+use crate::attn::block_spec::capacity::BlockSpecGQACapacity;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SelectionMetrics {
@@ -18,7 +20,7 @@ struct SelectionMetrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Selection {
     execution: ExecutionVariant,
-    capacity: DSparkGQACapacity,
+    capacity: BlockSpecGQACapacity,
     metrics: SelectionMetrics,
 }
 
@@ -27,12 +29,12 @@ impl Selection {
         self.execution
     }
 
-    pub fn capacity(self) -> DSparkGQACapacity {
+    pub fn capacity(self) -> BlockSpecGQACapacity {
         self.capacity
     }
 }
 
-/// Selects one legal SplitKV execution for the fixed DSpark proposal width.
+/// Selects one legal SplitKV execution for the fixed block-spec proposal width.
 ///
 /// A multi-token proposal can reuse each history K/V tile across Q rows. The
 /// selector compares the derived K/V load multiplicity, KV-iteration width,
@@ -40,11 +42,11 @@ impl Selection {
 /// execution.
 pub struct Selector {
     registry: backend_sdpa::Registry,
-    block_capacity: DSparkBlockCapacity,
+    block_capacity: BlockSpecCapacity,
 }
 
 impl Selector {
-    pub fn new(registry: backend_sdpa::Registry, block_capacity: DSparkBlockCapacity) -> Self {
+    pub fn new(registry: backend_sdpa::Registry, block_capacity: BlockSpecCapacity) -> Self {
         block_capacity.validate();
         Self {
             registry,
@@ -76,7 +78,7 @@ impl Selector {
 
     fn materialize_candidate(&self, execution: ExecutionVariant) -> Selection {
         let map = execution.map.thread_block;
-        let capacity = DSparkGQACapacity::new(self.block_capacity, map.max_q_tokens);
+        let capacity = BlockSpecGQACapacity::new(self.block_capacity, map.max_q_tokens);
         let q_token_ranges_per_request = self.block_capacity.block_size.div_ceil(capacity.max_q_tokens);
         let q_head_ranges_per_kv_head =
             (self.registry.config().q_heads_per_kv_head() as usize).div_ceil(map.max_q_heads as usize);
@@ -86,11 +88,11 @@ impl Selector {
             metrics: SelectionMetrics {
                 history_kv_load_multiplicity_per_request: q_token_ranges_per_request
                     .checked_mul(q_head_ranges_per_kv_head)
-                    .expect("DSpark history K/V load multiplicity must fit usize"),
+                    .expect("block-spec history K/V load multiplicity must fit usize"),
                 kv_tokens_per_iteration: map.kv_tokens_per_iteration,
                 padded_q_tokens_per_request: q_token_ranges_per_request
                     .checked_mul(capacity.max_q_tokens)
-                    .expect("DSpark padded Q-token count must fit usize"),
+                    .expect("block-spec padded Q-token count must fit usize"),
                 partial_state_group_capacity: capacity.max_sdpa_partial_state_groups,
                 max_q_heads: map.max_q_heads,
             },
@@ -132,7 +134,7 @@ mod tests {
     fn selector(config: backend_sdpa::Config, block_size: usize) -> Selector {
         Selector::new(
             backend_sdpa::Registry::new(config),
-            DSparkBlockCapacity::new(2, block_size),
+            BlockSpecCapacity::new(2, block_size),
         )
     }
 

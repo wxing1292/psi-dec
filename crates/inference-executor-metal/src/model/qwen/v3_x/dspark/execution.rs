@@ -6,7 +6,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
-use inference_executor_core::attn::DSparkBlockMetadata;
+use inference_executor_core::attn::BlockSpecMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
@@ -15,7 +15,7 @@ use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_we
 use inference_executor_core::sampling::SamplerConfig;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::dspark::state::DSparkGQAState;
+use crate::attn::block_spec::state::BlockSpecGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
@@ -48,7 +48,7 @@ mod file_io;
 
 pub struct Qwen3xDSparkExecution {
     prefill: Replay<Qwen3xDSparkPrefill>,
-    gqa_state: DSparkGQAState,
+    gqa_state: BlockSpecGQAState,
     embed: Replay<Qwen3xDSparkEmbed>,
     body: Replay<Qwen3xDSparkBody>,
     gather_unembed: Replay<Qwen3xDSparkGatherUnembed>,
@@ -392,12 +392,24 @@ impl Qwen3xDSparkExecution {
         pages: &Buffer,
         distribution_store: &SpecProbsStore,
     ) -> Qwen3xDSparkDecodeRecording {
-        let visible_history_token_ranges = proposal
-            .anchor_positions
-            .iter()
-            .map(|&anchor_position| 0..anchor_position)
-            .collect::<Vec<_>>();
-        let block = DSparkBlockMetadata::new(&proposal.req_slots, &visible_history_token_ranges, self.num_spec_tokens);
+        let mut flat_query_token_indices = Vec::with_capacity(proposal.req_slots.len() * self.num_spec_tokens);
+        let mut visible_history_token_ranges = Vec::with_capacity(flat_query_token_indices.capacity());
+        for &anchor_position in proposal.anchor_positions {
+            for block_offset in 0..self.num_spec_tokens {
+                flat_query_token_indices.push(
+                    anchor_position
+                        .checked_add(block_offset as u32)
+                        .expect("Qwen3x DSpark block token position must fit u32"),
+                );
+                visible_history_token_ranges.push(0..anchor_position);
+            }
+        }
+        let block = BlockSpecMetadata::new(
+            &proposal.req_slots,
+            &flat_query_token_indices,
+            &visible_history_token_ranges,
+            self.num_spec_tokens,
+        );
         self.gqa_state.prepare_block(&block);
         let mut block_token_ids = Vec::with_capacity(block.num_tokens());
         for &anchor_token_id in proposal.anchor_token_ids {

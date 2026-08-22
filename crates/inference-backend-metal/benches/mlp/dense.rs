@@ -101,8 +101,12 @@ impl QuantizedDenseMLPFixture {
         let config = dense_mlp::Config {
             hidden_dim: profile.hidden_dim,
             intermediate_dim: profile.intermediate_dim,
-            group_size: profile.group_size,
-            bits: profile.bits,
+            gate_up_group_size: profile.group_size,
+            gate_up_bits: profile.bits,
+            gate_up_scale_bias_dtype: Dtype::Bfloat16,
+            down_group_size: profile.group_size,
+            down_bits: profile.bits,
+            down_scale_bias_dtype: Dtype::Bfloat16,
             dtype: Dtype::Bfloat16,
         };
         let shape = dense_mlp::Shape {

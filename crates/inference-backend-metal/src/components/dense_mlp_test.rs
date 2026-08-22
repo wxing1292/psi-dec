@@ -25,12 +25,75 @@ fn test_swiglu_constants_have_explicit_thread_block_scope() {
 }
 
 #[test]
+fn test_mixed_q4_q6_layout_with_f32_affine_parameters_executes() {
+    let config = Config {
+        hidden_dim: 64,
+        intermediate_dim: 64,
+        gate_up_group_size: 32,
+        gate_up_bits: 4,
+        gate_up_scale_bias_dtype: Dtype::Float32,
+        down_group_size: 32,
+        down_bits: 6,
+        down_scale_bias_dtype: Dtype::Float32,
+        dtype: Dtype::Bfloat16,
+    };
+    let shape = Shape { num_total_tokens: 1 };
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let compute = Compute::new(&device, config);
+    let gate_up = config.gate_up_config();
+    let down = config.down_config();
+    let hidden_state = bf16_buffer(&device, &vec![1.0; config.hidden_dim as usize]);
+    let next_hidden_state = Buffer::new_zeroed(&device, config.output_bytes(shape));
+    let gate_up_scratch = Buffer::new_zeroed(&device, config.gate_up_output_bytes(shape));
+    let swiglu = Buffer::new_zeroed(&device, config.swiglu_bytes(shape));
+    let gate_up_weight = Buffer::new_zeroed(&device, gate_up.weight_bytes());
+    let gate_up_scales = Buffer::new_zeroed(&device, gate_up.scale_or_bias_bytes());
+    let gate_up_biases = Buffer::new_zeroed(&device, gate_up.scale_or_bias_bytes());
+    let down_weight = Buffer::new_zeroed(&device, down.weight_bytes());
+    let down_scales = Buffer::new_zeroed(&device, down.scale_or_bias_bytes());
+    let down_biases = Buffer::new_zeroed(&device, down.scale_or_bias_bytes());
+    let mut builder = stream.create_replay_program();
+    builder.record(compute.invoke(
+        shape,
+        ReplayU32::Fixed(shape.num_total_tokens),
+        Buffers {
+            hidden_state: &hidden_state,
+            next_hidden_state: &next_hidden_state,
+        },
+        Scratch {
+            gate_up: &gate_up_scratch,
+            swiglu: &swiglu,
+        },
+        Weights {
+            gate_up_weight: &gate_up_weight,
+            gate_up_scales: &gate_up_scales,
+            gate_up_biases: &gate_up_biases,
+            down_weight: &down_weight,
+            down_scales: &down_scales,
+            down_biases: &down_biases,
+        },
+    ));
+
+    stream.submit_replay(&builder.build()).wait();
+
+    assert_eq!(
+        next_hidden_state.read_typed::<u16>(0, config.hidden_dim as usize),
+        vec![0; config.hidden_dim as usize]
+    );
+}
+
+#[test]
 fn test_fixed() {
     let config = Config {
         hidden_dim: 64,
         intermediate_dim: 64,
-        group_size: 32,
-        bits: 4,
+        gate_up_group_size: 32,
+        gate_up_bits: 4,
+        gate_up_scale_bias_dtype: Dtype::Bfloat16,
+        down_group_size: 32,
+        down_bits: 4,
+        down_scale_bias_dtype: Dtype::Bfloat16,
         dtype: Dtype::Bfloat16,
     };
     let shape = Shape { num_total_tokens: 4 };
@@ -92,8 +155,8 @@ fn test_fixed() {
             .map(|value| bf16::from_f32(*value).to_f32())
             .collect::<Vec<_>>(),
         shape.num_total_tokens as usize,
-        config.group_size as usize,
-        config.bits as usize,
+        config.gate_up_group_size as usize,
+        config.gate_up_bits as usize,
         QuantizedDenseMLPReferenceWeights {
             gate_up_weight: &gate_up_weight_values,
             gate_up_scales: &bf16_values(&gate_up_scale_values),
@@ -121,8 +184,12 @@ fn test_random() {
     let config = Config {
         hidden_dim: 64,
         intermediate_dim: 4160,
-        group_size: 32,
-        bits: 4,
+        gate_up_group_size: 32,
+        gate_up_bits: 4,
+        gate_up_scale_bias_dtype: Dtype::Bfloat16,
+        down_group_size: 32,
+        down_bits: 4,
+        down_scale_bias_dtype: Dtype::Bfloat16,
         dtype: Dtype::Bfloat16,
     };
     let shape = Shape { num_total_tokens: 7 };
@@ -195,8 +262,8 @@ fn test_random() {
         },
         &bf16_values(&hidden_values),
         shape.num_total_tokens as usize,
-        config.group_size as usize,
-        config.bits as usize,
+        config.gate_up_group_size as usize,
+        config.gate_up_bits as usize,
         QuantizedDenseMLPReferenceWeights {
             gate_up_weight: &gate_up_weight_values,
             gate_up_scales: &bf16_values(&gate_up_scale_values),
@@ -358,8 +425,8 @@ impl BucketedDenseMLPFixture {
             },
             hidden,
             num_active_tokens as usize,
-            self.config.group_size as usize,
-            self.config.bits as usize,
+            self.config.gate_up_group_size as usize,
+            self.config.gate_up_bits as usize,
             self.weights.as_reference(),
         )
         .into_iter()
@@ -510,8 +577,12 @@ fn bucket_test_config() -> Config {
     Config {
         hidden_dim: 64,
         intermediate_dim: 4160,
-        group_size: 32,
-        bits: 4,
+        gate_up_group_size: 32,
+        gate_up_bits: 4,
+        gate_up_scale_bias_dtype: Dtype::Bfloat16,
+        down_group_size: 32,
+        down_bits: 4,
+        down_scale_bias_dtype: Dtype::Bfloat16,
         dtype: Dtype::Bfloat16,
     }
 }

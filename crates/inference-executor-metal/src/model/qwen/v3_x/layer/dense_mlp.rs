@@ -137,19 +137,25 @@ impl DenseMLPWeightBuffers {
         metal.validate();
         let gate_weight = remove_quant_weight(tensors, &bindings.gate.weight)?;
         let up_weight = remove_quant_weight(tensors, &bindings.up.weight)?;
-        let gate_scales = remove_typed_tensor(tensors, &bindings.gate.scales, safetensors::Dtype::BF16)?.into_data();
-        let up_scales = remove_typed_tensor(tensors, &bindings.up.scales, safetensors::Dtype::BF16)?.into_data();
-        let gate_biases = remove_typed_tensor(tensors, &bindings.gate.biases, safetensors::Dtype::BF16)?.into_data();
-        let up_biases = remove_typed_tensor(tensors, &bindings.up.biases, safetensors::Dtype::BF16)?.into_data();
+        let gate_up_dtype = safetensors_dtype(metal.gate_up.scale_bias_dtype);
+        let down_dtype = safetensors_dtype(metal.down.scale_bias_dtype);
+        let gate_scales = remove_typed_tensor(tensors, &bindings.gate.scales, gate_up_dtype)?.into_data();
+        let up_scales = remove_typed_tensor(tensors, &bindings.up.scales, gate_up_dtype)?.into_data();
+        let gate_biases = remove_typed_tensor(tensors, &bindings.gate.biases, gate_up_dtype)?.into_data();
+        let up_biases = remove_typed_tensor(tensors, &bindings.up.biases, gate_up_dtype)?.into_data();
         let down_weight = remove_quant_weight(tensors, &bindings.down.weight)?;
-        let down_scales = remove_typed_tensor(tensors, &bindings.down.scales, safetensors::Dtype::BF16)?.into_data();
-        let down_biases = remove_typed_tensor(tensors, &bindings.down.biases, safetensors::Dtype::BF16)?.into_data();
+        let down_scales = remove_typed_tensor(tensors, &bindings.down.scales, down_dtype)?.into_data();
+        let down_biases = remove_typed_tensor(tensors, &bindings.down.biases, down_dtype)?.into_data();
 
         let config = inference_backend_metal::components::dense_mlp::Config {
             hidden_dim: to_u32("dense hidden_dim", core.hidden_dim)?,
             intermediate_dim: to_u32("dense intermediate_dim", core.intermediate_dim)?,
-            group_size: metal.group_size,
-            bits: metal.bits,
+            gate_up_group_size: metal.gate_up.group_size,
+            gate_up_bits: metal.gate_up.bits,
+            gate_up_scale_bias_dtype: metal.gate_up.scale_bias_dtype,
+            down_group_size: metal.down.group_size,
+            down_bits: metal.down.bits,
+            down_scale_bias_dtype: metal.down.scale_bias_dtype,
             dtype: metal.io_dtype,
         };
         let gate_up_config = config.gate_up_config();
@@ -202,5 +208,13 @@ impl DenseMLPWeightBuffers {
             down_scales: &self.down_scales,
             down_biases: &self.down_biases,
         }
+    }
+}
+
+fn safetensors_dtype(dtype: inference_backend_metal::metal::Dtype) -> safetensors::Dtype {
+    match dtype {
+        inference_backend_metal::metal::Dtype::Bfloat16 => safetensors::Dtype::BF16,
+        inference_backend_metal::metal::Dtype::Float32 => safetensors::Dtype::F32,
+        dtype => panic!("unsupported dense MLP affine parameter dtype {dtype:?}"),
     }
 }

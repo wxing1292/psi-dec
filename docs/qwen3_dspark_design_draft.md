@@ -26,7 +26,7 @@ The current worktree contains these new areas:
 
 ```text
 crates/inference-executor-core/src/
-  attn/gqa/dspark_core.rs
+  attn/gqa/block_spec_core.rs
   model/qwen/v3_x/dspark/
   bin/qwen3_dspark_quantize.rs
 
@@ -37,7 +37,7 @@ crates/inference-backend-metal/src/components/
   metal/gqa_block_sdpa.metal
 
 crates/inference-executor-metal/src/
-  attn/dspark/*.rs
+  attn/block_spec/*.rs
   model/qwen/v3_x/dspark/
   sampling/dspark_markov.rs
   sampling/rejection_replay.rs
@@ -102,7 +102,7 @@ Qwen3Executor
     request sampling state
     sparse probability store
     Main and DSpark page-table layouts
-    DSparkBlockScratch
+    BlockSpecScratch
     PageArena
     pending Main transactions
 ```
@@ -320,11 +320,11 @@ Q heads per KV head  = 5
 
 The executor derives all values from the checkpoint.
 
-`DSparkGQA` owns two K/V domains:
+`BlockSpecGQA` owns two K/V domains:
 
 ```text
 persistent history K/V  runtime pages
-proposal-local K/V      DSparkBlockScratch
+proposal-local K/V      BlockSpecScratch
 ```
 
 The attention component records this sequence:
@@ -459,7 +459,7 @@ DSpark-disabled Qwen3 retains its Main-only page count.
 
 ## Scratch ownership
 
-`DSparkBlockScratch` is an executor-owned fixed-capacity resource.
+`BlockSpecScratch` is an executor-owned fixed-capacity resource.
 It contains:
 
 ```text
@@ -603,9 +603,9 @@ The current synchronous terminal-failure model does not require a second rollbac
 `inference-executor-metal` owns the model realization:
 
 - Weight buffers and tensor views
-- `DSparkGQA`
+- `BlockSpecGQA`
 - Persistent DSpark page interpretation
-- `DSparkBlockScratch`
+- `BlockSpecScratch`
 - `Qwen3xDSparkLayer`
 - Main-feature projection and context append
 - Markov sampling
@@ -631,7 +631,7 @@ The first-principles audit used these questions:
 | Question                                                   | Result                                                                |
 | ---------------------------------------------------------- | --------------------------------------------------------------------- |
 | Does each persistent value follow accepted Main history?   | Yes. Main K/V and DSpark context K/V share one cache-block lifecycle. |
-| Can proposal-local state escape its batch?                 | No. Local Q/K/V and attention partials live in `DSparkBlockScratch`.  |
+| Can proposal-local state escape its batch?                 | No. Local Q/K/V and attention partials live in `BlockSpecScratch`.  |
 | Does every CPU dependency create one clear wait boundary?  | Yes. Main output is read before Spec block construction.              |
 | Does any component submit or wait internally?              | No. The service owns both boundaries.                                 |
 | Does Main depend on a concrete DSpark model?               | No. Main exposes only the residual-capture seam.                      |
@@ -836,9 +836,9 @@ The executor must not become the global scheduler.
 
 ### Gated DSpark GQA
 
-Future work: Add a separate `GatedDSparkGQA` when a supported checkpoint requires it.
+Future work: Add a separate `GatedBlockSpecGQA` when a supported checkpoint requires it.
 
-The implementation must not add a `gated` runtime flag to `DSparkGQA`.
+The implementation must not add a `gated` runtime flag to `BlockSpecGQA`.
 The history map, block map, reducer, page layout, and scratch contracts must remain gate-neutral.
 
 ### Backend-neutral replay boundary

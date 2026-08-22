@@ -341,7 +341,7 @@ This table identifies the current selection owner. Component documents contain t
 | Component | Selectable unit | Selection owner and result |
 | --- | --- | --- |
 | GQA SDPA | Complete SplitKV Map/Reduce execution variant. | `gqa::sdpa::Selector` returns a rich component-local `Selection`. |
-| DSpark history SDPA | Complete SplitKV Map/Reduce execution variant plus fixed proposal capacity. | `dspark::sdpa::Selector` returns a component-local `Selection` with the variant and `DSparkGQACapacity`. |
+| Block-spec history SDPA | Complete SplitKV Map/Reduce execution variant plus fixed proposal capacity. | `block_spec::sdpa::Selector` returns a component-local `Selection` with the variant and `BlockSpecGQACapacity`. |
 | GDN | Complete recurrent execution variant. A future chunkwise algorithm must be another complete Variant. | `gdn::compute::Selector` returns `(VariantKey, &Variant)`. |
 | Quantized affine | QMV or QMM kernel for the runtime row count. | `affine_quantized::Selector` returns the selected kernel entry. |
 | Dense MLP | No independent outer variant. | Each affine owner selects QMV or QMM. |

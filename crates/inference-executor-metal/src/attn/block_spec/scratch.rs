@@ -1,13 +1,14 @@
+//! Shared scratch buffers for block-spec GQA.
+
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::DSparkGQACore;
+use inference_executor_core::attn::BlockSpecGQACore;
 
-use crate::attn::dspark::capacity::DSparkGQACapacity;
+use crate::attn::block_spec::capacity::BlockSpecGQACapacity;
 
-pub struct DSparkBlockScratch {
-    capacity: DSparkGQACapacity,
-    qkv: Buffer,
+pub struct BlockSpecScratch {
+    capacity: BlockSpecGQACapacity,
     q: Buffer,
     k: Buffer,
     v: Buffer,
@@ -20,9 +21,8 @@ pub struct DSparkBlockScratch {
 }
 
 #[derive(Clone, Copy)]
-pub struct DSparkBlockScratchBindings<'a> {
-    pub capacity: DSparkGQACapacity,
-    pub qkv: &'a Buffer,
+pub struct BlockSpecScratchBindings<'a> {
+    pub capacity: BlockSpecGQACapacity,
     pub q: &'a Buffer,
     pub k: &'a Buffer,
     pub v: &'a Buffer,
@@ -34,17 +34,17 @@ pub struct DSparkBlockScratchBindings<'a> {
     pub attention_output: &'a Buffer,
 }
 
-impl DSparkBlockScratch {
-    pub fn new(device: &Device, core: &DSparkGQACore, io_dtype: Dtype, capacity: DSparkGQACapacity) -> Self {
+impl BlockSpecScratch {
+    pub fn new(device: &Device, core: &BlockSpecGQACore, io_dtype: Dtype, capacity: BlockSpecGQACapacity) -> Self {
         core.validate();
         match io_dtype {
             Dtype::Bfloat16 => {},
-            Dtype::Float32 => todo!("F32 DSpark GQA model boundary is not supported"),
-            dtype => panic!("unsupported DSpark GQA model boundary dtype {dtype:?}"),
+            Dtype::Float32 => todo!("F32 block-spec GQA model boundary is not supported"),
+            dtype => panic!("unsupported block-spec GQA model boundary dtype {dtype:?}"),
         }
         assert_eq!(
             core.block_size, capacity.block.block_size,
-            "DSpark GQA core and scratch block sizes must match"
+            "block-spec GQA core and scratch block sizes must match"
         );
         let attention = &core.attention;
         let tensor_elements = |dim: usize| {
@@ -52,21 +52,20 @@ impl DSparkBlockScratch {
                 .block
                 .max_tokens
                 .checked_mul(dim)
-                .expect("DSpark block scratch tensor element count must fit usize")
+                .expect("block-spec block scratch tensor element count must fit usize")
         };
         let partial_stats = capacity
             .max_sdpa_partial_state_groups
             .checked_mul(attention.num_q_heads)
-            .expect("DSpark block scratch partial statistic count must fit usize");
+            .expect("block-spec block scratch partial statistic count must fit usize");
         let partial_values = partial_stats
             .checked_mul(attention.head_dim)
-            .expect("DSpark block scratch partial output count must fit usize");
-        assert_u32_index_domain(partial_stats, "DSpark block partial statistics");
-        assert_u32_index_domain(partial_values, "DSpark block partial output");
+            .expect("block-spec block scratch partial output count must fit usize");
+        assert_u32_index_domain(partial_stats, "block-spec block partial statistics");
+        assert_u32_index_domain(partial_values, "block-spec block partial output");
 
         Self {
             capacity,
-            qkv: Buffer::new_zeroed_elements(device, tensor_elements(attention.qkv_dim()), io_dtype),
             q: Buffer::new_zeroed_elements(device, tensor_elements(attention.q_dim()), io_dtype),
             k: Buffer::new_zeroed_elements(device, tensor_elements(attention.k_dim()), io_dtype),
             v: Buffer::new_zeroed_elements(device, tensor_elements(attention.v_dim()), io_dtype),
@@ -79,10 +78,9 @@ impl DSparkBlockScratch {
         }
     }
 
-    pub fn bindings(&self) -> DSparkBlockScratchBindings<'_> {
-        DSparkBlockScratchBindings {
+    pub fn bindings(&self) -> BlockSpecScratchBindings<'_> {
+        BlockSpecScratchBindings {
             capacity: self.capacity,
-            qkv: &self.qkv,
             q: &self.q,
             k: &self.k,
             v: &self.v,

@@ -176,7 +176,7 @@ Qwen35SpeculativeResources
 
 Qwen3xDSparkExecution
   prefill: Replay<Qwen3xDSparkPrefill>
-  gqa_state: DSparkGQAState
+  gqa_state: BlockSpecGQAState
   embed: Replay<Qwen3xDSparkEmbed>
   body: Replay<Qwen3xDSparkBody>
   gather_unembed: Replay<Qwen3xDSparkGatherUnembed>
@@ -333,7 +333,7 @@ Qwen3 follows the same ownership order with separate Vanilla and DSpark graphs.
 It parses its flat Main configuration and resolves its Main binding tree.
 When configured, it parses the DSpark configuration and passes it to the shared DSpark loader.
 It constructs one QKV GQA state domain and dense scratch.
-It constructs a second ungated GQA state domain and `DSparkBlockScratch` when DSpark is enabled.
+It constructs a second ungated GQA state domain and `BlockSpecScratch` when DSpark is enabled.
 It loads Main and Main output for both modes.
 The DSpark mode also loads the shared DSpark execution owner and rejection resources.
 
@@ -755,7 +755,7 @@ The combined branch and the DSpark branches are mutually exclusive.
 It accepts only complete Qwen3 Main page-ID blocks. It does not interpret runtime cache lanes.
 Qwen3 has zero state pages.
 It does not construct, restore, publish, commit, or reset a GDN state table.
-`DSparkGQAState` owns a separate DSpark page table, metadata buffers, backend, and block scratch.
+`BlockSpecGQAState` owns a separate DSpark page table, metadata buffers, backend, and block scratch.
 In DSpark mode, runtime cache lane 0 stores `[Main page IDs | DSpark page IDs]` for each logical block.
 `prepare_batch` validates the exact combined length and splits this list once.
 It sends each complete role-local list to the applicable state owner.
@@ -889,7 +889,7 @@ Main verification distributions use compact active-row identity because they exi
 
 Main K/V and persistent DSpark context K/V share one runtime cache-block lifecycle.
 The executor owns separate page tables and splits each runtime page span.
-Proposal-local Q/K/V and attention partials remain in executor-owned `DSparkBlockScratch`.
+Proposal-local Q/K/V and attention partials remain in executor-owned `BlockSpecScratch`.
 
 Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidates for each DSpark request slot.
 MTP uses the same decision-candidate count and shifts their physical state versions by `num_spec_tokens - 1`.

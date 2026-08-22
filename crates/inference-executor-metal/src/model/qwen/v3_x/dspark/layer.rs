@@ -11,9 +11,10 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkLayerWeightBindings;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xDenseMLPWeightBindings;
 
-use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
-use crate::attn::dspark::state::DSparkGQAState;
+use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
+use crate::attn::block_spec::state::BlockSpecGQAState;
 use crate::checkpoint::SafeTensorStore;
+use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::dense::scratch::DenseMLPScratch;
@@ -48,7 +49,7 @@ pub struct Qwen3xDSparkLayerScratch {
 #[derive(Clone, Copy)]
 pub struct Qwen3xDSparkLayerInput<'a> {
     pub num_tokens: u32,
-    pub metadata: &'a DSparkGQAMetadataBuffers,
+    pub metadata: &'a BlockSpecGQAMetadataBuffers,
     pub pages: &'a Buffer,
     pub residual_input: &'a Buffer,
     pub residual_output: &'a Buffer,
@@ -63,7 +64,7 @@ impl Qwen3xDSparkLayer {
         dspark_layer_index: usize,
         page_bytes: usize,
         bindings: &Qwen3xDSparkLayerWeightBindings,
-        gqa_state: &DSparkGQAState,
+        gqa_state: &BlockSpecGQAState,
         scratch: Rc<Qwen3xDSparkLayerScratch>,
         dense_scratch: Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
@@ -150,7 +151,7 @@ impl Qwen3xDSparkLayer {
         self.attention.unload_state();
     }
 
-    pub fn load_state(&mut self, state: &DSparkGQAState) {
+    pub fn load_state(&mut self, state: &BlockSpecGQAState) {
         self.attention.load_state(state);
     }
 
@@ -236,15 +237,12 @@ fn derive_qwen3x_dspark_dense_mlp_configs(
         .quantization
         .as_ref()
         .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark dense MLP requires quantization config"))?;
-    let resolved = resolve_uniform_quantization(
+    let gate_up = resolve_uniform_quantization(
         quantization,
-        &[
-            bindings.gate.weight.as_str(),
-            bindings.up.weight.as_str(),
-            bindings.down.weight.as_str(),
-        ],
-        "Qwen3x DSpark dense MLP",
+        &[bindings.gate.weight.as_str(), bindings.up.weight.as_str()],
+        "Qwen3x DSpark dense MLP gate/up",
     )?;
+    let down = quantization.resolve_for_tensor(&bindings.down.weight);
     let core = DenseMLPCore {
         model_layer_index: dspark_layer_index,
         hidden_dim: config.hidden_size,
@@ -252,8 +250,16 @@ fn derive_qwen3x_dspark_dense_mlp_configs(
     };
     core.validate();
     let metal = DenseMLPMetalConfig {
-        group_size: to_u32("Qwen3x DSpark dense MLP group_size", resolved.group_size)?,
-        bits: to_u32("Qwen3x DSpark dense MLP bits", resolved.bits)?,
+        gate_up: QuantizedAffineLayout {
+            group_size: to_u32("Qwen3x DSpark dense MLP gate/up group_size", gate_up.group_size)?,
+            bits: to_u32("Qwen3x DSpark dense MLP gate/up bits", gate_up.bits)?,
+            scale_bias_dtype: Dtype::Bfloat16,
+        },
+        down: QuantizedAffineLayout {
+            group_size: to_u32("Qwen3x DSpark dense MLP down group_size", down.group_size)?,
+            bits: to_u32("Qwen3x DSpark dense MLP down bits", down.bits)?,
+            scale_bias_dtype: Dtype::Bfloat16,
+        },
         io_dtype: Dtype::Bfloat16,
     };
     metal.validate();
@@ -325,12 +331,14 @@ mod tests {
 
         assert_eq!(first_core.model_layer_index, 0);
         assert_eq!(second_core.model_layer_index, 1);
-        assert_eq!(first_metal.bits, 4);
-        assert_eq!(second_metal.bits, 8);
+        assert_eq!(first_metal.gate_up.bits, 4);
+        assert_eq!(first_metal.down.bits, 4);
+        assert_eq!(second_metal.gate_up.bits, 8);
+        assert_eq!(second_metal.down.bits, 8);
     }
 
     #[test]
-    fn test_dense_mlp_rejects_mixed_projection_affine_layouts() {
+    fn test_dense_mlp_preserves_mixed_down_projection_affine_layout() {
         let mut config = config();
         config.quantization.as_mut().unwrap().tensor_overrides.insert(
             "layers.0.mlp.down_proj.weight".to_string(),
@@ -342,9 +350,10 @@ mod tests {
         );
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
-        let error = derive_qwen3x_dspark_dense_mlp_configs(&config, 0, &bindings.layers[0].mlp).unwrap_err();
+        let (_, metal) = derive_qwen3x_dspark_dense_mlp_configs(&config, 0, &bindings.layers[0].mlp).unwrap();
 
-        assert!(error.to_string().contains("dense MLP requires one affine layout"));
+        assert_eq!(metal.gate_up.bits, 4);
+        assert_eq!(metal.down.bits, 8);
     }
 
     fn config() -> Qwen3xDSparkConfig {

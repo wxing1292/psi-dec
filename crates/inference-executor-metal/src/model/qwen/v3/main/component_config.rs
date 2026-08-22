@@ -9,6 +9,7 @@ use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3::Qwen3ModelConfig;
 
 use crate::attn::gqa::backend::GQAMetalConfig;
+use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::model::qwen::v3_x::weight::to_u32;
 
@@ -54,9 +55,14 @@ pub fn derive_qwen3_dense_mlp_configs(
     };
     core.validate();
     let (group_size, bits) = quantization(config)?;
-    let metal = DenseMLPMetalConfig {
+    let affine = QuantizedAffineLayout {
         group_size,
         bits,
+        scale_bias_dtype: Dtype::Bfloat16,
+    };
+    let metal = DenseMLPMetalConfig {
+        gate_up: affine,
+        down: affine,
         io_dtype: Dtype::Bfloat16,
     };
     metal.validate();

@@ -393,8 +393,12 @@ impl MoEForwardFixture {
         let dense_config = dense_mlp::Config {
             hidden_dim: HIDDEN_DIM,
             intermediate_dim: INTERMEDIATE_DIM,
-            group_size: GROUP_SIZE,
-            bits: EXPERT_BITS,
+            gate_up_group_size: GROUP_SIZE,
+            gate_up_bits: EXPERT_BITS,
+            gate_up_scale_bias_dtype: Dtype::Bfloat16,
+            down_group_size: GROUP_SIZE,
+            down_bits: EXPERT_BITS,
+            down_scale_bias_dtype: Dtype::Bfloat16,
             dtype: Dtype::Bfloat16,
         };
         let dense_shape = dense_mlp::Shape {

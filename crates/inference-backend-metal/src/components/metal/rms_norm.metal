@@ -143,3 +143,51 @@ kernel void rms_norm_bf16_vec4(
             weight[vector_index] * bfloat4(float4(row_input[vector_index]) * local_inv_mean[0]);
     }
 }
+
+kernel void rms_norm_bf16_vec4_weight_f32(
+    device const bfloat4* input [[buffer(0)]],
+    device const float4* weight [[buffer(1)]],
+    device bfloat4* output [[buffer(2)]],
+    constant uint& num_active_tokens [[buffer(3)]],
+    constant uint& hidden_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsize [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
+) {
+    const uint row = gid;
+    if (row >= num_active_tokens) return;
+
+    const uint hidden_dim_vec = hidden_dim / 4;
+    float acc = 0.0f;
+    const device bfloat4* row_input = input + row * size_t(hidden_dim_vec);
+    for (uint vector_index = lid; vector_index < hidden_dim_vec; vector_index += lsize) {
+        float4 x = float4(row_input[vector_index]);
+        acc += dot(x, x);
+    }
+    acc = simd_sum(acc);
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[32];
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        acc = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / float(hidden_dim) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device bfloat4* row_output = output + row * size_t(hidden_dim_vec);
+    for (uint vector_index = lid; vector_index < hidden_dim_vec; vector_index += lsize) {
+        row_output[vector_index] = bfloat4(weight[vector_index] * (float4(row_input[vector_index]) * local_inv_mean[0]));
+    }
+}

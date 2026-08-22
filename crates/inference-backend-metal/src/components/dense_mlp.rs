@@ -41,8 +41,12 @@ impl SwiGLUKernelConstants {
 pub struct Config {
     pub hidden_dim: u32,
     pub intermediate_dim: u32,
-    pub group_size: u32,
-    pub bits: u32,
+    pub gate_up_group_size: u32,
+    pub gate_up_bits: u32,
+    pub gate_up_scale_bias_dtype: Dtype,
+    pub down_group_size: u32,
+    pub down_bits: u32,
+    pub down_scale_bias_dtype: Dtype,
     pub dtype: Dtype,
 }
 
@@ -51,24 +55,45 @@ impl Config {
         assert!(self.hidden_dim > 0);
         assert!(self.intermediate_dim > 0);
         self.stacked_intermediate_dim();
-        assert!(matches!(self.group_size, 32 | 64 | 128));
-        assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
+        assert!(matches!(self.gate_up_group_size, 32 | 64 | 128));
+        assert!(matches!(self.gate_up_bits, 2 | 3 | 4 | 6 | 8));
+        assert!(matches!(
+            self.gate_up_scale_bias_dtype,
+            Dtype::Float32 | Dtype::Bfloat16
+        ));
+        assert!(matches!(self.down_group_size, 32 | 64 | 128));
+        assert!(matches!(self.down_bits, 2 | 3 | 4 | 6 | 8));
+        assert!(matches!(self.down_scale_bias_dtype, Dtype::Float32 | Dtype::Bfloat16));
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
         i32::try_from(self.hidden_dim).expect("dense MLP hidden_dim must fit i32");
         i32::try_from(self.intermediate_dim).expect("dense MLP intermediate_dim must fit i32");
         i32::try_from(self.stacked_intermediate_dim()).expect("dense MLP stacked intermediate_dim must fit i32");
-        i32::try_from(self.group_size).expect("dense MLP group_size must fit i32");
-        i32::try_from(self.bits).expect("dense MLP bits must fit i32");
+        i32::try_from(self.gate_up_group_size).expect("dense MLP gate/up group_size must fit i32");
+        i32::try_from(self.gate_up_bits).expect("dense MLP gate/up bits must fit i32");
+        i32::try_from(self.down_group_size).expect("dense MLP down group_size must fit i32");
+        i32::try_from(self.down_bits).expect("dense MLP down bits must fit i32");
     }
 
     pub fn gate_up_config(self) -> affine_quantized::Config {
         self.validate();
-        self.affine_config_unchecked(self.stacked_intermediate_dim(), self.hidden_dim)
+        self.affine_config_unchecked(
+            self.stacked_intermediate_dim(),
+            self.hidden_dim,
+            self.gate_up_group_size,
+            self.gate_up_bits,
+            self.gate_up_scale_bias_dtype,
+        )
     }
 
     pub fn down_config(self) -> affine_quantized::Config {
         self.validate();
-        self.affine_config_unchecked(self.hidden_dim, self.intermediate_dim)
+        self.affine_config_unchecked(
+            self.hidden_dim,
+            self.intermediate_dim,
+            self.down_group_size,
+            self.down_bits,
+            self.down_scale_bias_dtype,
+        )
     }
 
     pub fn swiglu_bytes(self, shape: Shape) -> usize {
@@ -116,15 +141,22 @@ impl Config {
         )
     }
 
-    fn affine_config_unchecked(self, n: u32, k: u32) -> affine_quantized::Config {
+    fn affine_config_unchecked(
+        self,
+        n: u32,
+        k: u32,
+        group_size: u32,
+        bits: u32,
+        scale_bias_dtype: Dtype,
+    ) -> affine_quantized::Config {
         affine_quantized::Config {
             n: n.try_into().expect("dense MLP output dimension must fit i32"),
             k: k.try_into().expect("dense MLP input dimension must fit i32"),
-            group_size: self.group_size.try_into().expect("dense MLP group_size must fit i32"),
-            bits: self.bits.try_into().expect("dense MLP bits must fit i32"),
+            group_size: group_size.try_into().expect("dense MLP group_size must fit i32"),
+            bits: bits.try_into().expect("dense MLP bits must fit i32"),
             input_dtype: self.dtype,
             output_dtype: self.dtype,
-            scale_bias_dtype: self.dtype,
+            scale_bias_dtype,
         }
     }
 

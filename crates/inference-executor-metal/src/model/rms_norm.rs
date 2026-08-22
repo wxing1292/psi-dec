@@ -1,6 +1,7 @@
 use inference_backend_metal::components::rms_norm;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 
@@ -13,12 +14,21 @@ pub struct RMSNorm {
 
 impl RMSNorm {
     pub fn new(device: &Device, hidden_dim: usize, eps: f32) -> Self {
+        Self::new_with_weight_dtype(device, hidden_dim, eps, Dtype::Bfloat16)
+    }
+
+    pub fn new_with_weight_dtype(device: &Device, hidden_dim: usize, eps: f32, weight_dtype: Dtype) -> Self {
         assert!(hidden_dim > 0, "RMS norm hidden dimension must be positive");
         assert!(eps.is_finite() && eps > 0.0, "RMS norm epsilon must be positive");
         let hidden_dim = hidden_dim.try_into().expect("RMS norm hidden dimension must fit u32");
+        let config = match weight_dtype {
+            Dtype::Bfloat16 => rms_norm::Config::bf16(hidden_dim, eps),
+            Dtype::Float32 => rms_norm::Config::bf16_with_f32_weight(hidden_dim, eps),
+            dtype => panic!("unsupported RMS norm weight dtype {dtype:?}"),
+        };
         Self {
             weight: None,
-            compute: rms_norm::Compute::new(device, rms_norm::Config::bf16(hidden_dim, eps)),
+            compute: rms_norm::Compute::new(device, config),
         }
     }
 

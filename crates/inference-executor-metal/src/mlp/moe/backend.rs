@@ -731,8 +731,12 @@ fn shared_experts_config(core: &DenseMLPCore, config: GatedMoEMetalConfig) -> de
             .intermediate_dim
             .try_into()
             .expect("shared expert intermediate_dim must fit u32"),
-        group_size: config.group_size,
-        bits: config.bits,
+        gate_up_group_size: config.group_size,
+        gate_up_bits: config.bits,
+        gate_up_scale_bias_dtype: config.io_dtype,
+        down_group_size: config.group_size,
+        down_bits: config.bits,
+        down_scale_bias_dtype: config.io_dtype,
         dtype: config.io_dtype,
     }
 }

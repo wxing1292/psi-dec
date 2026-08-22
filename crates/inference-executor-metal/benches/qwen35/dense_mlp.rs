@@ -18,6 +18,7 @@ use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 use inference_executor_metal::def::layer::ReplayLayer;
+use inference_executor_metal::def::quantized_affine::QuantizedAffineLayout;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::def::replay_op::ReplayOp;
 use inference_executor_metal::mlp::dense::backend::DenseMLP;
@@ -199,8 +200,16 @@ impl<'a> RealDenseMLPFixture<'a> {
                 intermediate_dim: INTERMEDIATE_DIM as usize,
             },
             DenseMLPMetalConfig {
-                group_size: GROUP_SIZE,
-                bits: BITS,
+                gate_up: QuantizedAffineLayout {
+                    group_size: GROUP_SIZE,
+                    bits: BITS,
+                    scale_bias_dtype: Dtype::Bfloat16,
+                },
+                down: QuantizedAffineLayout {
+                    group_size: GROUP_SIZE,
+                    bits: BITS,
+                    scale_bias_dtype: Dtype::Bfloat16,
+                },
                 io_dtype: Dtype::Bfloat16,
             },
         );
@@ -587,8 +596,12 @@ fn dense_config() -> dense_mlp::Config {
     dense_mlp::Config {
         hidden_dim: HIDDEN_DIM,
         intermediate_dim: INTERMEDIATE_DIM,
-        group_size: GROUP_SIZE,
-        bits: BITS,
+        gate_up_group_size: GROUP_SIZE,
+        gate_up_bits: BITS,
+        gate_up_scale_bias_dtype: Dtype::Bfloat16,
+        down_group_size: GROUP_SIZE,
+        down_bits: BITS,
+        down_scale_bias_dtype: Dtype::Bfloat16,
         dtype: Dtype::Bfloat16,
     }
 }

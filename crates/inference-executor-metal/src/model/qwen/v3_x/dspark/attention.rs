@@ -5,7 +5,7 @@ use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::DSparkGQACore;
+use inference_executor_core::attn::BlockSpecGQACore;
 use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
@@ -13,43 +13,43 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkRopeScaling;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
 
-use crate::attn::dspark::backend::DSparkGQA;
-use crate::attn::dspark::backend::DSparkGQAInput;
-use crate::attn::dspark::context::DSparkGQAContextAppender;
-use crate::attn::dspark::context::DSparkGQAContextInput;
-use crate::attn::dspark::context::DSparkGQAContextScratch;
-use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
-use crate::attn::dspark::scratch::DSparkBlockScratch;
-use crate::attn::dspark::state::DSparkGQAState;
+use crate::attn::block_spec::backend::BlockSpecGQA;
+use crate::attn::block_spec::backend::BlockSpecGQAInput;
+use crate::attn::block_spec::backend::BlockSpecGQAMetalConfig;
+use crate::attn::block_spec::context::BlockSpecGQAContextAppender;
+use crate::attn::block_spec::context::BlockSpecGQAContextInput;
+use crate::attn::block_spec::context::BlockSpecGQAContextScratch;
+use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
+use crate::attn::block_spec::scratch::BlockSpecScratch;
+use crate::attn::block_spec::state::BlockSpecGQAState;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
-use crate::attn::gqa::backend::GQAMetalConfig;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
+use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3_x::layer::Qwen3xUngatedGQAWeightBuffers;
-use crate::model::qwen::v3_x::weight::resolve_uniform_quantization;
+use crate::model::qwen::v3_x::layer::Qwen3xBlockSpecGQAWeightBuffers;
 use crate::model::qwen::v3_x::weight::to_u32;
 
 pub struct Qwen3xDSparkAttention {
     dspark_layer_index: u32,
-    core: DSparkGQACore,
-    metal: GQAMetalConfig,
-    weights: Option<Qwen3xUngatedGQAWeightBuffers>,
-    backend: DSparkGQA,
-    context_appender: DSparkGQAContextAppender,
-    block_scratch: Option<Rc<DSparkBlockScratch>>,
-    context_scratch: Option<Rc<DSparkGQAContextScratch>>,
+    core: BlockSpecGQACore,
+    metal: BlockSpecGQAMetalConfig,
+    weights: Option<Qwen3xBlockSpecGQAWeightBuffers>,
+    backend: BlockSpecGQA,
+    context_appender: BlockSpecGQAContextAppender,
+    block_scratch: Option<Rc<BlockSpecScratch>>,
+    context_scratch: Option<Rc<BlockSpecGQAContextScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
 }
 
 impl Qwen3xDSparkAttention {
     pub fn new(
         device: &Device,
-        core: DSparkGQACore,
-        metal: GQAMetalConfig,
+        core: BlockSpecGQACore,
+        metal: BlockSpecGQAMetalConfig,
         dspark_layer_index: usize,
-        state: &DSparkGQAState,
+        state: &BlockSpecGQAState,
     ) -> Self {
         Self {
             dspark_layer_index: dspark_layer_index
@@ -59,7 +59,7 @@ impl Qwen3xDSparkAttention {
             metal,
             weights: None,
             backend: state.new_gqa(device, core.clone(), metal),
-            context_appender: DSparkGQAContextAppender::new(device, core, metal),
+            context_appender: BlockSpecGQAContextAppender::new(device, core, metal),
             block_scratch: Some(state.block_scratch()),
             context_scratch: Some(state.context_scratch()),
             request_page_table: Some(state.request_page_table()),
@@ -76,7 +76,7 @@ impl Qwen3xDSparkAttention {
             self.weights.is_none(),
             "Qwen3.x DSpark attention weights are already loaded"
         );
-        self.weights = Some(Qwen3xUngatedGQAWeightBuffers::load(
+        self.weights = Some(Qwen3xBlockSpecGQAWeightBuffers::load(
             device,
             store,
             &bindings,
@@ -104,7 +104,7 @@ impl Qwen3xDSparkAttention {
         self.block_scratch.take();
     }
 
-    pub fn load_state(&mut self, state: &DSparkGQAState) {
+    pub fn load_state(&mut self, state: &BlockSpecGQAState) {
         assert!(
             self.block_scratch.is_none() && self.context_scratch.is_none() && self.request_page_table.is_none(),
             "Qwen3.x DSpark attention state is already loaded"
@@ -114,7 +114,7 @@ impl Qwen3xDSparkAttention {
         self.request_page_table = Some(state.request_page_table());
     }
 
-    fn weights(&self) -> &Qwen3xUngatedGQAWeightBuffers {
+    fn weights(&self) -> &Qwen3xBlockSpecGQAWeightBuffers {
         self.weights
             .as_ref()
             .expect("Qwen3.x DSpark attention weights must be loaded before execution")
@@ -133,7 +133,7 @@ impl Qwen3xDSparkAttention {
     {
         self.context_appender.record(
             recorder,
-            DSparkGQAContextInput {
+            BlockSpecGQAContextInput {
                 num_tokens,
                 page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dspark_layer_index,
@@ -153,17 +153,17 @@ impl Qwen3xDSparkAttention {
     pub fn record_block<'a, R>(
         &'a self,
         recorder: &mut R,
-        metadata: &'a DSparkGQAMetadataBuffers,
+        metadata: &'a BlockSpecGQAMetadataBuffers,
         hidden_input: &'a Buffer,
         hidden_output: &'a Buffer,
         pages: &'a Buffer,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let _ = <DSparkGQA as ReplayLayer>::record(
+        let _ = <BlockSpecGQA as ReplayLayer>::record(
             &self.backend,
             recorder,
-            DSparkGQAInput {
+            BlockSpecGQAInput {
                 page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dspark_layer_index,
                 metadata,
@@ -179,13 +179,13 @@ impl Qwen3xDSparkAttention {
         );
     }
 
-    fn block_scratch(&self) -> &DSparkBlockScratch {
+    fn block_scratch(&self) -> &BlockSpecScratch {
         self.block_scratch
             .as_deref()
             .expect("Qwen3.x DSpark block scratch must be loaded before execution")
     }
 
-    fn context_scratch(&self) -> &DSparkGQAContextScratch {
+    fn context_scratch(&self) -> &BlockSpecGQAContextScratch {
         self.context_scratch
             .as_deref()
             .expect("Qwen3.x DSpark context scratch must be loaded before execution")
@@ -204,13 +204,9 @@ pub fn derive_qwen3x_dspark_gqa_configs(
     dspark_layer_index: usize,
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
-) -> Result<(DSparkGQACore, GQAMetalConfig), ModelExecutorError> {
+) -> Result<(BlockSpecGQACore, BlockSpecGQAMetalConfig), ModelExecutorError> {
     let core = qwen3x_dspark_gqa_core(config, num_spec_tokens, dspark_layer_index);
     let metal = qwen3x_dspark_gqa_metal_config(config, bindings, page_bytes)?;
-    assert!(
-        metal.num_ungated_tokens_per_page(&core.attention) > 0,
-        "Qwen3x DSpark GQA geometry must fit one cache page"
-    );
     Ok((core, metal))
 }
 
@@ -218,7 +214,7 @@ pub fn qwen3x_dspark_gqa_core(
     config: &Qwen3xDSparkConfig,
     num_spec_tokens: usize,
     dspark_layer_index: usize,
-) -> DSparkGQACore {
+) -> BlockSpecGQACore {
     assert!(
         num_spec_tokens > 0,
         "Qwen3x DSpark attention requires speculative tokens"
@@ -240,7 +236,7 @@ pub fn qwen3x_dspark_gqa_core(
         (config.head_dim as f32).sqrt().recip(),
     );
     attention.validate();
-    DSparkGQACore::new(attention, num_spec_tokens)
+    BlockSpecGQACore::new(attention, num_spec_tokens)
 }
 
 pub fn qwen3x_dspark_gqa_sdpa_config(
@@ -275,21 +271,25 @@ fn qwen3x_dspark_gqa_metal_config(
     config: &Qwen3xDSparkConfig,
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
-) -> Result<GQAMetalConfig, ModelExecutorError> {
+) -> Result<BlockSpecGQAMetalConfig, ModelExecutorError> {
     let quantization = config
         .quantization
         .as_ref()
         .ok_or_else(|| ModelExecutorError::custom("Qwen3x DSpark Metal executor requires quantization config"))?;
-    let resolved = resolve_uniform_quantization(
-        quantization,
-        &[
-            bindings.q.weight.as_str(),
-            bindings.k.weight.as_str(),
-            bindings.v.weight.as_str(),
-            bindings.output.weight.as_str(),
-        ],
-        "Qwen3x DSpark GQA",
-    )?;
+    let affine_layout = |tensor_name: &str| -> Result<QuantizedAffineLayout, ModelExecutorError> {
+        let resolved = quantization.resolve_for_tensor(tensor_name);
+        if !matches!(resolved.mode.as_deref(), None | Some("affine")) {
+            return Err(ModelExecutorError::custom(format!(
+                "Qwen3x DSpark GQA tensor {tensor_name:?} requires affine quantization, got mode={:?}",
+                resolved.mode
+            )));
+        }
+        Ok(QuantizedAffineLayout {
+            group_size: to_u32("Qwen3x DSpark GQA group_size", resolved.group_size)?,
+            bits: to_u32("Qwen3x DSpark GQA bits", resolved.bits)?,
+            scale_bias_dtype: Dtype::Bfloat16,
+        })
+    };
     let rope_scaling = match config.rope_scaling {
         Qwen3xDSparkRopeScaling::Default => RopeScaling::Default,
         Qwen3xDSparkRopeScaling::Yarn {
@@ -313,15 +313,18 @@ fn qwen3x_dspark_gqa_metal_config(
             }
         },
     };
-    let metal = GQAMetalConfig {
-        group_size: to_u32("Qwen3x DSpark GQA group_size", resolved.group_size)?,
-        bits: to_u32("Qwen3x DSpark GQA bits", resolved.bits)?,
+    let metal = BlockSpecGQAMetalConfig {
+        q: affine_layout(&bindings.q.weight)?,
+        k: affine_layout(&bindings.k.weight)?,
+        v: affine_layout(&bindings.v.weight)?,
+        output: affine_layout(&bindings.output.weight)?,
         page_bytes: to_u32("Qwen3x DSpark GQA page_bytes", page_bytes)?,
         rope_dim: to_u32("Qwen3x DSpark GQA rope_dim", config.head_dim)?,
         norm_eps: config.rms_norm_eps,
         rope_theta: config.rope_theta,
         rope_scaling,
         io_dtype: Dtype::Bfloat16,
+        norm_weight_dtype: Dtype::Bfloat16,
     };
     metal.validate();
     Ok(metal)
@@ -348,8 +351,8 @@ mod tests {
         assert_eq!(core.attention.hidden_dim, 32);
         assert_eq!(core.attention.num_q_heads, 4);
         assert_eq!(core.attention.num_kv_heads, 1);
-        assert_eq!(metal.group_size, 32);
-        assert_eq!(metal.bits, 4);
+        assert_eq!(metal.q.group_size, 32);
+        assert_eq!(metal.q.bits, 4);
     }
 
     #[test]
@@ -388,8 +391,8 @@ mod tests {
         let (_, layer_1_metal) =
             derive_qwen3x_dspark_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
 
-        assert_eq!(layer_0_metal.bits, 4);
-        assert_eq!(layer_1_metal.bits, 8);
+        assert_eq!(layer_0_metal.q.bits, 4);
+        assert_eq!(layer_1_metal.q.bits, 8);
     }
 
     #[test]
@@ -414,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gqa_rejects_mixed_projection_layouts_within_one_layer() {
+    fn test_gqa_preserves_mixed_projection_layouts_within_one_layer() {
         let mut config = config();
         config.quantization.as_mut().unwrap().tensor_overrides.insert(
             "layers.1.self_attn.k_proj.weight".to_string(),
@@ -426,9 +429,12 @@ mod tests {
         );
         let bindings = Qwen3xDSparkWeightBindings::from_config(&config);
 
-        let error = derive_qwen3x_dspark_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap_err();
+        let (_, metal) = derive_qwen3x_dspark_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
 
-        assert!(error.to_string().contains("GQA requires one affine layout"));
+        assert_eq!(metal.q.bits, 4);
+        assert_eq!(metal.k.bits, 8);
+        assert_eq!(metal.v.bits, 4);
+        assert_eq!(metal.output.bits, 4);
     }
 
     fn config() -> Qwen3xDSparkConfig {

@@ -1,3 +1,5 @@
+//! Shared low-level execution for speculative query blocks.
+
 pub mod backend;
 pub mod capacity;
 pub mod context;

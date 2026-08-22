@@ -76,6 +76,7 @@ pub struct Config {
     pub rope_theta: f32,
     pub rope_scaling: RopeScaling,
     pub dtype: Dtype,
+    pub norm_weight_dtype: Dtype,
 }
 
 impl Config {
@@ -88,6 +89,7 @@ impl Config {
             rope_theta,
             rope_scaling: RopeScaling::Default,
             dtype: Dtype::Float32,
+            norm_weight_dtype: Dtype::Bfloat16,
         }
     }
 
@@ -100,11 +102,17 @@ impl Config {
             rope_theta,
             rope_scaling: RopeScaling::Default,
             dtype: Dtype::Bfloat16,
+            norm_weight_dtype: Dtype::Bfloat16,
         }
     }
 
     pub fn with_rope_scaling(mut self, rope_scaling: RopeScaling) -> Self {
         self.rope_scaling = rope_scaling;
+        self
+    }
+
+    pub fn with_norm_weight_dtype(mut self, norm_weight_dtype: Dtype) -> Self {
+        self.norm_weight_dtype = norm_weight_dtype;
         self
     }
 
@@ -122,6 +130,7 @@ impl Config {
             "Yarn rope_theta must be greater than 1"
         );
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(matches!(self.norm_weight_dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
     pub fn num_slots(self, shape: Shape) -> usize {
@@ -145,7 +154,7 @@ impl Config {
     pub fn norm_weight_bytes(self) -> usize {
         checked_product(
             "RMSNorm/RoPE weight byte length",
-            &[self.head_dim as usize, Dtype::Bfloat16.item_size()],
+            &[self.head_dim as usize, self.norm_weight_dtype.item_size()],
         )
     }
 
@@ -281,10 +290,12 @@ impl Compute {
     pub fn new(device: &Device, config: Config) -> Self {
         let constants = KernelConstants::new(config);
         let source = rms_norm_rope_source(constants);
-        let function_name = match constants.config.dtype {
-            Dtype::Float32 => "rms_norm_rope_f32",
-            Dtype::Bfloat16 => "rms_norm_rope_bf16",
-            dtype => panic!("unsupported RMSNorm/RoPE dtype {dtype:?}"),
+        let function_name = match (constants.config.dtype, constants.config.norm_weight_dtype) {
+            (Dtype::Float32, Dtype::Bfloat16) => "rms_norm_rope_f32",
+            (Dtype::Float32, Dtype::Float32) => "rms_norm_rope_f32_weight_f32",
+            (Dtype::Bfloat16, Dtype::Bfloat16) => "rms_norm_rope_bf16",
+            (Dtype::Bfloat16, Dtype::Float32) => "rms_norm_rope_bf16_weight_f32",
+            dtypes => panic!("unsupported RMSNorm/RoPE IO/weight dtypes {dtypes:?}"),
         };
         Self {
             constants,
@@ -414,6 +425,13 @@ mod tests {
     }
 
     #[test]
+    fn test_norm_weight_can_use_f32_storage() {
+        let config = Config::bf16(2, 128, 128, 1e-6, 1_000_000.0).with_norm_weight_dtype(Dtype::Float32);
+
+        assert_eq!(config.norm_weight_bytes(), 128 * Dtype::Float32.item_size());
+    }
+
+    #[test]
     fn test_yarn_correction_range() {
         let scaling = RopeScaling::Yarn {
             factor: 32.0,
@@ -536,6 +554,45 @@ mod tests {
                 let normalized = bf16::from_f32(bf16::from_bits(*input_bits).to_f32() * inv_rms);
                 bf16::from_f32(bf16::from_bits(weight_bits).to_f32() * normalized.to_f32()).to_bits()
             })
+            .collect::<Vec<_>>();
+
+        assert_eq!(output.read_typed::<u16>(0, input.len()), expected);
+    }
+
+    #[test]
+    fn test_bf16_io_with_f32_norm_weight_matches_cpu_reference() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = Config::bf16(1, 4, 2, 1e-6, 1_000_000.0).with_norm_weight_dtype(Dtype::Float32);
+        let shape = Shape { num_total_tokens: 1 };
+        let input = [0.75, -1.25, 0.5, 2.0].map(|value| bf16::from_f32(value).to_bits());
+        let norm_weight = [1.3_f32, 0.9, 1.1, 0.7];
+        let input_buffer = Buffer::from_slice(&device, &input);
+        let norm_weight_buffer = Buffer::from_slice(&device, &norm_weight);
+        let flat_token_indices = Buffer::from_slice(&device, &[0_u32]);
+        let output = Buffer::new_zeroed_elements(&device, input.len(), Dtype::Bfloat16);
+        let kernel = Compute::new(&device, config);
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke(
+            shape,
+            Buffers {
+                input: &input_buffer,
+                norm_weight: &norm_weight_buffer,
+                flat_token_indices: &flat_token_indices,
+                output: &output,
+            },
+            ReplayU32::Fixed(shape.num_total_tokens),
+        ));
+        stream.submit_replay(&builder.build()).wait();
+
+        let input_f32 = input.map(|bits| bf16::from_bits(bits).to_f32());
+        let inv_rms = (input_f32.iter().map(|value| value * value).sum::<f32>() / input.len() as f32 + 1e-6)
+            .sqrt()
+            .recip();
+        let expected = input_f32
+            .iter()
+            .zip(norm_weight)
+            .map(|(input, weight)| bf16::from_f32(input * inv_rms * weight).to_bits())
             .collect::<Vec<_>>();
 
         assert_eq!(output.read_typed::<u16>(0, input.len()), expected);

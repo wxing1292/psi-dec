@@ -7,20 +7,21 @@ use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::mlp::dense::DenseMLPCore;
 
 use crate::def::layer::ReplayLayer;
+use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::scratch::DenseMLPScratchBindings;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DenseMLPMetalConfig {
-    pub group_size: u32,
-    pub bits: u32,
+    pub gate_up: QuantizedAffineLayout,
+    pub down: QuantizedAffineLayout,
     pub io_dtype: Dtype,
 }
 
 impl DenseMLPMetalConfig {
     pub fn validate(self) {
-        assert!(matches!(self.group_size, 32 | 64 | 128));
-        assert!(matches!(self.bits, 2 | 3 | 4 | 6 | 8));
+        self.gate_up.validate();
+        self.down.validate();
         match self.io_dtype {
             Dtype::Bfloat16 => {},
             Dtype::Float32 => todo!("F32 dense MLP model boundary is not supported"),
@@ -99,8 +100,12 @@ fn compute_config(core: &DenseMLPCore, config: DenseMLPMetalConfig) -> dense_mlp
             .intermediate_dim
             .try_into()
             .expect("dense MLP intermediate_dim must fit u32"),
-        group_size: config.group_size,
-        bits: config.bits,
+        gate_up_group_size: config.gate_up.group_size,
+        gate_up_bits: config.gate_up.bits,
+        gate_up_scale_bias_dtype: config.gate_up.scale_bias_dtype,
+        down_group_size: config.down.group_size,
+        down_bits: config.down.bits,
+        down_scale_bias_dtype: config.down.scale_bias_dtype,
         dtype: config.io_dtype,
     }
 }

@@ -1,63 +1,65 @@
+//! Persistent and replay state for block-spec GQA.
+
 use std::rc::Rc;
 
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Device;
-use inference_executor_core::attn::DSparkBlockCapacity;
-use inference_executor_core::attn::DSparkBlockMetadata;
-use inference_executor_core::attn::DSparkGQACore;
+use inference_executor_core::attn::BlockSpecCapacity;
+use inference_executor_core::attn::BlockSpecGQACore;
+use inference_executor_core::attn::BlockSpecMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::dspark::backend::DSparkGQA;
-use crate::attn::dspark::capacity::DSparkGQACapacity;
-use crate::attn::dspark::context::DSparkGQAContextScratch;
-use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
-use crate::attn::dspark::scratch::DSparkBlockScratch;
-use crate::attn::dspark::sdpa::Selection as SDPASelection;
-use crate::attn::dspark::sdpa::Selector as SDPASelector;
-use crate::attn::gqa::backend::GQAMetalConfig;
+use crate::attn::block_spec::backend::BlockSpecGQA;
+use crate::attn::block_spec::backend::BlockSpecGQAMetalConfig;
+use crate::attn::block_spec::capacity::BlockSpecGQACapacity;
+use crate::attn::block_spec::context::BlockSpecGQAContextScratch;
+use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
+use crate::attn::block_spec::scratch::BlockSpecScratch;
+use crate::attn::block_spec::sdpa::Selection as SDPASelection;
+use crate::attn::block_spec::sdpa::Selector as SDPASelector;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 
 mod file_io;
 
-pub struct DSparkGQAState {
+pub struct BlockSpecGQAState {
     sdpa_selection: SDPASelection,
-    block_scratch: Option<Rc<DSparkBlockScratch>>,
-    context_scratch: Option<Rc<DSparkGQAContextScratch>>,
+    block_scratch: Option<Rc<BlockSpecScratch>>,
+    context_scratch: Option<Rc<BlockSpecGQAContextScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
-    metadata: Option<DSparkGQAMetadataBuffers>,
-    core: DSparkGQACore,
+    metadata: Option<BlockSpecGQAMetadataBuffers>,
+    core: BlockSpecGQACore,
     sdpa_config: backend_sdpa::Config,
-    capacity: DSparkGQACapacity,
+    capacity: BlockSpecGQACapacity,
     max_context_tokens: usize,
     page_table_layout: GQAPageTableLayout,
     num_tokens_per_page: usize,
     num_cache_pages: usize,
 }
 
-impl DSparkGQAState {
+impl BlockSpecGQAState {
     pub fn new(
         device: &Device,
-        core: DSparkGQACore,
+        core: BlockSpecGQACore,
         sdpa_config: backend_sdpa::Config,
         page_table_layout: GQAPageTableLayout,
-        capacity: DSparkBlockCapacity,
+        capacity: BlockSpecCapacity,
         max_context_tokens: usize,
         num_cache_pages: usize,
     ) -> Self {
-        assert!(max_context_tokens > 0, "DSpark context scratch requires tokens");
-        assert!(num_cache_pages > 0, "DSpark GQA state requires cache pages");
+        assert!(max_context_tokens > 0, "block-spec context scratch requires tokens");
+        assert!(num_cache_pages > 0, "block-spec GQA state requires cache pages");
         assert!(
             u32::try_from(num_cache_pages - 1).is_ok(),
-            "DSpark cache page IDs must fit u32"
+            "block-spec cache page IDs must fit u32"
         );
         core.validate();
         sdpa_config.validate();
         page_table_layout.validate();
         assert_eq!(
             core.block_size, capacity.block_size,
-            "DSpark GQA state core and capacity block sizes must match"
+            "block-spec GQA state core and capacity block sizes must match"
         );
         let attention = &core.attention;
         assert_eq!(sdpa_config.num_q_heads as usize, attention.num_q_heads);
@@ -69,20 +71,20 @@ impl DSparkGQAState {
         let num_tokens_per_page = sdpa_config.tokens_per_page as usize;
         Self {
             sdpa_selection,
-            block_scratch: Some(Rc::new(DSparkBlockScratch::new(
+            block_scratch: Some(Rc::new(BlockSpecScratch::new(
                 device,
                 &core,
                 sdpa_config.io_dtype,
                 gqa_capacity,
             ))),
-            context_scratch: Some(Rc::new(DSparkGQAContextScratch::new(
+            context_scratch: Some(Rc::new(BlockSpecGQAContextScratch::new(
                 device,
                 &core,
                 sdpa_config.io_dtype,
                 max_context_tokens,
             ))),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
-            metadata: Some(DSparkGQAMetadataBuffers::new(device, gqa_capacity, sdpa_execution)),
+            metadata: Some(BlockSpecGQAMetadataBuffers::new(device, gqa_capacity, sdpa_execution)),
             core,
             sdpa_config,
             capacity: gqa_capacity,
@@ -97,11 +99,11 @@ impl DSparkGQAState {
         self.num_tokens_per_page
     }
 
-    pub fn prepare_block(&self, block: &DSparkBlockMetadata) -> GQAReplayShape {
+    pub fn prepare_block(&self, block: &BlockSpecMetadata) -> GQAReplayShape {
         self.metadata().update(block)
     }
 
-    pub fn new_gqa(&self, device: &Device, core: DSparkGQACore, metal: GQAMetalConfig) -> DSparkGQA {
+    pub fn new_gqa(&self, device: &Device, core: BlockSpecGQACore, metal: BlockSpecGQAMetalConfig) -> BlockSpecGQA {
         let shared = &self.core.attention;
         let attention = &core.attention;
         assert_eq!(core.block_size, self.core.block_size);
@@ -111,7 +113,7 @@ impl DSparkGQAState {
         assert_eq!(attention.num_kv_heads, shared.num_kv_heads);
         assert_eq!(attention.scale, shared.scale);
         assert_eq!(metal.io_dtype, self.sdpa_config.io_dtype);
-        DSparkGQA::new(device, core, metal, self.sdpa_selection.execution())
+        BlockSpecGQA::new(device, core, metal, self.sdpa_selection.execution())
     }
 
     pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
@@ -120,17 +122,17 @@ impl DSparkGQAState {
         let expected_page_ids = request_page_table
             .num_layers()
             .checked_mul(num_page_ids_per_layer)
-            .expect("DSpark GQA page-ID count must fit usize");
+            .expect("block-spec GQA page-ID count must fit usize");
         assert_eq!(
             page_ids.len(),
             expected_page_ids,
-            "DSpark GQA cache block must contain all layer page IDs"
+            "block-spec GQA cache block must contain all layer page IDs"
         );
         assert!(
             page_ids
                 .iter()
                 .all(|&page_id| (page_id as usize) < self.num_cache_pages),
-            "runtime supplied a DSpark GQA page ID outside the cache-page buffer"
+            "runtime supplied a block-spec GQA page ID outside the cache-page buffer"
         );
         for (layer_index, layer_page_ids) in page_ids.chunks_exact(num_page_ids_per_layer).enumerate() {
             request_page_table.write_page_ids(req_slot, layer_index, block_index, layer_page_ids);
@@ -143,7 +145,7 @@ impl DSparkGQAState {
             request_page_table
                 .num_layers()
                 .checked_mul(request_page_table.num_page_ids_per_block())
-                .expect("DSpark GQA page-ID count must fit usize"),
+                .expect("block-spec GQA page-ID count must fit usize"),
         );
         for layer_index in 0..request_page_table.num_layers() {
             page_ids.extend(request_page_table.read_page_ids(req_slot, layer_index, block_index));
@@ -155,19 +157,19 @@ impl DSparkGQAState {
         self.request_page_table_ref().reset_req_slots(req_slots);
     }
 
-    pub fn block_scratch(&self) -> Rc<DSparkBlockScratch> {
+    pub fn block_scratch(&self) -> Rc<BlockSpecScratch> {
         Rc::clone(
             self.block_scratch
                 .as_ref()
-                .expect("DSpark GQA block scratch state must be loaded"),
+                .expect("block-spec GQA block scratch state must be loaded"),
         )
     }
 
-    pub fn context_scratch(&self) -> Rc<DSparkGQAContextScratch> {
+    pub fn context_scratch(&self) -> Rc<BlockSpecGQAContextScratch> {
         Rc::clone(
             self.context_scratch
                 .as_ref()
-                .expect("DSpark GQA context scratch state must be loaded"),
+                .expect("block-spec GQA context scratch state must be loaded"),
         )
     }
 
@@ -175,10 +177,10 @@ impl DSparkGQAState {
         Rc::clone(self.request_page_table_ref())
     }
 
-    pub fn metadata(&self) -> &DSparkGQAMetadataBuffers {
+    pub fn metadata(&self) -> &BlockSpecGQAMetadataBuffers {
         self.metadata
             .as_ref()
-            .expect("DSpark GQA metadata state must be loaded")
+            .expect("block-spec GQA metadata state must be loaded")
     }
 
     pub fn release_resources(&mut self) {
@@ -187,11 +189,11 @@ impl DSparkGQAState {
                 && self.context_scratch.is_some()
                 && self.request_page_table.is_some()
                 && self.metadata.is_some(),
-            "DSpark GQA state resources are not loaded"
+            "block-spec GQA state resources are not loaded"
         );
         self.request_page_table
             .take()
-            .expect("DSpark GQA request page-table state must be loaded");
+            .expect("block-spec GQA request page-table state must be loaded");
         self.metadata.take();
         self.context_scratch.take();
         self.block_scratch.take();
@@ -203,22 +205,22 @@ impl DSparkGQAState {
                 && self.context_scratch.is_none()
                 && self.request_page_table.is_none()
                 && self.metadata.is_none(),
-            "DSpark GQA state resources are already loaded"
+            "block-spec GQA state resources are already loaded"
         );
-        self.block_scratch = Some(Rc::new(DSparkBlockScratch::new(
+        self.block_scratch = Some(Rc::new(BlockSpecScratch::new(
             device,
             &self.core,
             self.sdpa_config.io_dtype,
             self.capacity,
         )));
-        self.context_scratch = Some(Rc::new(DSparkGQAContextScratch::new(
+        self.context_scratch = Some(Rc::new(BlockSpecGQAContextScratch::new(
             device,
             &self.core,
             self.sdpa_config.io_dtype,
             self.max_context_tokens,
         )));
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
-        self.metadata = Some(DSparkGQAMetadataBuffers::new(
+        self.metadata = Some(BlockSpecGQAMetadataBuffers::new(
             device,
             self.capacity,
             self.sdpa_selection.execution(),
@@ -228,7 +230,7 @@ impl DSparkGQAState {
     fn request_page_table_ref(&self) -> &Rc<GQARequestPageTable> {
         self.request_page_table
             .as_ref()
-            .expect("DSpark GQA request page-table state must be loaded")
+            .expect("block-spec GQA request page-table state must be loaded")
     }
 }
 
@@ -237,15 +239,15 @@ mod tests {
     use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
-    use inference_executor_core::attn::DSparkBlockCapacity;
-    use inference_executor_core::attn::DSparkGQACore;
+    use inference_executor_core::attn::BlockSpecCapacity;
+    use inference_executor_core::attn::BlockSpecGQACore;
     use inference_executor_core::attn::GQAPageTableLayout;
     use inference_executor_core::attn::UngatedGQACore;
 
-    use super::DSparkGQAState;
+    use super::BlockSpecGQAState;
 
     #[test]
-    fn test_write_read_page_ids_uses_complete_dspark_block() {
+    fn test_write_read_page_ids_uses_complete_block_spec_block() {
         let device = Device::system_default();
         let state = new_state(&device);
 
@@ -255,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "runtime supplied a DSpark GQA page ID outside the cache-page buffer")]
+    #[should_panic(expected = "runtime supplied a block-spec GQA page ID outside the cache-page buffer")]
     fn test_write_page_ids_rejects_page_id_outside_cache() {
         let device = Device::system_default();
         let state = new_state(&device);
@@ -263,10 +265,10 @@ mod tests {
         state.write_page_ids(1, 1, &[30, 31, 40, 64]);
     }
 
-    fn new_state(device: &Device) -> DSparkGQAState {
-        DSparkGQAState::new(
+    fn new_state(device: &Device) -> BlockSpecGQAState {
+        BlockSpecGQAState::new(
             device,
-            DSparkGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
+            BlockSpecGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
             backend_sdpa::Config {
                 io_dtype: Dtype::Bfloat16,
                 num_q_heads: 1,
@@ -280,7 +282,7 @@ mod tests {
                 num_blocks: 2,
                 num_page_ids_per_block: 2,
             },
-            DSparkBlockCapacity::new(2, 1),
+            BlockSpecCapacity::new(2, 1),
             2,
             64,
         )

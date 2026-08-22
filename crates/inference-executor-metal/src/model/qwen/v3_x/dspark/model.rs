@@ -11,8 +11,8 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkLayerWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainFeatureWeightBindings;
 
-use crate::attn::dspark::metadata::DSparkGQAMetadataBuffers;
-use crate::attn::dspark::state::DSparkGQAState;
+use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
+use crate::attn::block_spec::state::BlockSpecGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
@@ -50,7 +50,7 @@ pub struct Qwen3xDSparkPrefillArgs<'a> {
 #[derive(Clone, Copy)]
 pub struct Qwen3xDSparkBodyArgs<'a> {
     pub num_tokens: u32,
-    pub metadata: &'a DSparkGQAMetadataBuffers,
+    pub metadata: &'a BlockSpecGQAMetadataBuffers,
     pub hidden_input: &'a Buffer,
     pub hidden_output: &'a Buffer,
     pub pages: &'a Buffer,
@@ -76,7 +76,7 @@ impl Qwen3xDSparkModel {
         page_bytes: usize,
         main_feature_bindings: &Qwen3xDSparkMainFeatureWeightBindings,
         layer_bindings: &[Qwen3xDSparkLayerWeightBindings],
-        gqa_state: &DSparkGQAState,
+        gqa_state: &BlockSpecGQAState,
         max_main_tokens: usize,
         max_block_tokens: usize,
     ) -> Result<Self, ModelExecutorError> {
@@ -187,7 +187,7 @@ impl Qwen3xDSparkModel {
         }
     }
 
-    pub fn load_state(&mut self, state: &DSparkGQAState) {
+    pub fn load_state(&mut self, state: &BlockSpecGQAState) {
         for layer in &mut self.layers {
             layer.load_state(state);
         }

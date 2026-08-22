@@ -3,12 +3,12 @@ use std::ops::Range;
 use crate::attn::UngatedGQACore;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DSparkGQACore {
+pub struct BlockSpecGQACore {
     pub attention: UngatedGQACore,
     pub block_size: usize,
 }
 
-impl DSparkGQACore {
+impl BlockSpecGQACore {
     pub fn new(attention: UngatedGQACore, block_size: usize) -> Self {
         let core = Self { attention, block_size };
         core.validate();
@@ -17,26 +17,26 @@ impl DSparkGQACore {
 
     pub fn validate(&self) {
         self.attention.validate();
-        assert!(self.block_size > 0, "DSpark GQA block_size must be positive");
+        assert!(self.block_size > 0, "block-spec GQA block_size must be positive");
         assert!(
             u32::try_from(self.block_size).is_ok(),
-            "DSpark GQA block_size must fit u32"
+            "block-spec GQA block_size must fit u32"
         );
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DSparkBlockCapacity {
+pub struct BlockSpecCapacity {
     pub max_requests: usize,
     pub block_size: usize,
     pub max_tokens: usize,
 }
 
-impl DSparkBlockCapacity {
+impl BlockSpecCapacity {
     pub fn new(max_requests: usize, block_size: usize) -> Self {
         let max_tokens = max_requests
             .checked_mul(block_size)
-            .expect("DSpark block token capacity must fit usize");
+            .expect("block-spec token capacity must fit usize");
         let capacity = Self {
             max_requests,
             block_size,
@@ -47,24 +47,24 @@ impl DSparkBlockCapacity {
     }
 
     pub fn validate(self) {
-        assert!(self.max_requests > 0, "DSpark block capacity requires requests");
-        assert!(self.block_size > 0, "DSpark block capacity requires block tokens");
+        assert!(self.max_requests > 0, "block-spec capacity requires requests");
+        assert!(self.block_size > 0, "block-spec capacity requires block tokens");
         assert_eq!(
             self.max_tokens,
             self.max_requests
                 .checked_mul(self.block_size)
-                .expect("DSpark block token capacity must fit usize"),
-            "DSpark block token capacity must match requests times block size"
+                .expect("block-spec token capacity must fit usize"),
+            "block-spec token capacity must match requests times block size"
         );
         assert!(
             u32::try_from(self.max_tokens).is_ok(),
-            "DSpark block token capacity must fit u32"
+            "block-spec token capacity must fit u32"
         );
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DSparkBlockMetadata {
+pub struct BlockSpecMetadata {
     req_slots: Vec<u32>,
     flat_token_indices: Vec<u32>,
     history_token_begins: Vec<u32>,
@@ -73,48 +73,52 @@ pub struct DSparkBlockMetadata {
     block_size: usize,
 }
 
-impl DSparkBlockMetadata {
-    pub fn new(req_slots: &[u32], visible_history_token_ranges: &[Range<u32>], block_size: usize) -> Self {
-        assert!(!req_slots.is_empty(), "DSpark block metadata requires requests");
+impl BlockSpecMetadata {
+    pub fn new(
+        req_slots: &[u32],
+        flat_query_token_indices: &[u32],
+        visible_history_token_ranges: &[Range<u32>],
+        block_size: usize,
+    ) -> Self {
+        assert!(!req_slots.is_empty(), "block-spec metadata requires requests");
+        assert!(block_size > 0, "block-spec metadata requires block tokens");
+        let num_tokens = req_slots
+            .len()
+            .checked_mul(block_size)
+            .expect("block-spec token count must fit usize");
         assert_eq!(
-            req_slots.len(),
-            visible_history_token_ranges.len(),
-            "DSpark block metadata requires one visible history token range per request"
+            flat_query_token_indices.len(),
+            num_tokens,
+            "block-spec metadata requires one query-token index per block row"
         );
-        assert!(block_size > 0, "DSpark block metadata requires block tokens");
+        assert_eq!(
+            visible_history_token_ranges.len(),
+            num_tokens,
+            "block-spec metadata requires one visible history token range per block row"
+        );
         assert!(
             u32::try_from(block_size).is_ok(),
-            "DSpark block metadata block_size must fit u32"
+            "block-spec metadata block_size must fit u32"
         );
         assert!(
             req_slots
                 .iter()
                 .enumerate()
                 .all(|(index, req_slot)| !req_slots[..index].contains(req_slot)),
-            "DSpark block metadata requires unique request slots"
+            "block-spec metadata requires unique request slots"
         );
         assert!(
             visible_history_token_ranges.iter().all(|range| range.start < range.end),
-            "DSpark visible history token ranges must be nonempty half-open ranges"
+            "block-spec visible history token ranges must be nonempty half-open ranges"
         );
-
-        let num_tokens = req_slots
-            .len()
-            .checked_mul(block_size)
-            .expect("DSpark block token count must fit usize");
         let mut req_slots_by_token = Vec::with_capacity(num_tokens);
-        let mut flat_token_indices = Vec::with_capacity(num_tokens);
         let mut history_token_begins = Vec::with_capacity(num_tokens);
         let mut history_token_ends = Vec::with_capacity(num_tokens);
-        for (&req_slot, visible_history_token_range) in req_slots.iter().zip(visible_history_token_ranges) {
-            let anchor_position = visible_history_token_range.end;
-            for block_offset in 0..block_size {
+        for (request_index, &req_slot) in req_slots.iter().enumerate() {
+            let request_begin = request_index * block_size;
+            let request_end = request_begin + block_size;
+            for visible_history_token_range in &visible_history_token_ranges[request_begin..request_end] {
                 req_slots_by_token.push(req_slot);
-                flat_token_indices.push(
-                    anchor_position
-                        .checked_add(block_offset as u32)
-                        .expect("DSpark block token position must fit u32"),
-                );
                 history_token_begins.push(visible_history_token_range.start);
                 history_token_ends.push(visible_history_token_range.end);
             }
@@ -122,7 +126,7 @@ impl DSparkBlockMetadata {
 
         Self {
             req_slots: req_slots_by_token,
-            flat_token_indices,
+            flat_token_indices: flat_query_token_indices.to_vec(),
             history_token_begins,
             history_token_ends,
             num_requests: req_slots.len(),
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_block_capacity_contains_only_batch_geometry() {
-        let capacity = DSparkBlockCapacity::new(3, 7);
+        let capacity = BlockSpecCapacity::new(3, 7);
 
         assert_eq!(capacity.max_requests, 3);
         assert_eq!(capacity.block_size, 7);
@@ -174,7 +178,12 @@ mod tests {
 
     #[test]
     fn test_block_metadata_uses_history_end_as_first_query_row() {
-        let metadata = DSparkBlockMetadata::new(&[2, 9], &[0..11, 4..20], 3);
+        let metadata = BlockSpecMetadata::new(
+            &[2, 9],
+            &[11, 12, 13, 20, 21, 22],
+            &[0..11, 0..11, 0..11, 4..20, 4..20, 4..20],
+            3,
+        );
 
         assert_eq!(metadata.req_slots(), [2, 2, 2, 9, 9, 9]);
         assert_eq!(metadata.flat_token_indices(), [11, 12, 13, 20, 21, 22]);
@@ -188,13 +197,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "unique request slots")]
     fn test_block_metadata_rejects_duplicate_request_slots() {
-        let _ = DSparkBlockMetadata::new(&[2, 2], &[0..11, 0..20], 3);
+        let _ = BlockSpecMetadata::new(&[2, 2], &[11, 12, 13, 20, 21, 22], &vec![0..11; 6], 3);
     }
 
     #[test]
     #[should_panic(expected = "nonempty half-open ranges")]
     fn test_block_metadata_rejects_empty_history_range() {
-        let empty_history = 11..11;
-        let _ = DSparkBlockMetadata::new(&[2], std::slice::from_ref(&empty_history), 3);
+        let _ = BlockSpecMetadata::new(&[2], &[11, 12, 13], &[11..11, 0..11, 0..11], 3);
+    }
+
+    #[test]
+    fn test_block_metadata_preserves_per_query_history_ranges() {
+        let metadata = BlockSpecMetadata::new(&[2], &[11, 12, 13], &[0..11, 1..11, 2..11], 3);
+
+        assert_eq!(metadata.history_token_begins(), [0, 1, 2]);
+        assert_eq!(metadata.history_token_ends(), [11, 11, 11]);
     }
 }

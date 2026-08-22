@@ -1,17 +1,19 @@
+//! Snapshot I/O for block-spec GQA state.
+
 use std::ops::Range;
 use std::rc::Rc;
 
 use inference_executor_core::def::ModelExecutorError;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::dspark::state::DSparkGQAState;
+use crate::attn::block_spec::state::BlockSpecGQAState;
 use crate::model::state_snapshot::FullStateIO;
 use crate::model::state_snapshot::GQAStateSnapshotFiles;
 use crate::model::state_snapshot::SelectedStateIO;
 use crate::model::state_snapshot::StateSnapshotReader;
 use crate::model::state_snapshot::StateSnapshotWriter;
 
-impl FullStateIO for DSparkGQAState {
+impl FullStateIO for BlockSpecGQAState {
     type Files = GQAStateSnapshotFiles;
 
     fn write_full_state(&self, writer: &mut StateSnapshotWriter, files: Self::Files) -> Result<(), ModelExecutorError> {
@@ -26,14 +28,14 @@ impl FullStateIO for DSparkGQAState {
         let request_page_table = Rc::get_mut(
             self.request_page_table
                 .as_mut()
-                .expect("DSpark GQA request page-table state must be loaded"),
+                .expect("block-spec GQA request page-table state must be loaded"),
         )
-        .expect("DSpark GQA request page table must be unattached during state loading");
+        .expect("block-spec GQA request page table must be unattached during state loading");
         request_page_table.read_full_state(reader, files)
     }
 }
 
-impl SelectedStateIO for DSparkGQAState {
+impl SelectedStateIO for BlockSpecGQAState {
     type ID = RawRequestSlot;
 
     fn write_selected_state(
@@ -55,9 +57,9 @@ impl SelectedStateIO for DSparkGQAState {
         let request_page_table = Rc::get_mut(
             self.request_page_table
                 .as_mut()
-                .expect("DSpark GQA request page-table state must be loaded"),
+                .expect("block-spec GQA request page-table state must be loaded"),
         )
-        .expect("DSpark GQA request page table must be unattached during state loading");
+        .expect("block-spec GQA request page table must be unattached during state loading");
         request_page_table.read_selected_state(reader, files, request_slot_ranges)
     }
 }

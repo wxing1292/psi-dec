@@ -48,7 +48,7 @@ The current implementation has these limits:
 ```text
 crates/inference-executor-core/src/
   attn/gqa/
-    dspark_core.rs               block geometry and metadata
+    block_spec_core.rs           block geometry and per-query history ranges
   sampling/
     dspark.rs                    CPU Markov, sampling, and confidence reference
   model/qwen/v3_x/dspark/
@@ -64,8 +64,8 @@ crates/inference-backend-metal/src/components/
   metal/gqa_block_sdpa.metal     dense bidirectional block kernel
 
 crates/inference-executor-metal/src/
-  attn/dspark/
-    backend.rs                   ungated DSpark GQA replay graph
+  attn/block_spec/
+    backend.rs                   shared ungated history-plus-block GQA replay graph
     capacity.rs                  Metal partial-output resource capacity
     context.rs                   persistent Main-context append
     metadata.rs                  history and block attention metadata
@@ -270,16 +270,17 @@ Both executors compose these owners with their model-specific lifecycle.
 ## Attention composition
 
 The supported official Qwen3x DSpark checkpoints use ungated GQA.
-`DSparkGQA` owns the DSpark QKV attention graph.
+`BlockSpecGQA` owns the shared history-plus-block attention graph.
 It does not add a mode to `UngatedGQA`.
 
 Each `Qwen3xDSparkLayer` resolves its exact Q/K/V/output affine layout from its weight bindings.
-It owns one `DSparkGQA` and one `DSparkGQAContextAppender`.
+The loader can retain one physical Q/K/V buffer and supply explicit offsets.
+It owns one `BlockSpecGQA` and one `BlockSpecGQAContextAppender`.
 Different layers can use different affine layouts.
 The Q/K/V/output tensors within one layer must use one layout because the current fused QKV ABI uses one
 `GQAMetalConfig`.
 
-`DSparkGQAState` owns only shared execution state.
+`BlockSpecGQAState` owns only shared execution state.
 It owns the page table, metadata, shared block/context scratch, and backend-selected SplitKV history contract.
 The shared scratch contract requires equal attention geometry and I/O dtype across layers.
 It does not require equal quantization layout across layers.
@@ -296,7 +297,7 @@ QKV projection
 ```
 
 The history path reads persistent paged K/V.
-The block path reads dense local K/V from `DSparkBlockScratch`.
+The block path reads dense local K/V from `BlockSpecScratch`.
 Both map paths write `SDPAPartialOutput` records with the selected physical layout.
 The selected SplitKV Reduce launch combines both sets.
 
@@ -305,10 +306,10 @@ For an anchor at position `p`, DSpark supplies `[0, p)`.
 The metadata does not infer the lower bound from the upper bound.
 The block kernel supplies the complete local block.
 
-`DSparkGQAState` gives its static attention and KV-cache facts to `backend_sdpa::Registry::new(...)`.
-`dspark::sdpa::Selector` derives each legal candidate's maximum Q-token-range extent, scratch extent, replay extent,
+`BlockSpecGQAState` gives its static attention and KV-cache facts to `backend_sdpa::Registry::new(...)`.
+`block_spec::sdpa::Selector` derives each legal candidate's maximum Q-token-range extent, scratch extent, replay extent,
 and launch-cost metrics. Its `Selection` contains the exact `backend_sdpa::ExecutionVariant` and
-`DSparkGQACapacity`. The state freezes this selection at initialization. `DSparkGQAMetadataBuffers` retains the exact
+`BlockSpecGQACapacity`. The state freezes this selection at initialization. `BlockSpecGQAMetadataBuffers` retains the exact
 execution variant. Recording does not run a second selector.
 
 The selector first minimizes how many times one history K/V token must be loaded for the fixed proposal. It then
@@ -316,7 +317,7 @@ compares the kernel KV-iteration width, padded Q rows, scratch extent, and Q-hea
 the Q-tile reuse directly. It does not assume that different layers or KV heads contain equal K/V data.
 
 For TiledQ, one request-local Q-token range contains at most `map.thread_block.max_q_tokens` queries. One history Map
-task reads a KV tile once for that Q-token range. `DSparkBlockMetadata` expands the request range across every Q row.
+task reads a KV tile once for that Q-token range. `BlockSpecMetadata` expands the request range across every Q row.
 The Map kernel intersects each row range with its Map TaskTemplate range.
 The block map writes one partial slot per Q-token range. Its grid supplies the Q-head index, Q-token-range index, and
 range-local Q-token offset. `q_token_ranges` derives the flat Q-token index. The end of the matching
@@ -372,7 +373,7 @@ A DSpark-disabled Qwen3 or Qwen3.5 executor uses only the Main span.
 
 ## Scratch capacity
 
-`DSparkBlockScratch` is an executor-owned resource.
+`BlockSpecScratch` is an executor-owned resource.
 It contains local Q/K/V, normalized Q/K, attention partials, and reduced output.
 
 Define:
@@ -384,9 +385,9 @@ P_capacity = next_power_of_two(max(T_capacity, 2 * Q_capacity))
 G_capacity = P_capacity * selected_max_q_tokens
 ```
 
-`DSparkBlockCapacity` is backend-neutral.
+`BlockSpecCapacity` is backend-neutral.
 It contains `max_requests`, the selected proposal length as `block_size`, and `max_tokens`.
-`DSparkGQACapacity` is Metal-specific.
+`BlockSpecGQACapacity` is Metal-specific.
 It derives `Q_capacity`, `P_capacity`, and `G_capacity` for metadata and partial scratch.
 The runtime core and executor core do not contain Metal `TaskTemplate` capacity.
 

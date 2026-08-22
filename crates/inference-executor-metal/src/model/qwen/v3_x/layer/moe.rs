@@ -14,6 +14,7 @@ use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xSparseExper
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
+use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::moe::backend::GatedMoE;
@@ -255,8 +256,16 @@ impl Qwen3xMoEWeights {
                 intermediate_dim: shared_experts_intermediate_dim,
             };
             let shared_experts_metal = DenseMLPMetalConfig {
-                group_size: metal.group_size,
-                bits: metal.bits,
+                gate_up: QuantizedAffineLayout {
+                    group_size: metal.group_size,
+                    bits: metal.bits,
+                    scale_bias_dtype: metal.io_dtype,
+                },
+                down: QuantizedAffineLayout {
+                    group_size: metal.group_size,
+                    bits: metal.bits,
+                    scale_bias_dtype: metal.io_dtype,
+                },
                 io_dtype: metal.io_dtype,
             };
             Some(Qwen3xSharedExpertsWeightBuffers {

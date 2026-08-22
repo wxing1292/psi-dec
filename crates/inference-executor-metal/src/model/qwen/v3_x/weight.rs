@@ -53,7 +53,22 @@ pub fn remove_qwen3x_norm_weight(
     name: &str,
     expected_shape: &[usize],
 ) -> Result<Buffer, ModelExecutorError> {
-    let data = remove_typed_tensor(tensors, name, safetensors::Dtype::BF16)?;
+    remove_norm_weight(device, tensors, name, expected_shape, Dtype::Bfloat16)
+}
+
+pub fn remove_norm_weight(
+    device: &Device,
+    tensors: &mut TensorMap,
+    name: &str,
+    expected_shape: &[usize],
+    dtype: Dtype,
+) -> Result<Buffer, ModelExecutorError> {
+    let dtype = match dtype {
+        Dtype::Bfloat16 => safetensors::Dtype::BF16,
+        Dtype::Float32 => safetensors::Dtype::F32,
+        dtype => panic!("unsupported norm weight dtype {dtype:?}"),
+    };
+    let data = remove_typed_tensor(tensors, name, dtype)?;
     validate_shape(name, data.shape(), expected_shape)?;
     Ok(Buffer::from_slice(device, data.data()))
 }

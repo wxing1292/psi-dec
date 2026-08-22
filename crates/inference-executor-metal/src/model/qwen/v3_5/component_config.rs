@@ -15,6 +15,7 @@ use inference_executor_core::model::qwen::v3_x::QuantizationConfig;
 
 use crate::attn::gdn::backend::GDNMetalConfig;
 use crate::attn::gqa::backend::GQAMetalConfig;
+use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::mlp::dense::backend::DenseMLPMetalConfig;
 use crate::mlp::moe::backend::GatedMoEMetalConfig;
 use crate::model::qwen::v3_x::weight::to_u32;
@@ -151,8 +152,16 @@ pub fn derive_qwen35_dense_mlp_configs(
     };
     core.validate();
     let metal = DenseMLPMetalConfig {
-        group_size: defaults.group_size,
-        bits: defaults.bits,
+        gate_up: QuantizedAffineLayout {
+            group_size: defaults.group_size,
+            bits: defaults.bits,
+            scale_bias_dtype: defaults.hidden_dtype,
+        },
+        down: QuantizedAffineLayout {
+            group_size: defaults.group_size,
+            bits: defaults.bits,
+            scale_bias_dtype: defaults.hidden_dtype,
+        },
         io_dtype: defaults.hidden_dtype,
     };
     metal.validate();

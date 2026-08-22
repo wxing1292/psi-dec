@@ -20,6 +20,7 @@ const BF16_VECTOR_WIDTH: u32 = 4;
 enum KernelKind {
     F32,
     Bf16Vectorized,
+    Bf16VectorizedF32Weight,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,10 +38,11 @@ impl KernelConstants {
     fn new(config: Config) -> Self {
         config.validate();
         Self {
-            kind: match config.io_dtype {
-                Dtype::Float32 => KernelKind::F32,
-                Dtype::Bfloat16 => KernelKind::Bf16Vectorized,
-                dtype => panic!("unsupported RMSNorm dtype {dtype:?}"),
+            kind: match (config.io_dtype, config.weight_dtype) {
+                (Dtype::Float32, Dtype::Float32) => KernelKind::F32,
+                (Dtype::Bfloat16, Dtype::Bfloat16) => KernelKind::Bf16Vectorized,
+                (Dtype::Bfloat16, Dtype::Float32) => KernelKind::Bf16VectorizedF32Weight,
+                dtypes => panic!("unsupported RMSNorm IO/weight dtypes {dtypes:?}"),
             },
             thread_block: ThreadBlockConstants { required_threads: 1024 },
         }
@@ -52,6 +54,7 @@ pub struct Config {
     pub hidden_dim: u32,
     pub eps: f32,
     pub io_dtype: Dtype,
+    pub weight_dtype: Dtype,
 }
 
 impl Config {
@@ -60,6 +63,7 @@ impl Config {
             hidden_dim,
             eps,
             io_dtype: Dtype::Float32,
+            weight_dtype: Dtype::Float32,
         }
     }
 
@@ -69,6 +73,17 @@ impl Config {
             hidden_dim,
             eps,
             io_dtype: Dtype::Bfloat16,
+            weight_dtype: Dtype::Bfloat16,
+        }
+    }
+
+    /// Creates a BF16 input/output configuration with F32 scale weights.
+    pub fn bf16_with_f32_weight(hidden_dim: u32, eps: f32) -> Self {
+        Self {
+            hidden_dim,
+            eps,
+            io_dtype: Dtype::Bfloat16,
+            weight_dtype: Dtype::Float32,
         }
     }
 
@@ -76,6 +91,11 @@ impl Config {
         assert!(self.hidden_dim > 0);
         assert!(self.eps.is_finite() && self.eps > 0.0);
         assert!(matches!(self.io_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(matches!(self.weight_dtype, Dtype::Float32 | Dtype::Bfloat16));
+        assert!(
+            self.io_dtype == Dtype::Bfloat16 || self.weight_dtype == Dtype::Float32,
+            "F32 RMSNorm IO requires F32 weights"
+        );
         assert!(
             self.io_dtype != Dtype::Bfloat16 || self.hidden_dim.is_multiple_of(BF16_VECTOR_WIDTH),
             "BF16 RMSNorm hidden_dim must be divisible by {BF16_VECTOR_WIDTH}"
@@ -99,7 +119,7 @@ impl Config {
     pub fn weight_bytes(self) -> usize {
         self.validate();
         (self.hidden_dim as usize)
-            .checked_mul(self.io_dtype.item_size())
+            .checked_mul(self.weight_dtype.item_size())
             .expect("RMSNorm weight byte length must fit usize")
     }
 }
@@ -302,6 +322,7 @@ fn rms_norm_function_name(constants: KernelConstants) -> &'static str {
     match constants.kind {
         KernelKind::F32 => "rms_norm_f32",
         KernelKind::Bf16Vectorized => "rms_norm_bf16_vec4",
+        KernelKind::Bf16VectorizedF32Weight => "rms_norm_bf16_vec4_weight_f32",
     }
 }
 
@@ -325,6 +346,61 @@ mod tests {
         let bf16 = KernelConstants::new(Config::bf16(64, 1.0e-6));
         assert_eq!(bf16.kind, KernelKind::Bf16Vectorized);
         assert_eq!(bf16.thread_block.required_threads, 1024);
+
+        let bf16_f32_weight = KernelConstants::new(Config::bf16_with_f32_weight(64, 1.0e-6));
+        assert_eq!(bf16_f32_weight.kind, KernelKind::Bf16VectorizedF32Weight);
+        assert_eq!(bf16_f32_weight.thread_block.required_threads, 1024);
+    }
+
+    #[test]
+    fn test_bf16_io_with_f32_weight_matches_reference() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let hidden_dim = 64_u32;
+        let config = Config::bf16_with_f32_weight(hidden_dim, 1.0e-6);
+        let shape = Shape { num_total_tokens: 1 };
+        let input_values = (0..hidden_dim)
+            .map(|index| ((index * 7 % 23) as f32 - 11.0) / 8.0)
+            .collect::<Vec<_>>();
+        let input_bits = input_values
+            .iter()
+            .copied()
+            .map(bf16::from_f32)
+            .map(bf16::to_bits)
+            .collect::<Vec<_>>();
+        let rounded_input = input_bits
+            .iter()
+            .copied()
+            .map(bf16::from_bits)
+            .map(bf16::to_f32)
+            .collect::<Vec<_>>();
+        let weight_values = (0..hidden_dim)
+            .map(|index| 0.7 + (index % 13) as f32 / 20.0)
+            .collect::<Vec<_>>();
+        let input = Buffer::from_slice(&device, &input_bits);
+        let weight = Buffer::from_slice(&device, &weight_values);
+        let output = Buffer::new_zeroed(&device, config.bytes(shape));
+        let compute = Compute::new(&device, config);
+        let mut builder = stream.create_replay_program();
+        builder.record(compute.invoke(
+            shape,
+            ReplayU32::Fixed(shape.num_total_tokens),
+            Buffers {
+                input: &input,
+                weight: &weight,
+                output: &output,
+            },
+        ));
+        stream.submit_replay(&builder.build()).wait();
+
+        let expected = rms_norm_reference(&rounded_input, &weight_values, None, 1, hidden_dim as usize, 1.0e-6);
+        let actual = output
+            .read_typed::<u16>(0, hidden_dim as usize)
+            .into_iter()
+            .map(bf16::from_bits)
+            .map(bf16::to_f32)
+            .collect::<Vec<_>>();
+        assert_close(&actual, &expected, 0.01);
     }
 
     #[test]
