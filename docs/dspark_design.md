@@ -593,8 +593,6 @@ The release Qwen3 service passed deterministic and probabilistic DSpark decode.
 The final one-request deterministic comparison measured a `36.565 tok/s` Main-only median and a `42.788 tok/s`
 DSpark median.
 DSpark was `17.0%` faster for that workload.
-The full optimization history is in [`qwen3_dspark_design_draft.md`](qwen3_dspark_design_draft.md).
-
 ### Qwen3.8 lifecycle verification
 
 The 2026-08-21 verification used base commit `8cbd20dee490c49e7089fa10034cbd53d2598680` with the active DSpark
