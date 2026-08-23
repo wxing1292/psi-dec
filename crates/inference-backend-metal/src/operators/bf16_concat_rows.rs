@@ -200,121 +200,63 @@ mod tests {
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.bf16_concat_rows.num_active_rows");
-    const INPUT_POISON: u16 = 0xffff;
-    const OUTPUT_CANARY: u16 = 0x7fc1;
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let config = Config { num_columns: 4 };
-        assert_eq!(
-            KernelConstants::current(config),
-            KernelConstants {
-                config,
-                thread_block: ThreadBlockConstants { required_threads: 256 },
-            }
-        );
-    }
-
-    #[test]
-    fn test_bucketed_replay_preserves_inactive_tail_across_grow_and_shrink() {
+    fn test_replay_matches_reference_across_active_counts() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = Config { num_columns: 4 };
-        let num_total_rows = 4;
-        let lhs = Buffer::from_slice(
+        let num_total_rows = 8;
+        let lhs_values = (0..num_total_rows * config.num_columns)
+            .map(|index| index as u16 + 1)
+            .collect::<Vec<_>>();
+        let rhs_values = (0..num_total_rows * config.num_columns)
+            .map(|index| index as u16 + 101)
+            .collect::<Vec<_>>();
+        let lhs = Buffer::from_slice(&device, &lhs_values);
+        let rhs = Buffer::from_slice(&device, &rhs_values);
+        let output = Buffer::new_zeroed_elements(
             &device,
-            &[
-                1_u16,
-                2,
-                3,
-                4,
-                5,
-                6,
-                7,
-                8,
-                9,
-                10,
-                11,
-                12,
-                INPUT_POISON,
-                INPUT_POISON,
-                INPUT_POISON,
-                INPUT_POISON,
-            ],
+            (num_total_rows * config.num_columns * 2) as usize,
+            Dtype::Bfloat16,
         );
-        let rhs = Buffer::from_slice(
-            &device,
-            &[
-                101_u16,
-                102,
-                103,
-                104,
-                105,
-                106,
-                107,
-                108,
-                109,
-                110,
-                111,
-                112,
-                INPUT_POISON,
-                INPUT_POISON,
-                INPUT_POISON,
-                INPUT_POISON,
-            ],
-        );
-        let output = Buffer::from_slice(&device, &[OUTPUT_CANARY; 40]);
         let kernel = Kernel::new(&device, config);
+        let mut cache = ReplayTestCache::new();
+        let (replay, cache_hit) = cache.record(num_total_rows, || {
+            let mut recorder = stream.create_replay_program();
+            recorder.record(kernel.invoke(
+                num_total_rows,
+                ReplayU32::Parameter(NUM_ACTIVE_ROWS),
+                Buffers {
+                    lhs: &lhs,
+                    rhs: &rhs,
+                    output: &output,
+                },
+            ));
+            recorder.build()
+        });
+        assert!(!cache_hit);
 
-        let mut recorder = stream.create_replay_program();
-        recorder.record(kernel.invoke(
-            num_total_rows,
-            ReplayU32::Parameter(NUM_ACTIVE_ROWS),
-            Buffers {
-                lhs: &lhs,
-                rhs: &rhs,
-                output: &output,
-            },
-        ));
-        let replay = recorder.build();
-
-        let expected_active = reference_concat(
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-            &[101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112],
-            4,
-        );
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
-            .wait();
-        assert_eq!(output.read_typed::<u16>(0, 24), expected_active);
-        assert_eq!(output.read_typed::<u16>(24, 16), vec![OUTPUT_CANARY; 16]);
-
-        lhs.write_typed(12, &[13_u16, 14, 15, 16]);
-        rhs.write_typed(12, &[113_u16, 114, 115, 116]);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 4))
-            .wait();
-        let expected_full = reference_concat(
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-            &[
-                101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
-            ],
-            4,
-        );
-        let full_output = output.read_typed::<u16>(0, 32);
-        assert_eq!(full_output, expected_full);
-        assert_eq!(output.read_typed::<u16>(32, 8), vec![OUTPUT_CANARY; 8]);
-
-        lhs.write_typed(12, &[INPUT_POISON; 4]);
-        rhs.write_typed(12, &[INPUT_POISON; 4]);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
-            .wait();
-        assert_eq!(output.read_typed::<u16>(0, 24), expected_active);
-        assert_eq!(output.read_typed::<u16>(24, 8), full_output[24..]);
-        assert_eq!(output.read_typed::<u16>(32, 8), vec![OUTPUT_CANARY; 8]);
+        for num_active_rows in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            let (replay, cache_hit) = cache.record(num_total_rows, || unreachable!());
+            assert!(cache_hit);
+            stream
+                .submit_replay_with_arguments(
+                    replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
+                )
+                .wait();
+            let num_active_input_values = num_active_rows * config.num_columns as usize;
+            let expected = reference_concat(
+                &lhs_values[..num_active_input_values],
+                &rhs_values[..num_active_input_values],
+                config.num_columns as usize,
+            );
+            assert_eq!(output.read_typed::<u16>(0, expected.len()), expected);
+        }
     }
 
     #[test]

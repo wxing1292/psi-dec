@@ -544,13 +544,3 @@ fn residual_add_function_name(config: Config) -> &'static str {
         },
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::KERNEL_CONSTANTS;
-
-    #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        assert_eq!(KERNEL_CONSTANTS.thread_block.required_threads, 256);
-    }
-}

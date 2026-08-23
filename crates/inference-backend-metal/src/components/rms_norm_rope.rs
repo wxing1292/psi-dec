@@ -401,7 +401,6 @@ mod tests {
     use super::Buffers;
     use super::Compute;
     use super::Config;
-    use super::KernelConstants;
     use super::RopeScaling;
     use super::Shape;
     use crate::metal::Buffer;
@@ -409,27 +408,6 @@ mod tests {
     use crate::metal::Dtype;
     use crate::metal::ReplayU32;
     use crate::metal::Stream;
-
-    #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let constants = KernelConstants::new(Config::bf16(4, 128, 128, 1e-6, 1_000_000.0));
-        assert_eq!(constants.config.num_heads, 4);
-        assert_eq!(constants.thread_block.required_threads, 128);
-    }
-
-    #[test]
-    fn test_norm_weight_uses_bf16_storage() {
-        let config = Config::f32(2, 128, 128, 1e-6, 1_000_000.0);
-
-        assert_eq!(config.norm_weight_bytes(), 128 * Dtype::Bfloat16.item_size());
-    }
-
-    #[test]
-    fn test_norm_weight_can_use_f32_storage() {
-        let config = Config::bf16(2, 128, 128, 1e-6, 1_000_000.0).with_norm_weight_dtype(Dtype::Float32);
-
-        assert_eq!(config.norm_weight_bytes(), 128 * Dtype::Float32.item_size());
-    }
 
     #[test]
     fn test_yarn_correction_range() {

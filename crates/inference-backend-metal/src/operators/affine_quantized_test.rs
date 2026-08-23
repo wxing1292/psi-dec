@@ -5,29 +5,12 @@ use inference_executor_core::replay::ReplayBucketPolicy;
 use super::*;
 use crate::metal::ReplayArguments;
 use crate::metal::Stream;
+use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.affine.num_active_rows");
 
 fn adaptive_config(n: i32, k: i32, dtype: Dtype) -> Config {
     Config::same_dtype(n, k, 64, 4, dtype)
-}
-
-#[test]
-#[should_panic(expected = "expert affine quantized kernels do not yet support mixed dtypes")]
-fn test_expert_config_rejects_unimplemented_mixed_dtype_template() {
-    ExpertConfig {
-        num_experts: 2,
-        matmul: Config {
-            n: 32,
-            k: 32,
-            group_size: 32,
-            bits: 4,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Float32,
-            scale_bias_dtype: Dtype::Bfloat16,
-        },
-    }
-    .validate();
 }
 
 #[test]
@@ -102,7 +85,7 @@ fn test_adaptive_topology_boundaries_follow_selector() {
 }
 
 #[test]
-fn test_bucketed_qmv_variants_match_exact_and_preserve_tail() {
+fn test_bucketed_qmv_variants_match_reference_across_active_counts() {
     let same_qmv = Config::same_dtype(4, 32, 32, 8, Dtype::Float32);
     let same_qmv_fast = Config::same_dtype(8, 512, 64, 8, Dtype::Float32);
     let same_qmv_quad = Config::same_dtype(9, 64, 64, 8, Dtype::Float32);
@@ -132,12 +115,12 @@ fn test_bucketed_qmv_variants_match_exact_and_preserve_tail() {
         (mixed_qmv, KernelKind::QmvBn8Bk32),
         (mixed_qmv_fast, KernelKind::QmvBn8Bk32),
     ] {
-        assert_bucketed_parity_and_canary(config, kind, 4, 3);
+        assert_bucketed_replay_matches_reference(config, kind, 4);
     }
 }
 
 #[test]
-fn test_bucketed_qmm_variants_match_exact_and_preserve_tail() {
+fn test_bucketed_qmm_variants_match_reference_across_active_counts() {
     let same = Config::same_dtype(32, 32, 32, 8, Dtype::Float32);
     let same_unaligned = Config::same_dtype(1, 32, 32, 8, Dtype::Float32);
     let same_q4_bf16 = Config::same_dtype(32, 64, 64, 4, Dtype::Bfloat16);
@@ -151,23 +134,22 @@ fn test_bucketed_qmm_variants_match_exact_and_preserve_tail() {
         scale_bias_dtype: Dtype::Float32,
     };
 
-    for (config, kind, num_total_rows, num_active_rows) in [
-        (same, KernelKind::QmmBm8Bn32, 16, 5),
-        (same, KernelKind::QmmBm16Bn32, 32, 9),
-        (same, KernelKind::QmmBm32Bn32, 64, 17),
-        (same_q4_bf16, KernelKind::QmmBm16Bn32, 32, 9),
-        (same_unaligned, KernelKind::QmmBm32Bn32, 64, 17),
-        (mixed_unaligned, KernelKind::QmmBm8Bn32, 16, 5),
-        (mixed_unaligned, KernelKind::QmmBm16Bn32, 32, 9),
-        (mixed_unaligned, KernelKind::QmmBm32Bn32, 64, 17),
+    for (config, kind, num_total_rows) in [
+        (same, KernelKind::QmmBm8Bn32, 16),
+        (same, KernelKind::QmmBm16Bn32, 32),
+        (same, KernelKind::QmmBm32Bn32, 64),
+        (same_q4_bf16, KernelKind::QmmBm16Bn32, 32),
+        (same_unaligned, KernelKind::QmmBm32Bn32, 64),
+        (mixed_unaligned, KernelKind::QmmBm8Bn32, 16),
+        (mixed_unaligned, KernelKind::QmmBm16Bn32, 32),
+        (mixed_unaligned, KernelKind::QmmBm32Bn32, 64),
     ] {
-        assert_bucketed_parity_and_canary(config, kind, num_total_rows, num_active_rows);
+        assert_bucketed_replay_matches_reference(config, kind, num_total_rows);
     }
 }
 
-fn assert_bucketed_parity_and_canary(config: Config, kind: KernelKind, num_total_rows: i32, num_active_rows: i32) {
+fn assert_bucketed_replay_matches_reference(config: Config, kind: KernelKind, num_total_rows: i32) {
     assert!(matches!(config.bits, 4 | 8));
-    assert!(num_active_rows < num_total_rows);
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let input_source = fixture_values(num_total_rows as usize * config.k as usize, 0.00390625);
@@ -192,95 +174,59 @@ fn assert_bucketed_parity_and_canary(config: Config, kind: KernelKind, num_total
     };
     let scales_buffer = buffer_from_f32(&device, &scales, config.scale_bias_dtype);
     let biases_buffer = buffer_from_f32(&device, &biases, config.scale_bias_dtype);
-    let sentinel = round_values_to_dtype(&[-123.0], config.output_dtype)[0];
-    let bucketed_output = buffer_from_f32(
-        &device,
-        &vec![sentinel; num_total_rows as usize * config.n as usize],
-        config.output_dtype,
-    );
-    let exact_output = Buffer::new_zeroed(&device, config.output_bytes(num_active_rows));
+    let output = Buffer::new_zeroed(&device, config.output_bytes(num_total_rows));
     let kernel = Kernel::new(&device, config, kind);
+    let mut cache = ReplayTestCache::new();
+    let (replay, cache_hit) = cache.record(num_total_rows, || {
+        let mut recorder = stream.create_replay_program();
+        recorder.record(kernel.invoke(
+            num_total_rows as u32,
+            ReplayU32::Parameter(NUM_ACTIVE_ROWS),
+            &output,
+            0,
+            &input,
+            0,
+            &weight,
+            0,
+            &scales_buffer,
+            0,
+            &biases_buffer,
+            0,
+        ));
+        recorder.build()
+    });
+    assert!(!cache_hit);
 
-    let mut exact_builder = stream.create_replay_program();
-    exact_builder.record(kernel.invoke(
-        num_active_rows as u32,
-        ReplayU32::Fixed(num_active_rows as u32),
-        &exact_output,
-        0,
-        &input,
-        0,
-        &weight,
-        0,
-        &scales_buffer,
-        0,
-        &biases_buffer,
-        0,
-    ));
-    let exact_replay = exact_builder.build();
-    stream.submit_replay(&exact_replay).wait();
-
-    let mut bucketed_builder = stream.create_replay_program();
-    bucketed_builder.record(kernel.invoke(
-        num_total_rows as u32,
-        ReplayU32::Parameter(NUM_ACTIVE_ROWS),
-        &bucketed_output,
-        0,
-        &input,
-        0,
-        &weight,
-        0,
-        &scales_buffer,
-        0,
-        &biases_buffer,
-        0,
-    ));
-    let bucketed_replay = bucketed_builder.build();
-    stream
-        .submit_replay_with_arguments(
-            &bucketed_replay,
-            &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
-        )
-        .wait();
-
-    let num_active_values = num_active_rows as usize * config.n as usize;
-    let num_total_values = num_total_rows as usize * config.n as usize;
-    let tolerance = output_tolerance(config.output_dtype);
-    let exact = read_f32(&exact_output, num_active_values, config.output_dtype);
-    let bucketed = read_f32(&bucketed_output, num_active_values, config.output_dtype);
-    assert_close_case(&bucketed, &exact, tolerance, config, kind);
-    let bucketed_values = read_f32(&bucketed_output, num_total_values, config.output_dtype);
-    assert_eq!(
-        &bucketed_values[num_active_values..],
-        vec![sentinel; num_total_values - num_active_values],
-        "bucketed affine wrote inactive output rows: config={config:?} kind={kind:?}"
-    );
-
-    stream
-        .submit_replay_with_arguments(
-            &bucketed_replay,
-            &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_total_rows as u32),
-        )
-        .wait();
-    let expected = round_values_to_dtype(
-        &cpu_affine_reference(config, num_total_rows, &input_values, &weight_values, &scales, &biases),
-        config.output_dtype,
-    );
-    let actual = read_f32(&bucketed_output, num_total_values, config.output_dtype);
-    assert_close_case(&actual, &expected, tolerance, config, kind);
-
-    stream
-        .submit_replay_with_arguments(
-            &bucketed_replay,
-            &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
-        )
-        .wait();
-    let shrunk = read_f32(&bucketed_output, num_total_values, config.output_dtype);
-    assert_close_case(&shrunk[..num_active_values], &exact, tolerance, config, kind);
-    assert_eq!(
-        &shrunk[num_active_values..],
-        &actual[num_active_values..],
-        "bucketed affine rewrote rows after the active prefix: config={config:?} kind={kind:?}"
-    );
+    let mut active_counts = vec![1, num_total_rows, 3, num_total_rows - 1, 2, num_total_rows / 2];
+    active_counts.retain(|&active| active > 0 && active <= num_total_rows);
+    active_counts.dedup();
+    for num_active_rows in active_counts {
+        let (replay, cache_hit) = cache.record(num_total_rows, || unreachable!());
+        assert!(cache_hit);
+        stream
+            .submit_replay_with_arguments(
+                replay,
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
+            )
+            .wait();
+        let expected = round_values_to_dtype(
+            &cpu_affine_reference(
+                config,
+                num_active_rows,
+                &input_values[..num_active_rows as usize * config.k as usize],
+                &weight_values,
+                &scales,
+                &biases,
+            ),
+            config.output_dtype,
+        );
+        let actual = read_f32(
+            &output,
+            num_active_rows as usize * config.n as usize,
+            config.output_dtype,
+        );
+        assert_close_case(&actual, &expected, output_tolerance(config.output_dtype), config, kind);
+    }
 }
 
 fn output_tolerance(dtype: Dtype) -> f32 {

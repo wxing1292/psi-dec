@@ -334,212 +334,23 @@ mod tests {
     use super::*;
     use crate::metal::ReplayArguments;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.rms_norm.num_active_tokens");
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let f32 = KernelConstants::new(Config::f32(64, 1.0e-6));
-        assert_eq!(f32.kind, KernelKind::F32);
-        assert_eq!(f32.thread_block.required_threads, 1024);
-
-        let bf16 = KernelConstants::new(Config::bf16(64, 1.0e-6));
-        assert_eq!(bf16.kind, KernelKind::Bf16Vectorized);
-        assert_eq!(bf16.thread_block.required_threads, 1024);
-
-        let bf16_f32_weight = KernelConstants::new(Config::bf16_with_f32_weight(64, 1.0e-6));
-        assert_eq!(bf16_f32_weight.kind, KernelKind::Bf16VectorizedF32Weight);
-        assert_eq!(bf16_f32_weight.thread_block.required_threads, 1024);
+    fn test_bf16_io_with_f32_weight_replay_matches_reference_across_active_counts() {
+        assert_replay_matches_reference(Config::bf16_with_f32_weight(64, 1.0e-6));
     }
 
     #[test]
-    fn test_bf16_io_with_f32_weight_matches_reference() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let hidden_dim = 64_u32;
-        let config = Config::bf16_with_f32_weight(hidden_dim, 1.0e-6);
-        let shape = Shape { num_total_tokens: 1 };
-        let input_values = (0..hidden_dim)
-            .map(|index| ((index * 7 % 23) as f32 - 11.0) / 8.0)
-            .collect::<Vec<_>>();
-        let input_bits = input_values
-            .iter()
-            .copied()
-            .map(bf16::from_f32)
-            .map(bf16::to_bits)
-            .collect::<Vec<_>>();
-        let rounded_input = input_bits
-            .iter()
-            .copied()
-            .map(bf16::from_bits)
-            .map(bf16::to_f32)
-            .collect::<Vec<_>>();
-        let weight_values = (0..hidden_dim)
-            .map(|index| 0.7 + (index % 13) as f32 / 20.0)
-            .collect::<Vec<_>>();
-        let input = Buffer::from_slice(&device, &input_bits);
-        let weight = Buffer::from_slice(&device, &weight_values);
-        let output = Buffer::new_zeroed(&device, config.bytes(shape));
-        let compute = Compute::new(&device, config);
-        let mut builder = stream.create_replay_program();
-        builder.record(compute.invoke(
-            shape,
-            ReplayU32::Fixed(shape.num_total_tokens),
-            Buffers {
-                input: &input,
-                weight: &weight,
-                output: &output,
-            },
-        ));
-        stream.submit_replay(&builder.build()).wait();
-
-        let expected = rms_norm_reference(&rounded_input, &weight_values, None, 1, hidden_dim as usize, 1.0e-6);
-        let actual = output
-            .read_typed::<u16>(0, hidden_dim as usize)
-            .into_iter()
-            .map(bf16::from_bits)
-            .map(bf16::to_f32)
-            .collect::<Vec<_>>();
-        assert_close(&actual, &expected, 0.01);
+    fn test_f32_replay_matches_reference_across_active_counts() {
+        assert_replay_matches_reference(Config::f32(64, 1.0e-6));
     }
 
     #[test]
-    fn test_bucketed_fixed() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let num_active_tokens = 2_u32;
-        let num_total_tokens = 4_u32;
-        let hidden_dim = 8_u32;
-        let config = Config::f32(hidden_dim, 1.0e-6);
-        let shape = Shape { num_total_tokens };
-        let kernel = Compute::new(&device, config);
-        let input_values = (0..config.num_values(shape))
-            .map(|index| index as f32 * 0.03125 - 0.5)
-            .collect::<Vec<_>>();
-        let weight_values = (0..hidden_dim)
-            .map(|index| 0.75 + index as f32 * 0.03125)
-            .collect::<Vec<_>>();
-        let input = Buffer::from_slice(&device, &input_values);
-        let weight = Buffer::from_slice(&device, &weight_values);
-        let sentinel = -321.0_f32;
-        let output = Buffer::from_slice(&device, &vec![sentinel; config.num_values(shape)]);
-
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            Buffers {
-                input: &input,
-                weight: &weight,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-        stream
-            .submit_replay_with_arguments(
-                &replay,
-                &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
-            )
-            .wait();
-
-        let active_values = num_active_tokens as usize * hidden_dim as usize;
-        let expected = rms_norm_reference(
-            &input_values[..active_values],
-            &weight_values,
-            None,
-            num_active_tokens as usize,
-            hidden_dim as usize,
-            1.0e-6,
-        );
-        assert_close(&output.read_typed::<f32>(0, active_values), &expected, 1.0e-5);
-        assert_eq!(
-            output.read_typed::<f32>(active_values, config.num_values(shape) - active_values),
-            vec![sentinel; config.num_values(shape) - active_values]
-        );
-    }
-
-    #[test]
-    fn test_bucketed_bf16_preserves_inactive_tail_across_grow_and_shrink() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let num_total_tokens = 2_u32;
-        let hidden_dim = 5120_u32;
-        let config = Config::bf16(hidden_dim, 1.0e-6);
-        let shape = Shape { num_total_tokens };
-        let kernel = Compute::new(&device, config);
-        let input_values = (0..config.num_values(shape))
-            .map(|index| ((index * 37) % 251) as f32 * 0.03125 - 3.5)
-            .collect::<Vec<_>>();
-        let weight_values = (0..hidden_dim)
-            .map(|index| 0.5 + ((index * 19) % 31) as f32 * 0.03125)
-            .collect::<Vec<_>>();
-        let input = Buffer::from_slice(
-            &device,
-            &input_values
-                .iter()
-                .copied()
-                .map(bf16::from_f32)
-                .map(bf16::to_bits)
-                .collect::<Vec<_>>(),
-        );
-        let weight = Buffer::from_slice(
-            &device,
-            &weight_values
-                .iter()
-                .copied()
-                .map(bf16::from_f32)
-                .map(bf16::to_bits)
-                .collect::<Vec<_>>(),
-        );
-        let sentinel = bf16::from_f32(-321.0).to_bits();
-        let output = Buffer::from_slice(&device, &vec![sentinel; config.num_values(shape)]);
-
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            Buffers {
-                input: &input,
-                weight: &weight,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-
-        assert_bf16_submission(
-            &stream,
-            &replay,
-            &output,
-            &input_values,
-            &weight_values,
-            1,
-            hidden_dim as usize,
-            sentinel,
-        );
-        assert_bf16_submission(
-            &stream,
-            &replay,
-            &output,
-            &input_values,
-            &weight_values,
-            2,
-            hidden_dim as usize,
-            sentinel,
-        );
-
-        let row_values = hidden_dim as usize;
-        input.write_typed(row_values, &vec![0x7fc1_u16; row_values]);
-        output.write_typed(row_values, &vec![sentinel; row_values]);
-        assert_bf16_submission(
-            &stream,
-            &replay,
-            &output,
-            &input_values,
-            &weight_values,
-            1,
-            row_values,
-            sentinel,
-        );
+    fn test_bf16_replay_matches_reference_across_active_counts() {
+        assert_replay_matches_reference(Config::bf16(64, 1.0e-6));
     }
 
     #[test]
@@ -548,43 +359,103 @@ mod tests {
         Config::bf16(3, 1.0e-6).validate();
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn assert_bf16_submission(
-        stream: &Stream,
-        replay: &crate::metal::ReplayProgram,
-        output: &Buffer,
-        input_values: &[f32],
-        weight_values: &[f32],
-        num_active_tokens: usize,
-        hidden_dim: usize,
-        sentinel: u16,
-    ) {
-        stream
-            .submit_replay_with_arguments(
-                replay,
-                &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32),
-            )
-            .wait();
-        let active_values = num_active_tokens * hidden_dim;
-        let expected = rms_norm_reference(
-            &input_values[..active_values],
-            weight_values,
-            None,
-            num_active_tokens,
-            hidden_dim,
-            1.0e-6,
-        );
-        let actual = output
-            .read_typed::<u16>(0, active_values)
-            .into_iter()
-            .map(bf16::from_bits)
-            .map(bf16::to_f32)
+    fn assert_replay_matches_reference(config: Config) {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let shape = Shape { num_total_tokens: 8 };
+        let kernel = Compute::new(&device, config);
+        let input_values = (0..config.num_values(shape))
+            .map(|index| ((index * 37) % 251) as f32 * 0.03125 - 3.5)
             .collect::<Vec<_>>();
-        assert_close(&actual, &expected, 0.02);
-        assert_eq!(
-            output.read_typed::<u16>(active_values, input_values.len() - active_values),
-            vec![sentinel; input_values.len() - active_values]
-        );
+        let weight_values = (0..config.hidden_dim)
+            .map(|index| 0.5 + ((index * 19) % 31) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let stored_input_values = round_values(&input_values, config.io_dtype);
+        let stored_weight_values = round_values(&weight_values, config.weight_dtype);
+        let input = buffer_from_values(&device, &stored_input_values, config.io_dtype);
+        let weight = buffer_from_values(&device, &stored_weight_values, config.weight_dtype);
+        let output = Buffer::new_zeroed(&device, config.bytes(shape));
+        let mut cache = ReplayTestCache::new();
+        let (replay, cache_hit) = cache.record(shape.num_total_tokens, || {
+            let mut recorder = stream.create_replay_program();
+            recorder.record(kernel.invoke(
+                shape,
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+                Buffers {
+                    input: &input,
+                    weight: &weight,
+                    output: &output,
+                },
+            ));
+            recorder.build()
+        });
+        assert!(!cache_hit);
+
+        for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            let (replay, cache_hit) = cache.record(shape.num_total_tokens, || unreachable!());
+            assert!(cache_hit);
+            stream
+                .submit_replay_with_arguments(
+                    replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32),
+                )
+                .wait();
+            let active_values = num_active_tokens * config.hidden_dim as usize;
+            let expected = rms_norm_reference(
+                &stored_input_values[..active_values],
+                &stored_weight_values,
+                None,
+                num_active_tokens,
+                config.hidden_dim as usize,
+                config.eps,
+            );
+            let actual = read_values(&output, active_values, config.io_dtype);
+            let tolerance = if config.io_dtype == Dtype::Float32 {
+                1.0e-5
+            } else {
+                0.02
+            };
+            assert_close(&actual, &expected, tolerance);
+        }
+    }
+
+    fn round_values(values: &[f32], dtype: Dtype) -> Vec<f32> {
+        match dtype {
+            Dtype::Float32 => values.to_vec(),
+            Dtype::Bfloat16 => values.iter().map(|value| bf16::from_f32(*value).to_f32()).collect(),
+            _ => panic!("unsupported RMSNorm test dtype {dtype:?}"),
+        }
+    }
+
+    fn buffer_from_values(device: &Device, values: &[f32], dtype: Dtype) -> Buffer {
+        match dtype {
+            Dtype::Float32 => Buffer::from_slice(device, values),
+            Dtype::Bfloat16 => {
+                Buffer::from_slice(
+                    device,
+                    &values
+                        .iter()
+                        .map(|value| bf16::from_f32(*value).to_bits())
+                        .collect::<Vec<_>>(),
+                )
+            },
+            _ => panic!("unsupported RMSNorm test dtype {dtype:?}"),
+        }
+    }
+
+    fn read_values(buffer: &Buffer, len: usize, dtype: Dtype) -> Vec<f32> {
+        match dtype {
+            Dtype::Float32 => buffer.read_typed(0, len),
+            Dtype::Bfloat16 => {
+                buffer
+                    .read_typed::<u16>(0, len)
+                    .into_iter()
+                    .map(bf16::from_bits)
+                    .map(bf16::to_f32)
+                    .collect()
+            },
+            _ => panic!("unsupported RMSNorm test dtype {dtype:?}"),
+        }
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

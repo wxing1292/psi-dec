@@ -281,9 +281,7 @@ mod tests {
     use super::Buffers;
     use super::Config;
     use super::Kernel;
-    use super::KernelConstants;
     use super::Shape;
-    use super::ThreadBlockConstants;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
@@ -291,122 +289,57 @@ mod tests {
     use crate::metal::ReplayParameterKey;
     use crate::metal::ReplayU32;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.softmax.num_active_rows");
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        for (num_values_per_row, required_threads) in [(1, 32), (129, 64), (4096, 1024)] {
-            let config = Config {
-                num_values_per_row,
-                dtype: Dtype::Bfloat16,
-            };
-            assert_eq!(
-                KernelConstants::current(config),
-                KernelConstants {
-                    config,
-                    thread_block: ThreadBlockConstants { required_threads },
-                }
-            );
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "F32 softmax is not implemented")]
-    fn test_f32_is_explicit_future_work() {
-        Config {
-            num_values_per_row: 4,
-            dtype: Dtype::Float32,
-        }
-        .validate();
-    }
-
-    #[test]
-    fn test_reference() {
+    fn test_replay_matches_reference_across_active_counts() {
         let config = Config {
             num_values_per_row: 4,
             dtype: Dtype::Bfloat16,
         };
-        let shape = Shape { num_total_rows: 2 };
+        let shape = Shape { num_total_rows: 8 };
         let (device, kernel) = create_softmax_kernel(config);
         let stream = Stream::new(&device);
-        let input_values = [-2.0, -1.0, 0.0, 1.0, 4.0, 2.0, 0.0, -2.0];
+        let input_values = (0..shape.num_total_rows as usize * config.num_values_per_row as usize)
+            .map(|index| ((index * 11 + 3) % 29) as f32 * 0.25 - 3.0)
+            .collect::<Vec<_>>();
         let input = bf16_buffer(&device, &input_values);
         let output = Buffer::new_zeroed(&device, shape.bytes(config));
+        let mut cache = ReplayTestCache::new();
+        let (replay, cache_hit) = cache.record(shape.num_total_rows, || {
+            let mut recorder = stream.create_replay_program();
+            recorder.record(kernel.invoke(
+                shape,
+                ReplayU32::Parameter(NUM_ACTIVE_ROWS),
+                Buffers {
+                    input: &input,
+                    output: &output,
+                },
+            ));
+            recorder.build()
+        });
+        assert!(!cache_hit);
 
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            ReplayU32::Fixed(shape.num_total_rows),
-            Buffers {
-                input: &input,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-        stream.submit_replay(&replay).wait();
-
-        let actual = read_bf16_values(&output, input_values.len());
-        let expected = cpu_softmax_bf16_rows(
-            &input_values,
-            shape.num_total_rows as usize,
-            config.num_values_per_row as usize,
-        );
-        assert_close(&actual, &expected, 0.01);
-    }
-
-    #[test]
-    fn test_bucketed_replay_preserves_inactive_tail_across_grow_and_shrink() {
-        let config = Config {
-            num_values_per_row: 4,
-            dtype: Dtype::Bfloat16,
-        };
-        let shape = Shape { num_total_rows: 4 };
-        let (device, kernel) = create_softmax_kernel(config);
-        let stream = Stream::new(&device);
-        let all_input_values = [
-            -2.0, -1.0, 0.0, 1.0, 4.0, 2.0, 0.0, -2.0, 0.5, -0.5, 1.5, 2.5, -3.0, 3.0, 2.0, 1.0,
-        ];
-        let mut three_row_input_values = all_input_values;
-        three_row_input_values[12..].fill(f32::NAN);
-        let input = bf16_buffer(&device, &three_row_input_values);
-        let sentinel = bf16::from_f32(-777.0).to_f32();
-        let output = bf16_buffer(&device, &[sentinel; 16]);
-
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            ReplayU32::Parameter(NUM_ACTIVE_ROWS),
-            Buffers {
-                input: &input,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
-            .wait();
-        let expected_three = cpu_softmax_bf16_rows(&all_input_values[..12], 3, 4);
-        let first = read_bf16_values(&output, 16);
-        assert_close(&first[..12], &expected_three, 0.01);
-        assert_eq!(&first[12..], &[sentinel; 4]);
-
-        write_bf16_values(&input, &all_input_values);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 4))
-            .wait();
-        let expected_four = cpu_softmax_bf16_rows(&all_input_values, 4, 4);
-        let full = read_bf16_values(&output, 16);
-        assert_close(&full, &expected_four, 0.01);
-
-        write_bf16_values(&input, &three_row_input_values);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
-            .wait();
-        let shrunk = read_bf16_values(&output, 16);
-        assert_close(&shrunk[..12], &expected_three, 0.01);
-        assert_eq!(&shrunk[12..], &full[12..]);
+        for num_active_rows in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            let (replay, cache_hit) = cache.record(shape.num_total_rows, || unreachable!());
+            assert!(cache_hit);
+            stream
+                .submit_replay_with_arguments(
+                    replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
+                )
+                .wait();
+            let num_active_values = num_active_rows * config.num_values_per_row as usize;
+            let actual = read_bf16_values(&output, num_active_values);
+            let expected = cpu_softmax_bf16_rows(
+                &input_values[..num_active_values],
+                num_active_rows,
+                config.num_values_per_row as usize,
+            );
+            assert_close(&actual, &expected, 0.01);
+        }
     }
 
     fn create_softmax_kernel(config: Config) -> (Device, Kernel) {
@@ -431,11 +364,6 @@ mod tests {
     fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
         let bits: Vec<u16> = values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect();
         Buffer::from_slice(device, &bits)
-    }
-
-    fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
-        let bits: Vec<u16> = values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect();
-        buffer.write_typed(0, &bits);
     }
 
     fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {

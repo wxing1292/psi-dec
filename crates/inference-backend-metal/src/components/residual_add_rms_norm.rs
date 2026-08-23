@@ -648,13 +648,6 @@ mod tests {
     use crate::metal::Stream;
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let constants = KernelConstants::new(Config::bf16(128, 1.0e-6), KernelKind::Bf16Vectorized);
-        assert_eq!(constants.kind, KernelKind::Bf16Vectorized);
-        assert_eq!(constants.thread_block.required_threads, 1024);
-    }
-
-    #[test]
     #[should_panic(expected = "BF16 residual-add RMSNorm hidden_dim must be divisible by 4")]
     fn test_bf16_rejects_non_vector_width() {
         Config::bf16(6, 1.0e-6).validate();

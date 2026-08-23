@@ -620,17 +620,26 @@ Recommendation: Use the narrowest production owner that can express the invarian
 Component unit tests use the same classification model across attention, MLP, sampling, and model I/O. They do not
 force the same lifecycle on components that have different ownership contracts.
 
-- GDN metadata tests exercise exact, bucketed, and caller-owned token-capacity APIs with one active request set.
+- GDN metadata tests exercise exact, bucketed, and caller-owned token-capacity APIs. The GDN numerical replay test
+  sweeps all active counts for a total capacity of `8` and checks persistent state.
 - GDN state tests exercise mixed commit modes, MTP state-version shifts, deferred publish, restore, and selective reset.
 - GQA metadata tests exercise single-query and tiled-query paths with exact, bucketed, and caller-owned capacity APIs.
 - GQA page-table tests exercise selected state I/O and selective reset without reproducing KV-kernel math.
-- MoE component tests protect execution-variant selection. Metal execution tests cover the optional shared-expert path.
-- Sampling tests protect mixed request configurations and Target and Draft runtime-parameter domains.
-- Rejection tests protect mixed ragged requests, zero-draft requests, prepared inputs, and result prefixes.
-- Dense MLP and basic Embed have no component test when a lower numerical test or a higher integration test owns the
-  contract.
-- Qwen3.5 MTP Embed keeps one component test for its two input branches, gather indices, and stage-local inactive tails.
-- Unembed tests protect caller-visible format validation. Metal tests protect numerical and inactive-region behavior.
+- MoE component tests protect execution-variant selection. Isolated replay tests compare token-major, expert-major,
+  shared-expert, and non-shared-expert active outputs with CPU references.
+- Sampling tests sweep all active rows in one recorded capacity. They protect mixed request configurations and Target
+  and Draft runtime-parameter domains.
+- Rejection tests sweep all active requests in one recorded capacity. They protect mixed ragged requests, zero-draft
+  requests, prepared inputs, and result prefixes.
+- Dense MLP, Embed, and RowGather isolated replay tests sweep active counts and compare active outputs with CPU
+  references.
+- Quantized affine, RMSNorm, Softmax, and BF16 row-concat replay tests use caller-provided active parameters. They
+  compare only the active logical output with CPU references.
+- The Qwen3.5 MTPEmbed component test uses nonzero weights. It compares previous-hidden gather, token embedding, and
+  the complete norm-concat-projection output with CPU references.
+- The Unembed test protects numerical replay parity. Qwen3, Qwen3.5, and DSpark GatherUnembed tests compose gather and
+  affine-unembed CPU references across all active counts for one recorded capacity. The DSpark test also protects the
+  request-major to step-major row conversion.
 
 Do not add a component test that only inspects replay keys, arguments, capacity identities, or record wiring. A replay
 contract test must execute the production owner, prove cache reuse across active counts, and compare the active logical
