@@ -161,6 +161,9 @@ The executor uses `Replay::component()` for Markov prepare, replay arguments, an
 The model recorder can contain either recording or both recordings.
 The Prefill recording owns its replay key.
 The Decode recording owns its required replay keys, sampling arguments, and request slots.
+The Decode body replay key includes the padded history SDPA TaskTemplate capacity.
+The active TaskTemplate count is a submission-time replay argument.
+Two history lengths share one body replay when their active counts have the same power-of-two capacity.
 The executor speculator enums prevent partially initialized DSpark field combinations.
 It also keeps replay programs and workspaces reusable across submissions.
 

@@ -10,6 +10,8 @@ use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::BlockSpecGQACore;
@@ -24,6 +26,17 @@ use crate::def::layer::ReplayLayer;
 use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::quantized_affine::QuantizedAffineWeights;
 use crate::def::replay_op::ReplayOp;
+
+pub const BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES: ReplayParameterKey =
+    ReplayParameterKey::new("block_spec_gqa.num_active_sdpa_map_task_templates");
+
+pub fn add_block_spec_gqa_replay_arguments(shape: GQAReplayShape, arguments: &mut ReplayArguments) {
+    shape.validate();
+    arguments.set_u32(
+        BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES,
+        shape.num_sdpa_map_task_templates,
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BlockSpecGQAMetalConfig {
@@ -402,7 +415,7 @@ impl ReplayLayer for BlockSpecGQA {
                 },
                 ReplayU32::Fixed(input.gqa_layer_index),
                 ReplayU32::Fixed(shape.num_tokens),
-                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
+                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
             )));
             self.record_block_sdpa(recorder, shape, input.metadata, scratch);
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
@@ -439,7 +452,7 @@ impl ReplayLayer for BlockSpecGQA {
                 ReplayU32::Fixed(input.gqa_layer_index),
                 ReplayU32::Fixed(shape.num_tokens),
                 ReplayU32::Fixed(shape.num_q_token_tiles),
-                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
+                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
             )));
             self.record_block_sdpa(recorder, shape, input.metadata, scratch);
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
@@ -500,4 +513,41 @@ fn norm_rope_config(
     norm_rope
         .with_rope_scaling(metal.rope_scaling)
         .with_norm_weight_dtype(metal.norm_weight_dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use inference_backend_metal::metal::ReplayArguments;
+    use inference_executor_core::attn::GQAReplayShape;
+
+    use super::BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES;
+    use super::add_block_spec_gqa_replay_arguments;
+
+    #[test]
+    fn replay_arguments_select_active_history_work_inside_one_capacity() {
+        let shape = GQAReplayShape {
+            num_tokens: 8,
+            num_total_tokens: 8,
+            num_q_token_tiles: 1,
+            num_total_q_token_tiles: 1,
+            num_sdpa_map_task_templates: 7,
+            num_total_sdpa_map_task_templates: 8,
+            reduce_sdpa_partial_outputs: true,
+        };
+        let mut shorter_history_arguments = ReplayArguments::new();
+        add_block_spec_gqa_replay_arguments(shape, &mut shorter_history_arguments);
+        let mut longer_history = shape;
+        longer_history.num_sdpa_map_task_templates = 8;
+        let mut longer_history_arguments = ReplayArguments::new();
+        add_block_spec_gqa_replay_arguments(longer_history, &mut longer_history_arguments);
+
+        assert_eq!(
+            shorter_history_arguments,
+            ReplayArguments::new().with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 7)
+        );
+        assert_eq!(
+            longer_history_arguments,
+            ReplayArguments::new().with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 8)
+        );
+    }
 }

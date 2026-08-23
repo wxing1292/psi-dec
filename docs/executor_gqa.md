@@ -249,6 +249,8 @@ For a fixed Q-token/head output coordinate, adjacent `cu_sdpa_partial_outputs` v
 
 `num_total_sdpa_map_task_templates` is the recorded replay capacity in the shared shape. The selector uses the shared
 capacity policy. Unused tail Map task templates contain an invalid Q-token-range index and do not write a map result.
+Block-spec GQA uses this padded count as the replay-cache shape. It supplies `num_sdpa_map_task_templates` as a
+submission-time replay argument. Thus, different active history lengths can share one recorded capacity.
 
 The SplitKV `SingleQ` map also permits an invalid-Q-token-range `SDPAMapTaskTemplate` in one token's generic composite
 range. This template does not write a history partial output for that slot.

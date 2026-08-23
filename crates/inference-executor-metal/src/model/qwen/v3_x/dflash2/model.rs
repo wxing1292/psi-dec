@@ -4,6 +4,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
+use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::mlp::dense::DenseMLPCore;
@@ -330,14 +331,41 @@ impl ReplayComponent for Qwen3xDFlash2Body {
     type Input<'a> = Qwen3xDFlash2BodyArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        let shape = input.metadata.replay_shape();
-        Qwen3xDFlash2BodyReplayKey {
-            num_tokens: shape.num_tokens,
-            num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
-        }
+        dflash2_body_replay_key(input.metadata.replay_shape())
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         self.model().record_body(recorder, *input);
+    }
+}
+
+fn dflash2_body_replay_key(shape: GQAReplayShape) -> Qwen3xDFlash2BodyReplayKey {
+    Qwen3xDFlash2BodyReplayKey {
+        num_tokens: shape.num_tokens,
+        num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inference_executor_core::attn::GQAReplayShape;
+
+    use super::dflash2_body_replay_key;
+
+    #[test]
+    fn body_replay_key_reuses_one_capacity_for_different_active_history_task_counts() {
+        let shape = GQAReplayShape {
+            num_tokens: 8,
+            num_total_tokens: 8,
+            num_q_token_tiles: 1,
+            num_total_q_token_tiles: 1,
+            num_sdpa_map_task_templates: 7,
+            num_total_sdpa_map_task_templates: 8,
+            reduce_sdpa_partial_outputs: true,
+        };
+        let mut longer_history = shape;
+        longer_history.num_sdpa_map_task_templates = 8;
+
+        assert_eq!(dflash2_body_replay_key(shape), dflash2_body_replay_key(longer_history));
     }
 }

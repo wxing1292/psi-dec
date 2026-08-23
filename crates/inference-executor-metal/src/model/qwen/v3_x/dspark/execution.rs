@@ -402,7 +402,7 @@ impl Qwen3xDSparkExecution {
             ));
             sequence.push(ReplayExecution::new(
                 self.body.replay(&decode.body_key),
-                &empty_arguments,
+                &decode.body_arguments,
             ));
             sequence.push(ReplayExecution::new(
                 self.gather_unembed.replay(&decode.gather_unembed_key),
@@ -492,6 +492,8 @@ impl Qwen3xDSparkExecution {
             pages,
         };
         let (body_key, _) = self.body.record(runtime, &body_input);
+        let mut body_arguments = ReplayArguments::new();
+        self.gqa_state.add_replay_arguments(&mut body_arguments);
         let gather_unembed_input = Qwen3xDSparkGatherUnembedArgs {
             num_requests: proposal
                 .req_slots
@@ -517,6 +519,7 @@ impl Qwen3xDSparkExecution {
         Qwen3xDSparkDecodeRecording {
             embed_key,
             body_key,
+            body_arguments,
             gather_unembed_key,
             sampling_key,
             sampling_arguments,
@@ -542,6 +545,7 @@ pub struct Qwen3xDSparkPrefillRecording {
 pub struct Qwen3xDSparkDecodeRecording {
     embed_key: Qwen3xDSparkEmbedReplayKey,
     body_key: Qwen3xDSparkBodyReplayKey,
+    body_arguments: ReplayArguments,
     gather_unembed_key: Qwen3xDSparkGatherUnembedReplayKey,
     sampling_key: Qwen3xDSparkSamplingReplayKey,
     sampling_arguments: ReplayArguments,

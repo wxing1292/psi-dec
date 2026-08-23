@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::attn::BlockSpecCapacity;
 use inference_executor_core::attn::BlockSpecGQACore;
 use inference_executor_core::attn::BlockSpecMetadata;
@@ -13,6 +14,7 @@ use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::block_spec::backend::BlockSpecGQA;
 use crate::attn::block_spec::backend::BlockSpecGQAMetalConfig;
+use crate::attn::block_spec::backend::add_block_spec_gqa_replay_arguments;
 use crate::attn::block_spec::capacity::BlockSpecGQACapacity;
 use crate::attn::block_spec::context::BlockSpecGQAContextScratch;
 use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
@@ -101,6 +103,10 @@ impl BlockSpecGQAState {
 
     pub fn prepare_block(&self, block: &BlockSpecMetadata) -> GQAReplayShape {
         self.metadata().update(block)
+    }
+
+    pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
+        add_block_spec_gqa_replay_arguments(self.metadata().replay_shape(), arguments);
     }
 
     pub fn new_gqa(&self, device: &Device, core: BlockSpecGQACore, metal: BlockSpecGQAMetalConfig) -> BlockSpecGQA {

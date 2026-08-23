@@ -346,6 +346,8 @@ impl Qwen3xDFlash2Execution {
             pages,
         };
         let (body_key, _) = self.body.record(runtime, &body_input);
+        let mut body_arguments = ReplayArguments::new();
+        self.gqa_state.add_replay_arguments(&mut body_arguments);
         let output_input = Qwen3xDFlash2OutputArgs {
             num_requests,
             hidden: &self.hidden_output,
@@ -359,6 +361,7 @@ impl Qwen3xDFlash2Execution {
         Qwen3xDFlash2DecodeRecording {
             embed_key,
             body_key,
+            body_arguments,
             output_key,
             output_arguments,
             req_slots: proposal.req_slots,
@@ -386,7 +389,7 @@ impl Qwen3xDFlash2Execution {
             ));
             sequence.push(ReplayExecution::new(
                 self.body.replay(&decode.body_key),
-                &empty_arguments,
+                &decode.body_arguments,
             ));
             sequence.push(ReplayExecution::new(
                 self.output.replay(&decode.output_key),
@@ -449,6 +452,7 @@ pub struct Qwen3xDFlash2PrefillRecording {
 pub struct Qwen3xDFlash2DecodeRecording {
     embed_key: Qwen3xDFlash2EmbedReplayKey,
     body_key: Qwen3xDFlash2BodyReplayKey,
+    body_arguments: ReplayArguments,
     output_key: Qwen3xDFlash2OutputReplayKey,
     output_arguments: ReplayArguments,
     req_slots: Vec<u32>,

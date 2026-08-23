@@ -65,6 +65,9 @@ Spec Prefill and Spec Decode are independent replay recordings.
 The outer owner can submit Prefill without Decode.
 It can submit Decode without new Prefill work.
 It can also submit Prefill followed by Decode in one model-specific Spec sequence.
+The Decode body replay key includes the padded history SDPA TaskTemplate capacity.
+The active TaskTemplate count is a submission-time replay argument.
+Two history lengths share one body replay when their active counts have the same power-of-two capacity.
 
 ```text
 Spec Prefill
