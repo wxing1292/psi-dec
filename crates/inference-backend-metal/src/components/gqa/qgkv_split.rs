@@ -148,21 +148,93 @@ impl Shape {
 
 #[cfg(test)]
 mod tests {
+    use super::Buffers;
+    use super::Compute;
     use super::Config;
-    use super::KernelConstants;
     use super::Shape;
-    use super::ThreadBlockConstants;
+    use crate::metal::Buffer;
+    use crate::metal::Device;
+    use crate::metal::Dtype;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
+    use crate::metal::ReplayU32;
+    use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
+
+    const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa_qgkv_split.num_active_tokens");
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let config = Config::bf16(2, 1, 128);
-        assert_eq!(
-            KernelConstants::current(config),
-            KernelConstants {
-                config,
-                thread_block: ThreadBlockConstants { required_threads: 256 },
+    fn test_replay_matches_reference_across_active_counts() {
+        const NUM_TOTAL_TOKENS: u32 = 8;
+
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = Config::f32(2, 1, 2);
+        let shape = Shape {
+            num_total_tokens: NUM_TOTAL_TOKENS,
+        };
+        let q_width = config.num_q_heads as usize * config.head_dim as usize;
+        let kv_width = config.num_kv_heads as usize * config.head_dim as usize;
+        let token_width = 2 * q_width + 2 * kv_width;
+        let qgkv_values = (0..NUM_TOTAL_TOKENS as usize * token_width)
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let qgkv = Buffer::from_slice(&device, &qgkv_values);
+        let q = Buffer::new_zeroed_elements(&device, config.num_q_slots(shape), Dtype::Float32);
+        let g = Buffer::new_zeroed_elements(&device, config.num_q_slots(shape), Dtype::Float32);
+        let k = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
+        let v = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
+        let compute = Compute::new(&device, config);
+        let mut cache = ReplayTestCache::new();
+        let (_, cache_hit) = cache.record(shape.num_total_tokens, || {
+            let mut builder = stream.create_replay_program();
+            builder.record(compute.invoke(
+                shape,
+                Buffers {
+                    qgkv: &qgkv,
+                    q: &q,
+                    g: &g,
+                    k: &k,
+                    v: &v,
+                },
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ));
+            builder.build()
+        });
+        assert!(!cache_hit);
+
+        for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            let (replay, cache_hit) = cache.record(shape.num_total_tokens, || unreachable!());
+            assert!(cache_hit);
+            stream
+                .submit_replay_with_arguments(
+                    replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32),
+                )
+                .wait();
+
+            let mut expected_q = Vec::with_capacity(num_active_tokens * q_width);
+            let mut expected_g = Vec::with_capacity(num_active_tokens * q_width);
+            let mut expected_k = Vec::with_capacity(num_active_tokens * kv_width);
+            let mut expected_v = Vec::with_capacity(num_active_tokens * kv_width);
+            for token_index in 0..num_active_tokens {
+                let row = &qgkv_values[token_index * token_width..(token_index + 1) * token_width];
+                for head_index in 0..config.num_q_heads as usize {
+                    let pair_begin = head_index * 2 * config.head_dim as usize;
+                    let pair_middle = pair_begin + config.head_dim as usize;
+                    let pair_end = pair_middle + config.head_dim as usize;
+                    expected_q.extend_from_slice(&row[pair_begin..pair_middle]);
+                    expected_g.extend_from_slice(&row[pair_middle..pair_end]);
+                }
+                let kv_begin = 2 * q_width;
+                expected_k.extend_from_slice(&row[kv_begin..kv_begin + kv_width]);
+                expected_v.extend_from_slice(&row[kv_begin + kv_width..]);
             }
-        );
+            assert_eq!(q.read_typed::<f32>(0, expected_q.len()), expected_q);
+            assert_eq!(g.read_typed::<f32>(0, expected_g.len()), expected_g);
+            assert_eq!(k.read_typed::<f32>(0, expected_k.len()), expected_k);
+            assert_eq!(v.read_typed::<f32>(0, expected_v.len()), expected_v);
+        }
     }
 
     #[test]

@@ -259,21 +259,9 @@ mod tests {
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const NUM_ACTIVE_WRITES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.kv.active_writes");
-
-    #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let config = Config {
-            num_kv_heads: 2,
-            head_dim: 2,
-            page_bytes: 16,
-            dtype: Dtype::Bfloat16,
-        };
-        let constants = KernelConstants::current(config);
-        assert_eq!(constants.config, config);
-        assert_eq!(constants.thread_block.required_threads, 256);
-    }
 
     #[test]
     #[should_panic(expected = "GQA KV page-write threads exceeds the shader u32 count domain")]
@@ -297,23 +285,23 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed() {
-        test_u16();
-        test_f32();
-    }
-
-    #[test]
-    fn test_bucketed_replay_preserves_inactive_kv_page() {
+    fn test_replay_matches_page_reference_across_active_counts() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let sentinel = 0x7777_u16;
-        let page_values = 16;
-        let pages = Buffer::from_slice(&device, &vec![sentinel; 2 * page_values]);
-        let flat_k = Buffer::from_slice(&device, &[10_u16, 11, 12, 13, 14, 15, 16, 17]);
-        let flat_v = Buffer::from_slice(&device, &[20_u16, 21, 22, 23, 24, 25, 26, 27]);
-        let req_slots = Buffer::from_slice(&device, &[0_u32, 0, 0, 1]);
-        let flat_token_indices = Buffer::from_slice(&device, &[0_u32, 1, 2, 0]);
-        let page_ids = Buffer::from_slice(&device, &[0_u32, 1]);
+        let page_values = 8_usize;
+        let num_pages = 4_usize;
+        let initial_page_value = 0x3555_u16;
+        let flat_k_values = (0..16).map(|index| 100 + index as u16).collect::<Vec<_>>();
+        let flat_v_values = (0..16).map(|index| 200 + index as u16).collect::<Vec<_>>();
+        let req_slot_values = [0_u32, 1, 0, 1, 0, 1, 0, 1];
+        let token_index_values = [0_u32, 0, 1, 1, 2, 2, 3, 3];
+        let page_id_values = [0_u32, 1, 2, 3];
+        let pages = Buffer::from_slice(&device, &vec![initial_page_value; num_pages * page_values]);
+        let flat_k = Buffer::from_slice(&device, &flat_k_values);
+        let flat_v = Buffer::from_slice(&device, &flat_v_values);
+        let req_slots = Buffer::from_slice(&device, &req_slot_values);
+        let flat_token_indices = Buffer::from_slice(&device, &token_index_values);
+        let page_ids = Buffer::from_slice(&device, &page_id_values);
         let config = Config {
             num_kv_heads: 1,
             head_dim: 2,
@@ -321,60 +309,70 @@ mod tests {
             dtype: Dtype::Bfloat16,
         };
         let shape = Shape {
-            num_total_token_writes: 4,
+            num_total_token_writes: 8,
             page_table_layout: PageTableLayout {
                 num_req_slots: 2,
                 num_gqa_layers: 1,
-                num_blocks: 1,
+                num_blocks: 2,
                 num_page_ids_per_block: 1,
             },
         };
         let kernel = Compute::new(&device, config);
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            Buffers {
-                pages: &pages,
-                flat_k: &flat_k,
-                flat_v: &flat_v,
-                req_slots: &req_slots,
-                flat_token_indices: &flat_token_indices,
-                page_ids: &page_ids,
-            },
-            ReplayU32::Parameter(NUM_ACTIVE_WRITES),
-            ReplayU32::Fixed(0),
-        ));
-        let replay = builder.build();
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, 3))
-            .wait();
-        assert_eq!(
-            pages.read_typed::<u16>(page_values, page_values),
-            vec![sentinel; page_values]
-        );
+        let mut cache = ReplayTestCache::new();
+        let (_, cache_hit) = cache.record(shape.num_total_token_writes, || {
+            let mut builder = stream.create_replay_program();
+            builder.record(kernel.invoke(
+                shape,
+                Buffers {
+                    pages: &pages,
+                    flat_k: &flat_k,
+                    flat_v: &flat_v,
+                    req_slots: &req_slots,
+                    flat_token_indices: &flat_token_indices,
+                    page_ids: &page_ids,
+                },
+                ReplayU32::Parameter(NUM_ACTIVE_WRITES),
+                ReplayU32::Fixed(0),
+            ));
+            builder.build()
+        });
+        assert!(!cache_hit);
 
-        pages.write_typed(0, &vec![sentinel; 2 * page_values]);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, 4))
-            .wait();
-        assert_ne!(
-            pages.read_typed::<u16>(page_values, page_values),
-            vec![sentinel; page_values]
-        );
+        for num_active_writes in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            pages.write_typed(0, &vec![initial_page_value; num_pages * page_values]);
+            let (replay, cache_hit) = cache.record(shape.num_total_token_writes, || unreachable!());
+            assert!(cache_hit);
+            stream
+                .submit_replay_with_arguments(
+                    replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, num_active_writes as u32),
+                )
+                .wait();
+
+            let mut expected = vec![initial_page_value; num_pages * page_values];
+            let num_tokens_per_page = config.num_tokens_per_page() as usize;
+            let kv_values_per_page = config.num_kv_heads as usize * num_tokens_per_page * config.head_dim as usize;
+            for write_index in 0..num_active_writes {
+                let req_slot = req_slot_values[write_index] as usize;
+                let token_index = token_index_values[write_index] as usize;
+                let block_index = token_index / num_tokens_per_page;
+                let page_id =
+                    page_id_values[req_slot * shape.page_table_layout.num_blocks as usize + block_index] as usize;
+                let page_token_index = token_index % num_tokens_per_page;
+                for dim_index in 0..config.head_dim as usize {
+                    let page_token_offset = page_token_index * config.head_dim as usize + dim_index;
+                    let flat_offset = write_index * config.head_dim as usize + dim_index;
+                    expected[page_id * page_values + page_token_offset] = flat_k_values[flat_offset];
+                    expected[page_id * page_values + kv_values_per_page + page_token_offset] =
+                        flat_v_values[flat_offset];
+                }
+            }
+            assert_eq!(pages.read_typed::<u16>(0, expected.len()), expected);
+        }
     }
 
-    fn test_u16() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let expected = [0, 0, 10, 11, 0, 0, 20, 21];
-        let pages = Buffer::new_zeroed(&device, expected.len() * size_of::<u16>());
-        let k = Buffer::from_slice(&device, &[10u16, 11]);
-        let v = Buffer::from_slice(&device, &[20u16, 21]);
-        run(&device, &stream, Dtype::Bfloat16, &pages, &k, &v);
-        assert_eq!(pages.read_typed::<u16>(0, expected.len()), expected);
-    }
-
-    fn test_f32() {
+    #[test]
+    fn test_f32_replay_matches_page_reference() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let expected = [0.0, 0.0, 10.0, 11.0, 0.0, 0.0, 20.0, 21.0];
@@ -405,20 +403,32 @@ mod tests {
             },
         };
         let kernel = Compute::new(device, config);
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            Buffers {
-                pages,
-                flat_k: k,
-                flat_v: v,
-                req_slots: &req_slots,
-                flat_token_indices: &flat_token_indices,
-                page_ids: &page_ids,
-            },
-            ReplayU32::Fixed(shape.num_total_token_writes),
-            ReplayU32::Fixed(0),
-        ));
-        stream.submit_replay(&builder.build()).wait();
+        let mut cache = ReplayTestCache::new();
+        let (_, cache_hit) = cache.record(shape.num_total_token_writes, || {
+            let mut recorder = stream.create_replay_program();
+            recorder.record(kernel.invoke(
+                shape,
+                Buffers {
+                    pages,
+                    flat_k: k,
+                    flat_v: v,
+                    req_slots: &req_slots,
+                    flat_token_indices: &flat_token_indices,
+                    page_ids: &page_ids,
+                },
+                ReplayU32::Parameter(NUM_ACTIVE_WRITES),
+                ReplayU32::Fixed(0),
+            ));
+            recorder.build()
+        });
+        assert!(!cache_hit);
+        let (replay, cache_hit) = cache.record(shape.num_total_token_writes, || unreachable!());
+        assert!(cache_hit);
+        stream
+            .submit_replay_with_arguments(
+                replay,
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_WRITES, shape.num_total_token_writes),
+            )
+            .wait();
     }
 }

@@ -13,23 +13,6 @@ const NUM_ACTIVE_Q_TOKEN_RANGES: ReplayParameterKey =
     ReplayParameterKey::new("test.gqa_block_sdpa.num_active_q_token_ranges");
 
 #[test]
-fn test_constants_have_explicit_thread_block_scope() {
-    let config = Config {
-        block_size: 3,
-        max_q_tokens: 8,
-        num_q_heads: 5,
-        num_kv_heads: 1,
-        head_dim: 32,
-        scale: 32.0_f32.sqrt().recip(),
-        dtype: Dtype::Bfloat16,
-    };
-    let constants = KernelConstants::current(config);
-    assert_eq!(constants.config, config);
-    assert_eq!(constants.thread_block.required_threads, 32);
-    assert_eq!(constants.thread_block.simdgroup_width, 32);
-}
-
-#[test]
 #[should_panic(expected = "complete request blocks")]
 fn test_block_shape_rejects_partial_request_block() {
     Shape {

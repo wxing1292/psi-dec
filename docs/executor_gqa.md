@@ -22,6 +22,7 @@ crates/inference-executor-metal/src/attn/
     sdpa.rs                 executor-owned candidate construction and execution selection
     batch_metadata.rs       capacity-sized GPU upload target for one SDPA selection
     backend.rs              gated QGKV Metal replay wiring
+    backend_full_test.rs    gated GQA owner replay and CPU parity
     scratch.rs              gated QGKV scratch allocation and borrowed replay bindings
     ungated_backend.rs      ungated QKV Metal replay wiring
     ungated_scratch.rs      ungated QKV scratch allocation and borrowed replay bindings
@@ -1008,17 +1009,16 @@ Explicit component barriers and backend-inferred buffer hazards provide the requ
 Focused backend and component tests provide part of the correctness coverage. Qwen wiring and model tests provide the
 remaining coverage.
 
-`gqa/split_kv/single_q_test.rs` compares SplitKV SingleQ with the CPU projected-GQA reference. It uses fixed input,
-random input, and a
-random ragged batch.
-
-Another case uses one KV split that spans multiple KV iterations. The cases validate compact KV-split indexing,
+`gqa/split_kv/single_q_test.rs` compares SplitKV SingleQ with the CPU projected-GQA reference. Its main replay test uses
+one isolated cache and the complete active-count sequence for capacity `8`. Focused cases cover a ragged batch and a
+logical cache block that spans multiple physical page IDs. The cases validate compact KV-split indexing,
 online-softmax iteration merging, request slots, page-table lookup, and causal visibility.
 
 `gqa/split_kv/tiled_q_test.rs` compares the BF16 SplitKV TiledQ map and reduce variant with the same CPU reference. One
-bucketed replay executes `5 -> 8 -> 5` active tokens. The test refreshes the explicit visible ranges for each submission.
-It poisons inactive query, KV, and request-slot inputs. It checks the active output and verifies that inactive
-partial-output, statistic, and final-output tails remain unchanged.
+isolated test cache records a total capacity of `8`. The test replays `1, 8, 3, 7, 2, 6, 4, 5`. It refreshes the
+explicit visible ranges for each submission and compares the active output with the CPU projected-GQA reference.
+`gqa/split_kv/single_q_test.rs` uses the same active-count sequence and CPU-reference contract. Both tests ignore
+inactive scratch and output tails.
 
 `gqa/block_sdpa_test.rs` records one total Q-token-range capacity of `8` and replays
 `1, 8, 3, 7, 2, 6, 4, 5` active ranges. It compares each active partial state and output with a CPU softmax reference.
@@ -1026,6 +1026,16 @@ This test protects the block-Spec total-dispatch and active-guard contract.
 
 `gqa/qkv_split.rs` records one total token capacity of `8` and uses the same non-monotonic active-count sequence.
 It compares Q, K, and V active rows with the exact CPU row-split reference.
+
+`gqa/qgkv_split.rs` and `gqa/activation_gate.rs` use the same isolated-cache sequence. They compare the active Q/G/K/V
+rows and gated attention values with exact CPU references. `gqa/kv_page_write.rs` compares the complete affected page
+arena with a CPU page-table and page-offset reference because page writes update persistent state. A separate
+identity-capacity replay protects the F32 page-copy path.
+
+`attn/gqa/backend_full_test.rs` records the real gated `GQA` owner. It replays the non-monotonic active-token sequence
+through the production multi-domain cache keys. It compares the active output and the persistent KV page with an
+independent CPU reconstruction of QGKV affine, split, RMSNorm/RoPE, causal GQA, activation gate, and output affine.
+The test ignores stateless scratch and output tails.
 
 Metal backend component replay sanity lives in:
 

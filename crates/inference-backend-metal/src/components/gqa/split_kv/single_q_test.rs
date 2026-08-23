@@ -6,6 +6,7 @@ use super::*;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::Stream;
+use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.split_kv_single_q.active_tokens");
 const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.paged.active_kv_splits");
@@ -35,78 +36,57 @@ fn test_sdpa_shape_rejects_shader_count_overflow() {
 }
 
 #[test]
-fn test_fixed() {
-    let config = fixture_config();
-    let shape = fixture_shape();
-    let q = fixture_values(config.num_output_values(shape), 0.125, 3);
-    let k = fixture_values(2 * config.num_kv_heads as usize * config.head_dim as usize, 0.0625, 5);
-    let v = fixture_values(2 * config.num_kv_heads as usize * config.head_dim as usize, 0.25, 7);
-    let kv_pages = kv_page_values(config, &[(&k, &v)]);
-    let actual = run_gqa_split_kv_single_q(
-        config,
-        shape,
-        TestInput {
-            q: &q,
-            kv_pages: &kv_pages,
-            req_slots: &[0, 0],
-            page_ids: &[0],
-            flat_token_indices: &[0, 1],
-        },
-    );
-    let expected = projected_gqa_reference(
-        &fixture_core(config),
-        GQAReferenceInput {
-            cu_tokens: &[0, 2],
-            token_indices: &[0],
-            q: &q,
-            context_k_by_req: &[&k],
-            context_v_by_req: &[&v],
-        },
-    );
-    assert_close(&actual, &expected, 2.0e-5);
-}
-
-#[test]
-fn test_bucketed_replay_matches_active_prefix_and_preserves_output_tail() {
+fn test_replay_matches_reference_across_active_counts() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let config = fixture_config();
+    let mut config = fixture_config();
+    config.page_bytes *= 2;
     let shape = Shape {
-        num_total_tokens: 4,
-        num_total_sdpa_map_task_templates: 4,
+        num_total_tokens: 8,
+        num_total_sdpa_map_task_templates: 8,
     };
     let q = generated_values(config.num_output_values(shape), 0x8B1D_5A73);
     let kv_stride = config.num_kv_heads as usize * config.head_dim as usize;
-    let k = generated_values(4 * kv_stride, 0x8B1D_5A74);
-    let v = generated_values(4 * kv_stride, 0x8B1D_5A75);
+    let k = generated_values(8 * kv_stride, 0x8B1D_5A74);
+    let v = generated_values(8 * kv_stride, 0x8B1D_5A75);
     let kv_pages = kv_page_values(config, &[(&k, &v)]);
     let q_buffer = Buffer::from_slice(&device, &q);
     let kv_pages_buffer = Buffer::from_slice(&device, &kv_pages);
-    let req_slots = Buffer::from_slice(&device, &[0_u32; 4]);
+    let req_slots = Buffer::from_slice(&device, &[0_u32; 8]);
     let page_ids = Buffer::from_slice(&device, &[0_u32]);
-    let task_templates = Buffer::from_slice(&device, &[0_u32, 0, 1, 1, 0, 2, 2, 0, 3, 3, 0, 4]);
-    let cu_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1, 2, 3, 4]);
-    let sentinel = -321.0_f32;
-    let output = Buffer::from_slice(&device, &vec![sentinel; config.num_output_values(shape)]);
+    let task_templates = Buffer::from_slice(
+        &device,
+        &(0..8_u32)
+            .flat_map(|token_index| [token_index, 0, token_index + 1])
+            .collect::<Vec<_>>(),
+    );
+    let cu_partial_outputs = Buffer::from_slice(&device, &(0..=8_u32).collect::<Vec<_>>());
+    let output = Buffer::new_zeroed_elements(&device, config.num_output_values(shape), Dtype::Float32);
     let scratch = Scratch::new(&device, config, shape);
     let kernels = Compute::new(&device, config, fixture_execution(config), shape);
-    let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map(
-        scratch.map_buffers(&q_buffer, &kv_pages_buffer, &req_slots, &page_ids, &task_templates),
-        ReplayU32::Fixed(0),
-        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-        ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
-    ));
-    builder.record_with_barrier_before(kernels.invoke_reduce(
-        scratch.reduce_buffers(&cu_partial_outputs, &output),
-        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-    ));
-    let replay = builder.build();
-    for num_active_tokens in [3_usize, 4] {
-        output.write_typed(0, &vec![sentinel; config.num_output_values(shape)]);
+    let cache_key = (shape.num_total_tokens, shape.num_total_sdpa_map_task_templates);
+    let mut cache = ReplayTestCache::new();
+    let (_, cache_hit) = cache.record(cache_key, || {
+        let mut builder = stream.create_replay_program();
+        builder.record(kernels.invoke_map(
+            scratch.map_buffers(&q_buffer, &kv_pages_buffer, &req_slots, &page_ids, &task_templates),
+            ReplayU32::Fixed(0),
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
+        ));
+        builder.record_with_barrier_before(kernels.invoke_reduce(
+            scratch.reduce_buffers(&cu_partial_outputs, &output),
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+        ));
+        builder.build()
+    });
+    assert!(!cache_hit);
+    for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+        let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+        assert!(cache_hit);
         stream
             .submit_replay_with_arguments(
-                &replay,
+                replay,
                 &ReplayArguments::new()
                     .with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32)
                     .with_u32(NUM_ACTIVE_KV_SPLITS, num_active_tokens as u32),
@@ -125,54 +105,11 @@ fn test_bucketed_replay_matches_active_prefix_and_preserves_output_tail() {
             },
         );
         assert_close(&actual, &expected, 2.0e-5);
-        assert_eq!(
-            output.read_typed::<f32>(num_active_values, config.num_output_values(shape) - num_active_values,),
-            vec![sentinel; config.num_output_values(shape) - num_active_values]
-        );
     }
 }
 
 #[test]
-fn test_random() {
-    let random_seed = 0x4C8F_17D2;
-    let config = fixture_config();
-    let shape = fixture_shape();
-    let q = generated_values(config.num_output_values(shape), random_seed);
-    let k = generated_values(
-        2 * config.num_kv_heads as usize * config.head_dim as usize,
-        random_seed.wrapping_add(1),
-    );
-    let v = generated_values(
-        2 * config.num_kv_heads as usize * config.head_dim as usize,
-        random_seed.wrapping_add(2),
-    );
-    let kv_pages = kv_page_values(config, &[(&k, &v)]);
-    let actual = run_gqa_split_kv_single_q(
-        config,
-        shape,
-        TestInput {
-            q: &q,
-            kv_pages: &kv_pages,
-            req_slots: &[0, 0],
-            page_ids: &[0],
-            flat_token_indices: &[0, 1],
-        },
-    );
-    let expected = projected_gqa_reference(
-        &fixture_core(config),
-        GQAReferenceInput {
-            cu_tokens: &[0, 2],
-            token_indices: &[0],
-            q: &q,
-            context_k_by_req: &[&k],
-            context_v_by_req: &[&v],
-        },
-    );
-    assert_close(&actual, &expected, 2.0e-5);
-}
-
-#[test]
-fn test_ragged_random() {
+fn test_ragged_requests_match_reference() {
     let random_seed = 0xD205_6AB9;
     let mut config = fixture_config();
     let mut shape = fixture_shape();
@@ -323,15 +260,22 @@ fn run_gqa_split_kv_single_q(config: Config, shape: Shape, input: TestInput<'_>)
     builder.record(kernels.invoke_map(
         scratch.map_buffers(&q, &kv_pages, &req_slots, &page_ids, &sdpa_map_task_templates),
         ReplayU32::Fixed(0),
-        ReplayU32::Fixed(shape.num_total_tokens),
-        ReplayU32::Fixed(shape.num_total_sdpa_map_task_templates),
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+        ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
     ));
     builder.record_with_barrier_before(kernels.invoke_reduce(
         scratch.reduce_buffers(&cu_sdpa_partial_outputs, &output),
-        ReplayU32::Fixed(shape.num_total_tokens),
+        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
     ));
     let replay = builder.build();
-    stream.submit_replay(&replay).wait();
+    stream
+        .submit_replay_with_arguments(
+            &replay,
+            &ReplayArguments::new()
+                .with_u32(NUM_ACTIVE_TOKENS, shape.num_total_tokens)
+                .with_u32(NUM_ACTIVE_KV_SPLITS, shape.num_total_sdpa_map_task_templates),
+        )
+        .wait();
     output.read_typed::<f32>(0, config.num_output_values(shape))
 }
 

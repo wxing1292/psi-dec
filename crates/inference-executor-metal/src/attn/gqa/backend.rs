@@ -662,21 +662,16 @@ fn affine_config(n: usize, k: usize, config: GQAMetalConfig) -> affine_quantized
 }
 
 #[cfg(test)]
+#[path = "backend_full_test.rs"]
+mod full_tests;
+
+#[cfg(test)]
 mod tests {
-    use half::bf16;
     use inference_backend_metal::components::rms_norm_rope::RopeScaling;
-    use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Dtype;
-    use inference_backend_metal::metal::ReplayArguments;
-    use inference_backend_metal::metal::ReplayU32;
-    use inference_backend_metal::metal::Stream;
     use inference_executor_core::attn::GQACore;
 
-    use super::GQA_NUM_ACTIVE_TOKENS;
     use super::GQAMetalConfig;
-    use super::backend_activation_gate;
-    use super::backend_qgkv_split;
-    use super::rms_norm_rope;
 
     #[test]
     #[should_panic(expected = "GQA Q-head count must fit u32")]
@@ -694,166 +689,5 @@ mod tests {
             io_dtype: Dtype::Bfloat16,
         }
         .num_tokens_per_page(&core);
-    }
-
-    #[test]
-    fn test_bucketed_scratch_leaves_shrink_expand_and_guard_poisoned_tail() {
-        let device = inference_backend_metal::metal::Device::system_default();
-        let stream = Stream::new(&device);
-        let split_config = backend_qgkv_split::Config::f32(1, 1, 2);
-        let split_shape = backend_qgkv_split::Shape { num_total_tokens: 2 };
-        let norm_config = rms_norm_rope::Config::f32(1, 2, 2, 1.0e-6, 1_000_000.0);
-        let norm_shape = rms_norm_rope::Shape { num_total_tokens: 2 };
-        let gate_config = backend_activation_gate::Config::f32(1, 2);
-        let gate_shape = backend_activation_gate::Shape { num_total_tokens: 2 };
-        let split = backend_qgkv_split::Compute::new(&device, split_config);
-        let q_norm = rms_norm_rope::Compute::new(&device, norm_config);
-        let k_norm = rms_norm_rope::Compute::new(&device, norm_config);
-        let gate = backend_activation_gate::Compute::new(&device, gate_config);
-        let input = Buffer::new_zeroed_elements(&device, split_config.num_qgkv_slots(split_shape), Dtype::Float32);
-        let q = Buffer::new_zeroed_elements(&device, split_config.num_q_slots(split_shape), Dtype::Float32);
-        let g = Buffer::new_zeroed_elements(&device, split_config.num_q_slots(split_shape), Dtype::Float32);
-        let k = Buffer::new_zeroed_elements(&device, split_config.num_kv_slots(split_shape), Dtype::Float32);
-        let v = Buffer::new_zeroed_elements(&device, split_config.num_kv_slots(split_shape), Dtype::Float32);
-        let norm_weight = Buffer::from_slice(&device, &[bf16::from_f32(1.0).to_bits(), bf16::from_f32(1.0).to_bits()]);
-        let flat_token_indices = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
-        let q_norm_output = Buffer::new_zeroed_elements(&device, norm_config.num_slots(norm_shape), Dtype::Float32);
-        let k_norm_output = Buffer::new_zeroed_elements(&device, norm_config.num_slots(norm_shape), Dtype::Float32);
-        let gated = Buffer::new_zeroed_elements(&device, gate_config.num_values(gate_shape), Dtype::Float32);
-        let mut builder = stream.create_replay_program();
-        builder.record(split.invoke(
-            split_shape,
-            backend_qgkv_split::Buffers {
-                qgkv: &input,
-                q: &q,
-                g: &g,
-                k: &k,
-                v: &v,
-            },
-            ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
-        ));
-        builder.record_with_barrier_before(q_norm.invoke(
-            norm_shape,
-            rms_norm_rope::Buffers {
-                input: &q,
-                norm_weight: &norm_weight,
-                flat_token_indices: &flat_token_indices,
-                output: &q_norm_output,
-            },
-            ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
-        ));
-        builder.record_with_barrier_before(k_norm.invoke(
-            norm_shape,
-            rms_norm_rope::Buffers {
-                input: &k,
-                norm_weight: &norm_weight,
-                flat_token_indices: &flat_token_indices,
-                output: &k_norm_output,
-            },
-            ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
-        ));
-        builder.record_with_barrier_before(gate.invoke(
-            gate_shape,
-            backend_activation_gate::Buffers {
-                attention_output: &q_norm_output,
-                g: &g,
-                output: &gated,
-            },
-            ReplayU32::Parameter(GQA_NUM_ACTIVE_TOKENS),
-        ));
-        let replay = builder.build();
-        let valid_rows = [
-            [1.0_f32, 2.0, 0.5, -0.5, 3.0, 4.0, 5.0, 6.0],
-            [2.0_f32, 1.0, -1.0, 1.0, 4.0, 3.0, 6.0, 5.0],
-        ];
-        for num_active_tokens in [1_usize, 2, 1] {
-            let mut input_values = valid_rows.into_iter().flatten().collect::<Vec<_>>();
-            let mut token_indices = vec![0_u32, 1];
-            if num_active_tokens == 1 {
-                input_values[8..].fill(f32::NAN);
-                token_indices[1] = u32::MAX;
-            }
-            input.write_typed(0, &input_values);
-            flat_token_indices.write_typed(0, &token_indices);
-            for buffer in [&q, &g, &k, &v, &q_norm_output, &k_norm_output, &gated] {
-                buffer.write_typed(0, &[-777.0_f32; 4]);
-            }
-            stream
-                .submit_replay_with_arguments(
-                    &replay,
-                    &ReplayArguments::new().with_u32(GQA_NUM_ACTIVE_TOKENS, num_active_tokens as u32),
-                )
-                .wait();
-
-            let expected_q = valid_rows[..num_active_tokens]
-                .iter()
-                .flat_map(|row| [row[0], row[1]])
-                .collect::<Vec<_>>();
-            let expected_g = valid_rows[..num_active_tokens]
-                .iter()
-                .flat_map(|row| [row[2], row[3]])
-                .collect::<Vec<_>>();
-            let expected_k = valid_rows[..num_active_tokens]
-                .iter()
-                .flat_map(|row| [row[4], row[5]])
-                .collect::<Vec<_>>();
-            let expected_v = valid_rows[..num_active_tokens]
-                .iter()
-                .flat_map(|row| [row[6], row[7]])
-                .collect::<Vec<_>>();
-            let expected_q_norm = expected_q
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .enumerate()
-                .flat_map(|(token_index, row)| norm_rope_2(row, token_index as f32))
-                .collect::<Vec<_>>();
-            let expected_k_norm = expected_k
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .enumerate()
-                .flat_map(|(token_index, row)| norm_rope_2(row, token_index as f32))
-                .collect::<Vec<_>>();
-            let expected_gated = expected_q_norm
-                .iter()
-                .zip(&expected_g)
-                .map(|(&value, &gate)| value / (1.0 + (-gate).exp()))
-                .collect::<Vec<_>>();
-            let num_active_values = num_active_tokens * 2;
-            for (buffer, expected) in [
-                (&q, &expected_q),
-                (&g, &expected_g),
-                (&k, &expected_k),
-                (&v, &expected_v),
-                (&q_norm_output, &expected_q_norm),
-                (&k_norm_output, &expected_k_norm),
-                (&gated, &expected_gated),
-            ] {
-                assert_close(&buffer.read_typed::<f32>(0, num_active_values), expected, 2.0e-5);
-                assert_eq!(
-                    buffer.read_typed::<f32>(num_active_values, 4 - num_active_values),
-                    vec![-777.0; 4 - num_active_values]
-                );
-            }
-        }
-    }
-
-    fn norm_rope_2(row: &[f32], position: f32) -> [f32; 2] {
-        let inv_rms = ((row[0] * row[0] + row[1] * row[1]) / 2.0 + 1.0e-6).sqrt().recip();
-        let x0 = row[0] * inv_rms;
-        let x1 = row[1] * inv_rms;
-        let (sin, cos) = position.sin_cos();
-        [x0 * cos - x1 * sin, x0 * sin + x1 * cos]
-    }
-
-    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
-        assert_eq!(actual.len(), expected.len());
-        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-            assert!(
-                (actual - expected).abs() <= tolerance,
-                "index {index}: actual={actual} expected={expected} tolerance={tolerance}"
-            );
-        }
     }
 }

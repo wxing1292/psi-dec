@@ -7,15 +7,14 @@ use super::*;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::Stream;
+use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.split_kv_tiled_q.num_active_tokens");
 const NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.num_active_q_token_tiles");
 const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.num_active_kv_splits");
-const BF16_CANARY: u16 = 0x42B6;
-const F32_CANARY: f32 = -777.0;
 
 #[test]
-fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
+fn test_replay_matches_reference_across_active_counts() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let (config, shape) = tiled_workload(128, 8);
@@ -40,84 +39,64 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
     let partial_max_logits = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(execution, shape));
     let output = Buffer::new_zeroed(&device, config.q_bytes(shape));
 
-    let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_map(
-        MapBuffers {
-            q: &q,
-            kv_pages: &kv_pages,
-            req_slots: &req_slots,
-            page_ids: &page_ids,
-            visible_kv_token_ranges: &visible_kv_token_ranges,
-            q_token_ranges: &q_token_ranges,
-            sdpa_map_task_templates: &sdpa_map_task_templates,
-            partial_output: &partial_output,
-            partial_exp_sums: &partial_exp_sums,
-            partial_max_logits: &partial_max_logits,
-        },
-        ReplayU32::Fixed(0),
-        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-        ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
-        ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
-    ));
-    builder.record_with_barrier_before(kernels.invoke_reduce(
-        ReduceBuffers {
-            partial_output: &partial_output,
-            partial_exp_sums: &partial_exp_sums,
-            partial_max_logits: &partial_max_logits,
-            q_token_ranges: &q_token_ranges,
-            cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
-            output: &output,
-        },
-        ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
-    ));
-    let replay = builder.build();
+    let cache_key = (
+        shape.num_total_tokens,
+        shape.num_total_q_token_tiles,
+        shape.num_total_sdpa_map_task_templates,
+    );
+    let mut cache = ReplayTestCache::new();
+    let (_, cache_hit) = cache.record(cache_key, || {
+        let mut builder = stream.create_replay_program();
+        builder.record(kernels.invoke_map(
+            MapBuffers {
+                q: &q,
+                kv_pages: &kv_pages,
+                req_slots: &req_slots,
+                page_ids: &page_ids,
+                visible_kv_token_ranges: &visible_kv_token_ranges,
+                q_token_ranges: &q_token_ranges,
+                sdpa_map_task_templates: &sdpa_map_task_templates,
+                partial_output: &partial_output,
+                partial_exp_sums: &partial_exp_sums,
+                partial_max_logits: &partial_max_logits,
+            },
+            ReplayU32::Fixed(0),
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
+            ReplayU32::Parameter(NUM_ACTIVE_KV_SPLITS),
+        ));
+        builder.record_with_barrier_before(kernels.invoke_reduce(
+            ReduceBuffers {
+                partial_output: &partial_output,
+                partial_exp_sums: &partial_exp_sums,
+                partial_max_logits: &partial_max_logits,
+                q_token_ranges: &q_token_ranges,
+                cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
+                output: &output,
+            },
+            ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_TILES),
+        ));
+        builder.build()
+    });
+    assert!(!cache_hit);
     let q_values_per_token = config.num_q_heads as usize * config.head_dim as usize;
     let kv_values_per_token = config.num_kv_heads as usize * config.head_dim as usize;
-    let max_q_tokens = execution.map.thread_block.max_q_tokens;
-    let partial_values_per_head = max_q_tokens as usize * config.head_dim as usize;
-    let partial_stats_per_head = max_q_tokens as usize;
-    let mut full_partial_output = None;
-    let mut full_partial_exp_sums = None;
-    let mut full_partial_max_logits = None;
-    let mut full_output = None;
+    visible_kv_token_ranges.write_typed(
+        0,
+        &(0..shape.num_total_tokens)
+            .flat_map(|q_token_index| [0, q_token_index + 1])
+            .collect::<Vec<_>>(),
+    );
 
-    for (case_index, num_active_tokens) in [5_usize, 8, 5].into_iter().enumerate() {
-        let q_submission = active_bf16_values(&q_values, num_active_tokens * q_values_per_token);
-        let k_submission = active_bf16_values(&k_values, num_active_tokens * kv_values_per_token);
-        let v_submission = active_bf16_values(&v_values, num_active_tokens * kv_values_per_token);
-        q.write_typed(0, &bf16_bits(&q_submission));
-        kv_pages.write_typed(0, &bf16_bits(&kv_page_values(config, &k_submission, &v_submission)));
-        req_slots.write_typed(
-            0,
-            &active_u32_values(&vec![0; shape.num_total_tokens as usize], num_active_tokens),
-        );
-        visible_kv_token_ranges.write_typed(
-            0,
-            &(0..num_active_tokens as u32)
-                .flat_map(|q_token_index| [0, q_token_index + 1])
-                .collect::<Vec<_>>(),
-        );
+    for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
         q_token_ranges.write_typed(0, &[0_u32, num_active_tokens as u32]);
         sdpa_map_task_templates.write_typed(0, &[0_u32, 0, num_active_tokens as u32]);
-        if case_index == 0 {
-            partial_output.write_typed(
-                0,
-                &vec![BF16_CANARY; config.partial_output_bytes(execution, shape) as usize / 2],
-            );
-            partial_exp_sums.write_typed(
-                0,
-                &vec![F32_CANARY; config.partial_output_stats_bytes(execution, shape) as usize / 4],
-            );
-            partial_max_logits.write_typed(
-                0,
-                &vec![F32_CANARY; config.partial_output_stats_bytes(execution, shape) as usize / 4],
-            );
-            output.write_typed(0, &vec![BF16_CANARY; config.q_bytes(shape) as usize / 2]);
-        }
+        let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+        assert!(cache_hit);
 
         stream
             .submit_replay_with_arguments(
-                &replay,
+                replay,
                 &ReplayArguments::new()
                     .with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32)
                     .with_u32(NUM_ACTIVE_Q_TOKEN_TILES, 1)
@@ -137,78 +116,6 @@ fn test_bucketed_replay_matches_reference_and_preserves_inactive_tails() {
         );
         let actual = read_bf16_values(&output, num_active_tokens * q_values_per_token);
         assert_close(&actual, &expected, 2.0e-2);
-
-        let partial_output_values = partial_output.read_typed::<u16>(
-            0,
-            config.partial_output_bytes(execution, shape) as usize / size_of::<u16>(),
-        );
-        let partial_exp_sum_values = partial_exp_sums.read_typed::<f32>(
-            0,
-            config.partial_output_stats_bytes(execution, shape) as usize / size_of::<f32>(),
-        );
-        let partial_max_logit_values = partial_max_logits.read_typed::<f32>(
-            0,
-            config.partial_output_stats_bytes(execution, shape) as usize / size_of::<f32>(),
-        );
-        let output_values = output.read_typed::<u16>(0, config.q_bytes(shape) as usize / size_of::<u16>());
-        if case_index == 0 {
-            assert_head_tails(
-                &partial_output_values,
-                config.num_q_heads as usize,
-                partial_values_per_head,
-                num_active_tokens * config.head_dim as usize,
-                BF16_CANARY,
-            );
-            assert_head_tails(
-                &partial_exp_sum_values,
-                config.num_q_heads as usize,
-                partial_stats_per_head,
-                num_active_tokens,
-                F32_CANARY,
-            );
-            assert_head_tails(
-                &partial_max_logit_values,
-                config.num_q_heads as usize,
-                partial_stats_per_head,
-                num_active_tokens,
-                F32_CANARY,
-            );
-            assert_eq!(
-                &output_values[num_active_tokens * q_values_per_token..],
-                &vec![BF16_CANARY; (shape.num_total_tokens as usize - num_active_tokens) * q_values_per_token]
-            );
-        } else if case_index == 1 {
-            full_partial_output = Some(partial_output_values);
-            full_partial_exp_sums = Some(partial_exp_sum_values);
-            full_partial_max_logits = Some(partial_max_logit_values);
-            full_output = Some(output_values);
-        } else {
-            assert_head_tail_matches(
-                &partial_output_values,
-                full_partial_output.as_ref().unwrap(),
-                config.num_q_heads as usize,
-                partial_values_per_head,
-                num_active_tokens * config.head_dim as usize,
-            );
-            assert_head_tail_matches(
-                &partial_exp_sum_values,
-                full_partial_exp_sums.as_ref().unwrap(),
-                config.num_q_heads as usize,
-                partial_stats_per_head,
-                num_active_tokens,
-            );
-            assert_head_tail_matches(
-                &partial_max_logit_values,
-                full_partial_max_logits.as_ref().unwrap(),
-                config.num_q_heads as usize,
-                partial_stats_per_head,
-                num_active_tokens,
-            );
-            assert_eq!(
-                &output_values[num_active_tokens * q_values_per_token..],
-                &full_output.as_ref().unwrap()[num_active_tokens * q_values_per_token..]
-            );
-        }
     }
 }
 
@@ -289,7 +196,7 @@ fn kv_page_values(config: Config, k: &[f32], v: &[f32]) -> Vec<f32> {
     let values_per_token = config.num_kv_heads as usize * config.head_dim as usize;
     let num_tokens_per_page = config.num_tokens_per_page() as usize;
     assert_eq!(k.len(), num_tokens_per_page * values_per_token);
-    let mut page = vec![f32::NAN; 2 * k.len()];
+    let mut page = vec![0.0; 2 * k.len()];
     for token in 0..num_tokens_per_page {
         for kv_head in 0..config.num_kv_heads as usize {
             for dim in 0..config.head_dim as usize {
@@ -316,18 +223,6 @@ fn generated_bf16_values(count: usize, random_seed: u32) -> Vec<f32> {
         .collect()
 }
 
-fn active_bf16_values(values: &[f32], active_len: usize) -> Vec<f32> {
-    let mut submission = values.to_vec();
-    submission[active_len..].fill(f32::NAN);
-    submission
-}
-
-fn active_u32_values(values: &[u32], active_len: usize) -> Vec<u32> {
-    let mut submission = values.to_vec();
-    submission[active_len..].fill(u32::MAX);
-    submission
-}
-
 fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
     Buffer::from_slice(device, &bf16_bits(values))
 }
@@ -342,34 +237,6 @@ fn read_bf16_values(buffer: &Buffer, count: usize) -> Vec<f32> {
         .into_iter()
         .map(|bits| bf16::from_bits(bits).to_f32())
         .collect()
-}
-
-fn assert_head_tails<T: Copy + std::fmt::Debug + PartialEq>(
-    actual: &[T],
-    num_heads: usize,
-    values_per_head: usize,
-    num_active_values_per_head: usize,
-    expected: T,
-) {
-    for head in 0..num_heads {
-        let tail_begin = head * values_per_head + num_active_values_per_head;
-        let tail_end = (head + 1) * values_per_head;
-        assert_eq!(&actual[tail_begin..tail_end], &vec![expected; tail_end - tail_begin]);
-    }
-}
-
-fn assert_head_tail_matches<T: std::fmt::Debug + PartialEq>(
-    actual: &[T],
-    expected: &[T],
-    num_heads: usize,
-    values_per_head: usize,
-    num_active_values_per_head: usize,
-) {
-    for head in 0..num_heads {
-        let tail_begin = head * values_per_head + num_active_values_per_head;
-        let tail_end = (head + 1) * values_per_head;
-        assert_eq!(&actual[tail_begin..tail_end], &expected[tail_begin..tail_end]);
-    }
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

@@ -192,21 +192,78 @@ fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32
 
 #[cfg(test)]
 mod tests {
+    use super::Buffers;
+    use super::Compute;
     use super::Config;
-    use super::KernelConstants;
     use super::Shape;
-    use super::ThreadBlockConstants;
+    use crate::metal::Buffer;
+    use crate::metal::Device;
+    use crate::metal::Dtype;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
+    use crate::metal::ReplayU32;
+    use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
+
+    const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa_activation_gate.num_active_tokens");
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let config = Config::bf16(2, 128);
-        assert_eq!(
-            KernelConstants::current(config),
-            KernelConstants {
-                config,
-                thread_block: ThreadBlockConstants { required_threads: 256 },
+    fn test_replay_matches_reference_across_active_counts() {
+        const NUM_TOTAL_TOKENS: u32 = 8;
+
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = Config::f32(2, 2);
+        let shape = Shape {
+            num_total_tokens: NUM_TOTAL_TOKENS,
+        };
+        let values_per_token = config.num_q_heads as usize * config.head_dim as usize;
+        let attention_values = (0..NUM_TOTAL_TOKENS as usize * values_per_token)
+            .map(|index| index as f32 * 0.03125 - 0.5)
+            .collect::<Vec<_>>();
+        let gate_values = (0..NUM_TOTAL_TOKENS as usize * values_per_token)
+            .map(|index| index as f32 * -0.0625 + 0.75)
+            .collect::<Vec<_>>();
+        let attention = Buffer::from_slice(&device, &attention_values);
+        let gates = Buffer::from_slice(&device, &gate_values);
+        let output = Buffer::new_zeroed_elements(&device, config.num_values(shape), Dtype::Float32);
+        let compute = Compute::new(&device, config);
+        let mut cache = ReplayTestCache::new();
+        let (_, cache_hit) = cache.record(shape.num_total_tokens, || {
+            let mut builder = stream.create_replay_program();
+            builder.record(compute.invoke(
+                shape,
+                Buffers {
+                    attention_output: &attention,
+                    g: &gates,
+                    output: &output,
+                },
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ));
+            builder.build()
+        });
+        assert!(!cache_hit);
+
+        for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            let (replay, cache_hit) = cache.record(shape.num_total_tokens, || unreachable!());
+            assert!(cache_hit);
+            stream
+                .submit_replay_with_arguments(
+                    replay,
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32),
+                )
+                .wait();
+            let num_active_values = num_active_tokens * values_per_token;
+            let expected = attention_values[..num_active_values]
+                .iter()
+                .zip(&gate_values[..num_active_values])
+                .map(|(&attention, &gate)| attention / (1.0 + (-gate).exp()))
+                .collect::<Vec<_>>();
+            let actual = output.read_typed::<f32>(0, num_active_values);
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 2.0e-5);
             }
-        );
+        }
     }
 
     #[test]

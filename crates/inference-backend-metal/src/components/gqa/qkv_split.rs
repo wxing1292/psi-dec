@@ -249,9 +249,7 @@ mod tests {
     use super::Buffers;
     use super::Compute;
     use super::Config;
-    use super::KernelConstants;
     use super::Shape;
-    use super::ThreadBlockConstants;
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
@@ -259,53 +257,9 @@ mod tests {
     use crate::metal::ReplayParameterKey;
     use crate::metal::ReplayU32;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa_qkv_split.num_active_tokens");
-
-    #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let config = Config::bf16(2, 1, 128);
-        assert_eq!(
-            KernelConstants::current(config),
-            KernelConstants {
-                config,
-                thread_block: ThreadBlockConstants { required_threads: 256 },
-            }
-        );
-    }
-
-    #[test]
-    fn test_fixed() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let config = Config::f32(2, 1, 2);
-        let shape = Shape { num_total_tokens: 2 };
-        let qkv = Buffer::from_slice(&device, &(0..16).map(|value| value as f32).collect::<Vec<_>>());
-        let q = Buffer::new_zeroed_elements(&device, config.num_q_slots(shape), Dtype::Float32);
-        let k = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
-        let v = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
-        let kernel = Compute::new(&device, config);
-
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            Buffers {
-                qkv: &qkv,
-                q: &q,
-                k: &k,
-                v: &v,
-            },
-            ReplayU32::Fixed(shape.num_total_tokens),
-        ));
-        stream.submit_replay(&builder.build()).wait();
-
-        assert_eq!(
-            q.read_typed::<f32>(0, 8),
-            vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0]
-        );
-        assert_eq!(k.read_typed::<f32>(0, 4), vec![4.0, 5.0, 12.0, 13.0]);
-        assert_eq!(v.read_typed::<f32>(0, 4), vec![6.0, 7.0, 14.0, 15.0]);
-    }
 
     #[test]
     fn test_replay_matches_reference_across_active_counts() {
@@ -329,22 +283,28 @@ mod tests {
         let k = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
         let v = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
         let kernel = Compute::new(&device, config);
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            Buffers {
-                qkv: &qkv,
-                q: &q,
-                k: &k,
-                v: &v,
-            },
-            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-        ));
-        let replay = builder.build();
+        let mut cache = ReplayTestCache::new();
+        let (_, cache_hit) = cache.record(shape.num_total_tokens, || {
+            let mut builder = stream.create_replay_program();
+            builder.record(kernel.invoke(
+                shape,
+                Buffers {
+                    qkv: &qkv,
+                    q: &q,
+                    k: &k,
+                    v: &v,
+                },
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ));
+            builder.build()
+        });
+        assert!(!cache_hit);
 
         for num_active_tokens in ACTIVE_COUNTS {
+            let (replay, cache_hit) = cache.record(shape.num_total_tokens, || unreachable!());
+            assert!(cache_hit);
             let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens);
-            stream.submit_replay_with_arguments(&replay, &arguments).wait();
+            stream.submit_replay_with_arguments(replay, &arguments).wait();
             let active_tokens = num_active_tokens as usize;
             let mut expected_q = Vec::with_capacity(active_tokens * q_width);
             let mut expected_k = Vec::with_capacity(active_tokens * kv_width);

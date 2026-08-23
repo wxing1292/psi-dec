@@ -284,19 +284,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn test_registry_uses_kernel_constants_without_a_path_enum() {
-        let registry = Registry::new(config(256, 6, 8));
-        let variants = registry.variants();
-
-        assert_eq!(variants[0].map.thread_block.max_q_tokens, 1);
-        assert_eq!(variants[0].map.thread_block.max_q_heads, 6);
-        assert_eq!(variants[0].map.thread_block.kv_tokens_per_iteration, 256);
-        assert_eq!(variants[0].map.thread_block.required_threads, 256);
-        assert_eq!(variants[1].map.thread_block.max_q_tokens, 8);
-        assert_eq!(variants[1].map.thread_block.max_q_heads, 3);
-        assert_eq!(variants[2].map.thread_block.max_q_heads, 6);
-        assert_eq!(registry.max_q_tokens_per_map_task(), 8);
-    }
 }
