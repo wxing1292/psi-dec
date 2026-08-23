@@ -568,15 +568,20 @@ Central replay infrastructure tests prove cache lookup, parameter transport, and
 test uses a small deterministic component and an exact reference. It must not use output inequality as a correctness
 oracle.
 
-Each cached replay owner must have an execution test for each independently variable active work domain. The test must
-use the production owner API. It must record one total capacity and topology, then replay a non-monotonic sequence of
-legal active counts. For a small domain such as a total capacity of `8`, the sequence must cover every legal active
-count. For example, use `1, 8, 3, 7, 2, 6, 4, 5`.
+Each replayable component must have an execution test for each independently variable active work domain. The test must
+use the production component record API through an isolated test replay cache. It must record one total capacity and
+topology, then replay a non-monotonic sequence of legal active counts. For a small domain such as a total capacity of
+`8`, the sequence must cover every legal active count. For example, use `1, 8, 3, 7, 2, 6, 4, 5`.
+
+Test peer components independently even when a production model owner records them in one replay program and stores
+that program in one cache. The component test cache is test-only orchestration. It must not add a production replay
+owner, wrapper, trait, or lifecycle operation. A separate model wiring test must prove the composite cache key, cache
+reuse, and shared replay-parameter binding.
 
 The owner test must prove these contracts:
 
-- The first use records one program. Later submissions with the same total capacity, topology, and static facts hit the
-  same cache entry.
+- The first use of the isolated test cache records one program. Later submissions with the same total capacity,
+  topology, and static facts hit the same cache entry.
 - Each submission produces the exact reference result for its active logical domain.
 - A change to total capacity, topology, or another record-time static fact selects or records a different entry.
 
@@ -605,6 +610,10 @@ List test entries before local helper functions. Keep the helpers at the end of 
 
 Do not keep constructor-only tests when stronger execution tests cover them. Do not test derived Rust behavior such as
 `PartialEq`.
+
+Do not keep a test that only inspects derived kernel constants, thread-block fields, or an unimplemented future-work
+branch. Prove a supported kernel configuration through execution. Keep a selector-boundary test when the selection
+changes replay topology or preserves a measured production policy.
 
 Keep unit tests beside the production logic that they validate. Keep a small and focused test module inline. Put longer
 unit-test coverage in a sibling `*_test.rs` file and declare it under `cfg(test)`.

@@ -10,4 +10,7 @@ pub mod metal;
 pub mod operators;
 mod runtime;
 
+#[cfg(test)]
+mod test_support;
+
 pub use runtime::MetalRuntime;
