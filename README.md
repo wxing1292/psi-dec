@@ -50,6 +50,39 @@ hf download mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
 
 The `qwen3_5_*` binaries support compatible Qwen3.5, Qwen3.6, and Qwen3.8 checkpoints.
 
+### DSpark and DFlash2 checkpoints
+
+Download the BF16 speculative checkpoints from
+[RadixArk/Qwen3.8-27B-DSpark](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark) and
+[z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2):
+
+```sh
+hf download RadixArk/Qwen3.8-27B-DSpark \
+  --local-dir models/Qwen3.8-27B-DSpark
+
+hf download z-lab/Qwen3.8-27B-DFlash2 \
+  --local-dir models/Qwen3.8-27B-DFlash2
+```
+
+Convert the source checkpoints to the psi-dec affine format:
+
+```sh
+cargo run --release -p inference-executor-core --bin qwen3x_spec_quantize -- dspark \
+  --input-dir "$PWD/models/Qwen3.8-27B-DSpark" \
+  --output-dir "$PWD/models/Qwen3.8-27B-DSpark-affine"
+
+cargo run --release -p inference-executor-core --bin qwen3x_spec_quantize -- dflash2 \
+  --input-dir "$PWD/models/Qwen3.8-27B-DFlash2" \
+  --output-dir "$PWD/models/Qwen3.8-27B-DFlash2-affine"
+```
+
+Each output directory must not exist before conversion.
+Both commands use group size 64 and 4-bit matrix payloads by default.
+DSpark uses 8 bits for `markov_head.markov_w2`.
+DFlash2 uses 6 bits for the selected layer 2 and layer 4 projections.
+Both formats store affine scales and biases as BF16.
+See the [service guide](docs/service.md) for the full conversion and startup contracts.
+
 Start the dense 27B service with MTP:
 
 ```sh
