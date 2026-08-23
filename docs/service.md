@@ -662,8 +662,8 @@ The body combines per-row sliding-history attention with bidirectional local-blo
 grouped convolution.
 DFlash2Output builds and samples the candidate lattice and writes sparse draft distributions.
 
-`--logging info` emits one `phase="executor.batch.perf"` event after each non-empty executor batch. The event uses the
-same schema for Vanilla, MTP, DSpark, and DFlash2. It also uses the same schema for prefill and decode batches:
+`--logging debug` emits one DEBUG `phase="executor.batch.perf"` event after each non-empty executor batch. The event
+uses the same schema for Vanilla, MTP, DSpark, and DFlash2. It also uses the same schema for prefill and decode batches:
 
 ```text
 component="executor"
@@ -698,8 +698,9 @@ It includes all dependent MTP passes and any recorded block-Spec Prefill and Dec
 DSpark or DFlash2 prefill-only batches can have nonzero `spec_ms` and zero `spec_passes`.
 `spec_passes` counts Spec Decode forwards. These values are host elapsed latencies. They are not GPU kernel timings.
 
-`--logging debug` emits the same INFO performance event. It also emits request and response diagnostics. It does not
-emit a second DEBUG performance event.
+`--logging info` does not emit the executor batch performance event. `--logging debug` also emits request and response
+diagnostics. The end-to-end performance helpers enable only the `inference-runtime-service::perf` DEBUG target when
+the selected server logging level is INFO.
 
 Internal model `Start` and `Stop` commands emit INFO lifecycle events on the
 `inference-runtime-service::lifecycle` target.
@@ -726,8 +727,28 @@ For Qwen3, each DSpark block forward is one pass.
 Qwen3 runs DSpark Prefill for a prefill-only batch.
 It does not run DSpark Decode because no sampled anchor exists.
 
-Runtime shutdown emits a scheduler table. The table contains call counts and latency percentiles for the runtime
-lifetime.
+The runtime emits non-empty periodical scheduler stats every 30 seconds. It resets these stats after each output.
+Runtime shutdown always emits separate lifetime scheduler stats. It does not reset the lifetime stats.
+
+Each scheduler stats output contains two tables. The scheduler API table contains enqueue and swap-in counts. It also
+contains prepare, cancel, and commit counts and latency percentiles. The Speculative acceptance table uses proposal
+indexes as columns:
+
+```text
+spec stat | overall | index@0 | index@1 | ...
+proposed  | ...
+accepted  | ...
+rate      | ...
+```
+
+The `overall` column sums the proposed and accepted counts across all indexes. Each remaining column reports one
+proposal index. `proposed` counts each proposal position that the Spec forward produced. `accepted` counts the
+responses whose `validated_tokens` include that position. `rate` is `accepted / proposed`. A column with no proposals
+has rate `N/A`.
+
+This rate differs from the conditional `acceptance_rate_by_index` in the executor batch performance event. The
+scheduler denominator includes every produced proposal at the index. The executor event includes an index only when
+all earlier proposal tokens passed verification.
 
 Long-running service and runtime components use these spans:
 

@@ -83,6 +83,7 @@ fn run_inner() -> Result<()> {
     tracing::info!("model executor initialized");
 
     let runtime_config = build_runtime_config(&config, &model)?;
+    let num_spec_tokens = model.num_spec_tokens();
     for cache_lane in 0..runtime_config.num_cache_lanes() {
         let lane = runtime_config.cache_lane(cache_lane);
         tracing::info!(
@@ -97,7 +98,7 @@ fn run_inner() -> Result<()> {
 
     tracing::info!(
         model_mode = model.model_mode(),
-        num_spec_tokens = model.num_spec_tokens(),
+        num_spec_tokens,
         grpc_listen_addr = %config.grpc_listen_addr(),
         http_listen_addr = %config.http_listen_addr(),
         num_cache_pages,
@@ -120,6 +121,7 @@ fn run_inner() -> Result<()> {
         qwen_codec,
         runtime_config,
         scheduler_config,
+        num_spec_tokens,
         model,
     )
 }

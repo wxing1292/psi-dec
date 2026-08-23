@@ -153,6 +153,7 @@ Options:
                         Pass 0 for an intentional sustained-load run.
   --logging LEVEL       Server logging: info or debug. Default: info.
                         Debug adds request/response and replay-stage details.
+                        The benchmark always enables the executor perf DEBUG target.
   -h, --help            Show this help.
 
 Examples:
@@ -1284,8 +1285,10 @@ run_server_case() {
     local log="/tmp/psi_dec_${label}.log"
 
     local server_command=("$@")
+    local server_rust_log="${RUST_LOG:-info}"
+    server_rust_log+=",inference-runtime-service::perf=debug"
     server_command+=(--logging "$LOGGING")
-    "${server_command[@]}" >"$log" 2>&1 &
+    RUST_LOG="$server_rust_log" "${server_command[@]}" >"$log" 2>&1 &
     ACTIVE_SERVER_PID=$!
 
     if ! wait_for_port; then

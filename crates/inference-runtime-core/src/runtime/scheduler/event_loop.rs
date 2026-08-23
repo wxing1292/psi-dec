@@ -28,6 +28,8 @@ use crate::runtime::scheduler::InstrumentedScheduler;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
 
+const SCHEDULER_STATS_INTERVAL: Duration = Duration::from_secs(30);
+
 pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
     user_req_rx: Receiver<QueuedReq>,
     swap_in_task_rx: Receiver<UserReq>,
@@ -38,6 +40,9 @@ pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, 
     request_slot_allocator: RequestSlotAllocator,
     page_id_allocator: Arc<U32IDAllocator>,
     model_executor_state: ModelExecutorState,
+
+    scheduler_stats_timer: Receiver<Instant>,
+
     executor_hibernation_mode: ExecutorHibernationMode,
     executor_hibernation_timeout: Duration,
     executor_hibernation_timer: Receiver<Instant>,
@@ -91,6 +96,9 @@ where
             request_slot_allocator,
             page_id_allocator,
             model_executor_state: ModelExecutorState::Started,
+
+            scheduler_stats_timer: after(SCHEDULER_STATS_INTERVAL),
+
             executor_hibernation_mode,
             executor_hibernation_timeout,
             executor_hibernation_timer: after(executor_hibernation_timeout),
@@ -110,24 +118,41 @@ where
         let shutdown_rx = self.shutdown.sync_rx().clone();
         'event_loop: while !self.shutdown.is_shutdown() {
             let mut select = Select::new();
-            let op_shutdown = select.recv(&shutdown_rx);
-            let op_recv_model_executor_resp = select.recv(&self.model_executor_resp_rx);
-            let op_recv_swap_in_task = select.recv(&self.swap_in_task_rx);
             let op_recv_req = if self.request_slot_allocator.free() > 0 {
                 Some(select.recv(&self.user_req_rx))
             } else {
                 None
             };
+            let op_recv_swap_in_task = select.recv(&self.swap_in_task_rx);
+            let op_recv_model_executor_resp = select.recv(&self.model_executor_resp_rx);
+            let op_scheduler_stats_timer = select.recv(&self.scheduler_stats_timer);
             let op_executor_hibernation_timer = match &self.model_executor_state {
                 ModelExecutorState::Started => Some(select.recv(&self.executor_hibernation_timer)),
                 ModelExecutorState::Stopped(_) => None,
             };
+            let op_shutdown = select.recv(&shutdown_rx);
             let op = select.select();
             let op_index = op.index();
             match op_index {
-                _ if op_index == op_shutdown => {
-                    let _ = op.recv(&shutdown_rx);
-                    break 'event_loop;
+                _ if Some(op_index) == op_recv_req => {
+                    let queued_req = op
+                        .recv(&self.user_req_rx)
+                        .map_err(|error| log_err_internal!("user request channel closed, stopping: {error}"))?;
+                    let request_slot = match self.request_slot_allocator.allocate() {
+                        RequestSlotAllocationResult::Ok { request_slot } => request_slot,
+                        RequestSlotAllocationResult::ResourceLimitExceeded => {
+                            panic!("available request-slot capacity must allow allocation")
+                        },
+                    };
+                    let user_req = UserReq::from((queued_req, request_slot));
+                    user_req.store_running();
+                    self.scheduler.enqueue(user_req);
+                },
+                _ if op_index == op_recv_swap_in_task => {
+                    let user_req = op
+                        .recv(&self.swap_in_task_rx)
+                        .map_err(|error| log_err_internal!("swap-in request channel closed, stopping: {error}"))?;
+                    self.swap_in(user_req);
                 },
                 _ if op_index == op_recv_model_executor_resp => {
                     let model_executor_resp = op.recv(&self.model_executor_resp_rx).map_err(|error| {
@@ -144,25 +169,12 @@ where
                         ReplayableModelExecutorResponse::Started | ReplayableModelExecutorResponse::Stopped => {},
                     }
                 },
-                _ if op_index == op_recv_swap_in_task => {
-                    let user_req = op
-                        .recv(&self.swap_in_task_rx)
-                        .map_err(|error| log_err_internal!("swap-in request channel closed, stopping: {error}"))?;
-                    self.swap_in(user_req);
-                },
-                _ if Some(op_index) == op_recv_req => {
-                    let queued_req = op
-                        .recv(&self.user_req_rx)
-                        .map_err(|error| log_err_internal!("user request channel closed, stopping: {error}"))?;
-                    let request_slot = match self.request_slot_allocator.allocate() {
-                        RequestSlotAllocationResult::Ok { request_slot } => request_slot,
-                        RequestSlotAllocationResult::ResourceLimitExceeded => {
-                            panic!("available request-slot capacity must allow allocation")
-                        },
-                    };
-                    let user_req = UserReq::from((queued_req, request_slot));
-                    user_req.store_running();
-                    self.scheduler.enqueue(user_req);
+                _ if op_index == op_scheduler_stats_timer => {
+                    let _ = op
+                        .recv(&self.scheduler_stats_timer)
+                        .expect("selected scheduler stats timer must fire");
+                    self.scheduler.print_periodical();
+                    self.scheduler_stats_timer = after(SCHEDULER_STATS_INTERVAL);
                 },
                 _ if Some(op_index) == op_executor_hibernation_timer => {
                     let _ = op
@@ -175,15 +187,17 @@ where
                         self.executor_hibernation_timer = after(self.executor_hibernation_timeout - idle_duration);
                     }
                 },
+                _ if op_index == op_shutdown => {
+                    let _ = op.recv(&shutdown_rx);
+                    break 'event_loop;
+                },
                 _ => unreachable!(),
             }
             self.do_flush()?;
         }
 
         self.shutdown.shutdown();
-        tracing::info!(
-            scheduler_stats = %format_args!("\n{}", self.scheduler.stats_table()),
-        );
+        self.scheduler.print_lifetime();
         tracing::info!("stopped");
         Ok(())
     }

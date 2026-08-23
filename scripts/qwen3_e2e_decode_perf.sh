@@ -86,6 +86,7 @@ Benchmark options:
   --case-cooldown-secs N
                        Default: 8
   --logging LEVEL      info or debug. Default: info
+                       The benchmark always enables the executor perf DEBUG target.
   --no-build           Skip cargo build --release
   -h, --help
 
@@ -734,6 +735,8 @@ run_server_case() {
     shift
     local server_log="/tmp/psi_dec_qwen3_${label}.log"
     local -a command=("$@")
+    local server_rust_log="${RUST_LOG:-info}"
+    server_rust_log+=",inference-runtime-service::perf=debug"
     command+=(--logging "$LOGGING")
 
     printf '==> Starting %s:' "$label"
@@ -741,7 +744,7 @@ run_server_case() {
     printf '\n'
 
     : >"$server_log"
-    "${command[@]}" >"$server_log" 2>&1 &
+    RUST_LOG="$server_rust_log" "${command[@]}" >"$server_log" 2>&1 &
     ACTIVE_SERVER_PID=$!
 
     if ! wait_for_server; then

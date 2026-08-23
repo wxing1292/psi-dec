@@ -10,37 +10,100 @@ use crate::compute::BatchDevReq;
 use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
+use crate::compute::SpecStats;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
 
 pub struct InstrumentedScheduler<Sch> {
-    num_enqueue: u64,
-    num_swap_in: u64,
-    hist_prepare: Histogram<u64>,
-    hist_cancel: Histogram<u64>,
-    hist_commit: Histogram<u64>,
+    periodical: SchedulerStats,
+    lifetime: SchedulerStats,
 
     scheduler: Sch,
 }
 
 impl<Sch> InstrumentedScheduler<Sch> {
-    pub fn new(scheduler: Sch) -> Self {
+    pub fn new(scheduler: Sch, num_spec_tokens: usize) -> Self {
+        Self {
+            periodical: SchedulerStats::new(num_spec_tokens),
+            lifetime: SchedulerStats::new(num_spec_tokens),
+
+            scheduler,
+        }
+    }
+
+    pub fn print_periodical(&mut self) {
+        if self.periodical.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            target: "inference-runtime-core::scheduler",
+            phase = "scheduler.stats.periodical",
+            scheduler_stats = %format_args!(
+                "\nScheduler APIs\n{}\n\nSpec Acceptance\n{}",
+                self.periodical.api.table(),
+                self.periodical.spec.table()
+            ),
+            "scheduler periodical stats"
+        );
+        self.periodical.reset();
+    }
+
+    pub fn print_lifetime(&self) {
+        tracing::info!(
+            target: "inference-runtime-core::scheduler",
+            phase = "scheduler.stats.lifetime",
+            scheduler_stats = %format_args!(
+                "\nScheduler APIs\n{}\n\nSpec Acceptance\n{}",
+                self.lifetime.api.table(),
+                self.lifetime.spec.table()
+            ),
+            "scheduler lifetime stats"
+        );
+    }
+}
+
+#[allow(clippy::upper_case_acronyms)]
+struct SchedulerAPIStats {
+    num_enqueue: u64,
+    num_swap_in: u64,
+    hist_prepare: Histogram<u64>,
+    hist_cancel: Histogram<u64>,
+    hist_commit: Histogram<u64>,
+}
+
+impl SchedulerAPIStats {
+    fn new() -> Self {
         Self {
             num_enqueue: 0,
             num_swap_in: 0,
             hist_prepare: Histogram::<u64>::new(4).unwrap(),
             hist_cancel: Histogram::<u64>::new(4).unwrap(),
             hist_commit: Histogram::<u64>::new(4).unwrap(),
-
-            scheduler,
         }
     }
 
-    pub fn stats_table(&self) -> Table {
+    fn is_empty(&self) -> bool {
+        self.num_enqueue == 0
+            && self.num_swap_in == 0
+            && self.hist_prepare.is_empty()
+            && self.hist_cancel.is_empty()
+            && self.hist_commit.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.num_enqueue = 0;
+        self.num_swap_in = 0;
+        self.hist_prepare.reset();
+        self.hist_cancel.reset();
+        self.hist_commit.reset();
+    }
+
+    fn table(&self) -> Table {
         let mut table = Table::new();
         table.load_style(UTF8_FULL.with_rounded_corners());
 
-        let mut header = vec![Cell::new("scheduler api"), Cell::new("count")];
+        let mut header = vec![Cell::new("scheduler API"), Cell::new("count")];
         header.extend(COLUMNS.iter().map(|(name, _)| Cell::new(*name)));
         table.set_header(header);
 
@@ -64,6 +127,69 @@ impl<Sch> InstrumentedScheduler<Sch> {
     }
 }
 
+impl SpecStats {
+    fn table(&self) -> Table {
+        let mut table = Table::new();
+        table.load_style(UTF8_FULL.with_rounded_corners());
+
+        let rate = |proposed, accepted| {
+            if proposed == 0 {
+                "N/A".to_string()
+            } else {
+                format!("{:.4}", accepted as f64 / proposed as f64)
+            }
+        };
+        let proposed = self.proposed_by_index().iter().sum::<u64>();
+        let accepted = self.accepted_by_index().iter().sum::<u64>();
+
+        let mut header = vec![Cell::new("spec stat"), Cell::new("overall")];
+        header.extend((0..self.len()).map(|index| Cell::new(format!("index@{index}"))));
+        table.set_header(header);
+
+        let mut proposed_row = vec![Cell::new("proposed"), Cell::new(proposed)];
+        proposed_row.extend(self.proposed_by_index().iter().map(Cell::new));
+        table.add_row(proposed_row);
+
+        let mut accepted_row = vec![Cell::new("accepted"), Cell::new(accepted)];
+        accepted_row.extend(self.accepted_by_index().iter().map(Cell::new));
+        table.add_row(accepted_row);
+
+        let mut rate_row = vec![Cell::new("rate"), Cell::new(rate(proposed, accepted))];
+        rate_row.extend(
+            self.proposed_by_index()
+                .iter()
+                .zip(self.accepted_by_index())
+                .map(|(&proposed, &accepted)| Cell::new(rate(proposed, accepted))),
+        );
+        table.add_row(rate_row);
+
+        table
+    }
+}
+
+struct SchedulerStats {
+    api: SchedulerAPIStats,
+    spec: SpecStats,
+}
+
+impl SchedulerStats {
+    fn new(num_spec_tokens: usize) -> Self {
+        Self {
+            api: SchedulerAPIStats::new(),
+            spec: SpecStats::new(num_spec_tokens),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.api.is_empty() && self.spec.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.api.reset();
+        self.spec.reset();
+    }
+}
+
 impl<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, Sch>
     Scheduler<UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp> for InstrumentedScheduler<Sch>
 where
@@ -76,12 +202,14 @@ where
 {
     fn enqueue(&mut self, user_req: UserReq) {
         self.scheduler.enqueue(user_req);
-        self.num_enqueue += 1;
+        self.periodical.api.num_enqueue += 1;
+        self.lifetime.api.num_enqueue += 1;
     }
 
     fn swap_in(&mut self, user_req: UserReq) {
         self.scheduler.swap_in(user_req);
-        self.num_swap_in += 1;
+        self.periodical.api.num_swap_in += 1;
+        self.lifetime.api.num_swap_in += 1;
     }
 
     fn pop_ready_reqs(&mut self) -> Option<UserReq> {
@@ -96,7 +224,9 @@ where
         let instant = Instant::now();
         let result = self.scheduler.prepare();
         let latency = instant.elapsed().as_micros() as u64;
-        let _ = self.hist_prepare.record(max(1, latency));
+        let latency = max(1, latency);
+        let _ = self.periodical.api.hist_prepare.record(latency);
+        let _ = self.lifetime.api.hist_prepare.record(latency);
         result
     }
 
@@ -104,14 +234,25 @@ where
         let instant = Instant::now();
         self.scheduler.cancel(batch_dev_req);
         let latency = instant.elapsed().as_micros() as u64;
-        let _ = self.hist_cancel.record(max(1, latency));
+        let latency = max(1, latency);
+        let _ = self.periodical.api.hist_cancel.record(latency);
+        let _ = self.lifetime.api.hist_cancel.record(latency);
     }
 
     fn commit(&mut self, batch_dev_resp: BatchDeviceResp) {
+        let num_spec_tokens = self.lifetime.spec.len();
+        if num_spec_tokens != 0 {
+            let delta = batch_dev_resp.spec_stats(num_spec_tokens);
+            self.periodical.spec.accumulate(&delta);
+            self.lifetime.spec.accumulate(&delta);
+        }
+
         let instant = Instant::now();
         self.scheduler.commit(batch_dev_resp);
         let latency = instant.elapsed().as_micros() as u64;
-        let _ = self.hist_commit.record(max(1, latency));
+        let latency = max(1, latency);
+        let _ = self.periodical.api.hist_commit.record(latency);
+        let _ = self.lifetime.api.hist_commit.record(latency);
     }
 }
 
@@ -189,7 +330,7 @@ mod tests {
         inner.expect_cancel().once().return_once(drop);
         inner.expect_commit().once().return_once(drop);
 
-        let mut scheduler = InstrumentedScheduler::new(inner);
+        let mut scheduler = InstrumentedScheduler::new(inner, 0);
         scheduler.enqueue(TestUserReq::new());
         scheduler.swap_in(TestUserReq::new());
         assert!(scheduler.pop_ready_reqs().is_none());
@@ -198,10 +339,27 @@ mod tests {
         scheduler.cancel(batch_dev_req);
         scheduler.commit(TestBatchDeviceResp::new());
 
-        assert_eq!(scheduler.num_enqueue, 1);
-        assert_eq!(scheduler.num_swap_in, 1);
-        assert_eq!(scheduler.hist_prepare.len(), 1);
-        assert_eq!(scheduler.hist_cancel.len(), 1);
-        assert_eq!(scheduler.hist_commit.len(), 1);
+        assert_eq!(scheduler.lifetime.api.num_enqueue, 1);
+        assert_eq!(scheduler.lifetime.api.num_swap_in, 1);
+        assert_eq!(scheduler.lifetime.api.hist_prepare.len(), 1);
+        assert_eq!(scheduler.lifetime.api.hist_cancel.len(), 1);
+        assert_eq!(scheduler.lifetime.api.hist_commit.len(), 1);
+    }
+
+    #[test]
+    fn test_spec_stats_table_uses_indexes_as_columns() {
+        let mut stats = SpecStats::new(2);
+        stats.record_spec_info(2, 1);
+        stats.record_spec_info(2, 1);
+        stats.record_spec_info(1, 0);
+
+        let table = stats.table().to_string();
+        assert!(table.contains("spec stat"));
+        assert!(table.contains("overall"));
+        assert!(table.contains("index@0"));
+        assert!(table.contains("index@1"));
+        assert!(table.contains("│ proposed  ┆ 5       ┆ 3       ┆ 2       │"));
+        assert!(table.contains("│ accepted  ┆ 2       ┆ 2       ┆ 0       │"));
+        assert!(table.contains("│ rate      ┆ 0.4000  ┆ 0.6667  ┆ 0.0000  │"));
     }
 }

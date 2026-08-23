@@ -74,6 +74,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
     pub fn new(
         model_runtime_config: RuntimeConfig,
         scheduler_config: SchedulerConfig,
+        num_spec_tokens: usize,
         shutdown: Shutdown,
         async_task_handle: &tokio::runtime::Handle,
     ) -> Self {
@@ -164,14 +165,17 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         {
             let schedule_queue = ScheduleQueue::new(swap_out_task_tx);
             let batcher = FIFOBatcher::new();
-            let scheduler = InstrumentedScheduler::new(SimpleScheduler::new(
-                schedule_queue,
-                batcher,
-                scheduler_config.max_requests,
-                scheduler_config.max_tokens,
-                scheduler_config.max_tokens_per_request,
-                scheduler_config.max_compute_slots,
-            ));
+            let scheduler = InstrumentedScheduler::new(
+                SimpleScheduler::new(
+                    schedule_queue,
+                    batcher,
+                    scheduler_config.max_requests,
+                    scheduler_config.max_tokens,
+                    scheduler_config.max_tokens_per_request,
+                    scheduler_config.max_compute_slots,
+                ),
+                num_spec_tokens,
+            );
             let event_loop = EventLoop::new(
                 user_req_rx,
                 swap_in_task_rx,
@@ -335,6 +339,7 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
     qwen_codec: Arc<QwenCodec>,
     model_runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
+    num_spec_tokens: usize,
     model: M,
 ) -> Result<()>
 where
@@ -348,6 +353,7 @@ where
     let runtime = Arc::new(InferenceRuntime::<N, L, NUM_TRIE_PARTITION>::new(
         model_runtime_config,
         scheduler_config,
+        num_spec_tokens,
         shutdown.clone(),
         server_tokio_runtime.handle(),
     ));
@@ -462,6 +468,7 @@ mod tests {
                 max_tokens_per_request: 1024,
                 max_compute_slots: 1,
             },
+            0,
             shutdown.clone(),
             async_task_runtime.handle(),
         );
@@ -779,6 +786,7 @@ mod tests {
                 max_tokens_per_request: 1024,
                 max_compute_slots: 1,
             },
+            0,
             shutdown.clone(),
             async_runtime.handle(),
         );

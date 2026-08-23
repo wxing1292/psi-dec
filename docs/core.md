@@ -78,7 +78,7 @@ then use that block as a non-terminal prefix.
                                     v
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ InstrumentedScheduler<SimpleScheduler>                                     │
-│ scheduler API latency/counts + hard request/token/per-request limits       │
+│ periodical/lifetime API and Spec stats + hard scheduler limits             │
 │ free/used compute slots + ordered compute-slot sequence                    │
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     │ runnable work + free slot
@@ -216,6 +216,13 @@ The event loop submits immediately when the scheduler has runnable token work an
 
 Request and token budgets remain hard per-batch limits in `FIFOBatcher::prepare`. They are not mutable aggregation
 thresholds. The current path has no scheduler flush timer.
+
+The scheduler stats timer fires every 30 seconds. It does not flush scheduler work. `InstrumentedScheduler` prints and
+resets non-empty periodical stats. It retains separate lifetime stats and always prints them during shutdown.
+
+Both scopes contain scheduler API counts/latencies and speculative-token counts. The speculative table counts every
+proposal position that the Spec forward produced. It counts an accepted position when `validated_tokens` contains that
+position. The rate is `accepted / proposed` at the same index.
 
 The trie decoder keeps proposal tokens, probabilities, and confidence values in one request-local proposal state.
 These vectors must have the same length. A verification-prefix trim changes all three vectors. Proposal confidence

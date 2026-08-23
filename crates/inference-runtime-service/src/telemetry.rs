@@ -92,7 +92,7 @@ pub fn emit_executor_batch_perf_metrics(
         .zip(&response_summary.num_spec_token_by_index)
         .map(|(&verified, &spec)| ratio(verified, spec))
         .collect::<Vec<_>>();
-    tracing::info!(
+    tracing::debug!(
         target: "inference-runtime-service::perf",
         component = "executor",
         phase = "executor.batch.perf",

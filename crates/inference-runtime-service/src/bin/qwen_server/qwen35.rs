@@ -141,6 +141,7 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
     tracing::info!("model executor initialized");
 
     let runtime_config = build_runtime_config(&config, &model_config, &model)?;
+    let num_spec_tokens = model.num_spec_tokens();
     for cache_lane in 0..runtime_config.num_cache_lanes() {
         let lane = runtime_config.cache_lane(cache_lane);
         tracing::info!(
@@ -155,7 +156,7 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
 
     tracing::info!(
         checkpoint_mtp_layers = model_config.text_config.mtp_num_hidden_layers,
-        num_spec_tokens = model.num_spec_tokens(),
+        num_spec_tokens,
         model_mode = model.model_mode(),
         grpc_listen_addr = %config.grpc_listen_addr(),
         http_listen_addr = %config.http_listen_addr(),
@@ -179,6 +180,7 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         qwen_codec,
         runtime_config,
         scheduler_config,
+        num_spec_tokens,
         model,
     )
 }
