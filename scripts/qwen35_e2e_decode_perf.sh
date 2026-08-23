@@ -1079,24 +1079,19 @@ def stable_value(encoded):
     return values[0] if len(set(values)) == 1 else "mixed"
 
 
-def percent(encoded):
-    return "-" if encoded == "na" else f"{100.0 * float(encoded):.1f}%"
-
-
 rows = []
+reference_status_counts = {}
 with open(os.environ["REPORT_FILE"], encoding="utf-8") as report:
     for line in report:
         fields = dict(part.split("=", 1) for part in line.split()[1:])
         sampled = stable_value(fields["samples"])
         proposed = stable_value(fields["proposed_spec"])
         verified = stable_value(fields["verified_spec"])
+        acceptance = "-" if proposed == "0" else f"{verified}/{proposed}"
         prompt = {
             "gsm8k_typing_average": "gsm8k",
             "beijing_travel": "beijing",
         }.get(fields["prompt"], fields["prompt"])
-        delta = fields.get("decode_delta_pct", "-")
-        if delta != "-":
-            delta = f"{float(delta):+.2f}%"
         rows.append(
             [
                 fields["label"],
@@ -1104,33 +1099,15 @@ with open(os.environ["REPORT_FILE"], encoding="utf-8") as report:
                 fields["max_new"],
                 sampled,
                 fields["median_decode_tok_s"],
-                fields.get("reference_decode_tok_s", "-"),
-                delta,
-                fields["median_ttft_ms"],
-                fields["median_inter_chunk_p95_ms"],
                 fields["median_tokens_per_chunk"],
-                percent(fields["median_acceptance_rate"]),
-                f"{verified}/{proposed}",
-                fields["reference_status"],
+                acceptance,
             ]
         )
+        status = fields["reference_status"]
+        reference_status_counts[status] = reference_status_counts.get(status, 0) + 1
 
-headers = [
-    "Case",
-    "Prompt",
-    "Max",
-    "Out",
-    "Tok/s",
-    "Ref",
-    "Delta",
-    "TTFT",
-    "p95",
-    "Tok/ch",
-    "Accept",
-    "V/P",
-    "Reference",
-]
-numeric_columns = {2, 3, 4, 5, 6, 7, 8, 9, 10}
+headers = ["Case", "Prompt", "Max", "Out", "Tok/s", "Tok/ch", "Accept"]
+numeric_columns = {2, 3, 4, 5, 6}
 widths = [max(len(headers[index]), *(len(row[index]) for row in rows)) for index in range(len(headers))]
 separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
 
@@ -1153,8 +1130,11 @@ for row in rows:
     print(format_row(row))
     previous_case = row[0]
 print(separator)
-print("Tok/s and Ref are median decode tokens/s. Delta compares Tok/s with Ref.")
-print("p95 is inter-chunk p95 in ms. Accept and V/P are verified/proposed speculative tokens.")
+print("Tok/s is median decode tokens/s. Accept is verified/proposed speculative tokens.")
+statuses = ", ".join(
+    f"{status}={count}" for status, count in sorted(reference_status_counts.items())
+)
+print(f"Reference: {statuses}. Use --show-runs for per-row deltas and details.")
 PY
 }
 
