@@ -4,8 +4,13 @@ use super::*;
 use crate::components::gqa::kv_page_write::PageTableLayout;
 use crate::components::gqa::sdpa;
 use crate::components::gqa::split_kv::tiled_q;
+use crate::metal::ReplayArguments;
+use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayU32;
 use crate::metal::Stream;
+
+const NUM_ACTIVE_Q_TOKEN_RANGES: ReplayParameterKey =
+    ReplayParameterKey::new("test.gqa_block_sdpa.num_active_q_token_ranges");
 
 #[test]
 fn test_constants_have_explicit_thread_block_scope() {
@@ -28,8 +33,8 @@ fn test_constants_have_explicit_thread_block_scope() {
 #[should_panic(expected = "complete request blocks")]
 fn test_block_shape_rejects_partial_request_block() {
     Shape {
-        num_tokens: 10,
-        num_q_token_ranges: 2,
+        num_total_tokens: 10,
+        num_total_q_token_ranges: 2,
         num_total_partial_output_slots: 16,
     }
     .validate(Config {
@@ -51,6 +56,107 @@ fn test_f32_kernel_matches_request_block_bidirectional_reference() {
 #[test]
 fn test_bf16_kernel_matches_request_block_bidirectional_reference() {
     assert_kernel_matches_request_block_bidirectional_reference(Dtype::Bfloat16, 1.0e-2);
+}
+
+#[test]
+fn test_replay_active_q_token_ranges_match_cpu_reference() {
+    const NUM_TOTAL_TOKENS: usize = 8;
+    const HEAD_DIM: usize = 32;
+    const ACTIVE_COUNTS: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
+
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let config = Config {
+        block_size: NUM_TOTAL_TOKENS as u32,
+        max_q_tokens: 1,
+        num_q_heads: 1,
+        num_kv_heads: 1,
+        head_dim: HEAD_DIM as u32,
+        scale: (HEAD_DIM as f32).sqrt().recip(),
+        dtype: Dtype::Float32,
+    };
+    let shape = Shape {
+        num_total_tokens: NUM_TOTAL_TOKENS as u32,
+        num_total_q_token_ranges: NUM_TOTAL_TOKENS as u32,
+        num_total_partial_output_slots: NUM_TOTAL_TOKENS as u32,
+    };
+    let q_values = (0..NUM_TOTAL_TOKENS * HEAD_DIM)
+        .map(|index| index as f32 * 0.003 - 0.4)
+        .collect::<Vec<_>>();
+    let k_values = (0..NUM_TOTAL_TOKENS * HEAD_DIM)
+        .map(|index| index as f32 * -0.002 + 0.3)
+        .collect::<Vec<_>>();
+    let v_values = (0..NUM_TOTAL_TOKENS * HEAD_DIM)
+        .map(|index| index as f32 * 0.004 - 0.2)
+        .collect::<Vec<_>>();
+    let q = Buffer::from_slice(&device, &q_values);
+    let local_k = Buffer::from_slice(&device, &k_values);
+    let local_v = Buffer::from_slice(&device, &v_values);
+    let q_token_ranges = Buffer::from_slice(
+        &device,
+        &(0..NUM_TOTAL_TOKENS as u32)
+            .flat_map(|index| [index, index + 1])
+            .collect::<Vec<_>>(),
+    );
+    let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &(0..=NUM_TOTAL_TOKENS as u32).collect::<Vec<_>>());
+    let partial_exp_sums = Buffer::new_zeroed_elements(&device, NUM_TOTAL_TOKENS, Dtype::Float32);
+    let partial_max_logits = Buffer::new_zeroed_elements(&device, NUM_TOTAL_TOKENS, Dtype::Float32);
+    let partial_output = Buffer::new_zeroed_elements(&device, NUM_TOTAL_TOKENS * HEAD_DIM, Dtype::Float32);
+    let kernel = Compute::new(&device, config);
+    let mut builder = stream.create_replay_program();
+    builder.record(kernel.invoke(
+        shape,
+        ReplayU32::Parameter(NUM_ACTIVE_Q_TOKEN_RANGES),
+        Buffers {
+            q: &q,
+            local_k: &local_k,
+            local_v: &local_v,
+            q_token_ranges: &q_token_ranges,
+            cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
+            partial_exp_sums: &partial_exp_sums,
+            partial_max_logits: &partial_max_logits,
+            partial_output: &partial_output,
+        },
+    ));
+    let replay = builder.build();
+
+    for num_active_ranges in ACTIVE_COUNTS {
+        let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_Q_TOKEN_RANGES, num_active_ranges);
+        stream.submit_replay_with_arguments(&replay, &arguments).wait();
+        let actual_exp_sums = partial_exp_sums.read_typed::<f32>(0, num_active_ranges as usize);
+        let actual_max_logits = partial_max_logits.read_typed::<f32>(0, num_active_ranges as usize);
+        let actual_output = partial_output.read_typed::<f32>(0, num_active_ranges as usize * HEAD_DIM);
+        for q_token_index in 0..num_active_ranges as usize {
+            let q_row = &q_values[q_token_index * HEAD_DIM..(q_token_index + 1) * HEAD_DIM];
+            let scores = (0..NUM_TOTAL_TOKENS)
+                .map(|kv_token_index| {
+                    let key = &k_values[kv_token_index * HEAD_DIM..(kv_token_index + 1) * HEAD_DIM];
+                    dot(q_row, key) * config.scale
+                })
+                .collect::<Vec<_>>();
+            let max_logit = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights = scores
+                .iter()
+                .map(|score| (*score - max_logit).exp())
+                .collect::<Vec<_>>();
+            let exp_sum = weights.iter().sum::<f32>();
+            assert!((actual_max_logits[q_token_index] - max_logit).abs() < 1.0e-4);
+            assert!((actual_exp_sums[q_token_index] - exp_sum).abs() < 1.0e-4);
+            for dim in 0..HEAD_DIM {
+                let expected = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(kv_token_index, weight)| weight * v_values[kv_token_index * HEAD_DIM + dim])
+                    .sum::<f32>()
+                    / exp_sum;
+                let actual = actual_output[q_token_index * HEAD_DIM + dim];
+                assert!(
+                    (actual - expected).abs() < 1.0e-4,
+                    "actual={actual} expected={expected}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -113,8 +219,8 @@ fn assert_composite_matches_reference(visible_kv_token_begins: &[u32]) {
         dtype: Dtype::Bfloat16,
     };
     let block_shape = Shape {
-        num_tokens: num_q_tokens as u32,
-        num_q_token_ranges: 1,
+        num_total_tokens: num_q_tokens as u32,
+        num_total_q_token_ranges: 1,
         num_total_partial_output_slots: 3,
     };
 
@@ -177,6 +283,7 @@ fn assert_composite_matches_reference(visible_kv_token_begins: &[u32]) {
     ));
     builder.record(block.invoke(
         block_shape,
+        ReplayU32::Fixed(block_shape.num_total_q_token_ranges),
         Buffers {
             q: &q,
             local_k: &local_k,
@@ -255,8 +362,8 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
         dtype,
     };
     let shape = Shape {
-        num_tokens: 6,
-        num_q_token_ranges: 2,
+        num_total_tokens: 6,
+        num_total_q_token_ranges: 2,
         num_total_partial_output_slots: 8,
     };
     let q_values = round_for_dtype(
@@ -291,6 +398,7 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
     let mut builder = stream.create_replay_program();
     builder.record(kernel.invoke(
         shape,
+        ReplayU32::Fixed(shape.num_total_q_token_ranges),
         Buffers {
             q: &q,
             local_k: &local_k,
@@ -307,7 +415,7 @@ fn assert_kernel_matches_request_block_bidirectional_reference(dtype: Dtype, out
     let actual_partial_exp_sums = partial_exp_sums.read_typed::<f32>(0, config.partial_output_stat_elements(shape));
     let actual_partial_max_logits = partial_max_logits.read_typed::<f32>(0, config.partial_output_stat_elements(shape));
     let actual_output = read_values(&partial_output, config.partial_output_values(shape), dtype);
-    for q_token_index in 0..shape.num_tokens as usize {
+    for q_token_index in 0..shape.num_total_tokens as usize {
         let local_kv_token_begin = q_token_index / config.block_size as usize * config.block_size as usize;
         for q_head in 0..config.num_q_heads as usize {
             let q_start = (q_token_index * config.num_q_heads as usize + q_head) * config.head_dim as usize;

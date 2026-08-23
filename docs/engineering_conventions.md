@@ -247,18 +247,21 @@ Put component coordinates, ABI records, and cumulative-offset examples in the ow
 
 Keep runtime or replay shapes separate from initialization capacity and storage layouts.
 
-`*ReplayShape` contains only values that describe one recorded execution and its submissions. Examples include active
-token, request, and runtime-partition counts. A bucketed replay shape can also contain the recorded capacity for each
-active work domain.
+`*ReplayShape` contains only values that define one recording. These values include recorded capacities, topology, and
+static geometry. Submission input contains the active counts and other dynamic values.
 
 A reusable leaf component may use one `*Shape` for exact and bucketed invocations. Keep this shape when it owns shape
 validation or derived execution extents, or when it preserves the contract of peer components. Do not remove it only
 because it contains one field.
 
-For a shared exact and bucketed shape, use `num_total_<domain>` for the recorded grid or capacity. The exact invocation
-uses the total count as its active count. It must not declare an unused active-count replay parameter. The bucketed
-invocation binds `num_active_<domain>` at submission and must validate `0 < num_active_<domain> <= num_total_<domain>`.
-Use `num_<domain>` only when the component has no active and total distinction.
+For each cached replay work domain, use `num_total_<domain>` for the recorded grid or capacity. Use
+`num_active_<domain>` for the logical work in one submission. Bind `num_active_<domain>` as a replay parameter. Keep
+the two values separate even when they are equal. Validate
+`0 < num_active_<domain> <= num_total_<domain>` before submission.
+
+The capacity policy can select `num_total_<domain> == num_active_<domain>`. This identity policy is necessary when the
+recorded commands cannot execute inactive lanes safely. It does not change the replay parameter or cache-key contract.
+Use `num_<domain>` only when the component has no replayed active and total distinction.
 
 Remove an exact API or a shared shape only after a repository-wide reference audit confirms that production does not
 use it. Tests and benchmarks are not sufficient evidence of production ownership.
@@ -335,6 +338,15 @@ Replay keys contain only facts that change these items:
 - Scratch extent
 - A necessary algorithm choice
 
+Within one replay owner, the cache key must contain each `num_total_<domain>`, the selected topology, and all other
+record-time static facts. It must not contain `num_active_<domain>`. A cache entry must be reusable for each legal
+active count in its recorded domain.
+
+Each submission must supply `num_active_<domain>` through a typed replay parameter. Changing only an active count must
+not record a new program. Changing a total count, topology, or other record-time static fact must select or record a
+different program. These requirements also apply when an identity capacity policy makes the active and total values
+equal for one submission.
+
 A reusable leaf component must expose its topology identity and topology boundaries for each bucketed work domain. The
 owner of a composite replay stage must union the boundaries from all participating leaf components before it selects a
 capacity. A component-local policy is not the final policy for a larger replay stage.
@@ -351,8 +363,8 @@ It separates the half-open topology domains `[.., b)` and `[b, ..)`. The policy 
 capacity for the preceding topology. Zero means that the work domain is absent. It must not be a replay bucket capacity.
 
 Two bindings may use the same replay parameter key only when they use the same scalar type, active work domain, and
-validated range. A selected topology must declare and submit only the parameters that its recorded commands consume.
-Do not add an unused replay parameter to make peer paths look symmetric.
+validated range. A selected topology must declare each active work domain that its recorded commands consume. It must
+submit each declared parameter exactly once.
 
 When one replay stage is the only consumer of a component, `Replay<T>` must be its single owner and access path.
 Use `Replay::component()` for prepare, replay-argument, and read operations that belong to that stage.
@@ -551,6 +563,29 @@ Keep these test responsibilities separate:
 - A Metal parity test proves kernel math, dispatch, ABI, padding, aliasing, and canaries.
 - An executor component test proves metadata, resource ownership, and component-local lifecycle.
 - An integration test proves model composition, weight residency, and full executor lifecycle.
+
+Central replay infrastructure tests prove cache lookup, parameter transport, and parameter-range validation. A central
+test uses a small deterministic component and an exact reference. It must not use output inequality as a correctness
+oracle.
+
+Each cached replay owner must have an execution test for each independently variable active work domain. The test must
+use the production owner API. It must record one total capacity and topology, then replay a non-monotonic sequence of
+legal active counts. For a small domain such as a total capacity of `8`, the sequence must cover every legal active
+count. For example, use `1, 8, 3, 7, 2, 6, 4, 5`.
+
+The owner test must prove these contracts:
+
+- The first use records one program. Later submissions with the same total capacity, topology, and static facts hit the
+  same cache entry.
+- Each submission produces the exact reference result for its active logical domain.
+- A change to total capacity, topology, or another record-time static fact selects or records a different entry.
+
+The test can ignore the inactive output or scratch tail. It must not fill the tail with NaN as poison. If the component
+writes persistent or scatter-addressed state, the test must also prove that inactive work does not change semantically
+unrelated state.
+
+Keep the component reference and active-domain projection in the component test. Centralize only repeated replay
+orchestration. Do not add a production trait, wrapper, or lifecycle operation for test reuse.
 
 Do not combine a CPU oracle, Metal parity, and a lifecycle scenario in one test.
 

@@ -7,6 +7,7 @@ use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("../metal/gqa_block_sdpa.metal");
 
@@ -82,7 +83,7 @@ impl Config {
         checked_product(
             "GQA block SDPA Q element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_q_heads as usize,
                 self.head_dim as usize,
             ],
@@ -93,7 +94,7 @@ impl Config {
         checked_product(
             "GQA block SDPA K/V element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_kv_heads as usize,
                 self.head_dim as usize,
             ],
@@ -121,7 +122,7 @@ impl Config {
         checked_product(
             "GQA block SDPA thread count",
             &[
-                shape.num_q_token_ranges as usize,
+                shape.num_total_q_token_ranges as usize,
                 self.num_q_heads as usize,
                 self.max_q_tokens as usize,
                 thread_block.required_threads as usize,
@@ -138,19 +139,19 @@ impl Config {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Shape {
-    pub num_tokens: u32,
-    pub num_q_token_ranges: u32,
+    pub num_total_tokens: u32,
+    pub num_total_q_token_ranges: u32,
     pub num_total_partial_output_slots: u32,
 }
 
 impl Shape {
     pub fn validate(self, config: Config) {
         config.validate();
-        assert!(self.num_tokens > 0);
-        assert!(self.num_q_token_ranges > 0 && self.num_q_token_ranges <= self.num_tokens);
-        assert!(self.num_total_partial_output_slots >= self.num_q_token_ranges);
+        assert!(self.num_total_tokens > 0);
+        assert!(self.num_total_q_token_ranges > 0 && self.num_total_q_token_ranges <= self.num_total_tokens);
+        assert!(self.num_total_partial_output_slots >= self.num_total_q_token_ranges);
         assert_eq!(
-            self.num_tokens % config.block_size,
+            self.num_total_tokens % config.block_size,
             0,
             "GQA block SDPA tokens must contain complete request blocks"
         );
@@ -222,11 +223,17 @@ impl Compute {
         Self { constants, kernel }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(
+        &'a self,
+        shape: Shape,
+        num_active_q_token_ranges: ReplayU32,
+        buffers: Buffers<'a>,
+    ) -> Invocation<'a> {
         Invocation {
             constants: self.constants,
             kernel: &self.kernel,
             shape,
+            num_active_q_token_ranges,
             buffers,
         }
     }
@@ -254,6 +261,7 @@ pub struct Invocation<'a> {
     constants: KernelConstants,
     kernel: &'a CompiledKernel,
     shape: Shape,
+    num_active_q_token_ranges: ReplayU32,
     buffers: Buffers<'a>,
 }
 
@@ -270,10 +278,19 @@ impl Operator for Invocation<'_> {
         recorder.set_buffer_write(5, self.buffers.partial_exp_sums, 0);
         recorder.set_buffer_write(6, self.buffers.partial_max_logits, 0);
         recorder.set_buffer_write(7, self.buffers.partial_output, 0);
+        match self.num_active_q_token_ranges {
+            ReplayU32::Fixed(value) => {
+                assert_eq!(value, self.shape.num_total_q_token_ranges);
+                recorder.set_u32(8, value);
+            },
+            ReplayU32::Parameter(key) => {
+                recorder.bind_u32(8, key, 1, self.shape.num_total_q_token_ranges);
+            },
+        }
         recorder.dispatch_threadblocks(
             (
                 config.num_q_heads as usize,
-                self.shape.num_q_token_ranges as usize,
+                self.shape.num_total_q_token_ranges as usize,
                 config.max_q_tokens as usize,
             ),
             (self.constants.thread_block.required_threads as usize, 1, 1),
@@ -290,13 +307,13 @@ impl Invocation<'_> {
         assert!(self.buffers.local_v.len_bytes() >= bytes(config.kv_elements(self.shape), config.dtype));
         assert!(
             self.buffers.q_token_ranges.len_bytes()
-                >= (self.shape.num_q_token_ranges as usize)
+                >= (self.shape.num_total_q_token_ranges as usize)
                     .checked_mul(2 * size_of::<u32>())
                     .expect("GQA block SDPA Q-token-range bytes must fit usize")
         );
         assert!(
             self.buffers.cu_sdpa_partial_outputs.len_bytes()
-                >= (self.shape.num_q_token_ranges as usize)
+                >= (self.shape.num_total_q_token_ranges as usize)
                     .checked_add(1)
                     .and_then(|count| count.checked_mul(size_of::<u32>()))
                     .expect("GQA block SDPA cumulative partial-output bytes must fit usize")

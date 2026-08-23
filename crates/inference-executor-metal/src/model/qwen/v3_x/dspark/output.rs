@@ -4,7 +4,9 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
+use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfidenceWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMarkovWeightBindings;
@@ -21,6 +23,9 @@ use crate::replay::ReplayComponent;
 use crate::sampling::dspark_markov::DSparkMarkovReplayShape;
 use crate::sampling::dspark_markov::DSparkProposal;
 use crate::sampling::spec_probs::SpecProbsStore;
+
+const DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.dspark.gather_unembed.num_active_rows");
 
 pub struct Qwen3xDSparkGatherUnembed {
     block_size: u32,
@@ -52,12 +57,15 @@ pub struct Qwen3xDSparkSamplingArgs<'a> {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkGatherUnembedReplayKey {
-    num_requests: u32,
+    num_total_rows: u32,
+    unembed_topology: affine_quantized::KernelKind,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkSamplingReplayKey {
-    shape: DSparkMarkovReplayShape,
+    num_total_requests: u32,
+    num_total_sampling_inputs: u32,
+    top_k: u32,
 }
 
 impl Qwen3xDSparkGatherUnembed {
@@ -110,6 +118,17 @@ impl Qwen3xDSparkGatherUnembed {
         }
         self.row_indices.write_typed(0, &row_indices);
     }
+
+    pub fn prepare_replay(&self, num_active_requests: u32) -> (Qwen3xDSparkGatherUnembedReplayKey, ReplayArguments) {
+        assert!(num_active_requests > 0 && num_active_requests <= self.max_requests);
+        let num_active_rows = num_active_requests * self.block_size;
+        let key = Qwen3xDSparkGatherUnembedReplayKey {
+            num_total_rows: num_active_rows,
+            unembed_topology: self.unembed().replay_topology(num_active_rows),
+        };
+        let arguments = ReplayArguments::new().with_u32(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS, num_active_rows);
+        (key, arguments)
+    }
 }
 
 impl ReplayComponent for Qwen3xDSparkGatherUnembed {
@@ -117,18 +136,16 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
     type Input<'a> = Qwen3xDSparkGatherUnembedArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Qwen3xDSparkGatherUnembedReplayKey {
-            num_requests: input.num_requests,
-        }
+        self.prepare_replay(input.num_requests).0
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         assert!(input.num_requests > 0 && input.num_requests <= self.max_requests);
-        let num_rows = input.num_requests * self.block_size;
+        let key = self.replay_key(input);
         self.gather.record(
             recorder,
-            num_rows,
-            ReplayU32::Fixed(num_rows),
+            key.num_total_rows,
+            ReplayU32::Parameter(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS),
             input.hidden_input,
             &self.row_indices,
             input.hidden_output,
@@ -137,8 +154,8 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
             self.unembed(),
             recorder,
             UnembedInput {
-                num_total_rows: num_rows,
-                num_active_rows: ReplayU32::Fixed(num_rows),
+                num_total_rows: key.num_total_rows,
+                num_active_rows: ReplayU32::Parameter(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS),
                 hidden: input.hidden_output,
                 logits: input.logits,
             },
@@ -196,7 +213,11 @@ impl ReplayComponent for Qwen3xDSparkSampling {
     type Input<'a> = Qwen3xDSparkSamplingArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Qwen3xDSparkSamplingReplayKey { shape: input.shape }
+        Qwen3xDSparkSamplingReplayKey {
+            num_total_requests: input.shape.num_total_requests,
+            num_total_sampling_inputs: input.shape.sampling.num_total_sampling_inputs,
+            top_k: input.shape.sampling.top_k,
+        }
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {

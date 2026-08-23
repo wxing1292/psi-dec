@@ -165,10 +165,12 @@ impl Qwen3xDFlash2Layer {
         self.scratch.residual_stream(self.dflash2_layer_index)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_prefill<'a, R>(
         &'a self,
         recorder: &mut R,
-        num_tokens: u32,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
         main_feature: &'a Buffer,
         req_slots: &'a Buffer,
         flat_token_indices: &'a Buffer,
@@ -176,30 +178,47 @@ impl Qwen3xDFlash2Layer {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.attention
-            .record_prefill(recorder, num_tokens, main_feature, req_slots, flat_token_indices, pages);
+        self.attention.record_prefill(
+            recorder,
+            num_total_tokens,
+            num_active_tokens,
+            main_feature,
+            req_slots,
+            flat_token_indices,
+            pages,
+        );
     }
 
-    pub fn record_block<'a, R>(&'a self, recorder: &mut R, input: Qwen3xDFlash2LayerInput<'a>) -> &'a Buffer
+    pub fn record_block<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
+        num_active_query_blocks: ReplayU32,
+        input: Qwen3xDFlash2LayerInput<'a>,
+    ) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         debug_assert!(input.num_tokens <= self.scratch.max_tokens);
         self.input_norm.record_with_barrier(
             recorder,
-            input.num_tokens,
-            ReplayU32::Fixed(input.num_tokens),
+            num_total_tokens,
+            num_active_tokens,
             input.residual_input,
             &self.scratch.normalized_hidden,
         );
         self.attention_conv.record_prepare(
             recorder,
-            input.num_tokens,
+            num_total_tokens,
+            num_active_tokens,
+            num_active_query_blocks,
             &self.scratch.normalized_hidden,
             &self.scratch.prepared_hidden,
         );
         self.attention.record_block(
             recorder,
+            num_active_tokens,
             input.metadata,
             &self.scratch.prepared_hidden,
             &self.scratch.branch_output,
@@ -207,29 +226,32 @@ impl Qwen3xDFlash2Layer {
         );
         self.attention_conv.record_finish(
             recorder,
-            input.num_tokens,
+            num_total_tokens,
+            num_active_query_blocks,
             &self.scratch.branch_output,
             &self.scratch.convolved_output,
         );
         self.residual_add.record(
             recorder,
-            input.num_tokens,
+            num_total_tokens,
             self.scratch.hidden_dim,
-            ReplayU32::Fixed(input.num_tokens),
+            num_active_tokens,
             input.residual_input,
             &self.scratch.convolved_output,
             &self.scratch.post_attention_hidden,
         );
         self.post_attention_norm.record_with_barrier(
             recorder,
-            input.num_tokens,
-            ReplayU32::Fixed(input.num_tokens),
+            num_total_tokens,
+            num_active_tokens,
             &self.scratch.post_attention_hidden,
             &self.scratch.normalized_hidden,
         );
         self.mlp_conv.record_prepare(
             recorder,
-            input.num_tokens,
+            num_total_tokens,
+            num_active_tokens,
+            num_active_query_blocks,
             &self.scratch.normalized_hidden,
             &self.scratch.prepared_hidden,
         );
@@ -237,20 +259,21 @@ impl Qwen3xDFlash2Layer {
             recorder,
             &self.scratch.prepared_hidden,
             &self.scratch.branch_output,
-            input.num_tokens,
-            ReplayU32::Fixed(input.num_tokens),
+            num_total_tokens,
+            num_active_tokens,
         );
         self.mlp_conv.record_finish(
             recorder,
-            input.num_tokens,
+            num_total_tokens,
+            num_active_query_blocks,
             &self.scratch.branch_output,
             &self.scratch.convolved_output,
         );
         self.residual_add.record(
             recorder,
-            input.num_tokens,
+            num_total_tokens,
             self.scratch.hidden_dim,
-            ReplayU32::Fixed(input.num_tokens),
+            num_active_tokens,
             &self.scratch.post_attention_hidden,
             &self.scratch.convolved_output,
             input.residual_output,

@@ -7,6 +7,8 @@ use inference_backend_metal::components::rms_norm_rope;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::attn::GQAPageTableLayout;
@@ -26,6 +28,30 @@ use crate::attn::gqa::ungated_scratch::UngatedGQAScratchBindings;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 
+pub const UNGATED_GQA_NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey =
+    ReplayParameterKey::new("ungated_gqa.num_active_q_token_tiles");
+pub const UNGATED_GQA_NUM_ACTIVE_KV_SPLITS: ReplayParameterKey =
+    ReplayParameterKey::new("ungated_gqa.num_active_kv_splits");
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct UngatedGQAReplayTopology {
+    pub sdpa_execution: backend_sdpa::ExecutionVariant,
+    pub qkv_affine: affine_quantized::KernelKind,
+    pub output_affine: affine_quantized::KernelKind,
+}
+
+pub fn add_ungated_gqa_private_replay_arguments(
+    shape: GQAReplayShape,
+    topology: UngatedGQAReplayTopology,
+    arguments: &mut ReplayArguments,
+) {
+    shape.validate();
+    if topology.sdpa_execution.map.thread_block.max_q_tokens > 1 {
+        arguments.set_u32(UNGATED_GQA_NUM_ACTIVE_Q_TOKEN_TILES, shape.num_q_token_tiles);
+    }
+    arguments.set_u32(UNGATED_GQA_NUM_ACTIVE_KV_SPLITS, shape.num_sdpa_map_task_templates);
+}
+
 #[derive(Clone, Copy)]
 pub struct UngatedGQAWeights<'a> {
     pub qkv_weight: &'a Buffer,
@@ -43,13 +69,14 @@ pub struct UngatedGQAWeights<'a> {
 #[derive(Clone, Copy)]
 pub struct UngatedGQAInput<'a> {
     pub page_table_layout: GQAPageTableLayout,
-    pub gqa_layer_index: u32,
+    pub gqa_layer_index: ReplayU32,
     pub batch_metadata: &'a GQAMetadataBuffers,
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
     pub kv_cache: GQAKVCacheBindings<'a>,
     pub weights: UngatedGQAWeights<'a>,
     pub scratch: UngatedGQAScratchBindings<'a>,
+    pub num_active_tokens: ReplayU32,
 }
 
 /// The caller-owned next-hidden-state buffer returned by one ungated GQA
@@ -105,9 +132,30 @@ impl GQAMetalConfig {
 
 impl UngatedGQA {
     fn validate_input(&self, input: &UngatedGQAInput<'_>) {
-        input.batch_metadata.replay_shape().validate();
+        let shape = input.batch_metadata.replay_shape();
+        shape.validate();
+        match input.num_active_tokens {
+            ReplayU32::Fixed(num_active_tokens) => {
+                assert_eq!(num_active_tokens, shape.num_tokens);
+                assert_eq!(shape.num_tokens, shape.num_total_tokens);
+                assert_eq!(shape.num_q_token_tiles, shape.num_total_q_token_tiles);
+            },
+            ReplayU32::Parameter(key) => {
+                assert_ne!(
+                    key, UNGATED_GQA_NUM_ACTIVE_Q_TOKEN_TILES,
+                    "ungated GQA active-token key must differ from the private Q-token-tile key"
+                );
+                assert_ne!(
+                    key, UNGATED_GQA_NUM_ACTIVE_KV_SPLITS,
+                    "ungated GQA active-token key must differ from the private KV-split key"
+                );
+                self.validate_token_capacity_topology(shape.num_tokens, shape.num_total_tokens);
+            },
+        }
         input.page_table_layout.validate();
-        assert!(input.gqa_layer_index < input.page_table_layout.num_gqa_layers);
+        if let ReplayU32::Fixed(index) = input.gqa_layer_index {
+            assert!(index < input.page_table_layout.num_gqa_layers);
+        }
     }
 
     pub fn new(device: &Device, core: UngatedGQACore, config: GQAMetalConfig, max_tokens: usize) -> Self {
@@ -154,6 +202,17 @@ impl UngatedGQA {
         policy: &GQAReplayBucketPolicy,
         num_total_tokens: u32,
     ) -> GQAReplayShape {
+        let num_tokens = cu_tokens.last().copied().unwrap_or_default();
+        assert!(num_tokens > 0, "ungated GQA replay requires active tokens");
+        assert!(
+            num_tokens <= num_total_tokens,
+            "ungated GQA active token count must not exceed the total token count"
+        );
+        assert!(
+            num_total_tokens <= policy.max_tokens(),
+            "ungated GQA total token count must not exceed the metadata capacity"
+        );
+        self.validate_token_capacity_topology(num_tokens, num_total_tokens);
         assert_eq!(
             batch_metadata.max_tokens(),
             self.sdpa_selector.limits().max_map_task_templates as usize
@@ -173,6 +232,29 @@ impl UngatedGQA {
         boundaries.sort_unstable();
         boundaries.dedup();
         boundaries.into_boxed_slice()
+    }
+
+    fn validate_token_capacity_topology(&self, num_tokens: u32, num_total_tokens: u32) {
+        assert_eq!(
+            self.qkv.topology(num_tokens),
+            self.qkv.topology(num_total_tokens),
+            "ungated GQA caller-owned token capacity must preserve the active QKV affine topology"
+        );
+        assert_eq!(
+            self.output.topology(num_tokens),
+            self.output.topology(num_total_tokens),
+            "ungated GQA caller-owned token capacity must preserve the active output affine topology"
+        );
+    }
+
+    pub fn replay_topology(&self, batch_metadata: &GQAMetadataBuffers) -> UngatedGQAReplayTopology {
+        let shape = batch_metadata.replay_shape();
+        shape.validate();
+        UngatedGQAReplayTopology {
+            sdpa_execution: batch_metadata.variant(),
+            qkv_affine: self.qkv.topology(shape.num_total_tokens),
+            output_affine: self.output.topology(shape.num_total_tokens),
+        }
     }
 }
 
@@ -194,9 +276,10 @@ impl ReplayLayer for UngatedGQA {
         let weights = input.weights;
         let batch_metadata = input.batch_metadata;
         let scratch = input.scratch;
+        let active_tokens = input.num_active_tokens;
         recorder.record_with_barrier_before(ReplayOp::opaque(self.qkv.invoke(
-            shape.num_tokens,
-            ReplayU32::Fixed(shape.num_tokens),
+            shape.num_total_tokens,
+            active_tokens,
             scratch.qkv,
             0,
             hidden_state,
@@ -216,6 +299,7 @@ impl ReplayLayer for UngatedGQA {
                 k: scratch.k,
                 v: scratch.v,
             },
+            active_tokens,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.q_norm_rope.invoke(
             self.norm_rope_shape(shape),
@@ -225,7 +309,7 @@ impl ReplayLayer for UngatedGQA {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 output: scratch.q_norm_rope,
             },
-            ReplayU32::Fixed(shape.num_tokens),
+            active_tokens,
         )));
         recorder.record(ReplayOp::opaque(self.k_norm_rope.invoke(
             self.norm_rope_shape(shape),
@@ -235,7 +319,7 @@ impl ReplayLayer for UngatedGQA {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 output: scratch.k_norm_rope,
             },
-            ReplayU32::Fixed(shape.num_tokens),
+            active_tokens,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
             self.kv_page_write_shape(shape, page_table_layout),
@@ -247,13 +331,13 @@ impl ReplayLayer for UngatedGQA {
                 flat_token_indices: batch_metadata.flat_token_indices(),
                 page_ids: kv_cache.page_ids,
             },
-            ReplayU32::Fixed(shape.num_tokens),
-            ReplayU32::Fixed(gqa_layer_index),
+            active_tokens,
+            gqa_layer_index,
         )));
         let attention_output = self.record_sdpa(recorder, input);
         recorder.record_with_barrier_before(ReplayOp::opaque(self.output.invoke(
-            shape.num_tokens,
-            ReplayU32::Fixed(shape.num_tokens),
+            shape.num_total_tokens,
+            active_tokens,
             next_hidden_state,
             0,
             attention_output,
@@ -280,6 +364,18 @@ impl UngatedGQA {
         let batch_metadata = input.batch_metadata;
         let kv_cache = input.kv_cache;
         let scratch = input.scratch;
+        let active_tokens = input.num_active_tokens;
+        let has_active_parameter = matches!(active_tokens, ReplayU32::Parameter(_));
+        let active_q_token_tiles = if has_active_parameter {
+            ReplayU32::Parameter(UNGATED_GQA_NUM_ACTIVE_Q_TOKEN_TILES)
+        } else {
+            ReplayU32::Fixed(shape.num_q_token_tiles)
+        };
+        let active_kv_splits = if has_active_parameter {
+            ReplayU32::Parameter(UNGATED_GQA_NUM_ACTIVE_KV_SPLITS)
+        } else {
+            ReplayU32::Fixed(shape.num_sdpa_map_task_templates)
+        };
         let execution = batch_metadata.variant();
         let map_constants = execution.map.thread_block;
         if map_constants.max_q_tokens == 1 {
@@ -301,9 +397,9 @@ impl UngatedGQA {
                     partial_max_logits: scratch.sdpa_partial_max_logits,
                     partial_output: scratch.sdpa_partial_output,
                 },
-                ReplayU32::Fixed(gqa_layer_index),
-                ReplayU32::Fixed(shape.num_tokens),
-                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
+                gqa_layer_index,
+                active_tokens,
+                active_kv_splits,
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
                 backend_single_q::ReduceBuffers {
@@ -313,7 +409,7 @@ impl UngatedGQA {
                     cu_sdpa_partial_outputs: batch_metadata.cu_sdpa_partial_outputs(),
                     output: scratch.attention_output,
                 },
-                ReplayU32::Fixed(shape.num_tokens),
+                active_tokens,
             )));
         } else {
             let sdpa_config = self.split_kv_tiled_q_config(page_table_layout);
@@ -332,10 +428,10 @@ impl UngatedGQA {
                     partial_exp_sums: scratch.sdpa_partial_exp_sums,
                     partial_max_logits: scratch.sdpa_partial_max_logits,
                 },
-                ReplayU32::Fixed(gqa_layer_index),
-                ReplayU32::Fixed(shape.num_tokens),
-                ReplayU32::Fixed(shape.num_q_token_tiles),
-                ReplayU32::Fixed(shape.num_sdpa_map_task_templates),
+                gqa_layer_index,
+                active_tokens,
+                active_q_token_tiles,
+                active_kv_splits,
             )));
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
                 backend_tiled_q::ReduceBuffers {
@@ -346,7 +442,7 @@ impl UngatedGQA {
                     cu_sdpa_partial_outputs: batch_metadata.cu_sdpa_partial_outputs(),
                     output: scratch.attention_output,
                 },
-                ReplayU32::Fixed(shape.num_q_token_tiles),
+                active_q_token_tiles,
             )));
         }
         scratch.attention_output
@@ -354,13 +450,13 @@ impl UngatedGQA {
 
     fn qkv_to_q_k_v_shape(&self, shape: GQAReplayShape) -> backend_qkv_split::Shape {
         backend_qkv_split::Shape {
-            num_tokens: shape.num_tokens,
+            num_total_tokens: shape.num_total_tokens,
         }
     }
 
     fn norm_rope_shape(&self, shape: GQAReplayShape) -> rms_norm_rope::Shape {
         rms_norm_rope::Shape {
-            num_total_tokens: shape.num_tokens,
+            num_total_tokens: shape.num_total_tokens,
         }
     }
 
@@ -370,7 +466,7 @@ impl UngatedGQA {
         page_table_layout: GQAPageTableLayout,
     ) -> backend_kv_page_write::Shape {
         backend_kv_page_write::Shape {
-            num_total_token_writes: shape.num_tokens,
+            num_total_token_writes: shape.num_total_tokens,
             page_table_layout: backend_page_table_layout(page_table_layout),
         }
     }
@@ -401,7 +497,7 @@ impl UngatedGQA {
 
     fn split_kv_single_q_shape(&self, shape: GQAReplayShape) -> backend_single_q::Shape {
         backend_single_q::Shape {
-            num_total_tokens: shape.num_tokens,
+            num_total_tokens: shape.num_total_tokens,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }
@@ -432,8 +528,8 @@ impl UngatedGQA {
 
     fn split_kv_tiled_q_shape(&self, shape: GQAReplayShape) -> backend_tiled_q::Shape {
         backend_tiled_q::Shape {
-            num_total_tokens: shape.num_tokens,
-            num_total_q_token_tiles: shape.num_q_token_tiles,
+            num_total_tokens: shape.num_total_tokens,
+            num_total_q_token_tiles: shape.num_total_q_token_tiles,
             num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
         }
     }

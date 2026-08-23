@@ -680,7 +680,7 @@ fn full_replay(
         &mut recorder,
         UngatedGQAInput {
             page_table_layout,
-            gqa_layer_index: 0,
+            gqa_layer_index: ReplayU32::Fixed(0),
             batch_metadata: metadata,
             hidden_state: hidden,
             next_hidden_state: output,
@@ -690,6 +690,7 @@ fn full_replay(
             },
             weights: weights.bindings(),
             scratch: scratch.bindings(),
+            num_active_tokens: ReplayU32::Fixed(metadata.replay_shape().num_tokens),
         },
     );
     recorder.build()

@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::components::residual_add;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -133,6 +134,92 @@ impl Qwen3MainLayer {
     pub fn residual_output(&self) -> &Buffer {
         self.scratch.residual_stream(self.layer_index)
     }
+
+    pub fn mlp_replay_topology(&self, num_total_tokens: u32) -> dense_mlp::ReplayTopology {
+        self.mlp.replay_topology(num_total_tokens)
+    }
+
+    pub fn record<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
+        input: Qwen3MainLayerInput<'a>,
+    ) -> &'a Buffer
+    where
+        R: Recorder<'a, Operator = ReplayOp<'a>>,
+    {
+        assert!(input.num_tokens > 0, "qwen3 Main replay requires active tokens");
+        assert!(
+            input.num_tokens <= num_total_tokens,
+            "qwen3 Main active tokens must not exceed the replay capacity"
+        );
+        let hidden_dim = self.scratch.hidden_dim();
+        self.input_norm.record_with_barrier(
+            recorder,
+            num_total_tokens,
+            num_active_tokens,
+            input.residual_input,
+            &self.scratch.normalized_hidden,
+        );
+        self.attention.record(
+            recorder,
+            &self.scratch.normalized_hidden,
+            &self.scratch.branch_output,
+            input.pages,
+            input.gqa,
+            num_active_tokens,
+        );
+        self.residual_add.record(
+            recorder,
+            num_total_tokens,
+            hidden_dim,
+            num_active_tokens,
+            input.residual_input,
+            &self.scratch.branch_output,
+            &self.scratch.post_attention_hidden,
+        );
+        self.post_attention_norm.record_with_barrier(
+            recorder,
+            num_total_tokens,
+            num_active_tokens,
+            &self.scratch.post_attention_hidden,
+            &self.scratch.normalized_hidden,
+        );
+        self.mlp.record(
+            recorder,
+            &self.scratch.normalized_hidden,
+            &self.scratch.branch_output,
+            num_total_tokens,
+            num_active_tokens,
+        );
+        match input.residual_capture_dest {
+            Some(capture) => {
+                self.residual_add.record_with_capture(
+                    recorder,
+                    num_total_tokens,
+                    hidden_dim,
+                    num_active_tokens,
+                    &self.scratch.post_attention_hidden,
+                    &self.scratch.branch_output,
+                    input.residual_output,
+                    capture,
+                )
+            },
+            None => {
+                self.residual_add.record(
+                    recorder,
+                    num_total_tokens,
+                    hidden_dim,
+                    num_active_tokens,
+                    &self.scratch.post_attention_hidden,
+                    &self.scratch.branch_output,
+                    input.residual_output,
+                )
+            },
+        }
+        input.residual_output
+    }
 }
 
 impl ReplayLayer for Qwen3MainLayer {
@@ -143,69 +230,13 @@ impl ReplayLayer for Qwen3MainLayer {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.input_norm.record_with_barrier(
+        Qwen3MainLayer::record(
+            self,
             recorder,
             input.num_tokens,
             ReplayU32::Fixed(input.num_tokens),
-            input.residual_input,
-            &self.scratch.normalized_hidden,
-        );
-        self.attention.record(
-            recorder,
-            &self.scratch.normalized_hidden,
-            &self.scratch.branch_output,
-            input.pages,
-            input.gqa,
-        );
-        self.residual_add.record(
-            recorder,
-            input.num_tokens,
-            self.scratch.hidden_dim(),
-            ReplayU32::Fixed(input.num_tokens),
-            input.residual_input,
-            &self.scratch.branch_output,
-            &self.scratch.post_attention_hidden,
-        );
-        self.post_attention_norm.record_with_barrier(
-            recorder,
-            input.num_tokens,
-            ReplayU32::Fixed(input.num_tokens),
-            &self.scratch.post_attention_hidden,
-            &self.scratch.normalized_hidden,
-        );
-        self.mlp.record(
-            recorder,
-            &self.scratch.normalized_hidden,
-            &self.scratch.branch_output,
-            input.num_tokens,
-            ReplayU32::Fixed(input.num_tokens),
-        );
-        match input.residual_capture_dest {
-            Some(capture) => {
-                self.residual_add.record_with_capture(
-                    recorder,
-                    input.num_tokens,
-                    self.scratch.hidden_dim(),
-                    ReplayU32::Fixed(input.num_tokens),
-                    &self.scratch.post_attention_hidden,
-                    &self.scratch.branch_output,
-                    input.residual_output,
-                    capture,
-                )
-            },
-            None => {
-                self.residual_add.record(
-                    recorder,
-                    input.num_tokens,
-                    self.scratch.hidden_dim(),
-                    ReplayU32::Fixed(input.num_tokens),
-                    &self.scratch.post_attention_hidden,
-                    &self.scratch.branch_output,
-                    input.residual_output,
-                )
-            },
-        }
-        input.residual_output
+            input,
+        )
     }
 }
 

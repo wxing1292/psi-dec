@@ -174,14 +174,21 @@ impl Qwen3xDFlash2Conv {
         self.weights.take();
     }
 
-    pub fn record_prepare<'a, R>(&'a self, recorder: &mut R, num_tokens: u32, hidden: &'a Buffer, output: &'a Buffer)
-    where
+    pub fn record_prepare<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
+        num_active_query_blocks: ReplayU32,
+        hidden: &'a Buffer,
+        output: &'a Buffer,
+    ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let (shape, weights) = self.shape_and_weights(num_tokens);
+        let (shape, weights) = self.shape_and_weights(num_total_tokens);
         recorder.record_with_barrier_before(ReplayOp::opaque(self.projection.invoke(
-            num_tokens,
-            ReplayU32::Fixed(num_tokens),
+            num_total_tokens,
+            num_active_tokens,
             &self.projected_coefficients,
             0,
             hidden,
@@ -195,7 +202,7 @@ impl Qwen3xDFlash2Conv {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.conv.invoke(
             shape,
-            ReplayU32::Fixed(shape.num_total_query_blocks),
+            num_active_query_blocks,
             dynamic_grouped_conv::Side::Prepare,
             dynamic_grouped_conv::Buffers {
                 hidden,
@@ -206,14 +213,20 @@ impl Qwen3xDFlash2Conv {
         )));
     }
 
-    pub fn record_finish<'a, R>(&'a self, recorder: &mut R, num_tokens: u32, hidden: &'a Buffer, output: &'a Buffer)
-    where
+    pub fn record_finish<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_query_blocks: ReplayU32,
+        hidden: &'a Buffer,
+        output: &'a Buffer,
+    ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let (shape, weights) = self.shape_and_weights(num_tokens);
+        let (shape, weights) = self.shape_and_weights(num_total_tokens);
         recorder.record_with_barrier_before(ReplayOp::opaque(self.conv.invoke(
             shape,
-            ReplayU32::Fixed(shape.num_total_query_blocks),
+            num_active_query_blocks,
             dynamic_grouped_conv::Side::Finish,
             dynamic_grouped_conv::Buffers {
                 hidden,

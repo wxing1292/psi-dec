@@ -468,8 +468,11 @@ impl Qwen3Executor {
 
 pub struct Qwen3ModelOpsRecorder {
     main_embed_key: Qwen3MainEmbedReplayKey,
+    main_embed_arguments: ReplayArguments,
     main_key: Qwen3MainReplayKey,
+    main_arguments: ReplayArguments,
     gather_unembed_key: Option<Qwen3GatherUnembedReplayKey>,
+    gather_unembed_arguments: ReplayArguments,
     sampling_key: Option<TopKSamplingReplayKey>,
     sampling_arguments: ReplayArguments,
     rejection_key: Option<RejectionReplayKey>,
@@ -590,11 +593,17 @@ impl ReplayableModel for Qwen3Executor {
         let model_batch_request = Qwen3ModelBatchRequest::from_core_batch(core_batch_req, sampler_configs);
         let microbatch = model_batch_request.microbatch();
         self.write_token_ids(microbatch.flat_token_ids());
+        let num_main_active_tokens = microbatch
+            .total_tokens()
+            .try_into()
+            .expect("qwen3 Main token count must fit u32");
+        let num_main_total_tokens = num_main_active_tokens;
         self.prepare_gqa_page_ids(core_batch_req);
         let gqa_shape = self.main_gqa_state.prepare_metadata(
             microbatch.req_slots(),
             microbatch.token_indices(),
             microbatch.cu_tokens(),
+            num_main_total_tokens,
         );
         debug_assert_eq!(gqa_shape.num_tokens as usize, microbatch.total_tokens());
         model_batch_request
@@ -610,20 +619,27 @@ impl ReplayableModel for Qwen3Executor {
     }
 
     fn begin_ops_recording(&mut self, model_batch_request: &Self::ModelBatchRequest) -> Self::ModelOpsRecorder {
-        let main_embed_key = Qwen3MainEmbedReplayKey::new(
-            model_batch_request
-                .microbatch()
-                .total_tokens()
-                .try_into()
-                .expect("qwen3 MainEmbed token count must fit u32"),
+        let num_main_active_tokens = model_batch_request
+            .microbatch()
+            .total_tokens()
+            .try_into()
+            .expect("qwen3 Main token count must fit u32");
+        let (main_embed_key, main_embed_arguments) = self.main_embed.component().prepare_replay(num_main_active_tokens);
+        let (main_key, mut main_arguments) = self.main.component().prepare_replay(
+            num_main_active_tokens,
+            self.main_gqa_state.metadata().replay_shape(),
+            self.main_gqa_state.replay_topology(),
         );
-        let main_key = Qwen3MainReplayKey::from_shape(self.main_gqa_state.metadata().replay_shape());
+        self.main_gqa_state.add_private_replay_arguments(&mut main_arguments);
         Qwen3ModelOpsRecorder {
             main_embed_key,
+            main_embed_arguments,
             main_key,
+            main_arguments,
             dspark_prefill: None,
             dspark_decode: None,
             gather_unembed_key: None,
+            gather_unembed_arguments: ReplayArguments::new(),
             sampling_key: None,
             sampling_arguments: ReplayArguments::new(),
             rejection_key: None,
@@ -675,6 +691,7 @@ impl ReplayableModel for Qwen3Executor {
             hidden_input: &model_batch_hidden,
             hidden_output: &self.hidden_output,
             gqa: self.main_gqa_state.metadata(),
+            gqa_replay_topology: self.main_gqa_state.replay_topology(),
             pages: self.pages.buffer(),
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
@@ -700,8 +717,9 @@ impl ReplayableModel for Qwen3Executor {
         if num_main_output_rows(model_batch_req.microbatch()) == 0 {
             return Qwen3ModelBatchResponse;
         }
-        recorder.gather_unembed_key =
-            Some(self.prepare_gather_unembed_replay(model_batch_req.microbatch(), model_batch_hidden));
+        let (key, arguments) = self.prepare_gather_unembed_replay(model_batch_req.microbatch(), model_batch_hidden);
+        recorder.gather_unembed_key = Some(key);
+        recorder.gather_unembed_arguments = arguments;
         Qwen3ModelBatchResponse
     }
 

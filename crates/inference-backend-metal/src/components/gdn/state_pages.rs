@@ -5,6 +5,7 @@ use crate::metal::CommandRecorder;
 use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const GDN_STATE_PAGE_WRITE_SOURCE: &str = include_str!("../metal/gdn_state_page_write.metal");
 const GDN_STATE_PAGE_READ_SOURCE: &str = include_str!("../metal/gdn_state_page_read.metal");
@@ -68,7 +69,7 @@ impl Config {
     pub fn state_slots_bytes(self, shape: Shape) -> usize {
         checked_product(
             "GDN state-slot metadata byte length",
-            &[shape.num_state_io_requests as usize, size_of::<u32>()],
+            &[shape.num_total_state_io_requests as usize, size_of::<u32>()],
         )
     }
 
@@ -93,7 +94,7 @@ impl Config {
             "GDN state-page batch count",
             &[
                 self.num_gdn_layers as usize,
-                shape.num_state_io_requests as usize,
+                shape.num_total_state_io_requests as usize,
                 pages_per_layer as usize,
             ],
         );
@@ -104,12 +105,12 @@ impl Config {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Shape {
-    pub num_state_io_requests: u32,
+    pub num_total_state_io_requests: u32,
 }
 
 impl Shape {
     pub fn validate(self) {
-        assert!(self.num_state_io_requests > 0);
+        assert!(self.num_total_state_io_requests > 0);
     }
 }
 
@@ -139,10 +140,16 @@ impl Write {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: WriteBuffers<'a>) -> WriteInvocation<'a> {
+    pub fn invoke<'a>(
+        &'a self,
+        shape: Shape,
+        num_active_state_io_requests: ReplayU32,
+        buffers: WriteBuffers<'a>,
+    ) -> WriteInvocation<'a> {
         WriteInvocation {
             kernel: self,
             shape,
+            num_active_state_io_requests,
             buffers,
         }
     }
@@ -151,6 +158,7 @@ impl Write {
 pub struct WriteInvocation<'a> {
     kernel: &'a Write,
     shape: Shape,
+    num_active_state_io_requests: ReplayU32,
     buffers: WriteBuffers<'a>,
 }
 
@@ -167,7 +175,7 @@ impl Operator for WriteInvocation<'_> {
         recorder.set_buffer_read(5, self.buffers.conv_state_slots, 0);
         recorder.set_u32(6, config.num_gdn_layers);
         recorder.set_u32(7, config.num_state_slots);
-        recorder.set_u32(8, self.shape.num_state_io_requests);
+        bind_active_state_io_requests(recorder, 8, self.shape, self.num_active_state_io_requests);
         recorder.set_u32(9, config.recurrent_state_bytes.div_ceil(config.page_bytes));
         recorder.set_u32(10, config.recurrent_state_bytes);
         recorder.set_u32(11, config.conv_state_bytes.div_ceil(config.page_bytes));
@@ -218,10 +226,16 @@ impl Read {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: ReadBuffers<'a>) -> ReadInvocation<'a> {
+    pub fn invoke<'a>(
+        &'a self,
+        shape: Shape,
+        num_active_state_io_requests: ReplayU32,
+        buffers: ReadBuffers<'a>,
+    ) -> ReadInvocation<'a> {
         ReadInvocation {
             kernel: self,
             shape,
+            num_active_state_io_requests,
             buffers,
         }
     }
@@ -230,6 +244,7 @@ impl Read {
 pub struct ReadInvocation<'a> {
     kernel: &'a Read,
     shape: Shape,
+    num_active_state_io_requests: ReplayU32,
     buffers: ReadBuffers<'a>,
 }
 
@@ -246,7 +261,7 @@ impl Operator for ReadInvocation<'_> {
         recorder.set_buffer_read(5, self.buffers.conv_state_slots, 0);
         recorder.set_u32(6, config.num_gdn_layers);
         recorder.set_u32(7, config.num_state_slots);
-        recorder.set_u32(8, self.shape.num_state_io_requests);
+        bind_active_state_io_requests(recorder, 8, self.shape, self.num_active_state_io_requests);
         recorder.set_u32(9, config.recurrent_state_bytes.div_ceil(config.page_bytes));
         recorder.set_u32(10, config.recurrent_state_bytes);
         recorder.set_u32(11, config.conv_state_bytes.div_ceil(config.page_bytes));
@@ -271,6 +286,23 @@ impl ReadInvocation<'_> {
     }
 }
 
+fn bind_active_state_io_requests(
+    recorder: &CommandRecorder<'_>,
+    index: usize,
+    shape: Shape,
+    num_active_state_io_requests: ReplayU32,
+) {
+    match num_active_state_io_requests {
+        ReplayU32::Fixed(value) => {
+            assert_eq!(value, shape.num_total_state_io_requests);
+            recorder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => {
+            recorder.bind_u32(index, key, 1, shape.num_total_state_io_requests);
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
@@ -281,7 +313,13 @@ mod tests {
     use super::WriteBuffers;
     use crate::metal::Buffer;
     use crate::metal::Device;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
+    use crate::metal::ReplayU32;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_STATE_IO_REQUESTS: ReplayParameterKey =
+        ReplayParameterKey::new("test.gdn_state_pages.num_active_state_io_requests");
 
     #[test]
     fn test_read_and_write_share_the_state_page_constants() {
@@ -300,7 +338,7 @@ mod tests {
             page_bytes: 16,
         }
         .num_total_pages(Shape {
-            num_state_io_requests: 1,
+            num_total_state_io_requests: 1,
         });
     }
 
@@ -318,7 +356,7 @@ mod tests {
         let page_read = Read::new(&device, config);
         let page_write = Write::new(&device, config);
         let shape = Shape {
-            num_state_io_requests: 2,
+            num_total_state_io_requests: 2,
         };
         let recurrent_values = (0..48).map(|value| value as f32 + 10.0).collect::<Vec<_>>();
         let conv_values = (0..24).map(|value| value as f32 + 100.0).collect::<Vec<_>>();
@@ -336,6 +374,7 @@ mod tests {
         let mut write = stream.create_replay_program();
         write.record(page_write.invoke(
             shape,
+            ReplayU32::Fixed(shape.num_total_state_io_requests),
             WriteBuffers {
                 pages: &pages,
                 recurrent_states: &recurrent_source,
@@ -364,6 +403,7 @@ mod tests {
         let mut read = stream.create_replay_program();
         read.record(page_read.invoke(
             shape,
+            ReplayU32::Fixed(shape.num_total_state_io_requests),
             ReadBuffers {
                 pages: &pages,
                 recurrent_states: &recurrent_target,
@@ -394,6 +434,72 @@ mod tests {
                 };
                 assert_eq!(conv_target.read_typed::<f32>(conv_start, 4), expected);
             }
+        }
+    }
+
+    #[test]
+    fn test_read_replay_active_prefix_matches_cpu_reference() {
+        const NUM_TOTAL_REQUESTS: u32 = 8;
+        const VALUES_PER_PAGE: usize = 4;
+        const CANARY: f32 = -777.0;
+        const ACTIVE_COUNTS: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
+
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = Config {
+            num_gdn_layers: 1,
+            num_state_slots: NUM_TOTAL_REQUESTS,
+            recurrent_state_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
+            conv_state_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
+            page_bytes: (VALUES_PER_PAGE * size_of::<f32>()) as u32,
+        };
+        let shape = Shape {
+            num_total_state_io_requests: NUM_TOTAL_REQUESTS,
+        };
+        let page_values = (0..NUM_TOTAL_REQUESTS as usize * 2 * VALUES_PER_PAGE)
+            .map(|index| index as f32 + 1.0)
+            .collect::<Vec<_>>();
+        let pages = Buffer::from_slice(&device, &page_values);
+        let page_ids = Buffer::from_slice(&device, &(0..NUM_TOTAL_REQUESTS * 2).collect::<Vec<_>>());
+        let state_slots = Buffer::from_slice(&device, &(0..NUM_TOTAL_REQUESTS).collect::<Vec<_>>());
+        let state_values = NUM_TOTAL_REQUESTS as usize * VALUES_PER_PAGE;
+        let recurrent_states = Buffer::from_slice(&device, &vec![CANARY; state_values]);
+        let conv_states = Buffer::from_slice(&device, &vec![CANARY; state_values]);
+        let read = Read::new(&device, config);
+        let mut builder = stream.create_replay_program();
+        builder.record(read.invoke(
+            shape,
+            ReplayU32::Parameter(NUM_ACTIVE_STATE_IO_REQUESTS),
+            ReadBuffers {
+                pages: &pages,
+                recurrent_states: &recurrent_states,
+                conv_states: &conv_states,
+                page_ids: &page_ids,
+                recurrent_state_slots: &state_slots,
+                conv_state_slots: &state_slots,
+            },
+        ));
+        let replay = builder.build();
+
+        for num_active_requests in ACTIVE_COUNTS {
+            recurrent_states.write_typed(0, &vec![CANARY; state_values]);
+            conv_states.write_typed(0, &vec![CANARY; state_values]);
+            let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_STATE_IO_REQUESTS, num_active_requests);
+            stream.submit_replay_with_arguments(&replay, &arguments).wait();
+
+            let mut expected_recurrent = vec![CANARY; state_values];
+            let mut expected_conv = vec![CANARY; state_values];
+            for request_index in 0..num_active_requests as usize {
+                let state_begin = request_index * VALUES_PER_PAGE;
+                let recurrent_page_begin = request_index * 2 * VALUES_PER_PAGE;
+                let conv_page_begin = recurrent_page_begin + VALUES_PER_PAGE;
+                expected_recurrent[state_begin..state_begin + VALUES_PER_PAGE]
+                    .copy_from_slice(&page_values[recurrent_page_begin..recurrent_page_begin + VALUES_PER_PAGE]);
+                expected_conv[state_begin..state_begin + VALUES_PER_PAGE]
+                    .copy_from_slice(&page_values[conv_page_begin..conv_page_begin + VALUES_PER_PAGE]);
+            }
+            assert_eq!(recurrent_states.read_typed::<f32>(0, state_values), expected_recurrent);
+            assert_eq!(conv_states.read_typed::<f32>(0, state_values), expected_conv);
         }
     }
 }

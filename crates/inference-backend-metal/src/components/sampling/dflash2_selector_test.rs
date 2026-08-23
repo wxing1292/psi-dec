@@ -2,10 +2,14 @@ use half::bf16;
 
 use super::*;
 use crate::metal::ReplayArguments;
+use crate::metal::ReplayParameterKey;
 use crate::metal::Stream;
 
+const TEST_NUM_ACTIVE_REQUESTS: ReplayParameterKey =
+    ReplayParameterKey::new("test.dflash2_selector.num_active_requests");
+
 #[test]
-fn test_scores_and_probabilistic_walk_match_reference_and_preserve_inactive_rows() {
+fn test_replay_matches_reference_for_all_active_request_counts() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let config = Config {
@@ -14,12 +18,16 @@ fn test_scores_and_probabilistic_walk_match_reference_and_preserve_inactive_rows
         embedding_dtype: Dtype::Bfloat16,
     };
     let shape = Shape {
-        num_total_requests: 2,
+        num_total_requests: 8,
         num_steps: 2,
     };
-    let candidates = vec![10, 20, 30, 40, 50, 60, 110, 120, 130, 140, 150, 160];
-    let anchors = vec![7, 107];
-    let expected_predecessors = vec![7, 7, 7, 10, 20, 30, 107, 107, 107, 110, 120, 130];
+    let candidates = (0..config.candidate_count(shape))
+        .map(|index| 1_000 + index as i32)
+        .collect::<Vec<_>>();
+    let anchors = (0..shape.num_total_requests)
+        .map(|request| 10_000 + request as i32)
+        .collect::<Vec<_>>();
+    let expected_predecessors = predecessor_reference(shape, config.top_k, &anchors, &candidates);
     let predecessor_embeddings = embedding_rows(&expected_predecessors, config.rank as usize, 0.013);
     let successor_embeddings = embedding_rows(&candidates, config.rank as usize, -0.009);
     let projected_hidden = (0..shape.proposal_count() * config.rank as usize)
@@ -30,25 +38,28 @@ fn test_scores_and_probabilistic_walk_match_reference_and_preserve_inactive_rows
         .collect::<Vec<_>>();
     let anchor_buffer = Buffer::from_slice(&device, &anchors);
     let candidate_buffer = Buffer::from_slice(&device, &candidates);
-    let predecessor_id_buffer = Buffer::from_slice(&device, &vec![i32::MIN; candidates.len()]);
+    let predecessor_id_buffer = Buffer::new_zeroed(&device, candidates.len() * size_of::<i32>());
     let predecessor_embedding_buffer = Buffer::from_slice(&device, &predecessor_embeddings);
     let successor_embedding_buffer = Buffer::from_slice(&device, &successor_embeddings);
     let hidden_buffer = Buffer::from_slice(&device, &projected_hidden);
     let logit_buffer = Buffer::from_slice(&device, &candidate_logits);
-    let score_canary = -777.0f32;
-    let score_buffer = Buffer::from_slice(&device, &vec![score_canary; config.score_count(shape)]);
+    let score_buffer = Buffer::new_zeroed(&device, config.score_count(shape) * size_of::<f32>());
     let runtime_params = Buffer::new_zeroed(&device, shape.num_total_requests as usize * 4 * size_of::<u32>());
     for request in 0..shape.num_total_requests as usize {
         runtime_params.write_typed(request * 4, &[0.8f32]);
-        runtime_params.write_typed(request * 4 + 1, &[17u32, 29, 0xD1A5_0001]);
+        runtime_params.write_typed(
+            request * 4 + 1,
+            &[17 + request as u32, 29 + request as u32, 0xD1A5_0001],
+        );
     }
-    let distribution_indices = Buffer::from_slice(&device, &[2u32, 3, 4, 5]);
-    let proposal_token_ids = Buffer::from_slice(&device, &[i32::MIN; 4]);
-    let proposal_probs = Buffer::from_slice(&device, &[-1.0f32; 4]);
-    let distribution_token_ids = Buffer::from_slice(&device, &[i32::MIN; 6 * 4]);
-    let distribution_probs = Buffer::from_slice(&device, &[-1.0f32; 6 * 4]);
+    let proposal_count = shape.proposal_count();
+    let distribution_indices = Buffer::from_slice(&device, &(0..proposal_count as u32).collect::<Vec<_>>());
+    let proposal_token_ids = Buffer::new_zeroed(&device, proposal_count * size_of::<i32>());
+    let proposal_probs = Buffer::new_zeroed(&device, proposal_count * size_of::<f32>());
+    let distribution_token_ids = Buffer::new_zeroed(&device, proposal_count * 4 * size_of::<i32>());
+    let distribution_probs = Buffer::new_zeroed(&device, proposal_count * 4 * size_of::<f32>());
     let compute = Compute::new(&device, config);
-    let active = ReplayU32::Parameter(NUM_ACTIVE_REQUESTS_KEY);
+    let active = ReplayU32::Parameter(TEST_NUM_ACTIVE_REQUESTS);
     let mut builder = stream.create_replay_program();
     builder.record(compute.invoke_predecessor_ids(
         shape,
@@ -83,18 +94,10 @@ fn test_scores_and_probabilistic_walk_match_reference_and_preserve_inactive_rows
             distribution_token_ids: &distribution_token_ids,
             distribution_probs: &distribution_probs,
             max_distribution_k: 4,
-            num_output_distributions: 6,
+            num_output_distributions: proposal_count as u32,
         },
     ));
     let replay = builder.build();
-    let mut arguments = ReplayArguments::new();
-    compute.add_replay_arguments(shape, 1, &mut arguments);
-    stream.submit_replay_with_arguments(&replay, &arguments).wait();
-
-    assert_eq!(
-        predecessor_id_buffer.read_typed::<i32>(0, candidates.len()),
-        [expected_predecessors[..6].to_vec(), vec![i32::MIN; 6]].concat()
-    );
     let expected_scores = score_reference(
         config,
         shape,
@@ -103,33 +106,83 @@ fn test_scores_and_probabilistic_walk_match_reference_and_preserve_inactive_rows
         &predecessor_embeddings,
         &successor_embeddings,
     );
-    let actual_scores = score_buffer.read_typed::<f32>(0, config.score_count(shape));
-    for (actual, expected) in actual_scores[..18].iter().zip(&expected_scores[..18]) {
-        assert!(
-            (actual - expected).abs() < 2.0e-4,
-            "actual={actual} expected={expected}"
-        );
-    }
-    assert_eq!(&actual_scores[18..], &vec![score_canary; 18]);
 
-    let (expected_tokens, expected_probs, expected_distributions) =
-        walk_reference(config, &candidates[..6], &actual_scores[..18], 0.8, 17, 29, 0xD1A5_0001);
-    assert_eq!(proposal_token_ids.read_typed::<i32>(0, 2), expected_tokens);
-    assert_eq!(proposal_token_ids.read_typed::<i32>(2, 2), vec![i32::MIN; 2]);
-    for (actual, expected) in proposal_probs.read_typed::<f32>(0, 2).iter().zip(expected_probs) {
-        assert!((actual - expected).abs() < 1.0e-6);
-    }
-    for step in 0..2 {
-        let distribution = 2 + step;
-        let ids = distribution_token_ids.read_typed::<i32>(distribution * 4, 4);
-        let probs = distribution_probs.read_typed::<f32>(distribution * 4, 4);
-        assert_eq!(&ids[..3], &candidates[step * 3..step * 3 + 3]);
-        assert_eq!(ids[3], -1);
-        for candidate in 0..3 {
-            assert!((probs[candidate] - expected_distributions[step][candidate]).abs() < 1.0e-6);
+    for num_active_requests in [1, 8, 3, 7, 2, 6, 4, 5] {
+        let arguments = ReplayArguments::new().with_u32(TEST_NUM_ACTIVE_REQUESTS, num_active_requests);
+        stream.submit_replay_with_arguments(&replay, &arguments).wait();
+
+        let active_candidate_count = num_active_requests as usize * shape.num_steps as usize * config.top_k as usize;
+        assert_eq!(
+            predecessor_id_buffer.read_typed::<i32>(0, active_candidate_count),
+            expected_predecessors[..active_candidate_count]
+        );
+        let active_score_count = active_candidate_count * config.top_k as usize;
+        let actual_scores = score_buffer.read_typed::<f32>(0, active_score_count);
+        for (actual, expected) in actual_scores.iter().zip(&expected_scores[..active_score_count]) {
+            assert!(
+                (actual - expected).abs() < 2.0e-4,
+                "actual={actual} expected={expected}"
+            );
         }
-        assert_eq!(probs[3], 0.0);
+
+        for request in 0..num_active_requests as usize {
+            let candidate_begin = request * shape.num_steps as usize * config.top_k as usize;
+            let candidate_end = candidate_begin + shape.num_steps as usize * config.top_k as usize;
+            let score_begin = request * shape.num_steps as usize * (config.top_k * config.top_k) as usize;
+            let score_end = score_begin + shape.num_steps as usize * (config.top_k * config.top_k) as usize;
+            let (expected_tokens, expected_probs, expected_distributions) = walk_reference(
+                config,
+                &candidates[candidate_begin..candidate_end],
+                &actual_scores[score_begin..score_end],
+                0.8,
+                17 + request as u32,
+                29 + request as u32,
+                0xD1A5_0001,
+            );
+            let proposal_begin = request * shape.num_steps as usize;
+            assert_eq!(
+                proposal_token_ids.read_typed::<i32>(proposal_begin, shape.num_steps as usize),
+                expected_tokens
+            );
+            for (actual, expected) in proposal_probs
+                .read_typed::<f32>(proposal_begin, shape.num_steps as usize)
+                .iter()
+                .zip(expected_probs)
+            {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+            for (step, expected_distribution) in expected_distributions.iter().enumerate() {
+                let distribution = proposal_begin + step;
+                let ids = distribution_token_ids.read_typed::<i32>(distribution * 4, 4);
+                let probs = distribution_probs.read_typed::<f32>(distribution * 4, 4);
+                let candidate_step_begin = candidate_begin + step * config.top_k as usize;
+                assert_eq!(
+                    &ids[..config.top_k as usize],
+                    &candidates[candidate_step_begin..candidate_step_begin + config.top_k as usize]
+                );
+                assert_eq!(ids[config.top_k as usize], -1);
+                for candidate in 0..config.top_k as usize {
+                    assert!((probs[candidate] - expected_distribution[candidate]).abs() < 1.0e-6);
+                }
+                assert_eq!(probs[config.top_k as usize], 0.0);
+            }
+        }
     }
+}
+
+fn predecessor_reference(shape: Shape, top_k: u32, anchors: &[i32], candidates: &[i32]) -> Vec<i32> {
+    let mut predecessors = Vec::with_capacity(candidates.len());
+    for (request, &anchor) in anchors.iter().enumerate() {
+        for step in 0..shape.num_steps as usize {
+            if step == 0 {
+                predecessors.extend(std::iter::repeat_n(anchor, top_k as usize));
+            } else {
+                let begin = (request * shape.num_steps as usize + step - 1) * top_k as usize;
+                predecessors.extend_from_slice(&candidates[begin..begin + top_k as usize]);
+            }
+        }
+    }
+    predecessors
 }
 
 fn embedding_rows(token_ids: &[i32], rank: usize, scale: f32) -> Vec<u16> {

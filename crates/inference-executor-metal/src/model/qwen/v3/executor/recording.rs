@@ -6,10 +6,9 @@ impl Qwen3Executor {
     fn submit_main_recording(&self, recorder: &Qwen3ModelOpsRecorder) -> MetalReplaySubmission {
         let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
         let main_replay = self.main.replay(&recorder.main_key);
-        let empty_arguments = ReplayArguments::new();
         let mut sequence = vec![
-            ReplayExecution::new(main_embed_replay, &empty_arguments),
-            ReplayExecution::new(main_replay, &empty_arguments),
+            ReplayExecution::new(main_embed_replay, &recorder.main_embed_arguments),
+            ReplayExecution::new(main_replay, &recorder.main_arguments),
         ];
         if let Some(gather_unembed_key) = &recorder.gather_unembed_key {
             assert!(
@@ -18,7 +17,7 @@ impl Qwen3Executor {
             );
             sequence.push(ReplayExecution::new(
                 self.gather_unembed.replay(gather_unembed_key),
-                &empty_arguments,
+                &recorder.gather_unembed_arguments,
             ));
             if let Some(rejection_key) = &recorder.rejection_key {
                 assert!(

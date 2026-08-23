@@ -9,6 +9,7 @@ use inference_backend_metal::components::gdn::state_pages;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 
 const STATE_PAGE_FLOATS: usize = 32 * 1024 / size_of::<f32>();
@@ -132,7 +133,10 @@ fn build_restore_replay(
     let read = state_pages::Read::new(device, config);
     let mut builder = stream.create_replay_program();
     builder.record(read.invoke(
-        state_pages::Shape { num_state_io_requests },
+        state_pages::Shape {
+            num_total_state_io_requests: num_state_io_requests,
+        },
+        ReplayU32::Fixed(num_state_io_requests),
         state_pages::ReadBuffers {
             pages: bindings.pages,
             recurrent_states: bindings.recurrent_states,
@@ -155,7 +159,10 @@ fn build_publish_replay(
     let write = state_pages::Write::new(device, config);
     let mut builder = stream.create_replay_program();
     builder.record(write.invoke(
-        state_pages::Shape { num_state_io_requests },
+        state_pages::Shape {
+            num_total_state_io_requests: num_state_io_requests,
+        },
+        ReplayU32::Fixed(num_state_io_requests),
         state_pages::WriteBuffers {
             pages: bindings.pages,
             recurrent_states: bindings.recurrent_states,

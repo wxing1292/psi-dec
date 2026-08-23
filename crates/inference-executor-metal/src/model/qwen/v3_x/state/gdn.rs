@@ -3,6 +3,8 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::GDNReplayShape;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
@@ -29,6 +31,9 @@ use crate::trace;
 
 mod file_io;
 
+const GDN_STATE_RESTORE_NUM_ACTIVE_REQUESTS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.gdn_state_restore.num_active_requests");
+
 pub struct Qwen3xGDNState {
     backend: Option<Rc<GDN>>,
     scratch: Option<Rc<GDNScratch>>,
@@ -45,7 +50,7 @@ pub struct Qwen3xGDNState {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GDNStateRestoreKey {
-    num_state_io_requests: usize,
+    num_total_state_io_requests: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -61,13 +66,29 @@ impl ReplayComponent for GDNStateRestore {
     type Input<'a> = GDNStateRestoreInput<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        let num_state_io_requests = input.request_state_table.restores().len();
-        assert!(num_state_io_requests > 0, "GDN restore replay requires restore jobs");
-        GDNStateRestoreKey { num_state_io_requests }
+        let num_total_state_io_requests = input
+            .request_state_table
+            .restores()
+            .len()
+            .try_into()
+            .expect("GDN restore I/O request count must fit u32");
+        assert!(
+            num_total_state_io_requests > 0,
+            "GDN restore replay requires restore jobs"
+        );
+        GDNStateRestoreKey {
+            num_total_state_io_requests,
+        }
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        input.request_state_table.record_restore(recorder, input.pages);
+        let key = self.replay_key(input);
+        input.request_state_table.record_restore(
+            recorder,
+            input.pages,
+            key.num_total_state_io_requests,
+            ReplayU32::Parameter(GDN_STATE_RESTORE_NUM_ACTIVE_REQUESTS),
+        );
     }
 }
 
@@ -206,7 +227,11 @@ impl Qwen3xGDNState {
         };
         let (key, cache_hit) = self.state_restore.record(runtime, &input);
         trace::gdn_state(|| format!("event=gdn_restore key={key:?} cache_hit={cache_hit}"));
-        runtime.submit_replay(self.state_restore.replay(&key)).wait();
+        let arguments =
+            ReplayArguments::new().with_u32(GDN_STATE_RESTORE_NUM_ACTIVE_REQUESTS, key.num_total_state_io_requests);
+        runtime
+            .submit_replay_with_arguments(self.state_restore.replay(&key), &arguments)
+            .wait();
         self.request_state_table.finish_restore();
     }
 

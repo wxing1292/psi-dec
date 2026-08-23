@@ -7,6 +7,7 @@ use std::rc::Rc;
 use inference_backend_metal::components::gdn::state_pages as backend_state_pages;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GDNCore;
 use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::attn::gdn::state::to_candidate_state_version;
@@ -333,8 +334,13 @@ impl GDNRequestStateTable {
         true
     }
 
-    pub fn record_restore<'a, R>(&'a self, recorder: &mut R, pages: &'a Buffer)
-    where
+    pub fn record_restore<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        pages: &'a Buffer,
+        num_total_state_io_requests: u32,
+        num_active_state_io_requests: ReplayU32,
+    ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let restores = self.restores.borrow();
@@ -346,6 +352,8 @@ impl GDNRequestStateTable {
             &resources.conv_states,
             self.layout,
             &restores,
+            num_total_state_io_requests,
+            num_active_state_io_requests,
         );
     }
 
@@ -697,6 +705,7 @@ impl GDNStatePageIO {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_restore<'a, R>(
         &'a self,
         recorder: &mut R,
@@ -705,6 +714,8 @@ impl GDNStatePageIO {
         conv_states: &'a Buffer,
         layout: GDNStateLayout,
         restores: &[GDNStateRestore],
+        num_total_state_io_requests: u32,
+        num_active_state_io_requests: ReplayU32,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -713,13 +724,18 @@ impl GDNStatePageIO {
             layout.page_bytes,
             restores.iter().flat_map(|restore| &restore.page_ids),
         );
-        let num_state_io_requests = restores
+        let num_state_io_requests: u32 = restores
             .len()
             .try_into()
             .expect("GDN restore I/O request count must fit u32");
         assert!(num_state_io_requests > 0, "GDN restore recording requires I/O requests");
+        assert_eq!(
+            num_state_io_requests, num_total_state_io_requests,
+            "GDN restore uses identity state-I/O request capacity"
+        );
         recorder.record(ReplayOp::opaque(self.read.invoke(
-            Self::shape(num_state_io_requests),
+            Self::shape(num_total_state_io_requests),
+            num_active_state_io_requests,
             backend_state_pages::ReadBuffers {
                 pages,
                 recurrent_states,
@@ -754,6 +770,7 @@ impl GDNStatePageIO {
         assert!(num_state_io_requests > 0, "GDN publish recording requires I/O requests");
         recorder.record(ReplayOp::opaque(self.write.invoke(
             Self::shape(num_state_io_requests),
+            ReplayU32::Fixed(num_state_io_requests),
             backend_state_pages::WriteBuffers {
                 pages,
                 recurrent_states,
@@ -766,7 +783,9 @@ impl GDNStatePageIO {
     }
 
     fn shape(num_state_io_requests: u32) -> backend_state_pages::Shape {
-        backend_state_pages::Shape { num_state_io_requests }
+        backend_state_pages::Shape {
+            num_total_state_io_requests: num_state_io_requests,
+        }
     }
 
     fn config(layout: GDNStateLayout) -> backend_state_pages::Config {

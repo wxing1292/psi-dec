@@ -2,6 +2,8 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::attn::UngatedGQACore;
@@ -17,6 +19,8 @@ use crate::attn::gqa::batch_metadata::GQAReplayBucketPolicy;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::attn::gqa::ungated_backend::UngatedGQA;
 use crate::attn::gqa::ungated_backend::UngatedGQAInput;
+use crate::attn::gqa::ungated_backend::UngatedGQAReplayTopology;
+use crate::attn::gqa::ungated_backend::add_ungated_gqa_private_replay_arguments;
 use crate::attn::gqa::ungated_scratch::UngatedGQAScratch;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
@@ -112,6 +116,7 @@ impl Qwen3MainGQA {
         output: &'a Buffer,
         pages: &'a Buffer,
         metadata: &'a GQAMetadataBuffers,
+        num_active_tokens: ReplayU32,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -120,10 +125,11 @@ impl Qwen3MainGQA {
             recorder,
             UngatedGQAInput {
                 page_table_layout: self.request_page_table().layout(),
-                gqa_layer_index: self
-                    .model_layer_index
-                    .try_into()
-                    .expect("qwen3 Main GQA layer index must fit u32"),
+                gqa_layer_index: ReplayU32::Fixed(
+                    self.model_layer_index
+                        .try_into()
+                        .expect("qwen3 Main GQA layer index must fit u32"),
+                ),
                 batch_metadata: metadata,
                 hidden_state: input,
                 next_hidden_state: output,
@@ -133,6 +139,7 @@ impl Qwen3MainGQA {
                 },
                 weights: self.weights().as_borrowed(),
                 scratch: self.scratch().bindings(),
+                num_active_tokens,
             },
         );
     }
@@ -153,6 +160,10 @@ impl Qwen3MainGQA {
         self.request_page_table
             .as_deref()
             .expect("qwen3 Main GQA state must be loaded before execution")
+    }
+
+    pub fn replay_topology(&self, metadata: &GQAMetadataBuffers) -> UngatedGQAReplayTopology {
+        self.backend().replay_topology(metadata)
     }
 }
 
@@ -257,8 +268,13 @@ impl Qwen3MainGQAState {
         page_ids
     }
 
-    pub fn prepare_metadata(&self, req_slots: &[u32], token_indices: &[u32], cu_tokens: &[u32]) -> GQAReplayShape {
-        let num_total_tokens = cu_tokens.last().copied().unwrap_or_default();
+    pub fn prepare_metadata(
+        &self,
+        req_slots: &[u32],
+        token_indices: &[u32],
+        cu_tokens: &[u32],
+        num_total_tokens: u32,
+    ) -> GQAReplayShape {
         self.backend().prepare(
             self.metadata(),
             req_slots,
@@ -267,6 +283,14 @@ impl Qwen3MainGQAState {
             &self.replay_bucket_policy,
             num_total_tokens,
         )
+    }
+
+    pub fn replay_topology(&self) -> UngatedGQAReplayTopology {
+        self.backend().replay_topology(self.metadata())
+    }
+
+    pub fn add_private_replay_arguments(&self, arguments: &mut ReplayArguments) {
+        add_ungated_gqa_private_replay_arguments(self.metadata().replay_shape(), self.replay_topology(), arguments);
     }
 
     pub fn reset_req_slots(&self, req_slots: &[RawRequestSlot]) {

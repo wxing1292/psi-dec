@@ -267,9 +267,6 @@ impl MapCompute {
             num_active_sampling_inputs > 0 && num_active_sampling_inputs <= shape.num_total_sampling_inputs,
             "DSpark Markov active sampling inputs must fit the recorded capacity"
         );
-        if shape.num_total_sampling_inputs <= 1 {
-            return;
-        }
         let num_partitions = shape
             .vocab_size
             .div_ceil(self.partial_candidate_layout().vocab_partition_size());
@@ -321,16 +318,12 @@ impl Operator for MapInvocation<'_> {
         recorder.set_buffer_read(7, self.buffers.w2_biases, 0);
         recorder.set_buffer_write(8, self.buffers.tile_token_ids, 0);
         recorder.set_buffer_write(9, self.buffers.tile_logits, 0);
-        if num_threads_per_row == num_total_threads {
-            recorder.set_u32(10, num_total_threads);
-        } else {
-            recorder.bind_u32(
-                10,
-                top_k::MAP_NUM_ACTIVE_THREADS_KEY,
-                num_threads_per_row,
-                num_total_threads,
-            );
-        }
+        recorder.bind_u32(
+            10,
+            top_k::MAP_NUM_ACTIVE_THREADS_KEY,
+            num_threads_per_row,
+            num_total_threads,
+        );
         recorder.set_u32(11, sampling.top_k);
         recorder.set_u32(12, num_partitions);
         recorder.set_u32(13, self.shape.base_logits_row_offset);

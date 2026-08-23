@@ -6,6 +6,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
 use inference_executor_core::backend::recorder::Recorder;
@@ -32,6 +33,13 @@ use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
 use crate::sampling::spec_probs::SpecProbsStore;
+
+const DFLASH2_OUTPUT_NUM_ACTIVE_PROPOSAL_ROWS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.dflash2.output.num_active_proposal_rows");
+const DFLASH2_OUTPUT_NUM_ACTIVE_CANDIDATES: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.dflash2.output.num_active_candidates");
+const DFLASH2_OUTPUT_NUM_ACTIVE_REQUESTS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.dflash2.output.num_active_requests");
 
 pub struct Qwen3xDFlash2Proposal {
     pub token_ids: Vec<Vec<u32>>,
@@ -98,7 +106,9 @@ pub struct Qwen3xDFlash2OutputArgs<'a> {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDFlash2OutputReplayKey {
-    num_requests: u32,
+    num_total_requests: u32,
+    unembed_topology: affine_quantized::KernelKind,
+    hidden_projection_topology: affine_quantized::KernelKind,
 }
 
 impl Qwen3xDFlash2Output {
@@ -373,6 +383,16 @@ impl Qwen3xDFlash2Output {
 
     pub fn add_replay_arguments(&self, num_requests: u32, arguments: &mut ReplayArguments) {
         let top_k_shape = self.top_k_shape(num_requests);
+        let selector_shape = self.selector_shape(num_requests);
+        let num_proposal_rows = top_k_shape.num_total_sampling_inputs;
+        let candidate_count = self
+            .selector_config
+            .candidate_count(selector_shape)
+            .try_into()
+            .expect("Qwen3x DFlash2 active candidate count must fit u32");
+        arguments.set_u32(DFLASH2_OUTPUT_NUM_ACTIVE_PROPOSAL_ROWS, num_proposal_rows);
+        arguments.set_u32(DFLASH2_OUTPUT_NUM_ACTIVE_CANDIDATES, candidate_count);
+        arguments.set_u32(DFLASH2_OUTPUT_NUM_ACTIVE_REQUESTS, num_requests);
         self.top_k_map
             .add_replay_arguments(top_k_shape, top_k_shape.num_total_sampling_inputs, arguments);
         self.top_k_reduce
@@ -433,7 +453,13 @@ impl ReplayComponent for Qwen3xDFlash2Output {
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         Qwen3xDFlash2OutputReplayKey {
-            num_requests: input.num_requests,
+            num_total_requests: input.num_requests,
+            unembed_topology: self
+                .unembed()
+                .replay_topology(input.num_requests * self.num_spec_tokens),
+            hidden_projection_topology: self
+                .hidden_projection
+                .topology(input.num_requests * self.num_spec_tokens),
         }
     }
 
@@ -442,7 +468,7 @@ impl ReplayComponent for Qwen3xDFlash2Output {
         self.gather.record(
             recorder,
             num_proposal_rows,
-            ReplayU32::Fixed(num_proposal_rows),
+            ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_PROPOSAL_ROWS),
             input.hidden,
             &self.row_indices,
             &self.proposal_hidden,
@@ -452,7 +478,7 @@ impl ReplayComponent for Qwen3xDFlash2Output {
             recorder,
             UnembedInput {
                 num_total_rows: num_proposal_rows,
-                num_active_rows: ReplayU32::Fixed(num_proposal_rows),
+                num_active_rows: ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_PROPOSAL_ROWS),
                 hidden: &self.proposal_hidden,
                 logits: &self.logits,
             },
@@ -484,7 +510,7 @@ impl ReplayComponent for Qwen3xDFlash2Output {
             .expect("Qwen3x DFlash2 selector weights must be loaded before execution");
         recorder.record_with_barrier_before(ReplayOp::opaque(self.hidden_projection.invoke(
             num_proposal_rows,
-            ReplayU32::Fixed(num_proposal_rows),
+            ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_PROPOSAL_ROWS),
             &self.projected_hidden,
             0,
             &self.proposal_hidden,
@@ -499,7 +525,7 @@ impl ReplayComponent for Qwen3xDFlash2Output {
         let selector_shape = self.selector_shape(input.num_requests);
         recorder.record_with_barrier_before(ReplayOp::opaque(self.selector.invoke_predecessor_ids(
             selector_shape,
-            ReplayU32::Fixed(input.num_requests),
+            ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_REQUESTS),
             dflash2_selector::PredecessorIdBuffers {
                 anchor_token_ids: &self.anchor_token_ids,
                 candidate_token_ids: &self.candidate_token_ids,
@@ -512,7 +538,7 @@ impl ReplayComponent for Qwen3xDFlash2Output {
             recorder,
             EmbedInput {
                 num_total_tokens: candidate_count,
-                num_active_tokens: ReplayU32::Fixed(candidate_count),
+                num_active_tokens: ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_CANDIDATES),
                 token_ids: &self.predecessor_token_ids,
                 output_hidden: &self.predecessor_embeddings,
             },
@@ -522,14 +548,14 @@ impl ReplayComponent for Qwen3xDFlash2Output {
             recorder,
             EmbedInput {
                 num_total_tokens: candidate_count,
-                num_active_tokens: ReplayU32::Fixed(candidate_count),
+                num_active_tokens: ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_CANDIDATES),
                 token_ids: &self.candidate_token_ids,
                 output_hidden: &self.successor_embeddings,
             },
         );
         recorder.record_with_barrier_before(ReplayOp::opaque(self.selector.invoke_scores(
             selector_shape,
-            ReplayU32::Fixed(input.num_requests),
+            ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_REQUESTS),
             dflash2_selector::ScoreBuffers {
                 candidate_logits: &self.candidate_logits,
                 projected_hidden: &self.projected_hidden,
@@ -540,7 +566,7 @@ impl ReplayComponent for Qwen3xDFlash2Output {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.selector.invoke_walk(
             selector_shape,
-            ReplayU32::Fixed(input.num_requests),
+            ReplayU32::Parameter(DFLASH2_OUTPUT_NUM_ACTIVE_REQUESTS),
             dflash2_selector::WalkBuffers {
                 candidate_token_ids: &self.candidate_token_ids,
                 scores: &self.scores,

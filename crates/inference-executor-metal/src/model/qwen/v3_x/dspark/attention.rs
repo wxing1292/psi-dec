@@ -120,10 +120,12 @@ impl Qwen3xDSparkAttention {
             .expect("Qwen3.x DSpark attention weights must be loaded before execution")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_prefill<'a, R>(
         &'a self,
         recorder: &mut R,
-        num_tokens: u32,
+        num_total_tokens: u32,
+        num_active_tokens: inference_backend_metal::metal::ReplayU32,
         main_feature: &'a Buffer,
         req_slots: &'a Buffer,
         flat_token_indices: &'a Buffer,
@@ -134,7 +136,8 @@ impl Qwen3xDSparkAttention {
         self.context_appender.record(
             recorder,
             BlockSpecGQAContextInput {
-                num_tokens,
+                num_total_tokens,
+                num_active_tokens,
                 page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dspark_layer_index,
                 main_feature,
@@ -153,6 +156,7 @@ impl Qwen3xDSparkAttention {
     pub fn record_block<'a, R>(
         &'a self,
         recorder: &mut R,
+        num_active_tokens: inference_backend_metal::metal::ReplayU32,
         metadata: &'a BlockSpecGQAMetadataBuffers,
         hidden_input: &'a Buffer,
         hidden_output: &'a Buffer,
@@ -175,6 +179,7 @@ impl Qwen3xDSparkAttention {
                 },
                 weights: self.weights().as_borrowed(),
                 scratch: self.block_scratch().bindings(),
+                num_active_tokens,
             },
         );
     }

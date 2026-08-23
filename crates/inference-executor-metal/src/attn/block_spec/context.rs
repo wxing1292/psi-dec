@@ -33,7 +33,8 @@ pub struct BlockSpecGQAContextScratchBindings<'a> {
 
 #[derive(Clone, Copy)]
 pub struct BlockSpecGQAContextInput<'a> {
-    pub num_tokens: u32,
+    pub num_total_tokens: u32,
+    pub num_active_tokens: ReplayU32,
     pub page_table_layout: GQAPageTableLayout,
     pub gqa_layer_index: u32,
     pub main_feature: &'a Buffer,
@@ -119,9 +120,9 @@ impl BlockSpecGQAContextAppender {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        assert!(input.num_tokens > 0, "block-spec context append requires tokens");
+        assert!(input.num_total_tokens > 0, "block-spec context append requires tokens");
         assert!(
-            input.num_tokens as usize <= input.scratch.max_tokens,
+            input.num_total_tokens as usize <= input.scratch.max_tokens,
             "block-spec context append exceeds scratch"
         );
         input.page_table_layout.validate();
@@ -129,10 +130,10 @@ impl BlockSpecGQAContextAppender {
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
             "block-spec context layer index exceeds the page table"
         );
-        let num_tokens = input.num_tokens;
+        let num_total_tokens = input.num_total_tokens;
         recorder.record_with_barrier_before(ReplayOp::opaque(self.k.invoke(
-            num_tokens,
-            ReplayU32::Fixed(num_tokens),
+            num_total_tokens,
+            input.num_active_tokens,
             input.scratch.k,
             0,
             input.main_feature,
@@ -145,8 +146,8 @@ impl BlockSpecGQAContextAppender {
             input.weights.k.biases_offset,
         )));
         recorder.record(ReplayOp::opaque(self.v.invoke(
-            num_tokens,
-            ReplayU32::Fixed(num_tokens),
+            num_total_tokens,
+            input.num_active_tokens,
             input.scratch.v,
             0,
             input.main_feature,
@@ -159,20 +160,18 @@ impl BlockSpecGQAContextAppender {
             input.weights.v.biases_offset,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.k_norm_rope.invoke(
-            rms_norm_rope::Shape {
-                num_total_tokens: input.num_tokens,
-            },
+            rms_norm_rope::Shape { num_total_tokens },
             rms_norm_rope::Buffers {
                 input: input.scratch.k,
                 norm_weight: input.weights.k_norm_weight,
                 flat_token_indices: input.flat_token_indices,
                 output: input.scratch.k_norm_rope,
             },
-            ReplayU32::Fixed(input.num_tokens),
+            input.num_active_tokens,
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.kv_page_write.invoke(
             backend_kv_page_write::Shape {
-                num_total_token_writes: input.num_tokens,
+                num_total_token_writes: num_total_tokens,
                 page_table_layout: backend_kv_page_write::PageTableLayout {
                     num_req_slots: input.page_table_layout.num_req_slots,
                     num_gqa_layers: input.page_table_layout.num_gqa_layers,
@@ -188,7 +187,7 @@ impl BlockSpecGQAContextAppender {
                 flat_token_indices: input.flat_token_indices,
                 page_ids: input.kv_cache.page_ids,
             },
-            ReplayU32::Fixed(input.num_tokens),
+            input.num_active_tokens,
             ReplayU32::Fixed(input.gqa_layer_index),
         )));
     }

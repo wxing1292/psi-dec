@@ -122,15 +122,11 @@ impl Compute {
             num_active_draft_distributions <= shape.num_total_draft_distributions,
             "sparse rejection active draft distributions must fit the recorded capacity"
         );
-        if shape.num_total_reqs > 1 {
-            arguments.set_u32(
-                NUM_ACTIVE_THREADS_KEY,
-                checked_num_threads(num_active_reqs, self.constants.thread_block.required_threads),
-            );
-        }
-        if shape.num_total_target_distributions > 1 {
-            arguments.set_u32(NUM_TARGET_DISTRIBUTIONS_KEY, num_active_target_distributions);
-        }
+        arguments.set_u32(
+            NUM_ACTIVE_THREADS_KEY,
+            checked_num_threads(num_active_reqs, self.constants.thread_block.required_threads),
+        );
+        arguments.set_u32(NUM_TARGET_DISTRIBUTIONS_KEY, num_active_target_distributions);
         if shape.num_total_draft_distributions > 0 {
             arguments.set_u32(NUM_DRAFT_DISTRIBUTIONS_KEY, num_active_draft_distributions);
         }
@@ -304,21 +300,13 @@ impl Operator for Invocation<'_> {
         recorder.set_u32(19, self.shape.max_draft_k);
         let num_threads_per_req = self.kernel.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_reqs, num_threads_per_req);
-        if num_threads_per_req == num_total_threads {
-            recorder.set_u32(14, num_total_threads);
-        } else {
-            recorder.bind_u32(14, NUM_ACTIVE_THREADS_KEY, num_threads_per_req, num_total_threads);
-        }
-        if self.shape.num_total_target_distributions == 1 {
-            recorder.set_u32(15, 1);
-        } else {
-            recorder.bind_u32(
-                15,
-                NUM_TARGET_DISTRIBUTIONS_KEY,
-                1,
-                self.shape.num_total_target_distributions,
-            );
-        }
+        recorder.bind_u32(14, NUM_ACTIVE_THREADS_KEY, num_threads_per_req, num_total_threads);
+        recorder.bind_u32(
+            15,
+            NUM_TARGET_DISTRIBUTIONS_KEY,
+            1,
+            self.shape.num_total_target_distributions,
+        );
         if self.shape.num_total_draft_distributions == 0 {
             recorder.set_u32(16, 0);
         } else {

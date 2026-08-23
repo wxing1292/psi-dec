@@ -50,7 +50,8 @@ use crate::sampling::top_k_sampling::TopKSamplingRuntimeParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DSparkMarkovReplayShape {
-    pub num_requests: u32,
+    pub num_total_requests: u32,
+    pub num_active_requests: u32,
     pub sampling: TopKSamplingShape,
 }
 
@@ -219,7 +220,8 @@ impl DSparkMarkovSampling {
             }
         }
         DSparkMarkovReplayShape {
-            num_requests: req_slots.len() as u32,
+            num_total_requests: req_slots.len() as u32,
+            num_active_requests: req_slots.len() as u32,
             sampling: sampling.expect("DSpark Markov requires steps"),
         }
     }
@@ -229,8 +231,16 @@ impl DSparkMarkovSampling {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let shape = input.shape;
-        assert!(shape.num_requests > 0 && shape.num_requests as usize <= self.max_requests);
-        assert_eq!(shape.sampling.num_active_sampling_inputs, shape.num_requests);
+        assert!(shape.num_total_requests > 0 && shape.num_total_requests as usize <= self.max_requests);
+        assert!(shape.num_active_requests > 0 && shape.num_active_requests <= shape.num_total_requests);
+        assert_eq!(
+            shape.num_active_requests, shape.num_total_requests,
+            "DSpark Markov base-logit rows use identity request capacity"
+        );
+        assert_eq!(
+            shape.sampling.num_active_sampling_inputs, shape.num_active_requests,
+            "DSpark Markov active requests must match active sampling inputs"
+        );
         let sampling = component_shape(shape.sampling);
         for step_index in 0..self.block_size {
             let input_token_ids = if step_index == 0 {
@@ -241,7 +251,7 @@ impl DSparkMarkovSampling {
             recorder.record_with_barrier_before(ReplayOp::opaque(self.top_k_map.invoke_replay(
                 backend_dspark_markov::MapShape {
                     sampling,
-                    base_logits_row_offset: step_index as u32 * shape.num_requests,
+                    base_logits_row_offset: step_index as u32 * shape.num_total_requests,
                 },
                 backend_dspark_markov::MapBuffers {
                     input_token_ids,

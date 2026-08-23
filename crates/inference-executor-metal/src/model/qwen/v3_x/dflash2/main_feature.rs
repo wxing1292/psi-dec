@@ -249,13 +249,19 @@ impl Qwen3xDFlash2MainFeatureProjector {
         &self.main_feature
     }
 
-    pub fn record<'a, R>(&'a self, recorder: &mut R, num_tokens: u32, main_rows: MainResidualRows<'a>) -> &'a Buffer
+    pub fn record<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
+        main_rows: MainResidualRows<'a>,
+    ) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        assert!(num_tokens > 0, "Qwen3 DFlash2 Main projection requires tokens");
+        assert!(num_total_tokens > 0, "Qwen3 DFlash2 Main projection requires tokens");
         assert!(
-            num_tokens <= self.layout.max_tokens,
+            num_total_tokens <= self.layout.max_tokens,
             "Qwen3 DFlash2 Main projection exceeds capacity"
         );
         let weights = self
@@ -266,8 +272,8 @@ impl Qwen3xDFlash2MainFeatureProjector {
             MainResidualRows::Indices(row_indices) => {
                 self.gather.record(
                     recorder,
-                    num_tokens,
-                    ReplayU32::Fixed(num_tokens),
+                    num_total_tokens,
+                    num_active_tokens,
                     &self.main_residuals,
                     row_indices,
                     &self.compact_main_residuals,
@@ -277,8 +283,8 @@ impl Qwen3xDFlash2MainFeatureProjector {
             MainResidualRows::Prefix => &self.main_residuals,
         };
         recorder.record_with_barrier_before(ReplayOp::opaque(self.fc.invoke(
-            num_tokens,
-            ReplayU32::Fixed(num_tokens),
+            num_total_tokens,
+            num_active_tokens,
             &self.main_feature,
             0,
             main_residuals,
@@ -292,8 +298,8 @@ impl Qwen3xDFlash2MainFeatureProjector {
         )));
         self.hidden_norm.record_with_barrier(
             recorder,
-            num_tokens,
-            ReplayU32::Fixed(num_tokens),
+            num_total_tokens,
+            num_active_tokens,
             &self.main_feature,
             &self.main_feature,
         );

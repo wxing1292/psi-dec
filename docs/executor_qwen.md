@@ -244,6 +244,17 @@ Qwen3xDFlash2DecodeRecording
   request slots
 ```
 
+### Mode architecture
+
+Vanilla executes Main embedding, Main, output projection, and target sampling.
+MTP adds its separate embedding, reusable physical body layer, and draft sampling owner.
+DSpark and DFlash2 remain peer model roles with independent Prefill and Decode recordings.
+They share only compatible lower-level block-spec GQA components.
+
+[`dspark_design.md`](dspark_design.md) defines DSpark fixed-block attention, Markov sampling, state, and lifecycle.
+[`dflash2_design.md`](dflash2_design.md) defines DFlash2 persistent history, sliding attention, dynamic convolution,
+candidate selection, state, and lifecycle.
+
 Semantic components own weights, static configuration, and `load + record`.
 Each weight-bearing leaf retains the core and Metal configuration that created its backend.
 Weight reload uses this retained contract and does not derive the backend configuration again.
@@ -499,7 +510,7 @@ Replay<Qwen35MTPEmbed>       previous-hidden gather + token embed + input projec
 Replay<Qwen35MTP>            one physical GQA body layer -> final norm
 Replay<DraftSampling>        draft sampling + sparse draft distribution
 Replay<RejectionSampling>    Main sparse distribution + rejection
-Replay<Rc<GDNRequestStateTable>>
+Replay<GDNStateRestore>
                               snapshot restore into live GDN state
 ```
 
@@ -515,7 +526,7 @@ It owns a base `ReplayBucketPolicy` capped by this capacity.
 It records the bucket capacity in `Qwen35MainEmbedReplayKey` and never records the active token count in the key.
 It uses the stage-owned `qwen3.5.main_embed.num_active_tokens` replay parameter for submission.
 The executor stores this argument with the prepared key and submits both to the same replay program.
-Qwen3 MainEmbed uses a fixed active count.
+Qwen3 MainEmbed uses its stage-owned active-token parameter with identity capacity.
 Qwen3.5 MTPEmbed uses a parameter active count as part of its composed replay.
 
 The shared row-gather leaf has one active/total recording API.
@@ -526,7 +537,7 @@ It binds the caller-provided active-row key with the range `1..=capacity`.
 The kernel checks the active row count before it reads an inactive row index or input value and before it writes an
 inactive output value.
 Qwen3.5 MTPEmbed and GatherUnembed use a parameter active count.
-Qwen3 and DSpark GatherUnembed use a fixed active count.
+Qwen3 and DSpark GatherUnembed use stage-owned active-row parameters with identity capacity.
 
 The shared unembedding leaf has one active/total recording API.
 It uses the caller-provided total row count and `ReplayU32` active row count.
@@ -537,7 +548,7 @@ The leaf exposes the affine kernel topology for a row capacity and every row cou
 The stage bucket policy must include these topology boundaries.
 This rule lets Gather and Unembed use one active-row key without padding across an affine kernel change.
 Qwen3.5 GatherUnembed uses a parameter active count.
-Qwen3 and DSpark GatherUnembed use a fixed active count.
+Qwen3 and DSpark GatherUnembed use parameter active counts with identity capacity.
 
 The shared BF16 row-concat leaf has one active/total recording API.
 The API names the recorded row count `num_total_rows` and the active row count `num_active_rows`.
@@ -576,6 +587,11 @@ Both paths validate the capture destination for the recorded capacity.
 RMS normalization and residual/RMS-normalization fusion have fixed token-count topology and add no replay bucket
 boundary.
 Qwen3.5 MTPEmbed, Main, and MTP use parameter active counts for normalization and residual recording.
+
+Qwen3 MainEmbed, Main, and GatherUnembed use the same active/total architecture.
+Their current capacity policy is identity.
+The total capacity remains in each key, and the active count remains a submission parameter.
+Qwen3 Main also submits the active Q-token-range and KV-split counts that its ungated GQA consumes.
 
 Qwen3.5 Main owns one token-capacity replay domain.
 The executor selects this capacity before it prepares Main attention metadata.
@@ -665,8 +681,21 @@ The recorder stores separate Main and MTP `ReplayArguments` because their active
 An active row count of zero omits GatherUnembed replay.
 
 Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed.
-Its Main key owns only the token count and GQA replay topology.
+Its Main key owns the total token capacity, every layer MLP topology, and the ungated GQA total capacities and topology.
+Active token, Q-token-range, and KV-split counts do not enter the key.
 It never aliases a Qwen3.5 key or stores an optional GDN key.
+
+DSpark and DFlash2 use identity capacity for Prefill rows, Embed rows, fixed-block token rows, and output rows.
+Each replay key still stores a `num_total_*` value, and each submission still supplies the matching `num_active_*`
+parameter.
+The block-Spec body independently pads the history Map TaskTemplate domain to a power-of-two total capacity.
+Its active Map count and active Q-token-range count are submission parameters.
+DFlash2 also supplies its active query-block count to dynamic grouped convolution.
+The DFlash2 body owns this replay parameter key. The convolution leaf binds the caller-owned key.
+The DFlash2 output owner similarly supplies one active-request key to all selector commands.
+The body and output owners submit these parameters when the recorded total capacity is `1`.
+Thus, one body cache entry can reuse compatible history capacity without retaining active work from the recording that
+created it.
 
 ## Main data flow and workspace ownership
 

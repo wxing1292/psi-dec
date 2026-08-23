@@ -9,6 +9,7 @@ use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayProgram;
+use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::metal::Stream;
 
 fn main() {
@@ -155,8 +156,8 @@ impl Fixture {
             dtype,
         };
         let shape = backend_block_sdpa::Shape {
-            num_tokens,
-            num_q_token_ranges,
+            num_total_tokens: num_tokens,
+            num_total_q_token_ranges: num_q_token_ranges,
             num_total_partial_output_slots,
         };
         shape.validate(config);
@@ -196,6 +197,7 @@ impl Fixture {
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
+            ReplayU32::Fixed(num_q_token_ranges),
             backend_block_sdpa::Buffers {
                 q: &q,
                 local_k: &local_k,

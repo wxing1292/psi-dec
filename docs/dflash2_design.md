@@ -158,6 +158,7 @@ normalized hidden
 
 The Metal grid covers request-local query blocks and hidden values.
 The replay argument limits work to active query blocks.
+It remains a replay argument when the total query-block capacity is `1`.
 The kernel does not combine requests or read state from another request.
 
 ## Candidate selection
@@ -263,7 +264,15 @@ crates/inference-backend-metal/src/components/
 Focused tests cover configuration adaptation, exact tensor manifests, independent affine layouts, per-query sliding
 ranges, dynamic grouped-convolution parity, candidate-selector parity, service mode normalization, and speculator
 mutual exclusion.
-The DFlash2 implementation does not require a real-model integration test for these structural contracts.
+
+The dynamic grouped-convolution and selector replay tests use test-owned active-work keys. Each test records a total
+capacity of `8`, replays `1, 8, 3, 7, 2, 6, 4, 5`, and compares the active output with its CPU reference. These tests
+prove that each leaf binds the caller-owned replay key instead of requiring a component-local key.
+
+The shared block-SDPA replay test records a total Q-token-range capacity of `8`. It replays active counts
+`1, 8, 3, 7, 2, 6, 4, 5` and compares each active output with the CPU softmax reference.
+The block-spec wiring test verifies that active history Map work remains a submission argument when body replay reuses
+one total capacity.
 
 Use [`service.md`](service.md) for conversion and startup commands.
 Use [`executor_benchmarks.md`](executor_benchmarks.md) before you make a performance claim.

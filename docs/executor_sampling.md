@@ -140,7 +140,8 @@ Sampling and rejection use `u32` capacity replay keys.
 not select replay buckets.
 Submission-scoped `ReplayArguments` contain exact active thread counts.
 Every padded kernel returns inactive lanes before it reads input, changes RNG state, or writes output.
-A 0/1 capacity uses an immediate constant to preserve the common single-request decode path.
+An absent zero-capacity work domain can use an immediate zero.
+Every nonempty active work domain remains a replay parameter, including a total capacity of `1`.
 
 Active top-k remains in the replay shape because it changes candidate and scratch geometry.
 Temperature, top-p, seed, logical position, and RNG domain are dynamic request data.
@@ -395,10 +396,12 @@ Focused Metal tests compare fixed and random distributions with these references
 They also compare mixed per-row parameters and deterministic seed/domain behavior.
 The Top-K tests keep separate parity cases for reduction, bitonic, sample, write-distribution, and fused
 sample-and-write-distribution kernels.
-One mixed reduction scenario covers greedy and stochastic rows, Target and Draft domains, padded capacity, growth,
-and shrink.
-One sparse rejection scenario covers rejection, all-accept, zero-draft, non-contiguous draft-distribution mapping,
-padded requests, growth, and shrink.
+One top-k sampling replay records a total row capacity of `8` in an isolated test cache. It replays
+`1, 8, 3, 7, 2, 6, 4, 5` and compares each active row with the CPU sparse-sampling reference. The rows include greedy
+and stochastic sampling and the Target and Draft domains.
+One sparse rejection replay uses the same active-request sequence. It compares active accepted counts, sampled tokens,
+sampled probabilities, and accepted-token prefixes with the CPU rejection reference. The fixture covers rejection,
+all-accept, zero-draft, and non-contiguous draft-distribution mapping. Both tests ignore inactive output tails.
 The DSpark Markov parity test covers a padded replay bucket and non-contiguous request slots.
 GPU tests run serially under the repository Metal reservation/lock rules.
 The `qwen3_dspark_sampling` benchmark prints proposal token IDs, exact proposal probability bits, and a stable

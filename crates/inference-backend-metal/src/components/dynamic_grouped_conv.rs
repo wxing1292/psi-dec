@@ -4,15 +4,10 @@ use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
-use crate::metal::ReplayArguments;
-use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("metal/dynamic_grouped_conv.metal");
 const REQUIRED_THREADS: usize = 256;
-
-pub const NUM_ACTIVE_QUERY_BLOCKS_KEY: ReplayParameterKey =
-    ReplayParameterKey::new("dynamic_grouped_conv.num_active_query_blocks");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -170,15 +165,6 @@ impl Compute {
             buffers,
         }
     }
-
-    pub fn add_replay_arguments(&self, shape: Shape, num_active_query_blocks: u32, arguments: &mut ReplayArguments) {
-        shape.validate();
-        assert!(num_active_query_blocks > 0);
-        assert!(num_active_query_blocks <= shape.num_total_query_blocks);
-        if shape.num_total_query_blocks > 1 {
-            arguments.set_u32(NUM_ACTIVE_QUERY_BLOCKS_KEY, num_active_query_blocks);
-        }
-    }
 }
 
 pub struct Invocation<'a> {
@@ -204,12 +190,7 @@ impl Operator for Invocation<'_> {
                 recorder.set_u32(4, value);
             },
             ReplayU32::Parameter(key) => {
-                assert_eq!(key, NUM_ACTIVE_QUERY_BLOCKS_KEY);
-                if self.shape.num_total_query_blocks == 1 {
-                    recorder.set_u32(4, 1);
-                } else {
-                    recorder.bind_u32(4, key, 1, self.shape.num_total_query_blocks);
-                }
+                recorder.bind_u32(4, key, 1, self.shape.num_total_query_blocks);
             },
         }
         recorder.set_u32(5, self.shape.query_block_size);
@@ -251,10 +232,20 @@ mod tests {
     use half::bf16;
 
     use super::*;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+
+    const TEST_NUM_ACTIVE_QUERY_BLOCKS: ReplayParameterKey =
+        ReplayParameterKey::new("test.dynamic_grouped_conv.num_active_query_blocks");
 
     #[test]
     fn test_metal_matches_request_local_reference_for_both_sides() {
+        assert_metal_matches_request_local_reference(8, &[1, 8, 3, 7, 2, 6, 4, 5]);
+        assert_metal_matches_request_local_reference(1, &[1]);
+    }
+
+    fn assert_metal_matches_request_local_reference(num_total_query_blocks: u32, active_query_block_counts: &[u32]) {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = Config {
@@ -265,7 +256,7 @@ mod tests {
             base_dtype: Dtype::Bfloat16,
         };
         let shape = Shape {
-            num_total_query_blocks: 3,
+            num_total_query_blocks,
             query_block_size: 4,
         };
         let num_tokens = shape.num_total_tokens() as usize;
@@ -288,7 +279,7 @@ mod tests {
             let mut builder = stream.create_replay_program();
             builder.record(compute.invoke(
                 shape,
-                ReplayU32::Parameter(NUM_ACTIVE_QUERY_BLOCKS_KEY),
+                ReplayU32::Parameter(TEST_NUM_ACTIVE_QUERY_BLOCKS),
                 side,
                 Buffers {
                     hidden: &hidden_buffer,
@@ -298,14 +289,22 @@ mod tests {
                 },
             ));
             let replay = builder.build();
-            let mut arguments = ReplayArguments::new();
-            compute.add_replay_arguments(shape, 2, &mut arguments);
-            stream.submit_replay_with_arguments(&replay, &arguments).wait();
+            for &num_active_query_blocks in active_query_block_counts {
+                let arguments = ReplayArguments::new().with_u32(TEST_NUM_ACTIVE_QUERY_BLOCKS, num_active_query_blocks);
+                stream.submit_replay_with_arguments(&replay, &arguments).wait();
 
-            let expected = reference(config, shape, 2, side, &hidden, &coefficients, &base);
-            let actual = output.read_typed::<u16>(0, hidden.len());
-            assert_eq!(&actual[..expected.len()], &expected);
-            assert_eq!(&actual[expected.len()..], &vec![0x7fc1; hidden.len() - expected.len()]);
+                let expected = reference(
+                    config,
+                    shape,
+                    num_active_query_blocks as usize,
+                    side,
+                    &hidden,
+                    &coefficients,
+                    &base,
+                );
+                let actual = output.read_typed::<u16>(0, expected.len());
+                assert_eq!(actual, expected);
+            }
         }
     }
 

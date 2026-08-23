@@ -29,9 +29,12 @@ use crate::def::replay_op::ReplayOp;
 
 pub const BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES: ReplayParameterKey =
     ReplayParameterKey::new("block_spec_gqa.num_active_sdpa_map_task_templates");
+pub const BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES: ReplayParameterKey =
+    ReplayParameterKey::new("block_spec_gqa.num_active_q_token_ranges");
 
 pub fn add_block_spec_gqa_replay_arguments(shape: GQAReplayShape, arguments: &mut ReplayArguments) {
     shape.validate();
+    arguments.set_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, shape.num_q_token_tiles);
     arguments.set_u32(
         BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES,
         shape.num_sdpa_map_task_templates,
@@ -108,6 +111,7 @@ pub struct BlockSpecGQAInput<'a> {
     pub kv_cache: GQAKVCacheBindings<'a>,
     pub weights: BlockSpecGQAWeights<'a>,
     pub scratch: BlockSpecScratchBindings<'a>,
+    pub num_active_tokens: ReplayU32,
 }
 
 pub struct BlockSpecGQA {
@@ -219,6 +223,10 @@ impl BlockSpecGQA {
         let shape = input.metadata.replay_shape();
         let sdpa_execution = input.metadata.sdpa_execution();
         shape.validate();
+        assert_eq!(
+            shape.num_tokens, shape.num_total_tokens,
+            "block-spec dense block attention requires an identity token capacity"
+        );
         assert!(shape.reduce_sdpa_partial_outputs);
         assert!(
             shape.num_tokens as usize <= input.scratch.capacity.block.max_tokens,
@@ -298,10 +306,11 @@ impl BlockSpecGQA {
     {
         recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
             backend_block_sdpa::Shape {
-                num_tokens: shape.num_tokens,
-                num_q_token_ranges: shape.num_q_token_tiles,
+                num_total_tokens: shape.num_total_tokens,
+                num_total_q_token_ranges: shape.num_total_q_token_tiles,
                 num_total_partial_output_slots: shape.num_total_sdpa_map_task_templates,
             },
+            ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
             backend_block_sdpa::Buffers {
                 q: scratch.q_norm_rope,
                 local_k: scratch.k_norm_rope,
@@ -328,9 +337,10 @@ impl ReplayLayer for BlockSpecGQA {
         let sdpa_execution = self.sdpa_execution;
         let attention = &self.core.attention;
         let scratch = input.scratch;
+        let active_tokens = input.num_active_tokens;
         recorder.record_with_barrier_before(ReplayOp::opaque(self.q.invoke(
-            shape.num_tokens,
-            ReplayU32::Fixed(shape.num_tokens),
+            shape.num_total_tokens,
+            active_tokens,
             scratch.q,
             0,
             input.hidden_state,
@@ -343,8 +353,8 @@ impl ReplayLayer for BlockSpecGQA {
             input.weights.q.biases_offset,
         )));
         recorder.record(ReplayOp::opaque(self.k.invoke(
-            shape.num_tokens,
-            ReplayU32::Fixed(shape.num_tokens),
+            shape.num_total_tokens,
+            active_tokens,
             scratch.k,
             0,
             input.hidden_state,
@@ -357,8 +367,8 @@ impl ReplayLayer for BlockSpecGQA {
             input.weights.k.biases_offset,
         )));
         recorder.record(ReplayOp::opaque(self.v.invoke(
-            shape.num_tokens,
-            ReplayU32::Fixed(shape.num_tokens),
+            shape.num_total_tokens,
+            active_tokens,
             scratch.v,
             0,
             input.hidden_state,
@@ -372,7 +382,7 @@ impl ReplayLayer for BlockSpecGQA {
         )));
         recorder.record_with_barrier_before(ReplayOp::opaque(self.q_norm_rope.invoke(
             rms_norm_rope::Shape {
-                num_total_tokens: shape.num_tokens,
+                num_total_tokens: shape.num_total_tokens,
             },
             rms_norm_rope::Buffers {
                 input: scratch.q,
@@ -380,11 +390,11 @@ impl ReplayLayer for BlockSpecGQA {
                 flat_token_indices: input.metadata.flat_token_indices(),
                 output: scratch.q_norm_rope,
             },
-            ReplayU32::Fixed(shape.num_tokens),
+            active_tokens,
         )));
         recorder.record(ReplayOp::opaque(self.k_norm_rope.invoke(
             rms_norm_rope::Shape {
-                num_total_tokens: shape.num_tokens,
+                num_total_tokens: shape.num_total_tokens,
             },
             rms_norm_rope::Buffers {
                 input: scratch.k,
@@ -392,13 +402,13 @@ impl ReplayLayer for BlockSpecGQA {
                 flat_token_indices: input.metadata.flat_token_indices(),
                 output: scratch.k_norm_rope,
             },
-            ReplayU32::Fixed(shape.num_tokens),
+            active_tokens,
         )));
 
         if sdpa_execution.map.thread_block.max_q_tokens == 1 {
             let sdpa_config = self.split_kv_single_q_config(input.page_table_layout);
             let sdpa_shape = backend_single_q::Shape {
-                num_total_tokens: shape.num_tokens,
+                num_total_tokens: shape.num_total_tokens,
                 num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
             };
             let sdpa = backend_single_q::Compute::new(&self.device, sdpa_config, sdpa_execution, sdpa_shape);
@@ -414,7 +424,7 @@ impl ReplayLayer for BlockSpecGQA {
                     partial_output: scratch.partial_output,
                 },
                 ReplayU32::Fixed(input.gqa_layer_index),
-                ReplayU32::Fixed(shape.num_tokens),
+                active_tokens,
                 ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
             )));
             self.record_block_sdpa(recorder, shape, input.metadata, scratch);
@@ -426,12 +436,12 @@ impl ReplayLayer for BlockSpecGQA {
                     cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
                     output: scratch.attention_output,
                 },
-                ReplayU32::Fixed(shape.num_tokens),
+                active_tokens,
             )));
         } else {
             let sdpa_config = self.split_kv_tiled_q_config(input.page_table_layout);
             let sdpa_shape = backend_tiled_q::Shape {
-                num_total_tokens: shape.num_tokens,
+                num_total_tokens: shape.num_total_tokens,
                 num_total_q_token_tiles: shape.num_total_q_token_tiles,
                 num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
             };
@@ -450,8 +460,8 @@ impl ReplayLayer for BlockSpecGQA {
                     partial_max_logits: scratch.partial_max_logits,
                 },
                 ReplayU32::Fixed(input.gqa_layer_index),
-                ReplayU32::Fixed(shape.num_tokens),
-                ReplayU32::Fixed(shape.num_q_token_tiles),
+                active_tokens,
+                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
                 ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
             )));
             self.record_block_sdpa(recorder, shape, input.metadata, scratch);
@@ -464,12 +474,12 @@ impl ReplayLayer for BlockSpecGQA {
                     cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
                     output: scratch.attention_output,
                 },
-                ReplayU32::Fixed(shape.num_q_token_tiles),
+                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
             )));
         }
         recorder.record_with_barrier_before(ReplayOp::opaque(self.output.invoke(
-            shape.num_tokens,
-            ReplayU32::Fixed(shape.num_tokens),
+            shape.num_total_tokens,
+            active_tokens,
             input.next_hidden_state,
             0,
             scratch.attention_output,
@@ -520,11 +530,12 @@ mod tests {
     use inference_backend_metal::metal::ReplayArguments;
     use inference_executor_core::attn::GQAReplayShape;
 
+    use super::BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES;
     use super::BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES;
     use super::add_block_spec_gqa_replay_arguments;
 
     #[test]
-    fn replay_arguments_select_active_history_work_inside_one_capacity() {
+    fn test_replay_arguments_select_active_history_work_inside_one_capacity() {
         let shape = GQAReplayShape {
             num_tokens: 8,
             num_total_tokens: 8,
@@ -543,11 +554,15 @@ mod tests {
 
         assert_eq!(
             shorter_history_arguments,
-            ReplayArguments::new().with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 7)
+            ReplayArguments::new()
+                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, 1)
+                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 7)
         );
         assert_eq!(
             longer_history_arguments,
-            ReplayArguments::new().with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 8)
+            ReplayArguments::new()
+                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, 1)
+                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 8)
         );
     }
 }

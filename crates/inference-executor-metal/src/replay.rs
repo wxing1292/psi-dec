@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn record_is_idempotent_and_replay_is_strict() {
+    fn test_record_is_idempotent_and_replay_is_strict() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "replay cache missing recorded batch")]
-    fn replay_panics_before_record() {
+    fn test_replay_panics_before_record() {
         let device = Device::system_default();
         let replay = Replay::new("test", component(&device));
         let _ = replay.replay(&1);

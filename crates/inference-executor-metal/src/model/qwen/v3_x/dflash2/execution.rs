@@ -293,8 +293,10 @@ impl Qwen3xDFlash2Execution {
             flat_token_indices: &self.prefill_flat_token_indices,
             pages,
         };
+        let (prepared_key, arguments) = self.prefill.component().prepare_replay(num_tokens, main_rows.gathers());
         let (key, _) = self.prefill.record(runtime, &input);
-        Qwen3xDFlash2PrefillRecording { key }
+        assert_eq!(key, prepared_key);
+        Qwen3xDFlash2PrefillRecording { key, arguments }
     }
 
     pub fn record_decode(
@@ -336,7 +338,9 @@ impl Qwen3xDFlash2Execution {
             token_ids,
             hidden_output: &self.hidden_input,
         };
+        let (prepared_embed_key, embed_arguments) = self.embed.component().prepare_replay(embed_input.num_tokens);
         let (embed_key, _) = self.embed.record(runtime, &embed_input);
+        assert_eq!(embed_key, prepared_embed_key);
         let metadata = self.gqa_state.metadata();
         let body_input = Qwen3xDFlash2BodyArgs {
             num_tokens: metadata.replay_shape().num_tokens,
@@ -348,6 +352,9 @@ impl Qwen3xDFlash2Execution {
         let (body_key, _) = self.body.record(runtime, &body_input);
         let mut body_arguments = ReplayArguments::new();
         self.gqa_state.add_replay_arguments(&mut body_arguments);
+        self.body
+            .component()
+            .add_replay_arguments(metadata.replay_shape(), &mut body_arguments);
         let output_input = Qwen3xDFlash2OutputArgs {
             num_requests,
             hidden: &self.hidden_output,
@@ -360,6 +367,7 @@ impl Qwen3xDFlash2Execution {
             .add_replay_arguments(num_requests, &mut output_arguments);
         Qwen3xDFlash2DecodeRecording {
             embed_key,
+            embed_arguments,
             body_key,
             body_arguments,
             output_key,
@@ -374,18 +382,17 @@ impl Qwen3xDFlash2Execution {
         prefill: Option<&Qwen3xDFlash2PrefillRecording>,
         decode: Option<&Qwen3xDFlash2DecodeRecording>,
     ) -> MetalReplaySubmission {
-        let empty_arguments = ReplayArguments::new();
         let mut sequence = Vec::with_capacity(4);
         if let Some(prefill) = prefill {
             sequence.push(ReplayExecution::new(
                 self.prefill.replay(&prefill.key),
-                &empty_arguments,
+                &prefill.arguments,
             ));
         }
         if let Some(decode) = decode {
             sequence.push(ReplayExecution::new(
                 self.embed.replay(&decode.embed_key),
-                &empty_arguments,
+                &decode.embed_arguments,
             ));
             sequence.push(ReplayExecution::new(
                 self.body.replay(&decode.body_key),
@@ -447,10 +454,12 @@ fn dflash2_query_layout(
 
 pub struct Qwen3xDFlash2PrefillRecording {
     key: Qwen3xDFlash2PrefillReplayKey,
+    arguments: ReplayArguments,
 }
 
 pub struct Qwen3xDFlash2DecodeRecording {
     embed_key: Qwen3xDFlash2EmbedReplayKey,
+    embed_arguments: ReplayArguments,
     body_key: Qwen3xDFlash2BodyReplayKey,
     body_arguments: ReplayArguments,
     output_key: Qwen3xDFlash2OutputReplayKey,

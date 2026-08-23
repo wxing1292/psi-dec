@@ -17,12 +17,14 @@ void gqa_block_sdpa_impl(
     device float* partial_exp_sums,
     device float* partial_max_logits,
     device T* partial_output,
+    uint num_active_q_token_ranges,
     threadgroup float* logits,
     uint3 group_index,
     uint simd_lane
 ) {
     const uint q_head_index = group_index.x;
     const uint q_token_range_index = group_index.y;
+    if (q_token_range_index >= num_active_q_token_ranges) return;
     const uint q_token_offset = group_index.z;
     const uint flat_q_token_begin = q_token_ranges[q_token_range_index * 2];
     const uint flat_q_token_end = q_token_ranges[q_token_range_index * 2 + 1];
@@ -94,13 +96,14 @@ kernel void gqa_block_sdpa_f32(
     device float* partial_exp_sums [[buffer(5)]],
     device float* partial_max_logits [[buffer(6)]],
     device float* partial_output [[buffer(7)]],
+    constant uint& num_active_q_token_ranges [[buffer(8)]],
     uint3 group_index [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     threadgroup float logits[block_size];
     gqa_block_sdpa_impl<float>(
         q, local_k, local_v, q_token_ranges, cu_sdpa_partial_outputs, partial_exp_sums, partial_max_logits,
-        partial_output, logits, group_index, simd_lane);
+        partial_output, num_active_q_token_ranges, logits, group_index, simd_lane);
 }
 
 kernel void gqa_block_sdpa_bf16(
@@ -112,11 +115,12 @@ kernel void gqa_block_sdpa_bf16(
     device float* partial_exp_sums [[buffer(5)]],
     device float* partial_max_logits [[buffer(6)]],
     device bfloat16_t* partial_output [[buffer(7)]],
+    constant uint& num_active_q_token_ranges [[buffer(8)]],
     uint3 group_index [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     threadgroup float logits[block_size];
     gqa_block_sdpa_impl<bfloat16_t>(
         q, local_k, local_v, q_token_ranges, cu_sdpa_partial_outputs, partial_exp_sums, partial_max_logits,
-        partial_output, logits, group_index, simd_lane);
+        partial_output, num_active_q_token_ranges, logits, group_index, simd_lane);
 }

@@ -405,9 +405,6 @@ impl MapCompute {
             num_active_sampling_inputs > 0 && num_active_sampling_inputs <= shape.num_total_sampling_inputs,
             "top-k active sampling inputs must fit the recorded capacity"
         );
-        if shape.num_total_sampling_inputs <= 1 {
-            return;
-        }
         let num_partitions = num_vocab_partitions(shape, self.partial_candidate_layout());
         let required_threads = MapThreadBlockConstants::current().required_threads;
         let num_threads_per_row = checked_num_threads(num_partitions, required_threads);
@@ -442,11 +439,7 @@ impl Operator for MapInvocation<'_> {
         let required_threads = constants.thread_block.required_threads;
         let num_threads_per_row = checked_num_threads(num_partitions, required_threads);
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        if num_threads_per_row == num_total_threads {
-            recorder.set_u32(3, num_total_threads);
-        } else {
-            recorder.bind_u32(3, MAP_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
-        }
+        recorder.bind_u32(3, MAP_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         recorder.dispatch_1d(num_total_threads as usize, required_threads as usize);
     }
 }
@@ -595,11 +588,7 @@ impl Operator for MergeInvocation<'_> {
         recorder.set_buffer_write(3, self.buffers.logits, 0);
         let required_threads = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, required_threads);
-        if self.shape.num_total_sampling_inputs == 1 {
-            recorder.set_u32(4, num_total_threads);
-        } else {
-            recorder.bind_u32(4, REDUCE_NUM_ACTIVE_THREADS_KEY, required_threads, num_total_threads);
-        }
+        recorder.bind_u32(4, REDUCE_NUM_ACTIVE_THREADS_KEY, required_threads, num_total_threads);
         recorder.set_u32(5, self.shape.top_k);
         recorder.set_u32(6, num_partitions);
         recorder.set_u32(7, num_candidates_per_partition(self.shape));
@@ -658,11 +647,7 @@ impl Operator for SampleInvocation<'_> {
         recorder.set_u32(9, self.partial_candidate_layout.vocab_partition_size());
         let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        if num_threads_per_row == num_total_threads {
-            recorder.set_u32(5, num_total_threads);
-        } else {
-            recorder.bind_u32(5, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
-        }
+        recorder.bind_u32(5, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
@@ -740,11 +725,7 @@ impl Operator for WriteDistributionInvocation<'_> {
         recorder.set_u32(12, self.buffers.num_output_distributions);
         let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        if num_threads_per_row == num_total_threads {
-            recorder.set_u32(6, num_total_threads);
-        } else {
-            recorder.bind_u32(6, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
-        }
+        recorder.bind_u32(6, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
@@ -842,11 +823,7 @@ impl Operator for SampleAndWriteDistributionInvocation<'_> {
         recorder.set_u32(14, self.buffers.num_output_distributions);
         let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        if num_threads_per_row == num_total_threads {
-            recorder.set_u32(8, num_total_threads);
-        } else {
-            recorder.bind_u32(8, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
-        }
+        recorder.bind_u32(8, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
@@ -862,9 +839,6 @@ fn add_top_k_reduce_replay_argument(
         num_active_sampling_inputs > 0 && num_active_sampling_inputs <= shape.num_total_sampling_inputs,
         "top-k active sampling inputs must fit the recorded capacity"
     );
-    if shape.num_total_sampling_inputs <= 1 {
-        return;
-    }
     let num_active_threads = checked_num_threads(num_active_sampling_inputs, required_threads);
     let num_total_threads = checked_num_threads(shape.num_total_sampling_inputs, required_threads);
     assert!(num_active_threads <= num_total_threads);

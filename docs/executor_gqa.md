@@ -251,6 +251,9 @@ For a fixed Q-token/head output coordinate, adjacent `cu_sdpa_partial_outputs` v
 capacity policy. Unused tail Map task templates contain an invalid Q-token-range index and do not write a map result.
 Block-spec GQA uses this padded count as the replay-cache shape. It supplies `num_sdpa_map_task_templates` as a
 submission-time replay argument. Thus, different active history lengths can share one recorded capacity.
+Block-spec token and Q-token-range capacities are currently identity capacities.
+The recording still dispatches the total Q-token-range extent and receives the active Q-token-range count at
+submission.
 
 The SplitKV `SingleQ` map also permits an invalid-Q-token-range `SDPAMapTaskTemplate` in one token's generic composite
 range. This template does not write a history partial output for that slot.
@@ -522,6 +525,7 @@ Projection split, norm/RoPE, KV write, activation gate, and the qgkv/output affi
 token reads input or metadata, mutates a page, or writes output. SplitKV SingleQ and TiledQ also return before inactive
 KV splits or Q-token ranges read their metadata. All token-domain commands use the same active-token parameter key
 and range.
+The ungated QKV split follows the same active/total contract and uses the caller-owned active-token key.
 
 `GQAInput::num_active_tokens` accepts `ReplayU32::Fixed(value)` or `ReplayU32::Parameter(key)`. A fixed value records
 active work without replay padding. A parameter key records a fixed total capacity and supplies the active count at
@@ -581,7 +585,8 @@ Main recording supplies each physical layer's fixed index through the same kerne
 
 Qwen3 uses its separate ungated GQA implementation.
 DSpark and DFlash2 keep separate model-level replay keys and submission ABIs.
-Both use the block-Spec replay shape with equal active and total token/range values and shared TaskTemplate padding.
+Both use the block-Spec replay shape with identity token and Q-token-range capacities and shared TaskTemplate padding.
+The active token, Q-token-range, and TaskTemplate counts remain submission values.
 The generic composite map includes one block partial-output slot.
 All SplitKV and block-SDPA partial producers store `partial_max_logits` as natural logits.
 SingleQ, TiledQ, and block-SDPA use the natural exponential for online softmax and partial reduction.
@@ -1014,6 +1019,13 @@ online-softmax iteration merging, request slots, page-table lookup, and causal v
 bucketed replay executes `5 -> 8 -> 5` active tokens. The test refreshes the explicit visible ranges for each submission.
 It poisons inactive query, KV, and request-slot inputs. It checks the active output and verifies that inactive
 partial-output, statistic, and final-output tails remain unchanged.
+
+`gqa/block_sdpa_test.rs` records one total Q-token-range capacity of `8` and replays
+`1, 8, 3, 7, 2, 6, 4, 5` active ranges. It compares each active partial state and output with a CPU softmax reference.
+This test protects the block-Spec total-dispatch and active-guard contract.
+
+`gqa/qkv_split.rs` records one total token capacity of `8` and uses the same non-monotonic active-count sequence.
+It compares Q, K, and V active rows with the exact CPU row-split reference.
 
 Metal backend component replay sanity lives in:
 

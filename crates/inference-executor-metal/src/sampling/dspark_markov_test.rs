@@ -178,6 +178,8 @@ fn test_markov_sampling_uses_each_sampled_token_for_the_next_step() {
         &[sampler_config; NUM_REQUESTS],
         &distribution_store,
     );
+    assert_eq!(shape.num_active_requests, NUM_REQUESTS as u32);
+    assert_eq!(shape.num_total_requests, NUM_REQUESTS as u32);
     assert_eq!(shape.sampling.num_active_sampling_inputs, NUM_REQUESTS as u32);
     assert_eq!(shape.sampling.num_total_sampling_inputs, 4);
     let mut base_logits_storage = vec![bf16::ZERO.to_bits(); BLOCK_SIZE * MAX_REQUESTS * VOCAB_SIZE];

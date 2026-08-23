@@ -138,14 +138,15 @@ Use these source files as concrete examples:
 
 ### Backend operator pattern
 
-This generic pattern shows the lowest component boundary. The names are placeholders.
+This generic pattern shows a replay-recorded backend operator at the lowest component boundary. The names are
+placeholders.
 
 ```rust
 pub struct ComponentInvocation<'a> {
     kernel: &'a ComponentKernel,
     shape: ComponentShape,
     buffers: ComponentBuffers<'a>,
-    num_active_items_key: Option<ReplayParameterKey>,
+    num_active_items_key: ReplayParameterKey,
 }
 
 impl Operator for ComponentInvocation<'_> {
@@ -157,10 +158,7 @@ impl Operator for ComponentInvocation<'_> {
         recorder.set_buffer_read(0, self.buffers.input, 0);
         recorder.set_buffer_write(1, self.buffers.output, 0);
 
-        match self.num_active_items_key {
-            Some(key) => recorder.bind_u32(2, key, 1, self.shape.num_total_items),
-            None => recorder.set_u32(2, self.shape.num_total_items),
-        }
+        recorder.bind_u32(2, self.num_active_items_key, 1, self.shape.num_total_items);
 
         recorder.dispatch_threadblocks(self.shape.grid(), self.kernel.threads_per_threadblock());
     }
@@ -451,7 +449,7 @@ Metadata buffers or `ReplayArguments` contain dynamic values that fit an existin
 ```text
 static / replay-defining
   component geometry and tuning
-  capacity bucket or exact shape when inactive lanes are unsupported
+  total capacity for each replayed work domain
   command topology and scratch extent
 
 dynamic / submission-scoped
@@ -468,8 +466,10 @@ actions:
 - Advancing RNG
 - Writing output
 
-Otherwise, the replay key keeps the exact count. Padding is a dispatch property. It does not permit changes to valid
-work or semantic descriptor counts.
+Otherwise, the capacity policy selects the active count as the total capacity. This identity policy can record more
+programs, but it preserves the same architecture: the total capacity remains in the key, and the active count remains
+a submission parameter. Padding is a dispatch property. It does not permit changes to valid work or semantic
+descriptor counts.
 
 The shared default capacity policy starts with these buckets:
 
@@ -489,8 +489,9 @@ a boundary above the configured capacity. The backend component that selects the
 Some work domains permit zero active work. In this case, a policy result of zero means that the domain does not record
 or dispatch work. Zero is not a replay capacity.
 
-`ReplayArguments` contain keyed submission values that recording declares. Submission validates that the caller
-provides each declared value exactly once and within its recorded bounds.
+`ReplayArguments` contain keyed submission values that recording declares. Each cached replay work domain declares its
+active count as one of these values. Submission validates that the caller provides each declared value exactly once
+and within its recorded bounds. Active and total counts remain separate when their values are equal.
 
 These arguments prevent a program rebuild for scalar activity changes. They do not replace component batch metadata.
 
@@ -631,8 +632,9 @@ force the same lifecycle on components that have different ownership contracts.
 - Qwen3.5 MTP Embed keeps one component test for its two input branches, gather indices, and stage-local inactive tails.
 - Unembed tests protect caller-visible format validation. Metal tests protect numerical and inactive-region behavior.
 
-Do not add a component test only for replay keys, replay arguments, replay capacity identities, or record wiring. These
-values are implementation details unless an external owner consumes them as a semantic contract.
+Do not add a component test that only inspects replay keys, arguments, capacity identities, or record wiring. A replay
+contract test must execute the production owner, prove cache reuse across active counts, and compare the active logical
+result with an exact reference. The central replay infrastructure test does not replace this owner test.
 
 Keep CPU-reference tests in `inference-executor-core`. Keep Metal parity, ABI, padding, and canary tests in their Metal
 owner. Keep lifecycle scenarios independent of both layers.

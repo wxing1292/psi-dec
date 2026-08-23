@@ -6,6 +6,7 @@ use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
+use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("../metal/gqa_qkv_split.metal");
 
@@ -68,7 +69,7 @@ impl Config {
     pub fn num_qkv_slots(self, shape: Shape) -> usize {
         checked_product(
             "ungated GQA projection element count",
-            &[shape.num_tokens as usize, self.qkv_width()],
+            &[shape.num_total_tokens as usize, self.qkv_width()],
         )
     }
 
@@ -76,7 +77,7 @@ impl Config {
         checked_product(
             "ungated GQA query element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_q_heads as usize,
                 self.head_dim as usize,
             ],
@@ -87,7 +88,7 @@ impl Config {
         checked_product(
             "ungated GQA key/value element count",
             &[
-                shape.num_tokens as usize,
+                shape.num_total_tokens as usize,
                 self.num_kv_heads as usize,
                 self.head_dim as usize,
             ],
@@ -130,13 +131,13 @@ impl Config {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Shape {
-    pub num_tokens: u32,
+    pub num_total_tokens: u32,
 }
 
 impl Shape {
     pub fn validate(self, config: Config) {
         config.validate();
-        assert!(self.num_tokens > 0);
+        assert!(self.num_total_tokens > 0);
         assert_u32_count_domain(config.num_qkv_slots(self), "ungated GQA projection elements");
     }
 }
@@ -169,12 +170,13 @@ impl Compute {
         }
     }
 
-    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>) -> Invocation<'a> {
+    pub fn invoke<'a>(&'a self, shape: Shape, buffers: Buffers<'a>, num_active_tokens: ReplayU32) -> Invocation<'a> {
         Invocation {
             constants: self.constants,
             kernel: &self.kernel,
             shape,
             buffers,
+            num_active_tokens,
         }
     }
 }
@@ -194,6 +196,7 @@ pub struct Invocation<'a> {
     kernel: &'a CompiledKernel,
     shape: Shape,
     buffers: Buffers<'a>,
+    num_active_tokens: ReplayU32,
 }
 
 impl Operator for Invocation<'_> {
@@ -205,11 +208,28 @@ impl Operator for Invocation<'_> {
         recorder.set_buffer_write(1, self.buffers.q, 0);
         recorder.set_buffer_write(2, self.buffers.k, 0);
         recorder.set_buffer_write(3, self.buffers.v, 0);
-        recorder.set_u32(4, shape.num_tokens);
+        set_replay_u32(
+            recorder,
+            4,
+            self.num_active_tokens,
+            shape.num_total_tokens,
+            "ungated GQA projection-split active token count",
+        );
         recorder.dispatch_1d(
             self.constants.config.num_qkv_slots(shape),
             self.constants.thread_block.required_threads as usize,
         );
+    }
+}
+
+fn set_replay_u32(recorder: &CommandRecorder<'_>, index: usize, value: ReplayU32, max_value: u32, name: &str) {
+    match value {
+        ReplayU32::Fixed(value) => {
+            assert!(value > 0, "{name} must be positive");
+            assert!(value <= max_value, "{name} exceeds recorded capacity");
+            recorder.set_u32(index, value);
+        },
+        ReplayU32::Parameter(key) => recorder.bind_u32(index, key, 1, max_value),
     }
 }
 
@@ -235,7 +255,12 @@ mod tests {
     use crate::metal::Buffer;
     use crate::metal::Device;
     use crate::metal::Dtype;
+    use crate::metal::ReplayArguments;
+    use crate::metal::ReplayParameterKey;
+    use crate::metal::ReplayU32;
     use crate::metal::Stream;
+
+    const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa_qkv_split.num_active_tokens");
 
     #[test]
     fn test_constants_have_explicit_thread_block_scope() {
@@ -254,7 +279,7 @@ mod tests {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = Config::f32(2, 1, 2);
-        let shape = Shape { num_tokens: 2 };
+        let shape = Shape { num_total_tokens: 2 };
         let qkv = Buffer::from_slice(&device, &(0..16).map(|value| value as f32).collect::<Vec<_>>());
         let q = Buffer::new_zeroed_elements(&device, config.num_q_slots(shape), Dtype::Float32);
         let k = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
@@ -270,6 +295,7 @@ mod tests {
                 k: &k,
                 v: &v,
             },
+            ReplayU32::Fixed(shape.num_total_tokens),
         ));
         stream.submit_replay(&builder.build()).wait();
 
@@ -282,8 +308,65 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_matches_reference_across_active_counts() {
+        const NUM_TOTAL_TOKENS: u32 = 8;
+        const ACTIVE_COUNTS: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
+
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let config = Config::f32(2, 1, 2);
+        let shape = Shape {
+            num_total_tokens: NUM_TOTAL_TOKENS,
+        };
+        let qkv_width = config.qkv_width();
+        let q_width = config.num_q_heads as usize * config.head_dim as usize;
+        let kv_width = config.num_kv_heads as usize * config.head_dim as usize;
+        let qkv_values = (0..NUM_TOTAL_TOKENS as usize * qkv_width)
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let qkv = Buffer::from_slice(&device, &qkv_values);
+        let q = Buffer::new_zeroed_elements(&device, config.num_q_slots(shape), Dtype::Float32);
+        let k = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
+        let v = Buffer::new_zeroed_elements(&device, config.num_kv_slots(shape), Dtype::Float32);
+        let kernel = Compute::new(&device, config);
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke(
+            shape,
+            Buffers {
+                qkv: &qkv,
+                q: &q,
+                k: &k,
+                v: &v,
+            },
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+        ));
+        let replay = builder.build();
+
+        for num_active_tokens in ACTIVE_COUNTS {
+            let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens);
+            stream.submit_replay_with_arguments(&replay, &arguments).wait();
+            let active_tokens = num_active_tokens as usize;
+            let mut expected_q = Vec::with_capacity(active_tokens * q_width);
+            let mut expected_k = Vec::with_capacity(active_tokens * kv_width);
+            let mut expected_v = Vec::with_capacity(active_tokens * kv_width);
+            for token_index in 0..active_tokens {
+                let row = &qkv_values[token_index * qkv_width..(token_index + 1) * qkv_width];
+                expected_q.extend_from_slice(&row[..q_width]);
+                expected_k.extend_from_slice(&row[q_width..q_width + kv_width]);
+                expected_v.extend_from_slice(&row[q_width + kv_width..]);
+            }
+            assert_eq!(q.read_typed::<f32>(0, expected_q.len()), expected_q);
+            assert_eq!(k.read_typed::<f32>(0, expected_k.len()), expected_k);
+            assert_eq!(v.read_typed::<f32>(0, expected_v.len()), expected_v);
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "ungated GQA projection elements exceeds the shader u32 count domain")]
     fn test_shape_rejects_shader_count_overflow() {
-        Shape { num_tokens: 1 << 30 }.validate(Config::f32(2, 1, 1));
+        Shape {
+            num_total_tokens: 1 << 30,
+        }
+        .validate(Config::f32(2, 1, 1));
     }
 }

@@ -551,130 +551,17 @@ Unit and Metal parity tests cover:
 - Padded Markov replay buckets and non-contiguous request slots
 - Ragged sparse rejection
 
-The source, test, and benchmark boundaries are:
+The block-SDPA replay test records a total Q-token-range capacity of `8`. It replays active counts
+`1, 8, 3, 7, 2, 6, 4, 5` and compares each active output with the CPU softmax reference.
+The old-Qwen Main wiring test verifies that active history Map work does not enter the replay key and is supplied at
+submission.
 
-```text
-src/
-  production semantics, components, replay wiring, and model execution
+Source and indexing review shows that Main residual capture uses the post-layer residual output for each configured
+zero-based decoder-layer ID. The current tests do not compare one captured row with an exact same-weight external
+hidden state.
 
-src/*_test.rs
-  unit and Metal parity tests for one production module
-
-benches/gqa/block_attn.rs
-  model-independent block-bidirectional SDPA map timing
-
-benches/rejection_sampling.rs
-  model-independent fused DSpark Markov map timing
-
-benches/qwen3/dspark.rs
-benches/qwen3/dspark/fixture.rs
-  real-checkpoint Main and DSpark executor lifecycle timing
-```
-
-The benchmark fixture uses only the public executor contract.
-Production `src` has no benchmark-only control path or state.
-
-Run the component benchmark with:
-
-```sh
-cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
-  --block-sizes 7 --num-requests 1 \
-  --max-q-tokens 8 \
-  --iters 1 --warmup-iters 0 --runs 1
-
-cargo bench -p inference-backend-metal --bench rejection_sampling -- \
-  --mode dspark-markov-top-k-map --rows 1 --top-k 20 --vocab 151936 \
-  --markov-rank 256 --markov-w1-group-size 64 --markov-w1-bits 4 \
-  --markov-w2-group-size 64 --markov-w2-bits 8 \
-  --iters 1 --warmup-iters 0 --runs 1
-```
-
-Run the executor benchmark with:
-
-```sh
-cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
-  --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
-  --cases dspark --num-requests 1 \
-  --iters 1 --warmup-iters 0 --runs 1
-```
-
-The release Qwen3 service passed deterministic and probabilistic DSpark decode.
-The final one-request deterministic comparison measured a `36.565 tok/s` Main-only median and a `42.788 tok/s`
-DSpark median.
-DSpark was `17.0%` faster for that workload.
-### Qwen3.8 lifecycle verification
-
-The 2026-08-21 verification used base commit `8cbd20dee490c49e7089fa10034cbd53d2598680` with the active DSpark
-Prefill/Decode working-tree changes. It used `Qwen3.8-27B-4bit` and the official `Qwen3.8-27B-DSpark` checkpoint.
-The converter used `group_size=64`, 4-bit affine weights, and an 8-bit `markov_head.markov_w2` override.
-
-The release service passed these cases:
-
-- A two-token DSpark proposal produced the same eight greedy output tokens as Main-only execution.
-- The checkpoint-native seven-token proposal completed four verification rounds.
-- Two concurrent requests shared batches with `num_reqs=2` and 14 proposal tokens without request-slot crossover.
-- A 231-token prompt used three Prefill-only batches before a final Prefill and Decode batch.
-- The verification rounds covered full acceptance, partial acceptance, and zero accepted proposal tokens.
-
-The service stopped cleanly after each run.
-This verification records correctness and lifecycle coverage.
-It does not provide a performance verdict.
-
-### Acceptance correctness
-
-The 2026-07-29 acceptance audit used clean commit `dad01342fb8eb4fc828b4fdd00db51d8db65fe9f` on an Apple M3
-Max with a 40-core GPU.
-It used `Qwen3-14B-4bit` and `dspark_qwen3_14b_block7-affine`.
-All GPU runs were serial.
-Each request used `temperature=0`, `top_k=1`, `top_p=1`, and `seed=1`.
-
-| Workload             | Verification rounds | Proposed tokens | Accepted tokens | Proposal acceptance | Accepted length |
-| -------------------- | ------------------: | --------------: | --------------: | ------------------: | --------------: |
-| Sky explanation      |                  34 |             238 |              65 |              27.31% |            2.91 |
-| Algebra              |                  20 |             140 |             113 |              80.71% |            6.65 |
-| Python code          |                  20 |             140 |             109 |              77.86% |            6.45 |
-| Database engineering |                  40 |             280 |              93 |              33.21% |            3.33 |
-| Aggregate            |                 114 |             798 |             380 |              47.62% |            4.33 |
-
-`Accepted length` includes the one Main continuation token from each verification round.
-This is the `tau` convention in the
-[DSpark paper](https://arxiv.org/abs/2607.05147).
-Proposal acceptance divides only accepted draft tokens by the seven fixed proposal slots.
-The two metrics must not be compared as if they use the same denominator.
-
-The aggregate conditional acceptance by proposal position was:
-
-```text
-position:                 1      2      3      4      5      6      7
-conditional acceptance: 82.5%  79.8%  74.7%  87.5%  83.7%  85.4%  85.7%
-```
-
-The per-position evidence does not show a proposal-position shift or suffix collapse.
-The workload spread also follows the expected DSpark behavior.
-Structured algebra and code accepted longer prefixes than open-ended explanations.
-
-The audit verified these contracts:
-
-- One anchor plus six MASK inputs produce seven proposal distributions.
-- Every proposal row sees persistent Main context before the anchor.
-- Every proposal row sees the complete local block with bidirectional attention.
-- Main residual capture uses the configured decoder-layer outputs.
-- Markov step zero consumes the anchor.
-- Each later Markov step consumes the preceding sampled draft token.
-- Rejection uses one Main distribution for each proposal and one final continuation distribution.
-
-Three of the four greedy outputs matched Main-only byte for byte.
-The database-engineering output diverged at output token 51.
-At the divergence, DSpark proposed token `235`.
-Rejection accepted zero tokens and the eight-row Main verification sampled token `117`.
-The one-row Main path sampled token `223`.
-Thus, rejection did not accept an incorrect draft token.
-Both paths reproduced their own output on a second run.
-
-Verdict: The audit found no DSpark proposal, Markov, attention, or rejection correctness defect.
-The low sky-prompt acceptance is workload-specific and is not representative of algebra or code.
-Strict one-row versus multi-row Main numerical determinism is not established.
-That investigation is separate from DSpark acceptance correctness.
+Use [`service.md`](service.md) for service verification commands.
+Use [`executor_benchmarks.md`](executor_benchmarks.md) for benchmark and performance-evidence rules.
 
 ## Deferred work
 

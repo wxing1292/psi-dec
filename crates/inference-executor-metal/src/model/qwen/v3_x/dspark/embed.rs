@@ -1,6 +1,8 @@
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Buffer;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 
 use crate::def::layer::ReplayLayer;
@@ -8,6 +10,9 @@ use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedInput;
 use crate::replay::ReplayComponent;
+
+const DSPARK_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.dspark.embed.num_active_tokens");
 
 pub struct Qwen3xDSparkEmbed {
     embed: Option<Rc<Embed>>,
@@ -22,7 +27,7 @@ pub struct Qwen3xDSparkEmbedArgs<'a> {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkEmbedReplayKey {
-    num_tokens: u32,
+    num_total_tokens: u32,
 }
 
 impl Qwen3xDSparkEmbed {
@@ -44,6 +49,15 @@ impl Qwen3xDSparkEmbed {
             .as_deref()
             .expect("Qwen3.x DSpark embed weights must be loaded before execution")
     }
+
+    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen3xDSparkEmbedReplayKey, ReplayArguments) {
+        assert!(num_active_tokens > 0, "Qwen3.x DSpark Embed requires active tokens");
+        let key = Qwen3xDSparkEmbedReplayKey {
+            num_total_tokens: num_active_tokens,
+        };
+        let arguments = ReplayArguments::new().with_u32(DSPARK_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens);
+        (key, arguments)
+    }
 }
 
 impl ReplayComponent for Qwen3xDSparkEmbed {
@@ -52,7 +66,7 @@ impl ReplayComponent for Qwen3xDSparkEmbed {
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         Qwen3xDSparkEmbedReplayKey {
-            num_tokens: input.num_tokens,
+            num_total_tokens: input.num_tokens,
         }
     }
 
@@ -62,7 +76,7 @@ impl ReplayComponent for Qwen3xDSparkEmbed {
             recorder,
             EmbedInput {
                 num_total_tokens: input.num_tokens,
-                num_active_tokens: ReplayU32::Fixed(input.num_tokens),
+                num_active_tokens: ReplayU32::Parameter(DSPARK_EMBED_NUM_ACTIVE_TOKENS),
                 token_ids: input.token_ids,
                 output_hidden: input.hidden_output,
             },

@@ -37,6 +37,9 @@ When changing GQA, Gated DeltaNet, dense MLP, MoE, sampling, or MTP source layou
 - Validate external input and configuration limits at the owning boundary. Use ordinary arithmetic and direct lossless
   casts in the same owner's private path after that boundary proves the result. Keep checked arithmetic at real runtime,
   allocation, file, snapshot, narrowing, shader-domain, and state-version boundaries.
+- For each cached replay work domain, supply `num_active_*` as a submission parameter. Put `num_total_*`, topology, and
+  other record-time static facts in the replay key. Keep `num_active_*` and `num_total_*` separate even when their values
+  are equal. Follow `docs/engineering_conventions.md` for replay tests and capacity selection.
 - When working with Rust, use rust-analyzer semantic operations whenever applicable: definition/reference lookup, type and diagnostic inspection, rename, and refactoring. Prefer them over textual heuristics for symbol identity and bindings; use `rg` for textual discovery, not as a substitute for semantic analysis. Rename each binding or item independently when the same spelling appears in multiple scopes. Rust-analyzer does not cover Metal, generated source strings, docs, inactive configurations, or host↔shader ABI correspondence, so audit those boundaries separately and still check for shadowing, stale references, and semantic-equivalence regressions.
 - Run Rust formatting as `cargo +nightly fmt`.
 - Do not reshape production `src` only to make benchmarks easier.

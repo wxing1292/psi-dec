@@ -3,6 +3,8 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
@@ -26,6 +28,11 @@ use crate::model::qwen::v3_x::dspark::main_feature::Qwen3xDSparkMainFeatureProje
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
+
+const DSPARK_PREFILL_NUM_ACTIVE_TOKENS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.dspark.prefill.num_active_tokens");
+const DSPARK_BODY_NUM_ACTIVE_TOKENS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3x.dspark.body.num_active_tokens");
 
 pub struct Qwen3xDSparkModel {
     main_feature_projector: Option<Rc<Qwen3xDSparkMainFeatureProjector>>,
@@ -61,13 +68,13 @@ pub struct Qwen3xDSparkBodyArgs<'a> {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkPrefillReplayKey {
-    num_tokens: u32,
+    num_total_tokens: u32,
     gathers_main_residual_rows: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDSparkBodyReplayKey {
-    num_tokens: u32,
+    num_total_tokens: u32,
     num_total_sdpa_map_task_templates: u32,
 }
 
@@ -205,19 +212,25 @@ impl Qwen3xDSparkModel {
         )
     }
 
-    fn record_prefill<'a, R>(&'a self, recorder: &mut R, args: Qwen3xDSparkPrefillArgs<'a>)
-    where
+    fn record_prefill<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
+        args: Qwen3xDSparkPrefillArgs<'a>,
+    ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         let main_feature = self
             .main_feature_projector
             .as_ref()
             .expect("DSpark Main-feature projector shell must exist")
-            .record(recorder, args.num_tokens, args.main_rows);
+            .record(recorder, num_total_tokens, num_active_tokens, args.main_rows);
         for layer in &self.layers {
             layer.record_prefill(
                 recorder,
-                args.num_tokens,
+                num_total_tokens,
+                num_active_tokens,
                 main_feature,
                 args.req_slots,
                 args.flat_token_indices,
@@ -226,7 +239,13 @@ impl Qwen3xDSparkModel {
         }
     }
 
-    fn record_body<'a, R>(&'a self, recorder: &mut R, args: Qwen3xDSparkBodyArgs<'a>) -> &'a Buffer
+    fn record_body<'a, R>(
+        &'a self,
+        recorder: &mut R,
+        num_total_tokens: u32,
+        num_active_tokens: ReplayU32,
+        args: Qwen3xDSparkBodyArgs<'a>,
+    ) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
@@ -235,6 +254,8 @@ impl Qwen3xDSparkModel {
             let residual_output = layer.residual_output();
             hidden = layer.record_block(
                 recorder,
+                num_total_tokens,
+                num_active_tokens,
                 Qwen3xDSparkLayerInput {
                     num_tokens: args.num_tokens,
                     metadata: args.metadata,
@@ -246,8 +267,8 @@ impl Qwen3xDSparkModel {
         }
         self.final_norm.record_with_barrier(
             recorder,
-            args.num_tokens,
-            ReplayU32::Fixed(args.num_tokens),
+            num_total_tokens,
+            num_active_tokens,
             hidden,
             args.hidden_output,
         );
@@ -279,6 +300,20 @@ impl Qwen3xDSparkPrefill {
             .as_deref()
             .expect("Qwen3.x DSpark Prefill model state must be loaded before execution")
     }
+
+    pub fn prepare_replay(
+        &self,
+        num_active_tokens: u32,
+        gathers_main_residual_rows: bool,
+    ) -> (Qwen3xDSparkPrefillReplayKey, ReplayArguments) {
+        assert!(num_active_tokens > 0, "Qwen3.x DSpark Prefill requires active tokens");
+        let key = Qwen3xDSparkPrefillReplayKey {
+            num_total_tokens: num_active_tokens,
+            gathers_main_residual_rows,
+        };
+        let arguments = ReplayArguments::new().with_u32(DSPARK_PREFILL_NUM_ACTIVE_TOKENS, num_active_tokens);
+        (key, arguments)
+    }
 }
 
 impl ReplayComponent for Qwen3xDSparkPrefill {
@@ -287,13 +322,18 @@ impl ReplayComponent for Qwen3xDSparkPrefill {
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         Qwen3xDSparkPrefillReplayKey {
-            num_tokens: input.num_tokens,
+            num_total_tokens: input.num_tokens,
             gathers_main_residual_rows: input.main_rows.gathers(),
         }
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.model().record_prefill(recorder, *input);
+        self.model().record_prefill(
+            recorder,
+            input.num_tokens,
+            ReplayU32::Parameter(DSPARK_PREFILL_NUM_ACTIVE_TOKENS),
+            *input,
+        );
     }
 }
 
@@ -321,6 +361,10 @@ impl Qwen3xDSparkBody {
             .as_deref()
             .expect("Qwen3.x DSpark body model state must be loaded before execution")
     }
+
+    pub fn add_replay_arguments(&self, shape: GQAReplayShape, arguments: &mut ReplayArguments) {
+        arguments.set_u32(DSPARK_BODY_NUM_ACTIVE_TOKENS, shape.num_tokens);
+    }
 }
 
 impl ReplayComponent for Qwen3xDSparkBody {
@@ -332,13 +376,19 @@ impl ReplayComponent for Qwen3xDSparkBody {
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        self.model().record_body(recorder, *input);
+        let shape = input.metadata.replay_shape();
+        self.model().record_body(
+            recorder,
+            shape.num_total_tokens,
+            ReplayU32::Parameter(DSPARK_BODY_NUM_ACTIVE_TOKENS),
+            *input,
+        );
     }
 }
 
 fn dspark_body_replay_key(shape: GQAReplayShape) -> Qwen3xDSparkBodyReplayKey {
     Qwen3xDSparkBodyReplayKey {
-        num_tokens: shape.num_tokens,
+        num_total_tokens: shape.num_total_tokens,
         num_total_sdpa_map_task_templates: shape.num_total_sdpa_map_task_templates,
     }
 }
@@ -350,7 +400,7 @@ mod tests {
     use super::dspark_body_replay_key;
 
     #[test]
-    fn body_replay_key_reuses_one_capacity_for_different_active_history_task_counts() {
+    fn test_body_replay_key_reuses_one_capacity_for_different_active_history_task_counts() {
         let shape = GQAReplayShape {
             num_tokens: 7,
             num_total_tokens: 7,

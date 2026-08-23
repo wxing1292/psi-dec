@@ -6,13 +6,9 @@ use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
-use crate::metal::ReplayArguments;
-use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayU32;
 
 const SOURCE: &str = include_str!("../metal/dflash2_selector.metal");
-
-pub const NUM_ACTIVE_REQUESTS_KEY: ReplayParameterKey = ReplayParameterKey::new("dflash2_selector.num_active_requests");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -178,14 +174,6 @@ impl Compute {
             buffers,
         }
     }
-
-    pub fn add_replay_arguments(&self, shape: Shape, num_active_requests: u32, arguments: &mut ReplayArguments) {
-        shape.validate();
-        assert!(num_active_requests > 0 && num_active_requests <= shape.num_total_requests);
-        if shape.num_total_requests > 1 {
-            arguments.set_u32(NUM_ACTIVE_REQUESTS_KEY, num_active_requests);
-        }
-    }
 }
 
 pub struct PredecessorIdInvocation<'a> {
@@ -329,12 +317,7 @@ fn bind_active_requests(recorder: &CommandRecorder<'_>, index: usize, shape: Sha
             recorder.set_u32(index, value);
         },
         ReplayU32::Parameter(key) => {
-            assert_eq!(key, NUM_ACTIVE_REQUESTS_KEY);
-            if shape.num_total_requests == 1 {
-                recorder.set_u32(index, 1);
-            } else {
-                recorder.bind_u32(index, key, 1, shape.num_total_requests);
-            }
+            recorder.bind_u32(index, key, 1, shape.num_total_requests);
         },
     }
 }

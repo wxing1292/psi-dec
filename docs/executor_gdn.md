@@ -745,8 +745,13 @@ dimension.
 Focused tests and benches use the same `ReplayLayer::record(...)` entrypoint as model replay.
 
 State page restore/publish belongs to `GDNRequestStateTable`, not to individual layer backends. These lifecycle stages
-retain exact keys and fixed arguments. They are not part of the forward request/token bucket policy. Runtime supplies one
-state-page vector per cache block. The vector contains every GDN layer in model order.
+are not part of the forward request/token bucket policy. Runtime supplies one state-page vector per cache block. The
+vector contains every GDN layer in model order.
+
+Cached restore uses identity state-I/O-request capacity. Its replay key contains
+`num_total_state_io_requests`, and submission supplies `num_active_state_io_requests` even when both values are equal.
+Publish records an exact one-shot program through the same active/total backend API and uses a fixed active value equal
+to the total extent.
 
 The manager splits that vector into recurrent and convolution page-ID staging. It then records one flattened all-layer
 page command:
@@ -1024,6 +1029,9 @@ the matching candidate/current slot to its page IDs.
 GDN page read/write helpers remain separate recordable backend-metal components. They restore or publish verified state
 pages. Runtime core owns page IDs and cache notifications. The model executor owns GDN state layout, request-slot
 interpretation, and candidate slot promotion. It owns only CPU transaction copies of runtime-provided page-ID vectors.
+
+The state-page read replay test records `num_total_state_io_requests = 8`. It replays active counts
+`1, 8, 3, 7, 2, 6, 4, 5` and compares the active recurrent and convolution state copies with a CPU reference.
 
 `begin_txn(...)` registers candidate state-slot mappings and future immutable-page mappings.
 It stores page mappings as typed `GDNStatePages` values for the current request txn.
