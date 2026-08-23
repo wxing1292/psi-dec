@@ -824,12 +824,16 @@ The default case matrix uses this order:
 
 The default 27B Main and MTP checkpoints use Qwen3.8. The default 35B Main and MTP checkpoints use Qwen3.6.
 Each case uses its Main checkpoint for tokenization by default. Use `--tokenizer` to override all cases.
+The default `representative2` workload contains one fixed GSM8K prompt and the original Beijing travel prompt.
+The helper repeats and summarizes each prompt independently. Each `RUN` and `SUMMARY` row contains the stable prompt
+ID. The `CONFIG` row contains the prompt-set name, prompt IDs, prompt count, and prompt-set SHA-256.
+Use `--prompt <text>` to replace the set with one custom prompt.
 If an MTP, DSpark, or DFlash2 checkpoint is absent and no download repository is configured, the helper prints a
 warning and skips that case. A missing Main checkpoint remains an error.
 Before it starts a DFlash2 case, the helper validates the affine config and safetensors headers.
 It rejects a checkpoint that contains a BF16 matrix.
 The helper stops the server after each explicit case.
-It applies the configured cooldown between runnable cases.
+It applies the configured cooldown between runnable cases. The default cooldown is 8 seconds.
 Each MTP summary label includes its proposal count, for example, `27b_mtp2`.
 DSpark and DFlash2 summary labels identify only the model and mode because their block geometry comes from the
 checkpoint.
@@ -842,39 +846,16 @@ Both helpers print these facts:
 - Cache and request capacity
 - Scheduler capacities
 - Sampling configuration and seed
+- Prompt identity
 - Trajectory fields
 
 Both helpers also print cooldown and speculative-acceptance fields.
 
-The Qwen3 helper does not contain a checked-in performance baseline.
-
-The helper contains an M3 Max Qwen3.6 baseline for Main-only and one-step MTP cases.
-The default Qwen3.8 27B checkpoints report a checkpoint configuration mismatch against this baseline.
-Two-step MTP and all DSpark and DFlash2 cases report that no hardware baseline exists.
-The baseline was recorded on 2026-07-21 at `132c5073`.
-It used these settings:
-
-- 384K pages
-- 2048-token cache blocks
-- Four running requests
-- The 4/128/64 scheduler configuration
-- A 30-second cooldown between runnable cases
+Neither helper contains checked-in performance numbers or baseline comparisons.
+Record comparison results outside the script with the complete provenance required by
+[`executor_benchmarks.md`](executor_benchmarks.md).
 
 The current default uses four running requests.
-
-A summary reports `baseline_status=comparable` only when all comparison inputs match. It then reports typed decode,
-TTFT, and inter-chunk delta percentages.
-
-These comparison inputs must match:
-
-- Machine and operating system
-- Checkpoint directory names
-- Prompt and sampling configuration
-- Capacities and cooldown
-- Sampled trajectory
-
-Baseline throughput and trajectory use machine, case, and token count as keys. A configuration or trajectory mismatch
-remains visible. It does not produce a performance delta.
 
 Summaries report these metrics:
 
@@ -888,8 +869,6 @@ Summaries report these metrics:
 For Main-only decoding, a chunk contains one token. Thus, inter-chunk time is inter-token latency.
 
 With MTP, inter-chunk time measures burst cadence. Interpret it with tokens for each chunk and the acceptance rate.
-
-A positive decode delta is faster. A positive TTFT or inter-chunk latency delta is slower.
 
 Use `--case-cooldown-secs 0` only for an intentional sustained-load experiment.
 

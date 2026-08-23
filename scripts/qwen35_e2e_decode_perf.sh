@@ -4,23 +4,34 @@ set -euo pipefail
 RUNS=7
 PORT=50061
 BUILD=1
-PROMPT="你好，北京有什么好玩的景点？香山如何？早上去晚上去？单纯爬山么？还有什么可以在香山玩的？"
+# One fixed GSM8K prompt and the original Beijing prompt.
+PROMPT_SET="representative2"
+PROMPT_IDS=(
+    "gsm8k_typing_average"
+    "beijing_travel"
+)
+PROMPTS=(
+    "Jared is trying to increase his typing speed. He starts with 47 words per minute (WPM). After some lessons the next time he tests his typing speed it has increased to 52 WPM. If he continues to increase his typing speed once more by 5 words, what will be the average of the three measurements?
+Please reason step by step, and put your final answer within \boxed{}."
+    "你好，北京有什么好玩的景点？香山如何？早上去晚上去？单纯爬山么？还有什么可以在香山玩的？"
+)
 MODEL_ROOT="$HOME/Workspace/models"
 TOKENIZER=""
 MODEL_27B=""
 MTP_27B=""
 DSPARK_27B=""
+DFLASH2_27B=""
 MODEL_35B=""
 MTP_35B=""
 DSPARK_35B=""
+DFLASH2_35B=""
 MODEL_27B_REPO="mlx-community/Qwen3.8-27B-4bit"
 MTP_27B_REPO="mlx-community/Qwen3.8-27B-MTP-4bit"
 DSPARK_27B_REPO=""
 MODEL_35B_REPO="mlx-community/Qwen3.6-35B-A3B-4bit"
 MTP_35B_REPO="mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
 DSPARK_35B_REPO=""
-CASES="27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark"
-BASELINE=1
+CASES="27b_off,35b_off,27b_mtp1,35b_mtp1,27b_dspark,35b_dspark,27b_dflash2,35b_dflash2,27b_mtp2,35b_mtp2"
 CASE_COOLDOWN_SECS=8
 LOGGING=info
 SEED=42
@@ -28,26 +39,6 @@ NUM_CACHE_PAGES=393216
 MAX_REQUESTS=4
 MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
-BASELINE_MACHINE="apple_m3_max_40_gpu_cores"
-BASELINE_DATE="2026-07-21"
-BASELINE_COMMIT="132c507380754302bd2e78a2d1a0abd4d1094d58"
-BASELINE_OS_VERSION="27.0"
-BASELINE_ARCH="arm64"
-BASELINE_NUM_CACHE_PAGES=393216
-BASELINE_CACHE_BLOCK_TOKENS=2048
-BASELINE_MAX_REQUESTS=4
-BASELINE_MAX_TOKENS=128
-BASELINE_MAX_TOKENS_PER_REQUEST=64
-BASELINE_CASE_COOLDOWN_SECS=8
-BASELINE_LOGGING="info"
-BASELINE_SEED=42
-BASELINE_MIN_RUNS=3
-BASELINE_PROMPT_SHA256="a4f0a10af5d122c667bfce70079dfc873cd384a28a879022b4c106b71feca78f"
-BASELINE_TOKENIZER_DIR_NAME="Qwen3.6-35B-A3B-4bit"
-BASELINE_MODEL_27B_DIR_NAME="Qwen3.6-27B-4bit"
-BASELINE_MTP_27B_DIR_NAME="Qwen3.6-27B-MTP-4bit"
-BASELINE_MODEL_35B_DIR_NAME="Qwen3.6-35B-A3B-4bit"
-BASELINE_MTP_35B_DIR_NAME="Qwen3.6-35B-A3B-MTP-4bit"
 CACHE_BLOCK_TOKENS=2048
 ACTIVE_SERVER_PID=""
 
@@ -71,17 +62,23 @@ Runs Qwen3.5/3.6/3.8 replay e2e decode perf one server at a time and reports
 decode throughput, TTFT, inter-chunk latency, and speculative acceptance.
 
 Options:
-  --runs N              Runs per token-count case. Default: 7
+  --runs N              Runs per prompt and token-count case. Default: 7
   --cases LIST          Comma-separated cases.
-                        Default: 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark
-                        Available: 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark
-                        Each *_mtp or *_dspark case runs 1 and then 2 speculative tokens.
-                        Group cases: 27b_on and 35b_on run both MTP and DSpark.
-                        Missing Spec checkpoints without a repo are warned and skipped.
+                        Default order:
+                          27b_off,35b_off,
+                          27b_mtp1,35b_mtp1,
+                          27b_dspark,35b_dspark,
+                          27b_dflash2,35b_dflash2,
+                          27b_mtp2,35b_mtp2
+                        Available modes: off, mtp, dspark, dflash2.
+                        The *_mtp alias runs proposal counts 1 and 2.
+                        DSpark and DFlash2 use checkpoint-defined block geometry.
+                        Group cases: 27b_on and 35b_on select all Spec modes.
+                        Missing Spec checkpoints are warned and skipped.
   --port N              Server port. Default: 50061
-  --prompt TEXT         Prompt string.
+  --prompt TEXT         Use one custom prompt instead of the default representative2 set.
   --seed N              Fixed request seed. Default: 42
-  --num-cache-pages N   Shared cache pages. Default: 393216 (baseline workload)
+  --num-cache-pages N   Shared cache pages. Default: 393216
   --max-requests N      Scheduler request capacity. Default: 4
   --max-tokens N        Scheduler flattened-token capacity. Default: 128
   --max-tokens-per-request N
@@ -91,9 +88,11 @@ Options:
   --model-27b DIR       27B Main directory. Default: MODEL_ROOT/Qwen3.8-27B-4bit
   --mtp-27b DIR         27B MTP directory. Default: MODEL_ROOT/Qwen3.8-27B-MTP-4bit
   --dspark-27b DIR      27B DSpark directory. Default: MODEL_ROOT/Qwen3.8-27B-DSpark-affine
+  --dflash2-27b DIR     27B affine DFlash2 directory. Default: MODEL_ROOT/Qwen3.8-27B-DFlash2-affine
   --model-35b DIR       35B Main directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-4bit
   --mtp-35b DIR         35B MTP directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit
   --dspark-35b DIR      35B DSpark directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine
+  --dflash2-35b DIR     35B affine DFlash2 directory. Default: MODEL_ROOT/Qwen3.6-35B-A3B-DFlash2-affine
   --model-27b-repo REPO Hugging Face repo used if the 27B Main model is missing.
   --mtp-27b-repo REPO   Hugging Face repo used if the 27B MTP model is missing.
   --dspark-27b-repo REPO
@@ -103,7 +102,6 @@ Options:
   --dspark-35b-repo REPO
                         Hugging Face repo used if the 35B affine DSpark model is missing.
   --no-build            Skip release build.
-  --no-baseline         Do not compare summary rows with the checked-in M3 Max baseline.
   --case-cooldown-secs N
                         Idle time between model cases. Default: 8
                         Pass 0 for an intentional sustained-load run.
@@ -114,13 +112,14 @@ Options:
 Examples:
   scripts/qwen35_e2e_decode_perf.sh \
     --model-root "$HOME/Workspace/models" \
-    --cases 27b_off,27b_mtp,27b_dspark,35b_off,35b_mtp,35b_dspark --runs 3
+    --cases 27b_off,35b_off,27b_mtp1,35b_mtp1,27b_dspark,35b_dspark \
+    --runs 3
 
   scripts/qwen35_e2e_decode_perf.sh \
     --model-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-4bit" \
     --mtp-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-MTP-4bit" \
     --dspark-35b "$HOME/Workspace/models/Qwen3.6-35B-A3B-DSpark-affine" \
-    --cases 35b_mtp,35b_dspark --runs 3
+    --cases 35b_mtp1,35b_dspark,35b_mtp2 --runs 3
 EOF
 }
 
@@ -155,7 +154,9 @@ while [[ $# -gt 0 ]]; do
             echo "--prompt requires a value" >&2
             exit 2
         }
-        PROMPT="$2"
+        PROMPT_SET="custom"
+        PROMPT_IDS=("custom")
+        PROMPTS=("$2")
         shift 2
         ;;
     --seed)
@@ -238,6 +239,14 @@ while [[ $# -gt 0 ]]; do
         DSPARK_27B="$2"
         shift 2
         ;;
+    --dflash2-27b)
+        [[ $# -ge 2 ]] || {
+            echo "--dflash2-27b requires a value" >&2
+            exit 2
+        }
+        DFLASH2_27B="$2"
+        shift 2
+        ;;
     --model-35b)
         [[ $# -ge 2 ]] || {
             echo "--model-35b requires a value" >&2
@@ -260,6 +269,14 @@ while [[ $# -gt 0 ]]; do
             exit 2
         }
         DSPARK_35B="$2"
+        shift 2
+        ;;
+    --dflash2-35b)
+        [[ $# -ge 2 ]] || {
+            echo "--dflash2-35b requires a value" >&2
+            exit 2
+        }
+        DFLASH2_35B="$2"
         shift 2
         ;;
     --model-27b-repo)
@@ -312,10 +329,6 @@ while [[ $# -gt 0 ]]; do
         ;;
     --no-build)
         BUILD=0
-        shift
-        ;;
-    --no-baseline)
-        BASELINE=0
         shift
         ;;
     --case-cooldown-secs)
@@ -377,6 +390,17 @@ require_positive_integer "--max-tokens-per-request" "$MAX_TOKENS_PER_REQUEST"
 require_nonnegative_integer "--case-cooldown-secs" "$CASE_COOLDOWN_SECS"
 require_nonnegative_integer "--seed" "$SEED"
 
+if ((${#PROMPTS[@]} == 0 || ${#PROMPT_IDS[@]} != ${#PROMPTS[@]})); then
+    echo "prompt IDs and prompts must define the same nonzero workload set" >&2
+    exit 2
+fi
+for prompt_index in "${!PROMPTS[@]}"; do
+    if [[ -z "${PROMPTS[$prompt_index]}" ]]; then
+        echo "prompt ${PROMPT_IDS[$prompt_index]} must not be empty" >&2
+        exit 2
+    fi
+done
+
 case "$LOGGING" in
 info | debug) ;;
 *)
@@ -397,9 +421,11 @@ fi
 [[ -n "$MODEL_27B" ]] || MODEL_27B="$MODEL_ROOT/Qwen3.8-27B-4bit"
 [[ -n "$MTP_27B" ]] || MTP_27B="$MODEL_ROOT/Qwen3.8-27B-MTP-4bit"
 [[ -n "$DSPARK_27B" ]] || DSPARK_27B="$MODEL_ROOT/Qwen3.8-27B-DSpark-affine"
+[[ -n "$DFLASH2_27B" ]] || DFLASH2_27B="$MODEL_ROOT/Qwen3.8-27B-DFlash2-affine"
 [[ -n "$MODEL_35B" ]] || MODEL_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-4bit"
 [[ -n "$MTP_35B" ]] || MTP_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-MTP-4bit"
 [[ -n "$DSPARK_35B" ]] || DSPARK_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-DSpark-affine"
+[[ -n "$DFLASH2_35B" ]] || DFLASH2_35B="$MODEL_ROOT/Qwen3.6-35B-A3B-DFlash2-affine"
 
 IFS=, read -r -a selected_cases <<<"$CASES"
 requested_cases=("${selected_cases[@]}")
@@ -420,13 +446,37 @@ append_case() {
 
 for case_name in "${requested_cases[@]}"; do
     case "$case_name" in
-    27b_on)
-        append_case 27b_mtp
+    27b_mtp)
+        append_case 27b_mtp1
+        append_case 27b_mtp2
+        ;;
+    27b_dspark)
         append_case 27b_dspark
         ;;
-    35b_on)
-        append_case 35b_mtp
+    27b_dflash2)
+        append_case 27b_dflash2
+        ;;
+    27b_on)
+        append_case 27b_mtp1
+        append_case 27b_dspark
+        append_case 27b_dflash2
+        append_case 27b_mtp2
+        ;;
+    35b_mtp)
+        append_case 35b_mtp1
+        append_case 35b_mtp2
+        ;;
+    35b_dspark)
         append_case 35b_dspark
+        ;;
+    35b_dflash2)
+        append_case 35b_dflash2
+        ;;
+    35b_on)
+        append_case 35b_mtp1
+        append_case 35b_dspark
+        append_case 35b_dflash2
+        append_case 35b_mtp2
         ;;
     *) append_case "$case_name" ;;
     esac
@@ -435,13 +485,15 @@ done
 need_27b=0
 need_27b_mtp=0
 need_27b_dspark=0
+need_27b_dflash2=0
 need_35b=0
 need_35b_mtp=0
 need_35b_dspark=0
+need_35b_dflash2=0
 for case_name in "${selected_cases[@]}"; do
     case "$case_name" in
     27b_off) need_27b=1 ;;
-    27b_mtp)
+    27b_mtp1 | 27b_mtp2)
         need_27b=1
         need_27b_mtp=1
         ;;
@@ -449,14 +501,22 @@ for case_name in "${selected_cases[@]}"; do
         need_27b=1
         need_27b_dspark=1
         ;;
+    27b_dflash2)
+        need_27b=1
+        need_27b_dflash2=1
+        ;;
     35b_off) need_35b=1 ;;
-    35b_mtp)
+    35b_mtp1 | 35b_mtp2)
         need_35b=1
         need_35b_mtp=1
         ;;
     35b_dspark)
         need_35b=1
         need_35b_dspark=1
+        ;;
+    35b_dflash2)
+        need_35b=1
+        need_35b_dflash2=1
         ;;
     *)
         echo "unknown case: $case_name" >&2
@@ -503,10 +563,49 @@ if not isinstance(quantization, dict):
     raise SystemExit(f"{option} must name an affine-quantized DSpark checkpoint")
 
 block_size = config.get("block_size")
-if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 2:
-    raise SystemExit(
-        f"{path} must have block_size >= 2 for the DSpark 1/2 benchmark matrix"
-    )
+if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 1:
+    raise SystemExit(f"{path} must have a positive DSpark block_size")
+PY
+}
+
+validate_affine_dflash2() {
+    local option="$1"
+    local dir="$2"
+    DFLASH2_DIR="$dir" DFLASH2_OPTION="$option" python3 - <<'PY'
+import json
+import os
+import struct
+from pathlib import Path
+
+option = os.environ["DFLASH2_OPTION"]
+model_dir = Path(os.environ["DFLASH2_DIR"])
+config_path = model_dir / "config.json"
+try:
+    config = json.loads(config_path.read_text())
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"unable to read {config_path}: {exc}") from exc
+
+quantization = config.get("quantization")
+if not isinstance(quantization, dict) or quantization.get("mode") != "affine":
+    raise SystemExit(f"{option} must name an affine-quantized DFlash2 checkpoint")
+if config.get("architectures") != ["DFlash2DraftModel"]:
+    raise SystemExit(f"{config_path} must describe one DFlash2DraftModel")
+
+for tensor_path in sorted(model_dir.glob("*.safetensors")):
+    try:
+        with tensor_path.open("rb") as stream:
+            header_bytes = struct.unpack("<Q", stream.read(8))[0]
+            header = json.loads(stream.read(header_bytes))
+    except (OSError, struct.error, json.JSONDecodeError) as exc:
+        raise SystemExit(f"unable to inspect {tensor_path}: {exc}") from exc
+    bf16_matrices = [name for name, metadata in header.items()
+                     if name != "__metadata__"
+                     and metadata.get("dtype") == "BF16"
+                     and len(metadata.get("shape", [])) == 2]
+    if bf16_matrices:
+        raise SystemExit(
+            f"{option} contains BF16 matrices in {tensor_path.name}; run qwen3_dflash2_quantize first"
+        )
 PY
 }
 
@@ -572,11 +671,27 @@ ensure_optional_model() {
     ensure_model "$repo" "$dir"
 }
 
+ensure_optional_local_model() {
+    local case_name="$1"
+    local option="$2"
+    local dir="$3"
+
+    if ! model_present "$dir"; then
+        echo "WARNING: skipping $case_name because its checkpoint is missing: $dir" >&2
+        echo "Pass $option DIR to enable this case." >&2
+        return 1
+    fi
+    echo "==> Found checkpoint: $dir"
+}
+
 if ((need_27b_mtp)); then
     ensure_optional_model 27b_mtp --mtp-27b "$MTP_27B_REPO" "$MTP_27B" || need_27b_mtp=0
 fi
 if ((need_27b_dspark)); then
     ensure_optional_model 27b_dspark --dspark-27b "$DSPARK_27B_REPO" "$DSPARK_27B" || need_27b_dspark=0
+fi
+if ((need_27b_dflash2)); then
+    ensure_optional_local_model 27b_dflash2 --dflash2-27b "$DFLASH2_27B" || need_27b_dflash2=0
 fi
 if ((need_35b_mtp)); then
     ensure_optional_model 35b_mtp --mtp-35b "$MTP_35B_REPO" "$MTP_35B" || need_35b_mtp=0
@@ -584,14 +699,19 @@ fi
 if ((need_35b_dspark)); then
     ensure_optional_model 35b_dspark --dspark-35b "$DSPARK_35B_REPO" "$DSPARK_35B" || need_35b_dspark=0
 fi
+if ((need_35b_dflash2)); then
+    ensure_optional_local_model 35b_dflash2 --dflash2-35b "$DFLASH2_35B" || need_35b_dflash2=0
+fi
 
 runnable_cases=()
 for case_name in "${selected_cases[@]}"; do
     case "$case_name" in
-    27b_mtp) ((need_27b_mtp)) || continue ;;
+    27b_mtp1 | 27b_mtp2) ((need_27b_mtp)) || continue ;;
     27b_dspark) ((need_27b_dspark)) || continue ;;
-    35b_mtp) ((need_35b_mtp)) || continue ;;
+    27b_dflash2) ((need_27b_dflash2)) || continue ;;
+    35b_mtp1 | 35b_mtp2) ((need_35b_mtp)) || continue ;;
     35b_dspark) ((need_35b_dspark)) || continue ;;
+    35b_dflash2) ((need_35b_dflash2)) || continue ;;
     esac
     runnable_cases+=("$case_name")
 done
@@ -637,6 +757,10 @@ fi
 if ((need_27b_dspark)); then
     require_dir "--dspark-27b" "$DSPARK_27B"
 fi
+if ((need_27b_dflash2)); then
+    require_dir "--dflash2-27b" "$DFLASH2_27B"
+    validate_affine_dflash2 "--dflash2-27b" "$DFLASH2_27B"
+fi
 if ((need_35b)); then
     require_dir "--model-35b" "$MODEL_35B"
 fi
@@ -645,6 +769,10 @@ if ((need_35b_mtp)); then
 fi
 if ((need_35b_dspark)); then
     require_dir "--dspark-35b" "$DSPARK_35B"
+fi
+if ((need_35b_dflash2)); then
+    require_dir "--dflash2-35b" "$DFLASH2_35B"
+    validate_affine_dflash2 "--dflash2-35b" "$DFLASH2_35B"
 fi
 if ((need_27b_dspark)); then
     validate_affine_dspark "--dspark-27b" "$DSPARK_27B"
@@ -666,80 +794,16 @@ current_machine_id() {
     echo "${normalized_chipset}_${gpu_cores}_gpu_cores"
 }
 
-baseline_config_mismatches() {
-    local current_machine="$1"
-    local current_os="$2"
-    local current_arch="$3"
-    local prompt_sha256
-    local mismatches=""
-    prompt_sha256="$(printf '%s' "$PROMPT" | shasum -a 256 | awk '{print $1}')"
-
-    [[ "$current_machine" == "$BASELINE_MACHINE" ]] || mismatches="machine"
-    [[ "$current_os" == "$BASELINE_OS_VERSION" ]] || mismatches="${mismatches:+$mismatches,}os"
-    [[ "$current_arch" == "$BASELINE_ARCH" ]] || mismatches="${mismatches:+$mismatches,}arch"
-    [[ "$NUM_CACHE_PAGES" == "$BASELINE_NUM_CACHE_PAGES" ]] || mismatches="${mismatches:+$mismatches,}num_cache_pages"
-    [[ "$CACHE_BLOCK_TOKENS" == "$BASELINE_CACHE_BLOCK_TOKENS" ]] || mismatches="${mismatches:+$mismatches,}cache_block_tokens"
-    [[ "$MAX_REQUESTS" == "$BASELINE_MAX_REQUESTS" ]] || mismatches="${mismatches:+$mismatches,}max_requests"
-    [[ "$MAX_TOKENS" == "$BASELINE_MAX_TOKENS" ]] || mismatches="${mismatches:+$mismatches,}max_tokens"
-    [[ "$MAX_TOKENS_PER_REQUEST" == "$BASELINE_MAX_TOKENS_PER_REQUEST" ]] || mismatches="${mismatches:+$mismatches,}max_tokens_per_request"
-    [[ "$CASE_COOLDOWN_SECS" == "$BASELINE_CASE_COOLDOWN_SECS" ]] || mismatches="${mismatches:+$mismatches,}case_cooldown_secs"
-    [[ "$LOGGING" == "$BASELINE_LOGGING" ]] || mismatches="${mismatches:+$mismatches,}logging"
-    [[ "$SEED" == "$BASELINE_SEED" ]] || mismatches="${mismatches:+$mismatches,}seed"
-    [[ "$prompt_sha256" == "$BASELINE_PROMPT_SHA256" ]] || mismatches="${mismatches:+$mismatches,}prompt"
-    if [[ -n "$TOKENIZER" ]]; then
-        [[ "$(basename "$TOKENIZER")" == "$BASELINE_TOKENIZER_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
-    elif ((need_35b)); then
-        [[ "$(basename "$MODEL_35B")" == "$BASELINE_TOKENIZER_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
-    else
-        [[ "$(basename "$MODEL_27B")" == "$BASELINE_TOKENIZER_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
-    fi
-    if ((need_27b)); then
-        [[ "$(basename "$MODEL_27B")" == "$BASELINE_MODEL_27B_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}model_27b"
-    fi
-    if ((need_27b_mtp)); then
-        [[ "$(basename "$MTP_27B")" == "$BASELINE_MTP_27B_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}mtp_27b"
-    fi
-    if ((need_35b)); then
-        [[ "$(basename "$MODEL_35B")" == "$BASELINE_MODEL_35B_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}model_35b"
-    fi
-    if ((need_35b_mtp)); then
-        [[ "$(basename "$MTP_35B")" == "$BASELINE_MTP_35B_DIR_NAME" ]] || mismatches="${mismatches:+$mismatches,}mtp_35b"
-    fi
-    echo "$mismatches"
+prompt_set_sha256() {
+    local prompt_index
+    for prompt_index in "${!PROMPTS[@]}"; do
+        printf '%s\034%s\035' "${PROMPT_IDS[$prompt_index]}" "${PROMPTS[$prompt_index]}"
+    done | shasum -a 256 | awk '{print $1}'
 }
 
-baseline_metrics() {
-    # Medians from a controlled M3 Max run on BASELINE_DATE at BASELINE_COMMIT.
-    # The run used three samples per token count and the exact workload recorded
-    # by the BASELINE_* constants above. The machine is part of the lookup key
-    # so another hardware baseline can be added without replacing these values.
-    # Fields: decode_tok_s, ttft_ms, inter_chunk_p50_ms, inter_chunk_p95_ms.
-    case "$1:$2:$3" in
-    apple_m3_max_40_gpu_cores:27b_off:256) echo "22.561,335.410,44.383,45.088" ;;
-    apple_m3_max_40_gpu_cores:27b_off:384) echo "22.490,339.124,44.820,45.101" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp1:256) echo "38.826,338.567,49.179,49.851" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp1:384) echo "36.921,358.611,51.069,51.663" ;;
-    apple_m3_max_40_gpu_cores:35b_off:256) echo "95.597,77.732,10.509,10.910" ;;
-    apple_m3_max_40_gpu_cores:35b_off:1024) echo "92.860,74.288,10.822,10.948" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:256) echo "147.397,78.127,13.030,13.383" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:1024) echo "129.709,75.905,13.585,14.221" ;;
-    *) return 1 ;;
-    esac
-}
-
-baseline_trajectory() {
-    # Fields: input tokens, sampled tokens, chunks, proposed speculative tokens, verified speculative tokens.
-    case "$1:$2:$3" in
-    apple_m3_max_40_gpu_cores:27b_off:256) echo "34,256,256,0,0" ;;
-    apple_m3_max_40_gpu_cores:27b_off:384) echo "34,384,384,0,0" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp1:256) echo "34,256,135,134,122" ;;
-    apple_m3_max_40_gpu_cores:27b_mtp1:384) echo "34,384,205,204,180" ;;
-    apple_m3_max_40_gpu_cores:35b_off:256) echo "34,256,256,0,0" ;;
-    apple_m3_max_40_gpu_cores:35b_off:1024) echo "34,1024,1024,0,0" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:256) echo "34,256,134,133,123" ;;
-    apple_m3_max_40_gpu_cores:35b_mtp1:1024) echo "34,1024,583,582,442" ;;
-    *) return 1 ;;
-    esac
+prompt_ids_csv() {
+    local IFS=,
+    printf '%s' "${PROMPT_IDS[*]}"
 }
 
 if [[ "$BUILD" -eq 1 ]]; then
@@ -765,10 +829,12 @@ wait_for_port() {
 run_decode() {
     local label="$1"
     local tokens="$2"
-    local run="$3"
-    local server_log="$4"
-    local tokenizer="$5"
-    local out="/tmp/psi_dec_${label}_${tokens}_${run}.out"
+    local prompt_id="$3"
+    local prompt="$4"
+    local run="$5"
+    local server_log="$6"
+    local tokenizer="$7"
+    local out="/tmp/psi_dec_${label}_${tokens}_${prompt_id}_${run}.out"
     local server_log_offset
     server_log_offset="$(wc -c <"$server_log")"
     if ! target/release/decode \
@@ -778,8 +844,8 @@ run_decode() {
         --chat-template auto \
         --show-stats \
         --hf-model-dir "$tokenizer" \
-        --prompt-str "$PROMPT" >"$out" 2>&1; then
-        echo "DECODE_FAILED label=$label max_new=$tokens run=$run client_output=$out server_log=$server_log" >&2
+        --prompt-str "$prompt" >"$out" 2>&1; then
+        echo "DECODE_FAILED label=$label max_new=$tokens prompt=$prompt_id run=$run client_output=$out server_log=$server_log" >&2
         tail -n 80 "$out" >&2 || true
         tail -n 120 "$server_log" >&2 || true
         return 1
@@ -787,7 +853,7 @@ run_decode() {
     local json
     json=$(grep "^{" "$out" | tail -n 1 || true)
     if [[ -z "$json" ]]; then
-        echo "DECODE_STATS_MISSING label=$label max_new=$tokens run=$run client_output=$out server_log=$server_log" >&2
+        echo "DECODE_STATS_MISSING label=$label max_new=$tokens prompt=$prompt_id run=$run client_output=$out server_log=$server_log" >&2
         tail -n 80 "$out" >&2 || true
         tail -n 120 "$server_log" >&2 || true
         return 1
@@ -854,7 +920,7 @@ print("{:.6f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{:.6f},{:.6f},{},{},{}"
     encode_rates(acceptance_rate_by_index),
 ))
 PY
-        echo "DECODE_STATS_INVALID label=$label max_new=$tokens run=$run client_output=$out server_log=$server_log" >&2
+        echo "DECODE_STATS_INVALID label=$label max_new=$tokens prompt=$prompt_id run=$run client_output=$out server_log=$server_log" >&2
         tail -n 80 "$out" >&2 || true
         tail -n 120 "$server_log" >&2 || true
         return 1
@@ -865,6 +931,7 @@ run_server_case() {
     local label="$1"
     local token_list="$2"
     local tokenizer="$3"
+    local prompt_index
     shift 3
     local log="/tmp/psi_dec_${label}.log"
 
@@ -880,115 +947,76 @@ run_server_case() {
         exit 1
     fi
 
-    for tokens in $token_list; do
-        local vals=""
-        local inputs=""
-        local chunks=""
-        local samples=""
-        local ttfts=""
-        local prompt_rates=""
-        local inter_chunk_p50s=""
-        local inter_chunk_p95s=""
-        local proposed_specs=""
-        local verified_specs=""
-        local acceptance_rates=""
-        local tokens_per_chunks=""
-        local spec_by_index=""
-        local verified_by_index=""
-        for run in $(seq 1 "$RUNS"); do
-            local parsed tokps chunk sampled input_tokens ttft prompt_rate
-            local inter_chunk_p50 inter_chunk_p95 proposed_spec verified_spec
-            local acceptance_rate tokens_per_chunk
-            local run_spec_by_index run_verified_by_index acceptance_rate_by_index
-            parsed=$(run_decode "$label" "$tokens" "$run" "$log" "$tokenizer")
-            IFS=, read -r \
-                tokps chunk sampled input_tokens ttft prompt_rate \
-                inter_chunk_p50 inter_chunk_p95 proposed_spec verified_spec \
-                acceptance_rate tokens_per_chunk run_spec_by_index \
-                run_verified_by_index acceptance_rate_by_index <<<"$parsed"
-            vals="$vals $tokps"
-            inputs="$inputs $input_tokens"
-            chunks="$chunks $chunk"
-            samples="$samples $sampled"
-            ttfts="$ttfts $ttft"
-            prompt_rates="$prompt_rates $prompt_rate"
-            inter_chunk_p50s="$inter_chunk_p50s $inter_chunk_p50"
-            inter_chunk_p95s="$inter_chunk_p95s $inter_chunk_p95"
-            proposed_specs="$proposed_specs $proposed_spec"
-            verified_specs="$verified_specs $verified_spec"
-            acceptance_rates="$acceptance_rates $acceptance_rate"
-            tokens_per_chunks="$tokens_per_chunks $tokens_per_chunk"
-            spec_by_index="$spec_by_index $run_spec_by_index"
-            verified_by_index="$verified_by_index $run_verified_by_index"
-            echo "RUN label=$label max_new=$tokens run=$run" \
-                "input_tokens=$input_tokens sampled=$sampled chunks=$chunk" \
-                "proposed_spec=$proposed_spec verified_spec=$verified_spec" \
-                "acceptance_rate=$acceptance_rate acceptance_rate_by_index=$acceptance_rate_by_index" \
-                "tokens_per_chunk=$tokens_per_chunk" \
-                "decode_tok_s=$tokps ttft_ms=$ttft prompt_tok_s=$prompt_rate" \
-                "inter_chunk_p50_ms=$inter_chunk_p50 inter_chunk_p95_ms=$inter_chunk_p95"
-        done
+    for prompt_index in "${!PROMPTS[@]}"; do
+        local prompt_id="${PROMPT_IDS[$prompt_index]}"
+        local prompt="${PROMPTS[$prompt_index]}"
+        for tokens in $token_list; do
+            local vals=""
+            local inputs=""
+            local chunks=""
+            local samples=""
+            local ttfts=""
+            local prompt_rates=""
+            local inter_chunk_p50s=""
+            local inter_chunk_p95s=""
+            local proposed_specs=""
+            local verified_specs=""
+            local acceptance_rates=""
+            local tokens_per_chunks=""
+            local spec_by_index=""
+            local verified_by_index=""
+            for run in $(seq 1 "$RUNS"); do
+                local parsed tokps chunk sampled input_tokens ttft prompt_rate
+                local inter_chunk_p50 inter_chunk_p95 proposed_spec verified_spec
+                local acceptance_rate tokens_per_chunk
+                local run_spec_by_index run_verified_by_index acceptance_rate_by_index
+                parsed=$(run_decode "$label" "$tokens" "$prompt_id" "$prompt" "$run" "$log" "$tokenizer")
+                IFS=, read -r \
+                    tokps chunk sampled input_tokens ttft prompt_rate \
+                    inter_chunk_p50 inter_chunk_p95 proposed_spec verified_spec \
+                    acceptance_rate tokens_per_chunk run_spec_by_index \
+                    run_verified_by_index acceptance_rate_by_index <<<"$parsed"
+                vals="$vals $tokps"
+                inputs="$inputs $input_tokens"
+                chunks="$chunks $chunk"
+                samples="$samples $sampled"
+                ttfts="$ttfts $ttft"
+                prompt_rates="$prompt_rates $prompt_rate"
+                inter_chunk_p50s="$inter_chunk_p50s $inter_chunk_p50"
+                inter_chunk_p95s="$inter_chunk_p95s $inter_chunk_p95"
+                proposed_specs="$proposed_specs $proposed_spec"
+                verified_specs="$verified_specs $verified_spec"
+                acceptance_rates="$acceptance_rates $acceptance_rate"
+                tokens_per_chunks="$tokens_per_chunks $tokens_per_chunk"
+                spec_by_index="$spec_by_index $run_spec_by_index"
+                verified_by_index="$verified_by_index $run_verified_by_index"
+                echo "RUN label=$label max_new=$tokens prompt=$prompt_id run=$run" \
+                    "input_tokens=$input_tokens sampled=$sampled chunks=$chunk" \
+                    "proposed_spec=$proposed_spec verified_spec=$verified_spec" \
+                    "acceptance_rate=$acceptance_rate acceptance_rate_by_index=$acceptance_rate_by_index" \
+                    "tokens_per_chunk=$tokens_per_chunk" \
+                    "decode_tok_s=$tokps ttft_ms=$ttft prompt_tok_s=$prompt_rate" \
+                    "inter_chunk_p50_ms=$inter_chunk_p50 inter_chunk_p95_ms=$inter_chunk_p95"
+            done
 
-        local baseline_decode=""
-        local baseline_ttft=""
-        local baseline_inter_chunk_p50=""
-        local baseline_inter_chunk_p95=""
-        local baseline_input_tokens=""
-        local baseline_sampled=""
-        local baseline_chunks=""
-        local baseline_proposed_spec=""
-        local baseline_verified_spec=""
-        local baseline_status="disabled"
-        local baseline_mismatch=""
-        if [[ "$BASELINE" -eq 1 ]]; then
-            IFS=, read -r \
-                baseline_decode baseline_ttft baseline_inter_chunk_p50 baseline_inter_chunk_p95 \
-                <<<"$(baseline_metrics "$MACHINE" "$label" "$tokens" || true)"
-            IFS=, read -r \
-                baseline_input_tokens baseline_sampled baseline_chunks \
-                baseline_proposed_spec baseline_verified_spec \
-                <<<"$(baseline_trajectory "$MACHINE" "$label" "$tokens" || true)"
-            if [[ -z "$baseline_decode" ]]; then
-                baseline_status="no-hardware-baseline"
-                baseline_mismatch="machine"
-            elif [[ -n "$BASELINE_CONFIG_MISMATCHES" ]]; then
-                baseline_status="config-mismatch"
-                baseline_mismatch="$BASELINE_CONFIG_MISMATCHES"
-            elif ((RUNS < BASELINE_MIN_RUNS)); then
-                baseline_status="insufficient-runs"
-                baseline_mismatch="runs"
-            else
-                baseline_status="comparable"
-            fi
-        fi
-        VALS="$vals" \
-            INPUTS="$inputs" \
-            CHUNKS="$chunks" \
-            SAMPLES="$samples" \
-            TTFTS="$ttfts" \
-            PROMPT_RATES="$prompt_rates" \
-            INTER_CHUNK_P50S="$inter_chunk_p50s" \
-            INTER_CHUNK_P95S="$inter_chunk_p95s" \
-            PROPOSED_SPECS="$proposed_specs" \
-            VERIFIED_SPECS="$verified_specs" \
-            ACCEPTANCE_RATES="$acceptance_rates" \
-            TOKENS_PER_CHUNKS="$tokens_per_chunks" \
-            SPEC_BY_INDEX="$spec_by_index" \
-            VERIFIED_BY_INDEX="$verified_by_index" \
-            LABEL="$label" \
-            TOKENS="$tokens" \
-            BASELINE_DECODE="$baseline_decode" \
-            BASELINE_TTFT="$baseline_ttft" \
-            BASELINE_INTER_CHUNK_P50="$baseline_inter_chunk_p50" \
-            BASELINE_INTER_CHUNK_P95="$baseline_inter_chunk_p95" \
-            BASELINE_INPUT_TOKENS="$baseline_input_tokens" \
-            BASELINE_SAMPLED="$baseline_sampled" \
-            BASELINE_CHUNKS="$baseline_chunks" \
-            BASELINE_PROPOSED_SPEC="$baseline_proposed_spec" \
-            BASELINE_VERIFIED_SPEC="$baseline_verified_spec" \
-            BASELINE_STATUS="$baseline_status" \
-            BASELINE_MISMATCH="$baseline_mismatch" \
-            python3 - <<'PY'
+            VALS="$vals" \
+                INPUTS="$inputs" \
+                CHUNKS="$chunks" \
+                SAMPLES="$samples" \
+                TTFTS="$ttfts" \
+                PROMPT_RATES="$prompt_rates" \
+                INTER_CHUNK_P50S="$inter_chunk_p50s" \
+                INTER_CHUNK_P95S="$inter_chunk_p95s" \
+                PROPOSED_SPECS="$proposed_specs" \
+                VERIFIED_SPECS="$verified_specs" \
+                ACCEPTANCE_RATES="$acceptance_rates" \
+                TOKENS_PER_CHUNKS="$tokens_per_chunks" \
+                SPEC_BY_INDEX="$spec_by_index" \
+                VERIFIED_BY_INDEX="$verified_by_index" \
+                LABEL="$label" \
+                TOKENS="$tokens" \
+                PROMPT_ID="$prompt_id" \
+                python3 - <<'PY'
 import os
 import statistics
 
@@ -1036,13 +1064,14 @@ acceptance_rate_text = (
     else "na"
 )
 prefix = (
-    "SUMMARY label={} max_new={} median_decode_tok_s={:.3f} median_ttft_ms={:.3f} "
+    "SUMMARY label={} max_new={} prompt={} median_decode_tok_s={:.3f} median_ttft_ms={:.3f} "
     "median_prompt_tok_s={:.3f} median_inter_chunk_p50_ms={:.3f} "
     "median_inter_chunk_p95_ms={:.3f} median_tokens_per_chunk={:.3f} "
     "median_acceptance_rate={} acceptance_rate_by_index={}"
 ).format(
     os.environ["LABEL"],
     os.environ["TOKENS"],
+    os.environ["PROMPT_ID"],
     median_decode,
     median_ttft,
     median_prompt_rate,
@@ -1052,61 +1081,6 @@ prefix = (
     acceptance_rate_text,
     acceptance_rate_by_index_text,
 )
-baseline_decode = os.environ.get("BASELINE_DECODE", "")
-baseline_status = os.environ["BASELINE_STATUS"]
-baseline_input_tokens = os.environ.get("BASELINE_INPUT_TOKENS", "")
-baseline_sampled = os.environ.get("BASELINE_SAMPLED", "")
-baseline_chunks = os.environ.get("BASELINE_CHUNKS", "")
-baseline_proposed_spec = os.environ.get("BASELINE_PROPOSED_SPEC", "")
-baseline_verified_spec = os.environ.get("BASELINE_VERIFIED_SPEC", "")
-if baseline_status == "comparable" and (
-    any(input_tokens != baseline_input_tokens for input_tokens in inputs)
-    or any(sample != baseline_sampled for sample in samples)
-    or any(chunk != baseline_chunks for chunk in chunks)
-    or any(proposed != baseline_proposed_spec for proposed in proposed_specs)
-    or any(verified != baseline_verified_spec for verified in verified_specs)
-):
-    baseline_status = "trajectory-mismatch"
-    baseline_mismatch = "trajectory"
-else:
-    baseline_mismatch = os.environ.get("BASELINE_MISMATCH", "")
-if baseline_decode:
-    def optional_float(name):
-        value = os.environ.get(name, "")
-        return None if value in ("", "na") else float(value)
-
-    baseline_decode_value = float(baseline_decode)
-    baseline_ttft = float(os.environ["BASELINE_TTFT"])
-    baseline_inter_chunk_p50 = optional_float("BASELINE_INTER_CHUNK_P50")
-    baseline_inter_chunk_p95 = optional_float("BASELINE_INTER_CHUNK_P95")
-    prefix += (
-        " baseline_decode_tok_s={:.3f} baseline_ttft_ms={:.3f} "
-        "baseline_inter_chunk_p50_ms={} baseline_inter_chunk_p95_ms={}"
-    ).format(
-        baseline_decode_value,
-        baseline_ttft,
-        "{:.3f}".format(baseline_inter_chunk_p50) if baseline_inter_chunk_p50 is not None else "na",
-        "{:.3f}".format(baseline_inter_chunk_p95) if baseline_inter_chunk_p95 is not None else "na",
-    )
-    if baseline_status == "comparable":
-        decode_delta = 100.0 * (median_decode - baseline_decode_value) / baseline_decode_value
-        ttft_delta = 100.0 * (median_ttft - baseline_ttft) / baseline_ttft
-        inter_chunk_p95_delta = (
-            100.0 * (median_inter_chunk_p95 - baseline_inter_chunk_p95) / baseline_inter_chunk_p95
-            if baseline_inter_chunk_p95 is not None
-            else None
-        )
-        prefix += (
-            " decode_delta_pct={:+.2f} ttft_delta_pct={:+.2f} "
-            "inter_chunk_p95_delta_pct={}"
-        ).format(
-            decode_delta,
-            ttft_delta,
-            "{:+.2f}".format(inter_chunk_p95_delta) if inter_chunk_p95_delta is not None else "na",
-        )
-prefix += " baseline_status={}".format(baseline_status)
-if baseline_mismatch:
-    prefix += " baseline_mismatch={}".format(baseline_mismatch)
 print(
     "{} min_decode_tok_s={:.3f} max_decode_tok_s={:.3f} runs={} input_tokens={} samples={} chunks={} proposed_spec={} verified_spec={}".format(
         prefix,
@@ -1121,12 +1095,33 @@ print(
     )
 )
 PY
+        done
     done
 
     cleanup_active_server
 }
 
-run_spec_case_sequence() {
+run_mtp_case() {
+    local model_label="$1"
+    local num_spec_tokens="$2"
+    local token_list="$3"
+    local server_binary="$4"
+    local model_dir="$5"
+    local mtp_model_dir="$6"
+    local tokenizer="${TOKENIZER:-$model_dir}"
+    local label="${model_label}_mtp${num_spec_tokens}"
+    run_server_case "$label" "$token_list" "$tokenizer" "$server_binary" \
+        --grpc-listen-addr "127.0.0.1:${PORT}" \
+        --hf-model-dir "$model_dir" \
+        --hf-mtp-model-dir "$mtp_model_dir" \
+        --num-spec-tokens "$num_spec_tokens" \
+        --num-cache-pages "$NUM_CACHE_PAGES" \
+        --max-requests "$MAX_REQUESTS" \
+        --max-tokens "$MAX_TOKENS" \
+        --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
+}
+
+run_block_spec_case() {
     local model_label="$1"
     local spec_mode="$2"
     local token_list="$3"
@@ -1137,30 +1132,23 @@ run_spec_case_sequence() {
     local spec_model_option
 
     case "$spec_mode" in
-    mtp) spec_model_option="--hf-mtp-model-dir" ;;
     dspark) spec_model_option="--hf-dspark-model-dir" ;;
+    dflash2) spec_model_option="--hf-dflash2-model-dir" ;;
     *)
-        echo "unsupported speculative mode: $spec_mode" >&2
+        echo "unsupported block speculative mode: $spec_mode" >&2
         exit 2
         ;;
     esac
 
-    for num_spec_tokens in 1 2; do
-        local label="${model_label}_${spec_mode}${num_spec_tokens}"
-        if ((num_spec_tokens > 1 && CASE_COOLDOWN_SECS > 0)); then
-            echo "COOLDOWN before=$label seconds=$CASE_COOLDOWN_SECS"
-            sleep "$CASE_COOLDOWN_SECS"
-        fi
-        run_server_case "$label" "$token_list" "$tokenizer" "$server_binary" \
-            --grpc-listen-addr "127.0.0.1:${PORT}" \
-            --hf-model-dir "$model_dir" \
-            "$spec_model_option" "$spec_model_dir" \
-            --num-spec-tokens "$num_spec_tokens" \
-            --num-cache-pages "$NUM_CACHE_PAGES" \
-            --max-requests "$MAX_REQUESTS" \
-            --max-tokens "$MAX_TOKENS" \
-            --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
-    done
+    local label="${model_label}_${spec_mode}"
+    run_server_case "$label" "$token_list" "$tokenizer" "$server_binary" \
+        --grpc-listen-addr "127.0.0.1:${PORT}" \
+        --hf-model-dir "$model_dir" \
+        "$spec_model_option" "$spec_model_dir" \
+        --num-cache-pages "$NUM_CACHE_PAGES" \
+        --max-requests "$MAX_REQUESTS" \
+        --max-tokens "$MAX_TOKENS" \
+        --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
 }
 
 run_named_case() {
@@ -1174,11 +1162,14 @@ run_named_case() {
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
-    27b_mtp)
-        run_spec_case_sequence 27b mtp "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$MTP_27B"
+    27b_mtp1 | 27b_mtp2)
+        run_mtp_case 27b "${1#27b_mtp}" "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$MTP_27B"
         ;;
     27b_dspark)
-        run_spec_case_sequence 27b dspark "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$DSPARK_27B"
+        run_block_spec_case 27b dspark "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$DSPARK_27B"
+        ;;
+    27b_dflash2)
+        run_block_spec_case 27b dflash2 "256 384" target/release/qwen3_5_dense "$MODEL_27B" "$DFLASH2_27B"
         ;;
     35b_off)
         run_server_case 35b_off "256 1024" "${TOKENIZER:-$MODEL_35B}" target/release/qwen3_5_sparse \
@@ -1189,11 +1180,14 @@ run_named_case() {
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
-    35b_mtp)
-        run_spec_case_sequence 35b mtp "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$MTP_35B"
+    35b_mtp1 | 35b_mtp2)
+        run_mtp_case 35b "${1#35b_mtp}" "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$MTP_35B"
         ;;
     35b_dspark)
-        run_spec_case_sequence 35b dspark "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$DSPARK_35B"
+        run_block_spec_case 35b dspark "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$DSPARK_35B"
+        ;;
+    35b_dflash2)
+        run_block_spec_case 35b dflash2 "256 1024" target/release/qwen3_5_sparse "$MODEL_35B" "$DFLASH2_35B"
         ;;
     *)
         echo "unknown case: $1" >&2
@@ -1214,8 +1208,9 @@ fi
 OS_VERSION="$(sw_vers -productVersion 2>/dev/null || uname -s)"
 ARCH="$(uname -m)"
 MACHINE="$(current_machine_id)"
-BASELINE_CONFIG_MISMATCHES="$(baseline_config_mismatches "$MACHINE" "$OS_VERSION" "$ARCH")"
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH baseline_machine=$BASELINE_MACHINE baseline_date=$BASELINE_DATE baseline_commit=$BASELINE_COMMIT baseline_os=$BASELINE_OS_VERSION baseline_arch=$BASELINE_ARCH baseline_num_cache_pages=$BASELINE_NUM_CACHE_PAGES baseline_cache_block_tokens=$BASELINE_CACHE_BLOCK_TOKENS baseline_max_requests=$BASELINE_MAX_REQUESTS baseline_max_tokens=$BASELINE_MAX_TOKENS baseline_max_tokens_per_request=$BASELINE_MAX_TOKENS_PER_REQUEST baseline_case_cooldown_secs=$BASELINE_CASE_COOLDOWN_SECS baseline_logging=$BASELINE_LOGGING baseline_seed=$BASELINE_SEED baseline_min_runs=$BASELINE_MIN_RUNS baseline_config_mismatches=${BASELINE_CONFIG_MISMATCHES:-none} num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST num_spec_tokens=1,2 cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_chars=${#PROMPT} tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B"
+PROMPT_SET_SHA256="$(prompt_set_sha256)"
+PROMPT_IDS_CSV="$(prompt_ids_csv)"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_geometry=checkpoint cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B"
 for case_index in "${!selected_cases[@]}"; do
     case_name="${selected_cases[$case_index]}"
     if [[ "$case_index" -gt 0 && "$CASE_COOLDOWN_SECS" -gt 0 ]]; then

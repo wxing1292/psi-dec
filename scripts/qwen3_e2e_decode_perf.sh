@@ -52,7 +52,7 @@ Runs Qwen3-14B with DSpark disabled/enabled, one server at a time.
 
 Cases:
   14b_off              Qwen3-14B Main only
-  14b_dspark           Qwen3-14B + affine DSpark with 1 and 2 speculative tokens
+  14b_dspark           Qwen3-14B + affine DSpark with checkpoint-defined block geometry
                        A missing DSpark checkpoint without a repo is warned and skipped.
 
 Model options:
@@ -448,10 +448,8 @@ if not isinstance(quantization, dict):
     )
 
 block_size = config.get("block_size")
-if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 2:
-    raise SystemExit(
-        f"{path} must have block_size >= 2 for the DSpark 1/2 benchmark matrix"
-    )
+if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size < 1:
+    raise SystemExit(f"{path} must have a positive DSpark block_size")
 PY
 }
 
@@ -794,25 +792,17 @@ run_server_case() {
     cleanup_server
 }
 
-run_dspark_case_sequence() {
-    for num_spec_tokens in 1 2; do
-        local label="14b_dspark${num_spec_tokens}"
-        if ((num_spec_tokens > 1 && CASE_COOLDOWN_SECS > 0)); then
-            echo "COOLDOWN before=$label seconds=$CASE_COOLDOWN_SECS"
-            sleep "$CASE_COOLDOWN_SECS"
-        fi
-        run_server_case "$label" \
-            target/release/qwen3 \
-            --grpc-listen-addr "127.0.0.1:${GRPC_PORT}" \
-            --http-listen-addr "127.0.0.1:${HTTP_PORT}" \
-            --hf-model-dir "$MODEL_DIR" \
-            --hf-dspark-model-dir "$DSPARK_DIR" \
-            --num-spec-tokens "$num_spec_tokens" \
-            --num-cache-pages "$NUM_CACHE_PAGES" \
-            --max-requests "$MAX_REQUESTS" \
-            --max-tokens "$MAX_TOKENS" \
-            --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
-    done
+run_dspark_case() {
+    run_server_case 14b_dspark \
+        target/release/qwen3 \
+        --grpc-listen-addr "127.0.0.1:${GRPC_PORT}" \
+        --http-listen-addr "127.0.0.1:${HTTP_PORT}" \
+        --hf-model-dir "$MODEL_DIR" \
+        --hf-dspark-model-dir "$DSPARK_DIR" \
+        --num-cache-pages "$NUM_CACHE_PAGES" \
+        --max-requests "$MAX_REQUESTS" \
+        --max-tokens "$MAX_TOKENS" \
+        --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
 }
 
 run_case() {
@@ -828,7 +818,7 @@ run_case() {
             --max-tokens "$MAX_TOKENS" \
             --max-tokens-per-request "$MAX_TOKENS_PER_REQUEST"
         ;;
-    14b_dspark) run_dspark_case_sequence ;;
+    14b_dspark) run_dspark_case ;;
     esac
 }
 
@@ -842,7 +832,7 @@ ARCH="$(uname -m)"
 MACHINE="$(machine_id)"
 PROMPT_SHA256="$(printf '%s' "$PROMPT" | shasum -a 256 | awk '{print $1}')"
 
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH model=$MODEL_DIR dspark=$DSPARK_DIR tokenizer=$TOKENIZER_DIR cases=$CASES max_new=$TOKENS runs=$RUNS build=$BUILD grpc_port=$GRPC_PORT http_port=$HTTP_PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST num_spec_tokens=1,2 case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_sha256=$PROMPT_SHA256 prompt_chars=${#PROMPT}"
+echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH model=$MODEL_DIR dspark=$DSPARK_DIR tokenizer=$TOKENIZER_DIR cases=$CASES max_new=$TOKENS runs=$RUNS build=$BUILD grpc_port=$GRPC_PORT http_port=$HTTP_PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST dspark_geometry=checkpoint case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_sha256=$PROMPT_SHA256 prompt_chars=${#PROMPT}"
 
 for index in "${!SELECTED_CASES[@]}"; do
     case_name="${SELECTED_CASES[$index]}"

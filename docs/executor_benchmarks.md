@@ -116,8 +116,7 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   The backend owns its one-SIMDgroup threadblock geometry.
 - `qwen3_dspark` loads real Main and DSpark checkpoints.
   It runs the public executor lifecycle for `main` or `dspark`.
-  Use `--num-spec-tokens N` to select the DSpark proposal length.
-  Omit the option to use the checkpoint `block_size`.
+  It uses the checkpoint `block_size` as the DSpark proposal length.
   It reports each record, submit/wait, read, and commit boundary.
   It reports `num_spec_tokens`, proposed tokens, accepted tokens, generated proposals, and acceptance.
 - `qwen3_dspark_forward` loads real Main and DSpark weights.
@@ -190,7 +189,7 @@ cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
 
 cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
   --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
-  --cases dspark --num-requests 1 --num-spec-tokens 2 \
+  --cases dspark --num-requests 1 \
   --iters 1 --warmup-iters 0 --runs 1
 
 cargo bench -p inference-executor-metal --bench qwen3_dspark_forward -- \
