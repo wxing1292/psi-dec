@@ -175,6 +175,39 @@ pub fn gdn_recurrent_reference(core: &GDNCore, input: GDNRecurrentReferenceInput
     }
 }
 
+pub fn gdn_output_norm_gate_reference(
+    core: &GDNCore,
+    recurrent_output: &[f32],
+    z: &[f32],
+    norm_weight: &[f32],
+    norm_eps: f32,
+) -> Vec<f32> {
+    core.validate();
+    assert!(norm_eps.is_finite() && norm_eps > 0.0);
+    assert_eq!(recurrent_output.len(), z.len());
+    assert_eq!(recurrent_output.len() % core.v_head_dim, 0);
+    assert_eq!(norm_weight.len(), core.v_head_dim);
+
+    let mut output = Vec::with_capacity(recurrent_output.len());
+    for (recurrent_row, z_row) in recurrent_output
+        .chunks_exact(core.v_head_dim)
+        .zip(z.chunks_exact(core.v_head_dim))
+    {
+        let inv_rms = (recurrent_row.iter().map(|value| value * value).sum::<f32>() / core.v_head_dim as f32
+            + norm_eps)
+            .sqrt()
+            .recip();
+        output.extend(
+            recurrent_row
+                .iter()
+                .zip(z_row)
+                .zip(norm_weight)
+                .map(|((&value, &gate), &weight)| value * inv_rms * weight * silu_reference(gate)),
+        );
+    }
+    output
+}
+
 fn inverse_l2_norm(
     conv_qkv: &[f32],
     token_index: usize,

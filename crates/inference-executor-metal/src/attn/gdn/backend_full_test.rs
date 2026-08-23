@@ -1,0 +1,446 @@
+use std::collections::HashSet;
+
+use half::bf16;
+use inference_backend_metal::metal::Buffer;
+use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayArguments;
+use inference_backend_metal::metal::ReplayU32;
+use inference_backend_metal::metal::Stream;
+use inference_executor_core::attn::GDNCore;
+use inference_executor_core::attn::gdn::reference::GDNRecurrentReferenceInput;
+use inference_executor_core::attn::gdn::reference::gdn_output_norm_gate_reference;
+use inference_executor_core::attn::gdn::reference::gdn_recurrent_reference;
+use inference_executor_core::attn::gdn::reference::gdn_short_conv_reference;
+use inference_executor_core::mlp::dense::reference::QuantizedAffineReferenceShape;
+use inference_executor_core::mlp::dense::reference::quantized_affine_reference;
+
+use super::GDN;
+use super::GDN_NUM_ACTIVE_TOKENS;
+use super::GDNInput;
+use super::GDNLayerStateBindings;
+use super::GDNMetalConfig;
+use super::GDNReplayTopology;
+use super::GDNWeights;
+use super::add_gdn_replay_arguments;
+use crate::attn::gdn::batch_metadata::GDNMetadataBuffers;
+use crate::attn::gdn::state_table::GDNPreparedRequestState;
+use crate::def::layer::ReplayLayer;
+use crate::def::replay_op::MetalReplayRuntime;
+use crate::def::replay_op::ReplayRecorder;
+use crate::replay::Replay;
+use crate::replay::ReplayComponent;
+
+const NUM_TOTAL_REQUESTS: u32 = 8;
+const NUM_TOTAL_TOKENS: u32 = 8;
+const NUM_SOURCE_STATE_SLOTS: usize = 8;
+const NUM_STATE_SLOTS: usize = 16;
+const HIDDEN_DIM: usize = 32;
+const QK_HEAD_DIM: usize = 32;
+const V_HEAD_DIM: usize = 32;
+const CONV_KERNEL_SIZE: usize = 3;
+const GROUP_SIZE: usize = 32;
+const BITS: usize = 8;
+const NORM_EPS: f32 = 1.0e-6;
+const STATE_CANARY: f32 = -0.75;
+
+#[test]
+fn test_replay_matches_cpu_reference_across_independent_active_domains() {
+    let device = Device::system_default();
+    let stream = Stream::new(&device);
+    let runtime = MetalReplayRuntime::new(&stream);
+    let core = fixture_core();
+    let config = fixture_config();
+    let component = GDN::new(&device, core.clone(), config);
+    let scratch = component.new_scratch(NUM_TOTAL_TOKENS as usize);
+    let metadata = GDNMetadataBuffers::new(&device, NUM_TOTAL_REQUESTS as usize, NUM_TOTAL_TOKENS as usize);
+    let policy = component.replay_bucket_policy(NUM_TOTAL_REQUESTS, NUM_TOTAL_TOKENS);
+    let hidden_values = generated_bf16_values(NUM_TOTAL_TOKENS as usize * HIDDEN_DIM, 0x792A_5F13, 0.5);
+    let hidden = bf16_buffer(&device, &hidden_values);
+    let next_hidden = Buffer::new_zeroed_elements(&device, NUM_TOTAL_TOKENS as usize * HIDDEN_DIM, Dtype::Bfloat16);
+    let weights = FixtureWeights::new(&device, &core);
+    let conv_stride = core.qkv_dim() * core.conv_state_len();
+    let recurrent_stride = core.num_v_heads * core.v_head_dim * core.qk_head_dim;
+    let source_conv = generated_values(NUM_SOURCE_STATE_SLOTS * conv_stride, 0x792A_5F14, 0.03125);
+    let source_recurrent = generated_values(NUM_SOURCE_STATE_SLOTS * recurrent_stride, 0x792A_5F15, 0.0078125);
+    let initial_conv_arena = state_arena(&source_conv, conv_stride);
+    let initial_recurrent_arena = state_arena(&source_recurrent, recurrent_stride);
+    let conv_state_arena = Buffer::from_slice(&device, &initial_conv_arena);
+    let recurrent_state_arena = Buffer::from_slice(&device, &initial_recurrent_arena);
+    let mut replay = Replay::new("test GDN", TestGDN(component));
+    let mut recorded_keys = HashSet::new();
+    let cases = [(1_u32, 1_u32), (8, 4), (3, 2), (7, 3), (2, 1), (6, 4), (4, 3), (5, 2)];
+
+    for (num_active_tokens, num_active_requests) in cases {
+        let cu_tokens = cumulative_tokens(num_active_tokens, num_active_requests);
+        let source_slots = (0..num_active_requests).collect::<Vec<_>>();
+        let mut candidate_slots = vec![u32::MAX; num_active_tokens as usize];
+        for (request_index, &request_end) in cu_tokens.iter().skip(1).enumerate() {
+            candidate_slots[request_end as usize - 1] = NUM_SOURCE_STATE_SLOTS as u32 + request_index as u32;
+        }
+        let prepared = GDNPreparedRequestState {
+            src_recurrent_state_slots: source_slots.clone(),
+            src_conv_state_slots: source_slots,
+            flat_materialized_recurrent_state_slots: candidate_slots.clone(),
+            flat_materialized_conv_state_slots: candidate_slots,
+        };
+        let shape = replay
+            .component()
+            .0
+            .prepare(&metadata, &cu_tokens, &prepared, &policy, NUM_TOTAL_TOKENS);
+        let topology = replay.component().0.replay_topology(&metadata, true);
+        let input = GDNInput {
+            hidden_state: &hidden,
+            next_hidden_state: &next_hidden,
+            scratch: scratch.bindings(),
+            batch_metadata: &metadata,
+            state: GDNLayerStateBindings {
+                conv_state: &conv_state_arena,
+                conv_state_offset_bytes: 0,
+                next_conv_state: &conv_state_arena,
+                next_conv_state_offset_bytes: 0,
+                recurrent_state_arena: &recurrent_state_arena,
+                recurrent_state_arena_offset_bytes: 0,
+            },
+            materialize_candidate_states: true,
+            weights: weights.bindings(),
+            num_active_tokens: ReplayU32::Parameter(GDN_NUM_ACTIVE_TOKENS),
+        };
+        let (key, cache_hit) = replay.record(&runtime, &input);
+        let seen = !recorded_keys.insert(key);
+        assert_eq!(cache_hit, seen);
+
+        conv_state_arena.write_typed(0, &initial_conv_arena);
+        recurrent_state_arena.write_typed(0, &initial_recurrent_arena);
+        next_hidden.zero_bytes(0, next_hidden.len_bytes());
+        let mut arguments = ReplayArguments::new();
+        add_gdn_replay_arguments(shape, &mut arguments);
+        runtime
+            .submit_replay_with_arguments(replay.replay(&key), &arguments)
+            .wait();
+
+        let reference = gdn_reference(
+            &core,
+            config,
+            &cu_tokens,
+            &hidden_values,
+            &source_conv,
+            &source_recurrent,
+            &initial_conv_arena,
+            &initial_recurrent_arena,
+            &weights,
+        );
+        let actual_output = read_bf16_values(&next_hidden, reference.output.len());
+        assert_close(&actual_output, &reference.output, 0.0625);
+        let actual_conv = conv_state_arena.read_typed::<f32>(0, initial_conv_arena.len());
+        let actual_recurrent = recurrent_state_arena.read_typed::<f32>(0, initial_recurrent_arena.len());
+        assert_close(&actual_conv, &reference.conv_state_arena, 0.0025);
+        assert_close(&actual_recurrent, &reference.recurrent_state_arena, 0.0025);
+    }
+}
+
+struct TestGDN(GDN);
+
+impl ReplayComponent for TestGDN {
+    type Key = (u32, u32, GDNReplayTopology);
+    type Input<'a> = GDNInput<'a>;
+
+    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
+        let shape = input.batch_metadata.replay_shape();
+        (
+            shape.num_total_reqs,
+            shape.num_total_tokens,
+            self.0
+                .replay_topology(input.batch_metadata, input.materialize_candidate_states),
+        )
+    }
+
+    fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
+        <GDN as ReplayLayer>::record(&self.0, recorder, *input);
+    }
+}
+
+struct FixtureWeights {
+    qkvabz_weight: Buffer,
+    qkvabz_scales: Buffer,
+    qkvabz_biases: Buffer,
+    conv_weight: Buffer,
+    norm_weight: Buffer,
+    a_log: Buffer,
+    dt_bias: Buffer,
+    output_weight: Buffer,
+    output_scales: Buffer,
+    output_biases: Buffer,
+    qkvabz_weight_values: Vec<u8>,
+    qkvabz_scale_values: Vec<f32>,
+    qkvabz_bias_values: Vec<f32>,
+    conv_weight_values: Vec<f32>,
+    norm_weight_values: Vec<f32>,
+    a_log_values: Vec<f32>,
+    dt_bias_values: Vec<f32>,
+    output_weight_values: Vec<u8>,
+    output_scale_values: Vec<f32>,
+    output_bias_values: Vec<f32>,
+}
+
+impl FixtureWeights {
+    fn new(device: &Device, core: &GDNCore) -> Self {
+        let qkvabz_shape = affine_reference_shape(1, core.qkvabz_dim(), core.hidden_dim);
+        let output_shape = affine_reference_shape(1, core.hidden_dim, core.v_dim());
+        let (qkvabz_weight_values, qkvabz_scale_values, qkvabz_bias_values) = affine_values(qkvabz_shape, 0xA812_40B1);
+        let (output_weight_values, output_scale_values, output_bias_values) = affine_values(output_shape, 0xA812_40B2);
+        let conv_weight_values = generated_bf16_values(core.qkv_dim() * core.conv_kernel_size, 0xA812_40B3, 0.0625);
+        let norm_weight_values = (0..core.v_head_dim)
+            .map(|index| bf16::from_f32(0.75 + (index % 7) as f32 * 0.03125).to_f32())
+            .collect::<Vec<_>>();
+        let a_log_values = vec![bf16::from_f32(-0.5).to_f32(); core.num_v_heads];
+        let dt_bias_values = vec![bf16::from_f32(0.125).to_f32(); core.num_v_heads];
+        Self {
+            qkvabz_weight: Buffer::from_slice(device, &qkvabz_weight_values),
+            qkvabz_scales: Buffer::from_slice(device, &qkvabz_scale_values),
+            qkvabz_biases: Buffer::from_slice(device, &qkvabz_bias_values),
+            conv_weight: bf16_buffer(device, &conv_weight_values),
+            norm_weight: bf16_buffer(device, &norm_weight_values),
+            a_log: bf16_buffer(device, &a_log_values),
+            dt_bias: bf16_buffer(device, &dt_bias_values),
+            output_weight: Buffer::from_slice(device, &output_weight_values),
+            output_scales: Buffer::from_slice(device, &output_scale_values),
+            output_biases: Buffer::from_slice(device, &output_bias_values),
+            qkvabz_weight_values,
+            qkvabz_scale_values,
+            qkvabz_bias_values,
+            conv_weight_values,
+            norm_weight_values,
+            a_log_values,
+            dt_bias_values,
+            output_weight_values,
+            output_scale_values,
+            output_bias_values,
+        }
+    }
+
+    fn bindings(&self) -> GDNWeights<'_> {
+        GDNWeights {
+            qkvabz_weight: &self.qkvabz_weight,
+            qkvabz_scales: &self.qkvabz_scales,
+            qkvabz_biases: &self.qkvabz_biases,
+            conv_weight: &self.conv_weight,
+            norm_weight: &self.norm_weight,
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            output_weight: &self.output_weight,
+            output_scales: &self.output_scales,
+            output_biases: &self.output_biases,
+        }
+    }
+}
+
+struct GDNReference {
+    output: Vec<f32>,
+    conv_state_arena: Vec<f32>,
+    recurrent_state_arena: Vec<f32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_reference(
+    core: &GDNCore,
+    config: GDNMetalConfig,
+    cu_tokens: &[u32],
+    hidden: &[f32],
+    source_conv: &[f32],
+    source_recurrent: &[f32],
+    initial_conv_arena: &[f32],
+    initial_recurrent_arena: &[f32],
+    weights: &FixtureWeights,
+) -> GDNReference {
+    let num_requests = cu_tokens.len() - 1;
+    let num_tokens = *cu_tokens.last().unwrap() as usize;
+    let qkvabz = quantized_affine_reference(
+        affine_reference_shape(num_tokens, core.qkvabz_dim(), core.hidden_dim),
+        &hidden[..num_tokens * core.hidden_dim],
+        &weights.qkvabz_weight_values,
+        &weights.qkvabz_scale_values,
+        &weights.qkvabz_bias_values,
+    );
+    let mut qkv = Vec::with_capacity(num_tokens * core.qkv_dim());
+    let mut a = Vec::with_capacity(num_tokens * core.num_v_heads);
+    let mut b = Vec::with_capacity(num_tokens * core.num_v_heads);
+    let mut z = Vec::with_capacity(num_tokens * core.v_dim());
+    for row in qkvabz.chunks_exact(core.qkvabz_dim()) {
+        let qkv_end = core.qkv_dim();
+        let a_end = qkv_end + core.num_v_heads;
+        let b_end = a_end + core.num_v_heads;
+        qkv.extend_from_slice(&row[..qkv_end]);
+        a.extend_from_slice(&row[qkv_end..a_end]);
+        b.extend_from_slice(&row[a_end..b_end]);
+        z.extend_from_slice(&row[b_end..]);
+    }
+    let conv_stride = core.qkv_dim() * core.conv_state_len();
+    let recurrent_stride = core.num_v_heads * core.v_head_dim * core.qk_head_dim;
+    let conv = gdn_short_conv_reference(
+        core,
+        cu_tokens,
+        &source_conv[..num_requests * conv_stride],
+        &qkv,
+        &weights.conv_weight_values,
+    );
+    let recurrent = gdn_recurrent_reference(
+        core,
+        GDNRecurrentReferenceInput {
+            cu_tokens,
+            source_recurrent_state: &source_recurrent[..num_requests * recurrent_stride],
+            conv_qkv: &conv.conv_qkv,
+            a: &a,
+            b: &b,
+            a_log: &weights.a_log_values,
+            dt_bias: &weights.dt_bias_values,
+        },
+    );
+    let norm_gated = gdn_output_norm_gate_reference(
+        core,
+        &recurrent.recurrent_output,
+        &z,
+        &weights.norm_weight_values,
+        config.norm_eps,
+    );
+    let output = quantize_bf16(&quantized_affine_reference(
+        affine_reference_shape(num_tokens, core.hidden_dim, core.v_dim()),
+        &norm_gated,
+        &weights.output_weight_values,
+        &weights.output_scale_values,
+        &weights.output_bias_values,
+    ));
+    let mut conv_state_arena = initial_conv_arena.to_vec();
+    let mut recurrent_state_arena = initial_recurrent_arena.to_vec();
+    for request_index in 0..num_requests {
+        let candidate_slot = NUM_SOURCE_STATE_SLOTS + request_index;
+        conv_state_arena[candidate_slot * conv_stride..(candidate_slot + 1) * conv_stride]
+            .copy_from_slice(&conv.next_conv_state[request_index * conv_stride..(request_index + 1) * conv_stride]);
+        recurrent_state_arena[candidate_slot * recurrent_stride..(candidate_slot + 1) * recurrent_stride]
+            .copy_from_slice(
+                &recurrent.next_recurrent_state
+                    [request_index * recurrent_stride..(request_index + 1) * recurrent_stride],
+            );
+    }
+    GDNReference {
+        output,
+        conv_state_arena,
+        recurrent_state_arena,
+    }
+}
+
+fn fixture_core() -> GDNCore {
+    GDNCore {
+        model_layer_index: 0,
+        hidden_dim: HIDDEN_DIM,
+        num_qk_heads: 1,
+        qk_head_dim: QK_HEAD_DIM,
+        num_v_heads: 1,
+        v_head_dim: V_HEAD_DIM,
+        conv_kernel_size: CONV_KERNEL_SIZE,
+        q_scale: (QK_HEAD_DIM as f32).sqrt().recip(),
+    }
+}
+
+fn fixture_config() -> GDNMetalConfig {
+    GDNMetalConfig {
+        group_size: GROUP_SIZE as u32,
+        bits: BITS as u32,
+        norm_eps: NORM_EPS,
+        input_dtype: Dtype::Bfloat16,
+        output_dtype: Dtype::Bfloat16,
+        qkvabz_scale_bias_dtype: Dtype::Float32,
+        output_scale_bias_dtype: Dtype::Float32,
+    }
+}
+
+fn cumulative_tokens(num_tokens: u32, num_requests: u32) -> Vec<u32> {
+    let base = num_tokens / num_requests;
+    let remainder = num_tokens % num_requests;
+    let mut cumulative = Vec::with_capacity(num_requests as usize + 1);
+    cumulative.push(0);
+    for request_index in 0..num_requests {
+        let count = base + u32::from(request_index < remainder);
+        cumulative.push(cumulative.last().copied().unwrap() + count);
+    }
+    cumulative
+}
+
+fn state_arena(source: &[f32], stride: usize) -> Vec<f32> {
+    let mut arena = vec![STATE_CANARY; NUM_STATE_SLOTS * stride];
+    arena[..source.len()].copy_from_slice(source);
+    arena
+}
+
+fn affine_reference_shape(num_rows: usize, output_dim: usize, input_dim: usize) -> QuantizedAffineReferenceShape {
+    QuantizedAffineReferenceShape {
+        num_rows,
+        output_dim,
+        input_dim,
+        group_size: GROUP_SIZE,
+        bits: BITS,
+    }
+}
+
+fn affine_values(shape: QuantizedAffineReferenceShape, seed: u32) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    let weight = (0..shape.weight_bytes())
+        .map(|index| ((index * 31 + seed as usize) % 251) as u8)
+        .collect::<Vec<_>>();
+    let scales = (0..shape.affine_param_len())
+        .map(|index| 0.000_75 + (index % 5) as f32 * 0.000_05)
+        .collect::<Vec<_>>();
+    let biases = (0..shape.affine_param_len())
+        .map(|index| -0.105 + (index % 7) as f32 * 0.001)
+        .collect::<Vec<_>>();
+    (weight, scales, biases)
+}
+
+fn generated_values(count: usize, mut state: u32, scale: f32) -> Vec<f32> {
+    (0..count)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((state >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0) * scale
+        })
+        .collect()
+}
+
+fn generated_bf16_values(count: usize, state: u32, scale: f32) -> Vec<f32> {
+    generated_values(count, state, scale)
+        .into_iter()
+        .map(|value| bf16::from_f32(value).to_f32())
+        .collect()
+}
+
+fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
+    Buffer::from_slice(
+        device,
+        &values
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {
+    buffer
+        .read_typed::<u16>(0, len)
+        .into_iter()
+        .map(|bits| bf16::from_bits(bits).to_f32())
+        .collect()
+}
+
+fn quantize_bf16(values: &[f32]) -> Vec<f32> {
+    values.iter().map(|&value| bf16::from_f32(value).to_f32()).collect()
+}
+
+fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        let difference = (actual - expected).abs();
+        assert!(
+            difference <= tolerance,
+            "GDN mismatch at {index}: actual={actual} expected={expected} difference={difference} \
+             tolerance={tolerance}"
+        );
+    }
+}

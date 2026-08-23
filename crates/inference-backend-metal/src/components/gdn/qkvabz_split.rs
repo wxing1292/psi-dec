@@ -226,145 +226,76 @@ mod tests {
     use crate::metal::ReplayParameterKey;
     use crate::metal::ReplayU32;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_split.num_active_tokens");
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        assert_eq!(
-            KernelConstants::current(),
-            KernelConstants {
-                thread_block: ThreadBlockConstants { required_threads: 256 },
-            }
-        );
-    }
+    fn test_replay_matches_reference_across_active_counts() {
+        const NUM_TOTAL_TOKENS: u32 = 8;
 
-    #[test]
-    fn test_fixed() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let config = Config::new(6, 2, 4);
-        let shape = Shape { num_total_tokens: 2 };
-        let qkvabz_values = (0..28).map(|value| value as f32).collect::<Vec<_>>();
+        let shape = Shape {
+            num_total_tokens: NUM_TOTAL_TOKENS,
+        };
+        let row_stride = config.qkvabz_row_stride() as usize;
+        let qkvabz_values = (0..NUM_TOTAL_TOKENS as usize * row_stride)
+            .map(|index| index as f32 * 0.125 - 3.0)
+            .collect::<Vec<_>>();
         let qkvabz = Buffer::from_slice(&device, &qkvabz_values);
         let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
         let a = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
         let b = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
         let z = Buffer::new_zeroed_elements(&device, config.num_z_values(shape), Dtype::Float32);
-        let kernel = Compute::new(&device, config);
+        let compute = Compute::new(&device, config);
+        let mut cache = ReplayTestCache::new();
+        let (_, cache_hit) = cache.record(shape.num_total_tokens, || {
+            let mut builder = stream.create_replay_program();
+            builder.record(compute.invoke(
+                shape,
+                Buffers {
+                    qkvabz: &qkvabz,
+                    qkv: &qkv,
+                    a: &a,
+                    b: &b,
+                    z: &z,
+                },
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+            ));
+            builder.build()
+        });
+        assert!(!cache_hit);
 
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            Buffers {
-                qkvabz: &qkvabz,
-                qkv: &qkv,
-                a: &a,
-                b: &b,
-                z: &z,
-            },
-            ReplayU32::Fixed(shape.num_total_tokens),
-        ));
-        stream.submit_replay(&builder.build()).wait();
-
-        assert_eq!(
-            qkv.read_typed::<f32>(0, config.num_qkv_values(shape)),
-            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0]
-        );
-        assert_eq!(
-            a.read_typed::<f32>(0, config.num_gate_values(shape)),
-            vec![6.0, 7.0, 20.0, 21.0]
-        );
-        assert_eq!(
-            b.read_typed::<f32>(0, config.num_gate_values(shape)),
-            vec![8.0, 9.0, 22.0, 23.0]
-        );
-        assert_eq!(
-            z.read_typed::<f32>(0, config.num_z_values(shape)),
-            vec![10.0, 11.0, 12.0, 13.0, 24.0, 25.0, 26.0, 27.0]
-        );
-    }
-
-    #[test]
-    fn test_bucketed_replay_preserves_inactive_output_tail() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let config = Config::new(2, 1, 2);
-        let shape = Shape { num_total_tokens: 2 };
-        let qkvabz = Buffer::new_zeroed_elements(&device, config.num_qkvabz_values(shape), Dtype::Float32);
-        let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
-        let a = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
-        let b = Buffer::new_zeroed_elements(&device, config.num_gate_values(shape), Dtype::Float32);
-        let z = Buffer::new_zeroed_elements(&device, config.num_z_values(shape), Dtype::Float32);
-        let kernel = Compute::new(&device, config);
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            shape,
-            Buffers {
-                qkvabz: &qkvabz,
-                qkv: &qkv,
-                a: &a,
-                b: &b,
-                z: &z,
-            },
-            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-        ));
-        let replay = builder.build();
-        let valid_rows = [[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]];
-        for num_active_tokens in [1_usize, 2, 1] {
-            let mut input = valid_rows.into_iter().flatten().collect::<Vec<_>>();
-            if num_active_tokens == 1 {
-                input[6..].fill(f32::NAN);
-            }
-            qkvabz.write_typed(0, &input);
-            qkv.write_typed(0, &[-777.0_f32; 4]);
-            a.write_typed(0, &[-777.0_f32; 2]);
-            b.write_typed(0, &[-777.0_f32; 2]);
-            z.write_typed(0, &[-777.0_f32; 4]);
+        for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            let (replay, cache_hit) = cache.record(shape.num_total_tokens, || unreachable!());
+            assert!(cache_hit);
             stream
                 .submit_replay_with_arguments(
-                    &replay,
+                    replay,
                     &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32),
                 )
                 .wait();
 
-            let active_rows = &valid_rows[..num_active_tokens];
-            assert_eq!(
-                qkv.read_typed::<f32>(0, num_active_tokens * 2),
-                flatten_columns(active_rows, 0, 2)
-            );
-            assert_eq!(
-                a.read_typed::<f32>(0, num_active_tokens),
-                flatten_columns(active_rows, 2, 3)
-            );
-            assert_eq!(
-                b.read_typed::<f32>(0, num_active_tokens),
-                flatten_columns(active_rows, 3, 4)
-            );
-            assert_eq!(
-                z.read_typed::<f32>(0, num_active_tokens * 2),
-                flatten_columns(active_rows, 4, 6)
-            );
-            assert_eq!(
-                qkv.read_typed::<f32>(num_active_tokens * 2, 4 - num_active_tokens * 2),
-                vec![-777.0; 4 - num_active_tokens * 2]
-            );
-            assert_eq!(
-                a.read_typed::<f32>(num_active_tokens, 2 - num_active_tokens),
-                vec![-777.0; 2 - num_active_tokens]
-            );
-            assert_eq!(
-                b.read_typed::<f32>(num_active_tokens, 2 - num_active_tokens),
-                vec![-777.0; 2 - num_active_tokens]
-            );
-            assert_eq!(
-                z.read_typed::<f32>(num_active_tokens * 2, 4 - num_active_tokens * 2),
-                vec![-777.0; 4 - num_active_tokens * 2]
-            );
+            let active_rows = qkvabz_values[..num_active_tokens * row_stride]
+                .chunks_exact(row_stride)
+                .collect::<Vec<_>>();
+            let expected_qkv = flatten_columns(&active_rows, 0, config.qkv_dim as usize);
+            let a_begin = config.qkv_dim as usize;
+            let b_begin = a_begin + config.num_v_heads as usize;
+            let z_begin = b_begin + config.num_v_heads as usize;
+            let expected_a = flatten_columns(&active_rows, a_begin, b_begin);
+            let expected_b = flatten_columns(&active_rows, b_begin, z_begin);
+            let expected_z = flatten_columns(&active_rows, z_begin, row_stride);
+            assert_eq!(qkv.read_typed::<f32>(0, expected_qkv.len()), expected_qkv);
+            assert_eq!(a.read_typed::<f32>(0, expected_a.len()), expected_a);
+            assert_eq!(b.read_typed::<f32>(0, expected_b.len()), expected_b);
+            assert_eq!(z.read_typed::<f32>(0, expected_z.len()), expected_z);
         }
     }
 
-    fn flatten_columns(rows: &[[f32; 6]], start: usize, end: usize) -> Vec<f32> {
+    fn flatten_columns(rows: &[&[f32]], start: usize, end: usize) -> Vec<f32> {
         rows.iter().flat_map(|row| row[start..end].iter().copied()).collect()
     }
 

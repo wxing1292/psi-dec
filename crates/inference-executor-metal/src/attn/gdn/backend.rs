@@ -438,3 +438,7 @@ fn affine_config(
         scale_bias_dtype,
     }
 }
+
+#[cfg(test)]
+#[path = "backend_full_test.rs"]
+mod full_tests;

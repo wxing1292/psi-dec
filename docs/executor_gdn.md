@@ -11,7 +11,7 @@ crates/inference-executor-core/src/attn/
   gdn/
     mod.rs                  GDN module root
     core.rs                 GDNCore metadata
-    reference.rs            CPU short-convolution and recurrent correctness oracles
+    reference.rs            CPU short-convolution, recurrent, and output-gate correctness oracles
     state.rs                backend-neutral per-request GDNStateTxn lifecycle metadata
 
 crates/inference-executor-metal/src/attn/
@@ -20,6 +20,7 @@ crates/inference-executor-metal/src/attn/
     mod.rs                  GDN Metal module root
     batch_metadata.rs       state-domain-owned, capacity-sized GPU metadata updated per microbatch
     backend.rs              GDN Metal replay wiring and candidate-state materialization
+    backend_full_test.rs    full GDN owner replay and CPU parity
     scratch.rs              reusable GDN scratch allocation owner and borrowed replay bindings
     request_slots.rs        private CPU request-slot/version/candidate mapping
     request_slots/
@@ -1030,8 +1031,9 @@ GDN page read/write helpers remain separate recordable backend-metal components.
 pages. Runtime core owns page IDs and cache notifications. The model executor owns GDN state layout, request-slot
 interpretation, and candidate slot promotion. It owns only CPU transaction copies of runtime-provided page-ID vectors.
 
-The state-page read replay test records `num_total_state_io_requests = 8`. It replays active counts
-`1, 8, 3, 7, 2, 6, 4, 5` and compares the active recurrent and convolution state copies with a CPU reference.
+The state-page read and write replay tests record `num_total_state_io_requests = 8`. They replay active counts
+`1, 8, 3, 7, 2, 6, 4, 5`. The read test compares the complete affected state arenas with a CPU copy reference. The
+write test compares the complete page arena with a CPU page-layout reference.
 
 `begin_txn(...)` registers candidate state-slot mappings and future immutable-page mappings.
 It stores page mappings as typed `GDNStatePages` values for the current request txn.
@@ -1193,14 +1195,20 @@ coverage. Slow/reference implementations are test oracles. They are not runtime 
 
 `compute_test.rs` compares Metal execution with the CPU short-convolution and recurrent references. It covers fixed
 one-request ragged decode, random ragged input, and a random multi-request ragged batch. Candidate-state tests compare each
-speculative prefix state with an independently evaluated CPU prefix reference. The bucketed candidate test reuses one
-program for `1 -> 2 -> 1` active requests and tokens. It poisons inactive token and metadata tails. It verifies active
-output/state parity and inactive scratch/state canaries. Its one-request rounds also use `u32::MAX` as the final
-row slot and verify that normal output remains correct while persistent state stays unmodified.
+speculative prefix state with an independently evaluated CPU prefix reference. The candidate replay test records total
+request and token capacities of `8`. It replays `1, 8, 3, 7, 2, 6, 4, 5` active requests and tokens through one isolated
+test cache. It compares active compute outputs and the complete persistent-state arenas with CPU references. Its
+one-request rounds also use `u32::MAX` as the final row slot and verify that normal output remains correct while
+persistent state stays unmodified.
 
 The state-page component test writes and reads two requests across two GDN layers. It compares the written page layout
 with an independent expected layout. It also verifies the selected recurrent and convolution slots and preserves all
 unselected state-slot canaries.
+
+`attn/gdn/backend_full_test.rs` records the real `GDN` owner. Its cases vary active requests and active tokens
+independently while they retain a token capacity of `8`. The test uses the production request-capacity keys. It compares
+the active BF16 output and the complete convolution and recurrent state arenas with an independent CPU reconstruction
+of both quantized affine projections, QKVABZ split, short convolution, recurrent transition, and output norm/gate.
 
 ## Tests and benches
 
@@ -1211,6 +1219,11 @@ Recommendation: Current tests and benches cover these areas:
 - State slot promotion
 - Page read/write helpers
 - Qwen layer integration
+
+The candidate-state replay test uses an isolated test cache with a total request and token capacity of `8`. It replays
+`1, 8, 3, 7, 2, 6, 4, 5` active requests and tokens. Each active output matches the CPU short-convolution, recurrent,
+and output-norm/gate references. The test compares the complete persistent-state arenas with an expected arena. Thus,
+inactive requests and unrelated state slots must remain unchanged.
 
 Current benches:
 

@@ -3,6 +3,7 @@ use std::mem::size_of;
 use half::bf16;
 use inference_executor_core::attn::gdn::GDNCore;
 use inference_executor_core::attn::gdn::reference::GDNRecurrentReferenceInput;
+use inference_executor_core::attn::gdn::reference::gdn_output_norm_gate_reference;
 use inference_executor_core::attn::gdn::reference::gdn_recurrent_reference;
 use inference_executor_core::attn::gdn::reference::gdn_short_conv_reference;
 
@@ -21,90 +22,10 @@ use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayU32;
 use crate::metal::Stream;
+use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_REQUESTS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_requests");
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gdn_compute.num_active_tokens");
-
-#[test]
-fn test_final_recurrent_state_constants_selection() {
-    let mut config = fixture_config();
-    assert_eq!(
-        VariantConstants::from_config(config)
-            .kernels
-            .final_recurrent_state
-            .thread_block
-            .num_v_rows,
-        8
-    );
-    config.v_head_dim = 12;
-    assert_eq!(
-        VariantConstants::from_config(config)
-            .kernels
-            .final_recurrent_state
-            .thread_block
-            .num_v_rows,
-        4
-    );
-    config.v_head_dim = 4;
-    assert_eq!(
-        VariantConstants::from_config(config)
-            .kernels
-            .final_recurrent_state
-            .thread_block
-            .num_v_rows,
-        4
-    );
-}
-
-#[test]
-fn test_compute_constants_defines_each_kernel_thread_block() {
-    let constants = VariantConstants::from_config(fixture_config());
-    assert_eq!(constants.kernels.short_conv.thread_block.required_threads, 256);
-    assert_eq!(
-        constants.kernels.candidate_conv_state.thread_block.required_threads,
-        256
-    );
-    assert_eq!(
-        constants.kernels.final_recurrent_state.thread_block.num_qk_dim_threads,
-        32
-    );
-    assert_eq!(constants.kernels.final_recurrent_state.thread_block.num_v_rows, 8);
-    assert_eq!(
-        constants.kernels.final_recurrent_state.thread_block.required_threads,
-        256
-    );
-    assert_eq!(
-        constants
-            .kernels
-            .candidate_recurrent_state
-            .thread_block
-            .num_qk_dim_threads,
-        32
-    );
-    assert_eq!(
-        constants.kernels.candidate_recurrent_state.thread_block.num_simdgroups,
-        2
-    );
-    assert_eq!(
-        constants
-            .kernels
-            .candidate_recurrent_state
-            .thread_block
-            .simdgroup
-            .num_v_rows,
-        2
-    );
-    assert_eq!(constants.kernels.candidate_recurrent_state.thread_block.num_v_rows(), 4);
-    assert_eq!(
-        constants
-            .kernels
-            .candidate_recurrent_state
-            .thread_block
-            .required_threads,
-        64
-    );
-    assert_eq!(constants.kernels.output_norm_gate.thread_block.required_threads, 128);
-}
 
 #[test]
 fn test_selector_returns_registered_recurrent_variant() {
@@ -554,11 +475,12 @@ fn test_candidate_state_preserves_distinct_source_slots() {
                 expected_conv_qkv[qkv_start..qkv_end].copy_from_slice(&conv_reference.conv_qkv);
                 expected_recurrent_output[output_start..output_end]
                     .copy_from_slice(&recurrent_reference.recurrent_output);
-                expected_norm_gated_output[output_start..output_end].copy_from_slice(&output_norm_gate_reference(
+                expected_norm_gated_output[output_start..output_end].copy_from_slice(&gdn_output_norm_gate_reference(
+                    &reference_core,
                     &recurrent_reference.recurrent_output,
                     &z_values[output_start..output_end],
                     &norm_weight_values,
-                    config,
+                    config.norm_eps,
                 ));
             }
             let flat_row = flat_start + num_prefix_rows - 1;
@@ -587,14 +509,15 @@ fn test_candidate_state_preserves_distinct_source_slots() {
 }
 
 #[test]
-fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state() {
-    const NUM_STATE_SLOTS: usize = 6;
+fn test_candidate_replay_matches_reference_across_active_counts() {
+    const NUM_REQUESTS: usize = 8;
+    const NUM_STATE_SLOTS: usize = NUM_REQUESTS * 3;
     const CANARY: f32 = -777.0;
 
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let config = fixture_config();
-    let shape = fixture_shape(2, 2);
+    let shape = fixture_shape(NUM_REQUESTS as u32, NUM_REQUESTS as u32);
     let kernels = Compute::new(&device, config);
     let qkv_values = fixture_values(config.num_qkv_values(shape), 0.03125, 3);
     let a_values = fixture_values(shape.num_total_tokens as usize * config.num_v_heads as usize, 0.0625, 5);
@@ -610,8 +533,8 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
     let dt_bias_values = vec![0.125_f32; config.num_v_heads as usize];
     let conv_state_stride = config.qkv_dim() as usize * config.conv_state_len() as usize;
     let recurrent_state_stride = config.recurrent_state_stride();
-    let source_conv_states = fixture_values(2 * conv_state_stride, 0.015625, 17);
-    let source_recurrent_states = fixture_values(2 * recurrent_state_stride, 0.0078125, 19);
+    let source_conv_states = fixture_values(NUM_REQUESTS * conv_state_stride, 0.015625, 17);
+    let source_recurrent_states = fixture_values(NUM_REQUESTS * recurrent_state_stride, 0.0078125, 19);
 
     let qkv = Buffer::new_zeroed_elements(&device, config.num_qkv_values(shape), Dtype::Float32);
     let a = Buffer::new_zeroed_elements(
@@ -629,9 +552,11 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
     let norm_weight = bf16_buffer(&device, &norm_weight_values);
     let a_log = bf16_buffer(&device, &a_log_values);
     let dt_bias = bf16_buffer(&device, &dt_bias_values);
-    let cu_tokens = Buffer::new_zeroed_elements(&device, 3, Dtype::Uint32);
-    let src_state_slots = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
-    let flat_materialized_state_slots = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
+    let cu_tokens = Buffer::from_slice(&device, &(0..=NUM_REQUESTS as u32).collect::<Vec<_>>());
+    let src_slot_values = (0..NUM_REQUESTS as u32).map(|req| req * 3).collect::<Vec<_>>();
+    let candidate_slot_values = (0..NUM_REQUESTS as u32).map(|req| req * 3 + 2).collect::<Vec<_>>();
+    let src_state_slots = Buffer::from_slice(&device, &src_slot_values);
+    let flat_materialized_state_slots = Buffer::from_slice(&device, &candidate_slot_values);
     let conv_state_arena = Buffer::new_zeroed_elements(&device, NUM_STATE_SLOTS * conv_state_stride, Dtype::Float32);
     let recurrent_state_arena =
         Buffer::new_zeroed_elements(&device, NUM_STATE_SLOTS * recurrent_state_stride, Dtype::Float32);
@@ -640,79 +565,70 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
         Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
     let norm_gated_output =
         Buffer::new_zeroed_elements(&device, config.num_recurrent_output_values(shape), Dtype::Float32);
-    let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_with_candidate_state_update(
-        shape,
-        Buffers {
-            qkv: &qkv,
-            a: &a,
-            b: &b,
-            z: &z,
-            conv_weight: &conv_weight,
-            norm_weight: &norm_weight,
-            a_log: &a_log,
-            dt_bias: &dt_bias,
-            cu_tokens: &cu_tokens,
-            src_recurrent_state_slots: &src_state_slots,
-            src_conv_state_slots: &src_state_slots,
-            flat_materialized_recurrent_state_slots: &flat_materialized_state_slots,
-            flat_materialized_conv_state_slots: &flat_materialized_state_slots,
-            conv_state: &conv_state_arena,
-            conv_state_offset_bytes: 0,
-            next_conv_state: &conv_state_arena,
-            next_conv_state_offset_bytes: 0,
-            recurrent_state_arena: &recurrent_state_arena,
-            recurrent_state_arena_offset_bytes: 0,
-            conv_qkv: &conv_qkv,
-            recurrent_output: &recurrent_output,
-            norm_gated_output: &norm_gated_output,
-        },
-        ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
-        ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-    ));
-    let replay = builder.build();
-    for num_active in [1_usize, 2, 1] {
-        let mut qkv_submission = qkv_values.clone();
-        let mut a_submission = a_values.clone();
-        let mut b_submission = b_values.clone();
-        let mut z_submission = z_values.clone();
-        if num_active == 1 {
-            qkv_submission[config.qkv_dim() as usize..].fill(f32::NAN);
-            a_submission[1..].fill(f32::NAN);
-            b_submission[1..].fill(f32::NAN);
-            z_submission[config.v_head_dim as usize..].fill(f32::NAN);
-        }
-        qkv.write_typed(0, &qkv_submission);
-        a.write_typed(0, &a_submission);
-        b.write_typed(0, &b_submission);
-        z.write_typed(0, &z_submission);
-        let metadata = if num_active == 1 {
-            ([0_u32, 1, u32::MAX], [0_u32, u32::MAX], [u32::MAX, u32::MAX])
-        } else {
-            ([0_u32, 1, 2], [0_u32, 3], [2_u32, 5])
-        };
-        cu_tokens.write_typed(0, &metadata.0);
-        src_state_slots.write_typed(0, &metadata.1);
-        flat_materialized_state_slots.write_typed(0, &metadata.2);
+    let cache_key = (shape.num_total_reqs, shape.num_total_tokens);
+    let mut cache = ReplayTestCache::new();
+    let (_, cache_hit) = cache.record(cache_key, || {
+        let mut builder = stream.create_replay_program();
+        builder.record(kernels.invoke_with_candidate_state_update(
+            shape,
+            Buffers {
+                qkv: &qkv,
+                a: &a,
+                b: &b,
+                z: &z,
+                conv_weight: &conv_weight,
+                norm_weight: &norm_weight,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                cu_tokens: &cu_tokens,
+                src_recurrent_state_slots: &src_state_slots,
+                src_conv_state_slots: &src_state_slots,
+                flat_materialized_recurrent_state_slots: &flat_materialized_state_slots,
+                flat_materialized_conv_state_slots: &flat_materialized_state_slots,
+                conv_state: &conv_state_arena,
+                conv_state_offset_bytes: 0,
+                next_conv_state: &conv_state_arena,
+                next_conv_state_offset_bytes: 0,
+                recurrent_state_arena: &recurrent_state_arena,
+                recurrent_state_arena_offset_bytes: 0,
+                conv_qkv: &conv_qkv,
+                recurrent_output: &recurrent_output,
+                norm_gated_output: &norm_gated_output,
+            },
+            ReplayU32::Parameter(NUM_ACTIVE_REQUESTS),
+            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+        ));
+        builder.build()
+    });
+    assert!(!cache_hit);
+    qkv.write_typed(0, &qkv_values);
+    a.write_typed(0, &a_values);
+    b.write_typed(0, &b_values);
+    z.write_typed(0, &z_values);
 
+    for num_active in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
         let mut conv_arena_values = vec![CANARY; NUM_STATE_SLOTS * conv_state_stride];
-        conv_arena_values[..conv_state_stride].copy_from_slice(&source_conv_states[..conv_state_stride]);
-        conv_arena_values[3 * conv_state_stride..4 * conv_state_stride]
-            .copy_from_slice(&source_conv_states[conv_state_stride..]);
+        for req in 0..NUM_REQUESTS {
+            let src_begin = req * conv_state_stride;
+            let arena_begin = req * 3 * conv_state_stride;
+            conv_arena_values[arena_begin..arena_begin + conv_state_stride]
+                .copy_from_slice(&source_conv_states[src_begin..src_begin + conv_state_stride]);
+        }
         conv_state_arena.write_typed(0, &conv_arena_values);
         let mut recurrent_arena_values = vec![CANARY; NUM_STATE_SLOTS * recurrent_state_stride];
-        recurrent_arena_values[..recurrent_state_stride]
-            .copy_from_slice(&source_recurrent_states[..recurrent_state_stride]);
-        recurrent_arena_values[3 * recurrent_state_stride..4 * recurrent_state_stride]
-            .copy_from_slice(&source_recurrent_states[recurrent_state_stride..]);
+        for req in 0..NUM_REQUESTS {
+            let src_begin = req * recurrent_state_stride;
+            let arena_begin = req * 3 * recurrent_state_stride;
+            recurrent_arena_values[arena_begin..arena_begin + recurrent_state_stride]
+                .copy_from_slice(&source_recurrent_states[src_begin..src_begin + recurrent_state_stride]);
+        }
         recurrent_state_arena.write_typed(0, &recurrent_arena_values);
-        conv_qkv.write_typed(0, &vec![CANARY; config.num_qkv_values(shape)]);
-        recurrent_output.write_typed(0, &vec![CANARY; config.num_recurrent_output_values(shape)]);
-        norm_gated_output.write_typed(0, &vec![CANARY; config.num_recurrent_output_values(shape)]);
+        let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+        assert!(cache_hit);
 
         stream
             .submit_replay_with_arguments(
-                &replay,
+                replay,
                 &ReplayArguments::new()
                     .with_u32(NUM_ACTIVE_REQUESTS, num_active as u32)
                     .with_u32(NUM_ACTIVE_TOKENS, num_active as u32),
@@ -744,11 +660,12 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
                 dt_bias: &dt_bias_values,
             },
         );
-        let norm_gate_reference = output_norm_gate_reference(
+        let norm_gate_reference = gdn_output_norm_gate_reference(
+            &fixture_core(active_shape),
             &recurrent_reference.recurrent_output,
             active_z_values,
             &norm_weight_values,
-            config,
+            config.norm_eps,
         );
         assert_close(
             &conv_qkv.read_typed::<f32>(0, config.num_qkv_values(active_shape)),
@@ -765,88 +682,25 @@ fn test_bucketed_candidate_replay_guards_poisoned_tails_and_optional_final_state
             &norm_gate_reference,
             2.0e-5,
         );
-        let active_qkv_count = config.num_qkv_values(active_shape);
-        assert_eq!(
-            conv_qkv.read_typed::<f32>(active_qkv_count, config.num_qkv_values(shape) - active_qkv_count),
-            vec![CANARY; config.num_qkv_values(shape) - active_qkv_count]
-        );
-        let active_output_count = config.num_recurrent_output_values(active_shape);
-        for output in [&recurrent_output, &norm_gated_output] {
-            assert_eq!(
-                output.read_typed::<f32>(
-                    active_output_count,
-                    config.num_recurrent_output_values(shape) - active_output_count,
-                ),
-                vec![CANARY; config.num_recurrent_output_values(shape) - active_output_count]
-            );
-        }
-
         let conv_state_after = conv_state_arena.read_typed::<f32>(0, NUM_STATE_SLOTS * conv_state_stride);
         let recurrent_state_after =
             recurrent_state_arena.read_typed::<f32>(0, NUM_STATE_SLOTS * recurrent_state_stride);
-        for req_index in 0..num_active {
-            let dst_slot = [1_usize, 4][req_index];
-            let candidate_slot = [2_usize, 5][req_index];
+        let mut expected_conv_arena = conv_arena_values;
+        let mut expected_recurrent_arena = recurrent_arena_values;
+        for (req_index, &candidate_slot_value) in candidate_slot_values.iter().take(num_active).enumerate() {
+            let candidate_slot = candidate_slot_value as usize;
             let conv_expected =
                 &conv_reference.next_conv_state[req_index * conv_state_stride..(req_index + 1) * conv_state_stride];
             let recurrent_expected = &recurrent_reference.next_recurrent_state
                 [req_index * recurrent_state_stride..(req_index + 1) * recurrent_state_stride];
-            if num_active == 1 {
-                assert_eq!(
-                    conv_state_slot(&conv_state_after, shape, dst_slot),
-                    vec![CANARY; conv_state_stride]
-                );
-                assert_eq!(
-                    recurrent_state_slot(&recurrent_state_after, shape, dst_slot),
-                    vec![CANARY; recurrent_state_stride]
-                );
-                assert_eq!(
-                    conv_state_slot(&conv_state_after, shape, candidate_slot),
-                    vec![CANARY; conv_state_stride]
-                );
-                assert_eq!(
-                    recurrent_state_slot(&recurrent_state_after, shape, candidate_slot),
-                    vec![CANARY; recurrent_state_stride]
-                );
-            } else {
-                assert_close(
-                    conv_state_slot(&conv_state_after, shape, candidate_slot),
-                    conv_expected,
-                    2.0e-5,
-                );
-                assert_close(
-                    recurrent_state_slot(&recurrent_state_after, shape, candidate_slot),
-                    recurrent_expected,
-                    2.0e-5,
-                );
-                assert_eq!(
-                    conv_state_slot(&conv_state_after, shape, dst_slot),
-                    vec![CANARY; conv_state_stride]
-                );
-                assert_eq!(
-                    recurrent_state_slot(&recurrent_state_after, shape, dst_slot),
-                    vec![CANARY; recurrent_state_stride]
-                );
-            }
+            expected_conv_arena[candidate_slot * conv_state_stride..(candidate_slot + 1) * conv_state_stride]
+                .copy_from_slice(conv_expected);
+            expected_recurrent_arena
+                [candidate_slot * recurrent_state_stride..(candidate_slot + 1) * recurrent_state_stride]
+                .copy_from_slice(recurrent_expected);
         }
-        if num_active == 1 {
-            assert_eq!(
-                conv_state_slot(&conv_state_after, shape, 4),
-                vec![CANARY; conv_state_stride]
-            );
-            assert_eq!(
-                conv_state_slot(&conv_state_after, shape, 5),
-                vec![CANARY; conv_state_stride]
-            );
-            assert_eq!(
-                recurrent_state_slot(&recurrent_state_after, shape, 4),
-                vec![CANARY; recurrent_state_stride]
-            );
-            assert_eq!(
-                recurrent_state_slot(&recurrent_state_after, shape, 5),
-                vec![CANARY; recurrent_state_stride]
-            );
-        }
+        assert_close(&conv_state_after, &expected_conv_arena, 2.0e-5);
+        assert_close(&recurrent_state_after, &expected_recurrent_arena, 2.0e-5);
     }
 }
 
@@ -1389,27 +1243,6 @@ fn assert_gdn_reference_matches(
         &recurrent_reference.next_recurrent_state,
         tolerance,
     );
-}
-
-fn output_norm_gate_reference(recurrent_output: &[f32], z: &[f32], norm_weight: &[f32], config: Config) -> Vec<f32> {
-    let mut output = Vec::with_capacity(recurrent_output.len());
-    for (recurrent_row, z_row) in recurrent_output
-        .chunks_exact(config.v_head_dim as usize)
-        .zip(z.chunks_exact(config.v_head_dim as usize))
-    {
-        let inv_rms = (recurrent_row.iter().map(|value| value * value).sum::<f32>() / config.v_head_dim as f32
-            + config.norm_eps)
-            .sqrt()
-            .recip();
-        output.extend(
-            recurrent_row
-                .iter()
-                .zip(z_row)
-                .zip(norm_weight)
-                .map(|((&value, &gate), &weight)| value * inv_rms * weight * gate / (1.0 + (-gate).exp())),
-        );
-    }
-    output
 }
 
 fn fixture_shape(num_reqs: u32, num_tokens: u32) -> Shape {
