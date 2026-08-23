@@ -244,9 +244,43 @@ fn validate_quantized_unembedding(max_tokens: u32, vocab_size: u32, hidden_dim: 
 }
 
 #[cfg(test)]
-mod tests {
-    use std::rc::Rc;
+pub fn fixture_unembed(device: &Device, config: UnembedConfig) -> (Unembed, Vec<u8>, Vec<f32>, Vec<f32>) {
+    use half::bf16;
 
+    config.validate();
+    let affine_config = config.affine_config();
+    let weight_values = (0..affine_config.weight_bytes())
+        .map(|index| ((index * 17 + 3) % 31) as u8)
+        .collect::<Vec<_>>();
+    let num_affine_values = affine_config.scale_or_bias_bytes() / size_of::<u16>();
+    let scale_values = (0..num_affine_values)
+        .map(|index| bf16::from_f32(0.000_244_140_63 + (index % 5) as f32 * 0.000_030_517_578).to_f32())
+        .collect::<Vec<_>>();
+    let bias_values = (0..num_affine_values)
+        .map(|index| bf16::from_f32(-0.000_122_070_31 + (index % 3) as f32 * 0.000_030_517_578).to_f32())
+        .collect::<Vec<_>>();
+    let bf16_buffer = |values: &[f32]| {
+        let bits = values
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect::<Vec<_>>();
+        Buffer::from_slice(device, &bits)
+    };
+    let unembed = Unembed {
+        config,
+        matmul: Rc::new(affine_quantized::Matmul::new(device, affine_config)),
+        weights: Some(Rc::new(UnembedWeights {
+            weight: Buffer::from_slice(device, &weight_values),
+            scales: bf16_buffer(&scale_values),
+            biases: bf16_buffer(&bias_values),
+        })),
+    };
+    unembed.validate_weights();
+    (unembed, weight_values, scale_values, bias_values)
+}
+
+#[cfg(test)]
+mod tests {
     use half::bf16;
     use inference_backend_metal::metal::Buffer;
     use inference_backend_metal::metal::Device;
@@ -254,107 +288,87 @@ mod tests {
     use inference_backend_metal::metal::ReplayParameterKey;
     use inference_backend_metal::metal::ReplayU32;
     use inference_backend_metal::metal::Stream;
+    use inference_executor_core::mlp::dense::reference::QuantizedAffineReferenceShape;
+    use inference_executor_core::mlp::dense::reference::quantized_affine_reference;
 
     use super::Dtype;
     use super::Unembed;
     use super::UnembedConfig;
     use super::UnembedInput;
-    use super::UnembedWeights;
+    use super::fixture_unembed;
     use crate::def::layer::ReplayLayer;
     use crate::def::replay_op::MetalReplayRuntime;
+    use crate::def::replay_op::ReplayRecorder;
+    use crate::replay::Replay;
+    use crate::replay::ReplayComponent;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.unembed.num_active_rows");
 
     #[test]
-    #[should_panic(expected = "unembed requires BF16 affine parameters")]
-    fn test_rejects_mixed_scale_bias_dtype() {
-        let config = UnembedConfig {
-            max_tokens: 16,
-            vocab_size: 151_936,
-            hidden_dim: 5120,
-            group_size: 64,
-            bits: 4,
-            input_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-            scale_bias_dtype: Dtype::Float32,
-        };
-        config.validate();
-    }
-
-    #[test]
-    fn test_bucketed_replay_preserves_inactive_rows_across_grow_and_shrink() {
+    fn test_replay_matches_cpu_reference_across_active_counts() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
-        let config = fixture_config(4);
-        let unembed = fixture_unembed(&device, config);
+        let config = fixture_config(8);
+        let (unembed, weight_values, scale_values, bias_values) = fixture_unembed(&device, config);
         let num_values_per_hidden_row = config.hidden_dim as usize;
         let num_values_per_logits_row = config.vocab_size as usize;
         let num_total_hidden_values = config.max_tokens as usize * num_values_per_hidden_row;
         let num_total_logits_values = config.max_tokens as usize * num_values_per_logits_row;
-        let sentinel = bf16::from_f32(-123.0).to_f32();
-        let hidden = bf16_buffer(&device, &vec![0.0; num_total_hidden_values]);
-        let logits = bf16_buffer(&device, &vec![sentinel; num_total_logits_values]);
-        let mut bucketed_recorder = runtime.create_recorder();
-        <Unembed as ReplayLayer>::record(
-            &unembed,
-            &mut bucketed_recorder,
-            UnembedInput {
-                num_total_rows: config.max_tokens,
-                num_active_rows: ReplayU32::Parameter(NUM_ACTIVE_ROWS),
-                hidden: &hidden,
-                logits: &logits,
-            },
-        );
-        let bucketed_replay = bucketed_recorder.build();
+        let hidden_values = (0..num_total_hidden_values)
+            .map(|index| bf16::from_f32(((index * 17 + 5) % 41) as f32 * 0.03125 - 0.625).to_f32())
+            .collect::<Vec<_>>();
+        let hidden = bf16_buffer(&device, &hidden_values);
+        let logits = Buffer::new_zeroed_elements(&device, num_total_logits_values, Dtype::Bfloat16);
+        let input = UnembedInput {
+            num_total_rows: config.max_tokens,
+            num_active_rows: ReplayU32::Parameter(NUM_ACTIVE_ROWS),
+            hidden: &hidden,
+            logits: &logits,
+        };
+        let mut replay = Replay::new("test Unembed", TestUnembed(unembed));
+        let (key, cache_hit) = replay.record(&runtime, &input);
+        assert!(!cache_hit);
 
-        let active_one = ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 1);
-        write_bf16_values(
-            &hidden,
-            &poisoned_hidden_values(config.max_tokens, num_values_per_hidden_row),
-        );
-        runtime
-            .submit_replay_with_arguments(&bucketed_replay, &active_one)
-            .wait();
-        let first_values = read_bf16_values(&logits, num_total_logits_values);
-        assert_eq!(
-            &first_values[..num_values_per_logits_row],
-            &vec![0.0; num_values_per_logits_row]
-        );
-        assert_eq!(
-            &first_values[num_values_per_logits_row..],
-            &vec![sentinel; num_total_logits_values - num_values_per_logits_row]
-        );
+        for num_active_rows in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            assert_eq!(replay.record(&runtime, &input), (key, true));
+            runtime
+                .submit_replay_with_arguments(
+                    replay.replay(&key),
+                    &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32),
+                )
+                .wait();
+            let expected = quantized_affine_reference(
+                QuantizedAffineReferenceShape {
+                    num_rows: num_active_rows,
+                    output_dim: num_values_per_logits_row,
+                    input_dim: num_values_per_hidden_row,
+                    group_size: config.group_size as usize,
+                    bits: config.bits as usize,
+                },
+                &hidden_values[..num_active_rows * num_values_per_hidden_row],
+                &weight_values,
+                &scale_values,
+                &bias_values,
+            );
+            let actual = read_bf16_values(&logits, num_active_rows * num_values_per_logits_row);
+            assert_close(&actual, &expected, 1.0e-2);
+        }
+    }
 
-        write_bf16_values(&hidden, &vec![0.0; num_total_hidden_values]);
-        runtime
-            .submit_replay_with_arguments(
-                &bucketed_replay,
-                &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, config.max_tokens),
-            )
-            .wait();
-        assert_eq!(
-            read_bf16_values(&logits, num_total_logits_values),
-            vec![0.0; num_total_logits_values]
-        );
+    struct TestUnembed(Unembed);
 
-        write_bf16_values(&logits, &vec![sentinel; num_total_logits_values]);
-        write_bf16_values(
-            &hidden,
-            &poisoned_hidden_values(config.max_tokens, num_values_per_hidden_row),
-        );
-        runtime
-            .submit_replay_with_arguments(&bucketed_replay, &active_one)
-            .wait();
-        let shrunk_values = read_bf16_values(&logits, num_total_logits_values);
-        assert_eq!(
-            &shrunk_values[..num_values_per_logits_row],
-            &vec![0.0; num_values_per_logits_row]
-        );
-        assert_eq!(
-            &shrunk_values[num_values_per_logits_row..],
-            &vec![sentinel; num_total_logits_values - num_values_per_logits_row]
-        );
+    impl ReplayComponent for TestUnembed {
+        type Key = (u32, super::affine_quantized::KernelKind);
+        type Input<'a> = UnembedInput<'a>;
+
+        fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
+            (input.num_total_rows, self.0.replay_topology(input.num_total_rows))
+        }
+
+        fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
+            <Unembed as ReplayLayer>::record(&self.0, recorder, *input);
+        }
     }
 
     fn fixture_config(max_tokens: u32) -> UnembedConfig {
@@ -370,28 +384,6 @@ mod tests {
         }
     }
 
-    fn fixture_unembed(device: &Device, config: UnembedConfig) -> Unembed {
-        config.validate();
-        let affine_config = config.affine_config();
-        let unembed = Unembed {
-            config,
-            matmul: Rc::new(super::affine_quantized::Matmul::new(device, affine_config)),
-            weights: Some(Rc::new(UnembedWeights {
-                weight: Buffer::new_zeroed(device, affine_config.weight_bytes()),
-                scales: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
-                biases: Buffer::new_zeroed(device, affine_config.scale_or_bias_bytes()),
-            })),
-        };
-        unembed.validate_weights();
-        unembed
-    }
-
-    fn poisoned_hidden_values(num_rows: u32, num_values_per_row: usize) -> Vec<f32> {
-        let mut values = vec![f32::NAN; num_rows as usize * num_values_per_row];
-        values[..num_values_per_row].fill(0.0);
-        values
-    }
-
     fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
         let bits = values
             .iter()
@@ -400,19 +392,23 @@ mod tests {
         Buffer::from_slice(device, &bits)
     }
 
-    fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
-        let bits = values
-            .iter()
-            .map(|value| bf16::from_f32(*value).to_bits())
-            .collect::<Vec<_>>();
-        buffer.write_typed(0, &bits);
-    }
-
     fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {
         buffer
             .read_typed::<u16>(0, len)
             .into_iter()
             .map(|bits| bf16::from_bits(bits).to_f32())
             .collect()
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let difference = (actual - expected).abs();
+            assert!(
+                difference <= tolerance,
+                "unembed mismatch at {index}: actual={actual} expected={expected} difference={difference} \
+                 tolerance={tolerance}"
+            );
+        }
     }
 }

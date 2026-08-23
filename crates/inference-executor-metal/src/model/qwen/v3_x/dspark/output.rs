@@ -233,16 +233,174 @@ impl ReplayComponent for Qwen3xDSparkSampling {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use half::bf16;
+    use inference_backend_metal::metal::Stream;
+    use inference_executor_core::mlp::dense::reference::QuantizedAffineReferenceShape;
+    use inference_executor_core::mlp::dense::reference::quantized_affine_reference;
+
+    use super::*;
+    use crate::def::replay_op::MetalReplayRuntime;
+    use crate::model::unembedding::UnembedConfig;
+    use crate::model::unembedding::fixture_unembed;
+    use crate::replay::Replay;
+
+    const MAX_REQUESTS: u32 = 8;
+    const BLOCK_SIZE: u32 = 3;
+    const NUM_TOTAL_ROWS: u32 = MAX_REQUESTS * BLOCK_SIZE;
+    const VOCAB_SIZE: u32 = 32;
+    const HIDDEN_DIM: u32 = 32;
+    const GROUP_SIZE: u32 = 32;
+
     #[test]
-    fn test_request_major_rows_transpose_to_step_major_rows() {
-        let num_requests = 2usize;
-        let block_size = 3usize;
-        let mut indices = Vec::new();
-        for step in 0..block_size {
-            for request in 0..num_requests {
-                indices.push(request * block_size + step);
+    fn test_gather_unembed_replay_matches_cpu_reference_across_active_counts() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let runtime = MetalReplayRuntime::new(&stream);
+        let (component, weights) = fixture_component(&device);
+        component.prepare(MAX_REQUESTS as usize);
+        let buffers = TestBuffers::new(&device);
+        let input = buffers.input(MAX_REQUESTS);
+        let mut replay = Replay::new("Qwen3.x DSpark GatherUnembed component test", component);
+        let (recorded_key, cache_hit) = replay.record(&runtime, &input);
+        assert!(!cache_hit);
+
+        for num_active_requests in [1_u32, 8, 3, 7, 2, 6, 4, 5] {
+            replay.component().prepare(num_active_requests as usize);
+            assert_eq!(replay.record(&runtime, &input), (recorded_key.clone(), true));
+            let num_active_rows = num_active_requests * BLOCK_SIZE;
+            runtime
+                .submit_replay_with_arguments(
+                    replay.replay(&recorded_key),
+                    &ReplayArguments::new().with_u32(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS, num_active_rows),
+                )
+                .wait();
+
+            let gathered = buffers.gathered_reference(num_active_requests as usize);
+            let actual_hidden = buffers
+                .hidden_output
+                .read_typed::<u16>(0, num_active_rows as usize * HIDDEN_DIM as usize);
+            let expected_hidden = gathered
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_hidden, expected_hidden);
+
+            let expected_logits = quantized_affine_reference(
+                QuantizedAffineReferenceShape {
+                    num_rows: num_active_rows as usize,
+                    output_dim: VOCAB_SIZE as usize,
+                    input_dim: HIDDEN_DIM as usize,
+                    group_size: GROUP_SIZE as usize,
+                    bits: 8,
+                },
+                &gathered,
+                &weights.weight,
+                &weights.scales,
+                &weights.biases,
+            );
+            let actual_logits = buffers
+                .logits
+                .read_typed::<u16>(0, num_active_rows as usize * VOCAB_SIZE as usize)
+                .into_iter()
+                .map(|bits| bf16::from_bits(bits).to_f32())
+                .collect::<Vec<_>>();
+            assert_close(&actual_logits, &expected_logits, 0.125);
+        }
+    }
+
+    struct TestBuffers {
+        hidden_input: Buffer,
+        hidden_output: Buffer,
+        logits: Buffer,
+        hidden_values: Vec<f32>,
+    }
+
+    impl TestBuffers {
+        fn new(device: &Device) -> Self {
+            let hidden_values = (0..NUM_TOTAL_ROWS as usize * HIDDEN_DIM as usize)
+                .map(|index| bf16::from_f32(((index * 23 + 9) % 127) as f32 * 0.015_625 - 0.875).to_f32())
+                .collect::<Vec<_>>();
+            let hidden_bits = hidden_values
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>();
+            Self {
+                hidden_input: Buffer::from_slice(device, &hidden_bits),
+                hidden_output: Buffer::new_zeroed_elements(
+                    device,
+                    NUM_TOTAL_ROWS as usize * HIDDEN_DIM as usize,
+                    Dtype::Bfloat16,
+                ),
+                logits: Buffer::new_zeroed_elements(
+                    device,
+                    NUM_TOTAL_ROWS as usize * VOCAB_SIZE as usize,
+                    Dtype::Bfloat16,
+                ),
+                hidden_values,
             }
         }
-        assert_eq!(indices, [0, 3, 1, 4, 2, 5]);
+
+        fn input(&self, num_requests: u32) -> Qwen3xDSparkGatherUnembedArgs<'_> {
+            Qwen3xDSparkGatherUnembedArgs {
+                num_requests,
+                hidden_input: &self.hidden_input,
+                hidden_output: &self.hidden_output,
+                logits: &self.logits,
+            }
+        }
+
+        fn gathered_reference(&self, num_active_requests: usize) -> Vec<f32> {
+            let mut output = Vec::with_capacity(num_active_requests * BLOCK_SIZE as usize * HIDDEN_DIM as usize);
+            for block_offset in 0..BLOCK_SIZE as usize {
+                for request_index in 0..num_active_requests {
+                    let source_row = request_index * BLOCK_SIZE as usize + block_offset;
+                    let begin = source_row * HIDDEN_DIM as usize;
+                    output.extend_from_slice(&self.hidden_values[begin..begin + HIDDEN_DIM as usize]);
+                }
+            }
+            output
+        }
+    }
+
+    struct TestUnembedWeights {
+        weight: Vec<u8>,
+        scales: Vec<f32>,
+        biases: Vec<f32>,
+    }
+
+    fn fixture_component(device: &Device) -> (Qwen3xDSparkGatherUnembed, TestUnembedWeights) {
+        let config = UnembedConfig {
+            max_tokens: NUM_TOTAL_ROWS,
+            vocab_size: VOCAB_SIZE,
+            hidden_dim: HIDDEN_DIM,
+            group_size: GROUP_SIZE,
+            bits: 8,
+            input_dtype: Dtype::Bfloat16,
+            output_dtype: Dtype::Bfloat16,
+            scale_bias_dtype: Dtype::Bfloat16,
+        };
+        let (unembed, weight, scales, biases) = fixture_unembed(device, config);
+        (
+            Qwen3xDSparkGatherUnembed::new(
+                device,
+                BLOCK_SIZE as usize,
+                MAX_REQUESTS as usize,
+                HIDDEN_DIM,
+                Rc::new(unembed),
+            ),
+            TestUnembedWeights { weight, scales, biases },
+        )
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "value mismatch at index={index}: actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
     }
 }

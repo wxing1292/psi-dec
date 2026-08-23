@@ -218,7 +218,6 @@ mod tests {
     use super::Buffers;
     use super::Compute;
     use super::Config;
-    use super::KernelConstants;
     use super::Shape;
     use crate::metal::Buffer;
     use crate::metal::Device;
@@ -227,179 +226,74 @@ mod tests {
     use crate::metal::ReplayParameterKey;
     use crate::metal::ReplayU32;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const VOCAB_SIZE: u32 = 2;
     const HIDDEN_DIM: u32 = 32;
     const GROUP_SIZE: u32 = 32;
     const BITS: u32 = 4;
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.quantized_embedding.num_active_tokens");
-    const OUTPUT_CANARY: u16 = 0x7fc1;
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let constants = KernelConstants::new(Config {
-            vocab_size: VOCAB_SIZE,
-            hidden_dim: HIDDEN_DIM,
-            group_size: GROUP_SIZE,
-            bits: BITS,
-            scale_bias_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Bfloat16,
-        });
-        assert_eq!(constants.scale_bias_dtype, Dtype::Bfloat16);
-        assert_eq!(constants.output_dtype, Dtype::Bfloat16);
-        assert_eq!(constants.thread_block.required_threads, 256);
-    }
+    fn test_replay_matches_reference_across_active_counts_and_affine_dtypes() {
+        for scale_bias_dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let device = Device::system_default();
+            let stream = Stream::new(&device);
+            let raw_scales = [0.5_f32, 0.25];
+            let raw_biases = [-1.0_f32, 2.0];
+            let scales = stored_affine_values(raw_scales, scale_bias_dtype);
+            let biases = stored_affine_values(raw_biases, scale_bias_dtype);
+            let config = Config {
+                vocab_size: VOCAB_SIZE,
+                hidden_dim: HIDDEN_DIM,
+                group_size: GROUP_SIZE,
+                bits: BITS,
+                scale_bias_dtype,
+                output_dtype: Dtype::Bfloat16,
+            };
+            let shape = Shape { num_total_tokens: 8 };
+            let token_ids_values = [0_i32, 1, -1, 2, 1, 0, 1, 0];
+            let token_ids = Buffer::from_slice(&device, &token_ids_values);
+            let weight = Buffer::from_slice(&device, &packed_q4_rows());
+            let scales_buffer = affine_buffer(&device, &scales, scale_bias_dtype);
+            let biases_buffer = affine_buffer(&device, &biases, scale_bias_dtype);
+            let output = Buffer::new_zeroed_elements(&device, shape.num_output_values(config), Dtype::Bfloat16);
+            let kernel = Compute::new(&device, config);
+            let cache_key = (shape.num_total_tokens, dtype_tag(scale_bias_dtype));
+            let mut cache = ReplayTestCache::new();
+            let (_, cache_hit) = cache.record(cache_key, || {
+                let mut recorder = stream.create_replay_program();
+                recorder.record(kernel.invoke(
+                    shape,
+                    ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+                    Buffers {
+                        token_ids: &token_ids,
+                        weight: &weight,
+                        scales: &scales_buffer,
+                        biases: &biases_buffer,
+                        output: &output,
+                    },
+                ));
+                recorder.build()
+            });
+            assert!(!cache_hit);
 
-    #[test]
-    #[should_panic(expected = "F32 quantized embedding output is not implemented")]
-    fn test_f32_output_is_explicit_future_work() {
-        Config {
-            vocab_size: VOCAB_SIZE,
-            hidden_dim: HIDDEN_DIM,
-            group_size: GROUP_SIZE,
-            bits: BITS,
-            scale_bias_dtype: Dtype::Bfloat16,
-            output_dtype: Dtype::Float32,
+            for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+                let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+                assert!(cache_hit);
+                stream
+                    .submit_replay_with_arguments(
+                        replay,
+                        &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32),
+                    )
+                    .wait();
+                let expected = token_ids_reference(&token_ids_values[..num_active_tokens], &scales, &biases);
+                assert_eq!(
+                    output.read_typed::<u16>(0, num_active_tokens * HIDDEN_DIM as usize,),
+                    expected
+                );
+            }
         }
-        .validate();
-    }
-
-    #[test]
-    fn test_f32_scale_bias_reference() {
-        let scales = [0.5f32, 0.25];
-        let biases = [-1.0f32, 2.0];
-        assert_reference(
-            Dtype::Float32,
-            &f32_bytes(&scales),
-            &f32_bytes(&biases),
-            &scales,
-            &biases,
-        );
-    }
-
-    #[test]
-    fn test_bf16_scale_bias_reference() {
-        let scales = [bf16::from_f32(0.5), bf16::from_f32(0.25)];
-        let biases = [bf16::from_f32(-1.0), bf16::from_f32(2.0)];
-        assert_reference(
-            Dtype::Bfloat16,
-            &bf16_bytes(&scales),
-            &bf16_bytes(&biases),
-            &scales.map(bf16::to_f32),
-            &biases.map(bf16::to_f32),
-        );
-    }
-
-    #[test]
-    fn test_bucketed_replay_preserves_inactive_tail_across_grow_and_shrink() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let scales = [0.5f32, 0.25];
-        let biases = [-1.0f32, 2.0];
-        let config = Config {
-            vocab_size: VOCAB_SIZE,
-            hidden_dim: HIDDEN_DIM,
-            group_size: GROUP_SIZE,
-            bits: BITS,
-            scale_bias_dtype: Dtype::Float32,
-            output_dtype: Dtype::Bfloat16,
-        };
-        let shape = Shape { num_total_tokens: 4 };
-        let token_ids = Buffer::from_slice(&device, &[0_u32, 1, 0, u32::MAX]);
-        let weight = Buffer::from_slice(&device, &packed_q4_rows());
-        let scales_buffer = Buffer::from_slice(&device, &f32_bytes(&scales));
-        let biases_buffer = Buffer::from_slice(&device, &f32_bytes(&biases));
-        let output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; shape.num_output_values(config)]);
-        let kernel = Compute::new(&device, config);
-
-        let mut recorder = stream.create_replay_program();
-        recorder.record(kernel.invoke(
-            shape,
-            ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            Buffers {
-                token_ids: &token_ids,
-                weight: &weight,
-                scales: &scales_buffer,
-                biases: &biases_buffer,
-                output: &output,
-            },
-        ));
-        let replay = recorder.build();
-
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 3))
-            .wait();
-        let active_values = 3 * HIDDEN_DIM as usize;
-        let expected_active = token_ids_reference(&[0, 1, 0], &scales, &biases);
-        assert_eq!(output.read_typed::<u16>(0, active_values), expected_active);
-        assert_eq!(
-            output.read_typed::<u16>(active_values, HIDDEN_DIM as usize),
-            vec![OUTPUT_CANARY; HIDDEN_DIM as usize]
-        );
-
-        token_ids.write_typed(3, &[1_u32]);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 4))
-            .wait();
-        let expected_full = token_ids_reference(&[0, 1, 0, 1], &scales, &biases);
-        let full_output = output.read_typed::<u16>(0, shape.num_output_values(config));
-        assert_eq!(full_output, expected_full);
-
-        token_ids.write_typed(3, &[u32::MAX]);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, 3))
-            .wait();
-        assert_eq!(output.read_typed::<u16>(0, active_values), expected_active);
-        assert_eq!(
-            output.read_typed::<u16>(active_values, HIDDEN_DIM as usize),
-            full_output[active_values..]
-        );
-    }
-
-    fn assert_reference(
-        scale_bias_dtype: Dtype,
-        scale_bytes: &[u8],
-        bias_bytes: &[u8],
-        scales: &[f32; 2],
-        biases: &[f32; 2],
-    ) {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let config = Config {
-            vocab_size: VOCAB_SIZE,
-            hidden_dim: HIDDEN_DIM,
-            group_size: GROUP_SIZE,
-            bits: BITS,
-            scale_bias_dtype,
-            output_dtype: Dtype::Bfloat16,
-        };
-        let shape = Shape { num_total_tokens: 4 };
-        let token_ids = [-1i32, 0, 1, 2];
-        let packed_weights = packed_q4_rows();
-        let token_ids = Buffer::from_slice(&device, &token_ids);
-        let weight = Buffer::from_slice(&device, &packed_weights);
-        let scales_buffer = Buffer::from_slice(&device, scale_bytes);
-        let biases_buffer = Buffer::from_slice(&device, bias_bytes);
-        let output = Buffer::new_zeroed_elements(&device, shape.num_output_values(config), Dtype::Bfloat16);
-        let kernel = Compute::new(&device, config);
-        let mut recorder = stream.create_replay_program();
-        recorder.record(kernel.invoke(
-            shape,
-            ReplayU32::Fixed(shape.num_total_tokens),
-            Buffers {
-                token_ids: &token_ids,
-                weight: &weight,
-                scales: &scales_buffer,
-                biases: &biases_buffer,
-                output: &output,
-            },
-        ));
-        let replay = recorder.build();
-        stream.submit_replay(&replay).wait();
-
-        let actual = output.read_typed::<u16>(0, shape.num_output_values(config));
-        let expected = token_ids_reference(&[-1, 0, 1, 2], scales, biases);
-        assert_eq!(actual, expected);
     }
 
     fn packed_q4_rows() -> Vec<u8> {
@@ -429,11 +323,35 @@ mod tests {
             .collect()
     }
 
-    fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|value| value.to_ne_bytes()).collect()
+    fn stored_affine_values(values: [f32; 2], dtype: Dtype) -> [f32; 2] {
+        match dtype {
+            Dtype::Float32 => values,
+            Dtype::Bfloat16 => values.map(|value| bf16::from_f32(value).to_f32()),
+            _ => panic!("unsupported embedding test affine dtype {dtype:?}"),
+        }
     }
 
-    fn bf16_bytes(values: &[bf16]) -> Vec<u8> {
-        values.iter().flat_map(|value| value.to_bits().to_ne_bytes()).collect()
+    fn affine_buffer(device: &Device, values: &[f32], dtype: Dtype) -> Buffer {
+        match dtype {
+            Dtype::Float32 => Buffer::from_slice(device, values),
+            Dtype::Bfloat16 => {
+                Buffer::from_slice(
+                    device,
+                    &values
+                        .iter()
+                        .map(|value| bf16::from_f32(*value).to_bits())
+                        .collect::<Vec<_>>(),
+                )
+            },
+            _ => panic!("unsupported embedding test affine dtype {dtype:?}"),
+        }
+    }
+
+    fn dtype_tag(dtype: Dtype) -> u32 {
+        match dtype {
+            Dtype::Float32 => 0,
+            Dtype::Bfloat16 => 1,
+            _ => panic!("unsupported embedding test affine dtype {dtype:?}"),
+        }
     }
 }

@@ -186,134 +186,75 @@ impl ReplayComponent for Qwen35GatherUnembed {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::time::SystemTime;
-    use std::time::UNIX_EPOCH;
-
+    use half::bf16;
     use inference_backend_metal::metal::Dtype;
     use inference_backend_metal::metal::Stream;
-    use inference_executor_core::checkpoint::QuantizedTensorBindings;
-    use inference_executor_core::checkpoint::SafeTensorIndex;
-    use safetensors::Dtype as SafeTensorDtype;
-    use safetensors::tensor::View;
-    use safetensors::tensor::serialize_to_file;
+    use inference_executor_core::mlp::dense::reference::QuantizedAffineReferenceShape;
+    use inference_executor_core::mlp::dense::reference::quantized_affine_reference;
 
     use super::*;
-    use crate::checkpoint::SafeTensorStore;
     use crate::def::replay_op::MetalReplayRuntime;
     use crate::model::unembedding::UnembedConfig;
+    use crate::model::unembedding::fixture_unembed;
     use crate::replay::Replay;
 
     const MAX_ROWS: u32 = 32;
     const VOCAB_SIZE: u32 = 32;
     const HIDDEN_DIM: u32 = 32;
     const GROUP_SIZE: u32 = 32;
-    const OUTPUT_CANARY: u16 = 0x7fc1;
-
-    const WEIGHT: &str = "unembed.weight";
-    const SCALES: &str = "unembed.scales";
-    const BIASES: &str = "unembed.biases";
-
-    struct OwnedTensor {
-        dtype: SafeTensorDtype,
-        shape: Vec<usize>,
-        data: Vec<u8>,
-    }
-
-    impl View for &OwnedTensor {
-        fn dtype(&self) -> SafeTensorDtype {
-            self.dtype
-        }
-
-        fn shape(&self) -> &[usize] {
-            &self.shape
-        }
-
-        fn data(&self) -> Cow<'_, [u8]> {
-            Cow::Borrowed(&self.data)
-        }
-
-        fn data_len(&self) -> usize {
-            self.data.len()
-        }
-    }
-
-    struct TempModelDir(PathBuf);
-
-    impl TempModelDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "psi-qwen35-gather-unembed-test-{}-{}",
-                std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempModelDir {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
-        }
-    }
+    const NUM_TOTAL_ROWS: u32 = 8;
 
     #[test]
-    fn test_bucketed_replay_matches_exact_and_preserves_tails_across_one_two_one() {
+    fn test_replay_matches_cpu_reference_across_active_counts() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
-        let component = test_component(&device);
+        let (component, weights) = fixture_component(&device);
         let buffers = TestBuffers::new(&device);
-
-        buffers.fill_outputs(OUTPUT_CANARY);
-        buffers.write_active_inputs(1);
-        let mut exact_recorder = runtime.create_recorder();
-        component.record(&mut exact_recorder, 1, ReplayU32::Fixed(1), buffers.input(1));
-        let exact_replay = exact_recorder.build();
-        runtime.submit_replay(&exact_replay).wait();
-        let exact_hidden = buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize);
-        let exact_logits = buffers.logits.read_typed::<u16>(0, VOCAB_SIZE as usize);
-
-        let (_, active_one_arguments) = component.prepare_replay(1);
-        let (active_two_key, active_two_arguments) = component.prepare_replay(2);
-        let mut replay = Replay::new("qwen3.5 GatherUnembed test", component);
-        let (recorded_key, cache_hit) = replay.record(&runtime, &buffers.input(2));
+        let input = buffers.input(NUM_TOTAL_ROWS);
+        let mut replay = Replay::new("qwen3.5 GatherUnembed component test", component);
+        let (recorded_key, cache_hit) = replay.record(&runtime, &input);
         assert!(!cache_hit);
-        assert_eq!(recorded_key, active_two_key);
 
-        buffers.fill_outputs(OUTPUT_CANARY);
-        buffers.write_active_inputs(1);
-        runtime
-            .submit_replay_with_arguments(replay.replay(&recorded_key), &active_one_arguments)
-            .wait();
-        assert_eq!(
-            buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize),
-            exact_hidden
-        );
-        assert_eq!(buffers.logits.read_typed::<u16>(0, VOCAB_SIZE as usize), exact_logits);
-        assert_output_tails(&buffers, 1);
+        for num_active_rows in [1_u32, 8, 3, 7, 2, 6, 4, 5] {
+            assert_eq!(replay.record(&runtime, &input), (recorded_key.clone(), true));
+            runtime
+                .submit_replay_with_arguments(
+                    replay.replay(&recorded_key),
+                    &ReplayArguments::new().with_u32(QWEN35_GATHER_UNEMBED_NUM_ACTIVE_ROWS, num_active_rows),
+                )
+                .wait();
 
-        buffers.fill_outputs(OUTPUT_CANARY);
-        buffers.write_active_inputs(2);
-        runtime
-            .submit_replay_with_arguments(replay.replay(&recorded_key), &active_two_arguments)
-            .wait();
-        assert_output_tails(&buffers, 2);
+            let gathered = buffers.gathered_reference(num_active_rows as usize);
+            let hidden_values = num_active_rows as usize * HIDDEN_DIM as usize;
+            let actual_hidden = buffers.hidden_output.read_typed::<u16>(0, hidden_values);
+            let expected_hidden = gathered
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_hidden, expected_hidden);
 
-        buffers.fill_outputs(OUTPUT_CANARY);
-        buffers.write_active_inputs(1);
-        runtime
-            .submit_replay_with_arguments(replay.replay(&recorded_key), &active_one_arguments)
-            .wait();
-        assert_eq!(
-            buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize),
-            exact_hidden
-        );
-        assert_eq!(buffers.logits.read_typed::<u16>(0, VOCAB_SIZE as usize), exact_logits);
-        assert_output_tails(&buffers, 1);
+            let expected_logits = quantized_affine_reference(
+                QuantizedAffineReferenceShape {
+                    num_rows: num_active_rows as usize,
+                    output_dim: VOCAB_SIZE as usize,
+                    input_dim: HIDDEN_DIM as usize,
+                    group_size: GROUP_SIZE as usize,
+                    bits: 8,
+                },
+                &gathered,
+                &weights.weight,
+                &weights.scales,
+                &weights.biases,
+            );
+            let actual_logits = buffers
+                .logits
+                .read_typed::<u16>(0, num_active_rows as usize * VOCAB_SIZE as usize)
+                .into_iter()
+                .map(|bits| bf16::from_bits(bits).to_f32())
+                .collect::<Vec<_>>();
+            assert_close(&actual_logits, &expected_logits, 0.125);
+        }
     }
 
     struct TestBuffers {
@@ -321,23 +262,31 @@ mod tests {
         row_indices: Buffer,
         hidden_output: Buffer,
         logits: Buffer,
+        hidden_values: Vec<f32>,
+        row_index_values: Vec<u32>,
     }
 
     impl TestBuffers {
         fn new(device: &Device) -> Self {
+            let hidden_values = (0..MAX_ROWS as usize * HIDDEN_DIM as usize)
+                .map(|index| bf16::from_f32(((index * 19 + 7) % 113) as f32 * 0.015_625 - 0.75).to_f32())
+                .collect::<Vec<_>>();
+            let hidden_bits = hidden_values
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>();
+            let row_index_values = vec![7, 1, 15, 3, 20, 0, 31, 9];
             Self {
-                hidden_input: Buffer::new_zeroed_elements(
-                    device,
-                    MAX_ROWS as usize * HIDDEN_DIM as usize,
-                    Dtype::Bfloat16,
-                ),
-                row_indices: Buffer::new_zeroed_elements(device, MAX_ROWS, Dtype::Uint32),
+                hidden_input: Buffer::from_slice(device, &hidden_bits),
+                row_indices: Buffer::from_slice(device, &row_index_values),
                 hidden_output: Buffer::new_zeroed_elements(
                     device,
                     MAX_ROWS as usize * HIDDEN_DIM as usize,
                     Dtype::Bfloat16,
                 ),
                 logits: Buffer::new_zeroed_elements(device, MAX_ROWS as usize * VOCAB_SIZE as usize, Dtype::Bfloat16),
+                hidden_values,
+                row_index_values,
             }
         }
 
@@ -351,81 +300,23 @@ mod tests {
             }
         }
 
-        fn write_active_inputs(&self, num_active_rows: u32) {
-            let mut hidden = vec![OUTPUT_CANARY; MAX_ROWS as usize * HIDDEN_DIM as usize];
-            hidden[..num_active_rows as usize * HIDDEN_DIM as usize].fill(0);
-            self.hidden_input.write_typed(0, &hidden);
-            let mut indices = vec![u32::MAX; MAX_ROWS as usize];
-            for (row, index) in indices.iter_mut().take(num_active_rows as usize).enumerate() {
-                *index = row as u32;
+        fn gathered_reference(&self, num_active_rows: usize) -> Vec<f32> {
+            let mut output = Vec::with_capacity(num_active_rows * HIDDEN_DIM as usize);
+            for &row_index in &self.row_index_values[..num_active_rows] {
+                let begin = row_index as usize * HIDDEN_DIM as usize;
+                output.extend_from_slice(&self.hidden_values[begin..begin + HIDDEN_DIM as usize]);
             }
-            self.row_indices.write_typed(0, &indices);
-        }
-
-        fn fill_outputs(&self, value: u16) {
-            for buffer in [&self.hidden_output, &self.logits] {
-                buffer.write_typed(0, &vec![value; buffer.len_bytes() / size_of::<u16>()]);
-            }
+            output
         }
     }
 
-    fn assert_output_tails(buffers: &TestBuffers, num_active_rows: usize) {
-        for (buffer, num_values_per_row) in [
-            (&buffers.hidden_output, HIDDEN_DIM as usize),
-            (&buffers.logits, VOCAB_SIZE as usize),
-        ] {
-            let values = buffer.read_typed::<u16>(0, buffer.len_bytes() / size_of::<u16>());
-            let active_values = num_active_rows * num_values_per_row;
-            assert!(values[..active_values].iter().all(|&value| value == 0));
-            assert!(values[active_values..].iter().all(|&value| value == OUTPUT_CANARY));
-        }
+    struct TestUnembedWeights {
+        weight: Vec<u8>,
+        scales: Vec<f32>,
+        biases: Vec<f32>,
     }
 
-    fn test_component(device: &Device) -> Qwen35GatherUnembed {
-        const FILE_NAME: &str = "model.safetensors";
-        let weight_bytes = VOCAB_SIZE as usize * HIDDEN_DIM as usize;
-        let affine_elements = VOCAB_SIZE as usize * HIDDEN_DIM as usize / GROUP_SIZE as usize;
-        let tensors = HashMap::from([
-            (
-                WEIGHT.to_string(),
-                OwnedTensor {
-                    dtype: SafeTensorDtype::U32,
-                    shape: vec![weight_bytes / size_of::<u32>()],
-                    data: vec![0; weight_bytes],
-                },
-            ),
-            (
-                SCALES.to_string(),
-                OwnedTensor {
-                    dtype: SafeTensorDtype::BF16,
-                    shape: vec![affine_elements],
-                    data: vec![0; affine_elements * size_of::<u16>()],
-                },
-            ),
-            (
-                BIASES.to_string(),
-                OwnedTensor {
-                    dtype: SafeTensorDtype::BF16,
-                    shape: vec![affine_elements],
-                    data: vec![0; affine_elements * size_of::<u16>()],
-                },
-            ),
-        ]);
-        let model_dir = TempModelDir::new();
-        serialize_to_file(
-            tensors.iter().map(|(name, tensor)| (name.as_str(), tensor)),
-            None,
-            &model_dir.0.join(FILE_NAME),
-        )
-        .unwrap();
-        let index = SafeTensorIndex::new(
-            tensors
-                .keys()
-                .map(|name| (name.clone(), FILE_NAME.to_string()))
-                .collect(),
-        )
-        .unwrap();
-        let mut store = SafeTensorStore::new(&model_dir.0, index);
+    fn fixture_component(device: &Device) -> (Qwen35GatherUnembed, TestUnembedWeights) {
         let config = UnembedConfig {
             max_tokens: MAX_ROWS,
             vocab_size: VOCAB_SIZE,
@@ -436,18 +327,20 @@ mod tests {
             output_dtype: Dtype::Bfloat16,
             scale_bias_dtype: Dtype::Bfloat16,
         };
-        let mut unembed = Unembed::new(device, config);
-        unembed
-            .load_weights(
-                device,
-                &mut store,
-                QuantizedTensorBindings {
-                    weight: WEIGHT.to_string(),
-                    scales: SCALES.to_string(),
-                    biases: BIASES.to_string(),
-                },
-            )
-            .unwrap();
-        Qwen35GatherUnembed::new(device, config.hidden_dim, Rc::new(unembed))
+        let (unembed, weight, scales, biases) = fixture_unembed(device, config);
+        (
+            Qwen35GatherUnembed::new(device, config.hidden_dim, Rc::new(unembed)),
+            TestUnembedWeights { weight, scales, biases },
+        )
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "value mismatch at index={index}: actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
     }
 }

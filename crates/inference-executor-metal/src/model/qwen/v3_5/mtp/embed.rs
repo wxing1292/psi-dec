@@ -247,14 +247,6 @@ impl Qwen35MTPEmbed {
         output
     }
 
-    #[cfg(test)]
-    fn record_reference<'a, R>(&'a self, recorder: &mut R, args: Qwen35MTPEmbedArgs<'a>) -> &'a Buffer
-    where
-        R: Recorder<'a, Operator = ReplayOp<'a>>,
-    {
-        self.record(recorder, args.num_tokens, ReplayU32::Fixed(args.num_tokens), args)
-    }
-
     pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen35MTPEmbedReplayKey, ReplayArguments) {
         let key = self.replay_key_for_active_tokens(num_active_tokens);
         let arguments = ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens);
@@ -443,9 +435,14 @@ mod tests {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
+    use half::bf16;
     use inference_backend_metal::metal::Stream;
     use inference_executor_core::checkpoint::QuantizedTensorBindings;
     use inference_executor_core::checkpoint::SafeTensorIndex;
+    use inference_executor_core::mlp::dense::reference::QuantizedAffineReferenceShape;
+    use inference_executor_core::mlp::dense::reference::quantized_affine_reference;
+    use inference_executor_core::mlp::dense::reference::quantized_affine_weight_row_reference;
+    use inference_executor_core::reference::rms_norm_reference;
     use safetensors::Dtype as SafeTensorDtype;
     use safetensors::tensor::View;
     use safetensors::tensor::serialize_to_file;
@@ -459,7 +456,8 @@ mod tests {
     const VOCAB_SIZE: u32 = 32;
     const HIDDEN_DIM: u32 = 32;
     const GROUP_SIZE: u32 = 32;
-    const OUTPUT_CANARY: u16 = 0x7fc1;
+    const NUM_TOTAL_TOKENS: u32 = 8;
+    const EPS: f32 = 1.0e-6;
 
     const EMBED_WEIGHT: &str = "embed.weight";
     const EMBED_SCALES: &str = "embed.scales";
@@ -510,48 +508,48 @@ mod tests {
     }
 
     #[test]
-    fn test_bucketed_replay_matches_fixed_capacity_reference_and_preserves_tails_across_grow_and_shrink() {
+    fn test_replay_matches_cpu_reference_across_active_counts() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
-        let component = fixture_component(&device);
+        let (component, weights) = fixture_component(&device);
         let buffers = TestBuffers::new(&device);
+        let input = buffers.input(NUM_TOTAL_TOKENS);
+        let mut replay = Replay::new("qwen3.5 MTPEmbed component test", component);
+        let (recorded_key, cache_hit) = replay.record(&runtime, &input);
+        assert!(!cache_hit);
 
-        buffers.fill_stage_outputs(&component, OUTPUT_CANARY);
-        buffers.write_active_inputs(3);
-        let mut reference_recorder = runtime.create_recorder();
-        component.record_reference(&mut reference_recorder, buffers.input(3));
-        let reference_replay = reference_recorder.build();
-        runtime.submit_replay(&reference_replay).wait();
-        let reference_output = buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize * 3);
+        for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+            assert_eq!(replay.record(&runtime, &input), (recorded_key.clone(), true));
+            runtime
+                .submit_replay_with_arguments(
+                    replay.replay(&recorded_key),
+                    &ReplayArguments::new().with_u32(QWEN35_MTP_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens as u32),
+                )
+                .wait();
 
-        buffers.fill_stage_outputs(&component, OUTPUT_CANARY);
-        buffers.write_active_inputs(3);
-        let (_, active_three_arguments) = component.prepare_replay(3);
-        let (_, active_four_arguments) = component.prepare_replay(4);
-        let mut replay = Replay::new("qwen3.5 MTPEmbed test", component);
-        let (recorded_key, _) = replay.record(&runtime, &buffers.input(3));
-        runtime
-            .submit_replay_with_arguments(replay.replay(&recorded_key), &active_three_arguments)
-            .wait();
-        assert_eq!(
-            buffers.hidden_output.read_typed::<u16>(0, HIDDEN_DIM as usize * 3),
-            reference_output
-        );
-        assert_stage_output_tails(replay.component(), &buffers, 3);
-
-        buffers.write_active_inputs(4);
-        runtime
-            .submit_replay_with_arguments(replay.replay(&recorded_key), &active_four_arguments)
-            .wait();
-        assert_stage_output_tails(replay.component(), &buffers, 4);
-
-        buffers.fill_stage_outputs(replay.component(), OUTPUT_CANARY);
-        buffers.write_active_inputs(3);
-        runtime
-            .submit_replay_with_arguments(replay.replay(&recorded_key), &active_three_arguments)
-            .wait();
-        assert_stage_output_tails(replay.component(), &buffers, 3);
+            let gathered = buffers.gathered_reference(num_active_tokens);
+            assert_bf16_close(
+                &buffers.prev_hidden_input,
+                &gathered,
+                num_active_tokens * HIDDEN_DIM as usize,
+                0.0,
+            );
+            let embeddings = buffers.embedding_reference(num_active_tokens, &weights);
+            assert_bf16_close(
+                &buffers.token_hidden_input,
+                &embeddings,
+                num_active_tokens * HIDDEN_DIM as usize,
+                0.0,
+            );
+            let expected = projection_reference(num_active_tokens, &gathered, &embeddings, &weights);
+            assert_bf16_close(
+                &buffers.hidden_output,
+                &expected,
+                num_active_tokens * HIDDEN_DIM as usize,
+                0.125,
+            );
+        }
     }
 
     struct TestBuffers {
@@ -561,18 +559,33 @@ mod tests {
         token_ids: Buffer,
         token_hidden_input: Buffer,
         hidden_output: Buffer,
+        prev_hidden_values: Vec<f32>,
+        prev_hidden_index_values: Vec<u32>,
+        token_id_values: Vec<u32>,
     }
 
     impl TestBuffers {
         fn new(device: &Device) -> Self {
             let hidden_elements = MAX_TOKENS as usize * HIDDEN_DIM as usize;
+            let prev_hidden_values = (0..hidden_elements)
+                .map(|index| bf16::from_f32(((index * 19 + 7) % 101) as f32 * 0.015_625 - 0.75).to_f32())
+                .collect::<Vec<_>>();
+            let prev_hidden_bits = prev_hidden_values
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>();
+            let prev_hidden_index_values = vec![7, 1, 15, 3, 20, 0, 31, 9];
+            let token_id_values = vec![4, 17, 2, 29, 11, 0, 23, 8];
             Self {
-                prev_hidden_source: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
-                prev_hidden_indices: Buffer::new_zeroed_elements(device, MAX_TOKENS, Dtype::Uint32),
+                prev_hidden_source: Buffer::from_slice(device, &prev_hidden_bits),
+                prev_hidden_indices: Buffer::from_slice(device, &prev_hidden_index_values),
                 prev_hidden_input: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
-                token_ids: Buffer::new_zeroed_elements(device, MAX_TOKENS, Dtype::Int32),
+                token_ids: Buffer::from_slice(device, &token_id_values),
                 token_hidden_input: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
                 hidden_output: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
+                prev_hidden_values,
+                prev_hidden_index_values,
+                token_id_values,
             }
         }
 
@@ -588,48 +601,53 @@ mod tests {
             }
         }
 
-        fn write_active_inputs(&self, num_active_tokens: u32) {
-            let mut indices = vec![u32::MAX; MAX_TOKENS as usize];
-            let mut token_ids = vec![u32::MAX; MAX_TOKENS as usize];
-            for index in 0..num_active_tokens as usize {
-                indices[index] = index as u32;
-                token_ids[index] = 0;
+        fn gathered_reference(&self, num_active_tokens: usize) -> Vec<f32> {
+            let mut output = Vec::with_capacity(num_active_tokens * HIDDEN_DIM as usize);
+            for &row_index in &self.prev_hidden_index_values[..num_active_tokens] {
+                let begin = row_index as usize * HIDDEN_DIM as usize;
+                output.extend_from_slice(&self.prev_hidden_values[begin..begin + HIDDEN_DIM as usize]);
             }
-            self.prev_hidden_indices.write_typed(0, &indices);
-            self.token_ids.write_typed(0, &token_ids);
+            output
         }
 
-        fn fill_stage_outputs(&self, component: &Qwen35MTPEmbed, value: u16) {
-            for buffer in [
-                &self.prev_hidden_input,
-                &self.token_hidden_input,
-                &self.hidden_output,
-                &component.normed_hidden,
-                &component.normed_embedding,
-                &component.fused_input,
-            ] {
-                buffer.write_typed(0, &vec![value; buffer.len_bytes() / size_of::<u16>()]);
+        fn embedding_reference(&self, num_active_tokens: usize, weights: &TestWeights) -> Vec<f32> {
+            let shape = QuantizedAffineReferenceShape {
+                num_rows: 1,
+                output_dim: VOCAB_SIZE as usize,
+                input_dim: HIDDEN_DIM as usize,
+                group_size: GROUP_SIZE as usize,
+                bits: 8,
+            };
+            let mut output = Vec::with_capacity(num_active_tokens * HIDDEN_DIM as usize);
+            for &token_id in &self.token_id_values[..num_active_tokens] {
+                output.extend(
+                    quantized_affine_weight_row_reference(
+                        shape,
+                        token_id as usize,
+                        &weights.embed_weight,
+                        &weights.embed_scales,
+                        &weights.embed_biases,
+                    )
+                    .into_iter()
+                    .map(|value| bf16::from_f32(value).to_f32()),
+                );
             }
+            output
         }
     }
 
-    fn assert_stage_output_tails(component: &Qwen35MTPEmbed, buffers: &TestBuffers, num_active_tokens: usize) {
-        for (buffer, num_values_per_row) in [
-            (&buffers.prev_hidden_input, HIDDEN_DIM as usize),
-            (&buffers.token_hidden_input, HIDDEN_DIM as usize),
-            (&buffers.hidden_output, HIDDEN_DIM as usize),
-            (&component.normed_hidden, HIDDEN_DIM as usize),
-            (&component.normed_embedding, HIDDEN_DIM as usize),
-            (&component.fused_input, HIDDEN_DIM as usize * 2),
-        ] {
-            let values = buffer.read_typed::<u16>(0, buffer.len_bytes() / size_of::<u16>());
-            let active_values = num_active_tokens * num_values_per_row;
-            assert!(values[..active_values].iter().all(|&value| value == 0));
-            assert!(values[active_values..].iter().all(|&value| value == OUTPUT_CANARY));
-        }
+    struct TestWeights {
+        embed_weight: Vec<u8>,
+        embed_scales: Vec<f32>,
+        embed_biases: Vec<f32>,
+        hidden_norm: Vec<f32>,
+        embedding_norm: Vec<f32>,
+        projection_weight: Vec<u8>,
+        projection_scales: Vec<f32>,
+        projection_biases: Vec<f32>,
     }
 
-    fn fixture_component(device: &Device) -> Qwen35MTPEmbed {
+    fn fixture_component(device: &Device) -> (Qwen35MTPEmbed, TestWeights) {
         const FILE_NAME: &str = "model.safetensors";
         let fc_config = affine_quantized::Config {
             n: HIDDEN_DIM as i32,
@@ -642,18 +660,19 @@ mod tests {
         };
         let embed_weight_bytes = VOCAB_SIZE as usize * HIDDEN_DIM as usize;
         let embed_affine_elements = VOCAB_SIZE as usize * HIDDEN_DIM as usize / GROUP_SIZE as usize;
+        let embed_weight = (0..embed_weight_bytes)
+            .map(|index| ((index * 17 + 3) % 251) as u8)
+            .collect::<Vec<_>>();
+        let embed_scales = (0..embed_affine_elements)
+            .map(|index| bf16::from_f32(0.003_906_25 + (index % 7) as f32 * 0.000_244_140_63).to_f32())
+            .collect::<Vec<_>>();
+        let embed_biases = (0..embed_affine_elements)
+            .map(|index| bf16::from_f32((index as f32 - 16.0) * 0.000_976_562_5).to_f32())
+            .collect::<Vec<_>>();
         let tensors = HashMap::from([
-            zero_tensor(EMBED_WEIGHT, SafeTensorDtype::U32, embed_weight_bytes),
-            zero_tensor(
-                EMBED_SCALES,
-                SafeTensorDtype::BF16,
-                embed_affine_elements * size_of::<u16>(),
-            ),
-            zero_tensor(
-                EMBED_BIASES,
-                SafeTensorDtype::BF16,
-                embed_affine_elements * size_of::<u16>(),
-            ),
+            owned_tensor(EMBED_WEIGHT, SafeTensorDtype::U32, embed_weight.clone()),
+            owned_tensor(EMBED_SCALES, SafeTensorDtype::BF16, bf16_bytes(&embed_scales)),
+            owned_tensor(EMBED_BIASES, SafeTensorDtype::BF16, bf16_bytes(&embed_biases)),
         ]);
         let model_dir = TempModelDir::new();
         serialize_to_file(
@@ -697,11 +716,27 @@ mod tests {
         let fc = affine_quantized::Matmul::new(device, fc_config);
         let replay_bucket_policy = ReplayBucketPolicy::with_topology_boundaries(MAX_TOKENS, &fc.topology_boundaries());
         let hidden_elements = MAX_TOKENS as usize * HIDDEN_DIM as usize;
-        let mut hidden_norm = RMSNorm::new(device, HIDDEN_DIM as usize, 1e-6);
-        hidden_norm.load_weights(Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16));
-        let mut embedding_norm = RMSNorm::new(device, HIDDEN_DIM as usize, 1e-6);
-        embedding_norm.load_weights(Buffer::new_zeroed_elements(device, HIDDEN_DIM, Dtype::Bfloat16));
-        Qwen35MTPEmbed {
+        let hidden_norm_values = (0..HIDDEN_DIM)
+            .map(|index| bf16::from_f32(0.75 + index as f32 * 0.007_812_5).to_f32())
+            .collect::<Vec<_>>();
+        let embedding_norm_values = (0..HIDDEN_DIM)
+            .map(|index| bf16::from_f32(1.125 - index as f32 * 0.003_906_25).to_f32())
+            .collect::<Vec<_>>();
+        let mut hidden_norm = RMSNorm::new(device, HIDDEN_DIM as usize, EPS);
+        hidden_norm.load_weights(bf16_buffer(device, &hidden_norm_values));
+        let mut embedding_norm = RMSNorm::new(device, HIDDEN_DIM as usize, EPS);
+        embedding_norm.load_weights(bf16_buffer(device, &embedding_norm_values));
+        let projection_weight = (0..fc_config.weight_bytes())
+            .map(|index| ((index * 29 + 11) % 251) as u8)
+            .collect::<Vec<_>>();
+        let num_projection_affine_values = fc_config.scale_or_bias_bytes() / size_of::<u16>();
+        let projection_scales = (0..num_projection_affine_values)
+            .map(|index| bf16::from_f32(0.000_244_140_63 + (index % 5) as f32 * 0.000_030_517_578).to_f32())
+            .collect::<Vec<_>>();
+        let projection_biases = (0..num_projection_affine_values)
+            .map(|index| bf16::from_f32(-0.000_122_070_31 + (index % 3) as f32 * 0.000_030_517_578).to_f32())
+            .collect::<Vec<_>>();
+        let component = Qwen35MTPEmbed {
             embed: Some(embed),
             input_gather: Gather::new(device, HIDDEN_DIM),
             hidden_norm,
@@ -714,18 +749,113 @@ mod tests {
             ),
             fc,
             projection_weights: Some(Qwen35MTPProjectionWeights {
-                weight: Buffer::new_zeroed(device, fc_config.weight_bytes()),
-                scales: Buffer::new_zeroed(device, fc_config.scale_or_bias_bytes()),
-                biases: Buffer::new_zeroed(device, fc_config.scale_or_bias_bytes()),
+                weight: Buffer::from_slice(device, &projection_weight),
+                scales: bf16_buffer(device, &projection_scales),
+                biases: bf16_buffer(device, &projection_biases),
             }),
             normed_hidden: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             normed_embedding: Buffer::new_zeroed_elements(device, hidden_elements, Dtype::Bfloat16),
             fused_input: Buffer::new_zeroed_elements(device, hidden_elements * 2, Dtype::Bfloat16),
             replay_bucket_policy,
+        };
+        (
+            component,
+            TestWeights {
+                embed_weight,
+                embed_scales,
+                embed_biases,
+                hidden_norm: hidden_norm_values,
+                embedding_norm: embedding_norm_values,
+                projection_weight,
+                projection_scales,
+                projection_biases,
+            },
+        )
+    }
+
+    fn projection_reference(
+        num_active_tokens: usize,
+        gathered: &[f32],
+        embeddings: &[f32],
+        weights: &TestWeights,
+    ) -> Vec<f32> {
+        let normed_hidden = rms_norm_reference(
+            gathered,
+            &weights.hidden_norm,
+            None,
+            num_active_tokens,
+            HIDDEN_DIM as usize,
+            EPS,
+        )
+        .into_iter()
+        .map(|value| bf16::from_f32(value).to_f32())
+        .collect::<Vec<_>>();
+        let normed_embeddings = rms_norm_reference(
+            embeddings,
+            &weights.embedding_norm,
+            None,
+            num_active_tokens,
+            HIDDEN_DIM as usize,
+            EPS,
+        )
+        .into_iter()
+        .map(|value| bf16::from_f32(value).to_f32())
+        .collect::<Vec<_>>();
+        let mut fused = Vec::with_capacity(num_active_tokens * HIDDEN_DIM as usize * 2);
+        for row_index in 0..num_active_tokens {
+            let begin = row_index * HIDDEN_DIM as usize;
+            let end = begin + HIDDEN_DIM as usize;
+            fused.extend_from_slice(&normed_embeddings[begin..end]);
+            fused.extend_from_slice(&normed_hidden[begin..end]);
+        }
+        quantized_affine_reference(
+            QuantizedAffineReferenceShape {
+                num_rows: num_active_tokens,
+                output_dim: HIDDEN_DIM as usize,
+                input_dim: HIDDEN_DIM as usize * 2,
+                group_size: GROUP_SIZE as usize,
+                bits: 8,
+            },
+            &fused,
+            &weights.projection_weight,
+            &weights.projection_scales,
+            &weights.projection_biases,
+        )
+    }
+
+    fn assert_bf16_close(buffer: &Buffer, expected: &[f32], num_values: usize, tolerance: f32) {
+        let actual = buffer
+            .read_typed::<u16>(0, num_values)
+            .into_iter()
+            .map(|bits| bf16::from_bits(bits).to_f32())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "value mismatch at index={index}: actual={actual} expected={expected} tolerance={tolerance}"
+            );
         }
     }
 
-    fn zero_tensor(name: &str, dtype: SafeTensorDtype, num_bytes: usize) -> (String, OwnedTensor) {
+    fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
+        Buffer::from_slice(
+            device,
+            &values
+                .iter()
+                .map(|value| bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn owned_tensor(name: &str, dtype: SafeTensorDtype, data: Vec<u8>) -> (String, OwnedTensor) {
         let item_size = match dtype {
             SafeTensorDtype::U32 => size_of::<u32>(),
             SafeTensorDtype::BF16 => size_of::<u16>(),
@@ -735,8 +865,8 @@ mod tests {
             name.to_string(),
             OwnedTensor {
                 dtype,
-                shape: vec![num_bytes / item_size],
-                data: vec![0; num_bytes],
+                shape: vec![data.len() / item_size],
+                data,
             },
         )
     }

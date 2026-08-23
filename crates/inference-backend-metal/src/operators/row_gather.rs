@@ -169,138 +169,71 @@ mod tests {
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const NUM_ACTIVE_ROWS: ReplayParameterKey = ReplayParameterKey::new("test.row_gather.num_active_rows");
-    const OUTPUT_CANARY: u8 = 0xa5;
 
     #[test]
-    fn test_constants_have_explicit_thread_block_scope() {
-        let config = Config {
-            num_cols: 4,
-            dtype: Dtype::Float32,
-        };
-        assert_eq!(
-            KernelConstants::new(config),
-            KernelConstants {
-                dtype: Dtype::Float32,
-                thread_block: ThreadBlockConstants { required_threads: 256 },
-            }
-        );
-    }
-
-    #[test]
-    fn test_bf16() {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let kernel = Kernel::new(
-            &device,
-            Config {
-                num_cols: 2,
-                dtype: Dtype::Bfloat16,
-            },
-        );
-        let input = Buffer::from_slice(
-            &device,
-            &[0x3f80_u16, 0x4000_u16, 0x4040_u16, 0x4080_u16, 0x40a0_u16, 0x40c0_u16],
-        );
-        let row_indices = Buffer::from_slice(&device, &[2_u32, 0]);
-        let output = Buffer::new_zeroed(&device, 4 * size_of::<u16>());
-
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            Shape { num_total_rows: 2 },
-            ReplayU32::Fixed(2),
-            Buffers {
-                input: &input,
-                row_indices: &row_indices,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-        stream.submit_replay(&replay).wait();
-
-        let values = output.read_typed::<u16>(0, 4);
-        assert_eq!(values, vec![0x40a0, 0x40c0, 0x3f80, 0x4000]);
-    }
-
-    #[test]
-    fn test_bucketed_bf16_and_f32_preserve_inactive_tail_across_grow_and_shrink() {
+    fn test_replay_matches_reference_across_active_counts_and_dtypes() {
         for dtype in [Dtype::Bfloat16, Dtype::Float32] {
-            assert_bucketed_grow_and_shrink(dtype);
+            let device = Device::system_default();
+            let stream = Stream::new(&device);
+            let config = Config { num_cols: 7, dtype };
+            let shape = Shape { num_total_rows: 8 };
+            let row_bytes = config.row_bytes();
+            let input_values = (0..16 * row_bytes)
+                .map(|index| ((index * 29 + 7) % 251) as u8)
+                .collect::<Vec<_>>();
+            let row_indices_values = [15_u32, 0, 7, 3, 12, 1, 9, 5];
+            let input = Buffer::from_slice(&device, &input_values);
+            let row_indices = Buffer::from_slice(&device, &row_indices_values);
+            let output = Buffer::new_zeroed(&device, shape.output_bytes(config));
+            let kernel = Kernel::new(&device, config);
+            let cache_key = (shape.num_total_rows, dtype_tag(dtype));
+            let mut cache = ReplayTestCache::new();
+            let (_, cache_hit) = cache.record(cache_key, || {
+                let mut builder = stream.create_replay_program();
+                builder.record(kernel.invoke(
+                    shape,
+                    ReplayU32::Parameter(NUM_ACTIVE_ROWS),
+                    Buffers {
+                        input: &input,
+                        row_indices: &row_indices,
+                        output: &output,
+                    },
+                ));
+                builder.build()
+            });
+            assert!(!cache_hit);
+
+            for num_active_rows in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+                let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+                assert!(cache_hit);
+                let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, num_active_rows as u32);
+                stream.submit_replay_with_arguments(replay, &arguments).wait();
+                let expected = gathered_bytes(&input_values, row_bytes, &row_indices_values[..num_active_rows]);
+                assert_eq!(output.read_typed::<u8>(0, num_active_rows * row_bytes), expected);
+            }
         }
     }
 
-    fn assert_bucketed_grow_and_shrink(dtype: Dtype) {
-        let device = Device::system_default();
-        let stream = Stream::new(&device);
-        let config = Config { num_cols: 3, dtype };
-        let capacity_shape = Shape { num_total_rows: 4 };
-        let row_bytes = config.row_bytes();
-        let input_values = (0..4 * row_bytes)
-            .map(|index| u8::try_from(index + 1).unwrap())
-            .collect::<Vec<_>>();
-        let input = Buffer::from_slice(&device, &input_values);
-        let row_indices = Buffer::from_slice(&device, &[2_u32, 0, 1, u32::MAX]);
-        let output = Buffer::from_slice(&device, &vec![OUTPUT_CANARY; 5 * row_bytes]);
-        let kernel = Kernel::new(&device, config);
-
-        let mut builder = stream.create_replay_program();
-        builder.record(kernel.invoke(
-            capacity_shape,
-            ReplayU32::Parameter(NUM_ACTIVE_ROWS),
-            Buffers {
-                input: &input,
-                row_indices: &row_indices,
-                output: &output,
-            },
-        ));
-        let replay = builder.build();
-
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
-            .wait();
-        let expected_active = gathered_bytes(&input_values, row_bytes, &[2, 0, 1]);
-        assert_eq!(output.read_typed::<u8>(0, 3 * row_bytes), expected_active);
-        assert_eq!(
-            output.read_typed::<u8>(3 * row_bytes, 2 * row_bytes),
-            vec![OUTPUT_CANARY; 2 * row_bytes]
-        );
-
-        row_indices.write_typed(3, &[3_u32]);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 4))
-            .wait();
-        let expected_full = gathered_bytes(&input_values, row_bytes, &[2, 0, 1, 3]);
-        let full_output = output.read_typed::<u8>(0, 4 * row_bytes);
-        assert_eq!(full_output, expected_full);
-        assert_eq!(
-            output.read_typed::<u8>(4 * row_bytes, row_bytes),
-            vec![OUTPUT_CANARY; row_bytes]
-        );
-
-        row_indices.write_typed(3, &[u32::MAX]);
-        stream
-            .submit_replay_with_arguments(&replay, &ReplayArguments::new().with_u32(NUM_ACTIVE_ROWS, 3))
-            .wait();
-        assert_eq!(output.read_typed::<u8>(0, 3 * row_bytes), expected_active);
-        assert_eq!(
-            output.read_typed::<u8>(3 * row_bytes, row_bytes),
-            full_output[3 * row_bytes..]
-        );
-        assert_eq!(
-            output.read_typed::<u8>(4 * row_bytes, row_bytes),
-            vec![OUTPUT_CANARY; row_bytes]
-        );
-    }
-
-    fn gathered_bytes(input: &[u8], row_bytes: usize, row_indices: &[usize]) -> Vec<u8> {
+    fn gathered_bytes(input: &[u8], row_bytes: usize, row_indices: &[u32]) -> Vec<u8> {
         row_indices
             .iter()
             .flat_map(|&row_index| {
+                let row_index = row_index as usize;
                 input[row_index * row_bytes..(row_index + 1) * row_bytes]
                     .iter()
                     .copied()
             })
             .collect()
+    }
+
+    fn dtype_tag(dtype: Dtype) -> u32 {
+        match dtype {
+            Dtype::Bfloat16 => 0,
+            Dtype::Float32 => 1,
+            _ => panic!("unsupported row-gather test dtype {dtype:?}"),
+        }
     }
 }

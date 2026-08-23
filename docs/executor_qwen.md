@@ -1107,6 +1107,16 @@ Unit tests cover:
 - MTP cache-lane mapping and MTP, DSpark, and DFlash2 sparse rejection.
 - DSpark configuration, bindings, attention, Markov sampling, and page splitting.
 - DFlash2 configuration adaptation, exact bindings, per-row sliding ranges, convolution, selector, and page splitting.
+- Embed, RowGather, and Unembed active-row replay against CPU references.
+- Qwen3 and Qwen3.5 GatherUnembed composition for every active row count in one recorded capacity.
+- DSpark GatherUnembed request-major to step-major conversion and affine unembedding for every active request count.
+- Qwen3.5 MTPEmbed previous-hidden gather, token embedding, both norms, concatenation, and input projection with nonzero
+  weights for every active token count.
+
+The Qwen3, Qwen3.5, DSpark, and DFlash2 Embed owners only bind model-local replay keys around the shared `Embed` leaf.
+They do not duplicate its numerical test. DFlash2 Output has a candidate-selection contract instead of the
+GatherUnembed contract. Its Gather, Unembed, Top-K, codebook Embed, and selector leaves retain independent numerical
+coverage.
 
 End-to-end tests exercise Qwen3 Main-only and Qwen3 DSpark through server/decode.
 They also exercise Qwen3.5 Vanilla, MTP, and DSpark modes.
