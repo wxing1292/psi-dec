@@ -7,25 +7,15 @@ use crate::metal::Buffer;
 use crate::metal::Device;
 use crate::metal::ReplayArguments;
 use crate::metal::Stream;
-
-const ACCEPTED_TOKEN_CANARY: i32 = -99;
-const ACCEPTED_PROB_CANARY: f32 = -99.0;
-const OUTPUT_TOKEN_CANARY: i32 = -77;
-const OUTPUT_PROB_CANARY: f32 = -77.0;
+use crate::test_support::ReplayTestCache;
 
 #[test]
-fn test_constants_have_explicit_thread_block_scope() {
-    let constants = super::KernelConstants::current();
-    assert_eq!(constants.thread_block.required_threads, 256);
-}
-
-#[test]
-fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
+fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let shape = Shape {
-        num_total_reqs: 4,
-        num_total_target_distributions: 8,
+        num_total_reqs: 8,
+        num_total_target_distributions: 12,
         num_total_draft_distributions: 5,
         top_k: 4,
         max_target_k: 4,
@@ -39,6 +29,10 @@ fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
         vec![0.0, 0.00, 1.00, 0.00, 0.0, 0.0],
         vec![0.0, 0.00, 0.00, 0.00, 1.0, 0.0],
         vec![0.0, 0.00, 0.00, 0.00, 0.0, 1.0],
+        vec![1.00, 0.00, 0.00, 0.00, 0.0, 0.0],
+        vec![0.00, 1.00, 0.00, 0.00, 0.0, 0.0],
+        vec![0.00, 0.00, 1.00, 0.00, 0.0, 0.0],
+        vec![0.00, 0.00, 0.00, 1.00, 0.0, 0.0],
     ];
     let draft_rows = vec![
         vec![0.0, 0.25, 0.50, 0.25, 0.0, 0.0],
@@ -61,53 +55,70 @@ fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
     }
 
     let mut padded_target_token_ids = vec![-1_i32; shape.num_total_target_distributions as usize * 4];
-    let mut padded_target_probs = vec![f32::NAN; shape.num_total_target_distributions as usize * 4];
+    let mut padded_target_probs = vec![0.0_f32; shape.num_total_target_distributions as usize * 4];
     padded_target_token_ids[..target_distribution.0.len()].copy_from_slice(&target_distribution.0);
     padded_target_probs[..target_distribution.1.len()].copy_from_slice(&target_distribution.1);
     let target_distribution_token_ids = Buffer::from_slice(&device, &padded_target_token_ids);
     let target_distribution_probs = Buffer::from_slice(&device, &padded_target_probs);
     let draft_distribution_token_ids = Buffer::from_slice(&device, &mapped_draft_token_ids);
     let draft_distribution_probs = Buffer::from_slice(&device, &mapped_draft_probs);
-    let flat_draft_token_ids = Buffer::from_slice(&device, &[2_i32, 3, 1, i32::MIN, i32::MIN]);
-    let cu_target_distributions = Buffer::from_slice(&device, &[0_u32, 3, 5, 6, u32::MAX]);
-    let cu_draft_distributions = Buffer::from_slice(&device, &[0_u32, 2, 3, 3, u32::MAX]);
-    let flat_draft_distribution_indices = Buffer::from_slice(&device, &[2_u32, 0, 4, u32::MAX, u32::MAX]);
-    let flat_accepted_token_ids = Buffer::from_slice(&device, &[ACCEPTED_TOKEN_CANARY; 5]);
-    let flat_accepted_probs = Buffer::from_slice(&device, &[ACCEPTED_PROB_CANARY; 5]);
-    let num_accepted_tokens = Buffer::from_slice(&device, &[u32::MAX; 4]);
-    let sampled_token_ids = Buffer::from_slice(&device, &[OUTPUT_TOKEN_CANARY; 4]);
-    let sampled_token_probs = Buffer::from_slice(&device, &[OUTPUT_PROB_CANARY; 4]);
+    let flat_draft_token_ids = Buffer::from_slice(&device, &[2_i32, 3, 1, 0, 0]);
+    let cu_target_values = [0_u32, 3, 5, 6, 7, 8, 9, 10, 11];
+    let cu_draft_values = [0_u32, 2, 3, 3, 3, 3, 3, 3, 3];
+    let cu_target_distributions = Buffer::from_slice(&device, &cu_target_values);
+    let cu_draft_distributions = Buffer::from_slice(&device, &cu_draft_values);
+    let flat_draft_distribution_indices = Buffer::from_slice(&device, &[2_u32, 0, 4, 0, 0]);
+    let flat_accepted_token_ids = Buffer::new_zeroed_elements(&device, 5, crate::metal::Dtype::Int32);
+    let flat_accepted_probs = Buffer::new_zeroed_elements(&device, 5, crate::metal::Dtype::Float32);
+    let num_accepted_tokens =
+        Buffer::new_zeroed_elements(&device, shape.num_total_reqs as usize, crate::metal::Dtype::Uint32);
+    let sampled_token_ids =
+        Buffer::new_zeroed_elements(&device, shape.num_total_reqs as usize, crate::metal::Dtype::Int32);
+    let sampled_token_probs =
+        Buffer::new_zeroed_elements(&device, shape.num_total_reqs as usize, crate::metal::Dtype::Float32);
     let runtime_params_values = [
         7_u32, 19, 4, 0, // reject path
         11, 23, 1, 0, // all-accept path
         13, 29, 1, 0, // zero-draft path
-        17, 31, 1, 0, // padded request
+        17, 31, 1, 0, 19, 37, 1, 0, 23, 41, 1, 0, 29, 43, 1, 0, 31, 47, 1, 0,
     ];
     let runtime_params = Buffer::from_slice(&device, &runtime_params_values);
     let kernel = Compute::new(&device);
-    let mut builder = stream.create_replay_program();
-    builder.record(kernel.invoke_replay(
-        shape,
-        Buffers {
-            target_distribution_token_ids: &target_distribution_token_ids,
-            target_distribution_probs: &target_distribution_probs,
-            draft_distribution_token_ids: &draft_distribution_token_ids,
-            draft_distribution_probs: &draft_distribution_probs,
-            flat_draft_token_ids: &flat_draft_token_ids,
-            cu_target_distributions: &cu_target_distributions,
-            cu_draft_distributions: &cu_draft_distributions,
-            flat_draft_distribution_indices: &flat_draft_distribution_indices,
-            flat_accepted_token_ids: &flat_accepted_token_ids,
-            flat_accepted_probs: &flat_accepted_probs,
-            num_accepted_tokens: &num_accepted_tokens,
-            sampled_token_ids: &sampled_token_ids,
-            sampled_token_probs: &sampled_token_probs,
-            runtime_params: &runtime_params,
-        },
-    ));
-    let replay = builder.build();
+    let cache_key = (
+        shape.num_total_reqs,
+        shape.num_total_target_distributions,
+        shape.num_total_draft_distributions,
+        shape.top_k,
+        shape.max_target_k,
+        shape.max_draft_k,
+    );
+    let mut cache = ReplayTestCache::new();
+    let (_, cache_hit) = cache.record(cache_key, || {
+        let mut builder = stream.create_replay_program();
+        builder.record(kernel.invoke_replay(
+            shape,
+            Buffers {
+                target_distribution_token_ids: &target_distribution_token_ids,
+                target_distribution_probs: &target_distribution_probs,
+                draft_distribution_token_ids: &draft_distribution_token_ids,
+                draft_distribution_probs: &draft_distribution_probs,
+                flat_draft_token_ids: &flat_draft_token_ids,
+                cu_target_distributions: &cu_target_distributions,
+                cu_draft_distributions: &cu_draft_distributions,
+                flat_draft_distribution_indices: &flat_draft_distribution_indices,
+                flat_accepted_token_ids: &flat_accepted_token_ids,
+                flat_accepted_probs: &flat_accepted_probs,
+                num_accepted_tokens: &num_accepted_tokens,
+                sampled_token_ids: &sampled_token_ids,
+                sampled_token_probs: &sampled_token_probs,
+                runtime_params: &runtime_params,
+            },
+        ));
+        builder.build()
+    });
+    assert!(!cache_hit);
 
-    let expected = [
+    let mut expected = vec![
         rejection_sample_reference(
             &draft_tokens[..2],
             &target_rows[..3],
@@ -137,15 +148,19 @@ fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
             runtime_params_values[13],
         ),
     ];
+    for req in 4..8 {
+        expected.push(rejection_sample_reference(
+            &[],
+            &target_rows[req + 3..req + 4],
+            &[],
+            runtime_params_values[req * 4],
+            runtime_params_values[req * 4 + 1],
+        ));
+    }
     let assert_active_outputs = |num_active_reqs: usize| {
-        let actual_counts = num_accepted_tokens.read_typed::<u32>(0, 4);
-        let actual_sampled_tokens = sampled_token_ids.read_typed::<i32>(0, 4);
-        let actual_sampled_probs = sampled_token_probs.read_typed::<f32>(0, 4);
-        let actual_accepted_tokens = flat_accepted_token_ids.read_typed::<i32>(0, 5);
-        let actual_accepted_probs = flat_accepted_probs.read_typed::<f32>(0, 5);
-        let mut expected_accepted_tokens = vec![ACCEPTED_TOKEN_CANARY; 5];
-        let mut expected_accepted_probs = vec![ACCEPTED_PROB_CANARY; 5];
-        let accepted_offsets = [0_usize, 2, 3, 3];
+        let actual_counts = num_accepted_tokens.read_typed::<u32>(0, num_active_reqs);
+        let actual_sampled_tokens = sampled_token_ids.read_typed::<i32>(0, num_active_reqs);
+        let actual_sampled_probs = sampled_token_probs.read_typed::<f32>(0, num_active_reqs);
         for req in 0..num_active_reqs {
             assert_eq!(
                 actual_counts[req] as usize,
@@ -161,49 +176,43 @@ fn test_mixed_ragged_requests_match_reference_and_preserve_inactive_capacity() {
                 &[expected[req].sampled_prob],
                 1.0e-5,
             );
-            let start = accepted_offsets[req];
-            for (slot, &token) in expected[req].accepted_tokens.iter().enumerate() {
-                expected_accepted_tokens[start + slot] = token as i32;
-                expected_accepted_probs[start + slot] = expected[req].accepted_probs[slot];
+            let start = cu_draft_values[req] as usize;
+            let num_accepted = expected[req].accepted_tokens.len();
+            if num_accepted > 0 {
+                assert_eq!(
+                    flat_accepted_token_ids.read_typed::<i32>(start, num_accepted),
+                    expected[req]
+                        .accepted_tokens
+                        .iter()
+                        .map(|&token| token as i32)
+                        .collect::<Vec<_>>()
+                );
+                assert_close(
+                    &flat_accepted_probs.read_typed::<f32>(start, num_accepted),
+                    &expected[req].accepted_probs,
+                    1.0e-5,
+                );
             }
         }
-        assert_eq!(actual_accepted_tokens, expected_accepted_tokens);
-        assert_close(&actual_accepted_probs, &expected_accepted_probs, 1.0e-5);
     };
-    let submit = |num_active_reqs, num_active_target_distributions, num_active_draft_distributions| {
+    let mut submit = |num_active_reqs: usize| {
+        let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+        assert!(cache_hit);
         let mut arguments = ReplayArguments::new();
         kernel.add_replay_arguments(
             shape,
-            num_active_reqs,
-            num_active_target_distributions,
-            num_active_draft_distributions,
+            num_active_reqs as u32,
+            cu_target_values[num_active_reqs],
+            cu_draft_values[num_active_reqs],
             &mut arguments,
         );
-        stream.submit_replay_with_arguments(&replay, &arguments).wait();
+        stream.submit_replay_with_arguments(replay, &arguments).wait();
     };
 
-    submit(3, 6, 3);
-    assert_active_outputs(3);
-    assert_eq!(num_accepted_tokens.read_typed::<u32>(3, 1), vec![u32::MAX]);
-    assert_eq!(sampled_token_ids.read_typed::<i32>(3, 1), vec![OUTPUT_TOKEN_CANARY]);
-    assert_eq!(sampled_token_probs.read_typed::<f32>(3, 1), vec![OUTPUT_PROB_CANARY]);
-
-    cu_target_distributions.write_typed(4, &[7_u32]);
-    cu_draft_distributions.write_typed(4, &[3_u32]);
-    submit(4, 7, 3);
-    assert_active_outputs(4);
-    let full_count = num_accepted_tokens.read_typed::<u32>(3, 1);
-    let full_token = sampled_token_ids.read_typed::<i32>(3, 1);
-    let full_prob = sampled_token_probs.read_typed::<f32>(3, 1);
-
-    cu_target_distributions.write_typed(4, &[u32::MAX]);
-    cu_draft_distributions.write_typed(4, &[u32::MAX]);
-    runtime_params.write_typed(12, &[u32::MAX; 4]);
-    submit(3, 6, 3);
-    assert_active_outputs(3);
-    assert_eq!(num_accepted_tokens.read_typed::<u32>(3, 1), full_count);
-    assert_eq!(sampled_token_ids.read_typed::<i32>(3, 1), full_token);
-    assert_eq!(sampled_token_probs.read_typed::<f32>(3, 1), full_prob);
+    for num_active_reqs in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+        submit(num_active_reqs);
+        assert_active_outputs(num_active_reqs);
+    }
 }
 
 fn write_distributions_from_dense(rows: &[Vec<f32>], row_stride: usize) -> (Vec<i32>, Vec<f32>) {

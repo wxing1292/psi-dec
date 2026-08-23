@@ -392,17 +392,20 @@ The production path must keep the BF16 contract unless broader checkpoint eviden
 ## Correctness and benchmarks
 
 CPU references define sampling, rejection, and sequential DSpark Markov math.
-Focused Metal tests compare fixed and random distributions with these references.
-They also compare mixed per-row parameters and deterministic seed/domain behavior.
-The Top-K tests keep separate parity cases for reduction, bitonic, sample, write-distribution, and fused
-sample-and-write-distribution kernels.
-One top-k sampling replay records a total row capacity of `8` in an isolated test cache. It replays
-`1, 8, 3, 7, 2, 6, 4, 5` and compares each active row with the CPU sparse-sampling reference. The rows include greedy
-and stochastic sampling and the Target and Draft domains.
+Each Top-K API records a total row capacity of `8` in an isolated test cache.
+The Merge, Sample, WriteDistribution, and SampleAndWriteDistribution tests replay
+`1, 8, 3, 7, 2, 6, 4, 5` and compare each active logical output with a CPU reference.
+The Merge and Sample tests cover F32 and BF16 logits with reduction and bitonic Map topologies.
+The distribution tests cover F32 and BF16 bitonic Map topologies, mapped distribution slots, mixed per-row runtime
+parameters, deterministic sample positions, and Target and Draft domains.
+All Top-K tests use a nonzero logits row offset.
 One sparse rejection replay uses the same active-request sequence. It compares active accepted counts, sampled tokens,
 sampled probabilities, and accepted-token prefixes with the CPU rejection reference. The fixture covers rejection,
-all-accept, zero-draft, and non-contiguous draft-distribution mapping. Both tests ignore inactive output tails.
-The DSpark Markov parity test covers a padded replay bucket and non-contiguous request slots.
+all-accept, zero-draft, and non-contiguous draft-distribution mapping.
+The DSpark Markov parity test uses the production `Replay<T>` cache with exact request-stride keys and padded sampling
+capacities. It runs the same non-monotonic active sequence with non-contiguous request slots. It compares proposal
+tokens, probabilities, confidences, and sparse distributions with the sequential CPU reference.
+These tests do not use inactive output tails as an oracle.
 GPU tests run serially under the repository Metal reservation/lock rules.
 The `qwen3_dspark_sampling` benchmark prints proposal token IDs, exact proposal probability bits, and a stable
 fingerprint of the complete sparse draft distribution.

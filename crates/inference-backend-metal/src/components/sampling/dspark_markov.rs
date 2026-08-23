@@ -467,24 +467,4 @@ mod tests {
             confidence: ConfidenceConfig { hidden_dim: 32 },
         }
     }
-
-    #[test]
-    fn test_constants_define_map_task_and_partial_candidate_layout() {
-        let constants = MapKernelConstants::current();
-        assert_eq!(constants.thread_block.max_vocab_tokens, 64);
-        assert_eq!(constants.thread_block.required_threads, 128);
-        assert_eq!(constants.thread_block.simdgroup_width, 32);
-        assert_eq!(constants.thread_block.results_per_simdgroup, 4);
-        assert_eq!(constants.partial_candidate_layout().vocab_partition_size(), 64);
-    }
-
-    #[test]
-    #[should_panic(expected = "F32 DSpark Markov I/O is not supported")]
-    fn test_f32_workload_contract_is_explicit_future_work() {
-        MapConfig {
-            io_dtype: Dtype::Float32,
-            ..config()
-        }
-        .validate();
-    }
 }

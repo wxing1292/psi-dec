@@ -4,6 +4,7 @@ use super::*;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::Stream;
+use crate::test_support::ReplayTestCache;
 
 const TEST_NUM_ACTIVE_REQUESTS: ReplayParameterKey =
     ReplayParameterKey::new("test.dflash2_selector.num_active_requests");
@@ -60,44 +61,49 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
     let distribution_probs = Buffer::new_zeroed(&device, proposal_count * 4 * size_of::<f32>());
     let compute = Compute::new(&device, config);
     let active = ReplayU32::Parameter(TEST_NUM_ACTIVE_REQUESTS);
-    let mut builder = stream.create_replay_program();
-    builder.record(compute.invoke_predecessor_ids(
-        shape,
-        active,
-        PredecessorIdBuffers {
-            anchor_token_ids: &anchor_buffer,
-            candidate_token_ids: &candidate_buffer,
-            predecessor_token_ids: &predecessor_id_buffer,
-        },
-    ));
-    builder.record_with_barrier_before(compute.invoke_scores(
-        shape,
-        active,
-        ScoreBuffers {
-            candidate_logits: &logit_buffer,
-            projected_hidden: &hidden_buffer,
-            predecessor_embeddings: &predecessor_embedding_buffer,
-            successor_embeddings: &successor_embedding_buffer,
-            scores: &score_buffer,
-        },
-    ));
-    builder.record_with_barrier_before(compute.invoke_walk(
-        shape,
-        active,
-        WalkBuffers {
-            candidate_token_ids: &candidate_buffer,
-            scores: &score_buffer,
-            runtime_params: &runtime_params,
-            output_distribution_indices: &distribution_indices,
-            proposal_token_ids: &proposal_token_ids,
-            proposal_probs: &proposal_probs,
-            distribution_token_ids: &distribution_token_ids,
-            distribution_probs: &distribution_probs,
-            max_distribution_k: 4,
-            num_output_distributions: proposal_count as u32,
-        },
-    ));
-    let replay = builder.build();
+    let cache_key = (shape.num_total_requests, shape.num_steps, config.rank, config.top_k);
+    let mut cache = ReplayTestCache::new();
+    let (_, cache_hit) = cache.record(cache_key, || {
+        let mut builder = stream.create_replay_program();
+        builder.record(compute.invoke_predecessor_ids(
+            shape,
+            active,
+            PredecessorIdBuffers {
+                anchor_token_ids: &anchor_buffer,
+                candidate_token_ids: &candidate_buffer,
+                predecessor_token_ids: &predecessor_id_buffer,
+            },
+        ));
+        builder.record_with_barrier_before(compute.invoke_scores(
+            shape,
+            active,
+            ScoreBuffers {
+                candidate_logits: &logit_buffer,
+                projected_hidden: &hidden_buffer,
+                predecessor_embeddings: &predecessor_embedding_buffer,
+                successor_embeddings: &successor_embedding_buffer,
+                scores: &score_buffer,
+            },
+        ));
+        builder.record_with_barrier_before(compute.invoke_walk(
+            shape,
+            active,
+            WalkBuffers {
+                candidate_token_ids: &candidate_buffer,
+                scores: &score_buffer,
+                runtime_params: &runtime_params,
+                output_distribution_indices: &distribution_indices,
+                proposal_token_ids: &proposal_token_ids,
+                proposal_probs: &proposal_probs,
+                distribution_token_ids: &distribution_token_ids,
+                distribution_probs: &distribution_probs,
+                max_distribution_k: 4,
+                num_output_distributions: proposal_count as u32,
+            },
+        ));
+        builder.build()
+    });
+    assert!(!cache_hit);
     let expected_scores = score_reference(
         config,
         shape,
@@ -108,8 +114,10 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
     );
 
     for num_active_requests in [1, 8, 3, 7, 2, 6, 4, 5] {
+        let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+        assert!(cache_hit);
         let arguments = ReplayArguments::new().with_u32(TEST_NUM_ACTIVE_REQUESTS, num_active_requests);
-        stream.submit_replay_with_arguments(&replay, &arguments).wait();
+        stream.submit_replay_with_arguments(replay, &arguments).wait();
 
         let active_candidate_count = num_active_requests as usize * shape.num_steps as usize * config.top_k as usize;
         assert_eq!(

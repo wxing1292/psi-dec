@@ -547,8 +547,8 @@ Unit and Metal parity tests cover:
 - Bidirectional block attention
 - Combined history and block reduction
 - Static partial-scratch capacity
-- Sequential Markov sampling
-- Padded Markov replay buckets and non-contiguous request slots
+- Sequential Markov sampling across all request counts
+- Production Markov replay-cache keys, padded sampling capacities, and non-contiguous request slots
 - Ragged sparse rejection
 
 The block-SDPA replay test records a total Q-token-range capacity of `8`. It replays active counts

@@ -235,6 +235,7 @@ mod tests {
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayParameterKey;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     const TEST_NUM_ACTIVE_QUERY_BLOCKS: ReplayParameterKey =
         ReplayParameterKey::new("test.dynamic_grouped_conv.num_active_query_blocks");
@@ -272,26 +273,33 @@ mod tests {
         let hidden_buffer = Buffer::from_slice(&device, &hidden);
         let coefficient_buffer = Buffer::from_slice(&device, &coefficients);
         let base_buffer = Buffer::from_slice(&device, &base);
-        let output = Buffer::from_slice(&device, &vec![0x7fc1u16; hidden.len()]);
+        let output = Buffer::new_zeroed_elements(&device, hidden.len(), Dtype::Bfloat16);
         let compute = Compute::new(&device, config);
 
         for side in [Side::Prepare, Side::Finish] {
-            let mut builder = stream.create_replay_program();
-            builder.record(compute.invoke(
-                shape,
-                ReplayU32::Parameter(TEST_NUM_ACTIVE_QUERY_BLOCKS),
-                side,
-                Buffers {
-                    hidden: &hidden_buffer,
-                    projected_coefficients: &coefficient_buffer,
-                    base: &base_buffer,
-                    output: &output,
-                },
-            ));
-            let replay = builder.build();
+            let mut cache = ReplayTestCache::new();
+            let cache_key = shape.num_total_query_blocks;
+            let (_, cache_hit) = cache.record(cache_key, || {
+                let mut builder = stream.create_replay_program();
+                builder.record(compute.invoke(
+                    shape,
+                    ReplayU32::Parameter(TEST_NUM_ACTIVE_QUERY_BLOCKS),
+                    side,
+                    Buffers {
+                        hidden: &hidden_buffer,
+                        projected_coefficients: &coefficient_buffer,
+                        base: &base_buffer,
+                        output: &output,
+                    },
+                ));
+                builder.build()
+            });
+            assert!(!cache_hit);
             for &num_active_query_blocks in active_query_block_counts {
+                let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+                assert!(cache_hit);
                 let arguments = ReplayArguments::new().with_u32(TEST_NUM_ACTIVE_QUERY_BLOCKS, num_active_query_blocks);
-                stream.submit_replay_with_arguments(&replay, &arguments).wait();
+                stream.submit_replay_with_arguments(replay, &arguments).wait();
 
                 let expected = reference(
                     config,

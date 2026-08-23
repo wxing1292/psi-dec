@@ -265,9 +265,10 @@ Focused tests cover configuration adaptation, exact tensor manifests, independen
 ranges, dynamic grouped-convolution parity, candidate-selector parity, service mode normalization, and speculator
 mutual exclusion.
 
-The dynamic grouped-convolution and selector replay tests use test-owned active-work keys. Each test records a total
-capacity of `8`, replays `1, 8, 3, 7, 2, 6, 4, 5`, and compares the active output with its CPU reference. These tests
-prove that each leaf binds the caller-owned replay key instead of requiring a component-local key.
+The dynamic grouped-convolution and selector replay tests use test-owned active-work keys and isolated test caches.
+Each test records a total capacity of `8`, replays `1, 8, 3, 7, 2, 6, 4, 5`, and compares the active output with its CPU
+reference. The convolution test also records capacity `1`.
+These tests prove that each leaf binds the caller-owned replay key instead of requiring a component-local key.
 
 The shared block-SDPA replay test records a total Q-token-range capacity of `8`. It replays active counts
 `1, 8, 3, 7, 2, 6, 4, 5` and compares each active output with the CPU softmax reference.
