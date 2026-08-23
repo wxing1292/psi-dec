@@ -293,7 +293,7 @@ fn qwen3x_dflash2_gqa_metal_config(
         Ok(QuantizedAffineLayout {
             group_size: to_u32("Qwen3x DFlash2 GQA group_size", resolved.group_size)?,
             bits: to_u32("Qwen3x DFlash2 GQA bits", resolved.bits)?,
-            scale_bias_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Bfloat16,
         })
     };
     let metal = BlockSpecGQAMetalConfig {

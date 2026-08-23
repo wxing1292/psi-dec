@@ -53,8 +53,10 @@ crates/inference-executor-core/src/
   model/qwen/v3_x/dspark/
     config.rs                    official configuration contract
     weight_layout.rs             exact source and affine binding trees
-  bin/
-    qwen3_dspark_quantize.rs     official BF16 -> affine converter
+  bin/qwen3x_spec_quantize/
+    main.rs                      shared Spec converter CLI
+    checkpoint.rs                shared safetensors and BF16 affine conversion
+    dspark.rs                    DSpark tensor and bit policy
 
 crates/inference-backend-metal/src/components/
   sampling/dspark_markov.rs      fused Markov, confidence, and tile-Top-K map component
@@ -519,19 +521,12 @@ options.
 The executor uses the Transformers defaults when the optional fields are absent.
 It applies the resolved inverse-frequency blend and attention factor to persistent context K and proposal-local Q/K.
 
-Convert an official checkpoint with this command:
-
-```sh
-cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
-  --input-dir /path/to/Qwen3-DSpark \
-  --output-dir /path/to/Qwen3-DSpark-affine \
-  --group-size 64 --bits 4 --markov-w2-bits 8
-```
-
-The output directory must not exist.
-The converter writes `model.safetensors` and `model.safetensors.index.json`.
+The shared Spec converter writes matrix payloads as packed `U32`.
+It writes affine scales and biases as BF16.
+It derives each packed code from the final stored BF16 parameters.
 It preserves DSpark-owned embedding and unembedding when the source provides them.
 It also preserves the confidence projection and bias as BF16.
+Use [`service.md`](service.md) for the source download and conversion command.
 
 ## Verification
 

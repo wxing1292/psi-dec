@@ -200,7 +200,7 @@ pub fn resolve_qwen3x_dspark_weight_bindings<'a>(
             || missing.contains(&bindings.confidence.bias.as_str());
         let confidence_hint = if missing_confidence {
             " The affine checkpoint is missing its enabled confidence head. Regenerate it from the official BF16 \
-             DSpark checkpoint with qwen3_dspark_quantize; do not reuse an affine checkpoint generated before \
+             DSpark checkpoint with qwen3x_spec_quantize dspark; do not reuse an affine checkpoint generated before \
              confidence support."
         } else {
             ""

@@ -31,6 +31,12 @@ crates/inference-executor-core/src/model/qwen/v3_5/
   pending_transactions.rs   Qwen35 sequence-ordered pending transactions
   weight_layout.rs          exact Qwen35 Main/unembed/MTP binding trees
 
+crates/inference-executor-core/src/bin/qwen3x_spec_quantize/
+  main.rs                   shared DSpark/DFlash2 converter CLI
+  checkpoint.rs             shared safetensors and BF16 affine conversion
+  dspark.rs                 DSpark tensor and bit policy
+  dflash2.rs                DFlash2 tensor and bit policy
+
 crates/inference-executor-metal/src/
   replay.rs                 generic Replay<T> component/cache owner
   model/

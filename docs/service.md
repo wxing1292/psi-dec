@@ -170,17 +170,28 @@ hf auth login
 hf download mlx-community/Qwen3-14B-4bit --local-dir models/Qwen3-14B-4bit
 hf download mlx-community/Qwen3.8-27B-4bit --local-dir models/Qwen3.8-27B-4bit
 hf download mlx-community/Qwen3.8-27B-MTP-4bit --local-dir models/Qwen3.8-27B-MTP-4bit
+hf download RadixArk/Qwen3.8-27B-DSpark --local-dir models/Qwen3.8-27B-DSpark
+hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir models/Qwen3.8-27B-DFlash2
 ```
 
 Use the corresponding 35B-A3B names for the sparse model. MTP checkpoints contain Spec weights. They must match the
 Main model family.
+
+The DSpark and DFlash2 repositories contain BF16 source checkpoints. Convert these checkpoints before service startup.
+Both converter subcommands use the same affine format:
+
+- Matrix payloads use packed `U32` storage.
+- Affine scales and biases use BF16 storage.
+- Quantization calculations use F32.
+- Packed codes use the final stored BF16 scale and bias values.
+- Unquantized tensors preserve their source BF16 dtype.
 
 ### Qwen3x DSpark conversion
 
 Convert an official BF16 Qwen3x DSpark checkpoint to the affine executor format:
 
 ```sh
-cargo run -p inference-executor-core --bin qwen3_dspark_quantize -- \
+cargo run -p inference-executor-core --bin qwen3x_spec_quantize -- dspark \
   --input-dir /path/to/Qwen3-DSpark \
   --output-dir /path/to/Qwen3-DSpark-affine \
   --group-size 64 --bits 4 --markov-w2-bits 8
@@ -200,7 +211,7 @@ Regenerate that checkpoint into a new output directory.
 Convert the official BF16 Qwen3.8 DFlash2 checkpoint to the affine executor format:
 
 ```sh
-cargo run -p inference-executor-core --bin qwen3_dflash2_quantize -- \
+cargo run -p inference-executor-core --bin qwen3x_spec_quantize -- dflash2 \
   --input-dir /path/to/Qwen3.8-27B-DFlash2 \
   --output-dir /path/to/Qwen3.8-27B-DFlash2-affine
 ```
@@ -209,9 +220,8 @@ The output directory must not exist before you run the converter.
 The default policy uses group size 64 and 4-bit affine matrices.
 It uses 6-bit affine matrices for layer 2 and layer 4 `v_proj` and `down_proj` weights.
 This policy matches the tensor-level Q4_K_M choices in `z-lab/Qwen3.8-27B-DFlash2-GGUF`.
-The converter writes matrix payloads as `U32` and affine parameters as F32.
 It preserves norms and dynamic-convolution base kernels as BF16.
-The output checkpoint contains no BF16 matrix.
+The output checkpoint contains no unquantized BF16 weight matrix.
 
 Qwen3 Main-only startup:
 

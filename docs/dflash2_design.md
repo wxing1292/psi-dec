@@ -223,11 +223,14 @@ The normalized config validates Main compatibility and these DFlash2 dimensions:
 DFlash2 reuses Main embedding and unembedding, so the DFlash2 manifest must not contain substitute embedding or
 unembedding tensors.
 
-The converter writes affine matrix payloads as `U32` and affine parameters as F32.
+The shared Spec converter writes affine matrix payloads as packed `U32`.
+It writes affine scales and biases as BF16.
+It derives each packed code from the final stored BF16 parameters.
 It preserves RMSNorm weights and dynamic-convolution base kernels as BF16.
-The produced checkpoint must contain no BF16 matrix.
+The produced checkpoint must contain no unquantized BF16 weight matrix.
 The default conversion uses group size 64 and 4-bit affine matrices.
 It uses 6-bit affine matrices for layer 2 and layer 4 `v_proj` and `down_proj` weights.
+Use [`service.md`](service.md) for the source download and conversion command.
 
 ## Source layout
 
@@ -235,6 +238,11 @@ It uses 6-bit affine matrices for layer 2 and layer 4 `v_proj` and `down_proj` w
 crates/inference-executor-core/src/model/qwen/v3_x/dflash2/
   config.rs
   weight_layout.rs
+
+crates/inference-executor-core/src/bin/qwen3x_spec_quantize/
+  main.rs
+  checkpoint.rs
+  dflash2.rs
 
 crates/inference-executor-metal/src/model/qwen/v3_x/dflash2/
   mod.rs

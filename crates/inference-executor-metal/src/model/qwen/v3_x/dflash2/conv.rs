@@ -82,7 +82,7 @@ impl Qwen3xDFlash2Conv {
                 .expect("Qwen3x DFlash2 convolution affine bits must fit i32"),
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
-            scale_bias_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Bfloat16,
         };
         projection_config.validate();
         let shape = dynamic_grouped_conv::Shape {
@@ -124,13 +124,13 @@ impl Qwen3xDFlash2Conv {
         let projection_scales = remove_typed_tensor(
             &mut tensors,
             &bindings.kernel_projection.scales,
-            safetensors::Dtype::F32,
+            safetensors::Dtype::BF16,
         )?
         .into_data();
         let projection_biases = remove_typed_tensor(
             &mut tensors,
             &bindings.kernel_projection.biases,
-            safetensors::Dtype::F32,
+            safetensors::Dtype::BF16,
         )?
         .into_data();
         validate_len(

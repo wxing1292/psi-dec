@@ -315,12 +315,12 @@ fn derive_qwen3x_dflash2_dense_mlp_configs(
         gate_up: QuantizedAffineLayout {
             group_size: to_u32("Qwen3x DFlash2 dense MLP gate/up group_size", gate_up.group_size)?,
             bits: to_u32("Qwen3x DFlash2 dense MLP gate/up bits", gate_up.bits)?,
-            scale_bias_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Bfloat16,
         },
         down: QuantizedAffineLayout {
             group_size: to_u32("Qwen3x DFlash2 dense MLP down group_size", down.group_size)?,
             bits: to_u32("Qwen3x DFlash2 dense MLP down bits", down.bits)?,
-            scale_bias_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Bfloat16,
         },
         io_dtype: Dtype::Bfloat16,
     };

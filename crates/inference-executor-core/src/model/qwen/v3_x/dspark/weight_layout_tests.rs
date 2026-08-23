@@ -99,7 +99,7 @@ fn test_rejects_missing_confidence_weights_when_enabled() {
 
     assert!(error.to_string().contains("confidence_head.proj.weight"));
     assert!(error.to_string().contains("official BF16 DSpark checkpoint"));
-    assert!(error.to_string().contains("qwen3_dspark_quantize"));
+    assert!(error.to_string().contains("qwen3x_spec_quantize dspark"));
 }
 
 #[test]

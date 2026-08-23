@@ -193,8 +193,8 @@ impl Qwen3xDFlash2MainFeatureProjector {
         require_affine_quantization(&quantization, &bindings.fc.weight)?;
         let fc_config = dflash2_fc_config(self.layout, &quantization);
         let weight = remove_quant_weight(&mut tensors, &bindings.fc.weight)?;
-        let scales = remove_typed_tensor(&mut tensors, &bindings.fc.scales, safetensors::Dtype::F32)?.into_data();
-        let biases = remove_typed_tensor(&mut tensors, &bindings.fc.biases, safetensors::Dtype::F32)?.into_data();
+        let scales = remove_typed_tensor(&mut tensors, &bindings.fc.scales, safetensors::Dtype::BF16)?.into_data();
+        let biases = remove_typed_tensor(&mut tensors, &bindings.fc.biases, safetensors::Dtype::BF16)?.into_data();
         validate_len("Qwen3 DFlash2 Main FC weight", weight.len(), fc_config.weight_bytes())?;
         validate_len(
             "Qwen3 DFlash2 Main FC scales",
@@ -330,7 +330,7 @@ fn dflash2_fc_config(
             .expect("Qwen3 DFlash2 Main FC bits must fit i32"),
         input_dtype: Dtype::Bfloat16,
         output_dtype: Dtype::Bfloat16,
-        scale_bias_dtype: Dtype::Float32,
+        scale_bias_dtype: Dtype::Bfloat16,
     }
 }
 

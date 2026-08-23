@@ -183,7 +183,7 @@ impl Qwen3xDFlash2Output {
                 .expect("Qwen3x DFlash2 selector affine bits must fit i32"),
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
-            scale_bias_dtype: Dtype::Float32,
+            scale_bias_dtype: Dtype::Bfloat16,
         };
         hidden_projection_config.validate();
         let codebook = |binding: &inference_executor_core::checkpoint::QuantizedTensorBindings| {
@@ -203,7 +203,7 @@ impl Qwen3xDFlash2Output {
                     .bits
                     .try_into()
                     .expect("Qwen3x DFlash2 selector codebook bits must fit u32"),
-                scale_bias_dtype: Dtype::Float32,
+                scale_bias_dtype: Dtype::Bfloat16,
                 output_dtype: Dtype::Bfloat16,
             })
         };
@@ -270,13 +270,13 @@ impl Qwen3xDFlash2Output {
         let scales = remove_typed_tensor(
             &mut tensors,
             &bindings.hidden_projection.scales,
-            safetensors::Dtype::F32,
+            safetensors::Dtype::BF16,
         )?
         .into_data();
         let biases = remove_typed_tensor(
             &mut tensors,
             &bindings.hidden_projection.biases,
-            safetensors::Dtype::F32,
+            safetensors::Dtype::BF16,
         )?
         .into_data();
         validate_len(

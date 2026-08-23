@@ -701,10 +701,22 @@ for tensor_path in sorted(model_dir.glob("*.safetensors")):
     bf16_matrices = [name for name, metadata in header.items()
                      if name != "__metadata__"
                      and metadata.get("dtype") == "BF16"
-                     and len(metadata.get("shape", [])) == 2]
+                     and len(metadata.get("shape", [])) == 2
+                     and not name.endswith(".scales")
+                     and not name.endswith(".biases")]
     if bf16_matrices:
         raise SystemExit(
-            f"{option} contains BF16 matrices in {tensor_path.name}; run qwen3_dflash2_quantize first"
+            f"{option} contains unquantized BF16 matrices in {tensor_path.name}; "
+            "run qwen3x_spec_quantize dflash2 first"
+        )
+    invalid_affine = [name for name, metadata in header.items()
+                      if name != "__metadata__"
+                      and (name.endswith(".scales") or name.endswith(".biases"))
+                      and metadata.get("dtype") != "BF16"]
+    if invalid_affine:
+        raise SystemExit(
+            f"{option} contains non-BF16 affine parameters in {tensor_path.name}; "
+            "regenerate it with qwen3x_spec_quantize dflash2"
         )
 PY
 }
