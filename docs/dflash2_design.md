@@ -228,6 +228,9 @@ It writes affine scales and biases as BF16.
 It derives each packed code from the final stored BF16 parameters.
 It preserves RMSNorm weights and dynamic-convolution base kernels as BF16.
 The produced checkpoint must contain no unquantized BF16 weight matrix.
+The loader also accepts checkpoints that store all affine scales and biases as F32.
+It reads the checkpoint dtype and uses that dtype for each DFlash2 affine consumer.
+All affine scales and biases in one DFlash2 checkpoint must use the same dtype.
 The default conversion uses group size 64 and 4-bit affine matrices.
 It uses 6-bit affine matrices for layer 2 and layer 4 `v_proj` and `down_proj` weights.
 Use [`service.md`](service.md) for the source download and conversion command.

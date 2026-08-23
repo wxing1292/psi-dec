@@ -11,6 +11,7 @@ use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2ConvWeight
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
+use crate::model::qwen::v3_x::weight::affine_parameter_safetensors_dtype;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::to_u32;
@@ -41,6 +42,7 @@ impl Qwen3xDFlash2Conv {
         num_spec_tokens: usize,
         max_requests: usize,
         bindings: &Qwen3xDFlash2ConvWeightBindings,
+        scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
         assert_eq!(num_spec_tokens, config.num_spec_tokens().get());
         let query_block_size = config.block_size;
@@ -82,7 +84,7 @@ impl Qwen3xDFlash2Conv {
                 .expect("Qwen3x DFlash2 convolution affine bits must fit i32"),
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
-            scale_bias_dtype: Dtype::Bfloat16,
+            scale_bias_dtype,
         };
         projection_config.validate();
         let shape = dynamic_grouped_conv::Shape {
@@ -121,18 +123,11 @@ impl Qwen3xDFlash2Conv {
         let mut tensors = store.load_tensors(names)?;
         let base = remove_typed_tensor(&mut tensors, &bindings.base_kernel, safetensors::Dtype::BF16)?.into_data();
         let projection_weight = remove_quant_weight(&mut tensors, &bindings.kernel_projection.weight)?;
-        let projection_scales = remove_typed_tensor(
-            &mut tensors,
-            &bindings.kernel_projection.scales,
-            safetensors::Dtype::BF16,
-        )?
-        .into_data();
-        let projection_biases = remove_typed_tensor(
-            &mut tensors,
-            &bindings.kernel_projection.biases,
-            safetensors::Dtype::BF16,
-        )?
-        .into_data();
+        let scale_bias_dtype = affine_parameter_safetensors_dtype(self.projection_config.scale_bias_dtype);
+        let projection_scales =
+            remove_typed_tensor(&mut tensors, &bindings.kernel_projection.scales, scale_bias_dtype)?.into_data();
+        let projection_biases =
+            remove_typed_tensor(&mut tensors, &bindings.kernel_projection.biases, scale_bias_dtype)?.into_data();
         validate_len(
             "Qwen3x DFlash2 convolution base",
             base.len(),

@@ -16,6 +16,7 @@ use crate::def::replay_op::ReplayOp;
 use crate::model::gather::Gather;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::main_residual_capture::MainResidualRows;
+use crate::model::qwen::v3_x::weight::affine_parameter_safetensors_dtype;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_qwen3x_norm_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
@@ -125,6 +126,7 @@ pub struct Qwen3xDFlash2MainFeatureProjector {
     layout: Qwen3xDFlash2MainFeatureLayout,
     residual_bindings: Qwen3xDFlash2MainResidualBindings,
     gather: Gather,
+    fc_config: affine_quantized::Config,
     fc: affine_quantized::Matmul,
     hidden_norm: RMSNorm,
     weights: Option<Qwen3xDFlash2MainFeatureWeights>,
@@ -145,6 +147,7 @@ impl Qwen3xDFlash2MainFeatureProjector {
         config: &Qwen3xDFlash2Config,
         bindings: &Qwen3xDFlash2MainFeatureWeightBindings,
         max_tokens: usize,
+        scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
         let layout = Qwen3xDFlash2MainFeatureLayout::new(config, max_tokens);
         let quantization = config
@@ -153,11 +156,12 @@ impl Qwen3xDFlash2MainFeatureProjector {
             .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 Main feature requires quantization config"))?
             .resolve_for_tensor(&bindings.fc.weight);
         require_affine_quantization(&quantization, &bindings.fc.weight)?;
-        let fc_config = dflash2_fc_config(layout, &quantization);
+        let fc_config = dflash2_fc_config(layout, &quantization, scale_bias_dtype);
         Ok(Self {
             layout,
             residual_bindings: Qwen3xDFlash2MainResidualBindings::new(&config.target_layer_ids),
             gather: Gather::new(device, layout.selected_hidden_dim),
+            fc_config,
             fc: affine_quantized::Matmul::new(device, fc_config),
             hidden_norm: RMSNorm::new(device, layout.hidden_dim as usize, config.rms_norm_eps),
             weights: None,
@@ -185,26 +189,24 @@ impl Qwen3xDFlash2MainFeatureProjector {
         let mut tensor_names = Vec::new();
         bindings.push_tensor_names(&mut tensor_names);
         let mut tensors = store.load_tensors(tensor_names)?;
-        let quantization = config
-            .quantization
-            .as_ref()
-            .ok_or_else(|| ModelExecutorError::custom("Qwen3x DFlash2 Main feature requires quantization config"))?
-            .resolve_for_tensor(&bindings.fc.weight);
-        require_affine_quantization(&quantization, &bindings.fc.weight)?;
-        let fc_config = dflash2_fc_config(self.layout, &quantization);
         let weight = remove_quant_weight(&mut tensors, &bindings.fc.weight)?;
-        let scales = remove_typed_tensor(&mut tensors, &bindings.fc.scales, safetensors::Dtype::BF16)?.into_data();
-        let biases = remove_typed_tensor(&mut tensors, &bindings.fc.biases, safetensors::Dtype::BF16)?.into_data();
-        validate_len("Qwen3 DFlash2 Main FC weight", weight.len(), fc_config.weight_bytes())?;
+        let scale_bias_dtype = affine_parameter_safetensors_dtype(self.fc_config.scale_bias_dtype);
+        let scales = remove_typed_tensor(&mut tensors, &bindings.fc.scales, scale_bias_dtype)?.into_data();
+        let biases = remove_typed_tensor(&mut tensors, &bindings.fc.biases, scale_bias_dtype)?.into_data();
+        validate_len(
+            "Qwen3 DFlash2 Main FC weight",
+            weight.len(),
+            self.fc_config.weight_bytes(),
+        )?;
         validate_len(
             "Qwen3 DFlash2 Main FC scales",
             scales.len(),
-            fc_config.scale_or_bias_bytes(),
+            self.fc_config.scale_or_bias_bytes(),
         )?;
         validate_len(
             "Qwen3 DFlash2 Main FC biases",
             biases.len(),
-            fc_config.scale_or_bias_bytes(),
+            self.fc_config.scale_or_bias_bytes(),
         )?;
         self.hidden_norm.load_weights(remove_qwen3x_norm_weight(
             device,
@@ -310,6 +312,7 @@ impl Qwen3xDFlash2MainFeatureProjector {
 fn dflash2_fc_config(
     layout: Qwen3xDFlash2MainFeatureLayout,
     quantization: &inference_executor_core::model::qwen::v3_x::ResolvedQuantizationConfig,
+    scale_bias_dtype: Dtype,
 ) -> affine_quantized::Config {
     affine_quantized::Config {
         n: layout
@@ -330,7 +333,7 @@ fn dflash2_fc_config(
             .expect("Qwen3 DFlash2 Main FC bits must fit i32"),
         input_dtype: Dtype::Bfloat16,
         output_dtype: Dtype::Bfloat16,
-        scale_bias_dtype: Dtype::Bfloat16,
+        scale_bias_dtype,
     }
 }
 

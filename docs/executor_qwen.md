@@ -477,6 +477,8 @@ Each DFlash2 semantic owner derives its geometry from `Qwen3xDFlash2Config` and 
 exact binding subtree.
 Q, K, V, output, gate, up, and down projections can use independent affine layouts.
 The loader does not assume that Wk and Wv have the same dtype or quantization layout.
+The loader accepts BF16 or F32 affine scales and biases.
+It selects the Metal affine parameter dtype from the checkpoint and requires one dtype for the full DFlash2 model.
 
 ## Replay ownership
 

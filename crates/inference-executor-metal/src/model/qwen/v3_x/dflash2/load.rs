@@ -2,8 +2,10 @@ use std::path::Path;
 use std::rc::Rc;
 
 use inference_backend_metal::metal::Device;
+use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::BlockSpecCapacity;
 use inference_executor_core::attn::GQAPageTableLayout;
+use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2WeightBindings;
@@ -61,6 +63,7 @@ pub fn load_qwen3x_dflash2(
         final_norm_weight,
         selector,
     } = resolve_qwen3x_dflash2_weight_bindings(config, store.index().tensor_names())?;
+    let scale_bias_dtype = load_scale_bias_dtype(&mut store, &selector.hidden_projection)?;
     let attention_core = qwen3x_dflash2_gqa_core(config, num_spec_tokens, 0);
     let attention_sdpa_config = qwen3x_dflash2_gqa_sdpa_config(config, load_config.page_size_bytes)?;
     let tokens_per_page = attention_sdpa_config.tokens_per_page as usize;
@@ -121,6 +124,7 @@ pub fn load_qwen3x_dflash2(
         unembed,
         &selector,
         sampler_bounds,
+        scale_bias_dtype,
     )?;
     output.load_weights(device, &mut store, selector)?;
     let mut model = Qwen3xDFlash2Model::new(
@@ -134,6 +138,7 @@ pub fn load_qwen3x_dflash2(
         load_config.max_tokens,
         load_config.max_requests,
         max_query_tokens,
+        scale_bias_dtype,
     )?;
     model.load_weights(device, &mut store, config, &main_feature, layers, final_norm_weight)?;
     Ok(Qwen3xDFlash2Loaded {
@@ -151,6 +156,37 @@ pub fn load_qwen3x_dflash2(
         page_bytes: load_config.page_size_bytes,
         max_main_tokens: load_config.max_tokens,
     })
+}
+
+fn load_scale_bias_dtype(
+    store: &mut SafeTensorStore,
+    bindings: &QuantizedTensorBindings,
+) -> Result<Dtype, ModelExecutorError> {
+    let tensors = store.load_tensors([bindings.scales.as_str(), bindings.biases.as_str()])?;
+    let scales = tensors
+        .get(&bindings.scales)
+        .expect("requested DFlash2 scale tensor must be loaded");
+    let biases = tensors
+        .get(&bindings.biases)
+        .expect("requested DFlash2 bias tensor must be loaded");
+    scale_bias_dtype(scales.dtype(), biases.dtype())
+}
+
+fn scale_bias_dtype(scales: safetensors::Dtype, biases: safetensors::Dtype) -> Result<Dtype, ModelExecutorError> {
+    if scales != biases {
+        return Err(ModelExecutorError::custom(format!(
+            "Qwen3x DFlash2 affine scales and biases must use one dtype, got scales={scales:?} biases={biases:?}"
+        )));
+    }
+    match scales {
+        safetensors::Dtype::BF16 => Ok(Dtype::Bfloat16),
+        safetensors::Dtype::F32 => Ok(Dtype::Float32),
+        dtype => {
+            Err(ModelExecutorError::custom(format!(
+                "Qwen3x DFlash2 affine scales and biases must use BF16 or F32, got {dtype:?}"
+            )))
+        },
+    }
 }
 
 fn num_page_ids_per_block(num_tokens_per_block: usize, num_tokens_per_page: usize) -> usize {

@@ -25,6 +25,7 @@ use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
 use crate::model::embedding::EmbedInput;
 use crate::model::gather::Gather;
+use crate::model::qwen::v3_x::weight::affine_parameter_safetensors_dtype;
 use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::to_u32;
@@ -112,6 +113,7 @@ pub struct Qwen3xDFlash2OutputReplayKey {
 }
 
 impl Qwen3xDFlash2Output {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
         config: &Qwen3xDFlash2Config,
@@ -120,6 +122,7 @@ impl Qwen3xDFlash2Output {
         unembed: Rc<Unembed>,
         bindings: &Qwen3xDFlash2SelectorWeightBindings,
         sampler_bounds: TopKSamplingBounds,
+        scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
         assert_eq!(
             num_spec_tokens,
@@ -183,7 +186,7 @@ impl Qwen3xDFlash2Output {
                 .expect("Qwen3x DFlash2 selector affine bits must fit i32"),
             input_dtype: Dtype::Bfloat16,
             output_dtype: Dtype::Bfloat16,
-            scale_bias_dtype: Dtype::Bfloat16,
+            scale_bias_dtype,
         };
         hidden_projection_config.validate();
         let codebook = |binding: &inference_executor_core::checkpoint::QuantizedTensorBindings| {
@@ -203,7 +206,7 @@ impl Qwen3xDFlash2Output {
                     .bits
                     .try_into()
                     .expect("Qwen3x DFlash2 selector codebook bits must fit u32"),
-                scale_bias_dtype: Dtype::Bfloat16,
+                scale_bias_dtype,
                 output_dtype: Dtype::Bfloat16,
             })
         };
@@ -267,18 +270,11 @@ impl Qwen3xDFlash2Output {
             bindings.hidden_projection.biases.as_str(),
         ])?;
         let weight = remove_quant_weight(&mut tensors, &bindings.hidden_projection.weight)?;
-        let scales = remove_typed_tensor(
-            &mut tensors,
-            &bindings.hidden_projection.scales,
-            safetensors::Dtype::BF16,
-        )?
-        .into_data();
-        let biases = remove_typed_tensor(
-            &mut tensors,
-            &bindings.hidden_projection.biases,
-            safetensors::Dtype::BF16,
-        )?
-        .into_data();
+        let scale_bias_dtype = affine_parameter_safetensors_dtype(self.hidden_projection_config.scale_bias_dtype);
+        let scales =
+            remove_typed_tensor(&mut tensors, &bindings.hidden_projection.scales, scale_bias_dtype)?.into_data();
+        let biases =
+            remove_typed_tensor(&mut tensors, &bindings.hidden_projection.biases, scale_bias_dtype)?.into_data();
         validate_len(
             "Qwen3x DFlash2 selector hidden-projection weight",
             weight.len(),

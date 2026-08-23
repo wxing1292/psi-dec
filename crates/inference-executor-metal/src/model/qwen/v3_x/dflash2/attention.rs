@@ -208,9 +208,10 @@ pub fn derive_qwen3x_dflash2_gqa_configs(
     dflash2_layer_index: usize,
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
+    scale_bias_dtype: Dtype,
 ) -> Result<(BlockSpecGQACore, BlockSpecGQAMetalConfig), ModelExecutorError> {
     let core = qwen3x_dflash2_gqa_core(config, num_spec_tokens, dflash2_layer_index);
-    let metal = qwen3x_dflash2_gqa_metal_config(config, bindings, page_bytes)?;
+    let metal = qwen3x_dflash2_gqa_metal_config(config, bindings, page_bytes, scale_bias_dtype)?;
     Ok((core, metal))
 }
 
@@ -277,6 +278,7 @@ fn qwen3x_dflash2_gqa_metal_config(
     config: &Qwen3xDFlash2Config,
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
+    scale_bias_dtype: Dtype,
 ) -> Result<BlockSpecGQAMetalConfig, ModelExecutorError> {
     let quantization = config
         .quantization
@@ -293,7 +295,7 @@ fn qwen3x_dflash2_gqa_metal_config(
         Ok(QuantizedAffineLayout {
             group_size: to_u32("Qwen3x DFlash2 GQA group_size", resolved.group_size)?,
             bits: to_u32("Qwen3x DFlash2 GQA bits", resolved.bits)?,
-            scale_bias_dtype: Dtype::Bfloat16,
+            scale_bias_dtype,
         })
     };
     let metal = BlockSpecGQAMetalConfig {
@@ -327,7 +329,8 @@ mod tests {
         let bindings = Qwen3xDFlash2WeightBindings::from_config(&config);
 
         let (core, metal) =
-            derive_qwen3x_dflash2_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
+            derive_qwen3x_dflash2_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024, Dtype::Bfloat16)
+                .unwrap();
 
         assert_eq!(core.block_size, 8);
         assert_eq!(core.attention.model_layer_index, 1);
@@ -354,9 +357,11 @@ mod tests {
         let bindings = Qwen3xDFlash2WeightBindings::from_config(&config);
 
         let (_, layer_0_metal) =
-            derive_qwen3x_dflash2_gqa_configs(&config, 7, 0, &bindings.layers[0].gqa, 32 * 1024).unwrap();
+            derive_qwen3x_dflash2_gqa_configs(&config, 7, 0, &bindings.layers[0].gqa, 32 * 1024, Dtype::Bfloat16)
+                .unwrap();
         let (_, layer_1_metal) =
-            derive_qwen3x_dflash2_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
+            derive_qwen3x_dflash2_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024, Dtype::Bfloat16)
+                .unwrap();
 
         assert_eq!(layer_0_metal.q.bits, 4);
         assert_eq!(layer_1_metal.q.bits, 8);
@@ -396,12 +401,18 @@ mod tests {
         );
         let bindings = Qwen3xDFlash2WeightBindings::from_config(&config);
 
-        let (_, metal) = derive_qwen3x_dflash2_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024).unwrap();
+        let (_, metal) =
+            derive_qwen3x_dflash2_gqa_configs(&config, 7, 1, &bindings.layers[1].gqa, 32 * 1024, Dtype::Float32)
+                .unwrap();
 
         assert_eq!(metal.q.bits, 4);
         assert_eq!(metal.k.bits, 8);
         assert_eq!(metal.v.bits, 4);
         assert_eq!(metal.output.bits, 4);
+        assert_eq!(metal.q.scale_bias_dtype, Dtype::Float32);
+        assert_eq!(metal.k.scale_bias_dtype, Dtype::Float32);
+        assert_eq!(metal.v.scale_bias_dtype, Dtype::Float32);
+        assert_eq!(metal.output.scale_bias_dtype, Dtype::Float32);
     }
 
     fn config() -> Qwen3xDFlash2Config {

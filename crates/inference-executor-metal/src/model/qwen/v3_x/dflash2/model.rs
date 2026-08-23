@@ -94,6 +94,7 @@ impl Qwen3xDFlash2Model {
         max_main_tokens: usize,
         max_requests: usize,
         max_block_tokens: usize,
+        scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
         assert_eq!(
             layer_bindings.len(),
@@ -118,6 +119,7 @@ impl Qwen3xDFlash2Model {
             config,
             main_feature_bindings,
             max_main_tokens,
+            scale_bias_dtype,
         )?);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for (dflash2_layer_index, bindings) in layer_bindings.iter().enumerate() {
@@ -132,6 +134,7 @@ impl Qwen3xDFlash2Model {
                 gqa_state,
                 Rc::clone(&layer_scratch),
                 Rc::clone(&dense_scratch),
+                scale_bias_dtype,
             )?);
         }
         Ok(Self {

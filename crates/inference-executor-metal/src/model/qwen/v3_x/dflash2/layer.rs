@@ -73,11 +73,18 @@ impl Qwen3xDFlash2Layer {
         gqa_state: &BlockSpecGQAState,
         scratch: Rc<Qwen3xDFlash2LayerScratch>,
         dense_scratch: Rc<DenseMLPScratch>,
+        scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
-        let (attention_core, attention_metal) =
-            derive_qwen3x_dflash2_gqa_configs(config, num_spec_tokens, dflash2_layer_index, &bindings.gqa, page_bytes)?;
+        let (attention_core, attention_metal) = derive_qwen3x_dflash2_gqa_configs(
+            config,
+            num_spec_tokens,
+            dflash2_layer_index,
+            &bindings.gqa,
+            page_bytes,
+            scale_bias_dtype,
+        )?;
         let (mlp_core, mlp_metal) =
-            derive_qwen3x_dflash2_dense_mlp_configs(config, dflash2_layer_index, &bindings.mlp)?;
+            derive_qwen3x_dflash2_dense_mlp_configs(config, dflash2_layer_index, &bindings.mlp, scale_bias_dtype)?;
         let hidden_dim = attention_core.attention.hidden_dim;
         assert_eq!(hidden_dim, mlp_core.hidden_dim);
         Ok(Self {
@@ -89,6 +96,7 @@ impl Qwen3xDFlash2Layer {
                 num_spec_tokens,
                 max_requests,
                 &bindings.attention_conv,
+                scale_bias_dtype,
             )?,
             attention: Qwen3xDFlash2Attention::new(
                 device,
@@ -99,7 +107,14 @@ impl Qwen3xDFlash2Layer {
             ),
             residual_add: ResidualAdd::new(device),
             post_attention_norm: RMSNorm::new(device, hidden_dim, config.rms_norm_eps),
-            mlp_conv: Qwen3xDFlash2Conv::new(device, config, num_spec_tokens, max_requests, &bindings.mlp_conv)?,
+            mlp_conv: Qwen3xDFlash2Conv::new(
+                device,
+                config,
+                num_spec_tokens,
+                max_requests,
+                &bindings.mlp_conv,
+                scale_bias_dtype,
+            )?,
             mlp: Qwen3xDenseMLP::new(device, mlp_core, mlp_metal, dense_scratch),
             scratch,
         })
@@ -286,6 +301,7 @@ fn derive_qwen3x_dflash2_dense_mlp_configs(
     config: &Qwen3xDFlash2Config,
     dflash2_layer_index: usize,
     bindings: &Qwen3xDenseMLPWeightBindings,
+    scale_bias_dtype: Dtype,
 ) -> Result<(DenseMLPCore, DenseMLPMetalConfig), ModelExecutorError> {
     let quantization = config
         .quantization
@@ -315,12 +331,12 @@ fn derive_qwen3x_dflash2_dense_mlp_configs(
         gate_up: QuantizedAffineLayout {
             group_size: to_u32("Qwen3x DFlash2 dense MLP gate/up group_size", gate_up.group_size)?,
             bits: to_u32("Qwen3x DFlash2 dense MLP gate/up bits", gate_up.bits)?,
-            scale_bias_dtype: Dtype::Bfloat16,
+            scale_bias_dtype,
         },
         down: QuantizedAffineLayout {
             group_size: to_u32("Qwen3x DFlash2 dense MLP down group_size", down.group_size)?,
             bits: to_u32("Qwen3x DFlash2 dense MLP down bits", down.bits)?,
-            scale_bias_dtype: Dtype::Bfloat16,
+            scale_bias_dtype,
         },
         io_dtype: Dtype::Bfloat16,
     };

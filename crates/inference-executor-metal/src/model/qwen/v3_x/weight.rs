@@ -36,6 +36,14 @@ pub fn remove_quant_weight(tensors: &mut TensorMap, name: &str) -> Result<Vec<u8
     Ok(remove_typed_tensor(tensors, name, safetensors::Dtype::U32)?.into_data())
 }
 
+pub fn affine_parameter_safetensors_dtype(dtype: Dtype) -> safetensors::Dtype {
+    match dtype {
+        Dtype::Bfloat16 => safetensors::Dtype::BF16,
+        Dtype::Float32 => safetensors::Dtype::F32,
+        dtype => panic!("unsupported affine parameter dtype {dtype:?}"),
+    }
+}
+
 pub fn load_qwen3x_norm_weight(
     device: &Device,
     store: &mut SafeTensorStore,
