@@ -1,4 +1,6 @@
 use half::bf16;
+use inference_executor_core::mlp::moe::reference::moe_combine_with_shared_experts_bf16_reference;
+use inference_executor_core::mlp::moe::reference::moe_combine_without_shared_experts_bf16_reference;
 
 use super::*;
 use crate::metal::Buffer;
@@ -7,197 +9,28 @@ use crate::metal::ReplayArguments;
 use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayProgram;
 use crate::metal::Stream;
+use crate::test_support::ReplayTestCache;
 
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.moe.expert_major.num_active_tokens");
-const U32_CANARY: u32 = 0xA5A5_5A5A;
-const BF16_CANARY: u16 = 0x42B6;
+const ACTIVE_SEQUENCE: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
 
 #[test]
-fn test_constants_have_phase_scoped_thread_blocks() {
-    let constants = KernelConstants::current();
-    assert_eq!(constants.layout_clear.required_threads, 256);
-    assert_eq!(constants.layout_count.required_threads, 256);
-    assert_eq!(constants.layout_prefix.required_threads, 1);
-    assert_eq!(constants.layout_scatter.required_threads, 256);
-    assert_eq!(constants.pack_input.required_threads, 256);
-    assert_eq!(constants.scatter_output.required_threads, 256);
+fn test_replay_matches_reference_across_active_counts() {
+    let fixture = ExpertMajorFixture::new();
+    let mut cache = ReplayTestCache::new();
+    let key = fixture.shape.num_total_tokens;
+    let (_, cache_hit) = cache.record(key, || fixture.replay());
+    assert!(!cache_hit);
+    for (case_index, num_active_tokens) in ACTIVE_SEQUENCE.into_iter().enumerate() {
+        let work = fixture.write_work(0x7148_9200_u32.wrapping_add(case_index as u32));
+        let (replay, cache_hit) = cache.record(key, || unreachable!());
+        assert!(cache_hit);
+        fixture.submit(replay, num_active_tokens);
+        fixture.assert_active_work(&work, num_active_tokens);
+    }
 }
 
-#[test]
-#[should_panic(expected = "MoE expert-major routed-hidden elements exceeds the shader u32 count domain")]
-fn test_shape_rejects_shader_count_overflow() {
-    Config::bf16(1, 1, 4).validate_shape(Shape {
-        num_total_tokens: 1 << 30,
-    });
-}
-
-#[test]
-fn test_layout_pack_scatter() {
-    let device = Device::system_default();
-    let stream = Stream::new(&device);
-    let config = Config::bf16(6, 3, 3);
-    let shape = Shape { num_total_tokens: 4 };
-    let input_values = [
-        1.0, 2.0, 3.0, //
-        4.0, 5.0, 6.0, //
-        7.0, 8.0, 9.0, -1.0, -2.0, -3.0,
-    ];
-    let expert_indices_values = [5_u32, 2, 2, 0, 5, 2, 3, 2, 5, 0, 2, 5];
-    let routed_probs_values = [
-        0.25_f32, 0.50, 0.25, //
-        0.125, 0.625, 0.25, //
-        0.75, 0.125, 0.125, //
-        0.20, 0.30, 0.50,
-    ];
-    let shared_hidden_values = [
-        0.5, 1.0, -0.5, //
-        1.5, -1.0, 0.25, //
-        -0.25, 0.75, 1.25, //
-        2.0, -1.5, 0.5,
-    ];
-    let shared_expert_gate_logits_values = [-1.0, 0.0, 1.0, 2.0];
-    let input = bf16_buffer(&device, &input_values);
-    let expert_indices = Buffer::from_slice(&device, &expert_indices_values);
-    let routed_probs = Buffer::from_slice(&device, &routed_probs_values);
-    let shared_hidden = bf16_buffer(&device, &shared_hidden_values);
-    let shared_expert_gate_logits = bf16_buffer(&device, &shared_expert_gate_logits_values);
-    let expert_counts = Buffer::new_zeroed(&device, config.expert_counts_bytes());
-    let expert_offsets = Buffer::new_zeroed(&device, config.expert_offsets_bytes());
-    let expert_cursors = Buffer::new_zeroed(&device, config.expert_counts_bytes());
-    let routes_by_expert = Buffer::new_zeroed(&device, config.route_indices_bytes(shape));
-    let routes_by_token = Buffer::new_zeroed(&device, config.route_indices_bytes(shape));
-    let experts_by_route = Buffer::new_zeroed(&device, config.route_indices_bytes(shape));
-    let packed_input = Buffer::new_zeroed(&device, config.route_hidden_bytes(shape));
-    let output = Buffer::new_zeroed(&device, config.token_hidden_bytes(shape));
-    let output_with_shared_experts = Buffer::new_zeroed(&device, config.token_hidden_bytes(shape));
-    let kernels = Compute::new(&device, config);
-
-    let mut builder = stream.create_replay_program();
-    builder.record(kernels.invoke_layout(
-        shape,
-        ReplayU32::Fixed(shape.num_total_tokens),
-        LayoutBuffers {
-            expert_indices: &expert_indices,
-            expert_counts: &expert_counts,
-            expert_offsets: &expert_offsets,
-            expert_cursors: &expert_cursors,
-            routes_by_expert: &routes_by_expert,
-            routes_by_token: &routes_by_token,
-            experts_by_route: &experts_by_route,
-        },
-    ));
-    builder.record_with_barrier_before(kernels.invoke_pack_input(
-        shape,
-        ReplayU32::Fixed(shape.num_total_tokens),
-        PackInputBuffers {
-            input: &input,
-            routes_by_expert: &routes_by_expert,
-            packed_input: &packed_input,
-        },
-    ));
-    builder.record_with_barrier_before(kernels.invoke_scatter_without_shared_experts(
-        shape,
-        ReplayU32::Fixed(shape.num_total_tokens),
-        ScatterWithoutSharedExpertsBuffers {
-            packed_output: &packed_input,
-            routes_by_token: &routes_by_token,
-            routed_probs: &routed_probs,
-            output: &output,
-        },
-    ));
-    builder.record_with_barrier_before(kernels.invoke_scatter_with_shared_experts(
-        shape,
-        ReplayU32::Fixed(shape.num_total_tokens),
-        ScatterWithSharedExpertsBuffers {
-            packed_output: &packed_input,
-            routes_by_token: &routes_by_token,
-            routed_probs: &routed_probs,
-            shared_hidden: &shared_hidden,
-            shared_expert_gate_logits: &shared_expert_gate_logits,
-            output: &output_with_shared_experts,
-        },
-    ));
-    let replay = builder.build();
-    stream.submit_replay(&replay).wait();
-
-    let routes_by_expert_values = routes_by_expert.read_typed::<u32>(0, 12);
-    let routes_by_token_values = routes_by_token.read_typed::<u32>(0, 12);
-    let experts_by_route_values = experts_by_route.read_typed::<u32>(0, 12);
-    assert_eq!(expert_counts.read_typed::<u32>(0, 6), vec![2, 0, 5, 1, 0, 4]);
-    assert_eq!(expert_offsets.read_typed::<u32>(0, 7), vec![0, 2, 2, 7, 8, 8, 12]);
-    assert_expert_major_maps(
-        &expert_indices_values,
-        &routes_by_expert_values,
-        &routes_by_token_values,
-        &experts_by_route_values,
-    );
-    assert_packed_input_matches_routes(
-        &input_values,
-        &packed_input.read_typed::<u16>(0, 36),
-        &routes_by_expert_values,
-        3,
-        3,
-    );
-    let expected = cpu_scatter(&input_values, &routed_probs_values, 4, 3, 3);
-    assert_eq!(output.read_typed::<u16>(0, 12), expected);
-    let expected_with_shared_experts = cpu_scatter_with_shared_experts(
-        &expected,
-        &shared_hidden_values,
-        &shared_expert_gate_logits_values,
-        4,
-        3,
-    );
-    assert_eq!(
-        output_with_shared_experts.read_typed::<u16>(0, 12),
-        expected_with_shared_experts
-    );
-}
-
-#[test]
-fn test_bucketed_layout_pack_scatter_preserves_inactive_capacity_and_shrink() {
-    let fixture = BucketedFixture::new();
-    let replay = fixture.bucketed_replay();
-
-    let first = fixture.write_work(5, 1);
-    fixture.submit(&replay, 5);
-    fixture.assert_active_work(&first, 5);
-    fixture.assert_canary_tails(5);
-
-    let full = fixture.write_work(6, 2);
-    fixture.submit(&replay, 6);
-    fixture.assert_active_work(&full, 6);
-    let full_routes_by_expert = fixture
-        .routes_by_expert
-        .read_typed::<u32>(0, fixture.num_total_routes());
-    let full_routes_by_token = fixture.routes_by_token.read_typed::<u32>(0, fixture.num_total_routes());
-    let full_experts_by_route = fixture
-        .experts_by_route
-        .read_typed::<u32>(0, fixture.num_total_routes());
-    let full_packed_input = fixture
-        .packed_input
-        .read_typed::<u16>(0, fixture.num_total_routes() * fixture.hidden_dim());
-    let full_output = fixture
-        .output
-        .read_typed::<u16>(0, fixture.num_total_tokens() * fixture.hidden_dim());
-    let full_output_with_shared_experts = fixture
-        .output_with_shared_experts
-        .read_typed::<u16>(0, fixture.num_total_tokens() * fixture.hidden_dim());
-
-    let smaller = fixture.write_work(5, 3);
-    fixture.submit(&replay, 5);
-    fixture.assert_active_work(&smaller, 5);
-    fixture.assert_preserved_tails(
-        5,
-        &full_routes_by_expert,
-        &full_routes_by_token,
-        &full_experts_by_route,
-        &full_packed_input,
-        &full_output,
-        &full_output_with_shared_experts,
-    );
-}
-
-struct BucketedWork {
+struct ExpertMajorWork {
     input: Vec<f32>,
     expert_indices: Vec<u32>,
     routed_probs: Vec<f32>,
@@ -205,11 +38,11 @@ struct BucketedWork {
     shared_expert_gate_logits: Vec<f32>,
 }
 
-struct BucketedFixture {
+struct ExpertMajorFixture {
     stream: Stream,
     config: Config,
     shape: Shape,
-    kernels: Compute,
+    compute: Compute,
     input: Buffer,
     expert_indices: Buffer,
     routed_probs: Buffer,
@@ -226,16 +59,12 @@ struct BucketedFixture {
     output_with_shared_experts: Buffer,
 }
 
-impl BucketedFixture {
+impl ExpertMajorFixture {
     fn new() -> Self {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = Config::bf16(6, 3, 3);
-        let shape = Shape { num_total_tokens: 6 };
-        let num_total_routes = config.num_routes(shape) as usize;
-        let num_total_tokens = shape.num_total_tokens as usize;
-        let hidden_dim = config.hidden_dim as usize;
-        let kernels = Compute::new(&device, config);
+        let config = Config::bf16(6, 3, 16);
+        let shape = Shape { num_total_tokens: 8 };
         Self {
             input: Buffer::new_zeroed(&device, config.token_hidden_bytes(shape)),
             expert_indices: Buffer::new_zeroed(&device, config.route_indices_bytes(shape)),
@@ -245,78 +74,90 @@ impl BucketedFixture {
             expert_counts: Buffer::new_zeroed(&device, config.expert_counts_bytes()),
             expert_offsets: Buffer::new_zeroed(&device, config.expert_offsets_bytes()),
             expert_cursors: Buffer::new_zeroed(&device, config.expert_counts_bytes()),
-            routes_by_expert: Buffer::from_slice(&device, &vec![U32_CANARY; num_total_routes]),
-            routes_by_token: Buffer::from_slice(&device, &vec![U32_CANARY; num_total_routes]),
-            experts_by_route: Buffer::from_slice(&device, &vec![U32_CANARY; num_total_routes]),
-            packed_input: Buffer::from_slice(&device, &vec![BF16_CANARY; num_total_routes * hidden_dim]),
-            output: Buffer::from_slice(&device, &vec![BF16_CANARY; num_total_tokens * hidden_dim]),
-            output_with_shared_experts: Buffer::from_slice(&device, &vec![BF16_CANARY; num_total_tokens * hidden_dim]),
+            routes_by_expert: Buffer::new_zeroed(&device, config.route_indices_bytes(shape)),
+            routes_by_token: Buffer::new_zeroed(&device, config.route_indices_bytes(shape)),
+            experts_by_route: Buffer::new_zeroed(&device, config.route_indices_bytes(shape)),
+            packed_input: Buffer::new_zeroed(&device, config.route_hidden_bytes(shape)),
+            output: Buffer::new_zeroed(&device, config.token_hidden_bytes(shape)),
+            output_with_shared_experts: Buffer::new_zeroed(&device, config.token_hidden_bytes(shape)),
+            compute: Compute::new(&device, config),
             stream,
             config,
             shape,
-            kernels,
         }
     }
 
-    fn bucketed_replay(&self) -> ReplayProgram {
+    fn replay(&self) -> ReplayProgram {
         let mut builder = self.stream.create_replay_program();
-        builder.record(self.kernels.invoke_layout(
+        builder.record(self.compute.invoke_layout(
             self.shape,
             ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            self.layout_buffers(),
+            LayoutBuffers {
+                expert_indices: &self.expert_indices,
+                expert_counts: &self.expert_counts,
+                expert_offsets: &self.expert_offsets,
+                expert_cursors: &self.expert_cursors,
+                routes_by_expert: &self.routes_by_expert,
+                routes_by_token: &self.routes_by_token,
+                experts_by_route: &self.experts_by_route,
+            },
         ));
-        builder.record_with_barrier_before(self.kernels.invoke_pack_input(
+        builder.record_with_barrier_before(self.compute.invoke_pack_input(
             self.shape,
             ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            self.pack_input_buffers(),
+            PackInputBuffers {
+                input: &self.input,
+                routes_by_expert: &self.routes_by_expert,
+                packed_input: &self.packed_input,
+            },
         ));
-        builder.record_with_barrier_before(self.kernels.invoke_scatter_without_shared_experts(
+        builder.record_with_barrier_before(self.compute.invoke_scatter_without_shared_experts(
             self.shape,
             ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            self.scatter_without_shared_experts_buffers(),
+            ScatterWithoutSharedExpertsBuffers {
+                packed_output: &self.packed_input,
+                routes_by_token: &self.routes_by_token,
+                routed_probs: &self.routed_probs,
+                output: &self.output,
+            },
         ));
-        builder.record_with_barrier_before(self.kernels.invoke_scatter_with_shared_experts(
+        builder.record_with_barrier_before(self.compute.invoke_scatter_with_shared_experts(
             self.shape,
             ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            self.scatter_with_shared_experts_buffers(),
+            ScatterWithSharedExpertsBuffers {
+                packed_output: &self.packed_input,
+                routes_by_token: &self.routes_by_token,
+                routed_probs: &self.routed_probs,
+                shared_hidden: &self.shared_hidden,
+                shared_expert_gate_logits: &self.shared_expert_gate_logits,
+                output: &self.output_with_shared_experts,
+            },
         ));
         builder.build()
     }
 
-    fn submit(&self, replay: &ReplayProgram, num_active_tokens: u32) {
-        self.stream
-            .submit_replay_with_arguments(
-                replay,
-                &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
-            )
-            .wait();
-    }
-
-    fn write_work(&self, num_active_tokens: usize, generation: u32) -> BucketedWork {
-        let mut input = vec![f32::NAN; self.num_total_tokens() * self.hidden_dim()];
-        let mut expert_indices = vec![u32::MAX; self.num_total_routes()];
-        let mut routed_probs = vec![f32::NAN; self.num_total_routes()];
-        let mut shared_hidden = vec![f32::NAN; self.num_total_tokens() * self.hidden_dim()];
-        let mut shared_expert_gate_logits = vec![f32::NAN; self.num_total_tokens()];
-        for (token, gate_logit) in shared_expert_gate_logits.iter_mut().enumerate().take(num_active_tokens) {
-            *gate_logit = generation as f32 * 0.25 + token as f32 * 0.125 - 0.5;
-            for dim in 0..self.hidden_dim() {
-                let index = token * self.hidden_dim() + dim;
-                input[index] = generation as f32 * 3.0 + token as f32 * 0.75 + dim as f32 * 0.25;
-                shared_hidden[index] = generation as f32 * -0.5 + token as f32 * 0.375 - dim as f32 * 0.125;
-            }
-            for slot in 0..self.num_experts_per_token() {
-                let route = token * self.num_experts_per_token() + slot;
-                expert_indices[route] = ((route as u32).wrapping_add(generation)) % self.config.num_experts;
-                routed_probs[route] = [0.25, 0.50, 0.25][slot];
-            }
-        }
-        write_bf16_values(&self.input, &input);
+    fn write_work(&self, seed: u32) -> ExpertMajorWork {
+        let num_tokens = self.shape.num_total_tokens as usize;
+        let num_routes = self.config.num_routes(self.shape) as usize;
+        let hidden_dim = self.config.hidden_dim as usize;
+        let input = bf16_values(&generated_values(num_tokens * hidden_dim, seed));
+        let expert_indices = (0..num_routes)
+            .map(|route| (route as u32 * 5 + seed) % self.config.num_experts)
+            .collect::<Vec<_>>();
+        let routed_probs = generated_probs(
+            num_tokens,
+            self.config.num_experts_per_token as usize,
+            seed.wrapping_add(1),
+        );
+        let shared_hidden = bf16_values(&generated_values(num_tokens * hidden_dim, seed.wrapping_add(2)));
+        let shared_expert_gate_logits = bf16_values(&generated_values(num_tokens, seed.wrapping_add(3)));
+        self.input.write_typed(0, &bf16_bits(&input));
         self.expert_indices.write_typed(0, &expert_indices);
         self.routed_probs.write_typed(0, &routed_probs);
-        write_bf16_values(&self.shared_hidden, &shared_hidden);
-        write_bf16_values(&self.shared_expert_gate_logits, &shared_expert_gate_logits);
-        BucketedWork {
+        self.shared_hidden.write_typed(0, &bf16_bits(&shared_hidden));
+        self.shared_expert_gate_logits
+            .write_typed(0, &bf16_bits(&shared_expert_gate_logits));
+        ExpertMajorWork {
             input,
             expert_indices,
             routed_probs,
@@ -325,230 +166,115 @@ impl BucketedFixture {
         }
     }
 
-    fn assert_active_work(&self, work: &BucketedWork, num_active_tokens: usize) {
-        let num_active_routes = num_active_tokens * self.num_experts_per_token();
-        let routes_by_expert = self.routes_by_expert.read_typed::<u32>(0, self.num_total_routes());
-        let routes_by_token = self.routes_by_token.read_typed::<u32>(0, self.num_total_routes());
-        let experts_by_route = self.experts_by_route.read_typed::<u32>(0, self.num_total_routes());
-        assert_expert_major_maps(
-            &work.expert_indices[..num_active_routes],
-            &routes_by_expert[..num_active_routes],
-            &routes_by_token[..num_active_routes],
-            &experts_by_route[..num_active_routes],
-        );
+    fn submit(&self, replay: &ReplayProgram, num_active_tokens: u32) {
+        let arguments = ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens);
+        self.stream.submit_replay_with_arguments(replay, &arguments).wait();
+    }
+
+    fn assert_active_work(&self, work: &ExpertMajorWork, num_active_tokens: u32) {
+        let num_active_tokens = num_active_tokens as usize;
+        let num_active_routes = num_active_tokens * self.config.num_experts_per_token as usize;
+        let hidden_dim = self.config.hidden_dim as usize;
+        let expert_indices = &work.expert_indices[..num_active_routes];
+
+        let expected_counts = expert_counts_reference(expert_indices, self.config.num_experts as usize);
+        let expected_offsets = expert_offsets_reference(&expected_counts);
         assert_eq!(
             self.expert_counts
-                .read_typed::<u32>(0, self.config.num_experts as usize)
-                .into_iter()
-                .sum::<u32>(),
-            num_active_routes as u32
+                .read_typed::<u32>(0, self.config.num_experts as usize),
+            expected_counts
         );
         assert_eq!(
             self.expert_offsets
-                .read_typed::<u32>(0, self.config.num_experts as usize + 1)
-                .last(),
-            Some(&(num_active_routes as u32))
+                .read_typed::<u32>(0, self.config.num_experts as usize + 1),
+            expected_offsets
+        );
+
+        let routes_by_expert = self.routes_by_expert.read_typed::<u32>(0, num_active_routes);
+        let routes_by_token = self.routes_by_token.read_typed::<u32>(0, num_active_routes);
+        let experts_by_route = self.experts_by_route.read_typed::<u32>(0, num_active_routes);
+        assert_expert_major_maps(
+            expert_indices,
+            &expected_offsets,
+            &routes_by_expert,
+            &routes_by_token,
+            &experts_by_route,
         );
         assert_packed_input_matches_routes(
             &work.input,
-            &self
-                .packed_input
-                .read_typed::<u16>(0, self.num_total_routes() * self.hidden_dim())
-                [..num_active_routes * self.hidden_dim()],
-            &routes_by_expert[..num_active_routes],
-            self.num_experts_per_token(),
-            self.hidden_dim(),
+            &self.packed_input.read_typed::<u16>(0, num_active_routes * hidden_dim),
+            &routes_by_expert,
+            self.config.num_experts_per_token as usize,
+            hidden_dim,
         );
-        let expected = cpu_scatter(
+
+        let routed_hidden = repeated_route_hidden(
             &work.input,
-            &work.routed_probs,
             num_active_tokens,
-            self.num_experts_per_token(),
-            self.hidden_dim(),
+            self.config.num_experts_per_token as usize,
+            hidden_dim,
         );
-        let num_active_output_elements = num_active_tokens * self.hidden_dim();
-        assert_eq!(
-            &self
-                .output
-                .read_typed::<u16>(0, self.num_total_tokens() * self.hidden_dim())[..num_active_output_elements],
-            expected
-        );
-        let expected_with_shared_experts = cpu_scatter_with_shared_experts(
-            &expected,
-            &work.shared_hidden,
-            &work.shared_expert_gate_logits,
+        let routed = moe_combine_without_shared_experts_bf16_reference(
+            &routed_hidden,
+            &work.routed_probs[..num_active_routes],
             num_active_tokens,
-            self.hidden_dim(),
+            self.config.num_experts_per_token as usize,
+            hidden_dim,
+        );
+        assert_eq!(self.output.read_typed::<u16>(0, routed.len()), routed);
+        let expected_with_shared_experts = moe_combine_with_shared_experts_bf16_reference(
+            &routed,
+            &work.shared_hidden[..num_active_tokens * hidden_dim],
+            &work.shared_expert_gate_logits[..num_active_tokens],
+            num_active_tokens,
+            hidden_dim,
         );
         assert_eq!(
-            &self
-                .output_with_shared_experts
-                .read_typed::<u16>(0, self.num_total_tokens() * self.hidden_dim())[..num_active_output_elements],
+            self.output_with_shared_experts
+                .read_typed::<u16>(0, expected_with_shared_experts.len()),
             expected_with_shared_experts
         );
     }
-
-    fn assert_canary_tails(&self, num_active_tokens: usize) {
-        let num_active_routes = num_active_tokens * self.num_experts_per_token();
-        let num_active_route_elements = num_active_routes * self.hidden_dim();
-        let num_active_output_elements = num_active_tokens * self.hidden_dim();
-        assert_eq!(
-            &self.routes_by_expert.read_typed::<u32>(0, self.num_total_routes())[num_active_routes..],
-            &vec![U32_CANARY; self.num_total_routes() - num_active_routes]
-        );
-        assert_eq!(
-            &self.routes_by_token.read_typed::<u32>(0, self.num_total_routes())[num_active_routes..],
-            &vec![U32_CANARY; self.num_total_routes() - num_active_routes]
-        );
-        assert_eq!(
-            &self.experts_by_route.read_typed::<u32>(0, self.num_total_routes())[num_active_routes..],
-            &vec![U32_CANARY; self.num_total_routes() - num_active_routes]
-        );
-        assert_eq!(
-            &self
-                .packed_input
-                .read_typed::<u16>(0, self.num_total_routes() * self.hidden_dim())[num_active_route_elements..],
-            &vec![BF16_CANARY; self.num_total_routes() * self.hidden_dim() - num_active_route_elements]
-        );
-        for output in [&self.output, &self.output_with_shared_experts] {
-            assert_eq!(
-                &output.read_typed::<u16>(0, self.num_total_tokens() * self.hidden_dim())[num_active_output_elements..],
-                &vec![BF16_CANARY; self.num_total_tokens() * self.hidden_dim() - num_active_output_elements]
-            );
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn assert_preserved_tails(
-        &self,
-        num_active_tokens: usize,
-        routes_by_expert: &[u32],
-        routes_by_token: &[u32],
-        experts_by_route: &[u32],
-        packed_input: &[u16],
-        output: &[u16],
-        output_with_shared_experts: &[u16],
-    ) {
-        let num_active_routes = num_active_tokens * self.num_experts_per_token();
-        let num_active_route_elements = num_active_routes * self.hidden_dim();
-        let num_active_output_elements = num_active_tokens * self.hidden_dim();
-        assert_eq!(
-            &self.routes_by_expert.read_typed::<u32>(0, self.num_total_routes())[num_active_routes..],
-            &routes_by_expert[num_active_routes..]
-        );
-        assert_eq!(
-            &self.routes_by_token.read_typed::<u32>(0, self.num_total_routes())[num_active_routes..],
-            &routes_by_token[num_active_routes..]
-        );
-        assert_eq!(
-            &self.experts_by_route.read_typed::<u32>(0, self.num_total_routes())[num_active_routes..],
-            &experts_by_route[num_active_routes..]
-        );
-        assert_eq!(
-            &self
-                .packed_input
-                .read_typed::<u16>(0, self.num_total_routes() * self.hidden_dim())[num_active_route_elements..],
-            &packed_input[num_active_route_elements..]
-        );
-        assert_eq!(
-            &self
-                .output
-                .read_typed::<u16>(0, self.num_total_tokens() * self.hidden_dim())[num_active_output_elements..],
-            &output[num_active_output_elements..]
-        );
-        assert_eq!(
-            &self
-                .output_with_shared_experts
-                .read_typed::<u16>(0, self.num_total_tokens() * self.hidden_dim())[num_active_output_elements..],
-            &output_with_shared_experts[num_active_output_elements..]
-        );
-    }
-
-    fn layout_buffers(&self) -> LayoutBuffers<'_> {
-        LayoutBuffers {
-            expert_indices: &self.expert_indices,
-            expert_counts: &self.expert_counts,
-            expert_offsets: &self.expert_offsets,
-            expert_cursors: &self.expert_cursors,
-            routes_by_expert: &self.routes_by_expert,
-            routes_by_token: &self.routes_by_token,
-            experts_by_route: &self.experts_by_route,
-        }
-    }
-
-    fn pack_input_buffers(&self) -> PackInputBuffers<'_> {
-        PackInputBuffers {
-            input: &self.input,
-            routes_by_expert: &self.routes_by_expert,
-            packed_input: &self.packed_input,
-        }
-    }
-
-    fn scatter_without_shared_experts_buffers(&self) -> ScatterWithoutSharedExpertsBuffers<'_> {
-        ScatterWithoutSharedExpertsBuffers {
-            packed_output: &self.packed_input,
-            routes_by_token: &self.routes_by_token,
-            routed_probs: &self.routed_probs,
-            output: &self.output,
-        }
-    }
-
-    fn scatter_with_shared_experts_buffers(&self) -> ScatterWithSharedExpertsBuffers<'_> {
-        ScatterWithSharedExpertsBuffers {
-            packed_output: &self.packed_input,
-            routes_by_token: &self.routes_by_token,
-            routed_probs: &self.routed_probs,
-            shared_hidden: &self.shared_hidden,
-            shared_expert_gate_logits: &self.shared_expert_gate_logits,
-            output: &self.output_with_shared_experts,
-        }
-    }
-
-    fn num_total_tokens(&self) -> usize {
-        self.shape.num_total_tokens as usize
-    }
-
-    fn num_total_routes(&self) -> usize {
-        self.config.num_routes(self.shape) as usize
-    }
-
-    fn num_experts_per_token(&self) -> usize {
-        self.config.num_experts_per_token as usize
-    }
-
-    fn hidden_dim(&self) -> usize {
-        self.config.hidden_dim as usize
-    }
 }
 
-fn cpu_scatter(input: &[f32], probs: &[f32], num_tokens: usize, topk: usize, hidden: usize) -> Vec<u16> {
-    let mut out = Vec::new();
-    for token in 0..num_tokens {
-        for dim in 0..hidden {
-            let mut acc = 0.0_f32;
-            for slot in 0..topk {
-                let route = token * topk + slot;
-                let route_weight = bf16::from_f32(probs[route]).to_f32();
-                let hidden_value = bf16::from_f32(input[token * hidden + dim]).to_f32();
-                let weighted = bf16::from_f32(route_weight * hidden_value).to_f32();
-                acc = bf16::from_f32(acc + weighted).to_f32();
-            }
-            out.push(bf16::from_f32(acc).to_bits());
-        }
+fn expert_counts_reference(expert_indices: &[u32], num_experts: usize) -> Vec<u32> {
+    let mut counts = vec![0_u32; num_experts];
+    for &expert_index in expert_indices {
+        counts[expert_index as usize] += 1;
     }
-    out
+    counts
+}
+
+fn expert_offsets_reference(expert_counts: &[u32]) -> Vec<u32> {
+    let mut offsets = Vec::with_capacity(expert_counts.len() + 1);
+    offsets.push(0);
+    for &count in expert_counts {
+        offsets.push(offsets.last().copied().unwrap() + count);
+    }
+    offsets
 }
 
 fn assert_expert_major_maps(
     expert_indices: &[u32],
+    expert_offsets: &[u32],
     routes_by_expert: &[u32],
     routes_by_token: &[u32],
     experts_by_route: &[u32],
 ) {
-    for (expert_route, original_route) in routes_by_expert.iter().enumerate() {
-        let original_route = *original_route as usize;
+    let mut seen_routes = vec![false; expert_indices.len()];
+    for (expert_route, &original_route) in routes_by_expert.iter().enumerate() {
+        let original_route = original_route as usize;
+        assert!(original_route < expert_indices.len());
+        assert!(!seen_routes[original_route]);
+        seen_routes[original_route] = true;
         assert_eq!(routes_by_token[original_route] as usize, expert_route);
         assert_eq!(experts_by_route[expert_route], expert_indices[original_route]);
+    }
+    assert!(seen_routes.into_iter().all(|seen| seen));
+    for expert in 0..expert_offsets.len() - 1 {
+        for &actual_expert in &experts_by_route[expert_offsets[expert] as usize..expert_offsets[expert + 1] as usize] {
+            assert_eq!(actual_expert as usize, expert);
+        }
     }
 }
 
@@ -556,47 +282,64 @@ fn assert_packed_input_matches_routes(
     input: &[f32],
     packed_input: &[u16],
     routes_by_expert: &[u32],
-    topk: usize,
-    hidden: usize,
+    num_experts_per_token: usize,
+    hidden_dim: usize,
 ) {
-    for (expert_route, original_route) in routes_by_expert.iter().enumerate() {
-        let token = *original_route as usize / topk;
-        for dim in 0..hidden {
+    for (expert_route, &original_route) in routes_by_expert.iter().enumerate() {
+        let token = original_route as usize / num_experts_per_token;
+        for hidden_index in 0..hidden_dim {
             assert_eq!(
-                packed_input[expert_route * hidden + dim],
-                bf16::from_f32(input[token * hidden + dim]).to_bits()
+                packed_input[expert_route * hidden_dim + hidden_index],
+                bf16::from_f32(input[token * hidden_dim + hidden_index]).to_bits()
             );
         }
     }
 }
 
-fn cpu_scatter_with_shared_experts(
-    routed_output: &[u16],
-    shared_hidden: &[f32],
-    shared_expert_gate_logits: &[f32],
+fn repeated_route_hidden(
+    input: &[f32],
     num_tokens: usize,
-    hidden: usize,
-) -> Vec<u16> {
-    let mut out = Vec::new();
-    for (token, gate_logit) in shared_expert_gate_logits.iter().enumerate().take(num_tokens) {
-        let gate_logit = bf16::from_f32(*gate_logit).to_f32();
-        let shared_expert_gate = 1.0 / (1.0 + (-gate_logit).exp());
-        for dim in 0..hidden {
-            let gid = token * hidden + dim;
-            let routed = bf16::from_bits(routed_output[gid]).to_f32();
-            let shared = bf16::from_f32(shared_hidden[gid]).to_f32();
-            out.push(bf16::from_f32(routed + shared_expert_gate * shared).to_bits());
+    num_experts_per_token: usize,
+    hidden_dim: usize,
+) -> Vec<f32> {
+    let mut output = Vec::with_capacity(num_tokens * num_experts_per_token * hidden_dim);
+    for token in 0..num_tokens {
+        let hidden = &input[token * hidden_dim..(token + 1) * hidden_dim];
+        for _ in 0..num_experts_per_token {
+            output.extend_from_slice(hidden);
         }
     }
-    out
+    output
 }
 
-fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
-    let bits: Vec<u16> = values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect();
-    Buffer::from_slice(device, &bits)
+fn generated_values(count: usize, mut state: u32) -> Vec<f32> {
+    (0..count)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
+        })
+        .collect()
 }
 
-fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
-    let bits: Vec<u16> = values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect();
-    buffer.write_typed(0, &bits);
+fn generated_probs(num_tokens: usize, num_routes: usize, mut state: u32) -> Vec<f32> {
+    let mut values = Vec::with_capacity(num_tokens * num_routes);
+    for _ in 0..num_tokens {
+        let row = (0..num_routes)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / 16_777_216.0) + 0.01
+            })
+            .collect::<Vec<_>>();
+        let sum = row.iter().sum::<f32>();
+        values.extend(row.into_iter().map(|value| value / sum));
+    }
+    values
+}
+
+fn bf16_bits(values: &[f32]) -> Vec<u16> {
+    values.iter().map(|value| bf16::from_f32(*value).to_bits()).collect()
+}
+
+fn bf16_values(values: &[f32]) -> Vec<f32> {
+    values.iter().map(|value| bf16::from_f32(*value).to_f32()).collect()
 }

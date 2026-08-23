@@ -635,15 +635,20 @@ expert-major execution.
 Changing the selector is a Metal backend performance change.
 Recommendation: Justify that change with full MoE wrapper numbers, not only isolated sparse MLP kernel timings.
 
-Focused tests compare routing, token-major sparse MLP, and combine with CPU references.
-They use fixed and random inputs.
-The expert-major test records the production subgraph `layout -> pack -> sparse MLP -> scatter`.
-It compares the final token-major output with the same CPU expert and bf16-combine references.
-This comparison covers fixed and random fixtures.
-Bucketed component tests use one reusable replay for an active prefix, full capacity, and a smaller active prefix.
-They poison inactive input and verify output canaries or preserved tails.
-Separate tests cover token-major, token-major fast-down, expert-major, normalized routing, non-normalized routing,
-shared combine, and non-shared combine because these cases use different kernels or data layouts.
+Focused leaf tests record one total capacity into an isolated test cache.
+They replay all legal active-token counts in non-monotonic order and compare the active logical domain with CPU
+references.
+The routing test covers normalized and non-normalized top-k probabilities.
+The sparse MLP test covers token-major and expert-major layouts, including the token-major fast-down topology.
+The combine test covers paths with and without shared experts.
+The expert-major layout test compares expert counts, expert offsets, route-map invariants, packed input, and both
+scatter paths with CPU references.
+It does not require a stable route order inside one expert group.
+The leaf tests do not use inactive output or scratch tails as an oracle.
+The full `GatedMoE` replay test uses isolated test caches and CPU composition references. It covers token-major capacity
+`4` and expert-major capacity `8`. It replays every legal active token count in non-monotonic order. It runs with and
+without shared experts. A separate routing replay test uses non-uniform router weights and checks active logits,
+probabilities, expert indices, and expert probabilities against the CPU routing reference.
 Replay infrastructure tests own generic replay-parameter validation.
 
 ## Tests and benchmarks

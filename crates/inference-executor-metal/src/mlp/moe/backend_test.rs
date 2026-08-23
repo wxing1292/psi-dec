@@ -5,11 +5,24 @@ use inference_backend_metal::components::dense_mlp;
 use inference_backend_metal::components::sparse_mlp;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
+use inference_executor_core::mlp::dense::reference::QuantizedAffineReferenceShape;
+use inference_executor_core::mlp::dense::reference::QuantizedDenseMLPReferenceGeometry;
+use inference_executor_core::mlp::dense::reference::QuantizedDenseMLPReferenceWeights;
+use inference_executor_core::mlp::dense::reference::quantized_affine_reference;
+use inference_executor_core::mlp::dense::reference::quantized_dense_mlp_reference;
+use inference_executor_core::mlp::moe::reference::QuantizedSparseMLPReferenceInput;
+use inference_executor_core::mlp::moe::reference::QuantizedSparseMLPReferenceWeights;
+use inference_executor_core::mlp::moe::reference::moe_combine_with_shared_experts_bf16_reference;
+use inference_executor_core::mlp::moe::reference::moe_combine_without_shared_experts_bf16_reference;
 use inference_executor_core::mlp::moe::reference::moe_routing_from_bf16_probs_reference;
+use inference_executor_core::mlp::moe::reference::quantized_sparse_mlp_reference;
 
 use super::*;
 use crate::def::replay_op::MetalReplayRuntime;
+use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::moe::scratch::MoEScratch;
+use crate::replay::Replay;
+use crate::replay::ReplayComponent;
 
 const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gated_moe.num_active_tokens");
 
@@ -33,14 +46,13 @@ fn test_selector_returns_registered_variant_at_crossover() {
 }
 
 #[test]
-fn test_routing_active_total_chain_preserves_inactive_rows_across_reuse() {
+fn test_routing_replay_matches_reference_across_active_counts() {
     let device = Device::system_default();
     let stream = inference_backend_metal::metal::Stream::new(&device);
     let (core, metal) = routing_test_config(true);
     let moe = GatedMoE::new(&device, core.clone(), metal);
     let router_config = affine_config_with_bits(core.num_experts, core.hidden_dim, metal.router_bits, metal);
-    let num_total_tokens = 4_u32;
-    let num_active_tokens = 3_u32;
+    let num_total_tokens = 8_u32;
     let hidden_dim = core.hidden_dim;
     let num_experts = core.num_experts;
     let topk = core.num_experts_per_token;
@@ -49,8 +61,6 @@ fn test_routing_active_total_chain_preserves_inactive_rows_across_reuse() {
             .map(|index| ((index * 17 + 5) % 41) as f32 * 0.03125 - 0.625)
             .collect::<Vec<_>>(),
     );
-    let mut active_hidden = all_hidden.clone();
-    active_hidden[num_active_tokens as usize * hidden_dim..].fill(f32::NAN);
     let router_weight_values = (0..num_experts * hidden_dim)
         .map(|index| ((index * 29 + 11) % 251) as u8)
         .collect::<Vec<_>>();
@@ -65,18 +75,16 @@ fn test_routing_active_total_chain_preserves_inactive_rows_across_reuse() {
             .collect::<Vec<_>>(),
     );
     assert_eq!(router_weight_values.len(), router_config.weight_bytes());
-    let hidden_state = bf16_buffer(&device, &active_hidden);
+    let hidden_state = bf16_buffer(&device, &all_hidden);
     let router_weight = Buffer::from_slice(&device, &router_weight_values);
     let router_scales = bf16_buffer(&device, &router_scale_values);
     let router_biases = bf16_buffer(&device, &router_bias_values);
-    let bf16_sentinel = bf16::from_f32(-777.0).to_f32();
-    let index_sentinel = 0xDEAD_BEEF_u32;
     let num_router_values = num_total_tokens as usize * num_experts;
     let num_routes = num_total_tokens as usize * topk;
-    let router_logits = bf16_buffer(&device, &vec![bf16_sentinel; num_router_values]);
-    let router_probs = bf16_buffer(&device, &vec![bf16_sentinel; num_router_values]);
-    let expert_indices = Buffer::from_slice(&device, &vec![index_sentinel; num_routes]);
-    let expert_probs = Buffer::from_slice(&device, &vec![-777.0_f32; num_routes]);
+    let router_logits = Buffer::new_zeroed_elements(&device, num_router_values, Dtype::Bfloat16);
+    let router_probs = Buffer::new_zeroed_elements(&device, num_router_values, Dtype::Bfloat16);
+    let expert_indices = Buffer::new_zeroed_elements(&device, num_routes, Dtype::Uint32);
+    let expert_probs = Buffer::new_zeroed_elements(&device, num_routes, Dtype::Float32);
     let scratch = MoERoutingScratchBindings {
         router_logits: &router_logits,
         router_probs: &router_probs,
@@ -107,162 +115,52 @@ fn test_routing_active_total_chain_preserves_inactive_rows_across_reuse() {
     );
 
     let runtime = MetalReplayRuntime::new(&stream);
-    let mut exact_recorder = runtime.create_recorder();
-    moe.record_routing(
-        &mut exact_recorder,
-        GatedMoERoutingInput {
-            num_total_tokens: num_active_tokens,
-            num_active_tokens: ReplayU32::Fixed(num_active_tokens),
-            hidden_state: &hidden_state,
-            scratch,
-            weights,
-        },
-    );
-    let exact_replay = exact_recorder.build();
-    runtime.submit_replay(&exact_replay).wait();
-    let active_router_values = num_active_tokens as usize * num_experts;
-    let active_routes = num_active_tokens as usize * topk;
-    let exact_logits = read_bf16_values(&router_logits, num_router_values);
-    let exact_probs = read_bf16_values(&router_probs, num_router_values);
-    let exact_indices = expert_indices.read_typed::<u32>(0, num_routes);
-    let exact_expert_probs = expert_probs.read_typed::<f32>(0, num_routes);
-    assert_close(
-        &exact_logits[..active_router_values],
-        &expected_logits[..active_router_values],
-        0.25,
-    );
-    assert_close(
-        &exact_probs[..active_router_values],
-        &expected_probs[..active_router_values],
-        0.02,
-    );
-    assert_eq!(
-        &exact_indices[..active_routes],
-        &expected_routes.expert_indices[..active_routes]
-    );
-    assert_close(
-        &exact_expert_probs[..active_routes],
-        &expected_routes.expert_probs[..active_routes],
-        0.02,
-    );
-    assert_eq!(&exact_logits[active_router_values..], &vec![bf16_sentinel; num_experts]);
-    assert_eq!(&exact_probs[active_router_values..], &vec![bf16_sentinel; num_experts]);
-    assert_eq!(&exact_indices[active_routes..], &vec![index_sentinel; topk]);
-    assert_eq!(&exact_expert_probs[active_routes..], &vec![-777.0_f32; topk]);
+    let mut replay = Replay::new("test.gated_moe.routing", TestGatedMoERouting(moe));
+    let input = GatedMoERoutingInput {
+        num_total_tokens,
+        num_active_tokens: ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
+        hidden_state: &hidden_state,
+        scratch,
+        weights,
+    };
+    let (key, cache_hit) = replay.record(&runtime, &input);
+    assert!(!cache_hit);
 
-    reset_routing_outputs(
-        &router_logits,
-        &router_probs,
-        &expert_indices,
-        &expert_probs,
-        num_router_values,
-        num_routes,
-        bf16_sentinel,
-        index_sentinel,
-    );
-    let mut bucketed_recorder = runtime.create_recorder();
-    moe.record_routing(
-        &mut bucketed_recorder,
-        GatedMoERoutingInput {
-            num_total_tokens,
-            num_active_tokens: ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-            hidden_state: &hidden_state,
-            scratch,
-            weights,
-        },
-    );
-    let bucketed_replay = bucketed_recorder.build();
-    runtime
-        .submit_replay_with_arguments(
-            &bucketed_replay,
-            &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
-        )
-        .wait();
-    let first_logits = read_bf16_values(&router_logits, num_router_values);
-    let first_probs = read_bf16_values(&router_probs, num_router_values);
-    let first_indices = expert_indices.read_typed::<u32>(0, num_routes);
-    let first_expert_probs = expert_probs.read_typed::<f32>(0, num_routes);
-    assert_close(
-        &first_logits[..active_router_values],
-        &exact_logits[..active_router_values],
-        0.0,
-    );
-    assert_close(
-        &first_probs[..active_router_values],
-        &exact_probs[..active_router_values],
-        0.0,
-    );
-    assert_eq!(&first_indices[..active_routes], &exact_indices[..active_routes]);
-    assert_close(
-        &first_expert_probs[..active_routes],
-        &exact_expert_probs[..active_routes],
-        0.0,
-    );
-    assert_eq!(&first_logits[active_router_values..], &vec![bf16_sentinel; num_experts]);
-    assert_eq!(&first_probs[active_router_values..], &vec![bf16_sentinel; num_experts]);
-    assert_eq!(&first_indices[active_routes..], &vec![index_sentinel; topk]);
-    assert_eq!(&first_expert_probs[active_routes..], &vec![-777.0_f32; topk]);
+    for num_active_tokens in [1_u32, 8, 3, 7, 2, 6, 4, 5] {
+        assert_eq!(replay.record(&runtime, &input), (key, true));
+        runtime
+            .submit_replay_with_arguments(
+                replay.replay(&key),
+                &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
+            )
+            .wait();
 
-    write_bf16_values(&hidden_state, &all_hidden);
-    runtime
-        .submit_replay_with_arguments(
-            &bucketed_replay,
-            &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_total_tokens),
-        )
-        .wait();
-    let full_logits = read_bf16_values(&router_logits, num_router_values);
-    let full_probs = read_bf16_values(&router_probs, num_router_values);
-    let full_indices = expert_indices.read_typed::<u32>(0, num_routes);
-    let full_expert_probs = expert_probs.read_typed::<f32>(0, num_routes);
-    assert_close(&full_logits, &expected_logits, 0.25);
-    assert_close(&full_probs, &expected_probs, 0.02);
-    assert_eq!(full_indices, expected_routes.expert_indices);
-    assert_close(&full_expert_probs, &expected_routes.expert_probs, 0.02);
-
-    write_bf16_values(&hidden_state, &active_hidden);
-    runtime
-        .submit_replay_with_arguments(
-            &bucketed_replay,
-            &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
-        )
-        .wait();
-    let shrunk_logits = read_bf16_values(&router_logits, num_router_values);
-    let shrunk_probs = read_bf16_values(&router_probs, num_router_values);
-    let shrunk_indices = expert_indices.read_typed::<u32>(0, num_routes);
-    let shrunk_expert_probs = expert_probs.read_typed::<f32>(0, num_routes);
-    assert_close(
-        &shrunk_logits[..active_router_values],
-        &exact_logits[..active_router_values],
-        0.0,
-    );
-    assert_close(
-        &shrunk_probs[..active_router_values],
-        &exact_probs[..active_router_values],
-        0.0,
-    );
-    assert_eq!(&shrunk_indices[..active_routes], &exact_indices[..active_routes]);
-    assert_close(
-        &shrunk_expert_probs[..active_routes],
-        &exact_expert_probs[..active_routes],
-        0.0,
-    );
-    assert_eq!(
-        &shrunk_logits[active_router_values..],
-        &full_logits[active_router_values..]
-    );
-    assert_eq!(
-        &shrunk_probs[active_router_values..],
-        &full_probs[active_router_values..]
-    );
-    assert_eq!(&shrunk_indices[active_routes..], &full_indices[active_routes..]);
-    assert_eq!(
-        &shrunk_expert_probs[active_routes..],
-        &full_expert_probs[active_routes..]
-    );
+        let active_router_values = num_active_tokens as usize * num_experts;
+        let active_routes = num_active_tokens as usize * topk;
+        assert_close(
+            &read_bf16_values(&router_logits, num_router_values)[..active_router_values],
+            &expected_logits[..active_router_values],
+            0.25,
+        );
+        assert_close(
+            &read_bf16_values(&router_probs, num_router_values)[..active_router_values],
+            &expected_probs[..active_router_values],
+            0.02,
+        );
+        assert_eq!(
+            &expert_indices.read_typed::<u32>(0, num_routes)[..active_routes],
+            &expected_routes.expert_indices[..active_routes]
+        );
+        assert_close(
+            &expert_probs.read_typed::<f32>(0, num_routes)[..active_routes],
+            &expected_routes.expert_probs[..active_routes],
+            0.02,
+        );
+    }
 }
 
 #[test]
-fn test_full_active_total_record_matches_fixed_and_preserves_inactive_rows() {
+fn test_full_replay_matches_reference_across_active_counts_and_topologies() {
     let device = Device::system_default();
     let stream = inference_backend_metal::metal::Stream::new(&device);
     let runtime = MetalReplayRuntime::new(&stream);
@@ -271,7 +169,7 @@ fn test_full_active_total_record_matches_fixed_and_preserves_inactive_rows() {
         let (core, metal) = full_test_config(with_shared_experts);
         let moe = GatedMoE::new(&device, core.clone(), metal);
         let weights = FullMoETestWeights::new(&device, &core, metal);
-        let max_tokens = 6_u32;
+        let max_tokens = 8_u32;
         let scratch = MoEScratch::new(&device, &core, metal, max_tokens as usize);
         let all_hidden = bf16_values(
             &(0..max_tokens as usize * core.hidden_dim)
@@ -279,109 +177,73 @@ fn test_full_active_total_record_matches_fixed_and_preserves_inactive_rows() {
                 .collect::<Vec<_>>(),
         );
         let hidden_state = bf16_buffer(&device, &all_hidden);
-        let sentinel = bf16::from_f32(91.0).to_bits();
         let output_elements = max_tokens as usize * core.hidden_dim;
-        let exact_output = Buffer::from_slice(&device, &vec![sentinel; output_elements]);
-        let bucketed_output = Buffer::from_slice(&device, &vec![sentinel; output_elements]);
+        let next_hidden_state = Buffer::new_zeroed_elements(&device, output_elements, Dtype::Bfloat16);
+        let mut replay = Replay::new("test.gated_moe.full", TestGatedMoE(moe));
 
-        for (num_active_tokens, num_total_tokens) in [(3_u32, 4_u32), (5_u32, 6_u32)] {
-            write_bf16_bits(&exact_output, &vec![sentinel; output_elements]);
-            write_bf16_bits(&bucketed_output, &vec![sentinel; output_elements]);
-            let mut active_hidden = all_hidden.clone();
-            active_hidden[num_active_tokens as usize * core.hidden_dim..].fill(f32::NAN);
-            write_bf16_values(&hidden_state, &active_hidden);
-
-            let mut exact_active_recorder = runtime.create_recorder();
-            let _ = <GatedMoE as ReplayLayer>::record(
-                &moe,
-                &mut exact_active_recorder,
-                weights.input(
-                    &scratch,
-                    &hidden_state,
-                    &exact_output,
-                    num_active_tokens,
-                    ReplayU32::Fixed(num_active_tokens),
-                ),
+        for (num_total_tokens, active_counts) in [
+            (4_u32, [1_u32, 4, 2, 3, 0, 0, 0, 0]),
+            (8_u32, [1_u32, 8, 3, 7, 2, 6, 4, 5]),
+        ] {
+            let input = weights.input(
+                &scratch,
+                &hidden_state,
+                &next_hidden_state,
+                num_total_tokens,
+                ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
             );
-            let exact_active_replay = exact_active_recorder.build();
+            let (key, cache_hit) = replay.record(&runtime, &input);
+            assert!(!cache_hit);
 
-            let mut exact_total_recorder = runtime.create_recorder();
-            let _ = <GatedMoE as ReplayLayer>::record(
-                &moe,
-                &mut exact_total_recorder,
-                weights.input(
-                    &scratch,
-                    &hidden_state,
-                    &exact_output,
-                    num_total_tokens,
-                    ReplayU32::Fixed(num_total_tokens),
-                ),
-            );
-            let exact_total_replay = exact_total_recorder.build();
+            for num_active_tokens in active_counts.into_iter().take(num_total_tokens as usize) {
+                assert_eq!(replay.record(&runtime, &input), (key, true));
+                runtime
+                    .submit_replay_with_arguments(
+                        replay.replay(&key),
+                        &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
+                    )
+                    .wait();
 
-            let mut bucketed_recorder = runtime.create_recorder();
-            let _ = <GatedMoE as ReplayLayer>::record(
-                &moe,
-                &mut bucketed_recorder,
-                weights.input(
-                    &scratch,
-                    &hidden_state,
-                    &bucketed_output,
-                    num_total_tokens,
-                    ReplayU32::Parameter(NUM_ACTIVE_TOKENS),
-                ),
-            );
-            let bucketed_replay = bucketed_recorder.build();
-
-            runtime.submit_replay(&exact_active_replay).wait();
-            let num_active_values = num_active_tokens as usize * core.hidden_dim;
-            let num_total_values = num_total_tokens as usize * core.hidden_dim;
-            let exact_active = exact_output.read_typed::<u16>(0, num_total_values);
-            assert_finite_nonzero_bf16_bits(&exact_active[..num_active_values]);
-            runtime
-                .submit_replay_with_arguments(
-                    &bucketed_replay,
-                    &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
-                )
-                .wait();
-            let first_bucketed = bucketed_output.read_typed::<u16>(0, num_total_values);
-            assert_eq!(&first_bucketed[..num_active_values], &exact_active[..num_active_values]);
-            assert_eq!(
-                &first_bucketed[num_active_values..],
-                &vec![sentinel; num_total_values - num_active_values]
-            );
-
-            write_bf16_values(&hidden_state, &all_hidden);
-            runtime.submit_replay(&exact_total_replay).wait();
-            let exact_total = exact_output.read_typed::<u16>(0, num_total_values);
-            runtime
-                .submit_replay_with_arguments(
-                    &bucketed_replay,
-                    &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_total_tokens),
-                )
-                .wait();
-            let full_bucketed = bucketed_output.read_typed::<u16>(0, num_total_values);
-            assert_eq!(full_bucketed, exact_total);
-
-            write_bf16_values(&hidden_state, &active_hidden);
-            runtime.submit_replay(&exact_active_replay).wait();
-            let exact_shrunk = exact_output.read_typed::<u16>(0, num_total_values);
-            runtime
-                .submit_replay_with_arguments(
-                    &bucketed_replay,
-                    &ReplayArguments::new().with_u32(NUM_ACTIVE_TOKENS, num_active_tokens),
-                )
-                .wait();
-            let shrunk_bucketed = bucketed_output.read_typed::<u16>(0, num_total_values);
-            assert_eq!(
-                &shrunk_bucketed[..num_active_values],
-                &exact_shrunk[..num_active_values]
-            );
-            assert_eq!(
-                &shrunk_bucketed[num_active_values..],
-                &full_bucketed[num_active_values..]
-            );
+                let active_values = num_active_tokens as usize * core.hidden_dim;
+                let actual = read_bf16_values(&next_hidden_state, output_elements);
+                let expected =
+                    full_moe_reference(&core, metal, &all_hidden[..active_values], num_active_tokens as usize);
+                assert_close(&actual[..active_values], &expected, 0.05);
+            }
         }
+    }
+}
+
+struct TestGatedMoERouting(GatedMoE);
+
+impl ReplayComponent for TestGatedMoERouting {
+    type Key = (u32, GatedMoERoutingReplayTopology);
+    type Input<'a> = GatedMoERoutingInput<'a>;
+
+    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
+        (
+            input.num_total_tokens,
+            self.0.routing_replay_topology(input.num_total_tokens),
+        )
+    }
+
+    fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
+        self.0.record_routing(recorder, *input);
+    }
+}
+
+struct TestGatedMoE(GatedMoE);
+
+impl ReplayComponent for TestGatedMoE {
+    type Key = (u32, GatedMoEReplayTopology);
+    type Input<'a> = GatedMoEInput<'a>;
+
+    fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
+        (input.num_total_tokens, self.0.replay_topology(input.num_total_tokens))
+    }
+
+    fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
+        let _ = <GatedMoE as ReplayLayer>::record(&self.0, recorder, *input);
     }
 }
 
@@ -619,6 +481,129 @@ fn routing_test_config(norm_topk_prob: bool) -> (GatedMoECore, GatedMoEMetalConf
     )
 }
 
+fn full_moe_reference(core: &GatedMoECore, metal: GatedMoEMetalConfig, hidden: &[f32], num_tokens: usize) -> Vec<f32> {
+    assert_eq!(hidden.len(), num_tokens * core.hidden_dim);
+    let router_config = affine_config_with_bits(core.num_experts, core.hidden_dim, metal.router_bits, metal);
+    let router_weights = vec![9_u8; router_config.weight_bytes()];
+    let router_scales = vec![0.000_976_562_5; router_config.scale_or_bias_bytes() / size_of::<u16>()];
+    let router_biases = vec![0.0; router_scales.len()];
+    let router_logits = cpu_router_logits(
+        router_config,
+        num_tokens,
+        hidden,
+        &router_weights,
+        &router_scales,
+        &router_biases,
+    );
+    let router_probs = cpu_softmax_bf16_rows(&router_logits, num_tokens, core.num_experts);
+    let routes = moe_routing_from_bf16_probs_reference(
+        &router_probs,
+        num_tokens,
+        core.num_experts,
+        core.num_experts_per_token,
+        core.norm_topk_prob,
+    );
+
+    let sparse_config = topk_experts_config(core, metal);
+    let gate_up_config = sparse_config.gate_up_config();
+    let down_config = sparse_config.down_config();
+    let gate_up_weight_len = core.num_experts * gate_up_config.weight_bytes_per_expert();
+    let gate_up_param_len = core.num_experts * gate_up_config.affine_param_bytes_per_expert() / size_of::<u16>();
+    let down_weight_len = core.num_experts * down_config.weight_bytes_per_expert();
+    let down_param_len = core.num_experts * down_config.affine_param_bytes_per_expert() / size_of::<u16>();
+    let token_indices = (0..num_tokens)
+        .flat_map(|token| (0..core.num_experts_per_token).map(move |_| token as u32))
+        .collect::<Vec<_>>();
+    let swiglu_indices = (0..token_indices.len() as u32).collect::<Vec<_>>();
+    let routed_hidden = quantized_sparse_mlp_reference(QuantizedSparseMLPReferenceInput {
+        hidden,
+        token_indices: &token_indices,
+        expert_indices: &routes.expert_indices,
+        swiglu_indices: &swiglu_indices,
+        hidden_dim: core.hidden_dim,
+        intermediate_dim: core.intermediate_dim,
+        group_size: metal.group_size as usize,
+        bits: metal.bits as usize,
+        num_experts: core.num_experts,
+        weights: QuantizedSparseMLPReferenceWeights {
+            gate_weight: &vec![7_u8; gate_up_weight_len],
+            gate_scales: &vec![0.000_976_562_5; gate_up_param_len],
+            gate_biases: &vec![0.0; gate_up_param_len],
+            up_weight: &vec![11_u8; gate_up_weight_len],
+            up_scales: &vec![0.000_976_562_5; gate_up_param_len],
+            up_biases: &vec![0.0; gate_up_param_len],
+            down_weight: &vec![13_u8; down_weight_len],
+            down_scales: &vec![0.000_976_562_5; down_param_len],
+            down_biases: &vec![0.0; down_param_len],
+        },
+    });
+    let routed_output = moe_combine_without_shared_experts_bf16_reference(
+        &routed_hidden,
+        &routes.expert_probs,
+        num_tokens,
+        core.num_experts_per_token,
+        core.hidden_dim,
+    );
+
+    let output = match core.shared_experts_core() {
+        None => routed_output,
+        Some(shared_core) => {
+            let dense_config = shared_experts_config(&shared_core, metal);
+            let gate_up = dense_config.gate_up_config();
+            let down = dense_config.down_config();
+            let shared_hidden = quantized_dense_mlp_reference(
+                &shared_core,
+                hidden,
+                num_tokens,
+                QuantizedDenseMLPReferenceGeometry {
+                    gate_up_group_size: metal.group_size as usize,
+                    gate_up_bits: metal.bits as usize,
+                    down_group_size: metal.group_size as usize,
+                    down_bits: metal.bits as usize,
+                },
+                QuantizedDenseMLPReferenceWeights {
+                    gate_up_weight: &vec![19_u8; gate_up.weight_bytes()],
+                    gate_up_scales: &vec![0.000_976_562_5; gate_up.scale_or_bias_bytes() / size_of::<u16>()],
+                    gate_up_biases: &vec![0.0; gate_up.scale_or_bias_bytes() / size_of::<u16>()],
+                    down_weight: &vec![23_u8; down.weight_bytes()],
+                    down_scales: &vec![0.000_976_562_5; down.scale_or_bias_bytes() / size_of::<u16>()],
+                    down_biases: &vec![0.0; down.scale_or_bias_bytes() / size_of::<u16>()],
+                },
+            );
+            let gate_shape = core
+                .shared_expert_gate_shape()
+                .expect("shared MoE reference requires a shared gate shape");
+            let gate_config = affine_config_with_bits(
+                gate_shape.out_dim,
+                gate_shape.in_dim,
+                metal.shared_expert_gate_bits,
+                metal,
+            );
+            let shared_gate_logits = quantized_affine_reference(
+                QuantizedAffineReferenceShape {
+                    num_rows: num_tokens,
+                    output_dim: gate_shape.out_dim,
+                    input_dim: gate_shape.in_dim,
+                    group_size: metal.group_size as usize,
+                    bits: metal.shared_expert_gate_bits as usize,
+                },
+                hidden,
+                &vec![17_u8; gate_config.weight_bytes()],
+                &vec![0.000_976_562_5; gate_config.scale_or_bias_bytes() / size_of::<u16>()],
+                &vec![0.0; gate_config.scale_or_bias_bytes() / size_of::<u16>()],
+            );
+            moe_combine_with_shared_experts_bf16_reference(
+                &routed_output,
+                &shared_hidden,
+                &shared_gate_logits,
+                num_tokens,
+                core.hidden_dim,
+            )
+        },
+    };
+    output.into_iter().map(|bits| bf16::from_bits(bits).to_f32()).collect()
+}
+
 fn cpu_router_logits(
     config: affine_quantized::Config,
     num_tokens: usize,
@@ -672,23 +657,6 @@ fn cpu_softmax_bf16_rows(values: &[f32], num_rows: usize, num_values_per_row: us
     output
 }
 
-#[allow(clippy::too_many_arguments)]
-fn reset_routing_outputs(
-    router_logits: &Buffer,
-    router_probs: &Buffer,
-    expert_indices: &Buffer,
-    expert_probs: &Buffer,
-    num_router_values: usize,
-    num_routes: usize,
-    bf16_sentinel: f32,
-    index_sentinel: u32,
-) {
-    write_bf16_values(router_logits, &vec![bf16_sentinel; num_router_values]);
-    write_bf16_values(router_probs, &vec![bf16_sentinel; num_router_values]);
-    expert_indices.write_typed(0, &vec![index_sentinel; num_routes]);
-    expert_probs.write_typed(0, &vec![-777.0_f32; num_routes]);
-}
-
 fn bf16_values(values: &[f32]) -> Vec<f32> {
     values.iter().map(|value| bf16::from_f32(*value).to_f32()).collect()
 }
@@ -701,18 +669,6 @@ fn bf16_buffer(device: &Device, values: &[f32]) -> Buffer {
     Buffer::from_slice(device, &bits)
 }
 
-fn write_bf16_values(buffer: &Buffer, values: &[f32]) {
-    let bits = values
-        .iter()
-        .map(|value| bf16::from_f32(*value).to_bits())
-        .collect::<Vec<_>>();
-    buffer.write_typed(0, &bits);
-}
-
-fn write_bf16_bits(buffer: &Buffer, bits: &[u16]) {
-    buffer.write_typed(0, bits);
-}
-
 fn filled_u8_buffer(device: &Device, len: usize, value: u8) -> Buffer {
     Buffer::from_slice(device, &vec![value; len])
 }
@@ -720,15 +676,6 @@ fn filled_u8_buffer(device: &Device, len: usize, value: u8) -> Buffer {
 fn filled_bf16_buffer(device: &Device, bytes: usize, value: f32) -> Buffer {
     assert_eq!(bytes % size_of::<u16>(), 0);
     Buffer::from_slice(device, &vec![bf16::from_f32(value).to_bits(); bytes / size_of::<u16>()])
-}
-
-fn assert_finite_nonzero_bf16_bits(bits: &[u16]) {
-    let values = bits
-        .iter()
-        .map(|bits| bf16::from_bits(*bits).to_f32())
-        .collect::<Vec<_>>();
-    assert!(values.iter().all(|value| value.is_finite()));
-    assert!(values.iter().any(|value| *value != 0.0));
 }
 
 fn read_bf16_values(buffer: &Buffer, len: usize) -> Vec<f32> {

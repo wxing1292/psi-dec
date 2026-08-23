@@ -294,11 +294,14 @@ The semantic data flow stays the same.
 
 ## Tests and benchmarks
 
-Focused backend tests compare the current quantized bf16 replay path with the CPU quantized dense-MLP reference.
-The tests use fixed and random inputs.
-They cover gate/up projection, `SiLU(gate) * up`, and down projection as one numerical contract.
-An active/total replay test crosses the affine topology boundaries.
-It verifies active output, poisoned inactive input, canary tails, capacity growth, and capacity shrink.
+The focused backend test records each dense MLP topology into an isolated test cache.
+It replays non-monotonic active-token sequences and compares each active output prefix with the CPU quantized
+dense-MLP reference.
+The reference covers the gate/up projection, `SiLU(gate) * up`, and the down projection as one numerical contract.
+It accepts separate group sizes and bit widths for the gate/up and down projections.
+The test covers the production Q4/Q4 BF16-affine layout and a mixed Q4/Q6 F32-affine layout.
+It records capacities on each side of the affine topology boundaries.
+It does not use inactive output or scratch rows as an oracle.
 Affine operator tests own kernel selection and topology-boundary contracts.
 
 Current Metal component bench:

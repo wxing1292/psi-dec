@@ -25,6 +25,14 @@ pub struct QuantizedDenseMLPReferenceWeights<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct QuantizedDenseMLPReferenceGeometry {
+    pub gate_up_group_size: usize,
+    pub gate_up_bits: usize,
+    pub down_group_size: usize,
+    pub down_bits: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct QuantizedAffineReferenceShape {
     pub num_rows: usize,
     pub output_dim: usize,
@@ -76,8 +84,7 @@ pub fn quantized_dense_mlp_reference(
     core: &DenseMLPCore,
     hidden: &[f32],
     num_tokens: usize,
-    group_size: usize,
-    bits: usize,
+    geometry: QuantizedDenseMLPReferenceGeometry,
     weights: QuantizedDenseMLPReferenceWeights<'_>,
 ) -> Vec<f32> {
     core.validate();
@@ -87,8 +94,8 @@ pub fn quantized_dense_mlp_reference(
         num_rows: num_tokens,
         output_dim: core.intermediate_dim * 2,
         input_dim: core.hidden_dim,
-        group_size,
-        bits,
+        group_size: geometry.gate_up_group_size,
+        bits: geometry.gate_up_bits,
     };
     let gate_up_hidden = quantized_affine_reference(
         gate_up_shape,
@@ -112,8 +119,8 @@ pub fn quantized_dense_mlp_reference(
         num_rows: num_tokens,
         output_dim: core.hidden_dim,
         input_dim: core.intermediate_dim,
-        group_size,
-        bits,
+        group_size: geometry.down_group_size,
+        bits: geometry.down_bits,
     };
     quantized_affine_reference(
         down_shape,
@@ -312,8 +319,12 @@ mod tests {
             &core,
             &hidden,
             1,
-            DIM,
-            8,
+            QuantizedDenseMLPReferenceGeometry {
+                gate_up_group_size: DIM,
+                gate_up_bits: 8,
+                down_group_size: DIM,
+                down_bits: 8,
+            },
             QuantizedDenseMLPReferenceWeights {
                 gate_up_weight: &gate_up_weight,
                 gate_up_scales: &gate_up_scales,
