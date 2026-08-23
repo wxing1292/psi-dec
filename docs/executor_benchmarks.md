@@ -296,3 +296,7 @@ For speculative decoding, also record these values:
 - Acceptance efficiency
 
 A throughput change with a different deterministic acceptance trajectory is not a pure executor or kernel comparison.
+
+A checked-in end-to-end reference is an observed result, not a threshold. The owning helper must record its complete
+provenance. It must suppress throughput deltas when the current provenance or deterministic trajectory does not match
+the reference.

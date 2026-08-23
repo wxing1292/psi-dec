@@ -825,8 +825,10 @@ The default case matrix uses this order:
 The default 27B Main and MTP checkpoints use Qwen3.8. The default 35B Main and MTP checkpoints use Qwen3.6.
 Each case uses its Main checkpoint for tokenization by default. Use `--tokenizer` to override all cases.
 The default `representative2` workload contains one fixed GSM8K prompt and the original Beijing travel prompt.
-The helper repeats and summarizes each prompt independently. Each `RUN` and `SUMMARY` row contains the stable prompt
-ID. The `CONFIG` row contains the prompt-set name, prompt IDs, prompt count, and prompt-set SHA-256.
+The helper repeats and summarizes each prompt independently. The default output contains a configuration table,
+measurement progress, and a final result table. Use `--show-runs` to also print machine-readable `CONFIG`, `RUN`, and
+`SUMMARY` rows. Each `RUN` and `SUMMARY` row contains the stable prompt ID. The configuration output contains the
+prompt-set name, prompt IDs, prompt count, and prompt-set SHA-256.
 Use `--prompt <text>` to replace the set with one custom prompt.
 If an MTP, DSpark, or DFlash2 checkpoint is absent and no download repository is configured, the helper prints a
 warning and skips that case. A missing Main checkpoint remains an error.
@@ -838,7 +840,7 @@ Each MTP summary label includes its proposal count, for example, `27b_mtp2`.
 DSpark and DFlash2 summary labels identify only the model and mode because their block geometry comes from the
 checkpoint.
 
-Both helpers print these facts:
+Both helpers record these facts:
 
 - Commit and dirty state
 - Model directories
@@ -849,11 +851,17 @@ Both helpers print these facts:
 - Prompt identity
 - Trajectory fields
 
-Both helpers also print cooldown and speculative-acceptance fields.
+Both helpers also record cooldown and speculative-acceptance fields.
 
-Neither helper contains checked-in performance numbers or baseline comparisons.
-Record comparison results outside the script with the complete provenance required by
-[`executor_benchmarks.md`](executor_benchmarks.md).
+The Qwen3.5/3.6/3.8 helper contains one observed reference run for its exact `representative2` workload. This reference
+is not a pass/fail threshold. The helper reports a throughput delta only when the machine, OS, architecture, clean
+state, model names, prompt hash, sampling configuration, scheduler capacities, and cooldown match. The run must contain
+at least as many samples as the reference. The input-token, sampled-token, chunk, proposal, verified-token, and
+conditional-acceptance trajectory must also match. The table reports the mismatch instead of a delta when one of these
+conditions does not match. Use `--no-reference` to disable this comparison.
+
+The Qwen3 helper does not contain a checked-in reference run. Record its comparison results outside the script with the
+complete provenance required by [`executor_benchmarks.md`](executor_benchmarks.md).
 
 The current default uses four running requests.
 

@@ -4,6 +4,8 @@ set -euo pipefail
 RUNS=7
 PORT=50061
 BUILD=1
+REFERENCE=1
+SHOW_RUNS=0
 # One fixed GSM8K prompt and the original Beijing prompt.
 PROMPT_SET="representative2"
 PROMPT_IDS=(
@@ -35,12 +37,43 @@ CASES="27b_off,35b_off,27b_mtp1,35b_mtp1,27b_dspark,35b_dspark,27b_dflash2,35b_d
 CASE_COOLDOWN_SECS=8
 LOGGING=info
 SEED=42
+TEMPERATURE=0.7
+TOP_K=20
+TOP_P=0.8
 NUM_CACHE_PAGES=393216
 MAX_REQUESTS=4
 MAX_TOKENS=128
 MAX_TOKENS_PER_REQUEST=64
 CACHE_BLOCK_TOKENS=2048
+REFERENCE_MACHINE="apple_m3_max_40_gpu_cores"
+REFERENCE_DATE="2026-08-23"
+REFERENCE_COMMIT="43d55f4e5df2edf9b29d1bba15dca31007f76c72"
+REFERENCE_DIRTY=0
+REFERENCE_OS_VERSION="27.0"
+REFERENCE_ARCH="arm64"
+REFERENCE_NUM_CACHE_PAGES=393216
+REFERENCE_CACHE_BLOCK_TOKENS=2048
+REFERENCE_MAX_REQUESTS=4
+REFERENCE_MAX_TOKENS=128
+REFERENCE_MAX_TOKENS_PER_REQUEST=64
+REFERENCE_CASE_COOLDOWN_SECS=8
+REFERENCE_LOGGING="info"
+REFERENCE_SEED=42
+REFERENCE_TEMPERATURE=0.7
+REFERENCE_TOP_K=20
+REFERENCE_TOP_P=0.8
+REFERENCE_RUNS=3
+REFERENCE_CASES="27b_off,35b_off,27b_mtp1,27b_dspark,27b_dflash2,27b_mtp2,35b_mtp1,35b_mtp2"
+REFERENCE_PROMPT_SET="representative2"
+REFERENCE_PROMPT_SET_SHA256="1e842b94e2f61518333df4682093921e5be3b2a8909a45157e7f7fc1fd27cffc"
+REFERENCE_MODEL_27B_DIR_NAME="Qwen3.8-27B-4bit"
+REFERENCE_MTP_27B_DIR_NAME="Qwen3.8-27B-MTP-4bit"
+REFERENCE_DSPARK_27B_DIR_NAME="Qwen3.8-27B-DSpark-affine"
+REFERENCE_DFLASH2_27B_DIR_NAME="Qwen3.8-27B-DFlash2-affine"
+REFERENCE_MODEL_35B_DIR_NAME="Qwen3.6-35B-A3B-4bit"
+REFERENCE_MTP_35B_DIR_NAME="Qwen3.6-35B-A3B-MTP-4bit"
 ACTIVE_SERVER_PID=""
+REPORT_FILE=""
 
 cleanup_active_server() {
     if [[ -n "$ACTIVE_SERVER_PID" ]]; then
@@ -50,9 +83,17 @@ cleanup_active_server() {
     fi
 }
 
-trap cleanup_active_server EXIT
-trap 'cleanup_active_server; exit 130' INT
-trap 'cleanup_active_server; exit 143' TERM
+cleanup() {
+    cleanup_active_server
+    if [[ -n "$REPORT_FILE" ]]; then
+        rm -f "$REPORT_FILE"
+        REPORT_FILE=""
+    fi
+}
+
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 usage() {
     cat <<'EOF'
@@ -78,6 +119,9 @@ Options:
   --port N              Server port. Default: 50061
   --prompt TEXT         Use one custom prompt instead of the default representative2 set.
   --seed N              Fixed request seed. Default: 42
+  --temperature N       Sampling temperature. Default: 0.7
+  --top-k N             Sampling top-k. Default: 20
+  --top-p N             Sampling top-p. Default: 0.8
   --num-cache-pages N   Shared cache pages. Default: 393216
   --max-requests N      Scheduler request capacity. Default: 4
   --max-tokens N        Scheduler flattened-token capacity. Default: 128
@@ -102,6 +146,8 @@ Options:
   --dspark-35b-repo REPO
                         Hugging Face repo used if the 35B affine DSpark model is missing.
   --no-build            Skip release build.
+  --no-reference        Do not compare summaries with the checked-in reference run.
+  --show-runs           Print each machine-readable RUN and SUMMARY row.
   --case-cooldown-secs N
                         Idle time between model cases. Default: 8
                         Pass 0 for an intentional sustained-load run.
@@ -165,6 +211,30 @@ while [[ $# -gt 0 ]]; do
             exit 2
         }
         SEED="$2"
+        shift 2
+        ;;
+    --temperature)
+        [[ $# -ge 2 ]] || {
+            echo "--temperature requires a value" >&2
+            exit 2
+        }
+        TEMPERATURE="$2"
+        shift 2
+        ;;
+    --top-k)
+        [[ $# -ge 2 ]] || {
+            echo "--top-k requires a value" >&2
+            exit 2
+        }
+        TOP_K="$2"
+        shift 2
+        ;;
+    --top-p)
+        [[ $# -ge 2 ]] || {
+            echo "--top-p requires a value" >&2
+            exit 2
+        }
+        TOP_P="$2"
         shift 2
         ;;
     --num-cache-pages)
@@ -331,6 +401,14 @@ while [[ $# -gt 0 ]]; do
         BUILD=0
         shift
         ;;
+    --no-reference)
+        REFERENCE=0
+        shift
+        ;;
+    --show-runs)
+        SHOW_RUNS=1
+        shift
+        ;;
     --case-cooldown-secs)
         [[ $# -ge 2 ]] || {
             echo "--case-cooldown-secs requires a value" >&2
@@ -389,6 +467,28 @@ require_positive_integer "--max-tokens" "$MAX_TOKENS"
 require_positive_integer "--max-tokens-per-request" "$MAX_TOKENS_PER_REQUEST"
 require_nonnegative_integer "--case-cooldown-secs" "$CASE_COOLDOWN_SECS"
 require_nonnegative_integer "--seed" "$SEED"
+require_positive_integer "--top-k" "$TOP_K"
+
+if ! TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" python3 - <<'PY'; then
+import math
+import os
+
+for name in ("TEMPERATURE", "TOP_P"):
+    try:
+        value = float(os.environ[name])
+    except ValueError as error:
+        raise SystemExit(f"--{name.lower().replace('_', '-')} expects a number") from error
+    if not math.isfinite(value):
+        raise SystemExit(f"--{name.lower().replace('_', '-')} must be finite")
+temperature = float(os.environ["TEMPERATURE"])
+top_p = float(os.environ["TOP_P"])
+if temperature < 0:
+    raise SystemExit("--temperature must be non-negative")
+if not 0 <= top_p <= 1:
+    raise SystemExit("--top-p must be in [0, 1]")
+PY
+    exit 2
+fi
 
 if ((${#PROMPTS[@]} == 0 || ${#PROMPT_IDS[@]} != ${#PROMPTS[@]})); then
     echo "prompt IDs and prompts must define the same nonzero workload set" >&2
@@ -806,6 +906,258 @@ prompt_ids_csv() {
     printf '%s' "${PROMPT_IDS[*]}"
 }
 
+reference_config_mismatches() {
+    local current_machine="$1"
+    local current_os="$2"
+    local current_arch="$3"
+    local current_dirty="$4"
+    local current_prompt_set_sha256="$5"
+    local mismatches=""
+
+    [[ "$current_machine" == "$REFERENCE_MACHINE" ]] || mismatches="machine"
+    [[ "$current_os" == "$REFERENCE_OS_VERSION" ]] || mismatches="${mismatches:+$mismatches,}os"
+    [[ "$current_arch" == "$REFERENCE_ARCH" ]] || mismatches="${mismatches:+$mismatches,}arch"
+    [[ "$current_dirty" == "$REFERENCE_DIRTY" ]] || mismatches="${mismatches:+$mismatches,}dirty"
+    [[ "$NUM_CACHE_PAGES" == "$REFERENCE_NUM_CACHE_PAGES" ]] ||
+        mismatches="${mismatches:+$mismatches,}num_cache_pages"
+    [[ "$CACHE_BLOCK_TOKENS" == "$REFERENCE_CACHE_BLOCK_TOKENS" ]] ||
+        mismatches="${mismatches:+$mismatches,}cache_block_tokens"
+    [[ "$MAX_REQUESTS" == "$REFERENCE_MAX_REQUESTS" ]] || mismatches="${mismatches:+$mismatches,}max_requests"
+    [[ "$MAX_TOKENS" == "$REFERENCE_MAX_TOKENS" ]] || mismatches="${mismatches:+$mismatches,}max_tokens"
+    [[ "$MAX_TOKENS_PER_REQUEST" == "$REFERENCE_MAX_TOKENS_PER_REQUEST" ]] ||
+        mismatches="${mismatches:+$mismatches,}max_tokens_per_request"
+    [[ "$CASE_COOLDOWN_SECS" == "$REFERENCE_CASE_COOLDOWN_SECS" ]] ||
+        mismatches="${mismatches:+$mismatches,}case_cooldown_secs"
+    [[ "$LOGGING" == "$REFERENCE_LOGGING" ]] || mismatches="${mismatches:+$mismatches,}logging"
+    [[ "$SEED" == "$REFERENCE_SEED" ]] || mismatches="${mismatches:+$mismatches,}seed"
+    [[ "$TEMPERATURE" == "$REFERENCE_TEMPERATURE" ]] || mismatches="${mismatches:+$mismatches,}temperature"
+    [[ "$TOP_K" == "$REFERENCE_TOP_K" ]] || mismatches="${mismatches:+$mismatches,}top_k"
+    [[ "$TOP_P" == "$REFERENCE_TOP_P" ]] || mismatches="${mismatches:+$mismatches,}top_p"
+    [[ "$PROMPT_SET" == "$REFERENCE_PROMPT_SET" ]] || mismatches="${mismatches:+$mismatches,}prompt_set"
+    [[ "$current_prompt_set_sha256" == "$REFERENCE_PROMPT_SET_SHA256" ]] ||
+        mismatches="${mismatches:+$mismatches,}prompt_set_sha256"
+    [[ -z "$TOKENIZER" ]] || mismatches="${mismatches:+$mismatches,}tokenizer"
+    if ((need_27b)); then
+        [[ "$(basename "$MODEL_27B")" == "$REFERENCE_MODEL_27B_DIR_NAME" ]] ||
+            mismatches="${mismatches:+$mismatches,}model_27b"
+    fi
+    if ((need_27b_mtp)); then
+        [[ "$(basename "$MTP_27B")" == "$REFERENCE_MTP_27B_DIR_NAME" ]] ||
+            mismatches="${mismatches:+$mismatches,}mtp_27b"
+    fi
+    if ((need_27b_dspark)); then
+        [[ "$(basename "$DSPARK_27B")" == "$REFERENCE_DSPARK_27B_DIR_NAME" ]] ||
+            mismatches="${mismatches:+$mismatches,}dspark_27b"
+    fi
+    if ((need_27b_dflash2)); then
+        [[ "$(basename "$DFLASH2_27B")" == "$REFERENCE_DFLASH2_27B_DIR_NAME" ]] ||
+            mismatches="${mismatches:+$mismatches,}dflash2_27b"
+    fi
+    if ((need_35b)); then
+        [[ "$(basename "$MODEL_35B")" == "$REFERENCE_MODEL_35B_DIR_NAME" ]] ||
+            mismatches="${mismatches:+$mismatches,}model_35b"
+    fi
+    if ((need_35b_mtp)); then
+        [[ "$(basename "$MTP_35B")" == "$REFERENCE_MTP_35B_DIR_NAME" ]] ||
+            mismatches="${mismatches:+$mismatches,}mtp_35b"
+    fi
+    echo "$mismatches"
+}
+
+reference_row() {
+    # Controlled medians from REFERENCE_RUNS runs on REFERENCE_DATE at REFERENCE_COMMIT.
+    # Fields: decode, TTFT, prompt throughput, inter-chunk p50, inter-chunk p95,
+    # tokens/chunk, verified/proposed, conditional acceptance by index, input tokens,
+    # sampled tokens, chunks, proposed tokens, verified tokens.
+    case "$1:$2:$3:$4" in
+    apple_m3_max_40_gpu_cores:27b_off:256:gsm8k_typing_average) echo "22.783|750.782|182.476|44.166|44.577|1.000|na|[]|137|256|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_off:384:gsm8k_typing_average) echo "22.804|753.362|181.852|44.037|44.424|1.000|na|[]|137|290|290|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_off:256:beijing_travel) echo "22.902|468.974|162.056|43.896|44.306|1.000|na|[]|76|256|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_off:384:beijing_travel) echo "22.800|476.638|159.450|44.139|44.497|1.000|na|[]|76|384|384|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_off:256:gsm8k_typing_average) echo "95.187|142.659|665.923|10.633|10.785|1.000|na|[]|95|256|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_off:1024:gsm8k_typing_average) echo "93.794|142.671|665.870|10.702|10.788|1.000|na|[]|95|1024|1024|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_off:256:beijing_travel) echo "96.918|69.216|491.215|10.390|10.750|1.000|na|[]|34|256|256|0|0" ;;
+    apple_m3_max_40_gpu_cores:35b_off:1024:beijing_travel) echo "94.152|70.052|485.351|10.701|10.804|1.000|na|[]|34|1024|1024|0|0" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:256:gsm8k_typing_average) echo "38.987|768.556|178.256|48.695|48.965|1.882|0.888889|[0.888889]|137|256|136|135|120" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:384:gsm8k_typing_average) echo "38.180|781.288|175.351|50.086|51.598|1.899|0.905063|[0.905063]|137|302|159|158|143" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:256:beijing_travel) echo "33.683|496.889|152.952|49.769|50.388|1.662|0.666667|[0.666667]|76|256|154|153|102" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp1:384:beijing_travel) echo "33.332|467.136|162.693|49.305|49.856|1.634|0.636752|[0.636752]|76|384|235|234|149" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark:256:gsm8k_typing_average) echo "40.121|770.961|177.700|104.424|105.463|4.129|0.466042|[0.819672,0.840000,0.809524,0.852941,0.620690,0.777778,0.857143]|137|256|62|427|199" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark:384:gsm8k_typing_average) echo "44.508|772.106|177.437|104.525|105.588|4.597|0.525151|[0.845070,0.866667,0.826923,0.883721,0.684211,0.846154,0.909091]|137|331|72|497|261" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark:256:beijing_travel) echo "16.176|455.169|166.971|104.262|104.527|1.673|0.096805|[0.434211,0.363636,0.333333,0.500000,0.250000,0.000000,0.000000]|76|256|153|1064|103" ;;
+    apple_m3_max_40_gpu_cores:27b_dspark:384:beijing_travel) echo "15.942|454.361|167.268|104.399|104.673|1.655|0.094620|[0.450216,0.326923,0.294118,0.400000,0.250000,0.000000,0.000000]|76|384|232|1617|153" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2:256:gsm8k_typing_average) echo "52.485|771.620|177.548|103.830|104.502|5.333|0.632219|[0.914894,0.860465,0.945946,0.857143,0.733333,1.000000,0.863636]|137|256|48|329|208" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2:384:gsm8k_typing_average) echo "56.047|771.315|177.619|104.058|104.674|5.738|0.690476|[0.933333,0.892857,0.940000,0.893617,0.785714,1.000000,0.878788]|137|350|61|420|290" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2:256:beijing_travel) echo "18.623|455.926|166.694|103.468|103.745|1.910|0.131042|[0.503759,0.417910,0.464286,0.461538,0.833333,0.400000,0.500000]|76|256|134|931|122" ;;
+    apple_m3_max_40_gpu_cores:27b_dflash2:384:beijing_travel) echo "18.364|453.470|167.596|103.608|103.932|1.892|0.128006|[0.475248,0.447917,0.511628,0.454545,0.600000,0.500000,0.333333]|76|384|203|1414|181" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:256:gsm8k_typing_average) echo "33.510|783.258|174.910|79.656|80.187|2.639|0.833333|[0.885417,0.882353]|137|256|97|192|160" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:384:gsm8k_typing_average) echo "33.912|781.389|175.329|79.989|81.440|2.688|0.851852|[0.898148,0.896907]|137|293|109|216|184" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:256:beijing_travel) echo "23.631|454.927|167.060|79.681|81.757|1.869|0.437500|[0.580882,0.506329]|76|256|137|272|119" ;;
+    apple_m3_max_40_gpu_cores:27b_mtp2:384:beijing_travel) echo "24.641|456.819|166.368|79.853|81.600|1.959|0.487179|[0.635897,0.532258]|76|384|196|390|190" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:256:gsm8k_typing_average) echo "151.944|148.260|640.766|12.966|13.232|1.954|0.961538|[0.961538]|95|256|131|130|125" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:1024:gsm8k_typing_average) echo "143.036|148.528|639.608|13.650|14.457|1.947|0.948571|[0.948571]|95|1024|526|525|498" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:256:beijing_travel) echo "145.200|72.721|467.543|12.880|13.143|1.855|0.861314|[0.861314]|34|256|138|137|118" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp1:1024:beijing_travel) echo "128.494|67.985|500.114|13.432|14.249|1.730|0.732657|[0.732657]|34|1024|592|591|433" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:256:gsm8k_typing_average) echo "147.372|152.273|623.881|18.881|19.277|2.753|0.885870|[0.945652,0.873563]|95|256|93|184|163" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:1024:gsm8k_typing_average) echo "142.556|152.156|624.358|19.406|19.917|2.753|0.880054|[0.940701,0.871060]|95|1024|372|742|653" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:256:beijing_travel) echo "135.523|73.573|462.124|18.717|19.079|2.510|0.762376|[0.861386,0.770115]|34|256|102|202|154" ;;
+    apple_m3_max_40_gpu_cores:35b_mtp2:1024:beijing_travel) echo "119.027|73.411|463.146|19.105|19.586|2.265|0.635255|[0.760532,0.670554]|34|1024|452|902|573" ;;
+    *) return 1 ;;
+    esac
+}
+
+print_config_table() {
+    CURRENT_COMMIT="$GIT_COMMIT" \
+        CURRENT_DIRTY="$GIT_DIRTY" \
+        CURRENT_MACHINE="$MACHINE" \
+        CURRENT_OS="$OS_VERSION" \
+        CURRENT_ARCH="$ARCH" \
+        CURRENT_RUNS="$RUNS" \
+        CURRENT_CASES="$CASES" \
+        CURRENT_COOLDOWN="$CASE_COOLDOWN_SECS" \
+        CURRENT_CAPACITY="$NUM_CACHE_PAGES pages; $CACHE_BLOCK_TOKENS tokens/block; $MAX_REQUESTS requests; $MAX_TOKENS tokens; $MAX_TOKENS_PER_REQUEST tokens/request" \
+        CURRENT_SAMPLING="seed=$SEED; temperature=$TEMPERATURE; top_k=$TOP_K; top_p=$TOP_P; thinking=on" \
+        CURRENT_PROMPTS="$PROMPT_SET: $PROMPT_IDS_CSV" \
+        CURRENT_PROMPT_SHA="$PROMPT_SET_SHA256" \
+        CURRENT_MODEL_27B="$MODEL_27B" \
+        CURRENT_MTP_27B="$MTP_27B" \
+        CURRENT_DSPARK_27B="$DSPARK_27B" \
+        CURRENT_DFLASH2_27B="$DFLASH2_27B" \
+        CURRENT_MODEL_35B="$MODEL_35B" \
+        CURRENT_MTP_35B="$MTP_35B" \
+        CURRENT_DSPARK_35B="$DSPARK_35B" \
+        CURRENT_DFLASH2_35B="$DFLASH2_35B" \
+        CURRENT_REFERENCE="enabled=$REFERENCE; $REFERENCE_DATE; $REFERENCE_COMMIT; $REFERENCE_MACHINE; runs=$REFERENCE_RUNS" \
+        CURRENT_REFERENCE_MISMATCHES="${REFERENCE_CONFIG_MISMATCHES:-none}" \
+        python3 - <<'PY'
+import os
+import textwrap
+
+rows = [
+    ("Source", f"{os.environ['CURRENT_COMMIT']} dirty={os.environ['CURRENT_DIRTY']}"),
+    ("Host", f"{os.environ['CURRENT_MACHINE']} os={os.environ['CURRENT_OS']} arch={os.environ['CURRENT_ARCH']}"),
+    ("Run", f"runs={os.environ['CURRENT_RUNS']} cooldown={os.environ['CURRENT_COOLDOWN']}s"),
+    ("Cases", os.environ["CURRENT_CASES"]),
+    ("Capacity", os.environ["CURRENT_CAPACITY"]),
+    ("Sampling", os.environ["CURRENT_SAMPLING"]),
+    ("Prompts", os.environ["CURRENT_PROMPTS"]),
+    ("Prompt SHA-256", os.environ["CURRENT_PROMPT_SHA"]),
+    ("27B Main", os.environ["CURRENT_MODEL_27B"]),
+    ("27B MTP", os.environ["CURRENT_MTP_27B"]),
+    ("27B DSpark", os.environ["CURRENT_DSPARK_27B"]),
+    ("27B DFlash2", os.environ["CURRENT_DFLASH2_27B"]),
+    ("35B Main", os.environ["CURRENT_MODEL_35B"]),
+    ("35B MTP", os.environ["CURRENT_MTP_35B"]),
+    ("35B DSpark", os.environ["CURRENT_DSPARK_35B"]),
+    ("35B DFlash2", os.environ["CURRENT_DFLASH2_35B"]),
+    ("Reference", os.environ["CURRENT_REFERENCE"]),
+    ("Ref mismatch", os.environ["CURRENT_REFERENCE_MISMATCHES"]),
+]
+key_width = max(len(key) for key, _ in rows)
+value_width = 96
+separator = "+-" + "-" * key_width + "-+-" + "-" * value_width + "-+"
+
+print(separator)
+print(f"| {'Configuration'.ljust(key_width)} | {'Value'.ljust(value_width)} |")
+print(separator)
+for key, value in rows:
+    lines = textwrap.wrap(value, value_width, break_long_words=False, break_on_hyphens=False) or [""]
+    for index, line in enumerate(lines):
+        label = key if index == 0 else ""
+        print(f"| {label.ljust(key_width)} | {line.ljust(value_width)} |")
+print(separator)
+PY
+}
+
+print_summary_table() {
+    REPORT_FILE="$REPORT_FILE" python3 - <<'PY'
+import os
+
+
+def stable_value(encoded):
+    values = encoded.split(",")
+    return values[0] if len(set(values)) == 1 else "mixed"
+
+
+def percent(encoded):
+    return "-" if encoded == "na" else f"{100.0 * float(encoded):.1f}%"
+
+
+rows = []
+with open(os.environ["REPORT_FILE"], encoding="utf-8") as report:
+    for line in report:
+        fields = dict(part.split("=", 1) for part in line.split()[1:])
+        sampled = stable_value(fields["samples"])
+        proposed = stable_value(fields["proposed_spec"])
+        verified = stable_value(fields["verified_spec"])
+        prompt = {
+            "gsm8k_typing_average": "gsm8k",
+            "beijing_travel": "beijing",
+        }.get(fields["prompt"], fields["prompt"])
+        delta = fields.get("decode_delta_pct", "-")
+        if delta != "-":
+            delta = f"{float(delta):+.2f}%"
+        rows.append(
+            [
+                fields["label"],
+                prompt,
+                fields["max_new"],
+                sampled,
+                fields["median_decode_tok_s"],
+                fields.get("reference_decode_tok_s", "-"),
+                delta,
+                fields["median_ttft_ms"],
+                fields["median_inter_chunk_p95_ms"],
+                fields["median_tokens_per_chunk"],
+                percent(fields["median_acceptance_rate"]),
+                f"{verified}/{proposed}",
+                fields["reference_status"],
+            ]
+        )
+
+headers = [
+    "Case",
+    "Prompt",
+    "Max",
+    "Out",
+    "Tok/s",
+    "Ref",
+    "Delta",
+    "TTFT",
+    "p95",
+    "Tok/ch",
+    "Accept",
+    "V/P",
+    "Reference",
+]
+numeric_columns = {2, 3, 4, 5, 6, 7, 8, 9, 10}
+widths = [max(len(headers[index]), *(len(row[index]) for row in rows)) for index in range(len(headers))]
+separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+
+
+def format_row(values):
+    cells = []
+    for index, value in enumerate(values):
+        cells.append(value.rjust(widths[index]) if index in numeric_columns else value.ljust(widths[index]))
+    return "| " + " | ".join(cells) + " |"
+
+
+print()
+print(separator)
+print(format_row(headers))
+print(separator)
+previous_case = None
+for row in rows:
+    if previous_case is not None and row[0] != previous_case:
+        print(separator)
+    print(format_row(row))
+    previous_case = row[0]
+print(separator)
+print("Tok/s and Ref are median decode tokens/s. Delta compares Tok/s with Ref.")
+print("p95 is inter-chunk p95 in ms. Accept and V/P are verified/proposed speculative tokens.")
+PY
+}
+
 if [[ "$BUILD" -eq 1 ]]; then
     cargo build --release -p inference-runtime-service --bin qwen3_5_dense --bin qwen3_5_sparse --bin decode
 fi
@@ -841,6 +1193,10 @@ run_decode() {
         --server-url "http://127.0.0.1:${PORT}" \
         --max-sampled-tokens "$tokens" \
         --seed "$SEED" \
+        --temperature "$TEMPERATURE" \
+        --top-k "$TOP_K" \
+        --top-p "$TOP_P" \
+        --enable-thinking true \
         --chat-template auto \
         --show-stats \
         --hf-model-dir "$tokenizer" \
@@ -951,6 +1307,7 @@ run_server_case() {
         local prompt_id="${PROMPT_IDS[$prompt_index]}"
         local prompt="${PROMPTS[$prompt_index]}"
         for tokens in $token_list; do
+            echo "MEASURE case=$label prompt=$prompt_id max_new=$tokens runs=$RUNS"
             local vals=""
             local inputs=""
             local chunks=""
@@ -990,16 +1347,60 @@ run_server_case() {
                 tokens_per_chunks="$tokens_per_chunks $tokens_per_chunk"
                 spec_by_index="$spec_by_index $run_spec_by_index"
                 verified_by_index="$verified_by_index $run_verified_by_index"
-                echo "RUN label=$label max_new=$tokens prompt=$prompt_id run=$run" \
-                    "input_tokens=$input_tokens sampled=$sampled chunks=$chunk" \
-                    "proposed_spec=$proposed_spec verified_spec=$verified_spec" \
-                    "acceptance_rate=$acceptance_rate acceptance_rate_by_index=$acceptance_rate_by_index" \
-                    "tokens_per_chunk=$tokens_per_chunk" \
-                    "decode_tok_s=$tokps ttft_ms=$ttft prompt_tok_s=$prompt_rate" \
-                    "inter_chunk_p50_ms=$inter_chunk_p50 inter_chunk_p95_ms=$inter_chunk_p95"
+                if ((SHOW_RUNS)); then
+                    echo "RUN label=$label max_new=$tokens prompt=$prompt_id run=$run" \
+                        "input_tokens=$input_tokens sampled=$sampled chunks=$chunk" \
+                        "proposed_spec=$proposed_spec verified_spec=$verified_spec" \
+                        "acceptance_rate=$acceptance_rate acceptance_rate_by_index=$acceptance_rate_by_index" \
+                        "tokens_per_chunk=$tokens_per_chunk" \
+                        "decode_tok_s=$tokps ttft_ms=$ttft prompt_tok_s=$prompt_rate" \
+                        "inter_chunk_p50_ms=$inter_chunk_p50 inter_chunk_p95_ms=$inter_chunk_p95"
+                fi
             done
 
-            VALS="$vals" \
+            local reference_record=""
+            local reference_decode=""
+            local reference_ttft=""
+            local reference_prompt_rate=""
+            local reference_inter_chunk_p50=""
+            local reference_inter_chunk_p95=""
+            local reference_tokens_per_chunk=""
+            local reference_acceptance_rate=""
+            local reference_acceptance_by_index=""
+            local reference_input_tokens=""
+            local reference_sampled=""
+            local reference_chunks=""
+            local reference_proposed_spec=""
+            local reference_verified_spec=""
+            local reference_status="disabled"
+            local reference_mismatch=""
+            if ((REFERENCE)); then
+                reference_record="$(reference_row "$MACHINE" "$label" "$tokens" "$prompt_id" || true)"
+                if [[ -z "$reference_record" ]]; then
+                    reference_status="no-reference-row"
+                    reference_mismatch="row"
+                else
+                    IFS='|' read -r \
+                        reference_decode reference_ttft reference_prompt_rate \
+                        reference_inter_chunk_p50 reference_inter_chunk_p95 \
+                        reference_tokens_per_chunk reference_acceptance_rate \
+                        reference_acceptance_by_index reference_input_tokens \
+                        reference_sampled reference_chunks reference_proposed_spec \
+                        reference_verified_spec <<<"$reference_record"
+                    if [[ -n "$REFERENCE_CONFIG_MISMATCHES" ]]; then
+                        reference_status="config-mismatch"
+                        reference_mismatch="$REFERENCE_CONFIG_MISMATCHES"
+                    elif ((RUNS < REFERENCE_RUNS)); then
+                        reference_status="insufficient-runs"
+                        reference_mismatch="runs"
+                    else
+                        reference_status="comparable"
+                    fi
+                fi
+            fi
+
+            local summary
+            summary="$(VALS="$vals" \
                 INPUTS="$inputs" \
                 CHUNKS="$chunks" \
                 SAMPLES="$samples" \
@@ -1016,6 +1417,21 @@ run_server_case() {
                 LABEL="$label" \
                 TOKENS="$tokens" \
                 PROMPT_ID="$prompt_id" \
+                REFERENCE_DECODE="$reference_decode" \
+                REFERENCE_TTFT="$reference_ttft" \
+                REFERENCE_PROMPT_RATE="$reference_prompt_rate" \
+                REFERENCE_INTER_CHUNK_P50="$reference_inter_chunk_p50" \
+                REFERENCE_INTER_CHUNK_P95="$reference_inter_chunk_p95" \
+                REFERENCE_TOKENS_PER_CHUNK="$reference_tokens_per_chunk" \
+                REFERENCE_ACCEPTANCE_RATE="$reference_acceptance_rate" \
+                REFERENCE_ACCEPTANCE_BY_INDEX="$reference_acceptance_by_index" \
+                REFERENCE_INPUT_TOKENS="$reference_input_tokens" \
+                REFERENCE_SAMPLED="$reference_sampled" \
+                REFERENCE_CHUNKS="$reference_chunks" \
+                REFERENCE_PROPOSED_SPEC="$reference_proposed_spec" \
+                REFERENCE_VERIFIED_SPEC="$reference_verified_spec" \
+                REFERENCE_STATUS="$reference_status" \
+                REFERENCE_MISMATCH="$reference_mismatch" \
                 python3 - <<'PY'
 import os
 import statistics
@@ -1081,6 +1497,47 @@ prefix = (
     acceptance_rate_text,
     acceptance_rate_by_index_text,
 )
+reference_decode = os.environ.get("REFERENCE_DECODE", "")
+reference_status = os.environ["REFERENCE_STATUS"]
+reference_mismatch = os.environ.get("REFERENCE_MISMATCH", "")
+if reference_status == "comparable" and (
+    any(value != os.environ["REFERENCE_INPUT_TOKENS"] for value in inputs)
+    or any(value != os.environ["REFERENCE_SAMPLED"] for value in samples)
+    or any(value != os.environ["REFERENCE_CHUNKS"] for value in chunks)
+    or any(value != os.environ["REFERENCE_PROPOSED_SPEC"] for value in proposed_specs)
+    or any(value != os.environ["REFERENCE_VERIFIED_SPEC"] for value in verified_specs)
+    or acceptance_rate_by_index_text != os.environ["REFERENCE_ACCEPTANCE_BY_INDEX"]
+):
+    reference_status = "trajectory-mismatch"
+    reference_mismatch = "trajectory"
+if reference_decode:
+    reference_decode_value = float(reference_decode)
+    reference_ttft = float(os.environ["REFERENCE_TTFT"])
+    reference_inter_chunk_p95 = float(os.environ["REFERENCE_INTER_CHUNK_P95"])
+    prefix += (
+        " reference_decode_tok_s={:.3f} reference_ttft_ms={:.3f} "
+        "reference_prompt_tok_s={} reference_inter_chunk_p50_ms={} "
+        "reference_inter_chunk_p95_ms={:.3f} reference_tokens_per_chunk={} "
+        "reference_acceptance_rate={} reference_acceptance_rate_by_index={}"
+    ).format(
+        reference_decode_value,
+        reference_ttft,
+        os.environ["REFERENCE_PROMPT_RATE"],
+        os.environ["REFERENCE_INTER_CHUNK_P50"],
+        reference_inter_chunk_p95,
+        os.environ["REFERENCE_TOKENS_PER_CHUNK"],
+        os.environ["REFERENCE_ACCEPTANCE_RATE"],
+        os.environ["REFERENCE_ACCEPTANCE_BY_INDEX"],
+    )
+    if reference_status == "comparable":
+        prefix += " decode_delta_pct={:+.2f} ttft_delta_pct={:+.2f} inter_chunk_p95_delta_pct={:+.2f}".format(
+            100.0 * (median_decode - reference_decode_value) / reference_decode_value,
+            100.0 * (median_ttft - reference_ttft) / reference_ttft,
+            100.0 * (median_inter_chunk_p95 - reference_inter_chunk_p95) / reference_inter_chunk_p95,
+        )
+prefix += f" reference_status={reference_status}"
+if reference_mismatch:
+    prefix += f" reference_mismatch={reference_mismatch}"
 print(
     "{} min_decode_tok_s={:.3f} max_decode_tok_s={:.3f} runs={} input_tokens={} samples={} chunks={} proposed_spec={} verified_spec={}".format(
         prefix,
@@ -1095,6 +1552,11 @@ print(
     )
 )
 PY
+            )"
+            printf '%s\n' "$summary" >>"$REPORT_FILE"
+            if ((SHOW_RUNS)); then
+                printf '%s\n' "$summary"
+            fi
         done
     done
 
@@ -1210,7 +1672,14 @@ ARCH="$(uname -m)"
 MACHINE="$(current_machine_id)"
 PROMPT_SET_SHA256="$(prompt_set_sha256)"
 PROMPT_IDS_CSV="$(prompt_ids_csv)"
-echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_geometry=checkpoint cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B"
+REFERENCE_CONFIG_MISMATCHES="$(
+    reference_config_mismatches "$MACHINE" "$OS_VERSION" "$ARCH" "$GIT_DIRTY" "$PROMPT_SET_SHA256"
+)"
+REPORT_FILE="$(mktemp "${TMPDIR:-/tmp}/psi_dec_qwen35_perf.XXXXXX")"
+if ((SHOW_RUNS)); then
+    echo "CONFIG commit=$GIT_COMMIT dirty=$GIT_DIRTY machine=$MACHINE os=$OS_VERSION arch=$ARCH runs=$RUNS build=$BUILD grpc_port=$PORT num_cache_pages=$NUM_CACHE_PAGES cache_block_tokens=$CACHE_BLOCK_TOKENS max_requests=$MAX_REQUESTS max_tokens=$MAX_TOKENS max_tokens_per_request=$MAX_TOKENS_PER_REQUEST mtp_num_spec_tokens=case-specific block_spec_geometry=checkpoint cases=$CASES case_cooldown_secs=$CASE_COOLDOWN_SECS logging=$LOGGING seed=$SEED temperature=$TEMPERATURE top_k=$TOP_K top_p=$TOP_P enable_thinking=1 prompt_set=$PROMPT_SET prompt_count=${#PROMPTS[@]} prompt_ids=$PROMPT_IDS_CSV prompt_set_sha256=$PROMPT_SET_SHA256 tokenizer=${TOKENIZER:-auto-per-model} model_27b=$MODEL_27B mtp_27b=$MTP_27B dspark_27b=$DSPARK_27B dflash2_27b=$DFLASH2_27B model_35b=$MODEL_35B mtp_35b=$MTP_35B dspark_35b=$DSPARK_35B dflash2_35b=$DFLASH2_35B reference_enabled=$REFERENCE reference_machine=$REFERENCE_MACHINE reference_date=$REFERENCE_DATE reference_commit=$REFERENCE_COMMIT reference_dirty=$REFERENCE_DIRTY reference_os=$REFERENCE_OS_VERSION reference_arch=$REFERENCE_ARCH reference_runs=$REFERENCE_RUNS reference_cases=$REFERENCE_CASES reference_prompt_set=$REFERENCE_PROMPT_SET reference_prompt_set_sha256=$REFERENCE_PROMPT_SET_SHA256 reference_config_mismatches=${REFERENCE_CONFIG_MISMATCHES:-none}"
+fi
+print_config_table
 for case_index in "${!selected_cases[@]}"; do
     case_name="${selected_cases[$case_index]}"
     if [[ "$case_index" -gt 0 && "$CASE_COOLDOWN_SECS" -gt 0 ]]; then
@@ -1219,3 +1688,4 @@ for case_index in "${!selected_cases[@]}"; do
     fi
     run_named_case "$case_name"
 done
+print_summary_table
