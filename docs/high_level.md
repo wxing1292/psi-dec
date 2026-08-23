@@ -296,6 +296,8 @@ Model
     final norm / unembedding
     sampling / rejection sampling
     MTP graph and logical steps
+    DSpark Prefill and fixed-block proposal graph
+    DFlash2 Prefill and fixed-block proposal graph
     request state, replay caches, and stage ordering
 
 Layer / Component
@@ -303,6 +305,8 @@ Layer / Component
     GQA, GDN, dense MLP, MoE
     embedding, unembedding, sampling, rejection sampling
     MTP physical-layer and logical-step semantics
+    DSpark block attention and Markov sampling semantics
+    DFlash2 sliding attention, dynamic convolution, and selector semantics
     model-level shape/input/output contract
     weights, request metadata, state/page metadata at that semantic boundary
     record support for replay composition

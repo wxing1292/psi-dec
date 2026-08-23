@@ -18,7 +18,7 @@ gRPC Decode ──────────────────────�
 Each layer has a separate owner:
 
 - **Runtime core:** Owns scheduling, request lifecycle, and cache ownership.
-- **Qwen executor:** Owns model layout, components, sampling, MTP, and replay order.
+- **Qwen executor:** Owns model layout, components, sampling, speculative model roles, and replay order.
 - **Metal backend:** Owns devices, buffers, kernels, recording, and ICB submission.
 
 ## Quick start
@@ -102,7 +102,7 @@ The [service guide](docs/service.md) also covers Main-only startup, gRPC, tool c
 inference-runtime-core      scheduling, lifecycle, and cache ownership
 inference-runtime-service   inference API, RPC, codecs, and server binaries
 inference-executor-core     backend-neutral model/component contracts
-inference-executor-metal    Qwen execution, replay, sampling, and MTP
+inference-executor-metal    Qwen execution, replay, sampling, MTP, DSpark, and DFlash2
 inference-backend-metal     Metal resources, kernels, and ICB runtime
 ```
 
@@ -113,6 +113,9 @@ All paths above live under `crates/`.
 - [Service](docs/service.md): Setup, APIs, operations, and end-to-end checks.
 - [Runtime core](docs/core.md): Scheduling, request lifecycle, and cache ownership.
 - [Executor](docs/executor.md): Qwen execution and component composition.
+- [Qwen executor](docs/executor_qwen.md): Vanilla, MTP, DSpark, and DFlash2 ownership and replay architecture.
+- [DSpark](docs/dspark_design.md): Fixed-block attention, Markov sampling, state, and lifecycle.
+- [DFlash2](docs/dflash2_design.md): Persistent history, sliding attention, convolution, selection, and lifecycle.
 - [Metal backend](crates/inference-backend-metal/README.md): Resources, kernels, and replay.
 - [Verification](docs/executor_benchmarks.md): Correctness, benchmarks, profiling, and performance evidence.
 - [Documentation index](docs/README.md): Component guides, engineering rules, and current work.
