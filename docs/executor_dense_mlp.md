@@ -307,13 +307,13 @@ Affine operator tests own kernel selection and topology-boundary contracts.
 Current Metal component bench:
 
 ```text
-cargo bench -p inference-backend-metal --bench dense_mlp -- --profile-time 1 --noplot
+cargo bench --bench dense_mlp -- --profile-time 1 --noplot
 ```
 
 Current Metal real-weight comparison bench:
 
 ```text
-cargo bench -p inference-executor-metal --bench qwen35_dense_mlp -- \
+cargo bench --bench qwen35_dense_mlp -- \
   --model-dir <27b-model-dir> --tokens 1 --cases full_auto \
   --iters 1 --warmup-iters 0 --runs 1
 ```

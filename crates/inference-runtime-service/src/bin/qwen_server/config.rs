@@ -13,11 +13,18 @@ use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::args::Qwen35Args;
 use crate::qwen_server::args::QwenLogLevel;
 use crate::qwen_server::args::QwenProfileMode;
+use crate::qwen_server::args::QwenSpecType;
 use crate::telemetry::ProfileMode;
 use crate::telemetry::ProfilingConfig;
 use crate::telemetry::TelemetryConfig;
 
 const MAX_QUEUED_REQUESTS: usize = 32;
+
+#[derive(Debug)]
+struct SpecCheckpoint {
+    model_dir: PathBuf,
+    spec_type: QwenSpecType,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Qwen3ModelMode {
@@ -41,6 +48,7 @@ pub struct Qwen3Config {
 
 impl Qwen3Config {
     pub fn from_args(args: Qwen3Args) -> Result<Self> {
+        let spec_checkpoint = normalize_spec_checkpoint(args.spec.hf_spec_model_dir, args.spec.spec_type)?;
         validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
             return Err(log_info_invalid_argument!(
@@ -59,9 +67,15 @@ impl Qwen3Config {
             ));
         }
 
-        let model_mode = match args.hf_dspark_model_dir {
-            Some(model_dir) => Qwen3ModelMode::DSpark { model_dir },
+        let model_mode = match spec_checkpoint {
             None => Qwen3ModelMode::Vanilla,
+            Some(SpecCheckpoint {
+                model_dir,
+                spec_type: QwenSpecType::DSpark,
+            }) => Qwen3ModelMode::DSpark { model_dir },
+            Some(_) => {
+                return Err(log_info_invalid_argument!("Qwen3 supports only --spec-type dspark"));
+            },
         };
         Ok(Self {
             grpc_listen_addr: args.grpc_listen_addr,
@@ -179,28 +193,20 @@ pub struct Qwen35Config {
 
 impl Qwen35Config {
     pub fn from_args(args: Qwen35Args) -> Result<Self> {
-        let num_speculator_checkpoints = [
-            args.hf_mtp_model_dir.is_some(),
-            args.hf_dspark_model_dir.is_some(),
-            args.hf_dflash2_model_dir.is_some(),
-        ]
-        .into_iter()
-        .filter(|configured| *configured)
-        .count();
-        if num_speculator_checkpoints > 1 {
+        let spec_checkpoint = normalize_spec_checkpoint(args.spec.hf_spec_model_dir, args.spec.spec_type)?;
+        let is_mtp = matches!(
+            spec_checkpoint.as_ref(),
+            Some(SpecCheckpoint {
+                spec_type: QwenSpecType::MTP,
+                ..
+            })
+        );
+        if args.num_spec_tokens.is_some() && !is_mtp {
             return Err(log_info_invalid_argument!(
-                "--hf-mtp-model-dir, --hf-dspark-model-dir, and --hf-dflash2-model-dir are mutually exclusive"
+                "--num-spec-tokens controls MTP proposal length and requires --spec-type mtp"
             ));
         }
-        if args.num_spec_tokens.is_some() && args.hf_mtp_model_dir.is_none() {
-            return Err(log_info_invalid_argument!(
-                "--num-spec-tokens controls MTP proposal length and requires --hf-mtp-model-dir"
-            ));
-        }
-        let num_mtp_tokens = args
-            .hf_mtp_model_dir
-            .as_ref()
-            .map(|_| args.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
+        let num_mtp_tokens = is_mtp.then(|| args.num_spec_tokens.unwrap_or(NonZeroUsize::MIN));
         validate_scheduler_token_capacity(args.max_tokens, args.max_tokens_per_request)?;
         validate_mtp_scheduler_capacity(num_mtp_tokens, args.max_tokens_per_request)?;
         if u32::try_from(args.max_requests.get()).is_err() {
@@ -220,17 +226,25 @@ impl Qwen35Config {
             ));
         }
 
-        let model_mode = if let Some(model_dir) = args.hf_mtp_model_dir {
-            Qwen35ModelMode::MTP {
+        let model_mode = match spec_checkpoint {
+            None => Qwen35ModelMode::Vanilla,
+            Some(SpecCheckpoint {
                 model_dir,
-                num_spec_tokens: num_mtp_tokens.expect("configured Qwen3.5 MTP must have a proposal length"),
-            }
-        } else if let Some(model_dir) = args.hf_dspark_model_dir {
-            Qwen35ModelMode::DSpark { model_dir }
-        } else if let Some(model_dir) = args.hf_dflash2_model_dir {
-            Qwen35ModelMode::DFlash2 { model_dir }
-        } else {
-            Qwen35ModelMode::Vanilla
+                spec_type: QwenSpecType::MTP,
+            }) => {
+                Qwen35ModelMode::MTP {
+                    num_spec_tokens: num_mtp_tokens.expect("configured Qwen3.5 MTP must have a proposal length"),
+                    model_dir,
+                }
+            },
+            Some(SpecCheckpoint {
+                model_dir,
+                spec_type: QwenSpecType::DSpark,
+            }) => Qwen35ModelMode::DSpark { model_dir },
+            Some(SpecCheckpoint {
+                model_dir,
+                spec_type: QwenSpecType::DFlash2,
+            }) => Qwen35ModelMode::DFlash2 { model_dir },
         };
         Ok(Self {
             grpc_listen_addr: args.grpc_listen_addr,
@@ -303,6 +317,21 @@ impl Qwen35Config {
 
     pub fn scheduler_config(&self) -> SchedulerConfig {
         self.scheduler_config
+    }
+}
+
+fn normalize_spec_checkpoint(
+    hf_spec_model_dir: Option<PathBuf>,
+    spec_type: Option<QwenSpecType>,
+) -> Result<Option<SpecCheckpoint>> {
+    match (hf_spec_model_dir, spec_type) {
+        (None, None) => Ok(None),
+        (Some(model_dir), Some(spec_type)) => Ok(Some(SpecCheckpoint { model_dir, spec_type })),
+        _ => {
+            Err(log_info_invalid_argument!(
+                "--hf-spec-model-dir and --spec-type must be specified together"
+            ))
+        },
     }
 }
 

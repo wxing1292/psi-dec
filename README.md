@@ -86,22 +86,46 @@ See the [service guide](docs/service.md) for the full conversion and startup con
 Start the dense 27B service with MTP:
 
 ```sh
-cargo run --release -p inference-runtime-service --bin qwen3_5_dense -- \
+cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
+  --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
+  --spec-type mtp \
   --num-spec-tokens 1
+```
+
+Start the dense 27B service with DSpark:
+
+```sh
+cargo run --release --bin qwen3_5_dense -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
+  --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-DSpark-affine" \
+  --spec-type dspark
+```
+
+Start the dense 27B service with DFlash2:
+
+```sh
+cargo run --release --bin qwen3_5_dense -- \
+  --grpc-listen-addr 127.0.0.1:50061 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
+  --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-DFlash2-affine" \
+  --spec-type dflash2
 ```
 
 Start the sparse 35B-A3B service with MTP:
 
 ```sh
-cargo run --release -p inference-runtime-service --bin qwen3_5_sparse -- \
+cargo run --release --bin qwen3_5_sparse -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
+  --hf-spec-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
+  --spec-type mtp \
   --num-spec-tokens 1
 ```
 
@@ -140,23 +164,23 @@ The tables select the `max_new=384` results for Qwen3.8-27B.
 
 GSM8K typing-average prompt:
 
-| Mode | Output | Decode tok/s | vs Vanilla | Tokens/chunk | Spec acceptance |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Vanilla | 290 | 22.804 | 1.000x | 1.000 | — |
-| MTP, 1 proposal | 302 | 38.180 | 1.674x | 1.899 | 143/158 (90.5%) |
-| MTP, 2 proposals | 293 | 33.912 | 1.487x | 2.688 | 184/216 (85.2%) |
-| DSpark | 331 | 44.508 | 1.952x | 4.597 | 261/497 (52.5%) |
-| DFlash2 | 350 | 56.047 | 2.458x | 5.738 | 290/420 (69.0%) |
+| Mode             | Output | Decode tok/s | vs Vanilla | Tokens/chunk | Spec acceptance |
+| ---------------- | -----: | -----------: | ---------: | -----------: | --------------: |
+| Vanilla          |    290 |       22.804 |     1.000x |        1.000 |               — |
+| MTP, 1 proposal  |    302 |       38.180 |     1.674x |        1.899 | 143/158 (90.5%) |
+| MTP, 2 proposals |    293 |       33.912 |     1.487x |        2.688 | 184/216 (85.2%) |
+| DSpark           |    331 |       44.508 |     1.952x |        4.597 | 261/497 (52.5%) |
+| DFlash2          |    350 |       56.047 |     2.458x |        5.738 | 290/420 (69.0%) |
 
 Chat prompt:
 
-| Mode | Output | Decode tok/s | vs Vanilla | Tokens/chunk | Spec acceptance |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Vanilla | 384 | 22.800 | 1.000x | 1.000 | — |
-| MTP, 1 proposal | 384 | 33.332 | 1.462x | 1.634 | 149/234 (63.7%) |
-| MTP, 2 proposals | 384 | 24.641 | 1.081x | 1.959 | 190/390 (48.7%) |
-| DSpark | 384 | 15.942 | 0.699x | 1.655 | 153/1617 (9.5%) |
-| DFlash2 | 384 | 18.364 | 0.805x | 1.892 | 181/1414 (12.8%) |
+| Mode             | Output | Decode tok/s | vs Vanilla | Tokens/chunk |  Spec acceptance |
+| ---------------- | -----: | -----------: | ---------: | -----------: | ---------------: |
+| Vanilla          |    384 |       22.800 |     1.000x |        1.000 |                — |
+| MTP, 1 proposal  |    384 |       33.332 |     1.462x |        1.634 |  149/234 (63.7%) |
+| MTP, 2 proposals |    384 |       24.641 |     1.081x |        1.959 |  190/390 (48.7%) |
+| DSpark           |    384 |       15.942 |     0.699x |        1.655 |  153/1617 (9.5%) |
+| DFlash2          |    384 |       18.364 |     0.805x |        1.892 | 181/1414 (12.8%) |
 
 `vs Vanilla` is the decode-throughput ratio for the same prompt.
 It is not a pure executor speedup when the output lengths differ.

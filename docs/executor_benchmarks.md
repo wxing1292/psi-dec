@@ -169,61 +169,61 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 Representative smoke commands:
 
 ```text
-cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
+cargo bench --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1 \
   --max-q-tokens 8 \
   --iters 1 --warmup-iters 0 --runs 1
 
 PSI_DEC_BUFFER_IO_BENCH_DIR=<storage-directory> \
-  cargo bench -p inference-backend-metal --bench buffer_io
+  cargo bench --bench buffer_io
 
-cargo bench -p inference-backend-metal --bench rejection_sampling -- \
+cargo bench --bench rejection_sampling -- \
   --mode dspark-markov-top-k-map --rows 1 --top-k 20 --vocab 151936 \
   --markov-rank 256 --markov-w1-group-size 64 --markov-w1-bits 4 \
   --markov-w2-group-size 64 --markov-w2-bits 8 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
+cargo bench --bench qwen3_gqa -- \
   --model-dir <qwen3-model-dir> --tokens-per-req 16 --contexts 128 \
   --iters 1 --warmup-iters 0 --runs 1 --validate
 
-cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
+cargo bench --bench qwen3_dspark -- \
   --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
   --cases dspark --num-requests 1 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen3_dspark_forward -- \
+cargo bench --bench qwen3_dspark_forward -- \
   --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
   --num-requests 1 --context 128 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen3_dspark_unembedding -- \
+cargo bench --bench qwen3_dspark_unembedding -- \
   --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
   --num-requests 1 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
+cargo bench --bench qwen3_dspark_sampling -- \
   --dspark-model-dir <dspark-model-dir> --num-requests 1 --top-k 1 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
+cargo bench --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b --tokens 1 \
   --contexts 0 --num-reqs 1 --gqa-split-kv-variants single_q \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
+cargo bench --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b \
   --gqa-tokens-per-req 64,1 --gqa-contexts-per-req 1024,65536 \
   --max-tokens 128 \
   --gqa-split-kv-variants single_q,tiled_q \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen35_layers -- \
+cargo bench --bench qwen35_layers -- \
   --model-dir <27b-model-dir> --cases layer0 --tokens 1 --contexts 0 \
   --max-tokens 128 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen35_executor -- \
+cargo bench --bench qwen35_executor -- \
   --model-dir <35b-model-dir> --mtp-model-dir <35b-mtp-model-dir> \
   --cases e2e_w_mtp --num-spec-tokens 2 \
   --iters 1 --warmup-iters 0 --runs 1

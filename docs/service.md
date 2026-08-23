@@ -191,7 +191,7 @@ Both converter subcommands use the same affine format:
 Convert an official BF16 Qwen3x DSpark checkpoint to the affine executor format:
 
 ```sh
-cargo run -p inference-executor-core --bin qwen3x_spec_quantize -- dspark \
+cargo run --bin qwen3x_spec_quantize -- dspark \
   --input-dir /path/to/Qwen3-DSpark \
   --output-dir /path/to/Qwen3-DSpark-affine \
   --group-size 64 --bits 4 --markov-w2-bits 8
@@ -211,7 +211,7 @@ Regenerate that checkpoint into a new output directory.
 Convert the official BF16 Qwen3.8 DFlash2 checkpoint to the affine executor format:
 
 ```sh
-cargo run -p inference-executor-core --bin qwen3x_spec_quantize -- dflash2 \
+cargo run --bin qwen3x_spec_quantize -- dflash2 \
   --input-dir /path/to/Qwen3.8-27B-DFlash2 \
   --output-dir /path/to/Qwen3.8-27B-DFlash2-affine
 ```
@@ -239,7 +239,8 @@ cargo run --release --bin qwen3 -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3-14B-4bit" \
-  --hf-dspark-model-dir "$PWD/models/Qwen3-DSpark-affine"
+  --hf-spec-model-dir "$PWD/models/Qwen3-DSpark-affine" \
+  --spec-type dspark
 ```
 
 The Qwen3 executor gets stop tokens from the checkpoint configuration when `generation_config.json` is absent.
@@ -251,7 +252,8 @@ cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-27B-4bit" \
-  --hf-dspark-model-dir "$PWD/models/Qwen3.6-27B-DSpark-affine"
+  --hf-spec-model-dir "$PWD/models/Qwen3.6-27B-DSpark-affine" \
+  --spec-type dspark
 ```
 
 Qwen3.8 dense startup with DFlash2:
@@ -261,11 +263,12 @@ cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
-  --hf-dflash2-model-dir "$PWD/models/Qwen3.8-27B-DFlash2-affine"
+  --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-DFlash2-affine" \
+  --spec-type dflash2
 ```
 
-The Qwen3.5 services reject a configuration that specifies more than one of `--hf-mtp-model-dir`,
-`--hf-dspark-model-dir`, and `--hf-dflash2-model-dir`.
+The Qwen3 service accepts only `--spec-type dspark`.
+The Qwen3.5 services accept `mtp`, `dspark`, and `dflash2`.
 
 Qwen3.5/Qwen3.6/Qwen3.8 startup with MTP enabled:
 
@@ -276,7 +279,8 @@ cargo run --release --bin qwen3_5_dense -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.8-27B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
+  --hf-spec-model-dir "$PWD/models/Qwen3.8-27B-MTP-4bit" \
+  --spec-type mtp \
   --num-spec-tokens 4
 ```
 
@@ -287,16 +291,16 @@ cargo run --release --bin qwen3_5_sparse -- \
   --grpc-listen-addr 127.0.0.1:50061 \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3.6-35B-A3B-4bit" \
-  --hf-mtp-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit"
+  --hf-spec-model-dir "$PWD/models/Qwen3.6-35B-A3B-MTP-4bit" \
+  --spec-type mtp
 ```
 
 The normal MTP, DSpark, and DFlash2 commands use the same service and scheduler arguments.
-Only the Spec checkpoint argument changes:
+Select the Spec checkpoint with these paired arguments:
 
 ```text
---hf-mtp-model-dir DIR
---hf-dspark-model-dir DIR
---hf-dflash2-model-dir DIR
+--hf-spec-model-dir DIR
+--spec-type {mtp,dspark,dflash2}
 ```
 
 An MTP checkpoint enables one speculative MTP step by default.
@@ -349,10 +353,9 @@ One lifecycle owner stops both listeners in these conditions:
 - A listener fails.
 - The process receives SIGINT or SIGTERM.
 
-`--num-spec-tokens` requires `--hf-mtp-model-dir`.
-The service rejects zero, use with a DSpark or DFlash2 checkpoint, a missing MTP directory, or more than one Spec
-checkpoint directory.
-For a Main-only run, omit all Spec checkpoint arguments and `--num-spec-tokens`.
+`--num-spec-tokens` requires `--spec-type mtp`.
+The service rejects zero, use with another Spec type, or an incomplete Spec checkpoint argument pair.
+For a Main-only run, omit both Spec checkpoint arguments and `--num-spec-tokens`.
 
 Qwen uses 32 KiB physical cache pages. Qwen3 and Qwen3.5 default to 256K pages. The Qwen3-14B geometry stores eight
 tokens in one physical page.

@@ -290,6 +290,6 @@ Each test requires the matching Main and speculative checkpoint environment vari
 Run the matrix with this command:
 
 ```sh
-cargo test --release -p inference-executor-metal \
+cargo test --release \
   --test model_state_io -- --ignored --nocapture --test-threads=1
 ```

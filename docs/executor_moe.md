@@ -656,8 +656,8 @@ Replay infrastructure tests own generic replay-parameter validation.
 Current Metal component benches:
 
 ```text
-cargo bench -p inference-backend-metal --bench moe
-cargo bench -p inference-backend-metal --bench sparse_mlp
+cargo bench --bench moe
+cargo bench --bench sparse_mlp
 ```
 
 The benches include Metal replay/ICB cases for MoE routing/combine.
@@ -679,7 +679,7 @@ tokens=1,2,4,8,16,32,64
 Current Metal real-weight MoE full-forward bench:
 
 ```text
-cargo bench -p inference-executor-metal --bench qwen35_moe -- \
+cargo bench --bench qwen35_moe -- \
   --model-dir <35b-a3b-model-dir> --layer 0 --tokens 1 \
   --impls token_major --iters 1 --warmup-iters 0 --runs 1
 ```
@@ -690,7 +690,7 @@ It runs explicit token-major and compact expert-major replay without a productio
 CLI arguments select the model path, layer, token list, iteration counts, implementation, and parity checking:
 
 ```text
-cargo bench -p inference-executor-metal --bench qwen35_moe -- \
+cargo bench --bench qwen35_moe -- \
   --model-dir <35b-a3b-model-dir> --layer 0 \
   --tokens 1,2,4,8,16,32,64 \
   --impls token_major,expert_major \

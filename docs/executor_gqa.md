@@ -1040,9 +1040,9 @@ The test ignores stateless scratch and output tails.
 Metal backend component replay sanity lives in:
 
 ```text
-cargo bench -p inference-backend-metal --bench gqa_split_kv -- --profile-time 1 --noplot
+cargo bench --bench gqa_split_kv -- --profile-time 1 --noplot
 
-cargo bench -p inference-backend-metal --bench gqa_block_attn -- \
+cargo bench --bench gqa_block_attn -- \
   --block-sizes 7 --num-requests 1,4 \
   --max-q-tokens 8 \
   --iters 1 --warmup-iters 0 --runs 1
@@ -1080,16 +1080,16 @@ pressure.
 Metal backend real full-forward replay bench lives in:
 
 ```text
-cargo bench -p inference-executor-metal --bench qwen3_gqa -- \
+cargo bench --bench qwen3_gqa -- \
   --model-dir <qwen3-model-dir> --tokens-per-req 16 --contexts 0,128,1024 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen3_dspark -- \
+cargo bench --bench qwen3_dspark -- \
   --model-dir <qwen3-model-dir> --dspark-model-dir <dspark-model-dir> \
   --cases dspark --num-requests 1 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen35_gqa -- \
+cargo bench --bench qwen35_gqa -- \
   --model-dir <27b-model-dir> --gqa-model 27b --tokens 1 \
   --contexts 0 --num-reqs 1 --gqa-split-kv-variants single_q \
   --iters 1 --warmup-iters 0 --runs 1

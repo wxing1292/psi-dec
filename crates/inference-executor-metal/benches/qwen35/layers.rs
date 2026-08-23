@@ -595,7 +595,7 @@ fn parse_usize_arg(value: &str, name: &str) -> usize {
 fn print_help_and_exit() -> ! {
     println!("qwen35_layers bench");
     println!();
-    println!("Usage: cargo bench -p inference-executor-metal --bench qwen35_layers -- [options]");
+    println!("Usage: cargo bench --bench qwen35_layers -- [options]");
     println!();
     println!("Options:");
     println!("--model-dir PATH");

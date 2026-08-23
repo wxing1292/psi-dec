@@ -1151,7 +1151,7 @@ PY
 }
 
 if [[ "$BUILD" -eq 1 ]]; then
-    cargo build --release -p inference-runtime-service --bin qwen3_5_dense --bin qwen3_5_sparse --bin decode
+    cargo build --release --bin qwen3_5_dense --bin qwen3_5_sparse --bin decode
 fi
 
 if pgrep -fl "qwen3_5|decode|inference-runtime-service|cargo bench|cargo run" >/dev/null 2>&1; then
@@ -1567,7 +1567,8 @@ run_mtp_case() {
     run_server_case "$label" "$token_list" "$tokenizer" "$server_binary" \
         --grpc-listen-addr "127.0.0.1:${PORT}" \
         --hf-model-dir "$model_dir" \
-        --hf-mtp-model-dir "$mtp_model_dir" \
+        --hf-spec-model-dir "$mtp_model_dir" \
+        --spec-type mtp \
         --num-spec-tokens "$num_spec_tokens" \
         --num-cache-pages "$NUM_CACHE_PAGES" \
         --max-requests "$MAX_REQUESTS" \
@@ -1583,22 +1584,13 @@ run_block_spec_case() {
     local model_dir="$5"
     local spec_model_dir="$6"
     local tokenizer="${TOKENIZER:-$model_dir}"
-    local spec_model_option
-
-    case "$spec_mode" in
-    dspark) spec_model_option="--hf-dspark-model-dir" ;;
-    dflash2) spec_model_option="--hf-dflash2-model-dir" ;;
-    *)
-        echo "unsupported block speculative mode: $spec_mode" >&2
-        exit 2
-        ;;
-    esac
 
     local label="${model_label}_${spec_mode}"
     run_server_case "$label" "$token_list" "$tokenizer" "$server_binary" \
         --grpc-listen-addr "127.0.0.1:${PORT}" \
         --hf-model-dir "$model_dir" \
-        "$spec_model_option" "$spec_model_dir" \
+        --hf-spec-model-dir "$spec_model_dir" \
+        --spec-type "$spec_mode" \
         --num-cache-pages "$NUM_CACHE_PAGES" \
         --max-requests "$MAX_REQUESTS" \
         --max-tokens "$MAX_TOKENS" \

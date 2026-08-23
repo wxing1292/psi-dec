@@ -503,7 +503,7 @@ if nc -z 127.0.0.1 "$HTTP_PORT" >/dev/null 2>&1; then
 fi
 
 if ((BUILD)); then
-    cargo build --release -p inference-runtime-service --bin qwen3 --bin decode
+    cargo build --release --bin qwen3 --bin decode
 fi
 
 if [[ ! -x target/release/qwen3 || ! -x target/release/decode ]]; then
@@ -798,7 +798,8 @@ run_dspark_case() {
         --grpc-listen-addr "127.0.0.1:${GRPC_PORT}" \
         --http-listen-addr "127.0.0.1:${HTTP_PORT}" \
         --hf-model-dir "$MODEL_DIR" \
-        --hf-dspark-model-dir "$DSPARK_DIR" \
+        --hf-spec-model-dir "$DSPARK_DIR" \
+        --spec-type dspark \
         --num-cache-pages "$NUM_CACHE_PAGES" \
         --max-requests "$MAX_REQUESTS" \
         --max-tokens "$MAX_TOKENS" \

@@ -3,9 +3,27 @@ use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use clap::Args;
 use clap::Parser;
 use clap::ValueEnum;
 use inference_runtime_core::config::ExecutorHibernationMode;
+
+#[derive(Debug, Args)]
+pub struct QwenSpecArgs {
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Speculative checkpoint directory (requires --spec-type)"
+    )]
+    pub hf_spec_model_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Speculative checkpoint type (requires --hf-spec-model-dir)"
+    )]
+    pub spec_type: Option<QwenSpecType>,
+}
 
 #[derive(Debug, Parser)]
 pub struct Qwen3Args {
@@ -18,8 +36,8 @@ pub struct Qwen3Args {
     #[arg(long, value_name = "DIR")]
     pub hf_model_dir: PathBuf,
 
-    #[arg(long, value_name = "DIR", help = "Optional official Qwen3 DSpark model directory")]
-    pub hf_dspark_model_dir: Option<PathBuf>,
+    #[command(flatten)]
+    pub spec: QwenSpecArgs,
 
     #[arg(long, value_enum)]
     pub profile: Option<QwenProfileMode>,
@@ -78,26 +96,8 @@ pub struct Qwen35Args {
     #[arg(long, value_name = "DIR")]
     pub hf_model_dir: PathBuf,
 
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Optional matching Qwen3.5/Qwen3.6 MTP checkpoint directory"
-    )]
-    pub hf_mtp_model_dir: Option<PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Optional matching Qwen3x DSpark checkpoint directory"
-    )]
-    pub hf_dspark_model_dir: Option<PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Optional matching Qwen3x DFlash2 checkpoint directory"
-    )]
-    pub hf_dflash2_model_dir: Option<PathBuf>,
+    #[command(flatten)]
+    pub spec: QwenSpecArgs,
 
     #[arg(long, value_enum)]
     pub profile: Option<QwenProfileMode>,
@@ -122,7 +122,7 @@ pub struct Qwen35Args {
 
     #[arg(
         long,
-        help = "Number of speculative tokens per MTP proposal; defaults to 1 and requires --hf-mtp-model-dir"
+        help = "Number of speculative tokens per MTP proposal; defaults to 1 and requires --spec-type mtp"
     )]
     pub num_spec_tokens: Option<NonZeroUsize>,
 
@@ -155,6 +155,17 @@ pub struct Qwen35Args {
 pub enum QwenProfileMode {
     Component,
     Operation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum QwenSpecType {
+    #[value(name = "mtp")]
+    MTP,
+    #[value(name = "dspark")]
+    DSpark,
+    #[value(name = "dflash2")]
+    DFlash2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -193,7 +204,8 @@ mod tests {
         assert_eq!(args.max_tokens.get(), 128);
         assert_eq!(args.max_tokens_per_request.get(), 64);
         assert_eq!(args.num_cache_pages.get(), 384 * 1024);
-        assert_eq!(args.hf_dspark_model_dir, None);
+        assert_eq!(args.spec.hf_spec_model_dir, None);
+        assert_eq!(args.spec.spec_type, None);
         assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
         assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
     }

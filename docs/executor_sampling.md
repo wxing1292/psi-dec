@@ -334,7 +334,7 @@ The real-weight Markov benchmark used
 It used the production Markov weights and deterministic zero base logits to isolate Markov correction and sampling.
 
 ```text
-cargo bench -p inference-executor-metal --bench qwen3_dspark_sampling -- \
+cargo bench --bench qwen3_dspark_sampling -- \
   --dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
   --num-requests 1 --temperature 0.7 --top-k 20 --top-p 0.8 --seed 42 \
   --warmup-iters 10 --iters 50 --runs 5
@@ -363,7 +363,8 @@ target/release/qwen3 \
   --grpc-listen-addr 127.0.0.1:50151 \
   --http-listen-addr 127.0.0.1:8011 \
   --hf-model-dir /Users/wenquanxing/Workspace/models/Qwen3-14B-4bit \
-  --hf-dspark-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --hf-spec-model-dir /Users/wenquanxing/Workspace/models/dspark_qwen3_14b_block7-affine \
+  --spec-type dspark \
   --num-cache-pages 4096 --max-requests 4 --max-tokens 128 \
   --max-tokens-per-request 64 --logging info
 
@@ -414,11 +415,11 @@ Use `--temperature`, `--top-k`, `--top-p`, and `--seed` to reproduce a sampling 
 Synthetic backend modes:
 
 ```text
-cargo bench -p inference-backend-metal --bench rejection_sampling -- \
+cargo bench --bench rejection_sampling -- \
   --mode top-k-sample --rows 1 --num-reqs 1 --spec-tokens 1 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-backend-metal --bench rejection_sampling -- \
+cargo bench --bench rejection_sampling -- \
   --mode dspark-markov-top-k-map --rows 1 --top-k 20 --vocab 151936 \
   --markov-rank 256 --markov-w1-group-size 64 --markov-w1-bits 4 \
   --markov-w2-group-size 64 --markov-w2-bits 8 \

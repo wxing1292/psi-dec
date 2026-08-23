@@ -1228,13 +1228,13 @@ inactive requests and unrelated state slots must remain unchanged.
 Current benches:
 
 ```text
-cargo bench -p inference-backend-metal --bench gdn_attn
-cargo bench -p inference-backend-metal --bench gdn_state_io
-cargo bench -p inference-executor-metal --bench qwen35_gdn -- \
+cargo bench --bench gdn_attn
+cargo bench --bench gdn_state_io
+cargo bench --bench qwen35_gdn -- \
   --model-dir <35b-a3b-model-dir> --tokens 1 --contexts 0 --num-reqs 1 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench -p inference-executor-metal --bench qwen35_gdn -- \
+cargo bench --bench qwen35_gdn -- \
   --model-dir <35b-a3b-model-dir> --tokens 2 --contexts 128 --num-reqs 1 \
   --candidate-states --subcomponents --iters 1 --warmup-iters 0 --runs 1
 ```
