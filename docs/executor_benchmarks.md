@@ -11,9 +11,10 @@ Use the smallest production owner that can prove the changed contract, then comp
 1. Compare each optimized backend component with a slow or CPU reference.
 2. Exercise the real production component API and the owner of its metadata and buffer.
 3. Verify one real-weight layer path.
-4. Scale Qwen layers through `layer0`, `layer4`, `first4`, and `main_all`.
-5. Add embedding, final norm, unembedding, and ordinary sampling.
-6. Add MTP proposal, sparse distributions, rejection, and commit last.
+4. Scale Qwen layer ranges through `layer0`, `layer4`, `first4`, and `all_layers`.
+5. Run the complete Main owner with all transformer layers and final norm.
+6. Add Main embedding, gather and unembedding, and ordinary sampling.
+7. Add MTP proposal, sparse distributions, rejection, and commit last.
 
 Component gains do not prove end-to-end performance.
 
@@ -52,13 +53,14 @@ embedding  unembedding  norm  buffer_io
 qwen3_gqa              qwen3_dspark           qwen3_dspark_forward
 qwen3_dspark_unembedding                       qwen3_dspark_sampling
 qwen35_dense_mlp       qwen35_moe             qwen35_gqa
-qwen35_gdn             qwen35_embed           qwen35_layers
-qwen35_output          qwen35_sampling        qwen35_executor
+qwen35_gdn             qwen35_main_layers     qwen35_main
+qwen35_main_embed      qwen35_main_gather_unembed
+qwen35_main_sampling   qwen35_vanilla_prefill_decode
 ```
 
 Real-weight targets accept the model paths that their production owner needs.
 `qwen3_dspark_sampling` needs only `--dspark-model-dir`.
-`qwen35_sampling` does not load model weights.
+`qwen35_main_sampling` does not load model weights.
 These targets share `--iters`, `--warmup-iters`, and `--runs`.
 
 Production `src` must not gain benchmark-only state, feature paths, or environment controls.
@@ -152,19 +154,91 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
   materializes every current row into a distinct slot and uses the production candidate-state kernels.
   `--subcomponents` reports candidate compute as `gdn.compute_candidate_state`.
 - `qwen35_moe` compares token-major and expert-major policies for real sparse-model weights.
-- `qwen35_layers` records only main transformer layers and accepts `layer0`, `layer3`, `layer4`, `first4`, or `main_all`.
-  For the 27B schedule, `layer3` is the first GQA layer. The bench submits the GQA and GDN replay arguments that the
-  selected layer range declares. `--max-tokens` defaults to 128. It fixes the scratch and metadata capacity and the
-  current active-partial-state scheduling budget. The bench uses the exact active replay extent. GQA cases report the
-  selected variant, padded replay extent, and materialized segment distribution.
-- `qwen35_output` begins at final norm, gather, and unembedding. It can isolate sampling and readback.
-- `qwen35_executor` measures the public executor contract with `e2e_wo_mtp` and `e2e_w_mtp` cases.
-- The `e2e_w_mtp` case accepts `--num-spec-tokens N` and defaults to one speculative token.
-- The `qwen35_executor` MTP case obtains proposal and draft tokens from production execution. It does not substitute a
-  static draft.
-- The `qwen35_executor` fixture obtains Main and MTP page-table widths from the loaded executor.
-- The fixture advances compute sequence, token index, and the next input token after each committed decode batch.
-  It does not reuse `token_index=0` after model state advances.
+- `qwen35_main_layers` records only selected `Qwen35MainLayer` owners.
+  It accepts `layer0`, `layer3`, `layer4`, `first4`, `all_layers`, or `layersSTART-END`.
+  `layersSTART-END` selects the half-open layer range `[START, END)`.
+  `all_layers` does not include final norm and does not measure the complete Main stage.
+  For the 27B schedule, `layer3` is the first GQA layer. The bench records fixed active extents and does not submit
+  dynamic replay arguments. `--max-tokens` defaults to 128. It fixes the scratch and metadata capacity and the current
+  active-partial-state scheduling budget. GQA cases report the selected variant, padded replay extent, and materialized
+  segment distribution.
+- `qwen35_main` records the production `Qwen35Main` owner.
+  Its implicit `main` case includes all transformer layers and final norm.
+  It uses the production replay key and active-token arguments.
+  It does not include MainEmbed, GatherUnembed, sampling, or readback.
+- `qwen35_main` and `qwen35_main_layers` use synthetic hidden inputs and initialized component metadata.
+  They validate `context + num_tokens` against the model position capacity.
+  Use `qwen35_vanilla_prefill_decode` when the measurement requires a real committed context.
+- `qwen35_main_embed` records the production `Qwen35MainEmbed` owner with real checkpoint weights.
+  It accepts `--tokens` and `--max-tokens`.
+- `qwen35_main_gather_unembed` records the production `Qwen35GatherUnembed` owner with real checkpoint weights.
+  Its `gather_unembed` case measures gather and unembedding together.
+  It accepts `--rows` and `--max-rows`.
+  Standalone Gather and Unembed measurements remain backend component benchmarks.
+- `qwen35_main_sampling` records the production ordinary `Sampling` replay owner.
+  It accepts `sample` and `sample_readback` cases.
+  It uses synthetic BF16 logits and does not load model weights.
+  It does not include draft write-distribution or rejection sampling.
+  The default sampling values are seed 42, temperature 0.7, Top-K 20, and Top-P 0.8.
+  It accepts the production greedy values `temperature=0` and `top_p=0`.
+- The Qwen3.5 Main component targets run `--warmup-iters` before each result sample.
+  They sort numeric shape lists and reject duplicate numeric shapes.
+- `qwen35_vanilla_prefill_decode` measures context-aware Prefill and Decode through the public `ReplayableModel`
+  lifecycle.
+  It resets request slots and rebuilds each starting context with committed, chunked Prefill work before each
+  trajectory.
+  The operation timer excludes the reset and context rebuild.
+  Prefill skips gather, unembedding, sampling, and readback because it has no Main output rows.
+  Decode commits one visible sampled token per request and uses that token as the next input.
+  `--prefill-tokens` and `--decode-tokens` are per-request operation totals.
+  Prefill splits totals that exceed the active batch capacity.
+  The active per-request chunk is `min(max_tokens_per_request, max_tokens / num_reqs)`.
+  The fixture allocates unique Main KV and GDN state page IDs from one shared page-ID domain.
+  It sends only newly materialized cache blocks for each request.
+
+  The target accepts these workload and capacity options:
+
+  ```text
+  --cases prefill,decode
+  --contexts N[,N...]
+  --prefill-tokens N[,N...]
+  --decode-tokens N[,N...]
+  --num-reqs N
+  --max-tokens N
+  --max-tokens-per-request N
+  --num-tokens-per-block N
+  --num-cache-pages N
+  --seed N
+  --temperature F
+  --top-k N
+  --top-p F
+  --warmup-iters N
+  --iters N
+  --runs N
+  ```
+
+  The default cases are `prefill,decode`.
+  The default contexts are `0,1024,4096,8192`.
+  The default Prefill totals are `64,128`.
+  The default Decode total is `32`.
+  The default capacities are one request, 128 batch tokens, 128 request tokens, 2,048 block tokens, and 393,216 pages.
+  The default sampling values are seed 42, temperature 0.7, Top-K 20, and Top-P 0.8.
+  The default timing controls are two warmup iterations, five measured iterations, and five runs.
+
+  The target sorts list values and rejects duplicate shapes.
+  It generates deterministic model-valid token IDs without a tokenizer.
+  Each result includes input and output FNV-1a fingerprints.
+  A Prefill result uses an untimed deterministic Decode probe for its output fingerprint.
+  The target verifies case-order independence and Prefill chunk decomposition before measurement.
+  It also compares Decode after alternate context chunking when the capacity permits the comparison.
+  Repeated trajectories and case-order checks require exact token and probability bits.
+  Chunk-decomposition checks require exact tokens and an absolute sampled-probability difference of at most `0.01`.
+  Each result reports the replay-cache-cold operation separately from steady-state samples.
+  Result timing separates context rebuild, prepare, record, Main replay, Main sampling replay, Spec replay, finish, and
+  commit feedback.
+  Context rebuild timing includes the request-slot reset.
+  Provenance reports the commit, dirty state, model path, machine, operating system, architecture, and relevant
+  environment.
 
 Representative smoke commands:
 
@@ -218,15 +292,34 @@ cargo bench --bench qwen35_gqa -- \
   --gqa-split-kv-variants single_q,tiled_q \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench --bench qwen35_layers -- \
+cargo bench --bench qwen35_main_layers -- \
   --model-dir <27b-model-dir> --cases layer0 --tokens 1 --contexts 0 \
   --max-tokens 128 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench --bench qwen35_executor -- \
-  --model-dir <35b-model-dir> --mtp-model-dir <35b-mtp-model-dir> \
-  --cases e2e_w_mtp --num-spec-tokens 2 \
+cargo bench --bench qwen35_main -- \
+  --model-dir <27b-model-dir> --tokens 1 --contexts 0 \
+  --max-tokens 128 \
   --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench --bench qwen35_main_embed -- \
+  --model-dir <27b-model-dir> --tokens 1 --max-tokens 128 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench --bench qwen35_main_gather_unembed -- \
+  --model-dir <27b-model-dir> --rows 1 --max-rows 128 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench --bench qwen35_main_sampling -- \
+  --cases sample,sample_readback --rows 1 --vocab-size 151936 --top-k 20 \
+  --iters 1 --warmup-iters 0 --runs 1
+
+cargo bench -p inference-executor-metal --bench qwen35_vanilla_prefill_decode -- \
+  --model-dir <model-dir> --cases prefill,decode \
+  --contexts 7 --prefill-tokens 2 --decode-tokens 2 \
+  --num-reqs 1 --max-tokens 2 --max-tokens-per-request 2 \
+  --num-tokens-per-block 8 --num-cache-pages 16384 \
+  --iters 1 --warmup-iters 1 --runs 1
 ```
 
 Run one performance command at a time. List the planned cases first. GPU contention and memory pressure invalidate
@@ -234,14 +327,13 @@ comparisons.
 
 ## Metrics
 
-`setup_us` includes model loading and fixture construction. `cache_miss_wall_us` is the first complete execution.
+`setup_us` includes model loading and fixture construction.
+The Qwen3 DSpark executor target uses `cache_miss_*` for its first complete execution.
+`qwen35_vanilla_prefill_decode` uses `replay_cache_cold_*` for the first operation after `clear_replay_cache()`.
 
-`cache_build_estimate_us` is the CPU record and execute-phase estimate after subtracting measured replay waits.
-Whole-executor samples report wall time and Main-only, Main-with-sampling, and speculator replay waits.
-
-Prepare, Main record, execute/read, feedback, and commit remain distinct host boundaries.
-The `finish_*` benchmark fields retain their existing output names.
-They now measure Main submit/read plus optional speculator record/submit/read.
+Executor trajectory targets report wall time and their production lifecycle boundaries.
+The Vanilla target reports the Main, Main-with-sampling, and Spec replay values from `ModelOutputTiming`.
+It reports prepare, record, finish, and feedback/commit as distinct host boundaries.
 
 Force-sync and profile-summary measurements are diagnostic metrics. They are not normal wall-clock throughput. Never
 compare the two measurement types as equivalent workloads.

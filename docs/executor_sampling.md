@@ -428,6 +428,6 @@ cargo bench --bench rejection_sampling -- \
 
 Supported modes are `top-k-sample`, `top-k-write-distribution`, `top-k-sample-and-write-distribution`,
 `rejection-sparse`, and `dspark-markov-top-k-map`.
-The model-executor targets are `qwen35_sampling` and `qwen3_dspark_sampling`.
+The model-executor targets are `qwen35_main_sampling` and `qwen3_dspark_sampling`.
 Qwen3.5 DSpark reuses the Qwen3x Markov component benchmark and adds end-to-end service validation.
 [`executor_benchmarks.md`](executor_benchmarks.md) defines shared measurement and provenance rules.

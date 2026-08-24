@@ -61,28 +61,33 @@ path = "benches/qwen35/moe.rs"
 harness = false
 
 [[bench]]
-name = "qwen35_layers"
-path = "benches/qwen35/layers.rs"
+name = "qwen35_main_layers"
+path = "benches/qwen35/main_layers.rs"
 harness = false
 
 [[bench]]
-name = "qwen35_output"
-path = "benches/qwen35/output.rs"
+name = "qwen35_main"
+path = "benches/qwen35/main.rs"
 harness = false
 
 [[bench]]
-name = "qwen35_embed"
-path = "benches/qwen35/embed.rs"
+name = "qwen35_main_embed"
+path = "benches/qwen35/main_embed.rs"
 harness = false
 
 [[bench]]
-name = "qwen35_sampling"
-path = "benches/qwen35/sampling.rs"
+name = "qwen35_main_gather_unembed"
+path = "benches/qwen35/main_gather_unembed.rs"
 harness = false
 
 [[bench]]
-name = "qwen35_executor"
-path = "benches/qwen35/executor.rs"
+name = "qwen35_main_sampling"
+path = "benches/qwen35/main_sampling.rs"
+harness = false
+
+[[bench]]
+name = "qwen35_vanilla_prefill_decode"
+path = "benches/qwen35/vanilla_prefill_decode.rs"
 harness = false
 
 [dev-dependencies]
