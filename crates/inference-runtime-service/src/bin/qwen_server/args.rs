@@ -8,7 +8,7 @@ use clap::Parser;
 use clap::ValueEnum;
 use inference_runtime_core::config::ExecutorHibernationMode;
 
-#[derive(Debug, Args)]
+#[derive(Args, Debug)]
 pub struct QwenSpecArgs {
     #[arg(
         long,

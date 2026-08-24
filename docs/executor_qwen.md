@@ -975,38 +975,20 @@ A state version ahead of its token index is a lifecycle invariant violation and 
 
 ## Supported MTP
 
-The executor supports zero or more logical MTP steps.
-The current checkpoint contract requires exactly one physical GQA body layer and shared Main token embedding.
-It does not permit dedicated MTP embeddings.
-`num_spec_tokens = K` chains that one physical layer K times.
-The logical model has K+1 token and cache lanes: Main plus one MTP lane for each dependent step.
-The Main flattened-token capacity and per-request capacity must each be at least K. This minimum lets the runtime
-initialize the K additional cache lanes. It does not require Main to verify an existing speculative suffix.
+MTP reuses one physical GQA body layer for `K` dependent logical steps.
+It shares the Main token embedding and owns its input projection, GQA page table, scratch, and proposal loop.
+Runtime cache lanes `1..=K` map to the matching logical MTP steps.
 
-`Qwen35MTPEmbed` owns previous-hidden gather, the shared `Rc<Embed>`, two checkpoint norms, concatenation, and quantized
-input projection.
-It also owns its private temporary buffers.
-`Qwen35MTP` owns the single `Qwen35MTPLayer`, final norm, and MTP GQA page-table handle.
-It maps runtime cache lanes `1..=K` to the matching MTP page-table rows.
-`Qwen35MTPSpeculator` owns the internal step loop and one execution accumulator.
-There is no physical layer vector and no duplicated weight owner.
-
-The composed proposal sequence remains:
+Each logical step uses the same composed sequence:
 
 ```text
-Main batch submission:
-    MainEmbed -> Main -> GatherUnembed -> RejectionSampling
-CPU sampling feedback
-MTP internal passes:
-    K * (MTPEmbed -> MTP -> GatherUnembed -> DraftSampling)
+MTPEmbed -> MTP -> GatherUnembed -> DraftSampling
 ```
 
-Normal non-MTP sampling remains:
+Each non-final step waits for its sampled token before the next step starts.
+The public Spec lifecycle remains one transaction.
 
-```text
-Main batch submission:
-    MainEmbed -> Main -> GatherUnembed -> Sampling
-```
+[`mtp_design.md`](mtp_design.md) documents the complete current component contract.
 
 ## Supported DSpark
 

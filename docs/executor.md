@@ -314,6 +314,9 @@ For exact files and current paths, use the component documents:
 
 - [`executor_qwen.md`](executor_qwen.md): Qwen semantic model loading, request state, replay stages, MTP, DSpark, and
   DFlash2.
+- [`mtp_design.md`](mtp_design.md): MTP input composition, sequential proposals, cache lanes, and sampling.
+- [`dspark_design.md`](dspark_design.md): DSpark block attention, Markov sampling, confidence, and persistent context.
+- [`dflash2_design.md`](dflash2_design.md): DFlash2 sliding attention, dynamic convolution, and proposal selection.
 - [`executor_gqa.md`](executor_gqa.md): GQA projection, KV pages, attention map and reduce, and outputs.
 - [`executor_gdn.md`](executor_gdn.md): GDN projection, short convolution, recurrence, and state pages.
 - [`executor_dense_mlp.md`](executor_dense_mlp.md): dense gated MLP.
