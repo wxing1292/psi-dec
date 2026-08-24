@@ -13,7 +13,7 @@ operation.
 `crates/inference-runtime-service/src/api/` owns these functions:
 
 - Token-level validation
-- Server request IDs
+- Process-local runtime request IDs
 - Stop-sequence merging
 - Submission and output streaming
 - Cancellation when a response is dropped
@@ -483,6 +483,35 @@ explicit diagnostic bypass.
 ## HTTP Chat Completions
 
 The HTTP listener runs with gRPC. It provides the OpenAI-compatible `POST /v1/chat/completions` route.
+
+### Request and response identity
+
+Each Chat Completions request may supply an `x-request-id` header with a UUID.
+The UUID is a request-correlation value.
+The caller may reuse it when the caller replays a request.
+The HTTP adapter generates a UUIDv4 when the header is absent.
+In this case, a later replay gets a different request UUID.
+The adapter returns the selected UUID in each successful response `x-request-id` header.
+
+The request UUID remains in the HTTP protocol layer.
+The runtime core and model executor continue to use the process-local numeric `RawRequestID`.
+The response body uses an independent `chatcmpl-{response UUID}` ID.
+Each new tool call uses an independent UUID as its tool-call ID.
+The streaming `tool_calls[].index` value identifies the array position only.
+It is not part of the tool-call identity.
+
+Axum invokes the Chat Completions handler for each HTTP request.
+The handler invocation owns its tool-call validation state.
+The shared `HTTPServer` does not own a cross-request tool-call registry.
+The handler reconstructs a tool-call ID set and pending-call map from the submitted conversation history.
+
+The caller stores each tool-call UUID in the assistant message.
+The caller uses the same UUID in the applicable tool-result message.
+On resume, the caller sends the complete history again.
+The new handler invocation scans this history and validates the correlation.
+It rejects duplicate assistant tool-call IDs in one submitted history.
+It does not compare tool-call IDs from independent HTTP requests.
+It does not regenerate historical tool-call IDs.
 
 ### Matched gRPC and HTTP tests
 

@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use futures_util::stream;
 use inference_runtime_core::Error;
 use inference_runtime_core::runtime::CompletionReason;
+use uuid::Uuid;
 
 use crate::codec::qwen::ResponseEvent;
 use crate::rpc::http::chat_completions::response::Delta;
@@ -96,7 +97,15 @@ async fn test_response() {
     .await
     .unwrap();
 
-    assert_eq!(response.id, "chatcmpl-7");
+    assert!(
+        Uuid::parse_str(
+            response
+                .id
+                .strip_prefix("chatcmpl-")
+                .expect("response ID must have the Chat Completions prefix"),
+        )
+        .is_ok()
+    );
     assert_eq!(
         response.choices[0].message.reasoning_content.as_deref(),
         Some("reasoning")
@@ -150,12 +159,22 @@ async fn test_stream_error() {
     .await;
 
     assert_eq!(events.len(), 2);
+    let role = serde_json::from_str::<serde_json::Value>(&events[0]).unwrap();
     let error = serde_json::from_str::<serde_json::Value>(&events[1]).unwrap();
-    assert_eq!(error["id"], "chatcmpl-7");
+    assert_eq!(error["id"], role["id"]);
+    let response_id = error["id"].as_str().unwrap();
+    assert!(
+        Uuid::parse_str(
+            response_id
+                .strip_prefix("chatcmpl-")
+                .expect("response ID must have the Chat Completions prefix"),
+        )
+        .is_ok()
+    );
     assert_eq!(error["error"]["code"], "aborted");
     assert!(!events.iter().any(|event| event == "[DONE]"));
 }
 
 fn fixture_metadata() -> ResponseMetadata {
-    ResponseMetadata::new(7, "qwen".to_string(), 3)
+    ResponseMetadata::new("qwen".to_string(), 3)
 }

@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use hf_chat_template::ChatTemplate;
 use inference_runtime_core::tokenizer::huggingface::HFTokenizer;
 use serde_json::json;
 use tokenizers::models::wordlevel::WordLevel;
+use uuid::Uuid;
 
 use crate::codec::qwen::QwenCodec;
+use crate::rpc::http::chat_completions::new_tool_call_id;
 use crate::rpc::http::chat_completions::request::Content;
 use crate::rpc::http::chat_completions::request::Message;
 use crate::rpc::http::chat_completions::request::Request;
@@ -13,6 +17,7 @@ use crate::rpc::http::chat_completions::request::Tool;
 use crate::rpc::http::chat_completions::request::ToolCall;
 use crate::rpc::http::chat_completions::request::ToolChoice;
 use crate::rpc::http::chat_completions::request::preprocess;
+use crate::rpc::http::chat_completions::resolve_request_id;
 
 #[test]
 fn test_schema() {
@@ -210,6 +215,52 @@ fn test_tool_history() {
 }
 
 #[test]
+fn test_tool_replay_with_caller_request_id() {
+    let caller_request_id = Uuid::parse_str("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-request-id",
+        HeaderValue::try_from(caller_request_id.to_string()).unwrap(),
+    );
+    let Ok(request_id) = resolve_request_id(&headers) else {
+        panic!("caller request UUID must be valid");
+    };
+    let tool_call_id = new_tool_call_id();
+    let codec = fixture_codec();
+    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+
+    let Ok(replay_request_id) = resolve_request_id(&headers) else {
+        panic!("replayed caller request UUID must be valid");
+    };
+    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+
+    assert_eq!(replay_request_id, request_id);
+    assert_eq!(request_id, caller_request_id);
+    assert_ne!(Uuid::parse_str(&tool_call_id).unwrap(), request_id);
+}
+
+#[test]
+fn test_tool_replay_with_generated_request_ids() {
+    let headers = HeaderMap::new();
+    let Ok(request_id) = resolve_request_id(&headers) else {
+        panic!("server must generate a request UUID");
+    };
+    let tool_call_id = new_tool_call_id();
+    let codec = fixture_codec();
+    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+
+    let Ok(replay_request_id) = resolve_request_id(&headers) else {
+        panic!("server must generate a replay request UUID");
+    };
+    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+
+    assert_ne!(replay_request_id, request_id);
+    let tool_call_id = Uuid::parse_str(&tool_call_id).unwrap();
+    assert_ne!(tool_call_id, request_id);
+    assert_ne!(tool_call_id, replay_request_id);
+}
+
+#[test]
 fn test_tool_definitions() {
     let codec = fixture_codec();
     for request in [
@@ -267,6 +318,35 @@ fn test_unsupported_options() {
         let request = serde_json::from_value::<Request>(request).unwrap();
         assert!(preprocess(request, &codec).is_err());
     }
+}
+
+fn tool_replay_request(tool_call_id: &str) -> Request {
+    serde_json::from_value(json!({
+        "model": "qwen",
+        "messages": [
+            {"role": "user", "content": "read"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": "contents",
+                "name": "read_file"
+            }
+        ],
+        "max_completion_tokens": 4
+    }))
+    .unwrap()
 }
 
 fn fixture_codec() -> QwenCodec {

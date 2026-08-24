@@ -19,8 +19,10 @@ use inference_runtime_core::Error;
 use inference_runtime_core::runtime::CompletionReason;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::codec::qwen::ResponseEvent;
+use crate::rpc::http::chat_completions::new_tool_call_id;
 use crate::rpc::http::error::HTTPError;
 use crate::rpc::http::error::map_error;
 use crate::rpc::http::error::openai_error_body;
@@ -139,9 +141,8 @@ where
             ResponseEvent::Thinking(chunk) => thinking.push_str(&chunk),
             ResponseEvent::Text(chunk) => text.push_str(&chunk),
             ResponseEvent::ToolCall(call) => {
-                let index = tool_calls.len();
                 tool_calls.push(ToolCall::Function {
-                    id: metadata.tool_call_id(index),
+                    id: new_tool_call_id(),
                     function: FunctionCall {
                         name: call.tool_id().as_str().to_string(),
                         arguments: call.arguments().as_value().to_string(),
@@ -201,9 +202,9 @@ pub struct ResponseMetadata {
 }
 
 impl ResponseMetadata {
-    pub fn new(request_id: usize, model: String, prompt_tokens: usize) -> Self {
+    pub fn new(model: String, prompt_tokens: usize) -> Self {
         Self {
-            id: format!("chatcmpl-{request_id}"),
+            id: format!("chatcmpl-{}", Uuid::new_v4()),
             model,
             created: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -211,10 +212,6 @@ impl ResponseMetadata {
                 .as_secs(),
             prompt_tokens,
         }
-    }
-
-    fn tool_call_id(&self, index: usize) -> String {
-        format!("call-{}-{index}", self.id)
     }
 
     fn usage(&self, completion_tokens: usize) -> Usage {
@@ -294,7 +291,7 @@ where
                     reasoning_content: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index,
-                        id: self.metadata.tool_call_id(index),
+                        id: new_tool_call_id(),
                         kind: "function",
                         function: FunctionCallDelta {
                             name: call.tool_id().as_str().to_string(),
