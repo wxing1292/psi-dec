@@ -19,10 +19,15 @@ mod token;
 pub use token::Token;
 
 mod resource;
+pub use resource::ConcreteResource;
+pub use resource::Resource;
 pub use resource::ResourceID;
 pub use resource::ResourcePlacement;
 pub use resource::ResourceTypeID;
+pub use resource::ResourceURI;
+pub use resource::SymbolicResource;
 pub use resource::validate_resource_placements;
+pub use resource::validate_resources;
 
 pub type RawRequestID = usize;
 pub type RawRequestSlot = u32;

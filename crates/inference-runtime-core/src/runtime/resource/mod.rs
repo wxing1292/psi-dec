@@ -5,6 +5,69 @@ use uuid::Uuid;
 use crate::Error;
 use crate::Result;
 
+mod concrete_resource;
+pub use concrete_resource::ConcreteResource;
+
+mod symbolic_resource;
+pub use symbolic_resource::SymbolicResource;
+
+#[derive(Debug)]
+pub enum Resource {
+    Symbolic(SymbolicResource),
+    Concrete(ConcreteResource),
+}
+
+impl Resource {
+    pub const fn id(&self) -> ResourceID {
+        match self {
+            Self::Symbolic(resource) => resource.id(),
+            Self::Concrete(resource) => resource.id(),
+        }
+    }
+
+    pub const fn resource_type(&self) -> ResourceTypeID {
+        self.id().resource_type()
+    }
+
+    pub const fn is_symbolic(&self) -> bool {
+        matches!(self, Self::Symbolic(_))
+    }
+
+    pub const fn is_concrete(&self) -> bool {
+        matches!(self, Self::Concrete(_))
+    }
+
+    pub const fn uri(&self) -> &ResourceURI {
+        match self {
+            Self::Symbolic(resource) => resource.uri(),
+            Self::Concrete(resource) => resource.uri(),
+        }
+    }
+
+    pub fn into_concrete(self, source: crate::memory::OffsetAllocation, num_resource_tokens: u32) -> Self {
+        debug_assert!(self.is_symbolic(), "only a symbolic resource can become concrete");
+        match self {
+            Self::Symbolic(resource) => Self::Concrete(resource.into_concrete(source, num_resource_tokens)),
+            Self::Concrete(_) => panic!("only a symbolic resource can become concrete"),
+        }
+    }
+
+    pub fn into_symbolic(self) -> Self {
+        debug_assert!(self.is_concrete(), "only a concrete resource can become symbolic");
+        match self {
+            Self::Symbolic(_) => panic!("only a concrete resource can become symbolic"),
+            Self::Concrete(resource) => Self::Symbolic(resource.into_symbolic()),
+        }
+    }
+
+    pub const fn concrete(&self) -> Option<&ConcreteResource> {
+        match self {
+            Self::Symbolic(_) => None,
+            Self::Concrete(resource) => Some(resource),
+        }
+    }
+}
+
 const UUID_VERSION_8: u8 = 8;
 const UUID_VERSION_BYTE_INDEX: usize = 6;
 const UUID_VARIANT_BYTE_INDEX: usize = 8;
@@ -58,6 +121,21 @@ impl ResourceID {
 
     pub const fn uuid(self) -> Uuid {
         self.0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ResourceURI(String);
+
+impl ResourceURI {
+    pub fn new(value: String) -> Self {
+        assert!(!value.is_empty(), "resource URI must not be empty");
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -140,83 +218,69 @@ pub fn validate_resource_placements(placements: &[ResourcePlacement]) -> Result<
     token_ranges.sort_unstable();
     for ranges in token_ranges.windows(2) {
         let [previous, current] = ranges else { unreachable!() };
-        if current.0 < previous.1 {
-            return Err(Error::invalid_argument(
-                "request resource placements contain overlapping token ranges",
-            ));
+        assert!(
+            current.0 >= previous.1,
+            "request resource placements must not contain overlapping token ranges"
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_resources(
+    resources: &[Resource],
+    placements: &[ResourcePlacement],
+    initial_token_count: usize,
+) -> Result<()> {
+    validate_resource_placements(placements)?;
+
+    let resource_by_id = resources
+        .iter()
+        .map(|resource| (resource.id(), resource))
+        .collect::<std::collections::HashMap<_, _>>();
+    if resource_by_id.len() != resources.len() {
+        return Err(Error::invalid_argument("request contains duplicate resource IDs"));
+    }
+    if resources.len() != placements.len() {
+        return Err(Error::invalid_argument(
+            "request resources and resource placement groups must have a one-to-one relation",
+        ));
+    }
+
+    for placement in placements {
+        let resource = resource_by_id.get(&placement.resource_id()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "resource placement references unknown resource ID {}",
+                placement.resource_id().uuid()
+            ))
+        })?;
+        for &(token_index, _, num_resource_tokens) in placement.placements() {
+            if token_index > initial_token_count || num_resource_tokens > initial_token_count - token_index {
+                return Err(Error::invalid_argument(format!(
+                    "resource placement token range exceeds request initial token count={initial_token_count}"
+                )));
+            }
+        }
+        let Some(concrete) = resource.concrete() else {
+            continue;
+        };
+        let concrete_num_resource_tokens = concrete.num_resource_tokens() as usize;
+        for &(_, resource_index, num_resource_tokens) in placement.placements() {
+            if resource_index > concrete_num_resource_tokens
+                || num_resource_tokens > concrete_num_resource_tokens - resource_index
+            {
+                return Err(Error::invalid_argument(format!(
+                    "resource placement range exceeds concrete resource token count={} for resource ID {}",
+                    concrete.num_resource_tokens(),
+                    placement.resource_id().uuid()
+                )));
+            }
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod resource_id_test;
 
-    #[test]
-    fn resource_id_round_trip_preserves_type() {
-        let resource_type = ResourceTypeID::new(0x1234);
-        let resource_id = ResourceID::new(resource_type);
-
-        assert_eq!(resource_id.resource_type(), resource_type);
-        assert_eq!(ResourceID::from_uuid(resource_id.uuid()).unwrap(), resource_id);
-        assert_eq!(
-            resource_id.uuid().as_bytes()[UUID_VERSION_BYTE_INDEX] >> 4,
-            UUID_VERSION_8
-        );
-    }
-
-    #[test]
-    fn resource_id_rejects_other_uuid_versions() {
-        let uuid = Uuid::new_v4();
-        assert!(matches!(ResourceID::from_uuid(uuid), Err(Error::InvalidArgument(_))));
-    }
-
-    #[test]
-    fn resource_placement_preserves_mapping_order() {
-        let resource_id = ResourceID::new(ResourceTypeID::new(1));
-        let placement = ResourcePlacement::new(resource_id, vec![(2, 0, 3), (8, 4, 2)], 16);
-
-        assert_eq!(placement.resource_id(), resource_id);
-        assert_eq!(placement.placements(), &[(2, 0, 3), (8, 4, 2)]);
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn resource_placement_asserts_invalid_mapping_contracts() {
-        let resource_id = ResourceID::new(ResourceTypeID::new(1));
-        assert!(std::panic::catch_unwind(|| ResourcePlacement::new(resource_id, Vec::new(), 16)).is_err());
-        assert!(
-            std::panic::catch_unwind(|| ResourcePlacement::new(resource_id, vec![(8, 0, 1), (2, 1, 1)], 16)).is_err()
-        );
-        assert!(std::panic::catch_unwind(|| ResourcePlacement::new(resource_id, vec![(0, 0, 0)], 16)).is_err());
-        assert!(std::panic::catch_unwind(|| ResourcePlacement::new(resource_id, vec![(15, 0, 2)], 16)).is_err());
-        assert!(
-            std::panic::catch_unwind(|| ResourcePlacement::new(resource_id, vec![(0, usize::MAX, 1)], 16)).is_err()
-        );
-        assert!(
-            std::panic::catch_unwind(|| { ResourcePlacement::new(resource_id, vec![(1, 0, 3), (3, 4, 2)], 16) })
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn request_placements_reject_duplicate_resource_and_cross_resource_overlap() {
-        let first_id = ResourceID::new(ResourceTypeID::new(1));
-        let second_id = ResourceID::new(ResourceTypeID::new(2));
-        let first = ResourcePlacement::new(first_id, vec![(2, 0, 3)], 16);
-        let duplicate = ResourcePlacement::new(first_id, vec![(8, 3, 2)], 16);
-        assert!(validate_resource_placements(&[first.clone(), duplicate]).is_err());
-
-        let overlap = ResourcePlacement::new(second_id, vec![(4, 0, 3)], 16);
-        assert!(validate_resource_placements(&[first, overlap]).is_err());
-    }
-
-    #[test]
-    fn request_placements_accept_disjoint_resources() {
-        let first = ResourcePlacement::new(ResourceID::new(ResourceTypeID::new(1)), vec![(2, 0, 3)], 16);
-        let second = ResourcePlacement::new(ResourceID::new(ResourceTypeID::new(2)), vec![(8, 4, 2)], 16);
-
-        validate_resource_placements(&[first, second]).unwrap();
-    }
-}
+#[cfg(test)]
+mod resource_placement_test;

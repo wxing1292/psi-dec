@@ -1,3 +1,4 @@
+use std::fmt;
 use std::slice;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -32,6 +33,16 @@ pub struct OffsetAllocation {
     base_ptr: *const u8,
     allocation: Allocation,
     len: usize,
+}
+
+impl fmt::Debug for OffsetAllocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OffsetAllocation")
+            .field("offset_bytes", &self.offset_bytes())
+            .field("len_bytes", &self.len_bytes())
+            .finish()
+    }
 }
 
 impl<S> OffsetAllocator<S>
@@ -98,6 +109,14 @@ where
 }
 
 impl OffsetAllocation {
+    pub fn offset_bytes(&self) -> u64 {
+        u64::from(self.allocation.offset)
+    }
+
+    pub fn len_bytes(&self) -> u64 {
+        self.len as u64
+    }
+
     pub fn ptr(&self) -> *mut u8 {
         unsafe { self.base_ptr.add(self.allocation.offset as usize) as *mut u8 }
     }
