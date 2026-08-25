@@ -8,6 +8,7 @@ use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use crate::runtime::request::AtomicRequestStatus;
 use crate::runtime::request::InternalRequest;
 use crate::runtime::request::TokenProbs;
+use crate::runtime::resource::Resource;
 
 pub struct QueuedRequest<const N: usize, const P: usize, const L: usize, DBC>
 where
@@ -16,6 +17,7 @@ where
     req_id: RawRequestID,
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+    resources: Vec<Resource>,
     token_prob_tx: Sender<TokenProbs>,
     sampling_config: SamplingConfig,
     context_window: usize,
@@ -29,6 +31,7 @@ where
         req_id: RawRequestID,
         req_status: AtomicRequestStatus,
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+        resources: Vec<Resource>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
         context_window: usize,
@@ -37,6 +40,7 @@ where
             req_id,
             req_status,
             decoder_blocks,
+            resources,
             token_prob_tx,
             sampling_config,
             context_window,
@@ -58,6 +62,7 @@ where
             req_id,
             req_status,
             decoder_blocks,
+            resources,
             token_prob_tx,
             sampling_config,
             context_window,
@@ -67,6 +72,7 @@ where
             req_slot,
             req_status,
             decoder_blocks,
+            resources,
             token_prob_tx,
             sampling_config,
             context_window,

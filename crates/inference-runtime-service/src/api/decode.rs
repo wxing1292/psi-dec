@@ -26,9 +26,15 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
         let DecodeRequest { tokens, mut sampling } = request;
         merge_stop_sequences(&mut sampling.stop_sequences, &self.default_stop_sequences);
 
-        let (queued_request, external_request) =
-            self.runtime
-                .initialize_req(request_id, Vec::new(), tokens, Vec::new(), sampling)?;
+        let (queued_request, external_request) = self.runtime.initialize_req(
+            request_id,
+            Vec::new(),
+            tokens,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            sampling,
+        )?;
         self.runtime.submit_req(queued_request)?;
         Ok(DecodeResponse::new(external_request))
     }

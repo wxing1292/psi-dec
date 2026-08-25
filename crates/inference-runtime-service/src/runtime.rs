@@ -31,6 +31,8 @@ use inference_runtime_core::runtime::QueuedRequest;
 use inference_runtime_core::runtime::RawRequestID;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::RequestSlotAllocator;
+use inference_runtime_core::runtime::Resource;
+use inference_runtime_core::runtime::ResourcePlacement;
 use inference_runtime_core::runtime::Token;
 use inference_runtime_core::runtime::decoder::TPKVBlockAllocator;
 use inference_runtime_core::runtime::decoder::TPStateBlockAllocator;
@@ -43,6 +45,7 @@ use inference_runtime_core::runtime::scheduler::InstrumentedScheduler;
 use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
+use inference_runtime_core::runtime::validate_resources;
 
 use crate::api::Inference;
 use crate::codec::qwen::QwenCodec;
@@ -228,12 +231,15 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize_req(
         &self,
         request_id: RawRequestID,
         history_tokens: Vec<Token>,
         prompt_tokens: Vec<Token>,
         sampled_tokens: Vec<Token>,
+        resources: Vec<Resource>,
+        resource_placements: Vec<ResourcePlacement>,
         sampling_config: SamplingConfig,
     ) -> Result<(RuntimeQueuedRequest<N, P, L>, ExternalRequest)> {
         let num_initial_tokens = history_tokens.len() + prompt_tokens.len() + sampled_tokens.len();
@@ -257,10 +263,11 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                 sampling_config.max_sampled_tokens
             )));
         }
+        validate_resources(&resources, &resource_placements, num_initial_tokens)?;
         let req_status = AtomicRequestStatus::new();
         let decoder_kv_blocks = TrieDecoderBlocks::new(
             self.block_cache.clone(),
-            Vec::new(),
+            resource_placements,
             history_tokens,
             prompt_tokens,
             sampled_tokens,
@@ -270,6 +277,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             request_id,
             req_status.clone(),
             decoder_kv_blocks,
+            resources,
             token_prob_tx,
             sampling_config,
             self.model_runtime_config.context_window,
@@ -485,7 +493,15 @@ mod tests {
     fn test_runtime_validates_initial_tokens_for_cache_lanes() {
         let (single_lane, single_lane_shutdown, _single_lane_async_runtime) = test_runtime::<1>();
         assert!(matches!(
-            single_lane.initialize_req(1, Vec::new(), Vec::new(), Vec::new(), SamplingConfig::default()),
+            single_lane.initialize_req(
+                1,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                SamplingConfig::default(),
+            ),
             Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 1")
         ));
         single_lane_shutdown.shutdown();
@@ -497,6 +513,8 @@ mod tests {
                 Vec::new(),
                 vec![Token::new(1), Token::new(2)],
                 Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 SamplingConfig::default(),
             ),
             Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 3")
@@ -506,6 +524,8 @@ mod tests {
                 2,
                 Vec::new(),
                 vec![Token::new(1), Token::new(2), Token::new(3)],
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 SamplingConfig::default(),
             )
@@ -527,6 +547,8 @@ mod tests {
                 vec![Token::new(1)],
                 vec![Token::new(2), Token::new(3)],
                 vec![Token::new(4)],
+                Vec::new(),
+                Vec::new(),
                 sampling,
             ),
             Err(Error::InvalidArgument(message))
@@ -548,6 +570,8 @@ mod tests {
                 Vec::new(),
                 vec![Token::new(1)],
                 vec![Token::new(2), Token::new(3)],
+                Vec::new(),
+                Vec::new(),
                 sampling,
             ),
             Err(Error::InvalidArgument(message))
@@ -565,7 +589,15 @@ mod tests {
             ..SamplingConfig::default()
         };
         let (queued_request, external_request) = runtime
-            .initialize_req(1, Vec::new(), vec![Token::new(1), Token::new(2)], Vec::new(), sampling)
+            .initialize_req(
+                1,
+                Vec::new(),
+                vec![Token::new(1), Token::new(2)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                sampling,
+            )
             .unwrap();
         let (request_slot_allocator, _request_slot_reset_rx) = RequestSlotAllocator::new(1);
         let request_slot = match request_slot_allocator.allocate() {
@@ -683,6 +715,8 @@ mod tests {
                 1,
                 Vec::new(),
                 vec![Token::new(1)],
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 SamplingConfig::default(),
             )
@@ -820,6 +854,8 @@ mod tests {
                 1,
                 Vec::new(),
                 vec![Token::new(1), Token::new(2), Token::new(3)],
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 sampling,
             )

@@ -13,6 +13,7 @@ use crate::runtime::request::AtomicRequestStatus;
 use crate::runtime::request::CompletionReason;
 use crate::runtime::request::RequestStatus;
 use crate::runtime::request::TokenProbs;
+use crate::runtime::resource::Resource;
 use crate::runtime::scheduler::ComputePhase;
 
 mod req_resp;
@@ -28,6 +29,7 @@ where
     req_slot: RequestSlot,
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+    resources: Vec<Resource>,
     in_flight_computes: VecDeque<ComputePhase>,
     token_prob_tx: Sender<TokenProbs>,
 
@@ -39,11 +41,13 @@ impl<const N: usize, const P: usize, const L: usize, DBC> InternalRequest<N, P, 
 where
     DBC: MultiLaneBlockCache<P, L>,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         req_id: RawRequestID,
         req_slot: RequestSlot,
         req_status: AtomicRequestStatus,
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+        resources: Vec<Resource>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
         context_window: usize,
@@ -53,6 +57,7 @@ where
             req_slot,
             req_status,
             decoder_blocks,
+            resources,
             in_flight_computes: VecDeque::new(),
             token_prob_tx,
             sampling_config,
