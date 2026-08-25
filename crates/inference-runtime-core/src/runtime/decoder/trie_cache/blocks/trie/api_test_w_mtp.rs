@@ -1351,6 +1351,7 @@ fn initialize_blocks(block_cache: Arc<TestMultiLaneTrieBlockCache>, total_tokens
     assert!(NUM_CACHE_LANE - 1 <= total_tokens.len());
     TestTrieKVBlocks::new(
         block_cache,
+        Vec::new(),
         std::iter::empty::<Token>(),
         std::iter::empty::<Token>(),
         total_tokens,

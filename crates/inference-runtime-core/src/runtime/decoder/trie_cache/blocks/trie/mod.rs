@@ -11,6 +11,7 @@ use crate::runtime::decoder::trie_cache::ImmutableBlock;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::decoder::trie_cache::MutableBlock;
 use crate::runtime::decoder::trie_cache::SemiImmutableBlock;
+use crate::runtime::resource::ResourcePlacement;
 
 mod api;
 mod token;
@@ -20,6 +21,8 @@ where
     BC: MultiLaneBlockCache<P, L>,
 {
     block_cache: Arc<BC>,
+    resource_placements: Vec<ResourcePlacement>,
+
     immutable_blocks: Vec<[ImmutableBlock<P>; L]>,
     semi_immutable_blocks: VecDeque<[SemiImmutableBlock<N>; L]>,
     mutable_blocks: VecDeque<[MutableBlock<N>; L]>,
@@ -41,9 +44,11 @@ where
     BC: MultiLaneBlockCache<P, L>,
 {
     const _ASSERT_N_GT_0: () = assert!(N > 0);
+    const _ASSERT_N_FITS_RESOURCE_SEGMENT: () = assert!(N <= u16::MAX as usize);
 
     pub fn new(
         block_cache: Arc<BC>,
+        resource_placements: Vec<ResourcePlacement>,
         history_tokens: impl IntoIterator<Item = Token>,
         prompt_tokens: impl IntoIterator<Item = Token>,
         sampled_tokens: impl IntoIterator<Item = Token>,
@@ -59,6 +64,7 @@ where
         assert!(L - 1 <= queued_tokens.len());
         Self {
             block_cache,
+            resource_placements,
 
             immutable_blocks: vec![],
             semi_immutable_blocks: VecDeque::new(),
@@ -75,6 +81,10 @@ where
 
             epoch: 0,
         }
+    }
+
+    pub fn resource_placements(&self) -> &[ResourcePlacement] {
+        &self.resource_placements
     }
 
     #[cfg(debug_assertions)]

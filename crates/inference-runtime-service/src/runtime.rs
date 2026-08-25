@@ -258,8 +258,13 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             )));
         }
         let req_status = AtomicRequestStatus::new();
-        let decoder_kv_blocks =
-            TrieDecoderBlocks::new(self.block_cache.clone(), history_tokens, prompt_tokens, sampled_tokens);
+        let decoder_kv_blocks = TrieDecoderBlocks::new(
+            self.block_cache.clone(),
+            Vec::new(),
+            history_tokens,
+            prompt_tokens,
+            sampled_tokens,
+        );
         let (token_prob_tx, token_prob_rx) = async_unbounded();
         let queued_request = QueuedRequest::new(
             request_id,

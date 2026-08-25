@@ -9,6 +9,7 @@ use crate::compute::QueryTokens;
 use crate::compute::SampledTokens;
 use crate::runtime::Token;
 use crate::runtime::decoder::BlockAnnotation;
+use crate::runtime::decoder::ResourceSegment;
 use crate::runtime::decoder::trie_cache::AllocateMultiLaneMutableBlockResult;
 use crate::runtime::decoder::trie_cache::BlockMetadata;
 use crate::runtime::decoder::trie_cache::CommitMultiLaneMutableBlockResult;
@@ -587,29 +588,51 @@ where
     }
 
     fn block_annotation_vec(&self, block_index: usize) -> [SmallVec<[BlockAnnotation; 1]>; L] {
-        if block_index > 0 {
-            std::array::from_fn(|_| vec![].into())
-        } else {
-            // MTP root lane identity, L = 4:
-            //
-            // verified tokens  t0  t1  t2  ...
-            // lane 0 root      t0  t1  t2  ...
-            // lane 1 root          t1  t2  ...  prefix: [t0]
-            // lane 2 root              t2  ...  prefix: [t0, t1]
-            // lane 3 root                  ...  prefix: [t0, t1, t2]
-            //
-            // TODO: Allow a short MTP root to defer its lane-specific PrefixTokens annotation until verified history
-            // contains that lane's complete prefix.
-            std::array::from_fn(|lane| {
-                if lane == 0 {
-                    vec![].into()
-                } else {
-                    let prefix_tokens: Arc<[Token]> = self.total_tokens().take(lane).collect::<Vec<_>>().into();
-                    debug_assert_eq!(lane, prefix_tokens.len());
-                    vec![BlockAnnotation::prefix_tokens(prefix_tokens)].into()
+        std::array::from_fn(|lane| {
+            let mut annotations: SmallVec<[BlockAnnotation; 1]> = SmallVec::new();
+            if block_index == 0 && lane > 0 {
+                // MTP root lane identity, L = 4:
+                //
+                // verified tokens  t0  t1  t2  ...
+                // lane 0 root      t0  t1  t2  ...
+                // lane 1 root          t1  t2  ...  prefix: [t0]
+                // lane 2 root              t2  ...  prefix: [t0, t1]
+                // lane 3 root                  ...  prefix: [t0, t1, t2]
+                //
+                // TODO: Allow a short MTP root to defer its lane-specific PrefixTokens annotation until verified
+                // history contains that lane's complete prefix.
+                let prefix_tokens: Arc<[Token]> = self.total_tokens().take(lane).collect::<Vec<_>>().into();
+                debug_assert_eq!(lane, prefix_tokens.len());
+                annotations.push(BlockAnnotation::prefix_tokens(prefix_tokens));
+            }
+
+            let block_token_start = block_index * N + lane;
+            let block_token_end = block_token_start + N;
+            for placement in &self.resource_placements {
+                for &(placement_token_start, resource_index, len) in placement.placements() {
+                    let placement_token_end = placement_token_start + len;
+                    let active_token_start = block_token_start.max(placement_token_start);
+                    let active_token_end = block_token_end.min(placement_token_end);
+                    if active_token_start >= active_token_end {
+                        continue;
+                    }
+
+                    let local_token_index = (active_token_start - block_token_start) as u16;
+                    let active_resource_index =
+                        u32::try_from(resource_index + active_token_start - placement_token_start)
+                            .expect("resource index must fit the cache annotation u32 domain");
+                    let active_len = (active_token_end - active_token_start) as u16;
+                    annotations.push(BlockAnnotation::resource(ResourceSegment::new(
+                        placement.resource_id(),
+                        local_token_index,
+                        active_resource_index,
+                        active_len,
+                    )));
                 }
-            })
-        }
+            }
+            annotations.sort_unstable();
+            annotations
+        })
     }
 }
 
@@ -624,3 +647,7 @@ mod api_test_w_mtp;
 #[cfg(test)]
 #[path = "./api_test_w_dspark.rs"]
 mod api_test_w_dspark;
+
+#[cfg(test)]
+#[path = "./api_test_resource.rs"]
+mod api_test_resource;
