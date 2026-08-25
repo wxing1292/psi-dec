@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 use smallvec::smallvec;
+use uuid::Uuid;
 
 use crate::channel::Shutdown;
 use crate::memory::DeviceBlock;
@@ -9,12 +10,12 @@ use crate::memory::U32IDAllocator;
 use crate::runtime::Token;
 use crate::runtime::decoder::BlockAnnotation;
 use crate::runtime::decoder::KVBlockPlacement;
-use crate::runtime::decoder::ResourceDigest;
 use crate::runtime::decoder::ResourceSegment;
 use crate::runtime::decoder::StateBlockPlacement;
 use crate::runtime::decoder::trie_cache::S3FIFOClient;
 use crate::runtime::decoder::trie_cache::Trie;
 use crate::runtime::decoder::trie_cache::TrieEdge;
+use crate::runtime::resource::ResourceID;
 
 pub const TEST_PARTITIONS: usize = 4;
 
@@ -23,9 +24,15 @@ pub fn new_trie() -> Arc<Trie<TEST_PARTITIONS>> {
 }
 
 pub fn new_annotations(seed: u8) -> SmallVec<[BlockAnnotation; 1]> {
+    let mut bytes = [seed; 16];
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let resource_id = ResourceID::from_uuid(Uuid::from_bytes(bytes)).unwrap();
     smallvec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest([seed; 32]),
+        resource_id,
         seed as u16,
+        seed as u32,
+        1,
     ))]
 }
 

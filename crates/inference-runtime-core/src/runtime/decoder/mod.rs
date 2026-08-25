@@ -10,7 +10,6 @@ pub use allocator::TPStateBlockAllocator;
 
 mod resource;
 pub use resource::BlockAnnotation;
-pub use resource::ResourceDigest;
 pub use resource::ResourceSegment;
 
 // pub mod hash_cache;

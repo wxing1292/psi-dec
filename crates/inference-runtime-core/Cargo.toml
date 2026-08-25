@@ -36,4 +36,5 @@ thiserror = { workspace = true }
 tokenizers = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
 zerocopy = { workspace = true }

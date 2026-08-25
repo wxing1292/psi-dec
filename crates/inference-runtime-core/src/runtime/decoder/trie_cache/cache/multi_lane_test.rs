@@ -13,13 +13,14 @@ use crate::channel::Shutdown;
 use crate::memory::U32IDAllocator;
 use crate::runtime::Token;
 use crate::runtime::decoder::BlockAnnotation;
-use crate::runtime::decoder::ResourceDigest;
 use crate::runtime::decoder::ResourceSegment;
 use crate::runtime::decoder::TPStateBlockAllocator;
 use crate::runtime::decoder::allocator::TPKVBlockAllocator;
 use crate::runtime::decoder::trie_cache::BlockMetadata;
 use crate::runtime::decoder::trie_cache::SingleLaneTrieBlockCache;
 use crate::runtime::decoder::trie_cache::block::DecoderBlock;
+use crate::runtime::resource::ResourceID;
+use crate::runtime::resource::ResourceTypeID;
 
 const NUM_KV_PAGES_PER_BLOCK: usize = 1;
 const NUM_STATE_PAGES_PER_BLOCK: usize = 1;
@@ -166,8 +167,10 @@ fn test_mutable_block_alloc_mutable_commit_immutable() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))];
     let tokens: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
     let result = block_cache.alloc_mutable_block::<NUM_TOKEN_PER_BLOCK>();
@@ -248,8 +251,10 @@ fn test_mutable_block_alloc_mutable_commit_immutable_collision() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))];
     let tokens: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
     let result = block_cache.alloc_mutable_block::<NUM_TOKEN_PER_BLOCK>();
@@ -380,8 +385,10 @@ fn test_semi_immutable_block_reserve_semi_immutable_free() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens: Arc<[Token]> = (0..NUM_TOKEN_PER_BLOCK)
@@ -430,8 +437,10 @@ fn test_semi_immutable_block_reserve_resource_limit_free() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations_0: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_0: Arc<[Token]> = (0..NUM_TOKEN_PER_BLOCK)
@@ -458,8 +467,10 @@ fn test_semi_immutable_block_reserve_resource_limit_free() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let annotations_1: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_1: Arc<[Token]> = (0..NUM_TOKEN_PER_BLOCK)
@@ -545,8 +556,10 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens: Arc<[Token]> = (0..NUM_TOKEN_PER_BLOCK)
@@ -630,8 +643,10 @@ fn test_semi_immutable_block_reserve_semi_immutable_commit_immutable_collision()
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens: Arc<[Token]> = (0..NUM_TOKEN_PER_BLOCK)
@@ -765,8 +780,10 @@ fn test_semi_immutable_block_reserve_immutable() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens: Arc<[Token]> = (0..NUM_TOKEN_PER_BLOCK)
@@ -888,8 +905,10 @@ fn test_semi_immutable_block_reserve_reservation_collision() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens: Arc<[Token]> = (0..NUM_TOKEN_PER_BLOCK)
@@ -1025,15 +1044,19 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_0() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations_common: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_common: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
 
     let annotations_diff_0: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_0: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
@@ -1047,8 +1070,10 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_0() {
     };
 
     let annotations_diff_1: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_1: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
@@ -1154,15 +1179,19 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_1() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations_common: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_common: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
 
     let annotations_diff_0: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_0: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
@@ -1199,8 +1228,10 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_1() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let annotations_diff_1: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_1: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
@@ -1307,15 +1338,19 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_0() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations_common: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_common: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
 
     let annotations_diff_0: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_0: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
@@ -1332,8 +1367,10 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_0() {
     };
 
     let annotations_diff_1: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_1: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
@@ -1445,15 +1482,19 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_1() {
     let (page_id_allocators, block_cache) = initialize_block_cache(max_pages_per_lane, cache_capacity);
 
     let annotations_common: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_common: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
 
     let annotations_diff_0: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_0: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();
@@ -1490,8 +1531,10 @@ fn test_semi_immutable_block_reserve_mutable_commit_immutable_collision_1() {
     assert_eq!(0, block_cache.num_unpinned_immutable_block());
 
     let annotations_diff_1: SmallVec<[BlockAnnotation; 1]> = vec![BlockAnnotation::resource(ResourceSegment::new(
-        ResourceDigest(rng.random()),
+        ResourceID::new(ResourceTypeID::new(rng.random())),
         rng.random(),
+        rng.random(),
+        1,
     ))]
     .into();
     let tokens_diff_1: Vec<Token> = (0..NUM_TOKEN_PER_BLOCK).map(|_| Token(rng.random::<u32>())).collect();

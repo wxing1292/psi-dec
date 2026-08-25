@@ -18,6 +18,12 @@ pub use request::TokenProbs;
 mod token;
 pub use token::Token;
 
+mod resource;
+pub use resource::ResourceID;
+pub use resource::ResourcePlacement;
+pub use resource::ResourceTypeID;
+pub use resource::validate_resource_placements;
+
 pub type RawRequestID = usize;
 pub type RawRequestSlot = u32;
 pub type RawPageID = u32;
