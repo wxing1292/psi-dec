@@ -15,6 +15,7 @@ use crate::runtime::scheduler::ScheduleQueue;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
 use crate::runtime::scheduler::allocate_sticky_token_budgets;
+use crate::runtime::tasks::AsyncTaskResp;
 
 pub struct SimpleScheduler<UserReq, DeviceReq, DeviceResp, B> {
     schedule_queue: ScheduleQueue<UserReq, DeviceReq, DeviceResp>,
@@ -106,12 +107,8 @@ where
         self.schedule_queue.enqueue(user_req);
     }
 
-    fn swap_in(&mut self, user_req: UserReq) {
-        self.schedule_queue.push_back(user_req);
-    }
-
-    fn pop_ready_reqs(&mut self) -> Option<UserReq> {
-        self.schedule_queue.pop_ready_reqs()
+    fn handle_async_task_resp(&mut self, resp: Box<dyn AsyncTaskResp>) {
+        self.schedule_queue.handle_async_task_resp(resp);
     }
 
     fn can_flush(&self) -> bool {
@@ -182,6 +179,7 @@ where
         self.free_compute_slots.push_front(compute_slot);
 
         self.batcher.cancel(&mut self.schedule_queue, dev_reqs);
+        self.schedule_queue.handle_ready_waits();
     }
 
     fn commit(&mut self, batch_dev_resp: BatchDeviceResp) {
@@ -207,6 +205,7 @@ where
         self.free_compute_slots.push_back(compute_slot);
 
         self.batcher.commit(&mut self.schedule_queue, dev_resps);
+        self.schedule_queue.handle_ready_waits();
     }
 }
 
@@ -312,9 +311,9 @@ mod tests {
             });
         batcher.expect_cancel().once().return_once(|_, _| {});
 
-        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
         let mut scheduler = SimpleScheduler::new(
-            ScheduleQueue::new(swap_out_task_tx),
+            ScheduleQueue::new(async_task_req_tx),
             batcher,
             max_req_budget,
             max_token_budget,
@@ -353,8 +352,8 @@ mod tests {
         batcher.expect_prepare().times(3).returning(|_, _, _, _, _| Vec::new());
         batcher.expect_commit().times(3).returning(|_, _| {});
 
-        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
-        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(swap_out_task_tx), batcher, 1, 8, 4, 3);
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
+        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(async_task_req_tx), batcher, 1, 8, 4, 3);
         let (first, second, third) = {
             let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
                 &mut scheduler;
@@ -384,8 +383,8 @@ mod tests {
         batcher.expect_prepare().times(3).returning(|_, _, _, _, _| Vec::new());
         batcher.expect_cancel().times(3).returning(|_, _| {});
 
-        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
-        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(swap_out_task_tx), batcher, 1, 8, 4, 3);
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
+        let mut scheduler = SimpleScheduler::new(ScheduleQueue::new(async_task_req_tx), batcher, 1, 8, 4, 3);
         let (first, second, third) = {
             let scheduler: &mut dyn Scheduler<TestUserReq, MockDevReq, MockDevResp, TestBatchDevReq, TestBatchDeviceResp> =
                 &mut scheduler;
@@ -412,8 +411,8 @@ mod tests {
     #[test]
     fn test_allocate_slot_token_budgets() {
         let req_id = 7;
-        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
-        let mut schedule_queue = ScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
+        let mut schedule_queue = ScheduleQueue::new(async_task_req_tx);
         let mut user_req = TestUserReq::new();
         user_req.expect_id().return_const(req_id);
         user_req

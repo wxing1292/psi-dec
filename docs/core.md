@@ -147,8 +147,8 @@ request-ID-to-token-budget map. `FIFOBatcher` consumes this map before it uses t
 budgets for the normal FIFO queue.
 
 Runtime admission and scheduler batching have separate limits. `RuntimeConfig::max_queued_requests` bounds the
-user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and both swap-task
-channels.
+user-request channel. `RuntimeConfig::max_running_requests` bounds the request-slot domain and the async-task request
+and response channels.
 
 `SchedulerConfig::max_requests`, `max_tokens`, and `max_tokens_per_request` remain per-batch limits.
 `max_tokens_per_request` must not exceed `max_tokens`.
@@ -195,9 +195,9 @@ residency.
 `ScheduleQueue::pop_ready_reqs`. This method synchronously polls the unordered wait collection and returns at most one
 ready request.
 
-A request can become terminal before or during the wait. The request then stays terminal. The event loop applies the
-same terminal check that it applies to an asynchronous swap-in completion. It releases a terminal request. Otherwise,
-it calls `Scheduler::swap_in`, which appends the request to the back of `run_queue`.
+A request can become terminal before or during the wait. The request then stays terminal. The event loop releases a
+terminal reservation-wait request. Otherwise, it calls `Scheduler::resume`, which appends the request to the back of
+`run_queue`.
 
 Shutdown cancels reservation waits when it drops the scheduler and its wait collection. The scheduler event loop
 remains a synchronous thread.

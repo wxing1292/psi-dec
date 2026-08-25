@@ -18,6 +18,9 @@ use crate::runtime::scheduler::ComputePhase;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::ReqTokenInventory;
 use crate::runtime::scheduler::UserRequest;
+use crate::runtime::tasks::AsyncTaskResp;
+use crate::runtime::tasks::ResourceMaterializationReq;
+use crate::runtime::tasks::ResourceMaterializationResp;
 
 impl<const N: usize, const P: usize, const L: usize, DBC> UserRequest<DeviceRequest, DeviceResponse>
     for InternalRequest<N, P, L, DBC>
@@ -44,6 +47,14 @@ where
         self.in_flight_computes.len()
     }
 
+    fn num_in_flight_blocking_async_tasks(&self) -> usize {
+        self.num_in_flight_blocking_async_tasks
+    }
+
+    fn num_in_flight_nonblocking_async_tasks(&self) -> usize {
+        self.num_in_flight_nonblocking_async_tasks
+    }
+
     fn request_estimate(&self) -> usize {
         1
     }
@@ -60,11 +71,17 @@ where
 
     fn prepare(&mut self, token_budget: usize) -> PrepareResult<DeviceRequest> {
         if self.status().is_terminal() {
-            return if self.in_flight_computes.is_empty() {
+            return if self.in_flight_computes.is_empty()
+                && self.num_in_flight_blocking_async_tasks == 0
+                && self.num_in_flight_nonblocking_async_tasks == 0
+            {
                 PrepareResult::Terminal
             } else {
                 PrepareResult::Skip
             };
+        }
+        if self.num_in_flight_blocking_async_tasks != 0 {
+            return PrepareResult::Skip;
         }
         if matches!(self.in_flight_computes.back(), Some(ComputePhase::Decode { .. })) {
             return PrepareResult::Skip;
@@ -93,6 +110,15 @@ where
                         PrepareResult::Skip
                     };
                 },
+                InitBlockOnceResult::ResourceNotFound { resource_ids, .. } => {
+                    self.num_in_flight_blocking_async_tasks += 1;
+                    let req = Box::new(ResourceMaterializationReq::new(
+                        self.req_id,
+                        resource_ids,
+                        self.resource_processor.clone(),
+                    ));
+                    return PrepareResult::BlockingAsyncTask { req };
+                },
                 InitBlockOnceResult::Success { ready_token_slots } => ready_token_slots,
             }
         }
@@ -120,6 +146,16 @@ where
         }
     }
 
+    fn handle_async_task_resp(&mut self, resp: Box<dyn AsyncTaskResp>) {
+        // TODO: Replace this single-response-type downcast before the runtime adds another async task response type.
+        // Resource materialization is currently the only async task response.
+        let resp = resp
+            .into_any()
+            .downcast::<ResourceMaterializationResp>()
+            .unwrap_or_else(|_| panic!("internal request received an unsupported async task response"));
+        resp.update(self);
+    }
+
     fn cancel(&mut self, dev_req: DeviceRequest) -> CancelResult {
         let DeviceRequest {
             req_id,
@@ -141,11 +177,16 @@ where
         self.decoder_blocks.cancel(decoder_query_tokens);
 
         if self.status().is_terminal() {
-            if self.in_flight_computes.is_empty() {
+            if self.in_flight_computes.is_empty()
+                && self.num_in_flight_blocking_async_tasks == 0
+                && self.num_in_flight_nonblocking_async_tasks == 0
+            {
                 CancelResult::Terminal
             } else {
                 CancelResult::Pending
             }
+        } else if self.num_in_flight_blocking_async_tasks != 0 {
+            CancelResult::Pending
         } else {
             debug_assert!(
                 !matches!(self.in_flight_computes.back(), Some(ComputePhase::Decode { .. })),
@@ -215,15 +256,44 @@ where
         }
 
         if self.status().is_terminal() {
-            if self.in_flight_computes.is_empty() {
+            if self.in_flight_computes.is_empty()
+                && self.num_in_flight_blocking_async_tasks == 0
+                && self.num_in_flight_nonblocking_async_tasks == 0
+            {
                 CommitResult::Terminal
             } else {
                 CommitResult::Pending
             }
-        } else if matches!(self.in_flight_computes.back(), Some(ComputePhase::Decode { .. })) {
+        } else if self.num_in_flight_blocking_async_tasks != 0
+            || matches!(self.in_flight_computes.back(), Some(ComputePhase::Decode { .. }))
+        {
             CommitResult::Pending
         } else {
             CommitResult::Continue
+        }
+    }
+}
+
+impl ResourceMaterializationResp {
+    fn update<const N: usize, const P: usize, const L: usize, DBC>(self, request: &mut InternalRequest<N, P, L, DBC>)
+    where
+        DBC: MultiLaneBlockCache<P, L>,
+    {
+        assert!(
+            request.num_in_flight_blocking_async_tasks != 0,
+            "resource materialization response requires an in-flight async task"
+        );
+        request.num_in_flight_blocking_async_tasks -= 1;
+        let concrete_resources = match self.into_result() {
+            Ok(resources) => resources,
+            Err(error) => {
+                tracing::error!(error = %error, request_id = request.req_id, "resource materialization failed");
+                request.store_aborted();
+                return;
+            },
+        };
+        for resource in concrete_resources {
+            request.decoder_blocks.resource_symbolic_to_concrete(resource);
         }
     }
 }

@@ -19,8 +19,9 @@ use crate::compute::DevResp;
 use crate::runtime::RawRequestID;
 use crate::runtime::scheduler::UserRequest;
 use crate::runtime::scheduler::dedup_vec_deque::DedupVecDeque;
+use crate::runtime::tasks::AsyncTaskReq;
+use crate::runtime::tasks::AsyncTaskResp;
 use crate::runtime::tasks::AwaitReservation;
-use crate::runtime::tasks::SwapOutTask;
 
 pub struct ScheduleQueue<UserReq, DeviceReq, DeviceResp> {
     id_requests: HashMap<RawRequestID, UserReq>,
@@ -28,7 +29,7 @@ pub struct ScheduleQueue<UserReq, DeviceReq, DeviceResp> {
 
     new_queue: VecDeque<UserReq>,
     waiting_reqs: FuturesUnordered<AwaitReservation<UserReq, DeviceReq, DeviceResp>>,
-    swap_out_task_tx: Sender<SwapOutTask<UserReq, DeviceReq, DeviceResp>>,
+    async_task_req_tx: Sender<Box<dyn AsyncTaskReq<Resp = dyn AsyncTaskResp>>>,
 
     phantom_data_dev_req: PhantomData<DeviceReq>,
     phantom_data_dev_resp: PhantomData<DeviceResp>,
@@ -40,14 +41,14 @@ where
     DeviceReq: DevReq,
     DeviceResp: DevResp,
 {
-    pub fn new(swap_out_task_tx: Sender<SwapOutTask<UserReq, DeviceReq, DeviceResp>>) -> Self {
+    pub fn new(async_task_req_tx: Sender<Box<dyn AsyncTaskReq<Resp = dyn AsyncTaskResp>>>) -> Self {
         Self {
             id_requests: hash_map! {},
 
             new_queue: VecDeque::new(),
             run_queue: DedupVecDeque::new(),
             waiting_reqs: FuturesUnordered::new(),
-            swap_out_task_tx,
+            async_task_req_tx,
 
             phantom_data_dev_req: PhantomData,
             phantom_data_dev_resp: PhantomData,
@@ -124,11 +125,51 @@ where
         }
     }
 
-    pub fn push_swap_out(
+    pub fn handle_ready_waits(&mut self) {
+        if self.waiting_reqs.is_empty() {
+            return;
+        }
+        while let Some(user_req) = self.pop_ready_reqs() {
+            if user_req.is_terminal() {
+                tracing::debug!(
+                    target: "inference-runtime-core::scheduler",
+                    phase = "request.reservation_wait_terminal",
+                    request_id = user_req.id(),
+                    "terminal reservation-wait request dropped"
+                );
+            } else {
+                self.push_back(user_req);
+            }
+        }
+    }
+
+    pub fn handle_async_task_req(
         &self,
-        swap_out_task: SwapOutTask<UserReq, DeviceReq, DeviceResp>,
-    ) -> Result<(), TrySendError<SwapOutTask<UserReq, DeviceReq, DeviceResp>>> {
-        self.swap_out_task_tx.try_send(swap_out_task)
+        req: Box<dyn AsyncTaskReq<Resp = dyn AsyncTaskResp>>,
+    ) -> Result<(), TrySendError<Box<dyn AsyncTaskReq<Resp = dyn AsyncTaskResp>>>> {
+        self.async_task_req_tx.try_send(req)
+    }
+
+    pub fn handle_async_task_resp(&mut self, resp: Box<dyn AsyncTaskResp>) {
+        let req_id = resp.request_id();
+        let user_req = self
+            .id_requests
+            .get_mut(&req_id)
+            .expect("async task response must reference a retained request");
+        user_req.handle_async_task_resp(resp);
+        let terminal = user_req.is_terminal();
+        let has_in_flight_compute = user_req.num_in_flight_computes() != 0;
+        let has_in_flight_blocking_async_task = user_req.num_in_flight_blocking_async_tasks() != 0;
+        let has_in_flight_nonblocking_async_task = user_req.num_in_flight_nonblocking_async_tasks() != 0;
+        if terminal
+            && !has_in_flight_compute
+            && !has_in_flight_blocking_async_task
+            && !has_in_flight_nonblocking_async_task
+        {
+            self.id_requests.remove(&req_id);
+        } else if !terminal && !has_in_flight_blocking_async_task {
+            self.run_queue.push_back(req_id);
+        }
     }
 
     pub fn insert(&mut self, user_req: UserReq) {
@@ -188,6 +229,20 @@ mod tests {
     type TestUserReq = MockUserRequest<MockDevReq, MockDevResp>;
     type TestScheduleQueue = ScheduleQueue<TestUserReq, MockDevReq, MockDevResp>;
 
+    struct TestAsyncTaskResp {
+        request_id: RawRequestID,
+    }
+
+    impl AsyncTaskResp for TestAsyncTaskResp {
+        fn request_id(&self) -> RawRequestID {
+            self.request_id
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+    }
+
     #[test]
     fn test_pop_ready_reqs_polls_notified_wait() {
         let req_id = 7;
@@ -198,8 +253,8 @@ mod tests {
         user_req.expect_id().return_const(req_id);
         user_req.expect_is_terminal().once().return_const(false);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_waiting_reqs(user_req, Box::pin(wait));
 
         event.notify(usize::MAX);
@@ -217,8 +272,8 @@ mod tests {
         ready_req.expect_id().return_const(ready_req_id);
         ready_req.expect_is_terminal().once().return_const(false);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_waiting_reqs(pending_req, Box::pin(future::pending()));
         schedule_queue.push_waiting_reqs(ready_req, Box::pin(async {}));
 
@@ -233,10 +288,106 @@ mod tests {
         user_req.expect_id().return_const(req_id);
         user_req.expect_is_terminal().once().return_const(true);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_waiting_reqs(user_req, Box::pin(async {}));
 
         assert_eq!(schedule_queue.pop_ready_reqs().map(|req| req.id()), Some(req_id));
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_requeues_request_wo_in_flight_work() {
+        let schedule_queue = schedule_queue_after_async_task_resp(false, 0, 0, 0);
+
+        assert_eq!(1, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_some());
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_requeues_request_w_in_flight_compute() {
+        let schedule_queue = schedule_queue_after_async_task_resp(false, 1, 0, 0);
+
+        assert_eq!(1, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_some());
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_requeues_request_w_in_flight_nonblocking_async_task() {
+        let schedule_queue = schedule_queue_after_async_task_resp(false, 0, 0, 1);
+
+        assert_eq!(1, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_some());
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_keeps_request_blocked_w_in_flight_blocking_async_task() {
+        let schedule_queue = schedule_queue_after_async_task_resp(false, 0, 1, 0);
+
+        assert_eq!(0, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_some());
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_removes_terminal_request_wo_in_flight_work() {
+        let schedule_queue = schedule_queue_after_async_task_resp(true, 0, 0, 0);
+
+        assert_eq!(0, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_none());
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_retains_terminal_request_w_in_flight_compute() {
+        let schedule_queue = schedule_queue_after_async_task_resp(true, 1, 0, 0);
+
+        assert_eq!(0, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_some());
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_retains_terminal_request_w_in_flight_blocking_async_task() {
+        let schedule_queue = schedule_queue_after_async_task_resp(true, 0, 1, 0);
+
+        assert_eq!(0, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_some());
+    }
+
+    #[test]
+    fn test_handle_async_task_resp_retains_terminal_request_w_in_flight_nonblocking_async_task() {
+        let schedule_queue = schedule_queue_after_async_task_resp(true, 0, 0, 1);
+
+        assert_eq!(0, schedule_queue.run_queue_size());
+        assert!(schedule_queue.get_ref(&7).is_some());
+    }
+
+    fn schedule_queue_after_async_task_resp(
+        terminal: bool,
+        num_in_flight_computes: usize,
+        num_in_flight_blocking_async_tasks: usize,
+        num_in_flight_nonblocking_async_tasks: usize,
+    ) -> TestScheduleQueue {
+        let req_id = 7;
+        let mut user_req = TestUserReq::new();
+        user_req.expect_id().once().return_const(req_id);
+        user_req.expect_handle_async_task_resp().once().return_once(|_| {});
+        user_req.expect_is_terminal().once().return_const(terminal);
+        user_req
+            .expect_num_in_flight_computes()
+            .once()
+            .return_const(num_in_flight_computes);
+        user_req
+            .expect_num_in_flight_blocking_async_tasks()
+            .once()
+            .return_const(num_in_flight_blocking_async_tasks);
+        user_req
+            .expect_num_in_flight_nonblocking_async_tasks()
+            .once()
+            .return_const(num_in_flight_nonblocking_async_tasks);
+
+        let (async_task_req_tx, _async_task_req_rx) = bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
+        schedule_queue.insert(user_req);
+
+        schedule_queue.handle_async_task_resp(Box::new(TestAsyncTaskResp { request_id: req_id }));
+        schedule_queue
     }
 }

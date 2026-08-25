@@ -111,6 +111,21 @@ where
                         break 'prepare_loop;
                     }
                 },
+                PrepareResult::BlockingAsyncTask { req } => {
+                    sticky_token_budgets.remove(&req_id);
+                    schedule_queue.insert(user_req);
+                    if schedule_queue.handle_async_task_req(req).is_err() {
+                        panic!("async task request queue must have available capacity");
+                    }
+                    continue 'prepare_loop;
+                },
+                PrepareResult::NonblockingAsyncTask { req } => {
+                    schedule_queue.push_front(user_req);
+                    if schedule_queue.handle_async_task_req(req).is_err() {
+                        panic!("async task request queue must have available capacity");
+                    }
+                    continue 'prepare_loop;
+                },
                 PrepareResult::Await { wait } => {
                     sticky_token_budgets.remove(&req_id);
                     schedule_queue.push_waiting_reqs(user_req, wait);
@@ -230,6 +245,8 @@ mod tests {
     use crate::compute::MockDevResp;
     use crate::runtime::scheduler::MockUserRequest;
     use crate::runtime::scheduler::ReqTokenInventory;
+    use crate::runtime::tasks::AsyncTaskReq;
+    use crate::runtime::tasks::AsyncTaskResp;
 
     type TestUserReq = MockUserRequest<MockDevReq, MockDevResp>;
     type TestScheduleQueue = ScheduleQueue<TestUserReq, MockDevReq, MockDevResp>;
@@ -249,8 +266,8 @@ mod tests {
             .once()
             .return_const(2usize);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(candidate);
         schedule_queue.push_back(in_flight_req_1);
         schedule_queue.push_back(in_flight_req_2);
@@ -276,8 +293,8 @@ mod tests {
             .once()
             .return_const(2usize);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(in_flight_req_1);
         schedule_queue.push_back(in_flight_req_2);
 
@@ -308,8 +325,8 @@ mod tests {
             expect_cancel(&mut seq, user_req);
         }
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         for user_req in user_reqs {
             schedule_queue.push_back(user_req);
         }
@@ -344,8 +361,8 @@ mod tests {
             expect_cancel(&mut seq, user_req);
         }
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         for user_req in user_reqs {
             schedule_queue.push_back(user_req);
         }
@@ -380,8 +397,8 @@ mod tests {
             expect_cancel(&mut seq, user_req);
         }
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         for user_req in user_reqs {
             schedule_queue.push_back(user_req);
         }
@@ -419,8 +436,8 @@ mod tests {
             expect_commit(&mut seq, user_req);
         }
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         for user_req in user_reqs {
             schedule_queue.push_back(user_req);
         }
@@ -459,8 +476,8 @@ mod tests {
             expect_commit(&mut seq, user_req);
         }
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         for user_req in user_reqs {
             schedule_queue.push_back(user_req);
         }
@@ -499,8 +516,8 @@ mod tests {
             expect_commit(&mut seq, user_req);
         }
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         for user_req in user_reqs {
             schedule_queue.push_back(user_req);
         }
@@ -630,8 +647,8 @@ mod tests {
             .in_sequence(&mut seq)
             .return_once(|_| CancelResult::Terminal);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(continue_req);
         schedule_queue.push_back(pending_req);
         schedule_queue.push_back(terminal_req);
@@ -775,8 +792,8 @@ mod tests {
             .in_sequence(&mut seq)
             .return_once(|_| CommitResult::Terminal);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(continue_req);
         schedule_queue.push_back(pending_req);
         schedule_queue.push_back(terminal_req);
@@ -851,8 +868,8 @@ mod tests {
             }
         });
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(sticky_req_1);
         schedule_queue.push_back(sticky_req_2);
 
@@ -907,8 +924,8 @@ mod tests {
             }
         });
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(req_1);
         schedule_queue.push_back(req_2);
 
@@ -920,6 +937,78 @@ mod tests {
         assert!(schedule_queue.get_ref(&2).is_some());
         assert_eq!(schedule_queue.run_queue_size(), 0);
         assert!(schedule_queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_prepare_blocking_async_task() {
+        let req_id = 1;
+        let token_budget = 8;
+        let mut user_req = mock_user_req(req_id);
+        user_req
+            .expect_token_estimate()
+            .once()
+            .returning(move || ReqTokenInventory::new::<1>(req_id, token_budget, 0, 0, &[]));
+        user_req.expect_prepare().once().return_once(move |_| {
+            PrepareResult::BlockingAsyncTask {
+                req: Box::new(TestAsyncTaskReq { request_id: req_id }),
+            }
+        });
+
+        let (async_task_req_tx, async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
+        schedule_queue.push_back(user_req);
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(1, token_budget, token_budget, AHashMap::new(), &mut schedule_queue);
+
+        assert!(dev_reqs.is_empty());
+        assert_eq!(async_task_req_rx.try_recv().unwrap().request_id(), req_id);
+        assert!(schedule_queue.get_ref(&req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 0);
+    }
+
+    #[test]
+    fn test_prepare_nonblocking_async_task() {
+        let req_id = 1;
+        let token_budget = 8;
+        let mut user_req = mock_user_req(req_id);
+        user_req
+            .expect_token_estimate()
+            .times(2)
+            .returning(move || ReqTokenInventory::new::<1>(req_id, token_budget, 0, 0, &[]));
+        let mut prepare_count = 0;
+        user_req.expect_prepare().times(2).returning(move |_| {
+            prepare_count += 1;
+            if prepare_count == 1 {
+                PrepareResult::NonblockingAsyncTask {
+                    req: Box::new(TestAsyncTaskReq { request_id: req_id }),
+                }
+            } else {
+                let mut dev_req = MockDevReq::new();
+                dev_req.expect_id().return_const(req_id);
+                dev_req.expect_req_cost().once().return_const(1usize);
+                dev_req.expect_token_cost().once().return_const(token_budget);
+                PrepareResult::Continue {
+                    dev_req,
+                    compute_phase: ComputePhase::Decode {
+                        epoch: 0,
+                        token_index: 0,
+                    },
+                }
+            }
+        });
+
+        let (async_task_req_tx, async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
+        schedule_queue.push_back(user_req);
+
+        let mut batcher = FIFOBatcher::new();
+        let dev_reqs = batcher.prepare(1, token_budget, token_budget, AHashMap::new(), &mut schedule_queue);
+
+        assert_eq!(dev_reqs.iter().map(DevReq::id).collect::<Vec<_>>(), vec![req_id]);
+        assert_eq!(async_task_req_rx.try_recv().unwrap().request_id(), req_id);
+        assert!(schedule_queue.get_ref(&req_id).is_some());
+        assert_eq!(schedule_queue.run_queue_size(), 0);
     }
 
     #[test]
@@ -945,8 +1034,8 @@ mod tests {
                     wait: Box::pin(async {}),
                 }
             });
-        let (swap_out_task_tx, swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(user_req);
 
         let mut batcher = FIFOBatcher::new();
@@ -960,7 +1049,7 @@ mod tests {
         assert!(dev_reqs.is_empty());
 
         assert_eq!(schedule_queue.pop_ready_reqs().map(|req| req.id()), Some(req_id));
-        assert!(swap_out_task_rx.try_recv().is_err());
+        assert!(async_task_req_rx.try_recv().is_err());
     }
 
     #[test]
@@ -995,8 +1084,8 @@ mod tests {
             .once()
             .return_const(0usize);
 
-        let (swap_out_task_tx, _swap_out_task_rx) = async_bounded(1);
-        let mut schedule_queue = TestScheduleQueue::new(swap_out_task_tx);
+        let (async_task_req_tx, _async_task_req_rx) = async_bounded(1);
+        let mut schedule_queue = TestScheduleQueue::new(async_task_req_tx);
         schedule_queue.push_back(current_req);
         schedule_queue.push_back(preempted_req);
 
@@ -1019,6 +1108,22 @@ mod tests {
         prepare_token_budget: usize,
         req_cost: usize,
         token_cost: usize,
+    }
+
+    struct TestAsyncTaskReq {
+        request_id: RawRequestID,
+    }
+
+    impl AsyncTaskReq for TestAsyncTaskReq {
+        type Resp = dyn AsyncTaskResp;
+
+        fn request_id(&self) -> RawRequestID {
+            self.request_id
+        }
+
+        fn run(self: Box<Self>) -> futures_lite::future::Boxed<Box<Self::Resp>> {
+            Box::pin(async { unreachable!("FIFO batcher tests do not execute async tasks") })
+        }
     }
 
     fn new_test_scheduled_req(

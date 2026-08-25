@@ -12,9 +12,12 @@ use crate::runtime::decoder::allocator::TPKVBlockAllocator;
 use crate::runtime::decoder::trie_cache::MultiLaneTrieBlockCache;
 use crate::runtime::decoder::trie_cache::SingleLaneTrieBlockCache;
 use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
+use crate::runtime::resource::Resource;
 use crate::runtime::resource::ResourceID;
 use crate::runtime::resource::ResourcePlacement;
 use crate::runtime::resource::ResourceTypeID;
+use crate::runtime::resource::ResourceURI;
+use crate::runtime::resource::SymbolicResource;
 
 const NUM_TOKEN_PER_BLOCK: usize = 4;
 const NUM_TRIE_PARTITION: usize = 4;
@@ -85,6 +88,10 @@ fn resource_annotations<const L: usize>(
     });
     let blocks = TestBlocks::new(
         Arc::new(TestMultiLaneBlockCache::new(block_cache_vec)),
+        vec![Resource::Symbolic(SymbolicResource::new(
+            resource_id,
+            ResourceURI::new("test://resource".to_string()),
+        ))],
         vec![ResourcePlacement::new(resource_id, vec![(3, 10, 4)], 9)],
         std::iter::empty::<Token>(),
         std::iter::empty::<Token>(),

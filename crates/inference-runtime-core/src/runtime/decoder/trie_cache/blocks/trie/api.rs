@@ -28,6 +28,7 @@ use crate::runtime::decoder::trie_cache::blocks::push_front_queued_tokens;
 use crate::runtime::decoder::trie_cache::blocks::push_tokens;
 use crate::runtime::decoder::trie_cache::blocks::schedule_tokens;
 use crate::runtime::decoder::trie_cache::blocks::unschedule_tokens;
+use crate::runtime::resource::ResourceID;
 
 impl<const N: usize, const P: usize, const L: usize, BC> DecoderBlocks for TrieDecoderBlocks<N, P, L, BC>
 where
@@ -58,6 +59,17 @@ where
 
         let block_index = self.immutable_blocks.len() + self.semi_immutable_blocks.len() + self.mutable_blocks.len();
         let annotation_vec = self.block_annotation_vec(block_index);
+        let resource_ids = annotation_resource_ids(&annotation_vec);
+        let missing_resource_ids = resource_ids
+            .iter()
+            .copied()
+            .filter(|resource_id| {
+                self.resources
+                    .get(resource_id)
+                    .expect("cache block annotation must reference a resource owned by its decoder blocks")
+                    .is_symbolic()
+            })
+            .collect::<Vec<_>>();
 
         let num_tokens = min(num_cachable_tokens, N);
         let tokens = if num_tokens == 0 {
@@ -72,6 +84,13 @@ where
             && self.mutable_blocks.is_empty()
             && self.semi_immutable_blocks.is_empty();
         if !use_cache {
+            if !missing_resource_ids.is_empty() {
+                push_front_queued_tokens::<L>(&mut self.queued_tokens, tokens.into_iter());
+                return InitBlockOnceResult::ResourceNotFound {
+                    ready_token_slots: self.ready_token_slots(),
+                    resource_ids: missing_resource_ids,
+                };
+            }
             match self.block_cache.alloc_mutable_block::<N>() {
                 AllocateMultiLaneMutableBlockResult::Mutable { mut block_vec } => {
                     for (block, annotations) in block_vec.iter_mut().zip(annotation_vec) {
@@ -106,6 +125,14 @@ where
                 .unwrap();
             match self.block_cache.reserve_semi_immutable_block(block_metadata_vec) {
                 ReserveMultiLaneSemiImmutableBlockResult::Mutable { mut block_vec } => {
+                    if !missing_resource_ids.is_empty() {
+                        push_front_queued_tokens::<L>(&mut self.queued_tokens, tokens.into_iter());
+                        self.block_cache.free_mutable_block(block_vec);
+                        return InitBlockOnceResult::ResourceNotFound {
+                            ready_token_slots: self.ready_token_slots(),
+                            resource_ids: missing_resource_ids,
+                        };
+                    }
                     push_tokens::<N, L>(&mut block_vec, &tokens);
                     self.mutable_blocks.push_back(block_vec);
                     InitBlockOnceResult::Success {
@@ -113,6 +140,14 @@ where
                     }
                 },
                 ReserveMultiLaneSemiImmutableBlockResult::SemiImmutable { block_vec } => {
+                    if !missing_resource_ids.is_empty() {
+                        push_front_queued_tokens::<L>(&mut self.queued_tokens, tokens.into_iter());
+                        self.block_cache.free_semi_immutable_block(block_vec);
+                        return InitBlockOnceResult::ResourceNotFound {
+                            ready_token_slots: self.ready_token_slots(),
+                            resource_ids: missing_resource_ids,
+                        };
+                    }
                     self.semi_immutable_blocks.push_back(block_vec);
                     InitBlockOnceResult::Success {
                         ready_token_slots: self.ready_token_slots(),
@@ -184,7 +219,7 @@ where
     #[sanity_check(sanity_check_fn = "self.sanity_check()")]
     fn prepare(&mut self, token_budget: usize) -> Option<QueryTokens> {
         debug_assert!(0 < token_budget);
-        // caller is expected to init enough ready token slots via init_block_once()
+        // caller is expected to init enough ready token slots via init_block_once
         debug_assert!(token_budget <= self.ready_token_slots());
 
         let num_ready_tokens = self.num_ready_tokens();
@@ -550,6 +585,19 @@ where
     }
 }
 
+fn annotation_resource_ids<const L: usize>(annotation_vec: &[SmallVec<[BlockAnnotation; 1]>; L]) -> Vec<ResourceID> {
+    let mut resource_ids = Vec::new();
+    for annotation in annotation_vec.iter().flatten() {
+        let BlockAnnotation::Resource(segment) = annotation else {
+            continue;
+        };
+        if !resource_ids.contains(&segment.resource_id()) {
+            resource_ids.push(segment.resource_id());
+        }
+    }
+    resource_ids
+}
+
 impl<const N: usize, const P: usize, const L: usize, BC> TrieDecoderBlocks<N, P, L, BC>
 where
     BC: MultiLaneBlockCache<P, L>,
@@ -651,3 +699,7 @@ mod api_test_w_dspark;
 #[cfg(test)]
 #[path = "./api_test_resource.rs"]
 mod api_test_resource;
+
+#[cfg(test)]
+#[path = "./api_test_support.rs"]
+mod api_test_support;

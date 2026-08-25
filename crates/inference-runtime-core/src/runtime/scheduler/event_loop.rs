@@ -27,12 +27,13 @@ use crate::runtime::RequestSlotAllocator;
 use crate::runtime::scheduler::InstrumentedScheduler;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
+use crate::runtime::tasks::AsyncTaskResp;
 
 const SCHEDULER_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, BatchDeviceResp, S> {
     user_req_rx: Receiver<QueuedReq>,
-    swap_in_task_rx: Receiver<UserReq>,
+    async_task_resp_rx: Receiver<Box<dyn AsyncTaskResp>>,
     model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
     model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
 
@@ -50,6 +51,7 @@ pub struct EventLoop<QueuedReq, UserReq, DeviceReq, DeviceResp, BatchDeviceReq, 
 
     shutdown: Shutdown,
 
+    phantom_data_user_req: PhantomData<UserReq>,
     phantom_data_device_req: PhantomData<DeviceReq>,
     phantom_data_device_resp: PhantomData<DeviceResp>,
 }
@@ -73,7 +75,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_req_rx: Receiver<QueuedReq>,
-        swap_in_task_rx: Receiver<UserReq>,
+        async_task_resp_rx: Receiver<Box<dyn AsyncTaskResp>>,
         model_executor_req_tx: Sender<ReplayableModelExecutorRequest<BatchDeviceReq>>,
         model_executor_resp_rx: Receiver<ReplayableModelExecutorResponse<BatchDeviceResp>>,
         scheduler: InstrumentedScheduler<S>,
@@ -89,7 +91,7 @@ where
         );
         Self {
             user_req_rx,
-            swap_in_task_rx,
+            async_task_resp_rx,
             model_executor_req_tx,
             model_executor_resp_rx,
             scheduler,
@@ -106,6 +108,7 @@ where
 
             shutdown,
 
+            phantom_data_user_req: PhantomData,
             phantom_data_device_req: PhantomData,
             phantom_data_device_resp: PhantomData,
         }
@@ -123,7 +126,7 @@ where
             } else {
                 None
             };
-            let op_recv_swap_in_task = select.recv(&self.swap_in_task_rx);
+            let op_recv_async_task_resp = select.recv(&self.async_task_resp_rx);
             let op_recv_model_executor_resp = select.recv(&self.model_executor_resp_rx);
             let op_scheduler_stats_timer = select.recv(&self.scheduler_stats_timer);
             let op_executor_hibernation_timer = match &self.model_executor_state {
@@ -148,11 +151,11 @@ where
                     user_req.store_running();
                     self.scheduler.enqueue(user_req);
                 },
-                _ if op_index == op_recv_swap_in_task => {
-                    let user_req = op
-                        .recv(&self.swap_in_task_rx)
-                        .map_err(|error| log_err_internal!("swap-in request channel closed, stopping: {error}"))?;
-                    self.swap_in(user_req);
+                _ if op_index == op_recv_async_task_resp => {
+                    let resp = op
+                        .recv(&self.async_task_resp_rx)
+                        .map_err(|error| log_err_internal!("async task response channel closed, stopping: {error}"))?;
+                    self.scheduler.handle_async_task_resp(resp);
                 },
                 _ if op_index == op_recv_model_executor_resp => {
                     let model_executor_resp = op.recv(&self.model_executor_resp_rx).map_err(|error| {
@@ -161,9 +164,6 @@ where
                     match model_executor_resp {
                         ReplayableModelExecutorResponse::Batch(batch_dev_resp) => {
                             self.scheduler.commit(batch_dev_resp);
-                            while let Some(user_req) = self.scheduler.pop_ready_reqs() {
-                                self.swap_in(user_req);
-                            }
                             self.idle_heartbeat = Instant::now();
                         },
                         ReplayableModelExecutorResponse::Started | ReplayableModelExecutorResponse::Stopped => {},
@@ -200,20 +200,6 @@ where
         self.scheduler.print_lifetime();
         tracing::info!("stopped");
         Ok(())
-    }
-
-    fn swap_in(&mut self, user_req: UserReq) {
-        if user_req.is_terminal() {
-            tracing::debug!(
-                target: "inference-runtime-core::scheduler",
-                phase = "request.reservation_wait_terminal",
-                request_id = user_req.id(),
-                "terminal reservation-wait request dropped"
-            );
-            drop(user_req);
-        } else {
-            self.scheduler.swap_in(user_req);
-        }
     }
 
     fn do_flush(&mut self) -> Result<()> {

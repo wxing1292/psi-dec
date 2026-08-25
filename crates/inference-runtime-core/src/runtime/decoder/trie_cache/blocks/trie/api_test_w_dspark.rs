@@ -5,7 +5,9 @@ use std::task::Poll;
 use futures_util::pin_mut;
 use futures_util::task::noop_waker_ref;
 use ordered_float::NotNan;
+use smallvec::SmallVec;
 
+use super::api_test_support::concrete_resource;
 use crate::channel::Shutdown;
 use crate::compute::DecoderSyncBlocks;
 use crate::compute::QueryTokens;
@@ -30,6 +32,12 @@ use crate::runtime::decoder::trie_cache::ReserveMultiLaneSemiImmutableBlockResul
 use crate::runtime::decoder::trie_cache::SingleLaneTrieBlockCache;
 use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use crate::runtime::decoder::trie_cache::UninitBlockOnceResult;
+use crate::runtime::resource::Resource;
+use crate::runtime::resource::ResourceID;
+use crate::runtime::resource::ResourcePlacement;
+use crate::runtime::resource::ResourceTypeID;
+use crate::runtime::resource::ResourceURI;
+use crate::runtime::resource::SymbolicResource;
 
 const NUM_KV_PAGES_PER_BLOCK: usize = 1;
 const NUM_STATE_PAGES_PER_BLOCK: usize = 1;
@@ -130,6 +138,86 @@ fn test_init_block_once_full_and_half_block_cache_miss_no_semi_immutable_success
     assert_total_tokens(&blocks.semi_immutable_blocks[0], [token_vec([1, 2, 3, 4])]);
     assert_semi_immutable_annotations(&blocks.semi_immutable_blocks[0], empty_annotations());
     assert_state(&blocks, 0, &[], &[], &token_vec([1, 2, 3, 4]), &token_vec([5, 6]), &[]);
+}
+
+#[test]
+fn test_init_block_once_full_and_half_block_cache_miss_resource_not_found_w_dspark() {
+    let total_tokens = token_vec([0, 1, 2, 3, 4, 5]);
+    let block_cache = initialize_block_cache(1024);
+    let resource_id = ResourceID::new(ResourceTypeID::new(7));
+    let placement = ResourcePlacement::new(resource_id, vec![(1, 0, 2)], total_tokens.len());
+    let mut blocks = TestTrieBlocks::new(
+        block_cache,
+        vec![symbolic_resource(resource_id)],
+        vec![placement],
+        std::iter::empty::<Token>(),
+        std::iter::empty::<Token>(),
+        total_tokens.clone(),
+    );
+
+    let InitBlockOnceResult::ResourceNotFound {
+        ready_token_slots,
+        resource_ids,
+    } = blocks.init_block_once()
+    else {
+        unreachable!()
+    };
+
+    assert_eq!(0, ready_token_slots);
+    assert_eq!(vec![resource_id], resource_ids);
+    assert_block_counts(&blocks, 0, 0, 0);
+    assert_state(&blocks, 0, &[], &[], &[], &total_tokens, &[]);
+}
+
+#[test]
+fn test_init_block_once_full_and_half_block_cache_miss_resource_found_w_dspark() {
+    let total_tokens = token_vec([0, 1, 2, 3, 4, 5]);
+    let block_cache = initialize_block_cache(1024);
+    let resource_id = ResourceID::new(ResourceTypeID::new(7));
+    let placement = ResourcePlacement::new(resource_id, vec![(1, 0, 2)], total_tokens.len());
+    let (resource, _resource_allocator) = concrete_resource(resource_id);
+    let mut blocks = TestTrieBlocks::new(
+        block_cache,
+        vec![resource],
+        vec![placement],
+        std::iter::empty::<Token>(),
+        std::iter::empty::<Token>(),
+        total_tokens,
+    );
+    let expected_annotations = blocks.block_annotation_vec(0).map(SmallVec::into_vec);
+
+    let InitBlockOnceResult::Success { ready_token_slots } = blocks.init_block_once() else {
+        unreachable!()
+    };
+
+    assert_eq!(NUM_TOKEN_PER_BLOCK, ready_token_slots);
+    assert_block_counts(&blocks, 0, 1, 0);
+    assert_total_tokens(&blocks.semi_immutable_blocks[0], [token_vec([0, 1, 2, 3])]);
+    assert_semi_immutable_annotations(&blocks.semi_immutable_blocks[0], expected_annotations);
+    assert_state(&blocks, 0, &[], &[], &token_vec([0, 1, 2, 3]), &token_vec([4, 5]), &[]);
+}
+
+#[test]
+fn test_init_block_once_full_and_half_block_cache_hit_bypasses_resource_w_dspark() {
+    let total_tokens = token_vec([0, 1, 2, 3, 4, 5]);
+    let block_cache = initialize_block_cache(1024);
+    let resource_id = ResourceID::new(ResourceTypeID::new(7));
+    let placement = ResourcePlacement::new(resource_id, vec![(1, 0, 2)], total_tokens.len());
+    let mut blocks = TestTrieBlocks::new(
+        block_cache.clone(),
+        vec![symbolic_resource(resource_id)],
+        vec![placement],
+        std::iter::empty::<Token>(),
+        std::iter::empty::<Token>(),
+        total_tokens.clone(),
+    );
+    insert_immutable_block_with_annotations(&block_cache, total_tokens, blocks.block_annotation_vec(0));
+    let InitBlockOnceResult::Success { ready_token_slots } = blocks.init_block_once() else {
+        unreachable!()
+    };
+
+    assert_eq!(0, ready_token_slots);
+    assert_block_counts(&blocks, 1, 0, 0);
 }
 
 #[test]
@@ -1072,6 +1160,7 @@ fn initialize_blocks(block_cache: Arc<TestMultiLaneTrieKVBlockCache>, total_toke
     TestTrieBlocks::new(
         block_cache,
         Vec::new(),
+        Vec::new(),
         std::iter::empty::<Token>(),
         std::iter::empty::<Token>(),
         total_tokens,
@@ -1151,6 +1240,39 @@ fn insert_immutable_block(
 
     let CommitMultiLaneMutableBlockResult::Immutable { block_vec } =
         block_cache.commit_mutable_block(parent_trie_node_key_vec, block_vec)
+    else {
+        unreachable!()
+    };
+    block_vec
+}
+
+fn insert_immutable_block_with_annotations(
+    block_cache: &TestMultiLaneTrieKVBlockCache,
+    total_tokens: Vec<Token>,
+    annotations: [SmallVec<[BlockAnnotation; 1]>; NUM_CACHE_LANE],
+) -> [ImmutableBlock<NUM_TOKEN_PER_BLOCK>; NUM_CACHE_LANE] {
+    assert!(NUM_TOKEN_PER_BLOCK <= total_tokens.len());
+    let block_metadata_vec: [BlockMetadata<NUM_TOKEN_PER_BLOCK>; NUM_CACHE_LANE] = [BlockMetadata::new(
+        None,
+        annotations[0].clone(),
+        Arc::<[Token]>::from(total_tokens[..NUM_TOKEN_PER_BLOCK].to_vec()),
+    )];
+    let AllocateMultiLaneMutableBlockResult::Mutable { mut block_vec } =
+        block_cache.alloc_mutable_block::<NUM_TOKEN_PER_BLOCK>()
+    else {
+        unreachable!()
+    };
+    for (block, block_metadata) in block_vec.iter_mut().zip(block_metadata_vec.iter()) {
+        block.insert_annotations(block_metadata.annotations().iter().cloned());
+        assert_eq!(
+            Vec::<Token>::new(),
+            block.push_tokens(block_metadata.tokens().as_ref().to_vec())
+        );
+    }
+    let scheduled_tokens = block_vec[0].schedule_tokens(NUM_TOKEN_PER_BLOCK).to_vec();
+    block_vec[0].cache_tokens(&scheduled_tokens);
+    let CommitMultiLaneMutableBlockResult::Immutable { block_vec } =
+        block_cache.commit_mutable_block([None], block_vec)
     else {
         unreachable!()
     };
@@ -1252,6 +1374,13 @@ fn assert_total_tokens<KVBlockType: DecoderBlock, const NUM_BLOCK: usize>(
 
 fn token_vec(values: impl AsRef<[u32]>) -> Vec<Token> {
     values.as_ref().iter().copied().map(Token::new).collect()
+}
+
+fn symbolic_resource(resource_id: ResourceID) -> Resource {
+    Resource::Symbolic(SymbolicResource::new(
+        resource_id,
+        ResourceURI::new("test://resource".to_string()),
+    ))
 }
 
 fn assert_state(

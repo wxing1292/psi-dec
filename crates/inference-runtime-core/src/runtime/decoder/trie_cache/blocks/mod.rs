@@ -2,6 +2,7 @@ use futures_lite::future::Boxed;
 
 use crate::compute::QueryTokens;
 use crate::compute::SampledTokens;
+use crate::runtime::resource::ResourceID;
 
 mod trie;
 pub use trie::TrieDecoderBlocks;
@@ -16,8 +17,16 @@ pub use util::unschedule_tokens;
 
 pub enum InitBlockOnceResult {
     ResourceLimitExceeded,
-    Await { wait: Boxed<()> },
-    Success { ready_token_slots: usize },
+    ResourceNotFound {
+        ready_token_slots: usize,
+        resource_ids: Vec<ResourceID>,
+    },
+    Await {
+        wait: Boxed<()>,
+    },
+    Success {
+        ready_token_slots: usize,
+    },
 }
 
 pub enum UninitBlockOnceResult {

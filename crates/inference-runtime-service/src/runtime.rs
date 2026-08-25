@@ -16,6 +16,8 @@ use inference_runtime_core::Result;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::channel::ShutdownGuard;
+use inference_runtime_core::compute::DeviceRequest;
+use inference_runtime_core::compute::DeviceResponse;
 use inference_runtime_core::compute::ReplayableModelExecutorRequest;
 use inference_runtime_core::compute::ReplayableModelExecutorResponse;
 use inference_runtime_core::config::RuntimeConfig;
@@ -45,6 +47,8 @@ use inference_runtime_core::runtime::scheduler::InstrumentedScheduler;
 use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
+use inference_runtime_core::runtime::tasks::AsyncTaskResp;
+use inference_runtime_core::runtime::tasks::ResourceProcessor;
 use inference_runtime_core::runtime::validate_resources;
 
 use crate::api::Inference;
@@ -65,6 +69,7 @@ pub struct InferenceRuntime<const N: usize, const L: usize, const P: usize> {
 
     shutdown: Shutdown,
     block_cache: Arc<RuntimeBlockCache<P, L>>,
+    resource_processor: Arc<ResourceProcessor>,
 
     user_req_tx: Sender<RuntimeQueuedRequest<N, P, L>>,
     model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
@@ -80,6 +85,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         num_spec_tokens: usize,
         shutdown: Shutdown,
         async_task_handle: &tokio::runtime::Handle,
+        resource_processor: Arc<ResourceProcessor>,
     ) -> Self {
         assert!(scheduler_config.max_requests > 0, "runtime requires request capacity");
         assert!(scheduler_config.max_tokens > 0, "runtime requires token capacity");
@@ -161,12 +167,13 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             .expect("model executor channel capacity must fit usize");
         let (model_executor_req_tx, model_executor_req_rx) = sync_bounded(model_executor_channel_capacity);
         let (model_executor_resp_tx, model_executor_resp_rx) = sync_bounded(model_executor_channel_capacity);
-        let (swap_out_task_tx, swap_out_task_rx) = async_bounded(model_runtime_config.max_running_requests);
-        let (swap_in_task_tx, swap_in_task_rx) =
-            sync_bounded::<RuntimeRequest<N, P, L>>(model_runtime_config.max_running_requests);
+        let (async_task_req_tx, async_task_req_rx) = async_bounded(model_runtime_config.max_running_requests);
+        let (async_task_resp_tx, async_task_resp_rx) =
+            sync_bounded::<Box<dyn AsyncTaskResp>>(model_runtime_config.max_running_requests);
 
         {
-            let schedule_queue = ScheduleQueue::new(swap_out_task_tx);
+            let schedule_queue: ScheduleQueue<RuntimeRequest<N, P, L>, DeviceRequest, DeviceResponse> =
+                ScheduleQueue::new(async_task_req_tx);
             let batcher = FIFOBatcher::new();
             let scheduler = InstrumentedScheduler::new(
                 SimpleScheduler::new(
@@ -181,7 +188,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             );
             let event_loop = EventLoop::new(
                 user_req_rx,
-                swap_in_task_rx,
+                async_task_resp_rx,
                 model_executor_req_tx,
                 model_executor_resp_rx,
                 scheduler,
@@ -203,8 +210,8 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             drop(scheduler_thread);
 
             let async_task_pool = AsyncTaskPool::new(
-                swap_out_task_rx,
-                swap_in_task_tx,
+                async_task_req_rx,
+                async_task_resp_tx,
                 shutdown.clone(),
                 model_runtime_config.max_running_requests,
             );
@@ -222,6 +229,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
 
             shutdown,
             block_cache,
+            resource_processor,
 
             user_req_tx,
             model_executor_req_rx,
@@ -267,6 +275,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         let req_status = AtomicRequestStatus::new();
         let decoder_kv_blocks = TrieDecoderBlocks::new(
             self.block_cache.clone(),
+            resources,
             resource_placements,
             history_tokens,
             prompt_tokens,
@@ -277,7 +286,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             request_id,
             req_status.clone(),
             decoder_kv_blocks,
-            resources,
+            self.resource_processor.clone(),
             token_prob_tx,
             sampling_config,
             self.model_runtime_config.context_window,
@@ -369,6 +378,7 @@ where
         num_spec_tokens,
         shutdown.clone(),
         server_tokio_runtime.handle(),
+        Arc::new(ResourceProcessor::new()),
     ));
     let inference = Arc::new(Inference::new(runtime.clone(), default_stop_sequences));
     let server_shutdown = shutdown.clone();
@@ -440,6 +450,7 @@ mod tests {
     use inference_runtime_core::runtime::scheduler::ComputePhase;
     use inference_runtime_core::runtime::scheduler::PrepareResult;
     use inference_runtime_core::runtime::scheduler::UserRequest;
+    use inference_runtime_core::runtime::tasks::ResourceProcessor;
     use ordered_float::NotNan;
     use tokio_stream::StreamExt;
 
@@ -484,6 +495,7 @@ mod tests {
             0,
             shutdown.clone(),
             async_task_runtime.handle(),
+            Arc::new(ResourceProcessor::new()),
         );
         assert_eq!(runtime.model_runtime_config.num_tokens_per_cache_block(), 1024);
         shutdown.shutdown();
@@ -828,6 +840,7 @@ mod tests {
             0,
             shutdown.clone(),
             async_runtime.handle(),
+            Arc::new(ResourceProcessor::new()),
         );
         (runtime, shutdown, async_runtime)
     }

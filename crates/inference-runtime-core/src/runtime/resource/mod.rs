@@ -66,6 +66,13 @@ impl Resource {
             Self::Concrete(resource) => Some(resource),
         }
     }
+
+    pub const fn symbolic(&self) -> Option<&SymbolicResource> {
+        match self {
+            Self::Symbolic(resource) => Some(resource),
+            Self::Concrete(_) => None,
+        }
+    }
 }
 
 const UUID_VERSION_8: u8 = 8;

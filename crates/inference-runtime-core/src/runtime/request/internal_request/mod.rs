@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use async_channel::Sender;
 use async_channel::TrySendError;
@@ -13,8 +14,8 @@ use crate::runtime::request::AtomicRequestStatus;
 use crate::runtime::request::CompletionReason;
 use crate::runtime::request::RequestStatus;
 use crate::runtime::request::TokenProbs;
-use crate::runtime::resource::Resource;
 use crate::runtime::scheduler::ComputePhase;
+use crate::runtime::tasks::ResourceProcessor;
 
 mod req_resp;
 
@@ -29,8 +30,10 @@ where
     req_slot: RequestSlot,
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
-    resources: Vec<Resource>,
+    resource_processor: Arc<ResourceProcessor>,
     in_flight_computes: VecDeque<ComputePhase>,
+    num_in_flight_blocking_async_tasks: usize,
+    num_in_flight_nonblocking_async_tasks: usize,
     token_prob_tx: Sender<TokenProbs>,
 
     sampling_config: SamplingConfig,
@@ -47,7 +50,7 @@ where
         req_slot: RequestSlot,
         req_status: AtomicRequestStatus,
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
-        resources: Vec<Resource>,
+        resource_processor: Arc<ResourceProcessor>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
         context_window: usize,
@@ -57,8 +60,10 @@ where
             req_slot,
             req_status,
             decoder_blocks,
-            resources,
+            resource_processor,
             in_flight_computes: VecDeque::new(),
+            num_in_flight_blocking_async_tasks: 0,
+            num_in_flight_nonblocking_async_tasks: 0,
             token_prob_tx,
             sampling_config,
             context_window,

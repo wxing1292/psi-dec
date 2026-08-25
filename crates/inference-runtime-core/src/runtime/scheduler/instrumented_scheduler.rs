@@ -13,6 +13,7 @@ use crate::compute::DevResp;
 use crate::compute::SpecStats;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
+use crate::runtime::tasks::AsyncTaskResp;
 
 pub struct InstrumentedScheduler<Sch> {
     periodical: SchedulerStats,
@@ -66,7 +67,7 @@ impl<Sch> InstrumentedScheduler<Sch> {
 #[allow(clippy::upper_case_acronyms)]
 struct SchedulerAPIStats {
     num_enqueue: u64,
-    num_swap_in: u64,
+    num_async_task_resp: u64,
     hist_prepare: Histogram<u64>,
     hist_cancel: Histogram<u64>,
     hist_commit: Histogram<u64>,
@@ -76,7 +77,7 @@ impl SchedulerAPIStats {
     fn new() -> Self {
         Self {
             num_enqueue: 0,
-            num_swap_in: 0,
+            num_async_task_resp: 0,
             hist_prepare: Histogram::<u64>::new(4).unwrap(),
             hist_cancel: Histogram::<u64>::new(4).unwrap(),
             hist_commit: Histogram::<u64>::new(4).unwrap(),
@@ -85,7 +86,7 @@ impl SchedulerAPIStats {
 
     fn is_empty(&self) -> bool {
         self.num_enqueue == 0
-            && self.num_swap_in == 0
+            && self.num_async_task_resp == 0
             && self.hist_prepare.is_empty()
             && self.hist_cancel.is_empty()
             && self.hist_commit.is_empty()
@@ -93,7 +94,7 @@ impl SchedulerAPIStats {
 
     fn reset(&mut self) {
         self.num_enqueue = 0;
-        self.num_swap_in = 0;
+        self.num_async_task_resp = 0;
         self.hist_prepare.reset();
         self.hist_cancel.reset();
         self.hist_commit.reset();
@@ -107,7 +108,10 @@ impl SchedulerAPIStats {
         header.extend(COLUMNS.iter().map(|(name, _)| Cell::new(*name)));
         table.set_header(header);
 
-        for (name, count) in [("enqueue", self.num_enqueue), ("swap_in", self.num_swap_in)] {
+        for (name, count) in [
+            ("enqueue", self.num_enqueue),
+            ("handle_async_task_resp", self.num_async_task_resp),
+        ] {
             let mut row = vec![Cell::new(name), Cell::new(count)];
             row.extend(COLUMNS.iter().map(|_| Cell::new("-")));
             table.add_row(row);
@@ -206,14 +210,10 @@ where
         self.lifetime.api.num_enqueue += 1;
     }
 
-    fn swap_in(&mut self, user_req: UserReq) {
-        self.scheduler.swap_in(user_req);
-        self.periodical.api.num_swap_in += 1;
-        self.lifetime.api.num_swap_in += 1;
-    }
-
-    fn pop_ready_reqs(&mut self) -> Option<UserReq> {
-        self.scheduler.pop_ready_reqs()
+    fn handle_async_task_resp(&mut self, resp: Box<dyn AsyncTaskResp>) {
+        self.scheduler.handle_async_task_resp(resp);
+        self.periodical.api.num_async_task_resp += 1;
+        self.lifetime.api.num_async_task_resp += 1;
     }
 
     fn can_flush(&self) -> bool {
@@ -323,8 +323,6 @@ mod tests {
         let mut inner =
             MockScheduler::<TestUserReq, MockDevReq, MockDevResp, TestBatchDeviceReq, TestBatchDeviceResp>::new();
         inner.expect_enqueue().once().return_once(drop);
-        inner.expect_swap_in().once().return_once(drop);
-        inner.expect_pop_ready_reqs().once().return_once(|| None);
         inner.expect_can_flush().once().return_const(true);
         inner.expect_prepare().once().return_once(TestBatchDeviceReq::new);
         inner.expect_cancel().once().return_once(drop);
@@ -332,15 +330,13 @@ mod tests {
 
         let mut scheduler = InstrumentedScheduler::new(inner, 0);
         scheduler.enqueue(TestUserReq::new());
-        scheduler.swap_in(TestUserReq::new());
-        assert!(scheduler.pop_ready_reqs().is_none());
         assert!(scheduler.can_flush());
         let batch_dev_req = scheduler.prepare();
         scheduler.cancel(batch_dev_req);
         scheduler.commit(TestBatchDeviceResp::new());
 
         assert_eq!(scheduler.lifetime.api.num_enqueue, 1);
-        assert_eq!(scheduler.lifetime.api.num_swap_in, 1);
+        assert_eq!(scheduler.lifetime.api.num_async_task_resp, 0);
         assert_eq!(scheduler.lifetime.api.hist_prepare.len(), 1);
         assert_eq!(scheduler.lifetime.api.hist_cancel.len(), 1);
         assert_eq!(scheduler.lifetime.api.hist_commit.len(), 1);

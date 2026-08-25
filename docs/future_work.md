@@ -20,6 +20,11 @@ document that owns the component.
 
 ## Runtime Lifecycle
 
+- Replace the single-type async-task response downcast before runtime core adds a second async-task response type.
+  The current request path assumes that every `AsyncTaskResp` is a `ResourceMaterializationResp`.
+  Keep this temporary assumption while resource materialization is the only async task.
+  The replacement must provide typed response dispatch without a request `Any` downcast and without an
+  `AsyncTaskPool` dependency on `UserRequest`.
 - Redesign host-pinned segment ownership before enabling offload.
   An allocation must have unique ownership for mutation and free operations.
   The new design permits only read-only shared views.
@@ -27,7 +32,7 @@ document that owns the component.
   Then implement KV and state onload and offload as a separate lifecycle.
   This lifecycle must remain distinct from the existing reservation-wait task.
   Follow the ownership and lifecycle design in [`model_state_io.md`](model_state_io.md).
-- Implement per-request `SwapOutTask` and swap-in work only for real model-state movement.
+- Implement explicit per-request model-state offload and onload tasks only for real model-state movement.
   Keep `AwaitReservation` in the scheduler-owned wait collection.
   Reserve `Swapped` for a request whose model state is not device-resident.
 - Measure and optimize full and selected model-state snapshot I/O.

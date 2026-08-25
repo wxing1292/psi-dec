@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::panic::AssertUnwindSafe;
 
 use async_channel::Receiver;
@@ -9,30 +8,26 @@ use tracing::Instrument;
 
 use crate::Result;
 use crate::channel::Shutdown;
-
-pub trait AsyncTask: Send + 'static {
-    type Output: Send + 'static;
-
-    fn run(self) -> impl Future<Output = Self::Output> + Send;
-}
+use crate::runtime::tasks::AsyncTaskReq;
+use crate::runtime::tasks::AsyncTaskResp;
 
 pub struct AsyncTaskPool<T>
 where
-    T: AsyncTask,
+    T: AsyncTaskReq + ?Sized,
 {
-    task_in_rx: Receiver<T>,
-    task_out_tx: Sender<T::Output>,
+    task_in_rx: Receiver<Box<T>>,
+    task_out_tx: Sender<Box<T::Resp>>,
     shutdown: Shutdown,
     num_runners: usize,
 }
 
 impl<T> AsyncTaskPool<T>
 where
-    T: AsyncTask,
+    T: AsyncTaskReq + ?Sized,
 {
     pub fn new(
-        task_in_rx: Receiver<T>,
-        task_out_tx: Sender<T::Output>,
+        task_in_rx: Receiver<Box<T>>,
+        task_out_tx: Sender<Box<T::Resp>>,
         shutdown: Shutdown,
         num_runners: usize,
     ) -> Self {
@@ -79,11 +74,11 @@ where
 
 async fn async_task_runner_guard<T>(
     runner_id: usize,
-    task_in_rx: Receiver<T>,
-    task_out_tx: Sender<T::Output>,
+    task_in_rx: Receiver<Box<T>>,
+    task_out_tx: Sender<Box<T::Resp>>,
     shutdown: Shutdown,
 ) where
-    T: AsyncTask,
+    T: AsyncTaskReq + ?Sized,
 {
     let shutdown_on_panic = shutdown.clone();
     let result = AssertUnwindSafe(async_task_runner_loop(runner_id, task_in_rx, task_out_tx, shutdown))
@@ -98,11 +93,11 @@ async fn async_task_runner_guard<T>(
 
 async fn async_task_runner_loop<T>(
     runner_id: usize,
-    task_in_rx: Receiver<T>,
-    task_out_tx: Sender<T::Output>,
+    task_in_rx: Receiver<Box<T>>,
+    task_out_tx: Sender<Box<T::Resp>>,
     shutdown: Shutdown,
 ) where
-    T: AsyncTask,
+    T: AsyncTaskReq + ?Sized,
 {
     let span = tracing::info_span!("async-task-runner", runner_id);
     async move {
@@ -124,6 +119,7 @@ async fn async_task_runner_loop<T>(
                 },
             };
 
+            let request_id = task.request_id();
             let output = tokio::select! {
                 biased;
                 shutdown = shutdown_rx.recv() => {
@@ -132,6 +128,11 @@ async fn async_task_runner_loop<T>(
                 },
                 output = task.run() => output,
             };
+            assert_eq!(
+                output.request_id(),
+                request_id,
+                "async task response must preserve the request ID"
+            );
             match task_out_tx.try_send(output) {
                 Ok(()) => {},
                 Err(TrySendError::Full(_)) => {
@@ -153,8 +154,6 @@ async fn async_task_runner_loop<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -163,20 +162,40 @@ mod tests {
     use crossbeam_channel::bounded as sync_bounded;
 
     use super::*;
+    use crate::runtime::RawRequestID;
 
-    type TaskFuture = Pin<Box<dyn Future<Output = usize> + Send>>;
+    type TaskFuture = futures_lite::future::Boxed<Box<TestResp>>;
 
     mockall::mock! {
         Task {
+            fn request_id(&self) -> RawRequestID;
             fn run(self) -> TaskFuture;
         }
     }
 
-    impl AsyncTask for MockTask {
-        type Output = usize;
+    impl AsyncTaskReq for MockTask {
+        type Resp = TestResp;
 
-        fn run(self) -> impl Future<Output = Self::Output> + Send {
-            MockTask::run(self)
+        fn request_id(&self) -> RawRequestID {
+            MockTask::request_id(self)
+        }
+
+        fn run(self: Box<Self>) -> TaskFuture {
+            MockTask::run(*self)
+        }
+    }
+
+    struct TestResp {
+        request_id: RawRequestID,
+    }
+
+    impl AsyncTaskResp for TestResp {
+        fn request_id(&self) -> RawRequestID {
+            self.request_id
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
         }
     }
 
@@ -199,8 +218,11 @@ mod tests {
         let pool_task = tokio::spawn(pool.event_loop());
 
         let mut task = MockTask::new();
-        task.expect_run().once().return_once(|| Box::pin(async { 7 }));
-        task_in_tx.send(task).await.unwrap();
+        task.expect_request_id().once().return_const(7usize);
+        task.expect_run()
+            .once()
+            .return_once(|| Box::pin(async { Box::new(TestResp { request_id: 7 }) }));
+        task_in_tx.send(Box::new(task)).await.unwrap();
         drop(task_in_tx);
 
         tokio::time::timeout(std::time::Duration::from_secs(1), pool_task)
@@ -208,7 +230,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(task_out_rx.try_recv(), Ok(7));
+        assert_eq!(task_out_rx.try_recv().unwrap().request_id(), 7);
     }
 
     #[tokio::test]
@@ -226,20 +248,21 @@ mod tests {
             dropped: running_dropped.clone(),
         };
         let mut running_task = MockTask::new();
+        running_task.expect_request_id().once().return_const(7usize);
         running_task.expect_run().once().return_once(move || {
             Box::pin(async move {
                 let _marker = running_marker;
                 started_tx.send(()).await.unwrap();
-                std::future::pending::<usize>().await
+                std::future::pending::<Box<TestResp>>().await
             })
         });
-        task_in_tx.send(running_task).await.unwrap();
+        task_in_tx.send(Box::new(running_task)).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
             .await
             .unwrap()
             .unwrap();
         for dropped in &queued_dropped {
-            task_in_tx.send(new_task(dropped.clone())).await.unwrap();
+            task_in_tx.send(Box::new(new_task(dropped.clone()))).await.unwrap();
         }
 
         shutdown.shutdown();

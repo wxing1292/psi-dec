@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use ordered_float::NotNan;
 
 use crate::compute::DecoderSyncBlocks;
@@ -11,6 +12,9 @@ use crate::runtime::decoder::trie_cache::ImmutableBlock;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::decoder::trie_cache::MutableBlock;
 use crate::runtime::decoder::trie_cache::SemiImmutableBlock;
+use crate::runtime::resource::ConcreteResource;
+use crate::runtime::resource::Resource;
+use crate::runtime::resource::ResourceID;
 use crate::runtime::resource::ResourcePlacement;
 
 mod api;
@@ -21,6 +25,7 @@ where
     BC: MultiLaneBlockCache<P, L>,
 {
     block_cache: Arc<BC>,
+    resources: AHashMap<ResourceID, Resource>,
     resource_placements: Vec<ResourcePlacement>,
 
     immutable_blocks: Vec<[ImmutableBlock<P>; L]>,
@@ -33,7 +38,6 @@ where
     spec_tokens: Vec<Token>,
     spec_probs: Vec<NotNan<f32>>,
     spec_confidences: Vec<NotNan<f32>>,
-
     num_in_sync_blocks: usize,
 
     epoch: usize, // TODO there is no test
@@ -48,11 +52,17 @@ where
 
     pub fn new(
         block_cache: Arc<BC>,
+        resources: Vec<Resource>,
         resource_placements: Vec<ResourcePlacement>,
         history_tokens: impl IntoIterator<Item = Token>,
         prompt_tokens: impl IntoIterator<Item = Token>,
         sampled_tokens: impl IntoIterator<Item = Token>,
     ) -> Self {
+        let resources = resources
+            .into_iter()
+            .map(|resource| (resource.id(), resource))
+            .collect::<AHashMap<_, _>>();
+
         let mut queued_tokens: VecDeque<Token> = history_tokens.into_iter().collect();
         let num_history_tokens = queued_tokens.len();
 
@@ -64,6 +74,7 @@ where
         assert!(L - 1 <= queued_tokens.len());
         Self {
             block_cache,
+            resources,
             resource_placements,
 
             immutable_blocks: vec![],
@@ -76,7 +87,6 @@ where
             spec_tokens: vec![],
             spec_probs: vec![],
             spec_confidences: vec![],
-
             num_in_sync_blocks: 0,
 
             epoch: 0,
@@ -85,6 +95,24 @@ where
 
     pub fn resource_placements(&self) -> &[ResourcePlacement] {
         &self.resource_placements
+    }
+
+    pub fn resource_symbolic_to_concrete(&mut self, resource: ConcreteResource) {
+        let resource_id = resource.id();
+        let owned_resource = self
+            .resources
+            .get_mut(&resource_id)
+            .expect("resource materialization must reference a resource owned by its decoder blocks");
+        assert!(
+            owned_resource.is_symbolic(),
+            "resource materialization must replace a symbolic resource"
+        );
+        assert_eq!(
+            owned_resource.uri(),
+            resource.uri(),
+            "resource materialization must preserve the resource URI"
+        );
+        *owned_resource = Resource::Concrete(resource);
     }
 
     #[cfg(debug_assertions)]

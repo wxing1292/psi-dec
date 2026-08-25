@@ -6,6 +6,8 @@ use crate::compute::BatchDevResp;
 use crate::compute::DevReq;
 use crate::compute::DevResp;
 use crate::runtime::RawRequestID;
+use crate::runtime::tasks::AsyncTaskReq;
+use crate::runtime::tasks::AsyncTaskResp;
 
 mod compute_slot;
 pub use compute_slot::ComputeSlot;
@@ -44,8 +46,7 @@ where
     BatchDeviceResp: BatchDevResp<DeviceResp>,
 {
     fn enqueue(&mut self, user_req: UserReq);
-    fn swap_in(&mut self, user_req: UserReq);
-    fn pop_ready_reqs(&mut self) -> Option<UserReq>;
+    fn handle_async_task_resp(&mut self, resp: Box<dyn AsyncTaskResp>);
     fn can_flush(&self) -> bool;
 
     fn prepare(&mut self) -> BatchDeviceReq;
@@ -84,6 +85,12 @@ pub enum ComputePhase {
 
 pub enum PrepareResult<DeviceReq> {
     ResourceLimitExceeded,
+    BlockingAsyncTask {
+        req: Box<dyn AsyncTaskReq<Resp = dyn AsyncTaskResp>>,
+    },
+    NonblockingAsyncTask {
+        req: Box<dyn AsyncTaskReq<Resp = dyn AsyncTaskResp>>,
+    },
     Await {
         wait: Boxed<()>,
     },
@@ -108,7 +115,7 @@ pub enum CancelResult {
 }
 
 #[mockall::automock]
-pub trait UserRequest<DeviceReq, DeviceResp>: Send + 'static
+pub trait UserRequest<DeviceReq, DeviceResp>: Send + Sized + 'static
 where
     DeviceReq: DevReq,
     DeviceResp: DevResp,
@@ -119,11 +126,14 @@ where
     fn store_swapped(&self) -> bool;
     fn is_terminal(&self) -> bool;
     fn num_in_flight_computes(&self) -> usize;
+    fn num_in_flight_blocking_async_tasks(&self) -> usize;
+    fn num_in_flight_nonblocking_async_tasks(&self) -> usize;
 
     fn request_estimate(&self) -> usize;
     fn token_estimate(&self) -> ReqTokenInventory<'_>;
 
     fn prepare(&mut self, token_budget: usize) -> PrepareResult<DeviceReq>;
+    fn handle_async_task_resp(&mut self, resp: Box<dyn AsyncTaskResp>);
     fn cancel(&mut self, dev_req: DeviceReq) -> CancelResult;
     fn commit(&mut self, dev_resp: DeviceResp) -> CommitResult;
 }
