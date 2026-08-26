@@ -623,6 +623,12 @@ that physical partial layout for one shared Reduce.
 DSpark and DFlash2 keep model-specific metadata construction.
 They do not use the general GQA request selector.
 
+`BiDiBlockGQAMetadataBuffers::update_with_active_requests(...)` separates recorded capacity from active work.
+The uploaded metadata retains the fixed request, Q-range, cumulative-partial, and TaskTemplate capacity.
+The returned replay shape selects the active request prefix and its corresponding token, Q-range, and TaskTemplate
+counts. Each Q range retains its final bidirectional local-block partial. Unused history splits use canonical empty
+ranges. This layout lets one recorded Spec Decode topology reuse the same buffers for different accepted prefixes.
+
 TiledQ requires one half-open `visible_kv_token_ranges` entry for each flat Q token. The Map kernel computes the
 intersection of this row range and the Map TaskTemplate K/V range. It does not infer a missing lower bound or causal
 upper bound. If the intersection is empty, TiledQ writes the empty partial state `exp_sum = 0` and

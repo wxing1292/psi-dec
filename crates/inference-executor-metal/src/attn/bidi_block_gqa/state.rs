@@ -104,8 +104,20 @@ impl BiDiBlockGQAState {
         self.num_tokens_per_page
     }
 
+    pub fn max_sdpa_map_task_templates(&self) -> u32 {
+        self.capacity.max_sdpa_map_task_templates as u32
+    }
+
     pub fn prepare_bidi_block(&self, block: &BiDiBlockGQAMetadata) -> GQAReplayShape {
         self.metadata().update(block)
+    }
+
+    pub fn prepare_bidi_block_with_active_requests(
+        &self,
+        block: &BiDiBlockGQAMetadata,
+        num_active_requests: usize,
+    ) -> GQAReplayShape {
+        self.metadata().update_with_active_requests(block, num_active_requests)
     }
 
     pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {

@@ -17,7 +17,11 @@ const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.g
 fn test_replay_matches_reference_across_active_counts() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
-    let (config, shape) = tiled_workload(128, 8);
+    let (config, base_shape) = tiled_workload(128, 8);
+    let shape = Shape {
+        num_total_sdpa_map_task_templates: 2,
+        ..base_shape
+    };
     let execution = tiled_execution(config);
     let kernels = Compute::new(&device, config, execution, shape);
     let q_values = generated_bf16_values(config.q_bytes(shape) as usize / size_of::<u16>(), 0x4751_4154);
@@ -32,8 +36,8 @@ fn test_replay_matches_reference_across_active_counts() {
     let visible_kv_token_ranges =
         Buffer::new_zeroed_elements(&device, shape.num_total_tokens as usize * 2, Dtype::Uint32);
     let q_token_ranges = Buffer::new_zeroed_elements(&device, 2, Dtype::Uint32);
-    let sdpa_map_task_templates = Buffer::new_zeroed_elements(&device, 3, Dtype::Uint32);
-    let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &[0_u32, 1]);
+    let sdpa_map_task_templates = Buffer::new_zeroed_elements(&device, 6, Dtype::Uint32);
+    let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &[0_u32, 2]);
     let partial_output = Buffer::new_zeroed(&device, config.partial_output_bytes(execution, shape));
     let partial_exp_sums = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(execution, shape));
     let partial_max_logits = Buffer::new_zeroed(&device, config.partial_output_stats_bytes(execution, shape));
@@ -90,7 +94,10 @@ fn test_replay_matches_reference_across_active_counts() {
 
     for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
         q_token_ranges.write_typed(0, &[0_u32, num_active_tokens as u32]);
-        sdpa_map_task_templates.write_typed(0, &[0_u32, 0, num_active_tokens as u32]);
+        // The first fixed-quota task has an empty history range. Map must
+        // materialize its canonical empty partial, and Reduce must preserve
+        // the result of the second task.
+        sdpa_map_task_templates.write_typed(0, &[0_u32, 0, 0, 0, 0, num_active_tokens as u32]);
         let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
         assert!(cache_hit);
 
@@ -100,7 +107,7 @@ fn test_replay_matches_reference_across_active_counts() {
                 &ReplayArguments::new()
                     .with_u32(NUM_ACTIVE_TOKENS, num_active_tokens as u32)
                     .with_u32(NUM_ACTIVE_Q_TOKEN_TILES, 1)
-                    .with_u32(NUM_ACTIVE_KV_SPLITS, 1),
+                    .with_u32(NUM_ACTIVE_KV_SPLITS, 2),
             )
             .wait();
 
