@@ -4,6 +4,7 @@ pub mod main_residual_capture;
 pub mod page_arena;
 pub mod qwen;
 pub mod residual_add;
+pub mod resource_embed;
 pub mod rms_norm;
 pub mod state_snapshot;
 pub mod unembedding;
