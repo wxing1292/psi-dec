@@ -40,11 +40,11 @@ impl SpecStats {
         debug_assert!(num_accepted <= num_proposed);
         debug_assert!(num_proposed <= self.proposed_by_index.len());
 
-        for index in 0..num_proposed {
-            self.proposed_by_index[index] += 1;
+        for count in &mut self.proposed_by_index[..num_proposed] {
+            *count += 1;
         }
-        for index in 0..num_accepted {
-            self.accepted_by_index[index] += 1;
+        for count in &mut self.accepted_by_index[..num_accepted] {
+            *count += 1;
         }
     }
 

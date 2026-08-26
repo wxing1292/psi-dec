@@ -171,13 +171,14 @@ impl Qwen3Executor {
             .rejection_sampling
             .component()
             .rejector();
-        let results = rejector.read_results(
-            prepared.num_active_decode_reqs(),
-            prepared.num_active_draft_distributions,
-        );
+        let num_active_decode_reqs = prepared.num_active_decode_reqs();
+        let results = rejector.read_results(num_active_decode_reqs, prepared.num_active_draft_distributions);
         let mut flat_draft_index = 0usize;
-        let mut decisions = Vec::with_capacity(prepared.num_active_decode_reqs());
-        for decode_req_index in 0..prepared.num_active_decode_reqs() {
+        let mut decisions = Vec::with_capacity(num_active_decode_reqs);
+        for (decode_req_index, &req_index) in prepared.decode_req_indices[..num_active_decode_reqs]
+            .iter()
+            .enumerate()
+        {
             let num_accepted_tokens = results.num_accepted_tokens(decode_req_index);
             decisions.push(Qwen3DecodeDecision {
                 validated_tokens: results
@@ -197,7 +198,6 @@ impl Qwen3Executor {
                 sampled_prob: results.sampled_prob(decode_req_index),
                 ..Qwen3DecodeDecision::default()
             });
-            let req_index = prepared.decode_req_indices[decode_req_index];
             flat_draft_index += microbatch.num_spec_tokens(req_index) as usize;
         }
         assert_eq!(

@@ -13,6 +13,30 @@
 //! execution into a stream batch. Private `KernelConstants` values describe
 //! compile-time kernel constants.
 
+pub mod dense_mlp;
+pub mod sparse_mlp;
+
+pub mod dynamic_grouped_conv;
+
+pub mod embedding;
+pub mod resource_embed;
+
+pub mod gdn;
+pub mod gqa;
+pub mod moe;
+
+pub mod residual_add;
+pub mod residual_add_rms_norm;
+
+pub mod rms_norm;
+pub mod rms_norm_rope;
+
+pub mod sampling;
+
+mod replay;
+pub use replay::ReplayOp;
+pub use replay::ReplayRecorder;
+
 fn checked_product(name: &str, factors: &[usize]) -> usize {
     factors
         .iter()
@@ -35,32 +59,6 @@ fn assert_u32_index_domain(num_elements: usize, name: &str) {
         "{name} exceeds the shader u32 element-index domain: num_elements={num_elements}"
     );
 }
-
-pub mod dense_mlp;
-pub mod sparse_mlp;
-
-pub mod dynamic_grouped_conv;
-
-pub mod embedding;
-pub mod resource_embed;
-
-pub mod gdn;
-
-pub mod gqa;
-
-pub mod moe;
-
-pub mod residual_add;
-pub mod residual_add_rms_norm;
-
-mod replay;
-pub use replay::ReplayOp;
-pub use replay::ReplayRecorder;
-
-pub mod rms_norm;
-pub mod rms_norm_rope;
-
-pub mod sampling;
 
 #[cfg(test)]
 mod tests {

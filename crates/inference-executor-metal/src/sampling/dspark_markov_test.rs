@@ -249,19 +249,19 @@ impl MarkovFixture {
         assert_close_nested(&proposal.token_probs, &expected_token_probs, 1.0e-5);
         assert_close_nested(&proposal.confidences, &reference_confidences, 1.0e-5);
 
-        for (request_index, &req_slot) in req_slots.iter().enumerate() {
-            for step_index in 0..BLOCK_SIZE {
+        for (&req_slot, reference_samples) in req_slots.iter().zip(&reference.samples_by_request[..req_slots.len()]) {
+            for (step_index, reference_sample) in reference_samples[..BLOCK_SIZE].iter().enumerate() {
                 let distribution_index = self.distribution_store.draft_distribution_index(req_slot, step_index);
                 let slot_begin = distribution_index as usize * 4;
                 assert_eq!(
                     self.distribution_store
                         .draft_token_ids()
                         .read_typed::<i32>(slot_begin, 4),
-                    reference.samples_by_request[request_index][step_index].prob_token_ids
+                    reference_sample.prob_token_ids
                 );
                 assert_close(
                     &self.distribution_store.draft_probs().read_typed::<f32>(slot_begin, 4),
-                    &reference.samples_by_request[request_index][step_index].prob_values,
+                    &reference_sample.prob_values,
                     1.0e-5,
                 );
             }

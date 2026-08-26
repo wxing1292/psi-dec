@@ -239,17 +239,16 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn initialize_req(
         &self,
         request_id: RawRequestID,
         history_tokens: Vec<Token>,
         prompt_tokens: Vec<Token>,
         sampled_tokens: Vec<Token>,
-        resources: Vec<Resource>,
-        resource_placements: Vec<ResourcePlacement>,
+        resource_entries: Vec<(Resource, ResourcePlacement)>,
         sampling_config: SamplingConfig,
     ) -> Result<(RuntimeQueuedRequest<N, P, L>, ExternalRequest)> {
+        let (resources, resource_placements): (Vec<_>, Vec<_>) = resource_entries.into_iter().unzip();
         let num_initial_tokens = history_tokens.len() + prompt_tokens.len() + sampled_tokens.len();
         let min_initial_tokens = usize::max(1, L - 1);
         if num_initial_tokens < min_initial_tokens {
@@ -507,11 +506,10 @@ mod tests {
         assert!(matches!(
             single_lane.initialize_req(
                 1,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
                 SamplingConfig::default(),
             ),
             Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 1")
@@ -522,11 +520,10 @@ mod tests {
         assert!(matches!(
             mtp.initialize_req(
                 1,
-                Vec::new(),
+                vec![],
                 vec![Token::new(1), Token::new(2)],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                vec![],
+                vec![],
                 SamplingConfig::default(),
             ),
             Err(Error::InvalidArgument(message)) if message.contains("minimum initial token count is 3")
@@ -534,11 +531,10 @@ mod tests {
         assert!(
             mtp.initialize_req(
                 2,
-                Vec::new(),
+                vec![],
                 vec![Token::new(1), Token::new(2), Token::new(3)],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                vec![],
+                vec![],
                 SamplingConfig::default(),
             )
             .is_ok()
@@ -559,8 +555,7 @@ mod tests {
                 vec![Token::new(1)],
                 vec![Token::new(2), Token::new(3)],
                 vec![Token::new(4)],
-                Vec::new(),
-                Vec::new(),
+                vec![],
                 sampling,
             ),
             Err(Error::InvalidArgument(message))
@@ -579,11 +574,10 @@ mod tests {
         assert!(matches!(
             runtime.initialize_req(
                 1,
-                Vec::new(),
+                vec![],
                 vec![Token::new(1)],
                 vec![Token::new(2), Token::new(3)],
-                Vec::new(),
-                Vec::new(),
+                vec![],
                 sampling,
             ),
             Err(Error::InvalidArgument(message))
@@ -601,15 +595,7 @@ mod tests {
             ..SamplingConfig::default()
         };
         let (queued_request, external_request) = runtime
-            .initialize_req(
-                1,
-                Vec::new(),
-                vec![Token::new(1), Token::new(2)],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                sampling,
-            )
+            .initialize_req(1, vec![], vec![Token::new(1), Token::new(2)], vec![], vec![], sampling)
             .unwrap();
         let (request_slot_allocator, _request_slot_reset_rx) = RequestSlotAllocator::new(1);
         let request_slot = match request_slot_allocator.allocate() {
@@ -653,14 +639,14 @@ mod tests {
             single_decode_completion(1, vec![vec![Token::new(4)]]),
             CompletionReason::StopSequence
         );
-        assert_eq!(single_decode_completion(1, Vec::new()), CompletionReason::LengthLimit);
+        assert_eq!(single_decode_completion(1, vec![]), CompletionReason::LengthLimit);
     }
 
     #[test]
     fn test_decode_completes_at_context_window_through_runtime_event_loop() {
         let (runtime, shutdown, async_runtime) = test_runtime_with_context::<1>(4);
         let runtime = Arc::new(runtime);
-        let inference = Inference::new(runtime.clone(), Vec::new());
+        let inference = Inference::new(runtime.clone(), vec![]);
         let sampling = SamplingConfig {
             max_sampled_tokens: 8,
             ..SamplingConfig::default()
@@ -719,17 +705,16 @@ mod tests {
         else {
             panic!("idle runtime must stop the model executor")
         };
-        assert_eq!(stopped_plan, ExecutorHibernationPlan::selected(Vec::new(), Vec::new()));
+        assert_eq!(stopped_plan, ExecutorHibernationPlan::selected(vec![], vec![]));
         response_tx.send(ReplayableModelExecutorResponse::Stopped).unwrap();
 
         let (queued_request, _external_request) = runtime
             .initialize_req(
                 1,
-                Vec::new(),
+                vec![],
                 vec![Token::new(1)],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                vec![],
+                vec![],
                 SamplingConfig::default(),
             )
             .unwrap();
@@ -865,11 +850,10 @@ mod tests {
         let (queued_request, external_request) = runtime
             .initialize_req(
                 1,
-                Vec::new(),
+                vec![],
                 vec![Token::new(1), Token::new(2), Token::new(3)],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                vec![],
+                vec![],
                 sampling,
             )
             .unwrap();
