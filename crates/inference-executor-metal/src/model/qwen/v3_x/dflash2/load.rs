@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::BlockSpecCapacity;
+use inference_executor_core::attn::BiDiBlockCapacity;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::checkpoint::QuantizedTensorBindings;
 use inference_executor_core::def::ModelExecutorError;
@@ -12,7 +12,7 @@ use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2WeightBind
 use inference_executor_core::model::qwen::v3_x::dflash2::resolve_qwen3x_dflash2_weight_bindings;
 use inference_executor_core::sampling::TopKSamplingBounds;
 
-use crate::attn::block_spec::state::BlockSpecGQAState;
+use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::model::embedding::Embed;
 use crate::model::qwen::v3_x::dflash2::attention::qwen3x_dflash2_gqa_core;
@@ -33,7 +33,7 @@ pub struct Qwen3xDFlash2LoadConfig {
 
 pub struct Qwen3xDFlash2Loaded {
     pub page_table_layout: GQAPageTableLayout,
-    pub gqa_state: BlockSpecGQAState,
+    pub gqa_state: BiDiBlockGQAState,
     pub model: Rc<Qwen3xDFlash2Model>,
     pub embed: Rc<Embed>,
     pub output: Qwen3xDFlash2Output,
@@ -87,8 +87,8 @@ pub fn load_qwen3x_dflash2(
             .try_into()
             .expect("Qwen3x DFlash2 pages per block must fit u32"),
     };
-    let capacity = BlockSpecCapacity::new(load_config.max_requests, query_block_size);
-    let gqa_state = BlockSpecGQAState::new(
+    let capacity = BiDiBlockCapacity::new(load_config.max_requests, query_block_size);
+    let gqa_state = BiDiBlockGQAState::new(
         device,
         attention_core,
         attention_sdpa_config,

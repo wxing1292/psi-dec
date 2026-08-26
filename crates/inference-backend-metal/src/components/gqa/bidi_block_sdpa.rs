@@ -9,7 +9,7 @@ use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayU32;
 
-const SOURCE: &str = include_str!("../metal/gqa_block_sdpa.metal");
+const SOURCE: &str = include_str!("../metal/gqa_bidi_block_sdpa.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ThreadBlockConstants {
@@ -47,7 +47,7 @@ impl KernelConstants {
 /// The grid supplies one Q-head index, Q-token-range index, and range-local
 /// Q-token offset for each threadblock. `q_token_ranges` derives the flat Q-token
 /// index. The end of the matching cumulative partial-output range identifies
-/// the block partial. One active threadblock owns one Q-token/Q-head block-SDPA
+/// the block partial. One active threadblock owns one Q-token/Q-head bidirectional block SDPA
 /// task. The selected SplitKV reducer later combines the bidirectional block
 /// and persistent-history partial outputs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -74,14 +74,14 @@ impl Config {
         assert_eq!(
             self.head_dim % thread_block.simdgroup_width,
             0,
-            "GQA block SDPA head_dim must be divisible by the SIMD width"
+            "bidirectional block SDPA head_dim must be divisible by the SIMD width"
         );
         assert!(matches!(self.dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
     fn q_elements(self, shape: Shape) -> usize {
         checked_product(
-            "GQA block SDPA Q element count",
+            "bidirectional block SDPA Q element count",
             &[
                 shape.num_total_tokens as usize,
                 self.num_q_heads as usize,
@@ -92,7 +92,7 @@ impl Config {
 
     fn kv_elements(self, shape: Shape) -> usize {
         checked_product(
-            "GQA block SDPA K/V element count",
+            "bidirectional block SDPA K/V element count",
             &[
                 shape.num_total_tokens as usize,
                 self.num_kv_heads as usize,
@@ -103,7 +103,7 @@ impl Config {
 
     fn partial_output_stat_elements(self, shape: Shape) -> usize {
         checked_product(
-            "GQA block SDPA partial-output statistic element count",
+            "bidirectional block SDPA partial-output statistic element count",
             &[
                 shape.num_total_partial_output_slots as usize,
                 self.num_q_heads as usize,
@@ -115,12 +115,12 @@ impl Config {
     fn partial_output_values(self, shape: Shape) -> usize {
         self.partial_output_stat_elements(shape)
             .checked_mul(self.head_dim as usize)
-            .expect("GQA block SDPA partial-output element count must fit usize")
+            .expect("bidirectional block SDPA partial-output element count must fit usize")
     }
 
     fn dispatch_threads(self, shape: Shape, thread_block: ThreadBlockConstants) -> usize {
         checked_product(
-            "GQA block SDPA thread count",
+            "bidirectional block SDPA thread count",
             &[
                 shape.num_total_q_token_ranges as usize,
                 self.num_q_heads as usize,
@@ -133,7 +133,7 @@ impl Config {
     fn thread_block_memory_bytes(self) -> usize {
         (self.block_size as usize)
             .checked_mul(size_of::<f32>())
-            .expect("GQA block SDPA thread-block memory must fit usize")
+            .expect("bidirectional block SDPA thread-block memory must fit usize")
     }
 }
 
@@ -153,18 +153,21 @@ impl Shape {
         assert_eq!(
             self.num_total_tokens % config.block_size,
             0,
-            "GQA block SDPA tokens must contain complete request blocks"
+            "bidirectional block SDPA tokens must contain complete request blocks"
         );
-        assert_u32_count_domain(config.q_elements(self), "GQA block SDPA Q");
-        assert_u32_count_domain(config.kv_elements(self), "GQA block SDPA K/V");
+        assert_u32_count_domain(config.q_elements(self), "bidirectional block SDPA Q");
+        assert_u32_count_domain(config.kv_elements(self), "bidirectional block SDPA K/V");
         assert_u32_index_domain(
             config.partial_output_stat_elements(self),
-            "GQA block SDPA partial-output statistics",
+            "bidirectional block SDPA partial-output statistics",
         );
-        assert_u32_index_domain(config.partial_output_values(self), "GQA block SDPA partial output");
+        assert_u32_index_domain(
+            config.partial_output_values(self),
+            "bidirectional block SDPA partial output",
+        );
         assert_u32_count_domain(
             config.dispatch_threads(self, ThreadBlockConstants::current()),
-            "GQA block SDPA threads",
+            "bidirectional block SDPA threads",
         );
     }
 }
@@ -191,32 +194,32 @@ impl Compute {
         config.validate();
         let constants = KernelConstants::current(config);
         let function_name = match config.dtype {
-            Dtype::Float32 => "gqa_block_sdpa_f32",
-            Dtype::Bfloat16 => "gqa_block_sdpa_bf16",
-            dtype => panic!("unsupported GQA block SDPA dtype {dtype:?}"),
+            Dtype::Float32 => "gqa_bidi_block_sdpa_f32",
+            Dtype::Bfloat16 => "gqa_bidi_block_sdpa_bf16",
+            dtype => panic!("unsupported bidirectional block SDPA dtype {dtype:?}"),
         };
-        let kernel = CompiledKernel::new(device, &block_sdpa_source(constants), function_name);
+        let kernel = CompiledKernel::new(device, &bidi_block_sdpa_source(constants), function_name);
         assert_eq!(
             kernel.thread_execution_width(),
             constants.thread_block.simdgroup_width as usize,
-            "GQA block SDPA requires a 32-thread SIMDgroup"
+            "bidirectional block SDPA requires a 32-thread SIMDgroup"
         );
         assert!(
             constants.thread_block.required_threads as usize <= kernel.max_total_threads_per_threadblock(),
-            "GQA block SDPA requires {} threads per thread block but the pipeline supports {}",
+            "bidirectional block SDPA requires {} threads per thread block but the pipeline supports {}",
             constants.thread_block.required_threads,
             kernel.max_total_threads_per_threadblock()
         );
         let max_thread_block_memory_length = device.max_threadblock_memory_length();
         assert!(
             config.thread_block_memory_bytes() <= max_thread_block_memory_length,
-            "GQA block SDPA requires {} bytes of thread-block memory but the device supports {}",
+            "bidirectional block SDPA requires {} bytes of thread-block memory but the device supports {}",
             config.thread_block_memory_bytes(),
             max_thread_block_memory_length
         );
         assert!(
             kernel.static_threadblock_memory_length() <= max_thread_block_memory_length,
-            "GQA block SDPA pipeline uses {} bytes of static thread-block memory but the device supports {}",
+            "bidirectional block SDPA pipeline uses {} bytes of static thread-block memory but the device supports {}",
             kernel.static_threadblock_memory_length(),
             max_thread_block_memory_length
         );
@@ -239,7 +242,7 @@ impl Compute {
     }
 }
 
-fn block_sdpa_source(kernel_constants: KernelConstants) -> String {
+fn bidi_block_sdpa_source(kernel_constants: KernelConstants) -> String {
     let config = kernel_constants.config;
     let source_constants = format!(
         "using namespace metal;\n\nconstant uint block_size = {}u;\nconstant uint num_q_heads = {}u;\nconstant uint \
@@ -309,21 +312,21 @@ impl Invocation<'_> {
             self.buffers.q_token_ranges.len_bytes()
                 >= (self.shape.num_total_q_token_ranges as usize)
                     .checked_mul(2 * size_of::<u32>())
-                    .expect("GQA block SDPA Q-token-range bytes must fit usize")
+                    .expect("bidirectional block SDPA Q-token-range bytes must fit usize")
         );
         assert!(
             self.buffers.cu_sdpa_partial_outputs.len_bytes()
                 >= (self.shape.num_total_q_token_ranges as usize)
                     .checked_add(1)
                     .and_then(|count| count.checked_mul(size_of::<u32>()))
-                    .expect("GQA block SDPA cumulative partial-output bytes must fit usize")
+                    .expect("bidirectional block SDPA cumulative partial-output bytes must fit usize")
         );
         let partial_output_stat_bytes = self
             .constants
             .config
             .partial_output_stat_elements(self.shape)
             .checked_mul(size_of::<f32>())
-            .expect("GQA block SDPA partial-output statistic bytes must fit usize");
+            .expect("bidirectional block SDPA partial-output statistic bytes must fit usize");
         assert!(self.buffers.partial_exp_sums.len_bytes() >= partial_output_stat_bytes);
         assert!(self.buffers.partial_max_logits.len_bytes() >= partial_output_stat_bytes);
         assert!(
@@ -335,9 +338,9 @@ impl Invocation<'_> {
 fn bytes(num_elements: usize, dtype: Dtype) -> usize {
     num_elements
         .checked_mul(dtype.item_size())
-        .expect("GQA block SDPA buffer byte length must fit usize")
+        .expect("bidirectional block SDPA buffer byte length must fit usize")
 }
 
 #[cfg(test)]
-#[path = "block_sdpa_test.rs"]
+#[path = "bidi_block_sdpa_test.rs"]
 mod tests;

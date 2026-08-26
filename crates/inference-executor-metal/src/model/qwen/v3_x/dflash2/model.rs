@@ -14,8 +14,8 @@ use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2LayerWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2MainFeatureWeightBindings;
 
-use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
-use crate::attn::block_spec::state::BlockSpecGQAState;
+use crate::attn::bidi_block_gqa::metadata::BiDiBlockGQAMetadataBuffers;
+use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
@@ -62,7 +62,7 @@ pub struct Qwen3xDFlash2PrefillArgs<'a> {
 #[derive(Clone, Copy)]
 pub struct Qwen3xDFlash2BodyArgs<'a> {
     pub num_tokens: u32,
-    pub metadata: &'a BlockSpecGQAMetadataBuffers,
+    pub metadata: &'a BiDiBlockGQAMetadataBuffers,
     pub hidden_input: &'a Buffer,
     pub hidden_output: &'a Buffer,
     pub pages: &'a Buffer,
@@ -90,7 +90,7 @@ impl Qwen3xDFlash2Model {
         page_bytes: usize,
         main_feature_bindings: &Qwen3xDFlash2MainFeatureWeightBindings,
         layer_bindings: &[Qwen3xDFlash2LayerWeightBindings],
-        gqa_state: &BlockSpecGQAState,
+        gqa_state: &BiDiBlockGQAState,
         max_main_tokens: usize,
         max_requests: usize,
         max_block_tokens: usize,
@@ -207,7 +207,7 @@ impl Qwen3xDFlash2Model {
         }
     }
 
-    pub fn load_state(&mut self, state: &BlockSpecGQAState) {
+    pub fn load_state(&mut self, state: &BiDiBlockGQAState) {
         for layer in &mut self.layers {
             layer.load_state(state);
         }
@@ -262,7 +262,7 @@ impl Qwen3xDFlash2Model {
         let mut hidden = args.hidden_input;
         for layer in &self.layers {
             let residual_output = layer.residual_output();
-            hidden = layer.record_block(
+            hidden = layer.record_bidi_block(
                 recorder,
                 num_total_tokens,
                 num_active_tokens,

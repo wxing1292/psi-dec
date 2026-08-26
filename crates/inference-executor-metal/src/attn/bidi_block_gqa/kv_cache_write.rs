@@ -7,16 +7,16 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
-use inference_executor_core::attn::BlockSpecGQACore;
+use inference_executor_core::attn::BiDiBlockGQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::backend::recorder::Recorder;
 
-use crate::attn::block_spec::backend::BlockSpecGQAMetalConfig;
-use crate::attn::block_spec::backend::BlockSpecGQAWeights;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQAMetalConfig;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQAWeights;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::def::replay_op::ReplayOp;
 
-pub struct BlockSpecGQAContextScratch {
+pub struct BiDiBlockGQAKVCacheWriteScratch {
     max_tokens: usize,
     k: Buffer,
     v: Buffer,
@@ -24,7 +24,7 @@ pub struct BlockSpecGQAContextScratch {
 }
 
 #[derive(Clone, Copy)]
-pub struct BlockSpecGQAContextScratchBindings<'a> {
+pub struct BiDiBlockGQAKVCacheWriteScratchBindings<'a> {
     pub max_tokens: usize,
     pub k: &'a Buffer,
     pub v: &'a Buffer,
@@ -32,7 +32,7 @@ pub struct BlockSpecGQAContextScratchBindings<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct BlockSpecGQAContextInput<'a> {
+pub struct BiDiBlockGQAKVCacheWriteInput<'a> {
     pub num_total_tokens: u32,
     pub num_active_tokens: ReplayU32,
     pub page_table_layout: GQAPageTableLayout,
@@ -41,29 +41,29 @@ pub struct BlockSpecGQAContextInput<'a> {
     pub req_slots: &'a Buffer,
     pub flat_token_indices: &'a Buffer,
     pub kv_cache: GQAKVCacheBindings<'a>,
-    pub weights: BlockSpecGQAWeights<'a>,
-    pub scratch: BlockSpecGQAContextScratchBindings<'a>,
+    pub weights: BiDiBlockGQAWeights<'a>,
+    pub scratch: BiDiBlockGQAKVCacheWriteScratchBindings<'a>,
 }
 
-pub struct BlockSpecGQAContextAppender {
+pub struct BiDiBlockGQAKVCacheWriter {
     k: affine_quantized::Matmul,
     v: affine_quantized::Matmul,
     k_norm_rope: rms_norm_rope::Compute,
     kv_page_write: backend_kv_page_write::Compute,
 }
 
-impl BlockSpecGQAContextScratch {
-    pub fn new(device: &Device, core: &BlockSpecGQACore, io_dtype: Dtype, max_tokens: usize) -> Self {
+impl BiDiBlockGQAKVCacheWriteScratch {
+    pub fn new(device: &Device, core: &BiDiBlockGQACore, io_dtype: Dtype, max_tokens: usize) -> Self {
         core.validate();
         match io_dtype {
             Dtype::Bfloat16 => {},
-            Dtype::Float32 => todo!("F32 block-spec GQA model boundary is not supported"),
-            dtype => panic!("unsupported block-spec GQA model boundary dtype {dtype:?}"),
+            Dtype::Float32 => todo!("F32 BiDiBlockGQA model boundary is not supported"),
+            dtype => panic!("unsupported BiDiBlockGQA model boundary dtype {dtype:?}"),
         }
-        assert!(max_tokens > 0, "block-spec context scratch requires tokens");
+        assert!(max_tokens > 0, "BiDiBlockGQA KV-cache-write scratch requires tokens");
         let kv_elements = max_tokens
             .checked_mul(core.attention.k_dim())
-            .expect("block-spec context scratch K/V element count must fit usize");
+            .expect("BiDiBlockGQA KV-cache-write scratch K/V element count must fit usize");
         Self {
             max_tokens,
             k: Buffer::new_zeroed_elements(device, kv_elements, io_dtype),
@@ -72,8 +72,8 @@ impl BlockSpecGQAContextScratch {
         }
     }
 
-    pub fn bindings(&self) -> BlockSpecGQAContextScratchBindings<'_> {
-        BlockSpecGQAContextScratchBindings {
+    pub fn bindings(&self) -> BiDiBlockGQAKVCacheWriteScratchBindings<'_> {
+        BiDiBlockGQAKVCacheWriteScratchBindings {
             max_tokens: self.max_tokens,
             k: &self.k,
             v: &self.v,
@@ -82,8 +82,8 @@ impl BlockSpecGQAContextScratch {
     }
 }
 
-impl BlockSpecGQAContextAppender {
-    pub fn new(device: &Device, core: BlockSpecGQACore, metal: BlockSpecGQAMetalConfig) -> Self {
+impl BiDiBlockGQAKVCacheWriter {
+    pub fn new(device: &Device, core: BiDiBlockGQACore, metal: BiDiBlockGQAMetalConfig) -> Self {
         core.validate();
         metal.validate();
         let attention = &core.attention;
@@ -104,11 +104,11 @@ impl BlockSpecGQAContextAppender {
                     num_kv_heads: attention
                         .num_kv_heads
                         .try_into()
-                        .expect("block-spec context KV-head count must fit u32"),
+                        .expect("BiDiBlockGQA KV-cache-write KV-head count must fit u32"),
                     head_dim: attention
                         .head_dim
                         .try_into()
-                        .expect("block-spec context head_dim must fit u32"),
+                        .expect("BiDiBlockGQA KV-cache-write head_dim must fit u32"),
                     page_bytes: metal.page_bytes,
                     dtype: metal.io_dtype,
                 },
@@ -116,19 +116,22 @@ impl BlockSpecGQAContextAppender {
         }
     }
 
-    pub fn record<'a, R>(&'a self, recorder: &mut R, input: BlockSpecGQAContextInput<'a>)
+    pub fn record<'a, R>(&'a self, recorder: &mut R, input: BiDiBlockGQAKVCacheWriteInput<'a>)
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        assert!(input.num_total_tokens > 0, "block-spec context append requires tokens");
+        assert!(
+            input.num_total_tokens > 0,
+            "BiDiBlockGQA KV-cache write requires tokens"
+        );
         assert!(
             input.num_total_tokens as usize <= input.scratch.max_tokens,
-            "block-spec context append exceeds scratch"
+            "BiDiBlockGQA KV-cache write exceeds scratch"
         );
         input.page_table_layout.validate();
         assert!(
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
-            "block-spec context layer index exceeds the page table"
+            "BiDiBlockGQA KV-cache-write layer index exceeds the page table"
         );
         let num_total_tokens = input.num_total_tokens;
         recorder.record_with_barrier_before(ReplayOp::opaque(self.k.invoke(
@@ -195,16 +198,16 @@ impl BlockSpecGQAContextAppender {
 
 fn k_norm_rope_config(
     core: &inference_executor_core::attn::UngatedGQACore,
-    metal: BlockSpecGQAMetalConfig,
+    metal: BiDiBlockGQAMetalConfig,
 ) -> rms_norm_rope::Config {
     let num_heads = core
         .num_kv_heads
         .try_into()
-        .expect("block-spec context KV-head count must fit u32");
+        .expect("BiDiBlockGQA KV-cache-write KV-head count must fit u32");
     let head_dim = core
         .head_dim
         .try_into()
-        .expect("block-spec context head_dim must fit u32");
+        .expect("BiDiBlockGQA KV-cache-write head_dim must fit u32");
     let norm_rope = match metal.io_dtype {
         Dtype::Float32 => {
             rms_norm_rope::Config::f32(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
@@ -212,7 +215,7 @@ fn k_norm_rope_config(
         Dtype::Bfloat16 => {
             rms_norm_rope::Config::bf16(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
         },
-        dtype => panic!("unsupported block-spec context dtype {dtype:?}"),
+        dtype => panic!("unsupported BiDiBlockGQA KV-cache-write dtype {dtype:?}"),
     };
     norm_rope
         .with_rope_scaling(metal.rope_scaling)

@@ -146,7 +146,7 @@ Main writes selected residuals directly into assigned capture columns.
 
 The query block has one anchor row and `block_size - 1` MASK rows.
 Only MASK rows produce proposals.
-Each layer reduces SplitKV history partials with bidirectional block-SDPA partials.
+Each layer reduces SplitKV history partials with bidirectional local-block SDPA partials.
 
 DFlash2 stores all committed history and reads this half-open range for each query:
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use half::bf16;
-use inference_backend_metal::components::gqa::block_sdpa as backend_block_sdpa;
+use inference_backend_metal::components::gqa::bidi_block_sdpa as backend_bidi_block_sdpa;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -146,7 +146,7 @@ impl Fixture {
             )
             .checked_next_power_of_two()
             .expect("GQA block-attention bench partial-output capacity must fit u32");
-        let config = backend_block_sdpa::Config {
+        let config = backend_bidi_block_sdpa::Config {
             block_size,
             max_q_tokens,
             num_q_heads,
@@ -155,7 +155,7 @@ impl Fixture {
             scale: (head_dim as f32).sqrt().recip(),
             dtype,
         };
-        let shape = backend_block_sdpa::Shape {
+        let shape = backend_bidi_block_sdpa::Shape {
             num_total_tokens: num_tokens,
             num_total_q_token_ranges: num_q_token_ranges,
             num_total_partial_output_slots,
@@ -192,13 +192,13 @@ impl Fixture {
         let partial_exp_sums = Buffer::new_zeroed_elements(device, partial_stat_elements, Dtype::Float32);
         let partial_max_logits = Buffer::new_zeroed_elements(device, partial_stat_elements, Dtype::Float32);
         let partial_output = Buffer::new_zeroed_elements(device, partial_output_elements, dtype);
-        let kernel = backend_block_sdpa::Compute::new(device, config);
+        let kernel = backend_bidi_block_sdpa::Compute::new(device, config);
         let stream = Stream::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(kernel.invoke(
             shape,
             ReplayU32::Fixed(num_q_token_ranges),
-            backend_block_sdpa::Buffers {
+            backend_bidi_block_sdpa::Buffers {
                 q: &q,
                 local_k: &local_k,
                 local_v: &local_v,
@@ -269,9 +269,9 @@ fn print_result(
         .collect::<Vec<_>>();
     per_iteration_us.sort_by(f64::total_cmp);
     println!(
-        "perf component=gqa-block-sdpa backend=metal operation=block-bidi-map dtype={} num_requests={} block_size={} \
-         num_tokens={} num_q_heads={} num_kv_heads={} head_dim={} max_q_tokens={} setup_us={:.3} cache_miss_us={:.3} \
-         iters={} runs={} median_us={:.3} samples_us={:?}",
+        "perf component=gqa-bidi-block-sdpa backend=metal operation=bidi-block-map dtype={} num_requests={} \
+         block_size={} num_tokens={} num_q_heads={} num_kv_heads={} head_dim={} max_q_tokens={} setup_us={:.3} \
+         cache_miss_us={:.3} iters={} runs={} median_us={:.3} samples_us={:?}",
         dtype_name(fixture.dtype),
         fixture.num_requests,
         fixture.block_size,
@@ -362,7 +362,11 @@ fn next_arg(values: &mut impl Iterator<Item = String>, flag: &str) -> String {
 }
 
 fn print_help_and_exit() -> ! {
-    let executable = PathBuf::from(std::env::args().next().unwrap_or_else(|| "gqa_block_attn".to_string()));
+    let executable = PathBuf::from(
+        std::env::args()
+            .next()
+            .unwrap_or_else(|| "gqa_bidi_block_sdpa".to_string()),
+    );
     println!(
         "{}\n--block-sizes 7\n--num-requests 1,4\n--num-q-heads 40\n--num-kv-heads 8\n--head-dim 128\n--max-q-tokens \
          8\n--dtypes bf16,f32\n--warmup-iters N\n--iters N\n--runs N",

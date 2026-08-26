@@ -6,7 +6,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
-use inference_executor_core::attn::BlockSpecMetadata;
+use inference_executor_core::attn::BiDiBlockGQAMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
@@ -16,7 +16,7 @@ use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SpecPrefillSelection;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::block_spec::state::BlockSpecGQAState;
+use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
@@ -50,7 +50,7 @@ mod file_io;
 
 pub struct Qwen3xDSparkExecution {
     prefill: Replay<Qwen3xDSparkPrefill>,
-    gqa_state: BlockSpecGQAState,
+    gqa_state: BiDiBlockGQAState,
     embed: Replay<Qwen3xDSparkEmbed>,
     body: Replay<Qwen3xDSparkBody>,
     gather_unembed: Replay<Qwen3xDSparkGatherUnembed>,
@@ -450,13 +450,13 @@ impl Qwen3xDSparkExecution {
                 visible_history_token_ranges.push(0..anchor_position);
             }
         }
-        let block = BlockSpecMetadata::new(
+        let block = BiDiBlockGQAMetadata::new(
             &proposal.req_slots,
             &flat_query_token_indices,
             &visible_history_token_ranges,
             self.num_spec_tokens,
         );
-        self.gqa_state.prepare_block(&block);
+        self.gqa_state.prepare_bidi_block(&block);
         let mut block_token_ids = Vec::with_capacity(block.num_tokens());
         for &anchor_token_id in proposal.anchor_token_ids {
             block_token_ids.push(

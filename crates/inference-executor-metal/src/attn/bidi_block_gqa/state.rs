@@ -1,67 +1,70 @@
-//! Persistent and replay state for block-spec GQA.
+//! Persistent and replay state for BiDiBlockGQA.
 
 use std::rc::Rc;
 
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::ReplayArguments;
-use inference_executor_core::attn::BlockSpecCapacity;
-use inference_executor_core::attn::BlockSpecGQACore;
-use inference_executor_core::attn::BlockSpecMetadata;
+use inference_executor_core::attn::BiDiBlockCapacity;
+use inference_executor_core::attn::BiDiBlockGQACore;
+use inference_executor_core::attn::BiDiBlockGQAMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::block_spec::backend::BlockSpecGQA;
-use crate::attn::block_spec::backend::BlockSpecGQAMetalConfig;
-use crate::attn::block_spec::backend::add_block_spec_gqa_replay_arguments;
-use crate::attn::block_spec::capacity::BlockSpecGQACapacity;
-use crate::attn::block_spec::context::BlockSpecGQAContextScratch;
-use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
-use crate::attn::block_spec::scratch::BlockSpecScratch;
-use crate::attn::block_spec::sdpa::Selection as SDPASelection;
-use crate::attn::block_spec::sdpa::Selector as SDPASelector;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQA;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQAMetalConfig;
+use crate::attn::bidi_block_gqa::backend::add_bidi_block_gqa_replay_arguments;
+use crate::attn::bidi_block_gqa::capacity::BiDiBlockGQACapacity;
+use crate::attn::bidi_block_gqa::kv_cache_write::BiDiBlockGQAKVCacheWriteScratch;
+use crate::attn::bidi_block_gqa::metadata::BiDiBlockGQAMetadataBuffers;
+use crate::attn::bidi_block_gqa::scratch::BiDiBlockGQAScratch;
+use crate::attn::bidi_block_gqa::sdpa::Selection as SDPASelection;
+use crate::attn::bidi_block_gqa::sdpa::Selector as SDPASelector;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 
 mod file_io;
 
-pub struct BlockSpecGQAState {
+pub struct BiDiBlockGQAState {
     sdpa_selection: SDPASelection,
-    block_scratch: Option<Rc<BlockSpecScratch>>,
-    context_scratch: Option<Rc<BlockSpecGQAContextScratch>>,
+    bidi_block_scratch: Option<Rc<BiDiBlockGQAScratch>>,
+    kv_cache_write_scratch: Option<Rc<BiDiBlockGQAKVCacheWriteScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
-    metadata: Option<BlockSpecGQAMetadataBuffers>,
-    core: BlockSpecGQACore,
+    metadata: Option<BiDiBlockGQAMetadataBuffers>,
+    core: BiDiBlockGQACore,
     sdpa_config: backend_sdpa::Config,
-    capacity: BlockSpecGQACapacity,
+    capacity: BiDiBlockGQACapacity,
     max_context_tokens: usize,
     page_table_layout: GQAPageTableLayout,
     num_tokens_per_page: usize,
     num_cache_pages: usize,
 }
 
-impl BlockSpecGQAState {
+impl BiDiBlockGQAState {
     pub fn new(
         device: &Device,
-        core: BlockSpecGQACore,
+        core: BiDiBlockGQACore,
         sdpa_config: backend_sdpa::Config,
         page_table_layout: GQAPageTableLayout,
-        capacity: BlockSpecCapacity,
+        capacity: BiDiBlockCapacity,
         max_context_tokens: usize,
         num_cache_pages: usize,
     ) -> Self {
-        assert!(max_context_tokens > 0, "block-spec context scratch requires tokens");
-        assert!(num_cache_pages > 0, "block-spec GQA state requires cache pages");
+        assert!(
+            max_context_tokens > 0,
+            "BiDiBlockGQA KV-cache-write scratch requires tokens"
+        );
+        assert!(num_cache_pages > 0, "BiDiBlockGQA state requires cache pages");
         assert!(
             u32::try_from(num_cache_pages - 1).is_ok(),
-            "block-spec cache page IDs must fit u32"
+            "BiDiBlockGQA cache page IDs must fit u32"
         );
         core.validate();
         sdpa_config.validate();
         page_table_layout.validate();
         assert_eq!(
             core.block_size, capacity.block_size,
-            "block-spec GQA state core and capacity block sizes must match"
+            "BiDiBlockGQA state core and capacity block sizes must match"
         );
         let attention = &core.attention;
         assert_eq!(sdpa_config.num_q_heads as usize, attention.num_q_heads);
@@ -73,20 +76,20 @@ impl BlockSpecGQAState {
         let num_tokens_per_page = sdpa_config.tokens_per_page as usize;
         Self {
             sdpa_selection,
-            block_scratch: Some(Rc::new(BlockSpecScratch::new(
+            bidi_block_scratch: Some(Rc::new(BiDiBlockGQAScratch::new(
                 device,
                 &core,
                 sdpa_config.io_dtype,
                 gqa_capacity,
             ))),
-            context_scratch: Some(Rc::new(BlockSpecGQAContextScratch::new(
+            kv_cache_write_scratch: Some(Rc::new(BiDiBlockGQAKVCacheWriteScratch::new(
                 device,
                 &core,
                 sdpa_config.io_dtype,
                 max_context_tokens,
             ))),
             request_page_table: Some(Rc::new(GQARequestPageTable::new(device, page_table_layout))),
-            metadata: Some(BlockSpecGQAMetadataBuffers::new(device, gqa_capacity, sdpa_execution)),
+            metadata: Some(BiDiBlockGQAMetadataBuffers::new(device, gqa_capacity, sdpa_execution)),
             core,
             sdpa_config,
             capacity: gqa_capacity,
@@ -101,15 +104,15 @@ impl BlockSpecGQAState {
         self.num_tokens_per_page
     }
 
-    pub fn prepare_block(&self, block: &BlockSpecMetadata) -> GQAReplayShape {
+    pub fn prepare_bidi_block(&self, block: &BiDiBlockGQAMetadata) -> GQAReplayShape {
         self.metadata().update(block)
     }
 
     pub fn add_replay_arguments(&self, arguments: &mut ReplayArguments) {
-        add_block_spec_gqa_replay_arguments(self.metadata().replay_shape(), arguments);
+        add_bidi_block_gqa_replay_arguments(self.metadata().replay_shape(), arguments);
     }
 
-    pub fn new_gqa(&self, device: &Device, core: BlockSpecGQACore, metal: BlockSpecGQAMetalConfig) -> BlockSpecGQA {
+    pub fn new_gqa(&self, device: &Device, core: BiDiBlockGQACore, metal: BiDiBlockGQAMetalConfig) -> BiDiBlockGQA {
         let shared = &self.core.attention;
         let attention = &core.attention;
         assert_eq!(core.block_size, self.core.block_size);
@@ -119,7 +122,7 @@ impl BlockSpecGQAState {
         assert_eq!(attention.num_kv_heads, shared.num_kv_heads);
         assert_eq!(attention.scale, shared.scale);
         assert_eq!(metal.io_dtype, self.sdpa_config.io_dtype);
-        BlockSpecGQA::new(device, core, metal, self.sdpa_selection.execution())
+        BiDiBlockGQA::new(device, core, metal, self.sdpa_selection.execution())
     }
 
     pub fn write_page_ids(&self, req_slot: u32, block_index: usize, page_ids: &[u32]) {
@@ -128,17 +131,17 @@ impl BlockSpecGQAState {
         let expected_page_ids = request_page_table
             .num_layers()
             .checked_mul(num_page_ids_per_layer)
-            .expect("block-spec GQA page-ID count must fit usize");
+            .expect("BiDiBlockGQA page-ID count must fit usize");
         assert_eq!(
             page_ids.len(),
             expected_page_ids,
-            "block-spec GQA cache block must contain all layer page IDs"
+            "BiDiBlockGQA cache block must contain all layer page IDs"
         );
         assert!(
             page_ids
                 .iter()
                 .all(|&page_id| (page_id as usize) < self.num_cache_pages),
-            "runtime supplied a block-spec GQA page ID outside the cache-page buffer"
+            "runtime supplied a BiDiBlockGQA page ID outside the cache-page buffer"
         );
         for (layer_index, layer_page_ids) in page_ids.chunks_exact(num_page_ids_per_layer).enumerate() {
             request_page_table.write_page_ids(req_slot, layer_index, block_index, layer_page_ids);
@@ -151,7 +154,7 @@ impl BlockSpecGQAState {
             request_page_table
                 .num_layers()
                 .checked_mul(request_page_table.num_page_ids_per_block())
-                .expect("block-spec GQA page-ID count must fit usize"),
+                .expect("BiDiBlockGQA page-ID count must fit usize"),
         );
         for layer_index in 0..request_page_table.num_layers() {
             page_ids.extend(request_page_table.read_page_ids(req_slot, layer_index, block_index));
@@ -163,19 +166,19 @@ impl BlockSpecGQAState {
         self.request_page_table_ref().reset_req_slots(req_slots);
     }
 
-    pub fn block_scratch(&self) -> Rc<BlockSpecScratch> {
+    pub fn bidi_block_scratch(&self) -> Rc<BiDiBlockGQAScratch> {
         Rc::clone(
-            self.block_scratch
+            self.bidi_block_scratch
                 .as_ref()
-                .expect("block-spec GQA block scratch state must be loaded"),
+                .expect("BiDiBlockGQA block scratch state must be loaded"),
         )
     }
 
-    pub fn context_scratch(&self) -> Rc<BlockSpecGQAContextScratch> {
+    pub fn kv_cache_write_scratch(&self) -> Rc<BiDiBlockGQAKVCacheWriteScratch> {
         Rc::clone(
-            self.context_scratch
+            self.kv_cache_write_scratch
                 .as_ref()
-                .expect("block-spec GQA context scratch state must be loaded"),
+                .expect("BiDiBlockGQA KV-cache-write scratch state must be loaded"),
         )
     }
 
@@ -183,50 +186,50 @@ impl BlockSpecGQAState {
         Rc::clone(self.request_page_table_ref())
     }
 
-    pub fn metadata(&self) -> &BlockSpecGQAMetadataBuffers {
+    pub fn metadata(&self) -> &BiDiBlockGQAMetadataBuffers {
         self.metadata
             .as_ref()
-            .expect("block-spec GQA metadata state must be loaded")
+            .expect("BiDiBlockGQA metadata state must be loaded")
     }
 
     pub fn release_resources(&mut self) {
         assert!(
-            self.block_scratch.is_some()
-                && self.context_scratch.is_some()
+            self.bidi_block_scratch.is_some()
+                && self.kv_cache_write_scratch.is_some()
                 && self.request_page_table.is_some()
                 && self.metadata.is_some(),
-            "block-spec GQA state resources are not loaded"
+            "BiDiBlockGQA state resources are not loaded"
         );
         self.request_page_table
             .take()
-            .expect("block-spec GQA request page-table state must be loaded");
+            .expect("BiDiBlockGQA request page-table state must be loaded");
         self.metadata.take();
-        self.context_scratch.take();
-        self.block_scratch.take();
+        self.kv_cache_write_scratch.take();
+        self.bidi_block_scratch.take();
     }
 
     pub fn allocate_resources(&mut self, device: &Device) {
         assert!(
-            self.block_scratch.is_none()
-                && self.context_scratch.is_none()
+            self.bidi_block_scratch.is_none()
+                && self.kv_cache_write_scratch.is_none()
                 && self.request_page_table.is_none()
                 && self.metadata.is_none(),
-            "block-spec GQA state resources are already loaded"
+            "BiDiBlockGQA state resources are already loaded"
         );
-        self.block_scratch = Some(Rc::new(BlockSpecScratch::new(
+        self.bidi_block_scratch = Some(Rc::new(BiDiBlockGQAScratch::new(
             device,
             &self.core,
             self.sdpa_config.io_dtype,
             self.capacity,
         )));
-        self.context_scratch = Some(Rc::new(BlockSpecGQAContextScratch::new(
+        self.kv_cache_write_scratch = Some(Rc::new(BiDiBlockGQAKVCacheWriteScratch::new(
             device,
             &self.core,
             self.sdpa_config.io_dtype,
             self.max_context_tokens,
         )));
         self.request_page_table = Some(Rc::new(GQARequestPageTable::new(device, self.page_table_layout)));
-        self.metadata = Some(BlockSpecGQAMetadataBuffers::new(
+        self.metadata = Some(BiDiBlockGQAMetadataBuffers::new(
             device,
             self.capacity,
             self.sdpa_selection.execution(),
@@ -236,7 +239,7 @@ impl BlockSpecGQAState {
     fn request_page_table_ref(&self) -> &Rc<GQARequestPageTable> {
         self.request_page_table
             .as_ref()
-            .expect("block-spec GQA request page-table state must be loaded")
+            .expect("BiDiBlockGQA request page-table state must be loaded")
     }
 }
 
@@ -245,15 +248,15 @@ mod tests {
     use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
     use inference_backend_metal::metal::Device;
     use inference_backend_metal::metal::Dtype;
-    use inference_executor_core::attn::BlockSpecCapacity;
-    use inference_executor_core::attn::BlockSpecGQACore;
+    use inference_executor_core::attn::BiDiBlockCapacity;
+    use inference_executor_core::attn::BiDiBlockGQACore;
     use inference_executor_core::attn::GQAPageTableLayout;
     use inference_executor_core::attn::UngatedGQACore;
 
-    use super::BlockSpecGQAState;
+    use super::BiDiBlockGQAState;
 
     #[test]
-    fn test_write_read_page_ids_uses_complete_block_spec_block() {
+    fn test_write_read_page_ids_uses_complete_bidi_block_gqa_block() {
         let device = Device::system_default();
         let state = new_state(&device);
 
@@ -263,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "runtime supplied a block-spec GQA page ID outside the cache-page buffer")]
+    #[should_panic(expected = "runtime supplied a BiDiBlockGQA page ID outside the cache-page buffer")]
     fn test_write_page_ids_rejects_page_id_outside_cache() {
         let device = Device::system_default();
         let state = new_state(&device);
@@ -271,10 +274,10 @@ mod tests {
         state.write_page_ids(1, 1, &[30, 31, 40, 64]);
     }
 
-    fn new_state(device: &Device) -> BlockSpecGQAState {
-        BlockSpecGQAState::new(
+    fn new_state(device: &Device) -> BiDiBlockGQAState {
+        BiDiBlockGQAState::new(
             device,
-            BlockSpecGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
+            BiDiBlockGQACore::new(UngatedGQACore::new(0, 128, 128, 1, 1, 1.0), 1),
             backend_sdpa::Config {
                 io_dtype: Dtype::Bfloat16,
                 num_q_heads: 1,
@@ -288,7 +291,7 @@ mod tests {
                 num_blocks: 2,
                 num_page_ids_per_block: 2,
             },
-            BlockSpecCapacity::new(2, 1),
+            BiDiBlockCapacity::new(2, 1),
             2,
             64,
         )

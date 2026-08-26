@@ -1,14 +1,14 @@
-//! Shared scratch buffers for block-spec GQA.
+//! Shared scratch buffers for BiDiBlockGQA.
 
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::BlockSpecGQACore;
+use inference_executor_core::attn::BiDiBlockGQACore;
 
-use crate::attn::block_spec::capacity::BlockSpecGQACapacity;
+use crate::attn::bidi_block_gqa::capacity::BiDiBlockGQACapacity;
 
-pub struct BlockSpecScratch {
-    capacity: BlockSpecGQACapacity,
+pub struct BiDiBlockGQAScratch {
+    capacity: BiDiBlockGQACapacity,
     q: Buffer,
     k: Buffer,
     v: Buffer,
@@ -21,8 +21,8 @@ pub struct BlockSpecScratch {
 }
 
 #[derive(Clone, Copy)]
-pub struct BlockSpecScratchBindings<'a> {
-    pub capacity: BlockSpecGQACapacity,
+pub struct BiDiBlockGQAScratchBindings<'a> {
+    pub capacity: BiDiBlockGQACapacity,
     pub q: &'a Buffer,
     pub k: &'a Buffer,
     pub v: &'a Buffer,
@@ -34,17 +34,17 @@ pub struct BlockSpecScratchBindings<'a> {
     pub attention_output: &'a Buffer,
 }
 
-impl BlockSpecScratch {
-    pub fn new(device: &Device, core: &BlockSpecGQACore, io_dtype: Dtype, capacity: BlockSpecGQACapacity) -> Self {
+impl BiDiBlockGQAScratch {
+    pub fn new(device: &Device, core: &BiDiBlockGQACore, io_dtype: Dtype, capacity: BiDiBlockGQACapacity) -> Self {
         core.validate();
         match io_dtype {
             Dtype::Bfloat16 => {},
-            Dtype::Float32 => todo!("F32 block-spec GQA model boundary is not supported"),
-            dtype => panic!("unsupported block-spec GQA model boundary dtype {dtype:?}"),
+            Dtype::Float32 => todo!("F32 BiDiBlockGQA model boundary is not supported"),
+            dtype => panic!("unsupported BiDiBlockGQA model boundary dtype {dtype:?}"),
         }
         assert_eq!(
             core.block_size, capacity.block.block_size,
-            "block-spec GQA core and scratch block sizes must match"
+            "BiDiBlockGQA core and scratch block sizes must match"
         );
         let attention = &core.attention;
         let tensor_elements = |dim: usize| {
@@ -52,17 +52,17 @@ impl BlockSpecScratch {
                 .block
                 .max_tokens
                 .checked_mul(dim)
-                .expect("block-spec block scratch tensor element count must fit usize")
+                .expect("BiDiBlockGQA block scratch tensor element count must fit usize")
         };
         let partial_stats = capacity
             .max_sdpa_partial_state_groups
             .checked_mul(attention.num_q_heads)
-            .expect("block-spec block scratch partial statistic count must fit usize");
+            .expect("BiDiBlockGQA block scratch partial statistic count must fit usize");
         let partial_values = partial_stats
             .checked_mul(attention.head_dim)
-            .expect("block-spec block scratch partial output count must fit usize");
-        assert_u32_index_domain(partial_stats, "block-spec block partial statistics");
-        assert_u32_index_domain(partial_values, "block-spec block partial output");
+            .expect("BiDiBlockGQA block scratch partial output count must fit usize");
+        assert_u32_index_domain(partial_stats, "BiDiBlockGQA block partial statistics");
+        assert_u32_index_domain(partial_values, "BiDiBlockGQA block partial output");
 
         Self {
             capacity,
@@ -78,8 +78,8 @@ impl BlockSpecScratch {
         }
     }
 
-    pub fn bindings(&self) -> BlockSpecScratchBindings<'_> {
-        BlockSpecScratchBindings {
+    pub fn bindings(&self) -> BiDiBlockGQAScratchBindings<'_> {
+        BiDiBlockGQAScratchBindings {
             capacity: self.capacity,
             q: &self.q,
             k: &self.k,

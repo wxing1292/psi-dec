@@ -3,12 +3,12 @@ use std::ops::Range;
 use crate::attn::UngatedGQACore;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BlockSpecGQACore {
+pub struct BiDiBlockGQACore {
     pub attention: UngatedGQACore,
     pub block_size: usize,
 }
 
-impl BlockSpecGQACore {
+impl BiDiBlockGQACore {
     pub fn new(attention: UngatedGQACore, block_size: usize) -> Self {
         let core = Self { attention, block_size };
         core.validate();
@@ -17,26 +17,26 @@ impl BlockSpecGQACore {
 
     pub fn validate(&self) {
         self.attention.validate();
-        assert!(self.block_size > 0, "block-spec GQA block_size must be positive");
+        assert!(self.block_size > 0, "BiDiBlockGQA block_size must be positive");
         assert!(
             u32::try_from(self.block_size).is_ok(),
-            "block-spec GQA block_size must fit u32"
+            "BiDiBlockGQA block_size must fit u32"
         );
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockSpecCapacity {
+pub struct BiDiBlockCapacity {
     pub max_requests: usize,
     pub block_size: usize,
     pub max_tokens: usize,
 }
 
-impl BlockSpecCapacity {
+impl BiDiBlockCapacity {
     pub fn new(max_requests: usize, block_size: usize) -> Self {
         let max_tokens = max_requests
             .checked_mul(block_size)
-            .expect("block-spec token capacity must fit usize");
+            .expect("BiDiBlockGQA token capacity must fit usize");
         let capacity = Self {
             max_requests,
             block_size,
@@ -47,24 +47,24 @@ impl BlockSpecCapacity {
     }
 
     pub fn validate(self) {
-        assert!(self.max_requests > 0, "block-spec capacity requires requests");
-        assert!(self.block_size > 0, "block-spec capacity requires block tokens");
+        assert!(self.max_requests > 0, "BiDiBlockGQA capacity requires requests");
+        assert!(self.block_size > 0, "BiDiBlockGQA capacity requires block tokens");
         assert_eq!(
             self.max_tokens,
             self.max_requests
                 .checked_mul(self.block_size)
-                .expect("block-spec token capacity must fit usize"),
-            "block-spec token capacity must match requests times block size"
+                .expect("BiDiBlockGQA token capacity must fit usize"),
+            "BiDiBlockGQA token capacity must match requests times block size"
         );
         assert!(
             u32::try_from(self.max_tokens).is_ok(),
-            "block-spec token capacity must fit u32"
+            "BiDiBlockGQA token capacity must fit u32"
         );
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockSpecMetadata {
+pub struct BiDiBlockGQAMetadata {
     req_slots: Vec<u32>,
     flat_token_indices: Vec<u32>,
     history_token_begins: Vec<u32>,
@@ -73,43 +73,43 @@ pub struct BlockSpecMetadata {
     block_size: usize,
 }
 
-impl BlockSpecMetadata {
+impl BiDiBlockGQAMetadata {
     pub fn new(
         req_slots: &[u32],
         flat_query_token_indices: &[u32],
         visible_history_token_ranges: &[Range<u32>],
         block_size: usize,
     ) -> Self {
-        assert!(!req_slots.is_empty(), "block-spec metadata requires requests");
-        assert!(block_size > 0, "block-spec metadata requires block tokens");
+        assert!(!req_slots.is_empty(), "BiDiBlockGQA metadata requires requests");
+        assert!(block_size > 0, "BiDiBlockGQA metadata requires block tokens");
         let num_tokens = req_slots
             .len()
             .checked_mul(block_size)
-            .expect("block-spec token count must fit usize");
+            .expect("BiDiBlockGQA token count must fit usize");
         assert_eq!(
             flat_query_token_indices.len(),
             num_tokens,
-            "block-spec metadata requires one query-token index per block row"
+            "BiDiBlockGQA metadata requires one query-token index per block row"
         );
         assert_eq!(
             visible_history_token_ranges.len(),
             num_tokens,
-            "block-spec metadata requires one visible history token range per block row"
+            "BiDiBlockGQA metadata requires one visible history token range per block row"
         );
         assert!(
             u32::try_from(block_size).is_ok(),
-            "block-spec metadata block_size must fit u32"
+            "BiDiBlockGQA metadata block_size must fit u32"
         );
         assert!(
             req_slots
                 .iter()
                 .enumerate()
                 .all(|(index, req_slot)| !req_slots[..index].contains(req_slot)),
-            "block-spec metadata requires unique request slots"
+            "BiDiBlockGQA metadata requires unique request slots"
         );
         assert!(
             visible_history_token_ranges.iter().all(|range| range.start < range.end),
-            "block-spec visible history token ranges must be nonempty half-open ranges"
+            "BiDiBlockGQA visible history token ranges must be nonempty half-open ranges"
         );
         let mut req_slots_by_token = Vec::with_capacity(num_tokens);
         let mut history_token_begins = Vec::with_capacity(num_tokens);
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_block_metadata_uses_history_end_as_first_query_row() {
-        let metadata = BlockSpecMetadata::new(
+        let metadata = BiDiBlockGQAMetadata::new(
             &[2, 9],
             &[11, 12, 13, 20, 21, 22],
             &[0..11, 0..11, 0..11, 4..20, 4..20, 4..20],
@@ -188,18 +188,18 @@ mod tests {
     #[test]
     #[should_panic(expected = "unique request slots")]
     fn test_block_metadata_rejects_duplicate_request_slots() {
-        let _ = BlockSpecMetadata::new(&[2, 2], &[11, 12, 13, 20, 21, 22], &vec![0..11; 6], 3);
+        let _ = BiDiBlockGQAMetadata::new(&[2, 2], &[11, 12, 13, 20, 21, 22], &vec![0..11; 6], 3);
     }
 
     #[test]
     #[should_panic(expected = "nonempty half-open ranges")]
     fn test_block_metadata_rejects_empty_history_range() {
-        let _ = BlockSpecMetadata::new(&[2], &[11, 12, 13], &[11..11, 0..11, 0..11], 3);
+        let _ = BiDiBlockGQAMetadata::new(&[2], &[11, 12, 13], &[11..11, 0..11, 0..11], 3);
     }
 
     #[test]
     fn test_block_metadata_preserves_per_query_history_ranges() {
-        let metadata = BlockSpecMetadata::new(&[2], &[11, 12, 13], &[0..11, 1..11, 2..11], 3);
+        let metadata = BiDiBlockGQAMetadata::new(&[2], &[11, 12, 13], &[0..11, 1..11, 2..11], 3);
 
         assert_eq!(metadata.history_token_begins(), [0, 1, 2]);
         assert_eq!(metadata.history_token_ends(), [11, 11, 11]);

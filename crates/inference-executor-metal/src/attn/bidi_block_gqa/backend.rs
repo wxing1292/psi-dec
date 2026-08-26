@@ -1,6 +1,6 @@
 //! Shared history-plus-block GQA recording.
 
-use inference_backend_metal::components::gqa::block_sdpa as backend_block_sdpa;
+use inference_backend_metal::components::gqa::bidi_block_sdpa as backend_bidi_block_sdpa;
 use inference_backend_metal::components::gqa::kv_page_write as backend_kv_page_write;
 use inference_backend_metal::components::gqa::sdpa as backend_sdpa;
 use inference_backend_metal::components::gqa::sdpa::ExecutionVariant;
@@ -14,35 +14,35 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayParameterKey;
 use inference_backend_metal::metal::ReplayU32;
 use inference_backend_metal::operators::affine_quantized;
-use inference_executor_core::attn::BlockSpecGQACore;
+use inference_executor_core::attn::BiDiBlockGQACore;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 
-use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
-use crate::attn::block_spec::scratch::BlockSpecScratchBindings;
+use crate::attn::bidi_block_gqa::metadata::BiDiBlockGQAMetadataBuffers;
+use crate::attn::bidi_block_gqa::scratch::BiDiBlockGQAScratchBindings;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::def::layer::ReplayLayer;
 use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::quantized_affine::QuantizedAffineWeights;
 use crate::def::replay_op::ReplayOp;
 
-pub const BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES: ReplayParameterKey =
-    ReplayParameterKey::new("block_spec_gqa.num_active_sdpa_map_task_templates");
-pub const BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES: ReplayParameterKey =
-    ReplayParameterKey::new("block_spec_gqa.num_active_q_token_ranges");
+pub const BIDI_BLOCK_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES: ReplayParameterKey =
+    ReplayParameterKey::new("bidi_block_gqa.num_active_sdpa_map_task_templates");
+pub const BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES: ReplayParameterKey =
+    ReplayParameterKey::new("bidi_block_gqa.num_active_q_token_ranges");
 
-pub fn add_block_spec_gqa_replay_arguments(shape: GQAReplayShape, arguments: &mut ReplayArguments) {
+pub fn add_bidi_block_gqa_replay_arguments(shape: GQAReplayShape, arguments: &mut ReplayArguments) {
     shape.validate();
-    arguments.set_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, shape.num_q_token_tiles);
+    arguments.set_u32(BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, shape.num_q_token_tiles);
     arguments.set_u32(
-        BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES,
+        BIDI_BLOCK_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES,
         shape.num_sdpa_map_task_templates,
     );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BlockSpecGQAMetalConfig {
+pub struct BiDiBlockGQAMetalConfig {
     pub q: QuantizedAffineLayout,
     pub k: QuantizedAffineLayout,
     pub v: QuantizedAffineLayout,
@@ -56,7 +56,7 @@ pub struct BlockSpecGQAMetalConfig {
     pub norm_weight_dtype: Dtype,
 }
 
-impl BlockSpecGQAMetalConfig {
+impl BiDiBlockGQAMetalConfig {
     pub fn validate(self) {
         self.q.validate();
         self.k.validate();
@@ -67,7 +67,7 @@ impl BlockSpecGQAMetalConfig {
         assert!(self.norm_eps.is_finite() && self.norm_eps > 0.0);
         assert!(self.rope_theta.is_finite() && self.rope_theta > 0.0);
         self.rope_scaling.validate();
-        assert_eq!(self.io_dtype, Dtype::Bfloat16, "block-spec GQA requires BF16 model IO");
+        assert_eq!(self.io_dtype, Dtype::Bfloat16, "BiDiBlockGQA requires BF16 model IO");
         assert!(matches!(self.norm_weight_dtype, Dtype::Float32 | Dtype::Bfloat16));
     }
 
@@ -79,20 +79,20 @@ impl BlockSpecGQAMetalConfig {
             .checked_mul(core.head_dim)
             .and_then(|values| values.checked_mul(2))
             .and_then(|values| values.checked_mul(self.io_dtype.item_size()))
-            .expect("block-spec GQA KV bytes per token must fit usize");
+            .expect("BiDiBlockGQA KV bytes per token must fit usize");
         let page_bytes = self.page_bytes as usize;
         assert!(
             page_bytes.is_multiple_of(bytes_per_token),
-            "block-spec GQA page must contain whole KV tokens"
+            "BiDiBlockGQA page must contain whole KV tokens"
         );
         (page_bytes / bytes_per_token)
             .try_into()
-            .expect("block-spec GQA tokens per page must fit u32")
+            .expect("BiDiBlockGQA tokens per page must fit u32")
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct BlockSpecGQAWeights<'a> {
+pub struct BiDiBlockGQAWeights<'a> {
     pub q: QuantizedAffineWeights<'a>,
     pub k: QuantizedAffineWeights<'a>,
     pub v: QuantizedAffineWeights<'a>,
@@ -102,37 +102,37 @@ pub struct BlockSpecGQAWeights<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct BlockSpecGQAInput<'a> {
+pub struct BiDiBlockGQAInput<'a> {
     pub page_table_layout: GQAPageTableLayout,
     pub gqa_layer_index: u32,
-    pub metadata: &'a BlockSpecGQAMetadataBuffers,
+    pub metadata: &'a BiDiBlockGQAMetadataBuffers,
     pub hidden_state: &'a Buffer,
     pub next_hidden_state: &'a Buffer,
     pub kv_cache: GQAKVCacheBindings<'a>,
-    pub weights: BlockSpecGQAWeights<'a>,
-    pub scratch: BlockSpecScratchBindings<'a>,
+    pub weights: BiDiBlockGQAWeights<'a>,
+    pub scratch: BiDiBlockGQAScratchBindings<'a>,
     pub num_active_tokens: ReplayU32,
 }
 
-pub struct BlockSpecGQA {
+pub struct BiDiBlockGQA {
     device: Device,
-    core: BlockSpecGQACore,
-    metal: BlockSpecGQAMetalConfig,
+    core: BiDiBlockGQACore,
+    metal: BiDiBlockGQAMetalConfig,
     q: affine_quantized::Matmul,
     k: affine_quantized::Matmul,
     v: affine_quantized::Matmul,
     q_norm_rope: rms_norm_rope::Compute,
     k_norm_rope: rms_norm_rope::Compute,
     sdpa_execution: ExecutionVariant,
-    block_sdpa: backend_block_sdpa::Compute,
+    bidi_block_sdpa: backend_bidi_block_sdpa::Compute,
     output: affine_quantized::Matmul,
 }
 
-impl BlockSpecGQA {
+impl BiDiBlockGQA {
     pub fn new(
         device: &Device,
-        core: BlockSpecGQACore,
-        metal: BlockSpecGQAMetalConfig,
+        core: BiDiBlockGQACore,
+        metal: BiDiBlockGQAMetalConfig,
         sdpa_execution: ExecutionVariant,
     ) -> Self {
         core.validate();
@@ -145,20 +145,20 @@ impl BlockSpecGQA {
             num_q_heads: attention
                 .num_q_heads
                 .try_into()
-                .expect("block-spec GQA Q-head count must fit u32"),
+                .expect("BiDiBlockGQA Q-head count must fit u32"),
             num_kv_heads: attention
                 .num_kv_heads
                 .try_into()
-                .expect("block-spec GQA KV-head count must fit u32"),
+                .expect("BiDiBlockGQA KV-head count must fit u32"),
             head_dim: attention
                 .head_dim
                 .try_into()
-                .expect("block-spec GQA head_dim must fit u32"),
+                .expect("BiDiBlockGQA head_dim must fit u32"),
             tokens_per_page: metal.num_tokens_per_page(attention),
         };
         assert!(
             sdpa_execution.supports(sdpa_config),
-            "block-spec history attention execution must support the layer geometry"
+            "BiDiBlockGQA history attention execution must support the layer geometry"
         );
         let output = attention.output_shape();
         Self {
@@ -181,26 +181,26 @@ impl BlockSpecGQA {
                 norm_rope_config(attention, metal, attention.num_kv_heads),
             ),
             sdpa_execution,
-            block_sdpa: backend_block_sdpa::Compute::new(
+            bidi_block_sdpa: backend_bidi_block_sdpa::Compute::new(
                 device,
-                backend_block_sdpa::Config {
+                backend_bidi_block_sdpa::Config {
                     block_size: core
                         .block_size
                         .try_into()
-                        .expect("block-spec GQA block size must fit u32"),
+                        .expect("BiDiBlockGQA block size must fit u32"),
                     max_q_tokens: sdpa_execution.map.thread_block.max_q_tokens,
                     num_q_heads: attention
                         .num_q_heads
                         .try_into()
-                        .expect("block-spec GQA Q-head count must fit u32"),
+                        .expect("BiDiBlockGQA Q-head count must fit u32"),
                     num_kv_heads: attention
                         .num_kv_heads
                         .try_into()
-                        .expect("block-spec GQA KV-head count must fit u32"),
+                        .expect("BiDiBlockGQA KV-head count must fit u32"),
                     head_dim: attention
                         .head_dim
                         .try_into()
-                        .expect("block-spec GQA head_dim must fit u32"),
+                        .expect("BiDiBlockGQA head_dim must fit u32"),
                     scale: attention.scale,
                     dtype: metal.io_dtype,
                 },
@@ -214,39 +214,39 @@ impl BlockSpecGQA {
         }
     }
 
-    fn validate_input(&self, input: &BlockSpecGQAInput<'_>) -> GQAReplayShape {
+    fn validate_input(&self, input: &BiDiBlockGQAInput<'_>) -> GQAReplayShape {
         input.page_table_layout.validate();
         assert!(
             input.gqa_layer_index < input.page_table_layout.num_gqa_layers,
-            "block-spec GQA layer index exceeds the page table"
+            "BiDiBlockGQA layer index exceeds the page table"
         );
         let shape = input.metadata.replay_shape();
         let sdpa_execution = input.metadata.sdpa_execution();
         shape.validate();
         assert_eq!(
             shape.num_tokens, shape.num_total_tokens,
-            "block-spec dense block attention requires an identity token capacity"
+            "BiDiBlockGQA dense block attention requires an identity token capacity"
         );
         assert!(shape.reduce_sdpa_partial_outputs);
         assert!(
             shape.num_tokens as usize <= input.scratch.capacity.block.max_tokens,
-            "block-spec GQA replay token count exceeds scratch"
+            "BiDiBlockGQA replay token count exceeds scratch"
         );
         assert!(
             shape.num_total_sdpa_map_task_templates as usize <= input.scratch.capacity.max_sdpa_map_task_templates,
-            "block-spec GQA replay partial count exceeds scratch"
+            "BiDiBlockGQA replay partial count exceeds scratch"
         );
         assert_eq!(
             input.scratch.capacity.block.block_size, self.core.block_size,
-            "block-spec GQA scratch block size must match the backend"
+            "BiDiBlockGQA scratch block size must match the backend"
         );
         assert_eq!(
             sdpa_execution, self.sdpa_execution,
-            "block-spec history attention metadata must match the frozen backend execution"
+            "BiDiBlockGQA history attention metadata must match the frozen backend execution"
         );
         assert_eq!(
             self.sdpa_execution.map.thread_block.max_q_tokens as usize, input.scratch.capacity.max_q_tokens,
-            "block-spec history attention execution must match scratch capacity"
+            "BiDiBlockGQA history attention execution must match scratch capacity"
         );
         shape
     }
@@ -257,15 +257,15 @@ impl BlockSpecGQA {
             num_q_heads: attention
                 .num_q_heads
                 .try_into()
-                .expect("block-spec GQA Q-head count must fit u32"),
+                .expect("BiDiBlockGQA Q-head count must fit u32"),
             num_kv_heads: attention
                 .num_kv_heads
                 .try_into()
-                .expect("block-spec GQA KV-head count must fit u32"),
+                .expect("BiDiBlockGQA KV-head count must fit u32"),
             head_dim: attention
                 .head_dim
                 .try_into()
-                .expect("block-spec GQA head_dim must fit u32"),
+                .expect("BiDiBlockGQA head_dim must fit u32"),
             scale: attention.scale,
             page_bytes: self.metal.page_bytes,
             page_table_layout: backend_page_table_layout(page_table_layout),
@@ -279,15 +279,15 @@ impl BlockSpecGQA {
             num_q_heads: attention
                 .num_q_heads
                 .try_into()
-                .expect("block-spec GQA Q-head count must fit u32"),
+                .expect("BiDiBlockGQA Q-head count must fit u32"),
             num_kv_heads: attention
                 .num_kv_heads
                 .try_into()
-                .expect("block-spec GQA KV-head count must fit u32"),
+                .expect("BiDiBlockGQA KV-head count must fit u32"),
             head_dim: attention
                 .head_dim
                 .try_into()
-                .expect("block-spec GQA head_dim must fit u32"),
+                .expect("BiDiBlockGQA head_dim must fit u32"),
             scale: attention.scale,
             page_bytes: self.metal.page_bytes,
             dtype: self.metal.io_dtype,
@@ -295,23 +295,23 @@ impl BlockSpecGQA {
         }
     }
 
-    fn record_block_sdpa<'a, R>(
+    fn record_bidi_block_sdpa<'a, R>(
         &'a self,
         recorder: &mut R,
         shape: GQAReplayShape,
-        metadata: &'a BlockSpecGQAMetadataBuffers,
-        scratch: BlockSpecScratchBindings<'a>,
+        metadata: &'a BiDiBlockGQAMetadataBuffers,
+        scratch: BiDiBlockGQAScratchBindings<'a>,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        recorder.record(ReplayOp::opaque(self.block_sdpa.invoke(
-            backend_block_sdpa::Shape {
+        recorder.record(ReplayOp::opaque(self.bidi_block_sdpa.invoke(
+            backend_bidi_block_sdpa::Shape {
                 num_total_tokens: shape.num_total_tokens,
                 num_total_q_token_ranges: shape.num_total_q_token_tiles,
                 num_total_partial_output_slots: shape.num_total_sdpa_map_task_templates,
             },
-            ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
-            backend_block_sdpa::Buffers {
+            ReplayU32::Parameter(BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
+            backend_bidi_block_sdpa::Buffers {
                 q: scratch.q_norm_rope,
                 local_k: scratch.k_norm_rope,
                 local_v: scratch.v,
@@ -325,8 +325,8 @@ impl BlockSpecGQA {
     }
 }
 
-impl ReplayLayer for BlockSpecGQA {
-    type Input<'a> = BlockSpecGQAInput<'a>;
+impl ReplayLayer for BiDiBlockGQA {
+    type Input<'a> = BiDiBlockGQAInput<'a>;
     type Output<'a> = &'a Buffer;
 
     fn record<'a, R>(&'a self, recorder: &mut R, input: Self::Input<'a>) -> Self::Output<'a>
@@ -425,9 +425,9 @@ impl ReplayLayer for BlockSpecGQA {
                 },
                 ReplayU32::Fixed(input.gqa_layer_index),
                 active_tokens,
-                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
+                ReplayU32::Parameter(BIDI_BLOCK_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
             )));
-            self.record_block_sdpa(recorder, shape, input.metadata, scratch);
+            self.record_bidi_block_sdpa(recorder, shape, input.metadata, scratch);
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
                 backend_single_q::ReduceBuffers {
                     partial_exp_sums: scratch.partial_exp_sums,
@@ -461,10 +461,10 @@ impl ReplayLayer for BlockSpecGQA {
                 },
                 ReplayU32::Fixed(input.gqa_layer_index),
                 active_tokens,
-                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
-                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
+                ReplayU32::Parameter(BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
+                ReplayU32::Parameter(BIDI_BLOCK_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES),
             )));
-            self.record_block_sdpa(recorder, shape, input.metadata, scratch);
+            self.record_bidi_block_sdpa(recorder, shape, input.metadata, scratch);
             recorder.record_with_barrier_before(ReplayOp::opaque(sdpa.invoke_reduce(
                 backend_tiled_q::ReduceBuffers {
                     partial_output: scratch.partial_output,
@@ -474,7 +474,7 @@ impl ReplayLayer for BlockSpecGQA {
                     cu_sdpa_partial_outputs: input.metadata.cu_sdpa_partial_outputs(),
                     output: scratch.attention_output,
                 },
-                ReplayU32::Parameter(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
+                ReplayU32::Parameter(BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES),
             )));
         }
         recorder.record_with_barrier_before(ReplayOp::opaque(self.output.invoke(
@@ -506,11 +506,11 @@ fn backend_page_table_layout(layout: GQAPageTableLayout) -> backend_kv_page_writ
 
 fn norm_rope_config(
     core: &inference_executor_core::attn::UngatedGQACore,
-    metal: BlockSpecGQAMetalConfig,
+    metal: BiDiBlockGQAMetalConfig,
     num_heads: usize,
 ) -> rms_norm_rope::Config {
-    let num_heads = num_heads.try_into().expect("block-spec GQA head count must fit u32");
-    let head_dim = core.head_dim.try_into().expect("block-spec GQA head_dim must fit u32");
+    let num_heads = num_heads.try_into().expect("BiDiBlockGQA head count must fit u32");
+    let head_dim = core.head_dim.try_into().expect("BiDiBlockGQA head_dim must fit u32");
     let norm_rope = match metal.io_dtype {
         Dtype::Float32 => {
             rms_norm_rope::Config::f32(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
@@ -518,7 +518,7 @@ fn norm_rope_config(
         Dtype::Bfloat16 => {
             rms_norm_rope::Config::bf16(num_heads, head_dim, metal.rope_dim, metal.norm_eps, metal.rope_theta)
         },
-        dtype => panic!("unsupported block-spec GQA dtype {dtype:?}"),
+        dtype => panic!("unsupported BiDiBlockGQA dtype {dtype:?}"),
     };
     norm_rope
         .with_rope_scaling(metal.rope_scaling)
@@ -530,9 +530,9 @@ mod tests {
     use inference_backend_metal::metal::ReplayArguments;
     use inference_executor_core::attn::GQAReplayShape;
 
-    use super::BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES;
-    use super::BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES;
-    use super::add_block_spec_gqa_replay_arguments;
+    use super::BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES;
+    use super::BIDI_BLOCK_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES;
+    use super::add_bidi_block_gqa_replay_arguments;
 
     #[test]
     fn test_replay_arguments_select_active_history_work_inside_one_capacity() {
@@ -546,23 +546,23 @@ mod tests {
             reduce_sdpa_partial_outputs: true,
         };
         let mut shorter_history_arguments = ReplayArguments::new();
-        add_block_spec_gqa_replay_arguments(shape, &mut shorter_history_arguments);
+        add_bidi_block_gqa_replay_arguments(shape, &mut shorter_history_arguments);
         let mut longer_history = shape;
         longer_history.num_sdpa_map_task_templates = 8;
         let mut longer_history_arguments = ReplayArguments::new();
-        add_block_spec_gqa_replay_arguments(longer_history, &mut longer_history_arguments);
+        add_bidi_block_gqa_replay_arguments(longer_history, &mut longer_history_arguments);
 
         assert_eq!(
             shorter_history_arguments,
             ReplayArguments::new()
-                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, 1)
-                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 7)
+                .with_u32(BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, 1)
+                .with_u32(BIDI_BLOCK_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 7)
         );
         assert_eq!(
             longer_history_arguments,
             ReplayArguments::new()
-                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, 1)
-                .with_u32(BLOCK_SPEC_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 8)
+                .with_u32(BIDI_BLOCK_GQA_NUM_ACTIVE_Q_TOKEN_RANGES, 1)
+                .with_u32(BIDI_BLOCK_GQA_NUM_ACTIVE_SDPA_MAP_TASK_TEMPLATES, 8)
         );
     }
 }

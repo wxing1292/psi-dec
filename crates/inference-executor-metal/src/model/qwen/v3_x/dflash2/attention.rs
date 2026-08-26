@@ -5,50 +5,50 @@ use inference_backend_metal::components::rms_norm_rope::RopeScaling;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
-use inference_executor_core::attn::BlockSpecGQACore;
+use inference_executor_core::attn::BiDiBlockGQACore;
 use inference_executor_core::attn::UngatedGQACore;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
 
-use crate::attn::block_spec::backend::BlockSpecGQA;
-use crate::attn::block_spec::backend::BlockSpecGQAInput;
-use crate::attn::block_spec::backend::BlockSpecGQAMetalConfig;
-use crate::attn::block_spec::context::BlockSpecGQAContextAppender;
-use crate::attn::block_spec::context::BlockSpecGQAContextInput;
-use crate::attn::block_spec::context::BlockSpecGQAContextScratch;
-use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
-use crate::attn::block_spec::scratch::BlockSpecScratch;
-use crate::attn::block_spec::state::BlockSpecGQAState;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQA;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQAInput;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQAMetalConfig;
+use crate::attn::bidi_block_gqa::kv_cache_write::BiDiBlockGQAKVCacheWriteInput;
+use crate::attn::bidi_block_gqa::kv_cache_write::BiDiBlockGQAKVCacheWriteScratch;
+use crate::attn::bidi_block_gqa::kv_cache_write::BiDiBlockGQAKVCacheWriter;
+use crate::attn::bidi_block_gqa::metadata::BiDiBlockGQAMetadataBuffers;
+use crate::attn::bidi_block_gqa::scratch::BiDiBlockGQAScratch;
+use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::attn::gqa::backend::GQAKVCacheBindings;
 use crate::attn::gqa::request_page_table::GQARequestPageTable;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::replay_op::ReplayOp;
-use crate::model::qwen::v3_x::layer::Qwen3xBlockSpecGQAWeightBuffers;
+use crate::model::qwen::v3_x::layer::Qwen3xBiDiBlockGQAWeightBuffers;
 use crate::model::qwen::v3_x::weight::to_u32;
 
 pub struct Qwen3xDFlash2Attention {
     dflash2_layer_index: u32,
-    core: BlockSpecGQACore,
-    metal: BlockSpecGQAMetalConfig,
-    weights: Option<Qwen3xBlockSpecGQAWeightBuffers>,
-    backend: BlockSpecGQA,
-    context_appender: BlockSpecGQAContextAppender,
-    block_scratch: Option<Rc<BlockSpecScratch>>,
-    context_scratch: Option<Rc<BlockSpecGQAContextScratch>>,
+    core: BiDiBlockGQACore,
+    metal: BiDiBlockGQAMetalConfig,
+    weights: Option<Qwen3xBiDiBlockGQAWeightBuffers>,
+    backend: BiDiBlockGQA,
+    kv_cache_writer: BiDiBlockGQAKVCacheWriter,
+    bidi_block_scratch: Option<Rc<BiDiBlockGQAScratch>>,
+    kv_cache_write_scratch: Option<Rc<BiDiBlockGQAKVCacheWriteScratch>>,
     request_page_table: Option<Rc<GQARequestPageTable>>,
 }
 
 impl Qwen3xDFlash2Attention {
     pub fn new(
         device: &Device,
-        core: BlockSpecGQACore,
-        metal: BlockSpecGQAMetalConfig,
+        core: BiDiBlockGQACore,
+        metal: BiDiBlockGQAMetalConfig,
         dflash2_layer_index: usize,
-        state: &BlockSpecGQAState,
+        state: &BiDiBlockGQAState,
     ) -> Self {
         Self {
             dflash2_layer_index: dflash2_layer_index
@@ -58,9 +58,9 @@ impl Qwen3xDFlash2Attention {
             metal,
             weights: None,
             backend: state.new_gqa(device, core.clone(), metal),
-            context_appender: BlockSpecGQAContextAppender::new(device, core, metal),
-            block_scratch: Some(state.block_scratch()),
-            context_scratch: Some(state.context_scratch()),
+            kv_cache_writer: BiDiBlockGQAKVCacheWriter::new(device, core, metal),
+            bidi_block_scratch: Some(state.bidi_block_scratch()),
+            kv_cache_write_scratch: Some(state.kv_cache_write_scratch()),
             request_page_table: Some(state.request_page_table()),
         }
     }
@@ -75,7 +75,7 @@ impl Qwen3xDFlash2Attention {
             self.weights.is_none(),
             "Qwen3.x DFlash2 attention weights are already loaded"
         );
-        self.weights = Some(Qwen3xBlockSpecGQAWeightBuffers::load(
+        self.weights = Some(Qwen3xBiDiBlockGQAWeightBuffers::load(
             device,
             store,
             &bindings,
@@ -95,25 +95,29 @@ impl Qwen3xDFlash2Attention {
 
     pub fn unload_state(&mut self) {
         assert!(
-            self.block_scratch.is_some() && self.context_scratch.is_some() && self.request_page_table.is_some(),
+            self.bidi_block_scratch.is_some()
+                && self.kv_cache_write_scratch.is_some()
+                && self.request_page_table.is_some(),
             "Qwen3.x DFlash2 attention state is not loaded"
         );
         self.request_page_table.take();
-        self.context_scratch.take();
-        self.block_scratch.take();
+        self.kv_cache_write_scratch.take();
+        self.bidi_block_scratch.take();
     }
 
-    pub fn load_state(&mut self, state: &BlockSpecGQAState) {
+    pub fn load_state(&mut self, state: &BiDiBlockGQAState) {
         assert!(
-            self.block_scratch.is_none() && self.context_scratch.is_none() && self.request_page_table.is_none(),
+            self.bidi_block_scratch.is_none()
+                && self.kv_cache_write_scratch.is_none()
+                && self.request_page_table.is_none(),
             "Qwen3.x DFlash2 attention state is already loaded"
         );
-        self.block_scratch = Some(state.block_scratch());
-        self.context_scratch = Some(state.context_scratch());
+        self.bidi_block_scratch = Some(state.bidi_block_scratch());
+        self.kv_cache_write_scratch = Some(state.kv_cache_write_scratch());
         self.request_page_table = Some(state.request_page_table());
     }
 
-    fn weights(&self) -> &Qwen3xBlockSpecGQAWeightBuffers {
+    fn weights(&self) -> &Qwen3xBiDiBlockGQAWeightBuffers {
         self.weights
             .as_ref()
             .expect("Qwen3.x DFlash2 attention weights must be loaded before execution")
@@ -132,9 +136,9 @@ impl Qwen3xDFlash2Attention {
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.context_appender.record(
+        self.kv_cache_writer.record(
             recorder,
-            BlockSpecGQAContextInput {
+            BiDiBlockGQAKVCacheWriteInput {
                 num_total_tokens,
                 num_active_tokens,
                 page_table_layout: self.request_page_table().layout(),
@@ -147,26 +151,26 @@ impl Qwen3xDFlash2Attention {
                     page_ids: self.request_page_table().page_ids_buffer(),
                 },
                 weights: self.weights().as_borrowed(),
-                scratch: self.context_scratch().bindings(),
+                scratch: self.kv_cache_write_scratch().bindings(),
             },
         );
     }
 
-    pub fn record_block<'a, R>(
+    pub fn record_bidi_block<'a, R>(
         &'a self,
         recorder: &mut R,
         num_active_tokens: inference_backend_metal::metal::ReplayU32,
-        metadata: &'a BlockSpecGQAMetadataBuffers,
+        metadata: &'a BiDiBlockGQAMetadataBuffers,
         hidden_input: &'a Buffer,
         hidden_output: &'a Buffer,
         pages: &'a Buffer,
     ) where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        let _ = <BlockSpecGQA as ReplayLayer>::record(
+        let _ = <BiDiBlockGQA as ReplayLayer>::record(
             &self.backend,
             recorder,
-            BlockSpecGQAInput {
+            BiDiBlockGQAInput {
                 page_table_layout: self.request_page_table().layout(),
                 gqa_layer_index: self.dflash2_layer_index,
                 metadata,
@@ -177,20 +181,20 @@ impl Qwen3xDFlash2Attention {
                     page_ids: self.request_page_table().page_ids_buffer(),
                 },
                 weights: self.weights().as_borrowed(),
-                scratch: self.block_scratch().bindings(),
+                scratch: self.bidi_block_scratch().bindings(),
                 num_active_tokens,
             },
         );
     }
 
-    fn block_scratch(&self) -> &BlockSpecScratch {
-        self.block_scratch
+    fn bidi_block_scratch(&self) -> &BiDiBlockGQAScratch {
+        self.bidi_block_scratch
             .as_deref()
             .expect("Qwen3.x DFlash2 block scratch must be loaded before execution")
     }
 
-    fn context_scratch(&self) -> &BlockSpecGQAContextScratch {
-        self.context_scratch
+    fn kv_cache_write_scratch(&self) -> &BiDiBlockGQAKVCacheWriteScratch {
+        self.kv_cache_write_scratch
             .as_deref()
             .expect("Qwen3.x DFlash2 context scratch must be loaded before execution")
     }
@@ -209,7 +213,7 @@ pub fn derive_qwen3x_dflash2_gqa_configs(
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
     scale_bias_dtype: Dtype,
-) -> Result<(BlockSpecGQACore, BlockSpecGQAMetalConfig), ModelExecutorError> {
+) -> Result<(BiDiBlockGQACore, BiDiBlockGQAMetalConfig), ModelExecutorError> {
     let core = qwen3x_dflash2_gqa_core(config, num_spec_tokens, dflash2_layer_index);
     let metal = qwen3x_dflash2_gqa_metal_config(config, bindings, page_bytes, scale_bias_dtype)?;
     Ok((core, metal))
@@ -219,7 +223,7 @@ pub fn qwen3x_dflash2_gqa_core(
     config: &Qwen3xDFlash2Config,
     num_spec_tokens: usize,
     dflash2_layer_index: usize,
-) -> BlockSpecGQACore {
+) -> BiDiBlockGQACore {
     assert!(
         num_spec_tokens > 0,
         "Qwen3x DFlash2 attention requires speculative tokens"
@@ -243,7 +247,7 @@ pub fn qwen3x_dflash2_gqa_core(
         (config.head_dim as f32).sqrt().recip(),
     );
     attention.validate();
-    BlockSpecGQACore::new(attention, num_query_rows)
+    BiDiBlockGQACore::new(attention, num_query_rows)
 }
 
 pub fn qwen3x_dflash2_gqa_sdpa_config(
@@ -279,7 +283,7 @@ fn qwen3x_dflash2_gqa_metal_config(
     bindings: &Qwen3xGQAWeightBindings,
     page_bytes: usize,
     scale_bias_dtype: Dtype,
-) -> Result<BlockSpecGQAMetalConfig, ModelExecutorError> {
+) -> Result<BiDiBlockGQAMetalConfig, ModelExecutorError> {
     let quantization = config
         .quantization
         .as_ref()
@@ -298,7 +302,7 @@ fn qwen3x_dflash2_gqa_metal_config(
             scale_bias_dtype,
         })
     };
-    let metal = BlockSpecGQAMetalConfig {
+    let metal = BiDiBlockGQAMetalConfig {
         q: affine_layout(&bindings.q.weight)?,
         k: affine_layout(&bindings.k.weight)?,
         v: affine_layout(&bindings.v.weight)?,

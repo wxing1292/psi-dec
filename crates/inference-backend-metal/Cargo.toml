@@ -52,8 +52,8 @@ path = "benches/gqa/split_kv.rs"
 harness = false
 
 [[bench]]
-name = "gqa_block_attn"
-path = "benches/gqa/block_attn.rs"
+name = "gqa_bidi_block_sdpa"
+path = "benches/gqa/bidi_block_sdpa.rs"
 harness = false
 
 [[bench]]

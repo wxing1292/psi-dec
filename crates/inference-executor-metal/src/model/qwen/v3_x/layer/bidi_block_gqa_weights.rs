@@ -7,8 +7,8 @@ use inference_executor_core::checkpoint::TensorMap;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xGQAWeightBindings;
 
-use crate::attn::block_spec::backend::BlockSpecGQAMetalConfig;
-use crate::attn::block_spec::backend::BlockSpecGQAWeights;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQAMetalConfig;
+use crate::attn::bidi_block_gqa::backend::BiDiBlockGQAWeights;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::quantized_affine::QuantizedAffineWeights;
@@ -18,7 +18,7 @@ use crate::model::qwen::v3_x::weight::remove_quant_weight;
 use crate::model::qwen::v3_x::weight::remove_typed_tensor;
 use crate::model::qwen::v3_x::weight::validate_len;
 
-pub struct Qwen3xBlockSpecGQAWeightBuffers {
+pub struct Qwen3xBiDiBlockGQAWeightBuffers {
     qkv_weight: Buffer,
     qkv_scales: Buffer,
     qkv_biases: Buffer,
@@ -45,19 +45,19 @@ struct AffineBytes {
     biases: Vec<u8>,
 }
 
-impl Qwen3xBlockSpecGQAWeightBuffers {
+impl Qwen3xBiDiBlockGQAWeightBuffers {
     pub fn load(
         device: &Device,
         store: &mut SafeTensorStore,
         bindings: &Qwen3xGQAWeightBindings,
         core: &UngatedGQACore,
-        metal: BlockSpecGQAMetalConfig,
+        metal: BiDiBlockGQAMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
         let mut tensor_names = Vec::new();
         bindings.push_tensor_names(&mut tensor_names);
         let mut tensors = store.load_tensors(tensor_names)?;
         let weights = Self::from_tensors(device, &mut tensors, bindings, core, metal)?;
-        assert!(tensors.is_empty(), "block-spec GQA must consume its tensor map");
+        assert!(tensors.is_empty(), "BiDiBlockGQA must consume its tensor map");
         Ok(weights)
     }
 
@@ -66,7 +66,7 @@ impl Qwen3xBlockSpecGQAWeightBuffers {
         tensors: &mut TensorMap,
         bindings: &Qwen3xGQAWeightBindings,
         core: &UngatedGQACore,
-        metal: BlockSpecGQAMetalConfig,
+        metal: BiDiBlockGQAMetalConfig,
     ) -> Result<Self, ModelExecutorError> {
         core.validate();
         metal.validate();
@@ -88,17 +88,17 @@ impl Qwen3xBlockSpecGQAWeightBuffers {
                 .weight
                 .len()
                 .checked_add(k.weight.len())
-                .expect("block-spec GQA V weight offset must fit usize"),
+                .expect("BiDiBlockGQA V weight offset must fit usize"),
             scales: q
                 .scales
                 .len()
                 .checked_add(k.scales.len())
-                .expect("block-spec GQA V scale offset must fit usize"),
+                .expect("BiDiBlockGQA V scale offset must fit usize"),
             biases: q
                 .biases
                 .len()
                 .checked_add(k.biases.len())
-                .expect("block-spec GQA V bias offset must fit usize"),
+                .expect("BiDiBlockGQA V bias offset must fit usize"),
         };
         let qkv_weight = concat_bytes(&[&q.weight, &k.weight, &v.weight]);
         let qkv_scales = concat_bytes(&[&q.scales, &k.scales, &v.scales]);
@@ -132,8 +132,8 @@ impl Qwen3xBlockSpecGQAWeightBuffers {
         })
     }
 
-    pub fn as_borrowed(&self) -> BlockSpecGQAWeights<'_> {
-        BlockSpecGQAWeights {
+    pub fn as_borrowed(&self) -> BiDiBlockGQAWeights<'_> {
+        BiDiBlockGQAWeights {
             q: self.qkv_weights(self.q_offsets),
             k: self.qkv_weights(self.k_offsets),
             v: self.qkv_weights(self.v_offsets),

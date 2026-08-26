@@ -140,7 +140,7 @@ component path as the design.
 ## Performance Investigations
 
 - Compare a complete base-2 GQA softmax family with the current natural-log family.
-  The experiment must migrate SplitKV SingleQ, SplitKV TiledQ, block SDPA, and their reducers as one compatible
+  The experiment must migrate SplitKV SingleQ, SplitKV TiledQ, bidirectional block SDPA, and their reducers as one compatible
   partial-state ABI. It must not mix base-2 and natural-log partial statistics or add a per-partial log-base flag.
   Compare focused Metal component performance and representative one-layer production GQA performance.
   Change the default only if the complete base-2 family preserves parity and gives a measured gain.
@@ -199,7 +199,7 @@ component path as the design.
   Compare the Main GQA, dense MLP, and unembed outputs before changing production kernels.
   Treat exact batch-shape reproducibility as a separate requirement from DSpark rejection correctness.
 - Add a separate gated DSpark GQA implementation when a supported checkpoint requires it.
-  Do not add a runtime gate flag to `BlockSpecGQA`.
+  Do not add a runtime gate flag to `BiDiBlockGQA`.
   Keep the history map, block map, reducer, page layout, and scratch contracts gate-neutral.
 - Add Qwen3 DSpark checkpoint variants only from real checkpoint contracts.
   This work can include a final-layer entry in the official `target_layer_ids` field, additional Markov heads, or a

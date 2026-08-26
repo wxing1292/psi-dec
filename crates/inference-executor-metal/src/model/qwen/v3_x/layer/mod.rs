@@ -13,5 +13,5 @@ pub use moe::Qwen3xMoE;
 mod ungated_gqa_weights;
 pub use ungated_gqa_weights::Qwen3xUngatedGQAWeightBuffers;
 
-mod block_spec_gqa_weights;
-pub use block_spec_gqa_weights::Qwen3xBlockSpecGQAWeightBuffers;
+mod bidi_block_gqa_weights;
+pub use bidi_block_gqa_weights::Qwen3xBiDiBlockGQAWeightBuffers;

@@ -10,7 +10,7 @@ use crate::metal::ReplayU32;
 use crate::metal::Stream;
 
 const NUM_ACTIVE_Q_TOKEN_RANGES: ReplayParameterKey =
-    ReplayParameterKey::new("test.gqa_block_sdpa.num_active_q_token_ranges");
+    ReplayParameterKey::new("test.gqa_bidi_block_sdpa.num_active_q_token_ranges");
 
 #[test]
 #[should_panic(expected = "complete request blocks")]

@@ -206,7 +206,7 @@ Qwen35SpeculativeResources
 
 Qwen3xDSparkExecution
   prefill: Replay<Qwen3xDSparkPrefill>
-  gqa_state: BlockSpecGQAState
+  gqa_state: BiDiBlockGQAState
   embed: Replay<Qwen3xDSparkEmbed>
   body: Replay<Qwen3xDSparkBody>
   gather_unembed: Replay<Qwen3xDSparkGatherUnembed>
@@ -217,7 +217,7 @@ Qwen3xDSparkExecution
 
 Qwen3xDFlash2Execution
   prefill: Replay<Qwen3xDFlash2Prefill>
-  gqa_state: BlockSpecGQAState
+  gqa_state: BiDiBlockGQAState
   embed: Replay<Qwen3xDFlash2Embed>
   body: Replay<Qwen3xDFlash2Body>
   output: Replay<Qwen3xDFlash2Output>
@@ -255,7 +255,7 @@ Qwen3xDFlash2DecodeRecording
 Vanilla executes Main embedding, Main, output projection, and target sampling.
 MTP adds its separate embedding, reusable physical body layer, and draft sampling owner.
 DSpark and DFlash2 remain peer model roles with independent Prefill and Decode recordings.
-They share only compatible lower-level block-spec GQA components.
+They share only compatible lower-level BiDiBlockGQA components.
 
 [`dspark_design.md`](dspark_design.md) defines DSpark fixed-block attention, Markov sampling, state, and lifecycle.
 [`dflash2_design.md`](dflash2_design.md) defines DFlash2 persistent history, sliding attention, dynamic convolution,
@@ -424,7 +424,7 @@ Qwen3 follows the same ownership order with separate Vanilla and DSpark graphs.
 It parses its flat Main configuration and resolves its Main binding tree.
 When configured, it parses the DSpark configuration and passes it to the shared DSpark loader.
 It constructs one QKV GQA state domain and dense scratch.
-It constructs a second ungated GQA state domain and `BlockSpecScratch` when DSpark is enabled.
+It constructs a second ungated GQA state domain and `BiDiBlockGQAScratch` when DSpark is enabled.
 It loads Main and Main output for both modes.
 The DSpark mode also loads the shared DSpark execution owner and rejection resources.
 
@@ -905,7 +905,7 @@ The MTP, DSpark, and DFlash2 branches are mutually exclusive.
 It accepts only complete Qwen3 Main page-ID blocks. It does not interpret runtime cache lanes.
 Qwen3 has zero state pages.
 It does not construct, restore, publish, commit, or reset a GDN state table.
-`BlockSpecGQAState` owns a separate DSpark or DFlash2 page table, metadata buffers, backend, and block scratch.
+`BiDiBlockGQAState` owns a separate DSpark or DFlash2 page table, metadata buffers, backend, and block scratch.
 In a fixed-block Spec mode, runtime cache lane 0 stores `[Main page IDs | Spec page IDs]` for each logical block.
 `prepare_batch` validates the exact combined length and splits this list once.
 It sends each complete role-local list to the applicable state owner.
@@ -1020,7 +1020,7 @@ Main verification distributions use compact active-row identity because they exi
 
 Main K/V and persistent DSpark context K/V share one runtime cache-block lifecycle.
 The executor owns separate page tables and splits each runtime page span.
-Proposal-local Q/K/V and attention partials remain in executor-owned `BlockSpecScratch`.
+Proposal-local Q/K/V and attention partials remain in executor-owned `BiDiBlockGQAScratch`.
 
 Qwen3.5 GDN keeps one current state and `num_spec_tokens + 1` decision candidates for each DSpark request slot.
 For DSpark, `num_spec_tokens` is the checkpoint `block_size`.

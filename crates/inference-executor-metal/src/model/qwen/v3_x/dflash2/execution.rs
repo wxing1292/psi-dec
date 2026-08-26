@@ -7,7 +7,7 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
-use inference_executor_core::attn::BlockSpecMetadata;
+use inference_executor_core::attn::BiDiBlockGQAMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
@@ -17,7 +17,7 @@ use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SpecPrefillSelection;
 use inference_runtime_core::runtime::RawRequestSlot;
 
-use crate::attn::block_spec::state::BlockSpecGQAState;
+use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
@@ -48,7 +48,7 @@ mod file_io;
 
 pub struct Qwen3xDFlash2Execution {
     prefill: Replay<Qwen3xDFlash2Prefill>,
-    gqa_state: BlockSpecGQAState,
+    gqa_state: BiDiBlockGQAState,
     embed: Replay<Qwen3xDFlash2Embed>,
     body: Replay<Qwen3xDFlash2Body>,
     output: Replay<Qwen3xDFlash2Output>,
@@ -310,13 +310,13 @@ impl Qwen3xDFlash2Execution {
         let query_block_size = self.num_spec_tokens + 1;
         let (flat_query_token_indices, visible_history_token_ranges) =
             dflash2_query_layout(proposal.anchor_positions, query_block_size, self.sliding_window);
-        let block = BlockSpecMetadata::new(
+        let block = BiDiBlockGQAMetadata::new(
             &proposal.req_slots,
             &flat_query_token_indices,
             &visible_history_token_ranges,
             query_block_size,
         );
-        self.gqa_state.prepare_block(&block);
+        self.gqa_state.prepare_bidi_block(&block);
         let mut block_token_ids = Vec::with_capacity(block.num_tokens());
         for &anchor_token_id in proposal.anchor_token_ids {
             block_token_ids.push(i32::try_from(anchor_token_id).expect("Qwen3x DFlash2 anchor token ID must fit i32"));

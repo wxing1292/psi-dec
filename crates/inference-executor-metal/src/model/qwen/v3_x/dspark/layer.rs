@@ -11,8 +11,8 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkLayerWeightBindings;
 use inference_executor_core::model::qwen::v3_x::weight_layout::Qwen3xDenseMLPWeightBindings;
 
-use crate::attn::block_spec::metadata::BlockSpecGQAMetadataBuffers;
-use crate::attn::block_spec::state::BlockSpecGQAState;
+use crate::attn::bidi_block_gqa::metadata::BiDiBlockGQAMetadataBuffers;
+use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::quantized_affine::QuantizedAffineLayout;
 use crate::def::replay_op::ReplayOp;
@@ -48,7 +48,7 @@ pub struct Qwen3xDSparkLayerScratch {
 #[derive(Clone, Copy)]
 pub struct Qwen3xDSparkLayerInput<'a> {
     pub num_tokens: u32,
-    pub metadata: &'a BlockSpecGQAMetadataBuffers,
+    pub metadata: &'a BiDiBlockGQAMetadataBuffers,
     pub pages: &'a Buffer,
     pub residual_input: &'a Buffer,
     pub residual_output: &'a Buffer,
@@ -63,7 +63,7 @@ impl Qwen3xDSparkLayer {
         dspark_layer_index: usize,
         page_bytes: usize,
         bindings: &Qwen3xDSparkLayerWeightBindings,
-        gqa_state: &BlockSpecGQAState,
+        gqa_state: &BiDiBlockGQAState,
         scratch: Rc<Qwen3xDSparkLayerScratch>,
         dense_scratch: Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
@@ -150,7 +150,7 @@ impl Qwen3xDSparkLayer {
         self.attention.unload_state();
     }
 
-    pub fn load_state(&mut self, state: &BlockSpecGQAState) {
+    pub fn load_state(&mut self, state: &BiDiBlockGQAState) {
         self.attention.load_state(state);
     }
 
@@ -182,7 +182,7 @@ impl Qwen3xDSparkLayer {
         );
     }
 
-    pub fn record_block<'a, R>(
+    pub fn record_bidi_block<'a, R>(
         &'a self,
         recorder: &mut R,
         num_total_tokens: u32,
@@ -199,7 +199,7 @@ impl Qwen3xDSparkLayer {
             input.residual_input,
             &self.scratch.normalized_hidden,
         );
-        self.attention.record_block(
+        self.attention.record_bidi_block(
             recorder,
             num_active_tokens,
             input.metadata,

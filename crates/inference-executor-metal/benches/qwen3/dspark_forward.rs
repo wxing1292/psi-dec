@@ -11,8 +11,8 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
 use inference_backend_metal::metal::ReplayProgram;
-use inference_executor_core::attn::BlockSpecCapacity;
-use inference_executor_core::attn::BlockSpecMetadata;
+use inference_executor_core::attn::BiDiBlockCapacity;
+use inference_executor_core::attn::BiDiBlockGQAMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::checkpoint::SafeTensorStore;
 use inference_executor_core::model::ReplayableModel;
@@ -24,7 +24,7 @@ use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
-use inference_executor_metal::attn::block_spec::state::BlockSpecGQAState;
+use inference_executor_metal::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::model::embedding::Embed;
 use inference_executor_metal::model::embedding::EmbedConfig;
@@ -376,7 +376,7 @@ struct DSparkFixture {
     _embed: Qwen3xDSparkEmbed,
     _body: Qwen3xDSparkBody,
     _model: Rc<Qwen3xDSparkModel>,
-    _gqa_state: BlockSpecGQAState,
+    _gqa_state: BiDiBlockGQAState,
     _token_ids: Buffer,
     hidden_input: Buffer,
     _pages: PageArena,
@@ -395,7 +395,7 @@ impl DSparkFixture {
         let attention_split_kv_config = qwen3x_dspark_gqa_sdpa_config(&config, QWEN3_PAGE_SIZE_BYTES)
             .expect("unable to build Qwen3 DSpark GQA SplitKV config");
         let num_layers = config.num_hidden_layers;
-        let capacity = BlockSpecCapacity::new(num_requests, config.block_size);
+        let capacity = BiDiBlockCapacity::new(num_requests, config.block_size);
         let tokens_per_page = attention_split_kv_config.tokens_per_page as usize;
         let num_page_ids_per_block = pages_per_cache_block(tokens_per_page);
         let page_table_layout = GQAPageTableLayout {
@@ -414,7 +414,7 @@ impl DSparkFixture {
             .checked_mul(num_layers)
             .and_then(|pages| pages.checked_mul(num_page_ids_per_block))
             .expect("DSpark comparison page count must fit usize");
-        let gqa_state = BlockSpecGQAState::new(
+        let gqa_state = BiDiBlockGQAState::new(
             device,
             attention_core,
             attention_split_kv_config,
@@ -426,13 +426,13 @@ impl DSparkFixture {
         let flat_query_token_indices = (0..num_requests)
             .flat_map(|_| context..context + config.block_size as u32)
             .collect::<Vec<_>>();
-        let block = BlockSpecMetadata::new(
+        let block = BiDiBlockGQAMetadata::new(
             &request_slots(num_requests),
             &flat_query_token_indices,
             &vec![0..context; num_requests * config.block_size],
             config.block_size,
         );
-        gqa_state.prepare_block(&block);
+        gqa_state.prepare_bidi_block(&block);
         let request_page_table = gqa_state.request_page_table();
         for req_slot in 0..num_requests {
             for layer_index in 0..num_layers {

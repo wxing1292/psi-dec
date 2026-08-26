@@ -43,7 +43,7 @@ inference-executor-metal
 Backend Criterion targets:
 
 ```text
-dense_mlp  sparse_mlp  moe  gqa_split_kv  gqa_block_attn  gdn_attn  gdn_state_io
+dense_mlp  sparse_mlp  moe  gqa_split_kv  gqa_bidi_block_sdpa  gdn_attn  gdn_state_io
 embedding  unembedding  norm  buffer_io
 ```
 
@@ -112,7 +112,7 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 - `qwen3_gqa` exposes static SplitKV tile geometry as CLI arguments. It can validate SingleQ output against TiledQ
   output.
   Its projection probes compare QMV, QMM BM8/BN32, and QMM BM16/BN32. These forced paths are benchmark-only.
-- `gqa_block_attn` measures the model-independent dense block-bidirectional SDPA map component.
+- `gqa_bidi_block_sdpa` measures the model-independent bidirectional local-block SDPA map component.
   It accepts block size, request count, head geometry, partial-state Q width, and dtype as CLI arguments.
   The default `max_q_tokens = 8` matches the current production TiledQ partial-state layout.
   The backend owns its one-SIMDgroup threadblock geometry.
@@ -243,7 +243,7 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 Representative smoke commands:
 
 ```text
-cargo bench --bench gqa_block_attn -- \
+cargo bench --bench gqa_bidi_block_sdpa -- \
   --block-sizes 7 --num-requests 1 \
   --max-q-tokens 8 \
   --iters 1 --warmup-iters 0 --runs 1

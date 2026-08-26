@@ -1,3 +1,3 @@
-pub mod block_spec;
+pub mod bidi_block_gqa;
 pub mod gdn;
 pub mod gqa;

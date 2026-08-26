@@ -2,13 +2,13 @@
 using namespace metal;
 typedef bfloat bfloat16_t;
 
-// One BlockSDPAThreadBlockTask maps 1:1 to one threadblock. The grid supplies
+// One BiDiBlockSDPAThreadBlockTask maps 1:1 to one threadblock. The grid supplies
 // q_head_index, q_token_range_index, and q_token_offset through x, y, and z.
 // q_token_ranges derives q_token_index. block_size derives the local K/V block.
 // cu_sdpa_partial_outputs derives the selected block partial-output slot.
 
 template <typename T>
-void gqa_block_sdpa_impl(
+void gqa_bidi_block_sdpa_impl(
     device const T* q,
     device const T* local_k,
     device const T* local_v,
@@ -87,7 +87,7 @@ void gqa_block_sdpa_impl(
     }
 }
 
-kernel void gqa_block_sdpa_f32(
+kernel void gqa_bidi_block_sdpa_f32(
     device const float* q [[buffer(0)]],
     device const float* local_k [[buffer(1)]],
     device const float* local_v [[buffer(2)]],
@@ -101,12 +101,12 @@ kernel void gqa_block_sdpa_f32(
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     threadgroup float logits[block_size];
-    gqa_block_sdpa_impl<float>(
+    gqa_bidi_block_sdpa_impl<float>(
         q, local_k, local_v, q_token_ranges, cu_sdpa_partial_outputs, partial_exp_sums, partial_max_logits,
         partial_output, num_active_q_token_ranges, logits, group_index, simd_lane);
 }
 
-kernel void gqa_block_sdpa_bf16(
+kernel void gqa_bidi_block_sdpa_bf16(
     device const bfloat16_t* q [[buffer(0)]],
     device const bfloat16_t* local_k [[buffer(1)]],
     device const bfloat16_t* local_v [[buffer(2)]],
@@ -120,7 +120,7 @@ kernel void gqa_block_sdpa_bf16(
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     threadgroup float logits[block_size];
-    gqa_block_sdpa_impl<bfloat16_t>(
+    gqa_bidi_block_sdpa_impl<bfloat16_t>(
         q, local_k, local_v, q_token_ranges, cu_sdpa_partial_outputs, partial_exp_sums, partial_max_logits,
         partial_output, num_active_q_token_ranges, logits, group_index, simd_lane);
 }

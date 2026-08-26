@@ -335,7 +335,7 @@ The current implementation uses these contracts:
 - Partial-state scratch allocation and layout.
 - Page-table layout and KV-cache ownership.
 - Map-before-Reduce dependency.
-- SingleQ, TiledQ, block SDPA, and their reducers share one natural-log partial-state ABI.
+- SingleQ, TiledQ, bidirectional block SDPA, and their reducers share one natural-log partial-state ABI.
 
 Replay padding can change the recorded Map grid. Therefore, the selector includes the selected replay capacity when it
 materializes and compares candidates.

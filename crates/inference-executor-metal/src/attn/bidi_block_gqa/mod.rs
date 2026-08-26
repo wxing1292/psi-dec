@@ -1,8 +1,8 @@
-//! Shared low-level execution for speculative query blocks.
+//! Paged-history GQA with a bidirectional local query block.
 
 pub mod backend;
 pub mod capacity;
-pub mod context;
+pub mod kv_cache_write;
 pub mod metadata;
 pub mod scratch;
 mod sdpa;

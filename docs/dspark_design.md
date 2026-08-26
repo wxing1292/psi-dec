@@ -150,7 +150,7 @@ Main writes selected residuals directly into assigned capture columns.
 The proposal block has one anchor and `N - 1` MASK rows.
 All `N` rows produce proposals in one transformer forward.
 
-Each layer reduces SplitKV history partials with bidirectional block-SDPA partials.
+Each layer reduces SplitKV history partials with bidirectional local-block SDPA partials.
 
 For anchor position `p`, each local row reads history range `[0, p)` and attends to all `N` local rows.
 Proposal-local K/V is temporary.
