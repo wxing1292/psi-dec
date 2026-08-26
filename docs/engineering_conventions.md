@@ -310,23 +310,32 @@ semantic branch.
 
 ### Validation and arithmetic
 
-Validate external inputs and maximum capacities at the owner boundary. Use ordinary arithmetic in the same owner's
-private path when this validation proves the result at each later use site. Do not repeat the same checked operation at
-each use site.
+Constructors and initialization paths must validate static configuration, topology, capacity, and layout. Explicit
+input validation must validate dynamic external, batch, and runtime inputs. These boundaries establish the trusted
+domain. Within that domain, private paths must use ordinary arithmetic and direct lossless casts. They must not repeat
+shape or range assertions that an owning boundary already proved.
+
+Each checked addition, subtraction, multiplication, or conversion must identify one named real boundary through its
+owner API, value name, or failure message. Allowed boundaries are allocation or byte sizing, external or runtime counts
+and indices, narrowing, shader counts and element indices, file or snapshot data, state versions, and real overflow.
+
+Outside a constructor, initialization path, or explicit input validator, an assertion must protect either a complex
+state or resource transition, or a non-local boundary that no existing owner has proved. For the latter case, add a
+concise adjacent justification that names the boundary. Do not add defensive assertions to a trusted private path.
 
 Keep checked arithmetic at these boundaries:
 
-- Allocation and buffer sizing
-- Runtime-supplied counts, indices, IDs, and capacities
-- File and snapshot offsets or lengths
+- Allocation and byte sizing
+- External or runtime counts, indices, IDs, and capacities
 - Narrowing or target-width-dependent conversions
 - Shader count and element-index domains
-- Real overflow boundaries
+- File and snapshot offsets or lengths
 - State-version conversion and shift semantics
+- Real overflow boundaries
 
 Use direct casts for conversions that are lossless on all supported targets. For example, Apple Metal code can use
-`u32 as u64` and `usize as u64`. Do not remove a checked operation only because a different owner validated a related
-value. Use `debug_assert!` for a repeated private bound after an initialization or prepare boundary proves it.
+`u32 as u64` and `usize as u64`. Do not mechanically remove checked arithmetic. Keep it when the operation still owns
+one of the listed boundaries. Do not keep it after the same owner already proved the complete domain.
 
 ## Replay and asynchronous resource safety
 

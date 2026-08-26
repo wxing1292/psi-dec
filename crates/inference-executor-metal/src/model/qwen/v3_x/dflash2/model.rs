@@ -20,7 +20,6 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
 use crate::def::replay_op::ReplayRecorder;
 use crate::mlp::dense::scratch::DenseMLPScratch;
-use crate::model::main_residual_capture::MainResidualRows;
 use crate::model::qwen::v3_x::dflash2::layer::Qwen3xDFlash2Layer;
 use crate::model::qwen::v3_x::dflash2::layer::Qwen3xDFlash2LayerInput;
 use crate::model::qwen::v3_x::dflash2::layer::Qwen3xDFlash2LayerScratch;
@@ -53,7 +52,6 @@ pub struct Qwen3xDFlash2Body {
 #[derive(Clone, Copy)]
 pub struct Qwen3xDFlash2PrefillArgs<'a> {
     pub num_tokens: u32,
-    pub main_rows: MainResidualRows<'a>,
     pub req_slots: &'a Buffer,
     pub flat_token_indices: &'a Buffer,
     pub pages: &'a Buffer,
@@ -71,7 +69,6 @@ pub struct Qwen3xDFlash2BodyArgs<'a> {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Qwen3xDFlash2PrefillReplayKey {
     num_total_tokens: u32,
-    gathers_main_residual_rows: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -234,7 +231,7 @@ impl Qwen3xDFlash2Model {
             .main_feature_projector
             .as_ref()
             .expect("DFlash2 Main-feature projector shell must exist")
-            .record(recorder, num_total_tokens, num_active_tokens, args.main_rows);
+            .record(recorder, num_total_tokens, num_active_tokens);
         for layer in &self.layers {
             layer.record_prefill(
                 recorder,
@@ -312,15 +309,10 @@ impl Qwen3xDFlash2Prefill {
             .expect("Qwen3.x DFlash2 Prefill model state must be loaded before execution")
     }
 
-    pub fn prepare_replay(
-        &self,
-        num_active_tokens: u32,
-        gathers_main_residual_rows: bool,
-    ) -> (Qwen3xDFlash2PrefillReplayKey, ReplayArguments) {
+    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen3xDFlash2PrefillReplayKey, ReplayArguments) {
         assert!(num_active_tokens > 0, "Qwen3.x DFlash2 Prefill requires active tokens");
         let key = Qwen3xDFlash2PrefillReplayKey {
             num_total_tokens: num_active_tokens,
-            gathers_main_residual_rows,
         };
         let arguments = ReplayArguments::new().with_u32(DFLASH2_PREFILL_NUM_ACTIVE_TOKENS, num_active_tokens);
         (key, arguments)
@@ -334,7 +326,6 @@ impl ReplayComponent for Qwen3xDFlash2Prefill {
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         Qwen3xDFlash2PrefillReplayKey {
             num_total_tokens: input.num_tokens,
-            gathers_main_residual_rows: input.main_rows.gathers(),
         }
     }
 

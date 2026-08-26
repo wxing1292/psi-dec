@@ -1,11 +1,11 @@
 //! Qwen3x DSpark Spec Prefill and Decode execution.
 //!
 //! `Qwen3xDSparkExecution` owns two independent recordings. Prefill creates persistent history K/V. Decode consumes
-//! that history and creates one proposal block. When both recordings exist, the execution owner submits Prefill first,
-//! inserts a dispatch barrier, and then submits the Decode replay sequence.
+//! that history and creates one proposal block. When both recordings exist, the execution owner submits Spec Decode
+//! prepare first, then Prefill, and then the remaining Spec Decode replay sequence.
 //!
 //! ```text
-//! Main selected residual capture                         Main decision
+//! Residual capture from selected Main layers             Main decision
 //! [Tmain, Lselected * H]                                 {sampled anchor}
 //!             |                                                   |
 //!             v                                                   v
@@ -38,9 +38,9 @@
 //!                                                      +---------------------------------------------+
 //! ```
 //!
-//! Main writes selected residuals directly into the capture column layout. Prefill does not run the anchor or MASK
-//! rows. Decode owns the complete body and proposal output composition. Its local Q/K/V and attention partials are
-//! ephemeral.
+//! Each selected Main layer writes every Main row directly into its capture columns. Prefill consumes this complete
+//! row prefix. Decode owns the complete body and proposal output composition. Its local Q/K/V and attention partials
+//! are ephemeral.
 
 pub mod attention;
 pub mod embed;

@@ -78,7 +78,6 @@ use inference_executor_core::sampling::RequestSamplingState;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
-use inference_executor_core::sampling::build_spec_prefill_selection;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
@@ -113,11 +112,9 @@ use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbedReplayKey;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2DecodeRecording;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2Execution;
 use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2PrefillRecording;
-use crate::model::qwen::v3_x::dflash2::execution::Qwen3xDFlash2ProposalInput;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkDecodeRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkPrefillRecording;
-use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
 use crate::model::qwen::v3_x::state::Qwen3xGDNState;
 use crate::model::qwen::v3_x::state::Qwen3xGQAState;
 use crate::model::state_snapshot::FullStateIO;
@@ -647,6 +644,94 @@ pub struct Qwen35Executor {
 }
 
 impl Qwen35Executor {
+    fn record_spec(&mut self, recorder: &mut Qwen35ModelOpsRecorder, microbatch: &Qwen35Microbatch) {
+        let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        let pages = self.pages.buffer();
+        // Spec Prefill consumes every Main row. Main GQA metadata already owns
+        // the expanded per-row request slots and token indices.
+        let spec_prefill = self.main_gqa_state.metadata();
+        let decode_req_indices = recorder
+            .rejection_prepared
+            .as_ref()
+            .map_or(&[][..], |prepared| prepared.decode_req_indices.as_slice());
+
+        let mut req_slots = Vec::with_capacity(decode_req_indices.len());
+        let mut anchor_indices = Vec::with_capacity(decode_req_indices.len());
+        let mut num_spec_tokens_by_request = Vec::with_capacity(decode_req_indices.len());
+        let mut sampler_configs = Vec::with_capacity(decode_req_indices.len());
+        for &req_index in decode_req_indices {
+            let num_spec_tokens = microbatch.num_spec_tokens(req_index);
+            let anchor_index =
+                microbatch.token_indices()[req_index] + microbatch.num_total_tokens(req_index) - num_spec_tokens;
+            req_slots.push(microbatch.req_slots()[req_index]);
+            anchor_indices.push(anchor_index);
+            num_spec_tokens_by_request.push(num_spec_tokens);
+            sampler_configs.push(microbatch.sampler_configs()[req_index]);
+        }
+
+        let token_ids = &self.token_ids;
+        match &mut self.speculator {
+            Qwen35Speculator::DSpark(dspark) => {
+                assert!(recorder.dspark_spec_prefill.is_none() && recorder.dspark_spec_decode.is_none());
+                recorder.dspark_spec_prefill =
+                    Some(dspark.execution.record_spec_prefill(&runtime, spec_prefill, pages));
+                if recorder.rejection_prepared.is_none() {
+                    return;
+                }
+                let rejection_sampling = dspark.common.rejection_sampling.component().rejector().output();
+                let (decode_prepare, markov_replay_shape) = dspark.execution.record_decode_prepare(
+                    &runtime,
+                    token_ids,
+                    rejection_sampling,
+                    &req_slots,
+                    &anchor_indices,
+                    &num_spec_tokens_by_request,
+                    &sampler_configs,
+                    &dspark.common.spec_probs,
+                );
+                recorder.dspark_spec_decode = Some(dspark.execution.record_spec_decode(
+                    &runtime,
+                    token_ids,
+                    decode_prepare,
+                    markov_replay_shape,
+                    req_slots,
+                    pages,
+                    &dspark.common.spec_probs,
+                ));
+            },
+            Qwen35Speculator::DFlash2(dflash2) => {
+                assert!(recorder.dflash2_spec_prefill.is_none() && recorder.dflash2_spec_decode.is_none());
+                recorder.dflash2_spec_prefill =
+                    Some(dflash2.execution.record_spec_prefill(&runtime, spec_prefill, pages));
+                if recorder.rejection_prepared.is_none() {
+                    return;
+                }
+                let rejection_sampling = dflash2.common.rejection_sampling.component().rejector().output();
+                let (decode_prepare, num_requests) = dflash2.execution.record_decode_prepare(
+                    &runtime,
+                    token_ids,
+                    rejection_sampling,
+                    &req_slots,
+                    &anchor_indices,
+                    &num_spec_tokens_by_request,
+                    &dflash2.common.spec_probs,
+                );
+                recorder.dflash2_spec_decode = Some(dflash2.execution.record_spec_decode(
+                    &runtime,
+                    token_ids,
+                    decode_prepare,
+                    num_requests,
+                    req_slots,
+                    pages,
+                    &dflash2.common.spec_probs,
+                ));
+            },
+            Qwen35Speculator::Vanilla | Qwen35Speculator::MTP(_) => {
+                panic!("qwen3.5 combined Spec recording requires DSpark or DFlash2")
+            },
+        }
+    }
+
     fn state_snapshot_files(&self) -> &'static [StateSnapshotFile] {
         match &self.speculator {
             Qwen35Speculator::Vanilla => VANILLA_STATE_SNAPSHOT_FILES,
@@ -854,10 +939,10 @@ pub struct Qwen35ModelOpsRecorder {
     mtp_sample_req_slots: Vec<u32>,
     mtp_sample_decision_indices: Vec<usize>,
     mtp_build_elapsed: Duration,
-    dspark_prefill: Option<Qwen3xDSparkPrefillRecording>,
-    dspark_decode: Option<Qwen3xDSparkDecodeRecording>,
-    dflash2_prefill: Option<Qwen3xDFlash2PrefillRecording>,
-    dflash2_decode: Option<Qwen3xDFlash2DecodeRecording>,
+    dspark_spec_prefill: Option<Qwen3xDSparkPrefillRecording>,
+    dspark_spec_decode: Option<Qwen3xDSparkDecodeRecording>,
+    dflash2_spec_prefill: Option<Qwen3xDFlash2PrefillRecording>,
+    dflash2_spec_decode: Option<Qwen3xDFlash2DecodeRecording>,
 }
 
 impl Qwen35ModelOpsRecorder {
@@ -1104,10 +1189,10 @@ impl ReplayableModel for Qwen35Executor {
             main_arguments,
             main_embed_cache_hit: false,
             main_cache_hit: false,
-            dspark_prefill: None,
-            dspark_decode: None,
-            dflash2_prefill: None,
-            dflash2_decode: None,
+            dspark_spec_prefill: None,
+            dspark_spec_decode: None,
+            dflash2_spec_prefill: None,
+            dflash2_spec_decode: None,
             main_gather_unembed_key: None,
             main_gather_unembed_arguments: ReplayArguments::new(),
             sampling_key: None,
@@ -1240,10 +1325,16 @@ impl ReplayableModel for Qwen35Executor {
             "qwen3.5 sampling rows must match the recording"
         );
         if num_main_sample_rows == 0 {
+            if self.speculator.is_dspark() || self.speculator.is_dflash2() {
+                self.record_spec(recorder, microbatch);
+            }
             return;
         }
         if self.speculator.is_enabled() {
             self.record_rejection_sampling(recorder, microbatch);
+            if self.speculator.is_dspark() || self.speculator.is_dflash2() {
+                self.record_spec(recorder, microbatch);
+            }
         } else {
             let (sampling_key, sampling_arguments) = self.record_sampling(microbatch);
             recorder.sampling_key = Some(sampling_key);
@@ -1262,20 +1353,39 @@ impl ReplayableModel for Qwen35Executor {
         replay_elapsed: Duration,
     ) -> Self::SampledOutput {
         if recorder.num_main_sample_rows == 0 {
-            let timing = ModelOutputTiming {
-                main_replay_elapsed: replay_elapsed,
-                ..ModelOutputTiming::default()
+            let timing = if self.speculator.is_dspark() || self.speculator.is_dflash2() {
+                ModelOutputTiming {
+                    main_spec_replay_elapsed: replay_elapsed,
+                    ..ModelOutputTiming::default()
+                }
+            } else {
+                ModelOutputTiming {
+                    main_replay_elapsed: replay_elapsed,
+                    ..ModelOutputTiming::default()
+                }
             };
             return Qwen35SampledOutput {
                 decisions: Vec::new(),
                 timing,
             };
         }
-        let (decisions, timing) = if self.speculator.is_enabled() {
+        let (mut decisions, mut timing) = if self.speculator.is_enabled() {
             self.read_rejection_sampling(recorder, model_batch_req.microbatch(), replay_elapsed)
         } else {
             self.read_sampling(recorder.num_main_sample_rows, replay_elapsed)
         };
+        if self.speculator.is_dspark() || self.speculator.is_dflash2() {
+            timing.main_spec_replay_elapsed = timing.main_sample_replay_elapsed;
+            timing.main_sample_replay_elapsed = Duration::ZERO;
+            timing.spec_passes = 1;
+            let read_start = Instant::now();
+            decisions = if self.speculator.is_dspark() {
+                self.read_dspark_proposal(recorder, decisions)
+            } else {
+                self.read_dflash2_proposal(recorder, decisions)
+            };
+            timing.spec_read_elapsed = read_start.elapsed();
+        }
         Qwen35SampledOutput { decisions, timing }
     }
 
@@ -1339,101 +1449,42 @@ impl ReplayableModel for Qwen35Executor {
         self.record_mtp_sampling(recorder);
     }
 
-    fn run_spec_prefill(&self, model_batch_req: &Self::ModelBatchRequest) -> bool {
-        (self.speculator.is_dspark() || self.speculator.is_dflash2()) && model_batch_req.microbatch().total_tokens() > 0
+    fn run_spec_prefill(&self, _model_batch_req: &Self::ModelBatchRequest) -> bool {
+        false
     }
 
     fn prefill_spec(
         &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchRequest,
-        sampled_output: &Self::SampledOutput,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _sampled_output: &Self::SampledOutput,
     ) {
-        let microbatch = model_batch_req.microbatch();
-        let accepted_prefix_lengths = sampled_output
-            .decisions
-            .iter()
-            .map(|decision| decision.validated_tokens.len())
-            .collect::<Vec<_>>();
-        let selection = build_spec_prefill_selection(microbatch, &accepted_prefix_lengths);
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        if self.speculator.is_dspark() {
-            assert!(
-                recorder.dspark_prefill.is_none(),
-                "qwen3.5 DSpark Prefill is already recorded"
-            );
-            recorder.dspark_prefill = Some(self.speculator.dspark_mut().execution.record_prefill(
-                &runtime,
-                &selection,
-                self.pages.buffer(),
-            ));
-        } else {
-            assert!(self.speculator.is_dflash2());
-            assert!(
-                recorder.dflash2_prefill.is_none(),
-                "qwen3.5 DFlash2 Prefill is already recorded"
-            );
-            recorder.dflash2_prefill = Some(self.speculator.dflash2_mut().execution.record_prefill(
-                &runtime,
-                &selection,
-                self.pages.buffer(),
-            ));
-        }
+        panic!("qwen3.5 DSpark/DFlash2 Spec Prefill is recorded with Main")
     }
 
     fn run_spec_decode(
         &self,
         _model_batch_req: &Self::ModelBatchRequest,
-        sampled_output: &Self::SampledOutput,
+        _sampled_output: &Self::SampledOutput,
     ) -> bool {
-        (self.speculator.is_dspark() || self.speculator.is_dflash2()) && !sampled_output.decisions.is_empty()
+        false
     }
 
     fn decode_spec(
         &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchRequest,
-        sampled_output: &Self::SampledOutput,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _sampled_output: &Self::SampledOutput,
     ) {
-        let microbatch = model_batch_req.microbatch();
-        let num_decode_reqs = (0..microbatch.num_reqs())
-            .filter(|&req_index| microbatch.is_decode_req(req_index))
-            .count();
-        assert_eq!(sampled_output.decisions.len(), num_decode_reqs);
-        if self.speculator.is_dspark() {
-            assert!(
-                recorder.dspark_decode.is_none(),
-                "qwen3.5 DSpark Decode is already recorded"
-            );
-            recorder.dspark_decode = Some(self.record_dspark_decode(microbatch, &sampled_output.decisions));
-        } else {
-            assert!(self.speculator.is_dflash2());
-            assert!(
-                recorder.dflash2_decode.is_none(),
-                "qwen3.5 DFlash2 Decode is already recorded"
-            );
-            recorder.dflash2_decode = Some(self.record_dflash2_decode(microbatch, &sampled_output.decisions));
-        }
+        panic!("qwen3.5 DSpark/DFlash2 Spec Decode is recorded with Main")
     }
 
     fn submit_spec(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission {
-        if self.speculator.is_dspark() {
-            let runtime = self.replay_runtime();
-            self.speculator.dspark().execution.submit(
-                &runtime,
-                recorder.dspark_prefill.as_ref(),
-                recorder.dspark_decode.as_ref(),
-            )
-        } else if self.speculator.is_dflash2() {
-            let runtime = self.replay_runtime();
-            self.speculator.dflash2().execution.submit(
-                &runtime,
-                recorder.dflash2_prefill.as_ref(),
-                recorder.dflash2_decode.as_ref(),
-            )
-        } else {
-            self.submit_mtp_recording(recorder)
-        }
+        assert!(
+            self.speculator.is_mtp(),
+            "qwen3.5 DSpark/DFlash2 Spec is submitted with Main"
+        );
+        self.submit_mtp_recording(recorder)
     }
 
     fn read_spec(
@@ -1443,25 +1494,13 @@ impl ReplayableModel for Qwen35Executor {
         mut sampled_output: Self::SampledOutput,
         replay_elapsed: Duration,
     ) -> Self::SampledOutput {
-        if self.speculator.is_dspark() {
-            sampled_output.timing.spec_replay_elapsed += replay_elapsed;
-            sampled_output.timing.spec_passes += 1;
-            let read_start = Instant::now();
-            sampled_output.decisions = self.read_dspark_proposal(recorder, sampled_output.decisions);
-            sampled_output.timing.spec_read_elapsed += read_start.elapsed();
-            sampled_output
-        } else if self.speculator.is_dflash2() {
-            sampled_output.timing.spec_replay_elapsed += replay_elapsed;
-            sampled_output.timing.spec_passes += 1;
-            let read_start = Instant::now();
-            sampled_output.decisions = self.read_dflash2_proposal(recorder, sampled_output.decisions);
-            sampled_output.timing.spec_read_elapsed += read_start.elapsed();
-            sampled_output
-        } else {
-            let timing = self.read_mtp_proposal(recorder, &mut sampled_output.decisions, replay_elapsed);
-            sampled_output.timing.add_assign(timing);
-            sampled_output
-        }
+        assert!(
+            self.speculator.is_mtp(),
+            "qwen3.5 DSpark/DFlash2 Spec is read with Main"
+        );
+        let timing = self.read_mtp_proposal(recorder, &mut sampled_output.decisions, replay_elapsed);
+        sampled_output.timing.add_assign(timing);
+        sampled_output
     }
 
     fn empty_sampled_output(&self) -> Self::SampledOutput {

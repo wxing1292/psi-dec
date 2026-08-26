@@ -25,7 +25,7 @@ struct Qwen3xDFlash2ConvWeights {
 }
 
 pub struct Qwen3xDFlash2Conv {
-    query_block_size: u32,
+    spec_block_size: u32,
     max_requests: u32,
     projection_config: affine_quantized::Config,
     projection: affine_quantized::Matmul,
@@ -45,7 +45,7 @@ impl Qwen3xDFlash2Conv {
         scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
         assert_eq!(num_spec_tokens, config.num_spec_tokens().get());
-        let query_block_size = config.block_size;
+        let spec_block_size = config.block_size;
         let quantization = config
             .quantization
             .as_ref()
@@ -91,13 +91,13 @@ impl Qwen3xDFlash2Conv {
             num_total_query_blocks: max_requests
                 .try_into()
                 .expect("Qwen3x DFlash2 convolution request capacity must fit u32"),
-            query_block_size: query_block_size
+            query_block_size: spec_block_size
                 .try_into()
-                .expect("Qwen3x DFlash2 convolution query block size must fit u32"),
+                .expect("Qwen3x DFlash2 convolution Spec block size must fit u32"),
         };
         shape.validate();
         Ok(Self {
-            query_block_size: shape.query_block_size,
+            spec_block_size: shape.query_block_size,
             max_requests: shape.num_total_query_blocks,
             projection_config,
             projection: affine_quantized::Matmul::new(device, projection_config),
@@ -233,12 +233,12 @@ impl Qwen3xDFlash2Conv {
     }
 
     fn shape_and_weights(&self, num_tokens: u32) -> (dynamic_grouped_conv::Shape, &Qwen3xDFlash2ConvWeights) {
-        assert!(num_tokens > 0 && num_tokens.is_multiple_of(self.query_block_size));
-        let num_requests = num_tokens / self.query_block_size;
+        assert!(num_tokens > 0 && num_tokens.is_multiple_of(self.spec_block_size));
+        let num_requests = num_tokens / self.spec_block_size;
         assert!(num_requests <= self.max_requests);
         let shape = dynamic_grouped_conv::Shape {
             num_total_query_blocks: num_requests,
-            query_block_size: self.query_block_size,
+            query_block_size: self.spec_block_size,
         };
         let weights = self
             .weights

@@ -44,6 +44,7 @@ pub struct Qwen3xDSparkLoaded {
     pub mask_token_id: i32,
     pub page_bytes: usize,
     pub max_main_tokens: usize,
+    pub max_anchor_position: u32,
     pub embed_uses_main: bool,
     pub unembed_uses_main: bool,
 }
@@ -214,6 +215,10 @@ pub fn load_qwen3x_dspark(
             .map_err(|_| ModelExecutorError::custom("Qwen3x DSpark MASK token ID must fit i32"))?,
         page_bytes: load_config.page_size_bytes,
         max_main_tokens: load_config.max_tokens,
+        max_anchor_position: load_config
+            .max_position_embeddings
+            .try_into()
+            .expect("Qwen3x DSpark maximum anchor position must fit u32"),
         embed_uses_main,
         unembed_uses_main,
     })

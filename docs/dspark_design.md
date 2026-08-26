@@ -9,7 +9,8 @@ See [`executor_gqa.md`](executor_gqa.md) for shared GQA and [`executor_sampling.
 Use `Main`, `MTP`, and `DSpark` or `Spec` for roles.
 Checkpoint fields such as `target_layer_ids` retain upstream names.
 
-Main owns token embedding, the transformer, selected residual capture, unembedding, Main sampling, and rejection.
+Main owns token embedding, the transformer, residual capture from selected Main layers, unembedding, Main sampling,
+and rejection.
 The DSpark owner owns its checkpoint, history page table, replay caches, workspaces, Markov head, and confidence head.
 Runtime core owns scheduling, request lifecycle, physical pages, and page IDs.
 
@@ -140,10 +141,14 @@ N = block_size proposal tokens
 ```
 
 Spec Prefill and Spec Decode use independent replay recordings.
-The outer owner may submit either replay or both after Main completes.
-Prefill keeps fixed Main rows and the accepted speculative prefix.
-It excludes the rejected suffix and the new anchor.
-Main writes selected residuals directly into assigned capture columns.
+The Qwen executor records them with Main and submits one ordered sequence.
+Spec Decode prepare follows rejection sampling. Prefill follows Main capture.
+When both exist, the serial sequence emits Spec Decode prepare first, then Prefill, and then the remaining Spec Decode
+work.
+Each selected Main layer writes every Main row directly into its assigned capture columns.
+Spec Prefill persists every captured Main row, including the rejected physical suffix.
+Logical commit exposes only fixed Main rows and the accepted speculative prefix.
+Spec Prefill borrows the active token count, request slots, and flat token indices from the current Main GQA metadata.
 
 ## Proposal block and attention
 
@@ -157,7 +162,7 @@ Proposal-local K/V is temporary.
 
 The template runs once for attention and once for MLP.
 
-The Decode replay key contains padded history TaskTemplate capacity.
+The Spec Decode replay key contains padded history TaskTemplate capacity.
 The active count remains a submission argument, so matching padded capacities reuse one replay.
 
 ## Markov sampling and confidence
@@ -197,17 +202,14 @@ draft_distribution_index = req_slot * N + proposal_position
 ```
 
 The service owns submission and wait boundaries.
-One Spec submission can contain Prefill, Decode, or both:
+DSpark uses one combined Main submission:
 
 ```text
-Main submission
-  Main Embed -> Main -> sampling or rejection
+Main Embed -> Main -> GatherUnembed -> RejectionSampling
+  -> Spec Decode prepare -> DSpark Prefill
+  -> DSpark Embed -> DSpark -> gather/unembed -> Markov sampling
 
-Spec submission
-  [DSpark Prefill]
-    -> [DSpark Embed -> DSpark -> gather/unembed -> Markov sampling]
-
-[] = stage is present only when the batch requires it
+Prefill-only: Main Embed -> Main -> DSpark Prefill
 ```
 
 Persistent state contains the DSpark page table and history K/V pages.
@@ -243,7 +245,7 @@ crates/inference-executor-core/src/bin/qwen3x_spec_quantize/
 
 crates/inference-executor-metal/src/model/qwen/v3_x/dspark/
   execution.rs               Prefill and Decode orchestration
-  main_feature.rs            selected Main residual projection
+  main_feature.rs            all-row projection from selected Main layers
   attention.rs               history-plus-block attention
   layer.rs                   DSpark layer composition
   model.rs                   model and replay owners

@@ -109,6 +109,7 @@ pub struct DSparkConfidenceInput<'a> {
 pub struct DSparkMarkovInput<'a> {
     pub shape: DSparkMarkovReplayShape,
     pub base_logits: &'a Buffer,
+    pub sample_positions: &'a Buffer,
     pub distribution_store: &'a SpecProbsStore,
     pub weights: DSparkMarkovWeights<'a>,
     pub confidence: DSparkConfidenceInput<'a>,
@@ -123,7 +124,6 @@ pub struct DSparkMarkovSampling {
     top_k_reduce: backend_top_k::ReduceCompute,
     anchor_token_ids: Buffer,
     req_slots: Buffer,
-    sample_positions: Buffer,
     partial_token_ids: Buffer,
     partial_logits: Buffer,
     params: Rc<SamplingParamsStore>,
@@ -165,7 +165,6 @@ impl DSparkMarkovSampling {
             top_k_reduce: backend_top_k::ReduceCompute::new(device),
             anchor_token_ids: Buffer::new_zeroed_elements(device, max_requests, Dtype::Int32),
             req_slots: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
-            sample_positions: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
             partial_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
             partial_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
             params,
@@ -174,50 +173,21 @@ impl DSparkMarkovSampling {
         }
     }
 
-    pub fn prepare(
+    pub fn prepare_static(
         &self,
         req_slots: &[u32],
-        anchor_token_ids: &[u32],
-        anchor_positions: &[u32],
         sampler_configs: &[SamplerConfig],
         distribution_store: &SpecProbsStore,
     ) -> DSparkMarkovReplayShape {
         assert!(!req_slots.is_empty(), "DSpark Markov sampling requires requests");
-        assert_eq!(req_slots.len(), anchor_token_ids.len());
-        assert_eq!(req_slots.len(), anchor_positions.len());
         assert_eq!(req_slots.len(), sampler_configs.len());
         assert!(req_slots.len() <= self.max_requests);
-        let max_position_increment =
-            u32::try_from(self.block_size).expect("DSpark proposal count must fit the sampling position domain");
-        assert!(
-            anchor_positions
-                .iter()
-                .all(|&anchor_position| anchor_position <= u32::MAX - max_position_increment),
-            "DSpark proposal sample positions must fit u32"
-        );
-        self.anchor_token_ids.write_typed(
-            0,
-            &anchor_token_ids
-                .iter()
-                .map(|&token_id| {
-                    i32::try_from(token_id).expect("DSpark anchor token ID must fit the model i32 token domain")
-                })
-                .collect::<Vec<_>>(),
-        );
         self.req_slots.write_typed(0, req_slots);
-        self.sample_positions.write_typed(
-            0,
-            &anchor_positions
-                .iter()
-                .map(|&anchor_position| anchor_position + 1)
-                .collect::<Vec<_>>(),
-        );
-
         let active = self.params.active_shape(sampler_configs);
         let sampling =
             active.with_num_total_sampling_inputs(self.bucket_policy.capacity(active.num_active_sampling_inputs));
-        for step_index in 0..self.block_size {
-            self.step_distribution_indices[step_index].write_typed(
+        for (step_index, distribution_indices) in self.step_distribution_indices.iter().enumerate() {
+            distribution_indices.write_typed(
                 0,
                 &req_slots
                     .iter()
@@ -230,6 +200,10 @@ impl DSparkMarkovSampling {
             num_active_requests: req_slots.len() as u32,
             sampling,
         }
+    }
+
+    pub fn anchor_token_ids(&self) -> &Buffer {
+        &self.anchor_token_ids
     }
 
     pub fn record<'a, R>(&'a self, recorder: &mut R, input: DSparkMarkovInput<'a>)
@@ -290,7 +264,7 @@ impl DSparkMarkovSampling {
                         distribution_probs: input.distribution_store.draft_probs(),
                         params: self.params.buffer(),
                         req_slots: &self.req_slots,
-                        sample_positions: &self.sample_positions,
+                        sample_positions: input.sample_positions,
                         sample_position_increment: step_index as u32,
                         sampling_domain: u32::from(inference_executor_core::sampling::SamplingDomain::Draft),
                         output_distribution_indices: &self.step_distribution_indices[step_index],

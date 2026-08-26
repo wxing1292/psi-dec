@@ -175,10 +175,7 @@ impl Qwen3Executor {
         let results = rejector.read_results(num_active_decode_reqs, prepared.num_active_draft_distributions);
         let mut flat_draft_index = 0usize;
         let mut decisions = Vec::with_capacity(num_active_decode_reqs);
-        for (decode_req_index, &req_index) in prepared.decode_req_indices[..num_active_decode_reqs]
-            .iter()
-            .enumerate()
-        {
+        for (decode_req_index, &req_index) in prepared.decode_req_indices.iter().enumerate() {
             let num_accepted_tokens = results.num_accepted_tokens(decode_req_index);
             decisions.push(Qwen3DecodeDecision {
                 validated_tokens: results

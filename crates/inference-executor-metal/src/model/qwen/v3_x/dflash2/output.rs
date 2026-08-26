@@ -53,7 +53,7 @@ struct Qwen3xDFlash2SelectorWeights {
 
 pub struct Qwen3xDFlash2Output {
     num_spec_tokens: u32,
-    query_block_size: u32,
+    spec_block_size: u32,
     max_requests: u32,
     hidden_dim: u32,
     vocab_size: u32,
@@ -83,23 +83,16 @@ pub struct Qwen3xDFlash2Output {
     successor_embeddings: Buffer,
     scores: Buffer,
     req_slots: Buffer,
-    sample_positions: Buffer,
     output_distribution_indices: Buffer,
     proposal_token_ids: Buffer,
     proposal_probs: Buffer,
-}
-
-pub struct Qwen3xDFlash2OutputPrepare<'a> {
-    pub req_slots: &'a [u32],
-    pub anchor_token_ids: &'a [u32],
-    pub anchor_positions: &'a [u32],
-    pub distribution_store: &'a SpecProbsStore,
 }
 
 #[derive(Clone, Copy)]
 pub struct Qwen3xDFlash2OutputArgs<'a> {
     pub num_requests: u32,
     pub hidden: &'a Buffer,
+    pub sample_positions: &'a Buffer,
     pub distribution_store: &'a SpecProbsStore,
 }
 
@@ -128,7 +121,7 @@ impl Qwen3xDFlash2Output {
             "Qwen3x DFlash2 proposal count must match the checkpoint"
         );
         let num_spec_tokens = to_u32("Qwen3x DFlash2 proposal count", num_spec_tokens)?;
-        let query_block_size = to_u32("Qwen3x DFlash2 query block size", config.block_size)?;
+        let spec_block_size = to_u32("Qwen3x DFlash2 Spec block size", config.block_size)?;
         let max_requests = to_u32("Qwen3x DFlash2 request capacity", max_requests)?;
         let hidden_dim = to_u32("Qwen3x DFlash2 hidden dimension", config.hidden_size)?;
         let vocab_size = to_u32("Qwen3x DFlash2 vocabulary", config.vocab_size)?;
@@ -138,11 +131,11 @@ impl Qwen3xDFlash2Output {
             embedding_dtype: Dtype::Bfloat16,
         };
         selector_config.validate();
-        if selector_config.top_k > params.bounds().top_k {
+        let sampler_bounds = params.bounds();
+        if selector_config.top_k > sampler_bounds.top_k {
             return Err(ModelExecutorError::custom(format!(
                 "Qwen3x DFlash2 selector_top_k={} exceeds executor sparse-distribution width {}",
-                selector_config.top_k,
-                params.bounds().top_k
+                selector_config.top_k, sampler_bounds.top_k
             )));
         }
         let num_proposal_rows = max_requests
@@ -213,7 +206,7 @@ impl Qwen3xDFlash2Output {
         let proposal_hidden_elements = num_proposal_rows as usize * hidden_dim as usize;
         Ok(Self {
             num_spec_tokens,
-            query_block_size,
+            spec_block_size,
             max_requests,
             hidden_dim,
             vocab_size,
@@ -247,7 +240,6 @@ impl Qwen3xDFlash2Output {
             successor_embeddings: Buffer::new_zeroed(device, selector_config.embedding_bytes(selector_shape)),
             scores: Buffer::new_zeroed_elements(device, selector_config.score_count(selector_shape), Dtype::Float32),
             req_slots: Buffer::new_zeroed_elements(device, max_requests as usize, Dtype::Uint32),
-            sample_positions: Buffer::new_zeroed_elements(device, max_requests as usize, Dtype::Uint32),
             output_distribution_indices: Buffer::new_zeroed_elements(device, num_proposal_rows as usize, Dtype::Uint32),
             proposal_token_ids: Buffer::new_zeroed_elements(device, num_proposal_rows as usize, Dtype::Int32),
             proposal_probs: Buffer::new_zeroed_elements(device, num_proposal_rows as usize, Dtype::Float32),
@@ -316,27 +308,19 @@ impl Qwen3xDFlash2Output {
         self.unembed = Some(unembed);
     }
 
-    pub fn prepare(&self, input: Qwen3xDFlash2OutputPrepare<'_>) -> u32 {
-        let num_requests = input.req_slots.len();
+    pub fn prepare_static(&self, req_slots: &[u32], distribution_store: &SpecProbsStore) -> u32 {
+        let num_requests = req_slots.len();
         assert!(num_requests > 0 && num_requests <= self.max_requests as usize);
-        assert_eq!(input.anchor_token_ids.len(), num_requests);
-        assert_eq!(input.anchor_positions.len(), num_requests);
-        assert!(
-            input
-                .anchor_positions
-                .iter()
-                .all(|&anchor_position| anchor_position <= u32::MAX - self.num_spec_tokens),
-            "Qwen3x DFlash2 proposal sample positions must fit u32"
-        );
+        self.req_slots.write_typed(0, req_slots);
         let proposal_rows = num_requests * self.num_spec_tokens as usize;
         let mut row_indices = Vec::with_capacity(proposal_rows);
         let mut distribution_indices = Vec::with_capacity(proposal_rows);
-        for (request_index, &req_slot) in input.req_slots.iter().enumerate() {
+        for (request_index, &req_slot) in req_slots.iter().enumerate() {
             for step_index in 0..self.num_spec_tokens as usize {
-                row_indices.push((request_index * self.query_block_size as usize + step_index + 1) as u32);
-                let distribution_index = input.distribution_store.draft_distribution_index(req_slot, step_index);
+                row_indices.push((request_index * self.spec_block_size as usize + step_index + 1) as u32);
+                let distribution_index = distribution_store.draft_distribution_index(req_slot, step_index);
                 assert!(
-                    distribution_index < input.distribution_store.num_draft_distributions(),
+                    distribution_index < distribution_store.num_draft_distributions(),
                     "Qwen3x DFlash2 draft distribution index exceeds the distribution store"
                 );
                 distribution_indices.push(distribution_index);
@@ -344,24 +328,11 @@ impl Qwen3xDFlash2Output {
         }
         self.row_indices.write_typed(0, &row_indices);
         self.output_distribution_indices.write_typed(0, &distribution_indices);
-        self.req_slots.write_typed(0, input.req_slots);
-        self.anchor_token_ids.write_typed(
-            0,
-            &input
-                .anchor_token_ids
-                .iter()
-                .map(|&token_id| i32::try_from(token_id).expect("Qwen3x DFlash2 anchor token ID must fit i32"))
-                .collect::<Vec<_>>(),
-        );
-        self.sample_positions.write_typed(
-            0,
-            &input
-                .anchor_positions
-                .iter()
-                .map(|&anchor_position| anchor_position + 1)
-                .collect::<Vec<_>>(),
-        );
         num_requests as u32
+    }
+
+    pub fn anchor_token_ids(&self) -> &Buffer {
+        &self.anchor_token_ids
     }
 
     pub fn hidden_dim(&self) -> u32 {
@@ -559,7 +530,7 @@ impl ReplayComponent for Qwen3xDFlash2Output {
                 scores: &self.scores,
                 params: self.params.buffer(),
                 req_slots: &self.req_slots,
-                sample_positions: &self.sample_positions,
+                sample_positions: input.sample_positions,
                 sampling_domain: u32::from(inference_executor_core::sampling::SamplingDomain::Draft),
                 output_distribution_indices: &self.output_distribution_indices,
                 proposal_token_ids: &self.proposal_token_ids,

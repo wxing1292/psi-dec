@@ -51,6 +51,7 @@ pub struct Qwen3xDSparkGatherUnembedArgs<'a> {
 pub struct Qwen3xDSparkSamplingArgs<'a> {
     pub shape: DSparkMarkovReplayShape,
     pub logits: &'a Buffer,
+    pub sample_positions: &'a Buffer,
     pub hidden: &'a Buffer,
     pub distribution_store: &'a SpecProbsStore,
 }
@@ -182,21 +183,18 @@ impl Qwen3xDSparkSampling {
         self.markov.unload_weights();
     }
 
-    pub fn prepare(
+    pub fn prepare_static(
         &self,
         req_slots: &[u32],
-        anchor_token_ids: &[u32],
-        anchor_positions: &[u32],
         sampler_configs: &[SamplerConfig],
         distribution_store: &SpecProbsStore,
     ) -> DSparkMarkovReplayShape {
-        self.markov.prepare(
-            req_slots,
-            anchor_token_ids,
-            anchor_positions,
-            sampler_configs,
-            distribution_store,
-        )
+        self.markov
+            .prepare_static(req_slots, sampler_configs, distribution_store)
+    }
+
+    pub fn anchor_token_ids(&self) -> &Buffer {
+        self.markov.anchor_token_ids()
     }
 
     pub fn add_replay_arguments(&self, shape: DSparkMarkovReplayShape, arguments: &mut ReplayArguments) {
@@ -225,6 +223,7 @@ impl ReplayComponent for Qwen3xDSparkSampling {
             recorder,
             input.shape,
             input.logits,
+            input.sample_positions,
             input.hidden,
             input.distribution_store,
         );

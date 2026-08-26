@@ -85,6 +85,7 @@ struct MarkovFixture {
     hidden_values: Vec<f32>,
     sampler_config: SamplerConfig,
     sampling_params: Rc<SamplingParamsStore>,
+    sample_positions: Buffer,
 }
 
 impl MarkovFixture {
@@ -169,6 +170,7 @@ impl MarkovFixture {
                 seed: 42,
             },
             sampling_params,
+            sample_positions: Buffer::new_zeroed_elements(device, MAX_REQUESTS, Dtype::Uint32),
         }
     }
 
@@ -176,13 +178,22 @@ impl MarkovFixture {
         let req_slots = &REQUEST_SLOTS[..num_active_requests];
         let configs = vec![self.sampler_config; num_active_requests];
         self.sampling_params.set(req_slots, &configs);
-        self.markov.prepare(
-            req_slots,
-            &ANCHOR_TOKEN_IDS[..num_active_requests],
-            &ANCHOR_POSITIONS[..num_active_requests],
-            &configs,
-            &self.distribution_store,
-        )
+        self.markov.anchor_token_ids().write_typed(
+            0,
+            &ANCHOR_TOKEN_IDS[..num_active_requests]
+                .iter()
+                .map(|&token_id| token_id as i32)
+                .collect::<Vec<_>>(),
+        );
+        self.sample_positions.write_typed(
+            0,
+            &ANCHOR_POSITIONS[..num_active_requests]
+                .iter()
+                .map(|&position| position + 1)
+                .collect::<Vec<_>>(),
+        );
+        self.markov
+            .prepare_static(req_slots, &configs, &self.distribution_store)
     }
 
     fn add_replay_arguments(&self, shape: DSparkMarkovReplayShape, arguments: &mut ReplayArguments) {
@@ -305,6 +316,7 @@ impl ReplayComponent for MarkovFixture {
             DSparkMarkovInput {
                 shape: *shape,
                 base_logits: &self.base_logits,
+                sample_positions: &self.sample_positions,
                 distribution_store: &self.distribution_store,
                 weights: self.weights(),
                 confidence: self.confidence(),

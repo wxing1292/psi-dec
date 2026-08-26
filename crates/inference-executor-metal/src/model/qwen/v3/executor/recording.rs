@@ -51,6 +51,16 @@ impl Qwen3Executor {
                 "qwen3 Main recording without output rows must not contain sampling"
             );
         }
+        if self.speculator.is_dspark() {
+            self.speculator.dspark().execution.append_spec_replays(
+                &mut sequence,
+                recorder
+                    .dspark_spec_prefill
+                    .as_ref()
+                    .expect("Qwen3 combined DSpark sequence requires Spec Prefill"),
+                recorder.dspark_spec_decode.as_ref(),
+            );
+        }
         self.replay_runtime().submit_replay_sequence(&sequence)
     }
 }

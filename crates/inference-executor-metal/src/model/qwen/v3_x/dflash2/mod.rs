@@ -1,12 +1,14 @@
 //! Qwen3x DFlash2 Spec Prefill and Decode execution.
 //!
-//! DFlash2 owns two independent replay stages. Prefill projects selected Main residuals and writes persistent history
-//! K/V. Decode runs an anchor plus MASK query block. Each layer combines sliding-history attention with full
-//! bidirectional block attention. The output owner selects a probabilistic candidate path and writes sparse draft
-//! distributions for Main rejection sampling.
+//! DFlash2 owns two independent replay stages. Prefill projects every captured row from the selected Main layers and
+//! writes persistent history K/V. Decode runs an anchor plus MASK query block. Each layer combines sliding-history
+//! attention with full bidirectional block attention. The output owner selects a probabilistic candidate path and
+//! writes sparse draft distributions for Main rejection sampling.
+//! When both recordings exist, the execution owner submits Spec Decode prepare first, then Prefill, and then the
+//! remaining Spec Decode replay sequence.
 //!
 //! ```text
-//! Main selected residual capture
+//! Residual capture from selected Main layers
 //!             |
 //!             v
 //! +---------------- Spec Prefill ----------------+

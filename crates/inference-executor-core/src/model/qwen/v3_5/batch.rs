@@ -148,10 +148,10 @@ impl Qwen35Microbatch {
                 .token_index()
                 .try_into()
                 .expect("qwen3.5 request token index must fit u32");
-            let q_len: u32 = request
+            let num_total_tokens: u32 = request
                 .token_cost()
                 .try_into()
-                .expect("qwen3.5 request q_len must fit u32");
+                .expect("qwen3.5 request token count must fit u32");
             let num_req_spec_tokens: u32 = request
                 .decoder_query_tokens
                 .num_spec_tokens()
@@ -172,15 +172,13 @@ impl Qwen35Microbatch {
                 .cloned()
                 .unwrap_or_default();
 
-            assert!(q_len > 0, "qwen3.5 batch requires positive q_len");
+            assert!(num_total_tokens > 0, "qwen3.5 batch requires request tokens");
             assert!(
-                num_req_main_output_rows <= q_len,
+                num_req_main_output_rows <= num_total_tokens,
                 "qwen3.5 sample tokens exceed request query tokens"
             );
-            let first_main_output_offset = q_len
-                .checked_sub(num_req_main_output_rows)
-                .expect("qwen3.5 Main output suffix must fit q_len");
-            flat_sample_mask.extend((0..q_len).map(|token_offset| token_offset >= first_main_output_offset));
+            let first_main_output_offset = num_total_tokens - num_req_main_output_rows;
+            flat_sample_mask.extend((0..num_total_tokens).map(|token_offset| token_offset >= first_main_output_offset));
 
             for lane in 0..=num_spec_tokens {
                 let needs_runtime_lane =
@@ -201,7 +199,7 @@ impl Qwen35Microbatch {
                 if needs_runtime_lane {
                     assert_eq!(
                         u32::try_from(token_ids.len()).expect("qwen3.5 token-lane length must fit u32"),
-                        q_len,
+                        num_total_tokens,
                         "qwen3.5 token lane must match request width for main and prefill MTP rows"
                     );
                 }
@@ -219,7 +217,7 @@ impl Qwen35Microbatch {
             token_indices.push(token_index);
             gdn_state_txns.push(gdn_state_txn(
                 token_index,
-                q_len,
+                num_total_tokens,
                 num_req_spec_tokens,
                 num_lanes,
                 matches!(request.decoder_query_tokens, QueryTokens::Prefill { .. }),
@@ -287,7 +285,7 @@ impl Qwen35Microbatch {
         &self.flat_token_ids_by_lane[lane][cu_tokens[req_index] as usize..cu_tokens[req_index + 1] as usize]
     }
 
-    pub fn q_len(&self, req_index: usize) -> u32 {
+    pub fn num_total_tokens(&self, req_index: usize) -> u32 {
         self.cu_tokens()[req_index + 1] - self.cu_tokens()[req_index]
     }
 
@@ -426,14 +424,14 @@ impl Qwen35ModelBatchRequest {
 /// and does not shift candidate versions.
 fn gdn_state_txn(
     token_index: u32,
-    q_len: u32,
+    num_total_tokens: u32,
     num_req_spec_tokens: u32,
     num_cache_lanes: usize,
     is_prefill: bool,
 ) -> GDNStateTxn {
     let dst_start_state_version = to_state_version(token_index);
     let dst_end_state_version = dst_start_state_version
-        .checked_add(q_len)
+        .checked_add(num_total_tokens)
         .expect("qwen3.5 GDN destination state range must fit u32");
     let num_candidate_states = if is_prefill {
         1
@@ -628,10 +626,7 @@ fn state_versions_for_decisions(microbatch: &Qwen35Microbatch, decisions: &[Qwen
             continue;
         }
 
-        let num_fixed_tokens = microbatch
-            .q_len(req_index)
-            .checked_sub(num_spec_tokens)
-            .expect("qwen3.5 speculative suffix must fit q_len");
+        let num_fixed_tokens = microbatch.num_total_tokens(req_index) - num_spec_tokens;
         let num_accepted_tokens = if microbatch.is_decode_req(req_index) {
             u32::try_from(
                 decision_iter
@@ -764,9 +759,7 @@ fn validate_gdn_state_txns(token_indices: &[u32], cu_tokens: &[u32], gdn_state_t
     );
     for req_index in 0..token_indices.len() {
         let txn = gdn_state_txns[req_index];
-        let q_len = cu_tokens[req_index + 1]
-            .checked_sub(cu_tokens[req_index])
-            .expect("qwen3.5 cumulative token counts must be increasing");
+        let num_total_tokens = cu_tokens[req_index + 1] - cu_tokens[req_index];
         assert_eq!(
             txn.dst_start_state_version(),
             to_state_version(token_indices[req_index]),
@@ -774,8 +767,8 @@ fn validate_gdn_state_txns(token_indices: &[u32], cu_tokens: &[u32], gdn_state_t
         );
         assert_eq!(
             txn.num_forward_tokens(),
-            q_len,
-            "qwen3.5 GDN state txn forward width must match q_len"
+            num_total_tokens,
+            "qwen3.5 GDN state txn forward width must match request tokens"
         );
     }
 }

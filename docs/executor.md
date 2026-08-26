@@ -519,9 +519,10 @@ create a cache boundary.
 
 Normal forward, output, and sampling commands can share one ordered command buffer when they share one dependency chain.
 
-MTP, DSpark, and DFlash2 proposal work remains separate from Main where the sampled result crosses the CPU boundary.
-GDN state candidate preparation and cache-boundary publication retain their transaction lifecycle when their GPU work
-is replayed.
+Qwen3 and Qwen3.5 DSpark, and Qwen3.5 DFlash2, record Main, rejection sampling, Spec Decode prepare, Spec
+Prefill, Spec Decode, and proposal sampling in one ordered GPU submission. Qwen3.5 MTP retains its established
+Spec lifecycle boundary. GDN state candidate preparation and cache-boundary publication retain their transaction
+lifecycle when their GPU work is replayed.
 
 The generic executor lifecycle uses role-qualified Main and Spec hooks:
 
@@ -541,10 +542,18 @@ submit_spec -> wait -> read_spec
 The first Spec form is one combined invocation.
 Qwen3.5 MTP uses this form and keeps its existing `embed_spec`, `forward_spec`, `unembed_spec`, and `sample_spec` order.
 
-The second Spec form contains independent Prefill and Decode invocations.
-DSpark and DFlash2 use this form through separate outer execution owners.
-The selected owner can record one or both invocations before one Spec submission.
-The service calls `read_spec` only when Spec Decode produces a host-visible result.
+The second Spec form is the generic interface vocabulary for independent Prefill and Decode invocations.
+Qwen3 and Qwen3.5 DSpark, and Qwen3.5 DFlash2, do not select this later fixed-block hook lifecycle.
+They record the fixed-block sequence as part of Main recording:
+
+```text
+Main -> rejection sampling -> Spec Decode prepare -> Spec Prefill -> Spec Decode -> proposal sampling
+submit_main -> wait -> read_main
+```
+
+Their `run_spec_prefill` and `run_spec_decode` hooks return false because the integrated sequence already contains this
+work.
+The corresponding later fixed-block hook methods are invalid for these executor paths.
 One model mode must not select both forms for the same batch.
 
 One model-specific Spec Decode owner can compose embedding, model layers, output, and sampling.

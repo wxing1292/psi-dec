@@ -976,7 +976,7 @@ Speculative Main verification must not promote a candidate written after rejecte
 version range to the versions that commit can select. GDN materializes those versions without interpreting their model
 meaning.
 
-For one Main request, Qwen calculates `num_fixed_tokens = q_len - num_spec_tokens`.
+For one Main request, Qwen calculates `num_fixed_tokens = num_total_tokens - num_spec_tokens`.
 It selects `input_state_version + num_fixed_tokens + num_accepted_tokens`.
 For input state 93, two fixed tokens, and two speculative tokens, accept counts 0, 1, and 2 select states 95, 96, and 97.
 `num_spec_tokens` does not directly change this calculation.

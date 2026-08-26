@@ -51,10 +51,10 @@ crates/inference-executor-metal/src/
     qwen/v3_x/
       dflash2/
         embed.rs            Main embedding view and anchor-plus-MASK replay
-        execution.rs        Prefill/Decode recording, submission, and proposal readback
+        execution.rs        Spec Prefill and Spec Decode recording, submission, and proposal readback
         load.rs             exact affine checkpoint and resource load
-        main_feature.rs     selected Main residual projection and direct capture owner
-        attention.rs        sliding-history plus block-bidirectional attention
+        main_feature.rs     all-row projection from selected Main layers and direct capture owner
+        attention.rs        sliding-history plus bidirectional local-block attention
         conv.rs             dynamic grouped-convolution weight owner
         layer.rs            independent Qwen3xDFlash2Layer
         model.rs            Prefill and body replay owners
@@ -63,8 +63,8 @@ crates/inference-executor-metal/src/
         embed.rs            Qwen3x DSpark embedding replay
         execution.rs        shared execution resources and per-batch recording
         load.rs             shared checkpoint and resource load
-        main_feature.rs     selected Main residual projection
-        attention.rs        paged-history plus block-bidirectional attention
+        main_feature.rs     all-row projection from selected Main layers
+        attention.rs        paged-history plus bidirectional local-block attention
         layer.rs            independent Qwen3xDSparkLayer
         model.rs            Prefill and body replay owners
         output.rs           gather/unembed and Markov sampling
@@ -213,6 +213,7 @@ Qwen3xDSparkExecution
   gather_unembed: Replay<Qwen3xDSparkGatherUnembed>
   sampling: Replay<Qwen3xDSparkSampling>
     markov: Qwen3xDSparkMarkov
+  decode_input: Replay<SpecDecodeInput>
   reusable hidden/logit workspaces
   page layout and block geometry
 
@@ -225,19 +226,21 @@ Qwen3xDFlash2Execution
     Main Unembed view
     raw Top-K merge
     candidate lattice and probabilistic path walk
+  decode_input: Replay<SpecDecodeInput>
   reusable hidden, convolution, selector, and attention workspaces
   page layout, query-block geometry, and sliding-window contract
 
 Qwen3ModelOpsRecorder / Qwen35ModelOpsRecorder
-  dspark_prefill: Option<Qwen3xDSparkPrefillRecording>
-  dspark_decode: Option<Qwen3xDSparkDecodeRecording>
-  dflash2_prefill: Option<Qwen3xDFlash2PrefillRecording>
-  dflash2_decode: Option<Qwen3xDFlash2DecodeRecording>
+  dspark_spec_prefill: Option<Qwen3xDSparkPrefillRecording>
+  dspark_spec_decode: Option<Qwen3xDSparkDecodeRecording>
+  dflash2_spec_prefill: Option<Qwen3xDFlash2PrefillRecording>
+  dflash2_spec_decode: Option<Qwen3xDFlash2DecodeRecording>
 
 Qwen3xDSparkPrefillRecording
   Prefill replay key
 
 Qwen3xDSparkDecodeRecording
+  optional Spec Decode prepare replay key and arguments
   embed/body/gather/sampling replay keys
   sampling arguments
   request slots
@@ -246,16 +249,22 @@ Qwen3xDFlash2PrefillRecording
   Prefill replay key
 
 Qwen3xDFlash2DecodeRecording
+  Spec Decode prepare replay key and arguments
   embed/body/output replay keys
   output arguments
   request slots
 ```
 
+The shared recorder keeps the Spec Prefill and Spec Decode fields for each fixed-block mode optional. Vanilla and MTP
+use `None/None`. A fixed-block Prefill-only batch uses `Some/None`. A fixed-block Spec Decode batch uses `Some/Some`.
+This state table does not require a separate enum because the selected outer model mode already owns the valid
+transition.
+
 ### Mode architecture
 
 Vanilla executes Main embedding, Main, output projection, and target sampling.
 MTP adds its separate embedding, reusable physical body layer, and draft sampling owner.
-DSpark and DFlash2 remain peer model roles with independent Prefill and Decode recordings.
+DSpark and DFlash2 remain peer model roles with independent Spec Prefill and Spec Decode recordings.
 They share only compatible lower-level BiDiBlockGQA components.
 
 [`dspark_design.md`](dspark_design.md) defines DSpark fixed-block attention, Markov sampling, state, and lifecycle.
@@ -495,7 +504,7 @@ The independent cached graphs are:
 ```text
 Replay<Qwen3MainEmbed>       Qwen3 token embedding
 Replay<Qwen3Main>            Qwen3 dense full-attention layers -> final norm
-Replay<Qwen3xDSparkPrefill>   selected Main residuals -> persistent DSpark context K/V
+Replay<Qwen3xDSparkPrefill>   all captured rows from selected Main layers -> persistent DSpark context K/V
 Replay<Qwen3GatherUnembed>   Qwen3 gather -> unembed
 Replay<Sampling>             ordinary Main sampling
 Replay<RejectionSampling>    Main sparse distributions -> speculative rejection
@@ -505,11 +514,13 @@ Replay<Qwen3xDSparkGatherUnembed>
                              request-major hidden -> step-major logits
 Replay<Qwen3xDSparkSampling>
                              Markov correction, sampling, and sparse draft storage
+Replay<SpecDecodeInput>      Qwen3/Qwen3.5 sparse rejection output -> fixed DSpark Spec Decode input and sampling positions
 Replay<Qwen3xDFlash2Prefill>
-                             selected Main residuals -> persistent DFlash2 history K/V
+                             all captured rows from selected Main layers -> persistent DFlash2 history K/V
 Replay<Qwen3xDFlash2Embed>    anchor + MASK block embedding through the Main Embed view
 Replay<Qwen3xDFlash2Body>     fixed DFlash2 layers -> final norm
 Replay<Qwen3xDFlash2Output>   gather MASK rows -> Main Unembed -> selector -> sparse draft storage
+Replay<SpecDecodeInput>       sparse rejection output -> fixed DFlash2 Spec Decode input and sampling position
 
 Replay<Qwen35MainEmbed>      token embedding
 Replay<Qwen35Main>           all Main layers -> final norm
@@ -697,7 +708,7 @@ It never aliases a Qwen3.5 key or stores an optional GDN key.
 DSpark and DFlash2 use identity capacity for Prefill rows, Embed rows, fixed-block token rows, and output rows.
 Each replay key still stores a `num_total_*` value, and each submission still supplies the matching `num_active_*`
 parameter.
-The block-Spec body independently pads the history Map TaskTemplate domain to a power-of-two total capacity.
+The BiDiBlockGQA body independently pads the history Map TaskTemplate domain to a power-of-two total capacity.
 Its active Map count and active Q-token-range count are submission parameters.
 DFlash2 also supplies its active query-block count to dynamic grouped convolution.
 The DFlash2 body owns this replay parameter key. The convolution leaf binds the caller-owned key.
@@ -740,7 +751,7 @@ The capture owner returns an optional opaque `residual_add::CaptureTarget`.
 The destination selects a stable BF16 column range that the capture owner owns.
 Each selected Main layer writes directly into its assigned range in one prearranged buffer.
 The capture path does not run a concatenate kernel.
-An indexed committed-row selection runs one gather before Main-feature projection.
+Spec Prefill projects the complete captured Main-row prefix.
 `None` records the ordinary residual add.
 
 The object-safe capture contract returns only this descriptor.
@@ -749,9 +760,9 @@ Both Main record methods remain generic over `Recorder<Operator = ReplayOp>`.
 
 The Qwen3 and Qwen3.5 loaders supply no capture owner when fixed-block Spec Prefill is disabled.
 When DSpark is enabled for Qwen3 or Qwen3.5, `Qwen3xDSparkMainFeatureProjector` owns the capture destinations.
-`Qwen3xDSparkPrefill` records Main-feature projection and context append after the Main CPU read.
+Both executors record `Qwen3xDSparkPrefill` before the combined Main and Spec submission.
 When DFlash2 is enabled for Qwen3.5, `Qwen3xDFlash2MainFeatureProjector` owns its separate capture destinations.
-`Qwen3xDFlash2Prefill` records its Main-feature projection and history append after the Main CPU read.
+Qwen3.5 records `Qwen3xDFlash2Prefill` before the combined Main and Spec submission.
 Main depends only on `MainResidualCapture`.
 
 `Qwen35GatherUnembedArgs` has a flat structure.
@@ -761,11 +772,7 @@ Gathered hidden and logits remain executor workspaces.
 ## Batch execution lifecycle
 
 The service calls the model hooks in a fixed order.
-The service records the Main components first.
-The service then owns the Main `submit`, `wait`, and CPU read boundaries.
-It evaluates the combined Spec gate and the fixed-block Prefill and Decode gates after the Main CPU read.
 One outer model mode selects only its applicable lifecycle.
-The service records the selected Spec work and owns the Spec `submit`, `wait`, and CPU read boundaries.
 An empty component input omits that component from its model sequence.
 The executor does not store a separate submitted-state flag.
 
@@ -778,8 +785,13 @@ It does not submit backend work.
 It returns immediately when the batch has no sampled rows.
 
 `sample_main` materializes Sampling or RejectionSampling when the batch has sampled rows.
-It returns immediately when the batch has no sampled rows.
-It does not submit backend work or read backend output.
+For Qwen3 and Qwen3.5 DSpark, and for Qwen3.5 DFlash2, it also calls `record_spec` before submission.
+Spec Prefill borrows the active token count, request slots, and flat token indices from the current Main GQA metadata.
+These buffers contain the complete captured Main-row prefix and remain valid through recording and submission.
+`record_spec_prefill` records physical Spec Prefill for every Main row.
+When the batch contains Decode requests, `record_decode_prepare` and `record_spec_decode` record the dependent Spec
+Decode path.
+These methods do not submit backend work or read backend output.
 
 `submit_main` submits one Main sequence.
 For a batch with no sampled rows, the sequence is:
@@ -802,35 +814,61 @@ For MTP, `submit_main` submits this sequence:
 MainEmbed -> Main -> GatherUnembed -> RejectionSampling
 ```
 
-For DSpark or DFlash2, it submits the same Main sequence:
+For Qwen3 or Qwen3.5 DSpark, it submits one ordered serial sequence:
 
 ```text
 MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+  -> SpecDecodeInput -> DSparkPrefill
+  -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 ```
 
-The service waits for the Main submission.
-It then calls `read_main`.
-`read_main` reads the sampled or rejection results on the CPU.
+For Qwen3.5 DFlash2, it submits one ordered serial sequence:
+
+```text
+MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+  -> SpecDecodeInput -> DFlash2Prefill
+  -> DFlash2Embed -> DFlash2 -> DFlash2Output
+```
+
+A prefill-only batch omits GatherUnembed, RejectionSampling, SpecDecodeInput, and Spec Decode.
+It still appends the applicable Spec Prefill replay after Main.
+
+The service waits once for this combined submission.
+`read_main` then reads the sparse rejection result and the final proposal result.
+It does not read either result before the combined wait completes.
+`main_spec_replay_elapsed` reports the combined Main and Spec submission duration.
+It does not report Main-only duration.
 
 Qwen3.5 MTP uses the existing combined `run_spec` lifecycle.
 Its `embed_spec`, `forward_spec`, `unembed_spec`, and `sample_spec` hooks materialize MTPEmbed, MTP, GatherUnembed, and
 DraftSampling.
 MTP does not use the fixed-block Prefill or Decode hooks.
 
-The service calls `run_spec_prefill` and `run_spec_decode` for a DSpark or DFlash2 mode after `read_main`.
-Spec Prefill runs whenever the selected owner receives Main capture rows.
-Spec Decode runs only when Main returns a sampled anchor.
-The lifecycle does not use a per-batch submitted-state flag.
+For Qwen3 and Qwen3.5 DSpark, and for Qwen3.5 DFlash2, `run_spec_prefill` and `run_spec_decode` return false because the
+fixed-block path is already part of `submit_main`.
+The later fixed-block hooks are impossible for these executor paths.
 
-`prefill_spec` materializes the selected DSpark or DFlash2 Prefill stage.
-It builds the persistent-history row selection after Main rejection sampling.
-For a decode request, the selection contains the fixed Main rows and the accepted speculative prefix.
-It excludes the rejected suffix and the newly sampled anchor.
-An explicit `MainResidualRows` variant selects direct prefix use or an indexed gather.
-`decode_spec` materializes the selected model's independent Decode stage.
-These hooks do not submit backend work or read backend output.
+Fixed-block Spec Prefill writes physical Spec history for every Main row, including a rejected Decode suffix.
+Runtime commit keeps logical history at the fixed Main rows plus the accepted speculative prefix.
+The rejected physical tail is not logically visible.
+The next transaction overwrites that tail before a later logical range can expose it.
 
-`submit_spec` starts one model-specific Spec transaction.
+`SpecDecodeInput` owns the static and GPU-written Decode-input lifecycle.
+Its `prepare` method fills its reusable resources for the current batch.
+`Qwen3xDSparkExecution` constructs this resource for both Qwen3 and Qwen3.5.
+`Qwen3xDFlash2Execution` constructs the same owner for Qwen3.5 DFlash2.
+`record_decode_prepare` reads `SparseRejectionSamplingOutput` and writes accepted-dependent anchor positions, anchor
+tokens, block token IDs, GQA metadata, and sampling positions.
+`record_spec_decode` binds the same physical buffers without an intermediate copy.
+Spec Decode keeps its proposal-block K/V in `BiDiBlockGQAScratch`.
+History SDPA reads persistent K/V only through the accepted anchor.
+Spec Decode does not write trie-backed K/V pages.
+Spec Prefill is the only fixed-block stage that writes persistent K/V, and it writes only Main rows whose blocks
+runtime already owns.
+Therefore, this path does not change scheduler budgets, logical token accounting, service context sizing, or runtime
+trie allocation.
+
+For Qwen3.5 MTP, `submit_spec` starts one model-specific Spec transaction.
 For `--num-spec-tokens K`, the Qwen3.5 MTP owner executes this dependent sequence K times:
 
 ```text
@@ -849,34 +887,6 @@ The current implementation waits and reads after each non-final MTP pass.
 `submit_spec` returns the final submission, and the service performs the final wait and `read_spec` call.
 This preserves one external Spec lifecycle while the MTP owner controls K internal passes.
 
-The Qwen3x DSpark prefill-only sequence is:
-
-```text
-DSparkPrefill
-```
-
-The Qwen3x DSpark decode-ready sequence is:
-
-```text
-DSparkPrefill -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
-```
-
-The Qwen3x DFlash2 prefill-only sequence is:
-
-```text
-DFlash2Prefill
-```
-
-The Qwen3x DFlash2 decode-ready sequence is:
-
-```text
-DFlash2Prefill -> DFlash2Embed -> DFlash2 -> DFlash2Output
-```
-
-The service waits for the Spec submission.
-It calls `read_spec` only after Spec Decode.
-`read_spec` reads draft tokens and probabilities on the CPU.
-
 The complete service order is:
 
 ```text
@@ -887,17 +897,19 @@ if run_spec(model_batch_req, sampled_output):
     embed_spec -> forward_spec -> unembed_spec -> sample_spec
     submit_spec -> wait -> read_spec
 
+# Generic fixed-block interface vocabulary. Current Qwen DSpark and DFlash2 paths do not select these hooks.
 if run_spec_prefill(model_batch_req):
     prefill_spec
 if run_spec_decode(model_batch_req, sampled_output):
     decode_spec
-if Spec Prefill or Spec Decode was recorded:
+if separate Spec Prefill or Spec Decode was recorded:
     submit_spec -> wait
 if Spec Decode was recorded:
     read_spec
 commit
 ```
 
+Qwen3 and Qwen3.5 DSpark, and Qwen3.5 DFlash2, complete during `submit_main -> wait -> read_main`.
 The MTP, DSpark, and DFlash2 branches are mutually exclusive.
 
 ## GQA/GDN lifecycle
@@ -911,7 +923,7 @@ In a fixed-block Spec mode, runtime cache lane 0 stores `[Main page IDs | Spec p
 `prepare_batch` validates the exact combined length and splits this list once.
 It sends each complete role-local list to the applicable state owner.
 Qwen3.5 Main and MTP own distinct gated `Qwen3xGQAState` domains.
-The Main and selected block-Spec state owners expose symmetric role-local state access:
+The Main and selected BiDiBlockGQA state owners expose symmetric role-local state access:
 
 ```text
 write_page_ids(req_slot, block_index, page_ids)
@@ -948,7 +960,7 @@ Commit selects verified state versions.
 It starts an uncached publish when jobs exist.
 
 MTP keeps the GDN current version aligned with the Main runtime cache frontier.
-For one request, Main calculates `num_fixed_tokens = q_len - num_spec_tokens`.
+For one request, Main calculates `num_fixed_tokens = num_total_tokens - num_spec_tokens`.
 It commits `input_state_version + num_fixed_tokens + num_accepted_tokens`.
 `num_spec_tokens` does not directly adjust this state version.
 MTP decode replays K - 1 verified tail tokens in the next Main call.
@@ -999,26 +1011,21 @@ The checkpoint `block_size` defines the fixed proposal count.
 `--num-spec-tokens` is an MTP-only service option.
 Qwen3.5 MTP, DSpark, and DFlash2 are mutually exclusive.
 
-Each DSpark-enabled executor keeps the Main submission free of DSpark work:
+Qwen3 and Qwen3.5 record Spec Decode prepare, DSpark Prefill, Spec Decode, and proposal sampling before submission.
+The GPU Spec Decode prepare stage reads rejection-sampling output directly.
+A decode-ready Qwen3 or Qwen3.5 batch uses this single submission:
 
 ```text
 MainEmbed -> Main -> GatherUnembed -> RejectionSampling
-```
-
-The CPU reads the Main result before it constructs the anchor block.
-The executor records DSpark Prefill after this read.
-A decode-ready batch records DSpark Decode after DSpark Prefill:
-
-```text
-DSparkPrefill -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
+  -> SpecDecodeInput -> DSparkPrefill
+  -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 ```
 
 DSpark input is request-major.
 `DSparkGatherUnembed` converts body output to the step-major order required by sequential Markov sampling.
 It validates the maximum request-by-step row domain at construction.
 DSpark reads stable temperature, top-p, seed, and top-k values from the shared request-slot `SamplingParamsStore`.
-Its CPU-prepared Decode input writes one first sample position for each request. DSpark step `i` adds `i` to that
-position.
+Spec Decode prepare writes one first sample position for each request. DSpark step `i` adds `i` to that position.
 The draft probability store uses request-slot identity because these rows cross a batch boundary.
 Main verification distributions use compact active-row identity because they exist only in one submission.
 
@@ -1044,8 +1051,6 @@ DFlash2 support is experimental.
 Qwen3.5-family executors support the affine Qwen3x DFlash2 checkpoint contract.
 The DFlash2 owner is a peer of the DSpark owner.
 It is not a mode flag inside DSpark.
-DFlash2 reads stable temperature and seed values from the same request-slot `SamplingParamsStore` as Main, MTP, and
-DSpark. Its sequential path walk adds each proposal step to the first sample position in the CPU-prepared Decode input.
 
 The checkpoint `block_size` defines the complete Decode query block.
 The Decode block contains one anchor row followed by `block_size - 1` MASK rows.
@@ -1053,18 +1058,23 @@ The Decode block contains one anchor row followed by `block_size - 1` MASK rows.
 Prefill and Decode are independent replay recordings:
 
 ```text
-Main submission:
-    MainEmbed -> Main -> GatherUnembed -> RejectionSampling
-CPU sampling feedback
-Spec Prefill:
-    DFlash2Prefill
-Spec Decode, when an anchor exists:
-    DFlash2Embed -> DFlash2 -> DFlash2Output
+MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+  -> SpecDecodeInput -> DFlash2Prefill
+  -> DFlash2Embed -> DFlash2 -> DFlash2Output
 ```
 
-Prefill projects the committed Main residual rows once.
-The committed rows contain the fixed Main rows and the accepted speculative prefix.
-They do not contain the rejected suffix or the newly sampled anchor.
+The executor records both independent recordings before one ordered submission.
+Prefill depends on Main capture.
+Spec Decode prepare depends on rejection sampling.
+The serial sequence emits Spec Decode prepare first, then Prefill, and then the remaining Spec Decode work.
+This order makes the acceptance-dependent chain ready first and preserves both dependencies without a CPU boundary.
+
+DFlash2 reads stable temperature and seed values from the same request-slot `SamplingParamsStore` as Main, MTP, and
+DSpark. The sequential path walk adds each proposal step to the first sample position from Spec Decode prepare.
+
+Prefill projects every physical Main residual row once.
+Logical history contains the fixed Main rows and the accepted speculative prefix.
+It does not expose the rejected physical suffix or the newly sampled anchor.
 Each DFlash2 layer derives persistent K/V from that projected Main feature and writes its own paged history cache.
 The persistent cache stores all history tokens.
 Decode limits reads, not writes, with one explicit half-open history range for each query row:

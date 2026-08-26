@@ -7,7 +7,8 @@ See [`executor_gqa.md`](executor_gqa.md) for shared GQA and [`executor_sampling.
 
 DFlash2 is a model role and a peer of DSpark, not a DSpark mode.
 
-Main owns token embedding, the transformer, selected residual capture, unembedding, Main sampling, and rejection.
+Main owns token embedding, the transformer, residual capture from selected Main layers, unembedding, Main sampling,
+and rejection.
 The DFlash2 owner owns its checkpoint, history page table, replay caches, workspaces, dynamic convolution, and selector.
 Runtime core owns scheduling, request lifecycle, physical pages, and page IDs.
 
@@ -137,10 +138,14 @@ N = block_size - 1 proposal tokens
 ```
 
 Spec Prefill and Spec Decode use independent replay recordings.
-The outer owner may submit either replay or both after Main completes.
-Prefill keeps fixed Main rows and the accepted speculative prefix.
-It excludes the rejected suffix and the new anchor.
-Main writes selected residuals directly into assigned capture columns.
+The Qwen executor records them with Main and submits one ordered sequence.
+Spec Decode prepare follows rejection sampling. Prefill follows Main capture.
+When both exist, the serial sequence emits Spec Decode prepare first, then Prefill, and then the remaining Spec Decode
+work.
+Each selected Main layer writes every Main row directly into its assigned capture columns.
+Spec Prefill persists every captured Main row, including the rejected physical suffix.
+Logical commit exposes only fixed Main rows and the accepted speculative prefix.
+Spec Prefill borrows the active token count, request slots, and flat token indices from the current Main GQA metadata.
 
 ## Proposal block and attention
 
@@ -157,7 +162,7 @@ DFlash2 stores all committed history and reads this half-open range for each que
 The local block contains the anchor and all MASK K/V with bidirectional attention.
 Its K/V is temporary.
 
-The Decode replay key contains padded history TaskTemplate capacity.
+The Spec Decode replay key contains padded history TaskTemplate capacity.
 The active count remains a submission argument, so matching padded capacities reuse one replay.
 
 ## Layer composition
@@ -233,7 +238,7 @@ crates/inference-executor-core/src/bin/qwen3x_spec_quantize/
 
 crates/inference-executor-metal/src/model/qwen/v3_x/dflash2/
   execution.rs               Prefill and Decode orchestration
-  main_feature.rs            selected Main residual projection
+  main_feature.rs            all-row projection from selected Main layers
   attention.rs               history-plus-block attention
   conv.rs                    dynamic grouped convolution
   layer.rs                   DFlash2 layer composition

@@ -33,7 +33,6 @@ use inference_executor_core::sampling::RequestSamplingState;
 use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
-use inference_executor_core::sampling::build_spec_prefill_selection;
 use inference_runtime_core::compute::BatchDevReq;
 use inference_runtime_core::compute::BatchDeviceRequest;
 use inference_runtime_core::compute::BatchDeviceResponse;
@@ -62,7 +61,6 @@ use crate::model::qwen::v3::main::output::Qwen3GatherUnembedReplayKey;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkDecodeRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkPrefillRecording;
-use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkProposalInput;
 use crate::model::state_snapshot::FullStateIO;
 use crate::model::state_snapshot::GQAStateSnapshotFiles;
 use crate::model::state_snapshot::PageArenaStateSnapshotFiles;
@@ -478,8 +476,8 @@ pub struct Qwen3ModelOpsRecorder {
     rejection_key: Option<RejectionReplayKey>,
     rejection_arguments: ReplayArguments,
     rejection_prepared: Option<PreparedRejection>,
-    dspark_prefill: Option<Qwen3xDSparkPrefillRecording>,
-    dspark_decode: Option<Qwen3xDSparkDecodeRecording>,
+    dspark_spec_prefill: Option<Qwen3xDSparkPrefillRecording>,
+    dspark_spec_decode: Option<Qwen3xDSparkDecodeRecording>,
     num_main_sample_rows: usize,
 }
 
@@ -638,8 +636,8 @@ impl ReplayableModel for Qwen3Executor {
             main_embed_arguments,
             main_key,
             main_arguments,
-            dspark_prefill: None,
-            dspark_decode: None,
+            dspark_spec_prefill: None,
+            dspark_spec_decode: None,
             gather_unembed_key: None,
             gather_unembed_arguments: ReplayArguments::new(),
             sampling_key: None,
@@ -738,10 +736,14 @@ impl ReplayableModel for Qwen3Executor {
             "qwen3 sampling rows must match the recording"
         );
         if num_main_sample_rows == 0 {
+            if self.speculator.is_dspark() {
+                self.record_spec(recorder, microbatch);
+            }
             return;
         }
         if self.speculator.is_dspark() {
             self.record_rejection_sampling(recorder, microbatch);
+            self.record_spec(recorder, microbatch);
         } else {
             assert!(
                 !microbatch.has_spec_tokens(),
@@ -764,103 +766,92 @@ impl ReplayableModel for Qwen3Executor {
         replay_elapsed: Duration,
     ) -> Self::SampledOutput {
         if recorder.num_main_sample_rows == 0 {
-            let timing = ModelOutputTiming {
-                main_replay_elapsed: replay_elapsed,
-                ..ModelOutputTiming::default()
+            let timing = if self.speculator.is_dspark() {
+                ModelOutputTiming {
+                    main_spec_replay_elapsed: replay_elapsed,
+                    ..ModelOutputTiming::default()
+                }
+            } else {
+                ModelOutputTiming {
+                    main_replay_elapsed: replay_elapsed,
+                    ..ModelOutputTiming::default()
+                }
             };
             return Qwen3SampledOutput {
                 decisions: Vec::new(),
                 timing,
             };
         }
-        let mut timing = ModelOutputTiming {
-            main_sample_replay_elapsed: replay_elapsed,
-            ..ModelOutputTiming::default()
-        };
-        let sample_read_start = Instant::now();
-        let decisions = if self.speculator.is_dspark() {
-            self.read_rejection_decisions(recorder, model_batch_req.microbatch())
+        let (mut decisions, mut timing) = if self.speculator.is_dspark() {
+            let read_start = Instant::now();
+            let decisions = self.read_rejection_decisions(recorder, model_batch_req.microbatch());
+            let timing = ModelOutputTiming {
+                main_spec_replay_elapsed: replay_elapsed,
+                rejection_read_elapsed: read_start.elapsed(),
+                spec_passes: 1,
+                ..ModelOutputTiming::default()
+            };
+            (decisions, timing)
         } else {
-            self.read_sample_decisions(recorder.num_main_sample_rows)
+            let read_start = Instant::now();
+            let decisions = self.read_sample_decisions(recorder.num_main_sample_rows);
+            let timing = ModelOutputTiming {
+                main_sample_replay_elapsed: replay_elapsed,
+                sample_read_elapsed: read_start.elapsed(),
+                ..ModelOutputTiming::default()
+            };
+            (decisions, timing)
         };
-        timing.sample_read_elapsed = sample_read_start.elapsed();
+        if self.speculator.is_dspark() {
+            let read_start = Instant::now();
+            decisions = self.read_dspark_proposal(recorder, decisions);
+            timing.spec_read_elapsed = read_start.elapsed();
+        }
         Qwen3SampledOutput { decisions, timing }
     }
 
-    fn run_spec_prefill(&self, model_batch_req: &Self::ModelBatchRequest) -> bool {
-        self.speculator.is_dspark() && model_batch_req.microbatch().total_tokens() > 0
+    fn run_spec_prefill(&self, _model_batch_req: &Self::ModelBatchRequest) -> bool {
+        false
     }
 
     fn prefill_spec(
         &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchRequest,
-        sampled_output: &Self::SampledOutput,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _sampled_output: &Self::SampledOutput,
     ) {
-        let microbatch = model_batch_req.microbatch();
-        let accepted_prefix_lengths = sampled_output
-            .decisions
-            .iter()
-            .map(|decision| decision.validated_tokens.len())
-            .collect::<Vec<_>>();
-        let selection = build_spec_prefill_selection(microbatch, &accepted_prefix_lengths);
-        let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        assert!(
-            recorder.dspark_prefill.is_none(),
-            "Qwen3 DSpark Prefill is already recorded"
-        );
-        recorder.dspark_prefill = Some(self.speculator.dspark_mut().execution.record_prefill(
-            &runtime,
-            &selection,
-            self.pages.buffer(),
-        ));
+        panic!("Qwen3 DSpark Prefill must be recorded with Main")
     }
 
     fn run_spec_decode(
         &self,
         _model_batch_req: &Self::ModelBatchRequest,
-        sampled_output: &Self::SampledOutput,
+        _sampled_output: &Self::SampledOutput,
     ) -> bool {
-        self.speculator.is_dspark() && !sampled_output.decisions.is_empty()
+        false
     }
 
     fn decode_spec(
         &mut self,
-        recorder: &mut Self::ModelOpsRecorder,
-        model_batch_req: &Self::ModelBatchRequest,
-        sampled_output: &Self::SampledOutput,
+        _recorder: &mut Self::ModelOpsRecorder,
+        _model_batch_req: &Self::ModelBatchRequest,
+        _sampled_output: &Self::SampledOutput,
     ) {
-        assert!(
-            recorder.dspark_decode.is_none(),
-            "Qwen3 DSpark Decode is already recorded"
-        );
-        recorder.dspark_decode =
-            Some(self.record_dspark_decode(model_batch_req.microbatch(), &sampled_output.decisions));
+        panic!("Qwen3 DSpark Decode must be recorded with Main")
     }
 
-    fn submit_spec(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission {
-        let runtime = self.replay_runtime();
-        self.speculator.dspark().execution.submit(
-            &runtime,
-            recorder.dspark_prefill.as_ref(),
-            recorder.dspark_decode.as_ref(),
-        )
+    fn submit_spec(&mut self, _recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+        panic!("Qwen3 DSpark Spec must be submitted with Main")
     }
 
     fn read_spec(
         &mut self,
-        recorder: &Self::ModelOpsRecorder,
+        _recorder: &Self::ModelOpsRecorder,
         _model_batch_req: &Self::ModelBatchRequest,
-        sampled_output: Self::SampledOutput,
-        replay_elapsed: Duration,
+        _sampled_output: Self::SampledOutput,
+        _replay_elapsed: Duration,
     ) -> Self::SampledOutput {
-        let mut timing = sampled_output.timing;
-        timing.spec_replay_elapsed += replay_elapsed;
-        timing.spec_passes += 1;
-        let read_start = Instant::now();
-        let decisions = self.read_dspark_proposal(recorder, sampled_output.decisions);
-        timing.spec_read_elapsed += read_start.elapsed();
-        Qwen3SampledOutput { decisions, timing }
+        panic!("Qwen3 DSpark Spec results must be read with Main")
     }
 
     fn empty_sampled_output(&self) -> Self::SampledOutput {

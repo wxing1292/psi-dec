@@ -1,4 +1,3 @@
-use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -7,21 +6,18 @@ use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayArguments;
 use inference_backend_metal::metal::ReplayExecution;
-use inference_executor_core::attn::BiDiBlockGQAMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2WeightBindings;
 use inference_executor_core::model::qwen::v3_x::dflash2::resolve_qwen3x_dflash2_weight_bindings;
-use inference_executor_core::sampling::SpecPrefillSelection;
 use inference_runtime_core::runtime::RawRequestSlot;
 
 use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
+use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
-use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::embedding::Embed;
-use crate::model::main_residual_capture::MainResidualRows;
 use crate::model::qwen::v3_x::dflash2::embed::Qwen3xDFlash2Embed;
 use crate::model::qwen::v3_x::dflash2::embed::Qwen3xDFlash2EmbedArgs;
 use crate::model::qwen::v3_x::dflash2::embed::Qwen3xDFlash2EmbedReplayKey;
@@ -36,11 +32,15 @@ use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2PrefillArgs;
 use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2PrefillReplayKey;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2Output;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2OutputArgs;
-use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2OutputPrepare;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2OutputReplayKey;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2Proposal;
+use crate::model::qwen::v3_x::spec_decode_input::SpecDecodeInput;
+use crate::model::qwen::v3_x::spec_decode_input::SpecDecodeInputArgs;
+use crate::model::qwen::v3_x::spec_decode_input::SpecDecodeInputConfig;
+use crate::model::qwen::v3_x::spec_decode_input::SpecDecodeInputRecording;
 use crate::model::unembedding::Unembed;
 use crate::replay::Replay;
+use crate::sampling::rejection_sampling::SparseRejectionSamplingOutput;
 use crate::sampling::spec_probs::SpecProbsStore;
 
 mod file_io;
@@ -51,48 +51,43 @@ pub struct Qwen3xDFlash2Execution {
     embed: Replay<Qwen3xDFlash2Embed>,
     body: Replay<Qwen3xDFlash2Body>,
     output: Replay<Qwen3xDFlash2Output>,
+    decode_input: Replay<SpecDecodeInput>,
     unloaded_model: Option<Qwen3xDFlash2Model>,
-    prefill_main_row_indices: Buffer,
-    prefill_req_slots: Buffer,
-    prefill_flat_token_indices: Buffer,
     hidden_input: Rc<Buffer>,
     hidden_output: Rc<Buffer>,
     page_table_layout: GQAPageTableLayout,
     num_spec_tokens: usize,
-    mask_token_id: i32,
-    sliding_window: u32,
     page_bytes: usize,
-}
-
-pub struct Qwen3xDFlash2ProposalInput<'a> {
-    req_slots: Vec<u32>,
-    anchor_token_ids: &'a [u32],
-    anchor_positions: &'a [u32],
-}
-
-impl<'a> Qwen3xDFlash2ProposalInput<'a> {
-    pub fn new(req_slots: Vec<u32>, anchor_token_ids: &'a [u32], anchor_positions: &'a [u32]) -> Self {
-        debug_assert_eq!(req_slots.len(), anchor_token_ids.len());
-        debug_assert_eq!(req_slots.len(), anchor_positions.len());
-        Self {
-            req_slots,
-            anchor_token_ids,
-            anchor_positions,
-        }
-    }
 }
 
 impl Qwen3xDFlash2Execution {
     pub fn new(device: &Device, loaded: Qwen3xDFlash2Loaded) -> Self {
         assert!(loaded.num_spec_tokens > 0);
-        let query_block_size = loaded.num_spec_tokens + 1;
+        let spec_block_size = loaded.num_spec_tokens + 1;
         let max_query_tokens = (loaded.page_table_layout.num_req_slots as usize)
-            .checked_mul(query_block_size)
+            .checked_mul(spec_block_size)
             .expect("Qwen3x DFlash2 query token capacity must fit usize");
         let hidden_bytes = max_query_tokens
             .checked_mul(loaded.output.hidden_dim() as usize)
             .and_then(|elements| elements.checked_mul(Dtype::Bfloat16.item_size()))
             .expect("Qwen3x DFlash2 hidden byte capacity must fit usize");
+        let sliding_window = loaded
+            .sliding_window
+            .try_into()
+            .expect("Qwen3x DFlash2 sliding window must fit u32");
+        let sdpa = loaded.gqa_state.metadata().sdpa_execution().map.thread_block;
+        let decode_input = SpecDecodeInput::new(
+            device,
+            SpecDecodeInputConfig::new(
+                loaded.page_table_layout.num_req_slots,
+                spec_block_size as u32,
+                sdpa,
+                sliding_window,
+                loaded.max_anchor_position,
+                loaded.gqa_state.max_sdpa_map_task_templates(),
+                loaded.mask_token_id,
+            ),
+        );
         Self {
             prefill: Replay::new(
                 "Qwen3x DFlash2 Prefill",
@@ -102,19 +97,12 @@ impl Qwen3xDFlash2Execution {
             embed: Replay::new("Qwen3x DFlash2 Embed", Qwen3xDFlash2Embed::new(loaded.embed)),
             body: Replay::new("Qwen3x DFlash2 Body", Qwen3xDFlash2Body::new(Rc::clone(&loaded.model))),
             output: Replay::new("Qwen3x DFlash2 Output", loaded.output),
-            prefill_main_row_indices: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
-            prefill_req_slots: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
-            prefill_flat_token_indices: Buffer::new_zeroed_elements(device, loaded.max_main_tokens, Dtype::Uint32),
+            decode_input: Replay::new("Qwen3x DFlash2 Spec Decode Prepare", decode_input),
             unloaded_model: None,
             hidden_input: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
             hidden_output: Rc::new(Buffer::new_zeroed(device, hidden_bytes)),
             page_table_layout: loaded.page_table_layout,
             num_spec_tokens: loaded.num_spec_tokens,
-            mask_token_id: loaded.mask_token_id,
-            sliding_window: loaded
-                .sliding_window
-                .try_into()
-                .expect("Qwen3x DFlash2 sliding window must fit u32"),
             page_bytes: loaded.page_bytes,
         }
     }
@@ -146,6 +134,7 @@ impl Qwen3xDFlash2Execution {
         self.embed.clear();
         self.body.clear();
         self.output.clear();
+        self.decode_input.clear();
     }
 
     pub fn unload_weights(&mut self) {
@@ -172,10 +161,10 @@ impl Qwen3xDFlash2Execution {
             final_norm_weight,
             selector,
         } = resolve_qwen3x_dflash2_weight_bindings(config, store.index().tensor_names())?;
-        let query_block_size = self.num_spec_tokens + 1;
+        let spec_block_size = self.num_spec_tokens + 1;
         let max_requests = self.page_table_layout.num_req_slots as usize;
         let max_query_tokens = max_requests
-            .checked_mul(query_block_size)
+            .checked_mul(spec_block_size)
             .expect("Qwen3x DFlash2 query token capacity must fit usize");
         let max_proposal_tokens = max_requests
             .checked_mul(self.num_spec_tokens)
@@ -254,84 +243,79 @@ impl Qwen3xDFlash2Execution {
         self.gqa_state.read_page_ids(req_slot, block_index)
     }
 
-    pub fn record_prefill(
+    pub fn record_spec_prefill(
         &mut self,
         runtime: &MetalReplayRuntime<'_>,
-        selection: &SpecPrefillSelection,
+        spec_prefill: &GQAMetadataBuffers,
         pages: &Buffer,
     ) -> Qwen3xDFlash2PrefillRecording {
-        let num_tokens: u32 = selection
-            .main_row_indices
-            .len()
-            .try_into()
-            .expect("Qwen3x DFlash2 Prefill token count must fit u32");
-        assert_eq!(selection.req_slots.len(), selection.main_row_indices.len());
-        assert_eq!(selection.flat_token_indices.len(), selection.main_row_indices.len());
-        self.prefill_main_row_indices
-            .write_typed(0, &selection.main_row_indices);
-        self.prefill_req_slots.write_typed(0, &selection.req_slots);
-        self.prefill_flat_token_indices
-            .write_typed(0, &selection.flat_token_indices);
-        let main_rows = if selection.main_rows_are_prefix() {
-            MainResidualRows::Prefix
-        } else {
-            MainResidualRows::Indices(&self.prefill_main_row_indices)
-        };
+        let num_tokens = spec_prefill.replay_shape().num_tokens;
         let input = Qwen3xDFlash2PrefillArgs {
             num_tokens,
-            main_rows,
-            req_slots: &self.prefill_req_slots,
-            flat_token_indices: &self.prefill_flat_token_indices,
+            req_slots: spec_prefill.req_slots(),
+            flat_token_indices: spec_prefill.flat_token_indices(),
             pages,
         };
-        let (prepared_key, arguments) = self.prefill.component().prepare_replay(num_tokens, main_rows.gathers());
+        let (prepared_key, arguments) = self.prefill.component().prepare_replay(num_tokens);
         let (key, _) = self.prefill.record(runtime, &input);
         assert_eq!(key, prepared_key);
         Qwen3xDFlash2PrefillRecording { key, arguments }
     }
 
-    pub fn record_decode(
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_decode_prepare(
         &mut self,
         runtime: &MetalReplayRuntime<'_>,
         token_ids: &Buffer,
-        proposal: Qwen3xDFlash2ProposalInput<'_>,
+        rejection_sampling: SparseRejectionSamplingOutput<'_>,
+        req_slots: &[u32],
+        anchor_indices: &[u32],
+        num_spec_tokens: &[u32],
+        distribution_store: &SpecProbsStore,
+    ) -> (SpecDecodeInputRecording, u32) {
+        let block = self
+            .decode_input
+            .component()
+            .prepare(req_slots, anchor_indices, num_spec_tokens);
+        let num_active_requests = req_slots.len();
+        let num_total_requests = block.num_requests();
+        self.gqa_state
+            .prepare_bidi_block_with_active_requests(&block, num_active_requests);
+        let num_requests = self.output.component().prepare_static(req_slots, distribution_store);
+        let input = SpecDecodeInputArgs {
+            num_active_requests: num_active_requests as u32,
+            num_total_requests: num_total_requests as u32,
+            rejection_sampling,
+            metadata: self.gqa_state.metadata(),
+            block_token_ids: token_ids,
+            anchor_token_ids: self.output.component().anchor_token_ids(),
+        };
+        let (prepared_key, arguments) = self.decode_input.component().prepare_replay_arguments(&input);
+        let (key, _) = self.decode_input.record(runtime, &input);
+        assert_eq!(key, prepared_key);
+        (SpecDecodeInputRecording { key, arguments }, num_requests)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_spec_decode(
+        &mut self,
+        runtime: &MetalReplayRuntime<'_>,
+        token_ids: &Buffer,
+        decode_prepare: SpecDecodeInputRecording,
+        num_requests: u32,
+        req_slots: Vec<u32>,
         pages: &Buffer,
         distribution_store: &SpecProbsStore,
     ) -> Qwen3xDFlash2DecodeRecording {
-        let query_block_size = self.num_spec_tokens + 1;
-        let (flat_query_token_indices, visible_history_token_ranges) =
-            dflash2_query_layout(proposal.anchor_positions, query_block_size, self.sliding_window);
-        let block = BiDiBlockGQAMetadata::new(
-            &proposal.req_slots,
-            &flat_query_token_indices,
-            &visible_history_token_ranges,
-            query_block_size,
-        );
-        self.gqa_state.prepare_bidi_block(&block);
-        let mut block_token_ids = Vec::with_capacity(block.num_tokens());
-        for &anchor_token_id in proposal.anchor_token_ids {
-            block_token_ids.push(i32::try_from(anchor_token_id).expect("Qwen3x DFlash2 anchor token ID must fit i32"));
-            block_token_ids.extend(std::iter::repeat_n(self.mask_token_id, self.num_spec_tokens));
-        }
-        token_ids.write_typed(0, &block_token_ids);
-        let num_requests = self.output.component().prepare(Qwen3xDFlash2OutputPrepare {
-            req_slots: &proposal.req_slots,
-            anchor_token_ids: proposal.anchor_token_ids,
-            anchor_positions: proposal.anchor_positions,
-            distribution_store,
-        });
+        let metadata = self.gqa_state.metadata();
         let embed_input = Qwen3xDFlash2EmbedArgs {
-            num_tokens: block
-                .num_tokens()
-                .try_into()
-                .expect("Qwen3x DFlash2 query token count must fit u32"),
+            num_tokens: metadata.replay_shape().num_tokens,
             token_ids,
             hidden_output: &self.hidden_input,
         };
         let (prepared_embed_key, embed_arguments) = self.embed.component().prepare_replay(embed_input.num_tokens);
         let (embed_key, _) = self.embed.record(runtime, &embed_input);
         assert_eq!(embed_key, prepared_embed_key);
-        let metadata = self.gqa_state.metadata();
         let body_input = Qwen3xDFlash2BodyArgs {
             num_tokens: metadata.replay_shape().num_tokens,
             metadata,
@@ -348,6 +332,7 @@ impl Qwen3xDFlash2Execution {
         let output_input = Qwen3xDFlash2OutputArgs {
             num_requests,
             hidden: &self.hidden_output,
+            sample_positions: self.decode_input.component().sample_positions(),
             distribution_store,
         };
         let (output_key, _) = self.output.record(runtime, &output_input);
@@ -356,29 +341,33 @@ impl Qwen3xDFlash2Execution {
             .component()
             .add_replay_arguments(num_requests, &mut output_arguments);
         Qwen3xDFlash2DecodeRecording {
+            decode_prepare,
             embed_key,
             embed_arguments,
             body_key,
             body_arguments,
             output_key,
             output_arguments,
-            req_slots: proposal.req_slots,
+            req_slots,
         }
     }
 
-    pub fn submit(
-        &self,
-        runtime: &MetalReplayRuntime<'_>,
-        prefill: Option<&Qwen3xDFlash2PrefillRecording>,
-        decode: Option<&Qwen3xDFlash2DecodeRecording>,
-    ) -> MetalReplaySubmission {
-        let mut sequence = Vec::with_capacity(4);
-        if let Some(prefill) = prefill {
+    pub fn append_spec_replays<'a>(
+        &'a self,
+        sequence: &mut Vec<ReplayExecution<'a>>,
+        prefill: &'a Qwen3xDFlash2PrefillRecording,
+        decode: Option<&'a Qwen3xDFlash2DecodeRecording>,
+    ) {
+        if let Some(decode) = decode {
             sequence.push(ReplayExecution::new(
-                self.prefill.replay(&prefill.key),
-                &prefill.arguments,
+                self.decode_input.replay(&decode.decode_prepare.key),
+                &decode.decode_prepare.arguments,
             ));
         }
+        sequence.push(ReplayExecution::new(
+            self.prefill.replay(&prefill.key),
+            &prefill.arguments,
+        ));
         if let Some(decode) = decode {
             sequence.push(ReplayExecution::new(
                 self.embed.replay(&decode.embed_key),
@@ -393,8 +382,6 @@ impl Qwen3xDFlash2Execution {
                 &decode.output_arguments,
             ));
         }
-        assert!(!sequence.is_empty(), "Qwen3x DFlash2 submission requires Spec work");
-        runtime.submit_replay_sequence(&sequence)
     }
 
     pub fn read_proposal(
@@ -408,46 +395,13 @@ impl Qwen3xDFlash2Execution {
     }
 }
 
-fn dflash2_query_layout(
-    anchor_positions: &[u32],
-    query_block_size: usize,
-    sliding_window: u32,
-) -> (Vec<u32>, Vec<Range<u32>>) {
-    assert!(query_block_size > 0, "Qwen3x DFlash2 query block must contain rows");
-    assert!(sliding_window > 0, "Qwen3x DFlash2 sliding window must contain tokens");
-    let query_block_size_u32 = u32::try_from(query_block_size).expect("Qwen3x DFlash2 query block size must fit u32");
-    let capacity = anchor_positions
-        .len()
-        .checked_mul(query_block_size)
-        .expect("Qwen3x DFlash2 query row count must fit usize");
-    let mut flat_query_token_indices = Vec::with_capacity(capacity);
-    let mut visible_history_token_ranges = Vec::with_capacity(capacity);
-    for &anchor_position in anchor_positions {
-        assert!(anchor_position > 0, "Qwen3x DFlash2 Decode requires a nonempty history");
-        assert!(
-            anchor_position <= u32::MAX - query_block_size_u32,
-            "Qwen3x DFlash2 query positions must fit u32"
-        );
-        for block_offset in 0..query_block_size {
-            let query_position = anchor_position + block_offset as u32;
-            let history_begin = (query_position + 1).saturating_sub(sliding_window);
-            assert!(
-                history_begin < anchor_position,
-                "Qwen3x DFlash2 sliding history must contain a token for every query row"
-            );
-            flat_query_token_indices.push(query_position);
-            visible_history_token_ranges.push(history_begin..anchor_position);
-        }
-    }
-    (flat_query_token_indices, visible_history_token_ranges)
-}
-
 pub struct Qwen3xDFlash2PrefillRecording {
     key: Qwen3xDFlash2PrefillReplayKey,
     arguments: ReplayArguments,
 }
 
 pub struct Qwen3xDFlash2DecodeRecording {
+    decode_prepare: SpecDecodeInputRecording,
     embed_key: Qwen3xDFlash2EmbedReplayKey,
     embed_arguments: ReplayArguments,
     body_key: Qwen3xDFlash2BodyReplayKey,
@@ -455,24 +409,4 @@ pub struct Qwen3xDFlash2DecodeRecording {
     output_key: Qwen3xDFlash2OutputReplayKey,
     output_arguments: ReplayArguments,
     req_slots: Vec<u32>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::dflash2_query_layout;
-
-    #[test]
-    fn test_query_layout_applies_sliding_window_per_query_row() {
-        let (positions, ranges) = dflash2_query_layout(&[10, 20], 4, 8);
-
-        assert_eq!(positions, [10, 11, 12, 13, 20, 21, 22, 23]);
-        assert_eq!(ranges, [3..10, 4..10, 5..10, 6..10, 13..20, 14..20, 15..20, 16..20]);
-    }
-
-    #[test]
-    fn test_query_layout_clamps_history_begin_to_zero() {
-        let (_, ranges) = dflash2_query_layout(&[1], 4, 8);
-
-        assert_eq!(ranges, [0..1, 0..1, 0..1, 0..1]);
-    }
 }

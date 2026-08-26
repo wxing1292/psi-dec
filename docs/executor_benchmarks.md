@@ -65,6 +65,23 @@ These targets share `--iters`, `--warmup-iters`, and `--runs`.
 
 Production `src` must not gain benchmark-only state, feature paths, or environment controls.
 
+For the Qwen3x GPU-prepared DSpark path or the Qwen3.5 DFlash2 path, compare a baseline commit or binary with the
+current commit or binary.
+Do not add a production executor mode, service option, or configuration key to select the old CPU read boundary.
+Use the same process shape, model, request batch, seeds, and sampler parameters for both runs.
+Record CPU preparation/read time, combined Main-and-Spec wall time, replay cache hit/build state, and proposal
+throughput.
+The combined submission duration is not a Main-only metric.
+
+For full-cycle measurements, start the Qwen3 or Qwen3.5 DSpark service, or the Qwen3.5 DFlash2 service, with the
+production commands in [`service.md`](service.md), and drive it with the production `decode` client. This path
+exercises the combined Main-and-Spec submission and reports
+`main_spec_replay_elapsed` through the executor timing data. Use identical server and client arguments for the
+baseline and current binaries.
+
+Run the initial measurements with the serial Metal compute pass.
+Treat a concurrent compute dispatch and a multi-queue overlap as separate measured follow-ups.
+
 ## Target meanings
 
 - `norm` measures standalone RMSNorm and residual-add RMSNorm variants.
@@ -115,7 +132,7 @@ Production `src` must not gain benchmark-only state, feature paths, or environme
 - `gqa_bidi_block_sdpa` measures the model-independent bidirectional local-block SDPA map component.
   It accepts block size, request count, head geometry, partial-state Q width, and dtype as CLI arguments.
   The default `max_q_tokens = 8` matches the current production TiledQ partial-state layout.
-  The backend owns its one-SIMDgroup threadblock geometry.
+  The backend owns its 32-thread threadgroup geometry.
 - `qwen3_dspark` loads real Main and DSpark checkpoints.
   It runs the public executor lifecycle for `main` or `dspark`.
   It uses the checkpoint `block_size` as the DSpark proposal length.

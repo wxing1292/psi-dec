@@ -12,9 +12,7 @@ impl Qwen35Executor {
                     num_spec_tokens <= self.speculator.num_spec_tokens(),
                     "qwen3.5 MTP proposal num_spec_tokens exceeds initialized MTP capacity"
                 );
-                let num_fixed_tokens = (flat_end - flat_start)
-                    .checked_sub(num_spec_tokens)
-                    .expect("qwen3.5 MTP proposal requires num_spec_tokens <= q_len");
+                let num_fixed_tokens = flat_end - flat_start - num_spec_tokens;
                 assert!(
                     num_fixed_tokens > 0,
                     "qwen3.5 MTP proposal requires a non-spec anchor token"

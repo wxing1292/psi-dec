@@ -123,10 +123,13 @@ impl Qwen3Microbatch {
                 .token_index()
                 .try_into()
                 .expect("Qwen3 request token index must fit u32");
-            let q_len: u32 = request
+            let num_total_tokens: u32 = request
                 .token_cost()
                 .try_into()
-                .expect("Qwen3 request q_len must fit u32");
+                .expect("Qwen3 request token count must fit u32");
+            token_index
+                .checked_add(num_total_tokens)
+                .expect("Qwen3 request token extent must fit u32");
             let num_req_spec_tokens: u32 = request
                 .decoder_query_tokens
                 .num_spec_tokens()
@@ -141,20 +144,18 @@ impl Qwen3Microbatch {
                 },
             };
             assert!(
-                num_sample_rows <= q_len,
+                num_sample_rows <= num_total_tokens,
                 "Qwen3 Main sample rows must fit the request query width"
             );
-            let first_sample_offset = q_len
-                .checked_sub(num_sample_rows)
-                .expect("Qwen3 Main sample suffix must fit q_len");
-            flat_sample_mask.extend((0..q_len).map(|token_offset| token_offset >= first_sample_offset));
+            let first_sample_offset = num_total_tokens - num_sample_rows;
+            flat_sample_mask.extend((0..num_total_tokens).map(|token_offset| token_offset >= first_sample_offset));
             if matches!(request.decoder_query_tokens, QueryTokens::Prefill { .. }) {
                 assert_eq!(
                     num_req_spec_tokens, 0,
                     "Qwen3 prefill request must not contain speculative tokens"
                 );
             }
-            assert!(q_len > 0, "Qwen3 batch requires positive q_len");
+            assert!(num_total_tokens > 0, "Qwen3 batch requires request tokens");
 
             let token_ids: Vec<i32> = request
                 .decoder_query_tokens
@@ -167,7 +168,7 @@ impl Qwen3Microbatch {
                 .collect::<Vec<_>>();
             assert_eq!(
                 token_ids.len(),
-                q_len as usize,
+                num_total_tokens as usize,
                 "Qwen3 token lane must match request width"
             );
             flat_token_ids.extend(token_ids);
@@ -213,7 +214,7 @@ impl Qwen3Microbatch {
         self.req_slots.len()
     }
 
-    pub fn q_len(&self, req_index: usize) -> u32 {
+    pub fn num_total_tokens(&self, req_index: usize) -> u32 {
         self.cu_tokens[req_index + 1] - self.cu_tokens[req_index]
     }
 

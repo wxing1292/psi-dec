@@ -212,13 +212,15 @@ impl Fixture {
             num_requests
         ];
         sampling_params.set(&req_slots, &sampler_configs);
-        let shape = markov.prepare(
-            &req_slots,
-            &anchor_token_ids,
-            &anchor_positions,
-            &sampler_configs,
-            &distribution_store,
+        markov.anchor_token_ids().write_typed(0, &anchor_token_ids);
+        let sample_positions = Buffer::from_slice(
+            device,
+            &anchor_positions
+                .iter()
+                .map(|&position| position + 1)
+                .collect::<Vec<_>>(),
         );
+        let shape = markov.prepare_static(&req_slots, &sampler_configs, &distribution_store);
         let base_logits = Buffer::new_zeroed_elements(
             device,
             num_requests
@@ -237,7 +239,14 @@ impl Fixture {
         );
         let replay_runtime = MetalReplayRuntime::new(runtime.stream());
         let mut recorder = replay_runtime.create_recorder();
-        markov.record(&mut recorder, shape, &base_logits, &hidden, &distribution_store);
+        markov.record(
+            &mut recorder,
+            shape,
+            &base_logits,
+            &sample_positions,
+            &hidden,
+            &distribution_store,
+        );
         let replay = recorder.build();
         let mut replay_arguments = ReplayArguments::new();
         markov.add_replay_arguments(shape, &mut replay_arguments);

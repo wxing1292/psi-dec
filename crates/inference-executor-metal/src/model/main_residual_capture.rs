@@ -1,17 +1,4 @@
 use inference_backend_metal::components::residual_add;
-use inference_backend_metal::metal::Buffer;
-
-#[derive(Clone, Copy)]
-pub enum MainResidualRows<'a> {
-    Prefix,
-    Indices(&'a Buffer),
-}
-
-impl MainResidualRows<'_> {
-    pub fn gathers(self) -> bool {
-        matches!(self, Self::Indices(_))
-    }
-}
 
 /// Selects stable capture destinations for Main layer residual outputs.
 ///

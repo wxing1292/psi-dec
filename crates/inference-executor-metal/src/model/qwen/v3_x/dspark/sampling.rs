@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use inference_backend_metal::components::embedding;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
@@ -143,21 +145,18 @@ impl Qwen3xDSparkMarkov {
         self.weights.take();
     }
 
-    pub fn prepare(
+    pub fn prepare_static(
         &self,
         req_slots: &[u32],
-        anchor_token_ids: &[u32],
-        anchor_positions: &[u32],
         sampler_configs: &[SamplerConfig],
         distribution_store: &SpecProbsStore,
     ) -> DSparkMarkovReplayShape {
-        self.backend.prepare(
-            req_slots,
-            anchor_token_ids,
-            anchor_positions,
-            sampler_configs,
-            distribution_store,
-        )
+        self.backend
+            .prepare_static(req_slots, sampler_configs, distribution_store)
+    }
+
+    pub fn anchor_token_ids(&self) -> &Buffer {
+        self.backend.anchor_token_ids()
     }
 
     pub fn record<'a, R>(
@@ -165,6 +164,7 @@ impl Qwen3xDSparkMarkov {
         recorder: &mut R,
         shape: DSparkMarkovReplayShape,
         base_logits: &'a Buffer,
+        sample_positions: &'a Buffer,
         hidden: &'a Buffer,
         distribution_store: &'a SpecProbsStore,
     ) where
@@ -183,6 +183,7 @@ impl Qwen3xDSparkMarkov {
             DSparkMarkovInput {
                 shape,
                 base_logits,
+                sample_positions,
                 distribution_store,
                 weights: weights.as_borrowed(),
                 confidence: DSparkConfidenceInput {
@@ -321,4 +322,3 @@ impl Qwen3xDSparkConfidenceWeights {
         }
     }
 }
-use std::rc::Rc;

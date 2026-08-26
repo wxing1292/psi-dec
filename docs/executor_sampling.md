@@ -39,14 +39,14 @@ crates/inference-executor-metal/src/sampling/
   dspark_markov.rs        sequential DSpark Markov, confidence, and sampling composition
   spec_probs.rs           SpecProbsStore sparse draft/target probability workspace
 
-crates/inference-executor-metal/src/model/qwen/v3_x/
-  spec_decode_input.rs    reusable fixed-capacity Spec Decode input owner
-
 crates/inference-executor-metal/src/model/qwen/v3_x/dspark/
   sampling.rs             Qwen3x Markov checkpoint weights and generic backend adapter
 
 crates/inference-executor-metal/src/model/qwen/v3_x/dflash2/
   output.rs               raw Top-K, selector checkpoint weights, path walk, and sparse draft storage
+
+crates/inference-executor-metal/src/model/qwen/v3_x/
+  spec_decode_input.rs    static and GPU-written fixed-block Decode-input owner
 ```
 
 Runtime core transports sampler configuration and sampled decisions.
@@ -140,15 +140,46 @@ compile-time constants require 256 threads. The recorded grid contains one threa
 slot. Replay arguments limit execution to the active request count.
 
 `SparseRejectionSamplingOutput` is the borrowed GPU-output boundary for accepted counts and sampled anchor token IDs.
-The model executor can pass this view to `spec_decode_input::Compute` without a host read or an intermediate copy.
-The transform writes accepted-dependent Spec Decode token, position, visible-history, TaskTemplate, and sampling-position
-metadata. Its replay key fixes the request capacity, Spec-block width, Q-range count, and TaskTemplate capacity.
-Its replay arguments select the active request prefix.
+Qwen3 and Qwen3.5 DSpark, and Qwen3.5 DFlash2, pass this view directly to `SpecDecodeInput`.
+They do not read rejection output before they record Spec Decode.
 
-`SpecDecodeInput` owns the acceptance-independent anchor buffer, the GPU-written first-sample-position buffer, and one
-fixed-capacity prepare replay lifecycle. `SpecDecodeInput::prepare` seeds BiDiBlockGQA metadata at maximum acceptance.
-It preserves active request order and fills only the inactive replay-capacity tail with unused valid request slots.
-The GPU transform rewrites active coordinates and endpoints before Spec Decode consumes the same buffers.
+Spec Prefill borrows `num_tokens`, request slots, and flat token indices directly from the current Main GQA metadata.
+That metadata already contains the complete active Main-row prefix and remains valid through the combined recording.
+`SpecDecodeInput::prepare` fills reusable GPU resources for the corresponding Spec Decode recording.
+
+`SpecDecodeInput` owns anchor indices and GPU-written first Spec sample positions for one Spec Decode lifecycle.
+It borrows the existing BiDiBlockGQA metadata buffers.
+It does not allocate a second GQA metadata owner or repack DSpark and DFlash2 sampling layouts.
+`record_decode_prepare` and `record_spec_decode` bind the same physical buffers.
+Active row order is semantic. Request row `r` must stay aligned across rejection outputs, anchor indices, token buffers,
+BiDiBlockGQA metadata, and sampling destinations. `num_total_requests` is the cached replay bucket and grid capacity.
+Active rows are its prefix, and inactive rows return before resource access. The owner fills inactive metadata rows with
+unused valid request slots only to materialize a structurally valid fixed-capacity BiDiBlockGQA layout.
+
+The `rejection_to_spec_decode_input` kernel uses one 32-thread threadgroup for each request-capacity slot.
+This is one Apple SIMDgroup on current targets, but correctness does not depend on SIMDgroup execution.
+Lane 0 writes request scalars.
+All threads stride the fixed Spec block and each fixed history-task quota.
+Replay arguments limit work to `num_active_requests`.
+Acceptance changes positions and range endpoints, but it does not change the grid or task count.
+The transform rewrites every active history task and preserves the final block-partial slot for each Q-token range.
+A history TaskTemplate is `{q_token_range_index, kv_token_begin, kv_token_end}`. It assigns one GQA Map threadblock the
+half-open persistent-history range `[kv_token_begin, kv_token_end)` for one Q-token range. One Map threadblock can loop
+over multiple K/V iterations in that range.
+The complete replay sequence is CPU-recorded before submission. Spec Decode prepare overwrites active query, range, and
+TaskTemplate coordinates before Spec Decode reads them. It cannot change the later replay key or grid, the Q-range and
+cumulative-partial structure, or the number of Map TaskTemplates.
+CPU preparation uses maximum acceptance to retain the metadata allocator's worst-case recorded split count and
+parallelism. Lower acceptance maps excess splits to canonical empty ranges. A smaller seed, including all-reject, can
+remain correct if each Q range retains at least one history task and its block partial. However, that seed can
+under-partition a later longer history range and change performance.
+At construction, the owner validates the model maximum anchor, the K/V iteration width, the Spec-block width, and
+the fixed TaskTemplate capacity with widened host arithmetic. This validation proves that all transform position,
+iteration-partition, and Task-quota intermediates fit `uint`. The Metal kernel then uses direct `uint` arithmetic.
+
+The transform records one Spec Decode prepare command. It writes the first Spec sample position as
+`accepted_anchor_index + 1`. DSpark step `i` adds `i` when it samples sequentially. DFlash2 adds its step index inside
+the path walk. No separate sampling-position update command is necessary.
 
 `SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
 `max_k` is the maximum sparse Top-K row width, not the vocabulary size.
@@ -199,8 +230,8 @@ Main and MTP share one `Rc<TopKSampling>` implementation.
 `RejectionSampler::prepare_replay_shape(...)` selects request, draft-distribution, and target-distribution capacities.
 It validates public prepared counts before it maps them to the `u32` replay domain.
 `RejectionSampling` validates the target-sampling and rejection shapes before the replay-cache lookup.
-`DSparkMarkovSampling` owns the compact request-slot mapping, first sample positions, partial candidates, and per-step
-outputs. It borrows the shared `SamplingParamsStore` through `Rc`.
+`DSparkMarkovSampling` owns the compact request-slot mapping, partial candidates, and per-step outputs.
+It borrows the shared `SamplingParamsStore` through `Rc`.
 It accepts borrowed weights at record time.
 `Qwen3xDSparkMarkov` owns Qwen checkpoint buffers and delegates execution to this backend owner.
 It loads one bounded `TensorMap` for W1, W2, and the required Markov-conditioned confidence head.
@@ -300,7 +331,7 @@ anchor token IDs + unary candidate IDs
 projected hidden + predecessor embeddings + successor embeddings + unary logits
   -> edge scores [request, step, predecessor, successor]
 
-edge scores + sampler runtime parameters
+edge scores + request-slot sampling parameters + first sample positions
   -> sequential request-local path walk
   -> proposal token/probability rows
   -> sparse draft distributions

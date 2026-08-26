@@ -227,6 +227,7 @@ pub trait ReplayableModel {
 pub struct ModelOutputTiming {
     pub main_replay_elapsed: Duration,
     pub main_sample_replay_elapsed: Duration,
+    pub main_spec_replay_elapsed: Duration,
     pub sample_read_elapsed: Duration,
     pub rejection_build_elapsed: Duration,
     pub rejection_read_elapsed: Duration,
@@ -240,6 +241,7 @@ impl ModelOutputTiming {
     pub fn add_assign(&mut self, other: Self) {
         self.main_replay_elapsed += other.main_replay_elapsed;
         self.main_sample_replay_elapsed += other.main_sample_replay_elapsed;
+        self.main_spec_replay_elapsed += other.main_spec_replay_elapsed;
         self.sample_read_elapsed += other.sample_read_elapsed;
         self.rejection_build_elapsed += other.rejection_build_elapsed;
         self.rejection_read_elapsed += other.rejection_read_elapsed;

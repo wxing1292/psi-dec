@@ -1090,7 +1090,10 @@ impl ExecutionTiming {
 }
 
 fn submit_wait_elapsed(timing: &ModelOutputTiming) -> Duration {
-    timing.main_replay_elapsed + timing.main_sample_replay_elapsed + timing.spec_replay_elapsed
+    timing.main_replay_elapsed
+        + timing.main_sample_replay_elapsed
+        + timing.main_spec_replay_elapsed
+        + timing.spec_replay_elapsed
 }
 
 fn assert_stage_accounting(timing: &ExecutionTiming) {

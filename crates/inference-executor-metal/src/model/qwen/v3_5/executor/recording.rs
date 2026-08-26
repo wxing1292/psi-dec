@@ -62,16 +62,30 @@ impl Qwen35Executor {
                 "qwen3.5 Main recording without output rows must not contain sampling"
             );
         }
-        trace::qwen35_state(|| {
-            format!("event=submit_main_sequence_start main_key={:?}", recorder.main_key)
-        });
+
+        if self.speculator.is_dspark() {
+            self.speculator.dspark().execution.append_spec_replays(
+                &mut sequence,
+                recorder
+                    .dspark_spec_prefill
+                    .as_ref()
+                    .expect("qwen3.5 combined DSpark sequence requires Spec Prefill"),
+                recorder.dspark_spec_decode.as_ref(),
+            );
+        } else if self.speculator.is_dflash2() {
+            self.speculator.dflash2().execution.append_spec_replays(
+                &mut sequence,
+                recorder
+                    .dflash2_spec_prefill
+                    .as_ref()
+                    .expect("qwen3.5 combined DFlash2 sequence requires Spec Prefill"),
+                recorder.dflash2_spec_decode.as_ref(),
+            );
+        }
+
+        trace::qwen35_state(|| format!("event=submit_main_sequence_start main_key={:?}", recorder.main_key));
         let submission = self.replay_runtime().submit_replay_sequence(&sequence);
-        trace::qwen35_state(|| {
-            format!(
-                "event=submit_main_sequence_submitted main_key={:?}",
-                recorder.main_key
-            )
-        });
+        trace::qwen35_state(|| format!("event=submit_main_sequence_submitted main_key={:?}", recorder.main_key));
         submission
     }
     fn submit_gdn_state_restore(&mut self) -> Duration {

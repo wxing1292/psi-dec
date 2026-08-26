@@ -1,67 +1,59 @@
 impl Qwen3Executor {
-    fn record_dspark_decode(
-        &mut self,
-        microbatch: &Qwen3Microbatch,
-        decisions: &[Qwen3DecodeDecision],
-    ) -> Qwen3xDSparkDecodeRecording {
-        let mut req_slots = Vec::new();
-        let mut anchor_token_ids = Vec::new();
-        let mut anchor_positions = Vec::new();
-        let mut sampler_configs = Vec::new();
-        let mut decision_index = 0usize;
-        for req_index in 0..microbatch.num_reqs() {
-            if !microbatch.is_decode_req(req_index) {
-                continue;
-            }
-            let decision = decisions
-                .get(decision_index)
-                .expect("Qwen3 DSpark requires one Main decision per decode request");
-            let num_spec_tokens = microbatch.num_spec_tokens(req_index);
-            assert!(
-                decision.validated_tokens.len() <= num_spec_tokens as usize,
-                "Qwen3 DSpark accepted-token count exceeds the speculative suffix"
-            );
-            let q_end = microbatch.cu_tokens()[req_index + 1] as usize;
-            let spec_start = q_end - num_spec_tokens as usize;
-            assert!(
-                microbatch.flat_token_ids()[spec_start..spec_start + decision.validated_tokens.len()]
-                    .iter()
-                    .copied()
-                    .eq(decision.validated_tokens.iter().map(|&token_id| {
-                        i32::try_from(token_id).expect("Qwen3 accepted token ID must fit i32")
-                    })),
-                "Qwen3 accepted tokens must match the speculative input prefix"
-            );
-            let num_fixed_tokens = microbatch.q_len(req_index) - num_spec_tokens;
-            let anchor_position =
-                microbatch.token_indices()[req_index] + num_fixed_tokens + decision.validated_tokens.len() as u32;
-            req_slots.push(microbatch.req_slots()[req_index]);
-            anchor_token_ids.push(decision.sampled_token);
-            anchor_positions.push(anchor_position);
-            sampler_configs.push(microbatch.sampler_configs()[req_index]);
-            decision_index += 1;
-        }
-        assert_eq!(
-            decision_index,
-            decisions.len(),
-            "Qwen3 DSpark decisions must match decode requests"
-        );
-        assert!(!req_slots.is_empty(), "Qwen3 DSpark proposal requires decode requests");
-
+    fn record_spec(&mut self, recorder: &mut Qwen3ModelOpsRecorder, microbatch: &Qwen3Microbatch) {
+        assert!(recorder.dspark_spec_prefill.is_none() && recorder.dspark_spec_decode.is_none());
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
+        let pages = self.pages.buffer();
+        // Spec Prefill consumes every Main row. Main GQA metadata already owns
+        // the expanded per-row request slots and token indices.
+        let spec_prefill = self.main_gqa_state.metadata();
+        recorder.dspark_spec_prefill = Some(
+            self.speculator
+                .dspark_mut()
+                .execution
+                .record_spec_prefill(&runtime, spec_prefill, pages),
+        );
+        let Some(prepared) = recorder.rejection_prepared.as_ref() else {
+            return;
+        };
+        let decode_req_indices = &prepared.decode_req_indices;
+
+        let mut req_slots = Vec::with_capacity(decode_req_indices.len());
+        let mut anchor_indices = Vec::with_capacity(decode_req_indices.len());
+        let mut num_spec_tokens_by_request = Vec::with_capacity(decode_req_indices.len());
+        let mut sampler_configs = Vec::with_capacity(decode_req_indices.len());
+        for &req_index in decode_req_indices {
+            let num_spec_tokens = microbatch.num_spec_tokens(req_index);
+            let anchor_index = microbatch.token_indices()[req_index]
+                + microbatch.num_total_tokens(req_index)
+                - num_spec_tokens;
+            req_slots.push(microbatch.req_slots()[req_index]);
+            anchor_indices.push(anchor_index);
+            num_spec_tokens_by_request.push(num_spec_tokens);
+            sampler_configs.push(microbatch.sampler_configs()[req_index]);
+        }
+
+        let token_ids = &self.token_ids;
         let dspark = self.speculator.dspark_mut();
-        dspark.execution.record_decode(
+        let rejection_sampling = dspark.rejection_sampling.component().rejector().output();
+        let (decode_prepare, markov_replay_shape) = dspark.execution.record_decode_prepare(
             &runtime,
-            &self.token_ids,
-            Qwen3xDSparkProposalInput::new(
-                req_slots,
-                &anchor_token_ids,
-                &anchor_positions,
-                &sampler_configs,
-            ),
-            self.pages.buffer(),
+            token_ids,
+            rejection_sampling,
+            &req_slots,
+            &anchor_indices,
+            &num_spec_tokens_by_request,
+            &sampler_configs,
             &dspark.spec_probs,
-        )
+        );
+        recorder.dspark_spec_decode = Some(dspark.execution.record_spec_decode(
+            &runtime,
+            token_ids,
+            decode_prepare,
+            markov_replay_shape,
+            req_slots,
+            pages,
+            &dspark.spec_probs,
+        ));
     }
 
     fn read_dspark_proposal(
@@ -74,9 +66,9 @@ impl Qwen3Executor {
             .execution
             .read_proposal(
                 recorder
-                    .dspark_decode
+                    .dspark_spec_decode
                     .as_ref()
-                    .expect("Qwen3 DSpark proposal requires a Decode recording"),
+                    .expect("Qwen3 DSpark proposal requires a Spec Decode recording"),
                 &mut dspark.spec_probs,
             );
         assert_eq!(

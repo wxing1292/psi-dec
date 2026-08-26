@@ -678,15 +678,15 @@ The current implementation submits each dependent pass separately and reads its 
 prepares the next pass.
 All passes reuse the same recorded replay programs, weights, scratch, and bound workspaces.
 
-A DSpark-enabled batch records DSpark Prefill after the Main CPU read.
-DSpark Prefill creates persistent DSpark history K/V from the completed Main capture.
-A decode-ready batch then records DSpark Decode in the same Spec submission.
-DSpark Decode contains DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
+A DSpark-enabled batch records DSpark Prefill after Main in the same ordered GPU submission.
+DSpark Prefill creates persistent DSpark history K/V from the Main capture.
+A decode-ready batch then records GPU Spec Decode prepare and DSpark Spec Decode before that submission.
+DSpark Spec Decode contains DSparkEmbed, DSpark, DSparkGatherUnembed, and DSparkSampling.
 
-A DFlash2-enabled batch uses the same outer two-stage lifecycle through its separate owner.
-DFlash2 Prefill creates persistent DFlash2 history K/V from the completed Main capture.
-A decode-ready batch records DFlash2 Decode after Prefill.
-DFlash2 Decode contains DFlash2Embed, the DFlash2 body, and DFlash2Output.
+A DFlash2-enabled batch uses the same integrated Main submission through its separate owner.
+DFlash2 Prefill creates persistent DFlash2 history K/V from the Main capture.
+A decode-ready batch records GPU Spec Decode prepare and DFlash2 Spec Decode after Prefill and before submission.
+DFlash2 Spec Decode contains DFlash2Embed, the DFlash2 body, and DFlash2Output.
 The body combines per-row sliding-history attention with bidirectional local-block attention and applies dynamic
 grouped convolution.
 DFlash2Output builds and samples the candidate lattice and writes sparse draft distributions.
@@ -722,9 +722,11 @@ all earlier speculative tokens passed verification. `num_spec_token_by_index[i]`
 batches before they calculate `acceptance_rate_by_index`.
 
 `main_ms` covers `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
-`spec_ms` covers the complete MTP, DSpark, or DFlash2 Spec lifecycle.
-It includes all dependent MTP passes and any recorded block-Spec Prefill and Decode work.
-DSpark or DFlash2 prefill-only batches can have nonzero `spec_ms` and zero `spec_passes`.
+For Qwen3 and Qwen3.5 DSpark, and for Qwen3.5 DFlash2, it also covers GPU Spec Decode prepare, Spec Prefill, Spec
+Decode, proposal sampling, and proposal read in the same ordered submission.
+`spec_ms` covers a separate Spec lifecycle. Qwen3.5 MTP uses this boundary. DSpark and DFlash2 do not, so their
+`spec_ms` is zero.
+DSpark or DFlash2 prefill-only batches can have nonzero `main_ms` and zero `spec_passes`.
 `spec_passes` counts Spec Decode forwards. These values are host elapsed latencies. They are not GPU kernel timings.
 
 `--logging info` does not emit the executor batch performance event. `--logging debug` also emits request and response
@@ -746,8 +748,9 @@ submit_main -> read_main
 
 embed_spec -> forward_spec -> unembed_spec -> sample_spec    MTP
 
-prefill_spec -> decode_spec                                DSpark or DFlash2
-submit_spec -> read_spec
+Main -> RejectionSampling -> Spec Decode prepare -> Spec Prefill    DSpark or DFlash2
+  -> Spec Decode -> proposal sampling
+submit_main -> read_main
 ```
 
 A pass is one proposal forward that runs.

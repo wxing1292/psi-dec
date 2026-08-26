@@ -42,6 +42,7 @@ pub struct Qwen3xDFlash2Loaded {
     pub sliding_window: usize,
     pub page_bytes: usize,
     pub max_main_tokens: usize,
+    pub max_anchor_position: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -55,7 +56,7 @@ pub fn load_qwen3x_dflash2(
     sampling_params: Rc<SamplingParamsStore>,
 ) -> Result<Qwen3xDFlash2Loaded, ModelExecutorError> {
     let num_spec_tokens = config.num_spec_tokens().get();
-    let query_block_size = config.block_size;
+    let spec_block_size = config.block_size;
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
     let Qwen3xDFlash2WeightBindings {
         main_feature,
@@ -87,7 +88,7 @@ pub fn load_qwen3x_dflash2(
             .try_into()
             .expect("Qwen3x DFlash2 pages per block must fit u32"),
     };
-    let capacity = BiDiBlockCapacity::new(load_config.max_requests, query_block_size);
+    let capacity = BiDiBlockCapacity::new(load_config.max_requests, spec_block_size);
     let gqa_state = BiDiBlockGQAState::new(
         device,
         attention_core,
@@ -155,6 +156,10 @@ pub fn load_qwen3x_dflash2(
         sliding_window: config.sliding_window,
         page_bytes: load_config.page_size_bytes,
         max_main_tokens: load_config.max_tokens,
+        max_anchor_position: load_config
+            .max_position_embeddings
+            .try_into()
+            .expect("Qwen3x DFlash2 maximum anchor position must fit u32"),
     })
 }
 

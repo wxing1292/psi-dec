@@ -262,7 +262,7 @@ impl Qwen35MTP {
         let max_context_tokens = (0..microbatch.num_reqs())
             .map(|req_index| {
                 microbatch.token_indices()[req_index]
-                    .checked_add(microbatch.q_len(req_index))
+                    .checked_add(microbatch.num_total_tokens(req_index))
                     .expect("qwen3.5 MTP GQA request context length overflow")
             })
             .max()
