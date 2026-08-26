@@ -8,6 +8,9 @@ pub use decoder::DecoderSyncBlocks;
 pub use decoder::QueryTokens;
 pub use decoder::SampledTokens;
 
+mod resource;
+pub use resource::DeviceResourcePlacement;
+
 #[mockall::automock]
 pub trait DevReq: Send + 'static {
     fn id(&self) -> RawRequestID;
@@ -35,6 +38,7 @@ pub struct DeviceRequest {
     pub req_slot: RawRequestSlot,
     pub decoder_query_tokens: QueryTokens,
     pub decoder_sync_blocks: DecoderSyncBlocks,
+    pub resource_placements: Vec<DeviceResourcePlacement>,
     pub sampling_config: SamplingConfig,
 }
 
@@ -44,6 +48,7 @@ impl DeviceRequest {
         req_slot: RawRequestSlot,
         decoder_query_tokens: QueryTokens,
         decoder_sync_blocks: DecoderSyncBlocks,
+        resource_placements: Vec<DeviceResourcePlacement>,
         sampling_config: SamplingConfig,
     ) -> Self {
         Self {
@@ -51,6 +56,7 @@ impl DeviceRequest {
             req_slot,
             decoder_query_tokens,
             decoder_sync_blocks,
+            resource_placements,
             sampling_config,
         }
     }

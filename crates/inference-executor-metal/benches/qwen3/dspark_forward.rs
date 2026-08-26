@@ -349,6 +349,7 @@ impl MainFixture {
                         ]],
                         Vec::new(),
                     ),
+                    vec![],
                     SamplingConfig {
                         max_sampled_tokens: usize::MAX,
                         temperature: 0.0,

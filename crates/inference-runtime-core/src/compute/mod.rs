@@ -4,6 +4,7 @@ pub use request::BatchDeviceRequest;
 pub use request::DecoderSyncBlocks;
 pub use request::DevReq;
 pub use request::DeviceRequest;
+pub use request::DeviceResourcePlacement;
 pub use request::MockBatchDevReq;
 pub use request::MockDevReq;
 pub use request::QueryTokens;

@@ -142,6 +142,7 @@ mod tests {
                 spec_tokens: spec_tokens.into_iter().map(Token::new).collect(),
             },
             DecoderSyncBlocks::new(0, vec![], vec![]),
+            vec![],
             SamplingConfig::default(),
         );
         Qwen35Microbatch::from_requests(&[request], vec![SamplerConfig::default()])
@@ -159,6 +160,7 @@ mod tests {
                 window,
             },
             DecoderSyncBlocks::new(0, vec![], vec![]),
+            vec![],
             SamplingConfig::default(),
         );
         Qwen35Microbatch::from_requests(&[request], vec![SamplerConfig::default()])

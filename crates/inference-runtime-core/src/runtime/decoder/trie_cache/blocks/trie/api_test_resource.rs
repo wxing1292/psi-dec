@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
+use super::api_test_support::concrete_resource;
 use crate::channel::Shutdown;
+use crate::compute::QueryTokens;
 use crate::memory::U32IDAllocator;
 use crate::runtime::Token;
 use crate::runtime::decoder::BlockAnnotation;
@@ -73,21 +75,63 @@ fn test_resource_annotations_block_nonzero_l2() {
     );
 }
 
+#[test]
+fn test_device_resource_placements_w_query_intersection() {
+    let resource_id = ResourceID::new(ResourceTypeID::new(7));
+    let placement = ResourcePlacement::new(resource_id, vec![(1, 1, 2), (6, 4, 2)], 9);
+    let (resource, _resource_allocator) = concrete_resource(resource_id, 8);
+    let blocks = TestBlocks::<1>::new(
+        block_cache::<1>(),
+        vec![resource],
+        vec![placement],
+        std::iter::empty::<Token>(),
+        std::iter::empty::<Token>(),
+        (0..9).map(Token::new),
+    );
+    let query_tokens = QueryTokens::Prefill {
+        epoch: 0,
+        token_index: 2,
+        tokens: vec![Token::new(2)],
+        window: 1,
+    };
+
+    let placements = blocks.device_resource_placements(&query_tokens);
+
+    assert_eq!(1, placements.len());
+    assert_eq!(0, placements[0].arena_offset_bytes());
+    assert_eq!(32, placements[0].arena_len_bytes());
+    assert_eq!(&[(1, 1, 2), (6, 4, 2)], placements[0].placements());
+}
+
+#[test]
+fn test_device_resource_placements_wo_query_intersection() {
+    let resource_id = ResourceID::new(ResourceTypeID::new(7));
+    let placement = ResourcePlacement::new(resource_id, vec![(1, 1, 2), (6, 4, 2)], 9);
+    let (resource, _resource_allocator) = concrete_resource(resource_id, 8);
+    let blocks = TestBlocks::<1>::new(
+        block_cache::<1>(),
+        vec![resource],
+        vec![placement],
+        std::iter::empty::<Token>(),
+        std::iter::empty::<Token>(),
+        (0..9).map(Token::new),
+    );
+    let query_tokens = QueryTokens::Prefill {
+        epoch: 0,
+        token_index: 3,
+        tokens: vec![Token::new(3), Token::new(4)],
+        window: 2,
+    };
+
+    assert!(blocks.device_resource_placements(&query_tokens).is_empty());
+}
+
 fn resource_annotations<const L: usize>(
     resource_id: ResourceID,
     block_index: usize,
 ) -> [SmallVec<[BlockAnnotation; 1]>; L] {
-    let block_cache_vec = std::array::from_fn(|_| {
-        let page_id_allocator = Arc::new(U32IDAllocator::new(16));
-        Arc::new(TestSingleLaneBlockCache::new(
-            TPKVBlockAllocator::new(1, page_id_allocator.clone()),
-            TPStateBlockAllocator::new(1, page_id_allocator),
-            16,
-            Shutdown::new(),
-        ))
-    });
     let blocks = TestBlocks::new(
-        Arc::new(TestMultiLaneBlockCache::new(block_cache_vec)),
+        block_cache::<L>(),
         vec![Resource::Symbolic(SymbolicResource::new(
             resource_id,
             ResourceURI::new("test://resource".to_string()),
@@ -98,6 +142,19 @@ fn resource_annotations<const L: usize>(
         (0..9).map(Token::new),
     );
     blocks.block_annotation_vec(block_index)
+}
+
+fn block_cache<const L: usize>() -> Arc<TestMultiLaneBlockCache<L>> {
+    let block_cache_vec = std::array::from_fn(|_| {
+        let page_id_allocator = Arc::new(U32IDAllocator::new(16));
+        Arc::new(TestSingleLaneBlockCache::new(
+            TPKVBlockAllocator::new(1, page_id_allocator.clone()),
+            TPStateBlockAllocator::new(1, page_id_allocator),
+            16,
+            Shutdown::new(),
+        ))
+    });
+    Arc::new(TestMultiLaneBlockCache::new(block_cache_vec))
 }
 
 fn resource(resource_id: ResourceID, local_token_index: u16, resource_index: u32, len: u16) -> BlockAnnotation {

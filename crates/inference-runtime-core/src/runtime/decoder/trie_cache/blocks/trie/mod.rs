@@ -5,6 +5,8 @@ use ahash::AHashMap;
 use ordered_float::NotNan;
 
 use crate::compute::DecoderSyncBlocks;
+use crate::compute::DeviceResourcePlacement;
+use crate::compute::QueryTokens;
 use crate::runtime::Token;
 #[cfg(debug_assertions)]
 use crate::runtime::decoder::trie_cache::DecoderBlock;
@@ -93,10 +95,6 @@ where
         }
     }
 
-    pub fn resource_placements(&self) -> &[ResourcePlacement] {
-        &self.resource_placements
-    }
-
     pub fn resource_symbolic_to_concrete(&mut self, resource: ConcreteResource) {
         let resource_id = resource.id();
         let owned_resource = self
@@ -113,6 +111,34 @@ where
             "resource materialization must preserve the resource URI"
         );
         *owned_resource = Resource::Concrete(resource);
+    }
+
+    pub fn device_resource_placements(&self, query_tokens: &QueryTokens) -> Vec<DeviceResourcePlacement> {
+        let query_token_start = query_tokens.token_index();
+        let query_token_end = query_token_start + query_tokens.token_consumption();
+        self.resource_placements
+            .iter()
+            .filter_map(|placement| {
+                let intersects_query = placement.placements().iter().any(|&(token_index, _, len)| {
+                    let token_end = token_index + len;
+                    query_token_start.max(token_index) < query_token_end.min(token_end)
+                });
+                if !intersects_query {
+                    return None;
+                }
+                let concrete = self
+                    .resources
+                    .get(&placement.resource_id())
+                    .expect("device resource placement must reference an owned resource")
+                    .concrete()
+                    .expect("device resource placement requires a concrete resource");
+                Some(DeviceResourcePlacement::new(
+                    concrete.source().offset_bytes(),
+                    concrete.source().len_bytes(),
+                    placement.placements().to_vec(),
+                ))
+            })
+            .collect()
     }
 
     #[cfg(debug_assertions)]

@@ -133,11 +133,13 @@ where
                 let compute_phase = compute_phase(&decoder_query_tokens);
                 self.in_flight_computes.push_back(compute_phase);
                 let decoder_sync_blocks = self.decoder_blocks.prepare_blocks();
+                let resource_placements = self.decoder_blocks.device_resource_placements(&decoder_query_tokens);
                 let dev_req = DeviceRequest::new(
                     self.req_id(),
                     self.req_slot(),
                     decoder_query_tokens,
                     decoder_sync_blocks,
+                    resource_placements,
                     self.sampling_config().clone(),
                 );
                 PrepareResult::Continue { dev_req, compute_phase }

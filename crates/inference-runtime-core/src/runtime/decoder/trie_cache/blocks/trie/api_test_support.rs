@@ -10,9 +10,7 @@ use crate::runtime::resource::ResourceID;
 use crate::runtime::resource::ResourceURI;
 use crate::runtime::resource::SymbolicResource;
 
-const RESOURCE_STORAGE_BYTES: usize = 64;
-const RESOURCE_ALLOCATION_BYTES: usize = 8;
-const NUM_RESOURCE_TOKENS: u32 = 2;
+const RESOURCE_TOKEN_BYTES: usize = 4;
 
 struct TestResourceStorage(Box<[u8]>);
 
@@ -40,11 +38,12 @@ impl BlockStorage for TestResourceStorage {
     }
 }
 
-pub fn concrete_resource(resource_id: ResourceID) -> (Resource, impl Send) {
-    let storage = TestResourceStorage(vec![0; RESOURCE_STORAGE_BYTES].into_boxed_slice());
-    let allocator = OffsetAllocator::new(Allocator::new(RESOURCE_STORAGE_BYTES as u32), storage);
-    let source = allocator.alloc_segment(RESOURCE_ALLOCATION_BYTES).unwrap();
+pub fn concrete_resource(resource_id: ResourceID, num_resource_tokens: u32) -> (Resource, impl Send) {
+    let allocation_bytes = num_resource_tokens as usize * RESOURCE_TOKEN_BYTES;
+    let storage = TestResourceStorage(vec![0; allocation_bytes].into_boxed_slice());
+    let allocator = OffsetAllocator::new(Allocator::new(allocation_bytes as u32), storage);
+    let source = allocator.alloc_segment(allocation_bytes).unwrap();
     let resource = SymbolicResource::new(resource_id, ResourceURI::new("test://resource".to_string()))
-        .into_concrete(source, NUM_RESOURCE_TOKENS);
+        .into_concrete(source, num_resource_tokens);
     (Resource::Concrete(resource), allocator)
 }

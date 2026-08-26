@@ -197,7 +197,7 @@ fn test_init_block_once_full_block_cache_miss_resource_found_w_mtp() {
     let block_cache = initialize_block_cache([1024; NUM_CACHE_LANE]);
     let resource_id = ResourceID::new(ResourceTypeID::new(7));
     let placement = ResourcePlacement::new(resource_id, vec![(1, 0, 2)], total_tokens.len());
-    let (resource, _resource_allocator) = concrete_resource(resource_id);
+    let (resource, _resource_allocator) = concrete_resource(resource_id, 2);
     let mut blocks = TestTrieKVBlocks::new(
         block_cache,
         vec![resource],
