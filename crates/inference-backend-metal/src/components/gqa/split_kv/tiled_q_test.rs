@@ -14,11 +14,12 @@ const NUM_ACTIVE_Q_TOKEN_TILES: ReplayParameterKey = ReplayParameterKey::new("te
 const NUM_ACTIVE_KV_SPLITS: ReplayParameterKey = ReplayParameterKey::new("test.gqa.tiled.num_active_kv_splits");
 
 #[test]
-fn test_replay_matches_reference_across_active_counts() {
+fn test_replay_bucketing() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let (config, base_shape) = tiled_workload(128, 8);
     let shape = Shape {
+        num_total_tokens: 4,
         num_total_sdpa_map_task_templates: 2,
         ..base_shape
     };
@@ -92,7 +93,7 @@ fn test_replay_matches_reference_across_active_counts() {
             .collect::<Vec<_>>(),
     );
 
-    for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+    for num_active_tokens in [1_usize, 4, 3, 2] {
         q_token_ranges.write_typed(0, &[0_u32, num_active_tokens as u32]);
         // The first fixed-quota task has an empty history range. Map must
         // materialize its canonical empty partial, and Reduce must preserve

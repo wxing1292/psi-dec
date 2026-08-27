@@ -257,9 +257,8 @@ impl Qwen3xDFlash2Execution {
             flat_token_indices: spec_prefill.flat_token_indices(),
             pages,
         };
-        let (prepared_key, arguments) = self.prefill.component().prepare_replay(num_tokens);
         let (key, _) = self.prefill.record(runtime, &input);
-        assert_eq!(key, prepared_key);
+        let arguments = self.prefill.component().replay_arguments(&key);
         Qwen3xDFlash2PrefillRecording { key, arguments }
     }
 
@@ -291,9 +290,11 @@ impl Qwen3xDFlash2Execution {
             block_token_ids: token_ids,
             anchor_token_ids: self.output.component().anchor_token_ids(),
         };
-        let (prepared_key, arguments) = self.decode_input.component().prepare_replay_arguments(&input);
         let (key, _) = self.decode_input.record(runtime, &input);
-        assert_eq!(key, prepared_key);
+        let arguments = self
+            .decode_input
+            .component()
+            .replay_arguments(&key, input.num_active_requests);
         (SpecDecodeInputRecording { key, arguments }, num_requests)
     }
 
@@ -314,9 +315,8 @@ impl Qwen3xDFlash2Execution {
             token_ids,
             hidden_output: &self.hidden_input,
         };
-        let (prepared_embed_key, embed_arguments) = self.embed.component().prepare_replay(embed_input.num_tokens);
         let (embed_key, _) = self.embed.record(runtime, &embed_input);
-        assert_eq!(embed_key, prepared_embed_key);
+        let embed_arguments = self.embed.component().replay_arguments(&embed_key);
         let body_input = Qwen3xDFlash2BodyArgs {
             num_tokens: metadata.replay_shape().num_tokens,
             metadata,

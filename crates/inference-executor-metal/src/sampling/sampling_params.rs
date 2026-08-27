@@ -93,7 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_store_uses_request_slot_identity() {
+    fn test_set_success() {
         let store = SamplingParamsStore::new(
             &Device::system_default(),
             TopKSamplingBounds {

@@ -298,13 +298,8 @@ impl Qwen3xDSparkPrefill {
             .expect("Qwen3.x DSpark Prefill model state must be loaded before execution")
     }
 
-    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen3xDSparkPrefillReplayKey, ReplayArguments) {
-        assert!(num_active_tokens > 0, "Qwen3.x DSpark Prefill requires active tokens");
-        let key = Qwen3xDSparkPrefillReplayKey {
-            num_total_tokens: num_active_tokens,
-        };
-        let arguments = ReplayArguments::new().with_u32(DSPARK_PREFILL_NUM_ACTIVE_TOKENS, num_active_tokens);
-        (key, arguments)
+    pub fn replay_arguments(&self, key: &Qwen3xDSparkPrefillReplayKey) -> ReplayArguments {
+        ReplayArguments::new().with_u32(DSPARK_PREFILL_NUM_ACTIVE_TOKENS, key.num_total_tokens)
     }
 }
 
@@ -391,7 +386,7 @@ mod tests {
     use super::dspark_body_replay_key;
 
     #[test]
-    fn test_body_replay_key_reuses_one_capacity_for_different_active_history_task_counts() {
+    fn test_replay_key_success() {
         let shape = GQAReplayShape {
             num_tokens: 7,
             num_total_tokens: 7,

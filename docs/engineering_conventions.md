@@ -313,15 +313,16 @@ semantic branch.
 Constructors and initialization paths must validate static configuration, topology, capacity, and layout. Explicit
 input validation must validate dynamic external, batch, and runtime inputs. These boundaries establish the trusted
 domain. Within that domain, private paths must use ordinary arithmetic and direct lossless casts. They must not repeat
-shape or range assertions that an owning boundary already proved.
+checked operations, `assert!`, or `debug_assert!` for a shape or range that an owning boundary already proved.
 
 Each checked addition, subtraction, multiplication, or conversion must identify one named real boundary through its
 owner API, value name, or failure message. Allowed boundaries are allocation or byte sizing, external or runtime counts
 and indices, narrowing, shader counts and element indices, file or snapshot data, state versions, and real overflow.
 
-Outside a constructor, initialization path, or explicit input validator, an assertion must protect either a complex
-state or resource transition, or a non-local boundary that no existing owner has proved. For the latter case, add a
-concise adjacent justification that names the boundary. Do not add defensive assertions to a trusted private path.
+Outside a constructor, initialization path, explicit input validator, or test, an assertion must protect either a
+complex state or resource transition, or a non-local boundary that no existing owner has proved. Add a concise adjacent
+source comment that names the boundary and explains why the assertion is necessary. Do not add defensive assertions to
+a trusted private path.
 
 Keep checked arithmetic at these boundaries:
 
@@ -560,6 +561,15 @@ Delivered history must be self-consistent.
 
 Each Rust test function starts with `test_`. It protects one behavior, correctness, ownership, or lifecycle contract.
 
+Use runtime-core unit tests as the primary naming and case-design reference. Name tests `test_<api>_<case>` or
+`test_<api_sequence>_<case>`. Use short case names such as `success`, `fail`, `invalid_shape`, and `bucketing`. Examples
+include `test_replay_success`, `test_replay_invalid_shape`, and `test_replay_bucketing`.
+
+Let the module path identify the component. Do not put backend, `matches_reference`, poison value, canary, fixture,
+capacity, or another internal mechanism in a test name. An actual named production or reference API can appear. Use one
+representative fixed case, mixed case, or compact table for one contract. Do not add one test for each branch,
+assertion, or helper.
+
 Organize component tests by owner API set and lifecycle scenario. Do not create one test for each internal helper or
 branch. One mixed-request scenario may assign a different case to each request when one owner prepares the full group.
 
@@ -579,8 +589,8 @@ oracle.
 
 Each replayable component must have an execution test for each independently variable active work domain. The test must
 use the production component record API through an isolated test replay cache. It must record one total capacity and
-topology, then replay a non-monotonic sequence of legal active counts. For a small domain such as a total capacity of
-`8`, the sequence must cover every legal active count. For example, use `1, 8, 3, 7, 2, 6, 4, 5`.
+topology, then replay a non-monotonic sequence of legal active counts. Use a recorded total capacity of `4` and the
+representative active sequence `[1, 4, 3, 2]` for a true active/total bucketing contract.
 
 Test peer components independently even when a production model owner records them in one replay program and stores
 that program in one cache. The component test cache is test-only orchestration. It must not add a production replay
@@ -594,9 +604,10 @@ The owner test must prove these contracts:
 - Each submission produces the exact reference result for its active logical domain.
 - A change to total capacity, topology, or another record-time static fact selects or records a different entry.
 
-The test can ignore the inactive output or scratch tail. It must not fill the tail with NaN as poison. If the component
-writes persistent or scatter-addressed state, the test must also prove that inactive work does not change semantically
-unrelated state.
+The test can ignore an ordinary inactive output or scratch tail. It must not fill that tail with NaN as poison. If the
+component writes persistent or scatter-addressed semantic destinations, the test must also prove that one submission
+does not change its inactive destinations. Snapshot the current inactive destinations before each partial submission
+when an earlier full replay can have changed them.
 
 Keep the component reference and active-domain projection in the component test. Centralize only repeated replay
 orchestration. Do not add a production trait, wrapper, or lifecycle operation for test reuse.

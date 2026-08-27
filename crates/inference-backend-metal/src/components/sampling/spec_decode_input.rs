@@ -386,9 +386,10 @@ mod tests {
     use crate::metal::Device;
     use crate::metal::ReplayArguments;
     use crate::metal::Stream;
+    use crate::test_support::ReplayTestCache;
 
     #[test]
-    fn test_reference_transform_matches_hand_calculated_mixed_batch() {
+    fn test_reference_success() {
         let config = Config {
             spec_block_size: 3,
             num_q_ranges_per_request: 1,
@@ -431,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_transform_updates_active_capacity_and_preserves_inactive_canaries() {
+    fn test_replay_bucketing() {
         const POISON_U32: u32 = 0xdead_beef;
         const POISON_I32: i32 = i32::MIN + 17;
 
@@ -451,9 +452,9 @@ mod tests {
             num_total_q_token_ranges: 4,
             num_total_task_templates: 12,
         };
-        let num_accepted_tokens = Buffer::from_slice(&device, &[2_u32, 0, 1, POISON_U32]);
-        let sampled_token_ids = Buffer::from_slice(&device, &[71_i32, 72, 73, POISON_I32]);
-        let anchor_indices = Buffer::from_slice(&device, &[10_u32, 20, 30, POISON_U32]);
+        let num_accepted_tokens = Buffer::from_slice(&device, &[2_u32, 0, 1, 3]);
+        let sampled_token_ids = Buffer::from_slice(&device, &[71_i32, 72, 73, 74]);
+        let anchor_indices = Buffer::from_slice(&device, &[10_u32, 20, 30, 40]);
         let anchor_token_ids = Buffer::from_slice(&device, &[POISON_I32; 4]);
         let sample_positions = Buffer::from_slice(&device, &[POISON_U32; 4]);
         let block_token_ids = Buffer::from_slice(&device, &[POISON_I32; 12]);
@@ -462,91 +463,119 @@ mod tests {
         let q_token_ranges = Buffer::from_slice(&device, &[0_u32, 3, 3, 6, 6, 9, 9, 12]);
         let cu_sdpa_partial_outputs = Buffer::from_slice(&device, &[0_u32, 3, 6, 9, 12]);
         let mut initial_task_templates = [POISON_U32; 36];
-        for block_task in [2_usize, 5, 8] {
+        for block_task in [2_usize, 5, 8, 11] {
             initial_task_templates[block_task * 3..block_task * 3 + 3].fill(u32::MAX);
         }
         let sdpa_map_task_templates = Buffer::from_slice(&device, &initial_task_templates);
         let compute = Compute::new(&device, config);
-        let mut builder = stream.create_replay_program();
-        builder.record(compute.invoke_replay(
-            shape,
-            Buffers {
-                num_accepted_tokens: &num_accepted_tokens,
-                sampled_token_ids: &sampled_token_ids,
-                anchor_indices: &anchor_indices,
-                anchor_token_ids: &anchor_token_ids,
-                sample_positions: &sample_positions,
-                block_token_ids: &block_token_ids,
-                flat_query_token_indices: &flat_query_token_indices,
-                visible_history_token_ranges: &visible_history_token_ranges,
-                q_token_ranges: &q_token_ranges,
-                cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
-                sdpa_map_task_templates: &sdpa_map_task_templates,
-            },
-        ));
-        let replay = builder.build();
-        let mut arguments = ReplayArguments::new();
-        compute.add_replay_arguments(shape, 3, &mut arguments);
+        let cache_key = (
+            shape.num_total_requests,
+            shape.num_total_q_token_ranges,
+            shape.num_total_task_templates,
+        );
+        let mut cache = ReplayTestCache::new();
+        let (_, cache_hit) = cache.record(cache_key, || {
+            let mut builder = stream.create_replay_program();
+            builder.record(compute.invoke_replay(
+                shape,
+                Buffers {
+                    num_accepted_tokens: &num_accepted_tokens,
+                    sampled_token_ids: &sampled_token_ids,
+                    anchor_indices: &anchor_indices,
+                    anchor_token_ids: &anchor_token_ids,
+                    sample_positions: &sample_positions,
+                    block_token_ids: &block_token_ids,
+                    flat_query_token_indices: &flat_query_token_indices,
+                    visible_history_token_ranges: &visible_history_token_ranges,
+                    q_token_ranges: &q_token_ranges,
+                    cu_sdpa_partial_outputs: &cu_sdpa_partial_outputs,
+                    sdpa_map_task_templates: &sdpa_map_task_templates,
+                },
+            ));
+            builder.build()
+        });
+        assert!(!cache_hit);
+        for num_active_requests in [1_u32, 4, 3, 2] {
+            let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
+            assert!(cache_hit);
+            let num_active_requests = num_active_requests as usize;
+            let inactive_requests = num_active_requests..4;
+            let inactive_tokens = num_active_requests * 3..12;
+            let inactive_ranges = num_active_requests * 6..24;
+            let inactive_tasks = num_active_requests * 9..36;
+            let inactive_anchor_token_ids =
+                anchor_token_ids.read_typed::<i32>(inactive_requests.start, inactive_requests.len());
+            let inactive_sample_positions =
+                sample_positions.read_typed::<u32>(inactive_requests.start, inactive_requests.len());
+            let inactive_block_token_ids =
+                block_token_ids.read_typed::<i32>(inactive_tokens.start, inactive_tokens.len());
+            let inactive_flat_query_token_indices =
+                flat_query_token_indices.read_typed::<u32>(inactive_tokens.start, inactive_tokens.len());
+            let inactive_visible_history_token_ranges =
+                visible_history_token_ranges.read_typed::<u32>(inactive_ranges.start, inactive_ranges.len());
+            let inactive_task_templates =
+                sdpa_map_task_templates.read_typed::<u32>(inactive_tasks.start, inactive_tasks.len());
+            let expected = reference_transform(
+                config,
+                &anchor_indices.read_typed::<u32>(0, num_active_requests),
+                &num_accepted_tokens.read_typed::<u32>(0, num_active_requests),
+                &sampled_token_ids.read_typed::<i32>(0, num_active_requests),
+                &q_token_ranges.read_typed::<u32>(0, 8),
+                &cu_sdpa_partial_outputs.read_typed::<u32>(0, 5),
+            );
+            let mut arguments = ReplayArguments::new();
+            compute.add_replay_arguments(shape, num_active_requests as u32, &mut arguments);
 
-        stream.submit_replay_with_arguments(&replay, &arguments).wait();
+            stream.submit_replay_with_arguments(replay, &arguments).wait();
 
-        assert_eq!(anchor_token_ids.read_typed::<i32>(0, 4), [71, 72, 73, POISON_I32]);
-        assert_eq!(sample_positions.read_typed::<u32>(0, 4), [13, 21, 32, POISON_U32]);
-        assert_eq!(
-            block_token_ids.read_typed::<i32>(0, 12),
-            [71, -7, -7, 72, -7, -7, 73, -7, -7, POISON_I32, POISON_I32, POISON_I32]
-        );
-        assert_eq!(
-            flat_query_token_indices.read_typed::<u32>(0, 12),
-            [12, 13, 14, 20, 21, 22, 31, 32, 33, POISON_U32, POISON_U32, POISON_U32]
-        );
-        assert_eq!(
-            visible_history_token_ranges.read_typed::<u32>(0, 24),
-            [
-                0, 12, 0, 12, 0, 12, 0, 20, 0, 20, 0, 20, 0, 31, 0, 31, 0, 31, POISON_U32, POISON_U32, POISON_U32,
-                POISON_U32, POISON_U32, POISON_U32
-            ]
-        );
-        assert_eq!(
-            sdpa_map_task_templates.read_typed::<u32>(0, 36),
-            [
-                0,
-                0,
-                4,
-                0,
-                4,
-                12,
-                u32::MAX,
-                u32::MAX,
-                u32::MAX,
-                1,
-                0,
-                8,
-                1,
-                8,
-                20,
-                u32::MAX,
-                u32::MAX,
-                u32::MAX,
-                2,
-                0,
-                16,
-                2,
-                16,
-                31,
-                u32::MAX,
-                u32::MAX,
-                u32::MAX,
-                POISON_U32,
-                POISON_U32,
-                POISON_U32,
-                POISON_U32,
-                POISON_U32,
-                POISON_U32,
-                POISON_U32,
-                POISON_U32,
-                POISON_U32
-            ]
-        );
+            assert_eq!(
+                anchor_token_ids.read_typed::<i32>(0, num_active_requests),
+                sampled_token_ids.read_typed::<i32>(0, num_active_requests)
+            );
+            assert_eq!(
+                sample_positions.read_typed::<u32>(0, num_active_requests),
+                expected.anchors.iter().map(|anchor| anchor + 1).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                block_token_ids.read_typed::<i32>(0, expected.block_token_ids.len()),
+                expected.block_token_ids
+            );
+            assert_eq!(
+                flat_query_token_indices.read_typed::<u32>(0, expected.flat_query_token_indices.len()),
+                expected.flat_query_token_indices
+            );
+            assert_eq!(
+                visible_history_token_ranges.read_typed::<u32>(0, expected.visible_history_token_ranges.len()),
+                expected.visible_history_token_ranges
+            );
+            assert_eq!(
+                sdpa_map_task_templates.read_typed::<u32>(0, expected.task_templates.len()),
+                expected.task_templates
+            );
+            assert_eq!(
+                anchor_token_ids.read_typed::<i32>(inactive_requests.start, inactive_requests.len()),
+                inactive_anchor_token_ids
+            );
+            assert_eq!(
+                sample_positions.read_typed::<u32>(inactive_requests.start, inactive_requests.len()),
+                inactive_sample_positions
+            );
+            assert_eq!(
+                block_token_ids.read_typed::<i32>(inactive_tokens.start, inactive_tokens.len()),
+                inactive_block_token_ids
+            );
+            assert_eq!(
+                flat_query_token_indices.read_typed::<u32>(inactive_tokens.start, inactive_tokens.len()),
+                inactive_flat_query_token_indices
+            );
+            assert_eq!(
+                visible_history_token_ranges.read_typed::<u32>(inactive_ranges.start, inactive_ranges.len()),
+                inactive_visible_history_token_ranges
+            );
+            assert_eq!(
+                sdpa_map_task_templates.read_typed::<u32>(inactive_tasks.start, inactive_tasks.len()),
+                inactive_task_templates
+            );
+        }
     }
 }

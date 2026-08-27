@@ -174,15 +174,11 @@ impl SpecDecodeInput {
         )
     }
 
-    pub fn prepare_replay_arguments(
-        &self,
-        input: &SpecDecodeInputArgs<'_>,
-    ) -> (SpecDecodeInputReplayKey, ReplayArguments) {
-        let key = self.replay_key(input);
+    pub fn replay_arguments(&self, key: &SpecDecodeInputReplayKey, num_active_requests: u32) -> ReplayArguments {
         let mut arguments = ReplayArguments::new();
         self.prepare
-            .add_replay_arguments(self.backend_shape(&key), input.num_active_requests, &mut arguments);
-        (key, arguments)
+            .add_replay_arguments(self.backend_shape(key), num_active_requests, &mut arguments);
+        arguments
     }
 
     fn visible_history_range(&self, query_position: u32, anchor_position: u32) -> Range<u32> {
@@ -246,7 +242,7 @@ mod tests {
     use super::SpecDecodeInputConfig;
 
     #[test]
-    fn test_owner_prepares_mixed_active_and_inactive_requests() {
+    fn test_prepare_bucketing() {
         let input = SpecDecodeInput::new(
             &Device::system_default(),
             SpecDecodeInputConfig::new(

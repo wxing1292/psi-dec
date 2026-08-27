@@ -353,7 +353,7 @@ mod tests {
     use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
     #[test]
-    fn test_prepare_inputs_handles_mixed_ragged_requests_and_zero_drafts() {
+    fn test_prepare_inputs_success() {
         let device = Device::system_default();
         let sampler = RejectionSampler::new(&device, 3, 5, 6, 4);
         let distributions = SpecProbsStore::new(&device, 3, 5, 6, 4);
@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_result_prefixes() {
+    fn test_read_results_success() {
         let device = Device::system_default();
         let sampler = RejectionSampler::new(&device, 2, 4, 12, 4);
         sampler.flat_accepted_token_ids.write_typed(0, &[11_i32, 12, 21]);
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "prepared draft distributions exceed sampler capacity")]
-    fn test_prepare_replay_shape_validates_public_prepared_input() {
+    fn test_prepare_replay_shape_invalid_shape() {
         let device = Device::system_default();
         let sampler = RejectionSampler::new(&device, 2, 2, 6, 4);
         let prepared = PreparedRejection {
@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "target sampling capacity must match target-distribution capacity")]
-    fn test_replay_cache_validates_cross_component_shape_before_lookup() {
+    fn test_replay_invalid_shape() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let bounds = TopKSamplingBounds {

@@ -126,14 +126,6 @@ impl BiDiBlockGQAMetadataBuffers {
             .div_ceil(self.sdpa_execution.map.thread_block.max_q_tokens as usize);
         let num_active_tokens = num_active_requests * block.block_size();
         let num_active_q_token_ranges = num_active_requests * num_q_ranges_per_request;
-        debug_assert!(num_active_tokens <= self.capacity.block.max_tokens);
-        debug_assert!(num_active_q_token_ranges <= self.capacity.max_q_token_ranges);
-        assert!(
-            num_active_q_token_ranges < metadata.cu_sdpa_partial_outputs.len(),
-            "active BiDiBlockGQA Q-token ranges must fit cumulative partial-output metadata"
-        );
-        #[cfg(debug_assertions)]
-        debug_assert_fixed_quota_invariants(&metadata, num_active_q_token_ranges);
         let num_active_task_templates = metadata.cu_sdpa_partial_outputs[num_active_q_token_ranges];
         let replay_shape = GQAReplayShape {
             num_tokens: num_active_tokens as u32,
@@ -141,7 +133,6 @@ impl BiDiBlockGQAMetadataBuffers {
             num_sdpa_map_task_templates: num_active_task_templates,
             ..metadata.replay_shape
         };
-        replay_shape.validate();
         self.replay_shape.set(Some(replay_shape));
         replay_shape
     }
@@ -179,54 +170,6 @@ impl BiDiBlockGQAMetadataBuffers {
     pub fn sdpa_execution(&self) -> ExecutionVariant {
         self.sdpa_execution
     }
-}
-
-#[cfg(debug_assertions)]
-fn debug_assert_fixed_quota_invariants(metadata: &BiDiBlockGQAMetadataUpload, num_active_q_token_ranges: usize) {
-    let cu = &metadata.cu_sdpa_partial_outputs;
-    debug_assert!(
-        num_active_q_token_ranges > 0 && num_active_q_token_ranges < cu.len(),
-        "active BiDiBlockGQA Q-token ranges must fit cumulative partial-output metadata"
-    );
-    debug_assert_eq!(cu[0], 0, "BiDiBlockGQA cumulative partial outputs must start at zero");
-    let task_templates = metadata.sdpa_map_task_templates.as_chunks::<3>().0;
-    for (q_token_range_index, partial_range) in cu.windows(2).enumerate() {
-        let begin = partial_range[0];
-        let end = partial_range[1];
-        debug_assert!(
-            end > begin,
-            "BiDiBlockGQA cumulative partial-output ranges must be strictly increasing"
-        );
-        debug_assert!(
-            end - begin >= 2,
-            "BiDiBlockGQA fixed quota requires at least one history partial and one block partial"
-        );
-        let block_partial_index = end as usize - 1;
-        debug_assert!(
-            block_partial_index < task_templates.len(),
-            "BiDiBlockGQA fixed quota exceeds the total TaskTemplate capacity"
-        );
-        debug_assert_eq!(
-            task_templates[block_partial_index],
-            [u32::MAX; 3],
-            "BiDiBlockGQA final quota slot must remain the block partial"
-        );
-        if q_token_range_index < num_active_q_token_ranges {
-            debug_assert!(
-                end <= metadata.replay_shape.num_total_sdpa_map_task_templates,
-                "active BiDiBlockGQA quota exceeds recorded TaskTemplate capacity"
-            );
-        }
-    }
-    let materialized_task_end = *cu
-        .last()
-        .expect("BiDiBlockGQA cumulative partial outputs must not be empty") as usize;
-    debug_assert!(
-        task_templates[materialized_task_end..]
-            .iter()
-            .all(|task| *task == [u32::MAX; 3]),
-        "BiDiBlockGQA replay padding must remain outside the materialized TaskTemplate extent"
-    );
 }
 
 fn build_metal_metadata(
@@ -485,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_quota_rewrite_matches_cpu_metadata_for_spec_decode_cases() {
+    fn test_spec_decode_success() {
         let dspark_variant = selected_variant(4, 7);
         for accepted in 0..=7 {
             assert_fixed_quota_rewrite_matches_cpu(&[10], &[7], &[accepted], 7, u32::MAX, dspark_variant);

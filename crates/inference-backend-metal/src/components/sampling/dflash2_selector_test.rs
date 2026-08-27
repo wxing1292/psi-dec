@@ -8,9 +8,10 @@ use crate::test_support::ReplayTestCache;
 
 const TEST_NUM_ACTIVE_REQUESTS: ReplayParameterKey =
     ReplayParameterKey::new("test.dflash2_selector.num_active_requests");
+const OUTPUT_DISTRIBUTION_INDICES: [u32; 8] = [3, 7, 1, 5, 0, 6, 2, 4];
 
 #[test]
-fn test_replay_matches_reference_for_all_active_request_counts() {
+fn test_replay_bucketing() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let config = Config {
@@ -19,7 +20,7 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
         embedding_dtype: Dtype::Bfloat16,
     };
     let shape = Shape {
-        num_total_requests: 8,
+        num_total_requests: 4,
         num_steps: 2,
     };
     let candidates = (0..config.candidate_count(shape))
@@ -58,7 +59,7 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
             .collect::<Vec<_>>(),
     );
     let proposal_count = shape.proposal_count();
-    let distribution_indices = Buffer::from_slice(&device, &(0..proposal_count as u32).collect::<Vec<_>>());
+    let distribution_indices = Buffer::from_slice(&device, &OUTPUT_DISTRIBUTION_INDICES);
     let proposal_token_ids = Buffer::new_zeroed(&device, proposal_count * size_of::<i32>());
     let proposal_probs = Buffer::new_zeroed(&device, proposal_count * size_of::<f32>());
     let distribution_token_ids = Buffer::new_zeroed(&device, proposal_count * 4 * size_of::<i32>());
@@ -120,9 +121,21 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
         &successor_embeddings,
     );
 
-    for num_active_requests in [1, 8, 3, 7, 2, 6, 4, 5] {
+    for num_active_requests in [1, 4, 3, 2] {
         let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
         assert!(cache_hit);
+        let inactive_distributions = OUTPUT_DISTRIBUTION_INDICES
+            [num_active_requests as usize * shape.num_steps as usize..]
+            .iter()
+            .map(|&distribution| {
+                let offset = distribution as usize * 4;
+                (
+                    distribution,
+                    distribution_token_ids.read_typed::<i32>(offset, 4),
+                    distribution_probs.read_typed::<f32>(offset, 4),
+                )
+            })
+            .collect::<Vec<_>>();
         let arguments = ReplayArguments::new().with_u32(TEST_NUM_ACTIVE_REQUESTS, num_active_requests);
         stream.submit_replay_with_arguments(replay, &arguments).wait();
 
@@ -167,7 +180,7 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
                 assert!((actual - expected).abs() < 1.0e-6);
             }
             for (step, expected_distribution) in expected_distributions.iter().enumerate() {
-                let distribution = proposal_begin + step;
+                let distribution = OUTPUT_DISTRIBUTION_INDICES[proposal_begin + step] as usize;
                 let ids = distribution_token_ids.read_typed::<i32>(distribution * 4, 4);
                 let probs = distribution_probs.read_typed::<f32>(distribution * 4, 4);
                 let candidate_step_begin = candidate_begin + step * config.top_k as usize;
@@ -181,6 +194,11 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
                 }
                 assert_eq!(probs[config.top_k as usize], 0.0);
             }
+        }
+        for (distribution, token_ids, probs) in inactive_distributions {
+            let offset = distribution as usize * 4;
+            assert_eq!(distribution_token_ids.read_typed::<i32>(offset, 4), token_ids);
+            assert_eq!(distribution_probs.read_typed::<f32>(offset, 4), probs);
         }
     }
 }

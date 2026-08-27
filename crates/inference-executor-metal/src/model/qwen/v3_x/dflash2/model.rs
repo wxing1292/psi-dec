@@ -309,13 +309,8 @@ impl Qwen3xDFlash2Prefill {
             .expect("Qwen3.x DFlash2 Prefill model state must be loaded before execution")
     }
 
-    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen3xDFlash2PrefillReplayKey, ReplayArguments) {
-        assert!(num_active_tokens > 0, "Qwen3.x DFlash2 Prefill requires active tokens");
-        let key = Qwen3xDFlash2PrefillReplayKey {
-            num_total_tokens: num_active_tokens,
-        };
-        let arguments = ReplayArguments::new().with_u32(DFLASH2_PREFILL_NUM_ACTIVE_TOKENS, num_active_tokens);
-        (key, arguments)
+    pub fn replay_arguments(&self, key: &Qwen3xDFlash2PrefillReplayKey) -> ReplayArguments {
+        ReplayArguments::new().with_u32(DFLASH2_PREFILL_NUM_ACTIVE_TOKENS, key.num_total_tokens)
     }
 }
 
@@ -405,7 +400,7 @@ mod tests {
     use super::dflash2_body_replay_key;
 
     #[test]
-    fn test_body_replay_key_reuses_one_capacity_for_different_active_history_task_counts() {
+    fn test_replay_key_success() {
         let shape = GQAReplayShape {
             num_tokens: 8,
             num_total_tokens: 8,

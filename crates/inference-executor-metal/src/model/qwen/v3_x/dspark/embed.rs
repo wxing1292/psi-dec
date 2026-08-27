@@ -50,13 +50,8 @@ impl Qwen3xDSparkEmbed {
             .expect("Qwen3.x DSpark embed weights must be loaded before execution")
     }
 
-    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen3xDSparkEmbedReplayKey, ReplayArguments) {
-        assert!(num_active_tokens > 0, "Qwen3.x DSpark Embed requires active tokens");
-        let key = Qwen3xDSparkEmbedReplayKey {
-            num_total_tokens: num_active_tokens,
-        };
-        let arguments = ReplayArguments::new().with_u32(DSPARK_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens);
-        (key, arguments)
+    pub fn replay_arguments(&self, key: &Qwen3xDSparkEmbedReplayKey) -> ReplayArguments {
+        ReplayArguments::new().with_u32(DSPARK_EMBED_NUM_ACTIVE_TOKENS, key.num_total_tokens)
     }
 }
 

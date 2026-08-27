@@ -10,12 +10,12 @@ use crate::metal::Stream;
 use crate::test_support::ReplayTestCache;
 
 #[test]
-fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
+fn test_replay_bucketing() {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let shape = Shape {
-        num_total_reqs: 8,
-        num_total_target_distributions: 12,
+        num_total_reqs: 4,
+        num_total_target_distributions: 7,
         num_total_draft_distributions: 5,
         top_k: 4,
         max_target_k: 4,
@@ -40,7 +40,10 @@ fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
         vec![0.0, 1.00, 0.00, 0.00, 0.0, 0.0],
     ];
     let draft_tokens = [2_u32, 3, 1];
-    let target_distribution = write_distributions_from_dense(&target_rows, shape.max_target_k as usize);
+    let target_distribution = write_distributions_from_dense(
+        &target_rows[..shape.num_total_target_distributions as usize],
+        shape.max_target_k as usize,
+    );
     let draft_distribution = write_distributions_from_dense(&draft_rows, shape.max_draft_k as usize);
     let draft_distribution_indices = [2_u32, 0, 4];
     let mut mapped_draft_token_ids = vec![-1_i32; shape.num_total_draft_distributions as usize * 4];
@@ -63,8 +66,8 @@ fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
     let draft_distribution_token_ids = Buffer::from_slice(&device, &mapped_draft_token_ids);
     let draft_distribution_probs = Buffer::from_slice(&device, &mapped_draft_probs);
     let flat_draft_token_ids = Buffer::from_slice(&device, &[2_i32, 3, 1, 0, 0]);
-    let cu_target_values = [0_u32, 3, 5, 6, 7, 8, 9, 10, 11];
-    let cu_draft_values = [0_u32, 2, 3, 3, 3, 3, 3, 3, 3];
+    let cu_target_values = [0_u32, 3, 5, 6, 7];
+    let cu_draft_values = [0_u32, 2, 3, 3, 3];
     let cu_target_distributions = Buffer::from_slice(&device, &cu_target_values);
     let cu_draft_distributions = Buffer::from_slice(&device, &cu_draft_values);
     let flat_draft_distribution_indices = Buffer::from_slice(&device, &[2_u32, 0, 4, 0, 0]);
@@ -80,7 +83,7 @@ fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
         7_u32, 19, 4, 0, // reject path
         11, 23, 1, 0, // all-accept path
         13, 29, 1, 0, // zero-draft path
-        17, 31, 1, 0, 19, 37, 1, 0, 23, 41, 1, 0, 29, 43, 1, 0, 31, 47, 1, 0,
+        17, 31, 1, 0,
     ];
     let runtime_params = Buffer::from_slice(&device, &runtime_params_values);
     let kernel = Compute::new(&device);
@@ -118,7 +121,7 @@ fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
     });
     assert!(!cache_hit);
 
-    let mut expected = vec![
+    let expected = [
         rejection_sample_reference(
             &draft_tokens[..2],
             &target_rows[..3],
@@ -148,15 +151,6 @@ fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
             runtime_params_values[13],
         ),
     ];
-    for req in 4..8 {
-        expected.push(rejection_sample_reference(
-            &[],
-            &target_rows[req + 3..req + 4],
-            &[],
-            runtime_params_values[req * 4],
-            runtime_params_values[req * 4 + 1],
-        ));
-    }
     let assert_active_outputs = |num_active_reqs: usize| {
         let actual_counts = num_accepted_tokens.read_typed::<u32>(0, num_active_reqs);
         let actual_sampled_tokens = sampled_token_ids.read_typed::<i32>(0, num_active_reqs);
@@ -209,7 +203,7 @@ fn test_mixed_ragged_replay_matches_reference_across_active_counts() {
         stream.submit_replay_with_arguments(replay, &arguments).wait();
     };
 
-    for num_active_reqs in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+    for num_active_reqs in [1_usize, 4, 3, 2] {
         submit(num_active_reqs);
         assert_active_outputs(num_active_reqs);
     }

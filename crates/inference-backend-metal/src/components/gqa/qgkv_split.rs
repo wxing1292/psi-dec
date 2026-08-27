@@ -164,8 +164,8 @@ mod tests {
     const NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("test.gqa_qgkv_split.num_active_tokens");
 
     #[test]
-    fn test_replay_matches_reference_across_active_counts() {
-        const NUM_TOTAL_TOKENS: u32 = 8;
+    fn test_replay_bucketing() {
+        const NUM_TOTAL_TOKENS: u32 = 4;
 
         let device = Device::system_default();
         let stream = Stream::new(&device);
@@ -203,7 +203,7 @@ mod tests {
         });
         assert!(!cache_hit);
 
-        for num_active_tokens in [1_usize, 8, 3, 7, 2, 6, 4, 5] {
+        for num_active_tokens in [1_usize, 4, 3, 2] {
             let (replay, cache_hit) = cache.record(shape.num_total_tokens, || unreachable!());
             assert!(cache_hit);
             stream

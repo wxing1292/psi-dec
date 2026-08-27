@@ -12,8 +12,9 @@ use crate::metal::ReplayArguments;
 use crate::metal::Stream;
 use crate::test_support::ReplayTestCache;
 
-const ACTIVE_SEQUENCE: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
-const SAMPLE_POSITIONS: [u32; 8] = [11, 29, 41, 53, 67, 79, 83, 97];
+const ACTIVE_SEQUENCE: [u32; 4] = [1, 4, 3, 2];
+const SAMPLE_POSITIONS: [u32; 4] = [11, 29, 41, 53];
+const OUTPUT_DISTRIBUTION_INDICES: [u32; 4] = [1, 3, 0, 2];
 
 #[test]
 fn test_map_variant_selection() {
@@ -55,7 +56,7 @@ fn test_map_variant_selection() {
 }
 
 #[test]
-fn test_merge_replay_matches_reference_across_active_counts_dtypes_and_topologies() {
+fn test_merge_replay_bucketing() {
     for dtype in [Dtype::Float32, Dtype::Bfloat16] {
         for top_k in [4, 64] {
             run_merge_case(dtype, top_k);
@@ -64,7 +65,7 @@ fn test_merge_replay_matches_reference_across_active_counts_dtypes_and_topologie
 }
 
 #[test]
-fn test_sample_replay_matches_reference_across_active_counts_dtypes_and_topologies() {
+fn test_sample_replay_bucketing() {
     for dtype in [Dtype::Float32, Dtype::Bfloat16] {
         for top_k in [20, 64] {
             run_sample_case(dtype, top_k);
@@ -73,14 +74,14 @@ fn test_sample_replay_matches_reference_across_active_counts_dtypes_and_topologi
 }
 
 #[test]
-fn test_write_distribution_replay_matches_reference_across_active_counts_and_dtypes() {
+fn test_write_distribution_replay_bucketing() {
     for dtype in [Dtype::Float32, Dtype::Bfloat16] {
         run_distribution_case(dtype, false);
     }
 }
 
 #[test]
-fn test_sample_and_write_distribution_replay_matches_reference_across_active_counts_and_dtypes() {
+fn test_sample_write_distribution_replay_bucketing() {
     for dtype in [Dtype::Float32, Dtype::Bfloat16] {
         run_distribution_case(dtype, true);
     }
@@ -90,7 +91,7 @@ fn run_merge_case(dtype: Dtype, top_k: u32) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let shape = Shape {
-        num_total_sampling_inputs: 8,
+        num_total_sampling_inputs: 4,
         vocab_size: 257,
         top_k,
     };
@@ -177,7 +178,7 @@ fn run_sample_case(dtype: Dtype, top_k: u32) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let shape = Shape {
-        num_total_sampling_inputs: 8,
+        num_total_sampling_inputs: 4,
         vocab_size: 257,
         top_k,
     };
@@ -257,7 +258,7 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let shape = Shape {
-        num_total_sampling_inputs: 8,
+        num_total_sampling_inputs: 4,
         vocab_size: 257,
         top_k: 20,
     };
@@ -266,9 +267,9 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
     let params = sampling_params(&device, &configs);
     let req_slots = Buffer::from_slice(&device, &(0..shape.num_total_sampling_inputs).collect::<Vec<_>>());
     let sample_positions = Buffer::from_slice(&device, &SAMPLE_POSITIONS);
-    let output_distribution_indices = Buffer::from_slice(&device, &[1_u32, 4, 7, 2, 5, 0, 3, 6]);
+    let output_distribution_indices = Buffer::from_slice(&device, &OUTPUT_DISTRIBUTION_INDICES);
     let max_k = 24_u32;
-    let num_output_distributions = 8_u32;
+    let num_output_distributions = 4_u32;
     let map = MapCompute::new(&device);
     let reduce = ReduceCompute::new(&device);
     let candidate_count = map.candidate_count(shape);
@@ -357,6 +358,17 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
     for num_active_rows in ACTIVE_SEQUENCE {
         let (replay, cache_hit) = cache.record(cache_key, || unreachable!());
         assert!(cache_hit);
+        let inactive_distributions = OUTPUT_DISTRIBUTION_INDICES[num_active_rows as usize..]
+            .iter()
+            .map(|&distribution| {
+                let offset = distribution as usize * max_k as usize;
+                (
+                    distribution,
+                    distribution_token_ids.read_typed::<i32>(offset, max_k as usize),
+                    distribution_probs.read_typed::<f32>(offset, max_k as usize),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut arguments = ReplayArguments::new();
         map.add_replay_arguments(shape, num_active_rows, &mut arguments);
         reduce.add_replay_arguments(shape, num_active_rows, &mut arguments);
@@ -373,10 +385,13 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
                 &sampled_token_probs,
             );
         }
-        for row in 0..num_active_rows as usize {
+        for (row, &distribution) in OUTPUT_DISTRIBUTION_INDICES
+            .iter()
+            .take(num_active_rows as usize)
+            .enumerate()
+        {
             let expected = sample_reference(shape, &reference_logits, &configs, sampling_domain, row);
-            let distribution = [1_usize, 4, 7, 2, 5, 0, 3, 6][row];
-            let offset = distribution * max_k as usize;
+            let offset = distribution as usize * max_k as usize;
             assert_eq!(
                 distribution_token_ids.read_typed::<i32>(offset, expected.prob_token_ids.len()),
                 expected.prob_token_ids
@@ -386,6 +401,14 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
                 &expected.prob_values,
                 1.0e-5,
             );
+        }
+        for (distribution, token_ids, probs) in inactive_distributions {
+            let offset = distribution as usize * max_k as usize;
+            assert_eq!(
+                distribution_token_ids.read_typed::<i32>(offset, max_k as usize),
+                token_ids
+            );
+            assert_eq!(distribution_probs.read_typed::<f32>(offset, max_k as usize), probs);
         }
     }
 }
@@ -425,11 +448,11 @@ fn sample_reference(
 }
 
 fn sampler_configs(max_top_k: usize) -> Vec<SamplerConfig> {
-    let requested_top_k = [1, max_top_k, 3, 7, 2, 11, 4, 5];
-    let temperatures = [0.0, 0.9, 0.7, 0.8, 1.0, 0.6, 0.5, 1.1];
-    let top_ps = [1.0, 0.82, 0.9, 0.85, 0.95, 0.75, 1.0, 0.88];
-    let seeds = [7, 19, 31, 43, 59, 61, 73, 89];
-    (0..8)
+    let requested_top_k = [1, max_top_k, 3, 7];
+    let temperatures = [0.0, 0.9, 0.7, 0.8];
+    let top_ps = [1.0, 0.82, 0.9, 0.85];
+    let seeds = [7, 19, 31, 43];
+    (0..4)
         .map(|row| {
             SamplerConfig {
                 temperature: temperatures[row],

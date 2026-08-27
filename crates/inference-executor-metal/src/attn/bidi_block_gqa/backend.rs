@@ -535,7 +535,7 @@ mod tests {
     use super::add_bidi_block_gqa_replay_arguments;
 
     #[test]
-    fn test_replay_arguments_select_active_history_work_inside_one_capacity() {
+    fn test_replay_arguments_success() {
         let shape = GQAReplayShape {
             num_tokens: 8,
             num_total_tokens: 8,

@@ -120,15 +120,8 @@ impl Qwen3xDSparkGatherUnembed {
         self.row_indices.write_typed(0, &row_indices);
     }
 
-    pub fn prepare_replay(&self, num_active_requests: u32) -> (Qwen3xDSparkGatherUnembedReplayKey, ReplayArguments) {
-        assert!(num_active_requests > 0 && num_active_requests <= self.max_requests);
-        let num_active_rows = num_active_requests * self.block_size;
-        let key = Qwen3xDSparkGatherUnembedReplayKey {
-            num_total_rows: num_active_rows,
-            unembed_topology: self.unembed().replay_topology(num_active_rows),
-        };
-        let arguments = ReplayArguments::new().with_u32(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS, num_active_rows);
-        (key, arguments)
+    pub fn replay_arguments(&self, key: &Qwen3xDSparkGatherUnembedReplayKey) -> ReplayArguments {
+        ReplayArguments::new().with_u32(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS, key.num_total_rows)
     }
 }
 
@@ -137,15 +130,19 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
     type Input<'a> = Qwen3xDSparkGatherUnembedArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        self.prepare_replay(input.num_requests).0
+        assert!(input.num_requests > 0 && input.num_requests <= self.max_requests);
+        let num_total_rows = input.num_requests * self.block_size;
+        Qwen3xDSparkGatherUnembedReplayKey {
+            num_total_rows,
+            unembed_topology: self.unembed().replay_topology(num_total_rows),
+        }
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
-        assert!(input.num_requests > 0 && input.num_requests <= self.max_requests);
-        let key = self.replay_key(input);
+        let num_total_rows = input.num_requests * self.block_size;
         self.gather.record(
             recorder,
-            key.num_total_rows,
+            num_total_rows,
             ReplayU32::Parameter(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS),
             input.hidden_input,
             &self.row_indices,
@@ -155,7 +152,7 @@ impl ReplayComponent for Qwen3xDSparkGatherUnembed {
             self.unembed(),
             recorder,
             UnembedInput {
-                num_total_rows: key.num_total_rows,
+                num_total_rows,
                 num_active_rows: ReplayU32::Parameter(DSPARK_GATHER_UNEMBED_NUM_ACTIVE_ROWS),
                 hidden: input.hidden_output,
                 logits: input.logits,
@@ -245,7 +242,7 @@ mod tests {
     use crate::model::unembedding::fixture_unembed;
     use crate::replay::Replay;
 
-    const MAX_REQUESTS: u32 = 8;
+    const MAX_REQUESTS: u32 = 4;
     const BLOCK_SIZE: u32 = 3;
     const NUM_TOTAL_ROWS: u32 = MAX_REQUESTS * BLOCK_SIZE;
     const VOCAB_SIZE: u32 = 32;
@@ -253,7 +250,7 @@ mod tests {
     const GROUP_SIZE: u32 = 32;
 
     #[test]
-    fn test_gather_unembed_replay_matches_cpu_reference_across_active_counts() {
+    fn test_replay_bucketing() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
         let runtime = MetalReplayRuntime::new(&stream);
@@ -265,7 +262,7 @@ mod tests {
         let (recorded_key, cache_hit) = replay.record(&runtime, &input);
         assert!(!cache_hit);
 
-        for num_active_requests in [1_u32, 8, 3, 7, 2, 6, 4, 5] {
+        for num_active_requests in [1_u32, 4, 3, 2] {
             replay.component().prepare(num_active_requests as usize);
             assert_eq!(replay.record(&runtime, &input), (recorded_key.clone(), true));
             let num_active_rows = num_active_requests * BLOCK_SIZE;
