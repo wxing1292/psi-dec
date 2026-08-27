@@ -839,6 +839,24 @@ It does not read either result before the combined wait completes.
 `main_spec_replay_elapsed` reports the combined Main and Spec submission duration.
 It does not report Main-only duration.
 
+Optional Metal 4 GPU timestamps split this sequence at five low-cardinality stages:
+
+```text
+Main
+  -> RejectionSampling
+  -> SpecDecodeInput
+  -> Spec Prefill
+  -> Spec Decode + proposal sampling
+```
+
+The executor maps the ordered stage intervals to `main_gpu_elapsed`, `rejection_gpu_elapsed`,
+`spec_prepare_gpu_elapsed`, `spec_prefill_gpu_elapsed`, and `spec_decode_gpu_elapsed`.
+It derives total Spec GPU time from the three Spec intervals.
+This data does not change `main_spec_replay_elapsed`, `main_cpu_ms`, or `spec_cpu_ms`.
+Service telemetry reports `executor_cpu_ms = main_cpu_ms + spec_cpu_ms` for comparisons across the old split
+fixed-block Spec lifecycle and the integrated lifecycle. Old and integrated `main_cpu_ms` values do not cover
+equivalent work.
+
 Qwen3.5 MTP uses the existing combined `run_spec` lifecycle.
 Its `embed_spec`, `forward_spec`, `unembed_spec`, and `sample_spec` hooks materialize MTPEmbed, MTP, GatherUnembed, and
 DraftSampling.

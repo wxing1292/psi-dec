@@ -1,5 +1,6 @@
 use crate::metal::BufferIO;
 use crate::metal::Device;
+use crate::metal::GpuTimestampGranularity;
 use crate::metal::ReplayArguments;
 use crate::metal::ReplayProgram;
 use crate::metal::ReplayProgramBuilder;
@@ -20,7 +21,7 @@ impl MetalRuntime {
 
     pub fn new(device: Device) -> Self {
         let buffer_io = BufferIO::new(&device);
-        let stream = Stream::new(&device);
+        let stream = Stream::new_with_gpu_timestamps(&device, GpuTimestampGranularity::from_environment());
         Self {
             device,
             buffer_io,

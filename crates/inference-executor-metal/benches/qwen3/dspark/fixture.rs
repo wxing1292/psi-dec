@@ -197,10 +197,18 @@ impl Fixture {
         let main_record = main_record_start.elapsed();
 
         let main_submit_start = Instant::now();
-        self.model.submit_main(&recorder).wait();
+        let main_submission = self.model.submit_main(&recorder);
+        main_submission.wait();
         let main_submit = main_submit_start.elapsed();
         let main_read_start = Instant::now();
-        let mut sampled_output = self.model.read_main(&recorder, &model_batch_request, main_submit);
+        let gpu_timestamp_durations = main_submission.gpu_timestamp_durations();
+        drop(main_submission);
+        let mut sampled_output = self.model.read_main(
+            &recorder,
+            &model_batch_request,
+            main_submit,
+            gpu_timestamp_durations.as_deref(),
+        );
         let main_read = main_read_start.elapsed();
 
         let mut spec_record = Duration::ZERO;

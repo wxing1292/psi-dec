@@ -1,6 +1,47 @@
+use std::time::Duration;
+
+use inference_executor_core::model::ModelOutputTiming;
+
 pub mod v3;
 pub mod v3_x;
 pub mod v3_5;
+
+fn apply_main_gpu_timing(
+    timing: &mut ModelOutputTiming,
+    gpu_timestamp_durations: Option<&[Duration]>,
+    integrated_spec: bool,
+    has_rejection: bool,
+    has_spec_decode: bool,
+) {
+    let Some(durations) = gpu_timestamp_durations else {
+        return;
+    };
+
+    let mut index = 0usize;
+    timing.main_gpu_elapsed = Some(durations[index]);
+    index += 1;
+    if has_rejection {
+        timing.rejection_gpu_elapsed = Some(durations[index]);
+        index += 1;
+    } else if integrated_spec {
+        timing.rejection_gpu_elapsed = Some(Duration::ZERO);
+    }
+    if integrated_spec {
+        if has_spec_decode {
+            timing.spec_prepare_gpu_elapsed = Some(durations[index]);
+            index += 1;
+        } else {
+            timing.spec_prepare_gpu_elapsed = Some(Duration::ZERO);
+        }
+        timing.spec_prefill_gpu_elapsed = Some(durations[index]);
+        index += 1;
+        if has_spec_decode {
+            timing.spec_decode_gpu_elapsed = Some(durations[index]);
+        } else {
+            timing.spec_decode_gpu_elapsed = Some(Duration::ZERO);
+        }
+    }
+}
 
 fn split_main_lane_page_ids(
     page_ids: &[u32],

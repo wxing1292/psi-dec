@@ -52,6 +52,7 @@ replays through Metal 4.
 │   │    ├─ command queue                          // MTL4CommandQueue                       │
 │   │    ├─ command allocator                      // MTL4CommandAllocator                   │
 │   │    ├─ commit completion                      // MTL4 commit feedback                    │
+│   │    ├─ optional timestamp profiler            // MTL4CounterHeap                        │
 │   │    └─ ResidencySet                           // wraps queue-attached MTLResidencySet   │
 │   └─ BufferIO                                                                              │
 │        └─ I/O command queue                      // serial MTLIOCommandQueue               │
@@ -126,6 +127,13 @@ The executor writes runtime input one time for each submission. `num_total_threa
 capacity. `num_active_threads` masks unused capacity for one submission.
 
 `MetalRuntime` owns one compute `Stream` and one `BufferIO`.
+When `PSI_DEC_METAL_GPU_TIMESTAMPS` is `relaxed` or `precise`, the Stream also owns one reusable Metal 4 timestamp
+counter heap. An instrumented replay sequence writes one initial timestamp and one timestamp after each caller-supplied
+stage end. `ReplaySubmission::wait()` first proves GPU completion. It then resolves the opaque heap on the CPU timeline
+and converts GPU ticks with `MTLDevice::queryTimestampFrequency()`.
+The unset or `off` configuration does not create the heap or encode timestamp commands.
+If the device cannot create the heap or Metal returns zero, unordered, or incomplete data, the submission returns no
+GPU intervals and preserves the normal completion path.
 `BufferIO::create` creates a new output file.
 `BufferIO::open` opens an existing input file.
 Both methods require `BufferIOFileCacheMode::Cached` or `BufferIOFileCacheMode::Uncached`.

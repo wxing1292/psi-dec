@@ -19,6 +19,7 @@ objc2-metal = { workspace = true, features = [
   "MTL4CommandQueue",
   "MTL4CommitFeedback",
   "MTL4ComputeCommandEncoder",
+  "MTL4Counters",
   "MTLResidencySet",
   "MTLGPUAddress",
   "MTLIOCommandBuffer",

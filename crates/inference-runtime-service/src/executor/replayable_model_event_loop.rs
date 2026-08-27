@@ -364,15 +364,23 @@ where
         }
 
         let main_replay_start = Instant::now();
-        {
+        let submission = {
             let _span = profiling::span("model.submit_main.wait");
             let submission = self.model.submit_main(&recorder);
             submission.wait();
-        }
+            submission
+        };
         let main_replay_elapsed = main_replay_start.elapsed();
+        let gpu_timestamp_durations = submission.gpu_timestamp_durations();
+        drop(submission);
         let mut sampled_output = if last_pp_stage {
             let _span = profiling::span("model.read_main");
-            self.model.read_main(&recorder, &model_batch_req, main_replay_elapsed)
+            self.model.read_main(
+                &recorder,
+                &model_batch_req,
+                main_replay_elapsed,
+                gpu_timestamp_durations.as_deref(),
+            )
         } else {
             self.model.empty_sampled_output()
         };
@@ -439,10 +447,7 @@ where
             spec_elapsed = spec_start.elapsed();
         }
         drop(recorder);
-        let spec_passes = self
-            .model
-            .sampled_output_timing(&sampled_output)
-            .map_or(0, |timing| timing.spec_passes);
+        let model_output_timing = self.model.sampled_output_timing(&sampled_output).unwrap_or_default();
 
         let batch_resp = {
             let _span = profiling::span("commit_batch");
@@ -461,7 +466,13 @@ where
             ExecutorBatchPerfMetrics {
                 main_elapsed,
                 spec_elapsed,
-                spec_passes,
+                spec_passes: model_output_timing.spec_passes,
+                main_gpu_elapsed: model_output_timing.main_gpu_elapsed,
+                rejection_gpu_elapsed: model_output_timing.rejection_gpu_elapsed,
+                spec_prepare_gpu_elapsed: model_output_timing.spec_prepare_gpu_elapsed,
+                spec_prefill_gpu_elapsed: model_output_timing.spec_prefill_gpu_elapsed,
+                spec_decode_gpu_elapsed: model_output_timing.spec_decode_gpu_elapsed,
+                spec_gpu_elapsed: model_output_timing.spec_gpu_elapsed(),
             },
         );
         tracing::debug!(
@@ -750,6 +761,7 @@ mod tests {
             _recorder: &Self::ModelOpsRecorder,
             _model_batch_req: &Self::ModelBatchRequest,
             _replay_elapsed: Duration,
+            _gpu_timestamp_durations: Option<&[Duration]>,
         ) -> Self::SampledOutput {
         }
 
@@ -931,6 +943,7 @@ mod tests {
             _recorder: &Self::ModelOpsRecorder,
             _model_batch_req: &Self::ModelBatchRequest,
             _replay_elapsed: Duration,
+            _gpu_timestamp_durations: Option<&[Duration]>,
         ) -> Self::SampledOutput {
             self.push(SpecLifecycleEvent::ReadMain);
         }

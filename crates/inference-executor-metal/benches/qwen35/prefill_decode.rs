@@ -726,7 +726,15 @@ impl VanillaFixture {
         let main_submit_wait = replay_start.elapsed();
         let sampled = match kind {
             BatchKind::Prefill => self.model.empty_sampled_output(),
-            BatchKind::Decode => self.model.read_main(&recorder, &model_batch_req, main_submit_wait),
+            BatchKind::Decode => {
+                let gpu_timestamp_durations = submission.gpu_timestamp_durations();
+                self.model.read_main(
+                    &recorder,
+                    &model_batch_req,
+                    main_submit_wait,
+                    gpu_timestamp_durations.as_deref(),
+                )
+            },
         };
         assert!(!self.model.run_spec(&model_batch_req, &sampled));
         assert!(!self.model.run_spec_prefill(&model_batch_req));

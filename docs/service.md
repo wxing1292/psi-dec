@@ -708,8 +708,15 @@ acceptance_rate=0.6667
 num_spec_token_by_index=[4, 3, 2]
 num_verified_token_by_index=[3, 2, 1]
 acceptance_rate_by_index=[0.7500, 0.6667, 0.5000]
-main_ms=14.2500
-spec_ms=6.5000
+executor_cpu_ms=20.7500
+main_cpu_ms=14.2500
+spec_cpu_ms=6.5000
+main_gpu_ms=10.7500
+rejection_gpu_ms=0.3500
+spec_prepare_gpu_ms=0.0200
+spec_prefill_gpu_ms=1.1000
+spec_decode_gpu_ms=1.8000
+spec_gpu_ms=2.9200
 spec_passes=2
 ```
 
@@ -721,13 +728,37 @@ all earlier speculative tokens passed verification. `num_spec_token_by_index[i]`
 `num_verified_token_by_index[i]` is the verified count at the same index. The helper scripts sum these counts across
 batches before they calculate `acceptance_rate_by_index`.
 
-`main_ms` covers `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
+`main_cpu_ms` covers `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
 For Qwen3 and Qwen3.5 DSpark, and for Qwen3.5 DFlash2, it also covers GPU Spec Decode prepare, Spec Prefill, Spec
 Decode, proposal sampling, and proposal read in the same ordered submission.
-`spec_ms` covers a separate Spec lifecycle. Qwen3.5 MTP uses this boundary. DSpark and DFlash2 do not, so their
-`spec_ms` is zero.
-DSpark or DFlash2 prefill-only batches can have nonzero `main_ms` and zero `spec_passes`.
-`spec_passes` counts Spec Decode forwards. These values are host elapsed latencies. They are not GPU kernel timings.
+`spec_cpu_ms` covers a separate Spec lifecycle. Qwen3.5 MTP uses this boundary. DSpark and DFlash2 do not, so their
+`spec_cpu_ms` is zero.
+DSpark or DFlash2 prefill-only batches can have nonzero `main_cpu_ms` and zero `spec_passes`.
+`executor_cpu_ms` is `main_cpu_ms + spec_cpu_ms`. Use `executor_cpu_ms` to compare the complete CPU-observed
+Main-to-Spec lifecycle across the old split DSpark or DFlash2 lifecycle and the integrated lifecycle. Do not compare
+old `main_cpu_ms` directly with integrated `main_cpu_ms` because the integrated value includes fixed-block Spec work.
+`spec_passes` counts Spec Decode forwards. The `*_cpu_ms` fields are CPU-observed wall latencies. They include GPU
+wait time and do not measure CPU active execution. The `*_gpu_ms` fields are GPU-observed Metal timestamp durations.
+
+Set `PSI_DEC_METAL_GPU_TIMESTAMPS=relaxed` to add Metal 4 GPU timestamp boundaries to Main submissions.
+The default is off. The off path does not allocate a counter heap or encode timestamp writes.
+Use `PSI_DEC_METAL_GPU_TIMESTAMPS=precise` only for an explicit diagnostic. Precise timestamps can split command
+encoders and change performance.
+
+The GPU timing fields have these meanings:
+
+- `main_gpu_ms` covers Main work before RejectionSampling. It includes ordinary Sampling when no rejection stage
+  exists.
+- `rejection_gpu_ms` covers RejectionSampling only.
+- `spec_prepare_gpu_ms` covers Spec Decode prepare.
+- `spec_prefill_gpu_ms` covers DSpark or DFlash2 Spec Prefill.
+- `spec_decode_gpu_ms` covers Spec Decode and proposal sampling.
+- `spec_gpu_ms` is `spec_prepare_gpu_ms + spec_prefill_gpu_ms + spec_decode_gpu_ms`.
+
+The fixed-block Spec fields apply to the integrated DSpark and DFlash2 submission. They are `unavailable` for MTP.
+An absent stage in an enabled integrated submission reports `0.0000`. All GPU fields report `unavailable` when the
+instrumentation is off or when Metal does not return a valid ordered timestamp sequence. This fallback does not change
+submission completion or output readback.
 
 `--logging info` does not emit the executor batch performance event. `--logging debug` also emits request and response
 diagnostics. The end-to-end performance helpers enable only the `inference-runtime-service::perf` DEBUG target when

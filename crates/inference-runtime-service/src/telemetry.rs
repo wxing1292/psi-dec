@@ -1,5 +1,6 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
 
@@ -62,6 +63,17 @@ fn four_decimal(value: f64) -> impl Display {
     FourDecimal(value)
 }
 
+struct OptionalMilliseconds(Option<Duration>);
+
+impl Display for OptionalMilliseconds {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(elapsed) => write!(formatter, "{:.4}", ms(elapsed)),
+            None => formatter.write_str("unavailable"),
+        }
+    }
+}
+
 struct FourDecimalList<'a>(&'a [f64]);
 
 impl Display for FourDecimalList<'_> {
@@ -86,6 +98,7 @@ pub fn emit_executor_batch_perf_metrics(
     metrics: ExecutorBatchPerfMetrics,
 ) {
     let acceptance_rate = ratio(response_summary.num_verified_tokens, response_summary.num_spec_tokens);
+    let executor_elapsed = metrics.main_elapsed + metrics.spec_elapsed;
     let acceptance_rate_by_index = response_summary
         .num_verified_token_by_index
         .iter()
@@ -107,8 +120,15 @@ pub fn emit_executor_batch_perf_metrics(
         num_spec_token_by_index = ?response_summary.num_spec_token_by_index,
         num_verified_token_by_index = ?response_summary.num_verified_token_by_index,
         acceptance_rate_by_index = %FourDecimalList(&acceptance_rate_by_index),
-        main_ms = %four_decimal(ms(metrics.main_elapsed)),
-        spec_ms = %four_decimal(ms(metrics.spec_elapsed)),
+        executor_cpu_ms = %four_decimal(ms(executor_elapsed)),
+        main_cpu_ms = %four_decimal(ms(metrics.main_elapsed)),
+        spec_cpu_ms = %four_decimal(ms(metrics.spec_elapsed)),
+        main_gpu_ms = %OptionalMilliseconds(metrics.main_gpu_elapsed),
+        rejection_gpu_ms = %OptionalMilliseconds(metrics.rejection_gpu_elapsed),
+        spec_prepare_gpu_ms = %OptionalMilliseconds(metrics.spec_prepare_gpu_elapsed),
+        spec_prefill_gpu_ms = %OptionalMilliseconds(metrics.spec_prefill_gpu_elapsed),
+        spec_decode_gpu_ms = %OptionalMilliseconds(metrics.spec_decode_gpu_elapsed),
+        spec_gpu_ms = %OptionalMilliseconds(metrics.spec_gpu_elapsed),
         spec_passes = metrics.spec_passes,
         "executor batch perf"
     );

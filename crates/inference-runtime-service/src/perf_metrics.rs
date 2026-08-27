@@ -11,6 +11,12 @@ pub struct ExecutorBatchPerfMetrics {
     pub main_elapsed: Duration,
     pub spec_elapsed: Duration,
     pub spec_passes: usize,
+    pub main_gpu_elapsed: Option<Duration>,
+    pub rejection_gpu_elapsed: Option<Duration>,
+    pub spec_prepare_gpu_elapsed: Option<Duration>,
+    pub spec_prefill_gpu_elapsed: Option<Duration>,
+    pub spec_decode_gpu_elapsed: Option<Duration>,
+    pub spec_gpu_elapsed: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]

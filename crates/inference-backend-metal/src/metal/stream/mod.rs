@@ -46,6 +46,9 @@ mod submission;
 pub use submission::ReplayExecution;
 pub use submission::ReplaySubmission;
 
+mod timestamp;
+pub use timestamp::GpuTimestampGranularity;
+
 const MAX_BUFFER_BINDINGS: usize = 31;
 const PARAMETER_BUFFER_ALIGNMENT: usize = 8;
 
@@ -92,10 +95,15 @@ pub struct Stream {
     allocator_in_flight: Rc<Cell<bool>>,
     completion: Rc<CommitCompletion>,
     residency_set: Rc<ResidencySet>,
+    timestamp_profiler: Option<timestamp::TimestampProfiler>,
 }
 
 impl Stream {
     pub fn new(device: &Device) -> Self {
+        Self::new_with_gpu_timestamps(device, None)
+    }
+
+    pub fn new_with_gpu_timestamps(device: &Device, timestamp_granularity: Option<GpuTimestampGranularity>) -> Self {
         let queue = device
             .as_raw()
             .newMTL4CommandQueue()
@@ -106,6 +114,8 @@ impl Stream {
             .expect("MTL4CommandAllocator allocation failed");
         let completion = CommitCompletion::new();
         let residency_set = ResidencySet::new(device.as_raw(), queue.clone());
+        let timestamp_profiler = timestamp_granularity
+            .and_then(|granularity| timestamp::TimestampProfiler::new(device.as_raw_retained(), granularity));
         Self {
             device: device.as_raw_retained(),
             queue,
@@ -113,6 +123,7 @@ impl Stream {
             allocator_in_flight: Rc::new(Cell::new(false)),
             completion,
             residency_set,
+            timestamp_profiler,
         }
     }
 
@@ -122,6 +133,12 @@ impl Stream {
 
     pub fn create_replay_program(&self) -> ReplayProgramBuilder {
         ReplayProgramBuilder::new(self)
+    }
+
+    pub fn gpu_timestamps_enabled(&self) -> bool {
+        self.timestamp_profiler
+            .as_ref()
+            .is_some_and(timestamp::TimestampProfiler::is_available)
     }
 
     pub fn submit_replay(&self, program: &ReplayProgram) -> ReplaySubmission {
@@ -137,7 +154,32 @@ impl Stream {
     }
 
     pub fn submit_replay_sequence(&self, executions: &[ReplayExecution<'_>]) -> ReplaySubmission {
-        submission::submit_replay_sequence(self, executions)
+        submission::submit_replay_sequence(self, executions, None)
+    }
+
+    pub fn submit_replay_sequence_with_gpu_timestamps(
+        &self,
+        executions: &[ReplayExecution<'_>],
+        stage_end_indices: &[usize],
+    ) -> ReplaySubmission {
+        assert!(
+            !stage_end_indices.is_empty(),
+            "Metal GPU timing requires at least one stage"
+        );
+        assert_eq!(
+            stage_end_indices.last().copied(),
+            Some(executions.len()),
+            "Metal GPU timing stages must cover the complete replay sequence"
+        );
+        let mut previous = 0usize;
+        for &stage_end_index in stage_end_indices {
+            assert!(
+                stage_end_index > previous && stage_end_index <= executions.len(),
+                "Metal GPU timing stage ends must be strictly increasing replay-sequence indices"
+            );
+            previous = stage_end_index;
+        }
+        submission::submit_replay_sequence(self, executions, Some(stage_end_indices))
     }
 }
 
@@ -165,6 +207,7 @@ mod tests {
     use crate::metal::CommandRecorder;
     use crate::metal::CompiledKernel;
     use crate::metal::Device;
+    use crate::metal::GpuTimestampGranularity;
     use crate::metal::Operator;
     use crate::metal::ReplayArguments;
     use crate::metal::ReplayExecution;
@@ -420,6 +463,59 @@ mod tests {
             .wait();
 
         assert_eq!(values.read_typed::<f32>(0, 1), vec![3.0]);
+    }
+
+    #[test]
+    fn test_gpu_timestamps_disabled() {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        let values = Buffer::from_slice(&device, &[1.0_f32]);
+        let mut builder = stream.create_replay_program();
+        builder.record(AddOneInvocation {
+            kernel: &kernel,
+            values: &values,
+            len: 1,
+        });
+        let program = builder.build();
+        let arguments = ReplayArguments::new();
+
+        let submission =
+            stream.submit_replay_sequence_with_gpu_timestamps(&[ReplayExecution::new(&program, &arguments)], &[1]);
+        submission.wait();
+
+        assert_eq!(submission.gpu_timestamp_durations(), None);
+        assert_eq!(values.read_typed::<f32>(0, 1), vec![2.0]);
+    }
+
+    #[test]
+    fn test_gpu_timestamps_success() {
+        let device = Device::system_default();
+        let kernel = CompiledKernel::new(&device, ADD_ONE_SOURCE, "add_one");
+        for granularity in [GpuTimestampGranularity::Relaxed, GpuTimestampGranularity::Precise] {
+            let stream = Stream::new_with_gpu_timestamps(&device, Some(granularity));
+            let values = Buffer::from_slice(&device, &[1.0_f32]);
+            let mut builder = stream.create_replay_program();
+            builder.record(AddOneInvocation {
+                kernel: &kernel,
+                values: &values,
+                len: 1,
+            });
+            let program = builder.build();
+            let arguments = ReplayArguments::new();
+
+            let submission = stream.submit_replay_sequence_with_gpu_timestamps(
+                &[
+                    ReplayExecution::new(&program, &arguments),
+                    ReplayExecution::new(&program, &arguments),
+                ],
+                &[1, 2],
+            );
+            submission.wait();
+
+            assert_eq!(submission.gpu_timestamp_durations().unwrap().len(), 2);
+            assert_eq!(values.read_typed::<f32>(0, 1), vec![3.0]);
+        }
     }
 
     #[test]

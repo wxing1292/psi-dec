@@ -24,6 +24,7 @@ pub use dtype::Dtype;
 pub use dtype::MetalBufferElement;
 pub use kernel::CompiledKernel;
 pub use stream::CommandRecorder;
+pub use stream::GpuTimestampGranularity;
 pub use stream::Operator;
 pub use stream::ReplayArguments;
 pub use stream::ReplayExecution;

@@ -19,6 +19,7 @@ use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::model::embedding::Embed;
+use crate::model::qwen::v3_x::SpecReplayStageEnds;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbed;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedArgs;
 use crate::model::qwen::v3_x::dspark::embed::Qwen3xDSparkEmbedReplayKey;
@@ -356,17 +357,21 @@ impl Qwen3xDSparkExecution {
         sequence: &mut Vec<ReplayExecution<'a>>,
         prefill: &'a Qwen3xDSparkPrefillRecording,
         decode: Option<&'a Qwen3xDSparkDecodeRecording>,
-    ) {
+    ) -> SpecReplayStageEnds {
+        let mut decode_prepare_end = None;
         if let Some(decode) = decode {
             sequence.push(ReplayExecution::new(
                 self.decode_input.replay(&decode.decode_prepare.key),
                 &decode.decode_prepare.arguments,
             ));
+            decode_prepare_end = Some(sequence.len());
         }
         sequence.push(ReplayExecution::new(
             self.prefill.replay(&prefill.key),
             &prefill.arguments,
         ));
+        let prefill_end = sequence.len();
+        let mut decode_end = None;
         if let Some(decode) = decode {
             sequence.push(ReplayExecution::new(
                 self.embed.replay(&decode.embed_key),
@@ -384,6 +389,12 @@ impl Qwen3xDSparkExecution {
                 self.sampling.replay(&decode.sampling_key),
                 &decode.sampling_arguments,
             ));
+            decode_end = Some(sequence.len());
+        }
+        SpecReplayStageEnds {
+            decode_prepare: decode_prepare_end,
+            prefill: prefill_end,
+            decode: decode_end,
         }
     }
 

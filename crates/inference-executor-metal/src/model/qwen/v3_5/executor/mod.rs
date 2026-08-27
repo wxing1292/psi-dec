@@ -93,6 +93,7 @@ use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
+use crate::model::qwen::apply_main_gpu_timing;
 use crate::model::qwen::split_main_lane_page_ids;
 use crate::model::qwen::v3_5::main::Qwen35Main;
 use crate::model::qwen::v3_5::main::Qwen35MainArgs;
@@ -1351,9 +1352,10 @@ impl ReplayableModel for Qwen35Executor {
         recorder: &Self::ModelOpsRecorder,
         model_batch_req: &Self::ModelBatchRequest,
         replay_elapsed: Duration,
+        gpu_timestamp_durations: Option<&[Duration]>,
     ) -> Self::SampledOutput {
         if recorder.num_main_sample_rows == 0 {
-            let timing = if self.speculator.is_dspark() || self.speculator.is_dflash2() {
+            let mut timing = if self.speculator.is_dspark() || self.speculator.is_dflash2() {
                 ModelOutputTiming {
                     main_spec_replay_elapsed: replay_elapsed,
                     ..ModelOutputTiming::default()
@@ -1364,6 +1366,13 @@ impl ReplayableModel for Qwen35Executor {
                     ..ModelOutputTiming::default()
                 }
             };
+            apply_main_gpu_timing(
+                &mut timing,
+                gpu_timestamp_durations,
+                self.speculator.is_dspark() || self.speculator.is_dflash2(),
+                recorder.rejection_key.is_some(),
+                recorder.dspark_spec_decode.is_some() || recorder.dflash2_spec_decode.is_some(),
+            );
             return Qwen35SampledOutput {
                 decisions: Vec::new(),
                 timing,
@@ -1386,6 +1395,13 @@ impl ReplayableModel for Qwen35Executor {
             };
             timing.spec_read_elapsed = read_start.elapsed();
         }
+        apply_main_gpu_timing(
+            &mut timing,
+            gpu_timestamp_durations,
+            self.speculator.is_dspark() || self.speculator.is_dflash2(),
+            recorder.rejection_key.is_some(),
+            recorder.dspark_spec_decode.is_some() || recorder.dflash2_spec_decode.is_some(),
+        );
         Qwen35SampledOutput { decisions, timing }
     }
 

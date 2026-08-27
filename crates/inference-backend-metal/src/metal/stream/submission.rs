@@ -1,6 +1,8 @@
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -9,6 +11,7 @@ use objc2_metal::MTL4CommandAllocator;
 use objc2_metal::MTL4CommandBuffer;
 use objc2_metal::MTL4CommandEncoder;
 use objc2_metal::MTL4CommandQueue;
+use objc2_metal::MTL4ComputeCommandEncoder;
 use objc2_metal::MTL4VisibilityOptions;
 use objc2_metal::MTLDevice;
 use objc2_metal::MTLStages;
@@ -21,6 +24,7 @@ use crate::metal::stream::replay::ReplayResources;
 use crate::metal::stream::replay::assert_replay_submission_queue;
 use crate::metal::stream::replay::encode_replay;
 use crate::metal::stream::replay::validate_replay_arguments;
+use crate::metal::stream::timestamp::SubmissionTimestamps;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayExecution<'a> {
@@ -42,6 +46,8 @@ pub struct ReplaySubmission {
     _resources: Vec<Rc<ReplayResources>>,
     _queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     _command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+    timestamps: Option<SubmissionTimestamps>,
+    timestamp_durations: RefCell<Option<Vec<Duration>>>,
     waited: Cell<bool>,
 }
 
@@ -50,6 +56,7 @@ impl ReplaySubmission {
         stream: &Stream,
         command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
         resources: Vec<Rc<ReplayResources>>,
+        timestamps: Option<SubmissionTimestamps>,
     ) -> Self {
         command_buffer.endCommandBuffer();
         let mut command_buffer_ptr = NonNull::new(Retained::as_ptr(&command_buffer).cast_mut())
@@ -72,6 +79,8 @@ impl ReplaySubmission {
             _resources: resources,
             _queue: stream.queue.clone(),
             _command_buffer: command_buffer,
+            timestamps,
+            timestamp_durations: RefCell::new(None),
             waited: Cell::new(false),
         }
     }
@@ -81,8 +90,15 @@ impl ReplaySubmission {
             return;
         }
         self.completion.wait();
+        if let Some(timestamps) = &self.timestamps {
+            *self.timestamp_durations.borrow_mut() = timestamps.resolve();
+        }
         self.allocator.reset();
         self.allocator_in_flight.set(false);
+    }
+
+    pub fn gpu_timestamp_durations(&self) -> Option<Vec<Duration>> {
+        self.timestamp_durations.borrow().clone()
     }
 }
 
@@ -92,7 +108,11 @@ impl Drop for ReplaySubmission {
     }
 }
 
-pub fn submit_replay_sequence(stream: &Stream, executions: &[ReplayExecution<'_>]) -> ReplaySubmission {
+pub fn submit_replay_sequence(
+    stream: &Stream,
+    executions: &[ReplayExecution<'_>],
+    timestamp_stage_end_indices: Option<&[usize]>,
+) -> ReplaySubmission {
     assert!(
         !executions.is_empty(),
         "Metal replay sequence requires at least one execution"
@@ -110,7 +130,6 @@ pub fn submit_replay_sequence(stream: &Stream, executions: &[ReplayExecution<'_>
             }
         }
     }
-
     assert!(
         !stream.allocator_in_flight.replace(true),
         "Metal stream command allocator already has an in-flight submission; wait before submitting again"
@@ -123,18 +142,50 @@ pub fn submit_replay_sequence(stream: &Stream, executions: &[ReplayExecution<'_>
     let encoder = command_buffer
         .computeCommandEncoder()
         .expect("MTL4ComputeCommandEncoder allocation failed");
-
-    let mut resources = Vec::with_capacity(executions.len());
-    for (index, execution) in executions.iter().enumerate() {
-        if index > 0 {
-            encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                MTLStages::Dispatch,
-                MTLStages::Dispatch,
-                MTL4VisibilityOptions::None,
-            );
-        }
-        resources.push(encode_replay(execution.program, &encoder, execution.arguments));
+    let timestamps = timestamp_stage_end_indices.and_then(|stage_end_indices| {
+        stream
+            .timestamp_profiler
+            .as_ref()
+            .and_then(|profiler| profiler.begin(stage_end_indices.len() + 1))
+    });
+    if let Some(timestamps) = &timestamps {
+        timestamps.write(&encoder, 0);
     }
+
+    let resources = if let Some(timestamps) = &timestamps {
+        let stage_end_indices = timestamp_stage_end_indices.expect("timestamp submission requires stage ends");
+        let mut resources = Vec::with_capacity(executions.len());
+        let mut next_timestamp_stage = 0usize;
+        for (index, execution) in executions.iter().enumerate() {
+            resources.push(encode_execution(&encoder, index, execution));
+            if stage_end_indices.get(next_timestamp_stage).copied() == Some(index + 1) {
+                timestamps.write(&encoder, next_timestamp_stage + 1);
+                next_timestamp_stage += 1;
+            }
+        }
+        resources
+    } else {
+        executions
+            .iter()
+            .enumerate()
+            .map(|(index, execution)| encode_execution(&encoder, index, execution))
+            .collect()
+    };
     encoder.endEncoding();
-    ReplaySubmission::submit(stream, command_buffer, resources)
+    ReplaySubmission::submit(stream, command_buffer, resources, timestamps)
+}
+
+fn encode_execution(
+    encoder: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    index: usize,
+    execution: &ReplayExecution<'_>,
+) -> Rc<ReplayResources> {
+    if index > 0 {
+        encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch,
+            MTLStages::Dispatch,
+            MTL4VisibilityOptions::None,
+        );
+    }
+    encode_replay(execution.program, encoder, execution.arguments)
 }

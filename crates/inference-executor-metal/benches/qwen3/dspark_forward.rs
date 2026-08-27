@@ -297,9 +297,14 @@ impl MainFixture {
         let output = self.model.unembed_main(&mut recorder, &prepared, &hidden);
         self.model.sample_main(&mut recorder, &prepared, &output);
         let replay_start = Instant::now();
-        self.model.submit_main(&recorder).wait();
+        let submission = self.model.submit_main(&recorder);
+        submission.wait();
         let replay_elapsed = replay_start.elapsed();
-        let sampled = self.model.read_main(&recorder, &prepared, replay_elapsed);
+        let gpu_timestamp_durations = submission.gpu_timestamp_durations();
+        drop(submission);
+        let sampled = self
+            .model
+            .read_main(&recorder, &prepared, replay_elapsed, gpu_timestamp_durations.as_deref());
         assert_eq!(self.model.sampled_output_len(&sampled), 0);
         let spec_replay_elapsed = if self.model.run_spec_prefill(&prepared) {
             self.model.prefill_spec(&mut recorder, &prepared, &sampled);

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use inference_backend_metal::components::residual_add;
 use inference_backend_metal::components::rms_norm;
 use inference_backend_metal::metal::Operator;
@@ -23,6 +25,10 @@ impl<'a> MetalReplayRuntime<'a> {
         ReplayRecorder::new(self.stream.create_replay_program())
     }
 
+    pub fn gpu_timestamps_enabled(&self) -> bool {
+        self.stream.gpu_timestamps_enabled()
+    }
+
     pub fn submit_replay(&self, replay: &ReplayProgram) -> MetalReplaySubmission {
         MetalReplaySubmission::new(self.stream.submit_replay(replay))
     }
@@ -37,6 +43,17 @@ impl<'a> MetalReplayRuntime<'a> {
 
     pub fn submit_replay_sequence(&self, executions: &[ReplayExecution<'_>]) -> MetalReplaySubmission {
         MetalReplaySubmission::new(self.stream.submit_replay_sequence(executions))
+    }
+
+    pub fn submit_replay_sequence_with_gpu_timestamps(
+        &self,
+        executions: &[ReplayExecution<'_>],
+        stage_end_indices: &[usize],
+    ) -> MetalReplaySubmission {
+        MetalReplaySubmission::new(
+            self.stream
+                .submit_replay_sequence_with_gpu_timestamps(executions, stage_end_indices),
+        )
     }
 }
 
@@ -102,11 +119,19 @@ impl MetalReplaySubmission {
     pub fn wait(&self) {
         self.inner.wait();
     }
+
+    pub fn gpu_timestamp_durations(&self) -> Option<Vec<Duration>> {
+        self.inner.gpu_timestamp_durations()
+    }
 }
 
 impl ExecutionSubmission for MetalReplaySubmission {
     fn wait(&self) {
         MetalReplaySubmission::wait(self);
+    }
+
+    fn gpu_timestamp_durations(&self) -> Option<Vec<Duration>> {
+        MetalReplaySubmission::gpu_timestamp_durations(self)
     }
 }
 

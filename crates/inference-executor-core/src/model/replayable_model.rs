@@ -57,6 +57,10 @@ use crate::def::ModelExecutorError;
 
 pub trait ExecutionSubmission {
     fn wait(&self);
+
+    fn gpu_timestamp_durations(&self) -> Option<Vec<Duration>> {
+        None
+    }
 }
 
 pub trait ReplayableModel {
@@ -122,6 +126,7 @@ pub trait ReplayableModel {
         recorder: &Self::ModelOpsRecorder,
         model_batch_req: &Self::ModelBatchRequest,
         replay_elapsed: Duration,
+        gpu_timestamp_durations: Option<&[Duration]>,
     ) -> Self::SampledOutput;
 
     fn run_spec(&self, _model_batch_req: &Self::ModelBatchRequest, _sampled_output: &Self::SampledOutput) -> bool {
@@ -235,6 +240,11 @@ pub struct ModelOutputTiming {
     pub spec_replay_elapsed: Duration,
     pub spec_read_elapsed: Duration,
     pub spec_passes: usize,
+    pub main_gpu_elapsed: Option<Duration>,
+    pub rejection_gpu_elapsed: Option<Duration>,
+    pub spec_prepare_gpu_elapsed: Option<Duration>,
+    pub spec_prefill_gpu_elapsed: Option<Duration>,
+    pub spec_decode_gpu_elapsed: Option<Duration>,
 }
 
 impl ModelOutputTiming {
@@ -249,10 +259,30 @@ impl ModelOutputTiming {
         self.spec_replay_elapsed += other.spec_replay_elapsed;
         self.spec_read_elapsed += other.spec_read_elapsed;
         self.spec_passes += other.spec_passes;
+        self.main_gpu_elapsed = add_optional_duration(self.main_gpu_elapsed, other.main_gpu_elapsed);
+        self.rejection_gpu_elapsed = add_optional_duration(self.rejection_gpu_elapsed, other.rejection_gpu_elapsed);
+        self.spec_prepare_gpu_elapsed =
+            add_optional_duration(self.spec_prepare_gpu_elapsed, other.spec_prepare_gpu_elapsed);
+        self.spec_prefill_gpu_elapsed =
+            add_optional_duration(self.spec_prefill_gpu_elapsed, other.spec_prefill_gpu_elapsed);
+        self.spec_decode_gpu_elapsed =
+            add_optional_duration(self.spec_decode_gpu_elapsed, other.spec_decode_gpu_elapsed);
     }
 
     pub fn is_zero(self) -> bool {
         self == Self::default()
+    }
+
+    pub fn spec_gpu_elapsed(self) -> Option<Duration> {
+        Some(self.spec_prepare_gpu_elapsed? + self.spec_prefill_gpu_elapsed? + self.spec_decode_gpu_elapsed?)
+    }
+}
+
+fn add_optional_duration(lhs: Option<Duration>, rhs: Option<Duration>) -> Option<Duration> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => Some(lhs + rhs),
+        (Some(elapsed), None) | (None, Some(elapsed)) => Some(elapsed),
+        (None, None) => None,
     }
 }
 
@@ -286,4 +316,24 @@ pub fn page_ids_by_layer_for_lane(
     }
 
     page_ids_by_layer
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::ModelOutputTiming;
+
+    #[test]
+    fn test_spec_gpu_elapsed_incomplete() {
+        let mut timing = ModelOutputTiming {
+            spec_prepare_gpu_elapsed: Some(Duration::from_millis(2)),
+            spec_prefill_gpu_elapsed: Some(Duration::from_millis(3)),
+            ..ModelOutputTiming::default()
+        };
+        assert_eq!(timing.spec_gpu_elapsed(), None);
+
+        timing.spec_decode_gpu_elapsed = Some(Duration::from_millis(5));
+        assert_eq!(timing.spec_gpu_elapsed(), Some(Duration::from_millis(10)));
+    }
 }

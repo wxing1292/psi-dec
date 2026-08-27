@@ -312,8 +312,16 @@ fn run_one_decode(model: &mut inference_executor_metal::model::qwen::v3_5::execu
     let hidden = model.forward_main(&mut recorder, &model_batch, hidden);
     let output = model.unembed_main(&mut recorder, &model_batch, &hidden);
     model.sample_main(&mut recorder, &model_batch, &output);
-    model.submit_main(&recorder).wait();
-    let mut sampled = model.read_main(&recorder, &model_batch, Duration::ZERO);
+    let submission = model.submit_main(&recorder);
+    submission.wait();
+    let gpu_timestamp_durations = submission.gpu_timestamp_durations();
+    drop(submission);
+    let mut sampled = model.read_main(
+        &recorder,
+        &model_batch,
+        Duration::ZERO,
+        gpu_timestamp_durations.as_deref(),
+    );
     let run_spec = model.run_spec(&model_batch, &sampled);
     let run_spec_prefill = model.run_spec_prefill(&model_batch);
     let run_spec_decode = model.run_spec_decode(&model_batch, &sampled);
