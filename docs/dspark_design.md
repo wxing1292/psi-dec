@@ -32,28 +32,28 @@ DSpark
 ------
 
 selected Main-layer hidden states
-                 │
-                 ▼
+                  │
+                  ▼
         capture / projection
-                 │
-                 ▼
+                  │
+                  ▼
         Main context H
        (Attention only)
 
       [ANCHOR] [MASK] [MASK] [MASK] ...
          t=0     t=1    t=2    t=3
-                 │
-                 ▼
+                  │
+                  ▼
         embedding / proposal input
-                 │
-                 ▼
+                  │
+                  ▼
 
 ┌───────────────────────────────────────────────────────────────┐
 │                     DSpark Layer × L                          │
 │                                                               │
 │                    draft hidden h_t                           │
-│                            │                                  │
-│                            ▼                                  │
+│                           │                                   │
+│                           ▼                                   │
 │                  ┌─────────────────┐                          │
 │                  │ Attention / MLP │                          │
 │                  └────────┬────────┘                          │

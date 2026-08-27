@@ -22,21 +22,21 @@ DFlash2
 -------
 
 selected Main-layer hidden states
-                 │
-                 ▼
+                  │
+                  ▼
         capture / projection
-                 │
-                 ▼
+                  │
+                  ▼
         Main context H
        (Attention only)
 
       [ANCHOR] [MASK] [MASK] [MASK] ...
          t=0     t=1    t=2    t=3
-                 │
-                 ▼
+                  │
+                  ▼
         embedding / proposal input
-                 │
-                 ▼
+                  │
+                  ▼
 
 ┌───────────────────────────────────────────────────────────────┐
 │                    DFlash2 Layer × L                          │
@@ -60,15 +60,16 @@ selected Main-layer hidden states
 │ h_t-1 ─►│          │                               │          │
 │         └────┬─────┘                               │          │
 │              ▼                                     │          │
-│             h'_t                                   │          │
+│            h'_t                                    │          │
 │              │                                     │          │
 │              ▼                                     │          │
 │      ┌─────────────────┐                           │          │
 │      │ Attention / MLP │                           │          │
-│      └────────┬────────┘                           │          │
-│               ▼                                    │          │
-│              r_t                                   │          │
-│                                                    │          │
+│      └───────┬─────────┘                           │          │
+│              ▼                                     │          │
+│             r_t                                    │          │
+│              │                                     │          │
+│              ▼                                     │          │
 │         ┌───────────┐                              │          │
 │ r_t ───►│ POST-CONV │◄─────────────────────────────┘          │
 │ r_t-1 ─►│           │                                         │
@@ -104,15 +105,15 @@ previous selected token a
 current top-k candidate b
 current draft hidden h_t
 
- h_t ──► H(h_t) ──┐
+ h_t ──► H(h_t) ───┐
                    ▼
- a ───► A(a) ───► elementwise product ──┐
+ a ───► A(a) ───► elementwise product ───┐
                                          ▼
- b ───► B(b) ─────────────────────────► dot ──┐
-                                               ▼
+ b ───► B(b) ─────────────────────────► dot ────┐
+                                                ▼
  U_t(b) ─────────────────────────────────────► add
-                                               │
-                                               ▼
+                                                │
+                                                ▼
                                            S_t(a,b)
 
 S_t(a,b) = U_t(b) + <A(a) * H(h_t), B(b)>
