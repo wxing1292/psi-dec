@@ -23,8 +23,11 @@ crates/inference-backend-metal/src/components/
   sampling/dflash2_selector.rs
                               DFlash2 edge scoring and sequential path walk
   sampling/rejection.rs       sparse rejection component
+  sampling/spec_decode_input.rs
+                              rejection-output to fixed-block Decode-input transform
   sampling/dspark_markov.rs   fused DSpark Markov, confidence, and Top-K Map component
   metal/sampling.metal
+  metal/spec_decode_input.metal
   metal/dflash2_selector.metal
   metal/dspark_markov_sampling.metal
 
@@ -132,6 +135,12 @@ owns one request. The threads cooperate
 on the sparse-distribution operations for that request. The block processes the draft sequence in order. The current
 compile-time constants require 256 threads. The recorded grid contains one thread block for each request capacity
 slot. Replay arguments limit execution to the active request count.
+
+`SparseRejectionSamplingOutput` is the borrowed GPU-output boundary for accepted counts and sampled anchor token IDs.
+The model executor can pass this view to `spec_decode_input::Compute` without a host read or an intermediate copy.
+The transform writes accepted-dependent Spec Decode token, position, visible-history, TaskTemplate, and sampling-position
+metadata. Its replay key fixes the request capacity, Spec-block width, Q-range count, and TaskTemplate capacity.
+Its replay arguments select the active request prefix.
 
 `SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
 `max_k` is the maximum sparse Top-K row width, not the vocabulary size.

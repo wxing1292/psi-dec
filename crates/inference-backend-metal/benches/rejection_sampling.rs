@@ -330,9 +330,7 @@ impl TopKFixture {
                     device, rows, top_k, vocab,
                 ))
             },
-            BenchMode::RejectionSparse => {
-                panic!("rejection bench mode cannot build top-k fixture")
-            },
+            BenchMode::RejectionSparse => panic!("rejection bench mode cannot build top-k fixture"),
             BenchMode::DSparkMarkovTopKMap => {
                 panic!("DSpark Markov bench mode cannot build generic top-k fixture")
             },

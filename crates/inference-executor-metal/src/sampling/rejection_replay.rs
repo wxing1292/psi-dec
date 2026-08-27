@@ -275,27 +275,8 @@ impl RejectionSampler {
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
-        self.sparse_sampler.record(
-            recorder,
-            input.shape,
-            SparseRejectionSamplingInputs {
-                target_distribution_token_ids: input.target_token_ids,
-                target_distribution_probs: input.target_probs,
-                draft_distribution_token_ids: input.draft_token_ids,
-                draft_distribution_probs: input.draft_probs,
-                flat_draft_token_ids: &self.flat_draft_token_ids,
-                cu_target_distributions: &self.cu_target_distributions,
-                cu_draft_distributions: &self.cu_draft_distributions,
-                flat_draft_distribution_indices: &self.flat_draft_distribution_indices,
-            },
-            SparseRejectionSamplingOutput {
-                flat_accepted_token_ids: &self.flat_accepted_token_ids,
-                flat_accepted_probs: &self.flat_accepted_probs,
-                num_accepted_tokens: &self.num_accepted_tokens,
-                sampled_token_ids: &self.sampled_token_ids,
-                sampled_token_probs: &self.sampled_token_probs,
-            },
-        );
+        self.sparse_sampler
+            .record(recorder, input.shape, self.input(input), self.output());
     }
 
     pub fn add_replay_arguments(&self, input: RejectionSamplerInput<'_>, arguments: &mut ReplayArguments) {
@@ -304,6 +285,29 @@ impl RejectionSampler {
 
     pub fn set_runtime_params(&self, params: &[SparseRejectionSamplingReqParams]) {
         self.sparse_sampler.set_runtime_params(params);
+    }
+
+    fn input<'a>(&'a self, input: RejectionSamplerInput<'a>) -> SparseRejectionSamplingInputs<'a> {
+        SparseRejectionSamplingInputs {
+            target_distribution_token_ids: input.target_token_ids,
+            target_distribution_probs: input.target_probs,
+            draft_distribution_token_ids: input.draft_token_ids,
+            draft_distribution_probs: input.draft_probs,
+            flat_draft_token_ids: &self.flat_draft_token_ids,
+            cu_target_distributions: &self.cu_target_distributions,
+            cu_draft_distributions: &self.cu_draft_distributions,
+            flat_draft_distribution_indices: &self.flat_draft_distribution_indices,
+        }
+    }
+
+    pub fn output(&self) -> SparseRejectionSamplingOutput<'_> {
+        SparseRejectionSamplingOutput {
+            flat_accepted_token_ids: &self.flat_accepted_token_ids,
+            flat_accepted_probs: &self.flat_accepted_probs,
+            num_accepted_tokens: &self.num_accepted_tokens,
+            sampled_token_ids: &self.sampled_token_ids,
+            sampled_token_probs: &self.sampled_token_probs,
+        }
     }
 
     pub fn read_results(&self, num_decode_reqs: usize, num_draft_distributions: usize) -> RejectionResults {
