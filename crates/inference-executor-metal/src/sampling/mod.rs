@@ -3,6 +3,7 @@ use std::cell::Cell;
 pub mod dspark_markov;
 pub mod rejection_sampling;
 pub mod rejection_replay;
+pub mod sampling_params;
 pub mod spec_probs;
 pub mod top_k_replay;
 pub mod top_k_sampling;

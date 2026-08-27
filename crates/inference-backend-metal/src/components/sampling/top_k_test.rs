@@ -14,16 +14,6 @@ use crate::test_support::ReplayTestCache;
 
 const ACTIVE_SEQUENCE: [u32; 8] = [1, 8, 3, 7, 2, 6, 4, 5];
 const SAMPLE_POSITIONS: [u32; 8] = [11, 29, 41, 53, 67, 79, 83, 97];
-const SAMPLE_DOMAINS: [SamplingDomain; 8] = [
-    SamplingDomain::Target,
-    SamplingDomain::Draft,
-    SamplingDomain::Target,
-    SamplingDomain::Draft,
-    SamplingDomain::Target,
-    SamplingDomain::Draft,
-    SamplingDomain::Target,
-    SamplingDomain::Draft,
-];
 
 #[test]
 fn test_map_variant_selection() {
@@ -183,6 +173,7 @@ fn run_merge_case(dtype: Dtype, top_k: u32) {
 }
 
 fn run_sample_case(dtype: Dtype, top_k: u32) {
+    let sampling_domain = SamplingDomain::Target;
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let shape = Shape {
@@ -192,7 +183,9 @@ fn run_sample_case(dtype: Dtype, top_k: u32) {
     };
     let (logits, reference_logits, logits_offset_bytes) = logits_fixture(&device, dtype, shape, 0x19A2_7C4D);
     let configs = sampler_configs(top_k as usize);
-    let runtime_params = runtime_params(&device, &configs);
+    let params = sampling_params(&device, &configs);
+    let req_slots = Buffer::from_slice(&device, &(0..shape.num_total_sampling_inputs).collect::<Vec<_>>());
+    let sample_positions = Buffer::from_slice(&device, &SAMPLE_POSITIONS);
     let map = MapCompute::new(&device);
     let reduce = ReduceCompute::new(&device);
     let candidate_count = map.candidate_count(shape);
@@ -229,7 +222,11 @@ fn run_sample_case(dtype: Dtype, top_k: u32) {
                 tile_logits: &tile_logits,
                 token_ids: &sampled_token_ids,
                 token_probs: &sampled_token_probs,
-                runtime_params: &runtime_params,
+                params: &params,
+                req_slots: &req_slots,
+                sample_positions: &sample_positions,
+                sample_position_increment: 0,
+                sampling_domain: u32::from(sampling_domain),
             },
         ));
         builder.build()
@@ -247,6 +244,7 @@ fn run_sample_case(dtype: Dtype, top_k: u32) {
             shape,
             &reference_logits,
             &configs,
+            sampling_domain,
             num_active_rows as usize,
             &sampled_token_ids,
             &sampled_token_probs,
@@ -255,6 +253,7 @@ fn run_sample_case(dtype: Dtype, top_k: u32) {
 }
 
 fn run_distribution_case(dtype: Dtype, sample: bool) {
+    let sampling_domain = SamplingDomain::Draft;
     let device = Device::system_default();
     let stream = Stream::new(&device);
     let shape = Shape {
@@ -264,7 +263,9 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
     };
     let (logits, reference_logits, logits_offset_bytes) = logits_fixture(&device, dtype, shape, 0xE6B4_2A17);
     let configs = sampler_configs(shape.top_k as usize);
-    let runtime_params = runtime_params(&device, &configs);
+    let params = sampling_params(&device, &configs);
+    let req_slots = Buffer::from_slice(&device, &(0..shape.num_total_sampling_inputs).collect::<Vec<_>>());
+    let sample_positions = Buffer::from_slice(&device, &SAMPLE_POSITIONS);
     let output_distribution_indices = Buffer::from_slice(&device, &[1_u32, 4, 7, 2, 5, 0, 3, 6]);
     let max_k = 24_u32;
     let num_output_distributions = 8_u32;
@@ -323,7 +324,11 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
                     sampled_token_probs: &sampled_token_probs,
                     distribution_token_ids: &distribution_token_ids,
                     distribution_probs: &distribution_probs,
-                    runtime_params: &runtime_params,
+                    params: &params,
+                    req_slots: &req_slots,
+                    sample_positions: &sample_positions,
+                    sample_position_increment: 0,
+                    sampling_domain: u32::from(sampling_domain),
                     output_distribution_indices: &output_distribution_indices,
                     max_k,
                     num_output_distributions,
@@ -337,7 +342,8 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
                     tile_logits: &tile_logits,
                     distribution_token_ids: &distribution_token_ids,
                     distribution_probs: &distribution_probs,
-                    runtime_params: &runtime_params,
+                    params: &params,
+                    req_slots: &req_slots,
                     output_distribution_indices: &output_distribution_indices,
                     max_k,
                     num_output_distributions,
@@ -361,13 +367,14 @@ fn run_distribution_case(dtype: Dtype, sample: bool) {
                 shape,
                 &reference_logits,
                 &configs,
+                sampling_domain,
                 num_active_rows as usize,
                 &sampled_token_ids,
                 &sampled_token_probs,
             );
         }
         for row in 0..num_active_rows as usize {
-            let expected = sample_reference(shape, &reference_logits, &configs, row);
+            let expected = sample_reference(shape, &reference_logits, &configs, sampling_domain, row);
             let distribution = [1_usize, 4, 7, 2, 5, 0, 3, 6][row];
             let offset = distribution * max_k as usize;
             assert_eq!(
@@ -387,6 +394,7 @@ fn assert_active_samples(
     shape: Shape,
     logits: &[f32],
     configs: &[SamplerConfig],
+    sampling_domain: SamplingDomain,
     num_active_rows: usize,
     sampled_token_ids: &Buffer,
     sampled_token_probs: &Buffer,
@@ -394,19 +402,25 @@ fn assert_active_samples(
     let actual_tokens = sampled_token_ids.read_typed::<i32>(0, num_active_rows);
     let actual_probs = sampled_token_probs.read_typed::<f32>(0, num_active_rows);
     for row in 0..num_active_rows {
-        let expected = sample_reference(shape, logits, configs, row);
+        let expected = sample_reference(shape, logits, configs, sampling_domain, row);
         assert_eq!(actual_tokens[row], expected.sampled_token as i32, "row={row}");
         assert_close(&actual_probs[row..row + 1], &[expected.sampled_prob], 1.0e-5);
     }
 }
 
-fn sample_reference(shape: Shape, logits: &[f32], configs: &[SamplerConfig], row: usize) -> ReferenceSampleRow {
+fn sample_reference(
+    shape: Shape,
+    logits: &[f32],
+    configs: &[SamplerConfig],
+    sampling_domain: SamplingDomain,
+    row: usize,
+) -> ReferenceSampleRow {
     sparse_sample_row_with_domain_reference(
         &configs[row],
         &logits[row * shape.vocab_size as usize..(row + 1) * shape.vocab_size as usize],
         configs[row].top_k,
         SAMPLE_POSITIONS[row],
-        SAMPLE_DOMAINS[row],
+        sampling_domain,
     )
 }
 
@@ -427,27 +441,18 @@ fn sampler_configs(max_top_k: usize) -> Vec<SamplerConfig> {
         .collect()
 }
 
-fn runtime_params(device: &Device, configs: &[SamplerConfig]) -> Buffer {
-    let params = Buffer::new_zeroed(device, configs.len() * 6 * size_of::<u32>());
-    for row in 0..configs.len() {
-        write_sampling_runtime_params(&params, row, &configs[row], SAMPLE_POSITIONS[row], SAMPLE_DOMAINS[row]);
+fn sampling_params(device: &Device, configs: &[SamplerConfig]) -> Buffer {
+    let params = Buffer::new_zeroed(device, configs.len() * 4 * size_of::<u32>());
+    for (row, config) in configs.iter().enumerate() {
+        write_sampling_params(&params, row, config);
     }
     params
 }
 
-fn write_sampling_runtime_params(
-    params: &Buffer,
-    row: usize,
-    config: &SamplerConfig,
-    sample_position: u32,
-    domain: SamplingDomain,
-) {
-    let offset = row * 6;
+fn write_sampling_params(params: &Buffer, row: usize, config: &SamplerConfig) {
+    let offset = row * 4;
     params.write_typed(offset, &[config.temperature, config.top_p]);
-    params.write_typed(
-        offset + 2,
-        &[config.seed(), sample_position, config.top_k as u32, domain as u32],
-    );
+    params.write_typed(offset + 2, &[config.seed(), config.top_k as u32]);
 }
 
 fn logits_fixture(device: &Device, dtype: Dtype, shape: Shape, seed: u32) -> (Buffer, Vec<f32>, usize) {

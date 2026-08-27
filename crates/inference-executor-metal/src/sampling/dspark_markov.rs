@@ -30,6 +30,8 @@
 //! `sampling::dspark_markov::MapCompute` computes both branches. The confidence branch
 //! reuses the current step's W1 embedding. It does not add a replay command.
 
+use std::rc::Rc;
+
 use inference_backend_metal::components::sampling::dspark_markov as backend_dspark_markov;
 use inference_backend_metal::components::sampling::top_k as backend_top_k;
 use inference_backend_metal::metal::Buffer;
@@ -39,14 +41,13 @@ use inference_backend_metal::metal::ReplayArguments;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::replay::ReplayBucketPolicy;
 use inference_executor_core::sampling::SamplerConfig;
-use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_executor_core::sampling::TopKSamplingShape;
 
 use crate::def::replay_op::ReplayOp;
+use crate::sampling::sampling_params::SamplingParamsStore;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_sampling::TopKSamplingOutputBuffers;
-use crate::sampling::top_k_sampling::TopKSamplingRuntimeParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DSparkMarkovReplayShape {
@@ -121,16 +122,23 @@ pub struct DSparkMarkovSampling {
     top_k_map: backend_dspark_markov::MapCompute,
     top_k_reduce: backend_top_k::ReduceCompute,
     anchor_token_ids: Buffer,
+    req_slots: Buffer,
+    sample_positions: Buffer,
     partial_token_ids: Buffer,
     partial_logits: Buffer,
-    step_params: Vec<TopKSamplingRuntimeParams>,
+    params: Rc<SamplingParamsStore>,
     step_outputs: Vec<TopKSamplingOutputBuffers>,
     step_distribution_indices: Vec<Buffer>,
 }
 
 impl DSparkMarkovSampling {
-    pub fn new(device: &Device, config: DSparkMarkovSamplingConfig) -> Self {
+    pub fn new(device: &Device, config: DSparkMarkovSamplingConfig, params: Rc<SamplingParamsStore>) -> Self {
         config.validate();
+        let param_bounds = params.bounds();
+        assert_eq!(param_bounds.vocab_size, config.sampling.vocab_size);
+        assert_eq!(param_bounds.top_k, config.sampling.top_k);
+        assert!(config.sampling.max_sampling_inputs <= param_bounds.max_sampling_inputs);
+        assert!(config.sampling.max_sampling_inputs <= params.num_req_slots());
         let max_requests = config.sampling.max_sampling_inputs as usize;
         let confidence_output = Buffer::new_zeroed_elements(
             device,
@@ -142,11 +150,9 @@ impl DSparkMarkovSampling {
         );
         let top_k_map = backend_dspark_markov::MapCompute::new(device, map_config(config));
         let candidate_count = top_k_map.candidate_count(component_shape(config.sampling.max_shape()));
-        let mut step_params = Vec::with_capacity(config.block_size);
         let mut step_outputs = Vec::with_capacity(config.block_size);
         let mut step_distribution_indices = Vec::with_capacity(config.block_size);
         for _ in 0..config.block_size {
-            step_params.push(TopKSamplingRuntimeParams::new(device, config.sampling));
             step_outputs.push(TopKSamplingOutputBuffers::new(device, config.sampling));
             step_distribution_indices.push(Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32));
         }
@@ -158,9 +164,11 @@ impl DSparkMarkovSampling {
             top_k_map,
             top_k_reduce: backend_top_k::ReduceCompute::new(device),
             anchor_token_ids: Buffer::new_zeroed_elements(device, max_requests, Dtype::Int32),
+            req_slots: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
+            sample_positions: Buffer::new_zeroed_elements(device, max_requests, Dtype::Uint32),
             partial_token_ids: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Int32),
             partial_logits: Buffer::new_zeroed_elements(device, candidate_count, Dtype::Float32),
-            step_params,
+            params,
             step_outputs,
             step_distribution_indices,
         }
@@ -196,8 +204,18 @@ impl DSparkMarkovSampling {
                 })
                 .collect::<Vec<_>>(),
         );
+        self.req_slots.write_typed(0, req_slots);
+        self.sample_positions.write_typed(
+            0,
+            &anchor_positions
+                .iter()
+                .map(|&anchor_position| anchor_position + 1)
+                .collect::<Vec<_>>(),
+        );
 
-        let mut sampling = None;
+        let active = self.params.active_shape(sampler_configs);
+        let sampling =
+            active.with_num_total_sampling_inputs(self.bucket_policy.capacity(active.num_active_sampling_inputs));
         for step_index in 0..self.block_size {
             self.step_distribution_indices[step_index].write_typed(
                 0,
@@ -206,23 +224,11 @@ impl DSparkMarkovSampling {
                     .map(|&req_slot| distribution_store.draft_distribution_index(req_slot, step_index))
                     .collect::<Vec<_>>(),
             );
-            let sample_positions = anchor_positions
-                .iter()
-                .map(|&anchor_position| anchor_position + step_index as u32 + 1)
-                .collect::<Vec<_>>();
-            self.step_params[step_index].set_configs(sampler_configs, &sample_positions, SamplingDomain::Draft);
-            let active = self.step_params[step_index].active_shape(sampler_configs);
-            let step_shape =
-                active.with_num_total_sampling_inputs(self.bucket_policy.capacity(active.num_active_sampling_inputs));
-            match sampling {
-                Some(expected) => assert_eq!(step_shape, expected),
-                None => sampling = Some(step_shape),
-            }
         }
         DSparkMarkovReplayShape {
             num_total_requests: req_slots.len() as u32,
             num_active_requests: req_slots.len() as u32,
-            sampling: sampling.expect("DSpark Markov requires steps"),
+            sampling,
         }
     }
 
@@ -282,7 +288,11 @@ impl DSparkMarkovSampling {
                         sampled_token_probs: &self.step_outputs[step_index].token_probs,
                         distribution_token_ids: input.distribution_store.draft_token_ids(),
                         distribution_probs: input.distribution_store.draft_probs(),
-                        runtime_params: self.step_params[step_index].buffer(),
+                        params: self.params.buffer(),
+                        req_slots: &self.req_slots,
+                        sample_positions: &self.sample_positions,
+                        sample_position_increment: step_index as u32,
+                        sampling_domain: u32::from(inference_executor_core::sampling::SamplingDomain::Draft),
                         output_distribution_indices: &self.step_distribution_indices[step_index],
                         max_k: input.distribution_store.max_k() as u32,
                         num_output_distributions: input.distribution_store.num_draft_distributions(),
@@ -294,9 +304,6 @@ impl DSparkMarkovSampling {
     }
 
     pub fn add_replay_arguments(&self, shape: DSparkMarkovReplayShape, arguments: &mut ReplayArguments) {
-        for params in &self.step_params {
-            params.consume(shape.sampling);
-        }
         self.top_k_map.add_replay_arguments(
             component_shape(shape.sampling),
             shape.sampling.num_active_sampling_inputs,

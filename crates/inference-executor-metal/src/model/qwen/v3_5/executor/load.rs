@@ -74,6 +74,7 @@ use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::rejection_replay::RejectionSampler;
 use crate::sampling::rejection_replay::RejectionSampling;
+use crate::sampling::sampling_params::SamplingParamsStore;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_replay::DraftSampling;
 use crate::sampling::top_k_replay::Sampling;
@@ -479,6 +480,11 @@ fn init_qwen_3_5_model_inner(
         top_k: MAX_TOP_K as u32,
     };
     sampler_bounds.validate();
+    let sampling_params = Rc::new(SamplingParamsStore::new(
+        &device,
+        sampler_bounds,
+        config.max_requests as u32,
+    ));
     trace::qwen35_state(|| {
         format!(
             "event=sampler_config temperature={} top_k={} top_p={} bounds_top_k={} max_sampling_inputs={} \
@@ -724,7 +730,7 @@ fn init_qwen_3_5_model_inner(
                 },
                 Rc::clone(&embed),
                 gather_unembed.unembed(),
-                sampler_bounds,
+                Rc::clone(&sampling_params),
             )?))
         },
         Qwen35SpecSource::DFlash2 {
@@ -746,7 +752,7 @@ fn init_qwen_3_5_model_inner(
                 },
                 Rc::clone(&embed),
                 gather_unembed.unembed(),
-                sampler_bounds,
+                Rc::clone(&sampling_params),
             )?))
         },
     };
@@ -775,7 +781,7 @@ fn init_qwen_3_5_model_inner(
     )?;
     main.load_weights(&device, &mut store, &model_config, main_bindings)?;
     drop(store);
-    let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));
+    let sampler = Rc::new(TopKSampling::new(&device, sampling_params));
     let speculative_resources = || {
         let rejection_sampler = Rc::new(RejectionSampler::new(
             &device,

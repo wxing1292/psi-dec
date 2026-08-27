@@ -2,6 +2,7 @@ impl Qwen3Executor {
     fn prepare_sample_replay(
         &mut self,
         sampler_configs: &[SamplerConfig],
+        sample_req_slots: &[u32],
         sample_positions: &[u32],
     ) -> (TopKSamplingReplayKey, ReplayArguments) {
         assert_eq!(
@@ -17,8 +18,7 @@ impl Qwen3Executor {
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         let (sample_key, _) = self.sampling.record(&runtime, &input);
-        self.sampler
-            .set_configs(sampler_configs, sample_positions, SamplingDomain::Target);
+        self.sampler.prepare(sample_req_slots, sample_positions);
         let mut replay_arguments = ReplayArguments::new();
         self.sampler.add_replay_arguments(sample_shape, &mut replay_arguments);
         (sample_key, replay_arguments)
@@ -26,8 +26,9 @@ impl Qwen3Executor {
 
     fn record_sampling(&mut self, microbatch: &Qwen3Microbatch) -> (TopKSamplingReplayKey, ReplayArguments) {
         let sampler_configs = sample_sampler_configs(microbatch);
+        let sample_req_slots = sample_req_slots(microbatch);
         let sample_positions = sample_token_positions(microbatch);
-        self.prepare_sample_replay(&sampler_configs, &sample_positions)
+        self.prepare_sample_replay(&sampler_configs, &sample_req_slots, &sample_positions)
     }
 
     fn read_sampled_token_ids(&self, num_decode_reqs: usize) -> Qwen3SampledTokens {
@@ -120,8 +121,7 @@ impl Qwen3Executor {
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         let (rejection_key, _) = rejection_sampling.record(&runtime, &input);
-        self.sampler
-            .set_configs(&sampler_configs, &sample_positions, SamplingDomain::Target);
+        self.sampler.prepare(&sample_req_slots(microbatch), &sample_positions);
         let mut runtime_params = Vec::with_capacity(num_active_decode_reqs);
         let mut sample_offset = 0usize;
         for &req_index in &prepared.decode_req_indices {

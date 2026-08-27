@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -15,6 +16,7 @@ use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
+use inference_executor_metal::sampling::sampling_params::SamplingParamsStore;
 use inference_executor_metal::sampling::spec_probs::SpecProbsStore;
 
 fn main() {
@@ -171,13 +173,14 @@ impl Fixture {
                 .expect("DSpark sampling benchmark vocabulary must fit u32"),
             top_k: top_k.try_into().expect("DSpark sampling benchmark top_k must fit u32"),
         };
+        let sampling_params = Rc::new(SamplingParamsStore::new(device, bounds, num_requests as u32));
         let mut markov = Qwen3xDSparkMarkov::new(
             device,
             &config,
             config.block_size,
             &bindings.markov,
             num_requests,
-            bounds,
+            Rc::clone(&sampling_params),
         )
         .expect("unable to construct Qwen3 DSpark Markov sampling");
         markov
@@ -208,6 +211,7 @@ impl Fixture {
             };
             num_requests
         ];
+        sampling_params.set(&req_slots, &sampler_configs);
         let shape = markov.prepare(
             &req_slots,
             &anchor_token_ids,

@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use half::bf16;
 use inference_backend_metal::MetalRuntime;
 use inference_backend_metal::metal::Buffer;
@@ -25,6 +27,7 @@ use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::ReplayRecorder;
 use crate::replay::Replay;
 use crate::replay::ReplayComponent;
+use crate::sampling::sampling_params::SamplingParamsStore;
 
 const BLOCK_SIZE: usize = 3;
 const MAX_REQUESTS: usize = 8;
@@ -81,15 +84,24 @@ struct MarkovFixture {
     base_logits_values: Vec<f32>,
     hidden_values: Vec<f32>,
     sampler_config: SamplerConfig,
+    sampling_params: Rc<SamplingParamsStore>,
 }
 
 impl MarkovFixture {
     fn new(device: &inference_backend_metal::metal::Device) -> Self {
-        let bounds = TopKSamplingBounds {
+        let sampling = TopKSamplingBounds {
             max_sampling_inputs: MAX_REQUESTS as u32,
             vocab_size: VOCAB_SIZE as u32,
             top_k: 4,
         };
+        let sampling_params = Rc::new(SamplingParamsStore::new(
+            device,
+            TopKSamplingBounds {
+                max_sampling_inputs: 2 * MAX_REQUESTS as u32,
+                ..sampling
+            },
+            MAX_REQUESTS as u32,
+        ));
         let markov = DSparkMarkovSampling::new(
             device,
             DSparkMarkovSamplingConfig {
@@ -105,8 +117,9 @@ impl MarkovFixture {
                 confidence: DSparkMarkovConfidenceConfig {
                     hidden_dim: HIDDEN_DIM as u32,
                 },
-                sampling: bounds,
+                sampling,
             },
+            Rc::clone(&sampling_params),
         );
         let mut w1_weight_values = vec![0_u8; VOCAB_SIZE * RANK];
         let mut w2_weight_values = vec![0_u8; VOCAB_SIZE * RANK];
@@ -155,15 +168,19 @@ impl MarkovFixture {
                 top_p: 0.9,
                 seed: 42,
             },
+            sampling_params,
         }
     }
 
     fn prepare(&self, num_active_requests: usize) -> DSparkMarkovReplayShape {
+        let req_slots = &REQUEST_SLOTS[..num_active_requests];
+        let configs = vec![self.sampler_config; num_active_requests];
+        self.sampling_params.set(req_slots, &configs);
         self.markov.prepare(
-            &REQUEST_SLOTS[..num_active_requests],
+            req_slots,
             &ANCHOR_TOKEN_IDS[..num_active_requests],
             &ANCHOR_POSITIONS[..num_active_requests],
-            &vec![self.sampler_config; num_active_requests],
+            &configs,
             &self.distribution_store,
         )
     }

@@ -13,9 +13,6 @@ use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2SelectorWeightBindings;
-use inference_executor_core::sampling::SamplerConfig;
-use inference_executor_core::sampling::SamplingDomain;
-use inference_executor_core::sampling::TopKSamplingBounds;
 
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
@@ -33,6 +30,7 @@ use crate::model::qwen::v3_x::weight::validate_len;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedInput;
 use crate::replay::ReplayComponent;
+use crate::sampling::sampling_params::SamplingParamsStore;
 use crate::sampling::spec_probs::SpecProbsStore;
 
 const DFLASH2_OUTPUT_NUM_ACTIVE_PROPOSAL_ROWS: ReplayParameterKey =
@@ -60,7 +58,7 @@ pub struct Qwen3xDFlash2Output {
     hidden_dim: u32,
     vocab_size: u32,
     selector_config: dflash2_selector::Config,
-    sampler_bounds: TopKSamplingBounds,
+    params: Rc<SamplingParamsStore>,
     gather: Gather,
     unembed: Option<Rc<Unembed>>,
     hidden_projection_config: affine_quantized::Config,
@@ -84,7 +82,8 @@ pub struct Qwen3xDFlash2Output {
     predecessor_embeddings: Buffer,
     successor_embeddings: Buffer,
     scores: Buffer,
-    runtime_params: Buffer,
+    req_slots: Buffer,
+    sample_positions: Buffer,
     output_distribution_indices: Buffer,
     proposal_token_ids: Buffer,
     proposal_probs: Buffer,
@@ -94,7 +93,6 @@ pub struct Qwen3xDFlash2OutputPrepare<'a> {
     pub req_slots: &'a [u32],
     pub anchor_token_ids: &'a [u32],
     pub anchor_positions: &'a [u32],
-    pub sampler_configs: &'a [SamplerConfig],
     pub distribution_store: &'a SpecProbsStore,
 }
 
@@ -121,7 +119,7 @@ impl Qwen3xDFlash2Output {
         max_requests: usize,
         unembed: Rc<Unembed>,
         bindings: &Qwen3xDFlash2SelectorWeightBindings,
-        sampler_bounds: TopKSamplingBounds,
+        params: Rc<SamplingParamsStore>,
         scale_bias_dtype: Dtype,
     ) -> Result<Self, ModelExecutorError> {
         assert_eq!(
@@ -140,10 +138,11 @@ impl Qwen3xDFlash2Output {
             embedding_dtype: Dtype::Bfloat16,
         };
         selector_config.validate();
-        if selector_config.top_k > sampler_bounds.top_k {
+        if selector_config.top_k > params.bounds().top_k {
             return Err(ModelExecutorError::custom(format!(
                 "Qwen3x DFlash2 selector_top_k={} exceeds executor sparse-distribution width {}",
-                selector_config.top_k, sampler_bounds.top_k
+                selector_config.top_k,
+                params.bounds().top_k
             )));
         }
         let num_proposal_rows = max_requests
@@ -219,7 +218,7 @@ impl Qwen3xDFlash2Output {
             hidden_dim,
             vocab_size,
             selector_config,
-            sampler_bounds,
+            params,
             gather: Gather::new(device, hidden_dim),
             unembed: Some(unembed),
             hidden_projection_config,
@@ -247,7 +246,8 @@ impl Qwen3xDFlash2Output {
             predecessor_embeddings: Buffer::new_zeroed(device, selector_config.embedding_bytes(selector_shape)),
             successor_embeddings: Buffer::new_zeroed(device, selector_config.embedding_bytes(selector_shape)),
             scores: Buffer::new_zeroed_elements(device, selector_config.score_count(selector_shape), Dtype::Float32),
-            runtime_params: Buffer::new_zeroed_elements(device, max_requests as usize * 4, Dtype::Uint32),
+            req_slots: Buffer::new_zeroed_elements(device, max_requests as usize, Dtype::Uint32),
+            sample_positions: Buffer::new_zeroed_elements(device, max_requests as usize, Dtype::Uint32),
             output_distribution_indices: Buffer::new_zeroed_elements(device, num_proposal_rows as usize, Dtype::Uint32),
             proposal_token_ids: Buffer::new_zeroed_elements(device, num_proposal_rows as usize, Dtype::Int32),
             proposal_probs: Buffer::new_zeroed_elements(device, num_proposal_rows as usize, Dtype::Float32),
@@ -321,7 +321,6 @@ impl Qwen3xDFlash2Output {
         assert!(num_requests > 0 && num_requests <= self.max_requests as usize);
         assert_eq!(input.anchor_token_ids.len(), num_requests);
         assert_eq!(input.anchor_positions.len(), num_requests);
-        assert_eq!(input.sampler_configs.len(), num_requests);
         assert!(
             input
                 .anchor_positions
@@ -345,6 +344,7 @@ impl Qwen3xDFlash2Output {
         }
         self.row_indices.write_typed(0, &row_indices);
         self.output_distribution_indices.write_typed(0, &distribution_indices);
+        self.req_slots.write_typed(0, input.req_slots);
         self.anchor_token_ids.write_typed(
             0,
             &input
@@ -353,23 +353,14 @@ impl Qwen3xDFlash2Output {
                 .map(|&token_id| i32::try_from(token_id).expect("Qwen3x DFlash2 anchor token ID must fit i32"))
                 .collect::<Vec<_>>(),
         );
-        for (request_index, (config, &anchor_position)) in
-            input.sampler_configs.iter().zip(input.anchor_positions).enumerate()
-        {
-            let sample_position = anchor_position + 1;
-            self.sampler_bounds
-                .active_top_k(config)
-                .expect("Qwen3x DFlash2 sampler config must fit executor bounds");
-            self.runtime_params.write_typed(
-                request_index * 4,
-                &[
-                    config.temperature.to_bits(),
-                    config.seed(),
-                    sample_position,
-                    u32::from(SamplingDomain::Draft),
-                ],
-            );
-        }
+        self.sample_positions.write_typed(
+            0,
+            &input
+                .anchor_positions
+                .iter()
+                .map(|&anchor_position| anchor_position + 1)
+                .collect::<Vec<_>>(),
+        );
         num_requests as u32
     }
 
@@ -566,7 +557,10 @@ impl ReplayComponent for Qwen3xDFlash2Output {
             dflash2_selector::WalkBuffers {
                 candidate_token_ids: &self.candidate_token_ids,
                 scores: &self.scores,
-                runtime_params: &self.runtime_params,
+                params: self.params.buffer(),
+                req_slots: &self.req_slots,
+                sample_positions: &self.sample_positions,
+                sampling_domain: u32::from(inference_executor_core::sampling::SamplingDomain::Draft),
                 output_distribution_indices: &self.output_distribution_indices,
                 proposal_token_ids: &self.proposal_token_ids,
                 proposal_probs: &self.proposal_probs,

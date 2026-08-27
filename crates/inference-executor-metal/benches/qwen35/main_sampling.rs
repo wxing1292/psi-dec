@@ -9,10 +9,10 @@ use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::sampling::MAX_TOP_K;
 use inference_executor_core::sampling::SamplerConfig;
-use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::replay::Replay;
+use inference_executor_metal::sampling::sampling_params::SamplingParamsStore;
 use inference_executor_metal::sampling::top_k_replay::Sampling;
 use inference_executor_metal::sampling::top_k_replay::SamplingInput;
 use inference_executor_metal::sampling::top_k_replay::TopKSamplingReplayKey;
@@ -158,7 +158,8 @@ impl MainSamplingFixture {
     fn new(device: &Device, args: &Args, max_rows: u32) -> Self {
         let bounds = TopKSamplingBounds::from_config(&args.sampler_config(), max_rows, args.vocab_size)
             .unwrap_or_else(|error| panic!("unable to initialize Qwen3.5 Main sampling bounds: {error}"));
-        let sampler = std::rc::Rc::new(TopKSampling::new(device, bounds));
+        let params = std::rc::Rc::new(SamplingParamsStore::new(device, bounds, max_rows));
+        let sampler = std::rc::Rc::new(TopKSampling::new(device, params));
         let logits = (0..max_rows as usize * args.vocab_size as usize)
             .map(|index| {
                 let row = index / args.vocab_size as usize;
@@ -176,12 +177,11 @@ impl MainSamplingFixture {
 
     fn prepare(&mut self, args: &Args, num_rows: u32) -> PreparedReplay {
         let configs = vec![args.sampler_config(); num_rows as usize];
+        let req_slots = (0..num_rows).collect::<Vec<_>>();
         let sample_positions = (0..num_rows).collect::<Vec<_>>();
         let shape = self.replay.component().prepare_shape(&configs);
-        self.replay
-            .component()
-            .sampler
-            .set_configs(&configs, &sample_positions, SamplingDomain::Target);
+        self.replay.component().sampler.set_params(&req_slots, &configs);
+        self.replay.component().sampler.prepare(&req_slots, &sample_positions);
         let mut arguments = ReplayArguments::new();
         self.replay
             .component()

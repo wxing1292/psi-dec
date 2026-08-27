@@ -356,6 +356,18 @@ pub fn sample_sampler_configs(microbatch: &Qwen3Microbatch) -> Vec<SamplerConfig
     configs
 }
 
+/// Returns the stable request slot for each Main output row.
+pub fn sample_req_slots(microbatch: &Qwen3Microbatch) -> Vec<u32> {
+    let mut req_slots = Vec::with_capacity(num_main_output_rows(microbatch));
+    for req_index in 0..microbatch.num_reqs() {
+        req_slots.extend(std::iter::repeat_n(
+            microbatch.req_slots[req_index],
+            microbatch.num_main_hidden_states_for_req(req_index),
+        ));
+    }
+    req_slots
+}
+
 pub fn sample_decisions_from_sampled_tokens(sampled_tokens: &Qwen3SampledTokens) -> Vec<Qwen3DecodeDecision> {
     sampled_tokens
         .token_ids

@@ -1,11 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct sampling_runtime_params {
+struct sampling_params {
     float temperature;
+    float top_p;
     uint seed;
-    uint sample_position;
-    uint sampling_domain;
+    uint top_k;
 };
 
 static inline uint psi_mix(uint h) {
@@ -86,22 +86,25 @@ kernel void dflash2_selector_scores_bf16(
 kernel void dflash2_selector_walk(
     device const int* candidate_token_ids [[buffer(0)]],
     device const float* scores [[buffer(1)]],
-    device const sampling_runtime_params* runtime_params [[buffer(2)]],
-    device const uint* output_distribution_indices [[buffer(3)]],
-    device int* proposal_token_ids [[buffer(4)]],
-    device float* proposal_probs [[buffer(5)]],
-    device int* distribution_token_ids [[buffer(6)]],
-    device float* distribution_probs [[buffer(7)]],
-    constant uint& num_active_requests [[buffer(8)]],
-    constant uint& num_steps [[buffer(9)]],
-    constant uint& top_k [[buffer(10)]],
-    constant uint& max_distribution_k [[buffer(11)]],
+    device const sampling_params* params [[buffer(2)]],
+    device const uint* req_slots [[buffer(3)]],
+    device const uint* sample_positions [[buffer(4)]],
+    device const uint* output_distribution_indices [[buffer(5)]],
+    device int* proposal_token_ids [[buffer(6)]],
+    device float* proposal_probs [[buffer(7)]],
+    device int* distribution_token_ids [[buffer(8)]],
+    device float* distribution_probs [[buffer(9)]],
+    constant uint& num_active_requests [[buffer(10)]],
+    constant uint& num_steps [[buffer(11)]],
+    constant uint& top_k [[buffer(12)]],
+    constant uint& max_distribution_k [[buffer(13)]],
+    constant uint& sampling_domain [[buffer(14)]],
     uint request [[thread_position_in_grid]]
 ) {
     if (request >= num_active_requests) {
         return;
     }
-    const sampling_runtime_params params = runtime_params[request];
+    const sampling_params request_params = params[req_slots[request]];
     uint previous = 0u;
     for (uint step = 0u; step < num_steps; ++step) {
         const ulong proposal = (ulong)request * (ulong)num_steps + (ulong)step;
@@ -118,9 +121,9 @@ kernel void dflash2_selector_walk(
         }
         const uint distribution = output_distribution_indices[proposal];
         const ulong distribution_base = (ulong)distribution * (ulong)max_distribution_k;
-        const bool greedy = params.temperature == 0.0f;
+        const bool greedy = request_params.temperature == 0.0f;
         float total = 0.0f;
-        const float inverse_temperature = greedy ? 0.0f : 1.0f / params.temperature;
+        const float inverse_temperature = greedy ? 0.0f : 1.0f / request_params.temperature;
         for (uint candidate = 0u; candidate < top_k; ++candidate) {
             const int token = candidate_token_ids[candidate_base + (ulong)candidate];
             const float score = scores[score_base + (ulong)candidate];
@@ -138,7 +141,7 @@ kernel void dflash2_selector_walk(
         uint selected = greedy ? maximum_index : top_k - 1u;
         if (!greedy) {
             const uint random = psi_sampling_random(
-                params.seed, params.sample_position + step, params.sampling_domain);
+                request_params.seed, sample_positions[request] + step, sampling_domain);
             const float draw = psi_uniform01(random);
             float cumulative = 0.0f;
             bool has_selected = false;

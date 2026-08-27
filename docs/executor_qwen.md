@@ -117,6 +117,7 @@ crates/inference-executor-metal/src/
         dflash2.rs          DFlash2 Spec proposal orchestration
 
 crates/inference-executor-metal/src/sampling/
+  sampling_params.rs        request-slot SamplingParamsStore shared by all sampling modes
   top_k_sampling.rs         TopKSampling and TopKSamplingOutputBuffers
   top_k_replay.rs           Sampling/DraftSampling replay components
   rejection_replay.rs       generic sparse rejection replay owner
@@ -1015,6 +1016,9 @@ DSparkPrefill -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 DSpark input is request-major.
 `DSparkGatherUnembed` converts body output to the step-major order required by sequential Markov sampling.
 It validates the maximum request-by-step row domain at construction.
+DSpark reads stable temperature, top-p, seed, and top-k values from the shared request-slot `SamplingParamsStore`.
+Its CPU-prepared Decode input writes one first sample position for each request. DSpark step `i` adds `i` to that
+position.
 The draft probability store uses request-slot identity because these rows cross a batch boundary.
 Main verification distributions use compact active-row identity because they exist only in one submission.
 
@@ -1040,6 +1044,8 @@ DFlash2 support is experimental.
 Qwen3.5-family executors support the affine Qwen3x DFlash2 checkpoint contract.
 The DFlash2 owner is a peer of the DSpark owner.
 It is not a mode flag inside DSpark.
+DFlash2 reads stable temperature and seed values from the same request-slot `SamplingParamsStore` as Main, MTP, and
+DSpark. Its sequential path walk adds each proposal step to the first sample position in the CPU-prepared Decode input.
 
 The checkpoint `block_size` defines the complete Decode query block.
 The Decode block contains one anchor row followed by `block_size - 1` MASK rows.

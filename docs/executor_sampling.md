@@ -29,7 +29,8 @@ crates/inference-backend-metal/src/components/
   metal/dspark_markov_sampling.metal
 
 crates/inference-executor-metal/src/sampling/
-  top_k_sampling.rs       TopKSampling, parameter/scratch, and TopKSamplingOutputBuffers
+  sampling_params.rs      SamplingParamsStore request-slot parameter owner
+  top_k_sampling.rs       TopKSampling row inputs, scratch, and TopKSamplingOutputBuffers
   top_k_replay.rs         Sampling and DraftSampling replay components
   rejection_replay.rs     sparse rejection replay owner, batch preparation, and bindings
   dspark_markov.rs        sequential DSpark Markov, confidence, and sampling composition
@@ -49,8 +50,22 @@ It keeps that seed stable until the slot resets.
 
 ## Normal sampling
 
-Each compact sampled row has its own sampling parameters.
-They include temperature, top-k, top-p, resolved seed, logical output-token position, and `SamplingDomain`.
+Each request slot has one stable sampling-parameter row:
+
+```text
+sampling_params[req_slot] = {temperature, top_p, seed, top_k}
+```
+
+`SamplingParamsStore` owns this buffer. One `Rc<SamplingParamsStore>` is shared by Vanilla, MTP, DSpark, and DFlash2
+inside one executor. The executor updates active request-slot rows when it prepares a batch.
+The request-slot buffer capacity and each invocation's sampling-row capacity are independent. Main can use the
+executor token-row capacity. DSpark uses the request-row capacity. Each consumer validates its static capacity when it
+is initialized.
+
+Each sampling invocation separately provides the compact sampling-row to `req_slot` mapping, the logical output-token
+position for each row, and one `SamplingDomain`. Main can contain multiple sampling rows for one request. Those rows
+reuse the same request-slot parameters and keep distinct positions. DSpark and DFlash2 reuse the same request-level
+parameters but retain their different proposal algorithms.
 The current default decode policy uses temperature 0.7, top-p 0.8, and top-k 20.
 Greedy decoding uses the same contract with top-k 1 and temperature 0.
 
@@ -62,7 +77,8 @@ logits [num_rows, vocab_size]
   -> TopKReduce
        merge partial candidates for one sampling row
        apply temperature and top-p
-       draw from (request seed, logical position, domain)
+       load params[req_slots[row]]
+       draw from (seed, sample_positions[row], sampling_domain)
   -> sampled token IDs + probabilities
 ```
 
@@ -144,14 +160,13 @@ An absent zero-capacity work domain can use an immediate zero.
 Every nonempty active work domain remains a replay parameter, including a total capacity of `1`.
 
 Active top-k remains in the replay shape because it changes candidate and scratch geometry.
-Temperature, top-p, seed, logical position, and RNG domain are dynamic request data.
-They never enter replay keys.
+Temperature, top-p, seed, and active top-k are stable request-slot data for a live batch. Logical positions, row-to-slot
+mappings, and the RNG domain are invocation data. They never enter replay keys.
 
-Writing runtime sampling or rejection parameters arms exactly one replay-argument preparation.
-That preparation consumes the matching active row or request count.
-It then clears the armed state.
-Replay without a fresh write is an invariant violation.
-It does not permit reuse of stale parameter rows.
+Writing sparse-rejection runtime parameters arms exactly one replay-argument preparation.
+That preparation consumes the matching active request count and clears the armed state.
+Sampling parameters use stable request-slot identity instead. Each sampling invocation supplies its current compact row
+mapping and positions.
 
 The Qwen executor owns these distinct graph and cache stages:
 
@@ -167,7 +182,8 @@ Main and MTP share one `Rc<TopKSampling>` implementation.
 `RejectionSampler::prepare_replay_shape(...)` selects request, draft-distribution, and target-distribution capacities.
 It validates public prepared counts before it maps them to the `u32` replay domain.
 `RejectionSampling` validates the target-sampling and rejection shapes before the replay-cache lookup.
-`DSparkMarkovSampling` owns model-neutral Markov runtime parameters, partial candidates, and per-step outputs.
+`DSparkMarkovSampling` owns the compact request-slot mapping, first sample positions, partial candidates, and per-step
+outputs. It borrows the shared `SamplingParamsStore` through `Rc`.
 It accepts borrowed weights at record time.
 `Qwen3xDSparkMarkov` owns Qwen checkpoint buffers and delegates execution to this backend owner.
 It loads one bounded `TensorMap` for W1, W2, and the required Markov-conditioned confidence head.

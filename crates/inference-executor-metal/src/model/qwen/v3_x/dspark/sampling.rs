@@ -29,6 +29,7 @@ use crate::sampling::dspark_markov::DSparkMarkovSampling;
 use crate::sampling::dspark_markov::DSparkMarkovSamplingConfig;
 use crate::sampling::dspark_markov::DSparkMarkovWeights;
 use crate::sampling::dspark_markov::DSparkProposal;
+use crate::sampling::sampling_params::SamplingParamsStore;
 use crate::sampling::spec_probs::SpecProbsStore;
 
 pub struct Qwen3xDSparkMarkov {
@@ -60,9 +61,9 @@ impl Qwen3xDSparkMarkov {
         num_spec_tokens: usize,
         bindings: &Qwen3xDSparkMarkovWeightBindings,
         max_requests: usize,
-        sampler_bounds: TopKSamplingBounds,
+        sampling_params: Rc<SamplingParamsStore>,
     ) -> Result<Self, ModelExecutorError> {
-        assert!(max_requests <= sampler_bounds.max_sampling_inputs as usize);
+        let sampler_bounds = sampling_params.bounds();
         let quantization = model_config
             .quantization
             .as_ref()
@@ -94,7 +95,7 @@ impl Qwen3xDSparkMarkov {
         };
         config.validate();
         Ok(Self {
-            backend: DSparkMarkovSampling::new(device, config),
+            backend: DSparkMarkovSampling::new(device, config, sampling_params),
             config,
             weights: None,
             confidence: None,
@@ -320,3 +321,4 @@ impl Qwen3xDSparkConfidenceWeights {
         }
     }
 }
+use std::rc::Rc;

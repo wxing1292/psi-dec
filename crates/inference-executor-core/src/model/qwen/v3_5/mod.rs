@@ -6,6 +6,7 @@ pub use batch::Qwen35SampledTokens;
 pub use batch::gather_flat_indices;
 pub use batch::num_main_output_rows;
 pub use batch::sample_decisions_from_sampled_tokens;
+pub use batch::sample_req_slots;
 pub use batch::sample_sampler_configs;
 pub use batch::sample_token_positions;
 pub use batch::to_core_batch_resp;

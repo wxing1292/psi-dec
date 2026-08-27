@@ -22,6 +22,7 @@ use inference_executor_core::model::qwen::v3::Qwen3SampledTokens;
 use inference_executor_core::model::qwen::v3::gather_flat_indices;
 use inference_executor_core::model::qwen::v3::num_main_output_rows;
 use inference_executor_core::model::qwen::v3::sample_decisions_from_sampled_tokens;
+use inference_executor_core::model::qwen::v3::sample_req_slots;
 use inference_executor_core::model::qwen::v3::sample_sampler_configs;
 use inference_executor_core::model::qwen::v3::sample_token_positions;
 use inference_executor_core::model::qwen::v3::to_core_batch_resp;
@@ -30,7 +31,6 @@ use inference_executor_core::model::qwen::v3::weight_layout::resolve_qwen3_model
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::sampling::RequestSamplingState;
 use inference_executor_core::sampling::SamplerConfig;
-use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_executor_core::sampling::build_spec_prefill_selection;
@@ -592,6 +592,8 @@ impl ReplayableModel for Qwen3Executor {
             .collect();
         let model_batch_request = Qwen3ModelBatchRequest::from_core_batch(core_batch_req, sampler_configs);
         let microbatch = model_batch_request.microbatch();
+        self.sampler
+            .set_params(microbatch.req_slots(), microbatch.sampler_configs());
         self.write_token_ids(microbatch.flat_token_ids());
         let num_main_active_tokens = microbatch
             .total_tokens()

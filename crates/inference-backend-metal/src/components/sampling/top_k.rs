@@ -176,7 +176,11 @@ pub struct SampleBuffers<'a> {
     pub tile_logits: &'a Buffer,
     pub token_ids: &'a Buffer,
     pub token_probs: &'a Buffer,
-    pub runtime_params: &'a Buffer,
+    pub params: &'a Buffer,
+    pub req_slots: &'a Buffer,
+    pub sample_positions: &'a Buffer,
+    pub sample_position_increment: u32,
+    pub sampling_domain: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -193,7 +197,8 @@ pub struct WriteDistributionBuffers<'a> {
     pub tile_logits: &'a Buffer,
     pub distribution_token_ids: &'a Buffer,
     pub distribution_probs: &'a Buffer,
-    pub runtime_params: &'a Buffer,
+    pub params: &'a Buffer,
+    pub req_slots: &'a Buffer,
     pub output_distribution_indices: &'a Buffer,
     pub max_k: u32,
     pub num_output_distributions: u32,
@@ -207,7 +212,11 @@ pub struct SampleAndWriteDistributionBuffers<'a> {
     pub sampled_token_probs: &'a Buffer,
     pub distribution_token_ids: &'a Buffer,
     pub distribution_probs: &'a Buffer,
-    pub runtime_params: &'a Buffer,
+    pub params: &'a Buffer,
+    pub req_slots: &'a Buffer,
+    pub sample_positions: &'a Buffer,
+    pub sample_position_increment: u32,
+    pub sampling_domain: u32,
     pub output_distribution_indices: &'a Buffer,
     pub max_k: u32,
     pub num_output_distributions: u32,
@@ -250,7 +259,8 @@ fn assert_reduce_inputs_fit(
     shape: Shape,
     tile_token_ids: &Buffer,
     tile_logits: &Buffer,
-    runtime_params: &Buffer,
+    params: &Buffer,
+    req_slots: &Buffer,
     layout: PartialCandidateLayout,
 ) {
     let candidates = partial_candidate_count(shape, layout);
@@ -263,12 +273,17 @@ fn assert_reduce_inputs_fit(
         "top-k partial-logit buffer is too short"
     );
     assert!(
-        runtime_params.len_bytes()
-            >= checked_product(
-                "Metal top-k runtime parameter byte length",
-                &[shape.num_total_sampling_inputs as usize, 6, size_of::<u32>()],
+        params.len_bytes() >= 4 * size_of::<u32>(),
+        "top-k sampling parameter store is empty"
+    );
+    assert!(
+        req_slots.len_bytes()
+            >= checked_bytes(
+                "Metal top-k request-slot row",
+                shape.num_total_sampling_inputs as usize,
+                size_of::<u32>(),
             ),
-        "top-k runtime parameter buffer is too short"
+        "top-k request-slot buffer is too short"
     );
 }
 
@@ -612,8 +627,18 @@ impl Operator for SampleInvocation<'_> {
             self.shape,
             self.buffers.tile_token_ids,
             self.buffers.tile_logits,
-            self.buffers.runtime_params,
+            self.buffers.params,
+            self.buffers.req_slots,
             self.partial_candidate_layout,
+        );
+        assert!(
+            self.buffers.sample_positions.len_bytes()
+                >= checked_bytes(
+                    "Metal top-k sample position",
+                    self.shape.num_total_sampling_inputs as usize,
+                    size_of::<u32>(),
+                ),
+            "top-k sample-position buffer is too short"
         );
         assert!(
             self.buffers.token_ids.len_bytes()
@@ -640,14 +665,18 @@ impl Operator for SampleInvocation<'_> {
         recorder.set_buffer_read(1, self.buffers.tile_logits, 0);
         recorder.set_buffer_write(2, self.buffers.token_ids, 0);
         recorder.set_buffer_write(3, self.buffers.token_probs, 0);
-        recorder.set_buffer_read(4, self.buffers.runtime_params, 0);
-        recorder.set_u32(6, self.shape.top_k);
-        recorder.set_u32(7, num_partitions);
-        recorder.set_u32(8, num_candidates_per_partition);
-        recorder.set_u32(9, self.partial_candidate_layout.vocab_partition_size());
+        recorder.set_buffer_read(4, self.buffers.params, 0);
+        recorder.set_buffer_read(5, self.buffers.req_slots, 0);
+        recorder.set_buffer_read(6, self.buffers.sample_positions, 0);
+        recorder.set_u32(8, self.buffers.sample_position_increment);
+        recorder.set_u32(9, self.buffers.sampling_domain);
+        recorder.set_u32(10, self.shape.top_k);
+        recorder.set_u32(11, num_partitions);
+        recorder.set_u32(12, num_candidates_per_partition);
+        recorder.set_u32(13, self.partial_candidate_layout.vocab_partition_size());
         let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        recorder.bind_u32(5, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
+        recorder.bind_u32(7, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
@@ -667,7 +696,8 @@ impl Operator for WriteDistributionInvocation<'_> {
             self.shape,
             self.buffers.tile_token_ids,
             self.buffers.tile_logits,
-            self.buffers.runtime_params,
+            self.buffers.params,
+            self.buffers.req_slots,
             self.partial_candidate_layout,
         );
         assert!(
@@ -715,17 +745,18 @@ impl Operator for WriteDistributionInvocation<'_> {
         recorder.set_buffer_read(1, self.buffers.tile_logits, 0);
         recorder.set_buffer_write(2, self.buffers.distribution_token_ids, 0);
         recorder.set_buffer_write(3, self.buffers.distribution_probs, 0);
-        recorder.set_buffer_read(4, self.buffers.runtime_params, 0);
-        recorder.set_buffer_read(5, self.buffers.output_distribution_indices, 0);
-        recorder.set_u32(7, self.shape.top_k);
-        recorder.set_u32(8, num_partitions);
-        recorder.set_u32(9, num_candidates_per_partition);
-        recorder.set_u32(10, self.partial_candidate_layout.vocab_partition_size());
-        recorder.set_u32(11, self.buffers.max_k);
-        recorder.set_u32(12, self.buffers.num_output_distributions);
+        recorder.set_buffer_read(4, self.buffers.params, 0);
+        recorder.set_buffer_read(5, self.buffers.req_slots, 0);
+        recorder.set_buffer_read(6, self.buffers.output_distribution_indices, 0);
+        recorder.set_u32(8, self.shape.top_k);
+        recorder.set_u32(9, num_partitions);
+        recorder.set_u32(10, num_candidates_per_partition);
+        recorder.set_u32(11, self.partial_candidate_layout.vocab_partition_size());
+        recorder.set_u32(12, self.buffers.max_k);
+        recorder.set_u32(13, self.buffers.num_output_distributions);
         let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        recorder.bind_u32(6, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
+        recorder.bind_u32(7, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }
@@ -745,8 +776,18 @@ impl Operator for SampleAndWriteDistributionInvocation<'_> {
             self.shape,
             self.buffers.tile_token_ids,
             self.buffers.tile_logits,
-            self.buffers.runtime_params,
+            self.buffers.params,
+            self.buffers.req_slots,
             self.partial_candidate_layout,
+        );
+        assert!(
+            self.buffers.sample_positions.len_bytes()
+                >= checked_bytes(
+                    "Metal top-k sample position",
+                    self.shape.num_total_sampling_inputs as usize,
+                    size_of::<u32>(),
+                ),
+            "top-k sample-position buffer is too short"
         );
         assert!(
             self.buffers.sampled_token_ids.len_bytes()
@@ -813,17 +854,26 @@ impl Operator for SampleAndWriteDistributionInvocation<'_> {
         recorder.set_buffer_write(3, self.buffers.sampled_token_probs, 0);
         recorder.set_buffer_write(4, self.buffers.distribution_token_ids, 0);
         recorder.set_buffer_write(5, self.buffers.distribution_probs, 0);
-        recorder.set_buffer_read(6, self.buffers.runtime_params, 0);
-        recorder.set_buffer_read(7, self.buffers.output_distribution_indices, 0);
-        recorder.set_u32(9, self.shape.top_k);
-        recorder.set_u32(10, num_partitions);
-        recorder.set_u32(11, num_candidates_per_partition);
-        recorder.set_u32(12, self.partial_candidate_layout.vocab_partition_size());
-        recorder.set_u32(13, self.buffers.max_k);
-        recorder.set_u32(14, self.buffers.num_output_distributions);
+        recorder.set_buffer_read(6, self.buffers.params, 0);
+        recorder.set_buffer_read(7, self.buffers.req_slots, 0);
+        recorder.set_buffer_read(8, self.buffers.sample_positions, 0);
+        recorder.set_buffer_read(9, self.buffers.output_distribution_indices, 0);
+        recorder.set_u32(11, self.buffers.sample_position_increment);
+        recorder.set_u32(12, self.buffers.sampling_domain);
+        recorder.set_u32(13, self.shape.top_k);
+        recorder.set_u32(14, num_partitions);
+        recorder.set_u32(15, num_candidates_per_partition);
+        recorder.set_u32(16, self.partial_candidate_layout.vocab_partition_size());
+        recorder.set_u32(17, self.buffers.max_k);
+        recorder.set_u32(18, self.buffers.num_output_distributions);
         let num_threads_per_row = self.constants.thread_block.required_threads;
         let num_total_threads = checked_num_threads(self.shape.num_total_sampling_inputs, num_threads_per_row);
-        recorder.bind_u32(8, REDUCE_NUM_ACTIVE_THREADS_KEY, num_threads_per_row, num_total_threads);
+        recorder.bind_u32(
+            10,
+            REDUCE_NUM_ACTIVE_THREADS_KEY,
+            num_threads_per_row,
+            num_total_threads,
+        );
         recorder.dispatch_1d(num_total_threads as usize, num_threads_per_row as usize);
     }
 }

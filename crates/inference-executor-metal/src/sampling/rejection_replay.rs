@@ -343,6 +343,7 @@ mod tests {
     use super::RejectionSamplingInput;
     use crate::def::replay_op::MetalReplayRuntime;
     use crate::replay::Replay;
+    use crate::sampling::sampling_params::SamplingParamsStore;
     use crate::sampling::spec_probs::SpecProbsStore;
     use crate::sampling::top_k_sampling::TopKSampling;
     use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
@@ -438,13 +439,14 @@ mod tests {
     fn test_replay_cache_validates_cross_component_shape_before_lookup() {
         let device = Device::system_default();
         let stream = Stream::new(&device);
+        let bounds = TopKSamplingBounds {
+            max_sampling_inputs: 8,
+            vocab_size: 16,
+            top_k: 4,
+        };
         let sampler = Rc::new(TopKSampling::new(
             &device,
-            TopKSamplingBounds {
-                max_sampling_inputs: 8,
-                vocab_size: 16,
-                top_k: 4,
-            },
+            Rc::new(SamplingParamsStore::new(&device, bounds, 4)),
         ));
         let rejector = Rc::new(RejectionSampler::new(&device, 2, 4, 8, 4));
         let mut replay = Replay::new("test rejection", RejectionSampling::new(sampler, rejector));

@@ -358,7 +358,11 @@ impl Qwen35Executor {
             return;
         }
         let (mtp_sampling_key, mtp_sampling_arguments) =
-            self.prepare_mtp_sampling_replay(&recorder.mtp_sampler_configs, &recorder.mtp_sample_positions);
+            self.prepare_mtp_sampling_replay(
+                &recorder.mtp_sampler_configs,
+                &recorder.mtp_sample_req_slots,
+                &recorder.mtp_sample_positions,
+            );
         recorder.mtp_sampling_key = Some(mtp_sampling_key);
         recorder.mtp_sampling_arguments = mtp_sampling_arguments;
     }
@@ -493,8 +497,7 @@ impl Qwen35Executor {
                     .expect("qwen3.5 MTP sample position must fit u32")
             })
             .collect::<Vec<_>>();
-        self.sampler
-            .set_configs(&recorder.mtp_sampler_configs, &sample_positions, SamplingDomain::Draft);
+        self.sampler.prepare(&recorder.mtp_sample_req_slots, &sample_positions);
     }
 
     fn read_mtp_step(&self, num_sample_rows: usize) -> (Vec<i32>, Vec<f32>, Duration) {

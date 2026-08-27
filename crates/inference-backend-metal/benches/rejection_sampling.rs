@@ -15,12 +15,12 @@ use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::Stream;
 use inference_executor_core::sampling::SamplingDomain;
 
-fn sampling_runtime_params(device: &Device, rows: u32, top_k: u32) -> Buffer {
-    let params = Buffer::new_zeroed(device, rows as usize * 6 * size_of::<u32>());
+fn sampling_params(device: &Device, rows: u32, top_k: u32) -> Buffer {
+    let params = Buffer::new_zeroed(device, rows as usize * 4 * size_of::<u32>());
     for row in 0..rows as usize {
-        let offset = row * 6;
+        let offset = row * 4;
         params.write_typed(offset, &[0.7f32, 0.8]);
-        params.write_typed(offset + 2, &[12345u32, 0, top_k, SamplingDomain::Target as u32]);
+        params.write_typed(offset + 2, &[12345u32, top_k]);
     }
     params
 }
@@ -359,7 +359,9 @@ impl ReplayFixture {
         let (stream, shape, logits, tile_token_ids, tile_logits, topk) = top_k_base(device, rows, top_k, vocab);
         let token_ids = Buffer::new_zeroed(device, rows as usize * size_of::<i32>());
         let token_probs = Buffer::new_zeroed(device, rows as usize * size_of::<f32>());
-        let runtime_params = sampling_runtime_params(device, rows, top_k);
+        let params = sampling_params(device, rows, top_k);
+        let req_slots = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
+        let sample_positions = Buffer::new_zeroed_elements(device, rows as usize, Dtype::Uint32);
         let reduce = top_k::ReduceCompute::new(device);
         let mut builder = stream.create_replay_program();
         builder.record(topk.invoke_replay(
@@ -380,7 +382,11 @@ impl ReplayFixture {
                 tile_logits: &tile_logits,
                 token_ids: &token_ids,
                 token_probs: &token_probs,
-                runtime_params: &runtime_params,
+                params: &params,
+                req_slots: &req_slots,
+                sample_positions: &sample_positions,
+                sample_position_increment: 0,
+                sampling_domain: u32::from(SamplingDomain::Target),
             },
             topk.partial_candidate_layout(),
         ));
@@ -399,7 +405,8 @@ impl ReplayFixture {
         let (stream, shape, logits, tile_token_ids, tile_logits, topk) = top_k_base(device, rows, top_k, vocab);
         let distribution_token_ids = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<i32>());
         let distribution_probs = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<f32>());
-        let runtime_params = sampling_runtime_params(device, rows, top_k);
+        let params = sampling_params(device, rows, top_k);
+        let req_slots = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
         let output_distribution_indices = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
         let reduce = top_k::ReduceCompute::new(device);
         let mut builder = stream.create_replay_program();
@@ -421,7 +428,8 @@ impl ReplayFixture {
                 tile_logits: &tile_logits,
                 distribution_token_ids: &distribution_token_ids,
                 distribution_probs: &distribution_probs,
-                runtime_params: &runtime_params,
+                params: &params,
+                req_slots: &req_slots,
                 output_distribution_indices: &output_distribution_indices,
                 max_k: top_k,
                 num_output_distributions: rows,
@@ -445,7 +453,9 @@ impl ReplayFixture {
         let sampled_token_probs = Buffer::new_zeroed(device, rows as usize * size_of::<f32>());
         let distribution_token_ids = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<i32>());
         let distribution_probs = Buffer::new_zeroed(device, rows as usize * top_k as usize * size_of::<f32>());
-        let runtime_params = sampling_runtime_params(device, rows, top_k);
+        let params = sampling_params(device, rows, top_k);
+        let req_slots = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
+        let sample_positions = Buffer::new_zeroed_elements(device, rows as usize, Dtype::Uint32);
         let output_distribution_indices = Buffer::from_slice(device, &(0..rows).collect::<Vec<_>>());
         let reduce = top_k::ReduceCompute::new(device);
         let mut builder = stream.create_replay_program();
@@ -469,7 +479,11 @@ impl ReplayFixture {
                 sampled_token_probs: &sampled_token_probs,
                 distribution_token_ids: &distribution_token_ids,
                 distribution_probs: &distribution_probs,
-                runtime_params: &runtime_params,
+                params: &params,
+                req_slots: &req_slots,
+                sample_positions: &sample_positions,
+                sample_position_increment: 0,
+                sampling_domain: u32::from(SamplingDomain::Target),
                 output_distribution_indices: &output_distribution_indices,
                 max_k: top_k,
                 num_output_distributions: rows,

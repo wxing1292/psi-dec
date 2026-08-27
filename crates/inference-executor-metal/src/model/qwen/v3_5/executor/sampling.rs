@@ -2,6 +2,7 @@ impl Qwen35Executor {
     fn prepare_sample_replay(
         &mut self,
         sampler_configs: &[SamplerConfig],
+        sample_req_slots: &[u32],
         sample_positions: &[u32],
     ) -> (TopKSamplingReplayKey, ReplayArguments) {
         assert_eq!(
@@ -17,8 +18,7 @@ impl Qwen35Executor {
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         let (sample_key, _) = self.sampling.record(&runtime, &input);
-        self.sampler
-            .set_configs(sampler_configs, sample_positions, SamplingDomain::Target);
+        self.sampler.prepare(sample_req_slots, sample_positions);
         let mut replay_arguments = ReplayArguments::new();
         self.sampler.add_replay_arguments(sample_shape, &mut replay_arguments);
         (sample_key, replay_arguments)
@@ -27,6 +27,7 @@ impl Qwen35Executor {
     fn prepare_mtp_sampling_replay(
         &mut self,
         sampler_configs: &[SamplerConfig],
+        sample_req_slots: &[u32],
         sample_positions: &[u32],
     ) -> (TopKSamplingReplayKey, ReplayArguments) {
         assert_eq!(
@@ -55,8 +56,7 @@ impl Qwen35Executor {
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
         let (sample_key, _) = mtp.sampling.record(&runtime, &input);
-        self.sampler
-            .set_configs(sampler_configs, sample_positions, SamplingDomain::Draft);
+        self.sampler.prepare(sample_req_slots, sample_positions);
         let mut replay_arguments = ReplayArguments::new();
         self.sampler.add_replay_arguments(sample_shape, &mut replay_arguments);
         (sample_key, replay_arguments)
@@ -64,8 +64,9 @@ impl Qwen35Executor {
 
     fn record_sampling(&mut self, microbatch: &Qwen35Microbatch) -> (TopKSamplingReplayKey, ReplayArguments) {
         let sampler_configs = sample_sampler_configs(microbatch);
+        let sample_req_slots = sample_req_slots(microbatch);
         let sample_positions = sample_token_positions(microbatch);
-        self.prepare_sample_replay(&sampler_configs, &sample_positions)
+        self.prepare_sample_replay(&sampler_configs, &sample_req_slots, &sample_positions)
     }
 
     fn assert_expected_draft_tokens_fit(&self, num_tokens: usize) {
@@ -200,8 +201,7 @@ impl Qwen35Executor {
             }
             recorder.rejection_key = Some(rejection_key);
         }
-        self.sampler
-            .set_configs(&sampler_configs, &sample_positions, SamplingDomain::Target);
+        self.sampler.prepare(&sample_req_slots(microbatch), &sample_positions);
         let mut rejection_runtime_params = Vec::with_capacity(num_active_decode_reqs);
         let mut target_offset = 0usize;
         for &req_index in &prepared.decode_req_indices {

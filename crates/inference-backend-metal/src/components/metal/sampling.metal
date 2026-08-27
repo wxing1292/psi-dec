@@ -6,13 +6,11 @@ using namespace metal;
 #define TILE_CURSOR_MAX 1024
 #define NEG_INF -3.4028234663852886e38f
 
-struct sampling_runtime_params {
+struct sampling_params {
     float temperature;
     float top_p;
     uint seed;
-    uint sample_position;
     uint top_k;
-    uint sampling_domain;
 };
 
 struct rejection_runtime_params {
@@ -458,7 +456,9 @@ static inline void merge_distribution(
 static inline void sample_merged_distribution(
     uint row,
     uint top_k,
-    sampling_runtime_params params,
+    sampling_params params,
+    uint sample_position,
+    uint sampling_domain,
     threadgroup const int* top_tokens,
     threadgroup const float* weights,
     device int* sampled_token_ids,
@@ -481,7 +481,7 @@ static inline void sample_merged_distribution(
     if (kept_count <= 0 || kept_total <= 0.0f) {
         return;
     }
-    uint random = psi_sampling_random(params.seed, params.sample_position, params.sampling_domain);
+    uint random = psi_sampling_random(params.seed, sample_position, sampling_domain);
     float draw = psi_uniform01(random) * kept_total;
     float cumulative = 0.0f;
     for (uint slot = 0; slot < kept_count; ++slot) {
@@ -536,12 +536,16 @@ kernel void top_k_sample_tiles(
     device const float* tile_logits [[buffer(1)]],
     device int* token_ids [[buffer(2)]],
     device float* token_probs [[buffer(3)]],
-    device const sampling_runtime_params* params [[buffer(4)]],
-    constant uint& num_active_threads_u [[buffer(5)]],
-    constant uint& top_k_u [[buffer(6)]],
-    constant uint& num_tiles_u [[buffer(7)]],
-    constant uint& tile_top_k_u [[buffer(8)]],
-    constant uint& vocab_tile_size_u [[buffer(9)]],
+    device const sampling_params* params [[buffer(4)]],
+    device const uint* req_slots [[buffer(5)]],
+    device const uint* sample_positions [[buffer(6)]],
+    constant uint& num_active_threads_u [[buffer(7)]],
+    constant uint& sample_position_increment [[buffer(8)]],
+    constant uint& sampling_domain [[buffer(9)]],
+    constant uint& top_k_u [[buffer(10)]],
+    constant uint& num_tiles_u [[buffer(11)]],
+    constant uint& tile_top_k_u [[buffer(12)]],
+    constant uint& vocab_tile_size_u [[buffer(13)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads_u) {
@@ -555,17 +559,19 @@ kernel void top_k_sample_tiles(
     threadgroup float reduce_values[THREADGROUP_SIZE];
     threadgroup int reduce_tokens[THREADGROUP_SIZE];
     threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
-    sampling_runtime_params row_params = params[row];
-    uint row_top_k = row_params.top_k;
+    sampling_params request_params = params[req_slots[row]];
+    uint row_top_k = request_params.top_k;
     if (row_top_k == 0 || row_top_k > top_k_u) {
         return;
     }
     merge_distribution(lane, row, row_top_k, num_tiles_u, tile_top_k_u,
-        vocab_tile_size_u, row_params.temperature, row_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
+        vocab_tile_size_u, request_params.temperature, request_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
         reduce_values, reduce_tokens, tile_cursors);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) {
-        sample_merged_distribution(row, row_top_k, row_params, top_tokens, weights, token_ids, token_probs);
+        sample_merged_distribution(
+            row, row_top_k, request_params, sample_positions[row] + sample_position_increment,
+            sampling_domain, top_tokens, weights, token_ids, token_probs);
     }
 }
 
@@ -574,15 +580,16 @@ kernel void top_k_write_distribution_tiles(
     device const float* tile_logits [[buffer(1)]],
     device int* token_ids [[buffer(2)]],
     device float* token_probs [[buffer(3)]],
-    device const sampling_runtime_params* params [[buffer(4)]],
-    device const uint* output_distribution_indices [[buffer(5)]],
-    constant uint& num_active_threads_u [[buffer(6)]],
-    constant uint& top_k_u [[buffer(7)]],
-    constant uint& num_tiles_u [[buffer(8)]],
-    constant uint& tile_top_k_u [[buffer(9)]],
-    constant uint& vocab_tile_size_u [[buffer(10)]],
-    constant uint& max_k_u [[buffer(11)]],
-    constant uint& num_output_distributions_u [[buffer(12)]],
+    device const sampling_params* params [[buffer(4)]],
+    device const uint* req_slots [[buffer(5)]],
+    device const uint* output_distribution_indices [[buffer(6)]],
+    constant uint& num_active_threads_u [[buffer(7)]],
+    constant uint& top_k_u [[buffer(8)]],
+    constant uint& num_tiles_u [[buffer(9)]],
+    constant uint& tile_top_k_u [[buffer(10)]],
+    constant uint& vocab_tile_size_u [[buffer(11)]],
+    constant uint& max_k_u [[buffer(12)]],
+    constant uint& num_output_distributions_u [[buffer(13)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads_u) {
@@ -597,13 +604,13 @@ kernel void top_k_write_distribution_tiles(
     threadgroup float reduce_values[THREADGROUP_SIZE];
     threadgroup int reduce_tokens[THREADGROUP_SIZE];
     threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
-    sampling_runtime_params row_params = params[row];
-    uint row_top_k = row_params.top_k;
+    sampling_params request_params = params[req_slots[row]];
+    uint row_top_k = request_params.top_k;
     if (row_top_k == 0 || row_top_k > top_k_u) {
         return;
     }
     merge_distribution(lane, row, row_top_k, num_tiles_u, tile_top_k_u,
-        vocab_tile_size_u, row_params.temperature, row_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
+        vocab_tile_size_u, request_params.temperature, request_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
         reduce_values, reduce_tokens, tile_cursors);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -626,15 +633,19 @@ kernel void top_k_sample_and_write_distribution_tiles(
     device float* sampled_token_probs [[buffer(3)]],
     device int* distribution_token_ids [[buffer(4)]],
     device float* distribution_probs [[buffer(5)]],
-    device const sampling_runtime_params* params [[buffer(6)]],
-    device const uint* output_distribution_indices [[buffer(7)]],
-    constant uint& num_active_threads_u [[buffer(8)]],
-    constant uint& top_k_u [[buffer(9)]],
-    constant uint& num_tiles_u [[buffer(10)]],
-    constant uint& tile_top_k_u [[buffer(11)]],
-    constant uint& vocab_tile_size_u [[buffer(12)]],
-    constant uint& max_k_u [[buffer(13)]],
-    constant uint& num_output_distributions_u [[buffer(14)]],
+    device const sampling_params* params [[buffer(6)]],
+    device const uint* req_slots [[buffer(7)]],
+    device const uint* sample_positions [[buffer(8)]],
+    device const uint* output_distribution_indices [[buffer(9)]],
+    constant uint& num_active_threads_u [[buffer(10)]],
+    constant uint& sample_position_increment [[buffer(11)]],
+    constant uint& sampling_domain [[buffer(12)]],
+    constant uint& top_k_u [[buffer(13)]],
+    constant uint& num_tiles_u [[buffer(14)]],
+    constant uint& tile_top_k_u [[buffer(15)]],
+    constant uint& vocab_tile_size_u [[buffer(16)]],
+    constant uint& max_k_u [[buffer(17)]],
+    constant uint& num_output_distributions_u [[buffer(18)]],
     uint global_thread_id [[thread_position_in_grid]]
 ) {
     if (global_thread_id >= num_active_threads_u) {
@@ -649,13 +660,13 @@ kernel void top_k_sample_and_write_distribution_tiles(
     threadgroup float reduce_values[THREADGROUP_SIZE];
     threadgroup int reduce_tokens[THREADGROUP_SIZE];
     threadgroup ushort tile_cursors[TILE_CURSOR_MAX];
-    sampling_runtime_params row_params = params[row];
-    uint row_top_k = row_params.top_k;
+    sampling_params request_params = params[req_slots[row]];
+    uint row_top_k = request_params.top_k;
     if (row_top_k == 0 || row_top_k > top_k_u) {
         return;
     }
     merge_distribution(lane, row, row_top_k, num_tiles_u, tile_top_k_u,
-        vocab_tile_size_u, row_params.temperature, row_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
+        vocab_tile_size_u, request_params.temperature, request_params.top_p, tile_token_ids, tile_logits, top_logits, top_tokens, weights,
         reduce_values, reduce_tokens, tile_cursors);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -671,7 +682,8 @@ kernel void top_k_sample_and_write_distribution_tiles(
 
     if (lane == 0) {
         sample_merged_distribution(
-            row, row_top_k, row_params, top_tokens, weights, sampled_token_ids, sampled_token_probs);
+            row, row_top_k, request_params, sample_positions[row] + sample_position_increment,
+            sampling_domain, top_tokens, weights, sampled_token_ids, sampled_token_probs);
     }
 }
 

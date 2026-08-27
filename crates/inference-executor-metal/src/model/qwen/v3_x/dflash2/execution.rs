@@ -13,7 +13,6 @@ use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2WeightBindings;
 use inference_executor_core::model::qwen::v3_x::dflash2::resolve_qwen3x_dflash2_weight_bindings;
-use inference_executor_core::sampling::SamplerConfig;
 use inference_executor_core::sampling::SpecPrefillSelection;
 use inference_runtime_core::runtime::RawRequestSlot;
 
@@ -69,24 +68,16 @@ pub struct Qwen3xDFlash2ProposalInput<'a> {
     req_slots: Vec<u32>,
     anchor_token_ids: &'a [u32],
     anchor_positions: &'a [u32],
-    sampler_configs: &'a [SamplerConfig],
 }
 
 impl<'a> Qwen3xDFlash2ProposalInput<'a> {
-    pub fn new(
-        req_slots: Vec<u32>,
-        anchor_token_ids: &'a [u32],
-        anchor_positions: &'a [u32],
-        sampler_configs: &'a [SamplerConfig],
-    ) -> Self {
+    pub fn new(req_slots: Vec<u32>, anchor_token_ids: &'a [u32], anchor_positions: &'a [u32]) -> Self {
         debug_assert_eq!(req_slots.len(), anchor_token_ids.len());
         debug_assert_eq!(req_slots.len(), anchor_positions.len());
-        debug_assert_eq!(req_slots.len(), sampler_configs.len());
         Self {
             req_slots,
             anchor_token_ids,
             anchor_positions,
-            sampler_configs,
         }
     }
 }
@@ -327,7 +318,6 @@ impl Qwen3xDFlash2Execution {
             req_slots: &proposal.req_slots,
             anchor_token_ids: proposal.anchor_token_ids,
             anchor_positions: proposal.anchor_positions,
-            sampler_configs: proposal.sampler_configs,
             distribution_store,
         });
         let embed_input = Qwen3xDFlash2EmbedArgs {

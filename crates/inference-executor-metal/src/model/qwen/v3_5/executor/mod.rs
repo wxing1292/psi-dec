@@ -64,6 +64,7 @@ use inference_executor_core::model::qwen::v3_5::Qwen35SampledTokens;
 use inference_executor_core::model::qwen::v3_5::gather_flat_indices;
 use inference_executor_core::model::qwen::v3_5::num_main_output_rows;
 use inference_executor_core::model::qwen::v3_5::sample_decisions_from_sampled_tokens;
+use inference_executor_core::model::qwen::v3_5::sample_req_slots;
 use inference_executor_core::model::qwen::v3_5::sample_sampler_configs;
 use inference_executor_core::model::qwen::v3_5::sample_token_positions;
 use inference_executor_core::model::qwen::v3_5::to_core_batch_resp;
@@ -75,7 +76,6 @@ use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::sampling::RequestSamplingState;
 use inference_executor_core::sampling::SamplerConfig;
-use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::SparseRejectionSamplingReqParams;
 use inference_executor_core::sampling::TopKSamplingBounds;
 use inference_executor_core::sampling::build_spec_prefill_selection;
@@ -983,6 +983,8 @@ impl ReplayableModel for Qwen35Executor {
         let model_batch_request =
             Qwen35ModelBatchRequest::from_core_batch(core_batch_req, num_spec_tokens, sampler_configs);
         let microbatch = model_batch_request.microbatch();
+        self.sampler
+            .set_params(microbatch.req_slots(), microbatch.sampler_configs());
         trace::qwen35_state(|| {
             format!(
                 "event=batch_from_core seq={} req_slots={:?} token_indices={:?} num_spec_tokens={:?} seeds={:?} \

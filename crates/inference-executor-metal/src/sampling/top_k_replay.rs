@@ -3,14 +3,17 @@ use std::rc::Rc;
 use inference_backend_metal::metal::Buffer;
 use inference_executor_core::replay::ReplayBucketPolicy;
 use inference_executor_core::sampling::SamplerConfig;
+use inference_executor_core::sampling::SamplingDomain;
 use inference_executor_core::sampling::TopKSamplingLogitsDtype;
 use inference_executor_core::sampling::TopKSamplingShape;
 
 use crate::def::replay_op::ReplayRecorder;
 use crate::replay::ReplayComponent;
 use crate::sampling::top_k_sampling::TopKSampling;
+use crate::sampling::top_k_sampling::TopKSamplingDraw;
 use crate::sampling::top_k_sampling::TopKSamplingInputs;
 use crate::sampling::top_k_sampling::TopKSamplingOutput;
+use crate::sampling::top_k_sampling::TopKSamplingSampleAndWriteDistributionOutput;
 use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -94,6 +97,7 @@ impl ReplayComponent for Sampling {
             recorder,
             input.shape,
             TopKSamplingLogitsDtype::Bfloat16,
+            SamplingDomain::Target,
             TopKSamplingInputs {
                 logits: input.logits,
                 logits_offset_bytes: 0,
@@ -116,12 +120,18 @@ impl ReplayComponent for DraftSampling {
             recorder,
             input.shape,
             TopKSamplingLogitsDtype::Bfloat16,
+            TopKSamplingDraw {
+                sample_position_increment: 0,
+                sampling_domain: SamplingDomain::Draft,
+            },
             TopKSamplingInputs {
                 logits: input.logits,
                 logits_offset_bytes: 0,
             },
-            input.output,
-            input.sparse,
+            TopKSamplingSampleAndWriteDistributionOutput {
+                sampled: input.output,
+                distribution: input.sparse,
+            },
         );
     }
 }

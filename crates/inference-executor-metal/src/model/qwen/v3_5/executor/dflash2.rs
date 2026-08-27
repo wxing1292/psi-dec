@@ -7,7 +7,6 @@ impl Qwen35Executor {
         let mut req_slots = Vec::new();
         let mut anchor_token_ids = Vec::new();
         let mut anchor_positions = Vec::new();
-        let mut sampler_configs = Vec::new();
         let mut decision_index = 0usize;
         for req_index in 0..microbatch.num_reqs() {
             if !microbatch.is_decode_req(req_index) {
@@ -38,7 +37,6 @@ impl Qwen35Executor {
             req_slots.push(microbatch.req_slots()[req_index]);
             anchor_token_ids.push(decision.sampled_token);
             anchor_positions.push(anchor_position);
-            sampler_configs.push(microbatch.sampler_configs()[req_index]);
             decision_index += 1;
         }
         assert_eq!(
@@ -57,7 +55,6 @@ impl Qwen35Executor {
                 req_slots,
                 &anchor_token_ids,
                 &anchor_positions,
-                &sampler_configs,
             ),
             self.pages.buffer(),
             &dflash2.common.spec_probs,

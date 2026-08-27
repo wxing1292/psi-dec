@@ -10,7 +10,6 @@ use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2Config;
 use inference_executor_core::model::qwen::v3_x::dflash2::Qwen3xDFlash2WeightBindings;
 use inference_executor_core::model::qwen::v3_x::dflash2::resolve_qwen3x_dflash2_weight_bindings;
-use inference_executor_core::sampling::TopKSamplingBounds;
 
 use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::checkpoint::SafeTensorStore;
@@ -20,6 +19,7 @@ use crate::model::qwen::v3_x::dflash2::attention::qwen3x_dflash2_gqa_sdpa_config
 use crate::model::qwen::v3_x::dflash2::model::Qwen3xDFlash2Model;
 use crate::model::qwen::v3_x::dflash2::output::Qwen3xDFlash2Output;
 use crate::model::unembedding::Unembed;
+use crate::sampling::sampling_params::SamplingParamsStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3xDFlash2LoadConfig {
@@ -52,7 +52,7 @@ pub fn load_qwen3x_dflash2(
     load_config: Qwen3xDFlash2LoadConfig,
     main_embed: Rc<Embed>,
     main_unembed: Rc<Unembed>,
-    sampler_bounds: TopKSamplingBounds,
+    sampling_params: Rc<SamplingParamsStore>,
 ) -> Result<Qwen3xDFlash2Loaded, ModelExecutorError> {
     let num_spec_tokens = config.num_spec_tokens().get();
     let query_block_size = config.block_size;
@@ -123,7 +123,7 @@ pub fn load_qwen3x_dflash2(
         load_config.max_requests,
         unembed,
         &selector,
-        sampler_bounds,
+        sampling_params,
         scale_bias_dtype,
     )?;
     output.load_weights(device, &mut store, selector)?;

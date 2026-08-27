@@ -52,6 +52,7 @@ use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
 use crate::sampling::rejection_replay::RejectionSampler;
 use crate::sampling::rejection_replay::RejectionSampling;
+use crate::sampling::sampling_params::SamplingParamsStore;
 use crate::sampling::spec_probs::SpecProbsStore;
 use crate::sampling::top_k_replay::Sampling;
 use crate::sampling::top_k_sampling::TopKSampling;
@@ -341,6 +342,11 @@ fn init_qwen_3_model_inner(
         top_k: MAX_TOP_K as u32,
     };
     sampler_bounds.validate();
+    let sampling_params = Rc::new(SamplingParamsStore::new(
+        &device,
+        sampler_bounds,
+        config.max_requests as u32,
+    ));
     let spec_load = match &init_mode {
         Qwen3InitMode::Vanilla => Qwen3SpecLoad::Vanilla,
         Qwen3InitMode::DSpark {
@@ -362,7 +368,7 @@ fn init_qwen_3_model_inner(
                 },
                 Rc::clone(&embed),
                 gather_unembed.unembed(),
-                sampler_bounds,
+                Rc::clone(&sampling_params),
             )?))
         },
     };
@@ -384,7 +390,7 @@ fn init_qwen_3_model_inner(
     main.load_weights(&device, &mut store, &model_config, main_bindings)?;
     drop(store);
 
-    let sampler = Rc::new(TopKSampling::new(&device, sampler_bounds));
+    let sampler = Rc::new(TopKSampling::new(&device, sampling_params));
     let (speculator, num_dspark_gqa_page_ids_per_block) = match spec_load {
         Qwen3SpecLoad::Vanilla => (Qwen3Speculator::Vanilla, 0),
         Qwen3SpecLoad::DSpark(loaded) => {

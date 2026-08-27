@@ -9,7 +9,6 @@ use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkWeightBindings;
 use inference_executor_core::model::qwen::v3_x::dspark::resolve_qwen3x_dspark_weight_bindings;
-use inference_executor_core::sampling::TopKSamplingBounds;
 
 use crate::attn::bidi_block_gqa::state::BiDiBlockGQAState;
 use crate::checkpoint::SafeTensorStore;
@@ -22,6 +21,7 @@ use crate::model::qwen::v3_x::dspark::sampling::Qwen3xDSparkMarkov;
 use crate::model::qwen::v3_x::weight::to_u32;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
+use crate::sampling::sampling_params::SamplingParamsStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3xDSparkLoadConfig {
@@ -55,7 +55,7 @@ pub fn load_qwen3x_dspark(
     load_config: Qwen3xDSparkLoadConfig,
     main_embed: Rc<Embed>,
     main_unembed: Rc<Unembed>,
-    sampler_bounds: TopKSamplingBounds,
+    sampling_params: Rc<SamplingParamsStore>,
 ) -> Result<Qwen3xDSparkLoaded, ModelExecutorError> {
     let num_spec_tokens = config.num_spec_tokens().get();
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
@@ -177,7 +177,7 @@ pub fn load_qwen3x_dspark(
         num_spec_tokens,
         &markov_bindings,
         load_config.max_requests,
-        sampler_bounds,
+        sampling_params,
     )?;
     markov.load_weights(device, &mut store, &markov_bindings, &confidence_bindings)?;
     let mut model = Qwen3xDSparkModel::new(

@@ -45,14 +45,18 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
     let hidden_buffer = Buffer::from_slice(&device, &projected_hidden);
     let logit_buffer = Buffer::from_slice(&device, &candidate_logits);
     let score_buffer = Buffer::new_zeroed(&device, config.score_count(shape) * size_of::<f32>());
-    let runtime_params = Buffer::new_zeroed(&device, shape.num_total_requests as usize * 4 * size_of::<u32>());
+    let params = Buffer::new_zeroed(&device, shape.num_total_requests as usize * 4 * size_of::<u32>());
     for request in 0..shape.num_total_requests as usize {
-        runtime_params.write_typed(request * 4, &[0.8f32]);
-        runtime_params.write_typed(
-            request * 4 + 1,
-            &[17 + request as u32, 29 + request as u32, 0xD1A5_0001],
-        );
+        params.write_typed(request * 4, &[0.8f32, 1.0]);
+        params.write_typed(request * 4 + 2, &[17 + request as u32, config.top_k]);
     }
+    let req_slots = Buffer::from_slice(&device, &(0..shape.num_total_requests).collect::<Vec<_>>());
+    let sample_positions = Buffer::from_slice(
+        &device,
+        &(0..shape.num_total_requests)
+            .map(|request| 29 + request)
+            .collect::<Vec<_>>(),
+    );
     let proposal_count = shape.proposal_count();
     let distribution_indices = Buffer::from_slice(&device, &(0..proposal_count as u32).collect::<Vec<_>>());
     let proposal_token_ids = Buffer::new_zeroed(&device, proposal_count * size_of::<i32>());
@@ -91,7 +95,10 @@ fn test_replay_matches_reference_for_all_active_request_counts() {
             WalkBuffers {
                 candidate_token_ids: &candidate_buffer,
                 scores: &score_buffer,
-                runtime_params: &runtime_params,
+                params: &params,
+                req_slots: &req_slots,
+                sample_positions: &sample_positions,
+                sampling_domain: 0xD1A5_0001,
                 output_distribution_indices: &distribution_indices,
                 proposal_token_ids: &proposal_token_ids,
                 proposal_probs: &proposal_probs,

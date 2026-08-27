@@ -105,7 +105,10 @@ pub struct ScoreBuffers<'a> {
 pub struct WalkBuffers<'a> {
     pub candidate_token_ids: &'a Buffer,
     pub scores: &'a Buffer,
-    pub runtime_params: &'a Buffer,
+    pub params: &'a Buffer,
+    pub req_slots: &'a Buffer,
+    pub sample_positions: &'a Buffer,
+    pub sampling_domain: u32,
     pub output_distribution_indices: &'a Buffer,
     pub proposal_token_ids: &'a Buffer,
     pub proposal_probs: &'a Buffer,
@@ -267,16 +270,19 @@ impl Operator for WalkInvocation<'_> {
         recorder.set_kernel(&self.compute.walk);
         recorder.set_buffer_read(0, self.buffers.candidate_token_ids, 0);
         recorder.set_buffer_read(1, self.buffers.scores, 0);
-        recorder.set_buffer_read(2, self.buffers.runtime_params, 0);
-        recorder.set_buffer_read(3, self.buffers.output_distribution_indices, 0);
-        recorder.set_buffer_write(4, self.buffers.proposal_token_ids, 0);
-        recorder.set_buffer_write(5, self.buffers.proposal_probs, 0);
-        recorder.set_buffer_write(6, self.buffers.distribution_token_ids, 0);
-        recorder.set_buffer_write(7, self.buffers.distribution_probs, 0);
-        bind_active_requests(recorder, 8, self.shape, self.num_active_requests);
-        recorder.set_u32(9, self.shape.num_steps);
-        recorder.set_u32(10, self.compute.config.top_k);
-        recorder.set_u32(11, self.buffers.max_distribution_k);
+        recorder.set_buffer_read(2, self.buffers.params, 0);
+        recorder.set_buffer_read(3, self.buffers.req_slots, 0);
+        recorder.set_buffer_read(4, self.buffers.sample_positions, 0);
+        recorder.set_buffer_read(5, self.buffers.output_distribution_indices, 0);
+        recorder.set_buffer_write(6, self.buffers.proposal_token_ids, 0);
+        recorder.set_buffer_write(7, self.buffers.proposal_probs, 0);
+        recorder.set_buffer_write(8, self.buffers.distribution_token_ids, 0);
+        recorder.set_buffer_write(9, self.buffers.distribution_probs, 0);
+        bind_active_requests(recorder, 10, self.shape, self.num_active_requests);
+        recorder.set_u32(11, self.shape.num_steps);
+        recorder.set_u32(12, self.compute.config.top_k);
+        recorder.set_u32(13, self.buffers.max_distribution_k);
+        recorder.set_u32(14, self.buffers.sampling_domain);
         recorder.dispatch_threadblocks((self.shape.num_total_requests as usize, 1, 1), (1, 1, 1));
     }
 }
@@ -292,9 +298,9 @@ impl WalkInvocation<'_> {
         assert!(self.buffers.num_output_distributions > 0);
         assert!(self.buffers.candidate_token_ids.len_bytes() >= candidates * size_of::<i32>());
         assert!(self.buffers.scores.len_bytes() >= config.score_count(self.shape) * size_of::<f32>());
-        assert!(
-            self.buffers.runtime_params.len_bytes() >= self.shape.num_total_requests as usize * 4 * size_of::<u32>()
-        );
+        assert!(self.buffers.params.len_bytes() >= 4 * size_of::<u32>());
+        assert!(self.buffers.req_slots.len_bytes() >= self.shape.num_total_requests as usize * size_of::<u32>());
+        assert!(self.buffers.sample_positions.len_bytes() >= self.shape.num_total_requests as usize * size_of::<u32>());
         assert!(self.buffers.output_distribution_indices.len_bytes() >= proposals * size_of::<u32>());
         assert!(self.buffers.proposal_token_ids.len_bytes() >= proposals * size_of::<i32>());
         assert!(self.buffers.proposal_probs.len_bytes() >= proposals * size_of::<f32>());
