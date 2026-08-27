@@ -39,6 +39,9 @@ crates/inference-executor-metal/src/sampling/
   dspark_markov.rs        sequential DSpark Markov, confidence, and sampling composition
   spec_probs.rs           SpecProbsStore sparse draft/target probability workspace
 
+crates/inference-executor-metal/src/model/qwen/v3_x/
+  spec_decode_input.rs    reusable fixed-capacity Spec Decode input owner
+
 crates/inference-executor-metal/src/model/qwen/v3_x/dspark/
   sampling.rs             Qwen3x Markov checkpoint weights and generic backend adapter
 
@@ -141,6 +144,11 @@ The model executor can pass this view to `spec_decode_input::Compute` without a 
 The transform writes accepted-dependent Spec Decode token, position, visible-history, TaskTemplate, and sampling-position
 metadata. Its replay key fixes the request capacity, Spec-block width, Q-range count, and TaskTemplate capacity.
 Its replay arguments select the active request prefix.
+
+`SpecDecodeInput` owns the acceptance-independent anchor buffer, the GPU-written first-sample-position buffer, and one
+fixed-capacity prepare replay lifecycle. `SpecDecodeInput::prepare` seeds BiDiBlockGQA metadata at maximum acceptance.
+It preserves active request order and fills only the inactive replay-capacity tail with unused valid request slots.
+The GPU transform rewrites active coordinates and endpoints before Spec Decode consumes the same buffers.
 
 `SpecProbsStore` owns `draft_token_ids`, `draft_probs`, `target_token_ids`, and `target_probs`.
 `max_k` is the maximum sparse Top-K row width, not the vocabulary size.
