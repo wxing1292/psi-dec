@@ -6,7 +6,7 @@ use inference_executor_core::model::qwen::v3_asr::init_qwen3_asr_config;
 use inference_executor_core::model::qwen::v3_asr::weight_layout::resolve_qwen3_asr_weight_bindings;
 use inference_runtime_core::runtime::ResourceID;
 use inference_runtime_core::runtime::ResourceURI;
-use inference_runtime_core::runtime::tasks::ResourceTypeProcessor;
+use inference_runtime_core::runtime::resource::processor::ResourceProcessor;
 
 use super::AudioSourceStore;
 use super::Qwen3ASRAudioProcessor;
@@ -42,7 +42,7 @@ fn test_audio_processor_materializes_registered_source() {
     let source = Qwen3ASRAudioSource::new(features, 128, 8).unwrap();
     let (uri, _registration) = processor.register_source(resource_id, source);
 
-    let concrete = futures_lite::future::block_on(processor.materialize(resource_id)).unwrap();
+    let concrete = futures_lite::future::block_on(processor.process(resource_id)).unwrap();
 
     assert_eq!(concrete.id(), resource_id);
     assert_eq!(concrete.uri(), &uri);

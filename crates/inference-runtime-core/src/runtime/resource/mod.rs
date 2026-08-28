@@ -10,6 +10,8 @@ use crate::Result;
 mod concrete_resource;
 pub use concrete_resource::ConcreteResource;
 
+pub mod processor;
+
 mod symbolic_resource;
 pub use symbolic_resource::SymbolicResource;
 

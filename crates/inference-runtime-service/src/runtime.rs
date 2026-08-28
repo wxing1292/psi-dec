@@ -42,6 +42,7 @@ use inference_runtime_core::runtime::decoder::TPStateBlockAllocator;
 use inference_runtime_core::runtime::decoder::trie_cache::MultiLaneTrieBlockCache;
 use inference_runtime_core::runtime::decoder::trie_cache::SingleLaneTrieBlockCache;
 use inference_runtime_core::runtime::decoder::trie_cache::TrieDecoderBlocks;
+use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
 use inference_runtime_core::runtime::scheduler::EventLoop;
 use inference_runtime_core::runtime::scheduler::FIFOBatcher;
 use inference_runtime_core::runtime::scheduler::InstrumentedScheduler;
@@ -49,7 +50,6 @@ use inference_runtime_core::runtime::scheduler::ScheduleQueue;
 use inference_runtime_core::runtime::scheduler::SimpleScheduler;
 use inference_runtime_core::runtime::tasks::AsyncTaskPool;
 use inference_runtime_core::runtime::tasks::AsyncTaskResp;
-use inference_runtime_core::runtime::tasks::ResourceProcessor;
 use inference_runtime_core::runtime::validate_resources;
 
 use crate::api::Inference;
@@ -70,7 +70,7 @@ pub struct InferenceRuntime<const N: usize, const L: usize, const P: usize> {
 
     shutdown: Shutdown,
     block_cache: Arc<RuntimeBlockCache<P, L>>,
-    resource_processor: Arc<ResourceProcessor>,
+    resource_processors: Arc<ResourceProcessors>,
 
     user_req_tx: Sender<RuntimeQueuedRequest<N, P, L>>,
     model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
@@ -86,7 +86,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         num_spec_tokens: usize,
         shutdown: Shutdown,
         async_task_handle: &tokio::runtime::Handle,
-        resource_processor: Arc<ResourceProcessor>,
+        resource_processors: Arc<ResourceProcessors>,
     ) -> Self {
         assert!(scheduler_config.max_requests > 0, "runtime requires request capacity");
         assert!(scheduler_config.max_tokens > 0, "runtime requires token capacity");
@@ -234,7 +234,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
 
             shutdown,
             block_cache,
-            resource_processor,
+            resource_processors,
 
             user_req_tx,
             model_executor_req_rx,
@@ -309,7 +309,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             req_status.clone(),
             decoder_kv_blocks,
             input_positions,
-            self.resource_processor.clone(),
+            self.resource_processors.clone(),
             token_prob_tx,
             sampling_config,
             self.model_runtime_config.context_window,
@@ -382,7 +382,7 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
     http_service: HTTPService,
-    resource_processor: Arc<ResourceProcessor>,
+    resource_processors: Arc<ResourceProcessors>,
     model_runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
     model: M,
@@ -402,7 +402,7 @@ where
         num_spec_tokens,
         shutdown.clone(),
         server_tokio_runtime.handle(),
-        resource_processor,
+        resource_processors,
     ));
     let inference = Arc::new(Inference::new(runtime.clone(), default_stop_sequences));
     let server_shutdown = shutdown.clone();
@@ -470,11 +470,11 @@ mod tests {
     use inference_runtime_core::runtime::RequestSlotAllocator;
     use inference_runtime_core::runtime::RequestStatus;
     use inference_runtime_core::runtime::Token;
+    use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
     use inference_runtime_core::runtime::scheduler::CommitResult;
     use inference_runtime_core::runtime::scheduler::ComputePhase;
     use inference_runtime_core::runtime::scheduler::PrepareResult;
     use inference_runtime_core::runtime::scheduler::UserRequest;
-    use inference_runtime_core::runtime::tasks::ResourceProcessor;
     use ordered_float::NotNan;
     use tokio_stream::StreamExt;
 
@@ -519,7 +519,7 @@ mod tests {
             0,
             shutdown.clone(),
             async_task_runtime.handle(),
-            Arc::new(ResourceProcessor::new()),
+            Arc::new(ResourceProcessors::new()),
         );
         assert_eq!(runtime.model_runtime_config.num_tokens_per_cache_block(), 1024);
         shutdown.shutdown();
@@ -872,7 +872,7 @@ mod tests {
             0,
             shutdown.clone(),
             async_runtime.handle(),
-            Arc::new(ResourceProcessor::new()),
+            Arc::new(ResourceProcessors::new()),
         );
         (runtime, shutdown, async_runtime)
     }

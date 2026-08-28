@@ -1,5 +1,6 @@
 pub mod pin_cache;
 pub mod decoder;
+pub mod resource;
 pub mod scheduler;
 pub mod tasks;
 
@@ -17,9 +18,6 @@ pub use request::RequestStatus;
 pub use request::TokenProbs;
 
 mod token;
-pub use token::Token;
-
-mod resource;
 pub use resource::ConcreteResource;
 pub use resource::Resource;
 pub use resource::ResourceID;
@@ -29,6 +27,7 @@ pub use resource::ResourceURI;
 pub use resource::SymbolicResource;
 pub use resource::validate_resource_placements;
 pub use resource::validate_resources;
+pub use token::Token;
 
 pub type RawRequestID = usize;
 pub type RawRequestSlot = u32;

@@ -9,8 +9,5 @@ mod await_reservation;
 pub use await_reservation::AwaitReservation;
 
 mod resource_materialization;
-pub use resource_materialization::ResourceFuture;
 pub use resource_materialization::ResourceMaterializationReq;
 pub use resource_materialization::ResourceMaterializationResp;
-pub use resource_materialization::ResourceProcessor;
-pub use resource_materialization::ResourceTypeProcessor;

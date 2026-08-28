@@ -11,7 +11,7 @@ use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use crate::runtime::request::AtomicRequestStatus;
 use crate::runtime::request::InternalRequest;
 use crate::runtime::request::TokenProbs;
-use crate::runtime::tasks::ResourceProcessor;
+use crate::runtime::resource::processor::ResourceProcessors;
 
 pub struct QueuedRequest<const N: usize, const P: usize, const L: usize, DBC>
 where
@@ -21,7 +21,7 @@ where
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
     input_positions: Option<RequestInputPositions>,
-    resource_processor: Arc<ResourceProcessor>,
+    resource_processors: Arc<ResourceProcessors>,
     token_prob_tx: Sender<TokenProbs>,
     sampling_config: SamplingConfig,
     context_window: usize,
@@ -37,7 +37,7 @@ where
         req_status: AtomicRequestStatus,
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
         input_positions: Option<RequestInputPositions>,
-        resource_processor: Arc<ResourceProcessor>,
+        resource_processors: Arc<ResourceProcessors>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
         context_window: usize,
@@ -47,7 +47,7 @@ where
             req_status,
             decoder_blocks,
             input_positions,
-            resource_processor,
+            resource_processors,
             token_prob_tx,
             sampling_config,
             context_window,
@@ -70,7 +70,7 @@ where
             req_status,
             decoder_blocks,
             input_positions,
-            resource_processor,
+            resource_processors,
             token_prob_tx,
             sampling_config,
             context_window,
@@ -81,7 +81,7 @@ where
             req_status,
             decoder_blocks,
             input_positions,
-            resource_processor,
+            resource_processors,
             token_prob_tx,
             sampling_config,
             context_window,

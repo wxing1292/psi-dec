@@ -17,8 +17,8 @@ use inference_runtime_core::memory::OffsetAllocation;
 use inference_runtime_core::runtime::ConcreteResource;
 use inference_runtime_core::runtime::ResourceID;
 use inference_runtime_core::runtime::ResourceURI;
-use inference_runtime_core::runtime::tasks::ResourceFuture;
-use inference_runtime_core::runtime::tasks::ResourceTypeProcessor;
+use inference_runtime_core::runtime::resource::processor::ResourceProcessFuture;
+use inference_runtime_core::runtime::resource::processor::ResourceProcessor;
 
 use super::AudioTower;
 use crate::model::resource_arena::MetalResourceArena;
@@ -138,8 +138,8 @@ impl Drop for AudioSourceRegistration {
     }
 }
 
-impl ResourceTypeProcessor for Qwen3ASRAudioProcessor {
-    fn materialize<'a>(&'a self, resource_id: ResourceID) -> ResourceFuture<'a> {
+impl ResourceProcessor for Qwen3ASRAudioProcessor {
+    fn process<'a>(&'a self, resource_id: ResourceID) -> ResourceProcessFuture<'a> {
         let source = self.sources.resolve(resource_id);
         Box::pin(async move {
             let (uri, source) = source.ok_or_else(|| {

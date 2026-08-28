@@ -44,9 +44,9 @@ use crate::runtime::resource::ResourcePlacement;
 use crate::runtime::resource::ResourceTypeID;
 use crate::runtime::resource::ResourceURI;
 use crate::runtime::resource::SymbolicResource;
+use crate::runtime::resource::processor::ResourceProcessors;
 use crate::runtime::scheduler::PrepareResult;
 use crate::runtime::scheduler::UserRequest;
-use crate::runtime::tasks::ResourceProcessor;
 
 const NUM_KV_PAGES_PER_BLOCK: usize = 1;
 const NUM_STATE_PAGES_PER_BLOCK: usize = 1;
@@ -559,7 +559,7 @@ fn test_prepare_resource_not_found_vanilla() {
         AtomicRequestStatus::new(),
         blocks,
         None,
-        Arc::new(ResourceProcessor::new()),
+        Arc::new(ResourceProcessors::new()),
         token_prob_tx,
         SamplingConfig::default(),
         context_window,

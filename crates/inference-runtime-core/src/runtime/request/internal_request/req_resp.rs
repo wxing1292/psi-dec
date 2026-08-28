@@ -115,7 +115,7 @@ where
                     let req = Box::new(ResourceMaterializationReq::new(
                         self.req_id,
                         resource_ids,
-                        self.resource_processor.clone(),
+                        self.resource_processors.clone(),
                     ));
                     return PrepareResult::BlockingAsyncTask { req };
                 },

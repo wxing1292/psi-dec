@@ -18,7 +18,7 @@ use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
-use inference_runtime_core::runtime::tasks::ResourceProcessor;
+use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
 
 use crate::codec::qwen::QwenCodec;
 use crate::qwen_server::args::Qwen35Args;
@@ -180,7 +180,7 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         config.grpc_listen_addr(),
         config.http_listen_addr(),
         HTTPService::ChatCompletions(qwen_codec),
-        Arc::new(ResourceProcessor::new()),
+        Arc::new(ResourceProcessors::new()),
         runtime_config,
         scheduler_config,
         model,

@@ -11,7 +11,7 @@ use inference_runtime_core::Result;
 use inference_runtime_core::config::CacheLaneRuntimeConfig;
 use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_internal;
-use inference_runtime_core::runtime::tasks::ResourceProcessor;
+use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
 
 use crate::asr::Qwen3ASRService;
 use crate::qwen_server::args::Qwen3ASRArgs;
@@ -64,8 +64,8 @@ fn run_inner() -> Result<()> {
         loaded.executor.asr_model_config().clone(),
         Arc::clone(&loaded.audio_processor),
     )?);
-    let mut resource_processor = ResourceProcessor::new();
-    resource_processor.register(QWEN3_ASR_AUDIO_RESOURCE_TYPE, loaded.audio_processor);
+    let mut resource_processors = ResourceProcessors::new();
+    resource_processors.register(QWEN3_ASR_AUDIO_RESOURCE_TYPE, loaded.audio_processor);
     let cache_lane = runtime_config.cache_lane(0);
     tracing::info!(
         model_mode = loaded.executor.model_mode(),
@@ -91,7 +91,7 @@ fn run_inner() -> Result<()> {
         config.grpc_listen_addr(),
         config.http_listen_addr(),
         HTTPService::Transcriptions(asr),
-        Arc::new(resource_processor),
+        Arc::new(resource_processors),
         runtime_config,
         scheduler_config,
         loaded.executor,

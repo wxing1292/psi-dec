@@ -133,6 +133,12 @@ component path as the design.
 
 ## Multimodal Input
 
+- Measure resource-arena memory before and after resource-level early unload.
+  The current runtime converts one concrete resource to symbolic form after all placement ranges for that resource
+  enter committed KV cache.
+  Measure peak arena bytes and later rematerialization frequency for requests with repeated audio, image, or video
+  placements.
+  Keep resource lifetime independent from cache-block and resource-segment lifetime.
 - Add long-audio chunking and streaming only after the collected Qwen3-ASR path has parity fixtures.
   Define timestamp, overlap, context carry, and output-merge contracts before implementation.
 - Add image support with a model-owned image processor, Vision Tower, spatial merger, and true T/H/W M-RoPE.

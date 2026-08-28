@@ -239,11 +239,12 @@ trie block miss
   -> one referenced resource is symbolic
        -> return ResourceNotFound
        -> create ResourceMaterializationReq outside init_block_once
-       -> dispatch through the registered ResourceTypeProcessor
+       -> dispatch through the registered ResourceProcessor
        -> apply ResourceMaterializationResp to the retained internal request
        -> initialize the block again
 ```
 
+`ResourceProcessors` maps each `ResourceTypeID` to one registered `ResourceProcessor`.
 Runtime core dispatches by `ResourceTypeID`.
 It does not interpret media types, checkpoint metadata, or tower inputs.
 The registered processor owns model-specific materialization.

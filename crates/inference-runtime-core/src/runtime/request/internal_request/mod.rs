@@ -15,8 +15,8 @@ use crate::runtime::request::AtomicRequestStatus;
 use crate::runtime::request::CompletionReason;
 use crate::runtime::request::RequestStatus;
 use crate::runtime::request::TokenProbs;
+use crate::runtime::resource::processor::ResourceProcessors;
 use crate::runtime::scheduler::ComputePhase;
-use crate::runtime::tasks::ResourceProcessor;
 
 mod req_resp;
 
@@ -32,7 +32,7 @@ where
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
     input_positions: Option<RequestInputPositions>,
-    resource_processor: Arc<ResourceProcessor>,
+    resource_processors: Arc<ResourceProcessors>,
     in_flight_computes: VecDeque<ComputePhase>,
     num_in_flight_blocking_async_tasks: usize,
     num_in_flight_nonblocking_async_tasks: usize,
@@ -53,7 +53,7 @@ where
         req_status: AtomicRequestStatus,
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
         input_positions: Option<RequestInputPositions>,
-        resource_processor: Arc<ResourceProcessor>,
+        resource_processors: Arc<ResourceProcessors>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
         context_window: usize,
@@ -64,7 +64,7 @@ where
             req_status,
             decoder_blocks,
             input_positions,
-            resource_processor,
+            resource_processors,
             in_flight_computes: VecDeque::new(),
             num_in_flight_blocking_async_tasks: 0,
             num_in_flight_nonblocking_async_tasks: 0,
