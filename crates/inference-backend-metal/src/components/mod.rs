@@ -13,6 +13,8 @@
 //! execution into a stream batch. Private `KernelConstants` values describe
 //! compile-time kernel constants.
 
+pub mod audio_attention;
+
 pub mod dense_mlp;
 pub mod sparse_mlp;
 
