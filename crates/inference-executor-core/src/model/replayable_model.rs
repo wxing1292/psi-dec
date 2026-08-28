@@ -74,8 +74,13 @@ pub trait ReplayableModel {
     fn model_name(&self) -> &str;
     fn model_mode(&self) -> &'static str;
 
+    /// Returns the maximum number of speculative tokens in one request step.
+    fn num_spec_tokens(&self) -> usize {
+        0
+    }
+
     fn default_stop_sequences(&self) -> Vec<Vec<Token>> {
-        Vec::new()
+        vec![]
     }
 
     fn reset_req_slots(&mut self, request_slots: &[RawRequestSlot]);

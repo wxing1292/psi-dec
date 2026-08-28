@@ -1016,6 +1016,10 @@ impl ReplayableModel for Qwen35Executor {
         }
     }
 
+    fn num_spec_tokens(&self) -> usize {
+        Qwen35Executor::num_spec_tokens(self)
+    }
+
     fn default_stop_sequences(&self) -> Vec<Vec<Token>> {
         self.default_stop_sequences.clone()
     }
