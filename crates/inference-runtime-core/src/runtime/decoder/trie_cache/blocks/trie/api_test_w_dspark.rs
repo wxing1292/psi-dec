@@ -12,6 +12,8 @@ use crate::channel::Shutdown;
 use crate::compute::DecoderSyncBlocks;
 use crate::compute::QueryTokens;
 use crate::compute::SampledTokens;
+use crate::config::SamplingConfig;
+use crate::memory::BlockAllocator;
 use crate::memory::U32IDAllocator;
 use crate::runtime::Token;
 use crate::runtime::decoder::BlockAnnotation;
@@ -32,12 +34,19 @@ use crate::runtime::decoder::trie_cache::ReserveMultiLaneSemiImmutableBlockResul
 use crate::runtime::decoder::trie_cache::SingleLaneTrieBlockCache;
 use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
 use crate::runtime::decoder::trie_cache::UninitBlockOnceResult;
+use crate::runtime::request::AtomicRequestStatus;
+use crate::runtime::request::InternalRequest;
+use crate::runtime::request::RequestSlotAllocationResult;
+use crate::runtime::request::RequestSlotAllocator;
 use crate::runtime::resource::Resource;
 use crate::runtime::resource::ResourceID;
 use crate::runtime::resource::ResourcePlacement;
 use crate::runtime::resource::ResourceTypeID;
 use crate::runtime::resource::ResourceURI;
 use crate::runtime::resource::SymbolicResource;
+use crate::runtime::scheduler::PrepareResult;
+use crate::runtime::scheduler::UserRequest;
+use crate::runtime::tasks::ResourceProcessor;
 
 const NUM_KV_PAGES_PER_BLOCK: usize = 1;
 const NUM_STATE_PAGES_PER_BLOCK: usize = 1;
@@ -520,6 +529,86 @@ fn test_prepare_cancel_commit_prefill_zero_token_index_w_dspark() {
     blocks.commit_blocks(sync_blocks);
     blocks.commit(query_tokens, SampledTokens::Prefill { epoch });
     assert_state(&blocks, 1, &token_vec([1, 2]), &[], &token_vec([3]), &[], &[]);
+}
+
+#[test]
+fn test_prepare_resource_not_found_w_dspark() {
+    const REQUEST_ID: usize = 1;
+
+    let total_tokens = token_vec([0, 1, 2, 3, 4, 5]);
+    let block_cache = initialize_block_cache(1024);
+    let resource_id = ResourceID::new(ResourceTypeID::new(7));
+    let placement = ResourcePlacement::new(resource_id, vec![(1, 0, 2)], total_tokens.len());
+    let blocks = TestTrieBlocks::new(
+        block_cache,
+        vec![symbolic_resource(resource_id)],
+        vec![placement],
+        std::iter::empty::<Token>(),
+        std::iter::empty::<Token>(),
+        total_tokens,
+    );
+    let context_window = blocks.num_total_tokens() + 1;
+    let (request_slot_allocator, _reset_rx) = RequestSlotAllocator::new(1);
+    let RequestSlotAllocationResult::Ok { request_slot } = request_slot_allocator.allocate() else {
+        unreachable!()
+    };
+    let (token_prob_tx, _token_prob_rx) = async_channel::bounded(1);
+    let mut request = InternalRequest::new(
+        REQUEST_ID,
+        request_slot,
+        AtomicRequestStatus::new(),
+        blocks,
+        Arc::new(ResourceProcessor::new()),
+        token_prob_tx,
+        SamplingConfig::default(),
+        context_window,
+    );
+
+    let PrepareResult::BlockingAsyncTask { req } = request.prepare(NUM_TOKEN_PER_BLOCK) else {
+        unreachable!()
+    };
+
+    assert_eq!(REQUEST_ID, req.request_id());
+    assert_eq!(1, request.num_in_flight_blocking_async_tasks());
+}
+
+#[test]
+fn test_prepare_commit_resource_unload_w_dspark() {
+    let total_tokens = token_vec([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let block_cache = initialize_block_cache(1024);
+    let resource_id = ResourceID::new(ResourceTypeID::new(7));
+    let placement = ResourcePlacement::new(resource_id, vec![(1, 0, 2), (5, 2, 1)], total_tokens.len());
+    let (resource, resource_allocator) = concrete_resource(resource_id, 3);
+    let mut blocks = TestTrieBlocks::new(
+        block_cache,
+        vec![resource],
+        vec![placement],
+        std::iter::empty::<Token>(),
+        std::iter::empty::<Token>(),
+        total_tokens,
+    );
+
+    let InitBlockOnceResult::Success { .. } = blocks.init_block_once() else {
+        unreachable!()
+    };
+    let query_tokens = blocks.prepare(NUM_TOKEN_PER_BLOCK).unwrap();
+    let sync_blocks = blocks.prepare_blocks();
+    let epoch = query_tokens.epoch();
+    blocks.commit_blocks(sync_blocks);
+    blocks.commit(query_tokens, SampledTokens::Prefill { epoch });
+    assert!(blocks.resources[&resource_id].is_concrete());
+
+    let InitBlockOnceResult::Success { .. } = blocks.init_block_once() else {
+        unreachable!()
+    };
+    let query_tokens = blocks.prepare(2).unwrap();
+    let sync_blocks = blocks.prepare_blocks();
+    let epoch = query_tokens.epoch();
+    blocks.commit_blocks(sync_blocks);
+    blocks.commit(query_tokens, SampledTokens::Prefill { epoch });
+    assert_eq!(6, blocks.num_cached_tokens());
+    assert!(blocks.resources[&resource_id].is_symbolic());
+    assert_eq!(0, resource_allocator.alloc_segment(12).unwrap().offset_bytes());
 }
 
 #[test]

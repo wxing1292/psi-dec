@@ -577,6 +577,7 @@ where
             }
         }
         self.try_mark_ready();
+        self.unload_cached_resources();
 
         debug_assert_eq!(ready_to_cached_token_window, index_start);
         debug_assert_eq!(ready_to_cached_token_window, index_end);

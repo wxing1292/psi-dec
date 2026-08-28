@@ -240,7 +240,10 @@ It does not calculate a vision `rope_delta`.
 The URI is opaque to runtime core.
 
 A symbolic resource can become concrete after materialization.
-A concrete resource can become symbolic after its arena allocation becomes invalid.
+A concrete resource becomes symbolic after all its placement ranges enter committed cache and the related device work
+retires.
+The transition drops the request-owned arena allocation, including when the last placement ends in a partial mutable
+cache block.
 The current service keeps the prepared source registration alive until transcription decode completes.
 
 The internal request must retain a concrete resource while an in-flight device request can read its allocation.

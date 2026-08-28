@@ -255,6 +255,8 @@ The internal request changes the matching symbolic resources to concrete resourc
 
 Runtime does not keep a mutable cache-block reservation while a blocking resource task runs.
 A concrete resource must remain alive until all device work that reads its allocation is complete.
+After commit caches all placement ranges for one resource, runtime changes that resource back to symbolic.
+The transition can occur while the last cache block is still mutable.
 The allocation returns its byte range through RAII release.
 
 The current runtime has one async response type.

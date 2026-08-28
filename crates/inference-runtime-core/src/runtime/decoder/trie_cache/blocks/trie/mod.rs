@@ -141,6 +141,24 @@ where
             .collect()
     }
 
+    fn unload_cached_resources(&mut self) {
+        let cached_token_end = self.num_cached_tokens();
+        let resources = &mut self.resources;
+        for placement in &self.resource_placements {
+            if placement.token_index_range().end > cached_token_end {
+                continue;
+            }
+
+            let resource_id = placement.resource_id();
+            if resources[&resource_id].is_symbolic() {
+                continue;
+            }
+
+            let resource = resources.remove(&resource_id).unwrap();
+            resources.insert(resource_id, resource.into_symbolic());
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn sanity_check(&self) {
         let mut cached_tokens = vec![];

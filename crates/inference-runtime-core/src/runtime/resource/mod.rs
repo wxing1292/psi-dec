@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -204,6 +205,14 @@ impl ResourcePlacement {
 
     pub fn placements(&self) -> &[(usize, usize, usize)] {
         &self.placements
+    }
+
+    /// Returns the smallest request-token range that contains all placements.
+    /// Tokens inside this range do not have to belong to the resource.
+    pub fn token_index_range(&self) -> Range<usize> {
+        let &(token_start, ..) = self.placements.first().unwrap();
+        let &(last_token_start, _, last_num_resource_tokens) = self.placements.last().unwrap();
+        token_start..last_token_start + last_num_resource_tokens
     }
 }
 
