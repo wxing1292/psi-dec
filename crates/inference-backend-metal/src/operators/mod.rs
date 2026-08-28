@@ -23,9 +23,12 @@
 //! count.
 //!
 //! `matmul_bf16::Matmul` selects GEMV or GEMM.
+//! `bias_activation_bf16::Kernel` is the separate row-wise epilogue used by
+//! model-level affine owners.
 
 pub mod affine_quantized;
 pub mod bf16_concat_rows;
+pub mod bias_activation_bf16;
 mod mlx_headers;
 pub mod matmul_bf16;
 pub mod row_gather;
