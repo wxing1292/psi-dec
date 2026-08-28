@@ -52,10 +52,10 @@ impl EmbedConfig {
 pub struct Embed {
     config: EmbedConfig,
     kernel: Rc<embedding::Compute>,
-    weights: Option<Rc<EmbedWeights>>,
+    weights: Option<Rc<QuantizedEmbeddingWeights>>,
 }
 
-struct EmbedWeights {
+pub struct QuantizedEmbeddingWeights {
     weight: Buffer,
     scales: Buffer,
     biases: Buffer,
@@ -105,7 +105,7 @@ impl Embed {
         bindings: QuantizedTensorBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(self.weights.is_none(), "embedding weights are already loaded");
-        self.weights = Some(Rc::new(EmbedWeights::load(
+        self.weights = Some(Rc::new(QuantizedEmbeddingWeights::load(
             device,
             store,
             self.config.config(),
@@ -120,6 +120,14 @@ impl Embed {
         self.weights.take();
     }
 
+    pub fn tied_weights(&self) -> Rc<QuantizedEmbeddingWeights> {
+        Rc::clone(
+            self.weights
+                .as_ref()
+                .expect("embedding weights must be loaded before they are tied"),
+        )
+    }
+
     fn validate_weights(&self) {
         let config = self.config.config();
         let weights = self.weights();
@@ -131,7 +139,7 @@ impl Embed {
         assert_eq!(weights.biases.len_bytes(), weights.scales.len_bytes());
     }
 
-    fn weights(&self) -> &EmbedWeights {
+    fn weights(&self) -> &QuantizedEmbeddingWeights {
         self.weights
             .as_deref()
             .expect("embedding weights must be loaded before execution")
@@ -174,7 +182,7 @@ impl ReplayLayer for Embed {
     }
 }
 
-impl EmbedWeights {
+impl QuantizedEmbeddingWeights {
     fn load(
         device: &Device,
         store: &mut SafeTensorStore,
@@ -204,6 +212,10 @@ impl EmbedWeights {
         };
         assert!(tensors.is_empty(), "embed must consume its tensor map");
         Ok(weights)
+    }
+
+    pub fn buffers(&self) -> (&Buffer, &Buffer, &Buffer) {
+        (&self.weight, &self.scales, &self.biases)
     }
 }
 

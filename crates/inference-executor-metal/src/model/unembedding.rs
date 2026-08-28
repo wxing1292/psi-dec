@@ -13,6 +13,7 @@ use inference_executor_core::def::ModelExecutorError;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
+use crate::model::embedding::QuantizedEmbeddingWeights;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnembedConfig {
@@ -66,7 +67,13 @@ impl UnembedConfig {
 pub struct Unembed {
     config: UnembedConfig,
     matmul: Rc<affine_quantized::Matmul>,
-    weights: Option<Rc<UnembedWeights>>,
+    weights: Option<UnembedWeightOwner>,
+}
+
+#[derive(Clone)]
+enum UnembedWeightOwner {
+    Independent(Rc<UnembedWeights>),
+    Tied(Rc<QuantizedEmbeddingWeights>),
 }
 
 struct UnembedWeights {
@@ -101,14 +108,20 @@ impl Unembed {
         bindings: QuantizedTensorBindings,
     ) -> Result<(), ModelExecutorError> {
         assert!(self.weights.is_none(), "unembed weights are already loaded");
-        self.weights = Some(Rc::new(UnembedWeights::load(
+        self.weights = Some(UnembedWeightOwner::Independent(Rc::new(UnembedWeights::load(
             device,
             store,
             self.config.affine_config(),
             bindings,
-        )?));
+        )?)));
         self.validate_weights();
         Ok(())
+    }
+
+    pub fn load_tied_weights(&mut self, weights: Rc<QuantizedEmbeddingWeights>) {
+        assert!(self.weights.is_none(), "unembed weights are already loaded");
+        self.weights = Some(UnembedWeightOwner::Tied(weights));
+        self.validate_weights();
     }
 
     pub fn unload_weights(&mut self) {
@@ -118,16 +131,21 @@ impl Unembed {
 
     fn validate_weights(&self) {
         let config = self.config.affine_config();
-        let weights = self.weights();
-        assert_eq!(weights.weight.len_bytes(), config.weight_bytes());
-        assert_eq!(weights.scales.len_bytes(), config.scale_or_bias_bytes());
-        assert_eq!(weights.biases.len_bytes(), weights.scales.len_bytes());
+        let (weight, scales, biases) = self.weight_buffers();
+        assert_eq!(weight.len_bytes(), config.weight_bytes());
+        assert_eq!(scales.len_bytes(), config.scale_or_bias_bytes());
+        assert_eq!(biases.len_bytes(), scales.len_bytes());
     }
 
-    fn weights(&self) -> &UnembedWeights {
-        self.weights
-            .as_deref()
+    fn weight_buffers(&self) -> (&Buffer, &Buffer, &Buffer) {
+        match self
+            .weights
+            .as_ref()
             .expect("unembed weights must be loaded before execution")
+        {
+            UnembedWeightOwner::Independent(weights) => (&weights.weight, &weights.scales, &weights.biases),
+            UnembedWeightOwner::Tied(weights) => weights.buffers(),
+        }
     }
 
     pub fn max_tokens(&self) -> u32 {
@@ -144,7 +162,7 @@ impl Unembed {
         Self {
             config,
             matmul: Rc::clone(&self.matmul),
-            weights: self.weights.as_ref().map(Rc::clone),
+            weights: self.weights.clone(),
         }
     }
 
@@ -177,7 +195,7 @@ impl ReplayLayer for Unembed {
         R: Recorder<'a, Operator = ReplayOp<'a>>,
     {
         self.validate_num_rows(input.num_total_rows);
-        let weights = self.weights();
+        let (weight, scales, biases) = self.weight_buffers();
         let invocation = self.matmul.invoke(
             input.num_total_rows,
             input.num_active_rows,
@@ -185,11 +203,11 @@ impl ReplayLayer for Unembed {
             0,
             input.hidden,
             0,
-            &weights.weight,
+            weight,
             0,
-            &weights.scales,
+            scales,
             0,
-            &weights.biases,
+            biases,
             0,
         );
         recorder.record_with_barrier_before(ReplayOp::opaque(invocation));
@@ -269,11 +287,11 @@ pub fn fixture_unembed(device: &Device, config: UnembedConfig) -> (Unembed, Vec<
     let unembed = Unembed {
         config,
         matmul: Rc::new(affine_quantized::Matmul::new(device, affine_config)),
-        weights: Some(Rc::new(UnembedWeights {
+        weights: Some(UnembedWeightOwner::Independent(Rc::new(UnembedWeights {
             weight: Buffer::from_slice(device, &weight_values),
             scales: bf16_buffer(&scale_values),
             biases: bf16_buffer(&bias_values),
-        })),
+        }))),
     };
     unembed.validate_weights();
     (unembed, weight_values, scale_values, bias_values)
