@@ -58,7 +58,7 @@ pub fn read_mlx_metal_header(root: &Path, rel_path: &str, included: &mut HashSet
 }
 
 fn mlx_header_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+    let mut candidates = vec![];
     if let Ok(path) = std::env::var("INFERENCE_BACKEND_METAL_MLX_SOURCE_DIR") {
         push_mlx_header_candidates(&mut candidates, PathBuf::from(path));
     }

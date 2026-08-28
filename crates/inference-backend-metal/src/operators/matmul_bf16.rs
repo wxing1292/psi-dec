@@ -8,8 +8,8 @@ use crate::metal::CompiledKernel;
 use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
-use crate::operators::mlx_headers::find_mlx_metal_header_root;
-use crate::operators::mlx_headers::read_mlx_metal_header;
+use crate::mlx_headers::find_mlx_metal_header_root;
+use crate::mlx_headers::read_mlx_metal_header;
 
 const GEMM_BM: u32 = 64;
 const GEMM_BN: u32 = 64;

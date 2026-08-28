@@ -19,6 +19,7 @@ pub mod sparse_mlp;
 pub mod dynamic_grouped_conv;
 
 pub mod embedding;
+pub mod layer_norm;
 pub mod resource_embed;
 
 pub mod gdn;

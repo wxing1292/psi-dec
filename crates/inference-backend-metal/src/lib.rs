@@ -8,6 +8,7 @@
 pub mod components;
 pub mod metal;
 pub mod operators;
+mod mlx_headers;
 mod runtime;
 
 #[cfg(test)]

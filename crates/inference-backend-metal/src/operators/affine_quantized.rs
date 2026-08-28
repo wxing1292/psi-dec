@@ -11,8 +11,8 @@ use crate::metal::Dtype;
 use crate::metal::Operator;
 use crate::metal::ReplayParameterKey;
 use crate::metal::ReplayU32;
-use crate::operators::mlx_headers::find_mlx_metal_header_root;
-use crate::operators::mlx_headers::read_mlx_metal_header;
+use crate::mlx_headers::find_mlx_metal_header_root;
+use crate::mlx_headers::read_mlx_metal_header;
 
 fn checked_product(name: &str, factors: &[usize]) -> usize {
     factors
