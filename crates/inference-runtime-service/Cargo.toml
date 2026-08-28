@@ -17,12 +17,15 @@ crossbeam-channel = { workspace = true }
 escargot = { workspace = true }
 futures-util = { workspace = true }
 hf-chat-template = { workspace = true }
+hound = { workspace = true }
 inference-executor-core = { path = "../inference-executor-core" }
 inference-executor-metal = { path = "../inference-executor-metal" }
 inference-runtime-core = { path = "../inference-runtime-core" }
 inference-runtime-proto = { path = "../inference-runtime-proto" }
 mimalloc = { workspace = true }
 ordered-float = { workspace = true }
+rubato = { workspace = true }
+rustfft = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = [

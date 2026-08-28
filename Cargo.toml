@@ -39,6 +39,7 @@ futures-util = "0.3"
 half = "2.7"
 hdrhistogram = "7.6"
 hf-chat-template = "1.0"
+hound = "3.5"
 inference-backend-metal = { path = "crates/inference-backend-metal" }
 inference-executor-core = { path = "crates/inference-executor-core" }
 inference-executor-metal = { path = "crates/inference-executor-metal" }
@@ -72,6 +73,8 @@ ordered-float = "5.3"
 prost = "0.14"
 quote = "1.0"
 rand = "0.10"
+rubato = "5.0"
+rustfft = "6.4"
 safetensors = "0.8"
 serde = "1.0"
 serde_json = "1.0"
