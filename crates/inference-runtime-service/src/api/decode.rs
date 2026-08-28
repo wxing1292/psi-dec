@@ -11,6 +11,7 @@ use inference_runtime_core::config::SamplingConfig;
 use inference_runtime_core::runtime::CompletionReason;
 use inference_runtime_core::runtime::ExternalRequest;
 use inference_runtime_core::runtime::RawRequestID;
+use inference_runtime_core::runtime::RequestInputPositions;
 use inference_runtime_core::runtime::RequestStatus;
 use inference_runtime_core::runtime::Resource;
 use inference_runtime_core::runtime::ResourcePlacement;
@@ -27,14 +28,21 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
 
         let DecodeRequest {
             tokens,
+            input_positions,
             resource_entries,
             mut sampling,
         } = request;
         merge_stop_sequences(&mut sampling.stop_sequences, &self.default_stop_sequences);
 
-        let (queued_request, external_request) =
-            self.runtime
-                .initialize_req(request_id, vec![], tokens, vec![], resource_entries, sampling)?;
+        let (queued_request, external_request) = self.runtime.initialize_req(
+            request_id,
+            vec![],
+            tokens,
+            vec![],
+            input_positions,
+            resource_entries,
+            sampling,
+        )?;
         self.runtime.submit_req(queued_request)?;
         Ok(DecodeResponse::new(external_request))
     }
@@ -42,6 +50,7 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
 
 pub struct DecodeRequest {
     tokens: Vec<Token>,
+    input_positions: Option<RequestInputPositions>,
     resource_entries: Vec<(Resource, ResourcePlacement)>,
     sampling: SamplingConfig,
 }
@@ -49,6 +58,7 @@ pub struct DecodeRequest {
 impl DecodeRequest {
     pub fn new(
         tokens: Vec<Token>,
+        input_positions: Option<RequestInputPositions>,
         resource_entries: Vec<(Resource, ResourcePlacement)>,
         sampling: SamplingConfig,
     ) -> Result<Self> {
@@ -85,6 +95,7 @@ impl DecodeRequest {
         }
         Ok(Self {
             tokens,
+            input_positions,
             resource_entries,
             sampling,
         })

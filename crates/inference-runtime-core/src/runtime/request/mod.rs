@@ -6,6 +6,9 @@ pub use status::RequestStatus;
 mod queued_request;
 pub use queued_request::QueuedRequest;
 
+mod input_positions;
+pub use input_positions::RequestInputPositions;
+
 mod internal_request;
 pub use internal_request::InternalRequest;
 

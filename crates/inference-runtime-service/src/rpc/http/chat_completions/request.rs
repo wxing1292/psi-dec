@@ -198,7 +198,7 @@ pub fn preprocess(
         seed,
         stop_sequences: vec![],
     };
-    let request = DecodeRequest::new(tokens, vec![], sampling).map_err(map_error)?;
+    let request = DecodeRequest::new(tokens, None, vec![], sampling).map_err(map_error)?;
     let tool_ids = if enable_tools {
         tools.into_iter().map(|tool| tool.tool_id().clone()).collect()
     } else {

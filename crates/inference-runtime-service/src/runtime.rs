@@ -32,6 +32,7 @@ use inference_runtime_core::runtime::InternalRequest;
 use inference_runtime_core::runtime::QueuedRequest;
 use inference_runtime_core::runtime::RawRequestID;
 use inference_runtime_core::runtime::RawRequestSlot;
+use inference_runtime_core::runtime::RequestInputPositions;
 use inference_runtime_core::runtime::RequestSlotAllocator;
 use inference_runtime_core::runtime::Resource;
 use inference_runtime_core::runtime::ResourcePlacement;
@@ -113,6 +114,10 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             model_runtime_config.context_window > min_initial_tokens,
             "runtime context window={} must exceed the minimum initial token count={min_initial_tokens}",
             model_runtime_config.context_window
+        );
+        assert!(
+            u32::try_from(model_runtime_config.context_window).is_ok(),
+            "runtime context window must fit u32"
         );
         assert!(
             scheduler_config.max_requests <= model_runtime_config.max_running_requests,
@@ -239,17 +244,25 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize_req(
         &self,
         request_id: RawRequestID,
         history_tokens: Vec<Token>,
         prompt_tokens: Vec<Token>,
         sampled_tokens: Vec<Token>,
+        input_positions: Option<RequestInputPositions>,
         resource_entries: Vec<(Resource, ResourcePlacement)>,
         sampling_config: SamplingConfig,
     ) -> Result<(RuntimeQueuedRequest<N, P, L>, ExternalRequest)> {
         let (resources, resource_placements): (Vec<_>, Vec<_>) = resource_entries.into_iter().unzip();
         let num_initial_tokens = history_tokens.len() + prompt_tokens.len() + sampled_tokens.len();
+        assert!(
+            input_positions
+                .as_ref()
+                .is_none_or(|positions| positions.initial().len() == num_initial_tokens),
+            "explicit request input positions must match the initial token count"
+        );
         let min_initial_tokens = usize::max(1, L - 1);
         if num_initial_tokens < min_initial_tokens {
             return Err(Error::invalid_argument(format!(
@@ -262,6 +275,16 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
                 "decode request initial token count={num_initial_tokens} must be less than context window={}",
                 self.model_runtime_config.context_window
             )));
+        }
+        if let Some(input_positions) = &input_positions {
+            let max_continuation_index = self.model_runtime_config.context_window - 1 - num_initial_tokens;
+            assert!(
+                input_positions
+                    .continuation_start()
+                    .iter()
+                    .all(|&position| max_continuation_index <= u32::MAX as usize - position as usize),
+                "explicit request continuation positions must fit u32 through the context window"
+            );
         }
         if sampled_tokens.len() >= sampling_config.max_sampled_tokens {
             return Err(Error::invalid_argument(format!(
@@ -285,6 +308,7 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime<N, L, P> {
             request_id,
             req_status.clone(),
             decoder_kv_blocks,
+            input_positions,
             self.resource_processor.clone(),
             token_prob_tx,
             sampling_config,
@@ -510,6 +534,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                None,
                 vec![],
                 SamplingConfig::default(),
             ),
@@ -524,6 +549,7 @@ mod tests {
                 vec![],
                 vec![Token::new(1), Token::new(2)],
                 vec![],
+                None,
                 vec![],
                 SamplingConfig::default(),
             ),
@@ -535,6 +561,7 @@ mod tests {
                 vec![],
                 vec![Token::new(1), Token::new(2), Token::new(3)],
                 vec![],
+                None,
                 vec![],
                 SamplingConfig::default(),
             )
@@ -556,6 +583,7 @@ mod tests {
                 vec![Token::new(1)],
                 vec![Token::new(2), Token::new(3)],
                 vec![Token::new(4)],
+                None,
                 vec![],
                 sampling,
             ),
@@ -578,6 +606,7 @@ mod tests {
                 vec![],
                 vec![Token::new(1)],
                 vec![Token::new(2), Token::new(3)],
+                None,
                 vec![],
                 sampling,
             ),
@@ -596,7 +625,15 @@ mod tests {
             ..SamplingConfig::default()
         };
         let (queued_request, external_request) = runtime
-            .initialize_req(1, vec![], vec![Token::new(1), Token::new(2)], vec![], vec![], sampling)
+            .initialize_req(
+                1,
+                vec![],
+                vec![Token::new(1), Token::new(2)],
+                vec![],
+                None,
+                vec![],
+                sampling,
+            )
             .unwrap();
         let (request_slot_allocator, _request_slot_reset_rx) = RequestSlotAllocator::new(1);
         let request_slot = match request_slot_allocator.allocate() {
@@ -655,7 +692,13 @@ mod tests {
         let mut response = Box::pin(
             inference
                 .decode(
-                    DecodeRequest::new(vec![Token::new(1), Token::new(2), Token::new(3)], vec![], sampling).unwrap(),
+                    DecodeRequest::new(
+                        vec![Token::new(1), Token::new(2), Token::new(3)],
+                        None,
+                        vec![],
+                        sampling,
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
         );
@@ -717,6 +760,7 @@ mod tests {
                 vec![],
                 vec![Token::new(1)],
                 vec![],
+                None,
                 vec![],
                 SamplingConfig::default(),
             )
@@ -856,6 +900,7 @@ mod tests {
                 vec![],
                 vec![Token::new(1), Token::new(2), Token::new(3)],
                 vec![],
+                None,
                 vec![],
                 sampling,
             )

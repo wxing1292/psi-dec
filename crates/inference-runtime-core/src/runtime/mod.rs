@@ -9,6 +9,7 @@ pub use request::CompletionReason;
 pub use request::ExternalRequest;
 pub use request::InternalRequest;
 pub use request::QueuedRequest;
+pub use request::RequestInputPositions;
 pub use request::RequestSlot;
 pub use request::RequestSlotAllocationResult;
 pub use request::RequestSlotAllocator;

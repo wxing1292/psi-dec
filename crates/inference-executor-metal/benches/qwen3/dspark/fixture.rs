@@ -275,6 +275,7 @@ impl Fixture {
                         spec_tokens: request.spec_tokens.clone(),
                     },
                     DecoderSyncBlocks::new(0, vec![vec![self.kv_page_ids(request.req_slot)]], Vec::new()),
+                    None,
                     vec![],
                     SamplingConfig {
                         max_sampled_tokens: usize::MAX,

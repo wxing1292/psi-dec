@@ -354,6 +354,7 @@ impl MainFixture {
                         ]],
                         Vec::new(),
                     ),
+                    None,
                     vec![],
                     SamplingConfig {
                         max_sampled_tokens: usize::MAX,

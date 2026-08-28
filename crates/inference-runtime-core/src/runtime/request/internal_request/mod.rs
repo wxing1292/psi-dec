@@ -7,6 +7,7 @@ use async_channel::TrySendError;
 use crate::config::SamplingConfig;
 use crate::runtime::RawRequestID;
 use crate::runtime::RawRequestSlot;
+use crate::runtime::RequestInputPositions;
 use crate::runtime::RequestSlot;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
@@ -30,6 +31,7 @@ where
     req_slot: RequestSlot,
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+    input_positions: Option<RequestInputPositions>,
     resource_processor: Arc<ResourceProcessor>,
     in_flight_computes: VecDeque<ComputePhase>,
     num_in_flight_blocking_async_tasks: usize,
@@ -50,6 +52,7 @@ where
         req_slot: RequestSlot,
         req_status: AtomicRequestStatus,
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+        input_positions: Option<RequestInputPositions>,
         resource_processor: Arc<ResourceProcessor>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
@@ -60,6 +63,7 @@ where
             req_slot,
             req_status,
             decoder_blocks,
+            input_positions,
             resource_processor,
             in_flight_computes: VecDeque::new(),
             num_in_flight_blocking_async_tasks: 0,

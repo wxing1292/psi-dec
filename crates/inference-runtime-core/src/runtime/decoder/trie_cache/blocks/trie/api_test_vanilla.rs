@@ -558,6 +558,7 @@ fn test_prepare_resource_not_found_vanilla() {
         request_slot,
         AtomicRequestStatus::new(),
         blocks,
+        None,
         Arc::new(ResourceProcessor::new()),
         token_prob_tx,
         SamplingConfig::default(),

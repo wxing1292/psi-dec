@@ -4,6 +4,7 @@ use async_channel::Sender;
 
 use crate::config::SamplingConfig;
 use crate::runtime::RawRequestID;
+use crate::runtime::RequestInputPositions;
 use crate::runtime::RequestSlot;
 use crate::runtime::decoder::trie_cache::MultiLaneBlockCache;
 use crate::runtime::decoder::trie_cache::TrieDecoderBlocks;
@@ -19,6 +20,7 @@ where
     req_id: RawRequestID,
     req_status: AtomicRequestStatus,
     decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+    input_positions: Option<RequestInputPositions>,
     resource_processor: Arc<ResourceProcessor>,
     token_prob_tx: Sender<TokenProbs>,
     sampling_config: SamplingConfig,
@@ -34,6 +36,7 @@ where
         req_id: RawRequestID,
         req_status: AtomicRequestStatus,
         decoder_blocks: TrieDecoderBlocks<N, P, L, DBC>,
+        input_positions: Option<RequestInputPositions>,
         resource_processor: Arc<ResourceProcessor>,
         token_prob_tx: Sender<TokenProbs>,
         sampling_config: SamplingConfig,
@@ -43,6 +46,7 @@ where
             req_id,
             req_status,
             decoder_blocks,
+            input_positions,
             resource_processor,
             token_prob_tx,
             sampling_config,
@@ -65,6 +69,7 @@ where
             req_id,
             req_status,
             decoder_blocks,
+            input_positions,
             resource_processor,
             token_prob_tx,
             sampling_config,
@@ -75,6 +80,7 @@ where
             req_slot,
             req_status,
             decoder_blocks,
+            input_positions,
             resource_processor,
             token_prob_tx,
             sampling_config,

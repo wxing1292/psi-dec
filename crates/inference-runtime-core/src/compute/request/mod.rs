@@ -38,6 +38,7 @@ pub struct DeviceRequest {
     pub req_slot: RawRequestSlot,
     pub decoder_query_tokens: QueryTokens,
     pub decoder_sync_blocks: DecoderSyncBlocks,
+    pub input_positions: Option<Vec<[u32; 3]>>,
     pub resource_placements: Vec<DeviceResourcePlacement>,
     pub sampling_config: SamplingConfig,
 }
@@ -48,6 +49,7 @@ impl DeviceRequest {
         req_slot: RawRequestSlot,
         decoder_query_tokens: QueryTokens,
         decoder_sync_blocks: DecoderSyncBlocks,
+        input_positions: Option<Vec<[u32; 3]>>,
         resource_placements: Vec<DeviceResourcePlacement>,
         sampling_config: SamplingConfig,
     ) -> Self {
@@ -56,6 +58,7 @@ impl DeviceRequest {
             req_slot,
             decoder_query_tokens,
             decoder_sync_blocks,
+            input_positions,
             resource_placements,
             sampling_config,
         }
