@@ -2,6 +2,7 @@ use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use inference_backend_metal::MetalRuntime;
 use inference_backend_metal::metal::Buffer;
@@ -13,6 +14,10 @@ use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3::init_qwen3_model_config;
 use inference_executor_core::model::qwen::v3::weight_layout::Qwen3ModelWeightBindings;
 use inference_executor_core::model::qwen::v3::weight_layout::resolve_qwen3_model_weight_bindings;
+use inference_executor_core::model::qwen::v3_asr::Qwen3ASRModelConfig;
+use inference_executor_core::model::qwen::v3_asr::audio_output_rows;
+use inference_executor_core::model::qwen::v3_asr::init_qwen3_asr_config;
+use inference_executor_core::model::qwen::v3_asr::weight_layout::resolve_qwen3_asr_weight_bindings;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkMainConfig;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
@@ -28,8 +33,10 @@ use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
+use crate::model::qwen::v3::executor::Qwen3Checkpoint;
 use crate::model::qwen::v3::executor::Qwen3DSparkSpeculator;
 use crate::model::qwen::v3::executor::Qwen3Executor;
+use crate::model::qwen::v3::executor::Qwen3InputEmbedding;
 use crate::model::qwen::v3::executor::Qwen3PendingTransactions;
 use crate::model::qwen::v3::executor::Qwen3Speculator;
 use crate::model::qwen::v3::executor::Qwen3WeightSource;
@@ -43,10 +50,12 @@ use crate::model::qwen::v3::main::embed::Qwen3MainEmbed;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayerScratch;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembed;
+use crate::model::qwen::v3_asr::Qwen3ASRAudioProcessor;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
 use crate::model::qwen::v3_x::dspark::load::load_qwen3x_dspark;
+use crate::model::resource_arena::MetalResourceArena;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
@@ -204,6 +213,10 @@ impl Qwen3ModelLayout {
 
 enum Qwen3InitMode<'a> {
     Vanilla,
+    Asr {
+        config: Box<Qwen3ASRModelConfig>,
+        resource_arena: Arc<MetalResourceArena>,
+    },
     DSpark {
         model_dir: &'a Path,
         config: Box<Qwen3xDSparkConfig>,
@@ -220,7 +233,48 @@ pub fn init_qwen_3_model(
     model_dir: impl AsRef<Path>,
     config: Qwen3ExecutorConfig,
 ) -> Result<Qwen3Executor, ModelExecutorError> {
+    config.validate();
     init_qwen_3_model_inner(model_dir.as_ref(), Qwen3InitMode::Vanilla, config)
+}
+
+pub struct Qwen3ASRLoaded {
+    pub executor: Qwen3Executor,
+    pub audio_processor: Arc<Qwen3ASRAudioProcessor>,
+}
+
+pub fn init_qwen3_asr_model(
+    model_dir: impl AsRef<Path>,
+    config: Qwen3ExecutorConfig,
+) -> Result<Qwen3ASRLoaded, ModelExecutorError> {
+    config.validate();
+    let model_dir = model_dir.as_ref();
+    let model_config = init_qwen3_asr_config(model_dir)?;
+    let store = SafeTensorStore::from_model_dir(model_dir)?;
+    let bindings = resolve_qwen3_asr_weight_bindings(&model_config, store.index().tensor_names())?;
+    let max_resource_tokens = audio_output_rows(model_config.preprocessor.max_frames);
+    let hidden_dim_bytes = model_config
+        .text
+        .hidden_size
+        .checked_mul(Dtype::Bfloat16.item_size())
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3-ASR hidden row byte length must fit usize"))?;
+    let arena_capacity_bytes = config
+        .max_requests
+        .checked_mul(max_resource_tokens)
+        .and_then(|tokens| tokens.checked_mul(hidden_dim_bytes))
+        .ok_or_else(|| ModelExecutorError::custom("Qwen3-ASR resource arena capacity must fit usize"))?;
+    let audio_processor = Qwen3ASRAudioProcessor::load(model_dir, &model_config, &bindings, arena_capacity_bytes)?;
+    let executor = init_qwen_3_model_inner(
+        model_dir,
+        Qwen3InitMode::Asr {
+            config: Box::new(model_config),
+            resource_arena: audio_processor.arena(),
+        },
+        config,
+    )?;
+    Ok(Qwen3ASRLoaded {
+        executor,
+        audio_processor,
+    })
 }
 
 pub fn init_qwen_3_model_with_dspark(
@@ -228,6 +282,7 @@ pub fn init_qwen_3_model_with_dspark(
     dspark_model_dir: impl AsRef<Path>,
     config: Qwen3ExecutorConfig,
 ) -> Result<Qwen3Executor, ModelExecutorError> {
+    config.validate();
     let dspark_model_dir = dspark_model_dir.as_ref();
     let dspark_config = init_qwen3x_dspark_config(dspark_model_dir)?;
     let num_spec_tokens = dspark_config.num_spec_tokens();
@@ -247,13 +302,17 @@ fn init_qwen_3_model_inner(
     init_mode: Qwen3InitMode<'_>,
     config: Qwen3ExecutorConfig,
 ) -> Result<Qwen3Executor, ModelExecutorError> {
-    config.validate();
-    let model_config = init_qwen3_model_config(model_dir)?;
+    let checkpoint = match &init_mode {
+        Qwen3InitMode::Asr { config, .. } => Qwen3Checkpoint::Asr(config.clone()),
+        Qwen3InitMode::Vanilla | Qwen3InitMode::DSpark { .. } => {
+            Qwen3Checkpoint::Text(init_qwen3_model_config(model_dir)?)
+        },
+    };
     if let Qwen3InitMode::DSpark {
         config: dspark_config, ..
     } = &init_mode
     {
-        let text = &model_config.text_config;
+        let text = checkpoint.text();
         dspark_config.validate_main(Qwen3xDSparkMainConfig {
             hidden_size: text.hidden_size,
             num_hidden_layers: text.num_hidden_layers,
@@ -262,22 +321,32 @@ fn init_qwen_3_model_inner(
             rope_theta: text.rope_theta,
         })?;
     }
-    let generation_config = HFGenerationConfig::load(model_dir)?;
-    let eos_token_ids = if generation_config.eos_token_ids().is_empty() {
-        model_config.eos_token_ids()
-    } else {
-        generation_config.eos_token_ids()
+    let eos_token_ids = match &checkpoint {
+        Qwen3Checkpoint::Text(model_config) => {
+            let generation_config = HFGenerationConfig::load(model_dir)?;
+            if generation_config.eos_token_ids().is_empty() {
+                model_config.eos_token_ids().to_vec()
+            } else {
+                generation_config.eos_token_ids().to_vec()
+            }
+        },
+        Qwen3Checkpoint::Asr(model_config) => model_config.generation.eos_token_ids.clone(),
     };
     let default_stop_sequences = eos_token_ids
         .iter()
         .map(|&token_id| vec![Token::new(token_id)])
         .collect();
 
-    let text = &model_config.text_config;
-    let quantization = model_config
-        .quantization
-        .as_ref()
-        .ok_or_else(|| ModelExecutorError::custom("qwen3 replay model requires quantization config"))?;
+    let text = checkpoint.text();
+    let quantization = match &checkpoint {
+        Qwen3Checkpoint::Text(model_config) => {
+            model_config
+                .quantization
+                .as_ref()
+                .ok_or_else(|| ModelExecutorError::custom("qwen3 replay model requires quantization config"))?
+        },
+        Qwen3Checkpoint::Asr(model_config) => &model_config.quantization,
+    };
     let main_config = Qwen3MainConfig {
         text,
         quantization,
@@ -306,7 +375,17 @@ fn init_qwen_3_model_inner(
     let device = Device::system_default();
     let runtime = MetalRuntime::new(device.clone());
     let mut store = SafeTensorStore::from_model_dir(model_dir)?;
-    let weight_bindings = resolve_qwen3_model_weight_bindings(&model_config, store.index().tensor_names())?;
+    let (embed_bindings, main_bindings, unembed_bindings) = match &checkpoint {
+        Qwen3Checkpoint::Text(model_config) => {
+            let Qwen3ModelWeightBindings { embed, main, unembed } =
+                resolve_qwen3_model_weight_bindings(model_config, store.index().tensor_names())?;
+            (embed, main, Some(unembed))
+        },
+        Qwen3Checkpoint::Asr(model_config) => {
+            let bindings = resolve_qwen3_asr_weight_bindings(model_config, store.index().tensor_names())?;
+            (bindings.embed, bindings.text, None)
+        },
+    };
     let main_gqa_state = Qwen3MainGQAState::new(
         &device,
         main_gqa_core,
@@ -328,11 +407,6 @@ fn init_qwen_3_model_inner(
         config.max_tokens,
     ));
 
-    let Qwen3ModelWeightBindings {
-        embed: embed_bindings,
-        main: main_bindings,
-        unembed: unembed_bindings,
-    } = weight_bindings;
     let mut embed = Embed::new(&device, layout.embedding_config());
     embed.load_weights(&device, &mut store, embed_bindings)?;
     let embed = Rc::new(embed);
@@ -340,7 +414,10 @@ fn init_qwen_3_model_inner(
     let hidden_output = Rc::new(Buffer::new_zeroed(&device, layout.hidden_bytes()));
     let unembed_config = layout.unembed_config();
     let mut unembed = Unembed::new(&device, unembed_config);
-    unembed.load_weights(&device, &mut store, unembed_bindings)?;
+    match unembed_bindings {
+        Some(unembed_bindings) => unembed.load_weights(&device, &mut store, unembed_bindings)?,
+        None => unembed.load_tied_weights(embed.tied_weights()),
+    }
     let gather_unembed = Qwen3GatherUnembed::new(&device, unembed_config.hidden_dim, Rc::new(unembed));
     let sampler_bounds = TopKSamplingBounds {
         max_sampling_inputs: layout.max_tokens,
@@ -354,7 +431,7 @@ fn init_qwen_3_model_inner(
         config.max_requests as u32,
     ));
     let spec_load = match &init_mode {
-        Qwen3InitMode::Vanilla => Qwen3SpecLoad::Vanilla,
+        Qwen3InitMode::Vanilla | Qwen3InitMode::Asr { .. } => Qwen3SpecLoad::Vanilla,
         Qwen3InitMode::DSpark {
             model_dir: dspark_model_dir,
             config: dspark_config,
@@ -441,6 +518,7 @@ fn init_qwen_3_model_inner(
         .expect("Qwen3 Main cache-lane page IDs per block must fit usize");
     let weight_source = match &init_mode {
         Qwen3InitMode::Vanilla => Qwen3WeightSource::Vanilla,
+        Qwen3InitMode::Asr { .. } => Qwen3WeightSource::Vanilla,
         Qwen3InitMode::DSpark { model_dir, config, .. } => {
             Qwen3WeightSource::DSpark {
                 model_dir: model_dir.to_path_buf(),
@@ -448,11 +526,29 @@ fn init_qwen_3_model_inner(
             }
         },
     };
+    let input_embedding = match &init_mode {
+        Qwen3InitMode::Vanilla | Qwen3InitMode::DSpark { .. } => Qwen3InputEmbedding::Text,
+        Qwen3InitMode::Asr { resource_arena, .. } => {
+            Qwen3InputEmbedding::resource(
+                &device,
+                inference_backend_metal::components::resource_embed::Config {
+                    hidden_dim: layout.hidden_dim,
+                    io_dtype: layout.hidden_dtype,
+                },
+                Arc::clone(resource_arena),
+                config.max_tokens,
+            )
+        },
+    };
+    let model_name = match &checkpoint {
+        Qwen3Checkpoint::Text(_) => "qwen3",
+        Qwen3Checkpoint::Asr(_) => "qwen3_asr",
+    };
     Ok(Qwen3Executor {
-        model_name: "qwen3".to_string(),
+        model_name: model_name.to_string(),
         model_dir: model_dir.to_path_buf(),
         weight_source,
-        model_config,
+        checkpoint,
         default_stop_sequences,
         config,
         runtime,
@@ -464,6 +560,7 @@ fn init_qwen_3_model_inner(
         unembed_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
         unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
         main_embed: Replay::new("qwen3 MainEmbed", Qwen3MainEmbed::new(embed)),
+        input_embedding,
         main: Replay::new("qwen3 Main", main),
         gather_unembed: Replay::new("qwen3 GatherUnembed", gather_unembed),
         sampling: Replay::new("qwen3 sampling", Sampling::new(Rc::clone(&sampler))),

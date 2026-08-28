@@ -67,7 +67,17 @@ impl Qwen3Executor {
     }
 
     pub fn model_config(&self) -> &Qwen3ModelConfig {
-        &self.model_config
+        match &self.checkpoint {
+            Qwen3Checkpoint::Text(config) => config,
+            Qwen3Checkpoint::Asr(_) => panic!("Qwen3-ASR does not contain a plain Qwen3 model config"),
+        }
+    }
+
+    pub fn asr_model_config(&self) -> &Qwen3ASRModelConfig {
+        match &self.checkpoint {
+            Qwen3Checkpoint::Text(_) => panic!("plain Qwen3 does not contain a Qwen3-ASR model config"),
+            Qwen3Checkpoint::Asr(config) => config,
+        }
     }
 
     pub fn num_spec_tokens(&self) -> usize {

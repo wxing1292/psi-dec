@@ -359,7 +359,7 @@ fn normalize_text(raw: TextCheckpointConfig) -> Result<Qwen3TextConfig, ModelExe
             "Qwen3-ASR text dimensions and scalar parameters must be positive and finite",
         ));
     }
-    if raw.num_attention_heads * raw.head_dim != raw.hidden_size
+    if raw.num_attention_heads.checked_mul(raw.head_dim) != Some(raw.hidden_size)
         || !raw.num_attention_heads.is_multiple_of(raw.num_key_value_heads)
     {
         return Err(ModelExecutorError::custom(

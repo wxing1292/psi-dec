@@ -28,6 +28,9 @@ use inference_executor_core::model::qwen::v3::sample_token_positions;
 use inference_executor_core::model::qwen::v3::to_core_batch_resp;
 use inference_executor_core::model::qwen::v3::weight_layout::Qwen3ModelWeightBindings;
 use inference_executor_core::model::qwen::v3::weight_layout::resolve_qwen3_model_weight_bindings;
+use inference_executor_core::model::qwen::v3_asr::Qwen3ASRModelConfig;
+use inference_executor_core::model::qwen::v3_asr::weight_layout::Qwen3ASRWeightBindings;
+use inference_executor_core::model::qwen::v3_asr::weight_layout::resolve_qwen3_asr_weight_bindings;
 use inference_executor_core::model::qwen::v3_x::dspark::Qwen3xDSparkConfig;
 use inference_executor_core::sampling::RequestSamplingState;
 use inference_executor_core::sampling::SamplerConfig;
@@ -84,12 +87,16 @@ use crate::sampling::top_k_sampling::TopKSampling;
 use crate::sampling::top_k_sampling::TopKSamplingOutputBuffers;
 use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
+mod input;
 mod load;
 
+use input::Qwen3InputEmbedding;
+pub use load::Qwen3ASRLoaded;
 pub use load::Qwen3ExecutorConfig;
 use load::Qwen3ModelLayout;
 pub use load::init_qwen_3_model;
 pub use load::init_qwen_3_model_with_dspark;
+pub use load::init_qwen3_asr_model;
 
 include!("batch.rs");
 include!("dspark.rs");
@@ -124,6 +131,20 @@ enum Qwen3WeightSource {
         model_dir: PathBuf,
         config: Box<Qwen3xDSparkConfig>,
     },
+}
+
+enum Qwen3Checkpoint {
+    Text(Qwen3ModelConfig),
+    Asr(Box<Qwen3ASRModelConfig>),
+}
+
+impl Qwen3Checkpoint {
+    fn text(&self) -> &inference_executor_core::model::qwen::v3::Qwen3TextConfig {
+        match self {
+            Self::Text(config) => &config.text_config,
+            Self::Asr(config) => &config.text,
+        }
+    }
 }
 
 struct Qwen3DSparkSpeculator {
@@ -265,7 +286,7 @@ pub struct Qwen3Executor {
     model_name: String,
     model_dir: PathBuf,
     weight_source: Qwen3WeightSource,
-    model_config: Qwen3ModelConfig,
+    checkpoint: Qwen3Checkpoint,
     default_stop_sequences: Vec<Vec<Token>>,
     config: Qwen3ExecutorConfig,
     runtime: MetalRuntime,
@@ -277,6 +298,7 @@ pub struct Qwen3Executor {
     unembed_hidden: Buffer,
     unembed_logits: Buffer,
     main_embed: Replay<Qwen3MainEmbed>,
+    input_embedding: Qwen3InputEmbedding,
     main: Replay<Qwen3Main>,
     gather_unembed: Replay<Qwen3GatherUnembed>,
     sampling: Replay<Sampling>,
@@ -304,6 +326,7 @@ impl Qwen3Executor {
 
     pub fn clear_replay_cache(&mut self) {
         self.main_embed.clear();
+        self.input_embedding.clear();
         self.main.clear();
         self.gather_unembed.clear();
         self.sampling.clear();
@@ -334,8 +357,18 @@ impl Qwen3Executor {
     pub fn load_weights(&mut self) -> Result<(), ModelExecutorError> {
         let device = self.runtime.device().clone();
         let mut store = SafeTensorStore::from_model_dir(&self.model_dir)?;
-        let Qwen3ModelWeightBindings { embed, main, unembed } =
-            resolve_qwen3_model_weight_bindings(&self.model_config, store.index().tensor_names())?;
+        let (embed, main, unembed) = match &self.checkpoint {
+            Qwen3Checkpoint::Text(config) => {
+                let Qwen3ModelWeightBindings { embed, main, unembed } =
+                    resolve_qwen3_model_weight_bindings(config, store.index().tensor_names())?;
+                (embed, main, Some(unembed))
+            },
+            Qwen3Checkpoint::Asr(config) => {
+                let Qwen3ASRWeightBindings { embed, text, .. } =
+                    resolve_qwen3_asr_weight_bindings(config, store.index().tensor_names())?;
+                (embed, text, None)
+            },
+        };
 
         let mut loaded_embed = self
             .unloaded_embed
@@ -347,11 +380,14 @@ impl Qwen3Executor {
             .unloaded_unembed
             .take()
             .expect("qwen3 Main unembed shell must exist during weight loading");
-        loaded_unembed.load_weights(&device, &mut store, unembed)?;
+        match unembed {
+            Some(unembed) => loaded_unembed.load_weights(&device, &mut store, unembed)?,
+            None => loaded_unembed.load_tied_weights(loaded_embed.tied_weights()),
+        }
         let loaded_unembed = Rc::new(loaded_unembed);
         self.main
             .component_mut()
-            .load_weights(&device, &mut store, &self.model_config.text_config, main)?;
+            .load_weights(&device, &mut store, self.checkpoint.text(), main)?;
 
         let residual_capture = match (&mut self.speculator, &self.weight_source) {
             (Qwen3Speculator::Vanilla, Qwen3WeightSource::Vanilla) => None,
@@ -468,6 +504,8 @@ impl Qwen3Executor {
 pub struct Qwen3ModelOpsRecorder {
     main_embed_key: Qwen3MainEmbedReplayKey,
     main_embed_arguments: ReplayArguments,
+    resource_embed_key: Option<inference_backend_metal::components::resource_embed::Shape>,
+    resource_embed_arguments: ReplayArguments,
     main_key: Qwen3MainReplayKey,
     main_arguments: ReplayArguments,
     gather_unembed_key: Option<Qwen3GatherUnembedReplayKey>,
@@ -541,9 +579,13 @@ impl ReplayableModel for Qwen3Executor {
     }
 
     fn model_mode(&self) -> &'static str {
-        match &self.speculator {
-            Qwen3Speculator::Vanilla => "vanilla",
-            Qwen3Speculator::DSpark(_) => "dspark",
+        match (&self.checkpoint, &self.speculator) {
+            (Qwen3Checkpoint::Text(_), Qwen3Speculator::Vanilla) => "vanilla",
+            (Qwen3Checkpoint::Text(_), Qwen3Speculator::DSpark(_)) => "dspark",
+            (Qwen3Checkpoint::Asr(_), Qwen3Speculator::Vanilla) => "asr",
+            (Qwen3Checkpoint::Asr(_), Qwen3Speculator::DSpark(_)) => {
+                panic!("Qwen3-ASR does not support DSpark")
+            },
         }
     }
 
@@ -607,6 +649,7 @@ impl ReplayableModel for Qwen3Executor {
             num_main_total_tokens,
         );
         debug_assert_eq!(gqa_shape.num_tokens as usize, microbatch.total_tokens());
+        self.input_embedding.prepare(&core_batch_req.dev_reqs);
         model_batch_request
     }
 
@@ -626,6 +669,12 @@ impl ReplayableModel for Qwen3Executor {
             .try_into()
             .expect("qwen3 Main token count must fit u32");
         let (main_embed_key, main_embed_arguments) = self.main_embed.component().prepare_replay(num_main_active_tokens);
+        let (resource_embed_key, resource_embed_arguments) = self
+            .input_embedding
+            .prepare_replay()
+            .map_or((None, ReplayArguments::new()), |(key, arguments)| {
+                (Some(key), arguments)
+            });
         let (main_key, mut main_arguments) = self.main.component().prepare_replay(
             num_main_active_tokens,
             self.main_gqa_state.metadata().replay_shape(),
@@ -635,6 +684,8 @@ impl ReplayableModel for Qwen3Executor {
         Qwen3ModelOpsRecorder {
             main_embed_key,
             main_embed_arguments,
+            resource_embed_key,
+            resource_embed_arguments,
             main_key,
             main_arguments,
             dspark_spec_prefill: None,
@@ -669,6 +720,11 @@ impl ReplayableModel for Qwen3Executor {
         assert_eq!(
             recorded_key, recorder.main_embed_key,
             "qwen3 MainEmbed replay input must match the prepared replay key"
+        );
+        let resource_embed_key = self.input_embedding.record(&runtime, &self.token_hidden_input);
+        assert_eq!(
+            resource_embed_key, recorder.resource_embed_key,
+            "Qwen3 ResourceEmbed replay input must match the prepared replay key"
         );
         Rc::clone(&self.token_hidden_input)
     }
@@ -897,9 +953,19 @@ fn num_page_ids_per_block(num_tokens_per_block: usize, num_tokens_per_page: usiz
 mod tests {
     use inference_executor_core::model::ReplayableModel;
     use inference_executor_core::model::qwen::v3::Qwen3ModelBatchRequest;
+    use inference_executor_core::model::qwen::v3_asr::audio_output_rows;
+    use inference_runtime_core::compute::BatchDeviceRequest;
+    use inference_runtime_core::compute::DecoderSyncBlocks;
+    use inference_runtime_core::compute::DeviceRequest;
+    use inference_runtime_core::compute::DeviceResourcePlacement;
+    use inference_runtime_core::compute::QueryTokens;
+    use inference_runtime_core::config::SamplingConfig;
+    use inference_runtime_core::memory::BlockAllocator;
+    use inference_runtime_core::runtime::Token;
 
     use super::Qwen3Executor;
     use super::Qwen3ExecutorConfig;
+    use super::init_qwen3_asr_model;
 
     #[test]
     fn test_executor_config_supports_qwen3_batch_contract() {
@@ -913,5 +979,78 @@ mod tests {
         .validate();
         fn assert_compact_qwen3_batch<T: ReplayableModel<ModelBatchRequest = Qwen3ModelBatchRequest>>() {}
         assert_compact_qwen3_batch::<Qwen3Executor>();
+    }
+
+    #[test]
+    #[ignore = "requires PSI_DEC_QWEN3_ASR_MODEL_DIR and the pinned local checkpoint"]
+    fn test_qwen3_asr_replaces_placeholder_embedding_before_text_decoder() {
+        let model_dir = std::env::var("PSI_DEC_QWEN3_ASR_MODEL_DIR").unwrap();
+        let mut loaded = init_qwen3_asr_model(
+            model_dir,
+            Qwen3ExecutorConfig {
+                max_requests: 1,
+                max_tokens: 16,
+                max_tokens_per_request: 16,
+                num_cache_pages: 64,
+                num_tokens_per_block: 1024,
+            },
+        )
+        .unwrap();
+        let config = loaded.executor.asr_model_config();
+
+        assert_eq!(loaded.executor.model_name(), "qwen3_asr");
+        assert_eq!(loaded.executor.model_mode(), "asr");
+        assert_eq!(config.text.hidden_size, 2048);
+        assert_eq!(
+            loaded.audio_processor.arena().storage().buffer().len_bytes(),
+            audio_output_rows(config.preprocessor.max_frames)
+                * config.text.hidden_size
+                * std::mem::size_of::<half::bf16>()
+        );
+
+        let hidden_dim = config.text.hidden_size;
+        let replacement = half::bf16::from_f32(0.5).to_bits();
+        let mut allocation = loaded
+            .audio_processor
+            .arena()
+            .alloc_segment(hidden_dim * std::mem::size_of::<half::bf16>())
+            .unwrap();
+        for bytes in allocation.slice_mut().as_chunks_mut::<2>().0 {
+            bytes.copy_from_slice(&replacement.to_ne_bytes());
+        }
+        let page_ids = vec![0; loaded.executor.num_kv_page_ids_per_block()];
+        let core_batch = BatchDeviceRequest::new(
+            0,
+            [DeviceRequest::new(
+                0,
+                0,
+                QueryTokens::Prefill {
+                    epoch: 0,
+                    token_index: 0,
+                    tokens: vec![Token::new(1), Token::new(config.audio_token_id)],
+                    window: 2,
+                },
+                DecoderSyncBlocks::new(0, vec![vec![page_ids]], vec![]),
+                vec![DeviceResourcePlacement::new(
+                    allocation.offset_bytes(),
+                    allocation.len_bytes(),
+                    vec![(1, 0, 1)],
+                )],
+                SamplingConfig::default(),
+            )],
+        );
+        let model_batch = loaded.executor.prepare_batch(&core_batch);
+        let mut recorder = loaded.executor.begin_ops_recording(&model_batch);
+        let hidden = loaded.executor.embed_main(&mut recorder, &model_batch);
+        loaded.executor.forward_main(&mut recorder, &model_batch, hidden);
+        loaded.executor.submit_main(&recorder).wait();
+
+        assert_eq!(
+            loaded
+                .executor
+                .token_hidden_input
+                .read_typed::<u16>(hidden_dim, hidden_dim),
+            vec![replacement; hidden_dim]
+        );
     }
 }
