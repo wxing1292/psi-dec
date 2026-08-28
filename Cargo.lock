@@ -1209,6 +1209,8 @@ dependencies = [
 name = "inference-executor-metal"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
+ "futures-lite",
  "half",
  "inference-backend-metal",
  "inference-executor-core",

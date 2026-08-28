@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-channel = { workspace = true }
 half = { workspace = true }
 inference-backend-metal = { workspace = true }
 inference-executor-core = { workspace = true }
@@ -92,4 +93,5 @@ path = "benches/qwen35/vanilla_prefill_decode.rs"
 harness = false
 
 [dev-dependencies]
+futures-lite = { workspace = true }
 libc = { workspace = true }
