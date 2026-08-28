@@ -34,6 +34,7 @@ use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
+use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::v3_5::component_config::Qwen35MetalDefaults;
@@ -899,6 +900,7 @@ fn init_qwen_3_5_model_inner(
         unembed_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
         unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
         main_embed: Replay::new("qwen3.5 MainEmbed", Qwen35MainEmbed::new(Rc::clone(&embed))),
+        input_embedding: InputEmbedding::Text,
         main: Replay::new("qwen3.5 Main", main),
         gather_unembed: Replay::new("qwen3.5 GatherUnembed", gather_unembed),
         sampling: Replay::new("qwen3.5 sampling", Sampling::new(Rc::clone(&sampler))),

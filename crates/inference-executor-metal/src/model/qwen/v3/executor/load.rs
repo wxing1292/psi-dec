@@ -31,12 +31,12 @@ use crate::checkpoint::SafeTensorStore;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
+use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::v3::executor::Qwen3Checkpoint;
 use crate::model::qwen::v3::executor::Qwen3DSparkSpeculator;
 use crate::model::qwen::v3::executor::Qwen3Executor;
-use crate::model::qwen::v3::executor::Qwen3InputEmbedding;
 use crate::model::qwen::v3::executor::Qwen3PendingTransactions;
 use crate::model::qwen::v3::executor::Qwen3Speculator;
 use crate::model::qwen::v3::executor::Qwen3WeightSource;
@@ -527,9 +527,9 @@ fn init_qwen_3_model_inner(
         },
     };
     let input_embedding = match &init_mode {
-        Qwen3InitMode::Vanilla | Qwen3InitMode::DSpark { .. } => Qwen3InputEmbedding::Text,
+        Qwen3InitMode::Vanilla | Qwen3InitMode::DSpark { .. } => InputEmbedding::Text,
         Qwen3InitMode::Asr { resource_arena, .. } => {
-            Qwen3InputEmbedding::resource(
+            InputEmbedding::resource(
                 &device,
                 inference_backend_metal::components::resource_embed::Config {
                     hidden_dim: layout.hidden_dim,

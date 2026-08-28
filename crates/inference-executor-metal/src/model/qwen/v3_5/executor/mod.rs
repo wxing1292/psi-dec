@@ -91,6 +91,7 @@ use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
+use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::apply_main_gpu_timing;
@@ -626,6 +627,7 @@ pub struct Qwen35Executor {
     unembed_hidden: Buffer,
     unembed_logits: Buffer,
     main_embed: Replay<Qwen35MainEmbed>,
+    input_embedding: InputEmbedding,
     main: Replay<Qwen35Main>,
     gather_unembed: Replay<Qwen35GatherUnembed>,
     sampling: Replay<Sampling>,
@@ -745,6 +747,7 @@ impl Qwen35Executor {
     pub fn clear_replay_cache(&mut self) {
         self.finish_cache_publish();
         self.main_embed.clear();
+        self.input_embedding.clear();
         self.main.clear();
         self.gather_unembed.clear();
         self.sampling.clear();
@@ -911,6 +914,8 @@ impl Qwen35Executor {
 pub struct Qwen35ModelOpsRecorder {
     main_embed_key: Qwen35MainEmbedReplayKey,
     main_embed_arguments: ReplayArguments,
+    resource_embed_key: Option<inference_backend_metal::components::resource_embed::Shape>,
+    resource_embed_arguments: ReplayArguments,
     main_key: Qwen35MainReplayKey,
     main_arguments: ReplayArguments,
     main_embed_cache_hit: bool,
@@ -1114,6 +1119,7 @@ impl ReplayableModel for Qwen35Executor {
         );
         let gqa_elapsed = gqa_start.elapsed();
         debug_assert_eq!(gqa_shape.num_tokens as usize, microbatch.total_tokens());
+        self.input_embedding.prepare(&core_batch_req.dev_reqs);
         let gdn_states_start = Instant::now();
         let gdn_prepared = self.main_gdn_state.prepare_states(
             microbatch.req_slots(),
@@ -1172,6 +1178,12 @@ impl ReplayableModel for Qwen35Executor {
             .try_into()
             .expect("qwen3.5 Main token count must fit u32");
         let (main_embed_key, main_embed_arguments) = self.main_embed.component().prepare_replay(num_main_active_tokens);
+        let (resource_embed_key, resource_embed_arguments) = self
+            .input_embedding
+            .prepare_replay()
+            .map_or((None, ReplayArguments::new()), |(key, arguments)| {
+                (Some(key), arguments)
+            });
         let (main_key, mut main_arguments) = self.main.component().prepare_replay(
             num_main_active_tokens,
             self.main_gqa_state.metadata().replay_shape(),
@@ -1190,6 +1202,8 @@ impl ReplayableModel for Qwen35Executor {
         Qwen35ModelOpsRecorder {
             main_embed_key,
             main_embed_arguments,
+            resource_embed_key,
+            resource_embed_arguments,
             main_key,
             main_arguments,
             main_embed_cache_hit: false,
@@ -1247,6 +1261,11 @@ impl ReplayableModel for Qwen35Executor {
             "qwen3.5 MainEmbed replay input must match the prepared replay key"
         );
         recorder.main_embed_cache_hit = cache_hit;
+        let resource_embed_key = self.input_embedding.record(&runtime, &self.token_hidden_input);
+        assert_eq!(
+            resource_embed_key, recorder.resource_embed_key,
+            "Qwen3.8 ResourceEmbed replay input must match the prepared replay key"
+        );
         Rc::clone(&self.token_hidden_input)
     }
 

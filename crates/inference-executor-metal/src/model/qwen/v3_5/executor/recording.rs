@@ -20,10 +20,14 @@ impl Qwen35Executor {
         let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
         let main_replay = self.main.replay(&recorder.main_key);
         let empty_arguments = ReplayArguments::new();
-        let mut sequence = vec![
-            ReplayExecution::new(main_embed_replay, &recorder.main_embed_arguments),
-            ReplayExecution::new(main_replay, &recorder.main_arguments),
-        ];
+        let mut sequence = vec![ReplayExecution::new(main_embed_replay, &recorder.main_embed_arguments)];
+        if let Some(resource_embed_key) = &recorder.resource_embed_key {
+            sequence.push(ReplayExecution::new(
+                self.input_embedding.replay(resource_embed_key),
+                &recorder.resource_embed_arguments,
+            ));
+        }
+        sequence.push(ReplayExecution::new(main_replay, &recorder.main_arguments));
         let runtime = self.replay_runtime();
         let mut timestamp_stage_ends = runtime.gpu_timestamps_enabled().then(|| Vec::with_capacity(5));
         if let Some(gather_unembed_key) = &recorder.main_gather_unembed_key {

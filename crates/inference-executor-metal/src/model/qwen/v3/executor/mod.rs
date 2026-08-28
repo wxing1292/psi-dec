@@ -48,6 +48,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::embedding::Embed;
+use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::apply_main_gpu_timing;
@@ -87,10 +88,8 @@ use crate::sampling::top_k_sampling::TopKSampling;
 use crate::sampling::top_k_sampling::TopKSamplingOutputBuffers;
 use crate::sampling::top_k_sampling::TopKSamplingWriteDistributionOutput;
 
-mod input;
 mod load;
 
-use input::Qwen3InputEmbedding;
 pub use load::Qwen3ASRLoaded;
 pub use load::Qwen3ExecutorConfig;
 use load::Qwen3ModelLayout;
@@ -298,7 +297,7 @@ pub struct Qwen3Executor {
     unembed_hidden: Buffer,
     unembed_logits: Buffer,
     main_embed: Replay<Qwen3MainEmbed>,
-    input_embedding: Qwen3InputEmbedding,
+    input_embedding: InputEmbedding,
     main: Replay<Qwen3Main>,
     gather_unembed: Replay<Qwen3GatherUnembed>,
     sampling: Replay<Sampling>,

@@ -13,12 +13,12 @@ use crate::model::resource_embed::ResourceEmbedInput;
 use crate::model::resource_embed::build_mapping_table;
 use crate::replay::Replay;
 
-pub enum Qwen3InputEmbedding {
+pub enum InputEmbedding {
     Text,
-    Resource(Box<Qwen3ResourceEmbedding>),
+    Resource(Box<ResourceInputEmbedding>),
 }
 
-pub struct Qwen3ResourceEmbedding {
+pub struct ResourceInputEmbedding {
     config: resource_embed::Config,
     arena: Arc<MetalResourceArena>,
     mappings: Buffer,
@@ -26,22 +26,20 @@ pub struct Qwen3ResourceEmbedding {
     prepared_table: Option<resource_embed::MappingTable>,
 }
 
-impl Qwen3InputEmbedding {
+impl InputEmbedding {
     pub fn resource(
         device: &Device,
         config: resource_embed::Config,
         arena: Arc<MetalResourceArena>,
         max_tokens: usize,
     ) -> Self {
-        assert!(max_tokens > 0, "Qwen3 ResourceEmbed requires token capacity");
+        assert!(max_tokens > 0, "ResourceEmbed requires token capacity");
         assert!(
             u32::try_from(max_tokens).is_ok(),
-            "Qwen3 ResourceEmbed token capacity must fit u32"
+            "ResourceEmbed token capacity must fit u32"
         );
-        let num_mapping_values = max_tokens
-            .checked_mul(3)
-            .expect("Qwen3 ResourceEmbed mapping capacity must fit usize");
-        Self::Resource(Box::new(Qwen3ResourceEmbedding {
+        let num_mapping_values = max_tokens * 3;
+        Self::Resource(Box::new(ResourceInputEmbedding {
             config,
             arena,
             mappings: Buffer::new_zeroed_elements(
@@ -49,7 +47,7 @@ impl Qwen3InputEmbedding {
                 num_mapping_values,
                 inference_backend_metal::metal::Dtype::Uint32,
             ),
-            replay: Replay::new("qwen3 ResourceEmbed", ResourceEmbed::new(device, config)),
+            replay: Replay::new("ResourceEmbed", ResourceEmbed::new(device, config)),
             prepared_table: None,
         }))
     }
@@ -59,7 +57,7 @@ impl Qwen3InputEmbedding {
             Self::Text => {
                 debug_assert!(
                     requests.iter().all(|request| request.resource_placements.is_empty()),
-                    "text-only Qwen3 does not accept resource placements"
+                    "text-only input embedding does not accept resource placements"
                 );
             },
             Self::Resource(resource) => resource.prepare(requests),
@@ -94,7 +92,7 @@ impl Qwen3InputEmbedding {
 
     pub fn replay(&self, key: &resource_embed::Shape) -> &inference_backend_metal::metal::ReplayProgram {
         match self {
-            Self::Text => panic!("text-only Qwen3 has no ResourceEmbed replay"),
+            Self::Text => panic!("text-only input embedding has no ResourceEmbed replay"),
             Self::Resource(resource) => resource.replay.replay(key),
         }
     }
@@ -106,7 +104,7 @@ impl Qwen3InputEmbedding {
     }
 }
 
-impl Qwen3ResourceEmbedding {
+impl ResourceInputEmbedding {
     fn prepare(&mut self, requests: &[DeviceRequest]) {
         self.prepared_table = build_mapping_table(self.config, requests);
         if let Some(table) = &self.prepared_table {
