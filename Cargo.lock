@@ -1215,6 +1215,7 @@ dependencies = [
  "inference-runtime-core",
  "inference-runtime-macro",
  "libc",
+ "offset-allocator",
  "safetensors",
  "wincode",
 ]
