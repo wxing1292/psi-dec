@@ -56,6 +56,7 @@ use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoaded;
 use crate::model::qwen::v3_x::dspark::load::load_qwen3x_dspark;
 use crate::model::resource_arena::MetalResourceArena;
+use crate::model::resource_arena::new_resource_arena;
 use crate::model::unembedding::Unembed;
 use crate::model::unembedding::UnembedConfig;
 use crate::replay::Replay;
@@ -240,6 +241,7 @@ pub fn init_qwen_3_model(
 pub struct Qwen3ASRLoaded {
     pub executor: Qwen3Executor,
     pub audio_processor: Arc<Qwen3ASRAudioProcessor>,
+    pub resource_arena: Arc<MetalResourceArena>,
 }
 
 pub fn init_qwen3_asr_model(
@@ -262,18 +264,21 @@ pub fn init_qwen3_asr_model(
         .checked_mul(max_resource_tokens)
         .and_then(|tokens| tokens.checked_mul(hidden_dim_bytes))
         .ok_or_else(|| ModelExecutorError::custom("Qwen3-ASR resource arena capacity must fit usize"))?;
-    let audio_processor = Qwen3ASRAudioProcessor::load(model_dir, &model_config, &bindings, arena_capacity_bytes)?;
+    let resource_arena = Arc::new(new_resource_arena(&Device::system_default(), arena_capacity_bytes));
+    let audio_processor =
+        Qwen3ASRAudioProcessor::load(model_dir, &model_config, &bindings, Arc::clone(&resource_arena))?;
     let executor = init_qwen_3_model_inner(
         model_dir,
         Qwen3InitMode::Asr {
             config: Box::new(model_config),
-            resource_arena: audio_processor.arena(),
+            resource_arena: Arc::clone(&resource_arena),
         },
         config,
     )?;
     Ok(Qwen3ASRLoaded {
         executor,
         audio_processor,
+        resource_arena,
     })
 }
 

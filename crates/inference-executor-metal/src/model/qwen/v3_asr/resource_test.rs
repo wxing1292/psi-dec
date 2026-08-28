@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use inference_backend_metal::metal::Device;
 use inference_executor_core::model::qwen::v3_asr::QWEN3_ASR_AUDIO_RESOURCE_TYPE;
 use inference_executor_core::model::qwen::v3_asr::Qwen3ASRAudioSource;
 use inference_executor_core::model::qwen::v3_asr::init_qwen3_asr_config;
@@ -10,6 +11,7 @@ use inference_runtime_core::runtime::resource::processor::ResourceProcessor;
 
 use super::AudioSourceStore;
 use super::Qwen3ASRAudioProcessor;
+use crate::model::resource_arena::new_resource_arena;
 
 #[test]
 fn test_audio_source_registration_owns_store_entry() {
@@ -34,7 +36,8 @@ fn test_audio_processor_materializes_registered_source() {
     let store = inference_executor_core::checkpoint::SafeTensorStore::from_model_dir(&model_dir).unwrap();
     let names = store.index().tensor_names().collect::<Vec<_>>();
     let bindings = resolve_qwen3_asr_weight_bindings(&config, names).unwrap();
-    let processor = Qwen3ASRAudioProcessor::load(&model_dir, &config, &bindings, 16 * 1024).unwrap();
+    let arena = Arc::new(new_resource_arena(&Device::system_default(), 16 * 1024));
+    let processor = Qwen3ASRAudioProcessor::load(&model_dir, &config, &bindings, Arc::clone(&arena)).unwrap();
     let resource_id = ResourceID::new(QWEN3_ASR_AUDIO_RESOURCE_TYPE);
     let features = (0..128 * 8)
         .map(|index| (index as f32 * 0.017).sin() + (index as f32 * 0.003).cos())
@@ -48,8 +51,7 @@ fn test_audio_processor_materializes_registered_source() {
     assert_eq!(concrete.uri(), &uri);
     assert_eq!(concrete.num_resource_tokens(), 1);
     assert_eq!(concrete.source().len_bytes(), 2048 * size_of::<half::bf16>() as u64);
-    let output = processor
-        .arena()
+    let output = arena
         .storage()
         .buffer()
         .read_typed::<u16>(concrete.source().offset_bytes() as usize / size_of::<u16>(), 2048)

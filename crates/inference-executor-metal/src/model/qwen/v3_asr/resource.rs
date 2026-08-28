@@ -22,11 +22,9 @@ use inference_runtime_core::runtime::resource::processor::ResourceProcessor;
 
 use super::AudioTower;
 use crate::model::resource_arena::MetalResourceArena;
-use crate::model::resource_arena::new_resource_arena;
 
 pub struct Qwen3ASRAudioProcessor {
     jobs: async_channel::Sender<AudioMaterializationJob>,
-    arena: Arc<MetalResourceArena>,
     sources: Arc<AudioSourceStore>,
 }
 
@@ -52,7 +50,7 @@ impl Qwen3ASRAudioProcessor {
         model_dir: impl AsRef<Path>,
         config: &Qwen3ASRModelConfig,
         bindings: &Qwen3ASRWeightBindings,
-        arena_capacity_bytes: usize,
+        arena: Arc<MetalResourceArena>,
     ) -> std::result::Result<Arc<Self>, ModelExecutorError> {
         let model_dir = model_dir.as_ref().to_path_buf();
         let audio_config = config.audio.clone();
@@ -65,12 +63,11 @@ impl Qwen3ASRAudioProcessor {
             .name("qwen3-asr-audio".to_string())
             .spawn(move || {
                 let device = Device::system_default();
-                let arena = Arc::new(new_resource_arena(&device, arena_capacity_bytes));
                 let result = SafeTensorStore::from_model_dir(&model_dir)
                     .and_then(|mut store| AudioTower::load(&device, &mut store, audio_config, audio_bindings));
                 match result {
                     Ok(tower) => {
-                        if ready_sender.send(Ok(Arc::clone(&arena))).is_err() {
+                        if ready_sender.send(Ok(())).is_err() {
                             return;
                         }
                         run_worker(&tower, &arena, hidden_dim_bytes, worker_jobs);
@@ -81,14 +78,10 @@ impl Qwen3ASRAudioProcessor {
                 }
             })
             .map_err(|error| ModelExecutorError::custom(format!("unable to start Qwen3-ASR audio worker: {error}")))?;
-        let arena = ready_receiver.recv().map_err(|error| {
+        ready_receiver.recv().map_err(|error| {
             ModelExecutorError::custom(format!("Qwen3-ASR audio worker stopped during init: {error}"))
         })??;
-        Ok(Arc::new(Self { jobs, arena, sources }))
-    }
-
-    pub fn arena(&self) -> Arc<MetalResourceArena> {
-        Arc::clone(&self.arena)
+        Ok(Arc::new(Self { jobs, sources }))
     }
 
     pub fn register_source(

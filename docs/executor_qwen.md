@@ -185,9 +185,9 @@ Qwen3Executor
   pages: PageArena
 
 Qwen3-ASR service composition
+  resource_arena: MetalResourceArena
   audio_processor: Qwen3ASRAudioProcessor
     audio_worker: AudioTower
-    resource_arena: MetalResourceArena
   executor: Qwen3Executor
     input_embedding: Qwen3InputEmbedding::Resource
       resource_embed: Replay<ResourceEmbed>

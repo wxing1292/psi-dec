@@ -57,9 +57,10 @@ crates/inference-executor-metal/src/model/
 
 crates/inference-runtime-core/src/runtime/
   resource/                 ResourceID, ResourceURI, Resource, and ResourcePlacement
+  resource/processor.rs     model-neutral processor contract and type router
   decoder/resource.rs       cache-block ResourceSegment annotation
   tasks/resource_materialization.rs
-                            model-neutral resource processor and async task
+                            async resource materialization transport
 
 crates/inference-runtime-service/src/
   asr/
@@ -92,10 +93,12 @@ The runtime core owns these objects and operations:
 
 The Qwen3-ASR executor integration owns these operations:
 
+- Resource-arena creation during multimodal model initialization.
 - The registered Qwen3-ASR audio resource processor.
 - Audio Tower weights and execution.
-- The Metal resource embedding arena.
 - The source-to-hidden replacement mapping.
+
+The model initializer passes one shared Metal resource arena to the audio processor and Qwen3 decoder.
 
 The shared Qwen3 executor owns text embedding, decoder execution, unembedding, and sampling.
 The Metal backend owns buffers, kernels, and replay submission.

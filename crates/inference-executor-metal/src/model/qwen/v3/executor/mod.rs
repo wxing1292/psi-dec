@@ -1005,7 +1005,7 @@ mod tests {
         assert_eq!(loaded.executor.model_mode(), "asr");
         assert_eq!(config.text.hidden_size, 2048);
         assert_eq!(
-            loaded.audio_processor.arena().storage().buffer().len_bytes(),
+            loaded.resource_arena.storage().buffer().len_bytes(),
             audio_output_rows(config.preprocessor.max_frames)
                 * config.text.hidden_size
                 * std::mem::size_of::<half::bf16>()
@@ -1014,8 +1014,7 @@ mod tests {
         let hidden_dim = config.text.hidden_size;
         let replacement = half::bf16::from_f32(0.5).to_bits();
         let mut allocation = loaded
-            .audio_processor
-            .arena()
+            .resource_arena
             .alloc_segment(hidden_dim * std::mem::size_of::<half::bf16>())
             .unwrap();
         for bytes in allocation.slice_mut().as_chunks_mut::<2>().0 {
