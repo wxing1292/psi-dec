@@ -12,6 +12,8 @@ use inference_runtime_core::runtime::CompletionReason;
 use inference_runtime_core::runtime::ExternalRequest;
 use inference_runtime_core::runtime::RawRequestID;
 use inference_runtime_core::runtime::RequestStatus;
+use inference_runtime_core::runtime::Resource;
+use inference_runtime_core::runtime::ResourcePlacement;
 use inference_runtime_core::runtime::Token;
 use inference_runtime_core::runtime::TokenProbs;
 use tokio_stream::Stream;
@@ -23,12 +25,16 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         assert_ne!(request_id, 0, "decode request ID allocator wrapped to zero");
 
-        let DecodeRequest { tokens, mut sampling } = request;
+        let DecodeRequest {
+            tokens,
+            resource_entries,
+            mut sampling,
+        } = request;
         merge_stop_sequences(&mut sampling.stop_sequences, &self.default_stop_sequences);
 
         let (queued_request, external_request) =
             self.runtime
-                .initialize_req(request_id, vec![], tokens, vec![], vec![], sampling)?;
+                .initialize_req(request_id, vec![], tokens, vec![], resource_entries, sampling)?;
         self.runtime.submit_req(queued_request)?;
         Ok(DecodeResponse::new(external_request))
     }
@@ -36,11 +42,16 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
 
 pub struct DecodeRequest {
     tokens: Vec<Token>,
+    resource_entries: Vec<(Resource, ResourcePlacement)>,
     sampling: SamplingConfig,
 }
 
 impl DecodeRequest {
-    pub fn new(tokens: Vec<Token>, sampling: SamplingConfig) -> Result<Self> {
+    pub fn new(
+        tokens: Vec<Token>,
+        resource_entries: Vec<(Resource, ResourcePlacement)>,
+        sampling: SamplingConfig,
+    ) -> Result<Self> {
         if tokens.is_empty() {
             return Err(Error::invalid_argument(
                 "decode request must include at least one token",
@@ -72,7 +83,11 @@ impl DecodeRequest {
                 "stop sequences must not include empty sequences",
             ));
         }
-        Ok(Self { tokens, sampling })
+        Ok(Self {
+            tokens,
+            resource_entries,
+            sampling,
+        })
     }
 }
 

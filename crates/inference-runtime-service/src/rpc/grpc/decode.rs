@@ -44,8 +44,8 @@ impl<const N: usize, const L: usize, const P: usize> InferenceRuntime for GRPCSe
                 .map(|sequence| sequence.tokens.into_iter().map(Token::new).collect())
                 .collect(),
         };
-        let request =
-            DecodeRequest::new(request.tokens.into_iter().map(Token::new).collect(), sampling).map_err(map_error)?;
+        let request = DecodeRequest::new(request.tokens.into_iter().map(Token::new).collect(), vec![], sampling)
+            .map_err(map_error)?;
         let response = self.inference.decode(request).map_err(map_error)?;
         let request_id = response.request_id() as u64;
         let response = response.map(move |event| map_response(request_id, event));

@@ -653,7 +653,9 @@ mod tests {
         };
         let mut response = Box::pin(
             inference
-                .decode(DecodeRequest::new(vec![Token::new(1), Token::new(2), Token::new(3)], sampling).unwrap())
+                .decode(
+                    DecodeRequest::new(vec![Token::new(1), Token::new(2), Token::new(3)], vec![], sampling).unwrap(),
+                )
                 .unwrap(),
         );
 

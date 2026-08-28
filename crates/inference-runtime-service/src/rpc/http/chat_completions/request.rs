@@ -196,9 +196,9 @@ pub fn preprocess(
             .unwrap_or(DEFAULT_SAMPLING_TOP_K),
         top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
         seed,
-        stop_sequences: Vec::new(),
+        stop_sequences: vec![],
     };
-    let request = DecodeRequest::new(tokens, sampling).map_err(map_error)?;
+    let request = DecodeRequest::new(tokens, vec![], sampling).map_err(map_error)?;
     let tool_ids = if enable_tools {
         tools.into_iter().map(|tool| tool.tool_id().clone()).collect()
     } else {
