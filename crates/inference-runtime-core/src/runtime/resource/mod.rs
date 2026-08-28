@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -44,10 +45,15 @@ impl Resource {
         }
     }
 
-    pub fn into_concrete(self, source: crate::memory::OffsetAllocation, num_resource_tokens: u32) -> Self {
+    pub fn into_concrete(
+        self,
+        allocator: Arc<dyn crate::memory::BlockAllocator<BlockSegment = crate::memory::OffsetAllocation>>,
+        source: crate::memory::OffsetAllocation,
+        num_resource_tokens: u32,
+    ) -> Self {
         debug_assert!(self.is_symbolic(), "only a symbolic resource can become concrete");
         match self {
-            Self::Symbolic(resource) => Self::Concrete(resource.into_concrete(source, num_resource_tokens)),
+            Self::Symbolic(resource) => Self::Concrete(resource.into_concrete(allocator, source, num_resource_tokens)),
             Self::Concrete(_) => panic!("only a symbolic resource can become concrete"),
         }
     }

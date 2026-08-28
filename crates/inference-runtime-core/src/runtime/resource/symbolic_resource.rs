@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use super::ConcreteResource;
 use super::ResourceID;
 use super::ResourceURI;
+use crate::memory::BlockAllocator;
 use crate::memory::OffsetAllocation;
 
 #[derive(Debug)]
@@ -22,7 +25,12 @@ impl SymbolicResource {
         &self.uri
     }
 
-    pub fn into_concrete(self, source: OffsetAllocation, num_resource_tokens: u32) -> ConcreteResource {
-        ConcreteResource::new(self.id, self.uri, source, num_resource_tokens)
+    pub fn into_concrete(
+        self,
+        allocator: Arc<dyn BlockAllocator<BlockSegment = OffsetAllocation>>,
+        source: OffsetAllocation,
+        num_resource_tokens: u32,
+    ) -> ConcreteResource {
+        ConcreteResource::new(self.id, self.uri, allocator, source, num_resource_tokens)
     }
 }
