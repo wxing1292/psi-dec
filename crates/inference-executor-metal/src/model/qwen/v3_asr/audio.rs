@@ -1,7 +1,7 @@
-use inference_backend_metal::components::audio_attention;
 use inference_backend_metal::components::audio_encoder_layout;
 use inference_backend_metal::components::layer_norm;
 use inference_backend_metal::components::residual_add;
+use inference_backend_metal::components::tower_block_attention;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
@@ -37,7 +37,7 @@ pub struct AudioTower {
     residual_add: residual_add::Compute,
     conv: [Affine; 3],
     conv_out: Linear,
-    attention: audio_attention::Compute,
+    attention: tower_block_attention::Compute,
     layers: Vec<AudioLayer>,
     ln_post: Norm,
     proj1: Affine,
@@ -125,13 +125,9 @@ impl AudioTower {
             residual_add: residual_add::Compute::new(device, residual_add::Config::bf16()),
             conv,
             conv_out,
-            attention: audio_attention::Compute::new(
+            attention: tower_block_attention::Compute::new(
                 device,
-                audio_attention::Config {
-                    num_heads,
-                    head_dim,
-                    window_size: dimensions.attention_window_rows,
-                },
+                tower_block_attention::Config { num_heads, head_dim },
             ),
             layers,
             ln_post,
@@ -251,10 +247,11 @@ impl AudioTower {
                 );
             }
             replay.record_with_barrier_before(self.attention.invoke(
-                audio_attention::Shape {
+                tower_block_attention::Shape {
                     num_rows: shape.num_rows,
+                    block_size: self.dimensions.attention_window_rows,
                 },
-                audio_attention::Buffers {
+                tower_block_attention::Buffers {
                     query: &q,
                     key: &k,
                     value: &v,

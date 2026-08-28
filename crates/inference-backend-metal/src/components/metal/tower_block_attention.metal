@@ -2,7 +2,7 @@
 #include <metal_simdgroup>
 using namespace metal;
 
-kernel void audio_window_attention_bf16(
+kernel void tower_block_attention_bf16(
     device const bfloat* query [[buffer(0)]],
     device const bfloat* key [[buffer(1)]],
     device const bfloat* value [[buffer(2)]],
@@ -19,34 +19,41 @@ kernel void audio_window_attention_bf16(
   const uint dim = thread_index.x;
   const uint head = group.x;
   const uint row = group.y;
-  if (head >= num_heads || row >= num_rows || dim >= head_dim) return;
+  const bool active_dim = dim < head_dim;
   const uint window_start = (row / window_size) * window_size;
   const uint window_end = min(window_start + window_size, num_rows);
   const ulong query_index = ((ulong)row * num_heads + head) * head_dim + dim;
-  const float q = float(query[query_index]);
-  threadgroup float partials[2];
+  const float q = active_dim ? float(query[query_index]) : 0.0f;
+  threadgroup float partials[4];
+  const uint num_simd_groups = (head_dim + 31u) / 32u;
   float maximum = -INFINITY;
   float denominator = 0.0f;
   float accumulator = 0.0f;
   for (uint key_row = window_start; key_row < window_end; ++key_row) {
     const ulong item_index = ((ulong)key_row * num_heads + head) * head_dim + dim;
-    const float partial = simd_sum(q * float(key[item_index]));
+    const float partial = simd_sum(active_dim ? q * float(key[item_index]) : 0.0f);
     if (lane == 0u) partials[simd_group] = partial;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (dim == 0u) partials[0] = (partials[0] + partials[1]) * scale;
+    if (dim == 0u) {
+      float score = 0.0f;
+      for (uint group_index = 0; group_index < num_simd_groups; ++group_index) {
+        score += partials[group_index];
+      }
+      partials[0] = score * scale;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float score = partials[0];
     if (score > maximum) {
       const float correction = maximum == -INFINITY ? 0.0f : precise::exp(maximum - score);
-      accumulator = accumulator * correction + float(value[item_index]);
+      accumulator = accumulator * correction + (active_dim ? float(value[item_index]) : 0.0f);
       denominator = denominator * correction + 1.0f;
       maximum = score;
     } else {
       const float probability = precise::exp(score - maximum);
-      accumulator += probability * float(value[item_index]);
+      accumulator += probability * (active_dim ? float(value[item_index]) : 0.0f);
       denominator += probability;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  output[query_index] = bfloat(accumulator / denominator);
+  if (active_dim) output[query_index] = bfloat(accumulator / denominator);
 }

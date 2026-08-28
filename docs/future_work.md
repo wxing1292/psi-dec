@@ -150,6 +150,11 @@ component path as the design.
 - Measure first-Prefill resource materialization latency and batch interference.
   Add separate resource-materialization scheduling only if the measurements justify it.
   Do not add modality-specific scheduler states.
+- Compare `tower_block_attention` with the decoder bidirectional block GQA implementation after Audio Tower and
+  Vision Tower correctness and performance baselines are stable.
+  Preserve the tower contract for contiguous Q/K/V without KV-cache or page metadata.
+  Preserve the decoder contract for GQA heads, paged state, request metadata, and SplitKV reduction.
+  Share a lower-level SDPA operation only if the operation has the same contract and a measured benefit.
 
 ## Replay Evolution
 

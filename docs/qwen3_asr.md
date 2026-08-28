@@ -41,7 +41,7 @@ crates/inference-backend-metal/src/
     bias_activation_bf16.rs BF16 bias-plus-activation operator
     conv2d_unfold.rs        audio Conv2D unfold operator
   components/
-    audio_attention.rs      Audio Tower self-attention
+    tower_block_attention.rs shared bidirectional block self-attention for encoder towers
     audio_encoder_layout.rs audio chunk/dechunk and merger layout
     layer_norm.rs           BF16 LayerNorm
     resource_embed.rs       resource-to-hidden replacement operation

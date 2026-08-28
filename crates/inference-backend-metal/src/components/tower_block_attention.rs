@@ -1,4 +1,4 @@
-//! Bidirectional attention over fixed audio windows.
+//! Bidirectional attention over contiguous token blocks.
 
 use crate::metal::Buffer;
 use crate::metal::CommandRecorder;
@@ -7,20 +7,21 @@ use crate::metal::Device;
 use crate::metal::Dtype;
 use crate::metal::Operator;
 
-const SOURCE: &str = include_str!("metal/audio_attention.metal");
+const SOURCE: &str = include_str!("metal/tower_block_attention.metal");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     pub num_heads: u32,
     pub head_dim: u32,
-    pub window_size: u32,
 }
 
 impl Config {
     fn validate(self) {
-        assert!(self.num_heads > 0, "audio attention head count must be positive");
-        assert_eq!(self.head_dim, 64, "audio attention supports head_dim=64");
-        assert!(self.window_size > 0, "audio attention window size must be positive");
+        assert!(self.num_heads > 0, "tower block attention head count must be positive");
+        assert!(
+            self.head_dim > 0 && self.head_dim <= 128,
+            "tower block attention supports head_dim <= 128"
+        );
     }
 
     fn scale(self) -> f32 {
@@ -35,11 +36,13 @@ impl Config {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Shape {
     pub num_rows: u32,
+    pub block_size: u32,
 }
 
 impl Shape {
     fn validate(self) {
-        debug_assert!(self.num_rows > 0, "audio attention row count must be positive");
+        debug_assert!(self.num_rows > 0, "tower block attention row count must be positive");
+        debug_assert!(self.block_size > 0, "tower block attention block size must be positive");
     }
 }
 
@@ -61,7 +64,7 @@ impl Compute {
         config.validate();
         Self {
             config,
-            kernel: CompiledKernel::new(device, SOURCE, "audio_window_attention_bf16"),
+            kernel: CompiledKernel::new(device, SOURCE, "tower_block_attention_bf16"),
         }
     }
 
@@ -93,7 +96,7 @@ impl Operator for Invocation<'_> {
         ] {
             debug_assert!(
                 buffer.len_bytes() >= tensor_bytes,
-                "audio attention {name} buffer is too small"
+                "tower block attention {name} buffer is too small"
             );
         }
         recorder.set_kernel(&self.compute.kernel);
@@ -104,11 +107,11 @@ impl Operator for Invocation<'_> {
         recorder.set_u32(4, self.shape.num_rows);
         recorder.set_u32(5, config.num_heads);
         recorder.set_u32(6, config.head_dim);
-        recorder.set_u32(7, config.window_size);
+        recorder.set_u32(7, self.shape.block_size);
         recorder.set_f32(8, config.scale());
         recorder.dispatch_threadblocks(
             (config.num_heads as usize, self.shape.num_rows as usize, 1),
-            (config.head_dim as usize, 1, 1),
+            (config.head_dim.next_multiple_of(32) as usize, 1, 1),
         );
     }
 }
@@ -123,15 +126,36 @@ mod tests {
     use crate::metal::Stream;
 
     #[test]
-    fn test_invoke_fixed_window() {
+    fn test_invoke_multiple_blocks() {
+        assert_invoke(
+            Config {
+                num_heads: 2,
+                head_dim: 64,
+            },
+            Shape {
+                num_rows: 5,
+                block_size: 3,
+            },
+        );
+    }
+
+    #[test]
+    fn test_invoke_head_dim_72() {
+        assert_invoke(
+            Config {
+                num_heads: 1,
+                head_dim: 72,
+            },
+            Shape {
+                num_rows: 3,
+                block_size: 3,
+            },
+        );
+    }
+
+    fn assert_invoke(config: Config, shape: Shape) {
         let device = Device::system_default();
         let stream = Stream::new(&device);
-        let config = Config {
-            num_heads: 2,
-            head_dim: 64,
-            window_size: 3,
-        };
-        let shape = Shape { num_rows: 5 };
         let num_values = shape.num_rows * config.num_heads * config.head_dim;
         let query_values = (0..num_values)
             .map(|index| bf16::from_f32((index % 17) as f32 * 0.015625 - 0.125))
@@ -183,8 +207,8 @@ mod tests {
         let head_dim = config.head_dim as usize;
         let num_heads = config.num_heads as usize;
         for row in 0..shape.num_rows as usize {
-            let window_start = row / config.window_size as usize * config.window_size as usize;
-            let window_end = (window_start + config.window_size as usize).min(shape.num_rows as usize);
+            let window_start = row / shape.block_size as usize * shape.block_size as usize;
+            let window_end = (window_start + shape.block_size as usize).min(shape.num_rows as usize);
             for head in 0..num_heads {
                 let query_start = (row * num_heads + head) * head_dim;
                 let scores = (window_start..window_end)
