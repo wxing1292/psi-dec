@@ -14,6 +14,7 @@
 //! compile-time kernel constants.
 
 pub mod audio_attention;
+pub mod audio_encoder_layout;
 
 pub mod dense_mlp;
 pub mod sparse_mlp;
