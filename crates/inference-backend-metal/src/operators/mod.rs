@@ -29,6 +29,7 @@
 pub mod affine_quantized;
 pub mod bf16_concat_rows;
 pub mod bias_activation_bf16;
+pub mod conv2d_unfold;
 mod mlx_headers;
 pub mod matmul_bf16;
 pub mod row_gather;
