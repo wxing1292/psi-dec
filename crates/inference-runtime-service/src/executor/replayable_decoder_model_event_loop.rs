@@ -7,6 +7,7 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Select;
 use crossbeam_channel::SelectedOperation;
 use crossbeam_channel::Sender;
+use inference_executor_core::model::EncoderExecutorLifecycle;
 use inference_executor_core::model::ExecutionSubmission;
 use inference_executor_core::model::ReplayableDecoderModel;
 use inference_runtime_core::channel::DedupNotifier;
@@ -23,6 +24,7 @@ use inference_runtime_core::compute::SampledTokens;
 use inference_runtime_core::runtime::RawRequestSlot;
 use inference_runtime_core::runtime::Token;
 
+use crate::executor::ReplayableModelExecutors;
 use crate::perf_metrics::ExecutorBatchPerfMetrics;
 use crate::perf_metrics::summarize_batch_device_request;
 use crate::perf_metrics::summarize_batch_device_response;
@@ -36,6 +38,7 @@ pub struct ReplayableDecoderModelEventLoop<M> {
     req_slot_reset_rx: Receiver<()>,
     shutdown: Shutdown,
     model: M,
+    encoder_executors: Vec<Arc<dyn EncoderExecutorLifecycle>>,
     model_state: ModelExecutorState,
     state_snapshot_path: PathBuf,
 }
@@ -56,9 +59,10 @@ where
         req_slot_reset_notifier: Arc<DedupNotifier<RawRequestSlot>>,
         req_slot_reset_rx: Receiver<()>,
         shutdown: Shutdown,
-        model: M,
+        executors: ReplayableModelExecutors<M>,
         state_snapshot_path: PathBuf,
     ) -> Self {
+        let (model, encoder_executors) = executors.into_parts();
         Self {
             model_executor_req_rx,
             model_executor_resp_tx,
@@ -66,6 +70,7 @@ where
             req_slot_reset_rx,
             shutdown,
             model,
+            encoder_executors,
             model_state: ModelExecutorState::Started,
             state_snapshot_path,
         }
@@ -192,6 +197,20 @@ where
             self.shutdown.shutdown();
             return false;
         }
+        for encoder in &self.encoder_executors {
+            if let Err(error) = encoder.start() {
+                tracing::error!(
+                    target: "inference-runtime-service::lifecycle",
+                    component = "encoder",
+                    phase = "start.failed",
+                    model = encoder.model_name(),
+                    error = %error,
+                    "unable to load encoder weights; shutting down"
+                );
+                self.shutdown.shutdown();
+                return false;
+            }
+        }
         self.model_state = ModelExecutorState::Started;
         self.remove_state_snapshot();
         tracing::info!(
@@ -224,6 +243,9 @@ where
             snapshot_path = %self.state_snapshot_path.display(),
             "stopping model"
         );
+        for encoder in &self.encoder_executors {
+            encoder.stop();
+        }
         self.reset_req_slots();
         self.model.clear_replay_cache();
         if let Err(error) = self.model.unload_state(&self.state_snapshot_path, &plan) {
@@ -624,6 +646,8 @@ mod tests {
         UnloadWeights,
         LoadWeights,
         LoadState(ExecutorHibernationPlan),
+        StartEncoder,
+        StopEncoder,
     }
 
     struct TestModel {
@@ -633,6 +657,25 @@ mod tests {
     }
 
     struct TestSubmission;
+
+    struct TestEncoder {
+        event_tx: Sender<ModelEvent>,
+    }
+
+    impl EncoderExecutorLifecycle for TestEncoder {
+        fn model_name(&self) -> &str {
+            "test encoder"
+        }
+
+        fn start(&self) -> Result<(), ModelExecutorError> {
+            self.event_tx.send(ModelEvent::StartEncoder).unwrap();
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.event_tx.send(ModelEvent::StopEncoder).unwrap();
+        }
+    }
 
     impl ExecutionSubmission for TestSubmission {
         fn wait(&self) {
@@ -1155,11 +1198,14 @@ mod tests {
             req_slot_reset_notifier.clone(),
             req_slot_reset_rx,
             shutdown.clone(),
-            TestModel {
-                event_tx,
-                weights_loaded: true,
-                state_loaded: true,
-            },
+            ReplayableModelExecutors::new(
+                TestModel {
+                    event_tx,
+                    weights_loaded: true,
+                    state_loaded: true,
+                },
+                vec![],
+            ),
             snapshot_path,
         );
         let executor_thread = std::thread::spawn(move || executor.event_loop());
@@ -1193,11 +1239,14 @@ mod tests {
             req_slot_reset_notifier.clone(),
             req_slot_reset_rx,
             shutdown.clone(),
-            TestModel {
-                event_tx,
-                weights_loaded: true,
-                state_loaded: true,
-            },
+            ReplayableModelExecutors::new(
+                TestModel {
+                    event_tx: event_tx.clone(),
+                    weights_loaded: true,
+                    state_loaded: true,
+                },
+                vec![Arc::new(TestEncoder { event_tx })],
+            ),
             snapshot_path.clone(),
         );
         let executor_thread = std::thread::spawn(move || executor.event_loop());
@@ -1219,6 +1268,7 @@ mod tests {
             model_executor_resp_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             ReplayableModelExecutorResponse::Stopped
         ));
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::StopEncoder);
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::ClearReplayCache);
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::UnloadState(plan.clone()));
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::UnloadWeights);
@@ -1248,6 +1298,7 @@ mod tests {
         assert_eq!(batch_response.seq, 7);
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::LoadWeights);
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::LoadState(plan.clone()));
+        assert_eq!(event_rx.recv().unwrap(), ModelEvent::StartEncoder);
         assert_eq!(event_rx.recv().unwrap(), ModelEvent::ResetRequestSlots(vec![11]));
         assert!(!snapshot_path.exists());
 
@@ -1275,12 +1326,15 @@ mod tests {
             req_slot_reset_notifier,
             req_slot_reset_rx,
             Shutdown::new(),
-            SpecLifecycleModel {
-                events: Rc::clone(&events),
-                run_spec,
-                run_prefill,
-                run_decode,
-            },
+            ReplayableModelExecutors::new(
+                SpecLifecycleModel {
+                    events: Rc::clone(&events),
+                    run_spec,
+                    run_prefill,
+                    run_decode,
+                },
+                vec![],
+            ),
             std::env::temp_dir().join("psi-dec-spec-lifecycle-test.state"),
         );
         executor.execute(BatchDeviceRequest::new(

@@ -55,6 +55,7 @@ use inference_runtime_core::runtime::validate_resources;
 use crate::api::Inference;
 use crate::consts::NUM_TRIE_PARTITION;
 use crate::executor::ReplayableDecoderModelEventLoop;
+use crate::executor::ReplayableModelExecutors;
 use crate::rpc;
 use crate::rpc::HTTPService;
 
@@ -385,7 +386,7 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
     resource_processors: Arc<ResourceProcessors>,
     model_runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
-    model: M,
+    executors: ReplayableModelExecutors<M>,
 ) -> Result<()>
 where
     M: ReplayableDecoderModel,
@@ -393,9 +394,9 @@ where
     let shutdown = Shutdown::new();
     let server_tokio_runtime = tokio::runtime::Runtime::new()
         .map_err(|error| log_err_unavailable!("unable to initialize RPC async runtime: {error}"))?;
-    let model_name = model.model_name().to_string();
-    let default_stop_sequences = model.default_stop_sequences();
-    let num_spec_tokens = model.num_spec_tokens();
+    let model_name = executors.decoder().model_name().to_string();
+    let default_stop_sequences = executors.decoder().default_stop_sequences();
+    let num_spec_tokens = executors.decoder().num_spec_tokens();
     let runtime = Arc::new(InferenceRuntime::<N, L, NUM_TRIE_PARTITION>::new(
         model_runtime_config,
         scheduler_config,
@@ -427,7 +428,7 @@ where
         runtime.request_slot_reset_notifier(),
         runtime.request_slot_reset_rx(),
         shutdown,
-        model,
+        executors,
         default_model_state_snapshot_path(),
     );
     executor.event_loop();

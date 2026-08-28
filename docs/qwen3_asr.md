@@ -13,7 +13,7 @@ Unresolved work is in [`future_work.md`](future_work.md).
 
 The current path supports the `mlx-community/Qwen3-ASR-1.7B-8bit` checkpoint contract on Apple Silicon.
 The text decoder uses the shared Qwen3 executor.
-The audio path uses one model-owned Audio Tower and one model-owned audio processor.
+The audio path uses one model-owned Audio encoder executor and one model-owned audio processor.
 
 The first version has these limits:
 
@@ -50,8 +50,8 @@ crates/inference-executor-metal/src/model/
   resource_arena.rs         shared Metal buffer and byte-range allocation owner
   resource_embed.rs         replay wrapper and active replacement mapping builder
   qwen/v3_asr/
-    audio.rs                Audio Tower load and execution
-    resource.rs             prepared-source registration and async materialization
+    audio.rs                Audio encoder worker, replay lifecycle, and Audio Tower
+    resource.rs             prepared-source registration and processor adapter
   qwen/v3/executor/
     input.rs                text-only or resource-aware input composition
 
@@ -95,10 +95,10 @@ The Qwen3-ASR executor integration owns these operations:
 
 - Resource-arena creation during multimodal model initialization.
 - The registered Qwen3-ASR audio resource processor.
-- Audio Tower weights and execution.
+- The standalone Audio encoder executor, worker, stream, weights, and execution.
 - The source-to-hidden replacement mapping.
 
-The model initializer passes one shared Metal resource arena to the audio processor and Qwen3 decoder.
+The model initializer passes one shared Metal resource arena to the Audio encoder executor and Qwen3 decoder.
 
 The shared Qwen3 executor owns text embedding, decoder execution, unembedding, and sampling.
 The Metal backend owns buffers, kernels, and replay submission.
@@ -147,7 +147,7 @@ initialize one cache block
        -> resource is symbolic
             -> return a blocking ResourceMaterializationReq
             -> dispatch by ResourceTypeID
-            -> run the Audio Tower
+            -> run the Audio encoder executor
             -> return a ConcreteResource
             -> reschedule the request
             -> initialize the block again
@@ -172,9 +172,12 @@ max_frames:        3000
 
 The service uses an offline band-limited resampler when the WAV sample rate is not 16 kHz.
 It calculates log-Mel features on CPU.
-It sends the prepared feature tensor to the model-owned audio worker only after a required cache block misses.
+It sends the prepared feature tensor to the model-owned Audio encoder executor only after a required cache block
+misses.
 
 The Audio Tower executes the checkpoint encoder, chunk layout, and final projection.
+The Audio encoder executor owns the worker thread, Metal stream, replay recording, weight residency, and submission.
+The runtime-facing processor only resolves the prepared source and forwards it to the executor.
 It writes decoder-width BF16 embeddings directly to a `MetalResourceArena` allocation.
 The output-row contract is:
 

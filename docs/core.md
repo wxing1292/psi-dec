@@ -248,6 +248,10 @@ trie block miss
 Runtime core dispatches by `ResourceTypeID`.
 It does not interpret media types, checkpoint metadata, or tower inputs.
 The registered processor owns model-specific materialization.
+For a local Metal implementation, the processor resolves its source and forwards it to a standalone encoder executor.
+For a remote implementation, the processor can call a remote encoder and install the validated result in the local
+resource arena.
+Runtime core does not distinguish these implementations.
 
 The materialization task does not hold the internal request.
 The task carries the request ID and required resource IDs.

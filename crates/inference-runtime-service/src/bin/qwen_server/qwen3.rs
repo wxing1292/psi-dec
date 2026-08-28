@@ -15,6 +15,7 @@ use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
 
 use crate::codec::qwen::QwenCodec;
+use crate::executor::ReplayableModelExecutors;
 use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::config::Qwen3Config;
 use crate::qwen_server::config::Qwen3ModelMode;
@@ -124,7 +125,7 @@ fn run_inner() -> Result<()> {
         Arc::new(ResourceProcessors::new()),
         runtime_config,
         scheduler_config,
-        model,
+        ReplayableModelExecutors::new(model, vec![]),
     )
 }
 

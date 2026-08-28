@@ -496,7 +496,9 @@ Pass `-F 'response_format=text'` to return only transcription text.
 The first version accepts one WAV resource for each request.
 It converts the input to mono F32 at 16 kHz and calculates log-Mel features on CPU.
 It completes this CPU work before runtime admission.
-The Audio Tower runs only when a required cache block misses and the resource remains symbolic.
+The Audio encoder executor runs only when a required cache block misses and the resource remains symbolic.
+It owns a worker thread, a Metal stream, the Audio Tower, and the Audio Tower weight lifecycle.
+Service hibernation stops and starts this executor with the decoder lifecycle command.
 See [`qwen3_asr.md`](qwen3_asr.md) for the resource and executor contract.
 
 ## gRPC decode

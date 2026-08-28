@@ -1,3 +1,7 @@
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use inference_backend_metal::components::audio_encoder_layout;
 use inference_backend_metal::components::layer_norm;
 use inference_backend_metal::components::residual_add;
@@ -5,6 +9,7 @@ use inference_backend_metal::components::tower_block_attention;
 use inference_backend_metal::metal::Buffer;
 use inference_backend_metal::metal::Device;
 use inference_backend_metal::metal::Dtype;
+use inference_backend_metal::metal::ReplayProgram;
 use inference_backend_metal::metal::ReplayProgramBuilder;
 use inference_backend_metal::metal::Stream;
 use inference_backend_metal::operators::bias_activation_bf16;
@@ -12,6 +17,8 @@ use inference_backend_metal::operators::conv2d_unfold;
 use inference_backend_metal::operators::matmul_bf16;
 use inference_executor_core::checkpoint::SafeTensorStore;
 use inference_executor_core::def::ModelExecutorError;
+use inference_executor_core::model::EncoderExecutorLifecycle;
+use inference_executor_core::model::ReplayableEncoderModel;
 use inference_executor_core::model::qwen::v3_asr::Qwen3ASRAudioConfig;
 use inference_executor_core::model::qwen::v3_asr::Qwen3ASRAudioSource;
 use inference_executor_core::model::qwen::v3_asr::audio_output_rows;
@@ -19,18 +26,61 @@ use inference_executor_core::model::qwen::v3_asr::weight_layout::Qwen3ASRAffineW
 use inference_executor_core::model::qwen::v3_asr::weight_layout::Qwen3ASRAudioLayerWeightBindings;
 use inference_executor_core::model::qwen::v3_asr::weight_layout::Qwen3ASRAudioWeightBindings;
 use inference_executor_core::model::qwen::v3_asr::weight_layout::Qwen3ASRNormWeightBindings;
+use inference_runtime_core::Error;
+use inference_runtime_core::Result as RuntimeResult;
+use inference_runtime_core::memory::BlockAllocator;
 use inference_runtime_core::memory::OffsetAllocation;
 
+use crate::def::replay_op::MetalReplayRuntime;
+use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::resource_arena::MetalResourceArena;
 
 const BF16_BYTES: usize = 2;
 const CONV_CHANNELS: u32 = 480;
 
-pub struct AudioTower {
+pub struct AudioEncoderExecutor {
+    jobs: async_channel::Sender<AudioEncoderJob>,
+}
+
+struct AudioEncoderModel {
+    model_dir: PathBuf,
     config: Qwen3ASRAudioConfig,
-    dimensions: AudioDimensions,
+    bindings: Qwen3ASRAudioWeightBindings,
     device: Device,
     stream: Stream,
+    arena: Arc<MetalResourceArena>,
+    tower: Option<AudioTower>,
+}
+
+struct AudioEncoderInput {
+    source: Arc<Qwen3ASRAudioSource>,
+    allocation: OffsetAllocation,
+}
+
+struct AudioEncoderPreparedInput {
+    shape: AudioShape,
+    output_offset_bytes: usize,
+    allocation: OffsetAllocation,
+    source: Buffer,
+    chunked: Buffer,
+    max_unfold: Buffer,
+    conv_a: Buffer,
+    conv_b: Buffer,
+    flattened: Buffer,
+    projected: Buffer,
+    hidden_a: Buffer,
+    hidden_b: Buffer,
+    norm: Buffer,
+    q: Buffer,
+    k: Buffer,
+    v: Buffer,
+    branch: Buffer,
+    ffn: Buffer,
+}
+
+struct AudioTower {
+    config: Qwen3ASRAudioConfig,
+    dimensions: AudioDimensions,
     unfold: conv2d_unfold::Kernel,
     layout: audio_encoder_layout::Compute,
     bias_activation: bias_activation_bf16::Kernel,
@@ -42,6 +92,15 @@ pub struct AudioTower {
     ln_post: Norm,
     proj1: Affine,
     proj2: Affine,
+}
+
+enum AudioEncoderJob {
+    Encode {
+        source: Arc<Qwen3ASRAudioSource>,
+        response: async_channel::Sender<RuntimeResult<OffsetAllocation>>,
+    },
+    Start(std::sync::mpsc::SyncSender<std::result::Result<(), ModelExecutorError>>),
+    Stop(std::sync::mpsc::SyncSender<()>),
 }
 
 struct AudioLayer {
@@ -83,6 +142,208 @@ struct AudioDimensions {
     attention_window_rows: u32,
 }
 
+impl AudioEncoderInput {
+    fn new(source: Arc<Qwen3ASRAudioSource>, allocation: OffsetAllocation) -> Self {
+        Self { source, allocation }
+    }
+}
+
+impl AudioEncoderExecutor {
+    pub fn load(
+        model_dir: impl AsRef<Path>,
+        config: Qwen3ASRAudioConfig,
+        bindings: Qwen3ASRAudioWeightBindings,
+        arena: Arc<MetalResourceArena>,
+    ) -> std::result::Result<Self, ModelExecutorError> {
+        let model_dir = model_dir.as_ref().to_path_buf();
+        let (jobs, worker_jobs) = async_channel::unbounded();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("qwen3-asr-audio".to_string())
+            .spawn(move || {
+                let result = AudioEncoderModel::load(model_dir, config, bindings, arena);
+                match result {
+                    Ok(mut model) => {
+                        if ready_sender.send(Ok(())).is_err() {
+                            return;
+                        }
+                        run_audio_encoder_worker(&mut model, worker_jobs);
+                    },
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                    },
+                }
+            })
+            .map_err(|error| ModelExecutorError::custom(format!("unable to start Qwen3-ASR audio worker: {error}")))?;
+        ready_receiver.recv().map_err(|error| {
+            ModelExecutorError::custom(format!("Qwen3-ASR audio worker stopped during init: {error}"))
+        })??;
+        Ok(Self { jobs })
+    }
+
+    pub async fn encode(&self, source: Arc<Qwen3ASRAudioSource>) -> RuntimeResult<OffsetAllocation> {
+        let (response, result) = async_channel::bounded(1);
+        self.jobs
+            .send(AudioEncoderJob::Encode { source, response })
+            .await
+            .map_err(|_| Error::unavailable("Qwen3-ASR audio encoder is not available"))?;
+        result
+            .recv()
+            .await
+            .map_err(|_| Error::unavailable("Qwen3-ASR audio encoder stopped before it returned an allocation"))?
+    }
+}
+
+impl EncoderExecutorLifecycle for AudioEncoderExecutor {
+    fn model_name(&self) -> &str {
+        "Qwen3-ASR Audio Encoder"
+    }
+
+    fn start(&self) -> std::result::Result<(), ModelExecutorError> {
+        let (response, result) = std::sync::mpsc::sync_channel(1);
+        self.jobs
+            .send_blocking(AudioEncoderJob::Start(response))
+            .expect("Audio encoder worker must exist during service start");
+        result
+            .recv()
+            .expect("Audio encoder worker must return its start result")
+    }
+
+    fn stop(&self) {
+        let (response, result) = std::sync::mpsc::sync_channel(1);
+        self.jobs
+            .send_blocking(AudioEncoderJob::Stop(response))
+            .expect("Audio encoder worker must exist during service stop");
+        result
+            .recv()
+            .expect("Audio encoder worker must acknowledge service stop");
+    }
+}
+
+impl AudioEncoderModel {
+    fn load(
+        model_dir: PathBuf,
+        config: Qwen3ASRAudioConfig,
+        bindings: Qwen3ASRAudioWeightBindings,
+        arena: Arc<MetalResourceArena>,
+    ) -> std::result::Result<Self, ModelExecutorError> {
+        let device = Device::system_default();
+        let stream = Stream::new(&device);
+        let mut model = Self {
+            model_dir,
+            config,
+            bindings,
+            device,
+            stream,
+            arena,
+            tower: None,
+        };
+        model.load_weights()?;
+        Ok(model)
+    }
+
+    fn tower(&self) -> &AudioTower {
+        self.tower
+            .as_ref()
+            .expect("Audio encoder weights must be loaded before execution")
+    }
+}
+
+impl ReplayableEncoderModel for AudioEncoderModel {
+    type Input = AudioEncoderInput;
+    type ModelOpsRecorder = ReplayProgram;
+    type Output = OffsetAllocation;
+    type PreparedInput = AudioEncoderPreparedInput;
+    type Submission = MetalReplaySubmission;
+
+    fn model_name(&self) -> &str {
+        "Qwen3-ASR Audio Encoder"
+    }
+
+    fn unload_weights(&mut self) {
+        assert!(
+            self.tower.take().is_some(),
+            "Audio encoder weights must be loaded before unload"
+        );
+    }
+
+    fn load_weights(&mut self) -> std::result::Result<(), ModelExecutorError> {
+        assert!(
+            self.tower.is_none(),
+            "Audio encoder weights must be unloaded before load"
+        );
+        let mut store = SafeTensorStore::from_model_dir(&self.model_dir)?;
+        self.tower = Some(AudioTower::load(
+            &self.device,
+            &mut store,
+            self.config.clone(),
+            self.bindings.clone(),
+        )?);
+        Ok(())
+    }
+
+    fn prepare(&mut self, input: Self::Input) -> Self::PreparedInput {
+        self.tower().prepare(&self.device, &input.source, input.allocation)
+    }
+
+    fn record(&mut self, input: &Self::PreparedInput) -> Self::ModelOpsRecorder {
+        let mut recorder = self.stream.create_replay_program();
+        self.tower().record(&mut recorder, input, &self.arena);
+        recorder.build()
+    }
+
+    fn submit(&mut self, recorder: &Self::ModelOpsRecorder) -> Self::Submission {
+        MetalReplayRuntime::new(&self.stream).submit_replay(recorder)
+    }
+
+    fn complete(
+        &mut self,
+        input: Self::PreparedInput,
+        recorder: Self::ModelOpsRecorder,
+        submission: Self::Submission,
+    ) -> Self::Output {
+        submission.wait();
+        drop(recorder);
+        input.allocation
+    }
+}
+
+fn run_audio_encoder_worker(model: &mut AudioEncoderModel, jobs: async_channel::Receiver<AudioEncoderJob>) {
+    while let Ok(job) = jobs.recv_blocking() {
+        match job {
+            AudioEncoderJob::Encode { source, response } => {
+                if model.tower.is_none()
+                    && let Err(error) = model.load_weights()
+                {
+                    let _ = response.send_blocking(Err(Error::unavailable(format!(
+                        "unable to load Qwen3-ASR audio encoder weights: {error}"
+                    ))));
+                    continue;
+                }
+                let num_resource_tokens = source.num_resource_tokens();
+                let hidden_dim_bytes = model.config.output_dim * size_of::<half::bf16>();
+                let allocation = model.arena.alloc_segment(num_resource_tokens * hidden_dim_bytes);
+                let result = allocation.map(|allocation| model.execute(AudioEncoderInput::new(source, allocation)));
+                let _ = response.send_blocking(result);
+            },
+            AudioEncoderJob::Start(response) => {
+                let result = if model.tower.is_some() {
+                    Ok(())
+                } else {
+                    model.load_weights()
+                };
+                let _ = response.send(result);
+            },
+            AudioEncoderJob::Stop(response) => {
+                if model.tower.is_some() {
+                    model.unload_weights();
+                }
+                let _ = response.send(());
+            },
+        }
+    }
+}
+
 impl AudioTower {
     pub fn load(
         device: &Device,
@@ -117,8 +378,6 @@ impl AudioTower {
         Ok(Self {
             config,
             dimensions,
-            device: device.clone(),
-            stream: Stream::new(device),
             unfold: conv2d_unfold::Kernel::new(device),
             layout: audio_encoder_layout::Compute::new(device),
             bias_activation: bias_activation_bf16::Kernel::new(device),
@@ -136,7 +395,12 @@ impl AudioTower {
         })
     }
 
-    pub fn encode(&self, source: &Qwen3ASRAudioSource, arena: &MetalResourceArena, allocation: &OffsetAllocation) {
+    fn prepare(
+        &self,
+        device: &Device,
+        source: &Qwen3ASRAudioSource,
+        allocation: OffsetAllocation,
+    ) -> AudioEncoderPreparedInput {
         debug_assert_eq!(source.num_mel_bins(), self.config.num_mel_bins);
         debug_assert!(source.num_frames() <= self.config.max_source_positions * 2);
         let shape = AudioShape::new(source.num_frames(), self.dimensions);
@@ -147,42 +411,69 @@ impl AudioTower {
         );
         let output_offset_bytes = allocation.offset_bytes() as usize;
 
-        let source_buffer = Buffer::from_slice(&self.device, source.features());
-        let chunked = bf16_buffer(&self.device, shape.chunked_values());
-        let max_unfold = bf16_buffer(&self.device, shape.max_unfold_values());
-        let conv_a = bf16_buffer(&self.device, shape.max_conv_values());
-        let conv_b = bf16_buffer(&self.device, shape.max_conv_values());
-        let flattened = bf16_buffer(&self.device, shape.flattened_values());
-        let projected = bf16_buffer(&self.device, shape.projected_values());
-        let hidden_a = bf16_buffer(&self.device, shape.hidden_values());
-        let hidden_b = bf16_buffer(&self.device, shape.hidden_values());
-        let norm = bf16_buffer(&self.device, shape.hidden_values());
-        let q = bf16_buffer(&self.device, shape.hidden_values());
-        let k = bf16_buffer(&self.device, shape.hidden_values());
-        let v = bf16_buffer(&self.device, shape.hidden_values());
-        let branch = bf16_buffer(&self.device, shape.hidden_values());
-        let ffn = bf16_buffer(&self.device, shape.ffn_values());
+        AudioEncoderPreparedInput {
+            shape,
+            output_offset_bytes,
+            allocation,
+            source: Buffer::from_slice(device, source.features()),
+            chunked: bf16_buffer(device, shape.chunked_values()),
+            max_unfold: bf16_buffer(device, shape.max_unfold_values()),
+            conv_a: bf16_buffer(device, shape.max_conv_values()),
+            conv_b: bf16_buffer(device, shape.max_conv_values()),
+            flattened: bf16_buffer(device, shape.flattened_values()),
+            projected: bf16_buffer(device, shape.projected_values()),
+            hidden_a: bf16_buffer(device, shape.hidden_values()),
+            hidden_b: bf16_buffer(device, shape.hidden_values()),
+            norm: bf16_buffer(device, shape.hidden_values()),
+            q: bf16_buffer(device, shape.hidden_values()),
+            k: bf16_buffer(device, shape.hidden_values()),
+            v: bf16_buffer(device, shape.hidden_values()),
+            branch: bf16_buffer(device, shape.hidden_values()),
+            ffn: bf16_buffer(device, shape.ffn_values()),
+        }
+    }
 
-        let mut replay = self.stream.create_replay_program();
+    fn record(&self, replay: &mut ReplayProgramBuilder, input: &AudioEncoderPreparedInput, arena: &MetalResourceArena) {
+        let AudioEncoderPreparedInput {
+            shape,
+            output_offset_bytes,
+            allocation: _,
+            source,
+            chunked,
+            max_unfold,
+            conv_a,
+            conv_b,
+            flattened,
+            projected,
+            hidden_a,
+            hidden_b,
+            norm,
+            q,
+            k,
+            v,
+            branch,
+            ffn,
+        } = input;
+        let shape = *shape;
         replay.record(self.layout.invoke_chunk_log_mel(
             audio_encoder_layout::LogMelChunkShape {
                 num_mel_bins: shape.num_mel_bins,
                 num_frames: shape.num_frames,
                 frames_per_chunk: shape.chunk_frames,
             },
-            &source_buffer,
-            &chunked,
+            source,
+            chunked,
         ));
 
         let conv_shapes = shape.conv_shapes();
-        let mut input = &chunked;
-        for ((affine, conv_shape), output) in self.conv.iter().zip(conv_shapes).zip([&conv_a, &conv_b, &conv_a]) {
-            replay.record_with_barrier_before(self.unfold.invoke(conv_shape, input, &max_unfold));
+        let mut input = chunked;
+        for ((affine, conv_shape), output) in self.conv.iter().zip(conv_shapes).zip([conv_a, conv_b, conv_a]) {
+            replay.record_with_barrier_before(self.unfold.invoke(conv_shape, input, max_unfold));
             replay.record_with_barrier_before(affine.matmul.invoke(
                 conv_shape.output_rows(),
                 output,
                 0,
-                &max_unfold,
+                max_unfold,
                 0,
                 &affine.weight,
                 0,
@@ -211,13 +502,13 @@ impl AudioTower {
                 channels: CONV_CHANNELS,
             },
             input,
-            &flattened,
+            flattened,
         ));
         replay.record_with_barrier_before(self.conv_out.matmul.invoke(
             shape.projected_rows,
-            &projected,
+            projected,
             0,
-            &flattened,
+            flattened,
             0,
             &self.conv_out.weight,
             0,
@@ -228,19 +519,19 @@ impl AudioTower {
                 source_rows_per_chunk: shape.rows_per_chunk,
                 hidden_dim: shape.d_model,
             },
-            &projected,
-            &hidden_a,
+            projected,
+            hidden_a,
         ));
 
-        let mut residual = &hidden_a;
-        let mut next = &hidden_b;
+        let mut residual = hidden_a;
+        let mut next = hidden_b;
         for layer in &self.layers {
-            replay.record_with_barrier_before(layer.self_attention_norm.invoke(shape.num_rows, residual, &norm));
-            for (affine, destination) in [(&layer.q, &q), (&layer.k, &k), (&layer.v, &v)] {
+            replay.record_with_barrier_before(layer.self_attention_norm.invoke(shape.num_rows, residual, norm));
+            for (affine, destination) in [(&layer.q, q), (&layer.k, k), (&layer.v, v)] {
                 affine.record(
-                    &mut replay,
+                    replay,
                     shape.num_rows,
-                    &norm,
+                    norm,
                     destination,
                     bias_activation_bf16::Activation::Identity,
                     &self.bias_activation,
@@ -252,58 +543,58 @@ impl AudioTower {
                     block_size: self.dimensions.attention_window_rows,
                 },
                 tower_block_attention::Buffers {
-                    query: &q,
-                    key: &k,
-                    value: &v,
-                    output: &branch,
+                    query: q,
+                    key: k,
+                    value: v,
+                    output: branch,
                 },
             ));
             layer.output.record(
-                &mut replay,
+                replay,
                 shape.num_rows,
-                &branch,
-                &q,
+                branch,
+                q,
                 bias_activation_bf16::Activation::Identity,
                 &self.bias_activation,
             );
-            self.record_residual_add(&mut replay, shape, residual, &q, next);
+            self.record_residual_add(replay, shape, residual, q, next);
             std::mem::swap(&mut residual, &mut next);
 
-            replay.record_with_barrier_before(layer.final_norm.invoke(shape.num_rows, residual, &norm));
+            replay.record_with_barrier_before(layer.final_norm.invoke(shape.num_rows, residual, norm));
             layer.fc1.record(
-                &mut replay,
+                replay,
                 shape.num_rows,
-                &norm,
-                &ffn,
+                norm,
+                ffn,
                 bias_activation_bf16::Activation::Gelu,
                 &self.bias_activation,
             );
             layer.fc2.record(
-                &mut replay,
+                replay,
                 shape.num_rows,
-                &ffn,
-                &q,
+                ffn,
+                q,
                 bias_activation_bf16::Activation::Identity,
                 &self.bias_activation,
             );
-            self.record_residual_add(&mut replay, shape, residual, &q, next);
+            self.record_residual_add(replay, shape, residual, q, next);
             std::mem::swap(&mut residual, &mut next);
         }
 
-        replay.record_with_barrier_before(self.ln_post.invoke(shape.num_rows, residual, &norm));
+        replay.record_with_barrier_before(self.ln_post.invoke(shape.num_rows, residual, norm));
         self.proj1.record(
-            &mut replay,
+            replay,
             shape.num_rows,
-            &norm,
-            &q,
+            norm,
+            q,
             bias_activation_bf16::Activation::Gelu,
             &self.bias_activation,
         );
         replay.record_with_barrier_before(self.proj2.matmul.invoke(
             shape.num_rows,
             arena.storage().buffer(),
-            output_offset_bytes,
-            &q,
+            *output_offset_bytes,
+            q,
             0,
             &self.proj2.weight,
             0,
@@ -315,12 +606,11 @@ impl AudioTower {
             },
             bias_activation_bf16::Activation::Identity,
             arena.storage().buffer(),
-            output_offset_bytes,
+            *output_offset_bytes,
             &self.proj2.bias,
             arena.storage().buffer(),
-            output_offset_bytes,
+            *output_offset_bytes,
         ));
-        self.stream.submit_replay(&replay.build()).wait();
     }
 
     fn record_residual_add<'a>(

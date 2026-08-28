@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use inference_executor_core::model::EncoderExecutorLifecycle;
 use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_asr::QWEN3_ASR_AUDIO_RESOURCE_TYPE;
@@ -14,6 +15,7 @@ use inference_runtime_core::log_err_internal;
 use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
 
 use crate::asr::Qwen3ASRService;
+use crate::executor::ReplayableModelExecutors;
 use crate::qwen_server::args::Qwen3ASRArgs;
 use crate::qwen_server::config::Qwen3ASRConfig;
 use crate::qwen_server::sizing::block_cache_capacity;
@@ -65,6 +67,7 @@ fn run_inner() -> Result<()> {
         Arc::clone(&loaded.audio_processor),
     )?);
     let mut resource_processors = ResourceProcessors::new();
+    let encoder_executors: Vec<Arc<dyn EncoderExecutorLifecycle>> = vec![loaded.audio_processor.encoder_executor()];
     resource_processors.register(QWEN3_ASR_AUDIO_RESOURCE_TYPE, loaded.audio_processor);
     let cache_lane = runtime_config.cache_lane(0);
     tracing::info!(
@@ -94,7 +97,7 @@ fn run_inner() -> Result<()> {
         Arc::new(resource_processors),
         runtime_config,
         scheduler_config,
-        loaded.executor,
+        ReplayableModelExecutors::new(loaded.executor, encoder_executors),
     )
 }
 

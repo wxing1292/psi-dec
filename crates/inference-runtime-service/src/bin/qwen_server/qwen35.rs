@@ -21,6 +21,7 @@ use inference_runtime_core::log_info_invalid_argument;
 use inference_runtime_core::runtime::resource::processor::ResourceProcessors;
 
 use crate::codec::qwen::QwenCodec;
+use crate::executor::ReplayableModelExecutors;
 use crate::qwen_server::args::Qwen35Args;
 use crate::qwen_server::config::Qwen35Config;
 use crate::qwen_server::config::Qwen35ModelMode;
@@ -183,7 +184,7 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
         Arc::new(ResourceProcessors::new()),
         runtime_config,
         scheduler_config,
-        model,
+        ReplayableModelExecutors::new(model, vec![]),
     )
 }
 

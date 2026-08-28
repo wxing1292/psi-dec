@@ -1,32 +1,34 @@
+use std::sync::Arc;
+
 use half::bf16;
 use inference_backend_metal::metal::Device;
-use inference_executor_core::checkpoint::SafeTensorStore;
+use inference_executor_core::model::EncoderExecutorLifecycle;
 use inference_executor_core::model::qwen::v3_asr::Qwen3ASRAudioSource;
 use inference_executor_core::model::qwen::v3_asr::init_qwen3_asr_config;
 use inference_executor_core::model::qwen::v3_asr::weight_layout::resolve_qwen3_asr_weight_bindings;
-use inference_runtime_core::memory::BlockAllocator;
 
-use super::AudioTower;
+use super::AudioEncoderExecutor;
 use super::BF16_BYTES;
 use crate::model::resource_arena::new_resource_arena;
 
 #[test]
 #[ignore = "requires PSI_DEC_QWEN3_ASR_MODEL_DIR and the pinned local checkpoint"]
-fn test_encode_fixed() {
+fn test_audio_encoder_fixed() {
     let model_dir = std::env::var("PSI_DEC_QWEN3_ASR_MODEL_DIR").unwrap();
     let config = init_qwen3_asr_config(&model_dir).unwrap();
-    let mut store = SafeTensorStore::from_model_dir(&model_dir).unwrap();
+    let store = inference_executor_core::checkpoint::SafeTensorStore::from_model_dir(&model_dir).unwrap();
     let names = store.index().tensor_names().collect::<Vec<_>>();
     let bindings = resolve_qwen3_asr_weight_bindings(&config, names).unwrap();
     let device = Device::system_default();
-    let arena = new_resource_arena(&device, 16 * 1024);
-    let tower = AudioTower::load(&device, &mut store, config.audio, bindings.audio).unwrap();
+    let arena = Arc::new(new_resource_arena(&device, 16 * 1024));
+    let executor = AudioEncoderExecutor::load(&model_dir, config.audio, bindings.audio, Arc::clone(&arena)).unwrap();
     let features = (0..128 * 8)
         .map(|index| (index as f32 * 0.017).sin() + (index as f32 * 0.003).cos())
         .collect();
     let source = Qwen3ASRAudioSource::new(features, 128, 8).unwrap();
-    let allocation = arena.alloc_segment(2048 * BF16_BYTES).unwrap();
-    tower.encode(&source, &arena, &allocation);
+    executor.stop();
+    executor.start().unwrap();
+    let allocation = futures_lite::future::block_on(executor.encode(Arc::new(source))).unwrap();
     let actual = arena
         .storage()
         .buffer()

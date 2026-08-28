@@ -564,8 +564,10 @@ and write-distribution contracts are in [`executor_sampling.md`](executor_sampli
 
 ## Concurrency and lifecycle
 
-The current service path uses one executor synchronously. The executor prepares a batch, executes it, obtains the
-result, and commits before the next batch.
+The current decoder service path uses one decoder executor synchronously.
+The decoder executor prepares a batch, executes it, obtains the result, and commits before the next decoder batch.
+Audio and Vision encoder executors use independent workers and Metal streams.
+They can execute while the decoder worker processes unrelated requests.
 
 Replay caches, scratch owners, request-slot state, and pending GDN transactions therefore remain executor-owned. They
 remain confined to one thread unless an API explicitly states otherwise.
@@ -573,7 +575,8 @@ remain confined to one thread unless an API explicitly states otherwise.
 Runtime core still owns the durable request and cache lifecycle. The executor reports sampled decisions and component
 results. It does not free globally owned pages or commit scheduler state independently.
 
-`inference-executor-core` owns `ReplayableDecoderModel`, executor timing, submission, and page interpretation contracts.
+`inference-executor-core` owns `ReplayableDecoderModel`, `ReplayableEncoderModel`, executor timing, submission, and page
+interpretation contracts.
 `ReplayableDecoderModel` also defines synchronous model residency operations.
 `model_name()` reports model identity. `model_mode()` reports the executor-owned `vanilla`, `mtp`, `dspark`, or
 `dflash2` composition mode for service telemetry.
@@ -584,6 +587,24 @@ Current Qwen model executors support this order:
 stop: clear_replay_cache -> unload_state -> unload_weights
 start: load_weights -> load_state
 ```
+
+Audio and Vision use standalone encoder executors.
+`AudioEncoderExecutor` and `VisionEncoderExecutor` each own one worker thread and one Metal stream.
+The worker owns a private model that implements `ReplayableEncoderModel`.
+This trait defines `prepare`, `record`, `submit`, and `complete` without decoder request slots, sampling, KV state, or
+snapshot operations.
+The encoder records one replay program for each current request.
+Replay reuse requires a future submission-argument contract for source and arena ranges.
+
+The service owns the heterogeneous `EncoderExecutorLifecycle` collection.
+`ReplayableModelExecutors<M>` groups one decoder with this encoder collection at the service boundary.
+It does not add execution or scheduling policy.
+It stops each encoder before it unloads decoder state and weights.
+It starts each encoder after it loads decoder state and before it accepts the next decoder batch.
+Encoder Stop drains earlier jobs on the encoder FIFO before it unloads weights.
+Encoder Start reloads weights on the same worker and stream.
+An encode job that races after Stop reloads the encoder before it records work.
+This rule prevents the scheduler hibernation timer from invalidating an in-flight resource task.
 
 The model shell remains allocated while its resources are unloaded.
 Weight-bearing component shells remain allocated and fail fast if execution accesses missing weights.
@@ -616,6 +637,7 @@ The manifest stores the exact `ExecutorHibernationPlan` used by Stop and Start.
 See [`model_state_io.md`](model_state_io.md) for the current format and remaining work.
 
 `ReplayableDecoderModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
+It coordinates the registered encoder executor lifecycles at the same command boundary.
 It also starts a stopped model before it executes a batch.
 Runtime core tracks executor residency and sends ordered lifecycle commands after the configured idle period.
 See [`executor_hibernation.md`](executor_hibernation.md) for the current lifecycle and remaining work.
