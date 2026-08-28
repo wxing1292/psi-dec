@@ -15,7 +15,7 @@ use inference_executor_core::attn::BiDiBlockCapacity;
 use inference_executor_core::attn::BiDiBlockGQAMetadata;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::checkpoint::SafeTensorStore;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3::Qwen3ModelConfig;
 use inference_executor_core::model::qwen::v3::init_qwen3_model_config;

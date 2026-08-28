@@ -13,7 +13,7 @@ use inference_backend_metal::metal::ReplayExecution;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::ModelOutputTiming;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3::Qwen3DecodeDecision;
 use inference_executor_core::model::qwen::v3::Qwen3Microbatch;
 use inference_executor_core::model::qwen::v3::Qwen3ModelBatchRequest;
@@ -565,7 +565,7 @@ impl Qwen3PendingTransactions {
     }
 }
 
-impl ReplayableModel for Qwen3Executor {
+impl ReplayableDecoderModel for Qwen3Executor {
     type ModelBatchRequest = Qwen3ModelBatchRequest;
     type ModelBatchHidden = Rc<Buffer>;
     type ModelBatchResponse = Qwen3ModelBatchResponse;
@@ -954,7 +954,7 @@ fn num_page_ids_per_block(num_tokens_per_block: usize, num_tokens_per_page: usiz
 
 #[cfg(test)]
 mod tests {
-    use inference_executor_core::model::ReplayableModel;
+    use inference_executor_core::model::ReplayableDecoderModel;
     use inference_executor_core::model::qwen::v3::Qwen3ModelBatchRequest;
     use inference_executor_core::model::qwen::v3_asr::audio_output_rows;
     use inference_runtime_core::compute::BatchDeviceRequest;
@@ -980,7 +980,7 @@ mod tests {
             num_tokens_per_block: 1024,
         }
         .validate();
-        fn assert_compact_qwen3_batch<T: ReplayableModel<ModelBatchRequest = Qwen3ModelBatchRequest>>() {}
+        fn assert_compact_qwen3_batch<T: ReplayableDecoderModel<ModelBatchRequest = Qwen3ModelBatchRequest>>() {}
         assert_compact_qwen3_batch::<Qwen3Executor>();
     }
 

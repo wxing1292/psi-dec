@@ -573,8 +573,8 @@ remain confined to one thread unless an API explicitly states otherwise.
 Runtime core still owns the durable request and cache lifecycle. The executor reports sampled decisions and component
 results. It does not free globally owned pages or commit scheduler state independently.
 
-`inference-executor-core` owns `ReplayableModel`, executor timing, submission, and page interpretation contracts.
-`ReplayableModel` also defines synchronous model residency operations.
+`inference-executor-core` owns `ReplayableDecoderModel`, executor timing, submission, and page interpretation contracts.
+`ReplayableDecoderModel` also defines synchronous model residency operations.
 `model_name()` reports model identity. `model_mode()` reports the executor-owned `vanilla`, `mtp`, `dspark`, or
 `dflash2` composition mode for service telemetry.
 All recoverable model operations return `ModelExecutorError`.
@@ -615,7 +615,7 @@ configuration. It does not use a GDN snapshot DTO.
 The manifest stores the exact `ExecutorHibernationPlan` used by Stop and Start.
 See [`model_state_io.md`](model_state_io.md) for the current format and remaining work.
 
-`ReplayableModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
+`ReplayableDecoderModelEventLoop` invokes these operations for idempotent `Start` and `Stop` commands.
 It also starts a stopped model before it executes a batch.
 Runtime core tracks executor residency and sends ordered lifecycle commands after the configured idle period.
 See [`executor_hibernation.md`](executor_hibernation.md) for the current lifecycle and remaining work.

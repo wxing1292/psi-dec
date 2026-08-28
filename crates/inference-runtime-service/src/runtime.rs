@@ -10,7 +10,7 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TrySendError;
 use crossbeam_channel::bounded as sync_bounded;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_runtime_core::Error;
 use inference_runtime_core::Result;
 use inference_runtime_core::channel::DedupNotifier;
@@ -54,7 +54,7 @@ use inference_runtime_core::runtime::validate_resources;
 
 use crate::api::Inference;
 use crate::consts::NUM_TRIE_PARTITION;
-use crate::executor::ReplayableModelEventLoop;
+use crate::executor::ReplayableDecoderModelEventLoop;
 use crate::rpc;
 use crate::rpc::HTTPService;
 
@@ -388,7 +388,7 @@ pub fn serve_replay_model<const N: usize, const L: usize, M>(
     model: M,
 ) -> Result<()>
 where
-    M: ReplayableModel,
+    M: ReplayableDecoderModel,
 {
     let shutdown = Shutdown::new();
     let server_tokio_runtime = tokio::runtime::Runtime::new()
@@ -421,7 +421,7 @@ where
         })
         .map_err(|error| log_err_unavailable!("unable to start RPC server thread: {error}"))?;
 
-    let executor = ReplayableModelEventLoop::new(
+    let executor = ReplayableDecoderModelEventLoop::new(
         runtime.model_executor_request_rx(),
         runtime.model_executor_response_tx(),
         runtime.request_slot_reset_notifier(),

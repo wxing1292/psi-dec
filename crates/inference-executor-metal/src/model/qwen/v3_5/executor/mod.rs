@@ -54,7 +54,7 @@ use inference_executor_core::attn::gdn::state::GDNStateTxn;
 use inference_executor_core::backend::runtime::Runtime;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::ModelOutputTiming;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3_5::Qwen35DecodeDecision;
 use inference_executor_core::model::qwen::v3_5::Qwen35Microbatch;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelBatchRequest;
@@ -1000,7 +1000,7 @@ pub struct Qwen35SampledOutput {
     timing: ModelOutputTiming,
 }
 
-impl ReplayableModel for Qwen35Executor {
+impl ReplayableDecoderModel for Qwen35Executor {
     type ModelBatchRequest = Qwen35ModelBatchRequest;
     type ModelBatchHidden = Rc<Buffer>;
     type ModelBatchResponse = Qwen35ModelBatchResponse;

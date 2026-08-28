@@ -8,7 +8,7 @@ use crossbeam_channel::Select;
 use crossbeam_channel::SelectedOperation;
 use crossbeam_channel::Sender;
 use inference_executor_core::model::ExecutionSubmission;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_runtime_core::channel::DedupNotifier;
 use inference_runtime_core::channel::Shutdown;
 use inference_runtime_core::compute::BatchDeviceRequest;
@@ -29,7 +29,7 @@ use crate::perf_metrics::summarize_batch_device_response;
 use crate::profiling;
 use crate::telemetry::emit_executor_batch_perf_metrics;
 
-pub struct ReplayableModelEventLoop<M> {
+pub struct ReplayableDecoderModelEventLoop<M> {
     model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
     model_executor_resp_tx: Sender<ReplayableModelExecutorResponse>,
     req_slot_reset_notifier: Arc<DedupNotifier<RawRequestSlot>>,
@@ -46,9 +46,9 @@ enum ModelExecutorState {
     Stopped(ExecutorHibernationPlan),
 }
 
-impl<M> ReplayableModelEventLoop<M>
+impl<M> ReplayableDecoderModelEventLoop<M>
 where
-    M: ReplayableModel,
+    M: ReplayableDecoderModel,
 {
     pub fn new(
         model_executor_req_rx: Receiver<ReplayableModelExecutorRequest>,
@@ -640,7 +640,7 @@ mod tests {
         }
     }
 
-    impl ReplayableModel for TestModel {
+    impl ReplayableDecoderModel for TestModel {
         type ModelBatchRequest = ();
         type ModelBatchHidden = ();
         type ModelBatchResponse = ();
@@ -830,7 +830,7 @@ mod tests {
         }
     }
 
-    impl ReplayableModel for SpecLifecycleModel {
+    impl ReplayableDecoderModel for SpecLifecycleModel {
         type ModelBatchRequest = ();
         type ModelBatchHidden = ();
         type ModelBatchResponse = ();
@@ -1149,7 +1149,7 @@ mod tests {
         let (event_tx, event_rx) = unbounded();
         let shutdown = Shutdown::new();
         let snapshot_path = test_snapshot_path("request-slot-resets");
-        let executor = ReplayableModelEventLoop::new(
+        let executor = ReplayableDecoderModelEventLoop::new(
             model_executor_req_rx,
             model_executor_resp_tx,
             req_slot_reset_notifier.clone(),
@@ -1187,7 +1187,7 @@ mod tests {
         let (event_tx, event_rx) = unbounded();
         let shutdown = Shutdown::new();
         let snapshot_path = test_snapshot_path("start-stop");
-        let executor = ReplayableModelEventLoop::new(
+        let executor = ReplayableDecoderModelEventLoop::new(
             model_executor_req_rx,
             model_executor_resp_tx,
             req_slot_reset_notifier.clone(),
@@ -1269,7 +1269,7 @@ mod tests {
         let (model_executor_resp_tx, _model_executor_resp_rx) = bounded(1);
         let (req_slot_reset_notifier, req_slot_reset_rx) = DedupNotifier::new();
         let events = Rc::new(RefCell::new(Vec::new()));
-        let mut executor = ReplayableModelEventLoop::new(
+        let mut executor = ReplayableDecoderModelEventLoop::new(
             model_executor_req_rx,
             model_executor_resp_tx,
             req_slot_reset_notifier,

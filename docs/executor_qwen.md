@@ -114,7 +114,7 @@ crates/inference-executor-metal/src/
         layer.rs            Qwen35MTPLayer and role-specific scratch
       plan.rs               Qwen35 component configuration and MTP validation
       executor/
-        mod.rs              Qwen35Executor fields and ReplayableModel integration
+        mod.rs              Qwen35Executor fields and ReplayableDecoderModel integration
         load.rs             layer count pass and separate Vanilla/MTP/DSpark/DFlash2 top-down load
         batch.rs            validation, prepare, reset, and commit lifecycle
         recording.rs        recorder lifecycle and common replay submission

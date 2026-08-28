@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3_x::dspark::init_qwen3x_dspark_config;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;

@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use inference_executor_core::model::ModelOutputTiming;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
 use inference_executor_core::sampling::MAX_TOP_K;
 use inference_executor_metal::model::qwen::v3_5::executor::Qwen35Executor;

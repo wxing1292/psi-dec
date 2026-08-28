@@ -202,7 +202,8 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
   It accepts the production greedy values `temperature=0` and `top_p=0`.
 - The Qwen3.5 Main component targets run `--warmup-iters` before each result sample.
   They sort numeric shape lists and reject duplicate numeric shapes.
-- `qwen35_vanilla_prefill_decode` measures context-aware Prefill and Decode through the public `ReplayableModel`
+- `qwen35_vanilla_prefill_decode` measures context-aware Prefill and Decode through the public
+  `ReplayableDecoderModel`
   lifecycle.
   It resets request slots and rebuilds each starting context with committed, chunked Prefill work before each
   trajectory.

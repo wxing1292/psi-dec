@@ -17,11 +17,11 @@ It must discard runtime cache metadata after any snapshot or restore failure.
 
 ## Current implementation boundary
 
-`inference-executor-core` owns `ReplayableModel`.
+`inference-executor-core` owns `ReplayableDecoderModel`.
 The trait defines batch execution and these synchronous resource operations:
 
 ```rust
-trait ReplayableModel {
+trait ReplayableDecoderModel {
     fn clear_replay_cache(&mut self);
     fn unload_state(
         &mut self,
@@ -42,7 +42,8 @@ Qwen3 and Qwen3.5 implement these operations.
 GQA, GDN, MTP, DSpark, MLP, embed, unembed, and sampling owners participate in symmetric resource traversal.
 The operations run synchronously on the model executor thread.
 
-`ReplayableModelEventLoop` owns the loaded model, its stable `Started` or `Stopped` state, and one state snapshot path.
+`ReplayableDecoderModelEventLoop` owns the loaded model, its stable `Started` or `Stopped` state, and one state snapshot
+path.
 It handles `Batch`, `Start`, and `Stop` requests synchronously on the executor thread.
 `Start` and `Stop` are idempotent when repeated with the same hibernation plan.
 `Batch` starts a stopped model before it executes the batch.
@@ -203,7 +204,7 @@ Future wiring may expose the tracked residency through a status API.
 ## Lifecycle flow
 
 ```text
-runtime core                        ReplayableModelEventLoop
+runtime core                        ReplayableDecoderModelEventLoop
     |                                         |
     | Stop(plan)                                  |
     |---------------------------------------->|

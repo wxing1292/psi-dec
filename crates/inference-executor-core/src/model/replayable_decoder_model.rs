@@ -63,7 +63,7 @@ pub trait ExecutionSubmission {
     }
 }
 
-pub trait ReplayableModel {
+pub trait ReplayableDecoderModel {
     type ModelBatchRequest;
     type ModelBatchHidden;
     type ModelBatchResponse;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3Executor;
 use inference_executor_metal::model::qwen::v3::executor::Qwen3ExecutorConfig;

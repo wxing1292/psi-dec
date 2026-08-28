@@ -1,2 +1,2 @@
-mod replayable_model_event_loop;
-pub use replayable_model_event_loop::ReplayableModelEventLoop;
+mod replayable_decoder_model_event_loop;
+pub use replayable_decoder_model_event_loop::ReplayableDecoderModelEventLoop;

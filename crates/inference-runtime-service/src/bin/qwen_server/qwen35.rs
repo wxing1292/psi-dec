@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use inference_executor_core::model::ReplayableModel;
+use inference_executor_core::model::ReplayableDecoderModel;
 use inference_executor_core::model::qwen::v3_5::QWEN35_PAGE_SIZE_BYTES;
 use inference_executor_core::model::qwen::v3_5::Qwen35ModelConfig;
 use inference_executor_core::model::qwen::v3_5::init_qwen35_model_config;
