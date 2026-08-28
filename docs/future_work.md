@@ -20,6 +20,14 @@ document that owns the component.
 
 ## Runtime Lifecycle
 
+- Revisit cross-request resource sharing after the complete multimodal path is stable.
+  Adapt the existing runtime pin-cache ownership model instead of adding a second ad hoc resource cache.
+  The shared object must be immutable while it has readers.
+  It must keep one RAII owner for arena allocation release.
+  Measure repeated-media workloads before selecting admission and eviction policies.
+- Add bounded retries for retryable resource materialization failures.
+  Keep programming errors as panics or assertions.
+  Abort the request after the retry limit.
 - Replace the single-type async-task response downcast before runtime core adds a second async-task response type.
   The current request path assumes that every `AsyncTaskResp` is a `ResourceMaterializationResp`.
   Keep this temporary assumption while resource materialization is the only async task.
@@ -122,6 +130,20 @@ Any new path must preserve these behaviors:
 
 Use end-to-end TTFT and prompt-throughput evidence to select the implementation. Do not treat a removed or hypothetical
 component path as the design.
+
+## Multimodal Input
+
+- Add long-audio chunking and streaming only after the collected Qwen3-ASR path has parity fixtures.
+  Define timestamp, overlap, context carry, and output-merge contracts before implementation.
+- Add image support with a model-owned image processor, Vision Tower, spatial merger, and true T/H/W M-RoPE.
+  Reuse the runtime resource contracts and `ResourceEmbed` replacement semantics.
+  Do not put vision position logic in runtime core.
+- Add video support after image support.
+  Define demux, frame sampling, timestamp placement, and multi-segment mapping from reference fixtures.
+  Reuse the compatible Vision Tower while keeping image and video processors separate.
+- Measure first-Prefill resource materialization latency and batch interference.
+  Add separate resource-materialization scheduling only if the measurements justify it.
+  Do not add modality-specific scheduler states.
 
 ## Replay Evolution
 

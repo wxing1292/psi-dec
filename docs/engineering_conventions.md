@@ -310,19 +310,30 @@ semantic branch.
 
 ### Validation and arithmetic
 
-Constructors and initialization paths must validate static configuration, topology, capacity, and layout. Explicit
-input validation must validate dynamic external, batch, and runtime inputs. These boundaries establish the trusted
-domain. Within that domain, private paths must use ordinary arithmetic and direct lossless casts. They must not repeat
-checked operations, `assert!`, or `debug_assert!` for a shape or range that an owning boundary already proved.
+The trust boundary determines validation behavior.
+
+Outside the trust boundary, input is not trusted. An explicit input validator must validate user input, external batch
+metadata, checkpoint data, file data, and other externally controlled values. A validation failure must return the
+shared typed `Error` or the component-specific recoverable error. The caller-visible semantics select the error
+variant. For example, invalid RPC input must return `InvalidArgument`.
+
+A constructor or initialization path establishes the trusted domain. It must validate static configuration, topology,
+capacity, layout, narrowing, allocation size, and shader-domain limits that its private paths require. It may use
+checked arithmetic to prove these invariants once.
+
+Inside the trust boundary, code manages invariants. Private paths must use ordinary arithmetic and direct lossless
+casts. An invariant violation is a code bug. Use `panic!`, `assert!`, or `debug_assert!` according to the lifecycle and
+cost rules. Do not convert an invariant violation to a recoverable error. Do not repeat checked operations,
+`assert!`, or `debug_assert!` for a shape or range that an owning boundary already proved.
 
 Each checked addition, subtraction, multiplication, or conversion must identify one named real boundary through its
 owner API, value name, or failure message. Allowed boundaries are allocation or byte sizing, external or runtime counts
 and indices, narrowing, shader counts and element indices, file or snapshot data, state versions, and real overflow.
 
 Outside a constructor, initialization path, explicit input validator, or test, an assertion must protect either a
-complex state or resource transition, or a non-local boundary that no existing owner has proved. Add a concise adjacent
-source comment that names the boundary and explains why the assertion is necessary. Do not add defensive assertions to
-a trusted private path.
+complex state or resource transition, or a non-local invariant that no existing owner has proved. Add a concise
+adjacent source comment that names the invariant and explains why the assertion is necessary. Do not add defensive
+assertions to a trusted private path.
 
 Keep checked arithmetic at these boundaries:
 

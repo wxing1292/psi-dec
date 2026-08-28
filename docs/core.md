@@ -63,7 +63,7 @@ then use that block as a non-terminal prefix.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ QueuedRequest                                                               │
+│ QueuedRequest                                                              │
 │ request ID + tokens + sampling/lifecycle state; no request slot            │
 └───────────────────────────────────┬────────────────────────────────────────┘
                                     │ event-loop admission when a slot is free
@@ -97,11 +97,11 @@ then use that block as a non-terminal prefix.
 │ initialize/reserve decoder blocks -> schedule query tokens                 │
 │ -> build DecoderSyncBlocks -> DeviceRequest                                │
 └──────────┬───────────────┬────────────────┬──────────────────┬─────────────┘
-           │ Continue      │ Pending        │ Await            │ resource/term
+           │ Continue      │ Pending        │ Await            │ async/term
            v               v                v                  v
 ┌──────────────────┐  ┌───────────────┐  ┌────────────────┐  ┌───────────────┐
-│ BatchDeviceReq   │  │ ID map only   │  │ waiting_reqs   │  │ preempt/drop  │
-│ Prefill: requeue │  │ await response│  │ wait future    │  │ or terminal   │
+│ BatchDeviceReq   │  │ ID map only   │  │ waiting_reqs   │  │ task pool or  │
+│ Prefill: requeue │  │ await response│  │ wait future    │  │ preempt/drop  │
 │ Decode: map only │  └───────────────┘  └────────────────┘  └───────────────┘
 └────────┬─────────┘
          │ executor submission
@@ -204,6 +204,62 @@ remains a synchronous thread.
 
 This is the complete lifecycle for cache-reservation waits. This lifecycle is not KV and state offload.
 Backing storage remains unchanged. Future onload and offload require an additional explicit ownership design.
+
+### Async tasks and input resources
+
+`AsyncTaskPool<T>` executes request-associated work outside the synchronous scheduler event loop.
+It is generic over `AsyncTaskReq`.
+It does not depend on `UserRequest`.
+
+`PrepareResult::BlockingAsyncTask` retains the internal request only in the request-ID map.
+It prevents further request preparation until the response updates the request.
+`PrepareResult::NonblockingAsyncTask` keeps the internal request runnable.
+Both task types prevent terminal request release until their responses arrive.
+
+Runtime core currently uses this path for input-resource materialization.
+A request owns each `Resource` and its stable `ResourcePlacement`.
+A symbolic resource contains a typed UUID and an opaque `ResourceURI`.
+A concrete resource also owns an arena `OffsetAllocation` and its logical resource-token count.
+
+`ResourcePlacement` maps absolute initial-request token ranges to logical resource-token ranges.
+Runtime intersects that mapping with each cache block.
+It stores the result as a `ResourceSegment` trie annotation.
+The segment contains the resource ID, block-local token index, logical resource index, and segment length.
+
+Cache-block initialization applies this sequence:
+
+```text
+trie block hit
+  -> do not materialize annotated resources
+
+trie block miss
+  -> all referenced resources are concrete
+       -> initialize the block and continue
+
+  -> one referenced resource is symbolic
+       -> return ResourceNotFound
+       -> create ResourceMaterializationReq outside init_block_once
+       -> dispatch through the registered ResourceTypeProcessor
+       -> apply ResourceMaterializationResp to the retained internal request
+       -> initialize the block again
+```
+
+Runtime core dispatches by `ResourceTypeID`.
+It does not interpret media types, checkpoint metadata, or tower inputs.
+The registered processor owns model-specific materialization.
+
+The materialization task does not hold the internal request.
+The task carries the request ID and required resource IDs.
+The response returns concrete resources with the same identities.
+The internal request changes the matching symbolic resources to concrete resources.
+
+Runtime does not keep a mutable cache-block reservation while a blocking resource task runs.
+A concrete resource must remain alive until all device work that reads its allocation is complete.
+The allocation returns its byte range through RAII release.
+
+The current runtime has one async response type.
+`InternalRequest` therefore downcasts `AsyncTaskResp` to `ResourceMaterializationResp`.
+[`future_work.md`](future_work.md) records the required typed dispatch work before a second response type is added.
 
 The event loop can submit after two request-work events:
 

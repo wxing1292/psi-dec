@@ -1,6 +1,6 @@
 # Qwen Executor
 
-This document describes the current Qwen3 and Qwen3.5/Qwen3.6/Qwen3.8 Metal executors.
+This document describes the current Qwen3, Qwen3-ASR, and Qwen3.5/Qwen3.6/Qwen3.8 Metal executors.
 The document covers checkpoint configuration, top-down loading, state preparation, cached replay, and sampling.
 Qwen3 supports separate Vanilla and fixed-block DSpark modes.
 Qwen3.5 supports separate Vanilla, reusable-layer MTP, fixed-block DSpark, and DFlash2 modes.
@@ -14,6 +14,11 @@ crates/inference-executor-core/src/model/qwen/v3/
   config.rs                 Qwen3ModelConfig/Qwen3TextConfig, strict parsing, and EOS fallback
   batch.rs                  Qwen3Microbatch, request, response, and sampled-decision contracts
   weight_layout.rs          exact Qwen3 Main/unembed binding tree
+
+crates/inference-executor-core/src/model/qwen/v3_asr/
+  config.rs                 strict Qwen3-ASR checkpoint and preprocessor contract
+  input.rs                  prepared audio and Audio Tower output-row geometry
+  weight_layout.rs          exact Audio Tower and shared Qwen3 text binding tree
 
 crates/inference-executor-core/src/model/qwen/v3_x/
   config.rs                 shared quantization, RoPE, and tensor-path value utilities
@@ -94,6 +99,9 @@ crates/inference-executor-metal/src/
         main.rs             MainEmbed, Main, and GatherUnembed orchestration
         sampling.rs         ordinary or rejection sampling and readback
         dspark.rs           DSpark Spec proposal orchestration
+    qwen/v3_asr/
+      audio.rs              Audio Tower load, model graph, and execution
+      resource.rs           prepared audio registration and async materialization
     qwen/v3_5/
       main/
         mod.rs              Qwen35 Main owner and replay key
@@ -175,6 +183,15 @@ Qwen3Executor
       rejection_sampling: Replay<RejectionSampling>
       spec_probs: SpecProbsStore
   pages: PageArena
+
+Qwen3-ASR service composition
+  audio_processor: Qwen3ASRAudioProcessor
+    audio_worker: AudioTower
+    resource_arena: MetalResourceArena
+  executor: Qwen3Executor
+    input_embedding: Qwen3InputEmbedding::Resource
+      resource_embed: Replay<ResourceEmbed>
+    shared Qwen3 Main text decoder
 
 Qwen35Executor
   main_gqa_state: Qwen3xGQAState
@@ -318,6 +335,13 @@ It does not add a variant to `Qwen35MTPLayer`.
 `Qwen3xDFlash2Layer` composes its own attention, dynamic grouped-convolution, RMSNorm, dense MLP, and residual
 components.
 It is not a DSpark flag or a `Qwen3xDSparkLayer` variant.
+
+Qwen3-ASR composes a separate Audio Tower with the Qwen3 text decoder.
+The CPU audio preprocessor and Audio Tower are model-owned components.
+The runtime sees only resources, placement spans, and async materialization tasks.
+The executor embeds vocabulary tokens first and then replaces active audio placeholder rows with Audio Tower output.
+Text-only Qwen3 retains its original embedding path.
+[`qwen3_asr.md`](qwen3_asr.md) defines the complete current Qwen3-ASR contract.
 
 `Qwen3xGQA` and `Qwen3xGDN` store compact per-kind layer indices, not model-layer indices, for page-table and
 state-arena addressing.
@@ -1122,6 +1146,8 @@ ephemeral executor workspaces.
 
 Unit tests cover:
 
+- Qwen3-ASR checkpoint parsing, audio preparation, Audio Tower execution, resource materialization, and
+  text-and-audio composition.
 - The strict flat Qwen3 adapter.
 - Model-specific Main batch contracts.
 - Normalized Qwen3.5 configuration and exact bindings.
@@ -1142,6 +1168,7 @@ They do not duplicate its numerical test. DFlash2 Output has a candidate-selecti
 GatherUnembed contract. Its Gather, Unembed, Top-K, codebook Embed, and selector leaves retain independent numerical
 coverage.
 
+End-to-end verification exercises Qwen3-ASR transcription through the service endpoint.
 End-to-end tests exercise Qwen3 Main-only and Qwen3 DSpark through server/decode.
 They also exercise Qwen3.5 Vanilla, MTP, and DSpark modes.
 Focused DFlash2 unit tests cover its new model and backend contracts.

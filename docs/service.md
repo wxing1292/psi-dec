@@ -3,8 +3,9 @@
 The service runs one transport-neutral `Inference` API over the runtime. The gRPC adapter submits model-ready token IDs
 through its `decode` operation.
 
-The HTTP adapter provides collected and streaming OpenAI-compatible Chat Completions. It uses the same `decode`
-operation.
+The HTTP adapter provides collected and streaming OpenAI-compatible Chat Completions.
+The Qwen3-ASR service instead provides collected OpenAI-compatible audio transcription.
+Both adapters use the same `decode` operation.
 
 [`core.md`](core.md) defines runtime scheduling and page ownership. The executor documents define model execution.
 
@@ -21,7 +22,9 @@ operation.
 `rpc/grpc/` owns protobuf conversion and tonic status mapping. `rpc/http/` owns HTTP listener setup, JSON parsing, and
 HTTP error mapping.
 
-The Qwen server loads one immutable `QwenCodec` from the model directory. It shares this codec with HTTP requests.
+The text Qwen server loads one immutable `QwenCodec` from the model directory.
+It shares this codec with HTTP requests.
+The Qwen3-ASR server loads one immutable `Qwen3ASRService` and its checkpoint tokenizer.
 
 RPC converts wire objects to the codec domain. It also maps codec events back to wire objects. RPC does not implement
 these functions:
@@ -152,7 +155,8 @@ The inference server does not own these controls:
 
 ## Binaries and checkpoints
 
-The service provides Qwen3 and Qwen3.5 binaries with optional speculative models.
+The service provides Qwen3, Qwen3-ASR, and Qwen3.5 binaries.
+The text-generation binaries can use optional speculative models.
 DSpark and DFlash2 support is experimental.
 Their checkpoint contracts, CLI, cache sizing, and proposal policies may change.
 It also provides Qwen3.5 binaries that retain their names for compatible Qwen3.6 and Qwen3.8 MLX checkpoints:
@@ -160,6 +164,7 @@ It also provides Qwen3.5 binaries that retain their names for compatible Qwen3.6
 | Model                  | Binary           | Main checkpoint                      | Optional Spec checkpoint                  |
 | ---------------------- | ---------------- | ------------------------------------ | ----------------------------------------- |
 | Qwen3 dense 14B        | `qwen3`          | `mlx-community/Qwen3-14B-4bit`       | optional official Qwen3 DSpark checkpoint |
+| Qwen3-ASR 1.7B         | `qwen3_asr`      | `mlx-community/Qwen3-ASR-1.7B-8bit`  | none                                      |
 | Qwen3.8 dense 27B      | `qwen3_5_dense`  | `mlx-community/Qwen3.8-27B-4bit`     | matching MTP, Qwen3x DSpark, or Qwen3x DFlash2 |
 | Qwen3.6 sparse 35B-A3B | `qwen3_5_sparse` | `mlx-community/Qwen3.6-35B-A3B-4bit` | matching MTP, Qwen3x DSpark, or Qwen3x DFlash2 |
 
@@ -168,6 +173,7 @@ Download with the Hugging Face CLI:
 ```sh
 hf auth login
 hf download mlx-community/Qwen3-14B-4bit --local-dir models/Qwen3-14B-4bit
+hf download mlx-community/Qwen3-ASR-1.7B-8bit --local-dir models/Qwen3-ASR-1.7B-8bit
 hf download mlx-community/Qwen3.8-27B-4bit --local-dir models/Qwen3.8-27B-4bit
 hf download mlx-community/Qwen3.8-27B-MTP-4bit --local-dir models/Qwen3.8-27B-MTP-4bit
 hf download RadixArk/Qwen3.8-27B-DSpark --local-dir models/Qwen3.8-27B-DSpark
@@ -231,6 +237,20 @@ cargo run --release --bin qwen3 -- \
   --http-listen-addr 127.0.0.1:8000 \
   --hf-model-dir "$PWD/models/Qwen3-14B-4bit"
 ```
+
+Qwen3-ASR startup:
+
+```sh
+cargo run --release --bin qwen3_asr -- \
+  --grpc-listen-addr 127.0.0.1:50051 \
+  --http-listen-addr 127.0.0.1:8000 \
+  --hf-model-dir "$PWD/models/Qwen3-ASR-1.7B-8bit"
+```
+
+Qwen3-ASR uses 16-token logical cache blocks.
+It defaults to 8,192 shared cache pages, two running requests, 128 flattened batch tokens, and 64 tokens for each
+request transaction.
+It uses one compute lane and does not use a speculative checkpoint.
 
 Qwen3 startup with DSpark:
 
@@ -435,6 +455,49 @@ One default batch has these scheduler limits:
 - 4 requests
 - 128 flattened tokens
 - 64 tokens for each request
+
+## HTTP audio transcription
+
+The `qwen3_asr` HTTP listener provides `POST /v1/audio/transcriptions`.
+The request uses `multipart/form-data` and accepts these fields:
+
+| Field | Requirement | Meaning |
+| --- | --- | --- |
+| `file` | Required, exactly once | Integer or F32 WAV audio |
+| `model` | Required, exactly once | Non-empty caller model identifier |
+| `language` | Optional, at most once | Checkpoint language name for forced-language decoding |
+| `prompt` | Optional, at most once | System context before the audio turn |
+| `response_format` | Optional, at most once | `json` or `text`; default is `json` |
+
+The endpoint rejects unknown or repeated fields.
+The request body limit is 32 MiB.
+Audio preparation runs in a blocking CPU task before runtime admission.
+The decoder emits at most 512 output tokens.
+
+Start a transcription:
+
+```sh
+curl -sS http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F 'file=@/absolute/path/to/audio.wav;type=audio/wav' \
+  -F 'model=qwen3-asr-1.7b'
+```
+
+The default JSON response has this shape:
+
+```json
+{"text":"transcribed text","language":"English"}
+```
+
+Pass `-F 'language=English'` to force one supported language.
+Language matching is case-insensitive and the response uses the checkpoint spelling.
+Pass `-F 'prompt=meeting about cache ownership'` to add context.
+Pass `-F 'response_format=text'` to return only transcription text.
+
+The first version accepts one WAV resource for each request.
+It converts the input to mono F32 at 16 kHz and calculates log-Mel features on CPU.
+It completes this CPU work before runtime admission.
+The Audio Tower runs only when a required cache block misses and the resource remains symbolic.
+See [`qwen3_asr.md`](qwen3_asr.md) for the resource and executor contract.
 
 ## gRPC decode
 

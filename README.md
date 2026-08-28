@@ -2,17 +2,18 @@
 
 `psi-dec` is a production-quality Qwen inference engine for Apple Silicon.
 It combines a model-agnostic Rust runtime, a Qwen executor, and a Metal replay backend.
+It supports text generation and Qwen3-ASR audio transcription.
 
 ## Architecture
 
 ```text
-HTTP Chat Completions ──► Qwen codec ──► token IDs ──┐
-                                                     ├─► Inference::decode
-gRPC Decode ────────────────────────► token IDs ─────┘          │
-                                                                ▼
-                   Runtime core ──► Qwen executor ──► Metal backend
-                        ▲                                    │
-                        └──────── tokens + lifecycle ────────┘
+HTTP Chat Completions ──► Qwen codec ─────────► token IDs ───┐
+HTTP Transcriptions ────► Qwen3-ASR processor ─► resources ──┼─► Inference::decode
+gRPC Decode ───────────────────────────────────► token IDs ──┘          │
+                                                                        ▼
+                          Runtime core ──► Qwen executor ──► Metal backend
+                               ▲                                    │
+                               └──────── tokens + lifecycle ────────┘
 ```
 
 Each layer has a separate owner:
@@ -151,7 +152,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-The [service guide](docs/service.md) also covers Main-only startup, gRPC, tool calls, and the HTTP API.
+The [service guide](docs/service.md) also covers Main-only startup, Qwen3-ASR, gRPC, tool calls, and the HTTP APIs.
 
 ## Reference performance
 

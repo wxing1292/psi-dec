@@ -162,13 +162,18 @@ Recommendation: Use a small symmetric entity when it makes peer ownership, data 
 Keep stable identity and explicit data-type or tuning choices. Derive facts and capacities from the model or
 configuration dimensions that own them. Do not store duplicates, pass duplicates, or use convenient magic limits.
 
-Use the same shape-validation structure across peer backend components:
+When a backend component API owns shape validation, use the same structure across peer components:
 
 1. Validate positive dimensions and relationships.
 2. Calculate named derived counts with checked arithmetic.
 3. Assert the shader domain.
 4. Validate the invocation-buffer ranges.
 5. Dispatch with the same derived count.
+
+This validation establishes the trusted shape domain. An upstream input, constructor, or initialization boundary can
+establish the same domain before the backend call. In that case, the private backend path must use ordinary arithmetic.
+It must not repeat checked arithmetic or recoverable validation for the same shape. Peer components must select the
+same owning boundary when their contracts match.
 
 A `u32` shader count must reject `2^32`. A `u32` element-index domain can contain exactly `2^32` elements. Its maximum
 index is `u32::MAX`. Name each assertion and boundary test for its `count` or `index` domain.
