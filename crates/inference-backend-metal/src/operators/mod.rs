@@ -21,9 +21,12 @@
 //! `affine_quantized::Matmul` is an adaptive owner. It selects one
 //! `affine_quantized::Kernel` from its private registry for the runtime row
 //! count.
+//!
+//! `matmul_bf16::Matmul` selects GEMV or GEMM.
 
 pub mod affine_quantized;
 pub mod bf16_concat_rows;
 mod mlx_headers;
+pub mod matmul_bf16;
 pub mod row_gather;
 pub mod softmax;

@@ -44,7 +44,7 @@ Backend Criterion targets:
 
 ```text
 dense_mlp  sparse_mlp  moe  gqa_split_kv  gqa_bidi_block_sdpa  gdn_attn  gdn_state_io
-embedding  unembedding  norm  buffer_io
+embedding  unembedding  norm  affine_quantized_matmul  matmul_bf16  buffer_io
 ```
 
 `rejection_sampling` is the backend custom-CLI target. Model-executor targets:
@@ -87,6 +87,8 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
 - `norm` measures standalone RMSNorm and residual-add RMSNorm variants.
   The `rms-only/replay64` cases record 64 standalone BF16 RMSNorm commands in one replay.
   This method amortizes command submission and wait overhead for kernel-level comparisons.
+- `matmul_bf16` measures the production adaptive BF16 matmul owner. It covers the `M = 1` GEMV path and the Steel
+  GEMM path with Qwen3-ASR hidden, FFN-up, and convolution-output matrix shapes.
 - `buffer_io` measures the production Metal `BufferIO` API at `4`, `64`, and `128 MiB`.
 
   | Benchmark key | Direction | macOS data cache | Timed completion |

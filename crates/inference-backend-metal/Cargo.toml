@@ -93,6 +93,11 @@ path = "benches/operators/affine_quantized_matmul.rs"
 harness = false
 
 [[bench]]
+name = "matmul_bf16"
+path = "benches/operators/matmul_bf16.rs"
+harness = false
+
+[[bench]]
 name = "buffer_io"
 path = "benches/metal/buffer_io.rs"
 harness = false

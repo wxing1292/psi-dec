@@ -344,6 +344,7 @@ This table identifies the current selection owner. Component documents contain t
 | BiDiBlockGQA history SDPA | Complete SplitKV Map/Reduce execution variant plus fixed proposal capacity. | `bidi_block_gqa::sdpa::Selector` returns a component-local `Selection` with the variant and `BiDiBlockGQACapacity`. |
 | GDN | Complete recurrent execution variant. A future chunkwise algorithm must be another complete Variant. | `gdn::compute::Selector` returns `(VariantKey, &Variant)`. |
 | Quantized affine | QMV or QMM kernel for the runtime row count. | `affine_quantized::Selector` returns the selected kernel entry. |
+| BF16 matmul | GEMV or Steel GEMM kernel for the runtime row count. | `matmul_bf16::Selector` returns the selected Variant. |
 | Dense MLP | No independent outer variant. | Each affine owner selects QMV or QMM. |
 | Unembedding | No independent outer variant. | Its affine owner selects QMV or QMM. |
 | MoE | Complete token-major or expert-major command graph. | The MoE `Selector` returns `(VariantKey, &Variant)`. |
