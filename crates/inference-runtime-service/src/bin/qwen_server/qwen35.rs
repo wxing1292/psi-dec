@@ -18,6 +18,7 @@ use inference_runtime_core::config::RuntimeConfig;
 use inference_runtime_core::log_err_internal;
 use inference_runtime_core::log_err_unavailable;
 use inference_runtime_core::log_info_invalid_argument;
+use inference_runtime_core::runtime::tasks::ResourceProcessor;
 
 use crate::codec::qwen::QwenCodec;
 use crate::qwen_server::args::Qwen35Args;
@@ -26,6 +27,7 @@ use crate::qwen_server::config::Qwen35ModelMode;
 use crate::qwen_server::sizing::block_cache_capacity;
 use crate::qwen_server::sizing::context_window;
 use crate::qwen_server::sizing::kv_dtype_bytes;
+use crate::rpc::HTTPService;
 use crate::runtime::serve_replay_model;
 use crate::specialization::SpecializedWorker;
 
@@ -177,10 +179,10 @@ fn run_service<const L: usize>(kind: ModelKind, args: Qwen35Args) -> Result<()> 
     serve_replay_model::<TOKENS_PER_CACHE_BLOCK, L, _>(
         config.grpc_listen_addr(),
         config.http_listen_addr(),
-        qwen_codec,
+        HTTPService::ChatCompletions(qwen_codec),
+        Arc::new(ResourceProcessor::new()),
         runtime_config,
         scheduler_config,
-        num_spec_tokens,
         model,
     )
 }

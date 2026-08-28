@@ -52,10 +52,10 @@ use inference_runtime_core::runtime::tasks::ResourceProcessor;
 use inference_runtime_core::runtime::validate_resources;
 
 use crate::api::Inference;
-use crate::codec::qwen::QwenCodec;
 use crate::consts::NUM_TRIE_PARTITION;
 use crate::executor::ReplayableModelEventLoop;
 use crate::rpc;
+use crate::rpc::HTTPService;
 
 type RuntimeBlockCache<const P: usize, const L: usize> =
     MultiLaneTrieBlockCache<P, L, TPKVBlockAllocator, TPStateBlockAllocator>;
@@ -357,10 +357,10 @@ impl<const N: usize, const L: usize, const P: usize> Drop for InferenceRuntime<N
 pub fn serve_replay_model<const N: usize, const L: usize, M>(
     grpc_listen_addr: SocketAddr,
     http_listen_addr: SocketAddr,
-    qwen_codec: Arc<QwenCodec>,
+    http_service: HTTPService,
+    resource_processor: Arc<ResourceProcessor>,
     model_runtime_config: RuntimeConfig,
     scheduler_config: SchedulerConfig,
-    num_spec_tokens: usize,
     model: M,
 ) -> Result<()>
 where
@@ -371,13 +371,14 @@ where
         .map_err(|error| log_err_unavailable!("unable to initialize RPC async runtime: {error}"))?;
     let model_name = model.model_name().to_string();
     let default_stop_sequences = model.default_stop_sequences();
+    let num_spec_tokens = model.num_spec_tokens();
     let runtime = Arc::new(InferenceRuntime::<N, L, NUM_TRIE_PARTITION>::new(
         model_runtime_config,
         scheduler_config,
         num_spec_tokens,
         shutdown.clone(),
         server_tokio_runtime.handle(),
-        Arc::new(ResourceProcessor::new()),
+        resource_processor,
     ));
     let inference = Arc::new(Inference::new(runtime.clone(), default_stop_sequences));
     let server_shutdown = shutdown.clone();
@@ -389,7 +390,7 @@ where
                 grpc_listen_addr,
                 http_listen_addr,
                 model_name,
-                qwen_codec,
+                http_service,
                 inference,
                 server_shutdown,
             ))

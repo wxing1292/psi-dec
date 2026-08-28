@@ -122,7 +122,7 @@ use response::postprocess_response;
 use response::postprocess_stream;
 use uuid::Uuid;
 
-use crate::rpc::http::HTTPServer;
+use crate::rpc::http::ChatCompletionsServer;
 use crate::rpc::http::error::HTTPError;
 use crate::rpc::http::error::invalid_request;
 use crate::rpc::http::error::map_error;
@@ -133,7 +133,7 @@ mod response;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 pub async fn handle<const N: usize, const L: usize, const P: usize>(
-    State(server): State<HTTPServer<N, L, P>>,
+    State(server): State<ChatCompletionsServer<N, L, P>>,
     headers: HeaderMap,
     payload: Result<Json<Request>, JsonRejection>,
 ) -> Result<AxumResponse, HTTPError> {
