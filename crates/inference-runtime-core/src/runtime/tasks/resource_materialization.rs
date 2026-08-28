@@ -39,6 +39,15 @@ impl ResourceProcessor {
         );
     }
 
+    pub fn unregister(&mut self, resource_type: ResourceTypeID) -> Arc<dyn ResourceTypeProcessor> {
+        self.processors.remove(&resource_type).unwrap_or_else(|| {
+            panic!(
+                "resource processor type ID {} must be registered before it is unregistered",
+                resource_type.value()
+            )
+        })
+    }
+
     pub fn processor(&self, resource_id: ResourceID) -> Arc<dyn ResourceTypeProcessor> {
         self.processors
             .get(&resource_id.resource_type())

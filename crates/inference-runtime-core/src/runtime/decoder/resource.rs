@@ -65,7 +65,7 @@ mod tests {
     use crate::runtime::resource::ResourceTypeID;
 
     #[test]
-    fn resource_segment_preserves_each_coordinate() {
+    fn test_resource_segment_preserves_each_coordinate() {
         let resource_id = ResourceID::new(ResourceTypeID::new(7));
         let segment = ResourceSegment::new(resource_id, 3, 11, 5);
 
