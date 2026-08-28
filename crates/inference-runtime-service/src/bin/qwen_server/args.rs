@@ -86,6 +86,59 @@ pub struct Qwen3Args {
 }
 
 #[derive(Debug, Parser)]
+pub struct Qwen3ASRArgs {
+    #[arg(long, default_value = "127.0.0.1:50051")]
+    pub grpc_listen_addr: SocketAddr,
+
+    #[arg(long, default_value = "127.0.0.1:8000")]
+    pub http_listen_addr: SocketAddr,
+
+    #[arg(long, value_name = "DIR")]
+    pub hf_model_dir: PathBuf,
+
+    #[arg(long, value_enum)]
+    pub profile: Option<QwenProfileMode>,
+
+    #[arg(long, value_enum, default_value_t = QwenLogLevel::Info)]
+    pub logging: QwenLogLevel,
+
+    #[arg(
+        long,
+        default_value = "300",
+        help = "Seconds without model execution before state and weights unload"
+    )]
+    pub executor_hibernation_timeout_secs: NonZeroU64,
+
+    #[arg(
+        long,
+        default_value = "selected",
+        value_name = "MODE",
+        help = "Executor hibernation state scope: all or selected"
+    )]
+    pub executor_hibernation_mode: ExecutorHibernationMode,
+
+    #[arg(long, default_value = "8192", help = "Total shared Qwen3-ASR KV-cache pages")]
+    pub num_cache_pages: NonZeroUsize,
+
+    #[arg(
+        long,
+        default_value = "2",
+        help = "Maximum running requests and requests scheduled per batch"
+    )]
+    pub max_requests: NonZeroUsize,
+
+    #[arg(long, default_value = "128", help = "Maximum flattened tokens scheduled per batch")]
+    pub max_tokens: NonZeroUsize,
+
+    #[arg(
+        long,
+        default_value = "64",
+        help = "Maximum tokens from one request in one forward transaction"
+    )]
+    pub max_tokens_per_request: NonZeroUsize,
+}
+
+#[derive(Debug, Parser)]
 pub struct Qwen35Args {
     #[arg(long, default_value = "127.0.0.1:50051")]
     pub grpc_listen_addr: SocketAddr,
@@ -179,6 +232,7 @@ mod tests {
     use clap::Parser;
     use inference_runtime_core::config::ExecutorHibernationMode;
 
+    use super::Qwen3ASRArgs;
     use super::Qwen3Args;
     use super::Qwen35Args;
 
@@ -211,6 +265,20 @@ mod tests {
     }
 
     #[test]
+    fn test_qwen3_asr_defaults() {
+        let args = Qwen3ASRArgs::try_parse_from(["qwen3_asr", "--hf-model-dir", "model"]).unwrap();
+
+        assert_eq!(args.grpc_listen_addr, "127.0.0.1:50051".parse().unwrap());
+        assert_eq!(args.http_listen_addr, "127.0.0.1:8000".parse().unwrap());
+        assert_eq!(args.max_requests.get(), 2);
+        assert_eq!(args.max_tokens.get(), 128);
+        assert_eq!(args.max_tokens_per_request.get(), 64);
+        assert_eq!(args.num_cache_pages.get(), 8 * 1024);
+        assert_eq!(args.executor_hibernation_timeout_secs.get(), 300);
+        assert_eq!(args.executor_hibernation_mode, ExecutorHibernationMode::Selected);
+    }
+
+    #[test]
     fn test_executor_hibernation_mode_accepts_all() {
         let qwen3 =
             Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", "--executor-hibernation-mode", "all"])
@@ -223,8 +291,17 @@ mod tests {
             "all",
         ])
         .unwrap();
+        let qwen3_asr = Qwen3ASRArgs::try_parse_from([
+            "qwen3_asr",
+            "--hf-model-dir",
+            "model",
+            "--executor-hibernation-mode",
+            "all",
+        ])
+        .unwrap();
 
         assert_eq!(qwen3.executor_hibernation_mode, ExecutorHibernationMode::All);
+        assert_eq!(qwen3_asr.executor_hibernation_mode, ExecutorHibernationMode::All);
         assert_eq!(qwen35.executor_hibernation_mode, ExecutorHibernationMode::All);
     }
 
@@ -244,6 +321,10 @@ mod tests {
             assert!(
                 Qwen3Args::try_parse_from(["qwen3", "--hf-model-dir", "model", flag, "0"]).is_err(),
                 "{flag} must reject zero for Qwen3"
+            );
+            assert!(
+                Qwen3ASRArgs::try_parse_from(["qwen3_asr", "--hf-model-dir", "model", flag, "0"]).is_err(),
+                "{flag} must reject zero for Qwen3-ASR"
             );
         }
         assert!(Qwen35Args::try_parse_from(["qwen3.5", "--hf-model-dir", "model", "--num-spec-tokens", "0"]).is_err());

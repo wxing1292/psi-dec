@@ -5,10 +5,12 @@ use clap::Parser;
 use inference_runtime_core::Error;
 use inference_runtime_core::config::ExecutorHibernationMode;
 
+use super::Qwen3ASRConfig;
 use super::Qwen3Config;
 use super::Qwen3ModelMode;
 use super::Qwen35Config;
 use super::Qwen35ModelMode;
+use crate::qwen_server::args::Qwen3ASRArgs;
 use crate::qwen_server::args::Qwen3Args;
 use crate::qwen_server::args::Qwen35Args;
 
@@ -24,25 +26,44 @@ fn parse_qwen3(extra: &[&str]) -> Qwen3Args {
     Qwen3Args::try_parse_from(args).unwrap()
 }
 
+fn parse_qwen3_asr(extra: &[&str]) -> Qwen3ASRArgs {
+    let mut args = vec!["qwen3_asr", "--hf-model-dir", "model"];
+    args.extend_from_slice(extra);
+    Qwen3ASRArgs::try_parse_from(args).unwrap()
+}
+
 #[test]
 fn test_executor_hibernation_timeout() {
     let qwen3_default = Qwen3Config::from_args(parse_qwen3(&[])).unwrap();
+    let qwen3_asr_default = Qwen3ASRConfig::from_args(parse_qwen3_asr(&[])).unwrap();
     let qwen35_default = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
     let qwen3_override = Qwen3Config::from_args(parse_qwen3(&["--executor-hibernation-timeout-secs", "17"])).unwrap();
+    let qwen3_asr_override =
+        Qwen3ASRConfig::from_args(parse_qwen3_asr(&["--executor-hibernation-timeout-secs", "17"])).unwrap();
     let qwen35_override =
         Qwen35Config::from_args(parse_qwen35(&["--executor-hibernation-timeout-secs", "17"])).unwrap();
 
     assert_eq!(qwen3_default.executor_hibernation_timeout(), Duration::from_secs(300));
+    assert_eq!(
+        qwen3_asr_default.executor_hibernation_timeout(),
+        Duration::from_secs(300)
+    );
     assert_eq!(qwen35_default.executor_hibernation_timeout(), Duration::from_secs(300));
     assert_eq!(qwen3_override.executor_hibernation_timeout(), Duration::from_secs(17));
+    assert_eq!(
+        qwen3_asr_override.executor_hibernation_timeout(),
+        Duration::from_secs(17)
+    );
     assert_eq!(qwen35_override.executor_hibernation_timeout(), Duration::from_secs(17));
 }
 
 #[test]
 fn test_executor_hibernation_mode() {
     let qwen3_default = Qwen3Config::from_args(parse_qwen3(&[])).unwrap();
+    let qwen3_asr_default = Qwen3ASRConfig::from_args(parse_qwen3_asr(&[])).unwrap();
     let qwen35_default = Qwen35Config::from_args(parse_qwen35(&[])).unwrap();
     let qwen3_all = Qwen3Config::from_args(parse_qwen3(&["--executor-hibernation-mode", "all"])).unwrap();
+    let qwen3_asr_all = Qwen3ASRConfig::from_args(parse_qwen3_asr(&["--executor-hibernation-mode", "all"])).unwrap();
     let qwen35_all = Qwen35Config::from_args(parse_qwen35(&["--executor-hibernation-mode", "all"])).unwrap();
 
     assert_eq!(
@@ -50,10 +71,15 @@ fn test_executor_hibernation_mode() {
         ExecutorHibernationMode::Selected
     );
     assert_eq!(
+        qwen3_asr_default.executor_hibernation_mode(),
+        ExecutorHibernationMode::Selected
+    );
+    assert_eq!(
         qwen35_default.executor_hibernation_mode(),
         ExecutorHibernationMode::Selected
     );
     assert_eq!(qwen3_all.executor_hibernation_mode(), ExecutorHibernationMode::All);
+    assert_eq!(qwen3_asr_all.executor_hibernation_mode(), ExecutorHibernationMode::All);
     assert_eq!(qwen35_all.executor_hibernation_mode(), ExecutorHibernationMode::All);
 }
 
@@ -61,6 +87,16 @@ fn test_executor_hibernation_mode() {
 fn test_scheduler_rejects_per_request_token_capacity_above_batch_capacity() {
     assert!(matches!(
         Qwen3Config::from_args(parse_qwen3(&["--max-tokens", "3", "--max-tokens-per-request", "4"])),
+        Err(Error::InvalidArgument(message))
+            if message.contains("--max-tokens-per-request=4 must not exceed --max-tokens=3")
+    ));
+    assert!(matches!(
+        Qwen3ASRConfig::from_args(parse_qwen3_asr(&[
+            "--max-tokens",
+            "3",
+            "--max-tokens-per-request",
+            "4",
+        ])),
         Err(Error::InvalidArgument(message))
             if message.contains("--max-tokens-per-request=4 must not exceed --max-tokens=3")
     ));
@@ -77,6 +113,11 @@ fn test_request_capacity_follows_max_requests() {
     assert_eq!(qwen3.scheduler_config().max_requests, 9);
     assert_eq!(qwen3.max_running_requests(), 9);
     assert_eq!(qwen3.max_queued_requests(), 32);
+
+    let qwen3_asr = Qwen3ASRConfig::from_args(parse_qwen3_asr(&["--max-requests", "9"])).unwrap();
+    assert_eq!(qwen3_asr.scheduler_config().max_requests, 9);
+    assert_eq!(qwen3_asr.max_running_requests(), 9);
+    assert_eq!(qwen3_asr.max_queued_requests(), 32);
 
     let qwen35_configs = [
         Qwen35Config::from_args(parse_qwen35(&["--max-requests", "9"])).unwrap(),
