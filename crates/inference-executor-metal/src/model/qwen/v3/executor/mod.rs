@@ -351,7 +351,7 @@ impl Qwen3Executor {
         let loaded_unembed = Rc::new(loaded_unembed);
         self.main
             .component_mut()
-            .load_weights(&device, &mut store, &self.model_config, main)?;
+            .load_weights(&device, &mut store, &self.model_config.text_config, main)?;
 
         let residual_capture = match (&mut self.speculator, &self.weight_source) {
             (Qwen3Speculator::Vanilla, Qwen3WeightSource::Vanilla) => None,

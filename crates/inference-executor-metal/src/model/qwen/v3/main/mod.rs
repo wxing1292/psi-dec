@@ -9,9 +9,10 @@ use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::attn::GQAReplayShape;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3::Qwen3ModelConfig;
+use inference_executor_core::model::qwen::v3::Qwen3TextConfig;
 use inference_executor_core::model::qwen::v3::weight_layout::Qwen3MainWeightBindings;
 
+use self::component_config::Qwen3MainConfig;
 use crate::attn::gqa::ungated_backend::UngatedGQAReplayTopology;
 use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::ReplayOp;
@@ -54,13 +55,13 @@ impl Qwen3Main {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
-        config: &Qwen3ModelConfig,
+        config: Qwen3MainConfig<'_>,
         gqa_state: &Qwen3MainGQAState,
         residual_capture: Option<Rc<dyn MainResidualCapture>>,
         layer_scratch: Rc<Qwen3MainLayerScratch>,
         dense_scratch: &Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
-        let text = &config.text_config;
+        let text = config.text;
         let mut layers = Vec::with_capacity(text.num_hidden_layers);
         for model_layer_index in 0..text.num_hidden_layers {
             layers.push(Qwen3MainLayer::new(
@@ -83,7 +84,7 @@ impl Qwen3Main {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        config: &Qwen3ModelConfig,
+        text: &Qwen3TextConfig,
         bindings: Qwen3MainWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         let Qwen3MainWeightBindings {
@@ -92,7 +93,7 @@ impl Qwen3Main {
         } = bindings;
         assert_eq!(
             layer_bindings.len(),
-            config.text_config.num_hidden_layers,
+            text.num_hidden_layers,
             "qwen3 Main config and checkpoint binding layer counts must match"
         );
         assert_eq!(
@@ -101,10 +102,9 @@ impl Qwen3Main {
             "qwen3 Main component and checkpoint binding layer counts must match"
         );
         for (layer, bindings) in self.layers.iter_mut().zip(layer_bindings) {
-            layer.load_weights(device, store, config, bindings)?;
+            layer.load_weights(device, store, text, bindings)?;
             store.unload_all();
         }
-        let text = &config.text_config;
         let final_norm_weight = load_qwen3x_norm_weight(device, store, &final_norm_weight, &[text.hidden_size])?;
         self.final_norm.load_weights(final_norm_weight);
         Ok(())

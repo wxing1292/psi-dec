@@ -10,7 +10,6 @@ use inference_backend_metal::metal::Dtype;
 use inference_executor_core::attn::GQAPageTableLayout;
 use inference_executor_core::def::ModelExecutorError;
 use inference_executor_core::model::qwen::v3::QWEN3_PAGE_SIZE_BYTES;
-use inference_executor_core::model::qwen::v3::Qwen3ModelConfig;
 use inference_executor_core::model::qwen::v3::init_qwen3_model_config;
 use inference_executor_core::model::qwen::v3::weight_layout::Qwen3ModelWeightBindings;
 use inference_executor_core::model::qwen::v3::weight_layout::resolve_qwen3_model_weight_bindings;
@@ -37,6 +36,7 @@ use crate::model::qwen::v3::executor::Qwen3WeightSource;
 use crate::model::qwen::v3::executor::compact_target_distribution_indices;
 use crate::model::qwen::v3::executor::num_page_ids_per_block;
 use crate::model::qwen::v3::main::Qwen3Main;
+use crate::model::qwen::v3::main::component_config::Qwen3MainConfig;
 use crate::model::qwen::v3::main::component_config::derive_qwen3_dense_mlp_configs;
 use crate::model::qwen::v3::main::component_config::derive_qwen3_gqa_configs;
 use crate::model::qwen::v3::main::embed::Qwen3MainEmbed;
@@ -119,12 +119,9 @@ pub struct Qwen3ModelLayout {
 }
 
 impl Qwen3ModelLayout {
-    fn from_model_config(model_config: &Qwen3ModelConfig, max_tokens: usize) -> Result<Self, ModelExecutorError> {
-        let text = &model_config.text_config;
-        let quant = model_config
-            .quantization
-            .as_ref()
-            .ok_or_else(|| ModelExecutorError::custom("qwen3 replay model requires quantization config"))?;
+    fn from_main_config(config: Qwen3MainConfig<'_>, max_tokens: usize) -> Result<Self, ModelExecutorError> {
+        let text = config.text;
+        let quant = config.quantization;
         Ok(Self {
             max_tokens: max_tokens as u32,
             vocab_size: text
@@ -276,11 +273,20 @@ fn init_qwen_3_model_inner(
         .map(|&token_id| vec![Token::new(token_id)])
         .collect();
 
-    let layout = Qwen3ModelLayout::from_model_config(&model_config, config.max_tokens)?;
+    let text = &model_config.text_config;
+    let quantization = model_config
+        .quantization
+        .as_ref()
+        .ok_or_else(|| ModelExecutorError::custom("qwen3 replay model requires quantization config"))?;
+    let main_config = Qwen3MainConfig {
+        text,
+        quantization,
+        page_size_bytes: QWEN3_PAGE_SIZE_BYTES,
+    };
+    let layout = Qwen3ModelLayout::from_main_config(main_config, config.max_tokens)?;
     layout.validate();
 
-    let text = &model_config.text_config;
-    let (main_gqa_core, main_gqa_metal) = derive_qwen3_gqa_configs(0, &model_config)?;
+    let (main_gqa_core, main_gqa_metal) = derive_qwen3_gqa_configs(0, main_config)?;
     let gqa_tokens_per_page = main_gqa_metal.num_ungated_tokens_per_page(&main_gqa_core) as usize;
     let main_page_ids_per_block = num_page_ids_per_block(config.num_tokens_per_block, gqa_tokens_per_page);
     let gqa_page_table_layout = GQAPageTableLayout {
@@ -314,7 +320,7 @@ fn init_qwen_3_model_inner(
         config.max_tokens,
         layout.hidden_dim as usize,
     ));
-    let (dense_core, dense_metal) = derive_qwen3_dense_mlp_configs(0, &model_config)?;
+    let (dense_core, dense_metal) = derive_qwen3_dense_mlp_configs(0, main_config)?;
     let dense_scratch = Rc::new(DenseMLPScratch::new(
         &device,
         &dense_core,
@@ -381,13 +387,13 @@ fn init_qwen_3_model_inner(
     };
     let mut main = Qwen3Main::new(
         &device,
-        &model_config,
+        main_config,
         &main_gqa_state,
         residual_capture,
         layer_scratch,
         &dense_scratch,
     )?;
-    main.load_weights(&device, &mut store, &model_config, main_bindings)?;
+    main.load_weights(&device, &mut store, text, main_bindings)?;
     drop(store);
 
     let sampler = Rc::new(TopKSampling::new(&device, sampling_params));

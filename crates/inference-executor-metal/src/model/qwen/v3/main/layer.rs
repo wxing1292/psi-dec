@@ -8,7 +8,7 @@ use inference_backend_metal::metal::Dtype;
 use inference_backend_metal::metal::ReplayU32;
 use inference_executor_core::backend::recorder::Recorder;
 use inference_executor_core::def::ModelExecutorError;
-use inference_executor_core::model::qwen::v3::Qwen3ModelConfig;
+use inference_executor_core::model::qwen::v3::Qwen3TextConfig;
 use inference_executor_core::model::qwen::v3::weight_layout::Qwen3LayerWeightBindings;
 
 use crate::attn::gqa::batch_metadata::GQAMetadataBuffers;
@@ -16,6 +16,7 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::layer::ReplayLayer;
 use crate::def::replay_op::ReplayOp;
 use crate::mlp::dense::scratch::DenseMLPScratch;
+use crate::model::qwen::v3::main::component_config::Qwen3MainConfig;
 use crate::model::qwen::v3::main::component_config::derive_qwen3_dense_mlp_configs;
 use crate::model::qwen::v3::main::component_config::derive_qwen3_gqa_configs;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQA;
@@ -58,14 +59,14 @@ impl Qwen3MainLayer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
-        config: &Qwen3ModelConfig,
+        config: Qwen3MainConfig<'_>,
         layer_index: usize,
         gqa_state: &Qwen3MainGQAState,
         scratch: Rc<Qwen3MainLayerScratch>,
         dense_scratch: Rc<DenseMLPScratch>,
     ) -> Result<Self, ModelExecutorError> {
-        let hidden_dim = config.text_config.hidden_size;
-        let eps = config.text_config.rms_norm_eps;
+        let hidden_dim = config.text.hidden_size;
+        let eps = config.text.rms_norm_eps;
         let (gqa_core, gqa_metal) = derive_qwen3_gqa_configs(layer_index, config)?;
         let attention = Qwen3MainGQA::new(gqa_core, gqa_metal, gqa_state);
         let (mlp_core, mlp_metal) = derive_qwen3_dense_mlp_configs(layer_index, config)?;
@@ -85,7 +86,7 @@ impl Qwen3MainLayer {
         &mut self,
         device: &Device,
         store: &mut SafeTensorStore,
-        config: &Qwen3ModelConfig,
+        text: &Qwen3TextConfig,
         bindings: Qwen3LayerWeightBindings,
     ) -> Result<(), ModelExecutorError> {
         let Qwen3LayerWeightBindings {
@@ -94,7 +95,7 @@ impl Qwen3MainLayer {
             gqa: attention_bindings,
             mlp: mlp_bindings,
         } = bindings;
-        let hidden_dim = config.text_config.hidden_size;
+        let hidden_dim = text.hidden_size;
         self.attention.load_weights(device, store, attention_bindings)?;
         self.mlp.load_weights(device, store, mlp_bindings)?;
         self.input_norm.load_weights(load_qwen3x_norm_weight(
