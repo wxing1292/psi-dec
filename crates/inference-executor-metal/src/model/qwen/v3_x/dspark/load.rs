@@ -54,7 +54,7 @@ pub fn load_qwen3x_dspark(
     model_dir: &Path,
     config: &Qwen3xDSparkConfig,
     load_config: Qwen3xDSparkLoadConfig,
-    main_embed: Rc<Embed>,
+    main_text_embed: Rc<Embed>,
     main_unembed: Rc<Unembed>,
     sampling_params: Rc<SamplingParamsStore>,
 ) -> Result<Qwen3xDSparkLoaded, ModelExecutorError> {
@@ -132,7 +132,7 @@ pub fn load_qwen3x_dspark(
         Rc::new(embed)
     } else {
         Rc::new(
-            main_embed.with_max_tokens(
+            main_text_embed.with_max_tokens(
                 max_block_tokens
                     .try_into()
                     .expect("Qwen3x DSpark shared embed rows must fit u32"),

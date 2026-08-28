@@ -73,8 +73,8 @@ path = "benches/qwen35/main.rs"
 harness = false
 
 [[bench]]
-name = "qwen35_main_embed"
-path = "benches/qwen35/main_embed.rs"
+name = "qwen35_main_text_embed"
+path = "benches/qwen35/main_text_embed.rs"
 harness = false
 
 [[bench]]

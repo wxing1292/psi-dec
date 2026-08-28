@@ -51,7 +51,7 @@ pub fn load_qwen3x_dflash2(
     model_dir: &Path,
     config: &Qwen3xDFlash2Config,
     load_config: Qwen3xDFlash2LoadConfig,
-    main_embed: Rc<Embed>,
+    main_text_embed: Rc<Embed>,
     main_unembed: Rc<Unembed>,
     sampling_params: Rc<SamplingParamsStore>,
 ) -> Result<Qwen3xDFlash2Loaded, ModelExecutorError> {
@@ -104,7 +104,7 @@ pub fn load_qwen3x_dflash2(
         .checked_mul(num_spec_tokens)
         .expect("Qwen3x DFlash2 proposal token capacity must fit usize");
     let embed = Rc::new(
-        main_embed.with_max_tokens(
+        main_text_embed.with_max_tokens(
             max_query_tokens
                 .try_into()
                 .expect("Qwen3x DFlash2 embed row capacity must fit u32"),

@@ -13,12 +13,7 @@ use crate::model::resource_embed::ResourceEmbedInput;
 use crate::model::resource_embed::build_mapping_table;
 use crate::replay::Replay;
 
-pub enum InputEmbedding {
-    Text,
-    Resource(Box<ResourceInputEmbedding>),
-}
-
-pub struct ResourceInputEmbedding {
+pub struct MainResourceEmbed {
     config: resource_embed::Config,
     arena: Arc<MetalResourceArena>,
     mappings: Buffer,
@@ -26,20 +21,20 @@ pub struct ResourceInputEmbedding {
     prepared_table: Option<resource_embed::MappingTable>,
 }
 
-impl InputEmbedding {
-    pub fn resource(
+impl MainResourceEmbed {
+    pub fn new(
         device: &Device,
         config: resource_embed::Config,
         arena: Arc<MetalResourceArena>,
         max_tokens: usize,
     ) -> Self {
-        assert!(max_tokens > 0, "ResourceEmbed requires token capacity");
+        assert!(max_tokens > 0, "MainResourceEmbed requires token capacity");
         assert!(
             u32::try_from(max_tokens).is_ok(),
-            "ResourceEmbed token capacity must fit u32"
+            "MainResourceEmbed token capacity must fit u32"
         );
         let num_mapping_values = max_tokens * 3;
-        Self::Resource(Box::new(ResourceInputEmbedding {
+        Self {
             config,
             arena,
             mappings: Buffer::new_zeroed_elements(
@@ -49,66 +44,38 @@ impl InputEmbedding {
             ),
             replay: Replay::new("ResourceEmbed", ResourceEmbed::new(device, config)),
             prepared_table: None,
-        }))
+        }
     }
 
     pub fn prepare(&mut self, requests: &[DeviceRequest]) {
-        match self {
-            Self::Text => {
-                debug_assert!(
-                    requests.iter().all(|request| request.resource_placements.is_empty()),
-                    "text-only input embedding does not accept resource placements"
-                );
-            },
-            Self::Resource(resource) => resource.prepare(requests),
-        }
-    }
-
-    pub fn prepare_replay(&self) -> Option<(resource_embed::Shape, ReplayArguments)> {
-        match self {
-            Self::Text => None,
-            Self::Resource(resource) => {
-                resource
-                    .prepared_table
-                    .as_ref()
-                    .map(|table| resource.replay.component().prepare_replay(table))
-            },
-        }
-    }
-
-    pub fn record(&mut self, runtime: &MetalReplayRuntime<'_>, hidden: &Buffer) -> Option<resource_embed::Shape> {
-        let Self::Resource(resource) = self else {
-            return None;
-        };
-        let table = resource.prepared_table.as_ref()?;
-        let input = ResourceEmbedInput {
-            table,
-            arena: resource.arena.storage().buffer(),
-            mappings: &resource.mappings,
-            hidden,
-        };
-        Some(resource.replay.record(runtime, &input).0)
-    }
-
-    pub fn replay(&self, key: &resource_embed::Shape) -> &inference_backend_metal::metal::ReplayProgram {
-        match self {
-            Self::Text => panic!("text-only input embedding has no ResourceEmbed replay"),
-            Self::Resource(resource) => resource.replay.replay(key),
-        }
-    }
-
-    pub fn clear(&mut self) {
-        if let Self::Resource(resource) = self {
-            resource.replay.clear();
-        }
-    }
-}
-
-impl ResourceInputEmbedding {
-    fn prepare(&mut self, requests: &[DeviceRequest]) {
         self.prepared_table = build_mapping_table(self.config, requests);
         if let Some(table) = &self.prepared_table {
             self.mappings.write_typed(0, table.encoded_u32s());
         }
+    }
+
+    pub fn prepare_replay(&self) -> Option<(resource_embed::Shape, ReplayArguments)> {
+        self.prepared_table
+            .as_ref()
+            .map(|table| self.replay.component().prepare_replay(table))
+    }
+
+    pub fn record(&mut self, runtime: &MetalReplayRuntime<'_>, hidden: &Buffer) -> Option<resource_embed::Shape> {
+        let table = self.prepared_table.as_ref()?;
+        let input = ResourceEmbedInput {
+            table,
+            arena: self.arena.storage().buffer(),
+            mappings: &self.mappings,
+            hidden,
+        };
+        Some(self.replay.record(runtime, &input).0)
+    }
+
+    pub fn replay(&self, key: &resource_embed::Shape) -> &inference_backend_metal::metal::ReplayProgram {
+        self.replay.replay(key)
+    }
+
+    pub fn clear(&mut self) {
+        self.replay.clear();
     }
 }

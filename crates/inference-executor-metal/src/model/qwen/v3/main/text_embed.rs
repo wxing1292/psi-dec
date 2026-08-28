@@ -13,21 +13,21 @@ use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedInput;
 use crate::replay::ReplayComponent;
 
-const QWEN3_MAIN_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
-    ReplayParameterKey::new("qwen3.main_embed.num_active_tokens");
+const QWEN3_MAIN_TEXT_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3.main_text_embed.num_active_tokens");
 
-pub struct Qwen3MainEmbed {
+pub struct Qwen3MainTextEmbed {
     embed: Option<Rc<Embed>>,
 }
 
 #[derive(Clone, Copy)]
-pub struct Qwen3MainEmbedArgs<'a> {
+pub struct Qwen3MainTextEmbedArgs<'a> {
     pub num_tokens: u32,
     pub token_ids: &'a Buffer,
     pub hidden_output: &'a Buffer,
 }
 
-impl Qwen3MainEmbed {
+impl Qwen3MainTextEmbed {
     pub fn new(embed: Rc<Embed>) -> Self {
         Self { embed: Some(embed) }
     }
@@ -52,7 +52,7 @@ impl Qwen3MainEmbed {
         recorder: &mut R,
         num_total_tokens: u32,
         num_active_tokens: ReplayU32,
-        args: Qwen3MainEmbedArgs<'a>,
+        args: Qwen3MainTextEmbedArgs<'a>,
     ) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
@@ -75,40 +75,43 @@ impl Qwen3MainEmbed {
         )
     }
 
-    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen3MainEmbedReplayKey, ReplayArguments) {
-        assert!(num_active_tokens > 0, "qwen3 MainEmbed replay requires active tokens");
-        let key = Qwen3MainEmbedReplayKey::new(num_active_tokens);
-        let arguments = ReplayArguments::new().with_u32(QWEN3_MAIN_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens);
+    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen3MainTextEmbedReplayKey, ReplayArguments) {
+        assert!(
+            num_active_tokens > 0,
+            "qwen3 MainTextEmbed replay requires active tokens"
+        );
+        let key = Qwen3MainTextEmbedReplayKey::new(num_active_tokens);
+        let arguments = ReplayArguments::new().with_u32(QWEN3_MAIN_TEXT_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens);
         (key, arguments)
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen3MainEmbedReplayKey {
+pub struct Qwen3MainTextEmbedReplayKey {
     num_total_tokens: u32,
 }
 
-impl Qwen3MainEmbedReplayKey {
+impl Qwen3MainTextEmbedReplayKey {
     pub fn new(num_total_tokens: u32) -> Self {
         Self { num_total_tokens }
     }
 }
 
-impl ReplayComponent for Qwen3MainEmbed {
-    type Key = Qwen3MainEmbedReplayKey;
-    type Input<'a> = Qwen3MainEmbedArgs<'a>;
+impl ReplayComponent for Qwen3MainTextEmbed {
+    type Key = Qwen3MainTextEmbedReplayKey;
+    type Input<'a> = Qwen3MainTextEmbedArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
-        Qwen3MainEmbedReplayKey::new(input.num_tokens)
+        Qwen3MainTextEmbedReplayKey::new(input.num_tokens)
     }
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         let key = self.replay_key(input);
-        Qwen3MainEmbed::record(
+        Qwen3MainTextEmbed::record(
             self,
             recorder,
             key.num_total_tokens,
-            ReplayU32::Parameter(QWEN3_MAIN_EMBED_NUM_ACTIVE_TOKENS),
+            ReplayU32::Parameter(QWEN3_MAIN_TEXT_EMBED_NUM_ACTIVE_TOKENS),
             *input,
         );
     }

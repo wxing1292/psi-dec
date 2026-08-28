@@ -29,7 +29,7 @@ use crate::replay::ReplayComponent;
 
 const QWEN3_MAIN_NUM_ACTIVE_TOKENS: ReplayParameterKey = ReplayParameterKey::new("qwen3.main.num_active_tokens");
 
-pub mod embed;
+pub mod text_embed;
 pub mod gqa;
 pub mod layer;
 pub mod output;

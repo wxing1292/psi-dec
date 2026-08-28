@@ -152,7 +152,7 @@ impl Qwen3xDFlash2Execution {
         device: &Device,
         model_dir: &Path,
         config: &Qwen3xDFlash2Config,
-        main_embed: &Rc<Embed>,
+        main_text_embed: &Rc<Embed>,
         main_unembed: &Rc<Unembed>,
     ) -> Result<(), ModelExecutorError> {
         let mut store = SafeTensorStore::from_model_dir(model_dir)?;
@@ -171,7 +171,7 @@ impl Qwen3xDFlash2Execution {
             .checked_mul(self.num_spec_tokens)
             .expect("Qwen3x DFlash2 proposal token capacity must fit usize");
         let embed = Rc::new(
-            main_embed.with_max_tokens(
+            main_text_embed.with_max_tokens(
                 max_query_tokens
                     .try_into()
                     .expect("Qwen3x DFlash2 embed row capacity must fit u32"),

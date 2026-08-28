@@ -598,7 +598,7 @@ impl DSparkFixture {
     }
 }
 
-fn load_main_embed(
+fn load_main_text_embed(
     device: &inference_backend_metal::metal::Device,
     store: &mut SafeTensorStore,
     config: &Qwen3ModelConfig,
@@ -687,7 +687,7 @@ fn load_dspark_embed(
         SafeTensorStore::from_model_dir(main_model_dir).expect("unable to open Main embedding weights");
     let main_bindings = resolve_qwen3_model_weight_bindings(&main_config, main_store.index().tensor_names())
         .expect("unable to resolve Main embedding weights");
-    Rc::new(load_main_embed(
+    Rc::new(load_main_text_embed(
         device,
         &mut main_store,
         &main_config,

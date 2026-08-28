@@ -16,9 +16,9 @@ use inference_executor_core::model::qwen::v3_5::weight_layout::resolve_qwen35_mo
 use inference_executor_metal::def::replay_op::MetalReplayRuntime;
 use inference_executor_metal::model::embedding::Embed;
 use inference_executor_metal::model::embedding::EmbedConfig;
-use inference_executor_metal::model::qwen::v3_5::main::embed::Qwen35MainEmbed;
-use inference_executor_metal::model::qwen::v3_5::main::embed::Qwen35MainEmbedArgs;
-use inference_executor_metal::model::qwen::v3_5::main::embed::Qwen35MainEmbedReplayKey;
+use inference_executor_metal::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbed;
+use inference_executor_metal::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbedArgs;
+use inference_executor_metal::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbedReplayKey;
 use inference_executor_metal::replay::Replay;
 
 const DEFAULT_MAX_TOKENS: u32 = 128;
@@ -26,7 +26,7 @@ const DEFAULT_MAX_TOKENS: u32 = 128;
 fn main() {
     let args = Args::parse();
     let device = Device::system_default();
-    let mut fixture = MainEmbedFixture::new(&device, &args.model_dir, args.max_tokens);
+    let mut fixture = MainTextEmbedFixture::new(&device, &args.model_dir, args.max_tokens);
 
     for &num_tokens in &args.tokens {
         let prepared = fixture.prepare(num_tokens);
@@ -91,19 +91,19 @@ impl Args {
     }
 }
 
-struct MainEmbedFixture {
+struct MainTextEmbedFixture {
     stream: Stream,
     token_ids: Buffer,
     hidden_output: Buffer,
-    replay: Replay<Qwen35MainEmbed>,
+    replay: Replay<Qwen35MainTextEmbed>,
 }
 
 struct PreparedReplay {
-    key: Qwen35MainEmbedReplayKey,
+    key: Qwen35MainTextEmbedReplayKey,
     arguments: ReplayArguments,
 }
 
-impl MainEmbedFixture {
+impl MainTextEmbedFixture {
     fn new(device: &Device, model_dir: &std::path::Path, max_tokens: u32) -> Self {
         let config = init_qwen35_model_config(model_dir).unwrap_or_else(|error| {
             panic!(
@@ -114,7 +114,7 @@ impl MainEmbedFixture {
         let quantization = config
             .quantization
             .as_ref()
-            .expect("qwen3.5 MainEmbed benchmark requires quantized weights");
+            .expect("qwen3.5 MainTextEmbed benchmark requires quantized weights");
         let vocab_size: u32 = config
             .text_config
             .vocab_size
@@ -152,7 +152,7 @@ impl MainEmbedFixture {
         let mut embed_component = Embed::new(device, embed_config);
         embed_component
             .load_weights(device, &mut store, embed)
-            .unwrap_or_else(|error| panic!("unable to load Qwen3.5 MainEmbed weights: {error}"));
+            .unwrap_or_else(|error| panic!("unable to load Qwen3.5 MainTextEmbed weights: {error}"));
         store.unload_all();
         let token_ids = (0..max_tokens)
             .map(|index| ((u64::from(index) * 65_537 + 17) % u64::from(vocab_size)) as i32)
@@ -166,14 +166,14 @@ impl MainEmbedFixture {
                 Dtype::Bfloat16,
             ),
             replay: Replay::new(
-                "qwen3.5 MainEmbed benchmark",
-                Qwen35MainEmbed::new(Rc::new(embed_component)),
+                "qwen3.5 MainTextEmbed benchmark",
+                Qwen35MainTextEmbed::new(Rc::new(embed_component)),
             ),
         }
     }
 
     fn prepare(&mut self, num_tokens: u32) -> PreparedReplay {
-        let input = Qwen35MainEmbedArgs {
+        let input = Qwen35MainTextEmbedArgs {
             num_tokens,
             token_ids: &self.token_ids,
             hidden_output: &self.hidden_output,
@@ -183,7 +183,7 @@ impl MainEmbedFixture {
         let (key, _) = self.replay.record(&runtime, &input);
         assert_eq!(
             key, expected_key,
-            "MainEmbed prepared and recorded replay keys must match"
+            "MainTextEmbed prepared and recorded replay keys must match"
         );
         PreparedReplay { key, arguments }
     }
@@ -221,9 +221,9 @@ fn print_perf(args: &Args, num_tokens: u32, replay: &ReplayProgram, samples: &[f
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "perf component=qwen35-main-embed model_dir={} case=embed num_tokens={num_tokens} max_tokens={} commands={} \
-         retained_buffers={} retained_pipelines={} constant_bytes={} iters={} runs={} median_us={median_us:.3} \
-         samples_us=[{samples_text}]",
+        "perf component=qwen35-main-text-embed model_dir={} case=embed num_tokens={num_tokens} max_tokens={} \
+         commands={} retained_buffers={} retained_pipelines={} constant_bytes={} iters={} runs={} \
+         median_us={median_us:.3} samples_us=[{samples_text}]",
         args.model_dir.display(),
         args.max_tokens,
         stats.command_count,
@@ -275,7 +275,7 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, name: &str) -> String {
 
 fn print_help_and_exit() -> ! {
     println!(
-        "qwen35_main_embed bench\n--model-dir PATH\n--tokens 1,4,16,64,128\n--max-tokens 128\n--iters \
+        "qwen35_main_text_embed bench\n--model-dir PATH\n--tokens 1,4,16,64,128\n--max-tokens 128\n--iters \
          N\n--warmup-iters N\n--runs N"
     );
     std::process::exit(0);

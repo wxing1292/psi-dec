@@ -54,7 +54,7 @@ qwen3_gqa              qwen3_dspark           qwen3_dspark_forward
 qwen3_dspark_unembedding                       qwen3_dspark_sampling
 qwen35_dense_mlp       qwen35_moe             qwen35_gqa
 qwen35_gdn             qwen35_main_layers     qwen35_main
-qwen35_main_embed      qwen35_main_gather_unembed
+qwen35_main_text_embed qwen35_main_gather_unembed
 qwen35_main_sampling   qwen35_vanilla_prefill_decode
 ```
 
@@ -141,13 +141,13 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
   It reports each record, submit/wait, read, and commit boundary.
   It reports `num_spec_tokens`, proposed tokens, accepted tokens, generated proposals, and acceptance.
 - `qwen3_dspark_forward` loads real Main and DSpark weights.
-  It compares the complete `MainEmbed` and Main forward with `DSparkEmbed` plus the complete DSpark backbone and final
-  norm.
+  It compares the complete `MainTextEmbed` and Main forward with `DSparkEmbed` plus the complete DSpark backbone and
+  final norm.
   The Main and DSpark depth-comparison cases use the same request count, seven rows per request, and history length.
   The result reports total and per-layer time.
   Use the per-layer value to compare the 40-layer Main stack with the five-layer DSpark stack.
   The additional `main-verification` result uses eight rows per request and a DSpark-enabled Main executor.
-  It includes `MainEmbed`, all Main layers, Main residual capture, and DSpark context projection.
+  It includes `MainTextEmbed`, all Main layers, Main residual capture, and DSpark context projection.
   It excludes Main `GatherUnembed` and rejection sampling.
 - `qwen3_dspark_unembedding` loads the production `Qwen3xDSparkGatherUnembed` component.
   It uses DSpark-owned unembed weights when they exist.
@@ -184,11 +184,11 @@ Treat a concurrent compute dispatch and a multi-queue overlap as separate measur
 - `qwen35_main` records the production `Qwen35Main` owner.
   Its implicit `main` case includes all transformer layers and final norm.
   It uses the production replay key and active-token arguments.
-  It does not include MainEmbed, GatherUnembed, sampling, or readback.
+  It does not include MainTextEmbed, GatherUnembed, sampling, or readback.
 - `qwen35_main` and `qwen35_main_layers` use synthetic hidden inputs and initialized component metadata.
   They validate `context + num_tokens` against the model position capacity.
   Use `qwen35_vanilla_prefill_decode` when the measurement requires a real committed context.
-- `qwen35_main_embed` records the production `Qwen35MainEmbed` owner with real checkpoint weights.
+- `qwen35_main_text_embed` records the production `Qwen35MainTextEmbed` owner with real checkpoint weights.
   It accepts `--tokens` and `--max-tokens`.
 - `qwen35_main_gather_unembed` records the production `Qwen35GatherUnembed` owner with real checkpoint weights.
   Its `gather_unembed` case measures gather and unembedding together.
@@ -322,7 +322,7 @@ cargo bench --bench qwen35_main -- \
   --max-tokens 128 \
   --iters 1 --warmup-iters 0 --runs 1
 
-cargo bench --bench qwen35_main_embed -- \
+cargo bench --bench qwen35_main_text_embed -- \
   --model-dir <27b-model-dir> --tokens 1 --max-tokens 128 \
   --iters 1 --warmup-iters 0 --runs 1
 

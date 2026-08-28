@@ -91,20 +91,20 @@ use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::def::replay_op::ReplayRecorder;
 use crate::model::embedding::Embed;
-use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
+use crate::model::main_resource_embed::MainResourceEmbed;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::apply_main_gpu_timing;
 use crate::model::qwen::split_main_lane_page_ids;
 use crate::model::qwen::v3_5::main::Qwen35Main;
 use crate::model::qwen::v3_5::main::Qwen35MainArgs;
 use crate::model::qwen::v3_5::main::Qwen35MainReplayKey;
-use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbed;
-use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbedArgs;
-use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbedReplayKey;
 use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembed;
 use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembedArgs;
 use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembedReplayKey;
+use crate::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbed;
+use crate::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbedArgs;
+use crate::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbedReplayKey;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::Qwen35MTPArgs;
 use crate::model::qwen::v3_5::mtp::Qwen35MTPReplayKey;
@@ -464,7 +464,7 @@ impl Qwen35Speculator {
         &mut self,
         device: &inference_backend_metal::metal::Device,
         source: &Qwen35WeightSource,
-        main_embed: &Rc<Embed>,
+        main_text_embed: &Rc<Embed>,
         main_unembed: &Rc<Unembed>,
     ) -> Result<Option<Rc<dyn MainResidualCapture>>, ModelExecutorError> {
         match (self, source) {
@@ -479,7 +479,9 @@ impl Qwen35Speculator {
                 mtp.embed
                     .component_mut()
                     .load_weights(device, &mut store, config, embed)?;
-                mtp.embed.component_mut().load_shared_weights(Rc::clone(main_embed));
+                mtp.embed
+                    .component_mut()
+                    .load_shared_weights(Rc::clone(main_text_embed));
                 mtp.body
                     .component_mut()
                     .load_weights(device, &mut store, config, body, final_norm_weight)?;
@@ -488,14 +490,14 @@ impl Qwen35Speculator {
             (Self::DSpark(dspark), Qwen35WeightSource::DSpark { model_dir, config }) => {
                 dspark
                     .execution
-                    .load_weights(device, model_dir, config, main_embed, main_unembed)?;
+                    .load_weights(device, model_dir, config, main_text_embed, main_unembed)?;
                 let capture: Rc<dyn MainResidualCapture> = dspark.execution.main_feature_projector();
                 Ok(Some(capture))
             },
             (Self::DFlash2(dflash2), Qwen35WeightSource::DFlash2 { model_dir, config }) => {
                 dflash2
                     .execution
-                    .load_weights(device, model_dir, config, main_embed, main_unembed)?;
+                    .load_weights(device, model_dir, config, main_text_embed, main_unembed)?;
                 let capture: Rc<dyn MainResidualCapture> = dflash2.execution.main_feature_projector();
                 Ok(Some(capture))
             },
@@ -626,8 +628,8 @@ pub struct Qwen35Executor {
     gather_flat_indices: Buffer,
     unembed_hidden: Buffer,
     unembed_logits: Buffer,
-    main_embed: Replay<Qwen35MainEmbed>,
-    input_embedding: InputEmbedding,
+    main_text_embed: Replay<Qwen35MainTextEmbed>,
+    main_resource_embed: Option<MainResourceEmbed>,
     main: Replay<Qwen35Main>,
     gather_unembed: Replay<Qwen35GatherUnembed>,
     sampling: Replay<Sampling>,
@@ -746,8 +748,10 @@ impl Qwen35Executor {
 
     pub fn clear_replay_cache(&mut self) {
         self.finish_cache_publish();
-        self.main_embed.clear();
-        self.input_embedding.clear();
+        self.main_text_embed.clear();
+        if let Some(main_resource_embed) = &mut self.main_resource_embed {
+            main_resource_embed.clear();
+        }
         self.main.clear();
         self.gather_unembed.clear();
         self.sampling.clear();
@@ -756,7 +760,7 @@ impl Qwen35Executor {
     }
 
     pub fn unload_weights(&mut self) {
-        let embed = self.main_embed.component_mut().unload_weights();
+        let embed = self.main_text_embed.component_mut().unload_weights();
         let unembed = self.gather_unembed.component_mut().unload_weights();
 
         self.main.component_mut().unset_residual_capture();
@@ -798,7 +802,7 @@ impl Qwen35Executor {
             self.speculator
                 .load_weights(&device, &self.weight_source, &loaded_embed, &loaded_unembed)?;
         self.main.component_mut().set_residual_capture(residual_capture);
-        self.main_embed.component_mut().load_weights(loaded_embed);
+        self.main_text_embed.component_mut().load_weights(loaded_embed);
         self.gather_unembed.component_mut().load_weights(loaded_unembed);
         Ok(())
     }
@@ -912,13 +916,13 @@ impl Qwen35Executor {
 }
 
 pub struct Qwen35ModelOpsRecorder {
-    main_embed_key: Qwen35MainEmbedReplayKey,
-    main_embed_arguments: ReplayArguments,
+    main_text_embed_key: Qwen35MainTextEmbedReplayKey,
+    main_text_embed_arguments: ReplayArguments,
     resource_embed_key: Option<inference_backend_metal::components::resource_embed::Shape>,
     resource_embed_arguments: ReplayArguments,
     main_key: Qwen35MainReplayKey,
     main_arguments: ReplayArguments,
-    main_embed_cache_hit: bool,
+    main_text_embed_cache_hit: bool,
     main_cache_hit: bool,
     main_gather_unembed_key: Option<Qwen35GatherUnembedReplayKey>,
     main_gather_unembed_arguments: ReplayArguments,
@@ -953,7 +957,7 @@ pub struct Qwen35ModelOpsRecorder {
 
 impl Qwen35ModelOpsRecorder {
     fn main_replay_cache_hit(&self) -> bool {
-        self.main_embed_cache_hit && self.main_cache_hit
+        self.main_text_embed_cache_hit && self.main_cache_hit
     }
 
     fn num_mtp_sample_rows(&self) -> usize {
@@ -1119,7 +1123,17 @@ impl ReplayableDecoderModel for Qwen35Executor {
         );
         let gqa_elapsed = gqa_start.elapsed();
         debug_assert_eq!(gqa_shape.num_tokens as usize, microbatch.total_tokens());
-        self.input_embedding.prepare(&core_batch_req.dev_reqs);
+        if let Some(main_resource_embed) = &mut self.main_resource_embed {
+            main_resource_embed.prepare(&core_batch_req.dev_reqs);
+        } else {
+            debug_assert!(
+                core_batch_req
+                    .dev_reqs
+                    .iter()
+                    .all(|request| request.resource_placements.is_empty()),
+                "text-only Qwen3.5 does not accept resource placements"
+            );
+        }
         let gdn_states_start = Instant::now();
         let gdn_prepared = self.main_gdn_state.prepare_states(
             microbatch.req_slots(),
@@ -1177,10 +1191,12 @@ impl ReplayableDecoderModel for Qwen35Executor {
             .total_tokens()
             .try_into()
             .expect("qwen3.5 Main token count must fit u32");
-        let (main_embed_key, main_embed_arguments) = self.main_embed.component().prepare_replay(num_main_active_tokens);
+        let (main_text_embed_key, main_text_embed_arguments) =
+            self.main_text_embed.component().prepare_replay(num_main_active_tokens);
         let (resource_embed_key, resource_embed_arguments) = self
-            .input_embedding
-            .prepare_replay()
+            .main_resource_embed
+            .as_ref()
+            .and_then(MainResourceEmbed::prepare_replay)
             .map_or((None, ReplayArguments::new()), |(key, arguments)| {
                 (Some(key), arguments)
             });
@@ -1195,18 +1211,18 @@ impl ReplayableDecoderModel for Qwen35Executor {
         self.main_gdn_state.add_private_replay_arguments(&mut main_arguments);
         trace::qwen35_state(|| {
             format!(
-                "event=begin_ops_recording main_embed_key={:?} main_key={:?}",
-                main_embed_key, main_key
+                "event=begin_ops_recording main_text_embed_key={:?} main_key={:?}",
+                main_text_embed_key, main_key
             )
         });
         Qwen35ModelOpsRecorder {
-            main_embed_key,
-            main_embed_arguments,
+            main_text_embed_key,
+            main_text_embed_arguments,
             resource_embed_key,
             resource_embed_arguments,
             main_key,
             main_arguments,
-            main_embed_cache_hit: false,
+            main_text_embed_cache_hit: false,
             main_cache_hit: false,
             dspark_spec_prefill: None,
             dspark_spec_decode: None,
@@ -1245,23 +1261,26 @@ impl ReplayableDecoderModel for Qwen35Executor {
         recorder: &mut Self::ModelOpsRecorder,
         model_batch_request: &Self::ModelBatchRequest,
     ) -> Self::ModelBatchHidden {
-        let input = Qwen35MainEmbedArgs {
+        let input = Qwen35MainTextEmbedArgs {
             num_tokens: model_batch_request
                 .microbatch()
                 .total_tokens()
                 .try_into()
-                .expect("qwen3.5 MainEmbed token count must fit u32"),
+                .expect("qwen3.5 MainTextEmbed token count must fit u32"),
             token_ids: &self.token_ids,
             hidden_output: &self.token_hidden_input,
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (recorded_key, cache_hit) = self.main_embed.record(&runtime, &input);
+        let (recorded_key, cache_hit) = self.main_text_embed.record(&runtime, &input);
         assert_eq!(
-            recorded_key, recorder.main_embed_key,
-            "qwen3.5 MainEmbed replay input must match the prepared replay key"
+            recorded_key, recorder.main_text_embed_key,
+            "qwen3.5 MainTextEmbed replay input must match the prepared replay key"
         );
-        recorder.main_embed_cache_hit = cache_hit;
-        let resource_embed_key = self.input_embedding.record(&runtime, &self.token_hidden_input);
+        recorder.main_text_embed_cache_hit = cache_hit;
+        let resource_embed_key = self
+            .main_resource_embed
+            .as_mut()
+            .and_then(|main_resource_embed| main_resource_embed.record(&runtime, &self.token_hidden_input));
         assert_eq!(
             resource_embed_key, recorder.resource_embed_key,
             "Qwen3.8 ResourceEmbed replay input must match the prepared replay key"
@@ -1278,7 +1297,7 @@ impl ReplayableDecoderModel for Qwen35Executor {
         let microbatch = model_batch_req.microbatch();
         assert!(
             Rc::ptr_eq(&model_batch_hidden, &self.token_hidden_input),
-            "qwen3.5 Main must consume the MainEmbed hidden workspace"
+            "qwen3.5 Main must consume the MainTextEmbed hidden workspace"
         );
         let input = Qwen35MainArgs {
             num_tokens: microbatch
@@ -1302,11 +1321,11 @@ impl ReplayableDecoderModel for Qwen35Executor {
         recorder.main_cache_hit = cache_hit;
         trace::qwen35_state(|| {
             format!(
-                "event=main_replays main_embed_key={:?} main_key={:?} main_embed_cache_hit={} main_cache_hit={} \
-                 cache_hit={}",
-                recorder.main_embed_key,
+                "event=main_replays main_text_embed_key={:?} main_key={:?} main_text_embed_cache_hit={} \
+                 main_cache_hit={} cache_hit={}",
+                recorder.main_text_embed_key,
                 recorder.main_key,
-                recorder.main_embed_cache_hit,
+                recorder.main_text_embed_cache_hit,
                 recorder.main_cache_hit,
                 recorder.main_replay_cache_hit(),
             )

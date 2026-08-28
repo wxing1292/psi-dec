@@ -17,13 +17,19 @@ impl Qwen35Executor {
     }
 
     fn submit_main_recording(&self, recorder: &Qwen35ModelOpsRecorder) -> MetalReplaySubmission {
-        let main_embed_replay = self.main_embed.replay(&recorder.main_embed_key);
+        let main_text_embed_replay = self.main_text_embed.replay(&recorder.main_text_embed_key);
         let main_replay = self.main.replay(&recorder.main_key);
         let empty_arguments = ReplayArguments::new();
-        let mut sequence = vec![ReplayExecution::new(main_embed_replay, &recorder.main_embed_arguments)];
+        let mut sequence = vec![ReplayExecution::new(
+            main_text_embed_replay,
+            &recorder.main_text_embed_arguments,
+        )];
         if let Some(resource_embed_key) = &recorder.resource_embed_key {
             sequence.push(ReplayExecution::new(
-                self.input_embedding.replay(resource_embed_key),
+                self.main_resource_embed
+                    .as_ref()
+                    .expect("Qwen3.8 ResourceEmbed replay requires MainResourceEmbed")
+                    .replay(resource_embed_key),
                 &recorder.resource_embed_arguments,
             ));
         }

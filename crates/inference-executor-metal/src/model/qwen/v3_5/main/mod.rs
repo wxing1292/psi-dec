@@ -34,7 +34,7 @@ use crate::model::qwen::v3_x::weight::load_qwen3x_norm_weight;
 use crate::model::rms_norm::RMSNorm;
 use crate::replay::ReplayComponent;
 
-pub mod embed;
+pub mod text_embed;
 pub mod layer;
 pub mod output;
 

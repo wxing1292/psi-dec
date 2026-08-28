@@ -48,21 +48,21 @@ use crate::checkpoint::SafeTensorStore;
 use crate::def::replay_op::MetalReplayRuntime;
 use crate::def::replay_op::MetalReplaySubmission;
 use crate::model::embedding::Embed;
-use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
+use crate::model::main_resource_embed::MainResourceEmbed;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::apply_main_gpu_timing;
 use crate::model::qwen::split_main_lane_page_ids;
 use crate::model::qwen::v3::main::Qwen3Main;
 use crate::model::qwen::v3::main::Qwen3MainArgs;
 use crate::model::qwen::v3::main::Qwen3MainReplayKey;
-use crate::model::qwen::v3::main::embed::Qwen3MainEmbed;
-use crate::model::qwen::v3::main::embed::Qwen3MainEmbedArgs;
-use crate::model::qwen::v3::main::embed::Qwen3MainEmbedReplayKey;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembed;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembedArgs;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembedReplayKey;
+use crate::model::qwen::v3::main::text_embed::Qwen3MainTextEmbed;
+use crate::model::qwen::v3::main::text_embed::Qwen3MainTextEmbedArgs;
+use crate::model::qwen::v3::main::text_embed::Qwen3MainTextEmbedReplayKey;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkDecodeRecording;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkPrefillRecording;
@@ -296,8 +296,8 @@ pub struct Qwen3Executor {
     gather_flat_indices: Buffer,
     unembed_hidden: Buffer,
     unembed_logits: Buffer,
-    main_embed: Replay<Qwen3MainEmbed>,
-    input_embedding: InputEmbedding,
+    main_text_embed: Replay<Qwen3MainTextEmbed>,
+    main_resource_embed: Option<MainResourceEmbed>,
     main: Replay<Qwen3Main>,
     gather_unembed: Replay<Qwen3GatherUnembed>,
     sampling: Replay<Sampling>,
@@ -324,8 +324,10 @@ impl Qwen3Executor {
     }
 
     pub fn clear_replay_cache(&mut self) {
-        self.main_embed.clear();
-        self.input_embedding.clear();
+        self.main_text_embed.clear();
+        if let Some(main_resource_embed) = &mut self.main_resource_embed {
+            main_resource_embed.clear();
+        }
         self.main.clear();
         self.gather_unembed.clear();
         self.sampling.clear();
@@ -333,7 +335,7 @@ impl Qwen3Executor {
     }
 
     pub fn unload_weights(&mut self) {
-        let embed = self.main_embed.component_mut().unload_weights();
+        let embed = self.main_text_embed.component_mut().unload_weights();
         let unembed = self.gather_unembed.component_mut().unload_weights();
 
         self.main.component_mut().unset_residual_capture();
@@ -400,7 +402,7 @@ impl Qwen3Executor {
             _ => panic!("qwen3 speculator and weight source must have matching variants"),
         };
         self.main.component_mut().set_residual_capture(residual_capture);
-        self.main_embed.component_mut().load_weights(loaded_embed);
+        self.main_text_embed.component_mut().load_weights(loaded_embed);
         self.gather_unembed.component_mut().load_weights(loaded_unembed);
         Ok(())
     }
@@ -501,8 +503,8 @@ impl Qwen3Executor {
 }
 
 pub struct Qwen3ModelOpsRecorder {
-    main_embed_key: Qwen3MainEmbedReplayKey,
-    main_embed_arguments: ReplayArguments,
+    main_text_embed_key: Qwen3MainTextEmbedReplayKey,
+    main_text_embed_arguments: ReplayArguments,
     resource_embed_key: Option<inference_backend_metal::components::resource_embed::Shape>,
     resource_embed_arguments: ReplayArguments,
     main_key: Qwen3MainReplayKey,
@@ -652,7 +654,17 @@ impl ReplayableDecoderModel for Qwen3Executor {
             num_main_total_tokens,
         );
         debug_assert_eq!(gqa_shape.num_tokens as usize, microbatch.total_tokens());
-        self.input_embedding.prepare(&core_batch_req.dev_reqs);
+        if let Some(main_resource_embed) = &mut self.main_resource_embed {
+            main_resource_embed.prepare(&core_batch_req.dev_reqs);
+        } else {
+            debug_assert!(
+                core_batch_req
+                    .dev_reqs
+                    .iter()
+                    .all(|request| request.resource_placements.is_empty()),
+                "text-only Qwen3 does not accept resource placements"
+            );
+        }
         model_batch_request
     }
 
@@ -671,10 +683,12 @@ impl ReplayableDecoderModel for Qwen3Executor {
             .total_tokens()
             .try_into()
             .expect("qwen3 Main token count must fit u32");
-        let (main_embed_key, main_embed_arguments) = self.main_embed.component().prepare_replay(num_main_active_tokens);
+        let (main_text_embed_key, main_text_embed_arguments) =
+            self.main_text_embed.component().prepare_replay(num_main_active_tokens);
         let (resource_embed_key, resource_embed_arguments) = self
-            .input_embedding
-            .prepare_replay()
+            .main_resource_embed
+            .as_ref()
+            .and_then(MainResourceEmbed::prepare_replay)
             .map_or((None, ReplayArguments::new()), |(key, arguments)| {
                 (Some(key), arguments)
             });
@@ -685,8 +699,8 @@ impl ReplayableDecoderModel for Qwen3Executor {
         );
         self.main_gqa_state.add_private_replay_arguments(&mut main_arguments);
         Qwen3ModelOpsRecorder {
-            main_embed_key,
-            main_embed_arguments,
+            main_text_embed_key,
+            main_text_embed_arguments,
             resource_embed_key,
             resource_embed_arguments,
             main_key,
@@ -709,22 +723,25 @@ impl ReplayableDecoderModel for Qwen3Executor {
         recorder: &mut Self::ModelOpsRecorder,
         model_batch_request: &Self::ModelBatchRequest,
     ) -> Self::ModelBatchHidden {
-        let input = Qwen3MainEmbedArgs {
+        let input = Qwen3MainTextEmbedArgs {
             num_tokens: model_batch_request
                 .microbatch()
                 .total_tokens()
                 .try_into()
-                .expect("qwen3 MainEmbed token count must fit u32"),
+                .expect("qwen3 MainTextEmbed token count must fit u32"),
             token_ids: &self.token_ids,
             hidden_output: &self.token_hidden_input,
         };
         let runtime = MetalReplayRuntime::new(self.runtime.stream());
-        let (recorded_key, _) = self.main_embed.record(&runtime, &input);
+        let (recorded_key, _) = self.main_text_embed.record(&runtime, &input);
         assert_eq!(
-            recorded_key, recorder.main_embed_key,
-            "qwen3 MainEmbed replay input must match the prepared replay key"
+            recorded_key, recorder.main_text_embed_key,
+            "qwen3 MainTextEmbed replay input must match the prepared replay key"
         );
-        let resource_embed_key = self.input_embedding.record(&runtime, &self.token_hidden_input);
+        let resource_embed_key = self
+            .main_resource_embed
+            .as_mut()
+            .and_then(|main_resource_embed| main_resource_embed.record(&runtime, &self.token_hidden_input));
         assert_eq!(
             resource_embed_key, recorder.resource_embed_key,
             "Qwen3 ResourceEmbed replay input must match the prepared replay key"
@@ -741,7 +758,7 @@ impl ReplayableDecoderModel for Qwen3Executor {
         let microbatch = model_batch_req.microbatch();
         assert!(
             Rc::ptr_eq(&model_batch_hidden, &self.token_hidden_input),
-            "qwen3 Main must consume the MainEmbed hidden workspace"
+            "qwen3 Main must consume the MainTextEmbed hidden workspace"
         );
         let input = Qwen3MainArgs {
             num_tokens: microbatch

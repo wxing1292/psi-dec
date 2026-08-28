@@ -34,7 +34,6 @@ use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::mlp::moe::scratch::MoEScratch;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
-use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::v3_5::component_config::Qwen35MetalDefaults;
@@ -54,9 +53,9 @@ use crate::model::qwen::v3_5::executor::Qwen35Speculator;
 use crate::model::qwen::v3_5::executor::Qwen35WeightSource;
 use crate::model::qwen::v3_5::executor::num_page_ids_per_block;
 use crate::model::qwen::v3_5::main::Qwen35Main;
-use crate::model::qwen::v3_5::main::embed::Qwen35MainEmbed;
 use crate::model::qwen::v3_5::main::layer::Qwen35MainLayerScratch;
 use crate::model::qwen::v3_5::main::output::Qwen35GatherUnembed;
+use crate::model::qwen::v3_5::main::text_embed::Qwen35MainTextEmbed;
 use crate::model::qwen::v3_5::mtp::Qwen35MTP;
 use crate::model::qwen::v3_5::mtp::embed::Qwen35MTPEmbed;
 use crate::model::qwen::v3_5::mtp::layer::Qwen35MTPLayerScratch;
@@ -899,8 +898,8 @@ fn init_qwen_3_5_model_inner(
         gather_flat_indices: Buffer::new_zeroed_elements(&device, config.max_tokens, Dtype::Uint32),
         unembed_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
         unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
-        main_embed: Replay::new("qwen3.5 MainEmbed", Qwen35MainEmbed::new(Rc::clone(&embed))),
-        input_embedding: InputEmbedding::Text,
+        main_text_embed: Replay::new("qwen3.5 MainTextEmbed", Qwen35MainTextEmbed::new(Rc::clone(&embed))),
+        main_resource_embed: None,
         main: Replay::new("qwen3.5 Main", main),
         gather_unembed: Replay::new("qwen3.5 GatherUnembed", gather_unembed),
         sampling: Replay::new("qwen3.5 sampling", Sampling::new(Rc::clone(&sampler))),

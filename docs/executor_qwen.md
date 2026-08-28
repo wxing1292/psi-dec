@@ -86,7 +86,7 @@ crates/inference-executor-metal/src/
     qwen/v3/
       main/
         mod.rs              Qwen3 Main owner and replay key
-        embed.rs            Qwen3 Main embedding component and replay key
+        text_embed.rs       Qwen3 Main text embedding component and replay key
         gqa.rs              Qwen3 Main ungated GQA weights, state, load, and record
         layer.rs            fixed Qwen3MainLayer and Qwen3MainLayerScratch
         output.rs           Qwen3 gather/unembed component and replay key
@@ -96,7 +96,7 @@ crates/inference-executor-metal/src/
         load.rs             separate Vanilla and DSpark top-down load
         batch.rs            validation, prepare, reset, and commit lifecycle
         recording.rs        recorder lifecycle and Main replay submission
-        main.rs             MainEmbed, Main, and GatherUnembed orchestration
+        main.rs             MainTextEmbed, MainResourceEmbed, Main, and GatherUnembed orchestration
         sampling.rs         ordinary or rejection sampling and readback
         dspark.rs           DSpark Spec proposal orchestration
     qwen/v3_asr/
@@ -105,7 +105,7 @@ crates/inference-executor-metal/src/
     qwen/v3_5/
       main/
         mod.rs              Qwen35 Main owner and replay key
-        embed.rs            Qwen35 Main embedding component and replay key
+        text_embed.rs       Qwen35 Main text embedding component and replay key
         layer.rs            Qwen35MainLayer variants and role-specific scratch
         output.rs           Qwen35 gather/unembed component and replay key
       mtp/
@@ -118,7 +118,7 @@ crates/inference-executor-metal/src/
         load.rs             layer count pass and separate Vanilla/MTP/DSpark/DFlash2 top-down load
         batch.rs            validation, prepare, reset, and commit lifecycle
         recording.rs        recorder lifecycle and common replay submission
-        main.rs             MainEmbed, Main, and GatherUnembed orchestration
+        main.rs             MainTextEmbed, MainResourceEmbed, Main, and GatherUnembed orchestration
         sampling.rs         Main/Spec/rejection orchestration and readback
         mtp.rs              MTP request, proposal-batch, and proposal flow
         dspark.rs           DSpark Spec proposal orchestration
@@ -172,7 +172,8 @@ Qwen3 has no GDN transaction, state-page metadata, MTP lane, or Qwen3.5 replay k
 ```text
 Qwen3Executor
   main_gqa_state: Qwen3MainGQAState
-  main_embed: Replay<Qwen3MainEmbed>
+  main_text_embed: Replay<Qwen3MainTextEmbed>
+  main_resource_embed: Option<MainResourceEmbed>
   main: Replay<Qwen3Main>
   gather_unembed: Replay<Qwen3GatherUnembed>
   sampling: Replay<Sampling>
@@ -189,14 +190,15 @@ Qwen3-ASR service composition
   audio_processor: Qwen3ASRAudioProcessor
     audio_worker: AudioTower
   executor: Qwen3Executor
-    input_embedding: Qwen3InputEmbedding::Resource
+    main_resource_embed: MainResourceEmbed
       resource_embed: Replay<ResourceEmbed>
     shared Qwen3 Main text decoder
 
 Qwen35Executor
   main_gqa_state: Qwen3xGQAState
   main_gdn_state: Qwen3xGDNState
-  main_embed: Replay<Qwen35MainEmbed>
+  main_text_embed: Replay<Qwen35MainTextEmbed>
+  main_resource_embed: Option<MainResourceEmbed>
   main: Replay<Qwen35Main>
   gather_unembed: Replay<Qwen35GatherUnembed>
   sampling: Replay<Sampling>
@@ -526,7 +528,7 @@ It panics if record did not establish the key.
 The independent cached graphs are:
 
 ```text
-Replay<Qwen3MainEmbed>       Qwen3 token embedding
+Replay<Qwen3MainTextEmbed>   Qwen3 token embedding
 Replay<Qwen3Main>            Qwen3 dense full-attention layers -> final norm
 Replay<Qwen3xDSparkPrefill>   all captured rows from selected Main layers -> persistent DSpark context K/V
 Replay<Qwen3GatherUnembed>   Qwen3 gather -> unembed
@@ -546,7 +548,7 @@ Replay<Qwen3xDFlash2Body>     fixed DFlash2 layers -> final norm
 Replay<Qwen3xDFlash2Output>   gather MASK rows -> Main Unembed -> selector -> sparse draft storage
 Replay<SpecDecodeInput>       sparse rejection output -> fixed DFlash2 Spec Decode input and sampling position
 
-Replay<Qwen35MainEmbed>      token embedding
+Replay<Qwen35MainTextEmbed>  token embedding
 Replay<Qwen35Main>           all Main layers -> final norm
 Replay<Qwen35GatherUnembed>  gather -> unembed
 Replay<Sampling>             ordinary Main sampling
@@ -558,19 +560,19 @@ Replay<GDNStateRestore>
                               snapshot restore into live GDN state
 ```
 
-MainEmbed and MTPEmbed are separate replay boundaries with their own keys.
+MainTextEmbed and MTPEmbed are separate replay boundaries with their own keys.
 
 The shared quantized embedding leaf has one active/total recording API.
 `num_total_tokens` defines the recorded grid and buffer extent.
 `num_active_tokens` is `ReplayU32::Fixed(num_total_tokens)` or a caller-provided replay parameter.
 A replay parameter has the range `1..=num_total_tokens`.
 The kernel checks the active token count before it reads `token_ids` or writes the output row.
-Qwen3.5 MainEmbed reads the configured token-row capacity from `Embed::max_tokens()`.
+Qwen3.5 MainTextEmbed reads the configured token-row capacity from `Embed::max_tokens()`.
 It owns a base `ReplayBucketPolicy` capped by this capacity.
-It records the bucket capacity in `Qwen35MainEmbedReplayKey` and never records the active token count in the key.
-It uses the stage-owned `qwen3.5.main_embed.num_active_tokens` replay parameter for submission.
+It records the bucket capacity in `Qwen35MainTextEmbedReplayKey` and never records the active token count in the key.
+It uses the stage-owned `qwen3.5.main_text_embed.num_active_tokens` replay parameter for submission.
 The executor stores this argument with the prepared key and submits both to the same replay program.
-Qwen3 MainEmbed uses its stage-owned active-token parameter with identity capacity.
+Qwen3 MainTextEmbed uses its stage-owned active-token parameter with identity capacity.
 Qwen3.5 MTPEmbed uses a parameter active count as part of its composed replay.
 
 The shared row-gather leaf has one active/total recording API.
@@ -632,7 +634,7 @@ RMS normalization and residual/RMS-normalization fusion have fixed token-count t
 boundary.
 Qwen3.5 MTPEmbed, Main, and MTP use parameter active counts for normalization and residual recording.
 
-Qwen3 MainEmbed, Main, and GatherUnembed use the same active/total architecture.
+Qwen3 MainTextEmbed, Main, and GatherUnembed use the same active/total architecture.
 Their current capacity policy is identity.
 The total capacity remains in each key, and the active count remains a submission parameter.
 Qwen3 Main also submits the active Q-token-range and KV-split counts that its ungated GQA consumes.
@@ -724,7 +726,7 @@ Main and MTP use the same replay cache because they bind the same stable buffers
 The recorder stores separate Main and MTP `ReplayArguments` because their active row counts can differ.
 An active row count of zero omits GatherUnembed replay.
 
-Qwen3 defines separate replay keys for MainEmbed, Main, and GatherUnembed.
+Qwen3 defines separate replay keys for MainTextEmbed, Main, and GatherUnembed.
 Its Main key owns the total token capacity, every layer MLP topology, and the ungated GQA total capacities and topology.
 Active token, Q-token-range, and KV-split counts do not enter the key.
 It never aliases a Qwen3.5 key or stores an optional GDN key.
@@ -745,7 +747,7 @@ created it.
 
 ```text
 token_ids
-  -> MainEmbed
+  -> MainTextEmbed
 token_hidden_input
   -> Main layers using model-local residual_stream[2] ping-pong
 hidden_output
@@ -800,7 +802,7 @@ One outer model mode selects only its applicable lifecycle.
 An empty component input omits that component from its model sequence.
 The executor does not store a separate submitted-state flag.
 
-`embed_main` materializes MainEmbed.
+`embed_main` materializes MainTextEmbed and optional MainResourceEmbed work.
 `forward_main` materializes Main.
 It registers the pending model transaction.
 It does not submit backend work.
@@ -821,13 +823,13 @@ These methods do not submit backend work or read backend output.
 For a batch with no sampled rows, the sequence is:
 
 ```text
-MainEmbed -> Main
+MainTextEmbed -> MainResourceEmbed? -> Main
 ```
 
 For ordinary sampling, the sequence is:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> Sampling
+MainTextEmbed -> MainResourceEmbed? -> Main -> GatherUnembed -> Sampling
 ```
 
 When a speculator is enabled, `sample_main` materializes RejectionSampling for both initial and speculative input.
@@ -835,13 +837,13 @@ RejectionSampling supports a ragged `0..N` speculative-token count per request.
 For MTP, `submit_main` submits this sequence:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+MainTextEmbed -> MainResourceEmbed? -> Main -> GatherUnembed -> RejectionSampling
 ```
 
 For Qwen3 or Qwen3.5 DSpark, it submits one ordered serial sequence:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+MainTextEmbed -> MainResourceEmbed? -> Main -> GatherUnembed -> RejectionSampling
   -> SpecDecodeInput -> DSparkPrefill
   -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 ```
@@ -849,7 +851,7 @@ MainEmbed -> Main -> GatherUnembed -> RejectionSampling
 For Qwen3.5 DFlash2, it submits one ordered serial sequence:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+MainTextEmbed -> MainResourceEmbed? -> Main -> GatherUnembed -> RejectionSampling
   -> SpecDecodeInput -> DFlash2Prefill
   -> DFlash2Embed -> DFlash2 -> DFlash2Output
 ```
@@ -1058,7 +1060,7 @@ The GPU Spec Decode prepare stage reads rejection-sampling output directly.
 A decode-ready Qwen3 or Qwen3.5 batch uses this single submission:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+MainTextEmbed -> MainResourceEmbed? -> Main -> GatherUnembed -> RejectionSampling
   -> SpecDecodeInput -> DSparkPrefill
   -> DSparkEmbed -> DSpark -> DSparkGatherUnembed -> DSparkSampling
 ```
@@ -1100,7 +1102,7 @@ The Decode block contains one anchor row followed by `block_size - 1` MASK rows.
 Prefill and Decode are independent replay recordings:
 
 ```text
-MainEmbed -> Main -> GatherUnembed -> RejectionSampling
+MainTextEmbed -> MainResourceEmbed? -> Main -> GatherUnembed -> RejectionSampling
   -> SpecDecodeInput -> DFlash2Prefill
   -> DFlash2Embed -> DFlash2 -> DFlash2Output
 ```

@@ -728,7 +728,8 @@ Measure the first request separately from steady-state throughput.
 
 Normal sampling submits these replay programs in one ordered Metal command buffer:
 
-- MainEmbed
+- MainTextEmbed
+- MainResourceEmbed when the batch contains resource placements
 - Main
 - GatherUnembed
 - Sampling
@@ -791,7 +792,8 @@ all earlier speculative tokens passed verification. `num_spec_token_by_index[i]`
 `num_verified_token_by_index[i]` is the verified count at the same index. The helper scripts sum these counts across
 batches before they calculate `acceptance_rate_by_index`.
 
-`main_cpu_ms` covers `MainEmbed -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
+`main_cpu_ms` covers
+`MainTextEmbed -> MainResourceEmbed? -> Main -> GatherUnembed -> Sampling/RejectionSampling -> submit/wait -> read`.
 For Qwen3 and Qwen3.5 DSpark, and for Qwen3.5 DFlash2, it also covers GPU Spec Decode prepare, Spec Prefill, Spec
 Decode, proposal sampling, and proposal read in the same ordered submission.
 `spec_cpu_ms` covers a separate Spec lifecycle. Qwen3.5 MTP uses this boundary. DSpark and DFlash2 do not, so their

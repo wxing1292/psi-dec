@@ -31,8 +31,8 @@ use crate::checkpoint::SafeTensorStore;
 use crate::mlp::dense::scratch::DenseMLPScratch;
 use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedConfig;
-use crate::model::input_embedding::InputEmbedding;
 use crate::model::main_residual_capture::MainResidualCapture;
+use crate::model::main_resource_embed::MainResourceEmbed;
 use crate::model::page_arena::PageArena;
 use crate::model::qwen::v3::executor::Qwen3Checkpoint;
 use crate::model::qwen::v3::executor::Qwen3DSparkSpeculator;
@@ -46,10 +46,10 @@ use crate::model::qwen::v3::main::Qwen3Main;
 use crate::model::qwen::v3::main::component_config::Qwen3MainConfig;
 use crate::model::qwen::v3::main::component_config::derive_qwen3_dense_mlp_configs;
 use crate::model::qwen::v3::main::component_config::derive_qwen3_gqa_configs;
-use crate::model::qwen::v3::main::embed::Qwen3MainEmbed;
 use crate::model::qwen::v3::main::gqa::Qwen3MainGQAState;
 use crate::model::qwen::v3::main::layer::Qwen3MainLayerScratch;
 use crate::model::qwen::v3::main::output::Qwen3GatherUnembed;
+use crate::model::qwen::v3::main::text_embed::Qwen3MainTextEmbed;
 use crate::model::qwen::v3_asr::Qwen3ASRAudioProcessor;
 use crate::model::qwen::v3_x::dspark::execution::Qwen3xDSparkExecution;
 use crate::model::qwen::v3_x::dspark::load::Qwen3xDSparkLoadConfig;
@@ -531,10 +531,10 @@ fn init_qwen_3_model_inner(
             }
         },
     };
-    let input_embedding = match &init_mode {
-        Qwen3InitMode::Vanilla | Qwen3InitMode::DSpark { .. } => InputEmbedding::Text,
+    let main_resource_embed = match &init_mode {
+        Qwen3InitMode::Vanilla | Qwen3InitMode::DSpark { .. } => None,
         Qwen3InitMode::Asr { resource_arena, .. } => {
-            InputEmbedding::resource(
+            Some(MainResourceEmbed::new(
                 &device,
                 inference_backend_metal::components::resource_embed::Config {
                     hidden_dim: layout.hidden_dim,
@@ -542,7 +542,7 @@ fn init_qwen_3_model_inner(
                 },
                 Arc::clone(resource_arena),
                 config.max_tokens,
-            )
+            ))
         },
     };
     let model_name = match &checkpoint {
@@ -564,8 +564,8 @@ fn init_qwen_3_model_inner(
         gather_flat_indices: Buffer::new_zeroed_elements(&device, config.max_tokens, Dtype::Uint32),
         unembed_hidden: Buffer::new_zeroed(&device, layout.hidden_bytes()),
         unembed_logits: Buffer::new_zeroed(&device, unembed_config.logits_bytes()),
-        main_embed: Replay::new("qwen3 MainEmbed", Qwen3MainEmbed::new(embed)),
-        input_embedding,
+        main_text_embed: Replay::new("qwen3 MainTextEmbed", Qwen3MainTextEmbed::new(embed)),
+        main_resource_embed,
         main: Replay::new("qwen3 Main", main),
         gather_unembed: Replay::new("qwen3 GatherUnembed", gather_unembed),
         sampling: Replay::new("qwen3 sampling", Sampling::new(Rc::clone(&sampler))),

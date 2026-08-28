@@ -14,22 +14,22 @@ use crate::model::embedding::Embed;
 use crate::model::embedding::EmbedInput;
 use crate::replay::ReplayComponent;
 
-const QWEN35_MAIN_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
-    ReplayParameterKey::new("qwen3.5.main_embed.num_active_tokens");
+const QWEN35_MAIN_TEXT_EMBED_NUM_ACTIVE_TOKENS: ReplayParameterKey =
+    ReplayParameterKey::new("qwen3.5.main_text_embed.num_active_tokens");
 
-pub struct Qwen35MainEmbed {
+pub struct Qwen35MainTextEmbed {
     embed: Option<Rc<Embed>>,
     replay_bucket_policy: ReplayBucketPolicy,
 }
 
 #[derive(Clone, Copy)]
-pub struct Qwen35MainEmbedArgs<'a> {
+pub struct Qwen35MainTextEmbedArgs<'a> {
     pub num_tokens: u32,
     pub token_ids: &'a Buffer,
     pub hidden_output: &'a Buffer,
 }
 
-impl Qwen35MainEmbed {
+impl Qwen35MainTextEmbed {
     pub fn new(embed: Rc<Embed>) -> Self {
         let max_tokens = embed.max_tokens();
         Self {
@@ -58,7 +58,7 @@ impl Qwen35MainEmbed {
         recorder: &mut R,
         num_total_tokens: u32,
         num_active_tokens: ReplayU32,
-        args: Qwen35MainEmbedArgs<'a>,
+        args: Qwen35MainTextEmbedArgs<'a>,
     ) -> &'a Buffer
     where
         R: Recorder<'a, Operator = ReplayOp<'a>>,
@@ -72,7 +72,7 @@ impl Qwen35MainEmbed {
                 assert_eq!(
                     self.replay_bucket_policy.capacity(args.num_tokens),
                     num_total_tokens,
-                    "qwen3.5 MainEmbed total token count must match its selected capacity"
+                    "qwen3.5 MainTextEmbed total token count must match its selected capacity"
                 )
             },
         }
@@ -88,32 +88,32 @@ impl Qwen35MainEmbed {
         )
     }
 
-    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen35MainEmbedReplayKey, ReplayArguments) {
+    pub fn prepare_replay(&self, num_active_tokens: u32) -> (Qwen35MainTextEmbedReplayKey, ReplayArguments) {
         let key = self.replay_key_for_active_tokens(num_active_tokens);
-        let arguments = ReplayArguments::new().with_u32(QWEN35_MAIN_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens);
+        let arguments = ReplayArguments::new().with_u32(QWEN35_MAIN_TEXT_EMBED_NUM_ACTIVE_TOKENS, num_active_tokens);
         (key, arguments)
     }
 
-    fn replay_key_for_active_tokens(&self, num_active_tokens: u32) -> Qwen35MainEmbedReplayKey {
-        Qwen35MainEmbedReplayKey::new(self.replay_bucket_policy.capacity(num_active_tokens))
+    fn replay_key_for_active_tokens(&self, num_active_tokens: u32) -> Qwen35MainTextEmbedReplayKey {
+        Qwen35MainTextEmbedReplayKey::new(self.replay_bucket_policy.capacity(num_active_tokens))
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Qwen35MainEmbedReplayKey {
+pub struct Qwen35MainTextEmbedReplayKey {
     num_total_tokens: u32,
 }
 
-impl Qwen35MainEmbedReplayKey {
+impl Qwen35MainTextEmbedReplayKey {
     /// Creates a key for an already-selected replay token capacity.
     pub fn new(num_total_tokens: u32) -> Self {
         Self { num_total_tokens }
     }
 }
 
-impl ReplayComponent for Qwen35MainEmbed {
-    type Key = Qwen35MainEmbedReplayKey;
-    type Input<'a> = Qwen35MainEmbedArgs<'a>;
+impl ReplayComponent for Qwen35MainTextEmbed {
+    type Key = Qwen35MainTextEmbedReplayKey;
+    type Input<'a> = Qwen35MainTextEmbedArgs<'a>;
 
     fn replay_key(&self, input: &Self::Input<'_>) -> Self::Key {
         self.replay_key_for_active_tokens(input.num_tokens)
@@ -121,11 +121,11 @@ impl ReplayComponent for Qwen35MainEmbed {
 
     fn record<'a>(&'a self, recorder: &mut ReplayRecorder, input: &Self::Input<'a>) {
         let key = self.replay_key(input);
-        Qwen35MainEmbed::record(
+        Qwen35MainTextEmbed::record(
             self,
             recorder,
             key.num_total_tokens,
-            ReplayU32::Parameter(QWEN35_MAIN_EMBED_NUM_ACTIVE_TOKENS),
+            ReplayU32::Parameter(QWEN35_MAIN_TEXT_EMBED_NUM_ACTIVE_TOKENS),
             *input,
         );
     }
