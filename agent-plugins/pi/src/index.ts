@@ -539,20 +539,8 @@ export default function register(pi: ExtensionAPI): void {
   const sessions = new SessionPool();
   pi.registerProvider("psi-dec", {
     name: "psi-dec",
-    baseUrl: process.env.PSI_DEC_GRPC_URL ?? "http://127.0.0.1:50061",
     apiKey: "unused",
     api: "psi-dec-messages" as any,
-    models: [
-      {
-        id: process.env.PSI_DEC_MODEL ?? "local-model",
-        name: process.env.PSI_DEC_MODEL ?? "psi-dec local model",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: Number(process.env.PSI_DEC_CONTEXT_WINDOW ?? 262144),
-        maxTokens: Number(process.env.PSI_DEC_MAX_TOKENS ?? 32768),
-      },
-    ],
     streamSimple: (model, context, options) => streamMessages(sessions, model, context, options),
   });
   pi.on("session_shutdown", async () => sessions.shutdownAll());

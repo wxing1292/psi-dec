@@ -312,9 +312,12 @@ thresholds. The current path has no scheduler flush timer.
 The scheduler stats timer fires every 30 seconds. It does not flush scheduler work. `InstrumentedScheduler` prints and
 resets non-empty periodical stats. It retains separate lifetime stats and always prints them during shutdown.
 
-Both scopes contain scheduler API counts/latencies and speculative-token counts. The speculative table counts every
-proposal position that the Spec forward produced. It counts an accepted position when `validated_tokens` contains that
-position. The rate is `accepted / proposed` at the same index.
+Both scopes contain scheduler API counts/latencies, batch-execution latency, and speculative-token counts.
+`InstrumentedScheduler` starts a batch-execution timer after `Scheduler::prepare` returns. It stops the timer when the
+matching response reaches `Scheduler::commit`. The metric includes executor work and time in the model-executor request
+and response channels. It does not measure GPU kernel time only. The speculative table counts every proposal position
+that the Spec forward produced. It counts an accepted position when `validated_tokens` contains that position. The rate
+is `accepted / proposed` at the same index.
 
 The trie decoder keeps proposal tokens, probabilities, and confidence values in one request-local proposal state.
 These vectors must have the same length. A verification-prefix trim changes all three vectors. Proposal confidence

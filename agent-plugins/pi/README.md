@@ -11,15 +11,81 @@ npm install
 pi install .
 ```
 
-Start a text-generation server on `127.0.0.1:50061`. Then select the `psi-dec` provider in Pi. These environment
-variables configure the default model:
+Start a text-generation server on `127.0.0.1:50061`. Add the `psi-dec` provider and its models to Pi's `models.json`.
+The plugin owns the `psi-dec-messages` transport. `models.json` owns the endpoint, model identity, context limit, and
+sampling defaults.
 
-| Variable | Default |
-| --- | --- |
-| `PSI_DEC_GRPC_URL` | `http://127.0.0.1:50061` |
-| `PSI_DEC_MODEL` | `local-model` |
-| `PSI_DEC_CONTEXT_WINDOW` | `262144` |
-| `PSI_DEC_MAX_TOKENS` | `32768` |
+The HTTP and resident-session providers can exist in the same configuration:
+
+```json
+{
+  "providers": {
+    "local": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "dummy",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "thinkingFormat": "openai"
+      },
+      "models": [
+        {
+          "id": "qwen3_5",
+          "name": "Qwen 3.5 27B Local HTTP",
+          "reasoning": true,
+          "contextWindow": 81920,
+          "maxTokens": 8192,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "samplingParams": {
+            "temperature": 1,
+            "top_k": 20,
+            "top_p": 0.8
+          }
+        }
+      ]
+    },
+    "psi-dec": {
+      "baseUrl": "http://127.0.0.1:50061",
+      "api": "psi-dec-messages",
+      "apiKey": "unused",
+      "models": [
+        {
+          "id": "qwen3_5",
+          "name": "Qwen 3.5 27B Local Session",
+          "reasoning": true,
+          "contextWindow": 81920,
+          "maxTokens": 8192,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "samplingParams": {
+            "temperature": 1,
+            "top_k": 20,
+            "top_p": 0.8
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+Select `local/qwen3_5` for the OpenAI-compatible HTTP path. Select `psi-dec/qwen3_5` for the resident-session path.
 
 The provider sends the complete Pi context on the first turn. It records the submitted message cursor. Each later
 request sends only the new user or tool-result messages. The provider does not retry an append request as a complete

@@ -1,6 +1,7 @@
 use std::cmp::max;
 use std::time::Instant;
 
+use ahash::AHashMap;
 use comfy_table::Cell;
 use comfy_table::Table;
 use comfy_table::presets::UTF8_FULL;
@@ -12,6 +13,7 @@ use crate::compute::DevReq;
 use crate::compute::DevResp;
 use crate::compute::SpecStats;
 use crate::runtime::CompletionReason;
+use crate::runtime::RawComputeSlotSeq;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::scheduler::UserRequest;
 use crate::runtime::tasks::AsyncTaskResp;
@@ -19,6 +21,8 @@ use crate::runtime::tasks::AsyncTaskResp;
 pub struct InstrumentedScheduler<Sch> {
     periodical: SchedulerStats,
     lifetime: SchedulerStats,
+
+    batch_execution_starts: AHashMap<RawComputeSlotSeq, Instant>,
 
     scheduler: Sch,
 }
@@ -28,6 +32,8 @@ impl<Sch> InstrumentedScheduler<Sch> {
         Self {
             periodical: SchedulerStats::new(num_spec_tokens),
             lifetime: SchedulerStats::new(num_spec_tokens),
+
+            batch_execution_starts: AHashMap::new(),
 
             scheduler,
         }
@@ -72,6 +78,7 @@ struct SchedulerAPIStats {
     hist_prepare: Histogram<u64>,
     hist_cancel: Histogram<u64>,
     hist_commit: Histogram<u64>,
+    hist_batch_execution: Histogram<u64>,
 }
 
 impl SchedulerAPIStats {
@@ -82,6 +89,7 @@ impl SchedulerAPIStats {
             hist_prepare: Histogram::<u64>::new(4).unwrap(),
             hist_cancel: Histogram::<u64>::new(4).unwrap(),
             hist_commit: Histogram::<u64>::new(4).unwrap(),
+            hist_batch_execution: Histogram::<u64>::new(4).unwrap(),
         }
     }
 
@@ -91,6 +99,7 @@ impl SchedulerAPIStats {
             && self.hist_prepare.is_empty()
             && self.hist_cancel.is_empty()
             && self.hist_commit.is_empty()
+            && self.hist_batch_execution.is_empty()
     }
 
     fn reset(&mut self) {
@@ -99,6 +108,7 @@ impl SchedulerAPIStats {
         self.hist_prepare.reset();
         self.hist_cancel.reset();
         self.hist_commit.reset();
+        self.hist_batch_execution.reset();
     }
 
     fn table(&self) -> Table {
@@ -109,10 +119,7 @@ impl SchedulerAPIStats {
         header.extend(COLUMNS.iter().map(|(name, _)| Cell::new(*name)));
         table.set_header(header);
 
-        for (name, count) in [
-            ("enqueue", self.num_enqueue),
-            ("handle_async_task_resp", self.num_async_task_resp),
-        ] {
+        for (name, count) in [("enqueue", self.num_enqueue), ("async_task", self.num_async_task_resp)] {
             let mut row = vec![Cell::new(name), Cell::new(count)];
             row.extend(COLUMNS.iter().map(|_| Cell::new("-")));
             table.add_row(row);
@@ -122,6 +129,7 @@ impl SchedulerAPIStats {
             ("prepare", &self.hist_prepare),
             ("cancel", &self.hist_cancel),
             ("commit", &self.hist_commit),
+            ("execution", &self.hist_batch_execution),
         ] {
             let mut row = vec![Cell::new(name), Cell::new(histogram.len().to_string())];
             row.extend(COLUMNS.iter().map(|(_, col)| Cell::new(cell(histogram, *col))));
@@ -224,6 +232,11 @@ where
     fn prepare(&mut self) -> BatchDeviceReq {
         let instant = Instant::now();
         let result = self.scheduler.prepare();
+        let batch_execution_start = self.batch_execution_starts.insert(result.seq(), Instant::now());
+        assert!(
+            batch_execution_start.is_none(),
+            "instrumented scheduler requires unique in-flight compute slot sequences"
+        );
         let latency = instant.elapsed().as_micros() as u64;
         let latency = max(1, latency);
         let _ = self.periodical.api.hist_prepare.record(latency);
@@ -232,8 +245,12 @@ where
     }
 
     fn cancel(&mut self, batch_dev_req: BatchDeviceReq) {
+        let compute_slot_seq = batch_dev_req.seq();
         let instant = Instant::now();
         self.scheduler.cancel(batch_dev_req);
+        self.batch_execution_starts
+            .remove(&compute_slot_seq)
+            .expect("instrumented scheduler cancellation requires a matching compute slot timestamp");
         let latency = instant.elapsed().as_micros() as u64;
         let latency = max(1, latency);
         let _ = self.periodical.api.hist_cancel.record(latency);
@@ -241,6 +258,16 @@ where
     }
 
     fn commit(&mut self, batch_dev_resp: BatchDeviceResp) -> Vec<(UserReq, CompletionReason)> {
+        let compute_slot_seq = batch_dev_resp.seq();
+        let batch_execution = self
+            .batch_execution_starts
+            .remove(&compute_slot_seq)
+            .expect("instrumented scheduler commit requires a matching compute slot timestamp")
+            .elapsed();
+        let batch_execution = max(1, batch_execution.as_micros() as u64);
+        let _ = self.periodical.api.hist_batch_execution.record(batch_execution);
+        let _ = self.lifetime.api.hist_batch_execution.record(batch_execution);
+
         let num_spec_tokens = self.lifetime.spec.len();
         if num_spec_tokens != 0 {
             let delta = batch_dev_resp.spec_stats(num_spec_tokens);
@@ -326,7 +353,14 @@ mod tests {
             MockScheduler::<TestUserReq, MockDevReq, MockDevResp, TestBatchDeviceReq, TestBatchDeviceResp>::new();
         inner.expect_enqueue().once().return_once(drop);
         inner.expect_can_flush().once().return_const(true);
-        inner.expect_prepare().once().return_once(TestBatchDeviceReq::new);
+        inner.expect_prepare().times(2).returning({
+            let mut compute_slot_seq = 1;
+            move || {
+                let batch_dev_req = batch_dev_req(compute_slot_seq);
+                compute_slot_seq += 1;
+                batch_dev_req
+            }
+        });
         inner.expect_cancel().once().return_once(drop);
         inner.expect_commit().once().return_once(|response| {
             drop(response);
@@ -338,13 +372,17 @@ mod tests {
         assert!(scheduler.can_flush());
         let batch_dev_req = scheduler.prepare();
         scheduler.cancel(batch_dev_req);
-        scheduler.commit(TestBatchDeviceResp::new());
+        let batch_dev_req = scheduler.prepare();
+        scheduler.commit(batch_dev_resp(batch_dev_req.seq()));
 
         assert_eq!(scheduler.lifetime.api.num_enqueue, 1);
         assert_eq!(scheduler.lifetime.api.num_async_task_resp, 0);
-        assert_eq!(scheduler.lifetime.api.hist_prepare.len(), 1);
+        assert_eq!(scheduler.lifetime.api.hist_prepare.len(), 2);
         assert_eq!(scheduler.lifetime.api.hist_cancel.len(), 1);
         assert_eq!(scheduler.lifetime.api.hist_commit.len(), 1);
+        assert_eq!(scheduler.periodical.api.hist_batch_execution.len(), 1);
+        assert_eq!(scheduler.lifetime.api.hist_batch_execution.len(), 1);
+        assert!(scheduler.batch_execution_starts.is_empty());
     }
 
     #[test]
@@ -362,5 +400,17 @@ mod tests {
         assert!(table.contains("│ proposed  ┆ 5       ┆ 3       ┆ 2       │"));
         assert!(table.contains("│ accepted  ┆ 2       ┆ 2       ┆ 0       │"));
         assert!(table.contains("│ rate      ┆ 0.4000  ┆ 0.6667  ┆ 0.0000  │"));
+    }
+
+    fn batch_dev_req(seq: u64) -> MockBatchDevReq<MockDevReq> {
+        let mut batch_dev_req = MockBatchDevReq::new();
+        batch_dev_req.expect_seq().return_const(seq);
+        batch_dev_req
+    }
+
+    fn batch_dev_resp(seq: u64) -> MockBatchDevResp<MockDevResp> {
+        let mut batch_dev_resp = MockBatchDevResp::new();
+        batch_dev_resp.expect_seq().return_const(seq);
+        batch_dev_resp
     }
 }
