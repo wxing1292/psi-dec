@@ -3,40 +3,126 @@ syntax = "proto3";
 package psi_dec.inference.v1;
 
 service InferenceRuntime {
-  rpc Decode(DecodeRequest) returns (stream DecodeResponse);
-  rpc DecodeStream(stream DecodeRequest) returns (stream DecodeResponse);
+  rpc GenerateTokens(GenerateTokensRequest) returns (stream GenerateTokensResponse);
+  rpc GenerateTokensStream(stream GenerateTokensRequest) returns (stream GenerateTokensResponse);
+  rpc GenerateMessages(GenerateMessagesRequest) returns (stream GenerateMessagesResponse);
+  rpc GenerateMessagesStream(stream GenerateMessagesRequest) returns (stream GenerateMessagesResponse);
 }
 
-message DecodeRequest {
+message GenerateTokensRequest {
   repeated uint32 tokens = 1;
-  uint32 max_sampled_tokens = 2;
-  repeated TokenSequence stop_sequences = 3;
-  optional float temperature = 4;
-  optional uint32 top_k = 5;
-  optional float top_p = 6;
-  optional uint32 seed = 7;
+  GenerationConfig generation = 2;
+}
+
+message GenerationConfig {
+  uint32 max_sampled_tokens = 1;
+  repeated TokenSequence stop_sequences = 2;
+  optional float temperature = 3;
+  optional uint32 top_k = 4;
+  optional float top_p = 5;
+  optional uint32 seed = 6;
 }
 
 message TokenSequence {
   repeated uint32 tokens = 1;
 }
 
-message DecodeResponse {
+message GenerateTokensResponse {
   uint64 request_id = 1;
   oneof event {
-    DecodeChunk chunk = 2;
-    DecodeCompletion completion = 3;
+    TokenChunk chunk = 2;
+    GenerationCompletion completion = 3;
   }
 }
 
-message DecodeChunk {
+message TokenChunk {
   repeated uint32 tokens = 1;
   repeated float probs = 2;
 }
 
-message DecodeCompletion {
+message GenerateMessagesRequest {
+  repeated InputMessage messages = 1;
+  ToolDelta tools = 2;
+  GenerationConfig generation = 3;
+  bool enable_thinking = 4;
+  optional ReasoningEffort reasoning_effort = 5;
+}
+
+enum ReasoningEffort {
+  REASONING_EFFORT_UNSPECIFIED = 0;
+  REASONING_EFFORT_LOW = 1;
+  REASONING_EFFORT_MEDIUM = 2;
+  REASONING_EFFORT_HIGH = 3;
+  REASONING_EFFORT_XHIGH = 4;
+}
+
+message InputMessage {
+  oneof message {
+    TextMessage system = 1;
+    TextMessage user = 2;
+    AssistantMessage assistant = 3;
+    ToolResultMessage tool_result = 4;
+  }
+}
+
+message TextMessage {
+  string text = 1;
+}
+
+message AssistantMessage {
+  repeated MessageContent content = 1;
+  repeated ToolCall tool_calls = 2;
+}
+
+message MessageContent {
+  oneof content {
+    string text = 1;
+    string reasoning = 2;
+  }
+}
+
+message ToolCall {
+  string id = 1;
+  string tool_id = 2;
+  string arguments_json = 3;
+}
+
+message ToolResultMessage {
+  string tool_call_id = 1;
+  string tool_id = 2;
+  repeated string text = 3;
+  bool is_error = 4;
+}
+
+message ToolDelta {
+  repeated ToolDefinition insert = 1;
+  repeated string remove = 2;
+}
+
+message ToolDefinition {
+  string id = 1;
+  optional string description = 2;
+  string input_schema_json = 3;
+}
+
+message GenerateMessagesResponse {
+  uint64 request_id = 1;
+  oneof event {
+    TextChunk reasoning = 2;
+    TextChunk text = 3;
+    ToolCall tool_call = 4;
+    GenerationCompletion completion = 5;
+  }
+}
+
+message TextChunk {
+  string text = 1;
+}
+
+message GenerationCompletion {
   CompletionReason reason = 1;
-  uint64 num_output_tokens = 2;
+  uint64 num_input_tokens = 2;
+  uint64 num_output_tokens = 3;
 }
 
 enum CompletionReason {

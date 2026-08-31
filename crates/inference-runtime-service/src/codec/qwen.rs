@@ -28,6 +28,7 @@ pub struct QwenCodec {
     chat_template: ChatTemplate,
     tokenizer: Arc<HFTokenizer>,
     thinking_end_token: Token,
+    turn_end_token: Token,
 }
 
 #[derive(Debug, PartialEq)]
@@ -38,6 +39,7 @@ pub enum ResponseEvent {
     Completed {
         reason: CompletionReason,
         num_output_tokens: usize,
+        turn_closed: bool,
     },
 }
 
@@ -67,10 +69,19 @@ impl QwenCodec {
                 "Qwen tokenizer does not decode its thinking boundary as {THINKING_END:?}"
             ));
         }
+        let turn_end_token = tokenizer
+            .token(TURN_END)
+            .ok_or_else(|| inference_runtime_core::log_err_internal!("Qwen tokenizer is missing {TURN_END:?}"))?;
+        if tokenizer.decode(&[turn_end_token])? != TURN_END {
+            return Err(inference_runtime_core::log_err_internal!(
+                "Qwen tokenizer does not decode its turn boundary as {TURN_END:?}"
+            ));
+        }
         Ok(Self {
             chat_template,
             tokenizer,
             thinking_end_token,
+            turn_end_token,
         })
     }
 
@@ -88,6 +99,55 @@ impl QwenCodec {
         reasoning_effort: Option<&str>,
         preserve_thinking: bool,
     ) -> Result<Vec<Token>> {
+        let prompt = self.render(messages, tools, enable_thinking, reasoning_effort, preserve_thinking)?;
+        self.tokenizer.encode(&prompt)
+    }
+
+    pub fn encode_continuation(
+        &self,
+        messages: Vec<Message>,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+        previous_turn_closed: bool,
+    ) -> Result<Vec<Token>> {
+        let mut anchored_messages = vec![
+            Message::user(CONTINUATION_ANCHOR_USER),
+            Message::assistant(CONTINUATION_ANCHOR_ASSISTANT),
+        ];
+        anchored_messages.extend(messages);
+        let prompt = self.render(anchored_messages, &[], enable_thinking, reasoning_effort, true)?;
+        let suffix = prompt
+            .split_once(CONTINUATION_ANCHOR_ASSISTANT)
+            .map(|(_, suffix)| suffix)
+            .ok_or_else(|| {
+                inference_runtime_core::log_err_internal!(
+                    "Qwen chat template did not preserve the continuation boundary"
+                )
+            })?;
+        let suffix = if previous_turn_closed {
+            suffix.strip_prefix(TURN_END).ok_or_else(|| {
+                inference_runtime_core::log_err_internal!(
+                    "Qwen chat template did not close the continuation anchor with {TURN_END:?}"
+                )
+            })?
+        } else {
+            suffix
+        };
+        self.tokenizer.encode(suffix)
+    }
+
+    fn closes_turn(&self, token: Token) -> bool {
+        token == self.turn_end_token
+    }
+
+    fn render(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+        preserve_thinking: bool,
+    ) -> Result<String> {
         let mut extra = Map::new();
         extra.insert("enable_thinking".to_string(), Value::Bool(enable_thinking));
         if let Some(reasoning_effort) = reasoning_effort {
@@ -108,7 +168,7 @@ impl QwenCodec {
         let prompt = self.chat_template.render(&input).map_err(|error| {
             inference_runtime_core::log_info_invalid_argument!("unable to render Qwen request: {error}")
         })?;
-        self.tokenizer.encode(&prompt)
+        Ok(prompt)
     }
 
     pub fn decode<S>(
@@ -125,9 +185,11 @@ impl QwenCodec {
             let mut response = Box::pin(response);
             let mut decoder = IncrementalDecoder::without_special_tokens(&codec.tokenizer);
             let mut parser = Parser::new(tool_ids, enable_thinking);
+            let mut last_output_token = None;
             loop {
                 match response.next().await {
                     Some(Ok(DecodeEvent::TokenProbs(token_probs))) => {
+                        last_output_token = token_probs.tokens.last().copied();
                         for event in decode_tokens(
                             &mut decoder,
                             &mut parser,
@@ -147,6 +209,7 @@ impl QwenCodec {
                         yield ResponseEvent::Completed {
                             reason,
                             num_output_tokens,
+                            turn_closed: last_output_token.is_some_and(|token| codec.closes_turn(token)),
                         };
                         break;
                     },
@@ -223,6 +286,9 @@ struct Parser {
 }
 
 const THINKING_END: &str = "</think>";
+const TURN_END: &str = "<|im_end|>";
+const CONTINUATION_ANCHOR_USER: &str = "psi-dec continuation anchor";
+const CONTINUATION_ANCHOR_ASSISTANT: &str = "<psi-dec-continuation-boundary>";
 const TOOL_START: &str = "<tool_call>";
 const TOOL_END: &str = "</tool_call>";
 

@@ -3,7 +3,6 @@ use inference_runtime_core::config::DEFAULT_SAMPLING_TOP_K;
 use inference_runtime_core::config::DEFAULT_SAMPLING_TOP_P;
 use inference_runtime_core::runtime::AtomicRequestStatus;
 use ordered_float::NotNan;
-use tokio_stream::StreamExt;
 
 use super::*;
 
@@ -58,7 +57,7 @@ fn test_stop_sequences_merge_and_deduplicate() {
 #[tokio::test]
 async fn test_response_preserves_token_chunks() {
     let (response, sender, status) = fixture_request(RequestStatus::Running);
-    let mut response = Box::pin(response);
+    let mut response = response;
     sender
         .send(RequestEvent::TokenProbs(TokenProbs {
             tokens: vec![fixture_token(1), fixture_token(2)],
@@ -70,16 +69,16 @@ async fn test_response_preserves_token_chunks() {
         .send(RequestEvent::TurnCompleted(CompletionReason::StopSequence))
         .await
         .unwrap();
-    match response.next().await.unwrap().unwrap() {
+    match response.recv_event().await.unwrap() {
         DecodeEvent::TokenProbs(chunk) => assert_eq!(chunk.tokens.len(), 2),
         _ => panic!("expected token chunk"),
     }
     assert!(matches!(
-        response.next().await.unwrap().unwrap(),
+        response.recv_event().await.unwrap(),
         DecodeEvent::Completed { .. }
     ));
-    assert!(response.next().await.is_none());
-    assert!(status.load().is_terminal());
+    assert_eq!(response.num_history_tokens(), 4);
+    assert_eq!(status.load(), RequestStatus::Running);
 }
 
 #[tokio::test]
@@ -105,9 +104,9 @@ async fn test_response_maps_terminal_errors() {
         RequestStatus::Aborted,
     ] {
         let (response, sender, _) = fixture_request(status);
-        let mut response = Box::pin(response);
+        let mut response = response;
         drop(sender);
-        let error = response.next().await.unwrap().unwrap_err();
+        let error = response.recv_event().await.unwrap_err();
         assert!(matches!(
             (status, error),
             (RequestStatus::Cancelled, Error::Cancelled(_))
@@ -127,9 +126,9 @@ fn test_response_drop_cancels_request() {
 async fn assert_completion_reason(expected: CompletionReason) {
     if expected == CompletionReason::ContextLimit {
         let (response, sender, _) = fixture_request(RequestStatus::Completed(expected));
-        let mut response = Box::pin(response);
+        let mut response = response;
         drop(sender);
-        match response.next().await.unwrap().unwrap() {
+        match response.recv_event().await.unwrap() {
             DecodeEvent::Completed { reason, .. } => assert_eq!(reason, expected),
             DecodeEvent::TokenProbs(_) => panic!("expected completion"),
         }
@@ -137,9 +136,9 @@ async fn assert_completion_reason(expected: CompletionReason) {
     }
 
     let (response, sender, _) = fixture_request(RequestStatus::Running);
-    let mut response = Box::pin(response);
+    let mut response = response;
     sender.send(RequestEvent::TurnCompleted(expected)).await.unwrap();
-    match response.next().await.unwrap().unwrap() {
+    match response.recv_event().await.unwrap() {
         DecodeEvent::Completed { reason, .. } => assert_eq!(reason, expected),
         DecodeEvent::TokenProbs(_) => panic!("expected completion"),
     }
@@ -162,7 +161,11 @@ fn fixture_sampling(max_sampled_tokens: usize) -> SamplingConfig {
 
 fn fixture_request(
     status: RequestStatus,
-) -> (DecodeResponse, async_channel::Sender<RequestEvent>, AtomicRequestStatus) {
+) -> (
+    DecodeSession<1, 1, 1>,
+    async_channel::Sender<RequestEvent>,
+    AtomicRequestStatus,
+) {
     let (sender, receiver) = async_channel::unbounded();
     let (cancel_tx, _cancel_rx) = async_channel::unbounded();
     let request_status = AtomicRequestStatus::new();
@@ -185,9 +188,5 @@ fn fixture_request(
         },
     }
     let request = ExternalRequest::new(42, request_status.clone(), receiver, cancel_tx);
-    (
-        DecodeResponse::new(DecodeSession::<1, 1, 1>::new(request)),
-        sender,
-        request_status,
-    )
+    (DecodeSession::new(request, 2), sender, request_status)
 }

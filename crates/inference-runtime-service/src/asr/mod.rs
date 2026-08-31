@@ -4,7 +4,6 @@ mod tokenizer;
 use std::path::Path;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use inference_executor_core::model::qwen::v3_asr::QWEN3_ASR_AUDIO_RESOURCE_TYPE;
 use inference_executor_core::model::qwen::v3_asr::Qwen3ASRModelConfig;
 use inference_executor_metal::model::qwen::v3_asr::AudioSourceRegistration;
@@ -140,10 +139,10 @@ impl Qwen3ASRService {
             ..SamplingConfig::default()
         };
         let request = DecodeRequest::new(tokens, None, vec![(resource, placement)], sampling)?;
-        let mut response = inference.decode(request)?;
+        let mut response = inference.create_session(request)?;
         let mut output_tokens = vec![];
-        while let Some(event) = response.next().await {
-            match event? {
+        loop {
+            match response.recv_event().await? {
                 DecodeEvent::TokenProbs(token_probs) => output_tokens.extend(token_probs.tokens),
                 DecodeEvent::Completed { .. } => {
                     let output = self.tokenizer.decode_without_special_tokens(&output_tokens)?;
@@ -151,7 +150,6 @@ impl Qwen3ASRService {
                 },
             }
         }
-        Err(Error::internal("Qwen3-ASR response ended without completion"))
     }
 
     fn normalize_language(&self, language: Option<&str>) -> Result<Option<String>> {

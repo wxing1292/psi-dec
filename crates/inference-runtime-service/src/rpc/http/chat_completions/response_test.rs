@@ -4,7 +4,7 @@ use inference_runtime_core::Error;
 use inference_runtime_core::runtime::CompletionReason;
 use uuid::Uuid;
 
-use crate::codec::qwen::ResponseEvent;
+use crate::api::messages::MessageEvent;
 use crate::rpc::http::chat_completions::response::Delta;
 use crate::rpc::http::chat_completions::response::Response;
 use crate::rpc::http::chat_completions::response::ResponseChoice;
@@ -85,9 +85,9 @@ fn test_response_chunk_schema() {
 async fn test_response() {
     let response = collect_response(
         stream::iter([
-            Ok(ResponseEvent::Thinking("reasoning".to_string())),
-            Ok(ResponseEvent::Text("hello".to_string())),
-            Ok(ResponseEvent::Completed {
+            Ok(MessageEvent::Reasoning("reasoning".to_string())),
+            Ok(MessageEvent::Text("hello".to_string())),
+            Ok(MessageEvent::Completed {
                 reason: CompletionReason::StopSequence,
                 num_output_tokens: 2,
             }),
@@ -119,9 +119,9 @@ async fn test_response() {
 async fn test_stream() {
     let events = ResponseStream::new(
         stream::iter([
-            Ok(ResponseEvent::Thinking("reasoning".to_string())),
-            Ok(ResponseEvent::Text("hello".to_string())),
-            Ok(ResponseEvent::Completed {
+            Ok(MessageEvent::Reasoning("reasoning".to_string())),
+            Ok(MessageEvent::Text("hello".to_string())),
+            Ok(MessageEvent::Completed {
                 reason: CompletionReason::LengthLimit,
                 num_output_tokens: 2,
             }),

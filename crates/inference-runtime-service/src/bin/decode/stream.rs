@@ -6,8 +6,9 @@ use inference_runtime_core::runtime::Token;
 use inference_runtime_core::tokenizer::huggingface::HFTokenizer;
 use inference_runtime_core::tokenizer::huggingface::IncrementalDecoder;
 use inference_runtime_proto::inference_runtime_service::CompletionReason as ProtoCompletionReason;
-use inference_runtime_proto::inference_runtime_service::DecodeRequest as ProtoDecodeRequest;
-use inference_runtime_proto::inference_runtime_service::decode_response::Event;
+use inference_runtime_proto::inference_runtime_service::GenerateTokensRequest as ProtoGenerateTokensRequest;
+use inference_runtime_proto::inference_runtime_service::GenerationConfig as ProtoGenerationConfig;
+use inference_runtime_proto::inference_runtime_service::generate_tokens_response::Event;
 use inference_runtime_proto::inference_runtime_service::inference_runtime_client::InferenceRuntimeClient;
 use inference_runtime_service::perf_metrics::DecodePerfMetrics;
 use tonic::Request;
@@ -47,24 +48,30 @@ impl<'a> DecodeStreamExecutor<'a> {
     }
 
     pub async fn execute(&mut self, request: &DecodeRequest) -> DecodeCliResult<DecodeStreamResult> {
-        let proto_request = ProtoDecodeRequest {
+        let proto_request = ProtoGenerateTokensRequest {
             tokens: request.tokens.iter().map(|token| token.value()).collect(),
-            max_sampled_tokens: request.max_sampled_tokens,
-            stop_sequences: Vec::new(),
-            temperature: Some(request.temperature),
-            top_k: Some(u32::try_from(request.top_k).map_err(|_| "top_k does not fit u32")?),
-            top_p: Some(request.top_p),
-            seed: request.seed,
+            generation: Some(ProtoGenerationConfig {
+                max_sampled_tokens: request.max_sampled_tokens,
+                stop_sequences: Vec::new(),
+                temperature: Some(request.temperature),
+                top_k: Some(u32::try_from(request.top_k).map_err(|_| "top_k does not fit u32")?),
+                top_p: Some(request.top_p),
+                seed: request.seed,
+            }),
         };
         let input_tokens = proto_request.tokens.len();
-        let max_sampled_tokens = proto_request.max_sampled_tokens;
+        let max_sampled_tokens = proto_request
+            .generation
+            .as_ref()
+            .expect("decode CLI always supplies generation config")
+            .max_sampled_tokens;
         let mut tonic_request = Request::new(proto_request);
         if let Some(timeout_ms) = self.runtime.timeout_ms() {
             tonic_request.set_timeout(Duration::from_millis(timeout_ms));
         }
         let mut stream = self
             .client
-            .decode(tonic_request)
+            .generate_tokens(tonic_request)
             .await
             .map_err(|err| format!("decode RPC failed: {err}"))?
             .into_inner();

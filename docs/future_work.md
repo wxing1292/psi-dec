@@ -8,16 +8,16 @@ document that owns the component.
 
 ## Agent Integration
 
-- Add HTTP session affinity for repeated agent turns only after resident-session eviction and recovery are available.
-  Keep conversation history in the caller. Require each HTTP request to contain the complete message history and use
-  the existing `QwenCodec` to produce checkpoint-authoritative tokens.
-  Let the Pi `openai-completions` provider send its stable `x-session-affinity` value. Use this value only to select an
-  ephemeral continuation in the existing `DecodeSessions` owner. Do not add a Pi custom provider, conversation store,
-  tool-event wire, or persistent session.
-  Permit at most one active turn for each affinity value.
-  Reuse a continuation only when its retained tokens are an exact prefix of the new input.
-  Treat a missing, evicted, or mismatched continuation as a cache miss and use the stateless trie and prefill path.
-  Keep `x-request-id` as request correlation. Do not use `x-client-request-id` as a continuation key.
+- Distinguish turn interruption from session shutdown. The first Pi provider closes the complete
+  `GenerateMessagesStream` when its `AbortSignal` fires.
+- Add a Codex-compatible agent adapter above the generation RPC. Keep durable threads, turns, items, approvals, tool
+  execution, and command execution out of the model-generation protocol.
+- Add branch support from an existing resident session. Return a new session identity. Share immutable token and cache
+  prefixes. Give the child independent mutable GDN state.
+- Investigate rewrite only after the GDN state-copy contract is explicit. A changed token prefix must not reuse GDN
+  state that belongs to the old prefix.
+- Keep compaction in Pi for the first version. Pi supplies the summary and retained messages as a new complete context.
+  Pi closes the old generation stream and creates a new runtime session. The Pi logical session ID does not change.
 
 ## Runtime Lifecycle
 

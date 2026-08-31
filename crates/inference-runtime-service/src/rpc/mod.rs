@@ -18,10 +18,11 @@ pub async fn run<const N: usize, const L: usize, const P: usize>(
     inference: Arc<Inference<N, L, P>>,
     shutdown: Shutdown,
 ) -> Result<()> {
+    let grpc_qwen_codec = http_service.qwen_codec();
     let grpc_inference = inference.clone();
     let grpc_shutdown = shutdown.clone();
     let grpc_server = async move {
-        let result = grpc::run(grpc_listen_addr, grpc_inference, grpc_shutdown.clone())
+        let result = grpc::run(grpc_listen_addr, grpc_inference, grpc_qwen_codec, grpc_shutdown.clone())
             .await
             .map_err(|error| log_err_unavailable!("gRPC server failed: {error}"));
         grpc_shutdown.shutdown();

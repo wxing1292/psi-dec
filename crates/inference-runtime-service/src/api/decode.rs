@@ -1,9 +1,5 @@
-use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::task::Context;
-use std::task::Poll;
 
-use futures_util::stream;
 use inference_runtime_core::Error;
 use inference_runtime_core::Result;
 use inference_runtime_core::config::MAX_SAMPLING_TOP_K;
@@ -18,15 +14,10 @@ use inference_runtime_core::runtime::Resource;
 use inference_runtime_core::runtime::ResourcePlacement;
 use inference_runtime_core::runtime::Token;
 use inference_runtime_core::runtime::TokenProbs;
-use tokio_stream::Stream;
 
 use crate::api::Inference;
 
 impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
-    pub fn decode(&self, request: DecodeRequest) -> Result<DecodeResponse> {
-        self.create_session(request).map(DecodeResponse::new)
-    }
-
     pub fn create_session(&self, request: DecodeRequest) -> Result<DecodeSession<N, L, P>> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         assert_ne!(request_id, 0, "decode request ID allocator wrapped to zero");
@@ -37,6 +28,7 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
             resource_entries,
             mut sampling,
         } = request;
+        let num_history_tokens = tokens.len();
         merge_stop_sequences(&mut sampling.stop_sequences, &self.default_stop_sequences);
 
         let external_request = self.runtime.create_session(
@@ -48,16 +40,21 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
             resource_entries,
             sampling,
         )?;
-        Ok(DecodeSession::new(external_request))
+        Ok(DecodeSession::new(external_request, num_history_tokens))
     }
 
-    pub fn continue_session(&self, session: &DecodeSession<N, L, P>, request: DecodeRequest) -> Result<()> {
+    pub fn continue_session(&self, session: &mut DecodeSession<N, L, P>, request: DecodeRequest) -> Result<()> {
+        assert!(
+            session.num_turn_output_tokens.is_none(),
+            "decode session cannot continue before turn completion",
+        );
         let DecodeRequest {
             tokens,
             token_positions,
             resource_entries,
             mut sampling,
         } = request;
+        let num_prompt_tokens = tokens.len();
         if token_positions.is_some() {
             return Err(Error::invalid_argument(
                 "decode session continuation does not support explicit token positions",
@@ -69,7 +66,9 @@ impl<const N: usize, const L: usize, const P: usize> Inference<N, L, P> {
             ));
         }
         merge_stop_sequences(&mut sampling.stop_sequences, &self.default_stop_sequences);
-        self.runtime.continue_session(&session.request, tokens, sampling)
+        self.runtime.continue_session(&session.request, tokens, sampling)?;
+        session.start_turn(num_prompt_tokens);
+        Ok(())
     }
 }
 
@@ -127,47 +126,18 @@ impl DecodeRequest {
     }
 }
 
-pub struct DecodeResponse {
-    request_id: RawRequestID,
-    stream: Pin<Box<dyn Stream<Item = Result<DecodeEvent>> + Send>>,
-}
-
-impl DecodeResponse {
-    fn new<const N: usize, const L: usize, const P: usize>(session: DecodeSession<N, L, P>) -> Self {
-        let request_id = session.request_id();
-        let stream = stream::unfold((session, false), |(mut session, closed)| {
-            async move {
-                if closed {
-                    return None;
-                }
-                let event = session.next_event().await?;
-                let closed = matches!(event, Ok(DecodeEvent::Completed { .. }) | Err(_));
-                Some((event, (session, closed)))
-            }
-        });
-        Self {
-            request_id,
-            stream: Box::pin(stream),
-        }
-    }
-
-    pub fn request_id(&self) -> RawRequestID {
-        self.request_id
-    }
-}
-
 pub struct DecodeSession<const N: usize, const L: usize, const P: usize> {
     request: ExternalRequest,
-    num_output_tokens: usize,
-    closed: bool,
+    num_history_tokens: usize,
+    num_turn_output_tokens: Option<usize>,
 }
 
 impl<const N: usize, const L: usize, const P: usize> DecodeSession<N, L, P> {
-    fn new(request: ExternalRequest) -> Self {
+    fn new(request: ExternalRequest, num_history_tokens: usize) -> Self {
         Self {
             request,
-            num_output_tokens: 0,
-            closed: false,
+            num_history_tokens,
+            num_turn_output_tokens: Some(0),
         }
     }
 
@@ -175,48 +145,59 @@ impl<const N: usize, const L: usize, const P: usize> DecodeSession<N, L, P> {
         self.request.req_id()
     }
 
-    pub async fn next_event(&mut self) -> Option<Result<DecodeEvent>> {
-        if self.closed {
-            return None;
-        }
+    pub fn num_history_tokens(&self) -> usize {
+        self.num_history_tokens
+    }
+
+    fn start_turn(&mut self, num_prompt_tokens: usize) {
+        assert!(
+            self.num_turn_output_tokens.is_none(),
+            "decode session cannot start two active turns"
+        );
+        self.num_history_tokens += num_prompt_tokens;
+        self.num_turn_output_tokens = Some(0);
+    }
+
+    pub async fn recv_event(&mut self) -> Result<DecodeEvent> {
         match self.request.event_rx().recv().await {
             Ok(RequestEvent::TokenProbs(token_probs)) => {
                 debug_assert!(!token_probs.tokens.is_empty());
                 debug_assert_eq!(token_probs.tokens.len(), token_probs.probs.len());
-                self.num_output_tokens += token_probs.tokens.len();
-                Some(Ok(DecodeEvent::TokenProbs(token_probs)))
+                self.num_history_tokens += token_probs.tokens.len();
+                *self
+                    .num_turn_output_tokens
+                    .as_mut()
+                    .expect("token output requires an active decode turn") += token_probs.tokens.len();
+                Ok(DecodeEvent::TokenProbs(token_probs))
             },
             Ok(RequestEvent::TurnCompleted(reason)) => {
-                let num_output_tokens = std::mem::take(&mut self.num_output_tokens);
-                Some(Ok(DecodeEvent::Completed {
+                let num_output_tokens = self
+                    .num_turn_output_tokens
+                    .take()
+                    .expect("turn completion requires an active decode turn");
+                Ok(DecodeEvent::Completed {
                     reason,
                     num_output_tokens,
-                }))
+                })
             },
             Err(_) => {
-                self.closed = true;
-                Some(match self.request.status() {
+                match self.request.status() {
                     RequestStatus::Completed(reason) => {
                         Ok(DecodeEvent::Completed {
                             reason,
-                            num_output_tokens: std::mem::take(&mut self.num_output_tokens),
+                            num_output_tokens: self
+                                .num_turn_output_tokens
+                                .take()
+                                .expect("terminal completion requires an active decode turn"),
                         })
                     },
                     RequestStatus::Cancelled => Err(Error::cancelled("request was cancelled")),
                     RequestStatus::TimedOut => Err(Error::deadline_exceeded("request deadline exceeded")),
                     RequestStatus::Aborted => Err(Error::aborted("request was aborted")),
                     status => panic!("request output closed in non-terminal state: {status:?}"),
-                })
+                }
             },
         }
-    }
-}
-
-impl Stream for DecodeResponse {
-    type Item = Result<DecodeEvent>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.stream.as_mut().poll_next(cx)
     }
 }
 

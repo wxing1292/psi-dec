@@ -6,6 +6,7 @@ use inference_runtime_core::runtime::Token;
 use crate::runtime::InferenceRuntime;
 
 pub mod decode;
+pub mod messages;
 
 pub struct Inference<const N: usize, const L: usize, const P: usize> {
     runtime: Arc<InferenceRuntime<N, L, P>>,

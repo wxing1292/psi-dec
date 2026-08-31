@@ -438,7 +438,6 @@ mod tests {
     use inference_runtime_core::runtime::scheduler::PrepareResult;
     use inference_runtime_core::runtime::scheduler::UserRequest;
     use ordered_float::NotNan;
-    use tokio_stream::StreamExt;
 
     use super::InferenceRuntime;
     use crate::api::Inference;
@@ -655,19 +654,17 @@ mod tests {
             max_sampled_tokens: 8,
             ..SamplingConfig::default()
         };
-        let mut response = Box::pin(
-            inference
-                .decode(
-                    DecodeRequest::new(
-                        vec![Token::new(1), Token::new(2), Token::new(3)],
-                        None,
-                        vec![],
-                        sampling,
-                    )
-                    .unwrap(),
+        let mut response = inference
+            .create_session(
+                DecodeRequest::new(
+                    vec![Token::new(1), Token::new(2), Token::new(3)],
+                    None,
+                    vec![],
+                    sampling,
                 )
                 .unwrap(),
-        );
+            )
+            .unwrap();
 
         let ReplayableModelExecutorRequest::Batch(batch_request) = runtime
             .model_executor_request_rx()
@@ -689,18 +686,17 @@ mod tests {
             .unwrap();
 
         async_runtime.block_on(async {
-            let DecodeEvent::TokenProbs(token_probs) = response.next().await.unwrap().unwrap() else {
+            let DecodeEvent::TokenProbs(token_probs) = response.recv_event().await.unwrap() else {
                 panic!("decode response should contain the sampled token")
             };
             assert_eq!(token_probs.tokens, vec![Token::new(4)]);
             assert!(matches!(
-                response.next().await.unwrap().unwrap(),
+                response.recv_event().await.unwrap(),
                 DecodeEvent::Completed {
                     reason: CompletionReason::ContextLimit,
                     num_output_tokens: 1,
                 }
             ));
-            assert!(response.next().await.is_none());
         });
         shutdown.shutdown();
     }

@@ -12,8 +12,8 @@ use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 
-use crate::api::decode::DecodeRequest;
-use crate::codec::qwen::QwenCodec;
+use crate::api::messages::MessageRequest;
+use crate::api::messages::ToolDelta;
 use crate::rpc::http::error::HTTPError;
 use crate::rpc::http::error::invalid_request;
 use crate::rpc::http::error::map_error;
@@ -138,10 +138,7 @@ enum ReasoningEffort {
     Xhigh,
 }
 
-pub fn preprocess(
-    request: Request,
-    qwen_codec: &QwenCodec,
-) -> Result<(DecodeRequest, usize, Vec<ToolID>, bool), HTTPError> {
+pub fn preprocess(request: Request) -> Result<MessageRequest, HTTPError> {
     if request.model.as_ref().is_some_and(String::is_empty) {
         return Err(invalid_request("model must not be empty"));
     }
@@ -154,8 +151,9 @@ pub fn preprocess(
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High | ReasoningEffort::Xhigh => "xhigh",
         }
+        .to_string()
     });
-    let enable_thinking = match (request.enable_thinking, reasoning_effort) {
+    let enable_thinking = match (request.enable_thinking, reasoning_effort.as_deref()) {
         (Some(false), Some(_)) => {
             return Err(invalid_request("reasoning_effort conflicts with enable_thinking false"));
         },
@@ -172,11 +170,7 @@ pub fn preprocess(
             return Err(invalid_request("tool_choice required is not supported"));
         },
     };
-    let rendered_tools = if enable_tools { tools.as_slice() } else { &[] };
-    let tokens = qwen_codec
-        .encode(messages, rendered_tools, enable_thinking, reasoning_effort, false)
-        .map_err(map_error)?;
-    let prompt_tokens = tokens.len();
+    let tools = if enable_tools { tools } else { Vec::new() };
     let max_sampled_tokens = request
         .max_completion_tokens
         .map(|tokens| tokens as usize)
@@ -198,13 +192,8 @@ pub fn preprocess(
         seed,
         stop_sequences: vec![],
     };
-    let request = DecodeRequest::new(tokens, None, vec![], sampling).map_err(map_error)?;
-    let tool_ids = if enable_tools {
-        tools.into_iter().map(|tool| tool.tool_id().clone()).collect()
-    } else {
-        Vec::new()
-    };
-    Ok((request, prompt_tokens, tool_ids, enable_thinking))
+    let tools = ToolDelta::new(tools, Vec::new()).map_err(map_error)?;
+    MessageRequest::new(messages, tools, sampling, enable_thinking, reasoning_effort).map_err(map_error)
 }
 
 fn convert_tools(tools: Vec<Tool>) -> Result<Vec<ToolDefinition>, HTTPError> {

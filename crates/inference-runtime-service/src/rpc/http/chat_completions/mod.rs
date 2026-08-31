@@ -145,10 +145,10 @@ pub async fn handle<const N: usize, const L: usize, const P: usize>(
         .as_ref()
         .is_some_and(|options| options.include_usage);
     let model = request.model.clone().unwrap_or_else(|| server.model_name.to_string());
-    let (request, prompt_tokens, tool_ids, enable_thinking) = preprocess(request, &server.qwen_codec)?;
-    let response = server.inference.decode(request).map_err(map_error)?;
-    let metadata = ResponseMetadata::new(model, prompt_tokens);
-    let response = server.qwen_codec.decode(response, tool_ids, enable_thinking);
+    let request = preprocess(request)?;
+    let session = server.message_generator.create_session(request).map_err(map_error)?;
+    let metadata = ResponseMetadata::new(model, session.num_input_tokens());
+    let response = session.response_stream();
     let mut response = if stream {
         postprocess_stream(response, metadata, include_usage)
     } else {
@@ -169,8 +169,4 @@ fn resolve_request_id(headers: &HeaderMap) -> Result<Uuid, HTTPError> {
         .to_str()
         .map_err(|_| invalid_request("x-request-id must be a UUID"))?;
     Uuid::parse_str(value).map_err(|_| invalid_request("x-request-id must be a UUID"))
-}
-
-fn new_tool_call_id() -> String {
-    Uuid::new_v4().to_string()
 }

@@ -7,6 +7,7 @@ use inference_runtime_core::channel::Shutdown;
 use tracing::Instrument;
 
 use crate::api::Inference;
+use crate::api::messages::MessageGenerator;
 use crate::asr::Qwen3ASRService;
 use crate::codec::qwen::QwenCodec;
 
@@ -22,19 +23,26 @@ pub enum HTTPService {
     Transcriptions(Arc<Qwen3ASRService>),
 }
 
+impl HTTPService {
+    pub fn qwen_codec(&self) -> Option<Arc<QwenCodec>> {
+        match self {
+            Self::ChatCompletions(codec) => Some(codec.clone()),
+            Self::Transcriptions(_) => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChatCompletionsServer<const N: usize, const L: usize, const P: usize> {
     model_name: Arc<str>,
-    inference: Arc<Inference<N, L, P>>,
-    qwen_codec: Arc<QwenCodec>,
+    message_generator: MessageGenerator<N, L, P>,
 }
 
 impl<const N: usize, const L: usize, const P: usize> ChatCompletionsServer<N, L, P> {
     fn new(model_name: String, inference: Arc<Inference<N, L, P>>, qwen_codec: Arc<QwenCodec>) -> Self {
         Self {
             model_name: model_name.into(),
-            inference,
-            qwen_codec,
+            message_generator: MessageGenerator::new(inference, qwen_codec),
         }
     }
 

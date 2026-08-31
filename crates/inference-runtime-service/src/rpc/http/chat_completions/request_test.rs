@@ -1,15 +1,8 @@
-use std::sync::Arc;
-
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
-use hf_chat_template::ChatTemplate;
-use inference_runtime_core::tokenizer::huggingface::HFTokenizer;
 use serde_json::json;
-use tokenizers::models::wordlevel::WordLevel;
 use uuid::Uuid;
 
-use crate::codec::qwen::QwenCodec;
-use crate::rpc::http::chat_completions::new_tool_call_id;
 use crate::rpc::http::chat_completions::request::Content;
 use crate::rpc::http::chat_completions::request::Message;
 use crate::rpc::http::chat_completions::request::Request;
@@ -116,7 +109,6 @@ fn test_role_fields_are_structural() {
 
 #[test]
 fn test_preprocess() {
-    let codec = fixture_codec();
     let request = serde_json::from_value::<Request>(json!({
         "model": "qwen",
         "messages": [
@@ -140,18 +132,13 @@ fn test_preprocess() {
     }))
     .unwrap();
 
-    let Ok((_, prompt_tokens, tool_ids, enable_thinking)) = preprocess(request, &codec) else {
+    let Ok(_) = preprocess(request) else {
         panic!("Pi Chat Completions request must preprocess");
     };
-    assert!(prompt_tokens > 0);
-    assert_eq!(tool_ids.len(), 1);
-    assert_eq!(tool_ids[0].as_str(), "read_file");
-    assert!(enable_thinking);
 }
 
 #[test]
 fn test_tool_history() {
-    let codec = fixture_codec();
     let request = serde_json::from_value::<Request>(json!({
         "model": "qwen",
         "messages": [
@@ -187,13 +174,9 @@ fn test_tool_history() {
     }))
     .unwrap();
 
-    let Ok((_, prompt_tokens, tool_ids, enable_thinking)) = preprocess(request, &codec) else {
+    let Ok(_) = preprocess(request) else {
         panic!("valid Chat Completions request must preprocess");
     };
-    assert!(prompt_tokens > 0);
-    assert_eq!(tool_ids.len(), 1);
-    assert_eq!(tool_ids[0].as_str(), "active_tool");
-    assert!(!enable_thinking);
 
     let request = serde_json::from_value::<Request>(json!({
         "model": "qwen",
@@ -211,7 +194,7 @@ fn test_tool_history() {
         ]
     }))
     .unwrap();
-    assert!(preprocess(request, &codec).is_err());
+    assert!(preprocess(request).is_err());
 }
 
 #[test]
@@ -225,14 +208,13 @@ fn test_tool_replay_with_caller_request_id() {
     let Ok(request_id) = resolve_request_id(&headers) else {
         panic!("caller request UUID must be valid");
     };
-    let tool_call_id = new_tool_call_id();
-    let codec = fixture_codec();
-    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+    let tool_call_id = Uuid::new_v4().to_string();
+    assert!(preprocess(tool_replay_request(&tool_call_id)).is_ok());
 
     let Ok(replay_request_id) = resolve_request_id(&headers) else {
         panic!("replayed caller request UUID must be valid");
     };
-    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+    assert!(preprocess(tool_replay_request(&tool_call_id)).is_ok());
 
     assert_eq!(replay_request_id, request_id);
     assert_eq!(request_id, caller_request_id);
@@ -245,14 +227,13 @@ fn test_tool_replay_with_generated_request_ids() {
     let Ok(request_id) = resolve_request_id(&headers) else {
         panic!("server must generate a request UUID");
     };
-    let tool_call_id = new_tool_call_id();
-    let codec = fixture_codec();
-    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+    let tool_call_id = Uuid::new_v4().to_string();
+    assert!(preprocess(tool_replay_request(&tool_call_id)).is_ok());
 
     let Ok(replay_request_id) = resolve_request_id(&headers) else {
         panic!("server must generate a replay request UUID");
     };
-    assert!(preprocess(tool_replay_request(&tool_call_id), &codec).is_ok());
+    assert!(preprocess(tool_replay_request(&tool_call_id)).is_ok());
 
     assert_ne!(replay_request_id, request_id);
     let tool_call_id = Uuid::parse_str(&tool_call_id).unwrap();
@@ -262,7 +243,6 @@ fn test_tool_replay_with_generated_request_ids() {
 
 #[test]
 fn test_tool_definitions() {
-    let codec = fixture_codec();
     for request in [
         json!({
             "model": "qwen",
@@ -286,13 +266,12 @@ fn test_tool_definitions() {
         }),
     ] {
         let request = serde_json::from_value::<Request>(request).unwrap();
-        assert!(preprocess(request, &codec).is_err());
+        assert!(preprocess(request).is_err());
     }
 }
 
 #[test]
 fn test_unsupported_options() {
-    let codec = fixture_codec();
     for request in [
         json!({
             "model": "",
@@ -316,7 +295,7 @@ fn test_unsupported_options() {
         }),
     ] {
         let request = serde_json::from_value::<Request>(request).unwrap();
-        assert!(preprocess(request, &codec).is_err());
+        assert!(preprocess(request).is_err());
     }
 }
 
@@ -347,30 +326,4 @@ fn tool_replay_request(tool_call_id: &str) -> Request {
         "max_completion_tokens": 4
     }))
     .unwrap()
-}
-
-fn fixture_codec() -> QwenCodec {
-    let template = ChatTemplate::from_str(
-        "{% for message in messages %}{{ message.role }}:{{ message.content }}{% endfor %}{% for tool in tools %}{{ \
-         tool.function.name }}{% endfor %}",
-    )
-    .unwrap();
-    QwenCodec::new(template, Arc::new(fixture_tokenizer())).unwrap()
-}
-
-fn fixture_tokenizer() -> HFTokenizer {
-    let model = WordLevel::builder()
-        .vocab(
-            [("[UNK]".to_string(), 0), ("</think>".to_string(), 1)]
-                .into_iter()
-                .collect(),
-        )
-        .unk_token("[UNK]".to_string())
-        .build()
-        .unwrap();
-    let mut tokenizer = tokenizers::Tokenizer::new(model);
-    tokenizer
-        .add_special_tokens([tokenizers::AddedToken::from("</think>", true)])
-        .unwrap();
-    HFTokenizer::new(tokenizer)
 }

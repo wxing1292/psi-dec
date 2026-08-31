@@ -21,8 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::codec::qwen::ResponseEvent;
-use crate::rpc::http::chat_completions::new_tool_call_id;
+use crate::api::messages::MessageEvent;
 use crate::rpc::http::error::HTTPError;
 use crate::rpc::http::error::map_error;
 use crate::rpc::http::error::openai_error_body;
@@ -120,7 +119,7 @@ struct Usage {
 
 pub async fn postprocess_response<S>(response: S, metadata: ResponseMetadata) -> Result<AxumResponse, HTTPError>
 where
-    S: Stream<Item = Result<ResponseEvent, Error>>,
+    S: Stream<Item = Result<MessageEvent, Error>>,
 {
     collect_response(response, metadata)
         .await
@@ -130,7 +129,7 @@ where
 
 async fn collect_response<S>(response: S, metadata: ResponseMetadata) -> Result<Response, Error>
 where
-    S: Stream<Item = Result<ResponseEvent, Error>>,
+    S: Stream<Item = Result<MessageEvent, Error>>,
 {
     let mut response = Box::pin(response);
     let mut thinking = String::new();
@@ -138,18 +137,18 @@ where
     let mut tool_calls = Vec::new();
     while let Some(event) = response.next().await {
         match event? {
-            ResponseEvent::Thinking(chunk) => thinking.push_str(&chunk),
-            ResponseEvent::Text(chunk) => text.push_str(&chunk),
-            ResponseEvent::ToolCall(call) => {
+            MessageEvent::Reasoning(chunk) => thinking.push_str(&chunk),
+            MessageEvent::Text(chunk) => text.push_str(&chunk),
+            MessageEvent::ToolCall(call) => {
                 tool_calls.push(ToolCall::Function {
-                    id: new_tool_call_id(),
+                    id: call.id().as_str().to_string(),
                     function: FunctionCall {
                         name: call.tool_id().as_str().to_string(),
                         arguments: call.arguments().as_value().to_string(),
                     },
                 });
             },
-            ResponseEvent::Completed {
+            MessageEvent::Completed {
                 reason,
                 num_output_tokens,
             } => {
@@ -185,7 +184,7 @@ where
 
 pub fn postprocess_stream<S>(response: S, metadata: ResponseMetadata, include_usage: bool) -> AxumResponse
 where
-    S: Stream<Item = Result<ResponseEvent, Error>> + Send + 'static,
+    S: Stream<Item = Result<MessageEvent, Error>> + Send + 'static,
 {
     let response = ResponseStream::new(response, metadata, include_usage)
         .map(|event| event.map(|data| Event::default().data(data)));
@@ -234,7 +233,7 @@ struct ResponseStream<S> {
 
 impl<S> ResponseStream<S>
 where
-    S: Stream<Item = Result<ResponseEvent, Error>>,
+    S: Stream<Item = Result<MessageEvent, Error>>,
 {
     fn new(response: S, metadata: ResponseMetadata, include_usage: bool) -> Self {
         let role = serialize(&ResponseChunk {
@@ -264,9 +263,9 @@ where
         }
     }
 
-    fn push_event(&mut self, event: ResponseEvent) {
+    fn push_event(&mut self, event: MessageEvent) {
         match event {
-            ResponseEvent::Thinking(reasoning_content) => {
+            MessageEvent::Reasoning(reasoning_content) => {
                 self.pending.push_back(serialize(&self.chunk(Delta {
                     role: None,
                     content: None,
@@ -274,7 +273,7 @@ where
                     tool_calls: None,
                 })));
             },
-            ResponseEvent::Text(content) => {
+            MessageEvent::Text(content) => {
                 self.pending.push_back(serialize(&self.chunk(Delta {
                     role: None,
                     content: Some(content),
@@ -282,7 +281,7 @@ where
                     tool_calls: None,
                 })));
             },
-            ResponseEvent::ToolCall(call) => {
+            MessageEvent::ToolCall(call) => {
                 let index = self.num_tool_calls;
                 self.num_tool_calls += 1;
                 self.pending.push_back(serialize(&self.chunk(Delta {
@@ -291,7 +290,7 @@ where
                     reasoning_content: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index,
-                        id: new_tool_call_id(),
+                        id: call.id().as_str().to_string(),
                         kind: "function",
                         function: FunctionCallDelta {
                             name: call.tool_id().as_str().to_string(),
@@ -300,7 +299,7 @@ where
                     }]),
                 })));
             },
-            ResponseEvent::Completed {
+            MessageEvent::Completed {
                 reason,
                 num_output_tokens,
             } => {
@@ -364,7 +363,7 @@ where
 
 impl<S> Stream for ResponseStream<S>
 where
-    S: Stream<Item = Result<ResponseEvent, Error>>,
+    S: Stream<Item = Result<MessageEvent, Error>>,
 {
     type Item = Result<String, Infallible>;
 

@@ -64,7 +64,7 @@ content.
 Each response stream keeps its incremental detokenization and Qwen response-grammar state private.
 
 The runtime request-event channel is intentionally `async_channel::unbounded`. It preserves committed token
-probabilities and turn-completion events without blocking synchronous runtime commit. Dropping a `DecodeResponse`
+probabilities and turn-completion events without blocking synchronous runtime commit. Dropping a `DecodeSession`
 drops its `ExternalRequest`. This action cancels only that request. A slow transport consumer does not terminate the
 request.
 
@@ -506,50 +506,68 @@ It owns a worker thread, a Metal stream, the Audio Tower, and the Audio Tower we
 Service hibernation stops and starts this executor with the decoder lifecycle command.
 See [`qwen3_asr.md`](qwen3_asr.md) for the resource and executor contract.
 
-## gRPC decode
+## gRPC generation
 
-`DecodeRequest` contains model-ready tokens and sampling fields. The internal service API can also contain explicit
-token positions for model-specific inputs such as M-RoPE. The gRPC request currently derives normal sequential token
-positions and does not expose this field. `DecodeRequest` does not contain a caller request ID or client-side default
-stop tokens.
+The service exports four symmetric RPCs:
 
-`Decode` accepts one request and returns one response stream. `DecodeStream` accepts an ordered stream of the same
-requests and returns one response stream. The server processes each input request to completion before it reads the
-next input request. Thus, response events from different requests cannot interleave.
+| Input domain | One turn | Multiple turns |
+| --- | --- | --- |
+| Model-ready token IDs | `GenerateTokens` | `GenerateTokensStream` |
+| Structured messages | `GenerateMessages` | `GenerateMessagesStream` |
 
-`DecodeStream` requires a first request. An empty input stream returns `InvalidArgument` before the server creates the
-response stream.
+`GenerateTokensRequest` contains token IDs and generation fields. The internal service API can also contain explicit
+token positions for model-specific inputs such as M-RoPE. The gRPC request derives normal sequential token positions
+and does not expose this field.
 
-The first `DecodeStream` request contains the initial model input. Each later request contains only the new prompt
-tokens for that turn. Each request also supplies the sampling configuration for its turn. The RPC does not store
-messages, tool events, or other conversation objects.
+`GenerateTokensStream` requires one initial request. The first request contains the initial model input. Each later
+request contains only the new prompt tokens for one turn. Each request supplies the generation configuration for that
+turn. The token API does not apply a chat template or add a turn separator. The caller must include every token in the
+new prompt suffix.
 
-One `DecodeStream` owns one runtime session:
+`GenerateMessagesRequest` has the same shape for every turn. The first request contains the initial messages and tool
+definitions. Each later request contains only the new user or tool-result messages for one turn. The server retains
+the exact sampled tokens. `QwenCodec` applies the checkpoint chat template only to the new turn boundary and messages.
+It submits the resulting prompt suffix to the resident runtime request. It does not decode and re-encode sampled
+assistant text.
+
+The Qwen adapter records whether the sampled output ended with `<|im_end|>`. If it did, the next prompt suffix starts
+with the template newline. Otherwise, the suffix starts with `<|im_end|>` and the template newline. This rule closes a
+turn that ended at a caller stop sequence or sampled-token limit before it appends the next message.
+
+Each turn can set a new `GenerationConfig`. `enable_thinking` and `reasoning_effort` must remain constant for one
+`GenerateMessagesStream`. These fields affect the checkpoint prompt prefix. A change would rewrite resident history.
+
+The streaming APIs are append-only. A caller that compacts, rewrites, or branches history must start a new stream.
+The server does not infer a replacement context and does not fall back to stateless generation inside an existing
+stream.
+
+`ToolDelta.insert` adds a definition or overwrites the definition with the same ID. `ToolDelta.remove` deletes a
+definition. Removing an absent ID has no effect. Duplicate IDs and an ID in both fields are invalid. The current Qwen
+adapter accepts tool definitions only on the first turn because the checkpoint template puts them in the prompt
+prefix. A tool change requires a new stream.
+
+The server completes one turn before it reads the next request. Events from different turns cannot interleave. One
+bidirectional stream owns one runtime session:
 
 ```text
-client                         service DecodeSessions                 scheduler / executor
-  |                                      |                                      |
-  | first DecodeRequest                 |                                      |
-  |------------------------------------>| create InternalRequest                |
-  |                                      | allocate one request slot ---------->|
-  |                                      |                                      | prefill / decode
-  |<------------------------------------------------------------------ chunks |
-  |                                      |<----------- completed InternalRequest|
-  |                                      | store pending request                |
-  |<------------- turn completion -------| then publish completion              |
-  |                                      |                                      |
-  | next DecodeRequest (new tokens only) |                                      |
-  |------------------------------------>| take pending request                  |
-  |                                      | start turn with new prompt tokens     |
-  |                                      | enqueue same request and slot -------->|
-  |                                      |                                      | continue from old cursor
-  |<------------------------------------------------------------------ chunks |
-  |                                      |<----------- completed InternalRequest|
-  |                                      | store, then publish                  |
-  |<------------- turn completion -------|                                      |
-  |                                      |                                      |
-  | half-close / cancel / stream error   |                                      |
-  |------------------------------------>| drop session -> cancel request ------>|
+client                     message adapter        DecodeSessions          scheduler / executor
+  |                              |                       |                          |
+  | first turn ----------------->| render tokens         |                          |
+  |                              |---------------------->| create InternalRequest   |
+  |                              |                       | allocate request slot --->|
+  |<--------------------------------------------------------------- output events |
+  |                              |                       |<---- completed request    |
+  |<---------------------------- completion ------------| store, then publish       |
+  |                              |                       |                          |
+  | new turn messages ---------->| render exact suffix   |                          |
+  |                              | close prior turn      |                          |
+  |                              | append suffix ------->| take pending request     |
+  |                              |                       | enqueue same slot ------->|
+  |<--------------------------------------------------------------- output events |
+  |                              |                       |<---- completed request    |
+  |<---------------------------- completion ------------| store, then publish       |
+  |                              |                       |                          |
+  | half-close / cancel -------->| drop adapter session  | cancel request ---------->|
 ```
 
 The manager stores the completed internal request before it publishes the turn-completion event. Thus, the next input
@@ -567,16 +585,41 @@ A request validation error, runtime error, or input stream error ends the RPC. A
 input. It does not cancel the active turn. The server finishes that turn, observes the half-close, and releases the
 pending session. RPC cancellation drops the session and cancels its runtime request.
 
-The server assigns one nonzero ID to the session. Each `DecodeResponse` envelope for all turns contains this ID.
-Unary `Decode` uses the same lifecycle for one turn. It releases the session after its completion event.
+The server assigns one nonzero ID to the session. Each response envelope for all turns contains this ID. A one-turn
+RPC uses the same lifecycle and releases the session after completion.
+
+`GenerationCompletion.num_input_tokens` is the complete resident token count before sampling starts for that turn.
+`GenerationCompletion.num_output_tokens` is the sampled token count for that turn.
 
 Each response has one of these forms:
 
-- A `chunk` with equal, non-empty token and probability arrays
-- One `completion` event
+- `GenerateTokensResponse`: a token/probability chunk or one completion
+- `GenerateMessagesResponse`: a reasoning chunk, text chunk, atomic tool call, or one completion
 
 Completion reasons are `STOP_SEQUENCE`, `LENGTH_LIMIT`, and `CONTEXT_LIMIT`. EOF without a completion event
 means that the stream failed.
+
+### Codex protocol correspondence
+
+The generation RPC is a model-serving substrate. It is not an agent protocol. A future Codex-compatible adapter can
+own durable thread state, approvals, tools, commands, and item history above these RPCs.
+
+| Current psi-dec concept | Codex app-server concept | Current difference |
+| --- | --- | --- |
+| gRPC bidirectional stream | initialized JSON-RPC connection plus a loaded thread | psi-dec has no handshake or client capabilities |
+| resident runtime session | `Thread` loaded by `thread/start` or `thread/resume` | psi-dec state is transient and has no resumable thread ID |
+| one `GenerateMessagesRequest` | `turn/start` input | psi-dec receives only the new append-only turn input |
+| reasoning chunk | `item/reasoning/summaryTextDelta` | psi-dec streams model reasoning text, not an agent summary item |
+| text chunk | `item/agentMessage/delta` | psi-dec has no `item/started` or `item/completed` envelope |
+| atomic tool call | tool-call item lifecycle | psi-dec does not execute a tool or manage approval |
+| generation completion | `turn/completed` | psi-dec reports a model stop reason, not an agent turn status |
+| no current operation | `turn/steer` and `turn/interrupt` | future agent adapter owns active-turn control |
+| no current operation | `thread/fork` | future agent adapter owns branch identity and state duplication |
+| caller rebuilds context | `thread/compact/start` | Pi currently owns summary generation and retry |
+
+Do not add durable thread operations to `GenerateMessagesStream`. A Codex-compatible service can translate a
+`turn/start` into one generation turn and translate generation events into Codex items. This boundary keeps runtime
+state reuse independent from agent persistence and tool execution.
 
 The external diagnostic client remains a gRPC client:
 
@@ -753,10 +796,10 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Both paths process messages and active function definitions through the shared `QwenCodec`. Each path calls
-`Inference::decode` one time.
+Both paths process messages and active function definitions through the shared `QwenCodec`. Each HTTP request creates
+one `DecodeSession`.
 
-The path maps the `ResponseEvent` stream to content, tool-call, completion, and usage fields.
+The path maps the `MessageEvent` stream to content, tool-call, completion, and usage fields.
 
 The service validates historical tool calls against their results. It does not validate them against currently active
 definitions.

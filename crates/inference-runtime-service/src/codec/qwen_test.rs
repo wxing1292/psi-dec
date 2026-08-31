@@ -8,6 +8,7 @@ use inference_runtime_core::Error;
 use inference_runtime_core::runtime::CompletionReason;
 use inference_runtime_core::runtime::Token;
 use inference_runtime_core::runtime::TokenProbs;
+use inference_runtime_core::tokenizer::Tokenizer;
 use inference_runtime_core::tokenizer::huggingface::HFTokenizer;
 use ordered_float::NotNan;
 use serde_json::json;
@@ -84,6 +85,62 @@ fn test_encode_rejects_invalid_messages() {
         codec.encode(Vec::new(), &[], true, None, true),
         Err(Error::InvalidArgument(message)) if message.contains("messages required")
     ));
+}
+
+#[test]
+fn test_encode_continuation_preserves_sampled_history() {
+    let template = ChatTemplate::from_str(concat!(
+        "{% for message in messages %}",
+        "{% if message.role == 'assistant' %}{{ message.content }}<|im_end|>",
+        "{% else %}{{ message.content }}{% endif %}",
+        "{% endfor %}",
+        "{% if add_generation_prompt %}<|im_start|>assistant{% endif %}",
+    ))
+    .unwrap();
+    let codec = QwenCodec::new(template, Arc::new(fixture_tokenizer(&["two", "assistant"]))).unwrap();
+
+    assert_eq!(
+        codec
+            .encode_continuation(vec![Message::user("two")], false, None, false)
+            .unwrap(),
+        vec![Token::new(4), Token::new(1), Token::new(5), Token::new(2)],
+    );
+    assert_eq!(
+        codec
+            .encode_continuation(vec![Message::user("two")], false, None, true)
+            .unwrap(),
+        vec![Token::new(1), Token::new(5), Token::new(2)],
+    );
+}
+
+#[test]
+#[ignore = "requires PSI_DEC_QWEN_MODEL_DIR"]
+fn test_checkpoint_continuation_contract() {
+    let model_dir = std::env::var("PSI_DEC_QWEN_MODEL_DIR").expect("PSI_DEC_QWEN_MODEL_DIR must be set");
+    let codec = QwenCodec::load(std::path::Path::new(&model_dir)).unwrap();
+    let first = Message::user("one");
+    let answer = Message::assistant("answer");
+    let second = Message::user("two");
+    let initial_tokens = codec.encode(vec![first.clone()], &[], false, None, true).unwrap();
+    let answer_tokens = codec.tokenizer.encode("answer").unwrap();
+    let full_tokens = codec
+        .encode(vec![first, answer, second.clone()], &[], false, None, true)
+        .unwrap();
+
+    let mut closed_tokens = initial_tokens.clone();
+    closed_tokens.extend(answer_tokens.iter().copied());
+    closed_tokens.push(codec.turn_end_token);
+    closed_tokens.extend(
+        codec
+            .encode_continuation(vec![second.clone()], false, None, true)
+            .unwrap(),
+    );
+    assert_eq!(closed_tokens, full_tokens);
+
+    let mut open_tokens = initial_tokens;
+    open_tokens.extend(answer_tokens);
+    open_tokens.extend(codec.encode_continuation(vec![second], false, None, false).unwrap());
+    assert_eq!(open_tokens, full_tokens);
 }
 
 #[test]
@@ -201,6 +258,7 @@ async fn test_decode_stream() {
             ResponseEvent::Completed {
                 reason: CompletionReason::StopSequence,
                 num_output_tokens: 4,
+                turn_closed: true,
             },
         ]
     );
@@ -256,7 +314,7 @@ fn fixture_tokenizer(text: &[&str]) -> HFTokenizer {
         .chain(
             text.iter()
                 .copied()
-                .chain(["</think>"])
+                .chain(["</think>", "<|im_end|>", "<|im_start|>"])
                 .enumerate()
                 .map(|(index, text)| (text.to_string(), u32::try_from(index + 1).unwrap())),
         )
@@ -268,7 +326,11 @@ fn fixture_tokenizer(text: &[&str]) -> HFTokenizer {
         .unwrap();
     let mut tokenizer = tokenizers::Tokenizer::new(model);
     tokenizer
-        .add_special_tokens([AddedToken::from("</think>", true)])
+        .add_special_tokens([
+            AddedToken::from("</think>", true),
+            AddedToken::from("<|im_end|>", true),
+            AddedToken::from("<|im_start|>", true),
+        ])
         .unwrap();
     HFTokenizer::new(tokenizer)
 }
